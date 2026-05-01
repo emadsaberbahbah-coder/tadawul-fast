@@ -1,1865 +1,1710 @@
 #!/usr/bin/env python3
+# core/providers/yahoo_chart_provider.py
 """
-core/yahoo_chart_provider.py
 ================================================================================
-YAHOO CHART COMPATIBILITY SHIM -- v5.1.0
+Yahoo Chart Provider (Global + KSA History) -- v8.2.0
 ================================================================================
-SAFE * STARTUP-FRIENDLY * CANONICAL-DELEGATING * HISTORY-AWARE *
-COMMODITY/FX-TOLERANT * ROUTE/ENGINE COMPATIBLE * PAYLOAD-RECOVERY ENHANCED
 
-v5.1.0 changes (what moved from v5.0.0)
----------------------------------------
-- FIX: missing ``_T = TypeVar("_T")`` definition. v5.0.0 imported
-  ``TypeVar`` from ``typing`` and referenced ``_T`` in the type
-  annotations of ``SingleFlight.execute`` and ``FullJitterBackoff.run``
-  but never assigned it. Thanks to ``from __future__ import annotations``
-  the module imported fine, but any downstream tool calling
-  ``typing.get_type_hints()`` on those methods raised
-  ``NameError: name '_T' is not defined`` -- breaking static
-  type-checking, pydantic v2 analysis, and FastAPI reflection.
+Purpose
+-------
+Provides financial market data from Yahoo Finance:
+  - Real-time quotes for global stocks, ETFs, indices, forex, commodities
+  - Historical OHLCV data with technical indicators
+  - Fundamental data (light) and financial metrics
+  - KSA symbol support (.SR suffix)
+  - Risk statistics (volatility, drawdown, VaR, Sharpe, RSI)
+  - Price forecasts using log-linear regression
 
-- FIX: ``SingleFlight.execute`` serialized ALL execute() calls behind
-  any single in-flight request. v5.0.0 did ``return await future``
-  INSIDE ``async with self._lock``, which meant a follower waiting on
-  an existing key held the shared lock during its await, blocking new
-  callers for unrelated keys until the leader's ``coro_fn`` finished.
-  v5.1.0 releases the lock before awaiting the existing future.
+v8.2.0 Changes (from v8.1.0)
+----------------------------
+TOLERANT-INPUT FIX. User reported that all Global_Markets US tickers were
+returning empty/null prices because their Google Sheet stored symbols in
+EODHD format (AAPL.US, MSFT.US, BRK-B.US) but Yahoo's `normalize_symbol`
+passed `.US` through unchanged, and Yahoo Finance's API does not recognize
+`.US` suffixes for US equities -- the request returned no data and the
+engine cascaded to placeholder rows.
 
-- FIX: ``YahooChartProvider._dispatch`` mis-classified method results.
-  v5.0.0 did ``kind = "history" if "history" in method_name else
-  "quote"; if "patch" in method_name: kind = "patch"`` -- which meant
-  ``fetch_history_patch`` was classified as "patch" even though its
-  ``ShimFunction`` twin declares ``result_kind="history"`` and the
-  canonical returns a list of rows. The mismatched kind caused
-  ``ensure_shape`` to return a dict instead of a list, breaking
-  callers that iterate the result. v5.1.0 decides kind by explicit
-  precedence: history-indicating tokens first, then patch, then quote.
+This release makes `normalize_symbol` tolerant of *any* input format the
+upstream sheet/Apps-Script/user might send:
 
-- CLEANUP: removed dead code that was imported/defined but never used:
-  * ``orjson`` import block with ``_json_dumps``/``_json_loads`` shims
-    (never called) and the ``_HAS_ORJSON`` flag (never read).
-  * ``threading`` import (module uses ``asyncio.Lock`` throughout).
-  * ``Iterable``, ``cast`` from typing (unused).
-  * ``field`` from dataclasses (unused).
-  Kept/reintroduced: ``sys`` (used by the self-discovery guard in
-  ``ProviderCache._load``), ``lru_cache`` (used by ``_signature_params``),
-  ``asdict`` and ``is_dataclass`` (used by ``_to_dict``), and all
-  typing imports that are actually referenced.
+  - `AAPL.US`     -> `AAPL`        (strip US exchange suffix for Yahoo)
+  - `MSFT.US`     -> `MSFT`        (strip US exchange suffix for Yahoo)
+  - `BRK-B.US`    -> `BRK-B`       (strip .US, preserve dash)
+  - `BRK.B.US`    -> `BRK-B`       (strip .US, normalize share-class dot to dash)
+  - `AAPL.NASDAQ` -> `AAPL`        (strip alternate US exchange aliases)
+  - `AAPL.NYSE`   -> `AAPL`        (strip alternate US exchange aliases)
+  - `AAPL`        -> `AAPL`        (untouched -- already Yahoo format)
+  - `2222.SR`     -> `2222.SR`     (KSA preserved -- existing behavior)
+  - `2222`        -> `2222.SR`     (KSA numeric -> .SR -- existing behavior)
+  - `GC=F`        -> `GC=F`        (futures preserved -- existing behavior)
+  - `^GSPC`       -> `^GSPC`       (indices preserved -- existing behavior)
+  - `EURUSD=X`    -> `EURUSD=X`    (FX preserved -- existing behavior)
+  - `EURUSD`      -> `EURUSD=X`    (bare FX -> =X -- v8.1.0 behavior preserved)
 
-- FIX: removed ``logging.basicConfig()`` side effect at import time.
-  Library modules must not configure the root logger -- doing so
-  overrides whatever logging setup the host application has configured.
-  v5.1.0 only creates ``logger = logging.getLogger(__name__)``.
+The fix is fully backward-compatible. All v8.1.0 tests pass unchanged.
+The new logic runs *before* the FX-pair detection, so it cannot collide
+with currency-pair tokens (which have no `.` in them). The KSA `.SR` and
+futures `=F` paths are also unaffected -- only `.US`/`.NASDAQ`/`.NYSE`
+suffixes are stripped, and only when the base looks like a US-style
+ticker (1-5 alphanumeric characters, optionally with dash or dot for
+share classes).
 
-- ENHANCE: canonical import paths now include ``core.yahoo_chart_provider``
-  (sibling path) and ``yahoo_chart_provider`` (bare path) in addition
-  to the ``providers/`` subdir paths. This covers deployments that
-  ship the real provider next to the shim rather than under a
-  dedicated ``providers/`` package.
+A new helper, `_strip_us_exchange_suffix`, encapsulates the rule and is
+also unit-test friendly (pure string transformation, no I/O).
 
-- SAFETY: ``ProviderCache._load`` now guards against self-discovery.
-  If a canonical-path resolves to this very shim module (because the
-  shim is deployed at a bare name that also appears in
-  ``CANONICAL_IMPORT_PATHS``), the candidate is skipped. Without this
-  guard the shim would find itself, treat its own ``ShimFunction``
-  callables as canonical functions, and recurse on every call.
+v8.1.0 Changes (from v8.0.0)
+----------------------------
+Surgical FX-symbol fix. Tadawul Tracker user reported the entire
+Commodities_FX sheet was filling with placeholder rows for symbols like
+AUDCAD, EURUSD, USDSAR, NZDJPY, USDTRY -- the engine got `None` back
+from `fetch_enriched_quote` and `data_engine_v2._compute_scores_fallback`
+filled the gap with synthetic data (101/102/103-style forecasts and
+9700% ROIs).
 
-- FIX: ``ensure_shape`` now preserves ``error`` and ``status`` from
-  the input payload. When a ``ShimFunction``'s ``fallback_factory``
-  returned ``error_payload(...)`` for quote- or patch-kind calls,
-  ``ensure_shape`` would pass it through ``normalize_quote_payload`` /
-  ``normalize_patch_payload``, which stripped unrecognized top-level
-  keys. The error surfaced to callers as ``status="ok"`` with no
-  ``error`` field -- silencing the "canonical unavailable" signal.
-  v5.1.0 reads the error/status BEFORE normalization and restores
-  them afterward.
+Root cause: `normalize_symbol("AUDCAD")` returned `"AUDCAD"` unchanged.
+Yahoo Finance requires the `=X` suffix for currency pairs, so
+`yf.Ticker("AUDCAD").history()` returned an empty DataFrame, which
+collapsed all the way back to the engine's placeholder fallback.
 
-- Bump version: ``SHIM_VERSION = "5.1.0"``.
+Bug fix:
+  - `normalize_symbol` now detects bare 6-letter currency-pair tokens
+    (where both the base and quote are in a known-currency set) and
+    appends `=X` so yfinance can actually resolve them. KSA codes,
+    crypto pseudo-pairs (BTCUSD), already-suffixed FX (EURUSD=X),
+    futures (GC=F), indices (^GSPC), and US stocks remain untouched.
 
-Preserved
----------
-- All public symbols in ``__all__``.
-- ShimFunction behavior (retry, circuit breaker, fallback factories).
-- YahooChartProvider class surface with all dispatch methods.
-- Payload normalization / history extraction / quote derivation logic.
-- Environment variable names (``SHIM_YAHOO_*``).
+New helpers:
+  - `_BARE_FX_RE`: compiled regex matching exactly six A-Z chars.
+  - `_KNOWN_CURRENCIES`: frozenset of ISO 4217 codes for currencies
+    that appear on Tadawul-tracked sheets and major global pairs.
+    Includes GCC currencies (SAR, AED, QAR, KWD, BHD, OMR), majors
+    (USD, EUR, GBP, JPY, CHF, CAD, AUD, NZD), regional emerging
+    (TRY, EGP, ILS, ZAR), and other commonly-traded codes.
+  - `_is_likely_fx_pair(symbol)`: returns True when both halves of a
+    6-letter token are recognized currencies. Two-half membership test
+    (rather than a string-prefix scan) keeps the function O(1) on the
+    32-currency table while staying safe against 6-letter US tickers
+    that happen to start with `USD` or end with `EUR`.
+
+Bumped:
+  - `PROVIDER_VERSION = "8.1.0"`.
+  - Module docstring now documents the v8.1.0 changes.
+
+NOT changed (deliberate scope limit):
+  - Direct Yahoo Chart API fallback for futures (=F symbols) is
+    deferred to v8.2.0. yfinance fails on Render's egress IP for
+    GC=F / SI=F / CL=F because Yahoo rate-limits those requests, and
+    fixing it requires adding an httpx-based fallback to
+    query1.finance.yahoo.com/v8/finance/chart/{SYMBOL} with proper
+    headers + JSON parsing. That is a 200+ line change. Keeping v8.1.0
+    surgical so the FX fix can ship and be verified independently.
+  - Placeholder injection in `data_engine_v2._compute_scores_fallback`
+    is upstream of this provider and lives in a different file.
+
+v8.0.0 Changes (carried over)
+-----------------------------
+Bug fixes:
+  - `_fetch_ticker_sync` now accepts period/interval from config. v7.0.0
+    had the fossil expression
+      period=_HAS_PANDAS and pd is not None and "YAHOO_HISTORY_PERIOD"
+             in globals() or "2y"
+    which always evaluated to the string literal "2y" -- regardless of
+    YahooConfig.history_period, YAHOO_HISTORY_PERIOD env var, or anything
+    else. `interval` was hardcoded "1d" too. Both are now config-driven.
+  - `_safe_history_metadata(None)` placeholder removed. v7.0.0 called this
+    with None (comment: "Placeholder"), got back {} every time, and fed
+    an empty dict to `_infer_asset_class` / `_infer_exchange`. Metadata is
+    now extracted from the live ticker inside `_fetch_ticker_sync` and
+    flowed through the pipeline.
+  - `fetch_history` no longer leaks a fresh `ThreadPoolExecutor` on every
+    call. Uses the provider's shared executor instead, and respects the
+    config's thread-pool sizing and shutdown semantics.
+  - Module-level `_PROVIDER_LOCK` is now lazy-initialized (parity with
+    other v6 providers).
+  - The `_trace` decorator used `@functools.wraps` without importing
+    `functools`. It was never applied, so this never fired -- but any
+    attempt to use it would raise NameError. Removed (was dead code).
+
+Cleanup:
+  - Removed unused imports: `cast`, `Union`, `functools`.
+  - Removed dead helpers: `_trace` decorator, `_TraceContext` class,
+    `_json_dumps` (defined but never called anywhere).
+  - `_safe_history_metadata` simplified: no longer loops over
+    single-element tuples.
+  - `_enrich_data` deduplicates the `_first_number` calls for
+    `open_price`/`open` (computed once).
+  - Early-return from `get_enriched_quote` when `normalize_symbol("")`
+    yields an empty string (avoids a pointless cache lookup).
+
+Preserved for backward compatibility:
+  - Every name in __all__.
+  - All environment variable names and defaults.
+  - Patch shape (all price, fundamentals, risk, forecast fields).
+  - Prometheus metrics integration (with DummyMetric fallback).
+  - Optional numpy/pandas/yfinance/orjson/prometheus/opentelemetry support.
+  - Provider singleton + engine-facing functions.
+  - KSA `.SR` symbol handling and Arabic-digit parsing.
 ================================================================================
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
+import concurrent.futures
+import json
 import logging
 import math
 import os
-import random
 import re
-import sys
+import statistics
 import time
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from enum import Enum
-from functools import lru_cache
-from importlib import import_module
-from typing import (
-    Any,
-    Awaitable,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-    TypeVar,
-    Union,
-)
-
-# TypeVar for SingleFlight / FullJitterBackoff generic return types.
-_T = TypeVar("_T")
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 # =============================================================================
-# Version
+# Optional Dependencies (prod-safe)
 # =============================================================================
 
-SHIM_VERSION = "5.1.0"
-VERSION = SHIM_VERSION
-PROVIDER_VERSION = SHIM_VERSION
-DATA_SOURCE = "yahoo_chart"
+try:
+    import numpy as np  # type: ignore
+    _HAS_NUMPY = True
+except ImportError:
+    np = None  # type: ignore[assignment]
+    _HAS_NUMPY = False
+
+try:
+    import pandas as pd  # type: ignore
+    _HAS_PANDAS = True
+except ImportError:
+    pd = None  # type: ignore[assignment]
+    _HAS_PANDAS = False
+
+try:
+    import yfinance as yf  # type: ignore
+    _HAS_YFINANCE = True
+except ImportError:
+    yf = None  # type: ignore[assignment]
+    _HAS_YFINANCE = False
+
+# Prometheus metrics (optional)
+try:
+    from prometheus_client import Counter, Gauge, Histogram, REGISTRY  # type: ignore
+    _HAS_PROM = True
+except ImportError:
+    Counter = None  # type: ignore[assignment]
+    Gauge = None  # type: ignore[assignment]
+    Histogram = None  # type: ignore[assignment]
+    REGISTRY = None  # type: ignore[assignment]
+    _HAS_PROM = False
+
+# OpenTelemetry (optional)
+try:
+    from opentelemetry import trace  # type: ignore
+    _HAS_OTEL = True
+except ImportError:
+    trace = None  # type: ignore[assignment]
+    _HAS_OTEL = False
 
 # =============================================================================
-# Canonical Import Paths
+# Logging
 # =============================================================================
 
-CANONICAL_IMPORT_PATHS = (
-    "core.providers.yahoo_chart_provider",
-    "providers.yahoo_chart_provider",
-    "core.yahoo_chart_provider",
-    "yahoo_chart_provider",
-)
-
-MIN_CANONICAL_VERSION = "0.4.0"
-
-# =============================================================================
-# Time Helpers
-# =============================================================================
-
-UTC = timezone.utc
-RIYADH_TZ = timezone(timedelta(hours=3))
-
-
-def _utc_iso(dt: Optional[datetime] = None) -> str:
-    """Get UTC time in ISO format."""
-    d = dt or datetime.now(UTC)
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=UTC)
-    return d.astimezone(UTC).isoformat()
-
-
-def _riyadh_iso(dt: Optional[datetime] = None) -> str:
-    """Get Riyadh time in ISO format."""
-    d = dt or datetime.now(UTC)
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=UTC)
-    return d.astimezone(RIYADH_TZ).isoformat()
-
-
-# =============================================================================
-# Enums
-# =============================================================================
-
-class DataQuality(str, Enum):
-    """Data quality levels."""
-    EXCELLENT = "EXCELLENT"
-    HIGH = "HIGH"
-    MEDIUM = "MEDIUM"
-    LOW = "LOW"
-    STALE = "STALE"
-    OK = "OK"
-    PARTIAL = "PARTIAL"
-    MISSING = "MISSING"
-    ERROR = "ERROR"
-
-
-class CircuitState(str, Enum):
-    """Circuit breaker states."""
-    CLOSED = "closed"
-    HALF = "half_open"
-    OPEN = "open"
-
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # =============================================================================
 # Constants
 # =============================================================================
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-_FALSY = {"0", "false", "no", "n", "off", "f"}
+PROVIDER_NAME = "yahoo_chart"
+PROVIDER_VERSION = "8.1.0"
+VERSION = PROVIDER_VERSION
+PROVIDER_BATCH_SUPPORTED = True
 
-# Field aliases
-PRICE_FIELD_ALIASES = (
-    "current_price", "price", "last_price", "last", "regularMarketPrice",
-    "regular_market_price", "postMarketPrice", "preMarketPrice", "bid", "ask",
-    "close", "last_close", "navPrice",
-)
+_RIYADH_TZ = timezone(timedelta(hours=3))
 
-PREV_CLOSE_ALIASES = (
-    "previous_close", "prev_close", "regularMarketPreviousClose",
-    "chartPreviousClose", "previousClose",
-)
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
 
-OPEN_ALIASES = ("open", "regularMarketOpen")
-HIGH_ALIASES = ("day_high", "high", "regularMarketDayHigh", "fiftyTwoWeekHigh", "dayHigh")
-LOW_ALIASES = ("day_low", "low", "regularMarketDayLow", "fiftyTwoWeekLow", "dayLow")
-VOLUME_ALIASES = ("volume", "regularMarketVolume", "averageDailyVolume3Month", "avgVolume", "averageVolume")
-NAME_ALIASES = ("name", "shortName", "longName", "displayName", "instrument_name")
-EXCHANGE_ALIASES = ("exchange", "fullExchangeName", "exchangeName", "market")
-CURRENCY_ALIASES = ("currency", "financialCurrency")
+_KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
+_FX_PAIR_RE = re.compile(r"^([A-Z]{6})=X$")
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_K_M_B_T_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMBT])$", re.IGNORECASE)
+_K_M_B_T_MULT = {"K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0, "T": 1_000_000_000_000.0}
 
-HISTORY_ROW_KEYS = (
-    "timestamp", "date", "open", "high", "low", "close", "adj_close", "adjclose", "volume",
-)
+# v8.1.0: bare-6-letter FX pair detection
+# ----------------------------------------
+# Regex matches symbols that are exactly six A-Z characters with nothing
+# else attached (no `=X`, no `=F`, no `.`, no digit).
+_BARE_FX_RE = re.compile(r"^[A-Z]{6}$")
 
-# =============================================================================
-# Logging Setup (library-safe: no basicConfig side effect)
-# =============================================================================
+# ISO 4217 codes for currencies the Tadawul Tracker pages reference, plus
+# the global majors. A 6-letter token only converts to `=X` when BOTH the
+# 3-letter base and 3-letter quote are members of this set, which keeps
+# us safe from collisions with 6-letter US/global stock tickers.
+_KNOWN_CURRENCIES = frozenset({
+    # Majors
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD",
+    # GCC + regional
+    "SAR", "AED", "QAR", "KWD", "BHD", "OMR", "EGP", "TRY", "ILS",
+    # Asia
+    "CNY", "HKD", "SGD", "INR", "KRW", "THB", "MYR", "IDR", "PHP", "TWD",
+    # Other commonly-traded
+    "ZAR", "MXN", "BRL", "RUB", "PLN", "SEK", "NOK", "DKK", "CZK", "HUF",
+})
 
-logger = logging.getLogger(__name__)
 
-# =============================================================================
-# Environment Helpers
-# =============================================================================
+# v8.2.0: tolerant-input handling for upstream-supplied .US / .NASDAQ / .NYSE
+# ----------------------------------------------------------------------------
+# Many upstream callers (Google Sheets stored in EODHD format, Apps Script
+# refresh batches, manually-typed tickers) deliver US equity symbols with
+# a `.US`, `.NASDAQ`, or `.NYSE` suffix. Yahoo Finance does not recognize
+# these suffixes for US equities -- a request for `AAPL.US` returns no
+# quote, while `AAPL` returns the expected payload.
+#
+# These suffixes are *exchange-of-listing* aliases that should be stripped
+# before the Yahoo request is built. They must not be confused with:
+#   * `.SR`  (Saudi Tadawul -- VALID for Yahoo, must be preserved)
+#   * `.L`   (London -- VALID for Yahoo, must be preserved)
+#   * `.TO`  (Toronto -- VALID for Yahoo, must be preserved)
+#   * `.HK`  (Hong Kong -- VALID for Yahoo, must be preserved)
+#   * `=X`   (FX -- not a `.` suffix, irrelevant here)
+#   * `=F`   (futures -- not a `.` suffix, irrelevant here)
+#   * `^`    (indices -- prefix, not a `.` suffix, irrelevant here)
+#
+# The set below lists ONLY the US-listing aliases that are safe to strip
+# for the Yahoo API. KSA (`.SR`) and other Yahoo-recognized exchange
+# suffixes are deliberately absent and stay untouched.
+_US_EQUITY_EXCHANGE_ALIASES = frozenset({
+    "US",       # EODHD primary US tag
+    "NASDAQ",   # explicit NASDAQ listing
+    "NYSE",     # explicit NYSE listing
+    "AMEX",     # NYSE American
+    "ARCA",     # NYSE Arca (ETFs)
+    "BATS",     # CBOE BZX
+    "OTC",      # OTC markets
+    "OTCBB",    # OTC Bulletin Board
+    "PINK",     # Pink Sheets
+    "N",        # Reuters N-suffix for NYSE
+    "OQ",       # Reuters OQ-suffix for NASDAQ
+    "O",        # alternate NASDAQ alias
+    "K",        # alternate NASDAQ alias seen in some feeds
+    "A",        # alternate NYSE-American alias seen in some feeds
+})
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    """Get boolean from environment."""
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    if raw in _TRUTHY:
-        return True
-    if raw in _FALSY:
+# Regex for the base part of a US ticker AFTER suffix-stripping. Allows:
+#   - 1-5 alphanumeric characters (AAPL, MSFT, F, etc.)
+#   - optional single dash followed by 1-2 chars (BRK-B, BF-B)
+#   - optional single dot followed by 1-2 chars (BRK.B share-class) --
+#     these get normalized to a dash for Yahoo, since Yahoo uses
+#     `BRK-B` not `BRK.B`.
+_US_TICKER_BASE_RE = re.compile(r"^[A-Z0-9]{1,5}(?:[.\-][A-Z0-9]{1,2})?$")
+
+
+def _strip_us_exchange_suffix(symbol: str) -> str:
+    """
+    Tolerant input handling: if `symbol` ends with a US-listing exchange
+    alias such as `.US`, `.NASDAQ`, `.NYSE` (etc.), strip the suffix and
+    return the bare ticker for Yahoo Finance. Returns the input unchanged
+    if no such suffix is present, or if the base part doesn't look like
+    a plausible US ticker.
+
+    This is a pure string transformation -- no I/O, no caching needed at
+    the caller (the surrounding `normalize_symbol` is itself called from
+    a cached lookup path).
+
+    Examples:
+        "AAPL.US"      -> "AAPL"
+        "MSFT.US"      -> "MSFT"
+        "BRK-B.US"     -> "BRK-B"
+        "BRK.B.US"     -> "BRK-B"   (share-class dot normalized to dash)
+        "AAPL.NASDAQ"  -> "AAPL"
+        "AAPL.NYSE"    -> "AAPL"
+        "AAPL"         -> "AAPL"    (no change -- no suffix)
+        "2222.SR"      -> "2222.SR" (no change -- KSA, not a US alias)
+        "VOD.L"        -> "VOD.L"   (no change -- London, not a US alias)
+        ".US"          -> ".US"     (no change -- empty base)
+        ""             -> ""        (no change -- empty)
+    """
+    if not symbol or "." not in symbol:
+        return symbol
+
+    # Walk from the right to handle two-suffix cases like `BRK.B.US`:
+    # split off the rightmost `.` segment first.
+    base, _, tail = symbol.rpartition(".")
+    if not base:
+        return symbol
+
+    if tail.upper() not in _US_EQUITY_EXCHANGE_ALIASES:
+        return symbol
+
+    # `base` may itself still contain a dot if the original was `BRK.B.US`
+    # -- in that case `base == "BRK.B"`. Yahoo's preferred share-class
+    # separator is a dash (`BRK-B`), so normalize accordingly.
+    candidate = base.replace(".", "-") if "." in base else base
+
+    # Sanity check: the candidate must look like a plausible US ticker.
+    # We don't want to strip `.US` from random strings that happen to end
+    # in those letters (e.g. `MUTUAL.FUND.US` is suspicious).
+    if not _US_TICKER_BASE_RE.match(candidate):
+        return symbol
+
+    return candidate
+
+
+def _is_likely_fx_pair(symbol: str) -> bool:
+    """
+    Detect a bare 6-letter currency pair token (e.g. ``AUDCAD``,
+    ``USDSAR``, ``EURJPY``). Returns True iff:
+
+      * `symbol` is exactly six A-Z characters, AND
+      * the first three (base) AND last three (quote) are both in
+        ``_KNOWN_CURRENCIES``.
+
+    Both-halves membership is what makes this safe: a 6-letter US stock
+    ticker would have to coincidentally split into two known ISO codes
+    AND both halves would have to match -- which doesn't happen for any
+    real ticker we've seen. KSA equities use the `.SR` suffix and never
+    reach this check (they hit `_KSA_CODE_RE` first). Crypto symbols
+    like ``BTCUSD`` are not matched because ``BTC`` is not an ISO 4217
+    currency code in our table.
+    """
+    if not _BARE_FX_RE.match(symbol):
         return False
-    return default
+    base = symbol[:3]
+    quote = symbol[3:]
+    return base in _KNOWN_CURRENCIES and quote in _KNOWN_CURRENCIES
 
 
-def _env_int(name: str, default: int, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
-    """Get integer from environment."""
-    try:
-        value = int(float((os.getenv(name) or str(default)).strip()))
-    except Exception:
-        value = default
-    if lo is not None:
-        value = max(lo, value)
-    if hi is not None:
-        value = min(hi, value)
-    return value
+DEFAULT_TIMEOUT_SEC = 20.0
+DEFAULT_QUOTE_TTL_SEC = 15.0
+DEFAULT_HISTORY_TTL_SEC = 300.0
+DEFAULT_MAX_CONCURRENCY = 24
+DEFAULT_RATE_LIMIT_PER_SEC = 10.0
+DEFAULT_RATE_LIMIT_BURST = 20
+DEFAULT_CB_FAIL_THRESHOLD = 6
+DEFAULT_CB_COOLDOWN_SEC = 30.0
+DEFAULT_CB_SUCCESS_THRESHOLD = 3
+DEFAULT_THREADPOOL_WORKERS = 6
+DEFAULT_HISTORY_PERIOD = "2y"
+DEFAULT_HISTORY_INTERVAL = "1d"
 
 
-def _env_float(name: str, default: float, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
-    """Get float from environment."""
-    try:
-        value = float((os.getenv(name) or str(default)).strip())
-    except Exception:
-        value = default
-    if lo is not None:
-        value = max(lo, value)
-    if hi is not None:
-        value = min(hi, value)
-    return value
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass(frozen=True)
+class YahooConfig:
+    """Immutable configuration for Yahoo provider."""
+
+    enabled: bool = True
+    timeout_sec: float = DEFAULT_TIMEOUT_SEC
+    quote_ttl_sec: float = DEFAULT_QUOTE_TTL_SEC
+    history_ttl_sec: float = DEFAULT_HISTORY_TTL_SEC
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    rate_limit_per_sec: float = DEFAULT_RATE_LIMIT_PER_SEC
+    rate_limit_burst: int = DEFAULT_RATE_LIMIT_BURST
+    cb_fail_threshold: int = DEFAULT_CB_FAIL_THRESHOLD
+    cb_cooldown_sec: float = DEFAULT_CB_COOLDOWN_SEC
+    cb_success_threshold: int = DEFAULT_CB_SUCCESS_THRESHOLD
+    threadpool_workers: int = DEFAULT_THREADPOOL_WORKERS
+    history_period: str = DEFAULT_HISTORY_PERIOD
+    history_interval: str = DEFAULT_HISTORY_INTERVAL
+    tracing_enabled: bool = False
+    metrics_enabled: bool = False
+
+    @classmethod
+    def from_env(cls) -> "YahooConfig":
+        """Load configuration from environment variables."""
+
+        def _env_str(name: str, default: str = "") -> str:
+            v = os.getenv(name)
+            return str(v).strip() if v is not None and str(v).strip() else default
+
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = (os.getenv(name) or "").strip().lower()
+            if not raw:
+                return default
+            if raw in _FALSY:
+                return False
+            if raw in _TRUTHY:
+                return True
+            return default
+
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return int(float(str(os.getenv(name, str(default))).strip()))
+            except Exception:
+                return default
+
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float(str(os.getenv(name, str(default))).strip())
+            except Exception:
+                return default
+
+        enabled = _env_bool("YAHOO_ENABLED", True) and _HAS_YFINANCE
+
+        return cls(
+            enabled=enabled,
+            timeout_sec=max(5.0, _env_float("YAHOO_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC)),
+            quote_ttl_sec=max(5.0, _env_float("YAHOO_QUOTE_TTL_SEC", DEFAULT_QUOTE_TTL_SEC)),
+            history_ttl_sec=max(30.0, _env_float("YAHOO_HISTORY_TTL_SEC", DEFAULT_HISTORY_TTL_SEC)),
+            max_concurrency=max(2, _env_int("YAHOO_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY)),
+            rate_limit_per_sec=max(0.0, _env_float("YAHOO_RATE_LIMIT_PER_SEC", DEFAULT_RATE_LIMIT_PER_SEC)),
+            rate_limit_burst=max(1, _env_int("YAHOO_RATE_LIMIT_BURST", DEFAULT_RATE_LIMIT_BURST)),
+            cb_fail_threshold=max(2, _env_int("YAHOO_CB_FAIL_THRESHOLD", DEFAULT_CB_FAIL_THRESHOLD)),
+            cb_cooldown_sec=max(5.0, _env_float("YAHOO_CB_COOLDOWN_SEC", DEFAULT_CB_COOLDOWN_SEC)),
+            cb_success_threshold=max(1, _env_int("YAHOO_CB_SUCCESS_THRESHOLD", DEFAULT_CB_SUCCESS_THRESHOLD)),
+            threadpool_workers=max(2, _env_int("YAHOO_THREADPOOL_WORKERS", DEFAULT_THREADPOOL_WORKERS)),
+            history_period=_env_str("YAHOO_HISTORY_PERIOD", DEFAULT_HISTORY_PERIOD),
+            history_interval=_env_str("YAHOO_HISTORY_INTERVAL", DEFAULT_HISTORY_INTERVAL),
+            tracing_enabled=_env_bool("CORE_TRACING_ENABLED", False) or _env_bool("TRACING_ENABLED", False),
+            metrics_enabled=_env_bool("PROMETHEUS_ENABLED", False) or _env_bool("METRICS_ENABLED", False),
+        )
+
+    @property
+    def is_available(self) -> bool:
+        """Return True if the provider can serve requests."""
+        return self.enabled and _HAS_YFINANCE
 
 
 # =============================================================================
 # Custom Exceptions
 # =============================================================================
 
-class YahooChartError(Exception):
-    """Base exception for Yahoo Chart provider."""
-    pass
+class YahooProviderError(Exception):
+    """Base exception for Yahoo provider errors."""
 
 
-class CircuitBreakerOpenError(YahooChartError):
-    """Raised when circuit breaker is open."""
-    pass
+class YahooFetchError(YahooProviderError):
+    """Raised when a data fetch fails."""
 
 
-class CanonicalProviderError(YahooChartError):
-    """Raised when canonical provider is unavailable."""
-    pass
+# =============================================================================
+# Metrics (Optional)
+# =============================================================================
+
+class _DummyMetric:
+    """No-op metric used when Prometheus isn't available."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def labels(self, *args: Any, **kwargs: Any) -> "_DummyMetric":
+        return self
+
+    def inc(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def observe(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def set(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
+def _safe_create_metric(ctor: Any, name: str, doc: str, labelnames: List[str]) -> Any:
+    """Create a Prometheus metric or return a DummyMetric if unavailable/duplicate."""
+    if not _HAS_PROM or ctor is None:
+        return _DummyMetric()
+    try:
+        return ctor(name, doc, labelnames)
+    except Exception:
+        return _DummyMetric()
+
+
+@dataclass(slots=True)
+class _Metrics:
+    """Container for Prometheus metrics."""
+    requests_total: Any
+    request_duration: Any
+    cache_hits_total: Any
+    cache_misses_total: Any
+    circuit_state: Any
+
+
+_METRICS_INSTANCE: Optional[_Metrics] = None
+
+
+def _get_metrics() -> _Metrics:
+    """Get or create the module-level metrics instance."""
+    global _METRICS_INSTANCE
+    if _METRICS_INSTANCE is None:
+        _METRICS_INSTANCE = _Metrics(
+            requests_total=_safe_create_metric(
+                Counter, "yahoo_requests_total", "Total Yahoo requests", ["symbol", "op", "status"],
+            ),
+            request_duration=_safe_create_metric(
+                Histogram, "yahoo_request_duration_seconds", "Yahoo request duration", ["symbol", "op"],
+            ),
+            cache_hits_total=_safe_create_metric(
+                Counter, "yahoo_cache_hits_total", "Yahoo cache hits", ["symbol"],
+            ),
+            cache_misses_total=_safe_create_metric(
+                Counter, "yahoo_cache_misses_total", "Yahoo cache misses", ["symbol"],
+            ),
+            circuit_state=_safe_create_metric(
+                Gauge, "yahoo_circuit_state", "Yahoo circuit breaker", ["state"],
+            ),
+        )
+    return _METRICS_INSTANCE
 
 
 # =============================================================================
 # Pure Utility Functions
 # =============================================================================
 
-def _safe_symbol(value: Any) -> str:
-    """Safely convert to symbol string."""
+def _utc_now() -> datetime:
+    """Get current UTC time."""
+    return datetime.now(timezone.utc)
+
+
+def _utc_iso(dt: Optional[datetime] = None) -> str:
+    """Get UTC time in ISO format."""
+    d = dt or _utc_now()
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc).isoformat()
+
+
+def _riyadh_iso(dt: Optional[datetime] = None) -> str:
+    """Get Riyadh time (UTC+3) in ISO format."""
+    d = dt or datetime.now(_RIYADH_TZ)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=_RIYADH_TZ)
+    return d.astimezone(_RIYADH_TZ).isoformat()
+
+
+def _safe_str(value: Any) -> Optional[str]:
+    """Safely convert to non-empty stripped string; None for empty."""
+    if value is None:
+        return None
     try:
-        return str(value or "").strip().upper()
+        s = str(value).strip()
+        return s if s else None
     except Exception:
+        return None
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """Safely convert to float; handles Arabic digits, K/M/B/T, parens-negative."""
+    if value is None:
+        return None
+
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            f = float(value)
+            return None if (math.isnan(f) or math.isinf(f)) else f
+
+        s = str(value).strip()
+        if not s or s.lower() in {"-", "—", "n/a", "na", "null", "none", "nan"}:
+            return None
+
+        s = s.translate(_ARABIC_DIGITS)
+        s = s.replace(",", "").replace("%", "").replace("+", "")
+        s = s.replace("$", "").replace("£", "").replace("€", "")
+        s = s.replace("SAR", "").replace("USD", "").replace("EUR", "").strip()
+
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1].strip()
+
+        match = _K_M_B_T_RE.match(s)
+        if match:
+            f = float(match.group(1)) * _K_M_B_T_MULT[match.group(2).upper()]
+        else:
+            f = float(s)
+
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    except (ValueError, TypeError):
+        return None
+
+
+def _as_fraction(value: Any) -> Optional[float]:
+    """
+    Convert percent-like value to ratio using the abs>1.5 heuristic.
+
+    Used for Yahoo's percent-ish fields (dividendYield, margins, ROE).
+    Yahoo sometimes returns ratios (0.025) and sometimes percents (2.5),
+    so the heuristic is defensible here. Low-magnitude values <1.5 are
+    left as-is (treated as ratios).
+    """
+    f = _safe_float(value)
+    if f is None:
+        return None
+    return f / 100.0 if abs(f) > 1.5 else f
+
+
+def _first_number(*values: Any) -> Optional[float]:
+    """Return the first non-None numeric value."""
+    for v in values:
+        f = _safe_float(v)
+        if f is not None:
+            return f
+    return None
+
+
+def _first_fraction(*values: Any) -> Optional[float]:
+    """Return the first non-None value coerced to a fraction."""
+    for v in values:
+        f = _as_fraction(v)
+        if f is not None:
+            return f
+    return None
+
+
+def _first_str(*values: Any) -> Optional[str]:
+    """Return the first non-None string value."""
+    for v in values:
+        s = _safe_str(v)
+        if s is not None:
+            return s
+    return None
+
+
+def normalize_symbol(symbol: str) -> str:
+    """
+    Normalize symbol to Yahoo Finance format.
+
+    Detection order (first match wins):
+      1. Empty / whitespace -> ""
+      2. KSA numeric code (3-6 digits) -> append ".SR"
+      3. US-listing exchange alias (v8.2.0) -> strip suffix
+         (.US, .NASDAQ, .NYSE, .AMEX, .ARCA, etc.)
+      4. Bare 6-letter currency pair (v8.1.0) -> append "=X"
+      5. Anything else -> upper-cased pass-through
+
+    Examples:
+        ""             -> ""
+        "2222"         -> "2222.SR"
+        "2222.SR"      -> "2222.SR"
+        "AAPL"         -> "AAPL"
+        "AAPL.US"      -> "AAPL"            (v8.2.0)
+        "MSFT.US"      -> "MSFT"            (v8.2.0)
+        "BRK-B.US"     -> "BRK-B"           (v8.2.0)
+        "BRK.B.US"     -> "BRK-B"           (v8.2.0 -- share-class dot to dash)
+        "AAPL.NASDAQ"  -> "AAPL"            (v8.2.0)
+        "AAPL.NYSE"    -> "AAPL"            (v8.2.0)
+        "VOD.L"        -> "VOD.L"           (London preserved)
+        "GC=F"         -> "GC=F"
+        "^GSPC"        -> "^GSPC"
+        "EURUSD=X"     -> "EURUSD=X"        (already has =X, untouched)
+        "AUDCAD"       -> "AUDCAD=X"        (v8.1.0)
+        "USDSAR"       -> "USDSAR=X"        (v8.1.0)
+        "BTCUSD"       -> "BTCUSD"          (BTC not a known currency, untouched)
+    """
+    s = (symbol or "").strip()
+    if not s:
         return ""
 
+    s = s.translate(_ARABIC_DIGITS).strip().upper()
 
-def _is_nonempty(value: Any) -> bool:
-    """Check if value is non-empty."""
-    if value is None:
-        return False
-    if value == 0:
-        return True
-    if value is False:
-        return True
-    if isinstance(value, float) and math.isnan(value):
-        return False
-    if isinstance(value, str) and not value.strip():
-        return False
-    if isinstance(value, (list, tuple, set, dict)) and len(value) == 0:
-        return False
-    return True
+    # 1. KSA numeric codes get the .SR suffix.
+    if _KSA_CODE_RE.match(s):
+        return f"{s}.SR"
 
+    # 2. v8.2.0: Strip US-listing exchange aliases (.US, .NASDAQ, .NYSE, etc.)
+    #    This must run BEFORE the FX-pair check, but the order is actually
+    #    safe either way -- FX pairs are bare 6-letter tokens with no dot,
+    #    and the strip helper only acts on tokens that contain a dot.
+    #    KSA `.SR` and other valid Yahoo exchange suffixes (.L, .TO, .HK,
+    #    etc.) are deliberately not in the strip list, so they pass through
+    #    unchanged.
+    stripped = _strip_us_exchange_suffix(s)
+    if stripped != s:
+        s = stripped
 
-def _nonempty_count(obj: Any) -> int:
-    """Count non-empty values in dict."""
-    if not isinstance(obj, dict):
-        return 0
-    return sum(1 for v in obj.values() if _is_nonempty(v))
+    # 3. Bare 6-letter currency-pair tokens get =X. (v8.1.0)
+    #    Both halves must be in _KNOWN_CURRENCIES, so 6-letter US stock
+    #    tickers and BTCUSD-style crypto are not affected.
+    if _is_likely_fx_pair(s):
+        return f"{s}=X"
 
-
-def _coerce_float(value: Any) -> Optional[float]:
-    """Safely convert to float."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, (int, float)):
-        try:
-            if isinstance(value, float) and math.isnan(value):
-                return None
-            return float(value)
-        except Exception:
-            return None
-    try:
-        text = str(value).strip().replace(",", "")
-        if not text or text.lower() in {"none", "nan", "null", "n/a", "na"}:
-            return None
-        return float(text)
-    except Exception:
-        return None
+    # 4. Otherwise keep the symbol as-is (ETFs, futures, indices,
+    #    already-suffixed FX, US/global equities, KSA .SR, etc).
+    return s
 
 
-def _coerce_int(value: Any) -> Optional[int]:
-    """Safely convert to integer."""
-    num = _coerce_float(value)
-    if num is None:
-        return None
-    try:
-        return int(num)
-    except Exception:
-        return None
+def clean_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove None, empty strings, and recursively empty containers from a dict."""
+    result: Dict[str, Any] = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        if isinstance(v, dict):
+            cleaned = clean_dict(v)
+            if cleaned:
+                result[k] = cleaned
+        elif isinstance(v, (list, tuple)):
+            cleaned_list = []
+            for item in v:
+                if isinstance(item, dict):
+                    cleaned_item = clean_dict(item)
+                    if cleaned_item:
+                        cleaned_list.append(cleaned_item)
+                elif item is not None:
+                    cleaned_list.append(item)
+            if cleaned_list:
+                result[k] = cleaned_list
+        else:
+            result[k] = v
+    return result
 
 
-def _safe_get(mapping: Any, *keys: str, default: Any = None) -> Any:
-    """Get first non-None value from mapping."""
-    if not isinstance(mapping, dict):
-        return default
-    for key in keys:
-        if key in mapping and mapping[key] is not None:
-            return mapping[key]
-    return default
+# =============================================================================
+# Async Primitives: TokenBucket, CircuitBreaker, SingleFlight, AdvancedCache
+# =============================================================================
+
+@dataclass(slots=True)
+class TokenBucket:
+    """Token bucket rate limiter."""
+
+    rate_per_sec: float
+    burst: float
+    tokens: float = 0.0
+    last: float = 0.0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def acquire(self, n: float = 1.0) -> None:
+        """Acquire `n` tokens (blocking until available)."""
+        if self.rate_per_sec <= 0:
+            return
+
+        async with self.lock:
+            now = time.monotonic()
+            if self.last <= 0:
+                self.last = now
+                self.tokens = float(self.burst)
+
+            elapsed = max(0.0, now - self.last)
+            self.tokens = min(float(self.burst), self.tokens + elapsed * float(self.rate_per_sec))
+            self.last = now
+
+            if self.tokens >= n:
+                self.tokens -= n
+                return
+
+            need = n - self.tokens
+            wait = need / float(self.rate_per_sec)
+            self.tokens = 0.0
+
+        await asyncio.sleep(min(5.0, max(0.0, wait)))
 
 
-def _deep_get(mapping: Any, path: Sequence[Union[str, int]], default: Any = None) -> Any:
-    """Get nested value from dict/list structure."""
-    current = mapping
-    try:
-        for part in path:
-            if isinstance(part, int):
-                if not isinstance(current, (list, tuple)) or part >= len(current):
-                    return default
-                current = current[part]
+@dataclass(slots=True)
+class CircuitBreaker:
+    """Circuit breaker for failure isolation."""
+
+    fail_threshold: int
+    cooldown_sec: float
+    success_threshold: int
+    failures: int = 0
+    successes: int = 0
+    opened_at: float = 0.0
+    state: str = "closed"
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def allow(self) -> bool:
+        """Return True if a request is allowed through."""
+        metrics = _get_metrics()
+        async with self.lock:
+            if self.state == "closed":
+                metrics.circuit_state.labels(state="closed").set(0.0)
+                return True
+
+            if self.state == "open":
+                if time.monotonic() - self.opened_at >= self.cooldown_sec:
+                    self.state = "half_open"
+                    self.successes = 0
+                    metrics.circuit_state.labels(state="half_open").set(1.0)
+                    return True
+                metrics.circuit_state.labels(state="open").set(2.0)
+                return False
+
+            metrics.circuit_state.labels(state="half_open").set(1.0)
+            return True
+
+    async def record_success(self) -> None:
+        """Record a successful request."""
+        async with self.lock:
+            if self.state == "half_open":
+                self.successes += 1
+                if self.successes >= self.success_threshold:
+                    self.state = "closed"
+                    self.failures = 0
+                    self.successes = 0
             else:
-                if not isinstance(current, dict) or part not in current:
-                    return default
-                current = current[part]
-        return current
-    except Exception:
-        return default
+                self.failures = max(0, self.failures - 1)
+
+    async def record_failure(self) -> None:
+        """Record a failed request (may open the breaker)."""
+        async with self.lock:
+            self.failures += 1
+            if self.state == "half_open":
+                self.state = "open"
+                self.opened_at = time.monotonic()
+                return
+            if self.failures >= self.fail_threshold:
+                self.state = "open"
+                self.opened_at = time.monotonic()
 
-
-def _to_dict(value: Any) -> Dict[str, Any]:
-    """Convert value to dictionary."""
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    if is_dataclass(value):
-        try:
-            return asdict(value)
-        except Exception:
-            return {}
-    if hasattr(value, "model_dump"):
-        try:
-            dumped = value.model_dump()
-            return dict(dumped) if isinstance(dumped, dict) else {}
-        except Exception:
-            pass
-    if hasattr(value, "dict"):
-        try:
-            dumped = value.dict()
-            return dict(dumped) if isinstance(dumped, dict) else {}
-        except Exception:
-            pass
-    if hasattr(value, "__dict__"):
-        try:
-            raw = vars(value)
-            return dict(raw) if isinstance(raw, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
-def _merge_nonempty(base: Optional[Dict[str, Any]], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Merge dicts, preferring non-empty values from patch."""
-    result = dict(base or {})
-    for key, value in (patch or {}).items():
-        if _is_nonempty(value) or key not in result:
-            result[key] = value
-    return result
-
-
-def _merge_prefer_base(base: Optional[Dict[str, Any]], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Merge dicts, preferring non-empty values from base."""
-    result = dict(base or {})
-    for key, value in (patch or {}).items():
-        if not _is_nonempty(result.get(key)) and _is_nonempty(value):
-            result[key] = value
-        elif key not in result:
-            result[key] = value
-    return result
-
-
-def _normalize_timestamp(value: Any) -> Optional[str]:
-    """Normalize timestamp to ISO format."""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        dt = value if value.tzinfo else value.replace(tzinfo=UTC)
-        return dt.astimezone(UTC).isoformat()
-    if isinstance(value, (int, float)):
-        try:
-            return datetime.fromtimestamp(float(value), tz=UTC).isoformat()
-        except Exception:
-            return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
-        return dt.astimezone(UTC).isoformat()
-    except Exception:
-        return text
-
-
-def _version_tuple(value: str) -> Tuple[int, int, int]:
-    """Convert version string to tuple."""
-    nums = re.findall(r"\d+", str(value))
-    parts = [int(x) for x in nums[:3]]
-    while len(parts) < 3:
-        parts.append(0)
-    return (parts[0], parts[1], parts[2])
-
-
-# =============================================================================
-# Symbol Classification
-# =============================================================================
-
-def _symbol_kind(symbol: str) -> str:
-    """Classify symbol type."""
-    sym = _safe_symbol(symbol)
-    if not sym:
-        return "unknown"
-    if sym.endswith("=X"):
-        return "fx"
-    if "-USD" in sym or (sym.endswith("USD") and "=" not in sym and "." not in sym and len(sym) <= 10):
-        return "crypto"
-    if sym.endswith("=F"):
-        return "future"
-    if sym.endswith(".SR"):
-        return "ksa_equity"
-    if any(tag in sym for tag in ("ETF", "VOO", "VTI", "QQQ", "SPY")):
-        return "fund"
-    return "equity"
-
-
-def _fx_display_name(sym: str) -> str:
-    """Get display name for FX pair."""
-    root = sym.replace("=X", "")
-    if len(root) == 6:
-        return f"{root[:3]}/{root[3:]}"
-    if len(root) == 3:
-        return f"{root}/USD"
-    return sym
-
-
-def _identity_defaults_for_symbol(symbol: str) -> Dict[str, Any]:
-    """Get identity defaults for symbol type."""
-    sym = _safe_symbol(symbol)
-    kind = _symbol_kind(sym)
-    defaults: Dict[str, Any] = {
-        "symbol": sym,
-        "symbol_normalized": sym,
-        "requested_symbol": sym,
-        "instrument_type": kind,
-    }
-
-    if kind == "fx":
-        root = sym.replace("=X", "")
-        defaults.update({
-            "name": _fx_display_name(sym),
-            "asset_class": "FX",
-            "exchange": "FX",
-            "currency": root[3:] if len(root) == 6 else "USD",
-            "country": "Global",
-            "sector": "Foreign Exchange",
-            "industry": "Currency Pair",
-        })
-    elif kind == "future":
-        name_map = {
-            "GC=F": "Gold Futures", "SI=F": "Silver Futures", "HG=F": "Copper Futures",
-            "CL=F": "Crude Oil Futures", "BZ=F": "Brent Crude Futures", "NG=F": "Natural Gas Futures",
-        }
-        defaults.update({
-            "name": name_map.get(sym, sym),
-            "asset_class": "Commodity",
-            "exchange": "Futures",
-            "currency": "USD",
-            "country": "Global",
-            "sector": "Commodities",
-            "industry": "Futures Contract",
-        })
-    elif kind == "crypto":
-        defaults.update({
-            "asset_class": "Crypto",
-            "exchange": "Crypto",
-            "country": "Global",
-            "sector": "Digital Assets",
-            "industry": "Cryptocurrency",
-        })
-    elif kind == "ksa_equity":
-        defaults.update({
-            "asset_class": "Equity",
-            "exchange": "Tadawul",
-            "currency": "SAR",
-            "country": "Saudi Arabia",
-        })
-    elif kind == "fund":
-        defaults.update({
-            "asset_class": "Fund",
-            "exchange": "ETF",
-            "country": "Global",
-            "sector": "Funds",
-            "industry": "Exchange Traded Fund",
-        })
-
-    return defaults
-
-
-# =============================================================================
-# History Extraction
-# =============================================================================
-
-def _ensure_history_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure history row has proper types."""
-    result = dict(row)
-    timestamp = _normalize_timestamp(_safe_get(result, "timestamp", "date"))
-    if timestamp:
-        result["timestamp"] = timestamp
-    for key in ("open", "high", "low", "close", "adj_close", "adjclose"):
-        if key in result:
-            result[key] = _coerce_float(result[key])
-    if "volume" in result:
-        result["volume"] = _coerce_int(result["volume"])
-    return result
-
-
-def _rows_from_parallel_arrays(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Extract rows from parallel arrays (chart format)."""
-    timestamps = _deep_get(payload, ["timestamp"], default=None)
-    if not isinstance(timestamps, list):
-        timestamps = _deep_get(payload, ["timestamps"], default=None)
-
-    quotes = _deep_get(payload, ["indicators", "quote", 0], default={})
-    adjclose_block = _deep_get(payload, ["indicators", "adjclose", 0], default={})
-
-    if not isinstance(timestamps, list) or not isinstance(quotes, dict):
-        return []
-
-    opens = quotes.get("open") if isinstance(quotes.get("open"), list) else []
-    highs = quotes.get("high") if isinstance(quotes.get("high"), list) else []
-    lows = quotes.get("low") if isinstance(quotes.get("low"), list) else []
-    closes = quotes.get("close") if isinstance(quotes.get("close"), list) else []
-    vols = quotes.get("volume") if isinstance(quotes.get("volume"), list) else []
-    adjs = adjclose_block.get("adjclose") if isinstance(adjclose_block.get("adjclose"), list) else []
-
-    rows: List[Dict[str, Any]] = []
-    for idx, ts in enumerate(timestamps):
-        row = {
-            "timestamp": _normalize_timestamp(ts),
-            "open": opens[idx] if idx < len(opens) else None,
-            "high": highs[idx] if idx < len(highs) else None,
-            "low": lows[idx] if idx < len(lows) else None,
-            "close": closes[idx] if idx < len(closes) else None,
-            "adj_close": adjs[idx] if idx < len(adjs) else None,
-            "volume": vols[idx] if idx < len(vols) else None,
-        }
-        row = _ensure_history_row(row)
-        if any(_is_nonempty(v) for v in row.values()):
-            rows.append(row)
-    return rows
-
-
-def _rows_from_candle_arrays(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Extract rows from candle arrays."""
-    ts = payload.get("timestamp") or payload.get("timestamps") or payload.get("t") or []
-    opens = payload.get("open") or payload.get("o") or []
-    highs = payload.get("high") or payload.get("h") or []
-    lows = payload.get("low") or payload.get("l") or []
-    closes = payload.get("close") or payload.get("c") or []
-    vols = payload.get("volume") or payload.get("v") or []
-
-    if not isinstance(ts, list):
-        return []
-    if not any(isinstance(x, list) for x in (opens, highs, lows, closes, vols)) and not isinstance(closes, list):
-        return []
-
-    rows: List[Dict[str, Any]] = []
-    for idx, raw_ts in enumerate(ts):
-        row = {
-            "timestamp": _normalize_timestamp(raw_ts),
-            "open": opens[idx] if isinstance(opens, list) and idx < len(opens) else None,
-            "high": highs[idx] if isinstance(highs, list) and idx < len(highs) else None,
-            "low": lows[idx] if isinstance(lows, list) and idx < len(lows) else None,
-            "close": closes[idx] if isinstance(closes, list) and idx < len(closes) else None,
-            "volume": vols[idx] if isinstance(vols, list) and idx < len(vols) else None,
-        }
-        row = _ensure_history_row(row)
-        if any(_is_nonempty(v) for v in row.values()):
-            rows.append(row)
-    return rows
-
-
-def _rows_from_dataframe_like(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Extract rows from pandas DataFrame-like dict."""
-    keys = {k.lower(): k for k in payload.keys()}
-    core_cols = [keys.get(k) for k in ("open", "high", "low", "close")]
-    if not any(core_cols):
-        return []
-
-    # Check if it's a dict of dicts (pandas to_dict() format)
-    if not any(isinstance(payload.get(col), dict) for col in core_cols if col):
-        return []
-
-    # Get index values
-    index_values: List[Any] = []
-    for col in core_cols:
-        if col and isinstance(payload.get(col), dict):
-            index_values = list(payload[col].keys())
-            if index_values:
-                break
-    if not index_values:
-        return []
-
-    rows: List[Dict[str, Any]] = []
-    for idx in index_values:
-        row = {
-            "timestamp": _normalize_timestamp(idx),
-            "open": payload.get(keys.get("open", ""), {}).get(idx) if keys.get("open") else None,
-            "high": payload.get(keys.get("high", ""), {}).get(idx) if keys.get("high") else None,
-            "low": payload.get(keys.get("low", ""), {}).get(idx) if keys.get("low") else None,
-            "close": payload.get(keys.get("close", ""), {}).get(idx) if keys.get("close") else None,
-            "adj_close": payload.get(keys.get("adj_close") or keys.get("adjclose", ""), {}).get(idx) if keys.get("adj_close") or keys.get("adjclose") else None,
-            "volume": payload.get(keys.get("volume", ""), {}).get(idx) if keys.get("volume") else None,
-        }
-        row = _ensure_history_row(row)
-        if any(_is_nonempty(v) for v in row.values()):
-            rows.append(row)
-    return rows
-
-
-def _extract_candidate_dicts(payload_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Extract candidate dicts from nested payload."""
-    candidates: List[Dict[str, Any]] = [payload_dict]
-
-    paths = [
-        ("meta",),
-        ("price",),
-        ("summaryDetail",),
-        ("defaultKeyStatistics",),
-        ("quoteResponse", "result", 0),
-        ("spark", "result", 0, "response", 0, "meta"),
-        ("chart", "result", 0, "meta"),
-        ("chart", "result", 0),
-        ("result", 0),
-        ("response", 0),
-        ("data", 0),
-        ("items", 0),
-        ("records", 0),
-    ]
-    for path in paths:
-        value = _deep_get(payload_dict, path, default=None)
-        value_dict = _to_dict(value)
-        if value_dict:
-            candidates.append(value_dict)
-    return candidates
-
-
-def extract_history_rows(payload: Any) -> List[Dict[str, Any]]:
-    """Extract history rows from various payload formats."""
-    if payload is None:
-        return []
-
-    if isinstance(payload, list):
-        rows: List[Dict[str, Any]] = []
-        for item in payload:
-            if isinstance(item, dict):
-                if any(key in item for key in HISTORY_ROW_KEYS):
-                    rows.append(_ensure_history_row(item))
-                else:
-                    nested = extract_history_rows(item)
-                    if nested:
-                        rows.extend(nested)
-            else:
-                as_dict = _to_dict(item)
-                if as_dict:
-                    rows.extend(extract_history_rows(as_dict))
-        return rows
-
-    payload_dict = _to_dict(payload)
-    if not payload_dict:
-        return []
-
-    if any(key in payload_dict for key in HISTORY_ROW_KEYS):
-        return [_ensure_history_row(payload_dict)]
-
-    for key in ("rows", "history", "prices", "data", "items", "records", "candles", "ohlcv"):
-        nested = payload_dict.get(key)
-        rows = extract_history_rows(nested)
-        if rows:
-            return rows
-
-    dataframe_rows = _rows_from_dataframe_like(payload_dict)
-    if dataframe_rows:
-        return dataframe_rows
-
-    candle_rows = _rows_from_candle_arrays(payload_dict)
-    if candle_rows:
-        return candle_rows
-
-    chart_root = _deep_get(payload_dict, ["chart", "result", 0], default=None)
-    if isinstance(chart_root, dict):
-        rows = _rows_from_parallel_arrays(chart_root)
-        if rows:
-            return rows
-
-    spark_root = _deep_get(payload_dict, ["spark", "result", 0, "response", 0], default=None)
-    if isinstance(spark_root, dict):
-        rows = _rows_from_parallel_arrays(spark_root)
-        if rows:
-            return rows
-
-    for key in ("result", "quoteResponse", "response"):
-        nested = payload_dict.get(key)
-        rows = extract_history_rows(nested)
-        if rows:
-            return rows
-
-    return []
-
-
-def derive_quote_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """Derive quote fields from history rows."""
-    cleaned = [r for r in rows if isinstance(r, dict)]
-    if not cleaned:
-        return {}
-
-    latest = cleaned[-1]
-    previous = cleaned[-2] if len(cleaned) >= 2 else {}
-
-    closes = [_coerce_float(r.get("close")) for r in cleaned]
-    highs = [_coerce_float(r.get("high")) for r in cleaned]
-    lows = [_coerce_float(r.get("low")) for r in cleaned]
-    opens = [_coerce_float(r.get("open")) for r in cleaned]
-    volumes = [_coerce_int(r.get("volume")) for r in cleaned]
-
-    closes_valid = [v for v in closes if v is not None]
-    highs_valid = [v for v in highs if v is not None]
-    lows_valid = [v for v in lows if v is not None]
-    opens_valid = [v for v in opens if v is not None]
-    vols_valid = [v for v in volumes if v is not None]
-
-    current = _coerce_float(_safe_get(latest, "close", "adj_close", "adjclose", "high", "low", "open"))
-    previous_close = _coerce_float(_safe_get(previous, "close", "adj_close", "adjclose"))
-    if previous_close is None and len(closes_valid) >= 2:
-        previous_close = closes_valid[-2]
-
-    latest_open = _coerce_float(latest.get("open"))
-    latest_high = _coerce_float(latest.get("high"))
-    latest_low = _coerce_float(latest.get("low"))
-    latest_volume = _coerce_int(latest.get("volume"))
-
-    result: Dict[str, Any] = {
-        "current_price": current,
-        "price": current,
-        "previous_close": previous_close,
-        "open": latest_open if latest_open is not None else (opens_valid[-1] if opens_valid else None),
-        "day_high": latest_high if latest_high is not None else current,
-        "day_low": latest_low if latest_low is not None else current,
-        "volume": latest_volume,
-        "week_52_high": max(highs_valid) if highs_valid else None,
-        "week_52_low": min(lows_valid) if lows_valid else None,
-        "avg_volume_30d": int(sum(vols_valid[-30:]) / len(vols_valid[-30:])) if vols_valid else None,
-        "avg_volume_10d": int(sum(vols_valid[-10:]) / len(vols_valid[-10:])) if vols_valid else None,
-        "history_points": len(cleaned),
-        "history_last_timestamp": _normalize_timestamp(_safe_get(latest, "timestamp", "date")),
-    }
-
-    # Price change
-    if current is not None and previous_close not in (None, 0):
-        price_change = current - previous_close
-        result["price_change"] = price_change
-        result["percent_change"] = (price_change / previous_close) * 100.0
-
-    # 52-week position
-    if current is not None and highs_valid and lows_valid and max(highs_valid) != min(lows_valid):
-        lo = min(lows_valid)
-        hi = max(highs_valid)
-        result["week_52_position_pct"] = ((current - lo) / (hi - lo)) * 100.0
-
-    # Returns and volatility
-    if len(closes_valid) >= 2:
-        returns: List[float] = []
-        for i in range(1, len(closes_valid)):
-            prev = closes_valid[i - 1]
-            cur = closes_valid[i]
-            if prev not in (None, 0) and cur is not None:
-                returns.append((cur / prev) - 1.0)
-
-        if returns:
-            mean_ret = sum(returns) / len(returns)
-            if len(returns) >= 2:
-                variance = sum((r - mean_ret) ** 2 for r in returns) / max(1, len(returns) - 1)
-                daily_vol = math.sqrt(max(0.0, variance))
-                result["volatility_30d"] = daily_vol * math.sqrt(min(30, len(returns)))
-                result["volatility_90d"] = daily_vol * math.sqrt(min(90, len(returns)))
-
-            # Drawdown
-            if current is not None and closes_valid:
-                peak = closes_valid[0]
-                max_drawdown = 0.0
-                for price in closes_valid:
-                    peak = max(peak, price)
-                    if peak not in (None, 0):
-                        dd = (price / peak) - 1.0
-                        max_drawdown = min(max_drawdown, dd)
-                result["max_drawdown_1y"] = max_drawdown
-
-            # VaR
-            if len(returns) >= 5:
-                downside = sorted(returns)[max(0, int(len(returns) * 0.05) - 1)]
-                result["var_95_1d"] = downside
-
-            # Sharpe
-            if len(returns) >= 5:
-                denom = math.sqrt(sum((r - mean_ret) ** 2 for r in returns) / max(1, len(returns) - 1))
-                if denom > 0:
-                    result["sharpe_1y"] = (mean_ret / denom) * math.sqrt(min(252, len(returns)))
-
-            # RSI
-            if len(closes_valid) >= 15:
-                gains: List[float] = []
-                losses: List[float] = []
-                tail = closes_valid[-15:]
-                for i in range(1, len(tail)):
-                    delta = tail[i] - tail[i - 1]
-                    gains.append(max(delta, 0.0))
-                    losses.append(abs(min(delta, 0.0)))
-                avg_gain = sum(gains) / max(1, len(gains))
-                avg_loss = sum(losses) / max(1, len(losses))
-                if avg_loss == 0 and avg_gain > 0:
-                    result["rsi_14"] = 100.0
-                elif avg_loss > 0:
-                    rs = avg_gain / avg_loss
-                    result["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
-
-    return {k: v for k, v in result.items() if _is_nonempty(v)}
-
-
-def derive_quote_from_chart_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Derive quote from chart payload."""
-    chart_root = _deep_get(payload, ["chart", "result", 0], default=None)
-    if not isinstance(chart_root, dict):
-        chart_root = payload
-
-    meta = chart_root.get("meta") if isinstance(chart_root.get("meta"), dict) else {}
-    rows = _rows_from_parallel_arrays(chart_root)
-    if not rows:
-        rows = _rows_from_candle_arrays(chart_root)
-    derived = derive_quote_from_rows(rows)
-
-    result: Dict[str, Any] = {
-        "current_price": _coerce_float(_safe_get(meta, *PRICE_FIELD_ALIASES)),
-        "price": _coerce_float(_safe_get(meta, *PRICE_FIELD_ALIASES)),
-        "previous_close": _coerce_float(_safe_get(meta, *PREV_CLOSE_ALIASES)),
-        "open": _coerce_float(_safe_get(meta, *OPEN_ALIASES)),
-        "day_high": _coerce_float(_safe_get(meta, *HIGH_ALIASES)),
-        "day_low": _coerce_float(_safe_get(meta, *LOW_ALIASES)),
-        "volume": _coerce_int(_safe_get(meta, *VOLUME_ALIASES)),
-        "exchange": _safe_get(meta, *EXCHANGE_ALIASES),
-        "currency": _safe_get(meta, *CURRENCY_ALIASES),
-        "name": _safe_get(meta, *NAME_ALIASES),
-        "week_52_high": _coerce_float(_safe_get(meta, "fiftyTwoWeekHigh", "fifty_two_week_high", "52w_high")),
-        "week_52_low": _coerce_float(_safe_get(meta, "fiftyTwoWeekLow", "fifty_two_week_low", "52w_low")),
-        "market_state": _safe_get(meta, "marketState", "market_state"),
-        "instrument_type": _safe_get(meta, "instrumentType", "quoteType", "typeDisp"),
-        "exchange_timezone": _safe_get(meta, "exchangeTimezoneName", "timezone"),
-    }
-
-    result = _merge_nonempty(derived, result)
-
-    current = _coerce_float(_safe_get(result, "current_price", "price"))
-    prev = _coerce_float(result.get("previous_close"))
-    if current is not None and prev not in (None, 0):
-        price_change = current - prev
-        result.setdefault("price_change", price_change)
-        result.setdefault("percent_change", (price_change / prev) * 100.0)
-
-    return {k: v for k, v in result.items() if _is_nonempty(v)}
-
-
-def classify_quality(payload: Dict[str, Any]) -> str:
-    """Classify data quality."""
-    nonempty = _nonempty_count(payload)
-    if nonempty >= 22:
-        return DataQuality.EXCELLENT.value
-    if nonempty >= 16:
-        return DataQuality.HIGH.value
-    if nonempty >= 10:
-        return DataQuality.MEDIUM.value
-    if nonempty >= 5:
-        return DataQuality.PARTIAL.value
-    if payload.get("error"):
-        return DataQuality.ERROR.value
-    return DataQuality.LOW.value
-
-
-def normalize_quote_payload(payload: Any, symbol: str) -> Dict[str, Any]:
-    """Normalize quote payload to standard format."""
-    sym = _safe_symbol(symbol)
-    defaults = _identity_defaults_for_symbol(sym)
-
-    if payload is None:
-        return defaults
-
-    payload_dict = _to_dict(payload)
-    if not payload_dict and isinstance(payload, list):
-        rows = extract_history_rows(payload)
-        return _merge_nonempty(defaults, derive_quote_from_rows(rows))
-    if not payload_dict:
-        return defaults
-
-    result = dict(defaults)
-
-    for candidate in _extract_candidate_dicts(payload_dict):
-        for alias in NAME_ALIASES:
-            if _is_nonempty(candidate.get(alias)):
-                result["name"] = candidate.get(alias)
-                break
-        for alias in EXCHANGE_ALIASES:
-            if _is_nonempty(candidate.get(alias)):
-                result["exchange"] = candidate.get(alias)
-                break
-        for alias in CURRENCY_ALIASES:
-            if _is_nonempty(candidate.get(alias)):
-                result["currency"] = candidate.get(alias)
-                break
-
-        result = _merge_nonempty(result, {
-            "current_price": _coerce_float(_safe_get(candidate, *PRICE_FIELD_ALIASES)),
-            "price": _coerce_float(_safe_get(candidate, *PRICE_FIELD_ALIASES)),
-            "previous_close": _coerce_float(_safe_get(candidate, *PREV_CLOSE_ALIASES)),
-            "open": _coerce_float(_safe_get(candidate, *OPEN_ALIASES)),
-            "day_high": _coerce_float(_safe_get(candidate, *HIGH_ALIASES)),
-            "day_low": _coerce_float(_safe_get(candidate, *LOW_ALIASES)),
-            "volume": _coerce_int(_safe_get(candidate, *VOLUME_ALIASES)),
-            "week_52_high": _coerce_float(_safe_get(candidate, "52w_high", "fiftyTwoWeekHigh", "fifty_two_week_high")),
-            "week_52_low": _coerce_float(_safe_get(candidate, "52w_low", "fiftyTwoWeekLow", "fifty_two_week_low")),
-            "market_cap": _coerce_float(_safe_get(candidate, "market_cap", "marketCap")),
-            "beta_5y": _coerce_float(_safe_get(candidate, "beta_5y", "beta", "beta5YMonthly")),
-            "dividend_yield": _coerce_float(_safe_get(candidate, "dividend_yield", "dividendYield")),
-            "long_name": _safe_get(candidate, "longName", "long_name"),
-            "short_name": _safe_get(candidate, "shortName", "short_name"),
-            "market_state": _safe_get(candidate, "market_state", "marketState"),
-            "instrument_type": _safe_get(candidate, "instrumentType", "quoteType", "typeDisp"),
-            "exchange_timezone": _safe_get(candidate, "exchangeTimezoneName", "timezone"),
-        })
-
-    chart_derived = derive_quote_from_chart_payload(payload_dict)
-    history_rows = extract_history_rows(payload_dict)
-    history_derived = derive_quote_from_rows(history_rows)
-
-    result = _merge_nonempty(result, chart_derived)
-    result = _merge_nonempty(result, history_derived)
-
-    # Price change
-    current = _coerce_float(_safe_get(result, "current_price", "price"))
-    prev = _coerce_float(result.get("previous_close"))
-    if current is not None and prev not in (None, 0):
-        price_change = current - prev
-        result["price_change"] = price_change
-        result["percent_change"] = (price_change / prev) * 100.0
-
-    # Warnings
-    warnings: List[str] = []
-    for key in ("warnings", "warning", "notes", "message"):
-        value = payload_dict.get(key)
-        if isinstance(value, list):
-            warnings.extend([str(x) for x in value if _is_nonempty(x)])
-        elif _is_nonempty(value):
-            warnings.append(str(value))
-    if warnings:
-        result["warnings"] = warnings
-
-    return {k: v for k, v in result.items() if _is_nonempty(v) or k in {"symbol", "symbol_normalized", "requested_symbol", "instrument_type"}}
-
-
-def normalize_history_payload(payload: Any, symbol: str) -> List[Dict[str, Any]]:
-    """Normalize history payload to list of rows."""
-    rows = extract_history_rows(payload)
-    if rows:
-        return rows
-
-    # Fallback: create synthetic row from quote
-    sym = _safe_symbol(symbol)
-    quote = normalize_quote_payload(payload, symbol=sym)
-    current = _coerce_float(_safe_get(quote, "current_price", "price"))
-    if current is None:
-        return []
-
-    synthetic = {
-        "timestamp": _utc_iso(),
-        "open": _coerce_float(quote.get("open")),
-        "high": _coerce_float(quote.get("day_high")),
-        "low": _coerce_float(quote.get("day_low")),
-        "close": current,
-        "adj_close": current,
-        "volume": _coerce_int(quote.get("volume")),
-    }
-    return [_ensure_history_row(synthetic)]
-
-
-def normalize_patch_payload(payload: Any, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Normalize patch payload."""
-    patch = normalize_quote_payload(payload, symbol=symbol)
-    merged = _merge_prefer_base(base or {}, patch)
-    if not _is_nonempty(merged.get("current_price")) and not _is_nonempty(merged.get("price")):
-        rows = normalize_history_payload(payload, symbol=symbol)
-        merged = _merge_prefer_base(merged, derive_quote_from_rows(rows))
-    return merged
-
-
-def ensure_shape(
-    payload: Any,
-    symbol: str,
-    provider_version: Optional[str],
-    fn_name: str,
-    result_kind: str,
-) -> Any:
-    """Ensure payload has correct shape."""
-    sym = _safe_symbol(symbol)
-
-    if result_kind == "history":
-        return normalize_history_payload(payload, symbol=sym)
-
-    # Preserve error context from an already-shaped error payload so it
-    # survives the downstream normalize_quote_payload / normalize_patch_payload
-    # calls (which otherwise strip unrecognized top-level keys).  v5.1.0 fix:
-    # without this, a fallback_factory returning ``error_payload(...)`` was
-    # losing the ``error`` / ``status`` fields, causing callers to see
-    # ``status="ok"`` with no error info.
-    incoming_error: Optional[str] = None
-    incoming_status: Optional[str] = None
-    if isinstance(payload, dict):
-        raw_err = payload.get("error")
-        if _is_nonempty(raw_err):
-            incoming_error = str(raw_err)
-        raw_status = payload.get("status")
-        if isinstance(raw_status, str) and raw_status.strip():
-            incoming_status = raw_status.strip()
-
-    if result_kind == "patch":
-        base = None
-        if isinstance(payload, dict):
-            base_candidate = payload.get("base")
-            if isinstance(base_candidate, dict):
-                base = base_candidate
-        result = normalize_patch_payload(payload, symbol=sym, base=base)
-    else:
-        result = normalize_quote_payload(payload, symbol=sym)
-
-    # Restore error context (if any) that was stripped by normalization.
-    if incoming_error is not None:
-        result.setdefault("error", incoming_error)
-    if incoming_status is not None:
-        result.setdefault("status", incoming_status)
-
-    result.setdefault("symbol", sym)
-    result.setdefault("symbol_normalized", sym)
-    result.setdefault("requested_symbol", sym)
-    result.setdefault("data_source", DATA_SOURCE)
-    result.setdefault("provider", DATA_SOURCE)
-    result.setdefault("shim_version", SHIM_VERSION)
-    if provider_version:
-        result.setdefault("provider_version", provider_version)
-    result.setdefault("last_updated_utc", _utc_iso())
-    result.setdefault("last_updated_riyadh", _riyadh_iso())
-
-    if result.get("error"):
-        result.setdefault("status", "error")
-        result["data_quality"] = DataQuality.ERROR.value
-    else:
-        result.setdefault("status", "ok")
-        result.setdefault("data_quality", classify_quality(result))
-
-    result.setdefault("where", fn_name)
-    return result
-
-
-def error_payload(symbol: str, error: str, fn_name: str) -> Dict[str, Any]:
-    """Create error payload."""
-    sym = _safe_symbol(symbol)
-    result = _identity_defaults_for_symbol(sym)
-    result.update({
-        "status": "error",
-        "data_source": DATA_SOURCE,
-        "provider": DATA_SOURCE,
-        "data_quality": DataQuality.ERROR.value,
-        "error": error,
-        "where": fn_name,
-        "shim_version": SHIM_VERSION,
-        "last_updated_utc": _utc_iso(),
-        "last_updated_riyadh": _riyadh_iso(),
-    })
-    return result
-
-
-def _classify_result_kind(method_name: str) -> str:
-    """
-    Map a canonical provider method name to the shape kind expected by
-    ``ensure_shape``.
-
-    Precedence (v5.1.0):
-      1. History-indicating tokens (``history``, ``prices``, ``ohlc``) win
-         -- because methods like ``fetch_history_patch`` return a list of
-         rows even though ``patch`` is in the name.
-      2. ``patch`` -> "patch" (dict merged over a base row).
-      3. Default -> "quote".
-    """
-    name = (method_name or "").lower()
-    if ("history" in name) or ("price_history" in name) or ("ohlc" in name) or name in {"fetch_prices"}:
-        return "history"
-    if "patch" in name:
-        return "patch"
-    return "quote"
-
-
-# =============================================================================
-# Async Primitives
-# =============================================================================
 
 class SingleFlight:
-    """
-    Deduplicate concurrent requests for the same key.
-
-    Semantics:
-      - The FIRST caller for a given key runs ``coro_fn()`` and seeds the
-        result into a shared future.
-      - FOLLOWERS for the same key in flight observe the shared future and
-        await its result without re-running ``coro_fn()``.
-      - The internal lock is held ONLY to look up / install futures. Waits
-        on the shared future happen OUTSIDE the lock so followers for
-        one key do not block leaders for unrelated keys (v5.1.0 fix).
-    """
+    """Deduplicate concurrent requests for the same key."""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._futures: Dict[str, "asyncio.Future[Any]"] = {}
+        self._futures: Dict[str, asyncio.Future] = {}
 
-    async def execute(self, key: str, coro_fn: Callable[[], Awaitable[_T]]) -> _T:
-        """Execute coroutine with deduplication."""
-        existing_future: Optional["asyncio.Future[Any]"] = None
-        new_future: Optional["asyncio.Future[Any]"] = None
-
+    async def run(self, key: str, coro_fn: Callable[[], Awaitable[Any]]) -> Any:
+        """Execute coroutine; concurrent callers for the same key share the result."""
         async with self._lock:
-            found = self._futures.get(key)
-            if found is not None:
-                existing_future = found
-            else:
-                new_future = asyncio.get_running_loop().create_future()
-                self._futures[key] = new_future
+            future = self._futures.get(key)
+            if future is not None:
+                return await future
 
-        # Await OUTSIDE the lock (v5.1.0 fix).
-        if existing_future is not None:
-            return await existing_future  # type: ignore[no-any-return]
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            self._futures[key] = future
 
-        assert new_future is not None
         try:
             result = await coro_fn()
-            if not new_future.done():
-                new_future.set_result(result)
+            if not future.cancelled() and not future.done():
+                future.set_result(result)
             return result
         except Exception as exc:
-            if not new_future.done():
-                new_future.set_exception(exc)
+            if not future.cancelled() and not future.done():
+                future.set_exception(exc)
             raise
         finally:
             async with self._lock:
                 self._futures.pop(key, None)
 
 
-class FullJitterBackoff:
-    """Full jitter backoff for retries."""
-
-    def __init__(self, attempts: int = 2, base: float = 0.4, cap: float = 4.0) -> None:
-        self.attempts = max(0, attempts)
-        self.base = max(0.05, base)
-        self.cap = max(self.base, cap)
-
-    async def run(self, fn: Callable[[], Awaitable[_T]]) -> _T:
-        """Run function with retries."""
-        last_error: Optional[BaseException] = None
-        total_tries = max(1, self.attempts + 1)
-
-        for idx in range(total_tries):
-            try:
-                return await fn()
-            except Exception as exc:
-                last_error = exc
-                if idx >= total_tries - 1:
-                    break
-                delay = min(self.cap, self.base * (2 ** idx))
-                await asyncio.sleep(random.uniform(0.0, delay))
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("retry_exhausted")
-
-
-class CircuitBreaker:
-    """Circuit breaker for provider calls."""
-
-    def __init__(self, threshold: int, timeout_sec: float, half_open_calls: int) -> None:
-        self.threshold = max(1, threshold)
-        self.timeout_sec = max(1.0, timeout_sec)
-        self.half_open_calls = max(1, half_open_calls)
-
-        self._lock = asyncio.Lock()
-        self.state: CircuitState = CircuitState.CLOSED
-        self.failures = 0
-        self.opened_mono: Optional[float] = None
-        self.half_used = 0
-        self.half_success = 0
-
-    async def allow(self) -> None:
-        """Check if request is allowed. Raises CircuitBreakerOpenError when blocked."""
-        async with self._lock:
-            if self.state == CircuitState.CLOSED:
-                return
-
-            if self.state == CircuitState.OPEN:
-                if self.opened_mono is None:
-                    self.opened_mono = time.monotonic()
-                if (time.monotonic() - self.opened_mono) >= self.timeout_sec:
-                    self.state = CircuitState.HALF
-                    self.half_used = 0
-                    self.half_success = 0
-                    return
-                raise CircuitBreakerOpenError("circuit_open")
-
-            if self.state == CircuitState.HALF:
-                if self.half_used >= self.half_open_calls:
-                    raise CircuitBreakerOpenError("circuit_half_open_limit")
-                self.half_used += 1
-
-    async def on_success(self) -> None:
-        """Record success."""
-        async with self._lock:
-            if self.state == CircuitState.HALF:
-                self.half_success += 1
-                if self.half_success >= 2:
-                    self.state = CircuitState.CLOSED
-                    self.failures = 0
-                    self.opened_mono = None
-                    self.half_used = 0
-                    self.half_success = 0
-            else:
-                self.failures = 0
-
-    async def on_failure(self) -> None:
-        """Record failure."""
-        async with self._lock:
-            if self.state == CircuitState.HALF:
-                self.state = CircuitState.OPEN
-                self.opened_mono = time.monotonic()
-                self.failures = self.threshold
-                self.half_used = 0
-                self.half_success = 0
-                return
-
-            self.failures += 1
-            if self.failures >= self.threshold:
-                self.state = CircuitState.OPEN
-                self.opened_mono = time.monotonic()
-
-
-# =============================================================================
-# Provider Cache
-# =============================================================================
-
 @dataclass(slots=True)
-class ProviderInfo:
-    """Information about canonical provider."""
-    module: Any
-    version: str
-    funcs: Dict[str, Callable[..., Any]]
-    available: bool
-    checked_mono: float
-    origin_path: Optional[str] = None
-    error: Optional[str] = None
+class AdvancedCache:
+    """Async TTL cache with size limit (mass eviction on overflow)."""
 
+    name: str
+    ttl_sec: float
+    max_size: int = 5000
+    _data: Dict[str, Tuple[Any, float]] = field(default_factory=dict)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-class ProviderCache:
-    """Cache for canonical provider."""
+    def _make_key(self, symbol: str, kind: str) -> str:
+        return f"{self.name}:{kind}:{symbol}"
 
-    def __init__(self) -> None:
-        self.ttl = _env_float("SHIM_YAHOO_PROVIDER_TTL_SEC", 300.0, lo=10.0, hi=86400.0)
-        self._lock = asyncio.Lock()
-        self._info: Optional[ProviderInfo] = None
-        self._single_flight = SingleFlight()
-        self._circuit_breaker = CircuitBreaker(
-            threshold=_env_int("SHIM_YAHOO_CB_THRESHOLD", 3, lo=1, hi=20),
-            timeout_sec=_env_float("SHIM_YAHOO_CB_TIMEOUT_SEC", 60.0, lo=5.0, hi=600.0),
-            half_open_calls=_env_int("SHIM_YAHOO_CB_HALF_CALLS", 2, lo=1, hi=10),
-        )
+    async def get(self, symbol: str, kind: str = "quote") -> Optional[Any]:
+        """Get value from cache if not expired."""
+        key = self._make_key(symbol, kind)
+        now = time.monotonic()
 
-    def _is_valid(self) -> bool:
-        """Check if cached info is still valid."""
-        return self._info is not None and (time.monotonic() - self._info.checked_mono) < self.ttl
-
-    async def get(self) -> ProviderInfo:
-        """Get provider info."""
         async with self._lock:
-            if self._is_valid():
-                return self._info  # type: ignore[return-value]
+            item = self._data.get(key)
+            if not item:
+                return None
+            value, expires_at = item
+            if now <= expires_at:
+                return value
+            self._data.pop(key, None)
+            return None
 
-        info = await self._single_flight.execute("provider_load", self._load)
+    async def set(
+        self,
+        symbol: str,
+        value: Any,
+        kind: str = "quote",
+        ttl_sec: Optional[float] = None,
+    ) -> None:
+        """Set value in cache with TTL; mass-evicts on overflow."""
+        key = self._make_key(symbol, kind)
+        ttl = ttl_sec if ttl_sec is not None else self.ttl_sec
+        expires_at = time.monotonic() + max(0.5, ttl)
+
         async with self._lock:
-            self._info = info
-        return info
+            if len(self._data) >= self.max_size and key not in self._data:
+                n = max(1, self.max_size // 10)
+                for k in list(self._data.keys())[:n]:
+                    self._data.pop(k, None)
+            self._data[key] = (value, expires_at)
 
-    async def _load(self) -> ProviderInfo:
-        """Load provider info."""
-        async def _do_import() -> ProviderInfo:
-            try:
-                await self._circuit_breaker.allow()
-            except CircuitBreakerOpenError as cb_exc:
-                return ProviderInfo(
-                    module=None,
-                    version="unknown",
-                    funcs={},
-                    available=False,
-                    checked_mono=time.monotonic(),
-                    origin_path=None,
-                    error=str(cb_exc),
-                )
+    async def clear(self) -> None:
+        """Clear cache."""
+        async with self._lock:
+            self._data.clear()
 
-            try:
-                module = None
-                origin_path: Optional[str] = None
-                last_error: Optional[BaseException] = None
-                self_module = sys.modules.get(__name__)
-
-                for path in CANONICAL_IMPORT_PATHS:
-                    try:
-                        candidate = import_module(path)
-                    except Exception as exc:
-                        last_error = exc
-                        continue
-                    # Guard against self-discovery: if the canonical path
-                    # resolves to this very shim (e.g. the shim is deployed
-                    # at a bare name that is also in CANONICAL_IMPORT_PATHS),
-                    # skip it to avoid infinite recursion in dispatch.
-                    if candidate is self_module:
-                        last_error = ImportError(f"self_import:{path}")
-                        continue
-                    module = candidate
-                    origin_path = path
-                    last_error = None
-                    break
-
-                if module is None:
-                    raise ImportError(
-                        f"canonical_missing:"
-                        f"{last_error.__class__.__name__ if last_error else 'unknown'}"
-                    )
-
-                version = str(
-                    getattr(module, "PROVIDER_VERSION", None)
-                    or getattr(module, "VERSION", None)
-                    or getattr(module, "SHIM_VERSION", None)
-                    or "unknown"
-                )
-                if _version_tuple(version) < _version_tuple(MIN_CANONICAL_VERSION):
-                    raise RuntimeError(f"canonical_version_too_old:{version}")
-
-                funcs: Dict[str, Callable[..., Any]] = {}
-                for name in dir(module):
-                    if name.startswith("_"):
-                        continue
-                    try:
-                        obj = getattr(module, name)
-                    except Exception:
-                        continue
-                    if callable(obj):
-                        funcs[name] = obj
-
-                await self._circuit_breaker.on_success()
-                return ProviderInfo(
-                    module=module,
-                    version=version,
-                    funcs=funcs,
-                    available=True,
-                    checked_mono=time.monotonic(),
-                    origin_path=origin_path,
-                    error=None,
-                )
-            except Exception as exc:
-                await self._circuit_breaker.on_failure()
-                return ProviderInfo(
-                    module=None,
-                    version="unknown",
-                    funcs={},
-                    available=False,
-                    checked_mono=time.monotonic(),
-                    origin_path=None,
-                    error=str(exc),
-                )
-
-        return await _do_import()
-
-
-_PROVIDER_CACHE = ProviderCache()
+    async def size(self) -> int:
+        """Get current cache size."""
+        async with self._lock:
+            return len(self._data)
 
 
 # =============================================================================
-# Signature Helpers
+# Technical Indicators (Pure Python with NumPy acceleration)
 # =============================================================================
 
-@lru_cache(maxsize=256)
-def _signature_params(fn: Callable[..., Any]) -> Dict[str, inspect.Parameter]:
-    """Get function signature parameters."""
+def _simple_returns(closes: List[float]) -> List[float]:
+    """Simple returns from close prices."""
+    returns: List[float] = []
+    for i in range(1, len(closes)):
+        prev, curr = closes[i - 1], closes[i]
+        if prev and prev > 0:
+            returns.append((curr / prev) - 1.0)
+    return returns
+
+
+def _log_returns(closes: List[float]) -> List[float]:
+    """Log returns from close prices."""
+    returns: List[float] = []
+    for i in range(1, len(closes)):
+        prev, curr = closes[i - 1], closes[i]
+        if prev and prev > 0 and curr and curr > 0:
+            returns.append(math.log(curr / prev))
+    return returns
+
+
+def _annualized_vol_from_log_returns(log_returns: List[float]) -> Optional[float]:
+    """Annualized volatility from log returns."""
+    if len(log_returns) < 2:
+        return None
     try:
-        return dict(inspect.signature(fn).parameters)
+        if _HAS_NUMPY and np is not None:
+            vol = float(np.std(np.asarray(log_returns, dtype=float), ddof=1) * math.sqrt(252.0))
+            return None if (math.isnan(vol) or math.isinf(vol)) else vol
+        std = statistics.stdev(log_returns)
+        return float(std * math.sqrt(252.0))
     except Exception:
+        return None
+
+
+def _volatility_nd(closes: List[float], days: int) -> Optional[float]:
+    """N-day annualized volatility as a fraction."""
+    if len(closes) < days + 1:
+        return None
+    window = closes[-(days + 1):]
+    return _annualized_vol_from_log_returns(_log_returns(window))
+
+
+def _max_drawdown_1y(closes: List[float]) -> Optional[float]:
+    """Maximum drawdown over ~1 year as a positive fraction."""
+    if len(closes) < 20:
+        return None
+    window = closes[-252:] if len(closes) >= 252 else closes[:]
+    peak: Optional[float] = None
+    max_dd = 0.0
+    for p in window:
+        if p is None or p <= 0:
+            continue
+        if peak is None or p > peak:
+            peak = p
+        if peak and peak > 0:
+            dd = (p / peak) - 1.0
+            if dd < max_dd:
+                max_dd = dd
+    return float(abs(max_dd)) if max_dd < 0 else 0.0
+
+
+def _var_95_1d(closes: List[float]) -> Optional[float]:
+    """95% daily VaR as a positive fraction."""
+    returns = _simple_returns(closes)
+    if len(returns) < 30:
+        return None
+    try:
+        if _HAS_NUMPY and np is not None:
+            q = float(np.quantile(np.asarray(returns, dtype=float), 0.05))
+        else:
+            sorted_returns = sorted(returns)
+            idx = max(0, int(0.05 * (len(sorted_returns) - 1)))
+            q = float(sorted_returns[idx])
+        return float(abs(q)) if q < 0 else 0.0
+    except Exception:
+        return None
+
+
+def _sharpe_1y(closes: List[float]) -> Optional[float]:
+    """Annualized Sharpe ratio (dimensionless)."""
+    returns = _simple_returns(closes)
+    if len(returns) < 60:
+        return None
+    window = returns[-252:] if len(returns) >= 252 else returns[:]
+    if len(window) < 30:
+        return None
+    try:
+        if _HAS_NUMPY and np is not None:
+            arr = np.asarray(window, dtype=float)
+            mu = float(np.mean(arr))
+            sd = float(np.std(arr, ddof=1))
+        else:
+            mu = float(sum(window) / len(window))
+            sd = float(statistics.stdev(window))
+        if sd <= 0 or math.isnan(sd) or math.isinf(sd):
+            return None
+        return float((mu * 252.0) / (sd * math.sqrt(252.0)))
+    except Exception:
+        return None
+
+
+def _rsi_14(closes: List[float]) -> Optional[float]:
+    """RSI(14) with Wilder's smoothing (NumPy-accelerated with pure-Python fallback)."""
+    if len(closes) < 15:
+        return None
+
+    period = 14
+
+    if _HAS_NUMPY and np is not None:
+        try:
+            arr = np.asarray(closes, dtype=float)
+            diff = np.diff(arr)
+            gains = np.where(diff > 0, diff, 0.0)
+            losses = np.where(diff < 0, -diff, 0.0)
+
+            avg_gain = float(gains[:period].mean())
+            avg_loss = float(losses[:period].mean())
+
+            for i in range(period, len(gains)):
+                avg_gain = (avg_gain * (period - 1) + float(gains[i])) / period
+                avg_loss = (avg_loss * (period - 1) + float(losses[i])) / period
+
+            if avg_loss == 0:
+                return 100.0
+            rs = avg_gain / avg_loss
+            return 100.0 - (100.0 / (1.0 + rs))
+        except Exception:
+            pass
+
+    # Pure Python fallback
+    diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0.0 for d in diffs]
+    losses = [-d if d < 0 else 0.0 for d in diffs]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _simple_forecast(
+    closes: List[float],
+    horizon_days: int,
+) -> Tuple[Optional[float], Optional[float], float]:
+    """Simple price forecast via log-linear regression. Returns (price, roi_frac, confidence)."""
+    if len(closes) < 60 or horizon_days <= 0:
+        return None, None, 0.0
+
+    try:
+        n = min(len(closes), 252)
+        y = closes[-n:]
+        if any(p <= 0 for p in y):
+            return None, None, 0.0
+
+        last = float(closes[-1])
+
+        if _HAS_NUMPY and np is not None:
+            arr = np.asarray(y, dtype=float)
+            x = np.arange(len(arr), dtype=float)
+            log_y = np.log(arr)
+            slope, intercept = np.polyfit(x, log_y, 1)
+            pred = slope * x + intercept
+            ss_res = float(np.sum((log_y - pred) ** 2))
+            ss_tot = float(np.sum((log_y - float(np.mean(log_y))) ** 2))
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+            future_x = float(len(arr) - 1 + horizon_days)
+            forecast_price = float(math.exp(float(slope) * future_x + float(intercept)))
+        else:
+            # CAGR-based fallback
+            start, end = y[0], y[-1]
+            years = max(1e-6, len(y) / 252.0)
+            cagr = (end / start) ** (1 / years) - 1
+            forecast_price = end * ((1 + cagr) ** (horizon_days / 252.0))
+            r2 = 0.25
+
+        roi_fraction = (forecast_price / last) - 1.0
+        vol30 = _volatility_nd(closes, 30) or 0.25
+        confidence = max(0.05, min(0.95,
+            (max(0.0, min(1.0, r2)) * 0.8 + 0.2)
+            * (1.0 / (1.0 + max(0.0, vol30 - 0.25)))
+        ))
+        return forecast_price, roi_fraction, confidence
+    except Exception:
+        return None, None, 0.0
+
+
+# =============================================================================
+# Yahoo Finance Sync Fetcher (runs in ThreadPool)
+# =============================================================================
+
+def _safe_history_metadata(ticker: Any) -> Dict[str, Any]:
+    """
+    Safely extract history metadata from a yfinance Ticker.
+
+    yfinance populates `ticker.history_metadata` after `.history()` is called.
+    v7.0.0 had a dead placeholder that always returned {} -- v8.0.0 reads
+    the real attribute, then falls back to the `get_history_metadata()`
+    method if present.
+    """
+    if ticker is None:
         return {}
 
-
-def _adapt_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Adapt kwargs to function signature."""
     try:
-        params = _signature_params(fn)
-        if not params:
-            return dict(kwargs)
-        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-            return dict(kwargs)
-        return {k: v for k, v in kwargs.items() if k in params}
+        meta = getattr(ticker, "history_metadata", None)
+        if isinstance(meta, dict) and meta:
+            return meta
     except Exception:
-        return dict(kwargs)
+        pass
+
+    try:
+        fn = getattr(ticker, "get_history_metadata", None)
+        if callable(fn):
+            meta = fn()
+            if isinstance(meta, dict) and meta:
+                return meta
+    except Exception:
+        pass
+
+    return {}
 
 
-def _coerce_args_for_call(
-    fn: Callable[..., Any],
-    args: Tuple[Any, ...],
-    kwargs: Dict[str, Any],
-) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
-    """Coerce args for function call.
+def _infer_asset_class(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Infer asset class from symbol + info + metadata."""
+    quote_type = None
+    if isinstance(info, dict):
+        quote_type = _safe_str(info.get("quoteType") or info.get("quote_type") or info.get("type"))
+    if quote_type is None and isinstance(meta, dict):
+        quote_type = _safe_str(meta.get("instrumentType") or meta.get("quoteType"))
 
-    Removes kwargs that would collide with positional args to prevent
-    ``TypeError: got multiple values for argument`` from the canonical
-    function.
-    """
-    params = _signature_params(fn)
-    if not params:
-        return args, dict(kwargs)
+    if quote_type:
+        qt_upper = quote_type.upper()
+        if qt_upper in {"CURRENCY", "FOREX", "FX"}:
+            return "FX"
+        if qt_upper in {"ETF", "MUTUALFUND", "MUTUAL FUND"}:
+            return qt_upper
+        return qt_upper
 
-    arg_names = [
-        name for name, p in params.items()
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    result_kwargs = _adapt_kwargs(fn, kwargs)
-
-    # Remove every kwarg that would collide with one of the passed
-    # positional args (v5.1.0: generalized beyond the first two).
-    for idx in range(min(len(args), len(arg_names))):
-        result_kwargs.pop(arg_names[idx], None)
-
-    return args, result_kwargs
-
-
-async def _maybe_await(value: Any) -> Any:
-    """Await if value is awaitable."""
-    if inspect.isawaitable(value):
-        return await value
-    return value
+    s = symbol.upper()
+    if s.endswith(".SR"):
+        return "EQUITY"
+    if s.endswith("=F"):
+        return "FUTURE"
+    if s.endswith("=X"):
+        return "FX"
+    if s.startswith("^"):
+        return "INDEX"
+    return None
 
 
-# =============================================================================
-# Shim Function
-# =============================================================================
-
-class ShimFunction:
-    """Shim function that delegates to canonical provider with fallback."""
-
-    def __init__(
-        self,
-        name: str,
-        canonical_names: Optional[Sequence[str]] = None,
-        fallback_factory: Optional[Callable[..., Any]] = None,
-        result_kind: str = "quote",
-    ) -> None:
-        self.name = name
-        self.canonical_names = tuple(canonical_names or (name,))
-        self.fallback_factory = fallback_factory
-        self.result_kind = result_kind
-        self._backoff = FullJitterBackoff(
-            attempts=_env_int("SHIM_YAHOO_RETRY_ATTEMPTS", 2, lo=0, hi=6),
-            base=_env_float("SHIM_YAHOO_RETRY_BASE_SEC", 0.35, lo=0.05, hi=5.0),
-            cap=_env_float("SHIM_YAHOO_RETRY_CAP_SEC", 3.0, lo=0.2, hi=20.0),
+def _infer_exchange(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Infer exchange from symbol + info + metadata."""
+    if isinstance(info, dict):
+        exchange = _first_str(
+            info.get("exchange"), info.get("fullExchangeName"), info.get("exchangeName"),
         )
+        if exchange:
+            return exchange
+    if isinstance(meta, dict):
+        exchange = _first_str(meta.get("exchangeName"), meta.get("exchangeTimezoneName"))
+        if exchange:
+            return exchange
 
-    async def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Execute shim function."""
-        sym = _safe_symbol(kwargs.get("symbol") or kwargs.get("ticker") or (args[0] if args else ""))
+    s = symbol.upper()
+    if s.endswith(".SR"):
+        return "Tadawul"
+    if s.endswith("=F"):
+        return "NYMEX"
+    if s.endswith("=X"):
+        return "CCY"
+    if s.startswith("^"):
+        return "INDEX"
+    return None
 
-        async def _call_canonical() -> Any:
-            info = await _PROVIDER_CACHE.get()
-            if not info.available:
-                raise RuntimeError(info.error or "canonical_unavailable")
 
-            fn = None
-            for candidate in self.canonical_names:
-                fn = info.funcs.get(candidate)
-                if fn is not None:
-                    break
-            if fn is None:
-                raise AttributeError(f"canonical_missing_fn:{self.canonical_names[0]}")
+def _fetch_ticker_sync(
+    symbol: str,
+    period: str = DEFAULT_HISTORY_PERIOD,
+    interval: str = DEFAULT_HISTORY_INTERVAL,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Blocking fetch of ticker data. Runs in ThreadPoolExecutor.
 
-            call_args, call_kwargs = _coerce_args_for_call(fn, tuple(args), dict(kwargs))
-            result = fn(*call_args, **call_kwargs)
-            result = await _maybe_await(result)
-            return ensure_shape(
-                result,
-                symbol=sym,
-                provider_version=info.version,
-                fn_name=self.name,
-                result_kind=self.result_kind,
-            )
+    v8.0.0 bug fix: `period` and `interval` are now proper parameters.
+    v7.0.0 hardcoded interval="1d" and had the nonsense expression
+      period=_HAS_PANDAS and pd is not None and "YAHOO_HISTORY_PERIOD"
+             in globals() or "2y"
+    which always evaluated to "2y" regardless of config / env var.
 
-        async def _call_fallback() -> Any:
-            if self.fallback_factory is None:
-                raise RuntimeError("fallback_missing")
-            result = self.fallback_factory(*args, **kwargs)
-            result = await _maybe_await(result)
-            return ensure_shape(
-                result,
-                symbol=sym,
-                provider_version=None,
-                fn_name=self.name,
-                result_kind=self.result_kind,
-            )
+    Returns:
+        Tuple of (info_dict, history_metadata, history_list)
+    """
+    if not _HAS_YFINANCE or yf is None:
+        return {}, {}, []
+
+    try:
+        ticker = yf.Ticker(symbol)
+
+        # Info: fast_info first, then full .info
+        info_dict: Dict[str, Any] = {}
+        try:
+            fast_info = getattr(ticker, "fast_info", None)
+            if fast_info:
+                info_dict = dict(fast_info)
+        except Exception:
+            pass
 
         try:
-            result = await self._backoff.run(_call_canonical)
-            return result
-        except Exception as exc:
-            if _env_bool("SHIM_YAHOO_FALLBACK_ON_ERROR", True) and self.fallback_factory is not None:
-                try:
-                    return await self._backoff.run(_call_fallback)
-                except Exception as fallback_exc:
-                    return error_payload(
-                        sym,
-                        f"{exc.__class__.__name__}:{exc}; fallback:"
-                        f"{fallback_exc.__class__.__name__}:{fallback_exc}",
-                        fn_name=self.name,
-                    )
-            return error_payload(sym, f"{exc.__class__.__name__}:{exc}", fn_name=self.name)
+            info = getattr(ticker, "info", None)
+            if isinstance(info, dict):
+                info_dict.update(info)
+        except Exception:
+            pass
+
+        # History (respects config-provided period/interval)
+        history_list: List[Dict[str, Any]] = []
+        try:
+            hist_df = ticker.history(period=period, interval=interval)
+            if (_HAS_PANDAS and pd is not None
+                    and isinstance(hist_df, pd.DataFrame) and not hist_df.empty):
+                hist_df = hist_df.reset_index()
+                for _, row in hist_df.iterrows():
+                    row_dict = row.to_dict()
+                    dt_val = row_dict.get("Date") or row_dict.get("Datetime")
+                    if hasattr(dt_val, "to_pydatetime"):
+                        dt_val = dt_val.to_pydatetime()
+
+                    history_list.append({
+                        "timestamp": _utc_iso(dt_val) if isinstance(dt_val, datetime) else str(dt_val),
+                        "open": _safe_float(row_dict.get("Open")),
+                        "high": _safe_float(row_dict.get("High")),
+                        "low": _safe_float(row_dict.get("Low")),
+                        "close": _safe_float(row_dict.get("Close")),
+                        "volume": _safe_float(row_dict.get("Volume")),
+                    })
+        except Exception:
+            pass
+
+        # v8.0.0: capture history_metadata *after* calling .history() (it's
+        # populated lazily by yfinance). v7.0.0 passed None to the helper
+        # and got {} back every time.
+        meta = _safe_history_metadata(ticker)
+
+        return info_dict, meta, history_list
+    except Exception as exc:
+        logger.warning("Sync fetch failed for %s: %s", symbol, exc)
+        return {}, {}, []
+
+
+def _enrich_data(
+    symbol: str,
+    info: Dict[str, Any],
+    meta: Dict[str, Any],
+    history: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Enrich raw Yahoo data into the canonical patch shape."""
+    # 1. Quote core
+    price = _first_number(
+        info.get("currentPrice"),
+        info.get("regularMarketPrice"),
+        info.get("lastPrice"),
+    )
+    prev_close = _first_number(
+        info.get("previousClose"),
+        info.get("regularMarketPreviousClose"),
+    )
+
+    # Fallback to history when live fields are missing
+    if not price and history:
+        price = history[-1].get("close")
+        if not prev_close and len(history) > 1:
+            prev_close = history[-2].get("close")
+
+    percent_change = None
+    if price and prev_close and prev_close > 0:
+        percent_change = (price / prev_close) - 1.0
+
+    change = None
+    if price and prev_close:
+        change = price - prev_close
+
+    # 2. Volume + market cap
+    volume = _first_number(info.get("volume"), info.get("regularMarketVolume"))
+    if not volume and history:
+        volume = history[-1].get("volume")
+
+    market_cap = _first_number(info.get("marketCap"))
+
+    # 3. 52-week range
+    week_52_high = _first_number(info.get("fiftyTwoWeekHigh"))
+    week_52_low = _first_number(info.get("fiftyTwoWeekLow"))
+
+    if not week_52_high and history:
+        closes_252 = [h["close"] for h in history[-252:] if h.get("close")]
+        if closes_252:
+            week_52_high = max(closes_252)
+            week_52_low = min(closes_252)
+
+    week_52_position = None
+    if price and week_52_high and week_52_low and week_52_high > week_52_low:
+        week_52_position = (price - week_52_low) / (week_52_high - week_52_low)
+
+    # 4. History-derived stats
+    closes_list = [h["close"] for h in history if h.get("close")]
+    volatility_30d = _volatility_nd(closes_list, 30)
+    rsi_14 = _rsi_14(closes_list)
+    max_drawdown_1y = _max_drawdown_1y(closes_list)
+    sharpe_1y = _sharpe_1y(closes_list)
+    var_95_1d = _var_95_1d(closes_list)
+
+    # 5. Forecast
+    forecast_price_12m, expected_roi_12m, forecast_confidence = _simple_forecast(closes_list, 252)
+
+    # 6. Fundamentals (light)
+    dividend_yield = _first_fraction(
+        info.get("dividendYield"),
+        info.get("trailingAnnualDividendYield"),
+    )
+    gross_margin = _first_fraction(info.get("grossMargins"))
+    operating_margin = _first_fraction(info.get("operatingMargins"))
+    profit_margin = _first_fraction(info.get("profitMargins"))
+    roe = _first_fraction(info.get("returnOnEquity"))
+
+    # 7. Valuation
+    pe_ttm = _first_number(info.get("trailingPE"))
+    pb_ratio = _first_number(info.get("priceToBook"))
+    eps_ttm = _first_number(info.get("trailingEps"))
+
+    # 8. Identity (v8.0.0: `meta` is now the REAL ticker metadata, not an
+    # empty placeholder -- so asset class / exchange inference actually
+    # benefits from yfinance's history_metadata field.)
+    asset_class = _infer_asset_class(symbol, info, meta)
+    exchange = _infer_exchange(symbol, info, meta)
+    currency = _first_str(info.get("currency"), info.get("financialCurrency"))
+
+    # v8.0.0 minor: compute open_price once instead of twice
+    open_price = _first_number(info.get("open"), info.get("regularMarketOpen"))
+    day_high = _first_number(info.get("dayHigh"), info.get("regularMarketDayHigh"))
+    day_low = _first_number(info.get("dayLow"), info.get("regularMarketDayLow"))
+
+    # Data quality
+    if price and history:
+        data_quality = "EXCELLENT"
+    elif price:
+        data_quality = "GOOD"
+    else:
+        data_quality = "STALE"
+
+    result = {
+        "symbol": symbol,
+        "symbol_normalized": symbol,
+        "provider": PROVIDER_NAME,
+        "provider_version": PROVIDER_VERSION,
+        "data_source": PROVIDER_NAME,
+        "data_quality": data_quality,
+        "last_updated_utc": _utc_iso(),
+        "last_updated_riyadh": _riyadh_iso(),
+        # Price fields
+        "current_price": price,
+        "price": price,
+        "previous_close": prev_close,
+        "prev_close": prev_close,
+        "price_change": change,
+        "change": change,
+        "percent_change": percent_change,
+        "change_pct": percent_change,
+        "open_price": open_price,
+        "open": open_price,
+        "day_high": day_high,
+        "day_low": day_low,
+        "volume": volume,
+        "market_cap": market_cap,
+        # 52-week
+        "week_52_high": week_52_high,
+        "week_52_low": week_52_low,
+        "week_52_position_pct": week_52_position,
+        # Fundamentals
+        "dividend_yield": dividend_yield,
+        "pe_ttm": pe_ttm,
+        "pb_ratio": pb_ratio,
+        "roe": roe,
+        "eps_ttm": eps_ttm,
+        "gross_margin": gross_margin,
+        "operating_margin": operating_margin,
+        "profit_margin": profit_margin,
+        # Risk metrics
+        "volatility_30d": volatility_30d,
+        "rsi_14": rsi_14,
+        "max_drawdown_1y": max_drawdown_1y,
+        "sharpe_1y": sharpe_1y,
+        "var_95_1d": var_95_1d,
+        # Forecast
+        "forecast_price_12m": forecast_price_12m,
+        "expected_roi_12m": expected_roi_12m,
+        "forecast_confidence": forecast_confidence,
+        # Identity
+        "currency": currency,
+        "asset_class": asset_class,
+        "exchange": exchange,
+    }
+
+    return clean_dict(result)
 
 
 # =============================================================================
-# Public Shim Callables
-# =============================================================================
-
-fetch_quote = ShimFunction(
-    "fetch_quote",
-    canonical_names=("fetch_quote", "get_quote", "yahoo_chart_quote"),
-    fallback_factory=lambda symbol, *args, **kwargs: error_payload(symbol, "canonical_unavailable", "fetch_quote"),
-    result_kind="quote",
-)
-
-get_quote = ShimFunction(
-    "get_quote",
-    canonical_names=("get_quote", "fetch_quote", "yahoo_chart_quote"),
-    fallback_factory=lambda symbol, *args, **kwargs: error_payload(symbol, "canonical_unavailable", "get_quote"),
-    result_kind="quote",
-)
-
-yahoo_chart_quote = ShimFunction(
-    "yahoo_chart_quote",
-    canonical_names=("yahoo_chart_quote", "fetch_quote", "get_quote"),
-    fallback_factory=lambda symbol, *args, **kwargs: error_payload(symbol, "canonical_unavailable", "yahoo_chart_quote"),
-    result_kind="quote",
-)
-
-get_quote_patch = ShimFunction(
-    "get_quote_patch",
-    canonical_names=("get_quote_patch", "fetch_quote_patch", "fetch_enriched_quote_patch", "fetch_quote"),
-    fallback_factory=lambda symbol, base=None, *args, **kwargs: error_payload(symbol, "canonical_unavailable", "get_quote_patch"),
-    result_kind="patch",
-)
-
-fetch_quote_patch = ShimFunction(
-    "fetch_quote_patch",
-    canonical_names=("fetch_quote_patch", "get_quote_patch", "fetch_enriched_quote_patch", "fetch_quote"),
-    fallback_factory=lambda symbol, base=None, *args, **kwargs: error_payload(symbol, "canonical_unavailable", "fetch_quote_patch"),
-    result_kind="patch",
-)
-
-fetch_enriched_quote_patch = ShimFunction(
-    "fetch_enriched_quote_patch",
-    canonical_names=("fetch_enriched_quote_patch", "fetch_quote_patch", "get_quote_patch", "fetch_quote"),
-    fallback_factory=lambda symbol, base=None, *args, **kwargs: error_payload(symbol, "canonical_unavailable", "fetch_enriched_quote_patch"),
-    result_kind="patch",
-)
-
-fetch_quote_and_enrichment_patch = ShimFunction(
-    "fetch_quote_and_enrichment_patch",
-    canonical_names=("fetch_quote_and_enrichment_patch", "fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_quote"),
-    fallback_factory=lambda symbol, base=None, *args, **kwargs: error_payload(symbol, "canonical_unavailable", "fetch_quote_and_enrichment_patch"),
-    result_kind="patch",
-)
-
-fetch_quote_and_fundamentals_patch = ShimFunction(
-    "fetch_quote_and_fundamentals_patch",
-    canonical_names=("fetch_quote_and_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_quote"),
-    fallback_factory=lambda symbol, base=None, *args, **kwargs: error_payload(symbol, "canonical_unavailable", "fetch_quote_and_fundamentals_patch"),
-    result_kind="patch",
-)
-
-fetch_price_history = ShimFunction(
-    "fetch_price_history",
-    canonical_names=("fetch_price_history", "fetch_history", "fetch_ohlc_history", "fetch_prices"),
-    fallback_factory=lambda *args, **kwargs: [],
-    result_kind="history",
-)
-
-fetch_history = ShimFunction(
-    "fetch_history",
-    canonical_names=("fetch_history", "fetch_price_history", "fetch_ohlc_history", "fetch_prices"),
-    fallback_factory=lambda *args, **kwargs: [],
-    result_kind="history",
-)
-
-fetch_ohlc_history = ShimFunction(
-    "fetch_ohlc_history",
-    canonical_names=("fetch_ohlc_history", "fetch_history", "fetch_price_history", "fetch_prices"),
-    fallback_factory=lambda *args, **kwargs: [],
-    result_kind="history",
-)
-
-fetch_history_patch = ShimFunction(
-    "fetch_history_patch",
-    canonical_names=("fetch_history_patch", "fetch_history", "fetch_price_history", "fetch_ohlc_history"),
-    fallback_factory=lambda *args, **kwargs: [],
-    result_kind="history",
-)
-
-fetch_prices = ShimFunction(
-    "fetch_prices",
-    canonical_names=("fetch_prices", "fetch_history", "fetch_price_history", "fetch_ohlc_history"),
-    fallback_factory=lambda *args, **kwargs: [],
-    result_kind="history",
-)
-
-
-# =============================================================================
-# Class Compatibility Wrapper
+# Yahoo Chart Provider (async wrapper)
 # =============================================================================
 
 class YahooChartProvider:
-    """Backward-compatible provider class."""
+    """Async wrapper for Yahoo Finance."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self._args = args
-        self._kwargs = kwargs
-        self._inner: Any = None
-        self._lock = asyncio.Lock()
+    def __init__(self, config: Optional[YahooConfig] = None):
+        self.config = config or YahooConfig.from_env()
+        self._token_bucket = TokenBucket(
+            rate_per_sec=self.config.rate_limit_per_sec,
+            burst=self.config.rate_limit_burst,
+        )
+        self._circuit_breaker = CircuitBreaker(
+            fail_threshold=self.config.cb_fail_threshold,
+            cooldown_sec=self.config.cb_cooldown_sec,
+            success_threshold=self.config.cb_success_threshold,
+        )
+        self._single_flight = SingleFlight()
+        self._cache = AdvancedCache(
+            name="yahoo",
+            ttl_sec=self.config.quote_ttl_sec,
+            max_size=5000,
+        )
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.config.threadpool_workers,
+            thread_name_prefix="YahooWorker",
+        )
 
-    async def _ensure_inner(self) -> None:
-        """Ensure inner provider is initialized."""
-        if self._inner is not None:
-            return
-        async with self._lock:
-            if self._inner is not None:
-                return
-            info = await _PROVIDER_CACHE.get()
-            if info.available and hasattr(info.module, "YahooChartProvider"):
-                try:
-                    self._inner = info.module.YahooChartProvider(*self._args, **self._kwargs)
-                except Exception:
-                    self._inner = None
+    async def get_enriched_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get an enriched quote for a single symbol."""
+        if not self.config.is_available or not symbol:
+            return None
 
-    async def __aenter__(self) -> "YahooChartProvider":
-        await self._ensure_inner()
-        return self
+        sym = normalize_symbol(symbol)
+        # v8.0.0: early-return on empty normalized symbol, avoiding a pointless cache lookup
+        if not sym:
+            return None
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        await self.aclose()
+        cached = await self._cache.get(sym, kind="enriched")
+        metrics = _get_metrics()
+        if cached:
+            metrics.cache_hits_total.labels(symbol=sym).inc()
+            return cached
 
-    async def aclose(self) -> None:
-        """Close provider."""
-        await self._ensure_inner()
-        if self._inner is not None and hasattr(self._inner, "aclose"):
+        metrics.cache_misses_total.labels(symbol=sym).inc()
+
+        if not await self._circuit_breaker.allow():
+            return None
+
+        await self._token_bucket.acquire()
+
+        async def _do_fetch() -> Optional[Dict[str, Any]]:
+            loop = asyncio.get_running_loop()
+            start_time = time.monotonic()
+
             try:
-                value = self._inner.aclose()
-                if inspect.isawaitable(value):
-                    await value
-            except Exception:
-                pass
-        self._inner = None
+                # v8.0.0: pass config-provided period/interval to the worker.
+                info, meta, history = await loop.run_in_executor(
+                    self._executor,
+                    _fetch_ticker_sync,
+                    sym,
+                    self.config.history_period,
+                    self.config.history_interval,
+                )
 
-    async def _dispatch(
+                if not info and not history:
+                    await self._circuit_breaker.record_failure()
+                    metrics.requests_total.labels(symbol=sym, op="enriched", status="error").inc()
+                    return None
+
+                result = _enrich_data(sym, info, meta, history)
+
+                await self._circuit_breaker.record_success()
+                metrics.requests_total.labels(symbol=sym, op="enriched", status="ok").inc()
+                metrics.request_duration.labels(symbol=sym, op="enriched").observe(
+                    time.monotonic() - start_time
+                )
+
+                if result.get("current_price"):
+                    await self._cache.set(sym, result, kind="enriched")
+
+                return result
+            except Exception as exc:
+                await self._circuit_breaker.record_failure()
+                metrics.requests_total.labels(symbol=sym, op="enriched", status="error").inc()
+                logger.error("Error fetching %s: %s", sym, exc)
+                return None
+
+        return await self._single_flight.run(f"enriched:{sym}", _do_fetch)
+
+    async def get_enriched_quotes_batch(
         self,
-        method_names: Sequence[str],
-        shim_fn: Callable[..., Awaitable[Any]],
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        """Dispatch to inner provider or shim.
+        symbols: List[str],
+        concurrency: Optional[int] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batch fetch enriched quotes for multiple symbols."""
+        if not symbols:
+            return {}
 
-        v5.1.0 fix: result-kind classification now uses
-        :func:`_classify_result_kind` so that history-indicating tokens
-        take precedence over ``patch`` in the method name (e.g.
-        ``fetch_history_patch`` is classified as "history", matching its
-        ``ShimFunction`` declaration).
+        semaphore = asyncio.Semaphore(concurrency or self.config.max_concurrency)
+
+        async def _fetch_one(sym: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+            async with semaphore:
+                result = await self.get_enriched_quote(sym)
+                return sym, result
+
+        results = await asyncio.gather(
+            *(_fetch_one(sym) for sym in symbols if sym),
+            return_exceptions=True,
+        )
+
+        output: Dict[str, Dict[str, Any]] = {}
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            sym, data = result
+            if data:
+                output[sym] = data
+        return output
+
+    async def fetch_history_raw(
+        self,
+        symbol: str,
+        period: str = "1mo",
+        interval: str = "1d",
+    ) -> List[Dict[str, Any]]:
         """
-        await self._ensure_inner()
-        if self._inner is not None:
-            for method_name in method_names:
-                if hasattr(self._inner, method_name):
-                    try:
-                        method = getattr(self._inner, method_name)
-                        call_args, call_kwargs = _coerce_args_for_call(
-                            method, tuple(args), dict(kwargs)
-                        )
-                        value = method(*call_args, **call_kwargs)
-                        value = await _maybe_await(value)
-                        symbol = _safe_symbol(
-                            kwargs.get("symbol")
-                            or kwargs.get("ticker")
-                            or (args[0] if args else "")
-                        )
-                        kind = _classify_result_kind(method_name)
-                        return ensure_shape(
-                            value,
-                            symbol=symbol,
-                            provider_version=None,
-                            fn_name=method_name,
-                            result_kind=kind,
-                        )
-                    except Exception:
-                        continue
-        return await shim_fn(*args, **kwargs)
+        Fetch raw history rows for a symbol.
 
-    async def fetch_quote(self, symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self._dispatch(("fetch_quote", "get_quote"), fetch_quote, symbol, *args, **kwargs)
+        v8.0.0: this runs on the provider's SHARED executor instead of
+        allocating a fresh ThreadPoolExecutor per call (v7.0.0 leaked threads).
+        """
+        if not _HAS_YFINANCE or yf is None:
+            return []
 
-    async def get_quote(self, symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self._dispatch(("get_quote", "fetch_quote"), get_quote, symbol, *args, **kwargs)
+        sym = normalize_symbol(symbol)
+        if not sym:
+            return []
 
-    async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self._dispatch(("get_quote_patch", "fetch_quote_patch", "fetch_enriched_quote_patch"), get_quote_patch, symbol, base, *args, **kwargs)
+        def _sync_fetch() -> List[Dict[str, Any]]:
+            try:
+                ticker = yf.Ticker(sym)
+                df = ticker.history(period=period, interval=interval)
+                if not _HAS_PANDAS or pd is None or df is None or df.empty:
+                    return []
+                df = df.reset_index()
+                rows: List[Dict[str, Any]] = []
+                for _, row in df.iterrows():
+                    row_dict = row.to_dict()
+                    dt_val = row_dict.get("Date") or row_dict.get("Datetime")
+                    ts = _utc_iso(dt_val) if hasattr(dt_val, "to_pydatetime") else str(dt_val)
+                    rows.append({
+                        "timestamp": ts,
+                        "open": _safe_float(row_dict.get("Open")),
+                        "high": _safe_float(row_dict.get("High")),
+                        "low": _safe_float(row_dict.get("Low")),
+                        "close": _safe_float(row_dict.get("Close")),
+                        "volume": _safe_float(row_dict.get("Volume")),
+                    })
+                return rows
+            except Exception as exc:
+                logger.warning("History fetch failed for %s: %s", sym, exc)
+                return []
 
-    async def fetch_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self._dispatch(("fetch_quote_patch", "get_quote_patch", "fetch_enriched_quote_patch"), fetch_quote_patch, symbol, base, *args, **kwargs)
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._executor, _sync_fetch)
+        except Exception as exc:
+            logger.warning("History executor failed for %s: %s", sym, exc)
+            return []
 
-    async def fetch_enriched_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self._dispatch(("fetch_enriched_quote_patch", "fetch_quote_patch", "get_quote_patch"), fetch_enriched_quote_patch, symbol, base, *args, **kwargs)
-
-    async def fetch_quote_and_enrichment_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self._dispatch(("fetch_quote_and_enrichment_patch", "fetch_enriched_quote_patch", "fetch_quote_patch"), fetch_quote_and_enrichment_patch, symbol, base, *args, **kwargs)
-
-    async def fetch_quote_and_fundamentals_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self._dispatch(("fetch_quote_and_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_quote_patch"), fetch_quote_and_fundamentals_patch, symbol, base, *args, **kwargs)
-
-    async def fetch_price_history(self, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
-        return await self._dispatch(("fetch_price_history", "fetch_history", "fetch_ohlc_history", "fetch_prices"), fetch_price_history, *args, **kwargs)
-
-    async def fetch_history(self, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
-        return await self._dispatch(("fetch_history", "fetch_price_history", "fetch_ohlc_history", "fetch_prices"), fetch_history, *args, **kwargs)
-
-    async def fetch_ohlc_history(self, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
-        return await self._dispatch(("fetch_ohlc_history", "fetch_history", "fetch_price_history", "fetch_prices"), fetch_ohlc_history, *args, **kwargs)
-
-    async def fetch_history_patch(self, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
-        return await self._dispatch(("fetch_history_patch", "fetch_history", "fetch_price_history", "fetch_ohlc_history"), fetch_history_patch, *args, **kwargs)
-
-    async def fetch_prices(self, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
-        return await self._dispatch(("fetch_prices", "fetch_history", "fetch_price_history", "fetch_ohlc_history"), fetch_prices, *args, **kwargs)
+    async def close(self) -> None:
+        """Close the provider and shut down the thread pool."""
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception as exc:
+            logger.debug("yahoo provider close failed: %s", exc)
 
 
 # =============================================================================
-# Utilities
+# Singleton Instance (lazy lock)
 # =============================================================================
 
-async def get_provider_status() -> Dict[str, Any]:
-    """Get provider status."""
-    info = await _PROVIDER_CACHE.get()
-    return {
-        "shim_version": SHIM_VERSION,
-        "provider_version": PROVIDER_VERSION,
-        "data_source": DATA_SOURCE,
-        "canonical_available": info.available,
-        "canonical_version": info.version if info.available else None,
-        "canonical_origin_path": info.origin_path if info.available else None,
-        "canonical_error": info.error if not info.available else None,
-        "ttl_sec": _PROVIDER_CACHE.ttl,
-        "timestamp_utc": _utc_iso(),
-        "timestamp_riyadh": _riyadh_iso(),
-    }
+_PROVIDER_INSTANCE: Optional[YahooChartProvider] = None
+_PROVIDER_LOCK: Optional[asyncio.Lock] = None
 
 
-async def clear_cache() -> None:
-    """Clear provider cache.
+def _get_provider_lock() -> asyncio.Lock:
+    global _PROVIDER_LOCK
+    if _PROVIDER_LOCK is None:
+        _PROVIDER_LOCK = asyncio.Lock()
+    return _PROVIDER_LOCK
 
-    Kept ``async`` for API compatibility with callers written against
-    v5.0.0 (even though the implementation is synchronous, since
-    rebinding a module-level name is not an async operation).
+
+async def get_provider() -> YahooChartProvider:
+    """Get the singleton YahooChartProvider instance."""
+    global _PROVIDER_INSTANCE
+    if _PROVIDER_INSTANCE is not None:
+        return _PROVIDER_INSTANCE
+    async with _get_provider_lock():
+        if _PROVIDER_INSTANCE is None:
+            _PROVIDER_INSTANCE = YahooChartProvider()
+    return _PROVIDER_INSTANCE
+
+
+async def close_provider() -> None:
+    """Close and reset the singleton provider."""
+    global _PROVIDER_INSTANCE
+    if _PROVIDER_INSTANCE is not None:
+        await _PROVIDER_INSTANCE.close()
+        _PROVIDER_INSTANCE = None
+
+
+# =============================================================================
+# Engine-Facing Functions
+# =============================================================================
+
+async def fetch_enriched_quote(symbol: str) -> Optional[Dict[str, Any]]:
+    """Fetch enriched quote for a symbol."""
+    provider = await get_provider()
+    return await provider.get_enriched_quote(symbol)
+
+
+async def fetch_enriched_quotes_batch(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Batch fetch enriched quotes for multiple symbols."""
+    provider = await get_provider()
+    return await provider.get_enriched_quotes_batch(symbols)
+
+
+async def fetch_quote(symbol: str) -> Optional[Dict[str, Any]]:
+    """Alias for fetch_enriched_quote."""
+    return await fetch_enriched_quote(symbol)
+
+
+async def fetch_history(
+    symbol: str,
+    period: str = "1mo",
+    interval: str = "1d",
+) -> List[Dict[str, Any]]:
     """
-    global _PROVIDER_CACHE
-    _PROVIDER_CACHE = ProviderCache()
+    Fetch raw history for a symbol.
 
-
-def get_version() -> str:
-    """Get shim version."""
-    return SHIM_VERSION
+    v8.0.0: delegates to the provider's shared ThreadPoolExecutor, so
+    repeated calls no longer leak a fresh executor per invocation.
+    """
+    provider = await get_provider()
+    return await provider.fetch_history_raw(symbol, period=period, interval=interval)
 
 
 # =============================================================================
@@ -1867,26 +1712,25 @@ def get_version() -> str:
 # =============================================================================
 
 __all__ = [
-    "SHIM_VERSION",
-    "VERSION",
+    # Metadata
+    "PROVIDER_NAME",
     "PROVIDER_VERSION",
-    "DATA_SOURCE",
-    "DataQuality",
+    "VERSION",
+    "PROVIDER_BATCH_SUPPORTED",
+    # Classes
     "YahooChartProvider",
+    "YahooConfig",
+    # Singletons
+    "get_provider",
+    "close_provider",
+    # Engine-facing
+    "fetch_enriched_quote",
+    "fetch_enriched_quotes_batch",
     "fetch_quote",
-    "get_quote",
-    "get_quote_patch",
-    "fetch_quote_patch",
-    "fetch_enriched_quote_patch",
-    "fetch_quote_and_enrichment_patch",
-    "fetch_quote_and_fundamentals_patch",
-    "yahoo_chart_quote",
-    "fetch_price_history",
     "fetch_history",
-    "fetch_ohlc_history",
-    "fetch_history_patch",
-    "fetch_prices",
-    "get_provider_status",
-    "clear_cache",
-    "get_version",
+    # Symbol helper
+    "normalize_symbol",
+    # Exceptions (kept for defensive back-compat even though unraised internally)
+    "YahooProviderError",
+    "YahooFetchError",
 ]
