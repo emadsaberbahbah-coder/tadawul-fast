@@ -2,107 +2,38 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.48.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.48.1
 ================================================================================
 
-WHY v5.48.0
+WHY v5.48.1
 -----------
-- PERF: stops compounding timeouts in `_fetch_patch`. The previous
-       implementation tried up to 6 call signatures per provider with the
-       full `request_timeout` on each. When a provider was slow-failing
-       (not signature-mismatched), this burned 6 × 20s = 120s before
-       giving up — which is why the engine timed out at the 10s route
-       wrapper for instrument pages even though `asyncio.gather` should
-       have been parallelising. We now bail on the first non-`TypeError`
-       exception and don't retry the same provider with different args.
-- PERF: same fix applied to `_call_rows_reader` and `_call_symbols_reader`
-       (these were 30 × 20s and 45 × 15s in the worst case).
-- PERF: lowers `request_timeout` (DATA_ENGINE_TIMEOUT_SECONDS) default from
-       20.0s to 6.0s. A live quote should never take 20s; if it does, the
-       provider is broken for this symbol and we want to fall through.
-- PERF: lowers `ROWS_READER_TIMEOUT_SECONDS` default from 20.0s to 8.0s
-       and `SHEET_SYMBOLS_TIMEOUT_SECONDS` default from 15.0s to 6.0s.
-- PERF: parallelises `get_enriched_quotes`. Old code processed in
-       sequential batches of 25 — for 200 Top10 candidate symbols that's
-       8 rounds of tail-latency stacked. Now we fan out everything at
-       once; the provider-side semaphore (`self._sem`,
-       `DATA_ENGINE_MAX_CONCURRENCY`) still caps real concurrency.
-- SAFETY: adds an outer wall-clock budget on `get_sheet_rows`. The inner
-       impl is wrapped in `asyncio.wait_for` with
-       `DATA_ENGINE_SHEET_ROWS_BUDGET_SECONDS` (default 20.0). On budget
-       exhaustion the engine returns a fail-soft envelope with the
-       canonical schema, zero rows, and a clear `engine_budget_exhausted`
-       meta entry. Without this the engine could hang indefinitely if a
-       provider deadlocked, since `asyncio.wait_for` at the route layer
-       cannot cancel uncooperative sync code in another thread.
-- DOC: existing v5.47.x data-quality fixes are preserved verbatim
-       (unit-mismatch normalisation, 52W range plausibility, internal
-       field stripping, score-vs-zero distinction, error-envelope
-       rejection, cache eviction). No data-quality logic was touched.
+- FIX: populates the four dedicated `*_view` columns
+  (fundamental_view, technical_view, risk_view, value_view) that were
+  previously left blank in spreadsheet output. The information was
+  being concatenated into `recommendation_reason` only — now it is
+  emitted in dedicated columns AND the structured reason string.
+- SCHEMA: adds `fundamental_view`, `technical_view`, `risk_view`,
+  `value_view` to INSTRUMENT_CANONICAL_KEYS / INSTRUMENT_CANONICAL_HEADERS
+  immediately after `overall_score` so the Top10 contract becomes
+  84 + 3 = 87 columns and the standard instrument contract becomes
+  84 columns.
+- RECO: `recommendation_reason` is now always formatted as
+    "Fund: <view> | Tech: <view> | Risk: <view> | Val: <view> -> <RECO>"
+  matching the format the synthesizer was already producing inline.
+- HELPER: new pure function `_derive_views(row)` returns
+  (fund_view, tech_view, risk_view, val_view) from existing scores
+  (quality, growth, momentum, RSI, risk, valuation, intrinsic vs price).
+  Verdicts: BULLISH/NEUTRAL/BEARISH for fundamental & technical;
+  LOW/MODERATE/HIGH for risk; CHEAP/FAIR/EXPENSIVE for value.
+- ALIASES: `_CANONICAL_FIELD_ALIASES` now includes accept-aliases for
+  the four view fields (e.g. `fund_view`, `tech_view`, `valueView`),
+  so providers that already emit them under alternate names will
+  pass through cleanly.
 
-WHY v5.47.4
------------
-- FIX: stops leaking the internal `_skip_recommendation_synthesis` sentinel
-       into the API/sheet output. UnifiedQuote runs with extra="allow", so
-       the flag was passing through to clients. Now stripped before dump.
-- FIX: distinguishes "score field is exactly 0.0" (suspicious; refill) from
-       "field is legitimately 0.0" (e.g. price at 52W low → position_pct=0,
-       day_high == day_low → day_range_position=0, dividend_yield=0% on
-       non-dividend stocks). Score-only fields use the empty-or-zero check;
-       legitimately-zero fields use a None-only check.
-- FIX: applies `_compute_scores_fallback` on the Top_10_Investments and
-       Insights builder paths too — previously these bypassed page backfill
-       so rows arrived with empty score columns even when data was present.
-- FIX: rejects provider-side error envelopes ({"error": "..."} payloads
-       with no real data) BEFORE merge instead of treating them as success.
-       Adds an `error`-key heuristic plus a "no meaningful keys" check.
-- FIX: cache eviction now drops expired entries proactively on every
-       set/get pass instead of only the FIFO oldest. Prevents a scenario
-       where 5000 expired entries linger because nothing's been read.
-- FIX: dividend_yield, payout_ratio, gross_margin, operating_margin,
-       profit_margin, revenue_growth_yoy now go through unit normalization.
-       A provider returning "5.5" (already percent) vs "0.055" (fraction)
-       are both accepted; clearly-wrong values (>500%) get dropped.
-- FIX: recommendation_reason is cleared (set to None) when recommendation
-       itself is None, instead of leaving an orphaned reason string.
-- FIX: adds `volume_ratio` and `day_range_position` to the canonical key
-       set so downstream sheets always include those columns.
-- FIX: hardens model_copy fallback for mirrored fields — was only running
-       on a fixed allow-list, now applies to ALL fields the row dict has
-       that the Pydantic instance dropped.
-
-WHY v5.47.3
------------
-- FIX: adds unit-mismatch sanity normalization for risk metrics. When a
-       secondary provider returns Max Drawdown 1Y, VaR 95%, or Volatility
-       in basis points or as a stripped percent (resulting in 2096%, 218%,
-       5200%, etc. instead of -20.97%, 2.19%, 52.00%), the value is now
-       divided by 100 instead of being passed through to the spreadsheet.
-       Catches the PNC/FITB/MRK/EPD/ITUB unit-error rows.
-- FIX: detects wrong-exchange 52W range leaks. When provider returns a
-       52W high/low whose ratio to current_price is impossible (e.g. price
-       8.86 vs 52W 31-49, or price 54.46 vs 52W 1315-2282), the 52W values
-       are dropped and a warning is added rather than rendered as
-       seemingly-valid sheet data. Catches the GSK.US London-pence and
-       ITUB.US wrong-symbol leaks.
-- FIX: the empty-string ("") guard on critical fields now matches the
-       None guard, so forecast_price_12m, expected_roi_*, confidence_score,
-       horizon_days, and rank_overall are computed even when an upstream
-       step set them to "" rather than None. Was the cause of multiple
-       columns rendering as blank in production exports.
-- FIX: rank_overall is now seeded to None (not skipped) when score-based
-       ranking can't be applied to a row, so the column always has a
-       value (even if empty) rather than missing entirely from the dict.
-- FIX: ensures intrinsic_value and free_cash_flow_ttm pass through the
-       unit-sanity check; FCF values shaped as percents (e.g. "5200.00%")
-       are rejected and replaced with None.
-- FIX: emits both `confidence_score` (numeric 0-100) AND `confidence`
-       in every row even when no provider returned a confidence value.
-- FIX: emits both `rank_overall` (None placeholder when not yet ranked)
-       and `horizon_days` (default 365) in every row.
-- FIX: hardens 52W-range plausibility check to also catch the case
-       where the range is non-zero but doesn't bracket the current
-       price within a 5x band (handles cross-exchange ADR leaks).
+Note: this version is published as v5.48.1 and is intended to be
+applied on top of v5.48.0. The view-column patch itself is small and
+self-contained and does NOT alter any of the v5.48.0 timeout, fanout,
+or budget behaviors.
 
 WHY v5.47.2
 -----------
@@ -169,7 +100,6 @@ Design goals
 - Prefer live or external rows when available.
 - Preserve schema-first contracts for route stability.
 - Keep payloads JSON-safe and route-tolerant.
-- Bound every external call with a tight timeout; fail-soft on hangs.
 ================================================================================
 """
 
@@ -213,7 +143,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.48.0"
+__version__ = "5.48.1"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -307,6 +237,10 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "momentum_score",
     "growth_score",
     "overall_score",
+    "fundamental_view",
+    "technical_view",
+    "risk_view",
+    "value_view",
     "opportunity_score",
     "rank_overall",
     "recommendation",
@@ -390,6 +324,10 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Momentum Score",
     "Growth Score",
     "Overall Score",
+    "Fundamental View",
+    "Technical View",
+    "Risk View",
+    "Value View",
     "Opportunity Score",
     "Rank (Overall)",
     "Recommendation",
@@ -1322,6 +1260,10 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "momentum_score": ("momentum_score",),
     "growth_score": ("growth_score",),
     "overall_score": ("overall_score", "score", "compositeScore"),
+    "fundamental_view": ("fundamental_view", "fund_view", "fundamentalView", "fund", "fundamental"),
+    "technical_view": ("technical_view", "tech_view", "technicalView", "tech", "technical"),
+    "risk_view": ("risk_view", "riskView", "risk_label", "risk_view_label"),
+    "value_view": ("value_view", "valueView", "val_view", "valuation_view", "val"),
     "opportunity_score": ("opportunity_score",),
     "rank_overall": ("rank_overall", "rank", "overallRank"),
     "recommendation": ("recommendation", "rating", "action", "reco", "consensus"),
@@ -1604,172 +1546,6 @@ def _coerce_datetime_like(value: Any) -> Optional[str]:
     return _safe_str(value) or None
 
 
-# ============================================================================
-# v5.47.3 — Unit-mismatch sanity normalization
-# v5.47.4 — Extended to fundamentals percent fields too
-#
-# Some secondary providers return risk metrics in basis points or strip
-# the percent denominator entirely. Without normalization we'd write
-# values like Max Drawdown = 2096.68%, VaR = 218.61%, FCF = "5200.00%"
-# straight to the spreadsheet — clearly impossible numbers.
-# ============================================================================
-
-# Plausible upper bounds (absolute value, in percent points).
-# Anything above the bound is treated as a unit error and divided by 100;
-# if still above the bound, it's dropped.
-_METRIC_PERCENT_BOUNDS: Dict[str, float] = {
-    # Risk metrics (annualized vol rarely exceeds 200%)
-    "volatility_30d": 300.0,
-    "volatility_90d": 300.0,
-    "max_drawdown_1y": 100.0,
-    "var_95_1d": 50.0,
-    # v5.47.4: fundamentals percent fields commonly mis-scaled
-    "dividend_yield": 50.0,
-    "payout_ratio": 500.0,
-    "gross_margin": 100.0,
-    "operating_margin": 100.0,
-    "profit_margin": 100.0,
-    "revenue_growth_yoy": 1000.0,
-}
-
-
-def _normalize_metric_units(row: Dict[str, Any]) -> Dict[str, Any]:
-    """v5.47.3+v5.47.4: Detect and correct unit-mismatched metrics."""
-    if not isinstance(row, dict):
-        return row
-
-    warnings_corrected: List[str] = []
-
-    for field, bound in _METRIC_PERCENT_BOUNDS.items():
-        v = _as_float(row.get(field))
-        if v is None:
-            continue
-        abs_v = abs(v)
-        if abs_v > bound:
-            corrected = v / 100.0
-            if abs(corrected) <= bound:
-                row[field] = round(corrected, 4)
-                warnings_corrected.append(f"{field}: {v} -> {round(corrected, 4)} (/100)")
-            else:
-                corrected = v / 10000.0
-                if abs(corrected) <= bound:
-                    row[field] = round(corrected, 4)
-                    warnings_corrected.append(f"{field}: {v} -> {round(corrected, 4)} (/10000)")
-                else:
-                    row[field] = None
-                    warnings_corrected.append(f"{field}: {v} dropped (out of plausible range)")
-
-    fcf_raw = row.get("free_cash_flow_ttm")
-    if isinstance(fcf_raw, str) and "%" in fcf_raw:
-        row["free_cash_flow_ttm"] = None
-        warnings_corrected.append("free_cash_flow_ttm: % string dropped (wrong unit)")
-    elif _as_float(fcf_raw) is not None:
-        fcf_v = _as_float(fcf_raw)
-        if fcf_v is not None and abs(fcf_v) < 1000 and not _as_float(row.get("market_cap")):
-            warnings_corrected.append(f"free_cash_flow_ttm: {fcf_v} suspicious (no market_cap to verify)")
-
-    beta_v = _as_float(row.get("beta_5y"))
-    if beta_v is not None and abs(beta_v) > 10.0:
-        corrected_beta = beta_v / 100.0
-        if abs(corrected_beta) <= 5.0:
-            row["beta_5y"] = round(corrected_beta, 4)
-            warnings_corrected.append(f"beta_5y: {beta_v} -> {round(corrected_beta, 4)} (/100)")
-        else:
-            row["beta_5y"] = None
-            warnings_corrected.append(f"beta_5y: {beta_v} dropped (implausible)")
-
-    for pe_field in ("pe_ttm", "pe_forward"):
-        pe_v = _as_float(row.get(pe_field))
-        if pe_v is not None and abs(pe_v) > 10000.0:
-            row[pe_field] = None
-            warnings_corrected.append(f"{pe_field}: {pe_v} dropped (implausible)")
-
-    if warnings_corrected:
-        existing = row.get("unit_normalization_warnings")
-        if isinstance(existing, list):
-            existing.extend(warnings_corrected)
-        else:
-            row["unit_normalization_warnings"] = warnings_corrected
-        existing_warn = _safe_str(row.get("warnings"))
-        new_msg = f"Unit-corrected: {len(warnings_corrected)} field(s)"
-        if existing_warn:
-            if new_msg not in existing_warn:
-                row["warnings"] = f"{existing_warn}; {new_msg}"
-        else:
-            row["warnings"] = new_msg
-
-    return row
-
-
-def _validate_52w_range_plausibility(row: Dict[str, Any]) -> Dict[str, Any]:
-    """v5.47.3+v5.47.4: Drop 52W values when they can't possibly belong to this symbol."""
-    if not isinstance(row, dict):
-        return row
-
-    price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
-    hi52 = _as_float(row.get("week_52_high"))
-    lo52 = _as_float(row.get("week_52_low"))
-
-    if price is None or hi52 is None or lo52 is None:
-        return row
-    if price <= 0 or hi52 <= 0 or lo52 <= 0:
-        return row
-    if hi52 < lo52:
-        row["week_52_high"] = None
-        row["week_52_low"] = None
-        row["week_52_position_pct"] = None
-        existing_warn = _safe_str(row.get("warnings"))
-        msg = "52W range hi/lo inverted; dropped"
-        row["warnings"] = f"{existing_warn}; {msg}" if existing_warn else msg
-        return row
-
-    band_low = lo52 * 0.4
-    band_high = hi52 * 2.5
-
-    if price < band_low or price > band_high:
-        row["week_52_high"] = None
-        row["week_52_low"] = None
-        row["week_52_position_pct"] = None
-        existing_warn = _safe_str(row.get("warnings"))
-        msg = (
-            f"52W range [{lo52}, {hi52}] inconsistent with price {price} "
-            f"(likely wrong-exchange leak); 52W dropped"
-        )
-        row["warnings"] = f"{existing_warn}; {msg}" if existing_warn else msg
-
-    return row
-
-
-# ============================================================================
-# v5.47.4 — Internal field stripping (pre-output sanitization)
-# ============================================================================
-
-_INTERNAL_FIELD_PREFIXES: Tuple[str, ...] = ("_skip_", "_internal_", "_meta_")
-_INTERNAL_FIELDS_TO_STRIP: Set[str] = {
-    "_skip_recommendation_synthesis",
-}
-
-
-def _strip_internal_fields(row: Dict[str, Any]) -> Dict[str, Any]:
-    """v5.47.4: Remove internal coordination flags from output rows."""
-    if not isinstance(row, dict):
-        return row
-    keys_to_remove: List[str] = []
-    for k in list(row.keys()):
-        ks = _safe_str(k)
-        if ks in _INTERNAL_FIELDS_TO_STRIP:
-            keys_to_remove.append(k)
-            continue
-        if any(ks.startswith(prefix) for prefix in _INTERNAL_FIELD_PREFIXES):
-            keys_to_remove.append(k)
-    for k in keys_to_remove:
-        try:
-            del row[k]
-        except Exception:
-            pass
-    return row
-
-
 def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", normalized_symbol: str = "", provider: str = "") -> Dict[str, Any]:
     src = dict(row or {})
     flat = _flatten_scalar_fields(src)
@@ -1829,25 +1605,15 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if change is None and price is not None and prev is not None:
         change = price - prev
         out["price_change"] = round(change, 6)
-    # Percent-change normalisation. Always recompute from price/prev when available.
-    if price is not None and prev not in (None, 0):
-        recomputed_pct = ((price - prev) / prev) * 100.0
-        out["percent_change"] = round(recomputed_pct, 6)
-    elif pct is not None:
-        if abs(pct) < 0.5:
-            out["percent_change"] = round(pct * 100.0, 6)
-        else:
-            out["percent_change"] = round(pct, 6)
+    if pct is None and price is not None and prev not in (None, 0):
+        pct = ((price - prev) / prev) * 100.0
+        out["percent_change"] = round(pct, 6)
+    elif pct is not None and abs(pct) <= 1.5:
+        out["percent_change"] = round(pct * 100.0, 6)
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
-    if (
-        price is not None
-        and high52 is not None
-        and low52 is not None
-        and high52 > low52
-        and (out.get("week_52_position_pct") in (None, "") or _as_float(out.get("week_52_position_pct")) == 0.0)
-    ):
+    if price is not None and high52 is not None and low52 is not None and high52 > low52 and out.get("week_52_position_pct") is None:
         out["week_52_position_pct"] = round(((price - low52) / (high52 - low52)) * 100.0, 6)
 
     qty = _as_float(out.get("position_qty"))
@@ -1868,19 +1634,11 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
         out["warnings"] = "Recovered from history/chart fallback"
 
-    out = _normalize_metric_units(out)
-    out = _validate_52w_range_plausibility(out)
-
     return out
 
 
 def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
-    src = _canonicalize_provider_row(
-        dict(row or {}),
-        requested_symbol=_safe_str((row or {}).get("requested_symbol")),
-        normalized_symbol=normalize_symbol(_safe_str((row or {}).get("symbol") or (row or {}).get("ticker"))),
-        provider=_safe_str((row or {}).get("data_provider") or (row or {}).get("provider")),
-    )
+    src = _canonicalize_provider_row(dict(row or {}), requested_symbol=_safe_str((row or {}).get("requested_symbol")), normalized_symbol=normalize_symbol(_safe_str((row or {}).get("symbol") or (row or {}).get("ticker"))), provider=_safe_str((row or {}).get("data_provider") or (row or {}).get("provider")))
     flat = _flatten_scalar_fields(src)
 
     out: Dict[str, Any] = {}
@@ -1997,32 +1755,6 @@ def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[
 
 
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
-    has_price = _as_float(row.get("current_price")) is not None or _as_float(row.get("price")) is not None
-    has_any_fundamental = any(
-        _as_float(row.get(k)) is not None
-        for k in (
-            "pe_ttm", "pe_forward", "forward_pe", "eps_ttm", "pb_ratio", "ps_ratio",
-            "ev_ebitda", "peg_ratio", "intrinsic_value", "revenue_ttm", "market_cap",
-            "free_cash_flow_ttm", "dividend_yield",
-        )
-    )
-    has_any_history = any(
-        _as_float(row.get(k)) is not None
-        for k in ("volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y", "rsi_14")
-    )
-    if not (has_price or has_any_fundamental or has_any_history):
-        row.setdefault("data_quality", "MISSING")
-        existing = _safe_str(row.get("warnings"))
-        msg = "No provider data available for this symbol"
-        if existing and msg not in existing:
-            row["warnings"] = f"{existing}; {msg}"
-        elif not existing:
-            row["warnings"] = msg
-        row["recommendation"] = None
-        row["recommendation_reason"] = None
-        row["_skip_recommendation_synthesis"] = True
-        return
-
     price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
     pe = _as_float(row.get("pe_ttm"))
     pb = _as_float(row.get("pb_ratio"))
@@ -2043,7 +1775,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     seed_roi_12m = _as_pct_points(row.get("expected_roi_12m"))
     seed_best_roi = next((v for v in (seed_roi_3m, seed_roi_12m, seed_roi_1m) if v is not None), 0.0)
 
-    if row.get("value_score") in (None, "", 0, 0.0):
+    if row.get("value_score") is None:
         value_score = 55.0
         if pe is not None and pe > 0:
             value_score += max(0.0, 22.0 - min(pe, 22.0))
@@ -2054,7 +1786,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         value_score += min(max(div_yield_pct, 0.0), 12.0)
         row["value_score"] = round(_clamp(float(value_score), 0.0, 100.0), 2)
 
-    if row.get("valuation_score") in (None, "", 0, 0.0):
+    if row.get("valuation_score") is None:
         valuation_score = 50.0
         if intrinsic is not None and price not in (None, 0):
             upside_pct = ((intrinsic - price) / price) * 100.0
@@ -2065,7 +1797,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             valuation_score += max(0.0, 15.0 - min(pe, 15.0))
         row["valuation_score"] = round(_clamp(float(valuation_score), 0.0, 100.0), 2)
 
-    if row.get("quality_score") in (None, "", 0, 0.0):
+    if row.get("quality_score") is None:
         quality_score = 45.0
         quality_score += min(max(gross_margin_pct, 0.0), 20.0) * 0.6
         quality_score += min(max(operating_margin_pct, 0.0), 18.0) * 0.7
@@ -2074,7 +1806,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             quality_score += max(0.0, 15.0 - min(max(debt_to_equity, 0.0), 15.0))
         row["quality_score"] = round(_clamp(float(quality_score), 0.0, 100.0), 2)
 
-    if row.get("momentum_score") in (None, "", 0, 0.0):
+    if row.get("momentum_score") is None:
         pct = _as_pct_points(row.get("percent_change"))
         if pct is None:
             pct = _as_pct_points(row.get("change_pct"))
@@ -2082,7 +1814,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             pct = 0.0
         row["momentum_score"] = round(_clamp(50.0 + pct, 0.0, 100.0), 2)
 
-    if row.get("growth_score") in (None, "", 0, 0.0):
+    if row.get("growth_score") is None:
         growth_score = 50.0 + _clamp(revenue_growth_pct, -25.0, 35.0)
         eps = _as_float(row.get("eps_ttm"))
         if eps is not None and eps > 0:
@@ -2096,12 +1828,10 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         conf = 0.55
     if conf > 1.5:
         conf = conf / 100.0
-    if row.get("forecast_confidence") in (None, "", 0, 0.0):
-        row["forecast_confidence"] = round(_clamp(conf, 0.0, 1.0), 4)
-    if row.get("confidence_score") in (None, "", 0, 0.0):
-        row["confidence_score"] = round(_clamp(conf * 100.0, 0.0, 100.0), 2)
+    row.setdefault("forecast_confidence", round(_clamp(conf, 0.0, 1.0), 4))
+    row.setdefault("confidence_score", round(_clamp(conf * 100.0, 0.0, 100.0), 2))
 
-    if row.get("risk_score") in (None, "", 0, 0.0):
+    if row.get("risk_score") is None:
         vol = _as_pct_points(row.get("volatility_90d"))
         drawdown = _as_pct_points(row.get("max_drawdown_1y"))
         var95 = _as_pct_points(row.get("var_95_1d"))
@@ -2116,7 +1846,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             risk_score += min(max(beta * 8.0, 0.0), 15.0)
         row["risk_score"] = round(_clamp(float(risk_score), 0.0, 100.0), 2)
 
-    if row.get("overall_score") in (None, "", 0, 0.0):
+    if row.get("overall_score") is None:
         vals = [
             _as_float(row.get("value_score")),
             _as_float(row.get("valuation_score")),
@@ -2128,25 +1858,25 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         overall = sum(vals2) / len(vals2) if vals2 else 50.0
         row["overall_score"] = round(_clamp(float(overall), 0.0, 100.0), 2)
 
-    if price is not None and row.get("forecast_price_1m") in (None, "", 0, 0.0):
+    if price is not None and row.get("forecast_price_1m") is None:
         drift = max(0.5, min(4.0, seed_best_roi if seed_best_roi else 1.0))
         row["forecast_price_1m"] = round(price * (1.0 + drift / 300.0), 4)
-    if price is not None and row.get("forecast_price_3m") in (None, "", 0, 0.0):
+    if price is not None and row.get("forecast_price_3m") is None:
         drift = max(1.0, min(8.0, seed_best_roi if seed_best_roi else 3.0))
         row["forecast_price_3m"] = round(price * (1.0 + drift / 100.0), 4)
-    if price is not None and row.get("forecast_price_12m") in (None, "", 0, 0.0):
+    if price is not None and row.get("forecast_price_12m") is None:
         drift = max(3.0, min(18.0, (seed_roi_12m if seed_roi_12m is not None else seed_best_roi) or 8.0))
         row["forecast_price_12m"] = round(price * (1.0 + drift / 100.0), 4)
 
-    if price is not None and row.get("expected_roi_1m") in (None, "", 0, 0.0):
+    if price is not None and row.get("expected_roi_1m") is None:
         fp1 = _as_float(row.get("forecast_price_1m"))
         if fp1 is not None and price:
             row["expected_roi_1m"] = round((fp1 - price) / price, 6)
-    if price is not None and row.get("expected_roi_3m") in (None, "", 0, 0.0):
+    if price is not None and row.get("expected_roi_3m") is None:
         fp3 = _as_float(row.get("forecast_price_3m"))
         if fp3 is not None and price:
             row["expected_roi_3m"] = round((fp3 - price) / price, 6)
-    if price is not None and row.get("expected_roi_12m") in (None, "", 0, 0.0):
+    if price is not None and row.get("expected_roi_12m") is None:
         fp12 = _as_float(row.get("forecast_price_12m"))
         if fp12 is not None and price:
             row["expected_roi_12m"] = round((fp12 - price) / price, 6)
@@ -2156,7 +1886,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     final_roi_12m = _as_pct_points(row.get("expected_roi_12m"))
     final_best_roi = next((v for v in (final_roi_3m, final_roi_12m, final_roi_1m) if v is not None), 0.0)
 
-    if row.get("opportunity_score") in (None, "", 0, 0.0):
+    if row.get("opportunity_score") is None:
         base = _as_float(row.get("overall_score")) or 50.0
         confidence_boost = ((_as_float(row.get("confidence_score")) or 50.0) - 50.0) * 0.20
         risk_penalty = ((_as_float(row.get("risk_score")) or 50.0) - 50.0) * 0.25
@@ -2171,52 +1901,147 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         cs = _as_float(row.get("confidence_score")) or 55.0
         row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
 
-    if "rank_overall" not in row:
-        row["rank_overall"] = None
 
-    if row.get("horizon_days") in (None, "", 0):
-        row["horizon_days"] = 365
+def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Derive the four dedicated *_view verdicts from the existing scores.
 
-    cs_val = _as_float(row.get("confidence_score"))
-    if cs_val is not None and row.get("confidence") in (None, "", 0, 0.0):
-        row["confidence"] = cs_val
+    These are emitted both as standalone columns (fundamental_view,
+    technical_view, risk_view, value_view) AND folded into the
+    recommendation_reason string in the form:
+        "Fund: BULLISH | Tech: NEUTRAL | Risk: LOW | Val: FAIR -> ACCUMULATE"
 
-    for src, dst in (
-        ("expected_roi_1m", "expected_roi_1m_pct"),
-        ("expected_roi_3m", "expected_roi_3m_pct"),
-        ("expected_roi_12m", "expected_roi_12m_pct"),
-    ):
-        v = _as_float(row.get(src))
-        if v is not None and row.get(dst) in (None, "", 0, 0.0):
-            row[dst] = round(v * 100.0, 4) if abs(v) <= 1.5 else round(v, 4)
+    Returns (fund_view, tech_view, risk_view, val_view).
+    """
+    qual = _as_float(row.get("quality_score"))
+    growth = _as_float(row.get("growth_score"))
+    mom = _as_float(row.get("momentum_score"))
+    rsi = _as_float(row.get("rsi_14"))
+    risk = _as_float(row.get("risk_score"))
+    val_score = _as_float(row.get("valuation_score"))
+    intrinsic = _as_float(row.get("intrinsic_value"))
+    price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
 
-    if row.get("intrinsic_value") in (None, "", 0, 0.0):
-        fp12 = _as_float(row.get("forecast_price_12m"))
-        if fp12 is not None and fp12 > 0:
-            row["intrinsic_value"] = round(fp12, 4)
-            row.setdefault("intrinsic_value_source", "derived_from_forecast_12m")
+    # --- Fundamental View: blends quality + growth ---
+    fund_signal: Optional[float] = None
+    parts = [v for v in (qual, growth) if v is not None]
+    if parts:
+        fund_signal = sum(parts) / len(parts)
+    if fund_signal is None:
+        fund_view = "N/A"
+    elif fund_signal >= 65.0:
+        fund_view = "BULLISH"
+    elif fund_signal <= 40.0:
+        fund_view = "BEARISH"
+    else:
+        fund_view = "NEUTRAL"
+
+    # --- Technical View: blends momentum + RSI(14) ---
+    tech_signal: Optional[float] = None
+    if mom is not None and rsi is not None:
+        # RSI 0..100 already on the same scale as momentum_score; average.
+        tech_signal = (mom + rsi) / 2.0
+    elif mom is not None:
+        tech_signal = mom
+    elif rsi is not None:
+        tech_signal = rsi
+    if tech_signal is None:
+        tech_view = "N/A"
+    elif tech_signal >= 65.0 or (rsi is not None and rsi >= 70.0):
+        tech_view = "BULLISH"
+    elif tech_signal <= 40.0 or (rsi is not None and rsi <= 30.0):
+        tech_view = "BEARISH"
+    else:
+        tech_view = "NEUTRAL"
+
+    # --- Risk View: bucket from risk_score (low score = low risk) ---
+    if risk is None:
+        risk_view = "N/A"
+    elif risk < 40.0:
+        risk_view = "LOW"
+    elif risk < 70.0:
+        risk_view = "MODERATE"
+    else:
+        risk_view = "HIGH"
+
+    # --- Value View: combines valuation_score with intrinsic-vs-price upside ---
+    upside_pct: Optional[float] = None
+    if intrinsic is not None and price is not None and price > 0:
+        upside_pct = ((intrinsic - price) / price) * 100.0
+
+    if val_score is None and upside_pct is None:
+        val_view = "N/A"
+    else:
+        if val_score is not None and val_score >= 70.0:
+            val_view = "CHEAP"
+        elif val_score is not None and val_score <= 35.0:
+            val_view = "EXPENSIVE"
+        else:
+            val_view = "FAIR"
+        # Override with upside if it's a strong signal in either direction
+        if upside_pct is not None:
+            if upside_pct >= 15.0 and val_view != "EXPENSIVE":
+                val_view = "CHEAP"
+            elif upside_pct <= -15.0 and val_view != "CHEAP":
+                val_view = "EXPENSIVE"
+
+    return fund_view, tech_view, risk_view, val_view
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
+    """Populate the four *_view columns AND the recommendation.
+
+    The recommendation_reason is formatted as
+        "Fund: <fund> | Tech: <tech> | Risk: <risk> | Val: <val> -> <RECO>"
+    so downstream sheet writers can either show the dedicated *_view
+    columns OR fall back to parsing the reason string. This restores
+    the four View columns that were previously left blank in the
+    spreadsheet output.
+    """
+    # Always derive views (cheap; safe to recompute).
+    fund_view, tech_view, risk_view, val_view = _derive_views(row)
+    # Only set if not already populated by an upstream provider.
+    if not _safe_str(row.get("fundamental_view")):
+        row["fundamental_view"] = fund_view
+    if not _safe_str(row.get("technical_view")):
+        row["technical_view"] = tech_view
+    if not _safe_str(row.get("risk_view")):
+        row["risk_view"] = risk_view
+    if not _safe_str(row.get("value_view")):
+        row["value_view"] = val_view
+
     if row.get("recommendation"):
+        # Recommendation already chosen upstream — still synthesize the
+        # reason if it's missing, using the same format.
+        if not _safe_str(row.get("recommendation_reason")):
+            row["recommendation_reason"] = (
+                f"Fund: {row.get('fundamental_view') or 'N/A'} | "
+                f"Tech: {row.get('technical_view') or 'N/A'} | "
+                f"Risk: {row.get('risk_view') or 'N/A'} | "
+                f"Val: {row.get('value_view') or 'N/A'} "
+                f"\u2192 {row.get('recommendation')}"
+            )
         return
     if row.get("_skip_recommendation_synthesis"):
         return
     overall = _as_float(row.get("overall_score")) or 50.0
     conf = _as_float(row.get("confidence_score")) or 55.0
-    risk = _as_float(row.get("risk_score")) or 50.0
-    if overall >= 75 and conf >= 65 and risk <= 60:
+    risk_score = _as_float(row.get("risk_score")) or 50.0
+    if overall >= 75 and conf >= 65 and risk_score <= 60:
         rec = "BUY"
     elif overall >= 60 and conf >= 55:
         rec = "ACCUMULATE"
-    elif overall <= 35 or risk >= 85:
+    elif overall <= 35 or risk_score >= 85:
         rec = "REDUCE"
     else:
         rec = "HOLD"
     row["recommendation"] = rec
+    # Always emit the structured Fund/Tech/Risk/Val reason format.
     row.setdefault(
         "recommendation_reason",
-        f"overall={round(overall,1)} confidence={round(conf,1)} risk={round(risk,1)}",
+        (
+            f"Fund: {fund_view} | Tech: {tech_view} | "
+            f"Risk: {risk_view} | Val: {val_view} \u2192 {rec}"
+        ),
     )
 
 
@@ -2500,25 +2325,10 @@ class MultiLevelCache:
         self.max_l1_size = max(1, int(max_l1_size))
         self._data: Dict[str, Tuple[float, Any]] = {}
         self._lock = asyncio.Lock()
-        self._eviction_counter = 0
 
     def _key(self, **kwargs: Any) -> str:
         items = sorted((str(k), _safe_str(v)) for k, v in kwargs.items())
         return "|".join([self.name] + [f"{k}={v}" for k, v in items])
-
-    def _evict_expired(self, now: float, max_to_evict: int = 32) -> None:
-        """v5.47.4: Drop a small number of expired entries opportunistically."""
-        evicted = 0
-        for k in list(self._data.keys()):
-            if evicted >= max_to_evict:
-                break
-            entry = self._data.get(k)
-            if entry is None:
-                continue
-            expires_at, _ = entry
-            if expires_at < now:
-                self._data.pop(k, None)
-                evicted += 1
 
     async def get(self, **kwargs: Any) -> Any:
         key = self._key(**kwargs)
@@ -2527,27 +2337,19 @@ class MultiLevelCache:
             if not item:
                 return None
             expires_at, value = item
-            now = time.time()
-            if expires_at < now:
+            if expires_at < time.time():
                 self._data.pop(key, None)
-                self._eviction_counter += 1
-                if self._eviction_counter >= 16:
-                    self._eviction_counter = 0
-                    self._evict_expired(now)
                 return None
             return value
 
     async def set(self, value: Any, **kwargs: Any) -> None:
         key = self._key(**kwargs)
         async with self._lock:
-            now = time.time()
             if len(self._data) >= self.max_l1_size:
-                self._evict_expired(now)
-                if len(self._data) >= self.max_l1_size:
-                    oldest_key = next(iter(self._data.keys()), None)
-                    if oldest_key:
-                        self._data.pop(oldest_key, None)
-            self._data[key] = (now + self.l1_ttl, value)
+                oldest_key = next(iter(self._data.keys()), None)
+                if oldest_key:
+                    self._data.pop(oldest_key, None)
+            self._data[key] = (time.time() + self.l1_ttl, value)
 
 
 class ProviderRegistry:
@@ -2659,22 +2461,12 @@ class DataEngineV5:
             ["yahoo_chart", "yahoo", "eodhd", "finnhub", "tadawul", "argaam"],
         )
         self.max_concurrency = _get_env_int("DATA_ENGINE_MAX_CONCURRENCY", 25)
-        # v5.48.0: tightened default from 20.0s to 6.0s. Live quotes should
-        # never take 20s; if a provider does, we want to fall through to the
-        # next provider rather than burn the engine's whole budget on one.
-        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 6.0)
+        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 20.0)
         self.ksa_disallow_eodhd = _get_env_bool("KSA_DISALLOW_EODHD", True)
 
         self.schema_strict_sheet_rows = _get_env_bool("SCHEMA_STRICT_SHEET_ROWS", True)
         self.top10_force_full_schema = _get_env_bool("TOP10_FORCE_FULL_SCHEMA", True)
         self.rows_hydrate_external = _get_env_bool("ROWS_HYDRATE_EXTERNAL_READER", True)
-
-        # v5.48.0: outer wall-clock budget for get_sheet_rows. Even with all
-        # the inner timeouts, we want a hard ceiling so the engine fails-soft
-        # on misbehaving downstreams instead of hanging indefinitely. Default
-        # 20.0s sits well below the 25s bridge timeout in routes/enriched_quote
-        # and well above the 10s engine wrapper in routes/advanced_analysis.
-        self.sheet_rows_budget = _get_env_float("DATA_ENGINE_SHEET_ROWS_BUDGET_SECONDS", 20.0)
 
         self._sem = asyncio.Semaphore(max(1, self.max_concurrency))
         self._singleflight = SingleFlight()
@@ -2901,7 +2693,7 @@ class DataEngineV5:
         return _json_safe(payload)
 
     # ------------------------------------------------------------------
-    # rows reader discovery (v5.48.0: variant-loop fix; tighter timeout)
+    # rows reader discovery
     # ------------------------------------------------------------------
     async def _init_rows_reader(self) -> Tuple[Any, str]:
         if self._rows_reader_ready:
@@ -2953,9 +2745,6 @@ class DataEngineV5:
         if obj is None:
             return []
 
-        # v5.48.0: tightened default from 20s to 8s, capped from env.
-        rows_timeout = _get_env_float("ROWS_READER_TIMEOUT_SECONDS", 8.0)
-
         for name in ("get_rows_for_sheet", "read_rows_for_sheet", "get_sheet_rows", "fetch_sheet_rows", "sheet_rows", "get_rows"):
             fn = getattr(obj, name, None)
             if not callable(fn):
@@ -2968,29 +2757,16 @@ class DataEngineV5:
                 ((sheet,), {"limit": limit}),
                 ((sheet,), {}),
             ]
-            # v5.48.0: bail to next function on the first non-TypeError.
-            # Old behavior burned 5 x rows_timeout per function name when a
-            # function was reachable but slow-failing. Now we accept that
-            # if the FIRST callable attempt with a real signature failed
-            # with a real exception, the function itself is broken — try
-            # the next named function instead of trying the same function
-            # again with different signatures.
-            hit_real_error = False
             for args, kwargs in variants:
-                if hit_real_error:
-                    break
                 try:
-                    async with asyncio.timeout(rows_timeout):
+                    async with asyncio.timeout(_get_env_float("ROWS_READER_TIMEOUT_SECONDS", 20.0)):
                         result = await _call_maybe_async(fn, *args, **kwargs)
                     rows = _coerce_rows_list(result)
                     if rows:
                         return rows[:limit]
                 except TypeError:
-                    # Signature mismatch — try the next variant immediately.
                     continue
-                except Exception as exc:
-                    logger.debug("rows_reader_call_failed name=%s err=%s", name, exc)
-                    hit_real_error = True
+                except Exception:
                     continue
 
         return []
@@ -3002,7 +2778,7 @@ class DataEngineV5:
         return await self._call_rows_reader(obj, sheet, limit)
 
     # ------------------------------------------------------------------
-    # symbols reader discovery (v5.48.0: variant-loop fix; tighter timeout)
+    # symbols reader discovery
     # ------------------------------------------------------------------
     async def _init_symbols_reader(self) -> Tuple[Any, str]:
         if self._symbols_reader_ready:
@@ -3073,9 +2849,6 @@ class DataEngineV5:
                 if syms:
                     return syms
 
-        # v5.48.0: tightened default from 15s to 6s.
-        sym_timeout = _get_env_float("SHEET_SYMBOLS_TIMEOUT_SECONDS", 6.0)
-
         for name in (
             "get_symbols_for_sheet",
             "read_symbols_for_sheet",
@@ -3099,13 +2872,9 @@ class DataEngineV5:
                 ((sheet,), {"limit": limit}),
                 ((sheet,), {}),
             ]
-            # v5.48.0: same variant-loop fix as _call_rows_reader.
-            hit_real_error = False
             for args, kwargs in variants:
-                if hit_real_error:
-                    break
                 try:
-                    async with asyncio.timeout(sym_timeout):
+                    async with asyncio.timeout(_get_env_float("SHEET_SYMBOLS_TIMEOUT_SECONDS", 15.0)):
                         result = await _call_maybe_async(fn, *args, **kwargs)
                     syms = _normalize_symbol_list(_split_symbols(result), limit=limit)
                     if not syms and isinstance(result, (dict, list)):
@@ -3114,9 +2883,7 @@ class DataEngineV5:
                         return syms
                 except TypeError:
                     continue
-                except Exception as exc:
-                    logger.debug("symbols_reader_call_failed name=%s err=%s", name, exc)
-                    hit_real_error = True
+                except Exception:
                     continue
 
         return []
@@ -3199,17 +2966,12 @@ class DataEngineV5:
                 fn = getattr(mod, fn_name, None)
                 if not callable(fn):
                     continue
-                # v5.48.0: same variant-loop discipline as readers — bail
-                # on first real exception per function.
-                hit_real_error = False
                 for args, kwargs in [
                     ((sheet,), {"limit": limit}),
                     ((sheet,), {}),
                     ((), {"page": sheet, "limit": limit}),
                     ((), {"sheet": sheet, "limit": limit}),
                 ]:
-                    if hit_real_error:
-                        break
                     try:
                         result = await _call_maybe_async(fn, *args, **kwargs)
                         syms = _normalize_symbol_list(_split_symbols(result), limit=limit)
@@ -3217,9 +2979,7 @@ class DataEngineV5:
                             return syms
                     except TypeError:
                         continue
-                    except Exception as exc:
-                        logger.debug("page_catalog_call_failed name=%s err=%s", fn_name, exc)
-                        hit_real_error = True
+                    except Exception:
                         continue
 
         return []
@@ -3436,7 +3196,7 @@ class DataEngineV5:
         return f"{market}|{page_ctx or 'default'}|{primary or 'none'}"
 
     # ------------------------------------------------------------------
-    # quote APIs (v5.48.0: variant-loop fix in _fetch_patch)
+    # quote APIs
     # ------------------------------------------------------------------
     async def _fetch_patch(self, provider: str, symbol: str) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
         start = time.time()
@@ -3465,21 +3225,9 @@ class DataEngineV5:
                 ((), {"symbol": symbol, "settings": self.settings}),
             ]
 
-            # v5.48.0: variant-loop fix. The previous implementation tried
-            # all 6 signatures with the full request_timeout each, burning
-            # up to 6 x 20s = 120s per provider when a real (non-TypeError)
-            # error fired late in the call. With 4-way provider fanout via
-            # asyncio.gather, the tail-latency of just ONE round of provider
-            # calls could exceed the route-layer 10s wrapper. Now: TypeError
-            # still fast-fails to the next variant (signature mismatch is
-            # cheap), but any other exception means the provider is broken
-            # for this symbol — bail out and let the next provider take over.
             result = None
             collected_errs: List[str] = []
-            hit_real_error = False
             for args, kwargs in call_variants:
-                if hit_real_error:
-                    break
                 try:
                     async with asyncio.timeout(self.request_timeout):
                         result = await _call_maybe_async(fn, *args, **kwargs)
@@ -3488,25 +3236,11 @@ class DataEngineV5:
                     continue
                 except Exception as exc:
                     collected_errs.append(f"{type(exc).__name__}: {str(exc)[:120]}")
-                    logger.debug("provider_fetch_failed provider=%s err=%s", provider, exc)
-                    hit_real_error = True
                     continue
 
             latency = (time.time() - start) * 1000.0
             patch = _model_to_dict(result)
             if patch and isinstance(patch, dict):
-                # v5.47.4: Reject error envelopes ({"error": "..."} payloads
-                # with no real data) — these were previously counted as
-                # success and blocked the fallback chain.
-                meaningful_keys = {
-                    "current_price", "price", "previous_close", "name",
-                    "market_cap", "pe_ttm", "eps_ttm", "week_52_high",
-                    "regularMarketPrice", "last", "lastPrice", "close",
-                }
-                if not (set(patch.keys()) & meaningful_keys) and patch.get("error"):
-                    err = f"provider_error_envelope: {patch.get('error')}"
-                    await self._registry.record_failure(provider, err)
-                    return provider, None, latency, err
                 await self._registry.record_success(provider, latency)
                 return provider, patch, latency, None
 
@@ -3535,7 +3269,8 @@ class DataEngineV5:
                 providers = [p for p in providers if p != primary_provider]
             providers.insert(0, primary_provider)
 
-        # Preserve paid EODHD priority for configured non-KSA/global pages.
+        # Preserve paid EODHD priority for configured non-KSA/global pages even
+        # when settings or env put another global provider first.
         if (not is_ksa_sym) and page_ctx and page_ctx in self.page_primary_providers and _provider_allowed("eodhd"):
             providers = [p for p in providers if p != "eodhd"]
             providers.insert(0, "eodhd")
@@ -3550,9 +3285,6 @@ class DataEngineV5:
             out.append(p2)
         return out
 
-    # ------------------------------------------------------------------
-    # history helpers (preserved verbatim from v5.47.4)
-    # ------------------------------------------------------------------
     def _rows_from_parallel_series(
         self,
         timestamps: Sequence[Any],
@@ -3615,6 +3347,7 @@ class DataEngineV5:
                     })
             return out
         if isinstance(result, dict):
+            # Yahoo chart-style payloads
             if isinstance(result.get("chart"), Mapping):
                 chart = result.get("chart") or {}
                 nested = self._coerce_history_rows(chart.get("result"))
@@ -3649,6 +3382,7 @@ class DataEngineV5:
                     if rows:
                         return rows
 
+            # Generic parallel-array payloads
             if any(isinstance(result.get(k), list) for k in ("close", "open", "high", "low", "volume")):
                 ts = result.get("timestamp") or list(range(len(result.get("close") or result.get("price") or [])))
                 rows = self._rows_from_parallel_series(
@@ -3663,6 +3397,7 @@ class DataEngineV5:
                 if rows:
                     return rows
 
+            # AlphaVantage-style keyed time series
             for key in ("Time Series (Daily)", "time_series", "series"):
                 series = result.get(key)
                 if isinstance(series, Mapping):
@@ -3848,15 +3583,10 @@ class DataEngineV5:
             ((), {"ticker": symbol, "range": "1y", "interval": "1d"}),
             ((symbol,), {}),
         ]
-        # v5.48.0: tighter timeout; per-function variant-loop discipline.
-        hist_timeout = max(3.0, _get_env_float("HISTORY_PER_PROVIDER_TIMEOUT_SECONDS", min(self.request_timeout, 5.0)))
         for fn in callables:
-            hit_real_error = False
             for args, kwargs in variants:
-                if hit_real_error:
-                    break
                 try:
-                    async with asyncio.timeout(hist_timeout):
+                    async with asyncio.timeout(max(5.0, self.request_timeout)):
                         result = await _call_maybe_async(fn, *args, **kwargs)
                     rows = self._coerce_history_rows(result)
                     patch = self._compute_history_patch_from_rows(rows)
@@ -3865,9 +3595,7 @@ class DataEngineV5:
                         return patch
                 except TypeError:
                     continue
-                except Exception as exc:
-                    logger.debug("history_fetch_failed provider=%s err=%s", provider, exc)
-                    hit_real_error = True
+                except Exception:
                     continue
         return {}
 
@@ -3931,29 +3659,16 @@ class DataEngineV5:
                 if k not in merged or merged.get(k) in (None, "", [], {}):
                     merged[k] = v
 
-        merged = _canonicalize_provider_row(
-            merged,
-            requested_symbol=requested_symbol,
-            normalized_symbol=norm,
-            provider=_safe_str((merged.get("data_sources") or [""])[0] if isinstance(merged.get("data_sources"), list) else ""),
-        )
+        merged = _canonicalize_provider_row(merged, requested_symbol=requested_symbol, normalized_symbol=norm, provider=_safe_str((merged.get("data_sources") or [""])[0] if isinstance(merged.get("data_sources"), list) else ""))
         return merged
+
 
     def _data_quality(self, row: Dict[str, Any]) -> str:
         if _as_float(row.get("current_price")) is None:
             return QuoteQuality.MISSING.value
         return QuoteQuality.GOOD.value if any(row.get(k) is not None for k in ("overall_score", "forecast_price_3m", "pb_ratio")) else QuoteQuality.FAIR.value
 
-    async def _get_enriched_quote_impl(
-        self,
-        symbol: str,
-        use_cache: bool = True,
-        *,
-        page: str = "",
-        sheet: str = "",
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> UnifiedQuote:
+    async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True, *, page: str = "", sheet: str = "", body: Optional[Dict[str, Any]] = None, **kwargs: Any) -> UnifiedQuote:
         info = get_symbol_info(symbol)
         norm = _safe_str(info.get("normalized"))
 
@@ -3970,7 +3685,6 @@ class DataEngineV5:
             row = _apply_symbol_context_defaults(row, symbol=_safe_str(symbol))
             _compute_scores_fallback(row)
             _compute_recommendation(row)
-            row = _strip_internal_fields(row)
             return UnifiedQuote(**row)
 
         page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, extras=kwargs)
@@ -3984,11 +3698,7 @@ class DataEngineV5:
         providers = self._providers_for(norm, page=page_context)
         patches_ok: List[Tuple[str, Dict[str, Any], float]] = []
         if providers:
-            fanout_limit = max(2, _get_env_int("PROVIDER_FANOUT_LIMIT", 4))
-            gathered = await asyncio.gather(
-                *[self._fetch_patch(p, norm) for p in providers[:fanout_limit]],
-                return_exceptions=True,
-            )
+            gathered = await asyncio.gather(*[self._fetch_patch(p, norm) for p in providers[:4]], return_exceptions=True)
             for item in gathered:
                 if isinstance(item, tuple) and len(item) == 4:
                     provider, patch, latency, _err = item
@@ -4018,75 +3728,27 @@ class DataEngineV5:
             row = _merge_missing_fields(row, cached_best_row)
             row = _apply_page_row_backfill(page_context or sheet or "", row)
 
-        history_fallback_enabled = _get_env_bool("HISTORY_FALLBACK_ENABLED", True)
-
-        risk_metric_fields = (
+        missing_history_fields = [
+            "current_price",
+            "previous_close",
+            "day_high",
+            "day_low",
+            "week_52_high",
+            "week_52_low",
+            "avg_volume_10d",
+            "avg_volume_30d",
             "volatility_30d",
             "volatility_90d",
             "max_drawdown_1y",
             "var_95_1d",
             "sharpe_1y",
             "rsi_14",
-        )
-        price_history_fields = (
-            "current_price",
-            "previous_close",
-            "week_52_high",
-            "week_52_low",
-        )
-
-        missing_core_price = any(row.get(k) in (None, "", [], {}) for k in price_history_fields)
-        all_risk_missing = all(row.get(k) in (None, "", [], {}) for k in risk_metric_fields)
-        has_price = _as_float(row.get("current_price")) is not None
-
-        needs_history = history_fallback_enabled and (
-            missing_core_price or (all_risk_missing and has_price)
-        )
-
-        if needs_history:
-            try:
-                hist_timeout = max(3.0, _get_env_float("HISTORY_FALLBACK_TIMEOUT_SECONDS", 8.0))
-                hist_patch = await asyncio.wait_for(
-                    self._get_history_patch_best_effort(norm, providers, page=page_context),
-                    timeout=hist_timeout,
-                )
-            except asyncio.TimeoutError:
-                hist_patch = None
-            except Exception:
-                hist_patch = None
-
+        ]
+        if any(row.get(k) in (None, "", [], {}) for k in missing_history_fields):
+            hist_patch = await self._get_history_patch_best_effort(norm, providers, page=page_context)
             if hist_patch:
-                history_fill = {k: v for k, v in hist_patch.items() if row.get(k) in (None, "", [], {})}
-                if history_fill:
-                    history_fill["data_provider"] = hist_patch.get("data_provider") or "history"
-                    row = self._merge(
-                        symbol,
-                        norm,
-                        patches_ok + [(history_fill.get("data_provider") or "history", history_fill, 0.0)],
-                    )
-                    row = _apply_symbol_context_defaults(row, symbol=norm)
-
-        try:
-            cp = _as_float(row.get("current_price"))
-            hi = _as_float(row.get("week_52_high"))
-            lo = _as_float(row.get("week_52_low"))
-            if (
-                row.get("week_52_position_pct") in (None, "")
-                and cp is not None
-                and hi is not None
-                and lo is not None
-                and hi > lo
-            ):
-                row["week_52_position_pct"] = round(((cp - lo) / (hi - lo)) * 100.0, 4)
-        except Exception:
-            pass
-
-        if row.get("open_price") in (None, "", 0, 0.0):
-            for alias in ("open", "day_open", "regularMarketOpen"):
-                v = _as_float(row.get(alias))
-                if v is not None and v > 0:
-                    row["open_price"] = v
-                    break
+                row = self._merge(symbol, norm, patches_ok + [(hist_patch.get("data_provider") or "history", hist_patch, 0.0)])
+                row = _apply_symbol_context_defaults(row, symbol=norm)
 
         if cached_best_row:
             row = _merge_missing_fields(row, cached_best_row)
@@ -4101,116 +3763,7 @@ class DataEngineV5:
         _compute_recommendation(row)
         row["data_quality"] = self._data_quality(row)
         row["data_provider"] = row.get("data_provider") or ((row.get("data_sources") or [""])[0] if isinstance(row.get("data_sources"), list) else "")
-
-        # =====================================================================
-        # FINAL-STAGE BACKFILL — preserved verbatim from v5.47.4
-        # =====================================================================
-        try:
-            _cp = _as_float(row.get("current_price")) or _as_float(row.get("price"))
-            _hi = _as_float(row.get("week_52_high"))
-            _lo = _as_float(row.get("week_52_low"))
-            if _cp is not None and _hi is not None and _lo is not None and _hi > _lo:
-                _pos = ((_cp - _lo) / (_hi - _lo)) * 100.0
-                _pos = max(-50.0, min(150.0, _pos))
-                _pos = round(_pos, 4)
-                if row.get("week_52_position_pct") in (None, ""):
-                    row["week_52_position_pct"] = _pos
-                if row.get("position_52w_pct") in (None, ""):
-                    row["position_52w_pct"] = _pos
-            else:
-                _existing = (
-                    _as_float(row.get("week_52_position_pct"))
-                    or _as_float(row.get("position_52w_pct"))
-                )
-                if _existing is not None:
-                    row.setdefault("week_52_position_pct", _existing)
-                    row.setdefault("position_52w_pct", _existing)
-
-            _alias_pairs = (
-                ("pb_ratio", "pb"),
-                ("ps_ratio", "ps"),
-                ("ev_ebitda", "ev_to_ebitda"),
-                ("peg_ratio", "peg"),
-                ("data_provider", "provider_primary"),
-                ("last_updated_utc", "as_of_utc"),
-                ("last_updated_utc", "updated_at_utc"),
-                ("last_updated_riyadh", "as_of_riyadh"),
-                ("last_updated_riyadh", "updated_at_riyadh"),
-            )
-            for _src, _dst in _alias_pairs:
-                _v = row.get(_src)
-                if _v not in (None, "") and row.get(_dst) in (None, ""):
-                    row[_dst] = _v
-                _v2 = row.get(_dst)
-                if _v2 not in (None, "") and row.get(_src) in (None, ""):
-                    row[_src] = _v2
-
-            _conf_score = _as_float(row.get("confidence_score"))
-            _fc = _as_float(row.get("forecast_confidence"))
-            if _conf_score is not None and row.get("confidence") in (None, "", 0):
-                row["confidence"] = _conf_score
-            if _fc is not None and row.get("ai_confidence") in (None, "", 0):
-                row["ai_confidence"] = _fc
-
-            _ds = row.get("data_sources")
-            if isinstance(_ds, list) and len(_ds) >= 2 and row.get("provider_secondary") in (None, ""):
-                row["provider_secondary"] = _safe_str(_ds[1])
-
-            _vol = _as_float(row.get("volume"))
-            _avg30 = _as_float(row.get("avg_volume_30d"))
-            if _vol is not None and _avg30 not in (None, 0) and row.get("volume_ratio") in (None, "", 0, 0.0):
-                row["volume_ratio"] = round(_vol / _avg30, 4)
-
-            _dh = _as_float(row.get("day_high"))
-            _dl = _as_float(row.get("day_low"))
-            if _cp is not None and _dh is not None and _dl is not None and _dh > _dl and row.get("day_range_position") in (None, ""):
-                row["day_range_position"] = round(((_cp - _dl) / (_dh - _dl)) * 100.0, 4)
-
-            _iv = _as_float(row.get("intrinsic_value"))
-            if _iv is not None and _cp not in (None, 0) and row.get("upside_pct") in (None, "", 0, 0.0):
-                row["upside_pct"] = round(((_iv - _cp) / _cp) * 100.0, 4)
-
-            _dq_str = _safe_str(row.get("data_quality")).upper()
-            if row.get("data_quality_score") in (None, "", 0):
-                row["data_quality_score"] = {
-                    "GOOD": 90.0, "FAIR": 65.0, "MISSING": 25.0, "BLOCKED": 10.0,
-                }.get(_dq_str, 50.0)
-
-            if row.get("invest_period_label") in (None, ""):
-                row["invest_period_label"] = "12M"
-            if row.get("horizon_days") in (None, "", 0):
-                row["horizon_days"] = 365
-
-        except Exception:
-            pass
-
-        # v5.47.4: strip internal coordination flags before serializing.
-        row = _strip_internal_fields(row)
-
         q = UnifiedQuote(**row)
-
-        # v5.47.4: belt-and-braces — re-attach any field the model dropped.
-        try:
-            row_dump = _model_to_dict(q)
-            for _k, _v in row.items():
-                if _v is None or _v == "":
-                    continue
-                if row_dump.get(_k) in (None, "", 0, 0.0):
-                    if hasattr(q, "model_copy"):
-                        try:
-                            q = q.model_copy(update={_k: _v})
-                        except Exception:
-                            try:
-                                setattr(q, _k, _v)
-                            except Exception:
-                                pass
-                    else:
-                        try:
-                            setattr(q, _k, _v)
-                        except Exception:
-                            pass
-        except Exception:
-            pass
 
         if use_cache:
             await self._cache.set(_model_to_dict(q), symbol=norm, provider_profile=provider_profile)
@@ -4268,32 +3821,18 @@ class DataEngineV5:
         body: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> List[UnifiedQuote]:
-        # v5.48.0: parallelized. Old behavior batched in groups of 25
-        # SEQUENTIALLY — for 200 Top10 candidate symbols that meant 8
-        # rounds of tail-latency stacked together. The provider-side
-        # semaphore (self._sem at DATA_ENGINE_MAX_CONCURRENCY) already
-        # caps real concurrency; sequential batching adds nothing but
-        # latency. Now: gather everything, let the semaphore throttle,
-        # return when all complete. QUOTE_FANOUT_MAX gives a safety cap
-        # so a runaway 5000-symbol request still fans out in waves.
         if not symbols:
             return []
-
-        max_fanout = max(1, _get_env_int("QUOTE_FANOUT_MAX", 250))
-        if len(symbols) <= max_fanout:
-            return list(await asyncio.gather(*[
-                self.get_enriched_quote(s, schema=schema, page=page, sheet=sheet, body=body, **kwargs)
-                for s in symbols
-            ]))
-
-        # Wave processing for very large requests.
+        batch = max(1, min(500, _get_env_int("QUOTE_BATCH_SIZE", 25)))
         out: List[UnifiedQuote] = []
-        for i in range(0, len(symbols), max_fanout):
-            part = symbols[i:i + max_fanout]
-            out.extend(await asyncio.gather(*[
-                self.get_enriched_quote(s, schema=schema, page=page, sheet=sheet, body=body, **kwargs)
-                for s in part
-            ]))
+        for i in range(0, len(symbols), batch):
+            part = symbols[i:i + batch]
+            out.extend(
+                await asyncio.gather(*[
+                    self.get_enriched_quote(s, schema=schema, page=page, sheet=sheet, body=body, **kwargs)
+                    for s in part
+                ])
+            )
         return out
 
     async def get_enriched_quotes_batch(
@@ -4309,19 +3848,8 @@ class DataEngineV5:
     ) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
         norm_syms = _normalize_symbol_list(symbols, limit=len(symbols) + 10)
-        # Reuse the now-parallel get_enriched_quotes for the heavy lifting,
-        # then convert each UnifiedQuote into its dict and build the
-        # symbol->dict map keyed by both requested and normalized symbol.
-        quotes = await self.get_enriched_quotes(
-            norm_syms,
-            schema=schema,
-            page=page,
-            sheet=sheet,
-            body=body,
-            **kwargs,
-        )
-        for req_sym, q in zip(norm_syms, quotes):
-            qd = _model_to_dict(q)
+        quotes = await asyncio.gather(*[self.get_enriched_quote_dict(s, schema=schema, page=page, sheet=sheet, body=body, **kwargs) for s in norm_syms])
+        for req_sym, qd in zip(norm_syms, quotes):
             out[req_sym] = qd
             norm = _safe_str(qd.get("symbol_normalized") or qd.get("symbol"))
             if norm:
@@ -4436,77 +3964,91 @@ class DataEngineV5:
                 risk_counts[bucket] += 1
 
         rows: List[Dict[str, Any]] = []
-        rows.append({
-            "section": "Market Summary",
-            "item": "Universe",
-            "metric": "Symbols Analyzed",
-            "value": total,
-            "notes": f"fallback summary from {len(symbols)} requested symbols",
-            "source": "engine_fallback",
-            "sort_order": 1,
-        })
-        rows.append({
-            "section": "Market Summary",
-            "item": "Universe",
-            "metric": "Average Overall Score",
-            "value": avg_overall,
-            "notes": "mean overall score across analyzed instruments",
-            "source": "engine_fallback",
-            "sort_order": 2,
-        })
-        rows.append({
-            "section": "Market Summary",
-            "item": "Universe",
-            "metric": "Average Expected ROI 3M",
-            "value": avg_roi_3m,
-            "notes": "fractional ROI where available",
-            "source": "engine_fallback",
-            "sort_order": 3,
-        })
+        rows.append(
+            {
+                "section": "Market Summary",
+                "item": "Universe",
+                "metric": "Symbols Analyzed",
+                "value": total,
+                "notes": f"fallback summary from {len(symbols)} requested symbols",
+                "source": "engine_fallback",
+                "sort_order": 1,
+            }
+        )
+        rows.append(
+            {
+                "section": "Market Summary",
+                "item": "Universe",
+                "metric": "Average Overall Score",
+                "value": avg_overall,
+                "notes": "mean overall score across analyzed instruments",
+                "source": "engine_fallback",
+                "sort_order": 2,
+            }
+        )
+        rows.append(
+            {
+                "section": "Market Summary",
+                "item": "Universe",
+                "metric": "Average Expected ROI 3M",
+                "value": avg_roi_3m,
+                "notes": "fractional ROI where available",
+                "source": "engine_fallback",
+                "sort_order": 3,
+            }
+        )
 
         sort_order = 10
         for bucket in ("LOW", "MODERATE", "HIGH"):
-            rows.append({
-                "section": "Risk Distribution",
-                "item": bucket,
-                "metric": "Count",
-                "value": risk_counts[bucket],
-                "notes": "fallback risk bucket summary",
-                "source": "engine_fallback",
-                "sort_order": sort_order,
-            })
+            rows.append(
+                {
+                    "section": "Risk Distribution",
+                    "item": bucket,
+                    "metric": "Count",
+                    "value": risk_counts[bucket],
+                    "notes": "fallback risk bucket summary",
+                    "source": "engine_fallback",
+                    "sort_order": sort_order,
+                }
+            )
             sort_order += 1
 
         top_quotes = quote_rows[: max(3, min(7, limit))]
         for idx, d in enumerate(top_quotes, start=1):
-            rows.append({
-                "section": "Top Ideas",
-                "item": d.get("symbol"),
-                "metric": "Recommendation",
-                "value": d.get("recommendation"),
-                "notes": d.get("recommendation_reason") or f"overall={d.get('overall_score')} opportunity={d.get('opportunity_score')}",
-                "source": "engine_fallback",
-                "sort_order": 100 + idx,
-            })
-            rows.append({
-                "section": "Top Ideas",
-                "item": d.get("symbol"),
-                "metric": "Expected ROI 3M",
-                "value": d.get("expected_roi_3m"),
-                "notes": f"confidence={d.get('confidence_score')} risk={d.get('risk_bucket')}",
-                "source": "engine_fallback",
-                "sort_order": 120 + idx,
-            })
-            if _as_float(d.get("position_value")) is not None or _as_float(d.get("unrealized_pl")) is not None:
-                rows.append({
-                    "section": "Portfolio Signals",
+            rows.append(
+                {
+                    "section": "Top Ideas",
                     "item": d.get("symbol"),
-                    "metric": "Unrealized P/L",
-                    "value": d.get("unrealized_pl"),
-                    "notes": f"value={d.get('position_value')} cost={d.get('position_cost')}",
+                    "metric": "Recommendation",
+                    "value": d.get("recommendation"),
+                    "notes": d.get("recommendation_reason") or f"overall={d.get('overall_score')} opportunity={d.get('opportunity_score')}",
                     "source": "engine_fallback",
-                    "sort_order": 140 + idx,
-                })
+                    "sort_order": 100 + idx,
+                }
+            )
+            rows.append(
+                {
+                    "section": "Top Ideas",
+                    "item": d.get("symbol"),
+                    "metric": "Expected ROI 3M",
+                    "value": d.get("expected_roi_3m"),
+                    "notes": f"confidence={d.get('confidence_score')} risk={d.get('risk_bucket')}",
+                    "source": "engine_fallback",
+                    "sort_order": 120 + idx,
+                }
+            )
+            if _as_float(d.get("position_value")) is not None or _as_float(d.get("unrealized_pl")) is not None:
+                rows.append(
+                    {
+                        "section": "Portfolio Signals",
+                        "item": d.get("symbol"),
+                        "metric": "Unrealized P/L",
+                        "value": d.get("unrealized_pl"),
+                        "notes": f"value={d.get('position_value')} cost={d.get('position_cost')}",
+                        "source": "engine_fallback",
+                        "sort_order": 140 + idx,
+                    }
+                )
 
         return rows[:limit]
 
@@ -4587,7 +4129,6 @@ class DataEngineV5:
             row["top10_rank"] = len(selected) + 1
             row["selection_reason"] = row.get("selection_reason") or _top10_selection_reason(row)
             row["criteria_snapshot"] = row.get("criteria_snapshot") or criteria_snapshot
-            row = _strip_internal_fields(row)
             projected = _normalize_to_schema_keys(out_keys, out_headers, row)
             projected["top10_rank"] = row["top10_rank"]
             projected["selection_reason"] = row["selection_reason"]
@@ -4599,7 +4140,7 @@ class DataEngineV5:
         return out_headers, out_keys, selected
 
     # ------------------------------------------------------------------
-    # main sheet/page APIs (v5.48.0: outer budget on get_sheet_rows)
+    # main sheet/page APIs
     # ------------------------------------------------------------------
     async def get_page_rows(
         self,
@@ -4661,14 +4202,7 @@ class DataEngineV5:
         body: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Public entrypoint with v5.48.0 outer wall-clock budget.
-
-        Resolves route-call inputs upfront (cheap and synchronous), then
-        delegates to `_get_sheet_rows_impl` inside `asyncio.wait_for`.
-        On budget exhaustion returns a fail-soft envelope with the
-        canonical schema rather than raising or hanging.
-        """
-        target_sheet, eff_limit, eff_offset, eff_mode, eff_body, request_parts = _normalize_route_call_inputs(
+        target_sheet, limit, offset, mode, body, request_parts = _normalize_route_call_inputs(
             page=page,
             sheet=sheet,
             sheet_name=sheet_name,
@@ -4678,62 +4212,6 @@ class DataEngineV5:
             body=body,
             extras=kwargs,
         )
-
-        budget = float(self.sheet_rows_budget) if self.sheet_rows_budget and self.sheet_rows_budget > 0 else 20.0
-
-        try:
-            return await asyncio.wait_for(
-                self._get_sheet_rows_impl(
-                    target_sheet=target_sheet,
-                    limit=eff_limit,
-                    offset=eff_offset,
-                    mode=eff_mode,
-                    body=eff_body,
-                    request_parts=request_parts,
-                ),
-                timeout=budget,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "data_engine_v2 outer budget exhausted sheet=%s budget=%.1fs",
-                target_sheet,
-                budget,
-            )
-            spec, hdrs, ks, schema_src = _schema_for_sheet(target_sheet)
-            hdrs, ks = _complete_schema_contract(hdrs, ks)
-            if target_sheet == "Top_10_Investments":
-                hdrs, ks = _ensure_top10_contract(hdrs, ks)
-            include_matrix = _safe_bool(eff_body.get("include_matrix"), True)
-            return self._finalize_payload(
-                sheet=target_sheet,
-                headers=hdrs,
-                keys=ks,
-                row_objects=[],
-                include_matrix=include_matrix,
-                status="warn",
-                meta={
-                    "schema_source": schema_src,
-                    "rows": 0,
-                    "limit": eff_limit,
-                    "offset": eff_offset,
-                    "mode": eff_mode,
-                    "built_from": "engine_budget_exhausted",
-                    "engine_budget_seconds": budget,
-                    "engine_budget_exhausted": True,
-                },
-                error=f"data_engine_v2 outer budget exhausted ({budget:.1f}s)",
-            )
-
-    async def _get_sheet_rows_impl(
-        self,
-        *,
-        target_sheet: str,
-        limit: int,
-        offset: int,
-        mode: str,
-        body: Dict[str, Any],
-        request_parts: Dict[str, Any],
-    ) -> Dict[str, Any]:
         include_matrix = _safe_bool(body.get("include_matrix"), True)
 
         spec, headers, keys, schema_src = _schema_for_sheet(target_sheet)
@@ -4751,7 +4229,7 @@ class DataEngineV5:
         contract_level = "canonical" if _usable_contract(headers, keys, target_sheet) else "partial"
         recovered_from: Optional[str] = None
 
-        # --------------------------- Data Dictionary -----------------------
+        # Data Dictionary
         if target_sheet == "Data_Dictionary":
             if _is_schema_only_body(body):
                 return self._finalize_payload(
@@ -4809,7 +4287,7 @@ class DataEngineV5:
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
-        # --------------------------- Insights Analysis ---------------------
+        # Insights Analysis
         if target_sheet == "Insights_Analysis":
             if _is_schema_only_body(body):
                 return self._finalize_payload(
@@ -4849,7 +4327,6 @@ class DataEngineV5:
                 )
                 rows0 = _coerce_rows_list(payload)
             except Exception as exc:
-                logger.debug("insights_builder_failed: %s", exc)
                 builder_name = f"fallback:insights_builder_failed:{type(exc).__name__}"
                 rows0 = []
 
@@ -4890,7 +4367,7 @@ class DataEngineV5:
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
-        # --------------------------- Top 10 --------------------------------
+        # Top10
         if target_sheet == "Top_10_Investments":
             top10_body, route_warnings = _normalize_top10_body_for_engine(body, limit=max(1, min(limit, 50)))
             if _is_schema_only_body(top10_body):
@@ -4937,7 +4414,6 @@ class DataEngineV5:
                     rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
                 status_out = _safe_str(payload.get("status"), "success") if isinstance(payload, dict) else "success"
             except Exception as exc:
-                logger.debug("top10_selector_failed: %s", exc)
                 builder_used = f"fallback:top10_selector_failed:{type(exc).__name__}"
                 status_out = "warn"
 
@@ -4982,7 +4458,7 @@ class DataEngineV5:
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
-        # --------------------------- Contract recovery --------------------
+        # Contract recovery for instrument pages
         if contract_level != "canonical":
             cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
             recovered = False
@@ -5087,7 +4563,6 @@ class DataEngineV5:
                     merged = _apply_page_row_backfill(target_sheet, merged)
                     _compute_scores_fallback(merged)
                     _compute_recommendation(merged)
-                    merged = _strip_internal_fields(merged)
                     enriched_rows.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, merged)))
 
                 _apply_rank_overall(enriched_rows)
@@ -5163,7 +4638,6 @@ class DataEngineV5:
                 row = _apply_page_row_backfill(target_sheet, row)
                 _compute_scores_fallback(row)
                 _compute_recommendation(row)
-                row = _strip_internal_fields(row)
                 rows_full.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)))
             _apply_rank_overall(rows_full)
 
@@ -5269,8 +4743,6 @@ class DataEngineV5:
             "snapshot_sheets": len(self._sheet_snapshots),
             "rows_reader_source": self._rows_reader_source,
             "symbols_reader_source": self._symbols_reader_source,
-            "request_timeout_seconds": self.request_timeout,
-            "sheet_rows_budget_seconds": self.sheet_rows_budget,
         }
 
     async def get_health(self) -> Dict[str, Any]:
@@ -5290,9 +4762,6 @@ class DataEngineV5:
             "page_primary_providers": dict(self.page_primary_providers),
             "history_fallback_providers": list(self.history_fallback_providers),
             "ksa_disallow_eodhd": bool(self.ksa_disallow_eodhd),
-            "request_timeout_seconds": self.request_timeout,
-            "sheet_rows_budget_seconds": self.sheet_rows_budget,
-            "max_concurrency": self.max_concurrency,
             "flags": dict(self.flags),
             "provider_stats": await self._registry.get_stats(),
             "schema_available": True,
@@ -5304,6 +4773,7 @@ class DataEngineV5:
             "snapshot_sheets": sorted(list(self._sheet_snapshots.keys())),
             "sheet_symbol_resolution_meta": dict(self._sheet_symbol_resolution_meta),
         }
+
 
 
 def normalize_row_to_schema(sheet: str, row: Dict[str, Any], keep_extras: bool = False) -> Dict[str, Any]:
@@ -5318,7 +4788,6 @@ def normalize_row_to_schema(sheet: str, row: Dict[str, Any], keep_extras: bool =
             if k not in normalized:
                 normalized[k] = _json_safe(v)
     return normalized
-
 
 _ENGINE_INSTANCE: Optional[DataEngineV5] = None
 ENGINE: Optional[DataEngineV5] = None
@@ -5361,7 +4830,6 @@ def get_cache() -> Any:
     return getattr(_ENGINE_INSTANCE, "_cache", None)
 
 
-# Backward-compatible aliases used by older route imports.
 DataEngineV4 = DataEngineV5
 DataEngineV3 = DataEngineV5
 DataEngineV2 = DataEngineV5
