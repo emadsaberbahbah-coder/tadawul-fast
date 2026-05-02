@@ -20,8 +20,8 @@ fixed-width contracts when the registry cannot be imported.
 
 Canonical targets
 -----------------
-- Standard sheets: 80 columns
-- Top_10_Investments: 83 columns
+- Standard sheets: 84 columns
+- Top_10_Investments: 87 columns
 - Insights_Analysis: 7 columns
 - Data_Dictionary: 9 columns
 
@@ -398,15 +398,7 @@ class UnifiedQuote(BaseModel):
     expected_roi_1m_pct: Optional[float] = None
     expected_roi_3m_pct: Optional[float] = None
     expected_roi_12m_pct: Optional[float] = None
-    # Bare ROI aliases (decimal fraction form, e.g. 0.05 = 5%) — declared so
-    # they aren't silently dropped by serialisers that skip extras.
-    expected_roi_1m: Optional[float] = None
-    expected_roi_3m: Optional[float] = None
-    expected_roi_12m: Optional[float] = None
     forecast_confidence: Optional[float] = None
-    # `confidence_score` is the 0-100 normalised view of forecast_confidence.
-    # Declared explicitly so downstream readers get it by attribute access.
-    confidence_score: Optional[float] = None
     forecast_method: Optional[str] = None
 
     value_score: Optional[float] = None
@@ -417,6 +409,11 @@ class UnifiedQuote(BaseModel):
     opportunity_score: Optional[float] = None
     rank_overall: Optional[float] = None
     confidence_bucket: Optional[str] = None
+
+    fundamental_view: Optional[str] = None
+    technical_view: Optional[str] = None
+    risk_view: Optional[str] = None
+    value_view: Optional[str] = None
 
     recommendation: Optional[Recommendation] = None
     recommendation_reason: Optional[str] = None
@@ -752,6 +749,10 @@ _FALLBACK_STANDARD_HEADERS: List[str] = [
     "Opportunity Score",
     "Rank Overall",
     "Confidence Bucket",
+    "Fundamental View",
+    "Technical View",
+    "Risk View",
+    "Value View",
     "Recommendation",
     "Recommendation Reason",
     "Data Source",
@@ -835,6 +836,10 @@ _FALLBACK_STANDARD_KEYS: List[str] = [
     "opportunity_score",
     "rank_overall",
     "confidence_bucket",
+    "fundamental_view",
+    "technical_view",
+    "risk_view",
+    "value_view",
     "recommendation",
     "recommendation_reason",
     "data_source",
@@ -1013,7 +1018,9 @@ VN_FORECAST: List[str] = _filter_present([
 ], CANONICAL_STANDARD_HEADERS)
 VN_SCORES: List[str] = _filter_present([
     "Value Score", "Quality Score", "Momentum Score", "Growth Score", "Overall Score",
-    "Opportunity Score", "Rank Overall", "Confidence Bucket", "Recommendation", "Recommendation Reason",
+    "Opportunity Score", "Rank Overall", "Confidence Bucket",
+    "Fundamental View", "Technical View", "Risk View", "Value View",
+    "Recommendation", "Recommendation Reason",
     "Risk Score", "Risk Bucket",
 ], CANONICAL_STANDARD_HEADERS)
 VN_META: List[str] = _filter_present([
@@ -1347,12 +1354,12 @@ def validate_sheet_data(sheet_name: str, data: Mapping[str, Any]) -> Tuple[bool,
     headers, keys = get_sheet_contract(canonical)
 
     expected = {
-        "Market_Leaders": 80,
-        "Global_Markets": 80,
-        "Commodities_FX": 80,
-        "Mutual_Funds": 80,
-        "My_Portfolio": 80,
-        "Top_10_Investments": 83,
+        "Market_Leaders": 84,
+        "Global_Markets": 84,
+        "Commodities_FX": 84,
+        "Mutual_Funds": 84,
+        "My_Portfolio": 84,
+        "Top_10_Investments": 87,
         "Insights_Analysis": 7,
         "Data_Dictionary": 9,
     }[canonical]
