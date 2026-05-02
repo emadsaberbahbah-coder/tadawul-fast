@@ -247,7 +247,7 @@ def _spec_kind(spec: Any) -> str:
         return "insights_output"
     if col_count == 9:
         return "dictionary_output"
-    if col_count == 87:
+    if col_count == 88:
         return "top10_output"
     if col_count >= 20:
         return "instrument_table"
