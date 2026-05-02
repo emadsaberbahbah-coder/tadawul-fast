@@ -19,9 +19,9 @@ Hard rules:
 - Missing values are allowed (null/empty), but columns MUST exist
 - No network calls. Import-safe.
 
-Special sheets (must NOT fall back to the 84-col instrument schema):
+Special sheets (must NOT fall back to the 85-col instrument schema):
 - Insights_Analysis: 7 columns (plus criteria_fields metadata)
-- Top_10_Investments: 87 columns (84 canonical + 3 Top10 extras)
+- Top_10_Investments: 88 columns (85 canonical + 3 Top10 extras)
 - Data_Dictionary: 9 columns (generated from registry)
 
 v2.2.0 FIX (addresses alignment + lookup drift causes)
@@ -69,7 +69,7 @@ __all__ = [
     "validate_schema_registry",
 ]
 
-SCHEMA_VERSION = "2.3.0"
+SCHEMA_VERSION = "2.4.0"
 
 # -----------------------------
 # Types / Models
@@ -88,7 +88,7 @@ _ALLOWED_DTYPES = {
 }
 
 _ALLOWED_KINDS = {
-    "instrument_table",   # standard 84 columns row-per-symbol
+    "instrument_table",   # standard 85 columns row-per-symbol
     "insights_analysis",  # criteria block + insights table (7 cols)
     "data_dictionary",    # auto-generated from schema
 }
@@ -190,12 +190,12 @@ def _sanitize_sheet(spec: SheetSpec) -> SheetSpec:
 
 
 # -----------------------------
-# Canonical columns (84)
+# Canonical columns (85)
 # -----------------------------
 
 def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     """
-    Canonical 84 columns used by:
+    Canonical 85 columns used by:
       Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds, My_Portfolio
 
     IMPORTANT:
@@ -270,15 +270,16 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     add("Risk", "Risk Score", "risk_score", "float", "0.00", False, "model", "0-100 or normalized scoring.")
     add("Risk", "Risk Bucket", "risk_bucket", "str", "text", False, "derived", "Low / Moderate / High.")
 
-    # Valuation (6) -> total 50
+    # Valuation (7) -> total 51
     add("Valuation", "P/B", "pb_ratio", "float", "0.00", False, "provider", "Price-to-book.")
     add("Valuation", "P/S", "ps_ratio", "float", "0.00", False, "provider", "Price-to-sales.")
     add("Valuation", "EV/EBITDA", "ev_ebitda", "float", "0.00", False, "provider", "Enterprise value multiple.")
     add("Valuation", "PEG", "peg_ratio", "float", "0.00", False, "provider", "PEG ratio.")
     add("Valuation", "Intrinsic Value", "intrinsic_value", "float", "0.00", False, "model", "Model intrinsic estimate.")
+    add("Valuation", "Upside %", "upside_pct", "pct", "0.00%", False, "model", "(intrinsic_value/current_price)-1.")
     add("Valuation", "Valuation Score", "valuation_score", "float", "0.00", False, "model", "0-100 or normalized scoring.")
 
-    # Forecast (9) -> total 59
+    # Forecast (9) -> total 60
     add("Forecast", "Forecast Price 1M", "forecast_price_1m", "float", "0.00", False, "model", "Forecast horizon 1M.")
     add("Forecast", "Forecast Price 3M", "forecast_price_3m", "float", "0.00", False, "model", "Forecast horizon 3M.")
     add("Forecast", "Forecast Price 12M", "forecast_price_12m", "float", "0.00", False, "model", "Forecast horizon 12M.")
@@ -289,7 +290,7 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     add("Forecast", "Confidence Score", "confidence_score", "float", "0.00", False, "model", "Scored confidence (normalized).")
     add("Forecast", "Confidence Bucket", "confidence_bucket", "str", "text", False, "derived", "High / Medium / Low.")
 
-    # Scores (7) -> total 66
+    # Scores (7) -> total 67
     add("Scores", "Value Score", "value_score", "float", "0.00", False, "model", "0-100 or normalized.")
     add("Scores", "Quality Score", "quality_score", "float", "0.00", False, "model", "0-100 or normalized.")
     add("Scores", "Momentum Score", "momentum_score", "float", "0.00", False, "model", "0-100 or normalized.")
@@ -298,19 +299,19 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     add("Scores", "Opportunity Score", "opportunity_score", "float", "0.00", False, "model", "Composite opportunity score.")
     add("Scores", "Rank (Overall)", "rank_overall", "int", "0", False, "derived", "Rank within page/universe.")
 
-    # Views (4) -> total 70   (added v2.3.0)
+    # Views (4) -> total 71   (added v2.3.0; shifted +1 in v2.4.0)
     add("Views", "Fundamental View", "fundamental_view", "str", "text", False, "derived", "BULLISH / NEUTRAL / BEARISH from quality+growth.")
     add("Views", "Technical View", "technical_view", "str", "text", False, "derived", "BULLISH / NEUTRAL / BEARISH from momentum+RSI.")
     add("Views", "Risk View", "risk_view", "str", "text", False, "derived", "LOW / MODERATE / HIGH from risk_score.")
     add("Views", "Value View", "value_view", "str", "text", False, "derived", "CHEAP / FAIR / EXPENSIVE from valuation_score+intrinsic.")
 
-    # Recommendation (4) -> total 74
+    # Recommendation (4) -> total 75
     add("Recommendation", "Recommendation", "recommendation", "str", "text", False, "model/derived", "BUY / HOLD / AVOID etc.")
     add("Recommendation", "Recommendation Reason", "recommendation_reason", "str", "text", False, "model", "Short explanation for UI.")
     add("Recommendation", "Horizon Days", "horizon_days", "int", "0", False, "criteria/derived", "Internal horizon in days.")
     add("Recommendation", "Invest Period Label", "invest_period_label", "str", "text", False, "derived", "1M / 3M / 12M label.")
 
-    # Portfolio (6) -> total 80
+    # Portfolio (6) -> total 81
     add("Portfolio", "Position Qty", "position_qty", "float", "0.00", False, "sheet/user", "Portfolio quantity.")
     add("Portfolio", "Avg Cost", "avg_cost", "float", "0.00", False, "sheet/user", "Average cost per unit.")
     add("Portfolio", "Position Cost", "position_cost", "float", "0.00", False, "derived", "position_qty * avg_cost.")
@@ -318,7 +319,7 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     add("Portfolio", "Unrealized P/L", "unrealized_pl", "float", "0.00", False, "derived", "position_value - position_cost.")
     add("Portfolio", "Unrealized P/L %", "unrealized_pl_pct", "pct", "0.00%", False, "derived", "unrealized_pl / position_cost.")
 
-    # Provenance (4) -> total 84
+    # Provenance (4) -> total 85
     add("Provenance", "Data Provider", "data_provider", "str", "text", False, "system", "Primary provider used for the row.")
     add("Provenance", "Last Updated (UTC)", "last_updated_utc", "datetime", "yyyy-mm-dd hh:mm:ss", False, "system", "Last update UTC.")
     add("Provenance", "Last Updated (Riyadh)", "last_updated_riyadh", "datetime", "yyyy-mm-dd hh:mm:ss", False, "system", "Last update Asia/Riyadh.")
@@ -443,7 +444,7 @@ _RAW_SCHEMA_REGISTRY: Dict[str, SheetSpec] = {
         columns=_sanitize_columns(
             "Top_10_Investments",
             "instrument_table",
-            _CANONICAL_COLUMNS + _top10_extra_columns(),  # 87 columns target
+            _CANONICAL_COLUMNS + _top10_extra_columns(),  # 88 columns target
             enforce_symbol_first=True,
         ),
         notes="Criteria-driven selection. Canonical columns + Top10 extras.",
@@ -750,14 +751,14 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
             seen_headers.add(col.header)
 
         if sheet_name in {"Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"}:
-            if len(spec.columns) != 84:
-                raise ValueError(f"[{sheet_name}] instrument_table must be 84 columns. Got: {len(spec.columns)}")
+            if len(spec.columns) != 85:
+                raise ValueError(f"[{sheet_name}] instrument_table must be 85 columns. Got: {len(spec.columns)}")
             if spec.columns[0].key != "symbol":
                 raise ValueError(f"[{sheet_name}] First column must be 'symbol'.")
 
         if sheet_name == "Top_10_Investments":
-            if len(spec.columns) != 87:
-                raise ValueError(f"[Top_10_Investments] must be 87 columns (84 + 3). Got: {len(spec.columns)}")
+            if len(spec.columns) != 88:
+                raise ValueError(f"[Top_10_Investments] must be 88 columns (85 + 3). Got: {len(spec.columns)}")
             if spec.columns[0].key != "symbol":
                 raise ValueError("[Top_10_Investments] First column must be 'symbol' (no blank leading column).")
 
