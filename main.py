@@ -2,84 +2,50 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.11.1)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.11.2)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
 
-Why this revision (v8.11.1 vs v8.11.0)
+Why this revision (v8.11.2 vs v8.11.1)
 --------------------------------------
-- FIX MEDIUM: Middleware ordering. v8.11.0 added RequestIDMiddleware FIRST,
-    NoResponseGuard second, GZip third. Starlette applies middleware in LIFO
-    stack order, so the OUTERMOST wrapper is the last added. v8.11.0's order
-    meant the effective outer-to-inner chain was [GZip, NoResponseGuard,
-    RequestID], making NoResponseGuardMiddleware run BEFORE RequestIDMiddleware
-    on the request path. The guard's `_request_id_from_request` helper had to
-    fall back to reading the X-Request-ID header directly since
-    `request.state.request_id` hadn't been set yet -- works for clients that
-    send the header but misses server-generated IDs when they don't.
-    v8.11.1 reorders: GZip first (innermost), NoResponseGuard second, RequestID
-    LAST (outermost). Now `request.state.request_id` is set BEFORE any other
-    middleware sees the request, and the X-Request-ID header is guaranteed on
-    every response including those synthesized by NoResponseGuardMiddleware.
+- FIX HIGH: Removed `routes.advanced_sheet_rows` from _CONTROLLED_ROUTE_PLAN.
+    Background: every route this module exposes (`/v1/advanced/sheet-rows`,
+    `/v1/advanced/health`) is canonically owned by `routes.investment_advisor`
+    per _CONTROLLED_CANONICAL_OWNER_MAP. When the controlled mount loop
+    processed `routes.advanced_sheet_rows`, _clone_filtered_router stripped
+    every route via the canonical-owner check (line: `canonical_owner != key`),
+    leaving 0 routes to add. v8.11.0 silently bucketed that into `no_router`
+    without counting it as failed; v8.11.1 expanded the strict-mode fail
+    surface AND _effective_failed_modules now counts `no_router` entries as
+    failed regardless of strict mode -- producing `failed_count: 1` and
+    `effective_failed_modules: ["routes.advanced_sheet_rows"]` on every boot
+    even though the service is fully functional (every URL is served by
+    `routes.investment_advisor` instead).
 
-- FIX MEDIUM: Exception handler now sets `X-Request-ID` HEADER on 500
-    responses. v8.11.0 included request_id in the JSON body but not as a
-    response header, breaking header-based log-correlation for clients
-    (Sentry, Datadog APM, etc.) that rely on the standard tracing header.
+    Removing the entry from the plan eliminates the redundant import,
+    eliminates the misleading "failed" status, and matches the actual route
+    topology where investment_advisor owns the entire `/v1/advanced/*` prefix.
+    The file `routes/advanced_sheet_rows.py` itself is left in the repo
+    untouched; it is simply no longer mounted.
 
-- FIX MEDIUM: NoResponseGuardMiddleware sets `X-Request-ID` HEADER on the
-    two synthesized 500 responses (None-response branch and
-    "No response returned" RuntimeError branch).
+- ADD: APP_ENTRY_VERSION bumped to 8.11.2.
 
-- FIX LOW: Fallback auth env-var list (used when config.py / core.config
-    imports fail) expanded to include `TFB_BEARER_TOKEN`, `BEARER_TOKEN`,
-    `TFB_API_KEY`, `API_KEY`, `X_API_KEY`. This brings parity with
-    config.py v7.3.0's from_env() token harvest, so a deployment that works
-    when config.py is importable also works when it fails at startup.
-
-- FIX LOW: `api_key` kwarg added to the first `_call_auth_ok_flexible`
-    attempt dict. config.py v7.3.0's `auth_ok` has an `api_key` parameter
-    for X-API-Key header routing; v8.11.0 silently fell through to the
-    simpler second attempt dict and lost the distinction.
-
-- FIX LOW: Strict mode now raises on "0 routes after filtering" for
-    non-optional modules. v8.11.0 silently recorded the condition under
-    `no_router` without checking the strict flag, allowing a partially-
-    wired service to boot even with ROUTES_STRICT_IMPORT=1.
-
-- ADD: `SERVICE_VERSION = APP_ENTRY_VERSION` cross-module canonical alias.
-    Matches worker.py v4.3.0, config.py v7.3.0, env.py v7.8.1,
-    track_performance v6.4.0, run_dashboard_sync v6.5.0.
-
-- ADD: `service_version` key in `_runtime_meta()` output alongside
-    `entry_version`. Telemetry endpoints now surface both names.
-
-- ADD: `_append_startup_warning(app, message)` helper that consolidates
-    the try/except pattern used at ~7 call sites in v8.11.0, deduplicates
-    warnings, and truncates messages longer than 2000 chars.
-
-- ADD: `_path_present_any(paths, *candidates)` helper for minor
-    diagnostic cleanup. Also expands the enriched_sheet_rows_* presence
-    detection to cover both `/sheet-rows` and `/sheet_rows` alias forms
-    (matches the canonical owner map's scope).
-
-- CLEANUP: `Sequence` removed from the `typing` import -- dead since
-    v8.10.0. No behavioral change.
-
-- SAFE: All v8.11.0 behavior preserved:
-    - Custom OpenAPI schema cache (signature-count-keyed) with native
-      FastAPI `docs_url`/`redoc_url`/`openapi_url`
+- SAFE: All v8.11.1 behavior preserved:
+    - Middleware ordering (RequestID outermost)
+    - X-Request-ID header on synthesized 500 responses
+    - api_key kwarg in _call_auth_ok_flexible
+    - Strict-mode raise on "0 routes after filtering"
+    - SERVICE_VERSION cross-module canonical alias
+    - service_version key in _runtime_meta()
+    - _append_startup_warning consolidation helper
+    - _path_present_any helper
+    - Custom OpenAPI signature-count-keyed cache
     - Controlled route mounting with canonical owner protection
-    - `investment_advisor` owns `/v1/advanced/sheet-rows`
-    - `investment_advisor` mounts BEFORE `advanced_sheet_rows`
-    - `allow_query_token` respected when config.py sets it
-    - `_secure_equals` timing-safe hmac.compare_digest comparison
-    - X-API-Key / Api-Key header support
-    - Canonical-path protection in `_clone_filtered_router`
-    - Engine init remains timeout-aware and non-fatal unless strict mode
+    - investment_advisor mounts BEFORE any potential advanced_sheet_rows
+      (now moot since the latter is removed)
 """
 from __future__ import annotations
 
@@ -229,7 +195,7 @@ class _StrictJSONResponse(JSONResponse):
 # =============================================================================
 # Version
 # =============================================================================
-APP_ENTRY_VERSION = "8.11.1"
+APP_ENTRY_VERSION = "8.11.2"
 # v8.11.1: Cross-module canonical alias (matches worker.py v4.3.0,
 # config.py v7.3.0, env.py v7.8.1, track_performance v6.4.0, etc.)
 SERVICE_VERSION = APP_ENTRY_VERSION
@@ -292,12 +258,20 @@ _OPTIONAL_ROUTE_MODULES: Set[str] = {
     "routes.routes_argaam",
 }
 
+# v8.11.2 FIX: routes.advanced_sheet_rows removed from the controlled plan.
+# Every URL it serves (/v1/advanced/sheet-rows, /v1/advanced/health) is
+# canonically owned by routes.investment_advisor per the owner map above,
+# so the filtered-router clone stripped 100% of its routes and bucketed it
+# under no_router["router filtered to 0 routes"]. v8.11.1's stricter
+# _effective_failed_modules counted that as failed, producing a misleading
+# `failed=1` boot status. The file routes/advanced_sheet_rows.py is still
+# in the repo but is no longer mounted; investment_advisor handles every
+# /v1/advanced/* path.
 _CONTROLLED_ROUTE_PLAN: Tuple[Tuple[str, str], ...] = (
     ("config", "routes.config"),
     ("advanced_analysis", "routes.advanced_analysis"),
     ("analysis_sheet_rows", "routes.analysis_sheet_rows"),
     ("investment_advisor", "routes.investment_advisor"),
-    ("advanced_sheet_rows", "routes.advanced_sheet_rows"),
     ("advisor", "routes.advisor"),
     ("enriched_quote", "routes.enriched_quote"),
 )
