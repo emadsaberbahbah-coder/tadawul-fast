@@ -126,12 +126,12 @@ _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 84,
-    "Global_Markets": 84,
-    "Commodities_FX": 84,
-    "Mutual_Funds": 84,
-    "My_Portfolio": 84,
-    _TOP10_PAGE: 87,
+    "Market_Leaders": 85,
+    "Global_Markets": 85,
+    "Commodities_FX": 85,
+    "Mutual_Funds": 85,
+    "My_Portfolio": 85,
+    _TOP10_PAGE: 88,
     _INSIGHTS_PAGE: 7,
     _DICTIONARY_PAGE: 9,
 }
@@ -205,7 +205,7 @@ _CANONICAL_80_HEADERS: List[str] = [
     "Dividend Yield", "Payout Ratio", "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin",
     "Operating Margin", "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)", "RSI (14)",
     "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)", "Sharpe (1Y)",
-    "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value",
+    "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %",
     "Valuation Score", "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence",
     "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
@@ -226,7 +226,7 @@ _CANONICAL_80_KEYS: List[str] = [
     "gross_margin", "operating_margin", "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y",
     "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
-    "intrinsic_value", "valuation_score", "forecast_price_1m", "forecast_price_3m",
+    "intrinsic_value", "upside_pct", "valuation_score", "forecast_price_1m", "forecast_price_3m",
     "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket", "value_score", "quality_score",
     "momentum_score", "growth_score", "overall_score",
@@ -707,7 +707,7 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, 87)
+    return _pad_contract(hdrs, ks, 88)
 
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
@@ -720,7 +720,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, 84)
+    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, 85)
     return h, k, "static_canonical_instrument"
 
 
@@ -732,7 +732,7 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    return _EXPECTED_SHEET_LENGTHS.get(page, 84)
+    return _EXPECTED_SHEET_LENGTHS.get(page, 85)
 
 
 def _schema_columns_from_any(spec: Any) -> List[Any]:
@@ -1455,7 +1455,7 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
         if kk == "intrinsic_value":
             return round(base * 1.04, 2)
         return round(base, 2)
-    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "week_52_position_pct", "unrealized_pl_pct", "dividend_yield", "payout_ratio", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score", "value_score", "quality_score", "momentum_score", "growth_score", "valuation_score", "risk_score", "beta_5y", "rsi_14", "gross_margin", "operating_margin", "profit_margin", "sharpe_1y", "var_95_1d", "volatility_30d", "volatility_90d", "max_drawdown_1y"}:
+    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "week_52_position_pct", "unrealized_pl_pct", "dividend_yield", "payout_ratio", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score", "value_score", "quality_score", "momentum_score", "growth_score", "valuation_score", "risk_score", "beta_5y", "rsi_14", "gross_margin", "operating_margin", "profit_margin", "sharpe_1y", "var_95_1d", "volatility_30d", "volatility_90d", "max_drawdown_1y", "upside_pct"}:
         score_base = max(1.0, 100.0 - float(row_index * 3))
         mapping = {
             "price_change": round(0.5 + row_index * 0.1, 2),
