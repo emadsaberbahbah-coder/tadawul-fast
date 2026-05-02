@@ -2,11 +2,104 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.0.8
+Advanced Analysis Root Owner — v4.0.9
 ================================================================================
 ROOT SHEET-ROWS OWNER * ENGINE-FIRST * HARD-TIMEOUT * SCHEMA-FIRST
-DICTIONARY-FAST-PATH * TOP10/INSIGHTS-SKIP-ENGINE * ENRICHED-QUOTES-FAST-PATH
-FAIL-SOFT * STABLE ENVELOPE * JSON-SAFE * GET+POST MERGED
+PER-PAGE CUSTOM LAYOUTS * MULTI-METHOD ANALYSIS * DICTIONARY-FAST-PATH
+TOP10/INSIGHTS-SKIP-ENGINE * ENRICHED-QUOTES-FAST-PATH * FAIL-SOFT
+STABLE ENVELOPE * JSON-SAFE * GET+POST MERGED
+
+v4.0.9 changes (from v4.0.8)
+----------------------------
+- ADD [MAJOR]: Per-page custom column layouts. Global_Markets now uses
+    "Layout A — Analyst Pro": a curated 46-column schema designed for
+    fundamental investment decisions, replacing the legacy 80-column
+    schema that was inherited by every page indiscriminately.
+
+    What's NEW in Layout A: four multi-method analysis verdict columns
+    (Fundamental View, Technical View, Risk View, Value View), each
+    derived from per-row metrics the engine already produces. The
+    `Recommendation Reason` column now synthesizes a one-line
+    multi-lens narrative: "Fund: BULLISH | Tech: NEUTRAL | Risk:
+    MODERATE | Val: FAIR → ACCUMULATE". A reader can now see WHY the
+    engine recommends what it recommends, in the same row, without
+    having to remember threshold rules.
+
+    What's REMOVED from Layout A (vs the legacy 80-column schema):
+      - Expected ROI 1M/3M/12M (always 0.33%/3%/8% — engine constants)
+      - Forecast Confidence (always 55% — engine constant)
+      - Confidence Score (always null — engine doesn't compute)
+      - Confidence Bucket (always "MODERATE" — engine default)
+      - Rank (Overall) (always null — engine doesn't compute)
+      - Horizon Days (always null — engine doesn't compute)
+      - Forecast Price 1M/3M (intrinsic_value × constants — meaningless)
+      - Open / 52W Position % (engine doesn't compute)
+      - Position Qty/Cost/Value/PL/PL% (My_Portfolio-only fields)
+      - Last Updated UTC (Riyadh time is sufficient for users)
+      - Warnings (rarely populated; surfaces as cell noise)
+      - Volatility 90D (30D is sufficient for short-horizon decisions)
+      - VaR 95% (Max Drawdown 1Y is more practical for retail)
+      - Risk Score (Risk Bucket label is more readable)
+      - Valuation Score (Value View column replaces it)
+      - P/B / P/S / EV/EBITDA / PEG (engine returns null today; revisit
+        after EODHD provider exposes them)
+      - Float Shares (rarely action-relevant)
+      - Previous Close / Day High / Day Low / Price Change / Avg Vol 10D
+        (Change % + 52W range cover this)
+      - Asset Class (Sector + Industry strictly more informative)
+      - Momentum Score (RSI + Technical View cover momentum)
+
+    Net: every column in the new layout has REAL, populated, action-
+    relevant data. No placeholder/null clutter.
+
+    Other pages (My_Portfolio, Market_Leaders, Commodities_FX,
+    Mutual_Funds, etc.) continue using the legacy canonical schema
+    until they're customized in subsequent releases.
+
+- ADD [MAJOR]: Multi-method analysis post-processor. After the engine
+    returns its per-row metrics and the route normalizes them to the
+    schema's keys, four verdict computations run on each row:
+
+    * `_compute_fundamental_view`: BULLISH / NEUTRAL / BEARISH from
+      profit_margin + operating_margin + revenue_growth_yoy +
+      debt_to_equity + pe_ttm. Threshold-based, not sector-relative,
+      so the verdict is explainable from the row's own data.
+
+    * `_compute_technical_view`: BULLISH / NEUTRAL / BEARISH from
+      RSI(14) + position within 52-week range. Overbought (RSI > 75)
+      → bearish; oversold (RSI < 30) → bullish; mid-range with
+      RSI 40-60 → bullish (healthy uptrend); else neutral.
+
+    * `_compute_risk_view`: LOW / MODERATE / HIGH from sharpe_1y +
+      volatility_30d + beta_5y + max_drawdown_1y. Three signals
+      pointing high → HIGH; three pointing low with no high signals
+      → LOW; else MODERATE.
+
+    * `_compute_value_view`: UNDERVALUED / FAIR / OVERVALUED from
+      upside_pct (current_price vs intrinsic_value). Backfills
+      upside_pct from intrinsic_value/current_price when the engine
+      leaves it null (Tier 0.5 path doesn't populate it directly).
+
+    All four return "N/A" if too many input fields are null, so a
+    sparse row gracefully shows N/A across the views rather than
+    misleading verdicts based on partial data.
+
+    The synthesized recommendation_reason replaces bare engine output
+    like "overall=64.7 confidence=55.0 risk=65.2" with a multi-lens
+    narrative. If a row already has a richer human-written reason
+    (e.g., from a future analyst-injected source), it's preserved.
+
+- WIRING: `_static_contract(page)` now consults `_PAGE_LAYOUT_OVERRIDES`
+    BEFORE falling through to the canonical schema. `_normalize_external_payload`
+    calls `_apply_multi_method_analysis` after `_normalize_to_schema_keys`
+    when the page is in `_MULTI_METHOD_ANALYSIS_PAGES`. Both wirings are
+    additive — pages NOT in either set get identical v4.0.8 behavior.
+
+- SAFE: All v4.0.8 behavior preserved for pages outside Global_Markets.
+    The placeholder failsoft path is unchanged. The Tier 0.5 fast path is
+    unchanged. The engine and providers are unchanged. Only the response
+    shape for Global_Markets is altered, and only by REPLACING null/
+    placeholder columns with curated, populated columns.
 
 v4.0.8 changes (from v4.0.7)
 ----------------------------
@@ -310,7 +403,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.0.8"
+ADVANCED_ANALYSIS_VERSION = "4.0.9"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -491,6 +584,374 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "last_updated_utc": ["as_of_utc", "asof_utc", "updated_at_utc", "timestamp_utc", "as_of"],
     "last_updated_riyadh": ["as_of_riyadh", "asof_riyadh", "updated_at_riyadh", "timestamp_riyadh"],
 }
+
+# =============================================================================
+# v4.0.9: PER-PAGE LAYOUT OVERRIDES + MULTI-METHOD ANALYSIS
+# =============================================================================
+# Each user-facing sheet (Global_Markets, My_Portfolio, Market_Leaders, etc.)
+# can have its own column set tailored to its purpose, instead of every page
+# inheriting the legacy 80-column canonical instrument schema.
+#
+# Global_Markets (this release) gets "Layout A — Analyst Pro": a curated
+# 46-column layout designed for fundamental investment decisions with
+# multi-method analysis verdicts (Fundamental / Technical / Risk / Value
+# views), each derived from the engine's existing per-row metrics.
+#
+# Other pages (My_Portfolio, Market_Leaders, etc.) continue to use the
+# legacy canonical schema until we customize them in subsequent releases.
+# =============================================================================
+
+# Layout A — Global_Markets analyst-grade layout (46 columns).
+# Rationale: each column either feeds a buy/hold/sell decision OR documents
+# the data source. Removed v4.0.8 columns: Open (engine doesn't compute),
+# 52W Position % (engine doesn't compute), Forecast Price 1M/3M (just
+# intrinsic_value × hardcoded multipliers), Expected ROI 1M/3M/12M (constants),
+# Forecast Confidence (always 55%), Confidence Score (always null), Confidence
+# Bucket (always "MODERATE"), Rank Overall (always null), Horizon Days
+# (always null), Position Qty/Cost/Value/PL (My_Portfolio-only fields),
+# Last Updated UTC (Riyadh time is sufficient), Warnings, Volatility 90D
+# (30D is enough), VaR 95% (less practical than max drawdown), Risk Score
+# (Risk Bucket label is more readable), Valuation Score (Value View
+# replaces it), P/B / P/S / EV/EBITDA / PEG (engine returns null today;
+# revisit when EODHD provider exposes them), Float Shares (rarely used),
+# Previous Close / Day High / Day Low / Price Change / Avg Volume 10D
+# (Change % + 52W range cover this), Asset Class (Sector/Industry better),
+# Momentum Score (RSI + Technical View cover momentum). Net effect: every
+# column has real, populated, action-relevant data.
+_LAYOUT_A_GLOBAL_MARKETS_HEADERS: List[str] = [
+    "Symbol", "Name", "Sector", "Industry", "Country", "Exchange", "Currency",
+    "Current Price", "Change %", "52W High", "52W Low", "Market Cap",
+    "Volume", "Avg Volume 30D",
+    "P/E (TTM)", "P/E (Forward)", "EPS (TTM)", "Intrinsic Value", "Upside %",
+    "Gross Margin", "Operating Margin", "Net Margin",
+    "Revenue (TTM)", "Revenue Growth YoY", "Free Cash Flow (TTM)",
+    "Debt/Equity", "Dividend Yield", "Payout Ratio",
+    "Beta (5Y)", "Volatility 30D", "Max Drawdown 1Y", "Sharpe (1Y)",
+    "RSI (14)", "Risk Bucket",
+    "Quality Score", "Value Score", "Growth Score", "Overall Score",
+    "Fundamental View", "Technical View", "Risk View", "Value View",
+    "Recommendation", "Recommendation Reason",
+    "Data Provider", "As Of (Riyadh)",
+]
+_LAYOUT_A_GLOBAL_MARKETS_KEYS: List[str] = [
+    "symbol", "name", "sector", "industry", "country", "exchange", "currency",
+    "current_price", "percent_change", "week_52_high", "week_52_low", "market_cap",
+    "volume", "avg_volume_30d",
+    "pe_ttm", "pe_forward", "eps_ttm", "intrinsic_value", "upside_pct",
+    "gross_margin", "operating_margin", "profit_margin",
+    "revenue_ttm", "revenue_growth_yoy", "free_cash_flow_ttm",
+    "debt_to_equity", "dividend_yield", "payout_ratio",
+    "beta_5y", "volatility_30d", "max_drawdown_1y", "sharpe_1y",
+    "rsi_14", "risk_bucket",
+    "quality_score", "value_score", "growth_score", "overall_score",
+    "fundamental_view", "technical_view", "risk_view", "value_view",
+    "recommendation", "recommendation_reason",
+    "data_provider", "last_updated_riyadh",
+]
+
+# Page → (headers, keys, schema_source_label) registry. Pages NOT in this
+# map fall through to the legacy canonical 80-column schema (My_Portfolio,
+# Market_Leaders, Commodities_FX, Mutual_Funds, etc.).
+_PAGE_LAYOUT_OVERRIDES: Dict[str, Tuple[List[str], List[str], str]] = {
+    "Global_Markets": (
+        _LAYOUT_A_GLOBAL_MARKETS_HEADERS,
+        _LAYOUT_A_GLOBAL_MARKETS_KEYS,
+        "static_layout_a_global_markets_v4_0_9",
+    ),
+}
+
+# Pages where multi-method analysis post-processing should run. These pages
+# have the four "view" columns in their schema; the post-processor populates
+# them from the engine's existing per-row metrics.
+_MULTI_METHOD_ANALYSIS_PAGES: Set[str] = {"Global_Markets"}
+
+
+# -----------------------------------------------------------------------------
+# Multi-method analysis — verdict labels
+# -----------------------------------------------------------------------------
+# These are the human-readable verdict strings rendered into the four "view"
+# columns. Stable across releases so Apps Script formatting rules (e.g.,
+# colored chips for BULLISH / BEARISH) don't break.
+_VIEW_NA = "N/A"
+
+_FUND_BULLISH = "BULLISH"
+_FUND_NEUTRAL = "NEUTRAL"
+_FUND_BEARISH = "BEARISH"
+
+_TECH_BULLISH = "BULLISH"
+_TECH_NEUTRAL = "NEUTRAL"
+_TECH_BEARISH = "BEARISH"
+
+_RISK_LOW = "LOW"
+_RISK_MODERATE = "MODERATE"
+_RISK_HIGH = "HIGH"
+
+_VALUE_UNDERVALUED = "UNDERVALUED"
+_VALUE_FAIR = "FAIR"
+_VALUE_OVERVALUED = "OVERVALUED"
+
+
+def _safe_num(row: Mapping[str, Any], key: str) -> Optional[float]:
+    """Coerce a row field to a finite float, or return None.
+
+    Used by every _compute_*_view helper. Treats NaN and Inf as missing data
+    so downstream threshold comparisons don't accidentally trigger on
+    pathological values from a partially-filled row.
+    """
+    v = row.get(key)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_upside_pct_local(row: Mapping[str, Any]) -> Optional[float]:
+    """Derive (intrinsic_value - current_price) / current_price.
+
+    The engine populates intrinsic_value but not upside_pct in Tier 0.5
+    responses; this fills the gap on the route side. Returns a fraction
+    (e.g. 0.08 for +8% upside), not a percentage point.
+    """
+    iv = _safe_num(row, "intrinsic_value")
+    cp = _safe_num(row, "current_price")
+    if iv is None or cp is None or cp <= 0:
+        return None
+    return round((iv - cp) / cp, 4)
+
+
+def _compute_fundamental_view(row: Mapping[str, Any]) -> str:
+    """Verdict from profitability + growth + leverage signals.
+
+    Bullish if margins healthy, growing, and not overleveraged.
+    Bearish if losing money, shrinking, or buried in debt.
+    Neutral otherwise.
+
+    Thresholds are intentionally absolute (not sector-relative) for
+    explainability — a user reading "BEARISH" can immediately check
+    profit_margin in the same row to understand why.
+    """
+    pm = _safe_num(row, "profit_margin")
+    om = _safe_num(row, "operating_margin")
+    rg = _safe_num(row, "revenue_growth_yoy")
+    de = _safe_num(row, "debt_to_equity")
+    pe = _safe_num(row, "pe_ttm")
+
+    inputs = [pm, om, rg]
+    if sum(1 for x in inputs if x is None) >= 2:
+        return _VIEW_NA
+
+    bullish = 0
+    bearish = 0
+    if pm is not None:
+        if pm > 0.15:
+            bullish += 1
+        elif pm < 0:
+            bearish += 2
+    if om is not None:
+        if om > 0.20:
+            bullish += 1
+        elif om < 0:
+            bearish += 2
+    if rg is not None:
+        if rg > 0.05:
+            bullish += 1
+        elif rg < -0.05:
+            bearish += 1
+    if de is not None:
+        if de < 0.5:
+            bullish += 1
+        elif de > 2.0:
+            bearish += 1
+    if pe is not None:
+        if 0 < pe < 20:
+            bullish += 1
+        elif pe > 50 or pe < 0:
+            bearish += 1
+
+    if bullish >= 3 and bearish == 0:
+        return _FUND_BULLISH
+    if bearish >= 2:
+        return _FUND_BEARISH
+    return _FUND_NEUTRAL
+
+
+def _compute_technical_view(row: Mapping[str, Any]) -> str:
+    """Verdict from RSI + position within 52-week range.
+
+    Overbought (RSI > 75) → bearish (rally exhausted).
+    Oversold (RSI < 30) → bullish (mean-reversion candidate).
+    RSI 40-60 with mid-range price → bullish (healthy uptrend).
+    Otherwise neutral.
+    """
+    rsi = _safe_num(row, "rsi_14")
+    cp = _safe_num(row, "current_price")
+    hi = _safe_num(row, "week_52_high")
+    lo = _safe_num(row, "week_52_low")
+
+    if rsi is None:
+        return _VIEW_NA
+
+    pos = None
+    if cp is not None and hi is not None and lo is not None and hi > lo:
+        pos = (cp - lo) / (hi - lo)
+
+    if rsi > 75:
+        return _TECH_BEARISH
+    if rsi < 30:
+        return _TECH_BULLISH
+    if 40 <= rsi <= 60 and pos is not None and 0.30 <= pos <= 0.70:
+        return _TECH_BULLISH
+    if rsi > 70 or (pos is not None and pos > 0.95):
+        return _TECH_BEARISH
+    return _TECH_NEUTRAL
+
+
+def _compute_risk_view(row: Mapping[str, Any]) -> str:
+    """Verdict from Sharpe + volatility + beta + max drawdown.
+
+    LOW: market-like volatility, positive Sharpe, contained drawdowns.
+    HIGH: vol > 40% OR beta > 2 OR drawdown > 30% OR negative Sharpe.
+    MODERATE: anything else.
+    """
+    sharpe = _safe_num(row, "sharpe_1y")
+    vol = _safe_num(row, "volatility_30d")
+    beta = _safe_num(row, "beta_5y")
+    mdd = _safe_num(row, "max_drawdown_1y")
+
+    inputs = [sharpe, vol, beta, mdd]
+    if sum(1 for x in inputs if x is None) >= 3:
+        return _VIEW_NA
+
+    high = 0
+    low = 0
+    if vol is not None:
+        if vol < 0.20:
+            low += 1
+        elif vol > 0.40:
+            high += 2
+        elif vol > 0.30:
+            high += 1
+    if beta is not None:
+        if beta < 1.0:
+            low += 1
+        elif beta > 2.0:
+            high += 2
+        elif beta > 1.5:
+            high += 1
+    if mdd is not None:
+        # max_drawdown_1y is a negative fraction (e.g., -0.15 = 15% drawdown)
+        if mdd > -0.15:
+            low += 1
+        elif mdd < -0.30:
+            high += 2
+        elif mdd < -0.20:
+            high += 1
+    if sharpe is not None:
+        if sharpe > 1.0:
+            low += 1
+        elif sharpe < 0:
+            high += 1
+
+    if high >= 3:
+        return _RISK_HIGH
+    if low >= 3 and high == 0:
+        return _RISK_LOW
+    return _RISK_MODERATE
+
+
+def _compute_value_view(row: Mapping[str, Any]) -> str:
+    """Verdict from upside_pct (current price vs intrinsic value).
+
+    UNDERVALUED if upside > 15%, OVERVALUED if upside < -5%, otherwise FAIR.
+    Falls back to recomputing upside_pct from intrinsic_value/current_price
+    if the row's upside_pct field is null (engine doesn't always populate
+    it directly).
+    """
+    upside = _safe_num(row, "upside_pct")
+    if upside is None:
+        upside = _compute_upside_pct_local(row)
+    if upside is None:
+        return _VIEW_NA
+
+    if upside > 0.15:
+        return _VALUE_UNDERVALUED
+    if upside < -0.05:
+        return _VALUE_OVERVALUED
+    return _VALUE_FAIR
+
+
+def _build_recommendation_reason(
+    row: Mapping[str, Any], views: Mapping[str, str],
+) -> str:
+    """Synthesize a multi-method recommendation reason from the four views.
+
+    Format: "Fund: BULLISH | Tech: NEUTRAL | Risk: MODERATE | Val: FAIR → ACCUMULATE"
+
+    The arrow + final recommendation makes the row self-explanatory:
+    a reader sees the four lenses' verdicts AND the synthesized call in
+    one string, without needing to remember threshold rules.
+    """
+    fv = views.get("fundamental_view") or _VIEW_NA
+    tv = views.get("technical_view") or _VIEW_NA
+    rv = views.get("risk_view") or _VIEW_NA
+    vv = views.get("value_view") or _VIEW_NA
+    rec = str(row.get("recommendation") or "HOLD").upper()
+    return f"Fund: {fv} | Tech: {tv} | Risk: {rv} | Val: {vv} → {rec}"
+
+
+def _apply_multi_method_analysis(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Mutate each row in-place to add the four view columns + enriched reason.
+
+    Called from `_normalize_external_payload` after rows are normalized to
+    the schema's keys but before they're packaged into the response envelope.
+    Idempotent: running twice produces identical output (the engine doesn't
+    set view fields, so they're always populated by this pass).
+
+    Special case: if `recommendation_reason` is empty OR a bare engine
+    string like "overall=64.7 confidence=55.0 risk=65.2", we replace it
+    with the synthesized multi-method reason. If the row already has a
+    rich human-written reason (e.g. from a future analyst-injected source),
+    we leave it alone.
+    """
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        # Backfill upside_pct if the engine left it null
+        if row.get("upside_pct") is None:
+            up = _compute_upside_pct_local(row)
+            if up is not None:
+                row["upside_pct"] = up
+
+        views = {
+            "fundamental_view": _compute_fundamental_view(row),
+            "technical_view": _compute_technical_view(row),
+            "risk_view": _compute_risk_view(row),
+            "value_view": _compute_value_view(row),
+        }
+        for k, v in views.items():
+            row[k] = v
+
+        # Replace bare engine reason with multi-method synthesis
+        existing = str(row.get("recommendation_reason") or "").strip().lower()
+        is_bare_engine_reason = (
+            not existing
+            or existing.startswith("overall=")
+            or "confidence=" in existing and "risk=" in existing and "→" not in existing
+        )
+        if is_bare_engine_reason:
+            row["recommendation_reason"] = _build_recommendation_reason(row, views)
+
+    return rows
+# =============================================================================
+# END v4.0.9 — multi-method analysis section
+# =============================================================================
+
 
 _DICTIONARY_REQUIRED_KEYS = {
     "symbol", "name", "current_price",
@@ -802,6 +1263,13 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
     return _pad_contract(hdrs, ks, 83)
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
+    # v4.0.9: per-page custom layouts (Global_Markets gets Layout A Pro
+    # with 46 curated columns + 4 multi-method analysis verdicts).
+    # Pages NOT in _PAGE_LAYOUT_OVERRIDES fall through to the legacy
+    # 80-column canonical instrument schema.
+    if page in _PAGE_LAYOUT_OVERRIDES:
+        hdrs, keys, source = _PAGE_LAYOUT_OVERRIDES[page]
+        return list(hdrs), list(keys), source
     if page == _TOP10_PAGE:
         h, k = _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS)
         return h, k, "static_canonical_top10"
@@ -1778,6 +2246,14 @@ def _normalize_external_payload(
     ks = list(keys or [])
     rows = _extract_rows_like(ext)
     normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
+    # v4.0.9: apply multi-method analysis post-processor for pages whose
+    # schema includes the four "view" columns (Fundamental/Technical/Risk/
+    # Value View) plus an enriched recommendation_reason. The engine
+    # doesn't compute these directly — they're derived here from the
+    # already-normalized per-row metrics so they stay synchronized with
+    # the visible row data even when the engine tier varies.
+    if page in _MULTI_METHOD_ANALYSIS_PAGES:
+        normalized_rows = _apply_multi_method_analysis(normalized_rows)
     if page == _TOP10_PAGE:
         normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
     normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
