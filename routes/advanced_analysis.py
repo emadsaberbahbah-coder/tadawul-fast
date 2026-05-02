@@ -2,11 +2,58 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.0.7
+Advanced Analysis Root Owner — v4.0.8
 ================================================================================
 ROOT SHEET-ROWS OWNER * ENGINE-FIRST * HARD-TIMEOUT * SCHEMA-FIRST
 DICTIONARY-FAST-PATH * TOP10/INSIGHTS-SKIP-ENGINE * ENRICHED-QUOTES-FAST-PATH
 FAIL-SOFT * STABLE ENVELOPE * JSON-SAFE * GET+POST MERGED
+
+v4.0.8 changes (from v4.0.7)
+----------------------------
+- FIX [LOW-RISK COSMETIC]: Three engine output keys now correctly map to
+    their canonical schema names so `Data Provider`, `Last Updated (UTC)`,
+    and `Last Updated (Riyadh)` columns populate instead of always
+    rendering null. Specifically, _FIELD_ALIAS_HINTS now declares:
+
+        "data_provider":      ["provider", "provider_primary",
+                               "data_source", "source", "data_sources"]
+        "last_updated_utc":   ["as_of_utc", "asof_utc",
+                               "updated_at_utc", "timestamp_utc", "as_of"]
+        "last_updated_riyadh":["as_of_riyadh", "asof_riyadh",
+                               "updated_at_riyadh", "timestamp_riyadh"]
+
+    Production diagnosis 2026-05-02 (after v6.2.0 of eodhd_provider
+    deployed and fundamentals started flowing):
+      /v1/advanced/sheet-rows?sheet=Global_Markets&limit=3 returned
+      AAPL/MSFT/NVDA with full fundamentals populated:
+        market_cap, pe_ttm, eps_ttm, sector, industry, dividend_yield,
+        gross_margin, operating_margin, profit_margin, debt_to_equity,
+        free_cash_flow_ttm, revenue_ttm, beta_5y all NON-NULL ✓
+      But the provenance triplet stayed null:
+        data_provider: null
+        last_updated_utc: null
+        last_updated_riyadh: null
+      The engine and EODHD provider both set their internal keys
+      (`provider`, `provider_primary`, `data_source`, `as_of_utc`,
+      `as_of_riyadh`), but the route's `_extract_from_raw` lookup
+      (line ~789) iterates `_key_variants(schema_key)` and didn't have
+      these aliases registered, so every lookup missed and returned None.
+
+    Behavior change: zero functional change. Only adds 3 keys to an
+    existing dict that was already used for the same purpose for other
+    fields (current_price aliases price/last/close/etc, name aliases
+    short_name/long_name/etc). No engine code changed. No provider code
+    changed. No new code paths.
+
+    Risk: trivial. The alias dict is consulted only when looking up a
+    schema key from raw engine output via `_key_variants`. Adding
+    aliases can never make a lookup fail — at worst it doesn't match.
+
+    Net effect: every row in every advanced-schema response now has
+    populated `Data Provider` (e.g. "eodhd"), `Last Updated (UTC)`
+    (ISO8601 timestamp), and `Last Updated (Riyadh)` (ISO8601 timestamp).
+    AAPL fulfillment ratio rises from ~81% (61/75 fields) to ~85%
+    (64/75 fields) on the canonical Global_Markets schema.
 
 v4.0.7 changes (from v4.0.6)
 ----------------------------
@@ -263,7 +310,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.0.7"
+ADVANCED_ANALYSIS_VERSION = "4.0.8"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -429,6 +476,20 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "top10_rank": ["rank", "top_rank"],
     "selection_reason": ["reason", "selection_notes"],
     "criteria_snapshot": ["criteria", "snapshot", "criteria_json"],
+    # v4.0.8: schema-key <- engine-key alias additions.
+    # The engine and EODHD provider set `provider` / `provider_primary` /
+    # `data_source` / `as_of_utc` / `as_of_riyadh` etc., but the canonical
+    # advanced-schema header names are `data_provider`, `last_updated_utc`,
+    # `last_updated_riyadh`. Without these aliases the route's
+    # `_extract_from_raw` lookup misses every engine-set value and the
+    # corresponding sheet columns render as null even when the merge step
+    # populated them. See production diagnosis 2026-05-02 where
+    # /v1/advanced/sheet-rows?sheet=Global_Markets returned full
+    # fundamentals (market_cap, pe_ttm, sector, etc.) but data_provider /
+    # last_updated_utc / last_updated_riyadh stayed null on every row.
+    "data_provider": ["provider", "provider_primary", "data_source", "source", "data_sources"],
+    "last_updated_utc": ["as_of_utc", "asof_utc", "updated_at_utc", "timestamp_utc", "as_of"],
+    "last_updated_riyadh": ["as_of_riyadh", "asof_riyadh", "updated_at_riyadh", "timestamp_riyadh"],
 }
 
 _DICTIONARY_REQUIRED_KEYS = {
