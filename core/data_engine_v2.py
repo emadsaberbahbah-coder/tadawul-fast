@@ -2,38 +2,8 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.48.1
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.2
 ================================================================================
-
-WHY v5.48.1
------------
-- FIX: populates the four dedicated `*_view` columns
-  (fundamental_view, technical_view, risk_view, value_view) that were
-  previously left blank in spreadsheet output. The information was
-  being concatenated into `recommendation_reason` only — now it is
-  emitted in dedicated columns AND the structured reason string.
-- SCHEMA: adds `fundamental_view`, `technical_view`, `risk_view`,
-  `value_view` to INSTRUMENT_CANONICAL_KEYS / INSTRUMENT_CANONICAL_HEADERS
-  immediately after `overall_score` so the Top10 contract becomes
-  84 + 3 = 87 columns and the standard instrument contract becomes
-  84 columns.
-- RECO: `recommendation_reason` is now always formatted as
-    "Fund: <view> | Tech: <view> | Risk: <view> | Val: <view> -> <RECO>"
-  matching the format the synthesizer was already producing inline.
-- HELPER: new pure function `_derive_views(row)` returns
-  (fund_view, tech_view, risk_view, val_view) from existing scores
-  (quality, growth, momentum, RSI, risk, valuation, intrinsic vs price).
-  Verdicts: BULLISH/NEUTRAL/BEARISH for fundamental & technical;
-  LOW/MODERATE/HIGH for risk; CHEAP/FAIR/EXPENSIVE for value.
-- ALIASES: `_CANONICAL_FIELD_ALIASES` now includes accept-aliases for
-  the four view fields (e.g. `fund_view`, `tech_view`, `valueView`),
-  so providers that already emit them under alternate names will
-  pass through cleanly.
-
-Note: this version is published as v5.48.1 and is intended to be
-applied on top of v5.48.0. The view-column patch itself is small and
-self-contained and does NOT alter any of the v5.48.0 timeout, fanout,
-or budget behaviors.
 
 WHY v5.47.2
 -----------
@@ -143,7 +113,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.48.1"
+__version__ = "5.47.3"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1260,12 +1230,12 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "momentum_score": ("momentum_score",),
     "growth_score": ("growth_score",),
     "overall_score": ("overall_score", "score", "compositeScore"),
-    "fundamental_view": ("fundamental_view", "fund_view", "fundamentalView", "fund", "fundamental"),
-    "technical_view": ("technical_view", "tech_view", "technicalView", "tech", "technical"),
-    "risk_view": ("risk_view", "riskView", "risk_label", "risk_view_label"),
-    "value_view": ("value_view", "valueView", "val_view", "valuation_view", "val"),
     "opportunity_score": ("opportunity_score",),
     "rank_overall": ("rank_overall", "rank", "overallRank"),
+    "fundamental_view": ("fundamental_view", "fundamentalView", "fund_view", "fundView"),
+    "technical_view": ("technical_view", "technicalView", "tech_view", "techView"),
+    "risk_view": ("risk_view", "riskView"),
+    "value_view": ("value_view", "valueView"),
     "recommendation": ("recommendation", "rating", "action", "reco", "consensus"),
     "recommendation_reason": ("recommendation_reason", "reason", "summary", "thesis", "analysis"),
     "horizon_days": ("horizon_days", "horizon", "days"),
@@ -1903,145 +1873,138 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
 
 
 def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
-    """Derive the four dedicated *_view verdicts from the existing scores.
-
-    These are emitted both as standalone columns (fundamental_view,
-    technical_view, risk_view, value_view) AND folded into the
-    recommendation_reason string in the form:
-        "Fund: BULLISH | Tech: NEUTRAL | Risk: LOW | Val: FAIR -> ACCUMULATE"
-
-    Returns (fund_view, tech_view, risk_view, val_view).
     """
-    qual = _as_float(row.get("quality_score"))
+    Derive the four view-column verdicts from existing per-row scores.
+    Each view returns "N/A" when its inputs are entirely absent.
+
+    Returns (fundamental_view, technical_view, risk_view, value_view).
+
+    Verdict rules (intentionally absolute thresholds for explainability):
+      Fundamental View  : BULLISH/NEUTRAL/BEARISH from quality_score+growth_score
+      Technical View    : BULLISH/NEUTRAL/BEARISH from momentum_score+rsi_14
+      Risk View         : LOW/MODERATE/HIGH from risk_score
+      Value View        : CHEAP/FAIR/EXPENSIVE from valuation_score+intrinsic vs price
+    """
+    quality = _as_float(row.get("quality_score"))
     growth = _as_float(row.get("growth_score"))
-    mom = _as_float(row.get("momentum_score"))
+    momentum = _as_float(row.get("momentum_score"))
     rsi = _as_float(row.get("rsi_14"))
     risk = _as_float(row.get("risk_score"))
-    val_score = _as_float(row.get("valuation_score"))
+    valuation = _as_float(row.get("valuation_score"))
     intrinsic = _as_float(row.get("intrinsic_value"))
-    price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
+    current = _as_float(row.get("current_price"))
 
-    # --- Fundamental View: blends quality + growth ---
-    fund_signal: Optional[float] = None
-    parts = [v for v in (qual, growth) if v is not None]
-    if parts:
-        fund_signal = sum(parts) / len(parts)
-    if fund_signal is None:
+    # ---- Fundamental View ----
+    if quality is None and growth is None:
         fund_view = "N/A"
-    elif fund_signal >= 65.0:
-        fund_view = "BULLISH"
-    elif fund_signal <= 40.0:
-        fund_view = "BEARISH"
     else:
-        fund_view = "NEUTRAL"
+        fund_avg = sum(x for x in (quality, growth) if x is not None) / max(
+            1, sum(1 for x in (quality, growth) if x is not None)
+        )
+        if fund_avg >= 70:
+            fund_view = "BULLISH"
+        elif fund_avg <= 40:
+            fund_view = "BEARISH"
+        else:
+            fund_view = "NEUTRAL"
 
-    # --- Technical View: blends momentum + RSI(14) ---
-    tech_signal: Optional[float] = None
-    if mom is not None and rsi is not None:
-        # RSI 0..100 already on the same scale as momentum_score; average.
-        tech_signal = (mom + rsi) / 2.0
-    elif mom is not None:
-        tech_signal = mom
-    elif rsi is not None:
-        tech_signal = rsi
-    if tech_signal is None:
+    # ---- Technical View ----
+    if momentum is None and rsi is None:
         tech_view = "N/A"
-    elif tech_signal >= 65.0 or (rsi is not None and rsi >= 70.0):
-        tech_view = "BULLISH"
-    elif tech_signal <= 40.0 or (rsi is not None and rsi <= 30.0):
-        tech_view = "BEARISH"
     else:
-        tech_view = "NEUTRAL"
+        bullish_signals = 0
+        bearish_signals = 0
+        if momentum is not None:
+            if momentum >= 70:
+                bullish_signals += 1
+            elif momentum <= 40:
+                bearish_signals += 1
+        if rsi is not None:
+            if rsi >= 70:
+                bearish_signals += 1   # overbought
+            elif rsi <= 30:
+                bullish_signals += 1   # oversold (mean-reversion)
+            elif 45 <= rsi <= 60:
+                bullish_signals += 1   # healthy uptrend zone
+        if bullish_signals > bearish_signals:
+            tech_view = "BULLISH"
+        elif bearish_signals > bullish_signals:
+            tech_view = "BEARISH"
+        else:
+            tech_view = "NEUTRAL"
 
-    # --- Risk View: bucket from risk_score (low score = low risk) ---
+    # ---- Risk View ----
     if risk is None:
         risk_view = "N/A"
-    elif risk < 40.0:
+    elif risk <= 35:
         risk_view = "LOW"
-    elif risk < 70.0:
-        risk_view = "MODERATE"
-    else:
+    elif risk >= 65:
         risk_view = "HIGH"
-
-    # --- Value View: combines valuation_score with intrinsic-vs-price upside ---
-    upside_pct: Optional[float] = None
-    if intrinsic is not None and price is not None and price > 0:
-        upside_pct = ((intrinsic - price) / price) * 100.0
-
-    if val_score is None and upside_pct is None:
-        val_view = "N/A"
     else:
-        if val_score is not None and val_score >= 70.0:
-            val_view = "CHEAP"
-        elif val_score is not None and val_score <= 35.0:
-            val_view = "EXPENSIVE"
-        else:
-            val_view = "FAIR"
-        # Override with upside if it's a strong signal in either direction
-        if upside_pct is not None:
-            if upside_pct >= 15.0 and val_view != "EXPENSIVE":
-                val_view = "CHEAP"
-            elif upside_pct <= -15.0 and val_view != "CHEAP":
-                val_view = "EXPENSIVE"
+        risk_view = "MODERATE"
 
-    return fund_view, tech_view, risk_view, val_view
+    # ---- Value View ----
+    upside_pct: Optional[float] = None
+    if intrinsic is not None and current is not None and current > 0:
+        upside_pct = (intrinsic - current) / current
+    if valuation is None and upside_pct is None:
+        value_view = "N/A"
+    else:
+        # Prefer concrete upside when available; fall back to score banding
+        if upside_pct is not None:
+            if upside_pct >= 0.15:
+                value_view = "CHEAP"
+            elif upside_pct <= -0.10:
+                value_view = "EXPENSIVE"
+            else:
+                value_view = "FAIR"
+        else:
+            # valuation_score: higher = better (more undervalued)
+            if valuation is not None and valuation >= 70:
+                value_view = "CHEAP"
+            elif valuation is not None and valuation <= 35:
+                value_view = "EXPENSIVE"
+            else:
+                value_view = "FAIR"
+
+    return fund_view, tech_view, risk_view, value_view
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
-    """Populate the four *_view columns AND the recommendation.
-
-    The recommendation_reason is formatted as
-        "Fund: <fund> | Tech: <tech> | Risk: <risk> | Val: <val> -> <RECO>"
-    so downstream sheet writers can either show the dedicated *_view
-    columns OR fall back to parsing the reason string. This restores
-    the four View columns that were previously left blank in the
-    spreadsheet output.
     """
-    # Always derive views (cheap; safe to recompute).
-    fund_view, tech_view, risk_view, val_view = _derive_views(row)
-    # Only set if not already populated by an upstream provider.
-    if not _safe_str(row.get("fundamental_view")):
-        row["fundamental_view"] = fund_view
-    if not _safe_str(row.get("technical_view")):
-        row["technical_view"] = tech_view
-    if not _safe_str(row.get("risk_view")):
-        row["risk_view"] = risk_view
-    if not _safe_str(row.get("value_view")):
-        row["value_view"] = val_view
+    Populate recommendation, recommendation_reason, AND the four view columns
+    (fundamental_view, technical_view, risk_view, value_view).
 
-    if row.get("recommendation"):
-        # Recommendation already chosen upstream — still synthesize the
-        # reason if it's missing, using the same format.
-        if not _safe_str(row.get("recommendation_reason")):
-            row["recommendation_reason"] = (
-                f"Fund: {row.get('fundamental_view') or 'N/A'} | "
-                f"Tech: {row.get('technical_view') or 'N/A'} | "
-                f"Risk: {row.get('risk_view') or 'N/A'} | "
-                f"Val: {row.get('value_view') or 'N/A'} "
-                f"\u2192 {row.get('recommendation')}"
-            )
-        return
-    if row.get("_skip_recommendation_synthesis"):
-        return
+    Idempotent: if recommendation is already set we still ensure the view
+    columns are present so callers re-running the engine don't drop the views.
+    """
     overall = _as_float(row.get("overall_score")) or 50.0
     conf = _as_float(row.get("confidence_score")) or 55.0
-    risk_score = _as_float(row.get("risk_score")) or 50.0
-    if overall >= 75 and conf >= 65 and risk_score <= 60:
+    risk = _as_float(row.get("risk_score")) or 50.0
+
+    # Always derive the four views (cheap, idempotent) so the schema columns
+    # never go blank on re-runs or fast-path re-emits.
+    fund_view, tech_view, risk_view, value_view = _derive_views(row)
+    row.setdefault("fundamental_view", fund_view)
+    row.setdefault("technical_view", tech_view)
+    row.setdefault("risk_view", risk_view)
+    row.setdefault("value_view", value_view)
+
+    if row.get("recommendation"):
+        return
+
+    if overall >= 75 and conf >= 65 and risk <= 60:
         rec = "BUY"
     elif overall >= 60 and conf >= 55:
         rec = "ACCUMULATE"
-    elif overall <= 35 or risk_score >= 85:
+    elif overall <= 35 or risk >= 85:
         rec = "REDUCE"
     else:
         rec = "HOLD"
     row["recommendation"] = rec
-    # Always emit the structured Fund/Tech/Risk/Val reason format.
     row.setdefault(
         "recommendation_reason",
-        (
-            f"Fund: {fund_view} | Tech: {tech_view} | "
-            f"Risk: {risk_view} | Val: {val_view} \u2192 {rec}"
-        ),
+        f"Fund: {fund_view} | Tech: {tech_view} | Risk: {risk_view} | Val: {value_view} \u2192 {rec}",
     )
 
 
