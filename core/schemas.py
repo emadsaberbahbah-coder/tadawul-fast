@@ -390,6 +390,7 @@ class UnifiedQuote(BaseModel):
     ev_ebitda: Optional[float] = None
     peg_ratio: Optional[float] = None
     intrinsic_value: Optional[float] = None
+    upside_pct: Optional[float] = None
     valuation_score: Optional[float] = None
 
     forecast_price_1m: Optional[float] = None
@@ -732,6 +733,7 @@ _FALLBACK_STANDARD_HEADERS: List[str] = [
     "EV/EBITDA",
     "PEG",
     "Intrinsic Value",
+    "Upside %",
     "Valuation Score",
     "Forecast Price 1M",
     "Forecast Price 3M",
@@ -819,6 +821,7 @@ _FALLBACK_STANDARD_KEYS: List[str] = [
     "ev_ebitda",
     "peg_ratio",
     "intrinsic_value",
+    "upside_pct",
     "valuation_score",
     "forecast_price_1m",
     "forecast_price_3m",
@@ -1007,7 +1010,7 @@ VN_CAP: List[str] = _filter_present([
 VN_FUNDAMENTALS: List[str] = _filter_present([
     "P/E TTM", "Forward P/E", "EPS TTM", "Dividend Yield", "Payout Ratio", "Revenue TTM",
     "Revenue YoY Growth", "Gross Margin", "Operating Margin", "Profit Margin", "Debt/Equity",
-    "Free Cash Flow TTM", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Valuation Score",
+    "Free Cash Flow TTM", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
 ], CANONICAL_STANDARD_HEADERS)
 VN_TECHNICALS: List[str] = _filter_present([
     "RSI 14", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% 1D", "Sharpe 1Y",
@@ -1124,6 +1127,7 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "ps_ratio": ("ps",),
     "peg_ratio": ("peg",),
     "intrinsic_value": ("fair_value",),
+    "upside_pct": ("upside_percent", "upside", "intrinsic_upside"),
     "top10_rank": ("rank_top10",),
 }
 
@@ -1354,12 +1358,12 @@ def validate_sheet_data(sheet_name: str, data: Mapping[str, Any]) -> Tuple[bool,
     headers, keys = get_sheet_contract(canonical)
 
     expected = {
-        "Market_Leaders": 84,
-        "Global_Markets": 84,
-        "Commodities_FX": 84,
-        "Mutual_Funds": 84,
-        "My_Portfolio": 84,
-        "Top_10_Investments": 87,
+        "Market_Leaders": 85,
+        "Global_Markets": 85,
+        "Commodities_FX": 85,
+        "Mutual_Funds": 85,
+        "My_Portfolio": 85,
+        "Top_10_Investments": 88,
         "Insights_Analysis": 7,
         "Data_Dictionary": 9,
     }[canonical]
