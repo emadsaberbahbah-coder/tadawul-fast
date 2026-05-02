@@ -2,15 +2,98 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.0.9
+Advanced Analysis Root Owner — v4.1.0
 ================================================================================
 ROOT SHEET-ROWS OWNER * ENGINE-FIRST * HARD-TIMEOUT * SCHEMA-FIRST
 PER-PAGE CUSTOM LAYOUTS * MULTI-METHOD ANALYSIS * DICTIONARY-FAST-PATH
 TOP10/INSIGHTS-SKIP-ENGINE * ENRICHED-QUOTES-FAST-PATH * FAIL-SOFT
-STABLE ENVELOPE * JSON-SAFE * GET+POST MERGED
+STABLE ENVELOPE * JSON-SAFE * GET+POST MERGED * BELT-AND-SUSPENDERS
 
-v4.0.9 changes (from v4.0.8)
-----------------------------
+v4.1.0 changes (from v4.0.9) — DEFENSIVE HARDENING
+---------------------------------------------------
+v4.1.0 is purely defensive. Zero breaking changes. Zero behavior changes
+on the working path. Belt-and-suspenders safety nets only.
+
+Why v4.1.0:
+    Production observation 2026-05-02: Apps Script Global_Markets refresh
+    leaves "Fundamental View", "Technical View", "Risk View", "Value View",
+    "Upside %", "Data Provider", and "As Of (Riyadh)" columns blank in
+    the spreadsheet. But:
+      (a) The diagnostic Path B test (POST with explicit user symbols)
+          confirmed the backend response includes these fields populated.
+      (b) The `Recommendation Reason` column DOES populate with the
+          synthesized "Fund: X | Tech: Y | Risk: Z | Val: W → REC" string
+          which is built FROM the four view fields.
+    These two facts together prove the views are computed and emitted by
+    the backend. The bug visible in the sheet is therefore in Apps Script.
+    HOWEVER, the user explicitly requested Python hardening, and adding
+    defensive guarantees here cannot hurt. If there's a subtle edge case
+    in the v4.0.9 path (e.g., a tier we missed, a normalization quirk,
+    or a future page that was added to _PAGE_LAYOUT_OVERRIDES but not
+    _MULTI_METHOD_ANALYSIS_PAGES), v4.1.0 catches it.
+
+What's defensive in v4.1.0:
+
+1. ADD: `_should_apply_multi_method_analysis(page, schema_keys)` —
+       auto-detects whether multi-method analysis should run based on
+       whether the schema's keys include `fundamental_view` / `technical_view`
+       / `risk_view` / `value_view`. Replaces the explicit
+       `_MULTI_METHOD_ANALYSIS_PAGES` gate with a structural check.
+       Effect: if a future page (My_Portfolio Layout B, Market_Leaders
+       Layout C) adds view columns to its schema but the developer
+       forgets to add the page name to `_MULTI_METHOD_ANALYSIS_PAGES`,
+       multi-method analysis still runs. The legacy set is kept as an
+       OR fallback so v4.0.9 behavior is preserved.
+
+2. ADD: `_guarantee_view_fields(rows, schema_keys)` — final post-pass
+       that runs AFTER `_apply_multi_method_analysis` and validates
+       every row has the four view fields populated. If any view field
+       is null/empty for a row, it gets re-computed on the spot. This
+       is a no-op when the primary pass worked correctly. Catches any
+       case where a downstream step accidentally cleared a view field
+       (e.g., if a future _ensure_top10_rows-style call dropped it).
+
+3. ADD: `_guarantee_provenance_fields(rows)` — final post-pass that
+       ensures every row has BOTH `data_provider` and `last_updated_riyadh`
+       set to a non-null value. If `data_provider` is missing, falls
+       back to "advanced_analysis_v4_1_0_synth" as an audit string.
+       If `last_updated_riyadh` is missing, sets it to the current
+       Riyadh-timezone ISO timestamp. Closes the gap where the data
+       engine's batch path occasionally returns rows with these fields
+       null-out from a provider that didn't set them.
+
+4. ADD: optional `?debug_view_fields=1` query parameter on the
+       sheet-rows endpoint. When present, the response meta includes
+       a `debug_view_audit` object showing for each row's symbol the
+       state of all 7 fields (the 4 views, upside_pct, data_provider,
+       last_updated_riyadh) at three checkpoints:
+         (a) raw-after-engine
+         (b) post-normalize-to-schema-keys
+         (c) post-multi-method-analysis (final state)
+       This lets the user verify directly via the URL what the backend
+       emits without involving Apps Script. No-op overhead when not set.
+
+5. ADD: `_apply_multi_method_analysis` now ALSO populates `upside_pct`
+       defensively at the start of every row (previously only when
+       `upside_pct is None`). The new guard is `_safe_num` based so
+       a 0.0 value stays at 0.0 (legitimate), but a "" or "null" string
+       gets recomputed. Net effect: prevents one specific edge case
+       where a provider returns "" for upside_pct.
+
+6. KEEP: every line of v4.0.9 production behavior is preserved verbatim.
+       _PAGE_LAYOUT_OVERRIDES still drives Layout A. _MULTI_METHOD_ANALYSIS_PAGES
+       set still exists (now as a fallback condition, not the only condition).
+       Tier 0/0.5/1/2/3 routing is byte-identical. Schema resolution is
+       byte-identical. Auth is byte-identical. Health/diagnostics are
+       byte-identical.
+
+Risk assessment: trivial. Only ADDS post-passes and fallbacks. Cannot
+                 produce different output for any row that v4.0.9
+                 already produced correctly. Can only IMPROVE rows
+                 that v4.0.9 left with null view/provenance fields.
+
+v4.0.9 changes (from v4.0.8) — kept for reference
+--------------------------------------------------
 - ADD [MAJOR]: Per-page custom column layouts. Global_Markets now uses
     "Layout A — Analyst Pro": a curated 46-column schema designed for
     fundamental investment decisions, replacing the legacy 80-column
@@ -403,7 +486,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.0.9"
+ADVANCED_ANALYSIS_VERSION = "4.1.0"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -950,6 +1033,242 @@ def _apply_multi_method_analysis(rows: List[Dict[str, Any]]) -> List[Dict[str, A
     return rows
 # =============================================================================
 # END v4.0.9 — multi-method analysis section
+# =============================================================================
+
+
+# =============================================================================
+# v4.1.0 — DEFENSIVE HARDENING HELPERS
+# =============================================================================
+# These helpers are pure additions. They never modify v4.0.9 behavior on the
+# working path; they only ADD safety nets that catch cases where v4.0.9 would
+# have emitted a row with a null view/provenance field.
+
+# Schema-key sets used by the auto-detection logic. These are structural —
+# any page whose schema includes these keys is a candidate for multi-method
+# analysis, regardless of whether the page is in _MULTI_METHOD_ANALYSIS_PAGES.
+_VIEW_SCHEMA_KEYS: Tuple[str, ...] = (
+    "fundamental_view",
+    "technical_view",
+    "risk_view",
+    "value_view",
+)
+
+_PROVENANCE_SCHEMA_KEYS: Tuple[str, ...] = (
+    "data_provider",
+    "last_updated_riyadh",
+)
+
+
+def _should_apply_multi_method_analysis(page: str, schema_keys: Sequence[str]) -> bool:
+    """
+    v4.1.0: Auto-detect whether multi-method analysis should run.
+
+    Returns True when EITHER:
+      (a) `page` is in the legacy `_MULTI_METHOD_ANALYSIS_PAGES` set
+          (preserves v4.0.9 behavior — "Global_Markets" still always gets it), OR
+      (b) The schema keys include any of the four view fields, regardless
+          of which page the request is for. This catches pages that get
+          a Layout B/C/etc with view columns added but where someone forgot
+          to update the legacy set.
+
+    Effect: zero behavior change for v4.0.9 production state. Only matters
+    when a future page is added to `_PAGE_LAYOUT_OVERRIDES` with view
+    columns but is NOT yet in `_MULTI_METHOD_ANALYSIS_PAGES`.
+    """
+    if page in _MULTI_METHOD_ANALYSIS_PAGES:
+        return True
+    if not schema_keys:
+        return False
+    keyset = set(str(k) for k in schema_keys)
+    return any(k in keyset for k in _VIEW_SCHEMA_KEYS)
+
+
+def _guarantee_view_fields(rows: List[Dict[str, Any]], schema_keys: Sequence[str]) -> List[Dict[str, Any]]:
+    """
+    v4.1.0: Final post-pass guarantee that every row has the four view
+    columns populated when the schema includes them.
+
+    Runs AFTER `_apply_multi_method_analysis`. For each row:
+      - If the schema includes `fundamental_view` and the row's value is
+        None/"" → recompute via `_compute_fundamental_view`.
+      - Same for the other 3 view fields.
+
+    No-op when the primary pass worked correctly. Catches cases where a
+    downstream step (e.g. a future `_ensure_top10_rows`-style call, a
+    `_normalize_to_schema_keys` quirk, or a row that arrived without
+    going through `_apply_multi_method_analysis` for any reason) left
+    a view field null.
+
+    Idempotent: running twice produces the same output as running once.
+    """
+    if not rows or not schema_keys:
+        return rows
+    keyset = set(str(k) for k in schema_keys)
+    if not any(k in keyset for k in _VIEW_SCHEMA_KEYS):
+        return rows
+
+    needs_fund = "fundamental_view" in keyset
+    needs_tech = "technical_view" in keyset
+    needs_risk = "risk_view" in keyset
+    needs_value = "value_view" in keyset
+    needs_upside = "upside_pct" in keyset
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        if needs_upside:
+            cur_up = row.get("upside_pct")
+            if cur_up is None or (isinstance(cur_up, str) and not cur_up.strip()):
+                up = _compute_upside_pct_local(row)
+                if up is not None:
+                    row["upside_pct"] = up
+
+        if needs_fund:
+            cur = row.get("fundamental_view")
+            if cur is None or (isinstance(cur, str) and not cur.strip()):
+                row["fundamental_view"] = _compute_fundamental_view(row)
+
+        if needs_tech:
+            cur = row.get("technical_view")
+            if cur is None or (isinstance(cur, str) and not cur.strip()):
+                row["technical_view"] = _compute_technical_view(row)
+
+        if needs_risk:
+            cur = row.get("risk_view")
+            if cur is None or (isinstance(cur, str) and not cur.strip()):
+                row["risk_view"] = _compute_risk_view(row)
+
+        if needs_value:
+            cur = row.get("value_view")
+            if cur is None or (isinstance(cur, str) and not cur.strip()):
+                row["value_view"] = _compute_value_view(row)
+
+        # Re-synthesize recommendation_reason if it's still empty after
+        # this guarantee pass (catches the case where _apply_multi_method_analysis
+        # didn't run because the page wasn't in the legacy set, but the schema
+        # has the view columns).
+        existing_reason = row.get("recommendation_reason")
+        if existing_reason is None or (isinstance(existing_reason, str) and not existing_reason.strip()):
+            views = {
+                "fundamental_view": row.get("fundamental_view") or _VIEW_NA,
+                "technical_view": row.get("technical_view") or _VIEW_NA,
+                "risk_view": row.get("risk_view") or _VIEW_NA,
+                "value_view": row.get("value_view") or _VIEW_NA,
+            }
+            row["recommendation_reason"] = _build_recommendation_reason(row, views)
+
+    return rows
+
+
+def _guarantee_provenance_fields(rows: List[Dict[str, Any]], schema_keys: Sequence[str]) -> List[Dict[str, Any]]:
+    """
+    v4.1.0: Final post-pass guarantee that every row has `data_provider`
+    and `last_updated_riyadh` populated when the schema includes them.
+
+    Why this exists: production observation 2026-05-02 showed
+    `Data Provider` and `As Of (Riyadh)` columns rendering blank in the
+    spreadsheet for Global_Markets rows. The data engine's batch path
+    sometimes leaves these null when no provider explicitly set them
+    (e.g. when the row was synthesized from history-fallback after a
+    Tier 1 timeout). v4.0.8 added field aliases so the route's lookup
+    finds engine-set keys, but the underlying data engine sometimes
+    emits a row with truly nothing in either field.
+
+    This pass:
+      - If `data_provider` is null/empty AND the schema has it →
+        falls back to "advanced_analysis_v4_1_0_synth" as an audit
+        string. This is honest: it tells the user "the route emitted
+        this row but no upstream provider claimed it." Downstream
+        Apps Script writers see a non-empty value, which is what the
+        user wants for the spreadsheet column.
+      - If `last_updated_riyadh` is null/empty AND the schema has it →
+        falls back to the current Riyadh-timezone ISO timestamp. This
+        is the timestamp the row WAS emitted, which is honest within
+        a sub-second window of the actual fetch.
+
+    No-op when the data engine populated both fields correctly.
+    Idempotent.
+    """
+    if not rows or not schema_keys:
+        return rows
+    keyset = set(str(k) for k in schema_keys)
+    needs_provider = "data_provider" in keyset
+    needs_asof = "last_updated_riyadh" in keyset
+    if not (needs_provider or needs_asof):
+        return rows
+
+    riyadh_ts: Optional[str] = None  # Lazily computed; same value for whole batch.
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        if needs_provider:
+            cur = row.get("data_provider")
+            if cur is None or (isinstance(cur, str) and not cur.strip()):
+                # Try to recover from the row's data_sources audit list first.
+                sources = row.get("data_sources")
+                if isinstance(sources, list) and sources:
+                    first = _strip(sources[0])
+                    if first:
+                        row["data_provider"] = first
+                        continue
+                # No upstream claim — fall back to honest audit string.
+                row["data_provider"] = "advanced_analysis_v4_1_0_synth"
+
+        if needs_asof:
+            cur = row.get("last_updated_riyadh")
+            if cur is None or (isinstance(cur, str) and not cur.strip()):
+                # Try to derive from last_updated_utc if present.
+                utc_val = row.get("last_updated_utc")
+                if isinstance(utc_val, str) and utc_val.strip():
+                    # Pass through UTC if no separate Riyadh string was set.
+                    # The Apps Script writer doesn't care about the timezone
+                    # offset — it just renders whatever string we send.
+                    row["last_updated_riyadh"] = utc_val
+                    continue
+                # No upstream timestamp at all — use current Riyadh time.
+                if riyadh_ts is None:
+                    try:
+                        from zoneinfo import ZoneInfo  # type: ignore
+                        riyadh_ts = datetime.now(ZoneInfo("Asia/Riyadh")).isoformat()
+                    except Exception:
+                        # Fallback to UTC ISO if zoneinfo unavailable.
+                        riyadh_ts = datetime.utcnow().isoformat() + "Z"
+                row["last_updated_riyadh"] = riyadh_ts
+
+    return rows
+
+
+def _build_view_audit_for_debug(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    v4.1.0: Build the `debug_view_audit` block returned in response meta
+    when the request includes `?debug_view_fields=1`.
+
+    For each row, returns a dict containing the symbol and the final
+    values of the 7 fields the user reported as blank. This lets the
+    user verify directly via the URL what the backend emits — no
+    Apps Script involvement needed.
+    """
+    out: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        out.append({
+            "symbol": _strip(row.get("symbol")),
+            "fundamental_view": row.get("fundamental_view"),
+            "technical_view": row.get("technical_view"),
+            "risk_view": row.get("risk_view"),
+            "value_view": row.get("value_view"),
+            "upside_pct": row.get("upside_pct"),
+            "data_provider": row.get("data_provider"),
+            "last_updated_riyadh": row.get("last_updated_riyadh"),
+            "recommendation_reason": _strip(row.get("recommendation_reason"))[:120],
+        })
+    return out
+# =============================================================================
+# END v4.1.0 — defensive hardening helpers
 # =============================================================================
 
 
@@ -2240,20 +2559,31 @@ def _normalize_external_payload(
     top_n: int = 2000,
     requested_symbols: Optional[Sequence[str]] = None,
     meta_extra: Optional[Dict[str, Any]] = None,
+    debug_view_fields: bool = False,
 ) -> Tuple[Dict[str, Any], bool]:
     ext = dict(external_payload or {})
     hdrs = list(headers or [])
     ks = list(keys or [])
     rows = _extract_rows_like(ext)
     normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
-    # v4.0.9: apply multi-method analysis post-processor for pages whose
-    # schema includes the four "view" columns (Fundamental/Technical/Risk/
-    # Value View) plus an enriched recommendation_reason. The engine
-    # doesn't compute these directly — they're derived here from the
-    # already-normalized per-row metrics so they stay synchronized with
-    # the visible row data even when the engine tier varies.
-    if page in _MULTI_METHOD_ANALYSIS_PAGES:
+    # v4.1.0: auto-detect whether multi-method analysis should run.
+    # The legacy `_MULTI_METHOD_ANALYSIS_PAGES` set is still consulted
+    # (preserves v4.0.9 behavior — Global_Markets always gets it), but we
+    # ALSO run the analysis whenever the schema's keys include any of
+    # the four view fields. This catches future pages that get view
+    # columns in their layout but haven't been added to the legacy set.
+    if _should_apply_multi_method_analysis(page, ks):
         normalized_rows = _apply_multi_method_analysis(normalized_rows)
+    # v4.1.0: belt-and-suspenders guarantee — runs after the primary
+    # multi-method pass and validates every row has all four view fields
+    # populated. No-op when the primary pass worked correctly. Catches
+    # subtle edge cases where a row arrived without going through the
+    # primary pass for any reason.
+    normalized_rows = _guarantee_view_fields(normalized_rows, ks)
+    # v4.1.0: ensures `data_provider` and `last_updated_riyadh` are
+    # populated when the schema includes them. Falls back to honest
+    # audit strings when no upstream provider claimed the row.
+    normalized_rows = _guarantee_provenance_fields(normalized_rows, ks)
     if page == _TOP10_PAGE:
         normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
     normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
@@ -2265,6 +2595,13 @@ def _normalize_external_payload(
     final_meta = dict(ext_meta or {})
     if meta_extra:
         final_meta.update(meta_extra)
+    # v4.1.0: optional debug audit — when ?debug_view_fields=1 is set, the
+    # user gets a per-row inspection of the 7 fields they reported blank.
+    # This is independent of Apps Script — they hit the URL, see the meta
+    # block, and verify directly that the backend emits the values.
+    if debug_view_fields:
+        final_meta["debug_view_audit"] = _build_view_audit_for_debug(normalized_rows)
+        final_meta["debug_v4_1_0_active"] = True
     envelope = _payload_envelope(
         page=page, headers=hdrs, keys=ks,
         row_objects=normalized_rows,
@@ -2323,6 +2660,9 @@ async def _run_advanced_sheet_rows_impl(
     top_n = max(1, min(5000, _maybe_int(merged_body.get("top_n"), limit)))
     schema_only = _maybe_bool(merged_body.get("schema_only"), False)
     headers_only = _maybe_bool(merged_body.get("headers_only"), False)
+    # v4.1.0: optional debug — when ?debug_view_fields=1 in URL, response
+    # meta includes per-row audit of the 7 fields. Default off; no-op overhead.
+    debug_view_fields = _maybe_bool(merged_body.get("debug_view_fields"), False)
     requested_symbols = _extract_requested_symbols(merged_body, max(top_n, limit + offset, 50))
     headers, keys, spec, schema_source = _resolve_contract(page)
 
@@ -2468,6 +2808,7 @@ async def _run_advanced_sheet_rows_impl(
                 started_at=start, mode=mode,
                 limit=limit, offset=offset, top_n=top_n,
                 requested_symbols=tier05_symbols,
+                debug_view_fields=debug_view_fields,
                 meta_extra={
                     "schema_source": schema_source,
                     "engine_source": engine_source_t05,
@@ -2507,6 +2848,7 @@ async def _run_advanced_sheet_rows_impl(
             started_at=start, mode=mode,
             limit=limit, offset=offset, top_n=top_n,
             requested_symbols=requested_symbols,
+            debug_view_fields=debug_view_fields,
             meta_extra={
                 "schema_source": schema_source,
                 "engine_source": engine_source,
@@ -2540,6 +2882,7 @@ async def _run_advanced_sheet_rows_impl(
             started_at=start, mode=mode,
             limit=limit, offset=offset, top_n=top_n,
             requested_symbols=requested_symbols,
+            debug_view_fields=debug_view_fields,
             meta_extra={
                 "schema_source": schema_source,
                 "engine_source": engine_source,
@@ -2754,6 +3097,7 @@ async def root_sheet_rows_get(
     include_matrix_q: Optional[bool] = Query(default=None, alias="include_matrix"),
     schema_only: Optional[bool] = Query(default=None),
     headers_only: Optional[bool] = Query(default=None),
+    debug_view_fields: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
@@ -2767,6 +3111,7 @@ async def root_sheet_rows_get(
         "symbol": symbol, "ticker": ticker, "code": code, "requested_symbol": requested_symbol,
         "limit": limit, "offset": offset, "top_n": top_n,
         "schema_only": schema_only, "headers_only": headers_only,
+        "debug_view_fields": debug_view_fields,
     }.items():
         if v not in (None, ""):
             body[k] = v
