@@ -56,13 +56,13 @@ BASE_PAGES = {
 }
 DERIVED_PAGES = {"Top_10_Investments", "Insights_Analysis", "Data_Dictionary"}
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
-    "Market_Leaders": 84,
-    "Global_Markets": 84,
-    "Commodities_FX": 84,
-    "Mutual_Funds": 84,
-    "My_Portfolio": 84,
+    "Market_Leaders": 85,
+    "Global_Markets": 85,
+    "Commodities_FX": 85,
+    "Mutual_Funds": 85,
+    "My_Portfolio": 85,
     "Insights_Analysis": 7,
-    "Top_10_Investments": 87,
+    "Top_10_Investments": 88,
     "Data_Dictionary": 9,
 }
 TOP10_SPECIAL_FIELDS: Tuple[str, ...] = ("top10_rank", "selection_reason", "criteria_snapshot")
