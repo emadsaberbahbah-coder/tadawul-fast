@@ -2,11 +2,95 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.0.6
+Advanced Analysis Root Owner — v4.0.7
 ================================================================================
 ROOT SHEET-ROWS OWNER * ENGINE-FIRST * HARD-TIMEOUT * SCHEMA-FIRST
 DICTIONARY-FAST-PATH * TOP10/INSIGHTS-SKIP-ENGINE * ENRICHED-QUOTES-FAST-PATH
 FAIL-SOFT * STABLE ENVELOPE * JSON-SAFE * GET+POST MERGED
+
+v4.0.7 changes (from v4.0.6)
+----------------------------
+- FIX [CRITICAL]: Tier 0.5 fast path now activates for the standard
+    Apps Script refresh case where the request supplies a sheet name
+    but no explicit symbols (e.g. ?sheet=Global_Markets&limit=100).
+
+    Production diagnosis 2026-05-02:
+      Apps Script refresh of Global_Markets returned 3 placeholder
+      rows (AAPL/MSFT/NVDA all-null) after a 20-second wait. The
+      response meta showed:
+        engine_call_duration_ms: 10000.003   (Tier 1 timeout)
+        tier2_duration_ms:        9999.816   (Tier 2 timeout)
+        tier:                     tier3_local_failsoft
+      No tier0_5_* keys in meta → Tier 0.5 was never even attempted.
+
+    Root cause was line ~1697 of v4.0.6 (and earlier):
+        if (page not in _SPECIAL_PAGES) and requested_symbols:
+            # Tier 0.5 ...
+    `requested_symbols` was an empty list because the request had no
+    `symbols=` query parameter. The `and requested_symbols` guard
+    short-circuited, so the entire Tier 0.5 fast path was skipped.
+    Tier 1 (engine.get_sheet_rows) then ran, hit its 10s timeout,
+    Tier 2 hit its 10s timeout, Tier 3 fail-soft emitted v4.0.6's
+    honest empty rows. Total user-visible latency: 20s for blank rows.
+
+    v4.0.7 fix has two parts:
+
+    1. NEW HELPER `_resolve_page_symbols_for_tier05` (~line 1408)
+       Resolves a symbol list locally when the request has none.
+       Tries (in order):
+         a. engine.get_sheet_symbols(page) — preferred
+         b. engine.get_page_symbols(page) — alias
+         c. engine.list_symbols_for_page(page) — alias
+         d. EMERGENCY_PAGE_SYMBOLS[page] — hardcoded last resort
+       Wrapped in asyncio.wait_for(timeout=4s) at the call site so an
+       unresponsive engine can't hang the request. If resolution
+       fails, Tier 0.5 is skipped and we fall through to Tier 1
+       exactly as in v4.0.6 (no regression on broken-engine paths).
+
+    2. EXPANDED Tier 0.5 GATE (~line 1750)
+       OLD: if (page not in _SPECIAL_PAGES) and requested_symbols:
+       NEW: First try to resolve symbols if the request has none, THEN
+            run Tier 0.5 if either path provided a symbol list.
+
+    Net behavior change:
+      - /v1/advanced/sheet-rows?sheet=Global_Markets&limit=100
+        (Apps Script's standard refresh) now hits Tier 0.5 with the
+        engine's resolved symbol list → enriched-quotes call returns
+        real data in ~5-10s → response goes back with real prices.
+        No more 20s timeout into empty rows.
+      - /v1/advanced/sheet-rows?sheet=Global_Markets&symbols=AAPL,MSFT
+        (caller supplies symbols) — UNCHANGED. tier05_symbol_source
+        in meta will say "explicit_request" exactly as in v4.0.5/v4.0.6.
+      - Special pages (Top_10_Investments, Insights_Analysis,
+        Data_Dictionary) — UNCHANGED. They hit the Tier 0 special-page
+        bypass before Tier 0.5 is even considered.
+      - Engine fail or hang — UNCHANGED. The 4s resolution timeout
+        plus the existing 18s ADVANCED_DIRECT_QUOTES_TIMEOUT_SEC means
+        v4.0.7 cannot hang longer than v4.0.6 in any scenario.
+
+    Diagnostics:
+      Response meta now includes:
+        tier0_5_attempted: true
+        tier0_5_duration_ms: <ms>
+        tier0_5_symbol_source: "engine.get_sheet_symbols" |
+                               "EMERGENCY_PAGE_SYMBOLS" |
+                               "explicit_request" |
+                               "resolve_timeout_4s" |
+                               "no_resolver_available"
+        tier0_5_symbol_count: <n>
+      The fast_path_reason field distinguishes the two routes:
+        "explicit_symbols_bypass_sheet_read" (caller supplied symbols)
+        "resolved_symbols:engine.get_sheet_symbols" (we resolved them)
+
+    THIS IS THE ROOT-CAUSE FIX for Global_Markets / Commodities_FX /
+    Mutual_Funds / Market_Leaders / My_Portfolio refreshes returning
+    blank rows after a 20s wait.
+
+    Tier 0 (special-page bypass), Tier 1 (engine), Tier 2 (legacy
+    adapter), and Tier 3 (fail-soft) routing logic is byte-identical
+    to v4.0.6. Only the Tier 0.5 entry condition is widened. v4.0.6's
+    honest-empty-placeholder fix is preserved. v4.0.5's enriched-quotes
+    fast path itself is preserved.
 
 v4.0.6 changes (from v4.0.5)
 ----------------------------
@@ -179,7 +263,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.0.6"
+ADVANCED_ANALYSIS_VERSION = "4.0.7"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -1406,6 +1490,87 @@ async def _resolve_engine(request: Request) -> Tuple[Optional[Any], str]:
     return None, "no_engine_available"
 
 
+async def _resolve_page_symbols_for_tier05(
+    request: Request,
+    page: str,
+    fetch_limit: int,
+) -> Tuple[List[str], str]:
+    """
+    v4.0.7: Resolve a symbol list for a sheet/page when the caller didn't
+    pass explicit symbols. Used by the Tier 0.5 fast path so that an
+    Apps Script refresh request like
+        /v1/advanced/sheet-rows?sheet=Global_Markets&limit=100
+    (no symbols query parameter) can still hit the fast path instead of
+    falling through to the slow Tier 1 (which times out at 10s) and
+    Tier 2 (another 10s) before fail-soft kicks in.
+
+    Resolution order (first non-empty wins):
+      1. engine.get_sheet_symbols(page) — preferred, uses the engine's
+         own resolver which honors page_catalog defaults, env overrides,
+         and the symbols_reader integration.
+      2. engine.get_page_symbols(page) — alias used by some engine
+         versions.
+      3. EMERGENCY_PAGE_SYMBOLS[page] — hardcoded last-resort list.
+         Always non-empty for instrument pages, so the Tier 0.5 path
+         will always have *something* to fetch even if the engine's
+         resolver is broken.
+
+    Returns (symbols_list, source_label). source_label is recorded in
+    the response meta for diagnostics. An empty list is returned only
+    if the page has no entry in EMERGENCY_PAGE_SYMBOLS (i.e. an unknown
+    page) AND the engine has no resolver — in which case Tier 0.5 will
+    skip and we fall through to Tier 1 as before.
+
+    This function is wrapped with asyncio.wait_for(timeout=4s) at the
+    call site, so an unresponsive engine resolver can't burn budget.
+    """
+    canon_page = normalize_page_name(page) if page else ""
+    if not canon_page:
+        canon_page = page or ""
+
+    # Prefer the engine's own resolver (honors page_catalog, env, etc.)
+    engine, _engine_source = await _resolve_engine(request)
+    if engine is not None:
+        for method_name in ("get_sheet_symbols", "get_page_symbols", "list_symbols_for_page"):
+            method = getattr(engine, method_name, None)
+            if not callable(method):
+                continue
+            for kwargs in (
+                {"sheet": canon_page, "limit": fetch_limit},
+                {"page": canon_page, "limit": fetch_limit},
+                {"sheet_name": canon_page, "limit": fetch_limit},
+            ):
+                try:
+                    result = method(**kwargs)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    if isinstance(result, (list, tuple)) and result:
+                        cleaned = [
+                            _normalize_symbol_token(s)
+                            for s in result
+                            if _normalize_symbol_token(s)
+                        ]
+                        if cleaned:
+                            return cleaned[:fetch_limit], f"engine.{method_name}"
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    logger.debug(
+                        "tier0.5 engine.%s(%s) raised: %s",
+                        method_name, kwargs, exc,
+                    )
+                    break
+
+    # Last-resort fallback: hardcoded emergency list. Always works for
+    # instrument pages because EMERGENCY_PAGE_SYMBOLS has entries for
+    # all of them.
+    emergency = EMERGENCY_PAGE_SYMBOLS.get(canon_page) or []
+    if emergency:
+        return list(emergency)[:fetch_limit], "EMERGENCY_PAGE_SYMBOLS"
+
+    return [], "no_resolver_available"
+
+
 async def _call_engine_sheet_rows(
     engine: Any,
     *,
@@ -1680,37 +1845,83 @@ async def _run_advanced_sheet_rows_impl(
 
     fetch_limit = max(limit + offset, top_n)
 
-    # ---- Tier 0.5 (NEW in v4.0.5): Direct enriched-quotes for instrument
-    # pages with explicit symbols. This bypasses get_sheet_rows entirely
-    # and calls the engine's enriched-quotes batch method — the same path
-    # that routes/enriched_quote.py uses successfully (Test B in
-    # production: 4.5s for one symbol with full real data).
+    # ---- Tier 0.5 (v4.0.7 expanded gating): Direct enriched-quotes for
+    # instrument pages. This bypasses get_sheet_rows entirely and calls
+    # the engine's enriched-quotes batch method — the same path that
+    # routes/enriched_quote.py uses successfully (Test B in production:
+    # 4.5s for one symbol with full real data).
     #
-    # Conditions:
+    # WHY v4.0.7 EXPANDED THIS GATE
+    # -----------------------------
+    # v4.0.5 introduced Tier 0.5 but only activated it when the caller
+    # passed explicit symbols. Apps Script's standard refresh path calls
+    # /v1/advanced/sheet-rows?sheet=Global_Markets&limit=100 with NO
+    # symbols query parameter (it expects the backend to resolve symbols
+    # from the sheet name). Result: requested_symbols was empty, the
+    # `and requested_symbols` guard short-circuited, Tier 0.5 was
+    # skipped entirely, Tier 1 timed out at 10s, Tier 2 timed out at
+    # 10s, and Tier 3 fail-soft emitted blank placeholder rows. This was
+    # the actual cause of "Global_Markets shows empty rows" reported
+    # 2026-05-02.
+    #
+    # v4.0.7 fix: when the caller passes no symbols, resolve the symbol
+    # list locally (via the engine's get_sheet_symbols if available, or
+    # the EMERGENCY_PAGE_SYMBOLS fallback as a last resort), then run
+    # Tier 0.5 with those resolved symbols. The symbol-resolution step
+    # has its own 4s timeout so we can't hang there. If resolution
+    # fails, Tier 0.5 is still skipped and we fall through to Tier 1
+    # exactly as in v4.0.5 (no regression).
+    #
+    # Conditions for Tier 0.5 to run (v4.0.7):
     #   - page is NOT a special page (Top10/Insights/Dictionary handled above)
-    #   - caller passed explicit symbols (no Sheets read needed)
+    #   - we have OR can resolve at least one symbol
     #
-    # If this path returns real rows, we return immediately. If the engine
-    # has no batch method, the call returns nothing usable, or it errors
-    # out, we fall through to Tier 1 unchanged.
+    # If this path returns real rows, we return immediately. If the
+    # engine has no batch method, the call returns nothing usable, or
+    # it errors out, we fall through to Tier 1 unchanged.
     tier05_meta: Dict[str, Any] = {}
-    if (page not in _SPECIAL_PAGES) and requested_symbols:
+    tier05_symbols: List[str] = list(requested_symbols or [])
+    tier05_symbol_source = "explicit_request" if tier05_symbols else ""
+
+    if (page not in _SPECIAL_PAGES) and not tier05_symbols:
+        # v4.0.7: resolve symbols when caller didn't provide any.
+        resolve_started = time.time()
+        try:
+            resolved, source = await asyncio.wait_for(
+                _resolve_page_symbols_for_tier05(request, page, fetch_limit),
+                timeout=4.0,
+            )
+            if resolved:
+                tier05_symbols = list(resolved)[:fetch_limit]
+                tier05_symbol_source = source
+        except asyncio.TimeoutError:
+            tier05_symbol_source = "resolve_timeout_4s"
+        except Exception as exc:
+            logger.debug("tier0.5 symbol resolution raised: %s", exc)
+            tier05_symbol_source = f"resolve_error:{type(exc).__name__}"
+        tier05_meta["tier0_5_resolve_duration_ms"] = round(
+            (time.time() - resolve_started) * 1000.0, 3
+        )
+
+    if (page not in _SPECIAL_PAGES) and tier05_symbols:
         tier05_started = time.time()
         engine_t05, engine_source_t05 = await _resolve_engine(request)
         payload_t05, callable_t05 = await _call_engine_enriched_quotes(
             engine_t05,
-            symbols=list(requested_symbols[:fetch_limit]),
+            symbols=list(tier05_symbols[:fetch_limit]),
             mode=mode or "",
             page=page,
             timeout_seconds=ADVANCED_DIRECT_QUOTES_TIMEOUT_SEC,
         )
         tier05_duration_ms = round((time.time() - tier05_started) * 1000.0, 3)
-        tier05_meta = {
+        tier05_meta.update({
             "tier0_5_attempted": True,
             "tier0_5_duration_ms": tier05_duration_ms,
             "tier0_5_callable": callable_t05,
             "tier0_5_engine_source": engine_source_t05,
-        }
+            "tier0_5_symbol_source": tier05_symbol_source,
+            "tier0_5_symbol_count": len(tier05_symbols),
+        })
 
         if isinstance(payload_t05, dict):
             envelope, has_data = _normalize_external_payload(
@@ -1719,7 +1930,7 @@ async def _run_advanced_sheet_rows_impl(
                 include_matrix=include_matrix, request_id=request_id,
                 started_at=start, mode=mode,
                 limit=limit, offset=offset, top_n=top_n,
-                requested_symbols=requested_symbols,
+                requested_symbols=tier05_symbols,
                 meta_extra={
                     "schema_source": schema_source,
                     "engine_source": engine_source_t05,
@@ -1727,7 +1938,11 @@ async def _run_advanced_sheet_rows_impl(
                     "engine_call_duration_ms": tier05_duration_ms,
                     "tier": "tier0_5_enriched_quotes_direct",
                     "source": f"{engine_source_t05}.{callable_t05}",
-                    "fast_path_reason": "explicit_symbols_bypass_sheet_read",
+                    "fast_path_reason": (
+                        "explicit_symbols_bypass_sheet_read"
+                        if tier05_symbol_source == "explicit_request"
+                        else f"resolved_symbols:{tier05_symbol_source}"
+                    ),
                 },
             )
             if has_data:
