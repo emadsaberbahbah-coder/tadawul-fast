@@ -65,13 +65,13 @@ BASE_SOURCE_PAGES: Tuple[str, ...] = (
 SOURCE_PAGES_SET = set(BASE_SOURCE_PAGES)
 
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
-    "Market_Leaders": 84,
-    "Global_Markets": 84,
-    "Commodities_FX": 84,
-    "Mutual_Funds": 84,
-    "My_Portfolio": 84,
+    "Market_Leaders": 85,
+    "Global_Markets": 85,
+    "Commodities_FX": 85,
+    "Mutual_Funds": 85,
+    "My_Portfolio": 85,
     "Insights_Analysis": 7,
-    "Top_10_Investments": 87,
+    "Top_10_Investments": 88,
     "Data_Dictionary": 9,
 }
 
@@ -202,6 +202,7 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("ev_ebitda", "EV/EBITDA"),
     ("peg_ratio", "PEG"),
     ("intrinsic_value", "Intrinsic Value"),
+    ("upside_pct", "Upside %"),
     ("valuation_score", "Valuation Score"),
     ("forecast_price_1m", "Forecast Price 1M"),
     ("forecast_price_3m", "Forecast Price 3M"),
