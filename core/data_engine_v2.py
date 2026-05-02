@@ -1970,14 +1970,94 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
     return fund_view, tech_view, risk_view, value_view
 
 
+def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
+    """
+    Backfill `intrinsic_value` and `upside_pct` when the upstream provider
+    did not supply them. Idempotent: never overwrites a real upstream value.
+
+    Intrinsic value heuristic (used only when upstream lacks it):
+      Combines a forward-PE multiple, a graham-style sqrt(eps*growth) anchor,
+      and the average of available analyst forecast targets. Returns the
+      median of the available signals so a single noisy input can't dominate.
+
+    Upside %:
+      (intrinsic_value - current_price) / current_price, written as a
+      decimal fraction (e.g. 0.08 = +8%) — matches how the route layer's
+      Layout A column "Upside %" reads it.
+    """
+    price = _as_float(row.get("current_price"))
+    if price is None or price <= 0:
+        return  # Nothing to anchor against
+
+    intrinsic = _as_float(row.get("intrinsic_value"))
+
+    # ---- Backfill intrinsic_value if missing ----
+    if intrinsic is None:
+        candidates: List[float] = []
+
+        # Signal 1: Forward-PE-based fair value
+        eps = _as_float(row.get("eps_ttm"))
+        pe_fwd = _as_float(row.get("pe_forward"))
+        pe_ttm = _as_float(row.get("pe_ttm"))
+        if eps is not None and eps > 0 and pe_fwd is not None and pe_fwd > 0:
+            # If forward PE is below trailing PE, market sees growth → fair value at trailing PE
+            anchor_pe = max(pe_fwd, min(pe_ttm or pe_fwd, 25.0))
+            candidates.append(eps * anchor_pe)
+        elif eps is not None and eps > 0 and pe_ttm is not None and 0 < pe_ttm < 50:
+            # Use sector-neutral 18x trailing PE as anchor when only TTM available
+            candidates.append(eps * 18.0)
+
+        # Signal 2: Forecast price targets (analyst / model)
+        forecasts: List[float] = []
+        for key in ("forecast_price_3m", "forecast_price_12m", "forecast_price_1m"):
+            fp = _as_float(row.get(key))
+            if fp is not None and fp > 0:
+                forecasts.append(fp)
+        if forecasts:
+            candidates.append(sum(forecasts) / len(forecasts))
+
+        # Signal 3: Graham-style sqrt(eps × growth × multiplier) anchor
+        rev_growth = _as_pct_points(row.get("revenue_growth_yoy"))
+        if eps is not None and eps > 0 and rev_growth is not None:
+            growth_capped = max(0.0, min(rev_growth, 25.0))   # cap at 25% to avoid blowups
+            anchor = eps * (8.5 + 2.0 * growth_capped)
+            if anchor > 0:
+                candidates.append(anchor)
+
+        if candidates:
+            candidates.sort()
+            mid = len(candidates) // 2
+            if len(candidates) % 2 == 1:
+                intrinsic = candidates[mid]
+            else:
+                intrinsic = (candidates[mid - 1] + candidates[mid]) / 2.0
+            # Sanity-cap: never claim more than 3x or less than 0.3x current price
+            intrinsic = max(price * 0.3, min(intrinsic, price * 3.0))
+            row["intrinsic_value"] = round(intrinsic, 2)
+
+    # ---- Compute upside_pct ----
+    intrinsic = _as_float(row.get("intrinsic_value"))
+    if intrinsic is not None and intrinsic > 0 and row.get("upside_pct") is None:
+        upside = (intrinsic - price) / price
+        row["upside_pct"] = round(upside, 4)
+
+
 def _compute_recommendation(row: Dict[str, Any]) -> None:
     """
     Populate recommendation, recommendation_reason, AND the four view columns
     (fundamental_view, technical_view, risk_view, value_view).
 
+    Also backfills `intrinsic_value` and `upside_pct` when the upstream
+    provider did not supply them, so the Layout A schema columns never
+    render blank.
+
     Idempotent: if recommendation is already set we still ensure the view
     columns are present so callers re-running the engine don't drop the views.
     """
+    # Backfill intrinsic_value + upside_pct BEFORE deriving views so the
+    # value_view path can read a populated upside_pct on its first call.
+    _compute_intrinsic_and_upside(row)
+
     overall = _as_float(row.get("overall_score")) or 50.0
     conf = _as_float(row.get("confidence_score")) or 55.0
     risk = _as_float(row.get("risk_score")) or 50.0
