@@ -2,7 +2,7 @@
 """
 core/providers/eodhd_provider.py
 ================================================================================
-EODHD Provider -- v6.1.0 (GLOBAL PRIMARY / HISTORY+FUNDAMENTALS / SCHEMA-ALIGNED)
+EODHD Provider -- v6.2.0 (GLOBAL PRIMARY / HISTORY+FUNDAMENTALS / SCHEMA-ALIGNED)
 ================================================================================
 
 Purpose
@@ -12,6 +12,73 @@ Primary provider for global market data:
   - Historical OHLCV data with technical indicators
   - Fundamental data (financials, ratios, company info)
   - Symbol normalization across exchanges
+
+v6.2.0 Changes (from v6.1.0)
+----------------------------
+[CRITICAL] Public entry points `quote`, `get_quote`, `fetch_quote` now
+route to `fetch_enriched_quote_patch` instead of the basic
+`_fetch_quote`. The basic path returned price/volume only; the enriched
+path returns price + volume + fundamentals (market_cap, P/E, EPS,
+dividend_yield, sector, industry, margins, debt/equity, FCF, ROE/ROA,
+beta, revenue) + history stats.
+
+Production diagnosis 2026-05-02 from /v1/enriched-quote?symbol=AAPL:
+    current_price: 280.14    ✓ (came from history fallback)
+    volume: 77.9M            ✓ (came from history fallback)
+    rsi_14, volatility, ...  ✓ (computed from history)
+    market_cap, pe_ttm, ...  ✗ all null
+    provider_primary:        ✗ null (no provider's full quote merged)
+
+Root cause: data_engine_v2.py `_pick_provider_callable` picks the first
+matching function name from this priority list:
+    ("get_quote", "fetch_quote", "fetch_enriched_quote",
+     "get_enriched_quote", "quote")
+Since v6.1.0 exposed `get_quote` first (as an alias of `quote`, which
+called `_fetch_quote` -- basic only), the engine never reached
+`fetch_enriched_quote_patch`. EODHD never delivered fundamentals to
+the merge step, so every Global_Markets row showed null fundamentals
+even though the API key was valid and the network was reachable.
+
+Compare yahoo_fundamentals_provider.py (line 1430+): every public name
+there aliases to `fetch_fundamentals_patch`. That provider got it
+right; v6.1.0 EODHD got it wrong. v6.2.0 brings EODHD in line.
+
+Behavior change for callers:
+  - OLD: `quote(symbol)` returned basic-quote dict; raised
+    EODHDFetchError on upstream failure.
+  - NEW: `quote(symbol)` returns enriched dict (basic + fundamentals +
+    history stats); on failure returns dict with `error` field (no
+    exception).
+
+The data_engine_v2 v5.47.4 error-envelope handling already accepts
+dict-with-error returns: `_fetch_patch` rejects patches that have an
+`error` field with no meaningful keys (current_price, market_cap,
+pe_ttm, etc.) and falls through to the next provider. Returning a
+dict instead of raising is therefore consistent with the engine's
+existing contract.
+
+Verified safe: only internal callers of `quote()` are `get_quote` and
+`fetch_quote` (which are aliases pointing to it). No other modules in
+the codebase import `quote` directly. Grep confirms zero external
+dependencies on the exception path.
+
+Net behavior change for users:
+  - /v1/advanced/sheet-rows?sheet=Global_Markets -- AAPL/MSFT/NVDA rows
+    now return populated market_cap, pe_ttm, eps_ttm, dividend_yield,
+    sector, industry, margins, beta, revenue, etc. on every refresh.
+  - provider_primary now records "eodhd" instead of null.
+  - Existing v4.0.7 Tier 0.5 fast path is unchanged. v4.0.6 honest
+    placeholder fallback is unchanged.
+  - Estimated fulfillment ratio jumps from ~45% to ~75-85% (depends on
+    how many EODHD fundamentals fields are populated for a given
+    symbol; varies by listing).
+
+This is a SURGICAL fix. Only the three module-level entry points are
+changed. The client class internals (`_fetch_quote`,
+`_fetch_fundamentals`, `_fetch_history_stats`,
+`fetch_enriched_quote_patch` on the client itself) are byte-identical
+to v6.1.0. Other public functions (`fetch_history`, `fetch_quotes`,
+batch path, etc.) are byte-identical.
 
 v6.1.0 Changes (from v6.0.0)
 ----------------------------
@@ -69,7 +136,7 @@ logger.addHandler(logging.NullHandler())
 # ---------------------------------------------------------------------------
 
 PROVIDER_NAME = "eodhd"
-PROVIDER_VERSION = "6.1.0"
+PROVIDER_VERSION = "6.2.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -1624,24 +1691,68 @@ async def enriched_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, An
 
 
 async def quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Fetch a quote; raises EODHDFetchError on failure."""
+    """
+    v6.2.0: Now returns the ENRICHED patch (basic quote + fundamentals +
+    history stats) instead of just basic quote.
+
+    Why the change
+    --------------
+    The data engine's `_pick_provider_callable` in core/data_engine_v2.py
+    picks the first matching name from this priority list:
+        ("get_quote", "fetch_quote", "fetch_enriched_quote",
+         "get_enriched_quote", "quote")
+    Since this module exposed `get_quote` (line 1637 below, alias of
+    quote), the engine ALWAYS called the basic-quote path and never
+    reached `fetch_enriched_quote_patch`. Result: prices and volume
+    came through but every fundamentals field (market_cap, P/E, EPS,
+    dividend_yield, sector, industry, margins, beta, revenue, etc.)
+    came back null on every Global_Markets refresh.
+
+    Production diagnosis 2026-05-02:
+        /v1/enriched-quote?symbol=AAPL
+        → current_price: 280.14 ✓ (from history fallback)
+        → volume: 77.9M ✓ (from history fallback)
+        → rsi_14, volatility, sharpe ✓ (computed from history)
+        → market_cap, pe_ttm, eps_ttm, sector, ...: ALL null ✗
+        → provider_primary: null ✗ (no provider's full quote succeeded)
+
+    Compare yahoo_fundamentals_provider, which got this right: every one
+    of its public functions (get_quote, fetch_quote, quote,
+    enriched_quote) is an alias for `fetch_fundamentals_patch`, so
+    fundamentals always come through regardless of which name the
+    engine picks.
+
+    Behavior change
+    ---------------
+    OLD: returns basic quote dict; raises EODHDFetchError on failure.
+    NEW: returns enriched patch dict (basic + fundamentals + history);
+         on failure returns dict with `error` field (no exception).
+
+    Why no exception: the data engine's v5.47.4 error-envelope check at
+    `_fetch_patch` (data_engine_v2.py line ~3506) explicitly handles
+    dict-with-error returns -- it rejects patches with `error` and no
+    meaningful keys, then falls through to the next provider. Returning
+    a dict gives the engine more diagnostic detail than an exception
+    string and is consistent with `fetch_quote_patch`'s existing pattern
+    (line 1647 below).
+
+    Risk: zero callers in this module relied on the exception other
+    than `get_quote` and `fetch_quote` which are aliases. Verified by
+    grep before deploy.
+    """
     if args or kwargs:
         logger.debug("quote(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
-    client = await get_client()
-    patch, err = await client._fetch_quote(symbol)
-    if err:
-        raise EODHDFetchError(f"Failed to fetch quote for {symbol}: {err}")
-    return patch
+    return await fetch_enriched_quote_patch(symbol)
 
 
 async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Alias for quote."""
-    return await quote(symbol, *args, **kwargs)
+    """v6.2.0: enriched-path alias (was basic quote in v6.1.0 and earlier)."""
+    return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
 
 
 async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Alias for quote."""
-    return await quote(symbol, *args, **kwargs)
+    """v6.2.0: enriched-path alias (was basic quote in v6.1.0 and earlier)."""
+    return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
 
 
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
