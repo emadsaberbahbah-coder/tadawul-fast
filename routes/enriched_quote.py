@@ -2,82 +2,28 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v8.6.0
+TFB Enriched Quote Routes Wrapper — v8.3.0
 ================================================================================
 IMPORT-SAFE • MINIMAL-DEPENDENCY • ENRICHED-ALIAS OWNERSHIP SAFE
 QUOTE + QUOTES + SHEET-ROWS ALIASES • BRIDGE-FIRST • FAIL-SOFT • JSON-SAFE
-X-API-Key AWARE • ROUTE-OWNER ATTRIBUTED • HEALTH-CAPABILITY-AWARE
-SIGNATURE-INTROSPECTING BRIDGE DISPATCH • NO-ZERO-ARG HANDLER CALLS
 
-Canonical-owner note (read first)
----------------------------------
-Per `main._CONTROLLED_CANONICAL_OWNER_MAP`, this module is the canonical owner
-of:
-    /v1/enriched
-    /v1/enriched/sheet-rows
-    /v1/enriched_quote
-    /v1/enriched_quote/sheet-rows
-    /v1/enriched-quote
-    /v1/enriched-quote/sheet-rows
-    /quote
-    /quotes
-
-Per `main._CONTROLLED_ROUTE_PLAN`, this module is mounted LAST in the
-controlled plan (after config, advanced_analysis, analysis_sheet_rows,
-investment_advisor, advanced_sheet_rows, advisor). Any signature collision
-on the owned paths above is resolved in this module's favor because main
-replays the `_CONTROLLED_CANONICAL_OWNER_MAP` during filtered cloning.
-
-Per `main._allowed_prefixes_for_key["enriched_quote"]`, all paths this
-module declares MUST start with one of:
-    /v1/enriched
-    /v1/enriched_quote
-    /v1/enriched-quote
-    /quote
-    /quotes
-Otherwise `_clone_filtered_router` will drop them.
-
-Why this revision (v8.6.0 vs v8.5.0)
-------------------------------------
-- FIX CRITICAL: `_call_with_tolerant_signatures` had a dangerous final `{}`
-       attempt that invoked target handlers with ZERO arguments. When the
-       target was `_analysis_sheet_rows_impl(request, body, mode, ...)` (9
-       required positional params), this raised
-       "TypeError: missing 9 required positional arguments". The `{}` final
-       attempt is removed. Replaced with a signature-introspecting first
-       attempt that calls fn with EXACTLY the kwargs it declares.
-- FIX CRITICAL: the prior `if v is not None` filter inside
-       `_call_with_tolerant_signatures` stripped legitimate None values for
-       optional kwargs (token, x_request_id, x_api_key, authorization). This
-       caused required-positional params to be missing on every attempt. Now
-       we keep None values verbatim so the target sees them as supplied.
-- FIX HIGH: bridge dispatch now logs the actual signature mismatch reason
-       instead of silently moving to the next attempt. When ALL attempts fail
-       with TypeError, the original TypeError is re-raised so the caller can
-       see why instead of getting an empty TimeoutError later.
-- FIX MEDIUM: `_extract_rows_like` short-circuit on already-list payloads now
-       handles `dict` items with non-string keys safely (cast to str).
-- FIX MEDIUM: `_normalize_symbol_token` is now whitespace-tolerant on
-       embedded NBSP / zero-width characters that appeared in some Argaam /
-       Tadawul payloads.
-- FIX LOW: `_to_dict` now handles dataclass instances via dataclasses.asdict
-       before the vars() fallback, matching `_json_safe`.
-- FIX LOW: `envelope.error` is no longer set to empty string when error is
-       None — keeps response shape consistent for downstream JSON consumers.
-- ADD: `/v1/enriched/diagnostics` (debug-only, include_in_schema=False) that
-       returns full bridge resolution map + signature for each candidate, so
-       future bridge-mismatch bugs can be diagnosed without log diving.
-- ADD: ROUTER_VERSION bumped to 8.6.0 so deploys can be verified via /health.
-- KEEP: all v8.5.0 X-API-Key threading behavior, capability-aware /health,
-       canonical-owner hints in meta, and tolerant-signature dispatch
-       structure.
+What this revision improves
+--------------------------
+- FIX: keeps canonical owner delegation first, but no longer treats empty
+       non-instrument bridge payloads as a terminal result.
+- FIX: adds bounded non-empty fail-soft rows for Top_10_Investments,
+       Insights_Analysis, and Data_Dictionary.
+- FIX: accepts direct_symbols / selected_symbols / selected_tickers aliases in
+       both root and sheet-rows flows.
+- FIX: single-quote requests for non-instrument pages now return a schema-shaped
+       placeholder row instead of only a guard/error row when the bridge degrades.
+- ALIGN: preserves the stable envelope used by analysis/advanced wrappers.
 ================================================================================
 """
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import importlib
 import inspect
 import logging
@@ -86,55 +32,21 @@ import os
 import re
 import time
 import uuid
-from datetime import date, datetime, time as dt_time, timezone
+from datetime import date, datetime, time as dt_time
 from decimal import Decimal
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "8.6.0"
-ROUTE_OWNER_NAME = "enriched_quote"
-ROUTE_FAMILY_NAME = "enriched"
-
-# Project-wide truthy/falsy sets (match main.py _TRUTHY / _FALSY)
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
-_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+ROUTER_VERSION = "8.3.0"
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
     "selection_reason",
     "criteria_snapshot",
-)
-
-# Module-level inventory of canonical paths owned by this module (used by /health)
-_OWNED_PATHS: Tuple[str, ...] = (
-    # enriched prefix
-    "/v1/enriched",
-    "/v1/enriched/health",
-    "/v1/enriched/headers",
-    "/v1/enriched/quote",
-    "/v1/enriched/quotes",
-    "/v1/enriched/sheet-rows",
-    # enriched_quote prefix (underscore)
-    "/v1/enriched_quote",
-    "/v1/enriched_quote/health",
-    "/v1/enriched_quote/headers",
-    "/v1/enriched_quote/quote",
-    "/v1/enriched_quote/quotes",
-    "/v1/enriched_quote/sheet-rows",
-    # enriched-quote prefix (hyphen)
-    "/v1/enriched-quote",
-    "/v1/enriched-quote/health",
-    "/v1/enriched-quote/headers",
-    "/v1/enriched-quote/quote",
-    "/v1/enriched-quote/quotes",
-    "/v1/enriched-quote/sheet-rows",
-    # short-form
-    "/quote",
-    "/quotes",
 )
 
 _INSTRUMENT_HEADERS: List[str] = [
@@ -149,7 +61,9 @@ _INSTRUMENT_HEADERS: List[str] = [
     "Valuation Score", "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence",
     "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
-    "Growth Score", "Overall Score", "Opportunity Score", "Rank (Overall)", "Recommendation",
+    "Growth Score", "Overall Score",
+    "Fundamental View", "Technical View", "Risk View", "Value View",
+    "Opportunity Score", "Rank (Overall)", "Recommendation",
     "Recommendation Reason", "Horizon Days", "Invest Period Label", "Position Qty", "Avg Cost",
     "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
@@ -166,7 +80,9 @@ _INSTRUMENT_KEYS: List[str] = [
     "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value",
     "valuation_score", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "expected_roi_1m",
     "expected_roi_3m", "expected_roi_12m", "forecast_confidence", "confidence_score", "confidence_bucket",
-    "value_score", "quality_score", "momentum_score", "growth_score", "overall_score", "opportunity_score",
+    "value_score", "quality_score", "momentum_score", "growth_score", "overall_score",
+    "fundamental_view", "technical_view", "risk_view", "value_view",
+    "opportunity_score",
     "rank_overall", "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
     "position_qty", "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
@@ -206,19 +122,12 @@ EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
     "Top_10_Investments": ["2222.SR", "1120.SR", "AAPL", "MSFT", "NVDA"],
 }
 
-# Whitespace characters to strip from symbol tokens (covers NBSP, ZWSP, BOM)
-_SYMBOL_INVISIBLE_CHARS = "\u00a0\u200b\u200c\u200d\ufeff"
-
 router = APIRouter(tags=["enriched"])
 
 
 # -----------------------------------------------------------------------------
 # Generic helpers
 # -----------------------------------------------------------------------------
-def _now_utc() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _strip(v: Any) -> str:
     if v is None:
         return ""
@@ -254,11 +163,6 @@ def _json_safe(value: Any) -> Any:
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(v) for v in value]
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        try:
-            return _json_safe(dataclasses.asdict(value))
-        except Exception:
-            pass
     try:
         if hasattr(value, "model_dump"):
             return _json_safe(value.model_dump())  # type: ignore[attr-defined]
@@ -277,20 +181,9 @@ def _json_safe(value: Any) -> Any:
 
 def _to_dict(obj: Any) -> Dict[str, Any]:
     if isinstance(obj, dict):
-        return {str(k): v for k, v in obj.items()}
+        return dict(obj)
     if obj is None:
         return {}
-    if isinstance(obj, Mapping):
-        try:
-            return {str(k): v for k, v in obj.items()}
-        except Exception:
-            return {}
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        try:
-            d = dataclasses.asdict(obj)
-            return d if isinstance(d, dict) else {}
-        except Exception:
-            pass
     try:
         if hasattr(obj, "model_dump"):
             d = obj.model_dump()  # type: ignore[attr-defined]
@@ -349,9 +242,9 @@ def _bool_from_any(value: Any, default: bool) -> bool:
         except Exception:
             return default
     s = _strip(value).lower()
-    if s in _TRUTHY:
+    if s in {"1", "true", "yes", "y", "on"}:
         return True
-    if s in _FALSY:
+    if s in {"0", "false", "no", "n", "off"}:
         return False
     return default
 
@@ -373,7 +266,7 @@ def _int_from_any(value: Any, default: int) -> int:
 def _split_symbols(value: str) -> List[str]:
     raw = (value or "").replace(";", ",").replace("\n", ",").replace("\t", ",").replace("|", ",")
     out: List[str] = []
-    seen: Set[str] = set()
+    seen = set()
     for part in raw.split(","):
         s = _strip(part)
         if s and s not in seen:
@@ -383,14 +276,9 @@ def _split_symbols(value: str) -> List[str]:
 
 
 def _normalize_symbol_token(sym: Any) -> str:
-    s = _strip(sym).upper()
+    s = _strip(sym).upper().replace(" ", "")
     if not s:
         return ""
-    # Strip embedded zero-width / nbsp before whitespace removal so codes
-    # arriving from external providers normalize cleanly.
-    for ch in _SYMBOL_INVISIBLE_CHARS:
-        s = s.replace(ch, "")
-    s = s.replace(" ", "")
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
     if s.endswith(".SA"):
@@ -405,7 +293,7 @@ def _list_from_body(body: Mapping[str, Any], *keys: str) -> List[str]:
         value = body.get(key)
         if isinstance(value, list):
             out: List[str] = []
-            seen: Set[str] = set()
+            seen = set()
             for item in value:
                 s = _normalize_symbol_token(item)
                 if s and s not in seen:
@@ -502,7 +390,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str]]:
 
 
 def _extract_contract_from_schema(page: str) -> Tuple[List[str], List[str]]:
-    for module_name in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
+    for module_name in ("core.sheets.schema_registry",):
         try:
             mod = importlib.import_module(module_name)
             get_sheet_spec = getattr(mod, "get_sheet_spec", None)
@@ -542,7 +430,7 @@ def _key_variants(key: str) -> List[str]:
     for alias in _FIELD_ALIAS_HINTS.get(k, []):
         variants.extend([alias, alias.lower(), alias.upper(), alias.replace("_", " "), alias.replace("_", "").lower()])
     out: List[str] = []
-    seen: Set[str] = set()
+    seen = set()
     for v in variants:
         s = _strip(v)
         if s and s not in seen:
@@ -595,17 +483,17 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
         return []
     if isinstance(payload, list):
         if payload and isinstance(payload[0], Mapping):
-            return [{str(k): v for k, v in dict(x).items()} for x in payload]
+            return [dict(x) for x in payload]
         return []
     if not isinstance(payload, Mapping):
         return []
     for name in ("row_objects", "records", "items", "data", "quotes", "results"):
         value = payload.get(name)
         if isinstance(value, list) and value and isinstance(value[0], Mapping):
-            return [{str(k): v for k, v in dict(x).items()} for x in value]
+            return [dict(x) for x in value]
     rows_value = payload.get("rows")
     if isinstance(rows_value, list) and rows_value and isinstance(rows_value[0], Mapping):
-        return [{str(k): v for k, v in dict(x).items()} for x in rows_value]
+        return [dict(x) for x in rows_value]
     for name in ("payload", "result", "response", "output", "data"):
         nested = payload.get(name)
         if isinstance(nested, Mapping):
@@ -695,9 +583,9 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     if kk in {"data_provider"}:
         return "enriched_quote.failsoft"
     if kk in {"last_updated_utc", "last_updated_riyadh"}:
-        return _now_utc()
+        return datetime.utcnow().isoformat()
     if kk == "recommendation":
-        return "HOLD" if row_index > 3 else "BUY"
+        return "Watch" if row_index > 3 else "Accumulate"
     if kk == "recommendation_reason":
         return "Local fail-soft row because canonical owner returned no usable rows."
     if kk in {"top10_rank", "rank_overall"}:
@@ -706,9 +594,7 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
         return "Local fail-soft Top10 selection because upstream rows were unavailable."
     if kk == "criteria_snapshot":
         return '{"source":"enriched_quote.failsoft"}'
-    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low",
-              "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
-              "intrinsic_value", "value"}:
+    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "intrinsic_value", "value"}:
         base = 100.0 + float(row_index)
         mapping = {
             "previous_close": round(base - 0.5, 2),
@@ -722,10 +608,7 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
             "value": round(base, 2),
         }
         return mapping.get(kk, round(base, 2))
-    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m",
-              "expected_roi_12m", "forecast_confidence", "confidence_score",
-              "overall_score", "opportunity_score", "value_score", "quality_score",
-              "momentum_score", "growth_score", "valuation_score", "risk_score"}:
+    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score", "value_score", "quality_score", "momentum_score", "growth_score", "valuation_score", "risk_score"}:
         base = max(1.0, 100.0 - float(row_index * 3))
         mapping = {
             "price_change": round(0.5 + row_index * 0.1, 2),
@@ -745,9 +628,7 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
             "risk_score": round(20 + row_index * 2, 2),
         }
         return mapping.get(kk, round(base, 2))
-    if kk in {"market_cap", "revenue_ttm", "free_cash_flow_ttm", "position_qty",
-              "position_value", "unrealized_pl", "volume", "avg_volume_10d",
-              "avg_volume_30d", "float_shares"}:
+    if kk in {"market_cap", "revenue_ttm", "free_cash_flow_ttm", "position_qty", "position_value", "unrealized_pl", "volume", "avg_volume_10d", "avg_volume_30d", "float_shares"}:
         scale = float(row_index)
         mapping = {
             "market_cap": 1000000000 + int(scale * 25000000),
@@ -805,7 +686,7 @@ def _build_insights_fallback_rows(symbols: Sequence[str], limit: int, offset: in
     requested = [_normalize_symbol_token(x) for x in symbols if _normalize_symbol_token(x)]
     if not requested:
         requested = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get("Insights_Analysis", []) if _normalize_symbol_token(x)]
-    stamp = _now_utc()
+    stamp = datetime.utcnow().isoformat()
     rows: List[Dict[str, Any]] = [
         {
             "section": "Coverage",
@@ -833,7 +714,7 @@ def _build_insights_fallback_rows(symbols: Sequence[str], limit: int, offset: in
                 "item": f"Fallback signal {idx}",
                 "symbol": sym,
                 "metric": "recommendation",
-                "value": "HOLD" if idx > 2 else "BUY",
+                "value": "Watch" if idx > 2 else "Accumulate",
                 "notes": "Generated locally because canonical owner payload was unavailable",
                 "last_updated_riyadh": stamp,
             }
@@ -865,7 +746,6 @@ class _Service:
         self.bridge_timeout_sec = self._env_float("TFB_ENRICHED_BRIDGE_TIMEOUT_SEC", 25.0)
         self.quote_call_timeout_sec = self._env_float("TFB_QUOTE_CALL_TIMEOUT_SEC", 20.0)
 
-        # core.config binding (best-effort)
         try:
             from core.config import auth_ok, get_settings_cached, is_open_mode  # type: ignore
         except Exception:
@@ -879,33 +759,13 @@ class _Service:
         self._get_settings_cached = get_settings_cached
         self._is_open_mode = is_open_mode
 
-        # page_catalog probe (multi-path fallback)
-        self.get_route_family: Optional[Callable[..., Any]] = None
-        self.normalize_page_name: Optional[Callable[..., Any]] = None
-        self.page_catalog_module = ""
-        for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
-            try:
-                _pcat = importlib.import_module(_pcat_path)
-                _grf = getattr(_pcat, "get_route_family", None)
-                _np = getattr(_pcat, "normalize_page_name", None)
-                if callable(_grf):
-                    self.get_route_family = _grf
-                    self.normalize_page_name = _np
-                    self.page_catalog_module = _pcat_path
-                    break
-            except Exception:
-                continue
-
-        # schema_registry probe (for /health capabilities)
-        self.schema_registry_module = ""
-        for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
-            try:
-                _sreg = importlib.import_module(_sreg_path)
-                if callable(getattr(_sreg, "get_sheet_spec", None)):
-                    self.schema_registry_module = _sreg_path
-                    break
-            except Exception:
-                continue
+        try:
+            from core.sheets.page_catalog import get_route_family, normalize_page_name  # type: ignore
+            self.get_route_family = get_route_family
+            self.normalize_page_name = normalize_page_name
+        except Exception:
+            self.get_route_family = None
+            self.normalize_page_name = None
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -915,21 +775,7 @@ class _Service:
         except Exception:
             return float(default)
 
-    def auth_guard(
-        self,
-        request: Request,
-        token_query: Optional[str],
-        x_app_token: Optional[str],
-        authorization: Optional[str],
-        x_api_key: Optional[str] = None,
-    ) -> None:
-        """
-        Flexible multi-signature dispatch for core.config.auth_ok.
-        Matches the pattern used by sister routers (investment_advisor v5.2.0,
-        analysis_sheet_rows v4.1.0, data_dictionary v2.7.0, config v5.9.0).
-        Richest signature first, degrades to {token} only.
-        """
-        # Open-mode short-circuit
+    def auth_guard(self, request: Request, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> None:
         try:
             if callable(self._is_open_mode) and bool(self._is_open_mode()):
                 return
@@ -946,71 +792,27 @@ class _Service:
 
         allow_query = False
         try:
-            allow_query = bool(
-                getattr(settings, "ALLOW_QUERY_TOKEN", False)
-                or getattr(settings, "allow_query_token", False)
-            )
+            allow_query = bool(getattr(settings, "allow_query_token", False))
         except Exception:
             allow_query = False
 
-        auth_token = _strip(x_app_token) or _strip(x_api_key)
-        auth_str = _strip(authorization)
-        if auth_str.lower().startswith("bearer "):
-            auth_token = _strip(auth_str.split(" ", 1)[1])
+        auth_token = _strip(x_app_token)
+        auth = _strip(authorization)
+        if auth.lower().startswith("bearer "):
+            auth_token = _strip(auth.split(" ", 1)[1])
         elif token_query and not auth_token and allow_query:
             auth_token = _strip(token_query)
 
-        headers: Dict[str, str] = {}
-        try:
-            headers = dict(request.headers)
-        except Exception:
-            headers = {}
-        if x_app_token:
-            headers.setdefault("X-APP-TOKEN", x_app_token)
-        if x_api_key:
-            headers.setdefault("X-API-Key", x_api_key)
-        if authorization:
-            headers.setdefault("Authorization", authorization)
-
+        headers = dict(request.headers)
         path = str(getattr(getattr(request, "url", None), "path", "") or "")
-
-        attempts: List[Dict[str, Any]] = [
-            {
-                "token": auth_token,
-                "authorization": authorization,
-                "headers": headers,
-                "api_key": x_api_key,
-                "path": path,
-                "request": request,
-                "settings": settings,
-            },
-            {
-                "token": auth_token,
-                "authorization": authorization,
-                "headers": headers,
-                "path": path,
-                "request": request,
-            },
-            {
-                "token": auth_token,
-                "authorization": authorization,
-                "headers": headers,
-                "path": path,
-            },
-            {
-                "token": auth_token,
-                "authorization": authorization,
-                "headers": headers,
-            },
-            {
-                "token": auth_token,
-                "authorization": authorization,
-            },
-            {
-                "token": auth_token,
-            },
+        attempts = [
+            {"token": auth_token, "authorization": authorization, "headers": headers, "path": path, "request": request, "settings": settings},
+            {"token": auth_token, "authorization": authorization, "headers": headers, "path": path, "request": request},
+            {"token": auth_token, "authorization": authorization, "headers": headers, "path": path},
+            {"token": auth_token, "authorization": authorization, "headers": headers},
+            {"token": auth_token, "authorization": authorization},
+            {"token": auth_token},
         ]
-
         for kwargs in attempts:
             try:
                 if bool(self._auth_ok(**kwargs)):
@@ -1115,24 +917,12 @@ class _Service:
         hdrs = list(headers)
         ks = list(keys)
         matrix = _rows_to_matrix(rows_out, ks) if include_matrix else []
-        base_meta = {
-            "duration_ms": round((time.time() - started_at) * 1000.0, 3),
-            "count": len(rows_out),
-            "dispatch": dispatch,
-            "mode": mode,
-            "route_owner": ROUTE_OWNER_NAME,
-            "route_family": route_family,
-            "timestamp_utc": _now_utc(),
-        }
-        if extra_meta:
-            base_meta.update(extra_meta)
         return _json_safe(
             {
                 "status": status,
                 "page": page,
                 "sheet": page,
                 "sheet_name": page,
-                "route_owner": ROUTE_OWNER_NAME,
                 "route_family": route_family,
                 "headers": hdrs if include_headers else [],
                 "display_headers": hdrs if include_headers else [],
@@ -1149,215 +939,81 @@ class _Service:
                 "data": rows_out,
                 "quotes": rows_out,
                 "count": len(rows_out),
-                "detail": error if error else "",
-                "error": error,  # None stays None — keeps response shape consistent
+                "detail": error or "",
+                "error": error,
                 "version": ROUTER_VERSION,
                 "request_id": request_id,
-                "timestamp_utc": _now_utc(),
-                "meta": base_meta,
+                "meta": {
+                    "duration_ms": round((time.time() - started_at) * 1000.0, 3),
+                    "count": len(rows_out),
+                    "dispatch": dispatch,
+                    "mode": mode,
+                    **(extra_meta or {}),
+                },
             }
         )
 
 
-# -----------------------------------------------------------------------------
-# Bridge dispatch — signature-introspecting, no-zero-arg-call safe
-# -----------------------------------------------------------------------------
-def _signature_for(fn: Any) -> Tuple[Optional[Set[str]], bool]:
-    """
-    Return (declared_param_names_or_None, accepts_var_keyword).
-
-    declared_param_names: set of POSITIONAL_OR_KEYWORD / KEYWORD_ONLY param
-        names the function accepts. None if signature could not be introspected.
-    accepts_var_keyword: True if fn declares **kwargs.
-    """
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return None, False
-    declared: Set[str] = set()
-    has_var_kw = False
-    for name, p in sig.parameters.items():
-        if p.kind == inspect.Parameter.VAR_KEYWORD:
-            has_var_kw = True
-        elif p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
-            declared.add(name)
-    return declared, has_var_kw
-
-
-async def _call_with_tolerant_signatures(
-    fn: Any,
-    *,
-    timeout_seconds: float,
-    kwargs: Optional[Dict[str, Any]] = None,
-) -> Any:
-    """
-    Call fn with a kwarg payload, tolerating signature mismatches.
-
-    Strategy:
-      1) Introspect fn's signature. If it declares **kwargs, pass everything.
-         Otherwise, pass exactly the declared params (keeping None values so
-         required-positional params are satisfied).
-      2) If introspection fails (C-implemented callables, etc.), fall back to
-         progressively-coarser kwarg variants.
-      3) Never call fn with zero args — that crashes any handler with
-         required positional params (the cause of v8.5.0's bug).
-      4) Keep None values throughout — Optional params expect to receive
-         None, and stripping them caused TypeErrors on every attempt.
-    """
+async def _call_with_tolerant_signatures(fn: Any, *, timeout_seconds: float, kwargs: Optional[Dict[str, Any]] = None) -> Any:
     payload_kwargs = dict(kwargs or {})
-
-    declared, has_var_kw = _signature_for(fn)
-
-    attempts: List[Dict[str, Any]] = []
-
-    # Preferred: signature-aware first attempt
-    if declared is not None:
-        if has_var_kw:
-            attempts.append(dict(payload_kwargs))
-        else:
-            attempts.append({k: payload_kwargs.get(k) for k in declared if k in payload_kwargs})
-
-    # Fallback variants (full payload first, then progressively coarser sets).
-    # Each variant keeps None values verbatim.
-    fallback_keysets: Sequence[Sequence[str]] = (
-        # Full payload as supplied by the caller
-        tuple(payload_kwargs.keys()),
-        # Full FastAPI handler signature
-        ("request", "body", "payload", "mode", "include_matrix_q",
-         "token", "x_app_token", "x_api_key", "authorization", "x_request_id"),
-        # Mid-rich
-        ("request", "body", "mode"),
-        # Minimal request+body
-        ("request", "body"),
-        # Body-centric
-        ("body", "mode"),
-        ("body",),
-        # Page-centric (no Request object)
-        ("page", "sheet", "sheet_name", "name", "tab", "symbols", "tickers",
-         "top_n", "limit", "offset", "mode"),
-    )
-    for keyset in fallback_keysets:
-        attempt = {k: payload_kwargs.get(k) for k in keyset if k in payload_kwargs}
-        if attempt:  # Never append empty {}
-            attempts.append(attempt)
-
-    # Deduplicate by keyset (preserving order)
-    deduped: List[Dict[str, Any]] = []
-    seen_signatures: Set[Tuple[str, ...]] = set()
+    attempts = [
+        payload_kwargs,
+        {k: payload_kwargs.get(k) for k in ("request", "body", "payload", "mode", "include_matrix_q", "token", "x_app_token", "authorization", "x_request_id")},
+        {k: payload_kwargs.get(k) for k in ("request", "body", "mode")},
+        {k: payload_kwargs.get(k) for k in ("request", "body")},
+        {k: payload_kwargs.get(k) for k in ("body", "mode")},
+        {k: payload_kwargs.get(k) for k in ("body",)},
+        {k: payload_kwargs.get(k) for k in ("page", "sheet", "sheet_name", "name", "tab", "symbols", "tickers", "top_n", "limit", "offset", "mode")},
+        {},
+    ]
+    last_error: Optional[Exception] = None
     for attempt in attempts:
-        sig_repr = tuple(sorted(attempt.keys()))
-        if not sig_repr or sig_repr in seen_signatures:
-            continue
-        seen_signatures.add(sig_repr)
-        deduped.append(attempt)
-
-    if not deduped:
-        # Nothing to call with — surface a clear error rather than calling fn()
-        raise TypeError(
-            f"_call_with_tolerant_signatures: no usable kwarg attempt for "
-            f"{getattr(fn, '__qualname__', fn)} given keys={sorted(payload_kwargs.keys())}"
-        )
-
-    last_type_error: Optional[TypeError] = None
-    for idx, attempt in enumerate(deduped):
+        call_kwargs = {k: v for k, v in attempt.items() if v is not None}
         try:
             if timeout_seconds > 0:
-                return await asyncio.wait_for(
-                    _call_maybe_async(fn, **attempt),
-                    timeout=timeout_seconds,
-                )
-            return await _call_maybe_async(fn, **attempt)
+                return await asyncio.wait_for(_call_maybe_async(fn, **call_kwargs), timeout=timeout_seconds)
+            return await _call_maybe_async(fn, **call_kwargs)
         except TypeError as exc:
-            last_type_error = exc
-            logger.debug(
-                "bridge dispatch attempt %d/%d failed for %s with keys=%s: %s",
-                idx + 1, len(deduped),
-                getattr(fn, "__qualname__", fn),
-                sorted(attempt.keys()),
-                exc,
-            )
+            last_error = exc
             continue
-        except Exception:
-            # Real runtime error from inside fn — surface immediately
+        except Exception as exc:
+            last_error = exc
             raise
-
-    # All attempts exhausted with TypeError — re-raise the last one with context
-    if last_type_error is not None:
-        raise TypeError(
-            f"All {len(deduped)} signature-tolerant call attempts failed for "
-            f"{getattr(fn, '__qualname__', fn)}. Last error: {last_type_error}"
-        ) from last_type_error
+    if last_error is not None:
+        raise last_error
     return None
 
 
-_BRIDGE_CANDIDATE_MODULES: Tuple[str, ...] = (
-    "routes.advanced_analysis",
-    "routes.analysis_sheet_rows",
-    "routes.investment_advisor",
-    "routes.advanced_sheet_rows",
-)
-
-_BRIDGE_CALLABLE_NAMES: Tuple[str, ...] = (
-    "_analysis_sheet_rows_impl",
-    "_run_advanced_sheet_rows_impl",
-    "_run_investment_advisor_impl",
-    "run_investment_advisor_engine",
-    "run_investment_advisor",
-)
-
-
 async def _resolve_bridge_impl(page: str, route_family: str) -> Tuple[Optional[Any], Dict[str, Any]]:
-    """
-    Resolve the best bridge implementation for (page, route_family).
-
-    Order:
-      - Dictionary / Insights / Top10 pages → advanced_analysis first
-      - Instrument pages                    → analysis_sheet_rows first
-      - advanced_sheet_rows always last as diagnostic fallback
-    """
     if route_family == "dictionary" or page == "Data_Dictionary":
-        module_order = (
-            "routes.advanced_analysis",
-            "routes.analysis_sheet_rows",
-            "routes.investment_advisor",
-            "routes.advanced_sheet_rows",
-        )
+        module_order = ("routes.advanced_analysis", "routes.analysis_sheet_rows", "routes.investment_advisor")
     elif route_family in {"top10", "insights"} or page in {"Top_10_Investments", "Insights_Analysis"}:
-        module_order = (
-            "routes.advanced_analysis",
-            "routes.analysis_sheet_rows",
-            "routes.investment_advisor",
-            "routes.advanced_sheet_rows",
-        )
+        module_order = ("routes.advanced_analysis", "routes.analysis_sheet_rows", "routes.investment_advisor")
     else:
-        module_order = (
-            "routes.analysis_sheet_rows",
-            "routes.advanced_analysis",
-            "routes.investment_advisor",
-            "routes.advanced_sheet_rows",
-        )
+        module_order = ("routes.analysis_sheet_rows", "routes.advanced_analysis", "routes.investment_advisor")
+
+    callable_candidates = (
+        "_analysis_sheet_rows_impl",
+        "_run_advanced_sheet_rows_impl",
+        "_run_investment_advisor_impl",
+        "run_investment_advisor_engine",
+        "run_investment_advisor",
+    )
 
     for module_name in module_order:
         try:
             module = importlib.import_module(module_name)
-        except Exception as exc:
-            logger.debug("bridge module import failed: %s (%s)", module_name, exc)
+        except Exception:
             continue
-        for callable_name in _BRIDGE_CALLABLE_NAMES:
+        for callable_name in callable_candidates:
             fn = getattr(module, callable_name, None)
             if callable(fn):
                 return fn, {"module": module_name, "callable": callable_name}
-
-    logger.warning(
-        "enriched_quote bridge unresolved for page=%s family=%s; falling back to local placeholder rows",
-        page,
-        route_family,
-    )
     return None, {}
 
 
 async def _delegate_sheet_rows_via_bridge(
-    svc: "_Service",
+    svc: _Service,
     request: Request,
     page: str,
     route_family: str,
@@ -1366,7 +1022,6 @@ async def _delegate_sheet_rows_via_bridge(
     include_matrix_q: Optional[bool],
     token_q: Optional[str],
     x_app_token: Optional[str],
-    x_api_key: Optional[str],
     authorization: Optional[str],
     x_request_id: Optional[str],
 ) -> Optional[Dict[str, Any]]:
@@ -1382,17 +1037,15 @@ async def _delegate_sheet_rows_via_bridge(
     prepared["tab"] = page
 
     symbols = _requested_symbols_from_body(prepared)
-    matrix_default = _bool_from_any(prepared.get("include_matrix"), True)
-    kwargs: Dict[str, Any] = {
+    kwargs = {
         "request": request,
         "body": prepared,
         "payload": prepared,
         "mode": mode_q or "",
-        "include_matrix_q": include_matrix_q if include_matrix_q is not None else matrix_default,
-        "include_matrix": include_matrix_q if include_matrix_q is not None else matrix_default,
+        "include_matrix_q": include_matrix_q if include_matrix_q is not None else _bool_from_any(prepared.get("include_matrix"), True),
+        "include_matrix": include_matrix_q if include_matrix_q is not None else _bool_from_any(prepared.get("include_matrix"), True),
         "token": token_q,
         "x_app_token": x_app_token,
-        "x_api_key": x_api_key,
         "authorization": authorization,
         "x_request_id": x_request_id,
         "page": page,
@@ -1407,27 +1060,7 @@ async def _delegate_sheet_rows_via_bridge(
         "offset": _int_from_any(prepared.get("offset"), 0),
     }
 
-    try:
-        out = await _call_with_tolerant_signatures(impl, timeout_seconds=svc.bridge_timeout_sec, kwargs=kwargs)
-    except asyncio.TimeoutError:
-        logger.warning(
-            "bridge call timed out after %.1fs for %s.%s page=%s",
-            svc.bridge_timeout_sec, impl_meta.get("module"), impl_meta.get("callable"), page,
-        )
-        return None
-    except TypeError as exc:
-        logger.error(
-            "bridge signature mismatch for %s.%s page=%s: %s",
-            impl_meta.get("module"), impl_meta.get("callable"), page, exc,
-        )
-        return None
-    except Exception as exc:
-        logger.error(
-            "bridge call raised for %s.%s page=%s: %s",
-            impl_meta.get("module"), impl_meta.get("callable"), page, exc,
-        )
-        return None
-
+    out = await _call_with_tolerant_signatures(impl, timeout_seconds=svc.bridge_timeout_sec, kwargs=kwargs)
     safe = _json_safe(out)
     if isinstance(safe, Mapping):
         result = dict(safe)
@@ -1461,7 +1094,6 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
         if not callable(fn):
             continue
         try:
-            res: Any = None
             for kwargs in ({"mode": mode, "schema": page}, {"schema": page}, {"mode": mode}, {}):
                 try:
                     res = await _call_maybe_async(fn, symbols, **kwargs)
@@ -1469,6 +1101,8 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
                 except TypeError:
                     res = None
                     continue
+            else:
+                res = None
             if isinstance(res, Mapping):
                 if all(isinstance(k, str) for k in res.keys()) and any(k in set(symbols) for k in res.keys()):
                     return {str(k): dict(v) if isinstance(v, Mapping) else {"symbol": k, "value": v} for k, v in res.items()}
@@ -1479,8 +1113,7 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
                     return {s: (dict(r) if isinstance(r, Mapping) else {"symbol": s, "value": r}) for s, r in zip(symbols, data)}
             elif isinstance(res, list):
                 return {s: (dict(r) if isinstance(r, Mapping) else {"symbol": s, "value": r}) for s, r in zip(symbols, res)}
-        except Exception as exc:
-            logger.debug("engine batch method %s failed: %s", method, exc)
+        except Exception:
             continue
 
     out: Dict[str, Dict[str, Any]] = {}
@@ -1489,27 +1122,23 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
     for s in symbols:
         try:
             if callable(per_dict_fn):
-                done = False
                 for kwargs in ({"mode": mode, "schema": page}, {"schema": page}, {"mode": mode}, {}):
                     try:
                         out[s] = await _call_maybe_async(per_dict_fn, s, **kwargs)
-                        done = True
                         break
                     except TypeError:
                         continue
-                if not done:
+                else:
                     out[s] = {"symbol": s, "error": "per_symbol_dict_call_failed"}
             elif callable(per_fn):
-                done = False
                 for kwargs in ({"mode": mode, "schema": page}, {"schema": page}, {"mode": mode}, {}):
                     try:
                         result = await _call_maybe_async(per_fn, s, **kwargs)
                         out[s] = dict(result) if isinstance(result, Mapping) else {"symbol": s, "value": result}
-                        done = True
                         break
                     except TypeError:
                         continue
-                if not done:
+                else:
                     out[s] = {"symbol": s, "error": "per_symbol_call_failed"}
             else:
                 out[s] = {"symbol": s, "error": "engine_missing_quote_method"}
@@ -1519,7 +1148,7 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
 
 
 async def _build_instrument_rows(
-    svc: "_Service",
+    svc: _Service,
     page: str,
     headers: Sequence[str],
     keys: Sequence[str],
@@ -1559,13 +1188,12 @@ async def _sheet_rows_handler(
     include_matrix_q: Optional[bool],
     token: Optional[str],
     x_app_token: Optional[str],
-    x_api_key: Optional[str],
     authorization: Optional[str],
     x_request_id: Optional[str],
 ) -> Dict[str, Any]:
     started_at = time.time()
     request_id = _request_id(request, x_request_id)
-    svc.auth_guard(request, token, x_app_token, authorization, x_api_key)
+    svc.auth_guard(request, token, x_app_token, authorization)
 
     prepared = dict(body or {})
     page = svc.normalize_page(_page_from_body(prepared) or "Market_Leaders")
@@ -1599,7 +1227,7 @@ async def _sheet_rows_handler(
         )
 
     bridge_result = await _delegate_sheet_rows_via_bridge(
-        svc, request, page, route_family, prepared, mode, include_matrix_q, token, x_app_token, x_api_key, authorization, x_request_id
+        svc, request, page, route_family, prepared, mode, include_matrix_q, token, x_app_token, authorization, x_request_id
     )
     if bridge_result is not None and _payload_has_real_rows(bridge_result):
         ext_rows = _extract_rows_like(bridge_result)
@@ -1680,13 +1308,12 @@ async def _single_quote_handler(
     mode_q: str,
     token_q: Optional[str],
     x_app_token: Optional[str],
-    x_api_key: Optional[str],
     authorization: Optional[str],
     x_request_id: Optional[str],
 ) -> Dict[str, Any]:
     started_at = time.time()
     request_id = _request_id(request, x_request_id)
-    svc.auth_guard(request, token_q, x_app_token, authorization, x_api_key)
+    svc.auth_guard(request, token_q, x_app_token, authorization)
 
     symbol = _strip(body.get("symbol") or body.get("ticker") or body.get("requested_symbol"))
     if not symbol:
@@ -1704,7 +1331,7 @@ async def _single_quote_handler(
         bridge_body = dict(body or {})
         bridge_body["symbols"] = [symbol]
         bridge_result = await _delegate_sheet_rows_via_bridge(
-            svc, request, page, route_family, bridge_body, mode_q, True, token_q, x_app_token, x_api_key, authorization, x_request_id
+            svc, request, page, route_family, bridge_body, mode_q, True, token_q, x_app_token, authorization, x_request_id
         )
         if bridge_result is not None and _payload_has_real_rows(bridge_result):
             rows = _extract_rows_like(bridge_result)
@@ -1778,94 +1405,12 @@ async def _single_quote_handler(
 @router.get("/v1/enriched/health", include_in_schema=False)
 @router.get("/v1/enriched_quote/health", include_in_schema=False)
 @router.get("/v1/enriched-quote/health", include_in_schema=False)
-async def health(request: Request) -> Dict[str, Any]:
-    request_id = _request_id(request, None)
-    bridge_available = False
-    bridge_module = ""
-    bridge_callable = ""
-    try:
-        fn, meta = await _resolve_bridge_impl("Market_Leaders", "instrument")
-        if fn is not None:
-            bridge_available = True
-            bridge_module = str(meta.get("module") or "")
-            bridge_callable = str(meta.get("callable") or "")
-    except Exception:
-        bridge_available = False
-
-    capabilities = {
-        "auth_ok_callable": callable(svc._auth_ok),
-        "is_open_mode_callable": callable(svc._is_open_mode),
-        "get_settings_cached_callable": callable(svc._get_settings_cached),
-        "page_catalog_available": bool(svc.page_catalog_module),
-        "schema_registry_available": bool(svc.schema_registry_module),
-        "bridge_resolvable": bridge_available,
-    }
-
-    return _json_safe(
-        {
-            "status": "ok" if bridge_available else "degraded",
-            "module": "routes.enriched_quote",
-            "router_version": ROUTER_VERSION,
-            "route_owner": ROUTE_OWNER_NAME,
-            "route_family": ROUTE_FAMILY_NAME,
-            "owns_enriched_sheet_rows": True,
-            "owned_paths": list(_OWNED_PATHS),
-            "bridge_candidate_modules": list(_BRIDGE_CANDIDATE_MODULES),
-            "bridge_active_module": bridge_module,
-            "bridge_active_callable": bridge_callable,
-            "page_catalog_module": svc.page_catalog_module,
-            "schema_registry_module": svc.schema_registry_module,
-            "capabilities": capabilities,
-            "path": str(getattr(getattr(request, "url", None), "path", "")),
-            "request_id": request_id,
-            "timestamp_utc": _now_utc(),
-        }
-    )
-
-
-@router.get("/v1/enriched/diagnostics", include_in_schema=False)
-@router.get("/v1/enriched_quote/diagnostics", include_in_schema=False)
-@router.get("/v1/enriched-quote/diagnostics", include_in_schema=False)
-async def diagnostics(request: Request) -> Dict[str, Any]:
-    """
-    Detailed bridge resolution map. Useful when /sheet-rows misbehaves —
-    shows which bridge module/callable was found and what its declared
-    parameters are, so signature mismatches can be diagnosed without
-    deploying a new build.
-    """
-    request_id = _request_id(request, None)
-    candidates_report: List[Dict[str, Any]] = []
-    for module_name in _BRIDGE_CANDIDATE_MODULES:
-        entry: Dict[str, Any] = {"module": module_name, "import_ok": False, "callables": {}}
-        try:
-            mod = importlib.import_module(module_name)
-            entry["import_ok"] = True
-        except Exception as exc:
-            entry["import_error"] = f"{type(exc).__name__}: {exc}"
-            candidates_report.append(entry)
-            continue
-        for name in _BRIDGE_CALLABLE_NAMES:
-            fn = getattr(mod, name, None)
-            if not callable(fn):
-                continue
-            declared, has_var_kw = _signature_for(fn)
-            entry["callables"][name] = {
-                "declared_params": sorted(list(declared)) if declared is not None else None,
-                "accepts_var_keyword": has_var_kw,
-                "is_coroutine": inspect.iscoroutinefunction(fn),
-            }
-        candidates_report.append(entry)
-
+async def health() -> Dict[str, Any]:
     return _json_safe({
         "status": "ok",
         "module": "routes.enriched_quote",
         "router_version": ROUTER_VERSION,
-        "route_owner": ROUTE_OWNER_NAME,
-        "candidate_modules": candidates_report,
-        "bridge_callable_names": list(_BRIDGE_CALLABLE_NAMES),
-        "bridge_timeout_sec": svc.bridge_timeout_sec,
-        "request_id": request_id,
-        "timestamp_utc": _now_utc(),
+        "owns_enriched_sheet_rows": True,
     })
 
 
@@ -1887,10 +1432,8 @@ async def headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]
         "keys": keys,
         "columns": keys,
         "fields": keys,
-        "route_owner": ROUTE_OWNER_NAME,
         "route_family": svc.route_family(page_norm),
         "router_version": ROUTER_VERSION,
-        "timestamp_utc": _now_utc(),
     })
 
 
@@ -1905,11 +1448,10 @@ async def quote_post(
     mode: str = Query(default=""),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    return await _single_quote_handler(request, body, page, mode, token, x_app_token, x_api_key, authorization, x_request_id)
+    return await _single_quote_handler(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
 
 @router.get("/v1/enriched/quote", include_in_schema=False)
@@ -1924,12 +1466,11 @@ async def quote_get(
     mode: str = Query(default=""),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
     body = _collect_sheet_body(symbol=symbol, ticker=ticker, page=page)
-    return await _single_quote_handler(request, body, page, mode, token, x_app_token, x_api_key, authorization, x_request_id)
+    return await _single_quote_handler(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
 
 @router.post("/v1/enriched/quotes", include_in_schema=False)
@@ -1942,11 +1483,10 @@ async def quotes_post(
     mode: str = Query(default=""),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    return await _sheet_rows_handler(request, body, mode, None, token, x_app_token, x_api_key, authorization, x_request_id)
+    return await _sheet_rows_handler(request, body, mode, None, token, x_app_token, authorization, x_request_id)
 
 
 @router.get("/v1/enriched/quotes", include_in_schema=False)
@@ -1975,7 +1515,6 @@ async def quotes_get(
     mode: str = Query(default=""),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
@@ -1998,7 +1537,7 @@ async def quotes_get(
         schema_only=schema_only,
         headers_only=headers_only,
     )
-    return await _sheet_rows_handler(request, body, mode, None, token, x_app_token, x_api_key, authorization, x_request_id)
+    return await _sheet_rows_handler(request, body, mode, None, token, x_app_token, authorization, x_request_id)
 
 
 @router.post("/v1/enriched/sheet-rows")
@@ -2011,11 +1550,10 @@ async def sheet_rows_post(
     include_matrix: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    return await _sheet_rows_handler(request, body, mode, include_matrix, token, x_app_token, x_api_key, authorization, x_request_id)
+    return await _sheet_rows_handler(request, body, mode, include_matrix, token, x_app_token, authorization, x_request_id)
 
 
 @router.get("/v1/enriched/sheet-rows")
@@ -2043,7 +1581,6 @@ async def sheet_rows_get(
     mode: str = Query(default=""),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
@@ -2065,7 +1602,7 @@ async def sheet_rows_get(
         schema_only=schema_only,
         headers_only=headers_only,
     )
-    return await _sheet_rows_handler(request, body, mode, include_matrix, token, x_app_token, x_api_key, authorization, x_request_id)
+    return await _sheet_rows_handler(request, body, mode, include_matrix, token, x_app_token, authorization, x_request_id)
 
 
 @router.post("/v1/enriched")
@@ -2077,15 +1614,14 @@ async def alias_root_post(
     mode: str = Query(default=""),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
     if _strip(body.get("symbol") or body.get("ticker") or body.get("requested_symbol")):
-        return await _single_quote_handler(request, body, _page_from_body(body), mode, token, x_app_token, x_api_key, authorization, x_request_id)
+        return await _single_quote_handler(request, body, _page_from_body(body), mode, token, x_app_token, authorization, x_request_id)
     if _requested_symbols_from_body(body):
-        return await _sheet_rows_handler(request, body, mode, None, token, x_app_token, x_api_key, authorization, x_request_id)
-    return await _sheet_rows_handler(request, body, mode, None, token, x_app_token, x_api_key, authorization, x_request_id)
+        return await _sheet_rows_handler(request, body, mode, None, token, x_app_token, authorization, x_request_id)
+    return await _sheet_rows_handler(request, body, mode, None, token, x_app_token, authorization, x_request_id)
 
 
 @router.get("/v1/enriched")
@@ -2115,7 +1651,6 @@ async def alias_root_get(
     mode: str = Query(default=""),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
@@ -2142,13 +1677,8 @@ async def alias_root_get(
     if ticker not in (None, ""):
         body["ticker"] = ticker
     if _strip(body.get("symbol") or body.get("ticker") or body.get("requested_symbol")):
-        return await _single_quote_handler(request, body, page or _page_from_body(body), mode, token, x_app_token, x_api_key, authorization, x_request_id)
-    return await _sheet_rows_handler(request, body, mode, include_matrix, token, x_app_token, x_api_key, authorization, x_request_id)
+        return await _single_quote_handler(request, body, page or _page_from_body(body), mode, token, x_app_token, authorization, x_request_id)
+    return await _sheet_rows_handler(request, body, mode, include_matrix, token, x_app_token, authorization, x_request_id)
 
 
-__all__ = [
-    "ROUTER_VERSION",
-    "ROUTE_OWNER_NAME",
-    "ROUTE_FAMILY_NAME",
-    "router",
-]
+__all__ = ["ROUTER_VERSION", "router"]
