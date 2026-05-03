@@ -2,70 +2,76 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v4.1.4
-(HORIZON-AWARE / TECHNICAL-SIGNALS / SHORT-TERM READY / SCHEMA-ALIGNED)
+Scoring Module — v5.0.0
+(VIEW-AWARE / 5-TIER RECOMMENDATIONS / PHANTOM-ROW-SAFE / SCHEMA-ALIGNED)
 ================================================================================
 
-v4.1.4 changes (what moved from v4.1.3)
----------------------------------------
-- FIX [HIGH]: Blue-chip guard was too narrow. v4.1.3 required BOTH
-  quality >= 65 AND growth >= 65 simultaneously. The problem: growth_score
-  returns None when revenue_growth_yoy is absent (common for ETFs,
-  commodities, and stocks whose data provider didn't return the field).
-  With growth is None, the guard's `growth is not None and g >= 65.0`
-  branch silently failed — and the stock got a false SELL/REDUCE.
+v5.0.0 changes (BREAKING in spirit, NOT in API)
+-----------------------------------------------
+The recommendation logic from v4.1.x was producing a near-2-state output
+(ACCUMULATE / HOLD only) because:
+  1. `compute_recommendation` thresholded on Overall Score alone — once
+     overall >= 65, it returned HOLD without inspecting the fundamental,
+     technical, risk, or value views.
+  2. The four "View" columns (Fundamental / Technical / Risk / Value)
+     existed in the output sheet but were never inputs to the decision —
+     they were derived AFTER the recommendation, then displayed.
+  3. EXPENSIVE valuations could still get BUY/ACCUMULATE recommendations
+     (no veto rule).
+  4. BEARISH technicals were ignored as long as Overall was high enough.
+  5. Phantom rows (XETRA tickers with no underlying data) still received
+     a 50-65 quality score from `data_quality_proxy`, which let them
+     reach the HOLD/BUY threshold.
+  6. The v4.1.4 "blue-chip guard" was actively SUPPRESSING legitimate
+     SELL/REDUCE signals when forward data was missing — making the
+     2-state collapse worse for high-quality rows.
 
-  Fix: the guard now fires in two independent cases:
-  (a) Full signal: quality >= 65 AND growth >= 65 AND risk <= 55
-      (the original v4.1.3 logic, unchanged).
-  (b) Quality-only: quality >= 70 AND risk <= 50, regardless of growth.
-      Tighter thresholds because we're using fewer inputs; symmetric
-      with (a) overall.
-  Either case triggers HOLD instead of SELL/REDUCE when forward-looking
-  data is missing.
+v5.0.0 fixes all of the above by:
+  A. NEW: `derive_fundamental_view`, `derive_technical_view`,
+     `derive_risk_view`, `derive_value_view` — produce the 4 View tokens
+     (BULLISH / NEUTRAL / BEARISH; LOW / MODERATE / HIGH; CHEAP / FAIR /
+     EXPENSIVE) directly from the underlying scores. These tokens become
+     INPUTS to the recommendation, not outputs of it.
+  B. REWRITTEN: `compute_recommendation` now delegates to
+     `core.reco_normalize.recommendation_from_views()` — the single
+     source of truth for view-aware 5-tier decisions. The old
+     score-only branches are gone.
+  C. NEW: View columns are written to AssetScores: `fundamental_view`,
+     `technical_view`, `risk_view`, `value_view`. Scoring engines can
+     now expose them in the sheet's "View" columns directly.
+  D. FIXED: `compute_quality_score` returns None (not 60) when neither
+     financial fundamentals NOR data_quality markers are present. This
+     stops phantom XETRA / data-missing rows from sneaking past the
+     scoring gate.
+  E. REMOVED: the v4.1.4 blue-chip guard. The view-aware logic now
+     handles the missing-forward-data case correctly without needing
+     to override SELL/REDUCE: high-quality stocks with no forward signal
+     end up at HOLD because no view triggers BUY/STRONG_BUY conditions,
+     not because a special-case override fires.
+  F. PRESERVED: every public symbol, every component-score function,
+     every horizon helper, every forecast helper, every signature.
+     This is a drop-in replacement.
 
-- FIX [MEDIUM]: compute_valuation_score weight normalization. v4.1.2 fixed
-  the anchors-only case but left the partial-signal calibration
-  inconsistent across symbols. Example: a symbol with only upside_n
-  (weight 0.40) scored with wsum=0.40, while a symbol with upside_n +
-  roi3_n + roi12_n + anchor_avg scored with wsum=1.00. The weighted
-  average is numerically the same shape but the EFFECTIVE minimum for
-  partial-signal symbols was higher. This made scores not directly
-  comparable.
+Public API (UNCHANGED):
+  __version__, SCORING_VERSION, Horizon, Signal, RSISignal,
+  compute_scores, score_row, score_quote, enrich_with_scores,
+  rank_rows_by_overall, assign_rank_overall, score_and_rank_rows,
+  AssetScores, ScoreWeights, ScoringWeights, ForecastParameters,
+  ScoringEngine, DEFAULT_WEIGHTS, DEFAULT_FORECASTS,
+  normalize_recommendation_code, CANONICAL_RECOMMENDATION_CODES,
+  detect_horizon, get_weights_for_horizon,
+  compute_technical_score, rsi_signal, short_term_signal,
+  derive_upside_pct, derive_volume_ratio, derive_day_range_position,
+  invest_period_label,
+  compute_valuation_score, compute_growth_score, compute_momentum_score,
+  compute_quality_score, compute_risk_score, compute_opportunity_score,
+  compute_confidence_score, compute_recommendation,
+  risk_bucket, confidence_bucket,
+  ScoringError, InvalidHorizonError, MissingDataError.
 
-  Fix: when any forward signal is present, give the partial-data case
-  the same expected weight floor (sum of missing weights treated as
-  neutral 0.5). Documented as v4.1.4 behavior; no behavior change for
-  full-signal symbols.
-
-- DOC: v4.1.3 blue-chip guard docstring clarified to explain both cases.
-
-Public API preserved. `compute_recommendation`'s signature is unchanged
-from v4.1.3. Callers that pass quality/growth/valuation still benefit
-from the stricter v4.1.3 logic; the new case (b) also fires when growth
-is None.
-
-v4.1.3 — Blue-chip guard (preserved)
-------------------------------------
-See v4.1.3 docstring block below for the original motivation.
-Blue-chip stocks (strong fundamentals, controlled risk) with silent
-forward-looking providers now receive HOLD instead of false SELL/REDUCE.
-
-v4.1.2 — Respect scoring.py's intentional None for valuation_score (preserved)
-------------------------------------------------------------------
-compute_valuation_score returns None (not a misleading near-zero score)
-when no forward-looking signal is available. downstream compute_scores
-handles None by skipping and renormalizing.
-
-v4.1.1 — normalize_recommendation_code preserves STRONG_BUY (preserved)
---------------------------------------------------------------------
-3-step resolution: canonical fast path, local alias table, then delegate
-to reco_normalize for unknown inputs only.
-
-v4.1.0 — ROI coercion + insufficient-input handling (preserved)
----------------------------------------------------------------
-_as_roi_fraction for all expected_roi_* fields; honest HOLD when
-scoring inputs are insufficient.
+Public API ADDITIONS in v5.0.0:
+  derive_fundamental_view, derive_technical_view,
+  derive_risk_view, derive_value_view.
 ================================================================================
 """
 
@@ -94,7 +100,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "4.1.4"
+__version__ = "5.0.0"
 SCORING_VERSION = __version__
 
 # =============================================================================
@@ -106,7 +112,6 @@ _RIYADH_TZ = timezone(timedelta(hours=3))
 
 
 def _utc_iso(dt: Optional[datetime] = None) -> str:
-    """Get UTC time in ISO format. Naive datetimes are treated as UTC."""
     d = dt or datetime.now(_UTC)
     if d.tzinfo is None:
         d = d.replace(tzinfo=_UTC)
@@ -114,7 +119,6 @@ def _utc_iso(dt: Optional[datetime] = None) -> str:
 
 
 def _riyadh_iso(dt: Optional[datetime] = None) -> str:
-    """Get Riyadh time in ISO format."""
     if dt is None:
         return datetime.now(_RIYADH_TZ).isoformat()
     d = dt
@@ -124,11 +128,10 @@ def _riyadh_iso(dt: Optional[datetime] = None) -> str:
 
 
 # =============================================================================
-# Enums
+# Enums (preserved)
 # =============================================================================
 
 class Horizon(str, Enum):
-    """Investment horizon classification."""
     DAY = "day"
     WEEK = "week"
     MONTH = "month"
@@ -136,7 +139,6 @@ class Horizon(str, Enum):
 
 
 class Signal(str, Enum):
-    """Trading signals."""
     STRONG_BUY = "STRONG_BUY"
     BUY = "BUY"
     HOLD = "HOLD"
@@ -145,7 +147,6 @@ class Signal(str, Enum):
 
 
 class RSISignal(str, Enum):
-    """RSI-based signals."""
     OVERSOLD = "Oversold"
     NEUTRAL = "Neutral"
     OVERBOUGHT = "Overbought"
@@ -153,31 +154,27 @@ class RSISignal(str, Enum):
 
 
 # =============================================================================
-# Custom Exceptions
+# Custom Exceptions (preserved)
 # =============================================================================
 
 class ScoringError(Exception):
-    """Base exception for scoring errors."""
     pass
 
 
 class InvalidHorizonError(ScoringError):
-    """Raised when horizon is invalid."""
     pass
 
 
 class MissingDataError(ScoringError):
-    """Raised when required data is missing."""
     pass
 
 
 # =============================================================================
-# Configuration
+# Configuration (preserved)
 # =============================================================================
 
 @dataclass(frozen=True)
 class ScoringConfig:
-    """Configuration for scoring module."""
     day_threshold: int = 5
     week_threshold: int = 14
     month_threshold: int = 90
@@ -230,7 +227,7 @@ class ScoringConfig:
 _CONFIG = ScoringConfig.from_env()
 
 # =============================================================================
-# Horizon Thresholds
+# Horizon Thresholds (preserved)
 # =============================================================================
 
 _HORIZON_DAYS_CUTOFFS: Tuple[Tuple[int, Horizon], ...] = (
@@ -241,7 +238,7 @@ _HORIZON_DAYS_CUTOFFS: Tuple[Tuple[int, Horizon], ...] = (
 
 
 # =============================================================================
-# Data Classes
+# Data Classes (extended with view fields in v5.0.0)
 # =============================================================================
 
 @dataclass(slots=True)
@@ -311,6 +308,14 @@ class AssetScores:
     horizon_label: Optional[str] = None
     horizon_days_effective: Optional[int] = None
 
+    # NEW in v5.0.0: the four View columns derived from the components.
+    # Now first-class outputs of compute_scores() rather than something
+    # the caller had to derive separately.
+    fundamental_view: Optional[str] = None
+    technical_view: Optional[str] = None
+    risk_view: Optional[str] = None
+    value_view: Optional[str] = None
+
     recommendation: str = "HOLD"
     recommendation_reason: str = "Insufficient data."
 
@@ -342,7 +347,7 @@ DEFAULT_FORECASTS = ForecastParameters()
 
 
 # =============================================================================
-# Pure Utility Functions
+# Pure Utility Functions (preserved)
 # =============================================================================
 
 def _clamp(value: float, min_val: float, max_val: float) -> float:
@@ -434,7 +439,7 @@ def _norm_confidence_0_1(value: Any) -> Optional[float]:
 
 
 # =============================================================================
-# Horizon Detection
+# Horizon Detection (preserved)
 # =============================================================================
 
 def detect_horizon(settings: Any = None, row: Optional[Mapping[str, Any]] = None) -> Tuple[Horizon, Optional[int]]:
@@ -505,7 +510,7 @@ def get_weights_for_horizon(horizon: Horizon, settings: Any = None) -> ScoreWeig
 
 
 # =============================================================================
-# Derived Field Helpers
+# Derived Field Helpers (preserved)
 # =============================================================================
 
 def derive_volume_ratio(row: Mapping[str, Any]) -> Optional[float]:
@@ -578,7 +583,7 @@ def invest_period_label(horizon: Horizon, horizon_days: Optional[int] = None) ->
 
 
 # =============================================================================
-# Technical Score
+# Technical Score (preserved)
 # =============================================================================
 
 def _rsi_to_zone_score(rsi: Optional[float]) -> Optional[float]:
@@ -688,7 +693,6 @@ def short_term_signal(
             return Signal.SELL.value
         return Signal.HOLD.value
 
-    # Month / Long
     if m >= 70 and t >= 55:
         return Signal.BUY.value
     if m <= 30 or t <= 35:
@@ -697,7 +701,7 @@ def short_term_signal(
 
 
 # =============================================================================
-# Forecast Helpers
+# Forecast Helpers (preserved)
 # =============================================================================
 
 def _forecast_params_from_settings(settings: Any) -> ForecastParameters:
@@ -834,15 +838,43 @@ def _completeness_factor(row: Mapping[str, Any]) -> float:
 
 
 def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
-    dq = _data_quality_factor(row)
-    comp = _completeness_factor(row)
-    data_quality_proxy = _clamp(0.55 * dq + 0.45 * comp, 0.0, 1.0)
+    """
+    Compute quality score (0-100).
 
+    v5.0.0 fix: returns None when there is genuinely no quality input —
+    no financial fundamentals AND no meaningful data-quality marker AND
+    completeness below 30%. Previously this path defaulted to ~60 from
+    the data-quality proxy, which let phantom rows (XETRA tickers with
+    no underlying data) sneak past the scoring gate and end up with
+    HOLD/BUY recommendations on empty information.
+
+    Detection rule for "phantom row":
+      - no roe / roa / op_margin / net_margin / debt_to_equity, AND
+      - data_quality is missing or in {POOR, STALE, MISSING, ERROR}, AND
+      - completeness < 30% of core fields populated.
+
+    A row that hits all three conditions returns None and is excluded
+    from the overall score.
+    """
     roe = _as_fraction(_get(row, "roe", "return_on_equity", "returnOnEquity"))
     roa = _as_fraction(_get(row, "roa", "return_on_assets", "returnOnAssets"))
     op_margin = _as_fraction(_get(row, "operating_margin", "operatingMarginTTM"))
     net_margin = _as_fraction(_get(row, "profit_margin", "net_margin", "profitMargins"))
     de = _get_float(row, "debt_to_equity", "debtToEquity")
+
+    has_any_financial = any(x is not None for x in (roe, roa, op_margin, net_margin, de))
+
+    dq_label = str(_get(row, "data_quality") or "").strip().upper()
+    dq_is_weak = dq_label in {"", "POOR", "STALE", "MISSING", "ERROR", "UNKNOWN"}
+
+    completeness = _completeness_factor(row)
+
+    # v5.0.0: phantom-row gate
+    if not has_any_financial and dq_is_weak and completeness < 0.30:
+        return None
+
+    dq = _data_quality_factor(row)
+    data_quality_proxy = _clamp(0.55 * dq + 0.45 * completeness, 0.0, 1.0)
 
     fin_parts: List[Tuple[float, float]] = []
 
@@ -890,17 +922,13 @@ def compute_valuation_score(row: Mapping[str, Any]) -> Optional[float]:
     """
     Compute valuation score (0-100).
 
-    v4.1.4: weight normalization for partial-signal symbols. When only
-    some forward signals are available, the weighted average divides by
-    the sum of available weights — which mathematically gives the raw
-    average, but made partial-signal scores not directly comparable to
-    full-signal scores. v4.1.4 normalizes by the full expected weight,
-    treating missing components as neutral 0.5 (not 0.0) so one strong
-    positive signal doesn't get a free pass.
+    Returns None if no forward-looking signal is available (upside,
+    3m ROI, 12m ROI all missing). Anchors-only (PE/PB/PS/PEG/EV) is
+    insufficient because those fields are backward-looking.
 
-    v4.1.2: returns None if no forward-looking signal is available
-    (upside / 3m ROI / 12m ROI all missing). Anchors-only (PE/PB/PS/PEG/
-    EV) is insufficient because those fields point backward, not forward.
+    Preserved from v4.1.4: weight normalization treats missing
+    components as neutral 0.5 so partial-signal scores stay
+    comparable to full-signal scores.
     """
     price = _get_float(row, "current_price", "price", "last_price", "last")
     if price is None or price <= 0:
@@ -951,14 +979,9 @@ def compute_valuation_score(row: Mapping[str, Any]) -> Optional[float]:
     roi3_n = _roi_norm(roi3, 0.35)
     roi12_n = _roi_norm(roi12, 0.80)
 
-    # v4.1.2: require at least one forward-looking signal.
     if upside_n is None and roi3_n is None and roi12_n is None:
         return None
 
-    # v4.1.4: normalize over full expected weight (1.00).
-    # Missing components contribute 0.5 (neutral) * their weight, so
-    # scores are on a consistent 0-100 scale regardless of which
-    # forward signals are present.
     FULL_WEIGHT = 1.00
     components: List[Tuple[float, Optional[float]]] = [
         (0.40, upside_n),
@@ -972,7 +995,6 @@ def compute_valuation_score(row: Mapping[str, Any]) -> Optional[float]:
         if value is not None:
             total += weight * value
         else:
-            # Missing component treated as neutral 0.5
             total += weight * 0.5
 
     score_01 = total / FULL_WEIGHT
@@ -1118,6 +1140,140 @@ def confidence_bucket(conf01: Optional[float]) -> Optional[str]:
     return "Low"
 
 
+# =============================================================================
+# View Derivation (NEW in v5.0.0)
+# =============================================================================
+#
+# These four functions translate the numeric component scores into the
+# qualitative View tokens that feed `compute_recommendation`. They are
+# the bridge between scoring and recommendation: scores are numeric
+# evidence; views are decision inputs.
+
+def derive_fundamental_view(
+    quality: Optional[float],
+    growth: Optional[float],
+) -> Optional[str]:
+    """
+    BULLISH / NEUTRAL / BEARISH from quality + growth scores.
+
+    Decision rules:
+      - Both quality and growth missing -> None (we don't know).
+      - quality >= 65 AND growth >= 60 -> BULLISH
+      - quality < 40 (regardless of growth)  -> BEARISH
+      - growth < 25  AND quality < 55       -> BEARISH
+      - Else                                -> NEUTRAL
+
+    The asymmetry — BEARISH triggers on either weak quality alone or on
+    weak growth combined with weak-ish quality — reflects the fact that
+    quality is the more important fundamental indicator, while growth
+    needs corroboration before it flips the view bearish.
+    """
+    if quality is None and growth is None:
+        return None
+
+    q = quality if quality is not None else 50.0
+    g = growth if growth is not None else 50.0
+
+    if q < 40.0:
+        return "BEARISH"
+    if g < 25.0 and q < 55.0:
+        return "BEARISH"
+    if q >= 65.0 and g >= 60.0:
+        return "BULLISH"
+    if q >= 70.0 and growth is None:
+        # Strong quality, growth unavailable: still bullish on fundamentals.
+        return "BULLISH"
+    return "NEUTRAL"
+
+
+def derive_technical_view(
+    technical: Optional[float],
+    momentum: Optional[float],
+    rsi_label: Optional[str] = None,
+) -> Optional[str]:
+    """
+    BULLISH / NEUTRAL / BEARISH from technical + momentum + RSI signal.
+
+    Decision rules:
+      - Both technical and momentum missing -> None.
+      - rsi_label == OVERBOUGHT capped at NEUTRAL  (over-extended setup)
+      - technical >= 65 AND momentum >= 55  -> BULLISH
+      - technical < 40 OR momentum < 35     -> BEARISH
+      - Else                                -> NEUTRAL
+    """
+    if technical is None and momentum is None:
+        return None
+
+    t = technical if technical is not None else 50.0
+    m = momentum if momentum is not None else 50.0
+
+    label = (rsi_label or "").strip().lower()
+    is_overbought = label.startswith("overbought")
+
+    if t < 40.0 or m < 35.0:
+        return "BEARISH"
+    if t >= 65.0 and m >= 55.0:
+        return "NEUTRAL" if is_overbought else "BULLISH"
+    return "NEUTRAL"
+
+
+def derive_risk_view(risk: Optional[float]) -> Optional[str]:
+    """
+    LOW / MODERATE / HIGH from a 0-100 risk score (higher = riskier).
+
+    Mirrors `risk_bucket()` but uses uppercase tokens that the
+    recommendation engine expects.
+    """
+    if risk is None:
+        return None
+    if risk <= _CONFIG.risk_low_threshold:
+        return "LOW"
+    if risk <= _CONFIG.risk_moderate_threshold:
+        return "MODERATE"
+    return "HIGH"
+
+
+def derive_value_view(
+    valuation: Optional[float],
+    upside_pct: Optional[float] = None,
+) -> Optional[str]:
+    """
+    CHEAP / FAIR / EXPENSIVE from valuation score and/or upside %.
+
+    Upside takes precedence when both are present because it's a direct,
+    forward-looking measure. Falls back to valuation_score thresholds:
+      - valuation >= 65 -> CHEAP
+      - valuation < 40  -> EXPENSIVE
+      - else            -> FAIR
+
+    Upside thresholds:
+      - upside >  +0.20 (>= 20%) -> CHEAP
+      - upside <  -0.10 (>= 10% overvalued) -> EXPENSIVE
+      - else (within +/-10..20%) -> FAIR
+    """
+    # Upside has priority when present
+    if upside_pct is not None:
+        if upside_pct > 0.20:
+            return "CHEAP"
+        if upside_pct < -0.10:
+            return "EXPENSIVE"
+        if valuation is None:
+            return "FAIR"
+
+    if valuation is None:
+        return None
+
+    if valuation >= 65.0:
+        return "CHEAP"
+    if valuation < 40.0:
+        return "EXPENSIVE"
+    return "FAIR"
+
+
+# =============================================================================
+# Recommendation (REWRITTEN in v5.0.0)
+# =============================================================================
+
 def compute_recommendation(
     overall: Optional[float],
     risk: Optional[float],
@@ -1132,164 +1288,114 @@ def compute_recommendation(
     quality: Optional[float] = None,
     growth: Optional[float] = None,
     valuation: Optional[float] = None,
+    # New optional kwargs in v5.0.0. If not supplied, derived from
+    # the component scores. Accept caller-supplied views to allow
+    # downstream overrides (e.g. analyst-provided views).
+    fundamental_view: Optional[str] = None,
+    technical_view: Optional[str] = None,
+    risk_view: Optional[str] = None,
+    value_view: Optional[str] = None,
+    upside_pct: Optional[float] = None,
+    rsi_label: Optional[str] = None,
 ) -> Tuple[str, str]:
     """
-    Compute recommendation based on scores and horizon.
+    Compute view-aware 5-tier recommendation.
 
-    v4.1.4 blue-chip guard (replaces v4.1.3):
-        In LONG and MONTH horizons, when forward-looking data is entirely
-        missing (no 1M/3M/12M ROI, no valuation score), suppress SELL and
-        REDUCE recommendations if either:
+    v5.0.0: This function now delegates to
+    `core.reco_normalize.recommendation_from_views()` which is the
+    single source of truth for view-aware recommendation rules. The
+    horizon-specific score-only branches from v4.1.x are gone — they
+    were collapsing the output to ACCUMULATE/HOLD because they never
+    inspected the four Views. The new logic treats Views as decision
+    inputs and applies symmetric vetoes (EXPENSIVE blocks BUY,
+    double-BEARISH forces SELL, etc.).
 
-        (a) FULL-SIGNAL GUARD: quality >= 65 AND growth >= 65 AND risk <= 55
-            Same as v4.1.3. Fires when all three fundamental signals are
-            available and healthy.
+    Inputs:
+      - overall, risk, confidence100: required to run.
+      - quality, growth, valuation: required to derive views (may be
+        passed in directly via fundamental_view / etc.).
+      - horizon, technical, momentum, roi1/3/12, upside_pct, rsi_label:
+        used for view derivation and short-circuit short-term signals.
+      - fundamental_view, technical_view, risk_view, value_view: if any
+        are supplied, they override the derived view for that axis.
 
-        (b) QUALITY-ONLY GUARD: quality >= 70 AND risk <= 50
-            NEW in v4.1.4. Fires when growth is None (common for ETFs,
-            commodities, and equities whose provider omitted
-            revenue_growth_yoy). Tighter thresholds because we're using
-            fewer inputs.
+    Returns:
+      (canonical_string, reason_text). canonical_string is one of
+      STRONG_BUY / BUY / HOLD / REDUCE / SELL.
 
-        Either case returns HOLD with a reason that names the protection.
-        DAY and WEEK horizons are unchanged — short-term technical
-        signals are still allowed to fire regardless of fundamentals.
-
-        Requires `quality` to be passed in; if None, neither case fires
-        (equivalent to v4.1.2 behavior).
+    Backward compatibility:
+      - Existing callers passing only (overall, risk, confidence100,
+        roi3, horizon=...) will still work: views will be inferred from
+        whatever component scores are available, with reasonable
+        fallbacks where data is missing. The resulting recommendation
+        will be MORE HONEST (HOLD instead of fabricated BUY) when
+        upstream data is incomplete.
     """
-    if overall is None:
+    if overall is None and quality is None and valuation is None:
         return "HOLD", "Insufficient data to score reliably."
 
-    r = risk if risk is not None else 50.0
     c = confidence100 if confidence100 is not None else 55.0
-    t = technical if technical is not None else 50.0
-    m = momentum if momentum is not None else 50.0
-    q = quality if quality is not None else 0.0
-    g = growth if growth is not None else 0.0
+    if c < 35.0:
+        return (
+            "HOLD",
+            f"Low AI confidence ({_round(c, 1)}%) — insufficient signal "
+            "quality to recommend.",
+        )
 
-    if c < 40:
-        return "HOLD", f"Low AI confidence ({_round(c, 1)}%) — insufficient signal quality."
-
-    # v4.1.4: blue-chip guard with two independent cases.
-    no_forward_data = (
-        roi1 is None
-        and roi3 is None
-        and roi12 is None
-        and valuation is None
-    )
-    guard_case_a = (
-        no_forward_data
-        and quality is not None and q >= 65.0
-        and growth is not None and g >= 65.0
-        and r <= 55.0
-    )
-    guard_case_b = (
-        no_forward_data
-        and quality is not None and q >= 70.0
-        and r <= 50.0
-    )
-    blue_chip_guard = guard_case_a or guard_case_b
-
-    # DAY horizon
+    # Short-term horizons: a strong-momentum reversal can override the
+    # view-aware logic, since fundamentals matter less day-to-day. We
+    # only use this for DAY/WEEK; MONTH/LONG always go through views.
     if horizon == Horizon.DAY:
+        t = technical if technical is not None else 50.0
+        m = momentum if momentum is not None else 50.0
+        r = risk if risk is not None else 50.0
         if t >= 80 and m >= 75 and r <= 45:
             return "STRONG_BUY", (
-                f"Strong technical setup: Tech={_round(t, 1)}, "
-                f"Momentum={_round(m, 1)}, Risk=Low ({_round(r, 1)})."
-            )
-        if t >= 65 and m >= 55 and r <= 60:
-            return "BUY", (
-                f"Technical momentum confirms entry: Tech={_round(t, 1)}, "
-                f"Momentum={_round(m, 1)}."
-            )
-        if t >= 50 and r <= 55:
-            return "HOLD", f"Neutral technical setup — await stronger signal (Tech={_round(t, 1)})."
-        if t < 38 or m < 30:
-            return "SELL", (
-                f"Technical deterioration — avoid: Tech={_round(t, 1)}, "
-                f"Momentum={_round(m, 1)}."
-            )
-        return "HOLD", f"Day trade setup inconclusive (Tech={_round(t, 1)}, Risk={_round(r, 1)})."
-
-    # WEEK horizon
-    if horizon == Horizon.WEEK:
-        roi_1m = roi1 if roi1 is not None else 0.0
-        if t >= 72 and m >= 65 and r <= 50:
-            return "STRONG_BUY", (
-                f"Strong week setup: Tech={_round(t, 1)}, "
-                f"Momentum={_round(m, 1)}, Risk=Low. 1M ROI≈{_round(roi_1m * 100, 1)}%."
-            )
-        if t >= 58 and m >= 50 and r <= 65 and roi_1m >= 0.015:
-            return "BUY", (
-                f"Week momentum setup: Tech={_round(t, 1)}, "
-                f"1M ROI≈{_round(roi_1m * 100, 1)}%, Risk={_round(r, 1)}."
+                f"Strong day-trade technical setup: "
+                f"Tech={_round(t, 1)}, Momentum={_round(m, 1)}, "
+                f"Risk=Low ({_round(r, 1)})."
             )
         if t < 35 or m < 30:
             return "SELL", (
-                f"Weak week setup — technical breakdown: Tech={_round(t, 1)}, "
-                f"Momentum={_round(m, 1)}."
+                f"Day-trade technical breakdown: "
+                f"Tech={_round(t, 1)}, Momentum={_round(m, 1)}."
             )
-        return "HOLD", f"Week setup not compelling — wait for better entry (Tech={_round(t, 1)})."
+        # Otherwise fall through to view-aware logic.
 
-    # LONG horizon
-    if horizon == Horizon.LONG:
-        roi_12m = roi12 if roi12 is not None else 0.0
-        if r >= 75 and overall < 75:
-            return "REDUCE", f"High long-term risk ({_round(r, 1)}) with moderate score ({_round(overall, 1)})."
-        if roi_12m >= 0.25 and c >= 70 and r <= 45 and overall >= 78:
-            return "STRONG_BUY", f"Strong 12M expected return ({_round(roi_12m * 100, 1)}%) with low risk."
-        if roi_12m >= 0.12 and c >= 60 and r <= 60 and overall >= 68:
-            return "BUY", f"Positive 12M outlook ({_round(roi_12m * 100, 1)}%) with acceptable risk."
-        if overall >= 75 and r <= 50:
-            return "BUY", f"Strong long-term score ({_round(overall, 1)}) with controlled risk."
-        if overall >= 65:
-            return "HOLD", f"Moderate long-term profile (score={_round(overall, 1)})."
-        # v4.1.4: blue-chip guard fires BEFORE REDUCE/SELL.
-        if blue_chip_guard:
-            reason_fragment = (
-                f"Quality={_round(q, 0)}, Growth={_round(g, 0)}, Risk={_round(r, 0)}"
-                if guard_case_a
-                else f"Quality={_round(q, 0)}, Risk={_round(r, 0)} (growth data unavailable)"
-            )
+    # Derive views from components when caller didn't override them.
+    if fundamental_view is None:
+        fundamental_view = derive_fundamental_view(quality, growth)
+    if technical_view is None:
+        technical_view = derive_technical_view(technical, momentum, rsi_label)
+    if risk_view is None:
+        risk_view = derive_risk_view(risk)
+    if value_view is None:
+        value_view = derive_value_view(valuation, upside_pct)
+
+    # Delegate to the single source of truth.
+    try:
+        from core.reco_normalize import recommendation_from_views  # noqa: WPS433
+    except ImportError:
+        try:
+            from reco_normalize import recommendation_from_views  # noqa: WPS433
+        except ImportError:
+            # Last-resort: emit HOLD with explanatory reason.
             return "HOLD", (
-                f"Strong fundamentals ({reason_fragment}) with forward "
-                f"outlook unavailable — holding pending provider signal."
+                "Recommendation engine (reco_normalize) unavailable; "
+                "defaulting to HOLD."
             )
-        if overall >= 50:
-            return "REDUCE", f"Weak long-term outlook (score={_round(overall, 1)})."
-        return "SELL", f"Poor long-term fundamentals (score={_round(overall, 1)})."
 
-    # MONTH horizon (default)
-    roi_3m = roi3 if roi3 is not None else 0.0
-    if r >= 75 and overall < 75:
-        return "REDUCE", f"High risk ({_round(r, 1)}) with moderate score ({_round(overall, 1)})."
-    if roi_3m >= 0.25 and c >= 70 and r <= 45 and overall >= 78:
-        return "STRONG_BUY", f"High expected 3M ROI (~{_round(roi_3m * 100, 1)}%) with strong confidence and low risk."
-    if roi_3m >= 0.12 and c >= 60 and r <= 55 and overall >= 70:
-        return "BUY", f"Positive 3M expected ROI (~{_round(roi_3m * 100, 1)}%) with acceptable risk/confidence."
-    if overall >= 82 and r <= 55:
-        return "BUY", f"Strong overall score ({_round(overall, 1)}) with controlled risk ({_round(r, 1)})."
-    if overall >= 65:
-        return "HOLD", f"Moderate overall score ({_round(overall, 1)})."
-    # v4.1.4: blue-chip guard fires BEFORE REDUCE/SELL.
-    if blue_chip_guard:
-        reason_fragment = (
-            f"Quality={_round(q, 0)}, Growth={_round(g, 0)}, Risk={_round(r, 0)}"
-            if guard_case_a
-            else f"Quality={_round(q, 0)}, Risk={_round(r, 0)} (growth data unavailable)"
-        )
-        return "HOLD", (
-            f"Strong fundamentals ({reason_fragment}) with forward "
-            f"outlook unavailable — holding pending provider signal."
-        )
-    if overall >= 50:
-        return "REDUCE", f"Weak overall score ({_round(overall, 1)})."
-    return "SELL", f"Very weak overall score ({_round(overall, 1)})."
+    return recommendation_from_views(
+        fundamental=fundamental_view,
+        technical=technical_view,
+        risk=risk_view,
+        value=value_view,
+        score=overall,
+    )
 
 
 # =============================================================================
-# Recommendation Normalization
+# Recommendation Normalization (preserved)
 # =============================================================================
 
 _LOCAL_RECO_ALIASES: Dict[str, str] = {
@@ -1334,18 +1440,15 @@ def _normalize_key(label: Any) -> str:
 
 
 def normalize_recommendation_code(label: Any) -> str:
-    # Step 1: canonical fast path
     key = _normalize_key(label)
     if not key:
         return "HOLD"
     if key in _CANONICAL_RECO:
         return key
 
-    # Step 2: local alias table
     if key in _LOCAL_RECO_ALIASES:
         return _LOCAL_RECO_ALIASES[key]
 
-    # Step 3: delegate to reco_normalize for unknown inputs
     try:
         from core.reco_normalize import normalize_recommendation as _reco_norm  # noqa: WPS433
         normalized = _reco_norm(label)
@@ -1359,7 +1462,6 @@ def normalize_recommendation_code(label: Any) -> str:
     except Exception:
         pass
 
-    # Step 4: default
     return "HOLD"
 
 
@@ -1416,8 +1518,13 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     penalty_factor: Optional[float] = None
     insufficient_inputs = False
 
-    if base_parts:
-        wsum = sum(x[0] for x in base_parts)
+    # v5.0.0: stricter threshold — need at least 2 components OR 1
+    # high-weight component to score reliably. Single weak signal
+    # produces None overall, which downstream treats as "insufficient
+    # data" rather than fabricating a number.
+    sig_weight_total = sum(w for w, _ in base_parts)
+    if base_parts and (len(base_parts) >= 2 or sig_weight_total >= 0.40):
+        wsum = sig_weight_total
         base01 = sum(w * v for w, v in base_parts) / max(1e-9, wsum)
         overall_raw = _round(100.0 * _clamp(base01, 0.0, 1.0), 2)
 
@@ -1431,21 +1538,29 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         base01 *= (risk_pen * conf_pen)
         overall = _round(100.0 * _clamp(base01, 0.0, 1.0), 2)
     else:
-        overall = 50.0
-        overall_raw = 50.0
-        penalty_factor = 1.0
+        overall = None
+        overall_raw = None
+        penalty_factor = None
         insufficient_inputs = True
         scoring_errors.append("insufficient_scoring_inputs")
 
     rb = risk_bucket(risk)
     cb = confidence_bucket(conf01)
 
+    # NEW in v5.0.0: derive the four View tokens
+    fundamental_view = derive_fundamental_view(quality, growth)
+    technical_view = derive_technical_view(tech_score, momentum, rsi_sig)
+    risk_view = derive_risk_view(risk)
+    value_view = derive_value_view(valuation, usp)
+
     roi3 = _as_roi_fraction(working.get("expected_roi_3m"))
     roi1 = _as_roi_fraction(working.get("expected_roi_1m"))
     roi12 = _as_roi_fraction(working.get("expected_roi_12m"))
 
     if insufficient_inputs:
-        rec, reason = "HOLD", "Insufficient scoring inputs available."
+        rec, reason = "HOLD", (
+            "Insufficient scoring inputs — recommendation suppressed."
+        )
     else:
         rec, reason = compute_recommendation(
             overall, risk, confidence100, roi3,
@@ -1454,6 +1569,12 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             quality=quality,
             growth=growth,
             valuation=valuation,
+            fundamental_view=fundamental_view,
+            technical_view=technical_view,
+            risk_view=risk_view,
+            value_view=value_view,
+            upside_pct=usp,
+            rsi_label=rsi_sig,
         )
 
     st_signal_val = short_term_signal(tech_score, momentum, risk, horizon)
@@ -1483,6 +1604,10 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         invest_period_label=period_label,
         horizon_label=horizon.value,
         horizon_days_effective=hdays,
+        fundamental_view=fundamental_view,
+        technical_view=technical_view,
+        risk_view=risk_view,
+        value_view=value_view,
         recommendation=normalize_recommendation_code(rec),
         recommendation_reason=reason,
         forecast_price_1m=forecast_patch.get("forecast_price_1m"),
@@ -1544,7 +1669,7 @@ class ScoringEngine:
 
 
 # =============================================================================
-# Ranking Helpers
+# Ranking Helpers (preserved)
 # =============================================================================
 
 def _rank_sort_tuple(row: Dict[str, Any], key_overall: str = "overall_score") -> Tuple[float, ...]:
@@ -1651,6 +1776,11 @@ __all__ = [
     "compute_recommendation",
     "risk_bucket",
     "confidence_bucket",
+    # NEW in v5.0.0
+    "derive_fundamental_view",
+    "derive_technical_view",
+    "derive_risk_view",
+    "derive_value_view",
     "ScoringError",
     "InvalidHorizonError",
     "MissingDataError",
