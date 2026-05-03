@@ -2,15 +2,16 @@
 """
 core/analysis/insights_builder.py
 ================================================================================
-Insights Analysis Builder -- v5.0.0
-(BUG-FIX / SCHEMA-FIRST / ALIGNED-WITH-CRITERIA-MODEL / REAL-TIMEOUTS)
+Insights Analysis Builder -- v6.0.0
+(SCHEMA-CORRECT / TIMESTAMP-FIX / SIGNAL-PRIORITY-PRESERVED / V5-V7 ALIGNED)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
 Purpose
 -------
 Builds Insights_Analysis page rows for the TFB dashboard. Generates a
-6-section executive summary with schema-aligned 9-column output.
+multi-section executive summary aligned with the canonical 7-column
+Insights_Analysis schema in `core.sheets.schema_registry` v2.5.0.
 
 Sections
 --------
@@ -22,40 +23,83 @@ Sections
   6. Macro Signals              -- sector signals, vs_sp500_ytd
   7. Risk Scenarios             -- Conservative / Moderate / Aggressive
 
-v5.0.0 Changes (from v4.0.0)
-----------------------------
-CRITICAL FIX:
-  - v4.0.0 had a SyntaxError: `await _fetch_quotes(...)` inside a plain
-    `def _build_top_picks_rows`. The file did not import. The helper is now
-    pure (receives pre-fetched quotes as a parameter) and its caller (the
-    async main builder) handles any fetching.
+Aligned with the v5/v7 view-aware family:
+  - core.sheets.schema_registry v2.5.0  (Insights_Analysis = 7 columns)
+  - core.scoring                v5.0.0
+  - core.reco_normalize         v7.0.0  (5-tier rec vocabulary)
+  - core.analysis.criteria_model v3.0.0
 
-Alignment with criteria_model.py:
-  - Horizon thresholds unified at 45 / 120 days (v4.0.0 used 135 in two places,
-    disagreeing with criteria_model which uses 120).
+================================================================================
+v6.0.0 Changes (from v5.0.0)
+================================================================================
+
+CRITICAL FIX: 7-column schema alignment
+---------------------------------------
+v5.0.0's `_FALLBACK_HEADERS` / `_FALLBACK_KEYS` listed 9 columns including
+`signal` and `priority` — but the canonical registry contract for
+Insights_Analysis is 7 columns:
+
+    ["section", "item", "symbol", "metric", "value", "notes",
+     "last_updated_riyadh"]
+
+When `get_insights_schema()` reads from the registry (the normal path),
+the projection in `_make_row()` returned 7 columns from the registry's
+keys list. The `signal` / `priority` values built by every section
+builder were silently dropped before reaching the sheet.
+
+v6.0.0:
+  - `_FALLBACK_HEADERS` and `_FALLBACK_KEYS` are now exactly 7 columns,
+    matching the registry verbatim.
+  - When the schema does NOT include `signal` / `priority` columns,
+    those values are embedded into the `notes` field as a `[SIGNAL|PRIORITY]`
+    prefix so the information is preserved end-to-end. No more silent
+    data loss.
+  - When the schema DOES include those columns (legacy or future
+    extension), they go into their own columns as before.
+
+CRITICAL FIX: timestamp key was being lost
+------------------------------------------
+v5.0.0's `_make_row()` built rows with `"as_of_riyadh": timestamp`, but
+the registry's canonical key is `"last_updated_riyadh"`. The schema
+projection step used `full_row.get("last_updated_riyadh", "")` — which
+returned `""` because the timestamp lived under `as_of_riyadh` instead.
+Every Insights row in production was emitting a blank timestamp.
+
+v6.0.0:
+  - `_make_row()` now writes the timestamp under BOTH `last_updated_riyadh`
+    (the registry-canonical key) AND `as_of_riyadh` (legacy alias) in
+    `full_row`. Whichever one the schema asks for, it gets a value.
+  - `_make_row()` now also accepts a `last_updated_riyadh` keyword argument
+    in addition to the legacy `as_of_riyadh`. Both resolve to the same
+    timestamp; either is fine.
+
+NEW: 5-tier recommendation token recognition
+--------------------------------------------
+The Top Picks section's `_SIGNAL_UP` mapping now also recognises the
+v7.0.0 5-tier vocabulary (`STRONG_BUY`, `BUY` keep BUY signal; `SELL`
+and `REDUCE` map to SELL signal; `HOLD` maps to neutral). Previously
+only `BUY`/`STRONG_BUY` were detected.
+
+================================================================================
+v5.0.0 Changes (PRESERVED)
+================================================================================
+
+  - SyntaxError fix: `_build_top_picks_rows` no longer uses `await` inside
+    a non-async def. Pure helper; caller fetches quotes.
+  - Horizon thresholds unified at 45 / 120 days (criteria_model alignment).
   - Signal mapping delegates to `criteria_model.signal_for_value` where
-    possible instead of maintaining a parallel vocabulary.
-  - Risk Scenarios section now uses `criteria_model.build_scenario_specs`
-    instead of the v4.0.0 "Placeholder" stub.
-  - Horizon-to-ROI-key mapping uses `criteria_model.horizon_to_expected_roi_key`
-    rather than a duplicated if/elif chain.
+    possible.
+  - Risk Scenarios uses `criteria_model.build_scenario_specs` (real, not
+    "Placeholder" stub).
+  - Timeouts (`quotes_timeout_sec` / `top10_timeout_sec`) are actually
+    enforced via `asyncio.wait_for` (in v4.0.0 they were ignored).
+  - Removed dead types (RowData, Signal/Priority/BuildStatus enums) and
+    unused imports.
+  - Consolidated engine method-dispatch retry loops into
+    `_invoke_engine_method`.
 
-Timeouts actually enforced:
-  - `quotes_timeout_sec` / `top10_timeout_sec` are now wrapped in
-    `asyncio.wait_for`. In v4.0.0 they were accepted-and-ignored.
-
-Cleanup:
-  - Removed dead types: RowData dataclass, Signal / Priority / BuildStatus
-    enums (never referenced, never exported).
-  - Removed unused imports (TypeVar, Union, cast, Awaitable, Callable,
-    timedelta, the unused `T = TypeVar("T")`).
-  - Removed the dead `_fetch_quotes(None, ...)` fallback branch that always
-    returned an empty dict.
-  - Consolidated the engine method-dispatch retry loops into one helper
-    (`_invoke_engine_method`).
-
-Design Rules (unchanged)
-------------------------
+Design Rules
+------------
   - No network calls at import time
   - Best-effort engine access only; never raises for normal route execution
   - Returns schema-correct rows even when the engine is missing
@@ -86,30 +130,38 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "5.0.0"
+INSIGHTS_BUILDER_VERSION = "6.0.0"
 
 # Riyadh timezone (UTC+3, no DST)
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
-# Schema fallback (9 columns, v3.4.0 INSIGHTS_ANALYSIS_FIELDS)
+# Schema fallback: exactly 7 columns matching schema_registry v2.5.0's
+# Insights_Analysis spec. Do NOT add `signal` or `priority` columns here —
+# the registry treats those as info to be embedded in `notes` (handled by
+# `_make_row`). Do NOT rename `last_updated_riyadh` to `as_of_riyadh`; the
+# registry uses the former and sheet writers depend on it.
 _FALLBACK_HEADERS: List[str] = [
     "Section", "Item", "Symbol", "Metric",
-    "Value", "Signal", "Priority", "Notes", "Last Updated (Riyadh)",
+    "Value", "Notes", "Last Updated (Riyadh)",
 ]
 _FALLBACK_KEYS: List[str] = [
     "section", "item", "symbol", "metric",
-    "value", "signal", "priority", "notes", "as_of_riyadh",
+    "value", "notes", "last_updated_riyadh",
 ]
 
-# Signal vocabulary used in rows produced by this module. The canonical source
-# of truth is criteria_model.SIGNAL_VALUES; these are local aliases for the
-# narrower set we actually emit.
+# Signal vocabulary used as `notes` markers (NOT as separate columns).
+# When the schema gains explicit signal/priority columns, _make_row routes
+# values to those columns instead.
 _SIGNAL_UP = "BUY"
 _SIGNAL_DOWN = "SELL"
 _SIGNAL_NEUTRAL = "HOLD"
 _SIGNAL_OK = "INFO"
 _SIGNAL_WARN = "ALERT"
 _SIGNAL_ALERT = "ALERT"
+
+# v6.0.0: 5-tier recommendation tokens that map to bullish/bearish signals
+_BULLISH_RECOS = frozenset({"BUY", "STRONG_BUY"})
+_BEARISH_RECOS = frozenset({"SELL", "REDUCE"})
 
 # Priority vocabulary
 _PRI_HIGH = "High"
@@ -428,36 +480,37 @@ def _extract_columns_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
     headers: List[str] = []
     keys: List[str] = []
 
-    if not isinstance(spec, dict):
+    cols = getattr(spec, "columns", None)
+    if cols is None and isinstance(spec, dict):
+        cols = spec.get("columns") or spec.get("fields") or []
+    if not isinstance(cols, list):
         return headers, keys
 
-    columns = spec.get("columns") or spec.get("fields") or []
-    if isinstance(columns, list):
-        for col in columns:
-            if isinstance(col, dict):
-                h = _safe_str(
-                    col.get("header") or col.get("display_header")
-                    or col.get("label") or col.get("title")
-                )
-                k = _safe_str(
-                    col.get("key") or col.get("field")
-                    or col.get("name") or col.get("id")
-                )
-            else:
-                h = _safe_str(
-                    getattr(col, "header", None) or getattr(col, "display_header", None)
-                    or getattr(col, "label", None)
-                )
-                k = _safe_str(
-                    getattr(col, "key", None) or getattr(col, "field", None)
-                    or getattr(col, "name", None)
-                )
-            if h or k:
-                headers.append(h or k.replace("_", " ").title())
-                keys.append(k or h.lower().replace(" ", "_"))
+    for col in cols:
+        if isinstance(col, dict):
+            h = _safe_str(
+                col.get("header") or col.get("display_header")
+                or col.get("label") or col.get("title")
+            )
+            k = _safe_str(
+                col.get("key") or col.get("field")
+                or col.get("name") or col.get("id")
+            )
+        else:
+            h = _safe_str(
+                getattr(col, "header", None) or getattr(col, "display_header", None)
+                or getattr(col, "label", None)
+            )
+            k = _safe_str(
+                getattr(col, "key", None) or getattr(col, "field", None)
+                or getattr(col, "name", None)
+            )
+        if h or k:
+            headers.append(h or k.replace("_", " ").title())
+            keys.append(k or h.lower().replace(" ", "_"))
 
     # Fallback: direct headers/keys on the spec
-    if not headers:
+    if not headers and isinstance(spec, dict):
         h2 = spec.get("headers") or spec.get("display_headers")
         k2 = spec.get("keys") or spec.get("fields")
         if isinstance(h2, list) and isinstance(k2, list) and h2 and k2:
@@ -471,6 +524,10 @@ def get_insights_schema() -> Tuple[List[str], List[str], str]:
     """
     Return the Insights_Analysis schema.
 
+    v6.0.0: registry contract is exactly 7 columns
+    (section, item, symbol, metric, value, notes, last_updated_riyadh).
+    The fallback below mirrors that.
+
     Returns:
         (headers, keys, source_marker)
     """
@@ -478,12 +535,13 @@ def get_insights_schema() -> Tuple[List[str], List[str], str]:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
         spec = get_sheet_spec("Insights_Analysis")
         headers, keys = _extract_columns_from_spec(spec)
-        if headers and keys and len(headers) == len(keys) and len(keys) >= 7:
+        # Registry v2.5.0 expects 7 columns; accept anything ≥6 to be tolerant.
+        if headers and keys and len(headers) == len(keys) and len(keys) >= 6:
             return headers, keys, "schema_registry.get_sheet_spec"
     except Exception as exc:
         logger.debug("get_insights_schema: schema_registry unavailable: %s", exc)
 
-    return list(_FALLBACK_HEADERS), list(_FALLBACK_KEYS), "hardcoded_fallback_9col"
+    return list(_FALLBACK_HEADERS), list(_FALLBACK_KEYS), "hardcoded_fallback_7col"
 
 
 def _get_criteria_fields() -> List[Dict[str, Any]]:
@@ -659,8 +717,34 @@ def _criteria_summary(criteria: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Row Builder
+# Row Builder (v6.0.0: schema-correct, no data loss)
 # ---------------------------------------------------------------------------
+
+def _format_notes_with_markers(notes: str, signal: str, priority: str) -> str:
+    """
+    Embed signal / priority into a notes string as a `[SIGNAL|PRIORITY]` prefix.
+
+    v6.0.0: The Insights_Analysis schema is 7 columns and does NOT include
+    dedicated `signal` or `priority` columns. To preserve the semantic
+    information that section builders compute, those values are prepended
+    to `notes`. Format:
+
+        signal + priority both set: "[BUY|HIGH] <original notes>"
+        only signal set:            "[BUY] <original notes>"
+        only priority set:          "[HIGH] <original notes>"
+        neither set:                 <original notes>
+
+    If `notes` is empty, just the marker is returned (or "" if no markers).
+    """
+    sig = _safe_str(signal)
+    pri = _safe_str(priority)
+    base = _safe_str(notes)
+    markers = [m for m in (sig, pri) if m]
+    if not markers:
+        return base
+    prefix = "[" + " | ".join(markers) + "]"
+    return f"{prefix} {base}" if base else prefix
+
 
 def _make_row(
     keys: Sequence[str],
@@ -674,9 +758,33 @@ def _make_row(
     priority: str = "",
     notes: str = "",
     as_of_riyadh: Optional[str] = None,
+    last_updated_riyadh: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build a row dict aligned with the current schema keys."""
-    timestamp = as_of_riyadh or _now_riyadh_iso()
+    """
+    Build a row dict aligned with the current schema keys.
+
+    v6.0.0 fixes two production bugs:
+
+    1. TIMESTAMP KEY MISMATCH:
+       v5.0.0 wrote the timestamp under `as_of_riyadh` only, but the
+       canonical registry key is `last_updated_riyadh`. The schema
+       projection emitted blank timestamps in production. v6.0.0 writes
+       the timestamp under BOTH keys in `full_row`, so whichever the
+       schema asks for, it gets a value. The function also accepts a
+       `last_updated_riyadh` keyword argument for callers using the
+       canonical name.
+
+    2. SIGNAL/PRIORITY DATA LOSS:
+       The 7-column registry schema for Insights_Analysis does NOT include
+       `signal` or `priority` columns. v5.0.0 packed those into `full_row`
+       but they were silently dropped during projection. v6.0.0 detects
+       whether the schema includes those columns:
+       - If yes: route `signal` / `priority` to their own columns.
+       - If no: embed them into `notes` as a `[SIGNAL|PRIORITY]` prefix
+         (see `_format_notes_with_markers`).
+       Either way, the information now flows end-to-end.
+    """
+    timestamp = last_updated_riyadh or as_of_riyadh or _now_riyadh_iso()
 
     # Format value: keep numbers numeric for sheet formatting
     if value is None:
@@ -686,15 +794,30 @@ def _make_row(
     else:
         formatted_value = _safe_str(value)
 
+    # v6.0.0: schema-aware signal/priority placement
+    has_signal_col = "signal" in keys
+    has_priority_col = "priority" in keys
+
+    sig_for_col = _safe_str(signal) if has_signal_col else ""
+    pri_for_col = _safe_str(priority) if has_priority_col else ""
+
+    # Anything that won't fit into a dedicated column gets embedded in notes.
+    sig_for_notes = "" if has_signal_col else _safe_str(signal)
+    pri_for_notes = "" if has_priority_col else _safe_str(priority)
+    notes_out = _format_notes_with_markers(notes, sig_for_notes, pri_for_notes)
+
+    # full_row exposes BOTH timestamp aliases so projection always finds one.
     full_row: Dict[str, Any] = {
         "section": _safe_str(section) or "General",
         "item": _safe_str(item) or "Item",
         "symbol": _safe_str(symbol),
         "metric": _safe_str(metric) or "metric",
         "value": formatted_value,
-        "signal": _safe_str(signal),
-        "priority": _safe_str(priority),
-        "notes": _safe_str(notes),
+        "signal": sig_for_col,
+        "priority": pri_for_col,
+        "notes": notes_out,
+        # v6.0.0: write both keys; schema can ask for whichever it likes
+        "last_updated_riyadh": timestamp,
         "as_of_riyadh": timestamp,
     }
 
@@ -747,7 +870,7 @@ def build_criteria_rows(
                     metric=key,
                     value=value_ratio,
                     notes=full_note,
-                    as_of_riyadh=timestamp,
+                    last_updated_riyadh=timestamp,
                 ))
                 continue
 
@@ -758,7 +881,7 @@ def build_criteria_rows(
             metric=key,
             value=value,
             notes=field_def.get("notes", ""),
-            as_of_riyadh=timestamp,
+            last_updated_riyadh=timestamp,
         ))
 
     # Snapshot
@@ -769,7 +892,7 @@ def build_criteria_rows(
         metric="criteria_snapshot",
         value=_criteria_snapshot(norm_criteria),
         notes="Compact JSON snapshot used by Top10 / advisor contextual logic",
-        as_of_riyadh=timestamp,
+        last_updated_riyadh=timestamp,
     ))
 
     # Summary
@@ -780,7 +903,7 @@ def build_criteria_rows(
         metric="criteria_summary",
         value=_days_to_horizon(int(norm_criteria["invest_period_days"])),
         notes=_criteria_summary(norm_criteria),
-        as_of_riyadh=timestamp,
+        last_updated_riyadh=timestamp,
     ))
 
     return rows
@@ -818,8 +941,6 @@ async def _invoke_engine_method(
     """
     Try a sequence of method names on `engine`, each with several kwargs
     variants. Returns the first non-None result, or None.
-
-    Replaces the four duplicated dispatcher loops in v4.0.0.
     """
     if not engine:
         return None
@@ -859,15 +980,7 @@ async def _fetch_quotes(
     mode: str = "",
     timeout_sec: float = _DEFAULT_QUOTES_TIMEOUT_SEC,
 ) -> Dict[str, Dict[str, Any]]:
-    """
-    Fetch quotes for a list of symbols from the engine, with real timeout.
-
-    Tries, in order:
-      - engine.get_enriched_quotes_batch(symbols, mode=...)
-      - engine.get_enriched_quotes_batch(symbols)
-      - engine.get_enriched_quotes(symbols)
-      - per-symbol: get_enriched_quote_dict / get_enriched_quote / get_quote
-    """
+    """Fetch quotes for a list of symbols from the engine, with real timeout."""
     if not engine or not symbols:
         return {}
 
@@ -1063,7 +1176,7 @@ async def _fetch_top10_symbols(
 
 
 # ---------------------------------------------------------------------------
-# Section Builders
+# Section Builders (unchanged from v5.0.0 except _make_row routing fix)
 # ---------------------------------------------------------------------------
 
 def _build_universe_snapshot_rows(
@@ -1079,7 +1192,7 @@ def _build_universe_snapshot_rows(
         keys=ctx.keys, section=section_name, item="Universe Size",
         metric="count", value=len(symbols),
         notes="Number of symbols requested for this section",
-        as_of_riyadh=ctx.ts,
+        last_updated_riyadh=ctx.ts,
     ))
 
     coverage_price = sum(1 for d in quotes.values() if _as_float(d.get("current_price")) is not None)
@@ -1089,13 +1202,13 @@ def _build_universe_snapshot_rows(
         keys=ctx.keys, section=section_name, item="Coverage",
         metric="coverage_current_price", value=f"{coverage_price}/{len(symbols)}",
         notes="Symbols with current_price available",
-        as_of_riyadh=ctx.ts,
+        last_updated_riyadh=ctx.ts,
     ))
     rows.append(_make_row(
         keys=ctx.keys, section=section_name, item="Coverage",
         metric="coverage_percent_change", value=f"{coverage_change}/{len(symbols)}",
         notes="Symbols with percent_change available",
-        as_of_riyadh=ctx.ts,
+        last_updated_riyadh=ctx.ts,
     ))
 
     # Movers
@@ -1112,27 +1225,27 @@ def _build_universe_snapshot_rows(
             symbol=top_sym, metric="percent_change",
             value=_as_percent_points(top_pc),
             notes=f"Highest percent_change in this universe (display: {_format_percent(top_pc)})",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
         rows.append(_make_row(
             keys=ctx.keys, section=section_name, item="Top Loser",
             symbol=bottom_sym, metric="percent_change",
             value=_as_percent_points(bottom_pc),
             notes=f"Lowest percent_change in this universe (display: {_format_percent(bottom_pc)})",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
         rows.append(_make_row(
             keys=ctx.keys, section=section_name, item="Average Change",
             metric="avg_percent_change", value=_as_percent_points(avg_pc),
             notes=f"Average percent_change across symbols (display: {_format_percent(avg_pc)})",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
     else:
         rows.append(_make_row(
             keys=ctx.keys, section=section_name, item="Snapshot",
             metric="status", value="No movers data",
             notes="percent_change not available for this universe",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     # Best expected ROI
@@ -1146,7 +1259,7 @@ def _build_universe_snapshot_rows(
             symbol=best_sym, metric="expected_roi_3m",
             value=_as_percent_points(best_roi),
             notes=f"Highest expected_roi_3m (display: {_format_percent(best_roi)})",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     # Highest volatility
@@ -1160,7 +1273,7 @@ def _build_universe_snapshot_rows(
             symbol=vol_sym, metric="volatility_90d",
             value=_as_percent_points(vol_val),
             notes=f"Highest volatility_90d (display: {_format_percent(vol_val)})",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     # Average confidence
@@ -1172,7 +1285,7 @@ def _build_universe_snapshot_rows(
             keys=ctx.keys, section=section_name, item="Average Forecast Confidence",
             metric="avg_forecast_confidence", value=avg_conf,
             notes="Average forecast_confidence across symbols with data",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     return rows
@@ -1215,7 +1328,7 @@ def _build_risk_alert_rows(
             metric="risk_alert_count", value=0,
             signal=_SIGNAL_OK, priority=_PRI_LOW,
             notes="No high-risk conditions detected",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
         return rows
 
@@ -1228,7 +1341,7 @@ def _build_risk_alert_rows(
         signal=_SIGNAL_ALERT if high_count > 0 else _SIGNAL_WARN,
         priority=_PRI_HIGH if high_count > 0 else _PRI_MEDIUM,
         notes=f"{len(high_risk)} symbol(s) with risk_score > 55. {high_count} above 70.",
-        as_of_riyadh=ctx.ts,
+        last_updated_riyadh=ctx.ts,
     ))
 
     for risk_score, sym, d in high_risk[:8]:
@@ -1251,7 +1364,7 @@ def _build_risk_alert_rows(
             symbol=sym, metric="risk_score", value=round(risk_score, 1),
             signal=signal, priority=priority,
             notes=" | ".join(note_parts),
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     for sym, reason, priority in cautions[:6]:
@@ -1259,7 +1372,7 @@ def _build_risk_alert_rows(
             keys=ctx.keys, section="Risk Alerts", item=f"Caution -- {sym}",
             symbol=sym, metric="caution_flag", value="Caution",
             signal=_SIGNAL_ALERT, priority=priority,
-            notes=reason, as_of_riyadh=ctx.ts,
+            notes=reason, last_updated_riyadh=ctx.ts,
         ))
 
     return rows
@@ -1292,7 +1405,7 @@ def _build_short_term_rows(
             metric="st_opportunities_count", value=0,
             signal=_SIGNAL_OK, priority=_PRI_LOW,
             notes=f"No symbols with technical_score >= {min_tech_score:.0f} + ST signal BUY",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
         return rows
 
@@ -1303,7 +1416,7 @@ def _build_short_term_rows(
         metric="st_opportunities_count", value=len(candidates),
         signal="BUY", priority=_PRI_HIGH,
         notes=f"{len(candidates)} symbol(s) with strong technical setup",
-        as_of_riyadh=ctx.ts,
+        last_updated_riyadh=ctx.ts,
     ))
 
     for tech_score, sym, d in candidates[:max_items]:
@@ -1346,7 +1459,7 @@ def _build_short_term_rows(
             keys=ctx.keys, section="Short-Term Opportunities",
             item=f"{st_signal} -- {sym}", symbol=sym, metric="technical_score",
             value=value_str, signal=signal, priority=priority,
-            notes=" | ".join(note_parts), as_of_riyadh=ctx.ts,
+            notes=" | ".join(note_parts), last_updated_riyadh=ctx.ts,
         ))
 
     return rows
@@ -1414,7 +1527,7 @@ def _build_portfolio_kpis_rows(
             metric="status", value="No Positions",
             signal=_SIGNAL_OK, priority=_PRI_LOW,
             notes="No position_qty / avg_cost found. Enter holdings in My_Portfolio.",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
         return rows
 
@@ -1433,14 +1546,14 @@ def _build_portfolio_kpis_rows(
         metric="position_count", value=position_count,
         priority=_PRI_LOW,
         notes=f"Health={health_score:.1f}/100. {at_risk_count} position(s) with risk_score > 60",
-        as_of_riyadh=ctx.ts,
+        last_updated_riyadh=ctx.ts,
     ))
     rows.append(_make_row(
         keys=ctx.keys, section="Portfolio KPIs", item="Total Value",
         metric="total_value", value=round(total_value, 2),
         priority=_PRI_LOW,
         notes=f"Cost basis: {round(total_cost, 2)}",
-        as_of_riyadh=ctx.ts,
+        last_updated_riyadh=ctx.ts,
     ))
     rows.append(_make_row(
         keys=ctx.keys, section="Portfolio KPIs", item="Unrealized P/L",
@@ -1448,7 +1561,7 @@ def _build_portfolio_kpis_rows(
         signal=pl_signal,
         priority=_PRI_HIGH if pl_pct_pts < -15 else (_PRI_MEDIUM if pl_pct_pts < -5 else _PRI_LOW),
         notes=f"{_format_percent(unrealized_pct)} | total_value - total_cost",
-        as_of_riyadh=ctx.ts,
+        last_updated_riyadh=ctx.ts,
     ))
 
     if total_day_pl != 0.0:
@@ -1458,7 +1571,7 @@ def _build_portfolio_kpis_rows(
             signal=_SIGNAL_OK if total_day_pl > 0 else _SIGNAL_ALERT,
             priority=_PRI_MEDIUM if abs(total_day_pl) > total_cost * 0.01 else _PRI_LOW,
             notes=f"Sum(day_pl) across {position_count} positions",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     for sym, dist_pp, priority in sorted(stop_alerts, key=lambda x: x[1]):
@@ -1471,7 +1584,7 @@ def _build_portfolio_kpis_rows(
                 f"Price only {dist_pp:.2f}% above stop loss. "
                 f"{'Review immediately.' if priority == _PRI_HIGH else 'Monitor closely.'}"
             ),
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     for sym, action, dev_abs in sorted(rebal_alerts, key=lambda x: x[2], reverse=True):
@@ -1483,7 +1596,7 @@ def _build_portfolio_kpis_rows(
             value=f"{dev_abs:.1f}% -> {action}",
             signal=signal, priority=priority,
             notes=f"Portfolio weight drifted {dev_abs:.1f}% from target. Action: {action}",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     return rows
@@ -1521,7 +1634,7 @@ def _build_macro_signal_rows(
             metric="macro_signal_count", value="No Data",
             signal=_SIGNAL_OK, priority=_PRI_LOW,
             notes="No sector_signal or vs_sp500_ytd data from Global_Markets universe",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
         return rows
 
@@ -1542,7 +1655,7 @@ def _build_macro_signal_rows(
             metric="sector_signal", value=dominant,
             signal=signal, priority=priority,
             notes=f"{sector}: {bullish} Bullish / {bearish} Bearish / {total - bullish - bearish} Neutral",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     outperformers.sort(key=lambda x: x[0], reverse=True)
@@ -1554,7 +1667,7 @@ def _build_macro_signal_rows(
             signal=_SIGNAL_UP,
             priority=_PRI_HIGH if vs_sp >= 10.0 else _PRI_MEDIUM,
             notes=f"YTD return exceeds S&P 500 by {vs_sp:.2f}% -- strong relative momentum",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     underperformers.sort(key=lambda x: x[0])
@@ -1566,10 +1679,27 @@ def _build_macro_signal_rows(
             signal=_SIGNAL_DOWN,
             priority=_PRI_HIGH if vs_sp <= -10.0 else _PRI_MEDIUM,
             notes=f"YTD return lags S&P 500 by {abs(vs_sp):.2f}%",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     return rows
+
+
+def _reco_to_signal(recommendation: str) -> str:
+    """
+    v6.0.0: map a 5-tier recommendation token to a row-level signal.
+
+    Mapping:
+      STRONG_BUY / BUY  -> _SIGNAL_UP   ("BUY")
+      SELL / REDUCE     -> _SIGNAL_DOWN ("SELL")
+      HOLD / unknown    -> _SIGNAL_NEUTRAL ("HOLD")
+    """
+    r = _safe_str(recommendation).upper()
+    if r in _BULLISH_RECOS:
+        return _SIGNAL_UP
+    if r in _BEARISH_RECOS:
+        return _SIGNAL_DOWN
+    return _SIGNAL_NEUTRAL
 
 
 def _build_top_picks_rows(
@@ -1580,8 +1710,9 @@ def _build_top_picks_rows(
     """
     Build Top Picks section rows from top10 payload.
 
-    Bug fix vs v4.0.0: no longer uses `await` -- the async caller fetches
-    any supplementary quotes and passes them via `top10_quotes`.
+    v6.0.0: signal mapping recognises full v7.0.0 5-tier vocabulary
+    (STRONG_BUY/BUY -> BUY signal, SELL/REDUCE -> SELL signal,
+    HOLD -> neutral).
     """
     rows: List[Dict[str, Any]] = []
     top_rows = _coerce_to_rows(top10_payload)
@@ -1594,7 +1725,7 @@ def _build_top_picks_rows(
                 keys=ctx.keys, section="Top Picks", item="Status",
                 metric="top10_status", value="Unavailable",
                 notes="Top10 payload is empty",
-                as_of_riyadh=ctx.ts,
+                last_updated_riyadh=ctx.ts,
             ))
             return rows
 
@@ -1604,7 +1735,7 @@ def _build_top_picks_rows(
             metric="top_picks_count", value=len(top10_symbols),
             priority=_PRI_LOW,
             notes=f"Top {len(top10_symbols)} picks (symbol-only fallback)",
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
         for i, sym in enumerate(top10_symbols[:10], 1):
@@ -1613,7 +1744,7 @@ def _build_top_picks_rows(
             recommendation = _safe_str(d.get("recommendation", ""))
             name = _safe_str(d.get("name", sym))
             priority = _PRI_HIGH if i <= 3 else (_PRI_MEDIUM if i <= 7 else _PRI_LOW)
-            signal = _SIGNAL_UP if recommendation in ("BUY", "STRONG_BUY") else _SIGNAL_NEUTRAL
+            signal = _reco_to_signal(recommendation)
 
             note = f"Reco={recommendation}" if recommendation else ""
             if name and name != sym:
@@ -1625,7 +1756,7 @@ def _build_top_picks_rows(
                 value=_format_percent(roi_3m) if roi_3m is not None else recommendation,
                 signal=signal, priority=priority,
                 notes=note or "Top pick",
-                as_of_riyadh=ctx.ts,
+                last_updated_riyadh=ctx.ts,
             ))
         return rows
 
@@ -1634,13 +1765,13 @@ def _build_top_picks_rows(
         keys=ctx.keys, section="Top Picks", item="Status",
         metric="top10_count", value=len(top_rows),
         notes="Top10 rows generated through selector/engine path",
-        as_of_riyadh=ctx.ts,
+        last_updated_riyadh=ctx.ts,
     ))
     rows.append(_make_row(
         keys=ctx.keys, section="Top Picks", item="Criteria Snapshot",
         metric="criteria_snapshot", value=_criteria_snapshot(ctx.norm_criteria),
         notes=_criteria_summary(ctx.norm_criteria),
-        as_of_riyadh=ctx.ts,
+        last_updated_riyadh=ctx.ts,
     ))
 
     horizon = _days_to_horizon(int(ctx.norm_criteria.get("invest_period_days", 90)))
@@ -1676,7 +1807,7 @@ def _build_top_picks_rows(
             note_parts.append(f"why={recommendation_reason}")
 
         priority = _PRI_HIGH if rank <= 3 else (_PRI_MEDIUM if rank <= 7 else _PRI_LOW)
-        signal = _SIGNAL_UP if recommendation in ("BUY", "STRONG_BUY") else _SIGNAL_NEUTRAL
+        signal = _reco_to_signal(recommendation)
 
         rows.append(_make_row(
             keys=ctx.keys, section="Top Picks", item=f"#{rank}",
@@ -1684,7 +1815,7 @@ def _build_top_picks_rows(
             value=_format_percent(roi_val) if roi_val is not None else "",
             notes=" | ".join(note_parts) if note_parts else "Top10 ranked item",
             signal=signal, priority=priority,
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
         if overall is not None:
@@ -1693,7 +1824,7 @@ def _build_top_picks_rows(
                 item=f"#{rank} Overall Score", symbol=sym,
                 metric="overall_score", value=overall,
                 notes=f"Rank={rank}" + (f" | {name}" if name else ""),
-                as_of_riyadh=ctx.ts,
+                last_updated_riyadh=ctx.ts,
             ))
 
         if selection_reason or recommendation_reason:
@@ -1702,7 +1833,7 @@ def _build_top_picks_rows(
                 item=f"#{rank} Selection Logic", symbol=sym,
                 metric="selection_reason", value=rank,
                 notes=selection_reason or recommendation_reason,
-                as_of_riyadh=ctx.ts,
+                last_updated_riyadh=ctx.ts,
             ))
 
     return rows
@@ -1711,9 +1842,6 @@ def _build_top_picks_rows(
 def _build_risk_scenario_rows(ctx: BuildContext) -> List[Dict[str, Any]]:
     """
     Build Risk Scenarios section rows using criteria_model.build_scenario_specs.
-
-    Replaces v4.0.0's "Placeholder" stub with actual Conservative/Moderate/
-    Aggressive scenario rows.
     """
     rows: List[Dict[str, Any]] = []
 
@@ -1751,7 +1879,7 @@ def _build_risk_scenario_rows(ctx: BuildContext) -> List[Dict[str, Any]]:
             metric="scenario_signal", value=spec.signal,
             signal=spec.signal, priority=priority,
             notes=spec.notes,
-            as_of_riyadh=ctx.ts,
+            last_updated_riyadh=ctx.ts,
         ))
 
     return rows
@@ -1792,13 +1920,7 @@ async def build_insights_analysis_rows(
     top10_timeout_sec: float = _DEFAULT_TOP10_TIMEOUT_SEC,
     build_budget_sec: float = _DEFAULT_BUILD_BUDGET_SEC,
 ) -> Dict[str, Any]:
-    """
-    Build Insights_Analysis page rows.
-
-    Returns:
-        Dict with keys: status, page, headers, keys, rows, row_objects,
-        rows_matrix, meta.
-    """
+    """Build Insights_Analysis page rows."""
     headers, keys, schema_source = get_insights_schema()
     timestamp = _now_riyadh_iso()
     norm_criteria = _normalize_criteria(criteria)
@@ -1827,8 +1949,8 @@ async def build_insights_analysis_rows(
             keys=keys, section="System", item="Builder Version",
             metric="insights_builder_version", value=INSIGHTS_BUILDER_VERSION,
             priority=_PRI_LOW,
-            notes=f"core/analysis/insights_builder.py v{INSIGHTS_BUILDER_VERSION} -- 9-col / 7-section schema",
-            as_of_riyadh=timestamp,
+            notes=f"core/analysis/insights_builder.py v{INSIGHTS_BUILDER_VERSION} -- 7-col schema (registry v2.5.0)",
+            last_updated_riyadh=timestamp,
         ))
 
     # Resolve universes
@@ -1856,7 +1978,7 @@ async def build_insights_analysis_rows(
         metric="build_status", value="OK" if build_ok else "WARN",
         signal=_SIGNAL_OK if build_ok else _SIGNAL_WARN, priority=_PRI_LOW,
         notes="OK = engine + universes available. WARN = criteria/system only",
-        as_of_riyadh=timestamp,
+        last_updated_riyadh=timestamp,
     ))
 
     # Early return: no engine or no universes
@@ -1868,7 +1990,7 @@ async def build_insights_analysis_rows(
             value="Not provided" if not engine else "Universes Empty",
             signal=_SIGNAL_WARN, priority=_PRI_MEDIUM,
             notes=f"{msg}. Returning criteria/system rows only.",
-            as_of_riyadh=timestamp,
+            last_updated_riyadh=timestamp,
         ))
         if do_risk_scenarios:
             rows.extend(_build_risk_scenario_rows(ctx))
@@ -1901,8 +2023,7 @@ async def build_insights_analysis_rows(
     def _remaining() -> float:
         return deadline - loop.time()
 
-    # Fetch quotes for all universes (concurrently within a universe, but
-    # sequentially across universes so we can honor the budget cleanly)
+    # Fetch quotes for all universes
     for section_name, sym_list in effective_universes.items():
         remaining = _remaining()
         if remaining <= 0.1:
@@ -1912,7 +2033,7 @@ async def build_insights_analysis_rows(
                 metric="build_budget_exhausted", value="WARN",
                 signal=_SIGNAL_WARN, priority=_PRI_MEDIUM,
                 notes=f"Skipped '{section_name}' -- build budget exhausted",
-                as_of_riyadh=timestamp,
+                last_updated_riyadh=timestamp,
             ))
             break
 
@@ -1951,7 +2072,7 @@ async def build_insights_analysis_rows(
         if top10_payload:
             rows.extend(_build_top_picks_rows(ctx, top10_payload))
         else:
-            # Symbols-only fallback: fetch symbols + their quotes, then delegate
+            # Symbols-only fallback
             top10_symbols = await _fetch_top10_symbols(
                 engine, criteria=norm_criteria,
                 limit=int(norm_criteria.get("top_n", 10)),
@@ -1990,10 +2111,10 @@ async def build_insights_analysis_rows(
                 metric="portfolio_status", value="Not Included",
                 signal=_SIGNAL_OK, priority=_PRI_LOW,
                 notes="My_Portfolio not in universes. Add My_Portfolio to pages_selected",
-                as_of_riyadh=timestamp,
+                last_updated_riyadh=timestamp,
             ))
 
-    # Risk Scenarios (now real, using criteria_model)
+    # Risk Scenarios
     if do_risk_scenarios:
         rows.extend(_build_risk_scenario_rows(ctx))
 
@@ -2008,7 +2129,7 @@ async def build_insights_analysis_rows(
             metric="builder_warnings", value="WARN",
             signal=_SIGNAL_WARN, priority=_PRI_MEDIUM,
             notes=" | ".join(warnings[:3]),
-            as_of_riyadh=timestamp,
+            last_updated_riyadh=timestamp,
         ))
 
     return {
