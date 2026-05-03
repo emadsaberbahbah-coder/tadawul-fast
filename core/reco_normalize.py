@@ -3,62 +3,87 @@
 """
 core/reco_normalize.py
 ================================================================================
-Recommendation Normalization -- v6.1.0
+Recommendation Normalization -- v7.0.0
 ================================================================================
 
-Purpose
--------
-- Provide a single canonical recommendation enum across the application.
-- Normalize upstream recommendation payloads without stripping advisory context.
-- Preserve and standardize:
-    - recommendation
-    - recommendation_reason
-    - horizon_days
-    - invest_period_label
-    - invest_period_days
-    - confidence / score / source fields where present
-- Remain deterministic, fast, import-safe, and exception-safe.
-
-v6.1.0 changes (what moved from v6.0.0)
+v7.0.0 changes (what moved from v6.1.0)
 ---------------------------------------
-- FIX: `Recommendation.from_score` 1-5 scale band alignment. v6.0.0 used
-  HOLD only for 2.5 < score <= 3.0, which meant score=3.1 → REDUCE even
-  though 3.0 is the conventional analyst neutral midpoint. v6.1.0 widens
-  HOLD to (2.5, 3.5], which also makes it consistent with how
-  `_parse_numeric_rating` maps `int(round(num)) == 3 → HOLD` and
-  `int(round(num)) == 4 → REDUCE` — previously the two code paths
-  disagreed on the treatment of 3.2 (v6.0.0 from_score → REDUCE,
-  v6.0.0 string-parse → HOLD).
-- FIX: `Recommendation.from_score` 1-3 scale now returns REDUCE between
-  HOLD and SELL bands and widens STRONG_BUY/BUY bands. v6.0.0's
-  `score <= 1.2 → STRONG_BUY` was too tight to hit in practice, and the
-  1-3 scale had no REDUCE bucket, forcing anything above 2.5 directly
-  to SELL.
-- FIX: `Recommendation.from_score` 0-100 scale now has a REDUCE bucket
-  between HOLD and SELL (35 <= score < 45), matching the other scales
-  that have a 5-level output range.
-- ROBUSTNESS: `from_score` coerces non-numeric input to float instead
-  of raising TypeError, returning HOLD on coercion failure.
-- ROBUSTNESS: `get_recommendation_score` accepts any string and returns
-  2 (HOLD) for invalid values rather than raising.
-- LINT: removed `field` variable shadowing of `dataclasses.field` inside
-  `normalize_recommendation_payload` (harmless at runtime but flagged by
-  every linter).
-- DOC: `__all__` ordering now places `RECO_*` constants after they are
-  defined in the file, so star-imports work regardless of execution order
-  during circular-import recovery.
-- PRESERVES: all pattern dictionaries (English, Arabic, French, Spanish,
-  German, Portuguese), all vendor field mappings, all regex patterns,
-  lru_cache on `_normalize_text`/`_normalize_arabic`/`_parse_string_recommendation`,
-  and the full public API surface.
+- NEW: `Recommendation.from_views()` -- view-aware 5-tier resolver.
+  This is the new single source of truth for mapping (Fundamental View,
+  Technical View, Risk View, Value View, Overall Score) into a canonical
+  recommendation. All other modules (scoring.py, investment_advisor.py,
+  investment_advisor_engine.py) now delegate to this method instead of
+  carrying their own duplicate logic.
 
-Public API preserved: VERSION, Recommendation, RECO_STRONG_BUY, RECO_BUY,
-RECO_HOLD, RECO_REDUCE, RECO_SELL, NormalizedRecommendation,
-normalize_recommendation, normalize_recommendation_payload,
-normalize_recommendation_row, normalize_recommendation_rows,
-batch_normalize, is_valid_recommendation, get_recommendation_score,
-recommendation_from_score, RecommendationError,
-InvalidRecommendationError.
+  Rule order (first match wins):
+    Priority 1 (NO DATA):
+      - Any of (Fund, Tech, Risk, Value) is None or blank, AND score is None
+        -> HOLD with reason "Insufficient data".
+      - Score is None and at least one view is also None -> HOLD.
+
+    Priority 2 (HARD SELL):
+      - (Fund == BEARISH and Tech == BEARISH)                          -> SELL
+      - score < 35                                                      -> SELL
+
+    Priority 3 (REDUCE):
+      - Fund == BEARISH                                                 -> REDUCE
+      - (Tech == BEARISH and Value == EXPENSIVE)                        -> REDUCE
+      - (score < 50 and Risk == HIGH)                                   -> REDUCE
+
+    Priority 4 (STRONG_BUY -- requires ALL conditions):
+      - Fund == BULLISH AND Tech == BULLISH AND Value == CHEAP AND
+        Risk != HIGH AND score >= 75                                    -> STRONG_BUY
+
+    Priority 5 (BUY):
+      - Fund == BULLISH AND Value in {CHEAP, FAIR} AND
+        Tech in {BULLISH, NEUTRAL} AND score >= 65                      -> BUY
+
+    Priority 6 (default):
+      - Anything else                                                   -> HOLD
+
+  Veto rules baked in by construction:
+    - Value == EXPENSIVE blocks STRONG_BUY/BUY (no rule allows them).
+    - Fund == NEUTRAL alone cannot reach BUY (Priority 5 requires BULLISH).
+    - Risk == HIGH blocks STRONG_BUY (caps at BUY).
+    - Fund == BEARISH AND Tech == BEARISH forces SELL (overrides any score).
+    - Any BEARISH fundamental forces REDUCE minimum (overrides BUY/STRONG_BUY).
+
+- NEW: `recommendation_from_views()` free function -- thin wrapper around
+  `Recommendation.from_views()` for callers that prefer functions over
+  classmethods.
+
+- NEW: View constants (FUND_BULLISH, TECH_NEUTRAL, etc.) and helper
+  `normalize_view_token()` for tolerant view parsing.
+
+- DOC: Examples added to docstrings showing the four most common decision
+  paths (CHEAP-bullish-low-risk -> STRONG_BUY, EXPENSIVE-bullish ->
+  capped at HOLD, BEARISH+BEARISH -> SELL regardless of score).
+
+- PRESERVED (no behavior change): everything from v6.1.0:
+  Recommendation enum, from_score / to_score / is_valid, all language
+  pattern dictionaries, all vendor field mappings, lru_cache on
+  internals, the full normalize_recommendation_* family,
+  NormalizedRecommendation dataclass, batch_normalize,
+  is_valid_recommendation, get_recommendation_score,
+  recommendation_from_score, RecommendationError,
+  InvalidRecommendationError. All RECO_* constants exported.
+
+Public API (unchanged + additions):
+- VERSION
+- Recommendation
+- RECO_STRONG_BUY, RECO_BUY, RECO_HOLD, RECO_REDUCE, RECO_SELL
+- NEW: VIEW_FUND_BULLISH, VIEW_FUND_NEUTRAL, VIEW_FUND_BEARISH
+- NEW: VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL, VIEW_TECH_BEARISH
+- NEW: VIEW_RISK_LOW, VIEW_RISK_MODERATE, VIEW_RISK_HIGH
+- NEW: VIEW_VALUE_CHEAP, VIEW_VALUE_FAIR, VIEW_VALUE_EXPENSIVE
+- NEW: normalize_view_token()
+- NEW: recommendation_from_views()
+- NormalizedRecommendation
+- normalize_recommendation, normalize_recommendation_payload
+- normalize_recommendation_row, normalize_recommendation_rows
+- batch_normalize, is_valid_recommendation
+- get_recommendation_score, recommendation_from_score
+- RecommendationError, InvalidRecommendationError
 ================================================================================
 """
 
@@ -86,11 +111,11 @@ from typing import (
 # Version
 # =============================================================================
 
-VERSION = "6.1.0"
+VERSION = "7.0.0"
 
 
 # =============================================================================
-# Enums
+# Enums and view constants
 # =============================================================================
 
 class Recommendation(str, Enum):
@@ -101,34 +126,11 @@ class Recommendation(str, Enum):
     REDUCE = "REDUCE"
     SELL = "SELL"
 
+    # ---- numeric score -> recommendation (preserved from v6.1.0) -----------
+
     @classmethod
     def from_score(cls, score: Any, scale: str = "1-5") -> "Recommendation":
-        """Convert a numeric score to a recommendation.
-
-        Scale conventions (v6.1.0):
-
-          1-5  (analyst convention, 1 = best):
-            score <= 1.5         -> STRONG_BUY
-            1.5 <  score <= 2.5  -> BUY
-            2.5 <  score <= 3.5  -> HOLD     (v6.0.0 upper bound was 3.0)
-            3.5 <  score <= 4.5  -> REDUCE
-            score >  4.5         -> SELL
-
-          1-3  (tiered, 1 = best):
-            score <= 1.3         -> STRONG_BUY
-            1.3 <  score <= 1.8  -> BUY
-            1.8 <  score <= 2.3  -> HOLD
-            2.3 <  score <= 2.7  -> REDUCE    (v6.0.0: missing, went straight to SELL)
-            score >  2.7         -> SELL
-
-          0-100 (score, higher = better):
-            score >= 85          -> STRONG_BUY
-            65 <= score <  85    -> BUY
-            45 <= score <  65    -> HOLD
-            35 <= score <  45    -> REDUCE    (v6.0.0: missing, went straight to SELL)
-            score <  35          -> SELL
-        """
-        # Coerce to float safely; return HOLD on failure (v6.0.0 raised TypeError).
+        """Convert a numeric score to a recommendation. (Preserved from v6.1.0.)"""
         try:
             if isinstance(score, bool):
                 s = float(score)
@@ -136,7 +138,7 @@ class Recommendation(str, Enum):
                 s = float(score)
             else:
                 s = float(str(score).strip().replace(",", "."))
-            if s != s:  # NaN guard
+            if s != s:
                 return cls.HOLD
         except (TypeError, ValueError):
             return cls.HOLD
@@ -146,20 +148,20 @@ class Recommendation(str, Enum):
                 return cls.STRONG_BUY
             if s <= 2.5:
                 return cls.BUY
-            if s <= 3.5:  # v6.1.0: was 3.0 in v6.0.0
+            if s <= 3.5:
                 return cls.HOLD
-            if s <= 4.5:  # v6.1.0: was 4.0 in v6.0.0
+            if s <= 4.5:
                 return cls.REDUCE
             return cls.SELL
 
         if scale == "1-3":
-            if s <= 1.3:  # v6.1.0: was 1.2 in v6.0.0
+            if s <= 1.3:
                 return cls.STRONG_BUY
             if s <= 1.8:
                 return cls.BUY
-            if s <= 2.3:  # v6.1.0: was 2.5 in v6.0.0
+            if s <= 2.3:
                 return cls.HOLD
-            if s <= 2.7:  # v6.1.0: REDUCE bucket added (absent in v6.0.0)
+            if s <= 2.7:
                 return cls.REDUCE
             return cls.SELL
 
@@ -170,31 +172,308 @@ class Recommendation(str, Enum):
                 return cls.BUY
             if s >= 45:
                 return cls.HOLD
-            if s >= 35:  # v6.1.0: REDUCE bucket added (absent in v6.0.0)
+            if s >= 35:
                 return cls.REDUCE
             return cls.SELL
 
         return cls.HOLD
 
     def to_score(self) -> int:
-        """Convert recommendation to a 0-4 score (0 = best, 4 = worst)."""
-        scores = {
+        """Convert recommendation to a 0-4 score (0 = best). (Preserved.)"""
+        return {
             Recommendation.STRONG_BUY: 0,
             Recommendation.BUY: 1,
             Recommendation.HOLD: 2,
             Recommendation.REDUCE: 3,
             Recommendation.SELL: 4,
-        }
-        return scores.get(self, 2)
+        }.get(self, 2)
 
     @classmethod
     def is_valid(cls, value: str) -> bool:
         """Check if value is a valid recommendation."""
         return value in cls._value2member_map_
 
+    # ---- NEW in v7.0.0: view-aware resolver --------------------------------
+
+    @classmethod
+    def from_views(
+        cls,
+        *,
+        fundamental: Any = None,
+        technical: Any = None,
+        risk: Any = None,
+        value: Any = None,
+        score: Any = None,
+    ) -> Tuple["Recommendation", str]:
+        """
+        Map four View strings + an Overall Score into a canonical recommendation.
+
+        This is the single source of truth for view-aware recommendation
+        decisions. scoring.compute_recommendation, the advisor's
+        _score_recommendation, and the engine's _score_recommendation all
+        delegate here.
+
+        Args:
+            fundamental:  Fundamental View   (BULLISH / NEUTRAL / BEARISH)
+            technical:    Technical View     (BULLISH / NEUTRAL / BEARISH)
+            risk:         Risk View          (LOW / MODERATE / HIGH)
+            value:        Value View         (CHEAP / FAIR / EXPENSIVE)
+            score:        Overall Score      (0-100, optional)
+
+        Returns:
+            (Recommendation enum, reason string).
+
+        Examples:
+            >>> Recommendation.from_views(
+            ...     fundamental="BULLISH", technical="BULLISH",
+            ...     risk="LOW", value="CHEAP", score=82
+            ... )
+            (<Recommendation.STRONG_BUY: 'STRONG_BUY'>, 'Strong fundamentals + ...')
+
+            >>> # EXPENSIVE veto: even with bullish views, can't be BUY/STRONG_BUY
+            >>> Recommendation.from_views(
+            ...     fundamental="BULLISH", technical="BULLISH",
+            ...     risk="LOW", value="EXPENSIVE", score=80
+            ... )
+            (<Recommendation.HOLD: 'HOLD'>, 'Bullish fundamentals but valuation ...')
+
+            >>> # Double-bearish forces SELL regardless of score
+            >>> Recommendation.from_views(
+            ...     fundamental="BEARISH", technical="BEARISH",
+            ...     risk="HIGH", value="FAIR", score=80
+            ... )
+            (<Recommendation.SELL: 'SELL'>, 'Bearish fundamentals AND bearish ...')
+        """
+        f = normalize_view_token(fundamental, kind="fundamental")
+        t = normalize_view_token(technical, kind="technical")
+        r = normalize_view_token(risk, kind="risk")
+        v = normalize_view_token(value, kind="value")
+
+        try:
+            s_val = float(score) if score is not None else None
+            if s_val is not None and s_val != s_val:  # NaN guard
+                s_val = None
+        except (TypeError, ValueError):
+            s_val = None
+
+        # ----- Priority 1: NO DATA --------------------------------------
+        # We need at least one view OR a score to make any call.
+        views_present = sum(1 for x in (f, t, r, v) if x)
+        if views_present == 0 and s_val is None:
+            return cls.HOLD, "Insufficient data — no views and no score available."
+        if views_present < 2 and s_val is None:
+            return cls.HOLD, "Insufficient data — too few signals to recommend."
+
+        # ----- Priority 2: HARD SELL ------------------------------------
+        if f == VIEW_FUND_BEARISH and t == VIEW_TECH_BEARISH:
+            score_text = f", Score={s_val:.0f}" if s_val is not None else ""
+            return cls.SELL, (
+                f"Bearish fundamentals AND bearish technicals — exit"
+                f"{score_text}."
+            )
+
+        if s_val is not None and s_val < 35.0:
+            return cls.SELL, f"Very weak overall score ({s_val:.1f}) — exit."
+
+        # ----- Priority 3: REDUCE ---------------------------------------
+        if f == VIEW_FUND_BEARISH:
+            return cls.REDUCE, (
+                "Bearish fundamentals — reduce exposure even with mixed "
+                "technical/value signals."
+            )
+
+        if t == VIEW_TECH_BEARISH and v == VIEW_VALUE_EXPENSIVE:
+            return cls.REDUCE, (
+                "Bearish technicals on an expensive valuation — reduce."
+            )
+
+        if s_val is not None and s_val < 50.0 and r == VIEW_RISK_HIGH:
+            return cls.REDUCE, (
+                f"Weak score ({s_val:.1f}) combined with high risk — reduce."
+            )
+
+        # ----- Priority 4: STRONG_BUY (all conditions required) ---------
+        if (
+            f == VIEW_FUND_BULLISH
+            and t == VIEW_TECH_BULLISH
+            and v == VIEW_VALUE_CHEAP
+            and r != VIEW_RISK_HIGH
+            and s_val is not None and s_val >= 75.0
+        ):
+            return cls.STRONG_BUY, (
+                f"Strong fundamentals + technicals on cheap valuation, "
+                f"risk under control (Score={s_val:.1f})."
+            )
+
+        # ----- Priority 5: BUY ------------------------------------------
+        if (
+            f == VIEW_FUND_BULLISH
+            and v in (VIEW_VALUE_CHEAP, VIEW_VALUE_FAIR)
+            and t in (VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL)
+            and s_val is not None and s_val >= 65.0
+        ):
+            return cls.BUY, (
+                f"Bullish fundamentals with acceptable valuation and "
+                f"technicals (Score={s_val:.1f})."
+            )
+
+        # Special-case BUY veto explanation: bullish fundamentals but
+        # valuation says EXPENSIVE -> HOLD with clear reason.
+        if (
+            f == VIEW_FUND_BULLISH
+            and t in (VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL)
+            and v == VIEW_VALUE_EXPENSIVE
+        ):
+            return cls.HOLD, (
+                "Bullish fundamentals but valuation expensive — wait for "
+                "a better entry."
+            )
+
+        # ----- Priority 6: HOLD (default) -------------------------------
+        score_part = f" Score={s_val:.1f}." if s_val is not None else ""
+        view_summary = (
+            f"Fund={f or 'N/A'}, Tech={t or 'N/A'}, "
+            f"Risk={r or 'N/A'}, Value={v or 'N/A'}."
+        )
+        return cls.HOLD, f"Mixed signals — holding. {view_summary}{score_part}"
+
+
+# View token canonical values
+VIEW_FUND_BULLISH = "BULLISH"
+VIEW_FUND_NEUTRAL = "NEUTRAL"
+VIEW_FUND_BEARISH = "BEARISH"
+
+VIEW_TECH_BULLISH = "BULLISH"
+VIEW_TECH_NEUTRAL = "NEUTRAL"
+VIEW_TECH_BEARISH = "BEARISH"
+
+VIEW_RISK_LOW = "LOW"
+VIEW_RISK_MODERATE = "MODERATE"
+VIEW_RISK_HIGH = "HIGH"
+
+VIEW_VALUE_CHEAP = "CHEAP"
+VIEW_VALUE_FAIR = "FAIR"
+VIEW_VALUE_EXPENSIVE = "EXPENSIVE"
+
+
+# Tolerant view-token normalizers
+_VIEW_FUND_ALIASES: Dict[str, str] = {
+    "BULLISH": VIEW_FUND_BULLISH, "BULL": VIEW_FUND_BULLISH,
+    "POSITIVE": VIEW_FUND_BULLISH, "STRONG": VIEW_FUND_BULLISH,
+    "GOOD": VIEW_FUND_BULLISH, "HEALTHY": VIEW_FUND_BULLISH,
+    "NEUTRAL": VIEW_FUND_NEUTRAL, "MIXED": VIEW_FUND_NEUTRAL,
+    "MODERATE": VIEW_FUND_NEUTRAL, "FAIR": VIEW_FUND_NEUTRAL,
+    "BEARISH": VIEW_FUND_BEARISH, "BEAR": VIEW_FUND_BEARISH,
+    "NEGATIVE": VIEW_FUND_BEARISH, "WEAK": VIEW_FUND_BEARISH,
+    "POOR": VIEW_FUND_BEARISH, "DETERIORATING": VIEW_FUND_BEARISH,
+}
+
+_VIEW_TECH_ALIASES: Dict[str, str] = {
+    "BULLISH": VIEW_TECH_BULLISH, "BULL": VIEW_TECH_BULLISH,
+    "UP": VIEW_TECH_BULLISH, "POSITIVE": VIEW_TECH_BULLISH,
+    "UPTREND": VIEW_TECH_BULLISH, "STRONG": VIEW_TECH_BULLISH,
+    "NEUTRAL": VIEW_TECH_NEUTRAL, "FLAT": VIEW_TECH_NEUTRAL,
+    "SIDEWAYS": VIEW_TECH_NEUTRAL, "MIXED": VIEW_TECH_NEUTRAL,
+    "BEARISH": VIEW_TECH_BEARISH, "BEAR": VIEW_TECH_BEARISH,
+    "DOWN": VIEW_TECH_BEARISH, "NEGATIVE": VIEW_TECH_BEARISH,
+    "DOWNTREND": VIEW_TECH_BEARISH, "WEAK": VIEW_TECH_BEARISH,
+}
+
+_VIEW_RISK_ALIASES: Dict[str, str] = {
+    "LOW": VIEW_RISK_LOW, "VERY LOW": VIEW_RISK_LOW, "VERY_LOW": VIEW_RISK_LOW,
+    "MINIMAL": VIEW_RISK_LOW, "SAFE": VIEW_RISK_LOW,
+    "MODERATE": VIEW_RISK_MODERATE, "MEDIUM": VIEW_RISK_MODERATE,
+    "MED": VIEW_RISK_MODERATE, "BALANCED": VIEW_RISK_MODERATE,
+    "MID": VIEW_RISK_MODERATE,
+    "HIGH": VIEW_RISK_HIGH, "VERY HIGH": VIEW_RISK_HIGH,
+    "VERY_HIGH": VIEW_RISK_HIGH, "ELEVATED": VIEW_RISK_HIGH,
+    "EXTREME": VIEW_RISK_HIGH, "DANGEROUS": VIEW_RISK_HIGH,
+}
+
+_VIEW_VALUE_ALIASES: Dict[str, str] = {
+    "CHEAP": VIEW_VALUE_CHEAP, "UNDERVALUED": VIEW_VALUE_CHEAP,
+    "BARGAIN": VIEW_VALUE_CHEAP, "DISCOUNTED": VIEW_VALUE_CHEAP,
+    "ATTRACTIVE": VIEW_VALUE_CHEAP, "VALUE": VIEW_VALUE_CHEAP,
+    "FAIR": VIEW_VALUE_FAIR, "FAIRLY VALUED": VIEW_VALUE_FAIR,
+    "FAIRLY_VALUED": VIEW_VALUE_FAIR, "REASONABLE": VIEW_VALUE_FAIR,
+    "NEUTRAL": VIEW_VALUE_FAIR,
+    "EXPENSIVE": VIEW_VALUE_EXPENSIVE, "OVERVALUED": VIEW_VALUE_EXPENSIVE,
+    "RICH": VIEW_VALUE_EXPENSIVE, "PREMIUM": VIEW_VALUE_EXPENSIVE,
+    "STRETCHED": VIEW_VALUE_EXPENSIVE,
+}
+
+
+def normalize_view_token(value: Any, *, kind: str = "fundamental") -> str:
+    """
+    Normalize a view-token string to its canonical form.
+
+    Returns the canonical token (e.g. 'BULLISH', 'EXPENSIVE') or '' if
+    the input can't be parsed. Tolerant to case, whitespace, hyphens, and
+    common synonyms.
+
+    Args:
+        value: The raw view value (string, None, or other).
+        kind:  One of 'fundamental', 'technical', 'risk', 'value'.
+    """
+    if value is None:
+        return ""
+    try:
+        s = str(value).strip().upper()
+    except Exception:
+        return ""
+    if not s or s in {"N/A", "NA", "NONE", "NULL", "-", "—", ""}:
+        return ""
+
+    # Strip trailing tokens like "VIEW", "RATING", "BUCKET"
+    for suffix in (" VIEW", " RATING", " BUCKET", " LEVEL"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+
+    # Normalize separators
+    s = s.replace("-", " ").replace("_", " ")
+    s = " ".join(s.split())
+
+    table = {
+        "fundamental": _VIEW_FUND_ALIASES,
+        "technical": _VIEW_TECH_ALIASES,
+        "risk": _VIEW_RISK_ALIASES,
+        "value": _VIEW_VALUE_ALIASES,
+    }.get(kind.lower(), _VIEW_FUND_ALIASES)
+
+    if s in table:
+        return table[s]
+    no_space = s.replace(" ", "_")
+    if no_space in table:
+        return table[no_space]
+    return ""
+
+
+def recommendation_from_views(
+    fundamental: Any = None,
+    technical: Any = None,
+    risk: Any = None,
+    value: Any = None,
+    score: Any = None,
+) -> Tuple[str, str]:
+    """
+    Free-function wrapper around `Recommendation.from_views()`.
+
+    Returns:
+        (canonical_string, reason_text). canonical_string is one of
+        STRONG_BUY / BUY / HOLD / REDUCE / SELL.
+    """
+    rec, reason = Recommendation.from_views(
+        fundamental=fundamental,
+        technical=technical,
+        risk=risk,
+        value=value,
+        score=score,
+    )
+    return rec.value, reason
+
 
 # =============================================================================
-# Constants
+# Constants (preserved verbatim from v6.1.0)
 # =============================================================================
 
 _RECO_ENUM = frozenset({r.value for r in Recommendation})
@@ -202,7 +481,6 @@ _RECO_ENUM = frozenset({r.value for r in Recommendation})
 _CONFIDENCE_HIGH = 0.8
 _CONFIDENCE_MEDIUM = 0.5
 
-# Null-ish / no-rating markers
 _NO_RATING: Set[str] = {
     "NA", "N/A", "NONE", "NULL", "UNKNOWN", "UNRATED", "NOT RATED", "NO RATING",
     "NR", "N R", "SUSPENDED", "UNDER REVIEW", "NOT COVERED", "NO COVERAGE",
@@ -210,7 +488,6 @@ _NO_RATING: Set[str] = {
     "NO RECOMMENDATION", "RATING WITHDRAWN", "WITHDRAWN", "NOT RANKED",
 }
 
-# Exact phrase mappings
 _STRONG_BUY_LIKE: Set[str] = {
     "STRONG BUY", "CONVICTION BUY", "HIGH CONVICTION BUY", "BUY STRONG",
     "TOP PICK", "BEST IDEA", "HIGHLY RECOMMENDED BUY", "BUY (STRONG)",
@@ -251,7 +528,6 @@ _SELL_LIKE: Set[str] = {
     "SELL RECOMMENDATION", "AVOIDANCE", "EXIT POSITION",
 }
 
-# Arabic
 _AR_BUY: Set[str] = {
     "شراء", "اشتر", "اشترى", "اشترِ", "تجميع", "زيادة", "ايجابي", "ايجابى",
     "فرصة شراء", "اداء متفوق", "زيادة المراكز", "توصية شراء", "توصية بالشراء",
@@ -277,7 +553,6 @@ _AR_SELL: Set[str] = {
     "بيع كلي", "تسييل", "تخلص من", "تجنب تماما",
 }
 
-# French
 _FR_BUY: Set[str] = {
     "ACHETER", "ACHAT", "ACCUMULER", "RENFORCER", "SURPERFORMER", "SURPERFORMANCE",
     "POSITIF", "BULLISH", "RECOMMANDATION D'ACHAT", "ACHAT FORT", "ACHAT SOLIDE",
@@ -299,7 +574,6 @@ _FR_SELL: Set[str] = {
     "RECOMMANDATION DE VENTE", "VENTE", "DÉGRADER",
 }
 
-# Spanish
 _ES_BUY: Set[str] = {
     "COMPRAR", "ACUMULAR", "SOBREPONDERAR", "SOBRERENDIMIENTO", "POSITIVO",
     "ALCISTA", "COMPRA", "RECOMENDACIÓN DE COMPRA", "COMPRA FUERTE",
@@ -321,7 +595,6 @@ _ES_SELL: Set[str] = {
     "RECOMENDACIÓN DE VENTA", "VENTA FUERTE",
 }
 
-# German
 _DE_BUY: Set[str] = {
     "KAUFEN", "KAUF", "AKKUMULIEREN", "AUFSTOCKEN", "ÜBERGEWICHTEN",
     "OUTPERFORM", "POSITIV", "BULLISH", "KAUFEMPFEHLUNG", "STARKER KAUF",
@@ -342,7 +615,6 @@ _DE_SELL: Set[str] = {
     "ABSTOSSEN", "REDUZIEREN AUF NULL",
 }
 
-# Portuguese
 _PT_BUY: Set[str] = {
     "COMPRAR", "ACUMULAR", "SOBREPONDERAR", "OUTPERFORM", "POSITIVO",
     "ALCISTA", "COMPRA", "RECOMENDAÇÃO DE COMPRA", "COMPRA FORTE",
@@ -364,13 +636,11 @@ _PT_SELL: Set[str] = {
     "RECOMENDAÇÃO DE VENTA", "VENDA FORTE", "LIQUIDAÇÃO",
 }
 
-# Combined language sets
 _LANG_BUY = _FR_BUY | _ES_BUY | _DE_BUY | _PT_BUY
 _LANG_HOLD = _FR_HOLD | _ES_HOLD | _DE_HOLD | _PT_HOLD
 _LANG_REDUCE = _FR_REDUCE | _ES_REDUCE | _DE_REDUCE | _PT_REDUCE
 _LANG_SELL = _FR_SELL | _ES_SELL | _DE_SELL | _PT_SELL
 
-# Vendor field mappings
 _VENDOR_FIELDS: Dict[str, List[str]] = {
     "default": [
         "recommendation", "reco", "rating", "action", "signal",
@@ -405,7 +675,6 @@ _VENDOR_FIELDS: Dict[str, List[str]] = {
     ],
 }
 
-# Context-preservation fields
 _REASON_FIELDS: List[str] = [
     "recommendation_reason",
     "reason",
@@ -458,7 +727,6 @@ _SCORE_FIELDS: List[str] = [
     "opportunity_score",
 ]
 
-# Compiled regex patterns
 _PAT_NEGATE = re.compile(r"\b(?:NOT|NO|NEVER|WITHOUT|HARDLY|RARELY|UNLIKELY|AVOID|AGAINST)\b", re.IGNORECASE)
 _PAT_NEGATION_CONTEXT = re.compile(r"(?:NOT|NO|NEVER)\s+(?:A\s+|AN\s+)?(STRONG\s+)?(BUY|SELL|HOLD|REDUCE)", re.IGNORECASE)
 
@@ -490,7 +758,7 @@ _PAT_PUNCT = re.compile(r"[^\w\s\-]")
 
 @dataclass
 class NormalizedRecommendation:
-    """Normalized recommendation with context."""
+    """Normalized recommendation with context. (Preserved from v6.1.0.)"""
     recommendation: str = Recommendation.HOLD.value
     recommendation_reason: Optional[str] = None
     horizon_days: Optional[int] = None
@@ -501,7 +769,6 @@ class NormalizedRecommendation:
     source_fields: Dict[str, Any] = dc_field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "recommendation": self.recommendation,
             "recommendation_reason": self.recommendation_reason,
@@ -515,7 +782,6 @@ class NormalizedRecommendation:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "NormalizedRecommendation":
-        """Create from dictionary."""
         return cls(
             recommendation=data.get("recommendation", Recommendation.HOLD.value),
             recommendation_reason=data.get("recommendation_reason"),
@@ -543,11 +809,10 @@ class InvalidRecommendationError(RecommendationError):
 
 
 # =============================================================================
-# Pure Utility Functions
+# Pure Utility Functions (preserved from v6.1.0)
 # =============================================================================
 
 def _safe_str(value: Any) -> str:
-    """Safely convert to string."""
     try:
         return "" if value is None else str(value).strip()
     except Exception:
@@ -555,7 +820,6 @@ def _safe_str(value: Any) -> str:
 
 
 def _clean_text(value: Any) -> str:
-    """Clean text by removing extra whitespace."""
     s = _safe_str(value)
     if not s:
         return ""
@@ -563,7 +827,6 @@ def _clean_text(value: Any) -> str:
 
 
 def _first_non_empty_str(items: Iterable[Any]) -> Optional[str]:
-    """Return first non-empty string from items."""
     for item in items:
         s = _safe_str(item)
         if s and s.lower() not in ("none", "null", "n/a", ""):
@@ -572,7 +835,6 @@ def _first_non_empty_str(items: Iterable[Any]) -> Optional[str]:
 
 
 def _to_float(value: Any) -> Optional[float]:
-    """Safely convert to float."""
     try:
         if value is None:
             return None
@@ -594,13 +856,11 @@ def _to_float(value: Any) -> Optional[float]:
 
 
 def _to_int(value: Any) -> Optional[int]:
-    """Safely convert to integer."""
     f = _to_float(value)
     return int(f) if f is not None else None
 
 
 def _as_ratio(value: Any) -> Optional[float]:
-    """Convert percent-like value to ratio."""
     f = _to_float(value)
     if f is None:
         return None
@@ -610,25 +870,21 @@ def _as_ratio(value: Any) -> Optional[float]:
 
 
 def _deep_get(data: Dict[str, Any], keys: Sequence[str]) -> Optional[Any]:
-    """Deep get from nested dictionary."""
     for key in keys:
         if not key:
             continue
 
-        # Direct key
         if key in data:
             value = data.get(key)
             if value is not None and _safe_str(value):
                 return value
 
-        # Nested path
         if "." in key:
             current: Any = data
             parts = key.split(".")
             valid = True
 
             for part in parts:
-                # Handle array indexing (e.g., "items[0]")
                 if "[" in part and "]" in part:
                     base, idx_str = part.split("[", 1)
                     idx = idx_str.rstrip("]")
@@ -661,26 +917,21 @@ def _deep_get(data: Dict[str, Any], keys: Sequence[str]) -> Optional[Any]:
 
 
 def _extract_candidate(value: Any) -> Optional[Any]:
-    """Extract recommendation candidate from various formats."""
     if value is None:
         return None
 
-    # Direct enum match
     if isinstance(value, str) and value.upper() in _RECO_ENUM:
         return value.upper()
 
-    # Numeric
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value
 
-    # Dictionary
     if isinstance(value, dict):
         for _, fields in _VENDOR_FIELDS.items():
             v = _deep_get(value, fields)
             if v is not None and _safe_str(v):
                 return v
 
-        # Check for rating-like keys
         for key in value.keys():
             if isinstance(key, str) and any(h in key.lower() for h in ["reco", "rating", "rank", "score", "consensus"]):
                 v = value[key]
@@ -689,7 +940,6 @@ def _extract_candidate(value: Any) -> Optional[Any]:
 
         return _first_non_empty_str(value.values())
 
-    # List or tuple
     if isinstance(value, (list, tuple)):
         if value and isinstance(value[0], dict):
             for item in value:
@@ -702,12 +952,11 @@ def _extract_candidate(value: Any) -> Optional[Any]:
 
 
 # =============================================================================
-# Arabic Normalization
+# Arabic / Text Normalization (preserved)
 # =============================================================================
 
 @lru_cache(maxsize=8192)
 def _normalize_arabic(text: str) -> str:
-    """Normalize Arabic text."""
     if not text:
         return ""
 
@@ -726,7 +975,6 @@ def _normalize_arabic(text: str) -> str:
 
 @lru_cache(maxsize=8192)
 def _normalize_text(text: str) -> str:
-    """Normalize text for pattern matching."""
     if not text:
         return ""
 
@@ -739,21 +987,18 @@ def _normalize_text(text: str) -> str:
 
 
 # =============================================================================
-# Numeric Rating Parsing
+# Numeric Rating Parsing (preserved from v6.1.0)
 # =============================================================================
 
 def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tuple[str, float]]:
-    """Parse numeric rating (e.g., 4/5, 3 stars)."""
     if not text:
         return None
 
     su = text.upper()
 
-    # Skip confidence scores
     if _PAT_CONFIDENCE.search(su) and not _PAT_RATING_HINT.search(su):
         return None
 
-    # Ratio pattern (e.g., 4/5, 8 out of 10)
     match = _PAT_RATIO.search(su)
     if match:
         try:
@@ -780,7 +1025,6 @@ def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tup
         except Exception:
             pass
 
-    # Single number
     match = _PAT_NUMBER.search(su)
     if not match:
         return None
@@ -794,7 +1038,6 @@ def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tup
     scale_3 = _PAT_SCALE_3.search(su)
     has_hint = _PAT_RATING_HINT.search(su) if context_hints else True
 
-    # 1-5 scale
     if 1.0 <= num <= 5.0 and (has_hint or scale_5):
         n = int(round(num))
         if n <= 2:
@@ -805,7 +1048,6 @@ def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tup
             return (Recommendation.REDUCE.value, 0.85)
         return (Recommendation.SELL.value, 0.85)
 
-    # 1-3 scale
     if 1.0 <= num <= 3.0 and (has_hint or scale_3):
         n = int(round(num))
         if n == 1:
@@ -814,7 +1056,6 @@ def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tup
             return (Recommendation.HOLD.value, 0.8)
         return (Recommendation.SELL.value, 0.8)
 
-    # 0-100 scale
     if 0.0 <= num <= 100.0 and has_hint:
         if num >= 70.0:
             return (Recommendation.BUY.value, 0.75)
@@ -822,7 +1063,6 @@ def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tup
             return (Recommendation.HOLD.value, 0.6)
         return (Recommendation.SELL.value, 0.75)
 
-    # 0-1 scale
     if 0.0 <= num <= 1.0 and has_hint:
         if num >= 0.7:
             return (Recommendation.BUY.value, 0.5)
@@ -834,15 +1074,12 @@ def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tup
 
 
 def _apply_negation(text: str, reco: str) -> str:
-    """Apply negation to recommendation."""
     if not text or not reco:
         return reco
 
-    # Context-based negation
     if _PAT_NEGATION_CONTEXT.search(text):
         return Recommendation.HOLD.value
 
-    # Simple negation
     if _PAT_NEGATE.search(text):
         if reco == Recommendation.SELL.value:
             return Recommendation.REDUCE.value
@@ -853,7 +1090,6 @@ def _apply_negation(text: str, reco: str) -> str:
 
 
 def _sentiment_analysis(text: str) -> Optional[str]:
-    """Basic sentiment analysis fallback."""
     if not text:
         return None
 
@@ -871,13 +1107,11 @@ def _sentiment_analysis(text: str) -> Optional[str]:
 
 
 # =============================================================================
-# Core Recommendation Parsing
+# Core Recommendation Parsing (preserved)
 # =============================================================================
 
 @lru_cache(maxsize=8192)
 def _parse_string_recommendation(raw: str) -> str:
-    """Parse recommendation from string."""
-    # Arabic
     ar_norm = _normalize_arabic(raw)
 
     if ar_norm in _AR_BUY:
@@ -898,16 +1132,13 @@ def _parse_string_recommendation(raw: str) -> str:
     if any(tok in ar_norm for tok in ["احتفاظ", "محايد", "انتظار", "مراقبة"]):
         return Recommendation.HOLD.value
 
-    # Normalized text
     norm = _normalize_text(raw)
     if not norm:
         return Recommendation.HOLD.value
 
-    # No rating markers
     if norm in _NO_RATING:
         return Recommendation.HOLD.value
 
-    # Language-specific
     if norm in _LANG_BUY:
         return Recommendation.BUY.value
     if norm in _LANG_SELL:
@@ -917,13 +1148,11 @@ def _parse_string_recommendation(raw: str) -> str:
     if norm in _LANG_REDUCE:
         return Recommendation.REDUCE.value
 
-    # Strong patterns
     if norm in _STRONG_SELL_LIKE or _PAT_STRONG_SELL.search(norm):
         return _apply_negation(norm, Recommendation.SELL.value)
     if norm in _STRONG_BUY_LIKE or _PAT_STRONG_BUY.search(norm):
         return _apply_negation(norm, Recommendation.STRONG_BUY.value)
 
-    # Standard patterns
     if norm in _SELL_LIKE or _PAT_SELL.search(norm):
         return _apply_negation(norm, Recommendation.SELL.value)
     if norm in _REDUCE_LIKE or _PAT_REDUCE.search(norm):
@@ -933,12 +1162,10 @@ def _parse_string_recommendation(raw: str) -> str:
     if norm in _BUY_LIKE or _PAT_BUY.search(norm):
         return _apply_negation(norm, Recommendation.BUY.value)
 
-    # Numeric rating
     num_result = _parse_numeric_rating(norm, context_hints=True)
     if num_result and num_result[1] >= _CONFIDENCE_MEDIUM:
         return _apply_negation(norm, num_result[0])
 
-    # Fallback patterns
     if _PAT_SELL.search(norm):
         return _apply_negation(norm, Recommendation.SELL.value)
     if _PAT_REDUCE.search(norm):
@@ -948,7 +1175,6 @@ def _parse_string_recommendation(raw: str) -> str:
     if _PAT_BUY.search(norm):
         return _apply_negation(norm, Recommendation.BUY.value)
 
-    # Sentiment analysis
     sentiment = _sentiment_analysis(norm)
     if sentiment:
         return sentiment
@@ -957,11 +1183,10 @@ def _parse_string_recommendation(raw: str) -> str:
 
 
 # =============================================================================
-# Horizon Helpers
+# Horizon Helpers (preserved)
 # =============================================================================
 
 def _horizon_label_from_days(days: Optional[int]) -> Optional[str]:
-    """Convert days to horizon label."""
     if days is None or days <= 0:
         return None
     if days <= 45:
@@ -974,15 +1199,12 @@ def _horizon_label_from_days(days: Optional[int]) -> Optional[str]:
 
 
 def _infer_horizon_days_from_payload(data: Dict[str, Any]) -> Optional[int]:
-    """Infer horizon days from payload."""
-    # Direct fields
     value = _deep_get(data, _HORIZON_DAYS_FIELDS)
     if value is not None:
         di = _to_int(value)
         if di is not None and di > 0:
             return di
 
-    # From label
     label = _clean_text(_deep_get(data, _HORIZON_LABEL_FIELDS)).upper()
     if label:
         label_map = {
@@ -994,7 +1216,6 @@ def _infer_horizon_days_from_payload(data: Dict[str, Any]) -> Optional[int]:
         if label in label_map:
             return label_map[label]
 
-    # From ROI fields
     if _deep_get(data, ["required_roi_1m"]) is not None:
         return 30
     if _deep_get(data, ["required_roi_3m"]) is not None:
@@ -1006,7 +1227,6 @@ def _infer_horizon_days_from_payload(data: Dict[str, Any]) -> Optional[int]:
 
 
 def _infer_horizon_label_from_payload(data: Dict[str, Any], horizon_days: Optional[int]) -> Optional[str]:
-    """Infer horizon label from payload."""
     label = _clean_text(_deep_get(data, _HORIZON_LABEL_FIELDS)).upper()
     if label:
         return label
@@ -1014,27 +1234,11 @@ def _infer_horizon_label_from_payload(data: Dict[str, Any], horizon_days: Option
 
 
 # =============================================================================
-# Public API
+# Public API (preserved + new)
 # =============================================================================
 
 def normalize_recommendation(value: Any) -> str:
-    """
-    Normalize a recommendation to canonical form.
-
-    Args:
-        value: Raw recommendation value (string, number, dict, etc.)
-
-    Returns:
-        Canonical recommendation: STRONG_BUY, BUY, HOLD, REDUCE, or SELL
-
-    Examples:
-        >>> normalize_recommendation("Strong Buy")
-        'STRONG_BUY'
-        >>> normalize_recommendation(4)
-        'REDUCE'
-        >>> normalize_recommendation({"rating": "Outperform"})
-        'BUY'
-    """
+    """Normalize a recommendation to canonical form. (Preserved from v6.1.0.)"""
     try:
         candidate = _extract_candidate(value)
         if candidate is None:
@@ -1065,62 +1269,30 @@ def normalize_recommendation(value: Any) -> str:
 
 
 def normalize_recommendation_payload(data: Any) -> Dict[str, Any]:
-    """
-    Normalize a recommendation payload without stripping context.
-
-    Args:
-        data: Raw payload (dict, string, or other)
-
-    Returns:
-        Normalized dict with recommendation, reason, horizon, etc.
-
-    Examples:
-        >>> normalize_recommendation_payload({
-        ...     "rating": "Buy",
-        ...     "recommendation_reason": "Strong fundamentals",
-        ...     "horizon_days": 90
-        ... })
-        {
-            'recommendation': 'BUY',
-            'recommendation_reason': 'Strong fundamentals',
-            'horizon_days': 90,
-            'invest_period_days': 90,
-            'invest_period_label': '3M',
-            'confidence': None,
-            'scores': {},
-            'source_fields': {}
-        }
-    """
+    """Normalize a recommendation payload without stripping context. (Preserved.)"""
     try:
         if isinstance(data, dict):
             raw = dict(data)
         else:
             raw = {"recommendation": data}
 
-        # Extract recommendation
         reco_value = _deep_get(raw, _VENDOR_FIELDS["default"] + _VENDOR_FIELDS["nested"])
         if reco_value is None:
             reco_value = raw.get("recommendation")
         recommendation = normalize_recommendation(reco_value if reco_value is not None else raw)
 
-        # Extract reason
         reason = _clean_text(_deep_get(raw, _REASON_FIELDS))
         if not reason:
             reason = _clean_text(raw.get("recommendation_reason"))
 
-        # Extract horizon days
         horizon_days = _infer_horizon_days_from_payload(raw)
         if horizon_days is None:
             horizon_days = _to_int(raw.get("horizon_days")) or _to_int(raw.get("invest_period_days"))
 
-        # Extract horizon label
         invest_period_label = _infer_horizon_label_from_payload(raw, horizon_days)
         if not invest_period_label:
             invest_period_label = _clean_text(raw.get("invest_period_label")).upper() or None
 
-        # Extract confidence
-        # v6.1.0: local loop var renamed from `field` to avoid shadowing
-        # `dataclasses.field` at function scope (lint-only; no runtime change).
         confidence = None
         for conf_field in _CONFIDENCE_FIELDS:
             val = _deep_get(raw, [conf_field])
@@ -1129,7 +1301,6 @@ def normalize_recommendation_payload(data: Any) -> Dict[str, Any]:
                 if confidence is not None:
                     break
 
-        # Extract scores
         scores: Dict[str, float] = {}
         for score_field in _SCORE_FIELDS:
             val = _deep_get(raw, [score_field])
@@ -1160,24 +1331,12 @@ def normalize_recommendation_payload(data: Any) -> Dict[str, Any]:
 
 
 def normalize_recommendation_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize a recommendation row.
-
-    Alias for normalize_recommendation_payload for row-level normalization.
-    """
+    """Normalize a recommendation row. (Preserved.)"""
     return normalize_recommendation_payload(row)
 
 
 def normalize_recommendation_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Normalize multiple recommendation rows.
-
-    Args:
-        rows: List of row dicts
-
-    Returns:
-        List of normalized row dicts
-    """
+    """Normalize multiple recommendation rows. (Preserved.)"""
     result: List[Dict[str, Any]] = []
     for row in rows:
         try:
@@ -1197,20 +1356,12 @@ def normalize_recommendation_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[s
 
 
 def batch_normalize(recommendations: Sequence[Any]) -> List[str]:
-    """
-    Normalize a batch of recommendations.
-
-    Args:
-        recommendations: List of raw recommendation values
-
-    Returns:
-        List of canonical recommendations
-    """
+    """Normalize a batch of recommendations. (Preserved.)"""
     return [normalize_recommendation(r) for r in recommendations]
 
 
 def is_valid_recommendation(value: Any) -> bool:
-    """Check if value is a valid canonical recommendation."""
+    """Check if value is a valid canonical recommendation. (Preserved.)"""
     try:
         return str(value) in _RECO_ENUM
     except Exception:
@@ -1218,11 +1369,7 @@ def is_valid_recommendation(value: Any) -> bool:
 
 
 def get_recommendation_score(reco: Any) -> int:
-    """Get numeric score for recommendation (0-4, 0 = STRONG_BUY best).
-
-    v6.1.0: accepts Any and returns 2 (HOLD) for invalid or non-string
-    inputs rather than raising.
-    """
+    """Get numeric score for recommendation (0-4, 0 = STRONG_BUY best). (Preserved.)"""
     try:
         s = str(reco)
     except Exception:
@@ -1236,15 +1383,13 @@ def get_recommendation_score(reco: Any) -> int:
 
 
 def recommendation_from_score(score: Any, scale: str = "1-5") -> str:
-    """Convert score to recommendation."""
+    """Convert score to recommendation. (Preserved.)"""
     return Recommendation.from_score(score, scale).value
 
 
 # =============================================================================
-# Backward compatibility constants
+# Backward-compatibility constants
 # =============================================================================
-# (Defined BEFORE __all__ so star-imports work consistently regardless of
-# whether another module reloads this module partway through initialization.)
 
 RECO_STRONG_BUY = Recommendation.STRONG_BUY.value
 RECO_BUY = Recommendation.BUY.value
@@ -1262,12 +1407,28 @@ __all__ = [
     "VERSION",
     # Enums
     "Recommendation",
-    # Constants
+    # Recommendation constants
     "RECO_STRONG_BUY",
     "RECO_BUY",
     "RECO_HOLD",
     "RECO_REDUCE",
     "RECO_SELL",
+    # NEW: View-token constants
+    "VIEW_FUND_BULLISH",
+    "VIEW_FUND_NEUTRAL",
+    "VIEW_FUND_BEARISH",
+    "VIEW_TECH_BULLISH",
+    "VIEW_TECH_NEUTRAL",
+    "VIEW_TECH_BEARISH",
+    "VIEW_RISK_LOW",
+    "VIEW_RISK_MODERATE",
+    "VIEW_RISK_HIGH",
+    "VIEW_VALUE_CHEAP",
+    "VIEW_VALUE_FAIR",
+    "VIEW_VALUE_EXPENSIVE",
+    # NEW: View helpers
+    "normalize_view_token",
+    "recommendation_from_views",
     # Data classes
     "NormalizedRecommendation",
     # Core functions
