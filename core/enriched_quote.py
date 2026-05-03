@@ -3,43 +3,59 @@
 """
 core/enriched_quote.py
 ===============================================================================
-TFB Enriched Quote Core — v4.1.0 (SCHEMA-ALIGNED / BUG-FIXED)
+TFB Enriched Quote Core — v4.2.0 (VIEW-AWARE / SCHEMA-ALIGNED)
 ===============================================================================
 CORE-ONLY • SCHEMA-FIRST • PAGE-CANONICAL • SPECIAL-PAGE SAFE • ENGINE-TOLERANT
 JSON-SAFE • SYNC/ASYNC SAFE • ROUTE-FRIENDLY • LIGHTWEIGHT • IMPORT-SAFE
 
-v4.1.0 changes (what moved from v4.0.0)
+v4.2.0 changes (what moved from v4.1.0)
 ---------------------------------------
+- FIX [HIGH]: Fallback instrument schema is now exactly 85 columns to match
+  `core.sheets.schema_registry` v2.5.0. v4.1.0's fallback was 80 columns and
+  was MISSING:
+    * `upside_pct` (Valuation, added in registry v2.4.0)
+    * `fundamental_view`, `technical_view`, `risk_view`, `value_view`
+      (Views group, added in registry v2.3.0)
+  When the schema registry could not be imported (minimal deploys, tests,
+  tooling), `schema_projection()` would silently drop these five fields from
+  every row, even though `core.scoring` v5.0.0 emits them and
+  `core.reco_normalize` v7.0.0 needs them as inputs to the 5-tier rec
+  cascade. With the registry healthy (the normal path) the views came
+  through correctly because `page_schema()` reads from the registry; the
+  fallback was the only break.
+- FIX [HIGH]: Top_10_Investments fallback total bumped from 83 → 88 (85 + 3)
+  to stay consistent with registry validation `validate_schema_registry`
+  which requires Top10 to be exactly 88 columns.
+- FIX [MED]: Fallback header list extended in lockstep — added "Upside %",
+  "Fundamental View", "Technical View", "Risk View", "Value View".
+  Previously the headers list was 80 entries while the keys list was 80;
+  both are now 85.
+- NEW: `VIEW_COLUMN_KEYS` constant exported, mirrors the registry export so
+  callers can treat enriched_quote and schema_registry as a single source.
+- NEW: `_strip_internal_fields()` helper (defence-in-depth). Engine
+  v5.47.4 / advisor_engine v4.2.0 already strip internal coordination flags
+  (`_skip_recommendation_synthesis`, `unit_normalization_warnings`,
+  `intrinsic_value_source`, anything starting with `_internal_` / `_meta_`
+  / `_debug_`) at source, but legacy / proxy / cached rows arriving here
+  may still carry them. `schema_projection()` would naturally filter them
+  too (since they aren't in the schema), but stripping early keeps the
+  matrix path clean and the `row` field on single-row responses honest.
+- ALIGN: header docstring now references registry v2.5.0 (not v2.2.0) and
+  the v5/v7 view-aware family in general.
+
+Public API is preserved verbatim from v4.1.0:
+`build_enriched_quote_payload`, `build_enriched_sheet_rows_payload`,
+`build_enriched_quote_payload_sync`, `get_enriched_quote_payload`,
+`enriched_quote`, `quote`, `get_router`, and `router` are all still
+exported under the same names.
+
+v4.1.0 changes (PRESERVED)
+--------------------------
 - FIX: added missing `dataclass` import (v4.0.0 referenced @dataclass at class
   body time without importing it — module failed to load).
 - FIX: renamed the `request_id()` helper to `_resolve_request_id()` to avoid
   being shadowed by the `request_id: Optional[str]` keyword argument inside
-  `build_enriched_quote_payload()`. The previous v4.0.0 call site crashed at
-  runtime because the name resolved to the string argument, not the helper.
-- ALIGN: fallback instrument schema is now exactly the canonical 80 columns
-  from `core.sheets.schema_registry` (v2.2.0). Non-canonical fields that were
-  previously baked in — `price_change_5d`, `volume_ratio`, `roe`, `roa`,
-  `rsi_signal`, `technical_score`, `day_range_position`, `atr_14`,
-  `upside_pct`, `analyst_rating`, `target_price`, `upside_downside_pct`,
-  `signal`, `trend_1m/3m/12m`, `short_term_signal` — are gone.
-- ALIGN: Top_10_Investments extras are now exactly 3 (`top10_rank`,
-  `selection_reason`, `criteria_snapshot`). The 4 trade-setup fields
-  (`entry_price`, `stop_loss_suggested`, `take_profit_suggested`,
-  `risk_reward_ratio`) are no longer present in the fallback schema and are
-  no longer force-initialized inside `normalize_rows()`.
-- ALIGN: Insights_Analysis fallback is now exactly 7 columns
-  (`section`, `item`, `symbol`, `metric`, `value`, `notes`,
-  `last_updated_riyadh`). The drifted `signal`, `priority`, `as_of_riyadh`
-  fields are gone.
-- ALIGN: paired fallback header lists (instruments / top10 / insights / data
-  dictionary) match the registry header text verbatim, so display headers are
-  correct (e.g. "P/E (TTM)", "52W Position %") even when the registry can't
-  be imported.
-
-Public API is preserved: `build_enriched_quote_payload`,
-`build_enriched_sheet_rows_payload`, `build_enriched_quote_payload_sync`,
-`get_enriched_quote_payload`, `enriched_quote`, `quote`, `get_router`, and
-`router` are all still exported under the same names.
+  `build_enriched_quote_payload()`.
 ================================================================================
 """
 
@@ -83,7 +99,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-MODULE_VERSION = "4.1.0"
+MODULE_VERSION = "4.2.0"
 
 # =============================================================================
 # Constants
@@ -110,6 +126,16 @@ DEFAULT_PAGE = "Market_Leaders"
 DEFAULT_LIMIT = 50
 DEFAULT_TIMEOUT_SEC = 25.0
 SPARSE_ROW_THRESHOLD = 8
+
+# Canonical view column keys (mirrors core.sheets.schema_registry.VIEW_COLUMN_KEYS).
+# Exposed for downstream code that needs to project/select view fields without
+# depending on a hardcoded list.
+VIEW_COLUMN_KEYS: Tuple[str, ...] = (
+    "fundamental_view",
+    "technical_view",
+    "risk_view",
+    "value_view",
+)
 
 # Page aliases (fallback when page_catalog unavailable)
 _PAGE_ALIASES: Dict[str, str] = {
@@ -196,6 +222,19 @@ _ENGINE_SINGLETON_NAMES = (
     "ENGINE",
     "DATA_ENGINE",
 )
+
+# v4.2.0: internal coordination fields that should never leak into the public
+# response. Engine v5.47.4 and advisor_engine v4.2.0 already strip these at
+# source; this is defence-in-depth for legacy / proxy / cached rows.
+_INTERNAL_FIELD_PREFIXES: Tuple[str, ...] = (
+    "_skip_", "_internal_", "_meta_", "_debug_", "_trace_",
+)
+_INTERNAL_FIELDS_TO_STRIP_HARD: frozenset = frozenset({
+    "_placeholder",
+    "_skip_recommendation_synthesis",
+    "unit_normalization_warnings",
+    "intrinsic_value_source",
+})
 
 
 # =============================================================================
@@ -486,6 +525,35 @@ def _title_header(key: str) -> str:
         else:
             words.append(part.capitalize())
     return " ".join(words)
+
+
+def _strip_internal_fields(row: Any) -> Any:
+    """
+    Remove engine internal coordination flags from a row dict (v4.2.0).
+
+    Engine v5.47.4 / advisor_engine v4.2.0 already strip these at source;
+    this is defence-in-depth for legacy / proxy / cached rows that may
+    still carry them. `schema_projection()` would naturally filter them
+    too (since they aren't in the schema list), but stripping early keeps
+    the matrix path clean and the `row` field on single-row responses
+    honest.
+    """
+    if not isinstance(row, dict):
+        return row
+    for k in list(row.keys()):
+        ks = str(k)
+        if ks in _INTERNAL_FIELDS_TO_STRIP_HARD:
+            try:
+                del row[k]
+            except Exception:
+                pass
+            continue
+        if any(ks.startswith(p) for p in _INTERNAL_FIELD_PREFIXES):
+            try:
+                del row[k]
+            except Exception:
+                pass
+    return row
 
 
 # =============================================================================
@@ -893,72 +961,91 @@ def _contract_from_keys(
 
 
 # =============================================================================
-# Fallback schema constants — aligned with core.sheets.schema_registry v2.2.0
+# Fallback schema constants — aligned with core.sheets.schema_registry v2.5.0
 # =============================================================================
 #
 # Do NOT add non-canonical fields here. The registry is the single source of
 # truth; these lists exist only to keep the module functional when the
 # registry can't be imported (e.g. minimal deploys, tests, tooling). Any drift
 # between these constants and the registry is a bug.
+#
+# v4.2.0: extended from 80 → 85 columns to match registry v2.5.0
+# (added upside_pct + 4 view columns).
 
-# Canonical 80 instrument columns — matches
+# Canonical 85 instrument columns — matches
 # core.sheets.schema_registry._canonical_instrument_columns() verbatim.
 _FALLBACK_INSTRUMENT_KEYS: List[str] = [
-    # Identity (8)
+    # Identity (8)            -> 8
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
-    # Price (10) -> 18
+    # Price (10)              -> 18
     "current_price", "previous_close", "open_price", "day_high", "day_low",
     "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
-    # Liquidity (6) -> 24
+    # Liquidity (6)           -> 24
     "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y",
-    # Fundamentals (12) -> 36
+    # Fundamentals (12)       -> 36
     "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio", "revenue_ttm",
     "revenue_growth_yoy", "gross_margin", "operating_margin", "profit_margin",
     "debt_to_equity", "free_cash_flow_ttm",
-    # Risk (8) -> 44
+    # Risk (8)                -> 44
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
     "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
-    # Valuation (6) -> 50
-    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value", "valuation_score",
-    # Forecast (9) -> 59
+    # Valuation (7)           -> 51   (v4.2.0: upside_pct added in registry v2.4.0)
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value",
+    "upside_pct", "valuation_score",
+    # Forecast (9)            -> 60
     "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
     "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket",
-    # Scores (7) -> 66
+    # Scores (7)              -> 67
     "value_score", "quality_score", "momentum_score", "growth_score",
     "overall_score", "opportunity_score", "rank_overall",
-    # Recommendation (4) -> 70
+    # Views (4)               -> 71   (v4.2.0: added in registry v2.3.0)
+    "fundamental_view", "technical_view", "risk_view", "value_view",
+    # Recommendation (4)      -> 75
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
-    # Portfolio (6) -> 76
+    # Portfolio (6)           -> 81
     "position_qty", "avg_cost", "position_cost", "position_value",
     "unrealized_pl", "unrealized_pl_pct",
-    # Provenance (4) -> 80
+    # Provenance (4)          -> 85
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
 ]
 
 _FALLBACK_INSTRUMENT_HEADERS: List[str] = [
+    # Identity
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
+    # Price
     "Current Price", "Previous Close", "Open", "Day High", "Day Low",
     "52W High", "52W Low", "Price Change", "Percent Change", "52W Position %",
+    # Liquidity
     "Volume", "Avg Volume 10D", "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)",
+    # Fundamentals
     "P/E (TTM)", "P/E (Forward)", "EPS (TTM)", "Dividend Yield", "Payout Ratio",
     "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin", "Operating Margin",
     "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)",
+    # Risk
     "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y",
     "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
-    "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Valuation Score",
+    # Valuation (v4.2.0: + Upside %)
+    "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
+    # Forecast
     "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
     "Forecast Confidence", "Confidence Score", "Confidence Bucket",
+    # Scores
     "Value Score", "Quality Score", "Momentum Score", "Growth Score",
     "Overall Score", "Opportunity Score", "Rank (Overall)",
+    # Views (v4.2.0: 4 new headers)
+    "Fundamental View", "Technical View", "Risk View", "Value View",
+    # Recommendation
     "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
+    # Portfolio
     "Position Qty", "Avg Cost", "Position Cost", "Position Value",
     "Unrealized P/L", "Unrealized P/L %",
+    # Provenance
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
 ]
 
-# Top_10_Investments extras (exactly 3 — registry appends these to the 80 canonical → 83)
+# Top_10_Investments extras (exactly 3 — registry appends these to the 85 canonical → 88)
 _FALLBACK_TOP10_EXTRA_KEYS: List[str] = [
     "top10_rank",
     "selection_reason",
@@ -1159,11 +1246,24 @@ def normalize_rows(
     keys: Sequence[str],
     page: str,
 ) -> List[Dict[str, Any]]:
-    """Normalize rows to schema."""
+    """
+    Normalize rows to schema.
+
+    v4.2.0: defensively strips engine internal coordination flags
+    (`_skip_recommendation_synthesis`, `_internal_*`, `unit_normalization_warnings`,
+    `intrinsic_value_source`, etc.) before schema projection. The view fields
+    (`fundamental_view`/`technical_view`/`risk_view`/`value_view`) flow through
+    schema projection automatically as long as `keys` includes them — which it
+    does when schema_registry v2.5.0 is loaded, OR when the fallback list above
+    is used.
+    """
     result: List[Dict[str, Any]] = []
 
     for row in rows:
         rd = dict(row or {})
+
+        # v4.2.0: strip internal coordination fields early
+        _strip_internal_fields(rd)
 
         # Normalize symbol/ticker
         if "symbol" not in rd and "ticker" in rd:
@@ -2286,6 +2386,7 @@ def get_router() -> None:
 
 __all__ = [
     "MODULE_VERSION",
+    "VIEW_COLUMN_KEYS",
     "build_enriched_quote_payload",
     "build_enriched_sheet_rows_payload",
     "build_enriched_quote_payload_sync",
