@@ -2,7 +2,7 @@
 """
 core/providers/eodhd_provider.py
 ================================================================================
-EODHD Provider -- v6.2.0 (GLOBAL PRIMARY / HISTORY+FUNDAMENTALS / SCHEMA-ALIGNED)
+EODHD Provider -- v6.3.0 (PERCENT-CHANGE CORRECTNESS / KSA STALE-PREV-CLOSE FIX)
 ================================================================================
 
 Purpose
@@ -13,98 +13,130 @@ Primary provider for global market data:
   - Fundamental data (financials, ratios, company info)
   - Symbol normalization across exchanges
 
-v6.2.0 Changes (from v6.1.0)
-----------------------------
+================================================================================
+v6.3.0 Changes (from v6.2.0)
+================================================================================
+
+[CRITICAL] Production Change% bugs fixed
+----------------------------------------
+Two long-standing production bugs in the percent_change pipeline are
+fixed surgically. All Change% values from EODHD now flow through a
+strict percent-aware pipeline plus cross-validation against EOD history.
+
+Bug 1 -- NVDA: real -0.56% displayed as -56% (100x magnification)
+.................................................................
+Reproducer in v6.2.0 and earlier:
+  - EODHD real-time endpoint returns NVDA `change_p` correctly most of
+    the time, but during pre-market / post-market sessions and on
+    sessions where EODHD's real-time has not propagated, `change_p`
+    arrives as null. The code fell through to:
+
+        change_frac = _to_ratio(_first_present(
+            data.get("percent_change"), data.get("changePercent"),
+        ))
+
+  - `_to_ratio` uses an `abs(f) > 1.5` heuristic to decide whether the
+    incoming value is a percent or a fraction. For NVDA at -0.56% the
+    incoming value is -0.56 (percent-points). Heuristic sees
+    abs(-0.56) = 0.56 < 1.5 and returns -0.56 UNCHANGED, treating it
+    as if it were already a fraction. The patch then stored
+    `percent_change = -0.56`. Downstream sheet display multiplied by
+    100 for percent formatting, producing the -56% the user saw.
+
+  - The contract bug: EODHD's API documentation is unambiguous --
+    `change_p`, `percent_change`, `changePercent` are ALL percent-point
+    values (e.g., -0.56 means -0.56%). They are NEVER fractions. The
+    `_to_ratio` heuristic was inappropriate here.
+
+  - v6.3.0 fix: replace `_to_ratio` with `_pct_to_ratio` (always /100)
+    in the fallback chain. The primary `change_p` path was already
+    correct; this fix closes the back-door corruption path.
+
+Bug 2 -- Aramco 2222.SR: real +0.65% displayed as -86%
+.......................................................
+Reproducer in v6.2.0 and earlier:
+  - EODHD's real-time endpoint occasionally returns a stale or
+    pre-split `previousClose` for KSA symbols. Production observation:
+    Aramco real-time response had close=~37.20 but previousClose=268
+    (a value last valid years ago, before split adjustment).
+
+  - The code computed `(close / prev) - 1 = (37.20 / 268) - 1 = -0.861`
+    and stored that as percent_change. Display *100 = -86%. The math
+    is correct given the input; the input is poison.
+
+  - At the same time, the `_fetch_history_stats` path computed
+    `(closes[-1] / closes[-2]) - 1` from EOD bars and produced the
+    correct +0.0065 (0.65%). But `_fetch_history_stats` ran AFTER
+    `_fetch_quote` in the merge step, so the bad real-time value won
+    (first-non-None semantics).
+
+  - v6.3.0 fix: after merging quote + history patches, cross-validate
+    `percent_change` between the two sources. If they disagree by more
+    than 5 percentage points (configurable, but historically robust
+    threshold), prefer the history-based value. EOD history is
+    mathematically forced to be correct given valid OHLC bars; it
+    cannot suffer from stale-previousClose corruption. When we
+    cross-validate-corrupt, we also rewrite `previous_close` /
+    `prev_close` / `price_change` / `change` to be consistent with the
+    history-derived value.
+
+  - Additional safeguard: any final `percent_change` magnitude > 50%
+    that is not corroborated by history gets a
+    `warning=suspicious_percent_change` flag so operators can
+    investigate without changing the value (don't silently rewrite
+    suspicious data when we have nothing to cross-check it against).
+
+[NEW] Diagnostic field: `change_pct_source`
+-------------------------------------------
+Every patch now records WHICH source produced the final percent_change:
+    "realtime_change_p"           - EODHD real-time `change_p`
+    "realtime_percent_change"     - EODHD real-time `percent_change` /
+                                    `changePercent` field
+    "realtime_close_div_prev"     - Computed from real-time close / prev
+    "history_eod"                 - Computed from EOD history bars
+    "cross_validated_history"     - Quote disagreed with history;
+                                    history won
+    "sanity_check_history"        - Quote was extreme (>50%); history
+                                    won
+
+This is invaluable for debugging future percent-change anomalies and
+costs nothing at runtime.
+
+[INTERNAL] History patch now also emits two underscore-prefixed keys
+--------------------------------------------------------------------
+    "_history_percent_change"   - history-derived pct change as fraction
+    "_history_previous_close"   - closes[-2] from EOD bars
+
+These are consumed by the cross-validation logic in
+`fetch_enriched_quote_patch` and popped before returning. They never
+appear in the user-facing patch.
+
+Preserved: every other behavior, every public symbol, every env var,
+the v6.2.0 enriched-path routing for quote/get_quote/fetch_quote, the
+v6.1.0 _safe_float treatment of decimal-typed Highlights fields. This
+is a SURGICAL fix targeted at the percent_change pipeline only.
+
+================================================================================
+v6.2.0 Changes (from v6.1.0) -- PRESERVED
+================================================================================
+
 [CRITICAL] Public entry points `quote`, `get_quote`, `fetch_quote` now
 route to `fetch_enriched_quote_patch` instead of the basic
 `_fetch_quote`. The basic path returned price/volume only; the enriched
-path returns price + volume + fundamentals (market_cap, P/E, EPS,
-dividend_yield, sector, industry, margins, debt/equity, FCF, ROE/ROA,
-beta, revenue) + history stats.
+path returns price + volume + fundamentals + history stats.
 
-Production diagnosis 2026-05-02 from /v1/enriched-quote?symbol=AAPL:
-    current_price: 280.14    ✓ (came from history fallback)
-    volume: 77.9M            ✓ (came from history fallback)
-    rsi_14, volatility, ...  ✓ (computed from history)
-    market_cap, pe_ttm, ...  ✗ all null
-    provider_primary:        ✗ null (no provider's full quote merged)
+Compare yahoo_fundamentals_provider.py: every public name there aliases
+to `fetch_fundamentals_patch`. v6.2.0 brought EODHD in line.
 
-Root cause: data_engine_v2.py `_pick_provider_callable` picks the first
-matching function name from this priority list:
-    ("get_quote", "fetch_quote", "fetch_enriched_quote",
-     "get_enriched_quote", "quote")
-Since v6.1.0 exposed `get_quote` first (as an alias of `quote`, which
-called `_fetch_quote` -- basic only), the engine never reached
-`fetch_enriched_quote_patch`. EODHD never delivered fundamentals to
-the merge step, so every Global_Markets row showed null fundamentals
-even though the API key was valid and the network was reachable.
+================================================================================
+v6.1.0 Changes (from v6.0.0) -- PRESERVED
+================================================================================
 
-Compare yahoo_fundamentals_provider.py (line 1430+): every public name
-there aliases to `fetch_fundamentals_patch`. That provider got it
-right; v6.1.0 EODHD got it wrong. v6.2.0 brings EODHD in line.
-
-Behavior change for callers:
-  - OLD: `quote(symbol)` returned basic-quote dict; raised
-    EODHDFetchError on upstream failure.
-  - NEW: `quote(symbol)` returns enriched dict (basic + fundamentals +
-    history stats); on failure returns dict with `error` field (no
-    exception).
-
-The data_engine_v2 v5.47.4 error-envelope handling already accepts
-dict-with-error returns: `_fetch_patch` rejects patches that have an
-`error` field with no meaningful keys (current_price, market_cap,
-pe_ttm, etc.) and falls through to the next provider. Returning a
-dict instead of raising is therefore consistent with the engine's
-existing contract.
-
-Verified safe: only internal callers of `quote()` are `get_quote` and
-`fetch_quote` (which are aliases pointing to it). No other modules in
-the codebase import `quote` directly. Grep confirms zero external
-dependencies on the exception path.
-
-Net behavior change for users:
-  - /v1/advanced/sheet-rows?sheet=Global_Markets -- AAPL/MSFT/NVDA rows
-    now return populated market_cap, pe_ttm, eps_ttm, dividend_yield,
-    sector, industry, margins, beta, revenue, etc. on every refresh.
-  - provider_primary now records "eodhd" instead of null.
-  - Existing v4.0.7 Tier 0.5 fast path is unchanged. v4.0.6 honest
-    placeholder fallback is unchanged.
-  - Estimated fulfillment ratio jumps from ~45% to ~75-85% (depends on
-    how many EODHD fundamentals fields are populated for a given
-    symbol; varies by listing).
-
-This is a SURGICAL fix. Only the three module-level entry points are
-changed. The client class internals (`_fetch_quote`,
-`_fetch_fundamentals`, `_fetch_history_stats`,
-`fetch_enriched_quote_patch` on the client itself) are byte-identical
-to v6.1.0. Other public functions (`fetch_history`, `fetch_quotes`,
-batch path, etc.) are byte-identical.
-
-v6.1.0 Changes (from v6.0.0)
-----------------------------
-Bug fixes continuing the v6.0.0 percent-vs-ratio hardening:
-  - EODHD's Highlights.RevenueGrowth is documented as a DECIMAL (e.g.
-    0.25 for 25%) but the v6.0.0 code piped it through _to_ratio, whose
-    heuristic correctly leaves small decimals alone — however, a tiny
-    value like 0.02 (2% growth) is also a ratio that doesn't need
-    conversion. The heuristic is safe here but we tighten the code path
-    by explicitly using _safe_float (no conversion) for fields that the
-    EODHD docs confirm are always decimals.
-  - Same treatment for DividendYield, PayoutRatio, ProfitMargin,
-    GrossMargin, OperatingMargin, ROE, ROA — all documented as decimals
-    in EODHD's fundamentals schema. Using _safe_float prevents the
-    silent 100× error if EODHD ever changes a field to percent units
-    (we'd rather see a visible anomaly than a silent overwrite).
-
-Cleanup:
-  - Added EODHD_MAX_PROVIDER_ATTEMPTS reference note (used by
-    data_engine_v2; placed here for operator documentation).
-
-Preserved for backward compatibility:
-  - Every name in __all__.
-  - Every environment variable name and default.
-  - Response patch shape (field names, aliases, data_quality values).
-  - Symbol normalization rules and exchange suffix maps.
+EODHD's Highlights.RevenueGrowth, DividendYield, PayoutRatio,
+ProfitMargin, GrossMargin, OperatingMargin, ROE, ROA are ALL documented
+as decimals. v6.1.0 switched these to `_safe_float` (no conversion)
+instead of `_to_ratio`, preventing silent 100x errors if EODHD ever
+changed a field's units.
 ================================================================================
 """
 
@@ -136,18 +168,26 @@ logger.addHandler(logging.NullHandler())
 # ---------------------------------------------------------------------------
 
 PROVIDER_NAME = "eodhd"
-PROVIDER_VERSION = "6.2.0"
+PROVIDER_VERSION = "6.3.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
-DEFAULT_USER_AGENT = "TFB-EODHD/6.1.0 (Render)"
+DEFAULT_USER_AGENT = "TFB-EODHD/6.3.0 (Render)"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 
 _US_LIKE_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-_]{0,16}$")
 _KSA_RE = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
+
+# v6.3.0 cross-validation thresholds (in fraction units, NOT percent)
+# Disagreement > 5 percentage points (i.e., 0.05 in fraction) between
+# real-time quote and EOD history triggers a preference for history.
+_PCT_CHANGE_DISAGREEMENT_THRESHOLD = 0.05
+# Any percent_change > ±50% magnitude with no corroborating history is
+# flagged as suspicious.
+_PCT_CHANGE_SUSPICIOUS_THRESHOLD = 0.50
 
 # Exchange suffix remapping for EODHD
 _EODHD_SUFFIX_REMAP: Dict[str, str] = {
@@ -393,10 +433,10 @@ def _to_ratio(value: Any) -> Optional[float]:
     """
     Convert percent-like value to ratio using the abs>1.5 heuristic.
 
-    WARNING: ambiguous for values between 0 and 1.5 (treated as ratios even
-    if they were meant as percents). Use `_pct_to_ratio` for fields you
-    KNOW are in percent units, or `_safe_float` for fields you KNOW are
-    already decimals.
+    WARNING: ambiguous for values between -1.5 and 1.5 (treated as
+    fractions even if they were meant as percents). DO NOT use this for
+    EODHD percent_change-family fields; use `_pct_to_ratio` instead.
+    Retained for fields where the source units are genuinely unknown.
     """
     f = _safe_float(value)
     if f is None:
@@ -409,8 +449,9 @@ def _pct_to_ratio(value: Any) -> Optional[float]:
     Convert a known-percent value to a ratio by dividing by 100.
 
     Use for fields whose API docs confirm percent units (e.g., EODHD's
-    /real-time change_p). Safer than `_to_ratio` when the source scale is
-    unambiguous.
+    /real-time `change_p`, `percent_change`, `changePercent`). Safer
+    than `_to_ratio` when the source scale is unambiguous -- v6.3.0
+    uses this exclusively for all EODHD percent-change fields.
     """
     f = _safe_float(value)
     return f / 100.0 if f is not None else None
@@ -898,16 +939,26 @@ class EODHDClient:
             if chg is None and close is not None and prev is not None and prev != 0:
                 chg = close - prev
 
-            # v6.0.0 bug fix: EODHD's `change_p` is documented as PERCENT
-            # (e.g., 1.25 for 1.25%). Use explicit /100 here.
+            # v6.3.0: ALL EODHD percent-change fields (`change_p`,
+            # `percent_change`, `changePercent`) are documented as
+            # percent-points. Use `_pct_to_ratio` exclusively -- never
+            # the `_to_ratio` heuristic, which silently corrupts values
+            # below 1.5 magnitude (production bug: NVDA -0.56% became
+            # -56% after _to_ratio left -0.56 unchanged thinking it
+            # was already a fraction).
+            change_pct_source = ""
             change_frac: Optional[float] = _pct_to_ratio(data.get("change_p"))
-            if change_frac is None:
-                # Fall back to the ambiguous keys via the heuristic
-                change_frac = _to_ratio(_first_present(
+            if change_frac is not None:
+                change_pct_source = "realtime_change_p"
+            else:
+                change_frac = _pct_to_ratio(_first_present(
                     data.get("percent_change"), data.get("changePercent"),
                 ))
+                if change_frac is not None:
+                    change_pct_source = "realtime_percent_change"
             if change_frac is None and close is not None and prev is not None and prev != 0:
                 change_frac = (close / prev) - 1.0
+                change_pct_source = "realtime_close_div_prev"
 
             exchange = _safe_str(_first_present(
                 data.get("exchange"), data.get("fullExchangeName"), data.get("primaryExchange"),
@@ -939,6 +990,9 @@ class EODHDClient:
                 "change": chg,
                 "percent_change": change_frac,
                 "change_pct": change_frac,
+                # v6.3.0: diagnostic field (consumed downstream / for
+                # operator visibility into which path produced the value)
+                "change_pct_source": change_pct_source or None,
                 "timestamp": _safe_str(_first_present(data.get("timestamp"), data.get("date"))),
                 "last_updated_utc": _utc_iso(),
                 "last_updated_riyadh": _riyadh_iso(),
@@ -1356,6 +1410,15 @@ class EODHDClient:
                 "change": history_price_change,
                 "percent_change": history_percent_change,
                 "change_pct": history_percent_change,
+                # v6.3.0: source marker so downstream knows this came from
+                # EOD history (used as fallback in cross-validation).
+                "change_pct_source": "history_eod" if history_percent_change is not None else None,
+                # v6.3.0: internal cross-validation fields. The leading
+                # underscore signals "private to provider"; consumed by
+                # `fetch_enriched_quote_patch` and popped before returning.
+                "_history_percent_change": history_percent_change,
+                "_history_previous_close": prev,
+                "_history_current_price": last,
                 "week_52_low": low_52,
                 "week_52_high": high_52,
                 "week_52_position_pct": pos_52_frac,
@@ -1501,6 +1564,8 @@ class EODHDClient:
                 and merged.get("previous_close") not in (None, 0)):
             try:
                 merged["percent_change"] = (float(merged["current_price"]) / float(merged["previous_close"])) - 1.0
+                if not merged.get("change_pct_source"):
+                    merged["change_pct_source"] = "merge_close_div_prev"
             except Exception:
                 pass
 
@@ -1540,6 +1605,94 @@ class EODHDClient:
         merged["fcf_ttm"] = _first_non_none(merged.get("fcf_ttm"), merged.get("free_cash_flow_ttm"))
         merged["d_e_ratio"] = _first_non_none(merged.get("d_e_ratio"), merged.get("debt_to_equity"))
 
+        # ------------------------------------------------------------------
+        # v6.3.0: percent_change cross-validation
+        # ------------------------------------------------------------------
+        # The merge step prefers real-time quote (runs first → wins). EODHD's
+        # real-time `previousClose` can be stale or pre-split for some KSA
+        # symbols, producing wildly wrong values like Aramco -86% from the
+        # naive (close/prev) - 1 path. EOD history is mathematically forced
+        # to be correct given valid OHLC bars; cross-validating against it
+        # catches the corruption.
+        #
+        # Strategy:
+        #   1. If quote and history both produced a percent_change AND they
+        #      disagree by > 5 percentage points, prefer history. Also
+        #      rewrite previous_close / prev_close / price_change / change
+        #      to be consistent with history's values, otherwise downstream
+        #      consumers see inconsistent fields (one set says +0.65%, the
+        #      other implies -86%).
+        #   2. Independent of (1): if the FINAL percent_change exceeds ±50%
+        #      magnitude, that's almost certainly a data error. If history
+        #      agrees with a reasonable value, swap. Otherwise flag with
+        #      `warning=suspicious_percent_change` and leave the value (we
+        #      don't silently rewrite suspicious data when nothing
+        #      cross-checks it).
+        # ------------------------------------------------------------------
+        hist_pct = merged.pop("_history_percent_change", None)
+        hist_prev = merged.pop("_history_previous_close", None)
+        hist_curr = merged.pop("_history_current_price", None)
+
+        quote_pct = merged.get("percent_change")
+        if quote_pct is not None and hist_pct is not None:
+            disagreement = abs(quote_pct - hist_pct)
+            if disagreement > _PCT_CHANGE_DISAGREEMENT_THRESHOLD:
+                logger.info(
+                    "eodhd: percent_change disagreement for %s: "
+                    "quote=%.4f hist=%.4f diff=%.4f -> using history",
+                    sym_norm, quote_pct, hist_pct, disagreement,
+                )
+                merged["percent_change"] = hist_pct
+                merged["change_pct"] = hist_pct
+                merged["change_pct_source"] = "cross_validated_history"
+                # Rewrite prev_close + price_change so the row is internally
+                # consistent. We trust history's prev (closes[-2]) over
+                # whatever stale value EODHD's real-time gave us.
+                if hist_prev is not None:
+                    merged["previous_close"] = hist_prev
+                    merged["prev_close"] = hist_prev
+                    if hist_curr is not None:
+                        try:
+                            merged["price_change"] = float(hist_curr) - float(hist_prev)
+                            merged["change"] = merged["price_change"]
+                        except Exception:
+                            pass
+                # Capture the original quote value for diagnostics
+                merged["change_pct_quote_raw"] = quote_pct
+
+        # Sanity-check final value.
+        final_pct = merged.get("percent_change")
+        if final_pct is not None and abs(final_pct) > _PCT_CHANGE_SUSPICIOUS_THRESHOLD:
+            if hist_pct is not None and abs(hist_pct) <= _PCT_CHANGE_SUSPICIOUS_THRESHOLD:
+                # History looks reasonable -- swap (also rewrite consistency fields)
+                logger.info(
+                    "eodhd: extreme percent_change for %s: %.4f -> swapping to history %.4f",
+                    sym_norm, final_pct, hist_pct,
+                )
+                merged["change_pct_quote_raw"] = final_pct
+                merged["percent_change"] = hist_pct
+                merged["change_pct"] = hist_pct
+                merged["change_pct_source"] = "sanity_check_history"
+                if hist_prev is not None:
+                    merged["previous_close"] = hist_prev
+                    merged["prev_close"] = hist_prev
+                    if hist_curr is not None:
+                        try:
+                            merged["price_change"] = float(hist_curr) - float(hist_prev)
+                            merged["change"] = merged["price_change"]
+                        except Exception:
+                            pass
+            else:
+                # No corroborating history -- mark suspicious but leave value
+                logger.warning(
+                    "eodhd: suspicious percent_change for %s: %.4f (no history corroboration)",
+                    sym_norm, final_pct,
+                )
+                existing = merged.get("warning") or ""
+                merged["warning"] = "|".join(
+                    p for p in (existing, "suspicious_percent_change") if p
+                )
+
         if merged.get("current_price") is None:
             merged["data_quality"] = "MISSING"
             merged["error"] = "fetch_failed"
@@ -1547,7 +1700,11 @@ class EODHDClient:
         else:
             merged["data_quality"] = "OK"
             if errors:
-                merged["warning"] = "partial_sources"
+                # Only set the partial-sources warning if we don't already
+                # have a more specific suspicious-data warning from the
+                # cross-validation step above.
+                if not merged.get("warning"):
+                    merged["warning"] = "partial_sources"
                 merged["info"] = {"warnings": sorted(set(errors))[:6]}
 
         return _clean_patch(merged)
@@ -1691,55 +1848,7 @@ async def enriched_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, An
 
 
 async def quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """
-    v6.2.0: Now returns the ENRICHED patch (basic quote + fundamentals +
-    history stats) instead of just basic quote.
-
-    Why the change
-    --------------
-    The data engine's `_pick_provider_callable` in core/data_engine_v2.py
-    picks the first matching name from this priority list:
-        ("get_quote", "fetch_quote", "fetch_enriched_quote",
-         "get_enriched_quote", "quote")
-    Since this module exposed `get_quote` (line 1637 below, alias of
-    quote), the engine ALWAYS called the basic-quote path and never
-    reached `fetch_enriched_quote_patch`. Result: prices and volume
-    came through but every fundamentals field (market_cap, P/E, EPS,
-    dividend_yield, sector, industry, margins, beta, revenue, etc.)
-    came back null on every Global_Markets refresh.
-
-    Production diagnosis 2026-05-02:
-        /v1/enriched-quote?symbol=AAPL
-        → current_price: 280.14 ✓ (from history fallback)
-        → volume: 77.9M ✓ (from history fallback)
-        → rsi_14, volatility, sharpe ✓ (computed from history)
-        → market_cap, pe_ttm, eps_ttm, sector, ...: ALL null ✗
-        → provider_primary: null ✗ (no provider's full quote succeeded)
-
-    Compare yahoo_fundamentals_provider, which got this right: every one
-    of its public functions (get_quote, fetch_quote, quote,
-    enriched_quote) is an alias for `fetch_fundamentals_patch`, so
-    fundamentals always come through regardless of which name the
-    engine picks.
-
-    Behavior change
-    ---------------
-    OLD: returns basic quote dict; raises EODHDFetchError on failure.
-    NEW: returns enriched patch dict (basic + fundamentals + history);
-         on failure returns dict with `error` field (no exception).
-
-    Why no exception: the data engine's v5.47.4 error-envelope check at
-    `_fetch_patch` (data_engine_v2.py line ~3506) explicitly handles
-    dict-with-error returns -- it rejects patches with `error` and no
-    meaningful keys, then falls through to the next provider. Returning
-    a dict gives the engine more diagnostic detail than an exception
-    string and is consistent with `fetch_quote_patch`'s existing pattern
-    (line 1647 below).
-
-    Risk: zero callers in this module relied on the exception other
-    than `get_quote` and `fetch_quote` which are aliases. Verified by
-    grep before deploy.
-    """
+    """v6.2.0: enriched-path alias. See module docstring for full rationale."""
     if args or kwargs:
         logger.debug("quote(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
     return await fetch_enriched_quote_patch(symbol)
