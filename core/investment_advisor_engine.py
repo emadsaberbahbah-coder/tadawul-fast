@@ -3,58 +3,89 @@
 """
 core/investment_advisor_engine.py
 ================================================================================
-INVESTMENT ADVISOR ENGINE — v4.1.0 (SCHEMA-ALIGNED / IMPORT-FIXED)
+INVESTMENT ADVISOR ENGINE — v4.2.0 (VIEW-AWARE / SYMMETRIC WITH ADVISOR v5.1.1)
 ================================================================================
 SYNC-EXPORT SAFE • ASYNC-INTERNAL • EXPORT-HARDENED • ROUTE-TOLERANT
 ENGINE-AWARE • PAGE-CATALOG NORMALIZED • TOP10-BUILDER FIRST
 INSIGHTS FALLBACK SAFE • SPECIAL-SCHEMA SAFE • NO-IMPORT-TIME-NETWORK
 ADVISOR + SHEET-ROWS SAFE • JSON-SAFE • 502-RESISTANT • MATRIX/ROW-OBJECT SAFE
 
-v4.1.0 changes (what moved from v4.0.0)
+v4.2.0 changes (what moved from v4.1.0)
 ---------------------------------------
-- CRITICAL FIX: `_normalize_engine_result` is now `async def`. v4.0.0 declared
-  it `def` but its body used `await _build_top10_rows_impl(...)`, which is a
-  hard `SyntaxError: 'await' outside async function`. The module could not
-  be imported at all — every caller listing `core.investment_advisor_engine`
-  in their candidates silently swallowed the `ImportError` and fell back.
-  The caller `_run_investment_advisor_async` now `await`s it.
-- ALIGN: Insights fallback is the registry's canonical 7-column shape
-  (`Section, Item, Symbol, Metric, Value, Notes, Last Updated (Riyadh)`).
-  The v4.0.0 9-column `Signal`/`Priority`/`as_of_riyadh` shape is gone.
-- ALIGN: Top_10_Investments fallback is the registry's 83 canonical columns
-  (80 + 3 extras). The v4.0.0 custom ~40-column list (`Volume Ratio`,
-  `RSI Signal`, `Tech Score`, `Upside %`, `Entry Price`, `Stop Loss (AI)`,
-  `Take Profit (AI)`, `Risk/Reward`, …) has been replaced.
-- ALIGN: generic instrument fallback is the full 80-column canonical schema.
-  v4.0.0 returned only 16 cherry-picked columns.
-- ALIGN: `_build_data_dictionary_rows` now walks `schema_registry` directly
-  when `core.sheets.data_dictionary` isn't present. v4.0.0 returned a single
-  stub row in that case.
-- FIX: `_load_headers_for_page` is now sync (renamed to
-  `_load_headers_keys_for_page`, returning `(headers, keys)`; the old name
-  is kept as a compat wrapper). Nothing it does is async (module imports +
-  sync `get_sheet_spec` calls), so the v4.0.0 async declaration forced
-  `_normalize_headers_keys` to call it via `_run_sync(...)` from inside a
-  running event loop, spawning a worker thread per request.
-- FIX: `ENGINE_MODULE_CANDIDATES` no longer includes `core.investment_advisor`
-  (the orchestrator that delegates back to this engine — infinite-loop
-  potential) or `core.investment_advisor_engine` (self). `_resolve_engine_callable`
-  now also guards on the short form of `__name__`.
-- FIX: `_execute_engine` now passes `sheet` / `page` kwargs in addition to
-  `body` / `payload`, so when the resolved callable is a data-engine
-  `get_sheet_rows(sheet=..., body=...)`, the intended page actually reaches
-  it. v4.0.0's attempt chain only landed on `fn(body=criteria, mode=m)`,
-  which made `data_engine_v2.get_sheet_rows` receive `sheet=None` and return
-  `Market_Leaders` rows regardless of the requested page.
-- CLEANUP: `DERIVED_OR_NON_SOURCE_PAGES` no longer carries the forbidden
-  names `KSA_TADAWUL` / `Advisor_Criteria` (`page_catalog` rejects them).
-- CLEANUP: recommendation string literals replaced with imports from
-  `core.reco_normalize` for consistency with `core/investment_advisor.py`.
+The four fixes that landed in core/investment_advisor.py v5.1.1 did NOT
+propagate into the engine in v4.1.0 — the engine was still running the
+unsafe percent heuristic and fabricating recommendations / buckets for
+rows with no real data. v4.2.0 brings the engine into symmetry with the
+orchestrator AND adds the view-aware delegation to reco_normalize.
 
-Public API is preserved: `InvestmentAdvisorEngine`, the `advisor` /
-`investment_advisor` singletons, factory functions, sync wrappers, and the
-`_run_investment_advisor_impl` / `_run_advisor_impl` hooks all resolve under
-the same names.
+- FIX [HIGH]: `_score_recommendation` now delegates to
+  `core.reco_normalize.recommendation_from_views()` — the single
+  source of truth for view-aware 5-tier decisions added in
+  reco_normalize v7.0.0. The composite-threshold logic from v4.1.0
+  ignored the four View columns (Fundamental / Technical / Risk /
+  Value) so a bullish-but-EXPENSIVE row could still get BUY. The
+  view-aware logic vetoes that correctly. Backward compatibility:
+  signature unchanged, return shape (`(reco, reason, composite)`)
+  unchanged — `composite` is now derived from `overall_score` so
+  `_backfill_rows` callers that read it still work.
+
+- FIX [HIGH]: `_score_recommendation` no longer applies the unsafe
+  `if abs(roi) <= 1.5: roi *= 100` heuristic. It used a new
+  `_resolve_roi_for_scoring()` helper that prefers `*_pct` mirrors
+  (engine v5.47.4 emits both forms) and only converts fraction →
+  percent when magnitude clearly indicates a fraction (`abs <= 5`).
+  Prevents legitimate small percentages like DNB.OL -1.10% being
+  mangled to -110%. Same fix advisor v5.1.1 made.
+
+- FIX [HIGH]: `_backfill_rows` now respects the engine's
+  `_skip_recommendation_synthesis` sentinel and only synthesises a
+  recommendation when at least one scoring field has real data. v4.1.0
+  fabricated SELL recommendations for empty rows because every score
+  defaulted to `0.0` in `_to_float`. New helper:
+  `_row_has_scoring_signal()` — same as advisor v5.1.1.
+
+- FIX [HIGH]: `_risk_bucket_from_row` and `_confidence_bucket_from_row`
+  now return `""` (not "Moderate"/"Medium") when the underlying score
+  is missing. Phantom rows no longer get fabricated risk/confidence
+  buckets. Same fix advisor v5.1.1 made.
+
+- FIX [MEDIUM]: `_build_special_fallback` instrument path no longer
+  hard-codes `RECO_HOLD` for symbols with no upstream data.
+  Recommendation stays None and the row is clearly flagged as a
+  fallback in `warnings` / `selection_reason`. Matches advisor v5.1.1.
+
+- FIX [LOW]: defensively strips internal coordination fields
+  (`_skip_recommendation_synthesis`, `_internal_*`, `_meta_*`,
+  `_debug_*`, `unit_normalization_warnings`, `intrinsic_value_source`)
+  from rows in `_normalize_rows` and again at final emission. Engine
+  v5.47.4 strips them at source but this layer should defend itself
+  for legacy / proxy / cached rows.
+
+- FIX: `status="warn"` from upstream engine is now treated as
+  success-with-caveat, not error. Same handling advisor v5.1.1 added.
+
+- ALIGN: `_FIELD_ALIAS_HINTS` now matches advisor v5.1.1's extended
+  alias map (engine v5.47.4 mirrored aliases).
+
+v4.1.0 changes (PRESERVED)
+--------------------------
+- `_normalize_engine_result` is `async def` (was a SyntaxError in
+  v4.0.0 because it used `await` inside a `def`).
+- `_load_headers_keys_for_page` is sync (was async in v4.0.0,
+  causing per-request worker-thread spawns).
+- `ENGINE_MODULE_CANDIDATES` excludes both this module and the
+  orchestrator (no infinite-loop dispatch).
+- `_execute_engine` passes sheet/page kwargs to the resolved data-
+  engine callable.
+- Insights / Data_Dictionary / instrument fallbacks aligned to the
+  registry-canonical schemas (7 / 9 / 80 columns).
+- `DERIVED_OR_NON_SOURCE_PAGES` excludes forbidden names.
+- Recommendation string literals come from `core.reco_normalize`.
+
+Public API is preserved verbatim from v4.1.0: `InvestmentAdvisorEngine`,
+the `advisor` / `investment_advisor` singletons, factory functions, sync
+wrappers, and the `_run_investment_advisor_impl` /
+`_run_advisor_impl` hooks all resolve under the same names.
 ================================================================================
 """
 
@@ -111,7 +142,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-INVESTMENT_ADVISOR_ENGINE_VERSION = "4.1.0"
+INVESTMENT_ADVISOR_ENGINE_VERSION = "4.2.0"
 
 
 # =============================================================================
@@ -132,6 +163,32 @@ except ImportError:
     RECO_HOLD = "HOLD"
     RECO_REDUCE = "REDUCE"
     RECO_SELL = "SELL"
+
+
+# =============================================================================
+# View-aware recommendation delegate (v4.2.0)
+# =============================================================================
+#
+# Resolves `recommendation_from_views` once at module load. If
+# reco_normalize is unavailable or pre-v7.0.0 (lacking the view-aware
+# function), `_VIEW_AWARE_AVAILABLE` stays False and the engine falls
+# back to a composite-only score, but without the unsafe ROI heuristic.
+
+_VIEW_AWARE_AVAILABLE: bool = False
+_recommendation_from_views: Optional[Callable[..., Tuple[str, str]]] = None
+
+try:
+    from core.reco_normalize import recommendation_from_views as _rfv  # type: ignore
+    _recommendation_from_views = _rfv
+    _VIEW_AWARE_AVAILABLE = True
+except ImportError:
+    try:
+        from reco_normalize import recommendation_from_views as _rfv  # type: ignore
+        _recommendation_from_views = _rfv
+        _VIEW_AWARE_AVAILABLE = True
+    except ImportError:
+        _VIEW_AWARE_AVAILABLE = False
+        _recommendation_from_views = None
 
 
 # =============================================================================
@@ -280,10 +337,6 @@ TOP10_BUILDER_FN_CANDIDATES = (
 # =============================================================================
 # Canonical fallback schemas — aligned with core.sheets.schema_registry v2.2.0
 # =============================================================================
-#
-# Do NOT add non-canonical fields. The registry is the single source of truth;
-# these lists exist only to keep the engine functional when the registry
-# can't be imported.
 
 # Canonical 80 instrument columns
 _GENERIC_FALLBACK_KEYS: List[str] = [
@@ -360,6 +413,125 @@ _DICTIONARY_HEADERS: List[str] = [
 # Top_10_Investments extras (3) — registry appends these to the canonical 80
 _TOP10_EXTRA_KEYS: List[str] = ["top10_rank", "selection_reason", "criteria_snapshot"]
 _TOP10_EXTRA_HEADERS: List[str] = ["Top10 Rank", "Selection Reason", "Criteria Snapshot"]
+
+
+# =============================================================================
+# Field aliases (v4.2.0: aligned with advisor v5.1.1)
+# =============================================================================
+
+_FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
+    "symbol": ["ticker", "code", "requested_symbol", "symbol_normalized"],
+    "ticker": ["symbol", "code", "requested_symbol"],
+    "name": ["company_name", "long_name", "instrument_name", "security_name", "title", "shortName", "longName"],
+    "current_price": ["price", "last_price", "last", "close", "market_price", "nav", "regularMarketPrice", "lastPrice"],
+    "previous_close": ["prev_close", "prior_close", "regularMarketPreviousClose"],
+    "open_price": ["open", "regularMarketOpen"],
+    "day_high": ["high", "regularMarketDayHigh"],
+    "day_low": ["low", "regularMarketDayLow"],
+    "price_change": ["change", "net_change", "regularMarketChange"],
+    "percent_change": ["change_pct", "change_percent", "pct_change", "regularMarketChangePercent"],
+    "week_52_position_pct": ["position_52w_pct", "fifty_two_week_position_pct", "52w_position_pct"],
+    "week_52_high": ["fiftyTwoWeekHigh", "fifty_two_week_high", "year_high", "52w_high"],
+    "week_52_low": ["fiftyTwoWeekLow", "fifty_two_week_low", "year_low", "52w_low"],
+    "market_cap": ["marketCap", "market_capitalization"],
+    "float_shares": ["floatShares", "sharesFloat"],
+    "beta_5y": ["beta"],
+    "pe_ttm": ["trailingPE", "peRatio", "pe"],
+    "pe_forward": ["forwardPE", "forward_pe"],
+    "eps_ttm": ["trailingEps", "eps"],
+    "dividend_yield": ["dividendYield", "trailingAnnualDividendYield"],
+    "payout_ratio": ["payoutRatio"],
+    "revenue_ttm": ["totalRevenue"],
+    "revenue_growth_yoy": ["revenueGrowth"],
+    "gross_margin": ["grossMargins"],
+    "operating_margin": ["operatingMargins"],
+    "profit_margin": ["profitMargins", "netMargin"],
+    "debt_to_equity": ["debtToEquity"],
+    "free_cash_flow_ttm": ["freeCashflow", "fcf_ttm"],
+    "rsi_14": ["rsi", "rsi14"],
+    "volatility_30d": ["vol30d", "volatility30d"],
+    "volatility_90d": ["vol90d", "volatility90d"],
+    "max_drawdown_1y": ["maxDrawdown1y", "drawdown1y"],
+    "pb_ratio": ["pb", "priceToBook"],
+    "ps_ratio": ["ps", "priceToSalesTrailing12Months"],
+    "ev_ebitda": ["ev_to_ebitda", "evToEbitda", "enterpriseToEbitda"],
+    "peg_ratio": ["peg", "pegRatio"],
+    "intrinsic_value": ["fairValue", "fair_value", "dcf"],
+    "risk_score": ["risk", "riskscore"],
+    "valuation_score": ["valuation", "valuationscore"],
+    "overall_score": ["score", "overall", "totalscore", "compositeScore"],
+    "opportunity_score": ["opportunity", "opportunityscore", "convictionScore"],
+    "value_score": ["valueScore"],
+    "quality_score": ["qualityScore"],
+    "momentum_score": ["momentumScore"],
+    "growth_score": ["growthScore"],
+    "confidence_score": ["confidence", "confidence_pct", "ai_confidence", "modelConfidenceScore"],
+    "forecast_confidence": ["confidence", "ai_confidence", "modelConfidence"],
+    "expected_roi_1m": ["roi_1m", "expected_return_1m", "expected_roi_1m_pct"],
+    "expected_roi_3m": ["roi_3m", "expected_return_3m", "expected_roi_3m_pct"],
+    "expected_roi_12m": ["roi_12m", "expected_return_12m", "expected_roi_12m_pct"],
+    "forecast_price_1m": ["target_price_1m", "projected_price_1m"],
+    "forecast_price_3m": ["target_price_3m", "projected_price_3m", "targetMeanPrice"],
+    "forecast_price_12m": ["target_price_12m", "projected_price_12m", "targetMedianPrice"],
+    "recommendation": ["signal", "rating", "action", "reco"],
+    "recommendation_reason": ["rationale", "reasoning", "signal_reason", "reason", "thesis"],
+    "selection_reason": ["reason", "recommendation_reason", "reco_reason"],
+    "criteria_snapshot": ["criteria", "criteria_json", "snapshot"],
+    "data_provider": ["provider", "source_provider", "primary_provider", "provider_primary"],
+    "last_updated_utc": ["updated_at_utc", "last_updated", "timestamp_utc", "as_of_utc", "asOf"],
+    "last_updated_riyadh": ["updated_at_riyadh", "as_of_riyadh", "timestamp_riyadh"],
+    "warnings": ["warning", "messages", "errors", "issues"],
+    "volume_ratio": ["volumeRatio"],
+    "day_range_position": ["dayRangePosition"],
+    "upside_pct": ["upsidePct"],
+    # NEW in v4.2.0: views (so view-aware delegation can find them)
+    "fundamental_view": ["fundamentalView", "fund_view"],
+    "technical_view": ["technicalView", "tech_view"],
+    "risk_view": ["riskView"],
+    "value_view": ["valueView", "valuation_view"],
+}
+
+
+# =============================================================================
+# Internal field stripping (v4.2.0: ported from advisor v5.1.1)
+# =============================================================================
+
+_INTERNAL_FIELD_PREFIXES: Tuple[str, ...] = (
+    "_skip_", "_internal_", "_meta_", "_debug_", "_trace_",
+)
+_INTERNAL_FIELDS_PRESERVED_TEMPORARILY: set = {
+    "_skip_recommendation_synthesis",
+}
+_INTERNAL_FIELDS_TO_STRIP_HARD: set = {
+    "_placeholder",
+    "unit_normalization_warnings",
+    "intrinsic_value_source",
+}
+
+
+def _strip_internal_fields(row: Any, *, hard: bool = False) -> Any:
+    """Remove engine internal coordination flags from a row dict."""
+    if not isinstance(row, dict):
+        return row
+    keys_to_remove: List[str] = []
+    for k in list(row.keys()):
+        ks = str(k)
+        if ks in _INTERNAL_FIELDS_TO_STRIP_HARD:
+            keys_to_remove.append(k)
+            continue
+        if hard and ks in _INTERNAL_FIELDS_PRESERVED_TEMPORARILY:
+            keys_to_remove.append(k)
+            continue
+        if ks in _INTERNAL_FIELDS_PRESERVED_TEMPORARILY:
+            continue  # Keep for now; consumed by _backfill_rows
+        if any(ks.startswith(prefix) for prefix in _INTERNAL_FIELD_PREFIXES):
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        try:
+            del row[k]
+        except Exception:
+            pass
+    return row
 
 
 # =============================================================================
@@ -478,6 +650,25 @@ def _to_float(value: Any, default: float) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _to_float_optional(value: Any) -> Optional[float]:
+    """v4.2.0: Convert to float OR return None if not convertible.
+
+    Used by `_score_recommendation` and bucket helpers to distinguish
+    "missing" from "zero". Same semantics as advisor v5.1.1.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except Exception:
+        return None
 
 
 def _to_bool(value: Any, default: bool = False) -> bool:
@@ -609,7 +800,7 @@ def _slice_rows(rows: List[Dict[str, Any]], offset: int, limit: int) -> List[Dic
 
 
 def _row_value_for_aliases(row: Mapping[str, Any], aliases: Sequence[str]) -> Any:
-    """Get value from row using aliases."""
+    """Get value from row using aliases. v4.2.0: alias-table expansion added."""
     if not isinstance(row, Mapping):
         return None
 
@@ -625,7 +816,10 @@ def _row_value_for_aliases(row: Mapping[str, Any], aliases: Sequence[str]) -> An
         a = _to_string(alias)
         if not a:
             continue
-        for candidate in [a, a.lower(), _normalize_key(a), _normalize_key_loose(a)]:
+        candidates = [a, a.lower(), _normalize_key(a), _normalize_key_loose(a)]
+        # v4.2.0: also walk the alias-hint table for cross-vendor mirrors
+        candidates.extend(_FIELD_ALIAS_HINTS.get(_normalize_key(a), []))
+        for candidate in candidates:
             c = _to_string(candidate)
             if c and c not in seen:
                 seen.add(c)
@@ -820,7 +1014,6 @@ def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
     if spec is None:
         return headers, keys
 
-    # dataclass-style: spec.columns is Iterable[ColumnSpec]
     cols = getattr(spec, "columns", None)
     if cols is None and isinstance(spec, Mapping):
         cols = spec.get("columns") or spec.get("fields")
@@ -862,7 +1055,6 @@ def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
         if headers and keys and len(headers) == len(keys):
             return headers, keys
 
-    # Alternate shape: spec has explicit "headers" / "keys" lists
     if isinstance(spec, Mapping):
         raw_headers = spec.get("headers") or spec.get("display_headers")
         raw_keys = spec.get("keys") or spec.get("fields")
@@ -879,14 +1071,7 @@ def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
 
 
 def _load_headers_keys_for_page(page: str) -> Tuple[List[str], List[str]]:
-    """
-    Load `(headers, keys)` for a page from the schema registry.
-
-    Sync on purpose — this only does module imports and sync attribute
-    lookups. The v4.0.0 version was `async` and got called via
-    `_run_sync(...)` from inside an already-running event loop, which spawned
-    a worker thread on every request.
-    """
+    """Load `(headers, keys)` for a page from the schema registry. Sync."""
     normalized = _normalize_page_name(page) or DEFAULT_PAGE
 
     for module_name in SCHEMA_MODULE_CANDIDATES:
@@ -913,13 +1098,11 @@ def _load_headers_keys_for_page(page: str) -> Tuple[List[str], List[str]]:
                 except Exception:
                     continue
                 if inspect.isawaitable(result):
-                    # Registry is sync; skip any awaitable result.
                     continue
                 headers, keys = _extract_headers_keys_from_spec(result)
                 if headers and keys and len(headers) == len(keys):
                     return list(headers), list(keys)
 
-    # Canonical fallbacks (registry-aligned)
     if normalized == INSIGHTS_PAGE_NAME:
         return list(_INSIGHTS_HEADERS), list(_INSIGHTS_KEYS)
     if normalized == DATA_DICTIONARY_PAGE_NAME:
@@ -939,7 +1122,7 @@ def _load_headers_for_page(page: str) -> List[str]:
 
 
 def _headers_to_keys(headers: List[str]) -> List[str]:
-    """Derive keys from headers. Used only when paired keys aren't available."""
+    """Derive keys from headers."""
     keys: List[str] = []
     seen: set = set()
     for idx, header in enumerate(headers):
@@ -1007,7 +1190,6 @@ def _normalize_payload(
     """Normalize request payload."""
     result = _merge_payloads(payload, body, kwargs)
 
-    # Extract request ID
     try:
         request_state = getattr(request, "state", None)
         request_id = _to_string(getattr(request_state, "request_id", ""))
@@ -1016,7 +1198,6 @@ def _normalize_payload(
     except Exception:
         pass
 
-    # Normalize page
     page = (
         result.get("page")
         or result.get("sheet")
@@ -1030,7 +1211,6 @@ def _normalize_payload(
     result["sheet"] = normalized_page
     result["sheet_name"] = normalized_page
 
-    # Normalize symbols
     symbol_values = (
         result.get("symbols")
         or result.get("tickers")
@@ -1043,7 +1223,6 @@ def _normalize_payload(
         result["symbols"] = symbols
         result["tickers"] = list(symbols)
 
-    # Normalize source pages
     selected_pages = _normalize_list(
         result.get("source_pages")
         or result.get("pages_selected")
@@ -1056,7 +1235,6 @@ def _normalize_payload(
             p for p in result["pages_selected"] if p in BASE_SOURCE_PAGES
         ]
 
-    # Normalize mode
     effective_mode = _normalize_mode(
         mode
         or result.get("advisor_data_mode")
@@ -1070,7 +1248,6 @@ def _normalize_payload(
     result["data_mode"] = effective_mode
     result["advisor_data_mode"] = effective_mode
 
-    # Normalize limit and offset
     limit = _to_int(result.get("limit") or result.get("top_n") or DEFAULT_LIMIT, DEFAULT_LIMIT)
     limit = max(_CONFIG.min_limit, min(limit, _CONFIG.max_limit))
     offset = _to_int(result.get("offset") or DEFAULT_OFFSET, DEFAULT_OFFSET)
@@ -1080,7 +1257,6 @@ def _normalize_payload(
     result["top_n"] = limit
     result["offset"] = offset
 
-    # Flags
     result["include_matrix"] = _to_bool(result.get("include_matrix"), True)
     result["include_headers"] = _to_bool(result.get("include_headers"), True)
     result.setdefault("format", "rows")
@@ -1124,24 +1300,15 @@ async def _call_tolerant(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> A
     request = kwargs.get("request")
     payload = kwargs.get("payload")
 
-    # Ordered set of attempts. Data-engine style (sheet/page positional) is
-    # tried before advisor-style (body/payload kwargs), because when the
-    # resolved callable is `data_engine_v2.get_sheet_rows(sheet, ...)`
-    # the advisor-style call path would hit `fn(body=criteria, mode=m)`
-    # with `sheet=None` and return the default page.
     attempts: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
-        # Caller-provided explicit shape
         (args, kwargs),
         ((), kwargs),
-        # Data-engine style: sheet/page as kwarg, body carries criteria
         ((), {"sheet": page, "body": body, "limit": limit, "offset": offset, "mode": mode}),
         ((), {"page": page, "body": body, "limit": limit, "offset": offset, "mode": mode}),
         ((), {"sheet_name": page, "body": body, "limit": limit, "mode": mode}),
-        # Data-engine style: positional sheet
         ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
         ((page,), {"body": body}),
         ((page,), {}),
-        # Advisor style
         ((), {"request": request, "payload": payload, "body": body, "mode": mode}),
         ((), {"payload": payload, "mode": mode}),
         ((), {"body": body, "mode": mode}),
@@ -1230,7 +1397,6 @@ async def _resolve_engine_callable(
     except Exception:
         state = None
 
-    # Check app state first
     if state is not None:
         for name in ENGINE_FUNCTION_CANDIDATES:
             fn = getattr(state, name, None)
@@ -1248,7 +1414,6 @@ async def _resolve_engine_callable(
                     "kind": "object_method",
                 }
 
-    # Check modules. Skip our own module under both full and short import names.
     self_names = {__name__, __name__.split(".")[-1]}
     for module_name in ENGINE_MODULE_CANDIDATES:
         if module_name in self_names:
@@ -1294,13 +1459,11 @@ async def _execute_engine(
     try:
         result = await _call_tolerant(
             fn,
-            # Data-engine-friendly kwargs come first
             sheet=page,
             page=page,
             sheet_name=page,
             limit=criteria.get("limit", DEFAULT_LIMIT),
             offset=criteria.get("offset", DEFAULT_OFFSET),
-            # Advisor-friendly kwargs
             request=request,
             payload=criteria,
             body=criteria,
@@ -1442,10 +1605,14 @@ def _matrix_rows_to_dicts(matrix: Any, keys: Sequence[str]) -> List[Dict[str, An
 
 
 def _normalize_rows(result: Mapping[str, Any], keys: List[str]) -> List[Dict[str, Any]]:
-    """Normalize rows from result."""
+    """Normalize rows from result.
+
+    v4.2.0: defensively strips hard-internal fields from each row at
+    the extraction stage (preserving the `_skip_recommendation_synthesis`
+    sentinel which is consumed by `_backfill_rows`).
+    """
     rows: List[Dict[str, Any]] = []
 
-    # Check common container keys
     for key in ("row_objects", "rowObjects", "rows", "items", "records", "data", "quotes"):
         value = result.get(key)
         if isinstance(value, list) and value:
@@ -1453,24 +1620,27 @@ def _normalize_rows(result: Mapping[str, Any], keys: List[str]) -> List[Dict[str
                 rows = [dict(v) for v in value if isinstance(v, Mapping)]
                 break
             if isinstance(value[0], (list, tuple)):
-                return _matrix_rows_to_dicts(value, keys)
+                rows = _matrix_rows_to_dicts(value, keys)
+                break
 
-    if rows:
-        return rows
+    if not rows:
+        for key in ("rows_matrix", "matrix"):
+            value = result.get(key)
+            if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
+                rows = _matrix_rows_to_dicts(value, keys)
+                break
 
-    # Check matrix
-    for key in ("rows_matrix", "matrix"):
-        value = result.get(key)
-        if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
-            return _matrix_rows_to_dicts(value, keys)
+    if not rows:
+        nested = _pick_first_mapping(result, "payload", "result", "response")
+        if nested:
+            nested_headers, nested_keys = _extract_payload_contract(dict(nested))
+            rows = _normalize_rows(dict(nested), nested_keys or nested_headers or keys)
 
-    # Check nested
-    nested = _pick_first_mapping(result, "payload", "result", "response")
-    if nested:
-        nested_headers, nested_keys = _extract_payload_contract(dict(nested))
-        return _normalize_rows(dict(nested), nested_keys or nested_headers or keys)
+    # v4.2.0: strip hard-internals from each row before downstream helpers see them
+    for row in rows:
+        _strip_internal_fields(row, hard=False)
 
-    return []
+    return rows
 
 
 def _normalize_headers_keys(
@@ -1499,7 +1669,6 @@ def _normalize_headers_keys(
     if headers and not keys:
         keys = _headers_to_keys(headers)
 
-    # Pull the canonical (headers, keys) pair from schema_registry (sync).
     schema_headers, schema_keys = _load_headers_keys_for_page(page)
 
     if page in {TOP10_PAGE_NAME, INSIGHTS_PAGE_NAME, DATA_DICTIONARY_PAGE_NAME}:
@@ -1509,7 +1678,6 @@ def _normalize_headers_keys(
         headers = list(schema_headers)
         keys = list(schema_keys)
 
-    # Safety net for Top_10: ensure the 3 required extras are trailing.
     if page == TOP10_PAGE_NAME:
         for extra_h, extra_k in zip(_TOP10_EXTRA_HEADERS, _TOP10_EXTRA_KEYS):
             if extra_k not in keys:
@@ -1520,51 +1688,184 @@ def _normalize_headers_keys(
     return headers, display_headers, keys
 
 
+# =============================================================================
+# Recommendation Scoring (v4.2.0: view-aware + safe ROI handling)
+# =============================================================================
+#
+# v4.2.0 changes from v4.1.0:
+# - delegates to reco_normalize.recommendation_from_views() when available
+#   (matches scoring.py v5.0.0 / advisor v5.1.1 behaviour)
+# - replaces the unsafe `if abs(roi) <= 1.5: roi *= 100` heuristic with
+#   `_resolve_roi_for_scoring()` (same as advisor v5.1.1)
+# - return shape preserved: `(reco, reason, composite)` so callers in
+#   `_backfill_rows` that read `composite` to fill `overall_score` still work.
+
+# Fields whose presence indicates the engine had real scoring signal.
+# If NONE of these are populated for a row, we don't synthesise a recommendation.
+_SCORING_SIGNAL_FIELDS: Tuple[str, ...] = (
+    "overall_score", "opportunity_score", "value_score", "quality_score",
+    "momentum_score", "growth_score", "valuation_score",
+    "expected_roi_3m", "expected_roi_1m", "expected_roi_12m",
+    "forecast_confidence", "confidence_score",
+)
+
+
+def _row_has_scoring_signal(row: Mapping[str, Any]) -> bool:
+    """v4.2.0: True if at least one scoring field has a real (non-None) value."""
+    for f in _SCORING_SIGNAL_FIELDS:
+        if _to_float_optional(row.get(f)) is not None:
+            return True
+    for f in _SCORING_SIGNAL_FIELDS:
+        v = _row_value_for_aliases(row, _FIELD_ALIAS_HINTS.get(f, []))
+        if _to_float_optional(v) is not None:
+            return True
+    return False
+
+
+def _resolve_roi_for_scoring(row: Mapping[str, Any], horizon: str = "3m") -> Optional[float]:
+    """v4.2.0: Resolve expected ROI in PERCENT for use in the composite score.
+
+    Strategy (replaces v4.1.0's unsafe `if abs(roi) <= 1.5: roi *= 100`):
+    1. Prefer `expected_roi_<horizon>_pct` (engine v5.47.4 emits both as
+       fraction and as `_pct`); this is unambiguous percent.
+    2. Fall back to canonical `expected_roi_<horizon>` (engine schema
+       defines this as a fraction, e.g. 0.05 = 5%); convert by *100 only
+       when magnitude clearly indicates a fraction (abs <= 5).
+    3. Return None if neither is present.
+    """
+    pct_keys = (f"expected_roi_{horizon}_pct", f"roi_{horizon}_pct")
+    for k in pct_keys:
+        v = _to_float_optional(row.get(k))
+        if v is not None:
+            return v
+
+    frac_keys = (f"expected_roi_{horizon}", f"roi_{horizon}", f"expected_return_{horizon}")
+    for k in frac_keys:
+        v = _to_float_optional(row.get(k))
+        if v is not None:
+            return v if abs(v) > 5.0 else (v * 100.0)
+    return None
+
+
+def _composite_to_recommendation(composite: float) -> Tuple[str, str]:
+    """v4.2.0: only used as fallback when reco_normalize is unavailable.
+
+    Same threshold buckets as v4.1.0 — composite-based, NOT view-aware.
+    Kept symmetric with advisor v5.1.1 fallback path.
+    """
+    if composite >= 70:
+        return RECO_STRONG_BUY, "High score / attractive upside"
+    if composite >= 55:
+        return RECO_BUY, "Favorable score / acceptable risk"
+    if composite >= 45:
+        return RECO_HOLD, "Balanced score / wait for confirmation"
+    if composite >= 30:
+        return RECO_REDUCE, "Weak score / elevated risk"
+    return RECO_SELL, "Low score / unfavorable risk-reward"
+
+
 def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
-    """Score and generate a fallback recommendation."""
+    """Score and generate a recommendation for a row.
+
+    v4.2.0: when the view-aware delegate
+    (`reco_normalize.recommendation_from_views`) is available, this
+    function uses the four View columns (Fundamental, Technical, Risk,
+    Value) plus the Overall Score to produce a 5-tier recommendation
+    with the same priority cascade scoring.py v5.0.0 uses. EXPENSIVE
+    valuations are vetoed from BUY, double-bearish forces SELL, etc.
+
+    When the view-aware delegate is NOT available (older
+    reco_normalize), falls back to the v4.1.0-style composite-threshold
+    logic but using `_resolve_roi_for_scoring` (no unsafe heuristic).
+
+    Return shape unchanged from v4.1.0: `(reco, reason, composite)`.
+    `composite` is exposed so `_backfill_rows` can fill `overall_score`
+    when missing.
+    """
     opportunity = _to_float(
         row.get("opportunity_score") or row.get("overall_score") or row.get("score"),
         0.0,
     )
     overall = _to_float(row.get("overall_score"), opportunity)
     risk = _to_float(row.get("risk_score"), 50.0)
-    expected_raw = _to_float(
-        row.get("expected_roi_3m")
-        or row.get("expected_roi_1m")
-        or row.get("expected_roi")
-        or row.get("forecast_return_pct"),
-        0.0,
-    )
 
-    # Convert fraction to percentage points if the value looks like a fraction
-    expected = (
-        expected_raw * 100.0
-        if abs(expected_raw) <= 1.5 and expected_raw != 0.0
-        else expected_raw
-    )
+    expected = _resolve_roi_for_scoring(row, horizon="3m")
+    if expected is None:
+        expected = _resolve_roi_for_scoring(row, horizon="1m")
+    if expected is None:
+        legacy = _to_float_optional(row.get("expected_roi") or row.get("forecast_return_pct"))
+        expected = legacy if (legacy is None or abs(legacy) > 5.0) else (legacy * 100.0)
+        if expected is None:
+            expected = 0.0
 
+    # Composite stays exposed for back-compat with `_backfill_rows`
     composite = overall + (0.35 * opportunity) + (0.20 * expected) - (0.25 * risk)
 
-    if composite >= 70:
-        return RECO_STRONG_BUY, "High score / attractive upside", composite
-    if composite >= 55:
-        return RECO_BUY, "Favorable score / acceptable risk", composite
-    if composite >= 45:
-        return RECO_HOLD, "Balanced score / wait for confirmation", composite
-    if composite >= 30:
-        return RECO_REDUCE, "Weak score / elevated risk", composite
-    return RECO_SELL, "Low score / unfavorable risk-reward", composite
+    # v4.2.0: prefer view-aware delegation
+    if _VIEW_AWARE_AVAILABLE and _recommendation_from_views is not None:
+        # Read views from row (canonical names + aliases)
+        f_view = _to_string(
+            row.get("fundamental_view")
+            or _row_value_for_aliases(row, _FIELD_ALIAS_HINTS.get("fundamental_view", []))
+        )
+        t_view = _to_string(
+            row.get("technical_view")
+            or _row_value_for_aliases(row, _FIELD_ALIAS_HINTS.get("technical_view", []))
+        )
+        r_view = _to_string(
+            row.get("risk_view")
+            or row.get("risk_bucket")
+            or _row_value_for_aliases(row, _FIELD_ALIAS_HINTS.get("risk_view", []))
+        )
+        v_view = _to_string(
+            row.get("value_view")
+            or _row_value_for_aliases(row, _FIELD_ALIAS_HINTS.get("value_view", []))
+        )
+
+        # Get overall score for view-aware decision
+        score_for_views = _to_float_optional(row.get("overall_score"))
+        if score_for_views is None:
+            # Fall back to composite as the "overall" signal so the
+            # view-aware logic still has score context.
+            score_for_views = composite
+
+        # Only delegate if we have at least one view OR a score; otherwise
+        # `recommendation_from_views` returns HOLD with "Insufficient data"
+        # which is what we want anyway.
+        try:
+            reco, reason = _recommendation_from_views(
+                fundamental=f_view or None,
+                technical=t_view or None,
+                risk=r_view or None,
+                value=v_view or None,
+                score=score_for_views,
+            )
+            return reco, reason, composite
+        except Exception as exc:
+            logger.debug(
+                "view-aware recommendation_from_views failed (%s); "
+                "falling back to composite threshold.", exc,
+            )
+
+    # Fallback path: composite-only (no view veto) — same as v4.1.0 thresholds
+    reco, reason = _composite_to_recommendation(composite)
+    return reco, reason, composite
 
 
 def _risk_bucket_from_row(row: MutableMapping[str, Any]) -> str:
-    """Get risk bucket from row."""
+    """Get risk bucket from row.
+
+    v4.2.0: returns "" (not "Moderate") when risk_score is missing.
+    Same fix advisor v5.1.1 made — phantom rows no longer get
+    fabricated buckets.
+    """
     existing = _to_string(row.get("risk_bucket"))
     if existing:
         return existing
 
-    risk = _to_float(row.get("risk_score"), float("nan"))
-    if math.isnan(risk):
-        return "Moderate"
+    risk = _to_float_optional(row.get("risk_score"))
+    if risk is None:
+        return ""
     if risk < 35:
         return "Low"
     if risk < 65:
@@ -1573,14 +1874,21 @@ def _risk_bucket_from_row(row: MutableMapping[str, Any]) -> str:
 
 
 def _confidence_bucket_from_row(row: MutableMapping[str, Any]) -> str:
-    """Get confidence bucket from row."""
+    """Get confidence bucket from row.
+
+    v4.2.0: returns "" (not "Medium") when no underlying score exists.
+    Same fix advisor v5.1.1 made.
+    """
     existing = _to_string(row.get("confidence_bucket"))
     if existing:
         return existing
 
-    score = _to_float(row.get("overall_score") or row.get("opportunity_score"), float("nan"))
-    if math.isnan(score):
-        return "Medium"
+    score = _to_float_optional(
+        row.get("confidence_score") or row.get("forecast_confidence")
+        or row.get("overall_score") or row.get("opportunity_score")
+    )
+    if score is None:
+        return ""
     if score >= 75:
         return "High"
     if score >= 50:
@@ -1606,7 +1914,16 @@ def _backfill_rows(
     page: str,
     criteria: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """Backfill missing fields in rows."""
+    """Backfill missing fields in rows.
+
+    v4.2.0 changes:
+    - Respects `_skip_recommendation_synthesis` sentinel from engine v5.47.4
+    - Only synthesises a recommendation if at least one scoring field has
+      real data (no more SELL recommendations from all-zero defaults)
+    - Only fills risk/confidence buckets if the underlying score exists
+    - Calls `_score_recommendation` which is now view-aware (delegates to
+      `reco_normalize.recommendation_from_views()`)
+    """
     page = _normalize_page_name(page) or DEFAULT_PAGE
 
     if page == INSIGHTS_PAGE_NAME:
@@ -1615,16 +1932,28 @@ def _backfill_rows(
         return rows
 
     for row in rows:
+        # v4.2.0: respect engine's "this row has no data, don't synthesize" flag
+        skip_sentinel = _to_bool(row.get("_skip_recommendation_synthesis"), False)
+
         reco = _to_string(row.get("recommendation"))
-        if not reco:
-            reco, reason, composite = _score_recommendation(row)
-            row["recommendation"] = reco
-            row.setdefault("selection_reason", reason)
+        if not reco and not skip_sentinel and _row_has_scoring_signal(row):
+            reco_val, reason, composite = _score_recommendation(row)
+            row["recommendation"] = reco_val
+            if not _to_string(row.get("selection_reason")):
+                row["selection_reason"] = reason
             if _is_blank(row.get("overall_score")) and not _is_blank(composite):
                 row["overall_score"] = round(composite, 2)
 
-        row.setdefault("risk_bucket", _risk_bucket_from_row(row))
-        row.setdefault("confidence_bucket", _confidence_bucket_from_row(row))
+        # v4.2.0: only fill buckets if we can compute them (don't fabricate)
+        risk_bucket = _risk_bucket_from_row(row)
+        if risk_bucket and _is_blank(row.get("risk_bucket")):
+            row["risk_bucket"] = risk_bucket
+        conf_bucket = _confidence_bucket_from_row(row)
+        if conf_bucket and _is_blank(row.get("confidence_bucket")):
+            row["confidence_bucket"] = conf_bucket
+
+        # v4.2.0: hard-strip the sentinel after consuming it
+        _strip_internal_fields(row, hard=True)
 
     if page == TOP10_PAGE_NAME:
         _ensure_top10_fields(rows, criteria)
@@ -1659,14 +1988,7 @@ def _ensure_rows_cover_keys(
 
 
 def _build_data_dictionary_rows(criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Build data dictionary rows.
-
-    Priority:
-    1. core.sheets.data_dictionary.build_data_dictionary_rows() if present
-    2. Iterate core.sheets.schema_registry.SCHEMA_REGISTRY directly
-    3. Minimal single-row stub (last resort)
-    """
+    """Build data dictionary rows."""
     # 1) Project-specific builder
     try:
         mod = importlib.import_module("core.sheets.data_dictionary")
@@ -1691,7 +2013,7 @@ def _build_data_dictionary_rows(criteria: Dict[str, Any]) -> List[Dict[str, Any]
     except Exception:  # pragma: no cover
         pass
 
-    # 2) Derive directly from schema_registry (authoritative)
+    # 2) Derive directly from schema_registry
     try:
         mod = importlib.import_module("core.sheets.schema_registry")
         registry = getattr(mod, "SCHEMA_REGISTRY", None)
@@ -1754,7 +2076,13 @@ def _build_data_dictionary_rows(criteria: Dict[str, Any]) -> List[Dict[str, Any]
 
 
 def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, Any]:
-    """Build fallback response for special pages (registry-aligned)."""
+    """Build fallback response for special pages.
+
+    v4.2.0: instrument fallback no longer hard-codes RECO_HOLD for
+    symbols with no upstream data. Recommendation stays None and the
+    row is clearly marked as a fallback in `warnings` /
+    `selection_reason`. Matches advisor v5.1.1.
+    """
     page = _normalize_page_name(page) or DEFAULT_PAGE
 
     if page == INSIGHTS_PAGE_NAME:
@@ -1777,6 +2105,15 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
                 "metric": "symbols_count",
                 "value": len(symbols) if isinstance(symbols, list) else 0,
                 "notes": "Symbol count from request payload",
+                "last_updated_riyadh": now_riyadh,
+            },
+            {
+                "section": "Status",
+                "item": "Engine availability",
+                "symbol": None,
+                "metric": "warning",
+                "value": "no_live_data",
+                "notes": "Engine returned no usable rows; this is a fallback summary",
                 "last_updated_riyadh": now_riyadh,
             },
         ]
@@ -1829,18 +2166,23 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
     rows: List[Dict[str, Any]] = []
     symbols = _normalize_list(criteria.get("symbols") or criteria.get("tickers"))
 
+    fallback_warning = "Fallback row — engine returned no live data for this symbol"
+
     for idx, symbol in enumerate(symbols[: criteria.get("top_n", DEFAULT_LIMIT)], start=1):
         row = {k: None for k in keys}
         if "symbol" in row:
             row["symbol"] = symbol
         if "name" in row:
             row["name"] = symbol
-        if "recommendation" in row:
-            row["recommendation"] = RECO_HOLD
+        # v4.2.0: do NOT default recommendation to RECO_HOLD. Leave None.
+        if "data_provider" in row:
+            row["data_provider"] = "advisor_engine_fallback_no_live_data"
+        if "warnings" in row:
+            row["warnings"] = fallback_warning
         if "top10_rank" in row:
             row["top10_rank"] = idx
         if "selection_reason" in row:
-            row["selection_reason"] = "Fallback candidate from supplied symbols"
+            row["selection_reason"] = "Fallback candidate from supplied symbols (no live advisor data)"
         if "criteria_snapshot" in row:
             row["criteria_snapshot"] = _json_compact(criteria)
         rows.append(row)
@@ -1874,13 +2216,13 @@ async def _normalize_engine_result(
     criteria: Dict[str, Any],
     resolver_meta: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Normalize engine result.
+    """Normalize engine result.
 
     async on purpose — it may `await` the Top10 builder when the engine
-    returns empty rows for Top_10_Investments. v4.0.0 declared this `def`
-    but used `await` inside, which is a hard SyntaxError that prevented
-    the module from being imported at all.
+    returns empty rows for Top_10_Investments.
+
+    v4.2.0: hard-strips internal fields from every row before final
+    emission, treats engine "warn" status as success-with-caveat.
     """
     page = _normalize_page_name(criteria.get("page")) or DEFAULT_PAGE
 
@@ -1896,7 +2238,6 @@ async def _normalize_engine_result(
         nested_meta = dict(raw_meta)
 
     if not rows and page in {TOP10_PAGE_NAME, INSIGHTS_PAGE_NAME, DATA_DICTIONARY_PAGE_NAME}:
-        # Try Top10 builder for Top10 page
         if page == TOP10_PAGE_NAME:
             top10_result = await _build_top10_rows_impl(criteria)
             if top10_result and top10_result.get("rows"):
@@ -1914,16 +2255,28 @@ async def _normalize_engine_result(
     rows = _backfill_rows(rows, page, criteria)
     rows = _ensure_rows_cover_keys(rows, keys, headers)
 
+    # v4.2.0: hard-strip internals one more time after backfill (defence in depth)
+    for row in rows:
+        _strip_internal_fields(row, hard=True)
+
     total_rows_before_slice = len(rows)
     offset = criteria.get("offset", DEFAULT_OFFSET)
     limit = criteria.get("limit", DEFAULT_LIMIT)
     rows = _slice_rows(rows, offset, limit)
 
+    # v4.2.0: handle engine status more carefully (matches advisor v5.1.1)
+    raw_status = _to_string(result.get("status")).lower()
+    if raw_status == "warn":
+        out_status = AdvisorStatus.WARN.value if rows else AdvisorStatus.ERROR.value
+    elif raw_status in {"error", "failed", "fail"} and not rows:
+        out_status = AdvisorStatus.ERROR.value
+    elif raw_status:
+        out_status = raw_status
+    else:
+        out_status = AdvisorStatus.SUCCESS.value if rows else AdvisorStatus.WARN.value
+
     out: Dict[str, Any] = {
-        "status": (
-            _to_string(result.get("status"))
-            or (AdvisorStatus.SUCCESS.value if rows else AdvisorStatus.WARN.value)
-        ),
+        "status": out_status,
         "page": page,
         "sheet": page,
         "sheet_name": page,
@@ -1946,11 +2299,14 @@ async def _normalize_engine_result(
             "page": page,
             "advisor_data_mode_effective": criteria.get("advisor_data_mode"),
             "normalized_by": "core.investment_advisor_engine",
+            "engine_version": INVESTMENT_ADVISOR_ENGINE_VERSION,
+            "view_aware": _VIEW_AWARE_AVAILABLE,
             "timestamp_utc": _now_utc_iso(),
             "offset": max(0, _to_int(offset, DEFAULT_OFFSET)),
             "limit": max(1, _to_int(limit, DEFAULT_LIMIT)),
             "rows_before_local_slice": total_rows_before_slice,
             "rows_after_local_slice": len(rows),
+            "engine_status": raw_status or None,
         },
     }
 
@@ -1994,7 +2350,6 @@ async def _run_investment_advisor_async(*args: Any, **kwargs: Any) -> Dict[str, 
         ),
     )
 
-    # Check snapshot cache
     if effective_mode == AdvisorMode.SNAPSHOT.value and _CONFIG.enable_snapshot_cache:
         cached = _snapshot_get(page, effective_mode, criteria=criteria, ttl_sec=ttl_sec)
         if cached:
@@ -2010,11 +2365,9 @@ async def _run_investment_advisor_async(*args: Any, **kwargs: Any) -> Dict[str, 
             cached["status"] = _to_string(cached.get("status")) or AdvisorStatus.SUCCESS.value
             return _json_safe(cached)
 
-    # Execute engine
     engine_result, resolver_meta = await _execute_engine(request, criteria)
     normalized = await _normalize_engine_result(engine_result, criteria, resolver_meta)
 
-    # Update snapshot cache
     if _CONFIG.enable_snapshot_cache and normalized.get("rows"):
         _snapshot_put(page, effective_mode, criteria, normalized)
         if effective_mode != AdvisorMode.SNAPSHOT.value:
@@ -2033,43 +2386,33 @@ class InvestmentAdvisorEngine:
     version = INVESTMENT_ADVISOR_ENGINE_VERSION
 
     def __call__(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Callable interface."""
         return self.run_investment_advisor(*args, **kwargs)
 
     def run_investment_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Run investment advisor synchronously."""
         return _run_sync(_run_investment_advisor_async(*args, **kwargs))
 
     def run_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Alias for run_investment_advisor."""
         return self.run_investment_advisor(*args, **kwargs)
 
     def execute_investment_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Alias for run_investment_advisor."""
         return self.run_investment_advisor(*args, **kwargs)
 
     def execute_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Alias for run_investment_advisor."""
         return self.run_investment_advisor(*args, **kwargs)
 
     def recommend(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Alias for run_investment_advisor."""
         return self.run_investment_advisor(*args, **kwargs)
 
     def recommend_investments(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Alias for run_investment_advisor."""
         return self.run_investment_advisor(*args, **kwargs)
 
     def get_recommendations(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Alias for run_investment_advisor."""
         return self.run_investment_advisor(*args, **kwargs)
 
     def build_recommendations(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Alias for run_investment_advisor."""
         return self.run_investment_advisor(*args, **kwargs)
 
     def warm_cache(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Warm the cache."""
         payload = _normalize_payload(
             payload=kwargs.get("payload") or kwargs.get("body") or kwargs,
             mode=kwargs.get("mode"),
@@ -2089,7 +2432,6 @@ class InvestmentAdvisorEngine:
         }
 
     def warm_snapshots(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Warm snapshots for pages."""
         payload = _normalize_payload(
             payload=kwargs.get("payload") or kwargs.get("body") or kwargs,
             mode=AdvisorMode.SNAPSHOT.value,
@@ -2126,11 +2468,9 @@ class InvestmentAdvisorEngine:
         }
 
     def preload_snapshots(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Alias for warm_snapshots."""
         return self.warm_snapshots(*args, **kwargs)
 
     def build_snapshot_cache(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """Alias for warm_snapshots."""
         return self.warm_snapshots(*args, **kwargs)
 
 
@@ -2149,32 +2489,26 @@ investment_advisor_runner = _SINGLETON
 
 
 def create_investment_advisor(*args: Any, **kwargs: Any) -> InvestmentAdvisorEngine:
-    """Create investment advisor instance."""
     return _SINGLETON
 
 
 def get_investment_advisor(*args: Any, **kwargs: Any) -> InvestmentAdvisorEngine:
-    """Get investment advisor instance."""
     return _SINGLETON
 
 
 def build_investment_advisor(*args: Any, **kwargs: Any) -> InvestmentAdvisorEngine:
-    """Build investment advisor instance."""
     return _SINGLETON
 
 
 def create_advisor(*args: Any, **kwargs: Any) -> InvestmentAdvisorEngine:
-    """Create advisor instance."""
     return _SINGLETON
 
 
 def get_advisor(*args: Any, **kwargs: Any) -> InvestmentAdvisorEngine:
-    """Get advisor instance."""
     return _SINGLETON
 
 
 def build_advisor(*args: Any, **kwargs: Any) -> InvestmentAdvisorEngine:
-    """Build advisor instance."""
     return _SINGLETON
 
 
@@ -2183,52 +2517,42 @@ def build_advisor(*args: Any, **kwargs: Any) -> InvestmentAdvisorEngine:
 # =============================================================================
 
 async def _run_investment_advisor_impl(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Async implementation wrapper."""
     return await _run_investment_advisor_async(*args, **kwargs)
 
 
 async def _run_advisor_impl(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Async implementation wrapper."""
     return await _run_investment_advisor_async(*args, **kwargs)
 
 
 def run_investment_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Run investment advisor synchronously."""
     return _SINGLETON.run_investment_advisor(*args, **kwargs)
 
 
 def run_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Run advisor synchronously."""
     return _SINGLETON.run_advisor(*args, **kwargs)
 
 
 def execute_investment_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Execute investment advisor synchronously."""
     return _SINGLETON.execute_investment_advisor(*args, **kwargs)
 
 
 def execute_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Execute advisor synchronously."""
     return _SINGLETON.execute_advisor(*args, **kwargs)
 
 
 def recommend(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Get recommendations synchronously."""
     return _SINGLETON.recommend(*args, **kwargs)
 
 
 def recommend_investments(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Get investment recommendations synchronously."""
     return _SINGLETON.recommend_investments(*args, **kwargs)
 
 
 def get_recommendations(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Get recommendations synchronously."""
     return _SINGLETON.get_recommendations(*args, **kwargs)
 
 
 def build_recommendations(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Build recommendations synchronously."""
     return _SINGLETON.build_recommendations(*args, **kwargs)
 
 
