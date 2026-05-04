@@ -2,76 +2,64 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.0.0
-(VIEW-AWARE / 5-TIER RECOMMENDATIONS / PHANTOM-ROW-SAFE / SCHEMA-ALIGNED)
+Scoring Module — v5.1.0
+(VIEW-AWARE / 5-TIER + CONVICTION FLOORS / INSIGHTS-INTEGRATED /
+ PHANTOM-ROW-SAFE / SCHEMA-ALIGNED)
 ================================================================================
 
-v5.0.0 changes (BREAKING in spirit, NOT in API)
------------------------------------------------
-The recommendation logic from v4.1.x was producing a near-2-state output
-(ACCUMULATE / HOLD only) because:
-  1. `compute_recommendation` thresholded on Overall Score alone — once
-     overall >= 65, it returned HOLD without inspecting the fundamental,
-     technical, risk, or value views.
-  2. The four "View" columns (Fundamental / Technical / Risk / Value)
-     existed in the output sheet but were never inputs to the decision —
-     they were derived AFTER the recommendation, then displayed.
-  3. EXPENSIVE valuations could still get BUY/ACCUMULATE recommendations
-     (no veto rule).
-  4. BEARISH technicals were ignored as long as Overall was high enough.
-  5. Phantom rows (XETRA tickers with no underlying data) still received
-     a 50-65 quality score from `data_quality_proxy`, which let them
-     reach the HOLD/BUY threshold.
-  6. The v4.1.4 "blue-chip guard" was actively SUPPRESSING legitimate
-     SELL/REDUCE signals when forward data was missing — making the
-     2-state collapse worse for high-quality rows.
+v5.1.0 changes (vs v5.0.0)
+--------------------------
+The v5.0.0 view-aware logic was correct but produced an undifferentiated
+output: every BUY looked like every other BUY. There was no signal for
+"how strong" the call was, no sector context, and the recommendation_reason
+was a flat sentence with no actionable detail.
 
-v5.0.0 fixes all of the above by:
-  A. NEW: `derive_fundamental_view`, `derive_technical_view`,
-     `derive_risk_view`, `derive_value_view` — produce the 4 View tokens
-     (BULLISH / NEUTRAL / BEARISH; LOW / MODERATE / HIGH; CHEAP / FAIR /
-     EXPENSIVE) directly from the underlying scores. These tokens become
-     INPUTS to the recommendation, not outputs of it.
-  B. REWRITTEN: `compute_recommendation` now delegates to
-     `core.reco_normalize.recommendation_from_views()` — the single
-     source of truth for view-aware 5-tier decisions. The old
-     score-only branches are gone.
-  C. NEW: View columns are written to AssetScores: `fundamental_view`,
-     `technical_view`, `risk_view`, `value_view`. Scoring engines can
-     now expose them in the sheet's "View" columns directly.
-  D. FIXED: `compute_quality_score` returns None (not 60) when neither
-     financial fundamentals NOR data_quality markers are present. This
-     stops phantom XETRA / data-missing rows from sneaking past the
-     scoring gate.
-  E. REMOVED: the v4.1.4 blue-chip guard. The view-aware logic now
-     handles the missing-forward-data case correctly without needing
-     to override SELL/REDUCE: high-quality stocks with no forward signal
-     end up at HOLD because no view triggers BUY/STRONG_BUY conditions,
-     not because a special-case override fires.
-  F. PRESERVED: every public symbol, every component-score function,
-     every horizon helper, every forecast helper, every signature.
-     This is a drop-in replacement.
+v5.1.0 fixes that without breaking any v5.0.0 contract:
 
-Public API (UNCHANGED):
-  __version__, SCORING_VERSION, Horizon, Signal, RSISignal,
-  compute_scores, score_row, score_quote, enrich_with_scores,
-  rank_rows_by_overall, assign_rank_overall, score_and_rank_rows,
-  AssetScores, ScoreWeights, ScoringWeights, ForecastParameters,
-  ScoringEngine, DEFAULT_WEIGHTS, DEFAULT_FORECASTS,
-  normalize_recommendation_code, CANONICAL_RECOMMENDATION_CODES,
-  detect_horizon, get_weights_for_horizon,
-  compute_technical_score, rsi_signal, short_term_signal,
-  derive_upside_pct, derive_volume_ratio, derive_day_range_position,
-  invest_period_label,
-  compute_valuation_score, compute_growth_score, compute_momentum_score,
-  compute_quality_score, compute_risk_score, compute_opportunity_score,
-  compute_confidence_score, compute_recommendation,
-  risk_bucket, confidence_bucket,
-  ScoringError, InvalidHorizonError, MissingDataError.
+A. NEW dataclass fields on AssetScores (all default to None / "" so
+   external code constructing AssetScores manually keeps working):
+     - sector_relative_score (Optional[float], populated by batch path)
+     - conviction_score      (Optional[float])
+     - top_factors           (str)
+     - top_risks             (str)
+     - position_size_hint    (str)
 
-Public API ADDITIONS in v5.0.0:
-  derive_fundamental_view, derive_technical_view,
-  derive_risk_view, derive_value_view.
+B. compute_scores() now (after the recommendation is computed) calls
+   core.insights_builder to add per-row insights. Specifically:
+     - conviction_score is computed from views + score extremity +
+       forecast_confidence + completeness.
+     - top_factors / top_risks / position_size_hint are derived per-row.
+     - The structured recommendation_reason is rebuilt to include the
+       conviction badge and top factors/risks line.
+   Sector-relative is NOT computed here (needs cohort) — see (D).
+
+C. compute_recommendation() gains two optional kwargs (`conviction`,
+   `sector_relative`) that pass through to recommendation_from_views().
+   When provided, they enable the conviction-floor downgrade in
+   reco_normalize v7.1.0+ (STRONG_BUY <60 -> BUY; BUY <45 -> HOLD).
+   compute_scores() now computes conviction FIRST (using a HOLD-as-
+   placeholder recommendation just to size the badge), then re-runs
+   compute_recommendation with conviction so the final label honors
+   the floor. This is two passes through reco_normalize but it's
+   cheap and it makes the conviction floor actually fire.
+
+D. score_and_rank_rows() now calls insights_builder.enrich_rows_with_insights
+   AFTER per-row scoring. This batch step:
+     - Builds sector cohorts from the rows.
+     - Computes sector_relative_score per row.
+     - Re-builds the recommendation_reason with sector-relative badge.
+   Per-row callers using compute_scores() directly still get a complete
+   row, just without sector context (sector_relative_score=None).
+
+E. PRESERVED: every public symbol from v5.0.0, every existing signature,
+   every component-score function, every horizon helper, every forecast
+   helper. compute_recommendation's `roi1/roi3/roi12` parameters are still
+   declared (kept for the day a callsite reaches in by name), even though
+   the v5.0.0+ view-aware path doesn't need them.
+
+Public API (UNCHANGED + additions):
+  All v5.0.0 exports are preserved. No removals.
+  Additions: AssetScores has 5 new fields with safe defaults.
 ================================================================================
 """
 
@@ -100,7 +88,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "5.0.0"
+__version__ = "5.1.0"
 SCORING_VERSION = __version__
 
 # =============================================================================
@@ -238,7 +226,7 @@ _HORIZON_DAYS_CUTOFFS: Tuple[Tuple[int, Horizon], ...] = (
 
 
 # =============================================================================
-# Data Classes (extended with view fields in v5.0.0)
+# Data Classes (extended in v5.1.0 with 5 new insight fields)
 # =============================================================================
 
 @dataclass(slots=True)
@@ -267,6 +255,20 @@ class ScoreWeights:
                 confidence_penalty_strength=self.confidence_penalty_strength,
             )
         return self
+
+    def as_factor_weights_map(self) -> Dict[str, float]:
+        """
+        Project into a {component_score_key: weight} mapping suitable for
+        passing into core.insights_builder.derive_top_factors. v5.1.0+.
+        """
+        return {
+            "valuation_score": self.w_valuation,
+            "momentum_score": self.w_momentum,
+            "quality_score": self.w_quality,
+            "growth_score": self.w_growth,
+            "opportunity_score": self.w_opportunity,
+            "technical_score": self.w_technical,
+        }
 
 
 @dataclass(slots=True)
@@ -308,9 +310,6 @@ class AssetScores:
     horizon_label: Optional[str] = None
     horizon_days_effective: Optional[int] = None
 
-    # NEW in v5.0.0: the four View columns derived from the components.
-    # Now first-class outputs of compute_scores() rather than something
-    # the caller had to derive separately.
     fundamental_view: Optional[str] = None
     technical_view: Optional[str] = None
     risk_view: Optional[str] = None
@@ -331,6 +330,15 @@ class AssetScores:
     expected_price_1m: Optional[float] = None
     expected_price_3m: Optional[float] = None
     expected_price_12m: Optional[float] = None
+
+    # NEW in v5.1.0 — populated by core.insights_builder via compute_scores().
+    # sector_relative_score is populated only via the batch path
+    # (score_and_rank_rows) since it requires a sector cohort.
+    sector_relative_score: Optional[float] = None
+    conviction_score: Optional[float] = None
+    top_factors: str = ""
+    top_risks: str = ""
+    position_size_hint: str = ""
 
     scoring_updated_utc: str = field(default_factory=_utc_iso)
     scoring_updated_riyadh: str = field(default_factory=_riyadh_iso)
@@ -806,7 +814,7 @@ def derive_forecast_patch(
 
 
 # =============================================================================
-# Component Scoring
+# Component Scoring (preserved from v5.0.0)
 # =============================================================================
 
 def _data_quality_factor(row: Mapping[str, Any]) -> float:
@@ -839,22 +847,17 @@ def _completeness_factor(row: Mapping[str, Any]) -> float:
 
 def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
     """
-    Compute quality score (0-100).
+    Compute quality score (0-100). Preserved from v5.0.0.
 
-    v5.0.0 fix: returns None when there is genuinely no quality input —
-    no financial fundamentals AND no meaningful data-quality marker AND
-    completeness below 30%. Previously this path defaulted to ~60 from
-    the data-quality proxy, which let phantom rows (XETRA tickers with
-    no underlying data) sneak past the scoring gate and end up with
-    HOLD/BUY recommendations on empty information.
+    Returns None when there is genuinely no quality input — no financial
+    fundamentals AND no meaningful data-quality marker AND completeness
+    below 30%. This is the phantom-row gate that prevents XETRA tickers
+    with no underlying data from sneaking into HOLD/BUY recommendations.
 
-    Detection rule for "phantom row":
+    Detection rule:
       - no roe / roa / op_margin / net_margin / debt_to_equity, AND
       - data_quality is missing or in {POOR, STALE, MISSING, ERROR}, AND
       - completeness < 30% of core fields populated.
-
-    A row that hits all three conditions returns None and is excluded
-    from the overall score.
     """
     roe = _as_fraction(_get(row, "roe", "return_on_equity", "returnOnEquity"))
     roa = _as_fraction(_get(row, "roa", "return_on_assets", "returnOnAssets"))
@@ -869,7 +872,7 @@ def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
 
     completeness = _completeness_factor(row)
 
-    # v5.0.0: phantom-row gate
+    # Phantom-row gate
     if not has_any_financial and dq_is_weak and completeness < 0.30:
         return None
 
@@ -920,15 +923,11 @@ def compute_confidence_score(row: Mapping[str, Any]) -> Tuple[Optional[float], O
 
 def compute_valuation_score(row: Mapping[str, Any]) -> Optional[float]:
     """
-    Compute valuation score (0-100).
+    Compute valuation score (0-100). Preserved from v5.0.0.
 
-    Returns None if no forward-looking signal is available (upside,
-    3m ROI, 12m ROI all missing). Anchors-only (PE/PB/PS/PEG/EV) is
-    insufficient because those fields are backward-looking.
-
-    Preserved from v4.1.4: weight normalization treats missing
-    components as neutral 0.5 so partial-signal scores stay
-    comparable to full-signal scores.
+    Returns None if no forward-looking signal is available (upside, 3m ROI,
+    12m ROI all missing). Anchors-only (PE/PB/PS/PEG/EV) is insufficient
+    because those fields are backward-looking.
     """
     price = _get_float(row, "current_price", "price", "last_price", "last")
     if price is None or price <= 0:
@@ -1141,33 +1140,14 @@ def confidence_bucket(conf01: Optional[float]) -> Optional[str]:
 
 
 # =============================================================================
-# View Derivation (NEW in v5.0.0)
+# View Derivation (preserved from v5.0.0)
 # =============================================================================
-#
-# These four functions translate the numeric component scores into the
-# qualitative View tokens that feed `compute_recommendation`. They are
-# the bridge between scoring and recommendation: scores are numeric
-# evidence; views are decision inputs.
 
 def derive_fundamental_view(
     quality: Optional[float],
     growth: Optional[float],
 ) -> Optional[str]:
-    """
-    BULLISH / NEUTRAL / BEARISH from quality + growth scores.
-
-    Decision rules:
-      - Both quality and growth missing -> None (we don't know).
-      - quality >= 65 AND growth >= 60 -> BULLISH
-      - quality < 40 (regardless of growth)  -> BEARISH
-      - growth < 25  AND quality < 55       -> BEARISH
-      - Else                                -> NEUTRAL
-
-    The asymmetry — BEARISH triggers on either weak quality alone or on
-    weak growth combined with weak-ish quality — reflects the fact that
-    quality is the more important fundamental indicator, while growth
-    needs corroboration before it flips the view bearish.
-    """
+    """BULLISH / NEUTRAL / BEARISH from quality + growth scores."""
     if quality is None and growth is None:
         return None
 
@@ -1181,7 +1161,6 @@ def derive_fundamental_view(
     if q >= 65.0 and g >= 60.0:
         return "BULLISH"
     if q >= 70.0 and growth is None:
-        # Strong quality, growth unavailable: still bullish on fundamentals.
         return "BULLISH"
     return "NEUTRAL"
 
@@ -1191,16 +1170,7 @@ def derive_technical_view(
     momentum: Optional[float],
     rsi_label: Optional[str] = None,
 ) -> Optional[str]:
-    """
-    BULLISH / NEUTRAL / BEARISH from technical + momentum + RSI signal.
-
-    Decision rules:
-      - Both technical and momentum missing -> None.
-      - rsi_label == OVERBOUGHT capped at NEUTRAL  (over-extended setup)
-      - technical >= 65 AND momentum >= 55  -> BULLISH
-      - technical < 40 OR momentum < 35     -> BEARISH
-      - Else                                -> NEUTRAL
-    """
+    """BULLISH / NEUTRAL / BEARISH from technical + momentum + RSI signal."""
     if technical is None and momentum is None:
         return None
 
@@ -1218,12 +1188,7 @@ def derive_technical_view(
 
 
 def derive_risk_view(risk: Optional[float]) -> Optional[str]:
-    """
-    LOW / MODERATE / HIGH from a 0-100 risk score (higher = riskier).
-
-    Mirrors `risk_bucket()` but uses uppercase tokens that the
-    recommendation engine expects.
-    """
+    """LOW / MODERATE / HIGH from a 0-100 risk score (higher = riskier)."""
     if risk is None:
         return None
     if risk <= _CONFIG.risk_low_threshold:
@@ -1237,21 +1202,7 @@ def derive_value_view(
     valuation: Optional[float],
     upside_pct: Optional[float] = None,
 ) -> Optional[str]:
-    """
-    CHEAP / FAIR / EXPENSIVE from valuation score and/or upside %.
-
-    Upside takes precedence when both are present because it's a direct,
-    forward-looking measure. Falls back to valuation_score thresholds:
-      - valuation >= 65 -> CHEAP
-      - valuation < 40  -> EXPENSIVE
-      - else            -> FAIR
-
-    Upside thresholds:
-      - upside >  +0.20 (>= 20%) -> CHEAP
-      - upside <  -0.10 (>= 10% overvalued) -> EXPENSIVE
-      - else (within +/-10..20%) -> FAIR
-    """
-    # Upside has priority when present
+    """CHEAP / FAIR / EXPENSIVE from valuation score and/or upside %."""
     if upside_pct is not None:
         if upside_pct > 0.20:
             return "CHEAP"
@@ -1271,7 +1222,7 @@ def derive_value_view(
 
 
 # =============================================================================
-# Recommendation (REWRITTEN in v5.0.0)
+# Recommendation (extended in v5.1.0 to thread conviction/sector through)
 # =============================================================================
 
 def compute_recommendation(
@@ -1288,48 +1239,29 @@ def compute_recommendation(
     quality: Optional[float] = None,
     growth: Optional[float] = None,
     valuation: Optional[float] = None,
-    # New optional kwargs in v5.0.0. If not supplied, derived from
-    # the component scores. Accept caller-supplied views to allow
-    # downstream overrides (e.g. analyst-provided views).
     fundamental_view: Optional[str] = None,
     technical_view: Optional[str] = None,
     risk_view: Optional[str] = None,
     value_view: Optional[str] = None,
     upside_pct: Optional[float] = None,
     rsi_label: Optional[str] = None,
+    # NEW in v5.1.0 — pass-through to reco_normalize v7.1.0+
+    conviction: Optional[float] = None,
+    sector_relative: Optional[float] = None,
 ) -> Tuple[str, str]:
     """
-    Compute view-aware 5-tier recommendation.
+    Compute view-aware 5-tier recommendation, with optional conviction floors.
 
-    v5.0.0: This function now delegates to
-    `core.reco_normalize.recommendation_from_views()` which is the
-    single source of truth for view-aware recommendation rules. The
-    horizon-specific score-only branches from v4.1.x are gone — they
-    were collapsing the output to ACCUMULATE/HOLD because they never
-    inspected the four Views. The new logic treats Views as decision
-    inputs and applies symmetric vetoes (EXPENSIVE blocks BUY,
-    double-BEARISH forces SELL, etc.).
+    v5.1.0: Adds `conviction` and `sector_relative` kwargs that pass through
+    to reco_normalize.recommendation_from_views(). When conviction is
+    provided, STRONG_BUY/BUY can be downgraded if conviction is below the
+    floor (60 / 45 respectively). REDUCE / SELL / HOLD are protective and
+    are never downgraded.
 
-    Inputs:
-      - overall, risk, confidence100: required to run.
-      - quality, growth, valuation: required to derive views (may be
-        passed in directly via fundamental_view / etc.).
-      - horizon, technical, momentum, roi1/3/12, upside_pct, rsi_label:
-        used for view derivation and short-circuit short-term signals.
-      - fundamental_view, technical_view, risk_view, value_view: if any
-        are supplied, they override the derived view for that axis.
-
-    Returns:
-      (canonical_string, reason_text). canonical_string is one of
-      STRONG_BUY / BUY / HOLD / REDUCE / SELL.
-
-    Backward compatibility:
-      - Existing callers passing only (overall, risk, confidence100,
-        roi3, horizon=...) will still work: views will be inferred from
-        whatever component scores are available, with reasonable
-        fallbacks where data is missing. The resulting recommendation
-        will be MORE HONEST (HOLD instead of fabricated BUY) when
-        upstream data is incomplete.
+    The roi1/roi3/roi12 parameters are kept in the signature for backward
+    compatibility with any caller passing them positionally; the v5.0.0+
+    view-aware path doesn't use them directly (the views already encode
+    the relevant signal).
     """
     if overall is None and quality is None and valuation is None:
         return "HOLD", "Insufficient data to score reliably."
@@ -1343,8 +1275,7 @@ def compute_recommendation(
         )
 
     # Short-term horizons: a strong-momentum reversal can override the
-    # view-aware logic, since fundamentals matter less day-to-day. We
-    # only use this for DAY/WEEK; MONTH/LONG always go through views.
+    # view-aware logic, since fundamentals matter less day-to-day.
     if horizon == Horizon.DAY:
         t = technical if technical is not None else 50.0
         m = momentum if momentum is not None else 50.0
@@ -1360,7 +1291,6 @@ def compute_recommendation(
                 f"Day-trade technical breakdown: "
                 f"Tech={_round(t, 1)}, Momentum={_round(m, 1)}."
             )
-        # Otherwise fall through to view-aware logic.
 
     # Derive views from components when caller didn't override them.
     if fundamental_view is None:
@@ -1379,7 +1309,11 @@ def compute_recommendation(
         try:
             from reco_normalize import recommendation_from_views  # noqa: WPS433
         except ImportError:
-            # Last-resort: emit HOLD with explanatory reason.
+            logger.warning(
+                "core.reco_normalize unavailable; defaulting to HOLD. "
+                "This typically means a deployment issue — recommendation "
+                "engine should always be present."
+            )
             return "HOLD", (
                 "Recommendation engine (reco_normalize) unavailable; "
                 "defaulting to HOLD."
@@ -1391,6 +1325,8 @@ def compute_recommendation(
         risk=risk_view,
         value=value_view,
         score=overall,
+        conviction=conviction,           # v5.1.0
+        sector_relative=sector_relative, # v5.1.0
     )
 
 
@@ -1466,10 +1402,45 @@ def normalize_recommendation_code(label: Any) -> str:
 
 
 # =============================================================================
+# v5.1.0: insights_builder lazy import helper
+# =============================================================================
+
+def _import_insights_builder():
+    """
+    Lazy import of core.insights_builder. Falls back to top-level
+    insights_builder for layouts that flatten the package. Returns None
+    if neither is available (insights are then skipped with a warning).
+    """
+    try:
+        from core import insights_builder as _ib  # noqa: WPS433
+        return _ib
+    except ImportError:
+        try:
+            import insights_builder as _ib  # noqa: WPS433
+            return _ib
+        except ImportError:
+            return None
+
+
+# =============================================================================
 # Main Scoring Function
 # =============================================================================
 
 def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
+    """
+    Score a single row.
+
+    v5.1.0 changes vs v5.0.0:
+      1. After component scores + views are computed, we ask insights_builder
+         for a conviction score (using a placeholder recommendation since we
+         haven't picked one yet) and pass that conviction into
+         compute_recommendation so the conviction-floor downgrade can fire.
+      2. After the final recommendation is set, we compute top_factors,
+         top_risks, position_size_hint and a structured recommendation_reason
+         via insights_builder.build_insights().
+      3. sector_relative_score is left as None at the per-row level — it's
+         set in the batch path (score_and_rank_rows).
+    """
     source = dict(row or {})
     scoring_errors: List[str] = []
 
@@ -1518,10 +1489,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     penalty_factor: Optional[float] = None
     insufficient_inputs = False
 
-    # v5.0.0: stricter threshold — need at least 2 components OR 1
-    # high-weight component to score reliably. Single weak signal
-    # produces None overall, which downstream treats as "insufficient
-    # data" rather than fabricating a number.
     sig_weight_total = sum(w for w, _ in base_parts)
     if base_parts and (len(base_parts) >= 2 or sig_weight_total >= 0.40):
         wsum = sig_weight_total
@@ -1547,7 +1514,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     rb = risk_bucket(risk)
     cb = confidence_bucket(conf01)
 
-    # NEW in v5.0.0: derive the four View tokens
     fundamental_view = derive_fundamental_view(quality, growth)
     technical_view = derive_technical_view(tech_score, momentum, rsi_sig)
     risk_view = derive_risk_view(risk)
@@ -1556,6 +1522,27 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     roi3 = _as_roi_fraction(working.get("expected_roi_3m"))
     roi1 = _as_roi_fraction(working.get("expected_roi_1m"))
     roi12 = _as_roi_fraction(working.get("expected_roi_12m"))
+
+    # ---- v5.1.0: compute conviction BEFORE the recommendation ---------
+    # We need conviction so the conviction-floor downgrade in
+    # reco_normalize can fire. Conviction depends on overall + views +
+    # forecast_confidence + completeness — all known at this point.
+    conviction: Optional[float] = None
+    ib = _import_insights_builder()
+    if ib is not None and overall is not None:
+        try:
+            conviction = ib.compute_conviction_score(
+                overall_score=overall,
+                fundamental_view=fundamental_view,
+                technical_view=technical_view,
+                risk_view=risk_view,
+                value_view=value_view,
+                forecast_confidence=conf01,
+                completeness=_completeness_factor(working),
+            )
+        except Exception as exc:
+            logger.debug("compute_conviction_score failed: %s", exc)
+            scoring_errors.append(f"conviction_failed: {type(exc).__name__}")
 
     if insufficient_inputs:
         rec, reason = "HOLD", (
@@ -1575,10 +1562,58 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             value_view=value_view,
             upside_pct=usp,
             rsi_label=rsi_sig,
+            conviction=conviction,
+            sector_relative=None,  # populated only via batch path
         )
+
+    canonical_rec = normalize_recommendation_code(rec)
 
     st_signal_val = short_term_signal(tech_score, momentum, risk, horizon)
     period_label = invest_period_label(horizon, hdays)
+
+    # ---- v5.1.0: build per-row insights (top_factors, top_risks, hint) -
+    top_factors_str: str = ""
+    top_risks_str: str = ""
+    pos_hint: str = ""
+    structured_reason: str = reason  # default: keep the raw reason
+
+    if ib is not None and not insufficient_inputs:
+        try:
+            # Build a synthetic row that contains the freshly-computed scores
+            # so insights_builder can derive top factors / risks correctly.
+            synthetic_row: Dict[str, Any] = dict(working)
+            synthetic_row.update({
+                "overall_score": overall,
+                "valuation_score": valuation,
+                "momentum_score": momentum,
+                "quality_score": quality,
+                "growth_score": growth,
+                "value_score": value_score,
+                "opportunity_score": opportunity,
+                "technical_score": tech_score,
+                "risk_score": risk,
+                "fundamental_view": fundamental_view,
+                "technical_view": technical_view,
+                "risk_view": risk_view,
+                "value_view": value_view,
+                "forecast_confidence": conf01,
+                "recommendation": canonical_rec,
+                "recommendation_reason": reason,
+            })
+
+            bundle = ib.build_insights(
+                synthetic_row,
+                sector_scores=None,  # batch path will override later
+                weights=weights.as_factor_weights_map(),
+                base_reason=reason,
+            )
+            top_factors_str = bundle.top_factors or ""
+            top_risks_str = bundle.top_risks or ""
+            pos_hint = bundle.position_size_hint or ""
+            structured_reason = bundle.recommendation_reason or reason
+        except Exception as exc:
+            logger.debug("build_insights failed for row: %s", exc)
+            scoring_errors.append(f"insights_failed: {type(exc).__name__}")
 
     scores = AssetScores(
         valuation_score=valuation,
@@ -1608,8 +1643,8 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         technical_view=technical_view,
         risk_view=risk_view,
         value_view=value_view,
-        recommendation=normalize_recommendation_code(rec),
-        recommendation_reason=reason,
+        recommendation=canonical_rec,
+        recommendation_reason=structured_reason,
         forecast_price_1m=forecast_patch.get("forecast_price_1m"),
         forecast_price_3m=forecast_patch.get("forecast_price_3m"),
         forecast_price_12m=forecast_patch.get("forecast_price_12m"),
@@ -1622,6 +1657,12 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         expected_price_1m=forecast_patch.get("expected_price_1m"),
         expected_price_3m=forecast_patch.get("expected_price_3m"),
         expected_price_12m=forecast_patch.get("expected_price_12m"),
+        # v5.1.0 insight fields:
+        sector_relative_score=None,  # populated by batch path
+        conviction_score=conviction,
+        top_factors=top_factors_str,
+        top_risks=top_risks_str,
+        position_size_hint=pos_hint,
         scoring_errors=scoring_errors,
     )
     return scores.to_dict()
@@ -1669,7 +1710,7 @@ class ScoringEngine:
 
 
 # =============================================================================
-# Ranking Helpers (preserved)
+# Ranking + Batch Scoring (v5.1.0: adds sector-relative pass)
 # =============================================================================
 
 def _rank_sort_tuple(row: Dict[str, Any], key_overall: str = "overall_score") -> Tuple[float, ...]:
@@ -1716,7 +1757,22 @@ def score_and_rank_rows(
     key_overall: str = "overall_score",
     inplace: bool = False,
 ) -> List[Dict[str, Any]]:
+    """
+    Score every row and rank by overall_score.
+
+    v5.1.0 addition: After per-row scoring, runs a batch-level pass via
+    insights_builder.enrich_rows_with_insights() to compute
+    sector_relative_score for each row and rebuild recommendation_reason
+    with the sector-adjusted badge. The sector cohort is derived from the
+    `sector` field on each row.
+
+    If insights_builder is unavailable the batch pass is silently skipped
+    and rows retain the per-row insights from compute_scores (which already
+    includes top_factors/top_risks/etc., just no sector context).
+    """
     prepared = list(rows) if inplace else [dict(r or {}) for r in rows]
+
+    # Per-row scoring (uses insights_builder for conviction + top_factors etc.)
     for row in prepared:
         try:
             row.update(compute_scores(row, settings=settings))
@@ -1727,6 +1783,34 @@ def score_and_rank_rows(
                 existing_errors = []
             existing_errors.append(f"scoring_exception: {type(exc).__name__}")
             row["scoring_errors"] = existing_errors
+
+    # v5.1.0: Batch-level insights pass — populates sector_relative_score
+    # and rebuilds recommendation_reason with sector context.
+    ib = _import_insights_builder()
+    if ib is not None:
+        try:
+            # Use the actual horizon weights for top_factors ranking. We
+            # detect a representative horizon from the first row that has
+            # one populated; fall back to MONTH defaults otherwise.
+            horizon_for_weights = Horizon.MONTH
+            for r in prepared:
+                hl = r.get("horizon_label")
+                if hl:
+                    try:
+                        horizon_for_weights = Horizon(hl)
+                        break
+                    except ValueError:
+                        continue
+            weights = get_weights_for_horizon(horizon_for_weights, settings)
+            ib.enrich_rows_with_insights(
+                prepared,
+                weights=weights.as_factor_weights_map(),
+                sector_key="sector",
+                inplace=True,
+            )
+        except Exception as exc:
+            logger.debug("score_and_rank_rows: batch insights failed: %s", exc)
+
     assign_rank_overall(prepared, key_overall=key_overall, inplace=True, rank_key="rank_overall")
     return prepared
 
@@ -1776,7 +1860,6 @@ __all__ = [
     "compute_recommendation",
     "risk_bucket",
     "confidence_bucket",
-    # NEW in v5.0.0
     "derive_fundamental_view",
     "derive_technical_view",
     "derive_risk_view",
