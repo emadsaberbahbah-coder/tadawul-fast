@@ -2,46 +2,56 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization -- v7.0.0 (ENTERPRISE ALIGNED / CACHE-HARDENED)
+Symbol Normalization -- v7.1.0 (COUNTRY-AWARE / CURRENCY-COMPLETE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
 
-v7.0.0 Changes (from v6.0.0)
+v7.1.0 Changes (from v7.0.0)
 ----------------------------
-Bug fixes:
-  - `detect_asset_class('ETH-USD')` now returns CRYPTO (was FOREX). The
-    `FX_DASH_RE` pattern `^[A-Z]{3}-[A-Z]{3}$` matches well-known crypto
-    pairs like ETH-USD / BTC-USD. v6 checked FX before crypto, so every
-    `{3letter}-USD` pair was classified as forex. Fix: `is_fx` now
-    rejects dashed pairs whose left side is a known crypto ticker, and
-    `detect_asset_class` checks crypto before FX.
-  - `normalize_symbol('EUR-USD')` now canonicalizes to 'EURUSD=X'. v6
-    only handled the slash form (`EUR/USD` -> `EURUSD=X`) but left the
-    dash form unchanged, contradicting the docstring's "FX -> EURUSD=X"
-    promise. Equal form passthrough preserved.
-  - `normalize_symbol('SPX.INDX')` now canonicalizes via `_INDEX_COMMON`
-    lookup (returns '^GSPC'). v6 returned 'SPX.INDX' unchanged, which
-    then caused `to_yahoo_symbol('SPX.INDX')` to produce '^SPX.INDX' --
-    an invalid Yahoo symbol.
-  - `is_index('NASDAQ')` returning True is no longer a footgun: the
-    ambiguous bare key 'NASDAQ' is removed from the _INDEX_COMMON map
-    (replaced by 'IXIC'). Callers can still look up 'SPX', 'DJI', 'FTSE'
-    etc. Detection via INDEX_CARET_RE / INDEX_SUFFIX_RE still works for
-    explicit index forms like '^IXIC' or 'IXIC.INDX'.
+NEW (audit fix - country=USA for .L/.DE etc.):
+  - `get_country_from_symbol(symbol) -> Optional[str]` returns a display-
+    friendly country name ("United Kingdom", "Germany", "Saudi Arabia",
+    "United States", etc.) for any symbol whose listing country can be
+    resolved from its exchange suffix or known overrides.
+    
+    Replaces the data engine's homegrown logic that returned "USA" for
+    every non-`.SR` / non-`=X` / non-`=F` symbol -- which mis-tagged
+    `.L` (UK), `.DE` (Germany), `.PA` (France), `.T` (Japan), `.HK`,
+    `.SS`, `.SZ`, `.NS`, `.AX`, etc. as American.
+    
+    Returns "Global" for FX / commodity / crypto, looks up major indexes
+    via a dedicated _INDEX_COUNTRY map (^GSPC -> United States,
+    ^FTSE -> United Kingdom, ^N225 -> Japan, ^TASI -> Saudi Arabia, ...),
+    and falls back to None when the symbol's jurisdiction cannot be
+    determined.
 
-Cleanup:
-  - Dead code removed: `_env_bool` helper defined inside `from_env()`
-    but never called.
-  - Unused import removed: `cast` from typing.
-  - `detect_market_type`: replaced linear enum scan (case-insensitive
-    string compare per value) with a precomputed `_MARKET_BY_CODE` dict
-    lookup.
-  - Added more known crypto base codes to `_CRYPTO_COMMON` (cameos from
-    major exchanges) to reduce FX/crypto ambiguity.
+NEW:
+  - `_COUNTRY_BY_EXCHANGE` mapping table covering 40+ markets.
+  - `_CURRENCY_BY_EXCHANGE` mapping table covering 40+ markets, replacing
+    the inline if/elif chain in `get_currency_from_symbol`.
+  - `_INDEX_COUNTRY` mapping for major indexes.
+
+Bug fixes:
+  - `get_currency_from_symbol`: the old version had hardcoded coverage
+    for US / UK / JP / EUR-zone only. Hong Kong, China, India, Australia,
+    Canada, Switzerland, Korea, Singapore, Saudi (already returned 'SAR'
+    via is_ksa shortcut), AE, QA, KW, EG, ZA, MX, BR, AR, TH, ID, MY,
+    PH, VN, TW, NZ, IL, DK, SE, NO, PL, CZ, HU all returned None.
+    All 40+ markets now covered by `_CURRENCY_BY_EXCHANGE`.
+    
+  - `get_primary_exchange` returned None for US share-class tickers like
+    BRK.B / BF.B / RDS.A. After `normalize_symbol` these stay dot-form,
+    so `split_symbol_exchange` returns exchange=None (because `.B` isn't
+    in `_EXCHANGE_SUFFIXES`), and the `s.isalpha()` US heuristic also
+    rejects them (the dot makes `.isalpha()` False). Added a CLASS_DOT_RE
+    branch so plausible share-class tickers route to "US".
 
 Preserved:
-  - Complete `__all__` surface.
+  - All v7.0.0 fixes (ETH-USD crypto vs FX, EUR-USD canonicalization,
+    SPX.INDX -> ^GSPC, NASDAQ key removed from _INDEX_COMMON, dead code
+    cleanup, _MARKET_BY_CODE precompute).
+  - Complete `__all__` surface (with one new export added).
   - All regex patterns (public and internal), all mapping tables.
   - All `lru_cache` sizes.
   - `SymbolNormalizationConfig` shape, all env var names.
@@ -49,6 +59,12 @@ Preserved:
   - KSA canonicalization (`####.SR`), TADAWUL: prefix handling, .SA/.SAU
     stripping, share-class conversion (BRK-B <-> BRK.B).
   - Exchange suffix table, MIC codes, default_exchange env handling.
+
+Operator note (data_engine integration):
+  After upgrading to v7.1.0, the data engine's `_infer_country_from_symbol`
+  helper should be replaced with a single call to
+  `get_country_from_symbol(symbol)`. A thin patch will land in
+  data_engine_v2 v5.47.4 once this file is reviewed.
 ================================================================================
 """
 
@@ -97,7 +113,7 @@ except ImportError:
 # Version and Exports
 # ---------------------------------------------------------------------------
 
-__version__ = "7.0.0"
+__version__ = "7.1.0"
 
 __all__ = [
     # Core enums
@@ -149,6 +165,7 @@ __all__ = [
     "standardize_share_class",
     "get_primary_exchange",
     "get_currency_from_symbol",
+    "get_country_from_symbol",   # v7.1.0
     "get_mic_code",
     # Provider-aware normalization
     "normalize_symbol_for_provider",
@@ -233,8 +250,6 @@ class SymbolNormalizationConfig:
         def _env_str(name: str, default: str = "") -> str:
             v = os.getenv(name)
             return default if v is None else str(v).strip()
-
-        # v7.0.0: removed the unused `_env_bool` helper (was dead code in v6).
 
         def _env_list(name: str) -> Tuple[str, ...]:
             raw = _env_str(name, "")
@@ -406,6 +421,157 @@ _MIC_MAPPINGS: Dict[str, str] = {
     "AU": "XASX", "KR": "XKRX", "SG": "XSES",
 }
 
+# v7.1.0: country lookup (display-friendly English names) keyed by the
+# exchange code returned by get_primary_exchange. This is the table the
+# new get_country_from_symbol consults. Bug being fixed: data engine
+# was returning "USA" for every non-.SR / non-special symbol because
+# its homegrown _infer_country_from_symbol had no exchange-suffix
+# lookup -- BARC.L, SAP.DE, 7203.T were all "USA".
+_COUNTRY_BY_EXCHANGE: Dict[str, str] = {
+    # Americas
+    "US": "United States",
+    "CA": "Canada",
+    "MX": "Mexico",
+    "BR": "Brazil",
+    "AR": "Argentina",
+    # EMEA
+    "UK": "United Kingdom",
+    "FR": "France",
+    "DE": "Germany",
+    "CH": "Switzerland",
+    "NL": "Netherlands",
+    "BE": "Belgium",
+    "ES": "Spain",
+    "IT": "Italy",
+    "DK": "Denmark",
+    "SE": "Sweden",
+    "NO": "Norway",
+    "FI": "Finland",
+    "PL": "Poland",
+    "CZ": "Czechia",
+    "HU": "Hungary",
+    "AT": "Austria",
+    "IE": "Ireland",
+    "PT": "Portugal",
+    "ZA": "South Africa",
+    "IL": "Israel",
+    "SA": "Saudi Arabia",
+    "AE": "United Arab Emirates",
+    "QA": "Qatar",
+    "KW": "Kuwait",
+    "EG": "Egypt",
+    # Asia Pacific
+    "JP": "Japan",
+    "HK": "Hong Kong",
+    "CN": "China",
+    "IN": "India",
+    "KR": "South Korea",
+    "TW": "Taiwan",
+    "SG": "Singapore",
+    "MY": "Malaysia",
+    "ID": "Indonesia",
+    "TH": "Thailand",
+    "VN": "Vietnam",
+    "PH": "Philippines",
+    "AU": "Australia",
+    "NZ": "New Zealand",
+    # Aliases that may surface from get_primary_exchange's KSA shortcut
+    "SAUDI": "Saudi Arabia",
+}
+
+# v7.1.0: currency lookup keyed by the same exchange code. Replaces
+# the inline if/elif chain in get_currency_from_symbol, which only
+# covered US / UK / JP / EUR-zone and returned None for HK, CN, IN,
+# AU, CA, CH, KR, SG, SA(non-KSA-shortcut), AE, QA, KW, EG, ZA, etc.
+_CURRENCY_BY_EXCHANGE: Dict[str, str] = {
+    # Americas
+    "US": "USD",
+    "CA": "CAD",
+    "MX": "MXN",
+    "BR": "BRL",
+    "AR": "ARS",
+    # EMEA - GBP
+    "UK": "GBP",
+    # EMEA - Euro zone
+    "FR": "EUR",
+    "DE": "EUR",
+    "NL": "EUR",
+    "BE": "EUR",
+    "ES": "EUR",
+    "IT": "EUR",
+    "AT": "EUR",
+    "IE": "EUR",
+    "PT": "EUR",
+    "FI": "EUR",
+    # EMEA - other
+    "CH": "CHF",
+    "DK": "DKK",
+    "SE": "SEK",
+    "NO": "NOK",
+    "PL": "PLN",
+    "CZ": "CZK",
+    "HU": "HUF",
+    "ZA": "ZAR",
+    "IL": "ILS",
+    "SA": "SAR",
+    "SAUDI": "SAR",
+    "AE": "AED",
+    "QA": "QAR",
+    "KW": "KWD",
+    "EG": "EGP",
+    # Asia Pacific
+    "JP": "JPY",
+    "HK": "HKD",
+    "CN": "CNY",
+    "IN": "INR",
+    "KR": "KRW",
+    "TW": "TWD",
+    "SG": "SGD",
+    "MY": "MYR",
+    "ID": "IDR",
+    "TH": "THB",
+    "VN": "VND",
+    "PH": "PHP",
+    "AU": "AUD",
+    "NZ": "NZD",
+}
+
+# v7.1.0: per-index country override for major caret-prefixed indexes.
+# Without this, ^GSPC / ^FTSE / ^N225 all resolved to "Global" because
+# is_special_symbol short-circuits before exchange-suffix logic.
+_INDEX_COUNTRY: Dict[str, str] = {
+    "^GSPC": "United States",
+    "^DJI": "United States",
+    "^IXIC": "United States",
+    "^NDX": "United States",
+    "^RUT": "United States",
+    "^VIX": "United States",
+    "^FTSE": "United Kingdom",
+    "^GDAXI": "Germany",
+    "^FCHI": "France",
+    "^N225": "Japan",
+    "^HSI": "Hong Kong",
+    "^SSEC": "China",
+    "^TASI": "Saudi Arabia",
+    "^NOMU": "Saudi Arabia",
+    "^STOXX50E": "European Union",
+    "^STOXX": "European Union",
+    "^AXJO": "Australia",
+    "^NSEI": "India",
+    "^BSESN": "India",
+    "^KS11": "South Korea",
+    "^TWII": "Taiwan",
+    "^STI": "Singapore",
+    "^JKSE": "Indonesia",
+    "^KLSE": "Malaysia",
+    "^SET": "Thailand",
+    "^MERV": "Argentina",
+    "^BVSP": "Brazil",
+    "^MXX": "Mexico",
+    "^GSPTSE": "Canada",
+    "^TA125": "Israel",
+}
+
 # Index mappings
 # v7.0.0 fix: the bare 'NASDAQ' key was a footgun -- it made is_index('NASDAQ')
 # return True, so detect_asset_class('NASDAQ') returned INDEX. But NASDAQ is
@@ -554,15 +720,27 @@ def strip_noise_prefix_suffix(text: str) -> str:
 
 @lru_cache(maxsize=20000)
 def looks_like_ksa(symbol: str) -> bool:
-    """Check if symbol looks like a KSA (Saudi) symbol."""
+    """
+    Check if symbol looks like a KSA (Saudi) symbol.
+
+    v7.1.0: also detects `.SAU` and `.SA` when the base is a pure 3-6
+    digit code (Tadawul format). `normalize_ksa_symbol` already knows
+    how to strip those suffixes, but `looks_like_ksa` previously only
+    accepted `.SR`, so `normalize_symbol("2222.SAU")` skipped the KSA
+    branch and returned the input unchanged. The pure-digit guard
+    keeps Brazilian `.SA` tickers (PETR4.SA, VALE3.SA) out -- they
+    have alphabetic prefixes and won't match `KSA_CODE_ONLY_RE`.
+    """
     s = clean_unicode(symbol).upper()
     if not s:
         return False
     if s.startswith("TADAWUL:"):
         return True
-    if s.endswith(".SR"):
-        code = s[:-3].strip()
-        return bool(KSA_CODE_ONLY_RE.match(code))
+    for suffix in (".SR", ".SAU", ".SA"):
+        if s.endswith(suffix):
+            code = s[:-len(suffix)].strip()
+            if KSA_CODE_ONLY_RE.match(code):
+                return True
     return bool(KSA_CODE_ONLY_RE.match(s))
 
 
@@ -1076,7 +1254,16 @@ def standardize_share_class(symbol: str) -> str:
 
 @lru_cache(maxsize=20000)
 def get_primary_exchange(symbol: str) -> Optional[str]:
-    """Get primary exchange for a symbol."""
+    """
+    Get primary exchange for a symbol.
+
+    v7.1.0: handles US share-class tickers (BRK.B, BF.B, RDS.A) which
+    normalise to dot form, so split_symbol_exchange returns exchange=None
+    (because '.B' is not a registered exchange suffix), and the
+    `s.isalpha()` heuristic also fails (the dot makes isalpha() False).
+    Now: if the dot is a share-class delimiter and the root is a
+    plausible US ticker, route to "US".
+    """
     s = normalize_symbol(symbol)
     if not s:
         return None
@@ -1092,8 +1279,16 @@ def get_primary_exchange(symbol: str) -> Optional[str]:
     if is_special_symbol(s):
         return "SPECIAL"
 
+    # Plain US ticker heuristic
     if s.isalpha() and 1 <= len(s) <= 5:
         return "US"
+
+    # v7.1.0: share-class US ticker heuristic (BRK.B etc.).
+    cls_match = CLASS_DOT_RE.match(s)
+    if cls_match:
+        root = cls_match.group(1)
+        if 1 <= len(root) <= 5:
+            return "US"
 
     return None
 
@@ -1111,7 +1306,18 @@ def get_mic_code(symbol: str) -> Optional[str]:
 
 @lru_cache(maxsize=20000)
 def get_currency_from_symbol(symbol: str) -> Optional[str]:
-    """Get currency for a symbol."""
+    """
+    Get currency for a symbol.
+
+    For FX pairs, returns the BASE currency (left side of the pair):
+    e.g. USDJPY=X -> "USD", EURGBP=X -> "EUR".
+
+    v7.1.0: replaced the inline US/UK/JP/EUR if-chain with a dict lookup
+    against `_CURRENCY_BY_EXCHANGE`, picking up 30+ markets that v7.0.0
+    silently returned None for: HK -> HKD, CN -> CNY, IN -> INR,
+    AU -> AUD, CA -> CAD, CH -> CHF, KR -> KRW, SG -> SGD, ZA -> ZAR,
+    AE -> AED, QA -> QAR, KW -> KWD, etc.
+    """
     s = normalize_symbol(symbol)
     if not s:
         return None
@@ -1129,14 +1335,76 @@ def get_currency_from_symbol(symbol: str) -> Optional[str]:
         return "SAR"
 
     exchange = get_primary_exchange(s)
-    if exchange == "US":
-        return "USD"
-    if exchange == "UK":
-        return "GBP"
-    if exchange == "JP":
-        return "JPY"
-    if exchange in {"DE", "FR", "IT", "ES", "NL", "BE", "AT", "FI", "IE", "PT"}:
-        return "EUR"
+    if exchange:
+        ccy = _CURRENCY_BY_EXCHANGE.get(exchange.upper())
+        if ccy:
+            return ccy
+
+    return None
+
+
+@lru_cache(maxsize=20000)
+def get_country_from_symbol(symbol: str) -> Optional[str]:
+    """
+    Get the listing country for a symbol as a display-friendly name.
+
+    NEW in v7.1.0. Closes the audit gap where the data engine returned
+    "USA" for every non-`.SR` / non-`=X` / non-`=F` symbol -- mis-tagging
+    `.L` (UK), `.DE` (Germany), `.PA` (France), `.T` (Japan), `.HK`,
+    `.SS`, `.NS`, `.AX`, etc. as American.
+
+    Resolution order:
+        1. `_INDEX_COUNTRY` override for caret-prefixed major indexes
+           (^GSPC -> United States, ^FTSE -> United Kingdom, ^N225 -> Japan,
+           ^TASI -> Saudi Arabia, ...).
+        2. KSA (Saudi Arabia) by `is_ksa`.
+        3. "Global" for FX, crypto, commodity-future, ISIN, and option
+           symbols (anything classified by `is_special_symbol`) once the
+           index check has passed.
+        4. `_COUNTRY_BY_EXCHANGE` lookup keyed by `get_primary_exchange`.
+        5. Plain US ticker / US share-class heuristic.
+        6. None when nothing matches.
+
+    Returns:
+        Display-friendly English country name (e.g. "United Kingdom",
+        "Saudi Arabia", "United States", "Germany"), the literal string
+        "Global" for asset-class symbols whose listing country is
+        ambiguous or not meaningful, or None when the country cannot be
+        determined.
+    """
+    s = normalize_symbol(symbol)
+    if not s:
+        return None
+
+    # 1. Major indexes have a known listing country
+    if s in _INDEX_COUNTRY:
+        return _INDEX_COUNTRY[s]
+
+    # 2. KSA shortcut (matches data engine's existing convention)
+    if is_ksa(s):
+        return "Saudi Arabia"
+
+    # 3. Other special symbols: FX, crypto, commodity, ISIN, option
+    if is_special_symbol(s):
+        return "Global"
+
+    # 4. Exchange-suffix lookup (the audit fix - no more silent USA fallback)
+    exchange = get_primary_exchange(s)
+    if exchange:
+        country = _COUNTRY_BY_EXCHANGE.get(exchange.upper())
+        if country:
+            return country
+        # exchange code recognised but no country mapping -> still better
+        # than fabricating "USA"; surface the unknown rather than lie.
+        return None
+
+    # 5. Plain US heuristic mirrors get_primary_exchange's fallback
+    if s.isalpha() and 1 <= len(s) <= 5:
+        return "United States"
+
+    cls_match = CLASS_DOT_RE.match(s)
+    if cls_match and 1 <= len(cls_match.group(1)) <= 5:
+        return "United States"
 
     return None
 
