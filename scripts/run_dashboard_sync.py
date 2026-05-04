@@ -3,17 +3,75 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.5.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.6.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
-Why this revision (v6.5.0 vs v6.4.0)
+Why this revision (v6.6.0 vs v6.5.0)
 -------------------------------------
+- 📌 PASSIVE upgrade. v6.6.0 ships ALONGSIDE the new "Insights" column
+     group introduced by:
+        core/sheets/schema_registry.py   v2.5.0 → v2.6.0   (85→90 / 88→93)
+        core/scoring.py                  v5.0.0 → v5.1.0
+        core/reco_normalize.py           v7.0.0 → v7.1.0
+        core/insights_builder.py         NEW v1.0.0
+     The 5 new columns are:
+        sector_relative_score, conviction_score,
+        top_factors, top_risks, position_size_hint
+     These appear at the END of the canonical schema, so every existing
+     positional index is preserved.
+
+     **No code changes are required in this runner.** This sync runner is
+     payload-shape-agnostic — it reads `headers` and `rows`/`rows_matrix`
+     directly from the backend response and writes them to Sheets verbatim.
+     When the backend (which depends on schema_registry v2.6.0) starts
+     returning 90-column rows for canonical pages and 93-column rows for
+     Top_10_Investments, this runner will write them correctly without
+     any modification, because:
+
+       • _extract_table_payload() uses the backend's `headers` array as
+         the column count source of truth (no hardcoded width).
+       • _rectify_matrix() pads/truncates each row to len(headers), so
+         additional columns in the response become additional sheet
+         columns automatically.
+       • SheetsWriter.write_table() writes whatever (headers, rows) it
+         is handed, with no assumptions about the schema.
+
+     The version bump is therefore a doc + co-deployment marker only:
+     it tells operators "this binary was tested against the v2.6.0
+     schema family." Behavior on v2.5.0 backends is unchanged.
+
+- DOC: changelog refreshed; co-deployment matrix added below.
+
+- BEHAVIOR: byte-for-byte equivalent to v6.5.0 except for SCRIPT_VERSION
+     and SERVICE_VERSION strings. Every preserved fix from v6.5.0 (sys
+     import, _TRUTHY/_FALSY parity, env-var fallbacks, --json flag,
+     recursion guard, expanded exit-code docs) carries forward.
+
+Co-deployment matrix (v6.6.0 family)
+------------------------------------
+  Module                                Version    Role
+  -------                               -------    ----
+  core/sheets/schema_registry.py        2.6.0      +5 Insights columns at tail
+  core/scoring.py                       5.1.0      populates 5 Insights fields
+  core/reco_normalize.py                7.1.0      conviction floor gating
+  core/insights_builder.py              1.0.0      NEW — pure-function module
+  scripts/run_dashboard_sync.py         6.6.0      passive: this file
+  worker.py                             unchanged  no schema awareness needed
+
+Operators upgrading from v6.5.0 should deploy schema_registry,
+scoring, reco_normalize, and insights_builder at the same time as
+this runner. Deploying this runner alone is harmless (it will simply
+keep writing 85/88-column rows from a v2.5.0 backend, identical to
+v6.5.0 behavior).
+
+Why v6.5.0 was issued (preserved for traceability)
+--------------------------------------------------
 - 🔑 FIX CRITICAL: `import sys` was MISSING in v6.4.0 but the module bottom
      had `sys.exit(main())`. Every CLI invocation (`python run_dashboard_sync.py
      ...`) crashed with `NameError: name 'sys' is not defined` before returning
      an exit code. Only the worker integration path (`run_from_worker_payload`)
-     continued to work. v6.5.0 adds `import sys` at the top so CLI usage
+     continued to work. v6.5.0 added `import sys` at the top so CLI usage
      actually functions.
 
 - 🔑 FIX HIGH: `_TRUTHY` / `_FALSY` realigned to exact `main._TRUTHY` /
@@ -121,8 +179,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.5.0"
-SERVICE_VERSION = SCRIPT_VERSION  # v6.5.0: cross-script alias
+SCRIPT_VERSION = "6.6.0"
+SERVICE_VERSION = SCRIPT_VERSION  # cross-script alias
 
 # -----------------------------------------------------------------------------
 # Project-wide truthy/falsy vocabulary (matches main._TRUTHY / _FALSY)
@@ -850,6 +908,11 @@ def _extract_table_payload(
     v6.5.0: Added `_depth` guard (max _MAX_PAYLOAD_RECURSION levels) so
     malicious or malformed payloads with deeply nested `"data"` keys don't
     trigger RecursionError.
+
+    v6.6.0 note: This function is column-count-agnostic. When the v2.6.0
+    schema family backend starts returning 90-column rows (canonical) or
+    93-column rows (Top_10), `headers_list` simply has 90 / 93 entries and
+    everything downstream adapts.
     """
     if not isinstance(resp, dict):
         return [], []
