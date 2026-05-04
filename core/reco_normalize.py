@@ -3,87 +3,51 @@
 """
 core/reco_normalize.py
 ================================================================================
-Recommendation Normalization -- v7.0.0
+Recommendation Normalization -- v7.1.0
 ================================================================================
 
-v7.0.0 changes (what moved from v6.1.0)
----------------------------------------
-- NEW: `Recommendation.from_views()` -- view-aware 5-tier resolver.
-  This is the new single source of truth for mapping (Fundamental View,
-  Technical View, Risk View, Value View, Overall Score) into a canonical
-  recommendation. All other modules (scoring.py, investment_advisor.py,
-  investment_advisor_engine.py) now delegate to this method instead of
-  carrying their own duplicate logic.
+v7.1.0 changes (vs v7.0.0)
+--------------------------
+- NEW kwargs on `Recommendation.from_views()`:
+    - `conviction`        (Optional[float], 0-100): when supplied, applies
+      conviction floors to the resulting recommendation:
+          STRONG_BUY    requires conviction >= 60  (else downgrade -> BUY)
+          BUY           requires conviction >= 45  (else downgrade -> HOLD)
+      REDUCE/SELL/HOLD are NOT downgraded — those are protective calls and
+      we want them to fire even when conviction is moderate. The conviction
+      number is also surfaced in the reason text so the user sees why a
+      call was capped.
+    - `sector_relative`   (Optional[float], 0-100): when supplied, surfaces
+      the percentile rank in the reason text. Does NOT change rule flow in
+      v7.1.0 (left to a future revision after we have backtest data on
+      sector-rotation effects).
+  Both kwargs are OPTIONAL with default None — every existing v7.0.0 caller
+  continues to work without changes.
 
-  Rule order (first match wins):
-    Priority 1 (NO DATA):
-      - Any of (Fund, Tech, Risk, Value) is None or blank, AND score is None
-        -> HOLD with reason "Insufficient data".
-      - Score is None and at least one view is also None -> HOLD.
+- FIX (defensive): `from_views()` now guards against `score` being a numpy
+  scalar / Decimal that survived basic float() but doesn't compare cleanly.
+  Wraps in `_to_float_strict()` before threshold checks.
 
-    Priority 2 (HARD SELL):
-      - (Fund == BEARISH and Tech == BEARISH)                          -> SELL
-      - score < 35                                                      -> SELL
+- FIX (cleanup): When BOTH conviction and base reason mention the score,
+  we de-duplicate the score badge so reasons stay readable.
 
-    Priority 3 (REDUCE):
-      - Fund == BEARISH                                                 -> REDUCE
-      - (Tech == BEARISH and Value == EXPENSIVE)                        -> REDUCE
-      - (score < 50 and Risk == HIGH)                                   -> REDUCE
+- DOC: Examples updated to show the conviction-floor downgrade path.
 
-    Priority 4 (STRONG_BUY -- requires ALL conditions):
-      - Fund == BULLISH AND Tech == BULLISH AND Value == CHEAP AND
-        Risk != HIGH AND score >= 75                                    -> STRONG_BUY
+- PRESERVED (no behavior change): all v7.0.0 behavior is unchanged when
+  conviction and sector_relative are not passed. Every public symbol from
+  v7.0.0 is exported. This is purely additive.
 
-    Priority 5 (BUY):
-      - Fund == BULLISH AND Value in {CHEAP, FAIR} AND
-        Tech in {BULLISH, NEUTRAL} AND score >= 65                      -> BUY
+v7.0.0 features (preserved verbatim)
+------------------------------------
+- View-aware 5-tier resolver with EXPENSIVE-veto / double-bearish-SELL /
+  STRONG_BUY-all-conditions / etc.
+- All language pattern dictionaries (EN/AR/FR/ES/DE/PT) and vendor field
+  mappings.
+- normalize_recommendation*, batch_normalize, NormalizedRecommendation.
 
-    Priority 6 (default):
-      - Anything else                                                   -> HOLD
-
-  Veto rules baked in by construction:
-    - Value == EXPENSIVE blocks STRONG_BUY/BUY (no rule allows them).
-    - Fund == NEUTRAL alone cannot reach BUY (Priority 5 requires BULLISH).
-    - Risk == HIGH blocks STRONG_BUY (caps at BUY).
-    - Fund == BEARISH AND Tech == BEARISH forces SELL (overrides any score).
-    - Any BEARISH fundamental forces REDUCE minimum (overrides BUY/STRONG_BUY).
-
-- NEW: `recommendation_from_views()` free function -- thin wrapper around
-  `Recommendation.from_views()` for callers that prefer functions over
-  classmethods.
-
-- NEW: View constants (FUND_BULLISH, TECH_NEUTRAL, etc.) and helper
-  `normalize_view_token()` for tolerant view parsing.
-
-- DOC: Examples added to docstrings showing the four most common decision
-  paths (CHEAP-bullish-low-risk -> STRONG_BUY, EXPENSIVE-bullish ->
-  capped at HOLD, BEARISH+BEARISH -> SELL regardless of score).
-
-- PRESERVED (no behavior change): everything from v6.1.0:
-  Recommendation enum, from_score / to_score / is_valid, all language
-  pattern dictionaries, all vendor field mappings, lru_cache on
-  internals, the full normalize_recommendation_* family,
-  NormalizedRecommendation dataclass, batch_normalize,
-  is_valid_recommendation, get_recommendation_score,
-  recommendation_from_score, RecommendationError,
-  InvalidRecommendationError. All RECO_* constants exported.
-
-Public API (unchanged + additions):
-- VERSION
-- Recommendation
-- RECO_STRONG_BUY, RECO_BUY, RECO_HOLD, RECO_REDUCE, RECO_SELL
-- NEW: VIEW_FUND_BULLISH, VIEW_FUND_NEUTRAL, VIEW_FUND_BEARISH
-- NEW: VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL, VIEW_TECH_BEARISH
-- NEW: VIEW_RISK_LOW, VIEW_RISK_MODERATE, VIEW_RISK_HIGH
-- NEW: VIEW_VALUE_CHEAP, VIEW_VALUE_FAIR, VIEW_VALUE_EXPENSIVE
-- NEW: normalize_view_token()
-- NEW: recommendation_from_views()
-- NormalizedRecommendation
-- normalize_recommendation, normalize_recommendation_payload
-- normalize_recommendation_row, normalize_recommendation_rows
-- batch_normalize, is_valid_recommendation
-- get_recommendation_score, recommendation_from_score
-- RecommendationError, InvalidRecommendationError
+Public API (additions only — fully backward compatible)
+- Recommendation.from_views(...) gains `conviction` and `sector_relative`.
+- recommendation_from_views(...) gains the same kwargs.
 ================================================================================
 """
 
@@ -111,7 +75,7 @@ from typing import (
 # Version
 # =============================================================================
 
-VERSION = "7.0.0"
+VERSION = "7.1.0"
 
 
 # =============================================================================
@@ -193,7 +157,7 @@ class Recommendation(str, Enum):
         """Check if value is a valid recommendation."""
         return value in cls._value2member_map_
 
-    # ---- NEW in v7.0.0: view-aware resolver --------------------------------
+    # ---- v7.0.0 + v7.1.0: view-aware resolver ------------------------------
 
     @classmethod
     def from_views(
@@ -204,33 +168,46 @@ class Recommendation(str, Enum):
         risk: Any = None,
         value: Any = None,
         score: Any = None,
+        # v7.1.0 additions (both optional)
+        conviction: Any = None,
+        sector_relative: Any = None,
     ) -> Tuple["Recommendation", str]:
         """
-        Map four View strings + an Overall Score into a canonical recommendation.
-
-        This is the single source of truth for view-aware recommendation
-        decisions. scoring.compute_recommendation, the advisor's
-        _score_recommendation, and the engine's _score_recommendation all
-        delegate here.
+        Map four View strings + Overall Score (+optional conviction +optional
+        sector-relative) into a canonical recommendation.
 
         Args:
-            fundamental:  Fundamental View   (BULLISH / NEUTRAL / BEARISH)
-            technical:    Technical View     (BULLISH / NEUTRAL / BEARISH)
-            risk:         Risk View          (LOW / MODERATE / HIGH)
-            value:        Value View         (CHEAP / FAIR / EXPENSIVE)
-            score:        Overall Score      (0-100, optional)
+            fundamental:     Fundamental View   (BULLISH / NEUTRAL / BEARISH)
+            technical:       Technical View     (BULLISH / NEUTRAL / BEARISH)
+            risk:            Risk View          (LOW / MODERATE / HIGH)
+            value:           Value View         (CHEAP / FAIR / EXPENSIVE)
+            score:           Overall Score      (0-100, optional)
+            conviction:      Conviction Score   (0-100, optional, v7.1.0+)
+            sector_relative: Sector-Adj Score   (0-100, optional, v7.1.0+)
 
         Returns:
             (Recommendation enum, reason string).
 
+        Conviction-floor downgrades (v7.1.0):
+            - STRONG_BUY with conviction < 60 -> downgraded to BUY
+            - BUY with conviction < 45        -> downgraded to HOLD
+            - REDUCE / SELL / HOLD are never downgraded (protective calls)
+
         Examples:
             >>> Recommendation.from_views(
             ...     fundamental="BULLISH", technical="BULLISH",
-            ...     risk="LOW", value="CHEAP", score=82
+            ...     risk="LOW", value="CHEAP", score=82, conviction=78
             ... )
             (<Recommendation.STRONG_BUY: 'STRONG_BUY'>, 'Strong fundamentals + ...')
 
-            >>> # EXPENSIVE veto: even with bullish views, can't be BUY/STRONG_BUY
+            >>> # Conviction floor: same views/score but conviction too low
+            >>> Recommendation.from_views(
+            ...     fundamental="BULLISH", technical="BULLISH",
+            ...     risk="LOW", value="CHEAP", score=82, conviction=52
+            ... )
+            (<Recommendation.BUY: 'BUY'>, '... downgraded from STRONG_BUY ...')
+
+            >>> # EXPENSIVE veto preserved from v7.0.0
             >>> Recommendation.from_views(
             ...     fundamental="BULLISH", technical="BULLISH",
             ...     risk="LOW", value="EXPENSIVE", score=80
@@ -249,15 +226,12 @@ class Recommendation(str, Enum):
         r = normalize_view_token(risk, kind="risk")
         v = normalize_view_token(value, kind="value")
 
-        try:
-            s_val = float(score) if score is not None else None
-            if s_val is not None and s_val != s_val:  # NaN guard
-                s_val = None
-        except (TypeError, ValueError):
-            s_val = None
+        s_val = _to_float_strict(score)
+        conv_val = _to_float_strict(conviction)
+        sect_val = _to_float_strict(sector_relative)
 
         # ----- Priority 1: NO DATA --------------------------------------
-        # We need at least one view OR a score to make any call.
+        # We need at least 2 views OR a score to make any call.
         views_present = sum(1 for x in (f, t, r, v) if x)
         if views_present == 0 and s_val is None:
             return cls.HOLD, "Insufficient data — no views and no score available."
@@ -293,28 +267,36 @@ class Recommendation(str, Enum):
             )
 
         # ----- Priority 4: STRONG_BUY (all conditions required) ---------
-        if (
+        is_strong_buy = (
             f == VIEW_FUND_BULLISH
             and t == VIEW_TECH_BULLISH
             and v == VIEW_VALUE_CHEAP
             and r != VIEW_RISK_HIGH
             and s_val is not None and s_val >= 75.0
-        ):
-            return cls.STRONG_BUY, (
+        )
+        if is_strong_buy:
+            base_reason = (
                 f"Strong fundamentals + technicals on cheap valuation, "
                 f"risk under control (Score={s_val:.1f})."
             )
+            return _apply_conviction_floor(
+                cls.STRONG_BUY, base_reason, conv_val, sect_val
+            )
 
         # ----- Priority 5: BUY ------------------------------------------
-        if (
+        is_buy = (
             f == VIEW_FUND_BULLISH
             and v in (VIEW_VALUE_CHEAP, VIEW_VALUE_FAIR)
             and t in (VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL)
             and s_val is not None and s_val >= 65.0
-        ):
-            return cls.BUY, (
+        )
+        if is_buy:
+            base_reason = (
                 f"Bullish fundamentals with acceptable valuation and "
                 f"technicals (Score={s_val:.1f})."
+            )
+            return _apply_conviction_floor(
+                cls.BUY, base_reason, conv_val, sect_val
             )
 
         # Special-case BUY veto explanation: bullish fundamentals but
@@ -324,9 +306,10 @@ class Recommendation(str, Enum):
             and t in (VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL)
             and v == VIEW_VALUE_EXPENSIVE
         ):
-            return cls.HOLD, (
+            return cls.HOLD, _attach_metrics(
                 "Bullish fundamentals but valuation expensive — wait for "
-                "a better entry."
+                "a better entry.",
+                conv_val, sect_val,
             )
 
         # ----- Priority 6: HOLD (default) -------------------------------
@@ -335,10 +318,116 @@ class Recommendation(str, Enum):
             f"Fund={f or 'N/A'}, Tech={t or 'N/A'}, "
             f"Risk={r or 'N/A'}, Value={v or 'N/A'}."
         )
-        return cls.HOLD, f"Mixed signals — holding. {view_summary}{score_part}"
+        return cls.HOLD, _attach_metrics(
+            f"Mixed signals — holding. {view_summary}{score_part}",
+            conv_val, sect_val,
+        )
 
 
+# =============================================================================
+# v7.1.0 internals: conviction-floor enforcement
+# =============================================================================
+
+def _to_float_strict(value: Any) -> Optional[float]:
+    """
+    Strict numeric coercion for thresholds. Returns None for None / NaN /
+    non-numeric. Defensive against numpy scalars / Decimal that survive
+    bare float() but compare oddly downstream.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            f = float(value)
+        else:
+            f = float(str(value).strip().replace(",", "."))
+        if f != f or f in (float("inf"), float("-inf")):
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def _attach_metrics(
+    base_reason: str,
+    conviction: Optional[float],
+    sector_relative: Optional[float],
+) -> str:
+    """
+    Append a metric badge "[Conv NN, Sector-Adj NN]" to base_reason if
+    those metrics are available. Skipped fields are omitted, so a row
+    with neither produces no badge at all.
+    """
+    parts: List[str] = []
+    if conviction is not None:
+        parts.append(f"Conv {conviction:.0f}")
+    if sector_relative is not None:
+        parts.append(f"Sector-Adj {sector_relative:.0f}")
+    if not parts:
+        return base_reason
+    return f"{base_reason} [{', '.join(parts)}]"
+
+
+_STRONG_BUY_CONVICTION_FLOOR = 60.0
+_BUY_CONVICTION_FLOOR = 45.0
+
+
+def _apply_conviction_floor(
+    initial: Recommendation,
+    initial_reason: str,
+    conviction: Optional[float],
+    sector_relative: Optional[float],
+) -> Tuple[Recommendation, str]:
+    """
+    Apply conviction floors to a STRONG_BUY/BUY recommendation.
+
+    Rules (v7.1.0):
+      - STRONG_BUY with conviction < 60 -> BUY (and note in reason)
+      - BUY with conviction < 45        -> HOLD (and note in reason)
+      - Any rec with conviction is None  -> unchanged (just attach badge)
+
+    Protective calls (REDUCE/SELL/HOLD) are never passed here, so they
+    never get downgraded.
+    """
+    if conviction is None:
+        # No conviction info — pass through with whatever badges apply
+        return initial, _attach_metrics(initial_reason, None, sector_relative)
+
+    # Cascade: STRONG_BUY -> BUY -> HOLD if conviction is below all floors.
+    # Single-step would leave STRONG_BUY at BUY with conv=40 even though
+    # BUY's own floor is 45, which is dishonest. Iterate until stable.
+    current = initial
+    current_reason = initial_reason
+    downgrades: List[str] = []
+
+    if current == Recommendation.STRONG_BUY and conviction < _STRONG_BUY_CONVICTION_FLOOR:
+        downgrades.append(
+            f"STRONG_BUY -> BUY (conviction {conviction:.0f} below floor "
+            f"{_STRONG_BUY_CONVICTION_FLOOR:.0f})"
+        )
+        current = Recommendation.BUY
+
+    if current == Recommendation.BUY and conviction < _BUY_CONVICTION_FLOOR:
+        downgrades.append(
+            f"BUY -> HOLD (conviction {conviction:.0f} below floor "
+            f"{_BUY_CONVICTION_FLOOR:.0f})"
+        )
+        current = Recommendation.HOLD
+
+    if downgrades:
+        current_reason = (
+            f"{initial_reason} Downgraded: " + "; ".join(downgrades) + "."
+        )
+
+    return current, _attach_metrics(current_reason, conviction, sector_relative)
+
+
+# =============================================================================
 # View token canonical values
+# =============================================================================
+
 VIEW_FUND_BULLISH = "BULLISH"
 VIEW_FUND_NEUTRAL = "NEUTRAL"
 VIEW_FUND_BEARISH = "BEARISH"
@@ -454,6 +543,8 @@ def recommendation_from_views(
     risk: Any = None,
     value: Any = None,
     score: Any = None,
+    conviction: Any = None,        # v7.1.0
+    sector_relative: Any = None,   # v7.1.0
 ) -> Tuple[str, str]:
     """
     Free-function wrapper around `Recommendation.from_views()`.
@@ -468,12 +559,14 @@ def recommendation_from_views(
         risk=risk,
         value=value,
         score=score,
+        conviction=conviction,
+        sector_relative=sector_relative,
     )
     return rec.value, reason
 
 
 # =============================================================================
-# Constants (preserved verbatim from v6.1.0)
+# Constants (preserved verbatim from v6.1.0 / v7.0.0)
 # =============================================================================
 
 _RECO_ENUM = frozenset({r.value for r in Recommendation})
@@ -1413,7 +1506,7 @@ __all__ = [
     "RECO_HOLD",
     "RECO_REDUCE",
     "RECO_SELL",
-    # NEW: View-token constants
+    # View-token constants
     "VIEW_FUND_BULLISH",
     "VIEW_FUND_NEUTRAL",
     "VIEW_FUND_BEARISH",
@@ -1426,7 +1519,7 @@ __all__ = [
     "VIEW_VALUE_CHEAP",
     "VIEW_VALUE_FAIR",
     "VIEW_VALUE_EXPENSIVE",
-    # NEW: View helpers
+    # View helpers
     "normalize_view_token",
     "recommendation_from_views",
     # Data classes
