@@ -2,11 +2,45 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.2
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.3
 ================================================================================
 
-WHY v5.47.2
+WHY v5.47.3
 -----------
+[CRITICAL] Percent-fraction fields are no longer pre-multiplied to percent
+points. v5.47.2 and earlier silently multiplied small-magnitude fraction
+values by 100 in seven places, which after the sheet display layer's own
+*100 step produced 100x-too-large output (NVDA -0.56% rendered as -56%,
+Aramco +0.65% diverged into the -86% noise via the same path, etc.).
+
+The contract is now consistent end-to-end:
+  - eodhd_provider v6.3.0 returns FRACTIONS for all percent fields
+    (e.g. -0.0056 for -0.56%, +0.0065 for +0.65%)
+  - data_engine_v2 v5.47.3 stores those fractions UNCHANGED
+  - sheet display layer applies its own *100 for percent formatting
+
+Affected fields:
+  - percent_change            (was pre-multiplied at canonicalize + history)
+  - week_52_position_pct      (was pre-multiplied at canonicalize + history)
+  - unrealized_pl_pct         (was pre-multiplied at canonicalize)
+  - max_drawdown_1y           (was pre-multiplied at history)
+  - var_95_1d                 (was pre-multiplied at history)
+
+v5.47.3 stores all of these as fractions. Internal helpers `_as_pct_points`
+and `_as_pct_fraction` already handled both shapes via the abs(>1.5)
+heuristic, so they continue to compute correctly against the now-fraction
+inputs without any code change.
+
+Operator note (sheet column formats):
+  RSI is correctly stored 0–100 (raw scale). Sharpe is correctly stored
+  as a unit-less ratio (e.g. 1.20). The reported "RSI 5,000%" and
+  "Sharpe 1,200%" anomalies are SHEET COLUMN FORMAT bugs in the
+  spreadsheet template, not engine bugs. To fix in the sheet:
+    - "RSI (14)"   column format → Number (not Percent)
+    - "Sharpe (1Y)" column format → Number (not Percent)
+
+WHY v5.47.2 (PRESERVED, see below for the full list)
+----------------------------------------------------
 - FIX: makes provider priority page-aware so non-KSA pages like
        Global_Markets, Commodities_FX, and Mutual_Funds prefer EODHD first
        while KSA pages keep their protected local-first routing.
@@ -508,6 +542,14 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _as_pct_fraction(x: Any) -> Optional[float]:
+    """
+    Coerce a percent-like value into a FRACTION (0.05 = 5%).
+
+    Heuristic: any |x| > 1.5 is treated as percent-points and divided by 100.
+    Use this when a field's source units are unknown and the heuristic is safe.
+    For known-fraction fields (e.g. percent_change after eodhd v6.3.0), DO NOT
+    apply this — store the value verbatim.
+    """
     v = _as_float(x)
     if v is None:
         return None
@@ -517,6 +559,14 @@ def _as_pct_fraction(x: Any) -> Optional[float]:
 
 
 def _as_pct_points(x: Any) -> Optional[float]:
+    """
+    Coerce a percent-like value into PERCENT POINTS (5.0 = 5%).
+
+    Inverse of _as_pct_fraction; multiplies sub-1.5 magnitudes by 100. Used
+    internally where downstream math expects percent-points (e.g. scoring
+    composites). Sheet display values must NOT pass through this helper —
+    the sheet's own *100 column format is the only display-side conversion.
+    """
     v = _as_float(x)
     if v is None:
         return None
@@ -1520,6 +1570,17 @@ def _coerce_datetime_like(value: Any) -> Optional[str]:
 
 
 def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", normalized_symbol: str = "", provider: str = "") -> Dict[str, Any]:
+    """
+    Normalize a provider patch into the canonical engine row shape.
+
+    v5.47.3 fix: percent-fraction fields are stored as FRACTIONS, never
+    pre-multiplied by 100. Three sites changed:
+      - percent_change       (fraction; was pre-multiplied via abs<=1.5 path)
+      - week_52_position_pct (fraction; was multiplied by 100 unconditionally)
+      - unrealized_pl_pct    (fraction; was multiplied by 100 unconditionally)
+    The downstream sheet display layer applies its own *100 percent format,
+    so the engine MUST keep the fraction representation intact.
+    """
     src = dict(row or {})
     flat = _flatten_scalar_fields(src)
     symbol = normalized_symbol or normalize_symbol(_safe_str(_lookup_alias_value(src, flat, "symbol") or requested_symbol))
@@ -1578,16 +1639,24 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if change is None and price is not None and prev is not None:
         change = price - prev
         out["price_change"] = round(change, 6)
+    # v5.47.3: store percent_change as a FRACTION (e.g. -0.0056 for -0.56%).
+    # If percent_change is missing, derive it as a fraction. If it's already
+    # present as a percent-points value (|x|>1.5), normalise it to fraction.
+    # Do NOT multiply small (already-fraction) values by 100 — that was the
+    # bug that turned NVDA -0.56% into -56% via the downstream *100 step.
     if pct is None and price is not None and prev not in (None, 0):
-        pct = ((price - prev) / prev) * 100.0
-        out["percent_change"] = round(pct, 6)
-    elif pct is not None and abs(pct) <= 1.5:
-        out["percent_change"] = round(pct * 100.0, 6)
+        pct = (price - prev) / prev
+        out["percent_change"] = round(pct, 8)
+    elif pct is not None and abs(pct) > 1.5:
+        out["percent_change"] = round(pct / 100.0, 8)
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
+    # v5.47.3: store week_52_position_pct as a FRACTION (e.g. 0.62 = 62% of
+    # the way from the 52w low to the 52w high). Was multiplied by 100 here,
+    # which after the sheet's *100 column format produced "6,200%" anomalies.
     if price is not None and high52 is not None and low52 is not None and high52 > low52 and out.get("week_52_position_pct") is None:
-        out["week_52_position_pct"] = round(((price - low52) / (high52 - low52)) * 100.0, 6)
+        out["week_52_position_pct"] = round((price - low52) / (high52 - low52), 6)
 
     qty = _as_float(out.get("position_qty"))
     avg_cost = _as_float(out.get("avg_cost"))
@@ -1600,8 +1669,9 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if pos_val is not None and pos_cost is not None and out.get("unrealized_pl") is None:
         out["unrealized_pl"] = round(pos_val - pos_cost, 6)
     upl = _as_float(out.get("unrealized_pl"))
+    # v5.47.3: store unrealized_pl_pct as a FRACTION. Was *100 here.
     if upl is not None and pos_cost not in (None, 0) and out.get("unrealized_pl_pct") is None:
-        out["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
+        out["unrealized_pl_pct"] = round(upl / pos_cost, 6)
 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
     if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
@@ -1881,12 +1951,6 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
     Each view returns "N/A" when its inputs are entirely absent.
 
     Returns (fundamental_view, technical_view, risk_view, value_view).
-
-    Verdict rules (intentionally absolute thresholds for explainability):
-      Fundamental View  : BULLISH/NEUTRAL/BEARISH from quality_score+growth_score
-      Technical View    : BULLISH/NEUTRAL/BEARISH from momentum_score+rsi_14
-      Risk View         : LOW/MODERATE/HIGH from risk_score
-      Value View        : CHEAP/FAIR/EXPENSIVE from valuation_score+intrinsic vs price
     """
     quality = _as_float(row.get("quality_score"))
     growth = _as_float(row.get("growth_score"))
@@ -1897,7 +1961,6 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
     intrinsic = _as_float(row.get("intrinsic_value"))
     current = _as_float(row.get("current_price"))
 
-    # ---- Fundamental View ----
     if quality is None and growth is None:
         fund_view = "N/A"
     else:
@@ -1911,7 +1974,6 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
         else:
             fund_view = "NEUTRAL"
 
-    # ---- Technical View ----
     if momentum is None and rsi is None:
         tech_view = "N/A"
     else:
@@ -1924,11 +1986,11 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
                 bearish_signals += 1
         if rsi is not None:
             if rsi >= 70:
-                bearish_signals += 1   # overbought
+                bearish_signals += 1
             elif rsi <= 30:
-                bullish_signals += 1   # oversold (mean-reversion)
+                bullish_signals += 1
             elif 45 <= rsi <= 60:
-                bullish_signals += 1   # healthy uptrend zone
+                bullish_signals += 1
         if bullish_signals > bearish_signals:
             tech_view = "BULLISH"
         elif bearish_signals > bullish_signals:
@@ -1936,7 +1998,6 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
         else:
             tech_view = "NEUTRAL"
 
-    # ---- Risk View ----
     if risk is None:
         risk_view = "N/A"
     elif risk <= 35:
@@ -1946,14 +2007,12 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
     else:
         risk_view = "MODERATE"
 
-    # ---- Value View ----
     upside_pct: Optional[float] = None
     if intrinsic is not None and current is not None and current > 0:
         upside_pct = (intrinsic - current) / current
     if valuation is None and upside_pct is None:
         value_view = "N/A"
     else:
-        # Prefer concrete upside when available; fall back to score banding
         if upside_pct is not None:
             if upside_pct >= 0.15:
                 value_view = "CHEAP"
@@ -1962,7 +2021,6 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
             else:
                 value_view = "FAIR"
         else:
-            # valuation_score: higher = better (more undervalued)
             if valuation is not None and valuation >= 70:
                 value_view = "CHEAP"
             elif valuation is not None and valuation <= 35:
@@ -1977,40 +2035,25 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     """
     Backfill `intrinsic_value` and `upside_pct` when the upstream provider
     did not supply them. Idempotent: never overwrites a real upstream value.
-
-    Intrinsic value heuristic (used only when upstream lacks it):
-      Combines a forward-PE multiple, a graham-style sqrt(eps*growth) anchor,
-      and the average of available analyst forecast targets. Returns the
-      median of the available signals so a single noisy input can't dominate.
-
-    Upside %:
-      (intrinsic_value - current_price) / current_price, written as a
-      decimal fraction (e.g. 0.08 = +8%) — matches how the route layer's
-      Layout A column "Upside %" reads it.
     """
     price = _as_float(row.get("current_price"))
     if price is None or price <= 0:
-        return  # Nothing to anchor against
+        return
 
     intrinsic = _as_float(row.get("intrinsic_value"))
 
-    # ---- Backfill intrinsic_value if missing ----
     if intrinsic is None:
         candidates: List[float] = []
 
-        # Signal 1: Forward-PE-based fair value
         eps = _as_float(row.get("eps_ttm"))
         pe_fwd = _as_float(row.get("pe_forward"))
         pe_ttm = _as_float(row.get("pe_ttm"))
         if eps is not None and eps > 0 and pe_fwd is not None and pe_fwd > 0:
-            # If forward PE is below trailing PE, market sees growth → fair value at trailing PE
             anchor_pe = max(pe_fwd, min(pe_ttm or pe_fwd, 25.0))
             candidates.append(eps * anchor_pe)
         elif eps is not None and eps > 0 and pe_ttm is not None and 0 < pe_ttm < 50:
-            # Use sector-neutral 18x trailing PE as anchor when only TTM available
             candidates.append(eps * 18.0)
 
-        # Signal 2: Forecast price targets (analyst / model)
         forecasts: List[float] = []
         for key in ("forecast_price_3m", "forecast_price_12m", "forecast_price_1m"):
             fp = _as_float(row.get(key))
@@ -2019,10 +2062,9 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
         if forecasts:
             candidates.append(sum(forecasts) / len(forecasts))
 
-        # Signal 3: Graham-style sqrt(eps × growth × multiplier) anchor
         rev_growth = _as_pct_points(row.get("revenue_growth_yoy"))
         if eps is not None and eps > 0 and rev_growth is not None:
-            growth_capped = max(0.0, min(rev_growth, 25.0))   # cap at 25% to avoid blowups
+            growth_capped = max(0.0, min(rev_growth, 25.0))
             anchor = eps * (8.5 + 2.0 * growth_capped)
             if anchor > 0:
                 candidates.append(anchor)
@@ -2034,11 +2076,9 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
                 intrinsic = candidates[mid]
             else:
                 intrinsic = (candidates[mid - 1] + candidates[mid]) / 2.0
-            # Sanity-cap: never claim more than 3x or less than 0.3x current price
             intrinsic = max(price * 0.3, min(intrinsic, price * 3.0))
             row["intrinsic_value"] = round(intrinsic, 2)
 
-    # ---- Compute upside_pct ----
     intrinsic = _as_float(row.get("intrinsic_value"))
     if intrinsic is not None and intrinsic > 0 and row.get("upside_pct") is None:
         upside = (intrinsic - price) / price
@@ -2047,26 +2087,14 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
     """
-    Populate recommendation, recommendation_reason, AND the four view columns
-    (fundamental_view, technical_view, risk_view, value_view).
-
-    Also backfills `intrinsic_value` and `upside_pct` when the upstream
-    provider did not supply them, so the Layout A schema columns never
-    render blank.
-
-    Idempotent: if recommendation is already set we still ensure the view
-    columns are present so callers re-running the engine don't drop the views.
+    Populate recommendation, recommendation_reason, AND the four view columns.
     """
-    # Backfill intrinsic_value + upside_pct BEFORE deriving views so the
-    # value_view path can read a populated upside_pct on its first call.
     _compute_intrinsic_and_upside(row)
 
     overall = _as_float(row.get("overall_score")) or 50.0
     conf = _as_float(row.get("confidence_score")) or 55.0
     risk = _as_float(row.get("risk_score")) or 50.0
 
-    # Always derive the four views (cheap, idempotent) so the schema columns
-    # never go blank on re-runs or fast-path re-emits.
     fund_view, tech_view, risk_view, value_view = _derive_views(row)
     row.setdefault("fundamental_view", fund_view)
     row.setdefault("technical_view", tech_view)
@@ -3495,6 +3523,19 @@ class DataEngineV5:
         return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
 
     def _compute_history_patch_from_rows(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Compute a quote patch from historical OHLCV rows.
+
+        v5.47.3 fix: percent-fraction fields are stored as FRACTIONS, not
+        pre-multiplied to percent-points. Four sites changed in this method:
+          - max_drawdown_1y      (was abs(max_dd) * 100.0; now abs(max_dd))
+          - var_95_1d            (was var95 * 100.0; now var95)
+          - percent_change       (was *100; now fraction (cur-prev)/prev)
+          - week_52_position_pct (was *100; now fraction (cp-lo)/(hi-lo))
+        These match the canonical fraction contract enforced elsewhere in the
+        engine. Volatilities (vol30/vol90) and Sharpe stay as their natural
+        units (annualised stdev as a fraction; Sharpe unit-less).
+        """
         closes: List[float] = []
         highs: List[float] = []
         lows: List[float] = []
@@ -3559,6 +3600,9 @@ class DataEngineV5:
             if peak > 0:
                 dd = (price / peak) - 1.0
                 max_dd = min(max_dd, dd)
+        # v5.47.3: max_drawdown_1y stored as FRACTION (e.g. 0.30 = 30% drawdown)
+        # v5.47.3: var_95_1d stored as FRACTION (e.g. 0.025 = 2.5% daily VaR)
+        # v5.47.3: percent_change stored as FRACTION
         patch: Dict[str, Any] = {
             "current_price": closes[-1],
             "previous_close": closes[-2],
@@ -3571,20 +3615,21 @@ class DataEngineV5:
             "avg_volume_30d": self._safe_mean(volumes[-30:]) if volumes else None,
             "volatility_30d": vol30,
             "volatility_90d": vol90,
-            "max_drawdown_1y": abs(max_dd) * 100.0,
-            "var_95_1d": var95 * 100.0 if var95 is not None else None,
+            "max_drawdown_1y": abs(max_dd),
+            "var_95_1d": var95 if var95 is not None else None,
             "sharpe_1y": sharpe,
             "rsi_14": rsi,
             "price_change": closes[-1] - closes[-2],
-            "percent_change": ((closes[-1] - closes[-2]) / closes[-2]) * 100.0 if closes[-2] not in (None, 0) else None,
+            "percent_change": (closes[-1] - closes[-2]) / closes[-2] if closes[-2] not in (None, 0) else None,
             "volume": volumes[-1] if volumes else None,
         }
+        # v5.47.3: week_52_position_pct stored as FRACTION (e.g. 0.62 = 62% of range)
         if patch.get("current_price") is not None and patch.get("week_52_high") is not None and patch.get("week_52_low") is not None:
             hi = _as_float(patch.get("week_52_high"))
             lo = _as_float(patch.get("week_52_low"))
             cp = _as_float(patch.get("current_price"))
             if hi is not None and lo is not None and cp is not None and hi > lo:
-                patch["week_52_position_pct"] = ((cp - lo) / (hi - lo)) * 100.0
+                patch["week_52_position_pct"] = (cp - lo) / (hi - lo)
         return {k: v for k, v in patch.items() if v is not None}
 
     async def _fetch_history_patch(self, provider: str, symbol: str) -> Dict[str, Any]:
@@ -3916,6 +3961,7 @@ class DataEngineV5:
     get_analysis_quotes_batch = get_enriched_quotes_batch
     quotes_batch = get_enriched_quotes_batch
     get_quote_dict = get_enriched_quote_dict
+
 
     # ------------------------------------------------------------------
     # builder fallbacks
