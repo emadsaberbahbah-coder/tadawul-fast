@@ -2,8 +2,9 @@
 # core/sheets/schema_registry.py
 """
 ================================================================================
-Schema Registry — v2.5.0
-(CANONICAL / SHEET-FIRST / STARTUP-SAFE / ALIAS-HARDENED / VIEW-AWARE FAMILY)
+Schema Registry — v2.6.0
+(CANONICAL / SHEET-FIRST / STARTUP-SAFE / ALIAS-HARDENED / VIEW-AWARE FAMILY /
+ INSIGHTS-EXTENDED)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -20,80 +21,70 @@ Hard rules:
 - Missing values are allowed (null/empty), but columns MUST exist
 - No network calls. Import-safe.
 
-Special sheets (must NOT fall back to the 85-col instrument schema):
+Special sheets (must NOT fall back to the canonical instrument schema):
 - Insights_Analysis: 7 columns (plus criteria_fields metadata)
-- Top_10_Investments: 88 columns (85 canonical + 3 Top10 extras)
+- Top_10_Investments: canonical + 3 Top10 extras
 - Data_Dictionary: 9 columns (generated from registry)
 
-Cross-module integration (v5/v7 family)
----------------------------------------
+Cross-module integration (v5/v7 family + v2.6.0)
+------------------------------------------------
 The four "Views" columns (Fundamental / Technical / Risk / Value) are the
 contract between the scoring engine and the recommendation engine:
 
-  - core.scoring v5.0.0 derives them via derive_fundamental_view(),
-    derive_technical_view(), derive_risk_view(), derive_value_view()
-    and writes them to AssetScores.
-  - core.reco_normalize v7.0.0 consumes them via
-    Recommendation.from_views() / recommendation_from_views() to apply
-    the 5-tier priority cascade with EXPENSIVE/double-bearish vetoes.
-  - core.investment_advisor v5.1.1 and core.investment_advisor_engine
-    v4.2.0 read them out of rows when synthesising recommendations.
+  - core.scoring v5.1.0 derives them via derive_fundamental_view(),
+    derive_technical_view(), derive_risk_view(), derive_value_view() and
+    writes them to AssetScores.
+  - core.reco_normalize v7.1.0 consumes them via Recommendation.from_views()
+    / recommendation_from_views() to apply the 5-tier priority cascade with
+    EXPENSIVE/double-bearish vetoes AND the new conviction-floor downgrade.
 
-Adding/removing a View column here without matching changes in those
-modules will break the recommendation pipeline. The four current
-view columns are baked into all four downstream consumers.
+The five "Insights" columns added in v2.6.0 (sector_relative_score,
+conviction_score, top_factors, top_risks, position_size_hint) are produced
+by core.insights_builder v1.0.0 from a fully-scored row plus an optional
+sector cohort. They sit in their own group at the END of the schema so all
+existing positional indices are preserved.
 
 ================================================================================
 Changelog
 ================================================================================
 
-v2.5.0 (current)
-- Version aligned with the view-aware recommendation family
-  (scoring v5.0.0, reco_normalize v7.0.0, scoring_engine v3.4.0,
-  investment_advisor v5.1.1, investment_advisor_engine v4.2.0).
-- NEW EXPORT: `VIEW_COLUMN_KEYS` -- tuple of the four canonical view
-  column keys for downstream code that needs to project/select them.
-- DOC: Sharpened the `value_view` notes to reflect actual derivation
-  (uses upside_pct + valuation_score, not "valuation_score+intrinsic"
-  as the v2.4.0 notes claimed).
-- DOC: Sharpened the `risk_view` notes to clarify the uppercase token
-  vocabulary (LOW/MODERATE/HIGH) is distinct from the existing
-  `risk_bucket` column's mixed-case vocabulary (Low/Moderate/High).
-- DOC: Header docstring now reflects the `Upside %` addition that
-  shipped in v2.4.0 (its column was already present in code; only
-  docstring lagged).
-- DOC: Cross-module integration note added so future maintainers know
-  which downstream files break if the View columns move.
-- BEHAVIOUR: NO structural schema changes. Every key, every header,
-  every group, every position is identical to v2.4.0. This is purely
-  a doc + export + version-alignment release.
+v2.6.0 (current)
+- NEW: "Insights" column group at the END of the canonical schema. Five
+  columns added (canonical 85 -> 90; Top10 88 -> 93):
+    1. sector_relative_score (float, 0-100, model)
+    2. conviction_score      (float, 0-100, model)
+    3. top_factors           (str,  text,    derived)
+    4. top_risks             (str,  text,    derived)
+    5. position_size_hint    (str,  text,    derived)
+  All five are appended at the end so existing positional indices are
+  untouched. Downstream callers using keyed access continue to work
+  unchanged. Callers using positional indexing for the END of the schema
+  must be updated to expect 90 columns instead of 85.
+- NEW EXPORT: `INSIGHTS_COLUMN_KEYS` — tuple of the five new keys, similar
+  in spirit to `VIEW_COLUMN_KEYS` from v2.5.0.
+- NEW VALIDATION: instrument_table now requires the five Insights columns
+  AND the four View columns. Both are enforced at validation time.
+- BUMP: instrument_table column count 85 -> 90, Top10 88 -> 93 in
+  validate_schema_registry.
+- DOC: Cross-module integration note expanded to cover insights_builder.
+
+v2.5.0
+- Version aligned with the view-aware recommendation family.
+- NEW EXPORT: `VIEW_COLUMN_KEYS`.
+- DOC sharpening on `value_view`, `risk_view`, `Upside %`.
 
 v2.4.0
-- Added `Upside %` (key: `upside_pct`) to the Valuation group as a
-  proper canonical column. Previously some downstream modules emitted
-  it without a schema home.
-- Bumped instrument_table column count from 84 → 85 and Top10 from
-  87 → 88 in `validate_schema_registry`.
+- Added `Upside %` (key: `upside_pct`) to the Valuation group.
+- Bumped instrument_table 84 -> 85 and Top10 87 -> 88.
 
 v2.3.0
-- Added the four "Views" columns (Fundamental View, Technical View,
-  Risk View, Value View) between Scores and Recommendation. These are
-  produced by core.scoring v5.0.0 and consumed by core.reco_normalize
-  v7.0.0's view-aware recommendation logic.
+- Added the four "Views" columns (Fundamental / Technical / Risk / Value).
 
 v2.2.0
-- Sanitization keeps removing BLANK/EMPTY columns.
-- FIX: Top10 extra columns are sanitized as a *fragment* (no "first
-  column must be symbol" rule). This prevents import-time validation
-  crashes that cause schema endpoints to fail and downstream consumers
-  to fall back to tiny schemas (Symbol/Error only).
-- Startup-safe validation: by default, validation errors do NOT crash
-  import. Set STRICT_SCHEMA_VALIDATION=1 to raise (CI / tests).
-- Canonical sheet lookup now supports stable aliases / case / space /
-  hyphen variants.
-- Snapshot digest now captures groups / formats / required flags for
-  stronger drift detection.
-
+- Top10 extras sanitized as a fragment.
+- Startup-safe validation (STRICT_SCHEMA_VALIDATION=1 to raise).
+- Stable sheet-name aliases.
+- Snapshot digest captures groups / formats / required flags.
 ================================================================================
 """
 
@@ -113,6 +104,7 @@ __all__ = [
     "SCHEMA_REGISTRY",
     "CANONICAL_SHEETS",
     "VIEW_COLUMN_KEYS",
+    "INSIGHTS_COLUMN_KEYS",
     "SCHEMA_VALIDATED_OK",
     "SCHEMA_VALIDATION_ERRORS",
     "list_sheets",
@@ -130,7 +122,7 @@ __all__ = [
     "validate_schema_registry",
 ]
 
-SCHEMA_VERSION = "2.5.0"
+SCHEMA_VERSION = "2.6.0"
 
 
 # Canonical view column keys, exposed for downstream code that needs to
@@ -141,6 +133,18 @@ VIEW_COLUMN_KEYS: Tuple[str, ...] = (
     "technical_view",
     "risk_view",
     "value_view",
+)
+
+
+# v2.6.0: Insights column keys, mirror role of VIEW_COLUMN_KEYS for the
+# new "Insights" column group. Order follows the column order in the
+# canonical schema.
+INSIGHTS_COLUMN_KEYS: Tuple[str, ...] = (
+    "sector_relative_score",
+    "conviction_score",
+    "top_factors",
+    "top_risks",
+    "position_size_hint",
 )
 
 
@@ -161,12 +165,19 @@ _ALLOWED_DTYPES = {
 }
 
 _ALLOWED_KINDS = {
-    "instrument_table",   # standard 85 columns row-per-symbol
+    "instrument_table",   # standard canonical columns row-per-symbol
     "insights_analysis",  # criteria block + insights table (7 cols)
     "data_dictionary",    # auto-generated from schema
 }
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
+
+# Canonical column counts (centralized so the docstring, validation code,
+# and any downstream sanity-checkers agree on a single source of truth).
+_CANONICAL_INSTRUMENT_COLS = 90  # v2.6.0: 85 + 5 new Insights columns
+_TOP10_TOTAL_COLS = 93           # v2.6.0: 90 + 3 Top10 extras
+_INSIGHTS_ANALYSIS_COLS = 7
+_DATA_DICTIONARY_COLS = 9
 
 
 @dataclass(frozen=True)
@@ -263,12 +274,12 @@ def _sanitize_sheet(spec: SheetSpec) -> SheetSpec:
 
 
 # -----------------------------
-# Canonical columns (85)
+# Canonical columns (90 in v2.6.0)
 # -----------------------------
 
 def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     """
-    Canonical 85 columns used by:
+    Canonical 90 columns used by:
       Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds, My_Portfolio
 
     Column groups and counts (running total):
@@ -277,19 +288,21 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
       Liquidity (6)        -> 24
       Fundamentals (12)    -> 36
       Risk (8)             -> 44
-      Valuation (7)        -> 51   (includes Upside % since v2.4.0)
+      Valuation (7)        -> 51   (Upside % since v2.4.0)
       Forecast (9)         -> 60
       Scores (7)           -> 67
       Views (4)            -> 71   (added v2.3.0)
       Recommendation (4)   -> 75
       Portfolio (6)        -> 81
       Provenance (4)       -> 85
+      Insights (5)         -> 90   (added v2.6.0)
 
     IMPORTANT:
     - Keep keys stable.
     - Add only at the END to preserve compatibility, OR bump SCHEMA_VERSION
       AND coordinate with core.scoring / core.reco_normalize / both
       investment_advisor* modules and their fallback column lists.
+    - v2.6.0 added at END, so existing positional indices are unchanged.
     """
     cols: List[ColumnSpec] = []
 
@@ -391,9 +404,9 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     # Views (4) -> total 71   (added v2.3.0)
     #
     # The four View columns are derived from the underlying scores by
-    # core.scoring v5.0.0 (functions: derive_fundamental_view,
+    # core.scoring v5.1.0 (functions: derive_fundamental_view,
     # derive_technical_view, derive_risk_view, derive_value_view) and
-    # then consumed by core.reco_normalize v7.0.0's view-aware 5-tier
+    # then consumed by core.reco_normalize v7.1.0's view-aware 5-tier
     # rule cascade in Recommendation.from_views() /
     # recommendation_from_views(). Moving these columns or renaming
     # their keys requires coordinated changes in those modules AND in
@@ -426,7 +439,7 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
 
     # Recommendation (4) -> total 75
     add("Recommendation", "Recommendation", "recommendation", "str", "text", False, "model/derived", "5-tier canonical token: STRONG_BUY / BUY / HOLD / REDUCE / SELL.")
-    add("Recommendation", "Recommendation Reason", "recommendation_reason", "str", "text", False, "model", "Short explanation for UI.")
+    add("Recommendation", "Recommendation Reason", "recommendation_reason", "str", "text", False, "model", "Structured explanation. v2.6.0+ format: 'Action: REC, Conv NN/100, Sector-Adj NN | Top factors: ... | Top risks: ... | <base reason>'.")
     add("Recommendation", "Horizon Days", "horizon_days", "int", "0", False, "criteria/derived", "Internal horizon in days.")
     add("Recommendation", "Invest Period Label", "invest_period_label", "str", "text", False, "derived", "1M / 3M / 12M label.")
 
@@ -443,6 +456,50 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     add("Provenance", "Last Updated (UTC)", "last_updated_utc", "datetime", "yyyy-mm-dd hh:mm:ss", False, "system", "Last update UTC.")
     add("Provenance", "Last Updated (Riyadh)", "last_updated_riyadh", "datetime", "yyyy-mm-dd hh:mm:ss", False, "system", "Last update Asia/Riyadh.")
     add("Provenance", "Warnings", "warnings", "str", "text", False, "system", "Non-fatal warnings / missing fields summary.")
+
+    # Insights (5) -> total 90  (added v2.6.0)
+    #
+    # The five Insights columns are produced by core.insights_builder v1.0.0
+    # from a fully-scored row (component scores + views + recommendation)
+    # plus an optional sector cohort. Conviction is fed back into
+    # core.reco_normalize v7.1.0+'s Recommendation.from_views() to enforce
+    # conviction-floor downgrades.
+    add(
+        "Insights", "Sector-Adj Score", "sector_relative_score",
+        "float", "0.00", False, "model",
+        "Percentile rank (0-100) of overall_score within sector cohort. "
+        "Returns null when sector cohort < 3 rows. "
+        "(core.insights_builder.compute_sector_relative_score)",
+    )
+    add(
+        "Insights", "Conviction Score", "conviction_score",
+        "float", "0.00", False, "model",
+        "0-100 measure of recommendation strength. Composition: 40% view "
+        "agreement, 30% score extremity, 20% forecast confidence, 10% data "
+        "completeness. Distinct from forecast_confidence (data quality). "
+        "(core.insights_builder.compute_conviction_score)",
+    )
+    add(
+        "Insights", "Top Factors", "top_factors",
+        "str", "text", False, "derived",
+        "Top-3 component scores by contribution (score*weight). "
+        "Pipe-separated, e.g. 'Quality 82 | Value 75 | Momentum 68'. "
+        "(core.insights_builder.derive_top_factors)",
+    )
+    add(
+        "Insights", "Top Risks", "top_risks",
+        "str", "text", False, "derived",
+        "Top-2 risk factors fired by rules (high vol, leverage, drawdown, "
+        "RSI extremes, negative margins, elevated VaR, high overall risk). "
+        "Pipe-separated. (core.insights_builder.derive_top_risks)",
+    )
+    add(
+        "Insights", "Position Size Hint", "position_size_hint",
+        "str", "text", False, "derived",
+        "Heuristic position-size anchor based on (recommendation, conviction). "
+        "NOT financial advice. e.g. '4-6% of portfolio' for high-conviction "
+        "STRONG_BUY. (core.insights_builder.build_position_size_hint)",
+    )
 
     return tuple(cols)
 
@@ -497,6 +554,7 @@ def _insights_criteria_fields() -> Tuple[CriteriaField, ...]:
         CriteriaField("min_expected_roi_pct", "Min Expected ROI %", "pct", "0.00", "Filter floor for expected ROI."),
         CriteriaField("max_risk_score", "Max Risk Score", "float", "60", "Filter ceiling for risk score."),
         CriteriaField("min_ai_confidence", "Min AI Confidence", "float", "0.60", "Filter floor for forecast_confidence/confidence_score."),
+        CriteriaField("min_conviction", "Min Conviction Score", "float", "0", "Filter floor for conviction_score (v2.6.0+)."),
     )
 
 
@@ -563,7 +621,7 @@ _RAW_SCHEMA_REGISTRY: Dict[str, SheetSpec] = {
         columns=_sanitize_columns(
             "Top_10_Investments",
             "instrument_table",
-            _CANONICAL_COLUMNS + _top10_extra_columns(),  # 88 columns target
+            _CANONICAL_COLUMNS + _top10_extra_columns(),  # 93 columns target in v2.6.0
             enforce_symbol_first=True,
         ),
         notes="Criteria-driven selection. Canonical columns + Top10 extras.",
@@ -870,12 +928,13 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
             seen_headers.add(col.header)
 
         if sheet_name in {"Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"}:
-            if len(spec.columns) != 85:
-                raise ValueError(f"[{sheet_name}] instrument_table must be 85 columns. Got: {len(spec.columns)}")
+            if len(spec.columns) != _CANONICAL_INSTRUMENT_COLS:
+                raise ValueError(
+                    f"[{sheet_name}] instrument_table must be {_CANONICAL_INSTRUMENT_COLS} columns "
+                    f"in v{SCHEMA_VERSION}. Got: {len(spec.columns)}"
+                )
             if spec.columns[0].key != "symbol":
                 raise ValueError(f"[{sheet_name}] First column must be 'symbol'.")
-            # v2.5.0: also validate the four View columns are present, since the
-            # recommendation pipeline depends on them. Cheap check, big payoff.
             spec_keys = {c.key for c in spec.columns}
             missing_views = [k for k in VIEW_COLUMN_KEYS if k not in spec_keys]
             if missing_views:
@@ -884,10 +943,23 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
                     f"The recommendation pipeline (core.reco_normalize.recommendation_from_views) "
                     f"depends on these."
                 )
+            # v2.6.0: Insights columns are required for the same reason —
+            # core.insights_builder writes them and downstream readers
+            # expect them.
+            missing_insights = [k for k in INSIGHTS_COLUMN_KEYS if k not in spec_keys]
+            if missing_insights:
+                raise ValueError(
+                    f"[{sheet_name}] Missing required insights column(s): {missing_insights}. "
+                    f"core.insights_builder.enrich_rows_with_insights writes these."
+                )
 
         if sheet_name == "Top_10_Investments":
-            if len(spec.columns) != 88:
-                raise ValueError(f"[Top_10_Investments] must be 88 columns (85 + 3). Got: {len(spec.columns)}")
+            if len(spec.columns) != _TOP10_TOTAL_COLS:
+                raise ValueError(
+                    f"[Top_10_Investments] must be {_TOP10_TOTAL_COLS} columns "
+                    f"({_CANONICAL_INSTRUMENT_COLS} canonical + 3 Top10) in v{SCHEMA_VERSION}. "
+                    f"Got: {len(spec.columns)}"
+                )
             if spec.columns[0].key != "symbol":
                 raise ValueError("[Top_10_Investments] First column must be 'symbol' (no blank leading column).")
             spec_keys = {c.key for c in spec.columns}
@@ -896,14 +968,19 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
                 raise ValueError(
                     f"[Top_10_Investments] Missing required view column(s): {missing_views}."
                 )
+            missing_insights = [k for k in INSIGHTS_COLUMN_KEYS if k not in spec_keys]
+            if missing_insights:
+                raise ValueError(
+                    f"[Top_10_Investments] Missing required insights column(s): {missing_insights}."
+                )
 
         if sheet_name == "Insights_Analysis":
-            if len(spec.columns) != 7:
-                raise ValueError(f"[Insights_Analysis] must be 7 columns. Got: {len(spec.columns)}")
+            if len(spec.columns) != _INSIGHTS_ANALYSIS_COLS:
+                raise ValueError(f"[Insights_Analysis] must be {_INSIGHTS_ANALYSIS_COLS} columns. Got: {len(spec.columns)}")
 
         if sheet_name == "Data_Dictionary":
-            if len(spec.columns) != 9:
-                raise ValueError(f"[Data_Dictionary] must be 9 columns. Got: {len(spec.columns)}")
+            if len(spec.columns) != _DATA_DICTIONARY_COLS:
+                raise ValueError(f"[Data_Dictionary] must be {_DATA_DICTIONARY_COLS} columns. Got: {len(spec.columns)}")
 
         seen_ckeys = set()
         for cf in spec.criteria_fields:
