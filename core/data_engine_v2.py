@@ -2,8 +2,40 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.3
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.4
 ================================================================================
+
+WHY v5.47.4
+-----------
+[AUDIT FIX] `country` was being filled in as "USA" for every non-KSA /
+non-FX / non-Future symbol. Tracing through the data: `_infer_country_
+from_symbol` only handled `.SR` and `=X` / `=F`, then fell back to "USA"
+for anything else -- so BARC.L (London), SAP.DE (Frankfurt), 7203.T
+(Tokyo), 0700.HK, RELIANCE.NS, BHP.AX, etc. were all silently tagged
+American.
+
+The country resolver now lives in `core.symbols.normalize` v7.1.0 as
+`get_country_from_symbol`, which knows 40+ markets and overrides for
+major indexes (^GSPC -> United States, ^FTSE -> United Kingdom,
+^N225 -> Japan, ^TASI -> Saudi Arabia, ...). v5.47.4 imports it and
+delegates. Same fix routed through `get_currency_from_symbol`, which
+closes 31 missing currencies (HK -> HKD, CN -> CNY, IN -> INR, AU -> AUD,
+CA -> CAD, CH -> CHF, KR -> KRW, SG -> SGD, ZA -> ZAR, AE -> AED, etc.).
+
+If `core.symbols.normalize` cannot be imported, both helpers fall back
+to a small in-engine lookup covering the same major suffixes -- still
+much better than blanket "USA". The legacy `s.upper()` `normalize_symbol`
+shim is preserved so cache keys, dedup, and downstream comparisons stay
+unchanged. (Switching to the canonicalising form would be an upgrade
+worth making but is intentionally out of scope here.)
+
+Touched (and only):
+  - `_infer_country_from_symbol`  -> delegates to normalize.py + fallback
+  - `_infer_currency_from_symbol` -> delegates to normalize.py + fallback
+  - new try-import block + minimal fallback tables
+Everything else (percent-fraction fixes, schema contracts, page routing,
+provider preferences, snapshot backfill, top10 fallback ranker, ...) is
+preserved verbatim from v5.47.3.
 
 WHY v5.47.3
 -----------
@@ -147,10 +179,88 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.47.3"
+__version__ = "5.47.4"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
+
+
+# =============================================================================
+# v5.47.4: optional symbol metadata helpers from core.symbols.normalize v7.1.0
+# =============================================================================
+# These provide accurate per-market country and currency lookup. If the
+# import fails (older deployment, package not on path), we degrade to a
+# small local table below -- still better than blanket "USA"/"USD".
+try:
+    from core.symbols.normalize import (  # type: ignore
+        get_country_from_symbol as _ext_get_country_from_symbol,
+        get_currency_from_symbol as _ext_get_currency_from_symbol,
+    )
+    _HAS_NORMALIZE_HELPERS = True
+except Exception:  # pragma: no cover
+    _ext_get_country_from_symbol = None  # type: ignore
+    _ext_get_currency_from_symbol = None  # type: ignore
+    _HAS_NORMALIZE_HELPERS = False
+
+# Local fallback tables (used only if core.symbols.normalize cannot be
+# imported; production should always have it). Keys are the trailing
+# `.SUFFIX` portion of a symbol, upper-cased.
+_FALLBACK_COUNTRY_BY_SUFFIX: Dict[str, str] = {
+    ".SR": "Saudi Arabia", ".SAU": "Saudi Arabia", ".TADAWUL": "Saudi Arabia",
+    ".US": "United States", ".N": "United States", ".NASDAQ": "United States",
+    ".NYSE": "United States", ".OQ": "United States",
+    ".L": "United Kingdom", ".LSE": "United Kingdom", ".LN": "United Kingdom",
+    ".DE": "Germany", ".F": "Germany", ".BE": "Germany",
+    ".PA": "France", ".FP": "France",
+    ".SW": "Switzerland", ".VX": "Switzerland",
+    ".AS": "Netherlands", ".BR": "Belgium", ".MC": "Spain",
+    ".MI": "Italy", ".IM": "Italy",
+    ".CO": "Denmark", ".ST": "Sweden", ".OL": "Norway", ".HE": "Finland",
+    ".AT": "Austria", ".VI": "Austria", ".IR": "Ireland",
+    ".T": "Japan", ".TYO": "Japan",
+    ".HK": "Hong Kong", ".HKG": "Hong Kong",
+    ".SS": "China", ".SZ": "China",
+    ".NS": "India", ".BO": "India", ".NSE": "India", ".BSE": "India",
+    ".KS": "South Korea", ".KQ": "South Korea",
+    ".TW": "Taiwan",
+    ".SI": "Singapore", ".SGX": "Singapore",
+    ".KL": "Malaysia", ".JK": "Indonesia", ".BK": "Thailand",
+    ".AX": "Australia", ".ASX": "Australia", ".NZ": "New Zealand",
+    ".TO": "Canada", ".V": "Canada",
+    ".SA": "Brazil", ".BA": "Argentina", ".MX": "Mexico",
+    ".AE": "United Arab Emirates", ".DFM": "United Arab Emirates", ".ADX": "United Arab Emirates",
+    ".QA": "Qatar", ".KW": "Kuwait", ".EG": "Egypt",
+    ".JSE": "South Africa", ".ZA": "South Africa",
+    ".TA": "Israel", ".TASE": "Israel",
+}
+
+_FALLBACK_CURRENCY_BY_SUFFIX: Dict[str, str] = {
+    ".SR": "SAR", ".SAU": "SAR", ".TADAWUL": "SAR",
+    ".US": "USD", ".N": "USD", ".NASDAQ": "USD", ".NYSE": "USD", ".OQ": "USD",
+    ".L": "GBP", ".LSE": "GBP", ".LN": "GBP",
+    ".DE": "EUR", ".F": "EUR", ".BE": "EUR",
+    ".PA": "EUR", ".FP": "EUR",
+    ".AS": "EUR", ".BR": "EUR", ".MC": "EUR",
+    ".MI": "EUR", ".IM": "EUR", ".AT": "EUR", ".VI": "EUR", ".IR": "EUR",
+    ".HE": "EUR",
+    ".SW": "CHF", ".VX": "CHF",
+    ".CO": "DKK", ".ST": "SEK", ".OL": "NOK",
+    ".T": "JPY", ".TYO": "JPY",
+    ".HK": "HKD", ".HKG": "HKD",
+    ".SS": "CNY", ".SZ": "CNY",
+    ".NS": "INR", ".BO": "INR", ".NSE": "INR", ".BSE": "INR",
+    ".KS": "KRW", ".KQ": "KRW",
+    ".TW": "TWD",
+    ".SI": "SGD", ".SGX": "SGD",
+    ".KL": "MYR", ".JK": "IDR", ".BK": "THB",
+    ".AX": "AUD", ".ASX": "AUD", ".NZ": "NZD",
+    ".TO": "CAD", ".V": "CAD",
+    ".SA": "BRL", ".BA": "ARS", ".MX": "MXN",
+    ".AE": "AED", ".DFM": "AED", ".ADX": "AED",
+    ".QA": "QAR", ".KW": "KWD", ".EG": "EGP",
+    ".JSE": "ZAR", ".ZA": "ZAR",
+    ".TA": "ILS", ".TASE": "ILS",
+}
 
 
 # =============================================================================
@@ -1444,7 +1554,31 @@ def _infer_exchange_from_symbol(symbol: str) -> str:
 
 
 def _infer_currency_from_symbol(symbol: str) -> str:
+    """
+    Best-effort currency inference from symbol shape.
+
+    v5.47.4: delegates to `core.symbols.normalize.get_currency_from_symbol`
+    when available -- which knows 40+ markets including HK, CN, IN, AU, CA,
+    CH, KR, SG, ZA, AE, etc. Previously this function returned "USD" as a
+    blanket fallback for non-KSA / non-FX / non-Future symbols, so a UK
+    listing was tagged USD, a Hong Kong listing was tagged USD, etc.
+
+    If the helper import failed at module load, falls back to a local
+    suffix lookup that covers the same major markets.
+    """
     s = normalize_symbol(symbol)
+    if not s:
+        return "USD"
+
+    if _HAS_NORMALIZE_HELPERS and _ext_get_currency_from_symbol is not None:
+        try:
+            ccy = _ext_get_currency_from_symbol(s)
+            if ccy:
+                return ccy
+        except Exception:
+            pass
+
+    # Local fallback path (only when the import isn't available)
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "SAR"
     if s.endswith("=X"):
@@ -1456,16 +1590,59 @@ def _infer_currency_from_symbol(symbol: str) -> str:
         return "FX"
     if s.endswith("=F"):
         return "USD"
+    if "." in s:
+        suffix = "." + s.rsplit(".", 1)[1].upper()
+        ccy = _FALLBACK_CURRENCY_BY_SUFFIX.get(suffix)
+        if ccy:
+            return ccy
     return "USD"
 
 
 def _infer_country_from_symbol(symbol: str) -> str:
+    """
+    Best-effort country inference from symbol shape.
+
+    v5.47.4 (AUDIT FIX): delegates to
+    `core.symbols.normalize.get_country_from_symbol` when available --
+    which knows 40+ markets and includes a per-index country override
+    table (^GSPC -> United States, ^FTSE -> United Kingdom,
+    ^N225 -> Japan, ^TASI -> Saudi Arabia, ...).
+
+    Previously this function only handled `.SR` and `=X` / `=F` and fell
+    back to "USA" for everything else, so BARC.L (London), SAP.DE
+    (Frankfurt), 7203.T (Tokyo), 0700.HK, RELIANCE.NS, BHP.AX, etc. were
+    all silently tagged American. That bug is the proximate cause of the
+    audit's "country=USA for .L/.DE/.SR" finding.
+
+    If the helper import failed at module load, falls back to a local
+    suffix lookup covering the same major markets.
+    """
     s = normalize_symbol(symbol)
+    if not s:
+        return ""
+
+    if _HAS_NORMALIZE_HELPERS and _ext_get_country_from_symbol is not None:
+        try:
+            country = _ext_get_country_from_symbol(s)
+            if country:
+                return country
+        except Exception:
+            pass
+
+    # Local fallback path (only when the import isn't available)
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "Saudi Arabia"
     if s.endswith("=X") or s.endswith("=F"):
         return "Global"
-    return "USA"
+    if "." in s:
+        suffix = "." + s.rsplit(".", 1)[1].upper()
+        country = _FALLBACK_COUNTRY_BY_SUFFIX.get(suffix)
+        if country:
+            return country
+    # Plain alphabetic short ticker -> US heuristic (mirrors normalize.py)
+    if s.isalpha() and 1 <= len(s) <= 5:
+        return "United States"
+    return ""
 
 
 def _infer_sector_from_symbol(symbol: str) -> str:
