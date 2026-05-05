@@ -3,14 +3,52 @@
 """
 core/investment_advisor_engine.py
 ================================================================================
-INVESTMENT ADVISOR ENGINE — v4.2.0 (VIEW-AWARE / SYMMETRIC WITH ADVISOR v5.1.1)
+INVESTMENT ADVISOR ENGINE — v4.3.0 (Wave 3 / v2.6.0 SCHEMA WIDTH)
 ================================================================================
 SYNC-EXPORT SAFE • ASYNC-INTERNAL • EXPORT-HARDENED • ROUTE-TOLERANT
 ENGINE-AWARE • PAGE-CATALOG NORMALIZED • TOP10-BUILDER FIRST
 INSIGHTS FALLBACK SAFE • SPECIAL-SCHEMA SAFE • NO-IMPORT-TIME-NETWORK
 ADVISOR + SHEET-ROWS SAFE • JSON-SAFE • 502-RESISTANT • MATRIX/ROW-OBJECT SAFE
+INSIGHTS-COLUMNS AWARE (v2.6.0 / Wave 3)
 
-v4.2.0 changes (what moved from v4.1.0)
+v4.3.0 changes (Wave 3 / v2.6.0 schema alignment)
+-------------------------------------------------
+Aligns the advisor engine's fallback contracts with the new 90-column
+instrument schema delivered in core/sheets/schema_registry v2.6.0 and
+core/data_engine_v2.py v5.49.0. The engine's view-aware reco logic from
+v4.2.0 stays intact — this revision is purely schema-width additive.
+
+- ADD: `_GENERIC_FALLBACK_KEYS` and `_GENERIC_FALLBACK_HEADERS` extended
+  from 80 -> 90 cols. Inserted in canonical positions to match the
+  engine's ordering:
+    * Valuation group: +`upside_pct` after `intrinsic_value` (6 -> 7).
+    * Scores group: split into Scores (5) + Views (4) + Composite
+      ranking (2). The four View columns (`fundamental_view`,
+      `technical_view`, `risk_view`, `value_view`) slot in after
+      `overall_score`, before `opportunity_score`. These were already
+      reachable via aliases in v4.2.0 but now have first-class fallback
+      slots so a "no live data" row still emits the full 90-column
+      contract.
+    * Insights group: +`sector_relative_score`, `conviction_score`,
+      `top_factors`, `top_risks`, `position_size_hint` appended after
+      `warnings`. These are produced upstream by core.insights_builder
+      v1.0.0 and reach this layer ready-to-emit.
+
+- ADD: `_FIELD_ALIAS_HINTS` picks up entries for the 5 Insights fields
+  so vendor variants ("convictionScore", "sectorAdjScore", "topFactors"
+  etc.) get folded into the canonical names by `_row_value_for_aliases`.
+
+- DERIVED: `_TOP10_EXTRA_KEYS` / `_TOP10_EXTRA_HEADERS` are unchanged
+  (still the 3 extras: top10_rank, selection_reason, criteria_snapshot).
+  The Top_10_Investments contract auto-derives to 93 cols via the
+  existing `_GENERIC_FALLBACK_* + _TOP10_EXTRA_*` concat in
+  `_load_headers_keys_for_page`.
+
+No behavioural changes; the view-aware delegation, internal-field
+stripping, ROI-safe scoring, and bucket fabrication fixes from v4.2.0
+remain in place verbatim.
+
+v4.2.0 changes (PRESERVED)
 ---------------------------------------
 The four fixes that landed in core/investment_advisor.py v5.1.1 did NOT
 propagate into the engine in v4.1.0 — the engine was still running the
@@ -142,7 +180,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-INVESTMENT_ADVISOR_ENGINE_VERSION = "4.2.0"
+INVESTMENT_ADVISOR_ENGINE_VERSION = "4.3.0"
 
 
 # =============================================================================
@@ -335,10 +373,10 @@ TOP10_BUILDER_FN_CANDIDATES = (
 
 
 # =============================================================================
-# Canonical fallback schemas — aligned with core.sheets.schema_registry v2.2.0
+# Canonical fallback schemas — aligned with core.sheets.schema_registry v2.6.0
 # =============================================================================
 
-# Canonical 80 instrument columns
+# Canonical 90 instrument columns (v4.3.0 / Wave 3)
 _GENERIC_FALLBACK_KEYS: List[str] = [
     # Identity (8)
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
@@ -354,15 +392,18 @@ _GENERIC_FALLBACK_KEYS: List[str] = [
     # Risk (8)
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
     "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
-    # Valuation (6)
-    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value", "valuation_score",
+    # Valuation (7) — v4.3.0: +upside_pct
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value", "upside_pct", "valuation_score",
     # Forecast (9)
     "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
     "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket",
-    # Scores (7)
-    "value_score", "quality_score", "momentum_score", "growth_score",
-    "overall_score", "opportunity_score", "rank_overall",
+    # Scores (5)
+    "value_score", "quality_score", "momentum_score", "growth_score", "overall_score",
+    # Views (4) — v4.3.0
+    "fundamental_view", "technical_view", "risk_view", "value_view",
+    # Composite ranking (2)
+    "opportunity_score", "rank_overall",
     # Recommendation (4)
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
     # Portfolio (6)
@@ -370,28 +411,46 @@ _GENERIC_FALLBACK_KEYS: List[str] = [
     "unrealized_pl", "unrealized_pl_pct",
     # Provenance (4)
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    # Insights (5) — v4.3.0 / Wave 3, produced by core.insights_builder v1.0.0
+    "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
 ]
 
 _GENERIC_FALLBACK_HEADERS: List[str] = [
+    # Identity (8)
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
+    # Price (10)
     "Current Price", "Previous Close", "Open", "Day High", "Day Low",
     "52W High", "52W Low", "Price Change", "Percent Change", "52W Position %",
+    # Liquidity (6)
     "Volume", "Avg Volume 10D", "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)",
+    # Fundamentals (12)
     "P/E (TTM)", "P/E (Forward)", "EPS (TTM)", "Dividend Yield", "Payout Ratio",
     "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin", "Operating Margin",
     "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)",
+    # Risk (8)
     "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y",
     "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
-    "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Valuation Score",
+    # Valuation (7) — v4.3.0: +Upside %
+    "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
+    # Forecast (9)
     "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
     "Forecast Confidence", "Confidence Score", "Confidence Bucket",
-    "Value Score", "Quality Score", "Momentum Score", "Growth Score",
-    "Overall Score", "Opportunity Score", "Rank (Overall)",
+    # Scores (5)
+    "Value Score", "Quality Score", "Momentum Score", "Growth Score", "Overall Score",
+    # Views (4) — v4.3.0
+    "Fundamental View", "Technical View", "Risk View", "Value View",
+    # Composite ranking (2)
+    "Opportunity Score", "Rank (Overall)",
+    # Recommendation (4)
     "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
+    # Portfolio (6)
     "Position Qty", "Avg Cost", "Position Cost", "Position Value",
     "Unrealized P/L", "Unrealized P/L %",
+    # Provenance (4)
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    # Insights (5) — v4.3.0 / Wave 3
+    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
 ]
 
 # Insights_Analysis — exactly 7 registry-canonical columns
@@ -489,6 +548,12 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "technical_view": ["technicalView", "tech_view"],
     "risk_view": ["riskView"],
     "value_view": ["valueView", "valuation_view"],
+    # NEW in v4.3.0: Insights columns (Wave 3, produced by core.insights_builder v1.0.0)
+    "sector_relative_score": ["sectorAdjScore", "sector_adj_score", "sectorRelativeScore"],
+    "conviction_score": ["convictionScore", "conviction"],
+    "top_factors": ["topFactors", "top_factor_list"],
+    "top_risks": ["topRisks", "top_risk_list"],
+    "position_size_hint": ["positionSizeHint", "position_hint", "size_hint"],
 }
 
 
