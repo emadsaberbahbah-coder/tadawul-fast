@@ -2,19 +2,50 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.13.1
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.14.0
 ================================================================================
 BRIDGE-FIRST • ROOT-OWNER ALIGNED • TOP10 FAIL-SOFT • STARTUP-SAFE
-AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE
+AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE • SCHEMA v2.6.0
 
-Purpose
--------
-This router is the /v1/advanced owner, but it now delegates sheet-row execution
-to the canonical root owner in routes.advanced_analysis instead of trying to
-rebuild Top_10_Investments locally.
+Why this revision (v2.14.0 vs v2.13.1)
+--------------------------------------
+v2.14.0 brings this router into alignment with the v2.6.0 schema family.
+The v2.13.1 build was running with **stale column counts and a fallback
+schema list missing 9 columns**, which surfaced as silent contract drift
+whenever `schema_registry` import failed (e.g. on early-boot probes,
+import-time circular failures, or in degraded environments).
 
-Why this revision
------------------
+- 🔑 FIX [CRITICAL]: `KNOWN_CANONICAL_HEADER_COUNTS` updated from
+     v2.5.0 numbers (85 / 88) to **v2.6.0 numbers (90 / 93)**. v2.13.1
+     numbers caused the meta endpoint and contract-shape regression
+     tests to report wrong widths even when the registry returned the
+     correct ones — operators reading `/v1/advanced/meta` saw 85/88
+     while the actual emitted rows were 90/93.
+
+- 🔑 FIX [HIGH]: `_CANONICAL_TOP10_SCHEMA_FALLBACK` rewritten to the
+     full v2.6.0 layout (93 entries). v2.13.1 had only 84 entries,
+     missing:
+       • the 4 View columns (fundamental_view, technical_view,
+         risk_view, value_view) added in schema v2.3.0
+       • the 5 Insights columns (sector_relative_score, conviction_score,
+         top_factors, top_risks, position_size_hint) added in v2.6.0
+     When the registry was unavailable, this router would emit 84-col
+     responses instead of 93-col ones. Schema-alignment tests caught
+     this in CI but production fall-back paths were affected.
+
+- FIX: `_CANONICAL_INSTRUMENT_SCHEMA_FALLBACK` derived as
+     `_CANONICAL_TOP10_SCHEMA_FALLBACK[:-3]` (90 entries) — same slice
+     contract as before, just on the corrected base list.
+
+- FIX: insights and data-dictionary fallbacks unchanged (still 7 / 9
+     cols — those didn't change between schema v2.5.0 and v2.6.0).
+
+- DOC: Header refreshed to reflect Wave 2A schema-family alignment.
+     Co-deployment matrix added so future maintainers know which
+     versions ship together.
+
+v2.13.1 fixes (preserved verbatim)
+----------------------------------
 - FIX: keeps the canonical root-owner bridge first while preserving bounded
        partial payloads instead of bubbling 502/5xx on bridge failure.
 - FIX: stops masking non-TypeError bridge exceptions during signature probing.
@@ -23,6 +54,26 @@ Why this revision
 - FIX: aligns fallback schema keys with the canonical engine contract
        (for example open_price, week_52_high, pb_ratio, ps_ratio, peg_ratio).
 - SAFE: no import-time network work and no hard dependency on optional modules.
+
+Co-deployment matrix (Wave 2A)
+------------------------------
+  Module                                Version    Notes
+  -------                               -------    -----
+  core/sheets/schema_registry.py        2.6.0      90/93/7/9 column layout
+  core/scoring.py                       5.1.0      View + Insights producer
+  core/reco_normalize.py                7.1.0      conviction-floor gating
+  core/insights_builder.py              1.0.0      pure-function module
+  core/investment_advisor.py            5.2.0      v2.6.0 fallback schemas
+  routes/investment_advisor.py          2.14.0     this file
+  scripts/run_dashboard_sync.py         6.6.0      passive
+
+Behavior on a v2.5.0 backend: the row-count metadata reported here will
+be wrong (it'll say 90/93 while the backend still emits 85/88). This is
+the intended regression-detector behavior — the router now matches the
+schema_registry it expects to be deployed alongside, so a mismatch is
+visible immediately at /v1/advanced/meta rather than silently at row
+boundaries.
+================================================================================
 """
 
 from __future__ import annotations
@@ -47,7 +98,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.13.1"
+INVESTMENT_ADVISOR_VERSION = "2.14.0"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -64,14 +115,19 @@ BASE_SOURCE_PAGES: Tuple[str, ...] = (
 )
 SOURCE_PAGES_SET = set(BASE_SOURCE_PAGES)
 
+# v2.14.0: aligned with schema_registry v2.6.0
+#   canonical instrument tables: 85 -> 90 (+4 Views, +5 Insights, +Upside%
+#     was already there from v2.4.0)
+#   Top_10_Investments:           88 -> 93 (90 canonical + 3 top10 extras)
+#   Insights_Analysis / Data_Dictionary: unchanged (7 / 9)
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
-    "Market_Leaders": 85,
-    "Global_Markets": 85,
-    "Commodities_FX": 85,
-    "Mutual_Funds": 85,
-    "My_Portfolio": 85,
+    "Market_Leaders": 90,
+    "Global_Markets": 90,
+    "Commodities_FX": 90,
+    "Mutual_Funds": 90,
+    "My_Portfolio": 90,
     "Insights_Analysis": 7,
-    "Top_10_Investments": 88,
+    "Top_10_Investments": 93,
     "Data_Dictionary": 9,
 }
 
@@ -79,6 +135,22 @@ TOP10_SPECIAL_FIELDS: Tuple[str, ...] = (
     "top10_rank",
     "selection_reason",
     "criteria_snapshot",
+)
+
+# v2.14.0: keys for the column groups added in schema v2.3.0 / v2.6.0.
+# Exposed for any downstream code that wants to project / select them.
+VIEW_COLUMN_KEYS: Tuple[str, ...] = (
+    "fundamental_view",
+    "technical_view",
+    "risk_view",
+    "value_view",
+)
+INSIGHTS_COLUMN_KEYS: Tuple[str, ...] = (
+    "sector_relative_score",
+    "conviction_score",
+    "top_factors",
+    "top_risks",
+    "position_size_hint",
 )
 
 PAGE_ALIAS_MAP: Dict[str, str] = {
@@ -152,7 +224,27 @@ except Exception:  # pragma: no cover
         return None
 
 
+# =============================================================================
+# Canonical fallback schema (v2.6.0 — 93 entries for Top10, 90 for instruments)
+# =============================================================================
+#
+# Used ONLY when `core.sheets.schema_registry.get_sheet_spec()` cannot be
+# imported. The registry is the single source of truth — these lists exist
+# only so the router degrades to a known-good contract instead of a 0-column
+# response when the registry is unavailable (boot ordering, partial deploys,
+# cold-start race conditions).
+#
+# Layout (matches schema_registry v2.6.0 exactly):
+#   Identity (8) | Price (10) | Liquidity (6) | Fundamentals (12) |
+#   Risk (8) | Valuation (7, incl. Upside %) | Forecast (9) | Scores (7) |
+#   Views (4) | Recommendation (4) | Portfolio (6) | Provenance (4) |
+#   Insights (5) = 90 canonical | + 3 Top10 extras = 93 total.
+#
+# DO NOT add fields here without first adding them to schema_registry; this
+# list must mirror the registry exactly or alignment tests will fail.
+
 _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
+    # Identity (8)
     ("symbol", "Symbol"),
     ("name", "Name"),
     ("asset_class", "Asset Class"),
@@ -161,6 +253,7 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("country", "Country"),
     ("sector", "Sector"),
     ("industry", "Industry"),
+    # Price (10)
     ("current_price", "Current Price"),
     ("previous_close", "Previous Close"),
     ("open_price", "Open"),
@@ -171,12 +264,14 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("price_change", "Price Change"),
     ("percent_change", "Percent Change"),
     ("week_52_position_pct", "52W Position %"),
+    # Liquidity (6)
     ("volume", "Volume"),
     ("avg_volume_10d", "Avg Volume 10D"),
     ("avg_volume_30d", "Avg Volume 30D"),
     ("market_cap", "Market Cap"),
     ("float_shares", "Float Shares"),
     ("beta_5y", "Beta (5Y)"),
+    # Fundamentals (12)
     ("pe_ttm", "P/E (TTM)"),
     ("pe_forward", "P/E (Forward)"),
     ("eps_ttm", "EPS (TTM)"),
@@ -189,6 +284,7 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("profit_margin", "Profit Margin"),
     ("debt_to_equity", "Debt/Equity"),
     ("free_cash_flow_ttm", "Free Cash Flow (TTM)"),
+    # Risk (8)
     ("rsi_14", "RSI (14)"),
     ("volatility_30d", "Volatility 30D"),
     ("volatility_90d", "Volatility 90D"),
@@ -197,6 +293,7 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("sharpe_1y", "Sharpe (1Y)"),
     ("risk_score", "Risk Score"),
     ("risk_bucket", "Risk Bucket"),
+    # Valuation (7) — Upside % present since schema v2.4.0
     ("pb_ratio", "P/B"),
     ("ps_ratio", "P/S"),
     ("ev_ebitda", "EV/EBITDA"),
@@ -204,6 +301,7 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("intrinsic_value", "Intrinsic Value"),
     ("upside_pct", "Upside %"),
     ("valuation_score", "Valuation Score"),
+    # Forecast (9)
     ("forecast_price_1m", "Forecast Price 1M"),
     ("forecast_price_3m", "Forecast Price 3M"),
     ("forecast_price_12m", "Forecast Price 12M"),
@@ -213,6 +311,7 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("forecast_confidence", "Forecast Confidence"),
     ("confidence_score", "Confidence Score"),
     ("confidence_bucket", "Confidence Bucket"),
+    # Scores (7)
     ("value_score", "Value Score"),
     ("quality_score", "Quality Score"),
     ("momentum_score", "Momentum Score"),
@@ -220,25 +319,42 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("overall_score", "Overall Score"),
     ("opportunity_score", "Opportunity Score"),
     ("rank_overall", "Rank (Overall)"),
+    # Views (4) — added schema v2.3.0; consumed by reco_normalize.from_views
+    ("fundamental_view", "Fundamental View"),
+    ("technical_view", "Technical View"),
+    ("risk_view", "Risk View"),
+    ("value_view", "Value View"),
+    # Recommendation (4)
     ("recommendation", "Recommendation"),
     ("recommendation_reason", "Recommendation Reason"),
     ("horizon_days", "Horizon Days"),
     ("invest_period_label", "Invest Period Label"),
+    # Portfolio (6)
     ("position_qty", "Position Qty"),
     ("avg_cost", "Avg Cost"),
     ("position_cost", "Position Cost"),
     ("position_value", "Position Value"),
     ("unrealized_pl", "Unrealized P/L"),
     ("unrealized_pl_pct", "Unrealized P/L %"),
+    # Provenance (4)
     ("data_provider", "Data Provider"),
     ("last_updated_utc", "Last Updated (UTC)"),
     ("last_updated_riyadh", "Last Updated (Riyadh)"),
     ("warnings", "Warnings"),
+    # Insights (5) — added schema v2.6.0; produced by core.insights_builder
+    ("sector_relative_score", "Sector-Adj Score"),
+    ("conviction_score", "Conviction Score"),
+    ("top_factors", "Top Factors"),
+    ("top_risks", "Top Risks"),
+    ("position_size_hint", "Position Size Hint"),
+    # Top10 extras (3) — only on Top_10_Investments
     ("top10_rank", "Top10 Rank"),
     ("selection_reason", "Selection Reason"),
     ("criteria_snapshot", "Criteria Snapshot"),
 ]
+# Instrument schema = same layout minus the 3 Top10 extras
 _CANONICAL_INSTRUMENT_SCHEMA_FALLBACK: List[Tuple[str, str]] = _CANONICAL_TOP10_SCHEMA_FALLBACK[:-3]
+
 _CANONICAL_INSIGHTS_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("section", "Section"),
     ("item", "Item"),
@@ -248,6 +364,7 @@ _CANONICAL_INSIGHTS_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("notes", "Notes"),
     ("last_updated_riyadh", "Last Updated (Riyadh)"),
 ]
+
 _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("sheet", "Sheet"),
     ("group", "Group"),
@@ -261,6 +378,23 @@ _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
 ]
 
 _SCHEMA_CACHE: Dict[str, Tuple[List[str], List[str]]] = {}
+
+
+# v2.14.0: import-time consistency assertion. If anyone hand-edits the
+# fallback list and forgets to keep it in sync with KNOWN_CANONICAL_HEADER_COUNTS,
+# we want startup to surface that immediately rather than at row time.
+_FALLBACK_INSTRUMENT_LEN = len(_CANONICAL_INSTRUMENT_SCHEMA_FALLBACK)
+_FALLBACK_TOP10_LEN = len(_CANONICAL_TOP10_SCHEMA_FALLBACK)
+assert _FALLBACK_INSTRUMENT_LEN == KNOWN_CANONICAL_HEADER_COUNTS["Market_Leaders"], (
+    f"Fallback instrument schema has {_FALLBACK_INSTRUMENT_LEN} entries, "
+    f"but KNOWN_CANONICAL_HEADER_COUNTS says {KNOWN_CANONICAL_HEADER_COUNTS['Market_Leaders']}. "
+    f"Update both together."
+)
+assert _FALLBACK_TOP10_LEN == KNOWN_CANONICAL_HEADER_COUNTS["Top_10_Investments"], (
+    f"Fallback Top10 schema has {_FALLBACK_TOP10_LEN} entries, "
+    f"but KNOWN_CANONICAL_HEADER_COUNTS says {KNOWN_CANONICAL_HEADER_COUNTS['Top_10_Investments']}. "
+    f"Update both together."
+)
 
 
 def _s(v: Any) -> str:
@@ -503,6 +637,25 @@ def _extract_schema_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[s
             headers2, keys2 = _extract_schema_headers_keys_from_spec(nested)
             if headers2 and keys2:
                 return headers2, keys2
+
+    # SheetSpec dataclass-style: spec.columns as iterable of ColumnSpec
+    cols = getattr(spec, "columns", None)
+    if isinstance(cols, (list, tuple)) and cols:
+        headers_out: List[str] = []
+        keys_out: List[str] = []
+        for idx, col in enumerate(cols):
+            header = _s(getattr(col, "header", None))
+            key = _s(getattr(col, "key", None))
+            if not header and not key:
+                continue
+            if not key:
+                key = f"column_{idx + 1}"
+            if not header:
+                header = key.replace("_", " ").title()
+            headers_out.append(header)
+            keys_out.append(key)
+        if headers_out and keys_out:
+            return headers_out, keys_out
 
     return [], []
 
@@ -1214,6 +1367,8 @@ async def _advanced_root_summary(request: Request) -> Dict[str, Any]:
             "bridge_source": bridge_source,
             "bridge_name": bridge_name,
             "contract_header_counts": dict(KNOWN_CANONICAL_HEADER_COUNTS),
+            "view_columns": list(VIEW_COLUMN_KEYS),
+            "insights_columns": list(INSIGHTS_COLUMN_KEYS),
             "supported_aliases": [
                 "/v1/advanced",
                 "/v1/advanced/sheet-rows",
@@ -1411,6 +1566,8 @@ async def advanced_meta(request: Request) -> Dict[str, Any]:
             "bridge_source": bridge_source,
             "bridge_name": bridge_name,
             "contract_header_counts": dict(KNOWN_CANONICAL_HEADER_COUNTS),
+            "view_columns": list(VIEW_COLUMN_KEYS),
+            "insights_columns": list(INSIGHTS_COLUMN_KEYS),
             "timestamp_utc": _now_utc(),
         }
     )
@@ -1543,4 +1700,10 @@ async def advanced_request_get(
     return payload
 
 
-__all__ = ["router", "INVESTMENT_ADVISOR_VERSION"]
+__all__ = [
+    "router",
+    "INVESTMENT_ADVISOR_VERSION",
+    "KNOWN_CANONICAL_HEADER_COUNTS",
+    "VIEW_COLUMN_KEYS",
+    "INSIGHTS_COLUMN_KEYS",
+]
