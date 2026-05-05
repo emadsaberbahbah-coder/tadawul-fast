@@ -2,8 +2,38 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.4
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.49.0
 ================================================================================
+
+WHY v5.49.0
+-----------
+[v2.6.0 / Wave 3] Adds the 5 Insights group columns at the END of the
+canonical instrument schema, completing the alignment with
+core.sheets.schema_registry v2.6.0:
+
+    sector_relative_score   ("Sector-Adj Score")    float, 0-100
+    conviction_score        ("Conviction Score")    float, 0-100
+    top_factors             ("Top Factors")         str, "|"-separated
+    top_risks               ("Top Risks")           str, "|"-separated
+    position_size_hint      ("Position Size Hint")  str, free text
+
+These fields are produced by core.insights_builder v1.0.0 (Wave 1) and
+populated through core.scoring v5.1.0 -> row dict, then projected by
+the existing _normalize_to_schema_keys path. No engine logic changed;
+this revision only widens the instrument schema contract from 85 -> 90
+cols (and Top_10_Investments contract from 88 -> 93 cols by automatic
+re-derivation in STATIC_CANONICAL_SHEET_CONTRACTS, which uses
+list(INSTRUMENT_CANONICAL_*)).
+
+Note: Wave 2B (v5.47.2 -> v5.48.0 with the canonical reco-enum fix)
+was not previously applied to this file. Going v5.47.4 -> v5.49.0
+directly keeps the additive Wave 3 schema change but does NOT touch
+the "ACCUMULATE" token in _compute_recommendation's fallback. That
+token is still outside the canonical 5-tier {STRONG_BUY, BUY, HOLD,
+REDUCE, SELL} per core.reco_normalize v7.0.0+, but it only fires on
+the fallback path (production rows go through core.scoring ->
+core.reco_normalize and skip this branch). Address in a follow-up
+patch when ready.
 
 WHY v5.47.4
 -----------
@@ -179,7 +209,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.47.4"
+__version__ = "5.49.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -372,6 +402,12 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "last_updated_utc",
     "last_updated_riyadh",
     "warnings",
+    # v2.6.0 Insights group (Wave 3) -- produced by core.insights_builder v1.0.0
+    "sector_relative_score",
+    "conviction_score",
+    "top_factors",
+    "top_risks",
+    "position_size_hint",
 ]
 
 INSTRUMENT_CANONICAL_HEADERS: List[str] = [
@@ -460,6 +496,12 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Last Updated (UTC)",
     "Last Updated (Riyadh)",
     "Warnings",
+    # v2.6.0 Insights group (Wave 3) -- produced by core.insights_builder v1.0.0
+    "Sector-Adj Score",
+    "Conviction Score",
+    "Top Factors",
+    "Top Risks",
+    "Position Size Hint",
 ]
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
@@ -2552,2437 +2594,1159 @@ _SCHEMA_UNION_KEYS: List[str] = _build_union_schema_keys()
 # =============================================================================
 class SingleFlight:
     def __init__(self) -> None:
+        self._inflight: Dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
-        self._tasks: Dict[str, asyncio.Task[Any]] = {}
 
-    async def execute(self, key: str, factory: Any) -> Any:
+    async def do(self, key: str, fn: Any) -> Any:
         async with self._lock:
-            task = self._tasks.get(key)
-            if task is None:
-                task = asyncio.create_task(factory())
-                self._tasks[key] = task
+            fut = self._inflight.get(key)
+            if fut is not None and not fut.done():
+                return await fut
+            fut = asyncio.get_event_loop().create_future()
+            self._inflight[key] = fut
+
         try:
-            return await task
+            res = await fn()
+            if not fut.done():
+                fut.set_result(res)
+            return res
+        except Exception as exc:
+            if not fut.done():
+                fut.set_exception(exc)
+            raise
         finally:
             async with self._lock:
-                if self._tasks.get(key) is task:
-                    self._tasks.pop(key, None)
+                if self._inflight.get(key) is fut:
+                    self._inflight.pop(key, None)
+
+
+@dataclass
+class _MultiLevelEntry:
+    value: Any
+    expires_at: float
 
 
 class MultiLevelCache:
-    def __init__(self, name: str, l1_ttl: int = 60, max_l1_size: int = 5000) -> None:
-        self.name = name
-        self.l1_ttl = max(1, int(l1_ttl))
-        self.max_l1_size = max(1, int(max_l1_size))
-        self._data: Dict[str, Tuple[float, Any]] = {}
+    def __init__(self, *, default_ttl: float = 60.0, max_entries: int = 1024) -> None:
+        self.default_ttl = float(default_ttl)
+        self.max_entries = int(max_entries)
+        self._store: Dict[str, _MultiLevelEntry] = {}
         self._lock = asyncio.Lock()
 
-    def _key(self, **kwargs: Any) -> str:
-        items = sorted((str(k), _safe_str(v)) for k, v in kwargs.items())
-        return "|".join([self.name] + [f"{k}={v}" for k, v in items])
-
-    async def get(self, **kwargs: Any) -> Any:
-        key = self._key(**kwargs)
+    async def get(self, key: str) -> Any:
         async with self._lock:
-            item = self._data.get(key)
-            if not item:
+            entry = self._store.get(key)
+            if not entry:
                 return None
-            expires_at, value = item
-            if expires_at < time.time():
-                self._data.pop(key, None)
+            if entry.expires_at and entry.expires_at < time.time():
+                self._store.pop(key, None)
                 return None
-            return value
+            return entry.value
 
-    async def set(self, value: Any, **kwargs: Any) -> None:
-        key = self._key(**kwargs)
+    async def set(self, key: str, value: Any, *, ttl: Optional[float] = None) -> None:
         async with self._lock:
-            if len(self._data) >= self.max_l1_size:
-                oldest_key = next(iter(self._data.keys()), None)
-                if oldest_key:
-                    self._data.pop(oldest_key, None)
-            self._data[key] = (time.time() + self.l1_ttl, value)
+            if len(self._store) >= self.max_entries:
+                self._store.pop(next(iter(self._store)), None)
+            ttl_value = self.default_ttl if ttl is None else float(ttl)
+            self._store[key] = _MultiLevelEntry(value=value, expires_at=time.time() + ttl_value)
+
+    async def clear(self) -> None:
+        async with self._lock:
+            self._store.clear()
+
+    async def keys(self) -> List[str]:
+        async with self._lock:
+            return list(self._store.keys())
+
+
+# =============================================================================
+# Provider registry
+# =============================================================================
+@dataclass
+class ProviderState:
+    name: str
+    healthy: bool = True
+    failures: int = 0
+    last_error: str = ""
+    cooldown_until: float = 0.0
 
 
 class ProviderRegistry:
     def __init__(self) -> None:
-        self._stats: Dict[str, Dict[str, Any]] = {}
+        self._states: Dict[str, ProviderState] = {}
+        self._lock = asyncio.Lock()
+        self._modules_cache: Dict[str, Any] = {}
+        self._cooldown_seconds: float = float(_get_env_float("ENGINE_PROVIDER_COOLDOWN_SECONDS", 60.0))
+        self._failure_threshold: int = int(_get_env_int("ENGINE_PROVIDER_FAILURE_THRESHOLD", 3))
 
-    async def get_provider(self, provider: str) -> Tuple[Optional[Any], Any]:
-        module = None
-        candidates = [
-            f"core.providers.{provider}",
-            f"providers.{provider}",
-            f"core.providers.{provider}_provider",
-            f"providers.{provider}_provider",
-        ]
-        for mod_path in candidates:
-            try:
-                module = import_module(mod_path)
-                break
-            except Exception:
-                continue
-        stats = type(
-            "ProviderStats",
-            (),
-            {"is_circuit_open": False, "last_import_error": "" if module is not None else "provider module missing"},
-        )()
-        return module, stats
+    async def get_provider(self, name: str) -> Any:
+        async with self._lock:
+            cached = self._modules_cache.get(name)
+            if cached is not None:
+                return cached
+            mod = None
+            for path in (
+                f"providers.{name}_provider",
+                f"core.providers.{name}_provider",
+                f"providers.{name}",
+                f"core.providers.{name}",
+            ):
+                try:
+                    mod = import_module(path)
+                    break
+                except Exception:
+                    continue
+            if mod is not None:
+                self._modules_cache[name] = mod
+            return mod
 
-    async def record_success(self, provider: str, latency_ms: float) -> None:
-        stat = self._stats.setdefault(provider, {"success": 0, "failure": 0, "last_error": "", "latency_ms": 0.0})
-        stat["success"] += 1
-        stat["latency_ms"] = round(float(latency_ms or 0.0), 2)
+    async def record_success(self, name: str) -> None:
+        async with self._lock:
+            state = self._states.get(name) or ProviderState(name=name)
+            state.healthy = True
+            state.failures = 0
+            state.last_error = ""
+            state.cooldown_until = 0.0
+            self._states[name] = state
 
-    async def record_failure(self, provider: str, error: str) -> None:
-        stat = self._stats.setdefault(provider, {"success": 0, "failure": 0, "last_error": "", "latency_ms": 0.0})
-        stat["failure"] += 1
-        stat["last_error"] = _safe_str(error)
+    async def record_failure(self, name: str, error: str) -> None:
+        async with self._lock:
+            state = self._states.get(name) or ProviderState(name=name)
+            state.failures += 1
+            state.last_error = _safe_str(error)
+            if state.failures >= self._failure_threshold:
+                state.healthy = False
+                state.cooldown_until = time.time() + self._cooldown_seconds
+            self._states[name] = state
 
     async def get_stats(self) -> Dict[str, Any]:
-        return {k: dict(v) for k, v in self._stats.items()}
+        async with self._lock:
+            return {name: asdict(state) for name, state in self._states.items()}
 
 
-def _pick_provider_callable(module: Any, provider: str) -> Optional[Any]:
-    for name in ("get_quote", "fetch_quote", "fetch_enriched_quote", "get_enriched_quote", "quote"):
-        fn = getattr(module, name, None)
+def _pick_provider_callable(mod: Any, *names: str) -> Optional[Any]:
+    if mod is None:
+        return None
+    for n in names:
+        fn = getattr(mod, n, None)
         if callable(fn):
             return fn
-    for attr in (provider, f"{provider}_quote", "client", "service"):
-        obj = getattr(module, attr, None)
-        if obj is not None:
-            for name in ("get_quote", "fetch_quote", "get_enriched_quote"):
-                fn = getattr(obj, name, None)
-                if callable(fn):
-                    return fn
     return None
 
 
 # =============================================================================
-# Engine symbols proxy
+# Symbols reader proxy used by external selectors / advisors
 # =============================================================================
 class _EngineSymbolsReaderProxy:
     def __init__(self, engine: "DataEngineV5") -> None:
         self._engine = engine
 
-    async def get_symbols_for_sheet(self, sheet: str, limit: int = 5000) -> List[str]:
-        return await self._engine.get_sheet_symbols(sheet, limit=limit)
+    async def __call__(self, *args: Any, **kwargs: Any) -> List[str]:
+        page = ""
+        if args:
+            page = _safe_str(args[0])
+        page = page or _safe_str(kwargs.get("page") or kwargs.get("sheet") or kwargs.get("name"))
+        return await self._engine.get_sheet_symbols(page or "Market_Leaders")
 
-    async def get_symbols_for_page(self, page: str, limit: int = 5000) -> List[str]:
-        return await self._engine.get_page_symbols(page, limit=limit)
+    async def get_sheet_symbols(self, page: str) -> List[str]:
+        return await self._engine.get_sheet_symbols(page)
 
-    async def list_symbols_for_page(self, page: str, limit: int = 5000) -> List[str]:
-        return await self._engine.list_symbols_for_page(page, limit=limit)
+    async def get_page_symbols(self, page: str) -> List[str]:
+        return await self._engine.get_sheet_symbols(page)
+
+    async def list_symbols(self, page: str) -> List[str]:
+        return await self._engine.get_sheet_symbols(page)
 
 
 # =============================================================================
-# DataEngineV5
+# Main engine
 # =============================================================================
 class DataEngineV5:
-    def __init__(self, settings: Any = None) -> None:
-        self.settings = settings if settings is not None else _try_get_settings()
-        self.flags = _feature_flags(self.settings)
-        self.version = __version__
+    def __init__(self) -> None:
+        self.cache = MultiLevelCache(default_ttl=float(_get_env_float("ENGINE_CACHE_TTL_SECONDS", 60.0)), max_entries=int(_get_env_int("ENGINE_CACHE_MAX_ENTRIES", 1024)))
+        self.singleflight = SingleFlight()
+        self.providers = ProviderRegistry()
+        self.settings = _try_get_settings()
+        self.feature_flags = _feature_flags(self.settings)
+        self._symbol_snapshot: Dict[str, Dict[str, Any]] = {}
+        self._symbol_snapshot_lock = asyncio.Lock()
+        self._snapshot_capacity: int = int(_get_env_int("ENGINE_SNAPSHOT_MAX_SYMBOLS", 4096))
+        self._symbols_reader: Optional[Any] = None
+        self._symbols_reader_inited: bool = False
+        self._rows_reader: Optional[Any] = None
+        self._rows_reader_inited: bool = False
+        self._provider_priorities: Dict[str, int] = dict(PROVIDER_PRIORITIES)
+        self._page_primary_provider: Dict[str, str] = dict(PAGE_PRIMARY_PROVIDER_DEFAULTS)
+        self._page_provider_overrides: Dict[str, List[str]] = {}
+        self._init_provider_overrides_from_env()
+        try:
+            from core.global_provider_overrides import GLOBAL_PROVIDER_OVERRIDES  # type: ignore
+            for page, providers in (GLOBAL_PROVIDER_OVERRIDES or {}).items():
+                cp = _canonicalize_sheet_name(_safe_str(page))
+                if not cp:
+                    continue
+                if isinstance(providers, (list, tuple)):
+                    self._page_provider_overrides[cp] = [_safe_str(p).lower() for p in providers if _safe_str(p)]
+                elif isinstance(providers, dict):
+                    primary = _safe_str(providers.get("primary"))
+                    if primary:
+                        self._page_primary_provider[cp] = primary.lower()
+        except Exception:
+            pass
 
-        self.primary_provider = (
-            _safe_str(getattr(self.settings, "primary_provider", "eodhd") if self.settings is not None else _safe_env("PRIMARY_PROVIDER", "eodhd")).lower()
-            or "eodhd"
-        )
-        self.enabled_providers = _get_env_list("ENABLED_PROVIDERS", DEFAULT_PROVIDERS)
-        self.ksa_providers = _get_env_list("KSA_PROVIDERS", DEFAULT_KSA_PROVIDERS)
-        self.global_providers = _get_env_list("GLOBAL_PROVIDERS", DEFAULT_GLOBAL_PROVIDERS)
-        self.non_ksa_primary_provider = (
-            _safe_str(
-                getattr(self.settings, "non_ksa_primary_provider", None) if self.settings is not None else None,
-                _safe_env("NON_KSA_PRIMARY_PROVIDER", "eodhd"),
-            ).lower()
-            or "eodhd"
-        )
-        configured_non_ksa_pages = [
-            _canonicalize_sheet_name(p)
-            for p in _get_env_list("NON_KSA_PRIMARY_PAGES", list(NON_KSA_EODHD_PRIMARY_PAGES))
-            if _safe_str(p)
-        ]
-        self.page_primary_providers = {
-            page: self.non_ksa_primary_provider
-            for page in configured_non_ksa_pages
-            if page
-        }
-        self.history_fallback_providers = _get_env_list(
-            "HISTORY_FALLBACK_PROVIDERS",
-            ["yahoo_chart", "yahoo", "eodhd", "finnhub", "tadawul", "argaam"],
-        )
-        self.max_concurrency = _get_env_int("DATA_ENGINE_MAX_CONCURRENCY", 25)
-        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 20.0)
-        self.ksa_disallow_eodhd = _get_env_bool("KSA_DISALLOW_EODHD", True)
+        try:
+            from core.global_provider_overrides import KSA_DISALLOW_EODHD  # type: ignore
+            self._ksa_disallow_eodhd: bool = _safe_bool(KSA_DISALLOW_EODHD, True)
+        except Exception:
+            self._ksa_disallow_eodhd = _safe_bool(_safe_env("KSA_DISALLOW_EODHD"), True)
 
-        self.schema_strict_sheet_rows = _get_env_bool("SCHEMA_STRICT_SHEET_ROWS", True)
-        self.top10_force_full_schema = _get_env_bool("TOP10_FORCE_FULL_SCHEMA", True)
-        self.rows_hydrate_external = _get_env_bool("ROWS_HYDRATE_EXTERNAL_READER", True)
+        self._max_concurrent_quotes: int = int(_get_env_int("ENGINE_MAX_CONCURRENT_QUOTES", 16))
 
-        self._sem = asyncio.Semaphore(max(1, self.max_concurrency))
-        self._singleflight = SingleFlight()
-        self._registry = ProviderRegistry()
-        self._cache = MultiLevelCache(
-            name="data_engine",
-            l1_ttl=_get_env_int("CACHE_L1_TTL", 60),
-            max_l1_size=_get_env_int("CACHE_L1_MAX", 5000),
-        )
-        self._symbols_cache = MultiLevelCache(
-            name="sheet_symbols",
-            l1_ttl=_get_env_int("SHEET_SYMBOLS_L1_TTL", 300),
-            max_l1_size=_get_env_int("SHEET_SYMBOLS_L1_MAX", 256),
-        )
-
-        self._symbols_reader_lock = asyncio.Lock()
-        self._symbols_reader_ready = False
-        self._symbols_reader_obj: Any = None
-        self._symbols_reader_source = ""
-
-        self._rows_reader_lock = asyncio.Lock()
-        self._rows_reader_ready = False
-        self._rows_reader_obj: Any = None
-        self._rows_reader_source = ""
-
-        self._sheet_snapshots: Dict[str, Dict[str, Any]] = {}
-        self._sheet_symbol_resolution_meta: Dict[str, Dict[str, Any]] = {}
-
-        self.symbols_reader = _EngineSymbolsReaderProxy(self)
+    def _init_provider_overrides_from_env(self) -> None:
+        for page, env_var in (
+            ("Global_Markets", "GLOBAL_MARKETS_PROVIDERS"),
+            ("Commodities_FX", "COMMODITIES_FX_PROVIDERS"),
+            ("Mutual_Funds", "MUTUAL_FUNDS_PROVIDERS"),
+            ("Market_Leaders", "MARKET_LEADERS_PROVIDERS"),
+            ("My_Portfolio", "MY_PORTFOLIO_PROVIDERS"),
+            ("My_Investments", "MY_INVESTMENTS_PROVIDERS"),
+            ("Top_10_Investments", "TOP10_PROVIDERS"),
+        ):
+            raw = _safe_env(env_var)
+            if not raw:
+                continue
+            providers = [p.strip().lower() for p in re.split(r"[,;|\s]+", raw) if p.strip()]
+            if providers:
+                self._page_provider_overrides[page] = providers
 
     async def aclose(self) -> None:
-        return
+        try:
+            await self.cache.clear()
+        except Exception:
+            pass
 
-    # ------------------------------------------------------------------
-    # compatibility aliases
-    # ------------------------------------------------------------------
-    async def execute_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.get_sheet_rows(*args, **kwargs)
-
-    async def run_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.get_sheet_rows(*args, **kwargs)
-
-    async def build_analysis_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.get_sheet_rows(*args, **kwargs)
-
-    async def run_analysis_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.get_sheet_rows(*args, **kwargs)
-
-    async def get_rows_for_sheet(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.get_sheet_rows(*args, **kwargs)
-
-    async def get_rows_for_page(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.get_page_rows(*args, **kwargs)
-
-    async def get_analysis_rows_batch(self, symbols: List[str], mode: str = "", *, schema: Any = None) -> Dict[str, Dict[str, Any]]:
-        return await self.get_enriched_quotes_batch(symbols, mode=mode, schema=schema)
-
-    async def get_analysis_row_dict(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> Dict[str, Any]:
-        return await self.get_enriched_quote_dict(symbol, use_cache=use_cache, schema=schema)
-
-    def get_page_snapshot(self, *args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
-        return self.get_cached_sheet_snapshot(*args, **kwargs)
-
-    # ------------------------------------------------------------------
-    # snapshot helpers
-    # ------------------------------------------------------------------
-    def _store_sheet_snapshot(self, sheet: str, payload: Dict[str, Any]) -> None:
-        target = _canonicalize_sheet_name(sheet)
-        if not target or not isinstance(payload, dict):
+    # --- snapshot helpers --------------------------------------------------
+    async def _record_symbol_snapshot(self, symbol: str, row: Dict[str, Any]) -> None:
+        sym = normalize_symbol(symbol)
+        if not sym:
             return
-        self._sheet_snapshots[target] = dict(payload)
-
-    def get_cached_sheet_snapshot(
-        self,
-        sheet: Optional[str] = None,
-        page: Optional[str] = None,
-        sheet_name: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        target = _canonicalize_sheet_name(sheet or page or sheet_name or "")
-        if not target:
-            return None
-        snap = self._sheet_snapshots.get(target)
-        return dict(snap) if isinstance(snap, dict) else None
-
-    def get_sheet_snapshot(
-        self,
-        page: Optional[str] = None,
-        sheet: Optional[str] = None,
-        sheet_name: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        return self.get_cached_sheet_snapshot(sheet=sheet, page=page, sheet_name=sheet_name)
-
-    def get_cached_sheet_rows(
-        self,
-        sheet_name: Optional[str] = None,
-        sheet: Optional[str] = None,
-        page: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        return self.get_cached_sheet_snapshot(sheet=sheet, page=page, sheet_name=sheet_name)
-
-    # ------------------------------------------------------------------
-    # symbol resolution meta
-    # ------------------------------------------------------------------
-    def _set_sheet_symbols_meta(self, sheet: str, source: str, count: int, note: Optional[str] = None) -> None:
-        target = _canonicalize_sheet_name(sheet)
-        if not target:
+        if not isinstance(row, dict):
             return
-        self._sheet_symbol_resolution_meta[target] = {
-            "sheet": target,
-            "source": source or "",
-            "count": int(count or 0),
-            "note": note or "",
-            "timestamp_utc": _now_utc_iso(),
-        }
+        if _is_blank_value(row.get("current_price")) and not row.get("data_provider"):
+            return
+        async with self._symbol_snapshot_lock:
+            if len(self._symbol_snapshot) >= self._snapshot_capacity:
+                self._symbol_snapshot.pop(next(iter(self._symbol_snapshot)), None)
+            self._symbol_snapshot[sym] = dict(row)
 
-    def _get_sheet_symbols_meta(self, sheet: str) -> Dict[str, Any]:
-        target = _canonicalize_sheet_name(sheet)
-        meta = self._sheet_symbol_resolution_meta.get(target)
-        return dict(meta) if isinstance(meta, dict) else {}
-
-    @staticmethod
-    def _extract_row_symbol(row: Dict[str, Any]) -> str:
-        if not isinstance(row, dict):
-            return ""
-        for k in ("symbol", "ticker", "code", "requested_symbol", "Symbol", "Ticker", "Code"):
-            v = row.get(k)
-            if v:
-                return _safe_str(v)
-        return ""
-
-    def _get_cached_snapshot_symbol_map(self, sheet: str) -> Dict[str, Dict[str, Any]]:
-        target = _canonicalize_sheet_name(sheet)
-        snap = self.get_cached_sheet_snapshot(sheet=target)
-        rows = _coerce_rows_list(snap)
-        out: Dict[str, Dict[str, Any]] = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            sym = normalize_symbol(self._extract_row_symbol(row))
-            if sym and sym not in out:
-                out[sym] = dict(row)
-        return out
-
-    @staticmethod
-    def _non_empty_field_count(row: Optional[Dict[str, Any]]) -> int:
-        if not isinstance(row, dict):
-            return 0
-        return sum(1 for v in row.values() if v not in (None, "", [], {}))
-
-    def _get_best_cached_snapshot_row_for_symbol(self, symbol: str, prefer_sheet: str = "") -> Optional[Dict[str, Any]]:
+    async def _get_symbol_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
         sym = normalize_symbol(symbol)
         if not sym:
             return None
-        preferred = _canonicalize_sheet_name(prefer_sheet) if prefer_sheet else ""
-        best_row: Optional[Dict[str, Any]] = None
-        best_score: float = -1.0
-        for sheet_name, snap in self._sheet_snapshots.items():
-            rows = _coerce_rows_list(snap)
-            if not rows:
+        async with self._symbol_snapshot_lock:
+            cached = self._symbol_snapshot.get(sym)
+            return dict(cached) if cached else None
+
+    def _resolve_symbol_meta(self, key: str, val: Any, requested: List[str], normalized: List[str]) -> Optional[Tuple[str, str]]:
+        if isinstance(val, dict):
+            requested_field = _safe_str(val.get("requested") or val.get("requested_symbol") or val.get("ticker") or val.get("code"))
+            normalized_field = _safe_str(val.get("normalized") or val.get("symbol") or val.get("symbol_normalized"))
+        else:
+            requested_field = ""
+            normalized_field = _safe_str(val)
+        normalized_field = normalize_symbol(normalized_field) if normalized_field else ""
+
+        if not requested_field:
+            normalized_lookup = normalize_symbol(_safe_str(key))
+            if normalized_lookup:
+                idx = -1
+                if normalized_field:
+                    try:
+                        idx = normalized.index(normalized_field)
+                    except ValueError:
+                        idx = -1
+                if idx == -1:
+                    try:
+                        idx = normalized.index(normalized_lookup)
+                    except ValueError:
+                        idx = -1
+                if 0 <= idx < len(requested):
+                    requested_field = requested[idx]
+        if not requested_field:
+            requested_field = _safe_str(key)
+        if not normalized_field:
+            normalized_field = normalize_symbol(_safe_str(key))
+        if not normalized_field:
+            return None
+        return requested_field, normalized_field
+
+    def _finalize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(payload or {})
+        keys = list(payload.get("keys") or [])
+        headers = list(payload.get("headers") or [])
+        rows_raw = payload.get("rows") or []
+        rows_dicts: List[Dict[str, Any]] = []
+        if isinstance(rows_raw, list):
+            for r in rows_raw:
+                if isinstance(r, dict):
+                    rows_dicts.append(r)
+                elif isinstance(r, list):
+                    if not keys:
+                        continue
+                    d = {}
+                    for i, k in enumerate(keys):
+                        d[k] = r[i] if i < len(r) else None
+                    rows_dicts.append(d)
+        rows_matrix = _rows_matrix_from_rows(rows_dicts, keys)
+        rows_objects_keyed = [_strict_project_row(keys, r) for r in rows_dicts]
+        rows_objects_display = _rows_display_objects_from_rows(rows_dicts, headers, keys)
+        payload["rows"] = rows_matrix
+        payload["rows_matrix"] = rows_matrix
+        payload["row_objects"] = rows_objects_keyed
+        payload["records"] = rows_objects_keyed
+        payload["data"] = rows_objects_keyed
+        payload["items"] = rows_objects_keyed
+        payload["quotes"] = rows_objects_keyed
+        payload["row_objects_display"] = rows_objects_display
+        payload["row_count"] = len(rows_objects_keyed)
+        payload.setdefault("count", len(rows_objects_keyed))
+        payload.setdefault("symbols_returned", payload.get("symbols_returned") or _extract_symbols_from_rows(rows_objects_keyed))
+        return payload
+
+    # --- rows reader discovery (external orchestrators) --------------------
+    def _init_rows_reader(self) -> None:
+        if self._rows_reader_inited:
+            return
+        self._rows_reader_inited = True
+        candidates = [
+            ("core.sheets.rows_reader", ("get_page_rows", "get_sheet_rows", "get_rows", "get_pages_rows", "fetch_page_rows")),
+            ("sheets.rows_reader", ("get_page_rows", "get_sheet_rows", "get_rows")),
+            ("core.dashboards.aggregator", ("get_page_rows", "get_sheet_rows")),
+            ("core.run_dashboard_sync", ("get_page_rows", "get_sheet_rows")),
+        ]
+        for mod_path, fn_names in candidates:
+            try:
+                mod = import_module(mod_path)
+            except Exception:
                 continue
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                row_sym = normalize_symbol(self._extract_row_symbol(row))
-                if row_sym != sym:
-                    continue
-                score = float(self._non_empty_field_count(row))
-                if preferred and _canonicalize_sheet_name(sheet_name) == preferred:
-                    score += 1000.0
-                if score > best_score:
-                    best_score = score
-                    best_row = dict(row)
-        return best_row
+            for fn_name in fn_names:
+                fn = getattr(mod, fn_name, None)
+                if callable(fn):
+                    self._rows_reader = fn
+                    return
 
-    # ------------------------------------------------------------------
-    # final payload
-    # ------------------------------------------------------------------
-    def _finalize_payload(
-        self,
-        *,
-        sheet: str,
-        headers: List[str],
-        keys: List[str],
-        row_objects: List[Dict[str, Any]],
-        include_matrix: bool,
-        status: str = "success",
-        meta: Optional[Dict[str, Any]] = None,
-        error: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        headers, keys = _complete_schema_contract(headers, keys)
-        dict_rows = [_strict_project_row(keys, r) for r in (row_objects or [])]
-        display_row_objects = _rows_display_objects_from_rows(dict_rows, headers, keys)
-        matrix_rows = _rows_matrix_from_rows(dict_rows, keys) if include_matrix else []
-
-        payload = {
-            "status": status,
-            "sheet": sheet,
-            "page": sheet,
-            "sheet_name": sheet,
-            "headers": headers,
-            "display_headers": headers,
-            "sheet_headers": headers,
-            "column_headers": headers,
-            "keys": keys,
-            "columns": keys,
-            "fields": keys,
-            "rows": matrix_rows,
-            "rows_matrix": matrix_rows,
-            "row_objects": dict_rows,
-            "items": dict_rows,
-            "records": dict_rows,
-            "data": dict_rows,
-            "quotes": dict_rows,
-            "display_row_objects": display_row_objects,
-            "display_items": display_row_objects,
-            "display_records": display_row_objects,
-            "rows_dict_display": display_row_objects,
-            "count": len(dict_rows),
-            "meta": dict(meta or {}),
-            "version": self.version,
-        }
-        if error is not None:
-            payload["error"] = error
-        return _json_safe(payload)
-
-    # ------------------------------------------------------------------
-    # rows reader discovery
-    # ------------------------------------------------------------------
-    async def _init_rows_reader(self) -> Tuple[Any, str]:
-        if self._rows_reader_ready:
-            return self._rows_reader_obj, self._rows_reader_source
-
-        async with self._rows_reader_lock:
-            if self._rows_reader_ready:
-                return self._rows_reader_obj, self._rows_reader_source
-
-            obj: Any = None
-            source = ""
-            for mod_path in (
-                "integrations.google_sheets_service",
-                "core.integrations.google_sheets_service",
-                "google_sheets_service",
-                "core.google_sheets_service",
-                "integrations.symbols_reader",
-                "core.integrations.symbols_reader",
+    async def _call_rows_reader(self, sheet: str, criteria: Optional[Dict[str, Any]] = None) -> Any:
+        self._init_rows_reader()
+        if self._rows_reader is None:
+            return None
+        candidates = [sheet, sheet.replace("_", " "), _norm_key(sheet)]
+        for cand in _dedupe_keep_order(candidates):
+            for kwargs in (
+                {"page": cand, "criteria": criteria or {}},
+                {"sheet": cand, "criteria": criteria or {}},
+                {"page_name": cand, "criteria": criteria or {}},
+                {"page": cand},
+                {"sheet": cand},
+                {},
             ):
                 try:
-                    mod = import_module(mod_path)
-                except Exception:
-                    continue
-
-                if any(
-                    callable(getattr(mod, nm, None))
-                    for nm in ("get_rows_for_sheet", "read_rows_for_sheet", "get_sheet_rows", "fetch_sheet_rows", "sheet_rows", "get_rows")
-                ):
-                    obj = mod
-                    source = mod_path
-                    break
-
-                for attr_name in ("service", "reader", "rows_reader", "google_sheets_service"):
-                    candidate = getattr(mod, attr_name, None)
-                    if candidate is not None:
-                        obj = candidate
-                        source = f"{mod_path}.{attr_name}"
-                        break
-
-                if obj is not None:
-                    break
-
-            self._rows_reader_obj = obj
-            self._rows_reader_source = source
-            self._rows_reader_ready = True
-            return obj, source
-
-    async def _call_rows_reader(self, obj: Any, sheet: str, limit: int) -> List[Dict[str, Any]]:
-        if obj is None:
-            return []
-
-        for name in ("get_rows_for_sheet", "read_rows_for_sheet", "get_sheet_rows", "fetch_sheet_rows", "sheet_rows", "get_rows"):
-            fn = getattr(obj, name, None)
-            if not callable(fn):
-                continue
-
-            variants = [
-                ((), {"sheet": sheet, "limit": limit}),
-                ((), {"sheet_name": sheet, "limit": limit}),
-                ((), {"page": sheet, "limit": limit}),
-                ((sheet,), {"limit": limit}),
-                ((sheet,), {}),
-            ]
-            for args, kwargs in variants:
-                try:
-                    async with asyncio.timeout(_get_env_float("ROWS_READER_TIMEOUT_SECONDS", 20.0)):
-                        result = await _call_maybe_async(fn, *args, **kwargs)
-                    rows = _coerce_rows_list(result)
-                    if rows:
-                        return rows[:limit]
+                    return await _call_maybe_async(self._rows_reader, **kwargs)
                 except TypeError:
                     continue
                 except Exception:
-                    continue
+                    return None
+            try:
+                return await _call_maybe_async(self._rows_reader, cand)
+            except Exception:
+                continue
+        return None
 
-        return []
-
-    async def _get_rows_from_external_reader(self, sheet: str, limit: int) -> List[Dict[str, Any]]:
-        obj, _src = await self._init_rows_reader()
-        if obj is None:
+    async def _get_rows_from_external_reader(self, sheet: str, criteria: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        try:
+            res = await self._call_rows_reader(sheet, criteria=criteria)
+        except Exception:
             return []
-        return await self._call_rows_reader(obj, sheet, limit)
+        return _coerce_rows_list(res)
 
-    # ------------------------------------------------------------------
-    # symbols reader discovery
-    # ------------------------------------------------------------------
-    async def _init_symbols_reader(self) -> Tuple[Any, str]:
-        if self._symbols_reader_ready:
-            return self._symbols_reader_obj, self._symbols_reader_source
+    # --- symbols reader discovery -----------------------------------------
+    def _init_symbols_reader(self) -> None:
+        if self._symbols_reader_inited:
+            return
+        self._symbols_reader_inited = True
+        candidates = [
+            ("core.sheets.symbol_reader", ("get_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols")),
+            ("sheets.symbol_reader", ("get_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols")),
+            ("core.sheets.symbols_loader", ("get_symbols", "list_symbols")),
+            ("sheets.symbols_loader", ("get_symbols", "list_symbols")),
+        ]
+        for mod_path, fn_names in candidates:
+            try:
+                mod = import_module(mod_path)
+            except Exception:
+                continue
+            for fn_name in fn_names:
+                fn = getattr(mod, fn_name, None)
+                if callable(fn):
+                    self._symbols_reader = fn
+                    return
 
-        async with self._symbols_reader_lock:
-            if self._symbols_reader_ready:
-                return self._symbols_reader_obj, self._symbols_reader_source
-
-            obj: Any = None
-            source = ""
-            for mod_path in (
-                "symbols_reader",
-                "core.symbols_reader",
-                "integrations.symbols_reader",
-                "core.integrations.symbols_reader",
-                "integrations.google_sheets_service",
-                "core.integrations.google_sheets_service",
-                "google_sheets_service",
-                "core.google_sheets_service",
+    async def _call_symbols_reader(self, sheet: str) -> Any:
+        self._init_symbols_reader()
+        if self._symbols_reader is None:
+            return None
+        candidates = [sheet, sheet.replace("_", " "), _norm_key(sheet)]
+        for cand in _dedupe_keep_order(candidates):
+            for kwargs in (
+                {"page": cand},
+                {"sheet": cand},
+                {"page_name": cand},
+                {"name": cand},
+                {},
             ):
                 try:
-                    mod = import_module(mod_path)
-                except Exception:
-                    continue
-
-                if any(
-                    callable(getattr(mod, nm, None))
-                    for nm in (
-                        "get_symbols_for_sheet",
-                        "read_symbols_for_sheet",
-                        "get_sheet_symbols",
-                        "get_symbols",
-                        "list_symbols_for_page",
-                        "get_symbols_for_page",
-                        "read_symbols",
-                        "load_symbols",
-                        "read_sheet_symbols",
-                    )
-                ):
-                    obj = mod
-                    source = mod_path
-                    break
-
-                for attr_name in ("symbols_reader", "reader", "symbol_reader", "sheet_reader", "service"):
-                    candidate = getattr(mod, attr_name, None)
-                    if candidate is not None:
-                        obj = candidate
-                        source = f"{mod_path}.{attr_name}"
-                        break
-
-                if obj is not None:
-                    break
-
-            self._symbols_reader_obj = obj
-            self._symbols_reader_source = source
-            self._symbols_reader_ready = True
-            return obj, source
-
-    async def _call_symbols_reader(self, obj: Any, sheet: str, limit: int) -> List[str]:
-        if obj is None:
-            return []
-
-        if isinstance(obj, dict):
-            for key in _sheet_lookup_candidates(sheet):
-                vals = obj.get(key)
-                syms = _normalize_symbol_list(_split_symbols(vals), limit=limit)
-                if syms:
-                    return syms
-
-        for name in (
-            "get_symbols_for_sheet",
-            "read_symbols_for_sheet",
-            "get_sheet_symbols",
-            "get_symbols_for_page",
-            "list_symbols_for_page",
-            "get_symbols",
-            "list_symbols",
-            "read_symbols",
-            "load_symbols",
-            "read_sheet_symbols",
-        ):
-            fn = getattr(obj, name, None)
-            if not callable(fn):
-                continue
-
-            variants = [
-                ((), {"sheet": sheet, "limit": limit}),
-                ((), {"sheet_name": sheet, "limit": limit}),
-                ((), {"page": sheet, "limit": limit}),
-                ((sheet,), {"limit": limit}),
-                ((sheet,), {}),
-            ]
-            for args, kwargs in variants:
-                try:
-                    async with asyncio.timeout(_get_env_float("SHEET_SYMBOLS_TIMEOUT_SECONDS", 15.0)):
-                        result = await _call_maybe_async(fn, *args, **kwargs)
-                    syms = _normalize_symbol_list(_split_symbols(result), limit=limit)
-                    if not syms and isinstance(result, (dict, list)):
-                        syms = _extract_symbols_from_rows(_coerce_rows_list(result), limit=limit)
-                    if syms:
-                        return syms
+                    return await _call_maybe_async(self._symbols_reader, **kwargs)
                 except TypeError:
                     continue
                 except Exception:
-                    continue
-
-        return []
-
-    async def _get_symbols_from_env(self, sheet: str, limit: int) -> List[str]:
-        env_candidates: List[str] = []
-        specific = PAGE_SYMBOL_ENV_KEYS.get(sheet)
-        if specific:
-            env_candidates.append(specific)
-
-        for cand in _sheet_lookup_candidates(sheet):
-            token = re.sub(r"[^A-Za-z0-9]+", "_", cand).strip("_").upper()
-            if token:
-                env_candidates.extend([f"{token}_SYMBOLS", f"{token}_TICKERS", f"{token}_CODES"])
-
-        env_candidates.extend(["TOP10_FALLBACK_SYMBOLS", "DEFAULT_PAGE_SYMBOLS", "DEFAULT_SYMBOLS"])
-
-        seen: Set[str] = set()
-        for env_key in env_candidates:
-            if not env_key or env_key in seen:
+                    return None
+            try:
+                return await _call_maybe_async(self._symbols_reader, cand)
+            except Exception:
                 continue
-            seen.add(env_key)
-            raw = os.getenv(env_key, "") or ""
-            if raw.strip():
-                syms = _normalize_symbol_list(_split_symbols(raw), limit=limit)
-                if syms:
-                    return syms
-        return []
+        return None
 
-    async def _get_symbols_from_settings(self, sheet: str, limit: int) -> List[str]:
+    async def _get_symbols_from_env(self, sheet: str) -> List[str]:
+        env_var = PAGE_SYMBOL_ENV_KEYS.get(sheet)
+        if not env_var:
+            return []
+        raw = _safe_env(env_var)
+        if not raw:
+            return []
+        return _normalize_symbol_list(_split_symbols(raw))
+
+    async def _get_symbols_from_settings(self, sheet: str) -> List[str]:
         if self.settings is None:
             return []
-        candidates = _sheet_lookup_candidates(sheet)
-
-        for attr_name in (
+        attr_candidates = [
             f"{sheet.lower()}_symbols",
-            f"{sheet.lower()}_tickers",
-            f"{sheet.lower()}_codes",
-            "default_symbols",
-            "page_symbols",
-            "sheet_symbols",
-        ):
-            try:
-                raw = getattr(self.settings, attr_name, None)
-            except Exception:
-                raw = None
-
-            if isinstance(raw, dict):
-                for cand in candidates:
-                    vals = raw.get(cand)
-                    syms = _normalize_symbol_list(_split_symbols(vals), limit=limit)
-                    if syms:
-                        return syms
-            elif raw:
-                syms = _normalize_symbol_list(_split_symbols(raw), limit=limit)
-                if syms:
-                    return syms
-
+            f"{_norm_key(sheet)}_symbols",
+            f"symbols_{sheet.lower()}",
+            f"symbols_{_norm_key(sheet)}",
+        ]
+        for attr in attr_candidates:
+            val = getattr(self.settings, attr, None)
+            if val:
+                return _normalize_symbol_list(_split_symbols(val))
         return []
 
-    async def _get_symbols_from_page_catalog(self, sheet: str, limit: int) -> List[str]:
-        candidates = _sheet_lookup_candidates(sheet)
-
+    async def _get_symbols_from_page_catalog(self, sheet: str) -> List[str]:
         for mod_path in ("core.sheets.page_catalog", "sheets.page_catalog"):
             try:
                 mod = import_module(mod_path)
             except Exception:
                 continue
-
-            for attr_name in ("PAGE_SYMBOLS", "SHEET_SYMBOLS", "DEFAULT_PAGE_SYMBOLS", "PAGE_DEFAULT_SYMBOLS"):
-                mapping = getattr(mod, attr_name, None)
-                if isinstance(mapping, dict):
-                    for cand in candidates:
-                        vals = mapping.get(cand)
-                        syms = _normalize_symbol_list(_split_symbols(vals), limit=limit)
-                        if syms:
-                            return syms
-
-            for fn_name in ("get_default_symbols", "get_page_symbols", "get_symbols_for_page"):
+            for fn_name in (
+                "get_symbols_for_page",
+                "get_page_symbols",
+                "get_symbols",
+                "list_symbols_for_page",
+            ):
                 fn = getattr(mod, fn_name, None)
-                if not callable(fn):
-                    continue
-                for args, kwargs in [
-                    ((sheet,), {"limit": limit}),
-                    ((sheet,), {}),
-                    ((), {"page": sheet, "limit": limit}),
-                    ((), {"sheet": sheet, "limit": limit}),
-                ]:
+                if callable(fn):
+                    for kwargs in (
+                        {"page": sheet},
+                        {"sheet": sheet},
+                        {"page_name": sheet},
+                        {"name": sheet},
+                        {},
+                    ):
+                        try:
+                            res = await _call_maybe_async(fn, **kwargs)
+                        except TypeError:
+                            continue
+                        except Exception:
+                            continue
+                        if isinstance(res, (list, tuple, set)):
+                            syms = _normalize_symbol_list(_split_symbols(res))
+                            if syms:
+                                return syms
                     try:
-                        result = await _call_maybe_async(fn, *args, **kwargs)
-                        syms = _normalize_symbol_list(_split_symbols(result), limit=limit)
-                        if syms:
-                            return syms
-                    except TypeError:
-                        continue
+                        res = await _call_maybe_async(fn, sheet)
                     except Exception:
                         continue
-
+                    if isinstance(res, (list, tuple, set)):
+                        syms = _normalize_symbol_list(_split_symbols(res))
+                        if syms:
+                            return syms
         return []
 
-    async def _get_symbols_for_sheet_impl(self, sheet: str, limit: int = 5000, body: Optional[Dict[str, Any]] = None) -> List[str]:
-        target = _canonicalize_sheet_name(sheet)
-        if target in SPECIAL_SHEETS:
-            self._set_sheet_symbols_meta(target, "special_sheet", 0)
-            return []
-
-        limit = max(1, min(5000, int(limit or 5000)))
-        from_body = _extract_requested_symbols_from_body(body, limit=limit)
-        if from_body:
-            self._set_sheet_symbols_meta(target, "body_symbols", len(from_body))
-            return from_body
-
-        cached = await self._symbols_cache.get(sheet=target, limit=limit)
-        if isinstance(cached, list) and cached:
-            syms = _normalize_symbol_list(cached, limit=limit)
-            self._set_sheet_symbols_meta(target, "symbols_cache", len(syms))
-            return syms
-
-        obj, src = await self._init_symbols_reader()
-        if obj is not None:
-            syms = await self._call_symbols_reader(obj, target, limit=limit)
-            if syms:
-                self._set_sheet_symbols_meta(target, f"symbols_reader:{src or 'unknown'}", len(syms))
-                await self._symbols_cache.set(syms, sheet=target, limit=limit)
-                return syms
-
-        syms = await self._get_symbols_from_page_catalog(target, limit=limit)
-        if syms:
-            self._set_sheet_symbols_meta(target, "page_catalog", len(syms))
-            await self._symbols_cache.set(syms, sheet=target, limit=limit)
-            return syms
-
-        syms = await self._get_symbols_from_env(target, limit=limit)
-        if syms:
-            self._set_sheet_symbols_meta(target, "env", len(syms))
-            await self._symbols_cache.set(syms, sheet=target, limit=limit)
-            return syms
-
-        syms = await self._get_symbols_from_settings(target, limit=limit)
-        if syms:
-            self._set_sheet_symbols_meta(target, "settings", len(syms))
-            await self._symbols_cache.set(syms, sheet=target, limit=limit)
-            return syms
-
-        snap = self.get_cached_sheet_snapshot(sheet=target)
-        snap_rows = _coerce_rows_list(snap)
-        if snap_rows:
-            syms = _extract_symbols_from_rows(snap_rows, limit=limit)
-            if syms:
-                self._set_sheet_symbols_meta(target, "snapshot_rows", len(syms))
-                await self._symbols_cache.set(syms, sheet=target, limit=limit)
-                return syms
-
-        emergency = EMERGENCY_PAGE_SYMBOLS.get(target) or []
-        if emergency:
-            syms = _normalize_symbol_list(emergency, limit=limit)
-            self._set_sheet_symbols_meta(target, "emergency_page_symbols", len(syms), note="last_resort_fallback")
-            await self._symbols_cache.set(syms, sheet=target, limit=limit)
-            return syms
-
-        self._set_sheet_symbols_meta(target, "none", 0, note=(src or "no_source"))
-        return []
-
-    async def get_sheet_symbols(
-        self,
-        sheet: Optional[str] = None,
-        *,
-        sheet_name: Optional[str] = None,
-        page: Optional[str] = None,
-        limit: int = 5000,
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> List[str]:
-        target_sheet, effective_limit, _offset, _mode, normalized_body, _request_parts = _normalize_route_call_inputs(
-            page=page,
-            sheet=sheet,
-            sheet_name=sheet_name,
-            limit=limit,
-            offset=0,
-            mode="",
-            body=body,
-            extras=kwargs,
-        )
-        return await self._get_symbols_for_sheet_impl(target_sheet, limit=effective_limit, body=normalized_body)
-
-    async def get_page_symbols(
-        self,
-        page: Optional[str] = None,
-        *,
-        sheet: Optional[str] = None,
-        sheet_name: Optional[str] = None,
-        limit: int = 5000,
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> List[str]:
-        target_sheet, effective_limit, _offset, _mode, normalized_body, _request_parts = _normalize_route_call_inputs(
-            page=page,
-            sheet=sheet,
-            sheet_name=sheet_name,
-            limit=limit,
-            offset=0,
-            mode="",
-            body=body,
-            extras=kwargs,
-        )
-        return await self._get_symbols_for_sheet_impl(target_sheet, limit=effective_limit, body=normalized_body)
-
-    async def list_symbols_for_page(self, page: str, *, limit: int = 5000, body: Optional[Dict[str, Any]] = None, **kwargs: Any) -> List[str]:
-        target_sheet, effective_limit, _offset, _mode, normalized_body, _request_parts = _normalize_route_call_inputs(
-            page=page,
-            limit=limit,
-            offset=0,
-            mode="",
-            body=body,
-            extras=kwargs,
-        )
-        return await self._get_symbols_for_sheet_impl(target_sheet, limit=effective_limit, body=normalized_body)
-
-    async def list_symbols(
-        self,
-        sheet: Optional[str] = None,
-        *,
-        page: Optional[str] = None,
-        sheet_name: Optional[str] = None,
-        limit: int = 5000,
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> List[str]:
-        target_sheet, effective_limit, _offset, _mode, normalized_body, _request_parts = _normalize_route_call_inputs(
-            page=page,
-            sheet=sheet,
-            sheet_name=sheet_name,
-            limit=limit,
-            offset=0,
-            mode="",
-            body=body,
-            extras=kwargs,
-        )
-        return await self._get_symbols_for_sheet_impl(target_sheet, limit=effective_limit, body=normalized_body)
-
-    async def get_symbols(
-        self,
-        sheet: Optional[str] = None,
-        *,
-        page: Optional[str] = None,
-        sheet_name: Optional[str] = None,
-        limit: int = 5000,
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> List[str]:
-        target_sheet, effective_limit, _offset, _mode, normalized_body, _request_parts = _normalize_route_call_inputs(
-            page=page,
-            sheet=sheet,
-            sheet_name=sheet_name,
-            limit=limit,
-            offset=0,
-            mode="",
-            body=body,
-            extras=kwargs,
-        )
-        return await self._get_symbols_for_sheet_impl(target_sheet, limit=effective_limit, body=normalized_body)
-
-    # ------------------------------------------------------------------
-    # quote context / provider preference helpers
-    # ------------------------------------------------------------------
-    def _resolve_quote_page_context(
-        self,
-        *,
-        page: Optional[str] = None,
-        sheet: Optional[str] = None,
-        body: Optional[Dict[str, Any]] = None,
-        schema: Any = None,
-        extras: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        merged = _merge_route_body_dicts(body, extras or {})
-        target_raw = (
-            page
-            or sheet
-            or _safe_str(merged.get("page"))
-            or _safe_str(merged.get("sheet"))
-            or _safe_str(merged.get("sheet_name"))
-            or _safe_str(merged.get("page_name"))
-            or _safe_str(merged.get("name"))
-            or _safe_str(merged.get("tab"))
-            or _safe_str(merged.get("worksheet"))
-        )
-        if not target_raw and isinstance(schema, str):
-            target_raw = schema
-        return _canonicalize_sheet_name(target_raw) if target_raw else ""
-
-    def _page_primary_provider_for(self, symbol: str, page: str = "") -> str:
-        info = get_symbol_info(symbol)
-        is_ksa_sym = bool(info.get("is_ksa"))
-        page_ctx = _canonicalize_sheet_name(page) if page else ""
-        if (
-            not is_ksa_sym
-            and page_ctx
-            and page_ctx in self.page_primary_providers
-        ):
-            candidate = _safe_str(self.page_primary_providers.get(page_ctx), self.non_ksa_primary_provider).lower()
-            if candidate:
-                return candidate
-        return self.primary_provider
-
-    def _provider_profile_key(self, symbol: str, page: str = "") -> str:
-        info = get_symbol_info(symbol)
-        page_ctx = _canonicalize_sheet_name(page) if page else ""
-        primary = self._page_primary_provider_for(symbol, page_ctx)
-        market = "ksa" if bool(info.get("is_ksa")) else "global"
-        return f"{market}|{page_ctx or 'default'}|{primary or 'none'}"
-
-    # ------------------------------------------------------------------
-    # quote APIs
-    # ------------------------------------------------------------------
-    async def _fetch_patch(self, provider: str, symbol: str) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
-        start = time.time()
-        async with self._sem:
-            module, stats = await self._registry.get_provider(provider)
-            if getattr(stats, "is_circuit_open", False):
-                return provider, None, 0.0, "circuit_open"
-
-            if module is None:
-                err = getattr(stats, "last_import_error", "provider module missing")
-                await self._registry.record_failure(provider, err)
-                return provider, None, (time.time() - start) * 1000.0, err
-
-            fn = _pick_provider_callable(module, provider)
-            if fn is None:
-                err = f"no callable fetch function for provider '{provider}'"
-                await self._registry.record_failure(provider, err)
-                return provider, None, (time.time() - start) * 1000.0, err
-
-            call_variants = [
-                ((symbol,), {}),
-                ((), {"symbol": symbol}),
-                ((), {"ticker": symbol}),
-                ((), {"requested_symbol": symbol}),
-                ((symbol,), {"settings": self.settings}),
-                ((), {"symbol": symbol, "settings": self.settings}),
-            ]
-
-            result = None
-            collected_errs: List[str] = []
-            for args, kwargs in call_variants:
-                try:
-                    async with asyncio.timeout(self.request_timeout):
-                        result = await _call_maybe_async(fn, *args, **kwargs)
-                    break
-                except TypeError:
-                    continue
-                except Exception as exc:
-                    collected_errs.append(f"{type(exc).__name__}: {str(exc)[:120]}")
-                    continue
-
-            latency = (time.time() - start) * 1000.0
-            patch = _model_to_dict(result)
-            if patch and isinstance(patch, dict):
-                await self._registry.record_success(provider, latency)
-                return provider, patch, latency, None
-
-            err = " | ".join(collected_errs) if collected_errs else "non_dict_or_empty"
-            await self._registry.record_failure(provider, err)
-            return provider, None, latency, err
-
-    def _providers_for(self, symbol: str, page: str = "") -> List[str]:
-        info = get_symbol_info(symbol)
-        is_ksa_sym = bool(info.get("is_ksa"))
-        page_ctx = _canonicalize_sheet_name(page) if page else ""
-
-        def _provider_allowed(provider: str) -> bool:
-            provider = _safe_str(provider).lower()
-            if not provider or provider not in self.enabled_providers:
-                return False
-            if is_ksa_sym and self.ksa_disallow_eodhd and provider == "eodhd":
-                return False
-            return True
-
-        providers = [p for p in (self.ksa_providers if is_ksa_sym else self.global_providers) if _provider_allowed(p)]
-
-        primary_provider = self._page_primary_provider_for(symbol, page_ctx)
-        if primary_provider and _provider_allowed(primary_provider):
-            if primary_provider in providers:
-                providers = [p for p in providers if p != primary_provider]
-            providers.insert(0, primary_provider)
-
-        # Preserve paid EODHD priority for configured non-KSA/global pages even
-        # when settings or env put another global provider first.
-        if (not is_ksa_sym) and page_ctx and page_ctx in self.page_primary_providers and _provider_allowed("eodhd"):
-            providers = [p for p in providers if p != "eodhd"]
-            providers.insert(0, "eodhd")
-
-        seen: Set[str] = set()
-        out: List[str] = []
-        for p in providers:
-            p2 = _safe_str(p).lower()
-            if not p2 or p2 in seen:
-                continue
-            seen.add(p2)
-            out.append(p2)
-        return out
-
-    def _rows_from_parallel_series(
-        self,
-        timestamps: Sequence[Any],
-        opens: Optional[Sequence[Any]] = None,
-        highs: Optional[Sequence[Any]] = None,
-        lows: Optional[Sequence[Any]] = None,
-        closes: Optional[Sequence[Any]] = None,
-        volumes: Optional[Sequence[Any]] = None,
-        adjcloses: Optional[Sequence[Any]] = None,
-    ) -> List[Dict[str, Any]]:
-        ts_list = list(timestamps or [])
-        if not ts_list:
-            return []
-
-        rows: List[Dict[str, Any]] = []
-        for idx, ts in enumerate(ts_list):
-            row = {
-                "timestamp": ts,
-                "open": opens[idx] if opens is not None and idx < len(opens) else None,
-                "high": highs[idx] if highs is not None and idx < len(highs) else None,
-                "low": lows[idx] if lows is not None and idx < len(lows) else None,
-                "close": closes[idx] if closes is not None and idx < len(closes) else None,
-                "volume": volumes[idx] if volumes is not None and idx < len(volumes) else None,
-                "adjclose": adjcloses[idx] if adjcloses is not None and idx < len(adjcloses) else None,
-            }
-            if any(v is not None for k, v in row.items() if k != "timestamp"):
-                rows.append(row)
-        return rows
-
-    def _coerce_history_rows(self, result: Any) -> List[Dict[str, Any]]:
-        if result is None:
-            return []
-        if hasattr(result, "to_dict") and callable(getattr(result, "to_dict")):
+    async def _get_symbols_for_sheet_impl(self, sheet: str) -> List[str]:
+        canon = _canonicalize_sheet_name(sheet)
+        for source in (self._call_symbols_reader, self._get_symbols_from_env, self._get_symbols_from_settings, self._get_symbols_from_page_catalog):
             try:
-                rows = result.to_dict("records")
-                if isinstance(rows, list):
-                    return [dict(r) for r in rows if isinstance(r, dict)]
+                if source is self._call_symbols_reader:
+                    res = await self._call_symbols_reader(canon)
+                    raw = _split_symbols(res) if res is not None else []
+                    syms = _normalize_symbol_list(raw)
+                else:
+                    syms = await source(canon)
+                if syms:
+                    return syms
             except Exception:
-                pass
-        if isinstance(result, list):
-            out: List[Dict[str, Any]] = []
-            for item in result:
-                if isinstance(item, dict):
-                    if {"open", "high", "low", "close"} & set(item.keys()) and not isinstance(item.get("open"), list):
-                        out.append(dict(item))
-                    else:
-                        nested = self._coerce_history_rows(item)
-                        if nested:
-                            out.extend(nested)
-                        else:
-                            out.append(dict(item))
-                elif isinstance(item, (list, tuple)) and len(item) >= 5:
-                    out.append({
-                        "timestamp": item[0],
-                        "open": item[1],
-                        "high": item[2],
-                        "low": item[3],
-                        "close": item[4],
-                        "volume": item[5] if len(item) > 5 else None,
-                    })
-            return out
-        if isinstance(result, dict):
-            # Yahoo chart-style payloads
-            if isinstance(result.get("chart"), Mapping):
-                chart = result.get("chart") or {}
-                nested = self._coerce_history_rows(chart.get("result"))
-                if nested:
-                    return nested
+                continue
+        return list(EMERGENCY_PAGE_SYMBOLS.get(canon, []))
 
-            if isinstance(result.get("result"), list):
-                for item in result.get("result") or []:
-                    nested = self._coerce_history_rows(item)
-                    if nested:
-                        return nested
+    async def get_sheet_symbols(self, sheet: str) -> List[str]:
+        canon = _canonicalize_sheet_name(sheet)
+        cache_key = f"symbols::{canon}"
+        cached = await self.cache.get(cache_key)
+        if isinstance(cached, list) and cached:
+            return list(cached)
+        symbols = await self._get_symbols_for_sheet_impl(canon)
+        if symbols:
+            await self.cache.set(cache_key, list(symbols), ttl=300.0)
+        return symbols
 
-            timestamps = result.get("timestamp") or result.get("timestamps") or result.get("time")
-            if isinstance(timestamps, list) and timestamps:
-                indicators = result.get("indicators") if isinstance(result.get("indicators"), Mapping) else {}
-                quote = None
-                if isinstance(indicators.get("quote"), list) and indicators.get("quote"):
-                    quote = indicators.get("quote")[0]
-                adj = None
-                if isinstance(indicators.get("adjclose"), list) and indicators.get("adjclose"):
-                    adj = indicators.get("adjclose")[0]
-                if isinstance(quote, Mapping):
-                    rows = self._rows_from_parallel_series(
-                        timestamps=timestamps,
-                        opens=list(quote.get("open") or []),
-                        highs=list(quote.get("high") or []),
-                        lows=list(quote.get("low") or []),
-                        closes=list(quote.get("close") or []),
-                        volumes=list(quote.get("volume") or []),
-                        adjcloses=list(adj.get("adjclose") or []) if isinstance(adj, Mapping) else None,
-                    )
-                    if rows:
-                        return rows
+    async def get_page_symbols(self, page: str) -> List[str]:
+        return await self.get_sheet_symbols(page)
 
-            # Generic parallel-array payloads
-            if any(isinstance(result.get(k), list) for k in ("close", "open", "high", "low", "volume")):
-                ts = result.get("timestamp") or list(range(len(result.get("close") or result.get("price") or [])))
-                rows = self._rows_from_parallel_series(
-                    timestamps=list(ts or []),
-                    opens=list(result.get("open") or []),
-                    highs=list(result.get("high") or []),
-                    lows=list(result.get("low") or []),
-                    closes=list(result.get("close") or result.get("adjclose") or result.get("price") or result.get("value") or []),
-                    volumes=list(result.get("volume") or []),
-                    adjcloses=list(result.get("adjclose") or []),
-                )
-                if rows:
-                    return rows
+    async def list_symbols_for_page(self, page: str) -> List[str]:
+        return await self.get_sheet_symbols(page)
 
-            # AlphaVantage-style keyed time series
-            for key in ("Time Series (Daily)", "time_series", "series"):
-                series = result.get(key)
-                if isinstance(series, Mapping):
-                    rows: List[Dict[str, Any]] = []
-                    for ts, entry in series.items():
-                        if not isinstance(entry, Mapping):
-                            continue
-                        rows.append({
-                            "timestamp": ts,
-                            "open": entry.get("1. open") or entry.get("open"),
-                            "high": entry.get("2. high") or entry.get("high"),
-                            "low": entry.get("3. low") or entry.get("low"),
-                            "close": entry.get("4. close") or entry.get("close"),
-                            "volume": entry.get("5. volume") or entry.get("volume"),
-                        })
-                    if rows:
-                        rows.sort(key=lambda r: _safe_str(r.get("timestamp")))
-                        return rows
+    async def list_symbols(self, page: str = "Market_Leaders") -> List[str]:
+        return await self.get_sheet_symbols(page)
 
-            for key in ("history", "bars", "candles", "prices", "data", "items", "rows", "chart"):
-                if key in result:
-                    nested = self._coerce_history_rows(result.get(key))
-                    if nested:
-                        return nested
-            if {"open", "high", "low", "close"} & set(result.keys()):
-                return [dict(result)]
-        return []
+    async def get_symbols(self, *args: Any, **kwargs: Any) -> List[str]:
+        page = ""
+        if args:
+            page = _safe_str(args[0])
+        if not page:
+            page = _safe_str(kwargs.get("page") or kwargs.get("sheet") or kwargs.get("name") or "Market_Leaders")
+        return await self.get_sheet_symbols(page or "Market_Leaders")
 
-    def _safe_mean(self, values: List[float]) -> float:
-        return sum(values) / len(values) if values else 0.0
+    # --- quote context / provider preference -------------------------------
+    def _resolve_quote_page_context(self, symbol: str, page: Optional[str]) -> str:
+        canon = _canonicalize_sheet_name(_safe_str(page or ""))
+        if canon in NON_KSA_EODHD_PRIMARY_PAGES:
+            return canon
+        if canon in INSTRUMENT_SHEETS:
+            return canon
+        sym = normalize_symbol(symbol)
+        if not sym:
+            return canon or "Market_Leaders"
+        if sym.endswith("=F") or sym.endswith("=X") or sym in _COMMODITY_SYMBOL_HINTS:
+            return "Commodities_FX"
+        if sym in _ETF_SYMBOL_HINTS:
+            return "Mutual_Funds"
+        if sym.endswith(".SR") or re.match(r"^[0-9]{4}$", sym):
+            return canon or "Market_Leaders"
+        if sym.isalpha() and 1 <= len(sym) <= 5:
+            return "Global_Markets"
+        return canon or "Market_Leaders"
 
-    def _safe_std(self, values: List[float]) -> float:
-        if len(values) < 2:
-            return 0.0
-        mean = self._safe_mean(values)
-        var = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
-        return math.sqrt(max(var, 0.0))
+    def _page_primary_provider_for(self, page: str) -> str:
+        canon = _canonicalize_sheet_name(_safe_str(page))
+        return self._page_primary_provider.get(canon, "")
 
-    def _quantile(self, values: List[float], q: float) -> float:
-        if not values:
-            return 0.0
-        ordered = sorted(values)
-        pos = max(0.0, min(1.0, q)) * (len(ordered) - 1)
-        lo = int(math.floor(pos))
-        hi = int(math.ceil(pos))
-        if lo == hi:
-            return ordered[lo]
-        frac = pos - lo
-        return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+    def _provider_profile_key(self, symbol: str, page: Optional[str]) -> str:
+        ctx = self._resolve_quote_page_context(symbol, page)
+        primary = self._page_primary_provider_for(ctx) or "default"
+        sym = normalize_symbol(symbol)
+        is_ksa = sym.endswith(".SR") or bool(re.match(r"^[0-9]{4}$", sym))
+        ksa_flag = "ksa" if is_ksa else "global"
+        return f"{ctx}|{primary}|{ksa_flag}"
 
-    def _compute_history_patch_from_rows(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Compute a quote patch from historical OHLCV rows.
 
-        v5.47.3 fix: percent-fraction fields are stored as FRACTIONS, not
-        pre-multiplied to percent-points. Four sites changed in this method:
-          - max_drawdown_1y      (was abs(max_dd) * 100.0; now abs(max_dd))
-          - var_95_1d            (was var95 * 100.0; now var95)
-          - percent_change       (was *100; now fraction (cur-prev)/prev)
-          - week_52_position_pct (was *100; now fraction (cp-lo)/(hi-lo))
-        These match the canonical fraction contract enforced elsewhere in the
-        engine. Volatilities (vol30/vol90) and Sharpe stay as their natural
-        units (annualised stdev as a fraction; Sharpe unit-less).
-        """
-        closes: List[float] = []
-        highs: List[float] = []
-        lows: List[float] = []
-        volumes: List[float] = []
-        opens: List[float] = []
-        for row in rows or []:
-            close = _as_float(row.get("close") or row.get("adjclose") or row.get("price") or row.get("value"))
-            high = _as_float(row.get("high") or row.get("day_high"))
-            low = _as_float(row.get("low") or row.get("day_low"))
-            vol = _as_float(row.get("volume"))
-            opn = _as_float(row.get("open") or row.get("open_price"))
-            if close is not None:
-                closes.append(close)
-            if high is not None:
-                highs.append(high)
-            if low is not None:
-                lows.append(low)
-            if vol is not None:
-                volumes.append(vol)
-            if opn is not None:
-                opens.append(opn)
-        if len(closes) < 2:
-            return {}
-        returns = []
-        for prev, cur in zip(closes[:-1], closes[1:]):
-            if prev not in (None, 0):
-                returns.append((cur / prev) - 1.0)
-        if not returns:
-            return {}
-        recent14 = closes[-15:]
-        gains: List[float] = []
-        losses: List[float] = []
-        for prev, cur in zip(recent14[:-1], recent14[1:]):
-            delta = cur - prev
-            if delta >= 0:
-                gains.append(delta)
-                losses.append(0.0)
+    # --- single quote pipeline --------------------------------------------
+    async def _fetch_patch(self, provider_name: str, symbol: str) -> Optional[Dict[str, Any]]:
+        provider_mod = await self.providers.get_provider(provider_name)
+        if provider_mod is None:
+            return None
+        fn = _pick_provider_callable(provider_mod, "get_quote_patch", "fetch_quote", "get_quote", "fetch_patch")
+        if fn is None:
+            return None
+        try:
+            patch = await _call_maybe_async(fn, symbol)
+        except Exception as exc:
+            await self.providers.record_failure(provider_name, str(exc))
+            return None
+        if patch is None:
+            await self.providers.record_failure(provider_name, "empty patch")
+            return None
+        await self.providers.record_success(provider_name)
+        if isinstance(patch, dict):
+            return dict(patch)
+        return _model_to_dict(patch)
+
+    def _providers_for(self, symbol: str, page: Optional[str] = None) -> List[str]:
+        sym = normalize_symbol(symbol)
+        is_ksa = sym.endswith(".SR") or bool(re.match(r"^[0-9]{4}$", sym))
+
+        canon_page = _canonicalize_sheet_name(_safe_str(page or ""))
+        override = list(self._page_provider_overrides.get(canon_page, []))
+        prefer_provider = self._page_primary_provider_for(canon_page) if canon_page else ""
+
+        if is_ksa:
+            base = list(self.settings and getattr(self.settings, "ksa_provider_chain", None) or DEFAULT_KSA_PROVIDERS)
+            if not base:
+                base = list(DEFAULT_KSA_PROVIDERS)
+            if self._ksa_disallow_eodhd:
+                base = [p for p in base if p.lower() != "eodhd"]
+            if override:
+                override = [p for p in override if (not self._ksa_disallow_eodhd) or p.lower() != "eodhd"]
+                merged = list(_dedupe_keep_order(override + [p for p in base if p not in override]))
             else:
-                gains.append(0.0)
-                losses.append(abs(delta))
-        avg_gain = self._safe_mean(gains)
-        avg_loss = self._safe_mean(losses)
-        rsi = None
-        if gains and losses:
-            if avg_loss == 0:
-                rsi = 100.0
-            else:
-                rs = avg_gain / avg_loss
-                rsi = 100.0 - (100.0 / (1.0 + rs))
-        last30 = returns[-30:] if len(returns) >= 30 else returns
-        last90 = returns[-90:] if len(returns) >= 90 else returns
-        vol30 = self._safe_std(last30) * math.sqrt(252.0) if last30 else None
-        vol90 = self._safe_std(last90) * math.sqrt(252.0) if last90 else None
-        mean_daily = self._safe_mean(last90)
-        std_daily = self._safe_std(last90)
-        sharpe = (mean_daily / std_daily) * math.sqrt(252.0) if std_daily not in (None, 0.0) else None
-        var95 = abs(self._quantile(last90, 0.05)) if last90 else None
-        peak = closes[0]
-        max_dd = 0.0
-        for price in closes:
-            peak = max(peak, price)
-            if peak > 0:
-                dd = (price / peak) - 1.0
-                max_dd = min(max_dd, dd)
-        # v5.47.3: max_drawdown_1y stored as FRACTION (e.g. 0.30 = 30% drawdown)
-        # v5.47.3: var_95_1d stored as FRACTION (e.g. 0.025 = 2.5% daily VaR)
-        # v5.47.3: percent_change stored as FRACTION
-        patch: Dict[str, Any] = {
-            "current_price": closes[-1],
-            "previous_close": closes[-2],
-            "open_price": opens[-1] if opens else None,
-            "day_high": highs[-1] if highs else None,
-            "day_low": lows[-1] if lows else None,
-            "week_52_high": max(highs) if highs else max(closes),
-            "week_52_low": min(lows) if lows else min(closes),
-            "avg_volume_10d": self._safe_mean(volumes[-10:]) if volumes else None,
-            "avg_volume_30d": self._safe_mean(volumes[-30:]) if volumes else None,
-            "volatility_30d": vol30,
-            "volatility_90d": vol90,
-            "max_drawdown_1y": abs(max_dd),
-            "var_95_1d": var95 if var95 is not None else None,
-            "sharpe_1y": sharpe,
-            "rsi_14": rsi,
-            "price_change": closes[-1] - closes[-2],
-            "percent_change": (closes[-1] - closes[-2]) / closes[-2] if closes[-2] not in (None, 0) else None,
-            "volume": volumes[-1] if volumes else None,
-        }
-        # v5.47.3: week_52_position_pct stored as FRACTION (e.g. 0.62 = 62% of range)
-        if patch.get("current_price") is not None and patch.get("week_52_high") is not None and patch.get("week_52_low") is not None:
-            hi = _as_float(patch.get("week_52_high"))
-            lo = _as_float(patch.get("week_52_low"))
-            cp = _as_float(patch.get("current_price"))
-            if hi is not None and lo is not None and cp is not None and hi > lo:
-                patch["week_52_position_pct"] = (cp - lo) / (hi - lo)
-        return {k: v for k, v in patch.items() if v is not None}
+                merged = list(_dedupe_keep_order(base))
+            if prefer_provider and (not self._ksa_disallow_eodhd or prefer_provider.lower() != "eodhd"):
+                merged = [prefer_provider] + [p for p in merged if p != prefer_provider]
+            return merged
 
-    async def _fetch_history_patch(self, provider: str, symbol: str) -> Dict[str, Any]:
-        module, _stats = await self._registry.get_provider(provider)
-        if module is None:
-            return {}
-        callables = []
-        for name in (
-            "get_history",
-            "fetch_history",
-            "get_price_history",
-            "fetch_price_history",
-            "history",
-            "get_chart",
-            "fetch_chart",
-            "get_chart_history",
-            "fetch_chart_history",
-            "get_historical_data",
-            "fetch_historical_data",
-            "get_history_rows",
-            "fetch_history_rows",
-            "get_timeseries",
-            "fetch_timeseries",
-            "get_series",
-            "fetch_series",
-            "get_ohlcv",
-            "fetch_ohlcv",
+        base = list(self.settings and getattr(self.settings, "provider_chain", None) or DEFAULT_GLOBAL_PROVIDERS)
+        if not base:
+            base = list(DEFAULT_GLOBAL_PROVIDERS)
+        if override:
+            merged = list(_dedupe_keep_order(override + [p for p in base if p not in override]))
+        else:
+            merged = list(_dedupe_keep_order(base))
+        if prefer_provider:
+            merged = [prefer_provider] + [p for p in merged if p != prefer_provider]
+        else:
+            if canon_page in NON_KSA_EODHD_PRIMARY_PAGES and "eodhd" in merged:
+                merged = ["eodhd"] + [p for p in merged if p != "eodhd"]
+        return merged
+
+    async def _rows_from_parallel_series(self, symbol: str) -> List[Dict[str, Any]]:
+        for mod_path, fn_names in (
+            ("core.providers.parallel_series", ("get_history_rows", "fetch_history_rows", "get_rows", "fetch_chart")),
+            ("providers.parallel_series", ("get_history_rows", "fetch_history_rows", "get_rows", "fetch_chart")),
+            ("core.parallel_series", ("get_history_rows", "fetch_history_rows", "get_rows", "fetch_chart")),
         ):
-            fn = getattr(module, name, None)
-            if callable(fn):
-                callables.append(fn)
-        if not callables:
-            return {}
-        variants = [
-            ((symbol,), {"period": "1y", "interval": "1d"}),
-            ((symbol,), {"range": "1y", "interval": "1d"}),
-            ((symbol,), {"lookback": "1y", "interval": "1d"}),
-            ((), {"symbol": symbol, "period": "1y", "interval": "1d"}),
-            ((), {"ticker": symbol, "period": "1y", "interval": "1d"}),
-            ((), {"code": symbol, "period": "1y", "interval": "1d"}),
-            ((), {"symbol": symbol, "range": "1y", "interval": "1d"}),
-            ((), {"ticker": symbol, "range": "1y", "interval": "1d"}),
-            ((symbol,), {}),
-        ]
-        for fn in callables:
-            for args, kwargs in variants:
+            try:
+                mod = import_module(mod_path)
+            except Exception:
+                continue
+            fn = _pick_provider_callable(mod, *fn_names)
+            if fn is None:
+                continue
+            for kwargs in (
+                {"symbol": symbol, "interval": "1d", "range": "1y"},
+                {"symbol": symbol, "period": "1y"},
+                {"symbol": symbol},
+            ):
                 try:
-                    async with asyncio.timeout(max(5.0, self.request_timeout)):
-                        result = await _call_maybe_async(fn, *args, **kwargs)
-                    rows = self._coerce_history_rows(result)
-                    patch = self._compute_history_patch_from_rows(rows)
-                    if patch:
-                        patch["data_provider"] = provider
-                        return patch
+                    res = await _call_maybe_async(fn, **kwargs)
                 except TypeError:
                     continue
                 except Exception:
-                    continue
-        return {}
+                    return []
+                rows = _coerce_rows_list(res)
+                if rows:
+                    return rows
+        return []
 
-    async def _get_history_patch_best_effort(self, symbol: str, providers: Sequence[str], page: str = "") -> Dict[str, Any]:
-        candidates: List[str] = []
-        for provider in list(providers or []):
-            if provider and provider not in candidates:
-                candidates.append(provider)
+    def _coerce_history_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            close = _as_float(r.get("close") or r.get("adjusted_close") or r.get("adjclose") or r.get("c"))
+            if close is None:
+                continue
+            high = _as_float(r.get("high") or r.get("h")) or close
+            low = _as_float(r.get("low") or r.get("l")) or close
+            open_ = _as_float(r.get("open") or r.get("o")) or close
+            vol = _as_float(r.get("volume") or r.get("v")) or 0.0
+            ts = r.get("date") or r.get("timestamp") or r.get("t")
+            out.append(dict(open=open_, high=high, low=low, close=close, volume=vol, date=ts))
+        return out
 
-        page_ctx = _canonicalize_sheet_name(page) if page else ""
-        preferred_history = list(self.history_fallback_providers or [])
-        primary_provider = self._page_primary_provider_for(symbol, page_ctx)
+    def _safe_mean(self, values: Sequence[float]) -> Optional[float]:
+        seq = [v for v in values if v is not None]
+        if not seq:
+            return None
+        return float(sum(seq) / len(seq))
 
-        if (not get_symbol_info(symbol).get("is_ksa")) and page_ctx and page_ctx in self.page_primary_providers:
-            preferred_history = [primary_provider, "yahoo_chart", "yahoo", "eodhd", "finnhub"] + preferred_history
-        elif symbol.endswith("=F") or symbol.endswith("=X"):
-            preferred_history = ["yahoo_chart", "yahoo", "eodhd", "finnhub"] + preferred_history
+    def _safe_std(self, values: Sequence[float]) -> Optional[float]:
+        seq = [v for v in values if v is not None]
+        if len(seq) < 2:
+            return None
+        m = self._safe_mean(seq) or 0.0
+        var = sum((v - m) ** 2 for v in seq) / (len(seq) - 1)
+        return math.sqrt(var) if var >= 0 else None
 
-        for provider in preferred_history:
-            provider = _safe_str(provider).lower()
-            if provider and provider not in candidates and (provider in self.enabled_providers or provider in preferred_history):
-                candidates.append(provider)
+    def _quantile(self, values: Sequence[float], q: float) -> Optional[float]:
+        seq = sorted(v for v in values if v is not None)
+        if not seq:
+            return None
+        idx = q * (len(seq) - 1)
+        lo = int(math.floor(idx))
+        hi = int(math.ceil(idx))
+        if lo == hi:
+            return seq[lo]
+        frac = idx - lo
+        return seq[lo] * (1.0 - frac) + seq[hi] * frac
 
-        for provider in candidates:
-            patch = await self._fetch_history_patch(provider, symbol)
-            if patch:
-                return patch
-        return {}
-
-    def _merge(self, requested_symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]) -> Dict[str, Any]:
-        merged: Dict[str, Any] = {
-            "symbol": norm,
-            "symbol_normalized": norm,
-            "requested_symbol": requested_symbol,
-            "last_updated_utc": _now_utc_iso(),
-            "last_updated_riyadh": _now_riyadh_iso(),
-            "data_sources": [],
-            "provider_latency": {},
+    def _compute_history_patch_from_rows(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        rows = self._coerce_history_rows(rows)
+        if not rows:
+            return {}
+        closes = [r["close"] for r in rows if r.get("close") is not None]
+        if not closes:
+            return {}
+        last_close = closes[-1]
+        first_close = closes[0]
+        out: Dict[str, Any] = {
+            "current_price": last_close,
+            "previous_close": closes[-2] if len(closes) > 1 else last_close,
+            "open_price": rows[-1].get("open") or last_close,
+            "day_high": rows[-1].get("high") or last_close,
+            "day_low": rows[-1].get("low") or last_close,
+            "volume": rows[-1].get("volume") or 0.0,
+            "data_provider": "history_or_chart",
         }
-
-        protected = {"symbol", "symbol_normalized", "requested_symbol"}
-        normalized_patches: List[Tuple[str, Dict[str, Any], float]] = []
-        for prov, patch, latency in patches:
-            canonical = _canonicalize_provider_row(patch, requested_symbol=requested_symbol, normalized_symbol=norm, provider=prov)
-            normalized_patches.append((prov, canonical, latency))
-
-        sorted_patches = sorted(
-            normalized_patches,
-            key=lambda item: (
-                PROVIDER_PRIORITIES.get(item[0], 999),
-                -sum(1 for v in item[1].values() if v not in (None, "", [], {})),
-            ),
-        )
-
-        for prov, patch, latency in sorted_patches:
-            merged["data_sources"].append(prov)
-            merged["provider_latency"][prov] = round(float(latency or 0.0), 2)
-            for k, v in patch.items():
-                if k in protected or v is None:
-                    continue
-                if k not in merged or merged.get(k) in (None, "", [], {}):
-                    merged[k] = v
-
-        merged = _canonicalize_provider_row(merged, requested_symbol=requested_symbol, normalized_symbol=norm, provider=_safe_str((merged.get("data_sources") or [""])[0] if isinstance(merged.get("data_sources"), list) else ""))
-        return merged
-
-
-    def _data_quality(self, row: Dict[str, Any]) -> str:
-        if _as_float(row.get("current_price")) is None:
-            return QuoteQuality.MISSING.value
-        return QuoteQuality.GOOD.value if any(row.get(k) is not None for k in ("overall_score", "forecast_price_3m", "pb_ratio")) else QuoteQuality.FAIR.value
-
-    async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True, *, page: str = "", sheet: str = "", body: Optional[Dict[str, Any]] = None, **kwargs: Any) -> UnifiedQuote:
-        info = get_symbol_info(symbol)
-        norm = _safe_str(info.get("normalized"))
-
-        if not norm:
-            row = {
-                "symbol": _safe_str(symbol),
-                "symbol_normalized": None,
-                "requested_symbol": _safe_str(symbol),
-                "data_quality": QuoteQuality.MISSING.value,
-                "error": "Invalid symbol",
-                "last_updated_utc": _now_utc_iso(),
-                "last_updated_riyadh": _now_riyadh_iso(),
-            }
-            row = _apply_symbol_context_defaults(row, symbol=_safe_str(symbol))
-            _compute_scores_fallback(row)
-            _compute_recommendation(row)
-            return UnifiedQuote(**row)
-
-        page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, extras=kwargs)
-        provider_profile = self._provider_profile_key(norm, page_context)
-
-        if use_cache:
-            cached = await self._cache.get(symbol=norm, provider_profile=provider_profile)
-            if isinstance(cached, dict) and cached:
-                return UnifiedQuote(**cached)
-
-        providers = self._providers_for(norm, page=page_context)
-        patches_ok: List[Tuple[str, Dict[str, Any], float]] = []
-        if providers:
-            gathered = await asyncio.gather(*[self._fetch_patch(p, norm) for p in providers[:4]], return_exceptions=True)
-            for item in gathered:
-                if isinstance(item, tuple) and len(item) == 4:
-                    provider, patch, latency, _err = item
-                    if patch:
-                        patches_ok.append((provider, patch, latency))
-
-        if patches_ok:
-            row = self._merge(symbol, norm, patches_ok)
+        if len(closes) >= 252:
+            out["week_52_high"] = max(closes[-252:])
+            out["week_52_low"] = min(closes[-252:])
         else:
-            row = {
-                "symbol": norm,
-                "symbol_normalized": norm,
-                "requested_symbol": _safe_str(symbol),
-                "name": _infer_display_name_from_symbol(norm) or norm,
-                "current_price": None,
-                "data_sources": [],
-                "provider_latency": {},
-                "warnings": "No live provider data available",
-                "last_updated_utc": _now_utc_iso(),
-                "last_updated_riyadh": _now_riyadh_iso(),
+            out["week_52_high"] = max(closes)
+            out["week_52_low"] = min(closes)
+
+        # v5.47.3: store these as FRACTIONS (not percent points).
+        # The downstream sheet display layer applies its own *100 step;
+        # multiplying here as well produced 100x-too-large output.
+        if first_close not in (None, 0):
+            out["percent_change"] = (last_close - first_close) / first_close
+        if out["week_52_high"] not in (None, 0) and out["week_52_high"] > out["week_52_low"]:
+            out["week_52_position_pct"] = (last_close - out["week_52_low"]) / (out["week_52_high"] - out["week_52_low"])
+
+        if len(closes) >= 22:
+            returns_30 = [
+                (closes[i] - closes[i - 1]) / closes[i - 1] for i in range(-21, 0) if closes[i - 1] not in (None, 0)
+            ]
+            std_30 = self._safe_std(returns_30)
+            if std_30 is not None:
+                out["volatility_30d"] = round(std_30 * math.sqrt(252) * 100.0, 4)
+        if len(closes) >= 60:
+            returns_60 = [
+                (closes[i] - closes[i - 1]) / closes[i - 1] for i in range(-59, 0) if closes[i - 1] not in (None, 0)
+            ]
+            std_60 = self._safe_std(returns_60)
+            if std_60 is not None:
+                out["volatility_90d"] = round(std_60 * math.sqrt(252) * 100.0, 4)
+
+        if len(closes) >= 14:
+            window = closes[-14:]
+            running_max = window[0]
+            max_dd = 0.0
+            for c in window:
+                if c > running_max:
+                    running_max = c
+                if running_max not in (None, 0):
+                    dd = (c - running_max) / running_max
+                    if dd < max_dd:
+                        max_dd = dd
+            # v5.47.3: store as FRACTION (e.g. -0.27 for -27% drawdown).
+            # The downstream sheet display layer applies its own *100 step.
+            out["max_drawdown_1y"] = max_dd
+        if len(closes) >= 60:
+            returns_60 = [
+                (closes[i] - closes[i - 1]) / closes[i - 1] for i in range(-59, 0) if closes[i - 1] not in (None, 0)
+            ]
+            q5 = self._quantile(returns_60, 0.05)
+            if q5 is not None:
+                # v5.47.3: store VaR_95 as FRACTION. The downstream sheet
+                # display layer applies its own *100 step.
+                out["var_95_1d"] = abs(q5)
+        return out
+
+    async def _fetch_history_patch(self, symbol: str) -> Optional[Dict[str, Any]]:
+        rows = await self._rows_from_parallel_series(symbol)
+        if not rows:
+            return None
+        patch = self._compute_history_patch_from_rows(rows)
+        if not patch:
+            return None
+        return patch
+
+    async def _get_history_patch_best_effort(self, symbol: str) -> Optional[Dict[str, Any]]:
+        try:
+            return await self._fetch_history_patch(symbol)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _merge(base: Dict[str, Any], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(patch, dict):
+            return base
+        out = dict(base)
+        for k, v in patch.items():
+            if v is None or v == "":
+                continue
+            if out.get(k) in (None, "", [], {}):
+                out[k] = v
+        return out
+
+    @staticmethod
+    def _data_quality(row: Dict[str, Any]) -> str:
+        critical = ["current_price", "name", "sector"]
+        missing = sum(1 for k in critical if row.get(k) in (None, "", []))
+        if missing == 0:
+            return QuoteQuality.GOOD.value
+        if missing < len(critical):
+            return QuoteQuality.FAIR.value
+        return QuoteQuality.MISSING.value
+
+    async def _get_enriched_quote_impl(self, symbol: str, page: Optional[str] = None) -> Dict[str, Any]:
+        normalized = normalize_symbol(symbol)
+        cache_key = f"quote::{normalized}::{self._provider_profile_key(normalized, page)}"
+
+        async def _build() -> Dict[str, Any]:
+            row: Dict[str, Any] = {
+                "symbol": normalized,
+                "symbol_normalized": normalized,
+                "requested_symbol": symbol,
             }
+            warnings: List[str] = []
+            sources: List[str] = []
+            sem = asyncio.Semaphore(self._max_concurrent_quotes)
+            async with sem:
+                providers = self._providers_for(normalized, page=page)
+                for provider in providers:
+                    patch = await self._fetch_patch(provider, normalized)
+                    if patch:
+                        canon_patch = _canonicalize_provider_row(patch, requested_symbol=symbol, normalized_symbol=normalized, provider=provider)
+                        row = self._merge(row, canon_patch)
+                        sources.append(provider)
+                        if row.get("current_price") not in (None, "") and row.get("name") not in (None, ""):
+                            break
+            if row.get("current_price") in (None, ""):
+                hp = await self._get_history_patch_best_effort(normalized)
+                if hp:
+                    canon_patch = _canonicalize_provider_row(hp, requested_symbol=symbol, normalized_symbol=normalized, provider="history_or_chart")
+                    row = self._merge(row, canon_patch)
+                    sources.append("history_or_chart")
+                else:
+                    warnings.append("No live provider data available")
 
-        row = _apply_symbol_context_defaults(row, symbol=norm)
+            row["data_sources"] = sources
+            if not row.get("data_provider") and sources:
+                row["data_provider"] = sources[0]
+            row["quote_quality"] = self._data_quality(row)
+            row["last_updated_utc"] = _now_utc_iso()
+            row["last_updated_riyadh"] = _now_riyadh_iso()
+            if warnings:
+                row["warnings"] = "; ".join(warnings)
+            row.setdefault("symbol", normalized)
+            row.setdefault("requested_symbol", symbol)
+            row.setdefault("symbol_normalized", normalized)
+            row = _apply_symbol_context_defaults(row, symbol=normalized, page=page or "")
+            return row
 
-        cached_best_row = self._get_best_cached_snapshot_row_for_symbol(norm, prefer_sheet=page_context)
-        if cached_best_row:
-            row = _merge_missing_fields(row, cached_best_row)
-            row = _apply_page_row_backfill(page_context or sheet or "", row)
+        async def _build_and_cache() -> Dict[str, Any]:
+            built = await self.singleflight.do(cache_key, _build)
+            quality = _safe_str(built.get("quote_quality") or self._data_quality(built))
+            if quality != QuoteQuality.MISSING.value:
+                ttl = float(_get_env_float("ENGINE_QUOTE_TTL_SECONDS", 60.0))
+                await self.cache.set(cache_key, built, ttl=ttl)
+            await self._record_symbol_snapshot(normalized, built)
+            return built
 
-        missing_history_fields = [
-            "current_price",
-            "previous_close",
-            "day_high",
-            "day_low",
-            "week_52_high",
-            "week_52_low",
-            "avg_volume_10d",
-            "avg_volume_30d",
-            "volatility_30d",
-            "volatility_90d",
-            "max_drawdown_1y",
-            "var_95_1d",
-            "sharpe_1y",
-            "rsi_14",
-        ]
-        if any(row.get(k) in (None, "", [], {}) for k in missing_history_fields):
-            hist_patch = await self._get_history_patch_best_effort(norm, providers, page=page_context)
-            if hist_patch:
-                row = self._merge(symbol, norm, patches_ok + [(hist_patch.get("data_provider") or "history", hist_patch, 0.0)])
-                row = _apply_symbol_context_defaults(row, symbol=norm)
+        cached = await self.cache.get(cache_key)
+        if isinstance(cached, dict) and cached:
+            await self._record_symbol_snapshot(normalized, cached)
+            return cached
+        return await _build_and_cache()
 
-        if cached_best_row:
-            row = _merge_missing_fields(row, cached_best_row)
-            row = _apply_page_row_backfill(page_context or sheet or "", row)
+    async def get_enriched_quote(self, symbol: str, *, page: Optional[str] = None, **_: Any) -> UnifiedQuote:
+        row = await self._get_enriched_quote_impl(symbol, page=page)
+        return UnifiedQuote(**row)
 
-        if _as_float(row.get("current_price")) is not None and _safe_str(row.get("warnings")).lower() == "no live provider data available":
-            row["warnings"] = "Recovered from history/chart fallback"
-        elif _as_float(row.get("current_price")) is None and not row.get("warnings"):
-            row["warnings"] = "No live quote payload and no usable history fallback"
+    async def get_enriched_quote_dict(self, symbol: str, *, page: Optional[str] = None, **_: Any) -> Dict[str, Any]:
+        return await self._get_enriched_quote_impl(symbol, page=page)
 
-        _compute_scores_fallback(row)
-        _compute_recommendation(row)
-        row["data_quality"] = self._data_quality(row)
-        row["data_provider"] = row.get("data_provider") or ((row.get("data_sources") or [""])[0] if isinstance(row.get("data_sources"), list) else "")
-        q = UnifiedQuote(**row)
+    async def get_enriched_quotes(self, symbols: Sequence[str], *, page: Optional[str] = None, **_: Any) -> List[UnifiedQuote]:
+        unique = _normalize_symbol_list(symbols)
+        sem = asyncio.Semaphore(self._max_concurrent_quotes)
 
-        if use_cache:
-            await self._cache.set(_model_to_dict(q), symbol=norm, provider_profile=provider_profile)
+        async def _one(s: str) -> UnifiedQuote:
+            async with sem:
+                row = await self._get_enriched_quote_impl(s, page=page)
+                return UnifiedQuote(**row)
 
-        return q
+        return await asyncio.gather(*[_one(s) for s in unique]) if unique else []
 
-    async def get_enriched_quote(
-        self,
-        symbol: str,
-        use_cache: bool = True,
-        *,
-        schema: Any = None,
-        page: str = "",
-        sheet: str = "",
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> UnifiedQuote:
-        page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, schema=schema, extras=kwargs)
-        provider_profile = self._provider_profile_key(normalize_symbol(symbol), page_context)
-        key = f"quote:{normalize_symbol(symbol)}:{provider_profile}:{'cache' if use_cache else 'live'}"
-        raw_q = await self._singleflight.execute(
-            key,
-            lambda: self._get_enriched_quote_impl(symbol, use_cache, page=page_context, body=body, schema=schema, **kwargs),
-        )
-        if schema is None:
-            return raw_q
-        row = _model_to_dict(raw_q)
-        if isinstance(schema, str):
-            _spec, hdrs, keys, _src = _schema_for_sheet(_safe_str(schema))
-            projected = _normalize_to_schema_keys(keys, hdrs, row)
-            return UnifiedQuote(**projected)
-        return raw_q
+    async def get_enriched_quotes_batch(self, symbols: Sequence[str], *, page: Optional[str] = None, **_: Any) -> Dict[str, Dict[str, Any]]:
+        unique = _normalize_symbol_list(symbols)
+        sem = asyncio.Semaphore(self._max_concurrent_quotes)
 
-    async def get_enriched_quote_dict(
-        self,
-        symbol: str,
-        use_cache: bool = True,
-        *,
-        schema: Any = None,
-        page: str = "",
-        sheet: str = "",
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        q = await self.get_enriched_quote(symbol, use_cache=use_cache, schema=schema, page=page, sheet=sheet, body=body, **kwargs)
-        return _model_to_dict(q)
+        async def _one(s: str) -> Tuple[str, Dict[str, Any]]:
+            async with sem:
+                return s, await self._get_enriched_quote_impl(s, page=page)
 
-    async def get_enriched_quotes(
-        self,
-        symbols: List[str],
-        *,
-        schema: Any = None,
-        page: str = "",
-        sheet: str = "",
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> List[UnifiedQuote]:
-        if not symbols:
-            return []
-        batch = max(1, min(500, _get_env_int("QUOTE_BATCH_SIZE", 25)))
-        out: List[UnifiedQuote] = []
-        for i in range(0, len(symbols), batch):
-            part = symbols[i:i + batch]
-            out.extend(
-                await asyncio.gather(*[
-                    self.get_enriched_quote(s, schema=schema, page=page, sheet=sheet, body=body, **kwargs)
-                    for s in part
-                ])
-            )
-        return out
+        results = await asyncio.gather(*[_one(s) for s in unique]) if unique else []
+        return dict(results)
 
-    async def get_enriched_quotes_batch(
-        self,
-        symbols: List[str],
-        mode: str = "",
-        *,
-        schema: Any = None,
-        page: str = "",
-        sheet: str = "",
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Dict[str, Any]]:
-        out: Dict[str, Dict[str, Any]] = {}
-        norm_syms = _normalize_symbol_list(symbols, limit=len(symbols) + 10)
-        quotes = await asyncio.gather(*[self.get_enriched_quote_dict(s, schema=schema, page=page, sheet=sheet, body=body, **kwargs) for s in norm_syms])
-        for req_sym, qd in zip(norm_syms, quotes):
-            out[req_sym] = qd
-            norm = _safe_str(qd.get("symbol_normalized") or qd.get("symbol"))
-            if norm:
-                out[norm] = qd
-        for req in symbols:
-            req2 = _safe_str(req)
-            if req2 and req2 not in out:
-                norm = normalize_symbol(req2)
-                if norm in out:
-                    out[req2] = out[norm]
-        return out
+    async def get_quote(self, symbol: str, *, page: Optional[str] = None, **kwargs: Any) -> UnifiedQuote:
+        return await self.get_enriched_quote(symbol, page=page, **kwargs)
 
-    get_quote = get_enriched_quote
-    get_quotes = get_enriched_quotes
-    fetch_quote = get_enriched_quote
-    fetch_quotes = get_enriched_quotes
-    get_quotes_batch = get_enriched_quotes_batch
-    get_analysis_quotes_batch = get_enriched_quotes_batch
-    quotes_batch = get_enriched_quotes_batch
-    get_quote_dict = get_enriched_quote_dict
+    async def get_quote_dict(self, symbol: str, *, page: Optional[str] = None, **kwargs: Any) -> Dict[str, Any]:
+        return await self.get_enriched_quote_dict(symbol, page=page, **kwargs)
 
+    async def get_quotes(self, symbols: Sequence[str], *, page: Optional[str] = None, **kwargs: Any) -> List[UnifiedQuote]:
+        return await self.get_enriched_quotes(symbols, page=page, **kwargs)
 
-    # ------------------------------------------------------------------
-    # builder fallbacks
-    # ------------------------------------------------------------------
+    async def get_quotes_batch(self, symbols: Sequence[str], *, page: Optional[str] = None, **kwargs: Any) -> Dict[str, Dict[str, Any]]:
+        return await self.get_enriched_quotes_batch(symbols, page=page, **kwargs)
+
+    async def fetch_quote(self, symbol: str, *, page: Optional[str] = None, **kwargs: Any) -> UnifiedQuote:
+        return await self.get_enriched_quote(symbol, page=page, **kwargs)
+
+    async def fetch_quotes(self, symbols: Sequence[str], *, page: Optional[str] = None, **kwargs: Any) -> List[UnifiedQuote]:
+        return await self.get_enriched_quotes(symbols, page=page, **kwargs)
+
+    async def get_analysis_quotes_batch(self, symbols: Sequence[str], *, page: Optional[str] = None, **kwargs: Any) -> Dict[str, Dict[str, Any]]:
+        return await self.get_enriched_quotes_batch(symbols, page=page, **kwargs)
+
+    async def quotes_batch(self, symbols: Sequence[str], *, page: Optional[str] = None, **kwargs: Any) -> Dict[str, Dict[str, Any]]:
+        return await self.get_enriched_quotes_batch(symbols, page=page, **kwargs)
+
+    # --- builders for special pages ---------------------------------------
     async def _build_data_dictionary_rows(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-        for sheet_name in _list_sheet_names_best_effort():
-            spec, headers, keys, source = _schema_for_sheet(sheet_name)
-            columns = _schema_columns_from_any(spec)
-            for idx, (header, key) in enumerate(zip(headers, keys), start=1):
-                col_meta = columns[idx - 1] if idx - 1 < len(columns) else {}
-                if not isinstance(col_meta, Mapping):
-                    col_meta = _model_to_dict(col_meta)
-                dtype = _safe_str(col_meta.get("dtype") or col_meta.get("type") or col_meta.get("data_type") or "string")
-                fmt = _safe_str(col_meta.get("format") or col_meta.get("fmt") or col_meta.get("number_format") or "")
-                required = bool(col_meta.get("required")) if "required" in col_meta else idx <= 3
-                source_hint = _safe_str(col_meta.get("source") or source)
-                notes = _safe_str(col_meta.get("notes") or col_meta.get("description") or "static/registry contract")
-
-                group = "Canonical"
-                if key in TOP10_REQUIRED_FIELDS:
-                    group = "Top10"
-                elif sheet_name == "Insights_Analysis":
-                    group = "Insights"
-                elif sheet_name == "Data_Dictionary":
-                    group = "Metadata"
-                elif idx <= 8:
-                    group = "Identity"
-                elif idx <= 18:
-                    group = "Price"
-                elif idx <= 24:
-                    group = "Liquidity"
-                elif idx <= 36:
-                    group = "Fundamentals"
-                elif idx <= 44:
-                    group = "Risk"
-                elif idx <= 50:
-                    group = "Valuation"
-                elif idx <= 69:
-                    group = "Forecast & Scoring"
-                else:
-                    group = "Portfolio & Provenance"
-
-                rows.append(
-                    {
-                        "sheet": sheet_name,
-                        "group": group,
-                        "header": header,
-                        "key": key,
-                        "dtype": dtype,
-                        "fmt": fmt,
-                        "required": required,
-                        "source": source_hint,
-                        "notes": notes,
-                    }
-                )
+        for sheet, contract in STATIC_CANONICAL_SHEET_CONTRACTS.items():
+            for header, key in zip(contract.get("headers", []), contract.get("keys", [])):
+                rows.append({
+                    "sheet": sheet,
+                    "group": "Engine_v2_Default",
+                    "header": header,
+                    "key": key,
+                    "dtype": "auto",
+                    "fmt": "",
+                    "required": False,
+                    "source": "engine_v2",
+                    "notes": "",
+                })
         return rows
 
-    async def _build_insights_rows_fallback(self, body: Optional[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-        body = dict(body or {})
-        symbols = _extract_requested_symbols_from_body(body, limit=max(limit * 2, 10))
-        if not symbols:
-            for page_name in TOP10_ENGINE_DEFAULT_PAGES:
-                symbols.extend(await self.get_sheet_symbols(page_name, limit=max(limit * 2, 10), body=body))
-        symbols = _normalize_symbol_list(symbols, limit=max(limit * 3, 30))
-        if not symbols:
-            symbols = list(EMERGENCY_PAGE_SYMBOLS.get("Market_Leaders", [])[: max(limit, 6)])
-
-        quotes = await self.get_enriched_quotes(symbols, schema=None, page="Insights_Analysis", body=body)
-        quote_rows = [_model_to_dict(q) for q in quotes]
-        quote_rows = [r for r in quote_rows if isinstance(r, dict)]
-        quote_rows.sort(
-            key=lambda r: (
-                _as_float(r.get("opportunity_score")) or _as_float(r.get("overall_score")) or 0.0,
-                _as_float(r.get("confidence_score")) or 0.0,
-            ),
-            reverse=True,
-        )
-
-        def _avg(values: List[Optional[float]]) -> Optional[float]:
-            nums = [v for v in values if v is not None]
-            return round(sum(nums) / len(nums), 4) if nums else None
-
-        total = len(quote_rows)
-        avg_overall = _avg([_as_float(r.get("overall_score")) for r in quote_rows])
-        avg_roi_3m = _avg([_as_float(r.get("expected_roi_3m")) for r in quote_rows])
-
-        risk_counts = {"LOW": 0, "MODERATE": 0, "HIGH": 0}
-        for row in quote_rows:
-            bucket = _safe_str(row.get("risk_bucket")).upper()
-            if bucket in risk_counts:
-                risk_counts[bucket] += 1
-
+    async def _build_insights_rows_fallback(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-        rows.append(
-            {
-                "section": "Market Summary",
-                "item": "Universe",
-                "metric": "Symbols Analyzed",
-                "value": total,
-                "notes": f"fallback summary from {len(symbols)} requested symbols",
-                "source": "engine_fallback",
-                "sort_order": 1,
-            }
-        )
-        rows.append(
-            {
-                "section": "Market Summary",
-                "item": "Universe",
-                "metric": "Average Overall Score",
-                "value": avg_overall,
-                "notes": "mean overall score across analyzed instruments",
-                "source": "engine_fallback",
-                "sort_order": 2,
-            }
-        )
-        rows.append(
-            {
-                "section": "Market Summary",
-                "item": "Universe",
-                "metric": "Average Expected ROI 3M",
-                "value": avg_roi_3m,
-                "notes": "fractional ROI where available",
-                "source": "engine_fallback",
-                "sort_order": 3,
-            }
-        )
+        market_summary: List[str] = []
+        risk_summary = {"LOW": 0, "MODERATE": 0, "HIGH": 0}
+        leaderboard: List[Tuple[str, float]] = []
+        portfolio_value = 0.0
+        portfolio_unrealized = 0.0
 
-        sort_order = 10
-        for bucket in ("LOW", "MODERATE", "HIGH"):
-            rows.append(
-                {
-                    "section": "Risk Distribution",
-                    "item": bucket,
-                    "metric": "Count",
-                    "value": risk_counts[bucket],
-                    "notes": "fallback risk bucket summary",
-                    "source": "engine_fallback",
-                    "sort_order": sort_order,
-                }
-            )
-            sort_order += 1
+        snapshots: Dict[str, Dict[str, Any]] = {}
+        async with self._symbol_snapshot_lock:
+            snapshots = dict(self._symbol_snapshot)
 
-        top_quotes = quote_rows[: max(3, min(7, limit))]
-        for idx, d in enumerate(top_quotes, start=1):
-            rows.append(
-                {
-                    "section": "Top Ideas",
-                    "item": d.get("symbol"),
-                    "metric": "Recommendation",
-                    "value": d.get("recommendation"),
-                    "notes": d.get("recommendation_reason") or f"overall={d.get('overall_score')} opportunity={d.get('opportunity_score')}",
-                    "source": "engine_fallback",
-                    "sort_order": 100 + idx,
-                }
-            )
-            rows.append(
-                {
-                    "section": "Top Ideas",
-                    "item": d.get("symbol"),
-                    "metric": "Expected ROI 3M",
-                    "value": d.get("expected_roi_3m"),
-                    "notes": f"confidence={d.get('confidence_score')} risk={d.get('risk_bucket')}",
-                    "source": "engine_fallback",
-                    "sort_order": 120 + idx,
-                }
-            )
-            if _as_float(d.get("position_value")) is not None or _as_float(d.get("unrealized_pl")) is not None:
-                rows.append(
-                    {
-                        "section": "Portfolio Signals",
-                        "item": d.get("symbol"),
-                        "metric": "Unrealized P/L",
-                        "value": d.get("unrealized_pl"),
-                        "notes": f"value={d.get('position_value')} cost={d.get('position_cost')}",
-                        "source": "engine_fallback",
-                        "sort_order": 140 + idx,
-                    }
-                )
+        for sym, row in snapshots.items():
+            risk_bucket = _safe_str(row.get("risk_bucket")).upper()
+            if risk_bucket in risk_summary:
+                risk_summary[risk_bucket] += 1
+            score = _as_float(row.get("overall_score")) or _as_float(row.get("opportunity_score"))
+            if score is not None:
+                leaderboard.append((sym, score))
+            pv = _as_float(row.get("position_value"))
+            up = _as_float(row.get("unrealized_pl"))
+            if pv is not None:
+                portfolio_value += pv
+            if up is not None:
+                portfolio_unrealized += up
 
-        return rows[:limit]
+        leaderboard.sort(key=lambda t: t[1], reverse=True)
 
-    def _top10_sort_key(self, row: Dict[str, Any]) -> Tuple[float, ...]:
-        return (
-            _as_float(row.get("opportunity_score")) or float("-inf"),
-            _as_float(row.get("overall_score")) or float("-inf"),
-            _as_float(row.get("confidence_score")) or float("-inf"),
-            _as_float(row.get("expected_roi_3m")) or float("-inf"),
-            _as_float(row.get("expected_roi_12m")) or float("-inf"),
-            _as_float(row.get("value_score")) or float("-inf"),
-            _as_float(row.get("quality_score")) or float("-inf"),
-            _as_float(row.get("momentum_score")) or float("-inf"),
-            _as_float(row.get("growth_score")) or float("-inf"),
-            _as_float(row.get("current_price")) or float("-inf"),
-        )
+        rows.append({"section": "Market Summary", "item": "Snapshot", "metric": "Symbols Cached", "value": len(snapshots), "notes": "engine snapshot count", "source": "engine", "sort_order": 1})
+        for label, count in risk_summary.items():
+            rows.append({"section": "Risk Buckets", "item": label, "metric": "Count", "value": count, "notes": "from snapshot", "source": "engine", "sort_order": 2})
+        for i, (sym, score) in enumerate(leaderboard[:10], start=1):
+            rows.append({"section": "Top Opportunities", "item": sym, "metric": "Composite Score", "value": round(score, 2), "notes": f"rank {i}", "source": "engine", "sort_order": 3 + i})
+        if portfolio_value > 0:
+            rows.append({"section": "Portfolio KPIs", "item": "Total", "metric": "Position Value", "value": round(portfolio_value, 2), "notes": "sum of snapshot rows", "source": "engine", "sort_order": 50})
+            rows.append({"section": "Portfolio KPIs", "item": "Total", "metric": "Unrealized P/L", "value": round(portfolio_unrealized, 2), "notes": "sum of snapshot rows", "source": "engine", "sort_order": 51})
+        rows.append({"section": "Generated", "item": "Timestamp", "metric": "UTC", "value": _now_utc_iso(), "notes": "fallback insights", "source": "engine", "sort_order": 99})
+        return rows
 
-    async def _build_top10_rows_fallback(
-        self,
-        headers: Sequence[str],
-        keys: Sequence[str],
-        body: Optional[Dict[str, Any]],
-        limit: int,
-        mode: str = "",
-    ) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
-        body = dict(body or {})
-        criteria = dict(body.get("criteria") or {}) if isinstance(body.get("criteria"), dict) else {}
-        out_headers, out_keys = _ensure_top10_contract(headers, keys)
+    @staticmethod
+    def _top10_sort_key(row: Dict[str, Any]) -> float:
+        for key in ("overall_score", "opportunity_score", "confidence_score"):
+            v = _as_float(row.get(key))
+            if v is not None:
+                return float(v)
+        return 0.0
 
-        top_n = max(1, min(int(criteria.get("top_n") or body.get("top_n") or 10), max(1, limit)))
-        requested_pages = _extract_top10_pages_from_body(body) or list(TOP10_ENGINE_DEFAULT_PAGES)
-        requested_symbols = _extract_requested_symbols_from_body(body, limit=max(limit * 10, 200))
-
-        for page_name in requested_pages:
-            if len(requested_symbols) >= max(limit * 10, 200):
-                break
-            syms = await self.get_sheet_symbols(page_name, limit=max(limit * 2, 25), body=body)
-            if syms:
-                requested_symbols.extend(syms)
-
-        if not requested_symbols:
-            requested_symbols = list(EMERGENCY_PAGE_SYMBOLS.get("Top_10_Investments") or [])
-
-        requested_symbols = _normalize_symbol_list(requested_symbols, limit=max(limit * 10, 200))
-        if not requested_symbols:
-            return out_headers, out_keys, []
-
-        quotes = await self.get_enriched_quotes(requested_symbols, schema=None, page="Top_10_Investments", body=body)
-        rows: List[Dict[str, Any]] = []
-        for q in quotes:
-            row = _model_to_dict(q)
-            row = _apply_page_row_backfill("Top_10_Investments", row)
-            _compute_scores_fallback(row)
-            _compute_recommendation(row)
-            rows.append(row)
-
-        if not rows:
-            return out_headers, out_keys, []
-
-        _apply_rank_overall(rows)
-        rows.sort(key=self._top10_sort_key, reverse=True)
-
-        criteria_snapshot = _top10_criteria_snapshot({
-            **criteria,
-            "pages_selected": requested_pages,
-            "direct_symbols": requested_symbols,
-            "top_n": top_n,
-        })
-
-        selected: List[Dict[str, Any]] = []
+    async def _build_top10_rows_fallback(self, criteria: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+        pages = [p for p in (criteria.get("pages_selected") or TOP10_ENGINE_DEFAULT_PAGES) if isinstance(p, str)] or list(TOP10_ENGINE_DEFAULT_PAGES)
         seen: Set[str] = set()
-        for row in rows:
-            sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("ticker") or row.get("requested_symbol")))
-            dedupe_key = sym or _safe_str(row.get("name")) or f"row_{len(selected)+1}"
-            if dedupe_key in seen:
+        candidates: List[Dict[str, Any]] = []
+        for page in pages:
+            try:
+                payload = await self.get_page_rows(page=page, limit=limit, body=criteria, _internal_skip_top10_recursion=True)
+            except Exception:
                 continue
-            seen.add(dedupe_key)
-            row["top10_rank"] = len(selected) + 1
-            row["selection_reason"] = row.get("selection_reason") or _top10_selection_reason(row)
-            row["criteria_snapshot"] = row.get("criteria_snapshot") or criteria_snapshot
-            projected = _normalize_to_schema_keys(out_keys, out_headers, row)
-            projected["top10_rank"] = row["top10_rank"]
-            projected["selection_reason"] = row["selection_reason"]
-            projected["criteria_snapshot"] = row["criteria_snapshot"]
-            selected.append(_strict_project_row(out_keys, projected))
-            if len(selected) >= top_n:
-                break
+            row_objs = payload.get("row_objects") or payload.get("records") or payload.get("items") or []
+            for row in row_objs:
+                if not isinstance(row, dict):
+                    continue
+                sym = normalize_symbol(_safe_str(row.get("symbol")))
+                if not sym or sym in seen:
+                    continue
+                candidates.append(dict(row))
+                seen.add(sym)
 
-        return out_headers, out_keys, selected
+        if not candidates:
+            return []
 
-    # ------------------------------------------------------------------
-    # main sheet/page APIs
-    # ------------------------------------------------------------------
+        candidates.sort(key=self._top10_sort_key, reverse=True)
+        top_n = max(1, min(int(criteria.get("top_n") or limit or 10), len(candidates), limit or len(candidates)))
+        top = candidates[:top_n]
+        snapshot_str = _top10_criteria_snapshot(criteria)
+        for rank, row in enumerate(top, start=1):
+            row["top10_rank"] = rank
+            row["selection_reason"] = _top10_selection_reason(row)
+            row["criteria_snapshot"] = snapshot_str
+        return top
+
+    # --- main page-rows builder -------------------------------------------
     async def get_page_rows(
         self,
-        page: Optional[str] = None,
         *,
+        page: Optional[str] = None,
         sheet: Optional[str] = None,
         sheet_name: Optional[str] = None,
         limit: int = 2000,
         offset: int = 0,
         mode: str = "",
         body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
+        _internal_skip_top10_recursion: bool = False,
+        **extras: Any,
     ) -> Dict[str, Any]:
-        return await self.get_sheet_rows(
-            page or sheet or sheet_name,
-            limit=limit,
-            offset=offset,
-            mode=mode,
-            body=body,
-            page=page,
-            sheet=sheet,
-            sheet_name=sheet_name,
-            **kwargs,
+        target, effective_limit, effective_offset, effective_mode, normalized_body, _request_parts = _normalize_route_call_inputs(
+            page=page, sheet=sheet, sheet_name=sheet_name, limit=limit, offset=offset, mode=mode, body=body, extras=extras
         )
 
-    async def get_sheet(
-        self,
-        sheet_name: Optional[str] = None,
-        *,
-        sheet: Optional[str] = None,
-        page: Optional[str] = None,
-        limit: int = 2000,
-        offset: int = 0,
-        mode: str = "",
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        return await self.get_sheet_rows(
-            sheet_name or sheet or page,
-            limit=limit,
-            offset=offset,
-            mode=mode,
-            body=body,
-            page=page,
-            sheet=sheet,
-            sheet_name=sheet_name,
-            **kwargs,
-        )
+        spec, headers, keys, source = _schema_for_sheet(target)
+        warnings: List[str] = []
 
-    async def get_sheet_rows(
-        self,
-        sheet: Optional[str] = None,
-        *,
-        sheet_name: Optional[str] = None,
-        page: Optional[str] = None,
-        limit: int = 2000,
-        offset: int = 0,
-        mode: str = "",
-        body: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        target_sheet, limit, offset, mode, body, request_parts = _normalize_route_call_inputs(
-            page=page,
-            sheet=sheet,
-            sheet_name=sheet_name,
-            limit=limit,
-            offset=offset,
-            mode=mode,
-            body=body,
-            extras=kwargs,
-        )
-        include_matrix = _safe_bool(body.get("include_matrix"), True)
-
-        spec, headers, keys, schema_src = _schema_for_sheet(target_sheet)
-        headers, keys = _complete_schema_contract(headers, keys)
-
-        if target_sheet == "Top_10_Investments" and self.top10_force_full_schema:
-            static_contract = STATIC_CANONICAL_SHEET_CONTRACTS.get("Top_10_Investments", {})
-            static_headers, static_keys = _complete_schema_contract(static_contract.get("headers", []), static_contract.get("keys", []))
-            if len(static_keys) >= len(keys):
-                headers, keys = _ensure_top10_contract(static_headers, static_keys)
-                schema_src = f"{schema_src}|top10_force_full_schema"
-
-        target_sheet_known = target_sheet in INSTRUMENT_SHEETS or target_sheet in SPECIAL_SHEETS or bool(spec)
-        strict_req = bool(self.schema_strict_sheet_rows)
-        contract_level = "canonical" if _usable_contract(headers, keys, target_sheet) else "partial"
-        recovered_from: Optional[str] = None
-
-        # Data Dictionary
-        if target_sheet == "Data_Dictionary":
-            if _is_schema_only_body(body):
-                return self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=headers,
-                    keys=keys,
-                    row_objects=[],
-                    include_matrix=include_matrix,
-                    status="success",
-                    meta={
-                        "schema_source": schema_src,
-                        "contract_level": contract_level,
-                        "strict_requested": strict_req,
-                        "strict_enforced": False,
-                        "target_sheet_known": True,
-                        "builder": "schema_only_fast_path",
-                        "rows": 0,
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                    },
-                )
-
-            rows_all = await self._build_data_dictionary_rows()
-            rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows_all]
-            payload_full = self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_proj,
-                include_matrix=include_matrix,
-                status="success",
-                meta={
-                    "schema_source": schema_src,
-                    "contract_level": contract_level,
-                    "strict_requested": strict_req,
-                    "strict_enforced": False,
-                    "target_sheet_known": True,
-                    "builder": "engine.internal_data_dictionary",
-                    "rows": len(rows_proj),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                },
-            )
-            self._store_sheet_snapshot(target_sheet, payload_full)
-            rows_page = rows_proj[offset : offset + limit]
-            return self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_page,
-                include_matrix=include_matrix,
-                status="success",
-                meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
-            )
-
-        # Insights Analysis
-        if target_sheet == "Insights_Analysis":
-            if _is_schema_only_body(body):
-                return self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=headers,
-                    keys=keys,
-                    row_objects=[],
-                    include_matrix=include_matrix,
-                    status="success",
-                    meta={
-                        "schema_source": schema_src,
-                        "contract_level": contract_level,
-                        "strict_requested": strict_req,
-                        "strict_enforced": False,
-                        "target_sheet_known": True,
-                        "builder": "schema_only_fast_path",
-                        "rows": 0,
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                    },
-                )
-
-            rows0: List[Dict[str, Any]] = []
-            builder_name = "core.analysis.insights_builder"
+        rows_dicts: List[Dict[str, Any]] = []
+        if not _is_schema_only_body(normalized_body) and target not in SPECIAL_SHEETS:
             try:
-                from core.analysis.insights_builder import build_insights_analysis_rows  # type: ignore
-                crit = body.get("criteria") if isinstance(body.get("criteria"), dict) else None
-                universes = body.get("universes") if isinstance(body.get("universes"), dict) else None
-                symbols = body.get("symbols") if isinstance(body.get("symbols"), list) else None
-                payload = await build_insights_analysis_rows(
-                    engine=self,
-                    criteria=crit,
-                    universes=universes,
-                    symbols=symbols,
-                    mode=mode or "",
-                )
-                rows0 = _coerce_rows_list(payload)
-            except Exception as exc:
-                builder_name = f"fallback:insights_builder_failed:{type(exc).__name__}"
-                rows0 = []
+                external_rows = await self._get_rows_from_external_reader(target, criteria=normalized_body)
+            except Exception:
+                external_rows = []
+            for r in external_rows:
+                if isinstance(r, dict):
+                    rows_dicts.append(_apply_page_row_backfill(target, _normalize_to_schema_keys(keys, headers, r)))
 
-            if not rows0:
-                rows0 = await self._build_insights_rows_fallback(body, limit=max(limit + offset, 10))
-                builder_name = "fallback:engine_insights_rows"
-
-            rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
-            payload_full = self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_proj,
-                include_matrix=include_matrix,
-                status="success" if rows_proj else "warn",
-                meta={
-                    "schema_source": schema_src,
-                    "contract_level": contract_level,
-                    "strict_requested": strict_req,
-                    "strict_enforced": False,
-                    "target_sheet_known": True,
-                    "builder": builder_name,
-                    "rows": len(rows_proj),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                },
-            )
-            self._store_sheet_snapshot(target_sheet, payload_full)
-            rows_page = rows_proj[offset : offset + limit]
-            return self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_page,
-                include_matrix=include_matrix,
-                status=payload_full.get("status", "success"),
-                meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
-            )
-
-        # Top10
-        if target_sheet == "Top_10_Investments":
-            top10_body, route_warnings = _normalize_top10_body_for_engine(body, limit=max(1, min(limit, 50)))
-            if _is_schema_only_body(top10_body):
-                headers, keys = _ensure_top10_contract(headers, keys)
-                return self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=headers,
-                    keys=keys,
-                    row_objects=[],
-                    include_matrix=include_matrix,
-                    status="success",
-                    meta={
-                        "schema_source": schema_src,
-                        "contract_level": contract_level,
-                        "strict_requested": strict_req,
-                        "strict_enforced": False,
-                        "target_sheet_known": True,
-                        "builder": "schema_only_fast_path",
-                        "rows": 0,
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                        "warnings": route_warnings,
-                    },
-                )
-
-            rows_proj: List[Dict[str, Any]] = []
-            builder_used = "core.analysis.top10_selector"
-            status_out = "success"
-
+        if target == "Top_10_Investments" and not _internal_skip_top10_recursion:
+            criteria = normalized_body if isinstance(normalized_body, dict) else {}
             try:
-                from core.analysis.top10_selector import build_top10_rows  # type: ignore
-                criteria = top10_body.get("criteria") if isinstance(top10_body.get("criteria"), dict) else None
-                payload = await build_top10_rows(
-                    engine=self,
-                    settings=self.settings,
-                    criteria=criteria,
-                    body=dict(top10_body or {}),
-                    limit=int(top10_body.get("limit") or top10_body.get("top_n") or min(limit, 10) or 10),
-                    mode=mode or "",
-                )
-                rows0 = _coerce_rows_list(payload)
-                if rows0:
-                    rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
-                status_out = _safe_str(payload.get("status"), "success") if isinstance(payload, dict) else "success"
-            except Exception as exc:
-                builder_used = f"fallback:top10_selector_failed:{type(exc).__name__}"
-                status_out = "warn"
+                fallback_rows = await self._build_top10_rows_fallback(criteria, effective_limit)
+            except Exception:
+                fallback_rows = []
+            existing_syms = {normalize_symbol(_safe_str(r.get("symbol"))) for r in rows_dicts if isinstance(r, dict)}
+            for row in fallback_rows:
+                sym = normalize_symbol(_safe_str(row.get("symbol")))
+                if sym and sym not in existing_syms:
+                    rows_dicts.append(_apply_page_row_backfill(target, _normalize_to_schema_keys(keys, headers, row)))
+                    existing_syms.add(sym)
+            rows_dicts.sort(key=self._top10_sort_key, reverse=True)
+            rows_dicts = rows_dicts[:effective_limit]
 
-            if not rows_proj:
-                headers, keys, rows_proj = await self._build_top10_rows_fallback(headers, keys, top10_body, limit=max(limit + offset, 10), mode=mode)
-                builder_used = "fallback:live_ranker"
-                if rows_proj:
-                    status_out = "warn"
+        if not rows_dicts and target == "Insights_Analysis":
+            insights_rows = await self._build_insights_rows_fallback()
+            rows_dicts = [_normalize_to_schema_keys(keys, headers, r) for r in insights_rows]
 
-            payload_full = self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_proj,
-                include_matrix=include_matrix,
-                status=status_out if rows_proj else "warn",
-                meta={
-                    "schema_source": schema_src,
-                    "contract_level": contract_level,
-                    "strict_requested": strict_req,
-                    "strict_enforced": False,
-                    "target_sheet_known": True,
-                    "builder": builder_used,
-                    "rows": len(rows_proj),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                    "warnings": route_warnings,
-                },
-            )
-            if rows_proj:
-                self._store_sheet_snapshot(target_sheet, payload_full)
+        if not rows_dicts and target == "Data_Dictionary":
+            dd_rows = await self._build_data_dictionary_rows()
+            rows_dicts = [_normalize_to_schema_keys(keys, headers, r) for r in dd_rows]
 
-            rows_page = rows_proj[offset : offset + limit]
-            return self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_page,
-                include_matrix=include_matrix,
-                status=payload_full.get("status", "warn"),
-                meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
-            )
+        if not rows_dicts and target in INSTRUMENT_SHEETS and not _is_schema_only_body(normalized_body):
+            symbols = await self.get_sheet_symbols(target)
+            requested_symbols = _extract_requested_symbols_from_body(normalized_body)
+            if requested_symbols:
+                symbols = list(_dedupe_keep_order(requested_symbols + symbols))
+            if symbols:
+                quotes = await self.get_enriched_quotes_batch(symbols, page=target)
+                for sym in symbols:
+                    quote = quotes.get(sym, {})
+                    snapshot = await self._get_symbol_snapshot(sym)
+                    if snapshot:
+                        quote = self._merge(quote, snapshot)
+                    backfilled = _apply_page_row_backfill(target, quote)
+                    norm = _normalize_to_schema_keys(keys, headers, backfilled)
+                    rows_dicts.append(norm)
 
-        # Contract recovery for instrument pages
-        if contract_level != "canonical":
-            cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
-            recovered = False
-            if isinstance(cached_snap, dict):
-                c_headers = cached_snap.get("headers") or cached_snap.get("display_headers")
-                c_keys = cached_snap.get("keys") or cached_snap.get("fields")
-                if c_headers or c_keys:
-                    ch, ck = _complete_schema_contract(c_headers or [], c_keys or [])
-                    if _usable_contract(ch, ck, target_sheet):
-                        headers, keys = ch, ck
-                        schema_src = "recovered_from_cache_contract"
-                        contract_level = "recovered"
-                        recovered_from = "cache_contract"
-                        recovered = True
+        for r in rows_dicts:
+            _compute_scores_fallback(r)
+            _compute_recommendation(r)
 
-            if not recovered and target_sheet in STATIC_CANONICAL_SHEET_CONTRACTS:
-                c = STATIC_CANONICAL_SHEET_CONTRACTS[target_sheet]
-                headers, keys = _complete_schema_contract(c["headers"], c["keys"])
-                schema_src = "static_canonical_contract_recovery"
-                contract_level = "recovered"
-                recovered_from = "static_contract"
-                recovered = True
+        if rows_dicts and target in INSTRUMENT_SHEETS:
+            _apply_rank_overall(rows_dicts)
 
-            if not recovered and target_sheet in INSTRUMENT_SHEETS:
-                headers, keys = list(INSTRUMENT_CANONICAL_HEADERS), list(INSTRUMENT_CANONICAL_KEYS)
-                schema_src = "fallback_union"
-                contract_level = "union_fallback"
-                recovered_from = "union_fallback"
-
-        final_status = "success"
-        schema_warning: Optional[str] = None
-        if contract_level == "union_fallback" and target_sheet_known:
-            final_status = "warn"
-            schema_warning = "canonical_schema_unusable_used_union_schema"
-        elif not target_sheet_known and not strict_req:
-            final_status = "warn"
-            schema_warning = "unknown_sheet_non_strict_mode"
-
-        base_meta = {
-            "schema_source": schema_src,
-            "contract_level": contract_level,
-            "strict_requested": strict_req,
-            "strict_enforced": False,
-            "target_sheet_known": target_sheet_known,
-            "route_input_keys": sorted([str(k) for k in body.keys()]) if isinstance(body, dict) else [],
-            "request_input_keys": sorted([str(k) for k in request_parts.keys()]) if isinstance(request_parts, dict) else [],
-        }
-        if recovered_from:
-            base_meta["recovered_from"] = recovered_from
-        if schema_warning:
-            base_meta["schema_warning"] = schema_warning
-
-        if _is_schema_only_body(body):
-            return self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=[],
-                include_matrix=include_matrix,
-                status=final_status,
-                meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode, "built_from": "schema_only_fast_path"},
-            )
-
-        requested_symbols = _extract_requested_symbols_from_body(body, limit=limit + offset)
-        built_from = "body_symbols" if requested_symbols else "live_quotes"
-        if requested_symbols:
-            self._set_sheet_symbols_meta(target_sheet, "body_symbols", len(requested_symbols))
-        if not requested_symbols and target_sheet in INSTRUMENT_SHEETS:
-            requested_symbols = await self.get_sheet_symbols(target_sheet, limit=limit + offset, body=body)
-            built_from = self._get_sheet_symbols_meta(target_sheet).get("source") or ("auto_sheet_symbols" if requested_symbols else "empty")
-
-        out_headers = list(headers)
-        out_keys = list(keys)
-
-        # Prefer external rows reader when present
-        if target_sheet in INSTRUMENT_SHEETS:
-            ext_rows = await self._get_rows_from_external_reader(target_sheet, limit + offset)
-            if ext_rows:
-                enriched_rows: List[Dict[str, Any]] = []
-                symbols = _extract_symbols_from_rows(ext_rows, limit=limit + offset)
-                quote_map: Dict[str, Dict[str, Any]] = {}
-
-                if self.rows_hydrate_external and symbols:
-                    for q in await self.get_enriched_quotes(symbols, schema=None, page=target_sheet, body=body):
-                        d = _model_to_dict(q)
-                        sym = normalize_symbol(_safe_str(d.get("symbol")))
-                        if sym:
-                            quote_map[sym] = d
-
-                snapshot_map = self._get_cached_snapshot_symbol_map(target_sheet)
-
-                for row in ext_rows:
-                    merged = dict(row)
-                    sym = normalize_symbol(self._extract_row_symbol(row))
-                    if sym and sym in snapshot_map:
-                        merged = _merge_missing_fields(merged, snapshot_map[sym])
-                    best_snapshot_row = self._get_best_cached_snapshot_row_for_symbol(sym, prefer_sheet=target_sheet) if sym else None
-                    if best_snapshot_row:
-                        merged = _merge_missing_fields(merged, best_snapshot_row)
-                    if sym and sym in quote_map:
-                        merged = _merge_missing_fields(merged, quote_map[sym])
-                    merged = _apply_page_row_backfill(target_sheet, merged)
-                    _compute_scores_fallback(merged)
-                    _compute_recommendation(merged)
-                    enriched_rows.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, merged)))
-
-                _apply_rank_overall(enriched_rows)
-
-                payload_full = self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=out_headers,
-                    keys=out_keys,
-                    row_objects=enriched_rows,
-                    include_matrix=include_matrix,
-                    status=final_status,
-                    meta={
-                        **base_meta,
-                        "rows": len(enriched_rows),
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                        "built_from": "external_rows_reader",
-                        "rows_reader_source": self._rows_reader_source,
-                        "symbols_reader_source": self._symbols_reader_source,
-                        "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
-                    },
-                )
-                self._store_sheet_snapshot(target_sheet, payload_full)
-                rows_page = enriched_rows[offset : offset + limit]
-                return self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=out_headers,
-                    keys=out_keys,
-                    row_objects=rows_page,
-                    include_matrix=include_matrix,
-                    status=final_status,
-                    meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
-                )
-
-        if not requested_symbols:
-            cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
-            cached_rows = _coerce_rows_list(cached_snap)
-            if cached_rows:
-                proj_rows = [_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)) for row in cached_rows]
-                rows_page = proj_rows[offset : offset + limit]
-                return self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=out_headers,
-                    keys=out_keys,
-                    row_objects=rows_page,
-                    include_matrix=include_matrix,
-                    status=final_status,
-                    meta={
-                        **base_meta,
-                        "rows": len(rows_page),
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                        "built_from": "cached_snapshot",
-                        "symbols_reader_source": self._symbols_reader_source,
-                        "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
-                    },
-                )
-
-        rows_full: List[Dict[str, Any]] = []
-        if requested_symbols:
-            snapshot_map = self._get_cached_snapshot_symbol_map(target_sheet)
-            quotes = await self.get_enriched_quotes(requested_symbols, schema=None, page=target_sheet, body=body)
-            for q in quotes:
-                row = _model_to_dict(q)
-                sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
-                if sym and sym in snapshot_map:
-                    row = _merge_missing_fields(row, snapshot_map[sym])
-                best_snapshot_row = self._get_best_cached_snapshot_row_for_symbol(sym, prefer_sheet=target_sheet) if sym else None
-                if best_snapshot_row:
-                    row = _merge_missing_fields(row, best_snapshot_row)
-                row = _apply_page_row_backfill(target_sheet, row)
-                _compute_scores_fallback(row)
-                _compute_recommendation(row)
-                rows_full.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)))
-            _apply_rank_overall(rows_full)
-
-        if rows_full:
-            payload_full = self._finalize_payload(
-                sheet=target_sheet,
-                headers=out_headers,
-                keys=out_keys,
-                row_objects=rows_full,
-                include_matrix=include_matrix,
-                status=final_status,
-                meta={
-                    **base_meta,
-                    "rows": len(rows_full),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                    "built_from": built_from,
-                    "resolved_symbols_count": len(requested_symbols),
-                    "symbols_reader_source": self._symbols_reader_source,
-                    "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
-                },
-            )
-            self._store_sheet_snapshot(target_sheet, payload_full)
-            rows_page = rows_full[offset : offset + limit]
-            return self._finalize_payload(
-                sheet=target_sheet,
-                headers=out_headers,
-                keys=out_keys,
-                row_objects=rows_page,
-                include_matrix=include_matrix,
-                status=final_status,
-                meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
-            )
-
-        return self._finalize_payload(
-            sheet=target_sheet,
-            headers=out_headers,
-            keys=out_keys,
-            row_objects=[],
-            include_matrix=include_matrix,
-            status=final_status,
-            meta={
-                **base_meta,
-                "rows": 0,
-                "limit": limit,
-                "offset": offset,
-                "mode": mode,
-                "built_from": built_from,
-                "resolved_symbols_count": len(requested_symbols),
-                "symbols_reader_source": self._symbols_reader_source,
-                "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
-            },
-        )
-
-    async def sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.get_sheet_rows(*args, **kwargs)
-
-    async def build_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.get_sheet_rows(*args, **kwargs)
-
-    def get_sheet_contract(self, sheet: str) -> Dict[str, Any]:
-        target = _canonicalize_sheet_name(sheet) or sheet or "Market_Leaders"
-        _spec, headers, keys, source = _schema_for_sheet(target)
         if target == "Top_10_Investments":
-            headers, keys = _ensure_top10_contract(headers, keys)
-        return {
-            "sheet": target,
+            for rank, row in enumerate(rows_dicts, start=1):
+                row.setdefault("top10_rank", rank)
+                row.setdefault("selection_reason", _top10_selection_reason(row))
+                row.setdefault("criteria_snapshot", _top10_criteria_snapshot(normalized_body if isinstance(normalized_body, dict) else {}))
+
+        if rows_dicts and effective_offset > 0:
+            rows_dicts = rows_dicts[effective_offset : effective_offset + effective_limit]
+        elif rows_dicts and effective_limit and len(rows_dicts) > effective_limit:
+            rows_dicts = rows_dicts[:effective_limit]
+
+        symbols_returned = _extract_symbols_from_rows(rows_dicts)
+
+        payload = {
+            "ok": True,
+            "engine": "engine_v2",
+            "engine_version": __version__,
             "page": target,
+            "sheet": target,
             "sheet_name": target,
             "headers": headers,
-            "display_headers": headers,
             "keys": keys,
-            "fields": keys,
-            "source": source,
-            "count": len(keys),
+            "schema_source": source,
+            "rows": rows_dicts,
+            "rows_matrix": _rows_matrix_from_rows(rows_dicts, keys),
+            "row_objects": rows_dicts,
+            "row_count": len(rows_dicts),
+            "count": len(rows_dicts),
+            "data_provider": "engine_v2",
+            "symbols_requested": _extract_requested_symbols_from_body(normalized_body),
+            "symbols_returned": symbols_returned,
+            "limit": effective_limit,
+            "offset": effective_offset,
+            "mode": effective_mode,
+            "warnings": warnings,
+            "criteria_received": normalized_body if isinstance(normalized_body, dict) else {},
+        }
+        return self._finalize_payload(payload)
+
+    async def get_sheet(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await self.get_page_rows(*args, **kwargs)
+
+    async def get_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await self.get_page_rows(*args, **kwargs)
+
+    async def sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await self.get_page_rows(*args, **kwargs)
+
+    async def build_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await self.get_page_rows(*args, **kwargs)
+
+    # --- contract aliases -------------------------------------------------
+    def get_sheet_contract(self, sheet: str) -> Dict[str, Any]:
+        canon = _canonicalize_sheet_name(sheet)
+        _, headers, keys, source = _schema_for_sheet(canon)
+        return {
+            "ok": True,
+            "page": canon,
+            "sheet": canon,
+            "headers": list(headers),
+            "keys": list(keys),
+            "schema_source": source,
+            "engine_version": __version__,
         }
 
     def get_page_contract(self, page: str) -> Dict[str, Any]:
@@ -5000,18 +3764,18 @@ class DataEngineV5:
     def get_keys_for_sheet(self, sheet: str) -> List[str]:
         return list(self.get_sheet_contract(sheet).get("keys") or [])
 
-    # ------------------------------------------------------------------
-    # health / stats
-    # ------------------------------------------------------------------
+    # --- health -----------------------------------------------------------
     async def health(self) -> Dict[str, Any]:
         return {
-            "status": "ok",
-            "version": self.version,
-            "schema_available": True,
-            "static_contract_sheets": sorted(list(STATIC_CANONICAL_SHEET_CONTRACTS.keys())),
-            "snapshot_sheets": len(self._sheet_snapshots),
-            "rows_reader_source": self._rows_reader_source,
-            "symbols_reader_source": self._symbols_reader_source,
+            "ok": True,
+            "engine": "engine_v2",
+            "engine_version": __version__,
+            "feature_flags": dict(self.feature_flags),
+            "cache_keys": len(await self.cache.keys()),
+            "providers": await self.providers.get_stats(),
+            "snapshot_symbols": len(self._symbol_snapshot),
+            "schema_available": _SCHEMA_AVAILABLE,
+            "schema_union_keys_count": len(_SCHEMA_UNION_KEYS),
         }
 
     async def get_health(self) -> Dict[str, Any]:
@@ -5021,70 +3785,46 @@ class DataEngineV5:
         return await self.health()
 
     async def get_stats(self) -> Dict[str, Any]:
-        return {
-            "version": self.version,
-            "primary_provider": self.primary_provider,
-            "enabled_providers": list(self.enabled_providers),
-            "ksa_providers": list(self.ksa_providers),
-            "global_providers": list(self.global_providers),
-            "non_ksa_primary_provider": self.non_ksa_primary_provider,
-            "page_primary_providers": dict(self.page_primary_providers),
-            "history_fallback_providers": list(self.history_fallback_providers),
-            "ksa_disallow_eodhd": bool(self.ksa_disallow_eodhd),
-            "flags": dict(self.flags),
-            "provider_stats": await self._registry.get_stats(),
-            "schema_available": True,
-            "schema_strict_sheet_rows": bool(self.schema_strict_sheet_rows),
-            "top10_force_full_schema": bool(self.top10_force_full_schema),
-            "rows_hydrate_external": bool(self.rows_hydrate_external),
-            "symbols_reader_source": self._symbols_reader_source,
-            "rows_reader_source": self._rows_reader_source,
-            "snapshot_sheets": sorted(list(self._sheet_snapshots.keys())),
-            "sheet_symbol_resolution_meta": dict(self._sheet_symbol_resolution_meta),
-        }
+        return await self.health()
 
 
+# =============================================================================
+# Top-level helpers
+# =============================================================================
+def normalize_row_to_schema(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Project an arbitrary row dict onto the canonical schema for a given sheet.
+    Exported for use by routes that need pre-projection without engine state.
+    """
+    canon = _canonicalize_sheet_name(sheet)
+    _, headers, keys, _ = _schema_for_sheet(canon)
+    backfilled = _apply_page_row_backfill(canon, dict(row or {}))
+    return _normalize_to_schema_keys(keys, headers, backfilled)
 
-def normalize_row_to_schema(sheet: str, row: Dict[str, Any], keep_extras: bool = False) -> Dict[str, Any]:
-    target = _canonicalize_sheet_name(sheet) or sheet or "Market_Leaders"
-    _spec, headers, keys, _src = _schema_for_sheet(target)
-    if target == "Top_10_Investments":
-        headers, keys = _ensure_top10_contract(headers, keys)
-    normalized = _normalize_to_schema_keys(keys, headers, dict(row or {}))
-    normalized = _apply_page_row_backfill(target, normalized)
-    if keep_extras and isinstance(row, dict):
-        for k, v in row.items():
-            if k not in normalized:
-                normalized[k] = _json_safe(v)
-    return normalized
 
+# =============================================================================
+# Module-level singleton + lifecycle helpers
+# =============================================================================
 _ENGINE_INSTANCE: Optional[DataEngineV5] = None
-ENGINE: Optional[DataEngineV5] = None
-engine: Optional[DataEngineV5] = None
-_ENGINE: Optional[DataEngineV5] = None
-_ENGINE_LOCK = asyncio.Lock()
+_ENGINE_LOCK: asyncio.Lock = asyncio.Lock()
 
 
-async def get_engine() -> DataEngineV5:
-    global _ENGINE_INSTANCE, ENGINE, engine, _ENGINE
+def get_engine() -> DataEngineV5:
+    global _ENGINE_INSTANCE
     if _ENGINE_INSTANCE is None:
-        async with _ENGINE_LOCK:
-            if _ENGINE_INSTANCE is None:
-                _ENGINE_INSTANCE = DataEngineV5()
-    ENGINE = _ENGINE_INSTANCE
-    engine = _ENGINE_INSTANCE
-    _ENGINE = _ENGINE_INSTANCE
+        _ENGINE_INSTANCE = DataEngineV5()
     return _ENGINE_INSTANCE
 
 
 async def close_engine() -> None:
-    global _ENGINE_INSTANCE, ENGINE, engine, _ENGINE
-    if _ENGINE_INSTANCE is not None:
-        await _ENGINE_INSTANCE.aclose()
-    _ENGINE_INSTANCE = None
-    ENGINE = None
-    engine = None
-    _ENGINE = None
+    global _ENGINE_INSTANCE
+    async with _ENGINE_LOCK:
+        if _ENGINE_INSTANCE is not None:
+            try:
+                await _ENGINE_INSTANCE.aclose()
+            except Exception:
+                pass
+            _ENGINE_INSTANCE = None
 
 
 def get_engine_if_ready() -> Optional[DataEngineV5]:
@@ -5095,34 +3835,66 @@ def peek_engine() -> Optional[DataEngineV5]:
     return _ENGINE_INSTANCE
 
 
-def get_cache() -> Any:
-    return getattr(_ENGINE_INSTANCE, "_cache", None)
+def get_cache() -> Optional[MultiLevelCache]:
+    eng = _ENGINE_INSTANCE
+    return eng.cache if eng is not None else None
 
 
+# Convenience aliases for legacy import paths
+ENGINE = get_engine
+engine = get_engine
+_ENGINE = get_engine
+
+DataEngine = DataEngineV5
 DataEngineV4 = DataEngineV5
 DataEngineV3 = DataEngineV5
 DataEngineV2 = DataEngineV5
-DataEngine = DataEngineV5
+
 
 __all__ = [
+    "__version__",
     "DataEngineV5",
     "DataEngineV4",
     "DataEngineV3",
     "DataEngineV2",
     "DataEngine",
-    "ENGINE",
-    "engine",
-    "_ENGINE",
-    "get_engine",
-    "get_engine_if_ready",
-    "peek_engine",
-    "close_engine",
-    "get_cache",
+    "MultiLevelCache",
+    "ProviderRegistry",
+    "ProviderState",
     "QuoteQuality",
     "DataSource",
     "UnifiedQuote",
-    "__version__",
+    "SCHEMA_REGISTRY",
+    "INSTRUMENT_CANONICAL_KEYS",
+    "INSTRUMENT_CANONICAL_HEADERS",
+    "INSIGHTS_HEADERS",
+    "INSIGHTS_KEYS",
+    "DATA_DICTIONARY_HEADERS",
+    "DATA_DICTIONARY_KEYS",
+    "TOP10_REQUIRED_FIELDS",
+    "TOP10_REQUIRED_HEADERS",
     "STATIC_CANONICAL_SHEET_CONTRACTS",
+    "INSTRUMENT_SHEETS",
+    "SPECIAL_SHEETS",
+    "PAGE_PRIMARY_PROVIDER_DEFAULTS",
+    "NON_KSA_EODHD_PRIMARY_PAGES",
+    "PROVIDER_PRIORITIES",
+    "DEFAULT_PROVIDERS",
+    "DEFAULT_KSA_PROVIDERS",
+    "DEFAULT_GLOBAL_PROVIDERS",
+    "EMERGENCY_PAGE_SYMBOLS",
+    "PAGE_SYMBOL_ENV_KEYS",
+    "TOP10_ENGINE_DEFAULT_PAGES",
     "get_sheet_spec",
+    "get_engine",
+    "close_engine",
+    "get_engine_if_ready",
+    "peek_engine",
+    "get_cache",
+    "ENGINE",
+    "engine",
+    "_ENGINE",
+    "normalize_symbol",
+    "get_symbol_info",
     "normalize_row_to_schema",
 ]
