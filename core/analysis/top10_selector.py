@@ -3,15 +3,53 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.8.0
+Top 10 Selector — v4.10.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
 SYNC+ASYNC CALLER TOLERANT • DISPLAY-HEADER TOLERANT • WRAPPER-PAYLOAD SAFE
 PARTIAL-DEGRADATION SAFE • DIRECT-SYMBOLS SAFE • TIMEOUT-GUARDED
+INSIGHTS-COLUMNS AWARE (v2.6.0 / Wave 3)
 
-Why v4.8.0
-----------
+Why v4.10.0
+-----------
+[v2.6.0 / Wave 3] Aligns Top10 with the new 5-Insights-column schema
+delivered in core/data_engine_v2.py v5.49.0 and core/sheets/schema_registry
+v2.6.0:
+
+    sector_relative_score   ("Sector-Adj Score")    float, 0-100
+    conviction_score        ("Conviction Score")    float, 0-100
+    top_factors             ("Top Factors")         str, "|"-separated
+    top_risks               ("Top Risks")           str, "|"-separated
+    position_size_hint      ("Position Size Hint")  str, free text
+
+Concrete changes vs v4.8.0:
+
+- DEFAULT_FALLBACK_KEYS / DEFAULT_FALLBACK_HEADERS extended from 88 -> 93
+  cols (85 instrument + 5 Insights + 3 Top10 extras). The 5 Insights
+  fields slot in between "warnings" and "top10_rank" so they end up at
+  the same canonical positions (86-90) the engine emits.
+- ROW_KEY_ALIASES picks up entries for the 5 Insights fields so legacy
+  payloads using "convictionScore", "sectorAdjScore", "topFactors" etc.
+  get normalised into the canonical names.
+- _selector_score now incorporates `conviction_score` and
+  `sector_relative_score` as additional weighted signals when present
+  (additive -- never penalises rows that lack these fields). Default
+  weights: 0.10 for conviction_score (overlaps confidence; smaller
+  weight), 0.07 for sector_relative_score (sector-relative momentum).
+- _canonical_selection_reason now appends the leading entry from
+  `top_factors` and `top_risks` (split on "|") so the Top10 Selection
+  Reason column carries one-line provenance for the v2.6.0 view.
+
+Note: Wave 2B (v4.9.0 -- canonical 5-tier reco enum compliance) was
+skipped for this file in this rollout. The 5-tier values are produced
+upstream by core.scoring v5.1.0 / core.reco_normalize v7.1.0 and reach
+this selector pre-normalised in the row's `recommendation` field, so
+no local reco synthesis is needed here; the additive schema is the
+only Wave 3 footprint.
+
+Why v4.8.0 (PRESERVED)
+----------------------
 - FIX: recognizes singular wrapper payloads like `quote`, `record`, and `item`
   in addition to plural envelopes, so valid single-row results are not dropped.
 - FIX: lets sparse live page rows merge with snapshot rows instead of choosing
@@ -42,7 +80,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.8.0"
+TOP10_SELECTOR_VERSION = "4.10.0"
 OUTPUT_PAGE = "Top_10_Investments"
 
 DEFAULT_SOURCE_PAGES = [
@@ -92,6 +130,7 @@ DEFAULT_FALLBACK_KEYS = [
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
     "position_qty", "avg_cost", "position_cost", "position_value", "unrealized_pl",
     "unrealized_pl_pct", "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
     "top10_rank", "selection_reason", "criteria_snapshot",
 ]
 
@@ -113,7 +152,9 @@ DEFAULT_FALLBACK_HEADERS = [
     "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
     "Position Qty", "Avg Cost", "Position Cost", "Position Value", "Unrealized P/L",
     "Unrealized P/L %", "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)",
-    "Warnings", "Top10 Rank", "Selection Reason", "Criteria Snapshot",
+    "Warnings",
+    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
+    "Top10 Rank", "Selection Reason", "Criteria Snapshot",
 ]
 
 ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -198,6 +239,11 @@ ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "last_updated_utc": ("last_updated_utc",),
     "last_updated_riyadh": ("last_updated_riyadh",),
     "warnings": ("warnings", "warning"),
+    "sector_relative_score": ("sector_relative_score", "sectorAdjScore", "sector_adj_score", "sectorRelativeScore", "sector_score_adj"),
+    "conviction_score": ("conviction_score", "convictionScore", "conviction"),
+    "top_factors": ("top_factors", "topFactors", "top_factor_list"),
+    "top_risks": ("top_risks", "topRisks", "top_risk_list"),
+    "position_size_hint": ("position_size_hint", "positionSizeHint", "position_hint", "size_hint"),
     "liquidity_score": ("liquidity_score",),
     "selection_reason": ("selection_reason", "selector_reason"),
     "top10_rank": ("top10_rank", "rank"),
@@ -1498,6 +1544,14 @@ def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> floa
     if roi is not None:
         score += roi * 100.0 * 0.20
 
+    # v4.10.0: Insights signals — additive, only contribute when present.
+    conviction = _safe_float(row.get("conviction_score"), None)
+    sector_rel = _safe_float(row.get("sector_relative_score"), None)
+    if conviction is not None:
+        score += conviction * 0.10
+    if sector_rel is not None:
+        score += sector_rel * 0.07
+
     direct_order_index = _direct_symbol_order_index(row, criteria)
     if direct_order_index is not None:
         score += max(0.0, 140.0 - float(direct_order_index * 2))
@@ -1540,6 +1594,18 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
         parts.append(f"Source={source_page}")
     if score_parts:
         parts.append(", ".join(score_parts[:3]))
+
+    # v4.10.0: surface leading top_factor / top_risk for the Selection Reason column.
+    factors_raw = _s(row.get("top_factors"))
+    if factors_raw:
+        top_factor = factors_raw.split("|", 1)[0].strip()
+        if top_factor:
+            parts.append(f"Factor: {top_factor}")
+    risks_raw = _s(row.get("top_risks"))
+    if risks_raw:
+        top_risk = risks_raw.split("|", 1)[0].strip()
+        if top_risk:
+            parts.append(f"Risk: {top_risk}")
 
     return " | ".join(parts) if parts else "Selected by Top10 composite scoring."
 
