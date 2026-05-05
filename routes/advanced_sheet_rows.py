@@ -2,7 +2,7 @@
 # routes/advanced_sheet_rows.py
 """
 ================================================================================
-Advanced Sheet-Rows Router — v4.0.0  (V1 SIBLING / V2.5.0-ALIGNED / FAIL-SOFT)
+Advanced Sheet-Rows Router — v4.1.0  (V1 SIBLING / V2.6.0-ALIGNED / WAVE 3)
 ================================================================================
 VERSIONED PATHS • SCHEMA-FIRST • INDEPENDENT DATA PATH • STABLE ENVELOPE
 JSON-SAFE • GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS
@@ -16,7 +16,7 @@ the versioned sheet-rows paths under `/v1/advanced/...`:
 - /v1/advanced/health
 - /v1/advanced/schema/sheet-spec  (alias for advanced_analysis equivalent)
 
-`routes.analysis_sheet_rows` v4.1.2 proxies its requests to BOTH
+`routes.analysis_sheet_rows` v4.3.0 proxies its requests to BOTH
 `routes.advanced_analysis._run_advanced_sheet_rows_impl` (root paths) AND
 `routes.advanced_sheet_rows._run_advanced_sheet_rows_impl` (this module),
 then picks the better-quality payload via `_pick_best_payload`. For that
@@ -24,27 +24,39 @@ comparison to be meaningful, this module must be an INDEPENDENT data path,
 not a thin delegate to `advanced_analysis`. The two siblings can diverge
 in two specific dimensions:
 
-  1. Static fallback width. `advanced_analysis` v4.0.0 has an 80-column
-     fallback that pads to 84 with placeholder columns. This module
-     ships an explicit 85-column fallback that matches
-     `core.sheets.schema_registry` v2.5.0 (and `core.enriched_quote`
-     v4.2.0): adds `upside_pct` after `intrinsic_value` and 4 view
-     columns (`fundamental_view`, `technical_view`, `risk_view`,
-     `value_view`) after the score block. Top_10_Investments is 88
-     (= 85 + 3 extras).
+  1. Static fallback width. From v4.1.0, both siblings ship a 90-column
+     fallback that matches `core.sheets.schema_registry` v2.6.0:
+        80 base + `upside_pct` + 4 view tokens + 5 Insights cols = 90
+     Top_10_Investments is 93 (= 90 + 3 Top10 extras).
 
-  2. Placeholder behavior. `advanced_analysis` v4.0.0 fabricates values
-     for missing fields (`recommendation="Accumulate"`, `overall_score=99`,
-     etc.). For a financial product these synthetic numbers can be acted
-     upon by the user. This module follows `analysis_sheet_rows` v4.1.2:
-     identity columns get filled, everything numeric returns None, and
-     a `warnings` field is set explicitly to "Placeholder fallback —
-     no live data".
+  2. Placeholder behavior. This module follows `analysis_sheet_rows` v4.3.0:
+     identity columns get filled, everything numeric (including the new
+     Insights cols) returns None, and a `warnings` field is set explicitly
+     to "Placeholder fallback — no live data".
 
-When `core.sheets.schema_registry` is reachable (the normal production path)
-both modules pick up whatever the registry says — including 90/93 from a
-v2.6.0 registry. The static-fallback divergence above only matters when the
-registry import has failed.
+v4.1.0 changes (from v4.0.0) — Wave 3
+-------------------------------------
+- BUMP: static fallback contract widened from 85 → 90 columns to align with
+    `core.sheets.schema_registry` v2.6.0 (Wave 1). Appends the 5 Insights
+    group columns at the END of the canonical schema (positions 86-90):
+      • `sector_relative_score` ("Sector-Adj Score")
+      • `conviction_score`      ("Conviction Score")
+      • `top_factors`           ("Top Factors")
+      • `top_risks`             ("Top Risks")
+      • `position_size_hint`    ("Position Size Hint")
+    All 5 are produced by `core.insights_builder` v1.0.0. Adding them at
+    the END preserves all existing positional indices.
+- BUMP: `_EXPECTED_SHEET_LENGTHS` instrument 85 → 90, Top10 88 → 93.
+- BUMP: hardcoded fallback default 85 → 90 in `_static_contract` and
+    `_expected_len`.
+- BUMP: assertion guard on `_CANONICAL_85_*` lengths updated 85 → 90.
+- KEEP: variable name `_CANONICAL_85_*` retained intentionally — same
+    convention as `_CANONICAL_80_*` in sibling files; renaming on every
+    bump would invalidate every textual reference in transcripts and
+    diagnostic output. The comment block makes the actual length explicit.
+- KEEP: every v4.0.0 fix preserved unchanged. Conservative placeholders
+    extended to return None for the new Insights cols. Internal-field
+    stripping, "warn" status handling — unchanged.
 
 What this revision changed (vs. the prior broken file)
 ------------------------------------------------------
@@ -104,7 +116,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_sheet_rows")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_SHEET_ROWS_VERSION = "4.0.0"
+ADVANCED_SHEET_ROWS_VERSION = "4.1.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Sheet Rows"])
 
 # ---------------------------------------------------------------------------
@@ -115,16 +127,18 @@ _INSIGHTS_PAGE = "Insights_Analysis"
 _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
-# v2.5.0 widths (85 / 88 / 7 / 9). Production registry-first path picks up
-# whatever the deployed registry has (e.g. 90/93 under v2.6.0).
+# v2.6.0 widths (90 / 93 / 7 / 9). Wave 3: appends 5 Insights cols to the
+# canonical 85-col v2.5.0 list. Production registry-first path always picks
+# up whatever the deployed registry has — these are only the static-fallback
+# defaults if registry import fails.
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 85,
-    "Global_Markets": 85,
-    "Commodities_FX": 85,
-    "Mutual_Funds": 85,
-    "My_Portfolio": 85,
-    "My_Investments": 85,
-    _TOP10_PAGE: 88,
+    "Market_Leaders": 90,
+    "Global_Markets": 90,
+    "Commodities_FX": 90,
+    "Mutual_Funds": 90,
+    "My_Portfolio": 90,
+    "My_Investments": 90,
+    _TOP10_PAGE: 93,
     _INSIGHTS_PAGE: 7,
     _DICTIONARY_PAGE: 9,
 }
@@ -257,6 +271,8 @@ _CANONICAL_85_KEYS: List[str] = [
     "unrealized_pl", "unrealized_pl_pct",
     # Provenance (4)
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    # Insights (5) — v2.6.0 / Wave 3 — produced by core.insights_builder v1.0.0
+    "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
 ]
 
 _CANONICAL_85_HEADERS: List[str] = [
@@ -292,10 +308,12 @@ _CANONICAL_85_HEADERS: List[str] = [
     "Unrealized P/L", "Unrealized P/L %",
     # Provenance
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    # Insights — v2.6.0 / Wave 3
+    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
 ]
 
-assert len(_CANONICAL_85_KEYS) == 85, f"v2.5.0 instrument keys must be 85, got {len(_CANONICAL_85_KEYS)}"
-assert len(_CANONICAL_85_HEADERS) == 85, f"v2.5.0 instrument headers must be 85, got {len(_CANONICAL_85_HEADERS)}"
+assert len(_CANONICAL_85_KEYS) == 90, f"v2.6.0 instrument keys must be 90, got {len(_CANONICAL_85_KEYS)}"
+assert len(_CANONICAL_85_HEADERS) == 90, f"v2.6.0 instrument headers must be 90, got {len(_CANONICAL_85_HEADERS)}"
 
 _INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
 _INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
@@ -843,7 +861,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_85_HEADERS, _CANONICAL_85_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 85))
+    h, k = _pad_contract(_CANONICAL_85_HEADERS, _CANONICAL_85_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 90))
     return h, k, "static_canonical_instrument_v2.5.0"
 
 
@@ -855,7 +873,7 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    return _EXPECTED_SHEET_LENGTHS.get(page, 85)
+    return _EXPECTED_SHEET_LENGTHS.get(page, 90)
 
 
 def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
