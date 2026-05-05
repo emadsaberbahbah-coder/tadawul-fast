@@ -2,7 +2,7 @@
 # core/schemas.py
 """
 ================================================================================
-Core Schemas + Sheet Headers — v6.0.0 (CANONICAL / REGISTRY-FIRST / STARTUP-SAFE)
+Core Schemas + Sheet Headers — v6.1.0 (REGISTRY-ALIGNED / CANONICAL 5-TIER)
 ================================================================================
 
 Purpose
@@ -18,18 +18,80 @@ The canonical source of truth is `core.sheets.schema_registry` whenever it is
 available. This file mirrors that registry and only falls back to deterministic,
 fixed-width contracts when the registry cannot be imported.
 
-Canonical targets
------------------
-- Standard sheets: 84 columns
-- Top_10_Investments: 87 columns
+Canonical targets (aligned with schema_registry v2.6.0)
+-------------------------------------------------------
+- Standard sheets: 90 columns   (was 85 in v2.5.0; +5 Insights cols)
+- Top_10_Investments: 93 columns (was 88 in v2.5.0; +5 Insights cols)
 - Insights_Analysis: 7 columns
 - Data_Dictionary: 9 columns
 
+The 5 new "Insights" columns appended in schema_registry v2.6.0 are:
+  sector_relative_score, conviction_score, top_factors, top_risks,
+  position_size_hint
+They are produced by `core.insights_builder` v1.0.0 and consumed by the
+recommendation pipeline in `core.scoring` v5.1.0 + `core.reco_normalize`
+v7.1.0.
+
+v6.1.0 changes (what moved from v6.0.0)
+---------------------------------------
+- 🔑 FIX [CRITICAL]: `validate_sheet_data` hardcoded 85/88 columns. v2.6.0
+  schema is 90/93. Every legitimate row from scoring v5.1.0 was failing
+  this check as "wrong column count". Counts now read 90/90/90/90/90/93/7/9.
+- 🔑 FIX [CRITICAL]: `_FALLBACK_STANDARD_HEADERS`/`_KEYS` was 85 entries
+  (claimed "84" in old docstring). Now 90 entries — adds the 5 Insights
+  columns after `recommendation_reason`. Top10 fallback follows: 90+3=93.
+- 🔑 FIX [HIGH]: `Recommendation.from_score` was emitting STRONG_SELL,
+  which is NOT in the canonical 5-tier defined by `core.reco_normalize`
+  (STRONG_BUY/BUY/HOLD/REDUCE/SELL only). Thresholds also disagreed:
+  schemas.py 0-100 said ≥70 = BUY, reco_normalize says ≥65 = BUY. v6.1.0
+  aligns thresholds and never emits STRONG_SELL from `from_score`.
+- DEPRECATION: `Recommendation.STRONG_SELL` enum value KEPT for backward
+  compatibility (existing imports won't break) but documented as
+  deprecated. `from_score` no longer emits it; `_RECOMMENDATION_ALIASES`
+  now maps "STRONG SELL" / "STRONG_SELL" strings to canonical SELL.
+  Scheduled for removal in v7.0.0.
+- ADD: `UnifiedQuote` extended with the 5 Insights fields.
+- ADD: `FIELD_ALIASES` extended with mappings for the 10 newer fields
+  (4 views + 5 insights + upside_pct).
+- ADD: `VN_INSIGHTS` group exported. `get_field_groups()` includes it.
+- ADD: `VN_VIEWS` group exported (the 4 view tokens deserve their own
+  bucket — previously they were merged into VN_SCORES which made
+  factor analysis confusing).
+- DOC: Note on the 5-engine investment framework (Fundamental, Technical,
+  Risk, Catalyst/News, AI Confidence). The current schema family covers
+  Fundamental/Technical/Risk/Value (via the 4 view tokens) and AI
+  Confidence (via forecast_confidence + conviction_score). The
+  Catalyst/News engine has no representation today — see "Future
+  directions" below.
+- PRESERVED: every public export from v6.0.0. `STRONG_SELL` enum value
+  still resolvable. `BatchProcessRequest`/`BatchProcessResponse`
+  unchanged. Legacy aliases (`ENRICHED_HEADERS_61`, `DEFAULT_HEADERS_59`,
+  `DEFAULT_HEADERS_ANALYSIS`) still point at the canonical standard
+  contract.
+
 Compatibility
 -------------
-Legacy names such as `ENRICHED_HEADERS_61` and `DEFAULT_HEADERS_59` are kept as
-exports, but now point to the canonical standard contract so old callers stop
-re-introducing the legacy 61-column worldview.
+Legacy names such as `ENRICHED_HEADERS_61` and `DEFAULT_HEADERS_59` are kept
+as exports, but now point to the canonical 90-column standard contract so
+old callers stop re-introducing the legacy 61-column worldview.
+
+Future directions (informational)
+---------------------------------
+A common multi-engine investment framework decomposes signal into:
+  A. Fundamental Engine     — quality + growth + balance sheet
+  B. Technical Engine       — trend + momentum (Elliott Wave / Gann are
+                              variants of trend-position analysis)
+  C. Risk Engine            — volatility + drawdown + position sizing
+  D. Catalyst & News Engine — earnings, regulatory events, sector trends
+  E. AI / Confidence Engine — model confidence + multi-axis conviction
+
+The v2.6.0 schema family covers A (quality_score, growth_score,
+fundamental_view), B (technical_score, momentum_score, technical_view),
+C (risk_score, volatility_*, var_95_1d, sharpe_1y, risk_view), and E
+(forecast_confidence, conviction_score, confidence_score). Engine D
+(news/catalyst) has no representation today and would require new
+columns in `schema_registry` (e.g. `news_score`, `catalyst_label`,
+`catalyst_date`). Adding it is a future cycle, not a v6.1.0 concern.
 """
 
 from __future__ import annotations
@@ -86,7 +148,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "6.0.0"
+SCHEMAS_VERSION = "6.1.0"
 
 # =============================================================================
 # Enums
@@ -119,34 +181,58 @@ class AssetClass(str, Enum):
 
 
 class Recommendation(str, Enum):
+    """Canonical recommendation labels.
+
+    v6.1.0 alignment with `core.reco_normalize.Recommendation`:
+    The canonical 5-tier set is STRONG_BUY / BUY / HOLD / REDUCE / SELL.
+
+    `STRONG_SELL` is DEPRECATED as of v6.1.0 (scheduled removal v7.0.0):
+      - It's NOT part of the canonical 5-tier in `core.reco_normalize`.
+      - `from_score()` no longer emits it (saturates at SELL instead).
+      - `normalize_recommendation()` now maps "STRONG SELL" / "STRONG_SELL"
+        input strings to canonical SELL.
+      - Kept as an enum value only so `from core.schemas import Recommendation;
+        Recommendation.STRONG_SELL` doesn't AttributeError on legacy callers.
+    """
     STRONG_BUY = "STRONG_BUY"
     BUY = "BUY"
     HOLD = "HOLD"
     REDUCE = "REDUCE"
     SELL = "SELL"
-    STRONG_SELL = "STRONG_SELL"
+    STRONG_SELL = "STRONG_SELL"  # DEPRECATED — see class docstring
 
     @classmethod
     def from_score(cls, score: float, scale: str = "0-100") -> "Recommendation":
+        """Convert a numeric score to a recommendation.
+
+        v6.1.0: thresholds aligned with `core.reco_normalize.Recommendation
+        .from_score()` so the same numeric input produces the same canonical
+        label regardless of which module is doing the conversion. Saturates
+        at SELL (never emits STRONG_SELL) — see class docstring for context.
+        """
         try:
             s = float(score)
-        except Exception:
+            if s != s:  # NaN guard
+                return cls.HOLD
+        except (TypeError, ValueError):
             return cls.HOLD
 
         if scale == "0-100":
+            # Aligned with reco_normalize.Recommendation.from_score("0-100").
+            # Old v6.0.0: ≥70 BUY, ≥30 REDUCE, ≥15 SELL, else STRONG_SELL.
+            # Canonical: ≥65 BUY, ≥35 REDUCE, else SELL (no STRONG_SELL).
             if s >= 85:
                 return cls.STRONG_BUY
-            if s >= 70:
+            if s >= 65:
                 return cls.BUY
             if s >= 45:
                 return cls.HOLD
-            if s >= 30:
+            if s >= 35:
                 return cls.REDUCE
-            if s >= 15:
-                return cls.SELL
-            return cls.STRONG_SELL
+            return cls.SELL
 
         if scale == "1-5":
+            # Aligned with reco_normalize 1-5 scale.
             if s <= 1.5:
                 return cls.STRONG_BUY
             if s <= 2.5:
@@ -154,8 +240,20 @@ class Recommendation(str, Enum):
             if s <= 3.5:
                 return cls.HOLD
             if s <= 4.5:
-                return cls.SELL
-            return cls.STRONG_SELL
+                return cls.REDUCE
+            return cls.SELL
+
+        if scale == "1-3":
+            # Aligned with reco_normalize 1-3 scale.
+            if s <= 1.3:
+                return cls.STRONG_BUY
+            if s <= 1.8:
+                return cls.BUY
+            if s <= 2.3:
+                return cls.HOLD
+            if s <= 2.7:
+                return cls.REDUCE
+            return cls.SELL
 
         return cls.HOLD
 
@@ -419,6 +517,13 @@ class UnifiedQuote(BaseModel):
     recommendation: Optional[Recommendation] = None
     recommendation_reason: Optional[str] = None
 
+    # v6.1.0: Insights fields (schema_registry v2.6.0 / insights_builder v1.0.0)
+    sector_relative_score: Optional[float] = None
+    conviction_score: Optional[float] = None
+    top_factors: Optional[str] = None
+    top_risks: Optional[str] = None
+    position_size_hint: Optional[str] = None
+
     data_source: Optional[str] = None
     data_quality: Optional[DataQuality] = None
     last_updated_utc: Optional[datetime] = None
@@ -578,6 +683,8 @@ class UnifiedQuote(BaseModel):
 _RECOMMENDATION_ALIASES = {
     "STRONG BUY": Recommendation.STRONG_BUY,
     "STRONG_BUY": Recommendation.STRONG_BUY,
+    "CONVICTION BUY": Recommendation.STRONG_BUY,
+    "TOP PICK": Recommendation.STRONG_BUY,
     "BUY": Recommendation.BUY,
     "ACCUMULATE": Recommendation.BUY,
     "ADD": Recommendation.BUY,
@@ -594,8 +701,11 @@ _RECOMMENDATION_ALIASES = {
     "SELL": Recommendation.SELL,
     "EXIT": Recommendation.SELL,
     "AVOID": Recommendation.SELL,
-    "STRONG SELL": Recommendation.STRONG_SELL,
-    "STRONG_SELL": Recommendation.STRONG_SELL,
+    # v6.1.0: STRONG_SELL inputs collapse to canonical SELL.
+    # The enum value still exists for back-compat, but no canonical
+    # producer emits it. See Recommendation class docstring.
+    "STRONG SELL": Recommendation.SELL,
+    "STRONG_SELL": Recommendation.SELL,
 }
 
 
@@ -757,6 +867,11 @@ _FALLBACK_STANDARD_HEADERS: List[str] = [
     "Value View",
     "Recommendation",
     "Recommendation Reason",
+    "Sector-Adj Score",
+    "Conviction Score",
+    "Top Factors",
+    "Top Risks",
+    "Position Size Hint",
     "Data Source",
     "Data Quality",
     "Last Updated UTC",
@@ -845,6 +960,11 @@ _FALLBACK_STANDARD_KEYS: List[str] = [
     "value_view",
     "recommendation",
     "recommendation_reason",
+    "sector_relative_score",
+    "conviction_score",
+    "top_factors",
+    "top_risks",
+    "position_size_hint",
     "data_source",
     "data_quality",
     "last_updated_utc",
@@ -1022,9 +1142,22 @@ VN_FORECAST: List[str] = _filter_present([
 VN_SCORES: List[str] = _filter_present([
     "Value Score", "Quality Score", "Momentum Score", "Growth Score", "Overall Score",
     "Opportunity Score", "Rank Overall", "Confidence Bucket",
-    "Fundamental View", "Technical View", "Risk View", "Value View",
     "Recommendation", "Recommendation Reason",
     "Risk Score", "Risk Bucket",
+], CANONICAL_STANDARD_HEADERS)
+# v6.1.0: views now have their own group (was lumped into VN_SCORES in v6.0.0).
+# Factor analysis pipelines wanted the four qualitative tokens separate from
+# the numeric scores, so they don't get treated as features.
+VN_VIEWS: List[str] = _filter_present([
+    "Fundamental View", "Technical View", "Risk View", "Value View",
+], CANONICAL_STANDARD_HEADERS)
+# v6.1.0: NEW Insights group (schema_registry v2.6.0).
+# These five fields are produced by core.insights_builder v1.0.0 and
+# travel inline alongside the core scores so consumers can render
+# explanations + sizing hints without a second backend call.
+VN_INSIGHTS: List[str] = _filter_present([
+    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
+    "Position Size Hint",
 ], CANONICAL_STANDARD_HEADERS)
 VN_META: List[str] = _filter_present([
     "Data Source", "Data Quality", "Last Updated UTC", "Last Updated Riyadh", "Error",
@@ -1127,8 +1260,21 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "ps_ratio": ("ps",),
     "peg_ratio": ("peg",),
     "intrinsic_value": ("fair_value",),
-    "upside_pct": ("upside_percent", "upside", "intrinsic_upside"),
+    "upside_pct": ("upside_percent", "upside", "intrinsic_upside", "upsidePct"),
     "top10_rank": ("rank_top10",),
+    # v6.1.0: aliases for the 4 view tokens (schema_registry v2.3.0+)
+    "fundamental_view": ("fundamentalView", "fund_view", "fundamentals_view"),
+    "technical_view": ("technicalView", "tech_view"),
+    "risk_view": ("riskView",),
+    "value_view": ("valueView", "valuation_view"),
+    # v6.1.0: aliases for the 5 insights fields (schema_registry v2.6.0+)
+    "sector_relative_score": ("sector_adj_score", "sectorRelativeScore", "sector_relative",
+                              "peer_relative_score", "sectorAdjScore"),
+    "conviction_score": ("conviction", "convictionScore", "conviction_pct"),
+    "top_factors": ("topFactors", "factors", "top_factor_list"),
+    "top_risks": ("topRisks", "risks", "top_risk_list"),
+    "position_size_hint": ("positionSizeHint", "position_size", "size_hint",
+                           "position_size_recommendation"),
 }
 
 ALIAS_TO_CANONICAL: Dict[str, str] = {}
@@ -1246,6 +1392,8 @@ def get_field_groups() -> Dict[str, List[str]]:
         "Technicals": list(VN_TECHNICALS),
         "Forecast": list(VN_FORECAST),
         "Scores": list(VN_SCORES),
+        "Views": list(VN_VIEWS),         # v6.1.0
+        "Insights": list(VN_INSIGHTS),   # v6.1.0
         "Meta": list(VN_META),
     }
 
@@ -1357,13 +1505,17 @@ def validate_sheet_data(sheet_name: str, data: Mapping[str, Any]) -> Tuple[bool,
     canonical = resolve_sheet_key(sheet_name)
     headers, keys = get_sheet_contract(canonical)
 
+    # v6.1.0: aligned with schema_registry v2.6.0.
+    # Was 85/88 in v6.0.0 — every legitimate row from scoring v5.1.0 was
+    # failing this check as "wrong column count" because the registry
+    # adds 5 Insights columns and v6.0.0 didn't know about them.
     expected = {
-        "Market_Leaders": 85,
-        "Global_Markets": 85,
-        "Commodities_FX": 85,
-        "Mutual_Funds": 85,
-        "My_Portfolio": 85,
-        "Top_10_Investments": 88,
+        "Market_Leaders": 90,
+        "Global_Markets": 90,
+        "Commodities_FX": 90,
+        "Mutual_Funds": 90,
+        "My_Portfolio": 90,
+        "Top_10_Investments": 93,
         "Insights_Analysis": 7,
         "Data_Dictionary": 9,
     }[canonical]
@@ -1414,6 +1566,8 @@ __all__ = [
     "VN_TECHNICALS",
     "VN_FORECAST",
     "VN_SCORES",
+    "VN_VIEWS",       # v6.1.0
+    "VN_INSIGHTS",    # v6.1.0
     "VN_META",
     "VN_HEADERS_KSA_TADAWUL",
     "VN_HEADERS_GLOBAL",
