@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.1.0  (V2.5.0-ALIGNED / FINANCIAL-SAFE)
+Advanced Analysis Root Owner — v4.2.0  (V2.6.0-ALIGNED / 90-COL / WAVE 3)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
@@ -17,14 +17,35 @@ Owns the canonical root paths:
 - /schema/data-dictionary
 and their /v1/schema aliases.
 
-v4.1.0 changes (from v4.0.0)
-----------------------------
+v4.2.0 changes (from v4.1.0) — Wave 3
+-------------------------------------
+- BUMP: static fallback contract widened from 85 → 90 columns to align with
+    `core.sheets.schema_registry` v2.6.0 (Wave 1). Appends the 5 Insights
+    group columns at the END of the canonical schema (positions 86-90):
+      • `sector_relative_score` ("Sector-Adj Score")
+      • `conviction_score`      ("Conviction Score")
+      • `top_factors`           ("Top Factors")
+      • `top_risks`             ("Top Risks")
+      • `position_size_hint`    ("Position Size Hint")
+    All 5 are produced by `core.insights_builder` v1.0.0. Adding them at
+    the END preserves all existing positional indices — purely additive.
+- BUMP: `_EXPECTED_SHEET_LENGTHS` instrument 85 → 90, Top10 88 → 93.
+- BUMP: `_static_contract` instrument padding 85 → 90.
+- BUMP: `_ensure_top10_contract` padding 88 → 93.
+- BUMP: `_expected_len` default 85 → 90.
+- KEEP: every v4.1.0 fix preserved unchanged. Conservative placeholders
+    (no fake numerics — also returns None for the new Insights fields),
+    internal-field stripping, "warn" status handling — all preserved.
+
+v4.1.0 changes (from v4.0.0) — preserved
+----------------------------------------
 - FIX [HIGH]: static fallback was at 80 keys, padding to 84 with placeholder
-    columns ("Column 81" → "column_81"...). v4.1.0 grows the static list to
+    columns ("Column 81" → "column_81"...). v4.1.0 grew the static list to
     the canonical 85 entries by inserting `upside_pct` after `intrinsic_value`
     (registry v2.4.0 added this column; we were the last sibling not to ship
     it). _EXPECTED_SHEET_LENGTHS bumped to 85/88. Production registry-first
     path was unaffected — this only mattered when registry import failed.
+    [v4.2.0 supersedes the 85/88 numbers — see top of this docstring.]
 - FIX [HIGH]: `_placeholder_value_for_key` no longer fabricates numeric
     values. Previously returned `recommendation="Accumulate"`,
     `expected_roi_3m=12.5%`, `forecast_confidence=99`, etc. for symbols
@@ -76,7 +97,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.1.0"
+ADVANCED_ANALYSIS_VERSION = "4.2.0"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -85,13 +106,13 @@ _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 85,
-    "Global_Markets": 85,
-    "Commodities_FX": 85,
-    "Mutual_Funds": 85,
-    "My_Portfolio": 85,
-    "My_Investments": 85,
-    _TOP10_PAGE: 88,
+    "Market_Leaders": 90,
+    "Global_Markets": 90,
+    "Commodities_FX": 90,
+    "Mutual_Funds": 90,
+    "My_Portfolio": 90,
+    "My_Investments": 90,
+    _TOP10_PAGE: 93,
     _INSIGHTS_PAGE: 7,
     _DICTIONARY_PAGE: 9,
 }
@@ -177,6 +198,7 @@ _CANONICAL_80_HEADERS: List[str] = [
     "Recommendation Reason", "Horizon Days", "Invest Period Label", "Position Qty", "Avg Cost",
     "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
 ]
 _CANONICAL_80_KEYS: List[str] = [
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
@@ -196,6 +218,7 @@ _CANONICAL_80_KEYS: List[str] = [
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label", "position_qty",
     "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
 ]
 _INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
 _INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
@@ -582,7 +605,7 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, 88)
+    return _pad_contract(hdrs, ks, 93)
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _TOP10_PAGE:
@@ -594,7 +617,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 85))
+    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 90))
     return h, k, "static_canonical_instrument"
 
 def _expected_len(page: str) -> int:
@@ -605,7 +628,7 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    return _EXPECTED_SHEET_LENGTHS.get(page, 85)
+    return _EXPECTED_SHEET_LENGTHS.get(page, 90)
 
 def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
     headers: List[str] = []
