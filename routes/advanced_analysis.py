@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.0.0
+Advanced Analysis Root Owner — v4.1.0  (V2.5.0-ALIGNED / FINANCIAL-SAFE)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
@@ -17,8 +17,33 @@ Owns the canonical root paths:
 - /schema/data-dictionary
 and their /v1/schema aliases.
 
-Why this revision
------------------
+v4.1.0 changes (from v4.0.0)
+----------------------------
+- FIX [HIGH]: static fallback was at 80 keys, padding to 84 with placeholder
+    columns ("Column 81" → "column_81"...). v4.1.0 grows the static list to
+    the canonical 85 entries by inserting `upside_pct` after `intrinsic_value`
+    (registry v2.4.0 added this column; we were the last sibling not to ship
+    it). _EXPECTED_SHEET_LENGTHS bumped to 85/88. Production registry-first
+    path was unaffected — this only mattered when registry import failed.
+- FIX [HIGH]: `_placeholder_value_for_key` no longer fabricates numeric
+    values. Previously returned `recommendation="Accumulate"`,
+    `expected_roi_3m=12.5%`, `forecast_confidence=99`, etc. for symbols
+    where the engine returned no data. In a financial product, those
+    synthetic numbers can be acted on by users. v4.1.0 returns `None` for
+    every numeric/score/ROI/forecast field and only fills identity columns
+    (symbol, name, asset_class, exchange, currency, country) plus a clear
+    `warnings` field. Same philosophy as `routes.analysis_sheet_rows`
+    v4.1.2 and `routes.advanced_sheet_rows` v4.0.0.
+- ADD: `_strip_internal_fields()` defensive helper. Removes engine internal
+    coordination flags (`_skip_recommendation_synthesis`, `_internal_*`,
+    `_meta_*`, `_debug_*`, `_trace_*`, plus the explicit hard-strip set).
+    Engine v5.47.4 strips these at source; this is defence-in-depth for
+    legacy / proxy / cached rows.
+- ADD: `status: "warn"` from engine v5.47.4 is treated as success-with-caveat
+    when rows are present (matching the rest of the route family).
+
+Why this revision (preserved from v4.0.0)
+-----------------------------------------
 - FIX: keeps root /sheet-rows authoritative and returns a stable envelope even
        when upstream builders degrade.
 - FIX: never emits empty-success payloads for special pages.
@@ -51,7 +76,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.0.0"
+ADVANCED_ANALYSIS_VERSION = "4.1.0"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -60,13 +85,13 @@ _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 84,
-    "Global_Markets": 84,
-    "Commodities_FX": 84,
-    "Mutual_Funds": 84,
-    "My_Portfolio": 84,
-    "My_Investments": 84,
-    _TOP10_PAGE: 87,
+    "Market_Leaders": 85,
+    "Global_Markets": 85,
+    "Commodities_FX": 85,
+    "Mutual_Funds": 85,
+    "My_Portfolio": 85,
+    "My_Investments": 85,
+    _TOP10_PAGE: 88,
     _INSIGHTS_PAGE: 7,
     _DICTIONARY_PAGE: 9,
 }
@@ -142,6 +167,7 @@ _CANONICAL_80_HEADERS: List[str] = [
     "Operating Margin", "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)", "RSI (14)",
     "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)", "Sharpe (1Y)",
     "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value",
+    "Upside %",
     "Valuation Score", "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence",
     "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
@@ -161,7 +187,7 @@ _CANONICAL_80_KEYS: List[str] = [
     "gross_margin", "operating_margin", "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y",
     "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
-    "intrinsic_value", "valuation_score", "forecast_price_1m", "forecast_price_3m",
+    "intrinsic_value", "upside_pct", "valuation_score", "forecast_price_1m", "forecast_price_3m",
     "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket", "value_score", "quality_score",
     "momentum_score", "growth_score", "overall_score",
@@ -198,7 +224,43 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "top10_rank": ["rank", "top_rank"],
     "selection_reason": ["reason", "selection_notes"],
     "criteria_snapshot": ["criteria", "snapshot", "criteria_json"],
+    # v4.1.0: engine v5.47.4 mirrors upside_pct
+    "upside_pct": ["upsidePct", "upside_percent", "intrinsic_upside"],
 }
+
+# v4.1.0: internal-field stripping — same set as enriched_quote v4.2.0 /
+# advanced_sheet_rows v4.0.0 / analysis_sheet_rows v4.1.2.
+_INTERNAL_FIELD_PREFIXES: Tuple[str, ...] = ("_skip_", "_internal_", "_meta_", "_debug_", "_trace_")
+_INTERNAL_FIELDS_TO_STRIP_HARD: frozenset = frozenset({
+    "_placeholder",
+    "_skip_recommendation_synthesis",
+    "unit_normalization_warnings",
+    "intrinsic_value_source",
+})
+
+
+def _strip_internal_fields(row: Any) -> Any:
+    """v4.1.0: Remove engine internal coordination flags from a row dict.
+
+    Defence-in-depth: engine v5.47.4 strips these at source, but rows from
+    legacy engine, proxies, or cached snapshots may still carry them.
+    """
+    if not isinstance(row, dict):
+        return row
+    keys_to_remove: List[str] = []
+    for k in list(row.keys()):
+        ks = str(k)
+        if ks in _INTERNAL_FIELDS_TO_STRIP_HARD:
+            keys_to_remove.append(k)
+            continue
+        if any(ks.startswith(prefix) for prefix in _INTERNAL_FIELD_PREFIXES):
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        try:
+            del row[k]
+        except Exception:
+            pass
+    return row
 
 def _strip(v: Any) -> str:
     try:
@@ -520,7 +582,7 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, 87)
+    return _pad_contract(hdrs, ks, 88)
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _TOP10_PAGE:
@@ -532,7 +594,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 84))
+    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 85))
     return h, k, "static_canonical_instrument"
 
 def _expected_len(page: str) -> int:
@@ -543,7 +605,7 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    return _EXPECTED_SHEET_LENGTHS.get(page, 84)
+    return _EXPECTED_SHEET_LENGTHS.get(page, 85)
 
 def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
     headers: List[str] = []
@@ -702,6 +764,8 @@ def _extract_status_error(payload: Any) -> Tuple[str, Optional[str], Dict[str, A
 
 def _normalize_to_schema_keys(*, schema_keys: Sequence[str], schema_headers: Sequence[str], raw: Mapping[str, Any]) -> Dict[str, Any]:
     raw = dict(raw or {})
+    # v4.1.0: defensively strip internal coordination flags before extraction.
+    _strip_internal_fields(raw)
     header_by_key = {str(k): str(h) for k, h in zip(schema_keys, schema_headers)}
     out: Dict[str, Any] = {}
     for k in schema_keys:
@@ -797,13 +861,31 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
     return final_rows
 
 def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
+    """Conservative placeholder (v4.1.0): identity columns get filled,
+    everything numeric returns None. The row is clearly marked as a
+    placeholder via the `warnings` field. Same philosophy as
+    `routes.analysis_sheet_rows` v4.1.2 / `routes.advanced_sheet_rows` v4.0.0.
+
+    v4.0.0 fabricated values like `recommendation="Accumulate"`,
+    `expected_roi_3m=12.5%`, `forecast_confidence=99` for symbols where
+    the engine returned no data. In a financial product, those synthetic
+    numbers can be acted on by users — financial-safety risk.
+    """
     kk = _normalize_key_name(key)
+
+    # Identity columns — safe to populate
     if kk in {"symbol", "ticker"}:
         return symbol
     if kk == "name":
-        return f"{page} {symbol}"
+        return symbol  # don't fabricate composite names
     if kk == "asset_class":
-        return "Commodity" if symbol.endswith("=F") else "FX" if symbol.endswith("=X") else "Fund" if page == "Mutual_Funds" else "Equity"
+        if symbol.endswith("=F"):
+            return "Commodity"
+        if symbol.endswith("=X"):
+            return "FX"
+        if page == "Mutual_Funds":
+            return "Fund"
+        return "Equity"
     if kk == "exchange":
         if symbol.endswith(".SR"):
             return "Tadawul"
@@ -813,36 +895,45 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
             return "FX"
         return "NASDAQ/NYSE"
     if kk == "currency":
-        return "SAR" if symbol.endswith(".SR") else "USD"
+        if symbol.endswith(".SR"):
+            return "SAR"
+        if symbol.endswith("=X") and len(symbol) >= 8:
+            pair = symbol.rstrip("=X")
+            if len(pair) >= 6:
+                return pair[3:6]
+        return "USD"
     if kk == "country":
-        return "Saudi Arabia" if symbol.endswith(".SR") else "Global"
+        if symbol.endswith(".SR"):
+            return "Saudi Arabia"
+        if symbol.endswith("=F") or symbol.endswith("=X"):
+            return "Global"
+        return "USA"
+
+    # Provenance — clearly mark as placeholder
     if kk == "data_provider":
-        return "advanced_analysis.placeholder_fallback"
+        return "placeholder_no_live_data"
     if kk in {"last_updated_utc", "last_updated_riyadh"}:
         return datetime.utcnow().isoformat()
-    if kk == "recommendation":
-        return "Watch" if row_index > 3 else "Accumulate"
-    if kk == "recommendation_reason":
-        return "Placeholder fallback because live engine returned no usable rows."
-    if kk in {"top10_rank", "rank_overall"}:
+    if kk == "warnings":
+        return "Placeholder fallback — no live data available for this symbol"
+
+    # Top10 metadata (schema requires non-empty)
+    if kk == "top10_rank":
         return row_index
     if kk == "selection_reason":
-        return "Placeholder fallback because upstream builders returned no usable rows."
+        return "Placeholder — upstream returned no usable rows; no real ranking applied"
     if kk == "criteria_snapshot":
-        return json.dumps({"symbol": symbol, "row_index": row_index, "source": "placeholder"}, ensure_ascii=False)
-    if kk in {"warnings", "notes"}:
-        return "placeholder"
-    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "avg_cost", "position_cost", "position_value", "unrealized_pl", "intrinsic_value"}:
-        base = 100.0 + float(row_index)
-        return round(base, 2)
-    if kk in {"percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score"}:
-        return round(max(1.0, 100.0 - float(row_index * 3)), 2)
-    if kk in {"risk_bucket", "confidence_bucket"}:
-        return "Moderate" if row_index > 3 else "High Confidence"
-    if kk == "invest_period_label":
-        return "3M"
-    if kk == "horizon_days":
-        return 90
+        return json.dumps(
+            {"symbol": symbol, "row_index": row_index, "source": "placeholder_no_live_data"},
+            ensure_ascii=False,
+        )
+
+    # Notes (Data_Dictionary)
+    if kk == "notes":
+        return "Placeholder fallback row"
+
+    # Everything else (prices, scores, ROIs, fundamentals, risk metrics,
+    # valuation ratios, forecasts, position data, view tokens) → None.
     return None
 
 def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
@@ -853,11 +944,15 @@ def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols
     rows: List[Dict[str, Any]] = []
     for idx, sym in enumerate(symbols, start=offset + 1):
         row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
+        # v4.1.0: ALWAYS guarantee a warnings field so the user knows
+        # this row is a placeholder, regardless of which page schema is used.
+        if "warnings" in row and not row.get("warnings"):
+            row["warnings"] = "Placeholder fallback — no live data available for this symbol"
         rows.append(row)
     if page == _TOP10_PAGE:
         for idx, row in enumerate(rows, start=offset + 1):
             row["top10_rank"] = idx
-            row.setdefault("selection_reason", "Placeholder fallback because upstream builders returned no usable rows.")
+            row.setdefault("selection_reason", "Placeholder — upstream returned no usable rows; no real ranking applied")
             row.setdefault("criteria_snapshot", "{}")
     return rows
 
@@ -883,11 +978,14 @@ def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: in
         symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(_INSIGHTS_PAGE, []) if _normalize_symbol_token(x)]
     stamp = datetime.utcnow().isoformat()
     rows: List[Dict[str, Any]] = [
-        {"section": "Coverage", "item": "Requested symbols", "symbol": "", "metric": "count", "value": len(symbols), "notes": "Local insights fallback summary", "last_updated_riyadh": stamp},
+        {"section": "Coverage", "item": "Requested symbols", "symbol": "", "metric": "count", "value": len(symbols), "notes": "Local insights fallback summary — no live engine data", "last_updated_riyadh": stamp},
         {"section": "Coverage", "item": "Universe sample", "symbol": "", "metric": "symbols", "value": ", ".join(symbols[:5]), "notes": "Sample of the symbols used by fallback mode", "last_updated_riyadh": stamp},
+        {"section": "Status", "item": "Engine availability", "symbol": "", "metric": "warning", "value": "Engine returned no usable rows", "notes": "Live engine and upstream proxies all returned empty/error payloads", "last_updated_riyadh": stamp},
     ]
+    # v4.1.0: don't fabricate per-symbol "Watch"/"Accumulate" signals.
+    # Just list which symbols WOULD have been analyzed.
     for idx, sym in enumerate(symbols[: max(1, limit + offset)], start=1):
-        rows.append({"section": "Signals", "item": f"Fallback signal {idx}", "symbol": sym, "metric": "recommendation", "value": "Watch" if idx > 2 else "Accumulate", "notes": "Generated locally because upstream insights payload was unavailable", "last_updated_riyadh": stamp})
+        rows.append({"section": "Pending Analysis", "item": f"Symbol {idx}", "symbol": sym, "metric": "status", "value": "no_live_data", "notes": "Symbol is in the requested universe but the engine returned no live row for it", "last_updated_riyadh": stamp})
     return _slice(rows, limit=limit, offset=offset)
 
 def _build_nonempty_failsoft_rows(*, page: str, headers: Sequence[str], keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int, top_n: int) -> List[Dict[str, Any]]:
@@ -904,7 +1002,8 @@ def _build_nonempty_failsoft_rows(*, page: str, headers: Sequence[str], keys: Se
 def _payload_envelope(*, page: str, headers: Sequence[str], keys: Sequence[str], row_objects: Sequence[Mapping[str, Any]], include_matrix: bool, request_id: str, started_at: float, mode: str, status_out: str, error_out: Optional[str], meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     hdrs = list(headers or [])
     ks = list(keys or [])
-    rows_dict = [{str(k): _json_safe(dict(r).get(k)) for k in ks} for r in (row_objects or [])]
+    # v4.1.0: strip internal flags at final emission too (defence-in-depth).
+    rows_dict = [_strip_internal_fields({str(k): _json_safe(dict(r).get(k)) for k in ks}) for r in (row_objects or [])]
     matrix = _rows_to_matrix(rows_dict, ks) if include_matrix else []
     return _json_safe({
         "status": status_out,
@@ -983,6 +1082,10 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
         normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
     normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
     status_out, error_out, ext_meta = _extract_status_error(ext)
+    # v4.1.0: treat engine v5.47.4 "warn" as success when rows are present
+    status_lc = (status_out or "").lower()
+    if status_lc == "warn":
+        status_out = "success" if normalized_rows else "warn"
     if not normalized_rows:
         status_out = "partial"
         error_out = error_out or "No usable rows returned"
