@@ -2,13 +2,54 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.1.2
+Analysis Sheet-Rows Router — v4.2.0  (V2.5.0-ALIGNED / 85-COL CONTRACT)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 
-v4.1.2 changes (from v4.1.1)
+v4.2.0 changes (from v4.1.2)
 ----------------------------
+- FIX [HIGH]: static fallback contract widened from 80 → 85 columns to
+    align with `core.sheets.schema_registry` v2.5.0+. v4.1.2's static
+    canonical list had ONLY 80 entries — it was missing FIVE columns
+    that the v2.4.0 schema bump introduced and v2.5.0 inherited:
+      • `fundamental_view`  (the LayoutA view tokens you spent days
+      • `technical_view`     fixing in Apps Script — the registry-down
+      • `risk_view`          path here was silently dropping them)
+      • `value_view`
+      • `upside_pct`         (mirror of intrinsic_value computation)
+    Combined with `_EXPECTED_SHEET_LENGTHS` set to 80, the static
+    fallback path silently TRUNCATED the last 4 entries every time
+    registry import failed: `data_provider`, `last_updated_utc`,
+    `last_updated_riyadh`, `warnings` — the provenance fields you most
+    need to debug data issues were exactly the ones being dropped.
+    v4.2.0 fixes this by:
+      - inserting 4 view tokens after `overall_score` (matching the
+        position they occupy in `routes.advanced_analysis` v4.1.0
+        and `core.enriched_quote` v4.2.0)
+      - inserting `upside_pct` after `intrinsic_value`
+      - widening the canonical list from 80 → 85 entries
+      - bumping `_EXPECTED_SHEET_LENGTHS` instrument pages 80 → 85
+      - bumping `_EXPECTED_SHEET_LENGTHS` Top_10_Investments 83 → 88
+      - bumping `_static_contract` instrument padding 80 → 85
+      - bumping `_ensure_top10_contract` padding 83 → 88
+      - bumping `_expected_len` default 80 → 85
+    Production registry-first path was unaffected — this only mattered
+    when `core.sheets.schema_registry` import failed (deploy boundary,
+    cold-start race, or schema module rebuild). When it did matter, it
+    matched exactly the LayoutA blanking symptom you investigated in
+    `05_Refresh.gs` v1.8.1 — view fields rendering empty after refresh.
+- KEEP: every v4.1.2 fix is preserved unchanged. Engine v5.47.4 alias
+    mappings (position_52w_pct, pb, ps, peg, ev_to_ebitda, confidence,
+    ai_confidence, provider_primary, as_of_utc, as_of_riyadh,
+    volume_ratio, day_range_position, upside_pct), conservative
+    placeholder values (no fake numerics), internal-field stripping
+    (_skip_recommendation_synthesis et al.), `status: "warn"` handling,
+    page+body context passing to engine quote calls, density-aware
+    payload quality scoring — all preserved.
+
+v4.1.2 changes (from v4.1.1) — preserved
+----------------------------------------
 - FIX [HIGH]: adds v5.47.4 engine alias mappings to _FIELD_ALIAS_HINTS so
     that mirrored fields the engine now emits (`position_52w_pct`, `pb`,
     `ps`, `peg`, `ev_to_ebitda`, `confidence`, `ai_confidence`,
@@ -54,15 +95,16 @@ v4.1.0 changes (from v4.0.0) — preserved
 ----------------------------------------
 - FIX: Canonical sheet widths realigned to `core.sheets.schema_registry`
     truth: instrument pages = 80, Top10 = 83, Insights = 7, DataDict = 9.
+    [v4.2.0 supersedes the 80/83 numbers — see top of this docstring.]
 - FIX: `_TOP10_REQUIRED_FIELDS` reduced to canonical 3-field fragment.
 - FIX: `_INSIGHTS_HEADERS` / `_INSIGHTS_KEYS` aligned to canonical 7-col schema.
 - KEEP: engine-first → core adapter → root proxy → advanced_sheet_rows proxy.
 - KEEP: placeholder / fail-soft payload rejection.
 - KEEP: schema_only / headers_only short-circuit, GET+POST body merge.
 
-Public API preserved. Every v4.1.1 request shape, response shape, status
-code, and meta field is unchanged. Only internal normalization,
-placeholder generation, and engine-call kwargs changed.
+Public API preserved. Every v4.1.2 request shape, response shape, status
+code, and meta field is unchanged. Only static-fallback contract widths
+changed in v4.2.0 (5 extra columns now emitted in registry-down mode).
 ================================================================================
 """
 
@@ -155,7 +197,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.1.2"
+ANALYSIS_SHEET_ROWS_VERSION = "4.2.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -164,12 +206,12 @@ _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 80,
-    "Global_Markets": 80,
-    "Commodities_FX": 80,
-    "Mutual_Funds": 80,
-    "My_Portfolio": 80,
-    _TOP10_PAGE: 83,
+    "Market_Leaders": 85,
+    "Global_Markets": 85,
+    "Commodities_FX": 85,
+    "Mutual_Funds": 85,
+    "My_Portfolio": 85,
+    _TOP10_PAGE: 88,
     _INSIGHTS_PAGE: 7,
     _DICTIONARY_PAGE: 9,
 }
@@ -289,10 +331,13 @@ _CANONICAL_80_HEADERS: List[str] = [
     "Operating Margin", "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)", "RSI (14)",
     "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)", "Sharpe (1Y)",
     "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value",
+    "Upside %",
     "Valuation Score", "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence",
     "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
-    "Growth Score", "Overall Score", "Opportunity Score", "Rank (Overall)", "Recommendation",
+    "Growth Score", "Overall Score",
+    "Fundamental View", "Technical View", "Risk View", "Value View",
+    "Opportunity Score", "Rank (Overall)", "Recommendation",
     "Recommendation Reason", "Horizon Days", "Invest Period Label", "Position Qty", "Avg Cost",
     "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
@@ -307,10 +352,12 @@ _CANONICAL_80_KEYS: List[str] = [
     "gross_margin", "operating_margin", "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y",
     "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
-    "intrinsic_value", "valuation_score", "forecast_price_1m", "forecast_price_3m",
+    "intrinsic_value", "upside_pct", "valuation_score", "forecast_price_1m", "forecast_price_3m",
     "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket", "value_score", "quality_score",
-    "momentum_score", "growth_score", "overall_score", "opportunity_score", "rank_overall",
+    "momentum_score", "growth_score", "overall_score",
+    "fundamental_view", "technical_view", "risk_view", "value_view",
+    "opportunity_score", "rank_overall",
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label", "position_qty",
     "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
@@ -818,7 +865,7 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, 83)
+    return _pad_contract(hdrs, ks, 88)
 
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
@@ -831,7 +878,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, 80)
+    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, 85)
     return h, k, "static_canonical_instrument"
 
 
@@ -843,7 +890,7 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    return _EXPECTED_SHEET_LENGTHS.get(page, 80)
+    return _EXPECTED_SHEET_LENGTHS.get(page, 85)
 
 
 def _schema_columns_from_any(spec: Any) -> List[Any]:
