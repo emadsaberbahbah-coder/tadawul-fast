@@ -2,13 +2,41 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.2.0  (V2.5.0-ALIGNED / 85-COL CONTRACT)
+Analysis Sheet-Rows Router — v4.3.0  (V2.6.0-ALIGNED / 90-COL CONTRACT / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 
-v4.2.0 changes (from v4.1.2)
-----------------------------
+v4.3.0 changes (from v4.2.0) — Wave 3
+-------------------------------------
+- BUMP: static fallback contract widened from 85 → 90 columns to align with
+    `core.sheets.schema_registry` v2.6.0 (Wave 1). v4.2.0's 85-col list was
+    the v2.5.0 intermediate stage — it closed the upside_pct + 4 view tokens
+    gap that caused your blank-LayoutA-cells bug. v4.3.0 closes the second
+    half of the rollout by appending the 5 Insights group columns at the END
+    of the canonical schema (positions 86-90):
+      • `sector_relative_score` ("Sector-Adj Score") — float, 0-100, model
+      • `conviction_score`      ("Conviction Score")  — float, 0-100, model
+      • `top_factors`           ("Top Factors")       — str,   pipe-separated
+      • `top_risks`             ("Top Risks")         — str,   pipe-separated
+      • `position_size_hint`    ("Position Size Hint")— str,   text
+    All 5 are produced by `core.insights_builder` v1.0.0 and consumed by
+    `core.scoring` v5.1.0+ to enforce the conviction-floor cascade in
+    `core.reco_normalize` v7.1.0. Adding them at the END means existing
+    positional indices in any Apps Script positional writers are untouched —
+    same additive-only philosophy as v2.5.0.
+- BUMP: `_EXPECTED_SHEET_LENGTHS` instrument pages 85 → 90, Top10 88 → 93.
+- BUMP: `_static_contract` instrument padding 85 → 90.
+- BUMP: `_ensure_top10_contract` padding 88 → 93.
+- BUMP: `_expected_len` default 85 → 90.
+- KEEP: every v4.2.0 fix preserved unchanged. Engine v5.47.4 alias mappings,
+    conservative placeholder values (no fake numerics — also returns None
+    for the new Insights fields), internal-field stripping, "warn" status
+    handling, page+body context passing, density-aware payload quality
+    scoring — all preserved.
+
+v4.2.0 changes (from v4.1.2) — preserved
+----------------------------------------
 - FIX [HIGH]: static fallback contract widened from 80 → 85 columns to
     align with `core.sheets.schema_registry` v2.5.0+. v4.1.2's static
     canonical list had ONLY 80 entries — it was missing FIVE columns
@@ -95,16 +123,18 @@ v4.1.0 changes (from v4.0.0) — preserved
 ----------------------------------------
 - FIX: Canonical sheet widths realigned to `core.sheets.schema_registry`
     truth: instrument pages = 80, Top10 = 83, Insights = 7, DataDict = 9.
-    [v4.2.0 supersedes the 80/83 numbers — see top of this docstring.]
+    [v4.2.0 superseded the 80/83 numbers with 85/88 for v2.5.0;
+     v4.3.0 supersedes those again with 90/93 for v2.6.0 — see top of
+     this docstring.]
 - FIX: `_TOP10_REQUIRED_FIELDS` reduced to canonical 3-field fragment.
 - FIX: `_INSIGHTS_HEADERS` / `_INSIGHTS_KEYS` aligned to canonical 7-col schema.
 - KEEP: engine-first → core adapter → root proxy → advanced_sheet_rows proxy.
 - KEEP: placeholder / fail-soft payload rejection.
 - KEEP: schema_only / headers_only short-circuit, GET+POST body merge.
 
-Public API preserved. Every v4.1.2 request shape, response shape, status
+Public API preserved. Every v4.2.0 request shape, response shape, status
 code, and meta field is unchanged. Only static-fallback contract widths
-changed in v4.2.0 (5 extra columns now emitted in registry-down mode).
+and the canonical key/header lists changed in v4.3.0.
 ================================================================================
 """
 
@@ -197,7 +227,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.2.0"
+ANALYSIS_SHEET_ROWS_VERSION = "4.3.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -206,12 +236,12 @@ _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 85,
-    "Global_Markets": 85,
-    "Commodities_FX": 85,
-    "Mutual_Funds": 85,
-    "My_Portfolio": 85,
-    _TOP10_PAGE: 88,
+    "Market_Leaders": 90,
+    "Global_Markets": 90,
+    "Commodities_FX": 90,
+    "Mutual_Funds": 90,
+    "My_Portfolio": 90,
+    _TOP10_PAGE: 93,
     _INSIGHTS_PAGE: 7,
     _DICTIONARY_PAGE: 9,
 }
@@ -341,6 +371,8 @@ _CANONICAL_80_HEADERS: List[str] = [
     "Recommendation Reason", "Horizon Days", "Invest Period Label", "Position Qty", "Avg Cost",
     "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    # v2.6.0 Insights group (Wave 3) — produced by core.insights_builder v1.0.0
+    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
 ]
 
 _CANONICAL_80_KEYS: List[str] = [
@@ -361,6 +393,8 @@ _CANONICAL_80_KEYS: List[str] = [
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label", "position_qty",
     "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    # v2.6.0 Insights group (Wave 3) — produced by core.insights_builder v1.0.0
+    "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
 ]
 
 _INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
@@ -865,7 +899,7 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, 88)
+    return _pad_contract(hdrs, ks, 93)
 
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
@@ -878,7 +912,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, 85)
+    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, 90)
     return h, k, "static_canonical_instrument"
 
 
@@ -890,7 +924,7 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    return _EXPECTED_SHEET_LENGTHS.get(page, 85)
+    return _EXPECTED_SHEET_LENGTHS.get(page, 90)
 
 
 def _schema_columns_from_any(spec: Any) -> List[Any]:
