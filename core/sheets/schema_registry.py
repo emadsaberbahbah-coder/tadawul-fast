@@ -2,9 +2,9 @@
 # core/sheets/schema_registry.py
 """
 ================================================================================
-Schema Registry — v2.6.0
+Schema Registry — v2.7.0
 (CANONICAL / SHEET-FIRST / STARTUP-SAFE / ALIAS-HARDENED / VIEW-AWARE FAMILY /
- INSIGHTS-EXTENDED)
+ INSIGHTS-EXTENDED / DECISION-MATRIX / CANDLESTICK-AWARE)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -26,7 +26,7 @@ Special sheets (must NOT fall back to the canonical instrument schema):
 - Top_10_Investments: canonical + 3 Top10 extras
 - Data_Dictionary: 9 columns (generated from registry)
 
-Cross-module integration (v5/v7 family + v2.6.0)
+Cross-module integration (v5/v7 family + v2.7.0)
 ------------------------------------------------
 The four "Views" columns (Fundamental / Technical / Risk / Value) are the
 contract between the scoring engine and the recommendation engine:
@@ -44,11 +44,55 @@ by core.insights_builder v1.0.0 from a fully-scored row plus an optional
 sector cohort. They sit in their own group at the END of the schema so all
 existing positional indices are preserved.
 
+The two "Decision Matrix" columns added in v2.7.0 (recommendation_detailed,
+recommendation_priority) are produced by core.data_engine_v2 v5.50.0+ via
+the 8-tier classifier _classify_8tier(). The canonical 5-tier
+`recommendation` field is preserved unchanged; the detailed/priority pair
+adds richer granularity (STRONG_SELL, SPECULATIVE_BUY, ACCUMULATE) that
+collapses back to the canonical token via _RECOMMENDATION_COLLAPSE_MAP.
+These two columns may be EMPTY when `recommendation` is set upstream by
+core.scoring -> core.reco_normalize, to avoid implying a detailed verdict
+that may disagree with the canonical one.
+
+The five "Candlestick" columns added in v2.7.0 (candlestick_pattern,
+candlestick_signal, candlestick_strength, candlestick_confidence,
+candlestick_patterns_recent) are produced by core.candlesticks v1.0.0
+when invoked from core.data_engine_v2 v5.50.0+ on OHLC history rows.
+Detection is BEST-EFFORT and OPTIONAL (gated by the
+ENGINE_CANDLESTICKS_ENABLED env flag); when the candlesticks module is
+unavailable or detection raises, these five columns stay null.
+
 ================================================================================
 Changelog
 ================================================================================
 
-v2.6.0 (current)
+v2.7.0 (current)
+- NEW: "Decision Matrix" column group (2 columns, appended at END):
+    1. recommendation_detailed (str, text, model)
+    2. recommendation_priority (int, 0,    model)
+  Aligns with core.data_engine_v2 v5.50.0+'s 8-tier Decision Matrix
+  classifier. The canonical `recommendation` 5-tier field is unchanged.
+- NEW: "Candlestick" column group (5 columns, appended at END):
+    1. candlestick_pattern         (str,   text,  derived)
+    2. candlestick_signal          (str,   text,  derived)
+    3. candlestick_strength        (str,   text,  derived)
+    4. candlestick_confidence      (float, 0.00,  derived)
+    5. candlestick_patterns_recent (str,   text,  derived)
+  Aligns with core.candlesticks v1.0.0 + core.data_engine_v2 v5.50.0+'s
+  candlestick wiring. 10 patterns supported (Doji, Hammer, Inverted
+  Hammer, Shooting Star, Hanging Man, Bullish/Bearish Marubozu,
+  Bullish/Bearish Engulfing, Morning Star, Evening Star).
+- BUMP: instrument_table column count 90 -> 97; Top10 93 -> 100.
+- NEW EXPORTS: `DECISION_COLUMN_KEYS`, `CANDLESTICK_COLUMN_KEYS`.
+- NEW VALIDATION: instrument_table now requires the seven new columns
+  (2 Decision + 5 Candlestick) AND all prior required columns (Views,
+  Insights). Same enforcement applied to Top_10_Investments.
+- All seven new columns are appended at the END so positional indices
+  for v2.6.0 callers are preserved. Keyed-access callers continue to
+  work unchanged. Callers that hardcoded "schema length is 90" must be
+  updated to 97.
+
+v2.6.0
 - NEW: "Insights" column group at the END of the canonical schema. Five
   columns added (canonical 85 -> 90; Top10 88 -> 93):
     1. sector_relative_score (float, 0-100, model)
@@ -105,6 +149,8 @@ __all__ = [
     "CANONICAL_SHEETS",
     "VIEW_COLUMN_KEYS",
     "INSIGHTS_COLUMN_KEYS",
+    "DECISION_COLUMN_KEYS",
+    "CANDLESTICK_COLUMN_KEYS",
     "SCHEMA_VALIDATED_OK",
     "SCHEMA_VALIDATION_ERRORS",
     "list_sheets",
@@ -122,7 +168,7 @@ __all__ = [
     "validate_schema_registry",
 ]
 
-SCHEMA_VERSION = "2.6.0"
+SCHEMA_VERSION = "2.7.0"
 
 
 # Canonical view column keys, exposed for downstream code that needs to
@@ -145,6 +191,29 @@ INSIGHTS_COLUMN_KEYS: Tuple[str, ...] = (
     "top_factors",
     "top_risks",
     "position_size_hint",
+)
+
+
+# v2.7.0: Decision Matrix column keys, produced by core.data_engine_v2
+# v5.50.0+'s 8-tier classifier. The canonical 5-tier `recommendation`
+# field is preserved unchanged; this pair adds richer detail and a
+# numeric priority. May be EMPTY when `recommendation` is upstream-set.
+DECISION_COLUMN_KEYS: Tuple[str, ...] = (
+    "recommendation_detailed",
+    "recommendation_priority",
+)
+
+
+# v2.7.0: Candlestick column keys, produced by core.candlesticks v1.0.0
+# when invoked from core.data_engine_v2 v5.50.0+ on OHLC history rows.
+# Detection is best-effort and may be disabled via the
+# ENGINE_CANDLESTICKS_ENABLED env flag, in which case these stay null.
+CANDLESTICK_COLUMN_KEYS: Tuple[str, ...] = (
+    "candlestick_pattern",
+    "candlestick_signal",
+    "candlestick_strength",
+    "candlestick_confidence",
+    "candlestick_patterns_recent",
 )
 
 
@@ -174,8 +243,8 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
 
 # Canonical column counts (centralized so the docstring, validation code,
 # and any downstream sanity-checkers agree on a single source of truth).
-_CANONICAL_INSTRUMENT_COLS = 90  # v2.6.0: 85 + 5 new Insights columns
-_TOP10_TOTAL_COLS = 93           # v2.6.0: 90 + 3 Top10 extras
+_CANONICAL_INSTRUMENT_COLS = 97  # v2.7.0: 90 + 2 Decision + 5 Candlestick
+_TOP10_TOTAL_COLS = 100          # v2.7.0: 97 + 3 Top10 extras
 _INSIGHTS_ANALYSIS_COLS = 7
 _DATA_DICTIONARY_COLS = 9
 
@@ -274,12 +343,12 @@ def _sanitize_sheet(spec: SheetSpec) -> SheetSpec:
 
 
 # -----------------------------
-# Canonical columns (90 in v2.6.0)
+# Canonical columns (97 in v2.7.0)
 # -----------------------------
 
 def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     """
-    Canonical 90 columns used by:
+    Canonical 97 columns used by:
       Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds, My_Portfolio
 
     Column groups and counts (running total):
@@ -296,13 +365,16 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
       Portfolio (6)        -> 81
       Provenance (4)       -> 85
       Insights (5)         -> 90   (added v2.6.0)
+      Decision (2)         -> 92   (added v2.7.0)
+      Candlestick (5)      -> 97   (added v2.7.0)
 
     IMPORTANT:
     - Keep keys stable.
     - Add only at the END to preserve compatibility, OR bump SCHEMA_VERSION
       AND coordinate with core.scoring / core.reco_normalize / both
       investment_advisor* modules and their fallback column lists.
-    - v2.6.0 added at END, so existing positional indices are unchanged.
+    - v2.7.0 added at END, so existing positional indices for v2.6.0 callers
+      are unchanged.
     """
     cols: List[ColumnSpec] = []
 
@@ -499,6 +571,81 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "Heuristic position-size anchor based on (recommendation, conviction). "
         "NOT financial advice. e.g. '4-6% of portfolio' for high-conviction "
         "STRONG_BUY. (core.insights_builder.build_position_size_hint)",
+    )
+
+    # Decision Matrix (2) -> total 92  (added v2.7.0)
+    #
+    # Produced by core.data_engine_v2 v5.50.0+'s 8-tier classifier
+    # _classify_8tier(). The canonical 5-tier `recommendation` field
+    # above is preserved unchanged; this pair adds richer detail and a
+    # numeric priority. May be EMPTY when `recommendation` is set
+    # upstream by core.scoring -> core.reco_normalize, to avoid
+    # implying a detailed verdict that may disagree with the canonical.
+    add(
+        "Decision", "Recommendation Detail", "recommendation_detailed",
+        "str", "text", False, "model",
+        "8-tier Decision Matrix verdict: STRONG_BUY / BUY / SPECULATIVE_BUY / "
+        "ACCUMULATE / HOLD / REDUCE / SELL / STRONG_SELL. Richer than the "
+        "canonical 5-tier `recommendation` field which collapses these via "
+        "core.data_engine_v2._RECOMMENDATION_COLLAPSE_MAP. Empty when "
+        "`recommendation` is set upstream by core.scoring -> core.reco_normalize.",
+    )
+    add(
+        "Decision", "Reco Priority", "recommendation_priority",
+        "int", "0", False, "model",
+        "1-8 priority rule that fired in the Decision Matrix. "
+        "1=Critical Risk (STRONG_SELL circuit breaker), "
+        "2=Golden Setup (STRONG_BUY), "
+        "3=High Beta/Growth (SPECULATIVE_BUY), "
+        "4=Core Position (BUY), "
+        "5=Value Play (ACCUMULATE), "
+        "6=Fundamental Failure (SELL), "
+        "7=Exit Strategy (REDUCE), "
+        "8=Neutral (HOLD). "
+        "Empty when `recommendation` is upstream-set.",
+    )
+
+    # Candlestick (5) -> total 97  (added v2.7.0)
+    #
+    # Produced by core.candlesticks v1.0.0 when invoked from
+    # core.data_engine_v2 v5.50.0+ on OHLC history rows. Detection is
+    # BEST-EFFORT and OPTIONAL: when the candlesticks module is
+    # unavailable, when the env flag ENGINE_CANDLESTICKS_ENABLED is
+    # disabled, or when detection raises, all five columns stay null.
+    # 10 patterns supported: Doji, Hammer, Inverted Hammer,
+    # Shooting Star, Hanging Man, Bullish/Bearish Marubozu,
+    # Bullish/Bearish Engulfing, Morning Star, Evening Star.
+    add(
+        "Candlestick", "Candle Pattern", "candlestick_pattern",
+        "str", "text", False, "derived",
+        "Latest candlestick pattern detected (e.g. 'Bullish Engulfing', 'Hammer', "
+        "'Doji'). Empty when no pattern fires or insufficient OHLC history. "
+        "(core.candlesticks.detect_patterns)",
+    )
+    add(
+        "Candlestick", "Candle Signal", "candlestick_signal",
+        "str", "text", False, "derived",
+        "Pattern signal: BULLISH / BEARISH / NEUTRAL / DOJI. Defaults to "
+        "NEUTRAL when no pattern detected.",
+    )
+    add(
+        "Candlestick", "Candle Strength", "candlestick_strength",
+        "str", "text", False, "derived",
+        "Pattern strength bucket: STRONG (confidence >= 75) / "
+        "MODERATE (>= 55) / WEAK (< 55). Empty when no pattern detected.",
+    )
+    add(
+        "Candlestick", "Candle Confidence", "candlestick_confidence",
+        "float", "0.00", False, "derived",
+        "Pattern confidence 0-100 derived from how comfortably the geometric "
+        "criteria are met for the detected pattern. Conservative scoring.",
+    )
+    add(
+        "Candlestick", "Recent Patterns (5D)", "candlestick_patterns_recent",
+        "str", "text", False, "derived",
+        "Pipe-separated list of pattern names detected across the last 5 "
+        "trading bars, oldest -> newest. Helps spot pattern clusters / "
+        "confirmations. Empty when no patterns in the window.",
     )
 
     return tuple(cols)
@@ -952,6 +1099,26 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
                     f"[{sheet_name}] Missing required insights column(s): {missing_insights}. "
                     f"core.insights_builder.enrich_rows_with_insights writes these."
                 )
+            # v2.7.0: Decision Matrix columns are required for schema
+            # alignment with core.data_engine_v2 v5.50.0+. Values may be
+            # empty (when `recommendation` is upstream-set), but the
+            # COLUMNS must exist so the engine can populate them.
+            missing_decision = [k for k in DECISION_COLUMN_KEYS if k not in spec_keys]
+            if missing_decision:
+                raise ValueError(
+                    f"[{sheet_name}] Missing required decision matrix column(s): {missing_decision}. "
+                    f"core.data_engine_v2 v5.50.0+ writes these via _classify_8tier()."
+                )
+            # v2.7.0: Candlestick columns are required for schema
+            # alignment with core.candlesticks v1.0.0. Values may be
+            # empty (when detection is disabled / unavailable), but
+            # the COLUMNS must exist.
+            missing_candlestick = [k for k in CANDLESTICK_COLUMN_KEYS if k not in spec_keys]
+            if missing_candlestick:
+                raise ValueError(
+                    f"[{sheet_name}] Missing required candlestick column(s): {missing_candlestick}. "
+                    f"core.candlesticks.detect_patterns writes these via core.data_engine_v2 v5.50.0+."
+                )
 
         if sheet_name == "Top_10_Investments":
             if len(spec.columns) != _TOP10_TOTAL_COLS:
@@ -972,6 +1139,16 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
             if missing_insights:
                 raise ValueError(
                     f"[Top_10_Investments] Missing required insights column(s): {missing_insights}."
+                )
+            missing_decision = [k for k in DECISION_COLUMN_KEYS if k not in spec_keys]
+            if missing_decision:
+                raise ValueError(
+                    f"[Top_10_Investments] Missing required decision matrix column(s): {missing_decision}."
+                )
+            missing_candlestick = [k for k in CANDLESTICK_COLUMN_KEYS if k not in spec_keys]
+            if missing_candlestick:
+                raise ValueError(
+                    f"[Top_10_Investments] Missing required candlestick column(s): {missing_candlestick}."
                 )
 
         if sheet_name == "Insights_Analysis":
