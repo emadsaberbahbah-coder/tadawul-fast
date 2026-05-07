@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.3.1  (V2.7.0-ALIGNED / 97-COL / v5.50.0)
+Advanced Analysis Root Owner — v4.3.2  (V2.7.0-ALIGNED / 97-COL / v5.50.0)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
@@ -16,6 +16,78 @@ Owns the canonical root paths:
 - /schema/pages
 - /schema/data-dictionary
 and their /v1/schema aliases.
+
+Why v4.3.2 — matrix row-extraction parity with legacy adapter
+-------------------------------------------------------------
+
+After v4.3.1 deployed successfully (engine bound via `get_engine()` factory,
+visible in startup log and meta.source), the data verification revealed
+that `/v1/advanced/sheet-rows` was returning placeholder rows with all
+v5.50.0 fields null:
+
+  meta.source: "core.data_engine_v2.get_engine().get_sheet_rows"  ✓
+  meta.dispatch: "advanced_analysis_fail_soft_nonempty"           ✗
+  data_provider: "placeholder_no_live_data"                       ✗
+  duration_ms: 1.037                                              ⚡ suspicious
+
+The 1ms response time and `fail_soft_nonempty` dispatch label proved the
+engine was returning a payload but the route was failing to extract any
+rows from it, then falling through to the local placeholder fallback.
+
+Comparing the v4.2.0 path (which DID populate `recommendation_detailed`)
+to the v4.3.1 path (which did NOT) revealed the root cause:
+
+The v5.50.0 engine returns rows in MATRIX form — `payload["rows"]` is a
+list of lists positionally keyed to `payload["keys"]`, not a list of dicts.
+The legacy adapter `core.data_engine.get_sheet_rows` includes a helper
+`_extract_payload_rows` with built-in matrix-to-dicts conversion using
+`_rows_from_matrix(rr, keys_hint)`. v4.3.1 went direct to v2 and bypassed
+that helper, then this route's local `_extract_rows_like` (which only
+recognized list-of-dicts) returned `[]` and the fallback fired.
+
+v4.3.2 changes (from v4.3.1)
+----------------------------
+- FIX [CRITICAL]: add `_rows_from_matrix()` helper symmetric with the
+    legacy adapter's logic. Converts list-of-lists rows into dict rows
+    using the provided keys, with safe handling for short/long rows.
+
+- FIX [CRITICAL]: add `_extract_rows_with_matrix_fallback(payload, keys)`
+    which first tries `_extract_rows_like` (preserves v4.3.1 behavior for
+    payloads that were already list-of-dicts), then falls back to matrix
+    extraction when the payload contains list-of-lists in any of the
+    standard buckets ("rows", "rows_matrix", "matrix", "data", "items",
+    "records", "quotes", "results").
+
+- FIX [CRITICAL]: `_normalize_external_payload` now calls the matrix-
+    aware extractor and passes the schema keys. This is the single
+    behavioral change that unblocks v5.50.0 enrichment from reaching
+    the wire.
+
+- KEEP: existing `_extract_rows_like` is preserved unchanged. It is
+    still used by `_run_advanced_sheet_rows_impl` for the post-normalize
+    "did this produce rows" check (which reads `row_objects` in the
+    normalized envelope — always list-of-dicts at that stage).
+
+- KEEP: every v4.3.1 / v4.3.0 / v4.2.0 / v4.1.0 fix preserved unchanged.
+
+Production verification after v4.3.2 deploy
+-------------------------------------------
+Hit `/v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1` and the
+response should now satisfy:
+
+  1. meta.source     == "core.data_engine_v2.get_engine().get_sheet_rows"  (unchanged from 4.3.1)
+  2. meta.dispatch   == "advanced_analysis_root"                          (was: fail_soft_nonempty)
+  3. status          == "success"                                         (was: partial)
+  4. data_provider   non-null and NOT "placeholder_no_live_data"
+  5. recommendation_detailed / recommendation_priority — non-null
+  6. fundamental_view / technical_view / risk_view / value_view — non-null
+  7. recommendation_reason — non-null
+  8. sector_relative_score / conviction_score — non-null
+  9. candlestick_signal — non-null on most symbols (some short-history symbols may legitimately be null)
+
+If conditions 1-3 pass but 4-9 still fail → engine bug.
+If condition 1 fails → v4.3.2 not actually deployed.
+If condition 2 still says fail_soft_nonempty → matrix extraction not catching this payload shape; need to inspect `meta.engine_payload_diagnostic` (added below for 4.3.2 visibility).
 
 Why v4.3.1 — v5.50.0 binding pattern corrected
 ----------------------------------------------
@@ -247,7 +319,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.3.1"
+ADVANCED_ANALYSIS_VERSION = "4.3.2"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -1070,6 +1142,86 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
                 return found
     return []
 
+def _rows_from_matrix(matrix: Any, keys: Sequence[str]) -> List[Dict[str, Any]]:
+    """v4.3.2: Convert a list-of-lists matrix into list-of-dicts using keys.
+
+    Symmetric with `core.data_engine._rows_from_matrix`. Each inner row is
+    zipped with the provided keys positionally; missing trailing values
+    become None, extra trailing values are dropped.
+
+    Inner items that are already dicts are passed through (so a "mixed"
+    bucket with both dicts and lists is handled). Inner items that are
+    neither dicts nor list/tuple are skipped.
+    """
+    if not isinstance(matrix, list) or not keys:
+        return []
+    ks = [str(k) for k in keys]
+    out: List[Dict[str, Any]] = []
+    for row in matrix:
+        if isinstance(row, dict):
+            out.append({k: row.get(k) for k in ks})
+            continue
+        if not isinstance(row, (list, tuple)):
+            continue
+        out.append({k: (row[i] if i < len(row) else None) for i, k in enumerate(ks)})
+    return out
+
+def _extract_rows_with_matrix_fallback(payload: Any, keys: Sequence[str]) -> List[Dict[str, Any]]:
+    """v4.3.2: Row extractor that handles both list-of-dicts and matrix payloads.
+
+    The v5.50.0 engine `get_sheet_rows()` returns rows in MATRIX form —
+    `payload["rows"]` is a list of lists positionally keyed to
+    `payload["keys"]`, not a list of dicts. The legacy adapter
+    `core.data_engine.get_sheet_rows` did matrix-to-dict conversion
+    internally before returning, which is why v4.2.0 (legacy) saw dicts
+    here and v4.3.1 (direct v2) saw nothing.
+
+    Strategy:
+      1. First try `_extract_rows_like` (handles dicts in any standard
+         bucket — preserves v4.3.1 behavior for dict-shaped payloads).
+      2. If that returns empty, scan the same buckets for list-of-list
+         data and convert via `_rows_from_matrix(rr, keys)`.
+      3. If the payload also has a top-level "rows_matrix" or "matrix"
+         key (some engines keep dict rows in "rows" and matrix in "matrix"
+         simultaneously), try that as a last resort.
+
+    Returns a list of dicts every time. Empty list on no match.
+    """
+    # Path 1: existing behavior — find dict rows anywhere
+    dict_rows = _extract_rows_like(payload)
+    if dict_rows:
+        return dict_rows
+    if not isinstance(payload, Mapping) or not keys:
+        return []
+    ks = list(keys)
+    # Path 2: scan same buckets for matrix data
+    for bucket in ("rows", "rows_matrix", "matrix", "data", "items", "records", "quotes", "results"):
+        rr = payload.get(bucket)
+        if not isinstance(rr, list) or not rr:
+            continue
+        # Skip buckets that are clearly not row data (already-handled dicts caught above;
+        # only matrix or mixed left here). Accept if first non-empty element is list/tuple.
+        first = rr[0]
+        if isinstance(first, (list, tuple)):
+            converted = _rows_from_matrix(rr, ks)
+            if converted:
+                return converted
+        elif isinstance(first, dict):
+            # Already-dicts case was handled by _extract_rows_like above; if we got here
+            # _extract_rows_like rejected this bucket (e.g. bucket=="rows" but first dict
+            # was empty). Try projecting anyway as defence-in-depth.
+            converted = _rows_from_matrix(rr, ks)
+            if converted:
+                return converted
+    # Path 3: nested payload envelopes (mirror _extract_rows_like's recursion)
+    for name in ("payload", "result", "response", "output", "data"):
+        nested = payload.get(name)
+        if isinstance(nested, Mapping):
+            inner = _extract_rows_with_matrix_fallback(nested, ks)
+            if inner:
+                return inner
+    return []
+
 def _extract_status_error(payload: Any) -> Tuple[str, Optional[str], Dict[str, Any]]:
     if not isinstance(payload, Mapping):
         return "success", None, {}
@@ -1393,7 +1545,37 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
     ext = dict(external_payload or {})
     hdrs = list(headers or [])
     ks = list(keys or [])
-    rows = _extract_rows_like(ext)
+    # v4.3.2: matrix-aware extraction. v5.50.0 engine returns rows in
+    # list-of-lists form (positionally keyed to ks); legacy adapter did
+    # this conversion internally. Calling the matrix-aware extractor here
+    # restores parity. Falls back identically to v4.3.1 for dict payloads.
+    rows = _extract_rows_with_matrix_fallback(ext, ks)
+    # v4.3.2: capture extraction diagnostic for production observability.
+    # If extraction returned 0 rows but the payload clearly has data, the
+    # diagnostic surfaces in meta.engine_payload_diagnostic so the next
+    # debugging step doesn't require code changes.
+    engine_payload_diagnostic: Dict[str, Any] = {}
+    if not rows and isinstance(ext, Mapping):
+        bucket_summary: Dict[str, str] = {}
+        for bucket in ("rows", "rows_matrix", "matrix", "row_objects", "records", "items", "data", "quotes", "results"):
+            v = ext.get(bucket)
+            if v is None:
+                continue
+            if isinstance(v, list):
+                if not v:
+                    bucket_summary[bucket] = "list[empty]"
+                else:
+                    first = v[0]
+                    bucket_summary[bucket] = "list[{}]({} els)".format(type(first).__name__, len(v))
+            else:
+                bucket_summary[bucket] = type(v).__name__
+        engine_payload_diagnostic = {
+            "buckets": bucket_summary,
+            "top_keys": sorted(list(ext.keys()))[:25],
+            "had_status": _strip(ext.get("status")) or "(absent)",
+            "had_error": _strip(ext.get("error")) or "(absent)",
+            "schema_keys_count": len(ks),
+        }
     normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
     if page == _TOP10_PAGE:
         normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
@@ -1409,6 +1591,8 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
     final_meta = dict(ext_meta or {})
     if meta_extra:
         final_meta.update(meta_extra)
+    if engine_payload_diagnostic:
+        final_meta["engine_payload_diagnostic"] = engine_payload_diagnostic
     return _payload_envelope(page=page, headers=hdrs, keys=ks, row_objects=normalized_rows, include_matrix=include_matrix, request_id=request_id, started_at=started_at, mode=mode, status_out=status_out or ("success" if normalized_rows else "partial"), error_out=error_out, meta=final_meta)
 
 async def _run_advanced_sheet_rows_impl(
