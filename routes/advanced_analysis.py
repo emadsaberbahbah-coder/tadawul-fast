@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.3.2  (V2.7.0-ALIGNED / 97-COL / v5.50.0)
+Advanced Analysis Root Owner — v4.3.3  (V2.7.0-ALIGNED / 97-COL / v5.50.0)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
@@ -16,6 +16,66 @@ Owns the canonical root paths:
 - /schema/pages
 - /schema/data-dictionary
 and their /v1/schema aliases.
+
+Why v4.3.3 — diagnostic visibility through the fallback path
+------------------------------------------------------------
+
+v4.3.2 added matrix-aware row extraction AND an `engine_payload_diagnostic`
+field intended to surface the raw engine payload shape when extraction
+returned 0 rows. The deploy succeeded (binding logs as expected) but the
+data response STILL showed:
+
+  status: "partial", dispatch: "fail_soft_nonempty",
+  data_provider: "placeholder_no_live_data",
+  duration_ms: 1.487
+
+And critically, the `engine_payload_diagnostic` field was MISSING from
+`meta`. Re-reading the impl exposed the bug:
+
+  payload, source = await _call_core_sheet_rows_best_effort(...)
+  if isinstance(payload, dict):
+      normalized = _normalize_external_payload(...)        ← diagnostic captured here
+      if _extract_rows_like(normalized):
+          return normalized                                 ← only returned on success
+  fallback_rows = _build_nonempty_failsoft_rows(...)        ← discards `normalized`
+  return _payload_envelope(..., meta={...})                 ← fresh meta, diagnostic lost
+
+The diagnostic was attached to `normalized.meta`, but the impl only
+returns `normalized` when `_extract_rows_like(normalized)` is truthy.
+On the empty path, `normalized` is discarded and a fresh fallback
+envelope is built — which is why the diagnostic never reached the wire.
+
+v4.3.3 changes (from v4.3.2)
+----------------------------
+- FIX: `_run_advanced_sheet_rows_impl` now CAPTURES the upstream
+    diagnostic before falling through to fallback rows, and merges it
+    into the fallback meta. Exposed fields:
+      * `upstream_payload_type`     — type(payload).__name__
+      * `upstream_payload_top_keys` — first 25 top-level keys
+      * `upstream_status`           — engine-reported status
+      * `upstream_error`            — engine-reported error (if any)
+      * `engine_payload_diagnostic` — bucket type/length summary from v4.3.2
+
+- ADD: explicit WARNING-level log when `_call_core_sheet_rows_best_effort`
+    returns a payload but the route can't extract rows from it. The log
+    line includes the payload top keys and the bucket summary, so we get
+    diagnostic evidence in the Render deploy logs without needing
+    additional API calls.
+
+- ADD: explicit WARNING-level log inside `_call_core_sheet_rows_best_effort`
+    when the engine raises a non-TypeError exception. v4.3.1/4.3.2
+    swallowed those exceptions silently into an `{"status": "error"}`
+    dict and returned, but the swallowed exception text was visible only
+    in the discarded normalized envelope.
+
+- KEEP: every v4.3.2 / v4.3.1 / v4.3.0 fix preserved unchanged. Matrix
+    extraction, v2 binding cascade, 97-col canonical — all intact.
+
+This is purely an observability revision. If v4.3.3's response STILL
+shows `status: partial` (likely), the new fields in `meta` will tell
+us exactly what the engine returned, and the deploy logs will show
+the engine call's exception (if any). With that data in hand we can
+write v4.3.4 as a precise behavioral fix.
 
 Why v4.3.2 — matrix row-extraction parity with legacy adapter
 -------------------------------------------------------------
@@ -319,7 +379,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.3.2"
+ADVANCED_ANALYSIS_VERSION = "4.3.3"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -1536,9 +1596,29 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
             continue
         except Exception as e:
             last_err = e
+            # v4.3.3: explicit WARNING log so non-TypeError engine failures
+            # are visible in Render deploy logs (previously swallowed silently
+            # into an error dict whose text only reached the discarded
+            # normalized envelope, never the wire).
+            try:
+                logger.warning(
+                    "[advanced_analysis v%s] engine call raised %s: %s "
+                    "(page=%r limit=%r offset=%r body_keys=%r)",
+                    ADVANCED_ANALYSIS_VERSION,
+                    e.__class__.__name__, e,
+                    page, limit, offset,
+                    sorted(list((body or {}).keys()))[:15],
+                )
+            except Exception:
+                pass
             break
     if last_err is not None:
-        return {"status": "error", "error": str(last_err), "row_objects": []}, CORE_GET_SHEET_ROWS_SOURCE
+        return {
+            "status": "error",
+            "error": "{}: {}".format(last_err.__class__.__name__, last_err),
+            "error_class": last_err.__class__.__name__,
+            "row_objects": [],
+        }, CORE_GET_SHEET_ROWS_SOURCE
     return None, None
 
 def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: str, headers: Sequence[str], keys: Sequence[str], include_matrix: bool, request_id: str, started_at: float, mode: str, limit: int = 2000, offset: int = 0, top_n: int = 2000, requested_symbols: Optional[Sequence[str]] = None, meta_extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1634,15 +1714,87 @@ async def _run_advanced_sheet_rows_impl(
         return _payload_envelope(page=page, headers=headers, keys=keys, row_objects=[], include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, status_out="success", error_out=None, meta={"dispatch": "schema_only", "schema_source": schema_source, "headers_only": headers_only, "schema_only": schema_only})
 
     payload, source = await _call_core_sheet_rows_best_effort(page=page, limit=max(limit + offset, top_n), offset=0, mode=mode or "", body=merged_body)
+
+    # v4.3.3: capture upstream diagnostic info BEFORE falling through to
+    # fallback. v4.3.2 attached this to the normalized envelope but the
+    # impl discarded that envelope when extraction failed, so the
+    # diagnostic never reached the wire. Capturing here ensures it
+    # reaches the fallback meta below.
+    upstream_diagnostic_meta: Dict[str, Any] = {}
     if isinstance(payload, dict):
+        try:
+            upstream_diagnostic_meta["upstream_payload_type"] = type(payload).__name__
+            upstream_diagnostic_meta["upstream_payload_top_keys"] = sorted(list(payload.keys()))[:25]
+            ups_status = _strip(payload.get("status"))
+            ups_error = _strip(payload.get("error")) or _strip(payload.get("detail")) or _strip(payload.get("message"))
+            ups_error_class = _strip(payload.get("error_class"))
+            if ups_status:
+                upstream_diagnostic_meta["upstream_status"] = ups_status
+            if ups_error:
+                upstream_diagnostic_meta["upstream_error"] = ups_error[:500]
+            if ups_error_class:
+                upstream_diagnostic_meta["upstream_error_class"] = ups_error_class
+            # Bucket-shape summary (mirrors the v4.3.2 diagnostic that was
+            # being lost). Tells us whether the engine returned matrix,
+            # dicts, empty lists, or nothing.
+            bucket_summary: Dict[str, str] = {}
+            for bucket in ("rows", "rows_matrix", "matrix", "row_objects", "records", "items", "data", "quotes", "results"):
+                v = payload.get(bucket)
+                if v is None:
+                    continue
+                if isinstance(v, list):
+                    if not v:
+                        bucket_summary[bucket] = "list[empty]"
+                    else:
+                        first = v[0]
+                        bucket_summary[bucket] = "list[{}]({} els)".format(type(first).__name__, len(v))
+                else:
+                    bucket_summary[bucket] = type(v).__name__
+            if bucket_summary:
+                upstream_diagnostic_meta["engine_payload_diagnostic"] = bucket_summary
+        except Exception:
+            pass
+
         normalized = _normalize_external_payload(external_payload=payload, page=page, headers=headers, keys=keys, include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, limit=limit, offset=offset, top_n=top_n, requested_symbols=requested_symbols, meta_extra={"schema_source": schema_source, "source": source or CORE_GET_SHEET_ROWS_SOURCE})
         if _extract_rows_like(normalized):
             return normalized
 
+    # v4.3.3: log the failure mode at WARNING so it shows up in Render
+    # deploy logs. The wire response also carries the same info in
+    # meta.upstream_* below, but log-side visibility is helpful when the
+    # caller is a script / scheduler that doesn't surface response meta.
+    try:
+        if upstream_diagnostic_meta:
+            logger.warning(
+                "[advanced_analysis v%s] engine call returned non-empty payload but route extracted 0 rows. "
+                "page=%r upstream_status=%r upstream_error=%r buckets=%r top_keys=%r",
+                ADVANCED_ANALYSIS_VERSION, page,
+                upstream_diagnostic_meta.get("upstream_status"),
+                upstream_diagnostic_meta.get("upstream_error"),
+                upstream_diagnostic_meta.get("engine_payload_diagnostic"),
+                upstream_diagnostic_meta.get("upstream_payload_top_keys"),
+            )
+        elif payload is None:
+            logger.warning(
+                "[advanced_analysis v%s] engine call returned None (payload is None). page=%r",
+                ADVANCED_ANALYSIS_VERSION, page,
+            )
+    except Exception:
+        pass
+
     fallback_rows = _build_nonempty_failsoft_rows(page=page, headers=headers, keys=keys, requested_symbols=requested_symbols, limit=limit, offset=offset, top_n=top_n)
     fallback_status = "partial" if fallback_rows else "error"
     fallback_error = "Local non-empty fallback emitted after upstream degradation" if fallback_rows else "No usable rows returned; schema-shaped fallback emitted"
-    return _payload_envelope(page=page, headers=headers, keys=keys, row_objects=fallback_rows, include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, status_out=fallback_status, error_out=fallback_error, meta={"dispatch": "advanced_analysis_fail_soft_nonempty" if fallback_rows else "advanced_analysis_fail_soft", "schema_source": schema_source, "source": source or CORE_GET_SHEET_ROWS_SOURCE})
+    fallback_meta: Dict[str, Any] = {
+        "dispatch": "advanced_analysis_fail_soft_nonempty" if fallback_rows else "advanced_analysis_fail_soft",
+        "schema_source": schema_source,
+        "source": source or CORE_GET_SHEET_ROWS_SOURCE,
+    }
+    # v4.3.3: merge upstream diagnostic so the wire response shows what
+    # the engine actually returned (or didn't).
+    if upstream_diagnostic_meta:
+        fallback_meta.update(upstream_diagnostic_meta)
+    return _payload_envelope(page=page, headers=headers, keys=keys, row_objects=fallback_rows, include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, status_out=fallback_status, error_out=fallback_error, meta=fallback_meta)
 
 @router.get("/health")
 @router.get("/v1/schema/health")
