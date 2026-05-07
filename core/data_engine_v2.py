@@ -2,8 +2,44 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.49.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.49.1
 ================================================================================
+
+WHY v5.49.1
+-----------
+[WAVE 2B APPLIED] Removes the non-canonical "ACCUMULATE" token from
+`_compute_recommendation`'s fallback path. v5.49.0 carried this debt
+forward intentionally; this revision settles it.
+
+The recommendation now maps strictly to the canonical 5-tier
+{STRONG_BUY, BUY, HOLD, REDUCE, SELL} per `core.reco_normalize` v7.0.0+
+(and `schemas.Recommendation` enum). Mapping rationale:
+
+    overall >= 80 and conf >= 70 and risk <= 55  ->  STRONG_BUY
+    overall >= 70 and conf >= 60 and risk <= 65  ->  BUY
+    overall >= 55 and conf >= 50                 ->  BUY    (was ACCUMULATE)
+    overall <= 20 and risk >= 80                 ->  SELL
+    overall <= 35 or  risk >= 85                 ->  REDUCE
+    otherwise                                     ->  HOLD
+
+Notes:
+- ACCUMULATE was a non-canonical "buy in tranches" token. Its semantic
+  intent (positive but less conviction than full BUY) folds cleanly
+  into BUY under the canonical enum -- downstream consumers that previously
+  treated ACCUMULATE as a positive signal will continue to receive a
+  positive signal.
+- The strongest tier is now promoted to STRONG_BUY (was BUY) to use the
+  full canonical range.
+- A weak-end SELL tier is added for very-weak rows (overall <= 20 and
+  risk >= 80) -- previously these collapsed into REDUCE.
+- This branch only fires when an upstream `recommendation` value is not
+  already present on the row. Rows produced through the production path
+  (`core.scoring` -> `core.reco_normalize`) skip this branch entirely,
+  so behavior on the canonical path is unchanged.
+
+No other engine logic changed in v5.49.1. The Wave 3 schema additions
+(sector_relative_score, conviction_score, top_factors, top_risks,
+position_size_hint) introduced in v5.49.0 are preserved as-is.
 
 WHY v5.49.0
 -----------
@@ -17,147 +53,27 @@ core.sheets.schema_registry v2.6.0:
     top_risks               ("Top Risks")           str, "|"-separated
     position_size_hint      ("Position Size Hint")  str, free text
 
-These fields are produced by core.insights_builder v1.0.0 (Wave 1) and
-populated through core.scoring v5.1.0 -> row dict, then projected by
-the existing _normalize_to_schema_keys path. No engine logic changed;
-this revision only widens the instrument schema contract from 85 -> 90
-cols (and Top_10_Investments contract from 88 -> 93 cols by automatic
-re-derivation in STATIC_CANONICAL_SHEET_CONTRACTS, which uses
-list(INSTRUMENT_CANONICAL_*)).
-
-Note: Wave 2B (v5.47.2 -> v5.48.0 with the canonical reco-enum fix)
-was not previously applied to this file. Going v5.47.4 -> v5.49.0
-directly keeps the additive Wave 3 schema change but does NOT touch
-the "ACCUMULATE" token in _compute_recommendation's fallback. That
-token is still outside the canonical 5-tier {STRONG_BUY, BUY, HOLD,
-REDUCE, SELL} per core.reco_normalize v7.0.0+, but it only fires on
-the fallback path (production rows go through core.scoring ->
-core.reco_normalize and skip this branch). Address in a follow-up
-patch when ready.
-
 WHY v5.47.4
 -----------
 [AUDIT FIX] `country` was being filled in as "USA" for every non-KSA /
-non-FX / non-Future symbol. Tracing through the data: `_infer_country_
-from_symbol` only handled `.SR` and `=X` / `=F`, then fell back to "USA"
-for anything else -- so BARC.L (London), SAP.DE (Frankfurt), 7203.T
-(Tokyo), 0700.HK, RELIANCE.NS, BHP.AX, etc. were all silently tagged
-American.
-
-The country resolver now lives in `core.symbols.normalize` v7.1.0 as
-`get_country_from_symbol`, which knows 40+ markets and overrides for
-major indexes (^GSPC -> United States, ^FTSE -> United Kingdom,
-^N225 -> Japan, ^TASI -> Saudi Arabia, ...). v5.47.4 imports it and
-delegates. Same fix routed through `get_currency_from_symbol`, which
-closes 31 missing currencies (HK -> HKD, CN -> CNY, IN -> INR, AU -> AUD,
-CA -> CAD, CH -> CHF, KR -> KRW, SG -> SGD, ZA -> ZAR, AE -> AED, etc.).
-
-If `core.symbols.normalize` cannot be imported, both helpers fall back
-to a small in-engine lookup covering the same major suffixes -- still
-much better than blanket "USA". The legacy `s.upper()` `normalize_symbol`
-shim is preserved so cache keys, dedup, and downstream comparisons stay
-unchanged. (Switching to the canonicalising form would be an upgrade
-worth making but is intentionally out of scope here.)
-
-Touched (and only):
-  - `_infer_country_from_symbol`  -> delegates to normalize.py + fallback
-  - `_infer_currency_from_symbol` -> delegates to normalize.py + fallback
-  - new try-import block + minimal fallback tables
-Everything else (percent-fraction fixes, schema contracts, page routing,
-provider preferences, snapshot backfill, top10 fallback ranker, ...) is
-preserved verbatim from v5.47.3.
+non-FX / non-Future symbol. The country/currency resolvers now delegate
+to `core.symbols.normalize` v7.1.0 helpers; falls back to in-engine
+suffix tables if that import is unavailable.
 
 WHY v5.47.3
 -----------
 [CRITICAL] Percent-fraction fields are no longer pre-multiplied to percent
-points. v5.47.2 and earlier silently multiplied small-magnitude fraction
-values by 100 in seven places, which after the sheet display layer's own
-*100 step produced 100x-too-large output (NVDA -0.56% rendered as -56%,
-Aramco +0.65% diverged into the -86% noise via the same path, etc.).
+points. Affected fields: percent_change, week_52_position_pct,
+unrealized_pl_pct, max_drawdown_1y, var_95_1d. All stored as fractions;
+sheet display layer applies its own *100 step.
 
-The contract is now consistent end-to-end:
-  - eodhd_provider v6.3.0 returns FRACTIONS for all percent fields
-    (e.g. -0.0056 for -0.56%, +0.0065 for +0.65%)
-  - data_engine_v2 v5.47.3 stores those fractions UNCHANGED
-  - sheet display layer applies its own *100 for percent formatting
-
-Affected fields:
-  - percent_change            (was pre-multiplied at canonicalize + history)
-  - week_52_position_pct      (was pre-multiplied at canonicalize + history)
-  - unrealized_pl_pct         (was pre-multiplied at canonicalize)
-  - max_drawdown_1y           (was pre-multiplied at history)
-  - var_95_1d                 (was pre-multiplied at history)
-
-v5.47.3 stores all of these as fractions. Internal helpers `_as_pct_points`
-and `_as_pct_fraction` already handled both shapes via the abs(>1.5)
-heuristic, so they continue to compute correctly against the now-fraction
-inputs without any code change.
-
-Operator note (sheet column formats):
-  RSI is correctly stored 0–100 (raw scale). Sharpe is correctly stored
-  as a unit-less ratio (e.g. 1.20). The reported "RSI 5,000%" and
-  "Sharpe 1,200%" anomalies are SHEET COLUMN FORMAT bugs in the
-  spreadsheet template, not engine bugs. To fix in the sheet:
-    - "RSI (14)"   column format → Number (not Percent)
-    - "Sharpe (1Y)" column format → Number (not Percent)
-
-WHY v5.47.2 (PRESERVED, see below for the full list)
-----------------------------------------------------
-- FIX: makes provider priority page-aware so non-KSA pages like
-       Global_Markets, Commodities_FX, and Mutual_Funds prefer EODHD first
-       while KSA pages keep their protected local-first routing.
-- FIX: makes quote cache / singleflight keys provider-profile aware so a row
-       cached for one page context does not silently override another page
-       that should use a different primary provider.
-- FIX: threads page context through enriched quote batch builders so
-       Global_Markets, Commodities_FX, and Mutual_Funds consistently use the
-       intended provider order during page builds and fallback hydration.
-- FIX: public engine entrypoints now tolerate extra kwargs from route wrappers
-       instead of failing on TypeError before building a canonical envelope.
-- FIX: merges request/query/body dicts into one normalized body so GET and POST
-       variants produce the same schema-first response contract.
-- FIX: adds schema/contract helper aliases expected by diagnostics/wrappers and
-       improves single-symbol extraction from direct request payloads.
-- FIX: keeps rows / rows_matrix strictly matrix-aligned to keys while
-       row_objects / items / records / data / quotes stay dict-row payloads.
-- FIX: hardens canonical sheet-name resolution by consulting page catalog
-       aliases/functions before falling back to static contracts.
-- FIX: strips fully blank schema pairs instead of fabricating ghost columns,
-       preventing false leading-column drift from partial specs.
-- FIX: prevents EODHD from being re-inserted for KSA symbols when
-       KSA_DISALLOW_EODHD=true even if it is the global primary provider.
-- FIX: enriches fallback Insights rows with market summary, risk-bucket counts,
-       leaderboard items, and portfolio KPI style signals.
-- FIX: improves fallback scoring with valuation_score, richer quality/risk logic,
-       and more stable opportunity/recommendation support.
-- FIX: preserves aligned snapshots and route compatibility aliases expected by
-       advisor / advanced / enriched wrappers and direct router calls.
-- FIX: adds commodity/FX self-recovery from chart/history payloads when live
-       quote payloads are sparse or unavailable.
-- FIX: applies symbol-aware page defaults so Commodities_FX rows keep useful
-       identity/context fields even during provider degradation.
-- FIX: adds a native Top 10 engine fallback ranker so the engine does not
-       depend on an external selector to build Top_10_Investments rows.
-- FIX: exposes normalize_row_to_schema and batch-analysis aliases expected by
-       downstream analysis/advisor routers.
-- FIX: adds snapshot-assisted row backfill for sparse live quote rows so
-       previously cached richer rows can safely fill missing schema fields.
-- FIX: exposes display-header object payloads alongside canonical key-based
-       row objects to make diagnostics and route wrappers easier to validate.
-- FIX: bridges EODHD-style aliases used by the new global provider revision,
-       including forward_pe -> pe_forward, day_open -> open_price,
-       fcf_ttm -> free_cash_flow_ttm, d_e_ratio -> debt_to_equity,
-       and avg_vol_* -> avg_volume_*.
-- FIX: strengthens page-aware backfill for Mutual_Funds and Commodities_FX so
-       identity/context fields stay populated without fabricating missing
-       equity-only fundamentals.
-- FIX: expands global-provider alias bridges for fundamentals / margins /
-       market-cap style fields commonly returned under alternative names.
-- FIX: adds cross-snapshot symbol backfill so richer rows built on one page can
-       safely fill sparse rows on Top_10_Investments, My_Portfolio, and other
-       dependent pages.
-- FIX: improves ETF / fund context defaults so non-KSA pages keep better
-       identity metadata when provider payloads are thin.
+WHY v5.47.2
+-----------
+- Page-aware provider priority for non-KSA pages.
+- Provider-profile-aware quote cache / singleflight keys.
+- Schema-first response contract for GET and POST variants.
+- Fallback ranker for Top_10_Investments.
+- Snapshot-assisted cross-page row backfill.
 
 Design goals
 ------------
@@ -209,7 +125,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.49.0"
+__version__ = "5.49.1"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -218,9 +134,6 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 # v5.47.4: optional symbol metadata helpers from core.symbols.normalize v7.1.0
 # =============================================================================
-# These provide accurate per-market country and currency lookup. If the
-# import fails (older deployment, package not on path), we degrade to a
-# small local table below -- still better than blanket "USA"/"USD".
 try:
     from core.symbols.normalize import (  # type: ignore
         get_country_from_symbol as _ext_get_country_from_symbol,
@@ -232,9 +145,6 @@ except Exception:  # pragma: no cover
     _ext_get_currency_from_symbol = None  # type: ignore
     _HAS_NORMALIZE_HELPERS = False
 
-# Local fallback tables (used only if core.symbols.normalize cannot be
-# imported; production should always have it). Keys are the trailing
-# `.SUFFIX` portion of a symbol, upper-cased.
 _FALLBACK_COUNTRY_BY_SUFFIX: Dict[str, str] = {
     ".SR": "Saudi Arabia", ".SAU": "Saudi Arabia", ".TADAWUL": "Saudi Arabia",
     ".US": "United States", ".N": "United States", ".NASDAQ": "United States",
@@ -317,197 +227,60 @@ class UnifiedQuote(BaseModel):
 # Canonical page contracts
 # =============================================================================
 INSTRUMENT_CANONICAL_KEYS: List[str] = [
-    "symbol",
-    "name",
-    "asset_class",
-    "exchange",
-    "currency",
-    "country",
-    "sector",
-    "industry",
-    "current_price",
-    "previous_close",
-    "open_price",
-    "day_high",
-    "day_low",
-    "week_52_high",
-    "week_52_low",
-    "price_change",
-    "percent_change",
-    "week_52_position_pct",
-    "volume",
-    "avg_volume_10d",
-    "avg_volume_30d",
-    "market_cap",
-    "float_shares",
-    "beta_5y",
-    "pe_ttm",
-    "pe_forward",
-    "eps_ttm",
-    "dividend_yield",
-    "payout_ratio",
-    "revenue_ttm",
-    "revenue_growth_yoy",
-    "gross_margin",
-    "operating_margin",
-    "profit_margin",
-    "debt_to_equity",
-    "free_cash_flow_ttm",
-    "rsi_14",
-    "volatility_30d",
-    "volatility_90d",
-    "max_drawdown_1y",
-    "var_95_1d",
-    "sharpe_1y",
-    "risk_score",
-    "risk_bucket",
-    "pb_ratio",
-    "ps_ratio",
-    "ev_ebitda",
-    "peg_ratio",
-    "intrinsic_value",
-    "upside_pct",
-    "valuation_score",
-    "forecast_price_1m",
-    "forecast_price_3m",
-    "forecast_price_12m",
-    "expected_roi_1m",
-    "expected_roi_3m",
-    "expected_roi_12m",
-    "forecast_confidence",
-    "confidence_score",
-    "confidence_bucket",
-    "value_score",
-    "quality_score",
-    "momentum_score",
-    "growth_score",
-    "overall_score",
-    "fundamental_view",
-    "technical_view",
-    "risk_view",
-    "value_view",
-    "opportunity_score",
-    "rank_overall",
-    "recommendation",
-    "recommendation_reason",
-    "horizon_days",
-    "invest_period_label",
-    "position_qty",
-    "avg_cost",
-    "position_cost",
-    "position_value",
-    "unrealized_pl",
-    "unrealized_pl_pct",
-    "data_provider",
-    "last_updated_utc",
-    "last_updated_riyadh",
-    "warnings",
+    "symbol", "name", "asset_class", "exchange", "currency", "country",
+    "sector", "industry", "current_price", "previous_close", "open_price",
+    "day_high", "day_low", "week_52_high", "week_52_low", "price_change",
+    "percent_change", "week_52_position_pct", "volume", "avg_volume_10d",
+    "avg_volume_30d", "market_cap", "float_shares", "beta_5y", "pe_ttm",
+    "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio", "revenue_ttm",
+    "revenue_growth_yoy", "gross_margin", "operating_margin", "profit_margin",
+    "debt_to_equity", "free_cash_flow_ttm", "rsi_14", "volatility_30d",
+    "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y", "risk_score",
+    "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
+    "intrinsic_value", "upside_pct", "valuation_score", "forecast_price_1m",
+    "forecast_price_3m", "forecast_price_12m", "expected_roi_1m",
+    "expected_roi_3m", "expected_roi_12m", "forecast_confidence",
+    "confidence_score", "confidence_bucket", "value_score", "quality_score",
+    "momentum_score", "growth_score", "overall_score", "fundamental_view",
+    "technical_view", "risk_view", "value_view", "opportunity_score",
+    "rank_overall", "recommendation", "recommendation_reason", "horizon_days",
+    "invest_period_label", "position_qty", "avg_cost", "position_cost",
+    "position_value", "unrealized_pl", "unrealized_pl_pct", "data_provider",
+    "last_updated_utc", "last_updated_riyadh", "warnings",
     # v2.6.0 Insights group (Wave 3) -- produced by core.insights_builder v1.0.0
-    "sector_relative_score",
-    "conviction_score",
-    "top_factors",
-    "top_risks",
+    "sector_relative_score", "conviction_score", "top_factors", "top_risks",
     "position_size_hint",
 ]
 
 INSTRUMENT_CANONICAL_HEADERS: List[str] = [
-    "Symbol",
-    "Name",
-    "Asset Class",
-    "Exchange",
-    "Currency",
-    "Country",
-    "Sector",
-    "Industry",
-    "Current Price",
-    "Previous Close",
-    "Open",
-    "Day High",
-    "Day Low",
-    "52W High",
-    "52W Low",
-    "Price Change",
-    "Percent Change",
-    "52W Position %",
-    "Volume",
-    "Avg Volume 10D",
-    "Avg Volume 30D",
-    "Market Cap",
-    "Float Shares",
-    "Beta (5Y)",
-    "P/E (TTM)",
-    "P/E (Forward)",
-    "EPS (TTM)",
-    "Dividend Yield",
-    "Payout Ratio",
-    "Revenue (TTM)",
-    "Revenue Growth YoY",
-    "Gross Margin",
-    "Operating Margin",
-    "Profit Margin",
-    "Debt/Equity",
-    "Free Cash Flow (TTM)",
-    "RSI (14)",
-    "Volatility 30D",
-    "Volatility 90D",
-    "Max Drawdown 1Y",
-    "VaR 95% (1D)",
-    "Sharpe (1Y)",
-    "Risk Score",
-    "Risk Bucket",
-    "P/B",
-    "P/S",
-    "EV/EBITDA",
-    "PEG",
-    "Intrinsic Value",
-    "Upside %",
-    "Valuation Score",
-    "Forecast Price 1M",
-    "Forecast Price 3M",
-    "Forecast Price 12M",
-    "Expected ROI 1M",
-    "Expected ROI 3M",
-    "Expected ROI 12M",
-    "Forecast Confidence",
-    "Confidence Score",
-    "Confidence Bucket",
-    "Value Score",
-    "Quality Score",
-    "Momentum Score",
-    "Growth Score",
-    "Overall Score",
-    "Fundamental View",
-    "Technical View",
-    "Risk View",
-    "Value View",
-    "Opportunity Score",
-    "Rank (Overall)",
-    "Recommendation",
-    "Recommendation Reason",
-    "Horizon Days",
-    "Invest Period Label",
-    "Position Qty",
-    "Avg Cost",
-    "Position Cost",
-    "Position Value",
-    "Unrealized P/L",
-    "Unrealized P/L %",
-    "Data Provider",
-    "Last Updated (UTC)",
-    "Last Updated (Riyadh)",
-    "Warnings",
-    # v2.6.0 Insights group (Wave 3) -- produced by core.insights_builder v1.0.0
-    "Sector-Adj Score",
-    "Conviction Score",
-    "Top Factors",
-    "Top Risks",
+    "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country",
+    "Sector", "Industry", "Current Price", "Previous Close", "Open",
+    "Day High", "Day Low", "52W High", "52W Low", "Price Change",
+    "Percent Change", "52W Position %", "Volume", "Avg Volume 10D",
+    "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)", "P/E (TTM)",
+    "P/E (Forward)", "EPS (TTM)", "Dividend Yield", "Payout Ratio",
+    "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin", "Operating Margin",
+    "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)", "RSI (14)",
+    "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)",
+    "Sharpe (1Y)", "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA",
+    "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
+    "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
+    "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
+    "Forecast Confidence", "Confidence Score", "Confidence Bucket",
+    "Value Score", "Quality Score", "Momentum Score", "Growth Score",
+    "Overall Score", "Fundamental View", "Technical View", "Risk View",
+    "Value View", "Opportunity Score", "Rank (Overall)", "Recommendation",
+    "Recommendation Reason", "Horizon Days", "Invest Period Label",
+    "Position Qty", "Avg Cost", "Position Cost", "Position Value",
+    "Unrealized P/L", "Unrealized P/L %", "Data Provider",
+    "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    # v2.6.0 Insights group (Wave 3)
+    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
     "Position Size Hint",
 ]
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
-    "top10_rank",
-    "selection_reason",
-    "criteria_snapshot",
+    "top10_rank", "selection_reason", "criteria_snapshot",
 )
 TOP10_REQUIRED_HEADERS: Dict[str, str] = {
     "top10_rank": "Top10 Rank",
@@ -515,47 +288,11 @@ TOP10_REQUIRED_HEADERS: Dict[str, str] = {
     "criteria_snapshot": "Criteria Snapshot",
 }
 
-INSIGHTS_HEADERS: List[str] = [
-    "Section",
-    "Item",
-    "Metric",
-    "Value",
-    "Notes",
-    "Source",
-    "Sort Order",
-]
-INSIGHTS_KEYS: List[str] = [
-    "section",
-    "item",
-    "metric",
-    "value",
-    "notes",
-    "source",
-    "sort_order",
-]
+INSIGHTS_HEADERS: List[str] = ["Section", "Item", "Metric", "Value", "Notes", "Source", "Sort Order"]
+INSIGHTS_KEYS: List[str] = ["section", "item", "metric", "value", "notes", "source", "sort_order"]
 
-DATA_DICTIONARY_HEADERS: List[str] = [
-    "Sheet",
-    "Group",
-    "Header",
-    "Key",
-    "DType",
-    "Format",
-    "Required",
-    "Source",
-    "Notes",
-]
-DATA_DICTIONARY_KEYS: List[str] = [
-    "sheet",
-    "group",
-    "header",
-    "key",
-    "dtype",
-    "fmt",
-    "required",
-    "source",
-    "notes",
-]
+DATA_DICTIONARY_HEADERS: List[str] = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
+DATA_DICTIONARY_KEYS: List[str] = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
 
 STATIC_CANONICAL_SHEET_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
     "Market_Leaders": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
@@ -573,23 +310,14 @@ STATIC_CANONICAL_SHEET_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
 }
 
 INSTRUMENT_SHEETS: Set[str] = {
-    "Market_Leaders",
-    "Global_Markets",
-    "Commodities_FX",
-    "Mutual_Funds",
-    "My_Portfolio",
-    "My_Investments",
-    "Top_10_Investments",
+    "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
+    "My_Portfolio", "My_Investments", "Top_10_Investments",
 }
 SPECIAL_SHEETS: Set[str] = {"Insights_Analysis", "Data_Dictionary"}
 
 TOP10_ENGINE_DEFAULT_PAGES: List[str] = [
-    "Market_Leaders",
-    "Global_Markets",
-    "Commodities_FX",
-    "Mutual_Funds",
-    "My_Portfolio",
-    "My_Investments",
+    "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
+    "My_Portfolio", "My_Investments",
 ]
 
 EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
@@ -618,12 +346,8 @@ DEFAULT_GLOBAL_PROVIDERS = ["eodhd", "yahoo", "finnhub"]
 NON_KSA_EODHD_PRIMARY_PAGES = {"Global_Markets", "Commodities_FX", "Mutual_Funds"}
 PAGE_PRIMARY_PROVIDER_DEFAULTS = {page: "eodhd" for page in NON_KSA_EODHD_PRIMARY_PAGES}
 PROVIDER_PRIORITIES = {
-    "tadawul": 10,
-    "argaam": 20,
-    "eodhd": 30,
-    "yahoo": 40,
-    "finnhub": 50,
-    "yahoo_chart": 60,
+    "tadawul": 10, "argaam": 20, "eodhd": 30,
+    "yahoo": 40, "finnhub": 50, "yahoo_chart": 60,
 }
 
 
@@ -694,14 +418,7 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _as_pct_fraction(x: Any) -> Optional[float]:
-    """
-    Coerce a percent-like value into a FRACTION (0.05 = 5%).
-
-    Heuristic: any |x| > 1.5 is treated as percent-points and divided by 100.
-    Use this when a field's source units are unknown and the heuristic is safe.
-    For known-fraction fields (e.g. percent_change after eodhd v6.3.0), DO NOT
-    apply this — store the value verbatim.
-    """
+    """Coerce a percent-like value into a FRACTION (0.05 = 5%)."""
     v = _as_float(x)
     if v is None:
         return None
@@ -711,14 +428,7 @@ def _as_pct_fraction(x: Any) -> Optional[float]:
 
 
 def _as_pct_points(x: Any) -> Optional[float]:
-    """
-    Coerce a percent-like value into PERCENT POINTS (5.0 = 5%).
-
-    Inverse of _as_pct_fraction; multiplies sub-1.5 magnitudes by 100. Used
-    internally where downstream math expects percent-points (e.g. scoring
-    composites). Sheet display values must NOT pass through this helper —
-    the sheet's own *100 column format is the only display-side conversion.
-    """
+    """Coerce a percent-like value into PERCENT POINTS (5.0 = 5%)."""
     v = _as_float(x)
     if v is None:
         return None
@@ -884,17 +594,8 @@ def _extract_requested_symbols_from_body(body: Optional[Dict[str, Any]], limit: 
         return []
     raw: List[str] = []
     for key in (
-        "symbols",
-        "tickers",
-        "selected_symbols",
-        "direct_symbols",
-        "codes",
-        "watchlist",
-        "portfolio_symbols",
-        "symbol",
-        "ticker",
-        "code",
-        "requested_symbol",
+        "symbols", "tickers", "selected_symbols", "direct_symbols", "codes",
+        "watchlist", "portfolio_symbols", "symbol", "ticker", "code", "requested_symbol",
     ):
         raw.extend(_split_symbols(body.get(key)))
     criteria = body.get("criteria")
@@ -1014,10 +715,7 @@ def _normalize_route_call_inputs(
     )
 
     effective_limit = _safe_int(
-        merged_body.get("limit", limit),
-        default=limit,
-        lo=1,
-        hi=5000,
+        merged_body.get("limit", limit), default=limit, lo=1, hi=5000,
     )
     if effective_limit <= 0:
         effective_limit = max(1, min(5000, int(limit or 2000)))
@@ -1118,7 +816,6 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
         k = _safe_str(raw_keys[i]) if i < len(raw_keys) else ""
 
         if not h and not k:
-            # Drop fully blank pairs instead of fabricating ghost columns.
             continue
         if h and not k:
             k = _norm_key(h)
@@ -1282,12 +979,6 @@ def _rows_from_matrix_payload(matrix: Any, cols: Sequence[Any]) -> List[Dict[str
 
 
 def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
-    """
-    Prefer explicit dict-row collections first:
-    row_objects / records / items / data / quotes
-    Then accept rows if they are dict rows.
-    Finally fall back to matrix + keys or to explicit single row dicts.
-    """
     if out is None:
         return []
 
@@ -1540,12 +1231,8 @@ def _lookup_alias_value(src: Mapping[str, Any], flat: Mapping[str, Any], alias: 
     if not alias:
         return None
     candidates = [
-        alias,
-        alias.lower(),
-        _norm_key(alias),
-        _norm_key_loose(alias),
-        alias.replace("_", " "),
-        alias.replace("_", "-"),
+        alias, alias.lower(), _norm_key(alias), _norm_key_loose(alias),
+        alias.replace("_", " "), alias.replace("_", "-"),
     ]
     src_ci = {str(k).strip().lower(): v for k, v in src.items()}
     src_loose = {_norm_key_loose(k): v for k, v in src.items()}
@@ -1596,18 +1283,7 @@ def _infer_exchange_from_symbol(symbol: str) -> str:
 
 
 def _infer_currency_from_symbol(symbol: str) -> str:
-    """
-    Best-effort currency inference from symbol shape.
-
-    v5.47.4: delegates to `core.symbols.normalize.get_currency_from_symbol`
-    when available -- which knows 40+ markets including HK, CN, IN, AU, CA,
-    CH, KR, SG, ZA, AE, etc. Previously this function returned "USD" as a
-    blanket fallback for non-KSA / non-FX / non-Future symbols, so a UK
-    listing was tagged USD, a Hong Kong listing was tagged USD, etc.
-
-    If the helper import failed at module load, falls back to a local
-    suffix lookup that covers the same major markets.
-    """
+    """v5.47.4: delegates to core.symbols.normalize.get_currency_from_symbol when available."""
     s = normalize_symbol(symbol)
     if not s:
         return "USD"
@@ -1620,7 +1296,6 @@ def _infer_currency_from_symbol(symbol: str) -> str:
         except Exception:
             pass
 
-    # Local fallback path (only when the import isn't available)
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "SAR"
     if s.endswith("=X"):
@@ -1641,24 +1316,7 @@ def _infer_currency_from_symbol(symbol: str) -> str:
 
 
 def _infer_country_from_symbol(symbol: str) -> str:
-    """
-    Best-effort country inference from symbol shape.
-
-    v5.47.4 (AUDIT FIX): delegates to
-    `core.symbols.normalize.get_country_from_symbol` when available --
-    which knows 40+ markets and includes a per-index country override
-    table (^GSPC -> United States, ^FTSE -> United Kingdom,
-    ^N225 -> Japan, ^TASI -> Saudi Arabia, ...).
-
-    Previously this function only handled `.SR` and `=X` / `=F` and fell
-    back to "USA" for everything else, so BARC.L (London), SAP.DE
-    (Frankfurt), 7203.T (Tokyo), 0700.HK, RELIANCE.NS, BHP.AX, etc. were
-    all silently tagged American. That bug is the proximate cause of the
-    audit's "country=USA for .L/.DE/.SR" finding.
-
-    If the helper import failed at module load, falls back to a local
-    suffix lookup covering the same major markets.
-    """
+    """v5.47.4 (AUDIT FIX): delegates to core.symbols.normalize.get_country_from_symbol when available."""
     s = normalize_symbol(symbol)
     if not s:
         return ""
@@ -1671,7 +1329,6 @@ def _infer_country_from_symbol(symbol: str) -> str:
         except Exception:
             pass
 
-    # Local fallback path (only when the import isn't available)
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "Saudi Arabia"
     if s.endswith("=X") or s.endswith("=F"):
@@ -1681,7 +1338,6 @@ def _infer_country_from_symbol(symbol: str) -> str:
         country = _FALLBACK_COUNTRY_BY_SUFFIX.get(suffix)
         if country:
             return country
-    # Plain alphabetic short ticker -> US heuristic (mirrors normalize.py)
     if s.isalpha() and 1 <= len(s) <= 5:
         return "United States"
     return ""
@@ -1789,17 +1445,7 @@ def _coerce_datetime_like(value: Any) -> Optional[str]:
 
 
 def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", normalized_symbol: str = "", provider: str = "") -> Dict[str, Any]:
-    """
-    Normalize a provider patch into the canonical engine row shape.
-
-    v5.47.3 fix: percent-fraction fields are stored as FRACTIONS, never
-    pre-multiplied by 100. Three sites changed:
-      - percent_change       (fraction; was pre-multiplied via abs<=1.5 path)
-      - week_52_position_pct (fraction; was multiplied by 100 unconditionally)
-      - unrealized_pl_pct    (fraction; was multiplied by 100 unconditionally)
-    The downstream sheet display layer applies its own *100 percent format,
-    so the engine MUST keep the fraction representation intact.
-    """
+    """v5.47.3: percent-fraction fields stored as FRACTIONS, never pre-multiplied by 100."""
     src = dict(row or {})
     flat = _flatten_scalar_fields(src)
     symbol = normalized_symbol or normalize_symbol(_safe_str(_lookup_alias_value(src, flat, "symbol") or requested_symbol))
@@ -1858,11 +1504,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if change is None and price is not None and prev is not None:
         change = price - prev
         out["price_change"] = round(change, 6)
-    # v5.47.3: store percent_change as a FRACTION (e.g. -0.0056 for -0.56%).
-    # If percent_change is missing, derive it as a fraction. If it's already
-    # present as a percent-points value (|x|>1.5), normalise it to fraction.
-    # Do NOT multiply small (already-fraction) values by 100 — that was the
-    # bug that turned NVDA -0.56% into -56% via the downstream *100 step.
+    # v5.47.3: store percent_change as a FRACTION
     if pct is None and price is not None and prev not in (None, 0):
         pct = (price - prev) / prev
         out["percent_change"] = round(pct, 8)
@@ -1871,9 +1513,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
-    # v5.47.3: store week_52_position_pct as a FRACTION (e.g. 0.62 = 62% of
-    # the way from the 52w low to the 52w high). Was multiplied by 100 here,
-    # which after the sheet's *100 column format produced "6,200%" anomalies.
+    # v5.47.3: store week_52_position_pct as a FRACTION
     if price is not None and high52 is not None and low52 is not None and high52 > low52 and out.get("week_52_position_pct") is None:
         out["week_52_position_pct"] = round((price - low52) / (high52 - low52), 6)
 
@@ -1888,7 +1528,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if pos_val is not None and pos_cost is not None and out.get("unrealized_pl") is None:
         out["unrealized_pl"] = round(pos_val - pos_cost, 6)
     upl = _as_float(out.get("unrealized_pl"))
-    # v5.47.3: store unrealized_pl_pct as a FRACTION. Was *100 here.
+    # v5.47.3: store unrealized_pl_pct as a FRACTION
     if upl is not None and pos_cost not in (None, 0) and out.get("unrealized_pl_pct") is None:
         out["unrealized_pl_pct"] = round(upl / pos_cost, 6)
 
@@ -1900,7 +1540,12 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
 
 
 def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
-    src = _canonicalize_provider_row(dict(row or {}), requested_symbol=_safe_str((row or {}).get("requested_symbol")), normalized_symbol=normalize_symbol(_safe_str((row or {}).get("symbol") or (row or {}).get("ticker"))), provider=_safe_str((row or {}).get("data_provider") or (row or {}).get("provider")))
+    src = _canonicalize_provider_row(
+        dict(row or {}),
+        requested_symbol=_safe_str((row or {}).get("requested_symbol")),
+        normalized_symbol=normalize_symbol(_safe_str((row or {}).get("symbol") or (row or {}).get("ticker"))),
+        provider=_safe_str((row or {}).get("data_provider") or (row or {}).get("provider")),
+    )
     flat = _flatten_scalar_fields(src)
 
     out: Dict[str, Any] = {}
@@ -2165,12 +1810,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
 
 
 def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
-    """
-    Derive the four view-column verdicts from existing per-row scores.
-    Each view returns "N/A" when its inputs are entirely absent.
-
-    Returns (fundamental_view, technical_view, risk_view, value_view).
-    """
+    """Derive the four view-column verdicts from existing per-row scores."""
     quality = _as_float(row.get("quality_score"))
     growth = _as_float(row.get("growth_score"))
     momentum = _as_float(row.get("momentum_score"))
@@ -2251,10 +1891,7 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
 
 
 def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
-    """
-    Backfill `intrinsic_value` and `upside_pct` when the upstream provider
-    did not supply them. Idempotent: never overwrites a real upstream value.
-    """
+    """Backfill intrinsic_value and upside_pct when upstream provider did not supply them."""
     price = _as_float(row.get("current_price"))
     if price is None or price <= 0:
         return
@@ -2307,6 +1944,22 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
 def _compute_recommendation(row: Dict[str, Any]) -> None:
     """
     Populate recommendation, recommendation_reason, AND the four view columns.
+
+    v5.49.1 (Wave 2B): canonical 5-tier mapping per core.reco_normalize v7.0.0+
+    and schemas.Recommendation enum. Output is one of:
+        STRONG_BUY | BUY | HOLD | REDUCE | SELL
+
+    Tier boundaries:
+        overall >= 80 and conf >= 70 and risk <= 55  -> STRONG_BUY
+        overall >= 70 and conf >= 60 and risk <= 65  -> BUY
+        overall >= 55 and conf >= 50                 -> BUY  (was ACCUMULATE)
+        overall <= 20 and risk >= 80                 -> SELL
+        overall <= 35 or  risk >= 85                 -> REDUCE
+        otherwise                                     -> HOLD
+
+    This branch only fires when no upstream `recommendation` value is
+    already present on the row. Production rows that flow through
+    core.scoring -> core.reco_normalize skip this branch entirely.
     """
     _compute_intrinsic_and_upside(row)
 
@@ -2323,10 +1976,19 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     if row.get("recommendation"):
         return
 
-    if overall >= 75 and conf >= 65 and risk <= 60:
+    # Canonical 5-tier mapping per core.reco_normalize v7.0.0+ /
+    # schemas.Recommendation. Order matters: most-restrictive first.
+    if overall >= 80 and conf >= 70 and risk <= 55:
+        rec = "STRONG_BUY"
+    elif overall >= 70 and conf >= 60 and risk <= 65:
         rec = "BUY"
-    elif overall >= 60 and conf >= 55:
-        rec = "ACCUMULATE"
+    elif overall >= 55 and conf >= 50:
+        # Was ACCUMULATE in v5.49.0 and earlier; folded into BUY in v5.49.1
+        # to align with the canonical 5-tier enum. Semantic intent (positive
+        # but lower-conviction signal) is preserved by the BUY token.
+        rec = "BUY"
+    elif overall <= 20 and risk >= 80:
+        rec = "SELL"
     elif overall <= 35 or risk >= 85:
         rec = "REDUCE"
     else:
@@ -3156,7 +2818,6 @@ class DataEngineV5:
         ksa_flag = "ksa" if is_ksa else "global"
         return f"{ctx}|{primary}|{ksa_flag}"
 
-
     # --- single quote pipeline --------------------------------------------
     async def _fetch_patch(self, provider_name: str, symbol: str) -> Optional[Dict[str, Any]]:
         provider_mod = await self.providers.get_provider(provider_name)
@@ -3312,8 +2973,6 @@ class DataEngineV5:
             out["week_52_low"] = min(closes)
 
         # v5.47.3: store these as FRACTIONS (not percent points).
-        # The downstream sheet display layer applies its own *100 step;
-        # multiplying here as well produced 100x-too-large output.
         if first_close not in (None, 0):
             out["percent_change"] = (last_close - first_close) / first_close
         if out["week_52_high"] not in (None, 0) and out["week_52_high"] > out["week_52_low"]:
@@ -3345,8 +3004,7 @@ class DataEngineV5:
                     dd = (c - running_max) / running_max
                     if dd < max_dd:
                         max_dd = dd
-            # v5.47.3: store as FRACTION (e.g. -0.27 for -27% drawdown).
-            # The downstream sheet display layer applies its own *100 step.
+            # v5.47.3: store as FRACTION
             out["max_drawdown_1y"] = max_dd
         if len(closes) >= 60:
             returns_60 = [
@@ -3354,8 +3012,7 @@ class DataEngineV5:
             ]
             q5 = self._quantile(returns_60, 0.05)
             if q5 is not None:
-                # v5.47.3: store VaR_95 as FRACTION. The downstream sheet
-                # display layer applies its own *100 step.
+                # v5.47.3: store as FRACTION
                 out["var_95_1d"] = abs(q5)
         return out
 
@@ -3530,7 +3187,6 @@ class DataEngineV5:
 
     async def _build_insights_rows_fallback(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-        market_summary: List[str] = []
         risk_summary = {"LOW": 0, "MODERATE": 0, "HIGH": 0}
         leaderboard: List[Tuple[str, float]] = []
         portfolio_value = 0.0
@@ -3792,10 +3448,7 @@ class DataEngineV5:
 # Top-level helpers
 # =============================================================================
 def normalize_row_to_schema(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Project an arbitrary row dict onto the canonical schema for a given sheet.
-    Exported for use by routes that need pre-projection without engine state.
-    """
+    """Project an arbitrary row dict onto the canonical schema for a given sheet."""
     canon = _canonicalize_sheet_name(sheet)
     _, headers, keys, _ = _schema_for_sheet(canon)
     backfilled = _apply_page_row_backfill(canon, dict(row or {}))
