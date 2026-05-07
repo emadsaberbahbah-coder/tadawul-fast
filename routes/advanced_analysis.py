@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.3.0  (V2.7.0-ALIGNED / 97-COL / v5.50.0)
+Advanced Analysis Root Owner — v4.3.1  (V2.7.0-ALIGNED / 97-COL / v5.50.0)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
@@ -16,6 +16,67 @@ Owns the canonical root paths:
 - /schema/pages
 - /schema/data-dictionary
 and their /v1/schema aliases.
+
+Why v4.3.1 — v5.50.0 binding pattern corrected
+----------------------------------------------
+
+v4.3.0 inverted the engine import preference (v2 first, legacy fallback) but
+attempted the import as `from core.data_engine_v2 import get_sheet_rows`.
+The deploy log immediately revealed the issue:
+
+  WARNING | routes.advanced_analysis | [advanced_analysis v4.3.0]
+  core.data_engine_v2 unavailable (cannot import name 'get_sheet_rows'
+  from 'core.data_engine_v2'); falling back to legacy core.data_engine
+
+Inspection of `core/data_engine_v2.py` confirmed: `get_sheet_rows` is an
+ASYNC METHOD on the `DataEngineV5` class, not a module-level function.
+The module's `__all__` exports `DataEngineV5`, `get_engine` (async factory),
+`get_engine_if_ready` (sync factory), and supporting constants — but NOT
+`get_sheet_rows` itself. The startup log corroborates: `engine_source:
+core.data_engine_v2` and `engine_ready: true`, so the v2 engine IS deployed
+and live; only the route's binding pattern was wrong.
+
+v4.3.1 changes (from v4.3.0)
+----------------------------
+- FIX [CRITICAL]: engine binding now uses `get_engine()` async factory
+    instead of trying to import a non-existent module-level `get_sheet_rows`.
+    A small adapter coroutine retrieves the engine and calls its async
+    `.get_sheet_rows()` method, keeping the existing
+    `_call_core_sheet_rows_best_effort` candidate-signature loop unchanged.
+
+- ADD: cascading binding probe with explicit logging at each step:
+    1. Try `from core.data_engine_v2 import get_sheet_rows` (top-level fn,
+       in case a future v2 build adds it). Logs INFO if bound.
+    2. Try `from core.data_engine_v2 import get_engine` (async factory) and
+       wrap. Logs INFO if bound — this is the expected production path.
+    3. Try `from core.data_engine_v2 import get_engine_if_ready` (sync
+       factory) with async-factory fallback for cold starts. Logs INFO if
+       bound. Belt-and-suspenders against the rare race where v2 module
+       imported but engine instance not yet warmed.
+    4. Fall back to `from core.data_engine import get_sheet_rows` (legacy).
+       Logs WARNING — this branch loses v5.50.0 enrichment.
+    5. All four failed: log ERROR. `core_get_sheet_rows is None`.
+
+- KEEP: `CORE_GET_SHEET_ROWS_SOURCE` reflects the actual binding chosen.
+    Production responses' `meta.source` will now read one of:
+      * `core.data_engine_v2.get_sheet_rows` (top-level — unlikely)
+      * `core.data_engine_v2.get_engine().get_sheet_rows` (expected)
+      * `core.data_engine_v2.get_engine_if_ready().get_sheet_rows`
+      * `core.data_engine.get_sheet_rows` (legacy fallback — bug indicator)
+
+- KEEP: every other v4.3.0 change preserved unchanged. 97-col canonical
+    fallback, `_EXPECTED_SHEET_LENGTHS` 97/100, all v4.2.0/v4.1.0 fixes.
+
+Production verification after v4.3.1 deploy
+-------------------------------------------
+After Render redeploy, the startup log should now show:
+
+  INFO | routes.advanced_analysis | [advanced_analysis v4.3.1]
+  engine bound via core.data_engine_v2.get_engine() (async factory)
+
+And NOT show the v4.3.0 warning about `cannot import name 'get_sheet_rows'`.
+Then hit `/v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1` and verify
+the same 7 conditions documented in the v4.3.0 narrative below.
 
 Why v4.3.0 — v5.50.0 ROUTING FIX (engine bypass corrected)
 ----------------------------------------------------------
@@ -186,7 +247,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.3.0"
+ADVANCED_ANALYSIS_VERSION = "4.3.1"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -260,53 +321,116 @@ except Exception:
         return None
 
 # =============================================================================
-# v4.3.0 CRITICAL FIX: engine import preference INVERTED.
+# v4.3.1 CRITICAL FIX: engine binding now uses get_engine() async factory.
 #
-# v4.2.0 tried `core.data_engine` (LEGACY) first, falling back to
-# `core.data_engine_v2` only if legacy import failed. Since legacy always
-# imports successfully (it exists in every deploy), the v5.50.0 engine
-# was never reached, and Views / Insights / Candlesticks / recommendation_reason
-# were never computed even though the schema correctly listed those keys.
+# v4.3.0 tried `from core.data_engine_v2 import get_sheet_rows` directly,
+# but `get_sheet_rows` is an async METHOD on the DataEngineV5 class, not a
+# module-level function. The v2 module's __all__ exports the engine class,
+# `get_engine`, `get_engine_if_ready`, and supporting constants — but no
+# top-level `get_sheet_rows`. v4.3.0's import therefore raised ImportError
+# and the route fell through to the legacy adapter.
 #
-# v4.3.0 tries `core.data_engine_v2` FIRST. The v5.50.0 engine's
-# get_sheet_rows() runs the full enrichment pipeline (Insights builder,
-# Views computer, Candlestick detector, recommendation_reason synth).
-# Falling back to the legacy adapter only when v2 is genuinely unavailable
-# preserves backward compatibility for any deploy that has not yet shipped
-# v5.50.0.
+# v4.3.1 cascades through binding patterns in order of preference:
+#   1. top-level `get_sheet_rows` from v2 (in case a future build adds it)
+#   2. `get_engine()` async factory + adapter coroutine — EXPECTED PATH
+#   3. `get_engine_if_ready()` sync factory + adapter coroutine
+#   4. legacy `core.data_engine.get_sheet_rows` — bug indicator if reached
 #
-# We log the binding choice on import so /meta and startup logs make the
-# selection auditable. The meta.source field on every response confirms
-# which engine actually served the call.
+# Every step logs explicitly. The chosen binding is reflected in
+# CORE_GET_SHEET_ROWS_SOURCE and surfaces in every response's meta.source
+# field, making the live binding trivially observable from production.
 # =============================================================================
 CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
 core_get_sheet_rows = None  # type: ignore[assignment]
 
+# Pattern 1: top-level function on v2 (may not exist; still try first)
 try:
     from core.data_engine_v2 import get_sheet_rows as core_get_sheet_rows  # type: ignore
     CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_sheet_rows"
     logger.info(
-        "[advanced_analysis v%s] engine bound to core.data_engine_v2 (preferred)",
+        "[advanced_analysis v%s] engine bound to core.data_engine_v2.get_sheet_rows (top-level fn)",
         ADVANCED_ANALYSIS_VERSION,
     )
-except Exception as _v2_err:
-    logger.warning(
-        "[advanced_analysis v%s] core.data_engine_v2 unavailable (%s); falling back to legacy core.data_engine",
-        ADVANCED_ANALYSIS_VERSION,
-        _v2_err,
+except Exception as _v2_topfn_err:
+    logger.info(
+        "[advanced_analysis v%s] core.data_engine_v2.get_sheet_rows top-level not present (%s); trying engine factory",
+        ADVANCED_ANALYSIS_VERSION, _v2_topfn_err,
     )
+
+# Pattern 2: get_engine() async factory + .get_sheet_rows() method (expected path)
+if core_get_sheet_rows is None:
+    try:
+        from core.data_engine_v2 import get_engine as _v2_get_engine  # type: ignore
+
+        async def _v2_engine_factory_adapter(*args: Any, **kwargs: Any) -> Any:
+            """v4.3.1: Adapter that calls the v5.50.0 engine via get_engine() factory.
+
+            The factory is async; the engine method is async; we await both.
+            Signature is **args, **kwargs so it remains compatible with the
+            existing _call_core_sheet_rows_best_effort candidate-signature loop.
+            """
+            engine = await _v2_get_engine()
+            return await engine.get_sheet_rows(*args, **kwargs)
+
+        core_get_sheet_rows = _v2_engine_factory_adapter  # type: ignore[assignment]
+        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_engine().get_sheet_rows"
+        logger.info(
+            "[advanced_analysis v%s] engine bound via core.data_engine_v2.get_engine() (async factory)",
+            ADVANCED_ANALYSIS_VERSION,
+        )
+    except Exception as _v2_factory_err:
+        logger.info(
+            "[advanced_analysis v%s] core.data_engine_v2.get_engine() unavailable (%s); trying ready-engine factory",
+            ADVANCED_ANALYSIS_VERSION, _v2_factory_err,
+        )
+
+# Pattern 3: get_engine_if_ready() sync factory with async-factory fallback
+if core_get_sheet_rows is None:
+    try:
+        from core.data_engine_v2 import get_engine_if_ready as _v2_get_engine_if_ready  # type: ignore
+
+        async def _v2_engine_ready_adapter(*args: Any, **kwargs: Any) -> Any:
+            """v4.3.1: Adapter using sync get_engine_if_ready() with cold-start fallback."""
+            engine = _v2_get_engine_if_ready()
+            if engine is None:
+                # Cold-start race: ready-check returned None, fall back to async factory
+                try:
+                    from core.data_engine_v2 import get_engine as _v2_async_factory  # type: ignore
+                    engine = await _v2_async_factory()
+                except Exception as inner_err:
+                    raise RuntimeError(
+                        "v2 engine not ready and async factory unavailable: " + repr(inner_err)
+                    ) from inner_err
+            return await engine.get_sheet_rows(*args, **kwargs)
+
+        core_get_sheet_rows = _v2_engine_ready_adapter  # type: ignore[assignment]
+        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_engine_if_ready().get_sheet_rows"
+        logger.info(
+            "[advanced_analysis v%s] engine bound via core.data_engine_v2.get_engine_if_ready() (sync factory)",
+            ADVANCED_ANALYSIS_VERSION,
+        )
+    except Exception as _v2_ready_err:
+        logger.info(
+            "[advanced_analysis v%s] core.data_engine_v2.get_engine_if_ready() unavailable (%s); trying legacy fallback",
+            ADVANCED_ANALYSIS_VERSION, _v2_ready_err,
+        )
+
+# Pattern 4: legacy fallback (bug indicator if reached — loses v5.50.0 enrichment)
+if core_get_sheet_rows is None:
     try:
         from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
         CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine.get_sheet_rows"
-        logger.info(
-            "[advanced_analysis v%s] engine bound to core.data_engine (legacy fallback)",
+        logger.warning(
+            "[advanced_analysis v%s] all v2 binding patterns failed; falling back to legacy core.data_engine "
+            "(this loses v5.50.0 enrichment — investigate v2 exports)",
             ADVANCED_ANALYSIS_VERSION,
         )
     except Exception as _legacy_err:
         core_get_sheet_rows = None  # type: ignore
+        CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
         logger.error(
-            "[advanced_analysis v%s] BOTH engines unavailable: v2_err=%r legacy_err=%r",
-            ADVANCED_ANALYSIS_VERSION, _v2_err, _legacy_err,
+            "[advanced_analysis v%s] BOTH v2 and legacy unavailable: legacy_err=%r",
+            ADVANCED_ANALYSIS_VERSION, _legacy_err,
         )
 
 # v4.3.0: 97-column canonical contract (was 90 in v4.2.0, 85 in v4.1.0,
