@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.2.0  (V2.6.0-ALIGNED / 90-COL / WAVE 3)
+Advanced Analysis Root Owner — v4.3.0  (V2.7.0-ALIGNED / 97-COL / v5.50.0)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
@@ -17,16 +17,105 @@ Owns the canonical root paths:
 - /schema/data-dictionary
 and their /v1/schema aliases.
 
-v4.2.0 changes (from v4.1.0) — Wave 3
--------------------------------------
+Why v4.3.0 — v5.50.0 ROUTING FIX (engine bypass corrected)
+----------------------------------------------------------
+
+Critical observation that motivated this revision:
+
+After deploying v5.50.0 (`core/data_engine_v2`) and registry v2.7.0 (97
+canonical columns), production responses on /v1/advanced/sheet-rows showed:
+
+  * Schema correct: 97 keys returned including all 7 new fields ✓
+  * `recommendation` populated, `recommendation_detailed` populated,
+    `recommendation_priority` populated ✓
+  * `fundamental_view`, `technical_view`, `risk_view`, `value_view` ALL NULL ✗
+  * `sector_relative_score`, `conviction_score`, `top_factors`, `top_risks`,
+    `position_size_hint` ALL NULL ✗
+  * `candlestick_pattern`, `candlestick_signal`, `candlestick_strength`,
+    `candlestick_confidence`, `candlestick_patterns_recent` ALL NULL ✗
+  * `recommendation_reason` NULL ✗
+  * Response meta: `"source": "core.data_engine.get_sheet_rows"`
+
+The meta key "source" pinpoints the bug: this route was importing the LEGACY
+`core.data_engine` adapter ahead of `core.data_engine_v2`. The legacy module
+in turn delegates to v2 internally, but its schema-projection layer
+(`_normalize_sheet_payload` → `_project_row`) only forwards keys that the
+LIVE schema_registry exposes, which works for the 97 keys themselves but
+DOES NOT trigger the v2 engine's full enrichment pipeline (Insights builder,
+Views computer, Candlestick detector, recommendation_reason synthesizer).
+
+v4.3.0 changes (from v4.2.0)
+----------------------------
+- FIX [CRITICAL]: engine import preference INVERTED. v4.2.0 tried
+    `core.data_engine` (legacy) FIRST and only fell back to
+    `core.data_engine_v2` if legacy import failed. Since legacy always
+    imports successfully, v2 was never reached. v4.3.0 tries
+    `core.data_engine_v2` FIRST. If v2 is unavailable, falls back to legacy.
+    This routes calls through the v5.50.0 enrichment pipeline so that
+    Views, Insights, Candlesticks, and recommendation_reason populate.
+
+    Logging on import is now explicit so /meta and startup logs make the
+    binding choice obvious. CORE_GET_SHEET_ROWS_SOURCE will read
+    "core.data_engine_v2.get_sheet_rows" in production after this deploy
+    (verifiable in the response.meta.source field).
+
+- BUMP [HIGH]: static fallback contract widened from 90 → 97 columns to
+    align with `core.sheets.schema_registry` v2.7.0. Adds the 7 v5.50.0
+    columns at canonical positions:
+      * positions 91-92 (after position_size_hint):
+          - `recommendation_detailed` ("Recommendation Detail")
+          - `recommendation_priority` ("Reco Priority")
+      * positions 93-97 (end of canonical):
+          - `candlestick_pattern`         ("Candle Pattern")
+          - `candlestick_signal`          ("Candle Signal")
+          - `candlestick_strength`        ("Candle Strength")
+          - `candlestick_confidence`      ("Candle Confidence")
+          - `candlestick_patterns_recent` ("Recent Patterns (5D)")
+    Adding them after position_size_hint preserves all existing positional
+    indices below 91 — purely additive, no key reordering.
+
+- BUMP: `_EXPECTED_SHEET_LENGTHS` instrument 90 → 97, Top10 93 → 100.
+- BUMP: `_static_contract` instrument padding 90 → 97.
+- BUMP: `_ensure_top10_contract` padding 93 → 100.
+- BUMP: `_expected_len` default 90 → 97.
+
+- KEEP: every v4.2.0 fix preserved unchanged. The 5 Insights group columns
+    (sector_relative_score, conviction_score, top_factors, top_risks,
+    position_size_hint) keep their canonical positions 86-90. The 4 view
+    columns (fundamental_view, technical_view, risk_view, value_view)
+    keep their canonical positions between rank_overall and recommendation.
+
+- KEEP: every v4.1.0 fix preserved unchanged. Conservative placeholders,
+    `_strip_internal_fields()`, "warn" status handling — all intact.
+
+Production verification after deploy
+------------------------------------
+Hit `/v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1` and inspect the
+response. The following MUST hold for v4.3.0 to be considered successful:
+
+  1. `meta.source == "core.data_engine_v2.get_sheet_rows"`
+  2. `recommendation_detailed` non-null (e.g. "HOLD")
+  3. `recommendation_priority` non-null (e.g. 8)
+  4. `fundamental_view` / `technical_view` / `risk_view` / `value_view`
+     all non-null on at least 80% of rows
+  5. `recommendation_reason` non-null on rows that have a recommendation
+  6. `sector_relative_score` / `conviction_score` non-null on enriched rows
+  7. `candlestick_signal` non-null on at least 80% of rows
+     (some symbols may have insufficient history → null is acceptable)
+
+If condition 1 holds but 2-7 fail, the route fix is correct but the v5.50.0
+engine is broken. If condition 1 fails, the v2 engine is not deployed.
+
+v4.2.0 changes (from v4.1.0) — Wave 3 — preserved
+-------------------------------------------------
 - BUMP: static fallback contract widened from 85 → 90 columns to align with
     `core.sheets.schema_registry` v2.6.0 (Wave 1). Appends the 5 Insights
     group columns at the END of the canonical schema (positions 86-90):
-      • `sector_relative_score` ("Sector-Adj Score")
-      • `conviction_score`      ("Conviction Score")
-      • `top_factors`           ("Top Factors")
-      • `top_risks`             ("Top Risks")
-      • `position_size_hint`    ("Position Size Hint")
+      * `sector_relative_score` ("Sector-Adj Score")
+      * `conviction_score`      ("Conviction Score")
+      * `top_factors`           ("Top Factors")
+      * `top_risks`             ("Top Risks")
+      * `position_size_hint`    ("Position Size Hint")
     All 5 are produced by `core.insights_builder` v1.0.0. Adding them at
     the END preserves all existing positional indices — purely additive.
 - BUMP: `_EXPECTED_SHEET_LENGTHS` instrument 85 → 90, Top10 88 → 93.
@@ -45,7 +134,7 @@ v4.1.0 changes (from v4.0.0) — preserved
     (registry v2.4.0 added this column; we were the last sibling not to ship
     it). _EXPECTED_SHEET_LENGTHS bumped to 85/88. Production registry-first
     path was unaffected — this only mattered when registry import failed.
-    [v4.2.0 supersedes the 85/88 numbers — see top of this docstring.]
+    [v4.2.0 superseded the 85/88 numbers; v4.3.0 supersedes again to 97/100.]
 - FIX [HIGH]: `_placeholder_value_for_key` no longer fabricates numeric
     values. Previously returned `recommendation="Accumulate"`,
     `expected_roi_3m=12.5%`, `forecast_confidence=99`, etc. for symbols
@@ -58,9 +147,9 @@ v4.1.0 changes (from v4.0.0) — preserved
 - ADD: `_strip_internal_fields()` defensive helper. Removes engine internal
     coordination flags (`_skip_recommendation_synthesis`, `_internal_*`,
     `_meta_*`, `_debug_*`, `_trace_*`, plus the explicit hard-strip set).
-    Engine v5.47.4 strips these at source; this is defence-in-depth for
+    Engine v5.47.4+ strips these at source; this is defence-in-depth for
     legacy / proxy / cached rows.
-- ADD: `status: "warn"` from engine v5.47.4 is treated as success-with-caveat
+- ADD: `status: "warn"` from engine v5.47.4+ is treated as success-with-caveat
     when rows are present (matching the rest of the route family).
 
 Why this revision (preserved from v4.0.0)
@@ -97,7 +186,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.2.0"
+ADVANCED_ANALYSIS_VERSION = "4.3.0"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -105,14 +194,16 @@ _INSIGHTS_PAGE = "Insights_Analysis"
 _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
+# v4.3.0: bumped from 90/93 to 97/100 to align with registry v2.7.0
+# (97 cols = 90 base + 2 Decision Matrix + 5 Candlestick).
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 90,
-    "Global_Markets": 90,
-    "Commodities_FX": 90,
-    "Mutual_Funds": 90,
-    "My_Portfolio": 90,
-    "My_Investments": 90,
-    _TOP10_PAGE: 93,
+    "Market_Leaders": 97,
+    "Global_Markets": 97,
+    "Commodities_FX": 97,
+    "Mutual_Funds": 97,
+    "My_Portfolio": 97,
+    "My_Investments": 97,
+    _TOP10_PAGE: 100,
     _INSIGHTS_PAGE: 7,
     _DICTIONARY_PAGE: 9,
 }
@@ -168,17 +259,71 @@ except Exception:
     def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
 
+# =============================================================================
+# v4.3.0 CRITICAL FIX: engine import preference INVERTED.
+#
+# v4.2.0 tried `core.data_engine` (LEGACY) first, falling back to
+# `core.data_engine_v2` only if legacy import failed. Since legacy always
+# imports successfully (it exists in every deploy), the v5.50.0 engine
+# was never reached, and Views / Insights / Candlesticks / recommendation_reason
+# were never computed even though the schema correctly listed those keys.
+#
+# v4.3.0 tries `core.data_engine_v2` FIRST. The v5.50.0 engine's
+# get_sheet_rows() runs the full enrichment pipeline (Insights builder,
+# Views computer, Candlestick detector, recommendation_reason synth).
+# Falling back to the legacy adapter only when v2 is genuinely unavailable
+# preserves backward compatibility for any deploy that has not yet shipped
+# v5.50.0.
+#
+# We log the binding choice on import so /meta and startup logs make the
+# selection auditable. The meta.source field on every response confirms
+# which engine actually served the call.
+# =============================================================================
 CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
-try:
-    from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
-    CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine.get_sheet_rows"
-except Exception:
-    try:
-        from core.data_engine_v2 import get_sheet_rows as core_get_sheet_rows  # type: ignore
-        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_sheet_rows"
-    except Exception:
-        core_get_sheet_rows = None  # type: ignore
+core_get_sheet_rows = None  # type: ignore[assignment]
 
+try:
+    from core.data_engine_v2 import get_sheet_rows as core_get_sheet_rows  # type: ignore
+    CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_sheet_rows"
+    logger.info(
+        "[advanced_analysis v%s] engine bound to core.data_engine_v2 (preferred)",
+        ADVANCED_ANALYSIS_VERSION,
+    )
+except Exception as _v2_err:
+    logger.warning(
+        "[advanced_analysis v%s] core.data_engine_v2 unavailable (%s); falling back to legacy core.data_engine",
+        ADVANCED_ANALYSIS_VERSION,
+        _v2_err,
+    )
+    try:
+        from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
+        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine.get_sheet_rows"
+        logger.info(
+            "[advanced_analysis v%s] engine bound to core.data_engine (legacy fallback)",
+            ADVANCED_ANALYSIS_VERSION,
+        )
+    except Exception as _legacy_err:
+        core_get_sheet_rows = None  # type: ignore
+        logger.error(
+            "[advanced_analysis v%s] BOTH engines unavailable: v2_err=%r legacy_err=%r",
+            ADVANCED_ANALYSIS_VERSION, _v2_err, _legacy_err,
+        )
+
+# v4.3.0: 97-column canonical contract (was 90 in v4.2.0, 85 in v4.1.0,
+# 80 in v4.0.0). Aligned with registry v2.7.0 / engine v5.50.0.
+#
+# Layout (1-indexed positions, all 97 columns):
+#   1-50  identity, prices, volume, fundamentals, risk metrics, valuation
+#   51-65 forecasts, ROIs, scores
+#   66-72 view tokens (4) + recommendation block start
+#   73-85 horizon, position, last-updated, warnings
+#   86-90 Wave 3 Insights (sector_relative_score..position_size_hint)
+#   91-92 v5.50.0 Decision Matrix (recommendation_detailed, recommendation_priority)
+#   93-97 v5.50.0 Candlestick (pattern, signal, strength, confidence, patterns_recent)
+#
+# IMPORTANT: name `_CANONICAL_80_HEADERS` is historical (started at 80
+# columns). Do not rename — kept for stable diff/grep-ability across
+# v4.0.0 → v4.3.0 history.
 _CANONICAL_80_HEADERS: List[str] = [
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
     "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
@@ -199,6 +344,11 @@ _CANONICAL_80_HEADERS: List[str] = [
     "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
+    # v4.3.0: v5.50.0 Decision Matrix columns
+    "Recommendation Detail", "Reco Priority",
+    # v4.3.0: v5.50.0 Candlestick columns
+    "Candle Pattern", "Candle Signal", "Candle Strength", "Candle Confidence",
+    "Recent Patterns (5D)",
 ]
 _CANONICAL_80_KEYS: List[str] = [
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
@@ -219,6 +369,11 @@ _CANONICAL_80_KEYS: List[str] = [
     "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
     "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
+    # v4.3.0: v5.50.0 Decision Matrix keys
+    "recommendation_detailed", "recommendation_priority",
+    # v4.3.0: v5.50.0 Candlestick keys
+    "candlestick_pattern", "candlestick_signal", "candlestick_strength", "candlestick_confidence",
+    "candlestick_patterns_recent",
 ]
 _INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
 _INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
@@ -249,6 +404,17 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "criteria_snapshot": ["criteria", "snapshot", "criteria_json"],
     # v4.1.0: engine v5.47.4 mirrors upside_pct
     "upside_pct": ["upsidePct", "upside_percent", "intrinsic_upside"],
+    # v4.3.0: v5.50.0 Decision Matrix aliases (engine may emit either form)
+    "recommendation_detailed": ["recommendationDetailed", "recommendation_detail",
+                                "reco_detailed", "reco_detail"],
+    "recommendation_priority": ["recommendationPriority", "reco_priority", "reco_pri"],
+    # v4.3.0: v5.50.0 Candlestick aliases
+    "candlestick_pattern": ["candle_pattern", "candlestickPattern"],
+    "candlestick_signal": ["candle_signal", "candlestickSignal"],
+    "candlestick_strength": ["candle_strength", "candlestickStrength"],
+    "candlestick_confidence": ["candle_confidence", "candlestickConfidence"],
+    "candlestick_patterns_recent": ["candle_patterns_recent", "candlestickPatternsRecent",
+                                    "recent_patterns_5d"],
 }
 
 # v4.1.0: internal-field stripping — same set as enriched_quote v4.2.0 /
@@ -600,12 +766,13 @@ def _pad_contract(headers: Sequence[str], keys: Sequence[str], expected_len: int
     return hdrs[:expected_len], ks[:expected_len]
 
 def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+    # v4.3.0: Top10 padding 93 → 100 (97 base + 3 Top10 metadata)
     hdrs, ks = _complete_schema_contract(headers, keys)
     for field in _TOP10_REQUIRED_FIELDS:
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, 93)
+    return _pad_contract(hdrs, ks, 100)
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _TOP10_PAGE:
@@ -617,7 +784,8 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 90))
+    # v4.3.0: instrument fallback default 90 → 97
+    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 97))
     return h, k, "static_canonical_instrument"
 
 def _expected_len(page: str) -> int:
@@ -628,7 +796,8 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    return _EXPECTED_SHEET_LENGTHS.get(page, 90)
+    # v4.3.0: default 90 → 97
+    return _EXPECTED_SHEET_LENGTHS.get(page, 97)
 
 def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
     headers: List[str] = []
@@ -956,7 +1125,8 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
         return "Placeholder fallback row"
 
     # Everything else (prices, scores, ROIs, fundamentals, risk metrics,
-    # valuation ratios, forecasts, position data, view tokens) → None.
+    # valuation ratios, forecasts, position data, view tokens,
+    # v5.50.0 Decision Matrix fields, v5.50.0 Candlestick fields) → None.
     return None
 
 def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
@@ -1175,6 +1345,7 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
         "version": ADVANCED_ANALYSIS_VERSION,
         "schema_registry_available": bool(get_sheet_spec is not None),
         "adapter_available": bool(core_get_sheet_rows is not None),
+        "engine_source": CORE_GET_SHEET_ROWS_SOURCE,
         "allowed_pages_count": len(_safe_allowed_pages()),
         "path": str(getattr(getattr(request, "url", None), "path", "")),
     })
