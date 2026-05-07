@@ -2,44 +2,118 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.49.1
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.50.0
 ================================================================================
+
+WHY v5.50.0
+-----------
+[DECISION MATRIX] Introduces an 8-tier "Decision Matrix" recommendation
+framework for richer signal granularity, while preserving the canonical
+5-tier `recommendation` field for downstream stability.
+
+The engine now populates THREE recommendation fields (instead of one):
+- `recommendation`             (str)  -- canonical 5-tier, unchanged
+                                          contract per core.reco_normalize
+                                          v7.0.0+ / schemas.Recommendation.
+- `recommendation_detailed`    (str)  -- NEW. 8-tier verdict from the
+                                          Decision Matrix priority rules.
+- `recommendation_priority`    (int)  -- NEW. 1-8, which priority rule
+                                          fired (1 = most restrictive).
+
+8-TIER PRIORITY RULES (most-restrictive first):
+
+    P1: STRONG_SELL      | risk >= 90                       (circuit breaker)
+    P2: STRONG_BUY       | overall >= 80, conf >= 75, risk <= 50
+    P3: SPECULATIVE_BUY  | overall >= 75, conf >= 50, risk 51-84
+    P4: BUY              | overall >= 70, conf >= 60, risk <= 65
+    P5: ACCUMULATE       | overall 55-69, conf >= 65, risk <= 55
+    P6: SELL             | overall <= 20 OR (overall <= 35 AND risk >= 80)
+    P7: REDUCE           | overall <= 35 OR risk >= 70
+    P8: HOLD             | otherwise
+
+COLLAPSE MAP (8-tier -> canonical 5-tier `recommendation` field):
+    STRONG_SELL     -> SELL
+    STRONG_BUY      -> STRONG_BUY
+    SPECULATIVE_BUY -> BUY        (positive signal, smaller position)
+    BUY             -> BUY
+    ACCUMULATE      -> BUY        (positive signal, lower conviction)
+    SELL            -> SELL
+    REDUCE          -> REDUCE
+    HOLD            -> HOLD
+
+GAP-CLOSING REFINEMENTS vs. the original spec:
+
+The originally proposed matrix had four real fall-through holes which
+collapsed into HOLD when they shouldn't have:
+  * BUY's `overall 70-79` was bounded; rows with overall >= 80 that
+    failed STRONG_BUY (e.g. confidence 60-74) fell through. Fixed by
+    changing BUY to lower-bound only (`overall >= 70`).
+  * SPECULATIVE_BUY's `risk 66-84` left a hole for overall >= 75 with
+    risk 51-65. Fixed by widening to `risk 51-84`.
+  * SELL required both weak fundamentals AND elevated risk; "safe
+    failure" rows (weak overall, low risk) were not captured. Fixed by
+    adding `overall <= 20` as a standalone trigger.
+  * REDUCE required both conditions; widened to OR.
+
+BEHAVIOR PRESERVATION:
+
+- The 8-tier classification only fires when no upstream `recommendation`
+  value is already present on the row. Production rows that flow
+  through core.scoring -> core.reco_normalize skip the classification
+  entirely and keep their canonical 5-tier value. In that case the
+  `recommendation_detailed` and `recommendation_priority` fields are
+  left blank/None to avoid implying a detailed verdict that may
+  disagree with the canonical one.
+- View fields (fundamental_view, technical_view, risk_view, value_view)
+  are still populated regardless of whether `recommendation` is
+  upstream-set.
+
+SCHEMA ADDITIONS:
+
+Two new fields appended to the END of the canonical instrument schema
+(same Wave-3-style additive expansion used in v5.49.0):
+
+    recommendation_detailed   ("Recommendation Detail")  str
+    recommendation_priority   ("Reco Priority")          int (1-8)
+
+[CANDLESTICKS] Also adds optional candlestick pattern detection via
+`core.candlesticks` v1.0.0+. When that module is importable, the engine
+runs pattern detection on the OHLC history series and populates 5
+additional schema fields:
+
+    candlestick_pattern         ("Candle Pattern")        str
+    candlestick_signal          ("Candle Signal")         str
+                                  -- BULLISH | BEARISH | NEUTRAL | DOJI
+    candlestick_strength        ("Candle Strength")       str
+                                  -- STRONG | MODERATE | WEAK
+    candlestick_confidence      ("Candle Confidence")     float (0-100)
+    candlestick_patterns_recent ("Recent Patterns (5D)")  str ("|"-sep)
+
+Patterns supported (Phase 1, surface-only -- no scoring impact yet):
+  Doji, Hammer, Inverted Hammer, Shooting Star, Hanging Man,
+  Bullish/Bearish Marubozu, Bullish/Bearish Engulfing,
+  Morning Star, Evening Star.
+
+The candlestick layer is:
+  - Optional. If `core.candlesticks` cannot be imported, the engine
+    runs unaffected and the 5 candle fields stay None.
+  - Best-effort. Any exception inside detection is swallowed; bad
+    history data does not break quote builds.
+  - Gated by env flag `ENGINE_CANDLESTICKS_ENABLED` (default True),
+    which can be set to "0" / "false" to disable per-symbol history
+    fetches if they prove too slow on large batches.
+
+NO OTHER ENGINE LOGIC CHANGED IN v5.50.0. Wave 3 Insights group,
+v5.47.4 country/currency normalize delegation, v5.47.3 percent-as-fraction
+storage, and v5.47.2 page-aware provider routing are all preserved
+verbatim.
 
 WHY v5.49.1
 -----------
-[WAVE 2B APPLIED] Removes the non-canonical "ACCUMULATE" token from
-`_compute_recommendation`'s fallback path. v5.49.0 carried this debt
-forward intentionally; this revision settles it.
-
-The recommendation now maps strictly to the canonical 5-tier
-{STRONG_BUY, BUY, HOLD, REDUCE, SELL} per `core.reco_normalize` v7.0.0+
-(and `schemas.Recommendation` enum). Mapping rationale:
-
-    overall >= 80 and conf >= 70 and risk <= 55  ->  STRONG_BUY
-    overall >= 70 and conf >= 60 and risk <= 65  ->  BUY
-    overall >= 55 and conf >= 50                 ->  BUY    (was ACCUMULATE)
-    overall <= 20 and risk >= 80                 ->  SELL
-    overall <= 35 or  risk >= 85                 ->  REDUCE
-    otherwise                                     ->  HOLD
-
-Notes:
-- ACCUMULATE was a non-canonical "buy in tranches" token. Its semantic
-  intent (positive but less conviction than full BUY) folds cleanly
-  into BUY under the canonical enum -- downstream consumers that previously
-  treated ACCUMULATE as a positive signal will continue to receive a
-  positive signal.
-- The strongest tier is now promoted to STRONG_BUY (was BUY) to use the
-  full canonical range.
-- A weak-end SELL tier is added for very-weak rows (overall <= 20 and
-  risk >= 80) -- previously these collapsed into REDUCE.
-- This branch only fires when an upstream `recommendation` value is not
-  already present on the row. Rows produced through the production path
-  (`core.scoring` -> `core.reco_normalize`) skip this branch entirely,
-  so behavior on the canonical path is unchanged.
-
-No other engine logic changed in v5.49.1. The Wave 3 schema additions
-(sector_relative_score, conviction_score, top_factors, top_risks,
-position_size_hint) introduced in v5.49.0 are preserved as-is.
+[WAVE 2B] Removed the non-canonical "ACCUMULATE" token from the fallback
+path. v5.50.0 re-introduces ACCUMULATE in the *detailed* field but
+collapses it to BUY in the canonical field, so the v5.49.1 audit
+property (no ACCUMULATE in canonical `recommendation`) is preserved.
 
 WHY v5.49.0
 -----------
@@ -125,7 +199,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.49.1"
+__version__ = "5.50.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -144,6 +218,25 @@ except Exception:  # pragma: no cover
     _ext_get_country_from_symbol = None  # type: ignore
     _ext_get_currency_from_symbol = None  # type: ignore
     _HAS_NORMALIZE_HELPERS = False
+
+
+# =============================================================================
+# v5.50.0: optional candlestick pattern detection from core.candlesticks v1.0.0
+# =============================================================================
+try:
+    from core.candlesticks import detect_patterns as _detect_candle_patterns  # type: ignore
+    _HAS_CANDLESTICKS = True
+except Exception:  # pragma: no cover
+    _detect_candle_patterns = None  # type: ignore
+    _HAS_CANDLESTICKS = False
+
+_CANDLESTICK_FIELD_KEYS: Tuple[str, ...] = (
+    "candlestick_pattern",
+    "candlestick_signal",
+    "candlestick_strength",
+    "candlestick_confidence",
+    "candlestick_patterns_recent",
+)
 
 _FALLBACK_COUNTRY_BY_SUFFIX: Dict[str, str] = {
     ".SR": "Saudi Arabia", ".SAU": "Saudi Arabia", ".TADAWUL": "Saudi Arabia",
@@ -224,6 +317,101 @@ class UnifiedQuote(BaseModel):
 
 
 # =============================================================================
+# v5.50.0: Decision Matrix 8-tier framework
+# =============================================================================
+# Detailed tokens are exposed in `recommendation_detailed`. The canonical
+# `recommendation` field stays 5-tier via _RECOMMENDATION_COLLAPSE_MAP.
+
+DETAILED_TOKENS: Tuple[str, ...] = (
+    "STRONG_SELL", "STRONG_BUY", "SPECULATIVE_BUY", "BUY",
+    "ACCUMULATE", "SELL", "REDUCE", "HOLD",
+)
+
+CANONICAL_TOKENS: Tuple[str, ...] = (
+    "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL",
+)
+
+_RECOMMENDATION_COLLAPSE_MAP: Dict[str, str] = {
+    "STRONG_SELL": "SELL",
+    "STRONG_BUY": "STRONG_BUY",
+    "SPECULATIVE_BUY": "BUY",
+    "BUY": "BUY",
+    "ACCUMULATE": "BUY",
+    "SELL": "SELL",
+    "REDUCE": "REDUCE",
+    "HOLD": "HOLD",
+}
+
+_DETAILED_RULE_LABELS: Dict[str, str] = {
+    "STRONG_SELL": "Critical Risk",
+    "STRONG_BUY": "Golden Setup",
+    "SPECULATIVE_BUY": "High Beta/Growth",
+    "BUY": "Core Position",
+    "ACCUMULATE": "Value Play",
+    "SELL": "Fundamental Failure",
+    "REDUCE": "Exit Strategy",
+    "HOLD": "Neutral",
+}
+
+
+def _classify_8tier(overall: float, conf: float, risk: float) -> Tuple[str, int, str]:
+    """
+    v5.50.0 Decision Matrix classifier.
+
+    Returns (detailed_token, priority_int, rule_label) from the 8-tier
+    priority order. Priority 1 is highest (most restrictive); higher
+    numbers are catch-alls. Inputs are expected on the 0-100 scale used
+    elsewhere in the engine.
+    """
+    # P1: STRONG_SELL — Critical Risk circuit breaker.
+    # Fires regardless of performance metrics when risk is extreme.
+    if risk >= 90:
+        return "STRONG_SELL", 1, _DETAILED_RULE_LABELS["STRONG_SELL"]
+
+    # P2: STRONG_BUY — The Golden Setup.
+    if overall >= 80 and conf >= 75 and risk <= 50:
+        return "STRONG_BUY", 2, _DETAILED_RULE_LABELS["STRONG_BUY"]
+
+    # P3: SPECULATIVE_BUY — High Beta / Growth.
+    # Captures strong overall (>= 75) with elevated risk (51-84).
+    if overall >= 75 and conf >= 50 and 51 <= risk <= 84:
+        return "SPECULATIVE_BUY", 3, _DETAILED_RULE_LABELS["SPECULATIVE_BUY"]
+
+    # P4: BUY — Core Position.
+    # Lower-bound only on overall to capture rows that miss STRONG_BUY
+    # or SPEC_BUY criteria but still satisfy the BUY thresholds.
+    if overall >= 70 and conf >= 60 and risk <= 65:
+        return "BUY", 4, _DETAILED_RULE_LABELS["BUY"]
+
+    # P5: ACCUMULATE — Value Play.
+    if 55 <= overall <= 69 and conf >= 65 and risk <= 55:
+        return "ACCUMULATE", 5, _DETAILED_RULE_LABELS["ACCUMULATE"]
+
+    # P6: SELL — Fundamental Failure.
+    # `overall <= 20` standalone catches "safe failure" (low risk +
+    # decoupled fundamentals); the AND clause catches weak+risky rows.
+    if overall <= 20 or (overall <= 35 and risk >= 80):
+        return "SELL", 6, _DETAILED_RULE_LABELS["SELL"]
+
+    # P7: REDUCE — Exit Strategy.
+    # OR-trigger: weak fundamentals OR elevated risk.
+    if overall <= 35 or risk >= 70:
+        return "REDUCE", 7, _DETAILED_RULE_LABELS["REDUCE"]
+
+    # P8: HOLD — Neutral catch-all.
+    return "HOLD", 8, _DETAILED_RULE_LABELS["HOLD"]
+
+
+def collapse_to_canonical(detailed_token: str) -> str:
+    """
+    Public helper: collapse an 8-tier detailed token to the canonical
+    5-tier token used in the `recommendation` field. Unknown tokens
+    fall through to HOLD.
+    """
+    return _RECOMMENDATION_COLLAPSE_MAP.get(_safe_str(detailed_token), "HOLD")
+
+
+# =============================================================================
 # Canonical page contracts
 # =============================================================================
 INSTRUMENT_CANONICAL_KEYS: List[str] = [
@@ -250,6 +438,11 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     # v2.6.0 Insights group (Wave 3) -- produced by core.insights_builder v1.0.0
     "sector_relative_score", "conviction_score", "top_factors", "top_risks",
     "position_size_hint",
+    # v5.50.0 Decision Matrix group
+    "recommendation_detailed", "recommendation_priority",
+    # v5.50.0 Candlestick group -- produced by core.candlesticks v1.0.0
+    "candlestick_pattern", "candlestick_signal", "candlestick_strength",
+    "candlestick_confidence", "candlestick_patterns_recent",
 ]
 
 INSTRUMENT_CANONICAL_HEADERS: List[str] = [
@@ -277,6 +470,11 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     # v2.6.0 Insights group (Wave 3)
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
     "Position Size Hint",
+    # v5.50.0 Decision Matrix group
+    "Recommendation Detail", "Reco Priority",
+    # v5.50.0 Candlestick group
+    "Candle Pattern", "Candle Signal", "Candle Strength",
+    "Candle Confidence", "Recent Patterns (5D)",
 ]
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
@@ -1134,6 +1332,15 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "value_view": ("value_view", "valueView"),
     "recommendation": ("recommendation", "rating", "action", "reco", "consensus"),
     "recommendation_reason": ("recommendation_reason", "reason", "summary", "thesis", "analysis"),
+    # v5.50.0 Decision Matrix aliases
+    "recommendation_detailed": ("recommendation_detailed", "reco_detailed", "recommendation_full", "recommendation_8tier", "detailed_recommendation"),
+    "recommendation_priority": ("recommendation_priority", "reco_priority", "priority", "decision_priority"),
+    # v5.50.0 Candlestick aliases
+    "candlestick_pattern": ("candlestick_pattern", "candle_pattern", "pattern", "candlestickPattern"),
+    "candlestick_signal": ("candlestick_signal", "candle_signal", "candlestickSignal"),
+    "candlestick_strength": ("candlestick_strength", "candle_strength", "candlestickStrength"),
+    "candlestick_confidence": ("candlestick_confidence", "candle_confidence", "candlestickConfidence"),
+    "candlestick_patterns_recent": ("candlestick_patterns_recent", "candle_patterns_recent", "recent_patterns", "candlestickPatternsRecent"),
     "horizon_days": ("horizon_days", "horizon", "days"),
     "invest_period_label": ("invest_period_label", "periodLabel", "horizonLabel"),
     "position_qty": ("position_qty", "positionQty", "qty", "quantity", "shares", "holdingQty"),
@@ -1943,29 +2150,35 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
     """
-    Populate recommendation, recommendation_reason, AND the four view columns.
+    Populate recommendation, recommendation_detailed, recommendation_priority,
+    recommendation_reason, AND the four view columns.
 
-    v5.49.1 (Wave 2B): canonical 5-tier mapping per core.reco_normalize v7.0.0+
-    and schemas.Recommendation enum. Output is one of:
-        STRONG_BUY | BUY | HOLD | REDUCE | SELL
+    v5.50.0 (Decision Matrix):
+    --------------------------
+    Computes three recommendation fields:
+      - recommendation_detailed   -- 8-tier verdict (DETAILED_TOKENS)
+      - recommendation_priority   -- which priority rule fired (1-8)
+      - recommendation            -- canonical 5-tier via collapse map
 
-    Tier boundaries:
-        overall >= 80 and conf >= 70 and risk <= 55  -> STRONG_BUY
-        overall >= 70 and conf >= 60 and risk <= 65  -> BUY
-        overall >= 55 and conf >= 50                 -> BUY  (was ACCUMULATE)
-        overall <= 20 and risk >= 80                 -> SELL
-        overall <= 35 or  risk >= 85                 -> REDUCE
-        otherwise                                     -> HOLD
+    Priority order (most-restrictive first):
+      P1 STRONG_SELL     - risk >= 90 (circuit breaker)
+      P2 STRONG_BUY      - overall >= 80, conf >= 75, risk <= 50
+      P3 SPECULATIVE_BUY - overall >= 75, conf >= 50, risk 51-84
+      P4 BUY             - overall >= 70, conf >= 60, risk <= 65
+      P5 ACCUMULATE      - overall 55-69, conf >= 65, risk <= 55
+      P6 SELL            - overall <= 20 OR (overall <= 35 AND risk >= 80)
+      P7 REDUCE          - overall <= 35 OR risk >= 70
+      P8 HOLD            - otherwise
 
-    This branch only fires when no upstream `recommendation` value is
-    already present on the row. Production rows that flow through
-    core.scoring -> core.reco_normalize skip this branch entirely.
+    Behavior:
+      - The four views (fundamental_view, technical_view, risk_view,
+        value_view) are populated regardless of upstream recommendation.
+      - If `recommendation` is already set upstream (e.g. by core.scoring
+        -> core.reco_normalize), this function leaves it alone AND skips
+        populating recommendation_detailed/priority -- to avoid implying
+        a detailed verdict that may disagree with the canonical one.
     """
     _compute_intrinsic_and_upside(row)
-
-    overall = _as_float(row.get("overall_score")) or 50.0
-    conf = _as_float(row.get("confidence_score")) or 55.0
-    risk = _as_float(row.get("risk_score")) or 50.0
 
     fund_view, tech_view, risk_view, value_view = _derive_views(row)
     row.setdefault("fundamental_view", fund_view)
@@ -1973,30 +2186,24 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     row.setdefault("risk_view", risk_view)
     row.setdefault("value_view", value_view)
 
+    # If an upstream recommendation already exists, respect it: do not
+    # overwrite, and do not populate detailed/priority that may disagree.
     if row.get("recommendation"):
         return
 
-    # Canonical 5-tier mapping per core.reco_normalize v7.0.0+ /
-    # schemas.Recommendation. Order matters: most-restrictive first.
-    if overall >= 80 and conf >= 70 and risk <= 55:
-        rec = "STRONG_BUY"
-    elif overall >= 70 and conf >= 60 and risk <= 65:
-        rec = "BUY"
-    elif overall >= 55 and conf >= 50:
-        # Was ACCUMULATE in v5.49.0 and earlier; folded into BUY in v5.49.1
-        # to align with the canonical 5-tier enum. Semantic intent (positive
-        # but lower-conviction signal) is preserved by the BUY token.
-        rec = "BUY"
-    elif overall <= 20 and risk >= 80:
-        rec = "SELL"
-    elif overall <= 35 or risk >= 85:
-        rec = "REDUCE"
-    else:
-        rec = "HOLD"
-    row["recommendation"] = rec
+    overall = _as_float(row.get("overall_score")) or 50.0
+    conf = _as_float(row.get("confidence_score")) or 55.0
+    risk = _as_float(row.get("risk_score")) or 50.0
+
+    detailed, priority, rule_label = _classify_8tier(overall, conf, risk)
+    canonical = _RECOMMENDATION_COLLAPSE_MAP.get(detailed, "HOLD")
+
+    row["recommendation_detailed"] = detailed
+    row["recommendation_priority"] = priority
+    row["recommendation"] = canonical
     row.setdefault(
         "recommendation_reason",
-        f"Fund: {fund_view} | Tech: {tech_view} | Risk: {risk_view} | Val: {value_view} \u2192 {rec}",
+        f"P{priority} {rule_label} [{detailed}]: Fund {fund_view} | Tech {tech_view} | Risk {risk_view} | Val {value_view} \u2192 {canonical}",
     )
 
 
@@ -3014,6 +3221,19 @@ class DataEngineV5:
             if q5 is not None:
                 # v5.47.3: store as FRACTION
                 out["var_95_1d"] = abs(q5)
+
+        # v5.50.0: candlestick pattern detection on the same OHLC rows.
+        # Best-effort: any failure yields empty fields, never an exception.
+        if _HAS_CANDLESTICKS and _detect_candle_patterns is not None:
+            try:
+                candle = _detect_candle_patterns(rows)
+                if isinstance(candle, dict):
+                    for k in _CANDLESTICK_FIELD_KEYS:
+                        if k in candle:
+                            out[k] = candle[k]
+            except Exception:
+                pass
+
         return out
 
     async def _fetch_history_patch(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -3084,6 +3304,32 @@ class DataEngineV5:
                     sources.append("history_or_chart")
                 else:
                     warnings.append("No live provider data available")
+
+            # v5.50.0: best-effort candlestick pattern detection.
+            # Live-provider rows skip the history-fallback path above and
+            # therefore would not get candlestick fields. Fetch a small
+            # OHLC series here, run detection, merge fields. Gated by
+            # ENGINE_CANDLESTICKS_ENABLED so it can be disabled if it's
+            # too slow on large batches. Skipped when the field is
+            # already populated (history-fallback path already ran).
+            if (
+                _HAS_CANDLESTICKS
+                and _detect_candle_patterns is not None
+                and _get_env_bool("ENGINE_CANDLESTICKS_ENABLED", True)
+                and "candlestick_pattern" not in row
+            ):
+                try:
+                    candle_history = await self._rows_from_parallel_series(normalized)
+                    if candle_history:
+                        coerced = self._coerce_history_rows(candle_history)
+                        if coerced:
+                            candle = _detect_candle_patterns(coerced)
+                            if isinstance(candle, dict):
+                                for k in _CANDLESTICK_FIELD_KEYS:
+                                    if k in candle:
+                                        row[k] = candle[k]
+                except Exception:
+                    pass
 
             row["data_sources"] = sources
             if not row.get("data_provider") and sources:
