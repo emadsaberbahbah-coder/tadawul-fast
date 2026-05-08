@@ -2,8 +2,95 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.50.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.51.0
 ================================================================================
+
+WHY v5.51.0
+-----------
+[HARDENING] Six defensive-programming fixes that close silent-failure paths
+identified during the v4.3.4 advanced_analysis route diagnostic. Every fix
+either prevents an exception from propagating up to the route layer, or
+adds visibility when something does go wrong. No business-logic changes.
+
+Symptom that motivated this revision:
+
+  Production /v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1 was
+  returning the route's local placeholder row (data_provider:
+  "placeholder_no_live_data") instead of the engine's enriched row,
+  with response time ~1ms — too fast for a real provider call. The
+  v4.3.4 diagnostic narrowed it to "engine returned a payload that the
+  route's matrix-extractor couldn't parse, OR engine raised". Both
+  paths trace back to silent failures in v5.50.0 — one bad symbol in a
+  batch crashed the whole gather; one provider returning malformed
+  data crashed canonicalization; any uncaught exception in
+  get_page_rows propagated unframed to the route.
+
+v5.51.0 fixes (all defensive, no logic changes):
+
+  [FIX-1] get_page_rows now wraps its entire body in try/except and
+      returns a structured error envelope (`{"ok": False, "_engine_error":
+      <repr>, "_engine_error_class": <class>, ...}`) instead of letting
+      exceptions propagate. The route's v4.3.4 best-effort wrapper will
+      capture this dict in its call_summary, and meta.upstream_status
+      will read "error" with the actual exception text — instead of the
+      coroutine-object misclassification we saw before.
+
+  [FIX-2] get_enriched_quotes_batch now uses asyncio.gather(...,
+      return_exceptions=True). Previously, one bad symbol's enrichment
+      propagating an exception killed the entire gather — meaning a
+      single failing symbol in an 8-symbol Market_Leaders batch
+      produced zero rows. v5.51.0 logs the failing symbol(s) at WARNING
+      and emits an empty-but-valid placeholder dict for them; the
+      remaining 7 symbols enrich normally.
+
+  [FIX-3] _canonicalize_provider_row is now wrapped in try/except where
+      it's called inside _build(). Provider modules sometimes return
+      malformed dicts (None values, recursive structures, exotic types
+      from yfinance .fast_info etc.) that crash the alias-flatten loop.
+      v5.51.0 falls back to a minimal row {symbol, requested_symbol,
+      data_provider, warnings} on canonicalize failure, logged at
+      WARNING. Build continues; user gets a partial row instead of an
+      empty page.
+
+  [FIX-4] SingleFlight.do() now uses asyncio.get_running_loop() instead
+      of the deprecated asyncio.get_event_loop(). On Python 3.12+ the
+      old call raises DeprecationWarning that can become RuntimeError
+      under stricter warning-filter configs. Render's runtime
+      occasionally trips this. Pure forward-compat fix.
+
+  [FIX-5] _init_symbols_reader now also probes
+      core.sheets.symbols_reader (PLURAL) and sheets.symbols_reader, in
+      addition to the singular variants v5.50.0 already tried. The
+      project's actual file is symbols_reader.py (plural) — v5.50.0
+      missed it and silently fell through to env / settings /
+      page_catalog / EMERGENCY_PAGE_SYMBOLS, which DID populate symbols
+      but masked the configuration mismatch.
+
+  [FIX-6] Diagnostic logging at every major step of get_page_rows,
+      get_enriched_quotes_batch, and _build. Logs emit at DEBUG level
+      by default (no production noise) but can be turned on via
+      ENGINE_DEBUG=1 to surface row counts, provider success/failure,
+      and exception details without code changes. Critical failures
+      (FIX-1, FIX-2, FIX-3 fallback paths) log at WARNING regardless.
+
+Forward compatibility note: every fix is purely additive or wraps
+existing behavior in error-handling. No public API changed. No schema
+fields added. No alias maps modified. v5.51.0 is a pure hardening
+revision; v5.50.0 callers continue to work unchanged.
+
+Verification after deploy:
+
+  1. /meta should show engine_version: "5.51.0"
+  2. /v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1 should return
+     either:
+       a. status: "success" with 1 fully populated row (real fix
+          worked — provider chain is now reaching live data), OR
+       b. status: "partial" with meta.upstream_status: "error" and
+          meta.upstream_error: <real exception text> (engine still
+          broken, but the route's diagnostic now sees the actual
+          failure instead of placeholder). Either way, root cause is
+          now diagnosable from a single API call.
+  3. Render logs should show "[engine_v2 v5.51.0]" prefix on warnings.
 
 WHY v5.50.0
 -----------
@@ -199,7 +286,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.50.0"
+__version__ = "5.51.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -2471,7 +2558,12 @@ class SingleFlight:
             fut = self._inflight.get(key)
             if fut is not None and not fut.done():
                 return await fut
-            fut = asyncio.get_event_loop().create_future()
+            # v5.51.0 [FIX-4]: get_running_loop() replaces deprecated
+            # get_event_loop() — the latter raises DeprecationWarning on
+            # Python 3.12+ which can become RuntimeError under stricter
+            # warning-filter configs. We're inside an async method so a
+            # running loop is guaranteed.
+            fut = asyncio.get_running_loop().create_future()
             self._inflight[key] = fut
 
         try:
@@ -2842,7 +2934,16 @@ class DataEngineV5:
         if self._symbols_reader_inited:
             return
         self._symbols_reader_inited = True
+        # v5.51.0 [FIX-5]: probe BOTH singular `symbol_reader` and plural
+        # `symbols_reader` module names. The project's actual file is
+        # symbols_reader.py (plural) — v5.50.0 only tried the singular
+        # variant, silently fell through to env/settings/page_catalog/
+        # EMERGENCY_PAGE_SYMBOLS, which masked the configuration mismatch.
+        # The fall-through still produced symbols (so it didn't break
+        # anything) but bypassed the project's authoritative source.
         candidates = [
+            ("core.sheets.symbols_reader", ("get_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols")),
+            ("sheets.symbols_reader", ("get_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols")),
             ("core.sheets.symbol_reader", ("get_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols")),
             ("sheets.symbol_reader", ("get_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols")),
             ("core.sheets.symbols_loader", ("get_symbols", "list_symbols")),
@@ -2857,6 +2958,10 @@ class DataEngineV5:
                 fn = getattr(mod, fn_name, None)
                 if callable(fn):
                     self._symbols_reader = fn
+                    logger.debug(
+                        "[engine_v2 v%s] symbols_reader bound: %s.%s",
+                        __version__, mod_path, fn_name,
+                    )
                     return
 
     async def _call_symbols_reader(self, sheet: str) -> Any:
@@ -3291,7 +3396,30 @@ class DataEngineV5:
                 for provider in providers:
                     patch = await self._fetch_patch(provider, normalized)
                     if patch:
-                        canon_patch = _canonicalize_provider_row(patch, requested_symbol=symbol, normalized_symbol=normalized, provider=provider)
+                        # v5.51.0 [FIX-3]: wrap canonicalize in try/except.
+                        # Provider modules sometimes return malformed dicts
+                        # (None values, recursive structures, exotic types
+                        # from yfinance .fast_info etc.) that crash the
+                        # alias-flatten loop. Falls back to the original
+                        # patch unchanged if canonicalize fails — partial
+                        # data is better than zero rows.
+                        try:
+                            canon_patch = _canonicalize_provider_row(patch, requested_symbol=symbol, normalized_symbol=normalized, provider=provider)
+                        except Exception as canon_err:
+                            logger.warning(
+                                "[engine_v2 v%s] canonicalize failed for symbol=%r provider=%r: %s: %s — falling back to raw patch",
+                                __version__, normalized, provider,
+                                canon_err.__class__.__name__, canon_err,
+                            )
+                            canon_patch = dict(patch) if isinstance(patch, dict) else {}
+                            canon_patch.setdefault("symbol", normalized)
+                            canon_patch.setdefault("requested_symbol", symbol)
+                            canon_patch.setdefault("data_provider", provider)
+                            warnings.append(
+                                "Provider {} canonicalize error ({}); raw patch used".format(
+                                    provider, canon_err.__class__.__name__,
+                                )
+                            )
                         row = self._merge(row, canon_patch)
                         sources.append(provider)
                         if row.get("current_price") not in (None, "") and row.get("name") not in (None, ""):
@@ -3299,7 +3427,19 @@ class DataEngineV5:
             if row.get("current_price") in (None, ""):
                 hp = await self._get_history_patch_best_effort(normalized)
                 if hp:
-                    canon_patch = _canonicalize_provider_row(hp, requested_symbol=symbol, normalized_symbol=normalized, provider="history_or_chart")
+                    # v5.51.0 [FIX-3]: same defensive wrap on history path.
+                    try:
+                        canon_patch = _canonicalize_provider_row(hp, requested_symbol=symbol, normalized_symbol=normalized, provider="history_or_chart")
+                    except Exception as canon_err:
+                        logger.warning(
+                            "[engine_v2 v%s] canonicalize failed for symbol=%r provider=history_or_chart: %s: %s",
+                            __version__, normalized,
+                            canon_err.__class__.__name__, canon_err,
+                        )
+                        canon_patch = dict(hp) if isinstance(hp, dict) else {}
+                        canon_patch.setdefault("symbol", normalized)
+                        canon_patch.setdefault("requested_symbol", symbol)
+                        canon_patch.setdefault("data_provider", "history_or_chart")
                     row = self._merge(row, canon_patch)
                     sources.append("history_or_chart")
                 else:
@@ -3376,7 +3516,36 @@ class DataEngineV5:
                 row = await self._get_enriched_quote_impl(s, page=page)
                 return UnifiedQuote(**row)
 
-        return await asyncio.gather(*[_one(s) for s in unique]) if unique else []
+        if not unique:
+            return []
+        # v5.51.0 [FIX-2]: return_exceptions=True so one bad symbol does
+        # NOT kill the whole gather. Failed symbols emit a minimal
+        # placeholder UnifiedQuote with the error captured in `warnings`.
+        results = await asyncio.gather(
+            *[_one(s) for s in unique], return_exceptions=True
+        )
+        out: List[UnifiedQuote] = []
+        for sym, res in zip(unique, results):
+            if isinstance(res, BaseException):
+                logger.warning(
+                    "[engine_v2 v%s] enrich failed for symbol=%r: %s: %s — emitting placeholder",
+                    __version__, sym, res.__class__.__name__, res,
+                )
+                placeholder = {
+                    "symbol": sym,
+                    "symbol_normalized": sym,
+                    "requested_symbol": sym,
+                    "data_provider": "engine_v2_error",
+                    "warnings": "Enrichment failed: {}: {}".format(
+                        res.__class__.__name__, str(res)[:200]
+                    ),
+                    "last_updated_utc": _now_utc_iso(),
+                    "last_updated_riyadh": _now_riyadh_iso(),
+                }
+                out.append(UnifiedQuote(**placeholder))
+            else:
+                out.append(res)
+        return out
 
     async def get_enriched_quotes_batch(self, symbols: Sequence[str], *, page: Optional[str] = None, **_: Any) -> Dict[str, Dict[str, Any]]:
         unique = _normalize_symbol_list(symbols)
@@ -3386,8 +3555,47 @@ class DataEngineV5:
             async with sem:
                 return s, await self._get_enriched_quote_impl(s, page=page)
 
-        results = await asyncio.gather(*[_one(s) for s in unique]) if unique else []
-        return dict(results)
+        if not unique:
+            return {}
+        # v5.51.0 [FIX-2]: return_exceptions=True so one bad symbol does
+        # NOT kill the whole batch. Previously, a single failing symbol
+        # in an 8-symbol Market_Leaders gather propagated the exception
+        # all the way to get_page_rows, producing zero rows. Now failed
+        # symbols emit a minimal placeholder row with the error captured
+        # in `warnings`; the remaining symbols enrich normally.
+        results = await asyncio.gather(
+            *[_one(s) for s in unique], return_exceptions=True
+        )
+        out: Dict[str, Dict[str, Any]] = {}
+        failed_symbols: List[str] = []
+        for sym, res in zip(unique, results):
+            if isinstance(res, BaseException):
+                failed_symbols.append(sym)
+                logger.warning(
+                    "[engine_v2 v%s] batch enrich failed for symbol=%r: %s: %s — emitting placeholder",
+                    __version__, sym, res.__class__.__name__, res,
+                )
+                out[sym] = {
+                    "symbol": sym,
+                    "symbol_normalized": sym,
+                    "requested_symbol": sym,
+                    "data_provider": "engine_v2_error",
+                    "warnings": "Enrichment failed: {}: {}".format(
+                        res.__class__.__name__, str(res)[:200]
+                    ),
+                    "last_updated_utc": _now_utc_iso(),
+                    "last_updated_riyadh": _now_riyadh_iso(),
+                }
+            else:
+                key, row = res
+                out[key] = row
+        if failed_symbols:
+            logger.warning(
+                "[engine_v2 v%s] batch enrich: %d/%d symbols failed: %s",
+                __version__, len(failed_symbols), len(unique),
+                ",".join(failed_symbols[:20]),
+            )
+        return out
 
     async def get_quote(self, symbol: str, *, page: Optional[str] = None, **kwargs: Any) -> UnifiedQuote:
         return await self.get_enriched_quote(symbol, page=page, **kwargs)
@@ -3523,107 +3731,272 @@ class DataEngineV5:
         _internal_skip_top10_recursion: bool = False,
         **extras: Any,
     ) -> Dict[str, Any]:
-        target, effective_limit, effective_offset, effective_mode, normalized_body, _request_parts = _normalize_route_call_inputs(
-            page=page, sheet=sheet, sheet_name=sheet_name, limit=limit, offset=offset, mode=mode, body=body, extras=extras
-        )
+        # v5.51.0 [FIX-1 + FIX-6]: entire body wrapped in try/except.
+        # Previously, exceptions in the external reader, top10 fallback,
+        # symbol enrichment, scoring, recommendation, ranking, slicing,
+        # or finalize_payload propagated to the route layer, where
+        # advanced_analysis v4.3.3 misclassified them as
+        # "engine_returned_unexpected_types" because _maybe_await
+        # silently swallowed the exception and returned the coroutine
+        # object. v5.51.0 catches all exceptions and returns a
+        # structured error dict so the route can see the actual failure.
+        debug_enabled = _get_env_bool("ENGINE_DEBUG", False)
+        try:
+            target, effective_limit, effective_offset, effective_mode, normalized_body, _request_parts = _normalize_route_call_inputs(
+                page=page, sheet=sheet, sheet_name=sheet_name, limit=limit, offset=offset, mode=mode, body=body, extras=extras
+            )
 
-        spec, headers, keys, source = _schema_for_sheet(target)
-        warnings: List[str] = []
+            if debug_enabled:
+                logger.debug(
+                    "[engine_v2 v%s] get_page_rows: target=%r limit=%d offset=%d mode=%r body_keys=%r",
+                    __version__, target, effective_limit, effective_offset,
+                    effective_mode, sorted(list((normalized_body or {}).keys()))[:15],
+                )
 
-        rows_dicts: List[Dict[str, Any]] = []
-        if not _is_schema_only_body(normalized_body) and target not in SPECIAL_SHEETS:
+            spec, headers, keys, source = _schema_for_sheet(target)
+            warnings: List[str] = []
+
+            rows_dicts: List[Dict[str, Any]] = []
+            if not _is_schema_only_body(normalized_body) and target not in SPECIAL_SHEETS:
+                try:
+                    external_rows = await self._get_rows_from_external_reader(target, criteria=normalized_body)
+                except Exception as ext_err:
+                    logger.warning(
+                        "[engine_v2 v%s] external_reader failed for target=%r: %s: %s",
+                        __version__, target, ext_err.__class__.__name__, ext_err,
+                    )
+                    external_rows = []
+                for r in external_rows:
+                    if isinstance(r, dict):
+                        rows_dicts.append(_apply_page_row_backfill(target, _normalize_to_schema_keys(keys, headers, r)))
+                if debug_enabled:
+                    logger.debug(
+                        "[engine_v2 v%s] after external_reader: %d rows", __version__, len(rows_dicts),
+                    )
+
+            if target == "Top_10_Investments" and not _internal_skip_top10_recursion:
+                criteria = normalized_body if isinstance(normalized_body, dict) else {}
+                try:
+                    fallback_rows = await self._build_top10_rows_fallback(criteria, effective_limit)
+                except Exception as t10_err:
+                    logger.warning(
+                        "[engine_v2 v%s] top10_fallback failed: %s: %s",
+                        __version__, t10_err.__class__.__name__, t10_err,
+                    )
+                    fallback_rows = []
+                existing_syms = {normalize_symbol(_safe_str(r.get("symbol"))) for r in rows_dicts if isinstance(r, dict)}
+                for row in fallback_rows:
+                    sym = normalize_symbol(_safe_str(row.get("symbol")))
+                    if sym and sym not in existing_syms:
+                        rows_dicts.append(_apply_page_row_backfill(target, _normalize_to_schema_keys(keys, headers, row)))
+                        existing_syms.add(sym)
+                rows_dicts.sort(key=self._top10_sort_key, reverse=True)
+                rows_dicts = rows_dicts[:effective_limit]
+
+            if not rows_dicts and target == "Insights_Analysis":
+                try:
+                    insights_rows = await self._build_insights_rows_fallback()
+                except Exception as ins_err:
+                    logger.warning(
+                        "[engine_v2 v%s] insights_fallback failed: %s: %s",
+                        __version__, ins_err.__class__.__name__, ins_err,
+                    )
+                    insights_rows = []
+                rows_dicts = [_normalize_to_schema_keys(keys, headers, r) for r in insights_rows]
+
+            if not rows_dicts and target == "Data_Dictionary":
+                try:
+                    dd_rows = await self._build_data_dictionary_rows()
+                except Exception as dd_err:
+                    logger.warning(
+                        "[engine_v2 v%s] data_dictionary_builder failed: %s: %s",
+                        __version__, dd_err.__class__.__name__, dd_err,
+                    )
+                    dd_rows = []
+                rows_dicts = [_normalize_to_schema_keys(keys, headers, r) for r in dd_rows]
+
+            if not rows_dicts and target in INSTRUMENT_SHEETS and not _is_schema_only_body(normalized_body):
+                try:
+                    symbols = await self.get_sheet_symbols(target)
+                except Exception as sym_err:
+                    logger.warning(
+                        "[engine_v2 v%s] get_sheet_symbols failed for target=%r: %s: %s",
+                        __version__, target, sym_err.__class__.__name__, sym_err,
+                    )
+                    symbols = list(EMERGENCY_PAGE_SYMBOLS.get(target, []))
+                requested_symbols = _extract_requested_symbols_from_body(normalized_body)
+                if requested_symbols:
+                    symbols = list(_dedupe_keep_order(requested_symbols + symbols))
+                if debug_enabled:
+                    logger.debug(
+                        "[engine_v2 v%s] target=%r symbols_count=%d (first 5: %s)",
+                        __version__, target, len(symbols), symbols[:5],
+                    )
+                if symbols:
+                    try:
+                        quotes = await self.get_enriched_quotes_batch(symbols, page=target)
+                    except Exception as enr_err:
+                        # FIX-2 inside get_enriched_quotes_batch already
+                        # protects against per-symbol failures with
+                        # return_exceptions=True; this catch is for the
+                        # extreme case where the batch coroutine itself
+                        # fails to set up (e.g. semaphore allocation).
+                        logger.warning(
+                            "[engine_v2 v%s] enriched_quotes_batch failed: %s: %s — emitting placeholder rows",
+                            __version__, enr_err.__class__.__name__, enr_err,
+                        )
+                        quotes = {
+                            sym: {
+                                "symbol": sym,
+                                "requested_symbol": sym,
+                                "data_provider": "engine_v2_error",
+                                "warnings": "Batch enrichment failed: {}".format(enr_err.__class__.__name__),
+                            } for sym in symbols
+                        }
+                    for sym in symbols:
+                        try:
+                            quote = quotes.get(sym, {})
+                            snapshot = await self._get_symbol_snapshot(sym)
+                            if snapshot:
+                                quote = self._merge(quote, snapshot)
+                            backfilled = _apply_page_row_backfill(target, quote)
+                            norm = _normalize_to_schema_keys(keys, headers, backfilled)
+                            rows_dicts.append(norm)
+                        except Exception as row_err:
+                            # Per-symbol normalization failure: skip the
+                            # symbol, log, continue. Better than producing
+                            # zero rows for the page.
+                            logger.warning(
+                                "[engine_v2 v%s] row normalize failed for symbol=%r: %s: %s",
+                                __version__, sym, row_err.__class__.__name__, row_err,
+                            )
+                            continue
+
+            for r in rows_dicts:
+                try:
+                    _compute_scores_fallback(r)
+                    _compute_recommendation(r)
+                except Exception as score_err:
+                    # Score / recommendation failure on one row: log, leave
+                    # row's existing fields, continue. Critical: do NOT abort
+                    # the entire batch over a scoring bug for one symbol.
+                    logger.warning(
+                        "[engine_v2 v%s] score/recommendation failed for symbol=%r: %s: %s",
+                        __version__, _safe_str(r.get("symbol")), score_err.__class__.__name__, score_err,
+                    )
+                    r.setdefault("warnings", "")
+                    r["warnings"] = (str(r["warnings"]) + "; score_error:" + score_err.__class__.__name__).strip("; ")
+
+            if rows_dicts and target in INSTRUMENT_SHEETS:
+                try:
+                    _apply_rank_overall(rows_dicts)
+                except Exception as rank_err:
+                    logger.warning(
+                        "[engine_v2 v%s] rank_overall failed: %s: %s",
+                        __version__, rank_err.__class__.__name__, rank_err,
+                    )
+
+            if target == "Top_10_Investments":
+                for rank, row in enumerate(rows_dicts, start=1):
+                    row.setdefault("top10_rank", rank)
+                    row.setdefault("selection_reason", _top10_selection_reason(row))
+                    row.setdefault("criteria_snapshot", _top10_criteria_snapshot(normalized_body if isinstance(normalized_body, dict) else {}))
+
+            if rows_dicts and effective_offset > 0:
+                rows_dicts = rows_dicts[effective_offset : effective_offset + effective_limit]
+            elif rows_dicts and effective_limit and len(rows_dicts) > effective_limit:
+                rows_dicts = rows_dicts[:effective_limit]
+
+            symbols_returned = _extract_symbols_from_rows(rows_dicts)
+
+            if debug_enabled:
+                logger.debug(
+                    "[engine_v2 v%s] target=%r final row_count=%d symbols_returned=%d",
+                    __version__, target, len(rows_dicts), len(symbols_returned),
+                )
+
+            payload = {
+                "ok": True,
+                "engine": "engine_v2",
+                "engine_version": __version__,
+                "page": target,
+                "sheet": target,
+                "sheet_name": target,
+                "headers": headers,
+                "keys": keys,
+                "schema_source": source,
+                "rows": rows_dicts,
+                "rows_matrix": _rows_matrix_from_rows(rows_dicts, keys),
+                "row_objects": rows_dicts,
+                "row_count": len(rows_dicts),
+                "count": len(rows_dicts),
+                "data_provider": "engine_v2",
+                "symbols_requested": _extract_requested_symbols_from_body(normalized_body),
+                "symbols_returned": symbols_returned,
+                "limit": effective_limit,
+                "offset": effective_offset,
+                "mode": effective_mode,
+                "warnings": warnings,
+                "criteria_received": normalized_body if isinstance(normalized_body, dict) else {},
+            }
+            return self._finalize_payload(payload)
+        except Exception as engine_err:
+            # v5.51.0 [FIX-1]: top-level engine error envelope. The route
+            # layer sees this as a dict (so `isinstance(payload, dict)` in
+            # _run_advanced_sheet_rows_impl is True and the diagnostic
+            # branch in v4.3.4 captures it). meta.upstream_status will
+            # read "error", meta.upstream_error will contain the exception
+            # message, and meta.upstream_error_class will identify the
+            # exception class — exactly the data we need to diagnose
+            # without re-deploying with more logging.
             try:
-                external_rows = await self._get_rows_from_external_reader(target, criteria=normalized_body)
+                target_for_error = _canonicalize_sheet_name(_safe_str(page or sheet or sheet_name or "Market_Leaders"))
             except Exception:
-                external_rows = []
-            for r in external_rows:
-                if isinstance(r, dict):
-                    rows_dicts.append(_apply_page_row_backfill(target, _normalize_to_schema_keys(keys, headers, r)))
-
-        if target == "Top_10_Investments" and not _internal_skip_top10_recursion:
-            criteria = normalized_body if isinstance(normalized_body, dict) else {}
+                target_for_error = "Market_Leaders"
+            error_repr = "{}: {}".format(engine_err.__class__.__name__, str(engine_err)[:500])
+            logger.error(
+                "[engine_v2 v%s] get_page_rows top-level exception for target=%r: %s",
+                __version__, target_for_error, error_repr,
+                exc_info=True,
+            )
             try:
-                fallback_rows = await self._build_top10_rows_fallback(criteria, effective_limit)
+                _, headers_for_error, keys_for_error, source_for_error = _schema_for_sheet(target_for_error)
             except Exception:
-                fallback_rows = []
-            existing_syms = {normalize_symbol(_safe_str(r.get("symbol"))) for r in rows_dicts if isinstance(r, dict)}
-            for row in fallback_rows:
-                sym = normalize_symbol(_safe_str(row.get("symbol")))
-                if sym and sym not in existing_syms:
-                    rows_dicts.append(_apply_page_row_backfill(target, _normalize_to_schema_keys(keys, headers, row)))
-                    existing_syms.add(sym)
-            rows_dicts.sort(key=self._top10_sort_key, reverse=True)
-            rows_dicts = rows_dicts[:effective_limit]
-
-        if not rows_dicts and target == "Insights_Analysis":
-            insights_rows = await self._build_insights_rows_fallback()
-            rows_dicts = [_normalize_to_schema_keys(keys, headers, r) for r in insights_rows]
-
-        if not rows_dicts and target == "Data_Dictionary":
-            dd_rows = await self._build_data_dictionary_rows()
-            rows_dicts = [_normalize_to_schema_keys(keys, headers, r) for r in dd_rows]
-
-        if not rows_dicts and target in INSTRUMENT_SHEETS and not _is_schema_only_body(normalized_body):
-            symbols = await self.get_sheet_symbols(target)
-            requested_symbols = _extract_requested_symbols_from_body(normalized_body)
-            if requested_symbols:
-                symbols = list(_dedupe_keep_order(requested_symbols + symbols))
-            if symbols:
-                quotes = await self.get_enriched_quotes_batch(symbols, page=target)
-                for sym in symbols:
-                    quote = quotes.get(sym, {})
-                    snapshot = await self._get_symbol_snapshot(sym)
-                    if snapshot:
-                        quote = self._merge(quote, snapshot)
-                    backfilled = _apply_page_row_backfill(target, quote)
-                    norm = _normalize_to_schema_keys(keys, headers, backfilled)
-                    rows_dicts.append(norm)
-
-        for r in rows_dicts:
-            _compute_scores_fallback(r)
-            _compute_recommendation(r)
-
-        if rows_dicts and target in INSTRUMENT_SHEETS:
-            _apply_rank_overall(rows_dicts)
-
-        if target == "Top_10_Investments":
-            for rank, row in enumerate(rows_dicts, start=1):
-                row.setdefault("top10_rank", rank)
-                row.setdefault("selection_reason", _top10_selection_reason(row))
-                row.setdefault("criteria_snapshot", _top10_criteria_snapshot(normalized_body if isinstance(normalized_body, dict) else {}))
-
-        if rows_dicts and effective_offset > 0:
-            rows_dicts = rows_dicts[effective_offset : effective_offset + effective_limit]
-        elif rows_dicts and effective_limit and len(rows_dicts) > effective_limit:
-            rows_dicts = rows_dicts[:effective_limit]
-
-        symbols_returned = _extract_symbols_from_rows(rows_dicts)
-
-        payload = {
-            "ok": True,
-            "engine": "engine_v2",
-            "engine_version": __version__,
-            "page": target,
-            "sheet": target,
-            "sheet_name": target,
-            "headers": headers,
-            "keys": keys,
-            "schema_source": source,
-            "rows": rows_dicts,
-            "rows_matrix": _rows_matrix_from_rows(rows_dicts, keys),
-            "row_objects": rows_dicts,
-            "row_count": len(rows_dicts),
-            "count": len(rows_dicts),
-            "data_provider": "engine_v2",
-            "symbols_requested": _extract_requested_symbols_from_body(normalized_body),
-            "symbols_returned": symbols_returned,
-            "limit": effective_limit,
-            "offset": effective_offset,
-            "mode": effective_mode,
-            "warnings": warnings,
-            "criteria_received": normalized_body if isinstance(normalized_body, dict) else {},
-        }
-        return self._finalize_payload(payload)
+                headers_for_error = []
+                keys_for_error = []
+                source_for_error = "missing_after_engine_error"
+            return {
+                "ok": False,
+                "engine": "engine_v2",
+                "engine_version": __version__,
+                "page": target_for_error,
+                "sheet": target_for_error,
+                "sheet_name": target_for_error,
+                "headers": headers_for_error,
+                "keys": keys_for_error,
+                "schema_source": source_for_error,
+                "rows": [],
+                "rows_matrix": [],
+                "row_objects": [],
+                "records": [],
+                "data": [],
+                "items": [],
+                "quotes": [],
+                "row_count": 0,
+                "count": 0,
+                "data_provider": "engine_v2_error",
+                "symbols_requested": [],
+                "symbols_returned": [],
+                "limit": int(limit) if isinstance(limit, int) else 2000,
+                "offset": int(offset) if isinstance(offset, int) else 0,
+                "mode": _safe_str(mode),
+                "warnings": ["Engine top-level exception: {}".format(error_repr)],
+                "status": "error",
+                "error": error_repr,
+                "error_class": engine_err.__class__.__name__,
+                "_engine_error": error_repr,
+                "_engine_error_class": engine_err.__class__.__name__,
+            }
 
     async def get_sheet(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_page_rows(*args, **kwargs)
