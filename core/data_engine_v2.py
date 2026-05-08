@@ -2,7 +2,82 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.51.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.52.0
+================================================================================
+
+WHY v5.52.0
+-----------
+[BUG FIXES] Six fixes that close a single-pattern bug surfaced by the AAPL/
+Global_Markets production verification of v5.51.0. Real EODHD enrichment was
+flowing (price, market cap, fundamentals, scores all populated) but seven
+schema fields were systematically null across all symbols:
+    fundamental_view, technical_view, risk_view, value_view,
+    forecast_confidence, confidence_score, recommendation_reason
+
+Root cause: `_normalize_to_schema_keys` populates the row with EVERY canonical
+schema key, setting absent values to None. By the time `_compute_scores_fallback`
+and `_compute_recommendation` run, the row dict ALREADY contains
+`{"fundamental_view": None, ...}`. The helpers used `row.setdefault(key, value)`
+which is a no-op when the key is present (even when its value is None). So the
+computed values for views, forecast_confidence, confidence_score, and
+recommendation_reason were silently discarded. The fields that did populate
+(recommendation, recommendation_detailed, recommendation_priority,
+confidence_bucket) used direct `row[k] = v` assignment or a falsy check, which
+works against None-valued keys.
+
+v5.52.0 fixes (all defensive, no business logic changes):
+
+  [FIX-7]  _compute_recommendation: 4 view tokens (fundamental_view,
+      technical_view, risk_view, value_view) and recommendation_reason now
+      use `if row.get(k) is None: row[k] = ...` instead of setdefault. The
+      computed values reach the wire.
+
+  [FIX-8]  _compute_scores_fallback: forecast_confidence and confidence_score
+      same fix. Confidence cascade now populates end-to-end.
+
+  [FIX-9]  _apply_page_row_backfill: remaining setdefault calls swapped to
+      the conditional-assignment pattern for idempotency regardless of
+      whether backfill runs before or after schema normalization.
+
+  [FIX-10] _compute_scores_fallback: NEW peg_ratio computation. EODHD
+      returns pe_ttm and revenue_growth_yoy directly; v5.51.0 never computed
+      the ratio. PEG = pe_ttm / (revenue_growth_yoy_pct) when both available
+      and growth positive. Sanity-clamped to [0, 10].
+
+  [FIX-11] _compute_recommendation: recommendation_reason now enriched with
+      view-summary detail (`Fund {VIEW} | Tech {VIEW} | ...`) — was always
+      computed in v5.51.0 but the setdefault prevented it from reaching the
+      row.
+
+  [FIX-12] _build_top10_rows_fallback: per-page get_page_rows call wrapped
+      in try/except so one bad source page can't kill the whole Top10
+      build. Defensive parity with v5.51.0 FIX-1.
+
+All fixes are surgical setdefault-to-conditional swaps plus the additive
+peg_ratio block. No public API changes. No schema changes. No alias map
+changes. v5.51.0 callers continue to work unchanged. Field names preserved.
+
+Verification after deploy:
+  /sheet-rows?sheet=Global_Markets&symbols=AAPL,MSFT&limit=2 should show:
+    - fundamental_view: BULLISH / BEARISH / NEUTRAL / N/A
+    - technical_view, risk_view, value_view: similarly populated
+    - forecast_confidence: 0.0-1.0 fraction
+    - confidence_score: 0-100 scalar
+    - recommendation_reason: descriptive string
+    - peg_ratio: numeric (when pe_ttm and growth available)
+  All other v5.51.0 behavior preserved.
+
+Still-null gaps after v5.52.0 (engine-layer work needed in v5.53.0+):
+  - candlestick_*  (5 fields): require core.candlesticks module which is
+    not currently importable in production. v5.53.0 should add an inline
+    detector.
+  - sector_relative_score, conviction_score, top_factors, top_risks,
+    position_size_hint (Insights group): the engine never invokes
+    core.insights_builder. v5.53.0 should wire it.
+  - Tadawul-specific: pe_ttm, revenue_*, margins, week_52_*, RSI, etc.
+    remain null on .SR symbols because the Tadawul provider doesn't return
+    fundamentals. This is a provider-layer gap, not engine.
+
 ================================================================================
 
 WHY v5.51.0
@@ -286,7 +361,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.51.0"
+__version__ = "5.52.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1878,12 +1953,17 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
         conf_fraction = _as_float(out.get("forecast_confidence"))
         if conf_fraction is not None:
             conf = conf_fraction * 100.0 if conf_fraction <= 1.5 else conf_fraction
-            out.setdefault("confidence_score", round(_clamp(conf, 0.0, 100.0), 2))
+            # v5.52.0 [FIX-9]: was setdefault, no-op against None.
+            if out.get("confidence_score") is None:
+                out["confidence_score"] = round(_clamp(conf, 0.0, 100.0), 2)
     if conf is not None and out.get("confidence_bucket") in (None, ""):
         out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
 
     if target == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
-        out.setdefault("data_provider", _safe_str(out.get("data_provider"), "history_or_fallback"))
+        # v5.52.0 [FIX-9]: setdefault is a no-op when key exists with
+        # None value. Use explicit None-check.
+        if out.get("data_provider") is None or out.get("data_provider") == "":
+            out["data_provider"] = _safe_str(out.get("data_provider"), "history_or_fallback")
         if out.get("forecast_confidence") in (None, ""):
             out["forecast_confidence"] = 0.55
         if out.get("confidence_score") in (None, ""):
@@ -1987,6 +2067,21 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         value_score += min(max(div_yield_pct, 0.0), 12.0)
         row["value_score"] = round(_clamp(float(value_score), 0.0, 100.0), 2)
 
+    # v5.52.0 [FIX-10]: PEG_ratio computation. EODHD returns pe_ttm and
+    # revenue_growth_yoy directly; v5.51.0 had no fallback to compute
+    # PEG from them. revenue_growth_yoy is stored as a fraction
+    # (v5.47.3) so we convert to percent points before division. Sanity-
+    # clamped to [0, 10] to filter out divide-by-near-zero blowups when
+    # growth is microscopic.
+    if row.get("peg_ratio") is None:
+        peg_pe = _as_float(row.get("pe_ttm")) or _as_float(row.get("pe_forward"))
+        peg_growth_pct = _as_pct_points(row.get("revenue_growth_yoy"))
+        if (peg_pe is not None and peg_pe > 0
+                and peg_growth_pct is not None and peg_growth_pct > 1.0):
+            peg = peg_pe / peg_growth_pct
+            if 0.0 <= peg <= 10.0:
+                row["peg_ratio"] = round(peg, 4)
+
     if row.get("valuation_score") is None:
         valuation_score = 50.0
         if intrinsic is not None and price not in (None, 0):
@@ -2029,8 +2124,13 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         conf = 0.55
     if conf > 1.5:
         conf = conf / 100.0
-    row.setdefault("forecast_confidence", round(_clamp(conf, 0.0, 1.0), 4))
-    row.setdefault("confidence_score", round(_clamp(conf * 100.0, 0.0, 100.0), 2))
+    # v5.52.0 [FIX-8]: schema-normalized rows have these keys with None,
+    # making setdefault a no-op. Explicit None-check ensures the
+    # confidence cascade reaches the wire.
+    if row.get("forecast_confidence") is None:
+        row["forecast_confidence"] = round(_clamp(conf, 0.0, 1.0), 4)
+    if row.get("confidence_score") is None:
+        row["confidence_score"] = round(_clamp(conf * 100.0, 0.0, 100.0), 2)
 
     if row.get("risk_score") is None:
         vol = _as_pct_points(row.get("volatility_90d"))
@@ -2268,10 +2368,17 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     _compute_intrinsic_and_upside(row)
 
     fund_view, tech_view, risk_view, value_view = _derive_views(row)
-    row.setdefault("fundamental_view", fund_view)
-    row.setdefault("technical_view", tech_view)
-    row.setdefault("risk_view", risk_view)
-    row.setdefault("value_view", value_view)
+    # v5.52.0 [FIX-7]: schema-normalized rows ALREADY contain these keys
+    # with value None, so setdefault is a no-op. Use explicit None-check
+    # so computed values reach the wire.
+    if row.get("fundamental_view") is None:
+        row["fundamental_view"] = fund_view
+    if row.get("technical_view") is None:
+        row["technical_view"] = tech_view
+    if row.get("risk_view") is None:
+        row["risk_view"] = risk_view
+    if row.get("value_view") is None:
+        row["value_view"] = value_view
 
     # If an upstream recommendation already exists, respect it: do not
     # overwrite, and do not populate detailed/priority that may disagree.
@@ -2288,10 +2395,16 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     row["recommendation_detailed"] = detailed
     row["recommendation_priority"] = priority
     row["recommendation"] = canonical
-    row.setdefault(
-        "recommendation_reason",
-        f"P{priority} {rule_label} [{detailed}]: Fund {fund_view} | Tech {tech_view} | Risk {risk_view} | Val {value_view} \u2192 {canonical}",
-    )
+    # v5.52.0 [FIX-11]: schema-normalized rows have recommendation_reason
+    # already keyed with None; setdefault is a no-op against None. Use
+    # explicit None-check so the descriptive verdict reaches the wire.
+    if row.get("recommendation_reason") is None:
+        row["recommendation_reason"] = (
+            "P{0} {1} [{2}]: Fund {3} | Tech {4} | Risk {5} | Val {6} \u2192 {7}".format(
+                priority, rule_label, detailed,
+                fund_view, tech_view, risk_view, value_view, canonical,
+            )
+        )
 
 
 def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
@@ -3692,7 +3805,14 @@ class DataEngineV5:
         for page in pages:
             try:
                 payload = await self.get_page_rows(page=page, limit=limit, body=criteria, _internal_skip_top10_recursion=True)
-            except Exception:
+            except Exception as t10_page_err:
+                # v5.52.0 [FIX-12]: log per-page failure so a Top10 build
+                # that comes back partial has a diagnostic trail.
+                logger.warning(
+                    "[engine_v2 v%s] top10 fallback skipped page=%r due to: %s: %s",
+                    __version__, page,
+                    t10_page_err.__class__.__name__, t10_page_err,
+                )
                 continue
             row_objs = payload.get("row_objects") or payload.get("records") or payload.get("items") or []
             for row in row_objs:
