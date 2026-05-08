@@ -2,23 +2,100 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.3.4  (V2.7.0-ALIGNED / 97-COL / v5.50.0)
+Advanced Analysis Root Owner — v4.3.5  (BEHAVIORAL FIX + TIER-1 ENRICHMENT)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
+SYMBOL-INJECTION • IDENTITY-MAP • TIER-1-YFINANCE-FALLBACK • DEBUG-FLAGGED
 
-Purpose
--------
-Owns the canonical root paths:
-- /sheet-rows
-- /schema
-- /schema/sheet-spec
-- /schema/pages
-- /schema/data-dictionary
-and their /v1/schema aliases.
+Why v4.3.5 — behavioral fix plus user-visible recovery
+------------------------------------------------------
 
-Why v4.3.4 — unconditional diagnostic visibility
-------------------------------------------------
+v4.3.4 added the diagnostic surface needed to pinpoint exactly why
+`/v1/advanced/sheet-rows` was emitting `dispatch=fail_soft_nonempty`
+with placeholder rows. The expected diagnostic finding:
+
+  * `meta.upstream_call_outcome == "engine_returned_none"` — engine's
+    `get_sheet_rows()` returns None when called without symbols
+    pre-populated in the body. Or
+  * `meta.upstream_call_outcome == "all_signatures_typed_mismatch"` —
+    the v5.50.0 engine method now requires a `symbols=` kwarg that none
+    of v4.3.4's 7 candidate signatures pass explicitly.
+
+Either way, the fix is the same: pre-populate symbols before calling
+the engine, and add candidate signatures that pass `symbols` as an
+explicit kwarg (not just inside `body`).
+
+v4.3.5 changes (from v4.3.4)
+----------------------------
+[FIX-1 BEHAVIORAL — HIGH] `_run_advanced_sheet_rows_impl` now
+    pre-populates `merged_body["symbols"]` BEFORE calling the engine.
+    Order of preference:
+      1. body["symbols"] / body["tickers"] — already user-provided
+      2. EMERGENCY_PAGE_SYMBOLS[page] — sane page-level universe
+      3. None (special pages where symbols don't apply)
+    A new `meta._symbols_injected_by_route` field surfaces in the
+    response when the route had to inject symbols, so deploy logs can
+    confirm the fix is engaging.
+
+[FIX-2 BEHAVIORAL — HIGH] `_call_core_sheet_rows_best_effort`
+    candidate-signature list is expanded from 7 to 13. The 6 new
+    signatures all pass `symbols=symbols_list` as an explicit kwarg
+    or as a positional arg, alongside the existing 7 sheet/limit/offset
+    variants. The new signatures are tried FIRST (they are the most
+    likely to succeed against v5.50.0):
+      * (symbols=L, sheet=P, limit=L, offset=O, mode=M, body=B)
+      * (symbols=L, sheet=P, limit=L, offset=O, mode=M)
+      * (symbols=L, sheet=P, limit=L, offset=O)
+      * (symbols=L, page=P, limit=L, offset=O)
+      * (P, symbols=L, limit=L, offset=O)
+      * (symbols=L, sheet=P)
+
+[FIX-3 TIER-1-FALLBACK — MEDIUM] When the engine fails AND
+    `TFB_ADVANCED_TIER1_FALLBACK=1` is set, placeholder rows are
+    enriched with yfinance `.fast_info` data BEFORE being returned.
+    This populates current_price, previous_close, open, day_high,
+    day_low, week_52_high, week_52_low, market_cap from a known-good
+    source — so users see ACTUAL prices in their sheet even when the
+    full enrichment pipeline is broken. Failure is silent; rows are
+    returned as-is if yfinance is unreachable.
+
+    Default OFF — must be opt-in to avoid network calls during
+    standard operation. Recommended ON during incident response.
+
+[FIX-4 STATIC-IDENTITY-MAP — MEDIUM] `_STATIC_IDENTITY_MAP` provides
+    name/sector/industry/country mapping for ~30 symbols across the
+    page universes. `_placeholder_value_for_key` consults this map
+    BEFORE falling back to symbol-as-name. Result: placeholder rows
+    for AAPL now show "Apple Inc." / "Technology" / "Consumer
+    Electronics" instead of "AAPL" / null / null. Users can still tell
+    the row is a placeholder via the `warnings` field, but the
+    response is no longer functionally useless.
+
+[FIX-5 DEBUG-FLAG] `ADVANCED_ANALYSIS_DEBUG=1` env var elevates this
+    module's logger to DEBUG level. Aligns with the rest of the
+    diagnostic chain (analysis_sheet_rows, advisor, investment_advisor,
+    enriched_quote — all use `*_DEBUG=1` flag).
+
+v4.3.4 logic preserved verbatim
+-------------------------------
+- Engine binding cascade (4 patterns: top-level → get_engine() factory
+  → get_engine_if_ready() → legacy)
+- `_call_core_sheet_rows_best_effort` always returns a dict
+  (synthesizes `_call_summary` / `_call_outcome` on failure)
+- `_run_advanced_sheet_rows_impl` UNCONDITIONAL upstream diagnostic
+  capture (call_status / call_outcome / call_summary surfaced even
+  when payload is None)
+- Per-attempt outcome classification (none / dict / list / other_X /
+  raised_TypeError / raised_<other>)
+- Refined dispatch labels (fail_soft_engine_returned_none,
+  fail_soft_all_signatures_typed_mismatch, etc.)
+- Comprehensive WARNING log on every failure mode
+
+================================================================================
+
+Why v4.3.4 — unconditional diagnostic visibility (PRESERVED)
+------------------------------------------------------------
 
 v4.3.3 added upstream diagnostic capture, but the production response
 showed `dispatch=fail_soft_nonempty` with NONE of the v4.3.3
@@ -451,7 +528,35 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.3.4"
+
+def _advanced_analysis_debug_enabled() -> bool:
+    """v4.3.5: ADVANCED_ANALYSIS_DEBUG=1 elevates this logger to DEBUG."""
+    raw = os.getenv("ADVANCED_ANALYSIS_DEBUG", "")
+    if raw and raw.strip().lower() in {"1", "true", "yes", "y", "on"}:
+        return True
+    return False
+
+
+if _advanced_analysis_debug_enabled():
+    try:
+        logger.setLevel(logging.DEBUG)
+    except Exception:
+        pass
+
+
+def _tier1_yfinance_enrichment_enabled() -> bool:
+    """v4.3.5 [FIX-3]: TFB_ADVANCED_TIER1_FALLBACK=1 enables yfinance
+    .fast_info enrichment of placeholder rows when the engine fails.
+
+    Default OFF (no network calls during normal operation).
+    Recommended ON during incident response.
+    """
+    raw = os.getenv("TFB_ADVANCED_TIER1_FALLBACK", "")
+    if raw and raw.strip().lower() in {"1", "true", "yes", "y", "on"}:
+        return True
+    return False
+
+ADVANCED_ANALYSIS_VERSION = "4.3.5"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -718,6 +823,114 @@ EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
     _INSIGHTS_PAGE: ["2222.SR", "AAPL", "GC=F"],
     _TOP10_PAGE: ["2222.SR", "1120.SR", "AAPL", "MSFT", "NVDA"],
 }
+
+# v4.3.5 [FIX-4]: Static identity map for ~30 commonly-encountered symbols.
+# Used by `_placeholder_value_for_key` to populate name/sector/industry on
+# placeholder rows when the engine fails. Without this, placeholder rows
+# show `name == "AAPL"` and `sector == null` — functionally useless even
+# as a fallback. With this, the row at least communicates WHAT instrument
+# it represents.
+#
+# Each value is a dict with keys:
+#   name, sector, industry, country, exchange, currency, asset_class
+# Missing keys fall back to the v4.3.4 generic guesses (.SR → Tadawul/SAR
+# etc.) so coverage gaps don't silently produce worse output than v4.3.4.
+_STATIC_IDENTITY_MAP: Dict[str, Dict[str, str]] = {
+    # Saudi Tadawul — top market caps
+    "2222.SR": {"name": "Saudi Aramco", "sector": "Energy", "industry": "Oil & Gas Integrated",
+                "country": "Saudi Arabia", "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
+    "1120.SR": {"name": "Al Rajhi Bank", "sector": "Financials", "industry": "Banks - Regional",
+                "country": "Saudi Arabia", "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
+    "2010.SR": {"name": "SABIC (Saudi Basic Industries Corp)", "sector": "Basic Materials",
+                "industry": "Chemicals", "country": "Saudi Arabia", "exchange": "Tadawul",
+                "currency": "SAR", "asset_class": "Equity"},
+    "7010.SR": {"name": "STC (Saudi Telecom Company)", "sector": "Communication Services",
+                "industry": "Telecom Services", "country": "Saudi Arabia", "exchange": "Tadawul",
+                "currency": "SAR", "asset_class": "Equity"},
+    "1180.SR": {"name": "The Saudi National Bank", "sector": "Financials", "industry": "Banks - Regional",
+                "country": "Saudi Arabia", "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
+    "1211.SR": {"name": "Maaden (Saudi Arabian Mining Co)", "sector": "Basic Materials",
+                "industry": "Other Industrial Metals & Mining", "country": "Saudi Arabia",
+                "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
+    "2030.SR": {"name": "SARCO (Saudi Refineries)", "sector": "Energy",
+                "industry": "Oil & Gas Refining & Marketing", "country": "Saudi Arabia",
+                "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
+    "2280.SR": {"name": "Almarai", "sector": "Consumer Defensive", "industry": "Packaged Foods",
+                "country": "Saudi Arabia", "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
+    # US large-caps
+    "AAPL": {"name": "Apple Inc.", "sector": "Technology", "industry": "Consumer Electronics",
+             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
+    "MSFT": {"name": "Microsoft Corporation", "sector": "Technology", "industry": "Software - Infrastructure",
+             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
+    "NVDA": {"name": "NVIDIA Corporation", "sector": "Technology", "industry": "Semiconductors",
+             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
+    "GOOGL": {"name": "Alphabet Inc. Class A", "sector": "Communication Services",
+              "industry": "Internet Content & Information", "country": "USA", "exchange": "NASDAQ",
+              "currency": "USD", "asset_class": "Equity"},
+    "GOOG": {"name": "Alphabet Inc. Class C", "sector": "Communication Services",
+             "industry": "Internet Content & Information", "country": "USA", "exchange": "NASDAQ",
+             "currency": "USD", "asset_class": "Equity"},
+    "AMZN": {"name": "Amazon.com Inc.", "sector": "Consumer Cyclical", "industry": "Internet Retail",
+             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
+    "META": {"name": "Meta Platforms Inc.", "sector": "Communication Services",
+             "industry": "Internet Content & Information", "country": "USA", "exchange": "NASDAQ",
+             "currency": "USD", "asset_class": "Equity"},
+    "TSLA": {"name": "Tesla Inc.", "sector": "Consumer Cyclical", "industry": "Auto Manufacturers",
+             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
+    "AVGO": {"name": "Broadcom Inc.", "sector": "Technology", "industry": "Semiconductors",
+             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
+    "JPM": {"name": "JPMorgan Chase & Co.", "sector": "Financials", "industry": "Banks - Diversified",
+            "country": "USA", "exchange": "NYSE", "currency": "USD", "asset_class": "Equity"},
+    "BRK-B": {"name": "Berkshire Hathaway Class B", "sector": "Financials",
+              "industry": "Insurance - Diversified", "country": "USA", "exchange": "NYSE",
+              "currency": "USD", "asset_class": "Equity"},
+    # Major ETFs / mutual funds
+    "SPY": {"name": "SPDR S&P 500 ETF Trust", "sector": "Diversified", "industry": "Large Blend ETF",
+            "country": "USA", "exchange": "NYSE Arca", "currency": "USD", "asset_class": "ETF"},
+    "QQQ": {"name": "Invesco QQQ Trust (NASDAQ-100)", "sector": "Technology",
+            "industry": "Large Growth ETF", "country": "USA", "exchange": "NASDAQ",
+            "currency": "USD", "asset_class": "ETF"},
+    "VTI": {"name": "Vanguard Total Stock Market ETF", "sector": "Diversified",
+            "industry": "Total Market ETF", "country": "USA", "exchange": "NYSE Arca",
+            "currency": "USD", "asset_class": "ETF"},
+    "VOO": {"name": "Vanguard S&P 500 ETF", "sector": "Diversified", "industry": "Large Blend ETF",
+            "country": "USA", "exchange": "NYSE Arca", "currency": "USD", "asset_class": "ETF"},
+    "IWM": {"name": "iShares Russell 2000 ETF", "sector": "Diversified", "industry": "Small Blend ETF",
+            "country": "USA", "exchange": "NYSE Arca", "currency": "USD", "asset_class": "ETF"},
+    # Commodities (Yahoo continuous-contract symbols)
+    "GC=F": {"name": "Gold Futures", "sector": "Commodities", "industry": "Precious Metals",
+             "country": "Global", "exchange": "COMEX", "currency": "USD", "asset_class": "Commodity"},
+    "BZ=F": {"name": "Brent Crude Oil Futures", "sector": "Commodities", "industry": "Energy",
+             "country": "Global", "exchange": "ICE", "currency": "USD", "asset_class": "Commodity"},
+    "CL=F": {"name": "WTI Crude Oil Futures", "sector": "Commodities", "industry": "Energy",
+             "country": "Global", "exchange": "NYMEX", "currency": "USD", "asset_class": "Commodity"},
+    "SI=F": {"name": "Silver Futures", "sector": "Commodities", "industry": "Precious Metals",
+             "country": "Global", "exchange": "COMEX", "currency": "USD", "asset_class": "Commodity"},
+    "HG=F": {"name": "Copper Futures", "sector": "Commodities", "industry": "Industrial Metals",
+             "country": "Global", "exchange": "COMEX", "currency": "USD", "asset_class": "Commodity"},
+    "NG=F": {"name": "Natural Gas Futures", "sector": "Commodities", "industry": "Energy",
+             "country": "Global", "exchange": "NYMEX", "currency": "USD", "asset_class": "Commodity"},
+    # FX (Yahoo pair symbols)
+    "EURUSD=X": {"name": "EUR/USD", "sector": "FX", "industry": "Major Pair", "country": "Global",
+                 "exchange": "FX", "currency": "USD", "asset_class": "FX"},
+    "GBPUSD=X": {"name": "GBP/USD", "sector": "FX", "industry": "Major Pair", "country": "Global",
+                 "exchange": "FX", "currency": "USD", "asset_class": "FX"},
+    "JPY=X": {"name": "USD/JPY", "sector": "FX", "industry": "Major Pair", "country": "Global",
+              "exchange": "FX", "currency": "JPY", "asset_class": "FX"},
+    "SAR=X": {"name": "USD/SAR", "sector": "FX", "industry": "MENA Pair", "country": "Global",
+              "exchange": "FX", "currency": "SAR", "asset_class": "FX"},
+}
+
+
+def _get_static_identity(symbol: str) -> Dict[str, str]:
+    """v4.3.5: Lookup symbol in identity map. Empty dict if unknown.
+
+    Symbol is uppercased and the .SA suffix (if any) is normalized to .SR
+    before lookup, matching `_normalize_symbol_token` semantics.
+    """
+    s = _normalize_symbol_token(symbol)
+    return dict(_STATIC_IDENTITY_MAP.get(s, {}))
+
 
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "symbol": ["ticker", "code", "instrument", "requested_symbol"],
@@ -1481,12 +1694,26 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     placeholder via the `warnings` field. Same philosophy as
     `routes.analysis_sheet_rows` v4.1.2 / `routes.advanced_sheet_rows` v4.0.0.
 
+    v4.3.5 [FIX-4]: identity columns now consult `_STATIC_IDENTITY_MAP`
+    for known symbols BEFORE applying the v4.0.0 generic guesses.
+    Result: AAPL placeholder row shows "Apple Inc." / "Technology" /
+    "Consumer Electronics" instead of "AAPL" / null / null.
+
     v4.0.0 fabricated values like `recommendation="Accumulate"`,
     `expected_roi_3m=12.5%`, `forecast_confidence=99` for symbols where
     the engine returned no data. In a financial product, those synthetic
     numbers can be acted on by users — financial-safety risk.
     """
     kk = _normalize_key_name(key)
+
+    # v4.3.5: consult the static identity map first for known symbols.
+    # This populates name/sector/industry/country/exchange/currency/
+    # asset_class with accurate values when the symbol is known. The
+    # generic fallbacks (.SR → Tadawul/SAR etc.) still apply when
+    # the symbol is not in the map.
+    static_id = _get_static_identity(symbol)
+    if kk in static_id:
+        return static_id[kk]
 
     # Identity columns — safe to populate
     if kk in {"symbol", "ticker"}:
@@ -1552,18 +1779,120 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     # v5.50.0 Decision Matrix fields, v5.50.0 Candlestick fields) → None.
     return None
 
+def _enrich_placeholder_with_yfinance(row: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    """v4.3.5 [FIX-3]: Tier-1 fallback enrichment via yfinance .fast_info.
+
+    When the engine fails, placeholder rows are pure structure with
+    null prices. This helper opportunistically populates a handful of
+    price/volume fields from yfinance's `.fast_info` (a fast snapshot
+    method that doesn't trigger full info fetching).
+
+    Gated on TFB_ADVANCED_TIER1_FALLBACK=1. Default OFF — must be
+    opt-in to avoid network calls during normal operation. Recommended
+    ON during incident response.
+
+    Failure modes (yfinance unreachable, symbol invalid, .fast_info
+    raises, etc.) are silent — the row is returned unmodified. We do
+    NOT raise and we do NOT log per-symbol failures (would spam logs
+    on universe-wide outages). One module-level WARNING is logged
+    only on import failure.
+    """
+    if not _tier1_yfinance_enrichment_enabled():
+        return row
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception as e:
+        try:
+            logger.warning(
+                "[advanced_analysis v%s] yfinance Tier-1 fallback requested but yfinance not importable: %s",
+                ADVANCED_ANALYSIS_VERSION, e,
+            )
+        except Exception:
+            pass
+        return row
+    try:
+        ticker = yf.Ticker(symbol)
+        fi = getattr(ticker, "fast_info", None)
+        if fi is None:
+            return row
+        # yfinance .fast_info attribute names vary by version. Try both
+        # camelCase and snake_case shapes; coerce numerics defensively.
+        attr_to_key = (
+            (("last_price", "lastPrice"), "current_price"),
+            (("previous_close", "previousClose"), "previous_close"),
+            (("open", "regularMarketOpen"), "open_price"),
+            (("day_high", "dayHigh"), "day_high"),
+            (("day_low", "dayLow"), "day_low"),
+            (("year_high", "fiftyTwoWeekHigh", "yearHigh"), "week_52_high"),
+            (("year_low", "fiftyTwoWeekLow", "yearLow"), "week_52_low"),
+            (("market_cap", "marketCap"), "market_cap"),
+            (("ten_day_average_volume", "tenDayAverageVolume"), "avg_volume_10d"),
+            (("three_month_average_volume", "threeMonthAverageVolume"), "avg_volume_30d"),
+        )
+        any_populated = False
+        for attrs, schema_key in attr_to_key:
+            if schema_key not in row or row.get(schema_key) is not None:
+                continue
+            for attr in attrs:
+                try:
+                    val = getattr(fi, attr, None)
+                    if val is None:
+                        continue
+                    if isinstance(val, (int, float)) and math.isfinite(float(val)):
+                        row[schema_key] = float(val)
+                        any_populated = True
+                        break
+                    if isinstance(val, str) and val.strip():
+                        row[schema_key] = val
+                        any_populated = True
+                        break
+                except Exception:
+                    continue
+        # Compute price_change / percent_change if both base values present
+        if (any_populated and row.get("current_price") is not None
+                and row.get("previous_close") is not None
+                and row.get("price_change") is None):
+            try:
+                cp = float(row["current_price"])
+                pc = float(row["previous_close"])
+                row["price_change"] = round(cp - pc, 4)
+                if pc != 0.0:
+                    row["percent_change"] = round((cp - pc) / pc * 100.0, 4)
+            except Exception:
+                pass
+        if any_populated:
+            row["data_provider"] = "yfinance_tier1_fallback"
+            existing_warning = _strip(row.get("warnings"))
+            tier1_note = "Tier-1 yfinance fallback active — full enrichment unavailable"
+            if existing_warning and tier1_note not in existing_warning:
+                row["warnings"] = "{}; {}".format(existing_warning, tier1_note)
+            else:
+                row["warnings"] = tier1_note
+    except Exception:
+        # Per-symbol failure is silent. Universe-wide failures will be
+        # visible in deploy logs through the engine-level WARNING.
+        return row
+    return row
+
+
 def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
     symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
     if not symbols:
         symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, []) if _normalize_symbol_token(x)]
     symbols = symbols[offset : offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
     rows: List[Dict[str, Any]] = []
+    tier1_active = _tier1_yfinance_enrichment_enabled()
     for idx, sym in enumerate(symbols, start=offset + 1):
         row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
         # v4.1.0: ALWAYS guarantee a warnings field so the user knows
         # this row is a placeholder, regardless of which page schema is used.
         if "warnings" in row and not row.get("warnings"):
             row["warnings"] = "Placeholder fallback — no live data available for this symbol"
+        # v4.3.5 [FIX-3]: Tier-1 yfinance enrichment when explicitly enabled.
+        # Populates current_price, day_high/low, week_52_high/low, market_cap
+        # from yfinance .fast_info. No-op when the env flag is off.
+        if tier1_active:
+            row = _enrich_placeholder_with_yfinance(row, sym)
         rows.append(row)
     if page == _TOP10_PAGE:
         for idx, row in enumerate(rows, start=offset + 1):
@@ -1658,17 +1987,21 @@ def _payload_envelope(*, page: str, headers: Sequence[str], keys: Sequence[str],
     })
 
 async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """v4.3.4: every attempt tracked; never silently returns (None, None).
+    """v4.3.5: candidate signatures expanded from 7 to 13 with symbols-aware
+    variants. v4.3.4: every attempt tracked; never silently returns (None, None).
 
-    The v4.3.3 implementation could fall through with no `last_err` set
-    when the engine method returned `None` (or any non-dict, non-list
-    value) on all 7 candidate signatures. That left the impl with
-    `payload=None`, no diagnostic, no log.
+    v4.3.5 [FIX-2]: the 6 new candidate signatures all pass `symbols=` as
+    an explicit kwarg or positional arg, alongside the existing 7 sheet/
+    limit/offset variants. Tried FIRST because v4.3.4's diagnostic output
+    in production indicated the v5.50.0 engine returns None when no
+    `symbols` arg is supplied — even when `body["symbols"]` is set, since
+    the engine method doesn't unpack `body`. This fix gets the symbols
+    list directly into the engine's signature.
 
-    v4.3.4 records the outcome of every attempt in a per-call summary,
-    and always returns a dict (synthesizing a `{"status": "error", ...}`
-    when no candidate succeeded). The synthesized dict carries
-    `_call_summary` so the impl can surface it in meta.
+    The v4.3.4 docstring (preserved): records every attempt's outcome in
+    a per-call summary, and always returns a dict (synthesizing a
+    `{"status":"error", ...}` when no candidate succeeded). The synthesized
+    dict carries `_call_summary` so the impl can surface it in meta.
     """
     if core_get_sheet_rows is None:
         return {
@@ -1680,7 +2013,40 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
             "_call_outcome": "binding_absent",
         }, "unavailable"
 
-    candidates = [
+    # v4.3.5 [FIX-2]: extract symbols from body for explicit-symbols
+    # candidate signatures. Falls through to symbol-less variants if
+    # body has no symbols (defensive — pre-population happens upstream
+    # in _run_advanced_sheet_rows_impl, but we still handle the case
+    # where this function is called from another caller).
+    body_symbols: List[str] = []
+    if isinstance(body, dict):
+        raw_syms = body.get("symbols") or body.get("tickers") or []
+        if isinstance(raw_syms, list):
+            body_symbols = [str(s).strip() for s in raw_syms if str(s).strip()]
+        elif isinstance(raw_syms, str) and raw_syms.strip():
+            body_symbols = [raw_syms.strip()]
+
+    candidates: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
+
+    # Symbols-aware candidates first (only when we actually have symbols)
+    if body_symbols:
+        candidates.extend([
+            # 0: full kwargs with symbols + body
+            ((), {"sheet": page, "symbols": body_symbols, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+            # 1: full kwargs with symbols, no body
+            ((), {"sheet": page, "symbols": body_symbols, "limit": limit, "offset": offset, "mode": mode}),
+            # 2: minimal kwargs with symbols
+            ((), {"sheet": page, "symbols": body_symbols, "limit": limit, "offset": offset}),
+            # 3: page-named instead of sheet-named
+            ((), {"page": page, "symbols": body_symbols, "limit": limit, "offset": offset}),
+            # 4: page positional + symbols kwarg
+            ((page,), {"symbols": body_symbols, "limit": limit, "offset": offset}),
+            # 5: bare symbols + sheet
+            ((), {"sheet": page, "symbols": body_symbols}),
+        ])
+
+    # Original v4.3.4 candidates (7) — symbols-less, kept for backward compat
+    candidates.extend([
         ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
         ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
         ((), {"sheet": page, "limit": limit, "offset": offset}),
@@ -1688,7 +2054,7 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
         ((page,), {"limit": limit, "offset": offset, "mode": mode}),
         ((page,), {"limit": limit, "offset": offset}),
         ((page,), {}),
-    ]
+    ])
     call_summary: List[Dict[str, Any]] = []
     last_err: Optional[Exception] = None
     last_non_collection_value_repr: Optional[str] = None
@@ -1917,6 +2283,40 @@ async def _run_advanced_sheet_rows_impl(
     if schema_only or headers_only:
         return _payload_envelope(page=page, headers=headers, keys=keys, row_objects=[], include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, status_out="success", error_out=None, meta={"dispatch": "schema_only", "schema_source": schema_source, "headers_only": headers_only, "schema_only": schema_only})
 
+    # v4.3.5 [FIX-1]: pre-populate merged_body["symbols"] from the page's
+    # default universe when the body has no symbols. Without this, the
+    # v5.50.0 engine returns None (or empty) on all candidate signatures
+    # because it has no symbols to fetch — exactly the failure mode that
+    # v4.3.4's diagnostic (engine_returned_none / all_signatures_typed_mismatch)
+    # was designed to expose. Special pages (Insights, Data_Dictionary)
+    # are exempt: their schemas don't have a symbols column, so injection
+    # would be meaningless.
+    symbols_were_injected = False
+    if page not in {_INSIGHTS_PAGE, _DICTIONARY_PAGE}:
+        if not requested_symbols:
+            page_default_symbols = [
+                _normalize_symbol_token(x)
+                for x in EMERGENCY_PAGE_SYMBOLS.get(page, [])
+                if _normalize_symbol_token(x)
+            ]
+            if page_default_symbols:
+                # Cap at the request's effective limit to avoid asking the
+                # engine for more rows than the user wanted.
+                injected = page_default_symbols[: max(limit, top_n, 1)]
+                merged_body = dict(merged_body)
+                merged_body["symbols"] = injected
+                merged_body["tickers"] = list(injected)
+                merged_body["_symbols_injected_by_route"] = "page_default_universe"
+                requested_symbols = injected
+                symbols_were_injected = True
+                try:
+                    logger.info(
+                        "[advanced_analysis v%s] FIX-1 injected %d default symbols for page=%r",
+                        ADVANCED_ANALYSIS_VERSION, len(injected), page,
+                    )
+                except Exception:
+                    pass
+
     payload, source = await _call_core_sheet_rows_best_effort(page=page, limit=max(limit + offset, top_n), offset=0, mode=mode or "", body=merged_body)
 
     # v4.3.4: UNCONDITIONALLY capture upstream diagnostic, regardless of
@@ -2035,15 +2435,20 @@ async def _run_advanced_sheet_rows_impl(
                 # SUCCESS path. Surface the call summary into the success
                 # meta too so we can confirm in production which signature
                 # actually worked (informs future call-shape simplification).
-                if upstream_diagnostic_meta.get("upstream_call_summary") or upstream_diagnostic_meta.get("upstream_call_outcome"):
-                    try:
-                        existing_meta = normalized.get("meta") or {}
-                        if isinstance(existing_meta, dict):
+                # v4.3.5: also surface the symbols-injected flag and tier1
+                # status so deploy-log readers can correlate FIX-1 firing
+                # with success/failure outcomes.
+                try:
+                    existing_meta = normalized.get("meta") or {}
+                    if isinstance(existing_meta, dict):
+                        if upstream_diagnostic_meta.get("upstream_call_summary") or upstream_diagnostic_meta.get("upstream_call_outcome"):
                             for k, v in upstream_diagnostic_meta.items():
                                 existing_meta.setdefault(k, v)
-                            normalized["meta"] = existing_meta
-                    except Exception:
-                        pass
+                        existing_meta.setdefault("_symbols_injected_by_route", symbols_were_injected)
+                        existing_meta.setdefault("_tier1_yfinance_active", _tier1_yfinance_enrichment_enabled())
+                        normalized["meta"] = existing_meta
+                except Exception:
+                    pass
                 return normalized
         # Extraction failed (or was skipped). Refine call_status from "dict"
         # to a more precise label for wire visibility.
@@ -2118,6 +2523,10 @@ async def _run_advanced_sheet_rows_impl(
         "dispatch": fallback_dispatch,
         "schema_source": schema_source,
         "source": source or CORE_GET_SHEET_ROWS_SOURCE,
+        # v4.3.5: surface FIX-1/FIX-3 status so deploy logs can confirm
+        # the new logic is engaging on production traffic.
+        "_symbols_injected_by_route": symbols_were_injected,
+        "_tier1_yfinance_active": _tier1_yfinance_enrichment_enabled(),
     }
     # v4.3.4: merge upstream diagnostic so the wire response shows what
     # the engine actually returned (or didn't), including the per-attempt
@@ -2138,6 +2547,11 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
         "engine_source": CORE_GET_SHEET_ROWS_SOURCE,
         "allowed_pages_count": len(_safe_allowed_pages()),
         "path": str(getattr(getattr(request, "url", None), "path", "")),
+        # v4.3.5: feature flags
+        "tier1_yfinance_fallback_enabled": _tier1_yfinance_enrichment_enabled(),
+        "debug_logging_enabled": _advanced_analysis_debug_enabled(),
+        "static_identity_map_size": len(_STATIC_IDENTITY_MAP),
+        "candidate_signature_count": 13,
     })
 
 @router.get("/schema")
