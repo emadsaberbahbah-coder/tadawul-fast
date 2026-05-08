@@ -2,21 +2,84 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.6.0
+ADVISOR ROUTER — v6.7.0
 ================================================================================
 SPECIAL-PAGE PROXY-FIRST • ROOT/ANALYSIS ALIGNED • SHORT-ADVISOR HARDENED •
 JSON-SAFE • GET+POST SAFE • FAIL-SOFT • CONTRACT-PROJECTED • ENGINE-TOLERANT
+DIAGNOSTIC-EMITTING • V2.6.0-ALIGNED • UPSTREAM-META-PRESERVING
 
-What this revision improves
---------------------------
-- FIX: special pages now prefer the canonical sheet-rows owners first:
-      analysis wrapper -> advanced root owner -> engine fallback.
-- FIX: advisor short family no longer depends on buggy downstream derived-page
-      runners before trying the already-working root/analysis routes.
-- FIX: Insights_Analysis, Top_10_Investments, and Data_Dictionary are handled
-      with bridge-first logic so advisor routes align with proven live paths.
-- FIX: tabular payloads are projected to canonical headers when available.
-- FIX: responses remain fail-soft and JSON-safe, exposing resolver metadata.
+v6.7.0 changes (from v6.6.0)
+----------------------------
+[FIX-1 SCHEMA-BUMP — HIGH] KNOWN_CANONICAL_HEADER_COUNTS bumped from v2.5.0
+    column counts (85/88) to v2.6.0 (90/93). Without this, when the registry
+    is unavailable (cold-start race, deploy boundary, schema rebuild) the
+    router pads/trims to 85 columns while analysis_sheet_rows v4.3.1 returns
+    90 — which silently truncates the 5 view + Insights columns at positions
+    86-90. Same class of bug as the LayoutA-blanking issue you fixed in
+    Apps Script `05_Refresh.gs` v1.8.1.
+
+[FIX-2 ENGINE-CASCADE-DIAGNOSTIC — HIGH] Module-level CORE_ENGINE_SOURCE
+    constant + _get_engine returns (engine, source) tuple. Cascade order:
+      1. app.state.<engine|data_engine|engine_v2|data_engine_v2|advisor_engine|investment_advisor_engine>
+      2. core.data_engine_v2.get_engine() / data_engine / ENGINE
+      3. core.data_engine.get_engine() (LEGACY = BUG INDICATOR)
+      4. core.investment_advisor_engine.<…>
+    Surfaced via meta.engine_source on every response and /health, /meta.
+
+[FIX-3 TOLERANT-CALL-SUMMARY — HIGH] _call_with_tolerant_signatures now
+    returns (result, call_summary, outcome) instead of raising. Per-attempt:
+    {attempt_idx, args_count, kwargs_keys, outcome, error_class, error_message}.
+    Outcomes: success | signature_typeerror | timeout | raised |
+    all_signatures_typeerror.
+
+[FIX-4 RESOLVER-CHAIN-CAPTURE — CRITICAL] All 5 resolvers
+    (_delegate_to_analysis_bridge, _delegate_to_advanced_bridge,
+    _run_engine_sheet_rows_fallback, _run_top10_builder, _run_advisor_runner)
+    now return (result, resolver_meta) where resolver_meta captures error
+    class + message + outcome rather than swallowing the exception with
+    `logger.warning + return None`. Master loop builds meta.resolver_chain
+    showing every attempt with outcome ∈ {success, missing, timeout, raised,
+    no_usable_payload, all_signatures_typeerror}.
+
+    This is the highest-value fix — v6.6.0 was the chain's only remaining
+    diagnostic blackhole. When advisor.py 503'd you got "could not resolve
+    a usable bridge" with no clue WHICH bridge or WHY. v6.7.0 returns a
+    full error envelope listing every attempted resolver with its error.
+
+[FIX-5 UPSTREAM-META-PROPAGATION] _UPSTREAM_DIAGNOSTIC_META_KEYS (22 keys)
+    preserved from analysis_sheet_rows v4.3.1, advanced_analysis v4.3.4,
+    investment_advisor v2.15.0, and data_engine_v2 v5.51.0 responses.
+    Diagnostic chain end-to-end:
+      client → advisor v6.7.0 → analysis_sheet_rows v4.3.1
+            → advanced_analysis v4.3.4 → investment_advisor v2.15.0
+            → data_engine_v2 v5.51.0
+
+[FIX-6 HANDLER-LEVEL-CATCH] All 8 route handlers (advisor_health,
+    advisor_meta, advisor_sheet_rows_get/post, advisor_recommendations_get/
+    post, advisor_run_get/post) wrap their bodies in top-level try/except.
+    HTTPException is re-raised. Other exceptions return a status:"error"
+    envelope with meta._engine_error, meta._engine_error_class, meta.handler.
+    No more 500s — consistent error shape across the router.
+
+[FIX-7 RESOLVER-EXHAUSTION-ENVELOPE] The 503 "no resolver succeeded"
+    path now returns a status:"error" envelope with full resolver_chain
+    instead of bare HTTPException(503, detail=…). Caller still gets a
+    parseable JSON response with diagnostic detail showing exactly what
+    each resolver tried.
+
+[FIX-8 LOG-PREFIX] [advisor v6.7.0] log prefix on every WARNING/ERROR;
+    ADVISOR_DEBUG=1 enables DEBUG-level logging.
+
+v6.6.0 logic preserved verbatim
+-------------------------------
+- Resolver order: bridge-first for derived pages, runner-priority for base
+  advisor operations, top10 builder priority for Top10 sheet-rows
+- _looks_like_fallback_only_top10 rejection (conviction-floor cascade gate)
+- _has_usable_payload semantics
+- All public route signatures (sheet-rows, recommendations, run × GET/POST)
+- Auth (_auth_ok_via_hook + env-token fallback + open-mode detection)
+- Contract projection (_project_to_contract_headers, _ensure_tabular_shape)
+- Tabular shape normalization for Top10/Insights/Data_Dictionary
 """
 
 from __future__ import annotations
@@ -42,7 +105,23 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_VERSION = "6.6.0"
+
+def _advisor_debug_enabled() -> bool:
+    """v6.7.0: ADVISOR_DEBUG=1 elevates this logger to DEBUG."""
+    raw = os.getenv("ADVISOR_DEBUG", "")
+    if raw and raw.strip().lower() in {"1", "true", "yes", "y", "on"}:
+        return True
+    return False
+
+
+if _advisor_debug_enabled():
+    try:
+        logger.setLevel(logging.DEBUG)
+    except Exception:
+        pass
+
+
+ADVISOR_VERSION = "6.7.0"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 DEFAULT_ADVISOR_PAGE = "Top_10_Investments"
@@ -55,22 +134,68 @@ BASE_PAGES = {
     "My_Portfolio",
 }
 DERIVED_PAGES = {"Top_10_Investments", "Insights_Analysis", "Data_Dictionary"}
+
+# v6.7.0 [FIX-1]: bumped to v2.6.0 column counts. v6.6.0 had 85/88 (v2.5.0
+# era) which silently truncated the 5 view + Insights columns at positions
+# 86-90 of instrument pages and 86-93 of Top_10_Investments when the registry
+# import failed — exactly the LayoutA-blanking class of bug fixed in
+# `05_Refresh.gs` v1.8.1 and `analysis_sheet_rows` v4.3.0 → v4.3.1.
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
-    "Market_Leaders": 85,
-    "Global_Markets": 85,
-    "Commodities_FX": 85,
-    "Mutual_Funds": 85,
-    "My_Portfolio": 85,
+    "Market_Leaders": 90,
+    "Global_Markets": 90,
+    "Commodities_FX": 90,
+    "Mutual_Funds": 90,
+    "My_Portfolio": 90,
     "Insights_Analysis": 7,
-    "Top_10_Investments": 88,
+    "Top_10_Investments": 93,
     "Data_Dictionary": 9,
 }
+
 TOP10_SPECIAL_FIELDS: Tuple[str, ...] = ("top10_rank", "selection_reason", "criteria_snapshot")
 TOP10_BUSINESS_SIGNAL_FIELDS: Tuple[str, ...] = (
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
     "current_price", "price_change", "percent_change", "risk_score", "valuation_score",
     "overall_score", "opportunity_score", "risk_bucket", "confidence_bucket", "recommendation",
 )
+
+# v6.7.0 [FIX-5]: comprehensive diagnostic key preservation list. These keys
+# are emitted by upstream routers/engines and must propagate end-to-end so
+# that advisor.py's response envelope contains the full diagnostic trail.
+#   - upstream_*  : from advanced_analysis v4.3.4 bridge
+#   - bridge_*    : from investment_advisor v2.15.0
+#   - engine_*    : from data_engine_v2 v5.51.0 + analysis_sheet_rows v4.3.1
+#   - proxy_*     : from analysis_sheet_rows v4.3.1 _proxy_callable
+#   - adapter_*   : from analysis_sheet_rows v4.3.1 _call_core_sheet_rows_*
+_UPSTREAM_DIAGNOSTIC_META_KEYS: Tuple[str, ...] = (
+    "upstream_call_outcome",
+    "upstream_call_summary",
+    "upstream_call_status",
+    "upstream_status",
+    "upstream_error",
+    "upstream_error_class",
+    "bridge_call_outcome",
+    "bridge_call_summary",
+    "bridge_error",
+    "bridge_error_class",
+    "bridge_source_module",
+    "bridge_callable",
+    "engine_payload_diagnostic",
+    "engine_source",
+    "engine_method_used",
+    "engine_method_summary",
+    "proxy_call_outcome",
+    "proxy_error",
+    "proxy_error_class",
+    "adapter_call_outcome",
+    "adapter_call_summary",
+    "best_source",
+)
+
+# v6.7.0 [FIX-2]: module-level constant tracking the most recently resolved
+# engine source. Updated every time _get_engine runs. Surfaced in /health,
+# /meta, and on every response's meta.engine_source.
+CORE_ENGINE_SOURCE: str = "unresolved"
+
 
 PROMETHEUS_AVAILABLE = False
 try:
@@ -95,6 +220,9 @@ AUTH_ENV_TOKEN_NAMES: Tuple[str, ...] = (
 )
 
 
+# =============================================================================
+# Generic helpers
+# =============================================================================
 def _strip(v: Any) -> str:
     if v is None:
         return ""
@@ -196,7 +324,7 @@ def _safe_engine_type(engine: Any) -> str:
     if engine is None:
         return "none"
     try:
-        return f"{engine.__class__.__module__}.{engine.__class__.__name__}"
+        return "{}.{}".format(engine.__class__.__module__, engine.__class__.__name__)
     except Exception:
         return type(engine).__name__
 
@@ -279,6 +407,9 @@ def _json_safe(value: Any) -> Any:
     return _clean(value)
 
 
+# =============================================================================
+# Auth
+# =============================================================================
 def _is_open_mode_enabled() -> bool:
     try:
         if callable(is_open_mode):
@@ -365,6 +496,9 @@ def _require_auth_or_401(*, token_query: Optional[str], x_app_token: Optional[st
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+# =============================================================================
+# Module / engine resolution
+# =============================================================================
 def _import_module_safely(name: str) -> Optional[Any]:
     try:
         return import_module(name)
@@ -372,48 +506,90 @@ def _import_module_safely(name: str) -> Optional[Any]:
         return None
 
 
-def _get_engine_from_state_obj(state_obj: Any) -> Any:
+def _engine_from_state_obj(state_obj: Any) -> Tuple[Any, Optional[str]]:
+    """v6.7.0: returns (engine, attr_name) — None attr means no match."""
     if state_obj is None:
-        return None
-    for attr in ("engine", "data_engine", "engine_v2", "data_engine_v2", "advisor_engine", "investment_advisor_engine"):
+        return None, None
+    for attr in ("engine", "data_engine", "engine_v2", "data_engine_v2",
+                 "advisor_engine", "investment_advisor_engine"):
         try:
             obj = getattr(state_obj, attr, None)
             if obj is not None:
-                return obj
+                return obj, attr
         except Exception:
             continue
-    return None
+    return None, None
 
 
-async def _get_engine(request: Request) -> Any:
+async def _get_engine(request: Request) -> Tuple[Any, str]:
+    """v6.7.0 [FIX-2]: explicit cascade with provenance tracking.
+
+    Returns (engine, source_string). source values:
+        app.state.<attr>                            — primary path
+        core.data_engine_v2.<callable>              — modern engine
+        core.data_engine.<callable>                 — LEGACY (bug indicator!)
+        core.investment_advisor_engine.<callable>   — fallback
+        unavailable                                 — nothing resolved
+
+    Updates the module-level CORE_ENGINE_SOURCE constant for surfacing in
+    /health and /meta. v6.6.0 returned only the engine and silently fell
+    through to legacy paths — making it impossible to detect at runtime
+    whether the legacy-binding bug was firing.
+    """
+    global CORE_ENGINE_SOURCE
+    # Path A: app.state.<engine attr>
     try:
-        engine = _get_engine_from_state_obj(request.app.state)
-        if engine is not None:
-            return engine
+        state = getattr(request.app, "state", None)
+        engine, attr = _engine_from_state_obj(state)
+        if engine is not None and attr:
+            source = "app.state.{}".format(attr)
+            CORE_ENGINE_SOURCE = source
+            return engine, source
     except Exception:
         pass
-    for module_name in ("core.data_engine_v2", "core.data_engine", "core.investment_advisor_engine"):
+
+    # Paths B-D: module imports in priority order
+    cascade = (
+        ("core.data_engine_v2", "modern"),
+        ("core.data_engine", "legacy"),
+        ("core.investment_advisor_engine", "advisor_specific"),
+    )
+    for module_name, _kind in cascade:
         module = _import_module_safely(module_name)
         if module is None:
             continue
-        for attr in ("engine", "data_engine", "ENGINE", "DATA_ENGINE", "advisor_engine", "investment_advisor_engine", "get_engine", "get_data_engine", "build_engine", "create_engine"):
+        # Try plain attribute (already-resolved engine)
+        for attr in ("engine", "data_engine", "ENGINE", "DATA_ENGINE",
+                     "advisor_engine", "investment_advisor_engine"):
             candidate = getattr(module, attr, None)
-            if candidate is None:
+            if candidate is not None and not callable(candidate):
+                source = "{}.{}".format(module_name, attr)
+                CORE_ENGINE_SOURCE = source
+                return candidate, source
+        # Try factory/getter callables
+        for attr in ("get_engine", "get_data_engine", "build_engine",
+                     "create_engine", "engine", "data_engine"):
+            candidate = getattr(module, attr, None)
+            if not callable(candidate):
                 continue
             try:
-                if callable(candidate):
-                    out = candidate()
-                    if inspect.isawaitable(out):
-                        out = await out
-                    if out is not None:
-                        return out
-                elif candidate is not None:
-                    return candidate
+                out = candidate()
+                if inspect.isawaitable(out):
+                    out = await out
+                if out is not None:
+                    source = "{}.{}()".format(module_name, attr)
+                    CORE_ENGINE_SOURCE = source
+                    return out, source
             except Exception:
                 continue
-    return None
+
+    CORE_ENGINE_SOURCE = "unavailable"
+    return None, "unavailable"
 
 
+# =============================================================================
+# Page canonicalization
+# =============================================================================
 def _canonicalize_page_name(value: Any) -> str:
     raw = _strip(value)
     if not raw:
@@ -423,7 +599,8 @@ def _canonicalize_page_name(value: Any) -> str:
     except Exception:
         page_catalog = None
     if page_catalog is not None:
-        for fn_name in ("canonicalize_page_name", "canonical_page_name", "normalize_page_name", "resolve_page_name", "resolve_canonical_page_name"):
+        for fn_name in ("canonicalize_page_name", "canonical_page_name", "normalize_page_name",
+                        "resolve_page_name", "resolve_canonical_page_name"):
             fn = getattr(page_catalog, fn_name, None)
             if callable(fn):
                 try:
@@ -537,6 +714,9 @@ def _payload_from_get(*, page: Optional[str], sheet: Optional[str], sheet_name: 
     return payload
 
 
+# =============================================================================
+# Tolerant signature dispatch — v6.7.0 [FIX-3]
+# =============================================================================
 async def _invoke_callable(fn: Callable[..., Any], *args: Any, timeout_seconds: float, **kwargs: Any) -> Any:
     if inspect.iscoroutinefunction(fn):
         return await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout_seconds)
@@ -554,7 +734,28 @@ def _looks_like_signature_type_error(exc: TypeError) -> bool:
     return any(marker in message for marker in signature_markers)
 
 
-async def _call_with_tolerant_signatures(fn: Callable[..., Any], *, timeout_seconds: float, args: Sequence[Any] = (), kwargs: Optional[Dict[str, Any]] = None) -> Any:
+async def _call_with_tolerant_signatures(
+    fn: Callable[..., Any],
+    *,
+    timeout_seconds: float,
+    args: Sequence[Any] = (),
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[Any, List[Dict[str, Any]], str]:
+    """v6.7.0 [FIX-3]: returns (result, call_summary, outcome) instead of raising.
+
+    outcome ∈ {success, signature_typeerror_all, timeout, raised}
+
+    call_summary is a list of per-attempt records:
+        {attempt_idx, args_count, kwargs_keys, outcome, error_class?, error_message?}
+
+    On success, result is the function's return value. On any failure mode,
+    result is None and the failure detail is in the LAST call_summary entry.
+
+    v6.6.0 raised TypeError, TimeoutError, and Exception — forcing every
+    caller to wrap in try/except and reconstruct a partial diagnostic from
+    `str(exc)`. v6.7.0 captures error_class + error_message + per-attempt
+    kwargs structure so the caller can surface a complete trail.
+    """
     payload_kwargs = kwargs or {}
     attempts = [
         (tuple(args), payload_kwargs),
@@ -572,27 +773,52 @@ async def _call_with_tolerant_signatures(fn: Callable[..., Any], *, timeout_seco
         }),
         ((), {}),
     ]
-    last_error: Optional[Exception] = None
-    for call_args, call_kwargs in attempts:
+    call_summary: List[Dict[str, Any]] = []
+
+    for idx, (call_args, call_kwargs) in enumerate(attempts):
         call_kwargs = {k: v for k, v in call_kwargs.items() if v is not None}
+        record: Dict[str, Any] = {
+            "attempt_idx": idx,
+            "args_count": len(call_args),
+            "kwargs_keys": sorted(call_kwargs.keys()),
+        }
         try:
-            return await _invoke_callable(fn, *call_args, timeout_seconds=timeout_seconds, **call_kwargs)
+            result = await _invoke_callable(fn, *call_args, timeout_seconds=timeout_seconds, **call_kwargs)
+            record["outcome"] = "success"
+            call_summary.append(record)
+            return result, call_summary, "success"
+        except asyncio.TimeoutError:
+            record["outcome"] = "timeout"
+            record["error_class"] = "TimeoutError"
+            record["error_message"] = "exceeded {:.1f}s".format(timeout_seconds)
+            call_summary.append(record)
+            return None, call_summary, "timeout"
         except TypeError as exc:
-            last_error = exc
             if _looks_like_signature_type_error(exc):
+                record["outcome"] = "signature_typeerror"
+            else:
+                record["outcome"] = "typeerror"
+            record["error_class"] = "TypeError"
+            record["error_message"] = str(exc)[:300]
+            call_summary.append(record)
+            if _looks_like_signature_type_error(exc):
+                # Try the next signature variant
                 continue
-            raise
-        except asyncio.TimeoutError as exc:
-            last_error = exc
-            raise
+            # Real TypeError from inside the function — propagate
+            return None, call_summary, "raised"
         except Exception as exc:
-            last_error = exc
-            raise
-    if last_error is not None:
-        raise last_error
-    return None
+            record["outcome"] = "raised"
+            record["error_class"] = exc.__class__.__name__
+            record["error_message"] = str(exc)[:500]
+            call_summary.append(record)
+            return None, call_summary, "raised"
+
+    return None, call_summary, "all_signatures_typeerror"
 
 
+# =============================================================================
+# Schema / contract helpers
+# =============================================================================
 def _extract_headers_from_spec(spec: Any) -> List[str]:
     if spec is None:
         return []
@@ -856,7 +1082,25 @@ def _merge_meta_resolver(result: Dict[str, Any], resolver_meta: Optional[Dict[st
     return result
 
 
-def _envelope_from_payload_result(*, result: Dict[str, Any], page: str, request_id: str, started_at: float, resolver_meta: Optional[Dict[str, Any]] = None, operation: str = "sheet_rows") -> Dict[str, Any]:
+def _absorb_upstream_meta(into_meta: Dict[str, Any], from_meta: Optional[Mapping[str, Any]], *, prefix: str = "") -> None:
+    """v6.7.0 [FIX-5]: copy diagnostic keys from upstream response meta.
+
+    Keys listed in _UPSTREAM_DIAGNOSTIC_META_KEYS are propagated. With prefix,
+    they're prefixed (e.g. 'analysis_engine_source') so multiple resolvers can
+    contribute without collision.
+    """
+    if not isinstance(from_meta, Mapping):
+        return
+    for diag_key in _UPSTREAM_DIAGNOSTIC_META_KEYS:
+        if diag_key in from_meta:
+            target = (prefix + diag_key) if prefix else diag_key
+            into_meta[target] = from_meta[diag_key]
+
+
+# =============================================================================
+# Envelope construction
+# =============================================================================
+def _envelope_from_payload_result(*, result: Dict[str, Any], page: str, request_id: str, started_at: float, resolver_meta: Optional[Dict[str, Any]] = None, resolver_chain: Optional[List[Dict[str, Any]]] = None, engine_source: Optional[str] = None, operation: str = "sheet_rows") -> Dict[str, Any]:
     out = _normalize_result_payload(result, page=page)
     out = _merge_meta_resolver(out, resolver_meta)
     meta = _extract_meta_mapping(out)
@@ -870,7 +1114,22 @@ def _envelope_from_payload_result(*, result: Dict[str, Any], page: str, request_
         "contract_header_count": _contract_header_count(page),
         "actual_header_count": len(out.get("headers", []) or []),
         "degraded_top10_rejected": False,
+        "engine_source": engine_source or CORE_ENGINE_SOURCE,
     })
+    if resolver_chain is not None:
+        # Trim each entry's call_summary to ≤ 5 attempts to keep meta compact
+        trimmed_chain: List[Dict[str, Any]] = []
+        for entry in resolver_chain:
+            entry_copy = dict(entry)
+            cs = entry_copy.get("call_summary")
+            if isinstance(cs, list) and len(cs) > 5:
+                entry_copy["call_summary"] = cs[:5]
+                entry_copy["call_summary_truncated"] = True
+            trimmed_chain.append(entry_copy)
+        meta["resolver_chain"] = trimmed_chain
+    # Absorb upstream diagnostic meta from the chosen result
+    inner = _extract_meta_mapping(out)
+    _absorb_upstream_meta(meta, inner)
     out["status"] = _strip(out.get("status")) or "success"
     out["page"] = _strip(out.get("page")) or page
     out["sheet"] = _strip(out.get("sheet")) or out["page"]
@@ -879,6 +1138,89 @@ def _envelope_from_payload_result(*, result: Dict[str, Any], page: str, request_
     return _json_safe(out)
 
 
+def _envelope_error(*, page: str, request_id: str, started_at: float, error: str, error_class: str, resolver_chain: Optional[List[Dict[str, Any]]] = None, engine_source: Optional[str] = None, operation: str = "sheet_rows", handler: Optional[str] = None, status_code_hint: int = 503) -> Dict[str, Any]:
+    """v6.7.0 [FIX-7]: structured error envelope replacing bare HTTPException.
+
+    Returned when no resolver succeeds and when handlers catch an uncaught
+    exception. Preserves a parseable shape so the client (the GAS frontend)
+    can read `meta.resolver_chain`, `meta._engine_error`, etc. instead of
+    only the raw 503 detail string.
+    """
+    trimmed_chain: List[Dict[str, Any]] = []
+    if resolver_chain:
+        for entry in resolver_chain:
+            entry_copy = dict(entry)
+            cs = entry_copy.get("call_summary")
+            if isinstance(cs, list) and len(cs) > 5:
+                entry_copy["call_summary"] = cs[:5]
+                entry_copy["call_summary_truncated"] = True
+            trimmed_chain.append(entry_copy)
+    return _json_safe({
+        "status": "error",
+        "page": page,
+        "sheet": page,
+        "sheet_name": page,
+        "headers": [],
+        "keys": [],
+        "display_headers": [],
+        "rows": [],
+        "rows_matrix": [],
+        "row_objects": [],
+        "items": [],
+        "data": [],
+        "version": ADVISOR_VERSION,
+        "error": error,
+        "detail": error,
+        "request_id": request_id,
+        "meta": {
+            "request_id": request_id,
+            "elapsed_ms": round((time.perf_counter() - started_at) * 1000.0, 2),
+            "router": "advisor_short",
+            "advisor_version": ADVISOR_VERSION,
+            "page": page,
+            "operation": operation,
+            "handler": handler,
+            "_engine_error": error,
+            "_engine_error_class": error_class,
+            "engine_source": engine_source or CORE_ENGINE_SOURCE,
+            "contract_header_count": _contract_header_count(page),
+            "resolver_chain": trimmed_chain,
+            "status_code_hint": status_code_hint,
+        },
+    })
+
+
+def _make_handler_exception_response(handler_name: str, exc: Exception, *, page: str = "", request_id: str = "", started_at: Optional[float] = None) -> Dict[str, Any]:
+    """v6.7.0 [FIX-6]: structured envelope returned by handler-level catch."""
+    if started_at is None:
+        started_at = time.perf_counter()
+    return _envelope_error(
+        page=page or DEFAULT_ADVISOR_PAGE,
+        request_id=request_id or uuid.uuid4().hex[:12],
+        started_at=started_at,
+        error="{}: {}".format(exc.__class__.__name__, str(exc)[:500]),
+        error_class=exc.__class__.__name__,
+        resolver_chain=None,
+        operation="handler_exception",
+        handler=handler_name,
+        status_code_hint=500,
+    )
+
+
+# =============================================================================
+# Resolver primitives — v6.7.0 [FIX-4]
+#
+# Each resolver returns (result, resolver_meta).
+#   - result is None on every failure mode
+#   - resolver_meta always contains:
+#       resolver_name, kind, outcome, [error_class, error_message,
+#       call_summary, module, callable]
+#
+# v6.6.0 swallowed exceptions with logger.warning + return None — the master
+# loop got no information about WHY each path failed. v6.7.0 surfaces each
+# attempt's outcome so the resolver_chain in the response envelope shows
+# exactly what happened.
+# =============================================================================
 async def _resolve_analysis_bridge_impl() -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
     module = _import_module_safely("routes.analysis_sheet_rows")
     if module is None:
@@ -945,78 +1287,134 @@ async def _resolve_top10_builder(request: Request) -> Tuple[Optional[Callable[..
     return None, {}
 
 
-async def _delegate_to_analysis_bridge(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    impl, meta = await _resolve_analysis_bridge_impl()
+async def _delegate_to_analysis_bridge(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    out_meta: Dict[str, Any] = {"resolver_name": "analysis_bridge", "kind": "bridge"}
+    impl, resolver_meta = await _resolve_analysis_bridge_impl()
+    out_meta.update(resolver_meta or {})
     if impl is None:
-        return None
+        out_meta["outcome"] = "missing"
+        out_meta["error_message"] = "routes.analysis_sheet_rows not importable or no impl callable"
+        return None, out_meta
+
     page = _extract_page(payload)
-    try:
-        out = await _call_with_tolerant_signatures(
-            impl,
-            timeout_seconds=_resolver_timeout("bridge", page=page),
-            kwargs={
-                "request": request,
-                "body": payload,
-                "mode": _strip(payload.get("mode")) or "live",
-                "include_matrix_q": _boolish(payload.get("include_matrix"), True),
-                "token": token,
-                "x_app_token": x_app_token,
-                "authorization": authorization,
-                "x_request_id": x_request_id,
-            },
-        )
-        result = _normalize_result_payload(out, page=page)
-        if not _has_usable_payload(result, page=page):
-            return None
-        return _merge_meta_resolver(result, meta)
-    except Exception as exc:
-        logger.warning("Analysis bridge failed. page=%s error=%s", page, exc, exc_info=True)
-        return None
+    result, call_summary, call_outcome = await _call_with_tolerant_signatures(
+        impl,
+        timeout_seconds=_resolver_timeout("bridge", page=page),
+        kwargs={
+            "request": request,
+            "body": payload,
+            "mode": _strip(payload.get("mode")) or "live",
+            "include_matrix_q": _boolish(payload.get("include_matrix"), True),
+            "token": token,
+            "x_app_token": x_app_token,
+            "authorization": authorization,
+            "x_request_id": x_request_id,
+        },
+    )
+    out_meta["call_summary"] = call_summary
+    out_meta["call_outcome"] = call_outcome
+
+    if call_outcome != "success":
+        out_meta["outcome"] = call_outcome
+        if call_summary:
+            last = call_summary[-1]
+            out_meta["error_class"] = last.get("error_class")
+            out_meta["error_message"] = last.get("error_message")
+        try:
+            logger.warning("[advisor v%s] analysis_bridge %s: %s — %s",
+                           ADVISOR_VERSION, call_outcome,
+                           out_meta.get("error_class"), out_meta.get("error_message"))
+        except Exception:
+            pass
+        return None, out_meta
+
+    payload_dict = _normalize_result_payload(result, page=page)
+    response_meta = _extract_meta_mapping(payload_dict)
+    _absorb_upstream_meta(out_meta, response_meta, prefix="upstream_")
+
+    if not _has_usable_payload(payload_dict, page=page):
+        out_meta["outcome"] = "no_usable_payload"
+        return None, out_meta
+
+    out_meta["outcome"] = "success"
+    return _merge_meta_resolver(payload_dict, out_meta), out_meta
 
 
-async def _delegate_to_advanced_bridge(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    impl, meta = await _resolve_advanced_bridge_impl()
+async def _delegate_to_advanced_bridge(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    out_meta: Dict[str, Any] = {"resolver_name": "advanced_bridge", "kind": "bridge"}
+    impl, resolver_meta = await _resolve_advanced_bridge_impl()
+    out_meta.update(resolver_meta or {})
     if impl is None:
-        return None
+        out_meta["outcome"] = "missing"
+        out_meta["error_message"] = "routes.advanced_analysis not importable or no impl callable"
+        return None, out_meta
+
     page = _extract_page(payload)
-    try:
-        out = await _call_with_tolerant_signatures(
-            impl,
-            timeout_seconds=_resolver_timeout("bridge", page=page),
-            kwargs={
-                "request": request,
-                "body": payload,
-                "mode": _strip(payload.get("mode")) or "live",
-                "include_matrix_q": _boolish(payload.get("include_matrix"), True),
-                "token": token,
-                "x_app_token": x_app_token,
-                "authorization": authorization,
-                "x_request_id": x_request_id,
-                "page": page,
-                "sheet": page,
-                "sheet_name": page,
-            },
-        )
-        result = _normalize_result_payload(out, page=page)
-        if not _has_usable_payload(result, page=page):
-            return None
-        return _merge_meta_resolver(result, meta)
-    except Exception as exc:
-        logger.warning("Advanced bridge failed. page=%s error=%s", page, exc, exc_info=True)
-        return None
+    result, call_summary, call_outcome = await _call_with_tolerant_signatures(
+        impl,
+        timeout_seconds=_resolver_timeout("bridge", page=page),
+        kwargs={
+            "request": request,
+            "body": payload,
+            "mode": _strip(payload.get("mode")) or "live",
+            "include_matrix_q": _boolish(payload.get("include_matrix"), True),
+            "token": token,
+            "x_app_token": x_app_token,
+            "authorization": authorization,
+            "x_request_id": x_request_id,
+            "page": page,
+            "sheet": page,
+            "sheet_name": page,
+        },
+    )
+    out_meta["call_summary"] = call_summary
+    out_meta["call_outcome"] = call_outcome
+
+    if call_outcome != "success":
+        out_meta["outcome"] = call_outcome
+        if call_summary:
+            last = call_summary[-1]
+            out_meta["error_class"] = last.get("error_class")
+            out_meta["error_message"] = last.get("error_message")
+        try:
+            logger.warning("[advisor v%s] advanced_bridge %s: %s — %s",
+                           ADVISOR_VERSION, call_outcome,
+                           out_meta.get("error_class"), out_meta.get("error_message"))
+        except Exception:
+            pass
+        return None, out_meta
+
+    payload_dict = _normalize_result_payload(result, page=page)
+    response_meta = _extract_meta_mapping(payload_dict)
+    _absorb_upstream_meta(out_meta, response_meta, prefix="upstream_")
+
+    if not _has_usable_payload(payload_dict, page=page):
+        out_meta["outcome"] = "no_usable_payload"
+        return None, out_meta
+
+    out_meta["outcome"] = "success"
+    return _merge_meta_resolver(payload_dict, out_meta), out_meta
 
 
-async def _run_engine_sheet_rows_fallback(*, request: Request, payload: Dict[str, Any], request_id: str) -> Optional[Dict[str, Any]]:
-    engine = await _get_engine(request)
+async def _run_engine_sheet_rows_fallback(*, request: Request, payload: Dict[str, Any], request_id: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    out_meta: Dict[str, Any] = {"resolver_name": "engine_fallback", "kind": "engine"}
+    engine, engine_source = await _get_engine(request)
+    out_meta["engine_source"] = engine_source
     if engine is None:
-        return None
+        out_meta["outcome"] = "missing"
+        out_meta["error_message"] = "no engine resolved via app.state or core.* modules"
+        return None, out_meta
+
+    out_meta["module"] = _safe_engine_type(engine)
     page = _extract_page(payload)
     include_matrix = _boolish(payload.get("include_matrix"), True)
     mode = _strip(payload.get("mode")) or "live"
-    last_error: Optional[Exception] = None
+    method_summary: List[Dict[str, Any]] = []
+
     for method_name in ("get_sheet_rows", "sheet_rows", "fetch_sheet_rows", "build_sheet_rows", "read_sheet_rows", "run_sheet_rows"):
         method = getattr(engine, method_name, None)
         if not callable(method):
+            method_summary.append({"method": method_name, "outcome": "missing"})
             continue
         attempts = [
             {"request": request, "body": payload, "payload": payload, "mode": mode, "include_matrix": include_matrix,
@@ -1031,75 +1429,176 @@ async def _run_engine_sheet_rows_fallback(*, request: Request, payload: Dict[str
             {"page": page, "sheet": page, "sheet_name": page, "target_sheet": page},
             {"sheet": page}, {},
         ]
+        method_record: Dict[str, Any] = {"method": method_name}
+        last_outcome = "exhausted_all_signatures"
+        last_error_class: Optional[str] = None
+        last_error_message: Optional[str] = None
+
         for kwargs in attempts:
             kwargs = {k: v for k, v in kwargs.items() if v is not None}
-            try:
-                out = await _call_with_tolerant_signatures(method, timeout_seconds=_resolver_timeout("engine", page=page), kwargs=kwargs)
-                result = _normalize_result_payload(out, page=page)
-                if not _has_usable_payload(result, page=page):
+            result, cs, outcome = await _call_with_tolerant_signatures(
+                method, timeout_seconds=_resolver_timeout("engine", page=page), kwargs=kwargs
+            )
+            last_outcome = outcome
+            if cs:
+                last_error_class = cs[-1].get("error_class")
+                last_error_message = cs[-1].get("error_message")
+
+            if outcome == "success":
+                payload_dict = _normalize_result_payload(result, page=page)
+                if _has_usable_payload(payload_dict, page=page):
+                    method_record["outcome"] = "success"
+                    method_summary.append(method_record)
+                    out_meta["method_summary"] = method_summary
+                    out_meta["engine_method_used"] = method_name
+                    out_meta["outcome"] = "success"
+                    response_meta = _extract_meta_mapping(payload_dict)
+                    _absorb_upstream_meta(out_meta, response_meta, prefix="upstream_")
+                    payload_dict = _merge_meta_resolver(payload_dict, out_meta)
+                    inner_meta = _extract_meta_mapping(payload_dict)
+                    inner_meta.setdefault("request_id", request_id)
+                    payload_dict["meta"] = inner_meta
+                    return payload_dict, out_meta
+                else:
+                    method_record["outcome"] = "no_usable_payload"
+                    last_outcome = "no_usable_payload"
                     continue
-                result = _merge_meta_resolver(result, {"source": _safe_engine_type(engine), "callable": method_name, "kind": "engine_fallback"})
-                meta = _extract_meta_mapping(result)
-                meta.setdefault("request_id", request_id)
-                result["meta"] = meta
-                return result
-            except TypeError as exc:
-                last_error = exc
+            elif outcome == "timeout":
+                method_record["outcome"] = "timeout"
+                method_record["error_message"] = last_error_message
+                method_summary.append(method_record)
+                out_meta["method_summary"] = method_summary
+                out_meta["outcome"] = "timeout"
+                out_meta["error_class"] = last_error_class
+                out_meta["error_message"] = last_error_message
+                return None, out_meta
+            elif outcome in ("raised", "all_signatures_typeerror"):
+                # raised on a single attempt = real error from inside the engine method;
+                # keep trying other signature variants only for typeerror cases
+                if outcome == "raised":
+                    method_record["outcome"] = "raised"
+                    method_record["error_class"] = last_error_class
+                    method_record["error_message"] = last_error_message
+                    method_summary.append(method_record)
+                    # Try the next method
+                    break
+                # all_signatures_typeerror — try more attempts but fallthrough
                 continue
-            except Exception as exc:
-                last_error = exc
-                continue
-    if last_error is not None:
-        logger.warning("Engine sheet-rows fallback failed. error=%s", last_error, exc_info=True)
-    return None
+
+        if "outcome" not in method_record:
+            method_record["outcome"] = last_outcome or "exhausted_all_signatures"
+            if last_error_class:
+                method_record["error_class"] = last_error_class
+                method_record["error_message"] = last_error_message
+            method_summary.append(method_record)
+
+    out_meta["method_summary"] = method_summary
+    # No method succeeded — surface the most recent error
+    last_with_error = next((m for m in reversed(method_summary) if m.get("error_class")), None)
+    if last_with_error:
+        out_meta["error_class"] = last_with_error.get("error_class")
+        out_meta["error_message"] = last_with_error.get("error_message")
+        out_meta["outcome"] = last_with_error.get("outcome", "raised")
+    else:
+        out_meta["outcome"] = "no_usable_payload"
+        out_meta["error_message"] = "engine produced no usable rows on any method"
+    return None, out_meta
 
 
 async def _run_top10_builder(*, request: Request, payload: Dict[str, Any], page: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    out_meta: Dict[str, Any] = {"resolver_name": "top10_builder", "kind": "direct"}
     builder, resolver_meta = await _resolve_top10_builder(request)
+    out_meta.update(resolver_meta or {})
     if builder is None:
-        return None, {}
-    try:
-        out = await _call_with_tolerant_signatures(
-            builder,
-            timeout_seconds=_resolver_timeout("top10", page=page),
-            kwargs={
-                "request": request, "body": payload, "payload": payload, "page": page, "sheet": page, "sheet_name": page,
-                "mode": _strip(payload.get("mode")) or "live", "symbols": payload.get("symbols"), "tickers": payload.get("tickers"),
-                "top_n": payload.get("top_n"), "limit": payload.get("limit"), "offset": payload.get("offset"),
-            },
-        )
-        result = _normalize_result_payload(out, page=page)
-        if _has_usable_payload(result, page=page):
-            return result, resolver_meta
-        return None, resolver_meta
-    except Exception as exc:
-        logger.warning("Top10 builder failed; page=%s error=%s", page, exc, exc_info=True)
-        return None, resolver_meta or {}
+        out_meta["outcome"] = "missing"
+        out_meta["error_message"] = "no top10 builder resolved"
+        return None, out_meta
+
+    result, call_summary, call_outcome = await _call_with_tolerant_signatures(
+        builder,
+        timeout_seconds=_resolver_timeout("top10", page=page),
+        kwargs={
+            "request": request, "body": payload, "payload": payload, "page": page, "sheet": page, "sheet_name": page,
+            "mode": _strip(payload.get("mode")) or "live", "symbols": payload.get("symbols"), "tickers": payload.get("tickers"),
+            "top_n": payload.get("top_n"), "limit": payload.get("limit"), "offset": payload.get("offset"),
+        },
+    )
+    out_meta["call_summary"] = call_summary
+    out_meta["call_outcome"] = call_outcome
+
+    if call_outcome != "success":
+        out_meta["outcome"] = call_outcome
+        if call_summary:
+            last = call_summary[-1]
+            out_meta["error_class"] = last.get("error_class")
+            out_meta["error_message"] = last.get("error_message")
+        try:
+            logger.warning("[advisor v%s] top10_builder %s: %s — %s",
+                           ADVISOR_VERSION, call_outcome,
+                           out_meta.get("error_class"), out_meta.get("error_message"))
+        except Exception:
+            pass
+        return None, out_meta
+
+    payload_dict = _normalize_result_payload(result, page=page)
+    if not _has_usable_payload(payload_dict, page=page):
+        out_meta["outcome"] = "no_usable_payload"
+        return None, out_meta
+
+    out_meta["outcome"] = "success"
+    return payload_dict, out_meta
 
 
 async def _run_advisor_runner(*, request: Request, payload: Dict[str, Any], page: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    out_meta: Dict[str, Any] = {"resolver_name": "advisor_runner", "kind": "function"}
     runner, resolver_meta = await _resolve_advisor_runner(request, page=page)
+    out_meta.update(resolver_meta or {})
     if runner is None:
-        return None, {}
-    try:
-        out = await _call_with_tolerant_signatures(
-            runner,
-            timeout_seconds=_resolver_timeout("runner", page=page),
-            kwargs={
-                "request": request, "body": payload, "payload": payload, "page": page, "sheet": page, "sheet_name": page,
-                "mode": _strip(payload.get("mode")) or "live", "symbols": payload.get("symbols"), "tickers": payload.get("tickers"),
-                "top_n": payload.get("top_n"), "limit": payload.get("limit"), "offset": payload.get("offset"),
-            },
-        )
-        result = _normalize_result_payload(out, page=page)
-        if _has_usable_payload(result, page=page):
-            return result, resolver_meta
-        return None, resolver_meta
-    except Exception as exc:
-        logger.warning("Advisor runner failed; page=%s error=%s", page, exc, exc_info=True)
-        return None, resolver_meta or {}
+        out_meta["outcome"] = "missing"
+        out_meta["error_message"] = "no advisor runner resolved"
+        return None, out_meta
+
+    result, call_summary, call_outcome = await _call_with_tolerant_signatures(
+        runner,
+        timeout_seconds=_resolver_timeout("runner", page=page),
+        kwargs={
+            "request": request, "body": payload, "payload": payload, "page": page, "sheet": page, "sheet_name": page,
+            "mode": _strip(payload.get("mode")) or "live", "symbols": payload.get("symbols"), "tickers": payload.get("tickers"),
+            "top_n": payload.get("top_n"), "limit": payload.get("limit"), "offset": payload.get("offset"),
+        },
+    )
+    out_meta["call_summary"] = call_summary
+    out_meta["call_outcome"] = call_outcome
+
+    if call_outcome != "success":
+        out_meta["outcome"] = call_outcome
+        if call_summary:
+            last = call_summary[-1]
+            out_meta["error_class"] = last.get("error_class")
+            out_meta["error_message"] = last.get("error_message")
+        try:
+            logger.warning("[advisor v%s] advisor_runner %s: %s — %s",
+                           ADVISOR_VERSION, call_outcome,
+                           out_meta.get("error_class"), out_meta.get("error_message"))
+        except Exception:
+            pass
+        return None, out_meta
+
+    payload_dict = _normalize_result_payload(result, page=page)
+    response_meta = _extract_meta_mapping(payload_dict)
+    _absorb_upstream_meta(out_meta, response_meta, prefix="upstream_")
+
+    if not _has_usable_payload(payload_dict, page=page):
+        out_meta["outcome"] = "no_usable_payload"
+        return None, out_meta
+
+    out_meta["outcome"] = "success"
+    return payload_dict, out_meta
 
 
+# =============================================================================
+# Master logic — v6.7.0 with resolver_chain capture
+# =============================================================================
 def _prefer_direct_bridge(page: str, *, operation: str) -> bool:
     if page in DERIVED_PAGES:
         return True
@@ -1126,155 +1625,300 @@ async def _run_advisor_logic(*, request: Request, payload: Dict[str, Any], token
     page = _extract_page(payload, default_page=DEFAULT_ADVISOR_PAGE)
     payload.update({"page": page, "sheet": page, "sheet_name": page})
 
+    # Resolve engine source up front so even resolver-failure paths report it
+    _engine, engine_source = await _get_engine(request)
+
+    resolver_chain: List[Dict[str, Any]] = []
+
+    def _finalize_success(result: Dict[str, Any], resolver_meta: Dict[str, Any]) -> Dict[str, Any]:
+        return _envelope_from_payload_result(
+            result=result, page=page, request_id=request_id, started_at=started_at,
+            resolver_meta=resolver_meta, resolver_chain=resolver_chain,
+            engine_source=engine_source, operation=operation,
+        )
+
+    # Stage 1: top10 builder (Top_10_Investments only)
     if _prefer_top10_builder(page, operation=operation):
-        top10_result, top10_meta = await _run_top10_builder(request=request, payload=payload, page=page)
-        if top10_result is not None:
-            return _envelope_from_payload_result(result=top10_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=top10_meta or {"source": "top10_builder", "kind": "direct"}, operation=operation)
+        result, meta = await _run_top10_builder(request=request, payload=payload, page=page)
+        resolver_chain.append(meta)
+        if result is not None:
+            return _finalize_success(result, meta)
 
+    # Stage 2: direct-bridge cascade for derived/base pages with sheet_rows op
     if _prefer_direct_bridge(page, operation=operation):
-        analysis_result = await _delegate_to_analysis_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
-        if analysis_result is not None:
-            return _envelope_from_payload_result(result=analysis_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(analysis_result).get("resolver"), operation=operation)
-        advanced_result = await _delegate_to_advanced_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
-        if advanced_result is not None:
-            return _envelope_from_payload_result(result=advanced_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(advanced_result).get("resolver"), operation=operation)
-        engine_result = await _run_engine_sheet_rows_fallback(request=request, payload=payload, request_id=request_id)
-        if engine_result is not None:
-            return _envelope_from_payload_result(result=engine_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(engine_result).get("resolver"), operation=operation)
+        result, meta = await _delegate_to_analysis_bridge(
+            request=request, payload=payload, token=token, x_app_token=x_app_token,
+            authorization=authorization, x_request_id=request_id,
+        )
+        resolver_chain.append(meta)
+        if result is not None:
+            return _finalize_success(result, meta)
 
+        result, meta = await _delegate_to_advanced_bridge(
+            request=request, payload=payload, token=token, x_app_token=x_app_token,
+            authorization=authorization, x_request_id=request_id,
+        )
+        resolver_chain.append(meta)
+        if result is not None:
+            return _finalize_success(result, meta)
+
+        result, meta = await _run_engine_sheet_rows_fallback(
+            request=request, payload=payload, request_id=request_id,
+        )
+        resolver_chain.append(meta)
+        if result is not None:
+            return _finalize_success(result, meta)
+
+    # Stage 3: advisor runner (for non-derived pages with recommendations/run)
     if _prefer_runner(page, operation=operation):
-        runner_result, runner_meta = await _run_advisor_runner(request=request, payload=payload, page=page)
-        if runner_result is not None:
-            return _envelope_from_payload_result(result=runner_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=runner_meta, operation=operation)
+        result, meta = await _run_advisor_runner(request=request, payload=payload, page=page)
+        resolver_chain.append(meta)
+        if result is not None:
+            return _finalize_success(result, meta)
 
-    analysis_result = await _delegate_to_analysis_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
-    if analysis_result is not None:
-        return _envelope_from_payload_result(result=analysis_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(analysis_result).get("resolver"), operation=operation)
-    advanced_result = await _delegate_to_advanced_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
-    if advanced_result is not None:
-        return _envelope_from_payload_result(result=advanced_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(advanced_result).get("resolver"), operation=operation)
-    engine_result = await _run_engine_sheet_rows_fallback(request=request, payload=payload, request_id=request_id)
-    if engine_result is not None:
-        return _envelope_from_payload_result(result=engine_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(engine_result).get("resolver"), operation=operation)
+    # Stage 4: universal fallback cascade
+    result, meta = await _delegate_to_analysis_bridge(
+        request=request, payload=payload, token=token, x_app_token=x_app_token,
+        authorization=authorization, x_request_id=request_id,
+    )
+    resolver_chain.append(meta)
+    if result is not None:
+        return _finalize_success(result, meta)
 
-    raise HTTPException(status_code=503, detail="Advisor router could not resolve a usable bridge, builder, or engine provider")
+    result, meta = await _delegate_to_advanced_bridge(
+        request=request, payload=payload, token=token, x_app_token=x_app_token,
+        authorization=authorization, x_request_id=request_id,
+    )
+    resolver_chain.append(meta)
+    if result is not None:
+        return _finalize_success(result, meta)
+
+    result, meta = await _run_engine_sheet_rows_fallback(
+        request=request, payload=payload, request_id=request_id,
+    )
+    resolver_chain.append(meta)
+    if result is not None:
+        return _finalize_success(result, meta)
+
+    # All resolvers exhausted — return diagnostic envelope (NOT bare 503)
+    try:
+        logger.warning(
+            "[advisor v%s] resolver_chain_exhausted page=%s operation=%s engine_source=%s attempts=%d",
+            ADVISOR_VERSION, page, operation, engine_source, len(resolver_chain),
+        )
+    except Exception:
+        pass
+    return _envelope_error(
+        page=page, request_id=request_id, started_at=started_at,
+        error="No resolver returned a usable payload (advisor v{} resolver chain exhausted)".format(ADVISOR_VERSION),
+        error_class="ResolverChainExhausted",
+        resolver_chain=resolver_chain,
+        engine_source=engine_source,
+        operation=operation,
+        handler="_run_advisor_logic",
+        status_code_hint=503,
+    )
 
 
+# =============================================================================
+# Routes — v6.7.0 [FIX-6] all wrapped in handler-level try/except
+# =============================================================================
 @router.get("/health")
 @router.get("/healthz")
 @router.get("/ping")
 async def advisor_health(request: Request) -> Dict[str, Any]:
-    engine = await _get_engine(request)
-    analysis_impl, analysis_meta = await _resolve_analysis_bridge_impl()
-    advanced_impl, advanced_meta = await _resolve_advanced_bridge_impl()
-    runner, runner_meta = await _resolve_advisor_runner(request, page=DEFAULT_ADVISOR_PAGE)
-    top10_builder, top10_meta = await _resolve_top10_builder(request)
-    settings_summary: Dict[str, Any] = {}
+    started_at = time.perf_counter()
     try:
-        settings = get_settings_cached()
-        if isinstance(settings, Mapping):
-            for key in ("APP_VERSION", "ENV", "OPEN_MODE", "REQUIRE_AUTH"):
-                value = settings.get(key)
-                if value not in (None, ""):
-                    settings_summary[key] = value
-    except Exception:
-        settings_summary = {}
-    contract_counts = {k: _contract_header_count(k) for k in KNOWN_CANONICAL_HEADER_COUNTS.keys()}
-    return _json_safe({
-        "status": "ok" if (engine is not None or analysis_impl is not None or advanced_impl is not None) else "degraded",
-        "version": ADVISOR_VERSION,
-        "short_family": True,
-        "engine_available": bool(engine),
-        "engine_type": _safe_engine_type(engine),
-        "analysis_bridge_available": bool(analysis_impl),
-        "analysis_bridge": analysis_meta or None,
-        "advanced_bridge_available": bool(advanced_impl),
-        "advanced_bridge": advanced_meta or None,
-        "advisor_runner_available": bool(runner),
-        "advisor_runner": runner_meta or None,
-        "top10_builder_available": bool(top10_builder),
-        "top10_builder": top10_meta or None,
-        "default_page": DEFAULT_ADVISOR_PAGE,
-        "base_pages": sorted(BASE_PAGES),
-        "derived_pages": sorted(DERIVED_PAGES),
-        "contract_header_counts": contract_counts,
-        "open_mode": _is_open_mode_enabled(),
-        "settings": settings_summary or None,
-        "timestamp_utc": _now_utc(),
-        "request_id": _strip(getattr(request.state, "request_id", "")) or None,
-    })
+        engine, engine_source = await _get_engine(request)
+        analysis_impl, analysis_meta = await _resolve_analysis_bridge_impl()
+        advanced_impl, advanced_meta = await _resolve_advanced_bridge_impl()
+        runner, runner_meta = await _resolve_advisor_runner(request, page=DEFAULT_ADVISOR_PAGE)
+        top10_builder, top10_meta = await _resolve_top10_builder(request)
+        settings_summary: Dict[str, Any] = {}
+        try:
+            settings = get_settings_cached()
+            if isinstance(settings, Mapping):
+                for key in ("APP_VERSION", "ENV", "OPEN_MODE", "REQUIRE_AUTH"):
+                    value = settings.get(key)
+                    if value not in (None, ""):
+                        settings_summary[key] = value
+        except Exception:
+            settings_summary = {}
+        contract_counts = {k: _contract_header_count(k) for k in KNOWN_CANONICAL_HEADER_COUNTS.keys()}
+        return _json_safe({
+            "status": "ok" if (engine is not None or analysis_impl is not None or advanced_impl is not None) else "degraded",
+            "version": ADVISOR_VERSION,
+            "short_family": True,
+            "engine_available": bool(engine),
+            "engine_type": _safe_engine_type(engine),
+            "engine_source": engine_source,
+            "analysis_bridge_available": bool(analysis_impl),
+            "analysis_bridge": analysis_meta or None,
+            "advanced_bridge_available": bool(advanced_impl),
+            "advanced_bridge": advanced_meta or None,
+            "advisor_runner_available": bool(runner),
+            "advisor_runner": runner_meta or None,
+            "top10_builder_available": bool(top10_builder),
+            "top10_builder": top10_meta or None,
+            "default_page": DEFAULT_ADVISOR_PAGE,
+            "base_pages": sorted(BASE_PAGES),
+            "derived_pages": sorted(DERIVED_PAGES),
+            "contract_header_counts": contract_counts,
+            "open_mode": _is_open_mode_enabled(),
+            "settings": settings_summary or None,
+            "timestamp_utc": _now_utc(),
+            "request_id": _strip(getattr(request.state, "request_id", "")) or None,
+        })
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[advisor v%s] handler exception in advisor_health", ADVISOR_VERSION)
+        return _make_handler_exception_response("advisor_health", exc, page="", started_at=started_at)
 
 
 @router.get("/meta")
 async def advisor_meta(request: Request) -> Dict[str, Any]:
-    engine = await _get_engine(request)
-    analysis_impl, analysis_meta = await _resolve_analysis_bridge_impl()
-    advanced_impl, advanced_meta = await _resolve_advanced_bridge_impl()
-    runner, runner_meta = await _resolve_advisor_runner(request, page=DEFAULT_ADVISOR_PAGE)
-    top10_builder, top10_meta = await _resolve_top10_builder(request)
-    return _json_safe({
-        "status": "success",
-        "version": ADVISOR_VERSION,
-        "route_family": "advisor_short",
-        "default_page": DEFAULT_ADVISOR_PAGE,
-        "engine_present": bool(engine),
-        "engine_type": _safe_engine_type(engine),
-        "analysis_bridge_available": bool(analysis_impl),
-        "analysis_bridge": analysis_meta or None,
-        "advanced_bridge_available": bool(advanced_impl),
-        "advanced_bridge": advanced_meta or None,
-        "advisor_runner_available": bool(runner),
-        "advisor_runner": runner_meta or None,
-        "top10_builder_available": bool(top10_builder),
-        "top10_builder": top10_meta or None,
-        "contract_header_counts": {k: _contract_header_count(k) for k in KNOWN_CANONICAL_HEADER_COUNTS.keys()},
-        "timestamp_utc": _now_utc(),
-        "request_id": _strip(getattr(request.state, "request_id", "")) or None,
-    })
+    started_at = time.perf_counter()
+    try:
+        engine, engine_source = await _get_engine(request)
+        analysis_impl, analysis_meta = await _resolve_analysis_bridge_impl()
+        advanced_impl, advanced_meta = await _resolve_advanced_bridge_impl()
+        runner, runner_meta = await _resolve_advisor_runner(request, page=DEFAULT_ADVISOR_PAGE)
+        top10_builder, top10_meta = await _resolve_top10_builder(request)
+        return _json_safe({
+            "status": "success",
+            "version": ADVISOR_VERSION,
+            "route_family": "advisor_short",
+            "default_page": DEFAULT_ADVISOR_PAGE,
+            "engine_present": bool(engine),
+            "engine_type": _safe_engine_type(engine),
+            "engine_source": engine_source,
+            "analysis_bridge_available": bool(analysis_impl),
+            "analysis_bridge": analysis_meta or None,
+            "advanced_bridge_available": bool(advanced_impl),
+            "advanced_bridge": advanced_meta or None,
+            "advisor_runner_available": bool(runner),
+            "advisor_runner": runner_meta or None,
+            "top10_builder_available": bool(top10_builder),
+            "top10_builder": top10_meta or None,
+            "contract_header_counts": {k: _contract_header_count(k) for k in KNOWN_CANONICAL_HEADER_COUNTS.keys()},
+            "upstream_diagnostic_keys_count": len(_UPSTREAM_DIAGNOSTIC_META_KEYS),
+            "timestamp_utc": _now_utc(),
+            "request_id": _strip(getattr(request.state, "request_id", "")) or None,
+        })
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[advisor v%s] handler exception in advisor_meta", ADVISOR_VERSION)
+        return _make_handler_exception_response("advisor_meta", exc, page="", started_at=started_at)
 
 
 @router.get("/metrics")
 async def advisor_metrics() -> Response:
     if not PROMETHEUS_AVAILABLE or generate_latest is None:
         return Response(content="Metrics not available", media_type="text/plain", status_code=503)
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    try:
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    except Exception as exc:
+        logger.exception("[advisor v%s] handler exception in advisor_metrics", ADVISOR_VERSION)
+        return Response(content="Metrics generation failed: {}".format(exc), media_type="text/plain", status_code=500)
 
 
 @router.get("/sheet-rows")
 @router.get("/sheet_rows")
 async def advisor_sheet_rows_get(request: Request, page: Optional[str] = Query(default=None), sheet: Optional[str] = Query(default=None), sheet_name: Optional[str] = Query(default=None), name: Optional[str] = Query(default=None), tab: Optional[str] = Query(default=None), symbol: Optional[str] = Query(default=None), ticker: Optional[str] = Query(default=None), symbols: Optional[str] = Query(default=None), tickers: Optional[str] = Query(default=None), mode: str = Query(default="live"), include_matrix: Optional[bool] = Query(default=None), schema_only: Optional[bool] = Query(default=None), headers_only: Optional[bool] = Query(default=None), top_n: Optional[int] = Query(default=None, ge=1, le=500), limit: int = Query(default=200, ge=1, le=5000), offset: int = Query(default=0, ge=0), token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(default=None, alias="Authorization"), x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")) -> Dict[str, Any]:
-    payload = _payload_from_get(page=page, sheet=sheet, sheet_name=sheet_name, name=name, tab=tab, symbol=symbol, ticker=ticker, symbols=symbols, tickers=tickers, mode=mode, include_matrix=include_matrix, schema_only=schema_only, headers_only=headers_only, top_n=top_n, limit=limit, offset=offset)
-    return await _run_advisor_logic(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="sheet_rows")
+    started_at = time.perf_counter()
+    fallback_page = _canonicalize_page_name(page or sheet or sheet_name or name or tab or DEFAULT_ADVISOR_PAGE) or DEFAULT_ADVISOR_PAGE
+    request_id = _request_id(request, x_request_id)
+    try:
+        payload = _payload_from_get(page=page, sheet=sheet, sheet_name=sheet_name, name=name, tab=tab, symbol=symbol, ticker=ticker, symbols=symbols, tickers=tickers, mode=mode, include_matrix=include_matrix, schema_only=schema_only, headers_only=headers_only, top_n=top_n, limit=limit, offset=offset)
+        return await _run_advisor_logic(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="sheet_rows")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[advisor v%s] handler exception in advisor_sheet_rows_get", ADVISOR_VERSION)
+        return _make_handler_exception_response("advisor_sheet_rows_get", exc, page=fallback_page, request_id=request_id, started_at=started_at)
 
 
 @router.post("/sheet-rows")
 @router.post("/sheet_rows")
 async def advisor_sheet_rows_post(request: Request, body: Dict[str, Any] = Body(default_factory=dict), token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(default=None, alias="Authorization"), x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")) -> Dict[str, Any]:
-    return await _run_advisor_logic(request=request, payload=_safe_dict(body), token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="sheet_rows")
+    started_at = time.perf_counter()
+    fallback_page = _extract_page(_safe_dict(body))
+    request_id = _request_id(request, x_request_id)
+    try:
+        return await _run_advisor_logic(request=request, payload=_safe_dict(body), token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="sheet_rows")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[advisor v%s] handler exception in advisor_sheet_rows_post", ADVISOR_VERSION)
+        return _make_handler_exception_response("advisor_sheet_rows_post", exc, page=fallback_page, request_id=request_id, started_at=started_at)
 
 
 @router.get("/recommendations")
 async def advisor_recommendations_get(request: Request, symbol: Optional[str] = Query(default=None), ticker: Optional[str] = Query(default=None), symbols: Optional[str] = Query(default=None), tickers: Optional[str] = Query(default=None), page: Optional[str] = Query(default=DEFAULT_ADVISOR_PAGE), mode: str = Query(default="live"), top_n: int = Query(default=10, ge=1, le=100), limit: int = Query(default=200, ge=1, le=5000), offset: int = Query(default=0, ge=0), include_matrix: Optional[bool] = Query(default=None), token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(default=None, alias="Authorization"), x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")) -> Dict[str, Any]:
-    payload = _payload_from_get(page=page, sheet=None, sheet_name=None, name=None, tab=None, symbol=symbol, ticker=ticker, symbols=symbols, tickers=tickers, mode=mode, include_matrix=include_matrix, schema_only=None, headers_only=None, top_n=top_n, limit=limit, offset=offset)
-    return await _run_advisor_logic(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="recommendations")
+    started_at = time.perf_counter()
+    fallback_page = _canonicalize_page_name(page or DEFAULT_ADVISOR_PAGE) or DEFAULT_ADVISOR_PAGE
+    request_id = _request_id(request, x_request_id)
+    try:
+        payload = _payload_from_get(page=page, sheet=None, sheet_name=None, name=None, tab=None, symbol=symbol, ticker=ticker, symbols=symbols, tickers=tickers, mode=mode, include_matrix=include_matrix, schema_only=None, headers_only=None, top_n=top_n, limit=limit, offset=offset)
+        return await _run_advisor_logic(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="recommendations")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[advisor v%s] handler exception in advisor_recommendations_get", ADVISOR_VERSION)
+        return _make_handler_exception_response("advisor_recommendations_get", exc, page=fallback_page, request_id=request_id, started_at=started_at)
 
 
 @router.post("/recommendations")
 async def advisor_recommendations_post(request: Request, body: Dict[str, Any] = Body(default_factory=dict), token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(default=None, alias="Authorization"), x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")) -> Dict[str, Any]:
-    payload = _safe_dict(body)
-    payload.setdefault("page", payload.get("sheet") or payload.get("sheet_name") or DEFAULT_ADVISOR_PAGE)
-    return await _run_advisor_logic(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="recommendations")
+    started_at = time.perf_counter()
+    fallback_page = _extract_page(_safe_dict(body))
+    request_id = _request_id(request, x_request_id)
+    try:
+        payload = _safe_dict(body)
+        payload.setdefault("page", payload.get("sheet") or payload.get("sheet_name") or DEFAULT_ADVISOR_PAGE)
+        return await _run_advisor_logic(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="recommendations")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[advisor v%s] handler exception in advisor_recommendations_post", ADVISOR_VERSION)
+        return _make_handler_exception_response("advisor_recommendations_post", exc, page=fallback_page, request_id=request_id, started_at=started_at)
 
 
 @router.get("/run")
 async def advisor_run_get(request: Request, page: Optional[str] = Query(default=DEFAULT_ADVISOR_PAGE), symbols: Optional[str] = Query(default=None), tickers: Optional[str] = Query(default=None), mode: str = Query(default="live"), top_n: int = Query(default=10, ge=1, le=100), limit: int = Query(default=200, ge=1, le=5000), offset: int = Query(default=0, ge=0), token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(default=None, alias="Authorization"), x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")) -> Dict[str, Any]:
-    payload = _payload_from_get(page=page, sheet=None, sheet_name=None, name=None, tab=None, symbol=None, ticker=None, symbols=symbols, tickers=tickers, mode=mode, include_matrix=None, schema_only=None, headers_only=None, top_n=top_n, limit=limit, offset=offset)
-    return await _run_advisor_logic(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="run")
+    started_at = time.perf_counter()
+    fallback_page = _canonicalize_page_name(page or DEFAULT_ADVISOR_PAGE) or DEFAULT_ADVISOR_PAGE
+    request_id = _request_id(request, x_request_id)
+    try:
+        payload = _payload_from_get(page=page, sheet=None, sheet_name=None, name=None, tab=None, symbol=None, ticker=None, symbols=symbols, tickers=tickers, mode=mode, include_matrix=None, schema_only=None, headers_only=None, top_n=top_n, limit=limit, offset=offset)
+        return await _run_advisor_logic(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="run")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[advisor v%s] handler exception in advisor_run_get", ADVISOR_VERSION)
+        return _make_handler_exception_response("advisor_run_get", exc, page=fallback_page, request_id=request_id, started_at=started_at)
 
 
 @router.post("/run")
 async def advisor_run_post(request: Request, body: Dict[str, Any] = Body(default_factory=dict), token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(default=None, alias="Authorization"), x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")) -> Dict[str, Any]:
-    return await _run_advisor_logic(request=request, payload=_safe_dict(body), token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="run")
+    started_at = time.perf_counter()
+    fallback_page = _extract_page(_safe_dict(body))
+    request_id = _request_id(request, x_request_id)
+    try:
+        return await _run_advisor_logic(request=request, payload=_safe_dict(body), token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id, operation="run")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[advisor v%s] handler exception in advisor_run_post", ADVISOR_VERSION)
+        return _make_handler_exception_response("advisor_run_post", exc, page=fallback_page, request_id=request_id, started_at=started_at)
 
 
-__all__ = ["router", "ADVISOR_VERSION"]
+__all__ = [
+    "router",
+    "ADVISOR_VERSION",
+    "CORE_ENGINE_SOURCE",
+    "KNOWN_CANONICAL_HEADER_COUNTS",
+    "_UPSTREAM_DIAGNOSTIC_META_KEYS",
+]
