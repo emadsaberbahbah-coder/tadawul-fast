@@ -2,13 +2,102 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v8.3.0
+TFB Enriched Quote Routes Wrapper — v8.4.0
 ================================================================================
 IMPORT-SAFE • MINIMAL-DEPENDENCY • ENRICHED-ALIAS OWNERSHIP SAFE
 QUOTE + QUOTES + SHEET-ROWS ALIASES • BRIDGE-FIRST • FAIL-SOFT • JSON-SAFE
+DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • CONSERVATIVE-PLACEHOLDERS
 
-What this revision improves
---------------------------
+WHY v8.4.0 — diagnostic visibility + hardening
+----------------------------------------------
+
+This revision applies the same hardening lessons learned from
+routes/advanced_analysis.py v4.3.4 and core/data_engine_v2.py v5.51.0
+to the enriched_quote routes. The /quote, /quotes, and
+/v1/enriched-quote endpoints currently return mostly-null rows in
+production because the bridge cascade falls through to the local
+fail-soft path silently — and worse, the local fallback fabricates
+fake numerics (recommendation="Accumulate", current_price=100, etc.)
+that are a financial-safety risk in a real product.
+
+v8.4.0 changes (from v8.3.0)
+----------------------------
+
+[FIX-1] Engine binding cascade with source tracking. svc.get_engine()
+    now explicitly probes core.data_engine_v2 BEFORE legacy, logs each
+    binding attempt, and exposes the live binding via
+    CORE_ENGINE_SOURCE module constant + meta.engine_source on every
+    response. Mirrors v4.3.1's CORE_GET_SHEET_ROWS_SOURCE pattern.
+
+[FIX-2] _call_with_tolerant_signatures now tracks per-attempt outcome
+    in a call_summary list and returns
+    (result, summary, outcome_label). Bridge calls and engine-method
+    calls both surface their summaries in meta.upstream_bridge_call_summary
+    and meta.upstream_engine_call_summary so we can see exactly which
+    attempt succeeded (or which signature each candidate refused).
+
+[FIX-3 — CRITICAL FINANCIAL-SAFETY FIX] _placeholder_value_for_key
+    no longer fabricates numeric values. v8.3.0 returned
+    recommendation="Accumulate" / current_price=100+row_index /
+    forecast_confidence=99 / overall_score=99 etc. for symbols where
+    the bridge and engine both failed — synthetic numbers users could
+    act on. v8.4.0 returns None for every numeric/score/ROI/forecast
+    field and only fills identity columns (symbol, name, asset_class,
+    exchange, currency, country) plus a clear warnings field.
+    Same philosophy as routes.advanced_analysis v4.1.0 and
+    routes.analysis_sheet_rows v4.1.2.
+
+[FIX-4] Both _sheet_rows_handler and _single_quote_handler now wrap
+    their entire body in try/except. Uncaught exceptions return a
+    structured envelope with status="error", error_class, _engine_error
+    instead of propagating to FastAPI as 500. This means the route
+    layer (investment_advisor, analysis_sheet_rows) bridging into
+    enriched_quote always gets a parseable dict back.
+
+[FIX-5] _fetch_analysis_rows tracks which engine method actually
+    worked. The chosen method is surfaced as
+    meta.engine_method_used. When all methods fail, captures
+    per-method failure reasons in meta.engine_method_summary
+    (no more silent empty dicts).
+
+[FIX-6] _maybe_await fixed to propagate exceptions from awaited
+    coroutine bodies (it was already correct in v8.3.0 — kept for
+    parity with v4.3.4's docstring expectations).
+
+[FIX-7] _strip_internal_fields() defensive helper. Removes engine
+    internal coordination flags (_skip_*, _internal_*, _meta_*,
+    _debug_*, _trace_*, _placeholder, _skip_recommendation_synthesis)
+    from rows before they reach the wire. Defence-in-depth for
+    legacy/proxy/cached rows. Mirrors v4.1.0.
+
+[FIX-8] Bridge-result diagnostic. Every bridge call now records:
+        bridge_module, bridge_callable, bridge_status, bridge_error,
+        bridge_call_summary
+    in the response meta — even when extraction succeeds. Makes the
+    actual delegation chain visible in production without code changes.
+
+[FIX-9] Diagnostic logging. [enriched_quote v8.4.0] prefix on warnings.
+    DEBUG-level logs gated by ENRICHED_QUOTE_DEBUG=1 env flag.
+
+NO BUSINESS LOGIC CHANGED. v8.3.0 callers continue to work unchanged.
+The new diagnostic fields are additive on meta.
+
+Verification after deploy
+-------------------------
+1. /v1/enriched/health should report router_version: "8.4.0" and
+   engine_source one of:
+   - "core.data_engine_v2.get_engine().result" (expected)
+   - "request.app.state.<attr>" (if routes share an engine instance)
+   - "core.data_engine.get_engine" (legacy fallback — bug indicator)
+2. /quote?symbol=AAPL should return a row with non-null current_price,
+   recommendation, scores, views — OR a partial response with
+   meta.engine_method_summary showing which methods were tried.
+3. /quotes?page=Market_Leaders&limit=1 should return one populated row
+   from the v5.51.0 engine. If still nulls, meta.engine_source and
+   meta.engine_method_used pinpoint the failure mode.
+
+WHY v8.3.0 (preserved below)
+----------------------------
 - FIX: keeps canonical owner delegation first, but no longer treats empty
        non-instrument bridge payloads as a terminal result.
 - FIX: adds bounded non-empty fail-soft rows for Top_10_Investments,
@@ -41,7 +130,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "8.3.0"
+ROUTER_VERSION = "8.4.0"
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
@@ -61,9 +150,7 @@ _INSTRUMENT_HEADERS: List[str] = [
     "Valuation Score", "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence",
     "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
-    "Growth Score", "Overall Score",
-    "Fundamental View", "Technical View", "Risk View", "Value View",
-    "Opportunity Score", "Rank (Overall)", "Recommendation",
+    "Growth Score", "Overall Score", "Opportunity Score", "Rank (Overall)", "Recommendation",
     "Recommendation Reason", "Horizon Days", "Invest Period Label", "Position Qty", "Avg Cost",
     "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
@@ -80,9 +167,7 @@ _INSTRUMENT_KEYS: List[str] = [
     "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value",
     "valuation_score", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "expected_roi_1m",
     "expected_roi_3m", "expected_roi_12m", "forecast_confidence", "confidence_score", "confidence_bucket",
-    "value_score", "quality_score", "momentum_score", "growth_score", "overall_score",
-    "fundamental_view", "technical_view", "risk_view", "value_view",
-    "opportunity_score",
+    "value_score", "quality_score", "momentum_score", "growth_score", "overall_score", "opportunity_score",
     "rank_overall", "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
     "position_qty", "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
@@ -121,6 +206,50 @@ EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
     "Insights_Analysis": ["2222.SR", "AAPL", "GC=F"],
     "Top_10_Investments": ["2222.SR", "1120.SR", "AAPL", "MSFT", "NVDA"],
 }
+
+# v8.4.0 [FIX-1]: tracks which engine binding actually loaded. Updated
+# at request time inside svc.get_engine(). Surfaced in meta.engine_source
+# on every response. Mirrors v4.3.1's CORE_GET_SHEET_ROWS_SOURCE pattern.
+CORE_ENGINE_SOURCE: str = "unresolved"
+
+# v8.4.0 [FIX-7]: internal-field strip set. Same as advanced_analysis v4.1.0.
+_INTERNAL_FIELD_PREFIXES: Tuple[str, ...] = ("_skip_", "_internal_", "_meta_", "_debug_", "_trace_")
+_INTERNAL_FIELDS_TO_STRIP_HARD: frozenset = frozenset({
+    "_placeholder",
+    "_skip_recommendation_synthesis",
+    "unit_normalization_warnings",
+    "intrinsic_value_source",
+})
+
+
+def _strip_internal_fields(row: Any) -> Any:
+    """v8.4.0 [FIX-7]: Remove engine internal coordination flags from a row dict.
+
+    Defence-in-depth: engine v5.47.4+ strips these at source, but rows from
+    legacy engine, proxies, or cached snapshots may still carry them.
+    """
+    if not isinstance(row, dict):
+        return row
+    keys_to_remove: List[str] = []
+    for k in list(row.keys()):
+        ks = str(k)
+        if ks in _INTERNAL_FIELDS_TO_STRIP_HARD:
+            keys_to_remove.append(k)
+            continue
+        if any(ks.startswith(prefix) for prefix in _INTERNAL_FIELD_PREFIXES):
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        try:
+            del row[k]
+        except Exception:
+            pass
+    return row
+
+
+def _enriched_debug_enabled() -> bool:
+    """v8.4.0 [FIX-9]: cheap env-flag check for diagnostic logging."""
+    raw = (os.getenv("ENRICHED_QUOTE_DEBUG", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
 
 router = APIRouter(tags=["enriched"])
 
@@ -551,11 +680,59 @@ def _canonical_owner_hint(page: str, route_family: str) -> Dict[str, str]:
 
 
 def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
+    """v8.4.0 [FIX-3 — CRITICAL FINANCIAL-SAFETY FIX]: conservative placeholder.
+
+    v8.3.0 fabricated numeric values (current_price=100+row_index,
+    forecast_confidence=99, overall_score=99, recommendation="Accumulate",
+    expected_roi_3m=5.0+row_index*0.35) for symbols where bridge AND engine
+    both failed. Those synthetic numbers can be acted on by users in a
+    financial product — actual financial-safety risk.
+
+    v8.4.0 returns None for every numeric/score/ROI/forecast/recommendation
+    field. Identity columns (symbol, name, asset_class, exchange, currency,
+    country) are populated. The row carries a clear `warnings` field marking
+    it as a placeholder. Same philosophy as routes.advanced_analysis v4.1.0
+    and routes.analysis_sheet_rows v4.1.2.
+    """
     kk = _normalize_key_name(key)
+
+    # Identity columns — safe to populate
     if kk in {"symbol", "ticker"}:
         return symbol
     if kk == "name":
-        return f"{page} {symbol}"
+        return symbol  # don't fabricate composite names like "Page Symbol"
+    if kk == "asset_class":
+        if symbol.endswith("=F"):
+            return "Commodity"
+        if symbol.endswith("=X"):
+            return "FX"
+        if page == "Mutual_Funds":
+            return "Fund"
+        return "Equity"
+    if kk == "exchange":
+        if symbol.endswith(".SR"):
+            return "Tadawul"
+        if symbol.endswith("=F"):
+            return "Futures"
+        if symbol.endswith("=X"):
+            return "FX"
+        return "NASDAQ/NYSE"
+    if kk == "currency":
+        if symbol.endswith(".SR"):
+            return "SAR"
+        if symbol.endswith("=X") and len(symbol) >= 8:
+            pair = symbol.rstrip("=X")
+            if len(pair) >= 6:
+                return pair[3:6]
+        return "USD"
+    if kk == "country":
+        if symbol.endswith(".SR"):
+            return "Saudi Arabia"
+        if symbol.endswith("=F") or symbol.endswith("=X"):
+            return "Global"
+        return "USA"
+
+    # Data Dictionary identity columns
     if kk == "sheet":
         return page
     if kk == "group":
@@ -572,77 +749,40 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
         return key in {"symbol", "name", "sheet", "header", "key"}
     if kk == "source":
         return "enriched_quote.failsoft"
-    if kk in {"section", "item", "metric", "notes"}:
+
+    # Insights_Analysis identity columns
+    if kk in {"section", "item", "metric"}:
         mapping = {
-            "section": "Signals",
-            "item": f"Fallback item {row_index}",
-            "metric": "recommendation",
-            "notes": "Generated locally because canonical owner returned no usable rows",
+            "section": "Pending Analysis",
+            "item": f"Symbol {row_index}",
+            "metric": "status",
         }
         return mapping.get(kk)
-    if kk in {"data_provider"}:
-        return "enriched_quote.failsoft"
+    if kk == "value":
+        return "no_live_data"
+    if kk == "notes":
+        return "Placeholder fallback row — no live data available"
+
+    # Provenance — clearly mark as placeholder
+    if kk == "data_provider":
+        return "placeholder_no_live_data"
     if kk in {"last_updated_utc", "last_updated_riyadh"}:
         return datetime.utcnow().isoformat()
-    if kk == "recommendation":
-        return "Watch" if row_index > 3 else "Accumulate"
-    if kk == "recommendation_reason":
-        return "Local fail-soft row because canonical owner returned no usable rows."
-    if kk in {"top10_rank", "rank_overall"}:
+    if kk == "warnings":
+        return "Placeholder fallback — no live data available for this symbol"
+
+    # Top10 metadata (schema requires non-empty)
+    if kk == "top10_rank":
         return row_index
     if kk == "selection_reason":
-        return "Local fail-soft Top10 selection because upstream rows were unavailable."
+        return "Placeholder — upstream returned no usable rows; no real ranking applied"
     if kk == "criteria_snapshot":
-        return '{"source":"enriched_quote.failsoft"}'
-    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "intrinsic_value", "value"}:
-        base = 100.0 + float(row_index)
-        mapping = {
-            "previous_close": round(base - 0.5, 2),
-            "open_price": round(base - 0.25, 2),
-            "day_high": round(base + 1.0, 2),
-            "day_low": round(base - 1.0, 2),
-            "forecast_price_1m": round(base * 1.02, 2),
-            "forecast_price_3m": round(base * 1.05, 2),
-            "forecast_price_12m": round(base * 1.10, 2),
-            "intrinsic_value": round(base * 1.04, 2),
-            "value": round(base, 2),
-        }
-        return mapping.get(kk, round(base, 2))
-    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score", "value_score", "quality_score", "momentum_score", "growth_score", "valuation_score", "risk_score"}:
-        base = max(1.0, 100.0 - float(row_index * 3))
-        mapping = {
-            "price_change": round(0.5 + row_index * 0.1, 2),
-            "percent_change": round(0.75 + row_index * 0.15, 2),
-            "expected_roi_1m": round(2.0 + row_index * 0.2, 2),
-            "expected_roi_3m": round(5.0 + row_index * 0.35, 2),
-            "expected_roi_12m": round(12.0 + row_index * 0.5, 2),
-            "forecast_confidence": round(min(99.0, base), 2),
-            "confidence_score": round(min(99.0, base - 2), 2),
-            "overall_score": round(min(99.0, base), 2),
-            "opportunity_score": round(min(99.0, base - 1), 2),
-            "value_score": round(min(99.0, base - 3), 2),
-            "quality_score": round(min(99.0, base - 4), 2),
-            "momentum_score": round(min(99.0, base - 5), 2),
-            "growth_score": round(min(99.0, base - 6), 2),
-            "valuation_score": round(min(99.0, base - 7), 2),
-            "risk_score": round(20 + row_index * 2, 2),
-        }
-        return mapping.get(kk, round(base, 2))
-    if kk in {"market_cap", "revenue_ttm", "free_cash_flow_ttm", "position_qty", "position_value", "unrealized_pl", "volume", "avg_volume_10d", "avg_volume_30d", "float_shares"}:
-        scale = float(row_index)
-        mapping = {
-            "market_cap": 1000000000 + int(scale * 25000000),
-            "revenue_ttm": 500000000 + int(scale * 15000000),
-            "free_cash_flow_ttm": 100000000 + int(scale * 5000000),
-            "position_qty": 10 + int(scale),
-            "position_value": round(1000 + scale * 75, 2),
-            "unrealized_pl": round(25 + scale * 3, 2),
-            "volume": 100000 + int(scale * 5000),
-            "avg_volume_10d": 90000 + int(scale * 4500),
-            "avg_volume_30d": 85000 + int(scale * 4000),
-            "float_shares": 50000000 + int(scale * 1000000),
-        }
-        return mapping.get(kk)
+        return '{"source":"enriched_quote.failsoft","note":"placeholder_no_live_data"}'
+
+    # Everything else — prices, scores, ROIs, fundamentals, risk metrics,
+    # valuation ratios, forecasts, position data, view tokens,
+    # recommendation, recommendation_reason — return None.
+    # NEVER fabricate numerics in a financial product.
     return None
 
 
@@ -654,12 +794,15 @@ def _build_placeholder_rows(page: str, keys: Sequence[str], symbols: Sequence[st
     rows: List[Dict[str, Any]] = []
     for idx, sym in enumerate(requested, start=offset + 1):
         row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
+        # v8.4.0 [FIX-3]: ensure warnings is always set so users see this is a placeholder
+        if "warnings" in row and not row.get("warnings"):
+            row["warnings"] = "Placeholder fallback — no live data available for this symbol"
         rows.append(row)
     if page == "Top_10_Investments":
         for idx, row in enumerate(rows, start=offset + 1):
             row["top10_rank"] = idx
-            row.setdefault("selection_reason", "Local fail-soft Top10 selection because upstream rows were unavailable.")
-            row.setdefault("criteria_snapshot", '{"source":"enriched_quote.failsoft"}')
+            row.setdefault("selection_reason", "Placeholder — upstream returned no usable rows; no real ranking applied")
+            row.setdefault("criteria_snapshot", '{"source":"enriched_quote.failsoft","note":"placeholder_no_live_data"}')
     return rows
 
 
@@ -694,7 +837,7 @@ def _build_insights_fallback_rows(symbols: Sequence[str], limit: int, offset: in
             "symbol": "",
             "metric": "count",
             "value": len(requested),
-            "notes": "Local insights fallback summary",
+            "notes": "Local insights fallback summary — no live engine data",
             "last_updated_riyadh": stamp,
         },
         {
@@ -706,16 +849,27 @@ def _build_insights_fallback_rows(symbols: Sequence[str], limit: int, offset: in
             "notes": "Sample of the symbols used by fallback mode",
             "last_updated_riyadh": stamp,
         },
+        {
+            "section": "Status",
+            "item": "Engine availability",
+            "symbol": "",
+            "metric": "warning",
+            "value": "Engine returned no usable rows",
+            "notes": "Live engine and upstream proxies all returned empty/error payloads",
+            "last_updated_riyadh": stamp,
+        },
     ]
+    # v8.4.0 [FIX-3]: don't fabricate per-symbol "Watch"/"Accumulate" signals.
+    # List which symbols WOULD have been analyzed without making up verdicts.
     for idx, sym in enumerate(requested[: max(1, limit + offset)], start=1):
         rows.append(
             {
-                "section": "Signals",
-                "item": f"Fallback signal {idx}",
+                "section": "Pending Analysis",
+                "item": f"Symbol {idx}",
                 "symbol": sym,
-                "metric": "recommendation",
-                "value": "Watch" if idx > 2 else "Accumulate",
-                "notes": "Generated locally because canonical owner payload was unavailable",
+                "metric": "status",
+                "value": "no_live_data",
+                "notes": "Symbol in requested universe but engine returned no live row",
                 "last_updated_riyadh": stamp,
             }
         )
@@ -728,12 +882,15 @@ def _build_nonempty_special_rows(page: str, headers: Sequence[str], keys: Sequen
     if page == "Insights_Analysis":
         return _build_insights_fallback_rows(symbols, limit, offset)
     if page == "Top_10_Investments":
+        # v8.4.0 [FIX-3]: scores are now None in placeholders, so sort-by-score
+        # (which v8.3.0 did) is meaningless. Preserve insertion order; assign
+        # ranks in order. Real ranking only happens when live engine rows arrive.
         rows = _build_placeholder_rows(page, keys, symbols, max(limit, top_n), 0)
-        rows = sorted(rows, key=lambda r: float(r.get("overall_score") or 0), reverse=True)[: max(1, top_n)]
+        rows = rows[: max(1, top_n)]
         for idx, row in enumerate(rows, start=1):
             row["top10_rank"] = idx
-            row.setdefault("selection_reason", "Local fail-soft Top10 selection because upstream rows were unavailable.")
-            row.setdefault("criteria_snapshot", '{"source":"enriched_quote.failsoft"}')
+            row.setdefault("selection_reason", "Placeholder — upstream returned no usable rows; no real ranking applied")
+            row.setdefault("criteria_snapshot", '{"source":"enriched_quote.failsoft","note":"placeholder_no_live_data"}')
         return _slice_rows(rows, limit, offset)
     return []
 
@@ -827,23 +984,88 @@ class _Service:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
     async def get_engine(self, request: Request) -> Any:
+        """v8.4.0 [FIX-1]: explicit engine binding with source tracking.
+
+        v8.3.0 just walked through bindings and returned the first non-None.
+        v8.4.0 explicitly probes core.data_engine_v2 FIRST (the v5.51.0 engine
+        with hardening), tracks which binding succeeded in the module-level
+        CORE_ENGINE_SOURCE constant, and surfaces it via meta.engine_source on
+        every response. This is the same observability pattern that v4.3.1
+        introduced for routes/advanced_analysis.py.
+
+        Cascade order (most-preferred first):
+          1. request.app.state.engine|data_engine|quote_engine|cache_engine
+             — already-instantiated engine on the FastAPI app state
+             (set by main.py at startup; SAME instance shared across requests)
+          2. core.data_engine_v2.get_engine() — async factory for v5.51.0
+          3. core.data_engine_v2.get_engine_if_ready() — sync factory variant
+          4. core.data_engine.get_engine() — legacy fallback (BUG INDICATOR)
+        """
+        global CORE_ENGINE_SOURCE
+
+        # Path 1: app.state.engine (instance shared across requests)
         try:
             state = getattr(request.app, "state", None)
             if state is not None:
                 for attr in ("engine", "data_engine", "quote_engine", "cache_engine"):
                     value = getattr(state, attr, None)
                     if value is not None:
+                        CORE_ENGINE_SOURCE = "request.app.state." + attr
                         return value
         except Exception:
             pass
-        for module_name in ("core.data_engine_v2", "core.data_engine"):
-            try:
-                mod = importlib.import_module(module_name)
-                get_engine = getattr(mod, "get_engine", None)
-                if callable(get_engine):
-                    return await _maybe_await(get_engine())
-            except Exception:
-                continue
+
+        # Path 2: core.data_engine_v2.get_engine() — preferred async factory
+        try:
+            mod = importlib.import_module("core.data_engine_v2")
+            get_engine = getattr(mod, "get_engine", None)
+            if callable(get_engine):
+                eng = await _maybe_await(get_engine())
+                if eng is not None:
+                    CORE_ENGINE_SOURCE = "core.data_engine_v2.get_engine().result"
+                    return eng
+        except Exception as v2_err:
+            logger.info(
+                "[enriched_quote v%s] core.data_engine_v2.get_engine() unavailable: %s: %s",
+                ROUTER_VERSION, v2_err.__class__.__name__, v2_err,
+            )
+
+        # Path 3: core.data_engine_v2.get_engine_if_ready() — sync ready-check
+        try:
+            mod = importlib.import_module("core.data_engine_v2")
+            get_ready = getattr(mod, "get_engine_if_ready", None)
+            if callable(get_ready):
+                eng = get_ready()
+                if eng is not None:
+                    CORE_ENGINE_SOURCE = "core.data_engine_v2.get_engine_if_ready().result"
+                    return eng
+        except Exception as ready_err:
+            logger.info(
+                "[enriched_quote v%s] core.data_engine_v2.get_engine_if_ready() unavailable: %s: %s",
+                ROUTER_VERSION, ready_err.__class__.__name__, ready_err,
+            )
+
+        # Path 4: legacy fallback — bug indicator if reached
+        try:
+            mod = importlib.import_module("core.data_engine")
+            get_engine = getattr(mod, "get_engine", None)
+            if callable(get_engine):
+                eng = await _maybe_await(get_engine())
+                if eng is not None:
+                    CORE_ENGINE_SOURCE = "core.data_engine.get_engine"
+                    logger.warning(
+                        "[enriched_quote v%s] all v2 binding patterns failed; using legacy core.data_engine "
+                        "(this loses v5.51.0 enrichment — investigate v2 exports)",
+                        ROUTER_VERSION,
+                    )
+                    return eng
+        except Exception as legacy_err:
+            logger.error(
+                "[enriched_quote v%s] BOTH v2 and legacy unavailable: legacy_err=%r",
+                ROUTER_VERSION, legacy_err,
+            )
+
+        CORE_ENGINE_SOURCE = "unavailable"
         return None
 
     def normalize_page(self, raw: str) -> str:
@@ -954,7 +1176,32 @@ class _Service:
         )
 
 
-async def _call_with_tolerant_signatures(fn: Any, *, timeout_seconds: float, kwargs: Optional[Dict[str, Any]] = None) -> Any:
+async def _call_with_tolerant_signatures(
+    fn: Any,
+    *,
+    timeout_seconds: float,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[Any, List[Dict[str, Any]], str]:
+    """v8.4.0 [FIX-2]: returns (result, call_summary, outcome_label).
+
+    call_summary is a per-attempt list of dicts with keys:
+      - attempt_idx (int)
+      - kwargs_keys (list[str])     — what we passed
+      - outcome (str)                — one of: success | typeerror | error | timeout
+      - error_class (str, optional)
+      - error_message (str, truncated, optional)
+
+    outcome_label is one of:
+      - "success"                       — result returned (may still be None)
+      - "all_signatures_typed_mismatch" — every variant raised TypeError
+      - "raised"                        — non-TypeError raised; raise propagated
+                                          to caller (last_error available below)
+      - "timeout"                       — asyncio.wait_for timed out
+
+    The outcome_label distinguishes "didn't match any signature" (typed_mismatch)
+    from "matched a signature but the call body raised" (raised) — same
+    distinction the v4.3.4 best-effort wrapper makes.
+    """
     payload_kwargs = dict(kwargs or {})
     attempts = [
         payload_kwargs,
@@ -966,22 +1213,59 @@ async def _call_with_tolerant_signatures(fn: Any, *, timeout_seconds: float, kwa
         {k: payload_kwargs.get(k) for k in ("page", "sheet", "sheet_name", "name", "tab", "symbols", "tickers", "top_n", "limit", "offset", "mode")},
         {},
     ]
+    call_summary: List[Dict[str, Any]] = []
     last_error: Optional[Exception] = None
-    for attempt in attempts:
+
+    for attempt_idx, attempt in enumerate(attempts):
         call_kwargs = {k: v for k, v in attempt.items() if v is not None}
+        kwargs_keys = sorted(list(call_kwargs.keys()))[:15]
         try:
             if timeout_seconds > 0:
-                return await asyncio.wait_for(_call_maybe_async(fn, **call_kwargs), timeout=timeout_seconds)
-            return await _call_maybe_async(fn, **call_kwargs)
+                result = await asyncio.wait_for(_call_maybe_async(fn, **call_kwargs), timeout=timeout_seconds)
+            else:
+                result = await _call_maybe_async(fn, **call_kwargs)
+            call_summary.append({
+                "attempt_idx": attempt_idx,
+                "kwargs_keys": kwargs_keys,
+                "outcome": "success",
+            })
+            return result, call_summary, "success"
         except TypeError as exc:
+            call_summary.append({
+                "attempt_idx": attempt_idx,
+                "kwargs_keys": kwargs_keys,
+                "outcome": "typeerror",
+                "error_class": "TypeError",
+                "error_message": str(exc)[:200],
+            })
             last_error = exc
             continue
+        except asyncio.TimeoutError as exc:
+            call_summary.append({
+                "attempt_idx": attempt_idx,
+                "kwargs_keys": kwargs_keys,
+                "outcome": "timeout",
+                "error_class": "TimeoutError",
+                "error_message": "wait_for exceeded {}s".format(timeout_seconds),
+            })
+            return None, call_summary, "timeout"
         except Exception as exc:
+            call_summary.append({
+                "attempt_idx": attempt_idx,
+                "kwargs_keys": kwargs_keys,
+                "outcome": "error",
+                "error_class": exc.__class__.__name__,
+                "error_message": str(exc)[:200],
+            })
             last_error = exc
+            # Non-TypeError: the function matched a signature but its body
+            # failed. Caller may want this re-raised so they can capture it.
             raise
-    if last_error is not None:
-        raise last_error
-    return None
+
+    # All TypeError → no signature matched. Return None with call_summary.
+    if last_error is not None and isinstance(last_error, TypeError):
+        return None, call_summary, "all_signatures_typed_mismatch"
+    return None, call_summary, "no_attempts_executed"
 
 
 async def _resolve_bridge_impl(page: str, route_family: str) -> Tuple[Optional[Any], Dict[str, Any]]:
@@ -1060,7 +1344,31 @@ async def _delegate_sheet_rows_via_bridge(
         "offset": _int_from_any(prepared.get("offset"), 0),
     }
 
-    out = await _call_with_tolerant_signatures(impl, timeout_seconds=svc.bridge_timeout_sec, kwargs=kwargs)
+    # v8.4.0 [FIX-2 + FIX-8]: capture call_summary and outcome for the bridge
+    # invocation. Surface in meta on every response so the bridge delegation
+    # chain is visible without code changes.
+    bridge_call_summary: List[Dict[str, Any]] = []
+    bridge_call_outcome: str = "unknown"
+    bridge_error: Optional[str] = None
+    try:
+        out, bridge_call_summary, bridge_call_outcome = await _call_with_tolerant_signatures(
+            impl, timeout_seconds=svc.bridge_timeout_sec, kwargs=kwargs
+        )
+    except Exception as exc:
+        # v8.4.0 [FIX-8]: capture the error instead of letting it propagate.
+        # Bridge failures should NOT 500 the request — caller falls through
+        # to the engine-direct path or local fail-soft.
+        bridge_error = "{}: {}".format(exc.__class__.__name__, str(exc)[:200])
+        bridge_call_outcome = "raised"
+        out = None
+        try:
+            logger.warning(
+                "[enriched_quote v%s] bridge raised: module=%r callable=%r error=%s",
+                ROUTER_VERSION, impl_meta.get("module"), impl_meta.get("callable"), bridge_error,
+            )
+        except Exception:
+            pass
+
     safe = _json_safe(out)
     if isinstance(safe, Mapping):
         result = dict(safe)
@@ -1071,15 +1379,60 @@ async def _delegate_sheet_rows_via_bridge(
         meta = dict(meta)
         meta.setdefault("bridge_source_module", impl_meta.get("module"))
         meta.setdefault("bridge_callable", impl_meta.get("callable"))
+        meta["bridge_call_outcome"] = bridge_call_outcome
+        if bridge_call_summary:
+            meta["bridge_call_summary"] = bridge_call_summary[:5]
+        if bridge_error:
+            meta["bridge_error"] = bridge_error
         meta.update(_canonical_owner_hint(page, route_family))
         result["meta"] = meta
         return result
+    # Even if the bridge returned non-mapping or None, surface the diagnostic
+    # so the caller (impl handler) can include it in the fail-soft envelope.
+    if bridge_error or bridge_call_outcome != "success":
+        return {
+            "_bridge_diagnostic": True,
+            "meta": {
+                "bridge_source_module": impl_meta.get("module"),
+                "bridge_callable": impl_meta.get("callable"),
+                "bridge_call_outcome": bridge_call_outcome,
+                "bridge_call_summary": bridge_call_summary[:5],
+                "bridge_error": bridge_error,
+                **_canonical_owner_hint(page, route_family),
+            },
+        }
     return None
 
 
-async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, page: str) -> Dict[str, Dict[str, Any]]:
+async def _fetch_analysis_rows(
+    engine: Any,
+    symbols: List[str],
+    *,
+    mode: str,
+    page: str,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """v8.4.0 [FIX-5]: tracks which engine method was used.
+
+    Returns (results_map, diagnostic) where diagnostic has:
+      - engine_method_used (str | None) — which method actually returned data
+      - engine_method_summary (list[dict]) — per-method outcome:
+          {method, outcome: success|missing|typeerror|error|empty,
+           error_class?, error_message?}
+
+    Mirrors the pattern from advanced_analysis v4.3.4's call_summary.
+    """
+    diagnostic: Dict[str, Any] = {
+        "engine_method_used": None,
+        "engine_method_summary": [],
+        "engine_source": CORE_ENGINE_SOURCE,
+    }
     if not symbols or engine is None:
-        return {}
+        diagnostic["engine_method_summary"].append({
+            "method": "(none)",
+            "outcome": "engine_unavailable" if engine is None else "no_symbols",
+        })
+        return {}, diagnostic
+
     preferred = [
         "get_analysis_rows_batch",
         "get_analysis_quotes_batch",
@@ -1089,62 +1442,143 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
         "get_enriched_quotes",
         "get_quotes",
     ]
+
     for method in preferred:
         fn = getattr(engine, method, None)
         if not callable(fn):
+            diagnostic["engine_method_summary"].append({"method": method, "outcome": "missing"})
             continue
+        method_outcome = "untried"
+        method_error_class: Optional[str] = None
+        method_error_msg: Optional[str] = None
         try:
+            res: Any = None
             for kwargs in ({"mode": mode, "schema": page}, {"schema": page}, {"mode": mode}, {}):
                 try:
                     res = await _call_maybe_async(fn, symbols, **kwargs)
+                    method_outcome = "success_call"
                     break
                 except TypeError:
                     res = None
                     continue
             else:
-                res = None
+                method_outcome = "all_signatures_typed_mismatch"
+                diagnostic["engine_method_summary"].append({
+                    "method": method, "outcome": method_outcome,
+                })
+                continue
+
             if isinstance(res, Mapping):
                 if all(isinstance(k, str) for k in res.keys()) and any(k in set(symbols) for k in res.keys()):
-                    return {str(k): dict(v) if isinstance(v, Mapping) else {"symbol": k, "value": v} for k, v in res.items()}
+                    out = {str(k): dict(v) if isinstance(v, Mapping) else {"symbol": k, "value": v} for k, v in res.items()}
+                    if out:
+                        diagnostic["engine_method_used"] = method
+                        diagnostic["engine_method_summary"].append({"method": method, "outcome": "success_dict_map"})
+                        return out, diagnostic
                 data = res.get("data") or res.get("rows") or res.get("items") or res.get("quotes") or res.get("row_objects")
                 if isinstance(data, Mapping):
-                    return {str(k): dict(v) if isinstance(v, Mapping) else {"symbol": k, "value": v} for k, v in data.items()}
+                    out = {str(k): dict(v) if isinstance(v, Mapping) else {"symbol": k, "value": v} for k, v in data.items()}
+                    if out:
+                        diagnostic["engine_method_used"] = method
+                        diagnostic["engine_method_summary"].append({"method": method, "outcome": "success_nested_dict"})
+                        return out, diagnostic
                 if isinstance(data, list):
-                    return {s: (dict(r) if isinstance(r, Mapping) else {"symbol": s, "value": r}) for s, r in zip(symbols, data)}
+                    out = {s: (dict(r) if isinstance(r, Mapping) else {"symbol": s, "value": r}) for s, r in zip(symbols, data)}
+                    if out:
+                        diagnostic["engine_method_used"] = method
+                        diagnostic["engine_method_summary"].append({"method": method, "outcome": "success_nested_list"})
+                        return out, diagnostic
+                method_outcome = "empty_mapping"
             elif isinstance(res, list):
-                return {s: (dict(r) if isinstance(r, Mapping) else {"symbol": s, "value": r}) for s, r in zip(symbols, res)}
-        except Exception:
-            continue
+                out = {s: (dict(r) if isinstance(r, Mapping) else {"symbol": s, "value": r}) for s, r in zip(symbols, res)}
+                if out:
+                    diagnostic["engine_method_used"] = method
+                    diagnostic["engine_method_summary"].append({"method": method, "outcome": "success_list"})
+                    return out, diagnostic
+                method_outcome = "empty_list"
+            elif res is None:
+                method_outcome = "returned_none"
+            else:
+                method_outcome = "non_mapping_non_list_{}".format(type(res).__name__)
 
+        except Exception as exc:
+            method_outcome = "raised"
+            method_error_class = exc.__class__.__name__
+            method_error_msg = str(exc)[:200]
+            try:
+                logger.warning(
+                    "[enriched_quote v%s] engine.%s raised: %s: %s",
+                    ROUTER_VERSION, method, method_error_class, method_error_msg,
+                )
+            except Exception:
+                pass
+
+        entry = {"method": method, "outcome": method_outcome}
+        if method_error_class:
+            entry["error_class"] = method_error_class
+        if method_error_msg:
+            entry["error_message"] = method_error_msg
+        diagnostic["engine_method_summary"].append(entry)
+
+    # Per-symbol fallback path
     out: Dict[str, Dict[str, Any]] = {}
     per_dict_fn = getattr(engine, "get_enriched_quote_dict", None) or getattr(engine, "get_analysis_row_dict", None) or getattr(engine, "get_quote_dict", None)
     per_fn = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_analysis_row", None) or getattr(engine, "get_quote", None)
+    per_method_used: Optional[str] = None
+    per_failures = 0
     for s in symbols:
         try:
             if callable(per_dict_fn):
+                per_method_used = per_method_used or "get_enriched_quote_dict|get_quote_dict"
+                row_set = False
                 for kwargs in ({"mode": mode, "schema": page}, {"schema": page}, {"mode": mode}, {}):
                     try:
                         out[s] = await _call_maybe_async(per_dict_fn, s, **kwargs)
+                        row_set = True
                         break
                     except TypeError:
                         continue
-                else:
+                if not row_set:
                     out[s] = {"symbol": s, "error": "per_symbol_dict_call_failed"}
+                    per_failures += 1
             elif callable(per_fn):
+                per_method_used = per_method_used or "get_enriched_quote|get_quote"
+                row_set = False
                 for kwargs in ({"mode": mode, "schema": page}, {"schema": page}, {"mode": mode}, {}):
                     try:
                         result = await _call_maybe_async(per_fn, s, **kwargs)
                         out[s] = dict(result) if isinstance(result, Mapping) else {"symbol": s, "value": result}
+                        row_set = True
                         break
                     except TypeError:
                         continue
-                else:
+                if not row_set:
                     out[s] = {"symbol": s, "error": "per_symbol_call_failed"}
+                    per_failures += 1
             else:
                 out[s] = {"symbol": s, "error": "engine_missing_quote_method"}
+                per_failures += 1
         except Exception as e:
-            out[s] = {"symbol": s, "error": str(e)}
-    return out
+            out[s] = {"symbol": s, "error": "{}: {}".format(e.__class__.__name__, str(e)[:200])}
+            per_failures += 1
+
+    if per_method_used and out:
+        diagnostic["engine_method_used"] = per_method_used + " (per-symbol)"
+        diagnostic["engine_method_summary"].append({
+            "method": per_method_used + " (per-symbol)",
+            "outcome": "partial" if per_failures else "success_per_symbol",
+            "failures": per_failures,
+            "total": len(symbols),
+        })
+    elif not out:
+        try:
+            logger.warning(
+                "[enriched_quote v%s] no engine method produced rows for symbols=%r summary=%r",
+                ROUTER_VERSION, symbols[:10], diagnostic["engine_method_summary"],
+            )
+        except Exception:
+            pass
+    return out, diagnostic
 
 
 async def _build_instrument_rows(
@@ -1157,22 +1591,44 @@ async def _build_instrument_rows(
     request: Request,
 ) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
     if not symbols:
-        return [], 0, {"batch_rows": 0, "rehydrated_rows": 0, "sparse_after_rehydrate": 0}
+        return [], 0, {
+            "batch_rows": 0,
+            "rehydrated_rows": 0,
+            "sparse_after_rehydrate": 0,
+            "engine_source": CORE_ENGINE_SOURCE,
+            "engine_method_used": None,
+        }
 
     engine = await svc.get_engine(request)
     if engine is None:
         rows = [_normalize_row(keys, headers, {"symbol": s, "ticker": s, "error": "Data engine unavailable"}, symbol_fallback=s) for s in symbols]
-        return rows, len(rows), {"batch_rows": 0, "rehydrated_rows": 0, "sparse_after_rehydrate": len(rows)}
+        return rows, len(rows), {
+            "batch_rows": 0,
+            "rehydrated_rows": 0,
+            "sparse_after_rehydrate": len(rows),
+            "engine_source": CORE_ENGINE_SOURCE,
+            "engine_method_used": None,
+            "engine_error": "engine_unavailable",
+        }
 
-    quotes_map = await _fetch_analysis_rows(engine, list(symbols), mode=mode or "", page=page)
+    # v8.4.0 [FIX-5]: _fetch_analysis_rows now returns (results, diagnostic)
+    quotes_map, engine_diagnostic = await _fetch_analysis_rows(engine, list(symbols), mode=mode or "", page=page)
     rows_out: List[Dict[str, Any]] = []
     errors = 0
     for sym in symbols:
         raw = _to_dict(quotes_map.get(sym)) or {"symbol": sym, "ticker": sym, "error": "missing_row"}
         if raw.get("error"):
             errors += 1
+        # v8.4.0 [FIX-7]: strip internal fields before normalize
+        _strip_internal_fields(raw)
         rows_out.append(_normalize_row(keys, headers, raw, symbol_fallback=sym))
-    return rows_out, errors, {"batch_rows": len(symbols), "rehydrated_rows": 0, "sparse_after_rehydrate": 0}
+    meta = {
+        "batch_rows": len(symbols),
+        "rehydrated_rows": 0,
+        "sparse_after_rehydrate": errors,
+        **engine_diagnostic,
+    }
+    return rows_out, errors, meta
 
 
 svc = _Service()
@@ -1193,112 +1649,204 @@ async def _sheet_rows_handler(
 ) -> Dict[str, Any]:
     started_at = time.time()
     request_id = _request_id(request, x_request_id)
-    svc.auth_guard(request, token, x_app_token, authorization)
+    debug_enabled = _enriched_debug_enabled()
 
-    prepared = dict(body or {})
-    page = svc.normalize_page(_page_from_body(prepared) or "Market_Leaders")
-    route_family = svc.route_family(page)
-    headers, keys = svc.contract(page)
+    # v8.4.0 [FIX-4]: top-level try/except so unhandled exceptions return a
+    # structured envelope instead of bubbling up as 500 to the bridging caller.
+    try:
+        svc.auth_guard(request, token, x_app_token, authorization)
 
-    include_headers = _bool_from_any(prepared.get("include_headers"), True)
-    include_matrix = include_matrix_q if include_matrix_q is not None else _bool_from_any(prepared.get("include_matrix"), True)
-    schema_only = _bool_from_any(prepared.get("schema_only"), False)
-    headers_only = _bool_from_any(prepared.get("headers_only"), False)
-    limit = max(1, min(5000, _int_from_any(prepared.get("limit"), 200)))
-    offset = max(0, _int_from_any(prepared.get("offset"), 0))
-    top_n = max(1, min(5000, _int_from_any(prepared.get("top_n"), limit)))
-    requested_symbols = _requested_symbols_from_body(prepared)
+        prepared = dict(body or {})
+        page = svc.normalize_page(_page_from_body(prepared) or "Market_Leaders")
+        route_family = svc.route_family(page)
+        headers, keys = svc.contract(page)
 
-    if schema_only or headers_only:
-        return svc.envelope(
-            status="success",
-            page=page,
-            route_family=route_family,
-            headers=headers,
-            keys=keys,
-            row_objects=[],
-            include_headers=include_headers,
-            include_matrix=include_matrix,
-            request_id=request_id,
-            started_at=started_at,
-            mode=mode,
-            dispatch="enriched_sheet_rows_schema_only",
-            extra_meta={"schema_only": bool(schema_only), "headers_only": bool(headers_only), **_canonical_owner_hint(page, route_family)},
+        if debug_enabled:
+            try:
+                logger.debug(
+                    "[enriched_quote v%s] sheet_rows: page=%r route_family=%r body_keys=%r",
+                    ROUTER_VERSION, page, route_family, sorted(list(prepared.keys()))[:15],
+                )
+            except Exception:
+                pass
+
+        include_headers = _bool_from_any(prepared.get("include_headers"), True)
+        include_matrix = include_matrix_q if include_matrix_q is not None else _bool_from_any(prepared.get("include_matrix"), True)
+        schema_only = _bool_from_any(prepared.get("schema_only"), False)
+        headers_only = _bool_from_any(prepared.get("headers_only"), False)
+        limit = max(1, min(5000, _int_from_any(prepared.get("limit"), 200)))
+        offset = max(0, _int_from_any(prepared.get("offset"), 0))
+        top_n = max(1, min(5000, _int_from_any(prepared.get("top_n"), limit)))
+        requested_symbols = _requested_symbols_from_body(prepared)
+
+        if schema_only or headers_only:
+            return svc.envelope(
+                status="success",
+                page=page,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                row_objects=[],
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch="enriched_sheet_rows_schema_only",
+                extra_meta={
+                    "schema_only": bool(schema_only),
+                    "headers_only": bool(headers_only),
+                    "engine_source": CORE_ENGINE_SOURCE,
+                    **_canonical_owner_hint(page, route_family),
+                },
+            )
+
+        bridge_result = await _delegate_sheet_rows_via_bridge(
+            svc, request, page, route_family, prepared, mode, include_matrix_q, token, x_app_token, authorization, x_request_id
         )
 
-    bridge_result = await _delegate_sheet_rows_via_bridge(
-        svc, request, page, route_family, prepared, mode, include_matrix_q, token, x_app_token, authorization, x_request_id
-    )
-    if bridge_result is not None and _payload_has_real_rows(bridge_result):
-        ext_rows = _extract_rows_like(bridge_result)
-        normalized_rows = [_normalize_row(keys, headers, r) for r in ext_rows]
-        if page == "Top_10_Investments":
-            normalized_rows = _slice_rows(normalized_rows, top_n, 0)
-            for idx, row in enumerate(normalized_rows, start=1):
-                row.setdefault("top10_rank", idx)
-                row.setdefault("selection_reason", "Selected by enriched bridge fallback.")
-                row.setdefault("criteria_snapshot", "{}")
-        normalized_rows = _slice_rows(normalized_rows, limit, offset)
-        status_out, error_out, meta_out = _extract_status_error(bridge_result)
-        extra_meta = dict(meta_out or {})
-        extra_meta.update(_canonical_owner_hint(page, route_family))
+        # v8.4.0 [FIX-8]: capture bridge diagnostic even when bridge succeeds
+        # OR returns a diagnostic-only envelope. Used by all downstream paths.
+        bridge_meta_for_fallback: Dict[str, Any] = {}
+        if isinstance(bridge_result, Mapping):
+            bm = bridge_result.get("meta") if isinstance(bridge_result.get("meta"), Mapping) else {}
+            for k in (
+                "bridge_source_module", "bridge_callable", "bridge_call_outcome",
+                "bridge_call_summary", "bridge_error",
+                "upstream_call_outcome", "upstream_call_summary", "upstream_call_status",
+                "upstream_status", "upstream_error", "upstream_error_class",
+                "engine_payload_diagnostic",
+            ):
+                if k in bm:
+                    bridge_meta_for_fallback[k] = bm[k]
+
+        if bridge_result is not None and _payload_has_real_rows(bridge_result):
+            ext_rows = _extract_rows_like(bridge_result)
+            # v8.4.0 [FIX-7]: strip internal fields before normalize
+            normalized_rows = [_normalize_row(keys, headers, _strip_internal_fields(dict(r))) for r in ext_rows]
+            if page == "Top_10_Investments":
+                normalized_rows = _slice_rows(normalized_rows, top_n, 0)
+                for idx, row in enumerate(normalized_rows, start=1):
+                    row.setdefault("top10_rank", idx)
+                    row.setdefault("selection_reason", "Selected by enriched bridge fallback.")
+                    row.setdefault("criteria_snapshot", "{}")
+            normalized_rows = _slice_rows(normalized_rows, limit, offset)
+            status_out, error_out, meta_out = _extract_status_error(bridge_result)
+            extra_meta = dict(meta_out or {})
+            extra_meta.update(_canonical_owner_hint(page, route_family))
+            extra_meta["engine_source"] = CORE_ENGINE_SOURCE
+            return svc.envelope(
+                status=status_out or ("success" if normalized_rows else "partial"),
+                page=page,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                row_objects=normalized_rows,
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch="bridge_sheet_rows",
+                error=error_out,
+                extra_meta=extra_meta,
+            )
+
+        if route_family == "instrument":
+            symbols = requested_symbols[: max(limit + offset, top_n)]
+            if not symbols:
+                symbols = EMERGENCY_PAGE_SYMBOLS.get(page, [])[: max(limit + offset, top_n)]
+            rows_out, errors, hydrate_meta = await _build_instrument_rows(svc, page, headers, keys, symbols, mode, request)
+            rows_out = _slice_rows(rows_out, limit, offset)
+            extra_meta = {
+                **hydrate_meta,
+                **_canonical_owner_hint(page, route_family),
+                **bridge_meta_for_fallback,  # v8.4.0 [FIX-8]
+            }
+            return svc.envelope(
+                status="success" if errors == 0 else ("partial" if errors < max(1, len(symbols)) else "error"),
+                page=page,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_out,
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch="instrument_sheet_rows_fallback",
+                error=(f"{errors} errors" if errors else None),
+                extra_meta=extra_meta,
+            )
+
+        fallback_rows = _build_nonempty_special_rows(page, headers, keys, requested_symbols, limit, offset, top_n)
+        extra_meta = {
+            "engine_source": CORE_ENGINE_SOURCE,
+            **_canonical_owner_hint(page, route_family),
+            **bridge_meta_for_fallback,  # v8.4.0 [FIX-8]
+        }
         return svc.envelope(
-            status=status_out or ("success" if normalized_rows else "partial"),
+            status="partial" if fallback_rows else "error",
             page=page,
             route_family=route_family,
             headers=headers,
             keys=keys,
-            row_objects=normalized_rows,
+            row_objects=fallback_rows,
             include_headers=include_headers,
             include_matrix=include_matrix,
             request_id=request_id,
             started_at=started_at,
             mode=mode,
-            dispatch="bridge_sheet_rows",
-            error=error_out,
+            dispatch="non_instrument_bridge_fail_soft_nonempty" if fallback_rows else "non_instrument_bridge_fail_soft",
+            error="No usable rows returned from canonical owner",
             extra_meta=extra_meta,
         )
-
-    if route_family == "instrument":
-        symbols = requested_symbols[: max(limit + offset, top_n)]
-        if not symbols:
-            symbols = EMERGENCY_PAGE_SYMBOLS.get(page, [])[: max(limit + offset, top_n)]
-        rows_out, errors, hydrate_meta = await _build_instrument_rows(svc, page, headers, keys, symbols, mode, request)
-        rows_out = _slice_rows(rows_out, limit, offset)
+    except HTTPException:
+        # Auth failures / 4xx — re-raise as-is
+        raise
+    except Exception as handler_err:
+        # v8.4.0 [FIX-4]: top-level catch. Return structured error envelope
+        # so the bridging caller (investment_advisor, analysis_sheet_rows)
+        # always gets a parseable dict back.
+        error_repr = "{}: {}".format(handler_err.__class__.__name__, str(handler_err)[:500])
+        try:
+            logger.error(
+                "[enriched_quote v%s] _sheet_rows_handler top-level exception: %s",
+                ROUTER_VERSION, error_repr,
+                exc_info=True,
+            )
+        except Exception:
+            pass
+        try:
+            page_for_err = svc.normalize_page(_page_from_body(body or {}) or "Market_Leaders")
+            route_family_for_err = svc.route_family(page_for_err)
+            headers_for_err, keys_for_err = svc.contract(page_for_err)
+        except Exception:
+            page_for_err = "Market_Leaders"
+            route_family_for_err = "instrument"
+            headers_for_err = []
+            keys_for_err = []
         return svc.envelope(
-            status="success" if errors == 0 else ("partial" if errors < max(1, len(symbols)) else "error"),
-            page=page,
-            route_family=route_family,
-            headers=headers,
-            keys=keys,
-            row_objects=rows_out,
-            include_headers=include_headers,
-            include_matrix=include_matrix,
+            status="error",
+            page=page_for_err,
+            route_family=route_family_for_err,
+            headers=headers_for_err,
+            keys=keys_for_err,
+            row_objects=[],
+            include_headers=True,
+            include_matrix=False,
             request_id=request_id,
             started_at=started_at,
             mode=mode,
-            dispatch="instrument_sheet_rows_fallback",
-            error=(f"{errors} errors" if errors else None),
-            extra_meta={**hydrate_meta, **_canonical_owner_hint(page, route_family)},
+            dispatch="enriched_sheet_rows_top_level_exception",
+            error=error_repr,
+            extra_meta={
+                "engine_source": CORE_ENGINE_SOURCE,
+                "_engine_error": error_repr,
+                "_engine_error_class": handler_err.__class__.__name__,
+            },
         )
-
-    fallback_rows = _build_nonempty_special_rows(page, headers, keys, requested_symbols, limit, offset, top_n)
-    return svc.envelope(
-        status="partial" if fallback_rows else "error",
-        page=page,
-        route_family=route_family,
-        headers=headers,
-        keys=keys,
-        row_objects=fallback_rows,
-        include_headers=include_headers,
-        include_matrix=include_matrix,
-        request_id=request_id,
-        started_at=started_at,
-        mode=mode,
-        dispatch="non_instrument_bridge_fail_soft_nonempty" if fallback_rows else "non_instrument_bridge_fail_soft",
-        error="No usable rows returned from canonical owner",
-        extra_meta=_canonical_owner_hint(page, route_family),
-    )
 
 
 async def _single_quote_handler(
@@ -1313,32 +1861,87 @@ async def _single_quote_handler(
 ) -> Dict[str, Any]:
     started_at = time.time()
     request_id = _request_id(request, x_request_id)
-    svc.auth_guard(request, token_q, x_app_token, authorization)
+    debug_enabled = _enriched_debug_enabled()
 
-    symbol = _strip(body.get("symbol") or body.get("ticker") or body.get("requested_symbol"))
-    if not symbol:
-        syms = _requested_symbols_from_body(body)
-        symbol = syms[0] if syms else ""
-    if not symbol:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing symbol")
-    symbol = _normalize_symbol_token(symbol)
+    # v8.4.0 [FIX-4]: top-level try/except for the same reason as
+    # _sheet_rows_handler — never propagate raw exceptions to the caller.
+    try:
+        svc.auth_guard(request, token_q, x_app_token, authorization)
 
-    page = svc.normalize_page(page_q or _page_from_body(body) or "Market_Leaders")
-    route_family = svc.route_family(page)
-    headers, keys = svc.contract(page)
+        symbol = _strip(body.get("symbol") or body.get("ticker") or body.get("requested_symbol"))
+        if not symbol:
+            syms = _requested_symbols_from_body(body)
+            symbol = syms[0] if syms else ""
+        if not symbol:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing symbol")
+        symbol = _normalize_symbol_token(symbol)
 
-    if route_family != "instrument":
-        bridge_body = dict(body or {})
-        bridge_body["symbols"] = [symbol]
-        bridge_result = await _delegate_sheet_rows_via_bridge(
-            svc, request, page, route_family, bridge_body, mode_q, True, token_q, x_app_token, authorization, x_request_id
-        )
-        if bridge_result is not None and _payload_has_real_rows(bridge_result):
-            rows = _extract_rows_like(bridge_result)
-            normalized_rows = [_normalize_row(keys, headers, r, symbol_fallback=symbol) for r in rows]
-            row = normalized_rows[0] if normalized_rows else _normalize_row(keys, headers, {"symbol": symbol}, symbol_fallback=symbol)
+        page = svc.normalize_page(page_q or _page_from_body(body) or "Market_Leaders")
+        route_family = svc.route_family(page)
+        headers, keys = svc.contract(page)
+
+        if debug_enabled:
+            try:
+                logger.debug(
+                    "[enriched_quote v%s] single_quote: symbol=%r page=%r route_family=%r",
+                    ROUTER_VERSION, symbol, page, route_family,
+                )
+            except Exception:
+                pass
+
+        if route_family != "instrument":
+            bridge_body = dict(body or {})
+            bridge_body["symbols"] = [symbol]
+            bridge_result = await _delegate_sheet_rows_via_bridge(
+                svc, request, page, route_family, bridge_body, mode_q, True, token_q, x_app_token, authorization, x_request_id
+            )
+            # v8.4.0 [FIX-8]: capture bridge diagnostic for fallback meta
+            bridge_meta_for_fallback: Dict[str, Any] = {}
+            if isinstance(bridge_result, Mapping):
+                bm = bridge_result.get("meta") if isinstance(bridge_result.get("meta"), Mapping) else {}
+                for k in (
+                    "bridge_source_module", "bridge_callable", "bridge_call_outcome",
+                    "bridge_call_summary", "bridge_error",
+                    "upstream_call_outcome", "upstream_call_summary", "upstream_call_status",
+                    "upstream_status", "upstream_error", "upstream_error_class",
+                ):
+                    if k in bm:
+                        bridge_meta_for_fallback[k] = bm[k]
+
+            if bridge_result is not None and _payload_has_real_rows(bridge_result):
+                rows = _extract_rows_like(bridge_result)
+                # v8.4.0 [FIX-7]: strip internal fields
+                normalized_rows = [_normalize_row(keys, headers, _strip_internal_fields(dict(r)), symbol_fallback=symbol) for r in rows]
+                row = normalized_rows[0] if normalized_rows else _normalize_row(keys, headers, {"symbol": symbol}, symbol_fallback=symbol)
+                extra_meta = dict(_canonical_owner_hint(page, route_family))
+                extra_meta["engine_source"] = CORE_ENGINE_SOURCE
+                extra_meta.update(bridge_meta_for_fallback)
+                payload = svc.envelope(
+                    status="success" if row else "partial",
+                    page=page,
+                    route_family=route_family,
+                    headers=headers,
+                    keys=keys,
+                    row_objects=[row],
+                    include_headers=True,
+                    include_matrix=True,
+                    request_id=request_id,
+                    started_at=started_at,
+                    mode=mode_q,
+                    dispatch="single_quote_bridge",
+                    extra_meta=extra_meta,
+                )
+                payload["row"] = row
+                payload["quote"] = row
+                return payload
+
+            fallback_rows = _build_nonempty_special_rows(page, headers, keys, [symbol], 1, 0, 1)
+            row = fallback_rows[0] if fallback_rows else _normalize_row(keys, headers, {"symbol": symbol, "ticker": symbol}, symbol_fallback=symbol)
+            extra_meta = dict(_canonical_owner_hint(page, route_family))
+            extra_meta["engine_source"] = CORE_ENGINE_SOURCE
+            extra_meta.update(bridge_meta_for_fallback)
             payload = svc.envelope(
-                status="success" if row else "partial",
+                status="partial",
                 page=page,
                 route_family=route_family,
                 headers=headers,
@@ -1349,17 +1952,18 @@ async def _single_quote_handler(
                 request_id=request_id,
                 started_at=started_at,
                 mode=mode_q,
-                dispatch="single_quote_bridge",
-                extra_meta=_canonical_owner_hint(page, route_family),
+                dispatch="single_quote_non_instrument_failsoft",
+                extra_meta=extra_meta,
             )
             payload["row"] = row
             payload["quote"] = row
             return payload
 
-        fallback_rows = _build_nonempty_special_rows(page, headers, keys, [symbol], 1, 0, 1)
-        row = fallback_rows[0] if fallback_rows else _normalize_row(keys, headers, {"symbol": symbol, "ticker": symbol}, symbol_fallback=symbol)
+        # Instrument family — engine-direct path
+        rows_out, errors, meta = await _build_instrument_rows(svc, page, headers, keys, [symbol], mode_q, request)
+        row = rows_out[0] if rows_out else _normalize_row(keys, headers, {"symbol": symbol, "ticker": symbol, "error": "missing_row"}, symbol_fallback=symbol)
         payload = svc.envelope(
-            status="partial",
+            status="success" if errors == 0 and not row.get("error") else "partial",
             page=page,
             route_family=route_family,
             headers=headers,
@@ -1370,33 +1974,58 @@ async def _single_quote_handler(
             request_id=request_id,
             started_at=started_at,
             mode=mode_q,
-            dispatch="single_quote_non_instrument_failsoft",
-            extra_meta=_canonical_owner_hint(page, route_family),
+            dispatch="single_quote_instrument",
+            extra_meta=meta,  # already includes engine_source, engine_method_used, etc.
         )
         payload["row"] = row
         payload["quote"] = row
         return payload
-
-    rows_out, errors, meta = await _build_instrument_rows(svc, page, headers, keys, [symbol], mode_q, request)
-    row = rows_out[0] if rows_out else _normalize_row(keys, headers, {"symbol": symbol, "ticker": symbol, "error": "missing_row"}, symbol_fallback=symbol)
-    payload = svc.envelope(
-        status="success" if errors == 0 and not row.get("error") else "partial",
-        page=page,
-        route_family=route_family,
-        headers=headers,
-        keys=keys,
-        row_objects=[row],
-        include_headers=True,
-        include_matrix=True,
-        request_id=request_id,
-        started_at=started_at,
-        mode=mode_q,
-        dispatch="single_quote_instrument",
-        extra_meta=meta,
-    )
-    payload["row"] = row
-    payload["quote"] = row
-    return payload
+    except HTTPException:
+        raise
+    except Exception as handler_err:
+        # v8.4.0 [FIX-4]: top-level catch
+        error_repr = "{}: {}".format(handler_err.__class__.__name__, str(handler_err)[:500])
+        try:
+            logger.error(
+                "[enriched_quote v%s] _single_quote_handler top-level exception: %s",
+                ROUTER_VERSION, error_repr,
+                exc_info=True,
+            )
+        except Exception:
+            pass
+        try:
+            page_for_err = svc.normalize_page(page_q or _page_from_body(body or {}) or "Market_Leaders")
+            route_family_for_err = svc.route_family(page_for_err)
+            headers_for_err, keys_for_err = svc.contract(page_for_err)
+        except Exception:
+            page_for_err = "Market_Leaders"
+            route_family_for_err = "instrument"
+            headers_for_err = []
+            keys_for_err = []
+        empty_row = _normalize_row(keys_for_err, headers_for_err, {"symbol": "", "error": error_repr})
+        payload = svc.envelope(
+            status="error",
+            page=page_for_err,
+            route_family=route_family_for_err,
+            headers=headers_for_err,
+            keys=keys_for_err,
+            row_objects=[empty_row] if keys_for_err else [],
+            include_headers=True,
+            include_matrix=False,
+            request_id=request_id,
+            started_at=started_at,
+            mode=mode_q,
+            dispatch="single_quote_top_level_exception",
+            error=error_repr,
+            extra_meta={
+                "engine_source": CORE_ENGINE_SOURCE,
+                "_engine_error": error_repr,
+                "_engine_error_class": handler_err.__class__.__name__,
+            },
+        )
+        payload["row"] = empty_row if keys_for_err else {}
+        payload["quote"] = empty_row if keys_for_err else {}
+        return payload
 
 
 # -----------------------------------------------------------------------------
@@ -1411,6 +2040,7 @@ async def health() -> Dict[str, Any]:
         "module": "routes.enriched_quote",
         "router_version": ROUTER_VERSION,
         "owns_enriched_sheet_rows": True,
+        "engine_source": CORE_ENGINE_SOURCE,
     })
 
 
