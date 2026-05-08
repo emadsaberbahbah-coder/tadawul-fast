@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.3.3  (V2.7.0-ALIGNED / 97-COL / v5.50.0)
+Advanced Analysis Root Owner — v4.3.4  (V2.7.0-ALIGNED / 97-COL / v5.50.0)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
@@ -16,6 +16,78 @@ Owns the canonical root paths:
 - /schema/pages
 - /schema/data-dictionary
 and their /v1/schema aliases.
+
+Why v4.3.4 — unconditional diagnostic visibility
+------------------------------------------------
+
+v4.3.3 added upstream diagnostic capture, but the production response
+showed `dispatch=fail_soft_nonempty` with NONE of the v4.3.3
+`upstream_*` fields present in `meta`. The only way that can happen
+is if `upstream_diagnostic_meta` was empty `{}` at merge time, which
+only occurs when `payload` is NOT a dict — i.e. when
+`_call_core_sheet_rows_best_effort` returned `None`.
+
+Re-reading that function exposed the silent-swallow:
+
+  res = core_get_sheet_rows(*args, **kwargs)
+  res = await _maybe_await(res)
+  if isinstance(res, dict): return res, SOURCE
+  if isinstance(res, list): return {"row_objects": res}, SOURCE
+  # ← if res is None / int / string / unexpected — NO return, NO error
+  except TypeError as e: last_err = e; continue
+  except Exception as e: last_err = e; break
+
+If the engine method returns `None` (or any non-dict, non-list value)
+the loop falls through with no `last_err` set. After all 7 candidates,
+`return None, None`. The impl receives `payload=None`,
+`isinstance(payload, dict)` is False, capture skipped, fallback meta
+has no diagnostic. Hence the silence on the wire.
+
+This is the highest-probability explanation: the v5.50.0
+`engine.get_sheet_rows()` method returns `None` (or returns
+quickly-and-emptily) when called without symbols pre-populated in the
+body — exactly the call shape this route uses. The legacy adapter
+worked in v4.2.0 because its own internal post-processing happened to
+synthesize a partial dict from pieces the engine emits even when its
+top-level return is unhelpful.
+
+v4.3.4 changes (from v4.3.3)
+----------------------------
+- FIX: `_call_core_sheet_rows_best_effort` now records EVERY attempt
+    (success / None / unexpected-type / TypeError / other-exception)
+    in a `call_summary` list, and always returns a dict — never
+    `(None, None)`. When all attempts fail with no exception (engine
+    returned None or unexpected types), the function returns:
+        {"status": "error", "error": "engine returned non-dict on all
+         signatures", "row_objects": [], "_call_summary": [...]}
+    so the impl always enters the `isinstance(payload, dict)` branch
+    and the diagnostic capture always runs.
+
+- FIX: `_run_advanced_sheet_rows_impl` now reads the new
+    `_call_summary` field if present and surfaces it in
+    `meta.upstream_call_summary` — wire-visible per-attempt detail
+    of what the engine returned for each signature tried. Each entry
+    records `{"signature_idx": N, "outcome": "<one of: dict|list|none|
+    other_<type>|raised_<class>>", "detail": "<short>"}`.
+
+- FIX: `_run_advanced_sheet_rows_impl` always populates
+    `upstream_diagnostic_meta` with at least an `upstream_call_status`
+    label, even when `payload` is None or non-dict. Possible values:
+    "absent" (payload is None — engine binding broken or no candidates)
+    "non_mapping_<type>" (payload is some other primitive)
+    "dict_with_zero_extractable_rows" (payload is a dict but no rows
+        recognized; full bucket summary still attached as before).
+
+- ADD: WARNING log on every failure mode (not just dict path), with
+    the call_summary text inline so deploy-log readers see what
+    happened without needing to hit the API.
+
+- KEEP: every prior fix preserved unchanged. Matrix extraction,
+    factory binding cascade, 97-col canonical, all v4.2.0/v4.1.0
+    fixes — all intact.
+
+After v4.3.4 deploys, the response meta WILL contain enough info
+to write v4.3.5 as a precise behavioral fix. No more guessing.
 
 Why v4.3.3 — diagnostic visibility through the fallback path
 ------------------------------------------------------------
@@ -379,7 +451,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.3.3"
+ADVANCED_ANALYSIS_VERSION = "4.3.4"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -760,11 +832,26 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 async def _maybe_await(x: Any) -> Any:
+    """v4.3.4: propagate exceptions from awaitable bodies.
+
+    v4.3.3 and earlier wrapped `await x` in try/except, which silently
+    swallowed exceptions raised inside the awaited coroutine and returned
+    the coroutine object itself. That caused
+    `_call_core_sheet_rows_best_effort` to misclassify engine exceptions
+    as "engine_returned_unexpected_types" with `last_repr=<coroutine ...>`,
+    losing the actual error class and message.
+
+    v4.3.4 only catches exceptions from `inspect.isawaitable()` (which
+    can fail on rare exotic types). Exceptions from inside the awaited
+    coroutine propagate to the caller, which has its own try/except in
+    `_call_core_sheet_rows_best_effort` and records them in `_call_summary`.
+    """
     try:
-        if inspect.isawaitable(x):
-            return await x
+        is_awaitable = inspect.isawaitable(x)
     except Exception:
-        pass
+        return x
+    if is_awaitable:
+        return await x
     return x
 
 def _as_list(v: Any) -> List[Any]:
@@ -1571,8 +1658,28 @@ def _payload_envelope(*, page: str, headers: Sequence[str], keys: Sequence[str],
     })
 
 async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """v4.3.4: every attempt tracked; never silently returns (None, None).
+
+    The v4.3.3 implementation could fall through with no `last_err` set
+    when the engine method returned `None` (or any non-dict, non-list
+    value) on all 7 candidate signatures. That left the impl with
+    `payload=None`, no diagnostic, no log.
+
+    v4.3.4 records the outcome of every attempt in a per-call summary,
+    and always returns a dict (synthesizing a `{"status": "error", ...}`
+    when no candidate succeeded). The synthesized dict carries
+    `_call_summary` so the impl can surface it in meta.
+    """
     if core_get_sheet_rows is None:
-        return None, None
+        return {
+            "status": "error",
+            "error": "core_get_sheet_rows is None — both v2 and legacy bindings failed",
+            "error_class": "BindingUnavailable",
+            "row_objects": [],
+            "_call_summary": [],
+            "_call_outcome": "binding_absent",
+        }, "unavailable"
+
     candidates = [
         ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
         ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
@@ -1582,44 +1689,141 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
         ((page,), {"limit": limit, "offset": offset}),
         ((page,), {}),
     ]
+    call_summary: List[Dict[str, Any]] = []
     last_err: Optional[Exception] = None
-    for args, kwargs in candidates:
+    last_non_collection_value_repr: Optional[str] = None
+
+    for idx, (args, kwargs) in enumerate(candidates):
+        sig_label = "args={} kwargs_keys={}".format(
+            "({})".format(",".join(repr(a) for a in args)) if args else "()",
+            sorted(list(kwargs.keys())),
+        )
         try:
             res = core_get_sheet_rows(*args, **kwargs)
             res = await _maybe_await(res)
             if isinstance(res, dict):
+                call_summary.append({"signature_idx": idx, "outcome": "dict",
+                                     "detail": "top_keys={}".format(sorted(list(res.keys()))[:10]),
+                                     "signature": sig_label})
+                # Attach summary to the returned dict so the impl can surface it.
+                if "_call_summary" not in res:
+                    try:
+                        res["_call_summary"] = call_summary
+                        res["_call_outcome"] = "dict"
+                    except Exception:
+                        pass
                 return res, CORE_GET_SHEET_ROWS_SOURCE
             if isinstance(res, list):
-                return {"row_objects": res}, CORE_GET_SHEET_ROWS_SOURCE
+                call_summary.append({"signature_idx": idx, "outcome": "list",
+                                     "detail": "len={}".format(len(res)),
+                                     "signature": sig_label})
+                return {
+                    "row_objects": res,
+                    "_call_summary": call_summary,
+                    "_call_outcome": "list",
+                }, CORE_GET_SHEET_ROWS_SOURCE
+            # v4.3.4: track non-dict, non-list returns instead of falling
+            # through silently. Most likely: engine returned None.
+            outcome = "none" if res is None else "other_{}".format(type(res).__name__)
+            try:
+                last_non_collection_value_repr = repr(res)[:200]
+            except Exception:
+                last_non_collection_value_repr = "<unrepresentable>"
+            call_summary.append({
+                "signature_idx": idx,
+                "outcome": outcome,
+                "detail": last_non_collection_value_repr,
+                "signature": sig_label,
+            })
+            # Continue to the next signature — maybe a different call shape works.
         except TypeError as e:
             last_err = e
+            call_summary.append({
+                "signature_idx": idx,
+                "outcome": "raised_TypeError",
+                "detail": "{}: {}".format(e.__class__.__name__, str(e)[:200]),
+                "signature": sig_label,
+            })
             continue
         except Exception as e:
             last_err = e
-            # v4.3.3: explicit WARNING log so non-TypeError engine failures
-            # are visible in Render deploy logs (previously swallowed silently
-            # into an error dict whose text only reached the discarded
-            # normalized envelope, never the wire).
+            call_summary.append({
+                "signature_idx": idx,
+                "outcome": "raised_{}".format(e.__class__.__name__),
+                "detail": "{}: {}".format(e.__class__.__name__, str(e)[:200]),
+                "signature": sig_label,
+            })
+            # v4.3.3 logged this; v4.3.4 keeps that log and breaks out
+            # so we don't keep retrying through a clearly-broken call path.
             try:
                 logger.warning(
                     "[advanced_analysis v%s] engine call raised %s: %s "
-                    "(page=%r limit=%r offset=%r body_keys=%r)",
+                    "(page=%r limit=%r offset=%r body_keys=%r signature_idx=%d)",
                     ADVANCED_ANALYSIS_VERSION,
                     e.__class__.__name__, e,
                     page, limit, offset,
                     sorted(list((body or {}).keys()))[:15],
+                    idx,
                 )
             except Exception:
                 pass
             break
-    if last_err is not None:
-        return {
-            "status": "error",
-            "error": "{}: {}".format(last_err.__class__.__name__, last_err),
-            "error_class": last_err.__class__.__name__,
-            "row_objects": [],
-        }, CORE_GET_SHEET_ROWS_SOURCE
-    return None, None
+
+    # No success and no successful return — synthesize an informative
+    # error dict. Classification logic (v4.3.4 corrected):
+    #
+    # Inspect the actual call_summary outcomes to pick the most precise
+    # label, NOT just `last_err is not None` (which v4.3.4-rc1 used and
+    # which conflated "all TypeError" with "non-TypeError exception"
+    # because TypeError sets last_err too).
+    outcomes = [entry["outcome"] for entry in call_summary if isinstance(entry, dict)]
+    has_non_typeerror_exception = any(
+        isinstance(o, str) and o.startswith("raised_") and o != "raised_TypeError"
+        for o in outcomes
+    )
+    all_typeerror = bool(outcomes) and all(o == "raised_TypeError" for o in outcomes)
+    has_none = any(o == "none" for o in outcomes)
+    has_other = any(isinstance(o, str) and o.startswith("other_") for o in outcomes)
+
+    if has_non_typeerror_exception and last_err is not None:
+        outcome_summary = "all_signatures_failed_with_exception"
+        synth_error = "{}: {}".format(last_err.__class__.__name__, last_err)
+        synth_class = last_err.__class__.__name__
+    elif all_typeerror:
+        outcome_summary = "all_signatures_typed_mismatch"
+        synth_error = "engine method rejected all 7 candidate signatures (TypeError on each)"
+        synth_class = "AllSignaturesTypeError"
+    elif has_none:
+        outcome_summary = "engine_returned_none"
+        synth_error = ("engine method returned None on at least one signature; "
+                       "no signature produced a dict or list. last_repr={}").format(
+            last_non_collection_value_repr or "(none)"
+        )
+        synth_class = "EngineReturnedNone"
+    elif has_other:
+        outcome_summary = "engine_returned_unexpected_types"
+        synth_error = ("engine method returned non-dict, non-list types "
+                       "on every signature. last_repr={}").format(
+            last_non_collection_value_repr or "(none)"
+        )
+        synth_class = "EngineReturnedUnexpectedType"
+    elif last_err is not None:
+        # Defensive — got an exception we couldn't classify above.
+        outcome_summary = "all_signatures_failed_with_exception"
+        synth_error = "{}: {}".format(last_err.__class__.__name__, last_err)
+        synth_class = last_err.__class__.__name__
+    else:
+        outcome_summary = "no_attempts_executed"
+        synth_error = "no candidate signatures were attempted (unexpected internal state)"
+        synth_class = "NoAttempts"
+    return {
+        "status": "error",
+        "error": synth_error,
+        "error_class": synth_class,
+        "row_objects": [],
+        "_call_summary": call_summary,
+        "_call_outcome": outcome_summary,
+    }, CORE_GET_SHEET_ROWS_SOURCE
 
 def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: str, headers: Sequence[str], keys: Sequence[str], include_matrix: bool, request_id: str, started_at: float, mode: str, limit: int = 2000, offset: int = 0, top_n: int = 2000, requested_symbols: Optional[Sequence[str]] = None, meta_extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     ext = dict(external_payload or {})
@@ -1715,15 +1919,48 @@ async def _run_advanced_sheet_rows_impl(
 
     payload, source = await _call_core_sheet_rows_best_effort(page=page, limit=max(limit + offset, top_n), offset=0, mode=mode or "", body=merged_body)
 
-    # v4.3.3: capture upstream diagnostic info BEFORE falling through to
-    # fallback. v4.3.2 attached this to the normalized envelope but the
-    # impl discarded that envelope when extraction failed, so the
-    # diagnostic never reached the wire. Capturing here ensures it
-    # reaches the fallback meta below.
+    # v4.3.4: UNCONDITIONALLY capture upstream diagnostic, regardless of
+    # payload shape. v4.3.3 only captured when `isinstance(payload, dict)`
+    # was True; the production response showed empty meta because v4.3.3's
+    # `_call_core_sheet_rows_best_effort` returned `(None, None)` when the
+    # engine returned non-dict, non-list values (e.g. None) on every
+    # candidate signature, so the dict-only capture branch never ran.
+    #
+    # v4.3.4's best-effort wrapper now ALWAYS returns a dict (even if the
+    # engine raised or returned junk on every signature, the wrapper
+    # synthesizes `{"status":"error", "_call_summary":[...], "_call_outcome":...}`).
+    # The capture below is still defensive — it handles None and non-dict
+    # cases for forward compatibility and future regression resilience.
+    #
+    # New fields surfaced to the wire (all under meta.):
+    #   * upstream_call_status   — one of: absent | non_mapping_<type>
+    #                              | error_dict | dict | dict_with_zero_extractable_rows
+    #   * upstream_call_summary  — per-attempt outcome list from the
+    #                              best-effort wrapper (signature_idx,
+    #                              outcome, detail, signature). Tells us
+    #                              EXACTLY what each candidate returned.
+    #   * upstream_call_outcome  — single-string label summarizing the
+    #                              overall failure mode (engine_returned_none
+    #                              / all_signatures_typed_mismatch /
+    #                              engine_returned_unexpected_types /
+    #                              all_signatures_failed_with_exception /
+    #                              binding_absent / dict / list).
+    #   * upstream_payload_type  — type name of the payload returned by
+    #                              the wrapper.
+    #   * upstream_payload_top_keys, upstream_status, upstream_error,
+    #     upstream_error_class, engine_payload_diagnostic — preserved
+    #     from v4.3.3 for dict payloads.
     upstream_diagnostic_meta: Dict[str, Any] = {}
-    if isinstance(payload, dict):
-        try:
+    try:
+        if payload is None:
+            upstream_diagnostic_meta["upstream_call_status"] = "absent"
+            upstream_diagnostic_meta["upstream_payload_type"] = "NoneType"
+        elif not isinstance(payload, dict):
+            upstream_diagnostic_meta["upstream_call_status"] = "non_mapping_{}".format(type(payload).__name__)
             upstream_diagnostic_meta["upstream_payload_type"] = type(payload).__name__
+        else:
+            # payload IS a dict — capture full detail.
+            upstream_diagnostic_meta["upstream_payload_type"] = "dict"
             upstream_diagnostic_meta["upstream_payload_top_keys"] = sorted(list(payload.keys()))[:25]
             ups_status = _strip(payload.get("status"))
             ups_error = _strip(payload.get("error")) or _strip(payload.get("detail")) or _strip(payload.get("message"))
@@ -1734,9 +1971,21 @@ async def _run_advanced_sheet_rows_impl(
                 upstream_diagnostic_meta["upstream_error"] = ups_error[:500]
             if ups_error_class:
                 upstream_diagnostic_meta["upstream_error_class"] = ups_error_class
-            # Bucket-shape summary (mirrors the v4.3.2 diagnostic that was
-            # being lost). Tells us whether the engine returned matrix,
-            # dicts, empty lists, or nothing.
+            # v4.3.4: pull the per-attempt call summary synthesized by the
+            # best-effort wrapper. This is the new headline diagnostic —
+            # it reveals exactly what each of the 7 candidate signatures
+            # returned, which directly informs the next code-side fix.
+            call_summary = payload.get("_call_summary")
+            call_outcome = payload.get("_call_outcome")
+            if isinstance(call_summary, list) and call_summary:
+                # Cap at 10 entries to keep meta payload bounded; we only
+                # have 7 candidates anyway.
+                upstream_diagnostic_meta["upstream_call_summary"] = call_summary[:10]
+            if call_outcome:
+                upstream_diagnostic_meta["upstream_call_outcome"] = str(call_outcome)
+            # Bucket-shape summary (preserved from v4.3.3). Tells us
+            # whether the engine returned matrix, dicts, empty lists,
+            # or nothing in standard buckets.
             bucket_summary: Dict[str, str] = {}
             for bucket in ("rows", "rows_matrix", "matrix", "row_objects", "records", "items", "data", "quotes", "results"):
                 v = payload.get(bucket)
@@ -1752,46 +2001,127 @@ async def _run_advanced_sheet_rows_impl(
                     bucket_summary[bucket] = type(v).__name__
             if bucket_summary:
                 upstream_diagnostic_meta["engine_payload_diagnostic"] = bucket_summary
-        except Exception:
-            pass
+            # Initial call_status — refined below if extraction fails.
+            if ups_status == "error":
+                upstream_diagnostic_meta["upstream_call_status"] = "error_dict"
+            else:
+                upstream_diagnostic_meta["upstream_call_status"] = "dict"
+    except Exception:
+        # Never let diagnostic capture itself fail the request.
+        pass
 
-        normalized = _normalize_external_payload(external_payload=payload, page=page, headers=headers, keys=keys, include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, limit=limit, offset=offset, top_n=top_n, requested_symbols=requested_symbols, meta_extra={"schema_source": schema_source, "source": source or CORE_GET_SHEET_ROWS_SOURCE})
-        if _extract_rows_like(normalized):
-            return normalized
+    # v4.3.4: only attempt normalization if payload is a dict AND it does
+    # NOT carry an engine-error envelope (status:error / _call_outcome
+    # set). The synthesized error dicts from `_call_core_sheet_rows_best_effort`
+    # are diagnostic-only — they have no `row_objects` or `rows` to extract.
+    # Skipping normalize on them is purely an optimization; calling it
+    # would waste cycles and produce identical outcomes.
+    if isinstance(payload, dict):
+        ups_status_for_normalize = _strip(payload.get("status")).lower()
+        ups_outcome_for_normalize = _strip(payload.get("_call_outcome"))
+        skip_normalize_due_to_error = (
+            ups_status_for_normalize == "error"
+            and ups_outcome_for_normalize in {
+                "engine_returned_none",
+                "all_signatures_typed_mismatch",
+                "engine_returned_unexpected_types",
+                "all_signatures_failed_with_exception",
+                "binding_absent",
+            }
+        )
+        if not skip_normalize_due_to_error:
+            normalized = _normalize_external_payload(external_payload=payload, page=page, headers=headers, keys=keys, include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, limit=limit, offset=offset, top_n=top_n, requested_symbols=requested_symbols, meta_extra={"schema_source": schema_source, "source": source or CORE_GET_SHEET_ROWS_SOURCE})
+            if _extract_rows_like(normalized):
+                # SUCCESS path. Surface the call summary into the success
+                # meta too so we can confirm in production which signature
+                # actually worked (informs future call-shape simplification).
+                if upstream_diagnostic_meta.get("upstream_call_summary") or upstream_diagnostic_meta.get("upstream_call_outcome"):
+                    try:
+                        existing_meta = normalized.get("meta") or {}
+                        if isinstance(existing_meta, dict):
+                            for k, v in upstream_diagnostic_meta.items():
+                                existing_meta.setdefault(k, v)
+                            normalized["meta"] = existing_meta
+                    except Exception:
+                        pass
+                return normalized
+        # Extraction failed (or was skipped). Refine call_status from "dict"
+        # to a more precise label for wire visibility.
+        if upstream_diagnostic_meta.get("upstream_call_status") == "dict":
+            upstream_diagnostic_meta["upstream_call_status"] = "dict_with_zero_extractable_rows"
 
-    # v4.3.3: log the failure mode at WARNING so it shows up in Render
-    # deploy logs. The wire response also carries the same info in
-    # meta.upstream_* below, but log-side visibility is helpful when the
-    # caller is a script / scheduler that doesn't surface response meta.
+    # v4.3.4: comprehensive WARNING log on every failure mode. Includes
+    # the new call_summary inline so deploy-log readers see what each
+    # signature returned without needing to hit the API.
     try:
-        if upstream_diagnostic_meta:
-            logger.warning(
-                "[advanced_analysis v%s] engine call returned non-empty payload but route extracted 0 rows. "
-                "page=%r upstream_status=%r upstream_error=%r buckets=%r top_keys=%r",
-                ADVANCED_ANALYSIS_VERSION, page,
-                upstream_diagnostic_meta.get("upstream_status"),
-                upstream_diagnostic_meta.get("upstream_error"),
-                upstream_diagnostic_meta.get("engine_payload_diagnostic"),
-                upstream_diagnostic_meta.get("upstream_payload_top_keys"),
-            )
-        elif payload is None:
-            logger.warning(
-                "[advanced_analysis v%s] engine call returned None (payload is None). page=%r",
-                ADVANCED_ANALYSIS_VERSION, page,
-            )
+        log_call_status = upstream_diagnostic_meta.get("upstream_call_status", "unknown")
+        log_call_outcome = upstream_diagnostic_meta.get("upstream_call_outcome")
+        log_call_summary = upstream_diagnostic_meta.get("upstream_call_summary")
+        # Compact the call_summary for log readability — one line per attempt.
+        compact_summary = ""
+        if isinstance(log_call_summary, list):
+            try:
+                compact_summary = " | ".join(
+                    "[{}]={}".format(entry.get("signature_idx", "?"), entry.get("outcome", "?"))
+                    for entry in log_call_summary
+                    if isinstance(entry, dict)
+                )
+            except Exception:
+                compact_summary = "(unprintable)"
+        logger.warning(
+            "[advanced_analysis v%s] engine call did not produce extractable rows. "
+            "page=%r call_status=%r call_outcome=%r upstream_status=%r upstream_error=%r "
+            "buckets=%r top_keys=%r summary=%s",
+            ADVANCED_ANALYSIS_VERSION, page,
+            log_call_status,
+            log_call_outcome,
+            upstream_diagnostic_meta.get("upstream_status"),
+            upstream_diagnostic_meta.get("upstream_error"),
+            upstream_diagnostic_meta.get("engine_payload_diagnostic"),
+            upstream_diagnostic_meta.get("upstream_payload_top_keys"),
+            compact_summary,
+        )
     except Exception:
         pass
 
     fallback_rows = _build_nonempty_failsoft_rows(page=page, headers=headers, keys=keys, requested_symbols=requested_symbols, limit=limit, offset=offset, top_n=top_n)
     fallback_status = "partial" if fallback_rows else "error"
     fallback_error = "Local non-empty fallback emitted after upstream degradation" if fallback_rows else "No usable rows returned; schema-shaped fallback emitted"
+    # v4.3.4: dispatch label now reflects the call_outcome when known so
+    # log/metric readers can distinguish "engine returned None" from
+    # "engine raised" from "engine returned wrong shape" without parsing
+    # the upstream_call_summary. Falls back to v4.3.3's generic label when
+    # the outcome is "dict" (i.e. engine returned a dict but it had no
+    # extractable rows — usually a matrix-projection mismatch).
+    fallback_dispatch = "advanced_analysis_fail_soft_nonempty" if fallback_rows else "advanced_analysis_fail_soft"
+    try:
+        co = upstream_diagnostic_meta.get("upstream_call_outcome")
+        cs = upstream_diagnostic_meta.get("upstream_call_status")
+        # v4.3.4: dispatch labels strip "engine_" prefix from outcomes
+        # to avoid "fail_soft_engine_engine_returned_none" redundancy.
+        co_label = co
+        if isinstance(co_label, str) and co_label.startswith("engine_"):
+            co_label = co_label[len("engine_"):]
+        if co in {"engine_returned_none", "all_signatures_typed_mismatch",
+                  "engine_returned_unexpected_types", "all_signatures_failed_with_exception",
+                  "binding_absent"}:
+            fallback_dispatch = "advanced_analysis_fail_soft_{}".format(co_label)
+        elif cs == "dict_with_zero_extractable_rows":
+            fallback_dispatch = "advanced_analysis_fail_soft_extractor_miss"
+        elif cs and cs.startswith("non_mapping_"):
+            fallback_dispatch = "advanced_analysis_fail_soft_{}".format(cs)
+        elif cs == "absent":
+            fallback_dispatch = "advanced_analysis_fail_soft_payload_absent"
+    except Exception:
+        pass
     fallback_meta: Dict[str, Any] = {
-        "dispatch": "advanced_analysis_fail_soft_nonempty" if fallback_rows else "advanced_analysis_fail_soft",
+        "dispatch": fallback_dispatch,
         "schema_source": schema_source,
         "source": source or CORE_GET_SHEET_ROWS_SOURCE,
     }
-    # v4.3.3: merge upstream diagnostic so the wire response shows what
-    # the engine actually returned (or didn't).
+    # v4.3.4: merge upstream diagnostic so the wire response shows what
+    # the engine actually returned (or didn't), including the per-attempt
+    # call summary that pinpoints the exact failure mode.
     if upstream_diagnostic_meta:
         fallback_meta.update(upstream_diagnostic_meta)
     return _payload_envelope(page=page, headers=headers, keys=keys, row_objects=fallback_rows, include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, status_out=fallback_status, error_out=fallback_error, meta=fallback_meta)
