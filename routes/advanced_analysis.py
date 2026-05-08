@@ -2,14 +2,85 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.3.5  (BEHAVIORAL FIX + TIER-1 ENRICHMENT)
+Advanced Analysis Root Owner — v4.3.6  (FACTORY-AWAIT BUG FIX — SURGICAL)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
 SYMBOL-INJECTION • IDENTITY-MAP • TIER-1-YFINANCE-FALLBACK • DEBUG-FLAGGED
+RUNTIME-AWAITABLE-DETECTION (v4.3.6)
 
-Why v4.3.5 — behavioral fix plus user-visible recovery
-------------------------------------------------------
+Why v4.3.6 — the binding adapter bug v4.3.5's diagnostic pinpointed
+------------------------------------------------------------------
+
+v4.3.5 deployed cleanly and its diagnostic surface worked exactly as
+designed. Production response on `/sheet-rows?sheet=Market_Leaders`
+revealed every one of the 13 candidate signatures raised the
+IDENTICAL error:
+
+  "TypeError: object DataEngineV5 can't be used in 'await' expression"
+
+This is not a signature mismatch — it's a single bug in v4.3.1's
+binding adapter. The v4.3.1 docstring assumed `core.data_engine_v2.
+get_engine` was an async factory. It isn't — it's a SYNC function
+that returns the DataEngineV5 instance directly. The adapter:
+
+    async def _v2_engine_factory_adapter(*args, **kwargs):
+        engine = await _v2_get_engine()      # ← bug
+        return await engine.get_sheet_rows(*args, **kwargs)
+
+becomes `await <DataEngineV5_instance>` at line 1, which is the
+exact error every candidate hit before the kwargs even reached
+the engine method.
+
+v4.3.6 changes (from v4.3.5)
+----------------------------
+[FIX-6 BINDING — CRITICAL] `_v2_engine_factory_adapter` and
+    `_v2_engine_ready_adapter` (cold-start fallback path) now use
+    runtime `inspect.isawaitable()` detection on the result of
+    `get_engine()` / `get_engine_if_ready()` / async-factory-fallback,
+    so the adapter works correctly regardless of whether the v2
+    module exports `get_engine` as a sync function (current v5.50.0
+    behavior) or as an async factory (older / future builds).
+
+    Before:
+      engine = await _v2_get_engine()
+    After:
+      raw = _v2_get_engine()
+      engine = await raw if inspect.isawaitable(raw) else raw
+
+    Same shape applied to the cold-start fallback inside
+    `_v2_engine_ready_adapter` for the async-factory backup path.
+
+This is a 6-line behavioral patch. All v4.3.5 work — symbol injection,
+13 candidate signatures, static identity map, Tier-1 yfinance
+fallback, comprehensive diagnostics — preserved verbatim. The bug
+was upstream of all of them; once the engine is reachable, every
+piece of v4.3.5's machinery is already aligned correctly.
+
+Production verification after v4.3.6 deploy
+-------------------------------------------
+The same `/sheet-rows?sheet=Market_Leaders&limit=2` request should now
+satisfy:
+
+  1. `meta.dispatch == "advanced_analysis_root"`            (was: fail_soft_*)
+  2. `status == "success"`                                  (was: partial)
+  3. `meta.upstream_call_outcome == "dict"`                 (was: all_signatures_typed_mismatch)
+  4. `meta._symbols_injected_by_route == true`              (preserved from v4.3.5)
+  5. row_objects[0].current_price non-null                  (Aramco real price)
+  6. row_objects[0].recommendation_detailed non-null
+  7. row_objects[0].fundamental_view non-null
+  8. row_objects[0].candlestick_signal non-null
+  9. row_objects[0].data_provider != "placeholder_no_live_data"
+
+If condition 1 holds but 5-9 still fail → the v5.50.0 engine itself
+is broken (separate from this fix). The `meta.upstream_call_summary`
+will now show outcome="dict" on whichever signature won, plus inner
+engine errors if any.
+
+================================================================================
+
+Why v4.3.5 — behavioral fix plus user-visible recovery (PRESERVED)
+------------------------------------------------------------------
 
 v4.3.4 added the diagnostic surface needed to pinpoint exactly why
 `/v1/advanced/sheet-rows` was emitting `dispatch=fail_soft_nonempty`
@@ -556,7 +627,7 @@ def _tier1_yfinance_enrichment_enabled() -> bool:
         return True
     return False
 
-ADVANCED_ANALYSIS_VERSION = "4.3.5"
+ADVANCED_ANALYSIS_VERSION = "4.3.6"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -672,19 +743,32 @@ if core_get_sheet_rows is None:
         from core.data_engine_v2 import get_engine as _v2_get_engine  # type: ignore
 
         async def _v2_engine_factory_adapter(*args: Any, **kwargs: Any) -> Any:
-            """v4.3.1: Adapter that calls the v5.50.0 engine via get_engine() factory.
+            """v4.3.6: Adapter that calls the v5.50.0 engine via get_engine().
 
-            The factory is async; the engine method is async; we await both.
+            v4.3.1 assumed `get_engine` was an async factory and unconditionally
+            did `await _v2_get_engine()`. v4.3.5 deploy verification revealed
+            this was wrong: in v5.50.0, `get_engine` is a SYNC function that
+            returns the DataEngineV5 instance directly. Awaiting the instance
+            raised `TypeError: object DataEngineV5 can't be used in 'await'
+            expression` on every call shape — defeating all 13 candidate
+            signatures.
+
+            v4.3.6 detects awaitable-ness at runtime via `inspect.isawaitable()`,
+            so the adapter works correctly whether `get_engine` returns a
+            coroutine (older / future v2 builds) or the engine instance
+            directly (current v5.50.0 behavior).
+
             Signature is **args, **kwargs so it remains compatible with the
             existing _call_core_sheet_rows_best_effort candidate-signature loop.
             """
-            engine = await _v2_get_engine()
+            raw = _v2_get_engine()
+            engine = await raw if inspect.isawaitable(raw) else raw
             return await engine.get_sheet_rows(*args, **kwargs)
 
         core_get_sheet_rows = _v2_engine_factory_adapter  # type: ignore[assignment]
         CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_engine().get_sheet_rows"
         logger.info(
-            "[advanced_analysis v%s] engine bound via core.data_engine_v2.get_engine() (async factory)",
+            "[advanced_analysis v%s] engine bound via core.data_engine_v2.get_engine() (factory pattern, runtime-await-aware)",
             ADVANCED_ANALYSIS_VERSION,
         )
     except Exception as _v2_factory_err:
@@ -699,13 +783,19 @@ if core_get_sheet_rows is None:
         from core.data_engine_v2 import get_engine_if_ready as _v2_get_engine_if_ready  # type: ignore
 
         async def _v2_engine_ready_adapter(*args: Any, **kwargs: Any) -> Any:
-            """v4.3.1: Adapter using sync get_engine_if_ready() with cold-start fallback."""
+            """v4.3.6: Adapter using sync get_engine_if_ready() with cold-start fallback.
+
+            Like `_v2_engine_factory_adapter` above, this adapter now detects
+            whether the cold-start async-factory backup returns a coroutine
+            or the engine instance directly. Same fix as v4.3.6 FIX-6.
+            """
             engine = _v2_get_engine_if_ready()
             if engine is None:
                 # Cold-start race: ready-check returned None, fall back to async factory
                 try:
                     from core.data_engine_v2 import get_engine as _v2_async_factory  # type: ignore
-                    engine = await _v2_async_factory()
+                    raw = _v2_async_factory()
+                    engine = await raw if inspect.isawaitable(raw) else raw
                 except Exception as inner_err:
                     raise RuntimeError(
                         "v2 engine not ready and async factory unavailable: " + repr(inner_err)
