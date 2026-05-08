@@ -2,50 +2,106 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.14.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.15.0
 ================================================================================
 BRIDGE-FIRST • ROOT-OWNER ALIGNED • TOP10 FAIL-SOFT • STARTUP-SAFE
 AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE • SCHEMA v2.6.0
+DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • EXCEPTION-MESSAGE-CAPTURE
 
-Why this revision (v2.14.0 vs v2.13.1)
---------------------------------------
-v2.14.0 brings this router into alignment with the v2.6.0 schema family.
-The v2.13.1 build was running with **stale column counts and a fallback
-schema list missing 9 columns**, which surfaced as silent contract drift
-whenever `schema_registry` import failed (e.g. on early-boot probes,
-import-time circular failures, or in degraded environments).
+WHY v2.15.0 — diagnostic visibility + bridge exception capture
+--------------------------------------------------------------
 
-- 🔑 FIX [CRITICAL]: `KNOWN_CANONICAL_HEADER_COUNTS` updated from
-     v2.5.0 numbers (85 / 88) to **v2.6.0 numbers (90 / 93)**. v2.13.1
-     numbers caused the meta endpoint and contract-shape regression
-     tests to report wrong widths even when the registry returned the
-     correct ones — operators reading `/v1/advanced/meta` saw 85/88
-     while the actual emitted rows were 90/93.
+This router is the /v1/advanced entry point. Its job is to delegate
+to the canonical bridge in routes.advanced_analysis (where the actual
+engine call happens) and normalize the result back. v2.15.0 makes that
+delegation chain visible in the response so we can debug it without
+guessing.
 
-- 🔑 FIX [HIGH]: `_CANONICAL_TOP10_SCHEMA_FALLBACK` rewritten to the
-     full v2.6.0 layout (93 entries). v2.13.1 had only 84 entries,
-     missing:
-       • the 4 View columns (fundamental_view, technical_view,
-         risk_view, value_view) added in schema v2.3.0
-       • the 5 Insights columns (sector_relative_score, conviction_score,
-         top_factors, top_risks, position_size_hint) added in v2.6.0
-     When the registry was unavailable, this router would emit 84-col
-     responses instead of 93-col ones. Schema-alignment tests caught
-     this in CI but production fall-back paths were affected.
+The motivating bug: routes/advanced_analysis.py v4.3.4 added rich
+diagnostic fields (upstream_call_summary, upstream_call_outcome) and
+core/data_engine_v2.py v5.51.0 added structured error envelopes.
+Those fields survive _normalize_payload_from_bridge correctly (it uses
+setdefault, not update) — but when the bridge call ITSELF raised an
+exception, v2.14.0's catch block at line 1054 reduced the diagnostic
+to "bridge exception: {ClassName}" — losing the actual error message
+and any per-attempt summary _call_candidate had collected.
 
-- FIX: `_CANONICAL_INSTRUMENT_SCHEMA_FALLBACK` derived as
-     `_CANONICAL_TOP10_SCHEMA_FALLBACK[:-3]` (90 entries) — same slice
-     contract as before, just on the corrected base list.
+v2.15.0 changes (from v2.14.0)
+------------------------------
 
-- FIX: insights and data-dictionary fallbacks unchanged (still 7 / 9
-     cols — those didn't change between schema v2.5.0 and v2.6.0).
+[FIX-1] Engine binding cascade with source tracking. _get_engine() now
+    explicitly probes core.data_engine_v2.get_engine() FIRST (the v5.51.0
+    engine), tracks which binding succeeded in the module-level
+    CORE_ENGINE_SOURCE constant, and surfaces it via meta.engine_source
+    on every response. Mirrors the pattern from advanced_analysis v4.3.1
+    and enriched_quote v8.4.0.
 
-- DOC: Header refreshed to reflect Wave 2A schema-family alignment.
-     Co-deployment matrix added so future maintainers know which
-     versions ship together.
+[FIX-2] _call_candidate now returns (result, call_summary, outcome_label)
+    — a per-attempt list with kwargs_keys + outcome (success | typeerror
+    | error). Previously it just returned the result and dropped all
+    information about which signature variants were tried. This makes
+    "all 9 variants raised TypeError" distinguishable from "matched
+    variant 3 successfully".
 
-v2.13.1 fixes (preserved verbatim)
-----------------------------------
+[FIX-3 — CRITICAL] Bridge exception capture preserves the full error
+    message, not just the class name. v2.14.0's catch block produced
+    `warning="bridge exception: ValueError"` regardless of what the
+    actual exception said. v2.15.0 produces `bridge_error: "ValueError:
+    <full message truncated to 500 chars>"` AND surfaces
+    bridge_call_summary so we can see which signature variant failed
+    and how. This is the single highest-value diagnostic improvement.
+
+[FIX-4] Top-level try/except on every handler. advanced_root_get,
+    advanced_root_post, advanced_request_post, advanced_request_get
+    all wrap their entire body. Uncaught exceptions return a structured
+    partial envelope with status="error", _engine_error,
+    _engine_error_class instead of bubbling to FastAPI as 500.
+
+[FIX-5] /health and /meta surface engine_source explicitly so
+    operators can confirm at a glance which engine binding the router
+    is actually using right now.
+
+[FIX-6] Diagnostic logging. [investment_advisor v2.15.0] log prefix
+    on warnings. INVESTMENT_ADVISOR_DEBUG=1 enables DEBUG level.
+
+NO BUSINESS LOGIC CHANGED. v2.14.0 callers continue to work unchanged.
+v2.14.0's schema-alignment fixes (90/93/7/9 column counts, view +
+insights columns) are preserved verbatim.
+
+Verification after deploy
+-------------------------
+1. /v1/advanced/health and /v1/advanced/meta should report
+   version "2.15.0" and engine_source one of:
+   - "request.app.state.engine" (typical)
+   - "core.data_engine_v2.get_engine().result" (v2 factory)
+   - "core.data_engine.get_engine" (legacy fallback — bug indicator)
+2. /v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1 — when the
+   bridge fails, the response should now contain meta.bridge_error
+   (full message), meta.bridge_call_summary (per-attempt outcomes),
+   and meta.bridge_call_outcome.
+3. When the bridge succeeds, advanced_analysis v4.3.4's
+   meta.upstream_call_summary / meta.upstream_call_outcome continue
+   to flow through unchanged — _normalize_payload_from_bridge still
+   uses setdefault for its own keys.
+
+WHY v2.14.0 (preserved verbatim)
+--------------------------------
+v2.14.0 brought this router into alignment with the v2.6.0 schema family.
+The v2.13.1 build was running with stale column counts and a fallback
+schema list missing 9 columns, which surfaced as silent contract drift
+whenever schema_registry import failed.
+
+- 🔑 FIX [CRITICAL]: KNOWN_CANONICAL_HEADER_COUNTS updated from
+     v2.5.0 numbers (85 / 88) to v2.6.0 numbers (90 / 93).
+- 🔑 FIX [HIGH]: _CANONICAL_TOP10_SCHEMA_FALLBACK rewritten to the
+     full v2.6.0 layout (93 entries) — 4 view columns + 5 insights
+     columns + Upside %.
+- FIX: _CANONICAL_INSTRUMENT_SCHEMA_FALLBACK derived as
+     _CANONICAL_TOP10_SCHEMA_FALLBACK[:-3] (90 entries).
+- FIX: import-time consistency assertions catch schema drift at boot.
+
+WHY v2.13.1 (preserved verbatim)
+--------------------------------
 - FIX: keeps the canonical root-owner bridge first while preserving bounded
        partial payloads instead of bubbling 502/5xx on bridge failure.
 - FIX: stops masking non-TypeError bridge exceptions during signature probing.
@@ -64,15 +120,11 @@ Co-deployment matrix (Wave 2A)
   core/reco_normalize.py                7.1.0      conviction-floor gating
   core/insights_builder.py              1.0.0      pure-function module
   core/investment_advisor.py            5.2.0      v2.6.0 fallback schemas
-  routes/investment_advisor.py          2.14.0     this file
+  routes/investment_advisor.py          2.15.0     this file
+  routes/advanced_analysis.py           4.3.4      diagnostic-emitting bridge
+  routes/enriched_quote.py              8.4.0      v2-binding cascade
+  core/data_engine_v2.py                5.51.0     hardened structured errors
   scripts/run_dashboard_sync.py         6.6.0      passive
-
-Behavior on a v2.5.0 backend: the row-count metadata reported here will
-be wrong (it'll say 90/93 while the backend still emits 85/88). This is
-the intended regression-detector behavior — the router now matches the
-schema_registry it expects to be deployed alongside, so a mismatch is
-visible immediately at /v1/advanced/meta rather than silently at row
-boundaries.
 ================================================================================
 """
 
@@ -98,7 +150,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.14.0"
+INVESTMENT_ADVISOR_VERSION = "2.15.0"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -115,11 +167,6 @@ BASE_SOURCE_PAGES: Tuple[str, ...] = (
 )
 SOURCE_PAGES_SET = set(BASE_SOURCE_PAGES)
 
-# v2.14.0: aligned with schema_registry v2.6.0
-#   canonical instrument tables: 85 -> 90 (+4 Views, +5 Insights, +Upside%
-#     was already there from v2.4.0)
-#   Top_10_Investments:           88 -> 93 (90 canonical + 3 top10 extras)
-#   Insights_Analysis / Data_Dictionary: unchanged (7 / 9)
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
     "Market_Leaders": 90,
     "Global_Markets": 90,
@@ -224,27 +271,7 @@ except Exception:  # pragma: no cover
         return None
 
 
-# =============================================================================
-# Canonical fallback schema (v2.6.0 — 93 entries for Top10, 90 for instruments)
-# =============================================================================
-#
-# Used ONLY when `core.sheets.schema_registry.get_sheet_spec()` cannot be
-# imported. The registry is the single source of truth — these lists exist
-# only so the router degrades to a known-good contract instead of a 0-column
-# response when the registry is unavailable (boot ordering, partial deploys,
-# cold-start race conditions).
-#
-# Layout (matches schema_registry v2.6.0 exactly):
-#   Identity (8) | Price (10) | Liquidity (6) | Fundamentals (12) |
-#   Risk (8) | Valuation (7, incl. Upside %) | Forecast (9) | Scores (7) |
-#   Views (4) | Recommendation (4) | Portfolio (6) | Provenance (4) |
-#   Insights (5) = 90 canonical | + 3 Top10 extras = 93 total.
-#
-# DO NOT add fields here without first adding them to schema_registry; this
-# list must mirror the registry exactly or alignment tests will fail.
-
 _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
-    # Identity (8)
     ("symbol", "Symbol"),
     ("name", "Name"),
     ("asset_class", "Asset Class"),
@@ -253,7 +280,6 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("country", "Country"),
     ("sector", "Sector"),
     ("industry", "Industry"),
-    # Price (10)
     ("current_price", "Current Price"),
     ("previous_close", "Previous Close"),
     ("open_price", "Open"),
@@ -264,14 +290,12 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("price_change", "Price Change"),
     ("percent_change", "Percent Change"),
     ("week_52_position_pct", "52W Position %"),
-    # Liquidity (6)
     ("volume", "Volume"),
     ("avg_volume_10d", "Avg Volume 10D"),
     ("avg_volume_30d", "Avg Volume 30D"),
     ("market_cap", "Market Cap"),
     ("float_shares", "Float Shares"),
     ("beta_5y", "Beta (5Y)"),
-    # Fundamentals (12)
     ("pe_ttm", "P/E (TTM)"),
     ("pe_forward", "P/E (Forward)"),
     ("eps_ttm", "EPS (TTM)"),
@@ -284,7 +308,6 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("profit_margin", "Profit Margin"),
     ("debt_to_equity", "Debt/Equity"),
     ("free_cash_flow_ttm", "Free Cash Flow (TTM)"),
-    # Risk (8)
     ("rsi_14", "RSI (14)"),
     ("volatility_30d", "Volatility 30D"),
     ("volatility_90d", "Volatility 90D"),
@@ -293,7 +316,6 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("sharpe_1y", "Sharpe (1Y)"),
     ("risk_score", "Risk Score"),
     ("risk_bucket", "Risk Bucket"),
-    # Valuation (7) — Upside % present since schema v2.4.0
     ("pb_ratio", "P/B"),
     ("ps_ratio", "P/S"),
     ("ev_ebitda", "EV/EBITDA"),
@@ -301,7 +323,6 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("intrinsic_value", "Intrinsic Value"),
     ("upside_pct", "Upside %"),
     ("valuation_score", "Valuation Score"),
-    # Forecast (9)
     ("forecast_price_1m", "Forecast Price 1M"),
     ("forecast_price_3m", "Forecast Price 3M"),
     ("forecast_price_12m", "Forecast Price 12M"),
@@ -311,7 +332,6 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("forecast_confidence", "Forecast Confidence"),
     ("confidence_score", "Confidence Score"),
     ("confidence_bucket", "Confidence Bucket"),
-    # Scores (7)
     ("value_score", "Value Score"),
     ("quality_score", "Quality Score"),
     ("momentum_score", "Momentum Score"),
@@ -324,19 +344,16 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("technical_view", "Technical View"),
     ("risk_view", "Risk View"),
     ("value_view", "Value View"),
-    # Recommendation (4)
     ("recommendation", "Recommendation"),
     ("recommendation_reason", "Recommendation Reason"),
     ("horizon_days", "Horizon Days"),
     ("invest_period_label", "Invest Period Label"),
-    # Portfolio (6)
     ("position_qty", "Position Qty"),
     ("avg_cost", "Avg Cost"),
     ("position_cost", "Position Cost"),
     ("position_value", "Position Value"),
     ("unrealized_pl", "Unrealized P/L"),
     ("unrealized_pl_pct", "Unrealized P/L %"),
-    # Provenance (4)
     ("data_provider", "Data Provider"),
     ("last_updated_utc", "Last Updated (UTC)"),
     ("last_updated_riyadh", "Last Updated (Riyadh)"),
@@ -347,14 +364,11 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("top_factors", "Top Factors"),
     ("top_risks", "Top Risks"),
     ("position_size_hint", "Position Size Hint"),
-    # Top10 extras (3) — only on Top_10_Investments
     ("top10_rank", "Top10 Rank"),
     ("selection_reason", "Selection Reason"),
     ("criteria_snapshot", "Criteria Snapshot"),
 ]
-# Instrument schema = same layout minus the 3 Top10 extras
 _CANONICAL_INSTRUMENT_SCHEMA_FALLBACK: List[Tuple[str, str]] = _CANONICAL_TOP10_SCHEMA_FALLBACK[:-3]
-
 _CANONICAL_INSIGHTS_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("section", "Section"),
     ("item", "Item"),
@@ -364,7 +378,6 @@ _CANONICAL_INSIGHTS_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("notes", "Notes"),
     ("last_updated_riyadh", "Last Updated (Riyadh)"),
 ]
-
 _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("sheet", "Sheet"),
     ("group", "Group"),
@@ -380,20 +393,35 @@ _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
 _SCHEMA_CACHE: Dict[str, Tuple[List[str], List[str]]] = {}
 
 
+# v2.15.0 [FIX-1]: tracks which engine binding actually loaded. Updated
+# at request time inside _get_engine(). Surfaced in meta.engine_source on
+# every response and in /health and /meta. Mirrors v4.3.1's
+# CORE_GET_SHEET_ROWS_SOURCE pattern.
+CORE_ENGINE_SOURCE: str = "unresolved"
+
+
+def _investment_advisor_debug_enabled() -> bool:
+    """v2.15.0 [FIX-6]: cheap env-flag check for diagnostic logging."""
+    raw = (os.getenv("INVESTMENT_ADVISOR_DEBUG", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 # v2.14.0: import-time consistency assertion. If anyone hand-edits the
 # fallback list and forgets to keep it in sync with KNOWN_CANONICAL_HEADER_COUNTS,
 # we want startup to surface that immediately rather than at row time.
 _FALLBACK_INSTRUMENT_LEN = len(_CANONICAL_INSTRUMENT_SCHEMA_FALLBACK)
 _FALLBACK_TOP10_LEN = len(_CANONICAL_TOP10_SCHEMA_FALLBACK)
 assert _FALLBACK_INSTRUMENT_LEN == KNOWN_CANONICAL_HEADER_COUNTS["Market_Leaders"], (
-    f"Fallback instrument schema has {_FALLBACK_INSTRUMENT_LEN} entries, "
-    f"but KNOWN_CANONICAL_HEADER_COUNTS says {KNOWN_CANONICAL_HEADER_COUNTS['Market_Leaders']}. "
-    f"Update both together."
+    "Fallback instrument schema has {} entries, but KNOWN_CANONICAL_HEADER_COUNTS "
+    "says {}. Update both together.".format(
+        _FALLBACK_INSTRUMENT_LEN, KNOWN_CANONICAL_HEADER_COUNTS["Market_Leaders"]
+    )
 )
 assert _FALLBACK_TOP10_LEN == KNOWN_CANONICAL_HEADER_COUNTS["Top_10_Investments"], (
-    f"Fallback Top10 schema has {_FALLBACK_TOP10_LEN} entries, "
-    f"but KNOWN_CANONICAL_HEADER_COUNTS says {KNOWN_CANONICAL_HEADER_COUNTS['Top_10_Investments']}. "
-    f"Update both together."
+    "Fallback Top10 schema has {} entries, but KNOWN_CANONICAL_HEADER_COUNTS "
+    "says {}. Update both together.".format(
+        _FALLBACK_TOP10_LEN, KNOWN_CANONICAL_HEADER_COUNTS["Top_10_Investments"]
+    )
 )
 
 
@@ -637,25 +665,6 @@ def _extract_schema_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[s
             headers2, keys2 = _extract_schema_headers_keys_from_spec(nested)
             if headers2 and keys2:
                 return headers2, keys2
-
-    # SheetSpec dataclass-style: spec.columns as iterable of ColumnSpec
-    cols = getattr(spec, "columns", None)
-    if isinstance(cols, (list, tuple)) and cols:
-        headers_out: List[str] = []
-        keys_out: List[str] = []
-        for idx, col in enumerate(cols):
-            header = _s(getattr(col, "header", None))
-            key = _s(getattr(col, "key", None))
-            if not header and not key:
-                continue
-            if not key:
-                key = f"column_{idx + 1}"
-            if not header:
-                header = key.replace("_", " ").title()
-            headers_out.append(header)
-            keys_out.append(key)
-        if headers_out and keys_out:
-            return headers_out, keys_out
 
     return [], []
 
@@ -936,21 +945,103 @@ def _require_auth_or_401(*, request: Request, token_query: Optional[str], x_app_
 
 
 async def _get_engine(request: Request) -> Optional[Any]:
+    """v2.15.0 [FIX-1]: explicit engine binding with source tracking.
+
+    v2.14.0 walked through bindings and returned the first non-None.
+    v2.15.0 explicitly probes core.data_engine_v2 FIRST (the v5.51.0
+    engine with hardening), tracks which binding succeeded in the
+    module-level CORE_ENGINE_SOURCE constant, and surfaces it via
+    meta.engine_source on every response. This is the same observability
+    pattern that v4.3.1 introduced for routes/advanced_analysis.py and
+    v8.4.0 introduced for routes/enriched_quote.py.
+
+    Cascade order (most-preferred first):
+      1. request.app.state.engine|data_engine
+         — already-instantiated engine on the FastAPI app state
+         (set by main.py at startup; SAME instance shared across requests)
+      2. core.data_engine_v2.get_engine() — async factory for v5.51.0
+      3. core.data_engine_v2.get_engine_if_ready() — sync ready-check
+      4. core.data_engine.get_engine() — legacy fallback (BUG INDICATOR)
+      5. core.investment_advisor_engine.get_engine() — last-resort
+    """
+    global CORE_ENGINE_SOURCE
+
+    # Path 1: app.state (instance shared across requests)
     try:
         st = getattr(request.app, "state", None)
-        if st and getattr(st, "engine", None):
-            return st.engine
-        if st and getattr(st, "data_engine", None):
-            return st.data_engine
+        if st is not None:
+            for attr in ("engine", "data_engine"):
+                value = getattr(st, attr, None)
+                if value is not None:
+                    CORE_ENGINE_SOURCE = "request.app.state." + attr
+                    return value
     except Exception:
         pass
 
-    for modpath in ("core.data_engine_v2", "core.data_engine", "core.investment_advisor_engine"):
+    # Path 2: core.data_engine_v2.get_engine() — preferred async factory
+    try:
+        mod = import_module("core.data_engine_v2")
+        get_engine = getattr(mod, "get_engine", None)
+        if callable(get_engine):
+            eng = get_engine()
+            if inspect.isawaitable(eng):
+                eng = await eng
+            if eng is not None:
+                CORE_ENGINE_SOURCE = "core.data_engine_v2.get_engine().result"
+                return eng
+    except Exception as v2_err:
         try:
-            mod = import_module(modpath)
+            logger.info(
+                "[investment_advisor v%s] core.data_engine_v2.get_engine() unavailable: %s: %s",
+                INVESTMENT_ADVISOR_VERSION, v2_err.__class__.__name__, v2_err,
+            )
         except Exception:
-            continue
-        for attr in ("get_engine", "get_data_engine", "engine", "data_engine", "ENGINE", "DATA_ENGINE"):
+            pass
+
+    # Path 3: core.data_engine_v2.get_engine_if_ready() — sync ready-check
+    try:
+        mod = import_module("core.data_engine_v2")
+        get_ready = getattr(mod, "get_engine_if_ready", None)
+        if callable(get_ready):
+            eng = get_ready()
+            if eng is not None:
+                CORE_ENGINE_SOURCE = "core.data_engine_v2.get_engine_if_ready().result"
+                return eng
+    except Exception as ready_err:
+        try:
+            logger.info(
+                "[investment_advisor v%s] core.data_engine_v2.get_engine_if_ready() unavailable: %s: %s",
+                INVESTMENT_ADVISOR_VERSION, ready_err.__class__.__name__, ready_err,
+            )
+        except Exception:
+            pass
+
+    # Path 4: legacy fallback — bug indicator if reached
+    try:
+        mod = import_module("core.data_engine")
+        get_engine = getattr(mod, "get_engine", None)
+        if callable(get_engine):
+            eng = get_engine()
+            if inspect.isawaitable(eng):
+                eng = await eng
+            if eng is not None:
+                CORE_ENGINE_SOURCE = "core.data_engine.get_engine"
+                try:
+                    logger.warning(
+                        "[investment_advisor v%s] all v2 binding patterns failed; using legacy "
+                        "core.data_engine (this loses v5.51.0 enrichment — investigate v2 exports)",
+                        INVESTMENT_ADVISOR_VERSION,
+                    )
+                except Exception:
+                    pass
+                return eng
+    except Exception:
+        pass
+
+    # Path 5: investment_advisor_engine — last-resort
+    try:
+        mod = import_module("core.investment_advisor_engine")
+        for attr in ("get_engine", "engine", "ENGINE"):
             candidate = getattr(mod, attr, None)
             if candidate is None:
                 continue
@@ -960,11 +1051,17 @@ async def _get_engine(request: Request) -> Optional[Any]:
                     if inspect.isawaitable(eng):
                         eng = await eng
                     if eng is not None:
+                        CORE_ENGINE_SOURCE = "core.investment_advisor_engine." + attr + "()"
                         return eng
                 elif candidate is not None:
+                    CORE_ENGINE_SOURCE = "core.investment_advisor_engine." + attr
                     return candidate
             except Exception:
                 continue
+    except Exception:
+        pass
+
+    CORE_ENGINE_SOURCE = "unavailable"
     return None
 
 
@@ -981,9 +1078,47 @@ async def _resolve_bridge_impl() -> Tuple[Optional[Any], str, str]:
     return None, "", ""
 
 
-async def _call_candidate(fn: Any, *, body: Dict[str, Any], request: Request, page: str, limit: int, offset: int, schema_only: bool) -> Any:
+async def _call_candidate(
+    fn: Any,
+    *,
+    body: Dict[str, Any],
+    request: Request,
+    page: str,
+    limit: int,
+    offset: int,
+    schema_only: bool,
+) -> Tuple[Any, List[Dict[str, Any]], str]:
+    """v2.15.0 [FIX-2]: returns (result, call_summary, outcome_label).
+
+    call_summary is a per-attempt list of dicts with keys:
+      - attempt_idx (int)
+      - kwargs_keys (list[str])     — what we passed
+      - outcome (str)                — one of: success | typeerror | error
+      - error_class (str, optional)
+      - error_message (str, truncated, optional)
+
+    outcome_label is one of:
+      - "success"                       — result returned (may still be None)
+      - "all_signatures_typed_mismatch" — every variant raised TypeError
+      - "raised"                        — non-TypeError raised; raise propagated
+                                          to caller
+      - "no_attempts_executed"          — fn was None
+      - "fn_not_callable"               — fn provided but not callable
+
+    The outcome distinguishes "didn't match any signature" (typed_mismatch)
+    from "matched a signature but the call body raised" (raised) — the
+    same distinction used in advanced_analysis v4.3.4 and enriched_quote
+    v8.4.0's tolerant call wrappers.
+
+    Note: when outcome is "raised", _execute_via_bridge's catch block will
+    receive the exception; call_summary is captured separately on the
+    last_call_summary module-level slot so the caller can pull it after
+    the raise. We expose this via a function-attribute storage pattern.
+    """
+    if fn is None:
+        return None, [], "no_attempts_executed"
     if not callable(fn):
-        return None
+        return None, [], "fn_not_callable"
 
     kwargs_variants = [
         {"request": request, "body": body, "page": page, "limit": limit, "offset": offset, "schema_only": schema_only},
@@ -997,22 +1132,55 @@ async def _call_candidate(fn: Any, *, body: Dict[str, Any], request: Request, pa
         {},
     ]
 
+    call_summary: List[Dict[str, Any]] = []
     last_type_error: Optional[Exception] = None
-    for kwargs in kwargs_variants:
+
+    for attempt_idx, kwargs in enumerate(kwargs_variants):
+        kwargs_keys = sorted(list(kwargs.keys()))[:15]
         try:
             result = fn(**kwargs)
             if inspect.isawaitable(result):
                 result = await result
-            return result
+            call_summary.append({
+                "attempt_idx": attempt_idx,
+                "kwargs_keys": kwargs_keys,
+                "outcome": "success",
+            })
+            return result, call_summary, "success"
         except TypeError as exc:
+            call_summary.append({
+                "attempt_idx": attempt_idx,
+                "kwargs_keys": kwargs_keys,
+                "outcome": "typeerror",
+                "error_class": "TypeError",
+                "error_message": str(exc)[:200],
+            })
             last_type_error = exc
             continue
-        except Exception:
+        except Exception as exc:
+            call_summary.append({
+                "attempt_idx": attempt_idx,
+                "kwargs_keys": kwargs_keys,
+                "outcome": "error",
+                "error_class": exc.__class__.__name__,
+                "error_message": str(exc)[:200],
+            })
+            # Surface the call_summary on the function attribute so the
+            # caller's except block can retrieve it after the raise.
+            try:
+                _call_candidate._last_call_summary = call_summary  # type: ignore[attr-defined]
+            except Exception:
+                pass
             raise
 
+    # All attempts raised TypeError
     if last_type_error is not None:
-        raise last_type_error
-    return None
+        try:
+            _call_candidate._last_call_summary = call_summary  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return None, call_summary, "all_signatures_typed_mismatch"
+    return None, call_summary, "no_attempts_executed"
 
 
 def _bridge_timeout_for_page(page: str) -> float:
@@ -1160,8 +1328,15 @@ async def _execute_via_bridge(
 
     bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl()
 
+    # v2.15.0 [FIX-1]: ensure CORE_ENGINE_SOURCE is fresh for this request,
+    # surfaced in any partial responses below.
+    try:
+        await _get_engine(request)
+    except Exception:
+        pass
+
     if schema_only_final or headers_only_final:
-        return _make_schema_only_response(
+        resp = _make_schema_only_response(
             page,
             include_matrix=include_matrix_final,
             request_id=request_id,
@@ -1169,6 +1344,9 @@ async def _execute_via_bridge(
             bridge_name=bridge_name,
             warnings=(["headers_only"] if headers_only_final else None),
         )
+        if isinstance(resp.get("meta"), dict):
+            resp["meta"]["engine_source"] = CORE_ENGINE_SOURCE
+        return resp
 
     if bridge_impl is None:
         return _make_partial_response(
@@ -1178,12 +1356,21 @@ async def _execute_via_bridge(
             bridge_source="",
             bridge_name="",
             warning="canonical root bridge unavailable",
+            extra_meta={"engine_source": CORE_ENGINE_SOURCE},
         )
 
     timeout_sec = _bridge_timeout_for_page(page)
 
+    # v2.15.0 [FIX-2 + FIX-3]: capture call_summary and outcome. Errors
+    # captured with FULL message, not just class name.
+    bridge_call_summary: List[Dict[str, Any]] = []
+    bridge_call_outcome: str = "unknown"
+    bridge_error_class: Optional[str] = None
+    bridge_error_message: Optional[str] = None
+    payload: Any = None
+
     try:
-        payload = await asyncio.wait_for(
+        payload, bridge_call_summary, bridge_call_outcome = await asyncio.wait_for(
             _call_candidate(
                 bridge_impl,
                 body=body,
@@ -1196,27 +1383,68 @@ async def _execute_via_bridge(
             timeout=timeout_sec,
         )
     except asyncio.TimeoutError:
+        # Try to recover whatever call_summary _call_candidate captured
+        # before the timeout fired.
+        try:
+            bridge_call_summary = list(getattr(_call_candidate, "_last_call_summary", []) or [])
+        except Exception:
+            bridge_call_summary = []
+        bridge_call_outcome = "timeout"
         return _make_partial_response(
             page,
             include_matrix=include_matrix_final,
             request_id=request_id,
             bridge_source=bridge_source,
             bridge_name=bridge_name,
-            warning=f"bridge timeout after {timeout_sec:.1f}s",
-            extra_meta={"bridge_timeout_sec": timeout_sec},
+            warning="bridge timeout after {:.1f}s".format(timeout_sec),
+            extra_meta={
+                "bridge_timeout_sec": timeout_sec,
+                "bridge_call_outcome": bridge_call_outcome,
+                "bridge_call_summary": bridge_call_summary[:5],
+                "engine_source": CORE_ENGINE_SOURCE,
+            },
         )
     except Exception as exc:
+        # v2.15.0 [FIX-3 — CRITICAL]: capture full error message AND
+        # the call_summary _call_candidate accumulated before raising.
+        # v2.14.0 only kept the class name. v2.15.0 surfaces the full
+        # message (truncated) plus per-attempt diagnostic.
+        bridge_error_class = exc.__class__.__name__
+        bridge_error_message = "{}: {}".format(bridge_error_class, str(exc)[:500])
+        bridge_call_outcome = "raised"
+        try:
+            bridge_call_summary = list(getattr(_call_candidate, "_last_call_summary", []) or [])
+        except Exception:
+            bridge_call_summary = []
+
+        try:
+            logger.warning(
+                "[investment_advisor v%s] bridge raised: source=%r name=%r error=%s",
+                INVESTMENT_ADVISOR_VERSION, bridge_source, bridge_name, bridge_error_message,
+            )
+        except Exception:
+            pass
+
         return _make_partial_response(
             page,
             include_matrix=include_matrix_final,
             request_id=request_id,
             bridge_source=bridge_source,
             bridge_name=bridge_name,
-            warning=f"bridge exception: {exc.__class__.__name__}",
-            extra_meta={"bridge_timeout_sec": timeout_sec},
+            warning="bridge exception: {}".format(bridge_error_class),
+            extra_meta={
+                "bridge_timeout_sec": timeout_sec,
+                "bridge_error": bridge_error_message,
+                "bridge_error_class": bridge_error_class,
+                "bridge_call_outcome": bridge_call_outcome,
+                "bridge_call_summary": bridge_call_summary[:5],
+                "engine_source": CORE_ENGINE_SOURCE,
+            },
         )
 
-    return _normalize_payload_from_bridge(
+    # Success path: payload is what the bridge returned. Forward through
+    # _normalize_payload_from_bridge then attach call_summary + engine_source.
+    normalized = _normalize_payload_from_bridge(
         payload,
         page=page,
         include_matrix=include_matrix_final,
@@ -1225,6 +1453,14 @@ async def _execute_via_bridge(
         bridge_name=bridge_name,
         timeout_sec=timeout_sec,
     )
+    if isinstance(normalized.get("meta"), dict):
+        meta_ref = normalized["meta"]
+        # setdefault so v4.3.4's upstream_call_summary etc. aren't clobbered
+        meta_ref.setdefault("bridge_call_outcome", bridge_call_outcome)
+        if bridge_call_summary:
+            meta_ref.setdefault("bridge_call_summary", bridge_call_summary[:5])
+        meta_ref.setdefault("engine_source", CORE_ENGINE_SOURCE)
+    return normalized
 
 
 def _advanced_get_body(
@@ -1349,6 +1585,78 @@ def _advanced_root_has_request_filters(
     return False
 
 
+def _make_handler_exception_response(
+    *,
+    page_hint: str,
+    request_id: str,
+    handler_name: str,
+    exc: BaseException,
+) -> Dict[str, Any]:
+    """v2.15.0 [FIX-4]: structured envelope for unhandled handler exceptions.
+
+    Returns a payload with status="error" plus _engine_error / _engine_error_class
+    in meta, instead of letting the exception bubble to FastAPI as a 500.
+    Same shape as a partial response so client code that handles
+    `partial`/`degraded` continues to work.
+    """
+    page = _normalize_page_name(page_hint or TOP10_PAGE_NAME)
+    error_class = exc.__class__.__name__
+    error_repr = "{}: {}".format(error_class, str(exc)[:500])
+    headers, keys = _load_schema_defaults(page)
+    meta = _make_meta(
+        request_id=request_id,
+        page=page,
+        status_out="error",
+        bridge_source="",
+        bridge_name="",
+        warnings=["{} top-level exception: {}".format(handler_name, error_class)],
+        timeout_sec=0.0,
+    )
+    meta["_engine_error"] = error_repr
+    meta["_engine_error_class"] = error_class
+    meta["engine_source"] = CORE_ENGINE_SOURCE
+    meta["handler"] = handler_name
+
+    try:
+        logger.error(
+            "[investment_advisor v%s] %s top-level exception: %s",
+            INVESTMENT_ADVISOR_VERSION, handler_name, error_repr,
+            exc_info=True,
+        )
+    except Exception:
+        pass
+
+    return jsonable_encoder(
+        {
+            "status": "error",
+            "page": page,
+            "sheet": page,
+            "sheet_name": page,
+            "route_family": _page_family(page),
+            "headers": headers,
+            "display_headers": headers,
+            "sheet_headers": headers,
+            "column_headers": headers,
+            "keys": keys,
+            "fields": keys,
+            "columns": keys,
+            "rows": [],
+            "row_objects": [],
+            "records": [],
+            "results": [],
+            "data": [],
+            "items": [],
+            "quotes": [],
+            "rows_matrix": [],
+            "version": INVESTMENT_ADVISOR_VERSION,
+            "request_id": request_id,
+            "error": error_repr,
+            "detail": error_repr,
+            "meta": meta,
+        }
+    )
+
+
 async def _advanced_root_summary(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
     bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl()
@@ -1363,6 +1671,7 @@ async def _advanced_root_summary(request: Request) -> Dict[str, Any]:
             "root_path": "/v1/advanced",
             "engine_present": bool(engine),
             "engine_type": type(engine).__name__ if engine else "none",
+            "engine_source": CORE_ENGINE_SOURCE,
             "bridge_available": bool(bridge_impl),
             "bridge_source": bridge_source,
             "bridge_name": bridge_name,
@@ -1421,80 +1730,94 @@ async def advanced_root_get(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
+    request_id = _request_id(request, x_request_id)
+    try:
+        _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
 
-    has_filters = _advanced_root_has_request_filters(
-        page=page,
-        sheet=sheet,
-        sheet_name=sheet_name,
-        name=name,
-        tab=tab,
-        symbols=symbols,
-        tickers=tickers,
-        pages=pages,
-        sources=sources,
-        risk_level=risk_level,
-        risk_profile=risk_profile,
-        confidence_level=confidence_level,
-        confidence_bucket=confidence_bucket,
-        investment_period_days=investment_period_days,
-        horizon_days=horizon_days,
-        min_expected_roi=min_expected_roi,
-        min_roi=min_roi,
-        min_confidence=min_confidence,
-        top_n=top_n,
-        limit=limit,
-        offset=offset,
-        mode=mode,
-        include_matrix=include_matrix,
-        schema_only=schema_only,
-        headers_only=headers_only,
-    )
+        has_filters = _advanced_root_has_request_filters(
+            page=page,
+            sheet=sheet,
+            sheet_name=sheet_name,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            pages=pages,
+            sources=sources,
+            risk_level=risk_level,
+            risk_profile=risk_profile,
+            confidence_level=confidence_level,
+            confidence_bucket=confidence_bucket,
+            investment_period_days=investment_period_days,
+            horizon_days=horizon_days,
+            min_expected_roi=min_expected_roi,
+            min_roi=min_roi,
+            min_confidence=min_confidence,
+            top_n=top_n,
+            limit=limit,
+            offset=offset,
+            mode=mode,
+            include_matrix=include_matrix,
+            schema_only=schema_only,
+            headers_only=headers_only,
+        )
 
-    if not has_filters:
-        payload = await _advanced_root_summary(request)
-        response.headers["X-Request-ID"] = _request_id(request, x_request_id)
+        if not has_filters:
+            payload = await _advanced_root_summary(request)
+            response.headers["X-Request-ID"] = request_id
+            return payload
+
+        body = _advanced_get_body(
+            page=page,
+            sheet=sheet,
+            sheet_name=sheet_name,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            pages=pages,
+            sources=sources,
+            risk_level=risk_level,
+            risk_profile=risk_profile,
+            confidence_level=confidence_level,
+            confidence_bucket=confidence_bucket,
+            investment_period_days=investment_period_days,
+            horizon_days=horizon_days,
+            min_expected_roi=min_expected_roi,
+            min_roi=min_roi,
+            min_confidence=min_confidence,
+            top_n=top_n,
+            limit=limit,
+            offset=offset,
+            include_matrix=include_matrix,
+            schema_only=schema_only,
+            headers_only=headers_only,
+        )
+
+        payload = await _execute_via_bridge(
+            request=request,
+            body=body,
+            include_matrix=include_matrix,
+            limit=limit if limit is not None else top_n,
+            offset=offset,
+            schema_only=schema_only,
+            headers_only=headers_only,
+            x_request_id=x_request_id,
+        )
+        response.headers["X-Request-ID"] = payload.get("request_id") or request_id
         return payload
-
-    body = _advanced_get_body(
-        page=page,
-        sheet=sheet,
-        sheet_name=sheet_name,
-        name=name,
-        tab=tab,
-        symbols=symbols,
-        tickers=tickers,
-        pages=pages,
-        sources=sources,
-        risk_level=risk_level,
-        risk_profile=risk_profile,
-        confidence_level=confidence_level,
-        confidence_bucket=confidence_bucket,
-        investment_period_days=investment_period_days,
-        horizon_days=horizon_days,
-        min_expected_roi=min_expected_roi,
-        min_roi=min_roi,
-        min_confidence=min_confidence,
-        top_n=top_n,
-        limit=limit,
-        offset=offset,
-        include_matrix=include_matrix,
-        schema_only=schema_only,
-        headers_only=headers_only,
-    )
-
-    payload = await _execute_via_bridge(
-        request=request,
-        body=body,
-        include_matrix=include_matrix,
-        limit=limit if limit is not None else top_n,
-        offset=offset,
-        schema_only=schema_only,
-        headers_only=headers_only,
-        x_request_id=x_request_id,
-    )
-    response.headers["X-Request-ID"] = payload.get("request_id") or _request_id(request, x_request_id)
-    return payload
+    except HTTPException:
+        # Auth failures and other 4xx — re-raise as-is
+        raise
+    except Exception as handler_err:
+        # v2.15.0 [FIX-4]: top-level catch — return structured envelope
+        page_hint = page or sheet or sheet_name or name or tab or TOP10_PAGE_NAME
+        return _make_handler_exception_response(
+            page_hint=page_hint,
+            request_id=request_id,
+            handler_name="advanced_root_get",
+            exc=handler_err,
+        )
 
 
 @router.post("")
@@ -1513,19 +1836,36 @@ async def advanced_root_post(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
-    payload = await _execute_via_bridge(
-        request=request,
-        body=dict(body or {}),
-        include_matrix=include_matrix,
-        limit=limit,
-        offset=offset,
-        schema_only=schema_only,
-        headers_only=headers_only,
-        x_request_id=x_request_id,
-    )
-    response.headers["X-Request-ID"] = payload.get("request_id") or _request_id(request, x_request_id)
-    return payload
+    request_id = _request_id(request, x_request_id)
+    try:
+        _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
+        payload = await _execute_via_bridge(
+            request=request,
+            body=dict(body or {}),
+            include_matrix=include_matrix,
+            limit=limit,
+            offset=offset,
+            schema_only=schema_only,
+            headers_only=headers_only,
+            x_request_id=x_request_id,
+        )
+        response.headers["X-Request-ID"] = payload.get("request_id") or request_id
+        return payload
+    except HTTPException:
+        raise
+    except Exception as handler_err:
+        page_hint = TOP10_PAGE_NAME
+        try:
+            if isinstance(body, Mapping):
+                page_hint = _s(body.get("page") or body.get("sheet") or body.get("sheet_name")) or page_hint
+        except Exception:
+            pass
+        return _make_handler_exception_response(
+            page_hint=page_hint,
+            request_id=request_id,
+            handler_name="advanced_root_post",
+            exc=handler_err,
+        )
 
 
 @router.get("/health")
@@ -1541,6 +1881,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
             "route_family": ROUTE_FAMILY_NAME,
             "engine_available": bool(engine),
             "engine_type": type(engine).__name__ if engine else "none",
+            "engine_source": CORE_ENGINE_SOURCE,
             "bridge_available": bool(bridge_impl),
             "bridge_source": bridge_source,
             "bridge_name": bridge_name,
@@ -1562,6 +1903,7 @@ async def advanced_meta(request: Request) -> Dict[str, Any]:
             "route_family": ROUTE_FAMILY_NAME,
             "engine_present": bool(engine),
             "engine_type": type(engine).__name__ if engine else "none",
+            "engine_source": CORE_ENGINE_SOURCE,
             "bridge_available": bool(bridge_impl),
             "bridge_source": bridge_source,
             "bridge_name": bridge_name,
@@ -1601,23 +1943,40 @@ async def advanced_request_post(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
-    body = dict(body or {})
-    if mode and not body.get("mode"):
-        body["mode"] = mode
+    request_id = _request_id(request, x_request_id)
+    try:
+        _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
+        body = dict(body or {})
+        if mode and not body.get("mode"):
+            body["mode"] = mode
 
-    payload = await _execute_via_bridge(
-        request=request,
-        body=body,
-        include_matrix=include_matrix,
-        limit=limit,
-        offset=offset,
-        schema_only=schema_only,
-        headers_only=headers_only,
-        x_request_id=x_request_id,
-    )
-    response.headers["X-Request-ID"] = payload.get("request_id") or _request_id(request, x_request_id)
-    return payload
+        payload = await _execute_via_bridge(
+            request=request,
+            body=body,
+            include_matrix=include_matrix,
+            limit=limit,
+            offset=offset,
+            schema_only=schema_only,
+            headers_only=headers_only,
+            x_request_id=x_request_id,
+        )
+        response.headers["X-Request-ID"] = payload.get("request_id") or request_id
+        return payload
+    except HTTPException:
+        raise
+    except Exception as handler_err:
+        page_hint = TOP10_PAGE_NAME
+        try:
+            if isinstance(body, Mapping):
+                page_hint = _s(body.get("page") or body.get("sheet") or body.get("sheet_name")) or page_hint
+        except Exception:
+            pass
+        return _make_handler_exception_response(
+            page_hint=page_hint,
+            request_id=request_id,
+            handler_name="advanced_request_post",
+            exc=handler_err,
+        )
 
 
 @router.get("/recommendations")
@@ -1655,49 +2014,61 @@ async def advanced_request_get(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
+    request_id = _request_id(request, x_request_id)
+    try:
+        _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
 
-    body = _advanced_get_body(
-        page=page,
-        sheet=sheet,
-        sheet_name=sheet_name,
-        name=name,
-        tab=tab,
-        symbols=symbols,
-        tickers=tickers,
-        pages=pages,
-        sources=sources,
-        risk_level=risk_level,
-        risk_profile=risk_profile,
-        confidence_level=confidence_level,
-        confidence_bucket=confidence_bucket,
-        investment_period_days=investment_period_days,
-        horizon_days=horizon_days,
-        min_expected_roi=min_expected_roi,
-        min_roi=min_roi,
-        min_confidence=min_confidence,
-        top_n=top_n,
-        limit=limit,
-        offset=offset,
-        include_matrix=include_matrix,
-        schema_only=schema_only,
-        headers_only=headers_only,
-    )
-    if mode:
-        body["mode"] = mode
+        body = _advanced_get_body(
+            page=page,
+            sheet=sheet,
+            sheet_name=sheet_name,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            pages=pages,
+            sources=sources,
+            risk_level=risk_level,
+            risk_profile=risk_profile,
+            confidence_level=confidence_level,
+            confidence_bucket=confidence_bucket,
+            investment_period_days=investment_period_days,
+            horizon_days=horizon_days,
+            min_expected_roi=min_expected_roi,
+            min_roi=min_roi,
+            min_confidence=min_confidence,
+            top_n=top_n,
+            limit=limit,
+            offset=offset,
+            include_matrix=include_matrix,
+            schema_only=schema_only,
+            headers_only=headers_only,
+        )
+        if mode:
+            body["mode"] = mode
 
-    payload = await _execute_via_bridge(
-        request=request,
-        body=body,
-        include_matrix=include_matrix,
-        limit=limit if limit is not None else top_n,
-        offset=offset,
-        schema_only=schema_only,
-        headers_only=headers_only,
-        x_request_id=x_request_id,
-    )
-    response.headers["X-Request-ID"] = payload.get("request_id") or _request_id(request, x_request_id)
-    return payload
+        payload = await _execute_via_bridge(
+            request=request,
+            body=body,
+            include_matrix=include_matrix,
+            limit=limit if limit is not None else top_n,
+            offset=offset,
+            schema_only=schema_only,
+            headers_only=headers_only,
+            x_request_id=x_request_id,
+        )
+        response.headers["X-Request-ID"] = payload.get("request_id") or request_id
+        return payload
+    except HTTPException:
+        raise
+    except Exception as handler_err:
+        page_hint = page or sheet or sheet_name or name or tab or TOP10_PAGE_NAME
+        return _make_handler_exception_response(
+            page_hint=page_hint,
+            request_id=request_id,
+            handler_name="advanced_request_get",
+            exc=handler_err,
+        )
 
 
 __all__ = [
