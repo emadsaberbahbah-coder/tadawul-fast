@@ -2,71 +2,135 @@
 # core/config.py
 """
 ================================================================================
-Core Configuration Module -- v7.0.0
+Core Configuration Module — v5.8.0
 (RENDER-SAFE / STARTUP-SAFE / SCHEMA-AWARE / ROUTE-AUTH-CONTROLLED)
 ================================================================================
-TADAWUL FAST BRIDGE -- Enterprise Configuration Management
+TADAWUL FAST BRIDGE – Enterprise Configuration Management
 
 Primary goals:
 - ✅ Avoid deploy/startup failures (NO network calls, NO heavy init at import-time)
 - ✅ Defensive env parsing + safe optional dependencies
 - ✅ Google credentials normalization (JSON / base64 / file path)
-- ✅ Distributed config sources are LAZY and opt-in (won't block Render port binding)
+- ✅ Distributed config sources are LAZY and opt-in (won’t block Render port binding)
 - ✅ Schema/page alignment via core.sheets.page_catalog + core.sheets.schema_registry
 - ✅ CRITICAL: headers/columns MUST ALWAYS exist even if computations are disabled
-- ✅ Granular route auth controls
+- ✅ Granular route auth controls:
+     - Keep service protected by default
+     - Allow explicit PUBLIC_EXACT_PATHS / PUBLIC_PATH_PREFIXES
+     - Support protected overrides
+     - Make auth decisions path-aware without forcing OPEN_MODE=true
 
-v7.0.0 Changes (from v6.0.0)
-----------------------------
-Bug fixes:
-  - `mask_secret_dict` previously leaked string/bytes values inside lists when
-    the enclosing key was sensitive (e.g. `{"api_keys": ["sk_live_...", ...]}`
-    produced unmasked output). Fixed: when the key matches a sensitive pattern
-    and the value is a list of primitives, each primitive is masked.
-  - `normalize_google_credentials` previously returned `(raw_string, None)`
-    when a `{...}`-looking env var failed to JSON-parse, AND short-circuited
-    further fallback paths (base64 / file). Callers then received malformed
-    JSON strings as "valid credentials". Fixed: parse failures are logged and
-    we continue to the next source; the function only returns a raw string
-    when it maps to a valid credentials dict.
-  - `coerce_dict(value, default=some_dict)` returned the caller's `default`
-    by reference, so later mutations on the returned dict leaked back into
-    the caller's default. Fixed: default is shallow-copied before return.
-  - `Environment.from_string("dev")` resolved to PRODUCTION because the enum
-    only accepted exact values. Added an alias table covering common forms
-    (`dev`, `prod`, `stage`, `test`, `qa`, `uat`, `ci`) before falling back
-    to the configured default (still PRODUCTION for safety).
+Safe-by-default philosophy:
+- Importing this module must NEVER crash, NEVER hang, NEVER do network I/O.
 
-Cleanup:
-  - Added `ConfigError`, `ConfigValidationError`, and `ConfigSourceError` to
-    `__all__` — they're catchable exceptions callers need access to.
-  - `TraceContext.__call__` now uses `functools.wraps` so decorated functions
-    preserve `__qualname__`, `__module__`, `__wrapped__`, and annotations
-    instead of only `__name__` and `__doc__`.
-  - Removed unused `cast` import from typing.
-  - `LogLevel` lookup in `Settings.from_env` uses direct member lookup via
-    `LogLevel.__members__` instead of a linear scan.
-  - `Settings.from_env` no longer double-reads `OPEN_MODE` from the environment.
+────────────────────────────────────────────────────────────────────────────────
+Why v5.8.0 (vs v5.7.0) — OPEN PRICE ROUTING (Phase 1.3 of upgrade plan)
+────────────────────────────────────────────────────────────────────────────────
 
-Preserved:
-  - Full `__all__` surface (60+ public names; exception exports added).
-  - Every public function signature and behavior for valid inputs.
-  - orjson fast-path with stdlib fallback.
-  - Entire distributed config-source stack (Consul / Etcd / ZooKeeper),
-    encryption helper, version management.
-  - `Settings` dataclass field set, defaults, and `from_env` / `from_file`
-    contracts.
-  - Auth helpers: `auth_ok`, `is_public_path`, `is_open_mode`,
-    `allowed_tokens`.
-  - Schema import fallback chain and page-catalog shims.
-================================================================================
+The May 2026 Global_Markets audit found Open Price 100% empty on the
+sheet. The schema canonical key is `open_price` (mapped to display
+header "Open"); both EODHD and Yahoo Chart providers DO emit an
+`open` value, and enriched_quote.py has the alias map
+{"open_price": ["open"]}. So the column SHOULD have populated.
+
+The investigation surfaced two latent issues a config-only change
+can't fully fix, but CAN make tractable for the provider /
+data_engine_v2 revisions that follow this one:
+
+  1. There's no documented preference order for which provider to
+     ask for `open_price`. EODHD's real-time endpoint sometimes
+     omits open during pre-market for thinly-traded symbols;
+     Yahoo Chart's regularMarketOpen is more reliable for those
+     cases but slower. Without an explicit chain, the engine just
+     uses whichever provider it touched first for the request.
+
+  2. KSA market symbols cannot use EODHD (KSA_DISALLOW_EODHD), so
+     the chain there must default to a different ordering.
+     Tadawul provider has open data; Argaam is a fallback;
+     Yahoo Chart works for Tadawul tickers via the `.SR` suffix.
+
+v5.8.0 adds explicit chain configuration so the upcoming provider
+and data_engine_v2 revisions for Phase 1.3 can read a single
+authoritative ordering instead of hardcoding one in each layer.
+
+[NEW dataclass fields on Settings]:
+  - open_price_enabled: bool = True
+      Master toggle. When False, providers / data_engine_v2 should
+      skip resolving `open_price` and the column publishes blank.
+      Useful for one-click incident recovery if a provider starts
+      returning bad open values.
+
+  - open_price_provider_chain: List[str]
+      Default: ["eodhd", "yahoo_chart"]
+      Order in which providers are consulted for `open_price` for
+      non-KSA symbols. First provider returning a non-null,
+      finite, > 0 value wins.
+
+  - open_price_ksa_provider_chain: List[str]
+      Default: ["tadawul", "argaam", "yahoo_chart"]
+      Order for KSA symbols (where EODHD is disallowed). Same
+      first-non-null semantics as above.
+
+  - open_price_fallback_to_previous_close: bool = False
+      Conservative default. When ALL providers in the chain return
+      null for open, this controls whether to substitute
+      previous_close:
+        False — leave open_price as null. The cell stays blank.
+                Honest: "we don't know today's open."
+        True  — copy previous_close into open_price. Useful for
+                pre-market display when "yesterday's close ≈ today's
+                open" is acceptable.
+      Default False — the audit found Open Price blank, NOT wrong.
+      Substituting would mask a data-quality issue rather than fix it.
+
+  - open_price_warn_when_missing: bool = True
+      When True, the data engine should append a warning to the
+      row's `warnings` array (e.g., "open_price_unavailable") when
+      every provider in the chain returns null. The Apps Script
+      writer in 02_Core.gs v2.5.4 routes such warnings through the
+      Warnings column without leaking into numeric cells.
+
+[NEW env vars]:
+  - OPEN_PRICE_ENABLED                       (bool, default True)
+  - OPEN_PRICE_PROVIDER_CHAIN                (CSV, default "eodhd,yahoo_chart")
+  - OPEN_PRICE_KSA_PROVIDER_CHAIN            (CSV, default "tadawul,argaam,yahoo_chart")
+  - OPEN_PRICE_FALLBACK_TO_PREVIOUS_CLOSE    (bool, default False)
+  - OPEN_PRICE_WARN_WHEN_MISSING             (bool, default True)
+
+[validate() updated]:
+  - Warns when an entry of either chain isn't in `enabled_providers`
+    (KSA chain entries are NOT cross-checked against enabled_providers
+    since KSA providers route via a different path).
+  - Warns when both chains are empty AND open_price_enabled=True
+    (the engine will always blank the column).
+
+[PRESERVED — strictly]:
+  - All v5.7.0 dataclass fields with byte-identical defaults
+  - All v5.7.0 env-var parsing (the new env vars are parsed AFTER
+    all existing ones; nothing is reordered)
+  - All v5.7.0 helpers / public API (settings_public_dict, auth_ok,
+    is_open_mode, mask_settings, etc.)
+  - SettingsCache TTL behavior, distributed config sources,
+    Google credential normalization, schema alignment
+  - The frozen=True dataclass contract — new fields are added with
+    their defaults, so existing callers using cls(**partial_kwargs)
+    continue to work without modification.
+
+After deploying v5.8.0:
+  - Existing deployments work unchanged: chains default to sensible
+    values; open_price_enabled=True; warn_when_missing=True.
+  - To override on Render: set OPEN_PRICE_PROVIDER_CHAIN env var to
+    a CSV like "yahoo_chart,eodhd" if you want to flip the priority.
+  - The provider files (eodhd_provider, yahoo_chart_provider) and
+    data_engine_v2 will read these settings in the upcoming Phase 1.3
+    revisions. Until then, the new fields are inert — no behavior
+    change, no risk.
 """
 
 from __future__ import annotations
 
 import base64
 import copy
-import functools
 import json
 import logging
 import os
@@ -79,23 +143,12 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from threading import RLock
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 # =============================================================================
 # Version
 # =============================================================================
-
-__version__ = "7.0.0"
+__version__ = "5.8.0"
 CONFIG_VERSION = __version__
 CONFIG_BUILD_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 
@@ -105,60 +158,63 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 # Fast JSON (orjson optional)
 # =============================================================================
-
 try:
     import orjson  # type: ignore
 
-    def _json_loads(data: Union[str, bytes]) -> Any:
+    def json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, str):
             data = data.encode("utf-8")
         return orjson.loads(data)
 
-    def _json_dumps(obj: Any, *, default: Callable = str) -> str:
+    def json_dumps(obj: Any, *, default: Callable = str) -> str:
         return orjson.dumps(obj, default=default).decode("utf-8")
 
     _HAS_ORJSON = True
-except ImportError:
-    def _json_loads(data: Union[str, bytes]) -> Any:
+except Exception:
+
+    def json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, bytes):
             data = data.decode("utf-8", errors="replace")
         return json.loads(data)
 
-    def _json_dumps(obj: Any, *, default: Callable = str) -> str:
+    def json_dumps(obj: Any, *, default: Callable = str) -> str:
         return json.dumps(obj, default=default, ensure_ascii=False)
 
     _HAS_ORJSON = False
 
 # =============================================================================
-# Optional Dependencies (Safe)
+# Optional dependencies (safe)
 # =============================================================================
-
 try:
     import yaml  # type: ignore
+
     _HAS_YAML = True
-except ImportError:
+except Exception:
     yaml = None  # type: ignore
     _HAS_YAML = False
 
 try:
     import toml  # type: ignore
+
     _HAS_TOML = True
-except ImportError:
+except Exception:
     toml = None  # type: ignore
     _HAS_TOML = False
 
 try:
     from cryptography.fernet import Fernet  # type: ignore
+
     _HAS_CRYPTO = True
-except ImportError:
+except Exception:
     Fernet = None  # type: ignore
     _HAS_CRYPTO = False
 
 try:
     from opentelemetry import trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
+
     _OTEL_AVAILABLE = True
-except ImportError:
+except Exception:
     trace = None  # type: ignore
     Status = None  # type: ignore
     StatusCode = None  # type: ignore
@@ -166,58 +222,141 @@ except ImportError:
 
 try:
     import consul  # type: ignore
+
     _CONSUL_AVAILABLE = True
-except ImportError:
+except Exception:
     consul = None  # type: ignore
     _CONSUL_AVAILABLE = False
 
 try:
     import etcd3  # type: ignore
+
     _ETCD_AVAILABLE = True
-except ImportError:
+except Exception:
     etcd3 = None  # type: ignore
     _ETCD_AVAILABLE = False
 
 try:
     from kazoo.client import KazooClient  # type: ignore
+
     _ZOOKEEPER_AVAILABLE = True
-except ImportError:
+except Exception:
     KazooClient = None  # type: ignore
     _ZOOKEEPER_AVAILABLE = False
 
 # =============================================================================
-# Custom Exceptions
+# Schema / Pages (OPTIONAL IMPORTS; never crash)
 # =============================================================================
+_HAS_SCHEMA = False
+_SCHEMA_VERSION: Optional[str] = None
+_SREG: Dict[str, Any] = {}
 
-class ConfigError(Exception):
-    """Base exception for configuration errors."""
-    pass
+_CANONICAL_PAGES_FALLBACK = [
+    "Market_Leaders",
+    "Global_Markets",
+    "Commodities_FX",
+    "Mutual_Funds",
+    "My_Portfolio",
+    "Insights_Analysis",
+    "Top_10_Investments",
+    "Data_Dictionary",
+]
+_TOP10_FEED_PAGES_FALLBACK = [
+    "Market_Leaders",
+    "Global_Markets",
+    "Commodities_FX",
+    "Mutual_Funds",
+    "My_Portfolio",
+]
+_FORBIDDEN_PAGES_FALLBACK = {"KSA_Tadawul", "Advisor_Criteria"}
 
 
-class ConfigValidationError(ConfigError):
-    """Raised when configuration validation fails."""
-    pass
+def _fallback_normalize_page_name(page: str, *, allow_output_pages: bool = True) -> str:
+    p = (page or "").strip()
+    if not p:
+        raise ValueError("Page name is empty.")
+    if p in _FORBIDDEN_PAGES_FALLBACK:
+        raise ValueError(f"Page '{p}' is forbidden/removed.")
+    if p not in _CANONICAL_PAGES_FALLBACK:
+        raise ValueError(f"Unknown page '{p}'. Allowed: {', '.join(sorted(_CANONICAL_PAGES_FALLBACK))}")
+    if (not allow_output_pages) and p in {"Top_10_Investments", "Data_Dictionary"}:
+        raise ValueError(f"Page '{p}' is output/meta and not allowed for this operation.")
+    return p
 
 
-class ConfigSourceError(ConfigError):
-    """Raised when a config source fails to load."""
-    pass
+def _fallback_get_top10_feed_pages(pages_override: Optional[List[str]] = None) -> List[str]:
+    base = pages_override or list(_TOP10_FEED_PAGES_FALLBACK)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for p in base:
+        try:
+            cp = _fallback_normalize_page_name(p, allow_output_pages=False)
+        except Exception:
+            continue
+        if cp not in seen:
+            seen.add(cp)
+            out.append(cp)
+    return out
 
+
+_normalize_page_name: Callable[..., str] = _fallback_normalize_page_name
+_get_top10_feed_pages: Callable[..., List[str]] = _fallback_get_top10_feed_pages
+
+
+def _safe_import_schema() -> None:
+    """
+    Import schema/page catalog lazily and safely.
+    Never throws; updates module globals if successful.
+    """
+    global _HAS_SCHEMA, _SCHEMA_VERSION, _SREG
+    global _CANONICAL_PAGES_FALLBACK, _TOP10_FEED_PAGES_FALLBACK, _FORBIDDEN_PAGES_FALLBACK
+    global _normalize_page_name, _get_top10_feed_pages
+
+    try:
+        from core.sheets.schema_registry import (  # type: ignore
+            SCHEMA_REGISTRY as _SREG2,
+            SCHEMA_VERSION as _SRV,
+        )
+        from core.sheets.page_catalog import (  # type: ignore
+            CANONICAL_PAGES as _CP,
+            FORBIDDEN_PAGES as _FP,
+            TOP10_FEED_PAGES_DEFAULT as _T10,
+            get_top10_feed_pages as _get_top10_feed_pages2,
+            normalize_page_name as _normalize_page_name2,
+        )
+
+        _HAS_SCHEMA = True
+        _SCHEMA_VERSION = str(_SRV) if _SRV is not None else "unknown"
+        _SREG = dict(_SREG2) if isinstance(_SREG2, dict) else {}
+
+        _CANONICAL_PAGES_FALLBACK = list(_CP)
+        _TOP10_FEED_PAGES_FALLBACK = list(_T10)
+        _FORBIDDEN_PAGES_FALLBACK = set(_FP)
+
+        _normalize_page_name = _normalize_page_name2  # type: ignore[assignment]
+        _get_top10_feed_pages = _get_top10_feed_pages2  # type: ignore[assignment]
+    except Exception:
+        _HAS_SCHEMA = False
+        if not isinstance(_SREG, dict):
+            _SREG = {}
+        _normalize_page_name = _fallback_normalize_page_name
+        _get_top10_feed_pages = _fallback_get_top10_feed_pages
+
+
+_safe_import_schema()
 
 # =============================================================================
-# Debug Logging Helper
+# Debug logging helper (never throws)
 # =============================================================================
-
 _DEBUG = (os.getenv("CORE_CONFIG_DEBUG", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _dbg(message: str, level: str = "info", **kwargs: Any) -> None:
-    """Debug logging for configuration module."""
     if not _DEBUG:
         return
     try:
         payload = {"message": message, **kwargs}
-        line = _json_dumps(payload, default=str)
+        line = json_dumps(payload, default=str)
         lvl = (level or "info").lower()
         if lvl == "error":
             logger.error(line)
@@ -232,20 +371,22 @@ def _dbg(message: str, level: str = "info", **kwargs: Any) -> None:
 
 
 # =============================================================================
-# TraceContext (Safe Wrapper)
+# TraceContext (safe)
 # =============================================================================
-
-_TRACING_ENABLED = (
-    os.getenv("CORE_TRACING_ENABLED", "") or os.getenv("TRACING_ENABLED", "")
-).strip().lower() in {"1", "true", "yes", "y", "on"}
+_TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or os.getenv("TRACING_ENABLED", "")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
 
 
 class TraceContext:
     """
     Lightweight OpenTelemetry wrapper.
-
-    Use as context manager: with TraceContext("name"): ...
-    Use as decorator: @TraceContext("name")
+    - Use as context manager: with TraceContext("name"): ...
+    - Use as decorator: @TraceContext("name")
     """
 
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
@@ -260,68 +401,64 @@ class TraceContext:
                 tracer = trace.get_tracer(__name__)
                 self._cm = tracer.start_as_current_span(self.name)
                 self._span = self._cm.__enter__()
-                for k, v in self.attributes.items():
-                    self._span.set_attribute(k, v)
+                try:
+                    for k, v in self.attributes.items():
+                        self._span.set_attribute(k, v)
+                except Exception:
+                    pass
             except Exception:
                 self._cm = None
                 self._span = None
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc, tb):
         try:
-            if self._span is not None and exc_val is not None and Status is not None and StatusCode is not None:
+            if self._span is not None and exc is not None and Status is not None and StatusCode is not None:
                 try:
-                    self._span.record_exception(exc_val)
+                    self._span.record_exception(exc)
                 except Exception:
                     pass
                 try:
-                    self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+                    self._span.set_status(Status(StatusCode.ERROR, str(exc)))
                 except Exception:
                     pass
         finally:
             if self._cm is not None:
                 try:
-                    return self._cm.__exit__(exc_type, exc_val, exc_tb)
+                    return self._cm.__exit__(exc_type, exc, tb)
                 except Exception:
                     return False
         return False
 
     def __call__(self, fn: Callable) -> Callable:
-        # v7.0.0: use functools.wraps so the decorated function preserves
-        # __qualname__, __module__, __wrapped__, annotations, etc.
-        name = self.name
-        attributes = self.attributes
-
-        @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            with TraceContext(name, attributes):
+            with TraceContext(self.name, self.attributes):
                 return fn(*args, **kwargs)
 
+        wrapper.__name__ = getattr(fn, "__name__", "wrapped")
+        wrapper.__doc__ = getattr(fn, "__doc__", None)
         return wrapper
 
 
 # =============================================================================
-# Coercion Helpers
+# Coercion helpers
 # =============================================================================
-
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "inactive"}
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
-def strip_value(value: Any) -> str:
-    """Strip value to string, return empty string for None."""
-    if value is None:
+def strip_value(v: Any) -> str:
+    if v is None:
         return ""
     try:
-        return str(value).strip()
+        return str(v).strip()
     except Exception:
         return ""
 
 
-def coerce_bool(value: Any, default: bool) -> bool:
-    """Coerce value to boolean."""
-    s = strip_value(value).lower()
+def coerce_bool(v: Any, default: bool) -> bool:
+    s = strip_value(v).lower()
     if not s:
         return default
     if s in _TRUTHY:
@@ -331,13 +468,9 @@ def coerce_bool(value: Any, default: bool) -> bool:
     return default
 
 
-def coerce_int(value: Any, default: int, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
-    """Coerce value to integer with optional bounds."""
+def coerce_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
     try:
-        if isinstance(value, (int, float)):
-            x = int(float(value))
-        else:
-            x = int(float(strip_value(value)))
+        x = int(float(v)) if isinstance(v, (int, float)) else int(float(strip_value(v)))
     except Exception:
         x = default
     if lo is not None and x < lo:
@@ -347,13 +480,9 @@ def coerce_int(value: Any, default: int, lo: Optional[int] = None, hi: Optional[
     return x
 
 
-def coerce_float(value: Any, default: float, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
-    """Coerce value to float with optional bounds."""
+def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
     try:
-        if isinstance(value, (int, float)):
-            x = float(value)
-        else:
-            x = float(strip_value(value))
+        x = float(v) if isinstance(v, (int, float)) else float(strip_value(v))
     except Exception:
         x = default
     if lo is not None and x < lo:
@@ -363,71 +492,72 @@ def coerce_float(value: Any, default: float, lo: Optional[float] = None, hi: Opt
     return x
 
 
-def coerce_list(value: Any, default: Optional[List[str]] = None) -> List[str]:
-    """Coerce value to list of strings."""
+def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
     if default is None:
         default = []
-    if value is None:
-        return list(default)  # return a fresh list, not the caller's default
-    if isinstance(value, (list, tuple)):
-        return [strip_value(x) for x in value if strip_value(x)]
-    s = strip_value(value)
+    if v is None:
+        return default
+    if isinstance(v, list):
+        return [strip_value(x) for x in v if strip_value(x)]
+    if isinstance(v, tuple):
+        return [strip_value(x) for x in v if strip_value(x)]
+    s = strip_value(v)
     if not s:
-        return list(default)
-    # Try JSON list
+        return default
     if s.startswith("[") and s.endswith("]"):
         try:
-            parsed = _json_loads(s)
+            parsed = json_loads(s)
             if isinstance(parsed, list):
                 return [strip_value(x) for x in parsed if strip_value(x)]
         except Exception:
             pass
-    # Comma-separated
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
-def coerce_dict(value: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Coerce value to dictionary.
-
-    v7.0.0: returns a shallow copy of the default on miss, so mutations on
-    the returned dict don't leak back into the caller's supplied default.
-    """
+def coerce_dict(v: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if default is None:
         default = {}
-    if value is None:
-        return dict(default)
-    if isinstance(value, dict):
-        return value
-    s = strip_value(value)
+    if v is None:
+        return default
+    if isinstance(v, dict):
+        return v
+    s = strip_value(v)
     if not s:
-        return dict(default)
+        return default
     try:
-        parsed = _json_loads(s)
+        parsed = json_loads(s)
         if isinstance(parsed, dict):
             return parsed
     except Exception:
         pass
-    return dict(default)
+    return default
 
 
 def is_valid_url(url: str) -> bool:
-    """Check if string is a valid HTTP/HTTPS URL."""
     return bool(_URL_RE.match(strip_value(url)))
 
 
 # =============================================================================
-# Sensitive Masking Helpers
+# Sensitive masking helpers
 # =============================================================================
-
 SENSITIVE_KEYS = {
-    "token", "secret", "key", "api_key", "apikey", "password",
-    "credential", "authorization", "bearer", "jwt", "private_key",
-    "client_secret", "encryption_key",
+    "token",
+    "secret",
+    "key",
+    "api_key",
+    "apikey",
+    "password",
+    "credential",
+    "authorization",
+    "bearer",
+    "jwt",
+    "private_key",
+    "client_secret",
+    "encryption_key",
 }
 
 
 def mask_secret(s: Optional[str], reveal_first: int = 2, reveal_last: int = 4) -> Optional[str]:
-    """Mask sensitive string, showing only first/last characters."""
     if not s:
         return None
     s = strip_value(s)
@@ -436,80 +566,43 @@ def mask_secret(s: Optional[str], reveal_first: int = 2, reveal_last: int = 4) -
     return s[:reveal_first] + "..." + s[-reveal_last:]
 
 
-def _key_is_sensitive(key: str, sensitive_keys: Set[str]) -> bool:
-    """Return True if the (lower-cased) key matches any sensitive pattern."""
-    lk = str(key).lower()
-    return any(sk in lk for sk in sensitive_keys)
-
-
 def mask_secret_dict(d: Dict[str, Any], sensitive_keys: Optional[Set[str]] = None) -> Dict[str, Any]:
-    """Recursively mask sensitive values in dictionary.
-
-    v7.0.0: string/bytes items inside a list are now masked when the
-    enclosing key is sensitive (e.g. ``{"api_keys": ["sk_live_...", ...]}``).
-    Previously only dict items inside the list were recursed, so raw
-    credential strings leaked through unmasked.
-    """
     if sensitive_keys is None:
         sensitive_keys = set(SENSITIVE_KEYS)
-    result: Dict[str, Any] = {}
+    out: Dict[str, Any] = {}
     for k, v in (d or {}).items():
-        is_sensitive = _key_is_sensitive(k, sensitive_keys)
+        lk = str(k).lower()
         if isinstance(v, dict):
-            result[k] = mask_secret_dict(v, sensitive_keys)
+            out[k] = mask_secret_dict(v, sensitive_keys)
         elif isinstance(v, list):
-            new_list: List[Any] = []
-            for x in v:
-                if isinstance(x, dict):
-                    new_list.append(mask_secret_dict(x, sensitive_keys))
-                elif is_sensitive and isinstance(x, (str, bytes)):
-                    new_list.append(mask_secret(str(x)))
-                else:
-                    new_list.append(x)
-            result[k] = new_list
-        elif is_sensitive and isinstance(v, (str, bytes)):
-            result[k] = mask_secret(str(v))
+            out[k] = [mask_secret_dict(x, sensitive_keys) if isinstance(x, dict) else x for x in v]
+        elif any(sk in lk for sk in sensitive_keys) and isinstance(v, (str, bytes)):
+            out[k] = mask_secret(str(v))
         else:
-            result[k] = v
-    return result
+            out[k] = v
+    return out
 
 
 # =============================================================================
-# Deep Merge + File Loader
+# Deep merge + file loader (safe)
 # =============================================================================
-
-def deep_merge(base: Dict[str, Any], override: Dict[str, Any], overwrite: bool = True) -> Dict[str, Any]:
-    """
-    Deep merge two dictionaries.
-
-    Args:
-        base: Base dictionary
-        override: Override dictionary
-        overwrite: If True, override existing keys; if False, only add missing keys
-
-    Returns:
-        Merged dictionary
-    """
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any], *, overwrite: bool = True) -> Dict[str, Any]:
     if not isinstance(base, dict):
         base = {}
     if not isinstance(override, dict):
         return dict(base)
-    result = copy.deepcopy(base)
+    out = copy.deepcopy(base)
     for k, v in override.items():
-        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
-            result[k] = deep_merge(result[k], v, overwrite=overwrite)
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = deep_merge(out[k], v, overwrite=overwrite)
         else:
-            if overwrite or k not in result:
-                result[k] = copy.deepcopy(v)
-    return result
+            if overwrite or k not in out:
+                out[k] = copy.deepcopy(v)
+    return out
 
 
 def load_file_content(path: Path) -> Dict[str, Any]:
-    """
-    Load configuration from file (JSON/YAML/TOML).
-
-    Returns empty dict on failure.
-    """
+    """Load config from JSON/YAML/TOML. Never throws; returns {} on failure."""
     try:
         if not path.exists() or not path.is_file():
             return {}
@@ -517,16 +610,20 @@ def load_file_content(path: Path) -> Dict[str, Any]:
         if not raw:
             return {}
         suffix = path.suffix.lower()
+
         if suffix == ".json":
-            obj = _json_loads(raw)
+            obj = json_loads(raw)
             return obj if isinstance(obj, dict) else {}
+
         if suffix in (".yml", ".yaml") and _HAS_YAML and yaml is not None:
             obj = yaml.safe_load(raw)
             return obj if isinstance(obj, dict) else {}
+
         if suffix == ".toml" and _HAS_TOML and toml is not None:
             obj = toml.loads(raw)
             return obj if isinstance(obj, dict) else {}
-        obj = _json_loads(raw)
+
+        obj = json_loads(raw)
         return obj if isinstance(obj, dict) else {}
     except Exception as e:
         _dbg("load_file_content failed", "warning", path=str(path), error=str(e))
@@ -536,60 +633,22 @@ def load_file_content(path: Path) -> Dict[str, Any]:
 # =============================================================================
 # Enums
 # =============================================================================
-
-# v7.0.0: common abbreviations used in deployment configs that should map
-# to canonical Environment values.
-_ENV_ALIASES: Dict[str, str] = {
-    "dev": "development",
-    "develop": "development",
-    "local": "development",
-    "prod": "production",
-    "live": "production",
-    "stage": "staging",
-    "stg": "staging",
-    "test": "testing",
-    "tst": "testing",
-    "qa": "testing",
-    "uat": "staging",
-    "ci": "testing",
-}
-
-
 class Environment(str, Enum):
-    """Deployment environment."""
     DEVELOPMENT = "development"
     TESTING = "testing"
     STAGING = "staging"
     PRODUCTION = "production"
 
     @classmethod
-    def from_string(cls, value: str, default: "Optional[Environment]" = None) -> "Environment":
-        """Resolve a string to an Environment, with alias support.
-
-        v7.0.0: handles common abbreviations like ``dev``, ``prod``,
-        ``stage``, ``test`` before falling back to ``default`` (which is
-        ``PRODUCTION`` when unspecified — fail-closed for security).
-        """
+    def from_string(cls, value: str) -> "Environment":
         v = strip_value(value).lower()
-        if not v:
-            return default if default is not None else cls.PRODUCTION
-        # Exact match first
         try:
             return cls(v)
-        except ValueError:
-            pass
-        # Alias match
-        aliased = _ENV_ALIASES.get(v)
-        if aliased is not None:
-            try:
-                return cls(aliased)
-            except ValueError:
-                pass
-        return default if default is not None else cls.PRODUCTION
+        except Exception:
+            return cls.PRODUCTION
 
 
 class LogLevel(str, Enum):
-    """Log levels."""
     TRACE = "TRACE"
     DEBUG = "DEBUG"
     INFO = "INFO"
@@ -599,7 +658,6 @@ class LogLevel(str, Enum):
 
 
 class AuthType(str, Enum):
-    """Authentication types."""
     NONE = "none"
     TOKEN = "token"
     BEARER = "bearer"
@@ -611,7 +669,6 @@ class AuthType(str, Enum):
 
 
 class CacheStrategy(str, Enum):
-    """Cache strategies."""
     MEMORY = "memory"
     REDIS = "redis"
     MEMCACHED = "memcached"
@@ -619,7 +676,6 @@ class CacheStrategy(str, Enum):
 
 
 class ConfigSource(str, Enum):
-    """Configuration sources."""
     ENV = "env"
     FILE = "file"
     CONSUL = "consul"
@@ -630,14 +686,12 @@ class ConfigSource(str, Enum):
 
 
 class ConfigStatus(str, Enum):
-    """Configuration version status."""
     ACTIVE = "active"
     ROLLED_BACK = "rolled_back"
     ARCHIVED = "archived"
 
 
 class EncryptionMethod(str, Enum):
-    """Encryption methods."""
     NONE = "none"
     BASE64 = "base64"
     AES = "aes"
@@ -645,17 +699,13 @@ class EncryptionMethod(str, Enum):
 
 
 # =============================================================================
-# Encryption Helper (Optional Crypto)
+# Encryption helper (optional crypto)
 # =============================================================================
-
 class ConfigEncryption:
-    """Configuration encryption helper."""
-
-    def __init__(self, method: EncryptionMethod = EncryptionMethod.NONE, key: Optional[str] = None):
+    def __init__(self, *, method: EncryptionMethod = EncryptionMethod.NONE, key: Optional[str] = None):
         self.method = method
         self.key = key
         self._fernet = None
-
         if self.method == EncryptionMethod.FERNET and _HAS_CRYPTO and key and Fernet is not None:
             try:
                 self._fernet = Fernet(key.encode("utf-8"))
@@ -663,7 +713,6 @@ class ConfigEncryption:
                 self._fernet = None
 
     def encrypt(self, value: str) -> str:
-        """Encrypt a value."""
         if not value:
             return value
         try:
@@ -678,7 +727,6 @@ class ConfigEncryption:
             return value
 
     def decrypt(self, value: str) -> str:
-        """Decrypt a value."""
         if not value:
             return value
         try:
@@ -694,302 +742,10 @@ class ConfigEncryption:
 
 
 # =============================================================================
-# Schema / Pages (Fallback + Safe Import)
+# Versioning
 # =============================================================================
-
-_HAS_SCHEMA = False
-_SCHEMA_VERSION: Optional[str] = None
-_SREG: Dict[str, Any] = {}
-
-# NOTE: the _FALLBACK suffix reflects initial values; these globals are
-# reassigned in `_safe_import_schema()` if the real modules import cleanly,
-# at which point they hold the authoritative live data.
-_CANONICAL_PAGES_FALLBACK = [
-    "Market_Leaders",
-    "Global_Markets",
-    "Commodities_FX",
-    "Mutual_Funds",
-    "My_Portfolio",
-    "Insights_Analysis",
-    "Top_10_Investments",
-    "Data_Dictionary",
-]
-
-_TOP10_FEED_PAGES_FALLBACK = [
-    "Market_Leaders",
-    "Global_Markets",
-    "Commodities_FX",
-    "Mutual_Funds",
-]
-
-_FORBIDDEN_PAGES_FALLBACK: Set[str] = {"KSA_Tadawul", "Advisor_Criteria"}
-
-
-def _fallback_normalize_page_name(page: str, allow_output_pages: bool = True) -> str:
-    """Fallback page name normalization."""
-    p = (page or "").strip()
-    if not p:
-        raise ValueError("Page name is empty.")
-    if p in _FORBIDDEN_PAGES_FALLBACK:
-        raise ValueError(f"Page '{p}' is forbidden/removed.")
-    if p not in _CANONICAL_PAGES_FALLBACK:
-        raise ValueError(f"Unknown page '{p}'. Allowed: {', '.join(sorted(_CANONICAL_PAGES_FALLBACK))}")
-    if not allow_output_pages and p in {"Top_10_Investments", "Data_Dictionary"}:
-        raise ValueError(f"Page '{p}' is output/meta and not allowed for this operation.")
-    return p
-
-
-def _fallback_get_top10_feed_pages(pages_override: Optional[List[str]] = None) -> List[str]:
-    """Fallback Top10 feed pages."""
-    base = pages_override or list(_TOP10_FEED_PAGES_FALLBACK)
-    result: List[str] = []
-    seen: Set[str] = set()
-    for p in base:
-        try:
-            cp = _fallback_normalize_page_name(p, allow_output_pages=False)
-        except Exception:
-            continue
-        if cp not in seen:
-            seen.add(cp)
-            result.append(cp)
-    return result
-
-
-_normalize_page_name: Callable[..., str] = _fallback_normalize_page_name
-_get_top10_feed_pages: Callable[..., List[str]] = _fallback_get_top10_feed_pages
-
-
-def _try_import_module(module_path: str) -> Optional[Any]:
-    """Try to import a module; return None on failure."""
-    try:
-        import importlib
-        return importlib.import_module(module_path)
-    except ImportError:
-        return None
-
-
-def _safe_import_schema() -> None:
-    """Safely import schema and page catalog modules."""
-    global _HAS_SCHEMA, _SCHEMA_VERSION, _SREG
-    global _CANONICAL_PAGES_FALLBACK, _TOP10_FEED_PAGES_FALLBACK, _FORBIDDEN_PAGES_FALLBACK
-    global _normalize_page_name, _get_top10_feed_pages
-
-    # Try schema_registry
-    sreg_mod = None
-    for path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
-        sreg_mod = _try_import_module(path)
-        if sreg_mod is not None:
-            break
-
-    # Try page_catalog
-    pcat_mod = None
-    for path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
-        pcat_mod = _try_import_module(path)
-        if pcat_mod is not None:
-            break
-
-    if sreg_mod is None or pcat_mod is None:
-        _HAS_SCHEMA = False
-        _SREG = {}
-        _normalize_page_name = _fallback_normalize_page_name
-        _get_top10_feed_pages = _fallback_get_top10_feed_pages
-        return
-
-    try:
-        _SREG = getattr(sreg_mod, "SCHEMA_REGISTRY", {})
-        _SCHEMA_VERSION = getattr(sreg_mod, "SCHEMA_VERSION", None)
-        _CANONICAL_PAGES_FALLBACK = list(getattr(pcat_mod, "CANONICAL_PAGES", _CANONICAL_PAGES_FALLBACK))
-        _FORBIDDEN_PAGES_FALLBACK = set(getattr(pcat_mod, "FORBIDDEN_PAGES", _FORBIDDEN_PAGES_FALLBACK))
-        _TOP10_FEED_PAGES_FALLBACK = list(getattr(pcat_mod, "TOP10_FEED_PAGES_DEFAULT", _TOP10_FEED_PAGES_FALLBACK))
-
-        norm_fn = getattr(pcat_mod, "normalize_page_name", None)
-        if callable(norm_fn):
-            _normalize_page_name = norm_fn
-
-        t10_fn = getattr(pcat_mod, "get_top10_feed_pages", None)
-        if callable(t10_fn):
-            _get_top10_feed_pages = t10_fn
-
-        _HAS_SCHEMA = True
-    except Exception as e:
-        _dbg("Schema import failed", "warning", error=str(e))
-        _HAS_SCHEMA = False
-        _SREG = {}
-
-
-_safe_import_schema()
-
-
-# =============================================================================
-# Page + Schema Helpers
-# =============================================================================
-
-_OUTPUT_PAGES = {"Top_10_Investments", "Data_Dictionary"}
-
-
-def canonical_pages() -> List[str]:
-    """Get list of canonical pages."""
-    return list(_CANONICAL_PAGES_FALLBACK)
-
-
-def forbidden_pages() -> Set[str]:
-    """Get set of forbidden pages."""
-    return set(_FORBIDDEN_PAGES_FALLBACK)
-
-
-def is_output_page(page: str) -> bool:
-    """Check if page is an output page."""
-    try:
-        return strip_value(page) in _OUTPUT_PAGES
-    except Exception:
-        return False
-
-
-def normalize_page(page: str, allow_output_pages: bool = True) -> str:
-    """Normalize page name."""
-    return _normalize_page_name(page, allow_output_pages=allow_output_pages)
-
-
-def top10_feed_pages_default() -> List[str]:
-    """Get default Top10 feed pages."""
-    return _get_top10_feed_pages(None)
-
-
-def schema_available() -> bool:
-    """Check if schema is available."""
-    return bool(_HAS_SCHEMA and isinstance(_SREG, dict) and _SREG)
-
-
-def schema_known(sheet: str) -> bool:
-    """Check if sheet is known in schema."""
-    try:
-        return strip_value(sheet) in _SREG
-    except Exception:
-        return False
-
-
-def schema_headers(sheet: str) -> List[str]:
-    """Get headers for a sheet."""
-    try:
-        spec = _SREG.get(strip_value(sheet))
-        if not spec:
-            return []
-        if hasattr(spec, "columns"):
-            return [getattr(c, "header", "") for c in spec.columns]
-        return []
-    except Exception:
-        return []
-
-
-def schema_keys(sheet: str) -> List[str]:
-    """Get keys for a sheet."""
-    try:
-        spec = _SREG.get(strip_value(sheet))
-        if not spec:
-            return []
-        if hasattr(spec, "columns"):
-            return [getattr(c, "key", "") for c in spec.columns]
-        return []
-    except Exception:
-        return []
-
-
-def schema_columns(sheet: str) -> List[Dict[str, Any]]:
-    """Get column specifications for a sheet."""
-    try:
-        spec = _SREG.get(strip_value(sheet))
-        if not spec:
-            return []
-        if hasattr(spec, "columns"):
-            result: List[Dict[str, Any]] = []
-            for c in spec.columns:
-                result.append({
-                    "group": getattr(c, "group", None),
-                    "header": getattr(c, "header", None),
-                    "key": getattr(c, "key", None),
-                    "dtype": getattr(c, "dtype", None),
-                    "fmt": getattr(c, "fmt", None),
-                    "required": bool(getattr(c, "required", False)),
-                    "source": getattr(c, "source", None),
-                    "notes": getattr(c, "notes", None),
-                })
-            return result
-        return []
-    except Exception:
-        return []
-
-
-def schema_row_template(sheet: str, fill_value: Any = None) -> Dict[str, Any]:
-    """Get row template for a sheet."""
-    try:
-        return {k: fill_value for k in schema_keys(sheet)}
-    except Exception:
-        return {}
-
-
-def normalize_row_to_schema(
-    sheet: str,
-    row: Dict[str, Any],
-    fill_missing_with_null: bool = True,
-) -> Dict[str, Any]:
-    """Normalize row to schema."""
-    try:
-        sheet = strip_value(sheet)
-        row = row or {}
-        keys = schema_keys(sheet)
-        if not keys:
-            return dict(row)
-        fill = None if fill_missing_with_null else ""
-        result: Dict[str, Any] = {}
-        for k in keys:
-            result[k] = row.get(k, fill)
-        for k, v in row.items():
-            if k not in result:
-                result[k] = v
-        return result
-    except Exception:
-        return dict(row or {})
-
-
-# =============================================================================
-# Path Normalization for Auth
-# =============================================================================
-
-def _clean_paths(values: Sequence[str]) -> List[str]:
-    """Clean and deduplicate path strings."""
-    result: List[str] = []
-    seen: Set[str] = set()
-    for v in values:
-        p = strip_value(v)
-        if not p:
-            continue
-        if not p.startswith("/"):
-            p = "/" + p
-        p = re.sub(r"/{2,}", "/", p).rstrip("/") or "/"
-        if p not in seen:
-            seen.add(p)
-            result.append(p)
-    return result
-
-
-def normalize_request_path(path: Optional[str]) -> str:
-    """Normalize request path for auth matching."""
-    p = strip_value(path)
-    if not p:
-        return ""
-    p = p.split("?", 1)[0].strip()
-    if not p.startswith("/"):
-        p = "/" + p
-    return re.sub(r"/{2,}", "/", p).rstrip("/") or "/"
-
-
-# =============================================================================
-# Version Management
-# =============================================================================
-
 @dataclass(slots=True)
 class ConfigVersion:
-    """Configuration version record."""
     version_id: str
     timestamp_utc: str
     source: ConfigSource
@@ -999,7 +755,6 @@ class ConfigVersion:
     status: ConfigStatus = ConfigStatus.ACTIVE
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "version_id": self.version_id,
             "timestamp_utc": self.timestamp_utc,
@@ -1012,43 +767,38 @@ class ConfigVersion:
 
 
 class ConfigVersionManager:
-    """Manages configuration version history."""
-
     def __init__(self, max_versions: int = 100):
         self.max_versions = max(10, int(max_versions))
         self._lock = RLock()
         self._versions: List[ConfigVersion] = []
 
-    def add(self, version: ConfigVersion) -> None:
-        """Add a version to history."""
+    def add(self, v: ConfigVersion) -> None:
         with self._lock:
-            self._versions.append(version)
+            self._versions.append(v)
             if len(self._versions) > self.max_versions:
-                self._versions = self._versions[-self.max_versions:]
+                self._versions = self._versions[-self.max_versions :]
 
     def history(self, limit: int = 20) -> List[ConfigVersion]:
-        """Get version history."""
         with self._lock:
-            return list(reversed(self._versions[-max(1, int(limit)):]))
+            return list(reversed(self._versions[-max(1, int(limit)) :]))
 
 
 _VERSION_MANAGER = ConfigVersionManager(max_versions=100)
 
 
 def get_version_manager() -> ConfigVersionManager:
-    """Get the global version manager."""
     return _VERSION_MANAGER
 
 
 def save_config_version(
     changes: Dict[str, Tuple[Any, Any]],
+    *,
     author: Optional[str] = None,
     comment: Optional[str] = None,
     source: ConfigSource = ConfigSource.RUNTIME,
 ) -> None:
-    """Save a configuration version."""
     try:
-        version = ConfigVersion(
+        v = ConfigVersion(
             version_id=str(uuid.uuid4()),
             timestamp_utc=datetime.now(timezone.utc).isoformat(),
             source=source,
@@ -1057,17 +807,15 @@ def save_config_version(
             comment=comment,
             status=ConfigStatus.ACTIVE,
         )
-        _VERSION_MANAGER.add(version)
+        _VERSION_MANAGER.add(v)
     except Exception:
         pass
 
 
 # =============================================================================
-# Google Credentials Normalization
+# Google credentials normalization
 # =============================================================================
-
 def _maybe_b64_decode(s: str) -> Optional[str]:
-    """Attempt base64 decode."""
     s2 = strip_value(s)
     if not s2:
         return None
@@ -1079,10 +827,9 @@ def _maybe_b64_decode(s: str) -> Optional[str]:
         return None
 
 
-def _read_text_file_if_exists(filepath: str) -> Optional[str]:
-    """Read text file if it exists."""
+def _read_text_file_if_exists(p: str) -> Optional[str]:
     try:
-        path = Path(strip_value(filepath))
+        path = Path(strip_value(p))
         if path.exists() and path.is_file():
             return path.read_text(encoding="utf-8", errors="replace")
     except Exception:
@@ -1090,128 +837,247 @@ def _read_text_file_if_exists(filepath: str) -> Optional[str]:
     return None
 
 
-def _parse_credentials_json(raw: str, source_label: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """Parse a JSON-looking credentials string.
-
-    v7.0.0 helper: returns (raw, dict) only on a successful parse to a
-    dict. On any parse failure, returns None and logs — callers continue
-    to the next credential source rather than receiving a malformed raw
-    string (which v6 did).
-    """
-    s = strip_value(raw)
-    if not (s.startswith("{") and s.endswith("}")):
-        return None
-    try:
-        d = _json_loads(s)
-    except Exception as e:
-        _dbg(
-            "normalize_google_credentials: JSON parse failed",
-            "warning",
-            source=source_label,
-            error=str(e),
-        )
-        return None
-    if isinstance(d, dict):
-        return (s, d)
-    _dbg(
-        "normalize_google_credentials: JSON is not a dict",
-        "warning",
-        source=source_label,
-        parsed_type=type(d).__name__,
-    )
-    return None
-
-
 def normalize_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
-    Normalize Google credentials from various sources.
-
-    Probes, in order:
-      1. ``GOOGLE_CREDENTIALS_DICT`` (JSON inline).
-      2. ``GOOGLE_SHEETS_CREDENTIALS`` / ``GOOGLE_CREDENTIALS`` (JSON inline).
-      3. ``GOOGLE_SHEETS_CREDENTIALS_B64`` / ``GOOGLE_CREDENTIALS_B64``
-         (base64-encoded JSON).
-      4. ``GOOGLE_APPLICATION_CREDENTIALS`` / ``GOOGLE_SHEETS_CREDENTIALS_FILE``
-         / ``GOOGLE_CREDENTIALS_FILE`` (path to JSON file).
-
-    v7.0.0: if a JSON-looking value fails to parse, the function now logs
-    a warning and continues to the next source. Previously it returned a
-    malformed raw string paired with ``None`` as the dict — poisoning
-    downstream callers AND short-circuiting the remaining sources.
-
-    Returns:
-        Tuple of (credentials_json_string, credentials_dict). Both are
-        ``None`` when no source yields valid credentials.
+    Returns (credentials_json_string, credentials_dict).
+    Accepts:
+      - GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS as JSON string
+      - GOOGLE_*_B64 (base64 JSON)
+      - GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_*_FILE as file path
+      - GOOGLE_CREDENTIALS_DICT as JSON dict string
     """
-    # 1) GOOGLE_CREDENTIALS_DICT
-    parsed = _parse_credentials_json(
-        os.getenv("GOOGLE_CREDENTIALS_DICT") or "",
-        "GOOGLE_CREDENTIALS_DICT",
-    )
-    if parsed is not None:
-        # Re-encode via _json_dumps to normalize formatting.
-        _raw, d = parsed
+    dict_env = strip_value(os.getenv("GOOGLE_CREDENTIALS_DICT") or "")
+    if dict_env.startswith("{") and dict_env.endswith("}"):
         try:
-            return (_json_dumps(d), d)
+            d = json_loads(dict_env)
+            if isinstance(d, dict):
+                return (json_dumps(d), d)
         except Exception:
-            return parsed
+            pass
 
-    # 2) GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS (direct JSON)
-    for env_name in ("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"):
-        raw = os.getenv(env_name) or ""
-        if raw.strip():
-            parsed = _parse_credentials_json(raw, env_name)
-            if parsed is not None:
-                return parsed
-            # else: malformed; try next source
+    raw = strip_value(os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or "")
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            d = json_loads(raw)
+            if isinstance(d, dict):
+                return (raw, d)
+        except Exception:
+            return (raw, None)
 
-    # 3) Base64-encoded JSON
-    for env_name in ("GOOGLE_SHEETS_CREDENTIALS_B64", "GOOGLE_CREDENTIALS_B64"):
-        b64 = strip_value(os.getenv(env_name) or "")
-        if not b64:
-            continue
+    b64 = strip_value(os.getenv("GOOGLE_SHEETS_CREDENTIALS_B64") or os.getenv("GOOGLE_CREDENTIALS_B64") or "")
+    if b64:
         decoded = _maybe_b64_decode(b64)
-        if decoded is None:
-            _dbg(
-                "normalize_google_credentials: base64 decode failed",
-                "warning",
-                source=env_name,
-            )
-            continue
-        parsed = _parse_credentials_json(decoded, f"{env_name} (b64-decoded)")
-        if parsed is not None:
-            return parsed
-        # else: decoded but not valid JSON — try next source
+        if decoded:
+            decoded = decoded.strip()
+            if decoded.startswith("{") and decoded.endswith("}"):
+                try:
+                    d = json_loads(decoded)
+                    if isinstance(d, dict):
+                        return (decoded, d)
+                except Exception:
+                    return (decoded, None)
 
-    # 4) File path
-    filepath = strip_value(
+    fp = strip_value(
         os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         or os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE")
         or os.getenv("GOOGLE_CREDENTIALS_FILE")
         or ""
     )
-    if filepath:
-        content = _read_text_file_if_exists(filepath)
-        if content is not None:
-            parsed = _parse_credentials_json(content, f"file:{filepath}")
-            if parsed is not None:
-                return parsed
+    if fp:
+        txt = _read_text_file_if_exists(fp)
+        if txt:
+            t = txt.strip()
+            if t.startswith("{") and t.endswith("}"):
+                try:
+                    d = json_loads(t)
+                    if isinstance(d, dict):
+                        return (t, d)
+                except Exception:
+                    return (t, None)
 
     return (None, None)
 
 
-# Alias for backward compatibility
-resolve_google_credentials = normalize_google_credentials
+# =============================================================================
+# Page + Schema helpers
+# =============================================================================
+_OUTPUT_PAGES = {"Top_10_Investments", "Data_Dictionary"}
+
+
+def canonical_pages() -> List[str]:
+    return list(_CANONICAL_PAGES_FALLBACK)
+
+
+def forbidden_pages() -> Set[str]:
+    return set(_FORBIDDEN_PAGES_FALLBACK)
+
+
+def is_output_page(page: str) -> bool:
+    try:
+        return strip_value(page) in _OUTPUT_PAGES
+    except Exception:
+        return False
+
+
+def normalize_page(page: str, *, allow_output_pages: bool = True) -> str:
+    return _normalize_page_name(page, allow_output_pages=allow_output_pages)
+
+
+def top10_feed_pages_default() -> List[str]:
+    return _get_top10_feed_pages(None)
+
+
+def schema_available() -> bool:
+    return bool(_HAS_SCHEMA and isinstance(_SREG, dict) and _SREG)
+
+
+def schema_known(sheet: str) -> bool:
+    try:
+        return strip_value(sheet) in _SREG
+    except Exception:
+        return False
+
+
+def schema_headers(sheet: str) -> List[str]:
+    try:
+        spec = _SREG.get(strip_value(sheet))
+        if not spec:
+            return []
+        return [c.header for c in spec.columns]
+    except Exception:
+        return []
+
+
+def schema_keys(sheet: str) -> List[str]:
+    try:
+        spec = _SREG.get(strip_value(sheet))
+        if not spec:
+            return []
+        return [c.key for c in spec.columns]
+    except Exception:
+        return []
+
+
+def schema_columns(sheet: str) -> List[Dict[str, Any]]:
+    try:
+        spec = _SREG.get(strip_value(sheet))
+        if not spec:
+            return []
+        out: List[Dict[str, Any]] = []
+        for c in spec.columns:
+            out.append(
+                {
+                    "group": getattr(c, "group", None),
+                    "header": getattr(c, "header", None),
+                    "key": getattr(c, "key", None),
+                    "dtype": getattr(c, "dtype", None),
+                    "fmt": getattr(c, "fmt", None),
+                    "required": bool(getattr(c, "required", False)),
+                    "source": getattr(c, "source", None),
+                    "notes": getattr(c, "notes", None),
+                }
+            )
+        return out
+    except Exception:
+        return []
+
+
+def schema_row_template(sheet: str, *, fill_value: Any = None) -> Dict[str, Any]:
+    try:
+        return {k: fill_value for k in schema_keys(sheet)}
+    except Exception:
+        return {}
+
+
+def normalize_row_to_schema(
+    sheet: str,
+    row: Dict[str, Any],
+    *,
+    fill_missing_with_null: bool = True,
+) -> Dict[str, Any]:
+    try:
+        sheet = strip_value(sheet)
+        row = row or {}
+        keys = schema_keys(sheet)
+        if not keys:
+            return dict(row)
+
+        fill = None if fill_missing_with_null else ""
+        out: Dict[str, Any] = {}
+        for k in keys:
+            out[k] = row.get(k, fill)
+
+        for k, v in row.items():
+            if k not in out:
+                out[k] = v
+        return out
+    except Exception:
+        return dict(row or {})
 
 
 # =============================================================================
-# Settings Class
+# Public/protected route defaults
 # =============================================================================
+_DEFAULT_PUBLIC_EXACT_PATHS = [
+    "/",
+    "/health",
+    "/readyz",
+    "/livez",
+    "/openapi.json",
+    "/docs",
+    "/redoc",
+    "/favicon.ico",
+    "/v1/advanced/health",
+    "/v1/advisor/health",
+]
 
+_DEFAULT_PUBLIC_PATH_PREFIXES = [
+    "/docs",
+    "/redoc",
+    "/static",
+]
+
+_DEFAULT_PROTECTED_EXACT_PATHS: List[str] = []
+
+_DEFAULT_PROTECTED_PATH_PREFIXES = [
+    "/v1/analysis",
+    "/v1/schema",
+    "/v1/advanced/sheet-rows",
+    "/v1/enriched/sheet-rows",
+]
+
+
+def _clean_paths(values: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for v in values:
+        p = strip_value(v)
+        if not p:
+            continue
+        if not p.startswith("/"):
+            p = "/" + p
+        p = re.sub(r"/{2,}", "/", p).rstrip("/") or "/"
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def normalize_request_path(path: Optional[str]) -> str:
+    p = strip_value(path)
+    if not p:
+        return ""
+    p = p.split("?", 1)[0].strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    return re.sub(r"/{2,}", "/", p).rstrip("/") or "/"
+
+
+# =============================================================================
+# Settings
+# =============================================================================
 @dataclass(frozen=True)
 class Settings:
-    """Application configuration settings."""
-
     # Meta
     config_version: str = CONFIG_VERSION
     build_timestamp: str = CONFIG_BUILD_TIMESTAMP
@@ -1225,9 +1091,15 @@ class Settings:
     # Pages / Catalog
     allowed_pages: List[str] = field(default_factory=lambda: canonical_pages())
     forbidden_pages: List[str] = field(default_factory=lambda: sorted(list(forbidden_pages())))
-    default_data_pages: List[str] = field(default_factory=lambda: [
-        "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio",
-    ])
+    default_data_pages: List[str] = field(
+        default_factory=lambda: [
+            "Market_Leaders",
+            "Global_Markets",
+            "Commodities_FX",
+            "Mutual_Funds",
+            "My_Portfolio",
+        ]
+    )
     top10_feed_pages: List[str] = field(default_factory=lambda: top10_feed_pages_default())
 
     # App
@@ -1248,10 +1120,10 @@ class Settings:
     open_mode: bool = False
     app_token: Optional[str] = None
     backup_app_token: Optional[str] = None
-    public_exact_paths: List[str] = field(default_factory=list)
-    public_path_prefixes: List[str] = field(default_factory=list)
-    protected_exact_paths: List[str] = field(default_factory=list)
-    protected_path_prefixes: List[str] = field(default_factory=list)
+    public_exact_paths: List[str] = field(default_factory=lambda: list(_DEFAULT_PUBLIC_EXACT_PATHS))
+    public_path_prefixes: List[str] = field(default_factory=lambda: list(_DEFAULT_PUBLIC_PATH_PREFIXES))
+    protected_exact_paths: List[str] = field(default_factory=lambda: list(_DEFAULT_PROTECTED_EXACT_PATHS))
+    protected_path_prefixes: List[str] = field(default_factory=lambda: list(_DEFAULT_PROTECTED_PATH_PREFIXES))
 
     # Backend
     backend_base_url: str = "http://localhost:8000"
@@ -1264,16 +1136,35 @@ class Settings:
     # Provider keys + base URLs
     eodhd_api_key: Optional[str] = None
     eodhd_base_url: str = "https://eodhd.com/api"
+
     finnhub_api_key: Optional[str] = None
     fmp_api_key: Optional[str] = None
     alphavantage_api_key: Optional[str] = None
     marketstack_api_key: Optional[str] = None
     twelvedata_api_key: Optional[str] = None
+
     fmp_base_url: Optional[str] = None
 
     # EODHD global defaults
     eodhd_symbol_suffix_default: str = "US"
     eodhd_append_exchange_suffix: bool = True
+
+    # Open Price routing — Phase 1.3 of dashboard upgrade plan (v5.8.0)
+    #
+    # Master toggle and per-region provider chain for the canonical
+    # `open_price` field (display header "Open"). The data engine
+    # asks providers in chain order; first non-null finite > 0 wins.
+    # Chain entries that aren't in `enabled_providers` are skipped at
+    # runtime (validate() emits a warning at startup).
+    open_price_enabled: bool = True
+    open_price_provider_chain: List[str] = field(
+        default_factory=lambda: ["eodhd", "yahoo_chart"]
+    )
+    open_price_ksa_provider_chain: List[str] = field(
+        default_factory=lambda: ["tadawul", "argaam", "yahoo_chart"]
+    )
+    open_price_fallback_to_previous_close: bool = False
+    open_price_warn_when_missing: bool = True
 
     # Market feature flags
     tadawul_market_enabled: bool = True
@@ -1318,41 +1209,73 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        """Create settings from environment variables."""
-        # Environment
         env_name = strip_value(os.getenv("APP_ENV") or os.getenv("TFB_ENV") or "production")
         app_name = strip_value(os.getenv("APP_NAME") or "TFB")
         app_version = strip_value(os.getenv("APP_VERSION") or __version__)
 
-        # Auth
         token = strip_value(os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or os.getenv("BACKEND_TOKEN") or "")
         backup_token = strip_value(os.getenv("BACKUP_APP_TOKEN") or "")
+
         require_auth = coerce_bool(os.getenv("REQUIRE_AUTH"), True)
 
-        # v7.0.0: read OPEN_MODE only once.
-        open_mode_raw = os.getenv("OPEN_MODE")
-        if open_mode_raw is not None:
-            open_mode = coerce_bool(open_mode_raw, False)
+        if os.getenv("OPEN_MODE") is not None:
+            open_mode = coerce_bool(os.getenv("OPEN_MODE"), False)
         else:
             open_mode = (not require_auth) and (not bool(token or backup_token))
 
-        # Provider keys
-        eodhd_key = strip_value(os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_API_KEY") or os.getenv("EODHD_KEY") or "")
+        eodhd_key = strip_value(
+            os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_API_KEY") or os.getenv("EODHD_KEY") or ""
+        )
         finnhub_key = strip_value(os.getenv("FINNHUB_API_KEY") or os.getenv("FINNHUB_KEY") or "")
         fmp_key = strip_value(os.getenv("FMP_API_KEY") or "")
-        alpha_key = strip_value(os.getenv("ALPHA_VANTAGE_API_KEY") or os.getenv("ALPHAVANTAGE_API_KEY") or "")
+        alpha_key = strip_value(
+            os.getenv("ALPHA_VANTAGE_API_KEY")
+            or os.getenv("ALPHAVANTAGE_API_KEY")
+            or os.getenv("ALPHAVANTAGE_KEY")
+            or ""
+        )
         marketstack_key = strip_value(os.getenv("MARKETSTACK_API_KEY") or "")
         twelvedata_key = strip_value(os.getenv("TWELVEDATA_API_KEY") or "")
 
-        # Provider URLs
         eodhd_base_url = strip_value(os.getenv("EODHD_BASE_URL") or "https://eodhd.com/api")
         fmp_base_url = strip_value(os.getenv("FMP_BASE_URL") or "") or None
 
-        # EODHD defaults
-        eodhd_suffix_default = strip_value(os.getenv("EODHD_DEFAULT_EXCHANGE") or os.getenv("EODHD_SYMBOL_SUFFIX_DEFAULT") or "US")
+        eodhd_suffix_default = strip_value(
+            os.getenv("EODHD_DEFAULT_EXCHANGE") or os.getenv("EODHD_SYMBOL_SUFFIX_DEFAULT") or "US"
+        )
         eodhd_append_suffix = coerce_bool(os.getenv("EODHD_APPEND_EXCHANGE_SUFFIX"), True)
 
-        # Enabled providers
+        # v5.8.0 — Open Price routing (Phase 1.3)
+        # Defaults are sensible; overrides via env vars only.
+        # Chain entries are lowercased for consistent comparison
+        # against enabled_providers / ksa_providers (also lowercased).
+        open_price_enabled = coerce_bool(os.getenv("OPEN_PRICE_ENABLED"), True)
+
+        op_chain_raw = coerce_list(
+            os.getenv("OPEN_PRICE_PROVIDER_CHAIN") or "eodhd,yahoo_chart"
+        )
+        open_price_provider_chain = [
+            strip_value(p).lower() for p in op_chain_raw if strip_value(p)
+        ]
+        if not open_price_provider_chain:
+            open_price_provider_chain = ["eodhd", "yahoo_chart"]
+
+        op_ksa_chain_raw = coerce_list(
+            os.getenv("OPEN_PRICE_KSA_PROVIDER_CHAIN") or "tadawul,argaam,yahoo_chart"
+        )
+        open_price_ksa_provider_chain = [
+            strip_value(p).lower() for p in op_ksa_chain_raw if strip_value(p)
+        ]
+        if not open_price_ksa_provider_chain:
+            open_price_ksa_provider_chain = ["tadawul", "argaam", "yahoo_chart"]
+
+        open_price_fallback_to_previous_close = coerce_bool(
+            os.getenv("OPEN_PRICE_FALLBACK_TO_PREVIOUS_CLOSE"), False
+        )
+        open_price_warn_when_missing = coerce_bool(
+            os.getenv("OPEN_PRICE_WARN_WHEN_MISSING"), True
+        )
+
         enabled_providers = [p.lower() for p in coerce_list(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS"))]
         if not enabled_providers:
             enabled_providers = []
@@ -1368,53 +1291,70 @@ class Settings:
         ksa_providers = [p.lower() for p in coerce_list(os.getenv("KSA_PROVIDERS") or "yahoo_chart,argaam")]
         primary_provider = strip_value(os.getenv("PRIMARY_PROVIDER") or "eodhd").lower()
 
-        # Logging — v7.0.0: direct member lookup instead of linear scan
-        log_level_str = strip_value(os.getenv("LOG_LEVEL") or "INFO").upper()
-        log_level = LogLevel.__members__.get(log_level_str, LogLevel.INFO)
+        ll = strip_value(os.getenv("LOG_LEVEL") or "INFO").upper()
+        log_level = LogLevel.INFO
+        for x in LogLevel:
+            if x.value == ll:
+                log_level = x
+                break
         log_format = strip_value(os.getenv("LOG_FORMAT") or "json").lower()
         log_json = coerce_bool(os.getenv("LOG_JSON"), True)
 
-        # Backend
-        backend_base_url = strip_value(os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://localhost:8000")
+        backend_base_url = strip_value(
+            os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://localhost:8000"
+        )
 
-        # Feature flags
         advanced_analysis_enabled = coerce_bool(os.getenv("ADVANCED_ANALYSIS_ENABLED"), True)
         ai_analysis_enabled = coerce_bool(os.getenv("AI_ANALYSIS_ENABLED"), True)
         tadawul_market_enabled = coerce_bool(os.getenv("TADAWUL_MARKET_ENABLED"), True)
         ksa_disallow_eodhd = coerce_bool(os.getenv("KSA_DISALLOW_EODHD"), False)
+
         computations_enabled = coerce_bool(os.getenv("COMPUTATIONS_ENABLED"), True)
         fundamentals_enabled = coerce_bool(os.getenv("FUNDAMENTALS_ENABLED"), True)
         technicals_enabled = coerce_bool(os.getenv("TECHNICALS_ENABLED"), True)
         forecasting_enabled = coerce_bool(os.getenv("FORECASTING_ENABLED"), True)
         scoring_enabled = coerce_bool(os.getenv("SCORING_ENABLED"), True)
+
         schema_enabled = coerce_bool(os.getenv("SCHEMA_ENABLED"), True)
         schema_headers_always = coerce_bool(os.getenv("SCHEMA_HEADERS_ALWAYS"), True)
         schema_fill_missing_with_null = coerce_bool(os.getenv("SCHEMA_FILL_MISSING_WITH_NULL"), True)
 
-        # Page lists
         allowed_pages_env = coerce_list(os.getenv("ALLOWED_PAGES"))
         if allowed_pages_env:
-            allowed = []
+            ap: List[str] = []
             for p in allowed_pages_env:
                 try:
-                    allowed.append(normalize_page(p, allow_output_pages=True))
+                    ap.append(normalize_page(p, allow_output_pages=True))
                 except Exception:
                     continue
-            allowed_pages = allowed or canonical_pages()
+            allowed_pages = ap or canonical_pages()
         else:
             allowed_pages = canonical_pages()
 
         default_data_pages_env = coerce_list(os.getenv("DEFAULT_DATA_PAGES"))
         if default_data_pages_env:
-            ddp = []
+            ddp: List[str] = []
             for p in default_data_pages_env:
                 try:
-                    ddp.append(normalize_page(p, allow_output_pages=False))
+                    cp = normalize_page(p, allow_output_pages=False)
+                    ddp.append(cp)
                 except Exception:
                     continue
-            default_data_pages = ddp or ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"]
+            default_data_pages = ddp or [
+                "Market_Leaders",
+                "Global_Markets",
+                "Commodities_FX",
+                "Mutual_Funds",
+                "My_Portfolio",
+            ]
         else:
-            default_data_pages = ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"]
+            default_data_pages = [
+                "Market_Leaders",
+                "Global_Markets",
+                "Commodities_FX",
+                "Mutual_Funds",
+                "My_Portfolio",
+            ]
 
         top10_feed_pages_env = coerce_list(os.getenv("TOP10_FEED_PAGES"))
         if top10_feed_pages_env:
@@ -1422,40 +1362,40 @@ class Settings:
         else:
             top10_feed_pages = top10_feed_pages_default()
 
-        # HTTP settings
         http_timeout_sec = coerce_float(os.getenv("HTTP_TIMEOUT_SEC"), 45.0, lo=5.0, hi=300.0)
         max_retries = coerce_int(os.getenv("MAX_RETRIES"), 2, lo=0, hi=20)
         retry_delay_sec = coerce_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 1.0, lo=0.0, hi=30.0)
 
-        # Cache settings
         cache_ttl_sec = coerce_int(os.getenv("CACHE_TTL_SEC") or os.getenv("CACHE_DEFAULT_TTL"), 20, lo=1, hi=3600)
         engine_cache_ttl_sec = coerce_int(os.getenv("ENGINE_CACHE_TTL_SEC"), 60, lo=1, hi=86400)
         cache_max_size = coerce_int(os.getenv("CACHE_MAX_SIZE"), 2048, lo=128, hi=200000)
 
-        # Concurrency (PRESERVED: reads ONLY BATCH_CONCURRENCY, never WEB_CONCURRENCY)
-        batch_concurrency = coerce_int(os.getenv("BATCH_CONCURRENCY"), 5, lo=1, hi=50)
+        batch_concurrency = coerce_int(os.getenv("BATCH_CONCURRENCY") or os.getenv("WEB_CONCURRENCY"), 5, lo=1, hi=50)
         ai_batch_size = coerce_int(os.getenv("AI_BATCH_SIZE"), 20, lo=1, hi=500)
         quote_batch_size = coerce_int(os.getenv("QUOTE_BATCH_SIZE") or os.getenv("TADAWUL_MAX_SYMBOLS"), 50, lo=1, hi=500)
 
-        # Engine lifecycle
         init_engine_on_boot = coerce_bool(os.getenv("INIT_ENGINE_ON_BOOT"), True)
         defer_router_mount = coerce_bool(os.getenv("DEFER_ROUTER_MOUNT"), False)
 
-        # Auth paths
-        public_exact_paths = _clean_paths(coerce_list(os.getenv("PUBLIC_EXACT_PATHS"), []))
-        public_path_prefixes = _clean_paths(coerce_list(os.getenv("PUBLIC_PATH_PREFIXES"), []))
-        protected_exact_paths = _clean_paths(coerce_list(os.getenv("PROTECTED_EXACT_PATHS"), []))
-        protected_path_prefixes = _clean_paths(coerce_list(os.getenv("PROTECTED_PATH_PREFIXES"), []))
+        public_exact_paths = _clean_paths(
+            coerce_list(os.getenv("PUBLIC_EXACT_PATHS"), list(_DEFAULT_PUBLIC_EXACT_PATHS))
+        )
+        public_path_prefixes = _clean_paths(
+            coerce_list(os.getenv("PUBLIC_PATH_PREFIXES"), list(_DEFAULT_PUBLIC_PATH_PREFIXES))
+        )
+        protected_exact_paths = _clean_paths(
+            coerce_list(os.getenv("PROTECTED_EXACT_PATHS"), list(_DEFAULT_PROTECTED_EXACT_PATHS))
+        )
+        protected_path_prefixes = _clean_paths(
+            coerce_list(os.getenv("PROTECTED_PATH_PREFIXES"), list(_DEFAULT_PROTECTED_PATH_PREFIXES))
+        )
 
-        # Google Sheets
         default_spreadsheet_id = strip_value(os.getenv("DEFAULT_SPREADSHEET_ID") or "") or None
         gs_json, gs_dict = normalize_google_credentials()
         google_apps_script_url = strip_value(os.getenv("GOOGLE_APPS_SCRIPT_URL") or "") or None
         google_apps_script_backup_url = strip_value(os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL") or "") or None
-        timezone_str = strip_value(os.getenv("TZ") or "Asia/Riyadh")
 
-        # Deep copy to prevent external mutation
-        safe_gs_dict = copy.deepcopy(gs_dict) if isinstance(gs_dict, dict) else gs_dict
+        tz = strip_value(os.getenv("TZ") or "Asia/Riyadh")
 
         return cls(
             schema_enabled=schema_enabled,
@@ -1468,7 +1408,7 @@ class Settings:
             top10_feed_pages=top10_feed_pages,
             environment=Environment.from_string(env_name),
             service_name=strip_value(os.getenv("SERVICE_NAME") or "Tadawul Fast Bridge"),
-            timezone=timezone_str,
+            timezone=tz,
             app_name=app_name,
             app_version=app_version,
             log_level=log_level,
@@ -1495,8 +1435,13 @@ class Settings:
             marketstack_api_key=marketstack_key or None,
             twelvedata_api_key=twelvedata_key or None,
             fmp_base_url=fmp_base_url,
-            eodhd_symbol_suffix_default=eodhd_suffix_default,
+            eodhd_symbol_suffix_default=eodhd_suffix_default or "US",
             eodhd_append_exchange_suffix=eodhd_append_suffix,
+            open_price_enabled=open_price_enabled,
+            open_price_provider_chain=open_price_provider_chain,
+            open_price_ksa_provider_chain=open_price_ksa_provider_chain,
+            open_price_fallback_to_previous_close=open_price_fallback_to_previous_close,
+            open_price_warn_when_missing=open_price_warn_when_missing,
             tadawul_market_enabled=tadawul_market_enabled,
             ksa_disallow_eodhd=ksa_disallow_eodhd,
             computations_enabled=computations_enabled,
@@ -1519,88 +1464,104 @@ class Settings:
             defer_router_mount=defer_router_mount,
             default_spreadsheet_id=default_spreadsheet_id,
             google_sheets_credentials_json=gs_json,
-            google_credentials_dict=safe_gs_dict,
+            google_credentials_dict=gs_dict,
             google_apps_script_url=google_apps_script_url,
             google_apps_script_backup_url=google_apps_script_backup_url,
         )
 
     def validate(self) -> Tuple[List[str], List[str]]:
-        """Validate settings and return (errors, warnings)."""
         errors: List[str] = []
-        warnings: List[str] = []
+        warnings_list: List[str] = []
 
-        # Forbidden pages check
         for fp in self.forbidden_pages or []:
             if fp in (self.allowed_pages or []):
                 errors.append(f"Forbidden page '{fp}' appears in allowed_pages. Remove it.")
 
-        # Default data pages check
         for p in self.default_data_pages or []:
             if p not in (self.allowed_pages or []):
-                warnings.append(f"default_data_pages contains '{p}' which is not in allowed_pages.")
+                warnings_list.append(f"default_data_pages contains '{p}' which is not in allowed_pages.")
 
-        # Top10 feed pages check
         for p in self.top10_feed_pages or []:
             if p not in (self.allowed_pages or []):
-                warnings.append(f"top10_feed_pages contains '{p}' which is not in allowed_pages.")
+                warnings_list.append(f"top10_feed_pages contains '{p}' which is not in allowed_pages.")
 
-        # Backend URL
         if self.backend_base_url and not is_valid_url(self.backend_base_url):
-            warnings.append(f"backend_base_url does not look like a URL: {self.backend_base_url!r}")
+            warnings_list.append(f"backend_base_url does not look like a URL: {self.backend_base_url!r}")
 
-        # Provider validation
         enabled_lower = [p.lower() for p in (self.enabled_providers or [])]
+
         if "eodhd" in enabled_lower and not self.eodhd_api_key:
             errors.append("Provider 'eodhd' is enabled but EODHD_API_KEY is missing.")
 
         if self.primary_provider and self.primary_provider.lower() not in enabled_lower:
-            warnings.append(
-                f"PRIMARY_PROVIDER={self.primary_provider!r} not included in "
-                f"ENABLED_PROVIDERS={self.enabled_providers!r}."
+            warnings_list.append(
+                f"PRIMARY_PROVIDER={self.primary_provider!r} not included in ENABLED_PROVIDERS={self.enabled_providers!r}."
             )
 
-        # Auth validation
+        # v5.8.0 — Open Price routing validation (Phase 1.3)
+        if self.open_price_enabled:
+            chain = [str(p).lower() for p in (self.open_price_provider_chain or [])]
+            ksa_chain = [str(p).lower() for p in (self.open_price_ksa_provider_chain or [])]
+
+            if not chain and not ksa_chain:
+                warnings_list.append(
+                    "OPEN_PRICE_ENABLED=true but both open_price_provider_chain and "
+                    "open_price_ksa_provider_chain are empty. Open Price column will "
+                    "always publish blank."
+                )
+
+            for p in chain:
+                if p and p not in enabled_lower:
+                    warnings_list.append(
+                        f"open_price_provider_chain entry '{p}' is not in ENABLED_PROVIDERS={self.enabled_providers!r}; "
+                        "it will be skipped at runtime."
+                    )
+
+            # KSA chain entries are NOT cross-checked against enabled_providers since
+            # KSA providers (tadawul, argaam) route via a different code path; warn
+            # only for completely unknown names.
+            known_ksa = {"tadawul", "argaam", "yahoo_chart", "yahoo", "eodhd", "finnhub"}
+            for p in ksa_chain:
+                if p and p not in known_ksa:
+                    warnings_list.append(
+                        f"open_price_ksa_provider_chain entry '{p}' is not a recognized provider; "
+                        "it will be skipped at runtime."
+                    )
+
+            if self.open_price_fallback_to_previous_close:
+                warnings_list.append(
+                    "OPEN_PRICE_FALLBACK_TO_PREVIOUS_CLOSE=true. open_price will be substituted "
+                    "with previous_close when no provider supplies a value. This may mask "
+                    "data-quality issues — the conservative default is False."
+                )
+
         if self.require_auth and not self.open_mode:
             if not (self.app_token or self.backup_app_token or allowed_tokens()):
                 errors.append(
-                    "REQUIRE_AUTH=true but no APP_TOKEN/BACKUP_APP_TOKEN/ALLOWED_TOKENS "
-                    "configured (and OPEN_MODE=false)."
+                    "REQUIRE_AUTH=true but no APP_TOKEN/BACKUP_APP_TOKEN/ALLOWED_TOKENS configured (and OPEN_MODE=false)."
                 )
 
         if self.open_mode and (self.app_token or self.backup_app_token):
-            warnings.append(
-                "OPEN_MODE=true while tokens exist. Service may be publicly exposed unintentionally."
-            )
+            warnings_list.append("OPEN_MODE=true while tokens exist. Service may be publicly exposed unintentionally.")
 
-        # Schema validation
-        if self.schema_enabled and not self.schema_headers_always:
-            warnings.append(
-                "SCHEMA_ENABLED=true but SCHEMA_HEADERS_ALWAYS is not true. "
-                "This can break column guarantees."
-            )
+        if self.schema_enabled and self.schema_headers_always is not True:
+            warnings_list.append("SCHEMA_ENABLED=true but SCHEMA_HEADERS_ALWAYS is not true. This can break column guarantees.")
 
         if self.schema_enabled and not schema_available():
-            warnings.append(
-                "Schema modules not available/importable yet. Falling back to static page list."
-            )
+            warnings_list.append("Schema modules not available/importable yet. Falling back to static page list.")
 
-        # Path overlap check
         if self.public_exact_paths and self.protected_exact_paths:
             overlap = set(self.public_exact_paths) & set(self.protected_exact_paths)
             if overlap:
-                warnings.append(
-                    f"Paths appear in both public_exact_paths and protected_exact_paths: {sorted(overlap)}"
-                )
+                warnings_list.append(f"Paths appear in both public_exact_paths and protected_exact_paths: {sorted(overlap)}")
 
-        return errors, warnings
+        return errors, warnings_list
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert settings to dictionary."""
         return asdict(self)
 
     @classmethod
     def from_file(cls, filepath: str) -> "Settings":
-        """Create settings from file (JSON/YAML/TOML)."""
         path = Path(filepath)
         content = load_file_content(path)
         base = cls.from_env()
@@ -1611,42 +1572,35 @@ class Settings:
 
 
 # =============================================================================
-# Settings Cache
+# Settings cache + API
 # =============================================================================
-
 class SettingsCache:
-    """Thread-safe settings cache with TTL."""
-
     def __init__(self, ttl_seconds: int = 30):
-        self._ttl = max(1, int(ttl_seconds))
         self._cache: Dict[str, Tuple[Any, float]] = {}
         self._lock = RLock()
+        self._ttl = max(1, int(ttl_seconds))
 
     def get(self, key: str) -> Optional[Any]:
-        """Get value from cache."""
         with self._lock:
             item = self._cache.get(key)
             if not item:
                 return None
-            value, expires_at = item
-            if time.time() < expires_at:
+            value, exp = item
+            if time.time() < exp:
                 return value
             self._cache.pop(key, None)
             return None
 
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
-        """Set value in cache."""
         with self._lock:
             t = self._ttl if ttl is None else max(1, int(ttl))
             self._cache[key] = (value, time.time() + t)
 
     def clear(self) -> None:
-        """Clear cache."""
         with self._lock:
             self._cache.clear()
 
     def stats(self) -> Dict[str, Any]:
-        """Get cache statistics."""
         with self._lock:
             return {"size": len(self._cache), "ttl": self._ttl}
 
@@ -1656,50 +1610,43 @@ _SETTINGS_CACHE = SettingsCache(ttl_seconds=_SETTINGS_CACHE_TTL)
 
 
 def get_settings() -> Settings:
-    """Get fresh settings from environment."""
     return Settings.from_env()
 
 
 def get_settings_cached(force_reload: bool = False) -> Settings:
-    """Get cached settings."""
     with TraceContext("get_settings_cached"):
         if force_reload:
             _SETTINGS_CACHE.clear()
         cached = _SETTINGS_CACHE.get("settings")
         if cached is not None:
             return cached
-        settings = get_settings()
-        _SETTINGS_CACHE.set("settings", settings)
-        return settings
+        s = get_settings()
+        _SETTINGS_CACHE.set("settings", s)
+        return s
 
 
 # =============================================================================
-# Distributed Config Sources
+# Distributed sources (optional, LAZY, safe, env-driven)
 # =============================================================================
-
 class ConfigSourceManager:
-    """Manages distributed configuration sources."""
-
     def __init__(self):
         self.sources: List[Tuple[ConfigSource, Callable[[], Optional[Dict[str, Any]]]]] = []
         self._lock = RLock()
 
     def register_source(self, source: ConfigSource, loader: Callable[[], Optional[Dict[str, Any]]]) -> None:
-        """Register a configuration source."""
         with self._lock:
             self.sources.append((source, loader))
 
     def load_merged(self) -> Dict[str, Any]:
-        """Load and merge all registered sources."""
         merged: Dict[str, Any] = {}
         with self._lock:
-            for source, loader in self.sources:
+            for src, loader in self.sources:
                 try:
                     data = loader()
                     if isinstance(data, dict) and data:
                         merged = deep_merge(merged, data, overwrite=True)
                 except Exception as e:
-                    _dbg("distributed source load failed", "warning", source=source.value, error=str(e))
+                    _dbg("distributed source load failed", "warning", source=src.value, error=str(e))
         return merged
 
 
@@ -1709,15 +1656,12 @@ _DISTRIBUTED_INIT_LOCK = RLock()
 
 
 def _distributed_enabled() -> bool:
-    """Check if distributed config is enabled."""
     if os.getenv("DISTRIBUTED_CONFIG_ENABLED") is not None:
         return coerce_bool(os.getenv("DISTRIBUTED_CONFIG_ENABLED"), False)
     return bool(os.getenv("CONSUL_HOST") or os.getenv("ETCD_HOST") or os.getenv("ZOOKEEPER_HOSTS"))
 
 
 class ConsulConfigSource:
-    """Consul configuration source."""
-
     def __init__(self, host: str, port: int, token: Optional[str], prefix: str):
         self.host = host
         self.port = port
@@ -1725,108 +1669,109 @@ class ConsulConfigSource:
         self.prefix = prefix
 
     def load(self) -> Optional[Dict[str, Any]]:
-        """Load configuration from Consul."""
         if not (_CONSUL_AVAILABLE and consul is not None):
             return None
         try:
-            client = consul.Consul(host=self.host, port=self.port, token=self.token)
-            _, data = client.kv.get(self.prefix, recurse=True)
+            client = consul.Consul(host=self.host, port=self.port, token=self.token)  # type: ignore
+            _, data = client.kv.get(self.prefix, recurse=True)  # type: ignore
             if not data:
                 return None
-            result: Dict[str, Any] = {}
+
+            out: Dict[str, Any] = {}
             for item in data:
-                key = item.get("Key") or ""
+                k = item.get("Key") or ""
                 raw = item.get("Value")
-                if not key or raw is None:
+                if not k or raw is None:
                     continue
-                rel = key[len(self.prefix) + 1:] if key.startswith(self.prefix) else key
+                rel = k[len(self.prefix) + 1 :] if k.startswith(self.prefix) else k
                 try:
-                    text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                    txt = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
                     try:
-                        value = _json_loads(text)
+                        val = json_loads(txt)
                     except Exception:
-                        value = text
+                        val = txt
                 except Exception:
                     continue
+
                 parts = [p for p in rel.split("/") if p]
-                cur = result
-                for part in parts[:-1]:
-                    cur.setdefault(part, {})
-                    if not isinstance(cur[part], dict):
-                        cur[part] = {}
-                    cur = cur[part]
+                cur = out
+                for p in parts[:-1]:
+                    cur.setdefault(p, {})
+                    if not isinstance(cur[p], dict):
+                        cur[p] = {}
+                    cur = cur[p]
                 if parts:
-                    cur[parts[-1]] = value
-            return result or None
+                    cur[parts[-1]] = val
+            return out or None
         except Exception as e:
             _dbg("consul load failed", "warning", error=str(e))
             return None
 
 
 class EtcdConfigSource:
-    """Etcd configuration source."""
-
     def __init__(self, host: str, port: int, prefix: str):
         self.host = host
         self.port = port
         self.prefix = prefix
 
     def load(self) -> Optional[Dict[str, Any]]:
-        """Load configuration from Etcd."""
         if not (_ETCD_AVAILABLE and etcd3 is not None):
             return None
         try:
-            client = etcd3.client(host=self.host, port=self.port)
-            result: Dict[str, Any] = {}
-            for value, meta in client.get_prefix(self.prefix):
+            client = etcd3.client(host=self.host, port=self.port)  # type: ignore
+            out: Dict[str, Any] = {}
+            for value, meta in client.get_prefix(self.prefix):  # type: ignore
                 key = (meta.key or b"").decode("utf-8", errors="replace")
-                rel = key[len(self.prefix):].lstrip("/")
+                rel = key[len(self.prefix) :].lstrip("/")
                 try:
-                    text = value.decode("utf-8", errors="replace") if isinstance(value, (bytes, bytearray)) else str(value)
+                    txt = value.decode("utf-8", errors="replace") if isinstance(value, (bytes, bytearray)) else str(value)
                     try:
-                        val = _json_loads(text)
+                        val = json_loads(txt)
                     except Exception:
-                        val = text
+                        val = txt
                 except Exception:
                     continue
+
                 parts = [p for p in rel.split("/") if p]
-                cur = result
-                for part in parts[:-1]:
-                    cur.setdefault(part, {})
-                    cur = cur[part]
+                cur = out
+                for p in parts[:-1]:
+                    cur.setdefault(p, {})
+                    if not isinstance(cur[p], dict):
+                        cur[p] = {}
+                    cur = cur[p]
                 if parts:
                     cur[parts[-1]] = val
-            return result or None
+            return out or None
         except Exception as e:
             _dbg("etcd load failed", "warning", error=str(e))
             return None
 
 
 class ZooKeeperConfigSource:
-    """ZooKeeper configuration source."""
-
     def __init__(self, hosts: str, prefix: str, start_timeout_sec: int = 3):
         self.hosts = hosts
         self.prefix = prefix
         self.start_timeout_sec = max(1, int(start_timeout_sec))
 
     def load(self) -> Optional[Dict[str, Any]]:
-        """Load configuration from ZooKeeper."""
         if not (_ZOOKEEPER_AVAILABLE and KazooClient is not None):
             return None
         client = None
         try:
-            client = KazooClient(hosts=self.hosts)
+            client = KazooClient(hosts=self.hosts)  # type: ignore
             client.start(timeout=self.start_timeout_sec)
-            result: Dict[str, Any] = {}
+
+            out: Dict[str, Any] = {}
 
             def walk(path: str, cur: Dict[str, Any]) -> None:
                 if not client.exists(path):
                     return
-                for child in client.get_children(path):
+                children = client.get_children(path)
+                for child in children:
                     child_path = f"{path}/{child}"
                     data, _ = client.get(child_path)
-                    if client.get_children(child_path):
+                    sub = client.get_children(child_path)
+                    if sub:
                         cur.setdefault(child, {})
                         if isinstance(cur[child], dict):
                             walk(child_path, cur[child])
@@ -1834,12 +1779,12 @@ class ZooKeeperConfigSource:
                         if data:
                             raw = data.decode("utf-8", errors="replace")
                             try:
-                                cur[child] = _json_loads(raw)
+                                cur[child] = json_loads(raw)
                             except Exception:
                                 cur[child] = raw
 
-            walk(self.prefix, result)
-            return result or None
+            walk(self.prefix, out)
+            return out or None
         except Exception as e:
             _dbg("zookeeper load failed", "warning", error=str(e))
             return None
@@ -1853,7 +1798,6 @@ class ZooKeeperConfigSource:
 
 
 def init_distributed_config() -> None:
-    """Initialize distributed configuration sources."""
     global _DISTRIBUTED_INIT_DONE
     with _DISTRIBUTED_INIT_LOCK:
         if _DISTRIBUTED_INIT_DONE:
@@ -1864,44 +1808,39 @@ def init_distributed_config() -> None:
             return
 
         with TraceContext("init_distributed_config"):
-            # Consul
             if os.getenv("CONSUL_HOST"):
-                consul_source = ConsulConfigSource(
-                    host=strip_value(os.getenv("CONSUL_HOST") or "localhost"),
-                    port=coerce_int(os.getenv("CONSUL_PORT"), 8500, lo=1, hi=65535),
-                    token=strip_value(os.getenv("CONSUL_TOKEN")) or None,
-                    prefix=strip_value(os.getenv("CONSUL_PREFIX") or "config/tadawul"),
-                )
-                _CONFIG_SOURCES.register_source(ConfigSource.CONSUL, consul_source.load)
+                host = strip_value(os.getenv("CONSUL_HOST") or "localhost")
+                port = coerce_int(os.getenv("CONSUL_PORT"), 8500, lo=1, hi=65535)
+                token = strip_value(os.getenv("CONSUL_TOKEN")) or None
+                prefix = strip_value(os.getenv("CONSUL_PREFIX") or "config/tadawul")
+                src = ConsulConfigSource(host=host, port=port, token=token, prefix=prefix)
+                _CONFIG_SOURCES.register_source(ConfigSource.CONSUL, src.load)
 
-            # Etcd
             if os.getenv("ETCD_HOST"):
-                etcd_source = EtcdConfigSource(
-                    host=strip_value(os.getenv("ETCD_HOST") or "localhost"),
-                    port=coerce_int(os.getenv("ETCD_PORT"), 2379, lo=1, hi=65535),
-                    prefix=strip_value(os.getenv("ETCD_PREFIX") or "/config/tadawul"),
-                )
-                _CONFIG_SOURCES.register_source(ConfigSource.ETCD, etcd_source.load)
+                host = strip_value(os.getenv("ETCD_HOST") or "localhost")
+                port = coerce_int(os.getenv("ETCD_PORT"), 2379, lo=1, hi=65535)
+                prefix = strip_value(os.getenv("ETCD_PREFIX") or "/config/tadawul")
+                src = EtcdConfigSource(host=host, port=port, prefix=prefix)
+                _CONFIG_SOURCES.register_source(ConfigSource.ETCD, src.load)
 
-            # ZooKeeper
             if os.getenv("ZOOKEEPER_HOSTS"):
-                zk_source = ZooKeeperConfigSource(
-                    hosts=strip_value(os.getenv("ZOOKEEPER_HOSTS") or "localhost:2181"),
-                    prefix=strip_value(os.getenv("ZOOKEEPER_PREFIX") or "/config/tadawul"),
-                    start_timeout_sec=coerce_int(os.getenv("ZOOKEEPER_START_TIMEOUT_SEC"), 3, lo=1, hi=10),
-                )
-                _CONFIG_SOURCES.register_source(ConfigSource.ZOOKEEPER, zk_source.load)
+                hosts = strip_value(os.getenv("ZOOKEEPER_HOSTS") or "localhost:2181")
+                prefix = strip_value(os.getenv("ZOOKEEPER_PREFIX") or "/config/tadawul")
+                zkt = coerce_int(os.getenv("ZOOKEEPER_START_TIMEOUT_SEC"), 3, lo=1, hi=10)
+                src = ZooKeeperConfigSource(hosts=hosts, prefix=prefix, start_timeout_sec=zkt)
+                _CONFIG_SOURCES.register_source(ConfigSource.ZOOKEEPER, src.load)
 
 
 def reload_settings() -> Settings:
-    """Reload settings from all sources."""
     with TraceContext("reload_settings"):
         init_distributed_config()
         _SETTINGS_CACHE.clear()
+
         base = asdict(Settings.from_env())
         merged = _CONFIG_SOURCES.load_merged()
         if merged:
             base = deep_merge(base, merged, overwrite=True)
+
         allowed = set(Settings.__dataclass_fields__.keys())
         cleaned = {k: v for k, v in base.items() if k in allowed}
         new_settings = Settings(**cleaned)
@@ -1909,86 +1848,123 @@ def reload_settings() -> Settings:
         return new_settings
 
 
-# =============================================================================
-# Auth Helpers
-# =============================================================================
+def config_health_check() -> Dict[str, Any]:
+    health: Dict[str, Any] = {"status": "healthy", "checks": {}, "warnings": [], "errors": []}
+    try:
+        init_distributed_config()
+        s = get_settings_cached()
+        health["checks"]["settings_accessible"] = True
+        errs, warns = s.validate()
+        if errs:
+            health["status"] = "degraded"
+            health["checks"]["settings_valid"] = False
+            health["errors"].extend(errs)
+        else:
+            health["checks"]["settings_valid"] = True
+        health["warnings"].extend(warns)
+    except Exception as e:
+        health["status"] = "unhealthy"
+        health["checks"]["settings_accessible"] = False
+        health["errors"].append(str(e))
 
+    s = get_settings_cached()
+    health["checks"]["cache"] = _SETTINGS_CACHE.stats()
+    health["checks"]["distributed_sources"] = len(_CONFIG_SOURCES.sources)
+    health["checks"]["has_orjson"] = bool(_HAS_ORJSON)
+    health["checks"]["tracing_enabled"] = bool(_TRACING_ENABLED and _OTEL_AVAILABLE)
+    health["checks"]["schema_available"] = bool(schema_available())
+    health["checks"]["schema_version"] = _SCHEMA_VERSION or "unknown"
+    health["checks"]["open_mode_effective"] = bool(is_open_mode())
+    health["checks"]["token_count"] = len(allowed_tokens())
+    health["checks"]["public_exact_paths"] = list(s.public_exact_paths or [])
+    health["checks"]["public_path_prefixes"] = list(s.public_path_prefixes or [])
+    return health
+
+
+# =============================================================================
+# Auth helpers
+# =============================================================================
 def allowed_tokens() -> List[str]:
-    """Get list of allowed authentication tokens."""
-    tokens = coerce_list(os.getenv("ALLOWED_TOKENS") or os.getenv("TFB_ALLOWED_TOKENS") or os.getenv("APP_TOKENS"))
-    tokens = [t for t in tokens if t]
-    if tokens:
-        return tokens
+    """
+    Allowed tokens list (comma-separated).
+    Priority:
+      1) ALLOWED_TOKENS
+      2) TFB_ALLOWED_TOKENS
+      3) APP_TOKENS
+      4) APP_TOKEN + BACKUP_APP_TOKEN
+    """
+    toks = coerce_list(os.getenv("ALLOWED_TOKENS") or os.getenv("TFB_ALLOWED_TOKENS") or os.getenv("APP_TOKENS"))
+    toks = [t for t in toks if t]
+    if toks:
+        return toks
+
     t1 = strip_value(os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or os.getenv("BACKEND_TOKEN") or "")
     t2 = strip_value(os.getenv("BACKUP_APP_TOKEN") or "")
-    result: List[str] = []
+    out: List[str] = []
     if t1:
-        result.append(t1)
-    if t2 and t2 not in result:
-        result.append(t2)
-    return result
+        out.append(t1)
+    if t2 and t2 not in out:
+        out.append(t2)
+    return out
 
 
 def is_open_mode() -> bool:
-    """Check if open mode is enabled (no authentication required)."""
+    """
+    If OPEN_MODE is set => honor it.
+    Else open only when REQUIRE_AUTH is false AND no tokens exist.
+    """
     env_flag = os.getenv("OPEN_MODE")
     if env_flag is not None:
         return coerce_bool(env_flag, False)
-    require_auth = coerce_bool(os.getenv("REQUIRE_AUTH"), True)
-    return (not require_auth) and (len(allowed_tokens()) == 0)
+
+    req = coerce_bool(os.getenv("REQUIRE_AUTH"), True)
+    return (not req) and (len(allowed_tokens()) == 0)
 
 
 def _norm_headers(headers: Any) -> Dict[str, str]:
-    """Normalize headers to lowercase dict."""
-    result: Dict[str, str] = {}
+    out: Dict[str, str] = {}
     try:
         if headers is None:
-            return result
+            return out
         if isinstance(headers, dict):
             for k, v in headers.items():
-                result[str(k).lower()] = strip_value(v)
-            return result
+                out[str(k).lower()] = strip_value(v)
+            return out
         if hasattr(headers, "items"):
             for k, v in headers.items():
-                result[str(k).lower()] = strip_value(v)
+                out[str(k).lower()] = strip_value(v)
     except Exception:
         pass
-    return result
+    return out
 
 
 def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
-    """Extract Bearer token from Authorization header."""
-    auth = strip_value(authorization)
-    if not auth:
+    a = strip_value(authorization)
+    if not a:
         return None
-    if auth.lower().startswith("bearer "):
-        return strip_value(auth.split(" ", 1)[1])
-    return auth
+    if a.lower().startswith("bearer "):
+        return strip_value(a.split(" ", 1)[1])
+    return a
 
 
 def is_public_path(path: Optional[str], settings: Optional[Settings] = None) -> bool:
-    """Check if path is public (no authentication required)."""
     s = settings or get_settings_cached()
     p = normalize_request_path(path)
     if not p:
         return False
 
-    # Check protected exact paths
     protected_exact = set(_clean_paths(s.protected_exact_paths or []))
     if p in protected_exact:
         return False
 
-    # Check protected path prefixes
     for prefix in _clean_paths(s.protected_path_prefixes or []):
         if prefix != "/" and p.startswith(prefix):
             return False
 
-    # Check public exact paths
     public_exact = set(_clean_paths(s.public_exact_paths or []))
     if p in public_exact:
         return True
 
-    # Check public path prefixes
     for prefix in _clean_paths(s.public_path_prefixes or []):
         if prefix == "/" or p.startswith(prefix):
             return True
@@ -2007,32 +1983,25 @@ def auth_ok(
     **_: Any,
 ) -> bool:
     """
-    Check if request is authenticated.
+    Standard auth check used by routes.
 
-    Args:
-        token: Direct token value
-        authorization: Authorization header value
-        headers: Request headers dict
-        api_key: API key value
-        path: Request path
-        request: Request object (FastAPI/Starlette)
-        settings: Settings instance
-
-    Returns:
-        True if authenticated, False otherwise
+    Supports:
+      - OPEN_MODE / REQUIRE_AUTH semantics
+      - path-aware public exemptions
+      - token param
+      - Authorization: Bearer <token>
+      - configured auth header name (default X-APP-TOKEN)
+      - X-API-KEY header
     """
     s = settings or get_settings_cached()
 
-    # Extract path and headers from request if provided
     req_path = path
     req_headers = headers
+
     if request is not None:
         try:
             if not req_path:
-                req_path = (
-                    getattr(getattr(request, "url", None), "path", None)
-                    or getattr(request, "scope", {}).get("path")
-                )
+                req_path = getattr(getattr(request, "url", None), "path", None) or getattr(request, "scope", {}).get("path")
         except Exception:
             pass
         try:
@@ -2041,17 +2010,15 @@ def auth_ok(
         except Exception:
             pass
 
-    # Check open mode
     if is_open_mode():
         return True
+
     if not s.require_auth:
         return True
 
-    # Check public path
     if is_public_path(req_path, settings=s):
         return True
 
-    # Check tokens
     allowed = set(allowed_tokens())
     if not allowed:
         return False
@@ -2059,86 +2026,34 @@ def auth_ok(
     if token and token in allowed:
         return True
 
-    # Check Authorization header
-    headers_norm = _norm_headers(req_headers)
-    bearer = _extract_bearer(authorization or headers_norm.get("authorization"))
+    h = _norm_headers(req_headers)
+    bearer = _extract_bearer(authorization or h.get("authorization"))
     if bearer and bearer in allowed:
         return True
 
-    # Check app token header
     configured_header = strip_value(s.auth_header_name or "X-APP-TOKEN").lower().replace("_", "-")
     configured_header_alt = configured_header.replace("-", "_")
+
     app_token = (
-        headers_norm.get(configured_header)
-        or headers_norm.get(configured_header_alt)
-        or headers_norm.get("x-app-token")
-        or headers_norm.get("x_app_token")
+        h.get(configured_header)
+        or h.get(configured_header_alt)
+        or h.get("x-app-token")
+        or h.get("x_app_token")
     )
     if app_token and app_token in allowed:
         return True
 
-    # Check API key
-    api_key_header = headers_norm.get("x-api-key") or headers_norm.get("x_api_key") or headers_norm.get("apikey")
-    if api_key_header and api_key_header in allowed:
+    api_hdr = h.get("x-api-key") or h.get("x_api_key") or h.get("apikey")
+    if api_hdr and api_hdr in allowed:
         return True
+
     if api_key and api_key in allowed:
         return True
 
     return False
 
 
-# =============================================================================
-# Health Check
-# =============================================================================
-
-def config_health_check() -> Dict[str, Any]:
-    """Run configuration health check."""
-    health: Dict[str, Any] = {
-        "status": "healthy",
-        "checks": {},
-        "warnings": [],
-        "errors": [],
-    }
-
-    try:
-        init_distributed_config()
-        s = get_settings_cached()
-        health["checks"]["settings_accessible"] = True
-
-        errors, warnings = s.validate()
-        if errors:
-            health["status"] = "degraded"
-            health["checks"]["settings_valid"] = False
-            health["errors"].extend(errors)
-        else:
-            health["checks"]["settings_valid"] = True
-        health["warnings"].extend(warnings)
-    except Exception as e:
-        health["status"] = "unhealthy"
-        health["checks"]["settings_accessible"] = False
-        health["errors"].append(str(e))
-
-    s = get_settings_cached()
-    health["checks"]["cache"] = _SETTINGS_CACHE.stats()
-    health["checks"]["distributed_sources"] = len(_CONFIG_SOURCES.sources)
-    health["checks"]["has_orjson"] = bool(_HAS_ORJSON)
-    health["checks"]["tracing_enabled"] = bool(_TRACING_ENABLED and _OTEL_AVAILABLE)
-    health["checks"]["schema_available"] = bool(schema_available())
-    health["checks"]["schema_version"] = _SCHEMA_VERSION or "unknown"
-    health["checks"]["open_mode_effective"] = bool(is_open_mode())
-    health["checks"]["token_count"] = len(allowed_tokens())
-    health["checks"]["public_exact_paths"] = list(s.public_exact_paths or [])
-    health["checks"]["public_path_prefixes"] = list(s.public_path_prefixes or [])
-
-    return health
-
-
-# =============================================================================
-# Mask Settings for Output
-# =============================================================================
-
 def mask_settings(settings: Optional[Settings] = None) -> Dict[str, Any]:
-    """Get masked settings dictionary for safe output."""
     s = settings or get_settings_cached()
     d = s.to_dict()
     d = mask_secret_dict(d, set(SENSITIVE_KEYS))
@@ -2151,18 +2066,12 @@ def mask_settings(settings: Optional[Settings] = None) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Module Exports
+# Exports
 # =============================================================================
-
 __all__ = [
     "__version__",
     "CONFIG_VERSION",
     "CONFIG_BUILD_TIMESTAMP",
-    # Exceptions (v7.0.0: exported)
-    "ConfigError",
-    "ConfigValidationError",
-    "ConfigSourceError",
-    # Enums
     "Environment",
     "LogLevel",
     "AuthType",
@@ -2170,9 +2079,8 @@ __all__ = [
     "ConfigSource",
     "ConfigStatus",
     "EncryptionMethod",
-    # Tracing
     "TraceContext",
-    # Coercion
+    "_dbg",
     "strip_value",
     "coerce_bool",
     "coerce_int",
@@ -2180,13 +2088,10 @@ __all__ = [
     "coerce_list",
     "coerce_dict",
     "is_valid_url",
-    # Merge / files
     "deep_merge",
     "load_file_content",
-    # Masking
     "mask_secret",
     "mask_secret_dict",
-    # Pages / Schema
     "canonical_pages",
     "forbidden_pages",
     "is_output_page",
@@ -2199,17 +2104,13 @@ __all__ = [
     "schema_columns",
     "schema_row_template",
     "normalize_row_to_schema",
-    # Paths / auth
     "normalize_request_path",
     "is_public_path",
-    # Versions
     "ConfigVersion",
     "ConfigVersionManager",
     "get_version_manager",
     "save_config_version",
-    # Encryption
     "ConfigEncryption",
-    # Settings
     "Settings",
     "get_settings",
     "get_settings_cached",
@@ -2220,6 +2121,4 @@ __all__ = [
     "auth_ok",
     "mask_settings",
     "init_distributed_config",
-    "normalize_google_credentials",
-    "resolve_google_credentials",
 ]
