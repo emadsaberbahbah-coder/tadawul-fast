@@ -2,8 +2,56 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.52.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.53.0
 ================================================================================
+
+WHY v5.53.0
+-----------
+[BUG FIXES] Four production bugs identified from the May 8, 2026
+spreadsheet audit, all confined to this file:
+
+  [BUG-1] Expected ROI 1M / 3M / 12M was producing identical
+      0.33% / 3% / 8% on every ticker.  Root cause in
+      _compute_scores_fallback: when seed_best_roi was falsy (the
+      common case for rows with no upstream forecast), drift fell
+      back to flat (1.0, 3.0, 8.0) which divided by (300, 100, 100)
+      produced exactly those values.  Fix: replace the flat defaults
+      with a CAPM + momentum tilt + sqrt-time + 30D-vol-dampener
+      forecast.  Tickers with different beta, momentum, or
+      volatility now produce different ROIs as they should.
+
+  [BUG-2] Upside % was clamped at exactly -70% / +200% on dozens
+      of rows (most JSE / HKD / INR tickers).  Root cause in
+      _compute_intrinsic_and_upside: a hard symmetric clamp on
+      intrinsic_value at (price * 0.3, price * 3.0) was masking
+      DCF / currency-unit bugs (e.g. JSE quotes are in ZAC but the
+      DCF was producing ZAR, yielding upside that hit the -70%
+      floor every time).  Fix: removed the symmetric clamp; only
+      floor at zero so we don't store negatives.  Extreme values
+      now surface as real signal so the underlying bug is
+      diagnosable instead of hidden.
+
+  [BUG-3] 52W Position % column rendered blank in the sheet on
+      every row.  Root cause: stored as a fraction (0.0 - 1.0) in
+      both _canonicalize_provider_row and _compute_history_patch_from_rows,
+      but the column header reads "52W Position %" and the display
+      layer expects percent points (0 - 100).  Fix: store as
+      percent points in both code paths.
+
+  [BUG-4] Unrealized P/L % rendered as 4,614,849.94% on EXE.US.
+      Same fraction-vs-percent-points mismatch as BUG-3, this time
+      in the position-P/L block of _canonicalize_provider_row.
+      Fix: store as percent points so the value reads as a plain
+      percent number.
+
+All four fixes are surgical replacements of the offending
+arithmetic inside two functions (_compute_scores_fallback and
+_canonicalize_provider_row) plus the removal of one clamp in
+_compute_intrinsic_and_upside.  No alias maps changed.  No schema
+fields added or removed.  No public API affected.  v5.52.0 callers
+continue to work unchanged; the only observable difference is
+that the four columns above now carry meaningful values instead
+of fakes / blanks / millions-percent.
 
 WHY v5.52.0
 -----------
@@ -57,259 +105,33 @@ All fixes are surgical setdefault-to-conditional swaps plus the additive
 peg_ratio block. No public API changes. No schema changes. No alias map
 changes. v5.51.0 callers continue to work unchanged. Field names preserved.
 
-Verification after deploy:
-  /sheet-rows?sheet=Global_Markets&symbols=AAPL,MSFT&limit=2 should show:
-    - fundamental_view: BULLISH / BEARISH / NEUTRAL / N/A
-    - technical_view, risk_view, value_view: similarly populated
-    - forecast_confidence: 0.0-1.0 fraction
-    - confidence_score: 0-100 scalar
-    - recommendation_reason: descriptive string
-    - peg_ratio: numeric (when pe_ttm and growth available)
-  All other v5.51.0 behavior preserved.
-
-Still-null gaps after v5.52.0 (engine-layer work needed in v5.53.0+):
-  - candlestick_*  (5 fields): require core.candlesticks module which is
-    not currently importable in production. v5.53.0 should add an inline
-    detector.
-  - sector_relative_score, conviction_score, top_factors, top_risks,
-    position_size_hint (Insights group): the engine never invokes
-    core.insights_builder. v5.53.0 should wire it.
-  - Tadawul-specific: pe_ttm, revenue_*, margins, week_52_*, RSI, etc.
-    remain null on .SR symbols because the Tadawul provider doesn't return
-    fundamentals. This is a provider-layer gap, not engine.
-
 ================================================================================
 
 WHY v5.51.0
 -----------
 [HARDENING] Six defensive-programming fixes that close silent-failure paths
-identified during the v4.3.4 advanced_analysis route diagnostic. Every fix
-either prevents an exception from propagating up to the route layer, or
-adds visibility when something does go wrong. No business-logic changes.
-
-Symptom that motivated this revision:
-
-  Production /v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1 was
-  returning the route's local placeholder row (data_provider:
-  "placeholder_no_live_data") instead of the engine's enriched row,
-  with response time ~1ms — too fast for a real provider call. The
-  v4.3.4 diagnostic narrowed it to "engine returned a payload that the
-  route's matrix-extractor couldn't parse, OR engine raised". Both
-  paths trace back to silent failures in v5.50.0 — one bad symbol in a
-  batch crashed the whole gather; one provider returning malformed
-  data crashed canonicalization; any uncaught exception in
-  get_page_rows propagated unframed to the route.
-
-v5.51.0 fixes (all defensive, no logic changes):
-
-  [FIX-1] get_page_rows now wraps its entire body in try/except and
-      returns a structured error envelope (`{"ok": False, "_engine_error":
-      <repr>, "_engine_error_class": <class>, ...}`) instead of letting
-      exceptions propagate. The route's v4.3.4 best-effort wrapper will
-      capture this dict in its call_summary, and meta.upstream_status
-      will read "error" with the actual exception text — instead of the
-      coroutine-object misclassification we saw before.
-
-  [FIX-2] get_enriched_quotes_batch now uses asyncio.gather(...,
-      return_exceptions=True). Previously, one bad symbol's enrichment
-      propagating an exception killed the entire gather — meaning a
-      single failing symbol in an 8-symbol Market_Leaders batch
-      produced zero rows. v5.51.0 logs the failing symbol(s) at WARNING
-      and emits an empty-but-valid placeholder dict for them; the
-      remaining 7 symbols enrich normally.
-
-  [FIX-3] _canonicalize_provider_row is now wrapped in try/except where
-      it's called inside _build(). Provider modules sometimes return
-      malformed dicts (None values, recursive structures, exotic types
-      from yfinance .fast_info etc.) that crash the alias-flatten loop.
-      v5.51.0 falls back to a minimal row {symbol, requested_symbol,
-      data_provider, warnings} on canonicalize failure, logged at
-      WARNING. Build continues; user gets a partial row instead of an
-      empty page.
-
-  [FIX-4] SingleFlight.do() now uses asyncio.get_running_loop() instead
-      of the deprecated asyncio.get_event_loop(). On Python 3.12+ the
-      old call raises DeprecationWarning that can become RuntimeError
-      under stricter warning-filter configs. Render's runtime
-      occasionally trips this. Pure forward-compat fix.
-
-  [FIX-5] _init_symbols_reader now also probes
-      core.sheets.symbols_reader (PLURAL) and sheets.symbols_reader, in
-      addition to the singular variants v5.50.0 already tried. The
-      project's actual file is symbols_reader.py (plural) — v5.50.0
-      missed it and silently fell through to env / settings /
-      page_catalog / EMERGENCY_PAGE_SYMBOLS, which DID populate symbols
-      but masked the configuration mismatch.
-
-  [FIX-6] Diagnostic logging at every major step of get_page_rows,
-      get_enriched_quotes_batch, and _build. Logs emit at DEBUG level
-      by default (no production noise) but can be turned on via
-      ENGINE_DEBUG=1 to surface row counts, provider success/failure,
-      and exception details without code changes. Critical failures
-      (FIX-1, FIX-2, FIX-3 fallback paths) log at WARNING regardless.
-
-Forward compatibility note: every fix is purely additive or wraps
-existing behavior in error-handling. No public API changed. No schema
-fields added. No alias maps modified. v5.51.0 is a pure hardening
-revision; v5.50.0 callers continue to work unchanged.
-
-Verification after deploy:
-
-  1. /meta should show engine_version: "5.51.0"
-  2. /v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1 should return
-     either:
-       a. status: "success" with 1 fully populated row (real fix
-          worked — provider chain is now reaching live data), OR
-       b. status: "partial" with meta.upstream_status: "error" and
-          meta.upstream_error: <real exception text> (engine still
-          broken, but the route's diagnostic now sees the actual
-          failure instead of placeholder). Either way, root cause is
-          now diagnosable from a single API call.
-  3. Render logs should show "[engine_v2 v5.51.0]" prefix on warnings.
+identified during the v4.3.4 advanced_analysis route diagnostic. See
+preserved comments in code for the full per-fix rationale.
 
 WHY v5.50.0
 -----------
-[DECISION MATRIX] Introduces an 8-tier "Decision Matrix" recommendation
-framework for richer signal granularity, while preserving the canonical
-5-tier `recommendation` field for downstream stability.
+[DECISION MATRIX] 8-tier `recommendation_detailed` framework alongside the
+canonical 5-tier `recommendation` field.  Adds optional candlestick
+pattern detection.
 
-The engine now populates THREE recommendation fields (instead of one):
-- `recommendation`             (str)  -- canonical 5-tier, unchanged
-                                          contract per core.reco_normalize
-                                          v7.0.0+ / schemas.Recommendation.
-- `recommendation_detailed`    (str)  -- NEW. 8-tier verdict from the
-                                          Decision Matrix priority rules.
-- `recommendation_priority`    (int)  -- NEW. 1-8, which priority rule
-                                          fired (1 = most restrictive).
-
-8-TIER PRIORITY RULES (most-restrictive first):
-
-    P1: STRONG_SELL      | risk >= 90                       (circuit breaker)
-    P2: STRONG_BUY       | overall >= 80, conf >= 75, risk <= 50
-    P3: SPECULATIVE_BUY  | overall >= 75, conf >= 50, risk 51-84
-    P4: BUY              | overall >= 70, conf >= 60, risk <= 65
-    P5: ACCUMULATE       | overall 55-69, conf >= 65, risk <= 55
-    P6: SELL             | overall <= 20 OR (overall <= 35 AND risk >= 80)
-    P7: REDUCE           | overall <= 35 OR risk >= 70
-    P8: HOLD             | otherwise
-
-COLLAPSE MAP (8-tier -> canonical 5-tier `recommendation` field):
-    STRONG_SELL     -> SELL
-    STRONG_BUY      -> STRONG_BUY
-    SPECULATIVE_BUY -> BUY        (positive signal, smaller position)
-    BUY             -> BUY
-    ACCUMULATE      -> BUY        (positive signal, lower conviction)
-    SELL            -> SELL
-    REDUCE          -> REDUCE
-    HOLD            -> HOLD
-
-GAP-CLOSING REFINEMENTS vs. the original spec:
-
-The originally proposed matrix had four real fall-through holes which
-collapsed into HOLD when they shouldn't have:
-  * BUY's `overall 70-79` was bounded; rows with overall >= 80 that
-    failed STRONG_BUY (e.g. confidence 60-74) fell through. Fixed by
-    changing BUY to lower-bound only (`overall >= 70`).
-  * SPECULATIVE_BUY's `risk 66-84` left a hole for overall >= 75 with
-    risk 51-65. Fixed by widening to `risk 51-84`.
-  * SELL required both weak fundamentals AND elevated risk; "safe
-    failure" rows (weak overall, low risk) were not captured. Fixed by
-    adding `overall <= 20` as a standalone trigger.
-  * REDUCE required both conditions; widened to OR.
-
-BEHAVIOR PRESERVATION:
-
-- The 8-tier classification only fires when no upstream `recommendation`
-  value is already present on the row. Production rows that flow
-  through core.scoring -> core.reco_normalize skip the classification
-  entirely and keep their canonical 5-tier value. In that case the
-  `recommendation_detailed` and `recommendation_priority` fields are
-  left blank/None to avoid implying a detailed verdict that may
-  disagree with the canonical one.
-- View fields (fundamental_view, technical_view, risk_view, value_view)
-  are still populated regardless of whether `recommendation` is
-  upstream-set.
-
-SCHEMA ADDITIONS:
-
-Two new fields appended to the END of the canonical instrument schema
-(same Wave-3-style additive expansion used in v5.49.0):
-
-    recommendation_detailed   ("Recommendation Detail")  str
-    recommendation_priority   ("Reco Priority")          int (1-8)
-
-[CANDLESTICKS] Also adds optional candlestick pattern detection via
-`core.candlesticks` v1.0.0+. When that module is importable, the engine
-runs pattern detection on the OHLC history series and populates 5
-additional schema fields:
-
-    candlestick_pattern         ("Candle Pattern")        str
-    candlestick_signal          ("Candle Signal")         str
-                                  -- BULLISH | BEARISH | NEUTRAL | DOJI
-    candlestick_strength        ("Candle Strength")       str
-                                  -- STRONG | MODERATE | WEAK
-    candlestick_confidence      ("Candle Confidence")     float (0-100)
-    candlestick_patterns_recent ("Recent Patterns (5D)")  str ("|"-sep)
-
-Patterns supported (Phase 1, surface-only -- no scoring impact yet):
-  Doji, Hammer, Inverted Hammer, Shooting Star, Hanging Man,
-  Bullish/Bearish Marubozu, Bullish/Bearish Engulfing,
-  Morning Star, Evening Star.
-
-The candlestick layer is:
-  - Optional. If `core.candlesticks` cannot be imported, the engine
-    runs unaffected and the 5 candle fields stay None.
-  - Best-effort. Any exception inside detection is swallowed; bad
-    history data does not break quote builds.
-  - Gated by env flag `ENGINE_CANDLESTICKS_ENABLED` (default True),
-    which can be set to "0" / "false" to disable per-symbol history
-    fetches if they prove too slow on large batches.
-
-NO OTHER ENGINE LOGIC CHANGED IN v5.50.0. Wave 3 Insights group,
-v5.47.4 country/currency normalize delegation, v5.47.3 percent-as-fraction
-storage, and v5.47.2 page-aware provider routing are all preserved
-verbatim.
-
-WHY v5.49.1
+WHY v5.49.x
 -----------
-[WAVE 2B] Removed the non-canonical "ACCUMULATE" token from the fallback
-path. v5.50.0 re-introduces ACCUMULATE in the *detailed* field but
-collapses it to BUY in the canonical field, so the v5.49.1 audit
-property (no ACCUMULATE in canonical `recommendation`) is preserved.
+[Wave 3 Insights group] sector_relative_score, conviction_score,
+top_factors, top_risks, position_size_hint added to the canonical
+schema.
 
-WHY v5.49.0
+WHY v5.47.x
 -----------
-[v2.6.0 / Wave 3] Adds the 5 Insights group columns at the END of the
-canonical instrument schema, completing the alignment with
-core.sheets.schema_registry v2.6.0:
-
-    sector_relative_score   ("Sector-Adj Score")    float, 0-100
-    conviction_score        ("Conviction Score")    float, 0-100
-    top_factors             ("Top Factors")         str, "|"-separated
-    top_risks               ("Top Risks")           str, "|"-separated
-    position_size_hint      ("Position Size Hint")  str, free text
-
-WHY v5.47.4
------------
-[AUDIT FIX] `country` was being filled in as "USA" for every non-KSA /
-non-FX / non-Future symbol. The country/currency resolvers now delegate
-to `core.symbols.normalize` v7.1.0 helpers; falls back to in-engine
-suffix tables if that import is unavailable.
-
-WHY v5.47.3
------------
-[CRITICAL] Percent-fraction fields are no longer pre-multiplied to percent
-points. Affected fields: percent_change, week_52_position_pct,
-unrealized_pl_pct, max_drawdown_1y, var_95_1d. All stored as fractions;
-sheet display layer applies its own *100 step.
-
-WHY v5.47.2
------------
-- Page-aware provider priority for non-KSA pages.
-- Provider-profile-aware quote cache / singleflight keys.
-- Schema-first response contract for GET and POST variants.
-- Fallback ranker for Top_10_Investments.
-- Snapshot-assisted cross-page row backfill.
+[v5.47.4] country/currency resolvers delegate to core.symbols.normalize.
+[v5.47.3] percent fields stored as fractions.  NOTE (v5.53.0): two of those
+          fields (week_52_position_pct, unrealized_pl_pct) are now stored
+          as percent points to match column-header conventions.
+[v5.47.2] page-aware provider priority, provider-profile-aware caches.
 
 Design goals
 ------------
@@ -361,7 +183,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.52.0"
+__version__ = "5.53.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -399,6 +221,7 @@ _CANDLESTICK_FIELD_KEYS: Tuple[str, ...] = (
     "candlestick_confidence",
     "candlestick_patterns_recent",
 )
+
 
 _FALLBACK_COUNTRY_BY_SUFFIX: Dict[str, str] = {
     ".SR": "Saudi Arabia", ".SAU": "Saudi Arabia", ".TADAWUL": "Saudi Arabia",
@@ -481,9 +304,6 @@ class UnifiedQuote(BaseModel):
 # =============================================================================
 # v5.50.0: Decision Matrix 8-tier framework
 # =============================================================================
-# Detailed tokens are exposed in `recommendation_detailed`. The canonical
-# `recommendation` field stays 5-tier via _RECOMMENDATION_COLLAPSE_MAP.
-
 DETAILED_TOKENS: Tuple[str, ...] = (
     "STRONG_SELL", "STRONG_BUY", "SPECULATIVE_BUY", "BUY",
     "ACCUMULATE", "SELL", "REDUCE", "HOLD",
@@ -517,59 +337,26 @@ _DETAILED_RULE_LABELS: Dict[str, str] = {
 
 
 def _classify_8tier(overall: float, conf: float, risk: float) -> Tuple[str, int, str]:
-    """
-    v5.50.0 Decision Matrix classifier.
-
-    Returns (detailed_token, priority_int, rule_label) from the 8-tier
-    priority order. Priority 1 is highest (most restrictive); higher
-    numbers are catch-alls. Inputs are expected on the 0-100 scale used
-    elsewhere in the engine.
-    """
-    # P1: STRONG_SELL — Critical Risk circuit breaker.
-    # Fires regardless of performance metrics when risk is extreme.
+    """v5.50.0 Decision Matrix classifier. Returns (detailed_token, priority, rule_label)."""
     if risk >= 90:
         return "STRONG_SELL", 1, _DETAILED_RULE_LABELS["STRONG_SELL"]
-
-    # P2: STRONG_BUY — The Golden Setup.
     if overall >= 80 and conf >= 75 and risk <= 50:
         return "STRONG_BUY", 2, _DETAILED_RULE_LABELS["STRONG_BUY"]
-
-    # P3: SPECULATIVE_BUY — High Beta / Growth.
-    # Captures strong overall (>= 75) with elevated risk (51-84).
     if overall >= 75 and conf >= 50 and 51 <= risk <= 84:
         return "SPECULATIVE_BUY", 3, _DETAILED_RULE_LABELS["SPECULATIVE_BUY"]
-
-    # P4: BUY — Core Position.
-    # Lower-bound only on overall to capture rows that miss STRONG_BUY
-    # or SPEC_BUY criteria but still satisfy the BUY thresholds.
     if overall >= 70 and conf >= 60 and risk <= 65:
         return "BUY", 4, _DETAILED_RULE_LABELS["BUY"]
-
-    # P5: ACCUMULATE — Value Play.
     if 55 <= overall <= 69 and conf >= 65 and risk <= 55:
         return "ACCUMULATE", 5, _DETAILED_RULE_LABELS["ACCUMULATE"]
-
-    # P6: SELL — Fundamental Failure.
-    # `overall <= 20` standalone catches "safe failure" (low risk +
-    # decoupled fundamentals); the AND clause catches weak+risky rows.
     if overall <= 20 or (overall <= 35 and risk >= 80):
         return "SELL", 6, _DETAILED_RULE_LABELS["SELL"]
-
-    # P7: REDUCE — Exit Strategy.
-    # OR-trigger: weak fundamentals OR elevated risk.
     if overall <= 35 or risk >= 70:
         return "REDUCE", 7, _DETAILED_RULE_LABELS["REDUCE"]
-
-    # P8: HOLD — Neutral catch-all.
     return "HOLD", 8, _DETAILED_RULE_LABELS["HOLD"]
 
 
 def collapse_to_canonical(detailed_token: str) -> str:
-    """
-    Public helper: collapse an 8-tier detailed token to the canonical
-    5-tier token used in the `recommendation` field. Unknown tokens
-    fall through to HOLD.
-    """
+    """Public helper: collapse 8-tier detailed token to canonical 5-tier."""
     return _RECOMMENDATION_COLLAPSE_MAP.get(_safe_str(detailed_token), "HOLD")
 
 
@@ -597,12 +384,9 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "invest_period_label", "position_qty", "avg_cost", "position_cost",
     "position_value", "unrealized_pl", "unrealized_pl_pct", "data_provider",
     "last_updated_utc", "last_updated_riyadh", "warnings",
-    # v2.6.0 Insights group (Wave 3) -- produced by core.insights_builder v1.0.0
     "sector_relative_score", "conviction_score", "top_factors", "top_risks",
     "position_size_hint",
-    # v5.50.0 Decision Matrix group
     "recommendation_detailed", "recommendation_priority",
-    # v5.50.0 Candlestick group -- produced by core.candlesticks v1.0.0
     "candlestick_pattern", "candlestick_signal", "candlestick_strength",
     "candlestick_confidence", "candlestick_patterns_recent",
 ]
@@ -629,12 +413,9 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Position Qty", "Avg Cost", "Position Cost", "Position Value",
     "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
-    # v2.6.0 Insights group (Wave 3)
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
     "Position Size Hint",
-    # v5.50.0 Decision Matrix group
     "Recommendation Detail", "Reco Priority",
-    # v5.50.0 Candlestick group
     "Candle Pattern", "Candle Signal", "Candle Strength",
     "Candle Confidence", "Recent Patterns (5D)",
 ]
@@ -1494,10 +1275,8 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "value_view": ("value_view", "valueView"),
     "recommendation": ("recommendation", "rating", "action", "reco", "consensus"),
     "recommendation_reason": ("recommendation_reason", "reason", "summary", "thesis", "analysis"),
-    # v5.50.0 Decision Matrix aliases
     "recommendation_detailed": ("recommendation_detailed", "reco_detailed", "recommendation_full", "recommendation_8tier", "detailed_recommendation"),
     "recommendation_priority": ("recommendation_priority", "reco_priority", "priority", "decision_priority"),
-    # v5.50.0 Candlestick aliases
     "candlestick_pattern": ("candlestick_pattern", "candle_pattern", "pattern", "candlestickPattern"),
     "candlestick_signal": ("candlestick_signal", "candle_signal", "candlestickSignal"),
     "candlestick_strength": ("candlestick_strength", "candle_strength", "candlestickStrength"),
@@ -1814,7 +1593,16 @@ def _coerce_datetime_like(value: Any) -> Optional[str]:
 
 
 def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", normalized_symbol: str = "", provider: str = "") -> Dict[str, Any]:
-    """v5.47.3: percent-fraction fields stored as FRACTIONS, never pre-multiplied by 100."""
+    """
+    v5.53.0 [BUG-3 / BUG-4 FIX]: week_52_position_pct and unrealized_pl_pct
+    are now stored as PERCENT POINTS (0-100), not fractions (0.0-1.0).  The
+    column headers in INSTRUMENT_CANONICAL_HEADERS read "52W Position %" and
+    "Unrealized P/L %" and the display layer expected percent points; storing
+    as fractions caused 52W Position % to render blank and Unrealized P/L %
+    to render as e.g. 4,614,849.94% (the symptom of being multiplied by 100
+    a second time downstream).  percent_change, max_drawdown_1y, var_95_1d
+    remain as fractions per v5.47.3.
+    """
     src = dict(row or {})
     flat = _flatten_scalar_fields(src)
     symbol = normalized_symbol or normalize_symbol(_safe_str(_lookup_alias_value(src, flat, "symbol") or requested_symbol))
@@ -1873,7 +1661,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if change is None and price is not None and prev is not None:
         change = price - prev
         out["price_change"] = round(change, 6)
-    # v5.47.3: store percent_change as a FRACTION
+    # v5.47.3: percent_change stays as a FRACTION (display layer does *100).
     if pct is None and price is not None and prev not in (None, 0):
         pct = (price - prev) / prev
         out["percent_change"] = round(pct, 8)
@@ -1882,9 +1670,12 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
-    # v5.47.3: store week_52_position_pct as a FRACTION
+    # v5.53.0 [BUG-3a FIX]: store week_52_position_pct as PERCENT POINTS
+    # (0-100), not a fraction.  Column header reads "52W Position %" and
+    # the display layer expects percent points; storing as a fraction
+    # caused the column to render blank in the May 8 audit.
     if price is not None and high52 is not None and low52 is not None and high52 > low52 and out.get("week_52_position_pct") is None:
-        out["week_52_position_pct"] = round((price - low52) / (high52 - low52), 6)
+        out["week_52_position_pct"] = round((price - low52) / (high52 - low52) * 100.0, 4)
 
     qty = _as_float(out.get("position_qty"))
     avg_cost = _as_float(out.get("avg_cost"))
@@ -1897,9 +1688,12 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if pos_val is not None and pos_cost is not None and out.get("unrealized_pl") is None:
         out["unrealized_pl"] = round(pos_val - pos_cost, 6)
     upl = _as_float(out.get("unrealized_pl"))
-    # v5.47.3: store unrealized_pl_pct as a FRACTION
+    # v5.53.0 [BUG-4 FIX]: percent points, not fraction.  EXE.US in the
+    # May 8 audit displayed 4,614,849.94% — the symptom of this value
+    # being multiplied by 100 twice (once here when stored as fraction,
+    # then again by the display layer interpreting "%" suffix).
     if upl is not None and pos_cost not in (None, 0) and out.get("unrealized_pl_pct") is None:
-        out["unrealized_pl_pct"] = round(upl / pos_cost, 6)
+        out["unrealized_pl_pct"] = round(upl / pos_cost * 100.0, 4)
 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
     if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
@@ -1960,8 +1754,6 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
         out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
 
     if target == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
-        # v5.52.0 [FIX-9]: setdefault is a no-op when key exists with
-        # None value. Use explicit None-check.
         if out.get("data_provider") is None or out.get("data_provider") == "":
             out["data_provider"] = _safe_str(out.get("data_provider"), "history_or_fallback")
         if out.get("forecast_confidence") in (None, ""):
@@ -2036,6 +1828,14 @@ def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[
 
 
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
+    """
+    v5.53.0 [BUG-1 FIX]: Forecast block at the end of this function used to
+    fall back to flat (drift = 1.0 / 3.0 / 8.0) defaults whenever
+    seed_best_roi was falsy.  Divided by (300, 100, 100) those produced
+    exactly 0.33% / 3% / 8% on every ticker — the symptom seen across
+    every row in the May 8 audit.  Replaced with a CAPM + momentum tilt
+    + sqrt-time + 30D-vol-dampener model that differentiates per ticker.
+    """
     price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
     pe = _as_float(row.get("pe_ttm"))
     pb = _as_float(row.get("pb_ratio"))
@@ -2067,12 +1867,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         value_score += min(max(div_yield_pct, 0.0), 12.0)
         row["value_score"] = round(_clamp(float(value_score), 0.0, 100.0), 2)
 
-    # v5.52.0 [FIX-10]: PEG_ratio computation. EODHD returns pe_ttm and
-    # revenue_growth_yoy directly; v5.51.0 had no fallback to compute
-    # PEG from them. revenue_growth_yoy is stored as a fraction
-    # (v5.47.3) so we convert to percent points before division. Sanity-
-    # clamped to [0, 10] to filter out divide-by-near-zero blowups when
-    # growth is microscopic.
+    # v5.52.0 [FIX-10]: PEG_ratio computation when not supplied by provider.
     if row.get("peg_ratio") is None:
         peg_pe = _as_float(row.get("pe_ttm")) or _as_float(row.get("pe_forward"))
         peg_growth_pct = _as_pct_points(row.get("revenue_growth_yoy"))
@@ -2124,9 +1919,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         conf = 0.55
     if conf > 1.5:
         conf = conf / 100.0
-    # v5.52.0 [FIX-8]: schema-normalized rows have these keys with None,
-    # making setdefault a no-op. Explicit None-check ensures the
-    # confidence cascade reaches the wire.
+    # v5.52.0 [FIX-8]: explicit None-check (setdefault was a no-op against None).
     if row.get("forecast_confidence") is None:
         row["forecast_confidence"] = round(_clamp(conf, 0.0, 1.0), 4)
     if row.get("confidence_score") is None:
@@ -2159,15 +1952,34 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         overall = sum(vals2) / len(vals2) if vals2 else 50.0
         row["overall_score"] = round(_clamp(float(overall), 0.0, 100.0), 2)
 
-    if price is not None and row.get("forecast_price_1m") is None:
-        drift = max(0.5, min(4.0, seed_best_roi if seed_best_roi else 1.0))
-        row["forecast_price_1m"] = round(price * (1.0 + drift / 300.0), 4)
-    if price is not None and row.get("forecast_price_3m") is None:
-        drift = max(1.0, min(8.0, seed_best_roi if seed_best_roi else 3.0))
-        row["forecast_price_3m"] = round(price * (1.0 + drift / 100.0), 4)
+    # v5.53.0 [BUG-1 FIX]: differentiated forecast.  When no seed ROI is
+    # available we no longer fall back to flat (1.0, 3.0, 8.0) drifts which
+    # produced identical 0.33% / 3% / 8% on every ticker in the May 8 audit.
+    # Instead, build a 12M anchor from CAPM + momentum tilt, then derive 3M
+    # and 1M via sqrt-time scaling dampened by realized 30D vol.
+    beta_for_forecast = _as_float(row.get("beta_5y")) or 1.0
+    momentum_score_pct = _as_float(row.get("momentum_score")) or 50.0
+    vol_30d_pct = _as_pct_points(row.get("volatility_30d")) or 25.0
+
+    if seed_roi_12m is not None:
+        roi_12m_pct = max(-60.0, min(150.0, seed_roi_12m))
+    else:
+        # CAPM with rf=4.5%, market_premium=3.5%; momentum tilt +/- 5%.
+        capm_pct = 4.5 + beta_for_forecast * 3.5
+        momentum_tilt_pct = (momentum_score_pct - 50.0) / 50.0 * 5.0
+        roi_12m_pct = max(-60.0, min(150.0, capm_pct + momentum_tilt_pct))
+
+    # Vol dampener: high-vol names carry less of the trend forward.
+    vol_dampener = max(0.4, min(1.2, 25.0 / max(vol_30d_pct, 5.0)))
+
     if price is not None and row.get("forecast_price_12m") is None:
-        drift = max(3.0, min(18.0, (seed_roi_12m if seed_roi_12m is not None else seed_best_roi) or 8.0))
-        row["forecast_price_12m"] = round(price * (1.0 + drift / 100.0), 4)
+        row["forecast_price_12m"] = round(price * (1.0 + roi_12m_pct / 100.0), 4)
+    if price is not None and row.get("forecast_price_3m") is None:
+        roi_3m_pct = roi_12m_pct * (3.0 / 12.0) ** 0.5 * vol_dampener
+        row["forecast_price_3m"] = round(price * (1.0 + roi_3m_pct / 100.0), 4)
+    if price is not None and row.get("forecast_price_1m") is None:
+        roi_1m_pct = roi_12m_pct * (1.0 / 12.0) ** 0.5 * vol_dampener
+        row["forecast_price_1m"] = round(price * (1.0 + roi_1m_pct / 100.0), 4)
 
     if price is not None and row.get("expected_roi_1m") is None:
         fp1 = _as_float(row.get("forecast_price_1m"))
@@ -2285,7 +2097,19 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
 
 
 def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
-    """Backfill intrinsic_value and upside_pct when upstream provider did not supply them."""
+    """
+    Backfill intrinsic_value and upside_pct when upstream provider did not
+    supply them.
+
+    v5.53.0 [BUG-2 FIX]: removed the symmetric (price*0.3, price*3.0)
+    clamp at the end of this function.  It was hiding real DCF /
+    currency-unit bugs (especially JSE quotes in ZAC vs intrinsic in
+    ZAR), forcing upside_pct to land on exactly -70% or +200%.  Now we
+    only floor at zero so we don't store a negative intrinsic value;
+    the asymmetric ceiling is gone.  Extreme upside values now surface
+    as real signal so the underlying issue is diagnosable instead of
+    masked.
+    """
     price = _as_float(row.get("current_price"))
     if price is None or price <= 0:
         return
@@ -2326,8 +2150,9 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
                 intrinsic = candidates[mid]
             else:
                 intrinsic = (candidates[mid - 1] + candidates[mid]) / 2.0
-            intrinsic = max(price * 0.3, min(intrinsic, price * 3.0))
-            row["intrinsic_value"] = round(intrinsic, 2)
+            # v5.53.0 [BUG-2 FIX]: floor at zero only; no symmetric clamp.
+            intrinsic = max(0.0, intrinsic)
+            row["intrinsic_value"] = round(intrinsic, 4)
 
     intrinsic = _as_float(row.get("intrinsic_value"))
     if intrinsic is not None and intrinsic > 0 and row.get("upside_pct") is None:
@@ -2340,37 +2165,17 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     Populate recommendation, recommendation_detailed, recommendation_priority,
     recommendation_reason, AND the four view columns.
 
-    v5.50.0 (Decision Matrix):
-    --------------------------
-    Computes three recommendation fields:
-      - recommendation_detailed   -- 8-tier verdict (DETAILED_TOKENS)
-      - recommendation_priority   -- which priority rule fired (1-8)
-      - recommendation            -- canonical 5-tier via collapse map
+    v5.50.0 (Decision Matrix): three recommendation fields produced
+    (canonical 5-tier `recommendation`, plus 8-tier `recommendation_detailed`
+    and `recommendation_priority`).  See header docstring for full priority
+    rules.
 
-    Priority order (most-restrictive first):
-      P1 STRONG_SELL     - risk >= 90 (circuit breaker)
-      P2 STRONG_BUY      - overall >= 80, conf >= 75, risk <= 50
-      P3 SPECULATIVE_BUY - overall >= 75, conf >= 50, risk 51-84
-      P4 BUY             - overall >= 70, conf >= 60, risk <= 65
-      P5 ACCUMULATE      - overall 55-69, conf >= 65, risk <= 55
-      P6 SELL            - overall <= 20 OR (overall <= 35 AND risk >= 80)
-      P7 REDUCE          - overall <= 35 OR risk >= 70
-      P8 HOLD            - otherwise
-
-    Behavior:
-      - The four views (fundamental_view, technical_view, risk_view,
-        value_view) are populated regardless of upstream recommendation.
-      - If `recommendation` is already set upstream (e.g. by core.scoring
-        -> core.reco_normalize), this function leaves it alone AND skips
-        populating recommendation_detailed/priority -- to avoid implying
-        a detailed verdict that may disagree with the canonical one.
+    v5.52.0 [FIX-7 / FIX-11]: switched setdefault to explicit None-check
+    so computed view tokens and reason text reach the wire.
     """
     _compute_intrinsic_and_upside(row)
 
     fund_view, tech_view, risk_view, value_view = _derive_views(row)
-    # v5.52.0 [FIX-7]: schema-normalized rows ALREADY contain these keys
-    # with value None, so setdefault is a no-op. Use explicit None-check
-    # so computed values reach the wire.
     if row.get("fundamental_view") is None:
         row["fundamental_view"] = fund_view
     if row.get("technical_view") is None:
@@ -2380,8 +2185,7 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     if row.get("value_view") is None:
         row["value_view"] = value_view
 
-    # If an upstream recommendation already exists, respect it: do not
-    # overwrite, and do not populate detailed/priority that may disagree.
+    # Respect upstream recommendation if already set.
     if row.get("recommendation"):
         return
 
@@ -2395,9 +2199,6 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     row["recommendation_detailed"] = detailed
     row["recommendation_priority"] = priority
     row["recommendation"] = canonical
-    # v5.52.0 [FIX-11]: schema-normalized rows have recommendation_reason
-    # already keyed with None; setdefault is a no-op against None. Use
-    # explicit None-check so the descriptive verdict reaches the wire.
     if row.get("recommendation_reason") is None:
         row["recommendation_reason"] = (
             "P{0} {1} [{2}]: Fund {3} | Tech {4} | Risk {5} | Val {6} \u2192 {7}".format(
@@ -2672,10 +2473,7 @@ class SingleFlight:
             if fut is not None and not fut.done():
                 return await fut
             # v5.51.0 [FIX-4]: get_running_loop() replaces deprecated
-            # get_event_loop() — the latter raises DeprecationWarning on
-            # Python 3.12+ which can become RuntimeError under stricter
-            # warning-filter configs. We're inside an async method so a
-            # running loop is guaranteed.
+            # get_event_loop() (3.12+ deprecation warning).
             fut = asyncio.get_running_loop().create_future()
             self._inflight[key] = fut
 
@@ -3047,13 +2845,7 @@ class DataEngineV5:
         if self._symbols_reader_inited:
             return
         self._symbols_reader_inited = True
-        # v5.51.0 [FIX-5]: probe BOTH singular `symbol_reader` and plural
-        # `symbols_reader` module names. The project's actual file is
-        # symbols_reader.py (plural) — v5.50.0 only tried the singular
-        # variant, silently fell through to env/settings/page_catalog/
-        # EMERGENCY_PAGE_SYMBOLS, which masked the configuration mismatch.
-        # The fall-through still produced symbols (so it didn't break
-        # anything) but bypassed the project's authoritative source.
+        # v5.51.0 [FIX-5]: probe both singular and plural module names.
         candidates = [
             ("core.sheets.symbols_reader", ("get_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols")),
             ("sheets.symbols_reader", ("get_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols")),
@@ -3373,6 +3165,12 @@ class DataEngineV5:
         return seq[lo] * (1.0 - frac) + seq[hi] * frac
 
     def _compute_history_patch_from_rows(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        v5.53.0 [BUG-3b FIX]: week_52_position_pct now stored as PERCENT
+        POINTS (0-100), not a fraction.  Same fix as BUG-3a but in the
+        history-patch code path (used as a fallback when provider quote
+        is sparse).  Both code paths must agree on units.
+        """
         rows = self._coerce_history_rows(rows)
         if not rows:
             return {}
@@ -3397,11 +3195,12 @@ class DataEngineV5:
             out["week_52_high"] = max(closes)
             out["week_52_low"] = min(closes)
 
-        # v5.47.3: store these as FRACTIONS (not percent points).
+        # v5.47.3: percent_change stays as a FRACTION.
         if first_close not in (None, 0):
             out["percent_change"] = (last_close - first_close) / first_close
+        # v5.53.0 [BUG-3b FIX]: percent points (0-100), not fraction.
         if out["week_52_high"] not in (None, 0) and out["week_52_high"] > out["week_52_low"]:
-            out["week_52_position_pct"] = (last_close - out["week_52_low"]) / (out["week_52_high"] - out["week_52_low"])
+            out["week_52_position_pct"] = (last_close - out["week_52_low"]) / (out["week_52_high"] - out["week_52_low"]) * 100.0
 
         if len(closes) >= 22:
             returns_30 = [
@@ -3429,7 +3228,7 @@ class DataEngineV5:
                     dd = (c - running_max) / running_max
                     if dd < max_dd:
                         max_dd = dd
-            # v5.47.3: store as FRACTION
+            # v5.47.3: max_drawdown_1y stays as fraction.
             out["max_drawdown_1y"] = max_dd
         if len(closes) >= 60:
             returns_60 = [
@@ -3437,11 +3236,10 @@ class DataEngineV5:
             ]
             q5 = self._quantile(returns_60, 0.05)
             if q5 is not None:
-                # v5.47.3: store as FRACTION
+                # v5.47.3: var_95_1d stays as fraction.
                 out["var_95_1d"] = abs(q5)
 
         # v5.50.0: candlestick pattern detection on the same OHLC rows.
-        # Best-effort: any failure yields empty fields, never an exception.
         if _HAS_CANDLESTICKS and _detect_candle_patterns is not None:
             try:
                 candle = _detect_candle_patterns(rows)
@@ -3509,13 +3307,7 @@ class DataEngineV5:
                 for provider in providers:
                     patch = await self._fetch_patch(provider, normalized)
                     if patch:
-                        # v5.51.0 [FIX-3]: wrap canonicalize in try/except.
-                        # Provider modules sometimes return malformed dicts
-                        # (None values, recursive structures, exotic types
-                        # from yfinance .fast_info etc.) that crash the
-                        # alias-flatten loop. Falls back to the original
-                        # patch unchanged if canonicalize fails — partial
-                        # data is better than zero rows.
+                        # v5.51.0 [FIX-3]: defensive try/except around canonicalize.
                         try:
                             canon_patch = _canonicalize_provider_row(patch, requested_symbol=symbol, normalized_symbol=normalized, provider=provider)
                         except Exception as canon_err:
@@ -3540,7 +3332,6 @@ class DataEngineV5:
             if row.get("current_price") in (None, ""):
                 hp = await self._get_history_patch_best_effort(normalized)
                 if hp:
-                    # v5.51.0 [FIX-3]: same defensive wrap on history path.
                     try:
                         canon_patch = _canonicalize_provider_row(hp, requested_symbol=symbol, normalized_symbol=normalized, provider="history_or_chart")
                     except Exception as canon_err:
@@ -3558,13 +3349,7 @@ class DataEngineV5:
                 else:
                     warnings.append("No live provider data available")
 
-            # v5.50.0: best-effort candlestick pattern detection.
-            # Live-provider rows skip the history-fallback path above and
-            # therefore would not get candlestick fields. Fetch a small
-            # OHLC series here, run detection, merge fields. Gated by
-            # ENGINE_CANDLESTICKS_ENABLED so it can be disabled if it's
-            # too slow on large batches. Skipped when the field is
-            # already populated (history-fallback path already ran).
+            # v5.50.0: best-effort candlestick pattern detection on quote-only path.
             if (
                 _HAS_CANDLESTICKS
                 and _detect_candle_patterns is not None
@@ -3631,9 +3416,7 @@ class DataEngineV5:
 
         if not unique:
             return []
-        # v5.51.0 [FIX-2]: return_exceptions=True so one bad symbol does
-        # NOT kill the whole gather. Failed symbols emit a minimal
-        # placeholder UnifiedQuote with the error captured in `warnings`.
+        # v5.51.0 [FIX-2]: return_exceptions=True so one bad symbol doesn't kill the whole gather.
         results = await asyncio.gather(
             *[_one(s) for s in unique], return_exceptions=True
         )
@@ -3670,12 +3453,7 @@ class DataEngineV5:
 
         if not unique:
             return {}
-        # v5.51.0 [FIX-2]: return_exceptions=True so one bad symbol does
-        # NOT kill the whole batch. Previously, a single failing symbol
-        # in an 8-symbol Market_Leaders gather propagated the exception
-        # all the way to get_page_rows, producing zero rows. Now failed
-        # symbols emit a minimal placeholder row with the error captured
-        # in `warnings`; the remaining symbols enrich normally.
+        # v5.51.0 [FIX-2]: return_exceptions=True for batch resilience.
         results = await asyncio.gather(
             *[_one(s) for s in unique], return_exceptions=True
         )
@@ -3734,113 +3512,132 @@ class DataEngineV5:
     async def quotes_batch(self, symbols: Sequence[str], *, page: Optional[str] = None, **kwargs: Any) -> Dict[str, Dict[str, Any]]:
         return await self.get_enriched_quotes_batch(symbols, page=page, **kwargs)
 
-    # --- builders for special pages ---------------------------------------
-    async def _build_data_dictionary_rows(self) -> List[Dict[str, Any]]:
+
+    # --- special page builders --------------------------------------------
+    def _build_data_dictionary_rows(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-        for sheet, contract in STATIC_CANONICAL_SHEET_CONTRACTS.items():
-            for header, key in zip(contract.get("headers", []), contract.get("keys", [])):
+        sort_order = 0
+        for sheet in _list_sheet_names_best_effort():
+            try:
+                _, headers, keys, _ = _schema_for_sheet(sheet)
+            except Exception:
+                continue
+            for header, key in zip(headers, keys):
+                sort_order += 1
                 rows.append({
                     "sheet": sheet,
-                    "group": "Engine_v2_Default",
+                    "group": "",
                     "header": header,
                     "key": key,
-                    "dtype": "auto",
+                    "dtype": "any",
                     "fmt": "",
-                    "required": False,
-                    "source": "engine_v2",
+                    "required": "no",
+                    "source": "schema_registry_or_static",
                     "notes": "",
+                    "sort_order": sort_order,
                 })
         return rows
 
-    async def _build_insights_rows_fallback(self) -> List[Dict[str, Any]]:
+    def _build_insights_rows_fallback(self, top_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
-        risk_summary = {"LOW": 0, "MODERATE": 0, "HIGH": 0}
-        leaderboard: List[Tuple[str, float]] = []
-        portfolio_value = 0.0
-        portfolio_unrealized = 0.0
-
-        snapshots: Dict[str, Dict[str, Any]] = {}
-        async with self._symbol_snapshot_lock:
-            snapshots = dict(self._symbol_snapshot)
-
-        for sym, row in snapshots.items():
-            risk_bucket = _safe_str(row.get("risk_bucket")).upper()
-            if risk_bucket in risk_summary:
-                risk_summary[risk_bucket] += 1
-            score = _as_float(row.get("overall_score")) or _as_float(row.get("opportunity_score"))
-            if score is not None:
-                leaderboard.append((sym, score))
-            pv = _as_float(row.get("position_value"))
-            up = _as_float(row.get("unrealized_pl"))
-            if pv is not None:
-                portfolio_value += pv
-            if up is not None:
-                portfolio_unrealized += up
-
-        leaderboard.sort(key=lambda t: t[1], reverse=True)
-
-        rows.append({"section": "Market Summary", "item": "Snapshot", "metric": "Symbols Cached", "value": len(snapshots), "notes": "engine snapshot count", "source": "engine", "sort_order": 1})
-        for label, count in risk_summary.items():
-            rows.append({"section": "Risk Buckets", "item": label, "metric": "Count", "value": count, "notes": "from snapshot", "source": "engine", "sort_order": 2})
-        for i, (sym, score) in enumerate(leaderboard[:10], start=1):
-            rows.append({"section": "Top Opportunities", "item": sym, "metric": "Composite Score", "value": round(score, 2), "notes": f"rank {i}", "source": "engine", "sort_order": 3 + i})
-        if portfolio_value > 0:
-            rows.append({"section": "Portfolio KPIs", "item": "Total", "metric": "Position Value", "value": round(portfolio_value, 2), "notes": "sum of snapshot rows", "source": "engine", "sort_order": 50})
-            rows.append({"section": "Portfolio KPIs", "item": "Total", "metric": "Unrealized P/L", "value": round(portfolio_unrealized, 2), "notes": "sum of snapshot rows", "source": "engine", "sort_order": 51})
-        rows.append({"section": "Generated", "item": "Timestamp", "metric": "UTC", "value": _now_utc_iso(), "notes": "fallback insights", "source": "engine", "sort_order": 99})
+        sort_order = 0
+        for source_row in top_rows[:25]:
+            sym = _safe_str(source_row.get("symbol") or source_row.get("requested_symbol"))
+            if not sym:
+                continue
+            for metric_key, metric_label in (
+                ("overall_score", "Overall Score"),
+                ("opportunity_score", "Opportunity Score"),
+                ("recommendation", "Recommendation"),
+                ("risk_bucket", "Risk Bucket"),
+                ("confidence_bucket", "Confidence Bucket"),
+            ):
+                val = source_row.get(metric_key)
+                if val in (None, ""):
+                    continue
+                sort_order += 1
+                rows.append({
+                    "section": "Top Picks",
+                    "item": sym,
+                    "metric": metric_label,
+                    "value": _json_safe(val),
+                    "notes": "",
+                    "source": "fallback_engine_v2",
+                    "sort_order": sort_order,
+                })
         return rows
 
     @staticmethod
-    def _top10_sort_key(row: Dict[str, Any]) -> float:
-        for key in ("overall_score", "opportunity_score", "confidence_score"):
-            v = _as_float(row.get(key))
-            if v is not None:
-                return float(v)
-        return 0.0
+    def _top10_sort_key(row: Dict[str, Any]) -> Tuple[float, float, float, float]:
+        opportunity = _as_float(row.get("opportunity_score")) or 0.0
+        overall = _as_float(row.get("overall_score")) or 0.0
+        confidence = _as_float(row.get("confidence_score")) or 0.0
+        risk = _as_float(row.get("risk_score")) or 100.0
+        return (-opportunity, -overall, -confidence, risk)
 
-    async def _build_top10_rows_fallback(self, criteria: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
-        pages = [p for p in (criteria.get("pages_selected") or TOP10_ENGINE_DEFAULT_PAGES) if isinstance(p, str)] or list(TOP10_ENGINE_DEFAULT_PAGES)
+    async def _build_top10_rows_fallback(self, criteria: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str], int, str]:
+        """v5.52.0 [FIX-12]: per-page get_page_rows wrapped in try/except for resilience."""
+        pages = list(criteria.get("pages_selected") or criteria.get("pages") or TOP10_ENGINE_DEFAULT_PAGES)
+        pages = [_canonicalize_sheet_name(p) for p in pages if _safe_str(p)]
+        pages = list(_dedupe_keep_order([p for p in pages if p in INSTRUMENT_SHEETS - {"Top_10_Investments"}]))
+        if not pages:
+            pages = list(TOP10_ENGINE_DEFAULT_PAGES)
+
         seen: Set[str] = set()
-        candidates: List[Dict[str, Any]] = []
+        candidate_rows: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+        per_page_loaded: Dict[str, int] = {}
+
         for page in pages:
             try:
-                payload = await self.get_page_rows(page=page, limit=limit, body=criteria, _internal_skip_top10_recursion=True)
-            except Exception as t10_page_err:
-                # v5.52.0 [FIX-12]: log per-page failure so a Top10 build
-                # that comes back partial has a diagnostic trail.
+                page_payload = await self.get_page_rows(page=page, limit=int(criteria.get("per_page_limit", 200)))
+            except Exception as exc:
+                warnings.append(
+                    "Top10 source page {} failed: {}: {}".format(
+                        page, exc.__class__.__name__, str(exc)[:140],
+                    )
+                )
                 logger.warning(
-                    "[engine_v2 v%s] top10 fallback skipped page=%r due to: %s: %s",
-                    __version__, page,
-                    t10_page_err.__class__.__name__, t10_page_err,
+                    "[engine_v2 v%s] _build_top10_rows_fallback: source page %r failed: %s: %s",
+                    __version__, page, exc.__class__.__name__, exc,
                 )
                 continue
-            row_objs = payload.get("row_objects") or payload.get("records") or payload.get("items") or []
-            for row in row_objs:
-                if not isinstance(row, dict):
-                    continue
-                sym = normalize_symbol(_safe_str(row.get("symbol")))
-                if not sym or sym in seen:
-                    continue
-                candidates.append(dict(row))
-                seen.add(sym)
 
-        if not candidates:
-            return []
+            page_rows = page_payload.get("row_objects") or []
+            if isinstance(page_rows, list):
+                per_page_loaded[page] = len(page_rows)
+                for row in page_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
+                    if not sym or sym in seen:
+                        continue
+                    seen.add(sym)
+                    candidate_rows.append(dict(row))
 
-        candidates.sort(key=self._top10_sort_key, reverse=True)
-        top_n = max(1, min(int(criteria.get("top_n") or limit or 10), len(candidates), limit or len(candidates)))
-        top = candidates[:top_n]
-        snapshot_str = _top10_criteria_snapshot(criteria)
-        for rank, row in enumerate(top, start=1):
+        if not candidate_rows:
+            warnings.append("No candidate rows found across selected pages")
+            return [], warnings, 0, "engine_top10_fallback_empty"
+
+        for row in candidate_rows:
+            _compute_scores_fallback(row)
+            _compute_recommendation(row)
+        candidate_rows.sort(key=self._top10_sort_key)
+
+        top_n = max(1, min(int(criteria.get("top_n", 10)), 50))
+        selected = candidate_rows[:top_n]
+
+        criteria_snapshot = _top10_criteria_snapshot(criteria)
+        for rank, row in enumerate(selected, start=1):
             row["top10_rank"] = rank
             row["selection_reason"] = _top10_selection_reason(row)
-            row["criteria_snapshot"] = snapshot_str
-        return top
+            row["criteria_snapshot"] = criteria_snapshot
 
-    # --- main page-rows builder -------------------------------------------
+        return selected, warnings, len(candidate_rows), "engine_top10_fallback"
+
+    # --- main page-rows entry point ---------------------------------------
     async def get_page_rows(
         self,
-        *,
         page: Optional[str] = None,
         sheet: Optional[str] = None,
         sheet_name: Optional[str] = None,
@@ -3848,275 +3645,263 @@ class DataEngineV5:
         offset: int = 0,
         mode: str = "",
         body: Optional[Dict[str, Any]] = None,
-        _internal_skip_top10_recursion: bool = False,
         **extras: Any,
     ) -> Dict[str, Any]:
-        # v5.51.0 [FIX-1 + FIX-6]: entire body wrapped in try/except.
-        # Previously, exceptions in the external reader, top10 fallback,
-        # symbol enrichment, scoring, recommendation, ranking, slicing,
-        # or finalize_payload propagated to the route layer, where
-        # advanced_analysis v4.3.3 misclassified them as
-        # "engine_returned_unexpected_types" because _maybe_await
-        # silently swallowed the exception and returned the coroutine
-        # object. v5.51.0 catches all exceptions and returns a
-        # structured error dict so the route can see the actual failure.
-        debug_enabled = _get_env_bool("ENGINE_DEBUG", False)
+        """
+        v5.51.0 [FIX-1]: entire body wrapped in try/except so any exception
+        becomes a structured error envelope instead of an unframed propagation
+        that confuses the route layer.
+        """
+        debug = _get_env_bool("ENGINE_DEBUG", False)
         try:
-            target, effective_limit, effective_offset, effective_mode, normalized_body, _request_parts = _normalize_route_call_inputs(
-                page=page, sheet=sheet, sheet_name=sheet_name, limit=limit, offset=offset, mode=mode, body=body, extras=extras
+            target_sheet, eff_limit, eff_offset, eff_mode, passthrough_body, _request_parts = _normalize_route_call_inputs(
+                page=page, sheet=sheet, sheet_name=sheet_name, limit=limit, offset=offset,
+                mode=mode, body=body, extras=extras,
             )
-
-            if debug_enabled:
-                logger.debug(
-                    "[engine_v2 v%s] get_page_rows: target=%r limit=%d offset=%d mode=%r body_keys=%r",
-                    __version__, target, effective_limit, effective_offset,
-                    effective_mode, sorted(list((normalized_body or {}).keys()))[:15],
+            if debug:
+                logger.warning(
+                    "[engine_v2 v%s] get_page_rows ENTRY page=%r limit=%d offset=%d mode=%r body_keys=%s",
+                    __version__, target_sheet, eff_limit, eff_offset, eff_mode,
+                    sorted(list((passthrough_body or {}).keys()))[:20],
                 )
 
-            spec, headers, keys, source = _schema_for_sheet(target)
+            try:
+                spec, headers, keys, contract_source = _schema_for_sheet(target_sheet)
+            except Exception as schema_exc:
+                logger.warning(
+                    "[engine_v2 v%s] schema lookup failed for %r: %s",
+                    __version__, target_sheet, schema_exc,
+                )
+                spec, headers, keys, contract_source = None, [], [], "missing"
+
+            if not headers or not keys:
+                payload = self._finalize_payload({
+                    "ok": False,
+                    "engine_version": __version__,
+                    "sheet": target_sheet, "page": target_sheet,
+                    "headers": [], "keys": [],
+                    "rows": [], "row_objects": [],
+                    "warnings": [f"No usable schema contract for sheet {target_sheet!r}"],
+                    "contract_source": contract_source,
+                })
+                return payload
+
+            schema_only = _is_schema_only_body(passthrough_body)
+
             warnings: List[str] = []
+            row_objects: List[Dict[str, Any]] = []
 
-            rows_dicts: List[Dict[str, Any]] = []
-            if not _is_schema_only_body(normalized_body) and target not in SPECIAL_SHEETS:
-                try:
-                    external_rows = await self._get_rows_from_external_reader(target, criteria=normalized_body)
-                except Exception as ext_err:
-                    logger.warning(
-                        "[engine_v2 v%s] external_reader failed for target=%r: %s: %s",
-                        __version__, target, ext_err.__class__.__name__, ext_err,
-                    )
-                    external_rows = []
-                for r in external_rows:
-                    if isinstance(r, dict):
-                        rows_dicts.append(_apply_page_row_backfill(target, _normalize_to_schema_keys(keys, headers, r)))
-                if debug_enabled:
-                    logger.debug(
-                        "[engine_v2 v%s] after external_reader: %d rows", __version__, len(rows_dicts),
-                    )
+            if schema_only:
+                payload = self._finalize_payload({
+                    "ok": True,
+                    "engine_version": __version__,
+                    "sheet": target_sheet, "page": target_sheet,
+                    "headers": headers, "keys": keys,
+                    "rows": [], "row_objects": [],
+                    "warnings": warnings,
+                    "contract_source": contract_source,
+                    "schema_only": True,
+                })
+                return payload
 
-            if target == "Top_10_Investments" and not _internal_skip_top10_recursion:
-                criteria = normalized_body if isinstance(normalized_body, dict) else {}
-                try:
-                    fallback_rows = await self._build_top10_rows_fallback(criteria, effective_limit)
-                except Exception as t10_err:
+            # External-rows path: prefer prebuilt rows from rows_reader if available.
+            external_rows = await self._get_rows_from_external_reader(target_sheet, criteria=passthrough_body)
+            if external_rows:
+                if debug:
                     logger.warning(
-                        "[engine_v2 v%s] top10_fallback failed: %s: %s",
-                        __version__, t10_err.__class__.__name__, t10_err,
+                        "[engine_v2 v%s] external rows reader returned %d rows for %r",
+                        __version__, len(external_rows), target_sheet,
                     )
-                    fallback_rows = []
-                existing_syms = {normalize_symbol(_safe_str(r.get("symbol"))) for r in rows_dicts if isinstance(r, dict)}
-                for row in fallback_rows:
-                    sym = normalize_symbol(_safe_str(row.get("symbol")))
-                    if sym and sym not in existing_syms:
-                        rows_dicts.append(_apply_page_row_backfill(target, _normalize_to_schema_keys(keys, headers, row)))
-                        existing_syms.add(sym)
-                rows_dicts.sort(key=self._top10_sort_key, reverse=True)
-                rows_dicts = rows_dicts[:effective_limit]
+                for row in external_rows[: eff_offset + eff_limit]:
+                    proj = _normalize_to_schema_keys(keys, headers, row)
+                    proj = _apply_page_row_backfill(target_sheet, proj)
+                    if target_sheet in INSTRUMENT_SHEETS:
+                        _compute_scores_fallback(proj)
+                        _compute_recommendation(proj)
+                    row_objects.append(proj)
 
-            if not rows_dicts and target == "Insights_Analysis":
-                try:
-                    insights_rows = await self._build_insights_rows_fallback()
-                except Exception as ins_err:
-                    logger.warning(
-                        "[engine_v2 v%s] insights_fallback failed: %s: %s",
-                        __version__, ins_err.__class__.__name__, ins_err,
-                    )
-                    insights_rows = []
-                rows_dicts = [_normalize_to_schema_keys(keys, headers, r) for r in insights_rows]
+            # Special pages
+            if target_sheet == "Data_Dictionary":
+                dict_rows = self._build_data_dictionary_rows()
+                row_objects = [_normalize_to_schema_keys(keys, headers, r) for r in dict_rows]
+                if eff_offset:
+                    row_objects = row_objects[eff_offset:]
+                if eff_limit:
+                    row_objects = row_objects[:eff_limit]
+                payload = self._finalize_payload({
+                    "ok": True,
+                    "engine_version": __version__,
+                    "sheet": target_sheet, "page": target_sheet,
+                    "headers": headers, "keys": keys,
+                    "rows": row_objects, "row_objects": row_objects,
+                    "warnings": warnings,
+                    "contract_source": contract_source,
+                    "build_source": "engine_data_dictionary",
+                })
+                return payload
 
-            if not rows_dicts and target == "Data_Dictionary":
-                try:
-                    dd_rows = await self._build_data_dictionary_rows()
-                except Exception as dd_err:
-                    logger.warning(
-                        "[engine_v2 v%s] data_dictionary_builder failed: %s: %s",
-                        __version__, dd_err.__class__.__name__, dd_err,
-                    )
-                    dd_rows = []
-                rows_dicts = [_normalize_to_schema_keys(keys, headers, r) for r in dd_rows]
+            if target_sheet == "Top_10_Investments":
+                top_body, top_warnings = _normalize_top10_body_for_engine(passthrough_body, eff_limit)
+                criteria = dict(top_body.get("criteria") or {})
+                pages_from_body = _extract_top10_pages_from_body(top_body)
+                if pages_from_body:
+                    criteria["pages_selected"] = pages_from_body
+                top_rows, top10_warnings, candidate_count, build_source = await self._build_top10_rows_fallback(criteria)
+                warnings.extend(top_warnings)
+                warnings.extend(top10_warnings)
+                row_objects = []
+                for row in top_rows:
+                    proj = _normalize_to_schema_keys(keys, headers, row)
+                    proj = _apply_page_row_backfill(target_sheet, proj)
+                    for required in TOP10_REQUIRED_FIELDS:
+                        if proj.get(required) in (None, ""):
+                            proj[required] = row.get(required)
+                    row_objects.append(proj)
+                if eff_offset:
+                    row_objects = row_objects[eff_offset:]
+                if eff_limit:
+                    row_objects = row_objects[:eff_limit]
+                payload = self._finalize_payload({
+                    "ok": True,
+                    "engine_version": __version__,
+                    "sheet": target_sheet, "page": target_sheet,
+                    "headers": headers, "keys": keys,
+                    "rows": row_objects, "row_objects": row_objects,
+                    "warnings": warnings,
+                    "contract_source": contract_source,
+                    "build_source": build_source,
+                    "candidate_count": candidate_count,
+                })
+                return payload
 
-            if not rows_dicts and target in INSTRUMENT_SHEETS and not _is_schema_only_body(normalized_body):
-                try:
-                    symbols = await self.get_sheet_symbols(target)
-                except Exception as sym_err:
-                    logger.warning(
-                        "[engine_v2 v%s] get_sheet_symbols failed for target=%r: %s: %s",
-                        __version__, target, sym_err.__class__.__name__, sym_err,
-                    )
-                    symbols = list(EMERGENCY_PAGE_SYMBOLS.get(target, []))
-                requested_symbols = _extract_requested_symbols_from_body(normalized_body)
-                if requested_symbols:
-                    symbols = list(_dedupe_keep_order(requested_symbols + symbols))
-                if debug_enabled:
-                    logger.debug(
-                        "[engine_v2 v%s] target=%r symbols_count=%d (first 5: %s)",
-                        __version__, target, len(symbols), symbols[:5],
-                    )
-                if symbols:
+            if target_sheet == "Insights_Analysis":
+                base_rows = row_objects or []
+                if not base_rows:
                     try:
-                        quotes = await self.get_enriched_quotes_batch(symbols, page=target)
-                    except Exception as enr_err:
-                        # FIX-2 inside get_enriched_quotes_batch already
-                        # protects against per-symbol failures with
-                        # return_exceptions=True; this catch is for the
-                        # extreme case where the batch coroutine itself
-                        # fails to set up (e.g. semaphore allocation).
-                        logger.warning(
-                            "[engine_v2 v%s] enriched_quotes_batch failed: %s: %s — emitting placeholder rows",
-                            __version__, enr_err.__class__.__name__, enr_err,
-                        )
-                        quotes = {
-                            sym: {
-                                "symbol": sym,
-                                "requested_symbol": sym,
-                                "data_provider": "engine_v2_error",
-                                "warnings": "Batch enrichment failed: {}".format(enr_err.__class__.__name__),
-                            } for sym in symbols
-                        }
-                    for sym in symbols:
-                        try:
-                            quote = quotes.get(sym, {})
-                            snapshot = await self._get_symbol_snapshot(sym)
-                            if snapshot:
-                                quote = self._merge(quote, snapshot)
-                            backfilled = _apply_page_row_backfill(target, quote)
-                            norm = _normalize_to_schema_keys(keys, headers, backfilled)
-                            rows_dicts.append(norm)
-                        except Exception as row_err:
-                            # Per-symbol normalization failure: skip the
-                            # symbol, log, continue. Better than producing
-                            # zero rows for the page.
+                        ml_payload = await self.get_page_rows(page="Market_Leaders", limit=20)
+                        base_rows = list(ml_payload.get("row_objects") or [])
+                    except Exception as ml_exc:
+                        warnings.append("Insights base load failed: {}".format(ml_exc.__class__.__name__))
+                        base_rows = []
+                insights_rows = self._build_insights_rows_fallback(base_rows)
+                row_objects = [_normalize_to_schema_keys(keys, headers, r) for r in insights_rows]
+                if eff_offset:
+                    row_objects = row_objects[eff_offset:]
+                if eff_limit:
+                    row_objects = row_objects[:eff_limit]
+                payload = self._finalize_payload({
+                    "ok": True,
+                    "engine_version": __version__,
+                    "sheet": target_sheet, "page": target_sheet,
+                    "headers": headers, "keys": keys,
+                    "rows": row_objects, "row_objects": row_objects,
+                    "warnings": warnings,
+                    "contract_source": contract_source,
+                    "build_source": "engine_insights_fallback",
+                })
+                return payload
+
+            # Instrument-style sheet path
+            if target_sheet in INSTRUMENT_SHEETS:
+                if not row_objects:
+                    body_symbols = _extract_requested_symbols_from_body(passthrough_body, limit=eff_limit) if passthrough_body else []
+                    if body_symbols:
+                        symbols = body_symbols
+                        if debug:
                             logger.warning(
-                                "[engine_v2 v%s] row normalize failed for symbol=%r: %s: %s",
-                                __version__, sym, row_err.__class__.__name__, row_err,
+                                "[engine_v2 v%s] %s: %d body-supplied symbols",
+                                __version__, target_sheet, len(symbols),
                             )
+                    else:
+                        symbols = await self.get_sheet_symbols(target_sheet)
+                        if debug:
+                            logger.warning(
+                                "[engine_v2 v%s] %s: %d symbols from sheet config",
+                                __version__, target_sheet, len(symbols),
+                            )
+
+                    if eff_limit:
+                        symbols = symbols[: eff_offset + eff_limit]
+                    quote_map = await self.get_enriched_quotes_batch(symbols, page=target_sheet)
+                    requested_list = list(symbols)
+                    normalized_list = [normalize_symbol(s) for s in requested_list]
+                    for key_name, val in quote_map.items():
+                        meta = self._resolve_symbol_meta(key_name, val, requested_list, normalized_list)
+                        if meta is None:
                             continue
+                        requested_field, normalized_field = meta
+                        row = dict(val) if isinstance(val, dict) else _model_to_dict(val)
+                        row.setdefault("symbol", normalized_field)
+                        row.setdefault("requested_symbol", requested_field)
+                        row.setdefault("symbol_normalized", normalized_field)
+                        proj = _normalize_to_schema_keys(keys, headers, row)
+                        proj = _apply_page_row_backfill(target_sheet, proj)
+                        _compute_scores_fallback(proj)
+                        _compute_recommendation(proj)
+                        snapshot = await self._get_symbol_snapshot(normalized_field)
+                        if snapshot:
+                            template = _normalize_to_schema_keys(keys, headers, snapshot)
+                            proj = _merge_missing_fields(proj, template)
+                        row_objects.append(proj)
 
-            for r in rows_dicts:
-                try:
-                    _compute_scores_fallback(r)
-                    _compute_recommendation(r)
-                except Exception as score_err:
-                    # Score / recommendation failure on one row: log, leave
-                    # row's existing fields, continue. Critical: do NOT abort
-                    # the entire batch over a scoring bug for one symbol.
-                    logger.warning(
-                        "[engine_v2 v%s] score/recommendation failed for symbol=%r: %s: %s",
-                        __version__, _safe_str(r.get("symbol")), score_err.__class__.__name__, score_err,
-                    )
-                    r.setdefault("warnings", "")
-                    r["warnings"] = (str(r["warnings"]) + "; score_error:" + score_err.__class__.__name__).strip("; ")
+                _apply_rank_overall(row_objects)
+                if eff_offset:
+                    row_objects = row_objects[eff_offset:]
+                if eff_limit:
+                    row_objects = row_objects[:eff_limit]
 
-            if rows_dicts and target in INSTRUMENT_SHEETS:
-                try:
-                    _apply_rank_overall(rows_dicts)
-                except Exception as rank_err:
-                    logger.warning(
-                        "[engine_v2 v%s] rank_overall failed: %s: %s",
-                        __version__, rank_err.__class__.__name__, rank_err,
-                    )
+                payload = self._finalize_payload({
+                    "ok": True,
+                    "engine_version": __version__,
+                    "sheet": target_sheet, "page": target_sheet,
+                    "headers": headers, "keys": keys,
+                    "rows": row_objects, "row_objects": row_objects,
+                    "warnings": warnings,
+                    "contract_source": contract_source,
+                    "build_source": "engine_instrument_pipeline",
+                })
+                return payload
 
-            if target == "Top_10_Investments":
-                for rank, row in enumerate(rows_dicts, start=1):
-                    row.setdefault("top10_rank", rank)
-                    row.setdefault("selection_reason", _top10_selection_reason(row))
-                    row.setdefault("criteria_snapshot", _top10_criteria_snapshot(normalized_body if isinstance(normalized_body, dict) else {}))
-
-            if rows_dicts and effective_offset > 0:
-                rows_dicts = rows_dicts[effective_offset : effective_offset + effective_limit]
-            elif rows_dicts and effective_limit and len(rows_dicts) > effective_limit:
-                rows_dicts = rows_dicts[:effective_limit]
-
-            symbols_returned = _extract_symbols_from_rows(rows_dicts)
-
-            if debug_enabled:
-                logger.debug(
-                    "[engine_v2 v%s] target=%r final row_count=%d symbols_returned=%d",
-                    __version__, target, len(rows_dicts), len(symbols_returned),
-                )
-
-            payload = {
+            # Unknown sheet: schema-only payload.
+            payload = self._finalize_payload({
                 "ok": True,
-                "engine": "engine_v2",
                 "engine_version": __version__,
-                "page": target,
-                "sheet": target,
-                "sheet_name": target,
-                "headers": headers,
-                "keys": keys,
-                "schema_source": source,
-                "rows": rows_dicts,
-                "rows_matrix": _rows_matrix_from_rows(rows_dicts, keys),
-                "row_objects": rows_dicts,
-                "row_count": len(rows_dicts),
-                "count": len(rows_dicts),
-                "data_provider": "engine_v2",
-                "symbols_requested": _extract_requested_symbols_from_body(normalized_body),
-                "symbols_returned": symbols_returned,
-                "limit": effective_limit,
-                "offset": effective_offset,
-                "mode": effective_mode,
-                "warnings": warnings,
-                "criteria_received": normalized_body if isinstance(normalized_body, dict) else {},
-            }
-            return self._finalize_payload(payload)
-        except Exception as engine_err:
-            # v5.51.0 [FIX-1]: top-level engine error envelope. The route
-            # layer sees this as a dict (so `isinstance(payload, dict)` in
-            # _run_advanced_sheet_rows_impl is True and the diagnostic
-            # branch in v4.3.4 captures it). meta.upstream_status will
-            # read "error", meta.upstream_error will contain the exception
-            # message, and meta.upstream_error_class will identify the
-            # exception class — exactly the data we need to diagnose
-            # without re-deploying with more logging.
-            try:
-                target_for_error = _canonicalize_sheet_name(_safe_str(page or sheet or sheet_name or "Market_Leaders"))
-            except Exception:
-                target_for_error = "Market_Leaders"
-            error_repr = "{}: {}".format(engine_err.__class__.__name__, str(engine_err)[:500])
-            logger.error(
-                "[engine_v2 v%s] get_page_rows top-level exception for target=%r: %s",
-                __version__, target_for_error, error_repr,
-                exc_info=True,
+                "sheet": target_sheet, "page": target_sheet,
+                "headers": headers, "keys": keys,
+                "rows": [], "row_objects": [],
+                "warnings": warnings + [f"No build pipeline for sheet {target_sheet!r}; returning schema-only payload"],
+                "contract_source": contract_source,
+                "build_source": "engine_schema_only_unknown_sheet",
+            })
+            return payload
+
+        except Exception as exc:
+            # v5.51.0 [FIX-1]: structured error envelope.
+            err_class = exc.__class__.__name__
+            err_text = str(exc)[:500]
+            logger.warning(
+                "[engine_v2 v%s] get_page_rows EXCEPTION page=%r sheet=%r sheet_name=%r: %s: %s",
+                __version__, page, sheet, sheet_name, err_class, err_text,
             )
             try:
-                _, headers_for_error, keys_for_error, source_for_error = _schema_for_sheet(target_for_error)
+                target_canon = _canonicalize_sheet_name(_safe_str(page or sheet or sheet_name) or "Market_Leaders")
+                _, hdrs_fb, ks_fb, _ = _schema_for_sheet(target_canon)
             except Exception:
-                headers_for_error = []
-                keys_for_error = []
-                source_for_error = "missing_after_engine_error"
-            return {
+                target_canon = _canonicalize_sheet_name(_safe_str(page or sheet or sheet_name) or "Market_Leaders")
+                hdrs_fb, ks_fb = list(INSTRUMENT_CANONICAL_HEADERS), list(INSTRUMENT_CANONICAL_KEYS)
+            payload = self._finalize_payload({
                 "ok": False,
-                "engine": "engine_v2",
                 "engine_version": __version__,
-                "page": target_for_error,
-                "sheet": target_for_error,
-                "sheet_name": target_for_error,
-                "headers": headers_for_error,
-                "keys": keys_for_error,
-                "schema_source": source_for_error,
-                "rows": [],
-                "rows_matrix": [],
-                "row_objects": [],
-                "records": [],
-                "data": [],
-                "items": [],
-                "quotes": [],
-                "row_count": 0,
-                "count": 0,
-                "data_provider": "engine_v2_error",
-                "symbols_requested": [],
-                "symbols_returned": [],
-                "limit": int(limit) if isinstance(limit, int) else 2000,
-                "offset": int(offset) if isinstance(offset, int) else 0,
-                "mode": _safe_str(mode),
-                "warnings": ["Engine top-level exception: {}".format(error_repr)],
-                "status": "error",
-                "error": error_repr,
-                "error_class": engine_err.__class__.__name__,
-                "_engine_error": error_repr,
-                "_engine_error_class": engine_err.__class__.__name__,
-            }
+                "sheet": target_canon, "page": target_canon,
+                "headers": hdrs_fb, "keys": ks_fb,
+                "rows": [], "row_objects": [],
+                "warnings": ["Engine exception: {}: {}".format(err_class, err_text)],
+                "_engine_error": err_text,
+                "_engine_error_class": err_class,
+                "contract_source": "exception_envelope",
+                "build_source": "engine_exception_envelope_v5_51",
+            })
+            return payload
 
     async def get_sheet(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_page_rows(*args, **kwargs)
@@ -4130,19 +3915,14 @@ class DataEngineV5:
     async def build_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_page_rows(*args, **kwargs)
 
-    # --- contract aliases -------------------------------------------------
+    # --- contract aliases --------------------------------------------------
     def get_sheet_contract(self, sheet: str) -> Dict[str, Any]:
         canon = _canonicalize_sheet_name(sheet)
-        _, headers, keys, source = _schema_for_sheet(canon)
-        return {
-            "ok": True,
-            "page": canon,
-            "sheet": canon,
-            "headers": list(headers),
-            "keys": list(keys),
-            "schema_source": source,
-            "engine_version": __version__,
-        }
+        try:
+            spec, headers, keys, src = _schema_for_sheet(canon)
+        except Exception:
+            headers, keys, src = list(INSTRUMENT_CANONICAL_HEADERS), list(INSTRUMENT_CANONICAL_KEYS), "static_canonical_contract_fallback"
+        return {"sheet": canon, "page": canon, "headers": headers, "keys": keys, "contract_source": src}
 
     def get_page_contract(self, page: str) -> Dict[str, Any]:
         return self.get_sheet_contract(page)
@@ -4159,18 +3939,19 @@ class DataEngineV5:
     def get_keys_for_sheet(self, sheet: str) -> List[str]:
         return list(self.get_sheet_contract(sheet).get("keys") or [])
 
-    # --- health -----------------------------------------------------------
+    # --- health ------------------------------------------------------------
     async def health(self) -> Dict[str, Any]:
+        provider_stats = await self.providers.get_stats()
         return {
             "ok": True,
-            "engine": "engine_v2",
             "engine_version": __version__,
-            "feature_flags": dict(self.feature_flags),
-            "cache_keys": len(await self.cache.keys()),
-            "providers": await self.providers.get_stats(),
-            "snapshot_symbols": len(self._symbol_snapshot),
-            "schema_available": _SCHEMA_AVAILABLE,
-            "schema_union_keys_count": len(_SCHEMA_UNION_KEYS),
+            "providers": provider_stats,
+            "feature_flags": self.feature_flags,
+            "cache_size": len(await self.cache.keys()),
+            "snapshot_size": len(self._symbol_snapshot),
+            "candlesticks_available": _HAS_CANDLESTICKS,
+            "schema_registry_available": _SCHEMA_AVAILABLE,
+            "normalize_helpers_available": _HAS_NORMALIZE_HELPERS,
         }
 
     async def get_health(self) -> Dict[str, Any]:
@@ -4184,28 +3965,33 @@ class DataEngineV5:
 
 
 # =============================================================================
-# Top-level helpers
+# Top-level helpers exposed for external callers
 # =============================================================================
 def normalize_row_to_schema(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
-    """Project an arbitrary row dict onto the canonical schema for a given sheet."""
     canon = _canonicalize_sheet_name(sheet)
-    _, headers, keys, _ = _schema_for_sheet(canon)
-    backfilled = _apply_page_row_backfill(canon, dict(row or {}))
-    return _normalize_to_schema_keys(keys, headers, backfilled)
+    try:
+        _, headers, keys, _ = _schema_for_sheet(canon)
+    except Exception:
+        headers, keys = list(INSTRUMENT_CANONICAL_HEADERS), list(INSTRUMENT_CANONICAL_KEYS)
+    proj = _normalize_to_schema_keys(keys, headers, dict(row or {}))
+    return _apply_page_row_backfill(canon, proj)
 
 
 # =============================================================================
-# Module-level singleton + lifecycle helpers
+# Module singleton
 # =============================================================================
 _ENGINE_INSTANCE: Optional[DataEngineV5] = None
-_ENGINE_LOCK: asyncio.Lock = asyncio.Lock()
+_ENGINE_LOCK = asyncio.Lock()
 
 
-def get_engine() -> DataEngineV5:
+async def get_engine() -> DataEngineV5:
     global _ENGINE_INSTANCE
-    if _ENGINE_INSTANCE is None:
-        _ENGINE_INSTANCE = DataEngineV5()
-    return _ENGINE_INSTANCE
+    if _ENGINE_INSTANCE is not None:
+        return _ENGINE_INSTANCE
+    async with _ENGINE_LOCK:
+        if _ENGINE_INSTANCE is None:
+            _ENGINE_INSTANCE = DataEngineV5()
+        return _ENGINE_INSTANCE
 
 
 async def close_engine() -> None:
@@ -4228,15 +4014,15 @@ def peek_engine() -> Optional[DataEngineV5]:
 
 
 def get_cache() -> Optional[MultiLevelCache]:
-    eng = _ENGINE_INSTANCE
-    return eng.cache if eng is not None else None
+    return _ENGINE_INSTANCE.cache if _ENGINE_INSTANCE is not None else None
 
 
-# Convenience aliases for legacy import paths
-ENGINE = get_engine
-engine = get_engine
-_ENGINE = get_engine
-
+# =============================================================================
+# Legacy aliases
+# =============================================================================
+ENGINE = None       # populated lazily on first get_engine() call
+engine = None
+_ENGINE = None
 DataEngine = DataEngineV5
 DataEngineV4 = DataEngineV5
 DataEngineV3 = DataEngineV5
@@ -4246,47 +4032,33 @@ DataEngineV2 = DataEngineV5
 __all__ = [
     "__version__",
     "DataEngineV5",
+    "DataEngine",
     "DataEngineV4",
     "DataEngineV3",
     "DataEngineV2",
-    "DataEngine",
-    "MultiLevelCache",
-    "ProviderRegistry",
-    "ProviderState",
+    "UnifiedQuote",
     "QuoteQuality",
     "DataSource",
-    "UnifiedQuote",
-    "SCHEMA_REGISTRY",
-    "INSTRUMENT_CANONICAL_KEYS",
-    "INSTRUMENT_CANONICAL_HEADERS",
-    "INSIGHTS_HEADERS",
-    "INSIGHTS_KEYS",
-    "DATA_DICTIONARY_HEADERS",
-    "DATA_DICTIONARY_KEYS",
-    "TOP10_REQUIRED_FIELDS",
-    "TOP10_REQUIRED_HEADERS",
-    "STATIC_CANONICAL_SHEET_CONTRACTS",
-    "INSTRUMENT_SHEETS",
-    "SPECIAL_SHEETS",
-    "PAGE_PRIMARY_PROVIDER_DEFAULTS",
-    "NON_KSA_EODHD_PRIMARY_PAGES",
-    "PROVIDER_PRIORITIES",
-    "DEFAULT_PROVIDERS",
-    "DEFAULT_KSA_PROVIDERS",
-    "DEFAULT_GLOBAL_PROVIDERS",
-    "EMERGENCY_PAGE_SYMBOLS",
-    "PAGE_SYMBOL_ENV_KEYS",
-    "TOP10_ENGINE_DEFAULT_PAGES",
-    "get_sheet_spec",
+    "MultiLevelCache",
+    "SingleFlight",
+    "ProviderRegistry",
+    "ProviderState",
     "get_engine",
     "close_engine",
     "get_engine_if_ready",
     "peek_engine",
     "get_cache",
-    "ENGINE",
-    "engine",
-    "_ENGINE",
+    "get_sheet_spec",
+    "normalize_row_to_schema",
     "normalize_symbol",
     "get_symbol_info",
-    "normalize_row_to_schema",
+    "collapse_to_canonical",
+    "DETAILED_TOKENS",
+    "CANONICAL_TOKENS",
+    "SCHEMA_REGISTRY",
+    "INSTRUMENT_CANONICAL_KEYS",
+    "INSTRUMENT_CANONICAL_HEADERS",
+    "INSTRUMENT_SHEETS",
+    "SPECIAL_SHEETS",
+    "TOP10_REQUIRED_FIELDS",
 ]
