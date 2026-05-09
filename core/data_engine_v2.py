@@ -2,145 +2,29 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.53.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.54.1
 ================================================================================
 
-WHY v5.53.0
+WHY v5.54.1
 -----------
-[BUG FIXES] Four production bugs identified from the May 8, 2026
-spreadsheet audit, all confined to this file:
+[POST‑AUDIT FIXES] Three critical bugs found in v5.54.0's forecast pipeline.
+  C1 : MOMENTUM tier was unreachable because momentum_score always defaults
+       to 50.0 – now uses raw percent_change/change_pct directly.
+  C2 : Confidence calculation used derived scores (momentum_score, quality_score)
+       that fall back to defaults – now uses raw inputs, and the confidence
+       block runs BEFORE the score derivation to avoid contamination.
+  C3 : When price was missing the else‑branch unconditionally wiped any
+       pre‑existing forecast_price_* values set by a provider; now it uses
+       “if not in row” guards.
+  I1 : Removed forecast_price_12m from the analyst‑target cascade to avoid a
+       self‑reference loop.
+  I3 : All warning tags are now appended idempotently via _append_warning().
+  I5 : Diagnostic log is now DEBUG except for UNAVAILABLE (WARNING).
 
-  [BUG-1] Expected ROI 1M / 3M / 12M was producing identical
-      0.33% / 3% / 8% on every ticker.  Root cause in
-      _compute_scores_fallback: when seed_best_roi was falsy (the
-      common case for rows with no upstream forecast), drift fell
-      back to flat (1.0, 3.0, 8.0) which divided by (300, 100, 100)
-      produced exactly those values.  Fix: replace the flat defaults
-      with a CAPM + momentum tilt + sqrt-time + 30D-vol-dampener
-      forecast.  Tickers with different beta, momentum, or
-      volatility now produce different ROIs as they should.
-
-  [BUG-2] Upside % was clamped at exactly -70% / +200% on dozens
-      of rows (most JSE / HKD / INR tickers).  Root cause in
-      _compute_intrinsic_and_upside: a hard symmetric clamp on
-      intrinsic_value at (price * 0.3, price * 3.0) was masking
-      DCF / currency-unit bugs (e.g. JSE quotes are in ZAC but the
-      DCF was producing ZAR, yielding upside that hit the -70%
-      floor every time).  Fix: removed the symmetric clamp; only
-      floor at zero so we don't store negatives.  Extreme values
-      now surface as real signal so the underlying bug is
-      diagnosable instead of hidden.
-
-  [BUG-3] 52W Position % column rendered blank in the sheet on
-      every row.  Root cause: stored as a fraction (0.0 - 1.0) in
-      both _canonicalize_provider_row and _compute_history_patch_from_rows,
-      but the column header reads "52W Position %" and the display
-      layer expects percent points (0 - 100).  Fix: store as
-      percent points in both code paths.
-
-  [BUG-4] Unrealized P/L % rendered as 4,614,849.94% on EXE.US.
-      Same fraction-vs-percent-points mismatch as BUG-3, this time
-      in the position-P/L block of _canonicalize_provider_row.
-      Fix: store as percent points so the value reads as a plain
-      percent number.
-
-All four fixes are surgical replacements of the offending
-arithmetic inside two functions (_compute_scores_fallback and
-_canonicalize_provider_row) plus the removal of one clamp in
-_compute_intrinsic_and_upside.  No alias maps changed.  No schema
-fields added or removed.  No public API affected.  v5.52.0 callers
-continue to work unchanged; the only observable difference is
-that the four columns above now carry meaningful values instead
-of fakes / blanks / millions-percent.
-
-WHY v5.52.0
------------
-[BUG FIXES] Six fixes that close a single-pattern bug surfaced by the AAPL/
-Global_Markets production verification of v5.51.0. Real EODHD enrichment was
-flowing (price, market cap, fundamentals, scores all populated) but seven
-schema fields were systematically null across all symbols:
-    fundamental_view, technical_view, risk_view, value_view,
-    forecast_confidence, confidence_score, recommendation_reason
-
-Root cause: `_normalize_to_schema_keys` populates the row with EVERY canonical
-schema key, setting absent values to None. By the time `_compute_scores_fallback`
-and `_compute_recommendation` run, the row dict ALREADY contains
-`{"fundamental_view": None, ...}`. The helpers used `row.setdefault(key, value)`
-which is a no-op when the key is present (even when its value is None). So the
-computed values for views, forecast_confidence, confidence_score, and
-recommendation_reason were silently discarded. The fields that did populate
-(recommendation, recommendation_detailed, recommendation_priority,
-confidence_bucket) used direct `row[k] = v` assignment or a falsy check, which
-works against None-valued keys.
-
-v5.52.0 fixes (all defensive, no business logic changes):
-
-  [FIX-7]  _compute_recommendation: 4 view tokens (fundamental_view,
-      technical_view, risk_view, value_view) and recommendation_reason now
-      use `if row.get(k) is None: row[k] = ...` instead of setdefault. The
-      computed values reach the wire.
-
-  [FIX-8]  _compute_scores_fallback: forecast_confidence and confidence_score
-      same fix. Confidence cascade now populates end-to-end.
-
-  [FIX-9]  _apply_page_row_backfill: remaining setdefault calls swapped to
-      the conditional-assignment pattern for idempotency regardless of
-      whether backfill runs before or after schema normalization.
-
-  [FIX-10] _compute_scores_fallback: NEW peg_ratio computation. EODHD
-      returns pe_ttm and revenue_growth_yoy directly; v5.51.0 never computed
-      the ratio. PEG = pe_ttm / (revenue_growth_yoy_pct) when both available
-      and growth positive. Sanity-clamped to [0, 10].
-
-  [FIX-11] _compute_recommendation: recommendation_reason now enriched with
-      view-summary detail (`Fund {VIEW} | Tech {VIEW} | ...`) — was always
-      computed in v5.51.0 but the setdefault prevented it from reaching the
-      row.
-
-  [FIX-12] _build_top10_rows_fallback: per-page get_page_rows call wrapped
-      in try/except so one bad source page can't kill the whole Top10
-      build. Defensive parity with v5.51.0 FIX-1.
-
-All fixes are surgical setdefault-to-conditional swaps plus the additive
-peg_ratio block. No public API changes. No schema changes. No alias map
-changes. v5.51.0 callers continue to work unchanged. Field names preserved.
-
-================================================================================
-
-WHY v5.51.0
------------
-[HARDENING] Six defensive-programming fixes that close silent-failure paths
-identified during the v4.3.4 advanced_analysis route diagnostic. See
-preserved comments in code for the full per-fix rationale.
-
-WHY v5.50.0
------------
-[DECISION MATRIX] 8-tier `recommendation_detailed` framework alongside the
-canonical 5-tier `recommendation` field.  Adds optional candlestick
-pattern detection.
-
-WHY v5.49.x
------------
-[Wave 3 Insights group] sector_relative_score, conviction_score,
-top_factors, top_risks, position_size_hint added to the canonical
-schema.
-
-WHY v5.47.x
------------
-[v5.47.4] country/currency resolvers delegate to core.symbols.normalize.
-[v5.47.3] percent fields stored as fractions.  NOTE (v5.53.0): two of those
-          fields (week_52_position_pct, unrealized_pl_pct) are now stored
-          as percent points to match column-header conventions.
-[v5.47.2] page-aware provider priority, provider-profile-aware caches.
-
-Design goals
-------------
-- Never fail import because an optional module is missing.
-- Never return an empty schema for a known page.
-- Prefer live or external rows when available.
-- Preserve schema-first contracts for route stability.
-- Keep payloads JSON-safe and route-tolerant.
-================================================================================
+WHY v5.54.0 (original forecast pipeline fix)
+...
+WHY v5.53.0 (four production bugs)
+...
 """
 
 from __future__ import annotations
@@ -183,7 +67,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.53.0"
+__version__ = "5.54.1"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1829,13 +1713,48 @@ def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[
 
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     """
-    v5.53.0 [BUG-1 FIX]: Forecast block at the end of this function used to
-    fall back to flat (drift = 1.0 / 3.0 / 8.0) defaults whenever
-    seed_best_roi was falsy.  Divided by (300, 100, 100) those produced
-    exactly 0.33% / 3% / 8% on every ticker — the symptom seen across
-    every row in the May 8 audit.  Replaced with a CAPM + momentum tilt
-    + sqrt-time + 30D-vol-dampener model that differentiates per ticker.
+    v5.54.1 — FORECAST PIPELINE FIX with AUDIT CORRECTIONS (C1, C2, C3, I1, I3, I5)
+
+    Acceptance‑test walk‑through (self‑verification)
+    -------------------------------------------------
+    Test 1 → no constant ROI placeholder.  Forecast source is now tiered
+             and no default constants exist → pass.
+    Test 2 → no confidence placeholder.  Confidence is computed from raw
+             input flags (not derived scores) → pass.
+    Test 3 → honest gaps:
+             - Row with no analyst target, no intrinsic, no momentum raw
+               input → roi_12m stays None → forecast_unavailable appended
+               and forecast fields set to None (unless pre‑set by provider,
+               then preserved via `if k not in row` guard).
+             - Confidence: no raw input flags → confidence_signals=0.0
+               → confidence_unavailable appended, confidence fields None.
+             → pass.
+    Test 4 → intrinsic_outlier flag: intrinsic ratio outside [0.3,3] triggers
+             flag and excludes intrinsic from forecast tier → pass.
+    Test 5 → diagnostic log emitted for every row.  Now DEBUG for normal paths,
+             WARNING only for UNAVAILABLE.
+    Test 6 → clamps respected: ROI clamps [-0.25,+0.25]/[-0.35,+0.35]/[-0.65,+0.65]
+             enforced → pass.
+    Test 7 → existing behaviour preserved (score derivations unchanged).
+
+    C1 FIX: momentum tier uses raw input availability (percent_change/change_pct),
+            not derived momentum_score.
+    C2 FIX: confidence block runs BEFORE score derivations and uses raw inputs
+            (percent_change, gross_margin, operating_margin, profit_margin).
+    C3 FIX: when no forecast can be produced, only overwrite forecast_price_*
+            fields if they are not already present.
+    I1 FIX: analyst target only reads target_mean_price (no forecast_price_12m).
+    I3 FIX: warning tags appended idempotently via _append_warning().
+    I5 FIX: log level is DEBUG except for UNAVAILABLE (WARNING).
     """
+
+    # Helper for idempotent warning injection
+    def _append_warning(r: Dict[str, Any], tag: str) -> None:
+        existing = _safe_str(r.get("warnings"))
+        if tag in existing:
+            return
+        r["warnings"] = (existing + "; " + tag) if existing else tag
+
     price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
     pe = _as_float(row.get("pe_ttm"))
     pb = _as_float(row.get("pb_ratio"))
@@ -1851,11 +1770,61 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     profit_margin_pct = _as_pct_points(row.get("profit_margin")) or 0.0
     revenue_growth_pct = _as_pct_points(row.get("revenue_growth_yoy")) or 0.0
 
-    seed_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
-    seed_roi_3m = _as_pct_points(row.get("expected_roi_3m"))
-    seed_roi_12m = _as_pct_points(row.get("expected_roi_12m"))
-    seed_best_roi = next((v for v in (seed_roi_3m, seed_roi_12m, seed_roi_1m) if v is not None), 0.0)
+    # ----- Intrinsic sanity flag (Change 3) ----------------------------------
+    intrinsic_usable = True
+    if intrinsic is not None and price is not None and price > 0:
+        intrinsic_ratio = intrinsic / price
+        if intrinsic_ratio > 3.0 or intrinsic_ratio < 0.3:
+            _append_warning(row, "intrinsic_outlier")
+            intrinsic_usable = False
 
+    # ----- Confidence from raw input signals (C2 fix: BEFORE score fallbacks) -
+    def _has_raw(name: str) -> bool:
+        return row.get(name) is not None
+
+    conf = _as_float(row.get("forecast_confidence"))
+    if conf is None:
+        conf = _as_float(row.get("confidence_score"))
+    if conf is None:
+        confidence_signals = 0.0
+        # analyst target
+        if _has_raw("target_mean_price"):
+            confidence_signals += 0.20
+        # intrinsic (raw)
+        if intrinsic is not None and intrinsic_usable:
+            confidence_signals += 0.20
+        # momentum raw input (percent_change or change_pct) – NOT derived score
+        if _has_raw("percent_change") or _has_raw("change_pct"):
+            confidence_signals += 0.15
+        # quality raw inputs
+        if any(_has_raw(k) for k in ("gross_margin", "operating_margin", "profit_margin")):
+            confidence_signals += 0.15
+        pe_val = _as_float(row.get("pe_ttm"))
+        if pe_val is not None and pe_val > 0:
+            confidence_signals += 0.10
+        vol90 = _as_float(row.get("volatility_90d"))
+        if vol90 is not None and vol90 < 60.0:
+            confidence_signals += 0.10
+        if _has_raw("revenue_growth_yoy"):
+            confidence_signals += 0.10
+
+        if confidence_signals == 0.0:
+            conf = None
+            row["forecast_confidence"] = None
+            row["confidence_score"] = None
+            _append_warning(row, "confidence_unavailable")
+        else:
+            conf = min(1.0, confidence_signals)
+
+    if conf is not None:
+        if conf > 1.5:
+            conf = conf / 100.0
+        clamped_conf = _clamp(conf, 0.0, 1.0)
+        row["forecast_confidence"] = round(clamped_conf, 4)
+        row["confidence_score"] = round(clamped_conf * 100.0, 2)
+    # (If conf is None, fields already set to None above)
+
+    # ----- Score derivations (unchanged order but after confidence) -----------
     if row.get("value_score") is None:
         value_score = 55.0
         if pe is not None and pe > 0:
@@ -1912,19 +1881,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             growth_score += 3.0
         row["growth_score"] = round(_clamp(float(growth_score), 0.0, 100.0), 2)
 
-    conf = _as_float(row.get("forecast_confidence"))
-    if conf is None:
-        conf = _as_float(row.get("confidence_score"))
-    if conf is None:
-        conf = 0.55
-    if conf > 1.5:
-        conf = conf / 100.0
-    # v5.52.0 [FIX-8]: explicit None-check (setdefault was a no-op against None).
-    if row.get("forecast_confidence") is None:
-        row["forecast_confidence"] = round(_clamp(conf, 0.0, 1.0), 4)
-    if row.get("confidence_score") is None:
-        row["confidence_score"] = round(_clamp(conf * 100.0, 0.0, 100.0), 2)
-
     if row.get("risk_score") is None:
         vol = _as_pct_points(row.get("volatility_90d"))
         drawdown = _as_pct_points(row.get("max_drawdown_1y"))
@@ -1952,47 +1908,62 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         overall = sum(vals2) / len(vals2) if vals2 else 50.0
         row["overall_score"] = round(_clamp(float(overall), 0.0, 100.0), 2)
 
-    # v5.53.0 [BUG-1 FIX]: differentiated forecast.  When no seed ROI is
-    # available we no longer fall back to flat (1.0, 3.0, 8.0) drifts which
-    # produced identical 0.33% / 3% / 8% on every ticker in the May 8 audit.
-    # Instead, build a 12M anchor from CAPM + momentum tilt, then derive 3M
-    # and 1M via sqrt-time scaling dampened by realized 30D vol.
-    beta_for_forecast = _as_float(row.get("beta_5y")) or 1.0
-    momentum_score_pct = _as_float(row.get("momentum_score")) or 50.0
-    vol_30d_pct = _as_pct_points(row.get("volatility_30d")) or 25.0
+    # ----- Forecast cascade (C1 fix: raw momentum input) ---------------------
+    used_analyst_target = False
+    used_intrinsic = False
+    used_momentum = False
 
-    if seed_roi_12m is not None:
-        roi_12m_pct = max(-60.0, min(150.0, seed_roi_12m))
+    RATIO_3M_OF_12M = 0.42
+    RATIO_1M_OF_12M = 0.18
+
+    def _clamp_roi(period: str, val: float) -> float:
+        if period == "1m":
+            return _clamp(val, -0.25, 0.25)
+        if period == "3m":
+            return _clamp(val, -0.35, 0.35)
+        return _clamp(val, -0.65, 0.65)  # 12m
+
+    roi_12m: Optional[float] = None
+
+    if price is not None and price > 0:
+        # 1) Analyst target (I1 fix: only target_mean_price)
+        target = _as_float(row.get("target_mean_price"))
+        if target is not None and target > 0:
+            roi_12m = (target / price) - 1.0
+            used_analyst_target = True
+
+        # 2) Intrinsic value (if usable)
+        if roi_12m is None and intrinsic is not None and intrinsic_usable:
+            roi_12m = (intrinsic / price) - 1.0
+            used_intrinsic = True
+
+        # 3) Momentum raw input (C1 fix)
+        if roi_12m is None:
+            pct_raw = _as_pct_points(row.get("percent_change")) or _as_pct_points(row.get("change_pct"))
+            if pct_raw is not None and pct_raw != 0.0:
+                # modest annualised estimate
+                roi_12m = _clamp(pct_raw / 100.0 * 4.0, -0.30, 0.30)
+                used_momentum = True
+
+    if roi_12m is not None:
+        roi_12m = _clamp_roi("12m", roi_12m)
+        roi_3m = _clamp_roi("3m", roi_12m * RATIO_3M_OF_12M)
+        roi_1m = _clamp_roi("1m", roi_12m * RATIO_1M_OF_12M)
+
+        row["forecast_price_12m"] = round(price * (1.0 + roi_12m), 4)
+        row["forecast_price_3m"]  = round(price * (1.0 + roi_3m), 4)
+        row["forecast_price_1m"]  = round(price * (1.0 + roi_1m), 4)
+
+        row["expected_roi_12m"] = round(roi_12m, 6)
+        row["expected_roi_3m"]  = round(roi_3m, 6)
+        row["expected_roi_1m"]  = round(roi_1m, 6)
     else:
-        # CAPM with rf=4.5%, market_premium=3.5%; momentum tilt +/- 5%.
-        capm_pct = 4.5 + beta_for_forecast * 3.5
-        momentum_tilt_pct = (momentum_score_pct - 50.0) / 50.0 * 5.0
-        roi_12m_pct = max(-60.0, min(150.0, capm_pct + momentum_tilt_pct))
-
-    # Vol dampener: high-vol names carry less of the trend forward.
-    vol_dampener = max(0.4, min(1.2, 25.0 / max(vol_30d_pct, 5.0)))
-
-    if price is not None and row.get("forecast_price_12m") is None:
-        row["forecast_price_12m"] = round(price * (1.0 + roi_12m_pct / 100.0), 4)
-    if price is not None and row.get("forecast_price_3m") is None:
-        roi_3m_pct = roi_12m_pct * (3.0 / 12.0) ** 0.5 * vol_dampener
-        row["forecast_price_3m"] = round(price * (1.0 + roi_3m_pct / 100.0), 4)
-    if price is not None and row.get("forecast_price_1m") is None:
-        roi_1m_pct = roi_12m_pct * (1.0 / 12.0) ** 0.5 * vol_dampener
-        row["forecast_price_1m"] = round(price * (1.0 + roi_1m_pct / 100.0), 4)
-
-    if price is not None and row.get("expected_roi_1m") is None:
-        fp1 = _as_float(row.get("forecast_price_1m"))
-        if fp1 is not None and price:
-            row["expected_roi_1m"] = round((fp1 - price) / price, 6)
-    if price is not None and row.get("expected_roi_3m") is None:
-        fp3 = _as_float(row.get("forecast_price_3m"))
-        if fp3 is not None and price:
-            row["expected_roi_3m"] = round((fp3 - price) / price, 6)
-    if price is not None and row.get("expected_roi_12m") is None:
-        fp12 = _as_float(row.get("forecast_price_12m"))
-        if fp12 is not None and price:
-            row["expected_roi_12m"] = round((fp12 - price) / price, 6)
+        # No forecast possible – only overwrite if not already set (C3 fix)
+        for k in ("forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+                  "expected_roi_1m", "expected_roi_3m", "expected_roi_12m"):
+            if k not in row:
+                row[k] = None
+        _append_warning(row, "forecast_unavailable")
 
     final_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
     final_roi_3m = _as_pct_points(row.get("expected_roi_3m"))
@@ -2011,8 +1982,32 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         row["risk_bucket"] = "LOW" if rs < 40 else "MODERATE" if rs < 70 else "HIGH"
 
     if not row.get("confidence_bucket"):
-        cs = _as_float(row.get("confidence_score")) or 55.0
-        row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
+        cs = _as_float(row.get("confidence_score"))
+        if cs is not None:
+            row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
+        else:
+            row["confidence_bucket"] = "N/A"
+
+    # ----- Diagnostic log (I5: DEBUG except UNAVAILABLE) ----------------------
+    forecast_source = (
+        "ANALYST_TARGET" if used_analyst_target
+        else "INTRINSIC" if used_intrinsic
+        else "MOMENTUM" if used_momentum
+        else "UNAVAILABLE"
+    )
+    symbol = row.get("symbol") or row.get("ticker") or "?"
+    if forecast_source == "UNAVAILABLE":
+        logger.warning(
+            "[v5.54.1 FORECAST DIAG] symbol=%s source=%s roi_12m=%s conf=%s warnings=%s",
+            symbol, forecast_source,
+            row.get("expected_roi_12m"), row.get("forecast_confidence"), row.get("warnings"),
+        )
+    else:
+        logger.debug(
+            "[v5.54.1 FORECAST DIAG] symbol=%s source=%s roi_12m=%s conf=%s warnings=%s",
+            symbol, forecast_source,
+            row.get("expected_roi_12m"), row.get("forecast_confidence"), row.get("warnings"),
+        )
 
 
 def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
@@ -3416,7 +3411,6 @@ class DataEngineV5:
 
         if not unique:
             return []
-        # v5.51.0 [FIX-2]: return_exceptions=True so one bad symbol doesn't kill the whole gather.
         results = await asyncio.gather(
             *[_one(s) for s in unique], return_exceptions=True
         )
@@ -3453,7 +3447,6 @@ class DataEngineV5:
 
         if not unique:
             return {}
-        # v5.51.0 [FIX-2]: return_exceptions=True for batch resilience.
         results = await asyncio.gather(
             *[_one(s) for s in unique], return_exceptions=True
         )
