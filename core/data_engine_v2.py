@@ -193,7 +193,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.55.1"
+__version__ = "5.56.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -239,7 +239,7 @@ _FALLBACK_COUNTRY_BY_SUFFIX: Dict[str, str] = {
     ".NYSE": "United States", ".OQ": "United States",
     ".L": "United Kingdom", ".LSE": "United Kingdom", ".LN": "United Kingdom",
     ".DE": "Germany", ".F": "Germany", ".BE": "Germany",
-    ".XETRA": "Germany", ".XETR": "Germany", ".ETR": "Germany",
+    ".XETRA": "Germany", ".XETR": "Germany", ".ETR": "Germany", ".EU": "European Union",
     ".PA": "France", ".FP": "France",
     ".SW": "Switzerland", ".VX": "Switzerland",
     ".AS": "Netherlands", ".BR": "Belgium", ".MC": "Spain",
@@ -268,7 +268,7 @@ _FALLBACK_CURRENCY_BY_SUFFIX: Dict[str, str] = {
     ".US": "USD", ".N": "USD", ".NASDAQ": "USD", ".NYSE": "USD", ".OQ": "USD",
     ".L": "GBP", ".LSE": "GBP", ".LN": "GBP",
     ".DE": "EUR", ".F": "EUR", ".BE": "EUR",
-    ".XETRA": "EUR", ".XETR": "EUR", ".ETR": "EUR",
+    ".XETRA": "EUR", ".XETR": "EUR", ".ETR": "EUR", ".EU": "EUR",
     ".PA": "EUR", ".FP": "EUR",
     ".AS": "EUR", ".BR": "EUR", ".MC": "EUR",
     ".MI": "EUR", ".IM": "EUR", ".AT": "EUR", ".VI": "EUR", ".IR": "EUR",
@@ -445,6 +445,8 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "invest_period_label", "position_qty", "avg_cost", "position_cost",
     "position_value", "unrealized_pl", "unrealized_pl_pct", "data_provider",
     "last_updated_utc", "last_updated_riyadh", "warnings",
+    "data_quality", "forecast_unavailable", "data_completeness_pct",
+    "missing_critical_fields", "data_sources",
     "sector_relative_score", "conviction_score", "top_factors", "top_risks",
     "position_size_hint",
     "recommendation_detailed", "recommendation_priority",
@@ -474,6 +476,8 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Position Qty", "Avg Cost", "Position Cost", "Position Value",
     "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    "Data Quality", "Forecast Unavailable", "Data Completeness %",
+    "Missing Critical Fields", "Data Sources",
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
     "Position Size Hint",
     "Recommendation Detail", "Reco Priority",
@@ -604,10 +608,36 @@ def _safe_int(x: Any, default: int = 0, lo: Optional[int] = None, hi: Optional[i
 
 
 def _as_float(x: Any) -> Optional[float]:
+    """Robust numeric coercion for provider values and already-formatted sheet values."""
     try:
         if x is None or x == "":
             return None
-        v = float(x)
+        if isinstance(x, bool):
+            return float(int(x))
+        if isinstance(x, (int, float)):
+            v = float(x)
+        else:
+            s = str(x).strip()
+            if not s or s.lower() in _NULL_STRINGS:
+                return None
+            neg = False
+            if s.startswith("(") and s.endswith(")"):
+                neg = True
+                s = s[1:-1]
+            s = (s.replace(",", "")
+                   .replace("▲", "")
+                   .replace("▼", "-")
+                   .replace("%", "")
+                   .replace("SAR", "")
+                   .replace("USD", "")
+                   .replace("EUR", "")
+                   .strip())
+            s = re.sub(r"[^0-9eE+\-.]", "", s)
+            if not s or s in {"-", "+", "."}:
+                return None
+            v = float(s)
+            if neg:
+                v = -abs(v)
         if math.isnan(v) or math.isinf(v):
             return None
         return v
@@ -909,6 +939,287 @@ def _apply_revenue_collapse_haircut(
     return new_score, True
 
 
+
+
+# =============================================================================
+# v5.56.0 — completeness, richer merge, diagnostics, and decision fields
+# =============================================================================
+_CRITICAL_DATA_FIELDS: Tuple[str, ...] = (
+    "symbol", "name", "asset_class", "exchange", "currency", "country",
+    "sector", "industry", "current_price", "previous_close", "volume",
+    "market_cap", "pe_ttm", "eps_ttm", "revenue_ttm", "revenue_growth_yoy",
+    "gross_margin", "operating_margin", "profit_margin", "debt_to_equity",
+    "free_cash_flow_ttm", "week_52_high", "week_52_low", "rsi_14",
+    "volatility_30d", "volatility_90d", "intrinsic_value", "forecast_confidence",
+)
+
+_PLACEHOLDER_STRINGS: Set[str] = {
+    "", "-", "--", "n/a", "na", "none", "null", "nan", "unknown",
+    "unclassified", "not available", "no live provider data available",
+}
+
+
+def _is_placeholder_scalar(value: Any, *, symbol_hint: str = "") -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        s = value.strip()
+        if s.lower() in _PLACEHOLDER_STRINGS:
+            return True
+        if symbol_hint and s.upper() == symbol_hint.upper():
+            return True
+    if isinstance(value, (list, tuple, set, dict)) and not value:
+        return True
+    return False
+
+
+def _is_better_value(field: str, current: Any, candidate: Any, *, symbol_hint: str = "") -> bool:
+    if _is_placeholder_scalar(candidate, symbol_hint=symbol_hint):
+        return False
+    if _is_placeholder_scalar(current, symbol_hint=symbol_hint):
+        return True
+
+    # Numeric quality: prefer non-zero fundamentals/technicals over zero placeholders.
+    cand_num = _as_float(candidate)
+    cur_num = _as_float(current)
+    if field in {
+        "market_cap", "float_shares", "pe_ttm", "pe_forward", "eps_ttm",
+        "revenue_ttm", "gross_margin", "operating_margin", "profit_margin",
+        "debt_to_equity", "free_cash_flow_ttm", "week_52_high", "week_52_low",
+        "avg_volume_10d", "avg_volume_30d", "rsi_14", "volatility_30d", "volatility_90d",
+    }:
+        if cand_num is not None and cand_num != 0 and (cur_num is None or cur_num == 0):
+            return True
+        return False
+
+    # Replace generic inferred labels with provider labels.
+    if field in {"name", "sector", "industry", "exchange", "country", "currency", "asset_class"}:
+        cur = _safe_str(current).upper()
+        cand = _safe_str(candidate).upper()
+        generic = {"NASDAQ/NYSE", "EQUITY", "UNITED STATES", "GLOBAL", "LISTED EQUITIES", "SAUDI MARKET"}
+        if cur in generic and cand and cand not in generic:
+            return True
+        if symbol_hint and cur == symbol_hint.upper() and cand != symbol_hint.upper():
+            return True
+
+    return False
+
+
+def _merge_richer_row(base: Dict[str, Any], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge provider patches by filling blanks and replacing clear placeholders."""
+    if not isinstance(patch, dict):
+        return dict(base or {})
+    out = dict(base or {})
+    symbol_hint = normalize_symbol(_safe_str(out.get("symbol") or patch.get("symbol") or patch.get("requested_symbol")))
+    for k, v in patch.items():
+        if v is None or v == "":
+            continue
+        if k == "warnings":
+            existing = _safe_str(out.get("warnings"))
+            incoming = _safe_str(v)
+            if incoming and incoming not in existing:
+                out["warnings"] = (existing + "; " + incoming) if existing else incoming
+            continue
+        if k == "data_sources":
+            existing_sources = out.get("data_sources")
+            if not isinstance(existing_sources, list):
+                existing_sources = _split_symbols(existing_sources) if existing_sources else []
+            incoming_sources = v if isinstance(v, list) else _split_symbols(v)
+            out["data_sources"] = list(_dedupe_keep_order(list(existing_sources) + list(incoming_sources)))
+            continue
+        if _is_better_value(k, out.get(k), v, symbol_hint=symbol_hint):
+            out[k] = v
+        elif out.get(k) in (None, "", [], {}):
+            out[k] = v
+    return out
+
+
+def _row_completeness_pct(row: Dict[str, Any]) -> Tuple[float, List[str]]:
+    missing: List[str] = []
+    available = 0
+    for field in _CRITICAL_DATA_FIELDS:
+        value = row.get(field)
+        if field in {"sector", "industry"} and _safe_str(value).upper() in {"UNKNOWN", "UNCLASSIFIED"}:
+            missing.append(field)
+            continue
+        if _is_placeholder_scalar(value, symbol_hint=_safe_str(row.get("symbol"))):
+            missing.append(field)
+        else:
+            available += 1
+    pct = (available / len(_CRITICAL_DATA_FIELDS)) * 100.0 if _CRITICAL_DATA_FIELDS else 0.0
+    return round(pct, 2), missing
+
+
+def _recompute_price_change_fields(row: Dict[str, Any]) -> None:
+    """Use price and previous_close as source of truth to avoid 0.96% becoming 96%."""
+    price = _as_float(row.get("current_price") or row.get("price"))
+    prev = _as_float(row.get("previous_close"))
+    if price is None or prev is None or prev == 0:
+        pct = _as_float(row.get("percent_change"))
+        if pct is not None and abs(pct) > 1.5:
+            row["percent_change"] = round(pct / 100.0, 8)
+        return
+    change = price - prev
+    row["price_change"] = round(change, 6)
+    row["percent_change"] = round(change / prev, 8)
+
+
+def _needs_history_patch(row: Dict[str, Any]) -> bool:
+    return any(row.get(k) in (None, "", [], {}) for k in (
+        "week_52_high", "week_52_low", "rsi_14", "volatility_30d",
+        "volatility_90d", "max_drawdown_1y", "var_95_1d",
+        "avg_volume_10d", "avg_volume_30d",
+    ))
+
+
+def _provider_row_rich_enough(row: Dict[str, Any]) -> bool:
+    pct, missing = _row_completeness_pct(row)
+    has_price = _as_float(row.get("current_price")) is not None
+    has_identity = bool(_safe_str(row.get("name"))) and bool(_safe_str(row.get("exchange")))
+    has_some_fundamentals = any(row.get(k) not in (None, "", [], {}) for k in (
+        "sector", "industry", "market_cap", "pe_ttm", "eps_ttm", "revenue_ttm",
+        "gross_margin", "profit_margin",
+    ))
+    return has_price and has_identity and has_some_fundamentals and pct >= 60.0 and not _needs_history_patch(row)
+
+
+def _apply_classification_fallbacks(row: Dict[str, Any]) -> None:
+    sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
+    if not sym:
+        return
+    if row.get("sector") in (None, ""):
+        inferred = _infer_sector_from_symbol(sym)
+        row["sector"] = inferred or "Unknown"
+        if not inferred:
+            _append_warning_tag(row, "sector_missing_from_provider")
+    if row.get("industry") in (None, ""):
+        inferred = _infer_industry_from_symbol(sym)
+        row["industry"] = inferred or "Unknown"
+        if not inferred:
+            _append_warning_tag(row, "industry_missing_from_provider")
+
+
+def _apply_completeness_diagnostics(row: Dict[str, Any]) -> None:
+    pct, missing = _row_completeness_pct(row)
+    row["data_completeness_pct"] = pct
+    row["missing_critical_fields"] = ",".join(missing[:20])
+    if row.get("data_quality") in (None, ""):
+        if pct >= 75:
+            row["data_quality"] = "GOOD"
+        elif pct >= 45:
+            row["data_quality"] = "PARTIAL"
+        else:
+            row["data_quality"] = "SPARSE"
+    if pct < 45:
+        _append_warning_tag(row, "sparse_provider_data")
+
+
+def _apply_candlestick_defaults(row: Dict[str, Any]) -> None:
+    if row.get("candlestick_pattern") in (None, ""):
+        row["candlestick_pattern"] = "No clear pattern"
+    if row.get("candlestick_signal") in (None, ""):
+        row["candlestick_signal"] = "NEUTRAL"
+    if row.get("candlestick_strength") in (None, ""):
+        row["candlestick_strength"] = 0
+    if row.get("candlestick_confidence") in (None, ""):
+        row["candlestick_confidence"] = 0
+    if row.get("candlestick_patterns_recent") in (None, ""):
+        row["candlestick_patterns_recent"] = "None"
+
+
+def _build_top_factors_and_risks(row: Dict[str, Any]) -> Tuple[str, str]:
+    factors: List[str] = []
+    risks: List[str] = []
+    overall = _as_float(row.get("overall_score"))
+    quality = _as_float(row.get("quality_score"))
+    value = _as_float(row.get("value_score"))
+    momentum = _as_float(row.get("momentum_score"))
+    growth = _as_float(row.get("growth_score"))
+    confidence = _as_float(row.get("confidence_score"))
+    risk = _as_float(row.get("risk_score"))
+    upside = _as_pct_points(row.get("upside_pct"))
+    revenue_growth = _as_pct_points(row.get("revenue_growth_yoy"))
+    debt = _as_float(row.get("debt_to_equity"))
+    completeness = _as_float(row.get("data_completeness_pct"))
+
+    if overall is not None and overall >= 70:
+        factors.append("High overall score")
+    if quality is not None and quality >= 65:
+        factors.append("Solid quality")
+    if value is not None and value >= 65:
+        factors.append("Attractive valuation")
+    if momentum is not None and momentum >= 65:
+        factors.append("Positive momentum")
+    if growth is not None and growth >= 60:
+        factors.append("Growth support")
+    if upside is not None and upside >= 10:
+        factors.append("Positive upside")
+    if confidence is not None and confidence >= 70:
+        factors.append("High confidence")
+
+    if risk is not None and risk >= 70:
+        risks.append("High risk score")
+    if confidence is None or confidence < 45:
+        risks.append("Low confidence")
+    if completeness is not None and completeness < 55:
+        risks.append("Sparse provider data")
+    if revenue_growth is not None and revenue_growth < -20:
+        risks.append("Revenue decline")
+    if debt is not None and debt > 2.5:
+        risks.append("High leverage")
+    if _safe_bool(row.get("forecast_unavailable")):
+        risks.append("Forecast unavailable")
+    if "HTTP 403" in _safe_str(row.get("warnings")):
+        risks.append("Provider access issue")
+
+    if not factors:
+        factors.append("Limited positive signals")
+    if not risks:
+        risks.append("No major model risk flagged")
+    return "; ".join(_dedupe_keep_order(factors[:5])), "; ".join(_dedupe_keep_order(risks[:5]))
+
+
+def _apply_enhanced_decision_fields(row: Dict[str, Any]) -> None:
+    _apply_classification_fallbacks(row)
+    _apply_completeness_diagnostics(row)
+
+    overall = _as_float(row.get("overall_score")) or 50.0
+    opportunity = _as_float(row.get("opportunity_score")) or overall
+    confidence = _as_float(row.get("confidence_score")) or 50.0
+    risk = _as_float(row.get("risk_score")) or 50.0
+    completeness = _as_float(row.get("data_completeness_pct")) or 0.0
+
+    if row.get("sector_relative_score") in (None, ""):
+        # Proxy until a true peer/sector benchmark is available.
+        row["sector_relative_score"] = round(_clamp((overall * 0.60) + (opportunity * 0.40), 0.0, 100.0), 2)
+
+    if row.get("conviction_score") in (None, ""):
+        conviction = (overall * 0.35) + (opportunity * 0.25) + (confidence * 0.25) + (completeness * 0.15) - max(0.0, risk - 60.0) * 0.20
+        row["conviction_score"] = round(_clamp(conviction, 0.0, 100.0), 2)
+
+    factors, risks = _build_top_factors_and_risks(row)
+    if row.get("top_factors") in (None, ""):
+        row["top_factors"] = factors
+    if row.get("top_risks") in (None, ""):
+        row["top_risks"] = risks
+
+    if row.get("position_size_hint") in (None, ""):
+        reco = _safe_str(row.get("recommendation")).upper()
+        conv = _as_float(row.get("conviction_score")) or 0.0
+        if reco in {"SELL", "REDUCE"} or _safe_bool(row.get("forecast_unavailable")):
+            hint = "Avoid / reduce"
+        elif reco == "STRONG_BUY" and conv >= 75 and risk <= 55:
+            hint = "Core 3-5%"
+        elif reco == "BUY" and conv >= 60 and risk <= 70:
+            hint = "Moderate 2-3%"
+        elif reco == "HOLD":
+            hint = "Hold / watchlist"
+        else:
+            hint = "Small 1-2%"
+        row["position_size_hint"] = hint
+
+    _apply_candlestick_defaults(row)
+
 # =============================================================================
 # v5.55.1 — GAP-3: Provider geo mis-attribution corrector (NEW)
 # =============================================================================
@@ -987,11 +1298,12 @@ def _correct_provider_geo_misattribution(row: Dict[str, Any]) -> Dict[str, Any]:
     # dual listings) legitimately trade in USD; we keep those by checking
     # that the country-override also fired (i.e., the geo profile is
     # internally inconsistent on the provider's side).
+    geo_profile_is_wrong = ("country" in overridden_fields) or (current_country.upper() == _safe_str(expected_country).upper())
     if (
         expected_currency
         and expected_currency.upper() != "USD"
         and current_currency.upper() == "USD"
-        and "country" in overridden_fields
+        and geo_profile_is_wrong
     ):
         row["currency"] = expected_currency
         overridden_fields.append("currency")
@@ -999,14 +1311,14 @@ def _correct_provider_geo_misattribution(row: Dict[str, Any]) -> Dict[str, Any]:
     # Exchange override: only fire when provider value is a US-exchange
     # fragment AND we already overrode country (geo-internally consistent).
     if (
-        "country" in overridden_fields
+        geo_profile_is_wrong
         and any(frag in current_exchange.upper() for frag in _US_EXCHANGE_FRAGMENTS)
     ):
         # Map suffix to a presentable exchange code. Strip leading dot.
         suffix_code = suffix[1:] if suffix.startswith(".") else suffix
         # Prefer well-known names where the suffix is opaque.
         suffix_to_exchange_name = {
-            "XETRA": "XETRA", "XETR": "XETRA", "ETR": "XETRA",
+            "XETRA": "XETRA", "XETR": "XETRA", "ETR": "XETRA", "EU": "Europe",
             "DE": "XETRA", "F": "Frankfurt", "BE": "Berlin",
             "PA": "Euronext Paris", "FP": "Euronext Paris",
             "AS": "Euronext Amsterdam", "BR": "Euronext Brussels",
@@ -1741,8 +2053,8 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "value_view": ("value_view", "valueView"),
     "recommendation": ("recommendation", "rating", "action", "reco", "consensus"),
     "recommendation_reason": ("recommendation_reason", "reason", "summary", "thesis", "analysis"),
-    "recommendation_detailed": ("recommendation_detailed", "reco_detailed", "recommendation_full", "recommendation_8tier", "detailed_recommendation"),
-    "recommendation_priority": ("recommendation_priority", "reco_priority", "priority", "decision_priority"),
+    "recommendation_detailed": ("recommendation_detailed", "recommendation_detail", "Recommendation Detail", "reco_detailed", "recommendation_full", "recommendation_8tier", "detailed_recommendation"),
+    "recommendation_priority": ("recommendation_priority", "reco_priority", "Reco Priority", "priority", "decision_priority"),
     "candlestick_pattern": ("candlestick_pattern", "candle_pattern", "pattern", "candlestickPattern"),
     "candlestick_signal": ("candlestick_signal", "candle_signal", "candlestickSignal"),
     "candlestick_strength": ("candlestick_strength", "candle_strength", "candlestickStrength"),
@@ -1760,6 +2072,16 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "last_updated_utc": ("last_updated_utc", "lastUpdated", "updatedAt", "timestamp", "asOf"),
     "last_updated_riyadh": ("last_updated_riyadh",),
     "warnings": ("warnings", "warning", "messages", "errors"),
+    "data_quality": ("data_quality", "dataQuality", "quality", "Data Quality"),
+    "forecast_unavailable": ("forecast_unavailable", "forecastUnavailable", "Forecast Unavailable"),
+    "data_completeness_pct": ("data_completeness_pct", "dataCompletenessPct", "Data Completeness %"),
+    "missing_critical_fields": ("missing_critical_fields", "missingCriticalFields", "Missing Critical Fields"),
+    "data_sources": ("data_sources", "sources", "Data Sources"),
+    "sector_relative_score": ("sector_relative_score", "sectorRelativeScore", "Sector-Adj Score"),
+    "conviction_score": ("conviction_score", "convictionScore", "Conviction Score"),
+    "top_factors": ("top_factors", "topFactors", "Top Factors"),
+    "top_risks": ("top_risks", "topRisks", "Top Risks"),
+    "position_size_hint": ("position_size_hint", "positionSizeHint", "Position Size Hint"),
 }
 
 _COMMODITY_SYMBOL_HINTS: Tuple[str, ...] = ("GC=F", "SI=F", "BZ=F", "CL=F", "NG=F", "HG=F")
@@ -2151,6 +2473,10 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         out["unrealized_pl_pct"] = round(upl / pos_cost * 100.0, 4)
 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
+
+    # v5.56.0: make price/previous_close the source of truth for day change.
+    # This prevents provider percent points like 0.96 from being read as 96%.
+    _recompute_price_change_fields(out)
 
     # v5.55.0 AUDIT-1: subunit-currency normalization (LSE/JSE/TASE).
     # Run AFTER provider field mapping so we have current_price + the
@@ -2743,9 +3069,7 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
-    """Decision Matrix v5.50.0 classifier — populates recommendation,
-    recommendation_detailed, recommendation_priority, recommendation_reason,
-    and the four view columns."""
+    """Decision Matrix v5.56.0 classifier and always-on detail filler."""
     _compute_intrinsic_and_upside(row)
 
     fund_view, tech_view, risk_view, value_view = _derive_views(row)
@@ -2758,27 +3082,35 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     if row.get("value_view") is None:
         row["value_view"] = value_view
 
-    if row.get("recommendation"):
-        return
-
     overall = _as_float(row.get("overall_score")) or 50.0
     conf = _as_float(row.get("confidence_score")) or 55.0
     risk = _as_float(row.get("risk_score")) or 50.0
 
     detailed, priority, rule_label = _classify_8tier(overall, conf, risk)
-    canonical = _RECOMMENDATION_COLLAPSE_MAP.get(detailed, "HOLD")
+    canonical_from_model = _RECOMMENDATION_COLLAPSE_MAP.get(detailed, "HOLD")
 
-    row["recommendation_detailed"] = detailed
-    row["recommendation_priority"] = priority
-    row["recommendation"] = canonical
-    if row.get("recommendation_reason") is None:
+    existing_reco = _safe_str(row.get("recommendation")).upper()
+    if existing_reco:
+        row["recommendation"] = _RECOMMENDATION_COLLAPSE_MAP.get(existing_reco, existing_reco if existing_reco in CANONICAL_TOKENS else canonical_from_model)
+    else:
+        row["recommendation"] = canonical_from_model
+
+    if row.get("recommendation_detailed") in (None, ""):
+        row["recommendation_detailed"] = detailed
+    if row.get("recommendation_priority") in (None, ""):
+        row["recommendation_priority"] = priority
+    if row.get("recommendation_reason") in (None, ""):
         row["recommendation_reason"] = (
-            "P{0} {1} [{2}]: Fund {3} | Tech {4} | Risk {5} | Val {6} \u2192 {7}".format(
-                priority, rule_label, detailed,
-                fund_view, tech_view, risk_view, value_view, canonical,
+            "P{0} {1} [{2}]: Fund {3} | Tech {4} | Risk {5} | Val {6} → {7}".format(
+                row.get("recommendation_priority") or priority,
+                rule_label,
+                row.get("recommendation_detailed") or detailed,
+                fund_view, tech_view, risk_view, value_view,
+                row.get("recommendation") or canonical_from_model,
             )
         )
 
+    _apply_enhanced_decision_fields(row)
 
 def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
     scored: List[Tuple[int, float]] = []
@@ -3119,6 +3451,22 @@ class ProviderRegistry:
         self._modules_cache: Dict[str, Any] = {}
         self._cooldown_seconds: float = float(_get_env_float("ENGINE_PROVIDER_COOLDOWN_SECONDS", 60.0))
         self._failure_threshold: int = int(_get_env_int("ENGINE_PROVIDER_FAILURE_THRESHOLD", 3))
+
+    async def is_available(self, name: str) -> bool:
+        async with self._lock:
+            state = self._states.get(name)
+            if state is None:
+                return True
+            if state.healthy:
+                return True
+            if state.cooldown_until and state.cooldown_until <= time.time():
+                state.healthy = True
+                state.failures = 0
+                state.last_error = ""
+                state.cooldown_until = 0.0
+                self._states[name] = state
+                return True
+            return False
 
     async def get_provider(self, name: str) -> Any:
         async with self._lock:
@@ -3532,7 +3880,7 @@ class DataEngineV5:
         canon = _canonicalize_sheet_name(sheet)
         for source in (self._call_symbols_reader, self._get_symbols_from_env, self._get_symbols_from_settings, self._get_symbols_from_page_catalog):
             try:
-                if source is self._call_symbols_reader:
+                if getattr(source, "__name__", "") == "_call_symbols_reader":
                     res = await self._call_symbols_reader(canon)
                     raw = _split_symbols(res) if res is not None else []
                     syms = _normalize_symbol_list(raw)
@@ -3606,6 +3954,8 @@ class DataEngineV5:
 
     # --- single quote pipeline --------------------------------------------
     async def _fetch_patch(self, provider_name: str, symbol: str) -> Optional[Dict[str, Any]]:
+        if not await self.providers.is_available(provider_name):
+            return None
         provider_mod = await self.providers.get_provider(provider_name)
         if provider_mod is None:
             return None
@@ -3779,8 +4129,29 @@ class DataEngineV5:
             if std_60 is not None:
                 out["volatility_90d"] = round(std_60 * math.sqrt(252) * 100.0, 4)
 
+        vols = [r.get("volume") for r in rows if r.get("volume") is not None]
+        if len(vols) >= 10:
+            out["avg_volume_10d"] = round(sum(vols[-10:]) / 10.0, 4)
+        if len(vols) >= 30:
+            out["avg_volume_30d"] = round(sum(vols[-30:]) / 30.0, 4)
+
+        if len(closes) >= 15:
+            gains: List[float] = []
+            losses: List[float] = []
+            for i in range(-14, 0):
+                diff = closes[i] - closes[i - 1]
+                gains.append(max(diff, 0.0))
+                losses.append(abs(min(diff, 0.0)))
+            avg_gain = sum(gains) / 14.0
+            avg_loss = sum(losses) / 14.0
+            if avg_loss == 0:
+                out["rsi_14"] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                out["rsi_14"] = round(100.0 - (100.0 / (1.0 + rs)), 4)
+
         if len(closes) >= 14:
-            window = closes[-14:]
+            window = closes[-252:] if len(closes) >= 252 else closes
             running_max = window[0]
             max_dd = 0.0
             for c in window:
@@ -3791,6 +4162,17 @@ class DataEngineV5:
                     if dd < max_dd:
                         max_dd = dd
             out["max_drawdown_1y"] = max_dd
+
+        if len(closes) >= 60:
+            daily_returns = [
+                (closes[i] - closes[i - 1]) / closes[i - 1]
+                for i in range(1, len(closes)) if closes[i - 1] not in (None, 0)
+            ]
+            if daily_returns:
+                avg_ret = self._safe_mean(daily_returns) or 0.0
+                std_ret = self._safe_std(daily_returns)
+                if std_ret is not None and std_ret > 0:
+                    out["sharpe_1y"] = round((avg_ret / std_ret) * math.sqrt(252), 4)
         if len(closes) >= 60:
             returns_60 = [
                 (closes[i] - closes[i - 1]) / closes[i - 1] for i in range(-59, 0) if closes[i - 1] not in (None, 0)
@@ -3828,15 +4210,7 @@ class DataEngineV5:
 
     @staticmethod
     def _merge(base: Dict[str, Any], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        if not isinstance(patch, dict):
-            return base
-        out = dict(base)
-        for k, v in patch.items():
-            if v is None or v == "":
-                continue
-            if out.get(k) in (None, "", [], {}):
-                out[k] = v
-        return out
+        return _merge_richer_row(base, patch)
 
     @staticmethod
     def _data_quality(row: Dict[str, Any]) -> str:
@@ -3893,8 +4267,24 @@ class DataEngineV5:
                             )
                         row = self._merge(row, canon_patch)
                         sources.append(provider)
-                        if row.get("current_price") not in (None, "") and row.get("name") not in (None, ""):
+                        if _provider_row_rich_enough(row):
                             break
+
+            # v5.56.0: even when a quote provider supplies price, enrich with
+            # chart/history if technical fields are still missing.
+            if row.get("current_price") not in (None, "") and _needs_history_patch(row):
+                hp = await self._get_history_patch_best_effort(normalized)
+                if hp:
+                    try:
+                        canon_patch = _canonicalize_provider_row(hp, requested_symbol=symbol, normalized_symbol=normalized, provider="history_or_chart")
+                    except Exception:
+                        canon_patch = dict(hp) if isinstance(hp, dict) else {}
+                        canon_patch.setdefault("symbol", normalized)
+                        canon_patch.setdefault("requested_symbol", symbol)
+                        canon_patch.setdefault("data_provider", "history_or_chart")
+                    row = self._merge(row, canon_patch)
+                    sources.append("history_or_chart")
+
             if row.get("current_price") in (None, ""):
                 hp = await self._get_history_patch_best_effort(normalized)
                 if hp:
@@ -3941,7 +4331,7 @@ class DataEngineV5:
                 except Exception:
                     pass
 
-            row["data_sources"] = sources
+            row["data_sources"] = list(_dedupe_keep_order(sources))
             if not row.get("data_provider") and sources:
                 row["data_provider"] = sources[0]
             row["quote_quality"] = self._data_quality(row)
@@ -3965,6 +4355,9 @@ class DataEngineV5:
                 unforecastable, reason = _detect_unforecastable_row(row)
                 if unforecastable:
                     _flag_row_unforecastable(row, reason)
+
+            _recompute_price_change_fields(row)
+            _apply_enhanced_decision_fields(row)
 
             return row
 
@@ -4200,7 +4593,8 @@ class DataEngineV5:
                     # v5.55.0 AUDIT-3 propagation: skip unforecastable rows
                     # from Top10 candidate pool. They can still appear on
                     # their source page but shouldn't dilute the Top10.
-                    if _safe_bool(row.get("forecast_unavailable")):
+                    warnings_text = _safe_str(row.get("warnings")).lower()
+                    if _safe_bool(row.get("forecast_unavailable")) or "forecast_unavailable" in warnings_text:
                         continue
                     seen.add(sym)
                     candidate_rows.append(dict(row))
