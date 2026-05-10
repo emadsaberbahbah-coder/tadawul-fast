@@ -2,8 +2,48 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.58.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.59.0
 ================================================================================
+
+WHY v5.59.0 — CLOSE TWO RUNTIME GAPS IN v5.58.0
+-----------------------------------------------
+Post-build runtime simulation against the May 10 2026 production sample
+revealed two logical gaps where v5.58.0's defenses were structurally
+present but did not fully achieve their stated intent:
+
+  GAP 1 — Phase E (now H) cleared intrinsic_value but not upside_pct.
+    When ETHE arrived with intrinsic=301.17 (ratio 16x price 18.78) AND
+    upstream-supplied upside_pct=+1503%, Phase E correctly suppressed
+    intrinsic_value but left the bogus upside_pct in place. The sheet
+    therefore still showed +1503% even after the unit-mismatch detection
+    fired.
+
+  GAP 2 — Phase D (now I) only validated synthesized upside_pct, not
+    upstream-supplied values. RNR.US arrived with upstream upside_pct=
+    +250% already set; Phase D's guard `row.get("upside_pct") is None`
+    short-circuited, letting the +250% value (well above the +200%
+    ceiling) pass through unchecked.
+
+v5.59.0 fixes:
+
+  H. (Phase E successor) hard-kill in _compute_scores_fallback now also
+     clears upside_pct when it suppresses intrinsic_value for
+     unit-mismatch reasons. One-line addition.
+
+  I. (Phase D successor) _compute_intrinsic_and_upside now revalidates
+     upstream-supplied upside_pct against the suspect bounds, not just
+     synthesized values. When existing upside_pct is already populated
+     and falls outside [-90%, +200%], suppress it AND clear
+     intrinsic_value, tagging "upside_synthesis_suspect".
+
+Expected post-deploy behavior:
+  - ETHE: intrinsic=None, upside_pct=None, tag intrinsic_unit_mismatch_suspected
+  - RNR.US: intrinsic=None, upside_pct=None, tag upside_synthesis_suspect
+
+[PRESERVED — strictly] All v5.58.0 phases A/B/C/F/G unchanged. Phases
+D and E renamed to I and H respectively to mark the v5.59.0 enhancement
+boundary; their logic now subsumes the original v5.58.0 behavior plus
+the gap closures.
 
 WHY v5.58.0 — DEFENSIVE CONSISTENCY HARDENING
 ----------------------------------------------
@@ -359,7 +399,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.58.0"
+__version__ = "5.59.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -2826,16 +2866,19 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     intrinsic_usable = True
     if intrinsic is not None and price is not None and price > 0:
         intrinsic_ratio = intrinsic / price
-        # v5.58.0 PHASE-E: hard-kill threshold for unit mismatches.
+        # v5.59.0 PHASE-H: hard-kill threshold for unit mismatches.
+        # (was Phase E in v5.58.0; v5.59.0 also clears upside_pct so
+        # an upstream-supplied bogus value cannot survive the pass.)
         # Above 10x (or below 1/100x) is almost certainly foreign-currency
-        # ADR fundamentals vs USD price. Suppress intrinsic_value entirely
-        # so downstream _compute_intrinsic_and_upside cannot re-derive
-        # upside from it. Tag distinct from "intrinsic_outlier" so audits
-        # can separate units bugs from genuinely-deep-value cases.
+        # ADR fundamentals vs USD price. Suppress intrinsic_value AND
+        # upside_pct so downstream code cannot re-derive or propagate
+        # either. Tag distinct from "intrinsic_outlier" so audits can
+        # separate units bugs from genuinely-deep-value cases.
         if (intrinsic_ratio > _INTRINSIC_UNIT_MISMATCH_RATIO_HIGH
                 or intrinsic_ratio < _INTRINSIC_UNIT_MISMATCH_RATIO_LOW):
             _append_warning(row, "intrinsic_unit_mismatch_suspected")
             row["intrinsic_value"] = None
+            row["upside_pct"] = None
             intrinsic = None
             intrinsic_usable = False
         elif intrinsic_ratio > 3.0 or intrinsic_ratio < 0.3:
@@ -3291,15 +3334,27 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
             row["upside_pct"] = None
             intrinsic = None
 
-    if intrinsic is not None and intrinsic > 0 and row.get("upside_pct") is None:
+    # v5.59.0 PHASE-I (was Phase D in v5.58.0): engine-level suspect-bound check.
+    # Mirrors scoring.py v5.2.4's _is_upside_suspect. Engine's upside_pct
+    # is what the sheet displays — scoring.py's filter operates on its
+    # own output, not on what reaches the sheet.
+    #
+    # v5.59.0 expands the check to ALSO validate upstream-supplied
+    # upside_pct values. Previously the guard `row.get("upside_pct") is None`
+    # short-circuited when the provider had already populated upside_pct,
+    # letting bogus values like RNR.US +250% pass through unchecked. Now:
+    #   (a) if upside_pct is None and intrinsic is set, compute and validate
+    #   (b) if upside_pct is already set (upstream), revalidate against bounds
+    #       and suppress if out of range
+    existing_upside = _as_float(row.get("upside_pct"))
+    if existing_upside is not None:
+        if (existing_upside < _UPSIDE_PCT_SUSPECT_FLOOR
+                or existing_upside > _UPSIDE_PCT_SUSPECT_CEILING):
+            _append_warning_tag(row, "upside_synthesis_suspect")
+            row["intrinsic_value"] = None
+            row["upside_pct"] = None
+    elif intrinsic is not None and intrinsic > 0:
         upside = (intrinsic - price) / price
-        # v5.58.0 PHASE-D: engine-level suspect-bound check.
-        # Mirrors scoring.py v5.2.4's _is_upside_suspect. Engine's
-        # upside_pct is what the sheet displays — scoring.py's filter
-        # operates on its own output, not on what reaches the sheet.
-        # When out of bounds, suppress upside_pct AND clear
-        # intrinsic_value so it does not propagate downstream into
-        # forecast_price_* via _compute_scores_fallback's intrinsic path.
         if (upside < _UPSIDE_PCT_SUSPECT_FLOOR
                 or upside > _UPSIDE_PCT_SUSPECT_CEILING):
             _append_warning_tag(row, "upside_synthesis_suspect")
