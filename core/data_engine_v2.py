@@ -2,29 +2,155 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.54.1
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.55.1
 ================================================================================
 
-WHY v5.54.1
------------
-[POST‑AUDIT FIXES] Three critical bugs found in v5.54.0's forecast pipeline.
-  C1 : MOMENTUM tier was unreachable because momentum_score always defaults
-       to 50.0 – now uses raw percent_change/change_pct directly.
-  C2 : Confidence calculation used derived scores (momentum_score, quality_score)
-       that fall back to defaults – now uses raw inputs, and the confidence
-       block runs BEFORE the score derivation to avoid contamination.
-  C3 : When price was missing the else‑branch unconditionally wiped any
-       pre‑existing forecast_price_* values set by a provider; now it uses
-       “if not in row” guards.
-  I1 : Removed forecast_price_12m from the analyst‑target cascade to avoid a
-       self‑reference loop.
-  I3 : All warning tags are now appended idempotently via _append_warning().
-  I5 : Diagnostic log is now DEBUG except for UNAVAILABLE (WARNING).
+WHY v5.55.1 — PRODUCTION-DATA VALIDATION FIXES (atop v5.55.0)
+--------------------------------------------------------------
+Live audit of the post-deploy Global_Markets sheet revealed three gaps in
+v5.55.0's coverage that needed targeted patches. v5.55.1 is purely additive
+and preserves every v5.55.0 helper, signature, and AUDIT-1..AUDIT-6 hook.
 
-WHY v5.54.0 (original forecast pipeline fix)
-...
-WHY v5.53.0 (four production bugs)
-...
+  GAP-1  SBK.JSE missed by 5% subunit threshold
+    Symptom : SBK.JSE upside_pct = -94.30% (intrinsic 1747.98 ZAR, price
+              30648 ZAC; ratio 5.7%, just above 5% threshold).
+    Fix     : Raise _SUBUNIT_DETECT_RATIO_THRESHOLD from 0.05 to 0.10.
+              All known production -85% to -99% LSE/JSE/TASE downside
+              cases observed have ratio < 6%; legitimate deep-value
+              stocks rarely trade above 10% of intrinsic.
+
+  GAP-2  Currency-aware skip needed for provider quirks
+    Symptom : SHEL.L returned by provider with currency="GBP" and
+              price=83.97 (i.e., already in the main unit, not pence).
+              v5.55.0's ratio-only detector could false-positive on
+              legitimate .L rows where price is in GBP.
+    Fix     : _normalize_subunit_currency_fields now skips when the row's
+              currency field equals the MAIN unit code (GBP/ZAR/ILS) for
+              that exchange. Only runs detection when currency is the
+              subunit code (GBX/ZAC/ILA) or unspecified.
+
+  GAP-3  XETRA / European stocks shown with Country=USA, Currency=USD
+    Symptom : BAS.XETRA, BMW.XETRA, MTX.XETRA, BEI.XETRA, BAYN.XETRA,
+              RHM.XETRA all showed Country="USA", Currency="USD",
+              Exchange="NYSE/NASDAQ" despite their symbol suffixes
+              clearly indicating Germany/XETRA. The provider was
+              mis-attributing these tickers as US.
+    Fix     : (a) Add .XETRA / .XETR / .EU / .ETR to country/currency
+              fallback tables. (b) NEW _correct_provider_geo_misattribution
+              helper — when a symbol's suffix authoritatively indicates a
+              non-US exchange but the provider returned US-attributed
+              country/currency/exchange, override with the suffix-derived
+              values. Tagged with "geo_misattribution_corrected:<fields>"
+              warning. Conservative: only fires when provider value is
+              specifically US AND suffix is in the recognized table.
+
+Diagnostic tags added in v5.55.1:
+    [v5.55.1 GEO-FIX]  — provider geo mis-attribution corrected
+
+[PRESERVED — strictly] All v5.55.0 / v5.54.1 / v5.54.0 / v5.53.0 helpers,
+signatures, behaviors, and AUDIT-1..AUDIT-6 hooks. v5.55.1 changes are
+additive (one new helper + new fallback entries + threshold tuning +
+currency-aware skip) plus the version bump.
+
+WHY v5.55.0 — AUDIT-DRIVEN DATA-QUALITY FIXES
+---------------------------------------------
+Production audit of the deployed Global_Markets sheet (1,707 rows × 46 cols)
+surfaced six structural data-quality defects that v5.54.1 did not address.
+The previous backend phases (scoring.py v5.2.3, scoring_engine.py v3.4.1)
+provided DOWNSTREAM containment; v5.55.0 fixes the UPSTREAM causes here in
+the orchestrator so bad data never reaches the scoring layer.
+
+  AUDIT-1  Currency-subunit mismatch (LSE/JSE/TASE phantom downside)
+    Symptom : AV.LSE -97.45%, STAN.LSE -99%, MTN.JSE -98.62%, POLI.TA -99%.
+    Cause   : current_price arrives in subunit (pence/cents/agorot) while
+              intrinsic_value and target_mean_price arrive in main unit
+              (GBP/ZAR/ILS). Pipeline treats them as same unit and computes
+              upside as if fair value were 1% of quoted price. The v5.53.0
+              note "removed symmetric clamp to avoid hiding currency-unit
+              bugs" explicitly anticipated this fix would land here.
+    Fix     : New _SUBUNIT_EXCHANGES table + _normalize_subunit_currency_fields
+              helper. Detection: field/price < 5% triggers a 100x conversion.
+              Called from _canonicalize_provider_row (provider path) AND
+              _compute_intrinsic_and_upside (synthesized path) so both
+              codepaths agree on units.
+
+  AUDIT-2  Zero market cap with valid shares + price (Kuwait, Egypt)
+    Symptom : OOREDOO.KW / HUMANSOFT.KW had market_cap=0 despite valid
+              prices and share counts. Yahoo and EODHD both occasionally
+              return 0 for these markets.
+    Fix     : New _synthesize_market_cap_if_zero helper. When market_cap
+              <= 0 but float_shares × current_price is in [1M, 10T],
+              backfill. Tagged "market_cap_synthesized_from_shares_and_price".
+
+  AUDIT-3  Placeholder forecasts on delisted / illiquid / stale rows
+    Symptom : LSI.US (delisted), EXPGF.US / BABWF.US / GMBXF.US (PINK
+              stale) received synthesized placeholder forecasts.
+              scoring.py v5.2.3 added an illiquid-skip path that honors
+              forecast_unavailable=True, but no one was setting that flag.
+    Fix     : New _detect_unforecastable_row + _flag_row_unforecastable.
+              Detection rules: data_quality already STALE/MISSING/ERROR
+              + no price; OR no price AND no market cap (delisted); OR
+              volume<1k + 0<market_cap<$1M (illiquid micro-cap). Sets
+              forecast_unavailable=True, data_quality=STALE/MISSING.
+
+  AUDIT-4  quality_score not revenue-collapse-aware
+    Symptom : KROS.US quality_score = 95 despite revenue YoY = -87%.
+              The fallback quality formula in _compute_scores_fallback
+              weighted margins / leverage independently of top-line
+              trajectory.
+    Fix     : New _apply_revenue_collapse_haircut. Multiplicative ramp:
+                -30% YoY -> 1.0x  (no penalty)
+                -50% YoY -> 0.80x
+                -75% YoY -> 0.55x (clamped floor)
+              Applied to quality_score after the standard formula but
+              before the 0-100 clamp. KROS-style cases drop 95 -> ~52.
+
+  AUDIT-5  Silent placeholder when all providers fail
+    Symptom : PRU.L (HTTP 403 from EODHD, history-fallback empty)
+              emitted a row with no data_quality marker.
+    Fix     : In _get_enriched_quote_impl, when no live data was
+              obtained AND history fallback failed, set
+              forecast_unavailable=True and data_quality=MISSING.
+
+  AUDIT-6  Synthesized intrinsic could itself be subunit-mismatched
+    Symptom : _compute_intrinsic_and_upside derives intrinsic from
+              eps_ttm × pe_forward. If eps_ttm comes from a provider
+              in the main unit while price is in the subunit, the
+              synthesized intrinsic is in the main unit too,
+              reproducing AUDIT-1 with a different provenance.
+    Fix     : After synthesis, _compute_intrinsic_and_upside calls
+              _normalize_subunit_currency_fields() so synthesized
+              intrinsics are also subunit-correct.
+
+Diagnostic tags (greppable after deploy):
+    [v5.55.0 SUBUNIT]          — currency-subunit normalization fired
+    [v5.55.0 MCAP]             — market_cap synthesized from shares×price
+    [v5.55.0 UNFORECASTABLE]   — row flagged for forecast skip
+    [v5.55.0 QUALITY-HAIRCUT]  — revenue-collapse haircut applied
+    [v5.55.0 FORECAST DIAG]    — per-row forecast tier outcome (DEBUG;
+                                  WARNING when source=UNAVAILABLE)
+
+[PRESERVED — strictly] Every v5.54.1 helper, signature, behaviour, and
+public API. v5.55.0 changes are all additive (new helpers + four call
+sites) plus the version bump. No removals from __all__, no signature
+changes.
+
+WHY v5.54.1 (post-audit forecast pipeline corrections — preserved)
+------------------------------------------------------------------
+  C1 : MOMENTUM tier was unreachable because momentum_score always
+       defaults to 50.0 — now uses raw percent_change/change_pct directly.
+  C2 : Confidence calculation used derived scores that fall back to
+       defaults — now uses raw inputs, and the confidence block runs
+       BEFORE the score derivation.
+  C3 : When price was missing the else-branch unconditionally wiped
+       any pre-existing forecast_price_* values; now uses "if not in
+       row" guards.
+  I1 : Removed forecast_price_12m from the analyst-target cascade.
+  I3 : All warning tags are appended idempotently.
+  I5 : Diagnostic log is DEBUG except for UNAVAILABLE (WARNING).
+
+WHY v5.54.0 (original forecast pipeline fix — preserved)
+WHY v5.53.0 (four production bugs — preserved)
 """
 
 from __future__ import annotations
@@ -67,7 +193,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.54.1"
+__version__ = "5.55.1"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -113,6 +239,7 @@ _FALLBACK_COUNTRY_BY_SUFFIX: Dict[str, str] = {
     ".NYSE": "United States", ".OQ": "United States",
     ".L": "United Kingdom", ".LSE": "United Kingdom", ".LN": "United Kingdom",
     ".DE": "Germany", ".F": "Germany", ".BE": "Germany",
+    ".XETRA": "Germany", ".XETR": "Germany", ".ETR": "Germany",
     ".PA": "France", ".FP": "France",
     ".SW": "Switzerland", ".VX": "Switzerland",
     ".AS": "Netherlands", ".BR": "Belgium", ".MC": "Spain",
@@ -141,6 +268,7 @@ _FALLBACK_CURRENCY_BY_SUFFIX: Dict[str, str] = {
     ".US": "USD", ".N": "USD", ".NASDAQ": "USD", ".NYSE": "USD", ".OQ": "USD",
     ".L": "GBP", ".LSE": "GBP", ".LN": "GBP",
     ".DE": "EUR", ".F": "EUR", ".BE": "EUR",
+    ".XETRA": "EUR", ".XETR": "EUR", ".ETR": "EUR",
     ".PA": "EUR", ".FP": "EUR",
     ".AS": "EUR", ".BR": "EUR", ".MC": "EUR",
     ".MI": "EUR", ".IM": "EUR", ".AT": "EUR", ".VI": "EUR", ".IR": "EUR",
@@ -166,6 +294,55 @@ _FALLBACK_CURRENCY_BY_SUFFIX: Dict[str, str] = {
 
 
 # =============================================================================
+# v5.55.0 — AUDIT-1: Currency-subunit exchange table
+# =============================================================================
+#
+# Exchanges that quote prices in a SUBUNIT (pence, cents, agorot) while
+# their fundamental data may arrive from upstream providers in the MAIN
+# unit (GBP, ZAR, ILS). Format: suffix -> (subunit_code, main_unit_code,
+# conversion_factor). Conversion is multiplicative: main_unit_value *
+# factor = subunit_value.
+#
+# Exchanges handled:
+#   .L / .LSE / .LN  London       — pence (GBX) vs pounds (GBP), factor 100
+#   .JSE / .ZA       Johannesburg — cents (ZAC) vs rand (ZAR),   factor 100
+#   .TA / .TASE      Tel Aviv     — agorot (ILA) vs shekels (ILS), factor 100
+_SUBUNIT_EXCHANGES: Dict[str, Tuple[str, str, float]] = {
+    ".L":    ("GBX", "GBP", 100.0),
+    ".LSE":  ("GBX", "GBP", 100.0),
+    ".LN":   ("GBX", "GBP", 100.0),
+    ".JSE":  ("ZAC", "ZAR", 100.0),
+    ".ZA":   ("ZAC", "ZAR", 100.0),
+    ".TA":   ("ILA", "ILS", 100.0),
+    ".TASE": ("ILA", "ILS", 100.0),
+}
+
+# Detection threshold for currency-subunit mismatch. A field whose value
+# is BELOW this fraction of current_price is suspected to be in the main
+# unit (vs the subunit current_price is quoted in).
+#
+# v5.55.1: raised from 0.05 to 0.10 after production audit revealed
+# SBK.JSE (ratio 5.7%) and similar borderline cases were being missed.
+# All observed phantom-downside cases on LSE/JSE/TASE have ratio < 6%;
+# legitimate deep-value stocks rarely trade above 10% of intrinsic.
+# Combined with the new currency-aware skip in _normalize_subunit_currency_fields,
+# false positives on rows where price is already in the main unit
+# (e.g., SHEL.L with currency="GBP") are prevented separately.
+_SUBUNIT_DETECT_RATIO_THRESHOLD: float = 0.10
+
+# Price-like fields considered for subunit normalization. All are
+# nominally denominated in the same unit as current_price.
+_SUBUNIT_PRICE_FIELDS: Tuple[str, ...] = (
+    "intrinsic_value",
+    "fair_value",
+    "target_mean_price",
+    "target_price",
+    "target_high_price",
+    "target_low_price",
+)
+
+
+# =============================================================================
 # Minimal domain models
 # =============================================================================
 class QuoteQuality(str, Enum):
@@ -186,7 +363,7 @@ class UnifiedQuote(BaseModel):
 
 
 # =============================================================================
-# v5.50.0: Decision Matrix 8-tier framework
+# v5.50.0: Decision Matrix 8-tier framework (preserved)
 # =============================================================================
 DETAILED_TOKENS: Tuple[str, ...] = (
     "STRONG_SELL", "STRONG_BUY", "SPECULATIVE_BUY", "BUY",
@@ -245,7 +422,7 @@ def collapse_to_canonical(detailed_token: str) -> str:
 
 
 # =============================================================================
-# Canonical page contracts
+# Canonical page contracts (preserved)
 # =============================================================================
 INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "symbol", "name", "asset_class", "exchange", "currency", "country",
@@ -377,7 +554,7 @@ PROVIDER_PRIORITIES = {
 
 
 # =============================================================================
-# Small helpers
+# Small helpers (preserved)
 # =============================================================================
 def _safe_str(x: Any, default: str = "") -> str:
     if x is None:
@@ -470,6 +647,411 @@ def _dedupe_keep_order(items: Sequence[Any]) -> List[Any]:
         out.append(item)
     return out
 
+
+# =============================================================================
+# v5.55.0 — AUDIT-driven helpers (NEW)
+# =============================================================================
+
+def _append_warning_tag(row: Dict[str, Any], tag: str) -> None:
+    """v5.55.0: idempotent warning append used by AUDIT-1 / -2 / -3 / -5 paths."""
+    if not tag:
+        return
+    existing = _safe_str(row.get("warnings"))
+    if tag in existing:
+        return
+    row["warnings"] = (existing + "; " + tag) if existing else tag
+
+
+def _is_subunit_exchange_symbol(symbol: str) -> bool:
+    """v5.55.0 AUDIT-1: True if symbol is on an exchange that quotes in subunits."""
+    s = _safe_str(symbol).upper()
+    if not s or "." not in s:
+        return False
+    suffix = "." + s.rsplit(".", 1)[1]
+    return suffix in _SUBUNIT_EXCHANGES
+
+
+def _normalize_subunit_currency_fields(row: Dict[str, Any], symbol_hint: str = "") -> Dict[str, Any]:
+    """
+    v5.55.0 AUDIT-1: Detect and correct currency-subunit mismatches for
+    exchanges that quote in subunits while their fundamental data may
+    arrive in the main unit.
+
+    v5.55.1 GAP-2 ENHANCEMENT: Currency-aware skip. Some providers return
+    .L tickers with currency="GBP" and price already in GBP (rather than
+    pence). For those rows the ratio-based detector could false-positive.
+    We now check the row's currency field against the exchange's main-unit
+    code: if they match (e.g., currency=="GBP" on a .L symbol), skip
+    normalization entirely.
+
+    Detection rule:  for each price-like field in _SUBUNIT_PRICE_FIELDS,
+    if its value / current_price < _SUBUNIT_DETECT_RATIO_THRESHOLD (10%
+    in v5.55.1), multiply by the conversion factor (typically 100) to
+    bring it into the subunit.
+
+    Idempotent: a field already in the subunit (ratio >= 10%) is left
+    alone. A field already converted by a prior call won't double-convert.
+
+    Returns the row dict (mutated in place). Appends
+    "currency_subunit_normalized:<fields>" to warnings when at least
+    one field was converted, and emits a [v5.55.0 SUBUNIT] log line.
+    """
+    sym = _safe_str(row.get("symbol") or symbol_hint).upper()
+    if not _is_subunit_exchange_symbol(sym):
+        return row
+
+    price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
+    if price is None or price <= 0:
+        return row
+
+    suffix = "." + sym.rsplit(".", 1)[1]
+    subunit_code, main_unit_code, factor = _SUBUNIT_EXCHANGES[suffix]
+
+    # v5.55.1 GAP-2: currency-aware skip. If the row's currency field
+    # explicitly says the price is in the MAIN unit (e.g., "GBP" on a
+    # .L symbol where SHEL.L provider returned GBP-denominated prices),
+    # skip normalization. We only act when currency is the subunit code
+    # ("GBX"/"ZAC"/"ILA") or unknown/blank.
+    current_currency = _safe_str(row.get("currency")).upper()
+    if current_currency == main_unit_code.upper():
+        try:
+            logger.debug(
+                "[v5.55.1 SUBUNIT] symbol=%s currency=%s matches main_unit_code; skipping normalization",
+                sym, current_currency,
+            )
+        except Exception:
+            pass
+        return row
+
+    normalized_fields: List[str] = []
+    for field in _SUBUNIT_PRICE_FIELDS:
+        val = _as_float(row.get(field))
+        if val is None or val <= 0:
+            continue
+        if (val / price) < _SUBUNIT_DETECT_RATIO_THRESHOLD:
+            row[field] = round(val * factor, 4)
+            normalized_fields.append(field)
+
+    if normalized_fields:
+        tag = "currency_subunit_normalized:" + ",".join(normalized_fields)
+        _append_warning_tag(row, tag)
+        try:
+            logger.debug(
+                "[v5.55.0 SUBUNIT] symbol=%s factor=%s normalized=%s price=%s",
+                sym, factor, ",".join(normalized_fields), price,
+            )
+        except Exception:
+            pass
+
+    return row
+
+
+def _synthesize_market_cap_if_zero(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    v5.55.0 AUDIT-2: Synthesize market_cap from float_shares × current_price
+    when the provider returned 0 or None.
+
+    Plausibility guard: only synthesize when the result is in [1M, 10T]
+    (USD-equivalent). Outside that range the inputs are almost certainly
+    wrong (zero/negative shares, or test data).
+
+    Idempotent: a row with a positive market_cap is left alone.
+    """
+    mc = _as_float(row.get("market_cap"))
+    if mc is not None and mc > 0:
+        return row
+
+    shares = _as_float(row.get("float_shares") or row.get("shares_outstanding"))
+    price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
+
+    if shares is None or shares <= 0 or price is None or price <= 0:
+        return row
+
+    synthesized = shares * price
+    if synthesized < 1.0e6 or synthesized > 1.0e13:
+        return row
+
+    row["market_cap"] = round(synthesized, 2)
+    _append_warning_tag(row, "market_cap_synthesized_from_shares_and_price")
+    try:
+        sym = _safe_str(row.get("symbol"))
+        logger.debug(
+            "[v5.55.0 MCAP] symbol=%s synthesized=%s shares=%s price=%s",
+            sym, synthesized, shares, price,
+        )
+    except Exception:
+        pass
+    return row
+
+
+def _detect_unforecastable_row(row: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    v5.55.0 AUDIT-3: Identify rows where forecast synthesis should be
+    skipped. Returns (is_unforecastable, reason).
+
+    When True, the caller should call _flag_row_unforecastable() to set
+    forecast_unavailable=True and ensure data_quality is marked.
+    scoring.py v5.2.3+ honors forecast_unavailable in
+    derive_forecast_patch's early-exit path.
+
+    Detection rules (first match wins):
+      data_quality_unrecoverable
+        - data_quality already STALE/MISSING/ERROR upstream + no price
+      no_price_or_market_cap
+        - both current_price and market_cap are None or <= 0 (delisted)
+      illiquid_micro_cap
+        - volume < 1000 AND 0 < market_cap < $1M (PINK-stale, dead names)
+    """
+    price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
+    market_cap = _as_float(row.get("market_cap"))
+    volume = _as_float(row.get("volume"))
+
+    dq = _safe_str(row.get("data_quality")).upper()
+    if dq in {"STALE", "MISSING", "ERROR"} and (price is None or price <= 0):
+        return True, "data_quality_unrecoverable"
+
+    no_price = price is None or price <= 0
+    no_mcap = market_cap is None or market_cap <= 0
+    if no_price and no_mcap:
+        return True, "no_price_or_market_cap"
+
+    if (
+        volume is not None
+        and volume < 1000.0
+        and market_cap is not None
+        and 0 < market_cap < 1.0e6
+    ):
+        return True, "illiquid_micro_cap"
+
+    return False, ""
+
+
+def _flag_row_unforecastable(row: Dict[str, Any], reason: str) -> None:
+    """
+    v5.55.0 AUDIT-3: Apply the unforecastable contract to a row.
+
+    Sets:
+      - forecast_unavailable = True
+      - data_quality        = MISSING / STALE / ERROR (per reason)
+      - warnings            = appended with "forecast_unavailable:<reason>"
+
+    Existing data_quality is preserved if already non-empty (we don't
+    downgrade upstream signal).
+    """
+    if not reason:
+        return
+    row["forecast_unavailable"] = True
+
+    if not _safe_str(row.get("data_quality")):
+        if reason == "data_quality_unrecoverable":
+            row["data_quality"] = "MISSING"
+        elif reason == "no_price_or_market_cap":
+            row["data_quality"] = "MISSING"
+        elif reason == "illiquid_micro_cap":
+            row["data_quality"] = "STALE"
+        else:
+            row["data_quality"] = "STALE"
+
+    _append_warning_tag(row, "forecast_unavailable:" + reason)
+    try:
+        sym = _safe_str(row.get("symbol"))
+        logger.info(
+            "[v5.55.0 UNFORECASTABLE] symbol=%s reason=%s data_quality=%s",
+            sym, reason, row.get("data_quality"),
+        )
+    except Exception:
+        pass
+
+
+def _apply_revenue_collapse_haircut(
+    quality_score: float,
+    revenue_growth_pct: Optional[float],
+    symbol_hint: str = "",
+) -> Tuple[float, bool]:
+    """
+    v5.55.0 AUDIT-4: Multiplicative haircut on quality scores when
+    revenue has collapsed YoY. Mirror of scoring.py v5.2.3's haircut,
+    applied locally so the fallback path produces consistent output
+    even when scoring.py is not invoked.
+
+    Returns (new_score, was_applied).
+
+    Linear ramp (revenue_growth_pct in PERCENT POINTS, e.g., -87.0):
+      revenue_growth >= -30%  -> 1.0   (no penalty)
+      revenue_growth = -50%   -> 0.80
+      revenue_growth = -75%   -> 0.55  (clamped floor)
+
+    A row with no revenue signal returns the input score unchanged.
+    """
+    if revenue_growth_pct is None or revenue_growth_pct >= -30.0:
+        return quality_score, False
+
+    START = -30.0
+    FLOOR = -75.0
+    MAX_HAIRCUT = 0.55
+
+    span = FLOOR - START
+    progress = (revenue_growth_pct - START) / span
+    progress = max(0.0, min(1.0, progress))
+    haircut = 1.0 - progress * (1.0 - MAX_HAIRCUT)
+    haircut = max(MAX_HAIRCUT, min(1.0, haircut))
+
+    new_score = quality_score * haircut
+    try:
+        logger.debug(
+            "[v5.55.0 QUALITY-HAIRCUT] symbol=%s revenue_growth_pct=%s haircut=%s "
+            "quality_before=%s quality_after=%s",
+            symbol_hint, revenue_growth_pct, haircut,
+            quality_score, new_score,
+        )
+    except Exception:
+        pass
+    return new_score, True
+
+
+# =============================================================================
+# v5.55.1 — GAP-3: Provider geo mis-attribution corrector (NEW)
+# =============================================================================
+
+# US-aliases that providers commonly return when mis-attributing a non-US
+# symbol. These trigger the override path; any other current_country value
+# is left alone.
+_US_COUNTRY_ALIASES: Set[str] = {
+    "USA", "US", "UNITED STATES", "UNITED STATES OF AMERICA", "U.S.",
+    "U.S.A.", "AMERICA",
+}
+
+# Exchange-name fragments that signal "this row was tagged as US-listed".
+# Used as the OR condition for exchange-override detection.
+_US_EXCHANGE_FRAGMENTS: Tuple[str, ...] = (
+    "NYSE", "NASDAQ", "NYSE/NASDAQ", "NASDAQ/NYSE", "AMEX", "BATS",
+    "ARCA", "OTCBB", "PINK",
+)
+
+
+def _correct_provider_geo_misattribution(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    v5.55.1 GAP-3: Override country/currency/exchange when the provider
+    returned US-attributed data for a symbol whose suffix authoritatively
+    indicates a non-US exchange.
+
+    Audit symptom (production sheet, May 10 2026):
+      BAS.XETRA, BMW.XETRA, MTX.XETRA, BEI.XETRA, BAYN.XETRA, RHM.XETRA
+      were shown with Currency=USD, Country=USA, Exchange=NYSE/NASDAQ.
+      The upstream provider was treating XETRA-suffixed tickers as US
+      listings. v5.55.0's _infer_*_from_symbol fallbacks only fire when
+      provider returned a blank value, so these affirmatively-wrong
+      values were never overridden.
+
+    Logic:
+      Only act when (a) symbol has a suffix in _FALLBACK_COUNTRY_BY_SUFFIX
+      that is NOT "United States", AND (b) the provider returned a US-
+      attributed value for country / currency / exchange. In that case
+      override with the suffix-derived value. Each overridden field is
+      tagged via warnings ("geo_misattribution_corrected:<fields>") and
+      a [v5.55.1 GEO-FIX] log line is emitted.
+
+    Conservative by design:
+      - Never overrides non-US country values (e.g., wouldn't change
+        "France" to "Germany" even on a .DE suffix; only US -> non-US).
+      - Never overrides correctly-typed currencies that happen to differ
+        from the fallback (e.g., a .HK row marked USD ADR is left alone
+        unless country is also wrongly USA).
+      - Idempotent: re-running the helper has no effect.
+    """
+    sym = _safe_str(row.get("symbol")).upper()
+    if "." not in sym:
+        return row
+
+    suffix = "." + sym.rsplit(".", 1)[1]
+    expected_country = _FALLBACK_COUNTRY_BY_SUFFIX.get(suffix)
+    expected_currency = _FALLBACK_CURRENCY_BY_SUFFIX.get(suffix)
+
+    # Skip when suffix unknown or expected geo IS US — nothing to correct.
+    if not expected_country or expected_country == "United States":
+        return row
+
+    current_country = _safe_str(row.get("country"))
+    current_currency = _safe_str(row.get("currency"))
+    current_exchange = _safe_str(row.get("exchange"))
+
+    overridden_fields: List[str] = []
+
+    # Country override: only fire when provider value is a US alias.
+    if current_country.upper() in _US_COUNTRY_ALIASES:
+        row["country"] = expected_country
+        overridden_fields.append("country")
+
+    # Currency override: only fire when provider value is "USD" AND the
+    # expected currency is genuinely non-USD. Some non-US tickers (ADRs,
+    # dual listings) legitimately trade in USD; we keep those by checking
+    # that the country-override also fired (i.e., the geo profile is
+    # internally inconsistent on the provider's side).
+    if (
+        expected_currency
+        and expected_currency.upper() != "USD"
+        and current_currency.upper() == "USD"
+        and "country" in overridden_fields
+    ):
+        row["currency"] = expected_currency
+        overridden_fields.append("currency")
+
+    # Exchange override: only fire when provider value is a US-exchange
+    # fragment AND we already overrode country (geo-internally consistent).
+    if (
+        "country" in overridden_fields
+        and any(frag in current_exchange.upper() for frag in _US_EXCHANGE_FRAGMENTS)
+    ):
+        # Map suffix to a presentable exchange code. Strip leading dot.
+        suffix_code = suffix[1:] if suffix.startswith(".") else suffix
+        # Prefer well-known names where the suffix is opaque.
+        suffix_to_exchange_name = {
+            "XETRA": "XETRA", "XETR": "XETRA", "ETR": "XETRA",
+            "DE": "XETRA", "F": "Frankfurt", "BE": "Berlin",
+            "PA": "Euronext Paris", "FP": "Euronext Paris",
+            "AS": "Euronext Amsterdam", "BR": "Euronext Brussels",
+            "MC": "BME Spain", "MI": "Borsa Italiana", "IM": "Borsa Italiana",
+            "L": "LSE", "LSE": "LSE", "LN": "LSE",
+            "SW": "SIX Swiss", "VX": "SIX Swiss",
+            "CO": "Nasdaq Copenhagen", "ST": "Nasdaq Stockholm",
+            "OL": "Oslo Bors", "HE": "Nasdaq Helsinki",
+            "T": "Tokyo", "TYO": "Tokyo",
+            "HK": "HKEX", "HKG": "HKEX",
+            "SS": "Shanghai", "SZ": "Shenzhen",
+            "NS": "NSE India", "NSE": "NSE India",
+            "BO": "BSE India", "BSE": "BSE India",
+            "KS": "KOSPI", "KQ": "KOSDAQ", "TW": "TWSE",
+            "AX": "ASX", "ASX": "ASX",
+            "TO": "TSX", "V": "TSX-V",
+            "SA": "B3 Brazil", "MX": "BMV",
+            "JSE": "JSE", "ZA": "JSE",
+            "TA": "TASE", "TASE": "TASE",
+            "KW": "Boursa Kuwait", "QA": "Qatar Stock Exchange",
+            "AE": "ADX/DFM", "DFM": "DFM", "ADX": "ADX",
+            "EG": "EGX", "SR": "Tadawul",
+        }
+        new_exchange = suffix_to_exchange_name.get(suffix_code, suffix_code)
+        row["exchange"] = new_exchange
+        overridden_fields.append("exchange")
+
+    if overridden_fields:
+        _append_warning_tag(row, "geo_misattribution_corrected:" + ",".join(overridden_fields))
+        try:
+            logger.info(
+                "[v5.55.1 GEO-FIX] symbol=%s suffix=%s overridden=%s "
+                "expected_country=%s expected_currency=%s",
+                sym, suffix, ",".join(overridden_fields),
+                expected_country, expected_currency,
+            )
+        except Exception:
+            pass
+
+    return row
+
+
+# =============================================================================
+# Page-catalog / sheet-name canonicalisation (preserved)
+# =============================================================================
 
 def _page_catalog_candidates() -> List[Any]:
     modules: List[Any] = []
@@ -1315,11 +1897,9 @@ def _infer_exchange_from_symbol(symbol: str) -> str:
 
 
 def _infer_currency_from_symbol(symbol: str) -> str:
-    """v5.47.4: delegates to core.symbols.normalize.get_currency_from_symbol when available."""
     s = normalize_symbol(symbol)
     if not s:
         return "USD"
-
     if _HAS_NORMALIZE_HELPERS and _ext_get_currency_from_symbol is not None:
         try:
             ccy = _ext_get_currency_from_symbol(s)
@@ -1327,7 +1907,6 @@ def _infer_currency_from_symbol(symbol: str) -> str:
                 return ccy
         except Exception:
             pass
-
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "SAR"
     if s.endswith("=X"):
@@ -1348,11 +1927,9 @@ def _infer_currency_from_symbol(symbol: str) -> str:
 
 
 def _infer_country_from_symbol(symbol: str) -> str:
-    """v5.47.4 (AUDIT FIX): delegates to core.symbols.normalize.get_country_from_symbol when available."""
     s = normalize_symbol(symbol)
     if not s:
         return ""
-
     if _HAS_NORMALIZE_HELPERS and _ext_get_country_from_symbol is not None:
         try:
             country = _ext_get_country_from_symbol(s)
@@ -1360,7 +1937,6 @@ def _infer_country_from_symbol(symbol: str) -> str:
                 return country
         except Exception:
             pass
-
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "Saudi Arabia"
     if s.endswith("=X") or s.endswith("=F"):
@@ -1478,14 +2054,18 @@ def _coerce_datetime_like(value: Any) -> Optional[str]:
 
 def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", normalized_symbol: str = "", provider: str = "") -> Dict[str, Any]:
     """
-    v5.53.0 [BUG-3 / BUG-4 FIX]: week_52_position_pct and unrealized_pl_pct
-    are now stored as PERCENT POINTS (0-100), not fractions (0.0-1.0).  The
-    column headers in INSTRUMENT_CANONICAL_HEADERS read "52W Position %" and
-    "Unrealized P/L %" and the display layer expected percent points; storing
-    as fractions caused 52W Position % to render blank and Unrealized P/L %
-    to render as e.g. 4,614,849.94% (the symptom of being multiplied by 100
-    a second time downstream).  percent_change, max_drawdown_1y, var_95_1d
-    remain as fractions per v5.47.3.
+    Canonicalize a provider-supplied row dict into the canonical schema.
+
+    v5.55.0 [AUDIT-1 / AUDIT-2 INTEGRATION]: After standard field mapping
+    and inferences, calls:
+      - _normalize_subunit_currency_fields() to fix LSE/JSE/TASE
+        intrinsic_value / target_mean_price unit mismatches
+      - _synthesize_market_cap_if_zero() to backfill market_cap from
+        float_shares × current_price when provider returned 0
+
+    [PRESERVED from v5.53.0] week_52_position_pct stored as PERCENT
+    POINTS (0-100), unrealized_pl_pct stored as PERCENT POINTS,
+    percent_change / max_drawdown_1y / var_95_1d stored as FRACTIONS.
     """
     src = dict(row or {})
     flat = _flatten_scalar_fields(src)
@@ -1545,7 +2125,6 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if change is None and price is not None and prev is not None:
         change = price - prev
         out["price_change"] = round(change, 6)
-    # v5.47.3: percent_change stays as a FRACTION (display layer does *100).
     if pct is None and price is not None and prev not in (None, 0):
         pct = (price - prev) / prev
         out["percent_change"] = round(pct, 8)
@@ -1554,10 +2133,6 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
-    # v5.53.0 [BUG-3a FIX]: store week_52_position_pct as PERCENT POINTS
-    # (0-100), not a fraction.  Column header reads "52W Position %" and
-    # the display layer expects percent points; storing as a fraction
-    # caused the column to render blank in the May 8 audit.
     if price is not None and high52 is not None and low52 is not None and high52 > low52 and out.get("week_52_position_pct") is None:
         out["week_52_position_pct"] = round((price - low52) / (high52 - low52) * 100.0, 4)
 
@@ -1572,14 +2147,26 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if pos_val is not None and pos_cost is not None and out.get("unrealized_pl") is None:
         out["unrealized_pl"] = round(pos_val - pos_cost, 6)
     upl = _as_float(out.get("unrealized_pl"))
-    # v5.53.0 [BUG-4 FIX]: percent points, not fraction.  EXE.US in the
-    # May 8 audit displayed 4,614,849.94% — the symptom of this value
-    # being multiplied by 100 twice (once here when stored as fraction,
-    # then again by the display layer interpreting "%" suffix).
     if upl is not None and pos_cost not in (None, 0) and out.get("unrealized_pl_pct") is None:
         out["unrealized_pl_pct"] = round(upl / pos_cost * 100.0, 4)
 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
+
+    # v5.55.0 AUDIT-1: subunit-currency normalization (LSE/JSE/TASE).
+    # Run AFTER provider field mapping so we have current_price + the
+    # candidate fields, but BEFORE downstream synthesis so any synthesis
+    # uses the corrected values.
+    out = _normalize_subunit_currency_fields(out, symbol_hint=inferred_symbol)
+
+    # v5.55.0 AUDIT-2: market_cap synthesis (Kuwait-style zero-cap rows).
+    out = _synthesize_market_cap_if_zero(out)
+
+    # v5.55.1 GAP-3: provider geo mis-attribution corrector. Runs LAST so
+    # all suffix-derived defaults from earlier inferences are present and
+    # we only override values the provider actively supplied. Conservative:
+    # only fires when provider attributed a non-US suffix as US.
+    out = _correct_provider_geo_misattribution(out)
+
     if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
         out["warnings"] = "Recovered from history/chart fallback"
 
@@ -1631,7 +2218,6 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
         conf_fraction = _as_float(out.get("forecast_confidence"))
         if conf_fraction is not None:
             conf = conf_fraction * 100.0 if conf_fraction <= 1.5 else conf_fraction
-            # v5.52.0 [FIX-9]: was setdefault, no-op against None.
             if out.get("confidence_score") is None:
                 out["confidence_score"] = round(_clamp(conf, 0.0, 100.0), 2)
     if conf is not None and out.get("confidence_bucket") in (None, ""):
@@ -1713,47 +2299,41 @@ def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[
 
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     """
-    v5.54.1 — FORECAST PIPELINE FIX with AUDIT CORRECTIONS (C1, C2, C3, I1, I3, I5)
+    v5.55.0 — AUDIT-3 / AUDIT-4 / AUDIT-6 integration on top of v5.54.1.
 
-    Acceptance‑test walk‑through (self‑verification)
-    -------------------------------------------------
-    Test 1 → no constant ROI placeholder.  Forecast source is now tiered
-             and no default constants exist → pass.
-    Test 2 → no confidence placeholder.  Confidence is computed from raw
-             input flags (not derived scores) → pass.
-    Test 3 → honest gaps:
-             - Row with no analyst target, no intrinsic, no momentum raw
-               input → roi_12m stays None → forecast_unavailable appended
-               and forecast fields set to None (unless pre‑set by provider,
-               then preserved via `if k not in row` guard).
-             - Confidence: no raw input flags → confidence_signals=0.0
-               → confidence_unavailable appended, confidence fields None.
-             → pass.
-    Test 4 → intrinsic_outlier flag: intrinsic ratio outside [0.3,3] triggers
-             flag and excludes intrinsic from forecast tier → pass.
-    Test 5 → diagnostic log emitted for every row.  Now DEBUG for normal paths,
-             WARNING only for UNAVAILABLE.
-    Test 6 → clamps respected: ROI clamps [-0.25,+0.25]/[-0.35,+0.35]/[-0.65,+0.65]
-             enforced → pass.
-    Test 7 → existing behaviour preserved (score derivations unchanged).
+    v5.55.0 changes vs v5.54.1:
+      - AUDIT-3: at the very top, run _detect_unforecastable_row() and
+        _flag_row_unforecastable() so delisted / illiquid / stale rows
+        are tagged before any score derivation. Scoring still runs on
+        these rows (so the sheet shows a row), but downstream forecast
+        consumers (scoring.py v5.2.3+) honor the flag.
+      - AUDIT-4: revenue-collapse haircut applied to quality_score
+        before the 0-100 clamp. KROS-style cases (revenue -87%) drop
+        from 95 to ~52 instead of staying at aspirational 95.
 
-    C1 FIX: momentum tier uses raw input availability (percent_change/change_pct),
-            not derived momentum_score.
-    C2 FIX: confidence block runs BEFORE score derivations and uses raw inputs
-            (percent_change, gross_margin, operating_margin, profit_margin).
-    C3 FIX: when no forecast can be produced, only overwrite forecast_price_*
-            fields if they are not already present.
-    I1 FIX: analyst target only reads target_mean_price (no forecast_price_12m).
-    I3 FIX: warning tags appended idempotently via _append_warning().
-    I5 FIX: log level is DEBUG except for UNAVAILABLE (WARNING).
+    [PRESERVED from v5.54.1]
+      C1: momentum tier uses raw input availability (percent_change /
+          change_pct), not derived momentum_score.
+      C2: confidence block runs BEFORE score derivations and uses raw
+          inputs.
+      C3: when no forecast can be produced, only overwrite
+          forecast_price_* if not already present.
+      I1: analyst target reads only target_mean_price.
+      I3: warnings appended idempotently.
+      I5: log level DEBUG except for UNAVAILABLE (WARNING).
     """
 
-    # Helper for idempotent warning injection
     def _append_warning(r: Dict[str, Any], tag: str) -> None:
         existing = _safe_str(r.get("warnings"))
         if tag in existing:
             return
         r["warnings"] = (existing + "; " + tag) if existing else tag
+
+    # v5.55.0 AUDIT-3: flag unforecastable rows up-front.
+    if not _safe_bool(row.get("forecast_unavailable")):
+        unforecastable, reason = _detect_unforecastable_row(row)
+        if unforecastable:
+            _flag_row_unforecastable(row, reason)
 
     price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
     pe = _as_float(row.get("pe_ttm"))
@@ -1770,7 +2350,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     profit_margin_pct = _as_pct_points(row.get("profit_margin")) or 0.0
     revenue_growth_pct = _as_pct_points(row.get("revenue_growth_yoy")) or 0.0
 
-    # ----- Intrinsic sanity flag (Change 3) ----------------------------------
     intrinsic_usable = True
     if intrinsic is not None and price is not None and price > 0:
         intrinsic_ratio = intrinsic / price
@@ -1778,7 +2357,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             _append_warning(row, "intrinsic_outlier")
             intrinsic_usable = False
 
-    # ----- Confidence from raw input signals (C2 fix: BEFORE score fallbacks) -
     def _has_raw(name: str) -> bool:
         return row.get(name) is not None
 
@@ -1787,16 +2365,12 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         conf = _as_float(row.get("confidence_score"))
     if conf is None:
         confidence_signals = 0.0
-        # analyst target
         if _has_raw("target_mean_price"):
             confidence_signals += 0.20
-        # intrinsic (raw)
         if intrinsic is not None and intrinsic_usable:
             confidence_signals += 0.20
-        # momentum raw input (percent_change or change_pct) – NOT derived score
         if _has_raw("percent_change") or _has_raw("change_pct"):
             confidence_signals += 0.15
-        # quality raw inputs
         if any(_has_raw(k) for k in ("gross_margin", "operating_margin", "profit_margin")):
             confidence_signals += 0.15
         pe_val = _as_float(row.get("pe_ttm"))
@@ -1822,9 +2396,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         clamped_conf = _clamp(conf, 0.0, 1.0)
         row["forecast_confidence"] = round(clamped_conf, 4)
         row["confidence_score"] = round(clamped_conf * 100.0, 2)
-    # (If conf is None, fields already set to None above)
 
-    # ----- Score derivations (unchanged order but after confidence) -----------
     if row.get("value_score") is None:
         value_score = 55.0
         if pe is not None and pe > 0:
@@ -1836,7 +2408,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         value_score += min(max(div_yield_pct, 0.0), 12.0)
         row["value_score"] = round(_clamp(float(value_score), 0.0, 100.0), 2)
 
-    # v5.52.0 [FIX-10]: PEG_ratio computation when not supplied by provider.
     if row.get("peg_ratio") is None:
         peg_pe = _as_float(row.get("pe_ttm")) or _as_float(row.get("pe_forward"))
         peg_growth_pct = _as_pct_points(row.get("revenue_growth_yoy"))
@@ -1864,6 +2435,17 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         quality_score += min(max(profit_margin_pct, 0.0), 15.0) * 0.7
         if debt_to_equity is not None:
             quality_score += max(0.0, 15.0 - min(max(debt_to_equity, 0.0), 15.0))
+
+        # v5.55.0 AUDIT-4: revenue-collapse haircut. Applied BEFORE the
+        # 0-100 clamp so it operates on the unclamped score. KROS-style
+        # cases drop from 95 to ~52.
+        sym_for_log = _safe_str(row.get("symbol"))
+        quality_score, _haircut_applied = _apply_revenue_collapse_haircut(
+            quality_score, revenue_growth_pct or None, symbol_hint=sym_for_log
+        )
+        if _haircut_applied:
+            _append_warning(row, "quality_revenue_collapse_haircut")
+
         row["quality_score"] = round(_clamp(float(quality_score), 0.0, 100.0), 2)
 
     if row.get("momentum_score") is None:
@@ -1908,7 +2490,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         overall = sum(vals2) / len(vals2) if vals2 else 50.0
         row["overall_score"] = round(_clamp(float(overall), 0.0, 100.0), 2)
 
-    # ----- Forecast cascade (C1 fix: raw momentum input) ---------------------
     used_analyst_target = False
     used_intrinsic = False
     used_momentum = False
@@ -1921,27 +2502,26 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             return _clamp(val, -0.25, 0.25)
         if period == "3m":
             return _clamp(val, -0.35, 0.35)
-        return _clamp(val, -0.65, 0.65)  # 12m
+        return _clamp(val, -0.65, 0.65)
 
     roi_12m: Optional[float] = None
 
-    if price is not None and price > 0:
-        # 1) Analyst target (I1 fix: only target_mean_price)
+    # v5.55.0 AUDIT-3: skip forecast synthesis entirely for unforecastable rows.
+    forecast_skip = _safe_bool(row.get("forecast_unavailable"))
+
+    if not forecast_skip and price is not None and price > 0:
         target = _as_float(row.get("target_mean_price"))
         if target is not None and target > 0:
             roi_12m = (target / price) - 1.0
             used_analyst_target = True
 
-        # 2) Intrinsic value (if usable)
         if roi_12m is None and intrinsic is not None and intrinsic_usable:
             roi_12m = (intrinsic / price) - 1.0
             used_intrinsic = True
 
-        # 3) Momentum raw input (C1 fix)
         if roi_12m is None:
             pct_raw = _as_pct_points(row.get("percent_change")) or _as_pct_points(row.get("change_pct"))
             if pct_raw is not None and pct_raw != 0.0:
-                # modest annualised estimate
                 roi_12m = _clamp(pct_raw / 100.0 * 4.0, -0.30, 0.30)
                 used_momentum = True
 
@@ -1951,19 +2531,19 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         roi_1m = _clamp_roi("1m", roi_12m * RATIO_1M_OF_12M)
 
         row["forecast_price_12m"] = round(price * (1.0 + roi_12m), 4)
-        row["forecast_price_3m"]  = round(price * (1.0 + roi_3m), 4)
-        row["forecast_price_1m"]  = round(price * (1.0 + roi_1m), 4)
+        row["forecast_price_3m"] = round(price * (1.0 + roi_3m), 4)
+        row["forecast_price_1m"] = round(price * (1.0 + roi_1m), 4)
 
         row["expected_roi_12m"] = round(roi_12m, 6)
-        row["expected_roi_3m"]  = round(roi_3m, 6)
-        row["expected_roi_1m"]  = round(roi_1m, 6)
+        row["expected_roi_3m"] = round(roi_3m, 6)
+        row["expected_roi_1m"] = round(roi_1m, 6)
     else:
-        # No forecast possible – only overwrite if not already set (C3 fix)
         for k in ("forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
                   "expected_roi_1m", "expected_roi_3m", "expected_roi_12m"):
             if k not in row:
                 row[k] = None
-        _append_warning(row, "forecast_unavailable")
+        if not forecast_skip:
+            _append_warning(row, "forecast_unavailable")
 
     final_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
     final_roi_3m = _as_pct_points(row.get("expected_roi_3m"))
@@ -1988,23 +2568,25 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         else:
             row["confidence_bucket"] = "N/A"
 
-    # ----- Diagnostic log (I5: DEBUG except UNAVAILABLE) ----------------------
-    forecast_source = (
-        "ANALYST_TARGET" if used_analyst_target
-        else "INTRINSIC" if used_intrinsic
-        else "MOMENTUM" if used_momentum
-        else "UNAVAILABLE"
-    )
+    if forecast_skip:
+        forecast_source = "SKIPPED_UNFORECASTABLE"
+    else:
+        forecast_source = (
+            "ANALYST_TARGET" if used_analyst_target
+            else "INTRINSIC" if used_intrinsic
+            else "MOMENTUM" if used_momentum
+            else "UNAVAILABLE"
+        )
     symbol = row.get("symbol") or row.get("ticker") or "?"
     if forecast_source == "UNAVAILABLE":
         logger.warning(
-            "[v5.54.1 FORECAST DIAG] symbol=%s source=%s roi_12m=%s conf=%s warnings=%s",
+            "[v5.55.0 FORECAST DIAG] symbol=%s source=%s roi_12m=%s conf=%s warnings=%s",
             symbol, forecast_source,
             row.get("expected_roi_12m"), row.get("forecast_confidence"), row.get("warnings"),
         )
     else:
         logger.debug(
-            "[v5.54.1 FORECAST DIAG] symbol=%s source=%s roi_12m=%s conf=%s warnings=%s",
+            "[v5.55.0 FORECAST DIAG] symbol=%s source=%s roi_12m=%s conf=%s warnings=%s",
             symbol, forecast_source,
             row.get("expected_roi_12m"), row.get("forecast_confidence"), row.get("warnings"),
         )
@@ -2093,17 +2675,18 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
 
 def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     """
-    Backfill intrinsic_value and upside_pct when upstream provider did not
-    supply them.
+    Backfill intrinsic_value and upside_pct when upstream provider did
+    not supply them.
 
-    v5.53.0 [BUG-2 FIX]: removed the symmetric (price*0.3, price*3.0)
-    clamp at the end of this function.  It was hiding real DCF /
-    currency-unit bugs (especially JSE quotes in ZAC vs intrinsic in
-    ZAR), forcing upside_pct to land on exactly -70% or +200%.  Now we
-    only floor at zero so we don't store a negative intrinsic value;
-    the asymmetric ceiling is gone.  Extreme upside values now surface
-    as real signal so the underlying issue is diagnosable instead of
-    masked.
+    v5.55.0 [AUDIT-6]: After synthesizing intrinsic from candidates,
+    runs _normalize_subunit_currency_fields() in case eps_ttm or other
+    components arrived in the main unit on a subunit-quoting exchange.
+    The synthesized intrinsic would otherwise reproduce the AUDIT-1
+    bug with a different provenance.
+
+    [PRESERVED from v5.53.0] No symmetric clamp at the end. Floor at
+    zero only — extreme upside values surface as real signal so
+    underlying issues remain diagnosable instead of masked.
     """
     price = _as_float(row.get("current_price"))
     if price is None or price <= 0:
@@ -2145,9 +2728,13 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
                 intrinsic = candidates[mid]
             else:
                 intrinsic = (candidates[mid - 1] + candidates[mid]) / 2.0
-            # v5.53.0 [BUG-2 FIX]: floor at zero only; no symmetric clamp.
             intrinsic = max(0.0, intrinsic)
             row["intrinsic_value"] = round(intrinsic, 4)
+
+            # v5.55.0 AUDIT-6: subunit normalization on synthesized intrinsic.
+            sym = _safe_str(row.get("symbol"))
+            if _is_subunit_exchange_symbol(sym):
+                _normalize_subunit_currency_fields(row, symbol_hint=sym)
 
     intrinsic = _as_float(row.get("intrinsic_value"))
     if intrinsic is not None and intrinsic > 0 and row.get("upside_pct") is None:
@@ -2156,18 +2743,9 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
-    """
-    Populate recommendation, recommendation_detailed, recommendation_priority,
-    recommendation_reason, AND the four view columns.
-
-    v5.50.0 (Decision Matrix): three recommendation fields produced
-    (canonical 5-tier `recommendation`, plus 8-tier `recommendation_detailed`
-    and `recommendation_priority`).  See header docstring for full priority
-    rules.
-
-    v5.52.0 [FIX-7 / FIX-11]: switched setdefault to explicit None-check
-    so computed view tokens and reason text reach the wire.
-    """
+    """Decision Matrix v5.50.0 classifier — populates recommendation,
+    recommendation_detailed, recommendation_priority, recommendation_reason,
+    and the four view columns."""
     _compute_intrinsic_and_upside(row)
 
     fund_view, tech_view, risk_view, value_view = _derive_views(row)
@@ -2180,7 +2758,6 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     if row.get("value_view") is None:
         row["value_view"] = value_view
 
-    # Respect upstream recommendation if already set.
     if row.get("recommendation"):
         return
 
@@ -2229,7 +2806,7 @@ def _top10_selection_reason(row: Dict[str, Any]) -> str:
         if val is None:
             continue
         suffix = "%" if key == "confidence_score" else ""
-        parts.append(f"{label}={round(val, 1)}{suffix}")
+        parts.append("{}={}{}".format(label, round(val, 1), suffix))
     return "Selected by fallback ranking" if not parts else ("Selected by fallback ranking: " + ", ".join(parts))
 
 
@@ -2278,13 +2855,12 @@ def _try_get_settings() -> Any:
 async def _call_maybe_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
     if inspect.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)
-
     result = await asyncio.to_thread(fn, *args, **kwargs)
     return await result if inspect.isawaitable(result) else result
 
 
 # =============================================================================
-# Schema registry helpers
+# Schema registry helpers (preserved)
 # =============================================================================
 try:
     from core.sheets.schema_registry import SCHEMA_REGISTRY as _RAW_SCHEMA_REGISTRY  # type: ignore
@@ -2380,7 +2956,7 @@ def get_sheet_spec(sheet: str) -> Any:
     static_contract = STATIC_CANONICAL_SHEET_CONTRACTS.get(canon)
     if static_contract:
         return dict(static_contract)
-    raise KeyError(f"Unknown sheet spec: {sheet}")
+    raise KeyError("Unknown sheet spec: " + str(sheet))
 
 
 def _schema_for_sheet(sheet: str) -> Tuple[Any, List[str], List[str], str]:
@@ -2455,7 +3031,7 @@ _SCHEMA_UNION_KEYS: List[str] = _build_union_schema_keys()
 
 
 # =============================================================================
-# Async utilities
+# Async utilities (preserved)
 # =============================================================================
 class SingleFlight:
     def __init__(self) -> None:
@@ -2467,8 +3043,6 @@ class SingleFlight:
             fut = self._inflight.get(key)
             if fut is not None and not fut.done():
                 return await fut
-            # v5.51.0 [FIX-4]: get_running_loop() replaces deprecated
-            # get_event_loop() (3.12+ deprecation warning).
             fut = asyncio.get_running_loop().create_future()
             self._inflight[key] = fut
 
@@ -2527,7 +3101,7 @@ class MultiLevelCache:
 
 
 # =============================================================================
-# Provider registry
+# Provider registry (preserved)
 # =============================================================================
 @dataclass
 class ProviderState:
@@ -2553,10 +3127,10 @@ class ProviderRegistry:
                 return cached
             mod = None
             for path in (
-                f"providers.{name}_provider",
-                f"core.providers.{name}_provider",
-                f"providers.{name}",
-                f"core.providers.{name}",
+                "providers.{}_provider".format(name),
+                "core.providers.{}_provider".format(name),
+                "providers.{}".format(name),
+                "core.providers.{}".format(name),
             ):
                 try:
                     mod = import_module(path)
@@ -2599,6 +3173,7 @@ def _pick_provider_callable(mod: Any, *names: str) -> Optional[Any]:
         if callable(fn):
             return fn
     return None
+
 
 
 # =============================================================================
@@ -2840,7 +3415,6 @@ class DataEngineV5:
         if self._symbols_reader_inited:
             return
         self._symbols_reader_inited = True
-        # v5.51.0 [FIX-5]: probe both singular and plural module names.
         candidates = [
             ("core.sheets.symbols_reader", ("get_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols")),
             ("sheets.symbols_reader", ("get_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols")),
@@ -2902,10 +3476,10 @@ class DataEngineV5:
         if self.settings is None:
             return []
         attr_candidates = [
-            f"{sheet.lower()}_symbols",
-            f"{_norm_key(sheet)}_symbols",
-            f"symbols_{sheet.lower()}",
-            f"symbols_{_norm_key(sheet)}",
+            "{}_symbols".format(sheet.lower()),
+            "{}_symbols".format(_norm_key(sheet)),
+            "symbols_{}".format(sheet.lower()),
+            "symbols_{}".format(_norm_key(sheet)),
         ]
         for attr in attr_candidates:
             val = getattr(self.settings, attr, None)
@@ -2972,7 +3546,7 @@ class DataEngineV5:
 
     async def get_sheet_symbols(self, sheet: str) -> List[str]:
         canon = _canonicalize_sheet_name(sheet)
-        cache_key = f"symbols::{canon}"
+        cache_key = "symbols::{}".format(canon)
         cached = await self.cache.get(cache_key)
         if isinstance(cached, list) and cached:
             return list(cached)
@@ -3028,7 +3602,7 @@ class DataEngineV5:
         sym = normalize_symbol(symbol)
         is_ksa = sym.endswith(".SR") or bool(re.match(r"^[0-9]{4}$", sym))
         ksa_flag = "ksa" if is_ksa else "global"
-        return f"{ctx}|{primary}|{ksa_flag}"
+        return "{}|{}|{}".format(ctx, primary, ksa_flag)
 
     # --- single quote pipeline --------------------------------------------
     async def _fetch_patch(self, provider_name: str, symbol: str) -> Optional[Dict[str, Any]]:
@@ -3160,12 +3734,7 @@ class DataEngineV5:
         return seq[lo] * (1.0 - frac) + seq[hi] * frac
 
     def _compute_history_patch_from_rows(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        v5.53.0 [BUG-3b FIX]: week_52_position_pct now stored as PERCENT
-        POINTS (0-100), not a fraction.  Same fix as BUG-3a but in the
-        history-patch code path (used as a fallback when provider quote
-        is sparse).  Both code paths must agree on units.
-        """
+        """v5.53.0: week_52_position_pct stored as PERCENT POINTS (0-100)."""
         rows = self._coerce_history_rows(rows)
         if not rows:
             return {}
@@ -3190,10 +3759,8 @@ class DataEngineV5:
             out["week_52_high"] = max(closes)
             out["week_52_low"] = min(closes)
 
-        # v5.47.3: percent_change stays as a FRACTION.
         if first_close not in (None, 0):
             out["percent_change"] = (last_close - first_close) / first_close
-        # v5.53.0 [BUG-3b FIX]: percent points (0-100), not fraction.
         if out["week_52_high"] not in (None, 0) and out["week_52_high"] > out["week_52_low"]:
             out["week_52_position_pct"] = (last_close - out["week_52_low"]) / (out["week_52_high"] - out["week_52_low"]) * 100.0
 
@@ -3223,7 +3790,6 @@ class DataEngineV5:
                     dd = (c - running_max) / running_max
                     if dd < max_dd:
                         max_dd = dd
-            # v5.47.3: max_drawdown_1y stays as fraction.
             out["max_drawdown_1y"] = max_dd
         if len(closes) >= 60:
             returns_60 = [
@@ -3231,10 +3797,8 @@ class DataEngineV5:
             ]
             q5 = self._quantile(returns_60, 0.05)
             if q5 is not None:
-                # v5.47.3: var_95_1d stays as fraction.
                 out["var_95_1d"] = abs(q5)
 
-        # v5.50.0: candlestick pattern detection on the same OHLC rows.
         if _HAS_CANDLESTICKS and _detect_candle_patterns is not None:
             try:
                 candle = _detect_candle_patterns(rows)
@@ -3285,8 +3849,16 @@ class DataEngineV5:
         return QuoteQuality.MISSING.value
 
     async def _get_enriched_quote_impl(self, symbol: str, page: Optional[str] = None) -> Dict[str, Any]:
+        """
+        v5.55.0 [AUDIT-5 INTEGRATION]: When all providers fail and the
+        history fallback is also empty, set forecast_unavailable=True
+        and data_quality=MISSING so scoring.py v5.2.3+'s illiquid-skip
+        path takes effect, preventing placeholder forecasts on
+        unrecoverable rows. Also runs a final unforecastable detection
+        pass after merge in case the assembled row qualifies.
+        """
         normalized = normalize_symbol(symbol)
-        cache_key = f"quote::{normalized}::{self._provider_profile_key(normalized, page)}"
+        cache_key = "quote::{}::{}".format(normalized, self._provider_profile_key(normalized, page))
 
         async def _build() -> Dict[str, Any]:
             row: Dict[str, Any] = {
@@ -3302,12 +3874,11 @@ class DataEngineV5:
                 for provider in providers:
                     patch = await self._fetch_patch(provider, normalized)
                     if patch:
-                        # v5.51.0 [FIX-3]: defensive try/except around canonicalize.
                         try:
                             canon_patch = _canonicalize_provider_row(patch, requested_symbol=symbol, normalized_symbol=normalized, provider=provider)
                         except Exception as canon_err:
                             logger.warning(
-                                "[engine_v2 v%s] canonicalize failed for symbol=%r provider=%r: %s: %s — falling back to raw patch",
+                                "[engine_v2 v%s] canonicalize failed for symbol=%r provider=%r: %s: %s",
                                 __version__, normalized, provider,
                                 canon_err.__class__.__name__, canon_err,
                             )
@@ -3343,8 +3914,14 @@ class DataEngineV5:
                     sources.append("history_or_chart")
                 else:
                     warnings.append("No live provider data available")
+                    # v5.55.0 AUDIT-5: when all providers fail and history
+                    # fallback is also empty, mark forecast_unavailable +
+                    # data_quality=MISSING so scoring.py v5.2.3+'s
+                    # illiquid-skip path takes effect. Without this flag,
+                    # downstream synthesizers emit placeholder forecasts
+                    # for delisted/erroring symbols (PRU.L style).
+                    _flag_row_unforecastable(row, "no_price_or_market_cap")
 
-            # v5.50.0: best-effort candlestick pattern detection on quote-only path.
             if (
                 _HAS_CANDLESTICKS
                 and _detect_candle_patterns is not None
@@ -3371,11 +3948,24 @@ class DataEngineV5:
             row["last_updated_utc"] = _now_utc_iso()
             row["last_updated_riyadh"] = _now_riyadh_iso()
             if warnings:
-                row["warnings"] = "; ".join(warnings)
+                existing = _safe_str(row.get("warnings"))
+                added = "; ".join(warnings)
+                row["warnings"] = (existing + "; " + added) if existing else added
             row.setdefault("symbol", normalized)
             row.setdefault("requested_symbol", symbol)
             row.setdefault("symbol_normalized", normalized)
             row = _apply_symbol_context_defaults(row, symbol=normalized, page=page or "")
+
+            # v5.55.0 AUDIT-5: final unforecastable detection sweep on the
+            # assembled row. Catches rows where individual providers
+            # returned partial data but the merged result still qualifies
+            # as unforecastable (no price + no market cap, illiquid, etc.).
+            # Idempotent: a row already flagged is left alone.
+            if not _safe_bool(row.get("forecast_unavailable")):
+                unforecastable, reason = _detect_unforecastable_row(row)
+                if unforecastable:
+                    _flag_row_unforecastable(row, reason)
+
             return row
 
         async def _build_and_cache() -> Dict[str, Any]:
@@ -3418,7 +4008,7 @@ class DataEngineV5:
         for sym, res in zip(unique, results):
             if isinstance(res, BaseException):
                 logger.warning(
-                    "[engine_v2 v%s] enrich failed for symbol=%r: %s: %s — emitting placeholder",
+                    "[engine_v2 v%s] enrich failed for symbol=%r: %s: %s",
                     __version__, sym, res.__class__.__name__, res,
                 )
                 placeholder = {
@@ -3431,6 +4021,8 @@ class DataEngineV5:
                     ),
                     "last_updated_utc": _now_utc_iso(),
                     "last_updated_riyadh": _now_riyadh_iso(),
+                    "forecast_unavailable": True,
+                    "data_quality": "ERROR",
                 }
                 out.append(UnifiedQuote(**placeholder))
             else:
@@ -3456,7 +4048,7 @@ class DataEngineV5:
             if isinstance(res, BaseException):
                 failed_symbols.append(sym)
                 logger.warning(
-                    "[engine_v2 v%s] batch enrich failed for symbol=%r: %s: %s — emitting placeholder",
+                    "[engine_v2 v%s] batch enrich failed for symbol=%r: %s: %s",
                     __version__, sym, res.__class__.__name__, res,
                 )
                 out[sym] = {
@@ -3469,6 +4061,8 @@ class DataEngineV5:
                     ),
                     "last_updated_utc": _now_utc_iso(),
                     "last_updated_riyadh": _now_riyadh_iso(),
+                    "forecast_unavailable": True,
+                    "data_quality": "ERROR",
                 }
             else:
                 key, row = res
@@ -3504,7 +4098,6 @@ class DataEngineV5:
 
     async def quotes_batch(self, symbols: Sequence[str], *, page: Optional[str] = None, **kwargs: Any) -> Dict[str, Dict[str, Any]]:
         return await self.get_enriched_quotes_batch(symbols, page=page, **kwargs)
-
 
     # --- special page builders --------------------------------------------
     def _build_data_dictionary_rows(self) -> List[Dict[str, Any]]:
@@ -3569,7 +4162,6 @@ class DataEngineV5:
         return (-opportunity, -overall, -confidence, risk)
 
     async def _build_top10_rows_fallback(self, criteria: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str], int, str]:
-        """v5.52.0 [FIX-12]: per-page get_page_rows wrapped in try/except for resilience."""
         pages = list(criteria.get("pages_selected") or criteria.get("pages") or TOP10_ENGINE_DEFAULT_PAGES)
         pages = [_canonicalize_sheet_name(p) for p in pages if _safe_str(p)]
         pages = list(_dedupe_keep_order([p for p in pages if p in INSTRUMENT_SHEETS - {"Top_10_Investments"}]))
@@ -3604,6 +4196,11 @@ class DataEngineV5:
                         continue
                     sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
                     if not sym or sym in seen:
+                        continue
+                    # v5.55.0 AUDIT-3 propagation: skip unforecastable rows
+                    # from Top10 candidate pool. They can still appear on
+                    # their source page but shouldn't dilute the Top10.
+                    if _safe_bool(row.get("forecast_unavailable")):
                         continue
                     seen.add(sym)
                     candidate_rows.append(dict(row))
@@ -3640,11 +4237,6 @@ class DataEngineV5:
         body: Optional[Dict[str, Any]] = None,
         **extras: Any,
     ) -> Dict[str, Any]:
-        """
-        v5.51.0 [FIX-1]: entire body wrapped in try/except so any exception
-        becomes a structured error envelope instead of an unframed propagation
-        that confuses the route layer.
-        """
         debug = _get_env_bool("ENGINE_DEBUG", False)
         try:
             target_sheet, eff_limit, eff_offset, eff_mode, passthrough_body, _request_parts = _normalize_route_call_inputs(
@@ -3674,7 +4266,7 @@ class DataEngineV5:
                     "sheet": target_sheet, "page": target_sheet,
                     "headers": [], "keys": [],
                     "rows": [], "row_objects": [],
-                    "warnings": [f"No usable schema contract for sheet {target_sheet!r}"],
+                    "warnings": ["No usable schema contract for sheet {!r}".format(target_sheet)],
                     "contract_source": contract_source,
                 })
                 return payload
@@ -3697,7 +4289,6 @@ class DataEngineV5:
                 })
                 return payload
 
-            # External-rows path: prefer prebuilt rows from rows_reader if available.
             external_rows = await self._get_rows_from_external_reader(target_sheet, criteria=passthrough_body)
             if external_rows:
                 if debug:
@@ -3713,7 +4304,6 @@ class DataEngineV5:
                         _compute_recommendation(proj)
                     row_objects.append(proj)
 
-            # Special pages
             if target_sheet == "Data_Dictionary":
                 dict_rows = self._build_data_dictionary_rows()
                 row_objects = [_normalize_to_schema_keys(keys, headers, r) for r in dict_rows]
@@ -3794,7 +4384,6 @@ class DataEngineV5:
                 })
                 return payload
 
-            # Instrument-style sheet path
             if target_sheet in INSTRUMENT_SHEETS:
                 if not row_objects:
                     body_symbols = _extract_requested_symbols_from_body(passthrough_body, limit=eff_limit) if passthrough_body else []
@@ -3829,6 +4418,13 @@ class DataEngineV5:
                         row.setdefault("symbol_normalized", normalized_field)
                         proj = _normalize_to_schema_keys(keys, headers, row)
                         proj = _apply_page_row_backfill(target_sheet, proj)
+                        # Propagate forecast_unavailable / data_quality flags
+                        # set by _get_enriched_quote_impl (AUDIT-5) into the
+                        # projected row so _compute_scores_fallback honors them.
+                        if _safe_bool(row.get("forecast_unavailable")) and not _safe_bool(proj.get("forecast_unavailable")):
+                            proj["forecast_unavailable"] = True
+                        if _safe_str(row.get("data_quality")) and not _safe_str(proj.get("data_quality")):
+                            proj["data_quality"] = row.get("data_quality")
                         _compute_scores_fallback(proj)
                         _compute_recommendation(proj)
                         snapshot = await self._get_symbol_snapshot(normalized_field)
@@ -3855,21 +4451,19 @@ class DataEngineV5:
                 })
                 return payload
 
-            # Unknown sheet: schema-only payload.
             payload = self._finalize_payload({
                 "ok": True,
                 "engine_version": __version__,
                 "sheet": target_sheet, "page": target_sheet,
                 "headers": headers, "keys": keys,
                 "rows": [], "row_objects": [],
-                "warnings": warnings + [f"No build pipeline for sheet {target_sheet!r}; returning schema-only payload"],
+                "warnings": warnings + ["No build pipeline for sheet {!r}; returning schema-only payload".format(target_sheet)],
                 "contract_source": contract_source,
                 "build_source": "engine_schema_only_unknown_sheet",
             })
             return payload
 
         except Exception as exc:
-            # v5.51.0 [FIX-1]: structured error envelope.
             err_class = exc.__class__.__name__
             err_text = str(exc)[:500]
             logger.warning(
@@ -3892,7 +4486,7 @@ class DataEngineV5:
                 "_engine_error": err_text,
                 "_engine_error_class": err_class,
                 "contract_source": "exception_envelope",
-                "build_source": "engine_exception_envelope_v5_51",
+                "build_source": "engine_exception_envelope_v5_55",
             })
             return payload
 
@@ -3945,6 +4539,9 @@ class DataEngineV5:
             "candlesticks_available": _HAS_CANDLESTICKS,
             "schema_registry_available": _SCHEMA_AVAILABLE,
             "normalize_helpers_available": _HAS_NORMALIZE_HELPERS,
+            "subunit_exchanges_count": len(_SUBUNIT_EXCHANGES),
+            "subunit_detect_threshold": _SUBUNIT_DETECT_RATIO_THRESHOLD,
+            "geo_correction_enabled": True,
         }
 
     async def get_health(self) -> Dict[str, Any]:
@@ -4013,7 +4610,7 @@ def get_cache() -> Optional[MultiLevelCache]:
 # =============================================================================
 # Legacy aliases
 # =============================================================================
-ENGINE = None       # populated lazily on first get_engine() call
+ENGINE = None
 engine = None
 _ENGINE = None
 DataEngine = DataEngineV5
