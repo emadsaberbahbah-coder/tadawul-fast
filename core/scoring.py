@@ -2,8 +2,9 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.2.3
-(AUDIT-DRIVEN HARDENING / NO-FABRICATED-CONFIDENCE /
+Scoring Module — v5.2.4
+(POST-DEPLOY SYNTHESIZER-OVER-AGGRESSION GUARD /
+ [PRESERVED v5.2.3] AUDIT-DRIVEN HARDENING / NO-FABRICATED-CONFIDENCE /
  RECOMMENDATION-COHERENCE-GUARDED / RISK-PENALTY-REBALANCED /
  REVENUE-COLLAPSE-AWARE QUALITY / UNIT-MISMATCH-SAFE FORECASTS /
  ILLIQUID-AWARE FORECAST SKIP /
@@ -11,6 +12,78 @@ Scoring Module — v5.2.3
  ACCUMULATE-ALIGNED / 5-TIER + CONVICTION FLOORS /
  INSIGHTS-INTEGRATED / PHANTOM-ROW-SAFE / SCHEMA-ALIGNED /
  v5.53.0 ENGINE-UNIT COMPATIBLE)
+================================================================================
+
+v5.2.4 changes (vs v5.2.3)  —  POST-DEPLOY SYNTHESIZER-OVER-AGGRESSION GUARD
+----------------------------------------------------------------------------
+Closes one structural defect surfaced by the post-deploy production
+audit (127-row Global_Markets sample, May 10 2026). v5.2.3's
+unit-mismatch FLOOR guard was correct and is preserved; v5.2.4 adds
+the missing CEILING guard plus a two-sided bound on the displayed
+upside_pct field.
+
+Audit observation (post-deploy):
+
+  IMPLAUSIBLY HIGH upside_pct values flowing through to display:
+
+    SD.US      +500.38%   intrinsic  86.45  / price  14.40   Energy E&P
+    NPSNY.US   +472.45%   intrinsic  63.08  / price  11.02   Internet Retail
+    CRK.US     +396.01%   intrinsic  69.94  / price  14.10   Energy E&P
+    SBK.JSE    +470.34%   intrinsic 174798  / price  30648   Banks
+                          (post data_engine_v2 v5.55.1 unit fix)
+    ML.PA      +190.00%   intrinsic  92.34  / price  31.84   Auto Parts
+    RCI.US     +166.43%   intrinsic  98.35  / price  36.92   Telecom
+    BCE.TO     +162.30%   intrinsic  86.79  / price  33.09   Telecom
+    KEP.US     +153.24%   intrinsic  39.10  / price  15.44   Utility
+
+  Root cause is in the upstream intrinsic synthesizer (in
+  data_engine_v2._compute_intrinsic_and_upside). It applies a
+  Graham-style formula:
+
+      anchor = eps * (8.5 + 2.0 * min(growth_yoy, 25%))
+
+  capped at a 58.5x EPS multiplier — appropriate for hyper-growth
+  tech, absurd for mature value sectors. The other path
+  (eps * pe_forward) is also leaky when pe_forward >> pe_ttm.
+
+v5.2.4 fixes:
+
+  G. derive_forecast_patch — SYNTHESIS CEILING guard.
+     Mirror to the v5.2.3 unit-mismatch FLOOR. After roi12 has been
+     synthesized FROM FAIR VALUE (roi12_synthesized_from_fair=True),
+     if it's > +200%, treat as synthesizer over-aggression, suppress
+     the entire forecast chain, and emit
+     "forecast_suspect_synthesis_overshoot" in errors.
+     Critically does NOT fire for provider-supplied roi12 — only for
+     values manufactured locally from fair/price.
+
+  H. derive_upside_pct — TWO-SIDED SUSPECT BOUNDS.
+     The displayed upside_pct field gets explicit bounds:
+       - upside < -90%  -> suppress (returns None).
+       - upside > +200% -> suppress (returns None).
+     The intermediate range [-90%, +200%] preserves legitimate
+     value calls (deep-distressed at -85%; aggressive value at
+     +180%). Thresholds chosen against the actual production sample.
+
+  I. compute_valuation_score — GUARDED UPSIDE COMPUTATION.
+     The ad-hoc upside = (fair / price) - 1.0 calculation routes
+     through _is_upside_suspect. When suspect, valuation falls
+     back to anchors (PE/PB/PS/PEG/EV) instead of getting a
+     max-saturated upside contribution.
+
+  J. compute_scores — ERROR TRACKING.
+     When derive_upside_pct returns None and the row had a
+     non-zero fair value, "upside_synthesis_suspect" is added
+     to scoring_errors so operators can audit affected rows.
+     (Enhanced in final v5.2.4: also fires when a directly-supplied
+     suspect upside_pct is suppressed, even if fair value is absent,
+     ensuring full audit coverage.)
+
+[PRESERVED — strictly] All v5.2.3 / v5.2.2 / v5.2.1 / v5.2.0 / v5.1.0
+helpers, signatures, dataclass fields, behaviors, and constants. The
+existing _FORECAST_ROI12_UNIT_MISMATCH_FLOOR is preserved exactly.
+Public API surface unchanged.
+
 ================================================================================
 
 v5.2.3 changes (vs v5.2.2)  —  AUDIT-DRIVEN HARDENING
@@ -200,7 +273,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "5.2.3"
+__version__ = "5.2.4"
 SCORING_VERSION = __version__
 
 # =============================================================================
@@ -297,6 +370,55 @@ _QUALITY_REVENUE_COLLAPSE_MAX_HAIRCUT = 0.55  # Min multiplier (1.0 = no penalty
 # instead of synthesizing.
 _CONFIDENCE_FALLBACK_MIN_COMPLETENESS = 0.40
 _CONFIDENCE_FALLBACK_MIN_PROVIDERS = 1
+
+
+# =============================================================================
+# v5.2.4 — Synthesizer-over-aggression guard
+# =============================================================================
+#
+# Mirror to v5.2.3's _FORECAST_ROI12_UNIT_MISMATCH_FLOOR, but on the
+# POSITIVE side. Catches the +396% / +470% / +500% upside cases
+# observed in the May 2026 post-deploy audit (SD.US, NPSNY.US, CRK.US,
+# SBK.JSE post-v5.55.1 unit fix).
+#
+# Only fires when roi12 was synthesized from fair value (not when
+# the provider supplied directly), because a provider-supplied
+# roi12 above +200% may reflect a legitimate high-conviction call
+# we don't want to silently suppress.
+
+# Forecast-synthesis CEILING guard (POSITIVE side, v5.2.4).
+_FORECAST_ROI12_SYNTHESIS_CEILING = 2.00   # +200% over 12 months
+
+# Two-sided suspect bounds for the user-visible upside_pct field.
+# Threshold rationale (against the production sample):
+#   FLOOR -90% catches AV.LSE (-97%), SMIN.LSE (-99%), SBK.JSE (-94%),
+#                      ANG.JSE (-96%); preserves -50% to -85% genuine.
+#   CEIL +200% catches SD.US (+500%), NPSNY.US (+472%), CRK.US (+396%),
+#                      SBK.JSE post-v5.55.1 (+470%); preserves
+#                      ML.PA (+190%), RCI.US (+166%), BCE.TO (+162%),
+#                      KEP.US (+153%).
+_UPSIDE_PCT_SUSPECT_FLOOR = -0.90      # -90%
+_UPSIDE_PCT_SUSPECT_CEILING = 2.00     # +200%
+
+
+def _is_upside_suspect(upside: Optional[float]) -> bool:
+    """
+    v5.2.4: Returns True when an upside_pct value falls outside the
+    data-quality sanity bounds.
+
+    Use to guard:
+      - The displayed upside_pct field (derive_upside_pct).
+      - The ad-hoc upside computation in compute_valuation_score.
+
+    None inputs return False (i.e. None is not "suspect" — it's just
+    absent; callers handle absence separately).
+    """
+    if upside is None:
+        return False
+    return (
+        upside < _UPSIDE_PCT_SUSPECT_FLOOR
+        or upside > _UPSIDE_PCT_SUSPECT_CEILING
+    )
 
 
 # =============================================================================
@@ -852,7 +974,7 @@ def get_weights_for_horizon(horizon: Horizon, settings: Any = None) -> ScoreWeig
 
 
 # =============================================================================
-# Derived Field Helpers (preserved)
+# Derived Field Helpers (v5.2.4 — derive_upside_pct updated)
 # =============================================================================
 
 def derive_volume_ratio(row: Mapping[str, Any]) -> Optional[float]:
@@ -891,8 +1013,32 @@ def derive_day_range_position(row: Mapping[str, Any]) -> Optional[float]:
 
 
 def derive_upside_pct(row: Mapping[str, Any]) -> Optional[float]:
+    """
+    Compute the displayed upside_pct field.
+
+    v5.2.4 — TWO-SIDED SUSPECT BOUNDS.
+    Suppresses values outside [_UPSIDE_PCT_SUSPECT_FLOOR,
+    _UPSIDE_PCT_SUSPECT_CEILING] (default -90% to +200%) by returning
+    None. Catches both the LSE/JSE/TASE phantom downsides
+    (-94% to -99%, subunit pricing artifacts) and the Graham-formula
+    synthesizer over-aggression (+396% to +500% on SD.US, NPSNY.US,
+    CRK.US, SBK.JSE).
+
+    The bounds apply to BOTH:
+      - a row-supplied upside_pct value (suppressed if suspect)
+      - a locally-computed (intrinsic - price) / price (suppressed
+        if suspect)
+
+    Returns None when:
+      - upside is missing (no price or no intrinsic)
+      - upside is suspect (outside bounds)
+    Otherwise returns the rounded fraction.
+    """
     usp = _get_float(row, "upside_pct")
     if usp is not None:
+        # v5.2.4: guard against suspect provider-supplied upside.
+        if _is_upside_suspect(usp):
+            return None
         return usp
 
     price = _get_float(row, "current_price", "price", "last_price")
@@ -901,7 +1047,13 @@ def derive_upside_pct(row: Mapping[str, Any]) -> Optional[float]:
     if price is None or price <= 0 or intrinsic is None or intrinsic <= 0:
         return None
 
-    return _round((intrinsic - price) / price, 4)
+    raw = (intrinsic - price) / price
+
+    # v5.2.4: guard against synthesizer-derived suspect upside.
+    if _is_upside_suspect(raw):
+        return None
+
+    return _round(raw, 4)
 
 
 def invest_period_label(horizon: Horizon, horizon_days: Optional[int] = None) -> str:
@@ -1043,7 +1195,7 @@ def short_term_signal(
 
 
 # =============================================================================
-# Forecast Helpers — v5.2.3: illiquid skip + unit-mismatch guard
+# Forecast Helpers — v5.2.4: hardened with ceiling guard
 # =============================================================================
 
 def _forecast_params_from_settings(settings: Any) -> ForecastParameters:
@@ -1132,17 +1284,20 @@ def derive_forecast_patch(
     forecasts: ForecastParameters,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """
-    v5.2.3: hardened forecast derivation.
+    v5.2.4: hardened forecast derivation.
 
-    Two new safety paths vs v5.2.2:
-      1. ILLIQUID-AWARE EARLY EXIT — when _is_row_unforecastable
-         returns True, return all-None patch immediately. Stops
-         the placeholder-forecast leak for delisted / stale rows.
-      2. UNIT-MISMATCH SANITY GUARD — after roi12 has been derived
-         (whether from API or synthesized), if it's < -50%, treat as
-         a unit-conversion bug (subunit pricing, share-class issue),
-         suppress the forecast, and emit an error tag. roi1/roi3
-         derived from this bad roi12 are also suppressed.
+    Three safety paths inherited from v5.2.3, plus one new in v5.2.4:
+      1. ILLIQUID-AWARE EARLY EXIT (v5.2.3) — when _is_row_unforecastable
+         returns True, return all-None patch immediately.
+      2. UNIT-MISMATCH SANITY GUARD, FLOOR side (v5.2.3) — after roi12
+         has been derived, if it's < -50%, treat as a unit-conversion
+         bug, suppress, emit "forecast_suspect_unit_mismatch".
+      3. SYNTHESIS-CEILING GUARD (v5.2.4 NEW) — symmetric to (2).
+         When roi12 was synthesized from fair value AND is > +200%,
+         treat as Graham-formula over-aggression, suppress, emit
+         "forecast_suspect_synthesis_overshoot". Does NOT fire for
+         provider-supplied roi12.
+      4. ROI clamping to ForecastParameters bounds (preserved).
     """
     errors: List[str] = []
 
@@ -1210,6 +1365,29 @@ def derive_forecast_patch(
             # since it's the unit-mismatched value, but keep 1m/3m.
             fp12 = None
 
+    # v5.2.4: SYNTHESIS-CEILING GUARD (POSITIVE side / CEILING).
+    # Mirror to the FLOOR guard above. ONLY fires when roi12 was
+    # synthesized from fair value (not provider-supplied), since a
+    # provider-supplied roi12 of +200%+ may be a legitimate
+    # high-conviction call we don't want to silently suppress.
+    # Production cases caught: SD.US (+500%), NPSNY.US (+472%),
+    # CRK.US (+396%), SBK.JSE post-v5.55.1 (+470%).
+    if (
+        roi12 is not None
+        and roi12_synthesized_from_fair
+        and roi12 > _FORECAST_ROI12_SYNTHESIS_CEILING
+    ):
+        errors.append("forecast_suspect_synthesis_overshoot")
+        roi12 = None
+        # The bad fair value also corrupted any 1m/3m derived from
+        # forecast_price_*; suppress them too. Convention matches
+        # the FLOOR-suppress branch above.
+        roi1 = None
+        roi3 = None
+        fp1 = None
+        fp3 = None
+        fp12 = None
+
     if roi12 is not None:
         roi12 = _clamp(roi12, forecasts.min_roi_12m, forecasts.max_roi_12m)
     if roi3 is None and roi12 is not None:
@@ -1250,7 +1428,8 @@ def derive_forecast_patch(
 
 
 # =============================================================================
-# Component Scoring — v5.2.3: revenue-collapse haircut on quality
+# Component Scoring — v5.2.4 (compute_valuation_score updated,
+# quality retains v5.2.3 revenue-collapse haircut)
 # =============================================================================
 
 def _data_quality_factor(row: Mapping[str, Any]) -> float:
@@ -1434,7 +1613,18 @@ def compute_confidence_score(row: Mapping[str, Any]) -> Tuple[Optional[float], O
 
 
 def compute_valuation_score(row: Mapping[str, Any]) -> Optional[float]:
-    """Compute valuation score (0-100). Preserved from v5.0.0."""
+    """
+    Compute valuation score (0-100).
+
+    v5.2.4 — GUARDED UPSIDE COMPUTATION.
+      The ad-hoc upside = (fair / price) - 1.0 calculation now
+      routes through _is_upside_suspect. When the upside is suspect
+      (outside [-90%, +200%]), it falls back to None for the upside
+      contribution, leaving the anchor stack (PE/PB/PS/PEG/EV) and
+      any provider-supplied roi3/roi12 to do the work.
+
+    [PRESERVED v5.0.0+]: anchor stack and ROI mixing logic unchanged.
+    """
     price = _get_float(row, "current_price", "price", "last_price", "last")
     if price is None or price <= 0:
         return None
@@ -1444,7 +1634,16 @@ def compute_valuation_score(row: Mapping[str, Any]) -> Optional[float]:
         "intrinsic_value", "fair_value", "target_price",
         "forecast_price_3m", "forecast_price_12m", "forecast_price_1m"
     )
-    upside = ((fair / price) - 1.0) if fair is not None and fair > 0 else None
+
+    # v5.2.4: GUARDED UPSIDE.
+    # Compute and immediately filter through _is_upside_suspect so a
+    # synthesizer artifact doesn't saturate the upside component.
+    upside: Optional[float] = None
+    if fair is not None and fair > 0:
+        raw_upside = (fair / price) - 1.0
+        if not _is_upside_suspect(raw_upside):
+            upside = raw_upside
+        # else: leave upside=None; anchors + ROIs carry the score.
 
     roi3 = _as_roi_fraction(_get(row, "expected_roi_3m", "expected_return_3m"))
     roi12 = _as_roi_fraction(_get(row, "expected_roi_12m", "expected_return_12m"))
@@ -1994,16 +2193,14 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     """
     Score a single row.
 
-    v5.2.3 changes:
-      - compute_confidence_score may now return (None, None); the
-        downstream penalty calc and bucket helpers already handle
-        this correctly.
-      - compute_quality_score may return a haircut-adjusted value.
-      - compute_recommendation now applies the coherence guard.
-      - derive_forecast_patch may early-exit (illiquid skip) or
-        suppress unit-mismatched roi12/roi3/roi1.
+    v5.2.4 changes:
+      - derive_upside_pct now returns None for suspect upsides.
+      - compute_valuation_score guards its upside computation.
+      - derive_forecast_patch has a synthesis-ceiling guard.
+      - error tracking added for suppressed suspect upsides
+        (computed AND directly-supplied, even without intrinsic value).
 
-    [PRESERVED] All v5.2.0 / v5.2.1 / v5.2.2 mechanics.
+    [PRESERVED] All v5.2.0 / v5.2.1 / v5.2.2 / v5.2.3 mechanics.
     """
     source = dict(row or {})
     scoring_errors: List[str] = []
@@ -2031,6 +2228,37 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     vol_ratio = derive_volume_ratio(working)
     drp = derive_day_range_position(working)
     usp = derive_upside_pct(working)
+
+    # v5.2.4: Track upside suppression.
+    # Fire the audit tag when:
+    #   (a) derive_upside_pct returned None, AND either
+    #        i.  the row had a computed upside that was suspect, OR
+    #        ii. the row had a directly-supplied suspect upside_pct
+    #            (even if fair/intrinsic is missing).
+    if usp is None:
+        _raw_intrinsic = _get_float(working, "intrinsic_value", "fair_value")
+        _raw_price = _get_float(working, "current_price", "price", "last_price")
+
+        reason_for_suppress = False
+
+        # Check computed upside (fair/price - 1)
+        if (
+            _raw_intrinsic is not None and _raw_intrinsic > 0
+            and _raw_price is not None and _raw_price > 0
+        ):
+            _raw_upside = (_raw_intrinsic - _raw_price) / _raw_price
+            if _is_upside_suspect(_raw_upside):
+                reason_for_suppress = True
+
+        # Check directly-supplied upside_pct from original source
+        if not reason_for_suppress:
+            _supplied_usp = _get_float(source, "upside_pct")
+            if _supplied_usp is not None and _is_upside_suspect(_supplied_usp):
+                reason_for_suppress = True
+
+        if reason_for_suppress:
+            scoring_errors.append("upside_synthesis_suspect")
+
     rsi_val = _get_float(working, "rsi_14", "rsi", "rsi14")
     rsi_sig = rsi_signal(rsi_val)
 
@@ -2060,16 +2288,8 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         overall_raw = _round(100.0 * _clamp(base01, 0.0, 1.0), 2)
 
         risk01 = (risk / 100.0) if risk is not None else 0.50
-        # v5.2.3: when conf01 is None (no signal), treat as
-        # mid-confidence for penalty calc only. We don't penalize
-        # rows for missing confidence — that would be double-counting
-        # the same data gap.
         conf01_used = conf01 if conf01 is not None else 0.55
 
-        # v5.2.3: with risk_penalty_strength=0.40 the penalty for a
-        # high-risk stock (risk01=0.7) becomes:
-        #   risk_pen = 1 - 0.40 * (0.7 * 0.70) = 1 - 0.196 = 0.80
-        # was 0.73 in v5.2.2 with strength=0.55.
         risk_pen = _clamp(1.0 - weights.risk_penalty_strength * (risk01 * 0.70), 0.0, 1.0)
         conf_pen = _clamp(1.0 - weights.confidence_penalty_strength * ((1.0 - conf01_used) * 0.80), 0.0, 1.0)
         penalty_factor = _round(risk_pen * conf_pen, 4)
