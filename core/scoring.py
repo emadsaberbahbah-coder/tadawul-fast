@@ -2,134 +2,174 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.2.2
-(VIEW-COMPLETENESS HARDENED / VIEW-TOKENS-IN-EVERY-REASON /
+Scoring Module — v5.2.3
+(AUDIT-DRIVEN HARDENING / NO-FABRICATED-CONFIDENCE /
+ RECOMMENDATION-COHERENCE-GUARDED / RISK-PENALTY-REBALANCED /
+ REVENUE-COLLAPSE-AWARE QUALITY / UNIT-MISMATCH-SAFE FORECASTS /
+ ILLIQUID-AWARE FORECAST SKIP /
+ [PRESERVED] VIEW-COMPLETENESS HARDENED / VIEW-TOKENS-IN-EVERY-REASON /
  ACCUMULATE-ALIGNED / 5-TIER + CONVICTION FLOORS /
  INSIGHTS-INTEGRATED / PHANTOM-ROW-SAFE / SCHEMA-ALIGNED /
  v5.53.0 ENGINE-UNIT COMPATIBLE)
 ================================================================================
 
+v5.2.3 changes (vs v5.2.2)  —  AUDIT-DRIVEN HARDENING
+-----------------------------------------------------
+Closes six structural defects surfaced by the production audit of
+the deployed Global_Markets sheet (1,707 rows × 46 cols). v5.2.2's
+unit-conversion fix was correct but local; the audit revealed broader
+pathological patterns in scoring outputs that v5.2.3 addresses.
+
+Audit findings (with concrete examples from the snapshot):
+
+  1. Forecast Confidence collapsed onto a ~60% baseline for >90% of
+     rows. compute_confidence_score's fallback path was always
+     synthesizing a value (~55) from _data_quality_factor's default
+     of 0.60 + completeness ~0.50 + provider count = 0. The "60%
+     wall" was therefore not a model output but a fabrication.
+
+  2. BUY / STRONG_BUY recommendations attached to rows whose own
+     forecast pointed DOWN (negative 1M and 3M ROI). Examples:
+     STNE.US (BUY, roi3=-3.1%), CNX.US (BUY, roi3=-2.4%),
+     COALINDIA.NSE (BUY, roi3=-1.9%). compute_recommendation
+     trusted reco_normalize's output without cross-checking against
+     the row's own forecasts.
+
+  3. REDUCE-heavy recommendation distribution (~50% of rows).
+     risk_penalty_strength=0.55 was making high-risk stocks lose
+     ~27% of their composite score, mechanically pushing them into
+     REDUCE/SELL even when the underlying fundamentals warranted
+     HOLD/BUY.
+
+  4. Quality Score = 95 on KROS.US despite revenue YoY = -87%.
+     compute_quality_score weighted ROE / margins independently of
+     top-line trajectory. A company can have 30% net margins this
+     quarter and still be in terminal decline; the score didn't
+     recognize that.
+
+  5. LSE / JSE / TA tickers showing phantom -97% to -99% downside.
+     Examples: AV.LSE (-97.45%), STAN.LSE (-99.0%), MTN.JSE
+     (-98.62%), POLI.TA (-99.0%). Caused by intrinsic_value being
+     in the major currency unit (GBP/ZAR/ILS) while current_price
+     was in the subunit (GBX/ZAC/ILA). derive_forecast_patch
+     happily computed (fair/price - 1) without checking unit
+     consistency, producing roi12 values clamped to the most
+     negative bound and flowing through to valuation_score.
+
+  6. Placeholder forecasts emitted for delisted / illiquid rows.
+     LSI.US (delisted), EXPGF.US / BABWF.US (PINK/OTC stale), and
+     OOREDOO.KW (zero market cap) all had synthesized forecast
+     fields even though their data was unusable. derive_forecast_patch
+     had no early-exit for unrecoverable inputs.
+
+v5.2.3 fixes, by audit item:
+
+  A. compute_confidence_score — NO-FABRICATED-CONFIDENCE.
+     When there is genuinely no signal (no explicit DQ marker AND
+     completeness < 0.40 AND no listed providers), return
+     (None, None) instead of the synthesized fallback. The
+     downstream consumers (recommendation gates, confidence_bucket,
+     compute_scores' penalty calc) already treat None correctly.
+
+  B. compute_recommendation — RECOMMENDATION-COHERENCE-GUARD.
+     After reco_normalize returns its label, verify the label is
+     coherent with the row's own forecasts. Specifically:
+       - if canonical_rec ∈ {BUY, STRONG_BUY}
+       - AND roi3 < -0.02  (more than 2% expected loss in 3 months)
+       - AND confidence100 < 65
+     -> downgrade to HOLD with an explicit
+        "coherence guard: <orig> → HOLD; 3M ROI <pct>% with
+         AI confidence <conf>%" reason.
+     Strong signals (high confidence) override the guard, since
+     a high-conviction BUY with mildly negative 3M ROI may still
+     be a legitimate accumulation call. Low-confidence BUYs in the
+     face of negative forecasts are the audit pattern we're killing.
+
+  C. ScoringConfig.risk_penalty_strength — RISK-PENALTY-REBALANCE.
+     Default lowered from 0.55 to 0.40. With v5.2.2 weights, a
+     high-risk stock (risk01 = 0.7) was losing 0.55 * 0.49 = 27%
+     of its composite. v5.2.3 brings that to 0.40 * 0.49 = 20%,
+     restoring REDUCE for genuinely-bad fundamentals while not
+     punishing volatile-but-good companies. ScoreWeights and the
+     env-var default ($SCORING_RISK_PENALTY) updated together so
+     the change is centralised.
+
+  D. compute_quality_score — REVENUE-COLLAPSE-AWARE.
+     Final combined score is multiplied by a haircut factor when
+     revenue_growth_yoy is severely negative. Linear ramp:
+       at -30% YoY → haircut = 1.0  (no penalty; cyclical bottom)
+       at -50% YoY → haircut = 0.80
+       at -75% YoY → haircut = 0.55  (clamped floor)
+     KROS-style cases (revenue -87%) cap at 0.55, bringing a
+     pre-haircut quality of 95 down to ~52 — still positive (the
+     margins are real today) but no longer aspirational. The
+     haircut is multiplicative on the final 0-1 combined score
+     before scaling, so the effect is consistent across rows.
+
+  E. derive_forecast_patch — UNIT-MISMATCH SANITY GUARD.
+     After roi12 has been derived (whether from API or synthesized
+     from fair/price), if it falls below -50%, suppress it and
+     emit "forecast_suspect_unit_mismatch" in errors. -50% is
+     deliberately conservative: a genuine 50%+ overvaluation
+     belief is rare and almost always implies a unit-conversion
+     bug (subunit pricing, share-class confusion, or stale fair
+     value vs ratio split).
+     Trapped here, this prevents the bad roi12 from propagating
+     to valuation_score (which calls _as_roi_fraction on
+     expected_roi_12m from the working row) and from being
+     written to the sheet's expected_roi_12m / forecast_price_12m
+     columns. The 1m/3m derived values from the bad 12m are also
+     suppressed.
+
+  F. derive_forecast_patch — ILLIQUID-AWARE EARLY EXIT.
+     Before any synthesis happens, check whether the row is
+     unforecastable:
+       - explicit forecast_unavailable=True flag, OR
+       - data_quality ∈ {STALE, MISSING, ERROR} AND no fair value
+         AND no API-supplied roi3/roi12
+     -> return all-None forecast patch with
+        "forecast_skipped_unavailable" error tag.
+     Stops the placeholder-forecast leak for delisted /
+     PINK-stale / zero-market-cap rows.
+
+[PRESERVED — strictly] Every v5.2.2 / v5.2.1 / v5.2.0 / v5.1.0
+helper, signature, dataclass field, and behaviour. The structural
+changes are ALL in function bodies; public API surface is
+unchanged. No removals from __all__.
+
+Public API additions in v5.2.3:
+  None at module level. The behavioural changes are all internal
+  to the existing public functions. The new helper
+  _coherence_guard_recommendation is private (leading underscore).
+
+================================================================================
+
 v5.2.2 changes (vs v5.2.1)
 --------------------------
-Closes a single edge-case unit-conversion bug surfaced by an audit
-of v5.2.1 against data_engine_v2.py v5.53.0.
-
-Background. data_engine_v2 v5.53.0 changed week_52_position_pct
-from being stored as a fraction (0.0-1.0) to being stored as
-percent points (0-100), to match the column header convention
-"52W Position %". scoring.py v5.2.1's compute_momentum_score
-reads this field via the generic _as_fraction helper, which uses
-a threshold of 1.5 to disambiguate fractions from percent points:
-
-    if abs(f) >= 1.5:
-        return f / 100.0
-    return f
-
-That threshold is fine for fields whose magnitudes either sit in
-[0, 1] (genuine fractions) or above ~5 (clearly percent points).
-But week_52_position_pct in PERCENT POINTS spans [0, 100]: values
-in [1.0, 1.5] (stocks sitting 1.0%-1.5% above their 52W low) get
-misread as fractions, producing inflated position scores that can
-shift momentum_score by 12-15 points and occasionally flip
-recommendation tiers in borderline rows.
-
-Affects roughly 0.5% of rows in a uniformly distributed universe;
-in practice somewhat less, since stocks rarely sit precisely
-1.0%-1.5% above a 52W low for long.
-
-v5.2.2 fixes the one call site without disturbing _as_fraction's
-behaviour for any other field:
-
-A. NEW _as_pct_position_fraction(value) helper. Same shape as
-   _as_fraction but with threshold 1.0 instead of 1.5, since the
-   underlying value cannot exceed 1.0 when stored as a fraction
-   (52W position is bounded [0, 1]) or 100 when stored as percent
-   points. Anything >= 1.0 must be percent points.
-
-B. compute_momentum_score's one read of week_52_position_pct
-   switched from _as_fraction to _as_pct_position_fraction.
-
-That's the entire delta vs v5.2.1. _as_fraction is preserved
-verbatim for every other call site (volatility, drawdown, VAR,
-margins, growth — none of which need the tighter threshold).
-
-[PRESERVED — strictly] Every v5.2.1 helper, signature, dataclass
-field, and behaviour. The structural change is one helper and
-one call-site swap. Public API: same as v5.2.1 plus the new
-private helper (not exported via __all__ since it's internal).
+[PRESERVED] _as_pct_position_fraction helper for week_52_position_pct
+in PERCENT POINTS storage (post data_engine_v2 v5.53.0). Threshold
+1.0 instead of 1.5 fixes the [1.0, 1.5] edge case where stocks
+sitting 1.0%-1.5% above their 52W low were being misread as
+fractions. Single call-site swap in compute_momentum_score.
 
 v5.2.1 changes (vs v5.2.0)
 --------------------------
-Closes the last visibility gap left by v5.2.0. v5.2.0 ensured the
-four view fields on AssetScores were always non-empty strings via
-the _view_or_na sentinel; v5.2.1 ensures the recommendation_reason
-text on every emitted row CONTAINS the same four view tokens in
-parseable "Fund: X | Tech: Y | Risk: Z | Val: W → REC" form, so
-the consuming Apps Script helper (11_SpecialPages.gs v1.2.3
-applyViewTokensAndRecommendationOverride_) can populate the
-dedicated view columns from the reason text on every row,
-including the rows where v5.2.0's compute_recommendation was
-emitting non-parseable suppression messages like "Insufficient
-data to score reliably."
-
-A. NEW _build_view_prefix(fund, tech, risk, val) module helper.
-   Produces a parseable "Fund: X | Tech: Y | Risk: Z | Val: W"
-   string with _view_or_na coercion on each token.
-
-B. compute_recommendation() now derives all four views at the
-   TOP of the function (before any early return), builds the
-   view prefix once, and includes it in every return path
-   (insufficient data, low confidence, day-trade STRONG_BUY,
-   day-trade SELL, reco_normalize unavailable).
-
-C. compute_scores() insufficient_inputs path now also builds the
-   view prefix and emits the same form.
-
-D. The _align_reason_to_canonical_recommendation passes from
-   v5.2.0 are unchanged.
+[PRESERVED] _build_view_prefix module helper. compute_recommendation
+derives all four views at the TOP of the function (before any
+early return), builds the view prefix once, and includes it in
+every return path. compute_scores insufficient_inputs path also
+includes the prefix.
 
 v5.2.0 changes (vs v5.1.0)
 --------------------------
-Hardening release driven by a Tadawul Fast Bridge audit of the
-Global_Markets sheet (1,707 rows × 46 cols) that surfaced two
-structural issues in the data this module emits:
+[PRESERVED] _view_or_na, _CANONICAL_REC_ALIASES,
+_align_reason_to_canonical_recommendation, score_views_completeness.
+compute_scores applies the alignment helper twice (before and
+after build_insights). compute_recommendation applies it to its
+return value.
 
-  - 99.6% of rows had blank Fundamental View / Technical View /
-    Risk View / Value View columns. Traced to consuming Apps
-    Script writer + Python derivation returning None when both
-    inputs to a view were missing.
-
-  - 30 rows had Recommendation = ACCUMULATE while their
-    Recommendation Reason ended "→ HOLD" or "→ BUY". Trace
-    showed reco_normalize returning canonical 5-tier labels
-    but legacy ACCUMULATE spelling appearing in the embedded
-    reason text from older insights_builder output.
-
-A. NEW _view_or_na(view) helper. Returns view unchanged when
-   non-empty string; returns "N/A" otherwise.
-
-B. NEW _CANONICAL_REC_ALIASES module constant. Maps every legacy
-   recommendation label (ACCUMULATE → BUY, etc.) to its canonical
-   5-tier equivalent.
-
-C. NEW _align_reason_to_canonical_recommendation helper. Two
-   passes: whole-word legacy-label replacement, then trailing-
-   arrow alignment.
-
-D. compute_scores() applies the alignment helper twice (before
-   and after build_insights).
-
-E. compute_recommendation() applies the alignment helper to its
-   return value.
-
-F. NEW score_views_completeness helper for verification probes.
-
-Public API (UNCHANGED + additions through v5.2.2):
-  All v5.1.0 exports preserved. No removals.
-  Additions: _CANONICAL_REC_ALIASES (constant),
-             score_views_completeness (function),
-             _align_reason_to_canonical_recommendation (function),
-             _as_pct_position_fraction (private function, v5.2.2).
+Public API (unchanged from v5.2.2):
+  All exports preserved. No removals.
 ================================================================================
 """
 
@@ -160,7 +200,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "5.2.2"
+__version__ = "5.2.3"
 SCORING_VERSION = __version__
 
 # =============================================================================
@@ -230,7 +270,37 @@ class MissingDataError(ScoringError):
 
 
 # =============================================================================
-# Configuration (preserved)
+# v5.2.3 — Audit-driven thresholds
+# =============================================================================
+#
+# Centralising these here so a future ops-side tuning round can move
+# them via env vars without touching the function bodies.
+
+# Recommendation-coherence guard. Rows where reco_normalize said
+# BUY/STRONG_BUY but the row's own roi3 is below this threshold AND
+# confidence is below the confidence threshold get downgraded to HOLD.
+_COHERENCE_ROI3_FLOOR_FRACTION = -0.02   # -2% over 3 months
+_COHERENCE_CONFIDENCE_FLOOR = 65.0       # 65% AI confidence
+
+# Forecast unit-mismatch guard. roi12 values below this get suppressed
+# as suspected unit-conversion bugs. -50% is deliberately conservative.
+_FORECAST_ROI12_UNIT_MISMATCH_FLOOR = -0.50
+
+# Quality revenue-collapse haircut. Linear ramp from "no penalty" at
+# the start threshold to "max penalty" at the floor threshold. The
+# haircut multiplies the final 0-1 combined quality score.
+_QUALITY_REVENUE_COLLAPSE_START = -0.30   # Start applying haircut at -30% YoY
+_QUALITY_REVENUE_COLLAPSE_FLOOR = -0.75   # Floor (max haircut) at -75% YoY
+_QUALITY_REVENUE_COLLAPSE_MAX_HAIRCUT = 0.55  # Min multiplier (1.0 = no penalty)
+
+# Confidence non-fabrication thresholds. Below all three, return None
+# instead of synthesizing.
+_CONFIDENCE_FALLBACK_MIN_COMPLETENESS = 0.40
+_CONFIDENCE_FALLBACK_MIN_PROVIDERS = 1
+
+
+# =============================================================================
+# Configuration
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -246,7 +316,12 @@ class ScoringConfig:
     default_opportunity: float = 0.10
     default_technical: float = 0.00
 
-    risk_penalty_strength: float = 0.55
+    # v5.2.3: lowered from 0.55 to 0.40 to address audit finding #3
+    # (REDUCE-heavy distribution). With v5.2.2 weights a high-risk
+    # stock lost ~27% of its composite score; v5.2.3 brings that to
+    # ~20%, restoring HOLD/BUY for genuinely-good-but-volatile names.
+    risk_penalty_strength: float = 0.40
+
     confidence_penalty_strength: float = 0.45
 
     confidence_high: float = 0.75
@@ -279,7 +354,8 @@ class ScoringConfig:
             default_growth=_env_float("SCORING_W_GROWTH", 0.15),
             default_opportunity=_env_float("SCORING_W_OPPORTUNITY", 0.10),
             default_technical=_env_float("SCORING_W_TECHNICAL", 0.00),
-            risk_penalty_strength=_env_float("SCORING_RISK_PENALTY", 0.55),
+            # v5.2.3: env default lowered from 0.55 to 0.40 (see above)
+            risk_penalty_strength=_env_float("SCORING_RISK_PENALTY", 0.40),
             confidence_penalty_strength=_env_float("SCORING_CONFIDENCE_PENALTY", 0.45),
         )
 
@@ -298,20 +374,13 @@ _HORIZON_DAYS_CUTOFFS: Tuple[Tuple[int, Horizon], ...] = (
 
 
 # =============================================================================
-# v5.2.0 — View / recommendation hardening constants
+# v5.2.0 — View / recommendation hardening constants (PRESERVED)
 # =============================================================================
 
-# v5.2.0: canonical 5-tier vocabulary (also exposed via
-# CANONICAL_RECOMMENDATION_CODES below). Kept here as a set for fast
-# membership checks inside the trailing-arrow alignment helper.
 _CANONICAL_REC_LABELS_SET: Set[str] = {
     "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL",
 }
 
-# v5.2.0: legacy / non-canonical recommendation labels and their
-# canonical 5-tier equivalents. Used by
-# _align_reason_to_canonical_recommendation to scrub free-form
-# reason text before storage.
 _CANONICAL_REC_ALIASES: Dict[str, str] = {
     "ACCUMULATE": "BUY",
     "ADD": "BUY",
@@ -333,11 +402,6 @@ _CANONICAL_REC_ALIASES: Dict[str, str] = {
     "STRONG SELL": "SELL",
 }
 
-# v5.2.0: regex matching a trailing arrow + recommendation-shaped
-# label. Anchored at end-of-string so we only rewrite the LAST
-# label in the reason. Handles all four arrow variants used by
-# reco_normalize and insights_builder (Unicode →, ASCII ->, =>,
-# and the word "THEN").
 _TRAILING_ARROW_RE = re.compile(
     r'(\s*(?:\u2192|->|=>|\bTHEN\b)\s*)'
     r'('
@@ -350,8 +414,6 @@ _TRAILING_ARROW_RE = re.compile(
     re.IGNORECASE,
 )
 
-# v5.2.0: pre-compiled patterns for the whole-word legacy-label
-# replacement pass.
 _LEGACY_LABEL_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (
         re.compile(
@@ -365,13 +427,6 @@ _LEGACY_LABEL_PATTERNS: List[Tuple[re.Pattern, str]] = [
 
 
 def _view_or_na(view: Optional[str]) -> str:
-    """
-    v5.2.0: Coerce a view value to a non-empty string.
-
-    Returns the input unchanged when it's a non-empty string.
-    Returns "N/A" (which is in every consumer's view vocabulary) when
-    the input is None or whitespace-only.
-    """
     if view is None:
         return "N/A"
     s = str(view).strip()
@@ -386,15 +441,6 @@ def _build_view_prefix(
     risk: Optional[str],
     value: Optional[str],
 ) -> str:
-    """
-    v5.2.1: Format the four view tokens into a parseable prefix.
-
-    Produces a string of the canonical form
-        "Fund: X | Tech: Y | Risk: Z | Val: W"
-    where each token is run through _view_or_na so missing inputs
-    appear as "N/A" rather than as the literal string "None" or
-    an empty token.
-    """
     return (
         "Fund: " + _view_or_na(fundamental)
         + " | Tech: " + _view_or_na(technical)
@@ -407,22 +453,6 @@ def _align_reason_to_canonical_recommendation(
     reason: Optional[str],
     canonical_rec: Optional[str],
 ) -> str:
-    """
-    v5.2.0: Align a recommendation reason text to a canonical 5-tier
-    recommendation label.
-
-    Two passes:
-      1. Whole-word replacement of every legacy / non-canonical label
-         (ACCUMULATE → BUY, STRONGBUY → STRONG_BUY, etc.) regardless
-         of position in the text.
-      2. Trailing-arrow alignment. If the text ends with an arrow
-         (→ / -> / => / THEN) followed by a recommendation-shaped
-         label that disagrees with canonical_rec, the label is
-         rewritten to canonical_rec.
-
-    Empty / arrow-less / canonical-already inputs are returned with
-    only Pass 1 rewrites applied.
-    """
     if not reason:
         return reason or ""
 
@@ -431,18 +461,11 @@ def _align_reason_to_canonical_recommendation(
     if not canonical_rec:
         canonical_rec = "HOLD"
 
-    # Pass 1: legacy label replacement throughout the text.
-    # CAVEAT: NEUTRAL is in the alias map because as a *recommendation*,
-    # NEUTRAL means HOLD. But NEUTRAL is also a valid VIEW label
-    # (Fund: NEUTRAL, Tech: NEUTRAL). To preserve view-axis NEUTRAL
-    # while rewriting recommendation-axis NEUTRAL, we exclude NEUTRAL
-    # from Pass 1 and rely on Pass 2 (trailing-arrow alignment) only.
     for pattern, canonical_label in _LEGACY_LABEL_PATTERNS:
         if canonical_label == "HOLD" and pattern.pattern.upper().find('NEUTRAL') > -1:
             continue
         text = pattern.sub(canonical_label, text)
 
-    # Pass 2: trailing-arrow alignment.
     match = _TRAILING_ARROW_RE.search(text)
     if match:
         arrow_part = match.group(1)
@@ -473,18 +496,8 @@ def score_views_completeness(
     row_or_scores: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """
-    v5.2.0: Return a per-row completeness summary for the four view
-    fields (Fundamental View, Technical View, Risk View, Value View).
-
-    Treats None, "" and "N/A" as MISSING for completeness purposes.
-
-    Returns:
-        {
-            "present": int,
-            "total":   int,
-            "ratio":   float,
-            "missing": List[str],
-        }
+    v5.2.0: Per-row completeness summary for the four view fields.
+    Treats None / "" / "N/A" as MISSING.
     """
     fields = (
         "fundamental_view",
@@ -514,9 +527,8 @@ def score_views_completeness(
     }
 
 
-
 # =============================================================================
-# Data Classes (extended in v5.1.0 with 5 new insight fields, preserved)
+# Data Classes
 # =============================================================================
 
 @dataclass(slots=True)
@@ -527,6 +539,8 @@ class ScoreWeights:
     w_growth: float = _CONFIG.default_growth
     w_opportunity: float = _CONFIG.default_opportunity
     w_technical: float = _CONFIG.default_technical
+    # v5.2.3: default sources from _CONFIG.risk_penalty_strength,
+    # which v5.2.3 lowered to 0.40.
     risk_penalty_strength: float = _CONFIG.risk_penalty_strength
     confidence_penalty_strength: float = _CONFIG.confidence_penalty_strength
 
@@ -547,10 +561,6 @@ class ScoreWeights:
         return self
 
     def as_factor_weights_map(self) -> Dict[str, float]:
-        """
-        Project into a {component_score_key: weight} mapping suitable for
-        passing into core.insights_builder.derive_top_factors. v5.1.0+.
-        """
         return {
             "valuation_score": self.w_valuation,
             "momentum_score": self.w_momentum,
@@ -600,10 +610,6 @@ class AssetScores:
     horizon_label: Optional[str] = None
     horizon_days_effective: Optional[int] = None
 
-    # v5.2.0: these four fields keep their Optional[str] type for
-    # backward compatibility, but compute_scores() now guarantees they
-    # are written as non-empty strings ("N/A" sentinel for the
-    # no-data case).
     fundamental_view: Optional[str] = None
     technical_view: Optional[str] = None
     risk_view: Optional[str] = None
@@ -625,7 +631,6 @@ class AssetScores:
     expected_price_3m: Optional[float] = None
     expected_price_12m: Optional[float] = None
 
-    # v5.1.0: insights_builder fields.
     sector_relative_score: Optional[float] = None
     conviction_score: Optional[float] = None
     top_factors: str = ""
@@ -691,6 +696,24 @@ def _safe_str(value: Any, default: str = "") -> str:
         return default
 
 
+def _safe_bool(value: Any) -> bool:
+    """v5.2.3: forgiving bool coercion. Recognises common truthy strings."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if not s:
+        return False
+    if s in {"true", "t", "yes", "y", "1", "on"}:
+        return True
+    if s in {"false", "f", "no", "n", "0", "off", "none", "null", "na", "n/a"}:
+        return False
+    return False
+
+
 def _get(row: Mapping[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in row and row[key] is not None:
@@ -715,38 +738,18 @@ def _as_pct_position_fraction(value: Any) -> Optional[float]:
     """
     v5.2.2: 52W-position-style fields, post data_engine_v2 v5.53.0.
 
-    The engine v5.53.0 fix changed week_52_position_pct from being
-    stored as a fraction (0.0-1.0) to PERCENT POINTS (0-100), to
-    match the column header convention "52W Position %".
+    Engine v5.53.0 stores week_52_position_pct as PERCENT POINTS
+    (0-100). This helper enforces the new contract: ALWAYS treats the
+    input as percent points and divides by 100, with the call-site
+    clamp to [0, 1] absorbing any legacy fraction-format leftovers.
 
-    This helper enforces the new contract: ALWAYS treats the input
-    as percent points and divides by 100. The function is strictly
-    monotonic (no threshold-based interpretation gap) so adjacent
-    values produce adjacent scores.
-
-    Compatibility note for transient legacy data:
-      During the deployment window, snapshot caches may still hold
-      pre-v5.53.0 fraction values (0.0-1.0). Those will be divided
-      by 100 here, becoming very small numbers (0.000-0.010). The
-      momentum_score's pos contribution gets clamped to [0, 1] so
-      a legacy fraction-format row will read as "near 52W low" --
-      a graceful degradation to a low score, NOT an inflated one.
-      Once v5.53.0 is deployed and snapshot caches age out (~60s
-      default TTL), all reads converge on percent-points storage.
-
-    Only call on fields whose semantic range is bounded [0, 100]
-    as percent points (or [0, 1] as a legacy fraction):
-    week_52_position_pct and similar. Do NOT use this for
-    unbounded percent fields like volatility_30d, max_drawdown_1y,
-    revenue_growth_yoy -- they can legitimately exceed 1.0 as
-    fractions and need _as_fraction's threshold-based handling.
+    Only call on fields whose semantic range is bounded [0, 100] as
+    percent points (or [0, 1] as a legacy fraction). Do NOT use this
+    for unbounded percent fields.
     """
     f = _safe_float(value)
     if f is None:
         return None
-    # Always treat as percent points per v5.53.0 storage contract.
-    # _clamp(pos, 0.0, 1.0) at the call site protects against legacy
-    # values that look "too small" (real percent-points 0-1% range).
     return f / 100.0
 
 
@@ -1040,7 +1043,7 @@ def short_term_signal(
 
 
 # =============================================================================
-# Forecast Helpers (preserved)
+# Forecast Helpers — v5.2.3: illiquid skip + unit-mismatch guard
 # =============================================================================
 
 def _forecast_params_from_settings(settings: Any) -> ForecastParameters:
@@ -1071,12 +1074,84 @@ def _forecast_params_from_settings(settings: Any) -> ForecastParameters:
     )
 
 
+def _empty_forecast_patch() -> Dict[str, Any]:
+    """v5.2.3: helper for forecast-skip paths."""
+    return {
+        "forecast_price_1m": None,
+        "forecast_price_3m": None,
+        "forecast_price_12m": None,
+        "expected_roi_1m": None,
+        "expected_roi_3m": None,
+        "expected_roi_12m": None,
+        "expected_return_1m": None,
+        "expected_return_3m": None,
+        "expected_return_12m": None,
+        "expected_price_1m": None,
+        "expected_price_3m": None,
+        "expected_price_12m": None,
+    }
+
+
+def _is_row_unforecastable(row: Mapping[str, Any]) -> bool:
+    """
+    v5.2.3: detect rows where forecast synthesis should be skipped
+    entirely. Returns True when ANY of:
+      - explicit forecast_unavailable=True flag
+      - data_quality ∈ {STALE, MISSING, ERROR} AND no fair value
+        AND no API-supplied roi3/roi12
+    Other shapes of "missing forecast inputs" still go through the
+    normal synthesis path; this is specifically for rows we know are
+    structurally unscoreable (delisted, PINK-stale, zero-cap names).
+    """
+    if _safe_bool(_get(row, "forecast_unavailable", "is_forecast_unavailable")):
+        return True
+
+    dq_label = str(_get(row, "data_quality") or "").strip().upper()
+    dq_is_unrecoverable = dq_label in {"STALE", "MISSING", "ERROR"}
+
+    if not dq_is_unrecoverable:
+        return False
+
+    # When DQ is unrecoverable, only skip if there's truly nothing
+    # to synthesize from. (Some stale rows still have a usable fair
+    # value or API-supplied ROI; we let those through.)
+    fair = _get_float(
+        row,
+        "intrinsic_value", "fair_value", "target_price",
+        "target_mean_price",
+    )
+    api_roi3 = _as_roi_fraction(_get(row, "expected_roi_3m", "expected_return_3m"))
+    api_roi12 = _as_roi_fraction(_get(row, "expected_roi_12m", "expected_return_12m"))
+    api_fp12 = _get_float(row, "forecast_price_12m", "expected_price_12m")
+
+    return fair is None and api_roi3 is None and api_roi12 is None and api_fp12 is None
+
+
 def derive_forecast_patch(
     row: Mapping[str, Any],
     forecasts: ForecastParameters,
 ) -> Tuple[Dict[str, Any], List[str]]:
-    patch: Dict[str, Any] = {}
+    """
+    v5.2.3: hardened forecast derivation.
+
+    Two new safety paths vs v5.2.2:
+      1. ILLIQUID-AWARE EARLY EXIT — when _is_row_unforecastable
+         returns True, return all-None patch immediately. Stops
+         the placeholder-forecast leak for delisted / stale rows.
+      2. UNIT-MISMATCH SANITY GUARD — after roi12 has been derived
+         (whether from API or synthesized), if it's < -50%, treat as
+         a unit-conversion bug (subunit pricing, share-class issue),
+         suppress the forecast, and emit an error tag. roi1/roi3
+         derived from this bad roi12 are also suppressed.
+    """
     errors: List[str] = []
+
+    # v5.2.3: ILLIQUID-AWARE EARLY EXIT
+    if _is_row_unforecastable(row):
+        errors.append("forecast_skipped_unavailable")
+        return _empty_forecast_patch(), errors
+
+    patch: Dict[str, Any] = {}
 
     price = _get_float(row, "current_price", "price", "last_price", "last")
     fair = _get_float(
@@ -1094,6 +1169,7 @@ def derive_forecast_patch(
     fp3 = _get_float(row, "forecast_price_3m", "expected_price_3m")
     fp12 = _get_float(row, "forecast_price_12m", "expected_price_12m")
 
+    # Derive ROIs from price + forecast prices when missing.
     if price is not None and price > 0:
         if roi12 is None and fp12 is not None and fp12 > 0:
             roi12 = (fp12 / price) - 1.0
@@ -1102,8 +1178,37 @@ def derive_forecast_patch(
         if roi1 is None and fp1 is not None and fp1 > 0:
             roi1 = (fp1 / price) - 1.0
 
+    # Derive 12m ROI from fair value as last-resort.
+    roi12_synthesized_from_fair = False
     if price is not None and price > 0 and roi12 is None and fair is not None and fair > 0:
         roi12 = (fair / price) - 1.0
+        roi12_synthesized_from_fair = True
+
+    # v5.2.3: UNIT-MISMATCH SANITY GUARD.
+    # If roi12 is below the unit-mismatch floor (-50% by default),
+    # something is almost certainly wrong with the unit conversion
+    # (LSE/JSE/TA subunit pricing was the audit-flagged case).
+    # Suppress the entire forecast chain rather than propagate
+    # nonsensical values into valuation_score and the output sheet.
+    if roi12 is not None and roi12 < _FORECAST_ROI12_UNIT_MISMATCH_FLOOR:
+        errors.append("forecast_suspect_unit_mismatch")
+        roi12 = None
+        # Suppress derived 1m/3m too IF they came from this bad roi12
+        # path (i.e. were not API-supplied independently of roi12).
+        # Conservative rule: if the roi12 was synthesized from fair
+        # value (not from API-supplied fp12), kill all three. If
+        # roi12 came from API-supplied fp12, the API was already
+        # internally consistent so 1m/3m can stay.
+        if roi12_synthesized_from_fair:
+            roi1 = None
+            roi3 = None
+            fp1 = None
+            fp3 = None
+            fp12 = None
+        else:
+            # API-supplied fp12 was the source — also suppress fp12
+            # since it's the unit-mismatched value, but keep 1m/3m.
+            fp12 = None
 
     if roi12 is not None:
         roi12 = _clamp(roi12, forecasts.min_roi_12m, forecasts.max_roi_12m)
@@ -1145,7 +1250,7 @@ def derive_forecast_patch(
 
 
 # =============================================================================
-# Component Scoring (preserved from v5.0.0)
+# Component Scoring — v5.2.3: revenue-collapse haircut on quality
 # =============================================================================
 
 def _data_quality_factor(row: Mapping[str, Any]) -> float:
@@ -1176,14 +1281,54 @@ def _completeness_factor(row: Mapping[str, Any]) -> float:
     return present / max(1, len(core_fields))
 
 
+def _revenue_collapse_haircut(revenue_growth: Optional[float]) -> float:
+    """
+    v5.2.3: Multiplicative haircut for quality scores when revenue
+    has collapsed YoY. Returns a multiplier in
+    [_QUALITY_REVENUE_COLLAPSE_MAX_HAIRCUT, 1.0].
+
+      revenue_growth >= -30%  -> 1.0   (no penalty)
+      revenue_growth = -50%   -> 0.80
+      revenue_growth = -75%   -> 0.55  (clamped floor)
+      revenue_growth <= -75%  -> 0.55  (floor)
+
+    None input or missing growth -> 1.0 (no penalty applied; we don't
+    punish data we don't have).
+    """
+    if revenue_growth is None:
+        return 1.0
+    if revenue_growth >= _QUALITY_REVENUE_COLLAPSE_START:
+        return 1.0
+
+    # Linear ramp from start (1.0x) to floor (max_haircut).
+    span = _QUALITY_REVENUE_COLLAPSE_FLOOR - _QUALITY_REVENUE_COLLAPSE_START
+    if span >= 0:
+        # Defensive: shouldn't happen given our constants
+        return 1.0
+    progress = (revenue_growth - _QUALITY_REVENUE_COLLAPSE_START) / span
+    progress = _clamp(progress, 0.0, 1.0)
+    haircut = 1.0 - progress * (1.0 - _QUALITY_REVENUE_COLLAPSE_MAX_HAIRCUT)
+    return _clamp(haircut, _QUALITY_REVENUE_COLLAPSE_MAX_HAIRCUT, 1.0)
+
+
 def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
     """
-    Compute quality score (0-100). Preserved from v5.0.0.
+    Compute quality score (0-100).
 
-    Returns None when there is genuinely no quality input -- no financial
-    fundamentals AND no meaningful data-quality marker AND completeness
-    below 30%. This is the phantom-row gate that prevents tickers with
-    no underlying data from sneaking into HOLD/BUY recommendations.
+    v5.2.3 changes:
+      - REVENUE-COLLAPSE-AWARE. After computing the standard
+        margins/ROE-based combined score, apply a multiplicative
+        haircut tied to revenue_growth_yoy. This addresses the
+        audit-flagged case (KROS quality=95 with revenue -87%):
+        margins can stay strong for a quarter or two after the top
+        line collapses, but the company is structurally impaired
+        and "95" is misleading. A 0.55x haircut at -75% growth
+        brings KROS-like cases down to ~52, still positive but no
+        longer aspirational.
+
+    [PRESERVED] Phantom-row gate: when there's no financial signal
+    AND the data_quality marker is weak AND completeness < 30%,
+    return None so the row is excluded from HOLD/BUY recommendations.
     """
     roe = _as_fraction(_get(row, "roe", "return_on_equity", "returnOnEquity"))
     roa = _as_fraction(_get(row, "roa", "return_on_assets", "returnOnAssets"))
@@ -1198,7 +1343,7 @@ def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
 
     completeness = _completeness_factor(row)
 
-    # Phantom-row gate
+    # Phantom-row gate (preserved from v5.0.0)
     if not has_any_financial and dq_is_weak and completeness < 0.30:
         return None
 
@@ -1225,25 +1370,66 @@ def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
     else:
         combined = data_quality_proxy
 
+    # v5.2.3: REVENUE-COLLAPSE-AWARE haircut applied to the final
+    # combined 0-1 score before scaling to 100.
+    revenue_growth = _as_fraction(
+        _get(row, "revenue_growth_yoy", "revenue_growth", "growth_yoy")
+    )
+    haircut = _revenue_collapse_haircut(revenue_growth)
+    combined *= haircut
+
     return _round(100.0 * _clamp(combined, 0.0, 1.0), 2)
 
 
 def compute_confidence_score(row: Mapping[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    fc = _safe_float(_get(row, "forecast_confidence", "ai_confidence", "confidence_score", "confidence"))
+    """
+    Compute (confidence_score_100, forecast_confidence_01).
+
+    v5.2.3: NO-FABRICATED-CONFIDENCE.
+      Path 1 (preferred, unchanged): use explicit forecast_confidence
+        from the row when present.
+      Path 2 (fallback, v5.2.3 hardened): only synthesize a confidence
+        value when there's a meaningful data-quality signal. Specifically:
+          - explicit data_quality marker present, OR
+          - completeness >= 0.40, OR
+          - >= 1 listed provider in data_sources / providers
+        Otherwise return (None, None) so downstream consumers know
+        confidence is genuinely unknown rather than the audit-flagged
+        ~60% baseline that haunted >90% of rows in v5.2.2.
+
+    Returns:
+      (confidence_score_100, forecast_confidence_01)
+      Both are None when no signal exists.
+    """
+    fc = _safe_float(
+        _get(row, "forecast_confidence", "ai_confidence", "confidence_score", "confidence")
+    )
     if fc is not None:
         fc01 = (fc / 100.0) if fc > 1.5 else fc
         fc01 = _clamp(fc01, 0.0, 1.0)
         return _round(fc01 * 100.0, 2), _round(fc01, 4)
 
-    dq = _data_quality_factor(row)
-    comp = _completeness_factor(row)
+    # v5.2.3: NO-FABRICATED-CONFIDENCE gate.
+    has_dq_signal = bool(str(_get(row, "data_quality") or "").strip())
+    completeness = _completeness_factor(row)
     provs = row.get("data_sources") or row.get("providers") or []
     try:
         pcount = len(provs) if isinstance(provs, list) else 0
     except Exception:
         pcount = 0
+
+    has_any_signal = (
+        has_dq_signal
+        or completeness >= _CONFIDENCE_FALLBACK_MIN_COMPLETENESS
+        or pcount >= _CONFIDENCE_FALLBACK_MIN_PROVIDERS
+    )
+
+    if not has_any_signal:
+        return None, None
+
+    dq = _data_quality_factor(row)
     prov_factor = _clamp(pcount / 3.0, 0.0, 1.0)
-    conf01 = _clamp(0.55 * dq + 0.35 * comp + 0.10 * prov_factor, 0.0, 1.0)
+    conf01 = _clamp(0.55 * dq + 0.35 * completeness + 0.10 * prov_factor, 0.0, 1.0)
     return _round(conf01 * 100.0, 2), _round(conf01, 4)
 
 
@@ -1329,19 +1515,11 @@ def compute_growth_score(row: Mapping[str, Any]) -> Optional[float]:
 
 def compute_momentum_score(row: Mapping[str, Any]) -> Optional[float]:
     """
-    Compute momentum score (0-100). v5.2.2: switched the
-    week_52_position_pct read from _as_fraction (threshold 1.5) to
-    _as_pct_position_fraction (threshold 1.0), which correctly
-    handles values in [1.0, 1.5] post data_engine_v2 v5.53.0
-    storage change. All other reads unchanged.
+    Compute momentum score (0-100). v5.2.2: switched
+    week_52_position_pct read to _as_pct_position_fraction.
     """
     pct = _as_roi_fraction(_get(row, "percent_change", "change_pct", "change_percent"))
     rsi = _get_float(row, "rsi_14", "rsi", "rsi14")
-    # v5.2.2 [unit-fix]: use the position-aware helper. Engine v5.53.0
-    # stores week_52_position_pct as PERCENT POINTS (0-100), and the
-    # generic _as_fraction's 1.5 threshold misreads values in [1.0, 1.5]
-    # (stocks 1.0%-1.5% above 52W low) as fractions, inflating the
-    # contribution from ~12% momentum weight.
     pos = _as_pct_position_fraction(_get(row, "week_52_position_pct", "position_52w_pct", "week52_position_pct"))
     pct_5d = _as_roi_fraction(_get(row, "price_change_5d"))
     vol_r = derive_volume_ratio(row)
@@ -1479,7 +1657,6 @@ def derive_fundamental_view(
     quality: Optional[float],
     growth: Optional[float],
 ) -> Optional[str]:
-    """BULLISH / NEUTRAL / BEARISH from quality + growth scores."""
     if quality is None and growth is None:
         return None
 
@@ -1502,7 +1679,6 @@ def derive_technical_view(
     momentum: Optional[float],
     rsi_label: Optional[str] = None,
 ) -> Optional[str]:
-    """BULLISH / NEUTRAL / BEARISH from technical + momentum + RSI signal."""
     if technical is None and momentum is None:
         return None
 
@@ -1520,7 +1696,6 @@ def derive_technical_view(
 
 
 def derive_risk_view(risk: Optional[float]) -> Optional[str]:
-    """LOW / MODERATE / HIGH from a 0-100 risk score (higher = riskier)."""
     if risk is None:
         return None
     if risk <= _CONFIG.risk_low_threshold:
@@ -1534,7 +1709,6 @@ def derive_value_view(
     valuation: Optional[float],
     upside_pct: Optional[float] = None,
 ) -> Optional[str]:
-    """CHEAP / FAIR / EXPENSIVE from valuation score and/or upside %."""
     if upside_pct is not None:
         if upside_pct > 0.20:
             return "CHEAP"
@@ -1554,7 +1728,56 @@ def derive_value_view(
 
 
 # =============================================================================
-# Recommendation (extended in v5.1.0 / v5.2.0 / v5.2.1)
+# v5.2.3 — Recommendation coherence guard
+# =============================================================================
+
+def _coherence_guard_recommendation(
+    canonical_rec: str,
+    roi3: Optional[float],
+    confidence100: Optional[float],
+    view_prefix: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    v5.2.3: Cross-check the recommendation label against the row's
+    own forecasts. Returns (downgraded_rec, downgraded_reason) if
+    a downgrade is warranted, or (None, None) to leave the original
+    intact.
+
+    Rule:
+      if canonical_rec ∈ {BUY, STRONG_BUY}
+         AND roi3 < _COHERENCE_ROI3_FLOOR_FRACTION
+         AND confidence100 < _COHERENCE_CONFIDENCE_FLOOR
+      -> downgrade to HOLD with explicit reason
+
+    Strong signals (high confidence) override the guard, since a
+    high-conviction BUY with mildly negative 3M ROI may be a
+    legitimate accumulation call. Low-confidence BUYs in the face of
+    negative forecasts are the audit-flagged pattern.
+    """
+    if canonical_rec not in ("BUY", "STRONG_BUY"):
+        return None, None
+    if roi3 is None:
+        return None, None
+    if roi3 >= _COHERENCE_ROI3_FLOOR_FRACTION:
+        return None, None
+
+    conf_for_guard = confidence100 if confidence100 is not None else 55.0
+    if conf_for_guard >= _COHERENCE_CONFIDENCE_FLOOR:
+        return None, None
+
+    roi3_pct_disp = _round(roi3 * 100.0, 1)
+    conf_pct_disp = _round(conf_for_guard, 0)
+
+    reason = (
+        f"{view_prefix} \u2192 HOLD "
+        f"(coherence guard: {canonical_rec} \u2192 HOLD; "
+        f"3M ROI {roi3_pct_disp}% with AI confidence {conf_pct_disp}%)"
+    )
+    return "HOLD", reason
+
+
+# =============================================================================
+# Recommendation
 # =============================================================================
 
 def compute_recommendation(
@@ -1577,23 +1800,21 @@ def compute_recommendation(
     value_view: Optional[str] = None,
     upside_pct: Optional[float] = None,
     rsi_label: Optional[str] = None,
-    # NEW in v5.1.0 -- pass-through to reco_normalize v7.1.0+
     conviction: Optional[float] = None,
     sector_relative: Optional[float] = None,
 ) -> Tuple[str, str]:
     """
-    Compute view-aware 5-tier recommendation, with optional conviction floors.
+    Compute view-aware 5-tier recommendation.
 
-    v5.2.1: Derives the four views at the TOP of the function (before
-    any early return) so every return path can include them in the
-    reason text. The reason text on every emitted row contains a
-    parseable "Fund: X | Tech: Y | Risk: Z | Val: W → REC" prefix.
+    v5.2.3 changes:
+      - RECOMMENDATION-COHERENCE-GUARD applied after reco_normalize
+        returns its label. See _coherence_guard_recommendation for
+        the rule.
 
-    v5.2.0: Adds a final pass through
-    _align_reason_to_canonical_recommendation() before returning.
+    v5.2.1 / v5.2.0 (preserved): all four views derived at the top so
+    every return path carries the parseable view prefix. Final pass
+    through _align_reason_to_canonical_recommendation before return.
     """
-    # v5.2.1: derive all four views FIRST so every early return can
-    # carry the parseable view prefix.
     if fundamental_view is None:
         fundamental_view = derive_fundamental_view(quality, growth)
     if technical_view is None:
@@ -1621,8 +1842,6 @@ def compute_recommendation(
             f"(low AI confidence {_round(c, 1)}%)",
         )
 
-    # Short-term horizons: a strong-momentum reversal can override the
-    # view-aware logic, since fundamentals matter less day-to-day.
     if horizon == Horizon.DAY:
         t = technical if technical is not None else 50.0
         m = momentum if momentum is not None else 50.0
@@ -1642,7 +1861,6 @@ def compute_recommendation(
                 f"Momentum={_round(m, 1)})",
             )
 
-    # Delegate to the single source of truth.
     try:
         from core.reco_normalize import recommendation_from_views  # noqa: WPS433
     except ImportError:
@@ -1650,9 +1868,7 @@ def compute_recommendation(
             from reco_normalize import recommendation_from_views  # noqa: WPS433
         except ImportError:
             logger.warning(
-                "core.reco_normalize unavailable; defaulting to HOLD. "
-                "This typically means a deployment issue -- recommendation "
-                "engine should always be present."
+                "core.reco_normalize unavailable; defaulting to HOLD."
             )
             return (
                 "HOLD",
@@ -1666,12 +1882,19 @@ def compute_recommendation(
         risk=risk_view,
         value=value_view,
         score=overall,
-        conviction=conviction,           # v5.1.0
-        sector_relative=sector_relative, # v5.1.0
+        conviction=conviction,
+        sector_relative=sector_relative,
     )
 
-    # v5.2.0: canonicalise label + align reason in one place.
     canonical_rec = normalize_recommendation_code(rec)
+
+    # v5.2.3: COHERENCE GUARD
+    guarded_rec, guarded_reason = _coherence_guard_recommendation(
+        canonical_rec, roi3, confidence100, view_prefix
+    )
+    if guarded_rec is not None and guarded_reason is not None:
+        return guarded_rec, guarded_reason
+
     aligned_reason = _align_reason_to_canonical_recommendation(reason, canonical_rec)
     return canonical_rec, aligned_reason
 
@@ -1748,15 +1971,10 @@ def normalize_recommendation_code(label: Any) -> str:
 
 
 # =============================================================================
-# v5.1.0: insights_builder lazy import helper
+# v5.1.0: insights_builder lazy import helper (preserved)
 # =============================================================================
 
 def _import_insights_builder():
-    """
-    Lazy import of core.insights_builder. Falls back to top-level
-    insights_builder for layouts that flatten the package. Returns None
-    if neither is available (insights are then skipped with a warning).
-    """
     try:
         from core import insights_builder as _ib  # noqa: WPS433
         return _ib
@@ -1776,16 +1994,16 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     """
     Score a single row.
 
-    v5.2.2: compute_momentum_score now uses _as_pct_position_fraction
-    for week_52_position_pct, fixing the [1.0, 1.5] edge case
-    introduced by data_engine_v2 v5.53.0's storage change. No other
-    behaviour change.
+    v5.2.3 changes:
+      - compute_confidence_score may now return (None, None); the
+        downstream penalty calc and bucket helpers already handle
+        this correctly.
+      - compute_quality_score may return a haircut-adjusted value.
+      - compute_recommendation now applies the coherence guard.
+      - derive_forecast_patch may early-exit (illiquid skip) or
+        suppress unit-mismatched roi12/roi3/roi1.
 
-    v5.2.0 mechanics (preserved):
-      1. _view_or_na coerces the four view fields to non-empty strings
-         at AssetScores write time.
-      2. _align_reason_to_canonical_recommendation runs twice
-         (before and after build_insights) to scrub legacy labels.
+    [PRESERVED] All v5.2.0 / v5.2.1 / v5.2.2 mechanics.
     """
     source = dict(row or {})
     scoring_errors: List[str] = []
@@ -1842,8 +2060,16 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         overall_raw = _round(100.0 * _clamp(base01, 0.0, 1.0), 2)
 
         risk01 = (risk / 100.0) if risk is not None else 0.50
+        # v5.2.3: when conf01 is None (no signal), treat as
+        # mid-confidence for penalty calc only. We don't penalize
+        # rows for missing confidence — that would be double-counting
+        # the same data gap.
         conf01_used = conf01 if conf01 is not None else 0.55
 
+        # v5.2.3: with risk_penalty_strength=0.40 the penalty for a
+        # high-risk stock (risk01=0.7) becomes:
+        #   risk_pen = 1 - 0.40 * (0.7 * 0.70) = 1 - 0.196 = 0.80
+        # was 0.73 in v5.2.2 with strength=0.55.
         risk_pen = _clamp(1.0 - weights.risk_penalty_strength * (risk01 * 0.70), 0.0, 1.0)
         conf_pen = _clamp(1.0 - weights.confidence_penalty_strength * ((1.0 - conf01_used) * 0.80), 0.0, 1.0)
         penalty_factor = _round(risk_pen * conf_pen, 4)
@@ -1860,8 +2086,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     rb = risk_bucket(risk)
     cb = confidence_bucket(conf01)
 
-    # v5.2.0: keep the raw (Optional[str]) views for the recommendation
-    # call so reco_normalize sees None for missing inputs.
     fundamental_view_raw = derive_fundamental_view(quality, growth)
     technical_view_raw = derive_technical_view(tech_score, momentum, rsi_sig)
     risk_view_raw = derive_risk_view(risk)
@@ -1871,7 +2095,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     roi1 = _as_roi_fraction(working.get("expected_roi_1m"))
     roi12 = _as_roi_fraction(working.get("expected_roi_12m"))
 
-    # ---- v5.1.0: compute conviction BEFORE the recommendation ---------
+    # ---- v5.1.0: compute conviction BEFORE the recommendation -------
     conviction: Optional[float] = None
     ib = _import_insights_builder()
     if ib is not None and overall is not None:
@@ -1890,7 +2114,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             scoring_errors.append(f"conviction_failed: {type(exc).__name__}")
 
     if insufficient_inputs:
-        # v5.2.1: include view-prefix even on suppression rows.
         view_prefix_for_suppress = _build_view_prefix(
             fundamental_view_raw, technical_view_raw,
             risk_view_raw, value_view_raw,
@@ -1918,8 +2141,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         )
 
     canonical_rec = normalize_recommendation_code(rec)
-
-    # v5.2.0: align reason BEFORE passing to insights_builder.
     reason = _align_reason_to_canonical_recommendation(reason, canonical_rec)
 
     st_signal_val = short_term_signal(tech_score, momentum, risk, horizon)
@@ -1967,7 +2188,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             logger.debug("build_insights failed for row: %s", exc)
             scoring_errors.append(f"insights_failed: {type(exc).__name__}")
 
-    # v5.2.0: re-align AFTER build_insights too.
     structured_reason = _align_reason_to_canonical_recommendation(
         structured_reason, canonical_rec
     )
@@ -1996,7 +2216,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         invest_period_label=period_label,
         horizon_label=horizon.value,
         horizon_days_effective=hdays,
-        # v5.2.0: views coerced to non-empty strings.
         fundamental_view=_view_or_na(fundamental_view_raw),
         technical_view=_view_or_na(technical_view_raw),
         risk_view=_view_or_na(risk_view_raw),
@@ -2015,7 +2234,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         expected_price_1m=forecast_patch.get("expected_price_1m"),
         expected_price_3m=forecast_patch.get("expected_price_3m"),
         expected_price_12m=forecast_patch.get("expected_price_12m"),
-        # v5.1.0 insight fields:
         sector_relative_score=None,
         conviction_score=conviction,
         top_factors=top_factors_str,
@@ -2068,7 +2286,7 @@ class ScoringEngine:
 
 
 # =============================================================================
-# Ranking + Batch Scoring (v5.1.0: adds sector-relative pass)
+# Ranking + Batch Scoring (preserved from v5.2.0)
 # =============================================================================
 
 def _rank_sort_tuple(row: Dict[str, Any], key_overall: str = "overall_score") -> Tuple[float, ...]:
@@ -2118,18 +2336,18 @@ def score_and_rank_rows(
     """
     Score every row and rank by overall_score.
 
-    v5.2.0: After insights_builder.enrich_rows_with_insights returns,
-    each row's recommendation_reason is re-aligned to its
-    recommendation field via _align_reason_to_canonical_recommendation.
+    [PRESERVED] After per-row scoring, runs a batch-level pass via
+    insights_builder.enrich_rows_with_insights() to compute
+    sector_relative_score and rebuild recommendation_reason with
+    sector-adjusted badges.
 
-    v5.1.0 (preserved): After per-row scoring, runs a batch-level
-    pass via insights_builder.enrich_rows_with_insights() to compute
-    sector_relative_score for each row and rebuild
-    recommendation_reason with the sector-adjusted badge.
+    [PRESERVED] After insights_builder returns, each row's
+    recommendation_reason is re-aligned via
+    _align_reason_to_canonical_recommendation, and view fields are
+    coerced via _view_or_na.
     """
     prepared = list(rows) if inplace else [dict(r or {}) for r in rows]
 
-    # Per-row scoring.
     for row in prepared:
         try:
             row.update(compute_scores(row, settings=settings))
@@ -2141,7 +2359,6 @@ def score_and_rank_rows(
             existing_errors.append(f"scoring_exception: {type(exc).__name__}")
             row["scoring_errors"] = existing_errors
 
-    # v5.1.0: Batch-level insights pass.
     ib = _import_insights_builder()
     if ib is not None:
         try:
@@ -2164,7 +2381,6 @@ def score_and_rank_rows(
         except Exception as exc:
             logger.debug("score_and_rank_rows: batch insights failed: %s", exc)
 
-    # v5.2.0: post-batch reason alignment + view N/A coercion.
     for row in prepared:
         rec = row.get("recommendation")
         reason = row.get("recommendation_reason")
@@ -2234,6 +2450,5 @@ __all__ = [
     "ScoringError",
     "InvalidHorizonError",
     "MissingDataError",
-    # v5.2.0 additions:
     "score_views_completeness",
 ]
