@@ -2,8 +2,87 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.57.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.58.0
 ================================================================================
+
+WHY v5.58.0 — DEFENSIVE CONSISTENCY HARDENING
+----------------------------------------------
+Post-deploy audit on May 10 2026 (16:26 UTC) revealed the v5.57.0 deploy
+produced contradictory row states: e.g., HPQ.US had BOTH the
+"forecast_unavailable_no_source" warning AND filled forecast prices
+matching the OLD momentum-fallback signature (roi_12m=+30.00% ==
+clamp(percent_change*4/100, +-0.30)). Mathematical fingerprint check
+across 19 sampled rows: 17/17 forecast-bearing rows matched the OLD
+formula, NONE matched the v5.57.0 intrinsic-clamped behavior.
+
+Two hypotheses were possible: (1) the deployment used an older file,
+or (2) some other module in the codebase produces the same +30% pattern.
+v5.58.0 hardens against BOTH cases by enforcing consistency invariants
+regardless of which upstream code path produced the row state.
+
+Additional production issues observed:
+  - KEP.US (+775,828%), KB.US (+256,189%), TM.US (+1,308%) — KRW/JPY
+    intrinsic values vs USD ADR price; legitimate units mismatch.
+  - ETHE (+1,503%), RNR.US (+249%) — implausible upside passing through
+    to sheet display because scoring.py v5.2.4's _is_upside_suspect
+    filters its OWN output but the engine's stored upside_pct is what
+    actually reaches the sheet.
+
+v5.58.0 fixes (defensive — independent of upstream code paths):
+
+  A. _compute_scores_fallback — IDEMPOTENT else-branch.
+     Change `if k not in row: row[k] = None` to unconditional
+     `row[k] = None`. The conditional form left stale momentum-fallback
+     values in place when the else-branch fired on a row processed by an
+     older path first (the production contradictory state).
+
+  B. _compute_scores_fallback — FINAL CONSISTENCY SWEEP.
+     After all logic, if forecast_unavailable=True, force ALL
+     forecast_price_* and expected_roi_* to None and tag with
+     "forecast_cleared_consistency_sweep". Catches any path where
+     forecasts got set despite forecast_unavailable being true.
+
+  C. _compute_intrinsic_and_upside — ADR / UNIT MISMATCH SUPPRESSION.
+     New constant _INTRINSIC_UNIT_MISMATCH_RATIO_HIGH=10.0 and _LOW=0.01.
+     When intrinsic/price falls outside [0.01, 10.0], the intrinsic is
+     almost certainly in the wrong currency unit (KRW/JPY ADR fundamentals
+     vs USD price). Suppress intrinsic_value, mark with
+     "intrinsic_unit_mismatch_suspected".
+
+  D. _compute_intrinsic_and_upside — ENGINE-LEVEL UPSIDE BOUNDS.
+     New constants _UPSIDE_PCT_SUSPECT_FLOOR=-0.90 and _CEILING=2.00,
+     mirroring scoring.py v5.2.4's bounds. When upside is computed
+     from intrinsic and falls outside these bounds, suppress
+     upside_pct AND clear intrinsic_value (so it doesn't propagate to
+     forecast synthesis). Tag with "upside_synthesis_suspect".
+
+  E. _compute_scores_fallback — TIGHTER intrinsic_usable.
+     Above the existing 3.0/0.3 outlier threshold, add a >10/<0.1
+     hard-kill threshold that suppresses intrinsic_value entirely
+     (sets to None), not just intrinsic_usable=False. This prevents
+     downstream _compute_intrinsic_and_upside from re-deriving upside
+     from a clearly-bogus intrinsic.
+
+  F. Module-level constants for C/D/E thresholds, near
+     _SUBUNIT_DETECT_RATIO_THRESHOLD.
+
+Expected post-deploy behavior:
+  - Rows with foreign-currency intrinsic (KEP.US, KB.US, TM.US) will
+    show BLANK intrinsic_value and upside_pct with the
+    "intrinsic_unit_mismatch_suspected" warning.
+  - Rows with implausible upside (RNR.US +250%, ETHE +1503%) will
+    show BLANK upside_pct with "upside_synthesis_suspect".
+  - Rows where forecast_unavailable is set will ALWAYS show all
+    forecast_price_* and expected_roi_* as BLANK, even if some
+    upstream path tried to fill them (the v5.57.0 contradictory
+    state observed in production becomes impossible).
+
+[PRESERVED — strictly] All v5.57.0 / v5.56.0 / v5.55.1 / v5.55.0 /
+v5.54.1 / v5.54.0 / v5.53.0 helpers, signatures, behaviors, AUDIT-1
+through AUDIT-6 hooks, subunit normalization, geo-misattribution
+corrections, completeness diagnostics, decision-field helpers, and
+the v5.57.0 momentum-fallback-removal narrative. Public API surface
+unchanged. No removals from __all__.
 
 WHY v5.57.0 — REMOVE MOMENTUM-BASED FORECAST FALLBACK
 ------------------------------------------------------
@@ -280,7 +359,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.57.0"
+__version__ = "5.58.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -427,6 +506,28 @@ _SUBUNIT_PRICE_FIELDS: Tuple[str, ...] = (
     "target_high_price",
     "target_low_price",
 )
+
+# v5.58.0 PHASE-D: engine-level upside_pct suspect bounds.
+# Mirrors scoring.py v5.2.4's _UPSIDE_PCT_SUSPECT_*. Applied here in
+# the engine because the engine's row["upside_pct"] is what reaches
+# the sheet display — scoring.py's filter operates on its own internal
+# output and does not override the engine's stored value.
+# Values observed in production sheet on May 10 2026 that motivate this:
+#   RNR.US +249.77%, ETHE +1503.69%, KEP.US +775,828%, KB.US +256,189%
+_UPSIDE_PCT_SUSPECT_FLOOR: float = -0.90      # -90%
+_UPSIDE_PCT_SUSPECT_CEILING: float = 2.00     # +200%
+
+# v5.58.0 PHASE-C / PHASE-E: ADR / foreign-currency intrinsic mismatch.
+# Above this ratio, intrinsic almost certainly came from foreign-currency
+# fundamentals (e.g., Korean Electric Power KEP.US ADR with intrinsic in
+# KRW vs price in USD: ratio = 119,803 / 15.44 = 7,758x).
+# Production observations: KEP.US 7,758x; KB.US 2,562x; TM.US 14.1x;
+# ETHE 16.0x. Threshold of 10x catches all four without false positives
+# on legitimate deep-value plays (the ceiling at +200% upside via
+# _UPSIDE_PCT_SUSPECT_CEILING already caps anything implausible below
+# 10x ratio, so 10x here is a units-mismatch detector, not a value-cap).
+_INTRINSIC_UNIT_MISMATCH_RATIO_HIGH: float = 10.0
+_INTRINSIC_UNIT_MISMATCH_RATIO_LOW: float = 0.01
 
 
 # =============================================================================
@@ -2725,7 +2826,19 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     intrinsic_usable = True
     if intrinsic is not None and price is not None and price > 0:
         intrinsic_ratio = intrinsic / price
-        if intrinsic_ratio > 3.0 or intrinsic_ratio < 0.3:
+        # v5.58.0 PHASE-E: hard-kill threshold for unit mismatches.
+        # Above 10x (or below 1/100x) is almost certainly foreign-currency
+        # ADR fundamentals vs USD price. Suppress intrinsic_value entirely
+        # so downstream _compute_intrinsic_and_upside cannot re-derive
+        # upside from it. Tag distinct from "intrinsic_outlier" so audits
+        # can separate units bugs from genuinely-deep-value cases.
+        if (intrinsic_ratio > _INTRINSIC_UNIT_MISMATCH_RATIO_HIGH
+                or intrinsic_ratio < _INTRINSIC_UNIT_MISMATCH_RATIO_LOW):
+            _append_warning(row, "intrinsic_unit_mismatch_suspected")
+            row["intrinsic_value"] = None
+            intrinsic = None
+            intrinsic_usable = False
+        elif intrinsic_ratio > 3.0 or intrinsic_ratio < 0.3:
             _append_warning(row, "intrinsic_outlier")
             intrinsic_usable = False
 
@@ -2922,10 +3035,17 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         row["expected_roi_3m"] = round(roi_3m, 6)
         row["expected_roi_1m"] = round(roi_1m, 6)
     else:
+        # v5.58.0 PHASE-A: unconditionally clear all forecast fields.
+        # The v5.57.0 form (`if k not in row: row[k] = None`) left stale
+        # values in place when this branch fired on a row that had been
+        # processed by an older code path first — the production audit
+        # on May 10 2026 showed rows like HPQ.US with the
+        # "forecast_unavailable_no_source" tag AND filled forecast prices
+        # (the OLD momentum-fallback +30% signature). Unconditional
+        # assignment guarantees consistency regardless of upstream state.
         for k in ("forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
                   "expected_roi_1m", "expected_roi_3m", "expected_roi_12m"):
-            if k not in row:
-                row[k] = None
+            row[k] = None
         if not forecast_skip:
             # v5.57.0: explicitly mark unforecastable so scoring.py v5.2.4's
             # _is_row_unforecastable() detects this path and skips synthesis.
@@ -2980,6 +3100,28 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             symbol, forecast_source,
             row.get("expected_roi_12m"), row.get("forecast_confidence"), row.get("warnings"),
         )
+
+    # v5.58.0 PHASE-B: final consistency sweep.
+    # If forecast_unavailable is set (by ANY path — this function's
+    # else-branch, an upstream provider, or a sibling module), then
+    # ALL forecast_price_* and expected_roi_* MUST be None. The audit on
+    # May 10 2026 surfaced contradictory rows where the unavailable tag
+    # coexisted with filled forecast values; this sweep makes that state
+    # impossible at the end of this function regardless of upstream code.
+    if _safe_bool(row.get("forecast_unavailable")):
+        cleared_any = False
+        for _k in ("forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+                   "expected_roi_1m", "expected_roi_3m", "expected_roi_12m"):
+            if row.get(_k) is not None:
+                row[_k] = None
+                cleared_any = True
+        if cleared_any:
+            _append_warning_tag(row, "forecast_cleared_consistency_sweep")
+            logger.warning(
+                "[v5.58.0 SWEEP] symbol=%s cleared stale forecasts because"
+                " forecast_unavailable=True (defensive consistency)",
+                symbol,
+            )
 
 
 def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
@@ -3132,9 +3274,39 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
                 _normalize_subunit_currency_fields(row, symbol_hint=sym)
 
     intrinsic = _as_float(row.get("intrinsic_value"))
+
+    # v5.58.0 PHASE-C: ADR / foreign-currency intrinsic suppression.
+    # When intrinsic/price ratio is wildly off, intrinsic almost certainly
+    # came from foreign-currency fundamentals while price is in the
+    # quoted currency (typical ADR pattern: KRW EPS x P/E vs USD price).
+    # Suppress before computing upside_pct so the bogus value never
+    # reaches the sheet. Distinct tag from "intrinsic_outlier" so audits
+    # can separate units bugs from genuine deep-value cases.
+    if intrinsic is not None and intrinsic > 0:
+        _ratio = intrinsic / price
+        if (_ratio > _INTRINSIC_UNIT_MISMATCH_RATIO_HIGH
+                or _ratio < _INTRINSIC_UNIT_MISMATCH_RATIO_LOW):
+            _append_warning_tag(row, "intrinsic_unit_mismatch_suspected")
+            row["intrinsic_value"] = None
+            row["upside_pct"] = None
+            intrinsic = None
+
     if intrinsic is not None and intrinsic > 0 and row.get("upside_pct") is None:
         upside = (intrinsic - price) / price
-        row["upside_pct"] = round(upside, 4)
+        # v5.58.0 PHASE-D: engine-level suspect-bound check.
+        # Mirrors scoring.py v5.2.4's _is_upside_suspect. Engine's
+        # upside_pct is what the sheet displays — scoring.py's filter
+        # operates on its own output, not on what reaches the sheet.
+        # When out of bounds, suppress upside_pct AND clear
+        # intrinsic_value so it does not propagate downstream into
+        # forecast_price_* via _compute_scores_fallback's intrinsic path.
+        if (upside < _UPSIDE_PCT_SUSPECT_FLOOR
+                or upside > _UPSIDE_PCT_SUSPECT_CEILING):
+            _append_warning_tag(row, "upside_synthesis_suspect")
+            row["intrinsic_value"] = None
+            # row["upside_pct"] is already None at this point
+        else:
+            row["upside_pct"] = round(upside, 4)
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
