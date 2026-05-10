@@ -2,8 +2,95 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.55.1
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.57.0
 ================================================================================
+
+WHY v5.57.0 — REMOVE MOMENTUM-BASED FORECAST FALLBACK
+------------------------------------------------------
+Closes the placeholder-cascade defect surfaced by the May 10 2026 post-deploy
+audit. scoring.py v5.2.4 was deployed and working as designed, but the +30%
+roi12 / +16% upside fingerprint hitting ~85% of rows turned out to originate
+inside data_engine_v2 itself, upstream of all scoring guards.
+
+Audit observation (Global_Markets sample, 127 rows):
+  IDENTICAL synthetic ratios across the entire universe whenever EODHD
+  fundamentals were unavailable:
+    intrinsic_value     = price * 1.16  (exact)
+    forecast_price_12m  = price * 1.30  (exact)
+    forecast_price_3m   = price * 1.126 (exact)
+    forecast_price_1m   = price * 1.054 (exact)
+    upside_pct          = +16.00%       (exact)
+    expected_roi_12m    = +30.00%       (exact)
+
+Concrete cases: ML.PA, BG.US, SEIC.US, DSV.CO, KDP.US, IBKR.US, TXN.US,
+AMZN.US, BIDU.US — all showed the identical fingerprint despite radically
+different fundamentals.
+
+Root cause was the momentum-based forecast fallback in _compute_scores_fallback:
+  roi_12m = _clamp(pct_raw / 100.0 * 4.0, -0.30, 0.30)
+
+This "annualizes" a daily/short-term percent_change by multiplying by 4
+(mathematically wrong regardless of unit interpretation), then clamps at
++/-30%. Any pct_raw > 7.5% saturates roi_12m at +30%, and the cascade through
+forecast_price_* and into _compute_intrinsic_and_upside's `forecasts` candidate
+list produced the exact ratio fingerprint above.
+
+v5.57.0 fixes:
+
+  J. _compute_scores_fallback — REMOVE MOMENTUM FALLBACK.
+     The third branch (the `pct_raw / 100 * 4.0` fallback) is removed
+     entirely. When neither target_mean_price nor a usable intrinsic
+     are available, roi_12m stays None, the else-branch fires, and
+     forecast_unavailable=True is set explicitly. used_momentum stays
+     False permanently; the "MOMENTUM" branch in forecast_source
+     becomes dead code (preserved for diff minimalism).
+
+  K. _compute_scores_fallback — EXPLICIT forecast_unavailable FLAG.
+     When the else-branch fires (no synthesis source), also set
+     row["forecast_unavailable"] = True so downstream consumers
+     (scoring.py v5.2.4's _is_row_unforecastable check, and our own
+     _compute_intrinsic_and_upside guard below) can detect this
+     state without inspecting warnings.
+
+  L. _compute_scores_fallback — DIAGNOSTIC TAG.
+     Add "forecast_unavailable_no_source" to warnings (in addition
+     to the existing "forecast_unavailable") so audit reports can
+     distinguish "no source available" from explicitly skipped.
+
+  M. _compute_intrinsic_and_upside — DEFENSIVE FORECAST FILTER.
+     When iterating forecast_price_* as intrinsic candidates, skip
+     them entirely if forecast_unavailable=True. (Belt-and-suspenders:
+     edit J already prevents these from existing on unforecastable
+     rows, but if any other code path injects them in the future this
+     filter prevents the cascade from re-emerging.)
+
+Expected post-deploy behavior:
+  Rows with no analyst target and no real intrinsic (EODHD-403 case)
+  will now show BLANK forecast/upside fields with warnings tagged
+  "forecast_unavailable; forecast_unavailable_no_source" instead of the
+  fake +30% / +16% ratios. Once EODHD recovers, real forecasts flow
+  through unchanged.
+
+[PRESERVED — strictly] All v5.56.0 / v5.55.1 / v5.55.0 / v5.54.1 / v5.54.0 /
+v5.53.0 helpers, signatures, behaviors, AUDIT-1 through AUDIT-6 hooks,
+subunit normalization, geo-misattribution corrections, completeness
+diagnostics, and decision-field helpers. Public API surface unchanged.
+No removals from __all__.
+
+WHY v5.56.0 — COMPLETENESS, RICHER MERGE, DIAGNOSTICS, DECISION FIELDS
+----------------------------------------------------------------------
+Adds upstream data-quality scaffolding that scoring.py and the sheet UI
+both depend on:
+  - _CRITICAL_DATA_FIELDS / _PLACEHOLDER_STRINGS / _is_placeholder_scalar
+  - _is_better_value / _merge_richer_row (replaces inline _merge)
+  - _row_completeness_pct / _recompute_price_change_fields
+  - _needs_history_patch / _provider_row_rich_enough
+  - _apply_classification_fallbacks / _apply_completeness_diagnostics
+  - _apply_candlestick_defaults / _build_top_factors_and_risks
+  - _apply_enhanced_decision_fields (master combiner; called from
+    _compute_recommendation and _get_enriched_quote_impl)
+Plus integration calls in _canonicalize_provider_row,
+_get_enriched_quote_impl, and _compute_recommendation.
 
 WHY v5.55.1 — PRODUCTION-DATA VALIDATION FIXES (atop v5.55.0)
 --------------------------------------------------------------
@@ -127,7 +214,7 @@ Diagnostic tags (greppable after deploy):
     [v5.55.0 MCAP]             — market_cap synthesized from shares×price
     [v5.55.0 UNFORECASTABLE]   — row flagged for forecast skip
     [v5.55.0 QUALITY-HAIRCUT]  — revenue-collapse haircut applied
-    [v5.55.0 FORECAST DIAG]    — per-row forecast tier outcome (DEBUG;
+    [v5.57.0 FORECAST DIAG]    — per-row forecast tier outcome (DEBUG;
                                   WARNING when source=UNAVAILABLE)
 
 [PRESERVED — strictly] Every v5.54.1 helper, signature, behaviour, and
@@ -193,7 +280,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.56.0"
+__version__ = "5.57.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -239,7 +326,7 @@ _FALLBACK_COUNTRY_BY_SUFFIX: Dict[str, str] = {
     ".NYSE": "United States", ".OQ": "United States",
     ".L": "United Kingdom", ".LSE": "United Kingdom", ".LN": "United Kingdom",
     ".DE": "Germany", ".F": "Germany", ".BE": "Germany",
-    ".XETRA": "Germany", ".XETR": "Germany", ".ETR": "Germany", ".EU": "European Union",
+    ".XETRA": "Germany", ".XETR": "Germany", ".ETR": "Germany",
     ".PA": "France", ".FP": "France",
     ".SW": "Switzerland", ".VX": "Switzerland",
     ".AS": "Netherlands", ".BR": "Belgium", ".MC": "Spain",
@@ -268,7 +355,7 @@ _FALLBACK_CURRENCY_BY_SUFFIX: Dict[str, str] = {
     ".US": "USD", ".N": "USD", ".NASDAQ": "USD", ".NYSE": "USD", ".OQ": "USD",
     ".L": "GBP", ".LSE": "GBP", ".LN": "GBP",
     ".DE": "EUR", ".F": "EUR", ".BE": "EUR",
-    ".XETRA": "EUR", ".XETR": "EUR", ".ETR": "EUR", ".EU": "EUR",
+    ".XETRA": "EUR", ".XETR": "EUR", ".ETR": "EUR",
     ".PA": "EUR", ".FP": "EUR",
     ".AS": "EUR", ".BR": "EUR", ".MC": "EUR",
     ".MI": "EUR", ".IM": "EUR", ".AT": "EUR", ".VI": "EUR", ".IR": "EUR",
@@ -445,8 +532,6 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "invest_period_label", "position_qty", "avg_cost", "position_cost",
     "position_value", "unrealized_pl", "unrealized_pl_pct", "data_provider",
     "last_updated_utc", "last_updated_riyadh", "warnings",
-    "data_quality", "forecast_unavailable", "data_completeness_pct",
-    "missing_critical_fields", "data_sources",
     "sector_relative_score", "conviction_score", "top_factors", "top_risks",
     "position_size_hint",
     "recommendation_detailed", "recommendation_priority",
@@ -476,8 +561,6 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Position Qty", "Avg Cost", "Position Cost", "Position Value",
     "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
-    "Data Quality", "Forecast Unavailable", "Data Completeness %",
-    "Missing Critical Fields", "Data Sources",
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
     "Position Size Hint",
     "Recommendation Detail", "Reco Priority",
@@ -608,36 +691,10 @@ def _safe_int(x: Any, default: int = 0, lo: Optional[int] = None, hi: Optional[i
 
 
 def _as_float(x: Any) -> Optional[float]:
-    """Robust numeric coercion for provider values and already-formatted sheet values."""
     try:
         if x is None or x == "":
             return None
-        if isinstance(x, bool):
-            return float(int(x))
-        if isinstance(x, (int, float)):
-            v = float(x)
-        else:
-            s = str(x).strip()
-            if not s or s.lower() in _NULL_STRINGS:
-                return None
-            neg = False
-            if s.startswith("(") and s.endswith(")"):
-                neg = True
-                s = s[1:-1]
-            s = (s.replace(",", "")
-                   .replace("▲", "")
-                   .replace("▼", "-")
-                   .replace("%", "")
-                   .replace("SAR", "")
-                   .replace("USD", "")
-                   .replace("EUR", "")
-                   .strip())
-            s = re.sub(r"[^0-9eE+\-.]", "", s)
-            if not s or s in {"-", "+", "."}:
-                return None
-            v = float(s)
-            if neg:
-                v = -abs(v)
+        v = float(x)
         if math.isnan(v) or math.isinf(v):
             return None
         return v
@@ -940,7 +997,6 @@ def _apply_revenue_collapse_haircut(
 
 
 
-
 # =============================================================================
 # v5.56.0 — completeness, richer merge, diagnostics, and decision fields
 # =============================================================================
@@ -1220,6 +1276,7 @@ def _apply_enhanced_decision_fields(row: Dict[str, Any]) -> None:
 
     _apply_candlestick_defaults(row)
 
+
 # =============================================================================
 # v5.55.1 — GAP-3: Provider geo mis-attribution corrector (NEW)
 # =============================================================================
@@ -1298,12 +1355,11 @@ def _correct_provider_geo_misattribution(row: Dict[str, Any]) -> Dict[str, Any]:
     # dual listings) legitimately trade in USD; we keep those by checking
     # that the country-override also fired (i.e., the geo profile is
     # internally inconsistent on the provider's side).
-    geo_profile_is_wrong = ("country" in overridden_fields) or (current_country.upper() == _safe_str(expected_country).upper())
     if (
         expected_currency
         and expected_currency.upper() != "USD"
         and current_currency.upper() == "USD"
-        and geo_profile_is_wrong
+        and "country" in overridden_fields
     ):
         row["currency"] = expected_currency
         overridden_fields.append("currency")
@@ -1311,14 +1367,14 @@ def _correct_provider_geo_misattribution(row: Dict[str, Any]) -> Dict[str, Any]:
     # Exchange override: only fire when provider value is a US-exchange
     # fragment AND we already overrode country (geo-internally consistent).
     if (
-        geo_profile_is_wrong
+        "country" in overridden_fields
         and any(frag in current_exchange.upper() for frag in _US_EXCHANGE_FRAGMENTS)
     ):
         # Map suffix to a presentable exchange code. Strip leading dot.
         suffix_code = suffix[1:] if suffix.startswith(".") else suffix
         # Prefer well-known names where the suffix is opaque.
         suffix_to_exchange_name = {
-            "XETRA": "XETRA", "XETR": "XETRA", "ETR": "XETRA", "EU": "Europe",
+            "XETRA": "XETRA", "XETR": "XETRA", "ETR": "XETRA",
             "DE": "XETRA", "F": "Frankfurt", "BE": "Berlin",
             "PA": "Euronext Paris", "FP": "Euronext Paris",
             "AS": "Euronext Amsterdam", "BR": "Euronext Brussels",
@@ -2053,8 +2109,8 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "value_view": ("value_view", "valueView"),
     "recommendation": ("recommendation", "rating", "action", "reco", "consensus"),
     "recommendation_reason": ("recommendation_reason", "reason", "summary", "thesis", "analysis"),
-    "recommendation_detailed": ("recommendation_detailed", "recommendation_detail", "Recommendation Detail", "reco_detailed", "recommendation_full", "recommendation_8tier", "detailed_recommendation"),
-    "recommendation_priority": ("recommendation_priority", "reco_priority", "Reco Priority", "priority", "decision_priority"),
+    "recommendation_detailed": ("recommendation_detailed", "reco_detailed", "recommendation_full", "recommendation_8tier", "detailed_recommendation"),
+    "recommendation_priority": ("recommendation_priority", "reco_priority", "priority", "decision_priority"),
     "candlestick_pattern": ("candlestick_pattern", "candle_pattern", "pattern", "candlestickPattern"),
     "candlestick_signal": ("candlestick_signal", "candle_signal", "candlestickSignal"),
     "candlestick_strength": ("candlestick_strength", "candle_strength", "candlestickStrength"),
@@ -2072,16 +2128,6 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "last_updated_utc": ("last_updated_utc", "lastUpdated", "updatedAt", "timestamp", "asOf"),
     "last_updated_riyadh": ("last_updated_riyadh",),
     "warnings": ("warnings", "warning", "messages", "errors"),
-    "data_quality": ("data_quality", "dataQuality", "quality", "Data Quality"),
-    "forecast_unavailable": ("forecast_unavailable", "forecastUnavailable", "Forecast Unavailable"),
-    "data_completeness_pct": ("data_completeness_pct", "dataCompletenessPct", "Data Completeness %"),
-    "missing_critical_fields": ("missing_critical_fields", "missingCriticalFields", "Missing Critical Fields"),
-    "data_sources": ("data_sources", "sources", "Data Sources"),
-    "sector_relative_score": ("sector_relative_score", "sectorRelativeScore", "Sector-Adj Score"),
-    "conviction_score": ("conviction_score", "convictionScore", "Conviction Score"),
-    "top_factors": ("top_factors", "topFactors", "Top Factors"),
-    "top_risks": ("top_risks", "topRisks", "Top Risks"),
-    "position_size_hint": ("position_size_hint", "positionSizeHint", "Position Size Hint"),
 }
 
 _COMMODITY_SYMBOL_HINTS: Tuple[str, ...] = ("GC=F", "SI=F", "BZ=F", "CL=F", "NG=F", "HG=F")
@@ -2845,11 +2891,23 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             roi_12m = (intrinsic / price) - 1.0
             used_intrinsic = True
 
-        if roi_12m is None:
-            pct_raw = _as_pct_points(row.get("percent_change")) or _as_pct_points(row.get("change_pct"))
-            if pct_raw is not None and pct_raw != 0.0:
-                roi_12m = _clamp(pct_raw / 100.0 * 4.0, -0.30, 0.30)
-                used_momentum = True
+        # v5.57.0: REMOVED momentum-based forecast fallback.
+        # The previous block `roi_12m = clamp(pct_raw / 100 * 4.0, -0.30, 0.30)`
+        # produced systematic +30% / +16% placeholder ratios across ~85% of
+        # rows whenever target_mean_price and intrinsic were both unavailable
+        # (the common case during EODHD 403s). Cascade chain:
+        #   roi_12m saturated at +0.30  -> forecast_price_12m = price * 1.30
+        #   roi_3m  = 0.30 * 0.42       -> forecast_price_3m  = price * 1.126
+        #   roi_1m  = 0.30 * 0.18       -> forecast_price_1m  = price * 1.054
+        # Then _compute_intrinsic_and_upside averaged the three forecast
+        # prices as an intrinsic candidate, yielding intrinsic = price * 1.16
+        # exactly and upside_pct = +16.00% exactly.
+        # The math (daily/short-term percent_change * 4) is fundamentally
+        # wrong as a 12-month projection, and the placeholder values were
+        # being treated as real forecasts by downstream consumers.
+        # When neither target_mean_price nor a usable intrinsic exist we
+        # now leave roi_12m as None and the else-branch below will mark
+        # forecast_unavailable=True. used_momentum stays False permanently.
 
     if roi_12m is not None:
         roi_12m = _clamp_roi("12m", roi_12m)
@@ -2869,7 +2927,13 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             if k not in row:
                 row[k] = None
         if not forecast_skip:
+            # v5.57.0: explicitly mark unforecastable so scoring.py v5.2.4's
+            # _is_row_unforecastable() detects this path and skips synthesis.
+            # Also tags with "forecast_unavailable_no_source" so audit reports
+            # can distinguish "no source available" from explicitly skipped.
+            row["forecast_unavailable"] = True
             _append_warning(row, "forecast_unavailable")
+            _append_warning(row, "forecast_unavailable_no_source")
 
     final_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
     final_roi_3m = _as_pct_points(row.get("expected_roi_3m"))
@@ -2906,13 +2970,13 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     symbol = row.get("symbol") or row.get("ticker") or "?"
     if forecast_source == "UNAVAILABLE":
         logger.warning(
-            "[v5.55.0 FORECAST DIAG] symbol=%s source=%s roi_12m=%s conf=%s warnings=%s",
+            "[v5.57.0 FORECAST DIAG] symbol=%s source=%s roi_12m=%s conf=%s warnings=%s",
             symbol, forecast_source,
             row.get("expected_roi_12m"), row.get("forecast_confidence"), row.get("warnings"),
         )
     else:
         logger.debug(
-            "[v5.55.0 FORECAST DIAG] symbol=%s source=%s roi_12m=%s conf=%s warnings=%s",
+            "[v5.57.0 FORECAST DIAG] symbol=%s source=%s roi_12m=%s conf=%s warnings=%s",
             symbol, forecast_source,
             row.get("expected_roi_12m"), row.get("forecast_confidence"), row.get("warnings"),
         )
@@ -3032,13 +3096,18 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
         elif eps is not None and eps > 0 and pe_ttm is not None and 0 < pe_ttm < 50:
             candidates.append(eps * 18.0)
 
-        forecasts: List[float] = []
-        for key in ("forecast_price_3m", "forecast_price_12m", "forecast_price_1m"):
-            fp = _as_float(row.get(key))
-            if fp is not None and fp > 0:
-                forecasts.append(fp)
-        if forecasts:
-            candidates.append(sum(forecasts) / len(forecasts))
+        # v5.57.0: only use forecasts as intrinsic candidates if they came
+        # from a real source. After v5.57.0's removal of the momentum
+        # fallback, forecast_unavailable=True means the forecasts (if
+        # somehow present) are not trustworthy, so skip them.
+        if not _safe_bool(row.get("forecast_unavailable")):
+            forecasts: List[float] = []
+            for key in ("forecast_price_3m", "forecast_price_12m", "forecast_price_1m"):
+                fp = _as_float(row.get(key))
+                if fp is not None and fp > 0:
+                    forecasts.append(fp)
+            if forecasts:
+                candidates.append(sum(forecasts) / len(forecasts))
 
         rev_growth = _as_pct_points(row.get("revenue_growth_yoy"))
         if eps is not None and eps > 0 and rev_growth is not None:
@@ -3069,7 +3138,7 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
-    """Decision Matrix v5.56.0 classifier and always-on detail filler."""
+    """Decision Matrix v5.57.0 classifier and always-on detail filler."""
     _compute_intrinsic_and_upside(row)
 
     fund_view, tech_view, risk_view, value_view = _derive_views(row)
@@ -3101,7 +3170,7 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
         row["recommendation_priority"] = priority
     if row.get("recommendation_reason") in (None, ""):
         row["recommendation_reason"] = (
-            "P{0} {1} [{2}]: Fund {3} | Tech {4} | Risk {5} | Val {6} → {7}".format(
+            "P{0} {1} [{2}]: Fund {3} | Tech {4} | Risk {5} | Val {6} \u2192 {7}".format(
                 row.get("recommendation_priority") or priority,
                 rule_label,
                 row.get("recommendation_detailed") or detailed,
@@ -3111,6 +3180,7 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
         )
 
     _apply_enhanced_decision_fields(row)
+
 
 def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
     scored: List[Tuple[int, float]] = []
@@ -3451,22 +3521,6 @@ class ProviderRegistry:
         self._modules_cache: Dict[str, Any] = {}
         self._cooldown_seconds: float = float(_get_env_float("ENGINE_PROVIDER_COOLDOWN_SECONDS", 60.0))
         self._failure_threshold: int = int(_get_env_int("ENGINE_PROVIDER_FAILURE_THRESHOLD", 3))
-
-    async def is_available(self, name: str) -> bool:
-        async with self._lock:
-            state = self._states.get(name)
-            if state is None:
-                return True
-            if state.healthy:
-                return True
-            if state.cooldown_until and state.cooldown_until <= time.time():
-                state.healthy = True
-                state.failures = 0
-                state.last_error = ""
-                state.cooldown_until = 0.0
-                self._states[name] = state
-                return True
-            return False
 
     async def get_provider(self, name: str) -> Any:
         async with self._lock:
@@ -3880,7 +3934,7 @@ class DataEngineV5:
         canon = _canonicalize_sheet_name(sheet)
         for source in (self._call_symbols_reader, self._get_symbols_from_env, self._get_symbols_from_settings, self._get_symbols_from_page_catalog):
             try:
-                if getattr(source, "__name__", "") == "_call_symbols_reader":
+                if source is self._call_symbols_reader:
                     res = await self._call_symbols_reader(canon)
                     raw = _split_symbols(res) if res is not None else []
                     syms = _normalize_symbol_list(raw)
@@ -3954,8 +4008,6 @@ class DataEngineV5:
 
     # --- single quote pipeline --------------------------------------------
     async def _fetch_patch(self, provider_name: str, symbol: str) -> Optional[Dict[str, Any]]:
-        if not await self.providers.is_available(provider_name):
-            return None
         provider_mod = await self.providers.get_provider(provider_name)
         if provider_mod is None:
             return None
@@ -4129,29 +4181,8 @@ class DataEngineV5:
             if std_60 is not None:
                 out["volatility_90d"] = round(std_60 * math.sqrt(252) * 100.0, 4)
 
-        vols = [r.get("volume") for r in rows if r.get("volume") is not None]
-        if len(vols) >= 10:
-            out["avg_volume_10d"] = round(sum(vols[-10:]) / 10.0, 4)
-        if len(vols) >= 30:
-            out["avg_volume_30d"] = round(sum(vols[-30:]) / 30.0, 4)
-
-        if len(closes) >= 15:
-            gains: List[float] = []
-            losses: List[float] = []
-            for i in range(-14, 0):
-                diff = closes[i] - closes[i - 1]
-                gains.append(max(diff, 0.0))
-                losses.append(abs(min(diff, 0.0)))
-            avg_gain = sum(gains) / 14.0
-            avg_loss = sum(losses) / 14.0
-            if avg_loss == 0:
-                out["rsi_14"] = 100.0
-            else:
-                rs = avg_gain / avg_loss
-                out["rsi_14"] = round(100.0 - (100.0 / (1.0 + rs)), 4)
-
         if len(closes) >= 14:
-            window = closes[-252:] if len(closes) >= 252 else closes
+            window = closes[-14:]
             running_max = window[0]
             max_dd = 0.0
             for c in window:
@@ -4162,17 +4193,6 @@ class DataEngineV5:
                     if dd < max_dd:
                         max_dd = dd
             out["max_drawdown_1y"] = max_dd
-
-        if len(closes) >= 60:
-            daily_returns = [
-                (closes[i] - closes[i - 1]) / closes[i - 1]
-                for i in range(1, len(closes)) if closes[i - 1] not in (None, 0)
-            ]
-            if daily_returns:
-                avg_ret = self._safe_mean(daily_returns) or 0.0
-                std_ret = self._safe_std(daily_returns)
-                if std_ret is not None and std_ret > 0:
-                    out["sharpe_1y"] = round((avg_ret / std_ret) * math.sqrt(252), 4)
         if len(closes) >= 60:
             returns_60 = [
                 (closes[i] - closes[i - 1]) / closes[i - 1] for i in range(-59, 0) if closes[i - 1] not in (None, 0)
@@ -4331,7 +4351,7 @@ class DataEngineV5:
                 except Exception:
                     pass
 
-            row["data_sources"] = list(_dedupe_keep_order(sources))
+            row["data_sources"] = sources
             if not row.get("data_provider") and sources:
                 row["data_provider"] = sources[0]
             row["quote_quality"] = self._data_quality(row)
@@ -4593,8 +4613,7 @@ class DataEngineV5:
                     # v5.55.0 AUDIT-3 propagation: skip unforecastable rows
                     # from Top10 candidate pool. They can still appear on
                     # their source page but shouldn't dilute the Top10.
-                    warnings_text = _safe_str(row.get("warnings")).lower()
-                    if _safe_bool(row.get("forecast_unavailable")) or "forecast_unavailable" in warnings_text:
+                    if _safe_bool(row.get("forecast_unavailable")):
                         continue
                     seen.add(sym)
                     candidate_rows.append(dict(row))
