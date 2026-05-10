@@ -2,8 +2,8 @@
 # core/scoring_engine.py
 """
 ================================================================================
-Scoring Engine -- v3.4.0
-(THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.0.0)
+Scoring Engine -- v3.4.1
+(THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.2.3+)
 ================================================================================
 
 This module is a pure compatibility shim. All scoring logic lives in
@@ -12,17 +12,85 @@ This module is a pure compatibility shim. All scoring logic lives in
 this module routes those imports to the canonical implementations in
 `core.scoring`.
 
-v3.4.0 changes
---------------
-- Recognize the four new view-derivation symbols added in
-  `core.scoring` v5.0.0:
-    derive_fundamental_view, derive_technical_view,
-    derive_risk_view,        derive_value_view.
-  These are now exported and reported in the degradation manifest.
-- Version bump from 3.3.0 to align with the v5 scoring family.
-- No behavior change in the bridge itself.
+v3.4.1 changes (vs v3.4.0)  --  AUDIT-DRIVEN SYNC
+-------------------------------------------------
+v3.4.0 silently fell behind core.scoring across the v5.0.0 -> v5.2.3
+audit-driven hardening rollouts. The bridge worked for every existing
+caller (passthrough imports propagate behavioural changes automatically),
+but three sync gaps had accumulated:
 
-API surface (unchanged):
+  Gap 1 -- score_views_completeness was added in core.scoring v5.2.0
+           as a per-row verification helper for the four view fields
+           (Fundamental / Technical / Risk / Value). The bridge never
+           imported or re-exported it. Callers reaching scoring_engine
+           via `from core.scoring_engine import *` could not see it.
+
+  Gap 2 -- Header docstring still claimed "DELEGATES TO core.scoring
+           v5.0.0". Reality: core.scoring has progressed through
+           v5.1.0 (Insights integration), v5.2.0 (view completeness,
+           ACCUMULATE alignment), v5.2.1 (view tokens in every reason),
+           v5.2.2 (52W position unit fix), and v5.2.3 (audit-driven
+           hardenings: no-fabricated-confidence, recommendation
+           coherence guard, risk penalty rebalance, revenue-collapse
+           haircut, forecast unit-mismatch guard, illiquid skip).
+           Anyone reading the bridge for orientation would be off by
+           two minor versions and would not know about the v5.2.3
+           hardenings at all.
+
+  Gap 3 -- _REQUIRED_CORE_SYMBOLS did not include
+           score_views_completeness, so get_degradation_report() could
+           not tell operators whether the deployed scoring module had
+           the v5.2.0+ verification surface. Operators reading the
+           report would think the pipeline was on pre-v5.2.0 even when
+           running v5.2.3.
+
+v3.4.1 closes all three gaps. The fixes are mechanical -- no logic
+changes, no signature changes, no public removals:
+
+A. NEW import + re-export of score_views_completeness from
+   core.scoring. Added to module-level namespace and __all__.
+
+B. NEW _AUDIT_HARDENING_SYMBOLS tuple groups the v5.2.0+ additions
+   (currently just score_views_completeness; future verification
+   helpers will be added here). The degradation report now reports
+   audit_hardening_symbols presence separately so callers can
+   distinguish between "running pre-v5.0.0 (no view-aware logic)"
+   and "running v5.0.0-v5.1.x (view-aware but missing audit
+   hardenings)".
+
+C. NEW is_audit_hardened() helper. Quick boolean for "are we on
+   v5.2.0+ scoring?". Mirror of the existing is_view_aware().
+
+D. _REQUIRED_CORE_SYMBOLS unchanged (those are the v5.0.0-era
+   contract — the bridge would be unusable without them). Audit-
+   hardening symbols are tracked via the new optional category
+   instead of being promoted to "required", so a deployment running
+   pre-v5.2.0 scoring still gets a working bridge with a degraded-
+   mode report rather than an ImportError.
+
+E. Header docstring corrected to reference core.scoring v5.2.3+ and
+   to enumerate the audit-driven hardenings the bridge passes
+   through.
+
+API surface (UNCHANGED + additions in v3.4.1):
+  All v3.4.0 exports preserved. No removals.
+  Additions:
+    - score_views_completeness (re-export from core.scoring v5.2.0+)
+    - is_audit_hardened (bridge-level helper)
+    - _AUDIT_HARDENING_SYMBOLS (private constant for the report)
+
+v3.4.0 changes (preserved)
+--------------------------
+- Recognize the four view-derivation symbols added in core.scoring
+  v5.0.0 (derive_fundamental_view, derive_technical_view,
+  derive_risk_view, derive_value_view) and surface them via
+  __all__ + the degradation report.
+
+v3.3.0 and earlier
+------------------
+Bridge contract for the v4.x scoring family. Preserved unchanged.
+
+API surface (preserved exports):
 - VERSION
 - ScoringEngine, AssetScores, ScoreWeights, ScoringWeights,
   ForecastParameters, DEFAULT_WEIGHTS, DEFAULT_FORECASTS
@@ -38,12 +106,14 @@ API surface (unchanged):
 - compute_quality_score, compute_risk_score, compute_opportunity_score
 - compute_confidence_score, compute_recommendation
 - risk_bucket, confidence_bucket
-- ScoringError, InvalidHorizonError, MissingDataError
-- get_degradation_report
-
-API surface (additions in v3.4.0):
 - derive_fundamental_view, derive_technical_view,
   derive_risk_view, derive_value_view
+- ScoringError, InvalidHorizonError, MissingDataError
+- get_degradation_report, is_view_aware
+
+API surface (additions in v3.4.1):
+- score_views_completeness
+- is_audit_hardened
 ================================================================================
 """
 
@@ -56,7 +126,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 
 # =============================================================================
 # Resolve the canonical core.scoring module
@@ -149,11 +219,16 @@ derive_upside_pct = _core_scoring.derive_upside_pct
 derive_volume_ratio = _core_scoring.derive_volume_ratio
 derive_day_range_position = _core_scoring.derive_day_range_position
 
-# View derivation helpers (NEW in v3.4.0, sourced from core.scoring v5.0.0)
+# View derivation helpers (v3.4.0, sourced from core.scoring v5.0.0+)
 derive_fundamental_view = getattr(_core_scoring, "derive_fundamental_view", None)
 derive_technical_view = getattr(_core_scoring, "derive_technical_view", None)
 derive_risk_view = getattr(_core_scoring, "derive_risk_view", None)
 derive_value_view = getattr(_core_scoring, "derive_value_view", None)
+
+# v3.4.1: View completeness verification helper, sourced from
+# core.scoring v5.2.0+. Falls back to None when the deployed scoring
+# module predates v5.2.0; the degradation report flags this case.
+score_views_completeness = getattr(_core_scoring, "score_views_completeness", None)
 
 # Period / horizon labels
 invest_period_label = _core_scoring.invest_period_label
@@ -185,9 +260,11 @@ score_and_rank_rows = _core_scoring.score_and_rank_rows
 #
 # Returns a structured snapshot of which scoring symbols resolved and
 # which fell back. Useful for diagnosing whether the deployed
-# scoring_engine is properly wired up to the v5.0.0 view-aware logic
-# vs an older scoring module.
+# scoring_engine is properly wired up to the v5.0.0+ view-aware logic
+# AND the v5.2.0+ audit-hardening surface, vs an older scoring module.
 
+# v5.0.0-era contract: bridge requires these to function at all.
+# Missing any of them is "degraded mode".
 _REQUIRED_CORE_SYMBOLS: Tuple[str, ...] = (
     "compute_scores",
     "score_row",
@@ -210,12 +287,22 @@ _REQUIRED_CORE_SYMBOLS: Tuple[str, ...] = (
     "RSISignal",
 )
 
-# View-derivation symbols added in scoring v5.0.0 / scoring_engine v3.4.0
+# View-derivation symbols added in scoring v5.0.0 / scoring_engine v3.4.0.
+# Missing any of these means "running pre-v5.0.0 -- no view-aware
+# recommendations". Bridge still works but capabilities are reduced.
 _VIEW_SYMBOLS: Tuple[str, ...] = (
     "derive_fundamental_view",
     "derive_technical_view",
     "derive_risk_view",
     "derive_value_view",
+)
+
+# v3.4.1: Audit-hardening symbols added in scoring v5.2.0+.
+# Missing any of these means "running v5.0.0-v5.1.x -- view-aware but
+# without the audit-driven verification surface". Bridge still works
+# but operators lose some diagnostic capabilities.
+_AUDIT_HARDENING_SYMBOLS: Tuple[str, ...] = (
+    "score_views_completeness",
 )
 
 _REQUIRED_RECO_SYMBOLS: Tuple[str, ...] = (
@@ -237,18 +324,26 @@ def get_degradation_report() -> Dict[str, Any]:
       - reco_normalize_version: the version of core.reco_normalize
       - core_symbols: dict of {symbol: present_bool} for required scoring symbols
       - view_symbols: dict of {symbol: present_bool} for view derivers
-        (NEW in v3.4.0)
+        (added v3.4.0)
+      - audit_hardening_symbols: dict of {symbol: present_bool} for
+        v5.2.0+ verification helpers (added v3.4.1)
       - reco_symbols: dict of {symbol: present_bool} for required reco symbols
       - import_log: list of successful/failed import attempts
       - missing_critical: list of missing CRITICAL symbols (degraded mode)
       - missing_view: list of missing view derivers (running pre-v5.0.0
         scoring module without view-aware logic)
+      - missing_audit_hardening: list of missing v5.2.0+ helpers
+        (running v5.0.0-v5.1.x scoring without audit-driven
+        verification surface)
+      - view_aware_recommendation_enabled: bool (v3.4.0+)
+      - audit_hardening_enabled: bool (v3.4.1+)
 
     Returns:
         Dict[str, Any]: The degradation report.
     """
     core_present = {sym: hasattr(_core_scoring, sym) for sym in _REQUIRED_CORE_SYMBOLS}
     view_present = {sym: hasattr(_core_scoring, sym) for sym in _VIEW_SYMBOLS}
+    audit_present = {sym: hasattr(_core_scoring, sym) for sym in _AUDIT_HARDENING_SYMBOLS}
 
     if _reco_normalize is not None:
         reco_present = {sym: hasattr(_reco_normalize, sym) for sym in _REQUIRED_RECO_SYMBOLS}
@@ -259,6 +354,7 @@ def get_degradation_report() -> Dict[str, Any]:
 
     missing_critical = [sym for sym, ok in core_present.items() if not ok]
     missing_view = [sym for sym, ok in view_present.items() if not ok]
+    missing_audit_hardening = [sym for sym, ok in audit_present.items() if not ok]
     missing_reco = [sym for sym, ok in reco_present.items() if not ok]
 
     return {
@@ -267,16 +363,19 @@ def get_degradation_report() -> Dict[str, Any]:
         "reco_normalize_version": reco_version,
         "core_symbols": core_present,
         "view_symbols": view_present,
+        "audit_hardening_symbols": audit_present,
         "reco_symbols": reco_present,
         "import_log": list(_import_attempt_log),
         "missing_critical": missing_critical,
         "missing_view": missing_view,
+        "missing_audit_hardening": missing_audit_hardening,
         "missing_reco": missing_reco,
         "view_aware_recommendation_enabled": (
             len(missing_view) == 0
             and "recommendation_from_views" in reco_present
             and reco_present.get("recommendation_from_views", False)
         ),
+        "audit_hardening_enabled": len(missing_audit_hardening) == 0,
     }
 
 
@@ -291,6 +390,24 @@ def is_view_aware() -> bool:
       - the bridge can't reach either module
     """
     return get_degradation_report().get("view_aware_recommendation_enabled", False)
+
+
+def is_audit_hardened() -> bool:
+    """
+    v3.4.1: Quick boolean check: is the deployed pipeline running
+    core.scoring v5.2.0+ with the audit-driven verification surface?
+
+    Returns False if core.scoring lacks any v5.2.0+ helpers
+    (currently: score_views_completeness). Mirror of is_view_aware().
+
+    Note: this checks for the v5.2.0+ public API surface. The v5.2.3
+    behavioural hardenings (no-fabricated-confidence, recommendation
+    coherence guard, risk penalty rebalance, revenue-collapse
+    haircut, forecast unit-mismatch guard, illiquid skip) are
+    behaviour-only changes and cannot be detected by symbol presence
+    alone. Use SCORING_VERSION for that.
+    """
+    return get_degradation_report().get("audit_hardening_enabled", False)
 
 
 # =============================================================================
@@ -362,11 +479,13 @@ __all__ = [
     "derive_upside_pct",
     "derive_volume_ratio",
     "derive_day_range_position",
-    # View derivation (NEW in v3.4.0)
+    # View derivation (v3.4.0)
     "derive_fundamental_view",
     "derive_technical_view",
     "derive_risk_view",
     "derive_value_view",
+    # Audit-hardening verification helpers (v3.4.1)
+    "score_views_completeness",
     # Periods
     "invest_period_label",
     # Recommendation
@@ -388,6 +507,7 @@ __all__ = [
     # Diagnostics
     "get_degradation_report",
     "is_view_aware",
+    "is_audit_hardened",
     # Exceptions
     "ScoringError",
     "InvalidHorizonError",
