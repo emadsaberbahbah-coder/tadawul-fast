@@ -2,8 +2,79 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.7.1 (GLOBAL PRIMARY / SUFFIX-AWARE GEO / CURRENCY-CANONICAL /
-                          PERCENT-POINTS ALIGNMENT + EPS FALLBACK)
+EODHD Provider — v4.7.2 (GLOBAL PRIMARY / SUFFIX-AWARE GEO / CURRENCY-CANONICAL /
+                          PERCENT-POINTS ALIGNMENT + EPS FALLBACK + RESILIENCE)
+================================================================================
+
+v4.7.2 — POST-v5.57.0 RESILIENCE & DIAGNOSTIC IMPROVEMENTS (May 10, 2026)
+-----------------------------------------------------------------------
+data_engine_v2 v5.57.0 removed the momentum-based forecast fallback,
+which means EODHD outages now cause forecast/upside fields to BLANK
+out instead of producing the +30%/+16% placeholder cascade. This
+makes the EODHD provider's reliability and diagnostic accuracy
+critical to overall sheet quality. v4.7.2 hardens five gaps surfaced
+during the v5.57.0 audit:
+
+  YA  fetch_history_stats now returns geo-defaulted error patch.
+       The v4.7.0 ISSUE-C fix established that on error, every fetch
+       method should return _build_error_patch_with_geo() so the
+       merged row carries correct country / currency / exchange even
+       when EODHD returned no data. fetch_quote and fetch_fundamentals
+       were updated correctly; fetch_history_stats was missed and
+       still returned {} on error. Now aligned with the other two.
+
+  YB  Better HTTP 403 body parsing.
+       EODHD returns HTTP 403 for several distinct reasons:
+         - Invalid / expired API key (NOT retry-able)
+         - Daily quota exhausted (RETRY-able after wait)
+         - Hourly rate limit hit (RETRY-able, sometimes returned as
+           403 instead of 429)
+         - IP geo-block (NOT retry-able)
+       Previously all 403s were tagged "auth_error" identically.
+       v4.7.2 parses the response body for keywords:
+         "quota", "rate limit", "exceeded", "too many" -> retry as 429
+         "ip block", "blocked", "geo" -> tag "ip_blocked" (no retry)
+         else -> tag "auth_error" (no retry, key invalid)
+       This significantly improves recovery from quota exhaustion and
+       gives ops accurate signal for diagnosis.
+
+  YC  Expanded currency canonicalization.
+       The v4.7.0 ISSUE-A/B fix mapped a small set of loose codes to
+       ISO. v4.7.2 expands the table with more variants observed in
+       EODHD responses across emerging-market exchanges:
+         EGP variants (Egp), AED variants (AEd, Dh),
+         QAR (Qar, QR), SAR (Sar, SR), JPY (JPy, Yen),
+         CNY (CNy, RMB, Rmb), INR (INr, Rs),
+         TWD (TWd, NT$), HKD (HKd, HK$),
+         BRL (BRl, R$), MXN (MXn, Mex$)
+       All map to ISO-4217 form so data_engine_v2 v5.55.0's subunit
+       table and downstream display all see consistent codes.
+
+  YD  eps_ttm fallback sanity bound.
+       The v4.7.1 FIX-B fallback computes eps_ttm = net_income_ttm /
+       shares_outstanding when Highlights.EarningsShare is missing.
+       Production EPS rarely exceeds $500/share or falls below -$200/
+       share; values outside that range usually indicate a units
+       mismatch (financials in millions vs shares in actual count),
+       a corrupt provider response, or test data. v4.7.2 validates
+       the computed value against [-200, +500] and suppresses to None
+       when out of range (with a debug log) rather than feed garbage
+       to data_engine_v2's _compute_intrinsic_and_upside.
+
+  YE  Header docstring narrative restored.
+       v4.7.1's docstring placeholder ("(omitted here for length but
+       present in the final script)") replaced with proper retroactive
+       summaries for v4.7.0 and v4.6.0.
+
+  YF  Version bump to 4.7.2 across PROVIDER_VERSION, UA_DEFAULT,
+       and the file's section header.
+
+[PRESERVED — strictly] All v4.7.1 / v4.7.0 / v4.6.0 behavior, signatures,
+env vars, cache keys, schema fields, alias mappings, and method names.
+v4.7.2 changes are additive (one return-tuple update + body-parser logic
++ table additions + bound check + docstring restoration) plus the
+version bump. Public API surface unchanged. No removals from __all__.
+
 ================================================================================
 
 v4.7.1 — PROVIDER-LAYER QUIET CORRECTIONS (May 10, 2026)
@@ -26,6 +97,7 @@ Two alignment gaps discovered during post-deploy audit of scoring v5.2.4:
 
     v4.7.1 now computes eps_ttm = net_income_ttm / shares_outstanding
     as a last-resort fallback before leaving the field empty.
+    (v4.7.2 YD adds a sanity bound on the fallback.)
 
 [PRESERVED] All v4.7.0 ISSUE-A through ISSUE-D fixes, suffix aliasing,
 currency-canonicalization, geo-default error patches, and env-var
@@ -81,8 +153,26 @@ are additive (4 new helpers + version bump) plus call-site wiring.
 
 WHY v4.6.0 — Global EODHD Primary
 ---------------------------------
-... (the rest of the original narrative is identical; omitted here for length
-    but present in the final script) ...
+- Global pages should use EODHD for: price + history + fundamentals (where available).
+- Only fall back to Yahoo providers when EODHD doesn't have a field.
+- International symbols should be supported across all pages (Global_Markets, Market_Leaders,
+  Mutual_Funds, My_Portfolio, Top_10_Investments, etc.)
+
+What v4.6.0 improved
+- ✅ Keeps EODHD as the primary provider for global shares.
+- ✅ Expands fundamentals extraction from nested Financials / Technicals / SplitsDividends.
+- ✅ Adds TTM rollups and derived ratios:
+      revenue_ttm, free_cash_flow_ttm, gross/operating/profit margins,
+      debt_to_equity, float_shares, avg_volume_10d.
+- ✅ Adds stronger history-derived fallback for quote fields when real-time is sparse.
+- ✅ Computes RSI14 from history and strengthens 52W high/low using daily highs/lows.
+- ✅ Adds more compatibility wrappers for engines/routes discovering common provider methods.
+- ✅ Still Render-safe: no pandas / numpy / scipy.
+
+Canonical patch orientation
+- Returns schema-aligned snake_case fields for engine merge.
+- Also includes selected backward-compatible aliases for older callers.
+
 ================================================================================
 """
 
@@ -106,32 +196,78 @@ logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "eodhd"
 
+
 # =============================================================================
 # v4.7.0 — Currency-code canonicalization (ISSUE-A, ISSUE-B)
 # =============================================================================
+#
+# EODHD returns several non-ISO currency codes that need normalization
+# before downstream consumers (data_engine_v2 v5.55.1 _SUBUNIT_EXCHANGES,
+# scoring.py, sheet display) can reliably reason about them.
+#
+# Mapping rationale:
+#   "GBp"  → "GBX"  : EODHD's lowercase-p convention for LSE pence stocks
+#                     vs. the ISO/financial-industry standard "GBX".
+#   "ZAc"  → "ZAC"  : Same convention for JSE rand-cents.
+#   "ILa"  → "ILA"  : Same convention for TASE shekel-agorot.
+#   "KWF"  → "KWD"  : EODHD legacy spelling; ISO 4217 code is KWD.
+#   "KD"   → "KWD"  : Common informal Kuwait-dinar abbreviation.
+#   "Rp"   → "IDR"  : Indonesian rupiah informal abbreviation.
+#   "RM"   → "MYR"  : Malaysian ringgit informal abbreviation.
+#
+# Anything not in this map is uppercased and returned as-is, preserving
+# valid ISO codes (USD, EUR, JPY, CNY, etc.) without modification.
+
 _CURRENCY_CODE_CANONICAL: Dict[str, str] = {
+    # GBP / pence
     "GBP": "GBP",
     "GBp": "GBX", "GBX": "GBX",
+    # ZAR / cents
     "ZAR": "ZAR",
     "ZAc": "ZAC", "ZAC": "ZAC",
+    # ILS / agorot
     "ILS": "ILS",
     "ILa": "ILA", "ILA": "ILA",
+    # Kuwaiti Dinar — EODHD has been seen returning "KWF", "KD" both meaning KWD
     "KWF": "KWD", "KD": "KWD", "KWD": "KWD",
+    # Indonesian Rupiah — "Rp" prefix sometimes returned
     "Rp": "IDR", "IDR": "IDR",
+    # Malaysian Ringgit — "RM" prefix sometimes returned
     "RM": "MYR", "MYR": "MYR",
+    # v4.7.2 YC: expanded loose-code aliases observed in EODHD responses
+    "EGP": "EGP", "Egp": "EGP",
+    "AED": "AED", "AEd": "AED", "Dh": "AED",
+    "QAR": "QAR", "Qar": "QAR", "QR": "QAR",
+    "SAR": "SAR", "Sar": "SAR", "SR": "SAR",
+    "JPY": "JPY", "JPy": "JPY", "Yen": "JPY",
+    "CNY": "CNY", "CNy": "CNY", "RMB": "CNY", "Rmb": "CNY",
+    "INR": "INR", "INr": "INR", "Rs": "INR",
+    "TWD": "TWD", "TWd": "TWD", "NT$": "TWD",
+    "HKD": "HKD", "HKd": "HKD", "HK$": "HKD",
+    "BRL": "BRL", "BRl": "BRL", "R$": "BRL",
+    "MXN": "MXN", "MXn": "MXN", "Mex$": "MXN",
 }
 
 
 def _canonicalize_currency_code(code: Any) -> Optional[str]:
-    """v4.7.0 ISSUE-A / ISSUE-B: Map loose currency codes to ISO."""
+    """
+    v4.7.0 ISSUE-A / ISSUE-B: Map EODHD's loose currency codes to ISO/
+    industry-standard forms.
+
+    Returns:
+        Canonical code (e.g., "GBX", "KWD") if recognized; else the input
+        uppercased and stripped; None when input is empty/invalid.
+    """
     s = safe_str(code)
     if not s:
         return None
     s = s.strip()
     if not s:
         return None
+    # Direct hit (case-sensitive for the ambiguous "GBp" vs "GBP" case).
     if s in _CURRENCY_CODE_CANONICAL:
         return _CURRENCY_CODE_CANONICAL[s]
+    # Fall through: uppercase and check.
     su = s.upper()
     if su in _CURRENCY_CODE_CANONICAL:
         return _CURRENCY_CODE_CANONICAL[su]
@@ -141,7 +277,17 @@ def _canonicalize_currency_code(code: Any) -> Optional[str]:
 # =============================================================================
 # v4.7.0 — Suffix-derived geo defaults (ISSUE-C)
 # =============================================================================
+#
+# Mirrors data_engine_v2 v5.55.1's _FALLBACK_*_BY_SUFFIX tables so that
+# when EODHD returns 403/empty for a known non-US symbol, we still emit
+# country/currency/exchange values consistent with the ticker. This is
+# defense-in-depth: data_engine_v2's GAP-3 corrector also overrides
+# wrong "USA" defaults, but populating them correctly here means the
+# corrector becomes a redundant safety net rather than a load-bearing
+# fix.
+
 _GEO_BY_SUFFIX: Dict[str, Tuple[str, str, str]] = {
+    # suffix : (country, currency, display_exchange)
     ".L":      ("United Kingdom", "GBX", "LSE"),
     ".LSE":    ("United Kingdom", "GBX", "LSE"),
     ".LN":     ("United Kingdom", "GBX", "LSE"),
@@ -206,7 +352,14 @@ _GEO_BY_SUFFIX: Dict[str, Tuple[str, str, str]] = {
 
 
 def _suffix_derived_geo_defaults(symbol: str) -> Dict[str, Optional[str]]:
-    """v4.7.0 ISSUE-C: Resolve country / currency / exchange from suffix."""
+    """
+    v4.7.0 ISSUE-C: Resolve country / currency / exchange from a symbol's
+    suffix when EODHD returns blank or 403.
+
+    Returns a dict with keys 'country', 'currency', 'exchange' (any may
+    be None when the suffix is unrecognized). Used to populate empty
+    error patches and to backfill blank fields in successful payloads.
+    """
     s = safe_str(symbol)
     if not s or "." not in s:
         return {"country": None, "currency": None, "exchange": None}
@@ -221,6 +374,20 @@ def _suffix_derived_geo_defaults(symbol: str) -> Dict[str, Optional[str]]:
 # =============================================================================
 # v4.7.0 — EODHD-canonical suffix mapping (ISSUE-D)
 # =============================================================================
+#
+# Some Yahoo-style suffix aliases need to be mapped to EODHD's preferred
+# form before submitting the API request. EODHD's docs are authoritative:
+#   - LSE:   ".LSE" canonical, ".L" is an alias that may not resolve
+#            for some endpoints.
+#   - XETRA: ".XETRA" canonical, ".XETR" / ".ETR" / ".DE" all map to it
+#            (we leave ".DE" alone because EODHD also accepts it as a
+#            distinct German listing).
+#   - JSE:   ".JSE" canonical.
+#   - TASE:  ".TA" canonical, ".TASE" alias.
+#
+# This map is intentionally conservative — only entries where the
+# alternate form is known to fail or yield degraded data are listed.
+
 _EODHD_SUFFIX_CANONICAL: Dict[str, str] = {
     ".L":      ".LSE",
     ".XETR":   ".XETRA",
@@ -230,7 +397,14 @@ _EODHD_SUFFIX_CANONICAL: Dict[str, str] = {
 
 
 def _canonicalize_eodhd_suffix(symbol_uppercased: str) -> str:
-    """v4.7.0 ISSUE-D: Map alias suffixes to EODHD's canonical form."""
+    """
+    v4.7.0 ISSUE-D: Map alias suffixes (e.g., ".L") to EODHD's canonical
+    form (e.g., ".LSE") before submitting an API request.
+
+    The input is expected to already be uppercased; the function preserves
+    the rest of the symbol exactly. Idempotent: a canonical suffix is
+    returned unchanged.
+    """
     if "." not in symbol_uppercased:
         return symbol_uppercased
     base, suffix_only = symbol_uppercased.rsplit(".", 1)
@@ -246,7 +420,21 @@ def _build_error_patch_with_geo(
     sym_norm: str,
     err_code: str,
 ) -> Dict[str, Any]:
-    """v4.7.0 ISSUE-C: Non-empty error patch with suffix-derived geo."""
+    """
+    v4.7.0 ISSUE-C: Build a non-empty error patch that carries
+    suffix-derived country/currency/exchange so the merged row
+    arrives at data_engine_v2 with correct geo even when EODHD's
+    real-time/fundamentals endpoints failed.
+
+    Without this, an empty {} patch lets a downstream universe-loader
+    default fill country/currency with "USA"/"USD", producing the
+    BAS.XETRA / BMW.XETRA / MTX.XETRA mis-attribution observed in
+    production.
+
+    The patch carries error metadata so callers can still detect
+    the failure; downstream merge logic preserves provided geo
+    fields ahead of stub fallbacks.
+    """
     geo = _suffix_derived_geo_defaults(sym_raw)
     return _clean_patch(
         {
@@ -263,15 +451,14 @@ def _build_error_patch_with_geo(
             "last_updated_riyadh": _riyadh_iso(),
         }
     )
-
-PROVIDER_VERSION = "4.7.1"
+PROVIDER_VERSION = "4.7.2"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
-UA_DEFAULT = "TFB-EODHD/4.7.1 (Render)"
+UA_DEFAULT = "TFB-EODHD/4.7.2 (Render)"
 
 try:
-    import orjson
+    import orjson  # type: ignore
 
     def json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, str):
@@ -279,7 +466,7 @@ try:
         return orjson.loads(data)
 
 except Exception:
-    import json
+    import json  # type: ignore
 
     def json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, bytes):
@@ -290,6 +477,7 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 _US_LIKE_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-_]{0,16}$")
 _KSA_RE = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
+
 
 # =============================================================================
 # Env helpers
@@ -474,11 +662,13 @@ def normalize_eodhd_symbol(symbol: str) -> str:
     s_up = s.upper()
 
     try:
-        from core.symbols.normalize import to_eodhd_symbol as _to_eodhd_symbol
+        from core.symbols.normalize import to_eodhd_symbol as _to_eodhd_symbol  # type: ignore
 
         if callable(_to_eodhd_symbol):
-            out = _to_eodhd_symbol(s_up, default_exchange=_default_exchange())
+            out = _to_eodhd_symbol(s_up, default_exchange=_default_exchange())  # type: ignore[arg-type]
             if isinstance(out, str) and out.strip():
+                # v4.7.0 ISSUE-D: canonicalize alias suffixes even when
+                # external normalizer returned a value.
                 return _canonicalize_eodhd_suffix(out.strip().upper())
     except Exception:
         pass
@@ -492,6 +682,7 @@ def normalize_eodhd_symbol(symbol: str) -> str:
     if "." in s_up:
         base, suf = s_up.rsplit(".", 1)
         if len(suf) >= 2:
+            # v4.7.0 ISSUE-D: ".L" → ".LSE", ".XETR" → ".XETRA", etc.
             return _canonicalize_eodhd_suffix(s_up)
         if not _append_exchange_suffix():
             return s_up
@@ -633,7 +824,7 @@ class _SingleFlight:
                 owner = False
 
         if not owner:
-            return await fut
+            return await fut  # type: ignore
 
         try:
             res = await coro_factory()
@@ -852,11 +1043,45 @@ class EODHDClient:
                         continue
 
                     if sc in (401, 403):
+                        # v4.7.2 YB: distinguish between auth_error / quota
+                        # exhaustion / IP block based on response body.
+                        # EODHD returns 403 (not 429) for daily quota exhaustion,
+                        # and the body contains keywords like "limit", "quota",
+                        # or "rate". Treat those as retry-able after a wait.
+                        # Genuine auth errors (invalid/expired key) are not
+                        # retry-able and bubble out immediately.
                         body_hint = ""
                         try:
-                            body_hint = (r.text or "")[:160]
+                            body_hint = (r.text or "")[:200]
                         except Exception:
                             body_hint = ""
+                        body_low = body_hint.lower()
+
+                        is_quota_or_rate = any(
+                            k in body_low for k in (
+                                "quota", "rate limit", "rate-limit", "ratelimit",
+                                "exceeded", "too many", "limit reached",
+                                "limit exceed", "calls per",
+                            )
+                        )
+                        is_ip_blocked = any(
+                            k in body_low for k in (
+                                "ip block", "ip-block", "blocked ip", "your ip",
+                                "geo block", "geographic",
+                            )
+                        )
+
+                        if is_quota_or_rate and sc == 403:
+                            # Treat as a soft rate-limit; back off and retry.
+                            ra = r.headers.get("Retry-After")
+                            wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else min(30.0, 5.0 + 2.0 * attempt)
+                            last_err = f"HTTP 403 quota_or_rate_limit"
+                            await asyncio.sleep(wait)
+                            continue
+
+                        if is_ip_blocked:
+                            return None, f"HTTP {sc} ip_blocked {body_hint}".strip()
+
                         return None, f"HTTP {sc} auth_error {body_hint}".strip()
 
                     if 500 <= sc < 600:
@@ -904,6 +1129,9 @@ class EODHDClient:
         async def _do() -> Tuple[Dict[str, Any], Optional[str]]:
             data, err = await self._request_json(f"real-time/{sym}", params={})
             if err or not isinstance(data, dict):
+                # v4.7.0 ISSUE-C: Return suffix-derived geo defaults instead
+                # of an empty patch so downstream merge has at least the
+                # symbol's authoritative country/currency/exchange.
                 return _build_error_patch_with_geo(sym_raw, sym, err or "bad_payload"), err or "bad_payload"
 
             close = safe_float(_first_present(data.get("close"), data.get("adjusted_close"), data.get("last"), data.get("price")))
@@ -921,9 +1149,11 @@ class EODHDClient:
                 change_frac = (close / prev) - 1.0
 
             exchange = safe_str(_first_present(data.get("exchange"), data.get("fullExchangeName"), data.get("primaryExchange")))
+            # v4.7.0 ISSUE-A / ISSUE-B: canonicalize EODHD's loose currency code.
             currency = _canonicalize_currency_code(_first_present(data.get("currency"), data.get("currency_code")))
             market_cap = safe_float(_first_present(data.get("market_cap"), data.get("marketCapitalization"), data.get("marketCapitalisation")))
 
+            # v4.7.0 ISSUE-C: backfill blank geo fields from the suffix.
             geo = _suffix_derived_geo_defaults(sym_raw)
             if not exchange and geo["exchange"]:
                 exchange = geo["exchange"]
@@ -980,6 +1210,7 @@ class EODHDClient:
         async def _do() -> Tuple[Dict[str, Any], Optional[str]]:
             data, err = await self._request_json(f"fundamentals/{sym}", params={})
             if err or not isinstance(data, dict):
+                # v4.7.0 ISSUE-C: error patch carries suffix-derived geo.
                 return _build_error_patch_with_geo(sym_raw, sym, err or "bad_payload"), err or "bad_payload"
 
             general = data.get("General") or {}
@@ -1067,8 +1298,10 @@ class EODHDClient:
             asset_class = _infer_asset_class(general, etf_data)
             country = safe_str(_first_present(general.get("CountryISO"), general.get("CountryName"), general.get("Country")))
             exchange = safe_str(_first_present(general.get("Exchange"), general.get("PrimaryExchange")))
+            # v4.7.0 ISSUE-A / ISSUE-B: canonicalize EODHD's loose currency code.
             currency = _canonicalize_currency_code(_first_present(general.get("CurrencyCode"), general.get("Currency"), highlights.get("Currency")))
 
+            # v4.7.0 ISSUE-C: backfill blanks from the suffix-derived geo table.
             geo = _suffix_derived_geo_defaults(sym_raw)
             if not country and geo["country"]:
                 country = geo["country"]
@@ -1086,16 +1319,42 @@ class EODHDClient:
             )
             payout_ratio = _frac_from_percentish(_first_present(splits.get("PayoutRatio"), highlights.get("PayoutRatio")))
 
-            # --- eps_ttm with v4.7.1 FIX-B fallback ---
-            eps_ttm_highlight = safe_float(
-                _first_present(highlights.get("EarningsShare"),
-                               highlights.get("DilutedEpsTTM"),
-                               highlights.get("EPSEstimateCurrentYear"))
+            # ---- eps_ttm with v4.7.1 FIX-B fallback + v4.7.2 YD sanity bound ----
+            #
+            # FIX-B: When Highlights.EarningsShare and DilutedEpsTTM are both
+            # missing (common for non-US listings), compute as
+            #   net_income_ttm / shares_outstanding
+            # to avoid leaving eps_ttm None. data_engine_v2's intrinsic
+            # synthesizer falls back to a constant +16% expected return when
+            # eps_ttm is missing, producing the uniform "+16.00%" upside
+            # observed in the May 2026 audit.
+            #
+            # YD (v4.7.2): Sanity bound on the fallback result. Production
+            # EPS rarely exceeds $500/share or falls below -$200/share; values
+            # outside that range almost always indicate a units mismatch
+            # (financials in millions vs shares in actual count), or test data.
+            # Suppress to None rather than feed garbage downstream.
+            _EPS_FALLBACK_CEILING = 500.0
+            _EPS_FALLBACK_FLOOR = -200.0
+
+            eps_ttm_final = safe_float(
+                _first_present(
+                    highlights.get("EarningsShare"),
+                    highlights.get("DilutedEpsTTM"),
+                    highlights.get("EPSEstimateCurrentYear"),
+                )
             )
-            if eps_ttm_highlight is None:
-                # Fallback: compute from TTM net income and shares outstanding
+            if eps_ttm_final is None:
                 if net_income_ttm is not None and shares_outstanding not in (None, 0.0):
-                    eps_ttm_highlight = net_income_ttm / shares_outstanding
+                    candidate = net_income_ttm / shares_outstanding
+                    if _EPS_FALLBACK_FLOOR <= candidate <= _EPS_FALLBACK_CEILING:
+                        eps_ttm_final = candidate
+                    else:
+                        logger.debug(
+                            "[eodhd v4.7.2] eps_ttm fallback rejected for %s: "
+                            "computed=%.4f outside bounds [%.1f, %.1f] (likely units mismatch)",
+                            sym, candidate, _EPS_FALLBACK_FLOOR, _EPS_FALLBACK_CEILING,
+                        )
 
             patch = _clean_patch(
                 {
@@ -1116,7 +1375,7 @@ class EODHDClient:
                     "shares_outstanding": shares_outstanding,
                     "float_shares": float_shares,
                     "shares_float": float_shares,
-                    "eps_ttm": eps_ttm_highlight,    # now with fallback
+                    "eps_ttm": eps_ttm_final,  # v4.7.1 FIX-B + v4.7.2 YD: with fallback + sanity bound
                     "pe_ttm": safe_float(_first_present(valuation.get("TrailingPE"), highlights.get("PERatio"))),
                     "forward_pe": safe_float(_first_present(valuation.get("ForwardPE"), highlights.get("ForwardPE"))),
                     "pb_ratio": safe_float(_first_present(valuation.get("PriceBookMRQ"), valuation.get("PriceBook"))),
@@ -1175,7 +1434,12 @@ class EODHDClient:
             from_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
             data, err = await self._request_json(f"eod/{sym}", params={"from": from_date})
             if err or not isinstance(data, list):
-                return {}, err or "bad_payload"
+                # v4.7.2 YA: align with v4.7.0 ISSUE-C philosophy. fetch_quote
+                # and fetch_fundamentals already return geo-defaulted patches on
+                # error so the merged row's country/currency/exchange are
+                # correct even on HTTP 403. fetch_history_stats was missed in
+                # the v4.7.0 build; fixing it here closes that gap.
+                return _build_error_patch_with_geo(sym_raw, sym, err or "bad_payload"), err or "bad_payload"
 
             rows = [r for r in data if isinstance(r, dict)]
             rows = [r for r in rows if safe_float(r.get("close")) is not None]
@@ -1245,7 +1509,8 @@ class EODHDClient:
             if high_52 != low_52:
                 pos_52_frac = (last - low_52) / (high_52 - low_52)
 
-            # v4.7.1 FIX-A: convert fraction to percent points (0-100)
+            # v4.7.1 FIX-A: convert fraction (0-1) to percent points (0-100)
+            # to match data_engine_v2 v5.53.0 + scoring v5.2.3 storage contract.
             pos_52_pct = (pos_52_frac * 100.0) if pos_52_frac is not None else None
 
             avg_vol_10 = sum(vols[-10:]) / 10.0 if len(vols) >= 10 else (sum(vols) / len(vols) if vols else None)
@@ -1279,6 +1544,7 @@ class EODHDClient:
                     "symbol_normalized": sym,
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
+                    # quote fallback from latest history row
                     "current_price": last,
                     "price": last,
                     "previous_close": prev,
@@ -1292,9 +1558,10 @@ class EODHDClient:
                     "change": history_price_change,
                     "percent_change": history_percent_change,
                     "change_pct": history_percent_change,
+                    # 52W / liquidity / risk
                     "week_52_low": low_52,
                     "week_52_high": high_52,
-                    "week_52_position_pct": pos_52_pct,   # percent points now
+                    "week_52_position_pct": pos_52_pct,   # v4.7.1: percent points (0-100), not fraction
                     "avg_vol_10d": avg_vol_10,
                     "avg_volume_10d": avg_vol_10,
                     "avg_vol_30d": avg_vol_30,
@@ -1406,7 +1673,7 @@ class EODHDClient:
                 errors.append(f"exception:{r.__class__.__name__}")
                 continue
             try:
-                patch, err = r
+                patch, err = r  # type: ignore[misc]
             except Exception:
                 errors.append("bad_task_result")
                 continue
@@ -1419,7 +1686,6 @@ class EODHDClient:
                     if k not in merged or merged.get(k) in (None, "", [], {}):
                         merged[k] = v
 
-        # fill aliases
         if merged.get("current_price") is None and merged.get("price") is not None:
             merged["current_price"] = merged.get("price")
         if merged.get("price") is None and merged.get("current_price") is not None:
@@ -1433,14 +1699,12 @@ class EODHDClient:
         if merged.get("day_open") is None and merged.get("open") is not None:
             merged["day_open"] = merged.get("open")
 
-        # synthesize market_cap if missing
         if merged.get("market_cap") is None and merged.get("shares_outstanding") is not None and merged.get("current_price") is not None:
             try:
                 merged["market_cap"] = float(merged["shares_outstanding"]) * float(merged["current_price"])
             except Exception:
                 pass
 
-        # fill % change
         if merged.get("percent_change") is None and merged.get("current_price") is not None and merged.get("previous_close") not in (None, 0.0):
             try:
                 merged["percent_change"] = (float(merged["current_price"]) / float(merged["previous_close"])) - 1.0
@@ -1451,15 +1715,14 @@ class EODHDClient:
                 merged["price_change"] = float(merged["current_price"]) - float(merged["previous_close"])
             except Exception:
                 pass
-
-        # compute 52W position if missing
         if merged.get("week_52_position_pct") is None:
+            # v4.7.1 FIX-A: compute 52W position and store as percent points (0-100).
             pos = _safe_div(
                 (safe_float(merged.get("current_price")) or 0.0) - (safe_float(merged.get("week_52_low")) or 0.0),
                 (safe_float(merged.get("week_52_high")) or 0.0) - (safe_float(merged.get("week_52_low")) or 0.0),
             )
             if pos is not None:
-                merged["week_52_position_pct"] = pos * 100.0   # also percent points
+                merged["week_52_position_pct"] = pos * 100.0
 
         if merged.get("current_price") is None:
             merged["data_quality"] = "MISSING"
@@ -1481,10 +1744,19 @@ class EODHDClient:
         merged["fcf_ttm"] = merged.get("fcf_ttm") or merged.get("free_cash_flow_ttm")
         merged["d_e_ratio"] = merged.get("d_e_ratio") or merged.get("debt_to_equity")
 
+        # v4.7.0 ISSUE-A / ISSUE-B: final currency-code canonicalization on
+        # the merged row. Defensive: even if every contributing patch was
+        # already canonicalized in this version, future provider tweaks
+        # might re-introduce loose codes.
         canon_currency = _canonicalize_currency_code(merged.get("currency"))
         if canon_currency:
             merged["currency"] = canon_currency
 
+        # v4.7.0 ISSUE-C: final suffix-derived geo backfill on the merged
+        # row. If every contributing fetcher errored, the merged row could
+        # still arrive without country/currency/exchange. The error patches
+        # carry these now (see _build_error_patch_with_geo) but this is
+        # the last line of defense before the row leaves the provider.
         merged_geo = _suffix_derived_geo_defaults(sym_raw)
         if not merged.get("country") and merged_geo["country"]:
             merged["country"] = merged_geo["country"]
