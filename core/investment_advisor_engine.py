@@ -3,126 +3,166 @@
 """
 core/investment_advisor_engine.py
 ================================================================================
-INVESTMENT ADVISOR ENGINE — v4.3.0 (Wave 3 / v2.6.0 SCHEMA WIDTH)
+INVESTMENT ADVISOR ENGINE — v4.4.0 (MAY 2026 CROSS-STACK SYNC)
 ================================================================================
 SYNC-EXPORT SAFE • ASYNC-INTERNAL • EXPORT-HARDENED • ROUTE-TOLERANT
 ENGINE-AWARE • PAGE-CATALOG NORMALIZED • TOP10-BUILDER FIRST
 INSIGHTS FALLBACK SAFE • SPECIAL-SCHEMA SAFE • NO-IMPORT-TIME-NETWORK
 ADVISOR + SHEET-ROWS SAFE • JSON-SAFE • 502-RESISTANT • MATRIX/ROW-OBJECT SAFE
-INSIGHTS-COLUMNS AWARE (v2.6.0 / Wave 3)
+INSIGHTS-COLUMNS AWARE (v2.6.0+) • DECISION/CANDLESTICK AWARE (v2.7.0+) •
+CONVICTION-FLOOR DELEGATION (v7.2.0+)
 
-v4.3.0 changes (Wave 3 / v2.6.0 schema alignment)
--------------------------------------------------
-Aligns the advisor engine's fallback contracts with the new 90-column
-instrument schema delivered in core/sheets/schema_registry v2.6.0 and
-core/data_engine_v2.py v5.49.0. The engine's view-aware reco logic from
-v4.2.0 stays intact — this revision is purely schema-width additive.
+================================================================================
+v4.4.0 changes (MAY 2026 CROSS-STACK SYNC)
+================================================================================
 
+Aligns investment_advisor_engine with the May 2026 cross-stack family.
+ADDITIVE (mostly): new fallback columns appended, new alias entries,
+new conviction-aware delegation path, __version__ alias. ONE
+COLUMN-ORDER ALIGNMENT (Phase B1) brings the fallback keys/headers in
+line with schema_registry v2.8.0's canonical position for
+opportunity_score and rank_overall (now positions 66-67, were 70-71 in
+v4.3.0 fallback).
+
+Cross-stack module references updated:
+  data_engine_v2  v5.49.0  -> v5.60.0+
+  reco_normalize  v7.0.0   -> v7.2.0
+  insights_builder v1.0.0  -> v7.0.0
+  scoring         v5.0.0   -> v5.2.5
+  schema_registry v2.6.0   -> v2.8.0
+  advisor (orchestrator) v5.1.1 unchanged here
+
+Plus references to NEW family members:
+  scoring_engine v3.4.2 (compatibility bridge)
+  top10_selector v4.11.0 (consumer with data-quality penalties)
+  criteria_model v3.1.0 (data model with conviction + exclusion fields)
+
+Phase-by-phase summary:
+-----------------------
+
+A. NARRATIVE SYNC. All cross-module version references in this header
+   updated to current versions.
+
+B. SCHEMA WIDTH 90 -> 97. _GENERIC_FALLBACK_KEYS and
+   _GENERIC_FALLBACK_HEADERS extended with the 7 columns added by
+   schema_registry v2.7.0 (preserved in v2.8.0):
+     Decision Matrix (2):
+       recommendation_detailed, recommendation_priority
+     Candlestick (5):
+       candlestick_pattern, candlestick_signal, candlestick_strength,
+       candlestick_confidence, candlestick_patterns_recent
+   Auto-derives Top_10_Investments to 100 cols (97 + 3 extras),
+   matching schema_registry v2.8.0's _TOP10_TOTAL_COLS.
+
+B1. COLUMN-ORDER CANONICALIZATION. opportunity_score and rank_overall
+   now sit INSIDE the Scores group (positions 66-67), BEFORE the Views
+   block, matching schema_registry v2.8.0's canonical column order
+   (Scores group has 7 fields, then Views group of 4). v4.3.0 placed
+   them AFTER Views in a separate "Composite ranking" group at
+   positions 70-71. This was inconsistent with the registry-loaded
+   path. After v4.4.0 both paths produce identical positional output.
+   KEY-AWARE callers (most callers) are unaffected; POSITION-AWARE
+   callers that hardcoded v4.3.0's fallback indices 67-70 may see
+   field shifts in those positions.
+
+C. ALIAS HINTS EXPANDED for the 7 new columns plus engine v5.60.0 +
+   scoring v5.2.5 internal fields. Vendor-style variants are folded
+   into canonical names by `_row_value_for_aliases`:
+     recommendation_detailed: ["recommendationDetailed", "reco_detailed"]
+     recommendation_priority: ["recommendationPriority", "reco_priority",
+                               "recommendation_priority_int"]
+     candlestick_pattern:     ["candlestickPattern", "candle_pattern"]
+     candlestick_signal:      ["candlestickSignal", "candle_signal"]
+     candlestick_strength:    ["candlestickStrength", "candle_strength"]
+     candlestick_confidence:  ["candlestickConfidence", "candle_confidence"]
+     candlestick_patterns_recent: ["candlestickPatternsRecent",
+                                   "candle_patterns_recent",
+                                   "patterns_recent_5d"]
+     last_error_class:        ["lastErrorClass", "error_class",
+                               "errorClass"]
+     forecast_unavailable:    ["forecastUnavailable",
+                               "is_forecast_unavailable",
+                               "isForecastUnavailable"]
+     scoring_errors:          ["scoringErrors", "scoring_error_list"]
+
+D. CONVICTION-AWARE DELEGATION. `_score_recommendation` now passes
+   `conviction_score` (read from the row) to
+   `recommendation_from_views` when the delegate supports it
+   (signature detected at module load via `_RFV_ACCEPTS_CONVICTION`).
+   This enables reco_normalize v7.2.0's env-tunable conviction-floor
+   downgrades:
+     RECO_STRONG_BUY_CONVICTION_FLOOR (default 60.0)
+     RECO_BUY_CONVICTION_FLOOR        (default 45.0)
+   Below these floors, STRONG_BUY downgrades to BUY and BUY to HOLD.
+   On TypeError ("unexpected keyword"), retries without
+   `conviction_score` so the call remains backwards-compatible with
+   reco_normalize v7.0.0/v7.1.0. Falls back to composite-only scoring
+   only on non-signature exceptions.
+
+E. __version__ ALIAS. NEW `__version__ = INVESTMENT_ADVISOR_ENGINE_VERSION`
+   (TFB module convention used by scoring v5.2.5, reco_normalize
+   v7.2.0, insights_builder v7.0.0, scoring_engine v3.4.2,
+   top10_selector v4.11.0, criteria_model v3.1.0, schema_registry
+   v2.8.0). `__all__` augmented.
+
+F. CROSS-STACK CAPABILITY DETECTION IN META. Result meta now carries:
+     view_aware                       : bool (existing) — was the
+                                        v7.0.0+ delegate resolved?
+     view_aware_conviction_supported  : bool (NEW v4.4.0) — does the
+                                        delegate accept
+                                        conviction_score? (i.e. is
+                                        reco_normalize v7.2.0+ active?)
+     engine_version                   : (existing) advisor engine
+                                        version (this module)
+   Surfaces upstream capabilities to consumers without exposing
+   internal dispatch details.
+
+G. VERSION BUMP 4.3.0 -> 4.4.0.
+
+PRESERVED VERBATIM from v4.3.0:
+- View-aware delegation (now extended with conviction support)
+- Internal field stripping per engine v5.60.0 contract
+  (_skip_recommendation_synthesis, _internal_*, _meta_*, _debug_*,
+  unit_normalization_warnings, intrinsic_value_source)
+- ROI-safe scoring via `_resolve_roi_for_scoring`
+- `_row_has_scoring_signal` sentinel handling
+- Bucket fabrication safety in `_risk_bucket_from_row` /
+  `_confidence_bucket_from_row` (return "" when source signal missing)
+- `_build_special_fallback` no longer hard-codes RECO_HOLD
+- TypeError-tolerant call dispatch (`_call_tolerant`)
+- Engine resolution order (delegates DOWN to data_engine_v2, never UP
+  to orchestrator, never to itself — no circular dispatch)
+- Snapshot cache + `status="warn"` handling
+
+================================================================================
+v4.3.0 changes (PRESERVED) — Wave 3 / v2.6.0 schema width
+================================================================================
 - ADD: `_GENERIC_FALLBACK_KEYS` and `_GENERIC_FALLBACK_HEADERS` extended
-  from 80 -> 90 cols. Inserted in canonical positions to match the
-  engine's ordering:
-    * Valuation group: +`upside_pct` after `intrinsic_value` (6 -> 7).
-    * Scores group: split into Scores (5) + Views (4) + Composite
-      ranking (2). The four View columns (`fundamental_view`,
-      `technical_view`, `risk_view`, `value_view`) slot in after
-      `overall_score`, before `opportunity_score`. These were already
-      reachable via aliases in v4.2.0 but now have first-class fallback
-      slots so a "no live data" row still emits the full 90-column
-      contract.
-    * Insights group: +`sector_relative_score`, `conviction_score`,
-      `top_factors`, `top_risks`, `position_size_hint` appended after
-      `warnings`. These are produced upstream by core.insights_builder
-      v1.0.0 and reach this layer ready-to-emit.
+  from 80 -> 90 cols (now extended to 97 in v4.4.0).
+- ADD: `_FIELD_ALIAS_HINTS` picked up Insights field variants
+  (convictionScore, sectorAdjScore, topFactors, etc.).
+- DERIVED: `_TOP10_EXTRA_KEYS` / `_TOP10_EXTRA_HEADERS` unchanged.
 
-- ADD: `_FIELD_ALIAS_HINTS` picks up entries for the 5 Insights fields
-  so vendor variants ("convictionScore", "sectorAdjScore", "topFactors"
-  etc.) get folded into the canonical names by `_row_value_for_aliases`.
+================================================================================
+v4.2.0 changes (PRESERVED) — view-aware delegation, ROI safety
+================================================================================
+- FIX [HIGH]: `_score_recommendation` delegates to
+  `core.reco_normalize.recommendation_from_views()` (single source of
+  truth for view-aware 5-tier decisions).
+- FIX [HIGH]: replaced unsafe `if abs(roi) <= 1.5: roi *= 100`
+  heuristic with `_resolve_roi_for_scoring()`.
+- FIX [HIGH]: `_backfill_rows` respects engine's
+  `_skip_recommendation_synthesis` sentinel.
+- FIX [HIGH]: `_risk_bucket_from_row` / `_confidence_bucket_from_row`
+  return "" (not "Moderate"/"Medium") when source score is missing.
+- FIX [MEDIUM]: `_build_special_fallback` no longer hard-codes
+  RECO_HOLD for symbols with no upstream data.
+- FIX [LOW]: defensive internal-field stripping.
+- FIX: `status="warn"` from upstream engine treated as success-with-caveat.
 
-- DERIVED: `_TOP10_EXTRA_KEYS` / `_TOP10_EXTRA_HEADERS` are unchanged
-  (still the 3 extras: top10_rank, selection_reason, criteria_snapshot).
-  The Top_10_Investments contract auto-derives to 93 cols via the
-  existing `_GENERIC_FALLBACK_* + _TOP10_EXTRA_*` concat in
-  `_load_headers_keys_for_page`.
-
-No behavioural changes; the view-aware delegation, internal-field
-stripping, ROI-safe scoring, and bucket fabrication fixes from v4.2.0
-remain in place verbatim.
-
-v4.2.0 changes (PRESERVED)
----------------------------------------
-The four fixes that landed in core/investment_advisor.py v5.1.1 did NOT
-propagate into the engine in v4.1.0 — the engine was still running the
-unsafe percent heuristic and fabricating recommendations / buckets for
-rows with no real data. v4.2.0 brings the engine into symmetry with the
-orchestrator AND adds the view-aware delegation to reco_normalize.
-
-- FIX [HIGH]: `_score_recommendation` now delegates to
-  `core.reco_normalize.recommendation_from_views()` — the single
-  source of truth for view-aware 5-tier decisions added in
-  reco_normalize v7.0.0. The composite-threshold logic from v4.1.0
-  ignored the four View columns (Fundamental / Technical / Risk /
-  Value) so a bullish-but-EXPENSIVE row could still get BUY. The
-  view-aware logic vetoes that correctly. Backward compatibility:
-  signature unchanged, return shape (`(reco, reason, composite)`)
-  unchanged — `composite` is now derived from `overall_score` so
-  `_backfill_rows` callers that read it still work.
-
-- FIX [HIGH]: `_score_recommendation` no longer applies the unsafe
-  `if abs(roi) <= 1.5: roi *= 100` heuristic. It used a new
-  `_resolve_roi_for_scoring()` helper that prefers `*_pct` mirrors
-  (engine v5.47.4 emits both forms) and only converts fraction →
-  percent when magnitude clearly indicates a fraction (`abs <= 5`).
-  Prevents legitimate small percentages like DNB.OL -1.10% being
-  mangled to -110%. Same fix advisor v5.1.1 made.
-
-- FIX [HIGH]: `_backfill_rows` now respects the engine's
-  `_skip_recommendation_synthesis` sentinel and only synthesises a
-  recommendation when at least one scoring field has real data. v4.1.0
-  fabricated SELL recommendations for empty rows because every score
-  defaulted to `0.0` in `_to_float`. New helper:
-  `_row_has_scoring_signal()` — same as advisor v5.1.1.
-
-- FIX [HIGH]: `_risk_bucket_from_row` and `_confidence_bucket_from_row`
-  now return `""` (not "Moderate"/"Medium") when the underlying score
-  is missing. Phantom rows no longer get fabricated risk/confidence
-  buckets. Same fix advisor v5.1.1 made.
-
-- FIX [MEDIUM]: `_build_special_fallback` instrument path no longer
-  hard-codes `RECO_HOLD` for symbols with no upstream data.
-  Recommendation stays None and the row is clearly flagged as a
-  fallback in `warnings` / `selection_reason`. Matches advisor v5.1.1.
-
-- FIX [LOW]: defensively strips internal coordination fields
-  (`_skip_recommendation_synthesis`, `_internal_*`, `_meta_*`,
-  `_debug_*`, `unit_normalization_warnings`, `intrinsic_value_source`)
-  from rows in `_normalize_rows` and again at final emission. Engine
-  v5.47.4 strips them at source but this layer should defend itself
-  for legacy / proxy / cached rows.
-
-- FIX: `status="warn"` from upstream engine is now treated as
-  success-with-caveat, not error. Same handling advisor v5.1.1 added.
-
-- ALIGN: `_FIELD_ALIAS_HINTS` now matches advisor v5.1.1's extended
-  alias map (engine v5.47.4 mirrored aliases).
-
-v4.1.0 changes (PRESERVED)
---------------------------
-- `_normalize_engine_result` is `async def` (was a SyntaxError in
-  v4.0.0 because it used `await` inside a `def`).
-- `_load_headers_keys_for_page` is sync (was async in v4.0.0,
-  causing per-request worker-thread spawns).
-- `ENGINE_MODULE_CANDIDATES` excludes both this module and the
-  orchestrator (no infinite-loop dispatch).
-- `_execute_engine` passes sheet/page kwargs to the resolved data-
-  engine callable.
-- Insights / Data_Dictionary / instrument fallbacks aligned to the
-  registry-canonical schemas (7 / 9 / 80 columns).
-- `DERIVED_OR_NON_SOURCE_PAGES` excludes forbidden names.
-- Recommendation string literals come from `core.reco_normalize`.
-
-Public API is preserved verbatim from v4.1.0: `InvestmentAdvisorEngine`,
-the `advisor` / `investment_advisor` singletons, factory functions, sync
-wrappers, and the `_run_investment_advisor_impl` /
+Public API is preserved verbatim from v4.3.0: `InvestmentAdvisorEngine`,
+the `advisor` / `investment_advisor` singletons, factory functions,
+sync wrappers, and the `_run_investment_advisor_impl` /
 `_run_advisor_impl` hooks all resolve under the same names.
 ================================================================================
 """
@@ -180,7 +220,12 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-INVESTMENT_ADVISOR_ENGINE_VERSION = "4.3.0"
+INVESTMENT_ADVISOR_ENGINE_VERSION = "4.4.0"
+# v4.4.0 Phase E: TFB module-version convention alias (mirrors scoring
+# v5.2.5, reco_normalize v7.2.0, insights_builder v7.0.0, scoring_engine
+# v3.4.2, top10_selector v4.11.0, criteria_model v3.1.0, schema_registry
+# v2.8.0).
+__version__ = INVESTMENT_ADVISOR_ENGINE_VERSION
 
 
 # =============================================================================
@@ -204,16 +249,24 @@ except ImportError:
 
 
 # =============================================================================
-# View-aware recommendation delegate (v4.2.0)
+# View-aware recommendation delegate (v4.2.0 + v4.4.0 conviction support)
 # =============================================================================
 #
 # Resolves `recommendation_from_views` once at module load. If
 # reco_normalize is unavailable or pre-v7.0.0 (lacking the view-aware
 # function), `_VIEW_AWARE_AVAILABLE` stays False and the engine falls
 # back to a composite-only score, but without the unsafe ROI heuristic.
+#
+# v4.4.0 Phase D: detect at module load whether the delegate accepts a
+# `conviction_score` kwarg. When True (reco_normalize v7.2.0+),
+# `_score_recommendation` will pass the row's conviction_score so the
+# env-tunable conviction-floor downgrade activates. Falls back to the
+# legacy 5-kwarg signature on TypeError so this is fully backwards-
+# compatible with reco_normalize v7.0.0 and v7.1.0.
 
 _VIEW_AWARE_AVAILABLE: bool = False
 _recommendation_from_views: Optional[Callable[..., Tuple[str, str]]] = None
+_RFV_ACCEPTS_CONVICTION: bool = False
 
 try:
     from core.reco_normalize import recommendation_from_views as _rfv  # type: ignore
@@ -227,6 +280,23 @@ except ImportError:
     except ImportError:
         _VIEW_AWARE_AVAILABLE = False
         _recommendation_from_views = None
+
+# v4.4.0 Phase D: signature inspection for conviction support
+if _recommendation_from_views is not None:
+    try:
+        _rfv_sig = inspect.signature(_recommendation_from_views)
+        _rfv_params = _rfv_sig.parameters
+        _RFV_ACCEPTS_CONVICTION = (
+            "conviction_score" in _rfv_params
+            or "conviction" in _rfv_params
+            or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in _rfv_params.values()
+            )
+        )
+    except (ValueError, TypeError):  # pragma: no cover
+        # Some builtins / wrapped functions don't expose signatures
+        _RFV_ACCEPTS_CONVICTION = False
 
 
 # =============================================================================
@@ -373,10 +443,34 @@ TOP10_BUILDER_FN_CANDIDATES = (
 
 
 # =============================================================================
-# Canonical fallback schemas — aligned with core.sheets.schema_registry v2.6.0
+# Canonical fallback schemas — aligned with core.sheets.schema_registry v2.8.0
 # =============================================================================
+#
+# v4.4.0 Phase B: 97 instrument columns (was 90 in v4.3.0). Added 7
+# columns at end: 2 Decision Matrix + 5 Candlestick.
+#
+# v4.4.0 Phase B1: Scores group ordering canonicalized to match
+# schema_registry v2.8.0. opportunity_score and rank_overall now sit
+# INSIDE the Scores group (positions 66-67), BEFORE Views. v4.3.0 had
+# them AFTER Views in a "Composite ranking" group at positions 70-71.
+#
+# Column groups and counts (running total):
+#   Identity (8)       ->  8
+#   Price (10)         -> 18
+#   Liquidity (6)      -> 24
+#   Fundamentals (12)  -> 36
+#   Risk (8)           -> 44
+#   Valuation (7)      -> 51
+#   Forecast (9)       -> 60
+#   Scores (7)         -> 67   (v4.4.0: includes opportunity + rank_overall)
+#   Views (4)          -> 71
+#   Recommendation (4) -> 75
+#   Portfolio (6)      -> 81
+#   Provenance (4)     -> 85
+#   Insights (5)       -> 90
+#   Decision (2)       -> 92   (NEW in v4.4.0; aligned with v2.7.0+)
+#   Candlestick (5)    -> 97   (NEW in v4.4.0; aligned with v2.7.0+)
 
-# Canonical 90 instrument columns (v4.3.0 / Wave 3)
 _GENERIC_FALLBACK_KEYS: List[str] = [
     # Identity (8)
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
@@ -392,18 +486,19 @@ _GENERIC_FALLBACK_KEYS: List[str] = [
     # Risk (8)
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
     "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
-    # Valuation (7) — v4.3.0: +upside_pct
+    # Valuation (7)
     "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value", "upside_pct", "valuation_score",
     # Forecast (9)
     "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
     "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket",
-    # Scores (5)
+    # Scores (7) — v4.4.0 Phase B1: includes opportunity + rank_overall (was in
+    # a separate "Composite ranking" group in v4.3.0; reordered to match
+    # schema_registry v2.8.0 canonical order).
     "value_score", "quality_score", "momentum_score", "growth_score", "overall_score",
-    # Views (4) — v4.3.0
-    "fundamental_view", "technical_view", "risk_view", "value_view",
-    # Composite ranking (2)
     "opportunity_score", "rank_overall",
+    # Views (4)
+    "fundamental_view", "technical_view", "risk_view", "value_view",
     # Recommendation (4)
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
     # Portfolio (6)
@@ -411,8 +506,21 @@ _GENERIC_FALLBACK_KEYS: List[str] = [
     "unrealized_pl", "unrealized_pl_pct",
     # Provenance (4)
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
-    # Insights (5) — v4.3.0 / Wave 3, produced by core.insights_builder v1.0.0
+    # Insights (5) — Wave 3 / v2.6.0, produced by core.scoring v5.2.5 as
+    # row fields (sector_relative_score additionally uses an optional
+    # sector cohort; the other four are derived from the fully-scored row).
     "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
+    # Decision Matrix (2) — v4.4.0 Phase B (NEW); aligned with
+    # schema_registry v2.7.0+. Produced by core.data_engine_v2 v5.60.0+
+    # via the 8-tier classifier _classify_8tier(). Empty when
+    # `recommendation` is upstream-set by core.scoring -> core.reco_normalize.
+    "recommendation_detailed", "recommendation_priority",
+    # Candlestick (5) — v4.4.0 Phase B (NEW); aligned with schema_registry
+    # v2.7.0+. Produced by core.candlesticks v1.0.0 when invoked from
+    # core.data_engine_v2 v5.60.0+ on OHLC history rows. Detection is
+    # BEST-EFFORT (gated by ENGINE_CANDLESTICKS_ENABLED env flag).
+    "candlestick_pattern", "candlestick_signal", "candlestick_strength",
+    "candlestick_confidence", "candlestick_patterns_recent",
 ]
 
 _GENERIC_FALLBACK_HEADERS: List[str] = [
@@ -430,18 +538,17 @@ _GENERIC_FALLBACK_HEADERS: List[str] = [
     # Risk (8)
     "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y",
     "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
-    # Valuation (7) — v4.3.0: +Upside %
+    # Valuation (7)
     "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
     # Forecast (9)
     "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
     "Forecast Confidence", "Confidence Score", "Confidence Bucket",
-    # Scores (5)
+    # Scores (7) — v4.4.0 Phase B1
     "Value Score", "Quality Score", "Momentum Score", "Growth Score", "Overall Score",
-    # Views (4) — v4.3.0
-    "Fundamental View", "Technical View", "Risk View", "Value View",
-    # Composite ranking (2)
     "Opportunity Score", "Rank (Overall)",
+    # Views (4)
+    "Fundamental View", "Technical View", "Risk View", "Value View",
     # Recommendation (4)
     "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
     # Portfolio (6)
@@ -449,8 +556,13 @@ _GENERIC_FALLBACK_HEADERS: List[str] = [
     "Unrealized P/L", "Unrealized P/L %",
     # Provenance (4)
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
-    # Insights (5) — v4.3.0 / Wave 3
+    # Insights (5)
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
+    # Decision Matrix (2) — v4.4.0 Phase B
+    "Recommendation Detail", "Reco Priority",
+    # Candlestick (5) — v4.4.0 Phase B
+    "Candle Pattern", "Candle Signal", "Candle Strength",
+    "Candle Confidence", "Recent Patterns (5D)",
 ]
 
 # Insights_Analysis — exactly 7 registry-canonical columns
@@ -469,13 +581,14 @@ _DICTIONARY_HEADERS: List[str] = [
     "Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes",
 ]
 
-# Top_10_Investments extras (3) — registry appends these to the canonical 80
+# Top_10_Investments extras (3) — registry appends these to the canonical 97
 _TOP10_EXTRA_KEYS: List[str] = ["top10_rank", "selection_reason", "criteria_snapshot"]
 _TOP10_EXTRA_HEADERS: List[str] = ["Top10 Rank", "Selection Reason", "Criteria Snapshot"]
 
 
 # =============================================================================
-# Field aliases (v4.2.0: aligned with advisor v5.1.1)
+# Field aliases (v4.4.0 Phase C: expanded with Decision/Candlestick + engine
+# v5.60.0 + scoring v5.2.5 internal fields)
 # =============================================================================
 
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
@@ -519,7 +632,7 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "risk_score": ["risk", "riskscore"],
     "valuation_score": ["valuation", "valuationscore"],
     "overall_score": ["score", "overall", "totalscore", "compositeScore"],
-    "opportunity_score": ["opportunity", "opportunityscore", "convictionScore"],
+    "opportunity_score": ["opportunity", "opportunityscore"],
     "value_score": ["valueScore"],
     "quality_score": ["qualityScore"],
     "momentum_score": ["momentumScore"],
@@ -543,17 +656,58 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "volume_ratio": ["volumeRatio"],
     "day_range_position": ["dayRangePosition"],
     "upside_pct": ["upsidePct"],
-    # NEW in v4.2.0: views (so view-aware delegation can find them)
+    # v4.2.0: views
     "fundamental_view": ["fundamentalView", "fund_view"],
     "technical_view": ["technicalView", "tech_view"],
     "risk_view": ["riskView"],
     "value_view": ["valueView", "valuation_view"],
-    # NEW in v4.3.0: Insights columns (Wave 3, produced by core.insights_builder v1.0.0)
+    # v4.3.0: Insights columns (Wave 3) — note: conviction_score was
+    # also listed under opportunity_score in v4.3.0 which was wrong;
+    # they are distinct fields produced separately by scoring v5.2.5.
     "sector_relative_score": ["sectorAdjScore", "sector_adj_score", "sectorRelativeScore"],
     "conviction_score": ["convictionScore", "conviction"],
     "top_factors": ["topFactors", "top_factor_list"],
     "top_risks": ["topRisks", "top_risk_list"],
     "position_size_hint": ["positionSizeHint", "position_hint", "size_hint"],
+    # v4.4.0 Phase C NEW: Decision Matrix (schema_registry v2.7.0+)
+    "recommendation_detailed": [
+        "recommendationDetailed", "reco_detailed", "recommendation_detail",
+        "recommendationDetail", "detailed_recommendation",
+    ],
+    "recommendation_priority": [
+        "recommendationPriority", "reco_priority", "recommendation_priority_int",
+        "decision_priority", "decisionPriority",
+    ],
+    # v4.4.0 Phase C NEW: Candlestick (schema_registry v2.7.0+)
+    "candlestick_pattern": [
+        "candlestickPattern", "candle_pattern", "candlestickPatternName",
+    ],
+    "candlestick_signal": [
+        "candlestickSignal", "candle_signal", "candlestickPatternSignal",
+    ],
+    "candlestick_strength": [
+        "candlestickStrength", "candle_strength",
+    ],
+    "candlestick_confidence": [
+        "candlestickConfidence", "candle_confidence",
+    ],
+    "candlestick_patterns_recent": [
+        "candlestickPatternsRecent", "candle_patterns_recent",
+        "patterns_recent_5d", "recentCandlestickPatterns",
+    ],
+    # v4.4.0 Phase C NEW: engine v5.60.0 + scoring v5.2.5 internal fields
+    # (NOT in default schema; recognized so they get extracted correctly
+    # from incoming row dicts when downstream consumers like top10_selector
+    # v4.11.0 or insights_builder v7.0.0 forward them through).
+    "last_error_class": [
+        "lastErrorClass", "error_class", "errorClass",
+    ],
+    "forecast_unavailable": [
+        "forecastUnavailable", "is_forecast_unavailable", "isForecastUnavailable",
+    ],
+    "scoring_errors": [
+        "scoringErrors", "scoring_error_list",
+    ],
 }
 
 
@@ -1136,7 +1290,12 @@ def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
 
 
 def _load_headers_keys_for_page(page: str) -> Tuple[List[str], List[str]]:
-    """Load `(headers, keys)` for a page from the schema registry. Sync."""
+    """Load `(headers, keys)` for a page from the schema registry. Sync.
+
+    v4.4.0: when the schema_registry is unavailable, falls back to the
+    97-column canonical layout (was 90 in v4.3.0). Top_10_Investments
+    auto-derives to 100 cols (97 + 3 extras).
+    """
     normalized = _normalize_page_name(page) or DEFAULT_PAGE
 
     for module_name in SCHEMA_MODULE_CANDIDATES:
@@ -1754,16 +1913,10 @@ def _normalize_headers_keys(
 
 
 # =============================================================================
-# Recommendation Scoring (v4.2.0: view-aware + safe ROI handling)
+# Recommendation Scoring
+# (v4.2.0: view-aware + safe ROI handling;
+#  v4.4.0 Phase D: conviction-aware view-aware delegation)
 # =============================================================================
-#
-# v4.2.0 changes from v4.1.0:
-# - delegates to reco_normalize.recommendation_from_views() when available
-#   (matches scoring.py v5.0.0 / advisor v5.1.1 behaviour)
-# - replaces the unsafe `if abs(roi) <= 1.5: roi *= 100` heuristic with
-#   `_resolve_roi_for_scoring()` (same as advisor v5.1.1)
-# - return shape preserved: `(reco, reason, composite)` so callers in
-#   `_backfill_rows` that read `composite` to fill `overall_score` still work.
 
 # Fields whose presence indicates the engine had real scoring signal.
 # If NONE of these are populated for a row, we don't synthesise a recommendation.
@@ -1791,7 +1944,7 @@ def _resolve_roi_for_scoring(row: Mapping[str, Any], horizon: str = "3m") -> Opt
     """v4.2.0: Resolve expected ROI in PERCENT for use in the composite score.
 
     Strategy (replaces v4.1.0's unsafe `if abs(roi) <= 1.5: roi *= 100`):
-    1. Prefer `expected_roi_<horizon>_pct` (engine v5.47.4 emits both as
+    1. Prefer `expected_roi_<horizon>_pct` (engine v5.60.0 emits both as
        fraction and as `_pct`); this is unambiguous percent.
     2. Fall back to canonical `expected_roi_<horizon>` (engine schema
        defines this as a fraction, e.g. 0.05 = 5%); convert by *100 only
@@ -1832,18 +1985,26 @@ def _composite_to_recommendation(composite: float) -> Tuple[str, str]:
 def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
     """Score and generate a recommendation for a row.
 
-    v4.2.0: when the view-aware delegate
-    (`reco_normalize.recommendation_from_views`) is available, this
-    function uses the four View columns (Fundamental, Technical, Risk,
-    Value) plus the Overall Score to produce a 5-tier recommendation
-    with the same priority cascade scoring.py v5.0.0 uses. EXPENSIVE
-    valuations are vetoed from BUY, double-bearish forces SELL, etc.
+    v4.4.0 Phase D: When the view-aware delegate
+    (`reco_normalize.recommendation_from_views`) is available AND the
+    delegate signature accepts `conviction_score` (i.e. reco_normalize
+    v7.2.0+), this function passes the row's conviction_score so the
+    env-tunable conviction-floor downgrade activates:
+        RECO_STRONG_BUY_CONVICTION_FLOOR (default 60.0)
+        RECO_BUY_CONVICTION_FLOOR        (default 45.0)
+    Below these floors, STRONG_BUY downgrades to BUY and BUY to HOLD.
 
-    When the view-aware delegate is NOT available (older
-    reco_normalize), falls back to the v4.1.0-style composite-threshold
-    logic but using `_resolve_roi_for_scoring` (no unsafe heuristic).
+    On TypeError ("unexpected keyword"), retries without
+    conviction_score for backwards-compat with v7.0.0/v7.1.0. Falls
+    back to composite-only on non-signature exceptions.
 
-    Return shape unchanged from v4.1.0: `(reco, reason, composite)`.
+    v4.2.0 (PRESERVED): when the view-aware delegate is available, uses
+    the four View columns (Fundamental, Technical, Risk, Value) plus
+    the Overall Score to produce a 5-tier recommendation with the
+    priority cascade scoring.py uses. EXPENSIVE valuations are vetoed
+    from BUY, double-bearish forces SELL, etc.
+
+    Return shape unchanged: `(reco, reason, composite)`.
     `composite` is exposed so `_backfill_rows` can fill `overall_score`
     when missing.
     """
@@ -1894,17 +2055,49 @@ def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
             # view-aware logic still has score context.
             score_for_views = composite
 
-        # Only delegate if we have at least one view OR a score; otherwise
-        # `recommendation_from_views` returns HOLD with "Insufficient data"
-        # which is what we want anyway.
+        # v4.4.0 Phase D: read conviction_score if available so reco_normalize
+        # v7.2.0+ can apply the conviction-floor downgrade.
+        conviction = _to_float_optional(
+            row.get("conviction_score")
+            or _row_value_for_aliases(row, _FIELD_ALIAS_HINTS.get("conviction_score", []))
+        )
+
+        # Build base kwargs once
+        base_kwargs: Dict[str, Any] = dict(
+            fundamental=f_view or None,
+            technical=t_view or None,
+            risk=r_view or None,
+            value=v_view or None,
+            score=score_for_views,
+        )
+
+        # Try with conviction first (if delegate supports it AND row has it)
+        if _RFV_ACCEPTS_CONVICTION and conviction is not None:
+            try:
+                reco, reason = _recommendation_from_views(
+                    conviction_score=conviction, **base_kwargs
+                )
+                return reco, reason, composite
+            except TypeError as te:
+                # Signature mismatch — module-load detection was wrong, or
+                # the function rejects the kwarg name. Fall through to the
+                # legacy call below.
+                logger.debug(
+                    "view-aware delegate rejected conviction_score (%s); "
+                    "retrying without it.", te,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "view-aware recommendation_from_views (with conviction) "
+                    "failed (%s); falling back to composite threshold.", exc,
+                )
+                reco, reason = _composite_to_recommendation(composite)
+                return reco, reason, composite
+
+        # Legacy call without conviction (backwards-compat with v7.0.0/v7.1.0
+        # or fallback when conviction_score isn't available on the row).
         try:
-            reco, reason = _recommendation_from_views(
-                fundamental=f_view or None,
-                technical=t_view or None,
-                risk=r_view or None,
-                value=v_view or None,
-                score=score_for_views,
-            )
+            reco, reason = _recommendation_from_views(**base_kwargs)
             return reco, reason, composite
         except Exception as exc:
             logger.debug(
@@ -1982,7 +2175,7 @@ def _backfill_rows(
     """Backfill missing fields in rows.
 
     v4.2.0 changes:
-    - Respects `_skip_recommendation_synthesis` sentinel from engine v5.47.4
+    - Respects `_skip_recommendation_synthesis` sentinel from engine v5.60.0+
     - Only synthesises a recommendation if at least one scoring field has
       real data (no more SELL recommendations from all-zero defaults)
     - Only fills risk/confidence buckets if the underlying score exists
@@ -2288,6 +2481,9 @@ async def _normalize_engine_result(
 
     v4.2.0: hard-strips internal fields from every row before final
     emission, treats engine "warn" status as success-with-caveat.
+
+    v4.4.0 Phase F: surfaces cross-stack capability flags in meta
+    (view_aware, view_aware_conviction_supported).
     """
     page = _normalize_page_name(criteria.get("page")) or DEFAULT_PAGE
 
@@ -2366,6 +2562,10 @@ async def _normalize_engine_result(
             "normalized_by": "core.investment_advisor_engine",
             "engine_version": INVESTMENT_ADVISOR_ENGINE_VERSION,
             "view_aware": _VIEW_AWARE_AVAILABLE,
+            # v4.4.0 Phase F: cross-stack capability flags
+            "view_aware_conviction_supported": (
+                _VIEW_AWARE_AVAILABLE and _RFV_ACCEPTS_CONVICTION
+            ),
             "timestamp_utc": _now_utc_iso(),
             "offset": max(0, _to_int(offset, DEFAULT_OFFSET)),
             "limit": max(1, _to_int(limit, DEFAULT_LIMIT)),
@@ -2627,6 +2827,8 @@ def build_recommendations(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
 __all__ = [
     "INVESTMENT_ADVISOR_ENGINE_VERSION",
+    # v4.4.0 Phase E: TFB module-version convention alias
+    "__version__",
     "InvestmentAdvisorEngine",
     "advisor",
     "investment_advisor",
