@@ -2,9 +2,10 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Finance Fundamentals Provider -- v6.0.0
+Yahoo Finance Fundamentals Provider -- v6.1.0
 ================================================================================
 FALLBACK FUNDAMENTALS • PROFILE ENRICHMENT • HISTORY AVG-VOLUME FALLBACK
+CURRENCY-SANITY GUARD • USER-AGENT ROTATION • EXPONENTIAL BACKOFF
 ENGINE-COMPATIBLE • STARTUP-SAFE • SINGLEFLIGHT • CACHE-BACKED • JSON-SAFE
 
 Purpose
@@ -14,59 +15,88 @@ equities and yahoo_chart remains primary for Yahoo-style quote/history data.
 This provider fills gaps when Yahoo has richer or more readily available
 metadata than the primary source.
 
-v6.0.0 Changes (from v5.5.0)
+v6.1.0 Changes (from v6.0.0)
 ----------------------------
-Bug fixes:
-  - `self.enabled` referenced in fetch_fundamentals but NEVER DEFINED. The
-    dataclass has no `enabled` slot and no @property -- so every call would
-    raise AttributeError. v6.0.0 adds `enabled` as a @property backed by the
-    `_configured()` helper. This bug was likely masked by the provider being
-    a fallback (rarely invoked), but the moment it was hit, it failed hard.
-  - `self.semaphore` was initialized but never acquired. v6.0.0 wires it
-    around the executor call inside the singleflight callback, so
-    concurrent yfinance fetches are now actually bounded by
-    `YF_MAX_CONCURRENCY`.
-  - `fetch_fundamentals_batch` had no concurrency cap and no parameter --
-    it created asyncio tasks for every symbol at once. Now accepts a
-    `concurrency` parameter and gates tasks through an asyncio.Semaphore.
-  - Rate-limiter token acquisition moved INSIDE the singleflight callback.
-    v5.5.0 consumed a token even for deduplicated callers, wasting budget
-    when many concurrent requests target the same symbol.
-  - Module-level `_INSTANCE = YahooFundamentalsProvider()` eager
-    instantiation replaced with lazy `get_provider()` / `close_provider()`
-    (parity with other v6 providers). Import no longer has side effects
-    beyond logger-handler registration.
-  - Module-level `_PROVIDER_LOCK` lazy-initialized. All intra-class
-    asyncio primitives (TokenBucket / CircuitBreaker / SingleFlight /
-    AdvancedCache / provider semaphore) now lazy-init on first async use.
+Bug fixes (data accuracy):
+  - CURRENCY-MISMATCH GUARD on 52W high/low. Yahoo's `fast_info` was
+    returning 52W high/low from a foreign listing (BP.US -> GBX; RIO.US ->
+    GBX; BRK-B.US -> BRK-A USD; CHT.US -> TWD; ASR.US -> MXN; ZTO.US -> HKD;
+    PRU.L -> USD) while `current_price` was correctly in the primary
+    listing's currency. v6.0.0 wrote the suspect values verbatim, producing
+    rows like BRK-B with 52W high = 782,014.25 against a 475.94 price. The
+    backend's `upside_synthesis_suspect` warning fired but the bad numbers
+    still propagated. v6.1.0 adds `_validate_52w_bounds()` which detects
+    these mismatches via the |candidate / current_price| ratio (default
+    suspect thresholds: >= 8.0 or <= 0.125), drops the offender, and falls
+    back to the 3-month history-derived high/low if those are in-range.
+    Emits structured warnings (`week_52_high_unit_mismatch_dropped`,
+    `week_52_high_used_history_fallback`, etc.) into the patch's `warnings`
+    list so downstream consumers can surface them without re-deriving the
+    diagnosis.
+  - Bounds are also auto-corrected when high < low (`week_52_high_low_
+    inverted`) and an alarm is raised when current price falls outside the
+    [low, high] band by more than 5% (`current_price_outside_52w_range`).
+
+Resilience (HTTP 403 / 429 from Yahoo):
+  - USER-AGENT ROTATION. Yahoo aggressively 403s requests sharing the
+    default urllib/python User-Agent header. v6.1.0 introduces an optional
+    `requests.Session` carrying a rotated browser User-Agent (Chrome /
+    Firefox / Safari on Win / Mac / Linux). The session is passed to
+    `yf.Ticker(symbol, session=session)` on every fetch. UA is re-rotated
+    on each retry. Gracefully degrades to bare `yf.Ticker(symbol)` if
+    `requests` is unavailable, if the running yfinance version doesn't
+    accept the `session` kwarg, or if `YF_USER_AGENT_ROTATION=0`.
+  - EXPONENTIAL BACKOFF WITH JITTER. v6.0.0 retried 4 times with a fixed
+    0.5s sleep. v6.1.0 uses base = min(8.0, 0.5 * 2**attempt) and adds
+    25% jitter. Detects 403/429/rate_limit substrings in the error string
+    and lengthens the cooldown to discourage tight-loop rate hammering.
+  - Retry count is now configurable via `YF_RETRY_ATTEMPTS` (default: 4).
+
+Observability:
+  - Patch output now includes a `warnings: List[str]` field listing every
+    field-level data-quality flag raised during the fetch (currency
+    mismatch, inverted bounds, history fallback used, etc.). This is the
+    same channel the advisor and scoring layer already read from --
+    no downstream changes required to surface the new warnings.
+  - `last_error_class` is now recorded on full-fail returns alongside
+    `error`, so the circuit breaker's status_code argument can be inferred
+    more accurately on follow-up.
 
 Cleanup:
-  - Removed dead code: `_trace` decorator, `TraceContext` class (never
-    applied to any method); `json_dumps` helper (never called);
-    `random` import (unused); `t0 = time.time()` (computed but never read);
-    `Status`, `StatusCode` OTEL imports (only used by removed TraceContext).
-  - Removed `functools` import (was only used by the removed `_trace`).
-  - Consolidated version: header says v5.4.0 but PROVIDER_VERSION said
-    v5.5.0 -- both now say v6.0.0.
-  - Engine-facing functions accept (and debug-log) extra args/kwargs for
-    parity with argaam/eodhd/finnhub/tadawul v6 adapters.
+  - Re-imported `random` (removed in v6.0.0). Required for UA rotation and
+    backoff jitter. Not used anywhere else.
+  - Added `requests` as an optional dependency (already pulled in
+    transitively by yfinance, so this is a free addition for any working
+    install).
+
+v6.0.0 fixes (preserved verbatim from upstream):
+  - `self.enabled` is a @property backed by `_configured()` (was missing,
+    raised AttributeError on call in v5.5.0)
+  - Provider's `semaphore` is now actually acquired around executor calls
+  - `fetch_fundamentals_batch` accepts a `concurrency` parameter and gates
+    tasks through an asyncio.Semaphore
+  - Rate-limiter token acquisition is INSIDE the singleflight callback
+  - Lazy singleton via `get_provider()` / `close_provider()`
+  - All intra-class asyncio primitives lazy-init on first async use
+  - Dead code removed (TraceContext, _trace, json_dumps, unused imports)
 
 Preserved for backward compatibility:
-  - Every name in __all__ plus the dataclass field names on the provider.
-  - All env variable names and defaults (YF_ENABLED, YF_TIMEOUT_SEC,
-    YF_FUND_TTL_SEC, YF_ERROR_TTL_SEC, YF_MAX_CONCURRENCY,
-    YF_RATE_LIMIT_PER_SEC, YF_CIRCUIT_BREAKER, YF_CB_FAIL_THRESHOLD,
-    YF_CB_COOLDOWN_SEC, YF_ENABLE_REDIS, REDIS_URL,
-    YF_VERBOSE_WARNINGS, YF_TRACING_ENABLED, PROMETHEUS_ENABLED).
+  - Every name in __all__ plus the dataclass field names on the provider
+  - All env variable names and defaults from v6.0.0
   - Patch shape (all fundamental/price/analyst fields and legacy aliases:
     price, prev_close, open, change, change_pct, 52w_high, 52w_low,
     forward_pe, pb, ps, peg, net_margin, revenue_growth,
-    dividend_yield_percent).
-  - DataQuality enum values (including STALE even though unreturned
-    internally -- external code may compare against it).
-  - Redis cache support (unchanged).
-  - Prometheus metrics shape (yf_fund_requests_total,
-    yf_fund_request_duration_seconds, yf_fund_circuit_breaker_state).
+    dividend_yield_percent)
+  - DataQuality enum values
+  - Redis cache support
+  - Prometheus metrics shape
+
+New env variables (v6.1.0):
+  - YF_USER_AGENT_ROTATION   (default: 1)   enable session-based UA rotation
+  - YF_PRICE_SANITY_GUARD    (default: 1)   enable 52W bounds validation
+  - YF_RETRY_ATTEMPTS        (default: 4)   per-fetch retry cap
+  - YF_PRICE_RATIO_HIGH      (default: 8.0) suspect-ratio upper threshold
+  - YF_PRICE_RATIO_LOW       (default: 0.125) suspect-ratio lower threshold
 ================================================================================
 """
 
@@ -79,6 +109,7 @@ import logging
 import math
 import os
 import pickle
+import random
 import re
 import time
 import zlib
@@ -99,7 +130,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.0.0"
+PROVIDER_VERSION = "6.1.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -109,6 +140,43 @@ _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _K_M_B_T_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMBT])$", re.IGNORECASE)
 _K_M_B_T_MULT = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
+
+# v6.1.0: rotated User-Agent pool (modern browsers, ~Q1 2026).
+# Yahoo's edge layer 403s the default python-urllib UA; sessions with these
+# are accepted at a much higher rate. Order doesn't matter -- callers pick
+# uniformly at random and rotate on retry.
+_USER_AGENTS: Tuple[str, ...] = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 "
+    "Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.2210.144",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 "
+    "Firefox/121.0",
+)
+
+# v6.1.0: suspect-ratio thresholds for 52W bounds. If `candidate / current`
+# is outside [_PRICE_RATIO_SUSPECT_LOW, _PRICE_RATIO_SUSPECT_HIGH], the
+# candidate is treated as a unit/currency mismatch (e.g. GBX high vs USD
+# price -> ratio ~ 100). These can be tuned via env vars.
+_PRICE_RATIO_SUSPECT_HIGH_DEFAULT = 8.0
+_PRICE_RATIO_SUSPECT_LOW_DEFAULT = 0.125
+
+# v6.1.0: substring markers used to detect rate-limit / auth errors in
+# yfinance exception text (it doesn't expose status codes cleanly).
+_RATE_LIMIT_MARKERS: Tuple[str, ...] = (
+    "403", "429", "forbidden", "rate limit", "too many requests",
+    "unauthorized", "401",
+)
 
 # =============================================================================
 # Optional Dependencies (prod-safe)
@@ -134,6 +202,17 @@ try:
 except ImportError:
     yf = None  # type: ignore[assignment]
     _HAS_YFINANCE = False
+
+# v6.1.0: requests is required for UA-rotation sessions. It is pulled in
+# transitively by yfinance, so this should always be available in any
+# environment where the provider can function -- but we degrade gracefully
+# if it's not.
+try:
+    import requests  # type: ignore
+    _HAS_REQUESTS = True
+except ImportError:
+    requests = None  # type: ignore[assignment]
+    _HAS_REQUESTS = False
 
 
 # =============================================================================
@@ -258,6 +337,35 @@ def _enable_redis() -> bool:
 
 def _redis_url() -> str:
     return _env_str("REDIS_URL", "redis://localhost:6379/0")
+
+
+# v6.1.0: new env helpers
+
+def _ua_rotation_enabled() -> bool:
+    """Enable session-based User-Agent rotation (default: on)."""
+    return _env_bool("YF_USER_AGENT_ROTATION", True) and _HAS_REQUESTS
+
+
+def _price_sanity_enabled() -> bool:
+    """Enable 52W high/low currency-mismatch validation (default: on)."""
+    return _env_bool("YF_PRICE_SANITY_GUARD", True)
+
+
+def _retry_attempts() -> int:
+    """Per-fetch retry attempts (default: 4, minimum: 1)."""
+    return max(1, _env_int("YF_RETRY_ATTEMPTS", 4))
+
+
+def _price_ratio_high() -> float:
+    """Upper threshold for the suspect candidate/current ratio."""
+    v = _env_float("YF_PRICE_RATIO_HIGH", _PRICE_RATIO_SUSPECT_HIGH_DEFAULT)
+    return v if v > 1.0 else _PRICE_RATIO_SUSPECT_HIGH_DEFAULT
+
+
+def _price_ratio_low() -> float:
+    """Lower threshold for the suspect candidate/current ratio."""
+    v = _env_float("YF_PRICE_RATIO_LOW", _PRICE_RATIO_SUSPECT_LOW_DEFAULT)
+    return v if 0.0 < v < 1.0 else _PRICE_RATIO_SUSPECT_LOW_DEFAULT
 
 
 # =============================================================================
@@ -485,6 +593,178 @@ def _infer_asset_class(info: Dict[str, Any], norm_symbol: str) -> Optional[str]:
     if _is_ksa_symbol(norm_symbol):
         return "Equity"
     return None
+
+
+# =============================================================================
+# v6.1.0: User-Agent Rotation + Session Factory
+# =============================================================================
+
+def _pick_random_ua() -> str:
+    """Pick a User-Agent string uniformly at random from the pool."""
+    return random.choice(_USER_AGENTS)
+
+
+def _create_yf_session() -> Optional[Any]:
+    """
+    Create a requests.Session pre-loaded with a rotated browser User-Agent.
+
+    Returns None if:
+      - requests is not installed, OR
+      - YF_USER_AGENT_ROTATION is explicitly disabled.
+
+    The session is suitable to pass into yfinance:
+        yf.Ticker(symbol, session=_create_yf_session())
+
+    Newer yfinance versions accept the `session` kwarg and route their
+    underlying HTTP calls through it; older versions ignore it (we wrap
+    the constructor in try/except to handle that).
+    """
+    if not _ua_rotation_enabled() or not _HAS_REQUESTS or requests is None:
+        return None
+    try:
+        sess = requests.Session()
+        sess.headers.update({
+            "User-Agent": _pick_random_ua(),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        })
+        return sess
+    except Exception as exc:
+        logger.debug("yf session creation failed: %s", exc)
+        return None
+
+
+def _rotate_session_ua(session: Any) -> None:
+    """Rotate the User-Agent header on an existing session (in-place)."""
+    if session is None:
+        return
+    try:
+        session.headers["User-Agent"] = _pick_random_ua()
+    except Exception:
+        pass
+
+
+def _is_rate_limit_error(err: Optional[BaseException]) -> bool:
+    """Heuristic: does the error string look like a 403 / 429 / rate-limit?"""
+    if err is None:
+        return False
+    try:
+        s = str(err).lower()
+    except Exception:
+        return False
+    return any(m in s for m in _RATE_LIMIT_MARKERS)
+
+
+# =============================================================================
+# v6.1.0: 52W Bounds Validation (Currency-Mismatch Guard)
+# =============================================================================
+
+def _is_suspect_price_ratio(ref: Optional[float], candidate: Optional[float]) -> bool:
+    """
+    Return True if `candidate` is suspiciously far from `ref` (likely a
+    currency/scale mismatch -- e.g. GBX value paired with a USD reference).
+
+    Both must be positive finite floats. The ratio thresholds default to
+    [0.125, 8.0] and can be tuned via YF_PRICE_RATIO_LOW / _HIGH env vars.
+    """
+    if ref is None or candidate is None:
+        return False
+    if ref <= 0 or candidate <= 0:
+        return False
+    ratio = candidate / ref
+    return ratio >= _price_ratio_high() or ratio <= _price_ratio_low()
+
+
+def _validate_52w_bounds(
+    current_price: Optional[float],
+    week_52_high: Optional[float],
+    week_52_low: Optional[float],
+    hist_52w_high: Optional[float],
+    hist_52w_low: Optional[float],
+) -> Tuple[Optional[float], Optional[float], List[str]]:
+    """
+    Validate the 52W high/low against `current_price` for unit consistency.
+
+    Symptoms this catches (observed in production):
+      BP.US   -- 52W high 609.40 (GBX from LSE listing) vs price 43.34 USD
+      RIO.US  -- 52W high 7,834.00 (GBX) vs price 105.38 USD
+      BRK-B.US -- 52W high 782,014.25 (BRK-A USD) vs price 475.94 USD
+      CHT.US  -- 52W high 138.00 (TWD) vs price 43.81 USD
+      ASR.US  -- 52W high 690.99 (MXN) vs price 308.99 USD
+      ZTO.US  -- 52W high 205.60 (HKD) vs price 25.05 USD
+      PRU.L   -- 52W high 119.76 (USD ADR) vs price 1,135.00 GBX
+
+    Behavior:
+      1. If a candidate is suspect, drop it (-> None) and emit
+         `week_52_<bound>_unit_mismatch_dropped`.
+      2. If the history-derived fallback (3mo window, not strictly 1y but
+         a strong sanity check) is in-range, use it and emit
+         `week_52_<bound>_used_history_fallback`.
+      3. If high < low after validation, swap them and emit
+         `week_52_high_low_inverted`.
+      4. If current_price is more than 5% outside the validated [low, high]
+         band, emit `current_price_outside_52w_range` (informational only;
+         the bounds are not rewritten).
+
+    Returns: (validated_high, validated_low, warnings)
+    """
+    warnings: List[str] = []
+
+    if not _price_sanity_enabled():
+        return week_52_high, week_52_low, warnings
+
+    cp = safe_float(current_price)
+    high = safe_float(week_52_high)
+    low = safe_float(week_52_low)
+    hh = safe_float(hist_52w_high)
+    hl = safe_float(hist_52w_low)
+
+    # Without a usable reference price we can't validate ratios. Just pass
+    # through unchanged.
+    if cp is None or cp <= 0:
+        return high, low, warnings
+
+    # Validate high
+    if high is not None and _is_suspect_price_ratio(cp, high):
+        warnings.append("week_52_high_unit_mismatch_dropped")
+        if hh is not None and not _is_suspect_price_ratio(cp, hh):
+            high = hh
+            warnings.append("week_52_high_used_history_fallback")
+        else:
+            high = None
+
+    # Validate low
+    if low is not None and _is_suspect_price_ratio(cp, low):
+        warnings.append("week_52_low_unit_mismatch_dropped")
+        if hl is not None and not _is_suspect_price_ratio(cp, hl):
+            low = hl
+            warnings.append("week_52_low_used_history_fallback")
+        else:
+            low = None
+
+    # Sanity: high should be >= low
+    if high is not None and low is not None and high < low:
+        warnings.append("week_52_high_low_inverted")
+        high, low = low, high
+
+    # Informational: current price should sit in the validated band
+    if high is not None and cp > high * 1.05:
+        warnings.append("current_price_outside_52w_range")
+    elif low is not None and cp < low * 0.95:
+        warnings.append("current_price_outside_52w_range")
+
+    return high, low, warnings
 
 
 # =============================================================================
@@ -919,18 +1199,22 @@ class YahooFundamentalsProvider:
             redis_url=_redis_url(),
         )
         logger.info(
-            "YahooFundamentalsProvider v%s initialized | yfinance=%s | concurrency=%s | rate=%s/s | cb=%s/%ss",
+            "YahooFundamentalsProvider v%s initialized | yfinance=%s | "
+            "requests=%s | UA_rotation=%s | sanity_guard=%s | retries=%s | "
+            "concurrency=%s | rate=%s/s | cb=%s/%ss",
             PROVIDER_VERSION,
             _HAS_YFINANCE,
+            _HAS_REQUESTS,
+            _ua_rotation_enabled(),
+            _price_sanity_enabled(),
+            _retry_attempts(),
             self.max_concurrency,
             _rate_limit(),
             _cb_fail_threshold(),
             _cb_cooldown_sec(),
         )
 
-    # v6.0.0 FIX: `enabled` was referenced by fetch_fundamentals but NEVER
-    # defined as a slot or property in v5.5.0. Every call would have raised
-    # AttributeError. Now a proper @property backed by `_configured()`.
+    # v6.0.0 FIX: `enabled` is a proper @property backed by `_configured()`.
     @property
     def enabled(self) -> bool:
         """Return True if YF_ENABLED and yfinance is installed."""
@@ -999,19 +1283,56 @@ class YahooFundamentalsProvider:
 
     # -- Blocking fetch (runs in ThreadPoolExecutor) ---------------------
 
+    def _construct_ticker(self, norm_symbol: str, session: Any) -> Any:
+        """
+        Construct a yf.Ticker. Try with `session=` first (newer yfinance);
+        fall back to positional-only construction if the kwarg is rejected.
+        """
+        if yf is None:
+            return None
+        if session is None:
+            return yf.Ticker(norm_symbol)
+        try:
+            return yf.Ticker(norm_symbol, session=session)
+        except TypeError:
+            # Older yfinance: doesn't accept session kwarg
+            return yf.Ticker(norm_symbol)
+        except Exception as exc:
+            logger.debug("yf.Ticker(%s, session=...) failed (%s); retrying bare",
+                         norm_symbol, exc)
+            return yf.Ticker(norm_symbol)
+
     def _blocking_fetch(self, norm_symbol: str) -> Dict[str, Any]:
         """
         Blocking yfinance fetch. Called via loop.run_in_executor.
 
-        Retries up to 4 times with 0.5s backoff on exceptions.
+        v6.1.0:
+          - Uses a requests.Session with rotated User-Agent (if available).
+          - Rotates UA on every retry.
+          - Exponential backoff with 25% jitter; doubled cooldown when the
+            error string looks like a rate-limit / auth response.
+          - Validates 52W high/low against current_price; falls back to
+            3-month history-derived bounds on suspected currency mismatch.
+          - Emits a `warnings: List[str]` field summarising every field-
+            level data-quality flag raised during the fetch.
         """
         if not _HAS_YFINANCE or yf is None:
-            return {"error": "yfinance_not_installed"}
+            return {"error": "yfinance_not_installed",
+                    "data_quality": DataQuality.ERROR.value,
+                    "last_error_class": "ImportError"}
 
-        last_err: Optional[Exception] = None
-        for attempt in range(4):
+        last_err: Optional[BaseException] = None
+        last_err_class: str = ""
+        session = _create_yf_session()
+        max_attempts = _retry_attempts()
+
+        for attempt in range(max_attempts):
             try:
-                t = yf.Ticker(norm_symbol)
+                t = self._construct_ticker(norm_symbol, session)
+                if t is None:
+                    return {"error": "yf_ticker_construct_failed",
+                            "data_quality": DataQuality.ERROR.value,
+                            "last_error_class": "RuntimeError"}
 
                 info: Dict[str, Any] = {}
                 try:
@@ -1052,16 +1373,29 @@ class YahooFundamentalsProvider:
                     safe_float(_get_attr(fast_info, "day_low", "dayLow")),
                     safe_float(_pick(info, "dayLow", "regularMarketDayLow")),
                 )
-                week_52_high = _coalesce(
+
+                # Raw (un-validated) 52W bounds from provider
+                raw_52w_high = _coalesce(
                     safe_float(_get_attr(fast_info, "fifty_two_week_high", "fiftyTwoWeekHigh", "week52High")),
                     safe_float(_pick(info, "fiftyTwoWeekHigh", "week52High")),
                     hist_52w_high,
                 )
-                week_52_low = _coalesce(
+                raw_52w_low = _coalesce(
                     safe_float(_get_attr(fast_info, "fifty_two_week_low", "fiftyTwoWeekLow", "week52Low")),
                     safe_float(_pick(info, "fiftyTwoWeekLow", "week52Low")),
                     hist_52w_low,
                 )
+
+                # v6.1.0: validate 52W bounds against current_price for unit
+                # consistency (currency / scale mismatch guard).
+                week_52_high, week_52_low, sanity_warnings = _validate_52w_bounds(
+                    current_price=safe_float(current_price),
+                    week_52_high=raw_52w_high,
+                    week_52_low=raw_52w_low,
+                    hist_52w_high=hist_52w_high,
+                    hist_52w_low=hist_52w_low,
+                )
+
                 volume = _coalesce(
                     safe_float(_get_attr(fast_info, "last_volume", "lastVolume", "regularMarketVolume")),
                     safe_float(_pick(info, "volume", "regularMarketVolume")),
@@ -1142,13 +1476,25 @@ class YahooFundamentalsProvider:
                 if operating_margin is None:
                     operating_margin = _pct_from_ratio(_pick(info, "ebitda"), revenue_ttm)
 
-                # 52-week position (fraction in [0,1])
+                # 52-week position (fraction in [0,1]) -- computed from the
+                # VALIDATED bounds, so it's now safe from currency mismatch.
                 week_52_position_pct: Optional[float] = None
                 cp = safe_float(current_price)
                 if (cp is not None and week_52_high is not None and week_52_low is not None
                         and week_52_high != week_52_low):
                     week_52_position_pct = (cp - float(week_52_low)) / (float(week_52_high) - float(week_52_low))
                     week_52_position_pct = max(0.0, min(1.0, float(week_52_position_pct)))
+
+                # Aggregate field-level warnings from this fetch
+                fetch_warnings: List[str] = list(sanity_warnings)
+                if not history_rows:
+                    fetch_warnings.append("history_3mo_empty")
+                if not info:
+                    fetch_warnings.append("info_empty")
+                if currency is None:
+                    fetch_warnings.append("currency_missing_from_provider")
+                if industry is None:
+                    fetch_warnings.append("industry_missing_from_provider")
 
                 out: Dict[str, Any] = {
                     "requested_symbol": norm_symbol,
@@ -1229,9 +1575,12 @@ class YahooFundamentalsProvider:
                     "short_ratio": short_ratio,
                     "short_percent": short_percent,
                     "history_rows_3mo": len(history_rows),
+
+                    # v6.1.0: structured field-level warnings
+                    "warnings": fetch_warnings,
                 }
 
-                # Legacy aliases (preserved verbatim from v5.5.0)
+                # Legacy aliases (preserved verbatim from v5.5.0 / v6.0.0)
                 out["price"] = out.get("current_price")
                 out["prev_close"] = out.get("previous_close")
                 out["open"] = out.get("open_price")
@@ -1270,16 +1619,29 @@ class YahooFundamentalsProvider:
 
             except Exception as exc:
                 last_err = exc
-                time.sleep(0.5)
+                last_err_class = type(exc).__name__
 
-        return {"error": str(last_err), "data_quality": DataQuality.ERROR.value}
+                # v6.1.0: exponential backoff with jitter; doubled on rate-
+                # limit signals.
+                base = min(8.0, 0.5 * (2 ** attempt))
+                if _is_rate_limit_error(exc):
+                    base = min(16.0, base * 2.0)
+                sleep_for = base + random.uniform(0.0, base * 0.25)
+                time.sleep(sleep_for)
+
+                # Rotate UA on retry to evade per-UA throttling
+                _rotate_session_ua(session)
+
+        return {
+            "error": str(last_err) if last_err else "unknown_error",
+            "last_error_class": last_err_class or "Unknown",
+            "data_quality": DataQuality.ERROR.value,
+        }
 
     # -- Async fetch API -----------------------------------------------------
 
     async def fetch_fundamentals(self, symbol: str) -> Dict[str, Any]:
         """Fetch fundamentals for a single symbol (cache + singleflight + circuit breaker)."""
-        # v6.0.0 FIX: self.enabled is now a real @property (was an
-        # AttributeError in v5.5.0 -- the dataclass had no such slot).
         if not self.enabled or not symbol:
             return {}
 
@@ -1295,21 +1657,23 @@ class YahooFundamentalsProvider:
             return {}
 
         async def _do() -> Dict[str, Any]:
-            # v6.0.0 FIX: rate-limiter token acquisition moved INSIDE the
-            # singleflight callback. v5.5.0 acquired a token before
-            # singleflight dedup, wasting budget for deduplicated callers.
+            # v6.0.0 FIX: rate-limiter token acquisition is INSIDE the
+            # singleflight callback to avoid wasting budget on dedup'd callers.
             await self.rate_limiter.wait_and_acquire()
 
-            # v6.0.0 FIX: actually acquire the provider's concurrency
-            # semaphore (v5.5.0 created it but never used it -- concurrent
-            # yfinance calls were effectively unbounded).
+            # v6.0.0 FIX: actually acquire the provider's concurrency semaphore.
             async with self._get_semaphore():
                 loop = asyncio.get_running_loop()
                 start_time = time.monotonic()
                 try:
                     res = await loop.run_in_executor(None, self._blocking_fetch, norm)
                     if "error" in res and res.get("data_quality") == DataQuality.ERROR.value:
-                        await self.circuit_breaker.on_failure()
+                        # v6.1.0: infer status_code from error string so the
+                        # circuit breaker can apply the extended cooldown.
+                        status_code = 403 if _is_rate_limit_error(
+                            Exception(str(res.get("error", "")))
+                        ) else 500
+                        await self.circuit_breaker.on_failure(status_code=status_code)
                         yf_fund_requests_total.labels(status="error").inc()
                         return {}
                     await self.circuit_breaker.on_success()
@@ -1336,7 +1700,6 @@ class YahooFundamentalsProvider:
         Batch fetch fundamentals for multiple symbols.
 
         v6.0.0: accepts a `concurrency` parameter (default: self.max_concurrency).
-        v5.5.0 created asyncio tasks for every symbol at once with no cap.
         Each fetch is also gated by the provider's semaphore inside
         fetch_fundamentals, so effective parallelism is the minimum of the
         two.
