@@ -3,11 +3,79 @@
 """
 core/reco_normalize.py
 ================================================================================
-Recommendation Normalization -- v7.1.0
+Recommendation Normalization -- v7.2.0
 ================================================================================
 
-v7.1.0 changes (vs v7.0.0)
+v7.2.0 changes (vs v7.1.0)
 --------------------------
+A.  ENV-TUNABLE CONVICTION FLOORS.
+    `_STRONG_BUY_CONVICTION_FLOOR` and `_BUY_CONVICTION_FLOOR` are now
+    sourced from environment variables `RECO_STRONG_BUY_CONVICTION_FLOOR`
+    and `RECO_BUY_CONVICTION_FLOOR` with the v7.1.0 defaults (60.0 / 45.0).
+    Ops can tune downgrade aggressiveness against backtest data without
+    a code change. Existing callers continue to work — the env vars are
+    optional with the v7.1.0 defaults.
+
+B.  RULE-ID INTROSPECTION (audit alignment).
+    Adds `recommendation_from_views_with_rule_id(...)` free function
+    returning `(canonical_str, reason, rule_id)`. The `rule_id` is one of
+    13 stable string constants (`RULE_ID_HARD_SELL_DOUBLE_BEARISH`, etc.)
+    exposing exactly which classification branch fired. Callers that
+    need audit visibility (scoring.py v5.2.5, sheet-level diagnostics)
+    can now distinguish a "STRONG_BUY downgraded by conviction floor"
+    from a "BUY by bullish-fund-acceptable-valuation" without parsing
+    the reason text.
+
+    Implementation: refactored the body of `from_views()` into a
+    module-level `_classify_views_with_rule_id()` helper. Both
+    `Recommendation.from_views()` (classmethod) and the existing
+    `recommendation_from_views()` (free function) keep their v7.1.0
+    return signatures — the rule_id is discarded internally so they
+    remain 100% backward-compatible.
+
+C.  __version__ ALIAS.
+    Added `__version__ = VERSION` alongside the v7.1.0 `VERSION` constant.
+    Aligns with the Python convention used by all other TFB modules
+    (scoring.py, data_engine_v2.py, eodhd_provider.py, etc.).
+
+D.  CONVICTION-BADGE DE-DUPLICATION.
+    In v7.1.0 a STRONG_BUY downgraded to BUY by conviction-floor produced
+    a reason like "...Downgraded: STRONG_BUY -> BUY (conviction 52 below
+    floor 60). [Conv 52]" — the conviction value appears twice. v7.2.0
+    suppresses the `[Conv NN]` badge when the downgrade prose already
+    cites the conviction value. The `[Sector-Adj NN]` badge is still
+    appended when sector_relative is supplied. Pure cosmetic fix.
+
+E.  REAL BUG FIX: "AVOID" mis-negated to REDUCE.
+    v7.1.0's `_PAT_NEGATE` included "AVOID" and "AGAINST" as negation
+    tokens, causing `_apply_negation("AVOID", SELL)` to return REDUCE
+    (downgrading the very recommendation that "AVOID" itself signaled).
+    The same defect affected free-text recommendations like "AVOID THIS
+    STOCK" coming from third-party advisor notes — they parsed as
+    REDUCE when they should be SELL.
+
+    Trace before fix:
+      Input: "AVOID"
+      1. _PAT_SELL matches "AVOID" -> initial reco = SELL
+      2. _apply_negation called with text="AVOID", reco=SELL
+      3. _PAT_NEGATE matches "AVOID" (in negate list!)
+      4. reco==SELL is downgraded to REDUCE  [WRONG]
+
+    Fix: removed "AVOID" and "AGAINST" from `_PAT_NEGATE`. They are
+    recommendation words, not negators. "DO NOT AVOID" would still
+    catch via the NOT token; "AGAINST" alone produces a HOLD via the
+    sentiment-analysis fallback, which is the safer default than the
+    spurious REDUCE downgrade.
+
+[PRESERVED — strictly] All v7.1.0 / v7.0.0 / v6.1.0 helpers, signatures,
+docstrings, examples, language pattern dictionaries (EN/AR/FR/ES/DE/PT),
+vendor field mappings, NormalizedRecommendation dataclass, exceptions,
+and every public symbol. Public API surface is augmented only (one new
+function + 13 RULE_ID_* constants + `__version__` alias). No removals
+from __all__.
+
+v7.1.0 changes (preserved verbatim)
+-----------------------------------
 - NEW kwargs on `Recommendation.from_views()`:
     - `conviction`        (Optional[float], 0-100): when supplied, applies
       conviction floors to the resulting recommendation:
@@ -46,13 +114,16 @@ v7.0.0 features (preserved verbatim)
 - normalize_recommendation*, batch_normalize, NormalizedRecommendation.
 
 Public API (additions only — fully backward compatible)
-- Recommendation.from_views(...) gains `conviction` and `sector_relative`.
-- recommendation_from_views(...) gains the same kwargs.
+- `__version__` alias (v7.2.0)
+- `recommendation_from_views_with_rule_id(...)` returning 3-tuple (v7.2.0)
+- 13 `RULE_ID_*` string constants (v7.2.0)
+- All v7.1.0 symbols preserved.
 ================================================================================
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field as dc_field
 from enum import Enum
@@ -75,7 +146,41 @@ from typing import (
 # Version
 # =============================================================================
 
-VERSION = "7.1.0"
+VERSION = "7.2.0"
+__version__ = VERSION  # v7.2.0 Phase C: align with TFB module convention
+
+
+# =============================================================================
+# v7.2.0 Phase B — Rule-ID constants for classification introspection
+# =============================================================================
+#
+# Stable string identifiers for each branch of the view-aware classifier.
+# Returned by recommendation_from_views_with_rule_id() so callers can
+# audit which rule fired without parsing the reason text.
+#
+# IDs are namespaced by outcome family: HARD_SELL_*, REDUCE_*, BUY_*,
+# HOLD_*, INSUFFICIENT_DATA_*. Naming is deliberately verbose so logs
+# read clearly.
+
+RULE_ID_INSUFFICIENT_DATA_NO_SIGNALS = "INSUFFICIENT_DATA_NO_VIEWS_NO_SCORE"
+RULE_ID_INSUFFICIENT_DATA_TOO_FEW = "INSUFFICIENT_DATA_TOO_FEW_SIGNALS"
+
+RULE_ID_HARD_SELL_DOUBLE_BEARISH = "HARD_SELL_DOUBLE_BEARISH"
+RULE_ID_HARD_SELL_LOW_SCORE = "HARD_SELL_LOW_SCORE"
+
+RULE_ID_REDUCE_BEARISH_FUND = "REDUCE_BEARISH_FUNDAMENTAL"
+RULE_ID_REDUCE_BEARISH_TECH_EXPENSIVE = "REDUCE_BEARISH_TECH_EXPENSIVE_VALUE"
+RULE_ID_REDUCE_WEAK_HIGH_RISK = "REDUCE_WEAK_SCORE_HIGH_RISK"
+
+RULE_ID_STRONG_BUY_ALL = "STRONG_BUY_ALL_CONDITIONS"
+RULE_ID_BUY_BULLISH_FUND = "BUY_BULLISH_FUND_ACCEPTABLE"
+
+RULE_ID_HOLD_BULLISH_EXPENSIVE_VETO = "HOLD_VETO_BULLISH_EXPENSIVE"
+RULE_ID_HOLD_MIXED = "HOLD_MIXED_SIGNALS"
+
+RULE_ID_DOWNGRADED_STRONG_BUY_TO_BUY = "STRONG_BUY_DOWNGRADED_BUY_LOW_CONVICTION"
+RULE_ID_DOWNGRADED_BUY_TO_HOLD = "BUY_DOWNGRADED_HOLD_LOW_CONVICTION"
+RULE_ID_DOWNGRADED_STRONG_BUY_TO_HOLD = "STRONG_BUY_CASCADED_HOLD_LOW_CONVICTION"
 
 
 # =============================================================================
@@ -157,7 +262,7 @@ class Recommendation(str, Enum):
         """Check if value is a valid recommendation."""
         return value in cls._value2member_map_
 
-    # ---- v7.0.0 + v7.1.0: view-aware resolver ------------------------------
+    # ---- v7.0.0 + v7.1.0 + v7.2.0: view-aware resolver ---------------------
 
     @classmethod
     def from_views(
@@ -188,10 +293,17 @@ class Recommendation(str, Enum):
         Returns:
             (Recommendation enum, reason string).
 
-        Conviction-floor downgrades (v7.1.0):
-            - STRONG_BUY with conviction < 60 -> downgraded to BUY
-            - BUY with conviction < 45        -> downgraded to HOLD
+        Conviction-floor downgrades (v7.1.0+, env-tunable in v7.2.0):
+            - STRONG_BUY with conviction < _STRONG_BUY_CONVICTION_FLOOR (60)
+              -> downgraded to BUY
+            - BUY with conviction < _BUY_CONVICTION_FLOOR (45)
+              -> downgraded to HOLD
             - REDUCE / SELL / HOLD are never downgraded (protective calls)
+
+        v7.2.0 note: this method delegates to
+        `_classify_views_with_rule_id()` and returns only the (rec, reason)
+        slice. For callers that want the rule_id for audit, use
+        `recommendation_from_views_with_rule_id()` instead.
 
         Examples:
             >>> Recommendation.from_views(
@@ -221,111 +333,20 @@ class Recommendation(str, Enum):
             ... )
             (<Recommendation.SELL: 'SELL'>, 'Bearish fundamentals AND bearish ...')
         """
-        f = normalize_view_token(fundamental, kind="fundamental")
-        t = normalize_view_token(technical, kind="technical")
-        r = normalize_view_token(risk, kind="risk")
-        v = normalize_view_token(value, kind="value")
-
-        s_val = _to_float_strict(score)
-        conv_val = _to_float_strict(conviction)
-        sect_val = _to_float_strict(sector_relative)
-
-        # ----- Priority 1: NO DATA --------------------------------------
-        # We need at least 2 views OR a score to make any call.
-        views_present = sum(1 for x in (f, t, r, v) if x)
-        if views_present == 0 and s_val is None:
-            return cls.HOLD, "Insufficient data — no views and no score available."
-        if views_present < 2 and s_val is None:
-            return cls.HOLD, "Insufficient data — too few signals to recommend."
-
-        # ----- Priority 2: HARD SELL ------------------------------------
-        if f == VIEW_FUND_BEARISH and t == VIEW_TECH_BEARISH:
-            score_text = f", Score={s_val:.0f}" if s_val is not None else ""
-            return cls.SELL, (
-                f"Bearish fundamentals AND bearish technicals — exit"
-                f"{score_text}."
-            )
-
-        if s_val is not None and s_val < 35.0:
-            return cls.SELL, f"Very weak overall score ({s_val:.1f}) — exit."
-
-        # ----- Priority 3: REDUCE ---------------------------------------
-        if f == VIEW_FUND_BEARISH:
-            return cls.REDUCE, (
-                "Bearish fundamentals — reduce exposure even with mixed "
-                "technical/value signals."
-            )
-
-        if t == VIEW_TECH_BEARISH and v == VIEW_VALUE_EXPENSIVE:
-            return cls.REDUCE, (
-                "Bearish technicals on an expensive valuation — reduce."
-            )
-
-        if s_val is not None and s_val < 50.0 and r == VIEW_RISK_HIGH:
-            return cls.REDUCE, (
-                f"Weak score ({s_val:.1f}) combined with high risk — reduce."
-            )
-
-        # ----- Priority 4: STRONG_BUY (all conditions required) ---------
-        is_strong_buy = (
-            f == VIEW_FUND_BULLISH
-            and t == VIEW_TECH_BULLISH
-            and v == VIEW_VALUE_CHEAP
-            and r != VIEW_RISK_HIGH
-            and s_val is not None and s_val >= 75.0
+        rec, reason, _rule_id = _classify_views_with_rule_id(
+            fundamental=fundamental,
+            technical=technical,
+            risk=risk,
+            value=value,
+            score=score,
+            conviction=conviction,
+            sector_relative=sector_relative,
         )
-        if is_strong_buy:
-            base_reason = (
-                f"Strong fundamentals + technicals on cheap valuation, "
-                f"risk under control (Score={s_val:.1f})."
-            )
-            return _apply_conviction_floor(
-                cls.STRONG_BUY, base_reason, conv_val, sect_val
-            )
-
-        # ----- Priority 5: BUY ------------------------------------------
-        is_buy = (
-            f == VIEW_FUND_BULLISH
-            and v in (VIEW_VALUE_CHEAP, VIEW_VALUE_FAIR)
-            and t in (VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL)
-            and s_val is not None and s_val >= 65.0
-        )
-        if is_buy:
-            base_reason = (
-                f"Bullish fundamentals with acceptable valuation and "
-                f"technicals (Score={s_val:.1f})."
-            )
-            return _apply_conviction_floor(
-                cls.BUY, base_reason, conv_val, sect_val
-            )
-
-        # Special-case BUY veto explanation: bullish fundamentals but
-        # valuation says EXPENSIVE -> HOLD with clear reason.
-        if (
-            f == VIEW_FUND_BULLISH
-            and t in (VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL)
-            and v == VIEW_VALUE_EXPENSIVE
-        ):
-            return cls.HOLD, _attach_metrics(
-                "Bullish fundamentals but valuation expensive — wait for "
-                "a better entry.",
-                conv_val, sect_val,
-            )
-
-        # ----- Priority 6: HOLD (default) -------------------------------
-        score_part = f" Score={s_val:.1f}." if s_val is not None else ""
-        view_summary = (
-            f"Fund={f or 'N/A'}, Tech={t or 'N/A'}, "
-            f"Risk={r or 'N/A'}, Value={v or 'N/A'}."
-        )
-        return cls.HOLD, _attach_metrics(
-            f"Mixed signals — holding. {view_summary}{score_part}",
-            conv_val, sect_val,
-        )
+        return rec, reason
 
 
 # =============================================================================
-# v7.1.0 internals: conviction-floor enforcement
+# v7.1.0 / v7.2.0 internals: conviction-floor enforcement
 # =============================================================================
 
 def _to_float_strict(value: Any) -> Optional[float]:
@@ -350,6 +371,24 @@ def _to_float_strict(value: Any) -> Optional[float]:
         return None
 
 
+def _env_float(name: str, default: float) -> float:
+    """
+    v7.2.0 Phase A helper. Best-effort env-var float load with default
+    fallback on parse failure / unset / NaN. Used for the conviction-
+    floor thresholds so ops can tune them without a code change.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        f = float(raw)
+        if f != f or f in (float("inf"), float("-inf")):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
 def _attach_metrics(
     base_reason: str,
     conviction: Optional[float],
@@ -370,8 +409,13 @@ def _attach_metrics(
     return f"{base_reason} [{', '.join(parts)}]"
 
 
-_STRONG_BUY_CONVICTION_FLOOR = 60.0
-_BUY_CONVICTION_FLOOR = 45.0
+# v7.2.0 Phase A — env-tunable conviction floors.
+# Defaults match v7.1.0 verbatim. Ops can override via:
+#     export RECO_STRONG_BUY_CONVICTION_FLOOR=65
+#     export RECO_BUY_CONVICTION_FLOOR=50
+# Loaded once at module import.
+_STRONG_BUY_CONVICTION_FLOOR = _env_float("RECO_STRONG_BUY_CONVICTION_FLOOR", 60.0)
+_BUY_CONVICTION_FLOOR = _env_float("RECO_BUY_CONVICTION_FLOOR", 45.0)
 
 
 def _apply_conviction_floor(
@@ -383,13 +427,22 @@ def _apply_conviction_floor(
     """
     Apply conviction floors to a STRONG_BUY/BUY recommendation.
 
-    Rules (v7.1.0):
-      - STRONG_BUY with conviction < 60 -> BUY (and note in reason)
-      - BUY with conviction < 45        -> HOLD (and note in reason)
+    Rules (v7.1.0, thresholds env-tunable in v7.2.0):
+      - STRONG_BUY with conviction < _STRONG_BUY_CONVICTION_FLOOR (60)
+        -> BUY (and note in reason)
+      - BUY with conviction < _BUY_CONVICTION_FLOOR (45)
+        -> HOLD (and note in reason)
       - Any rec with conviction is None  -> unchanged (just attach badge)
 
     Protective calls (REDUCE/SELL/HOLD) are never passed here, so they
     never get downgraded.
+
+    v7.2.0 Phase D: when a downgrade fires, the reason text already
+    cites the conviction value in prose ("conviction NN below floor NN"),
+    so the `[Conv NN]` badge would be redundant. We suppress the badge
+    in the downgrade path and keep only the `[Sector-Adj NN]` part when
+    sector_relative is supplied. The non-downgrade path (initial passes
+    through unchanged) still gets the full badge.
     """
     if conviction is None:
         # No conviction info — pass through with whatever badges apply
@@ -420,6 +473,9 @@ def _apply_conviction_floor(
         current_reason = (
             f"{initial_reason} Downgraded: " + "; ".join(downgrades) + "."
         )
+        # v7.2.0 Phase D: skip the redundant Conv badge — conviction value
+        # is already in the downgrade prose. Sector badge still applies.
+        return current, _attach_metrics(current_reason, None, sector_relative)
 
     return current, _attach_metrics(current_reason, conviction, sector_relative)
 
@@ -537,6 +593,178 @@ def normalize_view_token(value: Any, *, kind: str = "fundamental") -> str:
     return ""
 
 
+# =============================================================================
+# v7.2.0 Phase B — Module-level classifier with rule_id introspection
+# =============================================================================
+
+def _classify_views_with_rule_id(
+    *,
+    fundamental: Any = None,
+    technical: Any = None,
+    risk: Any = None,
+    value: Any = None,
+    score: Any = None,
+    conviction: Any = None,
+    sector_relative: Any = None,
+) -> Tuple[Recommendation, str, str]:
+    """
+    v7.2.0 Phase B: core view-aware classifier returning rule_id.
+
+    Implements the priority cascade preserved verbatim from v7.0.0 /
+    v7.1.0. Returns (rec, reason, rule_id) where rule_id is one of the
+    RULE_ID_* string constants for audit/log purposes.
+
+    `Recommendation.from_views()` and `recommendation_from_views()`
+    delegate here and discard the rule_id, preserving their v7.1.0
+    return signatures. `recommendation_from_views_with_rule_id()`
+    returns all three fields.
+    """
+    f = normalize_view_token(fundamental, kind="fundamental")
+    t = normalize_view_token(technical, kind="technical")
+    r = normalize_view_token(risk, kind="risk")
+    v = normalize_view_token(value, kind="value")
+
+    s_val = _to_float_strict(score)
+    conv_val = _to_float_strict(conviction)
+    sect_val = _to_float_strict(sector_relative)
+
+    # ----- Priority 1: NO DATA --------------------------------------
+    # We need at least 2 views OR a score to make any call.
+    views_present = sum(1 for x in (f, t, r, v) if x)
+    if views_present == 0 and s_val is None:
+        return (
+            Recommendation.HOLD,
+            "Insufficient data — no views and no score available.",
+            RULE_ID_INSUFFICIENT_DATA_NO_SIGNALS,
+        )
+    if views_present < 2 and s_val is None:
+        return (
+            Recommendation.HOLD,
+            "Insufficient data — too few signals to recommend.",
+            RULE_ID_INSUFFICIENT_DATA_TOO_FEW,
+        )
+
+    # ----- Priority 2: HARD SELL ------------------------------------
+    if f == VIEW_FUND_BEARISH and t == VIEW_TECH_BEARISH:
+        score_text = f", Score={s_val:.0f}" if s_val is not None else ""
+        return (
+            Recommendation.SELL,
+            f"Bearish fundamentals AND bearish technicals — exit{score_text}.",
+            RULE_ID_HARD_SELL_DOUBLE_BEARISH,
+        )
+
+    if s_val is not None and s_val < 35.0:
+        return (
+            Recommendation.SELL,
+            f"Very weak overall score ({s_val:.1f}) — exit.",
+            RULE_ID_HARD_SELL_LOW_SCORE,
+        )
+
+    # ----- Priority 3: REDUCE ---------------------------------------
+    if f == VIEW_FUND_BEARISH:
+        return (
+            Recommendation.REDUCE,
+            "Bearish fundamentals — reduce exposure even with mixed "
+            "technical/value signals.",
+            RULE_ID_REDUCE_BEARISH_FUND,
+        )
+
+    if t == VIEW_TECH_BEARISH and v == VIEW_VALUE_EXPENSIVE:
+        return (
+            Recommendation.REDUCE,
+            "Bearish technicals on an expensive valuation — reduce.",
+            RULE_ID_REDUCE_BEARISH_TECH_EXPENSIVE,
+        )
+
+    if s_val is not None and s_val < 50.0 and r == VIEW_RISK_HIGH:
+        return (
+            Recommendation.REDUCE,
+            f"Weak score ({s_val:.1f}) combined with high risk — reduce.",
+            RULE_ID_REDUCE_WEAK_HIGH_RISK,
+        )
+
+    # ----- Priority 4: STRONG_BUY (all conditions required) ---------
+    is_strong_buy = (
+        f == VIEW_FUND_BULLISH
+        and t == VIEW_TECH_BULLISH
+        and v == VIEW_VALUE_CHEAP
+        and r != VIEW_RISK_HIGH
+        and s_val is not None and s_val >= 75.0
+    )
+    if is_strong_buy:
+        base_reason = (
+            f"Strong fundamentals + technicals on cheap valuation, "
+            f"risk under control (Score={s_val:.1f})."
+        )
+        final_rec, final_reason = _apply_conviction_floor(
+            Recommendation.STRONG_BUY, base_reason, conv_val, sect_val
+        )
+        # Derive rule_id from initial -> final transition.
+        if final_rec == Recommendation.STRONG_BUY:
+            return final_rec, final_reason, RULE_ID_STRONG_BUY_ALL
+        elif final_rec == Recommendation.BUY:
+            return final_rec, final_reason, RULE_ID_DOWNGRADED_STRONG_BUY_TO_BUY
+        elif final_rec == Recommendation.HOLD:
+            # Cascaded: STRONG_BUY -> BUY -> HOLD via both conviction floors.
+            return final_rec, final_reason, RULE_ID_DOWNGRADED_STRONG_BUY_TO_HOLD
+        else:  # defensive — shouldn't reach here
+            return final_rec, final_reason, RULE_ID_STRONG_BUY_ALL
+
+    # ----- Priority 5: BUY ------------------------------------------
+    is_buy = (
+        f == VIEW_FUND_BULLISH
+        and v in (VIEW_VALUE_CHEAP, VIEW_VALUE_FAIR)
+        and t in (VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL)
+        and s_val is not None and s_val >= 65.0
+    )
+    if is_buy:
+        base_reason = (
+            f"Bullish fundamentals with acceptable valuation and "
+            f"technicals (Score={s_val:.1f})."
+        )
+        final_rec, final_reason = _apply_conviction_floor(
+            Recommendation.BUY, base_reason, conv_val, sect_val
+        )
+        if final_rec == Recommendation.BUY:
+            return final_rec, final_reason, RULE_ID_BUY_BULLISH_FUND
+        elif final_rec == Recommendation.HOLD:
+            return final_rec, final_reason, RULE_ID_DOWNGRADED_BUY_TO_HOLD
+        else:  # defensive
+            return final_rec, final_reason, RULE_ID_BUY_BULLISH_FUND
+
+    # Special-case BUY veto explanation: bullish fundamentals but
+    # valuation says EXPENSIVE -> HOLD with clear reason.
+    if (
+        f == VIEW_FUND_BULLISH
+        and t in (VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL)
+        and v == VIEW_VALUE_EXPENSIVE
+    ):
+        return (
+            Recommendation.HOLD,
+            _attach_metrics(
+                "Bullish fundamentals but valuation expensive — wait for "
+                "a better entry.",
+                conv_val, sect_val,
+            ),
+            RULE_ID_HOLD_BULLISH_EXPENSIVE_VETO,
+        )
+
+    # ----- Priority 6: HOLD (default) -------------------------------
+    score_part = f" Score={s_val:.1f}." if s_val is not None else ""
+    view_summary = (
+        f"Fund={f or 'N/A'}, Tech={t or 'N/A'}, "
+        f"Risk={r or 'N/A'}, Value={v or 'N/A'}."
+    )
+    return (
+        Recommendation.HOLD,
+        _attach_metrics(
+            f"Mixed signals — holding. {view_summary}{score_part}",
+            conv_val, sect_val,
+        ),
+        RULE_ID_HOLD_MIXED,
+    )
+
+
 def recommendation_from_views(
     fundamental: Any = None,
     technical: Any = None,
@@ -552,8 +780,12 @@ def recommendation_from_views(
     Returns:
         (canonical_string, reason_text). canonical_string is one of
         STRONG_BUY / BUY / HOLD / REDUCE / SELL.
+
+    v7.2.0: internally delegates to `_classify_views_with_rule_id()` and
+    discards the rule_id. For audit-style callers that need the rule_id,
+    use `recommendation_from_views_with_rule_id()` instead.
     """
-    rec, reason = Recommendation.from_views(
+    rec, reason, _rule_id = _classify_views_with_rule_id(
         fundamental=fundamental,
         technical=technical,
         risk=risk,
@@ -565,8 +797,56 @@ def recommendation_from_views(
     return rec.value, reason
 
 
+def recommendation_from_views_with_rule_id(
+    fundamental: Any = None,
+    technical: Any = None,
+    risk: Any = None,
+    value: Any = None,
+    score: Any = None,
+    conviction: Any = None,
+    sector_relative: Any = None,
+) -> Tuple[str, str, str]:
+    """
+    v7.2.0 Phase B: as `recommendation_from_views()` but additionally
+    returns a stable rule_id string identifying exactly which branch of
+    the classifier fired.
+
+    Returns:
+        (canonical_string, reason_text, rule_id)
+        - canonical_string ∈ {STRONG_BUY, BUY, HOLD, REDUCE, SELL}
+        - reason_text: human-readable explanation
+        - rule_id: one of the RULE_ID_* constants (e.g.
+          "STRONG_BUY_ALL_CONDITIONS", "REDUCE_BEARISH_FUNDAMENTAL",
+          "STRONG_BUY_DOWNGRADED_BUY_LOW_CONVICTION").
+
+    Useful for:
+      - Audit logs: track distribution of which rule fires across the
+        universe to spot rule-coverage gaps.
+      - Sheet-level diagnostics: surface the rule_id alongside the
+        recommendation for operator review.
+      - Debugging: distinguish "rule fired AND was downgraded" from
+        "different rule fired entirely".
+
+    All v7.1.0 conviction-floor behavior is preserved. A
+    `STRONG_BUY_DOWNGRADED_BUY_LOW_CONVICTION` rule_id, for example,
+    means the input qualified for STRONG_BUY by view conjunction but
+    was downgraded to BUY by the conviction floor — the audit can see
+    both facts without parsing prose.
+    """
+    rec, reason, rule_id = _classify_views_with_rule_id(
+        fundamental=fundamental,
+        technical=technical,
+        risk=risk,
+        value=value,
+        score=score,
+        conviction=conviction,
+        sector_relative=sector_relative,
+    )
+    return rec.value, reason, rule_id
+
+
 # =============================================================================
-# Constants (preserved verbatim from v6.1.0 / v7.0.0)
+# Constants (preserved verbatim from v6.1.0 / v7.0.0, with v7.2.0 Phase E fix)
 # =============================================================================
 
 _RECO_ENUM = frozenset({r.value for r in Recommendation})
@@ -820,7 +1100,21 @@ _SCORE_FIELDS: List[str] = [
     "opportunity_score",
 ]
 
-_PAT_NEGATE = re.compile(r"\b(?:NOT|NO|NEVER|WITHOUT|HARDLY|RARELY|UNLIKELY|AVOID|AGAINST)\b", re.IGNORECASE)
+# v7.2.0 Phase E (BUG FIX): removed "AVOID" and "AGAINST" from the negate
+# pattern. They are recommendation/sentiment words, not negation operators:
+#   - "AVOID" alone is a SELL signal (already classified by _PAT_SELL).
+#     With AVOID in NEGATE, _apply_negation downgraded its own SELL to
+#     REDUCE — a self-contradicting outcome.
+#   - "AGAINST" alone is a bearish sentiment signal handled by the
+#     fall-through sentiment analyzer. It was never reaching the negate
+#     branch productively (no preceding BUY/SELL/HOLD recommendation for
+#     it to negate in typical phrasing).
+# Phrases like "DO NOT AVOID THIS" still negate correctly because NOT is
+# preserved as the canonical negator.
+_PAT_NEGATE = re.compile(
+    r"\b(?:NOT|NO|NEVER|WITHOUT|HARDLY|RARELY|UNLIKELY)\b",
+    re.IGNORECASE,
+)
 _PAT_NEGATION_CONTEXT = re.compile(r"(?:NOT|NO|NEVER)\s+(?:A\s+|AN\s+)?(STRONG\s+)?(BUY|SELL|HOLD|REDUCE)", re.IGNORECASE)
 
 _PAT_STRONG_BUY = re.compile(r"\b(?:STRONG\s+BUY|CONVICTION\s+BUY|TOP\s+PICK|BEST\s+IDEA|MUST\s+BUY|FOCUS\s+BUY)\b", re.IGNORECASE)
@@ -1167,6 +1461,13 @@ def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tup
 
 
 def _apply_negation(text: str, reco: str) -> str:
+    """
+    v7.2.0 NOTE: after Phase E removed "AVOID" and "AGAINST" from
+    _PAT_NEGATE, this helper now correctly leaves a SELL-from-AVOID
+    classification untouched. The negation logic only fires on actual
+    negators (NOT/NO/NEVER/WITHOUT/HARDLY/RARELY/UNLIKELY) plus the
+    NEGATION_CONTEXT regex.
+    """
     if not text or not reco:
         return reco
 
@@ -1496,8 +1797,9 @@ RECO_SELL = Recommendation.SELL.value
 # =============================================================================
 
 __all__ = [
-    # Version
+    # Version (v7.2.0 Phase C: __version__ alias)
     "VERSION",
+    "__version__",
     # Enums
     "Recommendation",
     # Recommendation constants
@@ -1519,9 +1821,25 @@ __all__ = [
     "VIEW_VALUE_CHEAP",
     "VIEW_VALUE_FAIR",
     "VIEW_VALUE_EXPENSIVE",
+    # v7.2.0 Phase B: rule_id constants
+    "RULE_ID_INSUFFICIENT_DATA_NO_SIGNALS",
+    "RULE_ID_INSUFFICIENT_DATA_TOO_FEW",
+    "RULE_ID_HARD_SELL_DOUBLE_BEARISH",
+    "RULE_ID_HARD_SELL_LOW_SCORE",
+    "RULE_ID_REDUCE_BEARISH_FUND",
+    "RULE_ID_REDUCE_BEARISH_TECH_EXPENSIVE",
+    "RULE_ID_REDUCE_WEAK_HIGH_RISK",
+    "RULE_ID_STRONG_BUY_ALL",
+    "RULE_ID_BUY_BULLISH_FUND",
+    "RULE_ID_HOLD_BULLISH_EXPENSIVE_VETO",
+    "RULE_ID_HOLD_MIXED",
+    "RULE_ID_DOWNGRADED_STRONG_BUY_TO_BUY",
+    "RULE_ID_DOWNGRADED_BUY_TO_HOLD",
+    "RULE_ID_DOWNGRADED_STRONG_BUY_TO_HOLD",
     # View helpers
     "normalize_view_token",
     "recommendation_from_views",
+    "recommendation_from_views_with_rule_id",  # v7.2.0 Phase B
     # Data classes
     "NormalizedRecommendation",
     # Core functions
