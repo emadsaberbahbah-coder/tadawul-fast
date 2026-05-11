@@ -3,59 +3,75 @@
 """
 core/enriched_quote.py
 ===============================================================================
-TFB Enriched Quote Core — v4.2.0 (VIEW-AWARE / SCHEMA-ALIGNED)
+TFB Enriched Quote Core — v4.3.0 (DERIVE-AND-FILL / SCHEMA-ALIGNED / VIEW-AWARE)
 ===============================================================================
 CORE-ONLY • SCHEMA-FIRST • PAGE-CANONICAL • SPECIAL-PAGE SAFE • ENGINE-TOLERANT
 JSON-SAFE • SYNC/ASYNC SAFE • ROUTE-FRIENDLY • LIGHTWEIGHT • IMPORT-SAFE
 
-v4.2.0 changes (what moved from v4.1.0)
+v4.3.0 changes (what moved from v4.2.0)
 ---------------------------------------
-- FIX [HIGH]: Fallback instrument schema is now exactly 85 columns to match
-  `core.sheets.schema_registry` v2.5.0. v4.1.0's fallback was 80 columns and
-  was MISSING:
-    * `upside_pct` (Valuation, added in registry v2.4.0)
-    * `fundamental_view`, `technical_view`, `risk_view`, `value_view`
-      (Views group, added in registry v2.3.0)
-  When the schema registry could not be imported (minimal deploys, tests,
-  tooling), `schema_projection()` would silently drop these five fields from
-  every row, even though `core.scoring` v5.0.0 emits them and
-  `core.reco_normalize` v7.0.0 needs them as inputs to the 5-tier rec
-  cascade. With the registry healthy (the normal path) the views came
-  through correctly because `page_schema()` reads from the registry; the
-  fallback was the only break.
-- FIX [HIGH]: Top_10_Investments fallback total bumped from 83 → 88 (85 + 3)
-  to stay consistent with registry validation `validate_schema_registry`
-  which requires Top10 to be exactly 88 columns.
-- FIX [MED]: Fallback header list extended in lockstep — added "Upside %",
-  "Fundamental View", "Technical View", "Risk View", "Value View".
-  Previously the headers list was 80 entries while the keys list was 80;
-  both are now 85.
-- NEW: `VIEW_COLUMN_KEYS` constant exported, mirrors the registry export so
-  callers can treat enriched_quote and schema_registry as a single source.
-- NEW: `_strip_internal_fields()` helper (defence-in-depth). Engine
-  v5.47.4 / advisor_engine v4.2.0 already strip internal coordination flags
-  (`_skip_recommendation_synthesis`, `unit_normalization_warnings`,
-  `intrinsic_value_source`, anything starting with `_internal_` / `_meta_`
-  / `_debug_`) at source, but legacy / proxy / cached rows arriving here
-  may still carry them. `schema_projection()` would naturally filter them
-  too (since they aren't in the schema), but stripping early keeps the
-  matrix path clean and the `row` field on single-row responses honest.
-- ALIGN: header docstring now references registry v2.5.0 (not v2.2.0) and
-  the v5/v7 view-aware family in general.
+- FIX [HIGH]: NEW `_derive_missing_fields()` helper. v4.2.0 (and every prior
+  version) passed provider-shaped rows through `schema_projection()` without
+  computing canonical derived fields when the provider failed to supply them
+  but their inputs were present. Production audit (sheet snapshot, ~150
+  rows) showed this manifesting most visibly as:
+    * `week_52_position_pct` blank for rows where `current_price`,
+      `week_52_high`, and `week_52_low` were all populated -- the formula is
+      `(price - low) / (high - low)` and yet the cell was empty.
+    * `price_change` / `percent_change` blank when provider missed them but
+      current_price and previous_close were both present.
+    * Portfolio derivations (`position_cost`, `position_value`,
+      `unrealized_pl`, `unrealized_pl_pct`) blank for rows with non-zero
+      `position_qty` and `avg_cost`.
+    * `upside_pct` blank when `intrinsic_value` and `current_price` were
+      both available.
+    * `expected_roi_*` blank when `forecast_price_*` was populated.
+    * `confidence_bucket` / `risk_bucket` blank when their numeric score
+      was present (these used to be computed only inside scoring.py, but
+      cached / proxy rows arriving here may be missing them).
+    * `invest_period_label` blank when `horizon_days` was present.
+  v4.3.0 fills each of these on a strict fill-only-if-missing basis. An
+  existing non-empty value is NEVER overwritten. Every derivation is wrapped
+  in try/except and returns silently on bad inputs (None, zero divisors,
+  non-numeric strings) -- no exception ever escapes into row processing.
+- FIX [MED]: NEW `_normalize_warnings_field()`. yahoo_fundamentals_provider
+  v6.1.0 and yahoo_chart_provider v9/v10 emit `warnings` as `List[str]`
+  (e.g. `["week_52_high_unit_mismatch_dropped", "industry_missing_from_
+  provider"]`). The sheet's Warnings column displays a "; "-joined string
+  ("HTTP 403; industry_missing_from_provider; forecast_unavailable").
+  v4.2.0 wrote the raw list into the cell, where Apps Script then stringi-
+  fied it as a Python repr (`['week_52_high_...', ...]`). v4.3.0 coerces
+  the list to the canonical "; "-joined string format inside
+  `normalize_rows()`, accepting both list and string inputs idempotently.
+- WIRING: `normalize_rows()` now invokes `_derive_missing_fields()` and
+  `_normalize_warnings_field()` for instrument-shaped rows (detected via
+  the presence of `current_price` in `keys`) before `schema_projection()`.
+  Special pages (Insights_Analysis, Data_Dictionary) are not instrument-
+  shaped and bypass the derivation step. Top_10_Investments IS instrument-
+  shaped and benefits from derivation in addition to its existing top10-
+  specific normalization.
+- ALIGN: header docstring references the yahoo provider v6.1.0 changes and
+  scoring.py v5.0.0 cascade.
 
-Public API is preserved verbatim from v4.1.0:
+Public API is preserved verbatim from v4.2.0:
 `build_enriched_quote_payload`, `build_enriched_sheet_rows_payload`,
 `build_enriched_quote_payload_sync`, `get_enriched_quote_payload`,
-`enriched_quote`, `quote`, `get_router`, and `router` are all still
-exported under the same names.
+`enriched_quote`, `quote`, `get_router`, `router`, `VIEW_COLUMN_KEYS`,
+and `MODULE_VERSION` are all still exported under the same names.
 
-v4.1.0 changes (PRESERVED)
---------------------------
-- FIX: added missing `dataclass` import (v4.0.0 referenced @dataclass at class
-  body time without importing it — module failed to load).
-- FIX: renamed the `request_id()` helper to `_resolve_request_id()` to avoid
-  being shadowed by the `request_id: Optional[str]` keyword argument inside
-  `build_enriched_quote_payload()`.
+v4.2.0 fixes (PRESERVED)
+------------------------
+- Fallback instrument schema is exactly 85 columns (added `upside_pct` and
+  the 4 view columns to match schema_registry v2.5.0).
+- Top_10_Investments fallback total = 88 (85 + 3).
+- `VIEW_COLUMN_KEYS` constant exported.
+- `_strip_internal_fields()` defence-in-depth helper.
+
+v4.1.0 fixes (PRESERVED)
+------------------------
+- Added missing `dataclass` import.
+- Renamed `request_id()` helper to `_resolve_request_id()` to avoid
+  shadowing by the `request_id: Optional[str]` kw-argument.
 ================================================================================
 """
 
@@ -99,7 +115,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-MODULE_VERSION = "4.2.0"
+MODULE_VERSION = "4.3.0"
 
 # =============================================================================
 # Constants
@@ -236,6 +252,19 @@ _INTERNAL_FIELDS_TO_STRIP_HARD: frozenset = frozenset({
     "intrinsic_value_source",
 })
 
+# v4.3.0: bucket thresholds for confidence_bucket / risk_bucket derivation
+# (mirrors core.scoring v5.0.0). These are only used when scoring.py hasn't
+# already filled the bucket -- they are NEVER overridden.
+_CONFIDENCE_HIGH_MIN = 70.0
+_CONFIDENCE_MEDIUM_MIN = 50.0
+_RISK_LOW_MAX = 30.0
+_RISK_MODERATE_MAX = 60.0
+
+# v4.3.0: horizon-day thresholds for invest_period_label derivation
+_HORIZON_1M_MAX = 45    # <= 45d -> "1M"
+_HORIZON_3M_MAX = 135   # <= 135d -> "3M"
+# everything above -> "12M" (also covers 365 / 1Y / explicit long-term)
+
 
 # =============================================================================
 # Enums
@@ -358,6 +387,82 @@ def _to_int(value: Any, default: int) -> int:
 def _clamp(value: int, min_val: int, max_val: int) -> int:
     """Clamp value between min and max."""
     return max(min_val, min(value, max_val))
+
+
+def _to_number(x: Any) -> Optional[float]:
+    """
+    Strict numeric extraction for derivations (v4.3.0).
+
+    Returns None for None / non-numeric / NaN / Inf / bools. Tolerates
+    string formats that legacy / proxy rows may carry: thousands commas,
+    trailing "%", up/down arrows ("▲ 1.99%", "▼ -0.30%"), and standard
+    null tokens.
+
+    Distinct from `_json_safe` (which preserves arbitrary types) and from
+    `_to_int` (which collapses to integer). Used only inside
+    `_derive_missing_fields`.
+    """
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        try:
+            f = float(x)
+        except Exception:
+            return None
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    if isinstance(x, Decimal):
+        try:
+            f = float(x)
+        except Exception:
+            return None
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    try:
+        s = str(x).strip()
+        if not s:
+            return None
+        if s.lower() in {"none", "null", "nil", "n/a", "na", "-", "--"}:
+            return None
+        # strip arrow prefixes used in display strings
+        while s and s[0] in "▲▼ \t":
+            s = s[1:]
+        s = s.strip()
+        # strip trailing percent
+        if s.endswith("%"):
+            s = s[:-1].strip()
+        # strip thousands separators
+        s = s.replace(",", "")
+        # parens-negative ("(123.45)" -> "-123.45")
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1].strip()
+        f = float(s)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except Exception:
+        return None
+
+
+def _is_blank(value: Any) -> bool:
+    """
+    v4.3.0: True if `value` is None, empty string, whitespace-only string,
+    or one of the standard null tokens. Used by derivation guards to know
+    whether a field is "missing" and therefore eligible to be filled.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return True
+        if s.lower() in {"none", "null", "nil", "n/a", "na", "-", "--"}:
+            return True
+    return False
 
 
 def _json_safe(value: Any) -> Any:
@@ -554,6 +659,253 @@ def _strip_internal_fields(row: Any) -> Any:
             except Exception:
                 pass
     return row
+
+
+# =============================================================================
+# v4.3.0: Derive-and-Fill Helpers
+# =============================================================================
+
+def _normalize_warnings_field(row: Dict[str, Any]) -> None:
+    """
+    Coerce row['warnings'] to "; "-joined string format (v4.3.0).
+
+    Providers (yahoo_fundamentals_provider v6.1.0, yahoo_chart_provider
+    v9/v10, eodhd_provider) emit warnings as `List[str]`. The sheet's
+    Warnings column expects the canonical "; "-joined string that Apps
+    Script can split and badge. v4.2.0 wrote the raw list into the cell
+    where it stringified as a Python repr.
+
+    Idempotent: accepts list-of-strings, single string, None. Operates
+    in-place on `row`. Returns nothing.
+
+    Empty / missing -> row['warnings'] left untouched.
+    """
+    if not isinstance(row, dict):
+        return
+    w = row.get("warnings")
+    if w is None:
+        return
+    if isinstance(w, str):
+        # Already a string -- normalize whitespace only, don't re-split
+        s = w.strip()
+        if not s:
+            row["warnings"] = None
+        else:
+            row["warnings"] = s
+        return
+    if isinstance(w, (list, tuple, set)):
+        parts: List[str] = []
+        for item in w:
+            if item is None:
+                continue
+            try:
+                s = str(item).strip()
+            except Exception:
+                continue
+            if s and s.lower() not in {"none", "null", "nil"}:
+                parts.append(s)
+        if parts:
+            # Dedupe while preserving order
+            seen: set = set()
+            unique: List[str] = []
+            for p in parts:
+                if p not in seen:
+                    seen.add(p)
+                    unique.append(p)
+            row["warnings"] = "; ".join(unique)
+        else:
+            row["warnings"] = None
+        return
+    # Unknown type -> string-coerce
+    try:
+        s = str(w).strip()
+        row["warnings"] = s if s else None
+    except Exception:
+        row["warnings"] = None
+
+
+def _derive_missing_fields(row: Dict[str, Any]) -> None:
+    """
+    Compute canonical derived fields when their inputs are present but the
+    field itself is missing (v4.3.0). Operates in-place. Returns nothing.
+
+    Strict contract:
+      - Fill-only-if-missing. An existing non-empty value is NEVER touched.
+        See `_is_blank()` for the definition of "missing".
+      - No exception ever escapes. Each derivation is wrapped in its own
+        try/except. Bad inputs (None, zero divisor, non-numeric strings)
+        cause the derivation to skip, not crash.
+      - Idempotent. Running this twice on the same row leaves it unchanged
+        after the first pass.
+
+    Derivations (all in canonical decimal/fraction units, NOT percentages):
+
+      price_change            = current_price - previous_close
+      percent_change          = (current_price - previous_close) / previous_close
+      week_52_position_pct    = (current_price - week_52_low) / (week_52_high - week_52_low)
+      position_cost           = position_qty * avg_cost
+      position_value          = position_qty * current_price
+      unrealized_pl           = position_value - position_cost
+      unrealized_pl_pct       = unrealized_pl / position_cost
+      upside_pct              = (intrinsic_value / current_price) - 1
+      expected_roi_1m         = (forecast_price_1m  / current_price) - 1
+      expected_roi_3m         = (forecast_price_3m  / current_price) - 1
+      expected_roi_12m        = (forecast_price_12m / current_price) - 1
+      invest_period_label     = bucket(horizon_days)
+      confidence_bucket       = bucket(confidence_score | forecast_confidence)
+      risk_bucket             = bucket(risk_score)
+
+    Inputs are extracted via `_to_number()` which tolerates string-formatted
+    legacy values ("1,234.56", "▲ 1.99%", etc.). The function does not
+    distinguish provider-shaped rows from advisor-shaped ones -- every
+    derivation gates on the presence of its specific inputs.
+    """
+    if not isinstance(row, dict):
+        return
+
+    # -- Price derivations -------------------------------------------------
+    try:
+        cp = _to_number(row.get("current_price"))
+        pc = _to_number(row.get("previous_close"))
+        if cp is not None and pc is not None:
+            if _is_blank(row.get("price_change")):
+                row["price_change"] = cp - pc
+            if _is_blank(row.get("percent_change")) and pc != 0:
+                row["percent_change"] = (cp - pc) / pc
+    except Exception:
+        pass
+
+    # -- 52-week position --------------------------------------------------
+    try:
+        if _is_blank(row.get("week_52_position_pct")):
+            cp = _to_number(row.get("current_price"))
+            hi = _to_number(row.get("week_52_high"))
+            lo = _to_number(row.get("week_52_low"))
+            if cp is not None and hi is not None and lo is not None and hi != lo:
+                pos = (cp - lo) / (hi - lo)
+                # Clamp to [0, 1] -- a price slightly above/below the band
+                # would otherwise produce a nonsensical fraction. The fact
+                # that it's outside is independently flagged by the provider's
+                # `current_price_outside_52w_range` warning.
+                pos = max(0.0, min(1.0, pos))
+                row["week_52_position_pct"] = pos
+    except Exception:
+        pass
+
+    # -- Portfolio math ----------------------------------------------------
+    try:
+        qty = _to_number(row.get("position_qty"))
+        avg = _to_number(row.get("avg_cost"))
+        cp = _to_number(row.get("current_price"))
+        if qty is not None and avg is not None:
+            if _is_blank(row.get("position_cost")):
+                row["position_cost"] = qty * avg
+        if qty is not None and cp is not None:
+            if _is_blank(row.get("position_value")):
+                row["position_value"] = qty * cp
+        # Re-read in case we just filled them
+        pc_val = _to_number(row.get("position_cost"))
+        pv_val = _to_number(row.get("position_value"))
+        if pc_val is not None and pv_val is not None:
+            if _is_blank(row.get("unrealized_pl")):
+                row["unrealized_pl"] = pv_val - pc_val
+            upl = _to_number(row.get("unrealized_pl"))
+            if upl is not None and pc_val != 0 and _is_blank(row.get("unrealized_pl_pct")):
+                row["unrealized_pl_pct"] = upl / pc_val
+    except Exception:
+        pass
+
+    # -- Upside % from intrinsic value ------------------------------------
+    try:
+        if _is_blank(row.get("upside_pct")):
+            iv = _to_number(row.get("intrinsic_value"))
+            cp = _to_number(row.get("current_price"))
+            if iv is not None and cp is not None and cp > 0:
+                row["upside_pct"] = (iv / cp) - 1.0
+    except Exception:
+        pass
+
+    # -- Expected ROI from forecast prices --------------------------------
+    for horizon_key, forecast_key in (
+        ("expected_roi_1m", "forecast_price_1m"),
+        ("expected_roi_3m", "forecast_price_3m"),
+        ("expected_roi_12m", "forecast_price_12m"),
+    ):
+        try:
+            if _is_blank(row.get(horizon_key)):
+                fp = _to_number(row.get(forecast_key))
+                cp = _to_number(row.get("current_price"))
+                if fp is not None and cp is not None and cp > 0:
+                    row[horizon_key] = (fp / cp) - 1.0
+        except Exception:
+            pass
+
+    # -- Invest period label ----------------------------------------------
+    try:
+        if _is_blank(row.get("invest_period_label")):
+            hd = _to_number(row.get("horizon_days"))
+            if hd is not None and hd > 0:
+                if hd <= _HORIZON_1M_MAX:
+                    row["invest_period_label"] = "1M"
+                elif hd <= _HORIZON_3M_MAX:
+                    row["invest_period_label"] = "3M"
+                else:
+                    row["invest_period_label"] = "12M"
+    except Exception:
+        pass
+
+    # -- Confidence bucket --------------------------------------------------
+    # scoring.py emits this normally; this is a safety net for cached /
+    # proxy rows where the bucket was lost in transit.
+    try:
+        if _is_blank(row.get("confidence_bucket")):
+            # Prefer confidence_score (0-100); fall back to forecast_confidence
+            # (which may be 0-1 or 0-100 depending on source).
+            cs = _to_number(row.get("confidence_score"))
+            if cs is None:
+                fc = _to_number(row.get("forecast_confidence"))
+                if fc is not None:
+                    cs = fc * 100.0 if 0.0 <= fc <= 1.0 else fc
+            if cs is not None:
+                if cs >= _CONFIDENCE_HIGH_MIN:
+                    row["confidence_bucket"] = "HIGH"
+                elif cs >= _CONFIDENCE_MEDIUM_MIN:
+                    row["confidence_bucket"] = "MEDIUM"
+                else:
+                    row["confidence_bucket"] = "LOW"
+    except Exception:
+        pass
+
+    # -- Risk bucket --------------------------------------------------------
+    try:
+        if _is_blank(row.get("risk_bucket")):
+            rs = _to_number(row.get("risk_score"))
+            if rs is not None:
+                if rs <= _RISK_LOW_MAX:
+                    row["risk_bucket"] = "LOW"
+                elif rs <= _RISK_MODERATE_MAX:
+                    row["risk_bucket"] = "MODERATE"
+                else:
+                    row["risk_bucket"] = "HIGH"
+    except Exception:
+        pass
+
+
+def _is_instrument_shaped_keys(keys: Sequence[str]) -> bool:
+    """
+    v4.3.0: cheap guard used by normalize_rows() to decide whether the
+    derivation helper applies. Instrument-shaped pages have `current_price`
+    in their canonical key list (Market_Leaders, Global_Markets, etc., and
+    Top_10_Investments which appends 3 extras to the same 85). Special
+    pages like Insights_Analysis (section/item/metric/value/...) and
+    Data_Dictionary (sheet/group/header/...) do not, and bypass derivation.
+    """
+    if not keys:
+        return False
+    try:
+        return "current_price" in keys
+    except Exception:
+        return False
 
 
 # =============================================================================
@@ -1251,13 +1603,25 @@ def normalize_rows(
 
     v4.2.0: defensively strips engine internal coordination flags
     (`_skip_recommendation_synthesis`, `_internal_*`, `unit_normalization_warnings`,
-    `intrinsic_value_source`, etc.) before schema projection. The view fields
-    (`fundamental_view`/`technical_view`/`risk_view`/`value_view`) flow through
-    schema projection automatically as long as `keys` includes them — which it
-    does when schema_registry v2.5.0 is loaded, OR when the fallback list above
-    is used.
+    `intrinsic_value_source`, etc.) before schema projection.
+
+    v4.3.0: for instrument-shaped pages (any page whose canonical key list
+    contains `current_price` -- i.e. all five INSTRUMENT_PAGES and
+    Top_10_Investments), invokes `_derive_missing_fields()` to compute
+    canonical derivations (52W position, price change, portfolio math,
+    upside, ROI horizons, period/risk/confidence buckets) when their
+    inputs are present but the field itself is missing. Existing non-empty
+    values are never overwritten. Also normalises `warnings` from list
+    -> "; "-joined string for sheet display.
+
+    The view fields (`fundamental_view`/`technical_view`/`risk_view`/
+    `value_view`) flow through schema projection automatically as long as
+    `keys` includes them — which it does when schema_registry v2.5.0 is
+    loaded, OR when the fallback list above is used.
     """
     result: List[Dict[str, Any]] = []
+
+    instrument_shaped = _is_instrument_shaped_keys(keys)
 
     for row in rows:
         rd = dict(row or {})
@@ -1270,6 +1634,13 @@ def normalize_rows(
             rd["symbol"] = rd.get("ticker")
         if "ticker" not in rd and "symbol" in rd:
             rd["ticker"] = rd.get("symbol")
+
+        # v4.3.0: derive-and-fill (instrument-shaped pages only)
+        if instrument_shaped:
+            _derive_missing_fields(rd)
+
+        # v4.3.0: warnings field coercion (list -> "; "-joined string)
+        _normalize_warnings_field(rd)
 
         # Top_10_Investments-specific normalization (aligned with registry's 3 extras)
         if page == "Top_10_Investments":
