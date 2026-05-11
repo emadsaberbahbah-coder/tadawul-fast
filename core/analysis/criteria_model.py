@@ -2,43 +2,137 @@
 """
 core/analysis/criteria_model.py
 ================================================================================
-Advisor Criteria Model -- v3.0.0 (BUG-FIX, V2-ONLY, SCENARIO-TABLE)
+Advisor Criteria Model -- v3.1.0
+(CROSS-STACK CONVICTION + DATA-QUALITY CRITERIA, V2-ONLY, SCENARIO-TABLE)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
 Purpose
 -------
 Single validated source-of-truth for advisor criteria embedded in the
-Insights_Analysis top block (key/value rows) and shared by Top_10_Investments.
+Insights_Analysis top block (key/value rows) and shared by
+Top_10_Investments.
 
-v3.0.0 Changes (from v2.0.0)
-----------------------------
-BREAKING:
-  - Pydantic v1 is no longer supported. Requires pydantic>=2.0. (v1 EOL was
-    June 2024 and the previous fallback path was silently broken.)
+================================================================================
+v3.1.0 Changes (from v3.0.0)  --  CROSS-STACK CONVICTION + DATA-QUALITY
+================================================================================
 
-Bug fixes:
-  - max_risk_score=0 no longer gets replaced with the default 60.0
-    (the `_to_float(v, 60.0) or 60.0` idiom was falsey-replacing legitimate
-    zero values). Same fix applied to `amount`.
-  - SignalMapper rule registration is now thread-safe (module-level constants
-    instead of lazy-appended ClassVar list).
+Aligns criteria_model with the May 2026 cross-stack revisions:
+
+  - core.scoring v5.2.5 produces `conviction_score` per row (alongside
+    top_factors, top_risks, position_size_hint).
+  - core.reco_normalize v7.2.0 introduces env-tunable conviction floors
+    (RECO_STRONG_BUY_CONVICTION_FLOOR default 60, RECO_BUY_CONVICTION_FLOOR
+    default 45) used by the view-aware classification logic to downgrade
+    STRONG_BUY -> BUY and BUY -> HOLD when conviction falls below the
+    floor.
+  - core.data_engine_v2 v5.60.0 emits 5 engine-dropped valuation tags
+    (intrinsic_unit_mismatch_suspected, upside_synthesis_suspect,
+    engine_52w_high_unit_mismatch_dropped, engine_52w_low_unit_mismatch_dropped,
+    engine_52w_high_low_inverted) and 4 forecast-unavailable tags + bool
+    flag (forecast_unavailable, forecast_unavailable_no_source,
+    forecast_cleared_consistency_sweep, forecast_skipped_unavailable),
+    plus preserves provider `last_error_class` (Phase Q).
+  - core.analysis.top10_selector v4.11.0 applies data-quality penalties.
+  - core.analysis.insights_builder v7.0.0 surfaces all of these in the
+    Top Picks + NEW Data Quality Alerts section.
+
+All v3.1.0 changes are ADDITIVE WITH DEFAULTS -- no field removals, no
+validator changes for existing fields, no breaking API changes. Existing
+callers see identical behaviour.
+
+  A. NEW field `min_conviction_score` (float, 0-100, default 0.0 = no
+     filter). Lets callers express "I only want high-conviction picks"
+     without importing reco_normalize's floor mechanics directly. The
+     validator handles fraction shape (0.7 -> 70.0) consistent with
+     max_risk_score's preserved behaviour.
+
+  B. NEW exclusion bool fields for upstream data quality issues:
+       exclude_engine_dropped_valuation -- drop rows where engine cleared
+                                            intrinsic_value upstream
+       exclude_forecast_unavailable     -- drop rows without forecast
+       exclude_provider_errors          -- drop rows where last_error_class
+                                            is non-empty
+     All default False (opt-in filtering; preserves v3.0.0 semantics).
+
+  C. _SCENARIO_PRESETS extended with conviction floors + data quality
+     exclusions per scenario level:
+       Conservative: min_conviction=70, exclude all 3 data-quality flags
+       Moderate:     min_conviction=50, exclude only forecast_unavailable
+       Aggressive:   min_conviction=30, no exclusions (high opportunity)
+     Defaults chosen to align with reco_normalize v7.2.0's view-aware
+     conviction ladder (60/45 floors for STRONG_BUY/BUY downgrades).
+
+  D. `ScenarioSpec` (frozen dataclass) gained four new fields with
+     defaults:
+       min_conviction          : float = 0.0
+       exclude_engine_drops    : bool = False
+       exclude_forecast_unavail: bool = False
+       exclude_provider_errors : bool = False
+     Notes string updated to mention conviction floor and exclusion
+     policy when set. Existing callers that read only label / signal /
+     notes are unaffected.
+
+  E. NEW env-tunable conviction floor helpers (mirror reco_normalize
+     v7.2.0):
+       get_strong_buy_conviction_floor()
+           -- reads RECO_STRONG_BUY_CONVICTION_FLOOR (default 60.0)
+       get_buy_conviction_floor()
+           -- reads RECO_BUY_CONVICTION_FLOOR (default 45.0)
+     These let callers (e.g. UI components, dashboards, audit reports)
+     read the SAME floor reco_normalize uses without importing
+     reco_normalize directly. Single source of truth for the env var
+     names + defaults.
+
+  F. NEW `__version__ = CRITERIA_MODEL_VERSION` alias (TFB module
+     convention used by scoring v5.2.5, reco_normalize v7.2.0,
+     insights_builder v7.0.0, scoring_engine v3.4.2, top10_selector
+     v4.11.0).
+
+  G. KV map factory recognises new field labels via fuzzy aliases:
+       min_conviction_score: "min conviction", "conviction floor",
+                             "minimum conviction"
+       exclude_engine_dropped_valuation: "exclude engine drops"
+       exclude_forecast_unavailable: "exclude forecast unavailable",
+                                     "exclude forecast na"
+       exclude_provider_errors: "exclude provider errors"
+
+  H. __all__ augmented with __version__, get_strong_buy_conviction_floor,
+     get_buy_conviction_floor.
+
+  I. Version bump 3.0.0 -> 3.1.0.
+
+Wiring note (out-of-scope for v3.1.0): top10_selector._passes_filters
+and insights_builder section builders still need a follow-up patch to
+actively consume the new fields. v3.1.0 is the data-model foundation
+that makes them AVAILABLE.
+
+================================================================================
+v3.0.0 Changes (preserved)  --  BUG-FIX, V2-ONLY, SCENARIO-TABLE
+================================================================================
+
+BREAKING (v3.0.0):
+  - Pydantic v1 is no longer supported. Requires pydantic>=2.0.
+
+Bug fixes (v3.0.0):
+  - max_risk_score=0 no longer gets replaced with the default 60.0.
+  - SignalMapper rule registration is now thread-safe.
   - `top10_enabled`-as-integer no longer silently overrides an explicit
     `top_n` value from the same payload.
-  - `validate_assignment=True` removed from ConfigDict -- unnecessary overhead
-    for a data-holder model.
+  - `validate_assignment=True` removed from ConfigDict.
 
-Cleanup:
-  - Removed meaningless `ClassVar[...]` annotations on module-level constants.
-  - Removed dead constant HORIZON_LABELS (never referenced).
-  - Merged `_normalize_pages` (free fn) and `PageHelper` (class) into one path.
-  - Replaced three hardcoded blocks in `to_scenario_variants` with a single
-    table (_SCENARIO_PRESETS) -- easier to tune, ~50 lines shorter.
-  - Dropped unused imports (TypeVar, Union, cast in places that didn't need it).
-  - Exception classes now actually get raised when `strict=True` is passed.
+Cleanup (v3.0.0):
+  - Removed meaningless `ClassVar[...]` annotations.
+  - Removed dead constant HORIZON_LABELS.
+  - Merged `_normalize_pages` (free fn) and `PageHelper` (class).
+  - Replaced three hardcoded blocks in `to_scenario_variants` with a
+    single table (_SCENARIO_PRESETS).
+  - Exception classes now actually get raised when `strict=True`.
 
+================================================================================
 Design Principles (unchanged)
------------------------------
+================================================================================
+
 - No startup network I/O
 - Safe to import on Render
 - Lazy page-catalog loading
@@ -50,6 +144,7 @@ Design Principles (unchanged)
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -88,7 +183,9 @@ except ImportError as _exc:  # pragma: no cover
 # Constants
 # ---------------------------------------------------------------------------
 
-CRITERIA_MODEL_VERSION = "3.0.0"
+CRITERIA_MODEL_VERSION = "3.1.0"
+# v3.1.0 Phase F: TFB module-version convention alias.
+__version__ = CRITERIA_MODEL_VERSION
 
 # Valid signal values for Insights_Analysis Signal column
 SIGNAL_VALUES: FrozenSet[str] = frozenset({
@@ -100,6 +197,56 @@ SIGNAL_VALUES: FrozenSet[str] = frozenset({
 
 # Scenario labels for risk scenarios section
 SCENARIO_LABELS: Tuple[str, ...] = ("Conservative", "Moderate", "Aggressive")
+
+
+# ---------------------------------------------------------------------------
+# v3.1.0 Phase E — Env-tunable conviction floor helpers
+# ---------------------------------------------------------------------------
+#
+# Mirror constants here so callers (UI components, dashboards, audit
+# reports, top10_selector when it advances) can read the SAME floor
+# reco_normalize uses without importing reco_normalize directly. Single
+# source of truth for the env var names + defaults.
+
+def _env_float(name: str, default: float) -> float:
+    """Read float env var defensively; falls back to default on any error."""
+    try:
+        raw = (os.getenv(name) or "").strip()
+        if not raw:
+            return default
+        value = float(raw)
+        # NaN and infinity are not valid floors.
+        if value != value or value in (float("inf"), float("-inf")):
+            return default
+        return value
+    except (ValueError, TypeError):
+        return default
+
+
+def get_strong_buy_conviction_floor() -> float:
+    """
+    Return the canonical STRONG_BUY conviction floor.
+
+    Below this value, reco_normalize v7.2.0 view-aware classification
+    will downgrade STRONG_BUY -> BUY (or further down depending on the
+    rule chain). Mirrors reco_normalize's env knob so callers can read
+    the floor without importing reco_normalize.
+
+    Env: RECO_STRONG_BUY_CONVICTION_FLOOR (default 60.0)
+    """
+    return _env_float("RECO_STRONG_BUY_CONVICTION_FLOOR", 60.0)
+
+
+def get_buy_conviction_floor() -> float:
+    """
+    Return the canonical BUY conviction floor.
+
+    Below this value, reco_normalize v7.2.0 view-aware classification
+    will downgrade BUY -> HOLD. Mirrors reco_normalize's env knob.
+
+    Env: RECO_BUY_CONVICTION_FLOOR (default 45.0)
+    """
+    return _env_float("RECO_BUY_CONVICTION_FLOOR", 45.0)
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +342,8 @@ def _as_ratio(value: Any, default: float = 0.0) -> float:
     """
     Convert any percent-like value to a ratio (0.12 = 12%).
 
-    Accepts: 0.12, 12, "12%", "0.12". Values with abs > 1.5 are treated as
-    percentages and divided by 100.
+    Accepts: 0.12, 12, "12%", "0.12". Values with abs > 1.5 are treated
+    as percentages and divided by 100.
     """
     f = _to_float(value, None)
     if f is None:
@@ -466,8 +613,8 @@ def _numeric_signal(value: float, metric: str, th_high: float, th_low: float) ->
             return "DOWN"
         return "NEUTRAL"
 
-    # Scores / confidence / quality / momentum: higher = better
-    if any(k in metric_l for k in ("score", "confidence", "quality", "momentum")):
+    # Scores / confidence / quality / momentum / conviction: higher = better
+    if any(k in metric_l for k in ("score", "confidence", "quality", "momentum", "conviction")):
         if value >= th_high:
             return "HIGH"
         if value >= th_low:
@@ -505,6 +652,8 @@ def signal_for_value(
         'DOWN'
         >>> signal_for_value("BUY")
         'BUY'
+        >>> signal_for_value(75, metric="conviction_score")  # v3.1.0
+        'HIGH'
     """
     # 1. Exact signal passthrough
     s = _to_string(value).upper().replace(" ", "_").replace("-", "_")
@@ -557,13 +706,15 @@ class AdvisorCriteria(BaseModel):
 
     All ratio fields (required_return_pct, min_expected_roi_pct,
     min_ai_confidence) are stored as fractions (0.12 = 12%).
-    max_risk_score is stored on a 0-100 scale.
+    max_risk_score and min_conviction_score are stored on a 0-100 scale.
 
     Examples:
         >>> criteria = AdvisorCriteria(
         ...     risk_level="Moderate",
         ...     invest_period_days=90,
         ...     required_return_pct=0.10,
+        ...     min_conviction_score=60.0,             # v3.1.0
+        ...     exclude_forecast_unavailable=True,     # v3.1.0
         ... )
         >>> criteria.horizon
         '3M'
@@ -617,6 +768,19 @@ class AdvisorCriteria(BaseModel):
         description="Maximum allowed risk score (0-100)",
     )
 
+    # --- v3.1.0 NEW: Conviction floor (score 0-100) ---
+    min_conviction_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "Minimum conviction score filter (0-100, default 0 = no filter). "
+            "Aligns with reco_normalize v7.2.0 conviction floors (60/45 for "
+            "STRONG_BUY/BUY downgrades) and scoring v5.2.5 conviction_score "
+            "row field. Set to 60 to mirror reco_normalize STRONG_BUY floor."
+        ),
+    )
+
     # --- Capital ---
     amount: float = Field(
         default=0.0,
@@ -648,6 +812,40 @@ class AdvisorCriteria(BaseModel):
     include_top_opportunities: bool = Field(default=True)
     include_portfolio_health: bool = Field(default=True)
 
+    # --- v3.1.0 NEW: Data quality exclusion flags ---
+    # All default False (preserves v3.0.0 semantics; opt-in filtering).
+    # Map to engine v5.60.0 / scoring v5.2.5 / insights_builder v7.0.0
+    # tag detection logic.
+    exclude_engine_dropped_valuation: bool = Field(
+        default=False,
+        description=(
+            "Drop rows where the engine cleared intrinsic_value or "
+            "upside_pct upstream (5 tags from data_engine_v2 v5.60.0 "
+            "Phase H/I/P: intrinsic_unit_mismatch_suspected, "
+            "upside_synthesis_suspect, engine_52w_*_dropped, "
+            "engine_52w_high_low_inverted)."
+        ),
+    )
+    exclude_forecast_unavailable: bool = Field(
+        default=False,
+        description=(
+            "Drop rows where forecast synthesis was skipped (4 tags from "
+            "data_engine_v2 v5.60.0 Phase B: forecast_unavailable, "
+            "forecast_unavailable_no_source, forecast_cleared_consistency_sweep, "
+            "forecast_skipped_unavailable; OR forecast_unavailable bool flag)."
+        ),
+    )
+    exclude_provider_errors: bool = Field(
+        default=False,
+        description=(
+            "Drop rows where the provider's last_error_class is non-empty "
+            "(preserved by data_engine_v2 v5.60.0 Phase Q from eodhd "
+            "v4.7.3, yahoo_fundamentals v6.1.0, yahoo_chart v8.2.0, "
+            "enriched_quote v4.3.0). Null-string filter applies "
+            "('None'/'null'/'nan'/'n/a' counted as no error)."
+        ),
+    )
+
     # --- Provenance ---
     source_page: str = Field(default="Insights_Analysis")
     source_block: str = Field(default="top_block")
@@ -662,6 +860,8 @@ class AdvisorCriteria(BaseModel):
                     "invest_period_days": 90,
                     "required_return_pct": 0.10,
                     "max_risk_score": 60.0,
+                    "min_conviction_score": 60.0,
+                    "exclude_forecast_unavailable": True,
                 }
             ]
         },
@@ -702,6 +902,29 @@ class AdvisorCriteria(BaseModel):
             f = f * 100.0
         return _clamp(f, 0.0, 100.0)
 
+    @field_validator("min_conviction_score", mode="before")
+    @classmethod
+    def _validate_conviction(cls, v: Any) -> float:
+        """
+        v3.1.0: parse conviction floor with fraction-shape detection.
+
+        Accepts:
+          - None / "" / unparseable -> 0.0 (no filter, preserves
+            v3.0.0 semantics for rows that don't include this field).
+          - 0.7  -> 70.0 (treated as fraction since 0 < value <= 1).
+          - 70   -> 70.0 (treated as percent points).
+          - "60%" -> 60.0 (via _to_float).
+        Clamps to [0.0, 100.0].
+        """
+        parsed = _to_float(v, None)
+        if parsed is None:
+            return 0.0
+        # Mirror max_risk_score's fraction->percent shape detection
+        # (but preserve a legitimate zero, which means "no filter").
+        if 0.0 < parsed <= 1.0:
+            parsed = parsed * 100.0
+        return _clamp(parsed, 0.0, 100.0)
+
     @field_validator("amount", mode="before")
     @classmethod
     def _validate_amount(cls, v: Any) -> float:
@@ -731,6 +954,24 @@ class AdvisorCriteria(BaseModel):
     @classmethod
     def _validate_bool_flag(cls, v: Any) -> bool:
         return _to_bool(v, True)
+
+    @field_validator(
+        "exclude_engine_dropped_valuation",
+        "exclude_forecast_unavailable",
+        "exclude_provider_errors",
+        mode="before",
+    )
+    @classmethod
+    def _validate_exclusion_flag(cls, v: Any) -> bool:
+        """
+        v3.1.0: Exclusion flags default False (opt-in filtering).
+
+        Distinct from `_validate_bool_flag` which defaults to True for
+        section flags (where the default-on behaviour is desirable).
+        Exclusion flags default off so v3.0.0 callers see identical
+        behaviour.
+        """
+        return _to_bool(v, False)
 
     @model_validator(mode="after")
     def _finalize(self) -> "AdvisorCriteria":
@@ -810,6 +1051,10 @@ class AdvisorCriteria(BaseModel):
         The Moderate variant inherits user-supplied thresholds as minimums
         (so a user who asked for required_return=15% gets >=15% in Moderate).
         Conservative and Aggressive use fixed presets.
+
+        v3.1.0: variants now also carry min_conviction_score + 3 data
+        quality exclusion flags from _SCENARIO_PRESETS (see preset table
+        for per-scenario defaults).
         """
         base_days = self.invest_period_days
         base_pages = list(self.pages_selected)
@@ -841,6 +1086,15 @@ class AdvisorCriteria(BaseModel):
                 min_expected_roi_pct=preset["min_expected_roi_pct"],
                 min_ai_confidence=preset["min_ai_confidence"],
                 max_risk_score=preset["max_risk_score"],
+                # v3.1.0: NEW conviction + exclusion fields (defaults preserved
+                # when scenario preset doesn't override).
+                min_conviction_score=preset.get("min_conviction_score", 0.0),
+                exclude_engine_dropped_valuation=preset.get(
+                    "exclude_engine_dropped_valuation", False),
+                exclude_forecast_unavailable=preset.get(
+                    "exclude_forecast_unavailable", False),
+                exclude_provider_errors=preset.get(
+                    "exclude_provider_errors", False),
                 amount=self.amount,
                 pages_selected=base_pages,
                 top_n=base_top_n,
@@ -899,8 +1153,11 @@ class AdvisorCriteria(BaseModel):
                     instance.
 
         Examples:
-            >>> kv = {"Risk Level": "High", "Period (Days)": 180}
+            >>> kv = {"Risk Level": "High", "Period (Days)": 180,
+            ...       "Min Conviction": 60}
             >>> criteria = AdvisorCriteria.from_kv_map(kv)
+            >>> criteria.min_conviction_score
+            60.0
         """
         kv = dict(kv or {})
 
@@ -944,6 +1201,27 @@ class AdvisorCriteria(BaseModel):
             "min_ai_confidence": pick(
                 "min_ai_confidence", "min ai confidence",
                 "min confidence", "ai min confidence",
+            ),
+            # v3.1.0 Phase G: conviction + exclusion field aliases
+            "min_conviction_score": pick(
+                "min_conviction_score", "min conviction", "min_conviction",
+                "conviction floor", "minimum conviction", "min conviction score",
+                "conviction min", "conviction threshold",
+            ),
+            "exclude_engine_dropped_valuation": pick(
+                "exclude_engine_dropped_valuation",
+                "exclude engine drops", "exclude_engine_drops",
+                "exclude engine drop", "drop engine flagged",
+            ),
+            "exclude_forecast_unavailable": pick(
+                "exclude_forecast_unavailable",
+                "exclude forecast unavailable", "exclude_forecast_na",
+                "exclude forecast na", "drop unforecastable",
+            ),
+            "exclude_provider_errors": pick(
+                "exclude_provider_errors",
+                "exclude provider errors", "exclude_provider_errs",
+                "exclude provider error", "drop provider errors",
             ),
             "amount": pick(
                 "amount", "invest amount", "investment amount",
@@ -1013,6 +1291,7 @@ class AdvisorCriteria(BaseModel):
                 ["Risk Level", "Moderate"],
                 ["Investment Period (Days)", 90],
                 ["Required Return %", "10%"],
+                ["Min Conviction", 60],         # v3.1.0
                 ...
             ]
         """
@@ -1066,6 +1345,10 @@ def _norm_key(key: Any) -> str:
 # ---------------------------------------------------------------------------
 # Replaces three 20-line hardcoded blocks in v2.0.0's `to_scenario_variants`.
 # Tune scenario knobs by editing this table in one place.
+#
+# v3.1.0: extended with min_conviction_score + 3 data-quality exclusion
+# flags per scenario. Conservative wants high-conviction picks with clean
+# data; Aggressive accepts wider data tolerance for opportunity capture.
 
 _SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
     "Conservative": {
@@ -1075,6 +1358,13 @@ _SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "min_expected_roi_pct": 0.03,
         "min_ai_confidence": 0.70,
         "max_risk_score": 40.0,
+        # v3.1.0: Conservative wants high-conviction picks + clean data
+        # only. min_conviction=70 aligns with reco_normalize v7.2.0
+        # STRONG_BUY floor (60) plus a 10-point safety margin.
+        "min_conviction_score": 70.0,
+        "exclude_engine_dropped_valuation": True,
+        "exclude_forecast_unavailable": True,
+        "exclude_provider_errors": True,
     },
     "Moderate": {
         "risk_level": "Moderate",
@@ -1083,6 +1373,13 @@ _SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "min_expected_roi_pct": 0.07,
         "min_ai_confidence": 0.60,
         "max_risk_score": 60.0,
+        # v3.1.0: Moderate aligns with reco_normalize v7.2.0 BUY floor
+        # (45) plus a small margin. Only excludes forecast_unavailable
+        # since rows without forecasts can't contribute ROI signal anyway.
+        "min_conviction_score": 50.0,
+        "exclude_engine_dropped_valuation": False,
+        "exclude_forecast_unavailable": True,
+        "exclude_provider_errors": False,
     },
     "Aggressive": {
         "risk_level": "High",
@@ -1091,6 +1388,14 @@ _SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "min_expected_roi_pct": 0.15,
         "min_ai_confidence": 0.45,
         "max_risk_score": 80.0,
+        # v3.1.0: Aggressive accepts lower conviction (30 = HOLD-tier
+        # downgrades from BUY) and no data-quality exclusions to maximize
+        # the candidate pool. Operators see upstream caveats in the
+        # Insights_Analysis Data Quality Alerts section regardless.
+        "min_conviction_score": 30.0,
+        "exclude_engine_dropped_valuation": False,
+        "exclude_forecast_unavailable": False,
+        "exclude_provider_errors": False,
     },
 }
 
@@ -1109,6 +1414,16 @@ _SCENARIO_SIGNAL_MAP: Mapping[str, str] = {
 class ScenarioSpec:
     """
     Immutable descriptor for a single risk scenario row in Insights_Analysis.
+
+    v3.1.0: gained four new fields with defaults:
+        min_conviction          : 0-100 conviction floor for this scenario
+        exclude_engine_drops    : drop engine-cleared valuation rows
+        exclude_forecast_unavail: drop forecast-unavailable rows
+        exclude_provider_errors : drop rows with last_error_class set
+    All default values preserve v3.0.0 semantics for existing callers
+    (insights_builder v7.0.0's Risk Scenarios section reads only label /
+    signal / notes; the new fields surface through the notes string and
+    via direct attribute access for callers that need the policy).
     """
     label: str
     signal: str
@@ -1117,6 +1432,11 @@ class ScenarioSpec:
     required_return: float
     min_confidence: float
     horizon: str
+    # v3.1.0 NEW: conviction floor + 3 data quality exclusion flags
+    min_conviction: float = 0.0
+    exclude_engine_drops: bool = False
+    exclude_forecast_unavail: bool = False
+    exclude_provider_errors: bool = False
     notes: str = field(default="")
 
     def __post_init__(self) -> None:
@@ -1130,12 +1450,42 @@ class ScenarioSpec:
             raise ValueError(f"min_roi must be between 0 and 10: {self.min_roi}")
         if not 0 <= self.min_confidence <= 1:
             raise ValueError(f"min_confidence must be between 0 and 1: {self.min_confidence}")
+        # v3.1.0: validate new field
+        if not 0 <= self.min_conviction <= 100:
+            raise ValueError(
+                f"min_conviction must be between 0 and 100: {self.min_conviction}"
+            )
 
 
 def build_scenario_specs(criteria: AdvisorCriteria) -> List[ScenarioSpec]:
-    """Convert AdvisorCriteria scenarios to typed ScenarioSpec instances."""
-    return [
-        ScenarioSpec(
+    """
+    Convert AdvisorCriteria scenarios to typed ScenarioSpec instances.
+
+    v3.1.0: the notes string now also surfaces the conviction floor and
+    any data-quality exclusion policy active for the scenario.
+    """
+    specs: List[ScenarioSpec] = []
+    for variant in criteria.to_scenario_variants():
+        # Build the exclusion-policy suffix (only when at least one flag is on)
+        exclude_parts: List[str] = []
+        if variant.exclude_engine_dropped_valuation:
+            exclude_parts.append("engine-drops")
+        if variant.exclude_forecast_unavailable:
+            exclude_parts.append("forecast-na")
+        if variant.exclude_provider_errors:
+            exclude_parts.append("provider-errs")
+        exclude_suffix = f" | Exclude: {', '.join(exclude_parts)}" if exclude_parts else ""
+
+        notes = (
+            f"Risk ceiling: {variant.max_risk_score:.0f} | "
+            f"Min ROI: {variant.min_expected_roi_pct * 100:.1f}% | "
+            f"Min Confidence: {variant.min_ai_confidence * 100:.0f}% | "
+            f"Min Conviction: {variant.min_conviction_score:.0f} | "
+            f"Horizon: {variant.horizon}"
+            f"{exclude_suffix}"
+        )
+
+        specs.append(ScenarioSpec(
             label=variant.scenario_label(),
             signal=variant.scenario_signal(),
             max_risk=variant.max_risk_score,
@@ -1143,15 +1493,14 @@ def build_scenario_specs(criteria: AdvisorCriteria) -> List[ScenarioSpec]:
             required_return=variant.required_return_pct,
             min_confidence=variant.min_ai_confidence,
             horizon=variant.horizon,
-            notes=(
-                f"Risk ceiling: {variant.max_risk_score:.0f} | "
-                f"Min ROI: {variant.min_expected_roi_pct * 100:.1f}% | "
-                f"Min Confidence: {variant.min_ai_confidence * 100:.0f}% | "
-                f"Horizon: {variant.horizon}"
-            ),
-        )
-        for variant in criteria.to_scenario_variants()
-    ]
+            # v3.1.0: new fields
+            min_conviction=variant.min_conviction_score,
+            exclude_engine_drops=variant.exclude_engine_dropped_valuation,
+            exclude_forecast_unavail=variant.exclude_forecast_unavailable,
+            exclude_provider_errors=variant.exclude_provider_errors,
+            notes=notes,
+        ))
+    return specs
 
 
 # ---------------------------------------------------------------------------
@@ -1180,6 +1529,8 @@ def horizon_to_forecast_price_key(horizon: str) -> str:
 __all__ = [
     # Version
     "CRITERIA_MODEL_VERSION",
+    # v3.1.0 Phase F: __version__ alias (TFB module convention)
+    "__version__",
     # Constants
     "SCENARIO_LABELS",
     "SIGNAL_VALUES",
@@ -1199,6 +1550,9 @@ __all__ = [
     "map_days_to_horizon",
     "horizon_to_expected_roi_key",
     "horizon_to_forecast_price_key",
+    # v3.1.0 Phase E: env-tunable conviction floor helpers
+    "get_strong_buy_conviction_floor",
+    "get_buy_conviction_floor",
     # Page Helper (exposed for tests / callers that need canonical pages)
     "PageHelper",
     # Exceptions
