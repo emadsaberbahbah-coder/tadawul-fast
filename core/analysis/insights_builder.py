@@ -2,8 +2,10 @@
 """
 core/analysis/insights_builder.py
 ================================================================================
-Insights Analysis Builder -- v6.0.0
-(SCHEMA-CORRECT / TIMESTAMP-FIX / SIGNAL-PRIORITY-PRESERVED / V5-V7 ALIGNED)
+Insights Analysis Builder -- v7.0.0
+(CROSS-STACK SIGNAL ENRICHMENT + DATA-QUALITY ALERTS SECTION /
+ [PRESERVED v6.0.0] SCHEMA-CORRECT 7-COL / TIMESTAMP-FIX /
+ SIGNAL-PRIORITY-PRESERVED / V5-V7 ALIGNED)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -13,30 +15,142 @@ Builds Insights_Analysis page rows for the TFB dashboard. Generates a
 multi-section executive summary aligned with the canonical 7-column
 Insights_Analysis schema in `core.sheets.schema_registry` v2.5.0.
 
-Sections
---------
+Sections (v7.0.0: 8 sections)
+-----------------------------
   1. Market Summary             -- Trend signals per universe (gainers/losers/vol)
-  2. Top Picks                  -- Top 10 investments with signals and priorities
+  2. Top Picks                  -- Top 10 investments + scoring v5.2.5 enrichment
   3. Risk Alerts                -- High risk_score, overbought RSI, drawdowns
-  4. Short-Term Opportunities   -- technical_score + short_term_signal
-  5. Portfolio KPIs             -- P/L, stop distances, weight deviations
-  6. Macro Signals              -- sector signals, vs_sp500_ytd
-  7. Risk Scenarios             -- Conservative / Moderate / Aggressive
+  4. Data Quality Alerts        -- v7.0.0 NEW: provider errors + engine drops
+  5. Short-Term Opportunities   -- technical_score + short_term_signal
+  6. Portfolio KPIs             -- P/L, stop distances, weight deviations
+  7. Macro Signals              -- sector signals, vs_sp500_ytd
+  8. Risk Scenarios             -- Conservative / Moderate / Aggressive
 
-Aligned with the v5/v7 view-aware family:
+Aligned with the v5/v7 view-aware family + May 2026 cross-stack revisions:
   - core.sheets.schema_registry v2.5.0  (Insights_Analysis = 7 columns)
-  - core.scoring                v5.0.0
-  - core.reco_normalize         v7.0.0  (5-tier rec vocabulary)
+  - core.scoring                v5.2.5  (engine_dropped_valuation, provider_error)
+  - core.reco_normalize         v7.2.0  (5-tier vocabulary + rule_ids)
   - core.analysis.criteria_model v3.0.0
+  - core.data_engine_v2         v5.60.0 (warnings string, last_error_class)
+  - providers eodhd v4.7.3, yahoo_fundamentals v6.1.0, yahoo_chart v8.2.0,
+              enriched_quote v4.3.0
 
 ================================================================================
-v6.0.0 Changes (from v5.0.0)
+v7.0.0 changes (vs v6.0.0)  --  CROSS-STACK SIGNAL ENRICHMENT
+================================================================================
+
+Aligns insights_builder with the May 10/11 2026 provider+engine+scoring
+revisions. Five high-impact additions plus three small polish items:
+
+  A. NEW SECTION: "Data Quality Alerts"
+     v6.0.0 had no visibility into upstream provider failures or
+     engine-applied valuation clears. Operators reading
+     Insights_Analysis couldn't tell which symbols were affected by
+     upstream issues. v7.0.0 adds a dedicated section that scans
+     `all_quotes` for:
+       - `last_error_class` non-empty (provider error, preserved
+         through engine v5.60.0 Phase Q from eodhd v4.7.3 / yahoo
+         providers v6.1.0+v8.2.0).
+       - `warnings` containing engine-applied tags:
+           * intrinsic_unit_mismatch_suspected
+           * upside_synthesis_suspect
+           * engine_52w_high_unit_mismatch_dropped
+           * engine_52w_low_unit_mismatch_dropped
+           * engine_52w_high_low_inverted
+           * forecast_unavailable / forecast_unavailable_no_source /
+             forecast_cleared_consistency_sweep /
+             forecast_skipped_unavailable
+     Emits a summary row + up to 18 per-symbol detail rows split
+     into three sub-categories (provider error / engine-dropped
+     valuation / forecast skip). Tagged with `ALERT` signal so it
+     stands out in the sheet. Closes the audit-trail gap from
+     scoring's `provider_error:*` / `engine_dropped_valuation`
+     scoring_errors -> user-visible sheet output.
+
+     Controllable via `criteria.include_data_quality_alerts`
+     (default True). Skipped automatically when `all_quotes` is empty.
+
+  B. TOP PICKS ENRICHMENT from scoring v5.2.5
+     Top Picks rows now surface (when available in the source row):
+       - `conviction_score`      -> dedicated "Conviction" context row
+       - `top_factors`           -> in notes as "++<list>"
+       - `top_risks`             -> in notes as "--<list>"
+       - `position_size_hint`    -> dedicated "Position Size" context row
+     This gives operators the full reasoning chain
+     (scoring -> insights) without parsing recommendation_reason
+     text manually.
+
+  F. DATA-QUALITY BREAKDOWN per universe
+     `_build_universe_snapshot_rows` gains a "Data Quality" coverage
+     row showing clean-vs-flagged counts per universe. Complements
+     Phase A by giving per-universe quality snapshot before the
+     aggregate alerts.
+
+  G. FINER SIGNAL VOCABULARY in Top Picks
+     `_reco_to_signal` now returns finer-grained signal values:
+       STRONG_BUY -> "STRONG_BUY"  (was rolled to "BUY" in v6.0.0)
+       BUY        -> "BUY"
+       HOLD       -> "HOLD"
+       REDUCE     -> "REDUCE"      (was rolled to "SELL" in v6.0.0)
+       SELL       -> "SELL"
+     New tokens appear in notes prefixes like `[STRONG_BUY|HIGH]`
+     for clearer audit. Backward-compatible: existing
+     `_SIGNAL_UP`/`_SIGNAL_DOWN` module constants are preserved
+     verbatim for the macro/portfolio code paths that use them
+     directly. Only `_reco_to_signal` (Top Picks) is enhanced.
+
+  H. `__version__` ALIAS
+     Added `__version__ = INSIGHTS_BUILDER_VERSION` to align with
+     the TFB module convention used by scoring v5.2.5, reco_normalize
+     v7.2.0, data_engine_v2, providers, etc. Exported via `__all__`.
+
+  I. FORECAST_UNAVAILABLE DETECTION in Top Picks
+     When a Top Pick row has `forecast_unavailable` set (engine
+     v5.55.0 AUDIT-3 or v5.60.0 Phase B consistency-sweep), or its
+     warnings string carries `forecast_unavailable*` tags, the note
+     flags this explicitly ("forecast_unavailable_upstream") rather
+     than silently displaying empty ROI.
+
+  J. Version bump 6.0.0 -> 7.0.0.
+
+NEW helpers (private, prefix _):
+  - `_warning_tags_from_row(row)` -- mirror of scoring v5.2.5;
+    parses warnings string/list into a Set[str] with bare-key
+    extraction for "key:value" tags.
+  - `_provider_error_from_row(row)` -- extracts last_error_class
+    with null-string filter ("None"/"null"/"nan"/"n/a" filtered).
+  - `_row_has_engine_dropped_valuation(row)` -- mirror of scoring
+    v5.2.5 helper; True when row warnings contain engine-applied
+    valuation-drop tags.
+  - `_row_is_forecast_unavailable(row)` -- True when bool flag or
+    warning tag signals forecast skip.
+  - `_extract_scoring_enrichment(row)` -- pulls v5.2.5 fields
+    (conviction_score, top_factors, top_risks, position_size_hint)
+    into a small dict for Top Picks formatting.
+
+NEW constants (private, except __version__):
+  - `__version__` (public alias of INSIGHTS_BUILDER_VERSION)
+  - `_PROVIDER_ERROR_NULL_STRINGS` (filter set)
+  - `_ENGINE_DROPPED_VALUATION_TAGS` (set of 5 engine tags)
+  - `_ENGINE_UNFORECASTABLE_TAGS` (set of 4 engine tags)
+  - `_SIGNAL_STRONG_UP` = "STRONG_BUY"  (new finer-grained marker)
+  - `_SIGNAL_REDUCE` = "REDUCE"         (new finer-grained marker)
+
+[PRESERVED -- strictly] All v6.0.0 fixes (7-column schema,
+last_updated_riyadh key alignment, signal/priority embedded-in-notes)
+and v5.0.0 mechanics (await/asyncio.wait_for timeouts, criteria_model
+integration, top10_selector path, engine method-dispatch retry,
+build budget tracking). Public API surface augmented only. No removals
+from __all__.
+
+================================================================================
+v6.0.0 changes (preserved verbatim from v5.0.0)
 ================================================================================
 
 CRITICAL FIX: 7-column schema alignment
 ---------------------------------------
 v5.0.0's `_FALLBACK_HEADERS` / `_FALLBACK_KEYS` listed 9 columns including
-`signal` and `priority` — but the canonical registry contract for
+`signal` and `priority` -- but the canonical registry contract for
 Insights_Analysis is 7 columns:
 
     ["section", "item", "symbol", "metric", "value", "notes",
@@ -61,7 +175,7 @@ CRITICAL FIX: timestamp key was being lost
 ------------------------------------------
 v5.0.0's `_make_row()` built rows with `"as_of_riyadh": timestamp`, but
 the registry's canonical key is `"last_updated_riyadh"`. The schema
-projection step used `full_row.get("last_updated_riyadh", "")` — which
+projection step used `full_row.get("last_updated_riyadh", "")` -- which
 returned `""` because the timestamp lived under `as_of_riyadh` instead.
 Every Insights row in production was emitting a blank timestamp.
 
@@ -73,12 +187,13 @@ v6.0.0:
     in addition to the legacy `as_of_riyadh`. Both resolve to the same
     timestamp; either is fine.
 
-NEW: 5-tier recommendation token recognition
---------------------------------------------
+NEW: 5-tier recommendation token recognition (v6.0.0)
+-----------------------------------------------------
 The Top Picks section's `_SIGNAL_UP` mapping now also recognises the
 v7.0.0 5-tier vocabulary (`STRONG_BUY`, `BUY` keep BUY signal; `SELL`
 and `REDUCE` map to SELL signal; `HOLD` maps to neutral). Previously
-only `BUY`/`STRONG_BUY` were detected.
+only `BUY`/`STRONG_BUY` were detected. [v7.0.0 Phase G further refines
+this to return the canonical 5-tier token directly.]
 
 ================================================================================
 v5.0.0 Changes (PRESERVED)
@@ -117,7 +232,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -130,13 +245,15 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "6.0.0"
+INSIGHTS_BUILDER_VERSION = "7.0.0"
+# v7.0.0 Phase H: align with TFB module convention
+__version__ = INSIGHTS_BUILDER_VERSION
 
 # Riyadh timezone (UTC+3, no DST)
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
 # Schema fallback: exactly 7 columns matching schema_registry v2.5.0's
-# Insights_Analysis spec. Do NOT add `signal` or `priority` columns here —
+# Insights_Analysis spec. Do NOT add `signal` or `priority` columns here --
 # the registry treats those as info to be embedded in `notes` (handled by
 # `_make_row`). Do NOT rename `last_updated_riyadh` to `as_of_riyadh`; the
 # registry uses the former and sheet writers depend on it.
@@ -149,9 +266,12 @@ _FALLBACK_KEYS: List[str] = [
     "value", "notes", "last_updated_riyadh",
 ]
 
+# ---------------------------------------------------------------------------
 # Signal vocabulary used as `notes` markers (NOT as separate columns).
 # When the schema gains explicit signal/priority columns, _make_row routes
 # values to those columns instead.
+# ---------------------------------------------------------------------------
+
 _SIGNAL_UP = "BUY"
 _SIGNAL_DOWN = "SELL"
 _SIGNAL_NEUTRAL = "HOLD"
@@ -159,9 +279,19 @@ _SIGNAL_OK = "INFO"
 _SIGNAL_WARN = "ALERT"
 _SIGNAL_ALERT = "ALERT"
 
+# v7.0.0 Phase G: NEW finer-grained signal tokens for Top Picks.
+# Used by _reco_to_signal() to distinguish STRONG_BUY from BUY and
+# REDUCE from SELL in the [SIGNAL|PRIORITY] notes prefix. Backward
+# compatible: existing _SIGNAL_UP / _SIGNAL_DOWN constants preserved
+# verbatim for the macro / portfolio sections that use them directly.
+_SIGNAL_STRONG_UP = "STRONG_BUY"
+_SIGNAL_REDUCE = "REDUCE"
+
 # v6.0.0: 5-tier recommendation tokens that map to bullish/bearish signals
-_BULLISH_RECOS = frozenset({"BUY", "STRONG_BUY"})
-_BEARISH_RECOS = frozenset({"SELL", "REDUCE"})
+# (preserved set; the actual mapping function _reco_to_signal is enhanced
+# in v7.0.0 Phase G).
+_BULLISH_RECOS: FrozenSet[str] = frozenset({"BUY", "STRONG_BUY"})
+_BEARISH_RECOS: FrozenSet[str] = frozenset({"SELL", "REDUCE"})
 
 # Priority vocabulary
 _PRI_HIGH = "High"
@@ -173,6 +303,44 @@ _DEFAULT_MAX_SYMBOLS_PER_UNIVERSE = 100
 _DEFAULT_QUOTES_TIMEOUT_SEC = 10.0
 _DEFAULT_TOP10_TIMEOUT_SEC = 10.0
 _DEFAULT_BUILD_BUDGET_SEC = 30.0
+
+
+# ---------------------------------------------------------------------------
+# v7.0.0 Phase A — Cross-stack data-quality tag sets and helpers
+# ---------------------------------------------------------------------------
+#
+# These mirror the corresponding sets in scoring.py v5.2.5 verbatim so
+# both modules share the same canonical understanding of which warning
+# tags signal which kind of upstream issue. The provider error classes
+# come from eodhd_provider v4.7.3, yahoo_fundamentals_provider v6.1.0,
+# yahoo_chart_provider v8.2.0, and enriched_quote v4.3.0. The engine
+# warning tags come from data_engine_v2 v5.60.0 Phase H / I / P / B.
+
+# Strings that, even though non-empty, should be treated as "no error"
+# when found in last_error_class. Mirrors scoring.py v5.2.5 Phase L.
+_PROVIDER_ERROR_NULL_STRINGS: FrozenSet[str] = frozenset({
+    "none", "null", "nil", "nan", "n/a", "na",
+})
+
+# Engine-applied warning tags that mean the engine cleared intrinsic_value
+# and/or upside_pct due to unit-mismatch or synthesizer-overshoot
+# detection. Mirrors scoring.py v5.2.5 _ENGINE_DROPPED_VALUATION_TAGS.
+_ENGINE_DROPPED_VALUATION_TAGS: FrozenSet[str] = frozenset({
+    "intrinsic_unit_mismatch_suspected",
+    "upside_synthesis_suspect",
+    "engine_52w_high_unit_mismatch_dropped",
+    "engine_52w_low_unit_mismatch_dropped",
+    "engine_52w_high_low_inverted",
+})
+
+# Engine-emitted warning tags that mark a row as unforecastable.
+# Mirrors scoring.py v5.2.5 _ENGINE_UNFORECASTABLE_TAGS.
+_ENGINE_UNFORECASTABLE_TAGS: FrozenSet[str] = frozenset({
+    "forecast_unavailable",
+    "forecast_unavailable_no_source",
+    "forecast_cleared_consistency_sweep",
+    "forecast_skipped_unavailable",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +504,191 @@ def _is_signature_mismatch(error: TypeError) -> bool:
         "keyword-only argument",
     )
     return any(marker in msg for marker in markers)
+
+
+# ---------------------------------------------------------------------------
+# v7.0.0 Phase A — Data-quality parsing helpers
+# ---------------------------------------------------------------------------
+
+def _warning_tags_from_row(row: Mapping[str, Any]) -> Set[str]:
+    """
+    v7.0.0 Phase A: parse a row's `warnings` field into a Set[str] of
+    normalized tags. Mirrors scoring.py v5.2.5 `_warning_tags_from_row`
+    verbatim so both modules share the canonical parser.
+
+    Handles:
+      - None / missing / ""       -> empty set
+      - "; "-joined string         -> per data_engine_v2 v5.60.0 Phase N
+      - List[str] / Tuple / Set    -> defensive: scoring is called from
+                                      many paths; some bypass the engine
+      - "key:value" tags           -> both the full tag AND the bare key
+                                      are added so callers can match
+                                      against bare static tag sets
+
+    Returns a set even on error so callers can safely intersect with
+    static tag sets without None checks.
+    """
+    if row is None:
+        return set()
+    raw = row.get("warnings") if isinstance(row, Mapping) else None
+    if raw is None:
+        return set()
+
+    parts: List[str] = []
+    if isinstance(raw, str):
+        for piece in raw.split(";"):
+            s = piece.strip()
+            if s:
+                parts.append(s)
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        for item in raw:
+            if item is None:
+                continue
+            try:
+                s = str(item).strip()
+            except Exception:
+                continue
+            if s:
+                parts.append(s)
+    else:
+        try:
+            s = str(raw).strip()
+        except Exception:
+            s = ""
+        if s:
+            parts.append(s)
+
+    out: Set[str] = set()
+    for p in parts:
+        out.add(p)
+        if ":" in p:
+            bare = p.split(":", 1)[0].strip()
+            if bare:
+                out.add(bare)
+    return out
+
+
+def _provider_error_from_row(row: Mapping[str, Any]) -> str:
+    """
+    v7.0.0 Phase A: extract the row's last_error_class with null-string
+    filtering. Returns the error-class string if it's a real value, or
+    "" if the field is missing, empty, or a null-like string. Mirrors
+    the filtering used by scoring.py v5.2.5 Phase L.
+
+    The null-string filter prevents `_safe_str(None)` (which returns
+    the literal string "None") from being treated as a real error.
+    """
+    if not isinstance(row, Mapping):
+        return ""
+    for key in ("last_error_class", "lastErrorClass", "errorClass", "error_class"):
+        raw = row.get(key)
+        if raw is None:
+            continue
+        s = _safe_str(raw)
+        if not s:
+            continue
+        if s.lower() in _PROVIDER_ERROR_NULL_STRINGS:
+            continue
+        return s
+    return ""
+
+
+def _row_has_engine_dropped_valuation(row: Mapping[str, Any]) -> bool:
+    """
+    v7.0.0 Phase A: True when the row's warnings contain any of the
+    engine-applied valuation-drop tags (data_engine_v2 v5.60.0
+    Phase H / I / P). Mirrors scoring.py v5.2.5
+    `_row_engine_dropped_valuation`.
+
+    Note: this returns True regardless of whether `intrinsic_value` is
+    currently None or populated. The Data Quality Alerts section uses
+    it to flag the row; downstream logic in scoring already handles
+    the "missing intrinsic" case separately.
+    """
+    if not isinstance(row, Mapping):
+        return False
+    tags = _warning_tags_from_row(row)
+    if not tags:
+        return False
+    return bool(tags & _ENGINE_DROPPED_VALUATION_TAGS)
+
+
+def _row_is_forecast_unavailable(row: Mapping[str, Any]) -> bool:
+    """
+    v7.0.0 Phase I: True when the row's `forecast_unavailable` bool
+    flag is set OR its warnings string contains an unforecastable tag.
+    Defense in depth: engine v5.60.0 Phase B sets both, but a
+    downstream merge could drop one while preserving the other.
+    """
+    if not isinstance(row, Mapping):
+        return False
+    # Bool flag path
+    for key in ("forecast_unavailable", "is_forecast_unavailable"):
+        if _to_bool(row.get(key), False):
+            return True
+    # Warning tag path
+    tags = _warning_tags_from_row(row)
+    if tags and (tags & _ENGINE_UNFORECASTABLE_TAGS):
+        return True
+    return False
+
+
+def _engine_drop_tags_from_row(row: Mapping[str, Any]) -> List[str]:
+    """
+    v7.0.0 Phase A: return the sorted list of engine-dropped-valuation
+    tags present in the row's warnings, or [] if none.
+    """
+    if not isinstance(row, Mapping):
+        return []
+    matching = _warning_tags_from_row(row) & _ENGINE_DROPPED_VALUATION_TAGS
+    return sorted(matching)
+
+
+def _forecast_skip_tags_from_row(row: Mapping[str, Any]) -> List[str]:
+    """
+    v7.0.0 Phase A: return the sorted list of engine-unforecastable
+    tags present in the row's warnings, or [] if none. The bool flag
+    contributes a synthetic "forecast_unavailable" tag for symmetry.
+    """
+    if not isinstance(row, Mapping):
+        return []
+    matching = list(_warning_tags_from_row(row) & _ENGINE_UNFORECASTABLE_TAGS)
+    # If only the bool is set (no warning tag), surface a synthetic tag.
+    if not matching:
+        for key in ("forecast_unavailable", "is_forecast_unavailable"):
+            if _to_bool(row.get(key), False):
+                matching.append("forecast_unavailable")
+                break
+    return sorted(set(matching))
+
+
+def _extract_scoring_enrichment(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """
+    v7.0.0 Phase B: pull scoring v5.2.5 enrichment fields from a row
+    into a normalized dict for Top Picks formatting.
+
+    Returns a dict with keys:
+      - conviction:        float or None
+      - top_factors:       str (may be empty)
+      - top_risks:         str (may be empty)
+      - position_size_hint: str (may be empty)
+
+    All four are produced by scoring.py v5.2.5 via insights_builder's
+    upstream callers (`build_insights`, `enrich_rows_with_insights`).
+    """
+    if not isinstance(row, Mapping):
+        return {
+            "conviction": None,
+            "top_factors": "",
+            "top_risks": "",
+            "position_size_hint": "",
+        }
+    return {
+        "conviction": _as_float(row.get("conviction_score")),
+        "top_factors": _safe_str(row.get("top_factors")),
+        "top_risks": _safe_str(row.get("top_risks")),
+        "position_size_hint": _safe_str(row.get("position_size_hint")),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +888,7 @@ def get_insights_schema() -> Tuple[List[str], List[str], str]:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
         spec = get_sheet_spec("Insights_Analysis")
         headers, keys = _extract_columns_from_spec(spec)
-        # Registry v2.5.0 expects 7 columns; accept anything ≥6 to be tolerant.
+        # Registry v2.5.0 expects 7 columns; accept anything >=6 to be tolerant.
         if headers and keys and len(headers) == len(keys) and len(keys) >= 6:
             return headers, keys, "schema_registry.get_sheet_spec"
     except Exception as exc:
@@ -694,6 +1047,8 @@ def _normalize_criteria(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "include_risk_scenarios": _to_bool(c.get("include_risk_scenarios", True), True),
         "include_short_term": _to_bool(c.get("include_short_term", True), True),
         "include_macro_signals": _to_bool(c.get("include_macro_signals", True), True),
+        # v7.0.0 Phase A: NEW section flag (default True)
+        "include_data_quality_alerts": _to_bool(c.get("include_data_quality_alerts", True), True),
     }
 
 
@@ -717,7 +1072,7 @@ def _criteria_summary(criteria: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Row Builder (v6.0.0: schema-correct, no data loss)
+# Row Builder (v6.0.0: schema-correct, no data loss; preserved verbatim)
 # ---------------------------------------------------------------------------
 
 def _format_notes_with_markers(notes: str, signal: str, priority: str) -> str:
@@ -763,7 +1118,7 @@ def _make_row(
     """
     Build a row dict aligned with the current schema keys.
 
-    v6.0.0 fixes two production bugs:
+    v6.0.0 fixes two production bugs (preserved verbatim in v7.0.0):
 
     1. TIMESTAMP KEY MISMATCH:
        v5.0.0 wrote the timestamp under `as_of_riyadh` only, but the
@@ -910,7 +1265,7 @@ def build_criteria_rows(
 
 
 # ---------------------------------------------------------------------------
-# Engine Integration (Async with real timeouts)
+# Engine Integration (Async with real timeouts; preserved from v5.0.0)
 # ---------------------------------------------------------------------------
 
 async def _maybe_await(obj: Any) -> Any:
@@ -1176,7 +1531,44 @@ async def _fetch_top10_symbols(
 
 
 # ---------------------------------------------------------------------------
-# Section Builders (unchanged from v5.0.0 except _make_row routing fix)
+# v7.0.0 Phase G — Recommendation -> signal token mapping (refined)
+# ---------------------------------------------------------------------------
+
+def _reco_to_signal(recommendation: str) -> str:
+    """
+    v7.0.0 Phase G (vs v6.0.0): return the finer-grained 5-tier
+    signal token directly so Top Picks notes can distinguish
+    STRONG_BUY from BUY and REDUCE from SELL.
+
+    Mapping:
+      STRONG_BUY -> "STRONG_BUY"  (was "BUY" in v6.0.0)
+      BUY        -> "BUY"
+      HOLD       -> "HOLD"
+      REDUCE     -> "REDUCE"      (was "SELL" in v6.0.0)
+      SELL       -> "SELL"
+      unknown    -> "HOLD"        (safe default)
+
+    Other section builders (`_build_macro_signal_rows`,
+    `_build_portfolio_kpis_rows`) use `_SIGNAL_UP` / `_SIGNAL_DOWN`
+    directly and are NOT affected — those constants are preserved
+    verbatim.
+    """
+    r = _safe_str(recommendation).upper()
+    if r == "STRONG_BUY":
+        return _SIGNAL_STRONG_UP
+    if r == "BUY":
+        return _SIGNAL_UP
+    if r == "REDUCE":
+        return _SIGNAL_REDUCE
+    if r == "SELL":
+        return _SIGNAL_DOWN
+    if r == "HOLD":
+        return _SIGNAL_NEUTRAL
+    return _SIGNAL_NEUTRAL
+
+
+# ---------------------------------------------------------------------------
+# Section Builders (preserved from v6.0.0 except where noted)
 # ---------------------------------------------------------------------------
 
 def _build_universe_snapshot_rows(
@@ -1185,7 +1577,13 @@ def _build_universe_snapshot_rows(
     symbols: List[str],
     quotes: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Build Market Summary rows for one universe."""
+    """
+    Build Market Summary rows for one universe.
+
+    v7.0.0 Phase F: adds a "Data Quality" coverage row showing
+    clean-vs-flagged counts per universe (complements Phase A's
+    aggregate Data Quality Alerts section).
+    """
     rows: List[Dict[str, Any]] = []
 
     rows.append(_make_row(
@@ -1210,6 +1608,36 @@ def _build_universe_snapshot_rows(
         notes="Symbols with percent_change available",
         last_updated_riyadh=ctx.ts,
     ))
+
+    # v7.0.0 Phase F: per-universe data quality breakdown
+    if quotes:
+        flagged = 0
+        for d in quotes.values():
+            if (
+                _provider_error_from_row(d)
+                or _row_has_engine_dropped_valuation(d)
+                or _row_is_forecast_unavailable(d)
+            ):
+                flagged += 1
+        clean = len(quotes) - flagged
+        if flagged > 0:
+            signal = _SIGNAL_WARN
+            priority = _PRI_MEDIUM if flagged * 4 >= len(quotes) else _PRI_LOW
+            notes_text = (
+                f"{clean}/{len(quotes)} symbol(s) with clean data; "
+                f"{flagged} flagged (see Data Quality Alerts section)"
+            )
+        else:
+            signal = _SIGNAL_OK
+            priority = _PRI_LOW
+            notes_text = f"All {len(quotes)} symbol(s) reporting clean data"
+        rows.append(_make_row(
+            keys=ctx.keys, section=section_name, item="Data Quality",
+            metric="data_quality_clean_count", value=f"{clean}/{len(quotes)}",
+            signal=signal, priority=priority,
+            notes=notes_text,
+            last_updated_riyadh=ctx.ts,
+        ))
 
     # Movers
     movers = [(s, pc) for s, d in quotes.items()
@@ -1373,6 +1801,178 @@ def _build_risk_alert_rows(
             symbol=sym, metric="caution_flag", value="Caution",
             signal=_SIGNAL_ALERT, priority=priority,
             notes=reason, last_updated_riyadh=ctx.ts,
+        ))
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# v7.0.0 Phase A — NEW SECTION: Data Quality Alerts
+# ---------------------------------------------------------------------------
+
+def _build_data_quality_rows(
+    ctx: BuildContext,
+    quotes: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    v7.0.0 Phase A: NEW section -- surface provider errors and engine-
+    applied warning tags from the quote rows.
+
+    Scans all quotes for three categories of upstream issue:
+      1. PROVIDER ERROR -- `last_error_class` non-empty (preserved
+         through engine v5.60.0 Phase Q from eodhd v4.7.3 / yahoo
+         providers v6.1.0+v8.2.0). Common values: "RateLimited",
+         "AuthError", "IpBlocked", "NotFound", "NetworkError",
+         "InvalidPayload", "FetchError", "InvalidSymbol",
+         "MissingApiKey", "KsaBlocked".
+
+      2. ENGINE-DROPPED VALUATION -- `warnings` contains one of
+         _ENGINE_DROPPED_VALUATION_TAGS (Phase H/I/P of
+         data_engine_v2 v5.60.0 cleared intrinsic_value and/or
+         upside_pct due to unit-mismatch or synthesizer-overshoot
+         detection).
+
+      3. FORECAST UNAVAILABLE -- either the `forecast_unavailable`
+         bool flag is set OR warnings contains one of
+         _ENGINE_UNFORECASTABLE_TAGS (delisted / stale / no fair
+         value / forecast cleared by consistency sweep).
+
+    Emits:
+      - One summary row with the aggregate count.
+      - Up to 6 per-symbol rows for each of the three categories,
+        sorted alphabetically by symbol for deterministic output.
+
+    Returns [] if `quotes` is empty (early exit).
+    """
+    rows: List[Dict[str, Any]] = []
+    if not quotes:
+        return rows
+
+    # Scan all quotes once, partitioning into the three categories.
+    provider_errors: List[Tuple[str, str]] = []   # (symbol, error_class)
+    engine_drops: List[Tuple[str, str]] = []      # (symbol, tag_str)
+    forecast_skips: List[Tuple[str, str]] = []    # (symbol, tag_str)
+
+    for sym, d in quotes.items():
+        err_class = _provider_error_from_row(d)
+        if err_class:
+            provider_errors.append((sym, err_class))
+
+        drop_tags = _engine_drop_tags_from_row(d)
+        if drop_tags:
+            engine_drops.append((sym, ", ".join(drop_tags)))
+
+        # Distinct from drop: a row can be both engine-dropped AND
+        # forecast-unavailable. We report both so audit captures the
+        # full picture.
+        skip_tags = _forecast_skip_tags_from_row(d)
+        if skip_tags:
+            forecast_skips.append((sym, ", ".join(skip_tags)))
+
+    affected_symbols: Set[str] = (
+        {s for s, _ in provider_errors}
+        | {s for s, _ in engine_drops}
+        | {s for s, _ in forecast_skips}
+    )
+
+    # Summary row — always emit so the section is always present (clean
+    # or otherwise).
+    if not affected_symbols:
+        rows.append(_make_row(
+            keys=ctx.keys, section="Data Quality Alerts", item="Summary",
+            metric="data_quality_status", value="Clean",
+            signal=_SIGNAL_OK, priority=_PRI_LOW,
+            notes=(
+                f"No provider errors or engine-dropped fields across "
+                f"{len(quotes)} symbol(s) scanned"
+            ),
+            last_updated_riyadh=ctx.ts,
+        ))
+        return rows
+
+    total_affected = len(affected_symbols)
+    # Priority: HIGH when >10 symbols affected OR any provider error
+    # (provider errors are more actionable than engine drops).
+    has_provider_errors = bool(provider_errors)
+    summary_priority = (
+        _PRI_HIGH if (total_affected > 10 or has_provider_errors)
+        else _PRI_MEDIUM
+    )
+
+    rows.append(_make_row(
+        keys=ctx.keys, section="Data Quality Alerts", item="Summary",
+        metric="affected_symbol_count", value=total_affected,
+        signal=_SIGNAL_ALERT, priority=summary_priority,
+        notes=(
+            f"{len(provider_errors)} provider error(s) | "
+            f"{len(engine_drops)} engine-dropped valuation(s) | "
+            f"{len(forecast_skips)} forecast skip(s) "
+            f"across {total_affected} symbol(s)"
+        ),
+        last_updated_riyadh=ctx.ts,
+    ))
+
+    # Per-symbol provider error rows (top 6 by symbol, deduped via set)
+    seen_provider: Set[Tuple[str, str]] = set()
+    for sym, err_class in sorted(provider_errors):
+        key = (sym, err_class)
+        if key in seen_provider:
+            continue
+        seen_provider.add(key)
+        if len(seen_provider) > 6:
+            break
+        rows.append(_make_row(
+            keys=ctx.keys, section="Data Quality Alerts",
+            item=f"Provider Error -- {sym}",
+            symbol=sym, metric="last_error_class", value=err_class,
+            signal=_SIGNAL_ALERT, priority=_PRI_HIGH,
+            notes=(
+                f"Symbol last fetched via fallback after upstream "
+                f"`{err_class}`. Data may be from secondary provider."
+            ),
+            last_updated_riyadh=ctx.ts,
+        ))
+
+    # Per-symbol engine-drop rows (top 6 by symbol)
+    seen_drops: Set[Tuple[str, str]] = set()
+    for sym, tag_str in sorted(engine_drops):
+        key = (sym, tag_str)
+        if key in seen_drops:
+            continue
+        seen_drops.add(key)
+        if len(seen_drops) > 6:
+            break
+        rows.append(_make_row(
+            keys=ctx.keys, section="Data Quality Alerts",
+            item=f"Engine Dropped -- {sym}",
+            symbol=sym, metric="engine_dropped_field", value=tag_str,
+            signal=_SIGNAL_ALERT, priority=_PRI_MEDIUM,
+            notes=(
+                "Engine cleared intrinsic_value / upside_pct upstream "
+                "(unit-mismatch or synthesizer-overshoot detection)"
+            ),
+            last_updated_riyadh=ctx.ts,
+        ))
+
+    # Per-symbol forecast-skip rows (top 6 by symbol)
+    seen_skips: Set[Tuple[str, str]] = set()
+    for sym, tag_str in sorted(forecast_skips):
+        key = (sym, tag_str)
+        if key in seen_skips:
+            continue
+        seen_skips.add(key)
+        if len(seen_skips) > 6:
+            break
+        rows.append(_make_row(
+            keys=ctx.keys, section="Data Quality Alerts",
+            item=f"Forecast Unavailable -- {sym}",
+            symbol=sym, metric="forecast_unavailable_tag", value=tag_str,
+            signal=_SIGNAL_ALERT, priority=_PRI_MEDIUM,
+            notes=(
+                "Forecast synthesis skipped upstream "
+                "(delisted / stale / no fair value / consistency sweep)"
+            ),
+            last_updated_riyadh=ctx.ts,
         ))
 
     return rows
@@ -1685,23 +2285,6 @@ def _build_macro_signal_rows(
     return rows
 
 
-def _reco_to_signal(recommendation: str) -> str:
-    """
-    v6.0.0: map a 5-tier recommendation token to a row-level signal.
-
-    Mapping:
-      STRONG_BUY / BUY  -> _SIGNAL_UP   ("BUY")
-      SELL / REDUCE     -> _SIGNAL_DOWN ("SELL")
-      HOLD / unknown    -> _SIGNAL_NEUTRAL ("HOLD")
-    """
-    r = _safe_str(recommendation).upper()
-    if r in _BULLISH_RECOS:
-        return _SIGNAL_UP
-    if r in _BEARISH_RECOS:
-        return _SIGNAL_DOWN
-    return _SIGNAL_NEUTRAL
-
-
 def _build_top_picks_rows(
     ctx: BuildContext,
     top10_payload: Dict[str, Any],
@@ -1710,9 +2293,16 @@ def _build_top_picks_rows(
     """
     Build Top Picks section rows from top10 payload.
 
-    v6.0.0: signal mapping recognises full v7.0.0 5-tier vocabulary
-    (STRONG_BUY/BUY -> BUY signal, SELL/REDUCE -> SELL signal,
-    HOLD -> neutral).
+    v7.0.0 changes (vs v6.0.0):
+      Phase B: surface scoring v5.2.5 enrichment when available:
+        - conviction_score   -> separate "Conviction" context row
+        - top_factors        -> in main row notes as "++<list>"
+        - top_risks          -> in main row notes as "--<list>"
+        - position_size_hint -> separate "Position Size" context row
+      Phase G: `_reco_to_signal` now returns finer 5-tier tokens
+        (STRONG_BUY / BUY / HOLD / REDUCE / SELL) directly.
+      Phase I: rows with engine `forecast_unavailable*` flag/tag get
+        explicit "forecast_unavailable_upstream" mention in notes.
     """
     rows: List[Dict[str, Any]] = []
     top_rows = _coerce_to_rows(top10_payload)
@@ -1746,18 +2336,57 @@ def _build_top_picks_rows(
             priority = _PRI_HIGH if i <= 3 else (_PRI_MEDIUM if i <= 7 else _PRI_LOW)
             signal = _reco_to_signal(recommendation)
 
-            note = f"Reco={recommendation}" if recommendation else ""
+            # v7.0.0 Phase B: scoring enrichment
+            enr = _extract_scoring_enrichment(d)
+            note_parts: List[str] = []
+            if recommendation:
+                note_parts.append(f"reco={recommendation}")
             if name and name != sym:
-                note = f"{note} | {name}" if note else name
+                note_parts.append(name)
+            if enr["conviction"] is not None:
+                note_parts.append(f"conv={enr['conviction']:.0f}")
+            if enr["top_factors"]:
+                note_parts.append(f"++{enr['top_factors']}")
+            if enr["top_risks"]:
+                note_parts.append(f"--{enr['top_risks']}")
+
+            # v7.0.0 Phase I: forecast-unavailable flag
+            if _row_is_forecast_unavailable(d):
+                note_parts.append("forecast_unavailable_upstream")
 
             rows.append(_make_row(
                 keys=ctx.keys, section="Top Picks", item=f"#{i} {sym}",
                 symbol=sym, metric="expected_roi_3m",
                 value=_format_percent(roi_3m) if roi_3m is not None else recommendation,
                 signal=signal, priority=priority,
-                notes=note or "Top pick",
+                notes=" | ".join(note_parts) if note_parts else "Top pick",
                 last_updated_riyadh=ctx.ts,
             ))
+
+            # v7.0.0 Phase B: dedicated context rows for scoring enrichment
+            if enr["conviction"] is not None:
+                rows.append(_make_row(
+                    keys=ctx.keys, section="Top Picks Context",
+                    item=f"#{i} Conviction", symbol=sym,
+                    metric="conviction_score",
+                    value=round(enr["conviction"], 1),
+                    priority=_PRI_LOW,
+                    notes=(
+                        "Scoring conviction (0-100). High conviction = "
+                        "view conjunction + data completeness aligned"
+                    ),
+                    last_updated_riyadh=ctx.ts,
+                ))
+            if enr["position_size_hint"]:
+                rows.append(_make_row(
+                    keys=ctx.keys, section="Top Picks Context",
+                    item=f"#{i} Position Size", symbol=sym,
+                    metric="position_size_hint",
+                    value=enr["position_size_hint"],
+                    priority=_PRI_LOW,
+                    notes="Suggested position size from scoring insights",
+                    last_updated_riyadh=ctx.ts,
+                ))
         return rows
 
     # Full-payload path
@@ -1792,6 +2421,9 @@ def _build_top_picks_rows(
         overall = raw.get("overall_score")
         risk_bucket = _safe_str(raw.get("risk_bucket"))
 
+        # v7.0.0 Phase B: scoring v5.2.5 enrichment
+        enr = _extract_scoring_enrichment(raw)
+
         note_parts: List[str] = []
         if name:
             note_parts.append(name)
@@ -1799,12 +2431,22 @@ def _build_top_picks_rows(
             note_parts.append(f"reco={recommendation}")
         if confidence is not None:
             note_parts.append(f"conf={_format_percent(confidence)}")
+        if enr["conviction"] is not None:
+            note_parts.append(f"conv={enr['conviction']:.0f}")
         if risk_bucket:
             note_parts.append(f"risk={risk_bucket}")
+        if enr["top_factors"]:
+            note_parts.append(f"++{enr['top_factors']}")
+        if enr["top_risks"]:
+            note_parts.append(f"--{enr['top_risks']}")
         if selection_reason:
             note_parts.append(f"why={selection_reason}")
         elif recommendation_reason:
             note_parts.append(f"why={recommendation_reason}")
+
+        # v7.0.0 Phase I: forecast-unavailable flag
+        if _row_is_forecast_unavailable(raw):
+            note_parts.append("forecast_unavailable_upstream")
 
         priority = _PRI_HIGH if rank <= 3 else (_PRI_MEDIUM if rank <= 7 else _PRI_LOW)
         signal = _reco_to_signal(recommendation)
@@ -1824,6 +2466,32 @@ def _build_top_picks_rows(
                 item=f"#{rank} Overall Score", symbol=sym,
                 metric="overall_score", value=overall,
                 notes=f"Rank={rank}" + (f" | {name}" if name else ""),
+                last_updated_riyadh=ctx.ts,
+            ))
+
+        # v7.0.0 Phase B: dedicated context rows for scoring enrichment
+        if enr["conviction"] is not None:
+            rows.append(_make_row(
+                keys=ctx.keys, section="Top Picks Context",
+                item=f"#{rank} Conviction", symbol=sym,
+                metric="conviction_score",
+                value=round(enr["conviction"], 1),
+                priority=_PRI_LOW,
+                notes=(
+                    "Scoring conviction (0-100). Reflects view conjunction "
+                    "+ forecast confidence + data completeness"
+                ),
+                last_updated_riyadh=ctx.ts,
+            ))
+
+        if enr["position_size_hint"]:
+            rows.append(_make_row(
+                keys=ctx.keys, section="Top Picks Context",
+                item=f"#{rank} Position Size", symbol=sym,
+                metric="position_size_hint",
+                value=enr["position_size_hint"],
+                priority=_PRI_LOW,
+                notes="Suggested position size from scoring insights",
                 last_updated_riyadh=ctx.ts,
             ))
 
@@ -1920,7 +2588,16 @@ async def build_insights_analysis_rows(
     top10_timeout_sec: float = _DEFAULT_TOP10_TIMEOUT_SEC,
     build_budget_sec: float = _DEFAULT_BUILD_BUDGET_SEC,
 ) -> Dict[str, Any]:
-    """Build Insights_Analysis page rows."""
+    """
+    Build Insights_Analysis page rows.
+
+    v7.0.0: section ordering preserved from v6.0.0 with the new
+    "Data Quality Alerts" section inserted between Risk Alerts and
+    Short-Term Opportunities. The aggregate data-quality summary is
+    placed where operators see it after the action-oriented sections
+    (Top Picks, Risk Alerts) but before the diagnostic detail
+    sections (Short-Term, Portfolio KPIs).
+    """
     headers, keys, schema_source = get_insights_schema()
     timestamp = _now_riyadh_iso()
     norm_criteria = _normalize_criteria(criteria)
@@ -1930,6 +2607,7 @@ async def build_insights_analysis_rows(
     do_market_summary = norm_criteria.get("include_market_summary", True)
     do_top_picks = include_top10_section and norm_criteria.get("include_top_opportunities", True)
     do_risk_alerts = True  # always on; cheap
+    do_data_quality = norm_criteria.get("include_data_quality_alerts", True)  # v7.0.0 Phase A
     do_short_term = norm_criteria.get("include_short_term", True)
     do_portfolio_kpis = include_portfolio_kpis and norm_criteria.get("include_portfolio_health", True)
     do_risk_scenarios = norm_criteria.get("include_risk_scenarios", True)
@@ -1949,7 +2627,10 @@ async def build_insights_analysis_rows(
             keys=keys, section="System", item="Builder Version",
             metric="insights_builder_version", value=INSIGHTS_BUILDER_VERSION,
             priority=_PRI_LOW,
-            notes=f"core/analysis/insights_builder.py v{INSIGHTS_BUILDER_VERSION} -- 7-col schema (registry v2.5.0)",
+            notes=(
+                f"core/analysis/insights_builder.py v{INSIGHTS_BUILDER_VERSION} -- "
+                f"7-col schema (registry v2.5.0) + cross-stack signal enrichment"
+            ),
             last_updated_riyadh=timestamp,
         ))
 
@@ -2095,6 +2776,12 @@ async def build_insights_analysis_rows(
     if do_risk_alerts and ctx.all_quotes:
         rows.extend(_build_risk_alert_rows(ctx, ctx.all_quotes))
 
+    # v7.0.0 Phase A: NEW Data Quality Alerts section
+    # Placed after Risk Alerts (the other "things to worry about" section)
+    # and before the diagnostic detail sections (Short-Term, Portfolio).
+    if do_data_quality and ctx.all_quotes:
+        rows.extend(_build_data_quality_rows(ctx, ctx.all_quotes))
+
     # Short-Term Opportunities
     if do_short_term and ctx.all_quotes:
         rows.extend(_build_short_term_rows(ctx, ctx.all_quotes))
@@ -2160,8 +2847,13 @@ async def build_insights_analysis_rows(
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    # v7.0.0 Phase H: __version__ alias (in addition to legacy
+    # INSIGHTS_BUILDER_VERSION for backward compatibility).
     "INSIGHTS_BUILDER_VERSION",
+    "__version__",
+    # Schema accessors
     "get_insights_schema",
+    # Public builders
     "build_criteria_rows",
     "build_insights_analysis_rows",
 ]
