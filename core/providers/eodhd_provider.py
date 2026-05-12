@@ -2,9 +2,77 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.9.0 (PER-FAILURE PROVIDER-UNHEALTHY SIGNAL + CIRCUIT BREAKER
-                          + HEALTH PROBE + SESSION COUNTERS +
-                          MAY 2026 / v2.8.0 FAMILY ALIGNMENT)
+EODHD Provider — v4.9.1 (ENGINE PICK-ORDER FIX + PER-FAILURE PROVIDER-UNHEALTHY
+                          SIGNAL + CIRCUIT BREAKER + HEALTH PROBE + SESSION
+                          COUNTERS + MAY 2026 / v2.8.0 FAMILY ALIGNMENT)
+================================================================================
+
+v4.9.1 — ENGINE PICK-ORDER FIX (May 12, 2026)
+-----------------------------------------------------------------------
+v4.9.0 added `provider_unhealthy:eodhd` to every auth-class error patch
+via `_build_error_patch_with_geo`. Post-deploy verification confirmed
+those markers are NEVER appearing in production sheet rows or in
+`/v1/schema/provider-health.total_observations` — even though the
+provider is clearly producing the markers in its error patches.
+
+Root cause: engine v5.61.0's `_fetch_patch` discovers a provider's
+callable via `_pick_provider_callable` with this preference order:
+
+    ("get_quote_patch", "fetch_quote", "get_quote", "fetch_patch")
+
+eodhd_provider does NOT define `get_quote_patch`, so the engine falls
+through to `fetch_quote`. The module-level `fetch_quote` is a thin
+wrapper around `quote()` which **raises RuntimeError on err**:
+
+    async def quote(symbol):
+        patch, err = await client.fetch_quote(symbol)
+        if err:
+            raise RuntimeError(err)   # ← discards the error patch
+        return patch
+
+The engine catches the exception and returns None:
+
+    try:
+        patch = await _call_maybe_async(fn, symbol)
+    except Exception as exc:
+        await self.providers.record_failure(provider_name, str(exc))
+        return None   # ← engine never sees the v4.9.0 marker
+
+So the marker is correctly emitted by `_build_error_patch_with_geo`
+and travels through `client.fetch_quote` → `client.fetch_quote_patch`
+intact, but the engine never calls `fetch_quote_patch`. It calls the
+raising variant and the patch is thrown on the floor.
+
+This also explains the cross-provider asymmetry observed in production:
+yahoo's failure warnings (`quote:SYMBOL:HTTP 403`) DO surface on the
+sheet because yahoo_provider exposes `get_quote_patch` (which the
+engine matches first). eodhd's failures don't surface because the
+engine's first matching name (`fetch_quote`) raises instead.
+
+v4.9.1 closes the gap with a single-line behavioral change:
+
+  AL  NEW module-level `get_quote_patch(symbol, ...)` alias.
+       Routes to the existing `fetch_quote_patch` so engine's
+       `_pick_provider_callable` will match `get_quote_patch` first
+       (its preferred name) and receive the error patch with the
+       v4.9.0 `provider_unhealthy:eodhd` marker intact. Added to
+       `__all__`. No behavioral change to any existing function —
+       `fetch_quote` / `quote` / `get_quote` still raise on err
+       (their historical contract is preserved).
+
+  AM  Runtime log tags bumped `[eodhd v4.9.0]` -> `[eodhd v4.9.1]`.
+
+  AN  Version bumps: PROVIDER_VERSION="4.9.1", UA_DEFAULT updated,
+       file section header updated.
+
+[PRESERVED — strictly] All v4.9.0 / v4.8.0 / v4.7.x / v4.6.0 behavior,
+signatures, env vars, cache keys, schema fields, alias mappings, method
+names, AND the v4.8.0 circuit-breaker state machine + thresholds +
+half_open probe + diagnose_health() + get_provider_stats(). v4.9.1 is
+PURELY ADDITIVE: a single new function `get_quote_patch` plus version
+bumps. Public API surface unchanged (extension only). No removals from
+__all__; one addition.
+
 ================================================================================
 
 v4.9.0 — PER-FAILURE PROVIDER-UNHEALTHY SIGNAL (May 12, 2026)
@@ -570,11 +638,11 @@ def _build_error_patch_with_geo(
 # v4.9.0 — Constants and version
 # =============================================================================
 
-PROVIDER_VERSION = "4.9.0"
+PROVIDER_VERSION = "4.9.1"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
-UA_DEFAULT = "TFB-EODHD/4.9.0 (Render)"
+UA_DEFAULT = "TFB-EODHD/4.9.1 (Render)"
 
 try:
     import orjson  # type: ignore
@@ -826,7 +894,7 @@ class _ProviderHealth:
             if self._state in ("open", "half_open"):
                 self._state = "closed"
                 self._opened_at = None
-                logger.info("[eodhd v4.9.0] circuit_breaker closed after successful request")
+                logger.info("[eodhd v4.9.1] circuit_breaker closed after successful request")
 
     async def record_failure(self, error_class: str) -> None:
         """
@@ -861,7 +929,7 @@ class _ProviderHealth:
                 self._state = "open"
                 self._opened_at = now
                 logger.warning(
-                    "[eodhd v4.9.0] circuit_breaker re-opened: "
+                    "[eodhd v4.9.1] circuit_breaker re-opened: "
                     "half_open probe failed with %s", error_class,
                 )
                 return
@@ -873,7 +941,7 @@ class _ProviderHealth:
                 self._state = "open"
                 self._opened_at = now
                 logger.error(
-                    "[eodhd v4.9.0] circuit_breaker OPEN: "
+                    "[eodhd v4.9.1] circuit_breaker OPEN: "
                     "consecutive_auth=%d consecutive_ip=%d threshold=%d "
                     "(EODHD provider unhealthy — verify EODHD_API_KEY env var)",
                     self._consecutive_auth, self._consecutive_ip, threshold,
@@ -1899,7 +1967,7 @@ class EODHDClient:
                         warnings_list.append("eps_ttm_fallback_used")
                     else:
                         logger.debug(
-                            "[eodhd v4.9.0] eps_ttm fallback rejected for %s: "
+                            "[eodhd v4.9.1] eps_ttm fallback rejected for %s: "
                             "computed=%.4f outside bounds [%.1f, %.1f] (likely units mismatch)",
                             sym, candidate, _EPS_FALLBACK_FLOOR, _EPS_FALLBACK_CEILING,
                         )
@@ -2522,6 +2590,29 @@ async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str,
     return await client.fetch_quote_patch(symbol, *args, **kwargs)
 
 
+async def get_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """
+    v4.9.1 AL: Module-level alias for `fetch_quote_patch`.
+
+    Engine v5.61.0's `_fetch_patch` discovers provider callables via
+    `_pick_provider_callable` with this preference order:
+
+        ("get_quote_patch", "fetch_quote", "get_quote", "fetch_patch")
+
+    Prior to v4.9.1, eodhd_provider did not define `get_quote_patch`,
+    so the engine fell through to `fetch_quote` (which raises
+    RuntimeError on err and discards the v4.9.0 `provider_unhealthy:
+    eodhd` marker built by `_build_error_patch_with_geo`). This alias
+    aligns eodhd_provider with the engine's preferred name so the
+    engine receives the error patch with the marker intact.
+
+    No behavioral change to `fetch_quote` / `quote` / `get_quote` —
+    their historical raise-on-err contract is preserved for any
+    external caller that depends on it.
+    """
+    return await fetch_quote_patch(symbol, *args, **kwargs)
+
+
 async def fetch_history(symbol: str, days: Optional[int] = None, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
     client = await get_client()
     return await client.fetch_history(symbol, days=days, *args, **kwargs)
@@ -2680,11 +2771,13 @@ __all__ = [
     "get_quote",
     "fetch_quote",
     "fetch_quote_patch",
+    # v4.9.1 AL: engine pick-order alias (preferred name `get_quote_patch`).
+    "get_quote_patch",
     "fetch_history",
     "fetch_price_history",
     "fetch_ohlc_history",
     "fetch_quotes",
-    # v4.8.0 (preserved v4.9.0)
+    # v4.8.0 (preserved v4.9.0 / v4.9.1)
     "diagnose_health",
     "get_provider_stats",
 ]
