@@ -2,580 +2,156 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.3.6  (FACTORY-AWAIT BUG FIX — SURGICAL)
+Advanced Analysis Root Owner — v4.1.0
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
-SYMBOL-INJECTION • IDENTITY-MAP • TIER-1-YFINANCE-FALLBACK • DEBUG-FLAGGED
-RUNTIME-AWAITABLE-DETECTION (v4.3.6)
+PROVIDER-HEALTH SURFACE • v5.61.0 / v4.8.0 FAMILY ALIGNMENT
 
-Why v4.3.6 — the binding adapter bug v4.3.5's diagnostic pinpointed
-------------------------------------------------------------------
+WHY v4.1.0 — SURFACE THE ENGINE'S PROVIDER-UNHEALTHY REGISTRY (May 12, 2026)
+---------------------------------------------------------------------------
+v5.61.0 of `core.data_engine_v2` consumes the new `provider_unhealthy:eodhd`
+warning marker from `eodhd_provider v4.8.0`'s circuit breaker and tracks
+which providers are currently being demoted/skipped via a module-level
+registry. The engine's `health()` now returns a `provider_unhealthy_markers`
+snapshot showing which providers are unhealthy and their TTL remaining.
 
-v4.3.5 deployed cleanly and its diagnostic surface worked exactly as
-designed. Production response on `/sheet-rows?sheet=Market_Leaders`
-revealed every one of the 13 candidate signatures raised the
-IDENTICAL error:
+v4.0.0 of this route had no surface for that information — every
+response on `/sheet-rows` carried per-row `warnings` strings but no
+envelope-level signal that the engine had detected a systemic provider
+outage and was routing around it. Operators monitoring `/v1/schema/health`
+saw only `adapter_available: true` regardless of whether the upstream
+data fetch was healthy or in fallback mode.
 
-  "TypeError: object DataEngineV5 can't be used in 'await' expression"
+v4.0.0 also had a second issue blocking any v5.x engine alignment: the
+engine binding cascade tried `core.data_engine` (legacy) BEFORE
+`core.data_engine_v2`. Since the legacy module always imports successfully
+on this deployment, v2 was never reached — meaning even with v5.61.0
+deployed, the route's responses came from the legacy adapter's
+unenriched pipeline. v4.1.0 inverts that preference (v2 first, legacy
+fallback) and uses runtime-awaitable detection so the adapter works
+whether `get_engine` is exported as a sync function (v5.50.0+) or as
+an async factory (older/future builds).
 
-This is not a signature mismatch — it's a single bug in v4.3.1's
-binding adapter. The v4.3.1 docstring assumed `core.data_engine_v2.
-get_engine` was an async factory. It isn't — it's a SYNC function
-that returns the DataEngineV5 instance directly. The adapter:
-
-    async def _v2_engine_factory_adapter(*args, **kwargs):
-        engine = await _v2_get_engine()      # ← bug
-        return await engine.get_sheet_rows(*args, **kwargs)
-
-becomes `await <DataEngineV5_instance>` at line 1, which is the
-exact error every candidate hit before the kwargs even reached
-the engine method.
-
-v4.3.6 changes (from v4.3.5)
+v4.1.0 changes (from v4.0.0)
 ----------------------------
-[FIX-6 BINDING — CRITICAL] `_v2_engine_factory_adapter` and
-    `_v2_engine_ready_adapter` (cold-start fallback path) now use
-    runtime `inspect.isawaitable()` detection on the result of
-    `get_engine()` / `get_engine_if_ready()` / async-factory-fallback,
-    so the adapter works correctly regardless of whether the v2
-    module exports `get_engine` as a sync function (current v5.50.0
-    behavior) or as an async factory (older / future builds).
-
-    Before:
-      engine = await _v2_get_engine()
-    After:
-      raw = _v2_get_engine()
-      engine = await raw if inspect.isawaitable(raw) else raw
-
-    Same shape applied to the cold-start fallback inside
-    `_v2_engine_ready_adapter` for the async-factory backup path.
-
-This is a 6-line behavioral patch. All v4.3.5 work — symbol injection,
-13 candidate signatures, static identity map, Tier-1 yfinance
-fallback, comprehensive diagnostics — preserved verbatim. The bug
-was upstream of all of them; once the engine is reachable, every
-piece of v4.3.5's machinery is already aligned correctly.
-
-Production verification after v4.3.6 deploy
--------------------------------------------
-The same `/sheet-rows?sheet=Market_Leaders&limit=2` request should now
-satisfy:
-
-  1. `meta.dispatch == "advanced_analysis_root"`            (was: fail_soft_*)
-  2. `status == "success"`                                  (was: partial)
-  3. `meta.upstream_call_outcome == "dict"`                 (was: all_signatures_typed_mismatch)
-  4. `meta._symbols_injected_by_route == true`              (preserved from v4.3.5)
-  5. row_objects[0].current_price non-null                  (Aramco real price)
-  6. row_objects[0].recommendation_detailed non-null
-  7. row_objects[0].fundamental_view non-null
-  8. row_objects[0].candlestick_signal non-null
-  9. row_objects[0].data_provider != "placeholder_no_live_data"
-
-If condition 1 holds but 5-9 still fail → the v5.50.0 engine itself
-is broken (separate from this fix). The `meta.upstream_call_summary`
-will now show outcome="dict" on whichever signature won, plus inner
-engine errors if any.
-
-================================================================================
-
-Why v4.3.5 — behavioral fix plus user-visible recovery (PRESERVED)
-------------------------------------------------------------------
-
-v4.3.4 added the diagnostic surface needed to pinpoint exactly why
-`/v1/advanced/sheet-rows` was emitting `dispatch=fail_soft_nonempty`
-with placeholder rows. The expected diagnostic finding:
-
-  * `meta.upstream_call_outcome == "engine_returned_none"` — engine's
-    `get_sheet_rows()` returns None when called without symbols
-    pre-populated in the body. Or
-  * `meta.upstream_call_outcome == "all_signatures_typed_mismatch"` —
-    the v5.50.0 engine method now requires a `symbols=` kwarg that none
-    of v4.3.4's 7 candidate signatures pass explicitly.
-
-Either way, the fix is the same: pre-populate symbols before calling
-the engine, and add candidate signatures that pass `symbols` as an
-explicit kwarg (not just inside `body`).
-
-v4.3.5 changes (from v4.3.4)
-----------------------------
-[FIX-1 BEHAVIORAL — HIGH] `_run_advanced_sheet_rows_impl` now
-    pre-populates `merged_body["symbols"]` BEFORE calling the engine.
-    Order of preference:
-      1. body["symbols"] / body["tickers"] — already user-provided
-      2. EMERGENCY_PAGE_SYMBOLS[page] — sane page-level universe
-      3. None (special pages where symbols don't apply)
-    A new `meta._symbols_injected_by_route` field surfaces in the
-    response when the route had to inject symbols, so deploy logs can
-    confirm the fix is engaging.
-
-[FIX-2 BEHAVIORAL — HIGH] `_call_core_sheet_rows_best_effort`
-    candidate-signature list is expanded from 7 to 13. The 6 new
-    signatures all pass `symbols=symbols_list` as an explicit kwarg
-    or as a positional arg, alongside the existing 7 sheet/limit/offset
-    variants. The new signatures are tried FIRST (they are the most
-    likely to succeed against v5.50.0):
-      * (symbols=L, sheet=P, limit=L, offset=O, mode=M, body=B)
-      * (symbols=L, sheet=P, limit=L, offset=O, mode=M)
-      * (symbols=L, sheet=P, limit=L, offset=O)
-      * (symbols=L, page=P, limit=L, offset=O)
-      * (P, symbols=L, limit=L, offset=O)
-      * (symbols=L, sheet=P)
-
-[FIX-3 TIER-1-FALLBACK — MEDIUM] When the engine fails AND
-    `TFB_ADVANCED_TIER1_FALLBACK=1` is set, placeholder rows are
-    enriched with yfinance `.fast_info` data BEFORE being returned.
-    This populates current_price, previous_close, open, day_high,
-    day_low, week_52_high, week_52_low, market_cap from a known-good
-    source — so users see ACTUAL prices in their sheet even when the
-    full enrichment pipeline is broken. Failure is silent; rows are
-    returned as-is if yfinance is unreachable.
-
-    Default OFF — must be opt-in to avoid network calls during
-    standard operation. Recommended ON during incident response.
-
-[FIX-4 STATIC-IDENTITY-MAP — MEDIUM] `_STATIC_IDENTITY_MAP` provides
-    name/sector/industry/country mapping for ~30 symbols across the
-    page universes. `_placeholder_value_for_key` consults this map
-    BEFORE falling back to symbol-as-name. Result: placeholder rows
-    for AAPL now show "Apple Inc." / "Technology" / "Consumer
-    Electronics" instead of "AAPL" / null / null. Users can still tell
-    the row is a placeholder via the `warnings` field, but the
-    response is no longer functionally useless.
-
-[FIX-5 DEBUG-FLAG] `ADVANCED_ANALYSIS_DEBUG=1` env var elevates this
-    module's logger to DEBUG level. Aligns with the rest of the
-    diagnostic chain (analysis_sheet_rows, advisor, investment_advisor,
-    enriched_quote — all use `*_DEBUG=1` flag).
-
-v4.3.4 logic preserved verbatim
--------------------------------
-- Engine binding cascade (4 patterns: top-level → get_engine() factory
-  → get_engine_if_ready() → legacy)
-- `_call_core_sheet_rows_best_effort` always returns a dict
-  (synthesizes `_call_summary` / `_call_outcome` on failure)
-- `_run_advanced_sheet_rows_impl` UNCONDITIONAL upstream diagnostic
-  capture (call_status / call_outcome / call_summary surfaced even
-  when payload is None)
-- Per-attempt outcome classification (none / dict / list / other_X /
-  raised_TypeError / raised_<other>)
-- Refined dispatch labels (fail_soft_engine_returned_none,
-  fail_soft_all_signatures_typed_mismatch, etc.)
-- Comprehensive WARNING log on every failure mode
-
-================================================================================
-
-Why v4.3.4 — unconditional diagnostic visibility (PRESERVED)
-------------------------------------------------------------
-
-v4.3.3 added upstream diagnostic capture, but the production response
-showed `dispatch=fail_soft_nonempty` with NONE of the v4.3.3
-`upstream_*` fields present in `meta`. The only way that can happen
-is if `upstream_diagnostic_meta` was empty `{}` at merge time, which
-only occurs when `payload` is NOT a dict — i.e. when
-`_call_core_sheet_rows_best_effort` returned `None`.
-
-Re-reading that function exposed the silent-swallow:
-
-  res = core_get_sheet_rows(*args, **kwargs)
-  res = await _maybe_await(res)
-  if isinstance(res, dict): return res, SOURCE
-  if isinstance(res, list): return {"row_objects": res}, SOURCE
-  # ← if res is None / int / string / unexpected — NO return, NO error
-  except TypeError as e: last_err = e; continue
-  except Exception as e: last_err = e; break
-
-If the engine method returns `None` (or any non-dict, non-list value)
-the loop falls through with no `last_err` set. After all 7 candidates,
-`return None, None`. The impl receives `payload=None`,
-`isinstance(payload, dict)` is False, capture skipped, fallback meta
-has no diagnostic. Hence the silence on the wire.
-
-This is the highest-probability explanation: the v5.50.0
-`engine.get_sheet_rows()` method returns `None` (or returns
-quickly-and-emptily) when called without symbols pre-populated in the
-body — exactly the call shape this route uses. The legacy adapter
-worked in v4.2.0 because its own internal post-processing happened to
-synthesize a partial dict from pieces the engine emits even when its
-top-level return is unhelpful.
-
-v4.3.4 changes (from v4.3.3)
-----------------------------
-- FIX: `_call_core_sheet_rows_best_effort` now records EVERY attempt
-    (success / None / unexpected-type / TypeError / other-exception)
-    in a `call_summary` list, and always returns a dict — never
-    `(None, None)`. When all attempts fail with no exception (engine
-    returned None or unexpected types), the function returns:
-        {"status": "error", "error": "engine returned non-dict on all
-         signatures", "row_objects": [], "_call_summary": [...]}
-    so the impl always enters the `isinstance(payload, dict)` branch
-    and the diagnostic capture always runs.
-
-- FIX: `_run_advanced_sheet_rows_impl` now reads the new
-    `_call_summary` field if present and surfaces it in
-    `meta.upstream_call_summary` — wire-visible per-attempt detail
-    of what the engine returned for each signature tried. Each entry
-    records `{"signature_idx": N, "outcome": "<one of: dict|list|none|
-    other_<type>|raised_<class>>", "detail": "<short>"}`.
-
-- FIX: `_run_advanced_sheet_rows_impl` always populates
-    `upstream_diagnostic_meta` with at least an `upstream_call_status`
-    label, even when `payload` is None or non-dict. Possible values:
-    "absent" (payload is None — engine binding broken or no candidates)
-    "non_mapping_<type>" (payload is some other primitive)
-    "dict_with_zero_extractable_rows" (payload is a dict but no rows
-        recognized; full bucket summary still attached as before).
-
-- ADD: WARNING log on every failure mode (not just dict path), with
-    the call_summary text inline so deploy-log readers see what
-    happened without needing to hit the API.
-
-- KEEP: every prior fix preserved unchanged. Matrix extraction,
-    factory binding cascade, 97-col canonical, all v4.2.0/v4.1.0
-    fixes — all intact.
-
-After v4.3.4 deploys, the response meta WILL contain enough info
-to write v4.3.5 as a precise behavioral fix. No more guessing.
-
-Why v4.3.3 — diagnostic visibility through the fallback path
-------------------------------------------------------------
-
-v4.3.2 added matrix-aware row extraction AND an `engine_payload_diagnostic`
-field intended to surface the raw engine payload shape when extraction
-returned 0 rows. The deploy succeeded (binding logs as expected) but the
-data response STILL showed:
-
-  status: "partial", dispatch: "fail_soft_nonempty",
-  data_provider: "placeholder_no_live_data",
-  duration_ms: 1.487
-
-And critically, the `engine_payload_diagnostic` field was MISSING from
-`meta`. Re-reading the impl exposed the bug:
-
-  payload, source = await _call_core_sheet_rows_best_effort(...)
-  if isinstance(payload, dict):
-      normalized = _normalize_external_payload(...)        ← diagnostic captured here
-      if _extract_rows_like(normalized):
-          return normalized                                 ← only returned on success
-  fallback_rows = _build_nonempty_failsoft_rows(...)        ← discards `normalized`
-  return _payload_envelope(..., meta={...})                 ← fresh meta, diagnostic lost
-
-The diagnostic was attached to `normalized.meta`, but the impl only
-returns `normalized` when `_extract_rows_like(normalized)` is truthy.
-On the empty path, `normalized` is discarded and a fresh fallback
-envelope is built — which is why the diagnostic never reached the wire.
-
-v4.3.3 changes (from v4.3.2)
-----------------------------
-- FIX: `_run_advanced_sheet_rows_impl` now CAPTURES the upstream
-    diagnostic before falling through to fallback rows, and merges it
-    into the fallback meta. Exposed fields:
-      * `upstream_payload_type`     — type(payload).__name__
-      * `upstream_payload_top_keys` — first 25 top-level keys
-      * `upstream_status`           — engine-reported status
-      * `upstream_error`            — engine-reported error (if any)
-      * `engine_payload_diagnostic` — bucket type/length summary from v4.3.2
-
-- ADD: explicit WARNING-level log when `_call_core_sheet_rows_best_effort`
-    returns a payload but the route can't extract rows from it. The log
-    line includes the payload top keys and the bucket summary, so we get
-    diagnostic evidence in the Render deploy logs without needing
-    additional API calls.
-
-- ADD: explicit WARNING-level log inside `_call_core_sheet_rows_best_effort`
-    when the engine raises a non-TypeError exception. v4.3.1/4.3.2
-    swallowed those exceptions silently into an `{"status": "error"}`
-    dict and returned, but the swallowed exception text was visible only
-    in the discarded normalized envelope.
-
-- KEEP: every v4.3.2 / v4.3.1 / v4.3.0 fix preserved unchanged. Matrix
-    extraction, v2 binding cascade, 97-col canonical — all intact.
-
-This is purely an observability revision. If v4.3.3's response STILL
-shows `status: partial` (likely), the new fields in `meta` will tell
-us exactly what the engine returned, and the deploy logs will show
-the engine call's exception (if any). With that data in hand we can
-write v4.3.4 as a precise behavioral fix.
-
-Why v4.3.2 — matrix row-extraction parity with legacy adapter
--------------------------------------------------------------
-
-After v4.3.1 deployed successfully (engine bound via `get_engine()` factory,
-visible in startup log and meta.source), the data verification revealed
-that `/v1/advanced/sheet-rows` was returning placeholder rows with all
-v5.50.0 fields null:
-
-  meta.source: "core.data_engine_v2.get_engine().get_sheet_rows"  ✓
-  meta.dispatch: "advanced_analysis_fail_soft_nonempty"           ✗
-  data_provider: "placeholder_no_live_data"                       ✗
-  duration_ms: 1.037                                              ⚡ suspicious
-
-The 1ms response time and `fail_soft_nonempty` dispatch label proved the
-engine was returning a payload but the route was failing to extract any
-rows from it, then falling through to the local placeholder fallback.
-
-Comparing the v4.2.0 path (which DID populate `recommendation_detailed`)
-to the v4.3.1 path (which did NOT) revealed the root cause:
-
-The v5.50.0 engine returns rows in MATRIX form — `payload["rows"]` is a
-list of lists positionally keyed to `payload["keys"]`, not a list of dicts.
-The legacy adapter `core.data_engine.get_sheet_rows` includes a helper
-`_extract_payload_rows` with built-in matrix-to-dicts conversion using
-`_rows_from_matrix(rr, keys_hint)`. v4.3.1 went direct to v2 and bypassed
-that helper, then this route's local `_extract_rows_like` (which only
-recognized list-of-dicts) returned `[]` and the fallback fired.
-
-v4.3.2 changes (from v4.3.1)
-----------------------------
-- FIX [CRITICAL]: add `_rows_from_matrix()` helper symmetric with the
-    legacy adapter's logic. Converts list-of-lists rows into dict rows
-    using the provided keys, with safe handling for short/long rows.
-
-- FIX [CRITICAL]: add `_extract_rows_with_matrix_fallback(payload, keys)`
-    which first tries `_extract_rows_like` (preserves v4.3.1 behavior for
-    payloads that were already list-of-dicts), then falls back to matrix
-    extraction when the payload contains list-of-lists in any of the
-    standard buckets ("rows", "rows_matrix", "matrix", "data", "items",
-    "records", "quotes", "results").
-
-- FIX [CRITICAL]: `_normalize_external_payload` now calls the matrix-
-    aware extractor and passes the schema keys. This is the single
-    behavioral change that unblocks v5.50.0 enrichment from reaching
-    the wire.
-
-- KEEP: existing `_extract_rows_like` is preserved unchanged. It is
-    still used by `_run_advanced_sheet_rows_impl` for the post-normalize
-    "did this produce rows" check (which reads `row_objects` in the
-    normalized envelope — always list-of-dicts at that stage).
-
-- KEEP: every v4.3.1 / v4.3.0 / v4.2.0 / v4.1.0 fix preserved unchanged.
-
-Production verification after v4.3.2 deploy
--------------------------------------------
-Hit `/v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1` and the
-response should now satisfy:
-
-  1. meta.source     == "core.data_engine_v2.get_engine().get_sheet_rows"  (unchanged from 4.3.1)
-  2. meta.dispatch   == "advanced_analysis_root"                          (was: fail_soft_nonempty)
-  3. status          == "success"                                         (was: partial)
-  4. data_provider   non-null and NOT "placeholder_no_live_data"
-  5. recommendation_detailed / recommendation_priority — non-null
-  6. fundamental_view / technical_view / risk_view / value_view — non-null
-  7. recommendation_reason — non-null
-  8. sector_relative_score / conviction_score — non-null
-  9. candlestick_signal — non-null on most symbols (some short-history symbols may legitimately be null)
-
-If conditions 1-3 pass but 4-9 still fail → engine bug.
-If condition 1 fails → v4.3.2 not actually deployed.
-If condition 2 still says fail_soft_nonempty → matrix extraction not catching this payload shape; need to inspect `meta.engine_payload_diagnostic` (added below for 4.3.2 visibility).
-
-Why v4.3.1 — v5.50.0 binding pattern corrected
-----------------------------------------------
-
-v4.3.0 inverted the engine import preference (v2 first, legacy fallback) but
-attempted the import as `from core.data_engine_v2 import get_sheet_rows`.
-The deploy log immediately revealed the issue:
-
-  WARNING | routes.advanced_analysis | [advanced_analysis v4.3.0]
-  core.data_engine_v2 unavailable (cannot import name 'get_sheet_rows'
-  from 'core.data_engine_v2'); falling back to legacy core.data_engine
-
-Inspection of `core/data_engine_v2.py` confirmed: `get_sheet_rows` is an
-ASYNC METHOD on the `DataEngineV5` class, not a module-level function.
-The module's `__all__` exports `DataEngineV5`, `get_engine` (async factory),
-`get_engine_if_ready` (sync factory), and supporting constants — but NOT
-`get_sheet_rows` itself. The startup log corroborates: `engine_source:
-core.data_engine_v2` and `engine_ready: true`, so the v2 engine IS deployed
-and live; only the route's binding pattern was wrong.
-
-v4.3.1 changes (from v4.3.0)
-----------------------------
-- FIX [CRITICAL]: engine binding now uses `get_engine()` async factory
-    instead of trying to import a non-existent module-level `get_sheet_rows`.
-    A small adapter coroutine retrieves the engine and calls its async
-    `.get_sheet_rows()` method, keeping the existing
-    `_call_core_sheet_rows_best_effort` candidate-signature loop unchanged.
-
-- ADD: cascading binding probe with explicit logging at each step:
-    1. Try `from core.data_engine_v2 import get_sheet_rows` (top-level fn,
-       in case a future v2 build adds it). Logs INFO if bound.
-    2. Try `from core.data_engine_v2 import get_engine` (async factory) and
-       wrap. Logs INFO if bound — this is the expected production path.
-    3. Try `from core.data_engine_v2 import get_engine_if_ready` (sync
-       factory) with async-factory fallback for cold starts. Logs INFO if
-       bound. Belt-and-suspenders against the rare race where v2 module
-       imported but engine instance not yet warmed.
-    4. Fall back to `from core.data_engine import get_sheet_rows` (legacy).
-       Logs WARNING — this branch loses v5.50.0 enrichment.
-    5. All four failed: log ERROR. `core_get_sheet_rows is None`.
-
-- KEEP: `CORE_GET_SHEET_ROWS_SOURCE` reflects the actual binding chosen.
-    Production responses' `meta.source` will now read one of:
-      * `core.data_engine_v2.get_sheet_rows` (top-level — unlikely)
-      * `core.data_engine_v2.get_engine().get_sheet_rows` (expected)
-      * `core.data_engine_v2.get_engine_if_ready().get_sheet_rows`
-      * `core.data_engine.get_sheet_rows` (legacy fallback — bug indicator)
-
-- KEEP: every other v4.3.0 change preserved unchanged. 97-col canonical
-    fallback, `_EXPECTED_SHEET_LENGTHS` 97/100, all v4.2.0/v4.1.0 fixes.
-
-Production verification after v4.3.1 deploy
--------------------------------------------
-After Render redeploy, the startup log should now show:
-
-  INFO | routes.advanced_analysis | [advanced_analysis v4.3.1]
-  engine bound via core.data_engine_v2.get_engine() (async factory)
-
-And NOT show the v4.3.0 warning about `cannot import name 'get_sheet_rows'`.
-Then hit `/v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1` and verify
-the same 7 conditions documented in the v4.3.0 narrative below.
-
-Why v4.3.0 — v5.50.0 ROUTING FIX (engine bypass corrected)
-----------------------------------------------------------
-
-Critical observation that motivated this revision:
-
-After deploying v5.50.0 (`core/data_engine_v2`) and registry v2.7.0 (97
-canonical columns), production responses on /v1/advanced/sheet-rows showed:
-
-  * Schema correct: 97 keys returned including all 7 new fields ✓
-  * `recommendation` populated, `recommendation_detailed` populated,
-    `recommendation_priority` populated ✓
-  * `fundamental_view`, `technical_view`, `risk_view`, `value_view` ALL NULL ✗
-  * `sector_relative_score`, `conviction_score`, `top_factors`, `top_risks`,
-    `position_size_hint` ALL NULL ✗
-  * `candlestick_pattern`, `candlestick_signal`, `candlestick_strength`,
-    `candlestick_confidence`, `candlestick_patterns_recent` ALL NULL ✗
-  * `recommendation_reason` NULL ✗
-  * Response meta: `"source": "core.data_engine.get_sheet_rows"`
-
-The meta key "source" pinpoints the bug: this route was importing the LEGACY
-`core.data_engine` adapter ahead of `core.data_engine_v2`. The legacy module
-in turn delegates to v2 internally, but its schema-projection layer
-(`_normalize_sheet_payload` → `_project_row`) only forwards keys that the
-LIVE schema_registry exposes, which works for the 97 keys themselves but
-DOES NOT trigger the v2 engine's full enrichment pipeline (Insights builder,
-Views computer, Candlestick detector, recommendation_reason synthesizer).
-
-v4.3.0 changes (from v4.2.0)
-----------------------------
-- FIX [CRITICAL]: engine import preference INVERTED. v4.2.0 tried
-    `core.data_engine` (legacy) FIRST and only fell back to
-    `core.data_engine_v2` if legacy import failed. Since legacy always
-    imports successfully, v2 was never reached. v4.3.0 tries
-    `core.data_engine_v2` FIRST. If v2 is unavailable, falls back to legacy.
-    This routes calls through the v5.50.0 enrichment pipeline so that
-    Views, Insights, Candlesticks, and recommendation_reason populate.
-
-    Logging on import is now explicit so /meta and startup logs make the
-    binding choice obvious. CORE_GET_SHEET_ROWS_SOURCE will read
-    "core.data_engine_v2.get_sheet_rows" in production after this deploy
-    (verifiable in the response.meta.source field).
-
-- BUMP [HIGH]: static fallback contract widened from 90 → 97 columns to
-    align with `core.sheets.schema_registry` v2.7.0. Adds the 7 v5.50.0
-    columns at canonical positions:
-      * positions 91-92 (after position_size_hint):
-          - `recommendation_detailed` ("Recommendation Detail")
-          - `recommendation_priority` ("Reco Priority")
-      * positions 93-97 (end of canonical):
-          - `candlestick_pattern`         ("Candle Pattern")
-          - `candlestick_signal`          ("Candle Signal")
-          - `candlestick_strength`        ("Candle Strength")
-          - `candlestick_confidence`      ("Candle Confidence")
-          - `candlestick_patterns_recent` ("Recent Patterns (5D)")
-    Adding them after position_size_hint preserves all existing positional
-    indices below 91 — purely additive, no key reordering.
-
-- BUMP: `_EXPECTED_SHEET_LENGTHS` instrument 90 → 97, Top10 93 → 100.
-- BUMP: `_static_contract` instrument padding 90 → 97.
-- BUMP: `_ensure_top10_contract` padding 93 → 100.
-- BUMP: `_expected_len` default 90 → 97.
-
-- KEEP: every v4.2.0 fix preserved unchanged. The 5 Insights group columns
-    (sector_relative_score, conviction_score, top_factors, top_risks,
-    position_size_hint) keep their canonical positions 86-90. The 4 view
-    columns (fundamental_view, technical_view, risk_view, value_view)
-    keep their canonical positions between rank_overall and recommendation.
-
-- KEEP: every v4.1.0 fix preserved unchanged. Conservative placeholders,
-    `_strip_internal_fields()`, "warn" status handling — all intact.
-
-Production verification after deploy
-------------------------------------
-Hit `/v1/advanced/sheet-rows?sheet=Market_Leaders&limit=1` and inspect the
-response. The following MUST hold for v4.3.0 to be considered successful:
-
-  1. `meta.source == "core.data_engine_v2.get_sheet_rows"`
-  2. `recommendation_detailed` non-null (e.g. "HOLD")
-  3. `recommendation_priority` non-null (e.g. 8)
-  4. `fundamental_view` / `technical_view` / `risk_view` / `value_view`
-     all non-null on at least 80% of rows
-  5. `recommendation_reason` non-null on rows that have a recommendation
-  6. `sector_relative_score` / `conviction_score` non-null on enriched rows
-  7. `candlestick_signal` non-null on at least 80% of rows
-     (some symbols may have insufficient history → null is acceptable)
-
-If condition 1 holds but 2-7 fail, the route fix is correct but the v5.50.0
-engine is broken. If condition 1 fails, the v2 engine is not deployed.
-
-v4.2.0 changes (from v4.1.0) — Wave 3 — preserved
--------------------------------------------------
-- BUMP: static fallback contract widened from 85 → 90 columns to align with
-    `core.sheets.schema_registry` v2.6.0 (Wave 1). Appends the 5 Insights
-    group columns at the END of the canonical schema (positions 86-90):
-      * `sector_relative_score` ("Sector-Adj Score")
-      * `conviction_score`      ("Conviction Score")
-      * `top_factors`           ("Top Factors")
-      * `top_risks`             ("Top Risks")
-      * `position_size_hint`    ("Position Size Hint")
-    All 5 are produced by `core.insights_builder` v1.0.0. Adding them at
-    the END preserves all existing positional indices — purely additive.
-- BUMP: `_EXPECTED_SHEET_LENGTHS` instrument 85 → 90, Top10 88 → 93.
-- BUMP: `_static_contract` instrument padding 85 → 90.
-- BUMP: `_ensure_top10_contract` padding 88 → 93.
-- BUMP: `_expected_len` default 85 → 90.
-- KEEP: every v4.1.0 fix preserved unchanged. Conservative placeholders
-    (no fake numerics — also returns None for the new Insights fields),
-    internal-field stripping, "warn" status handling — all preserved.
-
-v4.1.0 changes (from v4.0.0) — preserved
-----------------------------------------
-- FIX [HIGH]: static fallback was at 80 keys, padding to 84 with placeholder
-    columns ("Column 81" → "column_81"...). v4.1.0 grew the static list to
-    the canonical 85 entries by inserting `upside_pct` after `intrinsic_value`
-    (registry v2.4.0 added this column; we were the last sibling not to ship
-    it). _EXPECTED_SHEET_LENGTHS bumped to 85/88. Production registry-first
-    path was unaffected — this only mattered when registry import failed.
-    [v4.2.0 superseded the 85/88 numbers; v4.3.0 supersedes again to 97/100.]
-- FIX [HIGH]: `_placeholder_value_for_key` no longer fabricates numeric
-    values. Previously returned `recommendation="Accumulate"`,
-    `expected_roi_3m=12.5%`, `forecast_confidence=99`, etc. for symbols
-    where the engine returned no data. In a financial product, those
-    synthetic numbers can be acted on by users. v4.1.0 returns `None` for
-    every numeric/score/ROI/forecast field and only fills identity columns
-    (symbol, name, asset_class, exchange, currency, country) plus a clear
-    `warnings` field. Same philosophy as `routes.analysis_sheet_rows`
-    v4.1.2 and `routes.advanced_sheet_rows` v4.0.0.
-- ADD: `_strip_internal_fields()` defensive helper. Removes engine internal
-    coordination flags (`_skip_recommendation_synthesis`, `_internal_*`,
-    `_meta_*`, `_debug_*`, `_trace_*`, plus the explicit hard-strip set).
-    Engine v5.47.4+ strips these at source; this is defence-in-depth for
-    legacy / proxy / cached rows.
-- ADD: `status: "warn"` from engine v5.47.4+ is treated as success-with-caveat
-    when rows are present (matching the rest of the route family).
-
-Why this revision (preserved from v4.0.0)
------------------------------------------
-- FIX: keeps root /sheet-rows authoritative and returns a stable envelope even
-       when upstream builders degrade.
-- FIX: never emits empty-success payloads for special pages.
-- FIX: supports schema_only / headers_only in both GET and POST flows.
-- FIX: normalizes external/core payloads into one contract:
-       headers/display_headers/sheet_headers/column_headers/keys/rows/
-       rows_matrix/row_objects/items/records/data/quotes.
-- ENHANCE: provides schema-safe local fallbacks for Top_10_Investments,
-           Insights_Analysis, Data_Dictionary, and instrument pages.
+[FIX-A — CRITICAL] Engine binding inversion. v4.0.0 tried
+    `from core.data_engine import get_sheet_rows` (legacy) first; the
+    legacy module always imports, so the v2 fallback was never reached.
+    v4.1.0 cascades through patterns in preferred order:
+      1. `core.data_engine_v2.get_engine()` (runtime-await-aware adapter)
+      2. `core.data_engine_v2.get_engine_if_ready()` with cold-start fallback
+      3. `core.data_engine_v2.get_sheet_rows` (top-level fn — may not exist)
+      4. `core.data_engine.get_sheet_rows` (legacy — bug indicator if reached)
+    Each step logs explicitly. `CORE_GET_SHEET_ROWS_SOURCE` and the
+    response's `meta.source` field reveal which binding won.
+
+[ADD-B] NEW `_get_engine_for_health()` helper. Lazily resolves the
+    v2 engine instance for the new `health()` surface. Cached at
+    module level after first successful import. Returns None if v2
+    is unavailable (graceful degradation — health-snapshot fields
+    just omit from the response).
+
+[ADD-C] NEW `_extract_provider_health_snapshot()` helper. Calls
+    `engine.health()`, extracts `provider_unhealthy_markers` +
+    `engine_version`, returns a JSON-safe dict. Catches all
+    exceptions and returns `{"unavailable": True, "error_class": ...}`
+    on failure. Safe to call from any request path — total budget
+    is whatever `engine.health()` costs (single async call, no API).
+
+[ADD-D] NEW envelope field: `meta.provider_health`. The
+    `_payload_envelope` builder accepts an optional `provider_health`
+    kwarg and surfaces it under `meta.provider_health`. Shape:
+      {
+        "unhealthy_markers": {
+          "active": [{"provider": "eodhd", "ttl_remaining_sec": 247.3}],
+          "active_count": 1,
+          "demote_enabled": true,
+          "skip_enabled": false,
+          "default_ttl_sec": 300.0
+        },
+        "engine_version": "5.61.0"
+      }
+
+[ADD-E] `_run_advanced_sheet_rows_impl` fetches provider_health
+    once per request via `_extract_provider_health_snapshot()` and
+    passes it into both the success-path envelope (via `_normalize_
+    external_payload` meta_extra) AND the fail-soft envelope. So
+    every response — success, partial, or error — carries the
+    engine's current provider-health view at the moment of the
+    request.
+
+[ADD-F] Envelope-level warning lift. When any row in the response
+    carries `circuit_open` or `provider_unhealthy:<X>` in its
+    `warnings` string, the systemic markers are LIFTED into the
+    envelope's top-level `warnings` array (preserving per-row
+    warnings intact for the Sheet's Warnings column). One entry
+    per distinct marker:
+      "EODHD provider circuit open (engine routing to fallback chain)"
+    Makes the systemic signal visible at glance without parsing
+    every row.
+
+[ADD-G] NEW `/v1/schema/provider-health` endpoint. Dedicated
+    read-only GET. Returns the registry snapshot WITHOUT triggering
+    a sheet build. Cheap polling target for Apps Script
+    `12_Diagnostics.gs runFullDiagnosticSweep_()` — one HTTP call
+    instead of one-per-page.
+
+[ADD-H] `/health` and `/v1/schema/health` endpoint enhancement.
+    Added: `engine_version` (from v2 engine), `provider_health_
+    endpoint_enabled: true`, `provider_unhealthy_count` (the
+    engine's `active_count` — 0 healthy, N>0 when providers are
+    being demoted/skipped). Operators get a one-call boolean
+    indicator of upstream-provider health.
+
+[KEEP] Every v4.0.0 capability preserved:
+    - Root paths: /sheet-rows, /schema, /schema/sheet-spec,
+      /schema/pages, /schema/data-dictionary + /v1/schema aliases
+    - GET+POST merging with query/body param normalization
+    - schema_only / headers_only handling in both flows
+    - Canonical envelope shape:
+      headers/display_headers/sheet_headers/column_headers/keys/
+      rows/rows_matrix/row_objects/items/records/data/quotes
+    - Schema-safe local fallbacks for Top_10_Investments,
+      Insights_Analysis, Data_Dictionary, and instrument pages
+    - 80-column canonical contract baseline (engine-side schema
+      registry override remains authoritative when available)
+    - Auth dispatch cascade preserved (6 attempt shapes)
+    - JSON-safe coercion preserved
+    - `_call_core_sheet_rows_best_effort` 7-candidate signature
+      loop preserved
+
+May 2026 / v2.8.0 family alignment
+----------------------------------
+This route aligns with:
+  - core.data_engine_v2          v5.61.0  (provider-unhealthy registry,
+                                            health() surface, PHASE-X)
+  - core.providers.eodhd_provider v4.8.0   (circuit breaker, diagnose_health,
+                                             get_provider_stats)
+  - core.providers.yahoo_fundamentals_provider v6.1.0
+  - core.providers.yahoo_chart_provider        v8.2.0
+  - core.scoring                  v5.2.5
+  - core.scoring_engine           v3.4.2
+  - core.reco_normalize           v7.2.0
+  - core.insights_builder         v7.0.0
+  - core.candlesticks             v1.0.0
+
+New env variables (v4.1.0)
+--------------------------
+None. v4.1.0's behavior is gated by which engine binding wins (v2 vs
+legacy). If v2 is unavailable, the new provider_health fields simply
+omit from responses (graceful degradation).
+
+Purpose
+-------
+Owns the canonical root paths:
+- /sheet-rows
+- /schema
+- /schema/sheet-spec
+- /schema/pages
+- /schema/data-dictionary
+- /v1/schema/provider-health  [v4.1.0 NEW]
+and their /v1/schema aliases.
 ================================================================================
 """
 
@@ -592,42 +168,302 @@ import uuid
 from dataclasses import is_dataclass
 from datetime import date, datetime, time as dt_time
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-
-def _advanced_analysis_debug_enabled() -> bool:
-    """v4.3.5: ADVANCED_ANALYSIS_DEBUG=1 elevates this logger to DEBUG."""
-    raw = os.getenv("ADVANCED_ANALYSIS_DEBUG", "")
-    if raw and raw.strip().lower() in {"1", "true", "yes", "y", "on"}:
-        return True
-    return False
+# =============================================================================
+# v4.1.0 — Version constant.
+# =============================================================================
+ADVANCED_ANALYSIS_VERSION = "4.1.0"
 
 
-if _advanced_analysis_debug_enabled():
+# =============================================================================
+# v4.1.0 [FIX-A — CRITICAL] Engine binding cascade.
+#
+# v4.0.0 tried `core.data_engine.get_sheet_rows` (legacy) FIRST and
+# only fell back to `core.data_engine_v2` if the legacy import failed.
+# Since legacy always imports successfully on this deployment, the v2
+# path was never reached and v5.61.0's enrichment (Decision Matrix,
+# Insights, Candlesticks, provider_unhealthy registry, ...) never
+# made it to the wire.
+#
+# v4.1.0 inverts that preference. Cascading binding probe in order:
+#
+#   1. `core.data_engine_v2.get_engine()` — async or sync factory.
+#      Runtime-awaitable detection via `inspect.isawaitable()` so the
+#      adapter works whether `get_engine` returns the engine instance
+#      directly (v5.50.0+ sync) or returns a coroutine (older / future
+#      async builds). EXPECTED PRODUCTION PATH.
+#
+#   2. `core.data_engine_v2.get_engine_if_ready()` — sync ready-check
+#      with async-factory cold-start fallback. Belt-and-suspenders
+#      against the rare race where the v2 module is imported but the
+#      engine instance hasn't warmed yet.
+#
+#   3. `core.data_engine_v2.get_sheet_rows` — top-level module-level
+#      function. Doesn't exist in v5.61.0 (`get_sheet_rows` is a method
+#      on DataEngineV5) but we still probe in case a future build
+#      adds a convenience wrapper.
+#
+#   4. `core.data_engine.get_sheet_rows` — legacy adapter. Bug
+#      indicator if reached: v2 module is unavailable or broken.
+#      Logs WARNING — this branch loses v5.61.0 enrichment.
+#
+# Every step logs explicitly. The chosen binding is reflected in
+# CORE_GET_SHEET_ROWS_SOURCE and surfaces in every response's
+# meta.source field, making the live binding trivially observable
+# from production.
+# =============================================================================
+CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
+core_get_sheet_rows = None  # type: ignore[assignment]
+
+# Pattern 1: get_engine() factory (sync or async) — EXPECTED PATH.
+try:
+    from core.data_engine_v2 import get_engine as _v2_get_engine  # type: ignore
+
+    async def _v2_engine_factory_adapter(*args: Any, **kwargs: Any) -> Any:
+        """v4.1.0: runtime-await-aware adapter for v2 engine factory.
+
+        `core.data_engine_v2.get_engine` may be sync (v5.50.0+ behavior,
+        returns DataEngineV5 instance directly) or async (older or
+        future builds, returns a coroutine that resolves to the
+        instance). `inspect.isawaitable` distinguishes at runtime.
+        """
+        raw = _v2_get_engine()
+        engine = await raw if inspect.isawaitable(raw) else raw
+        return await engine.get_sheet_rows(*args, **kwargs)
+
+    core_get_sheet_rows = _v2_engine_factory_adapter  # type: ignore[assignment]
+    CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_engine().get_sheet_rows"
+    logger.info(
+        "[advanced_analysis v%s] engine bound via core.data_engine_v2.get_engine() (factory pattern, runtime-await-aware)",
+        ADVANCED_ANALYSIS_VERSION,
+    )
+except Exception as _v2_factory_err:
+    logger.info(
+        "[advanced_analysis v%s] core.data_engine_v2.get_engine() unavailable (%s); trying ready-engine factory",
+        ADVANCED_ANALYSIS_VERSION, _v2_factory_err,
+    )
+
+# Pattern 2: get_engine_if_ready() sync with async-factory fallback.
+if core_get_sheet_rows is None:
     try:
-        logger.setLevel(logging.DEBUG)
-    except Exception:
-        pass
+        from core.data_engine_v2 import get_engine_if_ready as _v2_get_engine_if_ready  # type: ignore
+
+        async def _v2_engine_ready_adapter(*args: Any, **kwargs: Any) -> Any:
+            """v4.1.0: sync ready-check with cold-start async-factory fallback."""
+            engine = _v2_get_engine_if_ready()
+            if engine is None:
+                try:
+                    from core.data_engine_v2 import get_engine as _v2_async_factory  # type: ignore
+                    raw = _v2_async_factory()
+                    engine = await raw if inspect.isawaitable(raw) else raw
+                except Exception as inner_err:
+                    raise RuntimeError(
+                        "v2 engine not ready and async factory unavailable: " + repr(inner_err)
+                    ) from inner_err
+            return await engine.get_sheet_rows(*args, **kwargs)
+
+        core_get_sheet_rows = _v2_engine_ready_adapter  # type: ignore[assignment]
+        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_engine_if_ready().get_sheet_rows"
+        logger.info(
+            "[advanced_analysis v%s] engine bound via core.data_engine_v2.get_engine_if_ready() (sync factory)",
+            ADVANCED_ANALYSIS_VERSION,
+        )
+    except Exception as _v2_ready_err:
+        logger.info(
+            "[advanced_analysis v%s] core.data_engine_v2.get_engine_if_ready() unavailable (%s); trying top-level fn",
+            ADVANCED_ANALYSIS_VERSION, _v2_ready_err,
+        )
+
+# Pattern 3: top-level module-level function on v2 (unlikely; future-proofing).
+if core_get_sheet_rows is None:
+    try:
+        from core.data_engine_v2 import get_sheet_rows as core_get_sheet_rows  # type: ignore
+        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_sheet_rows"
+        logger.info(
+            "[advanced_analysis v%s] engine bound to core.data_engine_v2.get_sheet_rows (top-level fn)",
+            ADVANCED_ANALYSIS_VERSION,
+        )
+    except Exception as _v2_topfn_err:
+        logger.info(
+            "[advanced_analysis v%s] core.data_engine_v2.get_sheet_rows top-level not present (%s); trying legacy fallback",
+            ADVANCED_ANALYSIS_VERSION, _v2_topfn_err,
+        )
+
+# Pattern 4: legacy fallback — BUG INDICATOR if reached.
+if core_get_sheet_rows is None:
+    try:
+        from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
+        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine.get_sheet_rows"
+        logger.warning(
+            "[advanced_analysis v%s] all v2 binding patterns failed; falling back to legacy core.data_engine "
+            "(this loses v5.61.0 enrichment including provider_unhealthy registry — investigate v2 exports)",
+            ADVANCED_ANALYSIS_VERSION,
+        )
+    except Exception as _legacy_err:
+        core_get_sheet_rows = None  # type: ignore
+        CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
+        logger.error(
+            "[advanced_analysis v%s] BOTH v2 and legacy unavailable: legacy_err=%r",
+            ADVANCED_ANALYSIS_VERSION, _legacy_err,
+        )
 
 
-def _tier1_yfinance_enrichment_enabled() -> bool:
-    """v4.3.5 [FIX-3]: TFB_ADVANCED_TIER1_FALLBACK=1 enables yfinance
-    .fast_info enrichment of placeholder rows when the engine fails.
+# =============================================================================
+# v4.1.0 [ADD-B/C] Provider-health snapshot helpers.
+#
+# These resolve the v2 engine instance directly (bypassing the
+# get_sheet_rows adapter) so we can call `engine.health()` and read
+# the v5.61.0 `provider_unhealthy_markers` field. Cached at module
+# level after first successful resolution.
+# =============================================================================
+_V2_ENGINE_HEALTH_FACTORY: Optional[Any] = None
+_V2_ENGINE_HEALTH_FACTORY_INITED: bool = False
 
-    Default OFF (no network calls during normal operation).
-    Recommended ON during incident response.
+
+def _resolve_v2_engine_factory() -> Optional[Any]:
+    """v4.1.0: One-time resolution of the v2 engine factory callable.
+
+    Caches the result at module level. Returns None if v2 is
+    unavailable (graceful degradation — provider_health fields
+    simply omit from responses).
     """
-    raw = os.getenv("TFB_ADVANCED_TIER1_FALLBACK", "")
-    if raw and raw.strip().lower() in {"1", "true", "yes", "y", "on"}:
-        return True
-    return False
+    global _V2_ENGINE_HEALTH_FACTORY, _V2_ENGINE_HEALTH_FACTORY_INITED
+    if _V2_ENGINE_HEALTH_FACTORY_INITED:
+        return _V2_ENGINE_HEALTH_FACTORY
+    _V2_ENGINE_HEALTH_FACTORY_INITED = True
+    try:
+        from core.data_engine_v2 import get_engine as _factory  # type: ignore
+        _V2_ENGINE_HEALTH_FACTORY = _factory
+        return _factory
+    except Exception as e:
+        logger.info(
+            "[advanced_analysis v%s] v2 engine factory unavailable for health snapshot: %s",
+            ADVANCED_ANALYSIS_VERSION, e,
+        )
+        _V2_ENGINE_HEALTH_FACTORY = None
+        return None
 
-ADVANCED_ANALYSIS_VERSION = "4.3.6"
+
+async def _get_v2_engine_instance() -> Optional[Any]:
+    """v4.1.0: Resolve the v2 engine instance (sync or async factory)."""
+    factory = _resolve_v2_engine_factory()
+    if factory is None:
+        return None
+    try:
+        raw = factory()
+        if inspect.isawaitable(raw):
+            return await raw
+        return raw
+    except Exception as e:
+        logger.warning(
+            "[advanced_analysis v%s] v2 engine factory call failed: %s: %s",
+            ADVANCED_ANALYSIS_VERSION, e.__class__.__name__, e,
+        )
+        return None
+
+
+async def _extract_provider_health_snapshot() -> Dict[str, Any]:
+    """v4.1.0 [ADD-C]: Fetch the engine's provider-health snapshot.
+
+    Calls `engine.health()` and extracts the v5.61.0
+    `provider_unhealthy_markers` field plus `engine_version`.
+    Returns a JSON-safe dict suitable for embedding in
+    `meta.provider_health` or serving from the dedicated endpoint.
+
+    Failure shapes:
+      - v2 unavailable: {"unavailable": True, "reason": "v2_engine_not_bound"}
+      - health() raised: {"unavailable": True, "error_class": "...", "error_detail": "..."}
+      - health() returned no markers field: {"unavailable": True, "reason": "no_registry_in_health"}
+
+    Never raises. Safe to call from any request path.
+    """
+    engine = await _get_v2_engine_instance()
+    if engine is None:
+        return {"unavailable": True, "reason": "v2_engine_not_bound"}
+
+    health_method = getattr(engine, "health", None)
+    if not callable(health_method):
+        return {"unavailable": True, "reason": "engine_has_no_health_method"}
+
+    try:
+        raw = health_method()
+        health = await raw if inspect.isawaitable(raw) else raw
+    except Exception as e:
+        return {
+            "unavailable": True,
+            "error_class": e.__class__.__name__,
+            "error_detail": str(e)[:200],
+        }
+
+    if not isinstance(health, dict):
+        return {"unavailable": True, "reason": "health_returned_non_dict",
+                "type": type(health).__name__}
+
+    markers = health.get("provider_unhealthy_markers")
+    if markers is None:
+        # Older engine version (pre-v5.61.0) without the registry field.
+        return {
+            "unavailable": True,
+            "reason": "no_registry_in_health",
+            "engine_version": _strip(health.get("engine_version")) or None,
+        }
+
+    return _json_safe({
+        "unhealthy_markers": markers,
+        "engine_version": _strip(health.get("engine_version")) or None,
+    })
+
+
+def _lift_systemic_warning_markers(row_objects: Sequence[Mapping[str, Any]]) -> List[str]:
+    """v4.1.0 [ADD-F]: Lift systemic provider markers from row warnings
+    into envelope-level warnings.
+
+    Scans each row's `warnings` field for the v5.61.0 markers:
+      - "circuit_open" → "Provider circuit open (engine routing to fallback chain)"
+      - "provider_unhealthy:<X>" → "Upstream provider unhealthy: <X> (engine routing around it)"
+      - "HTTP 403" → "Provider access issue (HTTP 403)"
+
+    Deduplicated. Per-row warnings are NOT modified — only lifted.
+    Empty list if no markers found.
+    """
+    out: List[str] = []
+    seen_circuits = False
+    seen_unhealthy: Set[str] = set()
+    seen_http403 = False
+
+    for row in row_objects or []:
+        if not isinstance(row, Mapping):
+            continue
+        raw = row.get("warnings")
+        if raw is None:
+            continue
+        text = _strip(raw).lower() if not isinstance(raw, (list, tuple, set)) else "; ".join(
+            _strip(w).lower() for w in raw if _strip(w)
+        )
+        if not text:
+            continue
+        if "circuit_open" in text and not seen_circuits:
+            out.append("Provider circuit open (engine routing to fallback chain)")
+            seen_circuits = True
+        # Extract provider_unhealthy:<name> entries
+        for match in re.finditer(r"provider_unhealthy:([a-zA-Z0-9_\-]+)", text):
+            name = match.group(1)
+            if name and name not in seen_unhealthy:
+                seen_unhealthy.add(name)
+                out.append("Upstream provider unhealthy: {} (engine routing around it)".format(name))
+        if "http 403" in text and not seen_http403:
+            out.append("Provider access issue (HTTP 403)")
+            seen_http403 = True
+
+    return out
+
+
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -635,16 +471,14 @@ _INSIGHTS_PAGE = "Insights_Analysis"
 _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
-# v4.3.0: bumped from 90/93 to 97/100 to align with registry v2.7.0
-# (97 cols = 90 base + 2 Decision Matrix + 5 Candlestick).
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 97,
-    "Global_Markets": 97,
-    "Commodities_FX": 97,
-    "Mutual_Funds": 97,
-    "My_Portfolio": 97,
-    "My_Investments": 97,
-    _TOP10_PAGE: 100,
+    "Market_Leaders": 80,
+    "Global_Markets": 80,
+    "Commodities_FX": 80,
+    "Mutual_Funds": 80,
+    "My_Portfolio": 80,
+    "My_Investments": 80,
+    _TOP10_PAGE: 83,
     _INSIGHTS_PAGE: 7,
     _DICTIONARY_PAGE: 9,
 }
@@ -700,153 +534,9 @@ except Exception:
     def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
 
-# =============================================================================
-# v4.3.1 CRITICAL FIX: engine binding now uses get_engine() async factory.
-#
-# v4.3.0 tried `from core.data_engine_v2 import get_sheet_rows` directly,
-# but `get_sheet_rows` is an async METHOD on the DataEngineV5 class, not a
-# module-level function. The v2 module's __all__ exports the engine class,
-# `get_engine`, `get_engine_if_ready`, and supporting constants — but no
-# top-level `get_sheet_rows`. v4.3.0's import therefore raised ImportError
-# and the route fell through to the legacy adapter.
-#
-# v4.3.1 cascades through binding patterns in order of preference:
-#   1. top-level `get_sheet_rows` from v2 (in case a future build adds it)
-#   2. `get_engine()` async factory + adapter coroutine — EXPECTED PATH
-#   3. `get_engine_if_ready()` sync factory + adapter coroutine
-#   4. legacy `core.data_engine.get_sheet_rows` — bug indicator if reached
-#
-# Every step logs explicitly. The chosen binding is reflected in
-# CORE_GET_SHEET_ROWS_SOURCE and surfaces in every response's meta.source
-# field, making the live binding trivially observable from production.
-# =============================================================================
-CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
-core_get_sheet_rows = None  # type: ignore[assignment]
+# (v4.1.0: the original legacy-first binding block was REMOVED here;
+# the v2-first cascade now lives at module top after the imports.)
 
-# Pattern 1: top-level function on v2 (may not exist; still try first)
-try:
-    from core.data_engine_v2 import get_sheet_rows as core_get_sheet_rows  # type: ignore
-    CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_sheet_rows"
-    logger.info(
-        "[advanced_analysis v%s] engine bound to core.data_engine_v2.get_sheet_rows (top-level fn)",
-        ADVANCED_ANALYSIS_VERSION,
-    )
-except Exception as _v2_topfn_err:
-    logger.info(
-        "[advanced_analysis v%s] core.data_engine_v2.get_sheet_rows top-level not present (%s); trying engine factory",
-        ADVANCED_ANALYSIS_VERSION, _v2_topfn_err,
-    )
-
-# Pattern 2: get_engine() async factory + .get_sheet_rows() method (expected path)
-if core_get_sheet_rows is None:
-    try:
-        from core.data_engine_v2 import get_engine as _v2_get_engine  # type: ignore
-
-        async def _v2_engine_factory_adapter(*args: Any, **kwargs: Any) -> Any:
-            """v4.3.6: Adapter that calls the v5.50.0 engine via get_engine().
-
-            v4.3.1 assumed `get_engine` was an async factory and unconditionally
-            did `await _v2_get_engine()`. v4.3.5 deploy verification revealed
-            this was wrong: in v5.50.0, `get_engine` is a SYNC function that
-            returns the DataEngineV5 instance directly. Awaiting the instance
-            raised `TypeError: object DataEngineV5 can't be used in 'await'
-            expression` on every call shape — defeating all 13 candidate
-            signatures.
-
-            v4.3.6 detects awaitable-ness at runtime via `inspect.isawaitable()`,
-            so the adapter works correctly whether `get_engine` returns a
-            coroutine (older / future v2 builds) or the engine instance
-            directly (current v5.50.0 behavior).
-
-            Signature is **args, **kwargs so it remains compatible with the
-            existing _call_core_sheet_rows_best_effort candidate-signature loop.
-            """
-            raw = _v2_get_engine()
-            engine = await raw if inspect.isawaitable(raw) else raw
-            return await engine.get_sheet_rows(*args, **kwargs)
-
-        core_get_sheet_rows = _v2_engine_factory_adapter  # type: ignore[assignment]
-        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_engine().get_sheet_rows"
-        logger.info(
-            "[advanced_analysis v%s] engine bound via core.data_engine_v2.get_engine() (factory pattern, runtime-await-aware)",
-            ADVANCED_ANALYSIS_VERSION,
-        )
-    except Exception as _v2_factory_err:
-        logger.info(
-            "[advanced_analysis v%s] core.data_engine_v2.get_engine() unavailable (%s); trying ready-engine factory",
-            ADVANCED_ANALYSIS_VERSION, _v2_factory_err,
-        )
-
-# Pattern 3: get_engine_if_ready() sync factory with async-factory fallback
-if core_get_sheet_rows is None:
-    try:
-        from core.data_engine_v2 import get_engine_if_ready as _v2_get_engine_if_ready  # type: ignore
-
-        async def _v2_engine_ready_adapter(*args: Any, **kwargs: Any) -> Any:
-            """v4.3.6: Adapter using sync get_engine_if_ready() with cold-start fallback.
-
-            Like `_v2_engine_factory_adapter` above, this adapter now detects
-            whether the cold-start async-factory backup returns a coroutine
-            or the engine instance directly. Same fix as v4.3.6 FIX-6.
-            """
-            engine = _v2_get_engine_if_ready()
-            if engine is None:
-                # Cold-start race: ready-check returned None, fall back to async factory
-                try:
-                    from core.data_engine_v2 import get_engine as _v2_async_factory  # type: ignore
-                    raw = _v2_async_factory()
-                    engine = await raw if inspect.isawaitable(raw) else raw
-                except Exception as inner_err:
-                    raise RuntimeError(
-                        "v2 engine not ready and async factory unavailable: " + repr(inner_err)
-                    ) from inner_err
-            return await engine.get_sheet_rows(*args, **kwargs)
-
-        core_get_sheet_rows = _v2_engine_ready_adapter  # type: ignore[assignment]
-        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_engine_if_ready().get_sheet_rows"
-        logger.info(
-            "[advanced_analysis v%s] engine bound via core.data_engine_v2.get_engine_if_ready() (sync factory)",
-            ADVANCED_ANALYSIS_VERSION,
-        )
-    except Exception as _v2_ready_err:
-        logger.info(
-            "[advanced_analysis v%s] core.data_engine_v2.get_engine_if_ready() unavailable (%s); trying legacy fallback",
-            ADVANCED_ANALYSIS_VERSION, _v2_ready_err,
-        )
-
-# Pattern 4: legacy fallback (bug indicator if reached — loses v5.50.0 enrichment)
-if core_get_sheet_rows is None:
-    try:
-        from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
-        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine.get_sheet_rows"
-        logger.warning(
-            "[advanced_analysis v%s] all v2 binding patterns failed; falling back to legacy core.data_engine "
-            "(this loses v5.50.0 enrichment — investigate v2 exports)",
-            ADVANCED_ANALYSIS_VERSION,
-        )
-    except Exception as _legacy_err:
-        core_get_sheet_rows = None  # type: ignore
-        CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
-        logger.error(
-            "[advanced_analysis v%s] BOTH v2 and legacy unavailable: legacy_err=%r",
-            ADVANCED_ANALYSIS_VERSION, _legacy_err,
-        )
-
-# v4.3.0: 97-column canonical contract (was 90 in v4.2.0, 85 in v4.1.0,
-# 80 in v4.0.0). Aligned with registry v2.7.0 / engine v5.50.0.
-#
-# Layout (1-indexed positions, all 97 columns):
-#   1-50  identity, prices, volume, fundamentals, risk metrics, valuation
-#   51-65 forecasts, ROIs, scores
-#   66-72 view tokens (4) + recommendation block start
-#   73-85 horizon, position, last-updated, warnings
-#   86-90 Wave 3 Insights (sector_relative_score..position_size_hint)
-#   91-92 v5.50.0 Decision Matrix (recommendation_detailed, recommendation_priority)
-#   93-97 v5.50.0 Candlestick (pattern, signal, strength, confidence, patterns_recent)
-#
-# IMPORTANT: name `_CANONICAL_80_HEADERS` is historical (started at 80
-# columns). Do not rename — kept for stable diff/grep-ability across
-# v4.0.0 → v4.3.0 history.
 _CANONICAL_80_HEADERS: List[str] = [
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
     "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
@@ -856,22 +546,13 @@ _CANONICAL_80_HEADERS: List[str] = [
     "Operating Margin", "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)", "RSI (14)",
     "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)", "Sharpe (1Y)",
     "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value",
-    "Upside %",
     "Valuation Score", "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence",
     "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
-    "Growth Score", "Overall Score",
-    "Fundamental View", "Technical View", "Risk View", "Value View",
-    "Opportunity Score", "Rank (Overall)", "Recommendation",
+    "Growth Score", "Overall Score", "Opportunity Score", "Rank (Overall)", "Recommendation",
     "Recommendation Reason", "Horizon Days", "Invest Period Label", "Position Qty", "Avg Cost",
     "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
-    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
-    # v4.3.0: v5.50.0 Decision Matrix columns
-    "Recommendation Detail", "Reco Priority",
-    # v4.3.0: v5.50.0 Candlestick columns
-    "Candle Pattern", "Candle Signal", "Candle Strength", "Candle Confidence",
-    "Recent Patterns (5D)",
 ]
 _CANONICAL_80_KEYS: List[str] = [
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
@@ -882,21 +563,13 @@ _CANONICAL_80_KEYS: List[str] = [
     "gross_margin", "operating_margin", "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y",
     "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
-    "intrinsic_value", "upside_pct", "valuation_score", "forecast_price_1m", "forecast_price_3m",
+    "intrinsic_value", "valuation_score", "forecast_price_1m", "forecast_price_3m",
     "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket", "value_score", "quality_score",
-    "momentum_score", "growth_score", "overall_score",
-    "fundamental_view", "technical_view", "risk_view", "value_view",
-    "opportunity_score", "rank_overall",
+    "momentum_score", "growth_score", "overall_score", "opportunity_score", "rank_overall",
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label", "position_qty",
     "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
-    "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
-    # v4.3.0: v5.50.0 Decision Matrix keys
-    "recommendation_detailed", "recommendation_priority",
-    # v4.3.0: v5.50.0 Candlestick keys
-    "candlestick_pattern", "candlestick_signal", "candlestick_strength", "candlestick_confidence",
-    "candlestick_patterns_recent",
 ]
 _INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
 _INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
@@ -914,114 +587,6 @@ EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
     _TOP10_PAGE: ["2222.SR", "1120.SR", "AAPL", "MSFT", "NVDA"],
 }
 
-# v4.3.5 [FIX-4]: Static identity map for ~30 commonly-encountered symbols.
-# Used by `_placeholder_value_for_key` to populate name/sector/industry on
-# placeholder rows when the engine fails. Without this, placeholder rows
-# show `name == "AAPL"` and `sector == null` — functionally useless even
-# as a fallback. With this, the row at least communicates WHAT instrument
-# it represents.
-#
-# Each value is a dict with keys:
-#   name, sector, industry, country, exchange, currency, asset_class
-# Missing keys fall back to the v4.3.4 generic guesses (.SR → Tadawul/SAR
-# etc.) so coverage gaps don't silently produce worse output than v4.3.4.
-_STATIC_IDENTITY_MAP: Dict[str, Dict[str, str]] = {
-    # Saudi Tadawul — top market caps
-    "2222.SR": {"name": "Saudi Aramco", "sector": "Energy", "industry": "Oil & Gas Integrated",
-                "country": "Saudi Arabia", "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
-    "1120.SR": {"name": "Al Rajhi Bank", "sector": "Financials", "industry": "Banks - Regional",
-                "country": "Saudi Arabia", "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
-    "2010.SR": {"name": "SABIC (Saudi Basic Industries Corp)", "sector": "Basic Materials",
-                "industry": "Chemicals", "country": "Saudi Arabia", "exchange": "Tadawul",
-                "currency": "SAR", "asset_class": "Equity"},
-    "7010.SR": {"name": "STC (Saudi Telecom Company)", "sector": "Communication Services",
-                "industry": "Telecom Services", "country": "Saudi Arabia", "exchange": "Tadawul",
-                "currency": "SAR", "asset_class": "Equity"},
-    "1180.SR": {"name": "The Saudi National Bank", "sector": "Financials", "industry": "Banks - Regional",
-                "country": "Saudi Arabia", "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
-    "1211.SR": {"name": "Maaden (Saudi Arabian Mining Co)", "sector": "Basic Materials",
-                "industry": "Other Industrial Metals & Mining", "country": "Saudi Arabia",
-                "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
-    "2030.SR": {"name": "SARCO (Saudi Refineries)", "sector": "Energy",
-                "industry": "Oil & Gas Refining & Marketing", "country": "Saudi Arabia",
-                "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
-    "2280.SR": {"name": "Almarai", "sector": "Consumer Defensive", "industry": "Packaged Foods",
-                "country": "Saudi Arabia", "exchange": "Tadawul", "currency": "SAR", "asset_class": "Equity"},
-    # US large-caps
-    "AAPL": {"name": "Apple Inc.", "sector": "Technology", "industry": "Consumer Electronics",
-             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
-    "MSFT": {"name": "Microsoft Corporation", "sector": "Technology", "industry": "Software - Infrastructure",
-             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
-    "NVDA": {"name": "NVIDIA Corporation", "sector": "Technology", "industry": "Semiconductors",
-             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
-    "GOOGL": {"name": "Alphabet Inc. Class A", "sector": "Communication Services",
-              "industry": "Internet Content & Information", "country": "USA", "exchange": "NASDAQ",
-              "currency": "USD", "asset_class": "Equity"},
-    "GOOG": {"name": "Alphabet Inc. Class C", "sector": "Communication Services",
-             "industry": "Internet Content & Information", "country": "USA", "exchange": "NASDAQ",
-             "currency": "USD", "asset_class": "Equity"},
-    "AMZN": {"name": "Amazon.com Inc.", "sector": "Consumer Cyclical", "industry": "Internet Retail",
-             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
-    "META": {"name": "Meta Platforms Inc.", "sector": "Communication Services",
-             "industry": "Internet Content & Information", "country": "USA", "exchange": "NASDAQ",
-             "currency": "USD", "asset_class": "Equity"},
-    "TSLA": {"name": "Tesla Inc.", "sector": "Consumer Cyclical", "industry": "Auto Manufacturers",
-             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
-    "AVGO": {"name": "Broadcom Inc.", "sector": "Technology", "industry": "Semiconductors",
-             "country": "USA", "exchange": "NASDAQ", "currency": "USD", "asset_class": "Equity"},
-    "JPM": {"name": "JPMorgan Chase & Co.", "sector": "Financials", "industry": "Banks - Diversified",
-            "country": "USA", "exchange": "NYSE", "currency": "USD", "asset_class": "Equity"},
-    "BRK-B": {"name": "Berkshire Hathaway Class B", "sector": "Financials",
-              "industry": "Insurance - Diversified", "country": "USA", "exchange": "NYSE",
-              "currency": "USD", "asset_class": "Equity"},
-    # Major ETFs / mutual funds
-    "SPY": {"name": "SPDR S&P 500 ETF Trust", "sector": "Diversified", "industry": "Large Blend ETF",
-            "country": "USA", "exchange": "NYSE Arca", "currency": "USD", "asset_class": "ETF"},
-    "QQQ": {"name": "Invesco QQQ Trust (NASDAQ-100)", "sector": "Technology",
-            "industry": "Large Growth ETF", "country": "USA", "exchange": "NASDAQ",
-            "currency": "USD", "asset_class": "ETF"},
-    "VTI": {"name": "Vanguard Total Stock Market ETF", "sector": "Diversified",
-            "industry": "Total Market ETF", "country": "USA", "exchange": "NYSE Arca",
-            "currency": "USD", "asset_class": "ETF"},
-    "VOO": {"name": "Vanguard S&P 500 ETF", "sector": "Diversified", "industry": "Large Blend ETF",
-            "country": "USA", "exchange": "NYSE Arca", "currency": "USD", "asset_class": "ETF"},
-    "IWM": {"name": "iShares Russell 2000 ETF", "sector": "Diversified", "industry": "Small Blend ETF",
-            "country": "USA", "exchange": "NYSE Arca", "currency": "USD", "asset_class": "ETF"},
-    # Commodities (Yahoo continuous-contract symbols)
-    "GC=F": {"name": "Gold Futures", "sector": "Commodities", "industry": "Precious Metals",
-             "country": "Global", "exchange": "COMEX", "currency": "USD", "asset_class": "Commodity"},
-    "BZ=F": {"name": "Brent Crude Oil Futures", "sector": "Commodities", "industry": "Energy",
-             "country": "Global", "exchange": "ICE", "currency": "USD", "asset_class": "Commodity"},
-    "CL=F": {"name": "WTI Crude Oil Futures", "sector": "Commodities", "industry": "Energy",
-             "country": "Global", "exchange": "NYMEX", "currency": "USD", "asset_class": "Commodity"},
-    "SI=F": {"name": "Silver Futures", "sector": "Commodities", "industry": "Precious Metals",
-             "country": "Global", "exchange": "COMEX", "currency": "USD", "asset_class": "Commodity"},
-    "HG=F": {"name": "Copper Futures", "sector": "Commodities", "industry": "Industrial Metals",
-             "country": "Global", "exchange": "COMEX", "currency": "USD", "asset_class": "Commodity"},
-    "NG=F": {"name": "Natural Gas Futures", "sector": "Commodities", "industry": "Energy",
-             "country": "Global", "exchange": "NYMEX", "currency": "USD", "asset_class": "Commodity"},
-    # FX (Yahoo pair symbols)
-    "EURUSD=X": {"name": "EUR/USD", "sector": "FX", "industry": "Major Pair", "country": "Global",
-                 "exchange": "FX", "currency": "USD", "asset_class": "FX"},
-    "GBPUSD=X": {"name": "GBP/USD", "sector": "FX", "industry": "Major Pair", "country": "Global",
-                 "exchange": "FX", "currency": "USD", "asset_class": "FX"},
-    "JPY=X": {"name": "USD/JPY", "sector": "FX", "industry": "Major Pair", "country": "Global",
-              "exchange": "FX", "currency": "JPY", "asset_class": "FX"},
-    "SAR=X": {"name": "USD/SAR", "sector": "FX", "industry": "MENA Pair", "country": "Global",
-              "exchange": "FX", "currency": "SAR", "asset_class": "FX"},
-}
-
-
-def _get_static_identity(symbol: str) -> Dict[str, str]:
-    """v4.3.5: Lookup symbol in identity map. Empty dict if unknown.
-
-    Symbol is uppercased and the .SA suffix (if any) is normalized to .SR
-    before lookup, matching `_normalize_symbol_token` semantics.
-    """
-    s = _normalize_symbol_token(symbol)
-    return dict(_STATIC_IDENTITY_MAP.get(s, {}))
-
-
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "symbol": ["ticker", "code", "instrument", "requested_symbol"],
     "name": ["short_name", "long_name", "instrument_name"],
@@ -1033,54 +598,7 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "top10_rank": ["rank", "top_rank"],
     "selection_reason": ["reason", "selection_notes"],
     "criteria_snapshot": ["criteria", "snapshot", "criteria_json"],
-    # v4.1.0: engine v5.47.4 mirrors upside_pct
-    "upside_pct": ["upsidePct", "upside_percent", "intrinsic_upside"],
-    # v4.3.0: v5.50.0 Decision Matrix aliases (engine may emit either form)
-    "recommendation_detailed": ["recommendationDetailed", "recommendation_detail",
-                                "reco_detailed", "reco_detail"],
-    "recommendation_priority": ["recommendationPriority", "reco_priority", "reco_pri"],
-    # v4.3.0: v5.50.0 Candlestick aliases
-    "candlestick_pattern": ["candle_pattern", "candlestickPattern"],
-    "candlestick_signal": ["candle_signal", "candlestickSignal"],
-    "candlestick_strength": ["candle_strength", "candlestickStrength"],
-    "candlestick_confidence": ["candle_confidence", "candlestickConfidence"],
-    "candlestick_patterns_recent": ["candle_patterns_recent", "candlestickPatternsRecent",
-                                    "recent_patterns_5d"],
 }
-
-# v4.1.0: internal-field stripping — same set as enriched_quote v4.2.0 /
-# advanced_sheet_rows v4.0.0 / analysis_sheet_rows v4.1.2.
-_INTERNAL_FIELD_PREFIXES: Tuple[str, ...] = ("_skip_", "_internal_", "_meta_", "_debug_", "_trace_")
-_INTERNAL_FIELDS_TO_STRIP_HARD: frozenset = frozenset({
-    "_placeholder",
-    "_skip_recommendation_synthesis",
-    "unit_normalization_warnings",
-    "intrinsic_value_source",
-})
-
-
-def _strip_internal_fields(row: Any) -> Any:
-    """v4.1.0: Remove engine internal coordination flags from a row dict.
-
-    Defence-in-depth: engine v5.47.4 strips these at source, but rows from
-    legacy engine, proxies, or cached snapshots may still carry them.
-    """
-    if not isinstance(row, dict):
-        return row
-    keys_to_remove: List[str] = []
-    for k in list(row.keys()):
-        ks = str(k)
-        if ks in _INTERNAL_FIELDS_TO_STRIP_HARD:
-            keys_to_remove.append(k)
-            continue
-        if any(ks.startswith(prefix) for prefix in _INTERNAL_FIELD_PREFIXES):
-            keys_to_remove.append(k)
-    for k in keys_to_remove:
-        try:
-            del row[k]
-        except Exception:
-            pass
-    return row
 
 def _strip(v: Any) -> str:
     try:
@@ -1135,26 +653,11 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 async def _maybe_await(x: Any) -> Any:
-    """v4.3.4: propagate exceptions from awaitable bodies.
-
-    v4.3.3 and earlier wrapped `await x` in try/except, which silently
-    swallowed exceptions raised inside the awaited coroutine and returned
-    the coroutine object itself. That caused
-    `_call_core_sheet_rows_best_effort` to misclassify engine exceptions
-    as "engine_returned_unexpected_types" with `last_repr=<coroutine ...>`,
-    losing the actual error class and message.
-
-    v4.3.4 only catches exceptions from `inspect.isawaitable()` (which
-    can fail on rare exotic types). Exceptions from inside the awaited
-    coroutine propagate to the caller, which has its own try/except in
-    `_call_core_sheet_rows_best_effort` and records them in `_call_summary`.
-    """
     try:
-        is_awaitable = inspect.isawaitable(x)
+        if inspect.isawaitable(x):
+            return await x
     except Exception:
-        return x
-    if is_awaitable:
-        return await x
+        pass
     return x
 
 def _as_list(v: Any) -> List[Any]:
@@ -1412,13 +915,12 @@ def _pad_contract(headers: Sequence[str], keys: Sequence[str], expected_len: int
     return hdrs[:expected_len], ks[:expected_len]
 
 def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
-    # v4.3.0: Top10 padding 93 → 100 (97 base + 3 Top10 metadata)
     hdrs, ks = _complete_schema_contract(headers, keys)
     for field in _TOP10_REQUIRED_FIELDS:
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, 100)
+    return _pad_contract(hdrs, ks, 83)
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _TOP10_PAGE:
@@ -1430,8 +932,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
         return h, k, "static_canonical_dictionary"
-    # v4.3.0: instrument fallback default 90 → 97
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 97))
+    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 80))
     return h, k, "static_canonical_instrument"
 
 def _expected_len(page: str) -> int:
@@ -1442,8 +943,7 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    # v4.3.0: default 90 → 97
-    return _EXPECTED_SHEET_LENGTHS.get(page, 97)
+    return _EXPECTED_SHEET_LENGTHS.get(page, 80)
 
 def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
     headers: List[str] = []
@@ -1592,86 +1092,6 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
                 return found
     return []
 
-def _rows_from_matrix(matrix: Any, keys: Sequence[str]) -> List[Dict[str, Any]]:
-    """v4.3.2: Convert a list-of-lists matrix into list-of-dicts using keys.
-
-    Symmetric with `core.data_engine._rows_from_matrix`. Each inner row is
-    zipped with the provided keys positionally; missing trailing values
-    become None, extra trailing values are dropped.
-
-    Inner items that are already dicts are passed through (so a "mixed"
-    bucket with both dicts and lists is handled). Inner items that are
-    neither dicts nor list/tuple are skipped.
-    """
-    if not isinstance(matrix, list) or not keys:
-        return []
-    ks = [str(k) for k in keys]
-    out: List[Dict[str, Any]] = []
-    for row in matrix:
-        if isinstance(row, dict):
-            out.append({k: row.get(k) for k in ks})
-            continue
-        if not isinstance(row, (list, tuple)):
-            continue
-        out.append({k: (row[i] if i < len(row) else None) for i, k in enumerate(ks)})
-    return out
-
-def _extract_rows_with_matrix_fallback(payload: Any, keys: Sequence[str]) -> List[Dict[str, Any]]:
-    """v4.3.2: Row extractor that handles both list-of-dicts and matrix payloads.
-
-    The v5.50.0 engine `get_sheet_rows()` returns rows in MATRIX form —
-    `payload["rows"]` is a list of lists positionally keyed to
-    `payload["keys"]`, not a list of dicts. The legacy adapter
-    `core.data_engine.get_sheet_rows` did matrix-to-dict conversion
-    internally before returning, which is why v4.2.0 (legacy) saw dicts
-    here and v4.3.1 (direct v2) saw nothing.
-
-    Strategy:
-      1. First try `_extract_rows_like` (handles dicts in any standard
-         bucket — preserves v4.3.1 behavior for dict-shaped payloads).
-      2. If that returns empty, scan the same buckets for list-of-list
-         data and convert via `_rows_from_matrix(rr, keys)`.
-      3. If the payload also has a top-level "rows_matrix" or "matrix"
-         key (some engines keep dict rows in "rows" and matrix in "matrix"
-         simultaneously), try that as a last resort.
-
-    Returns a list of dicts every time. Empty list on no match.
-    """
-    # Path 1: existing behavior — find dict rows anywhere
-    dict_rows = _extract_rows_like(payload)
-    if dict_rows:
-        return dict_rows
-    if not isinstance(payload, Mapping) or not keys:
-        return []
-    ks = list(keys)
-    # Path 2: scan same buckets for matrix data
-    for bucket in ("rows", "rows_matrix", "matrix", "data", "items", "records", "quotes", "results"):
-        rr = payload.get(bucket)
-        if not isinstance(rr, list) or not rr:
-            continue
-        # Skip buckets that are clearly not row data (already-handled dicts caught above;
-        # only matrix or mixed left here). Accept if first non-empty element is list/tuple.
-        first = rr[0]
-        if isinstance(first, (list, tuple)):
-            converted = _rows_from_matrix(rr, ks)
-            if converted:
-                return converted
-        elif isinstance(first, dict):
-            # Already-dicts case was handled by _extract_rows_like above; if we got here
-            # _extract_rows_like rejected this bucket (e.g. bucket=="rows" but first dict
-            # was empty). Try projecting anyway as defence-in-depth.
-            converted = _rows_from_matrix(rr, ks)
-            if converted:
-                return converted
-    # Path 3: nested payload envelopes (mirror _extract_rows_like's recursion)
-    for name in ("payload", "result", "response", "output", "data"):
-        nested = payload.get(name)
-        if isinstance(nested, Mapping):
-            inner = _extract_rows_with_matrix_fallback(nested, ks)
-            if inner:
-                return inner
-    return []
-
 def _extract_status_error(payload: Any) -> Tuple[str, Optional[str], Dict[str, Any]]:
     if not isinstance(payload, Mapping):
         return "success", None, {}
@@ -1682,8 +1102,6 @@ def _extract_status_error(payload: Any) -> Tuple[str, Optional[str], Dict[str, A
 
 def _normalize_to_schema_keys(*, schema_keys: Sequence[str], schema_headers: Sequence[str], raw: Mapping[str, Any]) -> Dict[str, Any]:
     raw = dict(raw or {})
-    # v4.1.0: defensively strip internal coordination flags before extraction.
-    _strip_internal_fields(raw)
     header_by_key = {str(k): str(h) for k, h in zip(schema_keys, schema_headers)}
     out: Dict[str, Any] = {}
     for k in schema_keys:
@@ -1779,45 +1197,13 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
     return final_rows
 
 def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
-    """Conservative placeholder (v4.1.0): identity columns get filled,
-    everything numeric returns None. The row is clearly marked as a
-    placeholder via the `warnings` field. Same philosophy as
-    `routes.analysis_sheet_rows` v4.1.2 / `routes.advanced_sheet_rows` v4.0.0.
-
-    v4.3.5 [FIX-4]: identity columns now consult `_STATIC_IDENTITY_MAP`
-    for known symbols BEFORE applying the v4.0.0 generic guesses.
-    Result: AAPL placeholder row shows "Apple Inc." / "Technology" /
-    "Consumer Electronics" instead of "AAPL" / null / null.
-
-    v4.0.0 fabricated values like `recommendation="Accumulate"`,
-    `expected_roi_3m=12.5%`, `forecast_confidence=99` for symbols where
-    the engine returned no data. In a financial product, those synthetic
-    numbers can be acted on by users — financial-safety risk.
-    """
     kk = _normalize_key_name(key)
-
-    # v4.3.5: consult the static identity map first for known symbols.
-    # This populates name/sector/industry/country/exchange/currency/
-    # asset_class with accurate values when the symbol is known. The
-    # generic fallbacks (.SR → Tadawul/SAR etc.) still apply when
-    # the symbol is not in the map.
-    static_id = _get_static_identity(symbol)
-    if kk in static_id:
-        return static_id[kk]
-
-    # Identity columns — safe to populate
     if kk in {"symbol", "ticker"}:
         return symbol
     if kk == "name":
-        return symbol  # don't fabricate composite names
+        return f"{page} {symbol}"
     if kk == "asset_class":
-        if symbol.endswith("=F"):
-            return "Commodity"
-        if symbol.endswith("=X"):
-            return "FX"
-        if page == "Mutual_Funds":
-            return "Fund"
-        return "Equity"
+        return "Commodity" if symbol.endswith("=F") else "FX" if symbol.endswith("=X") else "Fund" if page == "Mutual_Funds" else "Equity"
     if kk == "exchange":
         if symbol.endswith(".SR"):
             return "Tadawul"
@@ -1827,143 +1213,37 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
             return "FX"
         return "NASDAQ/NYSE"
     if kk == "currency":
-        if symbol.endswith(".SR"):
-            return "SAR"
-        if symbol.endswith("=X") and len(symbol) >= 8:
-            pair = symbol.rstrip("=X")
-            if len(pair) >= 6:
-                return pair[3:6]
-        return "USD"
+        return "SAR" if symbol.endswith(".SR") else "USD"
     if kk == "country":
-        if symbol.endswith(".SR"):
-            return "Saudi Arabia"
-        if symbol.endswith("=F") or symbol.endswith("=X"):
-            return "Global"
-        return "USA"
-
-    # Provenance — clearly mark as placeholder
+        return "Saudi Arabia" if symbol.endswith(".SR") else "Global"
     if kk == "data_provider":
-        return "placeholder_no_live_data"
+        return "advanced_analysis.placeholder_fallback"
     if kk in {"last_updated_utc", "last_updated_riyadh"}:
         return datetime.utcnow().isoformat()
-    if kk == "warnings":
-        return "Placeholder fallback — no live data available for this symbol"
-
-    # Top10 metadata (schema requires non-empty)
-    if kk == "top10_rank":
+    if kk == "recommendation":
+        return "Watch" if row_index > 3 else "Accumulate"
+    if kk == "recommendation_reason":
+        return "Placeholder fallback because live engine returned no usable rows."
+    if kk in {"top10_rank", "rank_overall"}:
         return row_index
     if kk == "selection_reason":
-        return "Placeholder — upstream returned no usable rows; no real ranking applied"
+        return "Placeholder fallback because upstream builders returned no usable rows."
     if kk == "criteria_snapshot":
-        return json.dumps(
-            {"symbol": symbol, "row_index": row_index, "source": "placeholder_no_live_data"},
-            ensure_ascii=False,
-        )
-
-    # Notes (Data_Dictionary)
-    if kk == "notes":
-        return "Placeholder fallback row"
-
-    # Everything else (prices, scores, ROIs, fundamentals, risk metrics,
-    # valuation ratios, forecasts, position data, view tokens,
-    # v5.50.0 Decision Matrix fields, v5.50.0 Candlestick fields) → None.
+        return json.dumps({"symbol": symbol, "row_index": row_index, "source": "placeholder"}, ensure_ascii=False)
+    if kk in {"warnings", "notes"}:
+        return "placeholder"
+    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "avg_cost", "position_cost", "position_value", "unrealized_pl", "intrinsic_value"}:
+        base = 100.0 + float(row_index)
+        return round(base, 2)
+    if kk in {"percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score"}:
+        return round(max(1.0, 100.0 - float(row_index * 3)), 2)
+    if kk in {"risk_bucket", "confidence_bucket"}:
+        return "Moderate" if row_index > 3 else "High Confidence"
+    if kk == "invest_period_label":
+        return "3M"
+    if kk == "horizon_days":
+        return 90
     return None
-
-def _enrich_placeholder_with_yfinance(row: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-    """v4.3.5 [FIX-3]: Tier-1 fallback enrichment via yfinance .fast_info.
-
-    When the engine fails, placeholder rows are pure structure with
-    null prices. This helper opportunistically populates a handful of
-    price/volume fields from yfinance's `.fast_info` (a fast snapshot
-    method that doesn't trigger full info fetching).
-
-    Gated on TFB_ADVANCED_TIER1_FALLBACK=1. Default OFF — must be
-    opt-in to avoid network calls during normal operation. Recommended
-    ON during incident response.
-
-    Failure modes (yfinance unreachable, symbol invalid, .fast_info
-    raises, etc.) are silent — the row is returned unmodified. We do
-    NOT raise and we do NOT log per-symbol failures (would spam logs
-    on universe-wide outages). One module-level WARNING is logged
-    only on import failure.
-    """
-    if not _tier1_yfinance_enrichment_enabled():
-        return row
-    try:
-        import yfinance as yf  # type: ignore
-    except Exception as e:
-        try:
-            logger.warning(
-                "[advanced_analysis v%s] yfinance Tier-1 fallback requested but yfinance not importable: %s",
-                ADVANCED_ANALYSIS_VERSION, e,
-            )
-        except Exception:
-            pass
-        return row
-    try:
-        ticker = yf.Ticker(symbol)
-        fi = getattr(ticker, "fast_info", None)
-        if fi is None:
-            return row
-        # yfinance .fast_info attribute names vary by version. Try both
-        # camelCase and snake_case shapes; coerce numerics defensively.
-        attr_to_key = (
-            (("last_price", "lastPrice"), "current_price"),
-            (("previous_close", "previousClose"), "previous_close"),
-            (("open", "regularMarketOpen"), "open_price"),
-            (("day_high", "dayHigh"), "day_high"),
-            (("day_low", "dayLow"), "day_low"),
-            (("year_high", "fiftyTwoWeekHigh", "yearHigh"), "week_52_high"),
-            (("year_low", "fiftyTwoWeekLow", "yearLow"), "week_52_low"),
-            (("market_cap", "marketCap"), "market_cap"),
-            (("ten_day_average_volume", "tenDayAverageVolume"), "avg_volume_10d"),
-            (("three_month_average_volume", "threeMonthAverageVolume"), "avg_volume_30d"),
-        )
-        any_populated = False
-        for attrs, schema_key in attr_to_key:
-            if schema_key not in row or row.get(schema_key) is not None:
-                continue
-            for attr in attrs:
-                try:
-                    val = getattr(fi, attr, None)
-                    if val is None:
-                        continue
-                    if isinstance(val, (int, float)) and math.isfinite(float(val)):
-                        row[schema_key] = float(val)
-                        any_populated = True
-                        break
-                    if isinstance(val, str) and val.strip():
-                        row[schema_key] = val
-                        any_populated = True
-                        break
-                except Exception:
-                    continue
-        # Compute price_change / percent_change if both base values present
-        if (any_populated and row.get("current_price") is not None
-                and row.get("previous_close") is not None
-                and row.get("price_change") is None):
-            try:
-                cp = float(row["current_price"])
-                pc = float(row["previous_close"])
-                row["price_change"] = round(cp - pc, 4)
-                if pc != 0.0:
-                    row["percent_change"] = round((cp - pc) / pc * 100.0, 4)
-            except Exception:
-                pass
-        if any_populated:
-            row["data_provider"] = "yfinance_tier1_fallback"
-            existing_warning = _strip(row.get("warnings"))
-            tier1_note = "Tier-1 yfinance fallback active — full enrichment unavailable"
-            if existing_warning and tier1_note not in existing_warning:
-                row["warnings"] = "{}; {}".format(existing_warning, tier1_note)
-            else:
-                row["warnings"] = tier1_note
-    except Exception:
-        # Per-symbol failure is silent. Universe-wide failures will be
-        # visible in deploy logs through the engine-level WARNING.
-        return row
-    return row
-
 
 def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
     symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
@@ -1971,23 +1251,13 @@ def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols
         symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, []) if _normalize_symbol_token(x)]
     symbols = symbols[offset : offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
     rows: List[Dict[str, Any]] = []
-    tier1_active = _tier1_yfinance_enrichment_enabled()
     for idx, sym in enumerate(symbols, start=offset + 1):
         row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
-        # v4.1.0: ALWAYS guarantee a warnings field so the user knows
-        # this row is a placeholder, regardless of which page schema is used.
-        if "warnings" in row and not row.get("warnings"):
-            row["warnings"] = "Placeholder fallback — no live data available for this symbol"
-        # v4.3.5 [FIX-3]: Tier-1 yfinance enrichment when explicitly enabled.
-        # Populates current_price, day_high/low, week_52_high/low, market_cap
-        # from yfinance .fast_info. No-op when the env flag is off.
-        if tier1_active:
-            row = _enrich_placeholder_with_yfinance(row, sym)
         rows.append(row)
     if page == _TOP10_PAGE:
         for idx, row in enumerate(rows, start=offset + 1):
             row["top10_rank"] = idx
-            row.setdefault("selection_reason", "Placeholder — upstream returned no usable rows; no real ranking applied")
+            row.setdefault("selection_reason", "Placeholder fallback because upstream builders returned no usable rows.")
             row.setdefault("criteria_snapshot", "{}")
     return rows
 
@@ -2013,14 +1283,11 @@ def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: in
         symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(_INSIGHTS_PAGE, []) if _normalize_symbol_token(x)]
     stamp = datetime.utcnow().isoformat()
     rows: List[Dict[str, Any]] = [
-        {"section": "Coverage", "item": "Requested symbols", "symbol": "", "metric": "count", "value": len(symbols), "notes": "Local insights fallback summary — no live engine data", "last_updated_riyadh": stamp},
+        {"section": "Coverage", "item": "Requested symbols", "symbol": "", "metric": "count", "value": len(symbols), "notes": "Local insights fallback summary", "last_updated_riyadh": stamp},
         {"section": "Coverage", "item": "Universe sample", "symbol": "", "metric": "symbols", "value": ", ".join(symbols[:5]), "notes": "Sample of the symbols used by fallback mode", "last_updated_riyadh": stamp},
-        {"section": "Status", "item": "Engine availability", "symbol": "", "metric": "warning", "value": "Engine returned no usable rows", "notes": "Live engine and upstream proxies all returned empty/error payloads", "last_updated_riyadh": stamp},
     ]
-    # v4.1.0: don't fabricate per-symbol "Watch"/"Accumulate" signals.
-    # Just list which symbols WOULD have been analyzed.
     for idx, sym in enumerate(symbols[: max(1, limit + offset)], start=1):
-        rows.append({"section": "Pending Analysis", "item": f"Symbol {idx}", "symbol": sym, "metric": "status", "value": "no_live_data", "notes": "Symbol is in the requested universe but the engine returned no live row for it", "last_updated_riyadh": stamp})
+        rows.append({"section": "Signals", "item": f"Fallback signal {idx}", "symbol": sym, "metric": "recommendation", "value": "Watch" if idx > 2 else "Accumulate", "notes": "Generated locally because upstream insights payload was unavailable", "last_updated_riyadh": stamp})
     return _slice(rows, limit=limit, offset=offset)
 
 def _build_nonempty_failsoft_rows(*, page: str, headers: Sequence[str], keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int, top_n: int) -> List[Dict[str, Any]]:
@@ -2034,13 +1301,52 @@ def _build_nonempty_failsoft_rows(*, page: str, headers: Sequence[str], keys: Se
         return _slice(rows, limit=limit, offset=offset)
     return _build_placeholder_rows(page=page, keys=keys, requested_symbols=requested_symbols or EMERGENCY_PAGE_SYMBOLS.get(page, []), limit=limit, offset=offset)
 
-def _payload_envelope(*, page: str, headers: Sequence[str], keys: Sequence[str], row_objects: Sequence[Mapping[str, Any]], include_matrix: bool, request_id: str, started_at: float, mode: str, status_out: str, error_out: Optional[str], meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _payload_envelope(
+    *,
+    page: str,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    row_objects: Sequence[Mapping[str, Any]],
+    include_matrix: bool,
+    request_id: str,
+    started_at: float,
+    mode: str,
+    status_out: str,
+    error_out: Optional[str],
+    meta: Optional[Dict[str, Any]] = None,
+    provider_health: Optional[Mapping[str, Any]] = None,
+    lifted_warnings: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Build the canonical sheet-rows envelope.
+
+    v4.1.0 additions:
+      - `provider_health`: optional engine `health()` snapshot. Surfaced
+        under `meta.provider_health`. Pass the dict from
+        `_extract_provider_health_snapshot()`.
+      - `lifted_warnings`: optional list of envelope-level warnings
+        lifted from row warnings via `_lift_systemic_warning_markers`.
+        Surfaced under the top-level `warnings` key (Apps Script
+        12_Diagnostics.gs can read this without scanning every row).
+    """
     hdrs = list(headers or [])
     ks = list(keys or [])
-    # v4.1.0: strip internal flags at final emission too (defence-in-depth).
-    rows_dict = [_strip_internal_fields({str(k): _json_safe(dict(r).get(k)) for k in ks}) for r in (row_objects or [])]
+    rows_dict = [{str(k): _json_safe(dict(r).get(k)) for k in ks} for r in (row_objects or [])]
     matrix = _rows_to_matrix(rows_dict, ks) if include_matrix else []
-    return _json_safe({
+
+    # Compose final meta with provider_health attached.
+    final_meta: Dict[str, Any] = {
+        "duration_ms": round((time.time() - started_at) * 1000.0, 3),
+        "mode": mode,
+        "count": len(rows_dict),
+        "dispatch": "advanced_analysis_root",
+        "source": CORE_GET_SHEET_ROWS_SOURCE,
+    }
+    if meta:
+        final_meta.update(meta)
+    if provider_health is not None:
+        final_meta["provider_health"] = _json_safe(provider_health)
+
+    envelope: Dict[str, Any] = {
         "status": status_out,
         "page": page,
         "sheet": page,
@@ -2066,77 +1372,16 @@ def _payload_envelope(*, page: str, headers: Sequence[str], keys: Sequence[str],
         "error": error_out,
         "version": ADVANCED_ANALYSIS_VERSION,
         "request_id": request_id,
-        "meta": {
-            "duration_ms": round((time.time() - started_at) * 1000.0, 3),
-            "mode": mode,
-            "count": len(rows_dict),
-            "dispatch": "advanced_analysis_root",
-            "source": CORE_GET_SHEET_ROWS_SOURCE,
-            **(meta or {}),
-        },
-    })
+        "meta": final_meta,
+    }
+    if lifted_warnings:
+        envelope["warnings"] = list(lifted_warnings)
+    return _json_safe(envelope)
 
 async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """v4.3.5: candidate signatures expanded from 7 to 13 with symbols-aware
-    variants. v4.3.4: every attempt tracked; never silently returns (None, None).
-
-    v4.3.5 [FIX-2]: the 6 new candidate signatures all pass `symbols=` as
-    an explicit kwarg or positional arg, alongside the existing 7 sheet/
-    limit/offset variants. Tried FIRST because v4.3.4's diagnostic output
-    in production indicated the v5.50.0 engine returns None when no
-    `symbols` arg is supplied — even when `body["symbols"]` is set, since
-    the engine method doesn't unpack `body`. This fix gets the symbols
-    list directly into the engine's signature.
-
-    The v4.3.4 docstring (preserved): records every attempt's outcome in
-    a per-call summary, and always returns a dict (synthesizing a
-    `{"status":"error", ...}` when no candidate succeeded). The synthesized
-    dict carries `_call_summary` so the impl can surface it in meta.
-    """
     if core_get_sheet_rows is None:
-        return {
-            "status": "error",
-            "error": "core_get_sheet_rows is None — both v2 and legacy bindings failed",
-            "error_class": "BindingUnavailable",
-            "row_objects": [],
-            "_call_summary": [],
-            "_call_outcome": "binding_absent",
-        }, "unavailable"
-
-    # v4.3.5 [FIX-2]: extract symbols from body for explicit-symbols
-    # candidate signatures. Falls through to symbol-less variants if
-    # body has no symbols (defensive — pre-population happens upstream
-    # in _run_advanced_sheet_rows_impl, but we still handle the case
-    # where this function is called from another caller).
-    body_symbols: List[str] = []
-    if isinstance(body, dict):
-        raw_syms = body.get("symbols") or body.get("tickers") or []
-        if isinstance(raw_syms, list):
-            body_symbols = [str(s).strip() for s in raw_syms if str(s).strip()]
-        elif isinstance(raw_syms, str) and raw_syms.strip():
-            body_symbols = [raw_syms.strip()]
-
-    candidates: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
-
-    # Symbols-aware candidates first (only when we actually have symbols)
-    if body_symbols:
-        candidates.extend([
-            # 0: full kwargs with symbols + body
-            ((), {"sheet": page, "symbols": body_symbols, "limit": limit, "offset": offset, "mode": mode, "body": body}),
-            # 1: full kwargs with symbols, no body
-            ((), {"sheet": page, "symbols": body_symbols, "limit": limit, "offset": offset, "mode": mode}),
-            # 2: minimal kwargs with symbols
-            ((), {"sheet": page, "symbols": body_symbols, "limit": limit, "offset": offset}),
-            # 3: page-named instead of sheet-named
-            ((), {"page": page, "symbols": body_symbols, "limit": limit, "offset": offset}),
-            # 4: page positional + symbols kwarg
-            ((page,), {"symbols": body_symbols, "limit": limit, "offset": offset}),
-            # 5: bare symbols + sheet
-            ((), {"sheet": page, "symbols": body_symbols}),
-        ])
-
-    # Original v4.3.4 candidates (7) — symbols-less, kept for backward compat
-    candidates.extend([
+        return None, None
+    candidates = [
         ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
         ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
         ((), {"sheet": page, "limit": limit, "offset": offset}),
@@ -2144,196 +1389,82 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
         ((page,), {"limit": limit, "offset": offset, "mode": mode}),
         ((page,), {"limit": limit, "offset": offset}),
         ((page,), {}),
-    ])
-    call_summary: List[Dict[str, Any]] = []
+    ]
     last_err: Optional[Exception] = None
-    last_non_collection_value_repr: Optional[str] = None
-
-    for idx, (args, kwargs) in enumerate(candidates):
-        sig_label = "args={} kwargs_keys={}".format(
-            "({})".format(",".join(repr(a) for a in args)) if args else "()",
-            sorted(list(kwargs.keys())),
-        )
+    for args, kwargs in candidates:
         try:
             res = core_get_sheet_rows(*args, **kwargs)
             res = await _maybe_await(res)
             if isinstance(res, dict):
-                call_summary.append({"signature_idx": idx, "outcome": "dict",
-                                     "detail": "top_keys={}".format(sorted(list(res.keys()))[:10]),
-                                     "signature": sig_label})
-                # Attach summary to the returned dict so the impl can surface it.
-                if "_call_summary" not in res:
-                    try:
-                        res["_call_summary"] = call_summary
-                        res["_call_outcome"] = "dict"
-                    except Exception:
-                        pass
                 return res, CORE_GET_SHEET_ROWS_SOURCE
             if isinstance(res, list):
-                call_summary.append({"signature_idx": idx, "outcome": "list",
-                                     "detail": "len={}".format(len(res)),
-                                     "signature": sig_label})
-                return {
-                    "row_objects": res,
-                    "_call_summary": call_summary,
-                    "_call_outcome": "list",
-                }, CORE_GET_SHEET_ROWS_SOURCE
-            # v4.3.4: track non-dict, non-list returns instead of falling
-            # through silently. Most likely: engine returned None.
-            outcome = "none" if res is None else "other_{}".format(type(res).__name__)
-            try:
-                last_non_collection_value_repr = repr(res)[:200]
-            except Exception:
-                last_non_collection_value_repr = "<unrepresentable>"
-            call_summary.append({
-                "signature_idx": idx,
-                "outcome": outcome,
-                "detail": last_non_collection_value_repr,
-                "signature": sig_label,
-            })
-            # Continue to the next signature — maybe a different call shape works.
+                return {"row_objects": res}, CORE_GET_SHEET_ROWS_SOURCE
         except TypeError as e:
             last_err = e
-            call_summary.append({
-                "signature_idx": idx,
-                "outcome": "raised_TypeError",
-                "detail": "{}: {}".format(e.__class__.__name__, str(e)[:200]),
-                "signature": sig_label,
-            })
             continue
         except Exception as e:
             last_err = e
-            call_summary.append({
-                "signature_idx": idx,
-                "outcome": "raised_{}".format(e.__class__.__name__),
-                "detail": "{}: {}".format(e.__class__.__name__, str(e)[:200]),
-                "signature": sig_label,
-            })
-            # v4.3.3 logged this; v4.3.4 keeps that log and breaks out
-            # so we don't keep retrying through a clearly-broken call path.
-            try:
-                logger.warning(
-                    "[advanced_analysis v%s] engine call raised %s: %s "
-                    "(page=%r limit=%r offset=%r body_keys=%r signature_idx=%d)",
-                    ADVANCED_ANALYSIS_VERSION,
-                    e.__class__.__name__, e,
-                    page, limit, offset,
-                    sorted(list((body or {}).keys()))[:15],
-                    idx,
-                )
-            except Exception:
-                pass
             break
+    if last_err is not None:
+        return {"status": "error", "error": str(last_err), "row_objects": []}, CORE_GET_SHEET_ROWS_SOURCE
+    return None, None
 
-    # No success and no successful return — synthesize an informative
-    # error dict. Classification logic (v4.3.4 corrected):
-    #
-    # Inspect the actual call_summary outcomes to pick the most precise
-    # label, NOT just `last_err is not None` (which v4.3.4-rc1 used and
-    # which conflated "all TypeError" with "non-TypeError exception"
-    # because TypeError sets last_err too).
-    outcomes = [entry["outcome"] for entry in call_summary if isinstance(entry, dict)]
-    has_non_typeerror_exception = any(
-        isinstance(o, str) and o.startswith("raised_") and o != "raised_TypeError"
-        for o in outcomes
-    )
-    all_typeerror = bool(outcomes) and all(o == "raised_TypeError" for o in outcomes)
-    has_none = any(o == "none" for o in outcomes)
-    has_other = any(isinstance(o, str) and o.startswith("other_") for o in outcomes)
+def _normalize_external_payload(
+    *,
+    external_payload: Mapping[str, Any],
+    page: str,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    include_matrix: bool,
+    request_id: str,
+    started_at: float,
+    mode: str,
+    limit: int = 2000,
+    offset: int = 0,
+    top_n: int = 2000,
+    requested_symbols: Optional[Sequence[str]] = None,
+    meta_extra: Optional[Dict[str, Any]] = None,
+    provider_health: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize an engine payload into the canonical envelope.
 
-    if has_non_typeerror_exception and last_err is not None:
-        outcome_summary = "all_signatures_failed_with_exception"
-        synth_error = "{}: {}".format(last_err.__class__.__name__, last_err)
-        synth_class = last_err.__class__.__name__
-    elif all_typeerror:
-        outcome_summary = "all_signatures_typed_mismatch"
-        synth_error = "engine method rejected all 7 candidate signatures (TypeError on each)"
-        synth_class = "AllSignaturesTypeError"
-    elif has_none:
-        outcome_summary = "engine_returned_none"
-        synth_error = ("engine method returned None on at least one signature; "
-                       "no signature produced a dict or list. last_repr={}").format(
-            last_non_collection_value_repr or "(none)"
-        )
-        synth_class = "EngineReturnedNone"
-    elif has_other:
-        outcome_summary = "engine_returned_unexpected_types"
-        synth_error = ("engine method returned non-dict, non-list types "
-                       "on every signature. last_repr={}").format(
-            last_non_collection_value_repr or "(none)"
-        )
-        synth_class = "EngineReturnedUnexpectedType"
-    elif last_err is not None:
-        # Defensive — got an exception we couldn't classify above.
-        outcome_summary = "all_signatures_failed_with_exception"
-        synth_error = "{}: {}".format(last_err.__class__.__name__, last_err)
-        synth_class = last_err.__class__.__name__
-    else:
-        outcome_summary = "no_attempts_executed"
-        synth_error = "no candidate signatures were attempted (unexpected internal state)"
-        synth_class = "NoAttempts"
-    return {
-        "status": "error",
-        "error": synth_error,
-        "error_class": synth_class,
-        "row_objects": [],
-        "_call_summary": call_summary,
-        "_call_outcome": outcome_summary,
-    }, CORE_GET_SHEET_ROWS_SOURCE
-
-def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: str, headers: Sequence[str], keys: Sequence[str], include_matrix: bool, request_id: str, started_at: float, mode: str, limit: int = 2000, offset: int = 0, top_n: int = 2000, requested_symbols: Optional[Sequence[str]] = None, meta_extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    v4.1.0: forwards `provider_health` snapshot into the envelope so the
+    success path carries the same `meta.provider_health` field as the
+    fail-soft path. Also lifts systemic markers from row warnings into
+    envelope-level `warnings`.
+    """
     ext = dict(external_payload or {})
     hdrs = list(headers or [])
     ks = list(keys or [])
-    # v4.3.2: matrix-aware extraction. v5.50.0 engine returns rows in
-    # list-of-lists form (positionally keyed to ks); legacy adapter did
-    # this conversion internally. Calling the matrix-aware extractor here
-    # restores parity. Falls back identically to v4.3.1 for dict payloads.
-    rows = _extract_rows_with_matrix_fallback(ext, ks)
-    # v4.3.2: capture extraction diagnostic for production observability.
-    # If extraction returned 0 rows but the payload clearly has data, the
-    # diagnostic surfaces in meta.engine_payload_diagnostic so the next
-    # debugging step doesn't require code changes.
-    engine_payload_diagnostic: Dict[str, Any] = {}
-    if not rows and isinstance(ext, Mapping):
-        bucket_summary: Dict[str, str] = {}
-        for bucket in ("rows", "rows_matrix", "matrix", "row_objects", "records", "items", "data", "quotes", "results"):
-            v = ext.get(bucket)
-            if v is None:
-                continue
-            if isinstance(v, list):
-                if not v:
-                    bucket_summary[bucket] = "list[empty]"
-                else:
-                    first = v[0]
-                    bucket_summary[bucket] = "list[{}]({} els)".format(type(first).__name__, len(v))
-            else:
-                bucket_summary[bucket] = type(v).__name__
-        engine_payload_diagnostic = {
-            "buckets": bucket_summary,
-            "top_keys": sorted(list(ext.keys()))[:25],
-            "had_status": _strip(ext.get("status")) or "(absent)",
-            "had_error": _strip(ext.get("error")) or "(absent)",
-            "schema_keys_count": len(ks),
-        }
+    rows = _extract_rows_like(ext)
     normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
     if page == _TOP10_PAGE:
         normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
     normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
     status_out, error_out, ext_meta = _extract_status_error(ext)
-    # v4.1.0: treat engine v5.47.4 "warn" as success when rows are present
-    status_lc = (status_out or "").lower()
-    if status_lc == "warn":
-        status_out = "success" if normalized_rows else "warn"
     if not normalized_rows:
         status_out = "partial"
         error_out = error_out or "No usable rows returned"
     final_meta = dict(ext_meta or {})
     if meta_extra:
         final_meta.update(meta_extra)
-    if engine_payload_diagnostic:
-        final_meta["engine_payload_diagnostic"] = engine_payload_diagnostic
-    return _payload_envelope(page=page, headers=hdrs, keys=ks, row_objects=normalized_rows, include_matrix=include_matrix, request_id=request_id, started_at=started_at, mode=mode, status_out=status_out or ("success" if normalized_rows else "partial"), error_out=error_out, meta=final_meta)
+    # v4.1.0 [ADD-F]: lift systemic markers from row warnings to envelope level.
+    lifted = _lift_systemic_warning_markers(normalized_rows)
+    return _payload_envelope(
+        page=page,
+        headers=hdrs,
+        keys=ks,
+        row_objects=normalized_rows,
+        include_matrix=include_matrix,
+        request_id=request_id,
+        started_at=started_at,
+        mode=mode,
+        status_out=status_out or ("success" if normalized_rows else "partial"),
+        error_out=error_out,
+        meta=final_meta,
+        provider_health=provider_health,
+        lifted_warnings=lifted or None,
+    )
 
 async def _run_advanced_sheet_rows_impl(
     request: Request,
@@ -2371,263 +1502,105 @@ async def _run_advanced_sheet_rows_impl(
     headers, keys, spec, schema_source = _resolve_contract(page)
 
     if schema_only or headers_only:
-        return _payload_envelope(page=page, headers=headers, keys=keys, row_objects=[], include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, status_out="success", error_out=None, meta={"dispatch": "schema_only", "schema_source": schema_source, "headers_only": headers_only, "schema_only": schema_only})
+        # v4.1.0: schema-only path does NOT fetch provider_health
+        # (no live data being served — keep it cheap).
+        return _payload_envelope(
+            page=page, headers=headers, keys=keys, row_objects=[],
+            include_matrix=include_matrix, request_id=request_id, started_at=start,
+            mode=mode, status_out="success", error_out=None,
+            meta={"dispatch": "schema_only", "schema_source": schema_source,
+                  "headers_only": headers_only, "schema_only": schema_only},
+        )
 
-    # v4.3.5 [FIX-1]: pre-populate merged_body["symbols"] from the page's
-    # default universe when the body has no symbols. Without this, the
-    # v5.50.0 engine returns None (or empty) on all candidate signatures
-    # because it has no symbols to fetch — exactly the failure mode that
-    # v4.3.4's diagnostic (engine_returned_none / all_signatures_typed_mismatch)
-    # was designed to expose. Special pages (Insights, Data_Dictionary)
-    # are exempt: their schemas don't have a symbols column, so injection
-    # would be meaningless.
-    symbols_were_injected = False
-    if page not in {_INSIGHTS_PAGE, _DICTIONARY_PAGE}:
-        if not requested_symbols:
-            page_default_symbols = [
-                _normalize_symbol_token(x)
-                for x in EMERGENCY_PAGE_SYMBOLS.get(page, [])
-                if _normalize_symbol_token(x)
-            ]
-            if page_default_symbols:
-                # Cap at the request's effective limit to avoid asking the
-                # engine for more rows than the user wanted.
-                injected = page_default_symbols[: max(limit, top_n, 1)]
-                merged_body = dict(merged_body)
-                merged_body["symbols"] = injected
-                merged_body["tickers"] = list(injected)
-                merged_body["_symbols_injected_by_route"] = "page_default_universe"
-                requested_symbols = injected
-                symbols_were_injected = True
-                try:
-                    logger.info(
-                        "[advanced_analysis v%s] FIX-1 injected %d default symbols for page=%r",
-                        ADVANCED_ANALYSIS_VERSION, len(injected), page,
-                    )
-                except Exception:
-                    pass
+    # v4.1.0 [ADD-E]: fetch provider_health snapshot ONCE per request.
+    # Total budget = single async call to engine.health() (no upstream API).
+    # Forwarded into both success and fail-soft envelopes so every response
+    # carries the engine's current view of provider health at request time.
+    provider_health = await _extract_provider_health_snapshot()
 
-    payload, source = await _call_core_sheet_rows_best_effort(page=page, limit=max(limit + offset, top_n), offset=0, mode=mode or "", body=merged_body)
-
-    # v4.3.4: UNCONDITIONALLY capture upstream diagnostic, regardless of
-    # payload shape. v4.3.3 only captured when `isinstance(payload, dict)`
-    # was True; the production response showed empty meta because v4.3.3's
-    # `_call_core_sheet_rows_best_effort` returned `(None, None)` when the
-    # engine returned non-dict, non-list values (e.g. None) on every
-    # candidate signature, so the dict-only capture branch never ran.
-    #
-    # v4.3.4's best-effort wrapper now ALWAYS returns a dict (even if the
-    # engine raised or returned junk on every signature, the wrapper
-    # synthesizes `{"status":"error", "_call_summary":[...], "_call_outcome":...}`).
-    # The capture below is still defensive — it handles None and non-dict
-    # cases for forward compatibility and future regression resilience.
-    #
-    # New fields surfaced to the wire (all under meta.):
-    #   * upstream_call_status   — one of: absent | non_mapping_<type>
-    #                              | error_dict | dict | dict_with_zero_extractable_rows
-    #   * upstream_call_summary  — per-attempt outcome list from the
-    #                              best-effort wrapper (signature_idx,
-    #                              outcome, detail, signature). Tells us
-    #                              EXACTLY what each candidate returned.
-    #   * upstream_call_outcome  — single-string label summarizing the
-    #                              overall failure mode (engine_returned_none
-    #                              / all_signatures_typed_mismatch /
-    #                              engine_returned_unexpected_types /
-    #                              all_signatures_failed_with_exception /
-    #                              binding_absent / dict / list).
-    #   * upstream_payload_type  — type name of the payload returned by
-    #                              the wrapper.
-    #   * upstream_payload_top_keys, upstream_status, upstream_error,
-    #     upstream_error_class, engine_payload_diagnostic — preserved
-    #     from v4.3.3 for dict payloads.
-    upstream_diagnostic_meta: Dict[str, Any] = {}
-    try:
-        if payload is None:
-            upstream_diagnostic_meta["upstream_call_status"] = "absent"
-            upstream_diagnostic_meta["upstream_payload_type"] = "NoneType"
-        elif not isinstance(payload, dict):
-            upstream_diagnostic_meta["upstream_call_status"] = "non_mapping_{}".format(type(payload).__name__)
-            upstream_diagnostic_meta["upstream_payload_type"] = type(payload).__name__
-        else:
-            # payload IS a dict — capture full detail.
-            upstream_diagnostic_meta["upstream_payload_type"] = "dict"
-            upstream_diagnostic_meta["upstream_payload_top_keys"] = sorted(list(payload.keys()))[:25]
-            ups_status = _strip(payload.get("status"))
-            ups_error = _strip(payload.get("error")) or _strip(payload.get("detail")) or _strip(payload.get("message"))
-            ups_error_class = _strip(payload.get("error_class"))
-            if ups_status:
-                upstream_diagnostic_meta["upstream_status"] = ups_status
-            if ups_error:
-                upstream_diagnostic_meta["upstream_error"] = ups_error[:500]
-            if ups_error_class:
-                upstream_diagnostic_meta["upstream_error_class"] = ups_error_class
-            # v4.3.4: pull the per-attempt call summary synthesized by the
-            # best-effort wrapper. This is the new headline diagnostic —
-            # it reveals exactly what each of the 7 candidate signatures
-            # returned, which directly informs the next code-side fix.
-            call_summary = payload.get("_call_summary")
-            call_outcome = payload.get("_call_outcome")
-            if isinstance(call_summary, list) and call_summary:
-                # Cap at 10 entries to keep meta payload bounded; we only
-                # have 7 candidates anyway.
-                upstream_diagnostic_meta["upstream_call_summary"] = call_summary[:10]
-            if call_outcome:
-                upstream_diagnostic_meta["upstream_call_outcome"] = str(call_outcome)
-            # Bucket-shape summary (preserved from v4.3.3). Tells us
-            # whether the engine returned matrix, dicts, empty lists,
-            # or nothing in standard buckets.
-            bucket_summary: Dict[str, str] = {}
-            for bucket in ("rows", "rows_matrix", "matrix", "row_objects", "records", "items", "data", "quotes", "results"):
-                v = payload.get(bucket)
-                if v is None:
-                    continue
-                if isinstance(v, list):
-                    if not v:
-                        bucket_summary[bucket] = "list[empty]"
-                    else:
-                        first = v[0]
-                        bucket_summary[bucket] = "list[{}]({} els)".format(type(first).__name__, len(v))
-                else:
-                    bucket_summary[bucket] = type(v).__name__
-            if bucket_summary:
-                upstream_diagnostic_meta["engine_payload_diagnostic"] = bucket_summary
-            # Initial call_status — refined below if extraction fails.
-            if ups_status == "error":
-                upstream_diagnostic_meta["upstream_call_status"] = "error_dict"
-            else:
-                upstream_diagnostic_meta["upstream_call_status"] = "dict"
-    except Exception:
-        # Never let diagnostic capture itself fail the request.
-        pass
-
-    # v4.3.4: only attempt normalization if payload is a dict AND it does
-    # NOT carry an engine-error envelope (status:error / _call_outcome
-    # set). The synthesized error dicts from `_call_core_sheet_rows_best_effort`
-    # are diagnostic-only — they have no `row_objects` or `rows` to extract.
-    # Skipping normalize on them is purely an optimization; calling it
-    # would waste cycles and produce identical outcomes.
+    payload, source = await _call_core_sheet_rows_best_effort(
+        page=page, limit=max(limit + offset, top_n), offset=0,
+        mode=mode or "", body=merged_body,
+    )
     if isinstance(payload, dict):
-        ups_status_for_normalize = _strip(payload.get("status")).lower()
-        ups_outcome_for_normalize = _strip(payload.get("_call_outcome"))
-        skip_normalize_due_to_error = (
-            ups_status_for_normalize == "error"
-            and ups_outcome_for_normalize in {
-                "engine_returned_none",
-                "all_signatures_typed_mismatch",
-                "engine_returned_unexpected_types",
-                "all_signatures_failed_with_exception",
-                "binding_absent",
-            }
+        normalized = _normalize_external_payload(
+            external_payload=payload, page=page, headers=headers, keys=keys,
+            include_matrix=include_matrix, request_id=request_id, started_at=start,
+            mode=mode, limit=limit, offset=offset, top_n=top_n,
+            requested_symbols=requested_symbols,
+            meta_extra={"schema_source": schema_source,
+                        "source": source or CORE_GET_SHEET_ROWS_SOURCE},
+            provider_health=provider_health,
         )
-        if not skip_normalize_due_to_error:
-            normalized = _normalize_external_payload(external_payload=payload, page=page, headers=headers, keys=keys, include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, limit=limit, offset=offset, top_n=top_n, requested_symbols=requested_symbols, meta_extra={"schema_source": schema_source, "source": source or CORE_GET_SHEET_ROWS_SOURCE})
-            if _extract_rows_like(normalized):
-                # SUCCESS path. Surface the call summary into the success
-                # meta too so we can confirm in production which signature
-                # actually worked (informs future call-shape simplification).
-                # v4.3.5: also surface the symbols-injected flag and tier1
-                # status so deploy-log readers can correlate FIX-1 firing
-                # with success/failure outcomes.
-                try:
-                    existing_meta = normalized.get("meta") or {}
-                    if isinstance(existing_meta, dict):
-                        if upstream_diagnostic_meta.get("upstream_call_summary") or upstream_diagnostic_meta.get("upstream_call_outcome"):
-                            for k, v in upstream_diagnostic_meta.items():
-                                existing_meta.setdefault(k, v)
-                        existing_meta.setdefault("_symbols_injected_by_route", symbols_were_injected)
-                        existing_meta.setdefault("_tier1_yfinance_active", _tier1_yfinance_enrichment_enabled())
-                        normalized["meta"] = existing_meta
-                except Exception:
-                    pass
-                return normalized
-        # Extraction failed (or was skipped). Refine call_status from "dict"
-        # to a more precise label for wire visibility.
-        if upstream_diagnostic_meta.get("upstream_call_status") == "dict":
-            upstream_diagnostic_meta["upstream_call_status"] = "dict_with_zero_extractable_rows"
+        if _extract_rows_like(normalized):
+            return normalized
 
-    # v4.3.4: comprehensive WARNING log on every failure mode. Includes
-    # the new call_summary inline so deploy-log readers see what each
-    # signature returned without needing to hit the API.
-    try:
-        log_call_status = upstream_diagnostic_meta.get("upstream_call_status", "unknown")
-        log_call_outcome = upstream_diagnostic_meta.get("upstream_call_outcome")
-        log_call_summary = upstream_diagnostic_meta.get("upstream_call_summary")
-        # Compact the call_summary for log readability — one line per attempt.
-        compact_summary = ""
-        if isinstance(log_call_summary, list):
-            try:
-                compact_summary = " | ".join(
-                    "[{}]={}".format(entry.get("signature_idx", "?"), entry.get("outcome", "?"))
-                    for entry in log_call_summary
-                    if isinstance(entry, dict)
-                )
-            except Exception:
-                compact_summary = "(unprintable)"
-        logger.warning(
-            "[advanced_analysis v%s] engine call did not produce extractable rows. "
-            "page=%r call_status=%r call_outcome=%r upstream_status=%r upstream_error=%r "
-            "buckets=%r top_keys=%r summary=%s",
-            ADVANCED_ANALYSIS_VERSION, page,
-            log_call_status,
-            log_call_outcome,
-            upstream_diagnostic_meta.get("upstream_status"),
-            upstream_diagnostic_meta.get("upstream_error"),
-            upstream_diagnostic_meta.get("engine_payload_diagnostic"),
-            upstream_diagnostic_meta.get("upstream_payload_top_keys"),
-            compact_summary,
-        )
-    except Exception:
-        pass
-
-    fallback_rows = _build_nonempty_failsoft_rows(page=page, headers=headers, keys=keys, requested_symbols=requested_symbols, limit=limit, offset=offset, top_n=top_n)
+    # Fail-soft path: build placeholder rows, but still surface provider_health.
+    fallback_rows = _build_nonempty_failsoft_rows(
+        page=page, headers=headers, keys=keys,
+        requested_symbols=requested_symbols, limit=limit, offset=offset, top_n=top_n,
+    )
     fallback_status = "partial" if fallback_rows else "error"
-    fallback_error = "Local non-empty fallback emitted after upstream degradation" if fallback_rows else "No usable rows returned; schema-shaped fallback emitted"
-    # v4.3.4: dispatch label now reflects the call_outcome when known so
-    # log/metric readers can distinguish "engine returned None" from
-    # "engine raised" from "engine returned wrong shape" without parsing
-    # the upstream_call_summary. Falls back to v4.3.3's generic label when
-    # the outcome is "dict" (i.e. engine returned a dict but it had no
-    # extractable rows — usually a matrix-projection mismatch).
-    fallback_dispatch = "advanced_analysis_fail_soft_nonempty" if fallback_rows else "advanced_analysis_fail_soft"
-    try:
-        co = upstream_diagnostic_meta.get("upstream_call_outcome")
-        cs = upstream_diagnostic_meta.get("upstream_call_status")
-        # v4.3.4: dispatch labels strip "engine_" prefix from outcomes
-        # to avoid "fail_soft_engine_engine_returned_none" redundancy.
-        co_label = co
-        if isinstance(co_label, str) and co_label.startswith("engine_"):
-            co_label = co_label[len("engine_"):]
-        if co in {"engine_returned_none", "all_signatures_typed_mismatch",
-                  "engine_returned_unexpected_types", "all_signatures_failed_with_exception",
-                  "binding_absent"}:
-            fallback_dispatch = "advanced_analysis_fail_soft_{}".format(co_label)
-        elif cs == "dict_with_zero_extractable_rows":
-            fallback_dispatch = "advanced_analysis_fail_soft_extractor_miss"
-        elif cs and cs.startswith("non_mapping_"):
-            fallback_dispatch = "advanced_analysis_fail_soft_{}".format(cs)
-        elif cs == "absent":
-            fallback_dispatch = "advanced_analysis_fail_soft_payload_absent"
-    except Exception:
-        pass
-    fallback_meta: Dict[str, Any] = {
-        "dispatch": fallback_dispatch,
-        "schema_source": schema_source,
-        "source": source or CORE_GET_SHEET_ROWS_SOURCE,
-        # v4.3.5: surface FIX-1/FIX-3 status so deploy logs can confirm
-        # the new logic is engaging on production traffic.
-        "_symbols_injected_by_route": symbols_were_injected,
-        "_tier1_yfinance_active": _tier1_yfinance_enrichment_enabled(),
-    }
-    # v4.3.4: merge upstream diagnostic so the wire response shows what
-    # the engine actually returned (or didn't), including the per-attempt
-    # call summary that pinpoints the exact failure mode.
-    if upstream_diagnostic_meta:
-        fallback_meta.update(upstream_diagnostic_meta)
-    return _payload_envelope(page=page, headers=headers, keys=keys, row_objects=fallback_rows, include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, status_out=fallback_status, error_out=fallback_error, meta=fallback_meta)
+    fallback_error = (
+        "Local non-empty fallback emitted after upstream degradation"
+        if fallback_rows else "No usable rows returned; schema-shaped fallback emitted"
+    )
+    # v4.1.0: even fail-soft rows may carry warnings worth lifting (e.g. the
+    # placeholder builder marks rows with "Placeholder fallback").
+    lifted = _lift_systemic_warning_markers(fallback_rows)
+    return _payload_envelope(
+        page=page, headers=headers, keys=keys, row_objects=fallback_rows,
+        include_matrix=include_matrix, request_id=request_id, started_at=start,
+        mode=mode, status_out=fallback_status, error_out=fallback_error,
+        meta={
+            "dispatch": "advanced_analysis_fail_soft_nonempty" if fallback_rows else "advanced_analysis_fail_soft",
+            "schema_source": schema_source,
+            "source": source or CORE_GET_SHEET_ROWS_SOURCE,
+        },
+        provider_health=provider_health,
+        lifted_warnings=lifted or None,
+    )
 
 @router.get("/health")
 @router.get("/v1/schema/health")
 async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
+    """v4.1.0: enhanced with engine_version + provider_health summary.
+
+    Operators monitoring this endpoint can now see at a glance whether
+    the upstream-provider chain is healthy:
+      - provider_unhealthy_count == 0 → all providers healthy
+      - provider_unhealthy_count > 0  → engine is demoting/skipping
+        at least one provider; check /v1/schema/provider-health for detail.
+
+    Failures inside provider_health resolution are caught and surfaced as
+    `provider_health_error`; the health endpoint itself never raises.
+    """
+    # v4.1.0: cheap one-shot snapshot. Bounded by engine.health() cost.
+    provider_health_summary: Dict[str, Any] = {}
+    engine_version: Optional[str] = None
+    provider_unhealthy_count: Optional[int] = None
+    try:
+        snap = await _extract_provider_health_snapshot()
+        if isinstance(snap, dict):
+            engine_version = snap.get("engine_version")
+            markers = snap.get("unhealthy_markers")
+            if isinstance(markers, dict):
+                ac = markers.get("active_count")
+                if isinstance(ac, int):
+                    provider_unhealthy_count = ac
+            if snap.get("unavailable"):
+                provider_health_summary = {
+                    "available": False,
+                    "reason": snap.get("reason") or snap.get("error_class") or "unknown",
+                }
+            else:
+                provider_health_summary = {"available": True}
+    except Exception as e:
+        provider_health_summary = {
+            "available": False,
+            "reason": "{}:{}".format(e.__class__.__name__, str(e)[:120]),
+        }
+
     return _json_safe({
         "status": "ok",
         "service": "advanced_analysis",
@@ -2635,13 +1608,70 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
         "schema_registry_available": bool(get_sheet_spec is not None),
         "adapter_available": bool(core_get_sheet_rows is not None),
         "engine_source": CORE_GET_SHEET_ROWS_SOURCE,
+        "engine_version": engine_version,
+        "provider_health_endpoint_enabled": True,
+        "provider_health_summary": provider_health_summary,
+        "provider_unhealthy_count": provider_unhealthy_count,
         "allowed_pages_count": len(_safe_allowed_pages()),
         "path": str(getattr(getattr(request, "url", None), "path", "")),
-        # v4.3.5: feature flags
-        "tier1_yfinance_fallback_enabled": _tier1_yfinance_enrichment_enabled(),
-        "debug_logging_enabled": _advanced_analysis_debug_enabled(),
-        "static_identity_map_size": len(_STATIC_IDENTITY_MAP),
-        "candidate_signature_count": 13,
+    })
+
+
+@router.get("/schema/provider-health")
+@router.get("/v1/schema/provider-health")
+async def schema_provider_health(request: Request) -> Dict[str, Any]:
+    """v4.1.0 [ADD-G]: Dedicated provider-health snapshot endpoint.
+
+    Returns the engine's `provider_unhealthy_markers` registry without
+    triggering a sheet build. Cheap polling target for Apps Script
+    `12_Diagnostics.gs runFullDiagnosticSweep_()` — one HTTP call
+    instead of one-per-page to discover systemic provider outages.
+
+    Response shape:
+      {
+        "status": "success" | "unavailable",
+        "version": "4.1.0",
+        "engine_version": "5.61.0",
+        "provider_health": {
+          "unhealthy_markers": {
+            "active": [{"provider": "eodhd", "ttl_remaining_sec": 247.3}],
+            "active_count": 1,
+            "demote_enabled": true,
+            "skip_enabled": false,
+            "default_ttl_sec": 300.0
+          },
+          "engine_version": "5.61.0"
+        },
+        "timestamp_utc": "2026-05-12T10:24:31.482Z",
+        "request_id": "...",
+        "meta": { "source": "core.data_engine_v2.get_engine().health" }
+      }
+
+    On v2-engine-unavailable / no-registry-in-health, returns
+    `status: "unavailable"` with a `reason` field instead of raising.
+    Always returns 200; consumers should inspect the `status` field
+    rather than relying on HTTP codes.
+    """
+    request_id = str(uuid.uuid4())[:12]
+    started = time.time()
+
+    snap = await _extract_provider_health_snapshot()
+    unavailable = bool(snap.get("unavailable")) if isinstance(snap, dict) else True
+
+    return _json_safe({
+        "status": "unavailable" if unavailable else "success",
+        "version": ADVANCED_ANALYSIS_VERSION,
+        "engine_version": snap.get("engine_version") if isinstance(snap, dict) else None,
+        "engine_source": CORE_GET_SHEET_ROWS_SOURCE,
+        "provider_health": snap,
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "request_id": request_id,
+        "meta": {
+            "duration_ms": round((time.time() - started) * 1000.0, 3),
+            "dispatch": "schema_provider_health",
+            "source": "core.data_engine_v2.get_engine().health",
+            "path": str(getattr(getattr(request, "url", None), "path", "")),
+        },
     })
 
 @router.get("/schema")
