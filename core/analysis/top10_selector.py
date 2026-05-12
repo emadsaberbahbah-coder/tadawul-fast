@@ -3,188 +3,115 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.11.0
+Top 10 Selector -- v4.12.0
 ================================================================================
-LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
-TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
-SYNC+ASYNC CALLER TOLERANT • DISPLAY-HEADER TOLERANT • WRAPPER-PAYLOAD SAFE
-PARTIAL-DEGRADATION SAFE • DIRECT-SYMBOLS SAFE • TIMEOUT-GUARDED
-INSIGHTS-COLUMNS AWARE (v2.6.0 / Wave 3) • DATA-QUALITY-AWARE RANKING (v4.11.0)
-
-================================================================================
-Why v4.11.0 (vs v4.10.0)  —  CROSS-STACK DATA-QUALITY SIGNALS
-================================================================================
-
-v4.10.0 surfaced the Wave-3 Insights columns (sector_relative_score,
-conviction_score, top_factors, top_risks, position_size_hint) and added
-them to the composite scoring function. Since then, four upstream
-releases push richer audit signals into every quote row, none of which
-v4.10.0 reads:
-
-  - data_engine_v2 v5.60.0
-      Phase N: `warnings` canonicalized to "; "-joined string with
-               bare-key extraction.
-      Phase H/I/P: engine clears intrinsic_value / upside_pct on
-               unit-mismatch or synthesizer-overshoot detection and
-               emits one of five warning tags:
-                 - intrinsic_unit_mismatch_suspected
-                 - upside_synthesis_suspect
-                 - engine_52w_high_unit_mismatch_dropped
-                 - engine_52w_low_unit_mismatch_dropped
-                 - engine_52w_high_low_inverted
-      Phase B: forecast unavailability surfaced as warning tags +
-               `forecast_unavailable` bool flag:
-                 - forecast_unavailable
-                 - forecast_unavailable_no_source
-                 - forecast_cleared_consistency_sweep
-                 - forecast_skipped_unavailable
-      Phase Q: `last_error_class` preserved through engine from
-               providers (eodhd v4.7.3, yahoo_fundamentals v6.1.0,
-               yahoo_chart v8.2.0, enriched_quote v4.3.0).
-
-  - scoring v5.2.5
-      Surfaces `provider_error:<class>` and `engine_dropped_valuation`
-      in scoring_errors; produces conviction_score / top_factors /
-      top_risks / position_size_hint per row.
-
-  - reco_normalize v7.2.0
-      Adds rule_id introspection (not consumed here since scoring
-      v5.2.5 doesn't surface rule_id per row; tracked for future).
-
-  - insights_builder v7.0.0
-      Surfaces these signals in the Insights_Analysis Data Quality
-      Alerts section, mirroring the same warning-tag parsers.
-
-Consequence: in v4.10.0, a row with intrinsic_value=None due to
-`intrinsic_unit_mismatch_suspected` could still rank high in Top10
-because its overall_score (computed from other components) hadn't
-been adjusted for the cleared valuation. v4.11.0 closes this gap.
-
-  A. NEW cross-stack helpers + tag-set constants (mirror scoring v5.2.5
-     and insights_builder v7.0.0 byte-for-byte so the three modules
-     share the canonical warning-tag parser):
-       - _warning_tags_from_row(row) -> Set[str]
-       - _provider_error_from_row(row) -> str  (null-string filtered)
-       - _row_has_engine_dropped_valuation(row) -> bool
-       - _row_is_forecast_unavailable(row) -> bool
-       - _engine_drop_tags_from_row(row) -> List[str]
-       - _forecast_skip_tags_from_row(row) -> List[str]
-     Constants:
-       - _PROVIDER_ERROR_NULL_STRINGS (filter set)
-       - _ENGINE_DROPPED_VALUATION_TAGS (5 engine tags)
-       - _ENGINE_UNFORECASTABLE_TAGS (4 engine tags)
-
-  B. _selector_score applies SOFT PENALTIES for data-quality issues:
-       - engine_dropped_valuation: score -= 8.0
-         (rank-aware adjustment, not hard filter; rows can still rank
-         if other signals are strong)
-       - forecast_unavailable:     score -= 10.0
-         (heavier penalty since ROI signal is missing entirely)
-     Tunable via env:
-       - TOP10_PENALTY_ENGINE_DROP       (default 8.0)
-       - TOP10_PENALTY_FORECAST_UNAVAIL  (default 10.0)
-     Set either to 0.0 to disable that penalty without code changes.
-     Set to a large value (e.g. 100.0) to effectively hard-filter.
-
-  C. _canonical_selection_reason surfaces data-quality signals when
-     present (audit trail in the Top10 Selection Reason column):
-       - "Provider Error: RateLimited"   (when last_error_class set)
-       - "Engine: intrinsic_unit_mismatch_suspected"
-       - "Forecast: unavailable"
-     These appear AFTER existing reason parts and BEFORE the
-     factor/risk extras so the most important reason stays first.
-
-  D. _collect_candidate_rows meta extended with `data_quality_summary`
-     showing affected-row counts across the candidate pool:
-       {
-         "candidate_count": N,
-         "provider_error_count": k1,
-         "engine_dropped_valuation_count": k2,
-         "forecast_unavailable_count": k3,
-         "clean_count": N - any_flagged,
-       }
-     Surfaces in the route response under meta.data_quality_summary
-     so ops dashboards can spot upstream data-health issues without
-     reading every row.
-
-  E. NEW `__version__ = TOP10_SELECTOR_VERSION` alias (TFB module
-     convention used by scoring v5.2.5, reco_normalize v7.2.0,
-     insights_builder v7.0.0, scoring_engine v3.4.2). Exported via
-     __all__.
-
-  F. Version bump 4.10.0 -> 4.11.0.
-
-API surface (UNCHANGED + addition):
-  All v4.10.0 exports preserved. No removals.
-  Additions:
-    - __version__ (alias of TOP10_SELECTOR_VERSION)
-
-[PRESERVED -- strictly] All v4.10.0 mechanics:
-  - 93-column schema (85 instrument + 5 Insights + 3 Top10 extras)
-  - ROW_KEY_ALIASES entries for the 5 Insights fields
-  - Composite _selector_score baseline weights (overall 0.35,
-    opportunity 0.20, value/quality/momentum/growth/conf 0.08 each,
-    liquidity 0.05, risk-inverse 0.08, horizon-ROI 0.20,
-    conviction 0.10, sector_relative 0.07)
-  - _canonical_selection_reason leading top_factor / top_risk
-    extraction (split on "|")
-  - Direct-symbol intent preservation during selection top-up
-  - Snapshot merge with sparse live rows
-  - Top10 output-page fallback for sparse candidate pools
-  - Signature-safe retries, wrapper payload tolerance, partial
-    degradation, emergency symbol fallback, timeout guards
+LIVE * SCHEMA-FIRST * ROUTE-COMPATIBLE * ENGINE-SELF-RESOLVING * JSON-SAFE
+TOP10-METADATA GUARANTEED * SOURCE-PAGE SAFE * SNAPSHOT FALLBACK SAFE
+SYNC+ASYNC CALLER TOLERANT * DISPLAY-HEADER TOLERANT * WRAPPER-PAYLOAD SAFE
+PARTIAL-DEGRADATION SAFE * DIRECT-SYMBOLS SAFE * TIMEOUT-GUARDED
+INSIGHTS-COLUMNS AWARE (v2.6.0) * DATA-QUALITY-AWARE RANKING (v4.11.0)
+CRITERIA-v3.1.0 HARD-FILTER CONSUMER (v4.12.0) * DECISION-MATRIX AWARE
+CANDLESTICK AWARE (v4.12.0)
 
 ================================================================================
-Why v4.10.0 (PRESERVED)
+Why v4.12.0 (vs v4.11.0) -- CROSS-STACK FINISH WORK
 ================================================================================
 
-[v2.6.0 / Wave 3] Aligns Top10 with the new 5-Insights-column schema
-delivered in core/data_engine_v2.py v5.49.0 and core/sheets/schema_registry
-v2.6.0:
+v4.11.0 added the upstream warning-tag parser helpers and applied SOFT
+PENALTIES to `_selector_score` for engine-dropped valuation and
+forecast-unavailable rows. The penalty foundation is preserved
+verbatim. What v4.11.0 left on the table:
 
-    sector_relative_score   ("Sector-Adj Score")    float, 0-100
-    conviction_score        ("Conviction Score")    float, 0-100
-    top_factors             ("Top Factors")         str, "|"-separated
-    top_risks               ("Top Risks")           str, "|"-separated
-    position_size_hint      ("Position Size Hint")  str, free text
+  - criteria_model v3.1.0 introduced four new criteria fields
+    (min_conviction_score, exclude_engine_dropped_valuation,
+    exclude_forecast_unavailable, exclude_provider_errors) but
+    top10_selector v4.11.0 did not consume them as HARD filters in
+    `_passes_filters`. Operators could mark a row's valuation as
+    upstream-dropped, but couldn't opt to drop those rows entirely.
 
-Concrete changes vs v4.8.0:
+  - schema_registry v2.7.0 / v2.8.0 added 7 new canonical columns
+    (2 Decision Matrix + 5 Candlestick) but the local
+    DEFAULT_FALLBACK_KEYS list was still at 93 cols (90 instrument +
+    3 Top10 extras), missing those 7 entirely.
 
-- DEFAULT_FALLBACK_KEYS / DEFAULT_FALLBACK_HEADERS extended from 88 -> 93
-  cols (85 instrument + 5 Insights + 3 Top10 extras). The 5 Insights
-  fields slot in between "warnings" and "top10_rank" so they end up at
-  the same canonical positions (86-90) the engine emits.
-- ROW_KEY_ALIASES picks up entries for the 5 Insights fields so legacy
-  payloads using "convictionScore", "sectorAdjScore", "topFactors" etc.
-  get normalised into the canonical names.
-- _selector_score now incorporates `conviction_score` and
-  `sector_relative_score` as additional weighted signals when present
-  (additive -- never penalises rows that lack these fields). Default
-  weights: 0.10 for conviction_score (overlaps confidence; smaller
-  weight), 0.07 for sector_relative_score (sector-relative momentum).
-- _canonical_selection_reason now appends the leading entry from
-  `top_factors` and `top_risks` (split on "|") so the Top10 Selection
-  Reason column carries one-line provenance for the v2.6.0 view.
+  - DEFAULT_FALLBACK_KEYS placed opportunity_score / rank_overall as
+    a "Composite (2)" fragment AFTER Views -- but the authoritative
+    registry v2.8.0 has them INSIDE Scores(7) BEFORE Views.
 
-Note: Wave 2B (v4.9.0 -- canonical 5-tier reco enum compliance) was
-skipped for this file in this rollout. The 5-tier values are produced
-upstream by core.scoring v5.1.0 / core.reco_normalize v7.1.0 and reach
-this selector pre-normalised in the row's `recommendation` field, so
-no local reco synthesis is needed here; the additive schema is the
-only Wave 3 footprint.
+v4.12.0 phases:
 
-Why v4.8.0 (PRESERVED)
-----------------------
-- FIX: recognizes singular wrapper payloads like `quote`, `record`, and `item`
-  in addition to plural envelopes, so valid single-row results are not dropped.
-- FIX: lets sparse live page rows merge with snapshot rows instead of choosing
-  one or the other, improving resilience when one source is only partially filled.
-- FIX: allows Top10 output-page fallback to supplement sparse candidate pools,
-  not only completely empty pools, reducing zero-row or under-filled results.
-- FIX: preserves direct-symbol intent during final selection when the ranked
-  result set is smaller than the requested limit.
-- FIX: retains the earlier protections around signature-safe retries, wrapper
-  payload safety, partial degradation, and emergency symbol fallback.
+  A. Header docstring cross-stack sync. Adds references to the May
+     2026 sibling modules: schema_registry v2.8.0, scoring_engine
+     v3.4.2, criteria_model v3.1.0, investment_advisor_engine v4.4.0,
+     investment_advisor v5.3.0.
+
+  B. Schema width 93 -> 100 cols. Adds Decision(2) + Candlestick(5):
+       - Decision: recommendation_detailed, recommendation_priority
+         (data_engine_v2 v5.60.0+ _classify_8tier output)
+       - Candlestick: candlestick_pattern, candlestick_signal,
+         candlestick_strength, candlestick_confidence,
+         candlestick_patterns_recent
+         (core.candlesticks v1.0.0 via data_engine_v2)
+
+  B1. Scores group ordering canonicalized: opportunity_score and
+      rank_overall move INTO Scores group (positions 65-66) BEFORE
+      Views. The "Composite(2)" fragment is dissolved.
+
+  C. ROW_KEY_ALIASES extended with camelCase + vendor mirrors for the
+     seven new columns (recommendationDetailed, candlestickPattern,
+     etc.) so legacy payloads normalize correctly.
+
+  D. ** HEADLINE: HARD-FILTER CONSUMER for criteria_model v3.1.0. **
+     `_passes_filters` now reads and honours four new criteria fields:
+
+       min_conviction_score              (float, 0..100)
+         When > 0, drops rows where conviction_score is missing OR
+         below threshold. Aligns with reco_normalize v7.2.0 floors
+         (RECO_STRONG_BUY_CONVICTION_FLOOR=60).
+
+       exclude_engine_dropped_valuation  (bool, default false)
+         When true, drops rows tagged with any of the 5 engine
+         valuation-drop tags from data_engine_v2 v5.60.0+ Phase H/I/P.
+
+       exclude_forecast_unavailable      (bool, default false)
+         When true, drops rows with any of the 4 forecast-unavailable
+         tags from data_engine_v2 v5.60.0+ Phase B (or the bool flag).
+
+       exclude_provider_errors           (bool, default false)
+         When true, drops rows where last_error_class is non-empty
+         (preserved by data_engine_v2 v5.60.0+ Phase Q).
+
+     `_collect_criteria_from_inputs` preserves all four fields from
+     the inbound payload (with `min_conviction` accepted as alias for
+     `min_conviction_score` per schema_registry v2.7.0+ KV alias map).
+
+     The four hard filters compose with v4.11.0's SOFT PENALTIES.
+     Operators choose level of aggression:
+       - All flags false + non-zero penalties = soft signal (v4.11.0 default)
+       - Selected flags true = hard exclusion for those tags
+       - All flags true = strict mode (only fully-clean rows)
+     `min_conviction_score = 0` keeps v4.11.0 behaviour exactly.
+
+  E. Meta enrichment: `applied_v310_filters` block surfaces which
+     v3.1.0 filters were active and per-filter drop counts.
+
+  F. Version bump 4.11.0 -> 4.12.0.
+
+Cross-stack module references (May 2026 family):
+  schema_registry v2.8.0 / data_engine_v2 v5.60.0 / reco_normalize v7.2.0 /
+  scoring v5.2.5 / scoring_engine v3.4.2 / insights_builder v7.0.0 /
+  criteria_model v3.1.0 / investment_advisor_engine v4.4.0 /
+  investment_advisor v5.3.0.
+
+[PRESERVED -- strictly] All v4.11.0 / v4.10.0 / v4.8.0 mechanics:
+  - Warning-tag parser helpers + tag-set constants
+  - Soft penalties in _selector_score (env-tunable)
+  - _canonical_selection_reason data-quality audit trail
+  - data_quality_summary + selected_data_quality_summary in meta
+  - Wave-3 Insights columns + scoring signals
+  - Wrapper payload tolerance, snapshot merge, Top10 output-page
+    fallback, direct-symbol preservation, sig-safe retries,
+    partial degradation, emergency symbol fallback, timeout guards
 """
 
 from __future__ import annotations
@@ -208,141 +135,147 @@ from typing import (
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.11.0"
-# v4.11.0 Phase E: TFB module convention alias (used by scoring v5.2.5,
-# reco_normalize v7.2.0, insights_builder v7.0.0, scoring_engine v3.4.2).
+TOP10_SELECTOR_VERSION = "4.12.0"
 __version__ = TOP10_SELECTOR_VERSION
 
 OUTPUT_PAGE = "Top_10_Investments"
 
 DEFAULT_SOURCE_PAGES = [
-    "Market_Leaders",
-    "Global_Markets",
-    "Mutual_Funds",
-    "Commodities_FX",
-    "My_Portfolio",
+    "Market_Leaders", "Global_Markets", "Mutual_Funds",
+    "Commodities_FX", "My_Portfolio",
 ]
 
 DERIVED_OR_NON_SOURCE_PAGES = {
-    "KSA_TADAWUL",
-    "Advisor_Criteria",
-    "AI_Opportunity_Report",
-    "Insights_Analysis",
-    "Top_10_Investments",
-    "Data_Dictionary",
+    "KSA_TADAWUL", "Advisor_Criteria", "AI_Opportunity_Report",
+    "Insights_Analysis", "Top_10_Investments", "Data_Dictionary",
 }
 
-TOP10_REQUIRED_FIELDS = (
-    "top10_rank",
-    "selection_reason",
-    "criteria_snapshot",
-)
-
+TOP10_REQUIRED_FIELDS = ("top10_rank", "selection_reason", "criteria_snapshot")
 TOP10_REQUIRED_HEADERS = {
     "top10_rank": "Top10 Rank",
     "selection_reason": "Selection Reason",
     "criteria_snapshot": "Criteria Snapshot",
 }
 
+# =============================================================================
+# v4.12.0 Phase B/B1: Schema width 93 -> 100 cols
+# =============================================================================
+# Aligned with schema_registry v2.8.0 _canonical_instrument_columns:
+#   Identity 8 / Price 10 / Liquidity 6 / Fundamentals 12 / Risk 8 /
+#   Valuation 7 / Forecast 9 / Scores 7 (incl. opportunity + rank) /
+#   Views 4 / Recommendation 4 / Portfolio 6 / Provenance 4 /
+#   Insights 5 / Decision 2 / Candlestick 5 / Top10-extras 3 = 100
 DEFAULT_FALLBACK_KEYS = [
+    # Identity (8)
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
+    # Price (10)
     "current_price", "previous_close", "open_price", "day_high", "day_low",
     "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
+    # Liquidity (6)
     "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y",
+    # Fundamentals (12)
     "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio", "revenue_ttm",
     "revenue_growth_yoy", "gross_margin", "operating_margin", "profit_margin", "debt_to_equity",
-    "free_cash_flow_ttm", "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
-    "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda",
-    "peg_ratio", "intrinsic_value", "upside_pct", "valuation_score", "forecast_price_1m", "forecast_price_3m",
-    "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
-    "forecast_confidence", "confidence_score", "confidence_bucket", "value_score", "quality_score",
-    "momentum_score", "growth_score", "overall_score",
+    "free_cash_flow_ttm",
+    # Risk (8)
+    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
+    "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
+    # Valuation (7)
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value", "upside_pct", "valuation_score",
+    # Forecast (9)
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+    "forecast_confidence", "confidence_score", "confidence_bucket",
+    # Scores (7) -- v4.12.0 Phase B1: opportunity + rank reordered INTO Scores
+    "value_score", "quality_score", "momentum_score", "growth_score",
+    "overall_score", "opportunity_score", "rank_overall",
+    # Views (4)
     "fundamental_view", "technical_view", "risk_view", "value_view",
-    "opportunity_score", "rank_overall",
+    # Recommendation (4)
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
-    "position_qty", "avg_cost", "position_cost", "position_value", "unrealized_pl",
-    "unrealized_pl_pct", "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    # Portfolio (6)
+    "position_qty", "avg_cost", "position_cost", "position_value",
+    "unrealized_pl", "unrealized_pl_pct",
+    # Provenance (4)
+    "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    # Insights (5)
     "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
+    # Decision (2) -- NEW v4.12.0 Phase B
+    "recommendation_detailed", "recommendation_priority",
+    # Candlestick (5) -- NEW v4.12.0 Phase B
+    "candlestick_pattern", "candlestick_signal", "candlestick_strength",
+    "candlestick_confidence", "candlestick_patterns_recent",
+    # Top10 extras (3)
     "top10_rank", "selection_reason", "criteria_snapshot",
 ]
 
 DEFAULT_FALLBACK_HEADERS = [
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
-    "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
-    "Price Change", "Percent Change", "52W Position %", "Volume", "Avg Volume 10D",
-    "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)", "P/E (TTM)", "P/E (Forward)",
-    "EPS (TTM)", "Dividend Yield", "Payout Ratio", "Revenue (TTM)", "Revenue Growth YoY",
-    "Gross Margin", "Operating Margin", "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)",
-    "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)",
-    "Sharpe (1Y)", "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG",
-    "Intrinsic Value", "Upside %", "Valuation Score", "Forecast Price 1M", "Forecast Price 3M",
-    "Forecast Price 12M", "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
-    "Forecast Confidence", "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score",
-    "Momentum Score", "Growth Score", "Overall Score",
+    "Current Price", "Previous Close", "Open", "Day High", "Day Low",
+    "52W High", "52W Low", "Price Change", "Percent Change", "52W Position %",
+    "Volume", "Avg Volume 10D", "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)",
+    "P/E (TTM)", "P/E (Forward)", "EPS (TTM)", "Dividend Yield", "Payout Ratio",
+    "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin", "Operating Margin",
+    "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)",
+    "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y",
+    "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
+    "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
+    "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
+    "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
+    "Forecast Confidence", "Confidence Score", "Confidence Bucket",
+    # Scores (7) -- v4.12.0 Phase B1
+    "Value Score", "Quality Score", "Momentum Score", "Growth Score",
+    "Overall Score", "Opportunity Score", "Rank (Overall)",
+    # Views (4)
     "Fundamental View", "Technical View", "Risk View", "Value View",
-    "Opportunity Score", "Rank (Overall)",
+    # Recommendation (4)
     "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
-    "Position Qty", "Avg Cost", "Position Cost", "Position Value", "Unrealized P/L",
-    "Unrealized P/L %", "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)",
-    "Warnings",
+    # Portfolio (6)
+    "Position Qty", "Avg Cost", "Position Cost", "Position Value",
+    "Unrealized P/L", "Unrealized P/L %",
+    # Provenance (4)
+    "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    # Insights (5)
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
+    # Decision (2) -- NEW v4.12.0
+    "Recommendation Detail", "Reco Priority",
+    # Candlestick (5) -- NEW v4.12.0
+    "Candle Pattern", "Candle Signal", "Candle Strength",
+    "Candle Confidence", "Recent Patterns (5D)",
+    # Top10 extras (3)
     "Top10 Rank", "Selection Reason", "Criteria Snapshot",
 ]
 
 ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "symbol": ("symbol", "ticker", "code", "instrument", "security", "symbol_normalized", "requested_symbol"),
     "name": ("name", "company_name", "long_name", "instrument_name", "security_name"),
-    "asset_class": ("asset_class",),
-    "exchange": ("exchange",),
-    "currency": ("currency",),
-    "country": ("country",),
-    "sector": ("sector",),
-    "industry": ("industry",),
+    "asset_class": ("asset_class",), "exchange": ("exchange",), "currency": ("currency",),
+    "country": ("country",), "sector": ("sector",), "industry": ("industry",),
     "current_price": ("current_price", "price", "last_price", "last", "close", "market_price", "nav"),
-    "previous_close": ("previous_close",),
-    "open_price": ("open_price", "open"),
-    "day_high": ("day_high", "high"),
-    "day_low": ("day_low", "low"),
-    "week_52_high": ("week_52_high", "52w_high"),
-    "week_52_low": ("week_52_low", "52w_low"),
+    "previous_close": ("previous_close",), "open_price": ("open_price", "open"),
+    "day_high": ("day_high", "high"), "day_low": ("day_low", "low"),
+    "week_52_high": ("week_52_high", "52w_high"), "week_52_low": ("week_52_low", "52w_low"),
     "price_change": ("price_change", "change"),
     "percent_change": ("percent_change", "change_pct", "pct_change"),
     "week_52_position_pct": ("week_52_position_pct",),
     "volume": ("volume", "avg_volume", "trading_volume"),
-    "avg_volume_10d": ("avg_volume_10d",),
-    "avg_volume_30d": ("avg_volume_30d",),
-    "market_cap": ("market_cap",),
-    "float_shares": ("float_shares",),
-    "beta_5y": ("beta_5y",),
-    "pe_ttm": ("pe_ttm",),
-    "pe_forward": ("pe_forward",),
-    "eps_ttm": ("eps_ttm",),
-    "dividend_yield": ("dividend_yield",),
-    "payout_ratio": ("payout_ratio",),
-    "revenue_ttm": ("revenue_ttm",),
-    "revenue_growth_yoy": ("revenue_growth_yoy",),
-    "gross_margin": ("gross_margin",),
-    "operating_margin": ("operating_margin",),
-    "profit_margin": ("profit_margin",),
-    "debt_to_equity": ("debt_to_equity",),
-    "free_cash_flow_ttm": ("free_cash_flow_ttm",),
-    "rsi_14": ("rsi_14",),
-    "volatility_30d": ("volatility_30d",),
-    "volatility_90d": ("volatility_90d",),
-    "max_drawdown_1y": ("max_drawdown_1y",),
-    "var_95_1d": ("var_95_1d",),
-    "sharpe_1y": ("sharpe_1y",),
-    "risk_score": ("risk_score", "risk"),
+    "avg_volume_10d": ("avg_volume_10d",), "avg_volume_30d": ("avg_volume_30d",),
+    "market_cap": ("market_cap",), "float_shares": ("float_shares",), "beta_5y": ("beta_5y",),
+    "pe_ttm": ("pe_ttm",), "pe_forward": ("pe_forward",), "eps_ttm": ("eps_ttm",),
+    "dividend_yield": ("dividend_yield",), "payout_ratio": ("payout_ratio",),
+    "revenue_ttm": ("revenue_ttm",), "revenue_growth_yoy": ("revenue_growth_yoy",),
+    "gross_margin": ("gross_margin",), "operating_margin": ("operating_margin",),
+    "profit_margin": ("profit_margin",), "debt_to_equity": ("debt_to_equity",),
+    "free_cash_flow_ttm": ("free_cash_flow_ttm",), "rsi_14": ("rsi_14",),
+    "volatility_30d": ("volatility_30d",), "volatility_90d": ("volatility_90d",),
+    "max_drawdown_1y": ("max_drawdown_1y",), "var_95_1d": ("var_95_1d",),
+    "sharpe_1y": ("sharpe_1y",), "risk_score": ("risk_score", "risk"),
     "risk_bucket": ("risk_bucket", "risk_level"),
-    "pb_ratio": ("pb_ratio",),
-    "ps_ratio": ("ps_ratio",),
-    "ev_ebitda": ("ev_ebitda",),
-    "peg_ratio": ("peg_ratio",),
-    "intrinsic_value": ("intrinsic_value",),
+    "pb_ratio": ("pb_ratio",), "ps_ratio": ("ps_ratio",), "ev_ebitda": ("ev_ebitda",),
+    "peg_ratio": ("peg_ratio",), "intrinsic_value": ("intrinsic_value",),
     "upside_pct": ("upside_pct", "upsidePct", "upside_percent", "upside"),
     "valuation_score": ("valuation_score",),
-    "forecast_price_1m": ("forecast_price_1m",),
-    "forecast_price_3m": ("forecast_price_3m",),
+    "forecast_price_1m": ("forecast_price_1m",), "forecast_price_3m": ("forecast_price_3m",),
     "forecast_price_12m": ("forecast_price_12m",),
     "expected_roi_1m": ("expected_roi_1m", "roi_1m", "expected_return_1m"),
     "expected_roi_3m": ("expected_roi_3m", "roi_3m", "expected_return_3m"),
@@ -350,45 +283,54 @@ ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "forecast_confidence": ("forecast_confidence", "confidence_score", "ai_confidence"),
     "confidence_score": ("confidence_score", "forecast_confidence", "ai_confidence"),
     "confidence_bucket": ("confidence_bucket", "confidence_level"),
-    "value_score": ("value_score",),
-    "quality_score": ("quality_score",),
-    "momentum_score": ("momentum_score",),
-    "growth_score": ("growth_score",),
+    "value_score": ("value_score",), "quality_score": ("quality_score",),
+    "momentum_score": ("momentum_score",), "growth_score": ("growth_score",),
     "overall_score": ("overall_score", "advisor_score", "score"),
-    "opportunity_score": ("opportunity_score",),
-    "rank_overall": ("rank_overall",),
+    "opportunity_score": ("opportunity_score",), "rank_overall": ("rank_overall",),
     "recommendation": ("recommendation", "reco", "signal"),
     "recommendation_reason": ("recommendation_reason",),
     "horizon_days": ("horizon_days", "invest_period_days", "investment_period_days"),
     "invest_period_label": ("invest_period_label", "horizon_label"),
-    "position_qty": ("position_qty",),
-    "avg_cost": ("avg_cost",),
-    "position_cost": ("position_cost",),
-    "position_value": ("position_value",),
-    "unrealized_pl": ("unrealized_pl",),
-    "unrealized_pl_pct": ("unrealized_pl_pct",),
+    "position_qty": ("position_qty",), "avg_cost": ("avg_cost",),
+    "position_cost": ("position_cost",), "position_value": ("position_value",),
+    "unrealized_pl": ("unrealized_pl",), "unrealized_pl_pct": ("unrealized_pl_pct",),
     "data_provider": ("data_provider",),
-    "last_updated_utc": ("last_updated_utc",),
-    "last_updated_riyadh": ("last_updated_riyadh",),
+    "last_updated_utc": ("last_updated_utc",), "last_updated_riyadh": ("last_updated_riyadh",),
     "warnings": ("warnings", "warning"),
-    # v4.11.0 Phase E: cross-stack diagnostic fields produced by
-    # data_engine_v2 v5.60.0 (last_error_class via Phase Q, forecast_unavailable
-    # via Phase B) and scoring v5.2.5 (scoring_errors). Aliasing here ensures
-    # `_normalize_candidate_row` populates the canonical snake_case key when
-    # input rows carry camelCase variants, so downstream readers can rely on
-    # the canonical name (the parser helpers already handle variants directly
-    # as a defense-in-depth layer).
+    # v4.11.0 cross-stack diagnostic fields
     "last_error_class": ("last_error_class", "lastErrorClass", "error_class", "errorClass"),
     "forecast_unavailable": (
         "forecast_unavailable", "forecastUnavailable",
         "is_forecast_unavailable", "isForecastUnavailable",
     ),
     "scoring_errors": ("scoring_errors", "scoringErrors", "scoring_error_list"),
+    # v4.10.0 Wave-3 Insights
     "sector_relative_score": ("sector_relative_score", "sectorAdjScore", "sector_adj_score", "sectorRelativeScore", "sector_score_adj"),
     "conviction_score": ("conviction_score", "convictionScore", "conviction"),
     "top_factors": ("top_factors", "topFactors", "top_factor_list"),
     "top_risks": ("top_risks", "topRisks", "top_risk_list"),
     "position_size_hint": ("position_size_hint", "positionSizeHint", "position_hint", "size_hint"),
+    # v4.12.0 Phase C: Decision Matrix (data_engine_v2 v5.60.0+ _classify_8tier)
+    "recommendation_detailed": (
+        "recommendation_detailed", "recommendationDetailed", "recoDetailed",
+        "detailed_recommendation", "detailedRecommendation", "decision_detailed",
+    ),
+    "recommendation_priority": (
+        "recommendation_priority", "recommendationPriority", "recoPriority",
+        "priority", "decisionPriority", "reco_priority",
+    ),
+    # v4.12.0 Phase C: Candlestick (core.candlesticks v1.0.0)
+    "candlestick_pattern": ("candlestick_pattern", "candlestickPattern", "candlePattern", "pattern"),
+    "candlestick_signal": ("candlestick_signal", "candlestickSignal", "candleSignal", "pattern_signal"),
+    "candlestick_strength": ("candlestick_strength", "candlestickStrength", "candleStrength", "pattern_strength"),
+    "candlestick_confidence": (
+        "candlestick_confidence", "candlestickConfidence", "candleConfidence",
+        "pattern_confidence", "candle_confidence",
+    ),
+    "candlestick_patterns_recent": (
+        "candlestick_patterns_recent", "candlestickPatternsRecent", "candlePatternsRecent",
+        "patterns_recent", "recent_patterns", "recentPatterns",
+    ),
     "liquidity_score": ("liquidity_score",),
     "selection_reason": ("selection_reason", "selector_reason"),
     "top10_rank": ("top10_rank", "rank"),
@@ -410,29 +352,13 @@ _ENGINE_LOCK = asyncio.Lock()
 
 
 # =============================================================================
-# v4.11.0 Phase A — Cross-stack data-quality tag sets
+# v4.11.0 PRESERVED -- cross-stack data-quality tag sets
 # =============================================================================
-#
-# These constants mirror the corresponding sets in scoring.py v5.2.5
-# and insights_builder.py v7.0.0 verbatim. All three modules share the
-# same canonical understanding of which warning tags signal which kind
-# of upstream issue. Provider error classes come from eodhd_provider
-# v4.7.3, yahoo_fundamentals_provider v6.1.0, yahoo_chart_provider
-# v8.2.0, and enriched_quote v4.3.0. Engine warning tags come from
-# data_engine_v2 v5.60.0 Phase H/I/P/B.
 
-# Strings that, even though non-empty, should be treated as "no error"
-# when found in last_error_class.
 _PROVIDER_ERROR_NULL_STRINGS: FrozenSet[str] = frozenset({
     "none", "null", "nil", "nan", "n/a", "na",
 })
 
-# Engine-applied warning tags that mean the engine cleared
-# intrinsic_value and/or upside_pct due to unit-mismatch or
-# synthesizer-overshoot detection. A row carrying any of these tags
-# has its valuation signal explicitly invalidated upstream; v4.11.0
-# applies a soft penalty rather than hard-filtering so other strong
-# signals can still surface the row.
 _ENGINE_DROPPED_VALUATION_TAGS: FrozenSet[str] = frozenset({
     "intrinsic_unit_mismatch_suspected",
     "upside_synthesis_suspect",
@@ -441,9 +367,6 @@ _ENGINE_DROPPED_VALUATION_TAGS: FrozenSet[str] = frozenset({
     "engine_52w_high_low_inverted",
 })
 
-# Engine-emitted warning tags that mark a row as unforecastable. A
-# row carrying any of these (or the `forecast_unavailable` bool flag)
-# has no usable ROI signal upstream.
 _ENGINE_UNFORECASTABLE_TAGS: FrozenSet[str] = frozenset({
     "forecast_unavailable",
     "forecast_unavailable_no_source",
@@ -496,13 +419,7 @@ EMERGENCY_SYMBOLS = [
     s for s in [x.strip() for x in os.getenv("TOP10_SELECTOR_EMERGENCY_SYMBOLS", "").replace(";", ",").split(",")] if s
 ]
 
-# v4.11.0 Phase B: tunable soft penalties for data-quality issues.
-# Defaults chosen empirically:
-#   - 8.0 (engine drop) is ~weight of one of the smaller signals
-#     (value/quality/momentum at 0.08 -> 8.0 score points each).
-#   - 10.0 (forecast unavailable) is heavier since the row's ROI
-#     signal is missing entirely (otherwise weighted at 20% of score).
-# Set to 0.0 to disable; set to 100.0+ for effective hard filter.
+# v4.11.0 PRESERVED: tunable soft penalties
 _DATA_QUALITY_PENALTY_ENGINE_DROP = _env_float_signed("TOP10_PENALTY_ENGINE_DROP", 8.0)
 _DATA_QUALITY_PENALTY_FORECAST_UNAVAIL = _env_float_signed("TOP10_PENALTY_FORECAST_UNAVAIL", 10.0)
 
@@ -601,16 +518,10 @@ def _is_signature_mismatch_typeerror(exc: TypeError) -> bool:
     if not msg:
         return False
     signature_markers = (
-        "unexpected keyword argument",
-        "positional argument",
-        "required positional argument",
-        "takes ",
-        "got an unexpected keyword",
-        "multiple values for argument",
-        "missing 1 required positional argument",
-        "missing required positional argument",
-        "too many positional arguments",
-        "not enough positional arguments",
+        "unexpected keyword argument", "positional argument", "required positional argument",
+        "takes ", "got an unexpected keyword", "multiple values for argument",
+        "missing 1 required positional argument", "missing required positional argument",
+        "too many positional arguments", "not enough positional arguments",
     )
     return any(marker in msg for marker in signature_markers)
 
@@ -873,41 +784,19 @@ def _looks_like_row_dict(d: Any) -> bool:
         return True
     non_meta = [k for k in row.keys() if _s(k) not in WRAPPER_KEYS]
     return len(non_meta) >= 4
-
-
 # =============================================================================
-# v4.11.0 Phase A — Data-quality parsing helpers
+# v4.11.0 PRESERVED -- Data-quality parsing helpers
 # =============================================================================
-#
-# These mirror the corresponding helpers in scoring.py v5.2.5 and
-# insights_builder.py v7.0.0 verbatim so the three modules share the
-# canonical warning-tag parser. The bare-key extraction for "key:value"
-# tags is necessary because the engine v5.60.0 Phase N canonicalizes
-# warnings to a "; "-joined string where some tags carry a colon-
-# separated value (e.g., "forecast_unavailable:no_source").
 
 def _warning_tags_from_row(row: Mapping[str, Any]) -> Set[str]:
-    """
-    Parse a row's `warnings` field into a Set[str] of normalized tags.
-
-    Handles:
-      - None / missing / ""       -> empty set
-      - "; "-joined string         -> per data_engine_v2 v5.60.0 Phase N
-      - List[str] / Tuple / Set    -> defensive: some upstream paths
-                                      bypass engine canonicalization
-      - "key:value" tags           -> both the full tag AND the bare
-                                      key are added so callers can
-                                      match against bare static sets
-
-    Returns a set even on error so callers can safely intersect with
-    static tag sets without None checks.
+    """Parse a row's `warnings` field into a Set[str] of normalized tags.
+    Handles "; "-joined (engine v5.60.0 Phase N), lists, and "key:value" tags.
     """
     if not isinstance(row, Mapping):
         return set()
     raw = row.get("warnings")
     if raw is None:
         return set()
-
     parts: List[str] = []
     if isinstance(raw, str):
         for piece in raw.split(";"):
@@ -931,7 +820,6 @@ def _warning_tags_from_row(row: Mapping[str, Any]) -> Set[str]:
             s = ""
         if s:
             parts.append(s)
-
     out: Set[str] = set()
     for p in parts:
         out.add(p)
@@ -943,20 +831,7 @@ def _warning_tags_from_row(row: Mapping[str, Any]) -> Set[str]:
 
 
 def _provider_error_from_row(row: Mapping[str, Any]) -> str:
-    """
-    Extract the row's last_error_class with null-string filtering.
-
-    Returns the error-class string if it's a real value, or "" if the
-    field is missing, empty, or a null-like string ("None", "null",
-    "nan", "n/a"). The null-string filter prevents `_s(None)` (which
-    returns "" already) and stringified-None upstream merge artifacts
-    from being treated as real errors.
-
-    Common error classes from providers (eodhd v4.7.3 + yahoo v6.1.0/
-    v8.2.0): "RateLimited", "AuthError", "IpBlocked", "NotFound",
-    "NetworkError", "InvalidPayload", "FetchError", "InvalidSymbol",
-    "MissingApiKey", "KsaBlocked".
-    """
+    """Extract last_error_class with null-string filtering."""
     if not isinstance(row, Mapping):
         return ""
     for key in ("last_error_class", "lastErrorClass", "errorClass", "error_class"):
@@ -973,16 +848,7 @@ def _provider_error_from_row(row: Mapping[str, Any]) -> str:
 
 
 def _row_has_engine_dropped_valuation(row: Mapping[str, Any]) -> bool:
-    """
-    True when the row's warnings contain any of the engine-applied
-    valuation-drop tags (data_engine_v2 v5.60.0 Phase H/I/P).
-
-    Note: this returns True regardless of whether `intrinsic_value` or
-    `upside_pct` is currently None or populated. The penalty in
-    _selector_score and the surface in _canonical_selection_reason
-    both fire on the tag presence -- the actual cleared fields are
-    a separate concern handled by the engine itself.
-    """
+    """True when warnings contain any engine-applied valuation-drop tag."""
     if not isinstance(row, Mapping):
         return False
     tags = _warning_tags_from_row(row)
@@ -992,12 +858,7 @@ def _row_has_engine_dropped_valuation(row: Mapping[str, Any]) -> bool:
 
 
 def _row_is_forecast_unavailable(row: Mapping[str, Any]) -> bool:
-    """
-    True when the row's `forecast_unavailable` bool flag is set OR
-    its warnings string contains an unforecastable tag. Defense in
-    depth: engine v5.60.0 Phase B sets both, but a downstream merge
-    could drop one while preserving the other.
-    """
+    """True when forecast_unavailable bool set OR warnings contains an unforecastable tag."""
     if not isinstance(row, Mapping):
         return False
     for key in ("forecast_unavailable", "is_forecast_unavailable"):
@@ -1010,8 +871,6 @@ def _row_is_forecast_unavailable(row: Mapping[str, Any]) -> bool:
 
 
 def _engine_drop_tags_from_row(row: Mapping[str, Any]) -> List[str]:
-    """Return the sorted list of engine-dropped-valuation tags present
-    in the row's warnings, or [] if none."""
     if not isinstance(row, Mapping):
         return []
     matching = _warning_tags_from_row(row) & _ENGINE_DROPPED_VALUATION_TAGS
@@ -1019,9 +878,6 @@ def _engine_drop_tags_from_row(row: Mapping[str, Any]) -> List[str]:
 
 
 def _forecast_skip_tags_from_row(row: Mapping[str, Any]) -> List[str]:
-    """Return the sorted list of engine-unforecastable tags present in
-    the row's warnings, or [] if none. The bool flag contributes a
-    synthetic 'forecast_unavailable' tag for symmetry."""
     if not isinstance(row, Mapping):
         return []
     matching = list(_warning_tags_from_row(row) & _ENGINE_UNFORECASTABLE_TAGS)
@@ -1400,7 +1256,6 @@ def _rows_from_matrix(rows_matrix: Any, cols: Sequence[str]) -> List[Dict[str, A
 def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
     if payload is None or depth > 8:
         return []
-
     if isinstance(payload, list):
         if not payload:
             return []
@@ -1412,17 +1267,11 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
         if any(isinstance(x, (list, tuple)) for x in payload):
             return []
         return []
-
     mapping = _coerce_mapping(payload)
     if not mapping:
         return []
-
     if _looks_like_row_dict(mapping):
         return [mapping]
-
-    # Symbol-keyed dict of row payloads. Only accept when values themselves look
-    # like rows or can unwrap into a single row. Avoid treating diagnostics/meta
-    # dicts as candidate rows.
     rows_from_symbol_map: List[Dict[str, Any]] = []
     maybe_symbol_map = True
     symbol_like_keys = 0
@@ -1445,7 +1294,6 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
         rows_from_symbol_map.append(row)
     if maybe_symbol_map and symbol_like_keys > 0 and rows_from_symbol_map:
         return rows_from_symbol_map
-
     for key in ("row_objects", "rows", "records", "record", "items", "item", "results", "recommendations", "quotes", "quote", "data"):
         value = mapping.get(key)
         if isinstance(value, list):
@@ -1461,7 +1309,6 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
             rows = _extract_rows_like(value, depth + 1)
             if rows:
                 return rows
-
     for key in ("rows_matrix", "matrix"):
         value = mapping.get(key)
         if isinstance(value, list):
@@ -1469,14 +1316,12 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
             rows = _rows_from_matrix(value, keys_like)
             if rows:
                 return rows
-
     for key in ("payload", "result", "response", "output", "snapshot", "content", "envelope", "spec", "schema", "sheet_spec"):
         value = mapping.get(key)
         if value is not None and value is not payload:
             rows = _extract_rows_like(value, depth + 1)
             if rows:
                 return rows
-
     return []
 
 
@@ -1591,7 +1436,6 @@ async def _fetch_direct_symbol_rows(engine: Any, symbols: Sequence[str], mode: s
     rows = _extract_rows_like(payload)
     if rows:
         return rows
-
     if isinstance(payload, Mapping):
         direct_rows: List[Dict[str, Any]] = []
         for sym in syms:
@@ -1600,7 +1444,6 @@ async def _fetch_direct_symbol_rows(engine: Any, symbols: Sequence[str], mode: s
                 direct_rows.append(_coerce_mapping(candidate))
         if direct_rows:
             return direct_rows
-
     out: List[Dict[str, Any]] = []
     for sym in syms[:HYDRATION_SYMBOL_CAP]:
         single_attempts = [
@@ -1651,6 +1494,14 @@ def _collect_symbol_keys_from_mapping(mapping: Mapping[str, Any]) -> List[str]:
 
 
 def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """
+    Normalize the inbound criteria payload.
+
+    v4.12.0 Phase D: extended passthrough preserves all four criteria_model
+    v3.1.0 fields (min_conviction_score + 3 exclusion flags), with
+    min_conviction accepted as legacy alias for min_conviction_score per
+    schema_registry v2.7.0+ KV alias map.
+    """
     positional_maps = [arg for arg in args if isinstance(arg, Mapping)]
     body = _merge_mapping_like(
         *positional_maps,
@@ -1672,6 +1523,7 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         if v is not None and k not in {"criteria", "filters"}:
             criteria.setdefault(k, v)
 
+    # v4.12.0 Phase D: extended kwargs passthrough
     for k in (
         "pages_selected", "pages", "selected_pages", "sources", "page", "page_name", "sheet", "sheet_name",
         "symbols", "tickers", "direct_symbols", "top_n", "limit", "risk_level", "risk_profile",
@@ -1679,6 +1531,11 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         "horizon_days", "invest_period_label", "min_expected_roi", "min_roi", "min_confidence",
         "min_ai_confidence", "max_risk_score", "min_volume", "enrich_final", "schema_only",
         "headers_only", "include_headers", "include_matrix", "mode", "emergency_symbols",
+        # v4.12.0 Phase D: criteria_model v3.1.0 fields
+        "min_conviction_score", "min_conviction",
+        "exclude_engine_dropped_valuation",
+        "exclude_forecast_unavailable",
+        "exclude_provider_errors",
     ):
         if kwargs.get(k) is not None:
             criteria[k] = kwargs.get(k)
@@ -1721,6 +1578,18 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         min_roi = criteria.get("min_roi")
     min_roi_ratio = _safe_ratio(min_roi, None)
 
+    # v4.12.0 Phase D: normalize criteria_model v3.1.0 fields.
+    # Accept `min_conviction` as legacy alias.
+    min_conviction_raw = (
+        criteria.get("min_conviction_score")
+        if criteria.get("min_conviction_score") is not None
+        else criteria.get("min_conviction")
+    )
+    min_conviction_score = _safe_float(min_conviction_raw, None)
+    exclude_engine_drop = _coerce_bool(criteria.get("exclude_engine_dropped_valuation"), False)
+    exclude_forecast_unavail = _coerce_bool(criteria.get("exclude_forecast_unavailable"), False)
+    exclude_provider_errors = _coerce_bool(criteria.get("exclude_provider_errors"), False)
+
     normalized = dict(criteria)
     normalized["pages_selected"] = pages
     normalized["direct_symbols"] = direct_symbols
@@ -1741,6 +1610,11 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     normalized["include_headers"] = _coerce_bool(normalized.get("include_headers", True), True)
     normalized["include_matrix"] = _coerce_bool(normalized.get("include_matrix", True), True)
     normalized.setdefault("enrich_final", True)
+    # v4.12.0 Phase D: canonical v3.1.0 field values
+    normalized["min_conviction_score"] = min_conviction_score
+    normalized["exclude_engine_dropped_valuation"] = exclude_engine_drop
+    normalized["exclude_forecast_unavailable"] = exclude_forecast_unavail
+    normalized["exclude_provider_errors"] = exclude_provider_errors
     return normalized
 
 
@@ -1822,6 +1696,18 @@ def _risk_level_match(row: Mapping[str, Any], wanted: str) -> bool:
 
 
 def _passes_filters(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> bool:
+    """
+    v4.12.0 Phase D: ** HEADLINE ** Hard-filter consumer for criteria_model v3.1.0.
+
+    Adds four new hard-filter checks AFTER the v4.11.0 baseline filters:
+      - min_conviction_score (drops below threshold)
+      - exclude_engine_dropped_valuation (drops engine-valuation-cleared)
+      - exclude_forecast_unavailable (drops forecast-missing)
+      - exclude_provider_errors (drops provider-errored rows)
+
+    With all four flags false / unset, v4.12.0 behaviour is byte-identical
+    to v4.11.0 (and v4.10.0 before that).
+    """
     wanted_conf = _s(criteria.get("confidence_bucket") or criteria.get("confidence_level")).lower()
     wanted_risk = _s(criteria.get("risk_level") or criteria.get("risk_profile")).lower()
     horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
@@ -1857,6 +1743,30 @@ def _passes_filters(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> bool
     if min_volume is not None and volume is not None and volume < min_volume:
         return False
 
+    # v4.12.0 Phase D: criteria_model v3.1.0 hard filters.
+    min_conviction_raw = (
+        criteria.get("min_conviction_score")
+        if criteria.get("min_conviction_score") is not None
+        else criteria.get("min_conviction")
+    )
+    min_conviction = _safe_float(min_conviction_raw, None)
+    if min_conviction is not None and min_conviction > 0:
+        conviction = _safe_float(row.get("conviction_score"), None)
+        if conviction is None or conviction < min_conviction:
+            return False
+
+    if _coerce_bool(criteria.get("exclude_engine_dropped_valuation"), False):
+        if _row_has_engine_dropped_valuation(row):
+            return False
+
+    if _coerce_bool(criteria.get("exclude_forecast_unavailable"), False):
+        if _row_is_forecast_unavailable(row):
+            return False
+
+    if _coerce_bool(criteria.get("exclude_provider_errors"), False):
+        if _provider_error_from_row(row):
+            return False
+
     return True
 
 
@@ -1877,22 +1787,10 @@ def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> floa
     """
     Compute the composite ranking score for a candidate row.
 
-    Baseline weights (v4.10.0, preserved):
-      overall_score * 0.35  +  opportunity * 0.20  +
-      value/quality/momentum/growth/confidence each * 0.08  +
-      liquidity * 0.05  +  (100 - risk) * 0.08  +  roi_pct * 0.20
-
-    Wave-3 insights signals (v4.10.0, preserved, additive only):
-      conviction_score * 0.10  +  sector_relative_score * 0.07
-
-    v4.11.0 SOFT DATA-QUALITY PENALTIES (applied only when the row
-    carries the corresponding upstream signal):
-      -_DATA_QUALITY_PENALTY_ENGINE_DROP       when engine cleared
-                                                valuation upstream
-      -_DATA_QUALITY_PENALTY_FORECAST_UNAVAIL  when forecast missing
-
-    Direct-symbol priority and row-richness bonuses are preserved
-    verbatim from v4.10.0.
+    v4.12.0: ranking math is byte-identical to v4.11.0. The new Phase D
+    criteria-model filters operate ABOVE this layer in `_passes_filters`
+    as HARD filters, not ranking adjustments. v4.11.0 SOFT PENALTIES
+    (env-tunable) remain active here.
     """
     overall = _safe_float(row.get("overall_score"), None)
     opportunity = _safe_float(row.get("opportunity_score"), None)
@@ -1931,7 +1829,7 @@ def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> floa
     if roi is not None:
         score += roi * 100.0 * 0.20
 
-    # v4.10.0: Insights signals — additive, only contribute when present.
+    # v4.10.0 PRESERVED: Insights signals
     conviction = _safe_float(row.get("conviction_score"), None)
     sector_rel = _safe_float(row.get("sector_relative_score"), None)
     if conviction is not None:
@@ -1939,7 +1837,7 @@ def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> floa
     if sector_rel is not None:
         score += sector_rel * 0.07
 
-    # v4.11.0 Phase B: soft penalties for data-quality issues.
+    # v4.11.0 PRESERVED: soft data-quality penalties
     if _DATA_QUALITY_PENALTY_ENGINE_DROP and _row_has_engine_dropped_valuation(row):
         score -= _DATA_QUALITY_PENALTY_ENGINE_DROP
     if _DATA_QUALITY_PENALTY_FORECAST_UNAVAIL and _row_is_forecast_unavailable(row):
@@ -1951,20 +1849,8 @@ def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> floa
 
     score += min(_row_richness(row), 120) * 0.03
     return float(score)
-
-
 def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]) -> str:
-    """
-    Build the human-readable Selection Reason for the Top10 output row.
-
-    v4.11.0 Phase C: surfaces data-quality signals when present
-    (provider_error, engine drops, forecast unavailable) so the audit
-    trail in the Selection Reason column carries the upstream caveat.
-    Data-quality parts appear AFTER existing reason parts (reco,
-    confidence, risk, ROI, source, component scores) and BEFORE the
-    leading factor/risk extras so the most important reason stays
-    first and the audit caveat follows.
-    """
+    """v4.11.0 PRESERVED: Build human-readable Selection Reason w/ DQ audit trail."""
     recommendation = _s(row.get("recommendation"))
     confidence_bucket = _s(row.get("confidence_bucket"))
     risk_bucket = _s(row.get("risk_bucket"))
@@ -1999,14 +1885,12 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
     if score_parts:
         parts.append(", ".join(score_parts[:3]))
 
-    # v4.11.0 Phase C: data-quality audit trail.
+    # v4.11.0 Phase C: data-quality audit trail
     provider_error = _provider_error_from_row(row)
     if provider_error:
         parts.append(f"Provider Error: {provider_error}")
     engine_drops = _engine_drop_tags_from_row(row)
     if engine_drops:
-        # Compact form: just the first tag (most specific) + "+N more" if
-        # multiple. Keeps the Selection Reason cell readable.
         if len(engine_drops) == 1:
             parts.append(f"Engine: {engine_drops[0]}")
         else:
@@ -2014,7 +1898,7 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
     if _row_is_forecast_unavailable(row):
         parts.append("Forecast: unavailable")
 
-    # v4.10.0: leading top_factor / top_risk from the Insights bundle.
+    # v4.10.0: leading top_factor / top_risk
     factors_raw = _s(row.get("top_factors"))
     if factors_raw:
         top_factor = factors_raw.split("|", 1)[0].strip()
@@ -2048,29 +1932,11 @@ def _rank_and_project_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str
 
 
 # =============================================================================
-# v4.11.0 Phase D — Data-quality summary across candidate pool
+# v4.11.0 Phase D PRESERVED -- Data-quality summary across candidate pool
 # =============================================================================
 
 def _build_data_quality_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    """
-    Tally data-quality flags across a candidate-row pool.
-
-    Returns a small dict suitable for embedding into meta. The three
-    counts are independent (a single row can be flagged by multiple
-    categories), so `clean_count = candidate_count - any_flagged` is
-    NOT equal to candidate_count - sum(counts).
-
-    Output shape:
-      {
-        "candidate_count":              N,
-        "provider_error_count":         k1,
-        "engine_dropped_valuation_count": k2,
-        "forecast_unavailable_count":   k3,
-        "clean_count":                  N - any_flagged,
-        "any_flagged":                  N - clean_count,
-        "provider_error_classes":       Dict[str, int]   # e.g. {"RateLimited": 3}
-      }
-    """
+    """Tally data-quality flags across a candidate-row pool."""
     total = len(rows)
     if total == 0:
         return {
@@ -2126,6 +1992,90 @@ def _build_data_quality_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, 
 
 
 # =============================================================================
+# v4.12.0 Phase E -- criteria_model v3.1.0 hard-filter drop counts
+# =============================================================================
+
+def _count_v310_filter_drops(
+    candidate_rows: Sequence[Mapping[str, Any]],
+    criteria: Mapping[str, Any],
+) -> Dict[str, int]:
+    """
+    Pre-pass over the candidate pool that counts how many rows WOULD be
+    dropped by each individual v3.1.0 filter, regardless of whether
+    that filter is currently enabled in `criteria`.
+
+    Counts are INDEPENDENT (a row dropped by multiple filters appears in
+    multiple counts). The result is embedded into meta.applied_v310_filters
+    so ops dashboards can answer: "If we enabled X, how many rows would
+    we lose?" even when the operator hasn't enabled the filter yet.
+    """
+    min_conviction_raw = (
+        criteria.get("min_conviction_score")
+        if criteria.get("min_conviction_score") is not None
+        else criteria.get("min_conviction")
+    )
+    min_conviction = _safe_float(min_conviction_raw, None)
+
+    rows_dropped_min_conviction = 0
+    rows_dropped_engine_drop = 0
+    rows_dropped_forecast_unavail = 0
+    rows_dropped_provider_error = 0
+
+    for row in candidate_rows:
+        # min_conviction: count even when filter is disabled, to show
+        # "would-be-dropped" for ops tuning.
+        if min_conviction is not None and min_conviction > 0:
+            conviction = _safe_float(row.get("conviction_score"), None)
+            if conviction is None or conviction < min_conviction:
+                rows_dropped_min_conviction += 1
+        if _row_has_engine_dropped_valuation(row):
+            rows_dropped_engine_drop += 1
+        if _row_is_forecast_unavailable(row):
+            rows_dropped_forecast_unavail += 1
+        if _provider_error_from_row(row):
+            rows_dropped_provider_error += 1
+
+    return {
+        "rows_dropped_min_conviction": rows_dropped_min_conviction,
+        "rows_dropped_engine_drop": rows_dropped_engine_drop,
+        "rows_dropped_forecast_unavail": rows_dropped_forecast_unavail,
+        "rows_dropped_provider_error": rows_dropped_provider_error,
+    }
+
+
+def _build_applied_v310_filters_block(
+    candidate_rows: Sequence[Mapping[str, Any]],
+    criteria: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build the `meta.applied_v310_filters` observability block.
+
+    Combines criteria_model v3.1.0 field values with per-filter
+    would-be-drop counts. Ops dashboards consume this to surface the
+    effect of operator choices on the candidate pool.
+    """
+    min_conviction_raw = (
+        criteria.get("min_conviction_score")
+        if criteria.get("min_conviction_score") is not None
+        else criteria.get("min_conviction")
+    )
+    block = {
+        "min_conviction_score": _safe_float(min_conviction_raw, None),
+        "exclude_engine_dropped_valuation": _coerce_bool(
+            criteria.get("exclude_engine_dropped_valuation"), False
+        ),
+        "exclude_forecast_unavailable": _coerce_bool(
+            criteria.get("exclude_forecast_unavailable"), False
+        ),
+        "exclude_provider_errors": _coerce_bool(
+            criteria.get("exclude_provider_errors"), False
+        ),
+    }
+    block.update(_count_v310_filter_drops(candidate_rows, criteria))
+    return block
+
+
+# =============================================================================
 # Candidate collection
 # =============================================================================
 def _page_priority_symbol_limit(criteria: Mapping[str, Any]) -> int:
@@ -2165,13 +2115,8 @@ def _merge_row_prefer_richer(base: Mapping[str, Any], update: Mapping[str, Any])
 
 async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     meta: Dict[str, Any] = {
-        "page": page,
-        "rows": 0,
-        "snapshot_rows": 0,
-        "used_snapshot": False,
-        "merged_snapshot": False,
-        "timed_out": False,
-        "error": "",
+        "page": page, "rows": 0, "snapshot_rows": 0, "used_snapshot": False,
+        "merged_snapshot": False, "timed_out": False, "error": "",
     }
     try:
         rows = await asyncio.wait_for(_fetch_page_rows(engine, page, SOURCE_PAGE_LIMIT, mode), timeout=PAGE_TOTAL_TIMEOUT_SEC)
@@ -2211,10 +2156,8 @@ async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) ->
 
 async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str, criteria: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     meta: Dict[str, Any] = {
-        "requested_symbols": 0,
-        "enriched_rows": 0,
-        "hydration_used": False,
-        "hydration_error": "",
+        "requested_symbols": 0, "enriched_rows": 0,
+        "hydration_used": False, "hydration_error": "",
     }
     if not rows:
         return rows, meta
@@ -2281,13 +2224,10 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         "source_pages": pages,
         "direct_symbols_count": len(direct_symbols),
         "direct_symbols_requested": list(direct_symbols),
-        "source_page_rows": {},
-        "snapshot_rows": {},
+        "source_page_rows": {}, "snapshot_rows": {},
         "direct_symbol_rows": 0,
-        "page_diagnostics": [],
-        "hydration_diagnostics": [],
-        "partial_success": False,
-        "used_emergency_symbols": False,
+        "page_diagnostics": [], "hydration_diagnostics": [],
+        "partial_success": False, "used_emergency_symbols": False,
     }
 
     candidates: Dict[str, Dict[str, Any]] = {}
@@ -2395,9 +2335,12 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
 
     meta["deduped_candidate_count"] = len(candidates)
 
-    # v4.11.0 Phase D: data-quality summary across the candidate pool.
+    # v4.11.0 PRESERVED: data_quality_summary
     candidate_rows = list(candidates.values())
     meta["data_quality_summary"] = _build_data_quality_summary(candidate_rows)
+
+    # v4.12.0 Phase E: criteria_model v3.1.0 filter observability
+    meta["applied_v310_filters"] = _build_applied_v310_filters_block(candidate_rows, criteria)
 
     return candidate_rows, meta
 
@@ -2410,23 +2353,15 @@ def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: Li
     include_matrix = _coerce_bool(meta.get("include_matrix", True), True)
     payload = {
         "status": status,
-        "page": OUTPUT_PAGE,
-        "sheet": OUTPUT_PAGE,
-        "sheet_name": OUTPUT_PAGE,
+        "page": OUTPUT_PAGE, "sheet": OUTPUT_PAGE, "sheet_name": OUTPUT_PAGE,
         "route_family": "top10",
         "headers": headers if include_headers else [],
         "display_headers": headers if include_headers else [],
         "sheet_headers": headers if include_headers else [],
         "column_headers": headers if include_headers else [],
-        "keys": keys,
-        "columns": keys,
-        "fields": keys,
-        "rows": rows,
-        "data": rows,
-        "items": rows,
-        "quotes": rows,
-        "records": rows,
-        "row_objects": rows,
+        "keys": keys, "columns": keys, "fields": keys,
+        "rows": rows, "data": rows, "items": rows, "quotes": rows,
+        "records": rows, "row_objects": rows,
         "rows_matrix": _rows_to_matrix(rows, keys) if include_matrix else [],
         "count": len(rows),
         "version": TOP10_SELECTOR_VERSION,
@@ -2448,13 +2383,9 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
         if criteria.get("schema_only") or criteria.get("headers_only"):
             return _build_payload(
-                status="success",
-                headers=headers,
-                keys=keys,
-                rows=[],
+                status="success", headers=headers, keys=keys, rows=[],
                 meta={
-                    "build_status": "OK",
-                    "dispatch": "top10_selector",
+                    "build_status": "OK", "dispatch": "top10_selector",
                     "selector_version": TOP10_SELECTOR_VERSION,
                     "schema_only": bool(criteria.get("schema_only")),
                     "headers_only": bool(criteria.get("headers_only")),
@@ -2468,13 +2399,9 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         engine, engine_source = await _resolve_engine(*args, **kwargs)
         if engine is None:
             return _build_payload(
-                status="warn",
-                headers=headers,
-                keys=keys,
-                rows=[],
+                status="warn", headers=headers, keys=keys, rows=[],
                 meta={
-                    "build_status": "DEGRADED",
-                    "dispatch": "top10_selector",
+                    "build_status": "DEGRADED", "dispatch": "top10_selector",
                     "selector_version": TOP10_SELECTOR_VERSION,
                     "warning": "engine_unavailable",
                     "criteria_used": _json_safe(criteria),
@@ -2490,13 +2417,9 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         except Exception as exc:
             logger.warning("Top10 candidate collection failed: %s", exc, exc_info=True)
             return _build_payload(
-                status="warn",
-                headers=headers,
-                keys=keys,
-                rows=[],
+                status="warn", headers=headers, keys=keys, rows=[],
                 meta={
-                    "build_status": "DEGRADED",
-                    "dispatch": "top10_selector",
+                    "build_status": "DEGRADED", "dispatch": "top10_selector",
                     "selector_version": TOP10_SELECTOR_VERSION,
                     "warning": f"candidate_collection_failed:{type(exc).__name__}",
                     "criteria_used": _json_safe(criteria),
@@ -2550,10 +2473,6 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                     break
 
         projected_rows = _rank_and_project_rows(top_rows[:limit], keys, criteria)
-
-        # v4.11.0 Phase D: also surface DQ summary for the SELECTED rows
-        # so ops can see if the final Top10 set itself contains flagged
-        # entries (orthogonal to the candidate-pool DQ summary above).
         selected_dq_summary = _build_data_quality_summary(top_rows[:limit])
 
         status = "success" if projected_rows else "warn"
@@ -2576,9 +2495,6 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "include_matrix": criteria.get("include_matrix", True),
             "engine_source": engine_source,
             "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
-            # v4.11.0 Phase D: data-quality summary for the SELECTED rows.
-            # The candidate-pool DQ summary lives at meta.data_quality_summary
-            # (populated via collect_meta below).
             "selected_data_quality_summary": selected_dq_summary,
             **collect_meta,
         }
@@ -2593,13 +2509,9 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         headers, keys = _load_schema_defaults()
         criteria = _collect_criteria_from_inputs(*args, **kwargs)
         return _build_payload(
-            status="warn",
-            headers=headers,
-            keys=keys,
-            rows=[],
+            status="warn", headers=headers, keys=keys, rows=[],
             meta={
-                "build_status": "DEGRADED",
-                "dispatch": "top10_selector",
+                "build_status": "DEGRADED", "dispatch": "top10_selector",
                 "selector_version": TOP10_SELECTOR_VERSION,
                 "warning": "builder_total_timeout",
                 "criteria_used": _json_safe(criteria),
@@ -2680,7 +2592,6 @@ def select_top10_symbols(*args: Any, **kwargs: Any) -> Any:
 
 __all__ = [
     "TOP10_SELECTOR_VERSION",
-    # v4.11.0 Phase E: TFB module convention alias
     "__version__",
     "build_top10_rows",
     "build_top10_output_rows",
