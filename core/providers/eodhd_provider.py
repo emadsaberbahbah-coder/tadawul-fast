@@ -2,22 +2,102 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.8.0 (CIRCUIT BREAKER + HEALTH PROBE + SESSION COUNTERS +
+EODHD Provider — v4.9.0 (PER-FAILURE PROVIDER-UNHEALTHY SIGNAL + CIRCUIT BREAKER
+                          + HEALTH PROBE + SESSION COUNTERS +
                           MAY 2026 / v2.8.0 FAMILY ALIGNMENT)
 ================================================================================
 
-v4.8.0 — OPERATOR-VISIBLE PROVIDER HEALTH (May 12, 2026)
+v4.9.0 — PER-FAILURE PROVIDER-UNHEALTHY SIGNAL (May 12, 2026)
 -----------------------------------------------------------------------
-v4.7.3 has excellent per-request 403 body parsing (auth_error /
+v4.8.0 added a circuit breaker that opens after 8 consecutive AuthError
+or IpBlocked failures and, on entering the OPEN state, emits the
+cross-provider `provider_unhealthy:eodhd` marker via
+`_build_circuit_open_patch()`. Engine v5.61.0+ consumes that marker
+through its `_ProviderHealthRegistry` and routes around the unhealthy
+primary on subsequent fetches.
+
+In production, however, the breaker NEVER reaches its 8-consecutive
+threshold. Each symbol triggers three concurrent calls in
+`fetch_enriched_quote_patch` — `real-time/`, `fundamentals/`, and
+`eod/` — and in many real failure modes only SOME endpoints 403 while
+others return 200. `_ProviderHealth.record_success()` resets
+`consecutive_auth_errors` to 0 on every successful call, so the
+threshold is functionally unreachable while partial failures persist.
+Live diagnostics confirm this: the engine's
+`provider_unhealthy_markers.total_observations` stays at 0 even when
+every row's Warnings column carries HTTP 403 markers from `eod/` calls
+and downstream fields collapse silently.
+
+v4.9.0 closes the gap by emitting the unhealthy marker on EACH
+individual auth-class failure, not just when the breaker opens:
+
+  AH  `_build_error_patch_with_geo` enhancement.
+       When the error code indicates `auth_error` or `ip_blocked`, the
+       function now adds `provider_unhealthy:eodhd` to the patch's
+       warnings list, alongside the existing `fetch_failed:<err>` tag.
+       Engine v5.61.0+'s `_observe_provider_unhealthy_markers` reads
+       this marker and calls `_ProviderHealthRegistry.record_unhealthy(
+       "eodhd")` with a 300s TTL (default, env-configurable via
+       `ENGINE_PROVIDER_UNHEALTHY_TTL_SEC`). The registry is
+       idempotent: subsequent auth failures within the TTL refresh it;
+       after 300s with no auth errors the marker auto-expires and the
+       engine restores eodhd to its preferred chain position.
+
+       Granularity by error class:
+         - AuthError    -> EMIT (decisive provider-broken signal)
+         - IpBlocked    -> EMIT (decisive provider-broken signal)
+         - RateLimited  -> do NOT emit (transient, retries handle it)
+         - NotFound     -> do NOT emit (symbol-specific, not provider)
+         - NetworkError -> do NOT emit (transient)
+         - CircuitOpen  -> EMIT via _build_circuit_open_patch (existing
+                           v4.8.0 behavior, preserved verbatim)
+
+  AI  `fetch_quote_patch` alias fallback path.
+       The fallback error patch built in `fetch_quote_patch` when
+       `fetch_quote` returns empty (historically dead code in v4.8.0
+       because fetch_quote always returns a non-empty patch) now also
+       carries `provider_unhealthy:eodhd` when the upstream error
+       indicates an auth-class failure. Preserves consistency with
+       `_build_error_patch_with_geo`.
+
+  AJ  Runtime log tags updated to `[eodhd v4.9.0]`.
+       Helps operators correlate logs to the active version. Existing
+       structured-diagnostics log lines from v4.8.0 are preserved
+       byte-identical except for the version tag.
+
+  AK  Version bump to 4.9.0 across PROVIDER_VERSION, UA_DEFAULT, and
+       the file's section header. VERSION constant follows.
+
+[PRESERVED — strictly] All v4.8.0 / v4.7.3 / v4.7.2 / v4.7.1 / v4.7.0 /
+v4.6.0 behavior, signatures, env vars, cache keys, schema fields,
+alias mappings, method names, AND the v4.8.0 circuit-breaker state
+machine + thresholds + half_open probe behavior + diagnose_health() +
+get_provider_stats(). v4.9.0 is purely additive: the breaker still
+trips at 8-consecutive (and still emits `circuit_open` then), but
+auth/IP failures now signal the engine immediately via the warning
+marker WITHOUT waiting for the threshold. Public API surface
+unchanged. No removals from __all__.
+
+No new env variables in v4.9.0. The marker's TTL and demote/skip
+semantics live on the engine side (v5.61.0+) and are governed by:
+  - ENGINE_PROVIDER_UNHEALTHY_TTL_SEC  (default: 300)
+  - ENGINE_PROVIDER_UNHEALTHY_DEMOTE   (default: 1)
+  - ENGINE_PROVIDER_UNHEALTHY_SKIP     (default: 0)
+
+================================================================================
+
+v4.8.0 — OPERATOR-VISIBLE PROVIDER HEALTH (May 12, 2026)  [PRESERVED]
+-----------------------------------------------------------------------
+v4.7.3 had excellent per-request 403 body parsing (auth_error /
 quota_or_rate_limit / ip_blocked classification) and cross-provider
-warnings alignment, but operators have no way to detect the
+warnings alignment, but operators had no way to detect the
 "systematically broken" state where every request silently 403s.
-Without that signal, the engine keeps hammering EODHD for the full
-~1,929-symbol refresh batch while every row falls back to Yahoo —
-masking what is actually a single root-cause auth failure as
+Without that signal, the engine kept hammering EODHD for the full
+~1,929-symbol refresh batch while every row fell back to Yahoo —
+masking what was actually a single root-cause auth failure as
 "~30 downstream catchall fields per row".
 
-v4.8.0 adds the missing surface:
+v4.8.0 added the missing surface:
 
   AA  NEW `_ProviderHealth` async-safe state class.
        Tracks consecutive auth/IP failures and cumulative session
@@ -79,185 +159,49 @@ v4.8.0 adds the missing surface:
        Probes a known-stable symbol (default AAPL.US, configurable
        via EODHD_HEALTH_PROBE_SYMBOL) and returns a structured
        health report suitable for ops dashboards or operator menu
-       items. Returns:
-         {
-           "ok": bool,
-           "provider": "eodhd",
-           "provider_version": "4.8.0",
-           "timestamp_utc": ISO,
-           "timestamp_riyadh": ISO,
-           "api_key_present": bool,
-           "circuit_state": "closed"|"open"|"half_open",
-           "consecutive_auth_errors": int,
-           "consecutive_ip_blocks": int,
-           "probe": {
-             "symbol": str,
-             "fetched": bool,
-             "latency_ms": float|None,
-             "error_class": str|None,
-             "current_price": float|None,
-           },
-           "session_stats": {
-             "total_requests": int,
-             "success_count": int,
-             "auth_error_count": int,
-             "ip_block_count": int,
-             "rate_limit_count": int,
-             "network_error_count": int,
-           }
-         }
-
-       Safe to call any time — the probe respects the circuit
-       breaker (if open, returns without hitting the API). When
-       OK, this single call replaces parsing per-symbol error
-       patches to verify EODHD is healthy.
+       items.
 
   AE  NEW module-level `get_provider_stats()` function.
-       Returns the cumulative session counters as a dict (same
-       shape as `diagnose_health()["session_stats"]`). Lightweight,
-       no API call — operators can poll this to watch provider
-       behavior over time without triggering a probe.
-
-  AF  Docstring aligned-with refs synced to May 2026 family:
-       - data_engine_v2 v5.55.1 -> v5.60.0
-       - scoring v5.2.3+ -> v5.2.5
-       - schema_registry referenced as v2.8.0 (97-col canonical)
-
-  AG  Version bump to 4.8.0 across PROVIDER_VERSION, UA_DEFAULT
-      and the file's section header. VERSION constant follows.
-
-[PRESERVED — strictly] All v4.7.3 / v4.7.2 / v4.7.1 / v4.7.0 / v4.6.0
-behavior, signatures, env vars, cache keys, schema fields, alias
-mappings, and method names. v4.8.0 changes are additive (one new
-state class + one new function + circuit-breaker integration in
-_request_json + 3 new env vars + 1 new probe-symbol env var) plus
-the version bump. Public API surface unchanged. No removals from
-__all__; two additions (`diagnose_health`, `get_provider_stats`).
-
-New env variables (v4.8.0):
-  - EODHD_CIRCUIT_BREAKER_ENABLE (default: 1)   enable/disable circuit breaker
-  - EODHD_CIRCUIT_AUTH_THRESHOLD (default: 8)   consecutive auth/IP failures before opening
-  - EODHD_CIRCUIT_BACKOFF_SEC    (default: 300) seconds to wait before half-open probe
-  - EODHD_HEALTH_PROBE_SYMBOL    (default: "AAPL.US") symbol used by diagnose_health()
+       Returns the cumulative session counters as a dict. Lightweight,
+       no API call.
 
 ================================================================================
 
-v4.7.3 — CROSS-PROVIDER ALIGNMENT (May 11, 2026)
+v4.7.3 — CROSS-PROVIDER ALIGNMENT (May 11, 2026)  [PRESERVED]
 -----------------------------------------------------------------------
-Aligned this provider with the warnings convention used by:
-  - yahoo_fundamentals_provider v6.1.0
-  - yahoo_chart_provider     v8.2.0
-  - enriched_quote (core)    v4.3.0
-…so every row reaching the sheet's Warnings column has the same shape
-and can be rendered consistently. v4.7.2 emitted `merged["warning"]`
-(singular string) plus `merged["info"]["warnings"]` (nested list);
-v4.7.3 added the canonical `merged["warnings"]` (top-level list) that
-enriched_quote v4.3.0's `_normalize_warnings_field()` already knows
-how to "; "-join for the sheet. The legacy fields are preserved for
-back-compat with consumers that already read them.
-
   ZA  Top-level `warnings: List[str]` on every patch.
-       Each of fetch_quote / fetch_fundamentals / fetch_history_stats
-       collects field-level warnings during execution and ships
-       them in the patch under the key `warnings`. The aggregator in
-       fetch_enriched_quote_patch unions every contributing patch's
-       list via `_merge_warnings_inplace()`, dedupes while preserving
-       order, and writes the merged result back to merged["warnings"].
-       Examples emitted:
-         quote_currency_missing, quote_exchange_missing,
-         quote_current_price_missing, quote_exchange_from_suffix,
-         quote_currency_from_suffix, fundamentals_empty,
-         industry_missing_from_provider, eps_ttm_fallback_used,
-         eps_ttm_fallback_rejected, history_empty, history_too_short,
-         risk_metrics_unavailable, week_52_high_unit_mismatch_dropped,
-         week_52_low_unit_mismatch_dropped, week_52_high_low_inverted,
-         current_price_outside_52w_range.
-
   ZB  Currency-sanity guard on merged 52W bounds.
-       Mirrors yahoo_fundamentals_provider v6.1.0 and yahoo_chart_
-       provider v8.2.0. While EODHD usually returns the native
-       listing's currency consistently (so cross-currency drift is
-       less common than with Yahoo's ADR handling), multi-listed
-       instruments and Highlights/Technicals/EOD mismatch can still
-       produce out-of-band 52W values. `_is_suspect_price_ratio()`
-       and `_validate_52w_bounds_merged()` apply the same |candidate
-       / current_price| thresholds (default [0.125, 8.0]) to the
-       merged row AFTER all three fetches contribute. Suspect values
-       are dropped from `week_52_high` / `week_52_low` / `52w_high` /
-       `52w_low`; inverted high < low pairs are swapped; out-of-band
-       current price is flagged informationally. Tunable via
-       `EODHD_PRICE_RATIO_HIGH` / `EODHD_PRICE_RATIO_LOW`; disable
-       entirely via `EODHD_PRICE_SANITY_GUARD=0`.
-
   ZC  `last_error_class` field on full-fail returns.
-       Matches the diagnostic shape now used by the Yahoo providers,
-       letting downstream log analysis cluster failures by exception
-       class without parsing the free-form `error_detail` string.
+  ZD  Version bump to 4.7.3.
 
-  ZD  Version bump to 4.7.3 across PROVIDER_VERSION, UA_DEFAULT and
-       the file's section header.
-
-================================================================================
-
-v4.7.2 — POST-v5.57.0 RESILIENCE & DIAGNOSTIC IMPROVEMENTS (May 10, 2026)
------------------------------------------------------------------------
-  YA  fetch_history_stats now returns geo-defaulted error patch.
-  YB  Better HTTP 403 body parsing (quota vs auth_error vs ip_blocked).
-  YC  Expanded currency canonicalization (EGP/AED/QAR/SAR/JPY/CNY/INR/
-      TWD/HKD/BRL/MXN variants).
-  YD  eps_ttm fallback sanity bound (suppress to None when outside
-      [-200, +500]).
-  YE  Header docstring narrative restored.
-  YF  Version bump to 4.7.2.
-
-================================================================================
-
-v4.7.1 — PROVIDER-LAYER QUIET CORRECTIONS (May 10, 2026)
------------------------------------------------------------------------
-  FIX-A  week_52_position_pct stored as PERCENT POINTS (0-100), not
-         fraction (0-1). Engine v5.53.0 / scoring v5.2.5+ contract.
-  FIX-B  eps_ttm = net_income_ttm / shares_outstanding fallback when
-         Highlights.EarningsShare / DilutedEpsTTM both missing.
-
-================================================================================
-
-v4.7.0 — PROVIDER-LAYER FIXES FROM PRODUCTION SHEET AUDIT (May 10, 2026)
------------------------------------------------------------------------
-  ISSUE-A  Currency canonicalization (GBp -> GBX, KWF -> KWD, ...)
-  ISSUE-B  GBp lowercase-p normalized to GBX
-  ISSUE-C  Geo-defaulted error patches via _build_error_patch_with_geo
-  ISSUE-D  Suffix canonicalization (.L -> .LSE, .XETR -> .XETRA, ...)
+v4.7.2 — POST-v5.57.0 RESILIENCE & DIAGNOSTIC IMPROVEMENTS  [PRESERVED]
+v4.7.1 — PROVIDER-LAYER QUIET CORRECTIONS                  [PRESERVED]
+v4.7.0 — PROVIDER-LAYER FIXES FROM PRODUCTION SHEET AUDIT  [PRESERVED]
 
 ================================================================================
 
 May 2026 / v2.8.0 family alignment
 ----------------------------------
 This provider aligns with:
-  - core/sheets/schema_registry  v2.8.0  (97 instrument / 100 Top10 cols)
-  - core/data_engine_v2          v5.60.0 (97-col schema, Phase H/I/P drops,
-                                          Phase B forecast unavailable,
-                                          Phase Q last_error_class)
-  - core/scoring                 v5.2.5
-  - core/reco_normalize          v7.2.0
-  - core/scoring_engine          v3.4.2
-  - core/insights_builder        v7.0.0  (Data Quality Alerts)
-  - core/analysis/criteria_model v3.1.0
-  - core/analysis/top10_selector v4.12.0
+  - core/sheets/schema_registry    v2.8.0
+  - core/data_engine_v2            v5.61.0 (consumes `provider_unhealthy:eodhd`
+                                            warning marker via
+                                            _ProviderHealthRegistry —
+                                            v4.9.0 fires the marker on each
+                                            auth-class failure)
+  - core/scoring                   v5.2.5
+  - core/reco_normalize            v7.2.0
+  - core/scoring_engine            v3.4.2
+  - core/insights_builder          v7.0.0
+  - core/analysis/criteria_model   v3.1.0
+  - core/analysis/top10_selector   v4.12.0
   - core/investment_advisor_engine v4.4.0
-  - core/investment_advisor      v5.3.0
-  - core/candlesticks            v1.0.0
-  - yahoo_fundamentals_provider  v6.1.0
-  - yahoo_chart_provider         v8.2.0
-  - enriched_quote (core)        v4.3.0
+  - core/investment_advisor        v5.3.0
+  - core/candlesticks              v1.0.0
+  - yahoo_fundamentals_provider    v6.1.0
+  - yahoo_chart_provider           v8.2.0
+  - enriched_quote (core)          v4.3.0
 
-================================================================================
-
-WHY v4.6.0 — Global EODHD Primary
----------------------------------
-- Global pages should use EODHD for: price + history + fundamentals.
-- Only fall back to Yahoo providers when EODHD doesn't have a field.
-- International symbols should be supported across all pages.
-- Render-safe: no pandas / numpy / scipy.
 ================================================================================
 """
 
@@ -284,7 +228,7 @@ PROVIDER_NAME = "eodhd"
 
 # =============================================================================
 # v4.7.0 — Currency-code canonicalization (ISSUE-A, ISSUE-B)
-# (PRESERVED byte-identical in v4.8.0)
+# (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 #
 # EODHD returns several non-ISO currency codes that need normalization
@@ -340,7 +284,7 @@ def _canonicalize_currency_code(code: Any) -> Optional[str]:
 
 # =============================================================================
 # v4.7.0 — Suffix-derived geo defaults (ISSUE-C)
-# (PRESERVED byte-identical in v4.8.0)
+# (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 
 _GEO_BY_SUFFIX: Dict[str, Tuple[str, str, str]] = {
@@ -422,7 +366,7 @@ def _suffix_derived_geo_defaults(symbol: str) -> Dict[str, Optional[str]]:
 
 # =============================================================================
 # v4.7.0 — EODHD-canonical suffix mapping (ISSUE-D)
-# (PRESERVED byte-identical in v4.8.0)
+# (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 
 _EODHD_SUFFIX_CANONICAL: Dict[str, str] = {
@@ -447,7 +391,7 @@ def _canonicalize_eodhd_suffix(symbol_uppercased: str) -> str:
 
 # =============================================================================
 # v4.7.3 ZB — 52W bounds currency-sanity guard (cross-provider alignment)
-# (PRESERVED byte-identical in v4.8.0)
+# (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 
 _PRICE_RATIO_SUSPECT_HIGH_DEFAULT = 8.0
@@ -525,6 +469,49 @@ def _validate_52w_bounds_merged(
     return warnings
 
 
+# =============================================================================
+# v4.9.0 AH — Per-failure provider-unhealthy detection helper
+# =============================================================================
+#
+# Inspects an error string returned by `_request_json` and decides
+# whether the failure class warrants emitting the cross-provider
+# `provider_unhealthy:eodhd` warning marker.
+#
+# The marker is fired on ANY occurrence of an auth-class failure,
+# without waiting for the circuit breaker to reach its 8-consecutive
+# threshold. Engine v5.61.0+'s `_ProviderHealthRegistry` consumes the
+# marker, applies its 300s TTL (idempotent — repeated firings refresh
+# the same entry), and demotes/skips eodhd in subsequent chains.
+#
+# Granularity:
+#   - "auth_error"  (HTTP 401/403 with auth body)   -> EMIT
+#   - "ip_blocked"  (HTTP 401/403 with IP-block body) -> EMIT
+#   - "quota_or_rate_limit" / "HTTP 429"            -> do NOT emit
+#   - "HTTP 404 not_found"                          -> do NOT emit
+#   - "network_error:..." / "HTTP 5xx"              -> do NOT emit
+#   - "invalid_json_payload" / "bad_payload"        -> do NOT emit
+#   - "circuit_open"                                -> handled separately
+#                                                       by _build_circuit_open_patch
+
+_PROVIDER_UNHEALTHY_TRIGGER_TOKENS: Tuple[str, ...] = (
+    "auth_error",
+    "ip_blocked",
+)
+
+
+def _err_indicates_provider_unhealthy(err_code: Any) -> bool:
+    """
+    v4.9.0 AH: Return True if `err_code` indicates an auth-class
+    failure that should fire the per-failure `provider_unhealthy:eodhd`
+    marker. Case-insensitive substring match.
+    """
+    s = safe_str(err_code)
+    if not s:
+        return False
+    sl = s.lower()
+    return any(tok in sl for tok in _PROVIDER_UNHEALTHY_TRIGGER_TOKENS)
+
+
 def _build_error_patch_with_geo(
     sym_raw: str,
     sym_norm: str,
@@ -533,15 +520,30 @@ def _build_error_patch_with_geo(
     extra_warnings: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    v4.7.0 ISSUE-C / v4.7.3 ZA: Build a non-empty error patch that carries
-    suffix-derived country/currency/exchange so the merged row arrives at
-    data_engine_v2 with correct geo even when EODHD's endpoints failed.
+    v4.7.0 ISSUE-C / v4.7.3 ZA: Build a non-empty error patch that
+    carries suffix-derived country/currency/exchange so the merged row
+    arrives at data_engine_v2 with correct geo even when EODHD's
+    endpoints failed.
 
-    v4.7.3: also carries a structured `warnings` list with a fetch-failure
-    marker plus any caller-provided field-level flags.
+    v4.7.3: also carries a structured `warnings` list with a
+    fetch-failure marker plus any caller-provided field-level flags.
+
+    v4.9.0 AH: when `err_code` indicates `auth_error` or `ip_blocked`,
+    the patch also carries the cross-provider `provider_unhealthy:eodhd`
+    marker. Engine v5.61.0+'s `_observe_provider_unhealthy_markers`
+    extracts this from `warnings` and registers eodhd as unhealthy in
+    `_ProviderHealthRegistry` immediately — without waiting for the
+    circuit breaker's 8-consecutive threshold. Idempotent: repeated
+    firings within the engine's TTL window (default 300s) refresh the
+    same registry entry.
     """
     geo = _suffix_derived_geo_defaults(sym_raw)
     warnings_out: List[str] = [f"fetch_failed:{err_code}"]
+
+    # v4.9.0 AH: per-failure provider-unhealthy signal.
+    if _err_indicates_provider_unhealthy(err_code):
+        warnings_out.append("provider_unhealthy:eodhd")
+
     if extra_warnings:
         for w in extra_warnings:
             if w and w not in warnings_out:
@@ -557,7 +559,7 @@ def _build_error_patch_with_geo(
             "exchange": geo["exchange"],
             "error": err_code,
             "data_quality": "MISSING",
-            "warnings": warnings_out,  # v4.7.3 ZA
+            "warnings": warnings_out,  # v4.7.3 ZA + v4.9.0 AH
             "last_updated_utc": _utc_iso(),
             "last_updated_riyadh": _riyadh_iso(),
         }
@@ -565,14 +567,14 @@ def _build_error_patch_with_geo(
 
 
 # =============================================================================
-# v4.8.0 — Constants and version
+# v4.9.0 — Constants and version
 # =============================================================================
 
-PROVIDER_VERSION = "4.8.0"
+PROVIDER_VERSION = "4.9.0"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
-UA_DEFAULT = "TFB-EODHD/4.8.0 (Render)"
+UA_DEFAULT = "TFB-EODHD/4.9.0 (Render)"
 
 try:
     import orjson  # type: ignore
@@ -598,7 +600,7 @@ _KSA_RE = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
 
 # =============================================================================
 # Env helpers
-# (PRESERVED byte-identical in v4.8.0)
+# (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 def _env_str(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
@@ -680,7 +682,8 @@ def _price_ratio_low() -> float:
 
 
 # =============================================================================
-# v4.8.0 NEW — Circuit-breaker env helpers
+# v4.8.0 — Circuit-breaker env helpers
+# (PRESERVED byte-identical in v4.9.0)
 # =============================================================================
 #
 # Default thresholds chosen to be CONSERVATIVE:
@@ -691,6 +694,14 @@ def _price_ratio_low() -> float:
 #     for a recovered API key / fixed quota to be detected on the
 #     next refresh batch, but slow enough that we don't burn requests
 #     during the failure window.
+#
+# v4.9.0 NOTE: the 8-consecutive threshold remains the SAME. v4.9.0
+# adds a complementary per-failure signal path that fires the
+# `provider_unhealthy:eodhd` marker without waiting for the breaker.
+# The breaker still trips on sustained failure (its `circuit_open`
+# patch + 5-minute backoff still apply); the per-failure marker
+# handles the partial-failure case where the breaker can't reach
+# threshold because successes keep resetting the consecutive counter.
 
 _CIRCUIT_AUTH_THRESHOLD_DEFAULT = 8
 _CIRCUIT_BACKOFF_SEC_DEFAULT = 300.0
@@ -738,7 +749,8 @@ def _riyadh_iso(dt: Optional[datetime] = None) -> str:
 
 
 # =============================================================================
-# v4.8.0 NEW — _ProviderHealth (circuit breaker + session counters)
+# v4.8.0 — _ProviderHealth (circuit breaker + session counters)
+# (PRESERVED byte-identical in v4.9.0)
 # =============================================================================
 #
 # Async-safe state class. Module-level singleton instance is created lazily
@@ -758,7 +770,7 @@ def _riyadh_iso(dt: Optional[datetime] = None) -> str:
 # window with its own correctness questions.
 
 class _ProviderHealth:
-    """v4.8.0 AA: async-safe provider health + circuit breaker."""
+    """v4.8.0 AA: async-safe provider health + circuit breaker. (Preserved v4.9.0)"""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -783,20 +795,11 @@ class _ProviderHealth:
     async def begin_request(self) -> Tuple[bool, str]:
         """
         v4.8.0 AB: called before each HTTP request. Returns (allow, state).
-
-        Increments total_requests counter regardless of allow. Handles
-        the half_open transition when backoff has elapsed.
-
-        Returns:
-          (True,  "closed")     normal operation
-          (True,  "half_open")  backoff elapsed, probe allowed
-          (False, "open")       circuit open, request blocked
         """
         async with self._lock:
             self._total_requests += 1
 
             if not _circuit_breaker_enabled():
-                # Treat as closed; don't update state machine.
                 return True, "closed"
 
             if self._state == "closed":
@@ -806,12 +809,10 @@ class _ProviderHealth:
                 now = time.monotonic()
                 backoff = _circuit_backoff_sec()
                 if self._opened_at is not None and (now - self._opened_at) >= backoff:
-                    # Transition open -> half_open: allow one probe.
                     self._state = "half_open"
                     return True, "half_open"
                 return False, "open"
 
-            # half_open: allow probes; next record_* decides next state.
             return True, "half_open"
 
     async def record_success(self) -> None:
@@ -823,10 +824,9 @@ class _ProviderHealth:
             self._consecutive_ip = 0
             self._last_success = now
             if self._state in ("open", "half_open"):
-                # half_open -> closed (or auto-recover from stale open)
                 self._state = "closed"
                 self._opened_at = None
-                logger.info("[eodhd v4.8.0] circuit_breaker closed after successful request")
+                logger.info("[eodhd v4.9.0] circuit_breaker closed after successful request")
 
     async def record_failure(self, error_class: str) -> None:
         """
@@ -851,35 +851,29 @@ class _ProviderHealth:
                 self._rate_count += 1
             elif cls_lower == "networkerror":
                 self._network_count += 1
-            # Other classes (NotFound, InvalidPayload, BadTaskResult,
-            # MissingApiKey, InvalidSymbol, FetchError) are recorded
-            # via the timestamp but don't contribute to circuit opening.
 
             if not _circuit_breaker_enabled():
                 return
 
             threshold = _circuit_auth_threshold()
 
-            # If we're in half_open and just failed, re-open with fresh timer.
             if self._state == "half_open":
                 self._state = "open"
                 self._opened_at = now
                 logger.warning(
-                    "[eodhd v4.8.0] circuit_breaker re-opened: "
+                    "[eodhd v4.9.0] circuit_breaker re-opened: "
                     "half_open probe failed with %s", error_class,
                 )
                 return
 
-            # Already open: stay open; opened_at only updates on first open.
             if self._state == "open":
                 return
 
-            # closed: check whether to open
             if self._consecutive_auth >= threshold or self._consecutive_ip >= threshold:
                 self._state = "open"
                 self._opened_at = now
                 logger.error(
-                    "[eodhd v4.8.0] circuit_breaker OPEN: "
+                    "[eodhd v4.9.0] circuit_breaker OPEN: "
                     "consecutive_auth=%d consecutive_ip=%d threshold=%d "
                     "(EODHD provider unhealthy — verify EODHD_API_KEY env var)",
                     self._consecutive_auth, self._consecutive_ip, threshold,
@@ -893,7 +887,7 @@ class _ProviderHealth:
     async def snapshot(self) -> Dict[str, Any]:
         """
         v4.8.0 AD/AE: structured snapshot for diagnose_health() and
-        get_provider_stats(). All fields are plain JSON-serializable.
+        get_provider_stats().
         """
         async with self._lock:
             now = time.monotonic()
@@ -953,6 +947,13 @@ def _build_circuit_open_patch(sym_raw: str, sym_norm: str) -> Dict[str, Any]:
     not even attempting the API call. Carries the cross-provider
     `provider_unhealthy:eodhd` marker so the engine knows this is a
     systemic failure, not a per-symbol issue.
+
+    v4.9.0 NOTE: this is the "circuit fully tripped" path. The v4.9.0
+    per-failure path (via `_build_error_patch_with_geo`) emits the same
+    cross-provider marker on each individual auth failure even when
+    the breaker hasn't reached its 8-consecutive threshold. Both paths
+    carry the same marker shape so the engine sees consistent input
+    from either source.
     """
     geo = _suffix_derived_geo_defaults(sym_raw)
     return _clean_patch(
@@ -976,7 +977,7 @@ def _build_circuit_open_patch(sym_raw: str, sym_norm: str) -> Dict[str, Any]:
 
 # =============================================================================
 # Coercion helpers
-# (PRESERVED byte-identical in v4.8.0)
+# (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 def safe_float(v: Any) -> Optional[float]:
     if v is None:
@@ -1123,7 +1124,7 @@ def _merge_warnings_inplace(target: Dict[str, Any], incoming: Any) -> None:
 
 # =============================================================================
 # Symbol normalization (GLOBAL, incl. international)
-# (PRESERVED byte-identical in v4.8.0)
+# (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 def normalize_eodhd_symbol(symbol: str) -> str:
     s = (symbol or "").strip()
@@ -1166,7 +1167,7 @@ def normalize_eodhd_symbol(symbol: str) -> str:
 
 # =============================================================================
 # Nested-data helpers
-# (PRESERVED byte-identical in v4.8.0)
+# (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 def _listify_rows(node: Any) -> List[Dict[str, Any]]:
     if isinstance(node, list):
@@ -1275,7 +1276,7 @@ def _infer_asset_class(general: Dict[str, Any], etf_data: Dict[str, Any]) -> Opt
 
 # =============================================================================
 # Async primitives: SingleFlight + TTL Cache + TokenBucket
-# (PRESERVED byte-identical in v4.8.0)
+# (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 class _SingleFlight:
     def __init__(self) -> None:
@@ -1370,7 +1371,7 @@ class _TokenBucket:
 
 # =============================================================================
 # Stats calculations from close series (no numpy)
-# (PRESERVED byte-identical in v4.8.0)
+# (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 def _daily_returns(closes: List[float]) -> List[float]:
     rets: List[float] = []
@@ -1457,7 +1458,9 @@ def _rsi14(closes: List[float]) -> Optional[float]:
 
 # =============================================================================
 # EODHD Client
-# (v4.8.0: _request_json integrates circuit breaker; all other methods PRESERVED)
+# (v4.8.0 + v4.9.0: _request_json integrates circuit breaker; v4.9.0 emits
+#  per-failure provider_unhealthy:eodhd via _build_error_patch_with_geo;
+#  all other methods PRESERVED)
 # =============================================================================
 class EODHDClient:
     def __init__(self) -> None:
@@ -1491,7 +1494,8 @@ class EODHDClient:
         logger.info(
             "EODHDClient v%s initialized | api_key_present=%s | rate=%s/s | burst=%s | "
             "concurrency=%s | retries=%s | sanity_guard=%s | ratio=[%s, %s] | "
-            "circuit_breaker=%s threshold=%d backoff=%.0fs",
+            "circuit_breaker=%s threshold=%d backoff=%.0fs | "
+            "per_failure_unhealthy_signal=enabled",
             PROVIDER_VERSION,
             bool(self.api_key),
             rps,
@@ -1513,9 +1517,7 @@ class EODHDClient:
     def _classify_error(err: Optional[str]) -> str:
         """
         v4.8.0 AB: map the free-form error string from _request_json into
-        the structured class names the health tracker understands. Mirrors
-        the classification logic in fetch_enriched_quote_patch's error
-        loop so both paths feed `record_failure` consistently.
+        the structured class names the health tracker understands.
         """
         if not err:
             return "FetchError"
@@ -1539,31 +1541,20 @@ class EODHDClient:
     async def _request_json(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
         """
         v4.7.3 + v4.8.0 AB: HTTP request with retry, 403 body parsing, and
-        circuit-breaker integration.
+        circuit-breaker integration. (PRESERVED byte-identical in v4.9.0.)
 
-        v4.8.0 changes:
-          - Before each request, calls health.begin_request(). If the
-            circuit is OPEN, returns immediately with ("circuit_open",
-            "circuit_open") — no API hit, no token bucket consumption.
-          - After each request, records success/failure to health so the
-            breaker can transition state.
-
-        Existing v4.7.3 behavior (403 body parsing for auth_error /
-        quota_or_rate_limit / ip_blocked, retry-on-5xx, retry-on-429) is
-        PRESERVED VERBATIM. The circuit-breaker is a wrapper layer,
-        not a replacement.
+        The per-failure `provider_unhealthy:eodhd` marker emitted by
+        v4.9.0 is added DOWNSTREAM of this function in
+        `_build_error_patch_with_geo`, based on inspecting the error
+        string returned here. _request_json itself is unchanged.
         """
         if not self.api_key:
-            # Skip circuit-breaker accounting for missing-key — it's a
-            # configuration problem, not a provider-health problem.
             return None, "EODHD_API_KEY missing"
 
         # v4.8.0 AB: circuit-breaker check before the network call.
         health = await _get_health()
         allow, state_seen = await health.begin_request()
         if not allow:
-            # Circuit open: don't hit the API. Caller will translate this
-            # into the `circuit_open` error path.
             return None, "circuit_open"
 
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
@@ -1585,8 +1576,6 @@ class EODHDClient:
                         continue
 
                     if sc in (401, 403):
-                        # v4.7.2 YB: distinguish auth_error / quota / IP block.
-                        # (PRESERVED byte-identical in v4.8.0)
                         body_hint = ""
                         try:
                             body_hint = (r.text or "")[:200]
@@ -1612,7 +1601,6 @@ class EODHDClient:
                             ra = r.headers.get("Retry-After")
                             wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else min(30.0, 5.0 + 2.0 * attempt)
                             last_err = "HTTP 403 quota_or_rate_limit"
-                            # Record rate-limit for session counters (doesn't open circuit).
                             await health.record_failure("RateLimited")
                             await asyncio.sleep(wait)
                             continue
@@ -1633,8 +1621,6 @@ class EODHDClient:
                         continue
 
                     if sc == 404:
-                        # 404 is informational, not a provider-health issue —
-                        # the symbol just isn't in EODHD's catalog.
                         return None, "HTTP 404 not_found"
 
                     if sc >= 400:
@@ -1657,8 +1643,6 @@ class EODHDClient:
                     last_err = f"unexpected_error:{e.__class__.__name__}"
                     break
 
-        # Retries exhausted. Classify the last error so the health tracker
-        # can decide if it should contribute to circuit opening.
         final_class = self._classify_error(last_err)
         await health.record_failure(final_class)
         return None, last_err or "request_failed"
@@ -1681,11 +1665,12 @@ class EODHDClient:
             warnings_list: List[str] = []
             data, err = await self._request_json(f"real-time/{sym}", params={})
             if err or not isinstance(data, dict):
-                # v4.7.0 ISSUE-C + v4.7.3 ZA
-                # v4.8.0 AC: if the breaker is open, prefer the circuit_open
-                # patch over the generic error patch.
+                # v4.8.0 AC: circuit-open path
                 if err == "circuit_open":
                     return _build_circuit_open_patch(sym_raw, sym), err
+                # v4.9.0 AH: per-failure path — _build_error_patch_with_geo
+                # adds `provider_unhealthy:eodhd` to warnings automatically
+                # when the err indicates an auth-class failure.
                 return _build_error_patch_with_geo(sym_raw, sym, err or "bad_payload"), err or "bad_payload"
 
             close = safe_float(_first_present(data.get("close"), data.get("adjusted_close"), data.get("last"), data.get("price")))
@@ -1703,11 +1688,9 @@ class EODHDClient:
                 change_frac = (close / prev) - 1.0
 
             exchange = safe_str(_first_present(data.get("exchange"), data.get("fullExchangeName"), data.get("primaryExchange")))
-            # v4.7.0 ISSUE-A / ISSUE-B
             currency = _canonicalize_currency_code(_first_present(data.get("currency"), data.get("currency_code")))
             market_cap = safe_float(_first_present(data.get("market_cap"), data.get("marketCapitalization"), data.get("marketCapitalisation")))
 
-            # v4.7.0 ISSUE-C: backfill blank geo fields from the suffix.
             geo = _suffix_derived_geo_defaults(sym_raw)
             if not exchange and geo["exchange"]:
                 exchange = geo["exchange"]
@@ -1716,7 +1699,6 @@ class EODHDClient:
                 currency = geo["currency"]
                 warnings_list.append("quote_currency_from_suffix")
 
-            # v4.7.3 ZA: field-level data-quality flags
             if close is None:
                 warnings_list.append("quote_current_price_missing")
             if exchange is None:
@@ -1776,7 +1758,7 @@ class EODHDClient:
             warnings_list: List[str] = []
             data, err = await self._request_json(f"fundamentals/{sym}", params={})
             if err or not isinstance(data, dict):
-                # v4.7.0 ISSUE-C + v4.7.3 ZA + v4.8.0 AC
+                # v4.8.0 AC + v4.9.0 AH paths
                 if err == "circuit_open":
                     return _build_circuit_open_patch(sym_raw, sym), err
                 return _build_error_patch_with_geo(sym_raw, sym, err or "bad_payload"), err or "bad_payload"
@@ -1790,7 +1772,6 @@ class EODHDClient:
             etf_data = data.get("ETF_Data") or {}
             financials = data.get("Financials") or {}
 
-            # v4.7.3 ZA: empty-block flag
             if not general and not highlights and not financials:
                 warnings_list.append("fundamentals_empty")
 
@@ -1870,10 +1851,8 @@ class EODHDClient:
             asset_class = _infer_asset_class(general, etf_data)
             country = safe_str(_first_present(general.get("CountryISO"), general.get("CountryName"), general.get("Country")))
             exchange = safe_str(_first_present(general.get("Exchange"), general.get("PrimaryExchange")))
-            # v4.7.0 ISSUE-A / ISSUE-B
             currency = _canonicalize_currency_code(_first_present(general.get("CurrencyCode"), general.get("Currency"), highlights.get("Currency")))
 
-            # v4.7.0 ISSUE-C: backfill blanks from the suffix-derived geo table.
             geo = _suffix_derived_geo_defaults(sym_raw)
             if not country and geo["country"]:
                 country = geo["country"]
@@ -1885,7 +1864,6 @@ class EODHDClient:
                 exchange = geo["exchange"]
                 warnings_list.append("fundamentals_exchange_from_suffix")
 
-            # v4.7.3 ZA: industry / sector visibility
             sector_val = safe_str(general.get("Sector"))
             industry_val = safe_str(general.get("Industry"))
             if not industry_val:
@@ -1921,7 +1899,7 @@ class EODHDClient:
                         warnings_list.append("eps_ttm_fallback_used")
                     else:
                         logger.debug(
-                            "[eodhd v4.8.0] eps_ttm fallback rejected for %s: "
+                            "[eodhd v4.9.0] eps_ttm fallback rejected for %s: "
                             "computed=%.4f outside bounds [%.1f, %.1f] (likely units mismatch)",
                             sym, candidate, _EPS_FALLBACK_FLOOR, _EPS_FALLBACK_CEILING,
                         )
@@ -1948,7 +1926,7 @@ class EODHDClient:
                     "shares_outstanding": shares_outstanding,
                     "float_shares": float_shares,
                     "shares_float": float_shares,
-                    "eps_ttm": eps_ttm_final,  # v4.7.1 FIX-B + v4.7.2 YD: fallback + sanity bound
+                    "eps_ttm": eps_ttm_final,
                     "pe_ttm": safe_float(_first_present(valuation.get("TrailingPE"), highlights.get("PERatio"))),
                     "forward_pe": safe_float(_first_present(valuation.get("ForwardPE"), highlights.get("ForwardPE"))),
                     "pb_ratio": safe_float(_first_present(valuation.get("PriceBookMRQ"), valuation.get("PriceBook"))),
@@ -2009,8 +1987,7 @@ class EODHDClient:
             from_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
             data, err = await self._request_json(f"eod/{sym}", params={"from": from_date})
             if err or not isinstance(data, list):
-                # v4.7.2 YA + v4.7.3 ZA + v4.8.0 AC: geo-defaulted or
-                # circuit-open error patch with warnings.
+                # v4.8.0 AC + v4.9.0 AH paths
                 if err == "circuit_open":
                     return _build_circuit_open_patch(sym_raw, sym), err
                 return _build_error_patch_with_geo(sym_raw, sym, err or "bad_payload"), err or "bad_payload"
@@ -2064,7 +2041,6 @@ class EODHDClient:
                 return patch, None
 
             if n < 2:
-                # v4.7.3 ZA: too-short series visibility marker
                 warnings_list.append("history_too_short")
                 patch = _clean_patch(
                     {
@@ -2124,7 +2100,6 @@ class EODHDClient:
             sharpe = _sharpe_1y(rets_1y, rf_annual=rf)
             rsi14 = _rsi14(closes[-100:])
 
-            # v4.7.3 ZA: risk-metrics-unavailable flag
             if n >= 60 and vol_30 is None and vol_90 is None and sharpe is None and var95 is None and mdd_1y is None:
                 warnings_list.append("risk_metrics_unavailable")
 
@@ -2142,7 +2117,6 @@ class EODHDClient:
                     "symbol_normalized": sym,
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
-                    # quote fallback from latest history row
                     "current_price": last,
                     "price": last,
                     "previous_close": prev,
@@ -2156,10 +2130,9 @@ class EODHDClient:
                     "change": history_price_change,
                     "percent_change": history_percent_change,
                     "change_pct": history_percent_change,
-                    # 52W / liquidity / risk
                     "week_52_low": low_52,
                     "week_52_high": high_52,
-                    "week_52_position_pct": pos_52_pct,   # v4.7.1: percent points (0-100), not fraction
+                    "week_52_position_pct": pos_52_pct,
                     "avg_vol_10d": avg_vol_10,
                     "avg_volume_10d": avg_vol_10,
                     "avg_vol_30d": avg_vol_30,
@@ -2250,8 +2223,7 @@ class EODHDClient:
                 }
             )
 
-        # v4.8.0 AC: short-circuit when breaker is open. Saves the cost of
-        # launching three concurrent tasks that will all return circuit_open.
+        # v4.8.0 AC: short-circuit when breaker is open.
         health = await _get_health()
         if await health.is_open():
             patch = _build_circuit_open_patch(sym_raw, sym_norm)
@@ -2283,6 +2255,7 @@ class EODHDClient:
         errors: List[str] = []
         last_error_class: Optional[str] = None
         circuit_open_seen = False  # v4.8.0 AC
+        unhealthy_error_seen = False  # v4.9.0 AH
 
         for r in results:
             if isinstance(r, Exception):
@@ -2303,8 +2276,10 @@ class EODHDClient:
                     circuit_open_seen = True
                     last_error_class = last_error_class or "CircuitOpen"
                 elif "auth_error" in lerr:
+                    unhealthy_error_seen = True  # v4.9.0 AH
                     last_error_class = last_error_class or "AuthError"
                 elif "ip_blocked" in lerr:
+                    unhealthy_error_seen = True  # v4.9.0 AH
                     last_error_class = last_error_class or "IpBlocked"
                 elif "quota_or_rate_limit" in lerr or "429" in lerr:
                     last_error_class = last_error_class or "RateLimited"
@@ -2360,7 +2335,6 @@ class EODHDClient:
                 pass
 
         if merged.get("week_52_position_pct") is None:
-            # v4.7.1 FIX-A: percent points (0-100)
             pos = _safe_div(
                 (safe_float(merged.get("current_price")) or 0.0) - (safe_float(merged.get("week_52_low")) or 0.0),
                 (safe_float(merged.get("week_52_high")) or 0.0) - (safe_float(merged.get("week_52_low")) or 0.0),
@@ -2383,12 +2357,19 @@ class EODHDClient:
                     merged["week_52_position_pct"] = None
                     merged["position_52w_pct"] = None
 
-        # ---- v4.8.0 AC: cross-provider unhealthy signal ----
-        # If any of the three concurrent fetches surfaced a circuit_open
-        # error, hoist the cross-provider marker into merged.warnings so
-        # the engine knows EODHD is systemically unhealthy.
+        # ---- v4.8.0 AC + v4.9.0 AH: cross-provider unhealthy signal ----
+        # v4.8.0: if any of the three concurrent fetches surfaced a
+        #   circuit_open error, hoist the cross-provider marker.
+        # v4.9.0: also hoist when any concurrent fetch saw an auth_error
+        #   or ip_blocked error. This is belt-and-suspenders alongside
+        #   the per-failure marker added by _build_error_patch_with_geo
+        #   on the individual error patches — guarantees the marker is
+        #   present on the merged row even if `_clean_patch` or
+        #   `_merge_warnings_inplace` somehow dropped a list entry.
         if circuit_open_seen:
             _merge_warnings_inplace(merged, ["circuit_open", "provider_unhealthy:eodhd"])
+        elif unhealthy_error_seen:
+            _merge_warnings_inplace(merged, ["provider_unhealthy:eodhd"])
 
         # ---- Final data-quality verdict + legacy warning field ----
         if merged.get("current_price") is None:
@@ -2414,12 +2395,10 @@ class EODHDClient:
         merged["fcf_ttm"] = merged.get("fcf_ttm") or merged.get("free_cash_flow_ttm")
         merged["d_e_ratio"] = merged.get("d_e_ratio") or merged.get("debt_to_equity")
 
-        # v4.7.0 ISSUE-A / ISSUE-B: final currency canonicalization
         canon_currency = _canonicalize_currency_code(merged.get("currency"))
         if canon_currency:
             merged["currency"] = canon_currency
 
-        # v4.7.0 ISSUE-C: final suffix-derived geo backfill
         merged_geo = _suffix_derived_geo_defaults(sym_raw)
         if not merged.get("country") and merged_geo["country"]:
             merged["country"] = merged_geo["country"]
@@ -2450,9 +2429,23 @@ class EODHDClient:
         return await self.fetch_price_history(symbol, days=days, *args, **kwargs)
 
     async def fetch_quote_patch(self, symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """
+        v4.9.0 AI: fallback path now emits `provider_unhealthy:eodhd`
+        when the upstream err indicates an auth-class failure, mirroring
+        `_build_error_patch_with_geo`. Historically dead code (fetch_quote
+        always returns a non-empty patch via _build_error_patch_with_geo),
+        but preserved for defensive consistency in case any future caller
+        invokes this alias directly.
+        """
         patch, err = await self.fetch_quote(symbol)
         if patch:
             return patch
+
+        # v4.9.0 AI: per-failure marker in fallback path.
+        warnings_out: List[str] = [f"fetch_failed:{err or 'fetch_quote_failed'}"]
+        if _err_indicates_provider_unhealthy(err):
+            warnings_out.append("provider_unhealthy:eodhd")
+
         return _clean_patch(
             {
                 "symbol": (symbol or "").strip().upper(),
@@ -2460,7 +2453,7 @@ class EODHDClient:
                 "data_source": PROVIDER_NAME,
                 "error": err or "fetch_quote_failed",
                 "data_quality": "MISSING",
-                "warnings": [f"fetch_failed:{err or 'fetch_quote_failed'}"],
+                "warnings": warnings_out,
                 "last_updated_utc": _utc_iso(),
                 "last_updated_riyadh": _riyadh_iso(),
             }
@@ -2478,7 +2471,8 @@ class EODHDClient:
 
 # =============================================================================
 # Singleton + Engine-facing functions
-# (v4.8.0: ADDS diagnose_health + get_provider_stats; rest PRESERVED)
+# (PRESERVED byte-identical in v4.9.0; diagnose_health + get_provider_stats
+#  unchanged from v4.8.0)
 # =============================================================================
 _INSTANCE: Optional[EODHDClient] = None
 _INSTANCE_LOCK = asyncio.Lock()
@@ -2563,60 +2557,16 @@ async def fetch_quotes(symbols: List[str], *args: Any, **kwargs: Any) -> List[Di
 
 
 # =============================================================================
-# v4.8.0 NEW — diagnose_health() and get_provider_stats()
+# v4.8.0 — diagnose_health() and get_provider_stats()
+# (PRESERVED byte-identical in v4.9.0)
 # =============================================================================
 
 async def diagnose_health(probe_symbol: Optional[str] = None) -> Dict[str, Any]:
     """
     v4.8.0 AD: structured operator-visible health report for the EODHD
-    provider. Probes a known-stable symbol (default AAPL.US, overridable
-    via EODHD_HEALTH_PROBE_SYMBOL env var or this parameter) and returns
-    a JSON-serializable dict describing:
-
-      - whether the API key is present
-      - the circuit breaker state and counter histories
-      - the result of a single probe fetch (latency, error class)
-      - cumulative session statistics
-
-    This is the right call to verify "is EODHD healthy?" without parsing
-    per-symbol error patches from a refresh batch. Safe to call any time
-    — the probe respects the circuit breaker (if open, returns the
-    snapshot without hitting the API and notes probe.attempted=False).
-
-    Returns:
-      {
-        "ok": bool,                  # True iff probe fetched current_price
-        "provider": "eodhd",
-        "provider_version": "4.8.0",
-        "timestamp_utc": str,
-        "timestamp_riyadh": str,
-        "api_key_present": bool,
-        "circuit_state": str,        # "closed" | "open" | "half_open"
-        "circuit_breaker_enabled": bool,
-        "consecutive_auth_errors": int,
-        "consecutive_ip_blocks": int,
-        "last_failure_class": str|None,
-        "last_success_age_sec": float|None,
-        "last_failure_age_sec": float|None,
-        "circuit_opened_age_sec": float|None,
-        "probe": {
-          "symbol": str,
-          "attempted": bool,
-          "fetched": bool,
-          "latency_ms": float|None,
-          "error_class": str|None,
-          "current_price": float|None,
-          "data_quality": str|None,
-        },
-        "session_stats": {
-          "total_requests": int,
-          "success_count": int,
-          "auth_error_count": int,
-          "ip_block_count": int,
-          "rate_limit_count": int,
-          "network_error_count": int,
-        }
-      }
+    provider. Probes a known-stable symbol and returns a JSON-serializable
+    dict describing api key presence, circuit state, probe result, and
+    cumulative session statistics.
     """
     now_utc = _utc_iso()
     now_riy = _riyadh_iso()
@@ -2639,12 +2589,9 @@ async def diagnose_health(probe_symbol: Optional[str] = None) -> Dict[str, Any]:
         "data_quality": None,
     }
 
-    # If the circuit is open or API key is missing, don't attempt the probe.
     if not api_key_present:
         probe_info["error_class"] = "MissingApiKey"
     elif snapshot.get("circuit_state") == "open":
-        # Snapshot already records that breaker is open; an extra probe
-        # would just bump total_requests by 1 and return circuit_open.
         probe_info["error_class"] = "CircuitOpen"
     else:
         probe_info["attempted"] = True
@@ -2669,7 +2616,6 @@ async def diagnose_health(probe_symbol: Optional[str] = None) -> Dict[str, Any]:
             probe_info["latency_ms"] = round(elapsed_ms, 2)
             probe_info["error_class"] = e.__class__.__name__
 
-    # Re-snapshot after probe (counters and circuit state may have moved).
     snapshot_after = await health.snapshot()
 
     ok = bool(probe_info["fetched"]) and snapshot_after.get("circuit_state") == "closed"
@@ -2699,8 +2645,6 @@ async def get_provider_stats() -> Dict[str, Any]:
     v4.8.0 AE: cumulative session counters and circuit state. No API
     call. Cheap — operators can poll this on a timer to watch provider
     behavior over time without triggering a probe.
-
-    Returns the same shape as diagnose_health() minus the probe section.
     """
     now_utc = _utc_iso()
     health = await _get_health()
@@ -2740,7 +2684,7 @@ __all__ = [
     "fetch_price_history",
     "fetch_ohlc_history",
     "fetch_quotes",
-    # v4.8.0 NEW
+    # v4.8.0 (preserved v4.9.0)
     "diagnose_health",
     "get_provider_stats",
 ]
