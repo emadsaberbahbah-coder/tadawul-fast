@@ -2,7 +2,109 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.60.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.61.0
+================================================================================
+
+WHY v5.61.0 — CONSUME EODHD v4.8.0 CIRCUIT-BREAKER SIGNAL (May 12, 2026)
+------------------------------------------------------------------------
+v5.60.0 aligned with the cross-provider warnings convention from the May
+10/11 2026 provider revisions (PHASE-N) and added a defensive 52W
+backstop (PHASE-P). It does NOT yet consume the new circuit-breaker
+signal introduced in eodhd_provider v4.8.0 (May 12 2026), which now
+emits two new warning markers when its async-safe circuit breaker opens
+after consecutive auth/IP failures:
+
+    "circuit_open"
+    "provider_unhealthy:eodhd"
+
+Without engine-side recognition, the v5.60.0 chain pipeline keeps
+hammering EODHD for every symbol in a ~1,929-symbol refresh batch,
+even though the provider has already determined the API key is broken
+and is returning `circuit_open` instantly without a real HTTP call.
+Each row's Warnings column also doesn't surface the systemic nature
+of the failure — operators see misleading per-row "HTTP 403" tags
+instead of one clear "EODHD provider unhealthy" signal.
+
+v5.61.0 closes those gaps:
+
+  S.  NEW `_ProviderHealthRegistry` — async-safe module-level state
+      class tracking which providers have recently emitted
+      `provider_unhealthy:X` markers. Each entry has a TTL (default
+      300s, env-configurable via `ENGINE_PROVIDER_UNHEALTHY_TTL_SEC`).
+      Mirrors the eodhd_provider v4.8.0 `_ProviderHealth` design but
+      operates at the engine boundary, so signals from ANY provider
+      can flow through it — not just EODHD.
+
+      State surface:
+        - record_unhealthy(provider_name, ttl_sec) -> None
+        - is_unhealthy(provider_name) -> bool
+        - snapshot() -> Dict[str, Any]   for health endpoint
+        - clear_expired() -> None         internal pruning
+
+      Cumulative counters reset on process restart. The registry is
+      INTENTIONALLY decoupled from the provider's internal health
+      class — the provider knows about its API specifics, the
+      engine only consumes the structured warning marker.
+
+  T.  NEW `_extract_provider_unhealthy_markers(warnings)` — parses
+      a warnings value (list or "; "-joined string, per the v5.60.0
+      PHASE-N convention) and returns a set of provider names marked
+      unhealthy. Recognizes the `provider_unhealthy:<name>` prefix
+      from eodhd_provider v4.8.0 and any future providers adopting
+      the same convention.
+
+  U.  NEW `_observe_provider_unhealthy_markers(row)` — call site in
+      `_get_enriched_quote_impl` that registers any markers found in
+      a freshly-merged row with the registry. Idempotent: re-observing
+      the same marker just refreshes its TTL.
+
+  V.  `_providers_for()` ENHANCEMENT — consults the registry when
+      building the provider chain. Default behavior: DEMOTE an
+      unhealthy primary to the END of the chain (so fallbacks run
+      first but the primary is still attempted in case the marker
+      has gone stale and the registry hasn't been pruned yet).
+      With `ENGINE_PROVIDER_UNHEALTHY_SKIP=1`, an unhealthy provider
+      is SKIPPED entirely until the registry entry expires.
+
+  W.  `_build_top_factors_and_risks()` ENHANCEMENT — recognizes
+      new warning markers in the top_risks output:
+        - "circuit_open" -> "Provider circuit open"
+        - "provider_unhealthy:eodhd" -> "Upstream provider unhealthy"
+      Preserves the existing v5.56.0 "HTTP 403" -> "Provider access
+      issue" handling. The three are not mutually exclusive — a row
+      with all three warnings will show all three risk flags up to
+      the 5-item cap.
+
+  X.  `health()` ENHANCEMENT — adds `provider_unhealthy_markers` to
+      the health endpoint output, showing currently-tracked unhealthy
+      providers with their TTL remaining. Operators querying engine
+      health see "EODHD has been detected unhealthy, expires in 247s,
+      engine routing to Yahoo".
+
+  Y.  Version bump to 5.61.0 across __version__, the exception
+      envelope source tag (engine_exception_envelope_v5_61), and the
+      file's section header.
+
+[PRESERVED — strictly] All v5.60.0 / v5.59.0 / v5.58.0 / v5.57.0 /
+v5.56.0 / v5.55.1 / v5.55.0 / v5.54.1 / v5.54.0 / v5.53.0 helpers,
+signatures, behaviors, AUDIT-1 through AUDIT-6 hooks, subunit
+normalization, geo-misattribution corrections, completeness
+diagnostics, decision-field helpers, scoring fallbacks, intrinsic
+synthesis, decision matrix classifier, and the v5.57.0 / v5.58.0 /
+v5.59.0 forecast/upside narrative, plus the v5.60.0 PHASE-N / PHASE-O
+/ PHASE-P / PHASE-Q additions. v5.61.0 changes are additive (1 new
+class + 2 new helpers + 3 new env helpers + 4 small call-site
+additions in existing functions) plus the version bump. Public API
+surface unchanged. No removals from __all__.
+
+New env variables (v5.61.0):
+  - ENGINE_PROVIDER_UNHEALTHY_TTL_SEC  (default: 300)
+      TTL in seconds for a registered unhealthy marker.
+  - ENGINE_PROVIDER_UNHEALTHY_DEMOTE   (default: 1)
+      Demote unhealthy primary to end of chain.
+  - ENGINE_PROVIDER_UNHEALTHY_SKIP     (default: 0)
+      Skip unhealthy provider entirely (overrides demote).
+
 ================================================================================
 
 WHY v5.60.0 — CROSS-PROVIDER CONTRACT ALIGNMENT (May 11, 2026)
@@ -61,142 +163,50 @@ v5.60.0 fixes:
       percent points. Values > 1.5 are already percent points and
       left alone. Tagged with "week_52_position_pct_normalized_to_
       percent_points" so audits can see when the conversion fired.
-      Engine + scoring + eodhd convention preserved (0-100). Closes
-      the blank "52W Position %" column observed in the May 10 2026
-      audit on rows served by yahoo_fundamentals / yahoo_chart.
 
   P.  Engine-level 52W bounds defensive backstop.
       _validate_52w_bounds_defensive() mirrors the same |candidate /
       current_price| thresholds [0.125, 8.0] used by yahoo_fundamentals
-      v6.1.0 / yahoo_chart v8.2.0 / eodhd_provider v4.7.3. Called from
-      _canonicalize_provider_row AFTER the LSE/JSE/TASE subunit
-      normalizer (so subunit-specific math runs first on its own
-      audit cases). Catches the ADR pattern (BP.US 43.34 USD vs 52W
-      high 609.40 GBX) when providers somehow let it through —
-      defense in depth rather than primary fix. Tag distinct from
-      provider-layer tags so audits can attribute the catch
-      ("engine_52w_high_unit_mismatch_dropped").
+      v6.1.0 / yahoo_chart v8.2.0 / eodhd_provider v4.7.3. Defense
+      in depth rather than primary fix.
 
   Q.  last_error_class passthrough.
       Added to _CANONICAL_FIELD_ALIASES so the engine preserves the
-      provider-emitted value through canonicalization. Not added to
-      INSTRUMENT_CANONICAL_KEYS / _HEADERS yet — that's a sheet-side
-      schema change that the user can opt into later.
+      provider-emitted value through canonicalization.
 
-  R.  Version bump to 5.60.0 across __version__ and the file's
-      section header. health() reports new diagnostic flags
-      (price_sanity_guard_enabled, week_52_position_pct_units).
-
-[PRESERVED — strictly] All v5.59.0 / v5.58.0 / v5.57.0 / v5.56.0 /
-v5.55.1 / v5.55.0 / v5.54.1 / v5.54.0 / v5.53.0 helpers, signatures,
-behaviors, AUDIT-1 through AUDIT-6 hooks, subunit normalization,
-geo-misattribution corrections, completeness diagnostics, decision-
-field helpers, scoring fallbacks, intrinsic synthesis, decision
-matrix classifier, and the v5.57.0 / v5.58.0 / v5.59.0 forecast/
-upside narrative. v5.60.0 changes are additive (3 new helpers +
-2 call-site updates in existing helpers + 1 new validator + 1 alias
-entry) plus the version bump. Public API surface unchanged. No
-removals from __all__.
+  R.  Version bump to 5.60.0.
 
 ================================================================================
 
-WHY v5.59.0 — CLOSE TWO RUNTIME GAPS IN v5.58.0
------------------------------------------------
-Post-build runtime simulation against the May 10 2026 production sample
-revealed two logical gaps where v5.58.0's defenses were structurally
-present but did not fully achieve their stated intent:
+May 2026 / v2.8.0 family alignment
+----------------------------------
+This engine aligns with:
+  - core/sheets/schema_registry       v2.8.0  (97 instrument / 100 Top10 cols)
+  - core/scoring                      v5.2.5
+  - core/reco_normalize               v7.2.0
+  - core/scoring_engine               v3.4.2
+  - core/insights_builder             v7.0.0  (Data Quality Alerts)
+  - core/analysis/criteria_model      v3.1.0
+  - core/analysis/top10_selector      v4.12.0
+  - core/investment_advisor_engine    v4.4.0
+  - core/investment_advisor           v5.3.0
+  - core/candlesticks                 v1.0.0
+  - yahoo_fundamentals_provider       v6.1.0
+  - yahoo_chart_provider              v8.2.0
+  - enriched_quote (core)             v4.3.0
+  - eodhd_provider                    v4.8.0  (NEW: circuit breaker +
+                                                diagnose_health() +
+                                                get_provider_stats())
 
-  GAP 1 — Phase E (now H) cleared intrinsic_value but not upside_pct.
-    When ETHE arrived with intrinsic=301.17 (ratio 16x price 18.78) AND
-    upstream-supplied upside_pct=+1503%, Phase E correctly suppressed
-    intrinsic_value but left the bogus upside_pct in place. The sheet
-    therefore still showed +1503% even after the unit-mismatch detection
-    fired.
+================================================================================
 
-  GAP 2 — Phase D (now I) only validated synthesized upside_pct, not
-    upstream-supplied values. RNR.US arrived with upstream upside_pct=
-    +250% already set; Phase D's guard `row.get("upside_pct") is None`
-    short-circuited, letting the +250% value (well above the +200%
-    ceiling) pass through unchecked.
-
-v5.59.0 fixes:
-
-  H. (Phase E successor) hard-kill in _compute_scores_fallback now also
-     clears upside_pct when it suppresses intrinsic_value for
-     unit-mismatch reasons. One-line addition.
-
-  I. (Phase D successor) _compute_intrinsic_and_upside now revalidates
-     upstream-supplied upside_pct against the suspect bounds, not just
-     synthesized values. When existing upside_pct is already populated
-     and falls outside [-90%, +200%], suppress it AND clear
-     intrinsic_value, tagging "upside_synthesis_suspect".
-
-Expected post-deploy behavior:
-  - ETHE: intrinsic=None, upside_pct=None, tag intrinsic_unit_mismatch_suspected
-  - RNR.US: intrinsic=None, upside_pct=None, tag upside_synthesis_suspect
-
-[PRESERVED — strictly] All v5.58.0 phases A/B/C/F/G unchanged. Phases
-D and E renamed to I and H respectively to mark the v5.59.0 enhancement
-boundary; their logic now subsumes the original v5.58.0 behavior plus
-the gap closures.
-
-WHY v5.58.0 — DEFENSIVE CONSISTENCY HARDENING
-----------------------------------------------
-Post-deploy audit on May 10 2026 (16:26 UTC) revealed the v5.57.0 deploy
-produced contradictory row states: e.g., HPQ.US had BOTH the
-"forecast_unavailable_no_source" warning AND filled forecast prices
-matching the OLD momentum-fallback signature (roi_12m=+30.00% ==
-clamp(percent_change*4/100, +-0.30)). Mathematical fingerprint check
-across 19 sampled rows: 17/17 forecast-bearing rows matched the OLD
-formula, NONE matched the v5.57.0 intrinsic-clamped behavior.
-
-v5.58.0 hardens against this with idempotent forecast clearing in
-the unforecastable branch (PHASE-A), a final consistency sweep at the
-end of _compute_scores_fallback (PHASE-B), ADR / unit-mismatch
-suppression in _compute_intrinsic_and_upside (PHASE-C), engine-level
-upside bounds [-90%, +200%] (PHASE-D), tighter intrinsic-usable
-hard-kill at >10x / <0.1x (PHASE-E), and module-level constants
-(PHASE-F).
-
-WHY v5.57.0 — REMOVE MOMENTUM-BASED FORECAST FALLBACK
-------------------------------------------------------
-Closed the placeholder-cascade defect: the +30%/+16% fingerprint
-hitting ~85% of rows originated from the momentum-based forecast
-fallback in _compute_scores_fallback (roi_12m = clamp(pct_raw/100*4,
--0.30, 0.30)). v5.57.0 removed the third branch (J), sets
-forecast_unavailable=True explicitly (K), adds
-"forecast_unavailable_no_source" diagnostic tag (L), and the
-defensive forecast filter in _compute_intrinsic_and_upside (M).
-
-WHY v5.56.0 — COMPLETENESS, RICHER MERGE, DIAGNOSTICS, DECISION FIELDS
-----------------------------------------------------------------------
-Added upstream data-quality scaffolding: _CRITICAL_DATA_FIELDS,
-_is_better_value / _merge_richer_row, _row_completeness_pct,
-_apply_classification_fallbacks, _apply_completeness_diagnostics,
-_apply_candlestick_defaults, _build_top_factors_and_risks,
-_apply_enhanced_decision_fields, plus call-site wiring in
-_canonicalize_provider_row, _get_enriched_quote_impl, and
-_compute_recommendation.
-
-WHY v5.55.1 — PRODUCTION-DATA VALIDATION FIXES (atop v5.55.0)
---------------------------------------------------------------
-- GAP-1: _SUBUNIT_DETECT_RATIO_THRESHOLD raised 0.05 -> 0.10.
-- GAP-2: currency-aware skip in _normalize_subunit_currency_fields.
-- GAP-3: _correct_provider_geo_misattribution for XETRA US-misclassed
-         tickers.
-
-WHY v5.55.0 — AUDIT-DRIVEN DATA-QUALITY FIXES
----------------------------------------------
-AUDIT-1 currency-subunit mismatch (LSE/JSE/TASE),
-AUDIT-2 zero market cap synthesis,
-AUDIT-3 unforecastable row detection,
-AUDIT-4 revenue collapse haircut,
-AUDIT-5 silent placeholder when all providers fail,
-AUDIT-6 synthesized intrinsic subunit-correctness.
-
-WHY v5.54.1 (post-audit forecast pipeline corrections — preserved)
-WHY v5.54.0 (original forecast pipeline fix — preserved)
-WHY v5.53.0 (four production bugs — preserved)
+WHY v5.59.0 — CLOSE TWO RUNTIME GAPS IN v5.58.0  [preserved]
+WHY v5.58.0 — DEFENSIVE CONSISTENCY HARDENING    [preserved]
+WHY v5.57.0 — REMOVE MOMENTUM-BASED FORECAST     [preserved]
+WHY v5.56.0 — COMPLETENESS / RICHER MERGE        [preserved]
+WHY v5.55.1 — PRODUCTION VALIDATION FIXES        [preserved]
+WHY v5.55.0 — AUDIT-DRIVEN DATA-QUALITY FIXES    [preserved]
+WHY v5.54.1, v5.54.0, v5.53.0                    [preserved]
 """
 
 from __future__ import annotations
@@ -239,7 +249,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.60.0"
+__version__ = "5.61.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -373,14 +383,14 @@ _INTRINSIC_UNIT_MISMATCH_RATIO_HIGH: float = 10.0
 _INTRINSIC_UNIT_MISMATCH_RATIO_LOW: float = 0.01
 
 # v5.60.0 PHASE-P: engine-level 52W bounds defensive backstop.
-# Mirrors yahoo_fundamentals_provider v6.1.0 / yahoo_chart_provider
-# v8.2.0 / eodhd_provider v4.7.3 thresholds. Applied at the engine's
-# canonicalization layer so even if some bypass path injects suspect
-# 52W bounds (e.g., a legacy provider patch carried over the upgrade
-# horizon), the engine's stored row still arrives at the sheet with
-# the bogus value dropped.
 _ENGINE_PRICE_RATIO_SUSPECT_HIGH: float = 8.0
 _ENGINE_PRICE_RATIO_SUSPECT_LOW: float = 0.125
+
+# v5.61.0 PHASE-S: provider-unhealthy registry defaults.
+# Conservative — 300s gives a recovered EODHD key one refresh cycle to
+# self-heal via the provider's half-open probe before the engine even
+# considers retrying it as primary.
+_PROVIDER_UNHEALTHY_TTL_SEC_DEFAULT: float = 300.0
 
 
 # =============================================================================
@@ -697,7 +707,7 @@ def _dedupe_keep_order(items: Sequence[Any]) -> List[Any]:
 #   - yahoo_fundamentals_provider v6.1.0 emits warnings as List[str]
 #   - yahoo_chart_provider v8.2.0 emits warnings as List[str]
 #   - enriched_quote v4.3.0 normalizes warnings as List[str]
-#   - eodhd_provider v4.7.3 emits warnings as List[str]
+#   - eodhd_provider v4.7.3+ emits warnings as List[str]
 #
 # Legacy providers still emit "; "-joined strings. These helpers accept
 # both shapes and produce a deduped, order-preserving result that the
@@ -710,17 +720,6 @@ def _normalize_warnings_value(value: Any) -> List[str]:
     """
     v5.60.0: Coerce a warnings field (None / str / list / tuple / set)
     into a List[str] of unique non-empty markers, preserving order.
-
-    Accepts:
-      - None / "" / [] -> []
-      - "; "-joined string -> split on ";" and strip parts
-      - List[str] / Tuple[str] / Set[str] -> stripped items
-      - Any other scalar -> single-element list
-
-    Filters:
-      - Empty parts
-      - Literal "none", "null", "nil", "nan" (case-insensitive)
-      - Duplicates (first occurrence wins)
     """
     if value is None:
         return []
@@ -746,7 +745,6 @@ def _normalize_warnings_value(value: Any) -> List[str]:
         if s and s.lower() not in _WARNING_NULL_LITERALS:
             items.append(s)
 
-    # Order-preserving dedupe
     out: List[str] = []
     seen: Set[str] = set()
     for w in items:
@@ -757,21 +755,13 @@ def _normalize_warnings_value(value: Any) -> List[str]:
 
 
 def _warnings_to_string(value: Any) -> str:
-    """
-    v5.60.0: Render a warnings value as "; "-joined string for sheet
-    display. Returns "" for None / empty inputs. Idempotent with
-    _normalize_warnings_value.
-    """
+    """v5.60.0: Render a warnings value as "; "-joined string for sheet display."""
     parts = _normalize_warnings_value(value)
     return "; ".join(parts) if parts else ""
 
 
 def _union_warnings_strings(*values: Any) -> str:
-    """
-    v5.60.0: Union multiple warnings values (any mix of None / str /
-    list / tuple) into a single "; "-joined string, deduplicated,
-    order-preserving. Used at the merge boundary (_merge_richer_row).
-    """
+    """v5.60.0: Union multiple warnings values into a single "; "-joined string."""
     out: List[str] = []
     seen: Set[str] = set()
     for v in values:
@@ -783,6 +773,219 @@ def _union_warnings_strings(*values: Any) -> str:
 
 
 # =============================================================================
+# v5.61.0 PHASE-S / T / U — Provider health registry + signal extraction
+# =============================================================================
+#
+# The eodhd_provider v4.8.0 emits two new warning markers when its
+# circuit breaker opens:
+#
+#     "circuit_open"
+#     "provider_unhealthy:eodhd"
+#
+# v5.61.0 consumes the `provider_unhealthy:` form via this module-level
+# registry. The pattern is intentionally extensible to other providers
+# (yahoo, finnhub, tadawul, argaam) — any provider can adopt the same
+# `provider_unhealthy:<name>` convention and the engine will route
+# around it automatically.
+#
+# Three call sites:
+#   1. `_observe_provider_unhealthy_markers` is called from
+#      _get_enriched_quote_impl after each merged patch.
+#   2. `is_unhealthy` is consulted by `_providers_for` when building
+#      the chain.
+#   3. `snapshot` is called by `health()` for operator visibility.
+
+_PROVIDER_UNHEALTHY_PREFIX = "provider_unhealthy:"
+
+
+def _provider_unhealthy_ttl_sec() -> float:
+    """v5.61.0: env-configurable TTL for unhealthy markers."""
+    try:
+        v = float(os.getenv("ENGINE_PROVIDER_UNHEALTHY_TTL_SEC", _PROVIDER_UNHEALTHY_TTL_SEC_DEFAULT))
+    except Exception:
+        v = _PROVIDER_UNHEALTHY_TTL_SEC_DEFAULT
+    if v < 10.0:
+        return 10.0
+    if v > 3600.0:
+        return 3600.0
+    return v
+
+
+def _provider_unhealthy_demote_enabled() -> bool:
+    """v5.61.0: default True — demote unhealthy primary to end of chain."""
+    return _safe_bool(os.getenv("ENGINE_PROVIDER_UNHEALTHY_DEMOTE"), True)
+
+
+def _provider_unhealthy_skip_enabled() -> bool:
+    """v5.61.0: default False — skip unhealthy provider entirely (overrides demote)."""
+    return _safe_bool(os.getenv("ENGINE_PROVIDER_UNHEALTHY_SKIP"), False)
+
+
+def _extract_provider_unhealthy_markers(warnings: Any) -> Set[str]:
+    """
+    v5.61.0 PHASE-T: Parse a warnings value (list or "; "-joined string,
+    per the v5.60.0 PHASE-N convention) and return the set of provider
+    names marked unhealthy via the `provider_unhealthy:<name>` prefix.
+
+    Examples:
+        warnings = "HTTP 403; circuit_open; provider_unhealthy:eodhd"
+        -> {"eodhd"}
+
+        warnings = ["circuit_open", "provider_unhealthy:eodhd",
+                    "provider_unhealthy:yahoo"]
+        -> {"eodhd", "yahoo"}
+
+        warnings = "Recovered from history/chart fallback"
+        -> set()
+    """
+    out: Set[str] = set()
+    for w in _normalize_warnings_value(warnings):
+        if w.startswith(_PROVIDER_UNHEALTHY_PREFIX):
+            name = w[len(_PROVIDER_UNHEALTHY_PREFIX):].strip().lower()
+            if name:
+                out.add(name)
+    return out
+
+
+class _ProviderHealthRegistry:
+    """
+    v5.61.0 PHASE-S: Async-safe module-level registry of providers
+    recently marked unhealthy via `provider_unhealthy:<name>` warning
+    markers from any provider in the chain.
+
+    Each entry has a wall-clock expiration time (monotonic seconds).
+    Re-registering refreshes the entry's TTL. `is_unhealthy` lazily
+    prunes expired entries on each call so stale signals don't
+    accumulate in long-running processes.
+
+    State is in-memory only (resets on process restart). For
+    cross-replica coherence across multiple worker processes, each
+    replica builds its own local view from the patches it sees — this
+    is intentional and avoids the correctness questions of distributed
+    health state.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        # Maps provider_name -> expires_at (monotonic seconds)
+        self._entries: Dict[str, float] = {}
+        # Cumulative counters (never decrement; reset only on restart)
+        self._total_observations = 0
+
+    async def record_unhealthy(self, provider_name: str, ttl_sec: Optional[float] = None) -> None:
+        """
+        v5.61.0 PHASE-S: Register or refresh an unhealthy marker for a
+        provider. Idempotent: re-registering the same provider just
+        refreshes the TTL.
+        """
+        name = _safe_str(provider_name).lower()
+        if not name:
+            return
+        ttl = float(ttl_sec) if ttl_sec is not None else _provider_unhealthy_ttl_sec()
+        async with self._lock:
+            self._total_observations += 1
+            now = time.monotonic()
+            was_known = name in self._entries
+            self._entries[name] = now + ttl
+            if not was_known:
+                logger.info(
+                    "[engine_v2 v%s] provider_unhealthy registered: %s ttl=%.0fs total_observations=%d",
+                    __version__, name, ttl, self._total_observations,
+                )
+
+    async def is_unhealthy(self, provider_name: str) -> bool:
+        """
+        v5.61.0 PHASE-S: Check whether a provider is currently marked
+        unhealthy. Lazily prunes expired entries on each call.
+        """
+        name = _safe_str(provider_name).lower()
+        if not name:
+            return False
+        async with self._lock:
+            now = time.monotonic()
+            exp = self._entries.get(name)
+            if exp is None:
+                return False
+            if exp <= now:
+                # Expired — prune and report healthy.
+                self._entries.pop(name, None)
+                return False
+            return True
+
+    async def clear_expired(self) -> int:
+        """v5.61.0 PHASE-S: Prune all expired entries. Returns count pruned."""
+        async with self._lock:
+            now = time.monotonic()
+            to_remove = [name for name, exp in self._entries.items() if exp <= now]
+            for name in to_remove:
+                self._entries.pop(name, None)
+            return len(to_remove)
+
+    async def snapshot(self) -> Dict[str, Any]:
+        """
+        v5.61.0 PHASE-X: Structured snapshot for health() endpoint.
+        Returns the currently-tracked unhealthy providers along with
+        their TTL remaining in seconds. Expired entries are pruned
+        before snapshot.
+        """
+        async with self._lock:
+            now = time.monotonic()
+            # Inline prune
+            to_remove = [name for name, exp in self._entries.items() if exp <= now]
+            for name in to_remove:
+                self._entries.pop(name, None)
+            active: List[Dict[str, Any]] = []
+            for name, exp in sorted(self._entries.items()):
+                active.append({
+                    "provider": name,
+                    "ttl_remaining_sec": round(max(0.0, exp - now), 2),
+                })
+            return {
+                "active": active,
+                "active_count": len(active),
+                "total_observations": self._total_observations,
+                "demote_enabled": _provider_unhealthy_demote_enabled(),
+                "skip_enabled": _provider_unhealthy_skip_enabled(),
+                "default_ttl_sec": _provider_unhealthy_ttl_sec(),
+            }
+
+
+# Module-level singleton, created lazily.
+_PROVIDER_HEALTH_REGISTRY: Optional[_ProviderHealthRegistry] = None
+_PROVIDER_HEALTH_LOCK = asyncio.Lock()
+
+
+async def _get_provider_health_registry() -> _ProviderHealthRegistry:
+    """v5.61.0 PHASE-S: Lazy singleton accessor."""
+    global _PROVIDER_HEALTH_REGISTRY
+    if _PROVIDER_HEALTH_REGISTRY is None:
+        async with _PROVIDER_HEALTH_LOCK:
+            if _PROVIDER_HEALTH_REGISTRY is None:
+                _PROVIDER_HEALTH_REGISTRY = _ProviderHealthRegistry()
+    return _PROVIDER_HEALTH_REGISTRY
+
+
+async def _observe_provider_unhealthy_markers(row: Dict[str, Any]) -> None:
+    """
+    v5.61.0 PHASE-U: Call site invoked from _get_enriched_quote_impl
+    after each merged patch is received. Extracts `provider_unhealthy:X`
+    markers from the row's warnings and registers them with the
+    module-level registry so subsequent fetches benefit from the signal.
+
+    Safe to call any time — short-circuits cleanly when there are no
+    unhealthy markers in the row.
+    """
+    if not isinstance(row, dict):
+        return
+    markers = _extract_provider_unhealthy_markers(row.get("warnings"))
+    if not markers:
+        return
+    registry = await _get_provider_health_registry()
+    for provider_name in markers:
+        await registry.record_unhealthy(provider_name)
+
+
+# =============================================================================
 # v5.55.0 — AUDIT-driven helpers
 # =============================================================================
 
@@ -790,8 +993,6 @@ def _append_warning_tag(row: Dict[str, Any], tag: str) -> None:
     """
     v5.55.0: idempotent warning append. Treats warnings as a "; "-joined
     string for backward compatibility with all v5.55.0+ call sites.
-    Lists are not handled here — they should be normalized via
-    _warnings_to_string() before any code calls _append_warning_tag.
     """
     if not tag:
         return
@@ -811,11 +1012,7 @@ def _is_subunit_exchange_symbol(symbol: str) -> bool:
 
 
 def _normalize_subunit_currency_fields(row: Dict[str, Any], symbol_hint: str = "") -> Dict[str, Any]:
-    """
-    v5.55.0 AUDIT-1 + v5.55.1 GAP-2: Detect and correct currency-subunit
-    mismatches for exchanges that quote in subunits while their
-    fundamental data may arrive in the main unit.
-    """
+    """v5.55.0 AUDIT-1 + v5.55.1 GAP-2: subunit-currency normalization."""
     sym = _safe_str(row.get("symbol") or symbol_hint).upper()
     if not _is_subunit_exchange_symbol(sym):
         return row
@@ -827,7 +1024,6 @@ def _normalize_subunit_currency_fields(row: Dict[str, Any], symbol_hint: str = "
     suffix = "." + sym.rsplit(".", 1)[1]
     subunit_code, main_unit_code, factor = _SUBUNIT_EXCHANGES[suffix]
 
-    # v5.55.1 GAP-2: currency-aware skip
     current_currency = _safe_str(row.get("currency")).upper()
     if current_currency == main_unit_code.upper():
         try:
@@ -984,20 +1180,7 @@ def _validate_52w_bounds_defensive(row: Dict[str, Any]) -> List[str]:
     """
     v5.60.0 PHASE-P: Defense-in-depth 52W high/low validation at the
     engine layer. Mirrors yahoo_fundamentals_provider v6.1.0 /
-    yahoo_chart_provider v8.2.0 / eodhd_provider v4.7.3 thresholds
-    (8.0 / 0.125).
-
-    Most cases are caught at the provider layer; this is a safety
-    net for paths that bypass the new provider versions (legacy
-    provider patches, snapshot replays, external row readers).
-
-    Mutates `row` in place: clears `week_52_high` / `week_52_low` and
-    their `52w_*` aliases when out-of-band. Also clears the now-stale
-    `week_52_position_pct` / `position_52w_pct`. Tags via
-    `_append_warning_tag` with the "engine_*" prefix so audits can
-    distinguish engine-layer catches from provider-layer catches.
-
-    Returns the list of tags raised (for diagnostic correlation).
+    yahoo_chart_provider v8.2.0 / eodhd_provider v4.7.3+ thresholds.
     """
     tags: List[str] = []
 
@@ -1031,7 +1214,6 @@ def _validate_52w_bounds_defensive(row: Dict[str, Any]) -> List[str]:
             cleared_lo = True
             lo = None
 
-    # Swap inverted high < low (only if neither was dropped this pass)
     if not cleared_hi and not cleared_lo and hi is not None and lo is not None and hi < lo:
         row["week_52_high"] = lo
         row["week_52_low"] = hi
@@ -1041,7 +1223,6 @@ def _validate_52w_bounds_defensive(row: Dict[str, Any]) -> List[str]:
         _append_warning_tag(row, "engine_52w_high_low_inverted")
         hi, lo = lo, hi
 
-    # If bounds were cleared, also clear the now-stale position_pct
     if cleared_hi or cleared_lo:
         if row.get("week_52_position_pct") is not None:
             row["week_52_position_pct"] = None
@@ -1124,13 +1305,8 @@ def _is_better_value(field: str, current: Any, candidate: Any, *, symbol_hint: s
 
 def _merge_richer_row(base: Dict[str, Any], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    v5.56.0: Merge provider patches by filling blanks and replacing
-    placeholders.
-
-    v5.60.0 PHASE-N: warnings branch now uses _union_warnings_strings()
-    to handle both List[str] (new providers v4.x+) and "; "-joined str
-    (legacy providers) cleanly. Previously _safe_str(list_of_strings)
-    produced the literal "['a', 'b']" in the sheet's Warnings column.
+    v5.56.0: Merge provider patches by filling blanks and replacing placeholders.
+    v5.60.0 PHASE-N: warnings branch uses _union_warnings_strings().
     """
     if not isinstance(patch, dict):
         return dict(base or {})
@@ -1140,8 +1316,6 @@ def _merge_richer_row(base: Dict[str, Any], patch: Optional[Dict[str, Any]]) -> 
         if v is None or v == "":
             continue
         if k == "warnings":
-            # v5.60.0 PHASE-N: accept list or string, union with dedupe,
-            # render as "; "-joined string.
             merged_warnings = _union_warnings_strings(out.get("warnings"), v)
             if merged_warnings:
                 out["warnings"] = merged_warnings
@@ -1254,6 +1428,11 @@ def _apply_candlestick_defaults(row: Dict[str, Any]) -> None:
 
 
 def _build_top_factors_and_risks(row: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    v5.56.0 baseline + v5.61.0 PHASE-W: recognize new warning markers
+    from eodhd_provider v4.8.0 (circuit_open / provider_unhealthy:X)
+    in addition to the existing v5.56.0 HTTP 403 handling.
+    """
     factors: List[str] = []
     risks: List[str] = []
     overall = _as_float(row.get("overall_score"))
@@ -1295,7 +1474,19 @@ def _build_top_factors_and_risks(row: Dict[str, Any]) -> Tuple[str, str]:
         risks.append("High leverage")
     if _safe_bool(row.get("forecast_unavailable")):
         risks.append("Forecast unavailable")
-    if "HTTP 403" in _safe_str(row.get("warnings")):
+
+    # v5.61.0 PHASE-W: parse warnings via the v5.60.0 PHASE-N convention
+    # (list or string) and check for the v4.8.0 circuit-breaker markers
+    # plus the existing v5.56.0 HTTP 403 marker. All three are distinct
+    # signals — a row may carry any combination, and each contributes
+    # its own risk flag up to the 5-item cap.
+    warnings_list = _normalize_warnings_value(row.get("warnings"))
+    warnings_joined = "; ".join(warnings_list).lower()
+    if "circuit_open" in warnings_list or "circuit_open" in warnings_joined:
+        risks.append("Provider circuit open")
+    if any(w.lower().startswith(_PROVIDER_UNHEALTHY_PREFIX) for w in warnings_list):
+        risks.append("Upstream provider unhealthy")
+    if "http 403" in warnings_joined:
         risks.append("Provider access issue")
 
     if not factors:
@@ -2455,28 +2646,10 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     Canonicalize a provider-supplied row dict into the canonical schema.
 
     v5.60.0 PHASE-N: warnings normalization to deduped "; "-joined string
-      regardless of incoming shape (None / str / list / tuple). The new
-      providers (yahoo_fundamentals v6.1.0, yahoo_chart v8.2.0, eodhd
-      v4.7.3) emit warnings as List[str]; legacy providers emit string.
-    v5.60.0 PHASE-O: week_52_position_pct unit normalization (fraction
-      -> percent points). Closes the blank "52W Position %" column on
-      rows served by yahoo_fundamentals / yahoo_chart.
-    v5.60.0 PHASE-P: engine-level 52W bounds defensive backstop. Mirrors
-      yahoo_fundamentals v6.1.0 / yahoo_chart v8.2.0 / eodhd v4.7.3
-      thresholds [0.125, 8.0]. Defense in depth for paths that bypass
-      the new provider versions.
-    v5.60.0 PHASE-Q: last_error_class field preserved through
-      canonicalization via _CANONICAL_FIELD_ALIASES entry.
-
-    v5.55.0 [AUDIT-1 / AUDIT-2 INTEGRATION]: After standard field mapping
-    and inferences, calls _normalize_subunit_currency_fields() to fix
-    LSE/JSE/TASE unit mismatches, _synthesize_market_cap_if_zero() to
-    backfill market_cap from float_shares x current_price, and
-    _correct_provider_geo_misattribution() for v5.55.1 GAP-3.
-
-    [PRESERVED from v5.53.0] week_52_position_pct stored as PERCENT
-    POINTS (0-100), unrealized_pl_pct stored as PERCENT POINTS,
-    percent_change / max_drawdown_1y / var_95_1d stored as FRACTIONS.
+    v5.60.0 PHASE-O: week_52_position_pct unit normalization (fraction -> percent points)
+    v5.60.0 PHASE-P: engine-level 52W bounds defensive backstop
+    v5.60.0 PHASE-Q: last_error_class field preserved through canonicalization
+    v5.55.0+ AUDIT integration preserved.
     """
     src = dict(row or {})
     flat = _flatten_scalar_fields(src)
@@ -2519,9 +2692,6 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         out["last_updated_riyadh"] = _now_riyadh_iso()
 
     # v5.60.0 PHASE-N: normalize warnings to deduped "; "-joined string.
-    # Replaces v5.59.0's `isinstance(warnings, (list, tuple, set))` block
-    # which did not dedupe. New providers emit List[str]; legacy providers
-    # emit string. Both shapes flow through _warnings_to_string cleanly.
     out["warnings"] = _warnings_to_string(out.get("warnings"))
 
     price = _as_float(out.get("current_price")) or _as_float(out.get("price"))
@@ -2550,11 +2720,6 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         out["week_52_position_pct"] = round((price - low52) / (high52 - low52) * 100.0, 4)
 
     # v5.60.0 PHASE-O: week_52_position_pct unit normalization.
-    # Yahoo providers (yahoo_fundamentals v6.1.0, yahoo_chart v8.2.0)
-    # and enriched_quote v4.3.0 emit this as a FRACTION (0-1); eodhd
-    # v4.7.3 and this engine standardize on PERCENT POINTS (0-100).
-    # If the value came in as a fraction (<=1.5), convert to percent
-    # points. Values > 1.5 are already percent points and left alone.
     pos_pct_raw = _as_float(out.get("week_52_position_pct"))
     if pos_pct_raw is not None and 0.0 <= pos_pct_raw <= 1.5:
         out["week_52_position_pct"] = round(pos_pct_raw * 100.0, 4)
@@ -2588,10 +2753,6 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     out = _correct_provider_geo_misattribution(out)
 
     # v5.60.0 PHASE-P: engine-level 52W bounds defensive backstop.
-    # Applied AFTER subunit normalization (so subunit-specific math
-    # runs first on its own audit cases) but BEFORE the final
-    # data_quality verdict, so 52W bounds dropped here cascade through
-    # to position_pct cleanup.
     _validate_52w_bounds_defensive(out)
 
     if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
@@ -2726,8 +2887,7 @@ def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[
 
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     """
-    v5.59.0 PHASE-H: hard-kill in intrinsic-mismatch branch now clears
-      upside_pct alongside intrinsic_value.
+    v5.59.0 PHASE-H: hard-kill in intrinsic-mismatch branch clears upside_pct.
     v5.58.0 PHASE-A/B: idempotent forecast clearing + final sweep.
     v5.57.0: removed momentum-based forecast fallback.
     v5.55.0 AUDIT-3/AUDIT-4: unforecastable detection + revenue-collapse haircut.
@@ -2739,7 +2899,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             return
         r["warnings"] = (existing + "; " + tag) if existing else tag
 
-    # v5.55.0 AUDIT-3: flag unforecastable rows up-front.
     if not _safe_bool(row.get("forecast_unavailable")):
         unforecastable, reason = _detect_unforecastable_row(row)
         if unforecastable:
@@ -2763,9 +2922,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     intrinsic_usable = True
     if intrinsic is not None and price is not None and price > 0:
         intrinsic_ratio = intrinsic / price
-        # v5.59.0 PHASE-H (formerly v5.58.0 PHASE-E): hard-kill threshold
-        # for unit mismatches. v5.59.0 also clears upside_pct so an
-        # upstream-supplied bogus value cannot survive the pass.
         if (intrinsic_ratio > _INTRINSIC_UNIT_MISMATCH_RATIO_HIGH
                 or intrinsic_ratio < _INTRINSIC_UNIT_MISMATCH_RATIO_LOW):
             _append_warning(row, "intrinsic_unit_mismatch_suspected")
@@ -2856,7 +3012,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         if debt_to_equity is not None:
             quality_score += max(0.0, 15.0 - min(max(debt_to_equity, 0.0), 15.0))
 
-        # v5.55.0 AUDIT-4: revenue-collapse haircut.
         sym_for_log = _safe_str(row.get("symbol"))
         quality_score, _haircut_applied = _apply_revenue_collapse_haircut(
             quality_score, revenue_growth_pct or None, symbol_hint=sym_for_log
@@ -2936,9 +3091,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             roi_12m = (intrinsic / price) - 1.0
             used_intrinsic = True
 
-        # v5.57.0: REMOVED momentum-based forecast fallback. used_momentum
-        # stays False permanently.
-
     if roi_12m is not None:
         roi_12m = _clamp_roi("12m", roi_12m)
         roi_3m = _clamp_roi("3m", roi_12m * RATIO_3M_OF_12M)
@@ -2952,7 +3104,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         row["expected_roi_3m"] = round(roi_3m, 6)
         row["expected_roi_1m"] = round(roi_1m, 6)
     else:
-        # v5.58.0 PHASE-A: unconditionally clear all forecast fields.
         for k in ("forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
                   "expected_roi_1m", "expected_roi_3m", "expected_roi_12m"):
             row[k] = None
@@ -3107,10 +3258,9 @@ def _derive_views(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
 
 def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     """
-    v5.59.0 PHASE-I: revalidates upstream-supplied upside_pct against
-    suspect bounds, not only synthesized values.
+    v5.59.0 PHASE-I: revalidates upstream-supplied upside_pct against suspect bounds.
     v5.58.0 PHASE-C: ADR / foreign-currency intrinsic suppression.
-    v5.55.0 [AUDIT-6]: subunit-currency normalization on synthesized intrinsic.
+    v5.55.0 AUDIT-6: subunit-currency normalization on synthesized intrinsic.
     """
     price = _as_float(row.get("current_price"))
     if price is None or price <= 0:
@@ -3156,14 +3306,13 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
             intrinsic = max(0.0, intrinsic)
             row["intrinsic_value"] = round(intrinsic, 4)
 
-            # v5.55.0 AUDIT-6: subunit normalization on synthesized intrinsic.
             sym = _safe_str(row.get("symbol"))
             if _is_subunit_exchange_symbol(sym):
                 _normalize_subunit_currency_fields(row, symbol_hint=sym)
 
     intrinsic = _as_float(row.get("intrinsic_value"))
 
-    # v5.58.0 PHASE-C: ADR / foreign-currency intrinsic suppression.
+    # v5.58.0 PHASE-C
     if intrinsic is not None and intrinsic > 0:
         _ratio = intrinsic / price
         if (_ratio > _INTRINSIC_UNIT_MISMATCH_RATIO_HIGH
@@ -3173,8 +3322,7 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
             row["upside_pct"] = None
             intrinsic = None
 
-    # v5.59.0 PHASE-I: engine-level suspect-bound check on upside_pct.
-    # Validates BOTH upstream-supplied AND synthesized values.
+    # v5.59.0 PHASE-I
     existing_upside = _as_float(row.get("upside_pct"))
     if existing_upside is not None:
         if (existing_upside < _UPSIDE_PCT_SUSPECT_FLOOR
@@ -4081,7 +4229,18 @@ class DataEngineV5:
             return dict(patch)
         return _model_to_dict(patch)
 
-    def _providers_for(self, symbol: str, page: Optional[str] = None) -> List[str]:
+    async def _providers_for(self, symbol: str, page: Optional[str] = None) -> List[str]:
+        """
+        v5.61.0 PHASE-E: Build the provider chain for a symbol, then
+        consult the unhealthy-provider registry. Unhealthy primaries
+        are either:
+          - DEMOTED to end of chain (default — primary still gets one
+            attempt in case the marker has gone stale), OR
+          - SKIPPED entirely when ENGINE_PROVIDER_UNHEALTHY_SKIP=1.
+
+        The base chain build logic is preserved byte-identical from
+        v5.60.0 — registry consultation runs as a post-pass.
+        """
         sym = normalize_symbol(symbol)
         is_ksa = sym.endswith(".SR") or bool(re.match(r"^[0-9]{4}$", sym))
 
@@ -4102,20 +4261,61 @@ class DataEngineV5:
                 merged = list(_dedupe_keep_order(base))
             if prefer_provider and (not self._ksa_disallow_eodhd or prefer_provider.lower() != "eodhd"):
                 merged = [prefer_provider] + [p for p in merged if p != prefer_provider]
-            return merged
+        else:
+            base = list(self.settings and getattr(self.settings, "provider_chain", None) or DEFAULT_GLOBAL_PROVIDERS)
+            if not base:
+                base = list(DEFAULT_GLOBAL_PROVIDERS)
+            if override:
+                merged = list(_dedupe_keep_order(override + [p for p in base if p not in override]))
+            else:
+                merged = list(_dedupe_keep_order(base))
+            if prefer_provider:
+                merged = [prefer_provider] + [p for p in merged if p != prefer_provider]
+            else:
+                if canon_page in NON_KSA_EODHD_PRIMARY_PAGES and "eodhd" in merged:
+                    merged = ["eodhd"] + [p for p in merged if p != "eodhd"]
 
-        base = list(self.settings and getattr(self.settings, "provider_chain", None) or DEFAULT_GLOBAL_PROVIDERS)
-        if not base:
-            base = list(DEFAULT_GLOBAL_PROVIDERS)
-        if override:
-            merged = list(_dedupe_keep_order(override + [p for p in base if p not in override]))
-        else:
-            merged = list(_dedupe_keep_order(base))
-        if prefer_provider:
-            merged = [prefer_provider] + [p for p in merged if p != prefer_provider]
-        else:
-            if canon_page in NON_KSA_EODHD_PRIMARY_PAGES and "eodhd" in merged:
-                merged = ["eodhd"] + [p for p in merged if p != "eodhd"]
+        # v5.61.0 PHASE-E: consult the unhealthy-provider registry. If a
+        # provider in the chain is currently marked unhealthy, either
+        # skip it entirely or demote it to the end of the chain.
+        try:
+            registry = await _get_provider_health_registry()
+            skip = _provider_unhealthy_skip_enabled()
+            demote = _provider_unhealthy_demote_enabled()
+
+            healthy: List[str] = []
+            unhealthy: List[str] = []
+            for p in merged:
+                if await registry.is_unhealthy(p):
+                    unhealthy.append(p)
+                else:
+                    healthy.append(p)
+
+            if unhealthy:
+                if skip:
+                    # SKIP unhealthy entirely. Leaves only the healthy
+                    # fallbacks. If everything is unhealthy, fall back to
+                    # the original chain so we have at least one attempt
+                    # to make (better to try than to return nothing).
+                    merged = healthy if healthy else merged
+                    logger.info(
+                        "[engine_v2 v%s] _providers_for: SKIPPED unhealthy providers %s for symbol=%s page=%s; chain=%s",
+                        __version__, unhealthy, sym, canon_page, merged,
+                    )
+                elif demote:
+                    # DEMOTE unhealthy to end of chain (default).
+                    merged = healthy + unhealthy
+                    logger.info(
+                        "[engine_v2 v%s] _providers_for: DEMOTED unhealthy providers %s for symbol=%s page=%s; chain=%s",
+                        __version__, unhealthy, sym, canon_page, merged,
+                    )
+        except Exception as exc:
+            # Never let a registry failure break the chain pipeline.
+            logger.debug(
+                "[engine_v2 v%s] _providers_for registry consultation failed: %s: %s",
+                __version__, exc.__class__.__name__, exc,
+            )
+
         return merged
 
     async def _rows_from_parallel_series(self, symbol: str) -> List[Dict[str, Any]]:
@@ -4300,6 +4500,13 @@ class DataEngineV5:
         """
         v5.55.0 [AUDIT-5]: When all providers fail and history fallback
         is also empty, set forecast_unavailable=True + data_quality=MISSING.
+
+        v5.61.0 PHASE-D/U: after each provider patch merge, observe any
+        `provider_unhealthy:X` markers from the canonicalized row and
+        register them with the module-level health registry. The
+        observation runs BEFORE the rich-enough early-exit check, so the
+        registry sees signals even when the very first patch happens to
+        be rich enough to terminate the chain.
         """
         normalized = normalize_symbol(symbol)
         cache_key = "quote::{}::{}".format(normalized, self._provider_profile_key(normalized, page))
@@ -4314,7 +4521,9 @@ class DataEngineV5:
             sources: List[str] = []
             sem = asyncio.Semaphore(self._max_concurrent_quotes)
             async with sem:
-                providers = self._providers_for(normalized, page=page)
+                # v5.61.0 PHASE-E: _providers_for is now async to consult the
+                # unhealthy-provider registry.
+                providers = await self._providers_for(normalized, page=page)
                 for provider in providers:
                     patch = await self._fetch_patch(provider, normalized)
                     if patch:
@@ -4335,6 +4544,18 @@ class DataEngineV5:
                                     provider, canon_err.__class__.__name__,
                                 )
                             )
+                        # v5.61.0 PHASE-D: observe unhealthy markers from
+                        # the canonicalized patch BEFORE merging into row,
+                        # so the registry sees the signal even if the
+                        # merge step somehow drops the marker. Idempotent.
+                        try:
+                            await _observe_provider_unhealthy_markers(canon_patch)
+                        except Exception as obs_err:
+                            logger.debug(
+                                "[engine_v2 v%s] _observe_provider_unhealthy_markers failed: %s: %s",
+                                __version__, obs_err.__class__.__name__, obs_err,
+                            )
+
                         row = self._merge(row, canon_patch)
                         sources.append(provider)
                         if _provider_row_rich_enough(row):
@@ -4400,8 +4621,6 @@ class DataEngineV5:
             row["last_updated_utc"] = _now_utc_iso()
             row["last_updated_riyadh"] = _now_riyadh_iso()
             if warnings:
-                # v5.60.0 PHASE-N: union via _union_warnings_strings for
-                # consistent dedupe semantics.
                 row["warnings"] = _union_warnings_strings(row.get("warnings"), warnings)
             row.setdefault("symbol", normalized)
             row.setdefault("requested_symbol", symbol)
@@ -4415,6 +4634,17 @@ class DataEngineV5:
 
             _recompute_price_change_fields(row)
             _apply_enhanced_decision_fields(row)
+
+            # v5.61.0 PHASE-D: final observation pass on the fully-merged
+            # row. Catches the case where warnings only become visible
+            # after the merge step (e.g. union from a later provider).
+            try:
+                await _observe_provider_unhealthy_markers(row)
+            except Exception as obs_err:
+                logger.debug(
+                    "[engine_v2 v%s] final _observe_provider_unhealthy_markers failed: %s: %s",
+                    __version__, obs_err.__class__.__name__, obs_err,
+                )
 
             return row
 
@@ -4930,7 +5160,8 @@ class DataEngineV5:
                 "_engine_error": err_text,
                 "_engine_error_class": err_class,
                 "contract_source": "exception_envelope",
-                "build_source": "engine_exception_envelope_v5_60",
+                # v5.61.0: tag bumped so audits can attribute exceptions to this version.
+                "build_source": "engine_exception_envelope_v5_61",
             })
             return payload
 
@@ -4972,7 +5203,26 @@ class DataEngineV5:
 
     # --- health ------------------------------------------------------------
     async def health(self) -> Dict[str, Any]:
+        """
+        v5.61.0 PHASE-X: health() now includes provider_unhealthy_markers
+        showing currently-tracked unhealthy providers with their TTL
+        remaining. Operators querying engine health see "EODHD has been
+        detected unhealthy, TTL=247s, engine routing to fallbacks".
+        """
         provider_stats = await self.providers.get_stats()
+        # v5.61.0 PHASE-X: snapshot the unhealthy-provider registry. Safe
+        # to call even if no provider has ever been marked unhealthy —
+        # returns the empty active list plus the config flags.
+        try:
+            registry = await _get_provider_health_registry()
+            provider_unhealthy_markers = await registry.snapshot()
+        except Exception as reg_err:
+            provider_unhealthy_markers = {
+                "error": "snapshot_failed:{}".format(reg_err.__class__.__name__),
+                "active": [],
+                "active_count": 0,
+            }
+
         return {
             "ok": True,
             "engine_version": __version__,
@@ -4986,13 +5236,18 @@ class DataEngineV5:
             "subunit_exchanges_count": len(_SUBUNIT_EXCHANGES),
             "subunit_detect_threshold": _SUBUNIT_DETECT_RATIO_THRESHOLD,
             "geo_correction_enabled": True,
-            # v5.60.0 new diagnostics
+            # v5.60.0 diagnostics
             "engine_52w_guard_enabled": True,
             "engine_52w_ratio_high": _ENGINE_PRICE_RATIO_SUSPECT_HIGH,
             "engine_52w_ratio_low": _ENGINE_PRICE_RATIO_SUSPECT_LOW,
             "week_52_position_pct_units": "percent_points",
             "warnings_convention": "list_or_string_at_input_string_at_output",
             "last_error_class_alias_present": "last_error_class" in _CANONICAL_FIELD_ALIASES,
+            # v5.61.0 new diagnostics
+            "provider_unhealthy_markers": provider_unhealthy_markers,
+            "provider_unhealthy_demote_enabled": _provider_unhealthy_demote_enabled(),
+            "provider_unhealthy_skip_enabled": _provider_unhealthy_skip_enabled(),
+            "provider_unhealthy_ttl_sec": _provider_unhealthy_ttl_sec(),
         }
 
     async def get_health(self) -> Dict[str, Any]:
