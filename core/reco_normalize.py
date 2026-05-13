@@ -3,8 +3,26 @@
 """
 core/reco_normalize.py
 ================================================================================
-Recommendation Normalization -- v7.2.0
+Recommendation Normalization -- v7.2.1
 ================================================================================
+
+v7.2.1 changes (vs v7.2.0)
+--------------------------
+METADATA-ONLY PATCH — May 2026 cross-stack family alignment.
+
+Cross-stack consumer acknowledgment:
+- `investment_advisor` v5.3.1 now uses rule-id-aware cascade via
+  `recommendation_from_views_with_rule_id()` for audit visibility.
+- `investment_advisor_engine` v4.4.1 delegates view-aware recommendation
+  synthesis to `Recommendation.from_views()` with full conviction-floor
+  support.
+- `criteria_model` v3.1.1 mirrors the same env-tunable conviction floor
+  variables (`RECO_STRONG_BUY_CONVICTION_FLOOR`, `RECO_BUY_CONVICTION_FLOOR`)
+  for consistent thresholds across the investment pipeline.
+
+All v7.2.0 behavior preserved verbatim. This is purely a metadata-only
+patch with no functional changes — VERSION bumped to v7.2.1 for family
+alignment tracking.
 
 v7.2.0 changes (vs v7.1.0)
 --------------------------
@@ -146,8 +164,8 @@ from typing import (
 # Version
 # =============================================================================
 
-VERSION = "7.2.0"
-__version__ = VERSION  # v7.2.0 Phase C: align with TFB module convention
+VERSION = "7.2.1"
+__version__ = VERSION  # v7.2.1: cross-stack family alignment, TFB module convention
 
 
 # =============================================================================
