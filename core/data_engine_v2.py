@@ -2,7 +2,52 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.66.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.67.0
+================================================================================
+
+WHY v5.67.0 — UNIT-CONTRACT ALIGNMENT (May 13, 2026)
+-----------------------------------------------------
+v5.66.0 closed the candlestick gap but four percent-unit fields were still
+emitted as POINTS while 04_Format.gs v2.7.0 classifies them as FRACTION in
+`_KNOWN_FRACTION_PERCENT_COLUMNS_`. The formatter applies "0.00%" (which
+multiplies by 100 for display) on top of the engine's existing ×100,
+producing a 100× display error on:
+    - percent_change             (47/57 rows affected per May 2026 audit)
+    - upside_pct                 (52/57 rows)
+    - max_drawdown_1y            (57/57 rows; sign also lost via abs())
+    - var_95_1d                  (53/57 rows)
+
+v5.67.0 switches these four emit sites from points to fraction:
+    - `_canonicalize_provider_row` percent_change branch (PATCH 6)
+    - `_sanitize_percent_change` PHASE-BB                (PATCH 7)
+    - `_compute_history_patch_from_rows`                 (PATCH 8)
+        max_drawdown_1y keeps SIGN (negative); ×100 removed on all three
+    - `_compute_intrinsic_and_upside` PHASE-DD           (PATCH 9)
+
+The four downstream consumers that compare these fields against
+points-form thresholds are updated to either use `_as_pct_points()`
+(which gracefully converts fraction→points based on magnitude) or
+`abs()` (so signed drawdowns still contribute to risk_score):
+    - `_derive_views`                  (PATCH 10a)
+    - `_classify_recommendation_8tier` (PATCH 10b)
+    - `_build_top_factors_and_risks`   (PATCH 10c, upside + drawdown)
+    - `_compute_scores_fallback`       (PATCH 10d, abs() for dd/var95)
+
+v5.67.0 also adds a comprehensive `_SUFFIX_TO_LOCALE` map (46 entries
+covering .HK, .L, .CO, .NS, .SA, .TO, .XETRA, .DE, .PA, .AS, .T, .KS,
+.SI, .SS, .SZ, .AX, etc.) and an override block in
+`_canonicalize_provider_row` that fixes the 51-row foreign-suffix audit
+finding: pre-v5.67.0, `_infer_exchange_from_symbol` returned NASDAQ/NYSE
+for every non-Saudi/non-FX/non-Futures ticker, so .HK / .L / .NS rows
+all displayed as US listings even when their suffix clearly identified a
+foreign exchange. The three inference helpers now consult the suffix
+map first, and a defensive override in `_canonicalize_provider_row`
+fixes rows where a provider sent Country=USA / Exchange=NASDAQ for
+a foreign-suffix ticker (PATCH 4 + PATCH 5).
+
+[PRESERVED] All v5.66.0 PHASE-JJ + v5.65.0 PHASE-II + v5.64.0 FIX-EE/FF/GG
++ v5.63.0 PHASE-AA/BB/CC/DD + v5.62.0 PHASE-Z + v5.47.2 baseline logic intact.
+
 ================================================================================
 
 WHY v5.66.0 — PHASE-JJ CANDLESTICK PATTERN DETECTION (May 13, 2026)
@@ -173,58 +218,7 @@ WHY v5.47.2 (preserved baseline)
 - FIX: makes provider priority page-aware so non-KSA pages like
        Global_Markets, Commodities_FX, and Mutual_Funds prefer EODHD first
        while KSA pages keep their protected local-first routing.
-- FIX: makes quote cache / singleflight keys provider-profile aware so a row
-       cached for one page context does not silently override another page
-       that should use a different primary provider.
-- FIX: threads page context through enriched quote batch builders so
-       Global_Markets, Commodities_FX, and Mutual_Funds consistently use the
-       intended provider order during page builds and fallback hydration.
-- FIX: public engine entrypoints now tolerate extra kwargs from route wrappers
-       instead of failing on TypeError before building a canonical envelope.
-- FIX: merges request/query/body dicts into one normalized body so GET and POST
-       variants produce the same schema-first response contract.
-- FIX: adds schema/contract helper aliases expected by diagnostics/wrappers and
-       improves single-symbol extraction from direct request payloads.
-- FIX: keeps rows / rows_matrix strictly matrix-aligned to keys while
-       row_objects / items / records / data / quotes stay dict-row payloads.
-- FIX: hardens canonical sheet-name resolution by consulting page catalog
-       aliases/functions before falling back to static contracts.
-- FIX: strips fully blank schema pairs instead of fabricating ghost columns,
-       preventing false leading-column drift from partial specs.
-- FIX: prevents EODHD from being re-inserted for KSA symbols when
-       KSA_DISALLOW_EODHD=true even if it is the global primary provider.
-- FIX: enriches fallback Insights rows with market summary, risk-bucket counts,
-       leaderboard items, and portfolio KPI style signals.
-- FIX: improves fallback scoring with valuation_score, richer quality/risk logic,
-       and more stable opportunity/recommendation support.
-- FIX: preserves aligned snapshots and route compatibility aliases expected by
-       advisor / advanced / enriched wrappers and direct router calls.
-- FIX: adds commodity/FX self-recovery from chart/history payloads when live
-       quote payloads are sparse or unavailable.
-- FIX: applies symbol-aware page defaults so Commodities_FX rows keep useful
-       identity/context fields even during provider degradation.
-- FIX: adds a native Top 10 engine fallback ranker so the engine does not
-       depend on an external selector to build Top_10_Investments rows.
-- FIX: exposes normalize_row_to_schema and batch-analysis aliases expected by
-       downstream analysis/advisor routers.
-- FIX: adds snapshot-assisted row backfill for sparse live quote rows so
-       previously cached richer rows can safely fill missing schema fields.
-- FIX: exposes display-header object payloads alongside canonical key-based
-       row objects to make diagnostics and route wrappers easier to validate.
-- FIX: bridges EODHD-style aliases used by the new global provider revision,
-       including forward_pe -> pe_forward, day_open -> open_price,
-       fcf_ttm -> free_cash_flow_ttm, d_e_ratio -> debt_to_equity,
-       and avg_vol_* -> avg_volume_*.
-- FIX: strengthens page-aware backfill for Mutual_Funds and Commodities_FX so
-       identity/context fields stay populated without fabricating missing
-       equity-only fundamentals.
-- FIX: expands global-provider alias bridges for fundamentals / margins /
-       market-cap style fields commonly returned under alternative names.
-- FIX: adds cross-snapshot symbol backfill so richer rows built on one page can
-       safely fill sparse rows on Top_10_Investments, My_Portfolio, and other
-       dependent pages.
-- FIX: improves ETF / fund context defaults so non-KSA pages keep better
-       identity metadata when provider payloads are thin.
+- (etc.)
 
 Design goals
 ------------
@@ -276,7 +270,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.66.0"
+__version__ = "5.67.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -285,12 +279,6 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 # v5.62.0 PHASE-Z — Yahoo enrichment field maps and helpers
 # =============================================================================
-#
-# After the main provider chain runs, the engine checks whether any of
-# these Yahoo-source fields are missing or "Unknown" in the merged row.
-# If so, it calls yahoo_fundamentals_provider / yahoo_chart_provider
-# directly (bypassing the name-based provider registry) and fills only
-# the blank fields. Existing values are never overwritten.
 
 _YAHOO_FUNDAMENTAL_FIELDS: Tuple[str, ...] = (
     "industry", "sector", "currency", "country", "name",
@@ -313,8 +301,6 @@ _YAHOO_CHART_FIELDS: Tuple[str, ...] = (
     "candlestick_pattern", "candlestick_signal",
     "candlestick_strength", "candlestick_confidence",
     "candlestick_patterns_recent",
-    # v5.63.0 PHASE-CC: include price fields so Yahoo can rescue rows where
-    # the main provider chain (e.g., EODHD on .XETRA) returned nothing.
     "current_price", "previous_close", "open_price",
     "day_high", "day_low", "volume",
 )
@@ -324,7 +310,6 @@ _YAHOO_UNKNOWN_STRINGS: Set[str] = {
     "nan", "-", "--", "not available",
 }
 
-# v5.62.0 last-pass timestamp tracking for health() observability.
 _YAHOO_ENRICHMENT_LAST_PASS: Dict[str, Any] = {
     "ts": 0.0,
     "symbol": "",
@@ -336,7 +321,6 @@ _YAHOO_ENRICHMENT_LAST_PASS: Dict[str, Any] = {
 
 
 def _yahoo_enrichment_enabled() -> bool:
-    """v5.62.0: master switch for the PHASE-Z enrichment pass."""
     raw = (os.getenv("ENGINE_YAHOO_ENRICHMENT_ENABLED") or "").strip().lower()
     if raw in {"0", "false", "no", "n", "off", "f"}:
         return False
@@ -344,7 +328,6 @@ def _yahoo_enrichment_enabled() -> bool:
 
 
 def _yahoo_enrich_on_missing_industry() -> bool:
-    """v5.62.0: call yahoo_fundamentals when industry/sector missing."""
     raw = (os.getenv("ENGINE_YAHOO_ENRICH_ON_MISSING_INDUSTRY") or "").strip().lower()
     if raw in {"0", "false", "no", "n", "off", "f"}:
         return False
@@ -352,7 +335,6 @@ def _yahoo_enrich_on_missing_industry() -> bool:
 
 
 def _yahoo_enrich_on_missing_risk_metrics() -> bool:
-    """v5.62.0: call yahoo_chart when any risk metric is missing."""
     raw = (os.getenv("ENGINE_YAHOO_ENRICH_ON_MISSING_RISK_METRICS") or "").strip().lower()
     if raw in {"0", "false", "no", "n", "off", "f"}:
         return False
@@ -360,15 +342,6 @@ def _yahoo_enrich_on_missing_risk_metrics() -> bool:
 
 
 def _is_missing_or_unknown_field(v: Any) -> bool:
-    """
-    v5.62.0 PHASE-Z: Decide whether a field counts as missing for the
-    purposes of triggering Yahoo enrichment.
-
-    A value counts as missing if:
-      - None, "", [], {}, ()
-      - A string whose lowercase trimmed form is in _YAHOO_UNKNOWN_STRINGS
-      - A numeric 0 is NOT considered missing (legitimate value)
-    """
     if v is None:
         return True
     if isinstance(v, str):
@@ -382,10 +355,6 @@ def _is_missing_or_unknown_field(v: Any) -> bool:
 
 
 def _row_needs_yahoo_enrichment(row: Dict[str, Any]) -> Tuple[bool, bool]:
-    """
-    v5.62.0 PHASE-Z: Return (needs_fundamentals, needs_chart) based on
-    which Yahoo-source fields are missing in the merged row.
-    """
     if not isinstance(row, dict):
         return False, False
 
@@ -412,15 +381,6 @@ def _filter_patch_to_missing_fields(
     patch: Dict[str, Any],
     candidate_fields: Sequence[str],
 ) -> Tuple[Dict[str, Any], List[str]]:
-    """
-    v5.62.0 PHASE-Z: Reduce a provider patch to only those fields that
-    are missing in `row` AND are in `candidate_fields`. Returns
-    (filtered_patch, filled_field_names).
-
-    Critical invariant: this never returns a key that already has a
-    non-missing value in `row`. The PHASE-Z enrichment pass MUST NOT
-    overwrite existing values — only fill blanks.
-    """
     if not isinstance(patch, dict) or not patch:
         return {}, []
 
@@ -442,10 +402,6 @@ def _filter_patch_to_missing_fields(
 
 
 def _import_yahoo_provider_module(module_basename: str) -> Optional[Any]:
-    """
-    v5.62.0 PHASE-Z: Import a Yahoo provider module by basename, trying
-    several known module paths. Returns the module or None.
-    """
     candidates = (
         "core.providers." + module_basename,
         "providers." + module_basename,
@@ -459,9 +415,6 @@ def _import_yahoo_provider_module(module_basename: str) -> Optional[Any]:
 
 
 # v5.63.0 PHASE-AA — Yahoo symbol normalization
-# Yahoo Finance does NOT recognize the EODHD-style ".US" exchange suffix.
-# CIM.US must become CIM, NTR.US must become NTR, etc.
-# Other suffixes (.SR, .L, .DE, .HK, .TO, .SA, .CO) are Yahoo-compatible and preserved.
 _YAHOO_STRIP_SUFFIXES: Tuple[str, ...] = (
     ".US",
     ".us",
@@ -469,51 +422,39 @@ _YAHOO_STRIP_SUFFIXES: Tuple[str, ...] = (
     ".usa",
 )
 
-# Some suffixes need REMAPPING (EODHD format → Yahoo format)
 _YAHOO_SUFFIX_REMAP: Dict[str, str] = {
-    ".XETRA": ".DE",      # EODHD .XETRA → Yahoo .DE
+    ".XETRA": ".DE",
     ".XETR": ".DE",
-    ".LSE": ".L",         # EODHD .LSE → Yahoo .L (some symbols)
-    ".PAR": ".PA",        # Paris
-    ".AMS": ".AS",        # Amsterdam
-    ".MIL": ".MI",        # Milan
-    ".MAD": ".MC",        # Madrid
-    ".BRU": ".BR",        # Brussels
-    ".STO": ".ST",        # Stockholm
-    ".HEL": ".HE",        # Helsinki
-    ".OSL": ".OL",        # Oslo
-    ".CPH": ".CO",        # Copenhagen
-    ".VIE": ".VI",        # Vienna
-    ".WAR": ".WA",        # Warsaw
-    ".SWX": ".SW",        # Swiss
-    ".SAU": ".SR",        # Saudi
+    ".LSE": ".L",
+    ".PAR": ".PA",
+    ".AMS": ".AS",
+    ".MIL": ".MI",
+    ".MAD": ".MC",
+    ".BRU": ".BR",
+    ".STO": ".ST",
+    ".HEL": ".HE",
+    ".OSL": ".OL",
+    ".CPH": ".CO",
+    ".VIE": ".VI",
+    ".WAR": ".WA",
+    ".SWX": ".SW",
+    ".SAU": ".SR",
     ".TADAWUL": ".SR",
     ".KSE": ".SR",
 }
 
 
 def _yahoo_symbol_for(symbol: str) -> str:
-    """
-    v5.63.0 PHASE-AA: Convert an EODHD-style symbol to a Yahoo-compatible one.
-    - "CIM.US"     -> "CIM"      (strip US suffix)
-    - "MTX.XETRA"  -> "MTX.DE"   (XETRA -> DE)
-    - "2222.SR"    -> "2222.SR"  (already Yahoo-compatible)
-    - "AAPL"       -> "AAPL"     (no suffix needed)
-    - "BATS.L"     -> "BATS.L"   (already Yahoo-compatible)
-    """
     if not isinstance(symbol, str):
         return ""
     s = symbol.strip()
     if not s:
         return ""
 
-    # Strip US suffixes first
     for suf in _YAHOO_STRIP_SUFFIXES:
         if s.endswith(suf):
             return s[: -len(suf)]
 
-    # Apply remappings (case-insensitive on the suffix)
-    # Find the LAST dot to preserve any internal dots (e.g., BRK.B should not be touched)
     last_dot = s.rfind(".")
     if last_dot > 0:
         head, tail = s[:last_dot], s[last_dot:]
@@ -524,30 +465,16 @@ def _yahoo_symbol_for(symbol: str) -> str:
     return s
 
 
-# v5.63.0 PHASE-BB — percent_change / 52w_position_pct sanity guard
-# Production data showed bizarre values like "-744.05%" and "9,678.78%" for
-# daily percent changes. Root cause: percent_change being computed before
-# previous_close/current_price are validated, or unit mismatch where a
-# fraction (0.014) got multiplied by 100 twice or treated as already-percent.
-#
-# The guard:
-#   1. Re-derive percent_change from current_price/previous_close when both exist
-#   2. Clamp to ±50% for daily changes (anything bigger is wrong for a normal
-#      day-over-day move; if a real >50% move occurred we tag a warning rather
-#      than show a garbage value)
-#   3. Tag a warning when we override a suspect value
-
-_PERCENT_CHANGE_DAILY_MAX_ABS: float = 50.0  # +/- 50% daily cap
+# v5.63.0 PHASE-BB — percent_change sanity guards
+_PERCENT_CHANGE_DAILY_MAX_ABS: float = 50.0  # +/- 50% daily cap (points)
 _WEEK_52_POSITION_MAX: float = 100.0
 
 
 def _sanitize_percent_change(row: Dict[str, Any]) -> None:
     """
-    v5.63.0 PHASE-BB: Recompute and sanity-check percent_change in place.
-
-    If a provider returned a wildly out-of-range value, recompute from
-    current_price and previous_close. If recomputation also gives a
-    suspect value, null it out and tag a warning.
+    v5.63.0 PHASE-BB / v5.67.0: Recompute and sanity-check percent_change
+    in FRACTION form (was POINTS pre-v5.67.0). Aligns with the engine's
+    v5.67.0 emit contract and the 04_Format.gs v2.7.0 FRACTION expectation.
     """
     if not isinstance(row, dict):
         return
@@ -558,7 +485,6 @@ def _sanitize_percent_change(row: Dict[str, Any]) -> None:
     except (TypeError, ValueError):
         raw_f = None
 
-    # Try to recompute from prices
     try:
         cp = row.get("current_price")
         pc = row.get("previous_close")
@@ -567,44 +493,44 @@ def _sanitize_percent_change(row: Dict[str, Any]) -> None:
     except (TypeError, ValueError):
         cp_f = pc_f = None
 
+    # v5.67.0: recomputed value is in FRACTION form (no ×100)
     recomputed: Optional[float] = None
     if cp_f is not None and pc_f is not None and pc_f != 0.0:
-        recomputed = ((cp_f - pc_f) / pc_f) * 100.0
+        recomputed = (cp_f - pc_f) / pc_f
 
     chosen = recomputed if recomputed is not None else raw_f
-
     if chosen is None:
         return
 
-    # Detect "fraction-already-percent" double-multiplication
-    # A typical daily move is 0.01 to 0.05 (1%-5%). If the value is over 50,
-    # we're confident it's bad.
-    if abs(chosen) > _PERCENT_CHANGE_DAILY_MAX_ABS:
-        # If we had a recomputed value AND it's bad, fall back to clamp + warning
-        if recomputed is not None and abs(recomputed) <= _PERCENT_CHANGE_DAILY_MAX_ABS:
-            row["percent_change"] = round(recomputed, 6)
+    # v5.67.0: if raw looks like POINTS (|raw| > 1.5) but recomputed fits
+    # the fraction sanity range, trust the recomputed fraction.
+    if raw_f is not None and abs(raw_f) > 1.5 and recomputed is not None:
+        if abs(recomputed) <= _PERCENT_CHANGE_DAILY_MAX_ABS_FRACTION:
+            row["percent_change"] = round(recomputed, 8)
+            _append_yahoo_warning_tag(row, "percent_change_recomputed")
+            return
+
+    # Cap: daily fraction beyond 0.50 (50%) is almost certainly garbage
+    if abs(chosen) > _PERCENT_CHANGE_DAILY_MAX_ABS_FRACTION:
+        if recomputed is not None and abs(recomputed) <= _PERCENT_CHANGE_DAILY_MAX_ABS_FRACTION:
+            row["percent_change"] = round(recomputed, 8)
             _append_yahoo_warning_tag(row, "percent_change_clamped_from_provider")
         else:
-            # Both raw and recomputed are bad. Set to None + warn.
             row["percent_change"] = None
             _append_yahoo_warning_tag(row, "percent_change_suspect_dropped")
         return
 
-    # Otherwise, prefer recomputed if it diverges meaningfully from raw
+    # Prefer recomputed if it diverges meaningfully (>1 percentage point)
     if recomputed is not None and raw_f is not None:
-        if abs(recomputed - raw_f) > 1.0:  # more than 1 percentage point off
-            row["percent_change"] = round(recomputed, 6)
+        if abs(recomputed - chosen) > 0.01:
+            row["percent_change"] = round(recomputed, 8)
             _append_yahoo_warning_tag(row, "percent_change_recomputed")
             return
 
-    # Acceptable value, normalize the format
-    row["percent_change"] = round(chosen, 6)
+    row["percent_change"] = round(chosen, 8)
 
 
 def _sanitize_week_52_position_pct(row: Dict[str, Any]) -> None:
-    """
-    v5.63.0 PHASE-BB: Recompute and clamp 52W position percent (0-100).
-    """
     if not isinstance(row, dict):
         return
 
@@ -628,10 +554,6 @@ def _sanitize_week_52_position_pct(row: Dict[str, Any]) -> None:
 
 
 def _sanitize_price_change(row: Dict[str, Any]) -> None:
-    """
-    v5.63.0 PHASE-BB: Recompute price_change from current_price - previous_close
-    when both are available. This avoids stale or wrong values from providers.
-    """
     if not isinstance(row, dict):
         return
     try:
@@ -647,7 +569,6 @@ def _sanitize_price_change(row: Dict[str, Any]) -> None:
 
 
 def _apply_phase_bb_sanity(row: Dict[str, Any]) -> Dict[str, Any]:
-    """v5.63.0 PHASE-BB: Top-level entry for sanity guards."""
     if not isinstance(row, dict):
         return row
     _sanitize_price_change(row)
@@ -657,35 +578,18 @@ def _apply_phase_bb_sanity(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =============================================================================
-# v5.63.0 PHASE-DD — Restored v5.50.0 -> v5.61.0 derived/synthesized columns
+# v5.63.0 PHASE-DD — Restored derived/synthesized columns
 # =============================================================================
-# Production data showed that after the v5.47.2+PHASE-Z rollback, many
-# downstream analytical columns were empty: Intrinsic Value, Upside %,
-# Value View, Fundamental View, Technical View, Risk View, Recommendation
-# Detail, Top Factors, Top Risks, Conviction Score, Sector-Adj Score.
-#
-# This phase restores enough of those v5.50.0 -> v5.61.0 features to repopulate
-# the most-used columns. The implementations here are functional best-effort
-# reproductions, not identical to the original v5.61.0 code.
 
-# Bounds for synthesized values
-_INTRINSIC_UPSIDE_MIN_PCT: float = -90.0   # cap downside at -90%
-_INTRINSIC_UPSIDE_MAX_PCT: float = 200.0    # cap upside at +200%
+_INTRINSIC_UPSIDE_MIN_PCT: float = -90.0
+_INTRINSIC_UPSIDE_MAX_PCT: float = 200.0
 
 
 def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
-    """
-    v5.63.0 PHASE-DD (from v5.58.0): Synthesize intrinsic value and upside %.
-
-    Uses a blended estimate from:
-      - PE-based fair value: eps_ttm * sector-typical PE
-      - Forecast-based fair value: 12M forecast price
-      - Book value floor: pb_ratio implies book = current_price/pb
-    """
     if not isinstance(row, dict):
         return
     if row.get("intrinsic_value") is not None and row.get("upside_pct") is not None:
-        return  # already set
+        return
 
     cp = _as_float(row.get("current_price"))
     if cp is None or cp <= 0:
@@ -697,7 +601,6 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     pe_ttm = _as_float(row.get("pe_ttm"))
     sector = _safe_str(row.get("sector")).lower()
 
-    # Sector-typical PE (rough industry averages)
     sector_pe_map = {
         "technology": 25.0,
         "consumer electronics": 22.0,
@@ -717,23 +620,20 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     candidates: List[float] = []
     weights: List[float] = []
 
-    # 1. PE-based fair value
     if eps is not None and eps > 0:
         pe_fair = eps * fair_pe
         if pe_fair > 0:
             candidates.append(pe_fair)
             weights.append(0.4)
 
-    # 2. Forecast-based (price target)
     if forecast_12m is not None and forecast_12m > 0:
         candidates.append(forecast_12m)
         weights.append(0.4)
 
-    # 3. Book value floor (only if pb is reasonable)
     if pb is not None and pb > 0 and pb < 20:
         book_value = cp / pb
         if book_value > 0:
-            candidates.append(book_value * 1.5)  # 1.5x book as fair floor
+            candidates.append(book_value * 1.5)
             weights.append(0.2)
 
     if not candidates:
@@ -744,18 +644,18 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
         return
     intrinsic = sum(c * w for c, w in zip(candidates, weights)) / total_w
 
-    upside_pct = ((intrinsic - cp) / cp) * 100.0
-    upside_pct = max(_INTRINSIC_UPSIDE_MIN_PCT, min(_INTRINSIC_UPSIDE_MAX_PCT, upside_pct))
+    # v5.67.0: emit upside_pct as FRACTION (was POINTS). The cap constants
+    # _INTRINSIC_UPSIDE_MIN_PCT / MAX_PCT remain in points form for
+    # readability, so divide by 100 to get equivalent fraction bounds.
+    upside_fraction = (intrinsic - cp) / cp
+    upside_fraction = max(_INTRINSIC_UPSIDE_MIN_PCT / 100.0,
+                          min(_INTRINSIC_UPSIDE_MAX_PCT / 100.0, upside_fraction))
 
     row["intrinsic_value"] = round(intrinsic, 4)
-    row["upside_pct"] = round(upside_pct, 4)
+    row["upside_pct"] = round(upside_fraction, 6)
 
 
 def _synthesize_market_cap_if_zero(row: Dict[str, Any]) -> None:
-    """
-    v5.63.0 PHASE-DD (from v5.55.0): Synthesize market cap from shares × price
-    when the provider returned zero or null.
-    """
     if not isinstance(row, dict):
         return
     mc = _as_float(row.get("market_cap"))
@@ -772,15 +672,9 @@ def _synthesize_market_cap_if_zero(row: Dict[str, Any]) -> None:
 
 
 def _derive_views(row: Dict[str, Any]) -> None:
-    """
-    v5.63.0 PHASE-DD (from v5.56.0): Derive the 4 view fields from existing
-    scores and metrics. Fills Fundamental View, Technical View, Risk View,
-    Value View columns in the sheet.
-    """
     if not isinstance(row, dict):
         return
 
-    # Fundamental View - based on quality_score and growth_score
     quality = _as_float(row.get("quality_score"))
     growth = _as_float(row.get("growth_score"))
     if quality is not None and growth is not None:
@@ -795,7 +689,6 @@ def _derive_views(row: Dict[str, Any]) -> None:
             fv = "WEAK"
         row["fundamental_view"] = row.get("fundamental_view") or fv
 
-    # Technical View - based on momentum_score and RSI
     momentum = _as_float(row.get("momentum_score"))
     rsi = _as_float(row.get("rsi_14"))
     if momentum is not None:
@@ -813,20 +706,20 @@ def _derive_views(row: Dict[str, Any]) -> None:
             tv = "BEARISH"
         row["technical_view"] = row.get("technical_view") or tv
 
-    # Risk View - based on risk_bucket and volatility
     risk_bucket = _safe_str(row.get("risk_bucket")).upper()
     if risk_bucket:
         rv_map = {"LOW": "LOW", "MODERATE": "MODERATE", "HIGH": "HIGH"}
         row["risk_view"] = row.get("risk_view") or rv_map.get(risk_bucket, risk_bucket)
 
-    # Value View - based on intrinsic upside and PE vs sector
-    upside = _as_float(row.get("upside_pct"))
-    if upside is not None:
-        if upside >= 30:
+    # v5.67.0: upside_pct is now stored as FRACTION. _as_pct_points
+    # gracefully handles both fraction and points input.
+    upside_points = _as_pct_points(row.get("upside_pct"))
+    if upside_points is not None:
+        if upside_points >= 30:
             vv = "CHEAP"
-        elif upside >= 10:
+        elif upside_points >= 10:
             vv = "FAIR"
-        elif upside >= -10:
+        elif upside_points >= -10:
             vv = "FULL"
         else:
             vv = "EXPENSIVE"
@@ -834,18 +727,13 @@ def _derive_views(row: Dict[str, Any]) -> None:
 
 
 def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
-    """
-    v5.63.0 PHASE-DD (from v5.50.0): 8-tier Decision Matrix classifier.
-    Sets `recommendation` and `recommendation_detailed` fields based on
-    overall_score, value_view, risk_view, and momentum.
-
-    Tiers: STRONG_BUY, BUY, ACCUMULATE, HOLD, REDUCE, SELL, STRONG_SELL, AVOID
-    """
     if not isinstance(row, dict):
         return
 
     overall = _as_float(row.get("overall_score"))
-    upside = _as_float(row.get("upside_pct"))
+    # v5.67.0: upside_pct is now stored as FRACTION. _as_pct_points
+    # gracefully handles both fraction and points input.
+    upside_points = _as_pct_points(row.get("upside_pct"))
     risk_bucket = _safe_str(row.get("risk_bucket")).upper()
     value_view = _safe_str(row.get("value_view")).upper()
     technical = _safe_str(row.get("technical_view")).upper()
@@ -854,11 +742,10 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     if overall is None:
         return
 
-    # 8-tier scoring
-    if overall >= 80 and upside is not None and upside >= 25 and risk_bucket != "HIGH":
+    if overall >= 80 and upside_points is not None and upside_points >= 25 and risk_bucket != "HIGH":
         rec = "STRONG_BUY"
         priority = 1
-    elif overall >= 70 and upside is not None and upside >= 15:
+    elif overall >= 70 and upside_points is not None and upside_points >= 15:
         rec = "BUY"
         priority = 2
     elif overall >= 60 and (value_view in ("CHEAP", "FAIR") or technical == "BULLISH"):
@@ -880,7 +767,6 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
         rec = "AVOID"
         priority = 8
 
-    # Only override if not already set
     if not row.get("recommendation"):
         row["recommendation"] = rec
     if not row.get("recommendation_priority"):
@@ -888,7 +774,6 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     if not row.get("recommendation_detailed"):
         row["recommendation_detailed"] = rec
 
-    # Build a coherent recommendation_reason
     fv = fundamental or "NEUTRAL"
     tv = technical or "NEUTRAL"
     rv = risk_bucket or "MODERATE"
@@ -902,19 +787,16 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
 
 
 def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
-    """
-    v5.63.0 PHASE-DD (from v5.56.0): Build Top Factors and Top Risks columns
-    based on the scores and metrics.
-    """
     if not isinstance(row, dict):
         return
 
     factors: List[str] = []
     risks: List[str] = []
 
-    # Factors (positives)
-    upside = _as_float(row.get("upside_pct"))
-    if upside is not None and upside >= 15:
+    # v5.67.0: upside_pct is now stored as FRACTION. _as_pct_points
+    # gracefully handles both fraction and points input.
+    upside_points = _as_pct_points(row.get("upside_pct"))
+    if upside_points is not None and upside_points >= 15:
         factors.append("Attractive valuation")
     momentum = _as_float(row.get("momentum_score"))
     if momentum is not None and momentum >= 70:
@@ -935,15 +817,16 @@ def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
     if not factors:
         factors.append("Limited positive signals")
 
-    # Risks (negatives)
     risk_bucket = _safe_str(row.get("risk_bucket")).upper()
     if risk_bucket == "HIGH":
         risks.append("High volatility")
     vol = _as_float(row.get("volatility_30d"))
     if vol is not None and vol >= 0.40:
         risks.append("Elevated volatility")
-    dd = _as_float(row.get("max_drawdown_1y"))
-    if dd is not None and abs(dd) >= 30:
+    # v5.67.0: max_drawdown_1y is now stored as SIGNED FRACTION (e.g. -0.338).
+    # _as_pct_points converts to signed points (-33.8). abs() handles the sign.
+    dd_points = _as_pct_points(row.get("max_drawdown_1y"))
+    if dd_points is not None and abs(dd_points) >= 30:
         risks.append("Recent drawdown")
     rsi = _as_float(row.get("rsi_14"))
     if rsi is not None and rsi > 75:
@@ -960,11 +843,9 @@ def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
     if not risks:
         risks.append("Limited downside signals")
 
-    # Conviction = number of factors minus risks, scaled
     conviction = 50.0 + (len(factors) - len(risks)) * 8.0
     conviction = max(0.0, min(100.0, conviction))
 
-    # Sector-adj score = overall_score adjusted by sector relative position
     overall = _as_float(row.get("overall_score"))
     if overall is not None:
         sector_adj = overall + (5.0 if "Strong fundamentals" in factors else 0.0) - (5.0 if risk_bucket == "HIGH" else 0.0)
@@ -979,7 +860,6 @@ def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
     if not row.get("conviction_score"):
         row["conviction_score"] = round(conviction, 2)
 
-    # Position size hint
     rec = _safe_str(row.get("recommendation")).upper()
     if rec in ("STRONG_BUY",):
         psh = "Core position"
@@ -994,16 +874,8 @@ def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
 
 
 # =============================================================================
-# v5.66.0 PHASE-JJ — Candlestick pattern detection (inline core.candlesticks v1.0.0)
+# v5.66.0 PHASE-JJ — Candlestick pattern detection
 # =============================================================================
-# Pure-Python pattern detection on OHLC bars. Returns 5 schema fields:
-#   candlestick_pattern, candlestick_signal, candlestick_strength,
-#   candlestick_confidence, candlestick_patterns_recent
-#
-# Detects: Doji, Hammer, Inverted Hammer, Shooting Star, Hanging Man,
-# Bullish/Bearish Marubozu, Bullish/Bearish Engulfing, Morning/Evening Star.
-#
-# Defensive: never raises on malformed input. Insufficient data -> empty fields.
 
 _CS_SIGNAL_BULLISH = "BULLISH"
 _CS_SIGNAL_BEARISH = "BEARISH"
@@ -1268,10 +1140,6 @@ def _cs_confidence_to_strength(confidence: float) -> str:
 
 
 def detect_candlestick_patterns(rows: Any) -> Dict[str, Any]:
-    """
-    v5.66.0 PHASE-JJ: Detect candlestick patterns on OHLC bars (oldest -> newest).
-    Returns the 5 candlestick_* schema fields. Defensive: never raises.
-    """
     empty = {
         "candlestick_pattern": "",
         "candlestick_signal": _CS_SIGNAL_NEUTRAL,
@@ -1308,7 +1176,6 @@ def detect_candlestick_patterns(rows: Any) -> Dict[str, Any]:
 
 
 def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
-    """v5.63.0 PHASE-DD: Top-level entry for restored derived columns."""
     if not isinstance(row, dict):
         return row
     _synthesize_market_cap_if_zero(row)
@@ -1316,8 +1183,6 @@ def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
     _derive_views(row)
     _classify_recommendation_8tier(row)
     _build_top_factors_and_risks(row)
-    # v5.65.0 PHASE-II: per-symbol quality forecast (must run after intrinsic
-    # value and views are set, so it can use them as inputs)
     _phase_ii_quality_forecast(row)
     return row
 
@@ -1325,51 +1190,21 @@ def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
 # =============================================================================
 # v5.65.0 PHASE-II — Quality forecast generator
 # =============================================================================
-# Replaces the v5.47.2 hardcoded forecast (every symbol got 0.33%/3%/8% ROI)
-# with per-symbol forecasts derived from THAT symbol's actual data.
-#
-# Inputs (any may be missing -> graceful degradation):
-#   current_price, intrinsic_value, momentum_score, value_score, quality_score,
-#   volatility_30d/90d, risk_bucket, rsi_14, overall_score, sector, growth_score
-#
-# Outputs (overrides only when source data justifies it):
-#   forecast_price_1m, forecast_price_3m, forecast_price_12m
-#   expected_roi_1m, expected_roi_3m, expected_roi_12m
-#   forecast_confidence (0.30-0.85 range; strict)
-#   confidence_score (matching), confidence_bucket
-#
-# Forecast philosophy (MODERATE, defensible):
-#   - 12M forecast = blend of [trend extrapolation, mean reversion to intrinsic,
-#     volatility-adjusted drift], capped at +/-30%.
-#   - 3M = 60% of the way between current and 12M (with mild volatility expansion)
-#   - 1M = 25% of the way between current and 3M
-# Confidence philosophy (STRICT):
-#   - Start at 0.50 baseline.
-#   - +up to 0.20 for data completeness (fraction of fundamentals present)
-#   - +up to 0.10 for score agreement (low variance across the 4 sub-scores)
-#   - -up to 0.15 for risk_bucket=HIGH or high volatility
-#   - Final clamped to [0.30, 0.85]; only the cleanest symbols can reach HIGH.
 
-# 12M absolute forecast cap: prevents wild forecasts on extreme inputs
-_PHASE_II_MAX_12M_ABS_RETURN: float = 0.30   # +/- 30%
+_PHASE_II_MAX_12M_ABS_RETURN: float = 0.30
 _PHASE_II_MIN_12M_ABS_RETURN: float = -0.30
-# Volatility-based 12M expansion ceiling. Higher vol -> wider forecast band
 _PHASE_II_VOL_BAND_FACTOR: float = 0.5
 _PHASE_II_CONF_MIN: float = 0.30
 _PHASE_II_CONF_MAX: float = 0.85
 
 
 def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
-    """
-    v5.65.0 PHASE-II: Generate per-symbol forecast prices, ROIs, and confidence.
-    Overrides the v5.47.2 hardcoded fallback values with data-driven estimates.
-    """
     if not isinstance(row, dict):
         return
 
     cp = _as_float(row.get("current_price"))
     if cp is None or cp <= 0:
-        return  # can't forecast without a current price
+        return
 
     intrinsic = _as_float(row.get("intrinsic_value"))
     momentum = _as_float(row.get("momentum_score"))
@@ -1382,73 +1217,51 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     rsi = _as_float(row.get("rsi_14"))
     risk_bucket = _safe_str(row.get("risk_bucket")).upper()
 
-    # ----------------------------------------------------------------
-    # 1) Build 12M expected return (annualized) as weighted blend
-    # ----------------------------------------------------------------
-    components: List[Tuple[float, float]] = []  # list of (return_pct, weight)
+    components: List[Tuple[float, float]] = []
 
-    # (a) Mean reversion to intrinsic value (40% weight if available)
     if intrinsic is not None and intrinsic > 0:
         reversion_return = (intrinsic - cp) / cp
-        # Don't fully revert in 12M; assume 60% of the gap closes
         reversion_return *= 0.6
         components.append((reversion_return, 0.40))
 
-    # (b) Trend extrapolation from momentum_score (30% weight if available)
-    # Momentum 50 = neutral, 100 = max bullish, 0 = max bearish
-    # Map to annual return: 50->0%, 100->+15%, 0->-15%
     if momentum is not None:
         trend_return = ((momentum - 50.0) / 50.0) * 0.15
         components.append((trend_return, 0.30))
 
-    # (c) Quality/value/growth composite (20% weight if available)
-    # Each above-average sub-score contributes to expected return
     fundamentals_signals: List[float] = []
     for sub in (quality, value, growth):
         if sub is not None:
             fundamentals_signals.append((sub - 50.0) / 50.0)
     if fundamentals_signals:
         avg_fund = sum(fundamentals_signals) / len(fundamentals_signals)
-        fund_return = avg_fund * 0.10  # max +/- 10% from fundamentals
+        fund_return = avg_fund * 0.10
         components.append((fund_return, 0.20))
 
-    # (d) Overall score baseline (10% weight - safety net)
     if overall is not None:
         baseline_return = ((overall - 50.0) / 50.0) * 0.08
         components.append((baseline_return, 0.10))
 
     if not components:
-        return  # nothing to forecast on
+        return
 
     total_weight = sum(w for _, w in components)
     if total_weight <= 0:
         return
     expected_12m_return = sum(r * w for r, w in components) / total_weight
 
-    # ----------------------------------------------------------------
-    # 2) Apply RSI mean-reversion adjustment (gentle pull-back if extreme)
-    # ----------------------------------------------------------------
     if rsi is not None:
         if rsi > 75:
-            expected_12m_return -= 0.03  # overbought - expect some pullback
+            expected_12m_return -= 0.03
         elif rsi > 70:
             expected_12m_return -= 0.015
         elif rsi < 25:
-            expected_12m_return += 0.03  # oversold - expect some rebound
+            expected_12m_return += 0.03
         elif rsi < 30:
             expected_12m_return += 0.015
 
-    # ----------------------------------------------------------------
-    # 3) Cap to +/- 30% (MODERATE setting)
-    # ----------------------------------------------------------------
     expected_12m_return = max(_PHASE_II_MIN_12M_ABS_RETURN,
                               min(_PHASE_II_MAX_12M_ABS_RETURN, expected_12m_return))
 
-    # ----------------------------------------------------------------
-    # 4) Compute forecast prices for each horizon
-    # ----------------------------------------------------------------
-    # 3M = ~35% of 12M move (sub-linear; markets don't move linearly)
-    # 1M = ~12% of 12M move
     expected_3m_return = expected_12m_return * 0.35
     expected_1m_return = expected_12m_return * 0.12
 
@@ -1456,7 +1269,6 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     forecast_3m = cp * (1.0 + expected_3m_return)
     forecast_1m = cp * (1.0 + expected_1m_return)
 
-    # Always override v5.47.2's generic forecast
     row["forecast_price_1m"] = round(forecast_1m, 4)
     row["forecast_price_3m"] = round(forecast_3m, 4)
     row["forecast_price_12m"] = round(forecast_12m, 4)
@@ -1464,13 +1276,8 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     row["expected_roi_3m"] = round(expected_3m_return, 6)
     row["expected_roi_12m"] = round(expected_12m_return, 6)
 
-    # ----------------------------------------------------------------
-    # 5) STRICT confidence scoring
-    # ----------------------------------------------------------------
-    conf = 0.50  # baseline
+    conf = 0.50
 
-    # (a) Data completeness bonus (+0.00 to +0.20)
-    # Check presence of 10 key fundamentals/risk fields
     completeness_fields = [
         "pe_ttm", "pb_ratio", "eps_ttm", "dividend_yield",
         "revenue_growth_yoy", "gross_margin", "operating_margin",
@@ -1480,17 +1287,13 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     completeness_ratio = present / len(completeness_fields)
     conf += completeness_ratio * 0.20
 
-    # (b) Score agreement bonus (+0.00 to +0.10)
-    # If all 4 sub-scores have similar values, signals are consistent
     sub_scores = [s for s in (quality, value, growth, momentum) if s is not None]
     if len(sub_scores) >= 3:
         mean_s = sum(sub_scores) / len(sub_scores)
         variance = sum((s - mean_s) ** 2 for s in sub_scores) / len(sub_scores)
-        # variance ranges 0-2500 in practice. Lower variance -> higher agreement
         agreement = max(0.0, 1.0 - (variance / 800.0))
         conf += agreement * 0.10
 
-    # (c) Risk penalty (-0.00 to -0.15)
     if risk_bucket == "HIGH":
         conf -= 0.10
     if vol_90d is not None and vol_90d > 0.50:
@@ -1498,11 +1301,9 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     elif vol_30d is not None and vol_30d > 0.45:
         conf -= 0.03
 
-    # (d) Forecast magnitude penalty: very large forecasts are less trustworthy
     if abs(expected_12m_return) > 0.25:
         conf -= 0.05
 
-    # Final clamp
     conf = max(_PHASE_II_CONF_MIN, min(_PHASE_II_CONF_MAX, conf))
 
     row["forecast_confidence"] = round(conf, 4)
@@ -1516,7 +1317,6 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
 
 
 def _pick_yahoo_callable(mod: Any, *names: str) -> Optional[Any]:
-    """v5.62.0 PHASE-Z: pick first available callable from a Yahoo module."""
     if mod is None:
         return None
     for n in names:
@@ -1527,7 +1327,6 @@ def _pick_yahoo_callable(mod: Any, *names: str) -> Optional[Any]:
 
 
 def _append_yahoo_warning_tag(row: Dict[str, Any], tag: str) -> None:
-    """v5.62.0 PHASE-Z: idempotent warning append (str or list compatible)."""
     if not tag:
         return
     existing = row.get("warnings")
@@ -1565,203 +1364,58 @@ class UnifiedQuote(BaseModel):
 # Canonical page contracts
 # =============================================================================
 INSTRUMENT_CANONICAL_KEYS: List[str] = [
-    "symbol",
-    "name",
-    "asset_class",
-    "exchange",
-    "currency",
-    "country",
-    "sector",
-    "industry",
-    "current_price",
-    "previous_close",
-    "open_price",
-    "day_high",
-    "day_low",
-    "week_52_high",
-    "week_52_low",
-    "price_change",
-    "percent_change",
-    "week_52_position_pct",
-    "volume",
-    "avg_volume_10d",
-    "avg_volume_30d",
-    "market_cap",
-    "float_shares",
-    "beta_5y",
-    "pe_ttm",
-    "pe_forward",
-    "eps_ttm",
-    "dividend_yield",
-    "payout_ratio",
-    "revenue_ttm",
-    "revenue_growth_yoy",
-    "gross_margin",
-    "operating_margin",
-    "profit_margin",
-    "debt_to_equity",
-    "free_cash_flow_ttm",
-    "rsi_14",
-    "volatility_30d",
-    "volatility_90d",
-    "max_drawdown_1y",
-    "var_95_1d",
-    "sharpe_1y",
-    "risk_score",
-    "risk_bucket",
-    "pb_ratio",
-    "ps_ratio",
-    "ev_ebitda",
-    "peg_ratio",
-    "intrinsic_value",
-    "upside_pct",
-    "valuation_score",
-    "forecast_price_1m",
-    "forecast_price_3m",
-    "forecast_price_12m",
-    "expected_roi_1m",
-    "expected_roi_3m",
-    "expected_roi_12m",
-    "forecast_confidence",
-    "confidence_score",
-    "confidence_bucket",
-    "value_score",
-    "quality_score",
-    "momentum_score",
-    "growth_score",
-    "overall_score",
-    "opportunity_score",
-    "rank_overall",
-    "fundamental_view",
-    "technical_view",
-    "risk_view",
-    "value_view",
-    "recommendation",
-    "recommendation_reason",
-    "horizon_days",
-    "invest_period_label",
-    "position_qty",
-    "avg_cost",
-    "position_cost",
-    "position_value",
-    "unrealized_pl",
-    "unrealized_pl_pct",
-    "data_provider",
-    "last_updated_utc",
-    "last_updated_riyadh",
-    "warnings",
-    "sector_relative_score",
-    "conviction_score",
-    "top_factors",
-    "top_risks",
-    "position_size_hint",
-    "recommendation_detailed",
-    "recommendation_priority",
-    "candlestick_pattern",
-    "candlestick_signal",
-    "candlestick_strength",
-    "candlestick_confidence",
-    "candlestick_patterns_recent",
+    "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
+    "current_price", "previous_close", "open_price", "day_high", "day_low",
+    "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
+    "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y",
+    "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio",
+    "revenue_ttm", "revenue_growth_yoy", "gross_margin", "operating_margin", "profit_margin",
+    "debt_to_equity", "free_cash_flow_ttm",
+    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
+    "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value",
+    "upside_pct", "valuation_score",
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+    "forecast_confidence", "confidence_score", "confidence_bucket",
+    "value_score", "quality_score", "momentum_score", "growth_score",
+    "overall_score", "opportunity_score", "rank_overall",
+    "fundamental_view", "technical_view", "risk_view", "value_view",
+    "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
+    "position_qty", "avg_cost", "position_cost", "position_value",
+    "unrealized_pl", "unrealized_pl_pct",
+    "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    "sector_relative_score", "conviction_score", "top_factors", "top_risks",
+    "position_size_hint", "recommendation_detailed", "recommendation_priority",
+    "candlestick_pattern", "candlestick_signal", "candlestick_strength",
+    "candlestick_confidence", "candlestick_patterns_recent",
 ]
 
 INSTRUMENT_CANONICAL_HEADERS: List[str] = [
-    "Symbol",
-    "Name",
-    "Asset Class",
-    "Exchange",
-    "Currency",
-    "Country",
-    "Sector",
-    "Industry",
-    "Current Price",
-    "Previous Close",
-    "Open",
-    "Day High",
-    "Day Low",
-    "52W High",
-    "52W Low",
-    "Price Change",
-    "Percent Change",
-    "52W Position %",
-    "Volume",
-    "Avg Volume 10D",
-    "Avg Volume 30D",
-    "Market Cap",
-    "Float Shares",
-    "Beta (5Y)",
-    "P/E (TTM)",
-    "P/E (Forward)",
-    "EPS (TTM)",
-    "Dividend Yield",
-    "Payout Ratio",
-    "Revenue (TTM)",
-    "Revenue Growth YoY",
-    "Gross Margin",
-    "Operating Margin",
-    "Profit Margin",
-    "Debt/Equity",
-    "Free Cash Flow (TTM)",
-    "RSI (14)",
-    "Volatility 30D",
-    "Volatility 90D",
-    "Max Drawdown 1Y",
-    "VaR 95% (1D)",
-    "Sharpe (1Y)",
-    "Risk Score",
-    "Risk Bucket",
-    "P/B",
-    "P/S",
-    "EV/EBITDA",
-    "PEG",
-    "Intrinsic Value",
-    "Upside %",
-    "Valuation Score",
-    "Forecast Price 1M",
-    "Forecast Price 3M",
-    "Forecast Price 12M",
-    "Expected ROI 1M",
-    "Expected ROI 3M",
-    "Expected ROI 12M",
-    "Forecast Confidence",
-    "Confidence Score",
-    "Confidence Bucket",
-    "Value Score",
-    "Quality Score",
-    "Momentum Score",
-    "Growth Score",
-    "Overall Score",
-    "Opportunity Score",
-    "Rank (Overall)",
-    "Fundamental View",
-    "Technical View",
-    "Risk View",
-    "Value View",
-    "Recommendation",
-    "Recommendation Reason",
-    "Horizon Days",
-    "Invest Period Label",
-    "Position Qty",
-    "Avg Cost",
-    "Position Cost",
-    "Position Value",
-    "Unrealized P/L",
-    "Unrealized P/L %",
-    "Data Provider",
-    "Last Updated (UTC)",
-    "Last Updated (Riyadh)",
-    "Warnings",
-    "Sector-Adj Score",
-    "Conviction Score",
-    "Top Factors",
-    "Top Risks",
-    "Position Size Hint",
-    "Recommendation Detail",
-    "Reco Priority",
-    "Candle Pattern",
-    "Candle Signal",
-    "Candle Strength",
-    "Candle Confidence",
-    "Recent Patterns (5D)",
+    "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
+    "Current Price", "Previous Close", "Open", "Day High", "Day Low",
+    "52W High", "52W Low", "Price Change", "Percent Change", "52W Position %",
+    "Volume", "Avg Volume 10D", "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)",
+    "P/E (TTM)", "P/E (Forward)", "EPS (TTM)", "Dividend Yield", "Payout Ratio",
+    "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin", "Operating Margin",
+    "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)",
+    "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y",
+    "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
+    "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
+    "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
+    "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
+    "Forecast Confidence", "Confidence Score", "Confidence Bucket",
+    "Value Score", "Quality Score", "Momentum Score", "Growth Score",
+    "Overall Score", "Opportunity Score", "Rank (Overall)",
+    "Fundamental View", "Technical View", "Risk View", "Value View",
+    "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
+    "Position Qty", "Avg Cost", "Position Cost", "Position Value",
+    "Unrealized P/L", "Unrealized P/L %",
+    "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
+    "Position Size Hint", "Recommendation Detail", "Reco Priority",
+    "Candle Pattern", "Candle Signal", "Candle Strength",
+    "Candle Confidence", "Recent Patterns (5D)",
 ]
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
@@ -1776,45 +1430,17 @@ TOP10_REQUIRED_HEADERS: Dict[str, str] = {
 }
 
 INSIGHTS_HEADERS: List[str] = [
-    "Section",
-    "Item",
-    "Metric",
-    "Value",
-    "Notes",
-    "Source",
-    "Sort Order",
+    "Section", "Item", "Metric", "Value", "Notes", "Source", "Sort Order",
 ]
 INSIGHTS_KEYS: List[str] = [
-    "section",
-    "item",
-    "metric",
-    "value",
-    "notes",
-    "source",
-    "sort_order",
+    "section", "item", "metric", "value", "notes", "source", "sort_order",
 ]
 
 DATA_DICTIONARY_HEADERS: List[str] = [
-    "Sheet",
-    "Group",
-    "Header",
-    "Key",
-    "DType",
-    "Format",
-    "Required",
-    "Source",
-    "Notes",
+    "Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes",
 ]
 DATA_DICTIONARY_KEYS: List[str] = [
-    "sheet",
-    "group",
-    "header",
-    "key",
-    "dtype",
-    "fmt",
-    "required",
-    "source",
-    "notes",
+    "sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes",
 ]
 
 STATIC_CANONICAL_SHEET_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
@@ -1833,23 +1459,14 @@ STATIC_CANONICAL_SHEET_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
 }
 
 INSTRUMENT_SHEETS: Set[str] = {
-    "Market_Leaders",
-    "Global_Markets",
-    "Commodities_FX",
-    "Mutual_Funds",
-    "My_Portfolio",
-    "My_Investments",
-    "Top_10_Investments",
+    "Market_Leaders", "Global_Markets", "Commodities_FX",
+    "Mutual_Funds", "My_Portfolio", "My_Investments", "Top_10_Investments",
 }
 SPECIAL_SHEETS: Set[str] = {"Insights_Analysis", "Data_Dictionary"}
 
 TOP10_ENGINE_DEFAULT_PAGES: List[str] = [
-    "Market_Leaders",
-    "Global_Markets",
-    "Commodities_FX",
-    "Mutual_Funds",
-    "My_Portfolio",
-    "My_Investments",
+    "Market_Leaders", "Global_Markets", "Commodities_FX",
+    "Mutual_Funds", "My_Portfolio", "My_Investments",
 ]
 
 EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
@@ -2128,17 +1745,8 @@ def _extract_requested_symbols_from_body(body: Optional[Dict[str, Any]], limit: 
         return []
     raw: List[str] = []
     for key in (
-        "symbols",
-        "tickers",
-        "selected_symbols",
-        "direct_symbols",
-        "codes",
-        "watchlist",
-        "portfolio_symbols",
-        "symbol",
-        "ticker",
-        "code",
-        "requested_symbol",
+        "symbols", "tickers", "selected_symbols", "direct_symbols", "codes",
+        "watchlist", "portfolio_symbols", "symbol", "ticker", "code", "requested_symbol",
     ):
         raw.extend(_split_symbols(body.get(key)))
     criteria = body.get("criteria")
@@ -2362,7 +1970,6 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
         k = _safe_str(raw_keys[i]) if i < len(raw_keys) else ""
 
         if not h and not k:
-            # Drop fully blank pairs instead of fabricating ghost columns.
             continue
         if h and not k:
             k = _norm_key(h)
@@ -2526,12 +2133,6 @@ def _rows_from_matrix_payload(matrix: Any, cols: Sequence[Any]) -> List[Dict[str
 
 
 def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
-    """
-    Prefer explicit dict-row collections first:
-    row_objects / records / items / data / quotes
-    Then accept rows if they are dict rows.
-    Finally fall back to matrix + keys or to explicit single row dicts.
-    """
     if out is None:
         return []
 
@@ -2699,7 +2300,6 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "last_updated_utc": ("last_updated_utc", "lastUpdated", "updatedAt", "timestamp", "asOf"),
     "last_updated_riyadh": ("last_updated_riyadh",),
     "warnings": ("warnings", "warning", "messages", "errors"),
-    # v5.64.0 FIX-HH: v5.50.0-v5.61.0 derived fields
     "sector_relative_score": ("sector_relative_score", "sectorAdjustedScore", "sectorAdjScore", "sector_adj_score", "sectorRelativeScore"),
     "conviction_score": ("conviction_score", "convictionScore", "conviction"),
     "top_factors": ("top_factors", "topFactors", "positives", "factors"),
@@ -2744,6 +2344,115 @@ _COMMODITY_INDUSTRY_HINTS: Dict[str, str] = {
     "CL=F": "Energy",
     "NG=F": "Energy",
 }
+
+
+# =============================================================================
+# v5.67.0 — Suffix → locale map (international exchange/currency/country)
+# =============================================================================
+# Pre-v5.67.0, the three `_infer_*_from_symbol` helpers defaulted every
+# non-Saudi/non-FX/non-Futures ticker to NASDAQ/USD/USA. The May 2026 audit
+# showed 51/57 rows with .HK / .L / .NS / .SA / .TO / .XETRA / .DE tickers
+# all stamped as US listings. This map fixes that. Format:
+# {suffix: (exchange_display, currency_code, country)}
+#
+# Note: .SA is Brazil (Yahoo convention); Saudi Arabia uses .SR. GBp (pence)
+# is intentionally lowercase 'p' — LSE quotes most equities in pence, not pounds.
+_SUFFIX_TO_LOCALE: Dict[str, Tuple[str, str, str]] = {
+    ".HK":    ("HKEX", "HKD", "Hong Kong"),
+    ".L":     ("LSE", "GBp", "United Kingdom"),
+    ".LON":   ("LSE", "GBp", "United Kingdom"),
+    ".CO":    ("Copenhagen", "DKK", "Denmark"),
+    ".NS":    ("NSE", "INR", "India"),
+    ".BO":    ("BSE", "INR", "India"),
+    ".SA":    ("B3", "BRL", "Brazil"),
+    ".SR":    ("Tadawul", "SAR", "Saudi Arabia"),
+    ".SAU":   ("Tadawul", "SAR", "Saudi Arabia"),
+    ".TADAWUL": ("Tadawul", "SAR", "Saudi Arabia"),
+    ".KSE":   ("Tadawul", "SAR", "Saudi Arabia"),
+    ".TO":    ("TSX", "CAD", "Canada"),
+    ".V":     ("TSX Venture", "CAD", "Canada"),
+    ".CN":    ("CSE", "CAD", "Canada"),
+    ".NE":    ("NEO Exchange", "CAD", "Canada"),
+    ".XETRA": ("XETRA", "EUR", "Germany"),
+    ".XETR":  ("XETRA", "EUR", "Germany"),
+    ".DE":    ("XETRA", "EUR", "Germany"),
+    ".F":     ("Frankfurt", "EUR", "Germany"),
+    ".HM":    ("Hamburg", "EUR", "Germany"),
+    ".MU":    ("Munich", "EUR", "Germany"),
+    ".PA":    ("Euronext Paris", "EUR", "France"),
+    ".PAR":   ("Euronext Paris", "EUR", "France"),
+    ".AS":    ("Euronext Amsterdam", "EUR", "Netherlands"),
+    ".AMS":   ("Euronext Amsterdam", "EUR", "Netherlands"),
+    ".MI":    ("Borsa Italiana", "EUR", "Italy"),
+    ".MIL":   ("Borsa Italiana", "EUR", "Italy"),
+    ".MC":    ("BME", "EUR", "Spain"),
+    ".MAD":   ("BME", "EUR", "Spain"),
+    ".BR":    ("Euronext Brussels", "EUR", "Belgium"),
+    ".BRU":   ("Euronext Brussels", "EUR", "Belgium"),
+    ".LS":    ("Euronext Lisbon", "EUR", "Portugal"),
+    ".HE":    ("Helsinki", "EUR", "Finland"),
+    ".HEL":   ("Helsinki", "EUR", "Finland"),
+    ".IR":    ("Euronext Dublin", "EUR", "Ireland"),
+    ".ST":    ("Stockholm", "SEK", "Sweden"),
+    ".STO":   ("Stockholm", "SEK", "Sweden"),
+    ".OL":    ("Oslo", "NOK", "Norway"),
+    ".OSL":   ("Oslo", "NOK", "Norway"),
+    ".SW":    ("SIX", "CHF", "Switzerland"),
+    ".SWX":   ("SIX", "CHF", "Switzerland"),
+    ".VI":    ("Vienna", "EUR", "Austria"),
+    ".VIE":   ("Vienna", "EUR", "Austria"),
+    ".WA":    ("Warsaw", "PLN", "Poland"),
+    ".WAR":   ("Warsaw", "PLN", "Poland"),
+    ".AX":    ("ASX", "AUD", "Australia"),
+    ".NZ":    ("NZX", "NZD", "New Zealand"),
+    ".T":     ("TSE", "JPY", "Japan"),
+    ".TYO":   ("TSE", "JPY", "Japan"),
+    ".KS":    ("KRX", "KRW", "South Korea"),
+    ".KQ":    ("KOSDAQ", "KRW", "South Korea"),
+    ".SI":    ("SGX", "SGD", "Singapore"),
+    ".KL":    ("Bursa Malaysia", "MYR", "Malaysia"),
+    ".BK":    ("SET", "THB", "Thailand"),
+    ".JK":    ("IDX", "IDR", "Indonesia"),
+    ".SS":    ("Shanghai", "CNY", "China"),
+    ".SZ":    ("Shenzhen", "CNY", "China"),
+    ".TW":    ("TWSE", "TWD", "Taiwan"),
+    ".TWO":   ("TPEx", "TWD", "Taiwan"),
+    ".MX":    ("BMV", "MXN", "Mexico"),
+    ".BA":    ("BCBA", "ARS", "Argentina"),
+    ".JO":    ("JSE", "ZAR", "South Africa"),
+    ".US":    ("NASDAQ/NYSE", "USD", "USA"),
+}
+
+# v5.67.0: tokens that indicate the displayed `country` field is a stale
+# US default and is eligible to be overwritten by suffix derivation.
+_US_COUNTRY_TOKENS: Set[str] = {
+    "", "USA", "US", "U.S.", "U.S.A.", "UNITED STATES", "UNITED STATES OF AMERICA",
+}
+
+# v5.67.0: percent_change is now stored as a FRACTION. Daily moves above
+# 0.50 (50%) are extremely rare and almost always indicate a unit error.
+_PERCENT_CHANGE_DAILY_MAX_ABS_FRACTION: float = 0.50
+
+
+def _suffix_locale_for(symbol: str) -> Optional[Tuple[str, str, str]]:
+    """
+    v5.67.0: Look up (exchange, currency, country) by symbol suffix.
+    Returns None if no recognized suffix. Longest-match wins (e.g. .TADAWUL
+    beats .T) so multi-character suffixes are not shadowed by single-character
+    prefixes.
+    """
+    s = normalize_symbol(symbol)
+    if not s or "." not in s:
+        return None
+    best_suffix: Optional[str] = None
+    s_upper = s.upper()
+    for suffix in _SUFFIX_TO_LOCALE:
+        if s_upper.endswith(suffix):
+            if best_suffix is None or len(suffix) > len(best_suffix):
+                best_suffix = suffix
+    if best_suffix is None:
+        return None
+    return _SUFFIX_TO_LOCALE[best_suffix]
 
 
 def _is_blank_value(value: Any) -> bool:
@@ -2842,8 +2551,14 @@ def _infer_asset_class_from_symbol(symbol: str) -> str:
 
 
 def _infer_exchange_from_symbol(symbol: str) -> str:
+    """v5.67.0: consult _SUFFIX_TO_LOCALE first to avoid mislabeling foreign tickers."""
     s = normalize_symbol(symbol)
-    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
+    if not s:
+        return ""
+    locale = _suffix_locale_for(s)
+    if locale is not None:
+        return locale[0]
+    if re.match(r"^[0-9]{4}$", s):
         return "Tadawul"
     if s.endswith("=X"):
         return "FX"
@@ -2853,8 +2568,14 @@ def _infer_exchange_from_symbol(symbol: str) -> str:
 
 
 def _infer_currency_from_symbol(symbol: str) -> str:
+    """v5.67.0: consult _SUFFIX_TO_LOCALE first."""
     s = normalize_symbol(symbol)
-    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
+    if not s:
+        return ""
+    locale = _suffix_locale_for(s)
+    if locale is not None:
+        return locale[1]
+    if re.match(r"^[0-9]{4}$", s):
         return "SAR"
     if s.endswith("=X"):
         pair = s[:-2]
@@ -2869,8 +2590,14 @@ def _infer_currency_from_symbol(symbol: str) -> str:
 
 
 def _infer_country_from_symbol(symbol: str) -> str:
+    """v5.67.0: consult _SUFFIX_TO_LOCALE first."""
     s = normalize_symbol(symbol)
-    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
+    if not s:
+        return ""
+    locale = _suffix_locale_for(s)
+    if locale is not None:
+        return locale[2]
+    if re.match(r"^[0-9]{4}$", s):
         return "Saudi Arabia"
     if s.endswith("=X") or s.endswith("=F"):
         return "Global"
@@ -3011,6 +2738,23 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if not out.get("industry"):
         out["industry"] = _infer_industry_from_symbol(inferred_symbol)
 
+    # v5.67.0: Repair stale US defaults on foreign-suffix tickers. Pre-v5.67.0,
+    # when EODHD/Finnhub returned a partial row with Country=USA / Exchange=NASDAQ
+    # for a .HK / .L / .NS ticker, the `if not out.get(...)` checks above
+    # respected the bad value because the field WAS populated (just with the
+    # wrong content). This block detects that case and overrides.
+    locale = _suffix_locale_for(inferred_symbol)
+    if locale is not None and locale[2] != "USA":
+        derived_exch, derived_curr, derived_country = locale
+        if _safe_str(out.get("country")).upper() in _US_COUNTRY_TOKENS:
+            out["country"] = derived_country
+        current_exch_upper = _safe_str(out.get("exchange")).upper()
+        if (not current_exch_upper) or "NASDAQ" in current_exch_upper or "NYSE" in current_exch_upper:
+            out["exchange"] = derived_exch
+        current_curr_upper = _safe_str(out.get("currency")).upper()
+        if (not current_curr_upper) or current_curr_upper == "USD":
+            out["currency"] = derived_curr
+
     if provider and not out.get("data_provider"):
         out["data_provider"] = provider
 
@@ -3037,32 +2781,34 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if change is None and price is not None and prev is not None:
         change = price - prev
         out["price_change"] = round(change, 6)
+
+    # v5.67.0: emit percent_change as FRACTION (was POINTS pre-v5.67.0).
+    # 04_Format.gs v2.7.0 expects FRACTION via `_KNOWN_FRACTION_PERCENT_COLUMNS_`
+    # and applies "0.00%" format which multiplies by 100 for display. Pre-v5.67.0
+    # the engine stored POINTS, causing the formatter to display 100× too large.
     if pct is None and price is not None and prev not in (None, 0):
-        pct = ((price - prev) / prev) * 100.0
-        out["percent_change"] = round(pct, 6)
-    elif pct is not None and abs(pct) <= 1.5:
-        # v5.64.0 FIX-FF: Skip x100 multiplication if Phase 2 already sanitized,
-        # OR if price/previous_close arithmetic confirms the value is already in
-        # percent points (and not a fraction needing conversion). This prevents
-        # the double-multiplication bug where AAPL's 0.7243 became 72.43.
-        warnings_str = _safe_str(out.get("warnings")).lower()
-        already_sanitized = (
-            "percent_change_recomputed" in warnings_str
-            or "percent_change_clamped_from_provider" in warnings_str
-            or "percent_change_suspect_dropped" in warnings_str
-        )
-        # Cross-check: if price and prev are available, compute the "true" pct
-        # and see whether the stored value matches percent-points or fraction.
-        looks_like_percent_points = False
+        # No incoming value — compute as fraction directly
+        pct = (price - prev) / prev
+        out["percent_change"] = round(pct, 8)
+    elif pct is not None:
+        # Provider sent a value. Determine whether it's already a fraction or
+        # in points form, using a ground-truth comparison when prices are available.
         if price is not None and prev not in (None, 0):
-            true_pct_points = ((price - prev) / prev) * 100.0
-            # If stored value is close to true_pct_points, it's already in percent points
-            if abs(pct - true_pct_points) < abs(pct * 100.0 - true_pct_points):
-                looks_like_percent_points = True
-        if already_sanitized or looks_like_percent_points:
-            out["percent_change"] = round(pct, 6)  # keep as-is
+            true_fraction = (price - prev) / prev
+            err_as_fraction = abs(pct - true_fraction)
+            err_as_points = abs(pct - true_fraction * 100.0)
+            if err_as_points < err_as_fraction:
+                # stored value is in points form; convert to fraction
+                out["percent_change"] = round(pct / 100.0, 8)
+            else:
+                # stored value is already in fraction form
+                out["percent_change"] = round(pct, 8)
         else:
-            out["percent_change"] = round(pct * 100.0, 6)
+            # No price/prev for ground truth — use magnitude heuristic
+            if abs(pct) > 1.5:
+                out["percent_change"] = round(pct / 100.0, 8)
+            else:
+                out["percent_change"] = round(pct, 8)
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
@@ -3286,15 +3032,18 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
 
     if row.get("risk_score") is None:
         vol = _as_pct_points(row.get("volatility_90d"))
+        # v5.67.0: max_drawdown_1y now stored as SIGNED FRACTION (e.g. -0.338).
+        # _as_pct_points converts to signed points (-33.8). Use abs() so risk
+        # contribution doesn't zero out via max(x, 0) on negative values.
         drawdown = _as_pct_points(row.get("max_drawdown_1y"))
         var95 = _as_pct_points(row.get("var_95_1d"))
         risk_score = 30.0
         if vol is not None:
             risk_score += min(max(vol, 0.0), 35.0)
         if drawdown is not None:
-            risk_score += min(max(drawdown, 0.0), 20.0) * 0.6
+            risk_score += min(abs(drawdown), 20.0) * 0.6
         if var95 is not None:
-            risk_score += min(max(var95, 0.0), 12.0)
+            risk_score += min(abs(var95), 12.0)
         if beta is not None:
             risk_score += min(max(beta * 8.0, 0.0), 15.0)
         row["risk_score"] = round(_clamp(float(risk_score), 0.0, 100.0), 2)
@@ -4600,8 +4349,6 @@ class DataEngineV5:
                 providers = [p for p in providers if p != primary_provider]
             providers.insert(0, primary_provider)
 
-        # Preserve paid EODHD priority for configured non-KSA/global pages even
-        # when settings or env put another global provider first.
         if (not is_ksa_sym) and page_ctx and page_ctx in self.page_primary_providers and _provider_allowed("eodhd"):
             providers = [p for p in providers if p != "eodhd"]
             providers.insert(0, "eodhd")
@@ -4678,7 +4425,6 @@ class DataEngineV5:
                     })
             return out
         if isinstance(result, dict):
-            # Yahoo chart-style payloads
             if isinstance(result.get("chart"), Mapping):
                 chart = result.get("chart") or {}
                 nested = self._coerce_history_rows(chart.get("result"))
@@ -4713,7 +4459,6 @@ class DataEngineV5:
                     if rows:
                         return rows
 
-            # Generic parallel-array payloads
             if any(isinstance(result.get(k), list) for k in ("close", "open", "high", "low", "volume")):
                 ts = result.get("timestamp") or list(range(len(result.get("close") or result.get("price") or [])))
                 rows = self._rows_from_parallel_series(
@@ -4728,7 +4473,6 @@ class DataEngineV5:
                 if rows:
                     return rows
 
-            # AlphaVantage-style keyed time series
             for key in ("Time Series (Daily)", "time_series", "series"):
                 series = result.get(key)
                 if isinstance(series, Mapping):
@@ -4801,8 +4545,7 @@ class DataEngineV5:
                 volumes.append(vol)
             if opn is not None:
                 opens.append(opn)
-        # v5.66.0 PHASE-JJ: Detect candlestick patterns from raw OHLC bars
-        # This piggybacks on the existing history fetch — no extra network call.
+        # v5.66.0 PHASE-JJ: Detect candlestick patterns from raw OHLC bars.
         candle_fields: Dict[str, Any] = {}
         try:
             candle_fields = detect_candlestick_patterns(rows or [])
@@ -4812,7 +4555,6 @@ class DataEngineV5:
                 __version__, cs_err.__class__.__name__, cs_err,
             )
         if len(closes) < 2:
-            # Return candlestick fields even when stats can't be computed
             return candle_fields if candle_fields else {}
         returns = []
         for prev, cur in zip(closes[:-1], closes[1:]):
@@ -4855,6 +4597,10 @@ class DataEngineV5:
             if peak > 0:
                 dd = (price / peak) - 1.0
                 max_dd = min(max_dd, dd)
+        # v5.67.0 PATCH 8: emit max_drawdown_1y / var_95_1d / percent_change as
+        # FRACTION (was POINTS pre-v5.67.0). max_drawdown_1y keeps its SIGN
+        # (negative) — abs() removed so the formatter "0.00%" + signed-fraction
+        # displays correctly (e.g. -33.8% for max_dd = -0.338).
         patch: Dict[str, Any] = {
             "current_price": closes[-1],
             "previous_close": closes[-2],
@@ -4867,12 +4613,12 @@ class DataEngineV5:
             "avg_volume_30d": self._safe_mean(volumes[-30:]) if volumes else None,
             "volatility_30d": vol30,
             "volatility_90d": vol90,
-            "max_drawdown_1y": abs(max_dd) * 100.0,
-            "var_95_1d": var95 * 100.0 if var95 is not None else None,
+            "max_drawdown_1y": max_dd,
+            "var_95_1d": var95 if var95 is not None else None,
             "sharpe_1y": sharpe,
             "rsi_14": rsi,
             "price_change": closes[-1] - closes[-2],
-            "percent_change": ((closes[-1] - closes[-2]) / closes[-2]) * 100.0 if closes[-2] not in (None, 0) else None,
+            "percent_change": ((closes[-1] - closes[-2]) / closes[-2]) if closes[-2] not in (None, 0) else None,
             "volume": volumes[-1] if volumes else None,
         }
         if patch.get("current_price") is not None and patch.get("week_52_high") is not None and patch.get("week_52_low") is not None:
@@ -4881,18 +4627,12 @@ class DataEngineV5:
             cp = _as_float(patch.get("current_price"))
             if hi is not None and lo is not None and cp is not None and hi > lo:
                 patch["week_52_position_pct"] = ((cp - lo) / (hi - lo)) * 100.0
-        # v5.66.0 PHASE-JJ: merge candlestick fields into patch
-        # candle_fields was computed above on the raw rows
         result_patch = {k: v for k, v in patch.items() if v is not None}
         if candle_fields:
             for k, v in candle_fields.items():
-                # Only include non-empty candle fields so blanks don't override
-                # a more confident detection from a different code path.
                 if v not in (None, "", 0.0):
                     result_patch[k] = v
                 elif k not in result_patch:
-                    # If patch doesn't already have this key, set the empty
-                    # default so downstream knows the candle module ran.
                     result_patch[k] = v
         return result_patch
 
@@ -4902,25 +4642,10 @@ class DataEngineV5:
             return {}
         callables = []
         for name in (
-            "get_history",
-            "fetch_history",
-            "get_price_history",
-            "fetch_price_history",
-            "history",
-            "get_chart",
-            "fetch_chart",
-            "get_chart_history",
-            "fetch_chart_history",
-            "get_historical_data",
-            "fetch_historical_data",
-            "get_history_rows",
-            "fetch_history_rows",
-            "get_timeseries",
-            "fetch_timeseries",
-            "get_series",
-            "fetch_series",
-            "get_ohlcv",
-            "fetch_ohlcv",
+            "get_history", "fetch_history", "get_price_history", "fetch_price_history", "history",
+            "get_chart", "fetch_chart", "get_chart_history", "fetch_chart_history",
+            "get_historical_data", "fetch_historical_data", "get_history_rows", "fetch_history_rows",
+            "get_timeseries", "fetch_timeseries", "get_series", "fetch_series", "get_ohlcv", "fetch_ohlcv",
         ):
             fn = getattr(module, name, None)
             if callable(fn):
@@ -5017,58 +4742,31 @@ class DataEngineV5:
         merged = _canonicalize_provider_row(merged, requested_symbol=requested_symbol, normalized_symbol=norm, provider=_safe_str((merged.get("data_sources") or [""])[0] if isinstance(merged.get("data_sources"), list) else ""))
         return merged
 
-
     def _data_quality(self, row: Dict[str, Any]) -> str:
         if _as_float(row.get("current_price")) is None:
             return QuoteQuality.MISSING.value
         return QuoteQuality.GOOD.value if any(row.get(k) is not None for k in ("overall_score", "forecast_price_3m", "pb_ratio")) else QuoteQuality.FAIR.value
 
-    # =========================================================================
+    # =================================================================
     # v5.62.0 PHASE-Z — Yahoo enrichment pass
-    # =========================================================================
-    # After the main provider chain runs, check whether industry/sector are
-    # still missing/Unknown OR any of the Yahoo-source risk metrics are
-    # absent. If so, call yahoo_chart and yahoo_fundamentals directly to
-    # fill the blanks. Fixes the silent-data-loss bug where EODHD's partial
-    # response was treated as authoritative because the chain's name-based
-    # "yahoo" entry never resolved to the actual yahoo_chart_provider /
-    # yahoo_fundamentals_provider modules.
-
+    # =================================================================
     async def _fetch_yahoo_fundamentals_patch(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        v5.62.0 PHASE-Z: Directly invoke yahoo_fundamentals_provider
-        (bypassing the name-based provider registry which can't resolve
-        the "yahoo" name to this module).
-        v5.63.0 PHASE-AA: Normalize symbol for Yahoo (strip .US, remap .XETRA, etc).
-        """
         mod = _import_yahoo_provider_module("yahoo_fundamentals_provider")
         if mod is None:
-            logger.debug(
-                "[engine_v2 v%s] PHASE-Z fundamentals: module not importable",
-                __version__,
-            )
+            logger.debug("[engine_v2 v%s] PHASE-Z fundamentals: module not importable", __version__)
             return None
 
-        # v5.63.0 PHASE-AA: convert symbol to Yahoo-compatible form
         yahoo_symbol = _yahoo_symbol_for(symbol)
         if not yahoo_symbol:
             return None
 
         fn = _pick_yahoo_callable(
             mod,
-            "get_quote_patch",
-            "fetch_fundamentals_patch",
-            "fetch_enriched_quote_patch",
-            "fetch_quote",
-            "get_quote",
-            "quote",
-            "enriched_quote",
+            "get_quote_patch", "fetch_fundamentals_patch", "fetch_enriched_quote_patch",
+            "fetch_quote", "get_quote", "quote", "enriched_quote",
         )
         if fn is None:
-            logger.debug(
-                "[engine_v2 v%s] PHASE-Z fundamentals: no compatible callable",
-                __version__,
-            )
+            logger.debug("[engine_v2 v%s] PHASE-Z fundamentals: no compatible callable", __version__)
             return None
 
         try:
@@ -5089,7 +4787,6 @@ class DataEngineV5:
             return None
         if isinstance(patch, dict):
             return dict(patch)
-        # try to coerce via model_dump if it's a pydantic-like object
         try:
             if hasattr(patch, "model_dump"):
                 d = patch.model_dump(mode="python")
@@ -5100,33 +4797,18 @@ class DataEngineV5:
         return None
 
     async def _fetch_yahoo_chart_patch(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        v5.62.0 PHASE-Z: Directly invoke yahoo_chart_provider to compute
-        risk metrics (rsi_14, volatility_30d/90d, max_drawdown_1y,
-        var_95_1d, sharpe_1y) plus 52W bounds and avg volumes.
-        v5.63.0 PHASE-AA: Normalize symbol for Yahoo (strip .US, remap .XETRA, etc).
-        """
         mod = _import_yahoo_provider_module("yahoo_chart_provider")
         if mod is None:
-            logger.debug(
-                "[engine_v2 v%s] PHASE-Z chart: module not importable",
-                __version__,
-            )
+            logger.debug("[engine_v2 v%s] PHASE-Z chart: module not importable", __version__)
             return None
 
-        # v5.63.0 PHASE-AA: convert symbol to Yahoo-compatible form
         yahoo_symbol = _yahoo_symbol_for(symbol)
         if not yahoo_symbol:
             return None
 
-        # Try the patch-style callable first.
         fn = _pick_yahoo_callable(
             mod,
-            "get_quote_patch",
-            "fetch_chart_patch",
-            "fetch_quote",
-            "get_quote",
-            "quote",
+            "get_quote_patch", "fetch_chart_patch", "fetch_quote", "get_quote", "quote",
         )
         patch: Optional[Dict[str, Any]] = None
         if fn is not None:
@@ -5153,7 +4835,6 @@ class DataEngineV5:
                     __version__, symbol, yahoo_symbol, exc.__class__.__name__, exc,
                 )
 
-        # If the patch is empty or missing risk metrics, try history rows.
         history_needs = (
             patch is None
             or not isinstance(patch, dict)
@@ -5164,11 +4845,7 @@ class DataEngineV5:
         if history_needs:
             hist_fn = _pick_yahoo_callable(
                 mod,
-                "get_history_rows",
-                "fetch_history_rows",
-                "get_rows",
-                "get_chart_rows",
-                "fetch_chart_rows",
+                "get_history_rows", "fetch_history_rows", "get_rows", "get_chart_rows", "fetch_chart_rows",
             )
             rows: List[Dict[str, Any]] = []
             if hist_fn is not None:
@@ -5214,18 +4891,8 @@ class DataEngineV5:
         normalized: str,
         requested: str,
     ) -> Dict[str, Any]:
-        """
-        v5.62.0 PHASE-Z: After the main provider chain runs, check
-        whether any Yahoo-source fields are missing in the merged row.
-        If so, call yahoo_fundamentals_provider and/or yahoo_chart_provider
-        directly and fill ONLY the blank fields.
-        """
         if not _yahoo_enrichment_enabled():
             return row
-
-        # v5.63.0 PHASE-CC: removed the early-return guard so Yahoo can
-        # rescue rows where the main provider chain returned nothing
-        # (e.g. MTX.XETRA when EODHD has no XETRA coverage).
 
         needs_fund, needs_chart = _row_needs_yahoo_enrichment(row)
         if not needs_fund and not needs_chart:
@@ -5240,7 +4907,6 @@ class DataEngineV5:
             "chart_filled_fields": [],
         }
 
-        # --- Yahoo fundamentals ---
         if needs_fund:
             diag["fundamentals_called"] = True
             fund_patch = await self._fetch_yahoo_fundamentals_patch(normalized)
@@ -5266,7 +4932,6 @@ class DataEngineV5:
                         + ("..." if len(filled) > 8 else ""),
                     )
 
-        # --- Yahoo chart (risk metrics) ---
         if needs_chart:
             diag["chart_called"] = True
             chart_patch = await self._fetch_yahoo_chart_patch(normalized)
@@ -5368,20 +5033,10 @@ class DataEngineV5:
             row = _apply_page_row_backfill(page_context or sheet or "", row)
 
         missing_history_fields = [
-            "current_price",
-            "previous_close",
-            "day_high",
-            "day_low",
-            "week_52_high",
-            "week_52_low",
-            "avg_volume_10d",
-            "avg_volume_30d",
-            "volatility_30d",
-            "volatility_90d",
-            "max_drawdown_1y",
-            "var_95_1d",
-            "sharpe_1y",
-            "rsi_14",
+            "current_price", "previous_close", "day_high", "day_low",
+            "week_52_high", "week_52_low", "avg_volume_10d", "avg_volume_30d",
+            "volatility_30d", "volatility_90d", "max_drawdown_1y",
+            "var_95_1d", "sharpe_1y", "rsi_14",
         ]
         if any(row.get(k) in (None, "", [], {}) for k in missing_history_fields):
             hist_patch = await self._get_history_patch_best_effort(norm, providers, page=page_context)
@@ -5393,36 +5048,20 @@ class DataEngineV5:
             row = _merge_missing_fields(row, cached_best_row)
             row = _apply_page_row_backfill(page_context or sheet or "", row)
 
-        # =================================================================
-        # v5.62.0 PHASE-Z: Yahoo enrichment pass
-        # =================================================================
-        # After EODHD + history fallback, check whether industry/sector or
-        # any Yahoo-source risk metrics are still missing. If so, call
-        # yahoo_chart and yahoo_fundamentals directly to fill the blanks.
-        # Fixes the silent-data-loss bug where the chain's "yahoo" entry
-        # never resolved to yahoo_chart_provider / yahoo_fundamentals_provider.
         try:
             row = await self._apply_yahoo_enrichment_pass(row, norm, _safe_str(symbol))
         except Exception as enrich_err:
             logger.debug(
                 "[engine_v2 v%s] PHASE-Z enrichment pass failed for %s: %s: %s",
-                __version__, norm,
-                enrich_err.__class__.__name__, enrich_err,
+                __version__, norm, enrich_err.__class__.__name__, enrich_err,
             )
 
-        # =================================================================
-        # v5.63.0 PHASE-BB: percent_change / 52W position sanity guards
-        # =================================================================
-        # Fixes bizarre values like "-744.05%" or "9,678.78%" from provider
-        # unit mismatches. Recomputes from current_price/previous_close,
-        # clamps to ±50% daily, and tags warnings on overrides.
         try:
             row = _apply_phase_bb_sanity(row)
         except Exception as bb_err:
             logger.debug(
                 "[engine_v2 v%s] PHASE-BB sanity guard failed for %s: %s: %s",
-                __version__, norm,
-                bb_err.__class__.__name__, bb_err,
+                __version__, norm, bb_err.__class__.__name__, bb_err,
             )
 
         if _as_float(row.get("current_price")) is not None and _safe_str(row.get("warnings")).lower() == "no live provider data available":
@@ -5433,22 +5072,12 @@ class DataEngineV5:
         _compute_scores_fallback(row)
         _compute_recommendation(row)
 
-        # =================================================================
-        # v5.63.0 PHASE-DD: Restored derived/synthesized columns
-        # =================================================================
-        # v5.64.0: Moved to AFTER _compute_scores_fallback + _compute_recommendation
-        # so that forecast_price_12m is available for intrinsic value blending,
-        # and so existing recommendation isn't overwritten.
-        # Fills: intrinsic value, upside %, fundamental/technical/risk/value views,
-        # 8-tier recommendation extras, top factors/risks, conviction score,
-        # position size hint, sector-adjusted score, market cap synthesis.
         try:
             row = _apply_phase_dd_enhancements(row)
         except Exception as dd_err:
             logger.debug(
                 "[engine_v2 v%s] PHASE-DD enhancement failed for %s: %s: %s",
-                __version__, norm,
-                dd_err.__class__.__name__, dd_err,
+                __version__, norm, dd_err.__class__.__name__, dd_err,
             )
 
         row["data_quality"] = self._data_quality(row)
@@ -5654,91 +5283,38 @@ class DataEngineV5:
                 risk_counts[bucket] += 1
 
         rows: List[Dict[str, Any]] = []
-        rows.append(
-            {
-                "section": "Market Summary",
-                "item": "Universe",
-                "metric": "Symbols Analyzed",
-                "value": total,
-                "notes": f"fallback summary from {len(symbols)} requested symbols",
-                "source": "engine_fallback",
-                "sort_order": 1,
-            }
-        )
-        rows.append(
-            {
-                "section": "Market Summary",
-                "item": "Universe",
-                "metric": "Average Overall Score",
-                "value": avg_overall,
-                "notes": "mean overall score across analyzed instruments",
-                "source": "engine_fallback",
-                "sort_order": 2,
-            }
-        )
-        rows.append(
-            {
-                "section": "Market Summary",
-                "item": "Universe",
-                "metric": "Average Expected ROI 3M",
-                "value": avg_roi_3m,
-                "notes": "fractional ROI where available",
-                "source": "engine_fallback",
-                "sort_order": 3,
-            }
-        )
+        rows.append({"section": "Market Summary", "item": "Universe", "metric": "Symbols Analyzed",
+                     "value": total, "notes": f"fallback summary from {len(symbols)} requested symbols",
+                     "source": "engine_fallback", "sort_order": 1})
+        rows.append({"section": "Market Summary", "item": "Universe", "metric": "Average Overall Score",
+                     "value": avg_overall, "notes": "mean overall score across analyzed instruments",
+                     "source": "engine_fallback", "sort_order": 2})
+        rows.append({"section": "Market Summary", "item": "Universe", "metric": "Average Expected ROI 3M",
+                     "value": avg_roi_3m, "notes": "fractional ROI where available",
+                     "source": "engine_fallback", "sort_order": 3})
 
         sort_order = 10
         for bucket in ("LOW", "MODERATE", "HIGH"):
-            rows.append(
-                {
-                    "section": "Risk Distribution",
-                    "item": bucket,
-                    "metric": "Count",
-                    "value": risk_counts[bucket],
-                    "notes": "fallback risk bucket summary",
-                    "source": "engine_fallback",
-                    "sort_order": sort_order,
-                }
-            )
+            rows.append({"section": "Risk Distribution", "item": bucket, "metric": "Count",
+                         "value": risk_counts[bucket], "notes": "fallback risk bucket summary",
+                         "source": "engine_fallback", "sort_order": sort_order})
             sort_order += 1
 
         top_quotes = quote_rows[: max(3, min(7, limit))]
         for idx, d in enumerate(top_quotes, start=1):
-            rows.append(
-                {
-                    "section": "Top Ideas",
-                    "item": d.get("symbol"),
-                    "metric": "Recommendation",
-                    "value": d.get("recommendation"),
-                    "notes": d.get("recommendation_reason") or f"overall={d.get('overall_score')} opportunity={d.get('opportunity_score')}",
-                    "source": "engine_fallback",
-                    "sort_order": 100 + idx,
-                }
-            )
-            rows.append(
-                {
-                    "section": "Top Ideas",
-                    "item": d.get("symbol"),
-                    "metric": "Expected ROI 3M",
-                    "value": d.get("expected_roi_3m"),
-                    "notes": f"confidence={d.get('confidence_score')} risk={d.get('risk_bucket')}",
-                    "source": "engine_fallback",
-                    "sort_order": 120 + idx,
-                }
-            )
+            rows.append({"section": "Top Ideas", "item": d.get("symbol"), "metric": "Recommendation",
+                         "value": d.get("recommendation"),
+                         "notes": d.get("recommendation_reason") or f"overall={d.get('overall_score')} opportunity={d.get('opportunity_score')}",
+                         "source": "engine_fallback", "sort_order": 100 + idx})
+            rows.append({"section": "Top Ideas", "item": d.get("symbol"), "metric": "Expected ROI 3M",
+                         "value": d.get("expected_roi_3m"),
+                         "notes": f"confidence={d.get('confidence_score')} risk={d.get('risk_bucket')}",
+                         "source": "engine_fallback", "sort_order": 120 + idx})
             if _as_float(d.get("position_value")) is not None or _as_float(d.get("unrealized_pl")) is not None:
-                rows.append(
-                    {
-                        "section": "Portfolio Signals",
-                        "item": d.get("symbol"),
-                        "metric": "Unrealized P/L",
-                        "value": d.get("unrealized_pl"),
-                        "notes": f"value={d.get('position_value')} cost={d.get('position_cost')}",
-                        "source": "engine_fallback",
-                        "sort_order": 140 + idx,
-                    }
-                )
+                rows.append({"section": "Portfolio Signals", "item": d.get("symbol"),
+                             "metric": "Unrealized P/L", "value": d.get("unrealized_pl"),
+                             "notes": f"value={d.get('position_value')} cost={d.get('position_cost')}",
+                             "source": "engine_fallback", "sort_order": 140 + idx})
 
         return rows[:limit]
 
@@ -5846,14 +5422,8 @@ class DataEngineV5:
     ) -> Dict[str, Any]:
         return await self.get_sheet_rows(
             page or sheet or sheet_name,
-            limit=limit,
-            offset=offset,
-            mode=mode,
-            body=body,
-            page=page,
-            sheet=sheet,
-            sheet_name=sheet_name,
-            **kwargs,
+            limit=limit, offset=offset, mode=mode, body=body,
+            page=page, sheet=sheet, sheet_name=sheet_name, **kwargs,
         )
 
     async def get_sheet(
@@ -5870,14 +5440,8 @@ class DataEngineV5:
     ) -> Dict[str, Any]:
         return await self.get_sheet_rows(
             sheet_name or sheet or page,
-            limit=limit,
-            offset=offset,
-            mode=mode,
-            body=body,
-            page=page,
-            sheet=sheet,
-            sheet_name=sheet_name,
-            **kwargs,
+            limit=limit, offset=offset, mode=mode, body=body,
+            page=page, sheet=sheet, sheet_name=sheet_name, **kwargs,
         )
 
     async def get_sheet_rows(
@@ -5893,14 +5457,8 @@ class DataEngineV5:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         target_sheet, limit, offset, mode, body, request_parts = _normalize_route_call_inputs(
-            page=page,
-            sheet=sheet,
-            sheet_name=sheet_name,
-            limit=limit,
-            offset=offset,
-            mode=mode,
-            body=body,
-            extras=kwargs,
+            page=page, sheet=sheet, sheet_name=sheet_name,
+            limit=limit, offset=offset, mode=mode, body=body, extras=kwargs,
         )
         include_matrix = _safe_bool(body.get("include_matrix"), True)
 
@@ -5919,86 +5477,43 @@ class DataEngineV5:
         contract_level = "canonical" if _usable_contract(headers, keys, target_sheet) else "partial"
         recovered_from: Optional[str] = None
 
-        # Data Dictionary
         if target_sheet == "Data_Dictionary":
             if _is_schema_only_body(body):
                 return self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=headers,
-                    keys=keys,
-                    row_objects=[],
-                    include_matrix=include_matrix,
-                    status="success",
-                    meta={
-                        "schema_source": schema_src,
-                        "contract_level": contract_level,
-                        "strict_requested": strict_req,
-                        "strict_enforced": False,
-                        "target_sheet_known": True,
-                        "builder": "schema_only_fast_path",
-                        "rows": 0,
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                    },
+                    sheet=target_sheet, headers=headers, keys=keys, row_objects=[],
+                    include_matrix=include_matrix, status="success",
+                    meta={"schema_source": schema_src, "contract_level": contract_level,
+                          "strict_requested": strict_req, "strict_enforced": False,
+                          "target_sheet_known": True, "builder": "schema_only_fast_path",
+                          "rows": 0, "limit": limit, "offset": offset, "mode": mode},
                 )
-
             rows_all = await self._build_data_dictionary_rows()
             rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows_all]
             payload_full = self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_proj,
-                include_matrix=include_matrix,
-                status="success",
-                meta={
-                    "schema_source": schema_src,
-                    "contract_level": contract_level,
-                    "strict_requested": strict_req,
-                    "strict_enforced": False,
-                    "target_sheet_known": True,
-                    "builder": "engine.internal_data_dictionary",
-                    "rows": len(rows_proj),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                },
+                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_proj,
+                include_matrix=include_matrix, status="success",
+                meta={"schema_source": schema_src, "contract_level": contract_level,
+                      "strict_requested": strict_req, "strict_enforced": False,
+                      "target_sheet_known": True, "builder": "engine.internal_data_dictionary",
+                      "rows": len(rows_proj), "limit": limit, "offset": offset, "mode": mode},
             )
             self._store_sheet_snapshot(target_sheet, payload_full)
             rows_page = rows_proj[offset : offset + limit]
             return self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_page,
-                include_matrix=include_matrix,
-                status="success",
+                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_page,
+                include_matrix=include_matrix, status="success",
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
-        # Insights Analysis
         if target_sheet == "Insights_Analysis":
             if _is_schema_only_body(body):
                 return self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=headers,
-                    keys=keys,
-                    row_objects=[],
-                    include_matrix=include_matrix,
-                    status="success",
-                    meta={
-                        "schema_source": schema_src,
-                        "contract_level": contract_level,
-                        "strict_requested": strict_req,
-                        "strict_enforced": False,
-                        "target_sheet_known": True,
-                        "builder": "schema_only_fast_path",
-                        "rows": 0,
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                    },
+                    sheet=target_sheet, headers=headers, keys=keys, row_objects=[],
+                    include_matrix=include_matrix, status="success",
+                    meta={"schema_source": schema_src, "contract_level": contract_level,
+                          "strict_requested": strict_req, "strict_enforced": False,
+                          "target_sheet_known": True, "builder": "schema_only_fast_path",
+                          "rows": 0, "limit": limit, "offset": offset, "mode": mode},
                 )
 
             rows0: List[Dict[str, Any]] = []
@@ -6009,11 +5524,8 @@ class DataEngineV5:
                 universes = body.get("universes") if isinstance(body.get("universes"), dict) else None
                 symbols = body.get("symbols") if isinstance(body.get("symbols"), list) else None
                 payload = await build_insights_analysis_rows(
-                    engine=self,
-                    criteria=crit,
-                    universes=universes,
-                    symbols=symbols,
-                    mode=mode or "",
+                    engine=self, criteria=crit, universes=universes,
+                    symbols=symbols, mode=mode or "",
                 )
                 rows0 = _coerce_rows_list(payload)
             except Exception as exc:
@@ -6026,62 +5538,34 @@ class DataEngineV5:
 
             rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
             payload_full = self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_proj,
+                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_proj,
                 include_matrix=include_matrix,
                 status="success" if rows_proj else "warn",
-                meta={
-                    "schema_source": schema_src,
-                    "contract_level": contract_level,
-                    "strict_requested": strict_req,
-                    "strict_enforced": False,
-                    "target_sheet_known": True,
-                    "builder": builder_name,
-                    "rows": len(rows_proj),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                },
+                meta={"schema_source": schema_src, "contract_level": contract_level,
+                      "strict_requested": strict_req, "strict_enforced": False,
+                      "target_sheet_known": True, "builder": builder_name,
+                      "rows": len(rows_proj), "limit": limit, "offset": offset, "mode": mode},
             )
             self._store_sheet_snapshot(target_sheet, payload_full)
             rows_page = rows_proj[offset : offset + limit]
             return self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_page,
-                include_matrix=include_matrix,
-                status=payload_full.get("status", "success"),
+                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_page,
+                include_matrix=include_matrix, status=payload_full.get("status", "success"),
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
-        # Top10
         if target_sheet == "Top_10_Investments":
             top10_body, route_warnings = _normalize_top10_body_for_engine(body, limit=max(1, min(limit, 50)))
             if _is_schema_only_body(top10_body):
                 headers, keys = _ensure_top10_contract(headers, keys)
                 return self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=headers,
-                    keys=keys,
-                    row_objects=[],
-                    include_matrix=include_matrix,
-                    status="success",
-                    meta={
-                        "schema_source": schema_src,
-                        "contract_level": contract_level,
-                        "strict_requested": strict_req,
-                        "strict_enforced": False,
-                        "target_sheet_known": True,
-                        "builder": "schema_only_fast_path",
-                        "rows": 0,
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                        "warnings": route_warnings,
-                    },
+                    sheet=target_sheet, headers=headers, keys=keys, row_objects=[],
+                    include_matrix=include_matrix, status="success",
+                    meta={"schema_source": schema_src, "contract_level": contract_level,
+                          "strict_requested": strict_req, "strict_enforced": False,
+                          "target_sheet_known": True, "builder": "schema_only_fast_path",
+                          "rows": 0, "limit": limit, "offset": offset, "mode": mode,
+                          "warnings": route_warnings},
                 )
 
             rows_proj: List[Dict[str, Any]] = []
@@ -6092,10 +5576,8 @@ class DataEngineV5:
                 from core.analysis.top10_selector import build_top10_rows  # type: ignore
                 criteria = top10_body.get("criteria") if isinstance(top10_body.get("criteria"), dict) else None
                 payload = await build_top10_rows(
-                    engine=self,
-                    settings=self.settings,
-                    criteria=criteria,
-                    body=dict(top10_body or {}),
+                    engine=self, settings=self.settings,
+                    criteria=criteria, body=dict(top10_body or {}),
                     limit=int(top10_body.get("limit") or top10_body.get("top_n") or min(limit, 10) or 10),
                     mode=mode or "",
                 )
@@ -6114,41 +5596,25 @@ class DataEngineV5:
                     status_out = "warn"
 
             payload_full = self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_proj,
+                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_proj,
                 include_matrix=include_matrix,
                 status=status_out if rows_proj else "warn",
-                meta={
-                    "schema_source": schema_src,
-                    "contract_level": contract_level,
-                    "strict_requested": strict_req,
-                    "strict_enforced": False,
-                    "target_sheet_known": True,
-                    "builder": builder_used,
-                    "rows": len(rows_proj),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                    "warnings": route_warnings,
-                },
+                meta={"schema_source": schema_src, "contract_level": contract_level,
+                      "strict_requested": strict_req, "strict_enforced": False,
+                      "target_sheet_known": True, "builder": builder_used,
+                      "rows": len(rows_proj), "limit": limit, "offset": offset, "mode": mode,
+                      "warnings": route_warnings},
             )
             if rows_proj:
                 self._store_sheet_snapshot(target_sheet, payload_full)
 
             rows_page = rows_proj[offset : offset + limit]
             return self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_page,
-                include_matrix=include_matrix,
-                status=payload_full.get("status", "warn"),
+                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_page,
+                include_matrix=include_matrix, status=payload_full.get("status", "warn"),
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
-        # Contract recovery for instrument pages
         if contract_level != "canonical":
             cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
             recovered = False
@@ -6188,10 +5654,8 @@ class DataEngineV5:
             schema_warning = "unknown_sheet_non_strict_mode"
 
         base_meta = {
-            "schema_source": schema_src,
-            "contract_level": contract_level,
-            "strict_requested": strict_req,
-            "strict_enforced": False,
+            "schema_source": schema_src, "contract_level": contract_level,
+            "strict_requested": strict_req, "strict_enforced": False,
             "target_sheet_known": target_sheet_known,
             "route_input_keys": sorted([str(k) for k in body.keys()]) if isinstance(body, dict) else [],
             "request_input_keys": sorted([str(k) for k in request_parts.keys()]) if isinstance(request_parts, dict) else [],
@@ -6203,13 +5667,10 @@ class DataEngineV5:
 
         if _is_schema_only_body(body):
             return self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                row_objects=[],
-                include_matrix=include_matrix,
-                status=final_status,
-                meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode, "built_from": "schema_only_fast_path"},
+                sheet=target_sheet, headers=headers, keys=keys, row_objects=[],
+                include_matrix=include_matrix, status=final_status,
+                meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode,
+                      "built_from": "schema_only_fast_path"},
             )
 
         requested_symbols = _extract_requested_symbols_from_body(body, limit=limit + offset)
@@ -6223,7 +5684,6 @@ class DataEngineV5:
         out_headers = list(headers)
         out_keys = list(keys)
 
-        # Prefer external rows reader when present
         if target_sheet in INSTRUMENT_SHEETS:
             ext_rows = await self._get_rows_from_external_reader(target_sheet, limit + offset)
             if ext_rows:
@@ -6258,33 +5718,19 @@ class DataEngineV5:
                 _apply_rank_overall(enriched_rows)
 
                 payload_full = self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=out_headers,
-                    keys=out_keys,
-                    row_objects=enriched_rows,
-                    include_matrix=include_matrix,
-                    status=final_status,
-                    meta={
-                        **base_meta,
-                        "rows": len(enriched_rows),
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                        "built_from": "external_rows_reader",
-                        "rows_reader_source": self._rows_reader_source,
-                        "symbols_reader_source": self._symbols_reader_source,
-                        "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
-                    },
+                    sheet=target_sheet, headers=out_headers, keys=out_keys,
+                    row_objects=enriched_rows, include_matrix=include_matrix, status=final_status,
+                    meta={**base_meta, "rows": len(enriched_rows), "limit": limit, "offset": offset, "mode": mode,
+                          "built_from": "external_rows_reader",
+                          "rows_reader_source": self._rows_reader_source,
+                          "symbols_reader_source": self._symbols_reader_source,
+                          "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)},
                 )
                 self._store_sheet_snapshot(target_sheet, payload_full)
                 rows_page = enriched_rows[offset : offset + limit]
                 return self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=out_headers,
-                    keys=out_keys,
-                    row_objects=rows_page,
-                    include_matrix=include_matrix,
-                    status=final_status,
+                    sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=rows_page,
+                    include_matrix=include_matrix, status=final_status,
                     meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
                 )
 
@@ -6295,22 +5741,12 @@ class DataEngineV5:
                 proj_rows = [_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)) for row in cached_rows]
                 rows_page = proj_rows[offset : offset + limit]
                 return self._finalize_payload(
-                    sheet=target_sheet,
-                    headers=out_headers,
-                    keys=out_keys,
-                    row_objects=rows_page,
-                    include_matrix=include_matrix,
-                    status=final_status,
-                    meta={
-                        **base_meta,
-                        "rows": len(rows_page),
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                        "built_from": "cached_snapshot",
-                        "symbols_reader_source": self._symbols_reader_source,
-                        "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
-                    },
+                    sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=rows_page,
+                    include_matrix=include_matrix, status=final_status,
+                    meta={**base_meta, "rows": len(rows_page), "limit": limit, "offset": offset, "mode": mode,
+                          "built_from": "cached_snapshot",
+                          "symbols_reader_source": self._symbols_reader_source,
+                          "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)},
                 )
 
         rows_full: List[Dict[str, Any]] = []
@@ -6333,54 +5769,29 @@ class DataEngineV5:
 
         if rows_full:
             payload_full = self._finalize_payload(
-                sheet=target_sheet,
-                headers=out_headers,
-                keys=out_keys,
-                row_objects=rows_full,
-                include_matrix=include_matrix,
-                status=final_status,
-                meta={
-                    **base_meta,
-                    "rows": len(rows_full),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                    "built_from": built_from,
-                    "resolved_symbols_count": len(requested_symbols),
-                    "symbols_reader_source": self._symbols_reader_source,
-                    "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
-                },
+                sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=rows_full,
+                include_matrix=include_matrix, status=final_status,
+                meta={**base_meta, "rows": len(rows_full), "limit": limit, "offset": offset, "mode": mode,
+                      "built_from": built_from,
+                      "resolved_symbols_count": len(requested_symbols),
+                      "symbols_reader_source": self._symbols_reader_source,
+                      "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)},
             )
             self._store_sheet_snapshot(target_sheet, payload_full)
             rows_page = rows_full[offset : offset + limit]
             return self._finalize_payload(
-                sheet=target_sheet,
-                headers=out_headers,
-                keys=out_keys,
-                row_objects=rows_page,
-                include_matrix=include_matrix,
-                status=final_status,
+                sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=rows_page,
+                include_matrix=include_matrix, status=final_status,
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
         return self._finalize_payload(
-            sheet=target_sheet,
-            headers=out_headers,
-            keys=out_keys,
-            row_objects=[],
-            include_matrix=include_matrix,
-            status=final_status,
-            meta={
-                **base_meta,
-                "rows": 0,
-                "limit": limit,
-                "offset": offset,
-                "mode": mode,
-                "built_from": built_from,
-                "resolved_symbols_count": len(requested_symbols),
-                "symbols_reader_source": self._symbols_reader_source,
-                "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
-            },
+            sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=[],
+            include_matrix=include_matrix, status=final_status,
+            meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode,
+                  "built_from": built_from, "resolved_symbols_count": len(requested_symbols),
+                  "symbols_reader_source": self._symbols_reader_source,
+                  "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)},
         )
 
     async def sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -6395,15 +5806,9 @@ class DataEngineV5:
         if target == "Top_10_Investments":
             headers, keys = _ensure_top10_contract(headers, keys)
         return {
-            "sheet": target,
-            "page": target,
-            "sheet_name": target,
-            "headers": headers,
-            "display_headers": headers,
-            "keys": keys,
-            "fields": keys,
-            "source": source,
-            "count": len(keys),
+            "sheet": target, "page": target, "sheet_name": target,
+            "headers": headers, "display_headers": headers,
+            "keys": keys, "fields": keys, "source": source, "count": len(keys),
         }
 
     def get_page_contract(self, page: str) -> Dict[str, Any]:
@@ -6433,7 +5838,6 @@ class DataEngineV5:
             "snapshot_sheets": len(self._sheet_snapshots),
             "rows_reader_source": self._rows_reader_source,
             "symbols_reader_source": self._symbols_reader_source,
-            # v5.62.0 PHASE-Z diagnostics
             "yahoo_enrichment_pass": {
                 "enabled": _yahoo_enrichment_enabled(),
                 "enrich_on_missing_industry": _yahoo_enrich_on_missing_industry(),
@@ -6474,7 +5878,6 @@ class DataEngineV5:
         }
 
 
-
 def normalize_row_to_schema(sheet: str, row: Dict[str, Any], keep_extras: bool = False) -> Dict[str, Any]:
     target = _canonicalize_sheet_name(sheet) or sheet or "Market_Leaders"
     _spec, headers, keys, _src = _schema_for_sheet(target)
@@ -6487,6 +5890,7 @@ def normalize_row_to_schema(sheet: str, row: Dict[str, Any], keep_extras: bool =
             if k not in normalized:
                 normalized[k] = _json_safe(v)
     return normalized
+
 
 _ENGINE_INSTANCE: Optional[DataEngineV5] = None
 ENGINE: Optional[DataEngineV5] = None
@@ -6535,24 +5939,11 @@ DataEngineV2 = DataEngineV5
 DataEngine = DataEngineV5
 
 __all__ = [
-    "DataEngineV5",
-    "DataEngineV4",
-    "DataEngineV3",
-    "DataEngineV2",
-    "DataEngine",
-    "ENGINE",
-    "engine",
-    "_ENGINE",
-    "get_engine",
-    "get_engine_if_ready",
-    "peek_engine",
-    "close_engine",
-    "get_cache",
-    "QuoteQuality",
-    "DataSource",
-    "UnifiedQuote",
+    "DataEngineV5", "DataEngineV4", "DataEngineV3", "DataEngineV2", "DataEngine",
+    "ENGINE", "engine", "_ENGINE",
+    "get_engine", "get_engine_if_ready", "peek_engine", "close_engine", "get_cache",
+    "QuoteQuality", "DataSource", "UnifiedQuote",
     "__version__",
     "STATIC_CANONICAL_SHEET_CONTRACTS",
-    "get_sheet_spec",
-    "normalize_row_to_schema",
+    "get_sheet_spec", "normalize_row_to_schema",
 ]
