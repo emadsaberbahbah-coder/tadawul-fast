@@ -2,7 +2,45 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.63.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.64.0
+================================================================================
+
+WHY v5.64.0 — THREE-FIX PRODUCTION FOLLOWUP (May 13, 2026)
+-----------------------------------------------------------
+v5.63.0 post-deploy testing showed three remaining issues:
+
+  FIX-EE.  INSTRUMENT_CANONICAL_KEYS / HEADERS expansion
+           v5.47.2 baseline schema was missing 17 v5.50.0->v5.61.0 fields:
+           upside_pct, fundamental_view, technical_view, risk_view,
+           value_view, sector_relative_score, conviction_score,
+           top_factors, top_risks, position_size_hint,
+           recommendation_detailed, recommendation_priority, and 5
+           candlestick_* fields. Engine projection through canonical
+           keys dropped these even when Phase 4 set them on the row.
+           v5.64.0 adds them to INSTRUMENT_CANONICAL_KEYS and
+           INSTRUMENT_CANONICAL_HEADERS in matching positions.
+
+  FIX-FF.  percent_change x100 double-multiplication
+           `_canonicalize_provider_row` line 2369 multiplied percent_change
+           by 100 when value <= 1.5, assuming it was a fraction. This
+           re-ran AT SCHEMA PROJECTION TIME on already-sanitized values,
+           turning 0.7243 (correct percent points) into 72.43 (wrong).
+           v5.64.0 adds two guards: (a) skip x100 when the warnings
+           string indicates Phase 2 already sanitized, and (b) cross-check
+           against price/previous_close arithmetic to detect whether the
+           stored value is already in percent points.
+
+  FIX-GG.  Phase 4 execution order
+           PHASE-DD ran BEFORE `_compute_scores_fallback`, so
+           forecast_price_12m was None when `_compute_intrinsic_and_upside`
+           tried to blend it into the intrinsic value. Only the PE-based
+           component contributed, giving AAPL intrinsic=206.25 instead of
+           the blended 262.31. v5.64.0 moves PHASE-DD to AFTER
+           `_compute_scores_fallback` + `_compute_recommendation`.
+
+[PRESERVED] All v5.63.0 PHASE-AA/BB/CC/DD logic remains. All v5.62.0
+PHASE-Z Yahoo enrichment remains. v5.47.2 baseline intact.
+
 ================================================================================
 
 WHY v5.63.0 — FOUR-PHASE PRODUCTION FIX (May 13, 2026)
@@ -164,7 +202,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.63.0"
+__version__ = "5.64.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -992,6 +1030,7 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "ev_ebitda",
     "peg_ratio",
     "intrinsic_value",
+    "upside_pct",
     "valuation_score",
     "forecast_price_1m",
     "forecast_price_3m",
@@ -1009,6 +1048,10 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "overall_score",
     "opportunity_score",
     "rank_overall",
+    "fundamental_view",
+    "technical_view",
+    "risk_view",
+    "value_view",
     "recommendation",
     "recommendation_reason",
     "horizon_days",
@@ -1023,6 +1066,18 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "last_updated_utc",
     "last_updated_riyadh",
     "warnings",
+    "sector_relative_score",
+    "conviction_score",
+    "top_factors",
+    "top_risks",
+    "position_size_hint",
+    "recommendation_detailed",
+    "recommendation_priority",
+    "candlestick_pattern",
+    "candlestick_signal",
+    "candlestick_strength",
+    "candlestick_confidence",
+    "candlestick_patterns_recent",
 ]
 
 INSTRUMENT_CANONICAL_HEADERS: List[str] = [
@@ -1075,6 +1130,7 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "EV/EBITDA",
     "PEG",
     "Intrinsic Value",
+    "Upside %",
     "Valuation Score",
     "Forecast Price 1M",
     "Forecast Price 3M",
@@ -1092,6 +1148,10 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Overall Score",
     "Opportunity Score",
     "Rank (Overall)",
+    "Fundamental View",
+    "Technical View",
+    "Risk View",
+    "Value View",
     "Recommendation",
     "Recommendation Reason",
     "Horizon Days",
@@ -1106,6 +1166,18 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Last Updated (UTC)",
     "Last Updated (Riyadh)",
     "Warnings",
+    "Sector-Adj Score",
+    "Conviction Score",
+    "Top Factors",
+    "Top Risks",
+    "Position Size Hint",
+    "Recommendation Detail",
+    "Reco Priority",
+    "Candle Pattern",
+    "Candle Signal",
+    "Candle Strength",
+    "Candle Confidence",
+    "Recent Patterns (5D)",
 ]
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
@@ -2007,6 +2079,7 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "ev_ebitda": ("ev_ebitda", "enterpriseToEbitda", "evToEbitda"),
     "peg_ratio": ("peg_ratio", "peg", "pegRatio"),
     "intrinsic_value": ("intrinsic_value", "fairValue", "dcf", "dcfValue", "intrinsicValue"),
+    "upside_pct": ("upside_pct", "upsidePct", "upside_percent", "upsidePercent", "upside", "potentialUpside"),
     "valuation_score": ("valuation_score",),
     "forecast_price_1m": ("forecast_price_1m", "targetPrice1m", "priceTarget1m"),
     "forecast_price_3m": ("forecast_price_3m", "targetPrice3m", "priceTarget3m", "targetPrice", "targetMeanPrice"),
@@ -2024,6 +2097,10 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "overall_score": ("overall_score", "score", "compositeScore"),
     "opportunity_score": ("opportunity_score",),
     "rank_overall": ("rank_overall", "rank", "overallRank"),
+    "fundamental_view": ("fundamental_view", "fundamentalView", "fundamental_rating"),
+    "technical_view": ("technical_view", "technicalView", "technical_rating"),
+    "risk_view": ("risk_view", "riskView", "risk_rating", "risk_label"),
+    "value_view": ("value_view", "valueView", "value_rating", "valuation_label"),
     "recommendation": ("recommendation", "rating", "action", "reco", "consensus"),
     "recommendation_reason": ("recommendation_reason", "reason", "summary", "thesis", "analysis"),
     "horizon_days": ("horizon_days", "horizon", "days"),
@@ -2038,6 +2115,19 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "last_updated_utc": ("last_updated_utc", "lastUpdated", "updatedAt", "timestamp", "asOf"),
     "last_updated_riyadh": ("last_updated_riyadh",),
     "warnings": ("warnings", "warning", "messages", "errors"),
+    # v5.64.0 FIX-HH: v5.50.0-v5.61.0 derived fields
+    "sector_relative_score": ("sector_relative_score", "sectorAdjustedScore", "sectorAdjScore", "sector_adj_score", "sectorRelativeScore"),
+    "conviction_score": ("conviction_score", "convictionScore", "conviction"),
+    "top_factors": ("top_factors", "topFactors", "positives", "factors"),
+    "top_risks": ("top_risks", "topRisks", "negatives", "risks"),
+    "position_size_hint": ("position_size_hint", "positionSizeHint", "sizingHint", "sizing"),
+    "recommendation_detailed": ("recommendation_detailed", "recommendationDetailed", "recommendationDetail", "reco_detail", "detailed_recommendation"),
+    "recommendation_priority": ("recommendation_priority", "recoPriority", "priority", "reco_priority"),
+    "candlestick_pattern": ("candlestick_pattern", "candlePattern", "candlestickPattern", "pattern"),
+    "candlestick_signal": ("candlestick_signal", "candleSignal", "candlestickSignal", "patternSignal"),
+    "candlestick_strength": ("candlestick_strength", "candleStrength", "candlestickStrength", "patternStrength"),
+    "candlestick_confidence": ("candlestick_confidence", "candleConfidence", "candlestickConfidence", "patternConfidence"),
+    "candlestick_patterns_recent": ("candlestick_patterns_recent", "recentPatterns", "candlestickPatternsRecent", "patterns5d", "patterns_recent"),
 }
 
 _COMMODITY_SYMBOL_HINTS: Tuple[str, ...] = ("GC=F", "SI=F", "BZ=F", "CL=F", "NG=F", "HG=F")
@@ -2367,7 +2457,28 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         pct = ((price - prev) / prev) * 100.0
         out["percent_change"] = round(pct, 6)
     elif pct is not None and abs(pct) <= 1.5:
-        out["percent_change"] = round(pct * 100.0, 6)
+        # v5.64.0 FIX-FF: Skip x100 multiplication if Phase 2 already sanitized,
+        # OR if price/previous_close arithmetic confirms the value is already in
+        # percent points (and not a fraction needing conversion). This prevents
+        # the double-multiplication bug where AAPL's 0.7243 became 72.43.
+        warnings_str = _safe_str(out.get("warnings")).lower()
+        already_sanitized = (
+            "percent_change_recomputed" in warnings_str
+            or "percent_change_clamped_from_provider" in warnings_str
+            or "percent_change_suspect_dropped" in warnings_str
+        )
+        # Cross-check: if price and prev are available, compute the "true" pct
+        # and see whether the stored value matches percent-points or fraction.
+        looks_like_percent_points = False
+        if price is not None and prev not in (None, 0):
+            true_pct_points = ((price - prev) / prev) * 100.0
+            # If stored value is close to true_pct_points, it's already in percent points
+            if abs(pct - true_pct_points) < abs(pct * 100.0 - true_pct_points):
+                looks_like_percent_points = True
+        if already_sanitized or looks_like_percent_points:
+            out["percent_change"] = round(pct, 6)  # keep as-is
+        else:
+            out["percent_change"] = round(pct * 100.0, 6)
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
@@ -4706,12 +4817,22 @@ class DataEngineV5:
                 bb_err.__class__.__name__, bb_err,
             )
 
+        if _as_float(row.get("current_price")) is not None and _safe_str(row.get("warnings")).lower() == "no live provider data available":
+            row["warnings"] = "Recovered from history/chart fallback"
+        elif _as_float(row.get("current_price")) is None and not row.get("warnings"):
+            row["warnings"] = "No live quote payload and no usable history fallback"
+
+        _compute_scores_fallback(row)
+        _compute_recommendation(row)
+
         # =================================================================
         # v5.63.0 PHASE-DD: Restored derived/synthesized columns
         # =================================================================
-        # Restores v5.50.0-v5.61.0 functionality lost in the v5.47.2 rollback:
-        # intrinsic value, upside %, fundamental/technical/risk/value views,
-        # 8-tier recommendation, top factors/risks, conviction score,
+        # v5.64.0: Moved to AFTER _compute_scores_fallback + _compute_recommendation
+        # so that forecast_price_12m is available for intrinsic value blending,
+        # and so existing recommendation isn't overwritten.
+        # Fills: intrinsic value, upside %, fundamental/technical/risk/value views,
+        # 8-tier recommendation extras, top factors/risks, conviction score,
         # position size hint, sector-adjusted score, market cap synthesis.
         try:
             row = _apply_phase_dd_enhancements(row)
@@ -4722,13 +4843,6 @@ class DataEngineV5:
                 dd_err.__class__.__name__, dd_err,
             )
 
-        if _as_float(row.get("current_price")) is not None and _safe_str(row.get("warnings")).lower() == "no live provider data available":
-            row["warnings"] = "Recovered from history/chart fallback"
-        elif _as_float(row.get("current_price")) is None and not row.get("warnings"):
-            row["warnings"] = "No live quote payload and no usable history fallback"
-
-        _compute_scores_fallback(row)
-        _compute_recommendation(row)
         row["data_quality"] = self._data_quality(row)
         row["data_provider"] = row.get("data_provider") or ((row.get("data_sources") or [""])[0] if isinstance(row.get("data_sources"), list) else "")
         q = UnifiedQuote(**row)
