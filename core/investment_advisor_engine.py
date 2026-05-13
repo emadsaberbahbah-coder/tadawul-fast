@@ -3,17 +3,96 @@
 """
 core/investment_advisor_engine.py
 ================================================================================
-INVESTMENT ADVISOR ENGINE — v4.4.0 (MAY 2026 CROSS-STACK SYNC)
+INVESTMENT ADVISOR ENGINE — v4.4.1 (TOP10_SELECTOR v4.12.0 ALIGNMENT)
 ================================================================================
 SYNC-EXPORT SAFE • ASYNC-INTERNAL • EXPORT-HARDENED • ROUTE-TOLERANT
 ENGINE-AWARE • PAGE-CATALOG NORMALIZED • TOP10-BUILDER FIRST
 INSIGHTS FALLBACK SAFE • SPECIAL-SCHEMA SAFE • NO-IMPORT-TIME-NETWORK
 ADVISOR + SHEET-ROWS SAFE • JSON-SAFE • 502-RESISTANT • MATRIX/ROW-OBJECT SAFE
 INSIGHTS-COLUMNS AWARE (v2.6.0+) • DECISION/CANDLESTICK AWARE (v2.7.0+) •
-CONVICTION-FLOOR DELEGATION (v7.2.0+)
+CONVICTION-FLOOR DELEGATION (v7.2.0+) •
+CRITERIA-v3.1.0 HARD-FILTER DELEGATION (v4.4.1+, via top10_selector v4.12.0)
 
 ================================================================================
-v4.4.0 changes (MAY 2026 CROSS-STACK SYNC)
+v4.4.1 changes (TOP10_SELECTOR v4.12.0 ALIGNMENT)
+================================================================================
+
+METADATA-ONLY PATCH. No positional indices shift. No caller-visible
+behaviour changes. No column-count edits. No signature edits. No new
+runtime code paths. The headline v4.4.0 work (97-col fallback,
+conviction-aware delegation, view-aware scoring, capability-flag
+meta) is preserved verbatim.
+
+WHAT CHANGED. v4.4.1 acknowledges the downstream top10_selector
+v4.12.0 delivery (sibling module in the May 2026 cross-stack family).
+top10_selector v4.12.0 is now the HARD-FILTER AUTHORITY for four
+criteria_model v3.1.0 fields:
+
+  min_conviction_score              (float, 0..100)
+    When > 0, drops rows where conviction_score is missing OR below
+    threshold. Mirrors reco_normalize v7.2.0's conviction floors
+    (RECO_STRONG_BUY_CONVICTION_FLOOR=60).
+
+  exclude_engine_dropped_valuation  (bool, default false)
+    When true, drops rows tagged with any of the 5 engine
+    valuation-drop tags from data_engine_v2 v5.60.0+ Phase H/I/P.
+
+  exclude_forecast_unavailable      (bool, default false)
+    When true, drops rows with any of the 4 forecast-unavailable
+    tags from data_engine_v2 v5.60.0+ Phase B (or the bool flag).
+
+  exclude_provider_errors           (bool, default false)
+    When true, drops rows where last_error_class is non-empty
+    (preserved by data_engine_v2 v5.60.0+ Phase Q).
+
+DIVISION OF LABOUR. The engine forwards criteria to top10_selector
+v4.12.0 unchanged through `_build_top10_rows_impl`. top10_selector is
+the HARD-FILTER consumer; the engine remains the SOFT-SIGNAL
+authority via `_score_recommendation`'s view-aware + conviction-floor
+delegation (Phase D, preserved verbatim). No double-filtering.
+
+Operators get two independent controls:
+  - HARD exclusion via criteria_model v3.1.0 flags (handled downstream
+    in top10_selector v4.12.0 `_passes_filters`)
+  - SOFT downgrade via reco_normalize v7.2.0 conviction floors
+    (handled here in `_score_recommendation`)
+
+CROSS-STACK MODULE REFERENCES UPDATED:
+  top10_selector     v4.11.0  ->  v4.12.0   (hard-filter consumer active)
+  advisor orchestrator v5.1.1  ->  v5.3.0   (sibling cross-stack sync;
+                                             this module unchanged from
+                                             v4.4.0 except docstring
+                                             reference here)
+
+PHASE-BY-PHASE:
+---------------
+
+A. NARRATIVE SYNC ONLY. Docstring references for top10_selector
+   v4.11.0 -> v4.12.0 in three places:
+     - Cross-stack module references block (top of v4.4.0 section)
+     - Phase C alias documentation comment (engine internal fields
+       block)
+     - __version__ comment in the Version section
+   Plus documents the sibling orchestrator advance v5.1.1 -> v5.3.0
+   and adds a header line for v4.4.1.
+
+B. VERSION BUMP 4.4.0 -> 4.4.1.
+
+PRESERVED VERBATIM FROM v4.4.0:
+- All 97 instrument columns + 3 Top10 extras = 100-col Top10 layout
+- All 82 _FIELD_ALIAS_HINTS entries (Decision/Candlestick + engine
+  v5.60.0 internal fields + scoring v5.2.5 row fields)
+- View-aware + conviction-aware `_score_recommendation` with
+  `_RFV_ACCEPTS_CONVICTION` signature detection
+- `view_aware_conviction_supported` meta flag
+- `__version__` alias (advanced to "4.4.1" by this patch)
+- All `_strip_internal_fields` / `_row_has_scoring_signal` /
+  `_resolve_roi_for_scoring` / bucket-fabrication-safety logic
+- Engine resolution order (delegates DOWN to data_engine_v2)
+- Snapshot cache + `status="warn"` handling
+
+================================================================================
+v4.4.0 changes (MAY 2026 CROSS-STACK SYNC) — preserved
 ================================================================================
 
 Aligns investment_advisor_engine with the May 2026 cross-stack family.
@@ -30,11 +109,13 @@ Cross-stack module references updated:
   insights_builder v1.0.0  -> v7.0.0
   scoring         v5.0.0   -> v5.2.5
   schema_registry v2.6.0   -> v2.8.0
-  advisor (orchestrator) v5.1.1 unchanged here
+  advisor (orchestrator) v5.1.1 (advanced to v5.3.0 — see v4.4.1 note above)
 
 Plus references to NEW family members:
   scoring_engine v3.4.2 (compatibility bridge)
-  top10_selector v4.11.0 (consumer with data-quality penalties)
+  top10_selector v4.12.0 (consumer with data-quality penalties +
+    criteria_model v3.1.0 hard-filter authority; was v4.11.0 at the
+    original v4.4.0 release time, advanced in v4.4.1)
   criteria_model v3.1.0 (data model with conviction + exclusion fields)
 
 Phase-by-phase summary:
@@ -102,7 +183,8 @@ D. CONVICTION-AWARE DELEGATION. `_score_recommendation` now passes
 E. __version__ ALIAS. NEW `__version__ = INVESTMENT_ADVISOR_ENGINE_VERSION`
    (TFB module convention used by scoring v5.2.5, reco_normalize
    v7.2.0, insights_builder v7.0.0, scoring_engine v3.4.2,
-   top10_selector v4.11.0, criteria_model v3.1.0, schema_registry
+   top10_selector v4.12.0 (was v4.11.0 at v4.4.0 release time;
+   advanced in v4.4.1), criteria_model v3.1.0, schema_registry
    v2.8.0). `__all__` augmented.
 
 F. CROSS-STACK CAPABILITY DETECTION IN META. Result meta now carries:
@@ -220,11 +302,12 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-INVESTMENT_ADVISOR_ENGINE_VERSION = "4.4.0"
+INVESTMENT_ADVISOR_ENGINE_VERSION = "4.4.1"
 # v4.4.0 Phase E: TFB module-version convention alias (mirrors scoring
 # v5.2.5, reco_normalize v7.2.0, insights_builder v7.0.0, scoring_engine
-# v3.4.2, top10_selector v4.11.0, criteria_model v3.1.0, schema_registry
+# v3.4.2, top10_selector v4.12.0, criteria_model v3.1.0, schema_registry
 # v2.8.0).
+# v4.4.1: top10_selector advanced 4.11.0 -> 4.12.0; alignment updated here.
 __version__ = INVESTMENT_ADVISOR_ENGINE_VERSION
 
 
@@ -429,6 +512,8 @@ PAGE_NORMALIZER_FN_CANDIDATES = (
 )
 
 # Top10 builder
+# v4.4.1 note: top10_selector v4.12.0 is the criteria_model v3.1.0
+# hard-filter authority. This engine forwards criteria unchanged.
 TOP10_BUILDER_MODULE_CANDIDATES = (
     "core.analysis.top10_selector",
     "core.top10_selector",
@@ -698,7 +783,8 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     # v4.4.0 Phase C NEW: engine v5.60.0 + scoring v5.2.5 internal fields
     # (NOT in default schema; recognized so they get extracted correctly
     # from incoming row dicts when downstream consumers like top10_selector
-    # v4.11.0 or insights_builder v7.0.0 forward them through).
+    # v4.12.0 or insights_builder v7.0.0 forward them through).
+    # v4.4.1: top10_selector advanced 4.11.0 -> 4.12.0; reference refreshed here.
     "last_error_class": [
         "lastErrorClass", "error_class", "errorClass",
     ],
@@ -1710,6 +1796,14 @@ async def _execute_engine(
 # =============================================================================
 # Top10 Builder
 # =============================================================================
+#
+# v4.4.1 note: top10_selector v4.12.0 is the criteria_model v3.1.0
+# HARD-FILTER AUTHORITY for these four fields when present in criteria:
+#   - min_conviction_score
+#   - exclude_engine_dropped_valuation
+#   - exclude_forecast_unavailable
+#   - exclude_provider_errors
+# This engine forwards criteria UNCHANGED — no double-filtering.
 
 async def _build_top10_rows_impl(criteria: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Build Top10 rows using top10 selector."""
