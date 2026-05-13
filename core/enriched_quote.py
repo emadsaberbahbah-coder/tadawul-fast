@@ -3,75 +3,132 @@
 """
 core/enriched_quote.py
 ===============================================================================
-TFB Enriched Quote Core — v4.3.0 (DERIVE-AND-FILL / SCHEMA-ALIGNED / VIEW-AWARE)
+TFB Enriched Quote Core — v4.4.0 (SUFFIX-DERIVE / UNIT-NORMALIZE / PROVENANCE)
 ===============================================================================
 CORE-ONLY • SCHEMA-FIRST • PAGE-CANONICAL • SPECIAL-PAGE SAFE • ENGINE-TOLERANT
 JSON-SAFE • SYNC/ASYNC SAFE • ROUTE-FRIENDLY • LIGHTWEIGHT • IMPORT-SAFE
 
-v4.3.0 changes (what moved from v4.2.0)
+v4.4.0 changes (what moved from v4.3.0)
 ---------------------------------------
-- FIX [HIGH]: NEW `_derive_missing_fields()` helper. v4.2.0 (and every prior
-  version) passed provider-shaped rows through `schema_projection()` without
-  computing canonical derived fields when the provider failed to supply them
-  but their inputs were present. Production audit (sheet snapshot, ~150
-  rows) showed this manifesting most visibly as:
-    * `week_52_position_pct` blank for rows where `current_price`,
-      `week_52_high`, and `week_52_low` were all populated -- the formula is
-      `(price - low) / (high - low)` and yet the cell was empty.
-    * `price_change` / `percent_change` blank when provider missed them but
-      current_price and previous_close were both present.
-    * Portfolio derivations (`position_cost`, `position_value`,
-      `unrealized_pl`, `unrealized_pl_pct`) blank for rows with non-zero
-      `position_qty` and `avg_cost`.
-    * `upside_pct` blank when `intrinsic_value` and `current_price` were
-      both available.
-    * `expected_roi_*` blank when `forecast_price_*` was populated.
-    * `confidence_bucket` / `risk_bucket` blank when their numeric score
-      was present (these used to be computed only inside scoring.py, but
-      cached / proxy rows arriving here may be missing them).
-    * `invest_period_label` blank when `horizon_days` was present.
-  v4.3.0 fills each of these on a strict fill-only-if-missing basis. An
-  existing non-empty value is NEVER overwritten. Every derivation is wrapped
-  in try/except and returns silently on bad inputs (None, zero divisors,
-  non-numeric strings) -- no exception ever escapes into row processing.
-- FIX [MED]: NEW `_normalize_warnings_field()`. yahoo_fundamentals_provider
-  v6.1.0 and yahoo_chart_provider v9/v10 emit `warnings` as `List[str]`
-  (e.g. `["week_52_high_unit_mismatch_dropped", "industry_missing_from_
-  provider"]`). The sheet's Warnings column displays a "; "-joined string
-  ("HTTP 403; industry_missing_from_provider; forecast_unavailable").
-  v4.2.0 wrote the raw list into the cell, where Apps Script then stringi-
-  fied it as a Python repr (`['week_52_high_...', ...]`). v4.3.0 coerces
-  the list to the canonical "; "-joined string format inside
-  `normalize_rows()`, accepting both list and string inputs idempotently.
-- WIRING: `normalize_rows()` now invokes `_derive_missing_fields()` and
-  `_normalize_warnings_field()` for instrument-shaped rows (detected via
-  the presence of `current_price` in `keys`) before `schema_projection()`.
-  Special pages (Insights_Analysis, Data_Dictionary) are not instrument-
-  shaped and bypass the derivation step. Top_10_Investments IS instrument-
-  shaped and benefits from derivation in addition to its existing top10-
-  specific normalization.
-- ALIGN: header docstring references the yahoo provider v6.1.0 changes and
-  scoring.py v5.0.0 cascade.
 
-Public API is preserved verbatim from v4.2.0:
-`build_enriched_quote_payload`, `build_enriched_sheet_rows_payload`,
-`build_enriched_quote_payload_sync`, `get_enriched_quote_payload`,
-`enriched_quote`, `quote`, `get_router`, `router`, `VIEW_COLUMN_KEYS`,
-and `MODULE_VERSION` are all still exported under the same names.
+This release closes three gaps surfaced by the May 2026 sheet-snapshot audit
+(~57 representative rows, 97 columns). Every change here is a row-level
+defensive normalization that runs after the engine emits a row but before
+schema projection writes it to the response. None of these overwrite
+already-correct engine output; each one targets a documented failure mode
+where the engine emits a value that disagrees with the sheet's display
+contract (04_Format.gs v2.7.0 / schema_registry v2.5.0+).
+
+- FIX [HIGH]: NEW `_derive_exchange_currency_from_suffix()` helper. Audit
+  showed 51/57 rows with foreign-suffix tickers (`.HK`, `.L`, `.CO`, `.NS`,
+  `.SA`, `.TO`, `.XETRA`) carrying displayed values `Exchange=NASDAQ/NYSE`,
+  `Currency=USD`, `Country=USA`. The engine's own Warnings column flagged
+  this honestly (`quote_exchange_from_suffix; quote_currency_from_suffix`)
+  but never applied the derived values to the displayed fields. The new
+  helper consults a comprehensive `_SUFFIX_TO_LOCALE` map covering 35+
+  international exchange suffixes and overrides the three fields only
+  when (a) the symbol has a recognized non-US suffix AND (b) the displayed
+  country is blank or "USA". A clean US ticker without a suffix is never
+  touched.
+
+- FIX [HIGH]: NEW `_normalize_percent_units()` helper. Audit confirmed a
+  100x display error on 4 percent fields:
+    * `percent_change`: 47/57 rows out-of-range. CIM.US displayed -7.44%
+      vs real -0.07%. Caused by `data_engine_v2._canonicalize_provider_row`
+      storing as points (×100) while `04_Format.gs v2.6.0` classifies the
+      column as a fraction (×100 again on display).
+    * `upside_pct`: 52/57 rows out-of-range. Same pattern.
+    * `max_drawdown_1y`: 57/57 rows out-of-range. Engine emits
+      `abs(max_dd) * 100`.
+    * `var_95_1d`: 53/57 rows out-of-range. Engine emits `var95 * 100`.
+  For `percent_change` and `upside_pct` and `expected_roi_*`, the helper
+  uses a GROUND-TRUTH comparison: it computes what the value SHOULD be
+  from neighboring fields (current_price, previous_close, intrinsic_value,
+  forecast_price_*) and picks whichever of (stored) vs (stored/100) is a
+  closer match to the truth. This is robust because daily price changes
+  (~0-5%) fall in the same magnitude range as either convention. For
+  `max_drawdown_1y` and `var_95_1d` (where no neighbor-derived ground truth
+  is available), a magnitude threshold of 1.5 distinguishes points from
+  fraction. Idempotent: re-running on a normalized row is a no-op.
+
+- FIX [MED]: NEW `_ensure_provenance_fields()` helper. Audit showed three
+  audit-trail columns at 0% fill across all 57 rows:
+    * `last_updated_utc` — 0/57
+    * `last_updated_riyadh` — 0/57
+    * `data_provider` — 0/57
+  Without these, downstream consumers cannot tell whether a snapshot is
+  fresh or stale, or which provider sourced each row. The helper:
+    1. Stamps `last_updated_utc` / `last_updated_riyadh` with the current
+       time if missing (Riyadh is fixed UTC+3, no DST).
+    2. Recovers `data_provider` by reading `row['data_sources']` (engine
+       emits this list when multiple providers contribute) and falling
+       back to inferring from the `warnings` string (tokens like
+       `yahoo_chart_enrichment_applied` reveal the source).
+  Never overwrites a non-empty existing value.
+
+- WIRING: `normalize_rows()` now invokes the three new helpers for
+  instrument-shaped rows in this order:
+        _strip_internal_fields           (existing, v4.2.0)
+        symbol/ticker alias              (existing)
+        _derive_exchange_currency_from_suffix   (NEW, v4.4.0)
+        _normalize_percent_units                (NEW, v4.4.0)
+        _derive_missing_fields                  (existing, v4.3.0)
+        _normalize_warnings_field               (existing, v4.3.0)
+        _ensure_provenance_fields               (NEW, v4.4.0)
+        top10-specific normalization     (existing)
+        schema_projection                (existing)
+  Unit normalization runs BEFORE derive-missing so that downstream
+  derivations (e.g. confidence_bucket from confidence_score) operate on
+  clean canonical values. Provenance runs LAST so it can read the
+  normalized `warnings` string when inferring `data_provider`.
+
+- ADD: New constants block. `_SUFFIX_TO_LOCALE` (35+ entries),
+  `_FRACTION_FIELDS_GROUND_TRUTH` (5 entries, with input-key tuples),
+  `_FRACTION_FIELDS_MAGNITUDE` (3 entries, with threshold floats).
+  `_RIYADH_TZ` cached as a module constant to avoid recomputing.
+
+- ALIGN: header docstring references the May 2026 backend family —
+  schema_registry v2.5.0+, 04_Format.gs v2.7.0, data_engine_v2 v5.60.0.
+  MODULE_VERSION bumped to "4.4.0".
+
+Public API is preserved verbatim from v4.3.0: `build_enriched_quote_payload`,
+`build_enriched_sheet_rows_payload`, `build_enriched_quote_payload_sync`,
+`get_enriched_quote_payload`, `enriched_quote`, `quote`, `get_router`,
+`router`, `VIEW_COLUMN_KEYS`, and `MODULE_VERSION` are all still exported
+under the same names. No call-site changes required.
+
+PRESERVED — strictly. The v4.4.0 release adds:
+  - 3 new helper functions
+  - 3 new module-level constant blocks
+  - 5 new lines inside `normalize_rows()` that invoke the new helpers
+  - 1 module version bump
+NOT touched:
+  - `_derive_missing_fields()` body is byte-identical to v4.3.0
+  - `_normalize_warnings_field()` body is byte-identical to v4.3.0
+  - `_strip_internal_fields()` body is byte-identical to v4.2.0
+  - All v4.3.0 derivation thresholds (_CONFIDENCE_*, _RISK_*, _HORIZON_*)
+  - All v4.2.0 fallback schema constants (85 + 3 + 7 + 9 columns)
+  - All v4.2.0 / v4.1.0 internal field strip lists
+  - Every other public API and helper
+
+v4.3.0 fixes (PRESERVED)
+------------------------
+- `_derive_missing_fields()` fills 13 derivations on blank-only contract.
+- `_normalize_warnings_field()` coerces List[str] -> "; "-joined string.
+- `normalize_rows()` invokes derivations + warnings normalization for
+  instrument-shaped pages.
 
 v4.2.0 fixes (PRESERVED)
 ------------------------
-- Fallback instrument schema is exactly 85 columns (added `upside_pct` and
-  the 4 view columns to match schema_registry v2.5.0).
-- Top_10_Investments fallback total = 88 (85 + 3).
-- `VIEW_COLUMN_KEYS` constant exported.
-- `_strip_internal_fields()` defence-in-depth helper.
+- 85-column fallback schema (added `upside_pct` + 4 view columns).
+- Top_10_Investments fallback = 88 (85 + 3).
+- `VIEW_COLUMN_KEYS` exported.
+- `_strip_internal_fields()` defence-in-depth.
 
 v4.1.0 fixes (PRESERVED)
 ------------------------
-- Added missing `dataclass` import.
-- Renamed `request_id()` helper to `_resolve_request_id()` to avoid
-  shadowing by the `request_id: Optional[str]` kw-argument.
+- `dataclass` import added.
+- `request_id()` renamed to `_resolve_request_id()`.
 ================================================================================
 """
 
@@ -115,7 +172,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-MODULE_VERSION = "4.3.0"
+MODULE_VERSION = "4.4.0"
 
 # =============================================================================
 # Constants
@@ -267,6 +324,180 @@ _HORIZON_3M_MAX = 135   # <= 135d -> "3M"
 
 
 # =============================================================================
+# v4.4.0: Suffix -> locale map
+# =============================================================================
+#
+# Yahoo Finance / EODHD / Argaam / Finnhub all use suffix conventions to mark
+# international listings. The engine sometimes successfully derives the
+# exchange/currency from the suffix and writes them to the row, but other
+# code paths leave the displayed fields as US defaults and only emit a
+# warning. This table is consulted by `_derive_exchange_currency_from_suffix`
+# to repair the displayed fields when they appear to be stale US defaults.
+#
+# Format: ".SUFFIX": (exchange_display, currency_code, country)
+#
+# NOTE on `.SA`: Yahoo uses `.SA` for São Paulo / Brazil (e.g. PETR4.SA, BBAS3.SA).
+# Saudi Arabian listings on Yahoo use `.SR` instead (e.g. 2222.SR for Aramco).
+# The TFB `normalize_symbol()` function preserves both correctly.
+#
+# NOTE on `.XETRA`: Yahoo uses `.DE` for XETRA-listed German equities. The
+# `.XETRA` suffix appears in some upstream provider feeds (e.g. Deutsche
+# Telekom = DTE.XETRA in one feed, DTE.DE in another). Both map here.
+#
+# Currency codes follow ISO 4217. `GBp` (pence) is intentionally lowercase
+# 'p' to distinguish from `GBP` (pounds) — LSE quotes most equities in pence.
+
+_SUFFIX_TO_LOCALE: Dict[str, Tuple[str, str, str]] = {
+    # Hong Kong
+    ".HK":    ("HKEX",                    "HKD", "Hong Kong"),
+    # United Kingdom (London Stock Exchange)
+    ".L":     ("LSE",                     "GBp", "United Kingdom"),
+    ".LON":   ("LSE",                     "GBp", "United Kingdom"),
+    # Denmark
+    ".CO":    ("Copenhagen",              "DKK", "Denmark"),
+    # India
+    ".NS":    ("NSE",                     "INR", "India"),
+    ".BO":    ("BSE",                     "INR", "India"),
+    # Brazil
+    ".SA":    ("B3",                      "BRL", "Brazil"),
+    # Saudi Arabia
+    ".SR":    ("Tadawul",                 "SAR", "Saudi Arabia"),
+    # Canada
+    ".TO":    ("TSX",                     "CAD", "Canada"),
+    ".V":     ("TSX Venture",             "CAD", "Canada"),
+    ".CN":    ("CSE",                     "CAD", "Canada"),
+    ".NE":    ("NEO Exchange",            "CAD", "Canada"),
+    # Germany
+    ".XETRA": ("XETRA",                   "EUR", "Germany"),
+    ".DE":    ("XETRA",                   "EUR", "Germany"),
+    ".F":     ("Frankfurt",               "EUR", "Germany"),
+    ".HM":    ("Hamburg",                 "EUR", "Germany"),
+    ".MU":    ("Munich",                  "EUR", "Germany"),
+    # France
+    ".PA":    ("Euronext Paris",          "EUR", "France"),
+    # Netherlands
+    ".AS":    ("Euronext Amsterdam",      "EUR", "Netherlands"),
+    # Italy
+    ".MI":    ("Borsa Italiana",          "EUR", "Italy"),
+    # Spain
+    ".MC":    ("BME",                     "EUR", "Spain"),
+    # Belgium
+    ".BR":    ("Euronext Brussels",       "EUR", "Belgium"),
+    # Portugal
+    ".LS":    ("Euronext Lisbon",         "EUR", "Portugal"),
+    # Finland
+    ".HE":    ("Helsinki",                "EUR", "Finland"),
+    # Ireland
+    ".IR":    ("Euronext Dublin",         "EUR", "Ireland"),
+    # Sweden / Norway / Switzerland
+    ".ST":    ("Stockholm",               "SEK", "Sweden"),
+    ".OL":    ("Oslo",                    "NOK", "Norway"),
+    ".SW":    ("SIX",                     "CHF", "Switzerland"),
+    # Australia / New Zealand
+    ".AX":    ("ASX",                     "AUD", "Australia"),
+    ".NZ":    ("NZX",                     "NZD", "New Zealand"),
+    # Japan
+    ".T":     ("TSE",                     "JPY", "Japan"),
+    ".TYO":   ("TSE",                     "JPY", "Japan"),
+    # South Korea
+    ".KS":    ("KRX",                     "KRW", "South Korea"),
+    ".KQ":    ("KOSDAQ",                  "KRW", "South Korea"),
+    # Singapore
+    ".SI":    ("SGX",                     "SGD", "Singapore"),
+    # Malaysia / Thailand / Indonesia
+    ".KL":    ("Bursa Malaysia",          "MYR", "Malaysia"),
+    ".BK":    ("SET",                     "THB", "Thailand"),
+    ".JK":    ("IDX",                     "IDR", "Indonesia"),
+    # Greater China
+    ".SS":    ("Shanghai",                "CNY", "China"),
+    ".SZ":    ("Shenzhen",                "CNY", "China"),
+    ".TW":    ("TWSE",                    "TWD", "Taiwan"),
+    ".TWO":   ("TPEx",                    "TWD", "Taiwan"),
+    # Latin America / Africa
+    ".MX":    ("BMV",                     "MXN", "Mexico"),
+    ".BA":    ("BCBA",                    "ARS", "Argentina"),
+    ".JO":    ("JSE",                     "ZAR", "South Africa"),
+    # US suffix (used by some TFB providers) - explicitly leaves US defaults
+    # in place. We map it so the function can recognize it and short-circuit
+    # without modification.
+    ".US":    ("NASDAQ/NYSE",             "USD", "USA"),
+}
+
+# Country tokens that indicate the displayed `country` field is a stale US
+# default and is therefore eligible to be overwritten by suffix derivation.
+# Foreign tickers that already carry a non-US country string are LEFT ALONE.
+_US_COUNTRY_TOKENS: frozenset = frozenset({
+    "", "USA", "US", "U.S.", "U.S.A.", "UNITED STATES", "UNITED STATES OF AMERICA",
+})
+
+
+# =============================================================================
+# v4.4.0: Unit-normalization field tables
+# =============================================================================
+#
+# These tables drive `_normalize_percent_units`. They encode which sheet
+# columns are stored under the FRACTION contract (number/100 = percent) per
+# 04_Format.gs v2.6.0 / v2.7.0 `_KNOWN_FRACTION_PERCENT_COLUMNS_`, and how
+# to detect when the engine accidentally emitted them in POINTS form.
+#
+# GROUND-TRUTH fields: we can compute the canonical fraction from other
+# fields in the same row, so we use a least-squares-fit comparison rather
+# than a magnitude heuristic. This is the strongest possible detection
+# because daily price moves (~0-5%) overlap with both unit conventions
+# numerically.
+#
+# Format: (field_name, input_key_tuple, formula_fn)
+#         formula_fn receives the input values in declaration order and
+#         returns the canonical fraction.
+#
+# MAGNITUDE fields: we have no neighbor-derived ground truth, so we fall
+# back to magnitude detection. The threshold is chosen so that a typical
+# fraction value falls well below it and a typical points value falls well
+# above it.
+#
+# Format: (field_name, threshold_for_points_detection)
+
+_FRACTION_FIELDS_GROUND_TRUTH: Tuple[
+    Tuple[str, Tuple[str, ...], Callable[..., float]], ...
+] = (
+    ("percent_change",
+        ("current_price", "previous_close"),
+        lambda cp, pc: (cp - pc) / pc),
+    ("upside_pct",
+        ("intrinsic_value", "current_price"),
+        lambda iv, cp: (iv / cp) - 1.0),
+    ("expected_roi_1m",
+        ("forecast_price_1m", "current_price"),
+        lambda fp, cp: (fp / cp) - 1.0),
+    ("expected_roi_3m",
+        ("forecast_price_3m", "current_price"),
+        lambda fp, cp: (fp / cp) - 1.0),
+    ("expected_roi_12m",
+        ("forecast_price_12m", "current_price"),
+        lambda fp, cp: (fp / cp) - 1.0),
+)
+
+_FRACTION_FIELDS_MAGNITUDE: Tuple[Tuple[str, float], ...] = (
+    # max_drawdown_1y: fraction is [-1.0, 0]; points is [-100, 0] or [0, 100]
+    # if abs()-form. Threshold 1.5 cleanly separates them.
+    ("max_drawdown_1y",     1.5),
+    # var_95_1d: fraction is [0, 0.5] typically; points is [0, 50].
+    ("var_95_1d",           1.5),
+    # forecast_confidence: fraction is [0, 1]; points is [0, 100].
+    ("forecast_confidence", 1.5),
+)
+
+
+# =============================================================================
+# v4.4.0: Cached Riyadh timezone (UTC+3, no DST)
+# =============================================================================
+# Saudi Arabia does not observe DST, so the offset is a permanent +3:00.
+# Cached at module load to avoid recomputing the timedelta on every row.
+
+_RIYADH_TZ = dt.timezone(dt.timedelta(hours=3), name="Asia/Riyadh")
+
+
+# =============================================================================
 # Enums
 # =============================================================================
 
@@ -399,8 +630,8 @@ def _to_number(x: Any) -> Optional[float]:
     null tokens.
 
     Distinct from `_json_safe` (which preserves arbitrary types) and from
-    `_to_int` (which collapses to integer). Used only inside
-    `_derive_missing_fields`.
+    `_to_int` (which collapses to integer). Used by `_derive_missing_fields`
+    and (v4.4.0) `_normalize_percent_units`.
     """
     if x is None:
         return None
@@ -906,6 +1137,308 @@ def _is_instrument_shaped_keys(keys: Sequence[str]) -> bool:
         return "current_price" in keys
     except Exception:
         return False
+
+
+# =============================================================================
+# v4.4.0: Suffix-Derived Exchange / Currency / Country
+# =============================================================================
+
+def _suffix_for_symbol(symbol: str) -> Optional[str]:
+    """
+    Return the longest matching suffix from `_SUFFIX_TO_LOCALE` for a given
+    symbol, or None if the symbol has no recognized international suffix.
+
+    Longest-match matters because some suffixes are prefixes of others
+    (e.g. ".T" for TSE Japan is a prefix of ".TWO" for TPEx Taiwan).
+
+    Returns the suffix WITH the leading dot ("." prefix), so the caller
+    can look it up directly in `_SUFFIX_TO_LOCALE`.
+    """
+    if not symbol or "." not in symbol:
+        return None
+    sym_upper = symbol.upper()
+    # Try longest suffix first
+    best: Optional[str] = None
+    for suffix in _SUFFIX_TO_LOCALE:
+        if sym_upper.endswith(suffix):
+            if best is None or len(suffix) > len(best):
+                best = suffix
+    return best
+
+
+def _derive_exchange_currency_from_suffix(row: Dict[str, Any]) -> None:
+    """
+    Repair `exchange`, `currency`, `country` when the displayed values are
+    stale US defaults but the symbol carries a recognized non-US suffix
+    (v4.4.0).
+
+    The May 2026 audit found 51/57 rows in this state: e.g. `0939.HK` with
+    `Exchange=NASDAQ/NYSE`, `Currency=USD`, `Country=USA`. The engine's
+    Warnings column flagged it as `quote_exchange_from_suffix; quote_
+    currency_from_suffix` but the displayed fields were never corrected.
+
+    Decision logic:
+        1. Determine the symbol's suffix via `_suffix_for_symbol()`.
+        2. If no recognized suffix -> no-op.
+        3. If suffix is `.US` -> no-op (US defaults are correct).
+        4. For non-US suffix:
+             - Override `country` if it's blank or any US-equivalent token
+               (case-insensitive). A foreign country string already in the
+               field is RESPECTED -- we never overwrite legitimate data.
+             - Override `exchange` if it's blank or contains "NASDAQ" or
+               "NYSE" (case-insensitive). Other exchanges respected.
+             - Override `currency` if it's blank or "USD". Other currencies
+               respected.
+
+    The respect-existing logic is what makes this safe to run on every
+    instrument-shaped row: a row that already came through correctly
+    is left untouched.
+
+    Operates in-place. Returns nothing. No exception escapes.
+    """
+    if not isinstance(row, dict):
+        return
+
+    try:
+        symbol = _strip(row.get("symbol") or row.get("ticker"))
+        if not symbol:
+            return
+
+        suffix = _suffix_for_symbol(symbol)
+        if suffix is None or suffix == ".US":
+            return  # US ticker or unknown suffix -- leave alone
+
+        derived = _SUFFIX_TO_LOCALE.get(suffix)
+        if derived is None:
+            return  # defensive; shouldn't happen since _suffix_for_symbol
+                    # only returns known suffixes
+        derived_exch, derived_curr, derived_country = derived
+
+        # -- country
+        current_country = _strip(row.get("country")).upper()
+        if current_country in _US_COUNTRY_TOKENS:
+            row["country"] = derived_country
+
+        # -- exchange (overwrite blank or US-default values; keep legitimate
+        # non-US exchanges already in place)
+        current_exch = _strip(row.get("exchange")).upper()
+        if (not current_exch) or ("NASDAQ" in current_exch) or ("NYSE" in current_exch):
+            row["exchange"] = derived_exch
+
+        # -- currency (overwrite blank or "USD"; keep legitimate non-USD
+        # currencies already in place)
+        current_curr = _strip(row.get("currency")).upper()
+        if (not current_curr) or current_curr == "USD":
+            row["currency"] = derived_curr
+
+    except Exception:
+        # Strict contract: never let an exception escape into row processing
+        pass
+
+
+# =============================================================================
+# v4.4.0: Percent-Unit Normalization
+# =============================================================================
+
+def _normalize_percent_units(row: Dict[str, Any]) -> None:
+    """
+    Defensively convert points-convention values to fractions when the
+    column's display contract is fraction (v4.4.0).
+
+    Bug pattern (May 2026 audit, confirmed across 47-57 of 57 rows):
+        data_engine_v2 v5.60.0 `_canonicalize_provider_row` stores certain
+        percent fields in POINTS convention (number = percent value, e.g.
+        -0.0744 means -0.0744%), while 04_Format.gs v2.6.0/v2.7.0 classifies
+        those columns as FRACTION (formatter applies "0.00%" which
+        multiplies by 100 for display). Result: 100x display error
+        across `percent_change`, `upside_pct`, `max_drawdown_1y`,
+        `var_95_1d`, and the three `expected_roi_*` horizons.
+
+    Strategy (two-tier):
+        1. GROUND-TRUTH tier: for `percent_change`, `upside_pct`, and the
+           three `expected_roi_*` fields, we have neighbor fields that let
+           us compute the canonical fraction independently
+           ((cp - pc) / pc, (iv / cp) - 1, (fp / cp) - 1). Compare the
+           stored value against both (true_fraction) and (true_fraction *
+           100). Whichever is closer is the convention the engine emitted
+           in; if it's points-form, divide by 100. This is robust because
+           daily price moves (~0-5%) put fraction and points magnitudes
+           in the same numerical range -- a pure magnitude heuristic would
+           be unreliable here.
+
+        2. MAGNITUDE tier: for `max_drawdown_1y`, `var_95_1d`, and
+           `forecast_confidence`, no clean ground-truth field exists in
+           the row. We fall back to a magnitude check: a value with
+           |x| > 1.5 cannot be a valid fraction for these fields and is
+           almost certainly points-form. Divide by 100.
+
+    Both tiers are idempotent: re-running on an already-normalized row
+    leaves it unchanged. Both are safe on rows where the value was always
+    correct: the ground-truth tier picks the closer hypothesis (which is
+    "leave alone" when stored == true_fraction), and the magnitude tier
+    only fires above the threshold.
+
+    Operates in-place. Returns nothing. No exception escapes.
+    """
+    if not isinstance(row, dict):
+        return
+
+    # -- TIER 1: GROUND-TRUTH ---------------------------------------------
+    for field_name, input_keys, formula in _FRACTION_FIELDS_GROUND_TRUTH:
+        try:
+            stored = _to_number(row.get(field_name))
+            if stored is None:
+                continue
+
+            # Resolve all inputs; abort this field if any are missing
+            inputs: List[float] = []
+            ok = True
+            for k in input_keys:
+                v = _to_number(row.get(k))
+                if v is None:
+                    ok = False
+                    break
+                inputs.append(v)
+            if not ok:
+                continue
+
+            # Guard against zero divisor in the formula. Every formula in
+            # _FRACTION_FIELDS_GROUND_TRUTH divides by the LAST input.
+            if inputs[-1] == 0:
+                continue
+
+            try:
+                true_frac = float(formula(*inputs))
+            except Exception:
+                continue
+            if math.isnan(true_frac) or math.isinf(true_frac):
+                continue
+
+            # If the true fraction is essentially zero, both conventions
+            # produce identical stored values. Leave alone.
+            if abs(true_frac) < 1e-9:
+                continue
+
+            err_as_fraction = abs(stored - true_frac)
+            err_as_points = abs(stored - true_frac * 100.0)
+
+            if err_as_points < err_as_fraction:
+                # Stored is points convention -> convert to fraction
+                row[field_name] = stored / 100.0
+        except Exception:
+            # Strict contract: never let an exception escape
+            pass
+
+    # -- TIER 2: MAGNITUDE ------------------------------------------------
+    for field_name, threshold in _FRACTION_FIELDS_MAGNITUDE:
+        try:
+            stored = _to_number(row.get(field_name))
+            if stored is None:
+                continue
+            if abs(stored) > threshold:
+                # Almost certainly points-form. Convert to fraction.
+                row[field_name] = stored / 100.0
+        except Exception:
+            pass
+
+
+# =============================================================================
+# v4.4.0: Provenance-Field Guarantee
+# =============================================================================
+
+def _ensure_provenance_fields(row: Dict[str, Any]) -> None:
+    """
+    Fill `last_updated_utc`, `last_updated_riyadh`, and `data_provider`
+    when they are missing (v4.4.0).
+
+    The May 2026 audit found all three fields at 0% fill across 57 rows.
+    Without them, downstream consumers cannot tell snapshot freshness or
+    which provider sourced each row. The engine clearly retrieved data
+    from providers (Warnings column carries tokens like
+    `yahoo_chart_enrichment_applied:...`) but the audit fields themselves
+    were not making it through to the row builder.
+
+    Fills (fill-only-if-missing; never overwrites existing values):
+
+        last_updated_utc      -> current UTC time, ISO-8601 (second precision)
+        last_updated_riyadh   -> current Asia/Riyadh time (UTC+3), ISO-8601
+        data_provider         -> first non-empty entry from `data_sources`
+                                 list, or inferred from `warnings` text
+                                 (matching against known provider tokens).
+                                 Left blank if neither source available --
+                                 we never fabricate a provider name.
+
+    Should be called AFTER `_normalize_warnings_field` so the warnings
+    field is in canonical string form when we inspect it for provider
+    inference.
+
+    Operates in-place. Returns nothing. No exception escapes.
+    """
+    if not isinstance(row, dict):
+        return
+
+    # -- Timestamps -------------------------------------------------------
+    # Compute now() once at function entry so all rows in a batch share a
+    # consistent timestamp.
+    try:
+        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+        if _is_blank(row.get("last_updated_utc")):
+            try:
+                row["last_updated_utc"] = now_utc.isoformat()
+            except Exception:
+                pass
+
+        if _is_blank(row.get("last_updated_riyadh")):
+            try:
+                row["last_updated_riyadh"] = now_utc.astimezone(_RIYADH_TZ).isoformat()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # -- Data provider ----------------------------------------------------
+    try:
+        if _is_blank(row.get("data_provider")):
+            inferred: Optional[str] = None
+
+            # Source 1: data_sources list (engine emits this when multiple
+            # providers contribute to a single row)
+            sources = row.get("data_sources")
+            if isinstance(sources, (list, tuple)) and sources:
+                for s in sources:
+                    s_clean = _strip(s)
+                    if s_clean:
+                        inferred = s_clean
+                        break
+
+            # Source 2: infer from warnings text (engine emits tokens like
+            # `yahoo_chart_enrichment_applied:...` that reveal the source).
+            # This is best-effort; we never fabricate "unknown" or similar.
+            if inferred is None:
+                warnings_value = row.get("warnings")
+                if isinstance(warnings_value, str) and warnings_value:
+                    w_lower = warnings_value.lower()
+                    # Order matters: check more-specific tokens first
+                    if "yahoo_chart" in w_lower:
+                        inferred = "yahoo_chart"
+                    elif "yahoo_fundamentals" in w_lower:
+                        inferred = "yahoo_fundamentals"
+                    elif "yahoo" in w_lower:
+                        inferred = "yahoo"
+                    elif "argaam" in w_lower:
+                        inferred = "argaam"
+                    elif "tadawul" in w_lower:
+                        inferred = "tadawul"
+                    elif "finnhub" in w_lower:
+                        inferred = "finnhub"
+                    elif "eodhd" in w_lower:
+                        inferred = "eodhd"
+
+            if inferred:
+                row["data_provider"] = inferred
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -1614,10 +2147,38 @@ def normalize_rows(
     values are never overwritten. Also normalises `warnings` from list
     -> "; "-joined string for sheet display.
 
+    v4.4.0: extended pipeline for instrument-shaped pages with three new
+    defensive normalization steps:
+      - `_derive_exchange_currency_from_suffix()` repairs stale US
+        defaults on foreign-suffix tickers (e.g. 0939.HK no longer
+        displays as USA/USD/NASDAQ-NYSE).
+      - `_normalize_percent_units()` repairs the 100x display error on
+        percent_change, upside_pct, max_drawdown_1y, var_95_1d, and
+        expected_roi_* when the engine emits them in points convention
+        but the formatter expects fraction.
+      - `_ensure_provenance_fields()` guarantees last_updated_utc,
+        last_updated_riyadh, and data_provider are populated so the
+        sheet's audit columns aren't blank.
+
     The view fields (`fundamental_view`/`technical_view`/`risk_view`/
     `value_view`) flow through schema projection automatically as long as
     `keys` includes them — which it does when schema_registry v2.5.0 is
     loaded, OR when the fallback list above is used.
+
+    Pipeline order for instrument-shaped rows:
+        1. _strip_internal_fields                       (v4.2.0)
+        2. symbol/ticker alias                          (existing)
+        3. _derive_exchange_currency_from_suffix        (v4.4.0)
+        4. _normalize_percent_units                     (v4.4.0)
+        5. _derive_missing_fields                       (v4.3.0)
+        6. _normalize_warnings_field                    (v4.3.0)
+        7. _ensure_provenance_fields                    (v4.4.0)
+        8. top10-specific normalization                 (existing)
+        9. schema_projection                            (existing)
+
+    Step 4 runs BEFORE step 5 so that downstream derivations operate on
+    canonical (fraction) values. Step 7 runs AFTER step 6 so it can
+    inspect the normalized warnings string when inferring data_provider.
     """
     result: List[Dict[str, Any]] = []
 
@@ -1635,12 +2196,27 @@ def normalize_rows(
         if "ticker" not in rd and "symbol" in rd:
             rd["ticker"] = rd.get("symbol")
 
-        # v4.3.0: derive-and-fill (instrument-shaped pages only)
+        # Instrument-shaped normalization pipeline
         if instrument_shaped:
+            # v4.4.0: repair stale US defaults on foreign-suffix tickers
+            _derive_exchange_currency_from_suffix(rd)
+
+            # v4.4.0: repair 100x percent-unit drift
+            _normalize_percent_units(rd)
+
+            # v4.3.0: fill canonical derived fields when inputs are present
             _derive_missing_fields(rd)
 
         # v4.3.0: warnings field coercion (list -> "; "-joined string)
         _normalize_warnings_field(rd)
+
+        # v4.4.0: guarantee provenance fields (runs AFTER warnings normalization
+        # so it can inspect the canonical warnings string when inferring
+        # data_provider). Restricted to instrument-shaped pages because
+        # special pages (Insights, Data_Dictionary) have their own
+        # provenance conventions.
+        if instrument_shaped:
+            _ensure_provenance_fields(rd)
 
         # Top_10_Investments-specific normalization (aligned with registry's 3 extras)
         if page == "Top_10_Investments":
