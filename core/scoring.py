@@ -2,7 +2,7 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.2.7
+Scoring Module — v5.2.8
 (CANONICAL RECOMMENDATION SOURCE OF TRUTH — PRIORITY-EMITTING — PROVENANCE-TAGGED /
  [PRESERVED v5.2.6] DATA_ENGINE_V2 v5.67.0 FRACTION-CONTRACT ALIGNMENT /
  [PRESERVED v5.2.5] CROSS-PROVIDER CONTRACT ALIGNMENT WITH v4.7.3 / v6.1.0 /
@@ -16,6 +16,72 @@ Scoring Module — v5.2.7
  ACCUMULATE-ALIGNED / 5-TIER + CONVICTION FLOORS /
  INSIGHTS-INTEGRATED / PHANTOM-ROW-SAFE / SCHEMA-ALIGNED /
  v5.53.0 / v5.60.0 / v5.67.0 ENGINE-UNIT COMPATIBLE)
+================================================================================
+
+v5.2.8 changes (vs v5.2.7)  —  FIELD-NAME COLLISION FIX
+--------------------------------------------------------
+Renames the v5.2.7 canonical-priority row field to avoid a name collision
+with the schema v2.7.0 / data_engine_v2 v5.60.0 Decision Matrix surface.
+
+THE COLLISION
+-------------
+v5.2.7 emitted `row["recommendation_priority"]` as a string in P1..P5.
+Schema v2.7.0 / data_engine_v2 v5.60.0 also emit a row field named
+`recommendation_priority` — but as an int in 1..8, identifying which of
+the 8-tier classifier's rules fired (`_classify_8tier`).
+
+Both names landed in different waves; neither shipped to production
+before this fix. Resolution: rename the v5.2.7 emission. The schema
+v2.7.0 owner of the name was declared earlier and has a much larger
+blast radius (schema_registry, data_engine_v2, Apps Script
+04_Format.gs, audit_data_quality), so the v5.2.7 emission moves.
+
+THE RENAME
+----------
+Field name: `recommendation_priority`  →  `recommendation_priority_band`
+Semantic:   P1..P5 priority band (string)  — unchanged
+Constant:   CANONICAL_PRIORITIES = ("P1", "P2", "P3", "P4", "P5") — unchanged
+Source tag: "scoring.py v5.2.7"  →  "scoring.py v5.2.8" (auto-tracked
+            via f-string against __version__).
+
+Sites updated (11 occurrences):
+  - AssetScores dataclass field declaration
+  - derive_canonical_recommendation read site
+  - apply_canonical_recommendation patch dict key
+  - compute_scores AssetScores construction kwarg
+  - score_and_rank_rows post-insights re-sync write
+  - All references in module docstrings and inline comments
+
+No semantic or threshold changes. No other behaviour changes from
+v5.2.7. Idempotency check still uses RECOMMENDATION_SOURCE_TAG —
+which auto-bumps to "scoring.py v5.2.8" — so freshly-scored rows
+match the new constant. Any caller still reading `recommendation`
+(the 5-tier canonical code) is unaffected; `recommendation_reason`
+unchanged.
+
+DOWNSTREAM IMPACT
+-----------------
+- core.scoring_engine bridge v3.4.3 → v3.4.4 (re-exports the new
+  field name; updates `_V527_CASCADE_BRIDGE_FIELDS` →
+  `_V528_CASCADE_BRIDGE_FIELDS`).
+- Apps Script 04_Format.gs: reads `recommendation_priority_band`
+  from row dict to build the `P# [VERDICT]:` Detail string.
+- audit_data_quality / Diagnostic_Report: any grouping by priority
+  reads `recommendation_priority_band` for the P1..P5 view; the
+  separate `recommendation_priority` int (1..8) from schema v2.7.0
+  remains available for rule-which-fired audits.
+- investment_advisor_engine (v3.5.0 → v3.6.0, pending): consumes
+  `apply_canonical_recommendation` which now writes the new key.
+- data_engine_v2._compute_recommendation (pending v5.61.0 update):
+  same.
+
+[PRESERVED VERBATIM] All other v5.2.7 surface: derive_canonical_
+recommendation, apply_canonical_recommendation, CANONICAL_PRIORITIES,
+PRIO_P1..PRIO_P5, RECOMMENDATION_SOURCE_TAG, _compute_priority. All
+v5.2.6 and earlier features. The `_V527_CASCADE_BRIDGE_FIELDS`
+constant in the scoring_engine bridge becomes `_V528_*` to track the
+v5.2.8 row-field contract.
+
 ================================================================================
 
 v5.2.7 changes (vs v5.2.6)  —  CANONICAL RECOMMENDATION SOURCE OF TRUTH
@@ -51,7 +117,7 @@ THE FIX (this file)
 Make scoring.py the SINGLE SOURCE OF TRUTH by emitting two new fields
 that downstream consumers can read from instead of recomputing:
 
-  - recommendation_priority  (P1..P5, computed centrally — see
+  - recommendation_priority_band  (P1..P5, computed centrally — see
                               `_compute_priority`)
   - recommendation_source    (provenance tag — "scoring.py v5.2.7")
 
@@ -189,7 +255,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "5.2.7"
+__version__ = "5.2.8"
 SCORING_VERSION = __version__
 
 # v5.2.7: provenance tag emitted by compute_scores + apply_canonical_recommendation.
@@ -810,7 +876,7 @@ class AssetScores:
     # v5.2.7 additions — appended at end for additive-only schema compatibility.
     # Downstream dict consumers that iterate fields in declaration order are
     # unaffected; new fields are simply tacked on after scoring_errors.
-    recommendation_priority: Optional[str] = None
+    recommendation_priority_band: Optional[str] = None
     recommendation_source: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -2244,10 +2310,10 @@ def derive_canonical_recommendation(
 
     Returns
     -------
-    (recommendation, recommendation_reason, recommendation_priority)
+    (recommendation, recommendation_reason, recommendation_priority_band)
         - recommendation ∈ CANONICAL_RECOMMENDATION_CODES
         - recommendation_reason: aligned to the canonical label
-        - recommendation_priority ∈ CANONICAL_PRIORITIES (P1..P5)
+        - recommendation_priority_band ∈ CANONICAL_PRIORITIES (P1..P5)
 
     Does NOT modify the input row. For mutation, use
     apply_canonical_recommendation().
@@ -2257,7 +2323,7 @@ def derive_canonical_recommendation(
     if existing_tag == RECOMMENDATION_SOURCE_TAG:
         reco = normalize_recommendation_code(row.get("recommendation"))
         reason = _safe_str(row.get("recommendation_reason"))
-        priority = _safe_str(row.get("recommendation_priority"))
+        priority = _safe_str(row.get("recommendation_priority_band"))
 
         # Reconstruct priority if missing or corrupt (defensive against
         # downstream merge code that may drop the field).
@@ -2378,7 +2444,7 @@ def apply_canonical_recommendation(
         Patch dict with keys:
             "recommendation"            — canonical 5-tier label
             "recommendation_reason"     — aligned reason text
-            "recommendation_priority"   — P1..P5 bucket
+            "recommendation_priority_band"   — P1..P5 bucket
             "recommendation_source"     — provenance tag
         Or empty dict ({}) when overwrite=False and row is already
         canonically scored.
@@ -2403,7 +2469,7 @@ def apply_canonical_recommendation(
     return {
         "recommendation": reco,
         "recommendation_reason": reason,
-        "recommendation_priority": priority,
+        "recommendation_priority_band": priority,
         "recommendation_source": RECOMMENDATION_SOURCE_TAG,
     }
 
@@ -2418,7 +2484,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     Score a single row.
 
     v5.2.7 changes (vs v5.2.6):
-      - Emits `recommendation_priority` (P1..P5) computed by
+      - Emits `recommendation_priority_band` (P1..P5) computed by
         `_compute_priority` from the final canonical recommendation +
         the scored overall/risk/confidence/roi3 values. Same priority
         the downstream Recommendation Detail formatter should read.
@@ -2721,7 +2787,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         position_size_hint=pos_hint,
         scoring_errors=scoring_errors,
         # v5.2.7 additions
-        recommendation_priority=priority,
+        recommendation_priority_band=priority,
         recommendation_source=RECOMMENDATION_SOURCE_TAG,
     )
     return scores.to_dict()
@@ -2840,7 +2906,7 @@ def score_and_rank_rows(
     coerced via _view_or_na.
 
     v5.2.7: After the post-insights alignment pass, each row's
-    `recommendation_priority` is recomputed via `_compute_priority`
+    `recommendation_priority_band` is recomputed via `_compute_priority`
     so the priority bucket reflects any change to the canonical
     recommendation from the sector-adjusted re-evaluation. The
     `recommendation_source` provenance tag is also (re)written so
@@ -2902,7 +2968,7 @@ def score_and_rank_rows(
             _rk = _norm_score_0_100(row.get("risk_score"))
             _cf = _norm_score_0_100(row.get("confidence_score"))
             _r3 = _as_roi_fraction(row.get("expected_roi_3m"))
-            row["recommendation_priority"] = _compute_priority(
+            row["recommendation_priority_band"] = _compute_priority(
                 canonical_rec, _ov, _rk, _cf, _r3,
             )
             row["recommendation_source"] = RECOMMENDATION_SOURCE_TAG
