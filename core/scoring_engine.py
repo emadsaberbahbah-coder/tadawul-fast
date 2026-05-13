@@ -2,8 +2,8 @@
 # core/scoring_engine.py
 """
 ================================================================================
-Scoring Engine -- v3.4.3
-(THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.2.7+
+Scoring Engine -- v3.4.4
+(THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.2.8+
  AND core.reco_normalize v7.2.0+)
 ================================================================================
 
@@ -12,6 +12,63 @@ This module is a pure compatibility shim. All scoring logic lives in
 `ScoringEngine`, `compute_scores`, etc. from `core.scoring_engine` --
 this module routes those imports to the canonical implementations in
 `core.scoring`.
+
+================================================================================
+================================================================================
+v3.4.4 changes (vs v3.4.3)  --  FIELD-NAME COLLISION FIX SYNC
+================================================================================
+
+core.scoring v5.2.7 -> v5.2.8 renamed its canonical-priority row field
+to avoid a collision with the schema v2.7.0 / data_engine_v2 v5.60.0
+Decision Matrix surface, which also emits a row field named
+`recommendation_priority` but with different semantics (int 1..8 for
+which 8-tier classifier rule fired, vs. string "P1".."P5" for the
+canonical priority band).
+
+v3.4.4 syncs the bridge to the new field name. Purely additive /
+mechanical:
+
+  Phase A -- Header docstring sync: reference core.scoring v5.2.8+
+             as the canonical floor.
+
+  Phase B -- Row-field constant rename:
+               _V527_CASCADE_BRIDGE_FIELDS  ->  _V528_CASCADE_BRIDGE_FIELDS
+             Element rename inside the tuple:
+               "recommendation_priority"    ->  "recommendation_priority_band"
+             "recommendation_source" element unchanged.
+
+  Phase C -- get_degradation_report() field rename:
+               "v527_cascade_bridge_fields" ->  "v528_cascade_bridge_fields"
+             Type and shape unchanged (tuple of row-field strings).
+
+  Phase D -- Re-exported helper signatures unchanged:
+               derive_canonical_recommendation, apply_canonical_recommendation,
+               RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES,
+               PRIO_P1..PRIO_P5
+             All getattr() fallbacks preserved verbatim.
+
+  Phase E -- is_cascade_bridged() helper unchanged. The
+             _CASCADE_BRIDGE_SYMBOLS tuple still tracks the same 9
+             symbols (the API surface didn't change, only the
+             row-field NAME that compute_scores emits).
+
+  Phase F -- Version bump 3.4.3 -> 3.4.4.
+
+[PRESERVED -- strictly]
+  - Every v3.4.3 public name remains exported.
+  - is_view_aware, is_audit_hardened, is_reco_rule_id_aware,
+    is_cascade_bridged all unchanged.
+  - All v3.4.2 / v3.4.1 / v3.4.0 surface preserved.
+  - The RECOMMENDATION_SOURCE_TAG constant re-exported from
+    core.scoring auto-tracks v5.2.8 ("scoring.py v5.2.8") via the
+    f-string in core.scoring; bridge consumers comparing against the
+    constant get the right value automatically.
+
+No API consumer needs to change unless they were reading the field
+key by literal `"recommendation_priority"` -- which downstream
+investment_advisor_engine, data_engine_v2, and Apps Script
+04_Format.gs callers will be updated to do, all of which are still
+pending behind this bridge update.
 
 ================================================================================
 v3.4.3 changes (vs v3.4.2)  --  v5.2.7 CASCADE-BRIDGE AWARENESS
@@ -51,7 +108,7 @@ then core.scoring has advanced one more revision:
 
     Two new row fields produced by compute_scores / score_row /
     enrich_with_scores:
-      * recommendation_priority   (str; "P1".."P5" bucket)
+      * recommendation_priority_band   (str; "P1".."P5" bucket)
       * recommendation_source     (str; provenance tag)
 
     The scoring math, recommendation ladder, coherence guard, and
@@ -76,9 +133,9 @@ them via introspection helpers and the degradation report.
              still running core.scoring v5.2.0-v5.2.6 gets a working
              bridge with degraded-mode report rather than ImportError.
 
-  Phase C -- NEW _V527_CASCADE_BRIDGE_FIELDS tuple listing the two
+  Phase C -- NEW _V528_CASCADE_BRIDGE_FIELDS tuple listing the two
              additional row fields produced by compute_scores in
-             v5.2.7+: recommendation_priority, recommendation_source.
+             v5.2.7+: recommendation_priority_band, recommendation_source.
              Mirror to _V525_ENRICHMENT_FIELDS. Callers introspect via
              this constant to know what fields to expect from
              canonically-scored rows. Added to __all__.
@@ -97,7 +154,7 @@ them via introspection helpers and the degradation report.
                * cascade_bridge_symbols: {symbol: present_bool}
                * missing_cascade_bridge: [symbols]
                * cascade_bridge_enabled: bool
-               * v527_cascade_bridge_fields: tuple
+               * v528_cascade_bridge_fields: tuple
              Existing report fields preserved verbatim.
 
   Phase G -- Version bump 3.4.2 -> 3.4.3.
@@ -118,7 +175,7 @@ API surface (additions in v3.4.3):
   - derive_canonical_recommendation, apply_canonical_recommendation
   - RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES
   - PRIO_P1, PRIO_P2, PRIO_P3, PRIO_P4, PRIO_P5
-  - _V527_CASCADE_BRIDGE_FIELDS (private constant)
+  - _V528_CASCADE_BRIDGE_FIELDS (private constant)
   - is_cascade_bridged (bridge-level helper)
 
 ================================================================================
@@ -174,7 +231,7 @@ API surface (preserved exports):
 - get_degradation_report, is_view_aware, is_audit_hardened,
   is_reco_rule_id_aware, is_cascade_bridged [v3.4.3]
 - _V525_ENRICHMENT_FIELDS
-- _V527_CASCADE_BRIDGE_FIELDS [v3.4.3]
+- _V528_CASCADE_BRIDGE_FIELDS [v3.4.3]
 - derive_canonical_recommendation [v3.4.3]
 - apply_canonical_recommendation [v3.4.3]
 - RECOMMENDATION_SOURCE_TAG [v3.4.3]
@@ -196,7 +253,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # ---------------------------------------------------------------------------
 
-VERSION = "3.4.3"
+VERSION = "3.4.4"
 # v3.4.2 Phase B (preserved): __version__ alias matches TFB module
 # convention used by core.scoring v5.2.5+, core.reco_normalize v7.2.0+,
 # and insights_builder v7.0.0.
@@ -348,7 +405,7 @@ score_and_rank_rows = _core_scoring.score_and_rank_rows
 #   - data_engine_v2 (drop-in replacement for _compute_recommendation
 #     via the same call)
 #   - Apps Script 04_Format.gs (priority bucket read from
-#     row["recommendation_priority"] instead of recomputed locally)
+#     row["recommendation_priority_band"] instead of recomputed locally)
 #   - Top10 / Insights pages (canonical reason text with priority
 #     prefix)
 
@@ -415,15 +472,15 @@ _V525_ENRICHMENT_FIELDS: Tuple[str, ...] = (
 #     whether to recompute (idempotency guard)
 #   - data_engine_v2: same idempotency guard for its
 #     _compute_recommendation path
-#   - Apps Script 04_Format.gs: reads recommendation_priority to build
+#   - Apps Script 04_Format.gs: reads recommendation_priority_band to build
 #     the "P# [VERDICT]: Fund X | Tech Y | Risk Z | Val W" Detail
 #     string
-#   - audit_data_quality: correlates recommendation_priority against
+#   - audit_data_quality: correlates recommendation_priority_band against
 #     its own AlertPriority enum for cross-stack audit reports
-#   - Diagnostic_Report sheet: groups rows by recommendation_priority
+#   - Diagnostic_Report sheet: groups rows by recommendation_priority_band
 
-_V527_CASCADE_BRIDGE_FIELDS: Tuple[str, ...] = (
-    "recommendation_priority",  # str; "P1".."P5" canonical priority bucket
+_V528_CASCADE_BRIDGE_FIELDS: Tuple[str, ...] = (
+    "recommendation_priority_band",  # str; "P1".."P5" canonical priority bucket
     "recommendation_source",    # str; "scoring.py v5.2.7" provenance tag
 )
 
@@ -546,7 +603,7 @@ def get_degradation_report() -> Dict[str, Any]:
         v5.2.7+ canonical recommendation source-of-truth (added v3.4.3)
       - v525_enrichment_fields: tuple of row field names produced by
         compute_scores in v5.2.5+ (added v3.4.2)
-      - v527_cascade_bridge_fields: tuple of row field names produced
+      - v528_cascade_bridge_fields: tuple of row field names produced
         by compute_scores in v5.2.7+ (added v3.4.3)
       - import_log: list of successful/failed import attempts
       - missing_critical: list of missing CRITICAL symbols (degraded mode)
@@ -614,7 +671,7 @@ def get_degradation_report() -> Dict[str, Any]:
         # v3.4.3 Phase C: surface the v5.2.7 cascade-bridge field contract
         # so downstream consumers (investment_advisor_engine,
         # data_engine_v2, Apps Script 04_Format.gs) can introspect.
-        "v527_cascade_bridge_fields": tuple(_V527_CASCADE_BRIDGE_FIELDS),
+        "v528_cascade_bridge_fields": tuple(_V528_CASCADE_BRIDGE_FIELDS),
         "import_log": list(_import_attempt_log),
         "missing_critical": missing_critical,
         "missing_view": missing_view,
@@ -718,9 +775,9 @@ def is_cascade_bridged() -> bool:
     on canonically-scored rows.
 
     Note: the v5.2.7 behavioural change (compute_scores emits
-    recommendation_priority + recommendation_source on every row)
+    recommendation_priority_band + recommendation_source on every row)
     is signalled by the presence of these row fields; check
-    `_V527_CASCADE_BRIDGE_FIELDS` against a sample compute_scores
+    `_V528_CASCADE_BRIDGE_FIELDS` against a sample compute_scores
     output dict to verify the actual emission, not just the symbol
     surface.
     """
@@ -808,7 +865,7 @@ __all__ = [
     # v3.4.2 Phase C: v5.2.5 enrichment field contract
     "_V525_ENRICHMENT_FIELDS",
     # v3.4.3 Phase C: v5.2.7 cascade-bridge field contract
-    "_V527_CASCADE_BRIDGE_FIELDS",
+    "_V528_CASCADE_BRIDGE_FIELDS",
     # Periods
     "invest_period_label",
     # Recommendation
