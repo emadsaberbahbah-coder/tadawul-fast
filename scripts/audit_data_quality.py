@@ -2,64 +2,46 @@
 """
 scripts/audit_data_quality.py
 ================================================================================
-TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.5.0)
+TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.6.0)
 ================================================================================
 Aligned • Production-safe • Engine-compatible • Async-safe exports • Deterministic
 
-What's improved vs v4.4.0
-- 🔑 FIX CRITICAL: `_get_page_symbols` now correctly handles the DICT payload
-      returned by `integrations.symbols_reader.get_page_symbols(key,
-      spreadsheet_id=...)`. Per the canonical contract of
-      `core.symbols_reader` (re-exported via `integrations.symbols_reader`
-      v3.0.0), `get_page_symbols()` returns
-      `{"symbols": [...], "all": [...], "ksa": [...], "global": [...],
-       "by_type": {...}, "metadata": [...], "status": "...", "error": "..."}`
-      — NOT a plain list. v4.4.0's isinstance(res, (list, tuple, set)) check
-      silently dropped these dict payloads to an empty list, so the auditor
-      reported "No symbols for page=..." for every page on any deployment
-      where `get_symbols_for_page` isn't also exposed as a sync wrapper.
-      v4.5.0 prefers dict["symbols"] then dict["all"] then dict["ksa"+
-      "global"], then falls back to the sibling functions
-      `get_symbols_for_page` / `list_symbols_for_page` / `get_symbols` /
-      `list_symbols` / `read_page_symbols`.
-- FIX: `_TRUTHY` realigned to exact `main._TRUTHY` vocabulary (drops
-      `"active"` outlier). `_FALSY` added for symmetry.
-- FIX: `_load_deps` now records which symbols_reader module variant
-      succeeded (exposed in the diagnostic log line).
-- FIX: `SCRIPT_VERSION` alias exposed alongside `SERVICE_VERSION` for
-      cross-script consistency.
-- FIX: `_CPU_EXECUTOR` shutdown now also runs in a `try/finally` around
-      `run_audit()` library usage — not just `main()`. Prevents thread-pool
-      leaks when this module is imported and orchestrated from elsewhere.
-- FIX: `_get_page_symbols` preserves input order when extracting symbol
-      lists from dict payloads (previously mixed order from by_type buckets).
-- ALIGN: docstring names the canonical deps:
-      - integrations.symbols_reader v3.0.0 (bridge to core.symbols_reader)
-      - core.data_engine v6.x (get_enriched_quotes batch / get_enriched_quote)
-- KEEP: stable CLI contract, exit-code policy, JSON/CSV/Parquet/Excel export
-      formats, timestamp parsing, HMAC signing, all audit heuristics.
-
-CLI examples
-- python scripts/audit_data_quality.py --keys MARKET_LEADERS MY_PORTFOLIO \
-    --sheet-id "<SID>" --refresh 1 --json-out report.json --csv-out alerts.csv
-- python scripts/audit_data_quality.py --keys MARKET_LEADERS --max-symbols 200 \
-    --refresh 0 --alerts-only 1
-- python scripts/audit_data_quality.py --keys MARKET_LEADERS --include-ok 1 --top 20
-
-Environment
-- DEFAULT_SPREADSHEET_ID : fallback Sheet ID
-- AUDIT_BATCH_SIZE       : default 200
-- AUDIT_MAX_WORKERS      : thread pool size for file exports
-- AUDIT_HMAC_KEY         : optional HMAC signing for exported JSON
-
-Canonical dependencies
-- integrations.symbols_reader (or symbols_reader / core.symbols_reader)
-  - `get_page_symbols(key, spreadsheet_id=...)` → returns Dict
-  - `get_symbols_for_page(page=..., spreadsheet_id=..., limit=...)` → returns List[str]
-  - `list_symbols_for_page(...)` / `get_symbols(...)` / `list_symbols(...)` → List[str]
-- core.data_engine  (or core.data_engine_v2)
-  - `get_enriched_quotes(symbols, use_cache=True, ttl=None)` → List[UnifiedQuote|dict]
-  - `get_enriched_quote(symbol, use_cache=True, ttl=None)` → UnifiedQuote|dict
+What's improved vs v4.5.0  —  DATA_ENGINE_V2 v5.67.0 FRACTION-CONTRACT ALIGNMENT
+- 🔑 ALIGN: data_engine_v2 v5.67.0 (May 13 2026) switched four percent-unit
+      fields from POINTS to FRACTION to match 04_Format.gs v2.7.0's
+      `_KNOWN_FRACTION_PERCENT_COLUMNS_`:
+        - percent_change             ([-0.50, +0.50] daily cap)
+        - upside_pct                 ([-0.90, +2.00] cap)
+        - max_drawdown_1y            (signed; [-1.0, 0])
+        - var_95_1d                  (typically < 0.10)
+      v4.5.0 still treated `percent_change` as POINTS — so its 60% daily
+      threshold (`max_abs_change_pct`) and the 30% PRICE_SPIKE threshold
+      in `_detect_basic_anomalies` compared against fraction values like
+      0.025 (= 2.5% daily) and never fired for any move under +/-60% in
+      fraction form (= +/-6000% in points). SILENT REGRESSION: legitimate
+      +/-60% daily moves on v5.67.0 data went unflagged.
+- 🔑 NEW: `AuditConfig.percent_change_contract` — defaults to "fraction"
+      (v5.67.0+ canonical). Legacy "points" mode preserved for pre-v5.67.0
+      cached/snapshot data via `--legacy-percent-units 1` CLI flag or
+      `AUDIT_PERCENT_CONTRACT=points` env var.
+- 🔑 NEW: `_as_percent_change_points()` helper — converts fraction or
+      points input to consistent POINTS form using the configured contract.
+- 🔑 NEW: UNIT_DRIFT defense layer. `_audit_unit_drift_fraction_fields()`
+      flags rows where any of the four v5.67.0 fraction fields exceeds
+      plausible bounds:
+        - |percent_change| > 1.0  (>100% daily move impossible)
+        - |upside_pct| > 5.0      (>500% upside ≈ synthesizer bug)
+        - |max_drawdown_1y| > 1.0 (>100% drawdown impossible)
+        - |var_95_1d| > 1.0       (>100% VaR impossible)
+- 🔑 NEW: Engine-warning-tag surfacing (mirrors scoring.py v5.2.5 PHASE-L):
+        - "percent_change_recomputed"            → PROVIDER_PERCENT_RECOMPUTED (LOW)
+        - "percent_change_clamped_from_provider" → PROVIDER_PERCENT_CLAMPED (MEDIUM)
+        - "percent_change_suspect_dropped"       → PROVIDER_PERCENT_DROPPED (HIGH)
+- 🔑 NEW: `AuditConfig.enable_unit_drift_detection` (default True).
+- KEEP: every v4.5.0 fix preserved — `_get_page_symbols` dict handling,
+      `_extract_symbols_from_reader_payload`, `_TRUTHY`/`_FALSY`,
+      `SCRIPT_VERSION` alias, executor try/finally, async-safe exports,
+      HMAC signing, exit codes.
 
 Exit codes (stable)
 - 0 = no MEDIUM/HIGH/CRITICAL
@@ -85,7 +67,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 # -----------------------------------------------------------------------------
 # High-performance JSON (orjson optional)
@@ -144,7 +126,7 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-SERVICE_VERSION = "4.5.0"
+SERVICE_VERSION = "4.6.0"
 SCRIPT_VERSION = SERVICE_VERSION  # v4.5.0: alias for cross-script consistency
 
 logger = logging.getLogger("TFB.Audit")
@@ -155,7 +137,7 @@ logging.basicConfig(
 )
 
 # -----------------------------------------------------------------------------
-# Executors (global, persistent) - used ONLY for file writes / CPU-light work
+# Executors
 # -----------------------------------------------------------------------------
 def _clamp_int(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
@@ -171,7 +153,7 @@ _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 def _shutdown_executor(wait: bool = False) -> None:
     """Idempotent shutdown helper. Safe to call multiple times / in finally."""
     try:
-        _CPU_EXECUTOR.shutdown(wait=wait, cancel_futures=True)  # py3.9+
+        _CPU_EXECUTOR.shutdown(wait=wait, cancel_futures=True)
     except Exception:
         try:
             _CPU_EXECUTOR.shutdown(wait=wait)
@@ -224,6 +206,27 @@ class AlertPriority(str, Enum):
 
 
 # -----------------------------------------------------------------------------
+# v4.6.0 — Unit-contract constants
+# -----------------------------------------------------------------------------
+PERCENT_CONTRACT_FRACTION = "fraction"
+PERCENT_CONTRACT_POINTS = "points"
+_PERCENT_CONTRACT_CHOICES: Set[str] = {PERCENT_CONTRACT_FRACTION, PERCENT_CONTRACT_POINTS}
+
+_UNIT_DRIFT_BOUNDS_FRACTION: Dict[str, float] = {
+    "percent_change":   1.0,
+    "upside_pct":       5.0,
+    "max_drawdown_1y":  1.0,
+    "var_95_1d":        1.0,
+}
+
+_ENGINE_WARNING_TO_ISSUE: Dict[str, str] = {
+    "percent_change_recomputed":            "PROVIDER_PERCENT_RECOMPUTED",
+    "percent_change_clamped_from_provider": "PROVIDER_PERCENT_CLAMPED",
+    "percent_change_suspect_dropped":       "PROVIDER_PERCENT_DROPPED",
+}
+
+
+# -----------------------------------------------------------------------------
 # Config + Results
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
@@ -235,11 +238,17 @@ class AuditConfig:
     max_abs_change_pct: float = 60.0
     min_confidence_pct: float = 30.0
 
-    # history expectations (lightweight)
     min_history_points_soft: int = 60
     min_history_points_hard: int = 20
 
-    # output (informational)
+    # v4.6.0 — unit-contract for percent_change interpretation.
+    # "fraction" matches engine v5.67.0+ (default). Use "points" for
+    # pre-v5.67.0 cached/snapshot data.
+    percent_change_contract: str = PERCENT_CONTRACT_FRACTION
+
+    # v4.6.0 — toggle the UNIT_DRIFT_* defense layer.
+    enable_unit_drift_detection: bool = True
+
     export_formats: List[str] = field(default_factory=lambda: ["json", "csv"])
 
     def to_dict(self) -> Dict[str, Any]:
@@ -356,8 +365,6 @@ class AuditSummary:
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
-# v4.5.0: project-wide truthy/falsy vocabulary — matches main._TRUTHY / _FALSY.
-# (v4.4.0 had `"active"` as an outlier in _TRUTHY and no _FALSY set.)
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 
@@ -399,17 +406,9 @@ def _riyadh_iso(utc_iso_str: Optional[str] = None) -> str:
 
 
 def _parse_any_time(value: Any) -> Optional[datetime]:
-    """
-    Accepts:
-    - ISO strings (with optional Z)
-    - common formats: "YYYY-MM-DD HH:MM:SS" (UTC assumed)
-    - epoch seconds/ms (int/float or digit strings)
-    Never throws.
-    """
     if value is None:
         return None
 
-    # epoch numeric
     if isinstance(value, (int, float)) and value > 0:
         try:
             secs = float(value) / 1000.0 if float(value) > 2_000_000_000 else float(value)
@@ -423,7 +422,6 @@ def _parse_any_time(value: Any) -> Optional[datetime]:
 
     s = s.replace("Z", "+00:00").strip()
 
-    # epoch numeric string
     if s.isdigit():
         try:
             n = int(s)
@@ -432,7 +430,6 @@ def _parse_any_time(value: Any) -> Optional[datetime]:
         except Exception:
             pass
 
-    # ISO
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
@@ -441,7 +438,6 @@ def _parse_any_time(value: Any) -> Optional[datetime]:
     except Exception:
         pass
 
-    # common fallbacks
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d"):
         try:
             dt2 = datetime.strptime(s, fmt)  # noqa: DTZ007
@@ -547,6 +543,151 @@ def _chunk(lst: List[str], n: int) -> List[List[str]]:
 
 
 # -----------------------------------------------------------------------------
+# v4.6.0 — Engine v5.67.0 contract helpers
+# -----------------------------------------------------------------------------
+
+def _as_percent_change_points(value: Any, contract: str = PERCENT_CONTRACT_FRACTION) -> Optional[float]:
+    """
+    v4.6.0: Normalize a `percent_change`-style value to consistent POINTS form
+    using the configured contract.
+
+    Engine v5.67.0+ emit contract is FRACTION (e.g., 0.025 for +2.5% daily).
+    Pre-v5.67.0 engines emitted POINTS (e.g., 2.5).
+
+    Behavior:
+      contract == "fraction"  ->  multiply input by 100 (assumes fraction storage)
+      contract == "points"    ->  pass through (assumes points storage)
+      unknown contract        ->  defaults to "fraction"
+
+    None inputs pass through as None. Invalid coercions return None.
+    """
+    f = _safe_float(value, None)
+    if f is None:
+        return None
+
+    c = (contract or PERCENT_CONTRACT_FRACTION).strip().lower()
+    if c == PERCENT_CONTRACT_POINTS:
+        return f
+    return f * 100.0
+
+
+def _warning_tags_from_row(q: Mapping[str, Any]) -> Set[str]:
+    """
+    v4.6.0: Parse the row's `warnings` field into a set of normalized tags.
+    Mirrors the scoring.py v5.2.5 `_warning_tags_from_row` helper.
+
+    Handles:
+      - None / "" / missing -> empty set
+      - "; "-joined string (engine v5.67.0 canonical shape)
+      - Accidental List[str] / Tuple[str] / Set[str] input
+
+    For "key:value" tags both the full tag and the bare key are added.
+    """
+    if q is None:
+        return set()
+    if not isinstance(q, Mapping):
+        return set()
+    raw = q.get("warnings")
+    if raw is None:
+        return set()
+
+    parts: List[str] = []
+    if isinstance(raw, str):
+        for piece in raw.split(";"):
+            s = piece.strip()
+            if s:
+                parts.append(s)
+    elif isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            if item is None:
+                continue
+            try:
+                s = str(item).strip()
+            except Exception:
+                continue
+            if s:
+                parts.append(s)
+    else:
+        try:
+            s = str(raw).strip()
+        except Exception:
+            s = ""
+        if s:
+            parts.append(s)
+
+    out: Set[str] = set()
+    for p in parts:
+        out.add(p)
+        if ":" in p:
+            bare = p.split(":", 1)[0].strip()
+            if bare:
+                out.add(bare)
+    return out
+
+
+def _audit_unit_drift_fraction_fields(q: Mapping[str, Any]) -> List[str]:
+    """
+    v4.6.0: UNIT_DRIFT defense layer.
+
+    Engine v5.67.0 emits four fields in FRACTION form with bounded cap
+    ranges. If any of these arrives with magnitude exceeding plausible
+    bounds, the data has almost certainly come from a pre-v5.67.0 source
+    (still in POINTS form) or there's a regression in the emit path.
+
+    Bounds per `_UNIT_DRIFT_BOUNDS_FRACTION`:
+      - |percent_change| > 1.0  : >100% daily impossible
+      - |upside_pct| > 5.0      : >500% upside ≈ synthesizer / unit bug
+      - |max_drawdown_1y| > 1.0 : >100% drawdown impossible
+      - |var_95_1d| > 1.0       : >100% VaR impossible
+
+    Returns a list of issue tag strings. Empty list when all fields look
+    legitimate or are missing.
+    """
+    if not isinstance(q, Mapping):
+        return []
+
+    out: List[str] = []
+
+    pc_raw = q.get("percent_change") if "percent_change" in q else q.get("change_pct")
+    pc = _safe_float(pc_raw, None)
+    if pc is not None and abs(pc) > _UNIT_DRIFT_BOUNDS_FRACTION["percent_change"]:
+        out.append("UNIT_DRIFT_PERCENT_CHANGE")
+
+    up = _safe_float(q.get("upside_pct"), None)
+    if up is not None and abs(up) > _UNIT_DRIFT_BOUNDS_FRACTION["upside_pct"]:
+        out.append("UNIT_DRIFT_UPSIDE")
+
+    dd = _safe_float(q.get("max_drawdown_1y"), None)
+    if dd is not None and abs(dd) > _UNIT_DRIFT_BOUNDS_FRACTION["max_drawdown_1y"]:
+        out.append("UNIT_DRIFT_DRAWDOWN")
+
+    var = _safe_float(q.get("var_95_1d"), None)
+    if var is not None and abs(var) > _UNIT_DRIFT_BOUNDS_FRACTION["var_95_1d"]:
+        out.append("UNIT_DRIFT_VAR")
+
+    return out
+
+
+def _audit_engine_warning_tags(q: Mapping[str, Any]) -> List[str]:
+    """
+    v4.6.0: Surface engine-side data repairs as audit issues.
+
+      "percent_change_recomputed"            -> PROVIDER_PERCENT_RECOMPUTED
+      "percent_change_clamped_from_provider" -> PROVIDER_PERCENT_CLAMPED
+      "percent_change_suspect_dropped"       -> PROVIDER_PERCENT_DROPPED
+    """
+    tags = _warning_tags_from_row(q)
+    if not tags:
+        return []
+
+    out: List[str] = []
+    for engine_tag, audit_tag in _ENGINE_WARNING_TO_ISSUE.items():
+        if engine_tag in tags:
+            out.append(audit_tag)
+    return out
+
+
+# -----------------------------------------------------------------------------
 # Deps: symbols_reader + core.data_engine
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
@@ -564,9 +705,6 @@ def _load_deps() -> Deps:
     de = None
     err = None
 
-    # symbols reader: try known locations in priority order.
-    # integrations.symbols_reader v3.0.0 is the canonical bridge; the other
-    # names are fallbacks for partial-repo states.
     for mod_name in (
         "integrations.symbols_reader",
         "symbols_reader",
@@ -580,8 +718,6 @@ def _load_deps() -> Deps:
         except Exception:
             sr = None
 
-    # data engine wrapper: core.data_engine v6.x is canonical; v2 is the
-    # legacy variant. Try both.
     for de_name in ("core.data_engine", "core.data_engine_v2"):
         try:
             de = __import__(de_name, fromlist=["*"])
@@ -607,38 +743,19 @@ def _extract_symbols_from_reader_payload(res: Any) -> List[str]:
     """
     v4.5.0: canonical extractor for symbols_reader return payloads.
     Handles both list-style and dict-style returns.
-
-    The canonical dict shape (per integrations.symbols_reader v3.0.0,
-    which re-exports core.symbols_reader) is:
-        {
-            "all":     [...],   # canonical all
-            "symbols": [...],   # canonical preferred (CLI default)
-            "ksa":     [...],
-            "global":  [...],
-            "by_type": {...},
-            "metadata": [...],
-            "status":  "success" | "error",
-            "error":   "...",
-            "version": "x.y.z",
-        }
     """
     if res is None:
         return []
 
-    # List-style: legacy and some sibling wrappers (get_symbols_for_page, etc.)
     if isinstance(res, (list, tuple, set)):
         return [_norm_symbol(x) for x in res if _norm_symbol(x)]
 
-    # Dict-style: canonical get_page_symbols / get_universe shape.
     if isinstance(res, dict):
-        # Preferred order: `symbols` (CLI default), then `all`, then
-        # union of `ksa` + `global` preserving order.
         for key in ("symbols", "all"):
             seq = res.get(key)
             if isinstance(seq, (list, tuple, set)) and seq:
                 return [_norm_symbol(x) for x in seq if _norm_symbol(x)]
 
-        # Fallback: combine ksa + global (preserve input order, dedupe)
         merged: List[str] = []
         seen: Set[str] = set()
         for key in ("ksa", "global"):
@@ -653,7 +770,6 @@ def _extract_symbols_from_reader_payload(res: Any) -> List[str]:
         if merged:
             return merged
 
-        # Last resort: inspect by_type buckets
         by_type = res.get("by_type")
         if isinstance(by_type, dict):
             out: List[str] = []
@@ -674,23 +790,11 @@ def _extract_symbols_from_reader_payload(res: Any) -> List[str]:
 
 def _get_page_symbols(symbols_reader: Any, page_key: str, spreadsheet_id: str) -> List[str]:
     """
-    v4.5.0: handles both dict-style (`get_page_symbols`) and list-style
-    (`get_symbols_for_page`, etc.) return types.
-
-    Candidate resolution order (first callable that yields a non-empty
-    extraction wins):
-      1. get_page_symbols(key, spreadsheet_id=...)  → DICT payload
-      2. get_symbols_for_page(page=..., spreadsheet_id=..., limit=...)  → LIST
-      3. list_symbols_for_page(page=..., spreadsheet_id=..., limit=...)  → LIST
-      4. get_symbols(page=..., spreadsheet_id=..., limit=...)  → LIST
-      5. list_symbols(page=..., spreadsheet_id=..., limit=...)  → LIST
-      6. read_page_symbols(key, spreadsheet_id=...)  → LIST (legacy)
+    v4.5.0: handles both dict-style and list-style return types.
     """
     if symbols_reader is None:
         return []
 
-    # Order matters: get_page_symbols is the canonical entry per
-    # core.symbols_reader / integrations.symbols_reader v3.0.0.
     named_candidates: Tuple[Tuple[str, Dict[str, Any]], ...] = (
         ("get_page_symbols", {"call_style": "positional_key"}),
         ("get_symbols_for_page", {"call_style": "kw_page"}),
@@ -709,21 +813,17 @@ def _get_page_symbols(symbols_reader: Any, page_key: str, spreadsheet_id: str) -
         res: Any = None
         try:
             if call_style == "positional_key":
-                # Canonical: fn(page_key, spreadsheet_id=...)
                 try:
                     res = fn(page_key, spreadsheet_id=spreadsheet_id)
                 except TypeError:
-                    # Some legacy variants take (spreadsheet_id, key)
                     try:
                         res = fn(spreadsheet_id, page_key)
                     except Exception:
                         res = None
             elif call_style == "kw_page":
-                # Canonical: fn(page=..., spreadsheet_id=..., limit=...)
                 try:
                     res = fn(page=page_key, spreadsheet_id=spreadsheet_id)
                 except TypeError:
-                    # Some variants use `sheet=` or positional
                     try:
                         res = fn(sheet=page_key, spreadsheet_id=spreadsheet_id)
                     except TypeError:
@@ -742,7 +842,7 @@ def _get_page_symbols(symbols_reader: Any, page_key: str, spreadsheet_id: str) -
 
 
 # -----------------------------------------------------------------------------
-# Fetch quotes (aligned with core.data_engine public API)
+# Fetch quotes
 # -----------------------------------------------------------------------------
 def _obj_to_dict(x: Any) -> Dict[str, Any]:
     if x is None:
@@ -774,10 +874,6 @@ def _coerce_symbol_from_quote(q: Dict[str, Any]) -> str:
 
 
 def _pick_timestamp_utc(q: Dict[str, Any]) -> str:
-    """
-    Tries multiple keys; returns best-effort ISO string or "".
-    Never throws.
-    """
     for k in (
         "last_updated_utc",
         "forecast_updated_utc",
@@ -805,15 +901,6 @@ async def _fetch_quotes_map(
     ttl: Optional[int],
     batch_size: int,
 ) -> Dict[str, Dict[str, Any]]:
-    """
-    Uses `core.data_engine.get_enriched_quotes()` if available; otherwise falls
-    back to per-symbol calls.
-
-    Per core.data_engine v6.x contract:
-      - get_enriched_quotes(symbols, use_cache=True, ttl=None) → List[UnifiedQuote]
-      - get_enriched_quote(symbol, use_cache=True, ttl=None)   → UnifiedQuote
-    Returns: { SYMBOL: quote_dict }
-    """
     de = DEPS.data_engine
     if de is None:
         return {s: {"error": "core.data_engine not available"} for s in symbols}
@@ -827,7 +914,6 @@ async def _fetch_quotes_map(
     get_many = getattr(de, "get_enriched_quotes", None)
     get_one = getattr(de, "get_enriched_quote", None)
 
-    # Batch path
     if callable(get_many):
         for part in _chunk(symbols, max(1, int(batch_size))):
             try:
@@ -838,20 +924,16 @@ async def _fetch_quotes_map(
                         out[s] = {"error": "engine returned None"}
                     continue
 
-                # dict mapping (rare for core.data_engine, common for stubs)
                 if isinstance(res, dict):
                     for k, v in res.items():
                         kk = _norm_symbol(k)
                         if kk:
                             out[kk] = _obj_to_dict(v)
-                    # ensure placeholders for missing
                     for s in part:
                         out.setdefault(s, {"error": "missing quote row"})
                     continue
 
-                # list/tuple result (canonical for core.data_engine v6.x)
                 if isinstance(res, (list, tuple)):
-                    # Prefer embedded symbol mapping
                     temp: Dict[str, Dict[str, Any]] = {}
                     for item in res:
                         qd = _obj_to_dict(item)
@@ -861,7 +943,6 @@ async def _fetch_quotes_map(
 
                     if temp:
                         out.update(temp)
-                        # Fill missing by index alignment (best-effort)
                         for idx, s in enumerate(part):
                             if s in out:
                                 continue
@@ -871,7 +952,6 @@ async def _fetch_quotes_map(
                                 out[s] = {"error": "missing quote row"}
                         continue
 
-                    # Otherwise assume order aligns with input
                     for idx, s in enumerate(part):
                         if idx < len(res):
                             out[s] = _obj_to_dict(res[idx])
@@ -879,7 +959,6 @@ async def _fetch_quotes_map(
                             out[s] = {"error": "missing quote row"}
                     continue
 
-                # Unexpected type
                 for s in part:
                     out[s] = {"error": f"unexpected get_enriched_quotes type: {type(res).__name__}"}
 
@@ -887,7 +966,6 @@ async def _fetch_quotes_map(
                 for s in part:
                     out[s] = {"error": f"get_enriched_quotes failed: {e}"}
 
-        # fill missing with per-symbol (rare)
         missing = [s for s in symbols if s not in out]
         if missing and callable(get_one):
             for s in missing:
@@ -899,7 +977,6 @@ async def _fetch_quotes_map(
 
         return out
 
-    # Per-symbol fallback
     if callable(get_one):
         sem = asyncio.Semaphore(24)
 
@@ -918,7 +995,7 @@ async def _fetch_quotes_map(
 
 
 # -----------------------------------------------------------------------------
-# Audit logic
+# Audit logic — v4.6.0 Phase Q applied
 # -----------------------------------------------------------------------------
 def _coerce_confidence_pct(x: Any) -> float:
     v = _safe_float(x, 0.0) or 0.0
@@ -941,8 +1018,16 @@ def _derive_provider(q: Dict[str, Any]) -> str:
 
 
 def _detect_basic_anomalies(q: Dict[str, Any], config: AuditConfig) -> List[AnomalyType]:
+    """
+    v4.6.0: PRICE_SPIKE check uses `_as_percent_change_points()` so the
+    engine v5.67.0 fraction contract maps correctly to the points-form
+    30%-threshold.
+    """
     anomalies: List[AnomalyType] = []
-    chg = _safe_float(q.get("percent_change") or q.get("change_pct"), None)
+
+    raw_chg = q.get("percent_change") if "percent_change" in q else q.get("change_pct")
+    chg = _as_percent_change_points(raw_chg, config.percent_change_contract)
+
     if chg is not None and abs(chg) >= max(30.0, config.max_abs_change_pct * 0.75):
         anomalies.append(AnomalyType.PRICE_SPIKE)
 
@@ -962,6 +1047,9 @@ def _detect_basic_anomalies(q: Dict[str, Any], config: AuditConfig) -> List[Anom
 
 
 def _remediation_for_issues(issues: List[str]) -> List[RemediationAction]:
+    """
+    v4.6.0: extended with paths for UNIT_DRIFT_* and PROVIDER_PERCENT_* tags.
+    """
     actions: List[RemediationAction] = []
     for i in issues[:3]:
         if i in {"ZERO_PRICE", "PROVIDER_ERROR", "HARD_STALE_DATA"}:
@@ -972,6 +1060,51 @@ def _remediation_for_issues(issues: List[str]) -> List[RemediationAction]:
                     priority=AlertPriority.P1,
                     estimated_time_minutes=10,
                     automated=True,
+                )
+            )
+        elif i in {
+            "UNIT_DRIFT_PERCENT_CHANGE",
+            "UNIT_DRIFT_UPSIDE",
+            "UNIT_DRIFT_DRAWDOWN",
+            "UNIT_DRIFT_VAR",
+        }:
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Force refresh row (--refresh 1) to invoke engine v5.67.0+; if drift persists, check engine emit path for unit regression",
+                    priority=AlertPriority.P2,
+                    estimated_time_minutes=15,
+                    automated=False,
+                )
+            )
+        elif i == "PROVIDER_PERCENT_DROPPED":
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Investigate provider feed: percent_change garbage with no recoverable ground-truth (price/previous_close missing)",
+                    priority=AlertPriority.P2,
+                    estimated_time_minutes=20,
+                    automated=False,
+                )
+            )
+        elif i == "PROVIDER_PERCENT_CLAMPED":
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Provider sent percent_change outside ±50% daily cap; engine clamped. Verify provider unit contract.",
+                    priority=AlertPriority.P3,
+                    estimated_time_minutes=20,
+                    automated=False,
+                )
+            )
+        elif i == "PROVIDER_PERCENT_RECOMPUTED":
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Engine recomputed percent_change from price/previous_close (provider value disagreed). No action unless widespread.",
+                    priority=AlertPriority.P4,
+                    estimated_time_minutes=10,
+                    automated=False,
                 )
             )
         elif i in {"STALE_DATA"}:
@@ -1008,6 +1141,9 @@ def _remediation_for_issues(issues: List[str]) -> List[RemediationAction]:
 
 
 def _compute_quality_score(q: Dict[str, Any], config: AuditConfig) -> Tuple[float, DataQuality]:
+    """
+    v4.6.0: unit-drift penalty (10 pts per drift, cap 30) when enabled.
+    """
     score = 100.0
     price = _safe_float(q.get("current_price") or q.get("price"), None)
     if price is None:
@@ -1039,6 +1175,11 @@ def _compute_quality_score(q: Dict[str, Any], config: AuditConfig) -> Tuple[floa
     if 0 < conf < config.min_confidence_pct:
         score -= 5
 
+    if config.enable_unit_drift_detection:
+        drift_count = len(_audit_unit_drift_fraction_fields(q))
+        if drift_count > 0:
+            score -= min(30.0, 10.0 * drift_count)
+
     score = float(max(0.0, min(100.0, score)))
     if score >= 90:
         return score, DataQuality.EXCELLENT
@@ -1052,12 +1193,36 @@ def _compute_quality_score(q: Dict[str, Any], config: AuditConfig) -> Tuple[floa
 
 
 def _compute_severity(issues: List[str], quality: DataQuality) -> AuditSeverity:
+    """
+    v4.6.0: severity buckets updated for the new issue tags.
+      HIGH:    + UNIT_DRIFT_*  + PROVIDER_PERCENT_DROPPED
+      MEDIUM:  + PROVIDER_PERCENT_CLAMPED
+      LOW:     + PROVIDER_PERCENT_RECOMPUTED (when alone)
+    """
     if any(i in {"PROVIDER_ERROR", "ZERO_PRICE", "HARD_STALE_DATA", "ZOMBIE_TICKER"} for i in issues):
         return AuditSeverity.CRITICAL
+
+    if any(i in {
+        "UNIT_DRIFT_PERCENT_CHANGE",
+        "UNIT_DRIFT_UPSIDE",
+        "UNIT_DRIFT_DRAWDOWN",
+        "UNIT_DRIFT_VAR",
+        "PROVIDER_PERCENT_DROPPED",
+    } for i in issues):
+        return AuditSeverity.HIGH
+
     if issues and quality in {DataQuality.POOR, DataQuality.CRITICAL}:
         return AuditSeverity.HIGH
+
+    if "PROVIDER_PERCENT_CLAMPED" in issues:
+        return AuditSeverity.MEDIUM
+
+    if issues == ["PROVIDER_PERCENT_RECOMPUTED"]:
+        return AuditSeverity.LOW
+
     if issues:
         return AuditSeverity.MEDIUM
+
     return AuditSeverity.OK
 
 
@@ -1075,11 +1240,21 @@ def _compute_provider_health(q: Dict[str, Any], config: AuditConfig) -> Provider
 
 
 async def _audit_one(symbol: str, page: str, q: Dict[str, Any], config: AuditConfig) -> AuditResult:
+    """
+    v4.6.0 changes:
+      - percent_change normalized via `_as_percent_change_points`.
+      - Unit-drift detection via `_audit_unit_drift_fraction_fields`.
+      - Engine-warning surfacing via `_audit_engine_warning_tags`.
+      - `AuditResult.change_pct` always in POINTS form for display.
+    """
     symbol_n = _norm_symbol(symbol) or safe_str(symbol, "UNKNOWN")
     provider = _derive_provider(q)
 
     price = _safe_float(q.get("current_price") or q.get("price"), None)
-    chg_pct = _safe_float(q.get("percent_change") or q.get("change_pct"), None)
+
+    raw_chg = q.get("percent_change") if "percent_change" in q else q.get("change_pct")
+    chg_pct = _as_percent_change_points(raw_chg, config.percent_change_contract)
+
     volume = _safe_int(q.get("volume"), 0) or None
     mcap = _safe_float(q.get("market_cap"), None)
 
@@ -1113,6 +1288,17 @@ async def _audit_one(symbol: str, page: str, q: Dict[str, Any], config: AuditCon
     dq_raw = safe_str(q.get("data_quality"), "").strip().upper()
     if ("ZERO_PRICE" in issues and ("STALE_DATA" in issues or "HARD_STALE_DATA" in issues)) or dq_raw in {"MISSING", "BAD"}:
         issues.append("ZOMBIE_TICKER")
+
+    if config.enable_unit_drift_detection:
+        drift_tags = _audit_unit_drift_fraction_fields(q)
+        for tag in drift_tags:
+            if tag not in issues:
+                issues.append(tag)
+
+    warning_issue_tags = _audit_engine_warning_tags(q)
+    for tag in warning_issue_tags:
+        if tag not in issues:
+            issues.append(tag)
 
     _, quality = _compute_quality_score(q, config)
     anomalies = _dedupe_enum_preserve(_detect_basic_anomalies(q, config))
@@ -1203,21 +1389,10 @@ async def _export_csv(path: str, results: List[AuditResult]) -> None:
 
     loop = asyncio.get_running_loop()
     headers = [
-        "symbol",
-        "page",
-        "provider",
-        "severity",
-        "data_quality",
-        "provider_health",
-        "price",
-        "change_pct",
-        "age_hours",
-        "history_points",
-        "confidence_pct",
-        "issues",
-        "anomalies",
-        "error",
-        "last_updated_utc",
+        "symbol", "page", "provider", "severity", "data_quality",
+        "provider_health", "price", "change_pct", "age_hours",
+        "history_points", "confidence_pct", "issues", "anomalies",
+        "error", "last_updated_utc",
     ]
 
     def _write() -> None:
@@ -1309,9 +1484,11 @@ async def run_audit(
         return [], AuditSummary()
 
     logger.info(
-        "Deps OK | symbols_reader=%s | data_engine=%s",
+        "Deps OK | symbols_reader=%s | data_engine=%s | percent_contract=%s | unit_drift=%s",
         DEPS.symbols_reader_module_name or "(anon)",
         getattr(DEPS.data_engine, "__name__", "core.data_engine"),
+        config.percent_change_contract,
+        config.enable_unit_drift_detection,
     )
 
     sid = (spreadsheet_id or os.getenv("DEFAULT_SPREADSHEET_ID", "")).strip()
@@ -1320,7 +1497,7 @@ async def run_audit(
         return [], AuditSummary()
 
     use_cache = not bool(refresh)
-    ttl = None  # respect engine defaults
+    ttl = None
     batch_size = max(50, int(os.getenv("AUDIT_BATCH_SIZE", "200") or "200"))
 
     sem = asyncio.Semaphore(max(1, min(int(concurrency), 48)))
@@ -1374,6 +1551,21 @@ def _severity_rank(s: AuditSeverity) -> int:
     return order.get(s, 99)
 
 
+def _resolve_percent_contract_from_env_and_flag(flag_legacy: int) -> str:
+    """
+    v4.6.0: contract resolution order:
+      1. CLI flag --legacy-percent-units 1   -> "points"
+      2. AUDIT_PERCENT_CONTRACT env var      -> "points" / "fraction"
+      3. Default                              -> "fraction" (v5.67.0+)
+    """
+    if int(flag_legacy or 0) == 1:
+        return PERCENT_CONTRACT_POINTS
+    env = (os.getenv("AUDIT_PERCENT_CONTRACT") or "").strip().lower()
+    if env in _PERCENT_CONTRACT_CHOICES:
+        return env
+    return PERCENT_CONTRACT_FRACTION
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=f"TFB Data Quality Auditor v{SERVICE_VERSION}")
     p.add_argument("--keys", nargs="*", default=["MARKET_LEADERS"], help="Sheet page keys to audit")
@@ -1391,9 +1583,27 @@ def main() -> None:
     p.add_argument("--include-ok", type=int, default=0, help="1=include OK rows in console summary")
     p.add_argument("--top", type=int, default=15, help="top N rows to print to console")
     p.add_argument("--json-indent", type=int, default=0, help="JSON indentation (0=no pretty print)")
+
+    # v4.6.0: unit-contract flags
+    p.add_argument(
+        "--legacy-percent-units",
+        type=int,
+        default=0,
+        help="v4.6.0: 1=assume percent_change in POINTS form (pre-v5.67.0 engine); 0=FRACTION (v5.67.0+ default)",
+    )
+    p.add_argument(
+        "--no-unit-drift",
+        type=int,
+        default=0,
+        help="v4.6.0: 1=disable UNIT_DRIFT_* detection (not recommended); 0=enabled (default)",
+    )
+
     args = p.parse_args()
 
-    config = AuditConfig()
+    config = AuditConfig(
+        percent_change_contract=_resolve_percent_contract_from_env_and_flag(int(args.legacy_percent_units or 0)),
+        enable_unit_drift_detection=(int(args.no_unit_drift or 0) != 1),
+    )
 
     exit_code = 0
     try:
@@ -1410,10 +1620,8 @@ def main() -> None:
         )
         summary.audit_duration_ms = (time.time() - t0) * 1000.0
 
-        # Alerts
         alerts = [r for r in results if r.severity != AuditSeverity.OK]
 
-        # Console snapshot (optional, safe)
         try:
             top_n = max(0, int(args.top))
             if top_n > 0:
@@ -1431,7 +1639,6 @@ def main() -> None:
         except Exception:
             pass
 
-        # Exports (run gather inside event loop)
         export_tasks: List[Awaitable[None]] = []
 
         if args.json_out:
@@ -1462,7 +1669,6 @@ def main() -> None:
             summary.audit_duration_ms,
         )
 
-        # Exit code policy (stable)
         if summary.by_severity.get("CRITICAL", 0) > 0:
             exit_code = 3
         elif summary.by_severity.get("HIGH", 0) > 0:
