@@ -2,7 +2,44 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.65.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.66.0
+================================================================================
+
+WHY v5.66.0 — PHASE-JJ CANDLESTICK PATTERN DETECTION (May 13, 2026)
+--------------------------------------------------------------------
+v5.65.0 left the 5 candlestick_* columns showing identical placeholder
+values for every symbol ("No clear pattern / NEUTRAL / 0 / 0.00 / None").
+
+v5.66.0 embeds the `core.candlesticks` v1.0.0 pattern detection module
+directly into the engine and wires it into the history-row processing
+path. This is "free" — it piggybacks on the OHLC bars the history
+fallback already fetches, so no extra network calls.
+
+Patterns detected (oldest -> newest bars, defensive on malformed input):
+  Single-bar : Doji, Hammer, Inverted Hammer, Shooting Star,
+               Hanging Man, Bullish/Bearish Marubozu
+  Two-bar    : Bullish Engulfing, Bearish Engulfing
+  Three-bar  : Morning Star, Evening Star
+
+Trend context (used to disambiguate Hammer/Hanging Man and
+Inverted Hammer/Shooting Star — same geometry, opposite meaning):
+A 10-bar percentage change on closes preceding the candle being
+evaluated, with a 1% threshold for UP/DOWN/FLAT.
+
+Output fields written to the row:
+  candlestick_pattern         "Candle Pattern"       str
+  candlestick_signal          "Candle Signal"        str (BULLISH|BEARISH|NEUTRAL|DOJI)
+  candlestick_strength        "Candle Strength"      str (STRONG|MODERATE|WEAK)
+  candlestick_confidence      "Candle Confidence"    float (0-100)
+  candlestick_patterns_recent "Recent Patterns (5D)" str (" | "-separated)
+
+Integration: detection runs inside `_compute_history_patch_from_rows()`,
+which is called from both the main history fallback path AND the
+yahoo_chart_provider path. Detection happens for free whenever OHLC bars
+are processed.
+
+[PRESERVED] All v5.65.0 + v5.64.0 + v5.63.0 + v5.62.0 logic intact.
+
 ================================================================================
 
 WHY v5.65.0 — PHASE-II FORECAST QUALITY UPGRADE (May 13, 2026)
@@ -239,7 +276,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.65.0"
+__version__ = "5.66.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -954,6 +991,320 @@ def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
         psh = "Avoid / reduce"
     if not row.get("position_size_hint"):
         row["position_size_hint"] = psh
+
+
+# =============================================================================
+# v5.66.0 PHASE-JJ — Candlestick pattern detection (inline core.candlesticks v1.0.0)
+# =============================================================================
+# Pure-Python pattern detection on OHLC bars. Returns 5 schema fields:
+#   candlestick_pattern, candlestick_signal, candlestick_strength,
+#   candlestick_confidence, candlestick_patterns_recent
+#
+# Detects: Doji, Hammer, Inverted Hammer, Shooting Star, Hanging Man,
+# Bullish/Bearish Marubozu, Bullish/Bearish Engulfing, Morning/Evening Star.
+#
+# Defensive: never raises on malformed input. Insufficient data -> empty fields.
+
+_CS_SIGNAL_BULLISH = "BULLISH"
+_CS_SIGNAL_BEARISH = "BEARISH"
+_CS_SIGNAL_NEUTRAL = "NEUTRAL"
+_CS_SIGNAL_DOJI = "DOJI"
+
+_CS_STRENGTH_STRONG = "STRONG"
+_CS_STRENGTH_MODERATE = "MODERATE"
+_CS_STRENGTH_WEAK = "WEAK"
+
+_CS_P_DOJI = "Doji"
+_CS_P_HAMMER = "Hammer"
+_CS_P_INVERTED_HAMMER = "Inverted Hammer"
+_CS_P_SHOOTING_STAR = "Shooting Star"
+_CS_P_HANGING_MAN = "Hanging Man"
+_CS_P_MARUBOZU_BULL = "Bullish Marubozu"
+_CS_P_MARUBOZU_BEAR = "Bearish Marubozu"
+_CS_P_BULL_ENGULFING = "Bullish Engulfing"
+_CS_P_BEAR_ENGULFING = "Bearish Engulfing"
+_CS_P_MORNING_STAR = "Morning Star"
+_CS_P_EVENING_STAR = "Evening Star"
+
+_CS_PATTERN_SIGNAL: Dict[str, str] = {
+    _CS_P_DOJI: _CS_SIGNAL_DOJI,
+    _CS_P_HAMMER: _CS_SIGNAL_BULLISH,
+    _CS_P_INVERTED_HAMMER: _CS_SIGNAL_BULLISH,
+    _CS_P_SHOOTING_STAR: _CS_SIGNAL_BEARISH,
+    _CS_P_HANGING_MAN: _CS_SIGNAL_BEARISH,
+    _CS_P_MARUBOZU_BULL: _CS_SIGNAL_BULLISH,
+    _CS_P_MARUBOZU_BEAR: _CS_SIGNAL_BEARISH,
+    _CS_P_BULL_ENGULFING: _CS_SIGNAL_BULLISH,
+    _CS_P_BEAR_ENGULFING: _CS_SIGNAL_BEARISH,
+    _CS_P_MORNING_STAR: _CS_SIGNAL_BULLISH,
+    _CS_P_EVENING_STAR: _CS_SIGNAL_BEARISH,
+}
+
+_CS_DOJI_BODY_RATIO_MAX = 0.10
+_CS_MARUBOZU_BODY_RATIO_MIN = 0.95
+_CS_HAMMER_SHADOW_MULTIPLIER = 2.0
+_CS_HAMMER_OPP_SHADOW_RATIO_MAX = 0.30
+_CS_SMALL_BODY_RATIO_MAX = 0.30
+_CS_LONG_BODY_RATIO_MIN = 0.55
+_CS_TREND_LOOKBACK = 10
+_CS_TREND_THRESHOLD = 0.01
+_CS_RECENT_LOOKBACK = 5
+
+
+def _cs_coerce_bar(row: Any) -> Optional[Dict[str, float]]:
+    if not isinstance(row, dict):
+        return None
+    o = _as_float(row.get("open") if row.get("open") is not None else row.get("o"))
+    h = _as_float(row.get("high") if row.get("high") is not None else row.get("h"))
+    low = _as_float(row.get("low") if row.get("low") is not None else row.get("l"))
+    c = _as_float(
+        row.get("close")
+        if row.get("close") is not None
+        else (
+            row.get("adjusted_close")
+            if row.get("adjusted_close") is not None
+            else (row.get("adjclose") if row.get("adjclose") is not None else row.get("c"))
+        )
+    )
+    if c is None:
+        return None
+    if o is None:
+        o = c
+    if h is None:
+        h = max(o, c)
+    if low is None:
+        low = min(o, c)
+    if h < low:
+        h, low = low, h
+    v = _as_float(row.get("volume") if row.get("volume") is not None else row.get("v")) or 0.0
+    return {"open": o, "high": h, "low": low, "close": c, "volume": v}
+
+
+def _cs_coerce_bars(rows: Any) -> List[Dict[str, float]]:
+    out: List[Dict[str, float]] = []
+    if not rows:
+        return out
+    try:
+        iterable = list(rows)
+    except Exception:
+        return out
+    for row in iterable:
+        bar = _cs_coerce_bar(row)
+        if bar is not None:
+            out.append(bar)
+    return out
+
+
+def _cs_bar_geom(bar: Dict[str, float]) -> Dict[str, float]:
+    o = bar["open"]; h = bar["high"]; low = bar["low"]; c = bar["close"]
+    rng = max(h - low, 1e-12)
+    body = abs(c - o)
+    upper_shadow = max(h - max(o, c), 0.0)
+    lower_shadow = max(min(o, c) - low, 0.0)
+    return {
+        "open": o, "high": h, "low": low, "close": c, "range": rng,
+        "body": body, "body_ratio": body / rng,
+        "upper_shadow": upper_shadow, "lower_shadow": lower_shadow,
+        "upper_shadow_ratio": upper_shadow / rng,
+        "lower_shadow_ratio": lower_shadow / rng,
+        "is_bullish": c > o, "is_bearish": c < o,
+        "midpoint": (o + c) / 2.0,
+    }
+
+
+def _cs_trend_at(bars: List[Dict[str, float]], idx: int) -> str:
+    start = idx - _CS_TREND_LOOKBACK
+    if start < 0:
+        return "FLAT"
+    window = bars[start:idx]
+    if len(window) < 3:
+        return "FLAT"
+    first = window[0]["close"]
+    last = window[-1]["close"]
+    if first <= 0:
+        return "FLAT"
+    pct = (last - first) / first
+    if pct >= _CS_TREND_THRESHOLD:
+        return "UP"
+    if pct <= -_CS_TREND_THRESHOLD:
+        return "DOWN"
+    return "FLAT"
+
+
+def _cs_detect_marubozu(g: Dict[str, float]) -> Optional[Tuple[str, float]]:
+    if g["body_ratio"] < _CS_MARUBOZU_BODY_RATIO_MIN:
+        return None
+    confidence = 50.0 + (g["body_ratio"] - _CS_MARUBOZU_BODY_RATIO_MIN) * 1000.0
+    confidence = max(50.0, min(100.0, confidence))
+    if g["is_bullish"]:
+        return _CS_P_MARUBOZU_BULL, confidence
+    if g["is_bearish"]:
+        return _CS_P_MARUBOZU_BEAR, confidence
+    return None
+
+
+def _cs_detect_doji(g: Dict[str, float]) -> Optional[Tuple[str, float]]:
+    if g["body_ratio"] >= _CS_DOJI_BODY_RATIO_MAX:
+        return None
+    raw = 100.0 * (1.0 - g["body_ratio"] / _CS_DOJI_BODY_RATIO_MAX)
+    confidence = max(40.0, min(95.0, raw))
+    return _CS_P_DOJI, confidence
+
+
+def _cs_has_hammer_shape(g: Dict[str, float]) -> bool:
+    if g["body"] <= 0:
+        return False
+    if g["lower_shadow"] < _CS_HAMMER_SHADOW_MULTIPLIER * g["body"]:
+        return False
+    if g["upper_shadow_ratio"] > _CS_HAMMER_OPP_SHADOW_RATIO_MAX:
+        return False
+    return True
+
+
+def _cs_has_inverted_hammer_shape(g: Dict[str, float]) -> bool:
+    if g["body"] <= 0:
+        return False
+    if g["upper_shadow"] < _CS_HAMMER_SHADOW_MULTIPLIER * g["body"]:
+        return False
+    if g["lower_shadow_ratio"] > _CS_HAMMER_OPP_SHADOW_RATIO_MAX:
+        return False
+    return True
+
+
+def _cs_detect_hammer_family(g: Dict[str, float], trend: str) -> Optional[Tuple[str, float]]:
+    if _cs_has_hammer_shape(g):
+        ratio = g["lower_shadow"] / max(g["body"], 1e-9)
+        base_conf = min(85.0, 40.0 + ratio * 8.0)
+        if trend == "DOWN":
+            return _CS_P_HAMMER, base_conf
+        if trend == "UP":
+            return _CS_P_HANGING_MAN, base_conf * 0.85
+        return _CS_P_HAMMER, base_conf * 0.65
+    if _cs_has_inverted_hammer_shape(g):
+        ratio = g["upper_shadow"] / max(g["body"], 1e-9)
+        base_conf = min(80.0, 35.0 + ratio * 8.0)
+        if trend == "DOWN":
+            return _CS_P_INVERTED_HAMMER, base_conf
+        if trend == "UP":
+            return _CS_P_SHOOTING_STAR, base_conf
+        return _CS_P_INVERTED_HAMMER, base_conf * 0.65
+    return None
+
+
+def _cs_detect_engulfing(g_prev: Dict[str, float], g_curr: Dict[str, float]) -> Optional[Tuple[str, float]]:
+    if g_prev["body_ratio"] < _CS_DOJI_BODY_RATIO_MAX:
+        return None
+    if g_curr["body_ratio"] < _CS_DOJI_BODY_RATIO_MAX:
+        return None
+    prev_open = g_prev["open"]; prev_close = g_prev["close"]
+    curr_open = g_curr["open"]; curr_close = g_curr["close"]
+    if g_prev["is_bearish"] and g_curr["is_bullish"]:
+        if curr_open <= prev_close and curr_close >= prev_open:
+            engulf_factor = g_curr["body"] / max(g_prev["body"], 1e-9)
+            confidence = min(90.0, 50.0 + engulf_factor * 10.0)
+            return _CS_P_BULL_ENGULFING, confidence
+    if g_prev["is_bullish"] and g_curr["is_bearish"]:
+        if curr_open >= prev_close and curr_close <= prev_open:
+            engulf_factor = g_curr["body"] / max(g_prev["body"], 1e-9)
+            confidence = min(90.0, 50.0 + engulf_factor * 10.0)
+            return _CS_P_BEAR_ENGULFING, confidence
+    return None
+
+
+def _cs_detect_star(g_first: Dict[str, float], g_star: Dict[str, float], g_third: Dict[str, float]) -> Optional[Tuple[str, float]]:
+    if g_star["body_ratio"] >= _CS_SMALL_BODY_RATIO_MAX:
+        return None
+    if g_first["body_ratio"] < _CS_LONG_BODY_RATIO_MIN:
+        return None
+    if g_third["body_ratio"] < _CS_LONG_BODY_RATIO_MIN:
+        return None
+    if g_first["is_bearish"] and g_third["is_bullish"]:
+        if g_third["close"] > g_first["midpoint"]:
+            penetration = (g_third["close"] - g_first["midpoint"]) / max(g_first["body"], 1e-9)
+            confidence = min(95.0, 60.0 + penetration * 30.0)
+            return _CS_P_MORNING_STAR, confidence
+    if g_first["is_bullish"] and g_third["is_bearish"]:
+        if g_third["close"] < g_first["midpoint"]:
+            penetration = (g_first["midpoint"] - g_third["close"]) / max(g_first["body"], 1e-9)
+            confidence = min(95.0, 60.0 + penetration * 30.0)
+            return _CS_P_EVENING_STAR, confidence
+    return None
+
+
+def _cs_detect_at_index(bars: List[Dict[str, float]], idx: int) -> Optional[Tuple[str, float]]:
+    if idx < 0 or idx >= len(bars):
+        return None
+    trend = _cs_trend_at(bars, idx)
+    g_curr = _cs_bar_geom(bars[idx])
+    if idx >= 2:
+        g_first = _cs_bar_geom(bars[idx - 2])
+        g_star = _cs_bar_geom(bars[idx - 1])
+        star = _cs_detect_star(g_first, g_star, g_curr)
+        if star is not None:
+            return star
+    if idx >= 1:
+        g_prev = _cs_bar_geom(bars[idx - 1])
+        eng = _cs_detect_engulfing(g_prev, g_curr)
+        if eng is not None:
+            return eng
+    marubozu = _cs_detect_marubozu(g_curr)
+    if marubozu is not None:
+        return marubozu
+    hammer = _cs_detect_hammer_family(g_curr, trend)
+    if hammer is not None:
+        return hammer
+    doji = _cs_detect_doji(g_curr)
+    if doji is not None:
+        return doji
+    return None
+
+
+def _cs_confidence_to_strength(confidence: float) -> str:
+    if confidence >= 75.0:
+        return _CS_STRENGTH_STRONG
+    if confidence >= 55.0:
+        return _CS_STRENGTH_MODERATE
+    return _CS_STRENGTH_WEAK
+
+
+def detect_candlestick_patterns(rows: Any) -> Dict[str, Any]:
+    """
+    v5.66.0 PHASE-JJ: Detect candlestick patterns on OHLC bars (oldest -> newest).
+    Returns the 5 candlestick_* schema fields. Defensive: never raises.
+    """
+    empty = {
+        "candlestick_pattern": "",
+        "candlestick_signal": _CS_SIGNAL_NEUTRAL,
+        "candlestick_strength": "",
+        "candlestick_confidence": 0.0,
+        "candlestick_patterns_recent": "",
+    }
+    bars = _cs_coerce_bars(rows)
+    if not bars:
+        return empty
+    last_idx = len(bars) - 1
+    latest = _cs_detect_at_index(bars, last_idx)
+    if latest is None:
+        out = dict(empty)
+    else:
+        pattern, confidence = latest
+        out = {
+            "candlestick_pattern": pattern,
+            "candlestick_signal": _CS_PATTERN_SIGNAL.get(pattern, _CS_SIGNAL_NEUTRAL),
+            "candlestick_strength": _cs_confidence_to_strength(confidence),
+            "candlestick_confidence": round(float(confidence), 2),
+            "candlestick_patterns_recent": "",
+        }
+    recent_patterns: List[str] = []
+    start = max(0, last_idx - _CS_RECENT_LOOKBACK + 1)
+    for i in range(start, last_idx + 1):
+        det = _cs_detect_at_index(bars, i)
+        if det is None:
+            continue
+        name, _ = det
+        recent_patterns.append(name)
+    out["candlestick_patterns_recent"] = " | ".join(recent_patterns)
+    return out
 
 
 def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -4450,8 +4801,19 @@ class DataEngineV5:
                 volumes.append(vol)
             if opn is not None:
                 opens.append(opn)
+        # v5.66.0 PHASE-JJ: Detect candlestick patterns from raw OHLC bars
+        # This piggybacks on the existing history fetch — no extra network call.
+        candle_fields: Dict[str, Any] = {}
+        try:
+            candle_fields = detect_candlestick_patterns(rows or [])
+        except Exception as cs_err:
+            logger.debug(
+                "[engine_v2 v%s] PHASE-JJ candlestick detection failed: %s: %s",
+                __version__, cs_err.__class__.__name__, cs_err,
+            )
         if len(closes) < 2:
-            return {}
+            # Return candlestick fields even when stats can't be computed
+            return candle_fields if candle_fields else {}
         returns = []
         for prev, cur in zip(closes[:-1], closes[1:]):
             if prev not in (None, 0):
@@ -4519,7 +4881,20 @@ class DataEngineV5:
             cp = _as_float(patch.get("current_price"))
             if hi is not None and lo is not None and cp is not None and hi > lo:
                 patch["week_52_position_pct"] = ((cp - lo) / (hi - lo)) * 100.0
-        return {k: v for k, v in patch.items() if v is not None}
+        # v5.66.0 PHASE-JJ: merge candlestick fields into patch
+        # candle_fields was computed above on the raw rows
+        result_patch = {k: v for k, v in patch.items() if v is not None}
+        if candle_fields:
+            for k, v in candle_fields.items():
+                # Only include non-empty candle fields so blanks don't override
+                # a more confident detection from a different code path.
+                if v not in (None, "", 0.0):
+                    result_patch[k] = v
+                elif k not in result_patch:
+                    # If patch doesn't already have this key, set the empty
+                    # default so downstream knows the candle module ran.
+                    result_patch[k] = v
+        return result_patch
 
     async def _fetch_history_patch(self, provider: str, symbol: str) -> Dict[str, Any]:
         module, _stats = await self._registry.get_provider(provider)
