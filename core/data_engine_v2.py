@@ -2,7 +2,44 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.64.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.65.0
+================================================================================
+
+WHY v5.65.0 — PHASE-II FORECAST QUALITY UPGRADE (May 13, 2026)
+---------------------------------------------------------------
+v5.64.0 still inherited the v5.47.2 hardcoded forecasts: every symbol got
+the same Expected ROI (0.33% / 3% / 8%) and Forecast Confidence (0.55,
+"MODERATE"). This made the forecast columns useless for differentiating
+symbols.
+
+v5.65.0 adds PHASE-II `_phase_ii_quality_forecast()` which generates
+per-symbol forecasts from the symbol's own data:
+
+  Forecast Prices (1M / 3M / 12M):
+    - Blended from four weighted components:
+      (a) Mean reversion to intrinsic value     (40% weight)
+      (b) Trend extrapolation from momentum     (30% weight)
+      (c) Composite quality/value/growth signal (20% weight)
+      (d) Overall score baseline                (10% weight)
+    - RSI adjustment: overbought pulls back, oversold rebounds
+    - 12M cap: +/- 30% (MODERATE setting)
+    - 3M = 35% of 12M move; 1M = 12% of 12M move (sub-linear)
+
+  Expected ROI (1M / 3M / 12M):
+    - Derived from forecast prices: (forecast - current) / current
+    - Each horizon differs per symbol
+
+  Forecast Confidence (STRICT scoring):
+    - Baseline 0.50
+    - +up to 0.20 for data completeness (10 fundamentals/risk fields)
+    - +up to 0.10 for score agreement (low variance across sub-scores)
+    - -up to 0.15 for HIGH risk / elevated volatility
+    - -0.05 if forecast magnitude exceeds 25% (uncertainty bigger than signal)
+    - Clamped to [0.30, 0.85]: only well-supported symbols reach HIGH (>=0.70)
+    - Bucket: LOW (<0.50) / MODERATE (0.50-0.70) / HIGH (>=0.70)
+
+[PRESERVED] All v5.64.0 + v5.63.0 + v5.62.0 logic intact.
+
 ================================================================================
 
 WHY v5.64.0 — THREE-FIX PRODUCTION FOLLOWUP (May 13, 2026)
@@ -202,7 +239,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.64.0"
+__version__ = "5.65.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -928,7 +965,203 @@ def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
     _derive_views(row)
     _classify_recommendation_8tier(row)
     _build_top_factors_and_risks(row)
+    # v5.65.0 PHASE-II: per-symbol quality forecast (must run after intrinsic
+    # value and views are set, so it can use them as inputs)
+    _phase_ii_quality_forecast(row)
     return row
+
+
+# =============================================================================
+# v5.65.0 PHASE-II — Quality forecast generator
+# =============================================================================
+# Replaces the v5.47.2 hardcoded forecast (every symbol got 0.33%/3%/8% ROI)
+# with per-symbol forecasts derived from THAT symbol's actual data.
+#
+# Inputs (any may be missing -> graceful degradation):
+#   current_price, intrinsic_value, momentum_score, value_score, quality_score,
+#   volatility_30d/90d, risk_bucket, rsi_14, overall_score, sector, growth_score
+#
+# Outputs (overrides only when source data justifies it):
+#   forecast_price_1m, forecast_price_3m, forecast_price_12m
+#   expected_roi_1m, expected_roi_3m, expected_roi_12m
+#   forecast_confidence (0.30-0.85 range; strict)
+#   confidence_score (matching), confidence_bucket
+#
+# Forecast philosophy (MODERATE, defensible):
+#   - 12M forecast = blend of [trend extrapolation, mean reversion to intrinsic,
+#     volatility-adjusted drift], capped at +/-30%.
+#   - 3M = 60% of the way between current and 12M (with mild volatility expansion)
+#   - 1M = 25% of the way between current and 3M
+# Confidence philosophy (STRICT):
+#   - Start at 0.50 baseline.
+#   - +up to 0.20 for data completeness (fraction of fundamentals present)
+#   - +up to 0.10 for score agreement (low variance across the 4 sub-scores)
+#   - -up to 0.15 for risk_bucket=HIGH or high volatility
+#   - Final clamped to [0.30, 0.85]; only the cleanest symbols can reach HIGH.
+
+# 12M absolute forecast cap: prevents wild forecasts on extreme inputs
+_PHASE_II_MAX_12M_ABS_RETURN: float = 0.30   # +/- 30%
+_PHASE_II_MIN_12M_ABS_RETURN: float = -0.30
+# Volatility-based 12M expansion ceiling. Higher vol -> wider forecast band
+_PHASE_II_VOL_BAND_FACTOR: float = 0.5
+_PHASE_II_CONF_MIN: float = 0.30
+_PHASE_II_CONF_MAX: float = 0.85
+
+
+def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
+    """
+    v5.65.0 PHASE-II: Generate per-symbol forecast prices, ROIs, and confidence.
+    Overrides the v5.47.2 hardcoded fallback values with data-driven estimates.
+    """
+    if not isinstance(row, dict):
+        return
+
+    cp = _as_float(row.get("current_price"))
+    if cp is None or cp <= 0:
+        return  # can't forecast without a current price
+
+    intrinsic = _as_float(row.get("intrinsic_value"))
+    momentum = _as_float(row.get("momentum_score"))
+    quality = _as_float(row.get("quality_score"))
+    value = _as_float(row.get("value_score"))
+    growth = _as_float(row.get("growth_score"))
+    overall = _as_float(row.get("overall_score"))
+    vol_30d = _as_float(row.get("volatility_30d"))
+    vol_90d = _as_float(row.get("volatility_90d"))
+    rsi = _as_float(row.get("rsi_14"))
+    risk_bucket = _safe_str(row.get("risk_bucket")).upper()
+
+    # ----------------------------------------------------------------
+    # 1) Build 12M expected return (annualized) as weighted blend
+    # ----------------------------------------------------------------
+    components: List[Tuple[float, float]] = []  # list of (return_pct, weight)
+
+    # (a) Mean reversion to intrinsic value (40% weight if available)
+    if intrinsic is not None and intrinsic > 0:
+        reversion_return = (intrinsic - cp) / cp
+        # Don't fully revert in 12M; assume 60% of the gap closes
+        reversion_return *= 0.6
+        components.append((reversion_return, 0.40))
+
+    # (b) Trend extrapolation from momentum_score (30% weight if available)
+    # Momentum 50 = neutral, 100 = max bullish, 0 = max bearish
+    # Map to annual return: 50->0%, 100->+15%, 0->-15%
+    if momentum is not None:
+        trend_return = ((momentum - 50.0) / 50.0) * 0.15
+        components.append((trend_return, 0.30))
+
+    # (c) Quality/value/growth composite (20% weight if available)
+    # Each above-average sub-score contributes to expected return
+    fundamentals_signals: List[float] = []
+    for sub in (quality, value, growth):
+        if sub is not None:
+            fundamentals_signals.append((sub - 50.0) / 50.0)
+    if fundamentals_signals:
+        avg_fund = sum(fundamentals_signals) / len(fundamentals_signals)
+        fund_return = avg_fund * 0.10  # max +/- 10% from fundamentals
+        components.append((fund_return, 0.20))
+
+    # (d) Overall score baseline (10% weight - safety net)
+    if overall is not None:
+        baseline_return = ((overall - 50.0) / 50.0) * 0.08
+        components.append((baseline_return, 0.10))
+
+    if not components:
+        return  # nothing to forecast on
+
+    total_weight = sum(w for _, w in components)
+    if total_weight <= 0:
+        return
+    expected_12m_return = sum(r * w for r, w in components) / total_weight
+
+    # ----------------------------------------------------------------
+    # 2) Apply RSI mean-reversion adjustment (gentle pull-back if extreme)
+    # ----------------------------------------------------------------
+    if rsi is not None:
+        if rsi > 75:
+            expected_12m_return -= 0.03  # overbought - expect some pullback
+        elif rsi > 70:
+            expected_12m_return -= 0.015
+        elif rsi < 25:
+            expected_12m_return += 0.03  # oversold - expect some rebound
+        elif rsi < 30:
+            expected_12m_return += 0.015
+
+    # ----------------------------------------------------------------
+    # 3) Cap to +/- 30% (MODERATE setting)
+    # ----------------------------------------------------------------
+    expected_12m_return = max(_PHASE_II_MIN_12M_ABS_RETURN,
+                              min(_PHASE_II_MAX_12M_ABS_RETURN, expected_12m_return))
+
+    # ----------------------------------------------------------------
+    # 4) Compute forecast prices for each horizon
+    # ----------------------------------------------------------------
+    # 3M = ~35% of 12M move (sub-linear; markets don't move linearly)
+    # 1M = ~12% of 12M move
+    expected_3m_return = expected_12m_return * 0.35
+    expected_1m_return = expected_12m_return * 0.12
+
+    forecast_12m = cp * (1.0 + expected_12m_return)
+    forecast_3m = cp * (1.0 + expected_3m_return)
+    forecast_1m = cp * (1.0 + expected_1m_return)
+
+    # Always override v5.47.2's generic forecast
+    row["forecast_price_1m"] = round(forecast_1m, 4)
+    row["forecast_price_3m"] = round(forecast_3m, 4)
+    row["forecast_price_12m"] = round(forecast_12m, 4)
+    row["expected_roi_1m"] = round(expected_1m_return, 6)
+    row["expected_roi_3m"] = round(expected_3m_return, 6)
+    row["expected_roi_12m"] = round(expected_12m_return, 6)
+
+    # ----------------------------------------------------------------
+    # 5) STRICT confidence scoring
+    # ----------------------------------------------------------------
+    conf = 0.50  # baseline
+
+    # (a) Data completeness bonus (+0.00 to +0.20)
+    # Check presence of 10 key fundamentals/risk fields
+    completeness_fields = [
+        "pe_ttm", "pb_ratio", "eps_ttm", "dividend_yield",
+        "revenue_growth_yoy", "gross_margin", "operating_margin",
+        "rsi_14", "volatility_30d", "max_drawdown_1y",
+    ]
+    present = sum(1 for f in completeness_fields if _as_float(row.get(f)) is not None)
+    completeness_ratio = present / len(completeness_fields)
+    conf += completeness_ratio * 0.20
+
+    # (b) Score agreement bonus (+0.00 to +0.10)
+    # If all 4 sub-scores have similar values, signals are consistent
+    sub_scores = [s for s in (quality, value, growth, momentum) if s is not None]
+    if len(sub_scores) >= 3:
+        mean_s = sum(sub_scores) / len(sub_scores)
+        variance = sum((s - mean_s) ** 2 for s in sub_scores) / len(sub_scores)
+        # variance ranges 0-2500 in practice. Lower variance -> higher agreement
+        agreement = max(0.0, 1.0 - (variance / 800.0))
+        conf += agreement * 0.10
+
+    # (c) Risk penalty (-0.00 to -0.15)
+    if risk_bucket == "HIGH":
+        conf -= 0.10
+    if vol_90d is not None and vol_90d > 0.50:
+        conf -= 0.05
+    elif vol_30d is not None and vol_30d > 0.45:
+        conf -= 0.03
+
+    # (d) Forecast magnitude penalty: very large forecasts are less trustworthy
+    if abs(expected_12m_return) > 0.25:
+        conf -= 0.05
+
+    # Final clamp
+    conf = max(_PHASE_II_CONF_MIN, min(_PHASE_II_CONF_MAX, conf))
+
+    row["forecast_confidence"] = round(conf, 4)
+    row["confidence_score"] = round(conf * 100.0, 2)
+    if conf >= 0.70:
+        row["confidence_bucket"] = "HIGH"
+    elif conf >= 0.50:
+        row["confidence_bucket"] = "MODERATE"
+    else:
+        row["confidence_bucket"] = "LOW"
 
 
 def _pick_yahoo_callable(mod: Any, *names: str) -> Optional[Any]:
