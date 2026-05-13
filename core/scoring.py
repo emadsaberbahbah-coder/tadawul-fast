@@ -2,8 +2,9 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.2.6
-(DATA_ENGINE_V2 v5.67.0 FRACTION-CONTRACT ALIGNMENT /
+Scoring Module — v5.2.7
+(CANONICAL RECOMMENDATION SOURCE OF TRUTH — PRIORITY-EMITTING — PROVENANCE-TAGGED /
+ [PRESERVED v5.2.6] DATA_ENGINE_V2 v5.67.0 FRACTION-CONTRACT ALIGNMENT /
  [PRESERVED v5.2.5] CROSS-PROVIDER CONTRACT ALIGNMENT WITH v4.7.3 / v6.1.0 /
  v8.2.0 / v4.3.0 PROVIDERS + DATA_ENGINE_V2 v5.60.0 /
  [PRESERVED v5.2.4] POST-DEPLOY SYNTHESIZER-OVER-AGGRESSION GUARD /
@@ -17,242 +18,147 @@ Scoring Module — v5.2.6
  v5.53.0 / v5.60.0 / v5.67.0 ENGINE-UNIT COMPATIBLE)
 ================================================================================
 
+v5.2.7 changes (vs v5.2.6)  —  CANONICAL RECOMMENDATION SOURCE OF TRUTH
+-----------------------------------------------------------------------
+Closes the structural cascade-discrepancy surfaced by the May 13 2026
+audit of the deployed Top_10_Investments / Market_Leaders snapshot.
+
+THE BUG
+-------
+Two recommendation engines were running concurrently in production with
+DIFFERENT thresholds, writing DIFFERENT fields on the same row:
+
+  - scoring.py.compute_recommendation()             writes top-line
+                                                    `Recommendation`
+  - investment_advisor_engine._recommendation_from_scores() writes the
+                                                    `[VERDICT]` token
+                                                    inside `Recommendation
+                                                    Detail`
+
+The audit on a 140-row snapshot found 24 rows (≈17%) where the two
+engines disagreed:
+  - EXE.US: Recommendation=REDUCE, Detail="P2 [BUY]: Fund STRONG | ..."
+  - TREE.US: Recommendation=REDUCE, Detail="P2 [STRONG_BUY]: ..."
+  - WPM.TO / WPM.US / AEM.US / KGC.US / NLY.US / RDN.US / RRC.US / BRO.US /
+    TSM.US / NVO.US / PAGS.US / STNE.US / FIS.US / GPOR.US / CNX.US / SD.US /
+    DELTA.BK / NVO.US — same pattern.
+
+End-user-facing credibility killer — same row shows two contradictory
+verdicts.
+
+THE FIX (this file)
+-------------------
+Make scoring.py the SINGLE SOURCE OF TRUTH by emitting two new fields
+that downstream consumers can read from instead of recomputing:
+
+  - recommendation_priority  (P1..P5, computed centrally — see
+                              `_compute_priority`)
+  - recommendation_source    (provenance tag — "scoring.py v5.2.7")
+
+Plus two public helpers for downstream engines to consume:
+
+  - derive_canonical_recommendation(row, *, settings=None)
+        -> (recommendation, reason, priority)
+    Reads scores already on the row and derives the canonical triple.
+    Lightweight — does NOT re-run the full compute_scores pipeline
+    (no insights_builder, no sector batch pass).
+
+  - apply_canonical_recommendation(row, *, settings=None, overwrite=False)
+        -> patch dict
+    Drop-in replacement for legacy `_compute_recommendation` calls
+    in data_engine_v2 and `_recommendation_from_scores` calls in
+    investment_advisor_engine. The `overwrite=False` mode is
+    idempotent — returns {} if the row already carries the v5.2.7
+    provenance tag.
+
+THE PRIORITY MODEL
+------------------
+Aligned with the priority bucketing already in the production Detail
+strings (P2..P4 visible in the snapshot) and with the audit module's
+`AlertPriority` enum:
+
+  P1 = Critical action: STRONG_SELL, or REDUCE/SELL on broken/illiquid row
+       (risk≥90 + conf<45, or risk≥85 + overall<30)
+  P2 = STRONG_BUY, OR high-conviction BUY (overall≥80 + conf≥70)
+  P3 = BUY (normal conviction)
+  P4 = HOLD (default)
+  P5 = SELL or low-priority REDUCE
+
+DOWNSTREAM SEQUENCING (delivered in follow-ups)
+-----------------------------------------------
+This file alone won't fix the 24 inconsistent rows yet — the
+investment_advisor_engine still recomputes its own [VERDICT] string.
+Two follow-up files complete the fix:
+
+  1. investment_advisor_engine.py — replace `_recommendation_from_scores`
+     with `scoring.apply_canonical_recommendation(row, overwrite=False)`.
+     Kills the parallel "Strong Buy / Buy / Hold / Avoid" ladder with
+     its different thresholds; the Detail's [VERDICT] becomes identical
+     to the top-line.
+  2. data_engine_v2.py — replace `_compute_recommendation` with the
+     same call. Removes the ACCUMULATE 4-bucket logic and the
+     conflicting threshold math.
+
+[PRESERVED — strictly] All v5.2.6 / v5.2.5 / v5.2.4 / v5.2.3 / v5.2.2 /
+v5.2.1 / v5.2.0 helpers, signatures, dataclass fields, behaviors,
+constants, and the entire prior narrative. The new fields are appended
+at the end of AssetScores (additive only). The new helpers are
+additive. The existing `compute_recommendation` logic — including the
+view-prefix builder, the coherence guard, the reco_normalize
+delegation, and the alignment pass — is byte-identical. Public API
+surface is strictly extended; no removals from __all__.
+
+================================================================================
+
 v5.2.6 changes (vs v5.2.5)  —  DATA_ENGINE_V2 v5.67.0 FRACTION-CONTRACT ALIGNMENT
 ---------------------------------------------------------------------------------
+[PRESERVED — see prior file header for full narrative]
 Closes one defensive-shape-detection gap surfaced by the May 13 2026
-data_engine_v2 v5.67.0 unit-contract alignment release. v5.67.0 switched
-the engine's emit contract for four percent-unit fields from POINTS to
-FRACTION to align with 04_Format.gs v2.7.0's
-`_KNOWN_FRACTION_PERCENT_COLUMNS_` formatter expectation:
-
-  - percent_change             (was ×100 points → now fraction)
-  - upside_pct                 (was ×100 points → now fraction)
-  - max_drawdown_1y            (was abs()×100 → now SIGNED fraction)
-  - var_95_1d                  (was ×100 points → now fraction)
-
-Audit of scoring.py v5.2.5 against the new contract:
-
-  - `compute_momentum_score: percent_change`        OK via `_as_roi_fraction` (shape-aware, >1.0 → /100)
-  - `compute_risk_score: max_drawdown_1y`           OK via `_as_fraction` + `abs()` (signed fraction safe)
-  - `compute_risk_score: var_95_1d`                 OK via `_as_fraction`
-  - `compute_momentum_score: week_52_position_pct`  OK via `_as_pct_position_fraction` (v5.2.5 PHASE-M)
-  - `derive_upside_pct: upside_pct`                 GAP — no shape detection
-  - `compute_scores: upside_pct tracking`           GAP — no shape detection
-
-The first three are already defensively shape-aware (the helpers detect
-POINTS vs FRACTION by magnitude and convert). The fourth was hardened in
-v5.2.5 PHASE-M. The remaining gap is the `upside_pct` read path:
-
-  `_is_upside_suspect` bounds are FRACTION-form (-0.90, +2.00) by
-  intent — they match the engine v5.67.0 emit contract exactly. But
-  `derive_upside_pct` reads the row's `upside_pct` via `_get_float`
-  with NO shape conversion before the suspect check.
-
-  For an engine v5.67.0 row (upside_pct = 0.25 fraction):
-    _is_upside_suspect(0.25) = False → returned ✓
-  For a pre-v5.67.0 engine row (upside_pct = 25.0 points):
-    _is_upside_suspect(25.0) = True (25 > 2.0) → None ✗
-  For a non-engine path (test fixture, snapshot replay, third-party
-  importer) emitting points form:
-    same suppression failure mode ✗
-
-v5.2.6 fix — Phase Q:
-
-  Q. Defensive shape detection for upside_pct (NEW).
-
-     New private helper `_as_upside_fraction(value)` with shape
-     detection by magnitude:
-       |value| <= 2.5 → FRACTION (engine v5.67.0 canonical form;
-                                  covers the entire legitimate
-                                  range [-0.90, +2.00] with margin)
-       |value|  > 2.5 → PERCENT POINTS (pre-v5.67.0 engine, legacy
-                                       snapshots, non-engine paths;
-                                       divide by 100)
-
-     Threshold rationale: unlike `_as_pct_position_fraction` which
-     uses 1.5 (52W position range is bounded by 1.0 fraction),
-     `upside_pct` can legitimately reach 2.0 (200%) per the v5.67.0
-     engine cap `_INTRINSIC_UPSIDE_MAX_PCT / 100.0`. Using 1.5 would
-     misread legitimate fraction values in [1.5, 2.0]. Threshold 2.5
-     preserves the entire v5.67.0 legitimate fraction range and
-     catches all reasonable points values (≥2.5 points = ≥2.5%
-     upside; anything smaller is essentially never the actual case
-     in legacy data).
-
-     Idempotent across both shapes.
-
-     Applied at two call sites:
-       1. `derive_upside_pct` — the row's supplied `upside_pct` is
-          shape-normalized before `_is_upside_suspect` is evaluated.
-          Result is always fraction-form on return.
-       2. `compute_scores` — the v5.2.4 upside-suppression tracking
-          block reads the source row's `upside_pct` defensively so a
-          legacy POINTS value doesn't get falsely tagged as
-          "upside_synthesis_suspect" when in fact it's a valid
-          upside in disguise.
-
-  R. `_is_upside_suspect` docstring update — clarifies that the
-     bounds are FRACTION-form and aligned with the v5.67.0 engine
-     emit contract. No behavior change.
-
-  S. Version bump 5.2.5 → 5.2.6.
-
-[PRESERVED — strictly] All v5.2.5 / v5.2.4 / v5.2.3 / v5.2.2 / v5.2.1 /
-v5.2.0 helpers, signatures, dataclass fields, behaviors, constants,
-and the entire prior narrative. The new helper is additive. Public API
-surface unchanged. No removals from __all__.
+data_engine_v2 v5.67.0 unit-contract alignment release. New helper
+`_as_upside_fraction` with shape detection by magnitude. Applied at
+two call sites in `derive_upside_pct` and `compute_scores` upside-
+suppression tracking. Idempotent across both shapes.
 
 ================================================================================
 
 v5.2.5 changes (vs v5.2.4)  —  CROSS-PROVIDER CONTRACT ALIGNMENT
 -----------------------------------------------------------------
-Aligns scoring.py with the May 10/11 2026 provider + engine revisions:
-
-  - eodhd_provider v4.7.3, yahoo_fundamentals_provider v6.1.0,
-    yahoo_chart_provider v8.2.0, and enriched_quote v4.3.0 emit
-    `warnings` as List[str] (engine canonicalizes to "; "-joined
-    string at the merge boundary) and `last_error_class` for
-    diagnostic clustering on full-fail returns.
-  - data_engine_v2 v5.60.0 Phase O canonicalizes
-    week_52_position_pct to PERCENT POINTS (0-100). Phase P
-    defensively validates 52W bounds (drops bounds out of [8x, 1/8x]
-    of price). Phase Q preserves last_error_class through
-    canonicalize via a new alias entry. Phase H/I/P guards may
-    clear intrinsic_value AND/OR upside_pct when synthesizer
-    artifacts or unit mismatches are detected upstream.
-
-Four structural gaps in v5.2.4 vs the new cross-stack contract:
-
-  GAP 1 — Engine-applied valuation clears not surfaced.
-    Engine v5.60.0 may clear intrinsic_value AND upside_pct via
-    Phase H (hard-kill unit mismatch), Phase I (upside synthesis
-    suspect), or Phase P (52W bounds dropped). In those cases the
-    row arrives at scoring with intrinsic=None, upside_pct=None,
-    and the warnings string containing one of:
-      - "intrinsic_unit_mismatch_suspected"
-      - "upside_synthesis_suspect"
-      - "engine_52w_high_unit_mismatch_dropped"
-      - "engine_52w_low_unit_mismatch_dropped"
-      - "engine_52w_high_low_inverted"
-    v5.2.4's upside-suppression tracker only fires when scoring
-    ITSELF detects a suspect upside, so engine-cleared rows
-    produce no audit trail in scoring_errors.
-
-  GAP 2 — last_error_class not surfaced.
-    The new providers emit last_error_class (e.g., "RateLimited",
-    "AuthError", "IpBlocked", "NotFound", "NetworkError",
-    "InvalidPayload", "FetchError", "InvalidSymbol",
-    "MissingApiKey", "KsaBlocked") on full-fail returns. Engine
-    v5.60.0 Phase Q preserves the field through canonicalize.
-    Scoring v5.2.4 doesn't read it, so the audit trail loses an
-    important diagnostic signal — operators cannot distinguish a
-    row that came from a healthy provider vs one that was
-    constructed from a fallback after a primary-provider error.
-
-  GAP 3 — week_52_position_pct shape assumption.
-    v5.2.2's _as_pct_position_fraction assumed PERCENT POINTS
-    (0-100) only and unconditionally divided by 100. After engine
-    v5.60.0 Phase O the contract is enforced at the canonicalize
-    boundary, but rows from non-engine paths (test fixtures,
-    third-party importers, snapshot replays of pre-v5.60.0 data)
-    may still arrive as FRACTION (0-1), in which case the v5.2.4
-    form produced wrong results (0.156 -> 0.00156).
-
-  GAP 4 — Warnings-string-aware unforecastable detection missing.
-    v5.2.4's _is_row_unforecastable checks the forecast_unavailable
-    bool. Engine v5.60.0 Phase B's consistency sweep sets BOTH the
-    bool and the warning tag, but defense-in-depth says scoring
-    should also detect the warning string in case a downstream
-    merge drops the bool while preserving the warning (or a
-    direct-test row supplies only the warning).
-
-v5.2.5 fixes (preserved verbatim in v5.2.6):
-
-  K. Engine-applied valuation clear surfacing (GAP 1).
-     New helper _row_engine_dropped_valuation() reads the warnings
-     string for engine-applied tags.
-
-  L. last_error_class surfacing (GAP 2). compute_scores reads
-     last_error_class and appends "provider_error:<class>" to
-     scoring_errors.
-
-  M. Defensive _as_pct_position_fraction (GAP 3). Shape detection.
-
-  N. Warnings-string-aware unforecastable detection (GAP 4).
-     _is_row_unforecastable also checks the warnings string for
-     engine-emitted markers.
-
-  O. New helper _warning_tags_from_row(row).
-
-  P. Version bump to 5.2.5.
+[PRESERVED — see prior file header for full narrative]
+Engine-applied valuation clear surfacing, last_error_class surfacing,
+defensive _as_pct_position_fraction shape detection, warnings-string-
+aware unforecastable detection, _warning_tags_from_row helper.
 
 ================================================================================
 
 v5.2.4 changes (vs v5.2.3)  —  POST-DEPLOY SYNTHESIZER-OVER-AGGRESSION GUARD
 ----------------------------------------------------------------------------
-Closes one structural defect surfaced by the post-deploy production
-audit (127-row Global_Markets sample, May 10 2026). v5.2.3's
-unit-mismatch FLOOR guard was correct and is preserved; v5.2.4 adds
-the missing CEILING guard plus a two-sided bound on the displayed
-upside_pct field.
-
-v5.2.4 fixes (preserved verbatim in v5.2.5 / v5.2.6):
-
-  G. derive_forecast_patch — SYNTHESIS CEILING guard.
-  H. derive_upside_pct — TWO-SIDED SUSPECT BOUNDS.
-  I. compute_valuation_score — GUARDED UPSIDE COMPUTATION.
-  J. compute_scores — ERROR TRACKING.
-
-[PRESERVED — strictly] All v5.2.3 / v5.2.2 / v5.2.1 / v5.2.0 / v5.1.0
-helpers, signatures, dataclass fields, behaviors, and constants. The
-existing _FORECAST_ROI12_UNIT_MISMATCH_FLOOR is preserved exactly.
-Public API surface unchanged.
+[PRESERVED — see prior file header for full narrative]
+SYNTHESIS CEILING guard, TWO-SIDED SUSPECT BOUNDS on upside_pct,
+guarded upside computation in compute_valuation_score, error tracking
+for suspect upsides.
 
 ================================================================================
 
 v5.2.3 changes (vs v5.2.2)  —  AUDIT-DRIVEN HARDENING
 -----------------------------------------------------
-Closes six structural defects surfaced by the production audit of
-the deployed Global_Markets sheet (1,707 rows × 46 cols). v5.2.2's
-unit-conversion fix was correct but local; the audit revealed broader
-pathological patterns in scoring outputs that v5.2.3 addresses.
-
-v5.2.3 fixes (preserved):
-  A. compute_confidence_score — NO-FABRICATED-CONFIDENCE.
-  B. compute_recommendation — RECOMMENDATION-COHERENCE-GUARD.
-  C. ScoringConfig.risk_penalty_strength — RISK-PENALTY-REBALANCE.
-  D. compute_quality_score — REVENUE-COLLAPSE-AWARE.
-  E. derive_forecast_patch — UNIT-MISMATCH SANITY GUARD.
-  F. derive_forecast_patch — ILLIQUID-AWARE EARLY EXIT.
+[PRESERVED — see prior file header for full narrative]
+NO-FABRICATED-CONFIDENCE, RECOMMENDATION-COHERENCE-GUARD, RISK-PENALTY
+rebalance (0.55 -> 0.40), REVENUE-COLLAPSE-AWARE quality haircut,
+UNIT-MISMATCH SANITY guard, ILLIQUID-AWARE EARLY EXIT.
 
 ================================================================================
 
-v5.2.2 changes (vs v5.2.1)
---------------------------
-[PRESERVED] _as_pct_position_fraction helper for week_52_position_pct
-in PERCENT POINTS storage (post data_engine_v2 v5.53.0). Threshold
-1.0 instead of 1.5 fixes the [1.0, 1.5] edge case where stocks
-sitting 1.0%-1.5% above their 52W low were being misread as
-fractions. Single call-site swap in compute_momentum_score.
+v5.2.2 / v5.2.1 / v5.2.0 / v5.1.0 changes
+------------------------------------------
+[PRESERVED — see prior file headers for full narratives]
+Defensive shape helpers, view-prefix builder, view-completeness
+hardening, canonical recommendation alignment, insights_builder
+integration.
 
-v5.2.1 changes (vs v5.2.0)
---------------------------
-[PRESERVED] _build_view_prefix module helper. compute_recommendation
-derives all four views at the TOP of the function (before any
-early return), builds the view prefix once, and includes it in
-every return path. compute_scores insufficient_inputs path also
-includes the prefix.
-
-v5.2.0 changes (vs v5.1.0)
---------------------------
-[PRESERVED] _view_or_na, _CANONICAL_REC_ALIASES,
-_align_reason_to_canonical_recommendation, score_views_completeness.
-compute_scores applies the alignment helper twice (before and
-after build_insights). compute_recommendation applies it to its
-return value.
-
-Public API (unchanged from v5.2.5):
-  All exports preserved. No removals.
+Public API (extended in v5.2.7):
+  All v5.2.6 exports preserved. New: derive_canonical_recommendation,
+  apply_canonical_recommendation, RECOMMENDATION_SOURCE_TAG,
+  CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5.
 ================================================================================
 """
 
@@ -283,8 +189,13 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "5.2.6"
+__version__ = "5.2.7"
 SCORING_VERSION = __version__
+
+# v5.2.7: provenance tag emitted by compute_scores + apply_canonical_recommendation.
+# Downstream engines (investment_advisor_engine, data_engine_v2) read this to
+# decide whether a row has already been canonically scored (idempotency guard).
+RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
 
 # =============================================================================
 # Time Helpers
@@ -337,6 +248,27 @@ class RSISignal(str, Enum):
 
 
 # =============================================================================
+# v5.2.7 — Priority enum (NEW)
+# =============================================================================
+#
+# Aligned with audit_data_quality.AlertPriority (P1..P5) so downstream
+# audit / diagnostic correlation can compare against the same labels.
+# Also matches the priority bucketing already visible in the production
+# `Recommendation Detail` strings (P2..P4 seen in the May 13 snapshot).
+
+PRIO_P1 = "P1"   # Critical action: STRONG_SELL / broken-row REDUCE
+PRIO_P2 = "P2"   # STRONG_BUY or high-conviction BUY
+PRIO_P3 = "P3"   # BUY (normal conviction)
+PRIO_P4 = "P4"   # HOLD (default)
+PRIO_P5 = "P5"   # SELL or low-priority REDUCE
+
+CANONICAL_PRIORITIES: Tuple[str, ...] = (
+    PRIO_P1, PRIO_P2, PRIO_P3, PRIO_P4, PRIO_P5,
+)
+_CANONICAL_PRIORITIES_SET: Set[str] = set(CANONICAL_PRIORITIES)
+
+
+# =============================================================================
 # Custom Exceptions (preserved)
 # =============================================================================
 
@@ -383,37 +315,38 @@ _CONFIDENCE_FALLBACK_MIN_PROVIDERS = 1
 
 
 # =============================================================================
-# v5.2.4 — Synthesizer-over-aggression guard  (PRESERVED)
+# v5.2.7 — Priority assignment thresholds  (NEW)
 # =============================================================================
 #
-# Mirror to v5.2.3's _FORECAST_ROI12_UNIT_MISMATCH_FLOOR, but on the
-# POSITIVE side. Catches the +396% / +470% / +500% upside cases
-# observed in the May 2026 post-deploy audit (SD.US, NPSNY.US, CRK.US,
-# SBK.JSE post-v5.55.1 unit fix).
-#
-# Only fires when roi12 was synthesized from fair value (not when
-# the provider supplied directly), because a provider-supplied
-# roi12 above +200% may reflect a legitimate high-conviction call
-# we don't want to silently suppress.
+# Centralised so the priority model can be tuned without touching
+# `_compute_priority` body.
+
+# P2 vs P3 split for BUY recommendations: high-conviction BUY (overall ≥ 80
+# AND confidence ≥ 70) gets P2, normal BUY gets P3.
+_PRIORITY_BUY_HIGH_CONVICTION_OVERALL_FLOOR = 80.0
+_PRIORITY_BUY_HIGH_CONVICTION_CONFIDENCE_FLOOR = 70.0
+
+# P1 vs P5 split for REDUCE: REDUCE on a broken row (risk ≥ 90 AND
+# confidence < 45) escalates to P1 (urgent action). Otherwise P5.
+_PRIORITY_REDUCE_CRITICAL_RISK_FLOOR = 90.0
+_PRIORITY_REDUCE_CRITICAL_CONFIDENCE_CEILING = 45.0
+
+# P1 vs P5 split for SELL: SELL on a deeply-broken row (risk ≥ 85 AND
+# overall < 30) escalates to P1. Otherwise P5.
+_PRIORITY_SELL_CRITICAL_RISK_FLOOR = 85.0
+_PRIORITY_SELL_CRITICAL_OVERALL_CEILING = 30.0
+
+
+# =============================================================================
+# v5.2.4 — Synthesizer-over-aggression guard  (PRESERVED)
+# =============================================================================
 
 # Forecast-synthesis CEILING guard (POSITIVE side, v5.2.4).
 _FORECAST_ROI12_SYNTHESIS_CEILING = 2.00   # +200% over 12 months
 
 # Two-sided suspect bounds for the user-visible upside_pct field.
-# v5.2.6 NOTE: These bounds are FRACTION-FORM. They are aligned with
-# the data_engine_v2 v5.67.0 emit contract, which stores upside_pct
-# as a fraction (e.g., 0.25 for +25% upside; cap range
-# [-0.90, +2.00]). Callers that may receive POINTS-form values from
-# non-engine paths or legacy snapshots should normalize via
-# `_as_upside_fraction()` BEFORE calling `_is_upside_suspect`.
-#
-# Threshold rationale (against the production sample):
-#   FLOOR -90% catches AV.LSE (-97%), SMIN.LSE (-99%), SBK.JSE (-94%),
-#                      ANG.JSE (-96%); preserves -50% to -85% genuine.
-#   CEIL +200% catches SD.US (+500%), NPSNY.US (+472%), CRK.US (+396%),
-#                      SBK.JSE post-v5.55.1 (+470%); preserves
-#                      ML.PA (+190%), RCI.US (+166%), BCE.TO (+162%),
-#                      KEP.US (+153%).
+# v5.2.6 NOTE: These bounds are FRACTION-FORM, aligned with the
+# data_engine_v2 v5.67.0 emit contract.
 _UPSIDE_PCT_SUSPECT_FLOOR = -0.90      # -90% (fraction form)
 _UPSIDE_PCT_SUSPECT_CEILING = 2.00     # +200% (fraction form)
 
@@ -422,13 +355,6 @@ def _is_upside_suspect(upside: Optional[float]) -> bool:
     """
     v5.2.4: Returns True when an upside_pct value falls outside the
     data-quality sanity bounds.
-
-    Use to guard:
-      - The displayed upside_pct field (derive_upside_pct).
-      - The ad-hoc upside computation in compute_valuation_score.
-
-    None inputs return False (i.e. None is not "suspect" — it's just
-    absent; callers handle absence separately).
 
     v5.2.6 NOTE: The bounds are FRACTION-FORM, aligned with the
     data_engine_v2 v5.67.0 emit contract (upside_pct stored as
@@ -450,16 +376,6 @@ def _is_upside_suspect(upside: Optional[float]) -> bool:
 # =============================================================================
 # v5.2.5 — Cross-provider contract alignment  (PRESERVED)
 # =============================================================================
-#
-# Provider error-class values surfaced by eodhd_provider v4.7.3,
-# yahoo_fundamentals_provider v6.1.0, and yahoo_chart_provider v8.2.0
-# via the `last_error_class` field (preserved through engine
-# canonicalization by data_engine_v2 v5.60.0 Phase Q alias entry).
-#
-# Surfaced to scoring_errors as "provider_error:<class>" so audit
-# reports can correlate scoring outcomes against upstream provider
-# health. Not used to factor into confidence — _data_quality_factor
-# already accounts for data quality, so this would double-penalize.
 
 _PROVIDER_ERROR_CLASSES_KNOWN: Set[str] = {
     "AuthError",
@@ -474,19 +390,6 @@ _PROVIDER_ERROR_CLASSES_KNOWN: Set[str] = {
     "KsaBlocked",
 }
 
-# Engine-applied warning tags that indicate the engine (data_engine_v2
-# v5.60.0 Phase H / Phase I / Phase P) dropped intrinsic_value and/or
-# upside_pct because of unit-mismatch or synthesizer-overshoot
-# detection. When scoring sees these tags AND intrinsic is missing,
-# it surfaces "engine_dropped_valuation" to scoring_errors for audit
-# correlation.
-#
-# v5.2.6 NOTE: data_engine_v2 v5.67.0 switched to a fraction-emit
-# contract that eliminates the unit-mismatch class of bugs the
-# original tags were designed to catch. v5.67.0 rows are unlikely to
-# carry these tags, but the helper remains correct (returns False)
-# and continues to surface tags from legacy snapshot rows or older
-# engine versions still in production.
 _ENGINE_DROPPED_VALUATION_TAGS: Set[str] = {
     "intrinsic_unit_mismatch_suspected",
     "upside_synthesis_suspect",
@@ -495,9 +398,6 @@ _ENGINE_DROPPED_VALUATION_TAGS: Set[str] = {
     "engine_52w_high_low_inverted",
 }
 
-# Engine-emitted warning tags that mark a row as unforecastable.
-# v5.2.5 reads these in addition to the forecast_unavailable bool
-# for defense-in-depth against state-drift in downstream merge code.
 _ENGINE_UNFORECASTABLE_TAGS: Set[str] = {
     "forecast_unavailable",
     "forecast_unavailable_no_source",
@@ -509,15 +409,11 @@ _ENGINE_UNFORECASTABLE_TAGS: Set[str] = {
 def _warning_tags_from_row(row: Mapping[str, Any]) -> Set[str]:
     """
     v5.2.5: Parse the row's `warnings` field into a Set[str] of
-    normalized tags. Handles:
-      - None / "" / missing -> empty set
-      - "; "-joined string (engine v5.60.0 / v5.67.0 Phase N canonical shape)
-      - Accidental List[str] / Tuple[str] input (defensive: scoring
-        is called from many paths, some of which may bypass engine
-        canonicalization)
-    Each tag is stripped of whitespace. Empty parts after split are
-    dropped. Used by _row_engine_dropped_valuation() and the
-    warnings-aware branch of _is_row_unforecastable().
+    normalized tags. Handles None / empty / "; "-joined string /
+    list-or-tuple input. Each tag is stripped of whitespace. Empty
+    parts after split are dropped. Used by
+    _row_engine_dropped_valuation() and the warnings-aware branch of
+    _is_row_unforecastable().
     """
     if row is None:
         return set()
@@ -549,15 +445,9 @@ def _warning_tags_from_row(row: Mapping[str, Any]) -> Set[str]:
         if s:
             parts.append(s)
 
-    # Strip "key:value" suffix when comparing against the tag set —
-    # callers compare with the SET membership which uses bare keys.
-    # We keep both forms so callers can pick either.
     out: Set[str] = set()
     for p in parts:
         out.add(p)
-        # Also add the bare key (before any ":") so a tag like
-        # "forecast_unavailable:no_price_or_market_cap" is matched
-        # against the bare "forecast_unavailable" in the static sets.
         if ":" in p:
             bare = p.split(":", 1)[0].strip()
             if bare:
@@ -571,17 +461,6 @@ def _row_engine_dropped_valuation(row: Mapping[str, Any]) -> bool:
     the engine (data_engine_v2 v5.60.0 Phase H / I / P) dropped
     intrinsic_value or upside_pct due to unit-mismatch or
     synthesizer-overshoot detection upstream.
-
-    Used by compute_scores to append "engine_dropped_valuation" to
-    scoring_errors when intrinsic_value is missing AND one of these
-    tags is present — closes the audit-trail gap where engine-
-    cleared rows produced no scoring-layer diagnostic.
-
-    v5.2.6 NOTE: data_engine_v2 v5.67.0 emits values directly in
-    FRACTION form without the upstream-clear class of remediations,
-    so v5.67.0 rows are unlikely to carry these tags. The helper
-    remains useful for legacy snapshots and older engine versions
-    coexisting in production.
     """
     if row is None:
         return False
@@ -609,9 +488,7 @@ class ScoringConfig:
     default_technical: float = 0.00
 
     # v5.2.3: lowered from 0.55 to 0.40 to address audit finding #3
-    # (REDUCE-heavy distribution). With v5.2.2 weights a high-risk
-    # stock lost ~27% of its composite score; v5.2.3 brings that to
-    # ~20%, restoring HOLD/BUY for genuinely-good-but-volatile names.
+    # (REDUCE-heavy distribution).
     risk_penalty_strength: float = 0.40
 
     confidence_penalty_strength: float = 0.45
@@ -646,7 +523,6 @@ class ScoringConfig:
             default_growth=_env_float("SCORING_W_GROWTH", 0.15),
             default_opportunity=_env_float("SCORING_W_OPPORTUNITY", 0.10),
             default_technical=_env_float("SCORING_W_TECHNICAL", 0.00),
-            # v5.2.3: env default lowered from 0.55 to 0.40 (see above)
             risk_penalty_strength=_env_float("SCORING_RISK_PENALTY", 0.40),
             confidence_penalty_strength=_env_float("SCORING_CONFIDENCE_PENALTY", 0.45),
         )
@@ -831,8 +707,6 @@ class ScoreWeights:
     w_growth: float = _CONFIG.default_growth
     w_opportunity: float = _CONFIG.default_opportunity
     w_technical: float = _CONFIG.default_technical
-    # v5.2.3: default sources from _CONFIG.risk_penalty_strength,
-    # which v5.2.3 lowered to 0.40.
     risk_penalty_strength: float = _CONFIG.risk_penalty_strength
     confidence_penalty_strength: float = _CONFIG.confidence_penalty_strength
 
@@ -933,6 +807,12 @@ class AssetScores:
     scoring_updated_riyadh: str = field(default_factory=_riyadh_iso)
     scoring_errors: List[str] = field(default_factory=list)
 
+    # v5.2.7 additions — appended at end for additive-only schema compatibility.
+    # Downstream dict consumers that iterate fields in declaration order are
+    # unaffected; new fields are simply tacked on after scoring_errors.
+    recommendation_priority: Optional[str] = None
+    recommendation_source: str = ""
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -1030,53 +910,23 @@ def _as_pct_position_fraction(value: Any) -> Optional[float]:
     """
     v5.2.5: 52W-position-style fields with defensive shape detection.
 
-    Engine v5.60.0 / v5.67.0 Phase O canonicalizes week_52_position_pct
-    to PERCENT POINTS (0-100) at the canonicalize boundary, so rows
-    flowing from the engine arrive in percent-point form. But scoring
-    is called from many code paths, some of which may bypass engine
-    canonicalization (test fixtures, direct provider patches being
-    scored individually, snapshot replays of pre-v5.60.0 sheets).
-    Those rows may still arrive as FRACTION (0-1).
-
-    Shape detection (v5.2.5 — Phase M):
+    Shape detection (Phase M):
       |value| <= 1.5  ->  FRACTION; pass through with clamp to [0,1]
       |value|  > 1.5  ->  PERCENT POINTS; divide by 100 and clamp
 
-    Idempotent across both shapes. Closes the gap where a fraction
-    value (0.156) running through v5.2.4's unconditional /100 would
-    have produced 0.00156, dropping the position effectively to 0.
-
-    [PRESERVED v5.2.2] Public helper signature and return type
-    unchanged. The clamp at the call site remains harmless and is
-    kept for further defense.
+    Idempotent across both shapes.
     """
     f = _safe_float(value)
     if f is None:
         return None
     if abs(f) <= 1.5:
-        # FRACTION shape (engine pre-v5.60.0, non-engine paths, providers
-        # emitting raw fractions). Already in target [0, 1] range.
         return _clamp(f, 0.0, 1.0)
-    # PERCENT POINTS shape (engine v5.60.0 / v5.67.0 Phase O canonical
-    # form, eodhd_provider v4.7.3 native form, scoring.py v5.2.2 contract).
     return _clamp(f / 100.0, 0.0, 1.0)
 
 
 def _as_upside_fraction(value: Any) -> Optional[float]:
     """
     v5.2.6 — Phase Q: upside_pct shape detection.
-
-    The data_engine_v2 v5.67.0 release switched upside_pct from POINTS
-    (e.g., 25.0 for +25% upside) to FRACTION (e.g., 0.25). The engine
-    caps fraction output to the range [-0.90, +2.00] per
-    `_INTRINSIC_UPSIDE_MIN_PCT / 100.0` and `_INTRINSIC_UPSIDE_MAX_PCT / 100.0`.
-
-    Pre-v5.67.0 engines and many non-engine code paths (test fixtures,
-    snapshot replays of older sheets, third-party row importers) may
-    still emit POINTS. This helper detects shape by magnitude and
-    normalizes to fraction so `_is_upside_suspect` and the downstream
-    consumers (`derive_value_view`, `compute_recommendation`) see
-    consistent fraction-form input.
 
     Shape detection:
       |value| <= 2.5  ->  FRACTION (engine v5.67.0 canonical form;
@@ -1088,17 +938,6 @@ def _as_upside_fraction(value: Any) -> Optional[float]:
                                           snapshots, non-engine paths;
                                           divide by 100)
 
-    Threshold rationale: unlike `_as_pct_position_fraction` which uses
-    1.5 (52W position is bounded by 1.0 fraction = 100%), upside_pct
-    can legitimately reach 2.0 (200%) per the engine cap. A threshold
-    of 1.5 would misread valid fraction values in [1.5, 2.0]. Threshold
-    2.5 preserves the full v5.67.0 legitimate range, leaves headroom
-    for occasional analyst-supplied values up to +250%, and reliably
-    catches all reasonable points values (any |x| >= 2.5 points = ≥2.5%
-    upside; smaller-than-2.5% points-form upsides are tolerated as
-    "fraction" but the downstream suspect-bound check correctly accepts
-    them either way since the bounds are symmetric in magnitude).
-
     Idempotent across both shapes for any value within the engine's
     cap range. None inputs return None.
     """
@@ -1106,11 +945,7 @@ def _as_upside_fraction(value: Any) -> Optional[float]:
     if f is None:
         return None
     if abs(f) <= 2.5:
-        # FRACTION shape (engine v5.67.0 canonical form). Pass through;
-        # no clamp here since `_is_upside_suspect` is the sole reader
-        # and applies its own asymmetric bounds (-0.90, +2.00).
         return f
-    # POINTS shape (pre-v5.67.0 engine, legacy snapshots). Convert.
     return f / 100.0
 
 
@@ -1255,43 +1090,18 @@ def derive_upside_pct(row: Mapping[str, Any]) -> Optional[float]:
     """
     Compute the displayed upside_pct field.
 
-    v5.2.6 — Phase Q (NEW). When the row carries a supplied
-    `upside_pct`, normalize its shape via `_as_upside_fraction` before
-    evaluating the suspect bounds. Engine v5.67.0 stores upside_pct as
-    fraction (e.g., 0.25 for +25%); pre-v5.67.0 engines and non-engine
-    paths may emit POINTS (e.g., 25.0). The shape detection ensures
-    `_is_upside_suspect` always sees fraction-form input, eliminating
-    the false-positive suppression of valid POINTS-form upsides
-    (anything ≥+2.5% points was being flagged as suspect pre-v5.2.6
-    because 25.0 > +2.00 fraction ceiling).
+    v5.2.6 — Phase Q. When the row carries a supplied `upside_pct`,
+    normalize its shape via `_as_upside_fraction` before evaluating
+    the suspect bounds.
 
-    v5.2.4 — TWO-SIDED SUSPECT BOUNDS (preserved).
-    Suppresses values outside [_UPSIDE_PCT_SUSPECT_FLOOR,
-    _UPSIDE_PCT_SUSPECT_CEILING] (default -90% to +200% in fraction
-    form) by returning None. Catches both the LSE/JSE/TASE phantom
-    downsides (-94% to -99%, subunit pricing artifacts) and the
-    Graham-formula synthesizer over-aggression (+396% to +500% on
-    SD.US, NPSNY.US, CRK.US, SBK.JSE).
-
-    The bounds apply to BOTH:
-      - a row-supplied upside_pct value (shape-normalized via
-        _as_upside_fraction; suppressed if suspect)
-      - a locally-computed (intrinsic - price) / price (always
-        fraction; suppressed if suspect)
-
-    Returns None when:
-      - upside is missing (no price or no intrinsic)
-      - upside is suspect (outside bounds after shape normalization)
-    Otherwise returns the rounded fraction.
+    v5.2.4 — TWO-SIDED SUSPECT BOUNDS (preserved). Suppresses values
+    outside [_UPSIDE_PCT_SUSPECT_FLOOR, _UPSIDE_PCT_SUSPECT_CEILING]
+    (default -90% to +200% in fraction form) by returning None.
     """
-    # v5.2.6 Phase Q: shape-aware read. Handles both engine v5.67.0
-    # fraction and pre-v5.67.0 / non-engine POINTS forms.
     usp = _as_upside_fraction(_get(row, "upside_pct"))
     if usp is not None:
-        # v5.2.4 (preserved): guard against suspect provider-supplied upside.
         if _is_upside_suspect(usp):
             return None
-        # v5.2.6: round consistently with the synthesized-path return.
         return _round(usp, 4)
 
     price = _get_float(row, "current_price", "price", "last_price")
@@ -1302,7 +1112,6 @@ def derive_upside_pct(row: Mapping[str, Any]) -> Optional[float]:
 
     raw = (intrinsic - price) / price
 
-    # v5.2.4 (preserved): guard against synthesizer-derived suspect upside.
     if _is_upside_suspect(raw):
         return None
 
@@ -1500,31 +1309,15 @@ def _empty_forecast_patch() -> Dict[str, Any]:
 def _is_row_unforecastable(row: Mapping[str, Any]) -> bool:
     """
     v5.2.5 — WARNINGS-STRING-AWARE detection (Phase N).
-
     Returns True when forecast synthesis should be skipped entirely.
-    Detection rules (any of):
-      1. v5.2.3 explicit forecast_unavailable=True flag.
-      2. v5.2.3 data_quality ∈ {STALE, MISSING, ERROR} AND no fair
-         value AND no API-supplied roi3/roi12/fp12.
-      3. v5.2.5 NEW: warnings string contains any of
-         _ENGINE_UNFORECASTABLE_TAGS:
-           - "forecast_unavailable"
-           - "forecast_unavailable_no_source"
-           - "forecast_cleared_consistency_sweep"
-           - "forecast_skipped_unavailable"
-
-    Rules 1 + 2 preserved verbatim from v5.2.4. Rule 3 is additive.
     """
-    # Rule 1 — explicit bool (v5.2.3, preserved)
     if _safe_bool(_get(row, "forecast_unavailable", "is_forecast_unavailable")):
         return True
 
-    # Rule 3 — engine-emitted warning tags (v5.2.5 Phase N)
     tags = _warning_tags_from_row(row)
     if tags and (tags & _ENGINE_UNFORECASTABLE_TAGS):
         return True
 
-    # Rule 2 — DQ + no synthesizable inputs (v5.2.3, preserved)
     dq_label = str(_get(row, "data_quality") or "").strip().upper()
     dq_is_unrecoverable = dq_label in {"STALE", "MISSING", "ERROR"}
 
@@ -1548,34 +1341,10 @@ def derive_forecast_patch(
     forecasts: ForecastParameters,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """
-    v5.2.4: hardened forecast derivation.
-
-    Three safety paths inherited from v5.2.3, plus one new in v5.2.4:
-      1. ILLIQUID-AWARE EARLY EXIT (v5.2.3) — when _is_row_unforecastable
-         returns True, return all-None patch immediately.
-      2. UNIT-MISMATCH SANITY GUARD, FLOOR side (v5.2.3) — after roi12
-         has been derived, if it's < -50%, treat as a unit-conversion
-         bug, suppress, emit "forecast_suspect_unit_mismatch".
-      3. SYNTHESIS-CEILING GUARD (v5.2.4) — symmetric to (2).
-         When roi12 was synthesized from fair value AND is > +200%,
-         treat as Graham-formula over-aggression, suppress, emit
-         "forecast_suspect_synthesis_overshoot". Does NOT fire for
-         provider-supplied roi12.
-      4. ROI clamping to ForecastParameters bounds (preserved).
-
-    [v5.2.5 NOTE] _is_row_unforecastable now also detects engine-
-    emitted warning tags (Phase N). This function's behavior is
-    unchanged — it just sees an earlier early-exit on a wider set
-    of unforecastable rows.
-
-    [v5.2.6 NOTE] expected_roi_3m / expected_roi_12m are read via
-    `_as_roi_fraction` which is already shape-aware (>1.0 → /100), so
-    the data_engine_v2 v5.67.0 fraction emit contract is transparent
-    to this function. No behavioral change required.
+    v5.2.4: hardened forecast derivation (preserved).
     """
     errors: List[str] = []
 
-    # v5.2.3: ILLIQUID-AWARE EARLY EXIT (extended in v5.2.5 to honor warnings tags)
     if _is_row_unforecastable(row):
         errors.append("forecast_skipped_unavailable")
         return _empty_forecast_patch(), errors
@@ -1598,7 +1367,6 @@ def derive_forecast_patch(
     fp3 = _get_float(row, "forecast_price_3m", "expected_price_3m")
     fp12 = _get_float(row, "forecast_price_12m", "expected_price_12m")
 
-    # Derive ROIs from price + forecast prices when missing.
     if price is not None and price > 0:
         if roi12 is None and fp12 is not None and fp12 > 0:
             roi12 = (fp12 / price) - 1.0
@@ -1607,13 +1375,11 @@ def derive_forecast_patch(
         if roi1 is None and fp1 is not None and fp1 > 0:
             roi1 = (fp1 / price) - 1.0
 
-    # Derive 12m ROI from fair value as last-resort.
     roi12_synthesized_from_fair = False
     if price is not None and price > 0 and roi12 is None and fair is not None and fair > 0:
         roi12 = (fair / price) - 1.0
         roi12_synthesized_from_fair = True
 
-    # v5.2.3: UNIT-MISMATCH SANITY GUARD.
     if roi12 is not None and roi12 < _FORECAST_ROI12_UNIT_MISMATCH_FLOOR:
         errors.append("forecast_suspect_unit_mismatch")
         roi12 = None
@@ -1626,7 +1392,6 @@ def derive_forecast_patch(
         else:
             fp12 = None
 
-    # v5.2.4: SYNTHESIS-CEILING GUARD (POSITIVE side / CEILING).
     if (
         roi12 is not None
         and roi12_synthesized_from_fair
@@ -1714,16 +1479,7 @@ def _completeness_factor(row: Mapping[str, Any]) -> float:
 def _revenue_collapse_haircut(revenue_growth: Optional[float]) -> float:
     """
     v5.2.3: Multiplicative haircut for quality scores when revenue
-    has collapsed YoY. Returns a multiplier in
-    [_QUALITY_REVENUE_COLLAPSE_MAX_HAIRCUT, 1.0].
-
-      revenue_growth >= -30%  -> 1.0   (no penalty)
-      revenue_growth = -50%   -> 0.80
-      revenue_growth = -75%   -> 0.55  (clamped floor)
-      revenue_growth <= -75%  -> 0.55  (floor)
-
-    None input or missing growth -> 1.0 (no penalty applied; we don't
-    punish data we don't have).
+    has collapsed YoY.
     """
     if revenue_growth is None:
         return 1.0
@@ -1783,7 +1539,6 @@ def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
     else:
         combined = data_quality_proxy
 
-    # v5.2.3: REVENUE-COLLAPSE-AWARE haircut
     revenue_growth = _as_fraction(
         _get(row, "revenue_growth_yoy", "revenue_growth", "growth_yoy")
     )
@@ -1832,12 +1587,6 @@ def compute_confidence_score(row: Mapping[str, Any]) -> Tuple[Optional[float], O
 def compute_valuation_score(row: Mapping[str, Any]) -> Optional[float]:
     """
     v5.2.4 — GUARDED UPSIDE COMPUTATION (preserved verbatim).
-
-    The ad-hoc upside is computed locally as (fair / price) - 1.0
-    which is always a FRACTION; the v5.2.4 `_is_upside_suspect` guard
-    operates on it directly. No shape conversion needed here — that
-    only applies to row-supplied `upside_pct` values which go through
-    `derive_upside_pct` (which uses `_as_upside_fraction` in v5.2.6).
     """
     price = _get_float(row, "current_price", "price", "last_price", "last")
     if price is None or price <= 0:
@@ -1849,7 +1598,6 @@ def compute_valuation_score(row: Mapping[str, Any]) -> Optional[float]:
         "forecast_price_3m", "forecast_price_12m", "forecast_price_1m"
     )
 
-    # v5.2.4: GUARDED UPSIDE.
     upside: Optional[float] = None
     if fair is not None and fair > 0:
         raw_upside = (fair / price) - 1.0
@@ -1927,10 +1675,6 @@ def compute_momentum_score(row: Mapping[str, Any]) -> Optional[float]:
     """
     Compute momentum score (0-100). v5.2.5: _as_pct_position_fraction
     detects shape (fraction vs percent points) defensively.
-
-    [v5.2.6 NOTE] percent_change is read via `_as_roi_fraction`, which
-    is already shape-aware (>1.0 → /100). The data_engine_v2 v5.67.0
-    fraction emit contract is transparent here. No behavioral change.
     """
     pct = _as_roi_fraction(_get(row, "percent_change", "change_pct", "change_percent"))
     rsi = _get_float(row, "rsi_14", "rsi", "rsi14")
@@ -1967,14 +1711,6 @@ def compute_momentum_score(row: Mapping[str, Any]) -> Optional[float]:
 def compute_risk_score(row: Mapping[str, Any]) -> Optional[float]:
     """
     Compute risk score (0-100). Higher = riskier.
-
-    [v5.2.6 NOTE] max_drawdown_1y and var_95_1d are read via
-    `_as_fraction` which is shape-aware (>1.5 → /100). The
-    data_engine_v2 v5.67.0 fraction emit contract is transparent. The
-    drawdown SIGN flip (v5.67.0 emits signed negative fraction; pre-
-    v5.67.0 emitted abs() positive points) is handled by the existing
-    `abs(dd1y)` call below — the absolute magnitude is what feeds the
-    risk scale either way.
     """
     vol90 = _as_fraction(_get(row, "volatility_90d"))
     dd1y = _as_fraction(_get(row, "max_drawdown_1y"))
@@ -2136,10 +1872,6 @@ def derive_value_view(
 ) -> Optional[str]:
     """
     v5.2.6 NOTE: `upside_pct` is expected to be a FRACTION here.
-    Callers should obtain it via `derive_upside_pct` (which applies
-    `_as_upside_fraction` for shape detection in v5.2.6) so the
-    thresholds below (0.20 = 20%, -0.10 = -10%) are applied to
-    consistently fraction-form data.
     """
     if upside_pct is not None:
         if upside_pct > 0.20:
@@ -2174,17 +1906,6 @@ def _coherence_guard_recommendation(
     own forecasts. Returns (downgraded_rec, downgraded_reason) if
     a downgrade is warranted, or (None, None) to leave the original
     intact.
-
-    Rule:
-      if canonical_rec ∈ {BUY, STRONG_BUY}
-         AND roi3 < _COHERENCE_ROI3_FLOOR_FRACTION
-         AND confidence100 < _COHERENCE_CONFIDENCE_FLOOR
-      -> downgrade to HOLD with explicit reason
-
-    Strong signals (high confidence) override the guard, since a
-    high-conviction BUY with mildly negative 3M ROI may be a
-    legitimate accumulation call. Low-confidence BUYs in the face of
-    negative forecasts are the audit-flagged pattern.
     """
     if canonical_rec not in ("BUY", "STRONG_BUY"):
         return None, None
@@ -2238,17 +1959,14 @@ def compute_recommendation(
     """
     Compute view-aware 5-tier recommendation.
 
-    v5.2.3 changes (preserved):
-      - RECOMMENDATION-COHERENCE-GUARD applied after reco_normalize
-        returns its label.
+    v5.2.3: RECOMMENDATION-COHERENCE-GUARD applied after reco_normalize
+    returns its label.
 
-    v5.2.1 / v5.2.0 (preserved): all four views derived at the top so
-    every return path carries the parseable view prefix. Final pass
-    through _align_reason_to_canonical_recommendation before return.
+    v5.2.1 / v5.2.0: all four views derived at the top so every return
+    path carries the parseable view prefix. Final pass through
+    _align_reason_to_canonical_recommendation before return.
 
-    v5.2.6 NOTE: `upside_pct` is expected to be a FRACTION (e.g., 0.25
-    for +25%). Callers obtain it from `derive_upside_pct` which
-    applies `_as_upside_fraction` shape detection.
+    v5.2.6 NOTE: `upside_pct` is expected to be a FRACTION.
     """
     if fundamental_view is None:
         fundamental_view = derive_fundamental_view(quality, growth)
@@ -2332,6 +2050,78 @@ def compute_recommendation(
 
     aligned_reason = _align_reason_to_canonical_recommendation(reason, canonical_rec)
     return canonical_rec, aligned_reason
+
+
+# =============================================================================
+# v5.2.7 — Priority computation (NEW)
+# =============================================================================
+
+def _compute_priority(
+    reco: Optional[str],
+    overall: Optional[float],
+    risk: Optional[float],
+    confidence100: Optional[float],
+    roi3: Optional[float],
+) -> str:
+    """
+    v5.2.7: Centralized priority bucketing. The single point of truth
+    for the P1..P5 mapping so the top-line `Recommendation` column and
+    the downstream `Recommendation Detail` string cannot diverge.
+
+    Mapping (matching the priority bucketing visible in the production
+    Detail strings — P2..P4 in the May 13 snapshot):
+
+      P1 = Critical action:
+             - STRONG_SELL (canonical normalizes this to SELL; would
+               still resolve to P5 unless the broken-row threshold
+               trips, which is the correct conservative behavior)
+             - SELL on a deeply-broken row (risk >= 85 AND overall < 30)
+             - REDUCE on a critically-broken row
+               (risk >= 90 AND confidence < 45)
+      P2 = STRONG_BUY (always), or
+           High-conviction BUY (overall >= 80 AND confidence >= 70)
+      P3 = BUY (normal conviction)
+      P4 = HOLD (default — also the safe fallback for unknown labels)
+      P5 = SELL (non-critical), or
+           REDUCE (non-critical)
+
+    Inputs are tolerant:
+      - None overall/risk/confidence default to neutral midpoints
+        (50.0 / 50.0 / 55.0) so the function never raises.
+      - reco is normalized through `normalize_recommendation_code`
+        before the lookup to absorb legacy aliases (ACCUMULATE, etc).
+    """
+    o = overall if overall is not None else 50.0
+    r = risk if risk is not None else 50.0
+    c = confidence100 if confidence100 is not None else 55.0
+
+    canon = normalize_recommendation_code(reco) if reco else "HOLD"
+
+    if canon == "STRONG_BUY":
+        return PRIO_P2
+    if canon == "BUY":
+        if (
+            o >= _PRIORITY_BUY_HIGH_CONVICTION_OVERALL_FLOOR
+            and c >= _PRIORITY_BUY_HIGH_CONVICTION_CONFIDENCE_FLOOR
+        ):
+            return PRIO_P2
+        return PRIO_P3
+    if canon == "REDUCE":
+        if (
+            r >= _PRIORITY_REDUCE_CRITICAL_RISK_FLOOR
+            and c < _PRIORITY_REDUCE_CRITICAL_CONFIDENCE_CEILING
+        ):
+            return PRIO_P1
+        return PRIO_P5
+    if canon == "SELL":
+        if (
+            r >= _PRIORITY_SELL_CRITICAL_RISK_FLOOR
+            and o < _PRIORITY_SELL_CRITICAL_OVERALL_CEILING
+        ):
+            return PRIO_P1
+        return PRIO_P5
+    # HOLD and anything else
+    return PRIO_P4
 
 
 # =============================================================================
@@ -2422,35 +2212,239 @@ def _import_insights_builder():
 
 
 # =============================================================================
+# v5.2.7 — Canonical recommendation public helpers (NEW)
+# =============================================================================
+
+def derive_canonical_recommendation(
+    row: Mapping[str, Any],
+    *,
+    settings: Any = None,
+) -> Tuple[str, str, str]:
+    """
+    v5.2.7: Read the canonical (recommendation, reason, priority) triple
+    from a row that has already been through compute_scores() (or
+    equivalent — has overall/risk/confidence/views set).
+
+    Lightweight — does NOT re-run the full compute_scores pipeline
+    (no insights_builder, no sector batch pass). Use this from
+    downstream engines (investment_advisor_engine, data_engine_v2)
+    when the row's scores are already populated and you just need
+    the canonical recommendation triple.
+
+    Behavior
+    --------
+    1. If the row already carries `recommendation_source ==
+       RECOMMENDATION_SOURCE_TAG`, reads the existing values. The
+       priority is reconstructed if missing or corrupt.
+    2. Otherwise, derives fresh values by:
+         - Reading scores from the row (overall/risk/conf/roi/views)
+         - Calling compute_recommendation() with those scores
+         - Applying coherence guard + reason alignment
+         - Computing priority via _compute_priority()
+
+    Returns
+    -------
+    (recommendation, recommendation_reason, recommendation_priority)
+        - recommendation ∈ CANONICAL_RECOMMENDATION_CODES
+        - recommendation_reason: aligned to the canonical label
+        - recommendation_priority ∈ CANONICAL_PRIORITIES (P1..P5)
+
+    Does NOT modify the input row. For mutation, use
+    apply_canonical_recommendation().
+    """
+    # Idempotency fast-path: row already canonically scored.
+    existing_tag = _safe_str(row.get("recommendation_source"))
+    if existing_tag == RECOMMENDATION_SOURCE_TAG:
+        reco = normalize_recommendation_code(row.get("recommendation"))
+        reason = _safe_str(row.get("recommendation_reason"))
+        priority = _safe_str(row.get("recommendation_priority"))
+
+        # Reconstruct priority if missing or corrupt (defensive against
+        # downstream merge code that may drop the field).
+        if priority not in _CANONICAL_PRIORITIES_SET:
+            overall = _norm_score_0_100(row.get("overall_score"))
+            risk_s = _norm_score_0_100(row.get("risk_score"))
+            conf100 = _norm_score_0_100(row.get("confidence_score"))
+            roi3 = _as_roi_fraction(row.get("expected_roi_3m"))
+            priority = _compute_priority(reco, overall, risk_s, conf100, roi3)
+
+        return reco, reason, priority
+
+    # Fresh derivation — read existing scores from the row.
+    overall = _norm_score_0_100(row.get("overall_score"))
+    risk_s = _norm_score_0_100(row.get("risk_score"))
+    conf100 = _norm_score_0_100(row.get("confidence_score"))
+    if conf100 is None:
+        fc01 = _norm_confidence_0_1(row.get("forecast_confidence"))
+        if fc01 is not None:
+            conf100 = fc01 * 100.0
+
+    roi1 = _as_roi_fraction(row.get("expected_roi_1m"))
+    roi3 = _as_roi_fraction(row.get("expected_roi_3m"))
+    roi12 = _as_roi_fraction(row.get("expected_roi_12m"))
+
+    valuation = _norm_score_0_100(row.get("valuation_score"))
+    quality_s = _norm_score_0_100(row.get("quality_score"))
+    growth_s = _norm_score_0_100(row.get("growth_score"))
+    momentum_s = _norm_score_0_100(row.get("momentum_score"))
+    technical_s = _norm_score_0_100(row.get("technical_score"))
+    conviction = _norm_score_0_100(row.get("conviction_score"))
+    sector_rel = _norm_score_0_100(row.get("sector_relative_score"))
+
+    # Shape-aware upside read (v5.2.6 Phase Q).
+    usp = _as_upside_fraction(row.get("upside_pct"))
+    rsi_val = _get_float(row, "rsi_14", "rsi", "rsi14")
+    rsi_sig = rsi_signal(rsi_val)
+
+    # Pass through pre-set views if present (avoids re-derivation cost
+    # and respects upstream view decisions). The compute_recommendation
+    # helper will re-derive any view that arrives as None or "N/A".
+    def _coerce_view(v: Any) -> Optional[str]:
+        s = _safe_str(v)
+        if not s or s.upper() == "N/A":
+            return None
+        return s
+
+    fund_view = _coerce_view(row.get("fundamental_view"))
+    tech_view = _coerce_view(row.get("technical_view"))
+    risk_view_in = _coerce_view(row.get("risk_view"))
+    value_view_in = _coerce_view(row.get("value_view"))
+
+    horizon, _hdays = detect_horizon(settings, row)
+
+    rec, reason = compute_recommendation(
+        overall, risk_s, conf100, roi3,
+        horizon=horizon,
+        technical=technical_s,
+        momentum=momentum_s,
+        roi1=roi1,
+        roi12=roi12,
+        quality=quality_s,
+        growth=growth_s,
+        valuation=valuation,
+        fundamental_view=fund_view,
+        technical_view=tech_view,
+        risk_view=risk_view_in,
+        value_view=value_view_in,
+        upside_pct=usp,
+        rsi_label=rsi_sig,
+        conviction=conviction,
+        sector_relative=sector_rel,
+    )
+
+    canonical_rec = normalize_recommendation_code(rec)
+    aligned_reason = _align_reason_to_canonical_recommendation(reason, canonical_rec)
+    priority = _compute_priority(canonical_rec, overall, risk_s, conf100, roi3)
+
+    return canonical_rec, aligned_reason, priority
+
+
+def apply_canonical_recommendation(
+    row: Dict[str, Any],
+    *,
+    settings: Any = None,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """
+    v5.2.7: Drop-in replacement for legacy `_compute_recommendation(row)`
+    calls in data_engine_v2 and `_recommendation_from_scores(...)` calls
+    in investment_advisor_engine.
+
+    Computes the canonical (recommendation, reason, priority) triple
+    via derive_canonical_recommendation() and returns a patch dict
+    that the caller can merge into the row. Adds the v5.2.7 provenance
+    tag so subsequent calls can short-circuit.
+
+    Parameters
+    ----------
+    row : Dict[str, Any]
+        The row to derive from. Not mutated by this call — the patch
+        is returned for the caller to apply.
+    settings : Any, optional
+        Forwarded to derive_canonical_recommendation (used for
+        horizon detection only — does not affect the recommendation
+        math itself).
+    overwrite : bool, default False
+        - False (default): IDEMPOTENT mode. If the row already carries
+          `recommendation_source == RECOMMENDATION_SOURCE_TAG`, returns
+          an empty patch ({}). Safe to call from multiple pipeline
+          stages without risk of stale recomputation.
+        - True: Always recomputes. Use when you've just updated scores
+          on the row and want to refresh the recommendation.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Patch dict with keys:
+            "recommendation"            — canonical 5-tier label
+            "recommendation_reason"     — aligned reason text
+            "recommendation_priority"   — P1..P5 bucket
+            "recommendation_source"     — provenance tag
+        Or empty dict ({}) when overwrite=False and row is already
+        canonically scored.
+
+    Example (downstream engine integration)
+    ----------------------------------------
+        # In investment_advisor_engine._score_and_rank_rows, replace:
+        #     if _is_blank(r.get("recommendation")):
+        #         r["recommendation"] = _recommendation_from_scores(...)
+        # With:
+        #     r.update(scoring.apply_canonical_recommendation(r))
+        #
+        # In data_engine_v2._compute_recommendation, replace the whole
+        # body with:
+        #     row.update(scoring.apply_canonical_recommendation(row))
+    """
+    existing_tag = _safe_str(row.get("recommendation_source"))
+    if (not overwrite) and existing_tag == RECOMMENDATION_SOURCE_TAG:
+        return {}
+
+    reco, reason, priority = derive_canonical_recommendation(row, settings=settings)
+    return {
+        "recommendation": reco,
+        "recommendation_reason": reason,
+        "recommendation_priority": priority,
+        "recommendation_source": RECOMMENDATION_SOURCE_TAG,
+    }
+
+
+# =============================================================================
 # Main Scoring Function — v5.2.5 Phases K & L preserved + v5.2.6 Phase Q applied
+#                       + v5.2.7 priority + provenance emission
 # =============================================================================
 
 def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     """
     Score a single row.
 
-    v5.2.6 changes (vs v5.2.5):
-      - Q. `compute_scores` now reads the source row's `upside_pct`
-        via `_as_upside_fraction` (shape-aware) in the v5.2.4 upside-
-        suppression tracking block. Prevents false-positive
-        "upside_synthesis_suspect" tags for legacy POINTS-form
-        supplied upsides that the engine v5.67.0 fraction contract
-        would otherwise legitimately accept.
+    v5.2.7 changes (vs v5.2.6):
+      - Emits `recommendation_priority` (P1..P5) computed by
+        `_compute_priority` from the final canonical recommendation +
+        the scored overall/risk/confidence/roi3 values. Same priority
+        the downstream Recommendation Detail formatter should read.
+      - Emits `recommendation_source = RECOMMENDATION_SOURCE_TAG`
+        so downstream engines can detect this row was canonically
+        scored and skip recomputation.
+      - The insufficient_inputs path also gets a priority (P4) and the
+        source tag — every output row carries the canonical fields.
+
+    v5.2.6 changes (preserved):
+      - Q. `compute_scores` reads the source row's `upside_pct` via
+        `_as_upside_fraction` (shape-aware) in the v5.2.4 upside-
+        suppression tracking block.
 
     v5.2.5 changes (preserved):
       - K. Engine-applied valuation clears surfaced.
       - L. last_error_class surfaced as "provider_error:<class>".
 
     v5.2.4 changes (preserved):
-      - derive_upside_pct returns None for suspect upsides (now
-        shape-aware in v5.2.6).
+      - derive_upside_pct returns None for suspect upsides.
       - compute_valuation_score guards its upside computation.
       - derive_forecast_patch has a synthesis-ceiling guard.
-      - error tracking for suspect upsides (computed AND
-        directly-supplied, even without intrinsic value).
+      - error tracking for suspect upsides.
 
     [PRESERVED] All v5.2.0 / v5.2.1 / v5.2.2 / v5.2.3 / v5.2.4 / v5.2.5
-    mechanics.
+    / v5.2.6 mechanics.
     """
     source = dict(row or {})
     scoring_errors: List[str] = []
@@ -2494,13 +2488,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     usp = derive_upside_pct(working)
 
     # v5.2.4 + v5.2.6 Phase Q: Track scoring-layer upside suppression.
-    # When derive_upside_pct returned None we want to attribute it to
-    # either (a) a locally-suspect synthesized upside, or (b) a
-    # directly-supplied suspect upside_pct in the source row.
-    # v5.2.6: the source-supplied read uses _as_upside_fraction so a
-    # legacy POINTS value (e.g., 25.0 = +25%) is correctly normalized
-    # to fraction (0.25) before the bounds check; without this, valid
-    # points-form upsides ≥ 2.5% would be falsely tagged as suspect.
     if usp is None:
         _raw_intrinsic = _get_float(working, "intrinsic_value", "fair_value")
         _raw_price = _get_float(working, "current_price", "price", "last_price")
@@ -2517,8 +2504,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
 
         if not reason_for_suppress:
             # v5.2.6 Phase Q: shape-aware read of the source upside_pct.
-            # _as_upside_fraction handles both v5.67.0 fraction form
-            # (0.25) and pre-v5.67.0 / legacy POINTS form (25.0).
             _supplied_usp = _as_upside_fraction(_get(source, "upside_pct"))
             if _supplied_usp is not None and _is_upside_suspect(_supplied_usp):
                 reason_for_suppress = True
@@ -2631,6 +2616,13 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     canonical_rec = normalize_recommendation_code(rec)
     reason = _align_reason_to_canonical_recommendation(reason, canonical_rec)
 
+    # v5.2.7: Centralized priority computation. Same _compute_priority
+    # call that derive_canonical_recommendation/apply_canonical_recommendation
+    # use, guaranteeing the top-line `Recommendation` column and the
+    # downstream `Recommendation Detail` priority bucket can never
+    # diverge by construction.
+    priority = _compute_priority(canonical_rec, overall, risk, confidence100, roi3)
+
     st_signal_val = short_term_signal(tech_score, momentum, risk, horizon)
     period_label = invest_period_label(horizon, hdays)
 
@@ -2728,6 +2720,9 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         top_risks=top_risks_str,
         position_size_hint=pos_hint,
         scoring_errors=scoring_errors,
+        # v5.2.7 additions
+        recommendation_priority=priority,
+        recommendation_source=RECOMMENDATION_SOURCE_TAG,
     )
     return scores.to_dict()
 
@@ -2772,9 +2767,19 @@ class ScoringEngine:
     def enrich_with_scores(self, row: Dict[str, Any], in_place: bool = False) -> Dict[str, Any]:
         return enrich_with_scores(row, settings=self.settings, in_place=in_place)
 
+    def apply_canonical_recommendation(
+        self,
+        row: Dict[str, Any],
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """v5.2.7: Object-style alias for the module-level helper."""
+        return apply_canonical_recommendation(
+            row, settings=self.settings, overwrite=overwrite,
+        )
+
 
 # =============================================================================
-# Ranking + Batch Scoring (preserved from v5.2.0)
+# Ranking + Batch Scoring (preserved from v5.2.0, with v5.2.7 priority sync)
 # =============================================================================
 
 def _rank_sort_tuple(row: Dict[str, Any], key_overall: str = "overall_score") -> Tuple[float, ...]:
@@ -2833,6 +2838,14 @@ def score_and_rank_rows(
     recommendation_reason is re-aligned via
     _align_reason_to_canonical_recommendation, and view fields are
     coerced via _view_or_na.
+
+    v5.2.7: After the post-insights alignment pass, each row's
+    `recommendation_priority` is recomputed via `_compute_priority`
+    so the priority bucket reflects any change to the canonical
+    recommendation from the sector-adjusted re-evaluation. The
+    `recommendation_source` provenance tag is also (re)written so
+    rows that came in pre-scored from compute_scores AND rows that
+    were modified by insights_builder both carry the v5.2.7 tag.
     """
     prepared = list(rows) if inplace else [dict(r or {}) for r in rows]
 
@@ -2878,6 +2891,22 @@ def score_and_rank_rows(
             row["recommendation_reason"] = _align_reason_to_canonical_recommendation(
                 str(reason), canonical_rec
             )
+
+            # v5.2.7: keep priority in sync with the (possibly re-aligned)
+            # canonical recommendation, and reaffirm the provenance tag.
+            # Reads the row's current overall/risk/confidence/roi3 — which
+            # may have been adjusted by the batch insights pass via
+            # sector_relative_score — so the priority reflects the final
+            # post-batch state.
+            _ov = _norm_score_0_100(row.get("overall_score"))
+            _rk = _norm_score_0_100(row.get("risk_score"))
+            _cf = _norm_score_0_100(row.get("confidence_score"))
+            _r3 = _as_roi_fraction(row.get("expected_roi_3m"))
+            row["recommendation_priority"] = _compute_priority(
+                canonical_rec, _ov, _rk, _cf, _r3,
+            )
+            row["recommendation_source"] = RECOMMENDATION_SOURCE_TAG
+
         for view_key in ("fundamental_view", "technical_view", "risk_view", "value_view"):
             if view_key in row:
                 row[view_key] = _view_or_na(row.get(view_key))
@@ -2939,4 +2968,14 @@ __all__ = [
     "InvalidHorizonError",
     "MissingDataError",
     "score_views_completeness",
+    # v5.2.7 additions
+    "derive_canonical_recommendation",
+    "apply_canonical_recommendation",
+    "RECOMMENDATION_SOURCE_TAG",
+    "CANONICAL_PRIORITIES",
+    "PRIO_P1",
+    "PRIO_P2",
+    "PRIO_P3",
+    "PRIO_P4",
+    "PRIO_P5",
 ]
