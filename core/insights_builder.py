@@ -2,12 +2,87 @@
 # core/insights_builder.py
 """
 ================================================================================
-Insights Builder — v1.0.0
+Insights Builder — v7.0.0 (MAY 2026 CROSS-STACK SYNC)
 ================================================================================
 PRODUCTION-SAFE • PURE-FUNCTION • NO-NETWORK • SCHEMA-AWARE • IMPORT-SAFE
+TFB-VERSION-CONVENTION ALIGNED • CONVICTION-FLOOR-AWARE (v7.2.0+)
 
+================================================================================
+v7.0.0 changes (MAY 2026 CROSS-STACK SYNC)
+================================================================================
+
+Aligns insights_builder with the May 2026 cross-stack family. Behavior-
+preserving narrative patch: every function v1.0.0 produced, v7.0.0
+produces identically. Same arithmetic, same field names, same outputs.
+
+Cross-stack module references updated:
+  core.scoring                v5.1.0+  -> v5.2.5
+  core.sheets.schema_registry v2.6.0   -> v2.8.0
+  core.reco_normalize         v7.1.0+  -> v7.2.0
+
+Plus references to NEW family members:
+  core.analysis.top10_selector v4.12.0  (downstream consumer; reads the
+    `conviction_score` and other insight fields this module emits, then
+    applies criteria_model v3.1.0 hard filters and soft-signal penalties)
+  core.analysis.criteria_model v3.1.0   (data model whose hard-filter
+    fields are enforced by top10_selector v4.12.0 — NOT by this module.
+    insights_builder remains a pure ROW ENRICHER and never applies
+    criteria filters itself; that is by design)
+  core.investment_advisor_engine v4.4.1 (also reads conviction_score
+    from rows via its view-aware delegation path, when reco_normalize
+    v7.2.0+ is available)
+
+Phase-by-phase summary:
+-----------------------
+
+A. NARRATIVE SYNC. All cross-module version references in this header
+   updated to current versions. "Cross-module integration" section
+   re-written to reflect the v7.2.0 conviction-floor model: conviction
+   is read FROM rows by reco_normalize v7.2.0 (via its
+   `recommendation_from_views(conviction_score=...)` signature) and
+   used to gate STRONG_BUY -> BUY and BUY -> HOLD downgrades against
+   env-tunable floors.
+
+B. ENV-TUNABLE CONVICTION FLOORS SURFACED. Module-level constants
+     RECO_STRONG_BUY_CONVICTION_FLOOR_DEFAULT = 60.0
+     RECO_BUY_CONVICTION_FLOOR_DEFAULT        = 45.0
+   document the v7.2.0 default thresholds. NEW helpers:
+     get_strong_buy_conviction_floor() -> float
+     get_buy_conviction_floor()        -> float
+   read the same env vars reco_normalize v7.2.0 reads
+   (RECO_STRONG_BUY_CONVICTION_FLOOR, RECO_BUY_CONVICTION_FLOOR) with
+   identical default behavior, so callers can introspect the active
+   floors without importing reco_normalize. PURE READS, no state.
+
+C. __version__ ALIAS. NEW `__version__ = VERSION` (TFB module-version
+   convention used by scoring v5.2.5, reco_normalize v7.2.0,
+   scoring_engine v3.4.2, top10_selector v4.12.0, criteria_model
+   v3.1.0, schema_registry v2.8.0, investment_advisor_engine v4.4.1).
+   `__all__` augmented.
+
+D. DOCSTRING POLISH on `_DEFAULT_FACTOR_WEIGHTS` to reference scoring
+   v5.2.5 explicitly. No numeric change.
+
+E. VERSION BUMP 1.0.0 -> 7.0.0. Note: the jump is family-alignment
+   (matching the May 2026 cross-stack version numbering), not seven
+   versions of feature accretion. v1.0.0's public surface is fully
+   preserved and re-exported under the same names.
+
+PRESERVED VERBATIM from v1.0.0:
+- Pure-function design (no I/O, no mutable globals, deterministic)
+- All 6 emitted fields and their exact arithmetic:
+    conviction_score, sector_relative_score, top_factors, top_risks,
+    position_size_hint, recommendation_reason
+- All public function signatures (compute_*, derive_*, build_*,
+  enrich_*) and their default values
+- InsightsBundle dataclass shape and to_dict() contract
+- Risk-factor rules, position-size hint tables, factor labels
+- Idempotent recommendation_reason wrapper (strip-then-build)
+- Min sector cohort = 3 (sector_relative_score returns None below this)
+
+================================================================================
 Purpose
--------
+================================================================================
 Build derived "insights" fields on top of a scored row, beyond what the raw
 component-scoring pipeline produces. These fields are the bridge between
 numeric scoring and a useful, differentiated recommendation:
@@ -41,24 +116,45 @@ numeric scoring and a useful, differentiated recommendation:
 
 Cross-module integration
 ------------------------
-- Reads from rows produced by core.scoring v5.1.0+ (component scores, views,
-  recommendation, recommendation_reason, forecast_confidence).
-- Schema columns added in core.sheets.schema_registry v2.6.0 (Insights group):
+- Reads from rows produced by core.scoring v5.2.5 (component scores, views,
+  recommendation, recommendation_reason, forecast_confidence). The
+  component-score keys consumed by `derive_top_factors` correspond 1-1
+  with the fields `AssetScores` emits.
+- Schema columns this module fills are defined in core.sheets.schema_registry
+  v2.8.0 (Insights group, 5 fields):
     sector_relative_score, conviction_score, top_factors, top_risks,
     position_size_hint.
-- Conviction is fed back into core.reco_normalize v7.1.0+ via the new
-  `conviction` kwarg of Recommendation.from_views() to enforce conviction
-  floors (STRONG_BUY -> BUY when conviction < 60; BUY -> HOLD when < 45).
+- Conviction is consumed downstream by core.reco_normalize v7.2.0 via the
+  `recommendation_from_views(..., conviction_score=...)` kwarg to enforce
+  env-tunable conviction floors:
+      RECO_STRONG_BUY_CONVICTION_FLOOR  (default 60.0)
+      RECO_BUY_CONVICTION_FLOOR         (default 45.0)
+  Below these floors, STRONG_BUY downgrades to BUY and BUY to HOLD. This
+  module exposes the active floors via get_strong_buy_conviction_floor()
+  and get_buy_conviction_floor() for callers that want to introspect them
+  without importing reco_normalize.
+- core.analysis.top10_selector v4.12.0 consumes `conviction_score` for
+  both criteria_model v3.1.0 hard-filtering (min_conviction_score) and
+  soft-signal penalties. insights_builder is upstream of top10_selector
+  in the pipeline; this module produces the field, top10_selector reads
+  it. insights_builder NEVER applies criteria filters itself — that
+  separation of concerns is intentional and preserved in v7.0.0.
 
 Pure-function design
 --------------------
 Every function is deterministic given its inputs. No global mutable state.
 No I/O. Safe to call from sync or async contexts. Safe to import at module
-load (no side effects).
+load (no side effects). The env-floor helpers in Phase B do read os.environ
+on EACH call (not at import time), so they reflect runtime updates and
+remain side-effect-free.
 
 Public API
 ----------
-- VERSION, INSIGHTS_BUILDER_VERSION
+- VERSION, INSIGHTS_BUILDER_VERSION, __version__
+- RECO_STRONG_BUY_CONVICTION_FLOOR_DEFAULT  (v7.0.0)
+- RECO_BUY_CONVICTION_FLOOR_DEFAULT         (v7.0.0)
+- get_strong_buy_conviction_floor()         (v7.0.0)
+- get_buy_conviction_floor()                (v7.0.0)
 - InsightsBundle (dataclass)
 - compute_conviction_score()
 - compute_sector_relative_score()
@@ -75,6 +171,7 @@ Public API
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -82,8 +179,85 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 # Version
 # =============================================================================
 
-VERSION = "1.0.0"
+VERSION = "7.0.0"
 INSIGHTS_BUILDER_VERSION = VERSION
+# v7.0.0 Phase C: TFB module-version convention alias (mirrors scoring
+# v5.2.5, reco_normalize v7.2.0, scoring_engine v3.4.2, top10_selector
+# v4.12.0, criteria_model v3.1.0, schema_registry v2.8.0,
+# investment_advisor_engine v4.4.1).
+__version__ = VERSION
+
+
+# =============================================================================
+# Conviction-floor knobs (v7.0.0 Phase B)
+# =============================================================================
+#
+# Documents the v7.2.0 reco_normalize default thresholds and provides pure
+# read-only helpers so callers can introspect the ACTIVE floors without
+# importing reco_normalize. The helpers read os.environ on each call (not
+# at import time) so they reflect runtime updates and remain side-effect-
+# free.
+#
+# Below these floors, reco_normalize v7.2.0 applies downgrade logic:
+#   conviction < RECO_STRONG_BUY_CONVICTION_FLOOR -> STRONG_BUY -> BUY
+#   conviction < RECO_BUY_CONVICTION_FLOOR        -> BUY -> HOLD
+#
+# insights_builder does NOT apply downgrades itself; it only computes the
+# `conviction_score` field that reco_normalize consumes. These constants
+# and helpers exist so that callers (e.g. dashboards, debug tools) can
+# explain "why was STRONG_BUY downgraded to BUY?" without round-tripping
+# through reco_normalize.
+
+RECO_STRONG_BUY_CONVICTION_FLOOR_DEFAULT: float = 60.0
+RECO_BUY_CONVICTION_FLOOR_DEFAULT: float = 45.0
+
+
+def _read_float_env(name: str, default: float) -> float:
+    """
+    Read a float from os.environ with a default fallback.
+
+    Returns `default` on missing/empty/unparseable values, NaN, or inf.
+    Pure read; no logging side effects.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        return default
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(v) or math.isinf(v):
+        return default
+    return v
+
+
+def get_strong_buy_conviction_floor() -> float:
+    """
+    Return the active STRONG_BUY conviction floor (env-tunable).
+
+    Reads RECO_STRONG_BUY_CONVICTION_FLOOR from os.environ, with default
+    60.0 (mirrors reco_normalize v7.2.0).
+    """
+    return _read_float_env(
+        "RECO_STRONG_BUY_CONVICTION_FLOOR",
+        RECO_STRONG_BUY_CONVICTION_FLOOR_DEFAULT,
+    )
+
+
+def get_buy_conviction_floor() -> float:
+    """
+    Return the active BUY conviction floor (env-tunable).
+
+    Reads RECO_BUY_CONVICTION_FLOOR from os.environ, with default 45.0
+    (mirrors reco_normalize v7.2.0).
+    """
+    return _read_float_env(
+        "RECO_BUY_CONVICTION_FLOOR",
+        RECO_BUY_CONVICTION_FLOOR_DEFAULT,
+    )
 
 
 # =============================================================================
@@ -102,10 +276,13 @@ _FACTOR_LABELS: Dict[str, str] = {
     "technical_score": "Technical",
 }
 
-# Default weights mirroring the MONTH-horizon profile in core.scoring. Used
-# when the caller doesn't pass an explicit weights dict (e.g. ad-hoc usage).
-# For batch runs the caller should pass the actual horizon-aware weights so
-# top_factors reflects the real contribution to overall_score.
+# Default weights mirroring the MONTH-horizon profile in core.scoring v5.2.5.
+# Used when the caller doesn't pass an explicit weights dict (e.g. ad-hoc
+# usage). For batch runs the caller should pass the actual horizon-aware
+# weights so top_factors reflects the real contribution to overall_score.
+# These defaults intentionally match scoring v5.2.5's monthly weight profile
+# so that ad-hoc callers get a representative ranking without coupling to
+# the scoring module's internals.
 _DEFAULT_FACTOR_WEIGHTS: Dict[str, float] = {
     "valuation_score": 0.30,
     "momentum_score": 0.25,
@@ -853,6 +1030,13 @@ def enrich_rows_with_insights(
 __all__ = [
     "VERSION",
     "INSIGHTS_BUILDER_VERSION",
+    # v7.0.0 Phase C: TFB module-version convention alias
+    "__version__",
+    # v7.0.0 Phase B: env-tunable conviction-floor knobs
+    "RECO_STRONG_BUY_CONVICTION_FLOOR_DEFAULT",
+    "RECO_BUY_CONVICTION_FLOOR_DEFAULT",
+    "get_strong_buy_conviction_floor",
+    "get_buy_conviction_floor",
     "InsightsBundle",
     "compute_conviction_score",
     "compute_sector_relative_score",
