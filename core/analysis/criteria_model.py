@@ -2,7 +2,7 @@
 """
 core/analysis/criteria_model.py
 ================================================================================
-Advisor Criteria Model -- v3.1.0
+Advisor Criteria Model -- v3.1.1
 (CROSS-STACK CONVICTION + DATA-QUALITY CRITERIA, V2-ONLY, SCENARIO-TABLE)
 ================================================================================
 Tadawul Fast Bridge (TFB)
@@ -14,7 +14,69 @@ Insights_Analysis top block (key/value rows) and shared by
 Top_10_Investments.
 
 ================================================================================
-v3.1.0 Changes (from v3.0.0)  --  CROSS-STACK CONVICTION + DATA-QUALITY
+v3.1.1 Changes (from v3.1.0)  --  TOP10_SELECTOR v4.12.0 ALIGNMENT
+================================================================================
+
+METADATA-ONLY PATCH on top of v3.1.0. No field additions. No validator
+changes. No public API edits. No new runtime code paths. The headline
+update is acknowledgement that the wiring note from v3.1.0 is now
+PARTIALLY RESOLVED:
+
+  - core.analysis.top10_selector advanced v4.11.0 -> v4.12.0
+    v4.12.0 ACTIVATES all 4 criteria_model v3.1.0 hard-filter fields
+    in its `_passes_filters()`:
+        min_conviction_score
+        exclude_engine_dropped_valuation
+        exclude_forecast_unavailable
+        exclude_provider_errors
+    The data-model foundation laid by v3.1.0 is now actively consumed
+    on the Top_10_Investments page; criteria built from this module
+    take effect end-to-end through top10_selector v4.12.0.
+
+  - core.investment_advisor_engine advanced v4.4.0 -> v4.4.1 (metadata
+    sync acknowledging top10_selector v4.12.0 as hard-filter authority).
+
+  - core.investment_advisor (orchestrator) advanced v5.2.0 -> v5.3.1
+    (also metadata-only sync to current siblings).
+
+Pipeline reality check (v3.1.1):
+  - top10_selector v4.12.0     ACTIVE  -- consumes all 4 hard-filter fields
+  - insights_builder v7.0.0    PARTIAL -- consumes conviction_score for
+                                          Top Picks + Data Quality Alerts
+                                          sections; does NOT yet wire the
+                                          3 exclusion flags into section
+                                          builders (acceptable: those
+                                          flags are about row PRUNING,
+                                          which is top10_selector's job;
+                                          insights_builder's role is to
+                                          SURFACE the upstream issues, not
+                                          filter them out)
+  - reco_normalize v7.2.0      ACTIVE  -- consumes get_strong_buy_/buy_
+                                          conviction_floor() defaults
+                                          (env-tunable RECO_*_FLOOR vars)
+
+Phase-by-phase summary:
+-----------------------
+
+A. NARRATIVE SYNC. Header version line, cross-stack roster, Phase F
+   TFB-convention list, and the v3.1.0 wiring note all refreshed to
+   reflect current sibling versions and the now-completed top10
+   activation.
+
+B. VERSION BUMP 3.1.0 -> 3.1.1. `__version__` alias auto-tracks.
+
+PRESERVED VERBATIM from v3.1.0:
+- All 4 v3.1.0 fields: min_conviction_score + 3 exclusion bool flags
+- All v3.1.0 validators (incl. fraction-shape detection for conviction)
+- _SCENARIO_PRESETS with per-scenario conviction + exclusion config
+- ScenarioSpec dataclass with 4 new fields + validation
+- get_strong_buy_conviction_floor() + get_buy_conviction_floor()
+- KV map factory fuzzy aliases for all v3.1.0 fields
+- All v3.0.0 bug fixes (max_risk_score=0, thread-safety, top10_enabled
+  integer overrides)
+
+================================================================================
+v3.1.0 Changes (preserved)  --  CROSS-STACK CONVICTION + DATA-QUALITY
 ================================================================================
 
 Aligns criteria_model with the May 2026 cross-stack revisions:
@@ -33,7 +95,9 @@ Aligns criteria_model with the May 2026 cross-stack revisions:
     flag (forecast_unavailable, forecast_unavailable_no_source,
     forecast_cleared_consistency_sweep, forecast_skipped_unavailable),
     plus preserves provider `last_error_class` (Phase Q).
-  - core.analysis.top10_selector v4.11.0 applies data-quality penalties.
+  - core.analysis.top10_selector v4.12.0 applies data-quality penalties
+    AND (as of v4.12.0) activates the 4 v3.1.0 hard-filter fields in
+    `_passes_filters()`.
   - core.analysis.insights_builder v7.0.0 surfaces all of these in the
     Top Picks + NEW Data Quality Alerts section.
 
@@ -87,7 +151,8 @@ callers see identical behaviour.
   F. NEW `__version__ = CRITERIA_MODEL_VERSION` alias (TFB module
      convention used by scoring v5.2.5, reco_normalize v7.2.0,
      insights_builder v7.0.0, scoring_engine v3.4.2, top10_selector
-     v4.11.0).
+     v4.12.0, schema_registry v2.8.0, investment_advisor_engine v4.4.1,
+     investment_advisor v5.3.1).
 
   G. KV map factory recognises new field labels via fuzzy aliases:
        min_conviction_score: "min conviction", "conviction floor",
@@ -102,10 +167,18 @@ callers see identical behaviour.
 
   I. Version bump 3.0.0 -> 3.1.0.
 
-Wiring note (out-of-scope for v3.1.0): top10_selector._passes_filters
-and insights_builder section builders still need a follow-up patch to
-actively consume the new fields. v3.1.0 is the data-model foundation
-that makes them AVAILABLE.
+Wiring note (status as of v3.1.1):
+  - top10_selector v4.12.0  CONSUMES all 4 hard-filter fields in
+                            `_passes_filters()`. Previous "follow-up
+                            patch needed" status is RESOLVED here.
+  - insights_builder v7.0.0 CONSUMES conviction_score for Top Picks and
+                            surfaces engine/forecast/provider issues in
+                            its Data Quality Alerts section. The 3
+                            exclusion bool flags are deliberately NOT
+                            wired into section builders -- those flags
+                            are pruning policy, owned by top10_selector;
+                            insights_builder's role is to SURFACE
+                            issues, not filter them.
 
 ================================================================================
 v3.0.0 Changes (preserved)  --  BUG-FIX, V2-ONLY, SCENARIO-TABLE
@@ -183,8 +256,11 @@ except ImportError as _exc:  # pragma: no cover
 # Constants
 # ---------------------------------------------------------------------------
 
-CRITERIA_MODEL_VERSION = "3.1.0"
+CRITERIA_MODEL_VERSION = "3.1.1"
 # v3.1.0 Phase F: TFB module-version convention alias.
+# v3.1.1: top10_selector advanced v4.11.0 -> v4.12.0 (now actively
+# consumes the 4 hard-filter fields this module defines); sibling-version
+# references refreshed in docstring.
 __version__ = CRITERIA_MODEL_VERSION
 
 # Valid signal values for Insights_Analysis Signal column
@@ -200,13 +276,14 @@ SCENARIO_LABELS: Tuple[str, ...] = ("Conservative", "Moderate", "Aggressive")
 
 
 # ---------------------------------------------------------------------------
-# v3.1.0 Phase E — Env-tunable conviction floor helpers
+# v3.1.0 Phase E -- Env-tunable conviction floor helpers
 # ---------------------------------------------------------------------------
 #
 # Mirror constants here so callers (UI components, dashboards, audit
-# reports, top10_selector when it advances) can read the SAME floor
-# reco_normalize uses without importing reco_normalize directly. Single
-# source of truth for the env var names + defaults.
+# reports, top10_selector v4.12.0 which now actively consumes
+# `min_conviction_score` filtering) can read the SAME floor reco_normalize
+# uses without importing reco_normalize directly. Single source of truth
+# for the env var names + defaults.
 
 def _env_float(name: str, default: float) -> float:
     """Read float env var defensively; falls back to default on any error."""
