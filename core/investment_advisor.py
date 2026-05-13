@@ -3,14 +3,70 @@
 """
 core/investment_advisor.py
 ================================================================================
-INVESTMENT ADVISOR ORCHESTRATOR -- v5.3.0
-(SCHEMA v2.8.0 / SCORING v5.2.5 / RECO v7.2.0 / ENGINE v4.4.0)
+INVESTMENT ADVISOR ORCHESTRATOR -- v5.3.1
+(SCHEMA v2.8.0 / SCORING v5.2.5 / RECO v7.2.0 / ENGINE v4.4.1 / TOP10 v4.12.0)
 ================================================================================
-LIVE-BY-DEFAULT • ENGINE-FIRST • SNAPSHOT-TOLERANT • ROUTE-COMPATIBLE
-MODE-AWARE • SCHEMA-SAFE • JSON-SAFE • IMPORT-SAFE • WORKER-THREAD SAFE
-SPECIAL-PAGE SAFE • CONTRACT-PRESERVING • DICTIONARY-HARDENED
-VIEW-AWARE • CONVICTION-AWARE • RULE-ID-AWARE • DECISION-MATRIX AWARE
+LIVE-BY-DEFAULT * ENGINE-FIRST * SNAPSHOT-TOLERANT * ROUTE-COMPATIBLE
+MODE-AWARE * SCHEMA-SAFE * JSON-SAFE * IMPORT-SAFE * WORKER-THREAD SAFE
+SPECIAL-PAGE SAFE * CONTRACT-PRESERVING * DICTIONARY-HARDENED
+VIEW-AWARE * CONVICTION-AWARE * RULE-ID-AWARE * DECISION-MATRIX AWARE
 CANDLESTICK AWARE
+
+================================================================================
+v5.3.1 changes (TOP10 v4.12.0 + ENGINE v4.4.1 ALIGNMENT)
+================================================================================
+
+METADATA-ONLY PATCH on top of v5.3.0. No positional indices shift. No
+caller-visible behaviour changes. No column-count edits. No signature
+edits. No new runtime code paths. The headline updates are:
+
+  - core.analysis.top10_selector  advanced v4.11.0 -> v4.12.0
+    (v4.12.0 activates 4 criteria_model v3.1.0 hard-filter fields:
+     min_conviction_score, exclude_engine_dropped_valuation,
+     exclude_forecast_unavailable, exclude_provider_errors)
+
+  - core.investment_advisor_engine advanced v4.4.0 -> v4.4.1
+    (v4.4.1 is itself a metadata-only sync that documents the top10
+     hard-filter delegation; engine internals unchanged)
+
+This module (the advisor ORCHESTRATOR) is upstream of both:
+  advisor.run_investment_advisor()
+      -> investment_advisor_engine v4.4.1 (resolution)
+         -> data_engine_v2 v5.60.0 (row enrichment)
+            -> scoring v5.2.5 + reco_normalize v7.2.0 (recommendations)
+      -> top10_selector v4.12.0 (Top10 page only; hard-filter + ranking)
+
+DIVISION OF LABOR (v5.3.1, unchanged from v5.3.0):
+  - Orchestrator (this file): payload normalization, engine dispatch,
+    result shaping, snapshot caching, schema-aligned fallbacks. Does NOT
+    apply criteria_model v3.1.0 hard filters; that is top10_selector
+    v4.12.0's job. Does NOT score rows; that is the engine + scoring
+    pipeline's job.
+  - Engine: row resolution from data sources; 97-col enrichment.
+  - top10_selector v4.12.0: Top10 page criteria hard-filtering + soft
+    penalties + final ranking.
+  - reco_normalize v7.2.0: single source of truth for the 5-tier
+    recommendation labels.
+
+Phase-by-phase summary:
+-----------------------
+
+A. NARRATIVE SYNC. Header title line and the cross-stack module roster
+   updated to current sibling versions.
+
+B. VERSION BUMP 5.3.0 -> 5.3.1. `__version__` alias auto-tracks.
+
+PRESERVED VERBATIM from v5.3.0:
+- 97-col fallback schema (Decision Matrix + Candlestick groups intact)
+- 100-col Top10 layout (97 + 3 extras)
+- 4-tier view-aware reco delegation cascade
+- _is_view_aware_available / _is_view_aware_rule_id_available helpers
+- meta.view_aware + meta.view_aware_rule_id observability flags
+- All 86 _FIELD_ALIAS_HINTS entries
+- Internal field stripping (v5.1.1 + v5.2.0 + v5.3.0)
+- ROI-safe scoring, sentinel handling, bucket fabrication safety
+- All public API (InvestmentAdvisor class, singletons, factories,
+  sync wrappers, async _impl hooks)
 
 ================================================================================
 v5.3.0 changes (May 2026 cross-stack family)
@@ -31,13 +87,17 @@ cross-stack family that landed across the rest of the Python backend:
                                                 conviction-badge de-dup)
     core/scoring                     v5.2.5   (5 Insights row fields +
                                                 scoring_errors)
-    core/insights_builder            v7.0.0   (NEW Data Quality Alerts)
+    core/insights_builder            v7.0.0   (env-tunable conviction-floor
+                                                introspection helpers)
     core/scoring_engine              v3.4.2   (compatibility bridge,
                                                 is_reco_rule_id_aware helper)
-    core/analysis/top10_selector     v4.11.0  (data-quality penalties)
+    core/analysis/top10_selector     v4.12.0  (data-quality penalties +
+                                                criteria_model v3.1.0
+                                                hard-filter delegation)
     core/analysis/criteria_model     v3.1.0   (conviction + exclusion model)
-    core/investment_advisor_engine   v4.4.0   (97-col fallback, rule-id +
-                                                conviction-aware delegation)
+    core/investment_advisor_engine   v4.4.1   (97-col fallback, rule-id +
+                                                conviction-aware delegation,
+                                                top10_selector v4.12.0 alignment)
 
 Phases:
 
@@ -89,7 +149,7 @@ Phases:
      de-dup and embeds the rule_id in the reason where appropriate,
      so v5.3.0 uses the reason as-is. The `(canonical_code, reason,
      overall_score)` return shape of `_try_view_aware_recommendation`
-     is preserved verbatim — rule_id is captured for meta
+     is preserved verbatim -- rule_id is captured for meta
      observability via `_RECO_RULE_ID_AVAILABLE` only.
      Backwards-compatible: pre-v7.2.0 reco_normalize installations
      fall through to Tier 2 unchanged.
@@ -117,8 +177,8 @@ Phases:
   E. NEW `__version__ = INVESTMENT_ADVISOR_VERSION` alias (TFB module
      convention used by scoring v5.2.5, reco_normalize v7.2.0,
      insights_builder v7.0.0, scoring_engine v3.4.2, top10_selector
-     v4.11.0, criteria_model v3.1.0, schema_registry v2.8.0,
-     investment_advisor_engine v4.4.0).
+     v4.12.0, criteria_model v3.1.0, schema_registry v2.8.0,
+     investment_advisor_engine v4.4.1).
 
   F. `__all__` augmented with `__version__`.
 
@@ -127,7 +187,7 @@ Phases:
   H. Meta enrichment: `meta.view_aware` and `meta.view_aware_rule_id`
      now reflect whether the reco_normalize v7.0.0+ / v7.2.0+ paths
      are wired into THIS process. Mirrors the same flags emitted by
-     investment_advisor_engine v4.4.0 so an ops dashboard can detect
+     investment_advisor_engine v4.4.1 so an ops dashboard can detect
      a partial v7.x deployment (e.g. one process pinned to v7.1.0
      while another runs v7.2.0).
 
@@ -227,11 +287,13 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-INVESTMENT_ADVISOR_VERSION = "5.3.0"
+INVESTMENT_ADVISOR_VERSION = "5.3.1"
 # v5.3.0 Phase E: TFB module-version convention alias (mirrors scoring
 # v5.2.5, reco_normalize v7.2.0, insights_builder v7.0.0, scoring_engine
-# v3.4.2, top10_selector v4.11.0, criteria_model v3.1.0, schema_registry
-# v2.8.0, investment_advisor_engine v4.4.0).
+# v3.4.2, top10_selector v4.12.0, criteria_model v3.1.0, schema_registry
+# v2.8.0, investment_advisor_engine v4.4.1).
+# v5.3.1: top10_selector advanced 4.11.0 -> 4.12.0; engine advanced
+# 4.4.0 -> 4.4.1; sibling-version references updated here.
 __version__ = INVESTMENT_ADVISOR_VERSION
 
 
@@ -279,7 +341,7 @@ SPECIAL_PAGES = {
 }
 
 # Registry-canonical known pages. Forbidden pages (KSA_Tadawul,
-# Advisor_Criteria) are intentionally excluded — page_catalog rejects them
+# Advisor_Criteria) are intentionally excluded -- page_catalog rejects them
 # and keeping them here silently re-admitted them.
 ALL_KNOWN_PAGES = BASE_SOURCE_PAGES | SPECIAL_PAGES | {"AI_Opportunity_Report"}
 
@@ -363,7 +425,7 @@ SCHEMA_FUNCTION_CANDIDATES = (
 
 
 # =============================================================================
-# Canonical fallback schemas — aligned with core.sheets.schema_registry v2.8.0
+# Canonical fallback schemas -- aligned with core.sheets.schema_registry v2.8.0
 # =============================================================================
 #
 # Do NOT add non-canonical fields. The registry is the single source of
@@ -373,7 +435,7 @@ SCHEMA_FUNCTION_CANDIDATES = (
 # v5.3.0 Phase B: column count 90 -> 97. Adds Decision Matrix (2) and
 # Candlestick (5) groups at the END, matching schema_registry v2.7.0+
 # additions. The Scores group ordering (positions 60-66) already matched
-# the registry in v5.2.0 — opportunity_score and rank_overall live
+# the registry in v5.2.0 -- opportunity_score and rank_overall live
 # INSIDE Scores, BEFORE the Views group.
 #
 # Totals:
@@ -411,7 +473,7 @@ _GENERIC_FALLBACK_KEYS: List[str] = [
     "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
     "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket",
-    # Scores (7) — registry-canonical ordering: opportunity + rank INSIDE
+    # Scores (7) -- registry-canonical ordering: opportunity + rank INSIDE
     "value_score", "quality_score", "momentum_score", "growth_score",
     "overall_score", "opportunity_score", "rank_overall",
     # Views (4)  [v2.3.0]
@@ -425,10 +487,10 @@ _GENERIC_FALLBACK_KEYS: List[str] = [
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
     # Insights (5)  [v2.6.0]
     "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
-    # Decision (2) — NEW v5.3.0 / aligned with schema_registry v2.7.0+
+    # Decision (2) -- NEW v5.3.0 / aligned with schema_registry v2.7.0+
     # Produced by data_engine_v2 v5.60.0+'s 8-tier classifier _classify_8tier().
     "recommendation_detailed", "recommendation_priority",
-    # Candlestick (5) — NEW v5.3.0 / aligned with schema_registry v2.7.0+
+    # Candlestick (5) -- NEW v5.3.0 / aligned with schema_registry v2.7.0+
     # Produced by core.candlesticks v1.0.0; gated by ENGINE_CANDLESTICKS_ENABLED.
     "candlestick_pattern", "candlestick_signal", "candlestick_strength",
     "candlestick_confidence", "candlestick_patterns_recent",
@@ -467,11 +529,11 @@ _GENERIC_FALLBACK_HEADERS: List[str] = [
     "Unrealized P/L", "Unrealized P/L %",
     # Provenance (4)
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
-    # Insights (5) — note registry uses "Sector-Adj Score" not "Sector Relative Score"
+    # Insights (5) -- note registry uses "Sector-Adj Score" not "Sector Relative Score"
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
-    # Decision (2) — NEW v5.3.0
+    # Decision (2) -- NEW v5.3.0
     "Recommendation Detail", "Reco Priority",
-    # Candlestick (5) — NEW v5.3.0
+    # Candlestick (5) -- NEW v5.3.0
     "Candle Pattern", "Candle Signal", "Candle Strength",
     "Candle Confidence", "Recent Patterns (5D)",
 ]
@@ -492,7 +554,7 @@ _DICTIONARY_HEADERS: List[str] = [
     "Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes",
 ]
 
-# Top_10_Investments extras (3) — registry appends these to the canonical 97
+# Top_10_Investments extras (3) -- registry appends these to the canonical 97
 # (v5.3.0: was 90 in v5.2.0; the 3 Top10 extras count is unchanged)
 _TOP10_EXTRA_KEYS: List[str] = ["top10_rank", "selection_reason", "criteria_snapshot"]
 _TOP10_EXTRA_HEADERS: List[str] = ["Top10 Rank", "Selection Reason", "Criteria Snapshot"]
@@ -549,7 +611,7 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "risk_score": ["risk", "riskscore"],
     "valuation_score": ["valuation", "valuationscore"],
     "overall_score": ["score", "overall", "totalscore", "compositeScore"],
-    # v5.2.0: removed `convictionScore` from opportunity_score aliases —
+    # v5.2.0: removed `convictionScore` from opportunity_score aliases --
     # it now belongs to the canonical conviction_score key below.
     "opportunity_score": ["opportunity", "opportunityscore"],
     "value_score": ["valueScore"],
@@ -2351,7 +2413,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
     rows: List[Dict[str, Any]] = []
     symbols = _normalize_list(criteria.get("symbols") or criteria.get("tickers"))
 
-    fallback_warning = "Fallback row — engine returned no live data for this symbol"
+    fallback_warning = "Fallback row -- engine returned no live data for this symbol"
 
     for idx, symbol in enumerate(symbols[: criteria.get("top_n", DEFAULT_LIMIT)], start=1):
         row = {k: None for k in keys}
@@ -2441,7 +2503,7 @@ def _normalize_engine_result(
     limit = criteria.get("limit", DEFAULT_LIMIT)
     rows = _slice_rows(rows, offset, limit)
 
-    # Handle engine status carefully — engine v5.60.0 emits "warn" for
+    # Handle engine status carefully -- engine v5.60.0 emits "warn" for
     # partial-success and rows are still usable.
     raw_status = _to_string(result.get("status")).lower()
     if raw_status == "warn":
