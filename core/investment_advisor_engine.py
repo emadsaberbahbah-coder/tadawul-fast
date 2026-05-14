@@ -3,7 +3,7 @@
 """
 core/investment_advisor_engine.py
 ================================================================================
-INVESTMENT ADVISOR ENGINE — v4.4.1 (TOP10_SELECTOR v4.12.0 ALIGNMENT)
+INVESTMENT ADVISOR ENGINE — v4.4.2 (CANONICAL-BUCKET ROUTING via core.buckets v1.0.0)
 ================================================================================
 SYNC-EXPORT SAFE • ASYNC-INTERNAL • EXPORT-HARDENED • ROUTE-TOLERANT
 ENGINE-AWARE • PAGE-CATALOG NORMALIZED • TOP10-BUILDER FIRST
@@ -11,7 +11,68 @@ INSIGHTS FALLBACK SAFE • SPECIAL-SCHEMA SAFE • NO-IMPORT-TIME-NETWORK
 ADVISOR + SHEET-ROWS SAFE • JSON-SAFE • 502-RESISTANT • MATRIX/ROW-OBJECT SAFE
 INSIGHTS-COLUMNS AWARE (v2.6.0+) • DECISION/CANDLESTICK AWARE (v2.7.0+) •
 CONVICTION-FLOOR DELEGATION (v7.2.0+) •
-CRITERIA-v3.1.0 HARD-FILTER DELEGATION (v4.4.1+, via top10_selector v4.12.0)
+CRITERIA-v3.1.0 HARD-FILTER DELEGATION (v4.4.1+, via top10_selector v4.13.0) •
+CANONICAL-BUCKET ROUTED (v4.4.2+, via core.buckets v1.0.0)
+
+================================================================================
+v4.4.2 changes (CANONICAL-BUCKET ROUTING via core.buckets v1.0.0)
+================================================================================
+
+FOCUSED PATCH on top of v4.4.1. One behavioural change, well-scoped:
+the two bucket-backfill helpers now route through core.buckets v1.0.0
+instead of carrying their own inline thresholds. No positional indices
+shift. No column-count edits. No public-API signature edits. No change
+to `_score_recommendation` or the conviction-aware delegation path.
+
+WHAT CHANGED.
+
+  - `_risk_bucket_from_row` / `_confidence_bucket_from_row` are routed
+    through core.buckets v1.0.0 — the single authoritative bucket
+    helper already used by data_engine_v2 v5.69.0+, top10_selector
+    v4.13.0+, and the advisor orchestrator v5.3.2+. These helpers only
+    BACKFILL a bucket when the upstream data engine did not already set
+    one; routing them through core.buckets makes that backfill emit the
+    same canonical UPPERCASE labels ("LOW"/"MODERATE"/"HIGH") the rest
+    of the stack now emits, instead of the old title-case
+    "Low"/"Moderate"/"High" and the confidence helper's "Medium" tier.
+
+  - This also FIXES a latent confidence-scale bug: the legacy inline
+    thresholds did NOT auto-detect a 0-1 vs 0-100 scale, so a
+    forecast_confidence of 0.8 backfilled as "Low" (0.8 < 50). Routed
+    through core.buckets, 0.8 is auto-scaled and correctly buckets as
+    HIGH. An explicit bucket already on the row is preferred and
+    normalized (so "moderate risk" -> "MODERATE").
+
+  - canonical cutoffs now applied: risk <35 LOW / 35-70 MODERATE /
+    >=70 HIGH (was <35 / <65 / else); confidence >=75 HIGH / 50-75
+    MODERATE / <50 LOW.
+
+WHAT IS *NOT* CHANGED.
+
+  - `_score_recommendation` is untouched. Its v4.4.0 Phase D
+    conviction-aware view-aware delegation (with `_RFV_ACCEPTS_CONVICTION`
+    signature detection) and its composite-threshold last-resort
+    fallback (`_composite_to_recommendation`) are preserved verbatim.
+    There is no private `_recommendation_from_scores` in this module.
+
+  - The confidence source-score chain and the v4.2.0 "don't fabricate a
+    bucket for missing data -> return ''" contract are preserved
+    verbatim.
+
+GUARDED + REVERSIBLE. The core.buckets import is except-guarded. When
+core.buckets is unavailable the helpers fall back to the legacy v4.2.0
+inline thresholds, preserved verbatim — deployments without it see
+zero behaviour change. New `meta.buckets_canonical` flag mirrors the
+existing `meta.view_aware*` capability flags so an ops dashboard can
+detect a process where core.buckets failed to load.
+
+CROSS-STACK MODULE REFERENCES UPDATED:
+  top10_selector  v4.12.0  ->  v4.13.0   (canonical-bucket routed)
+  advisor orchestrator v5.3.0 -> v5.3.2  (canonical-bucket routed sibling)
+  core.buckets    (NEW)     v1.0.0        (canonical bucket helper)
+
+Version bump 4.4.1 -> 4.4.2. `__version__` alias auto-tracks. `__all__`
+unchanged (no new public symbols).
 
 ================================================================================
 v4.4.1 changes (TOP10_SELECTOR v4.12.0 ALIGNMENT)
@@ -302,12 +363,14 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-INVESTMENT_ADVISOR_ENGINE_VERSION = "4.4.1"
+INVESTMENT_ADVISOR_ENGINE_VERSION = "4.4.2"
 # v4.4.0 Phase E: TFB module-version convention alias (mirrors scoring
 # v5.2.5, reco_normalize v7.2.0, insights_builder v7.0.0, scoring_engine
-# v3.4.2, top10_selector v4.12.0, criteria_model v3.1.0, schema_registry
-# v2.8.0).
+# v3.4.2, top10_selector v4.13.0, criteria_model v3.1.0, schema_registry
+# v2.8.0, core.buckets v1.0.0).
 # v4.4.1: top10_selector advanced 4.11.0 -> 4.12.0; alignment updated here.
+# v4.4.2: _risk_bucket_from_row / _confidence_bucket_from_row routed
+# through core.buckets v1.0.0 (canonical bucket helper).
 __version__ = INVESTMENT_ADVISOR_ENGINE_VERSION
 
 
@@ -329,6 +392,50 @@ except ImportError:
     RECO_HOLD = "HOLD"
     RECO_REDUCE = "REDUCE"
     RECO_SELL = "SELL"
+
+
+# =============================================================================
+# v4.4.2 — core.buckets integration (canonical risk/confidence buckets)
+# =============================================================================
+#
+# v4.4.2 routes the bucket-backfill helpers (`_risk_bucket_from_row` /
+# `_confidence_bucket_from_row`) through core.buckets v1.0.0 — the single
+# authoritative risk/confidence bucket helper shared with data_engine_v2
+# v5.69.0+, top10_selector v4.13.0+, and the advisor orchestrator v5.3.2+.
+#
+# Before v4.4.2 these helpers carried their own inline thresholds that
+# diverged from the canonical cutoffs (risk "High" at >=65 here vs >=70
+# canonical) and — more importantly — did NOT auto-detect a 0-1 vs
+# 0-100 confidence scale, so a forecast_confidence of 0.8 backfilled as
+# "Low" instead of HIGH. core.buckets canonical cutoffs: risk <35 LOW /
+# 35-70 MODERATE / >=70 HIGH; confidence >=75 HIGH / 50-75 MODERATE /
+# <50 LOW, with 0-1 fractions auto-scaled to 0-100.
+#
+# The engine only BACKFILLS buckets (when the upstream data engine did
+# not already set one); routing through core.buckets makes that backfill
+# emit the same canonical UPPERCASE labels data_engine_v2 v5.69.0+
+# already emits, so the Risk Bucket / Confidence Bucket columns stay
+# casing-consistent across the whole stack.
+#
+# The import is except-guarded; when core.buckets is unavailable the four
+# names fall back to None, `_BUCKETS_AVAILABLE` is False, and the legacy
+# v4.2.0 inline thresholds run unchanged — so deployments without it see
+# zero behaviour change. core.buckets has no third-party deps and no TFB
+# imports, so there is no import-cycle risk here.
+try:
+    from core.buckets import (  # type: ignore
+        risk_bucket_from_score as _bk_risk_bucket_from_score,
+        confidence_bucket_from_score as _bk_confidence_bucket_from_score,
+        normalize_risk_bucket as _bk_normalize_risk_bucket,
+        normalize_confidence_bucket as _bk_normalize_confidence_bucket,
+    )
+    _BUCKETS_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised only when core.buckets is absent
+    _bk_risk_bucket_from_score = None  # type: ignore
+    _bk_confidence_bucket_from_score = None  # type: ignore
+    _bk_normalize_risk_bucket = None  # type: ignore
+    _bk_normalize_confidence_bucket = None  # type: ignore
+    _BUCKETS_AVAILABLE = False
 
 
 # =============================================================================
@@ -2207,17 +2314,43 @@ def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
 def _risk_bucket_from_row(row: MutableMapping[str, Any]) -> str:
     """Get risk bucket from row.
 
-    v4.2.0: returns "" (not "Moderate") when risk_score is missing.
-    Same fix advisor v5.1.1 made — phantom rows no longer get
-    fabricated buckets.
+    v4.4.2: routes through core.buckets v1.0.0 — the canonical
+    risk/confidence bucket helper shared with data_engine_v2 v5.69.0+,
+    top10_selector v4.13.0+, and the advisor orchestrator v5.3.2+.
+    Returns the canonical UPPERCASE label ("LOW" / "MODERATE" / "HIGH").
+    An explicit risk_bucket already on the row is preferred and
+    normalized through core.buckets so casing/variant noise ("Moderate",
+    "moderate risk") is canonicalized. When core.buckets is unavailable,
+    falls back to the legacy v4.2.0 inline thresholds (preserved
+    verbatim below).
+
+    v4.2.0 contract preserved: returns "" (not a fabricated bucket)
+    when risk_score is missing — phantom rows do not get fabricated
+    buckets.
     """
     existing = _to_string(row.get("risk_bucket"))
     if existing:
+        if _BUCKETS_AVAILABLE and _bk_normalize_risk_bucket is not None:
+            try:
+                # normalize() returns "" for unrecognized labels -> keep raw
+                return _bk_normalize_risk_bucket(existing) or existing
+            except Exception:
+                return existing
         return existing
 
     risk = _to_float_optional(row.get("risk_score"))
     if risk is None:
         return ""
+
+    if _BUCKETS_AVAILABLE and _bk_risk_bucket_from_score is not None:
+        try:
+            canon = _bk_risk_bucket_from_score(risk)
+            if canon:
+                return canon
+        except Exception:
+            pass
+
+    # ---- legacy fallback (v4.2.0 thresholds, preserved verbatim) ----
     if risk < 35:
         return "Low"
     if risk < 65:
@@ -2228,11 +2361,26 @@ def _risk_bucket_from_row(row: MutableMapping[str, Any]) -> str:
 def _confidence_bucket_from_row(row: MutableMapping[str, Any]) -> str:
     """Get confidence bucket from row.
 
-    v4.2.0: returns "" (not "Medium") when no underlying score exists.
-    Same fix advisor v5.1.1 made.
+    v4.4.2: routes through core.buckets v1.0.0. Returns the canonical
+    UPPERCASE label ("LOW" / "MODERATE" / "HIGH"). core.buckets
+    auto-detects the 0-1 vs 0-100 input scale, so a forecast_confidence
+    of 0.8 now correctly backfills as HIGH — the legacy inline
+    thresholds treated it as < 50 -> "Low". An explicit
+    confidence_bucket already on the row is preferred and normalized.
+    When core.buckets is unavailable, falls back to the legacy v4.2.0
+    inline thresholds (preserved verbatim below).
+
+    v4.2.0 contract preserved: returns "" when no underlying score
+    exists. The source-score chain (confidence_score -> forecast_confidence
+    -> overall_score -> opportunity_score) is unchanged.
     """
     existing = _to_string(row.get("confidence_bucket"))
     if existing:
+        if _BUCKETS_AVAILABLE and _bk_normalize_confidence_bucket is not None:
+            try:
+                return _bk_normalize_confidence_bucket(existing) or existing
+            except Exception:
+                return existing
         return existing
 
     score = _to_float_optional(
@@ -2241,6 +2389,16 @@ def _confidence_bucket_from_row(row: MutableMapping[str, Any]) -> str:
     )
     if score is None:
         return ""
+
+    if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
+        try:
+            canon = _bk_confidence_bucket_from_score(score)
+            if canon:
+                return canon
+        except Exception:
+            pass
+
+    # ---- legacy fallback (v4.2.0 thresholds, preserved verbatim) ----
     if score >= 75:
         return "High"
     if score >= 50:
@@ -2660,6 +2818,11 @@ async def _normalize_engine_result(
             "view_aware_conviction_supported": (
                 _VIEW_AWARE_AVAILABLE and _RFV_ACCEPTS_CONVICTION
             ),
+            # v4.4.2: core.buckets v1.0.0 availability — when True, the
+            # bucket-backfill helpers emit canonical UPPERCASE labels
+            # consistent with data_engine_v2 v5.69.0+, top10_selector
+            # v4.13.0+, and the advisor orchestrator v5.3.2+.
+            "buckets_canonical": _BUCKETS_AVAILABLE,
             "timestamp_utc": _now_utc_iso(),
             "offset": max(0, _to_int(offset, DEFAULT_OFFSET)),
             "limit": max(1, _to_int(limit, DEFAULT_LIMIT)),
