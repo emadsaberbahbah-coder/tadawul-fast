@@ -2,7 +2,53 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.67.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.68.0
+================================================================================
+
+WHY v5.68.0 — PROVIDER SYMBOL NORMALIZATION ROUTING (May 14, 2026)
+--------------------------------------------------------------------
+v5.67.0 reworked DISPLAY-side identity inference (`_SUFFIX_TO_LOCALE`
++ the `_canonicalize_provider_row` override block) so foreign-suffix
+tickers (.HK / .L / .NS / .XETRA ...) stop displaying as US listings.
+But the FETCH side was never touched: `_fetch_patch` and
+`_fetch_history_patch` still passed the RAW symbol to every provider,
+even though Yahoo / EODHD / Finnhub each expect a different symbol
+form (Yahoo wants BRK-B and .L; EODHD wants BRK.B and .LSE; Finnhub
+wants the bare US root). Foreign tickers were therefore still being
+rejected at the provider call, so the v5.67.0 display fix had nothing
+to display.
+
+v5.68.0 routes every provider symbol fetch through the canonical
+normalizer in `core.symbols.normalize` (v7.2.0+):
+  - PHASE 3  guarded import of the normalize provider-formatters,
+             aliased `_nz_*`; sets `_NORMALIZE_AVAILABLE`.
+  - PHASE 4  `_yahoo_symbol_for` delegates to `to_yahoo_symbol` first,
+             legacy strip/remap kept as fallback.
+  - PHASE 5  new `_provider_symbol_for(provider, symbol)` helper:
+             yahoo/yfinance/yahoo_chart -> to_yahoo_symbol,
+             eodhd -> to_eodhd_symbol, finnhub -> to_finnhub_symbol,
+             tadawul/argaam/other -> unchanged. Raw-symbol fallback
+             on any error or when normalize is unavailable.
+  - PHASE 6  `_SUFFIX_TO_LOCALE` extended with EODHD long-form and US
+             alias suffixes (.LSE/.NSE/.JSE/.HKG/.SHG/.NYSE/.OQ ...).
+  - PHASE 7  `_infer_country_from_symbol` consults
+             `_nz_get_country_from_symbol` before the "USA" default;
+             US/Global results are intentionally ignored to preserve
+             the "USA" display convention and the deliberate GBp
+             (pence) nuance for .L.
+  - PHASE 8  `_fetch_patch` translates per provider via
+             `_provider_symbol_for`, then tries the translated symbol
+             first and the RAW symbol second (zero-regression).
+  - PHASE 9  `_fetch_history_patch` applies the identical pattern.
+
+`get_currency_from_symbol` is deliberately NOT wired in yet — the
+GBp-vs-GBP pence trap needs the dedicated currency-normalization layer
+(next file). v5.67.0's unit-contract logic (PHASE-DD/II/JJ,
+percent_change fraction handling) is correct and is left untouched.
+
+[PRESERVED] All v5.67.0 + v5.66.0 PHASE-JJ + v5.65.0 PHASE-II
++ v5.64.0 + v5.63.0 + v5.62.0 PHASE-Z + v5.47.2 baseline logic intact.
+
 ================================================================================
 
 WHY v5.67.0 — UNIT-CONTRACT ALIGNMENT (May 13, 2026)
@@ -270,10 +316,41 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.67.0"
+__version__ = "5.68.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
+
+
+# =============================================================================
+# v5.68.0 — core.symbols.normalize integration (provider symbol routing)
+# =============================================================================
+# v5.68.0 routes every provider symbol fetch through the canonical normalizer
+# in core.symbols.normalize (v7.2.0+), which has the authoritative, complete
+# exchange-suffix and share-class translation per provider (Yahoo wants BRK-B
+# and .L; EODHD wants BRK.B and .LSE; Finnhub wants the bare US root). The
+# import is except-guarded so a missing or older normalize module degrades
+# gracefully to the legacy in-engine behavior via _NORMALIZE_AVAILABLE.
+try:
+    from core.symbols.normalize import (
+        to_yahoo_symbol as _nz_to_yahoo_symbol,
+        to_eodhd_symbol as _nz_to_eodhd_symbol,
+        to_finnhub_symbol as _nz_to_finnhub_symbol,
+        normalize_symbol_for_provider as _nz_normalize_symbol_for_provider,
+        get_country_from_symbol as _nz_get_country_from_symbol,
+        get_currency_from_symbol as _nz_get_currency_from_symbol,
+        get_primary_exchange as _nz_get_primary_exchange,
+    )
+    _NORMALIZE_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _nz_to_yahoo_symbol = None  # type: ignore
+    _nz_to_eodhd_symbol = None  # type: ignore
+    _nz_to_finnhub_symbol = None  # type: ignore
+    _nz_normalize_symbol_for_provider = None  # type: ignore
+    _nz_get_country_from_symbol = None  # type: ignore
+    _nz_get_currency_from_symbol = None  # type: ignore
+    _nz_get_primary_exchange = None  # type: ignore
+    _NORMALIZE_AVAILABLE = False
 
 
 # =============================================================================
@@ -445,11 +522,24 @@ _YAHOO_SUFFIX_REMAP: Dict[str, str] = {
 
 
 def _yahoo_symbol_for(symbol: str) -> str:
+    # v5.68.0 PHASE 4: delegate to core.symbols.normalize when available — it
+    # has the authoritative, complete suffix + share-class translation for
+    # Yahoo (e.g. BRK.B -> BRK-B, .LSE -> .L, US-alias stripping). The legacy
+    # strip/remap below is preserved as a fallback for when normalize is
+    # unavailable or returns nothing usable.
     if not isinstance(symbol, str):
         return ""
     s = symbol.strip()
     if not s:
         return ""
+
+    if _NORMALIZE_AVAILABLE and _nz_to_yahoo_symbol is not None:
+        try:
+            nz = _nz_to_yahoo_symbol(s)
+        except Exception:
+            nz = ""
+        if isinstance(nz, str) and nz.strip():
+            return nz.strip()
 
     for suf in _YAHOO_STRIP_SUFFIXES:
         if s.endswith(suf):
@@ -463,6 +553,49 @@ def _yahoo_symbol_for(symbol: str) -> str:
             return head + _YAHOO_SUFFIX_REMAP[tail_upper]
 
     return s
+
+
+def _provider_symbol_for(provider: str, symbol: str) -> str:
+    # v5.68.0 PHASE 5: translate a raw symbol into the form a specific
+    # provider expects, routing through core.symbols.normalize:
+    #   yahoo / yfinance / yahoo_chart -> to_yahoo_symbol (via _yahoo_symbol_for)
+    #   eodhd                          -> to_eodhd_symbol
+    #   finnhub                        -> to_finnhub_symbol
+    #   tadawul / argaam / anything else -> unchanged
+    # Any error, or normalize being unavailable, falls back to the RAW symbol,
+    # so this helper is strictly zero-regression.
+    if not isinstance(symbol, str):
+        return ""
+    raw = symbol.strip()
+    if not raw:
+        return ""
+    prov = (provider or "").strip().lower()
+
+    if prov in ("yahoo", "yfinance", "yahoo_chart"):
+        try:
+            out = _yahoo_symbol_for(raw)
+            if isinstance(out, str) and out.strip():
+                return out.strip()
+        except Exception:
+            pass
+        return raw
+
+    if not _NORMALIZE_AVAILABLE:
+        return raw
+
+    try:
+        if prov == "eodhd" and _nz_to_eodhd_symbol is not None:
+            out = _nz_to_eodhd_symbol(raw)
+            if isinstance(out, str) and out.strip():
+                return out.strip()
+        elif prov == "finnhub" and _nz_to_finnhub_symbol is not None:
+            out = _nz_to_finnhub_symbol(raw)
+            if isinstance(out, str) and out.strip():
+                return out.strip()
+    except Exception:
+        return raw
+
+    return raw
 
 
 # v5.63.0 PHASE-BB — percent_change sanity guards
@@ -2421,6 +2554,30 @@ _SUFFIX_TO_LOCALE: Dict[str, Tuple[str, str, str]] = {
     ".BA":    ("BCBA", "ARS", "Argentina"),
     ".JO":    ("JSE", "ZAR", "South Africa"),
     ".US":    ("NASDAQ/NYSE", "USD", "USA"),
+    # v5.68.0 PHASE 6: EODHD long-form suffixes + US exchange aliases. These
+    # let _suffix_locale_for / the _infer_* helpers recognize the symbol forms
+    # EODHD returns and the alias forms providers occasionally emit, instead of
+    # silently falling through to the NASDAQ/USD/USA default.
+    ".LSE":   ("LSE", "GBp", "United Kingdom"),
+    ".LN":    ("LSE", "GBp", "United Kingdom"),
+    ".NSE":   ("NSE", "INR", "India"),
+    ".BSE":   ("BSE", "INR", "India"),
+    ".JSE":   ("JSE", "ZAR", "South Africa"),
+    ".ZA":    ("JSE", "ZAR", "South Africa"),
+    ".HKG":   ("HKEX", "HKD", "Hong Kong"),
+    ".SHG":   ("Shanghai", "CNY", "China"),
+    ".SHE":   ("Shenzhen", "CNY", "China"),
+    ".KOSDAQ": ("KOSDAQ", "KRW", "South Korea"),
+    ".SGX":   ("SGX", "SGD", "Singapore"),
+    ".ASX":   ("ASX", "AUD", "Australia"),
+    ".KLSE":  ("Bursa Malaysia", "MYR", "Malaysia"),
+    ".IDX":   ("IDX", "IDR", "Indonesia"),
+    ".NZSE":  ("NZX", "NZD", "New Zealand"),
+    ".NYSE":  ("NYSE", "USD", "USA"),
+    ".NASDAQ": ("NASDAQ", "USD", "USA"),
+    ".OQ":    ("NASDAQ", "USD", "USA"),
+    ".NM":    ("NASDAQ", "USD", "USA"),
+    ".NG":    ("NASDAQ", "USD", "USA"),
 }
 
 # v5.67.0: tokens that indicate the displayed `country` field is a stale
@@ -2590,7 +2747,11 @@ def _infer_currency_from_symbol(symbol: str) -> str:
 
 
 def _infer_country_from_symbol(symbol: str) -> str:
-    """v5.67.0: consult _SUFFIX_TO_LOCALE first."""
+    """v5.67.0: consult _SUFFIX_TO_LOCALE first.
+    v5.68.0 PHASE 7: then consult core.symbols.normalize as a fallback before
+    defaulting to "USA". US/Global normalize results are intentionally ignored
+    so the established "USA" display convention and the deliberate GBp (pence)
+    nuance for .L are preserved."""
     s = normalize_symbol(symbol)
     if not s:
         return ""
@@ -2601,6 +2762,16 @@ def _infer_country_from_symbol(symbol: str) -> str:
         return "Saudi Arabia"
     if s.endswith("=X") or s.endswith("=F"):
         return "Global"
+    if _NORMALIZE_AVAILABLE and _nz_get_country_from_symbol is not None:
+        try:
+            nz_country = _nz_get_country_from_symbol(s)
+        except Exception:
+            nz_country = None
+        nz_country = (nz_country or "").strip()
+        if nz_country and nz_country.upper() not in {
+            "USA", "US", "UNITED STATES", "GLOBAL", "",
+        }:
+            return nz_country
     return "USA"
 
 
@@ -4296,14 +4467,26 @@ class DataEngineV5:
                 await self._registry.record_failure(provider, err)
                 return provider, None, (time.time() - start) * 1000.0, err
 
-            call_variants = [
-                ((symbol,), {}),
-                ((), {"symbol": symbol}),
-                ((), {"ticker": symbol}),
-                ((), {"requested_symbol": symbol}),
-                ((symbol,), {"settings": self.settings}),
-                ((), {"symbol": symbol, "settings": self.settings}),
-            ]
+            # v5.68.0 PHASE 8: translate the raw symbol into the form THIS
+            # provider expects, then try the translated symbol first and the
+            # RAW symbol second. The raw fallback keeps this zero-regression:
+            # if translation is wrong or normalize is unavailable, the original
+            # behavior (raw symbol) is still attempted.
+            provider_symbol = _provider_symbol_for(provider, symbol)
+            symbols_to_try = [provider_symbol]
+            if symbol and symbol not in symbols_to_try:
+                symbols_to_try.append(symbol)
+
+            call_variants = []
+            for _sym in symbols_to_try:
+                call_variants.extend([
+                    ((_sym,), {}),
+                    ((), {"symbol": _sym}),
+                    ((), {"ticker": _sym}),
+                    ((), {"requested_symbol": _sym}),
+                    ((_sym,), {"settings": self.settings}),
+                    ((), {"symbol": _sym, "settings": self.settings}),
+                ])
 
             result = None
             collected_errs: List[str] = []
@@ -4652,17 +4835,27 @@ class DataEngineV5:
                 callables.append(fn)
         if not callables:
             return {}
-        variants = [
-            ((symbol,), {"period": "1y", "interval": "1d"}),
-            ((symbol,), {"range": "1y", "interval": "1d"}),
-            ((symbol,), {"lookback": "1y", "interval": "1d"}),
-            ((), {"symbol": symbol, "period": "1y", "interval": "1d"}),
-            ((), {"ticker": symbol, "period": "1y", "interval": "1d"}),
-            ((), {"code": symbol, "period": "1y", "interval": "1d"}),
-            ((), {"symbol": symbol, "range": "1y", "interval": "1d"}),
-            ((), {"ticker": symbol, "range": "1y", "interval": "1d"}),
-            ((symbol,), {}),
-        ]
+        # v5.68.0 PHASE 9: same per-provider symbol translation as _fetch_patch
+        # — translate for the provider, try translated first then RAW symbol
+        # second (zero-regression fallback).
+        provider_symbol = _provider_symbol_for(provider, symbol)
+        symbols_to_try = [provider_symbol]
+        if symbol and symbol not in symbols_to_try:
+            symbols_to_try.append(symbol)
+
+        variants = []
+        for _sym in symbols_to_try:
+            variants.extend([
+                ((_sym,), {"period": "1y", "interval": "1d"}),
+                ((_sym,), {"range": "1y", "interval": "1d"}),
+                ((_sym,), {"lookback": "1y", "interval": "1d"}),
+                ((), {"symbol": _sym, "period": "1y", "interval": "1d"}),
+                ((), {"ticker": _sym, "period": "1y", "interval": "1d"}),
+                ((), {"code": _sym, "period": "1y", "interval": "1d"}),
+                ((), {"symbol": _sym, "range": "1y", "interval": "1d"}),
+                ((), {"ticker": _sym, "range": "1y", "interval": "1d"}),
+                ((_sym,), {}),
+            ])
         for fn in callables:
             for args, kwargs in variants:
                 try:
