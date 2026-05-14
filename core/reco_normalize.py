@@ -3,139 +3,153 @@
 """
 core/reco_normalize.py
 ================================================================================
-Recommendation Normalization -- v7.2.1
+Recommendation Normalization -- v8.0.0
+================================================================================
+
+v8.0.0 changes (vs v7.2.1) -- 8-TIER CANONICAL VOCABULARY
+---------------------------------------------------------
+MAJOR: the canonical recommendation enum is expanded from 5 tiers to 8 to
+become the single source of truth for the whole TFB stack. `data_engine_v2.py`'s
+`_classify_recommendation_8tier` already emits all eight tiers; previously
+`reco_normalize` could only represent five of them, so routing the engine's
+output through `normalize_recommendation()` silently collapsed `ACCUMULATE`
+into `BUY` and `STRONG_SELL` / `AVOID` into `SELL`. v8.0.0 removes that lossy
+collapse.
+
+Canonical tiers (best -> worst), with their 0-7 ordinal:
+
+    STRONG_BUY   ordinal 0
+    BUY          ordinal 1
+    ACCUMULATE   ordinal 2      <- NEW
+    HOLD         ordinal 3
+    REDUCE       ordinal 4
+    SELL         ordinal 5
+    STRONG_SELL  ordinal 6      <- NEW
+    AVOID        ordinal 7      <- NEW
+
+A.  ENUM EXPANSION.
+    `Recommendation` gains `ACCUMULATE`, `STRONG_SELL`, `AVOID`. `_RECO_ENUM`,
+    `RECO_*` module constants, and `__all__` are extended to match.
+
+B.  RE-BANDED `from_score()` / `recommendation_from_score()`.
+    The numeric->tier mapping is re-spaced for 8 tiers on every supported
+    scale. The 0-100 banding (the scale the engine and vendors use most):
+        >= 85  STRONG_BUY
+        70-84  BUY
+        60-69  ACCUMULATE
+        45-59  HOLD
+        35-44  REDUCE
+        25-34  SELL
+        15-24  STRONG_SELL
+        < 15   AVOID
+    The 1-5 and 1-3 scales are likewise subdivided; where a coarse scale
+    cannot distinguish 8 tiers (1-3 in particular) it maps to the nearest
+    representative tier rather than inventing false precision.
+
+C.  RE-BANDED `to_score()`.
+    Returns the 0-7 ordinal above (was 0-4). Callers that only compared
+    ordinals for ranking keep working — the order is preserved and still
+    monotonic. Callers that hard-coded "4 == worst" must move to "7 == worst";
+    `WORST_ORDINAL` is exported so they can reference it symbolically.
+
+D.  8-TIER VIEW RESOLVER.
+    `_classify_views_with_rule_id()` can now emit all eight tiers:
+      - STRONG_SELL: double-bearish (fund AND tech bearish) escalates to
+        STRONG_SELL when ALSO high risk or score < 25 -- previously these
+        cases were flattened to SELL.
+      - AVOID: reserved for the genuinely uninvestable -- score < 15, or
+        double-bearish on an EXPENSIVE valuation. AVOID is "do not hold
+        and do not enter"; SELL is "exit an existing position".
+      - ACCUMULATE: bullish fundamentals + cheap/fair value + non-bullish
+        (neutral) technicals with a moderate score band [55,65). This is
+        the "scale in, the thesis is good but the entry isn't urgent" call
+        that previously had to round to either BUY or HOLD.
+    Four new RULE_ID_* constants cover the new branches. All v7.x rule-ids
+    are preserved verbatim.
+
+E.  RE-BANDED `_parse_numeric_rating()`.
+    The vendor-rating numeric parser now resolves into the 8-tier space on
+    the 0-100 and 0-1 paths. The 1-5 / 1-3 star paths stay coarse (a 5-star
+    scale genuinely cannot express 8 tiers) but use the wider vocabulary
+    where the integer cleanly implies it.
+
+F.  STRING PARSING -- 8-tier aware.
+    New `_ACCUMULATE_LIKE` set so free text "ACCUMULATE" / "SCALE IN" /
+    "START A POSITION" resolves to ACCUMULATE instead of BUY. `_AVOID_LIKE`
+    so "AVOID" / "DO NOT BUY" / "UNINVESTABLE" resolves to AVOID instead of
+    SELL. `_STRONG_SELL_LIKE` (already existed) now maps to the STRONG_SELL
+    tier instead of collapsing to SELL. Multilingual sets (AR/FR/ES/DE/PT)
+    gain accumulate/avoid/strong-sell entries. Resolution order is
+    strongest-signal-first so "STRONG SELL" is never shadowed by "SELL".
+
+G.  CONVICTION FLOORS extended.
+    The conviction-floor cascade is unchanged for STRONG_BUY/BUY but now also
+    covers ACCUMULATE: ACCUMULATE with conviction below `_BUY_CONVICTION_FLOOR`
+    downgrades to HOLD (same floor as BUY -- a low-conviction "scale in" is
+    just a HOLD). Protective tiers (REDUCE/SELL/STRONG_SELL/AVOID/HOLD) are
+    still never downgraded.
+
+H.  PHASE E NEGATION FIX preserved + extended.
+    v7.2.1's removal of "AVOID"/"AGAINST" from `_PAT_NEGATE` is preserved.
+    `_apply_negation` is updated for the wider vocabulary: negating a
+    STRONG_BUY yields BUY (not HOLD); negating ACCUMULATE yields HOLD.
+
+[PRESERVED -- strictly] All v7.2.1 / v7.2.0 / v7.1.0 / v7.0.0 / v6.1.0
+behavior that is not explicitly re-banded above: multilingual pattern
+dictionaries (EN/AR/FR/ES/DE/PT), vendor field mappings, the
+NormalizedRecommendation dataclass, exceptions, deep-get extraction,
+Arabic normalization, horizon helpers, conviction-floor env tunables,
+rule-id introspection, and every public symbol from v7.2.1. The public
+API is augmented (3 enum members + 4 rule-ids + new *_LIKE sets +
+`WORST_ORDINAL`) -- nothing is removed from `__all__`.
+
+MIGRATION NOTE for downstream callers
+-------------------------------------
+- `to_score()` range changed 0-4 -> 0-7. Ranking code that sorts on the
+  ordinal is unaffected (order preserved). Code that hard-coded the literal
+  4 as "worst" must use `WORST_ORDINAL` (== 7) instead.
+- `normalize_recommendation()` may now return ACCUMULATE / STRONG_SELL /
+  AVOID. Any consumer with a hard-coded 5-value allow-list must widen it.
+  `is_valid_recommendation()` already reflects the full 8-tier set.
+
+================================================================================
+PRESERVED CHANGE HISTORY (v7.2.1 and earlier)
 ================================================================================
 
 v7.2.1 changes (vs v7.2.0)
 --------------------------
-METADATA-ONLY PATCH — May 2026 cross-stack family alignment.
-
-Cross-stack consumer acknowledgment:
-- `investment_advisor` v5.3.1 now uses rule-id-aware cascade via
-  `recommendation_from_views_with_rule_id()` for audit visibility.
-- `investment_advisor_engine` v4.4.1 delegates view-aware recommendation
-  synthesis to `Recommendation.from_views()` with full conviction-floor
-  support.
-- `criteria_model` v3.1.1 mirrors the same env-tunable conviction floor
-  variables (`RECO_STRONG_BUY_CONVICTION_FLOOR`, `RECO_BUY_CONVICTION_FLOOR`)
-  for consistent thresholds across the investment pipeline.
-
-All v7.2.0 behavior preserved verbatim. This is purely a metadata-only
-patch with no functional changes — VERSION bumped to v7.2.1 for family
-alignment tracking.
+METADATA-ONLY PATCH -- May 2026 cross-stack family alignment.
+- `investment_advisor` v5.3.1 uses rule-id-aware cascade via
+  `recommendation_from_views_with_rule_id()`.
+- `investment_advisor_engine` v4.4.1 delegates to `Recommendation.from_views()`.
+- `criteria_model` v3.1.1 mirrors the env-tunable conviction floor variables.
+All v7.2.0 behavior preserved verbatim.
 
 v7.2.0 changes (vs v7.1.0)
 --------------------------
-A.  ENV-TUNABLE CONVICTION FLOORS.
-    `_STRONG_BUY_CONVICTION_FLOOR` and `_BUY_CONVICTION_FLOOR` are now
-    sourced from environment variables `RECO_STRONG_BUY_CONVICTION_FLOOR`
-    and `RECO_BUY_CONVICTION_FLOOR` with the v7.1.0 defaults (60.0 / 45.0).
-    Ops can tune downgrade aggressiveness against backtest data without
-    a code change. Existing callers continue to work — the env vars are
-    optional with the v7.1.0 defaults.
+A.  ENV-TUNABLE CONVICTION FLOORS via `RECO_STRONG_BUY_CONVICTION_FLOOR` /
+    `RECO_BUY_CONVICTION_FLOOR` (defaults 60.0 / 45.0).
+B.  RULE-ID INTROSPECTION: `recommendation_from_views_with_rule_id(...)`
+    returning `(canonical_str, reason, rule_id)`.
+C.  `__version__` alias alongside `VERSION`.
+D.  Conviction-badge de-duplication in downgrade prose.
+E.  REAL BUG FIX: "AVOID"/"AGAINST" removed from `_PAT_NEGATE` (they are
+    recommendation words, not negators -- the defect downgraded a SELL to
+    REDUCE).
 
-B.  RULE-ID INTROSPECTION (audit alignment).
-    Adds `recommendation_from_views_with_rule_id(...)` free function
-    returning `(canonical_str, reason, rule_id)`. The `rule_id` is one of
-    13 stable string constants (`RULE_ID_HARD_SELL_DOUBLE_BEARISH`, etc.)
-    exposing exactly which classification branch fired. Callers that
-    need audit visibility (scoring.py v5.2.5, sheet-level diagnostics)
-    can now distinguish a "STRONG_BUY downgraded by conviction floor"
-    from a "BUY by bullish-fund-acceptable-valuation" without parsing
-    the reason text.
+v7.1.0 changes
+--------------
+- NEW optional kwargs on `Recommendation.from_views()`: `conviction`,
+  `sector_relative`. Conviction floors: STRONG_BUY needs >= 60 else -> BUY;
+  BUY needs >= 45 else -> HOLD. Protective calls never downgraded.
+- Defensive `_to_float_strict()` guard; score-badge de-duplication.
 
-    Implementation: refactored the body of `from_views()` into a
-    module-level `_classify_views_with_rule_id()` helper. Both
-    `Recommendation.from_views()` (classmethod) and the existing
-    `recommendation_from_views()` (free function) keep their v7.1.0
-    return signatures — the rule_id is discarded internally so they
-    remain 100% backward-compatible.
-
-C.  __version__ ALIAS.
-    Added `__version__ = VERSION` alongside the v7.1.0 `VERSION` constant.
-    Aligns with the Python convention used by all other TFB modules
-    (scoring.py, data_engine_v2.py, eodhd_provider.py, etc.).
-
-D.  CONVICTION-BADGE DE-DUPLICATION.
-    In v7.1.0 a STRONG_BUY downgraded to BUY by conviction-floor produced
-    a reason like "...Downgraded: STRONG_BUY -> BUY (conviction 52 below
-    floor 60). [Conv 52]" — the conviction value appears twice. v7.2.0
-    suppresses the `[Conv NN]` badge when the downgrade prose already
-    cites the conviction value. The `[Sector-Adj NN]` badge is still
-    appended when sector_relative is supplied. Pure cosmetic fix.
-
-E.  REAL BUG FIX: "AVOID" mis-negated to REDUCE.
-    v7.1.0's `_PAT_NEGATE` included "AVOID" and "AGAINST" as negation
-    tokens, causing `_apply_negation("AVOID", SELL)` to return REDUCE
-    (downgrading the very recommendation that "AVOID" itself signaled).
-    The same defect affected free-text recommendations like "AVOID THIS
-    STOCK" coming from third-party advisor notes — they parsed as
-    REDUCE when they should be SELL.
-
-    Trace before fix:
-      Input: "AVOID"
-      1. _PAT_SELL matches "AVOID" -> initial reco = SELL
-      2. _apply_negation called with text="AVOID", reco=SELL
-      3. _PAT_NEGATE matches "AVOID" (in negate list!)
-      4. reco==SELL is downgraded to REDUCE  [WRONG]
-
-    Fix: removed "AVOID" and "AGAINST" from `_PAT_NEGATE`. They are
-    recommendation words, not negators. "DO NOT AVOID" would still
-    catch via the NOT token; "AGAINST" alone produces a HOLD via the
-    sentiment-analysis fallback, which is the safer default than the
-    spurious REDUCE downgrade.
-
-[PRESERVED — strictly] All v7.1.0 / v7.0.0 / v6.1.0 helpers, signatures,
-docstrings, examples, language pattern dictionaries (EN/AR/FR/ES/DE/PT),
-vendor field mappings, NormalizedRecommendation dataclass, exceptions,
-and every public symbol. Public API surface is augmented only (one new
-function + 13 RULE_ID_* constants + `__version__` alias). No removals
-from __all__.
-
-v7.1.0 changes (preserved verbatim)
------------------------------------
-- NEW kwargs on `Recommendation.from_views()`:
-    - `conviction`        (Optional[float], 0-100): when supplied, applies
-      conviction floors to the resulting recommendation:
-          STRONG_BUY    requires conviction >= 60  (else downgrade -> BUY)
-          BUY           requires conviction >= 45  (else downgrade -> HOLD)
-      REDUCE/SELL/HOLD are NOT downgraded — those are protective calls and
-      we want them to fire even when conviction is moderate. The conviction
-      number is also surfaced in the reason text so the user sees why a
-      call was capped.
-    - `sector_relative`   (Optional[float], 0-100): when supplied, surfaces
-      the percentile rank in the reason text. Does NOT change rule flow in
-      v7.1.0 (left to a future revision after we have backtest data on
-      sector-rotation effects).
-  Both kwargs are OPTIONAL with default None — every existing v7.0.0 caller
-  continues to work without changes.
-
-- FIX (defensive): `from_views()` now guards against `score` being a numpy
-  scalar / Decimal that survived basic float() but doesn't compare cleanly.
-  Wraps in `_to_float_strict()` before threshold checks.
-
-- FIX (cleanup): When BOTH conviction and base reason mention the score,
-  we de-duplicate the score badge so reasons stay readable.
-
-- DOC: Examples updated to show the conviction-floor downgrade path.
-
-- PRESERVED (no behavior change): all v7.0.0 behavior is unchanged when
-  conviction and sector_relative are not passed. Every public symbol from
-  v7.0.0 is exported. This is purely additive.
-
-v7.0.0 features (preserved verbatim)
-------------------------------------
+v7.0.0 features
+---------------
 - View-aware 5-tier resolver with EXPENSIVE-veto / double-bearish-SELL /
-  STRONG_BUY-all-conditions / etc.
-- All language pattern dictionaries (EN/AR/FR/ES/DE/PT) and vendor field
-  mappings.
+  STRONG_BUY-all-conditions.
+- All language pattern dictionaries and vendor field mappings.
 - normalize_recommendation*, batch_normalize, NormalizedRecommendation.
-
-Public API (additions only — fully backward compatible)
-- `__version__` alias (v7.2.0)
-- `recommendation_from_views_with_rule_id(...)` returning 3-tuple (v7.2.0)
-- 13 `RULE_ID_*` string constants (v7.2.0)
-- All v7.1.0 symbols preserved.
 ================================================================================
 """
 
@@ -164,21 +178,17 @@ from typing import (
 # Version
 # =============================================================================
 
-VERSION = "7.2.1"
-__version__ = VERSION  # v7.2.1: cross-stack family alignment, TFB module convention
+VERSION = "8.0.0"
+__version__ = VERSION  # v8.0.0: 8-tier canonical vocabulary
 
 
 # =============================================================================
-# v7.2.0 Phase B — Rule-ID constants for classification introspection
+# v7.2.0 Phase B / v8.0.0 Phase D — Rule-ID constants for introspection
 # =============================================================================
 #
 # Stable string identifiers for each branch of the view-aware classifier.
 # Returned by recommendation_from_views_with_rule_id() so callers can
 # audit which rule fired without parsing the reason text.
-#
-# IDs are namespaced by outcome family: HARD_SELL_*, REDUCE_*, BUY_*,
-# HOLD_*, INSUFFICIENT_DATA_*. Naming is deliberately verbose so logs
-# read clearly.
 
 RULE_ID_INSUFFICIENT_DATA_NO_SIGNALS = "INSUFFICIENT_DATA_NO_VIEWS_NO_SCORE"
 RULE_ID_INSUFFICIENT_DATA_TOO_FEW = "INSUFFICIENT_DATA_TOO_FEW_SIGNALS"
@@ -200,24 +210,56 @@ RULE_ID_DOWNGRADED_STRONG_BUY_TO_BUY = "STRONG_BUY_DOWNGRADED_BUY_LOW_CONVICTION
 RULE_ID_DOWNGRADED_BUY_TO_HOLD = "BUY_DOWNGRADED_HOLD_LOW_CONVICTION"
 RULE_ID_DOWNGRADED_STRONG_BUY_TO_HOLD = "STRONG_BUY_CASCADED_HOLD_LOW_CONVICTION"
 
+# v8.0.0 Phase D — new rule-ids for the three additional tiers
+RULE_ID_ACCUMULATE_BULLISH_MODERATE = "ACCUMULATE_BULLISH_FUND_MODERATE_SCORE"
+RULE_ID_DOWNGRADED_ACCUMULATE_TO_HOLD = "ACCUMULATE_DOWNGRADED_HOLD_LOW_CONVICTION"
+RULE_ID_HARD_STRONG_SELL_DOUBLE_BEARISH = "STRONG_SELL_DOUBLE_BEARISH_ESCALATED"
+RULE_ID_AVOID_UNINVESTABLE = "AVOID_UNINVESTABLE"
+
 
 # =============================================================================
 # Enums and view constants
 # =============================================================================
 
 class Recommendation(str, Enum):
-    """Canonical recommendation values."""
+    """
+    Canonical recommendation values — 8-tier as of v8.0.0.
+
+    Ordering (best -> worst): STRONG_BUY, BUY, ACCUMULATE, HOLD,
+    REDUCE, SELL, STRONG_SELL, AVOID.
+    """
     STRONG_BUY = "STRONG_BUY"
     BUY = "BUY"
+    ACCUMULATE = "ACCUMULATE"   # v8.0.0
     HOLD = "HOLD"
     REDUCE = "REDUCE"
     SELL = "SELL"
+    STRONG_SELL = "STRONG_SELL"  # v8.0.0
+    AVOID = "AVOID"              # v8.0.0
 
-    # ---- numeric score -> recommendation (preserved from v6.1.0) -----------
+    # ---- numeric score -> recommendation (re-banded for 8 tiers in v8.0.0) -
 
     @classmethod
     def from_score(cls, score: Any, scale: str = "1-5") -> "Recommendation":
-        """Convert a numeric score to a recommendation. (Preserved from v6.1.0.)"""
+        """
+        Convert a numeric score to a recommendation.
+
+        v8.0.0: re-banded across 8 tiers. The 0-100 scale is the primary
+        path (engine + most vendors); the 1-5 and 1-3 star scales are
+        genuinely too coarse for 8 distinct tiers, so they map each integer
+        to its nearest representative tier rather than fabricating
+        precision the source data does not contain.
+
+        0-100 banding:
+            >= 85  STRONG_BUY
+            70-84  BUY
+            60-69  ACCUMULATE
+            45-59  HOLD
+            35-44  REDUCE
+            25-34  SELL
+            15-24  STRONG_SELL
+            < 15   AVOID
+        """
         try:
             if isinstance(score, bool):
                 s = float(score)
@@ -225,62 +267,89 @@ class Recommendation(str, Enum):
                 s = float(score)
             else:
                 s = float(str(score).strip().replace(",", "."))
-            if s != s:
+            if s != s:  # NaN
                 return cls.HOLD
         except (TypeError, ValueError):
             return cls.HOLD
 
         if scale == "1-5":
-            if s <= 1.5:
+            # 5-point scale: 1 best .. 5 worst. Eight tiers cannot be
+            # cleanly expressed on five integers, so we use half-step
+            # boundaries to reach the most defensible representative tier.
+            if s <= 1.25:
                 return cls.STRONG_BUY
-            if s <= 2.5:
+            if s <= 1.75:
                 return cls.BUY
-            if s <= 3.5:
+            if s <= 2.5:
+                return cls.ACCUMULATE
+            if s <= 3.25:
                 return cls.HOLD
-            if s <= 4.5:
+            if s <= 3.75:
                 return cls.REDUCE
-            return cls.SELL
+            if s <= 4.5:
+                return cls.SELL
+            if s <= 4.85:
+                return cls.STRONG_SELL
+            return cls.AVOID
 
         if scale == "1-3":
-            if s <= 1.3:
+            # 3-point scale is too coarse for 8 tiers; map to the three
+            # representative anchors plus the extreme tails.
+            if s <= 1.15:
                 return cls.STRONG_BUY
-            if s <= 1.8:
+            if s <= 1.6:
                 return cls.BUY
-            if s <= 2.3:
+            if s <= 2.4:
                 return cls.HOLD
-            if s <= 2.7:
-                return cls.REDUCE
-            return cls.SELL
+            if s <= 2.85:
+                return cls.SELL
+            return cls.AVOID
 
         if scale == "0-100":
             if s >= 85:
                 return cls.STRONG_BUY
-            if s >= 65:
+            if s >= 70:
                 return cls.BUY
+            if s >= 60:
+                return cls.ACCUMULATE
             if s >= 45:
                 return cls.HOLD
             if s >= 35:
                 return cls.REDUCE
-            return cls.SELL
+            if s >= 25:
+                return cls.SELL
+            if s >= 15:
+                return cls.STRONG_SELL
+            return cls.AVOID
 
         return cls.HOLD
 
     def to_score(self) -> int:
-        """Convert recommendation to a 0-4 score (0 = best). (Preserved.)"""
+        """
+        Convert recommendation to a 0-7 ordinal (0 = best, 7 = worst).
+
+        v8.0.0: range widened from 0-4 to 0-7. Ordering is preserved and
+        still strictly monotonic, so ranking/sort consumers are unaffected.
+        Code that hard-coded the literal 4 as "worst" must move to
+        `WORST_ORDINAL` (== 7).
+        """
         return {
             Recommendation.STRONG_BUY: 0,
             Recommendation.BUY: 1,
-            Recommendation.HOLD: 2,
-            Recommendation.REDUCE: 3,
-            Recommendation.SELL: 4,
-        }.get(self, 2)
+            Recommendation.ACCUMULATE: 2,
+            Recommendation.HOLD: 3,
+            Recommendation.REDUCE: 4,
+            Recommendation.SELL: 5,
+            Recommendation.STRONG_SELL: 6,
+            Recommendation.AVOID: 7,
+        }.get(self, 3)
 
     @classmethod
     def is_valid(cls, value: str) -> bool:
         """Check if value is a valid recommendation."""
         return value in cls._value2member_map_
 
-    # ---- v7.0.0 + v7.1.0 + v7.2.0: view-aware resolver ---------------------
+    # ---- view-aware resolver (8-tier as of v8.0.0) ------------------------
 
     @classmethod
     def from_views(
@@ -291,7 +360,6 @@ class Recommendation(str, Enum):
         risk: Any = None,
         value: Any = None,
         score: Any = None,
-        # v7.1.0 additions (both optional)
         conviction: Any = None,
         sector_relative: Any = None,
     ) -> Tuple["Recommendation", str]:
@@ -305,23 +373,23 @@ class Recommendation(str, Enum):
             risk:            Risk View          (LOW / MODERATE / HIGH)
             value:           Value View         (CHEAP / FAIR / EXPENSIVE)
             score:           Overall Score      (0-100, optional)
-            conviction:      Conviction Score   (0-100, optional, v7.1.0+)
-            sector_relative: Sector-Adj Score   (0-100, optional, v7.1.0+)
+            conviction:      Conviction Score   (0-100, optional)
+            sector_relative: Sector-Adj Score   (0-100, optional)
 
         Returns:
             (Recommendation enum, reason string).
 
-        Conviction-floor downgrades (v7.1.0+, env-tunable in v7.2.0):
-            - STRONG_BUY with conviction < _STRONG_BUY_CONVICTION_FLOOR (60)
-              -> downgraded to BUY
-            - BUY with conviction < _BUY_CONVICTION_FLOOR (45)
-              -> downgraded to HOLD
-            - REDUCE / SELL / HOLD are never downgraded (protective calls)
+        v8.0.0: the resolver can now emit all eight tiers. STRONG_SELL and
+        AVOID escalate from the v7.x SELL branches under the harshest
+        conditions; ACCUMULATE fills the "good thesis, non-urgent entry"
+        band that previously had to round to BUY or HOLD.
 
-        v7.2.0 note: this method delegates to
-        `_classify_views_with_rule_id()` and returns only the (rec, reason)
-        slice. For callers that want the rule_id for audit, use
-        `recommendation_from_views_with_rule_id()` instead.
+        Conviction-floor downgrades (env-tunable):
+            - STRONG_BUY  with conviction < _STRONG_BUY_CONVICTION_FLOOR (60)
+              -> BUY
+            - BUY         with conviction < _BUY_CONVICTION_FLOOR (45)  -> HOLD
+            - ACCUMULATE  with conviction < _BUY_CONVICTION_FLOOR (45)  -> HOLD
+            - REDUCE / SELL / STRONG_SELL / AVOID / HOLD are never downgraded.
 
         Examples:
             >>> Recommendation.from_views(
@@ -330,26 +398,26 @@ class Recommendation(str, Enum):
             ... )
             (<Recommendation.STRONG_BUY: 'STRONG_BUY'>, 'Strong fundamentals + ...')
 
-            >>> # Conviction floor: same views/score but conviction too low
+            >>> # ACCUMULATE: good thesis, neutral technicals, moderate score
             >>> Recommendation.from_views(
-            ...     fundamental="BULLISH", technical="BULLISH",
-            ...     risk="LOW", value="CHEAP", score=82, conviction=52
+            ...     fundamental="BULLISH", technical="NEUTRAL",
+            ...     risk="MODERATE", value="FAIR", score=58
             ... )
-            (<Recommendation.BUY: 'BUY'>, '... downgraded from STRONG_BUY ...')
+            (<Recommendation.ACCUMULATE: 'ACCUMULATE'>, 'Bullish fundamentals ...')
 
-            >>> # EXPENSIVE veto preserved from v7.0.0
-            >>> Recommendation.from_views(
-            ...     fundamental="BULLISH", technical="BULLISH",
-            ...     risk="LOW", value="EXPENSIVE", score=80
-            ... )
-            (<Recommendation.HOLD: 'HOLD'>, 'Bullish fundamentals but valuation ...')
-
-            >>> # Double-bearish forces SELL regardless of score
+            >>> # STRONG_SELL: double-bearish escalated by high risk
             >>> Recommendation.from_views(
             ...     fundamental="BEARISH", technical="BEARISH",
-            ...     risk="HIGH", value="FAIR", score=80
+            ...     risk="HIGH", value="FAIR", score=30
             ... )
-            (<Recommendation.SELL: 'SELL'>, 'Bearish fundamentals AND bearish ...')
+            (<Recommendation.STRONG_SELL: 'STRONG_SELL'>, 'Bearish on bearish ...')
+
+            >>> # AVOID: uninvestable — double-bearish on expensive valuation
+            >>> Recommendation.from_views(
+            ...     fundamental="BEARISH", technical="BEARISH",
+            ...     risk="HIGH", value="EXPENSIVE", score=20
+            ... )
+            (<Recommendation.AVOID: 'AVOID'>, 'Bearish on bearish, expensive ...')
         """
         rec, reason, _rule_id = _classify_views_with_rule_id(
             fundamental=fundamental,
@@ -361,6 +429,10 @@ class Recommendation(str, Enum):
             sector_relative=sector_relative,
         )
         return rec, reason
+
+
+# Symbolic "worst ordinal" so downstream code never hard-codes the literal.
+WORST_ORDINAL = Recommendation.AVOID.to_score()  # == 7 in v8.0.0
 
 
 # =============================================================================
@@ -391,9 +463,9 @@ def _to_float_strict(value: Any) -> Optional[float]:
 
 def _env_float(name: str, default: float) -> float:
     """
-    v7.2.0 Phase A helper. Best-effort env-var float load with default
-    fallback on parse failure / unset / NaN. Used for the conviction-
-    floor thresholds so ops can tune them without a code change.
+    Best-effort env-var float load with default fallback on parse failure /
+    unset / NaN. Used for the conviction-floor thresholds so ops can tune
+    them without a code change.
     """
     raw = os.getenv(name)
     if raw is None:
@@ -427,8 +499,8 @@ def _attach_metrics(
     return f"{base_reason} [{', '.join(parts)}]"
 
 
-# v7.2.0 Phase A — env-tunable conviction floors.
-# Defaults match v7.1.0 verbatim. Ops can override via:
+# Env-tunable conviction floors. Defaults match v7.1.0 verbatim. Ops can
+# override via:
 #     export RECO_STRONG_BUY_CONVICTION_FLOOR=65
 #     export RECO_BUY_CONVICTION_FLOOR=50
 # Loaded once at module import.
@@ -443,34 +515,33 @@ def _apply_conviction_floor(
     sector_relative: Optional[float],
 ) -> Tuple[Recommendation, str]:
     """
-    Apply conviction floors to a STRONG_BUY/BUY recommendation.
+    Apply conviction floors to a STRONG_BUY / BUY / ACCUMULATE recommendation.
 
-    Rules (v7.1.0, thresholds env-tunable in v7.2.0):
+    Rules (thresholds env-tunable):
       - STRONG_BUY with conviction < _STRONG_BUY_CONVICTION_FLOOR (60)
         -> BUY (and note in reason)
       - BUY with conviction < _BUY_CONVICTION_FLOOR (45)
         -> HOLD (and note in reason)
+      - ACCUMULATE with conviction < _BUY_CONVICTION_FLOOR (45)
+        -> HOLD (v8.0.0: a low-conviction "scale in" is just a HOLD)
       - Any rec with conviction is None  -> unchanged (just attach badge)
 
-    Protective calls (REDUCE/SELL/HOLD) are never passed here, so they
-    never get downgraded.
+    Protective calls (REDUCE / SELL / STRONG_SELL / AVOID / HOLD) are never
+    passed here, so they are never downgraded.
 
-    v7.2.0 Phase D: when a downgrade fires, the reason text already
-    cites the conviction value in prose ("conviction NN below floor NN"),
-    so the `[Conv NN]` badge would be redundant. We suppress the badge
-    in the downgrade path and keep only the `[Sector-Adj NN]` part when
-    sector_relative is supplied. The non-downgrade path (initial passes
-    through unchanged) still gets the full badge.
+    v7.2.0 Phase D: when a downgrade fires, the reason text already cites
+    the conviction value in prose, so the `[Conv NN]` badge would be
+    redundant — it is suppressed in the downgrade path; the
+    `[Sector-Adj NN]` part is still appended when supplied.
     """
     if conviction is None:
-        # No conviction info — pass through with whatever badges apply
         return initial, _attach_metrics(initial_reason, None, sector_relative)
 
-    # Cascade: STRONG_BUY -> BUY -> HOLD if conviction is below all floors.
-    # Single-step would leave STRONG_BUY at BUY with conv=40 even though
-    # BUY's own floor is 45, which is dishonest. Iterate until stable.
+    # Cascade: STRONG_BUY -> BUY -> HOLD, and ACCUMULATE -> HOLD, when
+    # conviction is below the relevant floor(s). Iterate until stable so a
+    # STRONG_BUY with conviction 40 does not stop at BUY (whose own floor
+    # is 45) — that would be dishonest.
     current = initial
-    current_reason = initial_reason
     downgrades: List[str] = []
 
     if current == Recommendation.STRONG_BUY and conviction < _STRONG_BUY_CONVICTION_FLOOR:
@@ -487,15 +558,25 @@ def _apply_conviction_floor(
         )
         current = Recommendation.HOLD
 
+    # v8.0.0: ACCUMULATE shares the BUY floor. ACCUMULATE only ever arrives
+    # here as the *initial* value (the STRONG_BUY/BUY cascade above cannot
+    # produce it), so this is an independent check, not part of the cascade.
+    if current == Recommendation.ACCUMULATE and conviction < _BUY_CONVICTION_FLOOR:
+        downgrades.append(
+            f"ACCUMULATE -> HOLD (conviction {conviction:.0f} below floor "
+            f"{_BUY_CONVICTION_FLOOR:.0f})"
+        )
+        current = Recommendation.HOLD
+
     if downgrades:
         current_reason = (
             f"{initial_reason} Downgraded: " + "; ".join(downgrades) + "."
         )
-        # v7.2.0 Phase D: skip the redundant Conv badge — conviction value
-        # is already in the downgrade prose. Sector badge still applies.
+        # Skip the redundant Conv badge — conviction value is already in the
+        # downgrade prose. Sector badge still applies.
         return current, _attach_metrics(current_reason, None, sector_relative)
 
-    return current, _attach_metrics(current_reason, conviction, sector_relative)
+    return current, _attach_metrics(initial_reason, conviction, sector_relative)
 
 
 # =============================================================================
@@ -535,11 +616,13 @@ _VIEW_TECH_ALIASES: Dict[str, str] = {
     "BULLISH": VIEW_TECH_BULLISH, "BULL": VIEW_TECH_BULLISH,
     "UP": VIEW_TECH_BULLISH, "POSITIVE": VIEW_TECH_BULLISH,
     "UPTREND": VIEW_TECH_BULLISH, "STRONG": VIEW_TECH_BULLISH,
+    "OVERSOLD": VIEW_TECH_BULLISH,
     "NEUTRAL": VIEW_TECH_NEUTRAL, "FLAT": VIEW_TECH_NEUTRAL,
     "SIDEWAYS": VIEW_TECH_NEUTRAL, "MIXED": VIEW_TECH_NEUTRAL,
     "BEARISH": VIEW_TECH_BEARISH, "BEAR": VIEW_TECH_BEARISH,
     "DOWN": VIEW_TECH_BEARISH, "NEGATIVE": VIEW_TECH_BEARISH,
     "DOWNTREND": VIEW_TECH_BEARISH, "WEAK": VIEW_TECH_BEARISH,
+    "OVERBOUGHT": VIEW_TECH_BEARISH,
 }
 
 _VIEW_RISK_ALIASES: Dict[str, str] = {
@@ -559,7 +642,7 @@ _VIEW_VALUE_ALIASES: Dict[str, str] = {
     "ATTRACTIVE": VIEW_VALUE_CHEAP, "VALUE": VIEW_VALUE_CHEAP,
     "FAIR": VIEW_VALUE_FAIR, "FAIRLY VALUED": VIEW_VALUE_FAIR,
     "FAIRLY_VALUED": VIEW_VALUE_FAIR, "REASONABLE": VIEW_VALUE_FAIR,
-    "NEUTRAL": VIEW_VALUE_FAIR,
+    "NEUTRAL": VIEW_VALUE_FAIR, "FULL": VIEW_VALUE_FAIR,
     "EXPENSIVE": VIEW_VALUE_EXPENSIVE, "OVERVALUED": VIEW_VALUE_EXPENSIVE,
     "RICH": VIEW_VALUE_EXPENSIVE, "PREMIUM": VIEW_VALUE_EXPENSIVE,
     "STRETCHED": VIEW_VALUE_EXPENSIVE,
@@ -612,7 +695,7 @@ def normalize_view_token(value: Any, *, kind: str = "fundamental") -> str:
 
 
 # =============================================================================
-# v7.2.0 Phase B — Module-level classifier with rule_id introspection
+# v7.2.0 Phase B / v8.0.0 Phase D — view classifier with rule_id introspection
 # =============================================================================
 
 def _classify_views_with_rule_id(
@@ -626,16 +709,23 @@ def _classify_views_with_rule_id(
     sector_relative: Any = None,
 ) -> Tuple[Recommendation, str, str]:
     """
-    v7.2.0 Phase B: core view-aware classifier returning rule_id.
+    Core view-aware classifier returning rule_id.
 
-    Implements the priority cascade preserved verbatim from v7.0.0 /
-    v7.1.0. Returns (rec, reason, rule_id) where rule_id is one of the
-    RULE_ID_* string constants for audit/log purposes.
+    v8.0.0: extended from a 5-tier to an 8-tier resolver. The priority
+    cascade preserves every v7.x branch verbatim; the changes are:
 
-    `Recommendation.from_views()` and `recommendation_from_views()`
-    delegate here and discard the rule_id, preserving their v7.1.0
-    return signatures. `recommendation_from_views_with_rule_id()`
-    returns all three fields.
+      - The v7.x "double-bearish -> SELL" branch now ESCALATES to
+        STRONG_SELL when risk is HIGH or score < 25, and to AVOID when the
+        valuation is also EXPENSIVE (uninvestable). Plain double-bearish
+        with neither aggravator still returns SELL exactly as before.
+      - The v7.x "very weak score -> SELL" branch now returns AVOID when
+        score < 15.
+      - A new ACCUMULATE branch sits between BUY and the EXPENSIVE veto:
+        bullish fundamentals + cheap/fair value + neutral technicals with
+        a moderate score band [55, 65).
+
+    Returns (rec, reason, rule_id) where rule_id is one of the RULE_ID_*
+    string constants.
     """
     f = normalize_view_token(fundamental, kind="fundamental")
     t = normalize_view_token(technical, kind="technical")
@@ -662,13 +752,45 @@ def _classify_views_with_rule_id(
             RULE_ID_INSUFFICIENT_DATA_TOO_FEW,
         )
 
-    # ----- Priority 2: HARD SELL ------------------------------------
+    # ----- Priority 2: HARD SELL / STRONG_SELL / AVOID --------------
+    # v8.0.0: the v7.x double-bearish SELL branch now escalates.
     if f == VIEW_FUND_BEARISH and t == VIEW_TECH_BEARISH:
         score_text = f", Score={s_val:.0f}" if s_val is not None else ""
+        # Worst case: double-bearish on an expensive valuation — uninvestable.
+        if v == VIEW_VALUE_EXPENSIVE:
+            return (
+                Recommendation.AVOID,
+                f"Bearish fundamentals AND bearish technicals on an "
+                f"expensive valuation — uninvestable, do not hold or "
+                f"enter{score_text}.",
+                RULE_ID_AVOID_UNINVESTABLE,
+            )
+        # Escalate to STRONG_SELL when high risk or a very weak score
+        # compounds the double-bearish signal.
+        if r == VIEW_RISK_HIGH or (s_val is not None and s_val < 25.0):
+            aggravator = (
+                "high risk" if r == VIEW_RISK_HIGH
+                else f"very weak score ({s_val:.1f})"
+            )
+            return (
+                Recommendation.STRONG_SELL,
+                f"Bearish fundamentals AND bearish technicals compounded "
+                f"by {aggravator} — exit with urgency{score_text}.",
+                RULE_ID_HARD_STRONG_SELL_DOUBLE_BEARISH,
+            )
+        # Plain double-bearish — unchanged from v7.x.
         return (
             Recommendation.SELL,
             f"Bearish fundamentals AND bearish technicals — exit{score_text}.",
             RULE_ID_HARD_SELL_DOUBLE_BEARISH,
+        )
+
+    # v8.0.0: a genuinely uninvestable score floors to AVOID, not SELL.
+    if s_val is not None and s_val < 15.0:
+        return (
+            Recommendation.AVOID,
+            f"Overall score critically low ({s_val:.1f}) — uninvestable.",
+            RULE_ID_AVOID_UNINVESTABLE,
         )
 
     if s_val is not None and s_val < 35.0:
@@ -717,13 +839,11 @@ def _classify_views_with_rule_id(
         final_rec, final_reason = _apply_conviction_floor(
             Recommendation.STRONG_BUY, base_reason, conv_val, sect_val
         )
-        # Derive rule_id from initial -> final transition.
         if final_rec == Recommendation.STRONG_BUY:
             return final_rec, final_reason, RULE_ID_STRONG_BUY_ALL
         elif final_rec == Recommendation.BUY:
             return final_rec, final_reason, RULE_ID_DOWNGRADED_STRONG_BUY_TO_BUY
         elif final_rec == Recommendation.HOLD:
-            # Cascaded: STRONG_BUY -> BUY -> HOLD via both conviction floors.
             return final_rec, final_reason, RULE_ID_DOWNGRADED_STRONG_BUY_TO_HOLD
         else:  # defensive — shouldn't reach here
             return final_rec, final_reason, RULE_ID_STRONG_BUY_ALL
@@ -749,6 +869,33 @@ def _classify_views_with_rule_id(
             return final_rec, final_reason, RULE_ID_DOWNGRADED_BUY_TO_HOLD
         else:  # defensive
             return final_rec, final_reason, RULE_ID_BUY_BULLISH_FUND
+
+    # ----- Priority 5b: ACCUMULATE (v8.0.0) -------------------------
+    # Good thesis, non-urgent entry: bullish fundamentals + acceptable
+    # (cheap/fair) valuation + non-bearish technicals, but the score sits
+    # in the moderate [55, 65) band — not strong enough for a full BUY.
+    # This is the "scale in" call that v7.x had to round to BUY or HOLD.
+    is_accumulate = (
+        f == VIEW_FUND_BULLISH
+        and v in (VIEW_VALUE_CHEAP, VIEW_VALUE_FAIR)
+        and t in (VIEW_TECH_BULLISH, VIEW_TECH_NEUTRAL)
+        and s_val is not None and 55.0 <= s_val < 65.0
+    )
+    if is_accumulate:
+        base_reason = (
+            f"Bullish fundamentals on acceptable valuation, but a moderate "
+            f"overall score (Score={s_val:.1f}) argues for scaling in "
+            f"rather than a full position."
+        )
+        final_rec, final_reason = _apply_conviction_floor(
+            Recommendation.ACCUMULATE, base_reason, conv_val, sect_val
+        )
+        if final_rec == Recommendation.ACCUMULATE:
+            return final_rec, final_reason, RULE_ID_ACCUMULATE_BULLISH_MODERATE
+        elif final_rec == Recommendation.HOLD:
+            return final_rec, final_reason, RULE_ID_DOWNGRADED_ACCUMULATE_TO_HOLD
+        else:  # defensive
+            return final_rec, final_reason, RULE_ID_ACCUMULATE_BULLISH_MODERATE
 
     # Special-case BUY veto explanation: bullish fundamentals but
     # valuation says EXPENSIVE -> HOLD with clear reason.
@@ -789,19 +936,20 @@ def recommendation_from_views(
     risk: Any = None,
     value: Any = None,
     score: Any = None,
-    conviction: Any = None,        # v7.1.0
-    sector_relative: Any = None,   # v7.1.0
+    conviction: Any = None,
+    sector_relative: Any = None,
 ) -> Tuple[str, str]:
     """
     Free-function wrapper around `Recommendation.from_views()`.
 
     Returns:
-        (canonical_string, reason_text). canonical_string is one of
-        STRONG_BUY / BUY / HOLD / REDUCE / SELL.
+        (canonical_string, reason_text). canonical_string is one of the
+        eight canonical tiers (STRONG_BUY / BUY / ACCUMULATE / HOLD /
+        REDUCE / SELL / STRONG_SELL / AVOID).
 
-    v7.2.0: internally delegates to `_classify_views_with_rule_id()` and
-    discards the rule_id. For audit-style callers that need the rule_id,
-    use `recommendation_from_views_with_rule_id()` instead.
+    Internally delegates to `_classify_views_with_rule_id()` and discards
+    the rule_id. For audit-style callers that need the rule_id, use
+    `recommendation_from_views_with_rule_id()` instead.
     """
     rec, reason, _rule_id = _classify_views_with_rule_id(
         fundamental=fundamental,
@@ -825,31 +973,22 @@ def recommendation_from_views_with_rule_id(
     sector_relative: Any = None,
 ) -> Tuple[str, str, str]:
     """
-    v7.2.0 Phase B: as `recommendation_from_views()` but additionally
-    returns a stable rule_id string identifying exactly which branch of
-    the classifier fired.
+    As `recommendation_from_views()` but additionally returns a stable
+    rule_id string identifying exactly which branch of the classifier fired.
 
     Returns:
         (canonical_string, reason_text, rule_id)
-        - canonical_string ∈ {STRONG_BUY, BUY, HOLD, REDUCE, SELL}
+        - canonical_string ∈ the 8 canonical tiers
         - reason_text: human-readable explanation
-        - rule_id: one of the RULE_ID_* constants (e.g.
-          "STRONG_BUY_ALL_CONDITIONS", "REDUCE_BEARISH_FUNDAMENTAL",
-          "STRONG_BUY_DOWNGRADED_BUY_LOW_CONVICTION").
+        - rule_id: one of the RULE_ID_* constants.
 
     Useful for:
-      - Audit logs: track distribution of which rule fires across the
+      - Audit logs: track the distribution of which rule fires across the
         universe to spot rule-coverage gaps.
       - Sheet-level diagnostics: surface the rule_id alongside the
         recommendation for operator review.
       - Debugging: distinguish "rule fired AND was downgraded" from
         "different rule fired entirely".
-
-    All v7.1.0 conviction-floor behavior is preserved. A
-    `STRONG_BUY_DOWNGRADED_BUY_LOW_CONVICTION` rule_id, for example,
-    means the input qualified for STRONG_BUY by view conjunction but
-    was downgraded to BUY by the conviction floor — the audit can see
-    both facts without parsing prose.
     """
     rec, reason, rule_id = _classify_views_with_rule_id(
         fundamental=fundamental,
@@ -864,7 +1003,7 @@ def recommendation_from_views_with_rule_id(
 
 
 # =============================================================================
-# Constants (preserved verbatim from v6.1.0 / v7.0.0, with v7.2.0 Phase E fix)
+# Constants (preserved from v7.2.1, extended for the 8-tier vocabulary)
 # =============================================================================
 
 _RECO_ENUM = frozenset({r.value for r in Recommendation})
@@ -882,20 +1021,38 @@ _NO_RATING: Set[str] = {
 _STRONG_BUY_LIKE: Set[str] = {
     "STRONG BUY", "CONVICTION BUY", "HIGH CONVICTION BUY", "BUY STRONG",
     "TOP PICK", "BEST IDEA", "HIGHLY RECOMMENDED BUY", "BUY (STRONG)",
-    "STRONG BUY RECOMMENDATION", "MUST BUY", "STRONG ACCUMULATE", "FOCUS BUY",
+    "STRONG BUY RECOMMENDATION", "MUST BUY", "FOCUS BUY",
+}
+
+# v8.0.0: "ACCUMULATE"-family text now resolves to the ACCUMULATE tier
+# instead of collapsing into BUY. "STRONG ACCUMULATE" stays in
+# _STRONG_BUY_LIKE (it is a high-conviction call, not a scale-in).
+_ACCUMULATE_LIKE: Set[str] = {
+    "ACCUMULATE", "ACCUMULATION", "SCALE IN", "SCALE-IN", "SCALING IN",
+    "START A POSITION", "START POSITION", "BUILD A POSITION",
+    "BUILD POSITION", "BEGIN ACCUMULATING", "PHASE IN", "AVERAGE IN",
+    "GRADUAL BUY", "STAGED BUY", "PARTIAL BUY", "NIBBLE",
 }
 
 _STRONG_SELL_LIKE: Set[str] = {
     "STRONG SELL", "SELL (STRONG)", "SELL STRONG", "EXIT IMMEDIATELY",
     "STRONG SELL RECOMMENDATION", "MUST SELL", "URGENT SELL", "FORCED EXIT",
-    "LIQUIDATE ALL",
+    "LIQUIDATE ALL", "DUMP", "FULL EXIT",
+}
+
+# v8.0.0: "AVOID"-family text now resolves to the AVOID tier instead of
+# collapsing into SELL. AVOID == "do not hold and do not enter".
+_AVOID_LIKE: Set[str] = {
+    "AVOID", "AVOIDANCE", "DO NOT BUY", "DO NOT ENTER", "DO NOT INVEST",
+    "STAY AWAY", "UNINVESTABLE", "NOT INVESTABLE", "BLACKLIST",
+    "BLACKLISTED", "NEVER BUY", "STEER CLEAR", "NO-GO", "NO GO",
 }
 
 _BUY_LIKE: Set[str] = {
-    "BUY", "ACCUMULATE", "ADD", "OUTPERFORM", "MARKET OUTPERFORM",
+    "BUY", "ADD", "OUTPERFORM", "MARKET OUTPERFORM",
     "SECTOR OUTPERFORM", "OVERWEIGHT", "INCREASE", "UPGRADE", "LONG",
     "BULLISH", "POSITIVE", "BUYING", "SPECULATIVE BUY", "RECOMMENDED BUY",
-    "BUY ON DIPS", "BUY RECOMMENDATION", "ACCUMULATION", "BUILT", "POSITION",
+    "BUY ON DIPS", "BUY RECOMMENDATION", "BUILT", "POSITION",
 }
 
 _HOLD_LIKE: Set[str] = {
@@ -913,17 +1070,27 @@ _REDUCE_LIKE: Set[str] = {
 }
 
 _SELL_LIKE: Set[str] = {
-    "SELL", "EXIT", "AVOID", "UNDERPERFORM", "MARKET UNDERPERFORM",
+    "SELL", "EXIT", "UNDERPERFORM", "MARKET UNDERPERFORM",
     "SECTOR UNDERPERFORM", "SHORT", "BEARISH", "NEGATIVE", "SELLING",
     "DOWNGRADE", "RED FLAG", "LIQUIDATE", "CLOSE POSITION", "UNWIND",
-    "SELL RECOMMENDATION", "AVOIDANCE", "EXIT POSITION",
+    "SELL RECOMMENDATION", "EXIT POSITION",
 }
 
+# --- Arabic --------------------------------------------------------------
 _AR_BUY: Set[str] = {
-    "شراء", "اشتر", "اشترى", "اشترِ", "تجميع", "زيادة", "ايجابي", "ايجابى",
+    "شراء", "اشتر", "اشترى", "اشترِ", "زيادة", "ايجابي", "ايجابى",
     "فرصة شراء", "اداء متفوق", "زيادة المراكز", "توصية شراء", "توصية بالشراء",
-    "شراء قوي", "شراء قوى", "احتفاظ مع ميل للشراء", "زيادة التعرض", "تعزيز المراكز",
-    "شراء مكثف", "تراكم", "مضاعفة", "تفوق", "متفوق", "زيادة وزن", "فرصة استثمارية",
+    "احتفاظ مع ميل للشراء", "زيادة التعرض", "تعزيز المراكز",
+    "مضاعفة", "تفوق", "متفوق", "زيادة وزن", "فرصة استثمارية",
+}
+
+_AR_STRONG_BUY: Set[str] = {
+    "شراء قوي", "شراء قوى", "شراء مكثف", "توصية شراء قوية", "شراء بقوة",
+}
+
+_AR_ACCUMULATE: Set[str] = {
+    "تجميع", "تراكم", "بناء مركز", "بناء المركز", "شراء تدريجي",
+    "تجميع تدريجي", "دخول تدريجي", "شراء جزئي",
 }
 
 _AR_HOLD: Set[str] = {
@@ -939,15 +1106,33 @@ _AR_REDUCE: Set[str] = {
 }
 
 _AR_SELL: Set[str] = {
-    "بيع", "تخارج", "سلبي", "سلبى", "تجنب", "خروج", "بيع قوي", "بيع قوى",
+    "بيع", "تخارج", "سلبي", "سلبى", "خروج",
     "توصية بيع", "توصية بالبيع", "اداء اقل", "اداء أقل", "تصفية", "الخروج من السهم",
-    "بيع كلي", "تسييل", "تخلص من", "تجنب تماما",
+    "بيع كلي", "تسييل", "تخلص من",
 }
 
+_AR_STRONG_SELL: Set[str] = {
+    "بيع قوي", "بيع قوى", "خروج فوري", "بيع بقوة", "تصفية كاملة",
+    "توصية بيع قوية", "خروج عاجل",
+}
+
+_AR_AVOID: Set[str] = {
+    "تجنب", "تجنب تماما", "ابتعد", "غير قابل للاستثمار", "لا تشتري",
+    "تجنب الشراء", "ابتعد عن",
+}
+
+# --- French --------------------------------------------------------------
 _FR_BUY: Set[str] = {
-    "ACHETER", "ACHAT", "ACCUMULER", "RENFORCER", "SURPERFORMER", "SURPERFORMANCE",
-    "POSITIF", "BULLISH", "RECOMMANDATION D'ACHAT", "ACHAT FORT", "ACHAT SOLIDE",
-    "ACCUMULATION", "AJOUTER", "SURPONDÉRER", "HAUSSIER",
+    "ACHETER", "ACHAT", "RENFORCER", "SURPERFORMER", "SURPERFORMANCE",
+    "POSITIF", "BULLISH", "RECOMMANDATION D'ACHAT", "AJOUTER",
+    "SURPONDÉRER", "HAUSSIER",
+}
+_FR_STRONG_BUY: Set[str] = {
+    "ACHAT FORT", "ACHAT SOLIDE", "ACHETER FORTEMENT", "FORTE CONVICTION",
+}
+_FR_ACCUMULATE: Set[str] = {
+    "ACCUMULER", "ACCUMULATION", "CONSTRUIRE UNE POSITION", "ENTRÉE PROGRESSIVE",
+    "ACHAT PROGRESSIF", "ACHAT ÉCHELONNÉ",
 }
 _FR_HOLD: Set[str] = {
     "CONSERVER", "GARDER", "NEUTRE", "MAINTENIR", "STABLE", "EN LIGNE",
@@ -960,15 +1145,29 @@ _FR_REDUCE: Set[str] = {
     "VENDRE PARTIELLEMENT", "ALLÉGEMENT",
 }
 _FR_SELL: Set[str] = {
-    "VENDRE", "CÉDER", "ÉVITER", "SOUS-PERFORMER", "SOUS-PERFORMANCE",
-    "BAISSIER", "NÉGATIF", "SORTIR", "LIQUIDER", "VENDRE FORT",
+    "VENDRE", "CÉDER", "SOUS-PERFORMER", "SOUS-PERFORMANCE",
+    "BAISSIER", "NÉGATIF", "SORTIR", "LIQUIDER",
     "RECOMMANDATION DE VENTE", "VENTE", "DÉGRADER",
 }
+_FR_STRONG_SELL: Set[str] = {
+    "VENDRE FORT", "VENTE FORTE", "SORTIE IMMÉDIATE", "LIQUIDER TOUT",
+}
+_FR_AVOID: Set[str] = {
+    "ÉVITER", "À ÉVITER", "NE PAS ACHETER", "RESTER À L'ÉCART", "PROSCRIRE",
+}
 
+# --- Spanish -------------------------------------------------------------
 _ES_BUY: Set[str] = {
-    "COMPRAR", "ACUMULAR", "SOBREPONDERAR", "SOBRERENDIMIENTO", "POSITIVO",
-    "ALCISTA", "COMPRA", "RECOMENDACIÓN DE COMPRA", "COMPRA FUERTE",
+    "COMPRAR", "SOBREPONDERAR", "SOBRERENDIMIENTO", "POSITIVO",
+    "ALCISTA", "COMPRA", "RECOMENDACIÓN DE COMPRA",
     "AÑADIR", "INCREMENTAR", "SUPERAR", "OUTPERFORM",
+}
+_ES_STRONG_BUY: Set[str] = {
+    "COMPRA FUERTE", "COMPRAR FUERTE", "ALTA CONVICCIÓN", "COMPRA DECIDIDA",
+}
+_ES_ACCUMULATE: Set[str] = {
+    "ACUMULAR", "ACUMULACIÓN", "CONSTRUIR POSICIÓN", "ENTRADA GRADUAL",
+    "COMPRA ESCALONADA", "COMPRA GRADUAL",
 }
 _ES_HOLD: Set[str] = {
     "MANTENER", "CONSERVAR", "NEUTRAL", "NEUTRO", "ESPERAR", "MONITOREAR",
@@ -981,15 +1180,29 @@ _ES_REDUCE: Set[str] = {
     "RECORTAR", "DISMINUCIÓN",
 }
 _ES_SELL: Set[str] = {
-    "VENDER", "EVITAR", "BAJISTA", "NEGATIVO", "SALIR", "LIQUIDAR",
+    "VENDER", "BAJISTA", "NEGATIVO", "SALIR", "LIQUIDAR",
     "BAJO RENDIMIENTO", "RENDIMIENTO INFERIOR", "VENTA", "DESHACERSE",
-    "RECOMENDACIÓN DE VENTA", "VENTA FUERTE",
+    "RECOMENDACIÓN DE VENTA",
+}
+_ES_STRONG_SELL: Set[str] = {
+    "VENTA FUERTE", "VENDER FUERTE", "SALIDA INMEDIATA", "LIQUIDAR TODO",
+}
+_ES_AVOID: Set[str] = {
+    "EVITAR", "A EVITAR", "NO COMPRAR", "MANTENERSE ALEJADO", "NO INVERTIR",
 }
 
+# --- German --------------------------------------------------------------
 _DE_BUY: Set[str] = {
-    "KAUFEN", "KAUF", "AKKUMULIEREN", "AUFSTOCKEN", "ÜBERGEWICHTEN",
-    "OUTPERFORM", "POSITIV", "BULLISH", "KAUFEMPFEHLUNG", "STARKER KAUF",
+    "KAUFEN", "KAUF", "AUFSTOCKEN", "ÜBERGEWICHTEN",
+    "OUTPERFORM", "POSITIV", "BULLISH", "KAUFEMPFEHLUNG",
     "HINZUFÜGEN", "ERHÖHEN", "ÜBERTREFFEN",
+}
+_DE_STRONG_BUY: Set[str] = {
+    "STARKER KAUF", "STARK KAUFEN", "HOHE ÜBERZEUGUNG", "KLARER KAUF",
+}
+_DE_ACCUMULATE: Set[str] = {
+    "AKKUMULIEREN", "AKKUMULATION", "POSITION AUFBAUEN", "SCHRITTWEISER EINSTIEG",
+    "GESTAFFELTER KAUF", "SCHRITTWEISE KAUFEN",
 }
 _DE_HOLD: Set[str] = {
     "HALTEN", "BEHALTEN", "NEUTRAL", "MARKTGEWICHT", "ABWARTEN", "BEOBACHTEN",
@@ -1001,15 +1214,30 @@ _DE_REDUCE: Set[str] = {
     "VERMINDERN", "ZURÜCKFAHREN",
 }
 _DE_SELL: Set[str] = {
-    "VERKAUFEN", "VERKAUF", "VERMEIDEN", "UNTERPERFORM", "BAISSIST", "NEGATIV",
-    "AUSSTEIGEN", "LIQUIDIEREN", "VERKAUFSEMPFEHLUNG", "STARKER VERKAUF",
-    "ABSTOSSEN", "REDUZIEREN AUF NULL",
+    "VERKAUFEN", "VERKAUF", "UNTERPERFORM", "BAISSIST", "NEGATIV",
+    "AUSSTEIGEN", "LIQUIDIEREN", "VERKAUFSEMPFEHLUNG",
+    "ABSTOSSEN",
+}
+_DE_STRONG_SELL: Set[str] = {
+    "STARKER VERKAUF", "STARK VERKAUFEN", "SOFORTIGER AUSSTIEG",
+    "ALLES LIQUIDIEREN",
+}
+_DE_AVOID: Set[str] = {
+    "VERMEIDEN", "ZU VERMEIDEN", "NICHT KAUFEN", "FERNBLEIBEN", "MEIDEN",
 }
 
+# --- Portuguese ----------------------------------------------------------
 _PT_BUY: Set[str] = {
-    "COMPRAR", "ACUMULAR", "SOBREPONDERAR", "OUTPERFORM", "POSITIVO",
-    "ALCISTA", "COMPRA", "RECOMENDAÇÃO DE COMPRA", "COMPRA FORTE",
-    "ADICIONAR", "AUMENTAR", "SUPERAR", "ACUMULAÇÃO",
+    "COMPRAR", "SOBREPONDERAR", "OUTPERFORM", "POSITIVO",
+    "ALCISTA", "COMPRA", "RECOMENDAÇÃO DE COMPRA",
+    "ADICIONAR", "AUMENTAR", "SUPERAR",
+}
+_PT_STRONG_BUY: Set[str] = {
+    "COMPRA FORTE", "COMPRAR FORTE", "ALTA CONVICÇÃO", "COMPRA DECIDIDA",
+}
+_PT_ACCUMULATE: Set[str] = {
+    "ACUMULAR", "ACUMULAÇÃO", "CONSTRUIR POSIÇÃO", "ENTRADA GRADUAL",
+    "COMPRA ESCALONADA", "COMPRA GRADUAL",
 }
 _PT_HOLD: Set[str] = {
     "MANTER", "CONSERVAR", "NEUTRO", "AGUARDAR", "MONITORAR",
@@ -1022,15 +1250,27 @@ _PT_REDUCE: Set[str] = {
     "CORTAR", "REDUÇÃO", "COLHER LUCROS",
 }
 _PT_SELL: Set[str] = {
-    "VENDER", "EVITAR", "BAIXISTA", "NEGATIVO", "SAIR", "LIQUIDAR",
+    "VENDER", "BAIXISTA", "NEGATIVO", "SAIR", "LIQUIDAR",
     "DESEMPENHO INFERIOR", "SUBPERFORM", "VENDA", "LIVRAR-SE",
-    "RECOMENDAÇÃO DE VENTA", "VENDA FORTE", "LIQUIDAÇÃO",
+    "RECOMENDAÇÃO DE VENTA",
+}
+_PT_STRONG_SELL: Set[str] = {
+    "VENDA FORTE", "VENDER FORTE", "SAÍDA IMEDIATA", "LIQUIDAR TUDO",
+    "LIQUIDAÇÃO",
+}
+_PT_AVOID: Set[str] = {
+    "EVITAR", "A EVITAR", "NÃO COMPRAR", "MANTER DISTÂNCIA", "NÃO INVESTIR",
 }
 
+# Aggregated multilingual sets (v8.0.0: now 8 tiers wide).
+_LANG_STRONG_BUY = _FR_STRONG_BUY | _ES_STRONG_BUY | _DE_STRONG_BUY | _PT_STRONG_BUY
 _LANG_BUY = _FR_BUY | _ES_BUY | _DE_BUY | _PT_BUY
+_LANG_ACCUMULATE = _FR_ACCUMULATE | _ES_ACCUMULATE | _DE_ACCUMULATE | _PT_ACCUMULATE
 _LANG_HOLD = _FR_HOLD | _ES_HOLD | _DE_HOLD | _PT_HOLD
 _LANG_REDUCE = _FR_REDUCE | _ES_REDUCE | _DE_REDUCE | _PT_REDUCE
 _LANG_SELL = _FR_SELL | _ES_SELL | _DE_SELL | _PT_SELL
+_LANG_STRONG_SELL = _FR_STRONG_SELL | _ES_STRONG_SELL | _DE_STRONG_SELL | _PT_STRONG_SELL
+_LANG_AVOID = _FR_AVOID | _ES_AVOID | _DE_AVOID | _PT_AVOID
 
 _VENDOR_FIELDS: Dict[str, List[str]] = {
     "default": [
@@ -1118,30 +1358,77 @@ _SCORE_FIELDS: List[str] = [
     "opportunity_score",
 ]
 
-# v7.2.0 Phase E (BUG FIX): removed "AVOID" and "AGAINST" from the negate
-# pattern. They are recommendation/sentiment words, not negation operators:
-#   - "AVOID" alone is a SELL signal (already classified by _PAT_SELL).
-#     With AVOID in NEGATE, _apply_negation downgraded its own SELL to
-#     REDUCE — a self-contradicting outcome.
-#   - "AGAINST" alone is a bearish sentiment signal handled by the
-#     fall-through sentiment analyzer. It was never reaching the negate
-#     branch productively (no preceding BUY/SELL/HOLD recommendation for
-#     it to negate in typical phrasing).
-# Phrases like "DO NOT AVOID THIS" still negate correctly because NOT is
-# preserved as the canonical negator.
+# v7.2.0 Phase E (BUG FIX, preserved): "AVOID" and "AGAINST" are NOT in the
+# negate pattern. They are recommendation/sentiment words, not negation
+# operators. "AVOID" alone is an AVOID-tier signal (v8.0.0); with AVOID in
+# NEGATE, _apply_negation would downgrade its own call. Phrases like
+# "DO NOT AVOID THIS" still negate correctly because NOT is the canonical
+# negator.
 _PAT_NEGATE = re.compile(
     r"\b(?:NOT|NO|NEVER|WITHOUT|HARDLY|RARELY|UNLIKELY)\b",
     re.IGNORECASE,
 )
-_PAT_NEGATION_CONTEXT = re.compile(r"(?:NOT|NO|NEVER)\s+(?:A\s+|AN\s+)?(STRONG\s+)?(BUY|SELL|HOLD|REDUCE)", re.IGNORECASE)
+_PAT_NEGATION_CONTEXT = re.compile(
+    r"(?:NOT|NO|NEVER)\s+(?:A\s+|AN\s+)?(STRONG\s+)?(BUY|SELL|HOLD|REDUCE|ACCUMULATE|AVOID)",
+    re.IGNORECASE,
+)
 
-_PAT_STRONG_BUY = re.compile(r"\b(?:STRONG\s+BUY|CONVICTION\s+BUY|TOP\s+PICK|BEST\s+IDEA|MUST\s+BUY|FOCUS\s+BUY)\b", re.IGNORECASE)
-_PAT_STRONG_SELL = re.compile(r"\b(?:STRONG\s+SELL|EXIT\s+IMMEDIATELY|MUST\s+SELL|URGENT\s+SELL)\b", re.IGNORECASE)
+_PAT_STRONG_BUY = re.compile(
+    r"\b(?:STRONG\s+BUY|CONVICTION\s+BUY|TOP\s+PICK|BEST\s+IDEA|MUST\s+BUY|FOCUS\s+BUY)\b",
+    re.IGNORECASE,
+)
+_PAT_STRONG_SELL = re.compile(
+    r"\b(?:STRONG\s+SELL|EXIT\s+IMMEDIATELY|MUST\s+SELL|URGENT\s+SELL|LIQUIDATE\s+ALL|FULL\s+EXIT)\b",
+    re.IGNORECASE,
+)
+# v8.0.0: dedicated patterns for the two new tiers.
+_PAT_ACCUMULATE = re.compile(
+    r"\b(?:ACCUMULATE|ACCUMULATION|SCALE[\s-]?IN|SCALING\s+IN|START\s+(?:A\s+)?POSITION|"
+    r"BUILD\s+(?:A\s+)?POSITION|PHASE\s+IN|AVERAGE\s+IN|GRADUAL\s+BUY|STAGED\s+BUY|PARTIAL\s+BUY)\b",
+    re.IGNORECASE,
+)
+_PAT_AVOID = re.compile(
+    r"\b(?:AVOID|AVOIDANCE|DO\s+NOT\s+BUY|DO\s+NOT\s+ENTER|DO\s+NOT\s+INVEST|"
+    r"STAY\s+AWAY|UNINVESTABLE|NOT\s+INVESTABLE|BLACKLIST(?:ED)?|NEVER\s+BUY|"
+    r"STEER\s+CLEAR|NO[\s-]?GO)\b",
+    re.IGNORECASE,
+)
+# v8.0.0: detects a genuine negation OF the AVOID call itself ("not avoid",
+# "no longer avoid", "never avoid"). This is deliberately distinct from the
+# AVOID idioms inside _PAT_AVOID ("DO NOT BUY" / "NEVER BUY" / "DO NOT
+# ENTER" ...), where the embedded NOT/NEVER is intrinsic to the AVOID
+# meaning and must NOT be treated as a negation. Without this distinction,
+# _apply_negation reads the "NOT BUY" inside "DO NOT BUY" as a negated BUY
+# and wrongly flattens a clear AVOID idiom to HOLD.
+_PAT_AVOID_NEGATED = re.compile(
+    r"\b(?:NOT|NO\s+LONGER|NEVER)\s+(?:TO\s+)?AVOID(?:ANCE|ING)?\b",
+    re.IGNORECASE,
+)
 
-_PAT_SELL = re.compile(r"\b(?:SELL|EXIT|AVOID|UNDERPERFORM|MARKET\s+UNDERPERFORM|SECTOR\s+UNDERPERFORM|SHORT|BEARISH|NEGATIVE|SELLING|DOWNGRADE|RED\s+FLAG|LIQUIDATE|CLOSE\s+POSITION|UNWIND|SELL\s+RECOMMENDATION|AVOIDANCE|EXIT\s+POSITION)\b", re.IGNORECASE)
-_PAT_REDUCE = re.compile(r"\b(?:REDUCE|TRIM|LIGHTEN|PARTIAL\s+SELL|TAKE\s+PROFIT|TAKE\s+PROFITS|UNDERWEIGHT|DECREASE|WEAKEN|CAUTIOUS|PROFIT\s+TAKING|SELL\s+STRENGTH|TRIM\s+POSITION|REDUCE\s+EXPOSURE|PARTIAL\s+EXIT|REDUCE\s+WEIGHT|CUT\s+POSITION|LESSEN|SCALE\s+BACK)\b", re.IGNORECASE)
-_PAT_HOLD = re.compile(r"\b(?:HOLD|NEUTRAL|MAINTAIN|UNCHANGED|MARKET\s+PERFORM|SECTOR\s+PERFORM|IN\s+LINE|EQUAL\s+WEIGHT|EQUALWEIGHT|FAIR\s+VALUE|FAIRLY\s+VALUED|WAIT|KEEP|STABLE|WATCH|MONITOR|NO\s+ACTION|PERFORM|HOLD\s+RECOMMENDATION|HOLDING|KEEP\s+POSITION|NO\s+CHANGE)\b", re.IGNORECASE)
-_PAT_BUY = re.compile(r"\b(?:BUY|ACCUMULATE|ADD|OUTPERFORM|MARKET\s+OUTPERFORM|SECTOR\s+OUTPERFORM|OVERWEIGHT|INCREASE|UPGRADE|LONG|BULLISH|POSITIVE|BUYING|SPECULATIVE\s+BUY|RECOMMENDED\s+BUY|BUY\s+ON\s+DIPS|BUY\s+RECOMMENDATION|ACCUMULATION|BUILT|POSITION)\b", re.IGNORECASE)
+_PAT_SELL = re.compile(
+    r"\b(?:SELL|EXIT|UNDERPERFORM|MARKET\s+UNDERPERFORM|SECTOR\s+UNDERPERFORM|SHORT|"
+    r"BEARISH|NEGATIVE|SELLING|DOWNGRADE|RED\s+FLAG|LIQUIDATE|CLOSE\s+POSITION|UNWIND|"
+    r"SELL\s+RECOMMENDATION|EXIT\s+POSITION)\b",
+    re.IGNORECASE,
+)
+_PAT_REDUCE = re.compile(
+    r"\b(?:REDUCE|TRIM|LIGHTEN|PARTIAL\s+SELL|TAKE\s+PROFIT|TAKE\s+PROFITS|UNDERWEIGHT|"
+    r"DECREASE|WEAKEN|CAUTIOUS|PROFIT\s+TAKING|SELL\s+STRENGTH|TRIM\s+POSITION|"
+    r"REDUCE\s+EXPOSURE|PARTIAL\s+EXIT|REDUCE\s+WEIGHT|CUT\s+POSITION|LESSEN|SCALE\s+BACK)\b",
+    re.IGNORECASE,
+)
+_PAT_HOLD = re.compile(
+    r"\b(?:HOLD|NEUTRAL|MAINTAIN|UNCHANGED|MARKET\s+PERFORM|SECTOR\s+PERFORM|IN\s+LINE|"
+    r"EQUAL\s+WEIGHT|EQUALWEIGHT|FAIR\s+VALUE|FAIRLY\s+VALUED|WAIT|KEEP|STABLE|WATCH|"
+    r"MONITOR|NO\s+ACTION|PERFORM|HOLD\s+RECOMMENDATION|HOLDING|KEEP\s+POSITION|NO\s+CHANGE)\b",
+    re.IGNORECASE,
+)
+_PAT_BUY = re.compile(
+    r"\b(?:BUY|ADD|OUTPERFORM|MARKET\s+OUTPERFORM|SECTOR\s+OUTPERFORM|OVERWEIGHT|INCREASE|"
+    r"UPGRADE|LONG|BULLISH|POSITIVE|BUYING|SPECULATIVE\s+BUY|RECOMMENDED\s+BUY|"
+    r"BUY\s+ON\s+DIPS|BUY\s+RECOMMENDATION|BUILT|POSITION)\b",
+    re.IGNORECASE,
+)
 
 _PAT_RATING_HINT = re.compile(r"\b(?:RATING|SCORE|RANK|RECOMMENDATION|CONSENSUS|STARS|STAR)\b", re.IGNORECASE)
 _PAT_RATIO = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:/|OF|OUT\s+OF)\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
@@ -1392,10 +1679,19 @@ def _normalize_text(text: str) -> str:
 
 
 # =============================================================================
-# Numeric Rating Parsing (preserved from v6.1.0)
+# Numeric Rating Parsing (re-banded for 8 tiers in v8.0.0)
 # =============================================================================
 
 def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tuple[str, float]]:
+    """
+    Parse an embedded numeric rating into (canonical_tier, confidence).
+
+    v8.0.0: the 0-100 and 0-1 paths resolve into the full 8-tier space.
+    The 1-5 / 1-3 star paths stay coarse — a 5-star or 3-point scale
+    genuinely cannot express 8 distinct tiers — but use the wider
+    vocabulary where the integer cleanly implies it (e.g. a 1/5 is a
+    STRONG_BUY, a 5/5 is a STRONG_SELL).
+    """
     if not text:
         return None
 
@@ -1420,13 +1716,22 @@ def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tup
                 else:
                     normalized = x
 
-                if normalized <= 2.0:
+                # normalized is on a 1 (best) .. 5 (worst) scale.
+                if normalized <= 1.25:
+                    return (Recommendation.STRONG_BUY.value, 0.9)
+                if normalized <= 1.9:
                     return (Recommendation.BUY.value, 0.9)
-                if normalized <= 3.0:
-                    return (Recommendation.HOLD.value, 0.7)
-                if normalized <= 4.0:
-                    return (Recommendation.REDUCE.value, 0.7)
-                return (Recommendation.SELL.value, 0.9)
+                if normalized <= 2.5:
+                    return (Recommendation.ACCUMULATE.value, 0.8)
+                if normalized <= 3.25:
+                    return (Recommendation.HOLD.value, 0.8)
+                if normalized <= 3.9:
+                    return (Recommendation.REDUCE.value, 0.8)
+                if normalized <= 4.5:
+                    return (Recommendation.SELL.value, 0.9)
+                if normalized <= 4.85:
+                    return (Recommendation.STRONG_SELL.value, 0.9)
+                return (Recommendation.AVOID.value, 0.9)
         except Exception:
             pass
 
@@ -1443,16 +1748,20 @@ def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tup
     scale_3 = _PAT_SCALE_3.search(su)
     has_hint = _PAT_RATING_HINT.search(su) if context_hints else True
 
+    # 1-5 integer scale: coarse, but the extremes map to the strong tiers.
     if 1.0 <= num <= 5.0 and (has_hint or scale_5):
         n = int(round(num))
-        if n <= 2:
+        if n == 1:
+            return (Recommendation.STRONG_BUY.value, 0.85)
+        if n == 2:
             return (Recommendation.BUY.value, 0.85)
         if n == 3:
             return (Recommendation.HOLD.value, 0.85)
         if n == 4:
             return (Recommendation.REDUCE.value, 0.85)
-        return (Recommendation.SELL.value, 0.85)
+        return (Recommendation.STRONG_SELL.value, 0.85)  # n == 5
 
+    # 1-3 integer scale: too coarse for 8 tiers — map to representative anchors.
     if 1.0 <= num <= 3.0 and (has_hint or scale_3):
         n = int(round(num))
         if n == 1:
@@ -1461,30 +1770,60 @@ def _parse_numeric_rating(text: str, context_hints: bool = True) -> Optional[Tup
             return (Recommendation.HOLD.value, 0.8)
         return (Recommendation.SELL.value, 0.8)
 
+    # 0-100 scale: full 8-tier resolution, matching Recommendation.from_score.
     if 0.0 <= num <= 100.0 and has_hint:
+        if num >= 85.0:
+            return (Recommendation.STRONG_BUY.value, 0.8)
         if num >= 70.0:
-            return (Recommendation.BUY.value, 0.75)
+            return (Recommendation.BUY.value, 0.78)
+        if num >= 60.0:
+            return (Recommendation.ACCUMULATE.value, 0.72)
         if num >= 45.0:
             return (Recommendation.HOLD.value, 0.6)
-        return (Recommendation.SELL.value, 0.75)
+        if num >= 35.0:
+            return (Recommendation.REDUCE.value, 0.72)
+        if num >= 25.0:
+            return (Recommendation.SELL.value, 0.78)
+        if num >= 15.0:
+            return (Recommendation.STRONG_SELL.value, 0.8)
+        return (Recommendation.AVOID.value, 0.8)
 
+    # 0-1 scale: lower-confidence, but still 8-tier aware.
     if 0.0 <= num <= 1.0 and has_hint:
+        if num >= 0.85:
+            return (Recommendation.STRONG_BUY.value, 0.55)
         if num >= 0.7:
-            return (Recommendation.BUY.value, 0.5)
+            return (Recommendation.BUY.value, 0.52)
+        if num >= 0.6:
+            return (Recommendation.ACCUMULATE.value, 0.48)
         if num >= 0.45:
             return (Recommendation.HOLD.value, 0.4)
-        return (Recommendation.SELL.value, 0.5)
+        if num >= 0.35:
+            return (Recommendation.REDUCE.value, 0.48)
+        if num >= 0.25:
+            return (Recommendation.SELL.value, 0.52)
+        if num >= 0.15:
+            return (Recommendation.STRONG_SELL.value, 0.55)
+        return (Recommendation.AVOID.value, 0.55)
 
     return None
 
 
 def _apply_negation(text: str, reco: str) -> str:
     """
-    v7.2.0 NOTE: after Phase E removed "AVOID" and "AGAINST" from
-    _PAT_NEGATE, this helper now correctly leaves a SELL-from-AVOID
-    classification untouched. The negation logic only fires on actual
-    negators (NOT/NO/NEVER/WITHOUT/HARDLY/RARELY/UNLIKELY) plus the
-    NEGATION_CONTEXT regex.
+    Apply negation logic to a parsed recommendation.
+
+    v8.0.0: extended for the wider vocabulary.
+      - An explicit negation-context match ("NOT A BUY", "NEVER SELL", ...)
+        flattens to HOLD, as before.
+      - A bare negator near a directional call softens it one step toward
+        the centre: STRONG_BUY -> BUY, BUY/ACCUMULATE -> HOLD,
+        SELL -> REDUCE, STRONG_SELL -> SELL, AVOID -> SELL.
+      - REDUCE / HOLD are already central/protective and pass through.
+
+    Preserves v7.2.0 Phase E: "AVOID"/"AGAINST" are not negators, so an
+    AVOID-from-"AVOID" classification is never spuriously softened by its
+    own keyword.
     """
     if not text or not reco:
         return reco
@@ -1493,10 +1832,16 @@ def _apply_negation(text: str, reco: str) -> str:
         return Recommendation.HOLD.value
 
     if _PAT_NEGATE.search(text):
+        if reco == Recommendation.STRONG_BUY.value:
+            return Recommendation.BUY.value
+        if reco in (Recommendation.BUY.value, Recommendation.ACCUMULATE.value):
+            return Recommendation.HOLD.value
         if reco == Recommendation.SELL.value:
             return Recommendation.REDUCE.value
-        if reco == Recommendation.BUY.value:
-            return Recommendation.HOLD.value
+        if reco == Recommendation.STRONG_SELL.value:
+            return Recommendation.SELL.value
+        if reco == Recommendation.AVOID.value:
+            return Recommendation.SELL.value
 
     return reco
 
@@ -1519,13 +1864,30 @@ def _sentiment_analysis(text: str) -> Optional[str]:
 
 
 # =============================================================================
-# Core Recommendation Parsing (preserved)
+# Core Recommendation Parsing (8-tier aware in v8.0.0)
 # =============================================================================
 
 @lru_cache(maxsize=8192)
 def _parse_string_recommendation(raw: str) -> str:
+    """
+    Parse a raw recommendation string into a canonical 8-tier value.
+
+    v8.0.0 resolution order is strongest-signal-first within each language
+    so a longer, more specific phrase is never shadowed by a substring
+    match — e.g. "STRONG SELL" must resolve before "SELL", "ACCUMULATE"
+    before "BUY", "AVOID" before "SELL".
+    """
     ar_norm = _normalize_arabic(raw)
 
+    # --- Arabic exact-set matches (strongest signal first) -------------
+    if ar_norm in _AR_STRONG_BUY:
+        return Recommendation.STRONG_BUY.value
+    if ar_norm in _AR_AVOID:
+        return Recommendation.AVOID.value
+    if ar_norm in _AR_STRONG_SELL:
+        return Recommendation.STRONG_SELL.value
+    if ar_norm in _AR_ACCUMULATE:
+        return Recommendation.ACCUMULATE.value
     if ar_norm in _AR_BUY:
         return Recommendation.BUY.value
     if ar_norm in _AR_HOLD:
@@ -1535,9 +1897,18 @@ def _parse_string_recommendation(raw: str) -> str:
     if ar_norm in _AR_SELL:
         return Recommendation.SELL.value
 
-    if any(tok in ar_norm for tok in ["شراء", "اشتر", "تجميع", "زيادة"]):
+    # --- Arabic fuzzy token containment (strongest signal first) -------
+    if any(tok in ar_norm for tok in ["تجنب", "ابتعد", "غير قابل للاستثمار"]):
+        return Recommendation.AVOID.value
+    if any(tok in ar_norm for tok in ["بيع قوي", "خروج فوري", "تصفية كاملة"]):
+        return Recommendation.STRONG_SELL.value
+    if any(tok in ar_norm for tok in ["شراء قوي", "شراء مكثف"]):
+        return Recommendation.STRONG_BUY.value
+    if any(tok in ar_norm for tok in ["تجميع", "تراكم", "شراء تدريجي", "دخول تدريجي"]):
+        return Recommendation.ACCUMULATE.value
+    if any(tok in ar_norm for tok in ["شراء", "اشتر", "زيادة"]):
         return Recommendation.BUY.value
-    if any(tok in ar_norm for tok in ["بيع قوي", "تخارج", "تجنب", "تصفية"]):
+    if any(tok in ar_norm for tok in ["تخارج", "تصفية"]):
         return Recommendation.SELL.value
     if any(tok in ar_norm for tok in ["جني ارباح", "تخفيف", "تقليص"]):
         return Recommendation.REDUCE.value
@@ -1551,6 +1922,17 @@ def _parse_string_recommendation(raw: str) -> str:
     if norm in _NO_RATING:
         return Recommendation.HOLD.value
 
+    # --- Multilingual (FR/ES/DE/PT) exact-set matches ------------------
+    # Strongest signal first so "STRONG SELL" / "AVOID" / "ACCUMULATE"
+    # are never shadowed by the plainer BUY/SELL sets.
+    if norm in _LANG_STRONG_BUY:
+        return Recommendation.STRONG_BUY.value
+    if norm in _LANG_AVOID:
+        return Recommendation.AVOID.value
+    if norm in _LANG_STRONG_SELL:
+        return Recommendation.STRONG_SELL.value
+    if norm in _LANG_ACCUMULATE:
+        return Recommendation.ACCUMULATE.value
     if norm in _LANG_BUY:
         return Recommendation.BUY.value
     if norm in _LANG_SELL:
@@ -1560,10 +1942,22 @@ def _parse_string_recommendation(raw: str) -> str:
     if norm in _LANG_REDUCE:
         return Recommendation.REDUCE.value
 
+    # --- English exact-set + regex (strongest signal first) ------------
+    if norm in _AVOID_LIKE or _PAT_AVOID.search(norm):
+        # The AVOID idioms ("DO NOT BUY", "NEVER BUY", "DO NOT ENTER" ...)
+        # embed a negator as part of their meaning. They must NOT pass
+        # through _apply_negation, which would misread that embedded
+        # NOT/NEVER as negating the call and flatten a clear AVOID to HOLD.
+        # Only a genuine negation of AVOID itself ("not avoid") flattens.
+        if _PAT_AVOID_NEGATED.search(norm):
+            return Recommendation.HOLD.value
+        return Recommendation.AVOID.value
     if norm in _STRONG_SELL_LIKE or _PAT_STRONG_SELL.search(norm):
-        return _apply_negation(norm, Recommendation.SELL.value)
+        return _apply_negation(norm, Recommendation.STRONG_SELL.value)
     if norm in _STRONG_BUY_LIKE or _PAT_STRONG_BUY.search(norm):
         return _apply_negation(norm, Recommendation.STRONG_BUY.value)
+    if norm in _ACCUMULATE_LIKE or _PAT_ACCUMULATE.search(norm):
+        return _apply_negation(norm, Recommendation.ACCUMULATE.value)
 
     if norm in _SELL_LIKE or _PAT_SELL.search(norm):
         return _apply_negation(norm, Recommendation.SELL.value)
@@ -1578,6 +1972,16 @@ def _parse_string_recommendation(raw: str) -> str:
     if num_result and num_result[1] >= _CONFIDENCE_MEDIUM:
         return _apply_negation(norm, num_result[0])
 
+    # --- regex fall-through (strongest signal first) -------------------
+    if _PAT_AVOID.search(norm):
+        # Same idiom-vs-genuine-negation handling as the exact-set branch.
+        if _PAT_AVOID_NEGATED.search(norm):
+            return Recommendation.HOLD.value
+        return Recommendation.AVOID.value
+    if _PAT_STRONG_SELL.search(norm):
+        return _apply_negation(norm, Recommendation.STRONG_SELL.value)
+    if _PAT_ACCUMULATE.search(norm):
+        return _apply_negation(norm, Recommendation.ACCUMULATE.value)
     if _PAT_SELL.search(norm):
         return _apply_negation(norm, Recommendation.SELL.value)
     if _PAT_REDUCE.search(norm):
@@ -1650,7 +2054,14 @@ def _infer_horizon_label_from_payload(data: Dict[str, Any], horizon_days: Option
 # =============================================================================
 
 def normalize_recommendation(value: Any) -> str:
-    """Normalize a recommendation to canonical form. (Preserved from v6.1.0.)"""
+    """
+    Normalize a recommendation to canonical form.
+
+    v8.0.0: may now return any of the eight canonical tiers
+    (STRONG_BUY / BUY / ACCUMULATE / HOLD / REDUCE / SELL /
+    STRONG_SELL / AVOID). Consumers with a hard-coded 5-value allow-list
+    must widen it; `is_valid_recommendation()` reflects the full set.
+    """
     try:
         candidate = _extract_candidate(value)
         if candidate is None:
@@ -1773,7 +2184,11 @@ def batch_normalize(recommendations: Sequence[Any]) -> List[str]:
 
 
 def is_valid_recommendation(value: Any) -> bool:
-    """Check if value is a valid canonical recommendation. (Preserved.)"""
+    """
+    Check if value is a valid canonical recommendation.
+
+    v8.0.0: the valid set is the full 8-tier vocabulary.
+    """
     try:
         return str(value) in _RECO_ENUM
     except Exception:
@@ -1781,21 +2196,28 @@ def is_valid_recommendation(value: Any) -> bool:
 
 
 def get_recommendation_score(reco: Any) -> int:
-    """Get numeric score for recommendation (0-4, 0 = STRONG_BUY best). (Preserved.)"""
+    """
+    Get numeric ordinal for a recommendation (0-7, 0 = STRONG_BUY best,
+    7 = AVOID worst).
+
+    v8.0.0: range widened from 0-4 to 0-7. Ordering is preserved and
+    monotonic; ranking consumers are unaffected. Unknown values map to
+    HOLD's ordinal (3), the neutral centre.
+    """
     try:
         s = str(reco)
     except Exception:
-        return 2
+        return Recommendation.HOLD.to_score()
     if s in _RECO_ENUM:
         try:
             return Recommendation(s).to_score()
         except Exception:
-            return 2
-    return 2
+            return Recommendation.HOLD.to_score()
+    return Recommendation.HOLD.to_score()
 
 
 def recommendation_from_score(score: Any, scale: str = "1-5") -> str:
-    """Convert score to recommendation. (Preserved.)"""
+    """Convert score to recommendation. (Re-banded for 8 tiers in v8.0.0.)"""
     return Recommendation.from_score(score, scale).value
 
 
@@ -1805,9 +2227,12 @@ def recommendation_from_score(score: Any, scale: str = "1-5") -> str:
 
 RECO_STRONG_BUY = Recommendation.STRONG_BUY.value
 RECO_BUY = Recommendation.BUY.value
+RECO_ACCUMULATE = Recommendation.ACCUMULATE.value   # v8.0.0
 RECO_HOLD = Recommendation.HOLD.value
 RECO_REDUCE = Recommendation.REDUCE.value
 RECO_SELL = Recommendation.SELL.value
+RECO_STRONG_SELL = Recommendation.STRONG_SELL.value  # v8.0.0
+RECO_AVOID = Recommendation.AVOID.value              # v8.0.0
 
 
 # =============================================================================
@@ -1815,17 +2240,22 @@ RECO_SELL = Recommendation.SELL.value
 # =============================================================================
 
 __all__ = [
-    # Version (v7.2.0 Phase C: __version__ alias)
+    # Version
     "VERSION",
     "__version__",
     # Enums
     "Recommendation",
-    # Recommendation constants
+    # Recommendation constants (v8.0.0: 8-tier)
     "RECO_STRONG_BUY",
     "RECO_BUY",
+    "RECO_ACCUMULATE",
     "RECO_HOLD",
     "RECO_REDUCE",
     "RECO_SELL",
+    "RECO_STRONG_SELL",
+    "RECO_AVOID",
+    # Ordinal helper (v8.0.0)
+    "WORST_ORDINAL",
     # View-token constants
     "VIEW_FUND_BULLISH",
     "VIEW_FUND_NEUTRAL",
@@ -1839,7 +2269,7 @@ __all__ = [
     "VIEW_VALUE_CHEAP",
     "VIEW_VALUE_FAIR",
     "VIEW_VALUE_EXPENSIVE",
-    # v7.2.0 Phase B: rule_id constants
+    # Rule-id constants
     "RULE_ID_INSUFFICIENT_DATA_NO_SIGNALS",
     "RULE_ID_INSUFFICIENT_DATA_TOO_FEW",
     "RULE_ID_HARD_SELL_DOUBLE_BEARISH",
@@ -1854,10 +2284,15 @@ __all__ = [
     "RULE_ID_DOWNGRADED_STRONG_BUY_TO_BUY",
     "RULE_ID_DOWNGRADED_BUY_TO_HOLD",
     "RULE_ID_DOWNGRADED_STRONG_BUY_TO_HOLD",
+    # v8.0.0 rule-ids
+    "RULE_ID_ACCUMULATE_BULLISH_MODERATE",
+    "RULE_ID_DOWNGRADED_ACCUMULATE_TO_HOLD",
+    "RULE_ID_HARD_STRONG_SELL_DOUBLE_BEARISH",
+    "RULE_ID_AVOID_UNINVESTABLE",
     # View helpers
     "normalize_view_token",
     "recommendation_from_views",
-    "recommendation_from_views_with_rule_id",  # v7.2.0 Phase B
+    "recommendation_from_views_with_rule_id",
     # Data classes
     "NormalizedRecommendation",
     # Core functions
