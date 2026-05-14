@@ -3,7 +3,7 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.12.0
+Top 10 Selector — v4.13.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -12,6 +12,7 @@ PARTIAL-DEGRADATION SAFE • DIRECT-SYMBOLS SAFE • TIMEOUT-GUARDED
 INSIGHTS-COLUMNS AWARE • DATA-QUALITY-AWARE RANKING
 CRITERIA-v3.1.0 HARD-FILTER CONSUMER (v4.12.0)
 DECISION-MATRIX AWARE • CANDLESTICK AWARE (v4.12.0)
+CANONICAL-BUCKET ROUTED • REAL OVERALL-RANK FALLBACK (v4.13.0)
 
 ================================================================================
 Cross-stack family (May 2026)
@@ -43,6 +44,16 @@ contract surfaces it consumes from upstream are:
   - core.candlesticks v1.0.0
       * Writes the 5 Candlestick columns via data_engine_v2 v5.60.0+
         (gated by ENGINE_CANDLESTICKS_ENABLED env flag).
+  - core.buckets v1.0.0
+      * Single authoritative risk/confidence bucket helper. v4.13.0
+        routes the risk-level and confidence-bucket *matching* in
+        `_passes_filters` through this module (risk_bucket_from_score /
+        confidence_bucket_from_score / normalize_risk_bucket /
+        normalize_confidence_bucket). Canonical cutoffs: risk <35 LOW /
+        35-70 MODERATE / >=70 HIGH; confidence >=75 HIGH / 50-75
+        MODERATE / <50 LOW. Shared with data_engine_v2, scoring.py and
+        the advisor modules. The import is except-guarded; when
+        unavailable the legacy inline thresholds are used unchanged.
   - core.scoring_engine v3.4.2 (compatibility bridge)
       * Tracks v5.2.5 enrichment fields and reco_normalize v7.2.0
         rule_id-aware classification surface.
@@ -61,6 +72,76 @@ contract surfaces it consumes from upstream are:
   - core.analysis.insights_builder v7.0.0
       * Sibling consumer of the same data-quality signals; renders the
         Data Quality Alerts section in Insights_Analysis.
+
+================================================================================
+What v4.13.0 adds (over v4.12.0)
+================================================================================
+v4.12.0 made top10_selector a HARD-FILTER consumer for criteria_model
+v3.1.0 and widened the schema to 100 columns. Two backlog items it left
+in place:
+
+  - `_rank_and_project_rows` filled a blank `rank_overall` with `idx` —
+    the positional Top10 index, i.e. *selector-score* order — which is
+    NOT a ranking by Overall Score. The #1 selector pick always got
+    rank_overall=1, the #2 pick rank_overall=2, and so on, regardless
+    of how their overall_score values actually compared.
+  - `_risk_level_match` / `_confidence_bucket_match` carried their own
+    inline threshold logic that diverged from the canonical cutoffs in
+    core.buckets v1.0.0 — and used OVERLAPPING bands. `_risk_level_match`
+    treated risk <=35 as low, 20-65 as moderate, >=45 as high, so a
+    mid-risk row (risk_score 50) matched BOTH a "moderate" filter and a
+    "high" filter. `_confidence_bucket_match` had the same shape.
+
+v4.13.0 phase changes:
+
+  A. core.buckets v1.0.0 integration. Adds an except-guarded import of
+     risk_bucket_from_score / confidence_bucket_from_score /
+     normalize_risk_bucket / normalize_confidence_bucket and a
+     `_BUCKETS_AVAILABLE` flag. When core.buckets is unavailable the
+     module behaves exactly as v4.12.0 did.
+
+  B. Real overall-score rank fallback. New `_compute_overall_rank_map`
+     builds a {position -> rank} map by sorting candidates on
+     `overall_score` DESCENDING (rows missing overall_score ranked last
+     in selector order; ties broken stably by incoming position).
+     `_rank_and_project_rows` now uses this map for the `rank_overall`
+     fallback instead of the positional `idx`. An engine-supplied
+     `rank_overall` (a true universe-wide rank from data_engine_v2
+     `_apply_rank_overall`) is still authoritative and preserved —
+     only a BLANK rank_overall is filled, and now it is filled with a
+     genuine sort-based rank. `top10_rank` is unchanged: rows arrive
+     pre-sorted by `_selector_score` desc, so the positional index IS
+     the correct Top10 rank.
+
+  C. Canonical-bucket routed matching. New private resolvers
+     `_resolve_risk_bucket_canon` / `_resolve_confidence_bucket_canon`
+     resolve a row to a canonical UPPERCASE bucket via core.buckets —
+     preferring an explicit bucket label, else deriving from
+     risk_score / forecast_confidence|confidence_score.
+     `_risk_level_match` / `_confidence_bucket_match` now do CRISP
+     canonical equality when core.buckets is available AND both the
+     operator's wanted level and the row resolve to canonical buckets.
+     ** Intentional behaviour refinement: ** this removes the
+     overlapping-band behaviour — a risk_score of 50 now matches a
+     "moderate" filter and NOT a "high" filter. When core.buckets is
+     unavailable, or either side fails to resolve, the legacy v4.12.0
+     threshold/substring logic runs unchanged (preserved verbatim). A
+     row with neither a bucket label nor a score is NOT excluded
+     (matches the legacy "can't determine -> keep" contract).
+
+  D. Selection-reason display polish. `_canonical_selection_reason`
+     normalizes the risk_bucket / confidence_bucket display strings
+     through core.buckets when available, so the Selection Reason text
+     is casing-consistent with the Risk Bucket / Confidence Bucket
+     columns. Falls back to the raw value on any failure.
+
+  E. Version bump 4.12.0 -> 4.13.0. `__all__` is unchanged — every new
+     helper is private (`_`-prefixed).
+
+NOTE: top10_selector does NOT write risk_bucket / confidence_bucket — it
+only READS them for filtering and display. The canonical cutoffs are
+therefore applied to *matching*, not to column production. Bucket
+*production* lives in data_engine_v2 (also routed through core.buckets).
 
 ================================================================================
 What v4.12.0 adds (over v4.11.0 / v4.10.0 / v4.9.0 / v4.8.0)
@@ -203,10 +284,11 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.12.0"
+TOP10_SELECTOR_VERSION = "4.13.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.8.0, scoring v5.2.5, reco_normalize v7.2.0,
 # insights_builder v7.0.0, scoring_engine v3.4.2, criteria_model v3.1.0).
+# v4.13.0 keeps the alias; adds core.buckets v1.0.0 to the family.
 __version__ = TOP10_SELECTOR_VERSION
 OUTPUT_PAGE = "Top_10_Investments"
 
@@ -535,6 +617,41 @@ try:
     from core.sheets.page_catalog import normalize_page_name as _normalize_page_name  # type: ignore
 except Exception:
     _normalize_page_name = None  # type: ignore
+
+
+# =============================================================================
+# v4.13.0 — core.buckets integration (canonical risk/confidence buckets)
+# =============================================================================
+# v4.13.0 routes the risk-level and confidence-bucket *matching* in
+# `_passes_filters` (via `_risk_level_match` / `_confidence_bucket_match`)
+# through core.buckets v1.0.0 — the single authoritative bucket helper
+# shared with data_engine_v2, scoring.py, and the advisor modules.
+#
+# Before v4.13.0 this module carried its own inline threshold logic that
+# diverged from the canonical cutoffs and used OVERLAPPING bands, so a
+# mid-risk row matched both a "moderate" and a "high" filter. core.buckets
+# canonical cutoffs: risk <35 LOW / 35-70 MODERATE / >=70 HIGH; confidence
+# >=75 HIGH / 50-75 MODERATE / <50 LOW (auto-detecting 0-1 vs 0-100 input).
+#
+# The import is except-guarded; when core.buckets is unavailable the four
+# names fall back to None, `_BUCKETS_AVAILABLE` is False, and the legacy
+# inline threshold logic runs unchanged — so deployments without it see
+# zero behaviour change. core.buckets has no third-party deps and no TFB
+# imports, so there is no import-cycle risk here.
+try:
+    from core.buckets import (  # type: ignore
+        risk_bucket_from_score as _bk_risk_bucket_from_score,
+        confidence_bucket_from_score as _bk_confidence_bucket_from_score,
+        normalize_risk_bucket as _bk_normalize_risk_bucket,
+        normalize_confidence_bucket as _bk_normalize_confidence_bucket,
+    )
+    _BUCKETS_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised only when core.buckets is absent
+    _bk_risk_bucket_from_score = None  # type: ignore
+    _bk_confidence_bucket_from_score = None  # type: ignore
+    _bk_normalize_risk_bucket = None  # type: ignore
+    _bk_normalize_confidence_bucket = None  # type: ignore
+    _BUCKETS_AVAILABLE = False
 
 
 # =============================================================================
@@ -1756,9 +1873,103 @@ def _choose_horizon_roi(row: Mapping[str, Any], horizon_days: int) -> Optional[f
     return _safe_ratio(row.get("expected_roi_12m"), None) or _safe_ratio(row.get("expected_roi_3m"), None) or _safe_ratio(row.get("expected_roi_1m"), None)
 
 
+# =============================================================================
+# v4.13.0 — Canonical bucket resolution (core.buckets v1.0.0 integration)
+# =============================================================================
+# top10_selector does NOT write risk_bucket / confidence_bucket — it only
+# READS them, for filtering (`_passes_filters`) and display
+# (`_canonical_selection_reason`). These resolvers normalize a row to a
+# canonical UPPERCASE bucket so the match functions below can do crisp
+# canonical equality instead of the v4.12.0 overlapping-band threshold
+# logic. They return "" whenever core.buckets is unavailable or the row
+# cannot be resolved — callers then drop to the preserved legacy path.
+
+def _resolve_risk_bucket_canon(row: Mapping[str, Any]) -> str:
+    """Resolve a row's risk bucket to a canonical UPPERCASE value
+    ("LOW" / "MODERATE" / "HIGH") via core.buckets, or "" if it cannot be
+    resolved. Prefers an explicit risk_bucket / risk_level label; falls
+    back to deriving from risk_score. Returns "" when core.buckets is
+    unavailable so callers drop to the legacy threshold logic."""
+    if not (
+        _BUCKETS_AVAILABLE
+        and _bk_normalize_risk_bucket is not None
+        and _bk_risk_bucket_from_score is not None
+    ):
+        return ""
+    label = _s(row.get("risk_bucket") or row.get("risk_level"))
+    if label:
+        try:
+            canon = _bk_normalize_risk_bucket(label)
+        except Exception:
+            canon = ""
+        if canon:
+            return canon
+    risk = _safe_float(row.get("risk_score"), None)
+    if risk is not None:
+        try:
+            return _bk_risk_bucket_from_score(risk) or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def _resolve_confidence_bucket_canon(row: Mapping[str, Any]) -> str:
+    """Resolve a row's confidence bucket to a canonical UPPERCASE value
+    via core.buckets, or "" if unresolved. Prefers an explicit
+    confidence_bucket / confidence_level label; falls back to deriving
+    from forecast_confidence / confidence_score (core.buckets
+    auto-detects the 0-1 vs 0-100 input scale)."""
+    if not (
+        _BUCKETS_AVAILABLE
+        and _bk_normalize_confidence_bucket is not None
+        and _bk_confidence_bucket_from_score is not None
+    ):
+        return ""
+    label = _s(row.get("confidence_bucket") or row.get("confidence_level"))
+    if label:
+        try:
+            canon = _bk_normalize_confidence_bucket(label)
+        except Exception:
+            canon = ""
+        if canon:
+            return canon
+    score = _safe_float(row.get("forecast_confidence") or row.get("confidence_score"), None)
+    if score is not None:
+        try:
+            return _bk_confidence_bucket_from_score(score) or ""
+        except Exception:
+            return ""
+    return ""
+
+
 def _confidence_bucket_match(row: Mapping[str, Any], wanted: str) -> bool:
     if not wanted:
         return True
+
+    # v4.13.0 canonical path: when core.buckets is available AND both the
+    # operator's wanted level and the row resolve to canonical buckets,
+    # compare them crisply. Falls through to the legacy v4.12.0 logic when
+    # core.buckets is unavailable or either side cannot be resolved.
+    wanted_canon = ""
+    if _BUCKETS_AVAILABLE and _bk_normalize_confidence_bucket is not None:
+        try:
+            wanted_canon = _bk_normalize_confidence_bucket(wanted)
+        except Exception:
+            wanted_canon = ""
+    if wanted_canon:
+        row_canon = _resolve_confidence_bucket_canon(row)
+        if row_canon:
+            return row_canon == wanted_canon
+        # Row has neither a confidence bucket label nor a confidence score
+        # -> cannot determine; don't exclude (matches legacy behaviour).
+        if (
+            _safe_float(row.get("forecast_confidence") or row.get("confidence_score"), None) is None
+            and not _s(row.get("confidence_bucket") or row.get("confidence_level"))
+        ):
+            return True
+        # else: fall through to the legacy threshold/substring logic below.
+
+    # ---- legacy path (v4.12.0 behaviour, preserved verbatim) ----
     row_bucket = _s(row.get("confidence_bucket") or row.get("confidence_level")).lower()
     if row_bucket:
         return wanted in row_bucket or row_bucket in wanted
@@ -1779,6 +1990,33 @@ def _confidence_bucket_match(row: Mapping[str, Any], wanted: str) -> bool:
 def _risk_level_match(row: Mapping[str, Any], wanted: str) -> bool:
     if not wanted:
         return True
+
+    # v4.13.0 canonical path: crisp canonical equality when core.buckets is
+    # available AND both sides resolve. This intentionally removes the
+    # v4.12.0 overlapping-band behaviour (a risk_score of 50 used to match
+    # both a "moderate" and a "high" filter). Falls through to the legacy
+    # v4.12.0 logic when core.buckets is unavailable or either side cannot
+    # be resolved.
+    wanted_canon = ""
+    if _BUCKETS_AVAILABLE and _bk_normalize_risk_bucket is not None:
+        try:
+            wanted_canon = _bk_normalize_risk_bucket(wanted)
+        except Exception:
+            wanted_canon = ""
+    if wanted_canon:
+        row_canon = _resolve_risk_bucket_canon(row)
+        if row_canon:
+            return row_canon == wanted_canon
+        # Row has neither a risk bucket label nor a risk_score -> cannot
+        # determine; don't exclude (matches legacy behaviour).
+        if (
+            _safe_float(row.get("risk_score"), None) is None
+            and not _s(row.get("risk_bucket") or row.get("risk_level"))
+        ):
+            return True
+        # else: fall through to the legacy threshold/substring logic below.
+
+    # ---- legacy path (v4.12.0 behaviour, preserved verbatim) ----
     row_bucket = _s(row.get("risk_bucket") or row.get("risk_level")).lower()
     if row_bucket:
         return wanted in row_bucket or row_bucket in wanted
@@ -1993,6 +2231,24 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
     confidence_bucket = _s(row.get("confidence_bucket"))
     risk_bucket = _s(row.get("risk_bucket"))
     source_page = _s(row.get("source_page"))
+
+    # v4.13.0 — display canonical bucket labels when core.buckets is
+    # available, so the Selection Reason text is casing-consistent with
+    # the Risk Bucket / Confidence Bucket columns regardless of upstream
+    # casing. Falls back to the raw value on any failure (zero-risk
+    # display polish — does not affect filtering).
+    if _BUCKETS_AVAILABLE:
+        if risk_bucket and _bk_normalize_risk_bucket is not None:
+            try:
+                risk_bucket = _bk_normalize_risk_bucket(risk_bucket) or risk_bucket
+            except Exception:
+                pass
+        if confidence_bucket and _bk_normalize_confidence_bucket is not None:
+            try:
+                confidence_bucket = _bk_normalize_confidence_bucket(confidence_bucket) or confidence_bucket
+            except Exception:
+                pass
+
     horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
     horizon_roi = _choose_horizon_roi(row, horizon_days)
 
@@ -2059,15 +2315,54 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
     return " | ".join(parts) if parts else "Selected by Top10 composite scoring."
 
 
+def _compute_overall_rank_map(rows: Sequence[Mapping[str, Any]]) -> Dict[int, int]:
+    """v4.13.0 — build a {0-based position -> rank} map by sorting on
+    `overall_score` DESCENDING.
+
+    This replaces the v4.12.0 behaviour where a blank `rank_overall` fell
+    back to the positional Top10 index (`idx`) — i.e. *selector-score*
+    order, which is NOT a ranking by Overall Score.
+
+    Rows missing `overall_score` are ranked last, in their original
+    (selector-score) order, so the column is always populated. Ties on
+    `overall_score` keep the incoming order as a stable tiebreaker, so the
+    higher-selector-score row gets the better overall rank on a tie.
+    """
+    ranked_positions = sorted(
+        range(len(rows)),
+        key=lambda i: (
+            # 0 = has a usable overall_score, 1 = missing -> sorted last
+            0 if _safe_float(rows[i].get("overall_score"), None) is not None else 1,
+            # negative so a HIGHER overall_score gets a LOWER (better) rank
+            -(_safe_float(rows[i].get("overall_score"), 0.0) or 0.0),
+            # stable tiebreaker: preserve incoming selector-score order
+            i,
+        ),
+    )
+    return {pos: rank for rank, pos in enumerate(ranked_positions, start=1)}
+
+
 def _rank_and_project_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str], criteria: Mapping[str, Any]) -> List[Dict[str, Any]]:
     criteria_snapshot = _json_compact(criteria)
+    # v4.13.0 — real overall-score-based ranking for the rank_overall
+    # fallback (was the positional Top10 index `idx` in v4.12.0).
+    overall_rank_map = _compute_overall_rank_map(rows)
     out: List[Dict[str, Any]] = []
     for idx, raw in enumerate(rows, start=1):
         row = dict(raw)
+        # top10_rank == position in the Top10 list (selector-score order).
+        # `rows` arrives already sorted by `_selector_score` desc, so the
+        # positional index IS the correct Top10 rank.
         if _is_blank(row.get("top10_rank")):
             row["top10_rank"] = idx
+        # rank_overall == rank by Overall Score. An engine-supplied value
+        # (a true universe-wide rank from data_engine_v2
+        # `_apply_rank_overall`) is authoritative and preserved as-is;
+        # only a BLANK rank_overall is filled — and the fallback is now a
+        # genuine descending rank on `overall_score` among the projected
+        # rows, NOT the positional selector-score index.
         if _is_blank(row.get("rank_overall")):
-            row["rank_overall"] = idx
+            row["rank_overall"] = overall_rank_map.get(idx - 1, idx)
         if _is_blank(row.get("selection_reason")):
             row["selection_reason"] = _canonical_selection_reason(row, criteria)
         if _is_blank(row.get("criteria_snapshot")):
