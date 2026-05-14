@@ -2,6 +2,80 @@
 # core/data_engine_v2.py
 """
 ================================================================================
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.70.0
+================================================================================
+
+WHY v5.70.0 — INSTRUMENT-SHEET SCHEMA-ALIGNMENT FIX (May 14, 2026)
+--------------------------------------------------------------------
+v5.70.0 resolves the cluster v5.69.0 explicitly deferred: the empty
+Confidence Score column, the empty Data Provider / Last Updated
+columns, and the ghost "Status" bleed-through. As v5.69.0 predicted,
+the three symptoms trace to a SINGLE column-projection / schema-
+alignment defect, not three independent bugs.
+
+ROOT CAUSE.
+  `_usable_contract` was intentionally permissive: for an instrument
+  sheet it only required {symbol/ticker} + {current_price/price/name}
+  in the keyset -- it did NOT verify the contract matched the canonical
+  97-column layout (INSTRUMENT_CANONICAL_KEYS). So when schema_registry's
+  instrument contract DIVERGED from canonical, the engine accepted the
+  divergent contract as "canonical" (contract_level == "canonical"), and
+  the existing recovery cascade in `get_sheet_rows` never fired.
+  But every engine compute path -- `_compute_scores_fallback`,
+  `_phase_ii_quality_forecast`, `_canonicalize_provider_row`,
+  `_apply_page_row_backfill`, `_classify_recommendation_8tier`, ... --
+  writes CANONICAL field names. Projecting that canonical output through
+  a divergent contract via `_strict_project_row` /
+  `_normalize_to_schema_keys`:
+    * STRANDS canonical values whose keys aren't in the contract
+      -> blank columns: Confidence Score, Data Provider, Last Updated.
+    * SURFACES registry-only columns the engine never fills
+      -> ghost columns: "Status".
+
+THE FIX, applied in phases:
+
+  PHASE 1 — tighten `_usable_contract` (canonical-key coverage gate).
+    New `_INSTRUMENT_CANONICAL_REQUIRED_KEYS` enumerates the canonical
+    keys the engine itself writes on every instrument row (the Identity/
+    Price/Risk/Forecast/Score/Recommendation/Provenance keys, including
+    confidence_score, data_provider and last_updated_*). New
+    `_instrument_contract_is_canonical(keys)` tests coverage. A
+    structurally-valid registry contract that omits any of these keys is
+    no longer accepted as canonical for instrument sheets (or for
+    Top_10_Investments, whose rows are engine-written instrument rows
+    plus the 3 Top10 fields). This makes `_schema_for_sheet` fall back to
+    the canonical static contract for a divergent registry contract --
+    and makes `contract_level` in `get_sheet_rows` report "partial"
+    honestly, so the existing recovery cascade fires.
+
+  PHASE 2 — instrument-sheet canonical contract enforcement.
+    New `instrument_force_canonical_schema` flag (env
+    INSTRUMENT_FORCE_CANONICAL_SCHEMA, default on) force-applies the
+    canonical 97-column instrument contract for every instrument sheet
+    in `get_sheet_rows`, exactly mirroring the existing
+    `top10_force_full_schema` block. This is the explicit guarantee --
+    it also corrects the case where the registry contract is a SUPERSET
+    of canonical (extra registry-only columns the engine cannot fill
+    anyway). It is a no-op when the resolved contract is already
+    canonical, so deployments whose registry already matches canonical
+    see ZERO change.
+
+  PHASE 3 — version bump + docstring + capability flags.
+    Version 5.69.0 -> 5.70.0; this WHY block; the v5.69.0-deferred
+    cluster is marked RESOLVED below; `instrument_force_canonical_schema`
+    is surfaced in `health()` and `get_stats()` so the active state is
+    observable in production.
+
+[PRESERVED] All v5.69.0 (recommendation unification + risk
+recalibration + intrinsic-value sanity bounds) + v5.68.0 provider-
+symbol-normalization routing + v5.67.0 unit-contract logic +
+v5.66.0 PHASE-JJ + v5.65.0 PHASE-II + v5.64.0 + v5.63.0 PHASE-DD +
+v5.62.0 PHASE-Z + v5.47.2 baseline logic intact. No compute logic
+changed; v5.70.0 only changes which COLUMN CONTRACT instrument-sheet
+rows project through, so canonical compute outputs land in real
+columns. `_apply_rank_overall`'s global descending sort is unchanged.
+
+================================================================================
 Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.69.0
 ================================================================================
 
@@ -50,14 +124,15 @@ PHASE 3 — Intrinsic-value sanity bounds.
     final blended intrinsic to the same band the upside clamp implies,
     so intrinsic_value and upside_pct stay mutually consistent.
 
-NOT IN v5.69.0 (deferred — separate focused pass):
+RESOLVED IN v5.70.0 (was deferred by v5.69.0):
   The empty Confidence Score column, the empty Data Provider /
-  Last Updated columns, and the ghost "Status" bleed-through are NOT
-  addressed here. That cluster of symptoms points to a single
-  column-projection / schema-alignment defect rather than three
-  independent bugs, and pinning it down safely requires a focused trace
-  of the row-projection chain (a wrong fix there shifts every column).
-  rank_overall already does a proper global descending sort
+  Last Updated columns, and the ghost "Status" bleed-through were NOT
+  addressed in v5.69.0. v5.69.0 correctly predicted that cluster of
+  symptoms pointed to a single column-projection / schema-alignment
+  defect rather than three independent bugs, and that pinning it down
+  safely required a focused trace of the row-projection chain. v5.70.0
+  is that focused pass -- see the WHY v5.70.0 block at the top of this
+  file. rank_overall already does a proper global descending sort
   (`_apply_rank_overall`) and is unchanged.
 
 [PRESERVED] All v5.68.0 provider-symbol-normalization routing +
@@ -381,7 +456,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.69.0"
+__version__ = "5.70.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -2368,6 +2443,70 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
     return hdrs, ks
 
 
+# =============================================================================
+# v5.70.0 — INSTRUMENT-SHEET SCHEMA-ALIGNMENT FIX (canonical-key coverage)
+# =============================================================================
+# This block resolves the v5.69.0-deferred cluster: the empty Confidence
+# Score column, the empty Data Provider / Last Updated columns, and the
+# ghost "Status" bleed-through. The three symptoms trace to a SINGLE
+# schema-alignment defect, not three independent bugs.
+#
+# Pre-v5.70.0 `_usable_contract` was intentionally permissive: for an
+# instrument sheet it only required {symbol/ticker} + {current_price/
+# price/name} in the keyset. It did NOT verify that the contract matched
+# the canonical 97-column layout (INSTRUMENT_CANONICAL_KEYS). So when
+# schema_registry's instrument contract DIVERGED from canonical, the
+# engine accepted the divergent contract as "canonical".
+#
+# But every engine compute path -- `_compute_scores_fallback`,
+# `_phase_ii_quality_forecast`, `_canonicalize_provider_row`,
+# `_apply_page_row_backfill`, `_classify_recommendation_8tier`, ... --
+# writes CANONICAL field names. Projecting that canonical output through
+# a divergent contract via `_strict_project_row` / `_normalize_to_schema_keys`:
+#   * STRANDS canonical values whose keys aren't in the contract
+#     -> blank columns: Confidence Score, Data Provider, Last Updated.
+#   * SURFACES registry-only columns the engine never fills
+#     -> ghost columns: "Status".
+#
+# `_INSTRUMENT_CANONICAL_REQUIRED_KEYS` is the set of canonical keys the
+# engine itself writes on every instrument row. A schema_registry
+# contract that omits any of them is NOT interchangeable with the
+# canonical layout, so `_usable_contract` now rejects it for instrument
+# sheets -- which makes `_schema_for_sheet` fall back to the canonical
+# static contract, so the engine's canonical compute outputs land in
+# real columns.
+_INSTRUMENT_CANONICAL_REQUIRED_KEYS: frozenset = frozenset({
+    # Identity
+    "symbol", "name", "asset_class", "exchange", "currency", "country",
+    # Price
+    "current_price", "previous_close", "percent_change",
+    # Risk
+    "risk_score", "risk_bucket",
+    # Forecast / confidence — the v5.69.0-deferred "empty Confidence Score"
+    "forecast_confidence", "confidence_score", "confidence_bucket",
+    # Scores
+    "overall_score", "opportunity_score", "rank_overall",
+    # Recommendation
+    "recommendation", "recommendation_reason",
+    "recommendation_detailed", "recommendation_priority",
+    # Provenance — the v5.69.0-deferred "empty Data Provider / Last Updated"
+    "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+})
+
+
+def _instrument_contract_is_canonical(keys: Sequence[str]) -> bool:
+    """v5.70.0: True only if `keys` covers every canonical key the engine
+    writes on instrument rows. A contract that passes the loose structural
+    check in `_usable_contract` but FAILS this is a divergent registry
+    contract -- treating it as canonical strands the engine's canonical
+    compute outputs (Confidence Score / Data Provider / Last Updated) in
+    blank columns and surfaces registry-only ghost columns. This is the
+    Phase-1 gate of the v5.70.0 schema-alignment fix."""
+    return _INSTRUMENT_CANONICAL_REQUIRED_KEYS.issubset(
+        {_safe_str(k) for k in (keys or [])}
+    )
+
+
 def _usable_contract(headers: Sequence[str], keys: Sequence[str], sheet_name: str = "") -> bool:
     if not headers or not keys:
         return False
@@ -2380,10 +2519,25 @@ def _usable_contract(headers: Sequence[str], keys: Sequence[str], sheet_name: st
             return False
         if not ({"current_price", "price", "name"} & keyset):
             return False
+        # v5.70.0 PHASE 1: a structurally-valid contract that diverges from
+        # the canonical 97-column layout (i.e. omits the engine-written
+        # canonical keys) is NOT canonical-usable. Rejecting it here makes
+        # `_schema_for_sheet` fall back to the canonical static contract,
+        # so engine compute outputs (confidence_score, data_provider,
+        # last_updated_*) project into real columns instead of being
+        # stranded -- and the ghost "Status" column cannot appear.
+        if not _instrument_contract_is_canonical(keys):
+            return False
     if canon == "Top_10_Investments":
         if not ({"symbol", "ticker", "requested_symbol"} & keyset):
             return False
         if not set(TOP10_REQUIRED_FIELDS).issubset(keyset):
+            return False
+        # v5.70.0 PHASE 1: Top_10 rows are engine-written instrument rows
+        # plus the 3 Top10 fields -- require the same canonical-key
+        # coverage so a divergent registry contract cannot strand the
+        # canonical compute outputs on the Top_10_Investments sheet either.
+        if not _instrument_contract_is_canonical(keys):
             return False
     if canon == "Insights_Analysis":
         if not ({"section", "item", "metric", "value"} <= keyset):
@@ -4028,6 +4182,16 @@ class DataEngineV5:
 
         self.schema_strict_sheet_rows = _get_env_bool("SCHEMA_STRICT_SHEET_ROWS", True)
         self.top10_force_full_schema = _get_env_bool("TOP10_FORCE_FULL_SCHEMA", True)
+        # v5.70.0 PHASE 2: force the canonical 97-column instrument contract
+        # for every instrument sheet (mirrors `top10_force_full_schema`).
+        # The engine's compute paths all write CANONICAL field names, so a
+        # divergent schema_registry contract strands those outputs in blank
+        # columns and surfaces ghost columns. This flag is the explicit
+        # guarantee that instrument-sheet projection always uses canonical
+        # keys/headers. Env-gated (INSTRUMENT_FORCE_CANONICAL_SCHEMA,
+        # default on); set False only if a deployment genuinely needs the
+        # raw registry contract on instrument sheets.
+        self.instrument_force_canonical_schema = _get_env_bool("INSTRUMENT_FORCE_CANONICAL_SCHEMA", True)
         self.rows_hydrate_external = _get_env_bool("ROWS_HYDRATE_EXTERNAL_READER", True)
 
         self._sem = asyncio.Semaphore(max(1, self.max_concurrency))
@@ -5976,6 +6140,36 @@ class DataEngineV5:
                 headers, keys = _ensure_top10_contract(static_headers, static_keys)
                 schema_src = f"{schema_src}|top10_force_full_schema"
 
+        # v5.70.0 PHASE 2 — INSTRUMENT-SHEET CANONICAL CONTRACT ENFORCEMENT.
+        # Every engine compute path (`_compute_scores_fallback`,
+        # `_phase_ii_quality_forecast`, `_canonicalize_provider_row`,
+        # `_apply_page_row_backfill`, `_classify_recommendation_8tier`, ...)
+        # writes CANONICAL field names. If schema_registry returned a
+        # contract that diverges from the canonical 97-column layout,
+        # projecting that engine output through it strands canonical
+        # values in blank columns (the v5.69.0-deferred "empty Confidence
+        # Score / Data Provider / Last Updated") and surfaces registry-only
+        # columns the engine never fills (the ghost "Status" column).
+        #
+        # Phase 1 (the tightened `_usable_contract` canonical-key gate)
+        # already makes `_schema_for_sheet` fall back to the canonical
+        # static contract for a *divergent* registry contract. This block
+        # is the explicit guarantee for ALL instrument sheets, including
+        # the case where the registry contract is a SUPERSET of canonical
+        # (extra registry-only columns that the engine cannot fill anyway):
+        # it force-applies the canonical instrument contract, exactly
+        # mirroring the `top10_force_full_schema` block just above. It is
+        # env-gated (INSTRUMENT_FORCE_CANONICAL_SCHEMA, default on) and is
+        # a no-op when the resolved contract is already canonical.
+        if (
+            target_sheet in INSTRUMENT_SHEETS
+            and target_sheet != "Top_10_Investments"
+            and self.instrument_force_canonical_schema
+        ):
+            if list(keys) != list(INSTRUMENT_CANONICAL_KEYS):
+                headers, keys = list(INSTRUMENT_CANONICAL_HEADERS), list(INSTRUMENT_CANONICAL_KEYS)
+                schema_src = f"{schema_src}|instrument_force_canonical_schema"
+
         target_sheet_known = target_sheet in INSTRUMENT_SHEETS or target_sheet in SPECIAL_SHEETS or bool(spec)
         strict_req = bool(self.schema_strict_sheet_rows)
         contract_level = "canonical" if _usable_contract(headers, keys, target_sheet) else "partial"
@@ -6338,6 +6532,7 @@ class DataEngineV5:
             "status": "ok",
             "version": self.version,
             "schema_available": True,
+            "instrument_force_canonical_schema": bool(self.instrument_force_canonical_schema),
             "static_contract_sheets": sorted(list(STATIC_CANONICAL_SHEET_CONTRACTS.keys())),
             "snapshot_sheets": len(self._sheet_snapshots),
             "rows_reader_source": self._rows_reader_source,
@@ -6374,6 +6569,7 @@ class DataEngineV5:
             "schema_available": True,
             "schema_strict_sheet_rows": bool(self.schema_strict_sheet_rows),
             "top10_force_full_schema": bool(self.top10_force_full_schema),
+            "instrument_force_canonical_schema": bool(self.instrument_force_canonical_schema),
             "rows_hydrate_external": bool(self.rows_hydrate_external),
             "symbols_reader_source": self._symbols_reader_source,
             "rows_reader_source": self._rows_reader_source,
