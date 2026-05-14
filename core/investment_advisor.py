@@ -3,14 +3,71 @@
 """
 core/investment_advisor.py
 ================================================================================
-INVESTMENT ADVISOR ORCHESTRATOR -- v5.3.1
-(SCHEMA v2.8.0 / SCORING v5.2.5 / RECO v7.2.0 / ENGINE v4.4.1 / TOP10 v4.12.0)
+INVESTMENT ADVISOR ORCHESTRATOR -- v5.3.2
+(SCHEMA v2.8.0 / SCORING v5.2.5 / RECO v7.2.0 / ENGINE v4.4.2 / TOP10 v4.13.0
+ / BUCKETS v1.0.0)
 ================================================================================
 LIVE-BY-DEFAULT * ENGINE-FIRST * SNAPSHOT-TOLERANT * ROUTE-COMPATIBLE
 MODE-AWARE * SCHEMA-SAFE * JSON-SAFE * IMPORT-SAFE * WORKER-THREAD SAFE
 SPECIAL-PAGE SAFE * CONTRACT-PRESERVING * DICTIONARY-HARDENED
 VIEW-AWARE * CONVICTION-AWARE * RULE-ID-AWARE * DECISION-MATRIX AWARE
-CANDLESTICK AWARE
+CANDLESTICK AWARE * CANONICAL-BUCKET ROUTED
+
+================================================================================
+v5.3.2 changes (CANONICAL-BUCKET ROUTING via core.buckets v1.0.0)
+================================================================================
+
+FOCUSED PATCH on top of v5.3.1. One behavioural change, well-scoped:
+the two bucket-backfill helpers now route through core.buckets v1.0.0
+instead of carrying their own inline thresholds. No positional indices
+shift. No column-count edits. No public-API signature edits. No change
+to the reco-delegation cascade.
+
+WHAT CHANGED.
+
+  - `_risk_bucket_from_row` / `_confidence_bucket_from_row` are routed
+    through core.buckets v1.0.0 -- the single authoritative bucket
+    helper already used by data_engine_v2 v5.69.0+ and top10_selector
+    v4.13.0+. These helpers only BACKFILL a bucket when the engine did
+    not already set one; routing them through core.buckets makes that
+    backfill emit the same canonical UPPERCASE labels
+    ("LOW"/"MODERATE"/"HIGH") the rest of the stack now emits, instead
+    of the old title-case "Low"/"Moderate"/"High" and the confidence
+    helper's "Medium" tier.
+
+  - This also FIXES a latent confidence-scale bug: the legacy inline
+    thresholds did NOT auto-detect a 0-1 vs 0-100 scale, so a
+    forecast_confidence of 0.8 backfilled as "Low" (0.8 < 50). Routed
+    through core.buckets, 0.8 is auto-scaled and correctly buckets as
+    HIGH. An explicit bucket already on the row is preferred and
+    normalized (so "moderate risk" -> "MODERATE").
+
+  - canonical cutoffs now applied: risk <35 LOW / 35-70 MODERATE /
+    >=70 HIGH (was <35 / <65 / else); confidence >=75 HIGH / 50-75
+    MODERATE / <50 LOW.
+
+WHAT IS *NOT* CHANGED.
+
+  - `_score_recommendation` is untouched. It ALREADY delegates to
+    reco_normalize via the v5.3.0 four-tier view-aware cascade; its
+    Tier-4 inline composite is a deliberate last-resort fallback for
+    when reco_normalize is entirely unavailable, and gutting it would
+    be a regression (no recommendation at all when reco_normalize is
+    down). There is no private `_recommendation_from_scores` in this
+    module.
+
+  - The source-score chains and the v5.1.1 "don't fabricate a bucket
+    for missing data -> return ''" contract are preserved verbatim.
+
+GUARDED + REVERSIBLE. The core.buckets import is except-guarded. When
+core.buckets is unavailable the helpers fall back to the legacy v5.1.1
+inline thresholds, preserved verbatim -- deployments without it see
+zero behaviour change. New `meta.buckets_canonical` flag mirrors the
+existing `meta.view_aware*` capability flags so an ops dashboard can
+detect a process where core.buckets failed to load.
+
+Version bump 5.3.1 -> 5.3.2. `__version__` alias auto-tracks. `__all__`
+unchanged (no new public symbols).
 
 ================================================================================
 v5.3.1 changes (TOP10 v4.12.0 + ENGINE v4.4.1 ALIGNMENT)
@@ -287,13 +344,15 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-INVESTMENT_ADVISOR_VERSION = "5.3.1"
+INVESTMENT_ADVISOR_VERSION = "5.3.2"
 # v5.3.0 Phase E: TFB module-version convention alias (mirrors scoring
 # v5.2.5, reco_normalize v7.2.0, insights_builder v7.0.0, scoring_engine
-# v3.4.2, top10_selector v4.12.0, criteria_model v3.1.0, schema_registry
-# v2.8.0, investment_advisor_engine v4.4.1).
+# v3.4.2, top10_selector v4.13.0, criteria_model v3.1.0, schema_registry
+# v2.8.0, investment_advisor_engine v4.4.2, core.buckets v1.0.0).
 # v5.3.1: top10_selector advanced 4.11.0 -> 4.12.0; engine advanced
 # 4.4.0 -> 4.4.1; sibling-version references updated here.
+# v5.3.2: _risk_bucket_from_row / _confidence_bucket_from_row routed
+# through core.buckets v1.0.0 (canonical bucket helper).
 __version__ = INVESTMENT_ADVISOR_VERSION
 
 
@@ -315,6 +374,49 @@ except ImportError:
     RECO_HOLD = "HOLD"
     RECO_REDUCE = "REDUCE"
     RECO_SELL = "SELL"
+
+
+# =============================================================================
+# v5.3.2 -- core.buckets integration (canonical risk/confidence buckets)
+# =============================================================================
+#
+# v5.3.2 routes the bucket-backfill helpers (`_risk_bucket_from_row` /
+# `_confidence_bucket_from_row`) through core.buckets v1.0.0 -- the single
+# authoritative risk/confidence bucket helper shared with data_engine_v2
+# v5.69.0+ and top10_selector v4.13.0+.
+#
+# Before v5.3.2 these helpers carried their own inline thresholds that
+# diverged from the canonical cutoffs (risk "High" at >=65 here vs >=70
+# canonical) and -- more importantly -- did NOT auto-detect a 0-1 vs
+# 0-100 confidence scale, so a forecast_confidence of 0.8 backfilled as
+# "Low" instead of HIGH. core.buckets canonical cutoffs: risk <35 LOW /
+# 35-70 MODERATE / >=70 HIGH; confidence >=75 HIGH / 50-75 MODERATE /
+# <50 LOW, with 0-1 fractions auto-scaled to 0-100.
+#
+# The orchestrator only BACKFILLS buckets (when the engine did not set
+# one); routing through core.buckets makes that backfill emit the same
+# canonical UPPERCASE labels data_engine_v2 v5.69.0+ already emits, so
+# the Risk Bucket / Confidence Bucket columns stay casing-consistent.
+#
+# The import is except-guarded; when core.buckets is unavailable the four
+# names fall back to None, `_BUCKETS_AVAILABLE` is False, and the legacy
+# inline thresholds run unchanged -- so deployments without it see zero
+# behaviour change. core.buckets has no third-party deps and no TFB
+# imports, so there is no import-cycle risk here.
+try:
+    from core.buckets import (  # type: ignore
+        risk_bucket_from_score as _bk_risk_bucket_from_score,
+        confidence_bucket_from_score as _bk_confidence_bucket_from_score,
+        normalize_risk_bucket as _bk_normalize_risk_bucket,
+        normalize_confidence_bucket as _bk_normalize_confidence_bucket,
+    )
+    _BUCKETS_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised only when core.buckets is absent
+    _bk_risk_bucket_from_score = None  # type: ignore
+    _bk_confidence_bucket_from_score = None  # type: ignore
+    _bk_normalize_risk_bucket = None  # type: ignore
+    _bk_normalize_confidence_bucket = None  # type: ignore
+    _BUCKETS_AVAILABLE = False
 
 
 # =============================================================================
@@ -2123,14 +2225,43 @@ def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
 
 
 def _risk_bucket_from_row(row: MutableMapping[str, Any]) -> str:
-    """Get risk bucket from row."""
+    """Get risk bucket from row.
+
+    v5.3.2: routes through core.buckets v1.0.0 -- the canonical
+    risk/confidence bucket helper shared with data_engine_v2 v5.69.0+
+    and top10_selector v4.13.0+. Returns the canonical UPPERCASE label
+    ("LOW" / "MODERATE" / "HIGH"). An explicit risk_bucket already on
+    the row is preferred and normalized through core.buckets so
+    casing/variant noise ("Moderate", "moderate risk") is canonicalized.
+    When core.buckets is unavailable, falls back to the legacy v5.1.1
+    inline thresholds (preserved verbatim below).
+
+    v5.1.1 contract preserved: returns "" (not a fabricated bucket)
+    when risk_score is missing.
+    """
     existing = _to_string(row.get("risk_bucket"))
     if existing:
+        if _BUCKETS_AVAILABLE and _bk_normalize_risk_bucket is not None:
+            try:
+                # normalize() returns "" for unrecognized labels -> keep raw
+                return _bk_normalize_risk_bucket(existing) or existing
+            except Exception:
+                return existing
         return existing
 
     risk = _to_float_optional(row.get("risk_score"))
     if risk is None:
         return ""  # v5.1.1: don't fabricate "Moderate" for missing data
+
+    if _BUCKETS_AVAILABLE and _bk_risk_bucket_from_score is not None:
+        try:
+            canon = _bk_risk_bucket_from_score(risk)
+            if canon:
+                return canon
+        except Exception:
+            pass
+
+    # ---- legacy fallback (v5.1.1 thresholds, preserved verbatim) ----
     if risk < 35:
         return "Low"
     if risk < 65:
@@ -2139,9 +2270,28 @@ def _risk_bucket_from_row(row: MutableMapping[str, Any]) -> str:
 
 
 def _confidence_bucket_from_row(row: MutableMapping[str, Any]) -> str:
-    """Get confidence bucket from row."""
+    """Get confidence bucket from row.
+
+    v5.3.2: routes through core.buckets v1.0.0. Returns the canonical
+    UPPERCASE label ("LOW" / "MODERATE" / "HIGH"). core.buckets
+    auto-detects the 0-1 vs 0-100 input scale, so a forecast_confidence
+    of 0.8 now correctly backfills as HIGH -- the legacy inline
+    thresholds treated it as < 50 -> "Low". An explicit
+    confidence_bucket already on the row is preferred and normalized.
+    When core.buckets is unavailable, falls back to the legacy v5.1.1
+    inline thresholds (preserved verbatim below).
+
+    v5.1.1 contract preserved: returns "" when no underlying score
+    exists. The source-score chain (confidence_score -> forecast_confidence
+    -> overall_score -> opportunity_score) is unchanged.
+    """
     existing = _to_string(row.get("confidence_bucket"))
     if existing:
+        if _BUCKETS_AVAILABLE and _bk_normalize_confidence_bucket is not None:
+            try:
+                return _bk_normalize_confidence_bucket(existing) or existing
+            except Exception:
+                return existing
         return existing
 
     score = _to_float_optional(
@@ -2150,6 +2300,16 @@ def _confidence_bucket_from_row(row: MutableMapping[str, Any]) -> str:
     )
     if score is None:
         return ""  # v5.1.1: don't fabricate "Medium" for missing data
+
+    if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
+        try:
+            canon = _bk_confidence_bucket_from_score(score)
+            if canon:
+                return canon
+        except Exception:
+            pass
+
+    # ---- legacy fallback (v5.1.1 thresholds, preserved verbatim) ----
     if score >= 75:
         return "High"
     if score >= 50:
@@ -2543,6 +2703,11 @@ def _normalize_engine_result(
             # v5.3.0 Phase H: reco_normalize delegate availability flags
             "view_aware": _is_view_aware_available(),
             "view_aware_rule_id": _is_view_aware_rule_id_available(),
+            # v5.3.2: core.buckets v1.0.0 availability -- when True, the
+            # bucket-backfill helpers emit canonical UPPERCASE labels
+            # consistent with data_engine_v2 v5.69.0+ and top10_selector
+            # v4.13.0+.
+            "buckets_canonical": _BUCKETS_AVAILABLE,
             "timestamp_utc": _now_utc_iso(),
             "offset": max(0, _to_int(offset, DEFAULT_OFFSET)),
             "limit": max(1, _to_int(limit, DEFAULT_LIMIT)),
