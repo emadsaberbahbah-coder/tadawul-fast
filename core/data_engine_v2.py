@@ -2,6 +2,71 @@
 # core/data_engine_v2.py
 """
 ================================================================================
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.69.0
+================================================================================
+
+WHY v5.69.0 — RECOMMENDATION UNIFICATION + RISK RECALIBRATION +
+              INTRINSIC-VALUE SANITY BOUNDS (May 14, 2026)
+--------------------------------------------------------------------
+Three dashboard-data-quality fixes, applied in phases:
+
+PHASE 1 — Recommendation unification (the headline bug).
+  The engine carried TWO divergent recommendation classifiers:
+  `_classify_recommendation_8tier` (8-tier) and `_compute_recommendation`
+  (a separate 4-tier BUY/ACCUMULATE/REDUCE/HOLD function). They wrote
+  `recommendation`, `recommendation_detailed`, and the `[..]` token in
+  `recommendation_reason` in an order-dependent way across five call
+  sites, so the three fields routinely disagreed on the dashboard
+  (e.g. COLB.US: main REDUCE / Detail ACCUMULATE / Reason "P3 [HOLD]").
+    v5.69.0: `_classify_recommendation_8tier` is now the SINGLE
+    authoritative writer. It canonicalizes any provider-supplied
+    recommendation through core.reco_normalize v8.0.0 (the authoritative
+    8-tier vocabulary), and writes `recommendation`,
+    `recommendation_detailed`, `recommendation_priority`, and
+    `recommendation_reason` all CONSISTENTLY from one value -- they can
+    no longer disagree. `_compute_recommendation` is retired to a thin
+    delegator so the five existing call sites are unchanged.
+
+PHASE 2 — Risk-score recalibration + canonical buckets.
+  The pre-v5.69.0 risk formula saturated: base 30.0 plus generous
+  component ceilings meant a typical equity scored ~80+ and bucketed
+  HIGH, so the Risk Bucket column was almost entirely HIGH.
+    v5.69.0 re-anchors the additive formula (base 10.0, recalibrated
+    per-component factors and caps) so a calm blue-chip lands ~30, a
+    normal equity ~50, and a genuinely volatile name ~82. risk_bucket
+    and confidence_bucket are now routed through core.buckets v1.0.0
+    (canonical UPPERCASE, recalibrated <35 LOW / 35-70 MODERATE /
+    >=70 HIGH; confidence >=75 HIGH / 50-75 MODERATE / <50 LOW) at all
+    four assignment sites. Both new imports are except-guarded with
+    inline-threshold fallbacks.
+
+PHASE 3 — Intrinsic-value sanity bounds.
+  The engine clamped `upside_pct` to +/-200% but emitted
+  `intrinsic_value` itself RAW, so a near-zero P/B (book_value = cp/pb
+  explodes) produced intrinsic_value = 21,008 vs a $105 price (INGR.US),
+  600 vs $12.87 (EC.US) -- written straight to the sheet.
+    v5.69.0 requires a trusted P/B floor, screens every individual
+    intrinsic candidate against a sane price multiple, and bounds the
+    final blended intrinsic to the same band the upside clamp implies,
+    so intrinsic_value and upside_pct stay mutually consistent.
+
+NOT IN v5.69.0 (deferred — separate focused pass):
+  The empty Confidence Score column, the empty Data Provider /
+  Last Updated columns, and the ghost "Status" bleed-through are NOT
+  addressed here. That cluster of symptoms points to a single
+  column-projection / schema-alignment defect rather than three
+  independent bugs, and pinning it down safely requires a focused trace
+  of the row-projection chain (a wrong fix there shifts every column).
+  rank_overall already does a proper global descending sort
+  (`_apply_rank_overall`) and is unchanged.
+
+[PRESERVED] All v5.68.0 provider-symbol-normalization routing +
+v5.67.0 unit-contract logic + v5.66.0 PHASE-JJ + v5.65.0 PHASE-II
++ v5.64.0 + v5.63.0 PHASE-DD + v5.62.0 PHASE-Z + v5.47.2 baseline
+logic intact. No behavior removed; the only call-path change is that
+all recommendations now flow through the single 8-tier classifier.
+
+================================================================================
 Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.68.0
 ================================================================================
 
@@ -316,7 +381,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.68.0"
+__version__ = "5.69.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -351,6 +416,61 @@ except Exception:  # pragma: no cover
     _nz_get_currency_from_symbol = None  # type: ignore
     _nz_get_primary_exchange = None  # type: ignore
     _NORMALIZE_AVAILABLE = False
+
+
+# =============================================================================
+# v5.69.0 — core.reco_normalize integration (canonical recommendation vocab)
+# =============================================================================
+# v5.69.0 routes recommendation classification through core.reco_normalize
+# (v8.0.0+), the single authoritative 8-tier recommendation vocabulary
+# (STRONG_BUY / BUY / ACCUMULATE / HOLD / REDUCE / SELL / STRONG_SELL /
+# AVOID). Before this, the engine carried TWO divergent classifiers --
+# `_classify_recommendation_8tier` (8-tier) and `_compute_recommendation`
+# (4-tier) -- which wrote `recommendation`, `recommendation_detailed`, and
+# the `[..]` token inside `recommendation_reason` in an order-dependent
+# way, so the three fields routinely disagreed (e.g. main REDUCE / Detail
+# ACCUMULATE / Reason "P3 [HOLD]"). The import is except-guarded so a
+# missing or older module degrades to the in-engine 8-tier logic via
+# `_RECO_NORMALIZE_AVAILABLE`.
+try:
+    from core.reco_normalize import (
+        normalize_recommendation as _rn_normalize_recommendation,
+        is_valid_recommendation as _rn_is_valid_recommendation,
+        get_recommendation_score as _rn_get_recommendation_score,
+    )
+    _RECO_NORMALIZE_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _rn_normalize_recommendation = None  # type: ignore
+    _rn_is_valid_recommendation = None  # type: ignore
+    _rn_get_recommendation_score = None  # type: ignore
+    _RECO_NORMALIZE_AVAILABLE = False
+
+
+# =============================================================================
+# v5.69.0 — core.buckets integration (canonical risk/confidence buckets)
+# =============================================================================
+# v5.69.0 routes risk_bucket / confidence_bucket through core.buckets
+# (v1.0.0+), the single authoritative bucket helper. Before this, the
+# engine computed buckets inline with thresholds that diverged from
+# scoring.py, investment_advisor.py, and investment_advisor_engine.py.
+# core.buckets uses UPPERCASE canonical labels and the recalibrated
+# risk split (<35 LOW / 35-70 MODERATE / >=70 HIGH). The import is
+# except-guarded; on failure the engine falls back to its inline
+# threshold logic via `_BUCKETS_AVAILABLE`.
+try:
+    from core.buckets import (
+        risk_bucket_from_score as _bk_risk_bucket_from_score,
+        confidence_bucket_from_score as _bk_confidence_bucket_from_score,
+        normalize_risk_bucket as _bk_normalize_risk_bucket,
+        normalize_confidence_bucket as _bk_normalize_confidence_bucket,
+    )
+    _BUCKETS_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _bk_risk_bucket_from_score = None  # type: ignore
+    _bk_confidence_bucket_from_score = None  # type: ignore
+    _bk_normalize_risk_bucket = None  # type: ignore
+    _bk_normalize_confidence_bucket = None  # type: ignore
+    _BUCKETS_AVAILABLE = False
 
 
 # =============================================================================
@@ -717,6 +837,41 @@ def _apply_phase_bb_sanity(row: Dict[str, Any]) -> Dict[str, Any]:
 _INTRINSIC_UPSIDE_MIN_PCT: float = -90.0
 _INTRINSIC_UPSIDE_MAX_PCT: float = 200.0
 
+# v5.69.0 — INTRINSIC-VALUE SANITY BOUNDS.
+# Pre-v5.69.0 the engine clamped `upside_pct` to +/-200% but emitted
+# `intrinsic_value` itself RAW. A single bad input -- most often a
+# near-zero P/B ratio, which makes book_value = cp / pb explode -- could
+# produce intrinsic_value = 21,008 against a $105 price (INGR.US), or
+# 600 against $12.87 (EC.US). The raw outlier was written straight to
+# the sheet.
+# v5.69.0 (a) screens each individual candidate and drops any that is
+# more than _INTRINSIC_CANDIDATE_MAX_MULT x or less than
+# _INTRINSIC_CANDIDATE_MIN_MULT x the current price (those are data
+# errors, not valuations), and (b) bounds the final blended intrinsic to
+# [MIN_MULT, MAX_MULT] x current price -- the same band the upside clamp
+# already implies (-90%..+200%), so intrinsic_value and upside_pct stay
+# mutually consistent.
+_INTRINSIC_VALUE_MIN_MULT: float = 1.0 + (_INTRINSIC_UPSIDE_MIN_PCT / 100.0)  # 0.10x cp
+_INTRINSIC_VALUE_MAX_MULT: float = 1.0 + (_INTRINSIC_UPSIDE_MAX_PCT / 100.0)  # 3.00x cp
+# A single candidate is allowed a slightly wider berth than the final
+# blended value before being discarded as a data error.
+_INTRINSIC_CANDIDATE_MIN_MULT: float = 0.05
+_INTRINSIC_CANDIDATE_MAX_MULT: float = 5.0
+# Floor on P/B before it is trusted to derive book value: pb below this
+# makes cp / pb explode and is almost always a data error.
+_INTRINSIC_MIN_TRUSTED_PB: float = 0.10
+
+
+def _intrinsic_candidate_ok(value: float, cp: float) -> bool:
+    """v5.69.0: True if an intrinsic-value candidate is within a sane
+    multiple of the current price. Outliers (near-zero P/B blow-ups, EPS
+    reported in the wrong unit, bad forecast prices) are rejected here so
+    they never reach the blended intrinsic."""
+    if value is None or cp is None or cp <= 0 or value <= 0:
+        return False
+    mult = value / cp
+    return _INTRINSIC_CANDIDATE_MIN_MULT <= mult <= _INTRINSIC_CANDIDATE_MAX_MULT
+
 
 def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     if not isinstance(row, dict):
@@ -755,19 +910,27 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
 
     if eps is not None and eps > 0:
         pe_fair = eps * fair_pe
-        if pe_fair > 0:
+        # v5.69.0: screen the EPS-multiple candidate against price sanity.
+        if pe_fair > 0 and _intrinsic_candidate_ok(pe_fair, cp):
             candidates.append(pe_fair)
             weights.append(0.4)
 
     if forecast_12m is not None and forecast_12m > 0:
-        candidates.append(forecast_12m)
-        weights.append(0.4)
+        # v5.69.0: screen the forecast-price candidate.
+        if _intrinsic_candidate_ok(forecast_12m, cp):
+            candidates.append(forecast_12m)
+            weights.append(0.4)
 
-    if pb is not None and pb > 0 and pb < 20:
+    # v5.69.0: require a TRUSTED P/B (>= _INTRINSIC_MIN_TRUSTED_PB). A
+    # near-zero P/B was the primary cause of intrinsic_value blow-ups
+    # (book_value = cp / pb -> huge). The candidate is also screened.
+    if pb is not None and _INTRINSIC_MIN_TRUSTED_PB <= pb < 20:
         book_value = cp / pb
         if book_value > 0:
-            candidates.append(book_value * 1.5)
-            weights.append(0.2)
+            pb_candidate = book_value * 1.5
+            if _intrinsic_candidate_ok(pb_candidate, cp):
+                candidates.append(pb_candidate)
+                weights.append(0.2)
 
     if not candidates:
         return
@@ -776,6 +939,14 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     if total_w <= 0:
         return
     intrinsic = sum(c * w for c, w in zip(candidates, weights)) / total_w
+
+    # v5.69.0: bound the blended intrinsic to a sane multiple of price.
+    # Even after per-candidate screening, a blend can drift; this is the
+    # final guard so intrinsic_value can never be the +200%-clamp outlier
+    # the dashboard was showing. The bounds match the upside clamp band,
+    # so intrinsic_value and upside_pct remain mutually consistent.
+    intrinsic = max(cp * _INTRINSIC_VALUE_MIN_MULT,
+                    min(cp * _INTRINSIC_VALUE_MAX_MULT, intrinsic))
 
     # v5.67.0: emit upside_pct as FRACTION (was POINTS). The cap constants
     # _INTRINSIC_UPSIDE_MIN_PCT / MAX_PCT remain in points form for
@@ -859,7 +1030,69 @@ def _derive_views(row: Dict[str, Any]) -> None:
         row["value_view"] = row.get("value_view") or vv
 
 
+# v5.69.0: canonical 8-tier priority map (best -> worst == priority 1 -> 8).
+# Mirrors core.reco_normalize's ordering. Used to derive a consistent
+# recommendation_priority whether the recommendation came from this
+# engine's score-based classifier or from an upstream provider string.
+_RECO_8TIER_PRIORITY: Dict[str, int] = {
+    "STRONG_BUY": 1,
+    "BUY": 2,
+    "ACCUMULATE": 3,
+    "HOLD": 4,
+    "REDUCE": 5,
+    "SELL": 6,
+    "STRONG_SELL": 7,
+    "AVOID": 8,
+}
+
+
+def _canonical_recommendation(value: Any) -> str:
+    """v5.69.0: canonicalize any recommendation string/number to the 8-tier
+    vocabulary. Routes through core.reco_normalize when available; otherwise
+    falls back to a conservative local upper-case match. Returns "" only for
+    genuinely unrecognizable input."""
+    if value in (None, ""):
+        return ""
+    if _RECO_NORMALIZE_AVAILABLE and _rn_normalize_recommendation is not None:
+        try:
+            canon = _safe_str(_rn_normalize_recommendation(value)).upper()
+            if canon in _RECO_8TIER_PRIORITY:
+                return canon
+        except Exception:
+            pass
+    # Fallback: direct match against the canonical set (handles the common
+    # case where the value is already canonical, e.g. engine-computed).
+    raw = _safe_str(value).upper().replace("-", "_").replace(" ", "_")
+    return raw if raw in _RECO_8TIER_PRIORITY else ""
+
+
+def _recommendation_priority(rec: str) -> int:
+    """v5.69.0: priority 1 (best) .. 8 (worst) for a canonical recommendation.
+    Unknown -> 4 (HOLD-equivalent neutral)."""
+    return _RECO_8TIER_PRIORITY.get(_safe_str(rec).upper(), 4)
+
+
 def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
+    """v5.69.0 — SINGLE AUTHORITATIVE recommendation writer.
+
+    Before v5.69.0 the engine had two divergent classifiers and three
+    fields (`recommendation`, `recommendation_detailed`, and the `[..]`
+    token in `recommendation_reason`) that were each written in a
+    different, order-dependent place -- so they routinely disagreed.
+
+    v5.69.0 contract:
+      * If an upstream provider already supplied `recommendation`, that
+        value is treated as authoritative and is canonicalized through
+        core.reco_normalize (so "Strong Buy", "outperform", a 1-5 rating,
+        Arabic, etc. all collapse to the 8-tier vocabulary). No regression
+        on legitimately provider-supplied recommendations.
+      * Otherwise the engine's own score+view classifier produces the
+        8-tier value.
+      * `recommendation` and `recommendation_detailed` are then set to the
+        SAME canonical value, `recommendation_priority` is derived from it,
+        and `recommendation_reason` references that SAME value. The three
+        fields can no longer disagree.
+    """
     if not isinstance(row, dict):
         return
 
@@ -872,51 +1105,65 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     technical = _safe_str(row.get("technical_view")).upper()
     fundamental = _safe_str(row.get("fundamental_view")).upper()
 
-    if overall is None:
+    # ------------------------------------------------------------------
+    # v5.69.0: was an authoritative recommendation already supplied
+    # upstream? If so it wins -- but it is canonicalized first so the
+    # vocabulary stays consistent with the engine-computed path.
+    # ------------------------------------------------------------------
+    preset = _canonical_recommendation(row.get("recommendation"))
+
+    rec: Optional[str] = None
+    priority: Optional[int] = None
+    classified_by = ""
+
+    if preset:
+        rec = preset
+        priority = _recommendation_priority(rec)
+        classified_by = "provider"
+    elif overall is not None:
+        # Engine's own score + view classifier (8-tier).
+        if overall >= 80 and upside_points is not None and upside_points >= 25 and risk_bucket != "HIGH":
+            rec, priority = "STRONG_BUY", 1
+        elif overall >= 70 and upside_points is not None and upside_points >= 15:
+            rec, priority = "BUY", 2
+        elif overall >= 60 and (value_view in ("CHEAP", "FAIR") or technical == "BULLISH"):
+            rec, priority = "ACCUMULATE", 3
+        elif overall >= 40:
+            rec, priority = "HOLD", 4
+        elif overall >= 30 and value_view == "EXPENSIVE":
+            rec, priority = "REDUCE", 5
+        elif overall >= 20:
+            rec, priority = "SELL", 6
+        elif risk_bucket == "HIGH":
+            rec, priority = "STRONG_SELL", 7
+        else:
+            rec, priority = "AVOID", 8
+        classified_by = "engine"
+
+    if rec is None:
+        # No upstream value and no overall_score -> cannot classify.
+        # Leave the fields untouched rather than fabricating a label.
         return
 
-    if overall >= 80 and upside_points is not None and upside_points >= 25 and risk_bucket != "HIGH":
-        rec = "STRONG_BUY"
-        priority = 1
-    elif overall >= 70 and upside_points is not None and upside_points >= 15:
-        rec = "BUY"
-        priority = 2
-    elif overall >= 60 and (value_view in ("CHEAP", "FAIR") or technical == "BULLISH"):
-        rec = "ACCUMULATE"
-        priority = 3
-    elif overall >= 40 or (overall is not None and 35 <= overall < 60):
-        rec = "HOLD"
-        priority = 4
-    elif overall >= 30 and value_view == "EXPENSIVE":
-        rec = "REDUCE"
-        priority = 5
-    elif overall >= 20:
-        rec = "SELL"
-        priority = 6
-    elif overall < 20 and risk_bucket == "HIGH":
-        rec = "STRONG_SELL"
-        priority = 7
-    else:
-        rec = "AVOID"
-        priority = 8
-
-    if not row.get("recommendation"):
-        row["recommendation"] = rec
-    if not row.get("recommendation_priority"):
-        row["recommendation_priority"] = priority
-    if not row.get("recommendation_detailed"):
-        row["recommendation_detailed"] = rec
+    # ------------------------------------------------------------------
+    # v5.69.0: write all three fields CONSISTENTLY from the single `rec`.
+    # These are overwrites, not fill-if-empty: the whole point is to
+    # eliminate the case where `recommendation` and `recommendation_detailed`
+    # were set by different code paths and disagreed.
+    # ------------------------------------------------------------------
+    row["recommendation"] = rec
+    row["recommendation_detailed"] = rec
+    row["recommendation_priority"] = priority
 
     fv = fundamental or "NEUTRAL"
     tv = technical or "NEUTRAL"
     rv = risk_bucket or "MODERATE"
     vv = value_view or "FAIR"
-    actual_rec = row.get("recommendation", rec)
-    if not row.get("recommendation_reason"):
-        row["recommendation_reason"] = (
-            f"P{priority} [{actual_rec}]: "
-            f"Fund {fv} | Tech {tv} | Risk {rv} | Val {vv}"
-        )
+    row["recommendation_reason"] = (
+        f"P{priority} [{rec}]: "
+        f"Fund {fv} | Tech {tv} | Risk {rv} | Val {vv} "
+        f"(via {classified_by})"
+    )
 
 
 def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
@@ -3049,7 +3296,17 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             conf = conf_fraction * 100.0 if conf_fraction <= 1.5 else conf_fraction
             out.setdefault("confidence_score", round(_clamp(conf, 0.0, 100.0), 2))
     if conf is not None and out.get("confidence_bucket") in (None, ""):
-        out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
+        # v5.69.0: route through core.buckets (canonical thresholds:
+        # >=75 HIGH / 50-75 MODERATE / <50 LOW). Guarded inline fallback.
+        _cb = ""
+        if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
+            try:
+                _cb = _bk_confidence_bucket_from_score(conf)
+            except Exception:
+                _cb = ""
+        if not _cb:
+            _cb = "HIGH" if conf >= 75 else "MODERATE" if conf >= 50 else "LOW"
+        out["confidence_bucket"] = _cb
 
     if target == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
         out.setdefault("data_provider", _safe_str(out.get("data_provider"), "history_or_fallback"))
@@ -3059,7 +3316,16 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             out["confidence_score"] = 55.0
         if out.get("forecast_confidence") not in (None, "") and out.get("confidence_bucket") in (None, ""):
             conf = _as_float(out.get("confidence_score")) or ((_as_float(out.get("forecast_confidence")) or 0.55) * 100.0)
-            out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
+            # v5.69.0: route through core.buckets; guarded inline fallback.
+            _cb = ""
+            if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
+                try:
+                    _cb = _bk_confidence_bucket_from_score(conf)
+                except Exception:
+                    _cb = ""
+            if not _cb:
+                _cb = "HIGH" if conf >= 75 else "MODERATE" if conf >= 50 else "LOW"
+            out["confidence_bucket"] = _cb
         if out.get("warnings") in (None, "") and _as_float(out.get("current_price")) is None:
             out["warnings"] = "Live quote sparse; chart/history fallback unavailable"
 
@@ -3202,21 +3468,47 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     row.setdefault("confidence_score", round(_clamp(conf * 100.0, 0.0, 100.0), 2))
 
     if row.get("risk_score") is None:
+        # v5.69.0 — RISK FORMULA RECALIBRATION.
+        #
+        # The pre-v5.69.0 formula saturated: base 30.0 plus generous
+        # component ceilings meant a *typical* equity (~28% annualized
+        # vol, ~30% max annual drawdown, ~2.5% daily VaR, beta ~1.0)
+        # scored ~80+ and bucketed HIGH -- so the dashboard's Risk
+        # Bucket column was almost entirely HIGH.
+        #
+        # v5.69.0 re-anchors the additive formula so that:
+        #   * a calm blue-chip (~15% vol / ~15% DD / ~1.5% VaR / 0.8 beta)
+        #     lands ~30  (LOW / low-MODERATE)
+        #   * a normal equity (~28% vol / ~30% DD / ~2.5% VaR / 1.0 beta)
+        #     lands ~50  (mid-MODERATE)
+        #   * a volatile name (~50% vol / ~55% DD / ~5% VaR / 1.6 beta)
+        #     lands ~82  (HIGH)
+        #
+        # `_as_pct_points` is still used for scale tolerance: it treats a
+        # value with |v| <= 1.5 as a fraction (x100) and anything larger
+        # as already in points. The in-engine emit site annualizes daily
+        # return std (x sqrt(252)), so volatility_90d arrives as an
+        # annualized fraction (~0.10-0.60) and converts cleanly. The
+        # recalibrated per-component caps below also bound the damage if
+        # an upstream provider mis-scales a field.
         vol = _as_pct_points(row.get("volatility_90d"))
-        # v5.67.0: max_drawdown_1y now stored as SIGNED FRACTION (e.g. -0.338).
-        # _as_pct_points converts to signed points (-33.8). Use abs() so risk
-        # contribution doesn't zero out via max(x, 0) on negative values.
+        # v5.67.0: max_drawdown_1y is a SIGNED FRACTION (e.g. -0.338);
+        # _as_pct_points -> signed points (-33.8); abs() below.
         drawdown = _as_pct_points(row.get("max_drawdown_1y"))
         var95 = _as_pct_points(row.get("var_95_1d"))
-        risk_score = 30.0
+        risk_score = 10.0  # was 30.0 — lowered base
         if vol is not None:
-            risk_score += min(max(vol, 0.0), 35.0)
+            # annualized vol points; ~28% normal -> ~16. cap 30.
+            risk_score += min(max(vol, 0.0) * 0.57, 30.0)
         if drawdown is not None:
-            risk_score += min(abs(drawdown), 20.0) * 0.6
+            # abs drawdown points; ~30% normal -> ~12. cap 24.
+            risk_score += min(abs(drawdown) * 0.40, 24.0)
         if var95 is not None:
-            risk_score += min(abs(var95), 12.0)
+            # abs daily VaR points; ~2.5% normal -> ~7. cap 15.
+            risk_score += min(abs(var95) * 2.80, 15.0)
         if beta is not None:
-            risk_score += min(max(beta * 8.0, 0.0), 15.0)
+            # beta ~1.0 normal -> ~5. cap 12.
+            risk_score += min(max(beta, 0.0) * 5.00, 12.0)
         row["risk_score"] = round(_clamp(float(risk_score), 0.0, 100.0), 2)
 
     if row.get("overall_score") is None:
@@ -3267,33 +3559,52 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         row["opportunity_score"] = round(_clamp(base + confidence_boost + roi_boost - risk_penalty, 0.0, 100.0), 2)
 
     if not row.get("risk_bucket"):
-        rs = _as_float(row.get("risk_score")) or 50.0
-        row["risk_bucket"] = "LOW" if rs < 40 else "MODERATE" if rs < 70 else "HIGH"
+        # v5.69.0: route through core.buckets (canonical UPPERCASE,
+        # recalibrated <35 LOW / 35-70 MODERATE / >=70 HIGH). Guarded
+        # fallback to the inline thresholds if core.buckets is missing.
+        rs = _as_float(row.get("risk_score"))
+        rb = ""
+        if _BUCKETS_AVAILABLE and _bk_risk_bucket_from_score is not None:
+            try:
+                rb = _bk_risk_bucket_from_score(rs)
+            except Exception:
+                rb = ""
+        if not rb:
+            rs_f = rs if rs is not None else 50.0
+            rb = "LOW" if rs_f < 35 else "MODERATE" if rs_f < 70 else "HIGH"
+        row["risk_bucket"] = rb
 
     if not row.get("confidence_bucket"):
-        cs = _as_float(row.get("confidence_score")) or 55.0
-        row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
+        # v5.69.0: route through core.buckets (auto-detects 0-1 vs 0-100
+        # input scale, canonical UPPERCASE). Guarded inline fallback.
+        cs = _as_float(row.get("confidence_score"))
+        cb = ""
+        if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
+            try:
+                cb = _bk_confidence_bucket_from_score(cs)
+            except Exception:
+                cb = ""
+        if not cb:
+            cs_f = cs if cs is not None else 55.0
+            cb = "HIGH" if cs_f >= 75 else "MODERATE" if cs_f >= 50 else "LOW"
+        row["confidence_bucket"] = cb
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
-    if row.get("recommendation"):
-        return
-    overall = _as_float(row.get("overall_score")) or 50.0
-    conf = _as_float(row.get("confidence_score")) or 55.0
-    risk = _as_float(row.get("risk_score")) or 50.0
-    if overall >= 75 and conf >= 65 and risk <= 60:
-        rec = "BUY"
-    elif overall >= 60 and conf >= 55:
-        rec = "ACCUMULATE"
-    elif overall <= 35 or risk >= 85:
-        rec = "REDUCE"
-    else:
-        rec = "HOLD"
-    row["recommendation"] = rec
-    row.setdefault(
-        "recommendation_reason",
-        f"overall={round(overall,1)} confidence={round(conf,1)} risk={round(risk,1)}",
-    )
+    """v5.69.0 — RETIRED as an independent classifier.
+
+    This used to be a second, divergent 4-tier classifier (BUY /
+    ACCUMULATE / REDUCE / HOLD only) that competed with
+    `_classify_recommendation_8tier` and produced the
+    main-vs-Detail-vs-Reason disagreement seen on the dashboard.
+
+    It is kept as a thin delegator so the five existing call sites do
+    not need to change: every recommendation now flows through the
+    SINGLE authoritative 8-tier classifier, which also routes through
+    core.reco_normalize. Calling this on a row that already has a
+    consistent recommendation is idempotent.
+    """
+    _classify_recommendation_8tier(row)
 
 
 def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
