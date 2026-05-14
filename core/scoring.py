@@ -2,8 +2,10 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.2.8
+Scoring Module — v5.2.9
 (CANONICAL RECOMMENDATION SOURCE OF TRUTH — PRIORITY-EMITTING — PROVENANCE-TAGGED /
+ [v5.2.9] CANONICAL-BUCKETS-ALIGNED (routes risk/confidence buckets through
+ core.buckets v1.0.0 — last module in the stack to do so) /
  [PRESERVED v5.2.6] DATA_ENGINE_V2 v5.67.0 FRACTION-CONTRACT ALIGNMENT /
  [PRESERVED v5.2.5] CROSS-PROVIDER CONTRACT ALIGNMENT WITH v4.7.3 / v6.1.0 /
  v8.2.0 / v4.3.0 PROVIDERS + DATA_ENGINE_V2 v5.60.0 /
@@ -16,6 +18,86 @@ Scoring Module — v5.2.8
  ACCUMULATE-ALIGNED / 5-TIER + CONVICTION FLOORS /
  INSIGHTS-INTEGRATED / PHANTOM-ROW-SAFE / SCHEMA-ALIGNED /
  v5.53.0 / v5.60.0 / v5.67.0 ENGINE-UNIT COMPATIBLE)
+================================================================================
+
+v5.2.9 changes (vs v5.2.8)  —  CANONICAL-BUCKETS ALIGNMENT
+-----------------------------------------------------------
+Routes scoring.py's `risk_bucket` and `confidence_bucket` helpers through
+the canonical `core.buckets` v1.0.0 module, eliminating the last pocket of
+divergent bucket math in the TFB Python stack.
+
+THE DIVERGENCE
+--------------
+core.buckets v1.0.0 was established as the SINGLE authoritative bucket
+helper, and over a sequence of releases the rest of the stack was routed
+through it:
+  - data_engine_v2          v5.70.0  (all 4 bucket assignment sites)
+  - core/analysis/top10_selector  v4.13.0
+  - core/investment_advisor (orchestrator)  v5.3.2
+  - core/investment_advisor_engine          v4.4.2
+
+scoring.py was the one module still carrying its OWN bucket math:
+  - `risk_bucket`:        Title-case "Low" / "Moderate" / "High",
+                          thresholds  <=35  /  <=65
+  - `confidence_bucket`:  Title-case "High" / "Medium" / "Low",
+                          thresholds  >=0.75  /  >=0.50  (0-1 fraction)
+
+core.buckets is canonical UPPERCASE — "LOW" / "MODERATE" / "HIGH" for
+risk (thresholds <35 / 35-70 / >=70) and "LOW" / "MODERATE" / "HIGH"
+for confidence (note: middle tier "MODERATE", not "Medium"; 0-100-scale-
+aware with auto-detection of 0-1 fraction input). So scoring.py's
+`AssetScores.risk_bucket` / `AssetScores.confidence_bucket` row fields
+disagreed with every other module's bucket fields — both in CASING and,
+at the threshold boundaries, in TIER.
+
+THE FIX (this file)
+-------------------
+PHASE 1 — except-guarded `core.buckets` import.
+  New module-level guarded import block (right after
+  RECOMMENDATION_SOURCE_TAG) binds `_bk_risk_bucket_from_score`,
+  `_bk_confidence_bucket_from_score`, `_bk_normalize_risk_bucket`,
+  `_bk_normalize_confidence_bucket`, and the `_BUCKETS_AVAILABLE` flag.
+  This is the same except-guarded cross-module-dependency pattern used
+  by data_engine_v2, top10_selector, and the investment_advisor pair.
+
+PHASE 2 — `risk_bucket` / `confidence_bucket` rewritten.
+  When `_BUCKETS_AVAILABLE`, both helpers route through core.buckets and
+  emit the CANONICAL UPPERCASE bucket. When core.buckets is NOT
+  importable, the LEGACY v5.2.8 inline thresholds run unchanged
+  (PRESERVED VERBATIM) — a deployment shipping scoring.py without
+  core/buckets.py sees ZERO behaviour change. The `None` -> `None`
+  contract is preserved on BOTH paths (a None input short-circuits
+  before either branch), and any unexpected core.buckets failure falls
+  through to the legacy path rather than raising.
+
+PHASE 3 — version bump + capability surface.
+  Version 5.2.8 -> 5.2.9; this changelog block; new module-level
+  `BUCKETS_CANONICAL` constant (True when the canonical path is live)
+  exported in `__all__` so audit / diagnostic tooling can confirm the
+  canonical bucket path is active.
+
+[NOT TOUCHED — deliberately]
+  - `derive_risk_view` is SEPARATE from `risk_bucket`: it builds the
+    UPPERCASE view-prefix token ("LOW"/"MODERATE"/"HIGH") and is left
+    byte-identical — it is not a bucket helper and routing it through
+    core.buckets would be a double-transform.
+  - All recommendation logic (`compute_recommendation`,
+    `_compute_priority`, `normalize_recommendation_code`,
+    `derive_canonical_recommendation`, `apply_canonical_recommendation`).
+    scoring.py's 5-tier canonical recommendation set remains the
+    established contract; the 5-tier-vs-8-tier reco_normalize question
+    is out of scope for a bucket-alignment release.
+  - `ScoringConfig.risk_low_threshold` / `risk_moderate_threshold` /
+    `confidence_high` / `confidence_medium` are KEPT — they still drive
+    the legacy fallback path and the env-tuning surface.
+
+[PRESERVED — strictly] All v5.2.8 / v5.2.7 / v5.2.6 / v5.2.5 / v5.2.4 /
+v5.2.3 / v5.2.2 / v5.2.1 / v5.2.0 helpers, signatures, dataclass fields,
+behaviors, constants, and the entire prior narrative. `risk_bucket` and
+`confidence_bucket` keep their exact signatures and were already in
+`__all__`; the only `__all__` change is the additive `BUCKETS_CANONICAL`
+export. Public API surface is strictly extended; no removals.
+
 ================================================================================
 
 v5.2.8 changes (vs v5.2.7)  —  FIELD-NAME COLLISION FIX
@@ -221,10 +303,11 @@ Defensive shape helpers, view-prefix builder, view-completeness
 hardening, canonical recommendation alignment, insights_builder
 integration.
 
-Public API (extended in v5.2.7):
-  All v5.2.6 exports preserved. New: derive_canonical_recommendation,
+Public API (extended in v5.2.9):
+  All v5.2.8 exports preserved. New in v5.2.9: BUCKETS_CANONICAL.
+  (v5.2.7 added: derive_canonical_recommendation,
   apply_canonical_recommendation, RECOMMENDATION_SOURCE_TAG,
-  CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5.
+  CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5.)
 ================================================================================
 """
 
@@ -255,13 +338,64 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "5.2.8"
+__version__ = "5.2.9"
 SCORING_VERSION = __version__
 
 # v5.2.7: provenance tag emitted by compute_scores + apply_canonical_recommendation.
 # Downstream engines (investment_advisor_engine, data_engine_v2) read this to
 # decide whether a row has already been canonically scored (idempotency guard).
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
+
+# =============================================================================
+# v5.2.9 — core.buckets integration  (NEW)
+# =============================================================================
+#
+# v5.2.9 routes scoring.py's `risk_bucket` and `confidence_bucket` helpers
+# through the canonical core.buckets v1.0.0 module — the single authoritative
+# bucket helper that data_engine_v2 v5.70.0, top10_selector v4.13.0, the
+# investment_advisor orchestrator v5.3.2, and the investment_advisor engine
+# v4.4.2 already route through. Before v5.2.9, scoring.py carried its own
+# divergent bucket math (Title-case "Low"/"Moderate"/"High", confidence
+# "High"/"Medium"/"Low", thresholds <=35 / <=65) — the last module in the
+# stack with non-canonical bucket logic.
+#
+# The import is except-guarded exactly like every other cross-module
+# dependency in this codebase: when core.buckets is importable, scoring.py
+# emits the CANONICAL UPPERCASE buckets; when it is NOT importable (a
+# deployment that ships scoring.py without core/buckets.py), the LEGACY
+# v5.2.8 inline thresholds are preserved verbatim as the fallback, so such
+# a deployment sees ZERO behaviour change. `_BUCKETS_AVAILABLE` records
+# which path is live and is surfaced via the module-level
+# `BUCKETS_CANONICAL` capability constant.
+try:
+    from core.buckets import (  # noqa: WPS433
+        risk_bucket_from_score as _bk_risk_bucket_from_score,
+        confidence_bucket_from_score as _bk_confidence_bucket_from_score,
+        normalize_risk_bucket as _bk_normalize_risk_bucket,
+        normalize_confidence_bucket as _bk_normalize_confidence_bucket,
+    )
+    _BUCKETS_AVAILABLE = True
+except Exception:  # ImportError or any partial-install failure
+    try:
+        from buckets import (  # noqa: WPS433
+            risk_bucket_from_score as _bk_risk_bucket_from_score,
+            confidence_bucket_from_score as _bk_confidence_bucket_from_score,
+            normalize_risk_bucket as _bk_normalize_risk_bucket,
+            normalize_confidence_bucket as _bk_normalize_confidence_bucket,
+        )
+        _BUCKETS_AVAILABLE = True
+    except Exception:
+        _bk_risk_bucket_from_score = None  # type: ignore
+        _bk_confidence_bucket_from_score = None  # type: ignore
+        _bk_normalize_risk_bucket = None  # type: ignore
+        _bk_normalize_confidence_bucket = None  # type: ignore
+        _BUCKETS_AVAILABLE = False
+
+# v5.2.9: capability constant — True when risk_bucket/confidence_bucket are
+# routing through canonical core.buckets, False when the legacy v5.2.8
+# inline-threshold fallback is live. Exported in __all__ so downstream
+# audit/diagnostic tooling can confirm the canonical bucket path is active.
+BUCKETS_CANONICAL: bool = _BUCKETS_AVAILABLE
 
 # =============================================================================
 # Time Helpers
@@ -1857,8 +1991,40 @@ def compute_opportunity_score(
 
 
 def risk_bucket(score: Optional[float]) -> Optional[str]:
+    """
+    Map a 0-100 risk score to a risk bucket.
+
+    v5.2.9: When core.buckets is available (`_BUCKETS_AVAILABLE`), routes
+    through the canonical `core.buckets.risk_bucket_from_score`, which
+    returns the CANONICAL UPPERCASE bucket ("LOW" / "MODERATE" / "HIGH")
+    on the canonical thresholds (<35 LOW / 35-70 MODERATE / >=70 HIGH).
+    This aligns scoring.py with data_engine_v2 v5.70.0, top10_selector
+    v4.13.0, and the investment_advisor pair, all of which already route
+    bucket math through core.buckets v1.0.0.
+
+    LEGACY FALLBACK (v5.2.8 — PRESERVED VERBATIM): when core.buckets is
+    NOT importable, the original inline thresholds run unchanged
+    (Title-case "Low" / "Moderate" / "High" on <=35 / <=65), so a
+    deployment shipping scoring.py without core/buckets.py sees ZERO
+    behaviour change.
+
+    The `None` -> `None` contract is preserved on BOTH paths: a None
+    score short-circuits before either branch.
+    """
     if score is None:
         return None
+    if _BUCKETS_AVAILABLE and _bk_risk_bucket_from_score is not None:
+        try:
+            result = _bk_risk_bucket_from_score(score)
+            if result:
+                # core.buckets RiskBucket is a str-Enum; coerce to a plain
+                # str so AssetScores.risk_bucket and downstream dict
+                # consumers always see a bare string.
+                return str(result)
+        except Exception as exc:  # never let a bucket helper failure
+            logger.debug("core.buckets.risk_bucket_from_score failed: %s", exc)
+        # fall through to the legacy path on any failure
+    # --- LEGACY v5.2.8 inline thresholds (PRESERVED VERBATIM) ---
     if score <= _CONFIG.risk_low_threshold:
         return "Low"
     if score <= _CONFIG.risk_moderate_threshold:
@@ -1867,8 +2033,43 @@ def risk_bucket(score: Optional[float]) -> Optional[str]:
 
 
 def confidence_bucket(conf01: Optional[float]) -> Optional[str]:
+    """
+    Map a 0-1 confidence fraction to a confidence bucket.
+
+    v5.2.9: When core.buckets is available (`_BUCKETS_AVAILABLE`), routes
+    through the canonical `core.buckets.confidence_bucket_from_score`,
+    which returns the CANONICAL UPPERCASE bucket ("LOW" / "MODERATE" /
+    "HIGH"). core.buckets auto-detects input scale — a value in [0,1.5]
+    is treated as a 0-1 fraction — so passing scoring.py's 0-1 `conf01`
+    directly is correct (0.80 -> HIGH, 0.60 -> MODERATE, 0.30 -> LOW).
+    Note the canonical middle tier is "MODERATE", not the legacy
+    "Medium".
+
+    LEGACY FALLBACK (v5.2.8 — PRESERVED VERBATIM): when core.buckets is
+    NOT importable, the original inline thresholds run unchanged
+    (Title-case "High" / "Medium" / "Low" on >=0.75 / >=0.50 of the 0-1
+    fraction), so a deployment shipping scoring.py without
+    core/buckets.py sees ZERO behaviour change.
+
+    The `None` -> `None` contract is preserved on BOTH paths: a None
+    conf01 short-circuits before either branch.
+    """
     if conf01 is None:
         return None
+    if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
+        try:
+            # conf01 is a 0-1 fraction; core.buckets auto-detects the
+            # scale and treats [0,1.5] as a fraction (x100 internally).
+            result = _bk_confidence_bucket_from_score(conf01)
+            if result:
+                # core.buckets ConfidenceBucket is a str-Enum; coerce to
+                # a plain str for AssetScores.confidence_bucket and
+                # downstream dict consumers.
+                return str(result)
+        except Exception as exc:
+            logger.debug("core.buckets.confidence_bucket_from_score failed: %s", exc)
+        # fall through to the legacy path on any failure
+    # --- LEGACY v5.2.8 inline thresholds (PRESERVED VERBATIM) ---
     if conf01 >= _CONFIG.confidence_high:
         return "High"
     if conf01 >= _CONFIG.confidence_medium:
@@ -3044,4 +3245,6 @@ __all__ = [
     "PRIO_P3",
     "PRIO_P4",
     "PRIO_P5",
+    # v5.2.9 additions
+    "BUCKETS_CANONICAL",
 ]
