@@ -2,69 +2,85 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization -- v7.1.0 (COUNTRY-AWARE / CURRENCY-COMPLETE)
+Symbol Normalization -- v7.2.0 (PROVIDER-SYMBOL-CORRECT / COUNTRY-AWARE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
 
-v7.1.0 Changes (from v7.0.0)
+v7.2.0 Changes (from v7.1.0)
 ----------------------------
-NEW (audit fix - country=USA for .L/.DE etc.):
-  - `get_country_from_symbol(symbol) -> Optional[str]` returns a display-
-    friendly country name ("United Kingdom", "Germany", "Saudi Arabia",
-    "United States", etc.) for any symbol whose listing country can be
-    resolved from its exchange suffix or known overrides.
-    
-    Replaces the data engine's homegrown logic that returned "USA" for
-    every non-`.SR` / non-`=X` / non-`=F` symbol -- which mis-tagged
-    `.L` (UK), `.DE` (Germany), `.PA` (France), `.T` (Japan), `.HK`,
-    `.SS`, `.SZ`, `.NS`, `.AX`, etc. as American.
-    
-    Returns "Global" for FX / commodity / crypto, looks up major indexes
-    via a dedicated _INDEX_COUNTRY map (^GSPC -> United States,
-    ^FTSE -> United Kingdom, ^N225 -> Japan, ^TASI -> Saudi Arabia, ...),
-    and falls back to None when the symbol's jurisdiction cannot be
-    determined.
+CRITICAL (audit fix -- provider symbol formatting; the root cause of the
+non-US data corruption seen in Market_Leaders / Global_Markets):
+  - `to_yahoo_symbol` now translates the (possibly aliased) exchange suffix
+    to the EXACT suffix Yahoo Finance expects, via the new
+    `_YAHOO_SUFFIX_MAP` table. Previously any non-US suffix was passed
+    through unchanged, so internal / EODHD-style suffixes that Yahoo does
+    NOT recognise (`.LSE`, `.LN`, `.NSE`, `.JSE`, `.ZA`, `.HKG`, `.TYO`,
+    `.KOSDAQ`, `.NYSE`, `.OQ`, `.N`, ...) were sent to Yahoo verbatim.
+    Yahoo rejected them, enrichment fell through, and the data engine
+    stamped those rows with US identity defaults -- `III.LSE`, `ANTO.LSE`,
+    `RR.LSE`, `HDFCLIFE.NSE`, `FSR.JSE` were all mis-tagged USA / USD,
+    which in turn inflated market caps ~100x (GBp priced as USD).
+    Now: `.LSE`/`.L`/`.LN` -> `.L`, `.NSE`/`.NS` -> `.NS`,
+    `.JSE`/`.ZA` -> `.JO`, `.TYO`/`.T` -> `.T`, `.HKG`/`.HK` -> `.HK`,
+    `.NYSE`/`.OQ`/`.N`/`.NM`/`.NG` -> `` (US, no suffix), etc.
+  - `to_yahoo_symbol` now converts share-class DOT tickers back to Yahoo's
+    DASH form: canonical `BRK.B` / `BRK.B.US` -> `BRK-B`. `normalize_symbol`
+    canonicalizes to the dot form, but Yahoo only accepts the dash form;
+    previously only the variant generator knew this, the primary formatter
+    returned the (rejected) dot form.
+
+HIGH (audit fix -- provider symbol formatting):
+  - `to_eodhd_symbol` now translates aliased suffixes to EODHD exchange
+    codes via `_EODHD_SUFFIX_MAP`, instead of echoing whatever suffix the
+    caller happened to pass. Yahoo-style short suffixes that EODHD rejects
+    are now mapped (e.g. `.L` -> `.LSE`, `.NYSE`/`.N`/`.OQ` -> `.US`,
+    `.TYO` -> `.TSE`). Inputs that already used EODHD-style suffixes are
+    unaffected. Unknown / uncertain suffixes fall back to the raw suffix,
+    so an unverified market degrades to pre-7.2.0 behaviour rather than
+    breaking.
+  - `to_finnhub_symbol` now strips ALL US exchange aliases (`.NYSE`, `.N`,
+    `.OQ`, `.NM`, `.NG`), not just the literal `.US`.
 
 NEW:
-  - `_COUNTRY_BY_EXCHANGE` mapping table covering 40+ markets.
-  - `_CURRENCY_BY_EXCHANGE` mapping table covering 40+ markets, replacing
-    the inline if/elif chain in `get_currency_from_symbol`.
-  - `_INDEX_COUNTRY` mapping for major indexes.
-
-Bug fixes:
-  - `get_currency_from_symbol`: the old version had hardcoded coverage
-    for US / UK / JP / EUR-zone only. Hong Kong, China, India, Australia,
-    Canada, Switzerland, Korea, Singapore, Saudi (already returned 'SAR'
-    via is_ksa shortcut), AE, QA, KW, EG, ZA, MX, BR, AR, TH, ID, MY,
-    PH, VN, TW, NZ, IL, DK, SE, NO, PL, CZ, HU all returned None.
-    All 40+ markets now covered by `_CURRENCY_BY_EXCHANGE`.
-    
-  - `get_primary_exchange` returned None for US share-class tickers like
-    BRK.B / BF.B / RDS.A. After `normalize_symbol` these stay dot-form,
-    so `split_symbol_exchange` returns exchange=None (because `.B` isn't
-    in `_EXCHANGE_SUFFIXES`), and the `s.isalpha()` US heuristic also
-    rejects them (the dot makes `.isalpha()` False). Added a CLASS_DOT_RE
-    branch so plausible share-class tickers route to "US".
+  - `.XETRA` / `.ETR` recognised as Deutsche Borse XETRA (-> DE). Live
+    symbol universes use `.XETRA`; previously it matched no exchange
+    suffix and fell through every country / currency / MIC / provider
+    resolution path.
+  - `_YAHOO_SUFFIX_MAP` -- raw-suffix -> Yahoo-suffix translation table,
+    total over `_EXCHANGE_SUFFIXES`.
+  - `_EODHD_SUFFIX_MAP` -- raw-suffix -> EODHD-exchange-code table
+    (best-effort; see operator note).
+  - `_share_class_dot_to_dash` -- internal helper, dot share class -> dash.
 
 Preserved:
+  - All v7.1.0 country/currency work (`get_country_from_symbol`,
+    `_COUNTRY_BY_EXCHANGE`, `_CURRENCY_BY_EXCHANGE`, `_INDEX_COUNTRY`,
+    share-class `get_primary_exchange` heuristic).
   - All v7.0.0 fixes (ETH-USD crypto vs FX, EUR-USD canonicalization,
     SPX.INDX -> ^GSPC, NASDAQ key removed from _INDEX_COMMON, dead code
     cleanup, _MARKET_BY_CODE precompute).
-  - Complete `__all__` surface (with one new export added).
-  - All regex patterns (public and internal), all mapping tables.
-  - All `lru_cache` sizes.
-  - `SymbolNormalizationConfig` shape, all env var names.
-  - Every provider formatter and variant generator.
+  - Complete `__all__` surface (no public API removed; none added).
+  - All regex patterns (public and internal), all mapping tables, all
+    `lru_cache` sizes, `SymbolNormalizationConfig` shape, all env var
+    names, every provider formatter and variant generator.
   - KSA canonicalization (`####.SR`), TADAWUL: prefix handling, .SA/.SAU
     stripping, share-class conversion (BRK-B <-> BRK.B).
   - Exchange suffix table, MIC codes, default_exchange env handling.
 
-Operator note (data_engine integration):
-  After upgrading to v7.1.0, the data engine's `_infer_country_from_symbol`
-  helper should be replaced with a single call to
-  `get_country_from_symbol(symbol)`. A thin patch will land in
-  data_engine_v2 v5.47.4 once this file is reviewed.
+Operator note (integration):
+  - data_engine_v2 must (a) replace `_infer_country_from_symbol` with
+    `get_country_from_symbol` (per the v7.1.0 note) AND (b) route ALL
+    provider fetches through `to_yahoo_symbol` / `to_eodhd_symbol` /
+    `normalize_symbol_for_provider`. The suffix-translation fix only
+    takes effect if the formatters are actually on the request path;
+    if the data engine hand-builds provider symbols anywhere, that path
+    must be removed.
+  - EODHD exchange codes for a few markets (Japan=TSE, China=SHG/SHE,
+    Korea=KO/KQ, Singapore=SG, Switzerland=SW) follow EODHD's documented
+    conventions but should be spot-checked against your EODHD
+    `/exchanges-list` if you trade those venues. Anything not explicitly
+    in `_EODHD_SUFFIX_MAP` falls back to the raw suffix.
 ================================================================================
 """
 
@@ -113,7 +129,7 @@ except ImportError:
 # Version and Exports
 # ---------------------------------------------------------------------------
 
-__version__ = "7.1.0"
+__version__ = "7.2.0"
 
 __all__ = [
     # Core enums
@@ -379,6 +395,7 @@ _EXCHANGE_SUFFIXES: Dict[str, str] = {
     ".L": "UK", ".LSE": "UK", ".LN": "UK",
     ".PA": "FR", ".FP": "FR",
     ".DE": "DE", ".F": "DE", ".BE": "DE", ".DU": "DE", ".HM": "DE",
+    ".XETRA": "DE", ".ETR": "DE",  # v7.2.0: Deutsche Borse XETRA
     ".SW": "CH", ".VX": "CH",
     ".AS": "NL", ".BR": "BE",
     ".MC": "ES",
@@ -419,6 +436,116 @@ _MIC_MAPPINGS: Dict[str, str] = {
     "UK": "XLON", "FR": "XPAR", "DE": "XETR", "CH": "XSWX", "SA": "XSAU",
     "AE": "XDFM", "JP": "XTKS", "HK": "XHKG", "CN": "XSHG", "IN": "XNSE",
     "AU": "XASX", "KR": "XKRX", "SG": "XSES",
+}
+
+# v7.2.0: Yahoo Finance suffix translation.
+# -----------------------------------------------------------------------------
+# Keys are the RAW suffix as returned by split_symbol_exchange (UPPER, no dot).
+# Values are the suffix Yahoo Finance actually expects, INCLUDING the leading
+# dot -- or "" (empty string) for US listings, which carry no Yahoo suffix.
+#
+# Why this exists: split_symbol_exchange returns whatever recognised alias the
+# caller passed (".LSE", ".LN" and ".L" are all valid UK aliases internally),
+# but Yahoo accepts exactly ONE suffix per venue. v7.1.0 and earlier passed any
+# non-US suffix through unchanged, so ".LSE" / ".NSE" / ".JSE" / ".TYO" / ".OQ"
+# went to Yahoo verbatim, were rejected, and the data engine fell back to US
+# identity defaults. This table is TOTAL over _EXCHANGE_SUFFIXES so to_yahoo_
+# symbol never has a gap; any caller-added env suffix not present here falls
+# back to pass-through (pre-7.2.0 behaviour).
+_YAHOO_SUFFIX_MAP: Dict[str, str] = {
+    # --- Americas ---
+    "US": "", "NYSE": "", "N": "", "NASDAQ": "", "OQ": "", "NM": "", "NG": "",
+    "TO": ".TO", "V": ".V", "CNQ": ".CN",
+    "MX": ".MX", "SA": ".SA", "BA": ".BA",
+    # --- EMEA ---
+    "L": ".L", "LSE": ".L", "LN": ".L",
+    "PA": ".PA", "FP": ".PA",
+    "DE": ".DE", "F": ".F", "BE": ".BE", "DU": ".DU", "HM": ".HM",
+    "XETRA": ".DE", "ETR": ".DE",
+    "SW": ".SW", "VX": ".SW",
+    "AS": ".AS", "BR": ".BR",
+    "MC": ".MC",
+    "MI": ".MI", "IM": ".MI",
+    "CO": ".CO", "ST": ".ST", "OL": ".OL", "HE": ".HE",
+    "WA": ".WA", "PR": ".PR", "BU": ".BD",
+    "AT": ".VI", "VI": ".VI",
+    "IR": ".IR", "DUB": ".IR",
+    "ZA": ".JO", "JSE": ".JO",
+    "TA": ".TA", "TASE": ".TA",
+    "SAU": ".SR", "SR": ".SR", "TADAWUL": ".SR",
+    # Yahoo Gulf coverage is limited; best-effort below.
+    "AE": ".AE", "DFM": ".AE", "ADX": ".AE",
+    "QA": ".QA", "QE": ".QA",
+    "KW": ".KW", "KSE": ".KW",
+    "EG": ".CA", "EGX": ".CA",  # Yahoo uses .CA for Cairo (EGX)
+    # --- Asia Pacific ---
+    "T": ".T", "TYO": ".T",
+    "HK": ".HK", "HKG": ".HK",
+    "SS": ".SS", "SHG": ".SS",
+    "SZ": ".SZ", "SHE": ".SZ",
+    "NS": ".NS", "NSE": ".NS",
+    "BO": ".BO", "BSE": ".BO",
+    "KS": ".KS", "KQ": ".KQ", "KOSDAQ": ".KQ",
+    "TW": ".TW", "TWO": ".TWO",
+    "SI": ".SI", "SGX": ".SI",
+    "KL": ".KL", "KLSE": ".KL",
+    "JK": ".JK", "IDX": ".JK",
+    "SET": ".BK", "BK": ".BK",
+    "VN": ".VN", "HOSE": ".VN",
+    "PS": ".PS", "PSE": ".PS",
+    "AU": ".AX", "AX": ".AX", "ASX": ".AX",
+    "NZ": ".NZ", "NZSE": ".NZ",
+}
+
+# v7.2.0: EODHD exchange-code translation.
+# -----------------------------------------------------------------------------
+# Keys are the RAW suffix as returned by split_symbol_exchange (UPPER, no dot).
+# Values are the EODHD exchange code (no dot). EODHD expects TICKER.EXCHANGE.
+#
+# Only entries that DIFFER from the raw suffix, or that normalise a family of
+# aliases onto a single EODHD code, need to be listed -- to_eodhd_symbol falls
+# back to the raw suffix (current behaviour) for anything not present here, so
+# an unverified market degrades gracefully rather than breaking.
+#
+# OPERATOR NOTE: the high-confidence entries are the Americas / Western Europe /
+# UK / India / Australia / HK / South Africa rows. Japan (TSE), China (SHG/SHE),
+# Korea (KO/KQ), Singapore (SG) and Switzerland (SW) follow EODHD's documented
+# conventions but should be spot-checked against your EODHD /exchanges-list.
+_EODHD_SUFFIX_MAP: Dict[str, str] = {
+    # --- Americas (US aliases all collapse to US) ---
+    "US": "US", "NYSE": "US", "N": "US", "NASDAQ": "US", "OQ": "US",
+    "NM": "US", "NG": "US",
+    "TO": "TO", "V": "V",
+    "MX": "MX", "SA": "SA", "BA": "BA",
+    # --- EMEA ---
+    "L": "LSE", "LSE": "LSE", "LN": "LSE",
+    "PA": "PA", "FP": "PA",
+    "DE": "XETRA", "XETRA": "XETRA", "ETR": "XETRA", "F": "F",
+    "SW": "SW", "VX": "SW",
+    "AS": "AS", "BR": "BR",
+    "MC": "MC",
+    "MI": "MI", "IM": "MI",
+    "CO": "CO", "ST": "ST", "OL": "OL", "HE": "HE",
+    "WA": "WAR", "PR": "PR",
+    "AT": "VI", "VI": "VI",
+    "IR": "IR", "DUB": "IR",
+    "ZA": "JSE", "JSE": "JSE",
+    "TA": "TA", "TASE": "TA",
+    "SAU": "SR", "SR": "SR", "TADAWUL": "SR",
+    # --- Asia Pacific ---
+    "T": "TSE", "TYO": "TSE",
+    "HK": "HK", "HKG": "HK",
+    "SS": "SHG", "SHG": "SHG",
+    "SZ": "SHE", "SHE": "SHE",
+    "NS": "NSE", "NSE": "NSE",
+    "BO": "BSE", "BSE": "BSE",
+    "KS": "KO", "KQ": "KQ", "KOSDAQ": "KQ",
+    "TW": "TW", "TWO": "TW",
+    "SI": "SG", "SGX": "SG",
+    "KL": "KLSE", "KLSE": "KLSE",
+    "JK": "JK", "IDX": "JK",
+    "AU": "AU", "AX": "AU", "ASX": "AU",
+    "NZ": "NZ", "NZSE": "NZ",
 }
 
 # v7.1.0: country lookup (display-friendly English names) keyed by the
@@ -669,6 +796,24 @@ def _unique_preserve_order(items: List[str]) -> List[str]:
         seen.add(item)
         result.append(item)
     return result
+
+
+def _share_class_dot_to_dash(sym: str) -> str:
+    """
+    Convert a share-class DOT ticker to the DASH form (BRK.B -> BRK-B).
+
+    v7.2.0 helper. `normalize_symbol` canonicalizes share classes to the
+    dot form, but Yahoo Finance expects the dash form. Only fires when the
+    whole string is a `<ALPHA>.<SINGLE-LETTER>` share-class pattern; plain
+    tickers ("AAPL"), dash tickers ("EPI-A") and anything else are returned
+    unchanged.
+    """
+    if not sym:
+        return sym
+    m = CLASS_DOT_RE.match(sym)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    return sym
 
 
 # =============================================================================
@@ -1317,6 +1462,11 @@ def get_currency_from_symbol(symbol: str) -> Optional[str]:
     silently returned None for: HK -> HKD, CN -> CNY, IN -> INR,
     AU -> AUD, CA -> CAD, CH -> CHF, KR -> KRW, SG -> SGD, ZA -> ZAR,
     AE -> AED, QA -> QAR, KW -> KWD, etc.
+
+    NOTE: this returns the LISTING currency only. It does NOT solve the
+    GBp-vs-GBP (pence vs pound) trap on UK listings -- that is a
+    price-scaling concern for the data engine / currency-normalization
+    layer, not a symbol concern.
     """
     s = normalize_symbol(symbol)
     if not s:
@@ -1428,11 +1578,23 @@ def to_yahoo_symbol(symbol: str) -> str:
     """
     Convert symbol to Yahoo Finance format.
 
+    v7.2.0: equity exchange suffixes are now TRANSLATED to the exact
+    suffix Yahoo expects (via `_YAHOO_SUFFIX_MAP`) instead of being
+    echoed verbatim, and share-class DOT tickers are converted back to
+    Yahoo's DASH form.
+
     Examples:
-        "AAPL"    -> "AAPL"
-        "2222.SR" -> "2222.SR"
-        "EUR/USD" -> "EURUSD=X"
-        "^GSPC"   -> "^GSPC"
+        "AAPL"      -> "AAPL"
+        "AAPL.US"   -> "AAPL"
+        "AAPL.NYSE" -> "AAPL"
+        "III.LSE"   -> "III.L"
+        "BARC.L"    -> "BARC.L"
+        "7203.TYO"  -> "7203.T"
+        "BRK.B"     -> "BRK-B"
+        "BRK.B.US"  -> "BRK-B"
+        "2222.SR"   -> "2222.SR"
+        "EUR/USD"   -> "EURUSD=X"
+        "^GSPC"     -> "^GSPC"
     """
     s = normalize_symbol(symbol)
     if not s:
@@ -1466,17 +1628,33 @@ def to_yahoo_symbol(symbol: str) -> str:
     if is_crypto(s):
         return s if "-" in s else f"{s}-USD"
 
-    # Strip known exchange suffix like .US for Yahoo equity
-    base, exchange = split_symbol_exchange(s)
-    if exchange == "US":
-        return base
+    # --- Equity ---------------------------------------------------------
+    # v7.2.0: translate the (possibly aliased) exchange suffix to the
+    # specific suffix Yahoo expects, and convert share-class DOT tickers
+    # back to Yahoo's DASH form.
+    base, raw_suffix = split_symbol_exchange(s)
+    if raw_suffix is not None:
+        yahoo_suffix = _YAHOO_SUFFIX_MAP.get(raw_suffix.upper())
+        if yahoo_suffix is not None:
+            base_out = _share_class_dot_to_dash(base)
+            return f"{base_out}{yahoo_suffix}" if yahoo_suffix else base_out
+        # Recognised by _EXCHANGE_SUFFIXES (e.g. a caller-added env
+        # suffix) but with no Yahoo mapping -> pass through unchanged.
+        return s
 
-    return s
+    # No exchange suffix. Could still be a share-class DOT ticker (BRK.B).
+    return _share_class_dot_to_dash(s)
 
 
 @lru_cache(maxsize=20000)
 def to_finnhub_symbol(symbol: str) -> str:
-    """Convert symbol to Finnhub format."""
+    """
+    Convert symbol to Finnhub format.
+
+    v7.2.0: strips ALL US exchange aliases (.NYSE/.N/.OQ/.NM/.NG), not
+    just the literal .US, so US-listed names always reach Finnhub as the
+    bare ticker.
+    """
     s = normalize_symbol(symbol)
     if not s:
         return ""
@@ -1485,8 +1663,10 @@ def to_finnhub_symbol(symbol: str) -> str:
         return s
 
     base, exchange = split_symbol_exchange(s)
-    if exchange == "US":
-        return base
+    if exchange:
+        # Any US-aliased suffix (.US/.NYSE/.N/.OQ/.NM/.NG) -> bare ticker.
+        if _EXCHANGE_SUFFIXES.get(f".{exchange.upper()}") == "US":
+            return base
 
     return s
 
@@ -1496,10 +1676,20 @@ def to_eodhd_symbol(symbol: str, default_exchange: Optional[str] = None) -> str:
     """
     Convert symbol to EODHD format (TICKER.EXCHANGE).
 
+    v7.2.0: aliased exchange suffixes are now TRANSLATED to EODHD
+    exchange codes (via `_EODHD_SUFFIX_MAP`) instead of being echoed
+    verbatim. Yahoo-style short suffixes EODHD rejects (`.L`, `.NYSE`,
+    `.N`, `.OQ`, `.TYO`, ...) are mapped to EODHD's codes. Suffixes not
+    present in the map fall back to the raw suffix (pre-7.2.0 behaviour).
+
     Examples:
-        "AAPL"    -> "AAPL.US"
-        "BRK.B"   -> "BRK.B.US"
-        "2222.SR" -> "2222.SR"
+        "AAPL"      -> "AAPL.US"
+        "AAPL.NYSE" -> "AAPL.US"
+        "BARC.L"    -> "BARC.LSE"
+        "III.LSE"   -> "III.LSE"
+        "7203.TYO"  -> "7203.TSE"
+        "BRK.B"     -> "BRK.B.US"
+        "2222.SR"   -> "2222.SR"
     """
     s = normalize_symbol(symbol)
     if not s:
@@ -1511,9 +1701,11 @@ def to_eodhd_symbol(symbol: str, default_exchange: Optional[str] = None) -> str:
     if is_ksa(s):
         return s if s.endswith(".SR") else f"{s}.SR"
 
-    base, exchange = split_symbol_exchange(s)
-    if exchange:
-        return f"{base}.{exchange}"
+    base, raw_suffix = split_symbol_exchange(s)
+    if raw_suffix is not None:
+        # v7.2.0: map to EODHD's exchange code; unknown -> raw suffix.
+        eodhd_code = _EODHD_SUFFIX_MAP.get(raw_suffix.upper(), raw_suffix.upper())
+        return f"{base}.{eodhd_code}"
 
     exchange = (default_exchange or _CONFIG.default_exchange).upper()
     return f"{s}.{exchange}"
