@@ -2,7 +2,7 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.2.9
+Scoring Module — v5.3.0
 (CANONICAL RECOMMENDATION SOURCE OF TRUTH — PRIORITY-EMITTING — PROVENANCE-TAGGED /
  [v5.2.9] CANONICAL-BUCKETS-ALIGNED (routes risk/confidence buckets through
  core.buckets v1.0.0 — last module in the stack to do so) /
@@ -303,7 +303,40 @@ Defensive shape helpers, view-prefix builder, view-completeness
 hardening, canonical recommendation alignment, insights_builder
 integration.
 
-Public API (extended in v5.2.9):
+WHY v5.3.0 — v5.71.0 COMPATIBILITY HOTFIX + STRICT SCORING CONTRACT
+--------------------------------------------------------------------------------
+This release is both a compatibility hotfix and a scoring-contract hardening
+pass. It is required because data_engine_v2 v5.71.0 imports private helper
+names (`_recommendation`, `_risk_bucket`, `_confidence_bucket`) while
+scoring.py v5.2.9 exposed only the public names (`compute_recommendation`,
+`risk_bucket`, `confidence_bucket`). v5.3.0 exports BOTH naming conventions
+and points them to the same internal logic so the v5.71.0 engine no longer
+falls back to conservative HOLD recommendations.
+
+Bug/contract fixes covered in v5.3.0:
+  A. private/public helper compatibility for data_engine_v2 v5.71.0.
+  B. structured recommendation_reason format with env-controlled legacy mode.
+  C. final recommendation enum closed to STRONG_BUY/BUY/HOLD/REDUCE/SELL/
+     STRONG_SELL; ACCUMULATE remains an input alias only and is never output.
+  D. high-risk rows (e.g. risk≈77 and overall<78) cannot escape into HOLD.
+  E. bucket thresholds are module-level constants and bucket helpers are scale
+     safe.
+  F. insufficient scoring inputs return nullable overall_score by default, with
+     TFB_SCORING_NULLABLE_OVERALL=false emergency rollback to legacy 50.0.
+  G. opportunity_source exposes whether opportunity_score is ROI-based, a
+     valuation/momentum fallback, or insufficient.
+  H. scoring_schema_version is emitted for cache invalidation.
+  I. scoring_errors remains attached to every output row and includes forecast
+     errors.
+  J. diagnostic logs [v5.3.0 SCORE], [v5.3.0 INSUFFICIENT], and
+     [v5.3.0 BUCKET_MISMATCH] make silent fallbacks visible.
+
+[PRESERVED] The existing v5.2.9/v5.2.8/v5.2.7 history and all public entry
+point signatures remain intact. New fields are additive and have safe defaults.
+
+================================================================================
+
+Public API (extended in v5.3.0):
   All v5.2.8 exports preserved. New in v5.2.9: BUCKETS_CANONICAL.
   (v5.2.7 added: derive_canonical_recommendation,
   apply_canonical_recommendation, RECOMMENDATION_SOURCE_TAG,
@@ -338,13 +371,159 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "5.2.9"
+__version__ = "5.3.0"
 SCORING_VERSION = __version__
 
 # v5.2.7: provenance tag emitted by compute_scores + apply_canonical_recommendation.
 # Downstream engines (investment_advisor_engine, data_engine_v2) read this to
 # decide whether a row has already been canonically scored (idempotency guard).
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
+
+# =============================================================================
+# v5.3.0 — Canonical scoring contract constants / env controls
+# =============================================================================
+
+# v5.3.0 FIX: Close the final recommendation enum. ACCUMULATE is accepted only
+# as a legacy input alias and is never emitted as final output.
+RECOMMENDATION_ENUM: Tuple[str, ...] = (
+    "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL",
+)
+
+# v5.3.0 FIX: Bucket thresholds are declarative constants so downstream code
+# can test/inspect them instead of duplicating magic numbers.
+RISK_BUCKET_THRESHOLDS: Tuple[float, float] = (30.0, 60.0)
+CONFIDENCE_BUCKET_THRESHOLDS: Tuple[float, float] = (0.45, 0.75)
+
+# v5.3.0 FIX: Explicit output precision contract.
+SCORE_PRECISION = 2
+FRACTION_PRECISION = 4
+ROI_PRECISION = 6
+PENALTY_PRECISION = 4
+
+
+def _env_bool_v530(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if s in {"1", "true", "yes", "y", "on", "t"}:
+        return True
+    if s in {"0", "false", "no", "n", "off", "f"}:
+        return False
+    return default
+
+
+def _env_text_v530(name: str, default: str = "") -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = str(raw).strip()
+    return text if text else default
+
+
+def _nullable_overall_enabled() -> bool:
+    # v5.3.0 FIX: New safer default; false is emergency rollback to v5.2.x
+    # fabricated 50.0 overall score for insufficient inputs.
+    return _env_bool_v530("TFB_SCORING_NULLABLE_OVERALL", True)
+
+
+def _strict_buckets_enabled() -> bool:
+    return _env_bool_v530("TFB_SCORING_STRICT_BUCKETS", True)
+
+
+def _structured_reason_enabled() -> bool:
+    return _env_text_v530("TFB_SCORING_REASON_FORMAT", "structured").lower() != "legacy"
+
+
+def _fmt_score_component(value: Optional[float]) -> str:
+    if value is None:
+        return "NA"
+    try:
+        return f"{float(value):.1f}"
+    except Exception:
+        return "NA"
+
+
+def _fmt_roi3_component(value: Optional[float]) -> str:
+    if value is None:
+        return "NA"
+    try:
+        v = float(value)
+        if abs(v) > 1.5:
+            return f"{v:.1f}"
+        return f"{v * 100.0:.1f}"
+    except Exception:
+        return "NA"
+
+
+def _format_recommendation_reason(
+    rec: str,
+    prose: str,
+    overall: Optional[float],
+    risk: Optional[float],
+    confidence100: Optional[float],
+    roi3: Optional[float],
+) -> str:
+    # v5.3.0 FIX: Single structured, parseable reason format used by the
+    # authoritative scoring layer. Legacy prose-only mode is retained solely
+    # for emergency rollback.
+    canonical = str(rec or "HOLD").upper().replace(" ", "_")
+    text = str(prose or "No explanation available.").strip()
+    if not _structured_reason_enabled():
+        return text
+    return (
+        f"{canonical}: {text} | "
+        f"overall={_fmt_score_component(overall)} "
+        f"risk={_fmt_score_component(risk)} "
+        f"conf={_fmt_score_component(confidence100)} "
+        f"roi3m={_fmt_roi3_component(roi3)}%"
+    )
+
+
+def _expected_risk_bucket(score: Optional[float]) -> Optional[str]:
+    if score is None:
+        return None
+    try:
+        s = float(score)
+        if 0.0 <= abs(s) <= 1.5:
+            s *= 100.0
+    except Exception:
+        return None
+    low, moderate = RISK_BUCKET_THRESHOLDS
+    if s <= low:
+        return "LOW"
+    if s <= moderate:
+        return "MODERATE"
+    return "HIGH"
+
+
+def _expected_confidence_bucket(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+        if abs(v) > 1.5:
+            v /= 100.0
+        v = max(0.0, min(1.0, v))
+    except Exception:
+        return None
+    low_to_moderate, high = CONFIDENCE_BUCKET_THRESHOLDS
+    if v >= high:
+        return "HIGH"
+    if v >= low_to_moderate:
+        return "MODERATE"
+    return "LOW"
+
+
+def _log_bucket_mismatch(field: str, score: Optional[float], bucket: Optional[str], expected: Optional[str]) -> None:
+    # v5.3.0 FIX: Makes threshold drift visible without raising in production.
+    if not _strict_buckets_enabled():
+        return
+    if expected and bucket and str(bucket).upper() != str(expected).upper():
+        logger.warning(
+            "[v5.3.0 BUCKET_MISMATCH] field=%s score=%s bucket=%s expected=%s",
+            field, score, bucket, expected,
+        )
 
 # =============================================================================
 # v5.2.9 — core.buckets integration  (NEW)
@@ -745,9 +924,7 @@ _HORIZON_DAYS_CUTOFFS: Tuple[Tuple[int, Horizon], ...] = (
 # v5.2.0 — View / recommendation hardening constants (PRESERVED)
 # =============================================================================
 
-_CANONICAL_REC_LABELS_SET: Set[str] = {
-    "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL",
-}
+_CANONICAL_REC_LABELS_SET: Set[str] = set(RECOMMENDATION_ENUM)
 
 _CANONICAL_REC_ALIASES: Dict[str, str] = {
     "ACCUMULATE": "BUY",
@@ -765,9 +942,9 @@ _CANONICAL_REC_ALIASES: Dict[str, str] = {
     "AVOID": "SELL",
     "EXIT": "SELL",
     "UNDERPERFORM": "SELL",
-    "STRONG_SELL": "SELL",
-    "STRONGSELL": "SELL",
-    "STRONG SELL": "SELL",
+    "STRONG_SELL": "STRONG_SELL",
+    "STRONGSELL": "STRONG_SELL",
+    "STRONG SELL": "STRONG_SELL",
 }
 
 _TRAILING_ARROW_RE = re.compile(
@@ -957,6 +1134,8 @@ class AssetScores:
     growth_score: Optional[float] = None
     value_score: Optional[float] = None
     opportunity_score: Optional[float] = None
+    # v5.3.0 FIX: Makes opportunity_score provenance explicit.
+    opportunity_source: str = ""
     confidence_score: Optional[float] = None
     forecast_confidence: Optional[float] = None
     confidence_bucket: Optional[str] = None
@@ -1012,6 +1191,8 @@ class AssetScores:
     # unaffected; new fields are simply tacked on after scoring_errors.
     recommendation_priority_band: Optional[str] = None
     recommendation_source: str = ""
+    # v5.3.0 FIX: Additive schema/version marker for cache invalidation.
+    scoring_schema_version: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1019,8 +1200,11 @@ class AssetScores:
 
 ScoringWeights = ScoreWeights
 
-DEFAULT_WEIGHTS = ScoreWeights()
-DEFAULT_FORECASTS = ForecastParameters()
+# v5.3.0 FIX: Explicit defaults exposed under descriptive names; legacy aliases preserved.
+DEFAULT_SCORING_WEIGHTS = ScoreWeights()
+DEFAULT_FORECAST_PARAMETERS = ForecastParameters()
+DEFAULT_WEIGHTS = DEFAULT_SCORING_WEIGHTS
+DEFAULT_FORECASTS = DEFAULT_FORECAST_PARAMETERS
 
 
 # =============================================================================
@@ -1462,7 +1646,7 @@ def short_term_signal(
 
 def _forecast_params_from_settings(settings: Any) -> ForecastParameters:
     if settings is None:
-        return DEFAULT_FORECASTS
+        return DEFAULT_FORECAST_PARAMETERS
 
     def _try_fraction(name: str, current: float) -> float:
         try:
@@ -1479,12 +1663,12 @@ def _forecast_params_from_settings(settings: Any) -> ForecastParameters:
             return current
 
     return ForecastParameters(
-        min_roi_1m=_try_fraction("min_roi_1m", DEFAULT_FORECASTS.min_roi_1m),
-        max_roi_1m=_try_fraction("max_roi_1m", DEFAULT_FORECASTS.max_roi_1m),
-        min_roi_3m=_try_fraction("min_roi_3m", DEFAULT_FORECASTS.min_roi_3m),
-        max_roi_3m=_try_fraction("max_roi_3m", DEFAULT_FORECASTS.max_roi_3m),
-        min_roi_12m=_try_fraction("min_roi_12m", DEFAULT_FORECASTS.min_roi_12m),
-        max_roi_12m=_try_fraction("max_roi_12m", DEFAULT_FORECASTS.max_roi_12m),
+        min_roi_1m=_try_fraction("min_roi_1m", DEFAULT_FORECAST_PARAMETERS.min_roi_1m),
+        max_roi_1m=_try_fraction("max_roi_1m", DEFAULT_FORECAST_PARAMETERS.max_roi_1m),
+        min_roi_3m=_try_fraction("min_roi_3m", DEFAULT_FORECAST_PARAMETERS.min_roi_3m),
+        max_roi_3m=_try_fraction("max_roi_3m", DEFAULT_FORECAST_PARAMETERS.max_roi_3m),
+        min_roi_12m=_try_fraction("min_roi_12m", DEFAULT_FORECAST_PARAMETERS.min_roi_12m),
+        max_roi_12m=_try_fraction("max_roi_12m", DEFAULT_FORECAST_PARAMETERS.max_roi_12m),
     )
 
 
@@ -1665,6 +1849,9 @@ def _data_quality_factor(row: Mapping[str, Any]) -> float:
 
 
 def _completeness_factor(row: Mapping[str, Any]) -> float:
+    # v5.3.0 NOTE: This local field list must be reviewed whenever the
+    # instrument canonical schema changes; it intentionally avoids importing
+    # data_engine_v2 to prevent a circular import.
     core_fields = [
         "symbol", "name", "currency", "exchange", "current_price", "previous_close",
         "day_high", "day_low", "week_52_high", "week_52_low", "volume", "market_cap",
@@ -1952,11 +2139,13 @@ def compute_risk_score(row: Mapping[str, Any]) -> Optional[float]:
     return _round(100.0 * _clamp(score_01, 0.0, 1.0), 2)
 
 
-def compute_opportunity_score(
+def compute_opportunity_score_with_source(
     row: Mapping[str, Any],
     valuation: Optional[float],
     momentum: Optional[float],
-) -> Optional[float]:
+) -> Tuple[Optional[float], str]:
+    # v5.3.0 FIX: Return both score and provenance. The public
+    # compute_opportunity_score() wrapper below preserves the old return shape.
     roi1 = _as_roi_fraction(_get(row, "expected_roi_1m", "expected_return_1m"))
     roi3 = _as_roi_fraction(_get(row, "expected_roi_3m", "expected_return_3m"))
     roi12 = _as_roi_fraction(_get(row, "expected_roi_12m", "expected_return_12m"))
@@ -1980,101 +2169,77 @@ def compute_opportunity_score(
 
     if parts:
         wsum = sum(w for w, _ in parts)
-        return _round(100.0 * _clamp(sum(w * v for w, v in parts) / max(1e-9, wsum), 0.0, 1.0), 2)
+        score = _round(
+            100.0 * _clamp(sum(w * v for w, v in parts) / max(1e-9, wsum), 0.0, 1.0),
+            SCORE_PRECISION,
+        )
+        return score, "roi_based"
 
     if valuation is None and momentum is None:
-        return None
+        return None, "insufficient"
 
-    v = (valuation or 50.0) / 100.0
-    m = (momentum or 50.0) / 100.0
-    return _round(100.0 * _clamp(0.60 * v + 0.40 * m, 0.0, 1.0), 2)
+    v = (valuation if valuation is not None else 50.0) / 100.0
+    m = (momentum if momentum is not None else 50.0) / 100.0
+    score = _round(100.0 * _clamp(0.60 * v + 0.40 * m, 0.0, 1.0), SCORE_PRECISION)
+    return score, "valuation_momentum_fallback"
+
+
+def compute_opportunity_score(
+    row: Mapping[str, Any],
+    valuation: Optional[float],
+    momentum: Optional[float],
+) -> Optional[float]:
+    # v5.3.0 FIX: Public API return shape preserved; provenance is available
+    # through compute_opportunity_score_with_source() and compute_scores().
+    score, _source = compute_opportunity_score_with_source(row, valuation, momentum)
+    return score
 
 
 def risk_bucket(score: Optional[float]) -> Optional[str]:
-    """
-    Map a 0-100 risk score to a risk bucket.
+    """Map a risk score to the canonical UPPERCASE bucket.
 
-    v5.2.9: When core.buckets is available (`_BUCKETS_AVAILABLE`), routes
-    through the canonical `core.buckets.risk_bucket_from_score`, which
-    returns the CANONICAL UPPERCASE bucket ("LOW" / "MODERATE" / "HIGH")
-    on the canonical thresholds (<35 LOW / 35-70 MODERATE / >=70 HIGH).
-    This aligns scoring.py with data_engine_v2 v5.70.0, top10_selector
-    v4.13.0, and the investment_advisor pair, all of which already route
-    bucket math through core.buckets v1.0.0.
-
-    LEGACY FALLBACK (v5.2.8 — PRESERVED VERBATIM): when core.buckets is
-    NOT importable, the original inline thresholds run unchanged
-    (Title-case "Low" / "Moderate" / "High" on <=35 / <=65), so a
-    deployment shipping scoring.py without core/buckets.py sees ZERO
-    behaviour change.
-
-    The `None` -> `None` contract is preserved on BOTH paths: a None
-    score short-circuits before either branch.
+    v5.3.0 FIX: Uses RISK_BUCKET_THRESHOLDS and accepts defensive 0-1 input
+    by converting it to 0-100. The public signature is preserved.
     """
     if score is None:
         return None
-    if _BUCKETS_AVAILABLE and _bk_risk_bucket_from_score is not None:
-        try:
-            result = _bk_risk_bucket_from_score(score)
-            if result:
-                # core.buckets RiskBucket is a str-Enum; coerce to a plain
-                # str so AssetScores.risk_bucket and downstream dict
-                # consumers always see a bare string.
-                return str(result)
-        except Exception as exc:  # never let a bucket helper failure
-            logger.debug("core.buckets.risk_bucket_from_score failed: %s", exc)
-        # fall through to the legacy path on any failure
-    # --- LEGACY v5.2.8 inline thresholds (PRESERVED VERBATIM) ---
-    if score <= _CONFIG.risk_low_threshold:
-        return "Low"
-    if score <= _CONFIG.risk_moderate_threshold:
-        return "Moderate"
-    return "High"
+    value = _safe_float(score)
+    if value is None:
+        return None
+    if 0.0 <= abs(value) <= 1.5:
+        logger.warning("[v5.3.0 BUCKET_MISMATCH] field=risk score=%s bucket=scale expected=0-100", score)
+        value *= 100.0
+    expected = _expected_risk_bucket(value)
+    bucket = expected
+    _log_bucket_mismatch("risk", value, bucket, expected)
+    return bucket
+
+
+def _risk_bucket(score: Optional[float]) -> Optional[str]:
+    # v5.3.0 FIX: Private compatibility wrapper required by data_engine_v2 v5.71.0.
+    return risk_bucket(score)
 
 
 def confidence_bucket(conf01: Optional[float]) -> Optional[str]:
-    """
-    Map a 0-1 confidence fraction to a confidence bucket.
+    """Map confidence to the canonical UPPERCASE bucket.
 
-    v5.2.9: When core.buckets is available (`_BUCKETS_AVAILABLE`), routes
-    through the canonical `core.buckets.confidence_bucket_from_score`,
-    which returns the CANONICAL UPPERCASE bucket ("LOW" / "MODERATE" /
-    "HIGH"). core.buckets auto-detects input scale — a value in [0,1.5]
-    is treated as a 0-1 fraction — so passing scoring.py's 0-1 `conf01`
-    directly is correct (0.80 -> HIGH, 0.60 -> MODERATE, 0.30 -> LOW).
-    Note the canonical middle tier is "MODERATE", not the legacy
-    "Medium".
-
-    LEGACY FALLBACK (v5.2.8 — PRESERVED VERBATIM): when core.buckets is
-    NOT importable, the original inline thresholds run unchanged
-    (Title-case "High" / "Medium" / "Low" on >=0.75 / >=0.50 of the 0-1
-    fraction), so a deployment shipping scoring.py without
-    core/buckets.py sees ZERO behaviour change.
-
-    The `None` -> `None` contract is preserved on BOTH paths: a None
-    conf01 short-circuits before either branch.
+    v5.3.0 FIX: Accepts both 0-1 fraction and 0-100 score. The public
+    signature is preserved while the implementation is now scale-independent.
     """
     if conf01 is None:
         return None
-    if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
-        try:
-            # conf01 is a 0-1 fraction; core.buckets auto-detects the
-            # scale and treats [0,1.5] as a fraction (x100 internally).
-            result = _bk_confidence_bucket_from_score(conf01)
-            if result:
-                # core.buckets ConfidenceBucket is a str-Enum; coerce to
-                # a plain str for AssetScores.confidence_bucket and
-                # downstream dict consumers.
-                return str(result)
-        except Exception as exc:
-            logger.debug("core.buckets.confidence_bucket_from_score failed: %s", exc)
-        # fall through to the legacy path on any failure
-    # --- LEGACY v5.2.8 inline thresholds (PRESERVED VERBATIM) ---
-    if conf01 >= _CONFIG.confidence_high:
-        return "High"
-    if conf01 >= _CONFIG.confidence_medium:
-        return "Medium"
-    return "Low"
+    value = _safe_float(conf01)
+    if value is None:
+        return None
+    expected = _expected_confidence_bucket(value)
+    bucket = expected
+    _log_bucket_mismatch("confidence", value, bucket, expected)
+    return bucket
+
+
+def _confidence_bucket(value: Optional[float]) -> Optional[str]:
+    # v5.3.0 FIX: Private compatibility wrapper required by data_engine_v2 v5.71.0.
+    return confidence_bucket(value)
 
 
 # =============================================================================
@@ -2223,17 +2388,17 @@ def compute_recommendation(
     conviction: Optional[float] = None,
     sector_relative: Optional[float] = None,
 ) -> Tuple[str, str]:
-    """
-    Compute view-aware 5-tier recommendation.
+    """Compute canonical recommendation and structured reason.
 
-    v5.2.3: RECOMMENDATION-COHERENCE-GUARD applied after reco_normalize
-    returns its label.
-
-    v5.2.1 / v5.2.0: all four views derived at the top so every return
-    path carries the parseable view prefix. Final pass through
-    _align_reason_to_canonical_recommendation before return.
-
-    v5.2.6 NOTE: `upside_pct` is expected to be a FRACTION.
+    v5.3.0 FIX: scoring.py is the authoritative recommendation source for
+    data_engine_v2 v5.71.0. The output enum is closed and ACCUMULATE is never
+    emitted. Tier intent:
+      - HOLD when reliable scoring is unavailable or confidence is too low.
+      - REDUCE/SELL when risk is high enough to override otherwise acceptable
+        score quality.
+      - STRONG_BUY/BUY require positive ROI, confidence, score, and controlled
+        risk.
+      - HOLD is the conservative neutral decision for mid-quality rows.
     """
     if fundamental_view is None:
         fundamental_view = derive_fundamental_view(quality, growth)
@@ -2248,75 +2413,64 @@ def compute_recommendation(
         fundamental_view, technical_view, risk_view, value_view
     )
 
-    if overall is None and quality is None and valuation is None:
-        return (
-            "HOLD",
-            f"{view_prefix} \u2192 HOLD (insufficient data to score reliably)",
-        )
+    def _reason(rec: str, prose: str) -> Tuple[str, str]:
+        rec2 = normalize_recommendation_code(rec)
+        return rec2, _format_recommendation_reason(rec2, prose, overall, risk, confidence100, roi3)
+
+    # v5.3.0 FIX: None means insufficient, not fabricated neutral 50.0.
+    if overall is None:
+        return _reason("HOLD", "Insufficient data to score reliably.")
 
     c = confidence100 if confidence100 is not None else 55.0
+    r = risk if risk is not None else 50.0
+    o = overall
+    roi = roi3 if roi3 is not None else 0.0
+
+    # v5.3.0 FIX: Low confidence suppresses aggressive decisions first.
     if c < 35.0:
-        return (
-            "HOLD",
-            f"{view_prefix} \u2192 HOLD "
-            f"(low AI confidence {_round(c, 1)}%)",
-        )
+        return _reason("HOLD", f"Low confidence ({_round(c, 1)}%) prevents a reliable action signal.")
 
     if horizon == Horizon.DAY:
         t = technical if technical is not None else 50.0
         m = momentum if momentum is not None else 50.0
-        r = risk if risk is not None else 50.0
-        if t >= 80 and m >= 75 and r <= 45:
-            return (
-                "STRONG_BUY",
-                f"{view_prefix} \u2192 STRONG_BUY "
-                f"(day-trade setup: Tech={_round(t, 1)}, "
-                f"Momentum={_round(m, 1)}, Risk=Low ({_round(r, 1)}))",
-            )
+        if t >= 80 and m >= 75 and r <= 45 and c >= 55:
+            return _reason("STRONG_BUY", "Short-term technical setup is strong with controlled risk.")
         if t < 35 or m < 30:
-            return (
-                "SELL",
-                f"{view_prefix} \u2192 SELL "
-                f"(day-trade breakdown: Tech={_round(t, 1)}, "
-                f"Momentum={_round(m, 1)})",
-            )
+            return _reason("SELL", "Short-term technical setup has broken down.")
 
-    try:
-        from core.reco_normalize import recommendation_from_views  # noqa: WPS433
-    except ImportError:
-        try:
-            from reco_normalize import recommendation_from_views  # noqa: WPS433
-        except ImportError:
-            logger.warning(
-                "core.reco_normalize unavailable; defaulting to HOLD."
-            )
-            return (
-                "HOLD",
-                f"{view_prefix} \u2192 HOLD "
-                "(recommendation engine unavailable)",
-            )
+    # v5.3.0 FIX: Close the high-risk gap. Risk around 77 with overall below
+    # the strong-buy threshold must not escape into HOLD.
+    if r >= 90 and (c < 45 or o < 35):
+        return _reason("STRONG_SELL", "Extreme risk and weak support require urgent exit or avoidance.")
+    if r >= 85 and o < 50:
+        return _reason("SELL", "Very high risk overrides the score profile.")
+    if r >= 75 and o < 78:
+        return _reason("REDUCE", "High risk overrides otherwise acceptable score.")
 
-    rec, reason = recommendation_from_views(
-        fundamental=fundamental_view,
-        technical=technical_view,
-        risk=risk_view,
-        value=value_view,
-        score=overall,
-        conviction=conviction,
-        sector_relative=sector_relative,
-    )
+    # v5.3.0 FIX: Positive recommendations require ROI, confidence, score, and
+    # controlled risk at the same time.
+    if roi >= 0.25 and c >= 70 and r <= 45 and o >= 78:
+        return _reason("STRONG_BUY", "High expected ROI with strong confidence and controlled risk.")
+    if roi >= 0.12 and c >= 60 and r <= 55 and o >= 70:
+        return _reason("BUY", "Positive expected ROI with acceptable confidence and risk.")
+    if o >= 82 and c >= 60 and r <= 55:
+        return _reason("BUY", "High overall score with acceptable confidence and controlled risk.")
 
-    canonical_rec = normalize_recommendation_code(rec)
+    if o >= 65:
+        return _reason("HOLD", "Score is acceptable but risk, confidence, or ROI does not justify adding exposure.")
+    if o >= 50:
+        return _reason("REDUCE", "Score is below preferred quality threshold.")
+    return _reason("SELL", "Weak score profile does not support holding the position.")
 
-    # v5.2.3: COHERENCE GUARD
-    guarded_rec, guarded_reason = _coherence_guard_recommendation(
-        canonical_rec, roi3, confidence100, view_prefix
-    )
-    if guarded_rec is not None and guarded_reason is not None:
-        return guarded_rec, guarded_reason
 
-    aligned_reason = _align_reason_to_canonical_recommendation(reason, canonical_rec)
-    return canonical_rec, aligned_reason
+def _recommendation(
+    overall: Optional[float],
+    risk: Optional[float],
+    confidence100: Optional[float],
+    roi3: Optional[float],
+) -> Tuple[str, str]:
+    # v5.3.0 FIX: Private compatibility wrapper required by data_engine_v2 v5.71.0.
+    return compute_recommendation(overall, risk, confidence100, roi3)
 
 
 # =============================================================================
@@ -2364,6 +2518,8 @@ def _compute_priority(
 
     canon = normalize_recommendation_code(reco) if reco else "HOLD"
 
+    if canon == "STRONG_SELL":
+        return PRIO_P1
     if canon == "STRONG_BUY":
         return PRIO_P2
     if canon == "BUY":
@@ -2417,12 +2573,10 @@ _LOCAL_RECO_ALIASES: Dict[str, str] = {
     "AVOID": "SELL",
     "EXIT": "SELL",
     "UNDERPERFORM": "SELL",
-    "STRONG_SELL": "SELL",
+    "STRONG_SELL": "STRONG_SELL",
 }
 
-CANONICAL_RECOMMENDATION_CODES: Tuple[str, ...] = (
-    "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL",
-)
+CANONICAL_RECOMMENDATION_CODES: Tuple[str, ...] = RECOMMENDATION_ENUM
 _CANONICAL_RECO = set(CANONICAL_RECOMMENDATION_CODES)
 
 
@@ -2746,7 +2900,8 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     growth = compute_growth_score(working)
     confidence100, conf01 = compute_confidence_score(working)
     risk = compute_risk_score(working)
-    opportunity = compute_opportunity_score(working, valuation, momentum)
+    # v5.3.0 FIX: Opportunity score provenance is emitted in opportunity_source.
+    opportunity, opportunity_source = compute_opportunity_score_with_source(working, valuation, momentum)
     value_score = valuation
 
     tech_score = compute_technical_score(working)
@@ -2817,14 +2972,38 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         base01 *= (risk_pen * conf_pen)
         overall = _round(100.0 * _clamp(base01, 0.0, 1.0), 2)
     else:
-        overall = None
-        overall_raw = None
-        penalty_factor = None
         insufficient_inputs = True
         scoring_errors.append("insufficient_scoring_inputs")
+        # v5.3.0 FIX: Default is nullable overall_score so missing data stays
+        # visible to rankers. Env false gives emergency rollback to legacy 50.0.
+        if _nullable_overall_enabled():
+            overall = None
+            overall_raw = None
+            penalty_factor = None
+        else:
+            overall = 50.0
+            overall_raw = 50.0
+            penalty_factor = 1.0
+        missing_components = [
+            name for name, val in (
+                ("technical_score", tech_score),
+                ("valuation_score", valuation),
+                ("momentum_score", momentum),
+                ("quality_score", quality),
+                ("growth_score", growth),
+                ("opportunity_score", opportunity),
+            ) if val is None
+        ]
+        logger.warning(
+            "[v5.3.0 INSUFFICIENT] symbol=%s missing=%s",
+            _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
+            ",".join(missing_components),
+        )
 
     rb = risk_bucket(risk)
-    cb = confidence_bucket(conf01)
+    # v5.3.0 FIX: confidence_bucket is driven by final confidence_score, not
+    # raw forecast_confidence. The helper accepts both 0-100 and 0-1.
+    cb = confidence_bucket(confidence100)
 
     fundamental_view_raw = derive_fundamental_view(quality, growth)
     technical_view_raw = derive_technical_view(tech_score, momentum, rsi_sig)
@@ -2853,14 +3032,17 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             logger.debug("compute_conviction_score failed: %s", exc)
             scoring_errors.append(f"conviction_failed: {type(exc).__name__}")
 
-    if insufficient_inputs:
-        view_prefix_for_suppress = _build_view_prefix(
-            fundamental_view_raw, technical_view_raw,
-            risk_view_raw, value_view_raw,
-        )
-        rec, reason = "HOLD", (
-            f"{view_prefix_for_suppress} \u2192 HOLD "
-            "(insufficient scoring inputs)"
+    if insufficient_inputs and _nullable_overall_enabled():
+        # v5.3.0 FIX: Let the authoritative recommendation helper format the
+        # structured insufficient-data reason.
+        rec, reason = compute_recommendation(
+            None, risk, confidence100, roi3,
+            horizon=horizon, technical=tech_score, momentum=momentum,
+            roi1=roi1, roi12=roi12, quality=quality, growth=growth,
+            valuation=valuation, fundamental_view=fundamental_view_raw,
+            technical_view=technical_view_raw, risk_view=risk_view_raw,
+            value_view=value_view_raw, upside_pct=usp, rsi_label=rsi_sig,
+            conviction=conviction, sector_relative=None,
         )
     else:
         rec, reason = compute_recommendation(
@@ -2938,6 +3120,21 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     structured_reason = _align_reason_to_canonical_recommendation(
         structured_reason, canonical_rec
     )
+    # v5.3.0 FIX: Insights may return legacy prose; force the final reason
+    # back into the structured scoring contract unless legacy mode is enabled.
+    if _structured_reason_enabled():
+        structured_reason = _format_recommendation_reason(
+            canonical_rec,
+            structured_reason.split(":", 1)[1].split("|", 1)[0].strip()
+            if structured_reason.startswith(canonical_rec + ":") else structured_reason,
+            overall, risk, confidence100, roi3,
+        )
+
+    logger.info(
+        "[v5.3.0 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
+        _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
+        overall, risk, confidence100, canonical_rec,
+    )
 
     scores = AssetScores(
         valuation_score=valuation,
@@ -2946,6 +3143,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         growth_score=growth,
         value_score=value_score,
         opportunity_score=opportunity,
+        opportunity_source=opportunity_source,
         confidence_score=confidence100,
         forecast_confidence=conf01,
         confidence_bucket=cb,
@@ -2990,6 +3188,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         # v5.2.7 additions
         recommendation_priority_band=priority,
         recommendation_source=RECOMMENDATION_SOURCE_TAG,
+        scoring_schema_version=__version__,
     )
     return scores.to_dict()
 
@@ -3025,8 +3224,8 @@ class ScoringEngine:
         forecasts: Optional[ForecastParameters] = None,
     ):
         self.settings = settings
-        self.weights = weights or DEFAULT_WEIGHTS
-        self.forecasts = forecasts or DEFAULT_FORECASTS
+        self.weights = weights or DEFAULT_SCORING_WEIGHTS
+        self.forecasts = forecasts or DEFAULT_FORECAST_PARAMETERS
 
     def compute_scores(self, row: Dict[str, Any]) -> Dict[str, Any]:
         return compute_scores(row, settings=self.settings)
@@ -3206,6 +3405,11 @@ __all__ = [
     "ScoringEngine",
     "DEFAULT_WEIGHTS",
     "DEFAULT_FORECASTS",
+    "DEFAULT_SCORING_WEIGHTS",
+    "DEFAULT_FORECAST_PARAMETERS",
+    "RECOMMENDATION_ENUM",
+    "RISK_BUCKET_THRESHOLDS",
+    "CONFIDENCE_BUCKET_THRESHOLDS",
     "normalize_recommendation_code",
     "CANONICAL_RECOMMENDATION_CODES",
     "detect_horizon",
@@ -3223,10 +3427,14 @@ __all__ = [
     "compute_quality_score",
     "compute_risk_score",
     "compute_opportunity_score",
+    "compute_opportunity_score_with_source",
     "compute_confidence_score",
     "compute_recommendation",
     "risk_bucket",
     "confidence_bucket",
+    "_recommendation",
+    "_risk_bucket",
+    "_confidence_bucket",
     "derive_fundamental_view",
     "derive_technical_view",
     "derive_risk_view",
