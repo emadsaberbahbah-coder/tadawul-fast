@@ -1,6 +1,71 @@
 #!/usr/bin/env python3
 # core/data_engine_v2.py
 """
+
+================================================================================
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.71.0
+================================================================================
+
+WHY v5.71.0 — ENGINE-AUTHORITATIVE RECOMMENDATIONS + PAGE-WIDE
+              RANKING GUARDS + DATA-QUALITY SMOKE DETECTORS
+              (May 15, 2026)
+--------------------------------------------------------------------
+v5.71.0 resolves the remaining advisory-control defects found after
+v5.70.0. The key design rule is explicit: non-authoritative values must
+not win silently. Provider recommendations are preserved for provenance,
+but the engine/scoring layer is authoritative by default.
+
+BUGS / FIXES ADDRESSED (A-K):
+  A. Rank (Overall) could become 1 for every row when ranking was applied
+     to per-symbol micro-batches. v5.71.0 introduces `apply_page_ranks()`
+     with a page-batch guard and a `force_single=True` override only for
+     explicitly requested single-symbol flows.
+  B. Provider `recommendation` values could silently override engine
+     scoring. v5.71.0 preserves the upstream value in `provider_rating`
+     and rewrites `recommendation` from `core.scoring._recommendation()`
+     unless `TFB_TRUST_PROVIDER_RECO=true` is explicitly set.
+  C. Local recommendation threshold ladders inside data_engine_v2 are
+     retired. `core.scoring._recommendation()` is the single source of
+     truth for recommendation and reason.
+  D. `ACCUMULATE` is not emitted in final output. Priority 3 remains a
+     documented reserved gap so existing P1/P2/P4/P5 downstream logic is
+     not broken.
+  E. Risk and confidence bucket inference is routed through
+     `core.scoring._risk_bucket()` and `core.scoring._confidence_bucket()`
+     with confidence normalized to 0-1 before calling the scoring helper.
+  F. `recommendation_reason` is always rewritten by the engine; upstream
+     or provider reasons are not allowed to remain via `setdefault()`.
+  G. Currency anomaly smoke detector flags impossible market-cap/currency
+     combinations such as foreign listings misrouted to USD.
+  H. Revenue anomaly smoke detector flags obvious reporting/listing
+     currency mismatch patterns such as revenue wildly exceeding market cap.
+  I. Rank no longer falls back from `overall_score` to `opportunity_score`.
+     Missing overall score is visible via `rank_skipped_no_overall_score`.
+  J. Top10 criteria snapshot now serializes the full criteria object and
+     truncates explicitly instead of silently dropping keys.
+  K. Quote singleflight/cache keys are page/provider-profile/schema-version
+     aware via `_make_cache_key()`.
+
+NEW / HONORED ENV VARS:
+  - TFB_TRUST_PROVIDER_RECO=false
+  - TFB_RANK_REQUIRE_PAGE_BATCH=true
+  - TFB_EMIT_CURRENCY_ANOMALY_WARNINGS=true
+  - TFB_CRITERIA_SNAPSHOT_MAX_CHARS=2000
+
+DIAGNOSTIC LOGS:
+  - [v5.71.0 RECO] symbol={sym} engine_rec={X} provider_rec={Y} source={engine|provider_override}
+  - [v5.71.0 RANK] page={page} n_rows={n} n_ranked={m} n_skipped={k}
+  - [v5.71.0 ANOMALY] symbol={sym} type={currency|revenue} detail={...}
+
+# v5.71.0 FOLLOW-UP:
+# investment_advisor.py::_score_recommendation still has a parallel
+# recommendation threshold ladder and should be unified with core.scoring.py
+# in a future revision.
+
+[PRESERVED] All v5.70.0 schema-alignment fixes remain intact, including
+forced canonical instrument contracts, empty Confidence Score / Data Provider /
+Last Updated recovery, and ghost Status column prevention.
+
 ================================================================================
 Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.70.0
 ================================================================================
@@ -420,6 +485,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import math
 import os
@@ -456,7 +522,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.70.0"
+__version__ = "5.71.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -546,6 +612,27 @@ except Exception:  # pragma: no cover
     _bk_normalize_risk_bucket = None  # type: ignore
     _bk_normalize_confidence_bucket = None  # type: ignore
     _BUCKETS_AVAILABLE = False
+
+
+# =============================================================================
+# v5.71.0 — core.scoring integration (single advisory source of truth)
+# =============================================================================
+# v5.71.0 FIX: Recommendations, recommendation reasons, and bucket labels must
+# be sourced from core.scoring by default. This guarded import preserves the
+# engine's no-import-failure rule while still making core.scoring the
+# authoritative path whenever available.
+try:
+    from core.scoring import (
+        _recommendation as _scoring_recommendation,
+        _risk_bucket as _scoring_risk_bucket,
+        _confidence_bucket as _scoring_confidence_bucket,
+    )
+    _SCORING_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _scoring_recommendation = None  # type: ignore
+    _scoring_risk_bucket = None  # type: ignore
+    _scoring_confidence_bucket = None  # type: ignore
+    _SCORING_AVAILABLE = False
 
 
 # =============================================================================
@@ -1105,10 +1192,9 @@ def _derive_views(row: Dict[str, Any]) -> None:
         row["value_view"] = row.get("value_view") or vv
 
 
-# v5.69.0: canonical 8-tier priority map (best -> worst == priority 1 -> 8).
-# Mirrors core.reco_normalize's ordering. Used to derive a consistent
-# recommendation_priority whether the recommendation came from this
-# engine's score-based classifier or from an upstream provider string.
+# v5.69.0: legacy 8-tier map retained for compatibility with imported provider
+# normalization only. v5.71.0 final output uses _FINAL_RECO_PRIORITY below and
+# never emits ACCUMULATE or AVOID.
 _RECO_8TIER_PRIORITY: Dict[str, int] = {
     "STRONG_BUY": 1,
     "BUY": 2,
@@ -1120,124 +1206,204 @@ _RECO_8TIER_PRIORITY: Dict[str, int] = {
     "AVOID": 8,
 }
 
+# v5.71.0 FIX: final output vocabulary. Priority 3 is intentionally reserved
+# / unused because ACCUMULATE is retired from output, but downstream Apps Script
+# historically expects P1/P2/P4/P5 style bands.
+_FINAL_RECO_PRIORITY: Dict[str, int] = {
+    "STRONG_BUY": 1,
+    "BUY": 2,
+    "HOLD": 4,
+    "REDUCE": 5,
+    "SELL": 5,
+    "STRONG_SELL": 5,
+}
+_FINAL_RECO_VALUES: Set[str] = set(_FINAL_RECO_PRIORITY.keys())
+_RECO_NORMALIZATION_MAP: Dict[str, str] = {
+    "STRONG_BUY": "STRONG_BUY",
+    "BUY": "BUY",
+    "OUTPERFORM": "BUY",
+    "OVERWEIGHT": "BUY",
+    "ACCUMULATE": "BUY",  # v5.71.0 FIX: never emit ACCUMULATE.
+    "ADD": "BUY",
+    "HOLD": "HOLD",
+    "NEUTRAL": "HOLD",
+    "MARKET_PERFORM": "HOLD",
+    "REDUCE": "REDUCE",
+    "UNDERPERFORM": "REDUCE",
+    "SELL": "SELL",
+    "STRONG_SELL": "STRONG_SELL",
+    "AVOID": "STRONG_SELL",  # v5.71.0 FIX: final enum excludes AVOID.
+}
+
 
 def _canonical_recommendation(value: Any) -> str:
-    """v5.69.0: canonicalize any recommendation string/number to the 8-tier
-    vocabulary. Routes through core.reco_normalize when available; otherwise
-    falls back to a conservative local upper-case match. Returns "" only for
-    genuinely unrecognizable input."""
+    """v5.71.0 FIX: canonicalize to the final 6-value output vocabulary.
+
+    Provider values may arrive in an 8-tier or free-text vocabulary. They are
+    preserved verbatim in provider_rating, but if explicitly trusted by env they
+    must still be normalized to the final dashboard-safe enum.
+    """
     if value in (None, ""):
         return ""
+    raw = _safe_str(value).upper().replace("-", "_").replace(" ", "_")
+    if raw in _RECO_NORMALIZATION_MAP:
+        return _RECO_NORMALIZATION_MAP[raw]
     if _RECO_NORMALIZE_AVAILABLE and _rn_normalize_recommendation is not None:
         try:
-            canon = _safe_str(_rn_normalize_recommendation(value)).upper()
-            if canon in _RECO_8TIER_PRIORITY:
-                return canon
+            canon = _safe_str(_rn_normalize_recommendation(value)).upper().replace("-", "_").replace(" ", "_")
+            return _RECO_NORMALIZATION_MAP.get(canon, canon if canon in _FINAL_RECO_VALUES else "")
         except Exception:
             pass
-    # Fallback: direct match against the canonical set (handles the common
-    # case where the value is already canonical, e.g. engine-computed).
-    raw = _safe_str(value).upper().replace("-", "_").replace(" ", "_")
-    return raw if raw in _RECO_8TIER_PRIORITY else ""
+    return raw if raw in _FINAL_RECO_VALUES else ""
 
 
 def _recommendation_priority(rec: str) -> int:
-    """v5.69.0: priority 1 (best) .. 8 (worst) for a canonical recommendation.
-    Unknown -> 4 (HOLD-equivalent neutral)."""
-    return _RECO_8TIER_PRIORITY.get(_safe_str(rec).upper(), 4)
+    """v5.71.0 FIX: P3 intentionally reserved; ACCUMULATE is retired."""
+    return _FINAL_RECO_PRIORITY.get(_safe_str(rec).upper(), 4)
+
+
+def _confidence_to_01(value: Any) -> Optional[float]:
+    v = _as_float(value)
+    if v is None:
+        return None
+    return v / 100.0 if abs(v) > 1.5 else v
+
+
+def _engine_risk_bucket(value: Any) -> str:
+    """v5.71.0 FIX: source risk buckets from core.scoring first."""
+    rs = _as_float(value)
+    if _SCORING_AVAILABLE and _scoring_risk_bucket is not None:
+        try:
+            bucket = _safe_str(_scoring_risk_bucket(rs)).upper()
+            if bucket:
+                return bucket
+        except Exception:
+            pass
+    if _BUCKETS_AVAILABLE and _bk_risk_bucket_from_score is not None:
+        try:
+            bucket = _safe_str(_bk_risk_bucket_from_score(rs)).upper()
+            if bucket:
+                return bucket
+        except Exception:
+            pass
+    return ""
+
+
+def _engine_confidence_bucket(value: Any) -> str:
+    """v5.71.0 FIX: source confidence buckets from core.scoring using 0-1 scale."""
+    conf01 = _confidence_to_01(value)
+    if _SCORING_AVAILABLE and _scoring_confidence_bucket is not None:
+        try:
+            bucket = _safe_str(_scoring_confidence_bucket(conf01)).upper()
+            if bucket:
+                return bucket
+        except Exception:
+            pass
+    # Fallback only to core.buckets, not a local ladder in the call sites.
+    if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
+        try:
+            score100 = None if conf01 is None else conf01 * 100.0
+            bucket = _safe_str(_bk_confidence_bucket_from_score(score100)).upper()
+            if bucket:
+                return bucket
+        except Exception:
+            pass
+    return ""
+
+
+def _engine_recommendation_from_scoring(row: Dict[str, Any]) -> Tuple[str, str]:
+    """v5.71.0 FIX: delegate recommendation/reason to core.scoring._recommendation.
+
+    This function contains no local threshold ladder. If core.scoring is not
+    importable, it returns a conservative HOLD with an explicit reason and warning
+    so the engine stays import-safe without silently trusting provider data.
+    """
+    overall = _as_float(row.get("overall_score"))
+    risk = _as_float(row.get("risk_score"))
+    conf100 = _as_float(row.get("confidence_score"))
+    if conf100 is None:
+        conf01 = _confidence_to_01(row.get("forecast_confidence"))
+        conf100 = None if conf01 is None else conf01 * 100.0
+    roi3 = _as_pct_fraction(row.get("expected_roi_3m"))
+
+    if _SCORING_AVAILABLE and _scoring_recommendation is not None:
+        try:
+            result = _scoring_recommendation(overall, risk, conf100, roi3)
+            if isinstance(result, tuple):
+                rec_raw = result[0] if len(result) >= 1 else ""
+                reason = _safe_str(result[1]) if len(result) >= 2 else ""
+            elif isinstance(result, dict):
+                rec_raw = result.get("recommendation") or result.get("rec") or result.get("action")
+                reason = _safe_str(result.get("reason") or result.get("recommendation_reason"))
+            else:
+                rec_raw = result
+                reason = ""
+            rec = _canonical_recommendation(rec_raw)
+            if not rec:
+                rec = "HOLD"
+                reason = reason or "Engine scoring returned an unrecognized recommendation; normalized to HOLD."
+                _append_warning(row, f"invalid_engine_recommendation:{_safe_str(rec_raw)}")
+            return rec, reason or f"Engine scoring recommendation based on overall={overall}, risk={risk}, confidence={conf100}, roi_3m={roi3}."
+        except Exception as exc:
+            _append_warning(row, f"scoring_recommendation_failed:{exc.__class__.__name__}")
+
+    _append_warning(row, "scoring_recommendation_unavailable")
+    return "HOLD", "core.scoring._recommendation unavailable; conservative HOLD applied."
 
 
 def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
-    """v5.69.0 — SINGLE AUTHORITATIVE recommendation writer.
+    """v5.71.0 FIX: compatibility wrapper, now engine-authoritative.
 
-    Before v5.69.0 the engine had two divergent classifiers and three
-    fields (`recommendation`, `recommendation_detailed`, and the `[..]`
-    token in `recommendation_reason`) that were each written in a
-    different, order-dependent place -- so they routinely disagreed.
-
-    v5.69.0 contract:
-      * If an upstream provider already supplied `recommendation`, that
-        value is treated as authoritative and is canonicalized through
-        core.reco_normalize (so "Strong Buy", "outperform", a 1-5 rating,
-        Arabic, etc. all collapse to the 8-tier vocabulary). No regression
-        on legitimately provider-supplied recommendations.
-      * Otherwise the engine's own score+view classifier produces the
-        8-tier value.
-      * `recommendation` and `recommendation_detailed` are then set to the
-        SAME canonical value, `recommendation_priority` is derived from it,
-        and `recommendation_reason` references that SAME value. The three
-        fields can no longer disagree.
+    The function name is preserved because existing call sites use it, but it no
+    longer contains a local 8-tier threshold ladder and never lets provider data
+    win silently.
     """
     if not isinstance(row, dict):
         return
 
-    overall = _as_float(row.get("overall_score"))
-    # v5.67.0: upside_pct is now stored as FRACTION. _as_pct_points
-    # gracefully handles both fraction and points input.
-    upside_points = _as_pct_points(row.get("upside_pct"))
-    risk_bucket = _safe_str(row.get("risk_bucket")).upper()
-    value_view = _safe_str(row.get("value_view")).upper()
-    technical = _safe_str(row.get("technical_view")).upper()
-    fundamental = _safe_str(row.get("fundamental_view")).upper()
+    symbol = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol") or row.get("ticker")))
+    provider_raw = row.get("provider_rating")
+    if provider_raw in (None, ""):
+        provider_raw = row.get("recommendation")
+    if provider_raw not in (None, "") and row.get("provider_rating") in (None, ""):
+        # v5.71.0 FIX: preserve provider value before rewriting recommendation.
+        row["provider_rating"] = _safe_str(provider_raw)
 
-    # ------------------------------------------------------------------
-    # v5.69.0: was an authoritative recommendation already supplied
-    # upstream? If so it wins -- but it is canonicalized first so the
-    # vocabulary stays consistent with the engine-computed path.
-    # ------------------------------------------------------------------
-    preset = _canonical_recommendation(row.get("recommendation"))
+    engine_rec, engine_reason = _engine_recommendation_from_scoring(row)
+    provider_rec = _canonical_recommendation(provider_raw)
+    trust_provider = _get_env_bool("TFB_TRUST_PROVIDER_RECO", False)
 
-    rec: Optional[str] = None
-    priority: Optional[int] = None
-    classified_by = ""
+    if trust_provider and provider_rec:
+        final_rec = provider_rec
+        source = "provider_override"
+        reason = f"Provider recommendation explicitly trusted by TFB_TRUST_PROVIDER_RECO=true; engine_rec={engine_rec}."
+    else:
+        final_rec = engine_rec
+        source = "engine"
+        reason = engine_reason
 
-    if preset:
-        rec = preset
-        priority = _recommendation_priority(rec)
-        classified_by = "provider"
-    elif overall is not None:
-        # Engine's own score + view classifier (8-tier).
-        if overall >= 80 and upside_points is not None and upside_points >= 25 and risk_bucket != "HIGH":
-            rec, priority = "STRONG_BUY", 1
-        elif overall >= 70 and upside_points is not None and upside_points >= 15:
-            rec, priority = "BUY", 2
-        elif overall >= 60 and (value_view in ("CHEAP", "FAIR") or technical == "BULLISH"):
-            rec, priority = "ACCUMULATE", 3
-        elif overall >= 40:
-            rec, priority = "HOLD", 4
-        elif overall >= 30 and value_view == "EXPENSIVE":
-            rec, priority = "REDUCE", 5
-        elif overall >= 20:
-            rec, priority = "SELL", 6
-        elif risk_bucket == "HIGH":
-            rec, priority = "STRONG_SELL", 7
-        else:
-            rec, priority = "AVOID", 8
-        classified_by = "engine"
+    if final_rec not in _FINAL_RECO_VALUES:
+        # v5.71.0 FIX: final output must never emit ACCUMULATE/AVOID/unknown.
+        _append_warning(row, f"final_recommendation_normalized:{final_rec}")
+        final_rec = _canonical_recommendation(final_rec) or "HOLD"
 
-    if rec is None:
-        # No upstream value and no overall_score -> cannot classify.
-        # Leave the fields untouched rather than fabricating a label.
-        return
-
-    # ------------------------------------------------------------------
-    # v5.69.0: write all three fields CONSISTENTLY from the single `rec`.
-    # These are overwrites, not fill-if-empty: the whole point is to
-    # eliminate the case where `recommendation` and `recommendation_detailed`
-    # were set by different code paths and disagreed.
-    # ------------------------------------------------------------------
-    row["recommendation"] = rec
-    row["recommendation_detailed"] = rec
+    priority = _recommendation_priority(final_rec)
+    row["recommendation"] = final_rec
+    row["recommendation_detailed"] = final_rec
     row["recommendation_priority"] = priority
+    row["reco_priority"] = priority
+    row["recommendation_source"] = source
+    # v5.71.0 FIX: always rewrite reason; never setdefault provider/upstream text.
+    row["recommendation_reason"] = reason
+    # v5.71.0 FIX: surface currency/revenue anomalies after final row scoring.
+    _apply_v571_anomaly_warnings(row)
 
-    fv = fundamental or "NEUTRAL"
-    tv = technical or "NEUTRAL"
-    rv = risk_bucket or "MODERATE"
-    vv = value_view or "FAIR"
-    row["recommendation_reason"] = (
-        f"P{priority} [{rec}]: "
-        f"Fund {fv} | Tech {tv} | Risk {rv} | Val {vv} "
-        f"(via {classified_by})"
+    logger.info(
+        "[v5.71.0 RECO] symbol=%s engine_rec=%s provider_rec=%s source=%s",
+        symbol or "",
+        engine_rec,
+        provider_rec or "",
+        source,
     )
 
 
@@ -1318,7 +1484,8 @@ def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
     rec = _safe_str(row.get("recommendation")).upper()
     if rec in ("STRONG_BUY",):
         psh = "Core position"
-    elif rec in ("BUY", "ACCUMULATE"):
+    elif rec == "BUY":
+        # v5.71.0 FIX: ACCUMULATE is no longer emitted.
         psh = "Standard position"
     elif rec == "HOLD":
         psh = "Maintain or trim"
@@ -1636,9 +1803,11 @@ def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
     _synthesize_market_cap_if_zero(row)
     _compute_intrinsic_and_upside(row)
     _derive_views(row)
+    # v5.71.0 FIX: forecast/confidence must be refreshed before the final
+    # engine-authoritative recommendation pass.
+    _phase_ii_quality_forecast(row)
     _classify_recommendation_8tier(row)
     _build_top_factors_and_risks(row)
-    _phase_ii_quality_forecast(row)
     return row
 
 
@@ -1763,12 +1932,8 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
 
     row["forecast_confidence"] = round(conf, 4)
     row["confidence_score"] = round(conf * 100.0, 2)
-    if conf >= 0.70:
-        row["confidence_bucket"] = "HIGH"
-    elif conf >= 0.50:
-        row["confidence_bucket"] = "MODERATE"
-    else:
-        row["confidence_bucket"] = "LOW"
+    # v5.71.0 FIX: bucket comes from core.scoring using 0-1 confidence scale.
+    row["confidence_bucket"] = _engine_confidence_bucket(conf)
 
 
 def _pick_yahoo_callable(mod: Any, *names: str) -> Optional[Any]:
@@ -1793,6 +1958,61 @@ def _append_yahoo_warning_tag(row: Dict[str, Any], tag: str) -> None:
     if tag in s:
         return
     row["warnings"] = (s + "; " + tag) if s else tag
+
+
+
+def _append_warning(row: Dict[str, Any], warning_text: str) -> None:
+    """v5.71.0 FIX: idempotent warning appender for list/string warnings."""
+    if not isinstance(row, dict) or not warning_text:
+        return
+    existing = row.get("warnings")
+    if isinstance(existing, list):
+        if warning_text not in existing:
+            existing.append(warning_text)
+        return
+    parts = [p.strip() for p in re.split(r"[;|]", _safe_str(existing)) if p.strip()]
+    if warning_text not in parts:
+        parts.append(warning_text)
+    row["warnings"] = "; ".join(parts)
+
+
+def _detect_currency_anomaly(row: Dict[str, Any]) -> Optional[str]:
+    """v5.71.0 FIX: smoke detector for likely listing/reporting currency mismatch."""
+    if not _get_env_bool("TFB_EMIT_CURRENCY_ANOMALY_WARNINGS", True):
+        return None
+    mc = _as_float(row.get("market_cap"))
+    price = _as_float(row.get("current_price"))
+    currency = _safe_str(row.get("currency")).upper()
+    symbol = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
+    if mc is not None and mc > 1e12 and currency == "USD" and price is not None and price < 10000:
+        return f"market_cap_currency_suspect:symbol={symbol}:mc={mc:.0f}:currency={currency}"
+    return None
+
+
+def _detect_revenue_anomaly(row: Dict[str, Any]) -> Optional[str]:
+    """v5.71.0 FIX: smoke detector for revenue shown in wrong currency scale."""
+    if not _get_env_bool("TFB_EMIT_CURRENCY_ANOMALY_WARNINGS", True):
+        return None
+    revenue = _as_float(row.get("revenue_ttm"))
+    mc = _as_float(row.get("market_cap"))
+    symbol = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
+    if revenue is not None and revenue > 0 and mc is not None and mc > 0 and revenue / mc > 50.0:
+        return f"revenue_currency_suspect:symbol={symbol}:revenue={revenue:.0f}:market_cap={mc:.0f}"
+    return None
+
+
+def _apply_v571_anomaly_warnings(row: Dict[str, Any]) -> None:
+    """v5.71.0 FIX: emit anomaly warnings and diagnostic logs."""
+    for kind, fn in (("currency", _detect_currency_anomaly), ("revenue", _detect_revenue_anomaly)):
+        detail = fn(row)
+        if detail:
+            _append_warning(row, detail)
+            logger.warning(
+                "[v5.71.0 ANOMALY] symbol=%s type=%s detail=%s",
+                normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol"))),
+                kind,
+                detail,
+            )
 
 
 # =============================================================================
@@ -1842,6 +2062,7 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
     "sector_relative_score", "conviction_score", "top_factors", "top_risks",
     "position_size_hint", "recommendation_detailed", "recommendation_priority",
+    "provider_rating", "recommendation_source",
     "candlestick_pattern", "candlestick_signal", "candlestick_strength",
     "candlestick_confidence", "candlestick_patterns_recent",
 ]
@@ -1869,6 +2090,7 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
     "Position Size Hint", "Recommendation Detail", "Reco Priority",
+    "Provider Rating", "Recommendation Source",
     "Candle Pattern", "Candle Signal", "Candle Strength",
     "Candle Confidence", "Recent Patterns (5D)",
 ]
@@ -2413,6 +2635,16 @@ def _get_env_list(name: str, default: Sequence[str]) -> List[str]:
     return [p.strip().lower() for p in re.split(r"[,;|\s]+", raw) if p.strip()]
 
 
+
+def _make_cache_key(symbol: str, page: str = "", provider_profile: str = "", schema_version: str = "") -> str:
+    """v5.71.0 FIX: page/provider/schema-aware quote cache key."""
+    sym = normalize_symbol(symbol)
+    page_ctx = _canonicalize_sheet_name(page) if page else "default"
+    profile = _safe_str(provider_profile, "none")
+    version = _safe_str(schema_version, __version__)
+    return f"quote:{sym}:page={page_ctx}:profile={profile}:schema={version}"
+
+
 def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
     raw_headers = list(headers or [])
     raw_keys = list(keys or [])
@@ -2489,6 +2721,7 @@ _INSTRUMENT_CANONICAL_REQUIRED_KEYS: frozenset = frozenset({
     # Recommendation
     "recommendation", "recommendation_reason",
     "recommendation_detailed", "recommendation_priority",
+    "provider_rating", "recommendation_source",
     # Provenance — the v5.69.0-deferred "empty Data Provider / Last Updated"
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
 })
@@ -2841,6 +3074,8 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "position_size_hint": ("position_size_hint", "positionSizeHint", "sizingHint", "sizing"),
     "recommendation_detailed": ("recommendation_detailed", "recommendationDetailed", "recommendationDetail", "reco_detail", "detailed_recommendation"),
     "recommendation_priority": ("recommendation_priority", "recoPriority", "priority", "reco_priority"),
+    "provider_rating": ("provider_rating", "providerRating", "provider_recommendation", "analystRating", "analyst_rating"),
+    "recommendation_source": ("recommendation_source", "recommendationSource", "reco_source", "source_recommendation"),
     "candlestick_pattern": ("candlestick_pattern", "candlePattern", "candlestickPattern", "pattern"),
     "candlestick_signal": ("candlestick_signal", "candleSignal", "candlestickSignal", "patternSignal"),
     "candlestick_strength": ("candlestick_strength", "candleStrength", "candlestickStrength", "patternStrength"),
@@ -3450,17 +3685,8 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             conf = conf_fraction * 100.0 if conf_fraction <= 1.5 else conf_fraction
             out.setdefault("confidence_score", round(_clamp(conf, 0.0, 100.0), 2))
     if conf is not None and out.get("confidence_bucket") in (None, ""):
-        # v5.69.0: route through core.buckets (canonical thresholds:
-        # >=75 HIGH / 50-75 MODERATE / <50 LOW). Guarded inline fallback.
-        _cb = ""
-        if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
-            try:
-                _cb = _bk_confidence_bucket_from_score(conf)
-            except Exception:
-                _cb = ""
-        if not _cb:
-            _cb = "HIGH" if conf >= 75 else "MODERATE" if conf >= 50 else "LOW"
-        out["confidence_bucket"] = _cb
+        # v5.71.0 FIX: confidence bucket comes from core.scoring helper.
+        out["confidence_bucket"] = _engine_confidence_bucket(conf)
 
     if target == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
         out.setdefault("data_provider", _safe_str(out.get("data_provider"), "history_or_fallback"))
@@ -3470,16 +3696,8 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             out["confidence_score"] = 55.0
         if out.get("forecast_confidence") not in (None, "") and out.get("confidence_bucket") in (None, ""):
             conf = _as_float(out.get("confidence_score")) or ((_as_float(out.get("forecast_confidence")) or 0.55) * 100.0)
-            # v5.69.0: route through core.buckets; guarded inline fallback.
-            _cb = ""
-            if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
-                try:
-                    _cb = _bk_confidence_bucket_from_score(conf)
-                except Exception:
-                    _cb = ""
-            if not _cb:
-                _cb = "HIGH" if conf >= 75 else "MODERATE" if conf >= 50 else "LOW"
-            out["confidence_bucket"] = _cb
+            # v5.71.0 FIX: confidence bucket comes from core.scoring helper.
+            out["confidence_bucket"] = _engine_confidence_bucket(conf)
         if out.get("warnings") in (None, "") and _as_float(out.get("current_price")) is None:
             out["warnings"] = "Live quote sparse; chart/history fallback unavailable"
 
@@ -3713,66 +3931,79 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         row["opportunity_score"] = round(_clamp(base + confidence_boost + roi_boost - risk_penalty, 0.0, 100.0), 2)
 
     if not row.get("risk_bucket"):
-        # v5.69.0: route through core.buckets (canonical UPPERCASE,
-        # recalibrated <35 LOW / 35-70 MODERATE / >=70 HIGH). Guarded
-        # fallback to the inline thresholds if core.buckets is missing.
-        rs = _as_float(row.get("risk_score"))
-        rb = ""
-        if _BUCKETS_AVAILABLE and _bk_risk_bucket_from_score is not None:
-            try:
-                rb = _bk_risk_bucket_from_score(rs)
-            except Exception:
-                rb = ""
-        if not rb:
-            rs_f = rs if rs is not None else 50.0
-            rb = "LOW" if rs_f < 35 else "MODERATE" if rs_f < 70 else "HIGH"
-        row["risk_bucket"] = rb
+        # v5.71.0 FIX: risk bucket comes from core.scoring helper.
+        row["risk_bucket"] = _engine_risk_bucket(row.get("risk_score"))
 
     if not row.get("confidence_bucket"):
-        # v5.69.0: route through core.buckets (auto-detects 0-1 vs 0-100
-        # input scale, canonical UPPERCASE). Guarded inline fallback.
-        cs = _as_float(row.get("confidence_score"))
-        cb = ""
-        if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
-            try:
-                cb = _bk_confidence_bucket_from_score(cs)
-            except Exception:
-                cb = ""
-        if not cb:
-            cs_f = cs if cs is not None else 55.0
-            cb = "HIGH" if cs_f >= 75 else "MODERATE" if cs_f >= 50 else "LOW"
-        row["confidence_bucket"] = cb
+        # v5.71.0 FIX: confidence bucket comes from core.scoring helper.
+        row["confidence_bucket"] = _engine_confidence_bucket(row.get("confidence_score"))
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
-    """v5.69.0 — RETIRED as an independent classifier.
+    """v5.71.0 FIX: recommendation delegates to core.scoring via wrapper.
 
-    This used to be a second, divergent 4-tier classifier (BUY /
-    ACCUMULATE / REDUCE / HOLD only) that competed with
-    `_classify_recommendation_8tier` and produced the
-    main-vs-Detail-vs-Reason disagreement seen on the dashboard.
-
-    It is kept as a thin delegator so the five existing call sites do
-    not need to change: every recommendation now flows through the
-    SINGLE authoritative 8-tier classifier, which also routes through
-    core.reco_normalize. Calling this on a row that already has a
-    consistent recommendation is idempotent.
+    Kept for call-site compatibility. It no longer contains or calls a local
+    threshold ladder, and it always rewrites recommendation_reason from the
+    engine path.
     """
     _classify_recommendation_8tier(row)
 
 
-def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
+def apply_page_ranks(rows: List[Dict[str, Any]], page_name: str = "", force_single: bool = False) -> None:
+    """v5.71.0 FIX: page-wide ranking pass using overall_score only.
+
+    Single-row ranking is allowed only when force_single=True. We never infer
+    an explicit single-symbol request from len(rows) == 1 because that was the
+    root cause of the rank-always-1 bug.
+    """
+    if not isinstance(rows, list) or not rows:
+        logger.info("[v5.71.0 RANK] page=%s n_rows=0 n_ranked=0 n_skipped=0", page_name or "")
+        return
+
+    require_page_batch = _get_env_bool("TFB_RANK_REQUIRE_PAGE_BATCH", True)
+    if require_page_batch and len(rows) <= 1 and not force_single:
+        for row in rows:
+            if isinstance(row, dict):
+                row["rank_overall"] = None
+                _append_warning(row, "rank_skipped_per_symbol_batch")
+        logger.info(
+            "[v5.71.0 RANK] page=%s n_rows=%d n_ranked=0 n_skipped=%d",
+            page_name or "",
+            len(rows),
+            len(rows),
+        )
+        return
+
     scored: List[Tuple[int, float]] = []
+    skipped = 0
     for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
         score = _as_float(row.get("overall_score"))
         if score is None:
-            score = _as_float(row.get("opportunity_score"))
-        if score is None:
+            row["rank_overall"] = None
+            _append_warning(row, "rank_skipped_no_overall_score")
+            skipped += 1
             continue
         scored.append((i, score))
+
     scored.sort(key=lambda t: t[1], reverse=True)
     for rank, (idx, _) in enumerate(scored, start=1):
         rows[idx]["rank_overall"] = rank
+
+    logger.info(
+        "[v5.71.0 RANK] page=%s n_rows=%d n_ranked=%d n_skipped=%d",
+        page_name or "",
+        len(rows),
+        len(scored),
+        skipped,
+    )
+
+
+def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
+    """Backward-compatible wrapper. Prefer apply_page_ranks(page_name=...)."""
+    apply_page_ranks(rows, page_name="", force_single=False)
 
 
 def _top10_selection_reason(row: Dict[str, Any]) -> str:
@@ -3792,21 +4023,15 @@ def _top10_selection_reason(row: Dict[str, Any]) -> str:
 
 
 def _top10_criteria_snapshot(criteria: Dict[str, Any]) -> str:
-    keep = {
-        "top_n": criteria.get("top_n"),
-        "pages_selected": criteria.get("pages_selected"),
-        "horizon_days": criteria.get("horizon_days") or criteria.get("invest_period_days"),
-        "risk_level": criteria.get("risk_level"),
-        "min_expected_roi": criteria.get("min_expected_roi"),
-        "confidence_level": criteria.get("confidence_level"),
-        "direct_symbols": criteria.get("direct_symbols") or criteria.get("symbols"),
-    }
-    keep = {k: v for k, v in keep.items() if v not in (None, "", [], {})}
+    """v5.71.0 FIX: serialize full criteria; never silently drop keys."""
     try:
-        import json
-        return json.dumps(_json_safe(keep), ensure_ascii=False, separators=(",", ":"))
+        payload = json.dumps(_json_safe(criteria or {}), ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
     except Exception:
         return "{}"
+    max_chars = max(200, _get_env_int("TFB_CRITERIA_SNAPSHOT_MAX_CHARS", 2000))
+    if len(payload) > max_chars:
+        return payload[:max_chars] + f"[truncated at {max_chars} chars]"
+    return payload
 
 
 def _feature_flags(settings: Any) -> Dict[str, bool]:
@@ -5662,8 +5887,10 @@ class DataEngineV5:
         page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, extras=kwargs)
         provider_profile = self._provider_profile_key(norm, page_context)
 
+        cache_key = _make_cache_key(norm, page_context, provider_profile, __version__)
         if use_cache:
-            cached = await self._cache.get(symbol=norm, provider_profile=provider_profile)
+            # v5.71.0 FIX: cache key includes page/provider/schema context.
+            cached = await self._cache.get(cache_key=cache_key)
             if isinstance(cached, dict) and cached:
                 return UnifiedQuote(**cached)
 
@@ -5753,7 +5980,8 @@ class DataEngineV5:
         q = UnifiedQuote(**row)
 
         if use_cache:
-            await self._cache.set(_model_to_dict(q), symbol=norm, provider_profile=provider_profile)
+            # v5.71.0 FIX: cache key includes page/provider/schema context.
+            await self._cache.set(_model_to_dict(q), cache_key=cache_key)
 
         return q
 
@@ -5770,7 +5998,8 @@ class DataEngineV5:
     ) -> UnifiedQuote:
         page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, schema=schema, extras=kwargs)
         provider_profile = self._provider_profile_key(normalize_symbol(symbol), page_context)
-        key = f"quote:{normalize_symbol(symbol)}:{provider_profile}:{'cache' if use_cache else 'live'}"
+        # v5.71.0 FIX: singleflight key includes page/provider/schema context.
+        key = _make_cache_key(normalize_symbol(symbol), page_context, provider_profile, __version__) + (":cache" if use_cache else ":live")
         raw_q = await self._singleflight.execute(
             key,
             lambda: self._get_enriched_quote_impl(symbol, use_cache, page=page_context, body=body, schema=schema, **kwargs),
@@ -6042,7 +6271,7 @@ class DataEngineV5:
         if not rows:
             return out_headers, out_keys, []
 
-        _apply_rank_overall(rows)
+        apply_page_ranks(rows, page_name="Top_10_Investments")
         rows.sort(key=self._top10_sort_key, reverse=True)
 
         criteria_snapshot = _top10_criteria_snapshot({
@@ -6413,7 +6642,7 @@ class DataEngineV5:
                     _compute_recommendation(merged)
                     enriched_rows.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, merged)))
 
-                _apply_rank_overall(enriched_rows)
+                apply_page_ranks(enriched_rows, page_name=target_sheet)
 
                 payload_full = self._finalize_payload(
                     sheet=target_sheet, headers=out_headers, keys=out_keys,
@@ -6463,7 +6692,7 @@ class DataEngineV5:
                 _compute_scores_fallback(row)
                 _compute_recommendation(row)
                 rows_full.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)))
-            _apply_rank_overall(rows_full)
+            apply_page_ranks(rows_full, page_name=target_sheet)
 
         if rows_full:
             payload_full = self._finalize_payload(
