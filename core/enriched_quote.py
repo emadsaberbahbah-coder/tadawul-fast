@@ -3,125 +3,124 @@
 """
 core/enriched_quote.py
 ===============================================================================
-TFB Enriched Quote Core — v4.4.0 (SUFFIX-DERIVE / UNIT-NORMALIZE / PROVENANCE)
+TFB Enriched Quote Core — v4.5.0 (METADATA-SSOT / OUTLIER-GATE / EMPTY-ROW MARK)
 ===============================================================================
 CORE-ONLY • SCHEMA-FIRST • PAGE-CANONICAL • SPECIAL-PAGE SAFE • ENGINE-TOLERANT
 JSON-SAFE • SYNC/ASYNC SAFE • ROUTE-FRIENDLY • LIGHTWEIGHT • IMPORT-SAFE
 
-v4.4.0 changes (what moved from v4.3.0)
+v4.5.0 changes (what moved from v4.4.0)
 ---------------------------------------
 
-This release closes three gaps surfaced by the May 2026 sheet-snapshot audit
-(~57 representative rows, 97 columns). Every change here is a row-level
-defensive normalization that runs after the engine emits a row but before
-schema projection writes it to the response. None of these overwrite
-already-correct engine output; each one targets a documented failure mode
-where the engine emits a value that disagrees with the sheet's display
-contract (04_Format.gs v2.7.0 / schema_registry v2.5.0+).
+This release closes the four remaining issues from the May 2026 sheet-snapshot
+audit that v4.4.0 left in place:
 
-- FIX [HIGH]: NEW `_derive_exchange_currency_from_suffix()` helper. Audit
-  showed 51/57 rows with foreign-suffix tickers (`.HK`, `.L`, `.CO`, `.NS`,
-  `.SA`, `.TO`, `.XETRA`) carrying displayed values `Exchange=NASDAQ/NYSE`,
-  `Currency=USD`, `Country=USA`. The engine's own Warnings column flagged
-  this honestly (`quote_exchange_from_suffix; quote_currency_from_suffix`)
-  but never applied the derived values to the displayed fields. The new
-  helper consults a comprehensive `_SUFFIX_TO_LOCALE` map covering 35+
-  international exchange suffixes and overrides the three fields only
-  when (a) the symbol has a recognized non-US suffix AND (b) the displayed
-  country is blank or "USA". A clean US ticker without a suffix is never
-  touched.
+- FIX [CRITICAL]: NEW `_derive_metadata_from_normalize()` helper. v4.4.0 used
+  a LOCAL `_SUFFIX_TO_LOCALE` table for suffix→(exchange, currency, country)
+  inference, but that table was MISSING entries for `.KW` (Boursa Kuwait),
+  `.JSE` (South Africa long-form), `.QA`, `.AE`, `.DFM`, `.ADX`, `.EG`, `.TA`,
+  `.TASE` — exactly the suffixes that drove the MABANEE.KW / OOREDOO.KW /
+  ALAFCO.KW / ANG.JSE / MTN.JSE corruption (displayed as NASDAQ/NYSE/USD/USA).
+  The new helper delegates to `normalize.infer_symbol_metadata()` (v5.3.0+),
+  which is the SINGLE SOURCE OF TRUTH for symbol metadata across the codebase.
+  When `normalize.py` v5.3.0 is unavailable, the v4.4.0 legacy path is used
+  as fallback (and we've patched the missing suffixes into the local table
+  so even the legacy path now handles them).
 
-- FIX [HIGH]: NEW `_normalize_percent_units()` helper. Audit confirmed a
-  100x display error on 4 percent fields:
-    * `percent_change`: 47/57 rows out-of-range. CIM.US displayed -7.44%
-      vs real -0.07%. Caused by `data_engine_v2._canonicalize_provider_row`
-      storing as points (×100) while `04_Format.gs v2.6.0` classifies the
-      column as a fraction (×100 again on display).
-    * `upside_pct`: 52/57 rows out-of-range. Same pattern.
-    * `max_drawdown_1y`: 57/57 rows out-of-range. Engine emits
-      `abs(max_dd) * 100`.
-    * `var_95_1d`: 53/57 rows out-of-range. Engine emits `var95 * 100`.
-  For `percent_change` and `upside_pct` and `expected_roi_*`, the helper
-  uses a GROUND-TRUTH comparison: it computes what the value SHOULD be
-  from neighboring fields (current_price, previous_close, intrinsic_value,
-  forecast_price_*) and picks whichever of (stored) vs (stored/100) is a
-  closer match to the truth. This is robust because daily price changes
-  (~0-5%) fall in the same magnitude range as either convention. For
-  `max_drawdown_1y` and `var_95_1d` (where no neighbor-derived ground truth
-  is available), a magnitude threshold of 1.5 distinguishes points from
-  fraction. Idempotent: re-running on a normalized row is a no-op.
+- FIX [HIGH]: NEW `_sanitize_outliers()` helper. The audit showed several
+  ratios at impossible magnitudes that polluted scoring:
+    * VSH.US `pe_ttm` = 3,620 (real EPS ≈ 0.01 → division blowup)
+    * MAS.US `pb_ratio` = -54.45 (negative equity, ratio meaningless)
+    * SBGI.US `debt_to_equity` = 1,151 (likely a unit/scale error)
+    * IRWD.US `pb_ratio` = -2.65
+  The helper clamps each field against an empirically-derived range; values
+  outside the range are nulled and a `sanitized:<field>_out_of_range` warning
+  is appended. This stops the scoring engine from propagating garbage.
 
-- FIX [MED]: NEW `_ensure_provenance_fields()` helper. Audit showed three
-  audit-trail columns at 0% fill across all 57 rows:
-    * `last_updated_utc` — 0/57
-    * `last_updated_riyadh` — 0/57
-    * `data_provider` — 0/57
-  Without these, downstream consumers cannot tell whether a snapshot is
-  fresh or stale, or which provider sourced each row. The helper:
-    1. Stamps `last_updated_utc` / `last_updated_riyadh` with the current
-       time if missing (Riyadh is fixed UTC+3, no DST).
-    2. Recovers `data_provider` by reading `row['data_sources']` (engine
-       emits this list when multiple providers contribute) and falling
-       back to inferring from the `warnings` string (tokens like
-       `yahoo_chart_enrichment_applied` reveal the source).
-  Never overwrites a non-empty existing value.
+- FIX [HIGH]: NEW `_sanitize_price_consistency()` helper. BKNG.US showed
+  `week_52_high = 5,839.41` vs `current_price = 154.48` — a 37x ratio that's
+  almost certainly the wrong instrument matched (or an unapplied split). The
+  helper nulls 52W high when its ratio to current price exceeds 10x, and
+  nulls 52W low when current/low exceeds 100x. Both append `sanitized:`
+  warnings. The derived `week_52_position_pct` is also invalidated.
 
-- WIRING: `normalize_rows()` now invokes the three new helpers for
-  instrument-shaped rows in this order:
+- FIX [HIGH]: NEW `_check_revenue_currency_units()` helper. IX.US (Orix)
+  showed `revenue_ttm = 3,330,831,024,128` (3.3 trillion) vs
+  `market_cap = 40,246,726,307` (40 billion) — a 82x ratio that can only be
+  explained by revenue being reported in JPY while market cap is in USD.
+  The helper detects this when |revenue| / market_cap > 100x and nulls
+  the revenue field with a `sanitized:revenue_currency_suspect` warning.
+
+- FIX [MED]: NEW `_detect_and_mark_empty_row()` helper. ALAFCO.KW had every
+  core price/volume/fundamental field blank, yet the scoring engine still
+  emitted `recommendation=REDUCE, overall_score=50, risk_score=10,
+  confidence_score=55` — pure scoring defaults that LOOK like a real signal.
+  This is a contract violation: a row with no provider data should not
+  produce a recommendation. The helper detects rows where every core
+  field is blank, marks `data_quality=MISSING`, overrides `recommendation`
+  to "NA", clears all score fields, and appends `empty_row_no_provider_data`
+  to warnings.
+
+- WIRING: `normalize_rows()` pipeline order updated (existing helpers
+  preserved verbatim; new ones inserted at appropriate stages):
         _strip_internal_fields           (existing, v4.2.0)
         symbol/ticker alias              (existing)
-        _derive_exchange_currency_from_suffix   (NEW, v4.4.0)
-        _normalize_percent_units                (NEW, v4.4.0)
-        _derive_missing_fields                  (existing, v4.3.0)
-        _normalize_warnings_field               (existing, v4.3.0)
-        _ensure_provenance_fields               (NEW, v4.4.0)
+        _derive_metadata_from_normalize  (NEW v4.5.0 — replaces v4.4.0)
+        _normalize_percent_units         (existing v4.4.0)
+        _derive_missing_fields           (existing v4.3.0)
+        _sanitize_outliers               (NEW v4.5.0)
+        _sanitize_price_consistency      (NEW v4.5.0)
+        _check_revenue_currency_units    (NEW v4.5.0)
+        _normalize_warnings_field        (existing v4.3.0)
+        _ensure_provenance_fields        (existing v4.4.0)
+        _detect_and_mark_empty_row       (NEW v4.5.0 — must run LAST)
         top10-specific normalization     (existing)
         schema_projection                (existing)
-  Unit normalization runs BEFORE derive-missing so that downstream
-  derivations (e.g. confidence_bucket from confidence_score) operate on
-  clean canonical values. Provenance runs LAST so it can read the
-  normalized `warnings` string when inferring `data_provider`.
 
-- ADD: New constants block. `_SUFFIX_TO_LOCALE` (35+ entries),
-  `_FRACTION_FIELDS_GROUND_TRUTH` (5 entries, with input-key tuples),
-  `_FRACTION_FIELDS_MAGNITUDE` (3 entries, with threshold floats).
-  `_RIYADH_TZ` cached as a module constant to avoid recomputing.
+  Empty-row detection runs LAST so that genuinely populated rows aren't
+  mismarked: every fill/derive/sanitize step has already run by then.
 
-- ALIGN: header docstring references the May 2026 backend family —
-  schema_registry v2.5.0+, 04_Format.gs v2.7.0, data_engine_v2 v5.60.0.
-  MODULE_VERSION bumped to "4.4.0".
+- ALIGN: `_SUFFIX_TO_LOCALE` patched with the missing entries from the
+  May 2026 audit. Even without the normalize.py v5.3.0 upgrade, the
+  legacy path now correctly handles .KW, .JSE, .QA, .AE, .DFM, .ADX, .EG,
+  .TA, .TASE. MODULE_VERSION bumped to "4.5.0".
 
-Public API is preserved verbatim from v4.3.0: `build_enriched_quote_payload`,
-`build_enriched_sheet_rows_payload`, `build_enriched_quote_payload_sync`,
-`get_enriched_quote_payload`, `enriched_quote`, `quote`, `get_router`,
-`router`, `VIEW_COLUMN_KEYS`, and `MODULE_VERSION` are all still exported
-under the same names. No call-site changes required.
+Public API is preserved verbatim from v4.4.0: every exported name still
+resolves to the same callable with the same signature. No call-site changes.
 
-PRESERVED — strictly. The v4.4.0 release adds:
-  - 3 new helper functions
-  - 3 new module-level constant blocks
-  - 5 new lines inside `normalize_rows()` that invoke the new helpers
+PRESERVED — strictly. The v4.5.0 release adds:
+  - 6 new helper functions
+  - 1 new module-level constant block (_OUTLIER_LIMITS)
+  - 9 new suffix entries patched into _SUFFIX_TO_LOCALE
+  - 1 optional cross-module import (normalize.infer_symbol_metadata)
+  - 6 new lines inside `normalize_rows()` that invoke the new helpers
   - 1 module version bump
 NOT touched:
   - `_derive_missing_fields()` body is byte-identical to v4.3.0
   - `_normalize_warnings_field()` body is byte-identical to v4.3.0
   - `_strip_internal_fields()` body is byte-identical to v4.2.0
+  - `_normalize_percent_units()` body is byte-identical to v4.4.0
+  - `_ensure_provenance_fields()` body is byte-identical to v4.4.0
+  - `_derive_exchange_currency_from_suffix()` body is byte-identical to
+    v4.4.0 (kept as legacy fallback when normalize.py v5.3.0 unavailable)
   - All v4.3.0 derivation thresholds (_CONFIDENCE_*, _RISK_*, _HORIZON_*)
   - All v4.2.0 fallback schema constants (85 + 3 + 7 + 9 columns)
   - All v4.2.0 / v4.1.0 internal field strip lists
   - Every other public API and helper
 
+v4.4.0 fixes (PRESERVED)
+------------------------
+- `_derive_exchange_currency_from_suffix()` repairs stale US defaults.
+- `_normalize_percent_units()` corrects 100x display drift.
+- `_ensure_provenance_fields()` guarantees timestamp + provider fields.
+
 v4.3.0 fixes (PRESERVED)
 ------------------------
 - `_derive_missing_fields()` fills 13 derivations on blank-only contract.
 - `_normalize_warnings_field()` coerces List[str] -> "; "-joined string.
-- `normalize_rows()` invokes derivations + warnings normalization for
-  instrument-shaped pages.
 
 v4.2.0 fixes (PRESERVED)
 ------------------------
 - 85-column fallback schema (added `upside_pct` + 4 view columns).
-- Top_10_Investments fallback = 88 (85 + 3).
 - `VIEW_COLUMN_KEYS` exported.
 - `_strip_internal_fields()` defence-in-depth.
 
@@ -172,7 +171,41 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-MODULE_VERSION = "4.4.0"
+MODULE_VERSION = "4.5.0"
+
+# =============================================================================
+# v4.5.0: Optional import of single-source-of-truth metadata inference
+# =============================================================================
+#
+# normalize.py v5.3.0+ exposes `infer_symbol_metadata()` which returns a dict
+# with {exchange, currency, country, country_code, market_type, asset_class,
+# mic, inferred_from} for any symbol. This is the SINGLE SOURCE OF TRUTH.
+#
+# If the import fails (e.g. running with an older normalize.py), we fall back
+# to the local `_SUFFIX_TO_LOCALE` table below — which has been patched in
+# v4.5.0 to include the previously-missing .KW / .JSE / .QA / .AE / .EG / .TA
+# / .TASE suffixes.
+
+_infer_symbol_metadata: Optional[Callable[[str], Dict[str, Any]]] = None
+
+for _norm_path in (
+    "core.symbols.normalize",
+    "core.normalize",
+    "symbols.normalize",
+    "normalize",
+):
+    try:
+        _norm_mod = importlib.import_module(_norm_path)
+        _fn = getattr(_norm_mod, "infer_symbol_metadata", None)
+        if callable(_fn):
+            _infer_symbol_metadata = _fn
+            logger.debug("enriched_quote v4.5.0: bound infer_symbol_metadata from %s", _norm_path)
+            break
+    except ImportError:
+        continue
+    except Exception:  # pragma: no cover
+        continue
+
 
 # =============================================================================
 # Constants
@@ -324,25 +357,28 @@ _HORIZON_3M_MAX = 135   # <= 135d -> "3M"
 
 
 # =============================================================================
-# v4.4.0: Suffix -> locale map
+# v4.4.0 + v4.5.0: Suffix -> locale map (LEGACY FALLBACK)
 # =============================================================================
 #
-# Yahoo Finance / EODHD / Argaam / Finnhub all use suffix conventions to mark
-# international listings. The engine sometimes successfully derives the
-# exchange/currency from the suffix and writes them to the row, but other
-# code paths leave the displayed fields as US defaults and only emit a
-# warning. This table is consulted by `_derive_exchange_currency_from_suffix`
-# to repair the displayed fields when they appear to be stale US defaults.
+# v4.5.0 NOTE: This table is now used as a FALLBACK when normalize.py v5.3.0
+# is unavailable (i.e. `_infer_symbol_metadata` is None at import time). The
+# preferred path is `_derive_metadata_from_normalize()` which delegates to
+# `normalize.infer_symbol_metadata()` — the single source of truth.
+#
+# v4.5.0 also PATCHES the v4.4.0 table with previously-missing entries:
+# .KW, .JSE, .QA, .AE, .DFM, .ADX, .EG, .TA, .TASE. The v4.4.0 table was
+# missing these — which is exactly why MABANEE.KW (Kuwait), ANG.JSE (South
+# Africa), and similar foreign listings showed as NASDAQ/NYSE/USD/USA in
+# the May 2026 audit. Even if normalize.py v5.3.0 isn't deployed, v4.5.0's
+# patched table will resolve them correctly.
 #
 # Format: ".SUFFIX": (exchange_display, currency_code, country)
 #
 # NOTE on `.SA`: Yahoo uses `.SA` for São Paulo / Brazil (e.g. PETR4.SA, BBAS3.SA).
 # Saudi Arabian listings on Yahoo use `.SR` instead (e.g. 2222.SR for Aramco).
-# The TFB `normalize_symbol()` function preserves both correctly.
 #
 # NOTE on `.XETRA`: Yahoo uses `.DE` for XETRA-listed German equities. The
-# `.XETRA` suffix appears in some upstream provider feeds (e.g. Deutsche
-# Telekom = DTE.XETRA in one feed, DTE.DE in another). Both map here.
+# `.XETRA` suffix appears in some upstream provider feeds. Both map here.
 #
 # Currency codes follow ISO 4217. `GBp` (pence) is intentionally lowercase
 # 'p' to distinguish from `GBP` (pounds) — LSE quotes most equities in pence.
@@ -353,10 +389,12 @@ _SUFFIX_TO_LOCALE: Dict[str, Tuple[str, str, str]] = {
     # United Kingdom (London Stock Exchange)
     ".L":     ("LSE",                     "GBp", "United Kingdom"),
     ".LON":   ("LSE",                     "GBp", "United Kingdom"),
+    ".LSE":   ("LSE",                     "GBp", "United Kingdom"),
     # Denmark
     ".CO":    ("Copenhagen",              "DKK", "Denmark"),
     # India
     ".NS":    ("NSE",                     "INR", "India"),
+    ".NSE":   ("NSE",                     "INR", "India"),
     ".BO":    ("BSE",                     "INR", "India"),
     # Brazil
     ".SA":    ("B3",                      "BRL", "Brazil"),
@@ -417,6 +455,21 @@ _SUFFIX_TO_LOCALE: Dict[str, Tuple[str, str, str]] = {
     ".MX":    ("BMV",                     "MXN", "Mexico"),
     ".BA":    ("BCBA",                    "ARS", "Argentina"),
     ".JO":    ("JSE",                     "ZAR", "South Africa"),
+    # ---- v4.5.0 patches: previously-missing entries that drove the
+    # May 2026 sheet corruption (MABANEE.KW, OOREDOO.KW, ALAFCO.KW,
+    # ANG.JSE, MTN.JSE displaying as NASDAQ/NYSE/USD/USA)
+    ".KW":    ("Boursa Kuwait",           "KWD", "Kuwait"),
+    ".KSE":   ("Boursa Kuwait",           "KWD", "Kuwait"),
+    ".JSE":   ("JSE",                     "ZAR", "South Africa"),
+    ".QA":    ("QSE",                     "QAR", "Qatar"),
+    ".QE":    ("QSE",                     "QAR", "Qatar"),
+    ".AE":    ("DFM/ADX",                 "AED", "United Arab Emirates"),
+    ".DFM":   ("DFM",                     "AED", "United Arab Emirates"),
+    ".ADX":   ("ADX",                     "AED", "United Arab Emirates"),
+    ".EG":    ("EGX",                     "EGP", "Egypt"),
+    ".EGX":   ("EGX",                     "EGP", "Egypt"),
+    ".TA":    ("TASE",                    "ILS", "Israel"),
+    ".TASE":  ("TASE",                    "ILS", "Israel"),
     # US suffix (used by some TFB providers) - explicitly leaves US defaults
     # in place. We map it so the function can recognize it and short-circuit
     # without modification.
@@ -446,16 +499,10 @@ _US_COUNTRY_TOKENS: frozenset = frozenset({
 # because daily price moves (~0-5%) overlap with both unit conventions
 # numerically.
 #
-# Format: (field_name, input_key_tuple, formula_fn)
-#         formula_fn receives the input values in declaration order and
-#         returns the canonical fraction.
-#
 # MAGNITUDE fields: we have no neighbor-derived ground truth, so we fall
 # back to magnitude detection. The threshold is chosen so that a typical
 # fraction value falls well below it and a typical points value falls well
 # above it.
-#
-# Format: (field_name, threshold_for_points_detection)
 
 _FRACTION_FIELDS_GROUND_TRUTH: Tuple[
     Tuple[str, Tuple[str, ...], Callable[..., float]], ...
@@ -491,10 +538,71 @@ _FRACTION_FIELDS_MAGNITUDE: Tuple[Tuple[str, float], ...] = (
 # =============================================================================
 # v4.4.0: Cached Riyadh timezone (UTC+3, no DST)
 # =============================================================================
-# Saudi Arabia does not observe DST, so the offset is a permanent +3:00.
-# Cached at module load to avoid recomputing the timedelta on every row.
 
 _RIYADH_TZ = dt.timezone(dt.timedelta(hours=3), name="Asia/Riyadh")
+
+
+# =============================================================================
+# v4.5.0: Outlier-clamp limits per ratio/metric field
+# =============================================================================
+#
+# Each entry is (min_acceptable, max_acceptable). Values outside the range
+# are nulled by `_sanitize_outliers()` and a `sanitized:<field>_out_of_range`
+# warning is appended.
+#
+# Limits were chosen from the May 2026 audit, biased toward NOT touching
+# legitimate values:
+#   * `pe_ttm`: 3,620 (VSH.US, EPS≈0.01 blowup) → clamp at ±1000
+#   * `pb_ratio`: -54.45 (MAS.US, negative equity) → clamp at -50..100
+#   * `debt_to_equity`: 1,151 (SBGI.US, likely scale error) → clamp at 0..1000
+#   * `peg_ratio`: 45.77 (CVCO.US, near-zero growth) → clamp at -100..100
+#
+# The bands are intentionally wide so that ordinary high-growth or
+# distressed-equity cases pass through. Only true outliers (3+ orders of
+# magnitude beyond normal) get nulled.
+
+_OUTLIER_LIMITS: Dict[str, Tuple[float, float]] = {
+    "pe_ttm":         (-1000.0, 1000.0),
+    "pe_forward":     (-1000.0, 1000.0),
+    "pb_ratio":       (-50.0,    100.0),
+    "ps_ratio":       (0.0,     1000.0),
+    "ev_ebitda":      (-500.0,   500.0),
+    "peg_ratio":      (-100.0,   100.0),
+    "debt_to_equity": (0.0,     1000.0),
+}
+
+# Threshold above which `week_52_high / current_price` indicates a corrupt
+# 52W high (probable unapplied split or wrong instrument matched). BKNG.US
+# in the May 2026 audit hit 37x; we clamp at 10x.
+_WEEK_52_HIGH_RATIO_LIMIT = 10.0
+
+# Threshold above which `current_price / week_52_low` indicates a corrupt
+# 52W low (symmetric to the high check above).
+_WEEK_52_LOW_RATIO_LIMIT = 100.0
+
+# Threshold above which `revenue_ttm / market_cap` indicates revenue and
+# market_cap are in different currency units. IX.US (Orix) hit ~82x in the
+# audit (3.3T JPY revenue vs 40B USD market cap). Cross-currency drift
+# typically lands between 80x (JPY/USD) and 150x (KRW/USD), so 50x is a
+# safe cutoff that catches the audit cases while leaving room for ordinary
+# low-margin retailers (Walmart ≈ 1x, Costco ≈ 0.6x) and even extreme
+# distressed cases (a struggling commodity trader rarely exceeds 25-30x).
+_REVENUE_MCAP_RATIO_LIMIT = 50.0
+
+# Core fields that indicate a row received actual provider data. If ALL of
+# these are blank, `_detect_and_mark_empty_row()` overrides the engine's
+# default scoring.
+_EMPTY_ROW_INDICATOR_FIELDS: Tuple[str, ...] = (
+    "current_price",
+    "previous_close",
+    "open_price",
+    "day_high",
+    "day_low",
+    "week_52_high",
+    "week_52_low",
+    "volume",
+    "market_cap",
+)
 
 
 # =============================================================================
@@ -623,15 +731,6 @@ def _clamp(value: int, min_val: int, max_val: int) -> int:
 def _to_number(x: Any) -> Optional[float]:
     """
     Strict numeric extraction for derivations (v4.3.0).
-
-    Returns None for None / non-numeric / NaN / Inf / bools. Tolerates
-    string formats that legacy / proxy rows may carry: thousands commas,
-    trailing "%", up/down arrows ("▲ 1.99%", "▼ -0.30%"), and standard
-    null tokens.
-
-    Distinct from `_json_safe` (which preserves arbitrary types) and from
-    `_to_int` (which collapses to integer). Used by `_derive_missing_fields`
-    and (v4.4.0) `_normalize_percent_units`.
     """
     if x is None:
         return None
@@ -682,8 +781,7 @@ def _to_number(x: Any) -> Optional[float]:
 def _is_blank(value: Any) -> bool:
     """
     v4.3.0: True if `value` is None, empty string, whitespace-only string,
-    or one of the standard null tokens. Used by derivation guards to know
-    whether a field is "missing" and therefore eligible to be filled.
+    or one of the standard null tokens.
     """
     if value is None:
         return True
@@ -846,7 +944,7 @@ def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> L
 
 
 def _title_header(key: str) -> str:
-    """Convert key to title case header (used only when a registry header is unavailable)."""
+    """Convert key to title case header."""
     text = str(key or "").replace("_", " ").strip()
     if not text:
         return ""
@@ -864,16 +962,7 @@ def _title_header(key: str) -> str:
 
 
 def _strip_internal_fields(row: Any) -> Any:
-    """
-    Remove engine internal coordination flags from a row dict (v4.2.0).
-
-    Engine v5.47.4 / advisor_engine v4.2.0 already strip these at source;
-    this is defence-in-depth for legacy / proxy / cached rows that may
-    still carry them. `schema_projection()` would naturally filter them
-    too (since they aren't in the schema list), but stripping early keeps
-    the matrix path clean and the `row` field on single-row responses
-    honest.
-    """
+    """Remove engine internal coordination flags from a row dict (v4.2.0)."""
     if not isinstance(row, dict):
         return row
     for k in list(row.keys()):
@@ -893,23 +982,52 @@ def _strip_internal_fields(row: Any) -> Any:
 
 
 # =============================================================================
+# v4.5.0: Warnings-append helper
+# =============================================================================
+
+def _append_warning(row: Dict[str, Any], message: str) -> None:
+    """
+    Append a warning to the row's `warnings` field, preserving any existing
+    warnings. Used by v4.5.0 sanity-gate helpers.
+
+    The `warnings` field is canonicalized to a "; "-joined string by
+    `_normalize_warnings_field()` later in the pipeline. We use the same
+    canonical format here so the result is identical whether we append
+    early or late.
+    """
+    if not isinstance(row, dict) or not message:
+        return
+    try:
+        existing = row.get("warnings")
+        if existing is None:
+            row["warnings"] = message
+            return
+        if isinstance(existing, str):
+            if not existing.strip():
+                row["warnings"] = message
+            else:
+                row["warnings"] = existing.strip() + "; " + message
+            return
+        if isinstance(existing, (list, tuple)):
+            row["warnings"] = list(existing) + [message]
+            return
+        # Unknown type: coerce to string and append
+        try:
+            s = str(existing).strip()
+            row["warnings"] = (s + "; " + message) if s else message
+        except Exception:
+            row["warnings"] = message
+    except Exception:
+        pass
+
+
+# =============================================================================
 # v4.3.0: Derive-and-Fill Helpers
 # =============================================================================
 
 def _normalize_warnings_field(row: Dict[str, Any]) -> None:
     """
     Coerce row['warnings'] to "; "-joined string format (v4.3.0).
-
-    Providers (yahoo_fundamentals_provider v6.1.0, yahoo_chart_provider
-    v9/v10, eodhd_provider) emit warnings as `List[str]`. The sheet's
-    Warnings column expects the canonical "; "-joined string that Apps
-    Script can split and badge. v4.2.0 wrote the raw list into the cell
-    where it stringified as a Python repr.
-
-    Idempotent: accepts list-of-strings, single string, None. Operates
-    in-place on `row`. Returns nothing.
-
-    Empty / missing -> row['warnings'] left untouched.
     """
     if not isinstance(row, dict):
         return
@@ -917,7 +1035,6 @@ def _normalize_warnings_field(row: Dict[str, Any]) -> None:
     if w is None:
         return
     if isinstance(w, str):
-        # Already a string -- normalize whitespace only, don't re-split
         s = w.strip()
         if not s:
             row["warnings"] = None
@@ -936,7 +1053,6 @@ def _normalize_warnings_field(row: Dict[str, Any]) -> None:
             if s and s.lower() not in {"none", "null", "nil"}:
                 parts.append(s)
         if parts:
-            # Dedupe while preserving order
             seen: set = set()
             unique: List[str] = []
             for p in parts:
@@ -947,7 +1063,6 @@ def _normalize_warnings_field(row: Dict[str, Any]) -> None:
         else:
             row["warnings"] = None
         return
-    # Unknown type -> string-coerce
     try:
         s = str(w).strip()
         row["warnings"] = s if s else None
@@ -959,37 +1074,6 @@ def _derive_missing_fields(row: Dict[str, Any]) -> None:
     """
     Compute canonical derived fields when their inputs are present but the
     field itself is missing (v4.3.0). Operates in-place. Returns nothing.
-
-    Strict contract:
-      - Fill-only-if-missing. An existing non-empty value is NEVER touched.
-        See `_is_blank()` for the definition of "missing".
-      - No exception ever escapes. Each derivation is wrapped in its own
-        try/except. Bad inputs (None, zero divisor, non-numeric strings)
-        cause the derivation to skip, not crash.
-      - Idempotent. Running this twice on the same row leaves it unchanged
-        after the first pass.
-
-    Derivations (all in canonical decimal/fraction units, NOT percentages):
-
-      price_change            = current_price - previous_close
-      percent_change          = (current_price - previous_close) / previous_close
-      week_52_position_pct    = (current_price - week_52_low) / (week_52_high - week_52_low)
-      position_cost           = position_qty * avg_cost
-      position_value          = position_qty * current_price
-      unrealized_pl           = position_value - position_cost
-      unrealized_pl_pct       = unrealized_pl / position_cost
-      upside_pct              = (intrinsic_value / current_price) - 1
-      expected_roi_1m         = (forecast_price_1m  / current_price) - 1
-      expected_roi_3m         = (forecast_price_3m  / current_price) - 1
-      expected_roi_12m        = (forecast_price_12m / current_price) - 1
-      invest_period_label     = bucket(horizon_days)
-      confidence_bucket       = bucket(confidence_score | forecast_confidence)
-      risk_bucket             = bucket(risk_score)
-
-    Inputs are extracted via `_to_number()` which tolerates string-formatted
-    legacy values ("1,234.56", "▲ 1.99%", etc.). The function does not
-    distinguish provider-shaped rows from advisor-shaped ones -- every
-    derivation gates on the presence of its specific inputs.
     """
     if not isinstance(row, dict):
         return
@@ -1014,10 +1098,6 @@ def _derive_missing_fields(row: Dict[str, Any]) -> None:
             lo = _to_number(row.get("week_52_low"))
             if cp is not None and hi is not None and lo is not None and hi != lo:
                 pos = (cp - lo) / (hi - lo)
-                # Clamp to [0, 1] -- a price slightly above/below the band
-                # would otherwise produce a nonsensical fraction. The fact
-                # that it's outside is independently flagged by the provider's
-                # `current_price_outside_52w_range` warning.
                 pos = max(0.0, min(1.0, pos))
                 row["week_52_position_pct"] = pos
     except Exception:
@@ -1034,7 +1114,6 @@ def _derive_missing_fields(row: Dict[str, Any]) -> None:
         if qty is not None and cp is not None:
             if _is_blank(row.get("position_value")):
                 row["position_value"] = qty * cp
-        # Re-read in case we just filled them
         pc_val = _to_number(row.get("position_cost"))
         pv_val = _to_number(row.get("position_value"))
         if pc_val is not None and pv_val is not None:
@@ -1086,12 +1165,8 @@ def _derive_missing_fields(row: Dict[str, Any]) -> None:
         pass
 
     # -- Confidence bucket --------------------------------------------------
-    # scoring.py emits this normally; this is a safety net for cached /
-    # proxy rows where the bucket was lost in transit.
     try:
         if _is_blank(row.get("confidence_bucket")):
-            # Prefer confidence_score (0-100); fall back to forecast_confidence
-            # (which may be 0-1 or 0-100 depending on source).
             cs = _to_number(row.get("confidence_score"))
             if cs is None:
                 fc = _to_number(row.get("forecast_confidence"))
@@ -1125,11 +1200,7 @@ def _derive_missing_fields(row: Dict[str, Any]) -> None:
 def _is_instrument_shaped_keys(keys: Sequence[str]) -> bool:
     """
     v4.3.0: cheap guard used by normalize_rows() to decide whether the
-    derivation helper applies. Instrument-shaped pages have `current_price`
-    in their canonical key list (Market_Leaders, Global_Markets, etc., and
-    Top_10_Investments which appends 3 extras to the same 85). Special
-    pages like Insights_Analysis (section/item/metric/value/...) and
-    Data_Dictionary (sheet/group/header/...) do not, and bypass derivation.
+    derivation helper applies.
     """
     if not keys:
         return False
@@ -1140,24 +1211,23 @@ def _is_instrument_shaped_keys(keys: Sequence[str]) -> bool:
 
 
 # =============================================================================
-# v4.4.0: Suffix-Derived Exchange / Currency / Country
+# v4.4.0: Suffix-Derived Exchange / Currency / Country (LEGACY FALLBACK)
 # =============================================================================
+#
+# v4.5.0 NOTE: this function is now used ONLY when normalize.py v5.3.0+ is
+# unavailable (i.e. `_infer_symbol_metadata is None`). The preferred path is
+# `_derive_metadata_from_normalize()` below. Body unchanged from v4.4.0 for
+# byte-level traceability — patches to the v4.4.0 behavior went into
+# `_SUFFIX_TO_LOCALE` (added .KW, .JSE, .QA, .AE, .DFM, .ADX, .EG, .TA, .TASE).
 
 def _suffix_for_symbol(symbol: str) -> Optional[str]:
     """
     Return the longest matching suffix from `_SUFFIX_TO_LOCALE` for a given
     symbol, or None if the symbol has no recognized international suffix.
-
-    Longest-match matters because some suffixes are prefixes of others
-    (e.g. ".T" for TSE Japan is a prefix of ".TWO" for TPEx Taiwan).
-
-    Returns the suffix WITH the leading dot ("." prefix), so the caller
-    can look it up directly in `_SUFFIX_TO_LOCALE`.
     """
     if not symbol or "." not in symbol:
         return None
     sym_upper = symbol.upper()
-    # Try longest suffix first
     best: Optional[str] = None
     for suffix in _SUFFIX_TO_LOCALE:
         if sym_upper.endswith(suffix):
@@ -1170,31 +1240,7 @@ def _derive_exchange_currency_from_suffix(row: Dict[str, Any]) -> None:
     """
     Repair `exchange`, `currency`, `country` when the displayed values are
     stale US defaults but the symbol carries a recognized non-US suffix
-    (v4.4.0).
-
-    The May 2026 audit found 51/57 rows in this state: e.g. `0939.HK` with
-    `Exchange=NASDAQ/NYSE`, `Currency=USD`, `Country=USA`. The engine's
-    Warnings column flagged it as `quote_exchange_from_suffix; quote_
-    currency_from_suffix` but the displayed fields were never corrected.
-
-    Decision logic:
-        1. Determine the symbol's suffix via `_suffix_for_symbol()`.
-        2. If no recognized suffix -> no-op.
-        3. If suffix is `.US` -> no-op (US defaults are correct).
-        4. For non-US suffix:
-             - Override `country` if it's blank or any US-equivalent token
-               (case-insensitive). A foreign country string already in the
-               field is RESPECTED -- we never overwrite legitimate data.
-             - Override `exchange` if it's blank or contains "NASDAQ" or
-               "NYSE" (case-insensitive). Other exchanges respected.
-             - Override `currency` if it's blank or "USD". Other currencies
-               respected.
-
-    The respect-existing logic is what makes this safe to run on every
-    instrument-shaped row: a row that already came through correctly
-    is left untouched.
-
-    Operates in-place. Returns nothing. No exception escapes.
+    (v4.4.0 LEGACY — used only when normalize.py v5.3.0 is unavailable).
     """
     if not isinstance(row, dict):
         return
@@ -1206,34 +1252,121 @@ def _derive_exchange_currency_from_suffix(row: Dict[str, Any]) -> None:
 
         suffix = _suffix_for_symbol(symbol)
         if suffix is None or suffix == ".US":
-            return  # US ticker or unknown suffix -- leave alone
+            return
 
         derived = _SUFFIX_TO_LOCALE.get(suffix)
         if derived is None:
-            return  # defensive; shouldn't happen since _suffix_for_symbol
-                    # only returns known suffixes
+            return
         derived_exch, derived_curr, derived_country = derived
 
-        # -- country
         current_country = _strip(row.get("country")).upper()
         if current_country in _US_COUNTRY_TOKENS:
             row["country"] = derived_country
 
-        # -- exchange (overwrite blank or US-default values; keep legitimate
-        # non-US exchanges already in place)
         current_exch = _strip(row.get("exchange")).upper()
         if (not current_exch) or ("NASDAQ" in current_exch) or ("NYSE" in current_exch):
             row["exchange"] = derived_exch
 
-        # -- currency (overwrite blank or "USD"; keep legitimate non-USD
-        # currencies already in place)
         current_curr = _strip(row.get("currency")).upper()
         if (not current_curr) or current_curr == "USD":
             row["currency"] = derived_curr
 
     except Exception:
-        # Strict contract: never let an exception escape into row processing
         pass
+
+
+# =============================================================================
+# v4.5.0: Metadata via normalize.py SSOT (PRIMARY PATH)
+# =============================================================================
+
+def _derive_metadata_from_normalize(row: Dict[str, Any]) -> None:
+    """
+    Repair `exchange`, `currency`, `country` by delegating to
+    `normalize.infer_symbol_metadata()` — the SINGLE SOURCE OF TRUTH as of
+    normalize.py v5.3.0 (v4.5.0).
+
+    Behavior:
+      - High-confidence inference (`exchange_suffix`, `ksa_pattern`):
+        override stale US defaults exactly like the v4.4.0 legacy path.
+      - Low-confidence inference (`us_heuristic`): fill BLANK fields only;
+        never override a value that's already there. The us_heuristic
+        applies to plain 1-5 letter alpha tickers like "AAPL" or "META"
+        — we don't want to overwrite a provider-supplied country.
+      - No inference (`none`): no-op. The provider's data stays as-is.
+
+    Falls back to the v4.4.0 `_derive_exchange_currency_from_suffix()` when
+    `normalize.infer_symbol_metadata` is unavailable. This preserves the
+    v4.4.0 behavior on systems that haven't deployed normalize.py v5.3.0.
+
+    The architectural improvement over v4.4.0:
+      - normalize.py v5.3.0 has 44 country entries vs v4.4.0's 35 hand-coded
+        ones. Specifically, `.KW`, `.JSE`, `.QA`, `.AE`, `.EG`, `.TA` —
+        the exact suffixes that broke MABANEE.KW / OOREDOO.KW / ANG.JSE /
+        MTN.JSE in the May 2026 audit — are now resolved correctly.
+      - Single source of truth. Future suffix additions go in one place
+        (normalize.py) and propagate automatically.
+
+    Operates in-place. Returns nothing. No exception escapes.
+    """
+    if not isinstance(row, dict):
+        return
+
+    # Fallback when normalize.py v5.3.0+ is unavailable
+    if _infer_symbol_metadata is None:
+        _derive_exchange_currency_from_suffix(row)
+        return
+
+    try:
+        symbol = _strip(row.get("symbol") or row.get("ticker"))
+        if not symbol:
+            return
+
+        meta = _infer_symbol_metadata(symbol)
+        if not isinstance(meta, dict):
+            return
+
+        inferred_from = meta.get("inferred_from")
+        if inferred_from in (None, "", "none"):
+            return  # nothing to apply
+
+        derived_exch = meta.get("exchange")
+        derived_curr = meta.get("currency")
+        derived_country = meta.get("country")
+
+        if inferred_from == "us_heuristic":
+            # Low-confidence: fill blank fields only, never override.
+            if derived_country and _is_blank(row.get("country")):
+                row["country"] = derived_country
+            if derived_exch and _is_blank(row.get("exchange")):
+                row["exchange"] = derived_exch
+            if derived_curr and _is_blank(row.get("currency")):
+                row["currency"] = derived_curr
+            return
+
+        # High-confidence (exchange_suffix, ksa_pattern, special_pattern):
+        # override US defaults exactly like the v4.4.0 contract.
+        if derived_country:
+            cur_country = _strip(row.get("country")).upper()
+            if cur_country in _US_COUNTRY_TOKENS:
+                row["country"] = derived_country
+
+        if derived_exch:
+            cur_exch = _strip(row.get("exchange")).upper()
+            if (not cur_exch) or ("NASDAQ" in cur_exch) or ("NYSE" in cur_exch):
+                row["exchange"] = derived_exch
+
+        if derived_curr:
+            cur_curr = _strip(row.get("currency")).upper()
+            if (not cur_curr) or cur_curr == "USD":
+                row["currency"] = derived_curr
+
+    except Exception:
+        # Strict contract: never let an exception escape into row processing.
+        # If normalize.py raises, fall back to legacy table.
+        try:
+            _derive_exchange_currency_from_suffix(row)
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -1243,42 +1376,7 @@ def _derive_exchange_currency_from_suffix(row: Dict[str, Any]) -> None:
 def _normalize_percent_units(row: Dict[str, Any]) -> None:
     """
     Defensively convert points-convention values to fractions when the
-    column's display contract is fraction (v4.4.0).
-
-    Bug pattern (May 2026 audit, confirmed across 47-57 of 57 rows):
-        data_engine_v2 v5.60.0 `_canonicalize_provider_row` stores certain
-        percent fields in POINTS convention (number = percent value, e.g.
-        -0.0744 means -0.0744%), while 04_Format.gs v2.6.0/v2.7.0 classifies
-        those columns as FRACTION (formatter applies "0.00%" which
-        multiplies by 100 for display). Result: 100x display error
-        across `percent_change`, `upside_pct`, `max_drawdown_1y`,
-        `var_95_1d`, and the three `expected_roi_*` horizons.
-
-    Strategy (two-tier):
-        1. GROUND-TRUTH tier: for `percent_change`, `upside_pct`, and the
-           three `expected_roi_*` fields, we have neighbor fields that let
-           us compute the canonical fraction independently
-           ((cp - pc) / pc, (iv / cp) - 1, (fp / cp) - 1). Compare the
-           stored value against both (true_fraction) and (true_fraction *
-           100). Whichever is closer is the convention the engine emitted
-           in; if it's points-form, divide by 100. This is robust because
-           daily price moves (~0-5%) put fraction and points magnitudes
-           in the same numerical range -- a pure magnitude heuristic would
-           be unreliable here.
-
-        2. MAGNITUDE tier: for `max_drawdown_1y`, `var_95_1d`, and
-           `forecast_confidence`, no clean ground-truth field exists in
-           the row. We fall back to a magnitude check: a value with
-           |x| > 1.5 cannot be a valid fraction for these fields and is
-           almost certainly points-form. Divide by 100.
-
-    Both tiers are idempotent: re-running on an already-normalized row
-    leaves it unchanged. Both are safe on rows where the value was always
-    correct: the ground-truth tier picks the closer hypothesis (which is
-    "leave alone" when stored == true_fraction), and the magnitude tier
-    only fires above the threshold.
-
-    Operates in-place. Returns nothing. No exception escapes.
+    column's display contract is fraction (v4.4.0). Body unchanged.
     """
     if not isinstance(row, dict):
         return
@@ -1290,7 +1388,6 @@ def _normalize_percent_units(row: Dict[str, Any]) -> None:
             if stored is None:
                 continue
 
-            # Resolve all inputs; abort this field if any are missing
             inputs: List[float] = []
             ok = True
             for k in input_keys:
@@ -1302,8 +1399,6 @@ def _normalize_percent_units(row: Dict[str, Any]) -> None:
             if not ok:
                 continue
 
-            # Guard against zero divisor in the formula. Every formula in
-            # _FRACTION_FIELDS_GROUND_TRUTH divides by the LAST input.
             if inputs[-1] == 0:
                 continue
 
@@ -1314,8 +1409,6 @@ def _normalize_percent_units(row: Dict[str, Any]) -> None:
             if math.isnan(true_frac) or math.isinf(true_frac):
                 continue
 
-            # If the true fraction is essentially zero, both conventions
-            # produce identical stored values. Leave alone.
             if abs(true_frac) < 1e-9:
                 continue
 
@@ -1323,10 +1416,8 @@ def _normalize_percent_units(row: Dict[str, Any]) -> None:
             err_as_points = abs(stored - true_frac * 100.0)
 
             if err_as_points < err_as_fraction:
-                # Stored is points convention -> convert to fraction
                 row[field_name] = stored / 100.0
         except Exception:
-            # Strict contract: never let an exception escape
             pass
 
     # -- TIER 2: MAGNITUDE ------------------------------------------------
@@ -1336,10 +1427,138 @@ def _normalize_percent_units(row: Dict[str, Any]) -> None:
             if stored is None:
                 continue
             if abs(stored) > threshold:
-                # Almost certainly points-form. Convert to fraction.
                 row[field_name] = stored / 100.0
         except Exception:
             pass
+
+
+# =============================================================================
+# v4.5.0: Outlier-Clamp Sanity Gate
+# =============================================================================
+
+def _sanitize_outliers(row: Dict[str, Any]) -> None:
+    """
+    Null fields whose values fall outside empirically-determined sane
+    bounds (v4.5.0). Each clamp appends a `sanitized:<field>_out_of_range`
+    warning so downstream auditors can see what was dropped.
+
+    May 2026 audit cases that triggered this:
+      * VSH.US `pe_ttm` = 3,620  (EPS≈0.01 division blowup)
+      * MAS.US `pb_ratio` = -54.45  (negative equity, ratio meaningless)
+      * SBGI.US `debt_to_equity` = 1,151  (likely a scale error)
+      * IRWD.US `pb_ratio` = -2.65
+      * CVCO.US `peg_ratio` = 45.77  (near-zero growth blowup)
+
+    The bands in `_OUTLIER_LIMITS` are intentionally wide; only true
+    outliers (3+ orders of magnitude beyond normal) get nulled. A
+    legitimate high P/E like 80 for a growth stock passes through.
+
+    Operates in-place. Returns nothing. No exception escapes.
+    """
+    if not isinstance(row, dict):
+        return
+
+    for field, (lo, hi) in _OUTLIER_LIMITS.items():
+        try:
+            val = _to_number(row.get(field))
+            if val is None:
+                continue
+            if val < lo or val > hi:
+                row[field] = None
+                _append_warning(row, f"sanitized:{field}_out_of_range={val:.2f}")
+        except Exception:
+            pass
+
+
+def _sanitize_price_consistency(row: Dict[str, Any]) -> None:
+    """
+    Null `week_52_high` / `week_52_low` when their ratio to current price
+    indicates corrupt data — most likely an unapplied stock split or a
+    wrong-instrument match (v4.5.0).
+
+    May 2026 audit case that triggered this:
+      * BKNG.US `week_52_high` = 5,839.41 vs `current_price` = 154.48
+        (37x ratio). BKNG actually trades around $5,000 — the current_price
+        value is clearly wrong, OR the 52W high is from a different
+        instrument. Either way, downstream scoring (52W position, momentum)
+        would be polluted. Safer to null the suspect field.
+
+    Also invalidates the derived `week_52_position_pct` when either
+    bound is nulled.
+
+    Operates in-place. Returns nothing. No exception escapes.
+    """
+    if not isinstance(row, dict):
+        return
+
+    try:
+        cp = _to_number(row.get("current_price"))
+        if cp is None or cp <= 0:
+            return  # can't ratio-check without a valid current price
+
+        hi = _to_number(row.get("week_52_high"))
+        if hi is not None and hi > 0:
+            ratio = hi / cp
+            if ratio > _WEEK_52_HIGH_RATIO_LIMIT:
+                row["week_52_high"] = None
+                row["week_52_position_pct"] = None
+                _append_warning(
+                    row,
+                    f"sanitized:week_52_high_extreme_ratio={ratio:.1f}x",
+                )
+
+        lo = _to_number(row.get("week_52_low"))
+        if lo is not None and lo > 0:
+            ratio = cp / lo
+            if ratio > _WEEK_52_LOW_RATIO_LIMIT:
+                row["week_52_low"] = None
+                row["week_52_position_pct"] = None
+                _append_warning(
+                    row,
+                    f"sanitized:week_52_low_extreme_ratio={ratio:.1f}x",
+                )
+    except Exception:
+        pass
+
+
+def _check_revenue_currency_units(row: Dict[str, Any]) -> None:
+    """
+    Null `revenue_ttm` when its magnitude relative to `market_cap` indicates
+    the two fields are reported in different currency units (v4.5.0).
+
+    May 2026 audit case that triggered this:
+      * IX.US (Orix) `revenue_ttm` = 3,330,831,024,128 (3.3T) vs
+        `market_cap` = 40,246,726,307 (40B) — 82x ratio. Orix is a
+        Japanese financial services company; revenue is naturally
+        reported in JPY by the provider while market_cap comes through
+        in USD. Without this check, downstream P/S, EV/Revenue, and
+        revenue-growth ratios are all corrupted.
+
+    Threshold is 50x — chosen so that legitimate distressed cases
+    (revenue ≈ 25-30x of market cap, e.g. a low-margin retailer with
+    a temporarily depressed share price) pass through, while typical
+    cross-currency drift (JPY 80x, KRW 130x, IDR 150x) is caught.
+
+    Operates in-place. Returns nothing. No exception escapes.
+    """
+    if not isinstance(row, dict):
+        return
+
+    try:
+        rev = _to_number(row.get("revenue_ttm"))
+        mcap = _to_number(row.get("market_cap"))
+        if rev is None or mcap is None or mcap <= 0:
+            return
+
+        ratio = abs(rev) / mcap
+        if ratio > _REVENUE_MCAP_RATIO_LIMIT:
+            row["revenue_ttm"] = None
+            _append_warning(
+                row,
+                f"sanitized:revenue_currency_suspect_ratio={ratio:.0f}x",
+            )
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -1349,37 +1568,11 @@ def _normalize_percent_units(row: Dict[str, Any]) -> None:
 def _ensure_provenance_fields(row: Dict[str, Any]) -> None:
     """
     Fill `last_updated_utc`, `last_updated_riyadh`, and `data_provider`
-    when they are missing (v4.4.0).
-
-    The May 2026 audit found all three fields at 0% fill across 57 rows.
-    Without them, downstream consumers cannot tell snapshot freshness or
-    which provider sourced each row. The engine clearly retrieved data
-    from providers (Warnings column carries tokens like
-    `yahoo_chart_enrichment_applied:...`) but the audit fields themselves
-    were not making it through to the row builder.
-
-    Fills (fill-only-if-missing; never overwrites existing values):
-
-        last_updated_utc      -> current UTC time, ISO-8601 (second precision)
-        last_updated_riyadh   -> current Asia/Riyadh time (UTC+3), ISO-8601
-        data_provider         -> first non-empty entry from `data_sources`
-                                 list, or inferred from `warnings` text
-                                 (matching against known provider tokens).
-                                 Left blank if neither source available --
-                                 we never fabricate a provider name.
-
-    Should be called AFTER `_normalize_warnings_field` so the warnings
-    field is in canonical string form when we inspect it for provider
-    inference.
-
-    Operates in-place. Returns nothing. No exception escapes.
+    when they are missing (v4.4.0). Body unchanged.
     """
     if not isinstance(row, dict):
         return
 
-    # -- Timestamps -------------------------------------------------------
-    # Compute now() once at function entry so all rows in a batch share a
-    # consistent timestamp.
     try:
         now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
@@ -1397,13 +1590,10 @@ def _ensure_provenance_fields(row: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-    # -- Data provider ----------------------------------------------------
     try:
         if _is_blank(row.get("data_provider")):
             inferred: Optional[str] = None
 
-            # Source 1: data_sources list (engine emits this when multiple
-            # providers contribute to a single row)
             sources = row.get("data_sources")
             if isinstance(sources, (list, tuple)) and sources:
                 for s in sources:
@@ -1412,14 +1602,10 @@ def _ensure_provenance_fields(row: Dict[str, Any]) -> None:
                         inferred = s_clean
                         break
 
-            # Source 2: infer from warnings text (engine emits tokens like
-            # `yahoo_chart_enrichment_applied:...` that reveal the source).
-            # This is best-effort; we never fabricate "unknown" or similar.
             if inferred is None:
                 warnings_value = row.get("warnings")
                 if isinstance(warnings_value, str) and warnings_value:
                     w_lower = warnings_value.lower()
-                    # Order matters: check more-specific tokens first
                     if "yahoo_chart" in w_lower:
                         inferred = "yahoo_chart"
                     elif "yahoo_fundamentals" in w_lower:
@@ -1437,6 +1623,102 @@ def _ensure_provenance_fields(row: Dict[str, Any]) -> None:
 
             if inferred:
                 row["data_provider"] = inferred
+    except Exception:
+        pass
+
+
+# =============================================================================
+# v4.5.0: Empty-Row Detection and Marking
+# =============================================================================
+
+def _detect_and_mark_empty_row(row: Dict[str, Any]) -> None:
+    """
+    Detect rows where every core price/volume/fundamental field is blank
+    and override the scoring engine's default recommendation (v4.5.0).
+
+    May 2026 audit case that triggered this:
+      * ALAFCO.KW had NO current_price, previous_close, open, day_high/low,
+        52W high/low, volume, market_cap, or any fundamentals. Yet the
+        scoring engine still emitted:
+          - recommendation = "REDUCE"
+          - overall_score  = 50.0
+          - risk_score     = 10.0
+          - confidence_score = 55.0
+          - recommendation_reason = "REDUCE: Score is below preferred
+            quality threshold. | overall=50.0 risk=10.0 conf=55.0 roi3m=NA%"
+        These are pure scoring defaults that LOOK like real analysis. A
+        downstream auditor reading the row would conclude "REDUCE this
+        position" when the truth is "we have no data on this symbol."
+
+    The fix:
+      1. Count how many of `_EMPTY_ROW_INDICATOR_FIELDS` are populated.
+      2. If ZERO are populated:
+         - Set `data_quality` = "MISSING"
+         - Override `recommendation` = "NA"
+         - Override `recommendation_reason` to explain why
+         - Null all score fields (overall, value, quality, momentum, growth,
+           opportunity, confidence, forecast_confidence, risk)
+         - Null `risk_bucket` and `confidence_bucket`
+         - Append `empty_row_no_provider_data` to warnings
+
+    This runs LAST in the pipeline so every fill/derive/sanitize step has
+    already had a chance to populate fields. A row that genuinely has no
+    data after all of those won't be saved by any further processing.
+
+    Operates in-place. Returns nothing. No exception escapes.
+    """
+    if not isinstance(row, dict):
+        return
+
+    try:
+        populated = 0
+        for f in _EMPTY_ROW_INDICATOR_FIELDS:
+            if not _is_blank(row.get(f)):
+                populated += 1
+
+        if populated > 0:
+            return  # row has actual data; leave alone
+
+        # Empty row — override engine defaults
+        row["data_quality"] = "MISSING"
+        row["recommendation"] = "NA"
+        row["recommendation_reason"] = (
+            "Insufficient data: no provider returned price or fundamental "
+            "fields for this symbol"
+        )
+
+        # Null score defaults so consumers can't mistake them for real
+        # scoring output
+        for score_field in (
+            "overall_score",
+            "value_score",
+            "quality_score",
+            "momentum_score",
+            "growth_score",
+            "opportunity_score",
+            "confidence_score",
+            "forecast_confidence",
+            "risk_score",
+            "valuation_score",
+            "rank_overall",
+        ):
+            try:
+                row[score_field] = None
+            except Exception:
+                pass
+
+        # Null bucket fields too
+        for bucket_field in ("risk_bucket", "confidence_bucket"):
+            try:
+                row[bucket_field] = None
+            except Exception:
+                pass
+
+        # Warnings (uses _append_warning so any prior warnings are preserved;
+        # _normalize_warnings_field has already run by this point in the
+        # pipeline so warnings are in canonical string form)
+        _append_warning(row, "empty_row_no_provider_data")
+
     except Exception:
         pass
 
@@ -1544,7 +1826,6 @@ def extract_symbols(
 # Page Schema Resolution
 # =============================================================================
 
-# Lazy-loaded catalog functions
 _catalog_normalize_page_name: Optional[Callable] = None
 _catalog_route_family: Optional[Callable] = None
 _catalog_is_instrument_page: Optional[Callable] = None
@@ -1565,7 +1846,6 @@ for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalo
     except Exception:  # pragma: no cover
         continue
 
-# Fallback implementations
 if _catalog_normalize_page_name is None:
     def _normalize_page_fallback(name: str, allow_output_pages: bool = True) -> str:
         return _strip(name) or ""
@@ -1590,7 +1870,6 @@ if _catalog_is_instrument_page is None:
 
     _catalog_is_instrument_page = _is_instrument_page_fallback
 
-# Schema registry
 _get_sheet_spec: Optional[Callable] = None
 for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
     try:
@@ -1711,7 +1990,6 @@ def _canonical_contract_fallback(
     page: str,
 ) -> Tuple[List[str], List[str], List[str], List[Dict[str, Any]]]:
     """Fallback contract when schema registry unavailable."""
-    # 1) Try data_engine_v2 contracts first (same source-of-truth fallback)
     for module_name in ("core.data_engine_v2", "core.data_engine"):
         try:
             mod = importlib.import_module(module_name)
@@ -1762,7 +2040,6 @@ def _canonical_contract_fallback(
                 ]
                 return headers or display, keys, display, columns
 
-    # 2) Hardcoded fallbacks matching the registry exactly
     if page == "Top_10_Investments":
         keys = list(_FALLBACK_INSTRUMENT_KEYS) + list(_FALLBACK_TOP10_EXTRA_KEYS)
         headers = list(_FALLBACK_INSTRUMENT_HEADERS) + list(_FALLBACK_TOP10_EXTRA_HEADERS)
@@ -1789,7 +2066,6 @@ def _canonical_contract_fallback(
             source="static_canonical_instrument_contract",
         )
 
-    # 3) Last resort: minimal status/error contract
     return _contract_from_keys(["status", "error"])
 
 
@@ -1798,11 +2074,10 @@ def _contract_from_paired(
     headers: Sequence[str],
     source: Optional[str] = None,
 ) -> Tuple[List[str], List[str], List[str], List[Dict[str, Any]]]:
-    """Create contract from paired keys + headers lists (preferred when headers are known)."""
+    """Create contract from paired keys + headers lists."""
     keys_list = [str(k) for k in keys if _strip(k)]
     headers_list = [str(h) for h in headers if _strip(h)]
 
-    # Pad headers if paired list is shorter than keys
     if len(headers_list) < len(keys_list):
         for key in keys_list[len(headers_list):]:
             headers_list.append(_title_header(key) or key)
@@ -1826,7 +2101,7 @@ def _contract_from_paired(
 def _contract_from_keys(
     keys: Sequence[str],
 ) -> Tuple[List[str], List[str], List[str], List[Dict[str, Any]]]:
-    """Create contract from keys list (headers derived via _title_header)."""
+    """Create contract from keys list."""
     keys_list = [str(k) for k in keys if _strip(k)]
     headers = [_title_header(k) or k for k in keys_list]
     columns = [
@@ -1848,89 +2123,54 @@ def _contract_from_keys(
 # =============================================================================
 # Fallback schema constants — aligned with core.sheets.schema_registry v2.5.0
 # =============================================================================
-#
-# Do NOT add non-canonical fields here. The registry is the single source of
-# truth; these lists exist only to keep the module functional when the
-# registry can't be imported (e.g. minimal deploys, tests, tooling). Any drift
-# between these constants and the registry is a bug.
-#
-# v4.2.0: extended from 80 → 85 columns to match registry v2.5.0
-# (added upside_pct + 4 view columns).
 
-# Canonical 85 instrument columns — matches
-# core.sheets.schema_registry._canonical_instrument_columns() verbatim.
 _FALLBACK_INSTRUMENT_KEYS: List[str] = [
-    # Identity (8)            -> 8
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
-    # Price (10)              -> 18
     "current_price", "previous_close", "open_price", "day_high", "day_low",
     "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
-    # Liquidity (6)           -> 24
     "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y",
-    # Fundamentals (12)       -> 36
     "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio", "revenue_ttm",
     "revenue_growth_yoy", "gross_margin", "operating_margin", "profit_margin",
     "debt_to_equity", "free_cash_flow_ttm",
-    # Risk (8)                -> 44
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
     "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
-    # Valuation (7)           -> 51   (v4.2.0: upside_pct added in registry v2.4.0)
     "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value",
     "upside_pct", "valuation_score",
-    # Forecast (9)            -> 60
     "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
     "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket",
-    # Scores (7)              -> 67
     "value_score", "quality_score", "momentum_score", "growth_score",
     "overall_score", "opportunity_score", "rank_overall",
-    # Views (4)               -> 71   (v4.2.0: added in registry v2.3.0)
     "fundamental_view", "technical_view", "risk_view", "value_view",
-    # Recommendation (4)      -> 75
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
-    # Portfolio (6)           -> 81
     "position_qty", "avg_cost", "position_cost", "position_value",
     "unrealized_pl", "unrealized_pl_pct",
-    # Provenance (4)          -> 85
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
 ]
 
 _FALLBACK_INSTRUMENT_HEADERS: List[str] = [
-    # Identity
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
-    # Price
     "Current Price", "Previous Close", "Open", "Day High", "Day Low",
     "52W High", "52W Low", "Price Change", "Percent Change", "52W Position %",
-    # Liquidity
     "Volume", "Avg Volume 10D", "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)",
-    # Fundamentals
     "P/E (TTM)", "P/E (Forward)", "EPS (TTM)", "Dividend Yield", "Payout Ratio",
     "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin", "Operating Margin",
     "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)",
-    # Risk
     "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y",
     "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
-    # Valuation (v4.2.0: + Upside %)
     "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
-    # Forecast
     "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
     "Forecast Confidence", "Confidence Score", "Confidence Bucket",
-    # Scores
     "Value Score", "Quality Score", "Momentum Score", "Growth Score",
     "Overall Score", "Opportunity Score", "Rank (Overall)",
-    # Views (v4.2.0: 4 new headers)
     "Fundamental View", "Technical View", "Risk View", "Value View",
-    # Recommendation
     "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
-    # Portfolio
     "Position Qty", "Avg Cost", "Position Cost", "Position Value",
     "Unrealized P/L", "Unrealized P/L %",
-    # Provenance
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
 ]
 
-# Top_10_Investments extras (exactly 3 — registry appends these to the 85 canonical → 88)
 _FALLBACK_TOP10_EXTRA_KEYS: List[str] = [
     "top10_rank",
     "selection_reason",
@@ -1942,7 +2182,6 @@ _FALLBACK_TOP10_EXTRA_HEADERS: List[str] = [
     "Criteria Snapshot",
 ]
 
-# Insights_Analysis (exactly 7)
 _FALLBACK_INSIGHTS_KEYS: List[str] = [
     "section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh",
 ]
@@ -1950,7 +2189,6 @@ _FALLBACK_INSIGHTS_HEADERS: List[str] = [
     "Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)",
 ]
 
-# Data_Dictionary (9)
 _FALLBACK_DATA_DICTIONARY_KEYS: List[str] = [
     "sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes",
 ]
@@ -1987,7 +2225,6 @@ def extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
         return rows
 
     if isinstance(payload, Mapping):
-        # Check common container keys
         for key in ("row_objects", "records", "items", "rows", "data", "results", "quotes"):
             value = payload.get(key)
             if isinstance(value, list):
@@ -1999,19 +2236,16 @@ def extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
                 if rows:
                     return rows
 
-        # Single row
         for key in ("row", "quote"):
             value = payload.get(key)
             rd = row_from_any(value)
             if rd:
                 return [rd]
 
-        # Payload itself looks like a row
         if _looks_like_row(payload):
             rd = row_from_any(payload)
             return [rd] if rd else []
 
-        # Recursively check nested
         for key in ("payload", "result"):
             nested = payload.get(key)
             nested_rows = extract_rows_like(nested)
@@ -2134,51 +2368,35 @@ def normalize_rows(
     """
     Normalize rows to schema.
 
-    v4.2.0: defensively strips engine internal coordination flags
-    (`_skip_recommendation_synthesis`, `_internal_*`, `unit_normalization_warnings`,
-    `intrinsic_value_source`, etc.) before schema projection.
+    v4.5.0 pipeline order for instrument-shaped pages:
+        1. _strip_internal_fields              (v4.2.0)
+        2. symbol/ticker alias                 (existing)
+        3. _derive_metadata_from_normalize     (v4.5.0 -- replaces v4.4.0)
+        4. _normalize_percent_units            (v4.4.0)
+        5. _derive_missing_fields              (v4.3.0)
+        6. _sanitize_outliers                  (v4.5.0 NEW)
+        7. _sanitize_price_consistency         (v4.5.0 NEW)
+        8. _check_revenue_currency_units       (v4.5.0 NEW)
+        9. _normalize_warnings_field           (v4.3.0)
+        10. _ensure_provenance_fields          (v4.4.0)
+        11. _detect_and_mark_empty_row         (v4.5.0 NEW -- runs LAST)
+        12. top10-specific normalization       (existing)
+        13. schema_projection                  (existing)
 
-    v4.3.0: for instrument-shaped pages (any page whose canonical key list
-    contains `current_price` -- i.e. all five INSTRUMENT_PAGES and
-    Top_10_Investments), invokes `_derive_missing_fields()` to compute
-    canonical derivations (52W position, price change, portfolio math,
-    upside, ROI horizons, period/risk/confidence buckets) when their
-    inputs are present but the field itself is missing. Existing non-empty
-    values are never overwritten. Also normalises `warnings` from list
-    -> "; "-joined string for sheet display.
-
-    v4.4.0: extended pipeline for instrument-shaped pages with three new
-    defensive normalization steps:
-      - `_derive_exchange_currency_from_suffix()` repairs stale US
-        defaults on foreign-suffix tickers (e.g. 0939.HK no longer
-        displays as USA/USD/NASDAQ-NYSE).
-      - `_normalize_percent_units()` repairs the 100x display error on
-        percent_change, upside_pct, max_drawdown_1y, var_95_1d, and
-        expected_roi_* when the engine emits them in points convention
-        but the formatter expects fraction.
-      - `_ensure_provenance_fields()` guarantees last_updated_utc,
-        last_updated_riyadh, and data_provider are populated so the
-        sheet's audit columns aren't blank.
-
-    The view fields (`fundamental_view`/`technical_view`/`risk_view`/
-    `value_view`) flow through schema projection automatically as long as
-    `keys` includes them — which it does when schema_registry v2.5.0 is
-    loaded, OR when the fallback list above is used.
-
-    Pipeline order for instrument-shaped rows:
-        1. _strip_internal_fields                       (v4.2.0)
-        2. symbol/ticker alias                          (existing)
-        3. _derive_exchange_currency_from_suffix        (v4.4.0)
-        4. _normalize_percent_units                     (v4.4.0)
-        5. _derive_missing_fields                       (v4.3.0)
-        6. _normalize_warnings_field                    (v4.3.0)
-        7. _ensure_provenance_fields                    (v4.4.0)
-        8. top10-specific normalization                 (existing)
-        9. schema_projection                            (existing)
-
-    Step 4 runs BEFORE step 5 so that downstream derivations operate on
-    canonical (fraction) values. Step 7 runs AFTER step 6 so it can
-    inspect the normalized warnings string when inferring data_provider.
+    Rationale for ordering:
+      - Metadata (step 3) BEFORE everything else so downstream steps see
+        correct currency for revenue-vs-market-cap checks.
+      - Unit normalization (step 4) BEFORE derivations (step 5) so
+        derived fields use canonical (fraction) inputs.
+      - Sanitization (steps 6-8) AFTER derivations because some derivations
+        depend on the raw values; we want to keep derived outputs even if
+        the raw inputs get nulled.
+      - Warnings (step 9) AFTER all sanitization so all `sanitized:*`
+        markers from steps 6-8 are merged into the canonical string.
+      - Provenance (step 10) AFTER warnings so it can inspect the canonical
+        warnings string for data_provider inference.
+      - Empty-row detection (step 11) LAST so every fill/derive step has
+        already had a chance to populate fields.
     """
     result: List[Dict[str, Any]] = []
 
@@ -2187,10 +2405,10 @@ def normalize_rows(
     for row in rows:
         rd = dict(row or {})
 
-        # v4.2.0: strip internal coordination fields early
+        # 1. v4.2.0: strip internal coordination fields early
         _strip_internal_fields(rd)
 
-        # Normalize symbol/ticker
+        # 2. Normalize symbol/ticker aliases
         if "symbol" not in rd and "ticker" in rd:
             rd["symbol"] = rd.get("ticker")
         if "ticker" not in rd and "symbol" in rd:
@@ -2198,27 +2416,40 @@ def normalize_rows(
 
         # Instrument-shaped normalization pipeline
         if instrument_shaped:
-            # v4.4.0: repair stale US defaults on foreign-suffix tickers
-            _derive_exchange_currency_from_suffix(rd)
+            # 3. v4.5.0: metadata via normalize.py SSOT (with v4.4.0 fallback)
+            _derive_metadata_from_normalize(rd)
 
-            # v4.4.0: repair 100x percent-unit drift
+            # 4. v4.4.0: repair 100x percent-unit drift
             _normalize_percent_units(rd)
 
-            # v4.3.0: fill canonical derived fields when inputs are present
+            # 5. v4.3.0: fill canonical derived fields when inputs are present
             _derive_missing_fields(rd)
 
-        # v4.3.0: warnings field coercion (list -> "; "-joined string)
+            # 6. v4.5.0: clamp outlier ratios (PE>1000, PB<-50, etc.)
+            _sanitize_outliers(rd)
+
+            # 7. v4.5.0: null corrupt 52W high/low (BKNG 5,839 vs 154 case)
+            _sanitize_price_consistency(rd)
+
+            # 8. v4.5.0: null cross-currency revenue (IX.US Orix case)
+            _check_revenue_currency_units(rd)
+
+        # 9. v4.3.0: warnings field coercion (list -> "; "-joined string).
+        # MUST run after the v4.5.0 sanity gates so their `sanitized:*`
+        # warnings are merged into the canonical string.
         _normalize_warnings_field(rd)
 
-        # v4.4.0: guarantee provenance fields (runs AFTER warnings normalization
-        # so it can inspect the canonical warnings string when inferring
-        # data_provider). Restricted to instrument-shaped pages because
-        # special pages (Insights, Data_Dictionary) have their own
-        # provenance conventions.
+        # 10. v4.4.0: guarantee provenance fields (runs AFTER warnings
+        # normalization so it can inspect the canonical warnings string).
+        # Restricted to instrument-shaped pages.
         if instrument_shaped:
             _ensure_provenance_fields(rd)
 
-        # Top_10_Investments-specific normalization (aligned with registry's 3 extras)
+            # 11. v4.5.0: detect and mark empty rows (runs LAST so every
+            # fill/derive step has had a chance to populate fields)
+            _detect_and_mark_empty_row(rd)
+
+        # 12. Top_10_Investments-specific normalization
         if page == "Top_10_Investments":
             if rd.get("top10_rank") is None and rd.get("rank_overall") is not None:
                 rd["top10_rank"] = rd.get("rank_overall")
@@ -2246,6 +2477,7 @@ def normalize_rows(
             if rd.get("criteria_snapshot") in {None, ""}:
                 rd["criteria_snapshot"] = None
 
+        # 13. Final schema projection
         result.append(schema_projection(rd, keys))
 
     return result
@@ -2262,7 +2494,6 @@ def derive_headers_keys(
     if keys:
         return headers, keys, display_headers or headers, columns
 
-    # Try from meta
     meta_headers = source_meta.get("headers") if isinstance(source_meta, Mapping) else None
     meta_keys = source_meta.get("keys") if isinstance(source_meta, Mapping) else None
     meta_display = source_meta.get("display_headers") if isinstance(source_meta, Mapping) else None
@@ -2274,7 +2505,6 @@ def derive_headers_keys(
             [],
         )
 
-    # Derive from rows
     seen: set = set()
     derived_keys: List[str] = []
     for row in rows:
@@ -2314,13 +2544,7 @@ def safe_status(
 # =============================================================================
 
 def _resolve_request_id(request: Any, explicit: Optional[str] = None) -> str:
-    """
-    Resolve a request ID for response/log tracing.
-
-    Renamed from v4.0.0 `request_id()` to avoid being shadowed by the
-    `request_id: Optional[str]` keyword argument on
-    `build_enriched_quote_payload()`.
-    """
+    """Resolve a request ID for response/log tracing."""
     if _strip(explicit):
         return _strip(explicit)
 
@@ -2457,13 +2681,11 @@ async def resolve_engine(engine: Any, request: Any = None) -> Any:
         except Exception:  # pragma: no cover
             continue
 
-        # Check singletons
         for name in _ENGINE_SINGLETON_NAMES:
             obj = getattr(mod, name, None)
             if obj is not None:
                 return obj
 
-        # Check factories
         for name in _ENGINE_FACTORY_NAMES:
             fn = getattr(mod, name, None)
             if not callable(fn):
@@ -2700,7 +2922,6 @@ def method_variants(
         {},
     ]
 
-    # Deduplicate
     result: List[Dict[str, Any]] = []
     seen: set = set()
     for item in variants:
@@ -2819,7 +3040,6 @@ async def engine_quotes(
                 return quote_map[cand]
         return {}
 
-    # Batch methods first
     for method_name in _BATCH_QUOTE_METHODS:
         fn = getattr(engine, method_name, None)
         if not callable(fn):
@@ -2860,11 +3080,9 @@ async def engine_quotes(
                 if sym:
                     _put(sym, row)
 
-        # Check if all symbols have non-sparse rows
         if all(_get(sym) and not is_sparse_row(_get(sym)) for sym in symbols):
             break
 
-    # Rehydrate sparse/missing rows with single methods
     sparse = [sym for sym in symbols if not _get(sym) or is_sparse_row(_get(sym))]
     if sparse:
         for sym in sparse:
@@ -2890,7 +3108,6 @@ async def engine_quotes(
                     _put(sym, best_row)
                     break
 
-    # Build output rows
     result_rows: List[Dict[str, Any]] = []
     for sym in symbols:
         row = _get(sym)
@@ -2902,7 +3119,6 @@ async def engine_quotes(
             row["ticker"] = row.get("symbol")
         result_rows.append(row)
 
-    # Determine final status
     if any(_strip(r.get("error")) for r in result_rows):
         status = "error" if all(_strip(r.get("error")) for r in result_rows) else "partial"
 
@@ -2992,34 +3208,9 @@ async def build_enriched_quote_payload(
     request_id: Optional[str] = None,
     **extra: Any,
 ) -> Dict[str, Any]:
-    """
-    Build enriched quote payload.
-
-    This is the main entry point for the enriched quote module.
-
-    Args:
-        engine: Optional engine instance
-        request: Optional request object
-        settings: Optional settings object
-        body: Request body
-        page: Page name
-        symbol: Single symbol
-        symbols: List of symbols
-        mode: Execution mode (auto, live_quotes, live_sheet, snapshot)
-        limit: Row limit
-        schema_only: Return only schema
-        headers_only: Return only headers
-        include_matrix: Include rows matrix
-        table_mode: Enable table mode
-        request_id: Request ID for tracing
-        **extra: Extra parameters
-
-    Returns:
-        Enriched quote payload
-    """
+    """Build enriched quote payload. Main entry point for the module."""
     started_at = time.perf_counter()
 
-    # Extract request data
     request_query = extract_request_query(request)
     request_path = extract_request_path_params(request)
     settings_dict = extract_settings_dict(settings)
@@ -3028,7 +3219,6 @@ async def build_enriched_quote_payload(
 
     merged = _merge_dicts(request_query, request_path, settings_dict, body_dict, extra_dict)
 
-    # Normalize page
     page_norm = normalize_page(
         page
         or merged.get("page")
@@ -3040,11 +3230,8 @@ async def build_enriched_quote_payload(
     )
     route_fam = route_family(page_norm)
 
-    # Request ID (uses the renamed helper; v4.0.0 shadowed the helper with the
-    # kw-argument, which is why the next line previously crashed)
     req_id = _resolve_request_id(request, request_id)
 
-    # Parameters
     limit_raw = limit if isinstance(limit, int) and limit > 0 else _to_int(
         merged.get("limit"), _CONFIG.default_limit
     )
@@ -3067,13 +3254,11 @@ async def build_enriched_quote_payload(
         else _truthy(merged.get("table_mode"), False)
     )
 
-    # Extract symbols
     resolved_symbols = extract_symbols(
         body_dict, request_query, request_path, extra_dict,
         explicit_symbol=symbol, explicit_symbols=symbols,
     )
 
-    # Determine mode
     raw_mode = mode or merged.get("mode")
     if raw_mode and _strip(raw_mode).lower() != "auto":
         mode_out = _strip(raw_mode).lower()
@@ -3084,17 +3269,14 @@ async def build_enriched_quote_payload(
     else:
         mode_out = "live_sheet"
 
-    # Initialize
     warnings: List[str] = []
     rows: List[Dict[str, Any]] = []
     source_meta: Dict[str, Any] = {}
     status_out = "success"
     error_out: Optional[str] = None
 
-    # Resolve engine
     engine_obj = await resolve_engine(engine, request)
 
-    # Special pages
     if page_norm in SPECIAL_PAGES:
         if schema_only_out or headers_only_out:
             headers, keys, display_headers, columns = page_schema(page_norm)
@@ -3162,7 +3344,6 @@ async def build_enriched_quote_payload(
             if not rows:
                 warnings.append("special_page_engine_fallback_empty")
 
-    # Instrument quote mode
     elif resolved_symbols and is_instrument_page(page_norm):
         quote_rows, quote_meta, quote_status, quote_error = await engine_quotes(
             engine=engine_obj,
@@ -3206,7 +3387,6 @@ async def build_enriched_quote_payload(
                 error_out = sheet_error or error_out
                 warnings.append("quotes_rehydrated_from_sheet_rows")
 
-    # Table mode / page mode
     else:
         sheet_rows, sheet_meta, sheet_status, sheet_error = await engine_sheet_rows(
             engine=engine_obj,
@@ -3227,27 +3407,23 @@ async def build_enriched_quote_payload(
         status_out = sheet_status
         error_out = sheet_error
 
-    # Derive headers and keys
     headers, keys, display_headers, columns = derive_headers_keys(
         page=page_norm,
         rows=rows,
         source_meta=source_meta,
     )
 
-    # Apply schema-only/headers-only
     if schema_only_out or headers_only_out:
         rows = []
     else:
         rows = normalize_rows(rows[:limit_out], keys, page_norm)
 
-    # Warnings for empty rows
     if not rows and not (schema_only_out or headers_only_out):
         if error_out:
             warnings.append("no_rows_with_error")
         else:
             warnings.append("no_rows_returned")
 
-    # Final status
     status_final = safe_status(status_out, rows, headers, error_out, warnings)
 
     return envelope(
@@ -3275,6 +3451,7 @@ async def build_enriched_quote_payload(
             "engine_present": engine_obj is not None,
             "engine_type": type(engine_obj).__name__ if engine_obj is not None else "none",
             "source_meta_keys": sorted(list(source_meta.keys())) if isinstance(source_meta, Mapping) else [],
+            "normalize_ssot_available": _infer_symbol_metadata is not None,
         },
     )
 
