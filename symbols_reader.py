@@ -25,6 +25,41 @@ Design goals
     - "2222.sr"  -> "2222.SR"
 - Helpful provider hint for downstream readers/builders
 
+Changes vs v1.1.0
+-----------------
+- ADD: Middle East suffix recognition for `normalize_symbol`. Maps 11
+    alternate Yahoo suffixes to their canonical short form so foreign
+    listings dedupe consistently upstream:
+        .KSE   -> .KW     (Kuwait alternate -> Boursa Kuwait canonical)
+        .QE    -> .QA     (Qatar alternate -> QSE canonical)
+        .DFM   -> .AE     (UAE Dubai Financial Market -> generic UAE)
+        .ADX   -> .AE     (UAE Abu Dhabi -> generic UAE)
+        .EGX   -> .EG     (Egypt alternate -> EGX canonical)
+        .TASE  -> .TA     (Israel alternate -> Tel Aviv canonical)
+        .LSE   -> .L      (UK alternate)
+        .LON   -> .L      (UK alternate)
+        .XETRA -> .DE     (Germany alternate)
+        .NSE   -> .NS     (India alternate)
+        .TYO   -> .T      (Japan alternate)
+    Aligned with enriched_quote.py v4.6.0 `_SUFFIX_TO_LOCALE` and the
+    yahoo_chart_provider v8.2.0 / yahoo_fundamentals_provider v6.2.0
+    `_SUFFIX_TO_LOCALE_DEFAULTS` maps. Means `MABANEE.KSE`, `MABANEE.kw`,
+    and `MABANEE.KW` all normalize to a single canonical `MABANEE.KW`,
+    so a downstream `_ordered_unique` call dedupes them as one symbol
+    rather than three.
+- ADD: `_SUFFIX_CANONICAL_MAP` module-level constant (private).
+- ADD: `_canonicalize_suffix(symbol)` private helper.
+- ADD: 5 new tests covering ME canonicalization + dedup. All 9 v1.1.0
+    tests preserved; total now 14.
+- BUMP: `SCRIPT_VERSION = "1.2.0"`.
+
+Preserved from v1.1.0
+---------------------
+- Full API surface (no signature changes).
+- All v1.1.0 fixes intact: `limit=0` honored, `default_limit` kwarg
+    name, empty `explicit_symbols` no longer locks `source`, nested
+    ROW_CONTAINER_KEYS recursion.
+
 Changes vs v1.0.0 (uploaded baseline)
 -------------------------------------
 - FIX MEDIUM: `limit=0` is now honored (was silently treated as "no limit"
@@ -76,7 +111,7 @@ from typing import Any, Iterable, Mapping, Sequence
 # Version / logger (TFB canonical pattern)
 # ------------------------------------------------------------------------------
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 __version__ = SCRIPT_VERSION
 
 logger = logging.getLogger(__name__)
@@ -271,7 +306,7 @@ def _clean_text(value: Any) -> str:
     if value is None:
         return ""
     text = str(value)
-    text = text.replace("،", ",").replace("؛", ";")
+    text = text.replace("\u060c", ",").replace("\u061b", ";")
     text = text.replace("\u00A0", " ").replace("\u2007", " ").replace("\u202F", " ")
     return text.strip()
 
@@ -354,6 +389,78 @@ def get_default_symbols_for_page(page: Any, limit: int | None = None) -> list[st
 # Symbol normalization
 # ------------------------------------------------------------------------------
 
+# v1.2.0: Middle East + global suffix canonicalization map.
+#
+# Maps alternate Yahoo-style suffixes to their canonical short form. Applied
+# as the final step of `normalize_symbol` so that semantically-equivalent
+# variants dedupe upstream, before reaching any downstream consumer.
+#
+# Byte-aligned with the alternate-suffix entries in:
+#   * enriched_quote.py v4.6.0 _SUFFIX_TO_LOCALE
+#   * yahoo_chart_provider.py v8.2.0 _SUFFIX_TO_LOCALE_DEFAULTS
+#   * yahoo_fundamentals_provider.py v6.2.0 _SUFFIX_TO_LOCALE_DEFAULTS
+# (Those tables list BOTH variants pointing at the same exchange; this
+# canonical map picks one as primary so dedup works.)
+#
+# Choice of canonical form follows Yahoo Finance's own preferred suffix
+# for each market (the shorter / Yahoo-native variant).
+_SUFFIX_CANONICAL_MAP: dict[str, str] = {
+    # Middle East
+    ".KSE":   ".KW",      # Kuwait alternate -> Boursa Kuwait canonical
+    ".QE":    ".QA",      # Qatar alternate -> QSE canonical
+    ".DFM":   ".AE",      # UAE Dubai Financial Market -> generic UAE
+    ".ADX":   ".AE",      # UAE Abu Dhabi -> generic UAE
+    ".EGX":   ".EG",      # Egypt alternate -> EGX canonical
+    ".TASE":  ".TA",      # Israel alternate -> Tel Aviv canonical
+
+    # Other global aliases (carried for symmetry with the provider tables)
+    ".LSE":   ".L",       # UK alternate
+    ".LON":   ".L",       # UK alternate
+    ".XETRA": ".DE",      # Germany alternate
+    ".NSE":   ".NS",      # India NSE alternate
+    ".TYO":   ".T",       # Japan TYO alternate
+}
+
+
+def _canonicalize_suffix(symbol: str) -> str:
+    """
+    v1.2.0: Canonicalize alternate Yahoo suffix variants to the standard form.
+
+    Operates on the LAST `.suffix` segment of a symbol. Returns the symbol
+    unchanged when:
+      - it has no `.` (e.g. `AAPL`, `^GSPC`, `GC=F`, `EURUSD=X`)
+      - the suffix isn't in `_SUFFIX_CANONICAL_MAP` (e.g. `.SR`, `.A` class
+        share suffixes, unknown formats)
+
+    Examples
+    --------
+        MABANEE.KSE  -> MABANEE.KW
+        OOREDOO.QE   -> OOREDOO.QA
+        EMAAR.DFM    -> EMAAR.AE
+        EMAAR.ADX    -> EMAAR.AE
+        4030.EGX     -> 4030.EG
+        STOCK.TASE   -> STOCK.TA
+        BARC.LSE     -> BARC.L
+        VOW3.XETRA   -> VOW3.DE
+        HCLTECH.NSE  -> HCLTECH.NS
+        7203.TYO     -> 7203.T
+        BRK.A        -> BRK.A          (`.A` not in map; class share preserved)
+        AAPL         -> AAPL           (no dot; unchanged)
+        ^GSPC        -> ^GSPC          (no dot; unchanged)
+        GC=F         -> GC=F           (no dot; unchanged)
+    """
+    if "." not in symbol or len(symbol) < 3:
+        return symbol
+    base, _, suffix = symbol.rpartition(".")
+    if not base or not suffix:
+        return symbol
+    suffix_with_dot = "." + suffix
+    canonical = _SUFFIX_CANONICAL_MAP.get(suffix_with_dot)
+    if canonical is None:
+        return symbol
+    return f"{base}{canonical}"
+
+
 def normalize_symbol(raw: Any) -> str | None:
     token = _clean_text(raw)
     if not token:
@@ -381,6 +488,12 @@ def normalize_symbol(raw: Any) -> str | None:
     if _KSA_SUFFIX_RE.fullmatch(token):
         left = token.split(".", 1)[0]
         return f"{left}.SR"
+
+    # v1.2.0: Middle East + global suffix canonicalization
+    # (.KSE -> .KW, .QE -> .QA, .DFM/.ADX -> .AE, .EGX -> .EG, .TASE -> .TA,
+    #  .LSE/.LON -> .L, .XETRA -> .DE, .NSE -> .NS, .TYO -> .T)
+    # No-op for tokens without a `.suffix` and for unrecognized suffixes.
+    token = _canonicalize_suffix(token)
 
     return token
 
@@ -744,28 +857,28 @@ if __name__ == "__main__":
     assert result.symbols == ["2222.SR", "1120.SR", "2010.SR"]
     assert result.used_page_defaults is True
     assert result.source == "page_defaults"
-    print("[OK]  1/9 Page defaults (v1.1.0 FIX: corrected limit kwarg name)")
+    print("[OK]  1/14 Page defaults (v1.1.0 FIX: corrected limit kwarg name)")
 
     # Test 2: Extraction and mapping KSA suffixes / aliases
     payload = {"tickers": ["2222", "1120.sr", "GOLD", "N/A", "AAPL"]}
     result = resolve_symbols(payload=payload)
     assert result.symbols == ["2222.SR", "1120.SR", "GC=F", "AAPL"]
     assert "N/A" in result.dropped_tokens
-    print("[OK]  2/9 Extraction & normalization (preserved from v1.0.0)")
+    print("[OK]  2/14 Extraction & normalization (preserved from v1.0.0)")
 
     # Test 3: Nested Row extractions
     payload_with_rows = {"data": [{"ticker": "TSLA"}, {"code": "MSFT"}]}
     result = resolve_symbols(payload=payload_with_rows)
     assert result.symbols == ["TSLA", "MSFT"]
-    print("[OK]  3/9 Nested row extraction (preserved from v1.0.0)")
+    print("[OK]  3/14 Nested row extraction (preserved from v1.0.0)")
 
-    # --- New in v1.1.0 ---
+    # --- Preserved from v1.1.0 ---
 
     # Test 4: limit=0 must return empty list (was dropped as falsy in v1.0.0)
     result = resolve_symbols(page="market_leaders", default_limit=0)
     assert result.symbols == [], f"Expected [], got {result.symbols}"
     assert result.limit_applied == 0
-    print("[OK]  4/9 v1.1.0 FIX: limit=0 returns empty list (was falsy-dropped)")
+    print("[OK]  4/14 v1.1.0 FIX: limit=0 returns empty list (was falsy-dropped)")
 
     # Test 5: explicit_symbols precedence + source label
     result = resolve_symbols(
@@ -775,7 +888,7 @@ if __name__ == "__main__":
     assert "AAPL" in result.symbols and "MSFT" in result.symbols
     assert "IBM" in result.symbols   # still merged from payload
     assert result.source == "explicit_symbols"
-    print("[OK]  5/9 explicit_symbols precedence + source label")
+    print("[OK]  5/14 explicit_symbols precedence + source label")
 
     # Test 6: empty explicit_symbols doesn't lock source (v1.1.0 FIX)
     result = resolve_symbols(
@@ -786,7 +899,7 @@ if __name__ == "__main__":
     assert result.source == "request", (
         f"v1.1.0 FIX: source should be 'request' not '{result.source}'"
     )
-    print("[OK]  6/9 v1.1.0 FIX: empty explicit_symbols doesn't lock source")
+    print("[OK]  6/14 v1.1.0 FIX: empty explicit_symbols doesn't lock source")
 
     # Test 7: nested ROW_CONTAINER_KEYS recursion (v1.1.0 FIX)
     nested = {"rows": [{"data": [{"ticker": "NVDA"}]}]}
@@ -794,14 +907,14 @@ if __name__ == "__main__":
     assert "NVDA" in result.symbols, (
         f"v1.1.0 FIX: nested recursion should find NVDA; got {result.symbols}"
     )
-    print("[OK]  7/9 v1.1.0 FIX: nested ROW_CONTAINER_KEYS recursion")
+    print("[OK]  7/14 v1.1.0 FIX: nested ROW_CONTAINER_KEYS recursion")
 
     # Test 8: provider hint per page
     assert get_provider_hint_for_page("Market_Leaders") == "KSA_PRIMARY"
     assert get_provider_hint_for_page("Global_Markets") == "EODHD_PRIMARY"
     assert get_provider_hint_for_page("Top_10_Investments") == "HYBRID"
     assert get_provider_hint_for_page("Unknown_Page") == "AUTO"
-    print("[OK]  8/9 Provider hint routing")
+    print("[OK]  8/14 Provider hint routing")
 
     # Test 9: dropped tokens captured + query_params merge
     result = resolve_symbols(
@@ -815,7 +928,70 @@ if __name__ == "__main__":
     assert "2222.SR" in result.symbols
     assert "--" in result.dropped_tokens
     assert "N/A" in result.dropped_tokens
-    print("[OK]  9/9 dropped tokens captured + query_params merge")
+    print("[OK]  9/14 dropped tokens captured + query_params merge")
+
+    # --- New in v1.2.0: Middle East suffix canonicalization ---
+
+    # Test 10: Middle East suffix canonicalization (one symbol per region)
+    assert normalize_symbol("MABANEE.KSE") == "MABANEE.KW", \
+        f"v1.2.0: .KSE -> .KW; got {normalize_symbol('MABANEE.KSE')!r}"
+    assert normalize_symbol("OOREDOO.QE") == "OOREDOO.QA", \
+        f"v1.2.0: .QE -> .QA; got {normalize_symbol('OOREDOO.QE')!r}"
+    assert normalize_symbol("EMAAR.DFM") == "EMAAR.AE", \
+        f"v1.2.0: .DFM -> .AE; got {normalize_symbol('EMAAR.DFM')!r}"
+    assert normalize_symbol("FAB.ADX") == "FAB.AE", \
+        f"v1.2.0: .ADX -> .AE; got {normalize_symbol('FAB.ADX')!r}"
+    assert normalize_symbol("HRHO.EGX") == "HRHO.EG", \
+        f"v1.2.0: .EGX -> .EG; got {normalize_symbol('HRHO.EGX')!r}"
+    assert normalize_symbol("TEVA.TASE") == "TEVA.TA", \
+        f"v1.2.0: .TASE -> .TA; got {normalize_symbol('TEVA.TASE')!r}"
+    print("[OK] 10/14 v1.2.0: ME canonicalization "
+          "(.KSE/.QE/.DFM/.ADX/.EGX/.TASE)")
+
+    # Test 11: Lowercase input + dedup
+    # MABANEE.KSE, mabanee.kw, and MABANEE.KW all reduce to MABANEE.KW
+    # and dedupe to a single symbol -- this is the key downstream win.
+    result = resolve_symbols(payload={"tickers": [
+        "MABANEE.KSE", "mabanee.kw", "MABANEE.KW",
+    ]})
+    assert result.symbols == ["MABANEE.KW"], \
+        f"v1.2.0: all three should dedupe to MABANEE.KW; got {result.symbols}"
+    print("[OK] 11/14 v1.2.0: lowercase + alternate-suffix dedup "
+          "(3 inputs -> 1 canonical)")
+
+    # Test 12: Global suffix canonicalization (UK / Germany / India / Japan)
+    assert normalize_symbol("BARC.LSE") == "BARC.L", \
+        f"v1.2.0: .LSE -> .L; got {normalize_symbol('BARC.LSE')!r}"
+    assert normalize_symbol("BARC.LON") == "BARC.L", \
+        f"v1.2.0: .LON -> .L; got {normalize_symbol('BARC.LON')!r}"
+    assert normalize_symbol("VOW3.XETRA") == "VOW3.DE", \
+        f"v1.2.0: .XETRA -> .DE; got {normalize_symbol('VOW3.XETRA')!r}"
+    assert normalize_symbol("HCLTECH.NSE") == "HCLTECH.NS", \
+        f"v1.2.0: .NSE -> .NS; got {normalize_symbol('HCLTECH.NSE')!r}"
+    assert normalize_symbol("7203.TYO") == "7203.T", \
+        f"v1.2.0: .TYO -> .T; got {normalize_symbol('7203.TYO')!r}"
+    print("[OK] 12/14 v1.2.0: global canonicalization "
+          "(.LSE/.LON/.XETRA/.NSE/.TYO)")
+
+    # Test 13: Already-canonical and unaffected symbols
+    # KSA / futures / FX / indices / class shares / plain-alpha tickers
+    # must pass through untouched -- the v1.2.0 logic is additive only.
+    assert normalize_symbol("MABANEE.KW") == "MABANEE.KW"        # already canonical
+    assert normalize_symbol("2222") == "2222.SR"                  # KSA numeric (regression)
+    assert normalize_symbol("2222.SR") == "2222.SR"               # KSA .SR (regression)
+    assert normalize_symbol("AAPL") == "AAPL"                     # bare US ticker
+    assert normalize_symbol("GC=F") == "GC=F"                     # future
+    assert normalize_symbol("EURUSD=X") == "EURUSD=X"             # FX (already-suffixed)
+    assert normalize_symbol("^GSPC") == "^GSPC"                   # index
+    assert normalize_symbol("BRK.A") == "BRK.A"                   # class share (`.A` not in map)
+    assert normalize_symbol("RDS.B") == "RDS.B"                   # class share (`.B` not in map)
+    print("[OK] 13/14 v1.2.0: already-canonical + non-suffix symbols unchanged")
+
+    # Test 14: Unknown suffix is left alone (no false attribution)
+    assert normalize_symbol("FOOBAR.XYZ") == "FOOBAR.XYZ", \
+        f"v1.2.0: unknown suffix unchanged; got {normalize_symbol('FOOBAR.XYZ')!r}"
+    assert normalize_symbol("WEIRD.ZZZ") == "WEIRD.ZZZ"
+    print("[OK] 14/14 v1.2.0: unknown suffix unchanged (no false attribution)")
 
     print()
-    print(f"All 9 tests passed -- symbols_reader v{SCRIPT_VERSION} verified.")
+    print(f"All 14 tests passed -- symbols_reader v{SCRIPT_VERSION} verified.")
