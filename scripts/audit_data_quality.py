@@ -2,9 +2,58 @@
 """
 scripts/audit_data_quality.py
 ================================================================================
-TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.6.0)
+TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.7.0)
 ================================================================================
 Aligned • Production-safe • Engine-compatible • Async-safe exports • Deterministic
+
+What's improved vs v4.6.0  —  ENGINE v5.72.0 + ENRICHED_QUOTE v4.6.0 ALIGNMENT
+- 🔑 ALIGN: data_engine_v2 v5.72.0 (May 2026 audit) + enriched_quote v4.6.0
+      added seven new warning tag families that v4.6.0 of this script
+      didn't recognize. v4.7.0 wires them into the engine-warning
+      surfacing path so they appear as audit issues and roll up into
+      summary counts:
+        - "sanitized:{field}_out_of_range"     (engine sanitized an
+            extreme provider value: ev_ebitda, pe_ttm, debt_to_equity,
+            etc.) → PROVIDER_VALUE_SANITIZED (LOW)
+        - "v572:exchange_corrected_from=X"     (engine force-overrode
+            a mislabeled foreign exchange, e.g. NASDAQ→Boursa Kuwait
+            for *.KW tickers) → IDENTITY_CORRECTED_BY_ENGINE (INFO)
+        - "v572:currency_corrected_from=X"     (engine force-overrode
+            currency, e.g. USD→KWD for Kuwait tickers) → same audit
+            tag (the bare "v572" key catches both v572:* variants)
+        - "empty_row_no_provider_data"         (engine detected a row
+            with no usable provider data and reset recommendation to
+            NA) → EMPTY_ROW (HIGH)
+        - "market_cap_currency_suspect"        (engine flagged a
+            market_cap value as inconsistent with its currency label)
+            → MARKET_CAP_CURRENCY_SUSPECT (MEDIUM)
+        - "revenue_currency_suspect"           (same for revenue)
+            → REVENUE_CURRENCY_SUSPECT (MEDIUM)
+        - "quote_current_price_missing"        (provider quote endpoint
+            returned no price; engine fell back to chart) →
+            QUOTE_PRICE_MISSING (MEDIUM)
+        - "inferred_from"                      (bare key matching any
+            "inferred_from=*" tag added when identity came from the
+            suffix table rather than the provider) →
+            IDENTITY_INFERRED_FROM_SUFFIX (INFO)
+- 🔑 SEVERITY: `_compute_severity` re-tiered to keep INFO/LOW tags
+      from bubbling to MEDIUM by default. Rows with ONLY info-tier tags
+      now report INFO; rows with only info+low tags report LOW. Specific
+      data-integrity tags (MARKET_CAP_CURRENCY_SUSPECT etc.) still hit
+      MEDIUM; EMPTY_ROW joins UNIT_DRIFT_*/PROVIDER_PERCENT_DROPPED at
+      HIGH. Exit code semantics are unchanged: INFO and LOW both → 0.
+- 🔑 REMEDIATION: `_remediation_for_issues` extended with six new
+      action paths so the alert payload tells operators what to do
+      (e.g. "force refresh and verify symbol is still listed" for
+      EMPTY_ROW; "verify currency mapping in symbols_reader" for the
+      currency-suspect tags).
+- ARCH: severity-tier sets (`_SEVERITY_CRITICAL_TAGS`, `_HIGH_`, `_MEDIUM_`,
+      `_LOW_`, `_INFO_`) hoisted to module level so tests and summary
+      builders can reference them. Internal-only — not exported.
+- KEEP: every v4.6.0 capability preserved. percent_change FRACTION
+      contract, UNIT_DRIFT defense layer, percent-warning surfacing,
+      `--legacy-percent-units` and `AUDIT_PERCENT_CONTRACT` flags,
+      HMAC signing, all four export formats, exit codes.
 
 What's improved vs v4.5.0  —  DATA_ENGINE_V2 v5.67.0 FRACTION-CONTRACT ALIGNMENT
 - 🔑 ALIGN: data_engine_v2 v5.67.0 (May 13 2026) switched four percent-unit
@@ -126,7 +175,7 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-SERVICE_VERSION = "4.6.0"
+SERVICE_VERSION = "4.7.0"
 SCRIPT_VERSION = SERVICE_VERSION  # v4.5.0: alias for cross-script consistency
 
 logger = logging.getLogger("TFB.Audit")
@@ -220,9 +269,21 @@ _UNIT_DRIFT_BOUNDS_FRACTION: Dict[str, float] = {
 }
 
 _ENGINE_WARNING_TO_ISSUE: Dict[str, str] = {
+    # v4.6.0: percent_change repair tags
     "percent_change_recomputed":            "PROVIDER_PERCENT_RECOMPUTED",
     "percent_change_clamped_from_provider": "PROVIDER_PERCENT_CLAMPED",
     "percent_change_suspect_dropped":       "PROVIDER_PERCENT_DROPPED",
+    # v4.7.0: engine v5.72.0 + enriched_quote v4.6.0 tag families.
+    # "sanitized" and "v572" are BARE KEYS (matched after splitting on
+    # ":") so they catch every "sanitized:<field>_out_of_range" and
+    # every "v572:<field>_corrected_from=X" variant in one entry.
+    "sanitized":                            "PROVIDER_VALUE_SANITIZED",
+    "v572":                                 "IDENTITY_CORRECTED_BY_ENGINE",
+    "inferred_from":                        "IDENTITY_INFERRED_FROM_SUFFIX",
+    "empty_row_no_provider_data":           "EMPTY_ROW",
+    "market_cap_currency_suspect":          "MARKET_CAP_CURRENCY_SUSPECT",
+    "revenue_currency_suspect":             "REVENUE_CURRENCY_SUSPECT",
+    "quote_current_price_missing":          "QUOTE_PRICE_MISSING",
 }
 
 
@@ -1107,6 +1168,67 @@ def _remediation_for_issues(issues: List[str]) -> List[RemediationAction]:
                     automated=False,
                 )
             )
+        # v4.7.0: new tag families from engine v5.72.0 + enriched_quote v4.6.0
+        elif i == "EMPTY_ROW":
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Engine detected no usable provider data for this row. Force refresh; if still empty, verify symbol is still listed / actively traded on its exchange.",
+                    priority=AlertPriority.P1,
+                    estimated_time_minutes=15,
+                    automated=True,
+                )
+            )
+        elif i in {"MARKET_CAP_CURRENCY_SUSPECT", "REVENUE_CURRENCY_SUSPECT"}:
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Provider value magnitude disagrees with its currency label (likely foreign listing tagged USD). Verify currency mapping in symbols_reader / provider; engine v5.72.0 force-correct should resolve once locale is canonical.",
+                    priority=AlertPriority.P2,
+                    estimated_time_minutes=20,
+                    automated=False,
+                )
+            )
+        elif i == "QUOTE_PRICE_MISSING":
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Provider quote endpoint returned no price; engine fell back to chart data. Watch for pattern — isolated cases are self-healing; widespread misses point to provider outage or symbol expiry.",
+                    priority=AlertPriority.P3,
+                    estimated_time_minutes=15,
+                    automated=False,
+                )
+            )
+        elif i == "PROVIDER_VALUE_SANITIZED":
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Engine sanitized one or more extreme financial-ratio values (P/E, D/E, EV/EBITDA, etc.). Inspect the row's `warnings` field for the specific sanitized:<field>_out_of_range tag. No action unless the underlying provider value drift is widespread.",
+                    priority=AlertPriority.P3,
+                    estimated_time_minutes=15,
+                    automated=False,
+                )
+            )
+        elif i == "IDENTITY_CORRECTED_BY_ENGINE":
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Engine v5.72.0 force-overrode a mislabeled exchange or currency (typical for foreign tickers tagged with US exchange/USD). Operational info — no action needed; the row is now correct.",
+                    priority=AlertPriority.P5,
+                    estimated_time_minutes=5,
+                    automated=False,
+                )
+            )
+        elif i == "IDENTITY_INFERRED_FROM_SUFFIX":
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Engine inferred exchange/currency/country from the symbol suffix table because the provider did not supply them. Operational info — no action needed.",
+                    priority=AlertPriority.P5,
+                    estimated_time_minutes=5,
+                    automated=False,
+                )
+            )
         elif i in {"STALE_DATA"}:
             actions.append(
                 RemediationAction(
@@ -1192,35 +1314,80 @@ def _compute_quality_score(q: Dict[str, Any], config: AuditConfig) -> Tuple[floa
     return score, DataQuality.CRITICAL
 
 
+# v4.7.0: severity-tier sets used by _compute_severity. Hoisted to module
+# level so tests and summary builders can reference them.
+_SEVERITY_CRITICAL_TAGS: Set[str] = {
+    "PROVIDER_ERROR", "ZERO_PRICE", "HARD_STALE_DATA", "ZOMBIE_TICKER",
+}
+_SEVERITY_HIGH_TAGS: Set[str] = {
+    "UNIT_DRIFT_PERCENT_CHANGE",
+    "UNIT_DRIFT_UPSIDE",
+    "UNIT_DRIFT_DRAWDOWN",
+    "UNIT_DRIFT_VAR",
+    "PROVIDER_PERCENT_DROPPED",
+    "EMPTY_ROW",  # v4.7.0
+}
+_SEVERITY_MEDIUM_TAGS: Set[str] = {
+    "PROVIDER_PERCENT_CLAMPED",
+    # v4.7.0
+    "MARKET_CAP_CURRENCY_SUSPECT",
+    "REVENUE_CURRENCY_SUSPECT",
+    "QUOTE_PRICE_MISSING",
+}
+_SEVERITY_LOW_TAGS: Set[str] = {
+    "PROVIDER_PERCENT_RECOMPUTED",
+    "PROVIDER_VALUE_SANITIZED",  # v4.7.0
+}
+_SEVERITY_INFO_TAGS: Set[str] = {
+    # v4.7.0
+    "IDENTITY_CORRECTED_BY_ENGINE",
+    "IDENTITY_INFERRED_FROM_SUFFIX",
+}
+
+
 def _compute_severity(issues: List[str], quality: DataQuality) -> AuditSeverity:
     """
-    v4.6.0: severity buckets updated for the new issue tags.
-      HIGH:    + UNIT_DRIFT_*  + PROVIDER_PERCENT_DROPPED
-      MEDIUM:  + PROVIDER_PERCENT_CLAMPED
-      LOW:     + PROVIDER_PERCENT_RECOMPUTED (when alone)
+    v4.7.0: re-tiered to keep INFO/LOW tags from bubbling to MEDIUM by
+    default.
+
+      CRITICAL: PROVIDER_ERROR / ZERO_PRICE / HARD_STALE_DATA / ZOMBIE_TICKER
+      HIGH:     UNIT_DRIFT_* / PROVIDER_PERCENT_DROPPED / EMPTY_ROW
+                (or any non-empty issue when quality is POOR/CRITICAL)
+      MEDIUM:   PROVIDER_PERCENT_CLAMPED / MARKET_CAP_CURRENCY_SUSPECT /
+                REVENUE_CURRENCY_SUSPECT / QUOTE_PRICE_MISSING
+                (or any other non-info, non-low issue)
+      LOW:      PROVIDER_PERCENT_RECOMPUTED / PROVIDER_VALUE_SANITIZED
+                (when the row's issues are confined to LOW + INFO tags)
+      INFO:     IDENTITY_CORRECTED_BY_ENGINE / IDENTITY_INFERRED_FROM_SUFFIX
+                (when the row's issues are confined to INFO tags)
+      OK:       no issues
+
+    Exit-code semantics are preserved: INFO and LOW both yield exit 0.
     """
-    if any(i in {"PROVIDER_ERROR", "ZERO_PRICE", "HARD_STALE_DATA", "ZOMBIE_TICKER"} for i in issues):
+    issues_set = set(issues)
+
+    if issues_set & _SEVERITY_CRITICAL_TAGS:
         return AuditSeverity.CRITICAL
 
-    if any(i in {
-        "UNIT_DRIFT_PERCENT_CHANGE",
-        "UNIT_DRIFT_UPSIDE",
-        "UNIT_DRIFT_DRAWDOWN",
-        "UNIT_DRIFT_VAR",
-        "PROVIDER_PERCENT_DROPPED",
-    } for i in issues):
+    if issues_set & _SEVERITY_HIGH_TAGS:
         return AuditSeverity.HIGH
 
-    if issues and quality in {DataQuality.POOR, DataQuality.CRITICAL}:
+    if issues_set and quality in {DataQuality.POOR, DataQuality.CRITICAL}:
         return AuditSeverity.HIGH
 
-    if "PROVIDER_PERCENT_CLAMPED" in issues:
+    if issues_set & _SEVERITY_MEDIUM_TAGS:
         return AuditSeverity.MEDIUM
 
-    if issues == ["PROVIDER_PERCENT_RECOMPUTED"]:
+    # v4.7.0: classify pure-INFO and INFO+LOW issue sets distinctly.
+    # Order matters: check the stricter (INFO-only) subset before the
+    # looser (INFO|LOW) one.
+    if issues_set and issues_set <= _SEVERITY_INFO_TAGS:
+        return AuditSeverity.INFO
+
+    if issues_set and issues_set <= (_SEVERITY_INFO_TAGS | _SEVERITY_LOW_TAGS):
         return AuditSeverity.LOW
 
-    if issues:
+    if issues_set:
         return AuditSeverity.MEDIUM
 
     return AuditSeverity.OK
@@ -1553,10 +1720,11 @@ def _severity_rank(s: AuditSeverity) -> int:
 
 def _resolve_percent_contract_from_env_and_flag(flag_legacy: int) -> str:
     """
-    v4.6.0: contract resolution order:
+    Contract resolution order (introduced v4.6.0, preserved in v4.7.0):
       1. CLI flag --legacy-percent-units 1   -> "points"
       2. AUDIT_PERCENT_CONTRACT env var      -> "points" / "fraction"
-      3. Default                              -> "fraction" (v5.67.0+)
+      3. Default                              -> "fraction" (v5.67.0+,
+         still canonical in current engine v5.72.0)
     """
     if int(flag_legacy or 0) == 1:
         return PERCENT_CONTRACT_POINTS
