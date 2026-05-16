@@ -2,7 +2,7 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) -- v8.1.0
+Yahoo Chart Provider (Global + KSA History) -- v8.2.0
 ================================================================================
 
 Purpose
@@ -14,6 +14,69 @@ Provides financial market data from Yahoo Finance:
   - KSA symbol support (.SR suffix)
   - Risk statistics (volatility, drawdown, VaR, Sharpe, RSI)
   - Price forecasts using log-linear regression
+
+v8.2.0 Changes (from v8.1.0)
+----------------------------
+Provider-side identity alignment with `enriched_quote.py` v4.6.0
+`_SUFFIX_TO_LOCALE`. Goal: when Yahoo's `info` payload doesn't return
+`exchange` / `currency` / `country` (delayed feeds, ADRs, quirky listings),
+the provider populates them from the symbol's suffix instead of leaving
+them blank. The downstream normalization stage in `enriched_quote.py`
+then has nothing left to repair.
+
+Background: the May 2026 Global_Markets audit showed Kuwait/Qatar/UAE/
+South Africa/Egypt/Israel listings (MABANEE.KW, OOREDOO.KW, ANG.JSE,
+MTN.JSE, etc.) reaching the sheet tagged as NASDAQ / USD / USA because
+Yahoo's `info.exchange`, `info.currency`, and `info.country` were
+empty for those tickers. The engine's defensive correction in
+`enriched_quote.py` v4.6.0 catches this downstream, but plugging the
+hole at the source is cleaner and gives a single point of audit.
+
+New:
+  - `_infer_symbol_metadata_external`: optional binding to
+    `normalize.infer_symbol_metadata()` (the v5.3.0+ SSOT used by
+    `enriched_quote.py` v4.6.0). When the import succeeds, the provider
+    delegates to it for identity inference.
+  - `_SUFFIX_TO_LOCALE_DEFAULTS`: 64-entry mapping of Yahoo suffixes
+    to `(exchange, currency, country)` — byte-identical structure to
+    enriched_quote v4.6.0 `_SUFFIX_TO_LOCALE`. Used as fallback when
+    normalize.py SSOT is unavailable. Covers GCC (.KW, .QA, .AE, .DFM,
+    .ADX, .SR, .EG, .EGX), MENA (.TA, .TASE, .IS), Europe (.L, .LSE,
+    .DE, .PA, .AS, .MI, .MC, .BR, .LS, .HE, .ST, .OL, .SW, .CO, .IR,
+    .WA, .VI, .PR, .BD, .AT), Asia-Pacific (.HK, .NS, .NSE, .BO, .T,
+    .TYO, .KS, .KQ, .SI, .KL, .BK, .JK, .SS, .SZ, .TW, .TWO, .AX, .NZ),
+    Americas (.SA, .MX, .BA, .TO, .V, .CN, .NE, .SN, .LM), and Africa
+    (.JO, .JSE).
+  - `_identity_defaults_for_symbol(symbol)`: returns a dict with
+    `exchange`, `currency`, `country`, `asset_class` keys derived from
+    the symbol's suffix structure. Resolution order: special patterns
+    (=F, =X, ^) first; then SSOT delegation; then longest-match suffix
+    in `_SUFFIX_TO_LOCALE_DEFAULTS`; then plain-alpha-as-US-equity
+    convention; finally all None for unknown formats.
+
+Modified:
+  - `_infer_asset_class`: when Yahoo's `quoteType` is blank, falls
+    through to `_identity_defaults_for_symbol` so 60+ stock-exchange
+    suffixes return `EQUITY` (previously only `.SR` did).
+  - `_infer_exchange`: same fallthrough for exchange-display names.
+    MABANEE.KW now returns "Boursa Kuwait" instead of None.
+  - `_enrich_data`: identity block now adds a `country` field to the
+    patch shape (NEW — was absent in v8.1.0) and fills blank
+    `currency` / `exchange` / `country` from the suffix-derived defaults
+    when Yahoo's `info` left them empty. Yahoo's own values always win
+    when present.
+
+Bumped:
+  - `PROVIDER_VERSION = "8.2.0"`.
+
+NOT changed (deliberate):
+  - v8.1.0 FX-symbol fix (bare 6-letter pairs -> `=X`) preserved verbatim.
+  - v8.0.0 fixes (period/interval config, shared executor, real metadata)
+    preserved verbatim.
+  - Direct Yahoo Chart API fallback for futures (deferred to v8.3.0).
+  - Patch shape is additive only: existing fields keep their values,
+    `country` is added. Downstream consumers see one more key, never
+    a missing or renamed one.
 
 v8.1.0 Changes (from v8.0.0)
 ----------------------------
@@ -170,6 +233,35 @@ except ImportError:
     _HAS_OTEL = False
 
 # =============================================================================
+# v8.2.0: Optional Identity SSOT (normalize.py v5.3.0+)
+# =============================================================================
+#
+# The PRIMARY path for symbol -> (exchange, currency, country) inference
+# delegates to core/symbols/normalize.py::infer_symbol_metadata() -- the
+# same SSOT used by enriched_quote.py v4.6.0. When that import fails
+# (running against an older normalize.py, or no core package on path),
+# we fall through to the local _SUFFIX_TO_LOCALE_DEFAULTS table further
+# down in this module.
+
+_infer_symbol_metadata_external: Optional[Callable[[str], Dict[str, Any]]] = None
+for _norm_path in (
+    "core.symbols.normalize",
+    "core.normalize",
+    "symbols.normalize",
+    "normalize",
+):
+    try:
+        _norm_mod_v82 = __import__(_norm_path, fromlist=["infer_symbol_metadata"])
+        _fn_v82 = getattr(_norm_mod_v82, "infer_symbol_metadata", None)
+        if callable(_fn_v82):
+            _infer_symbol_metadata_external = _fn_v82
+            break
+    except ImportError:
+        continue
+    except Exception:
+        continue
+
+# =============================================================================
 # Logging
 # =============================================================================
 
@@ -181,7 +273,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.1.0"
+PROVIDER_VERSION = "8.2.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -192,7 +284,7 @@ _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
 
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
 _FX_PAIR_RE = re.compile(r"^([A-Z]{6})=X$")
-_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_ARABIC_DIGITS = str.maketrans("\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669", "0123456789")
 _K_M_B_T_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMBT])$", re.IGNORECASE)
 _K_M_B_T_MULT = {"K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0, "T": 1_000_000_000_000.0}
 
@@ -465,12 +557,12 @@ def _safe_float(value: Any) -> Optional[float]:
             return None if (math.isnan(f) or math.isinf(f)) else f
 
         s = str(value).strip()
-        if not s or s.lower() in {"-", "—", "n/a", "na", "null", "none", "nan"}:
+        if not s or s.lower() in {"-", "\u2014", "n/a", "na", "null", "none", "nan"}:
             return None
 
         s = s.translate(_ARABIC_DIGITS)
         s = s.replace(",", "").replace("%", "").replace("+", "")
-        s = s.replace("$", "").replace("£", "").replace("€", "")
+        s = s.replace("$", "").replace("\u00a3", "").replace("\u20ac", "")
         s = s.replace("SAR", "").replace("USD", "").replace("EUR", "").strip()
 
         if s.startswith("(") and s.endswith(")"):
@@ -986,6 +1078,184 @@ def _simple_forecast(
 
 
 # =============================================================================
+# v8.2.0: Identity Defaults Table (suffix -> exchange/currency/country)
+# =============================================================================
+#
+# Byte-aligned with enriched_quote.py v4.6.0 _SUFFIX_TO_LOCALE. Used as
+# fallback when the normalize.py SSOT (`_infer_symbol_metadata_external`)
+# is unavailable. Adding a new suffix here AND in enriched_quote.py keeps
+# the two layers in sync; preferring the SSOT route avoids the need.
+
+_SUFFIX_TO_LOCALE_DEFAULTS: Dict[str, Tuple[str, str, str]] = {
+    # Hong Kong
+    ".HK":    ("HKEX",                    "HKD", "Hong Kong"),
+    # United Kingdom
+    ".L":     ("LSE",                     "GBp", "United Kingdom"),
+    ".LON":   ("LSE",                     "GBp", "United Kingdom"),
+    ".LSE":   ("LSE",                     "GBp", "United Kingdom"),
+    # Denmark
+    ".CO":    ("Copenhagen",              "DKK", "Denmark"),
+    # India
+    ".NS":    ("NSE",                     "INR", "India"),
+    ".NSE":   ("NSE",                     "INR", "India"),
+    ".BO":    ("BSE",                     "INR", "India"),
+    # Brazil
+    ".SA":    ("B3",                      "BRL", "Brazil"),
+    # Saudi Arabia
+    ".SR":    ("Tadawul",                 "SAR", "Saudi Arabia"),
+    # Canada
+    ".TO":    ("TSX",                     "CAD", "Canada"),
+    ".V":     ("TSX Venture",             "CAD", "Canada"),
+    ".CN":    ("CSE",                     "CAD", "Canada"),
+    ".NE":    ("NEO Exchange",            "CAD", "Canada"),
+    # Germany
+    ".XETRA": ("XETRA",                   "EUR", "Germany"),
+    ".DE":    ("XETRA",                   "EUR", "Germany"),
+    ".F":     ("Frankfurt",               "EUR", "Germany"),
+    ".HM":    ("Hamburg",                 "EUR", "Germany"),
+    ".MU":    ("Munich",                  "EUR", "Germany"),
+    # France / Benelux / Iberia / Italy
+    ".PA":    ("Euronext Paris",          "EUR", "France"),
+    ".AS":    ("Euronext Amsterdam",      "EUR", "Netherlands"),
+    ".MI":    ("Borsa Italiana",          "EUR", "Italy"),
+    ".MC":    ("BME",                     "EUR", "Spain"),
+    ".BR":    ("Euronext Brussels",       "EUR", "Belgium"),
+    ".LS":    ("Euronext Lisbon",         "EUR", "Portugal"),
+    ".HE":    ("Helsinki",                "EUR", "Finland"),
+    ".IR":    ("Euronext Dublin",         "EUR", "Ireland"),
+    # Scandinavia / Switzerland
+    ".ST":    ("Stockholm",               "SEK", "Sweden"),
+    ".OL":    ("Oslo",                    "NOK", "Norway"),
+    ".SW":    ("SIX",                     "CHF", "Switzerland"),
+    # Oceania
+    ".AX":    ("ASX",                     "AUD", "Australia"),
+    ".NZ":    ("NZX",                     "NZD", "New Zealand"),
+    # Japan / Korea / SE Asia
+    ".T":     ("TSE",                     "JPY", "Japan"),
+    ".TYO":   ("TSE",                     "JPY", "Japan"),
+    ".KS":    ("KRX",                     "KRW", "South Korea"),
+    ".KQ":    ("KOSDAQ",                  "KRW", "South Korea"),
+    ".SI":    ("SGX",                     "SGD", "Singapore"),
+    ".KL":    ("Bursa Malaysia",          "MYR", "Malaysia"),
+    ".BK":    ("SET",                     "THB", "Thailand"),
+    ".JK":    ("IDX",                     "IDR", "Indonesia"),
+    # Greater China / Taiwan
+    ".SS":    ("Shanghai",                "CNY", "China"),
+    ".SZ":    ("Shenzhen",                "CNY", "China"),
+    ".TW":    ("TWSE",                    "TWD", "Taiwan"),
+    ".TWO":   ("TPEx",                    "TWD", "Taiwan"),
+    # Latin America / Africa
+    ".MX":    ("BMV",                     "MXN", "Mexico"),
+    ".BA":    ("BCBA",                    "ARS", "Argentina"),
+    ".JO":    ("JSE",                     "ZAR", "South Africa"),
+    ".JSE":   ("JSE",                     "ZAR", "South Africa"),
+    # GCC (Kuwait / Qatar / UAE)
+    ".KW":    ("Boursa Kuwait",           "KWD", "Kuwait"),
+    ".KSE":   ("Boursa Kuwait",           "KWD", "Kuwait"),
+    ".QA":    ("QSE",                     "QAR", "Qatar"),
+    ".QE":    ("QSE",                     "QAR", "Qatar"),
+    ".AE":    ("DFM/ADX",                 "AED", "United Arab Emirates"),
+    ".DFM":   ("DFM",                     "AED", "United Arab Emirates"),
+    ".ADX":   ("ADX",                     "AED", "United Arab Emirates"),
+    # MENA other
+    ".EG":    ("EGX",                     "EGP", "Egypt"),
+    ".EGX":   ("EGX",                     "EGP", "Egypt"),
+    ".TA":    ("TASE",                    "ILS", "Israel"),
+    ".TASE":  ("TASE",                    "ILS", "Israel"),
+    # Emerging Europe (v4.6.0 expansion)
+    ".IS":    ("BIST",                    "TRY", "Turkey"),
+    ".WA":    ("GPW",                     "PLN", "Poland"),
+    ".VI":    ("Wien",                    "EUR", "Austria"),
+    ".PR":    ("PSE",                     "CZK", "Czech Republic"),
+    ".BD":    ("BUX",                     "HUF", "Hungary"),
+    ".AT":    ("ATHEX",                   "EUR", "Greece"),
+    # Latin America (v4.6.0 expansion)
+    ".SN":    ("Santiago",                "CLP", "Chile"),
+    ".LM":    ("Lima",                    "PEN", "Peru"),
+    # US sentinel (some upstream feeds attach .US to ADRs)
+    ".US":    ("NASDAQ/NYSE",             "USD", "USA"),
+}
+
+
+def _identity_defaults_for_symbol(symbol: str) -> Dict[str, Optional[str]]:
+    """
+    Return identity defaults (exchange / currency / country / asset_class)
+    derived purely from the symbol's structure (v8.2.0).
+
+    Resolution order (first match wins):
+      1. Empty / None             -> all None
+      2. ``...=F`` futures        -> NYMEX / USD / USA / FUTURE
+      3. ``...=X`` FX pairs       -> CCY / None / None / FX
+      4. ``^...`` indices         -> INDEX / None / None / INDEX
+      5. SSOT (normalize.py)      -> whatever it returns (when available)
+      6. Longest-match suffix in  -> (exchange, currency, country) / EQUITY
+         ``_SUFFIX_TO_LOCALE_DEFAULTS``
+      7. Plain alpha, no dot      -> NASDAQ/NYSE / USD / USA / EQUITY
+      8. Unknown                  -> all None (don't guess)
+
+    Used by ``_infer_asset_class`` / ``_infer_exchange`` / ``_enrich_data``
+    when Yahoo's ``info`` payload doesn't supply the relevant field.
+    """
+    if not symbol:
+        return {"exchange": None, "currency": None, "country": None, "asset_class": None}
+
+    s = symbol.strip().upper()
+
+    # Special patterns (these don't appear in _SUFFIX_TO_LOCALE_DEFAULTS)
+    if s.endswith("=F"):
+        return {"exchange": "NYMEX", "currency": "USD", "country": "USA", "asset_class": "FUTURE"}
+    if s.endswith("=X"):
+        return {"exchange": "CCY", "currency": None, "country": None, "asset_class": "FX"}
+    if s.startswith("^"):
+        return {"exchange": "INDEX", "currency": None, "country": None, "asset_class": "INDEX"}
+
+    # SSOT path (normalize.py v5.3.0+) when available
+    if _infer_symbol_metadata_external is not None:
+        try:
+            meta = _infer_symbol_metadata_external(s)
+            if isinstance(meta, dict):
+                inferred_from = meta.get("inferred_from")
+                if inferred_from not in (None, "", "none"):
+                    return {
+                        "exchange": meta.get("exchange"),
+                        "currency": meta.get("currency"),
+                        "country": meta.get("country"),
+                        "asset_class": meta.get("asset_class") or "EQUITY",
+                    }
+        except Exception:
+            pass
+
+    # Local table fallback: longest matching suffix wins
+    best_suffix: Optional[str] = None
+    for suf in _SUFFIX_TO_LOCALE_DEFAULTS:
+        if s.endswith(suf):
+            if best_suffix is None or len(suf) > len(best_suffix):
+                best_suffix = suf
+    if best_suffix is not None:
+        exch, curr, country = _SUFFIX_TO_LOCALE_DEFAULTS[best_suffix]
+        return {
+            "exchange": exch,
+            "currency": curr,
+            "country": country,
+            "asset_class": "EQUITY",
+        }
+
+    # Plain alpha with no dot -> US equity by Yahoo convention
+    # (futures/FX/indices already handled above; any remaining no-dot
+    # symbol is a US ticker like AAPL, BRK-A, GOOG, etc.)
+    if "." not in s:
+        return {
+            "exchange": "NASDAQ/NYSE",
+            "currency": "USD",
+            "country": "USA",
+            "asset_class": "EQUITY",
+        }
+
+    # Unknown suffix -> don't guess
+    return {"exchange": None, "currency": None, "country": None, "asset_class": None}
+
+
+# =============================================================================
 # Yahoo Finance Sync Fetcher (runs in ThreadPool)
 # =============================================================================
 
@@ -1021,7 +1291,15 @@ def _safe_history_metadata(ticker: Any) -> Dict[str, Any]:
 
 
 def _infer_asset_class(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Infer asset class from symbol + info + metadata."""
+    """
+    Infer asset class from symbol + info + metadata.
+
+    Priority order (v8.2.0):
+      1. Yahoo `info.quoteType` (or `meta.instrumentType`) when present.
+      2. v8.2.0: fall through to `_identity_defaults_for_symbol` which
+         covers 60+ stock-exchange suffixes (all return "EQUITY") plus
+         the futures / FX / index special patterns.
+    """
     quote_type = None
     if isinstance(info, dict):
         quote_type = _safe_str(info.get("quoteType") or info.get("quote_type") or info.get("type"))
@@ -1036,20 +1314,23 @@ def _infer_asset_class(symbol: str, info: Any = None, meta: Optional[Dict[str, A
             return qt_upper
         return qt_upper
 
-    s = symbol.upper()
-    if s.endswith(".SR"):
-        return "EQUITY"
-    if s.endswith("=F"):
-        return "FUTURE"
-    if s.endswith("=X"):
-        return "FX"
-    if s.startswith("^"):
-        return "INDEX"
-    return None
+    # v8.2.0: suffix-table fallthrough (replaces v8.1.0's hand-coded
+    # .SR / =F / =X / ^ checks; same patterns + 60 more)
+    defaults = _identity_defaults_for_symbol(symbol)
+    return defaults.get("asset_class")
 
 
 def _infer_exchange(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Infer exchange from symbol + info + metadata."""
+    """
+    Infer exchange from symbol + info + metadata.
+
+    Priority order (v8.2.0):
+      1. Yahoo `info.exchange` / `info.fullExchangeName` / `info.exchangeName`.
+      2. Yahoo `meta.exchangeName` / `meta.exchangeTimezoneName`.
+      3. v8.2.0: fall through to `_identity_defaults_for_symbol` which
+         resolves 60+ stock-exchange suffixes to display names
+         (e.g. .KW -> "Boursa Kuwait", .NS -> "NSE", .HK -> "HKEX").
+    """
     if isinstance(info, dict):
         exchange = _first_str(
             info.get("exchange"), info.get("fullExchangeName"), info.get("exchangeName"),
@@ -1061,16 +1342,10 @@ def _infer_exchange(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]
         if exchange:
             return exchange
 
-    s = symbol.upper()
-    if s.endswith(".SR"):
-        return "Tadawul"
-    if s.endswith("=F"):
-        return "NYMEX"
-    if s.endswith("=X"):
-        return "CCY"
-    if s.startswith("^"):
-        return "INDEX"
-    return None
+    # v8.2.0: suffix-table fallthrough (replaces v8.1.0's hand-coded
+    # .SR / =F / =X / ^ checks)
+    defaults = _identity_defaults_for_symbol(symbol)
+    return defaults.get("exchange")
 
 
 def _fetch_ticker_sync(
@@ -1226,12 +1501,29 @@ def _enrich_data(
     pb_ratio = _first_number(info.get("priceToBook"))
     eps_ttm = _first_number(info.get("trailingEps"))
 
-    # 8. Identity (v8.0.0: `meta` is now the REAL ticker metadata, not an
-    # empty placeholder -- so asset class / exchange inference actually
-    # benefits from yfinance's history_metadata field.)
+    # 8. Identity (v8.2.0: when Yahoo doesn't return exchange / currency /
+    #    country, fall through to suffix-derived defaults so the downstream
+    #    `enriched_quote.py` v4.6.0 normalization stage has nothing left to
+    #    repair. Yahoo's values always win when present.)
+    #    v8.0.0: `meta` is now the REAL ticker metadata, not an empty
+    #    placeholder -- so asset class / exchange inference actually
+    #    benefits from yfinance's history_metadata field.
     asset_class = _infer_asset_class(symbol, info, meta)
     exchange = _infer_exchange(symbol, info, meta)
+
+    # Currency: prefer Yahoo's explicit field, fall back to suffix table
     currency = _first_str(info.get("currency"), info.get("financialCurrency"))
+
+    # Country: NEW in v8.2.0 (was absent from the v8.1.0 patch shape).
+    # Prefer Yahoo's `country` field, fall back to suffix table.
+    country = _first_str(info.get("country"))
+
+    # Single lookup, used for any field Yahoo left blank
+    _identity_defaults = _identity_defaults_for_symbol(symbol)
+    if currency is None and _identity_defaults.get("currency"):
+        currency = _identity_defaults["currency"]
+    if country is None and _identity_defaults.get("country"):
+        country = _identity_defaults["country"]
 
     # v8.0.0 minor: compute open_price once instead of twice
     open_price = _first_number(info.get("open"), info.get("regularMarketOpen"))
@@ -1295,6 +1587,7 @@ def _enrich_data(
         "forecast_confidence": forecast_confidence,
         # Identity
         "currency": currency,
+        "country": country,
         "asset_class": asset_class,
         "exchange": exchange,
     }
