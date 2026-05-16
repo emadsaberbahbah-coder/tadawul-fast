@@ -2,134 +2,66 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization -- v7.2.0 (PROVIDER-SYMBOL-CORRECT / COUNTRY-AWARE)
+Symbol Normalization — v5.3.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
 
-v7.2.0 Changes (from v7.1.0)
-----------------------------
-CRITICAL (audit fix -- provider symbol formatting; the root cause of the
-non-US data corruption seen in Market_Leaders / Global_Markets):
-  - `to_yahoo_symbol` now translates the (possibly aliased) exchange suffix
-    to the EXACT suffix Yahoo Finance expects, via the new
-    `_YAHOO_SUFFIX_MAP` table. Previously any non-US suffix was passed
-    through unchanged, so internal / EODHD-style suffixes that Yahoo does
-    NOT recognise (`.LSE`, `.LN`, `.NSE`, `.JSE`, `.ZA`, `.HKG`, `.TYO`,
-    `.KOSDAQ`, `.NYSE`, `.OQ`, `.N`, ...) were sent to Yahoo verbatim.
-    Yahoo rejected them, enrichment fell through, and the data engine
-    stamped those rows with US identity defaults -- `III.LSE`, `ANTO.LSE`,
-    `RR.LSE`, `HDFCLIFE.NSE`, `FSR.JSE` were all mis-tagged USA / USD,
-    which in turn inflated market caps ~100x (GBp priced as USD).
-    Now: `.LSE`/`.L`/`.LN` -> `.L`, `.NSE`/`.NS` -> `.NS`,
-    `.JSE`/`.ZA` -> `.JO`, `.TYO`/`.T` -> `.T`, `.HKG`/`.HK` -> `.HK`,
-    `.NYSE`/`.OQ`/`.N`/`.NM`/`.NG` -> `` (US, no suffix), etc.
-  - `to_yahoo_symbol` now converts share-class DOT tickers back to Yahoo's
-    DASH form: canonical `BRK.B` / `BRK.B.US` -> `BRK-B`. `normalize_symbol`
-    canonicalizes to the dot form, but Yahoo only accepts the dash form;
-    previously only the variant generator knew this, the primary formatter
-    returned the (rejected) dot form.
+Key upgrades in v5.3.0 (root-cause fixes for sheet data corruption)
+- ✅ Complete CURRENCY_BY_COUNTRY map — KW->KWD, KR->KRW, TW->TWD, HK->HKD, IN->INR,
+    ZA->ZAR, BR->BRL, AU->AUD, CA->CAD, CH->CHF, SE->SEK, MX->MXN, etc.
+    Fixes the bug where MABANEE.KW / OOREDOO.KW were getting currency=USD because
+    get_currency_from_symbol() returned None and the consumer defaulted to USD.
+- ✅ New EXCHANGE_DISPLAY_NAMES map — KW->"Boursa Kuwait", KR->"KRX", JSE->"JSE",
+    LSE->"LSE", etc. Fixes the bug where non-US listings showed "NASDAQ/NYSE".
+- ✅ New COUNTRY_DISPLAY_NAMES map — KW->"Kuwait", KR->"South Korea", etc.
+- ✅ New get_exchange_display(symbol)         — full exchange name for the sheet.
+- ✅ New get_country_from_symbol(symbol)      — full country name for the sheet.
+- ✅ New is_us_ticker_heuristic(symbol)       — opt-in US heuristic (low-confidence).
+- ✅ New infer_symbol_metadata(symbol)        — single composite call returning
+    {symbol_normalized, exchange, exchange_code, currency, country, country_code,
+     market_type, asset_class, mic, inferred_from}. This is the SINGLE SOURCE OF
+    TRUTH consumers should call once; never re-derive these fields independently.
+- ✅ Conservative defaults — when suffix is unknown AND symbol is not a clean
+    US-looking ticker, all metadata fields return None (consumer must rely on
+    provider data instead of defaulting to USD/NASDAQ).
 
-HIGH (audit fix -- provider symbol formatting):
-  - `to_eodhd_symbol` now translates aliased suffixes to EODHD exchange
-    codes via `_EODHD_SUFFIX_MAP`, instead of echoing whatever suffix the
-    caller happened to pass. Yahoo-style short suffixes that EODHD rejects
-    are now mapped (e.g. `.L` -> `.LSE`, `.NYSE`/`.N`/`.OQ` -> `.US`,
-    `.TYO` -> `.TSE`). Inputs that already used EODHD-style suffixes are
-    unaffected. Unknown / uncertain suffixes fall back to the raw suffix,
-    so an unverified market degrades to pre-7.2.0 behaviour rather than
-    breaking.
-  - `to_finnhub_symbol` now strips ALL US exchange aliases (`.NYSE`, `.N`,
-    `.OQ`, `.NM`, `.NG`), not just the literal `.US`.
+Preserved from v5.2.0
+- All existing public APIs and exports
+- Share-class handling (BRK.B), EODHD formatting, Yahoo formatting
+- Unicode/Arabic digit cleaning
+- KSA Tadawul canonicalization (####.SR)
+- Provider-aware normalization (yahoo/finnhub/eodhd/google/tradingview)
 
-NEW:
-  - `.XETRA` / `.ETR` recognised as Deutsche Borse XETRA (-> DE). Live
-    symbol universes use `.XETRA`; previously it matched no exchange
-    suffix and fell through every country / currency / MIC / provider
-    resolution path.
-  - `_YAHOO_SUFFIX_MAP` -- raw-suffix -> Yahoo-suffix translation table,
-    total over `_EXCHANGE_SUFFIXES`.
-  - `_EODHD_SUFFIX_MAP` -- raw-suffix -> EODHD-exchange-code table
-    (best-effort; see operator note).
-  - `_share_class_dot_to_dash` -- internal helper, dot share class -> dash.
-
-Preserved:
-  - All v7.1.0 country/currency work (`get_country_from_symbol`,
-    `_COUNTRY_BY_EXCHANGE`, `_CURRENCY_BY_EXCHANGE`, `_INDEX_COUNTRY`,
-    share-class `get_primary_exchange` heuristic).
-  - All v7.0.0 fixes (ETH-USD crypto vs FX, EUR-USD canonicalization,
-    SPX.INDX -> ^GSPC, NASDAQ key removed from _INDEX_COMMON, dead code
-    cleanup, _MARKET_BY_CODE precompute).
-  - Complete `__all__` surface (no public API removed; none added).
-  - All regex patterns (public and internal), all mapping tables, all
-    `lru_cache` sizes, `SymbolNormalizationConfig` shape, all env var
-    names, every provider formatter and variant generator.
-  - KSA canonicalization (`####.SR`), TADAWUL: prefix handling, .SA/.SAU
-    stripping, share-class conversion (BRK-B <-> BRK.B).
-  - Exchange suffix table, MIC codes, default_exchange env handling.
-
-Operator note (integration):
-  - data_engine_v2 must (a) replace `_infer_country_from_symbol` with
-    `get_country_from_symbol` (per the v7.1.0 note) AND (b) route ALL
-    provider fetches through `to_yahoo_symbol` / `to_eodhd_symbol` /
-    `normalize_symbol_for_provider`. The suffix-translation fix only
-    takes effect if the formatters are actually on the request path;
-    if the data engine hand-builds provider symbols anywhere, that path
-    must be removed.
-  - EODHD exchange codes for a few markets (Japan=TSE, China=SHG/SHE,
-    Korea=KO/KQ, Singapore=SG, Switzerland=SW) follow EODHD's documented
-    conventions but should be spot-checked against your EODHD
-    `/exchanges-list` if you trade those venues. Anything not explicitly
-    in `_EODHD_SUFFIX_MAP` falls back to the raw suffix.
-================================================================================
+Performance
+- Pure Python + regex + lru_cache (microsecond latency)
+- Optional orjson for fast JSON env parsing
 """
 
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from functools import lru_cache
-from typing import (
-    Any,
-    Dict,
-    List,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-)
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 # ---------------------------------------------------------------------------
-# High-Performance JSON Support
+# High-Performance JSON fallback
 # ---------------------------------------------------------------------------
-
 try:
     import orjson  # type: ignore
 
-    def _json_loads(data: Union[str, bytes]) -> Any:
-        if isinstance(data, str):
-            data = data.encode("utf-8")
+    def json_loads(data: Union[str, bytes]) -> Any:
         return orjson.loads(data)
-
-    _HAS_ORJSON = True
-except ImportError:
+except Exception:
     import json  # type: ignore
 
-    def _json_loads(data: Union[str, bytes]) -> Any:
-        if isinstance(data, bytes):
-            data = data.decode("utf-8", errors="replace")
+    def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-    _HAS_ORJSON = False
-
-# ---------------------------------------------------------------------------
-# Version and Exports
-# ---------------------------------------------------------------------------
-
-__version__ = "7.2.0"
+__version__ = "5.3.0"
 
 __all__ = [
     # Core enums
@@ -158,6 +90,7 @@ __all__ = [
     "is_cusip",
     "is_sedol",
     "is_option",
+    "is_us_ticker_heuristic",
     # Options helpers
     "parse_occ_option",
     # Provider formatting
@@ -181,10 +114,20 @@ __all__ = [
     "standardize_share_class",
     "get_primary_exchange",
     "get_currency_from_symbol",
-    "get_country_from_symbol",   # v7.1.0
+    "get_exchange_display",
+    "get_country_from_symbol",
     "get_mic_code",
-    # Provider-aware normalization
+    # Composite metadata (v5.3.0)
+    "infer_symbol_metadata",
+    # Provider-aware normalization (optional)
     "normalize_symbol_for_provider",
+    # Maps (exposed for downstream consumers / audit tools)
+    "CURRENCY_BY_COUNTRY",
+    "EXCHANGE_DISPLAY_NAMES",
+    "COUNTRY_DISPLAY_NAMES",
+    "EXCHANGE_SUFFIXES",
+    "MIC_MAPPINGS",
+    # Version
     "__version__",
 ]
 
@@ -193,7 +136,7 @@ __all__ = [
 # =============================================================================
 
 
-class MarketType(str, Enum):
+class MarketType(Enum):
     """Primary market classification."""
     KSA = "ksa"
     US = "us"
@@ -215,7 +158,7 @@ class MarketType(str, Enum):
     SPECIAL = "special"
 
 
-class AssetClass(str, Enum):
+class AssetClass(Enum):
     """Asset class classification."""
     EQUITY = "equity"
     ETF = "etf"
@@ -234,7 +177,7 @@ class AssetClass(str, Enum):
     UNKNOWN = "unknown"
 
 
-class SymbolQuality(str, Enum):
+class SymbolQuality(Enum):
     """Symbol validation quality."""
     EXCELLENT = "excellent"
     GOOD = "good"
@@ -244,66 +187,53 @@ class SymbolQuality(str, Enum):
 
 
 # =============================================================================
-# Configuration
+# Env helpers (single source of truth)
 # =============================================================================
 
-@dataclass(frozen=True)
-class SymbolNormalizationConfig:
-    """Configuration for symbol normalization."""
-    default_exchange: str = "US"
-    default_equity_exchange_suffix: str = ""
-    strip_prefixes: Tuple[str, ...] = ()
-    strip_suffixes: Tuple[str, ...] = ()
-    exchange_map: Dict[str, str] = field(default_factory=dict)
-    index_map: Dict[str, str] = field(default_factory=dict)
-    fx_map: Dict[str, str] = field(default_factory=dict)
-    commodity_map: Dict[str, str] = field(default_factory=dict)
-    crypto_map: Dict[str, str] = field(default_factory=dict)
-
-    @classmethod
-    def from_env(cls) -> "SymbolNormalizationConfig":
-        """Load configuration from environment variables."""
-        def _env_str(name: str, default: str = "") -> str:
-            v = os.getenv(name)
-            return default if v is None else str(v).strip()
-
-        def _env_list(name: str) -> Tuple[str, ...]:
-            raw = _env_str(name, "")
-            if not raw:
-                return tuple()
-            return tuple(p.strip() for p in raw.split(",") if p.strip())
-
-        def _env_dict(name: str) -> Dict[str, str]:
-            raw = _env_str(name, "")
-            if not raw:
-                return {}
-            try:
-                data = _json_loads(raw)
-                if isinstance(data, dict):
-                    return {str(k).upper(): str(v) for k, v in data.items()}
-            except Exception:
-                pass
-            return {}
-
-        return cls(
-            default_exchange=_env_str("EODHD_DEFAULT_EXCHANGE", "US").upper(),
-            default_equity_exchange_suffix=_env_str(
-                "NORMALIZE_DEFAULT_EQUITY_EXCHANGE_SUFFIX", "",
-            ).upper(),
-            strip_prefixes=_env_list("NORMALIZE_STRIP_PREFIXES"),
-            strip_suffixes=_env_list("NORMALIZE_STRIP_SUFFIXES"),
-            exchange_map=_env_dict("SYMBOL_EXCHANGE_MAP_JSON"),
-            index_map=_env_dict("SYMBOL_INDEX_MAP_JSON"),
-            fx_map=_env_dict("SYMBOL_FX_MAP_JSON"),
-            commodity_map=_env_dict("SYMBOL_COMMODITY_MAP_JSON"),
-            crypto_map=_env_dict("SYMBOL_CRYPTO_MAP_JSON"),
-        )
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 
 
-_CONFIG = SymbolNormalizationConfig.from_env()
+def _env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v).strip()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _env_str(name, "")
+    if raw == "":
+        return bool(default)
+    s = raw.strip().lower()
+    if s in _TRUTHY:
+        return True
+    if s in _FALSY:
+        return False
+    return bool(default)
+
+
+def _env_list(name: str) -> Tuple[str, ...]:
+    raw = _env_str(name, "")
+    if not raw:
+        return tuple()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return tuple(parts)
+
+
+def _env_dict(name: str) -> Dict[str, str]:
+    raw = _env_str(name, "")
+    if not raw:
+        return {}
+    try:
+        data = json_loads(raw)
+        if isinstance(data, dict):
+            return {str(k).upper(): str(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
 
 # =============================================================================
-# Unicode and Digit Normalization
+# Unicode + Digit Normalization
 # =============================================================================
 
 _ARABIC_INDIC = "٠١٢٣٤٥٦٧٨٩"
@@ -334,9 +264,8 @@ _SLASH_RE = re.compile(f"[{_SLASH_CHARS}]")
 
 _SPACE_RE = re.compile(r"\s+")
 
-
 # =============================================================================
-# Pattern Definitions (Compiled)
+# Pattern Definitions
 # =============================================================================
 
 # KSA Tadawul patterns
@@ -355,47 +284,65 @@ OCC_OPTION_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$", re.IGNORECASE)
 # Index patterns
 INDEX_CARET_RE = re.compile(r"^\^[A-Z0-9]+$", re.IGNORECASE)
 INDEX_SUFFIX_RE = re.compile(r"^([A-Z0-9]+)\.INDX$", re.IGNORECASE)
+INDEX_COMMON: Dict[str, str] = {
+    "SPX": "^GSPC", "SP500": "^GSPC", "DJI": "^DJI", "DOW": "^DJI", "NDX": "^NDX",
+    "NASDAQ": "^IXIC", "RUT": "^RUT", "FTSE": "^FTSE", "DAX": "^GDAXI", "CAC": "^FCHI",
+    "NIKKEI": "^N225", "N225": "^N225", "HSI": "^HSI", "SSEC": "^SSEC", "TASI": "^TASI",
+    "NOMU": "^NOMU", "VIX": "^VIX",
+}
 
 # Forex patterns
-FX_EQUAL_RE = re.compile(r"^([A-Z]{3,6})=X$", re.IGNORECASE)
+FX_EQUAL_RE = re.compile(r"^([A-Z]{3,6})=[X]$", re.IGNORECASE)
 FX_SLASH_RE = re.compile(r"^([A-Z]{3})/([A-Z]{3})$", re.IGNORECASE)
 FX_DASH_RE = re.compile(r"^([A-Z]{3})-([A-Z]{3})$", re.IGNORECASE)
 FX_SUFFIX_RE = re.compile(r"^([A-Z]{3,6})\.FOREX$", re.IGNORECASE)
+FX_COMMON_PAIRS: Set[str] = {
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
+    "EURGBP", "EURJPY", "GBPJPY", "CHFJPY", "EURCHF", "GBPCHF", "AUDJPY",
+}
 
 # Commodity futures patterns
-FUTURE_EQUAL_RE = re.compile(r"^([A-Z0-9]{1,6})=F$", re.IGNORECASE)
+FUTURE_EQUAL_RE = re.compile(r"^([A-Z0-9]{1,6})=[F]$", re.IGNORECASE)
 FUTURE_SUFFIX_RE = re.compile(r"^([A-Z0-9]{1,6})\.(COMM|COM|FUT)$", re.IGNORECASE)
+COMMODITY_CODES: Dict[str, str] = {
+    "GC": "gold", "SI": "silver", "PL": "platinum", "PA": "palladium",
+    "CL": "wti_crude", "BZ": "brent_crude", "NG": "natural_gas", "HO": "heating_oil",
+    "RB": "gasoline", "ZC": "corn", "ZW": "wheat", "ZS": "soybeans",
+    "ZM": "soybean_meal", "ZL": "soybean_oil", "ZR": "rough_rice", "ZO": "oats",
+    "KE": "kc_wheat", "MW": "spring_wheat", "CC": "cocoa", "KC": "coffee",
+    "CT": "cotton", "OJ": "orange_juice", "SB": "sugar", "LB": "lumber",
+    "HG": "copper", "ALI": "aluminium", "NICKEL": "nickel", "ZINC": "zinc",
+    "LEAD": "lead", "TIN": "tin",
+}
 
 # Crypto patterns
 CRYPTO_DASH_RE = re.compile(r"^([A-Z0-9]{2,15})-([A-Z]{2,10})$", re.IGNORECASE)
 CRYPTO_SUFFIX_RE = re.compile(r"^([A-Z0-9]{2,15})\.(CRYPTO|CC|C)$", re.IGNORECASE)
+CRYPTO_COMMON: Dict[str, str] = {
+    "BTC": "bitcoin", "ETH": "ethereum", "XRP": "ripple", "LTC": "litecoin",
+    "BCH": "bitcoin_cash", "ADA": "cardano", "DOT": "polkadot", "LINK": "chainlink",
+    "BNB": "binance", "XLM": "stellar", "DOGE": "dogecoin", "UNI": "uniswap",
+    "SOL": "solana", "MATIC": "polygon", "AVAX": "avalanche", "ATOM": "cosmos",
+    "ALGO": "algorand", "VET": "vechain", "FIL": "filecoin", "TRX": "tron",
+    "USDT": "tether", "USDC": "usd_coin", "SHIB": "shiba_inu", "LUNA": "terra",
+}
 
 # ETF patterns
 ETF_SUFFIX_RE = re.compile(r"^([A-Z0-9]+)\.(ETF|ET)$", re.IGNORECASE)
+ETF_COMMON_PREFIX: Set[str] = {"SPY", "QQQ", "IVV", "VTI", "VOO", "BND", "EFA", "IWM", "AGG", "GLD", "SLV"}
 
-# Share class patterns
-CLASS_DASH_RE = re.compile(r"^([A-Z]+)-([A-Z])$", re.IGNORECASE)
-CLASS_DOT_RE = re.compile(r"^([A-Z]+)\.([A-Z])$", re.IGNORECASE)
-
-# Allowed characters
-ALLOWED_CHARS_RE = re.compile(r"^[A-Z0-9\.\-\^=\/\@\#]+$", re.IGNORECASE)
-
-
-# =============================================================================
-# Known Mappings
-# =============================================================================
-
-# Exchange suffixes mapping (keys must be UPPER and include leading dot)
-_EXCHANGE_SUFFIXES: Dict[str, str] = {
+# Exchange suffixes mapping (NOTE: keys must be UPPER and include leading dot)
+# Value is the country/market code; pairs to CURRENCY_BY_COUNTRY etc. below.
+EXCHANGE_SUFFIXES: Dict[str, str] = {
     # Americas
     ".US": "US", ".NYSE": "US", ".N": "US", ".NASDAQ": "US", ".OQ": "US", ".NM": "US", ".NG": "US",
     ".TO": "CA", ".V": "CA", ".CNQ": "CA",
     ".MX": "MX", ".SA": "BR", ".BA": "AR",
+
     # EMEA
     ".L": "UK", ".LSE": "UK", ".LN": "UK",
     ".PA": "FR", ".FP": "FR",
-    ".DE": "DE", ".F": "DE", ".BE": "DE", ".DU": "DE", ".HM": "DE",
-    ".XETRA": "DE", ".ETR": "DE",  # v7.2.0: Deutsche Borse XETRA
+    ".DE": "DE", ".F": "DE", ".BE": "DE", ".DU": "DE", ".HM": "DE", ".XETRA": "DE",
     ".SW": "CH", ".VX": "CH",
     ".AS": "NL", ".BR": "BE",
     ".MC": "ES",
@@ -411,6 +358,7 @@ _EXCHANGE_SUFFIXES: Dict[str, str] = {
     ".QA": "QA", ".QE": "QA",
     ".KW": "KW", ".KSE": "KW",
     ".EG": "EG", ".EGX": "EG",
+
     # Asia Pacific
     ".T": "JP", ".TYO": "JP",
     ".HK": "HK", ".HKG": "HK",
@@ -430,156 +378,107 @@ _EXCHANGE_SUFFIXES: Dict[str, str] = {
     ".NZ": "NZ", ".NZSE": "NZ",
 }
 
-# ISO 10383 MIC Code Mapping
-_MIC_MAPPINGS: Dict[str, str] = {
-    "US": "XNYS", "NASDAQ": "XNAS", "CA": "XTSE", "MX": "XMEX", "BR": "BVMF",
-    "UK": "XLON", "FR": "XPAR", "DE": "XETR", "CH": "XSWX", "SA": "XSAU",
-    "AE": "XDFM", "JP": "XTKS", "HK": "XHKG", "CN": "XSHG", "IN": "XNSE",
-    "AU": "XASX", "KR": "XKRX", "SG": "XSES",
-}
+# =============================================================================
+# Currency / Exchange / Country display tables (v5.3.0 fix)
+# Single source of truth — DO NOT duplicate these maps in consumer modules.
+# =============================================================================
 
-# v7.2.0: Yahoo Finance suffix translation.
-# -----------------------------------------------------------------------------
-# Keys are the RAW suffix as returned by split_symbol_exchange (UPPER, no dot).
-# Values are the suffix Yahoo Finance actually expects, INCLUDING the leading
-# dot -- or "" (empty string) for US listings, which carry no Yahoo suffix.
-#
-# Why this exists: split_symbol_exchange returns whatever recognised alias the
-# caller passed (".LSE", ".LN" and ".L" are all valid UK aliases internally),
-# but Yahoo accepts exactly ONE suffix per venue. v7.1.0 and earlier passed any
-# non-US suffix through unchanged, so ".LSE" / ".NSE" / ".JSE" / ".TYO" / ".OQ"
-# went to Yahoo verbatim, were rejected, and the data engine fell back to US
-# identity defaults. This table is TOTAL over _EXCHANGE_SUFFIXES so to_yahoo_
-# symbol never has a gap; any caller-added env suffix not present here falls
-# back to pass-through (pre-7.2.0 behaviour).
-_YAHOO_SUFFIX_MAP: Dict[str, str] = {
-    # --- Americas ---
-    "US": "", "NYSE": "", "N": "", "NASDAQ": "", "OQ": "", "NM": "", "NG": "",
-    "TO": ".TO", "V": ".V", "CNQ": ".CN",
-    "MX": ".MX", "SA": ".SA", "BA": ".BA",
-    # --- EMEA ---
-    "L": ".L", "LSE": ".L", "LN": ".L",
-    "PA": ".PA", "FP": ".PA",
-    "DE": ".DE", "F": ".F", "BE": ".BE", "DU": ".DU", "HM": ".HM",
-    "XETRA": ".DE", "ETR": ".DE",
-    "SW": ".SW", "VX": ".SW",
-    "AS": ".AS", "BR": ".BR",
-    "MC": ".MC",
-    "MI": ".MI", "IM": ".MI",
-    "CO": ".CO", "ST": ".ST", "OL": ".OL", "HE": ".HE",
-    "WA": ".WA", "PR": ".PR", "BU": ".BD",
-    "AT": ".VI", "VI": ".VI",
-    "IR": ".IR", "DUB": ".IR",
-    "ZA": ".JO", "JSE": ".JO",
-    "TA": ".TA", "TASE": ".TA",
-    "SAU": ".SR", "SR": ".SR", "TADAWUL": ".SR",
-    # Yahoo Gulf coverage is limited; best-effort below.
-    "AE": ".AE", "DFM": ".AE", "ADX": ".AE",
-    "QA": ".QA", "QE": ".QA",
-    "KW": ".KW", "KSE": ".KW",
-    "EG": ".CA", "EGX": ".CA",  # Yahoo uses .CA for Cairo (EGX)
-    # --- Asia Pacific ---
-    "T": ".T", "TYO": ".T",
-    "HK": ".HK", "HKG": ".HK",
-    "SS": ".SS", "SHG": ".SS",
-    "SZ": ".SZ", "SHE": ".SZ",
-    "NS": ".NS", "NSE": ".NS",
-    "BO": ".BO", "BSE": ".BO",
-    "KS": ".KS", "KQ": ".KQ", "KOSDAQ": ".KQ",
-    "TW": ".TW", "TWO": ".TWO",
-    "SI": ".SI", "SGX": ".SI",
-    "KL": ".KL", "KLSE": ".KL",
-    "JK": ".JK", "IDX": ".JK",
-    "SET": ".BK", "BK": ".BK",
-    "VN": ".VN", "HOSE": ".VN",
-    "PS": ".PS", "PSE": ".PS",
-    "AU": ".AX", "AX": ".AX", "ASX": ".AX",
-    "NZ": ".NZ", "NZSE": ".NZ",
-}
-
-# v7.2.0: EODHD exchange-code translation.
-# -----------------------------------------------------------------------------
-# Keys are the RAW suffix as returned by split_symbol_exchange (UPPER, no dot).
-# Values are the EODHD exchange code (no dot). EODHD expects TICKER.EXCHANGE.
-#
-# Only entries that DIFFER from the raw suffix, or that normalise a family of
-# aliases onto a single EODHD code, need to be listed -- to_eodhd_symbol falls
-# back to the raw suffix (current behaviour) for anything not present here, so
-# an unverified market degrades gracefully rather than breaking.
-#
-# OPERATOR NOTE: the high-confidence entries are the Americas / Western Europe /
-# UK / India / Australia / HK / South Africa rows. Japan (TSE), China (SHG/SHE),
-# Korea (KO/KQ), Singapore (SG) and Switzerland (SW) follow EODHD's documented
-# conventions but should be spot-checked against your EODHD /exchanges-list.
-_EODHD_SUFFIX_MAP: Dict[str, str] = {
-    # --- Americas (US aliases all collapse to US) ---
-    "US": "US", "NYSE": "US", "N": "US", "NASDAQ": "US", "OQ": "US",
-    "NM": "US", "NG": "US",
-    "TO": "TO", "V": "V",
-    "MX": "MX", "SA": "SA", "BA": "BA",
-    # --- EMEA ---
-    "L": "LSE", "LSE": "LSE", "LN": "LSE",
-    "PA": "PA", "FP": "PA",
-    "DE": "XETRA", "XETRA": "XETRA", "ETR": "XETRA", "F": "F",
-    "SW": "SW", "VX": "SW",
-    "AS": "AS", "BR": "BR",
-    "MC": "MC",
-    "MI": "MI", "IM": "MI",
-    "CO": "CO", "ST": "ST", "OL": "OL", "HE": "HE",
-    "WA": "WAR", "PR": "PR",
-    "AT": "VI", "VI": "VI",
-    "IR": "IR", "DUB": "IR",
-    "ZA": "JSE", "JSE": "JSE",
-    "TA": "TA", "TASE": "TA",
-    "SAU": "SR", "SR": "SR", "TADAWUL": "SR",
-    # --- Asia Pacific ---
-    "T": "TSE", "TYO": "TSE",
-    "HK": "HK", "HKG": "HK",
-    "SS": "SHG", "SHG": "SHG",
-    "SZ": "SHE", "SHE": "SHE",
-    "NS": "NSE", "NSE": "NSE",
-    "BO": "BSE", "BSE": "BSE",
-    "KS": "KO", "KQ": "KQ", "KOSDAQ": "KQ",
-    "TW": "TW", "TWO": "TW",
-    "SI": "SG", "SGX": "SG",
-    "KL": "KLSE", "KLSE": "KLSE",
-    "JK": "JK", "IDX": "JK",
-    "AU": "AU", "AX": "AU", "ASX": "AU",
-    "NZ": "NZ", "NZSE": "NZ",
-}
-
-# v7.1.0: country lookup (display-friendly English names) keyed by the
-# exchange code returned by get_primary_exchange. This is the table the
-# new get_country_from_symbol consults. Bug being fixed: data engine
-# was returning "USA" for every non-.SR / non-special symbol because
-# its homegrown _infer_country_from_symbol had no exchange-suffix
-# lookup -- BARC.L, SAP.DE, 7203.T were all "USA".
-_COUNTRY_BY_EXCHANGE: Dict[str, str] = {
+# Country code → ISO 4217 currency
+CURRENCY_BY_COUNTRY: Dict[str, str] = {
     # Americas
-    "US": "United States",
+    "US": "USD", "CA": "CAD", "MX": "MXN", "BR": "BRL", "AR": "ARS",
+    # EMEA
+    "UK": "GBP",
+    "FR": "EUR", "DE": "EUR", "NL": "EUR", "BE": "EUR", "ES": "EUR",
+    "IT": "EUR", "AT": "EUR", "FI": "EUR", "IE": "EUR", "PT": "EUR",
+    "CH": "CHF",
+    "DK": "DKK", "SE": "SEK", "NO": "NOK",
+    "PL": "PLN", "CZ": "CZK", "HU": "HUF",
+    "ZA": "ZAR", "IL": "ILS",
+    "SA": "SAR", "AE": "AED", "QA": "QAR", "KW": "KWD", "EG": "EGP",
+    # Asia-Pacific
+    "JP": "JPY", "HK": "HKD", "CN": "CNY", "IN": "INR",
+    "KR": "KRW", "TW": "TWD", "SG": "SGD", "MY": "MYR",
+    "ID": "IDR", "TH": "THB", "VN": "VND", "PH": "PHP",
+    "AU": "AUD", "NZ": "NZD",
+}
+
+# Country code → human-readable exchange name to write to the sheet "Exchange" column
+EXCHANGE_DISPLAY_NAMES: Dict[str, str] = {
+    # Americas
+    "US": "NASDAQ/NYSE",
+    "CA": "TSX",
+    "MX": "BMV",
+    "BR": "B3",
+    "AR": "BCBA",
+    # EMEA
+    "UK": "LSE",
+    "FR": "Euronext Paris",
+    "DE": "XETRA",
+    "CH": "SIX",
+    "NL": "Euronext Amsterdam",
+    "BE": "Euronext Brussels",
+    "ES": "BME",
+    "IT": "Borsa Italiana",
+    "AT": "Wiener Borse",
+    "FI": "Nasdaq Helsinki",
+    "IE": "Euronext Dublin",
+    "PT": "Euronext Lisbon",
+    "DK": "Nasdaq Copenhagen",
+    "SE": "Stockholm",
+    "NO": "Oslo",
+    "PL": "GPW",
+    "CZ": "PSE",
+    "HU": "BSE Budapest",
+    "ZA": "JSE",
+    "IL": "TASE",
+    "SA": "Tadawul",
+    "AE": "DFM/ADX",
+    "QA": "QSE",
+    "KW": "Boursa Kuwait",
+    "EG": "EGX",
+    # Asia-Pacific
+    "JP": "TSE",
+    "HK": "HKEX",
+    "CN": "SSE/SZSE",
+    "IN": "NSE",
+    "KR": "KRX",
+    "TW": "TWSE",
+    "SG": "SGX",
+    "MY": "Bursa Malaysia",
+    "ID": "IDX",
+    "TH": "SET",
+    "VN": "HOSE",
+    "PH": "PSE",
+    "AU": "ASX",
+    "NZ": "NZX",
+}
+
+# Country code → human-readable country name to write to the sheet "Country" column
+COUNTRY_DISPLAY_NAMES: Dict[str, str] = {
+    "US": "USA",
     "CA": "Canada",
     "MX": "Mexico",
     "BR": "Brazil",
     "AR": "Argentina",
-    # EMEA
     "UK": "United Kingdom",
     "FR": "France",
     "DE": "Germany",
-    "CH": "Switzerland",
     "NL": "Netherlands",
     "BE": "Belgium",
     "ES": "Spain",
     "IT": "Italy",
+    "AT": "Austria",
+    "FI": "Finland",
+    "IE": "Ireland",
+    "PT": "Portugal",
+    "CH": "Switzerland",
     "DK": "Denmark",
     "SE": "Sweden",
     "NO": "Norway",
-    "FI": "Finland",
     "PL": "Poland",
     "CZ": "Czechia",
     "HU": "Hungary",
-    "AT": "Austria",
-    "IE": "Ireland",
-    "PT": "Portugal",
     "ZA": "South Africa",
     "IL": "Israel",
     "SA": "Saudi Arabia",
@@ -587,7 +486,6 @@ _COUNTRY_BY_EXCHANGE: Dict[str, str] = {
     "QA": "Qatar",
     "KW": "Kuwait",
     "EG": "Egypt",
-    # Asia Pacific
     "JP": "Japan",
     "HK": "Hong Kong",
     "CN": "China",
@@ -602,218 +500,88 @@ _COUNTRY_BY_EXCHANGE: Dict[str, str] = {
     "PH": "Philippines",
     "AU": "Australia",
     "NZ": "New Zealand",
-    # Aliases that may surface from get_primary_exchange's KSA shortcut
-    "SAUDI": "Saudi Arabia",
 }
 
-# v7.1.0: currency lookup keyed by the same exchange code. Replaces
-# the inline if/elif chain in get_currency_from_symbol, which only
-# covered US / UK / JP / EUR-zone and returned None for HK, CN, IN,
-# AU, CA, CH, KR, SG, SA(non-KSA-shortcut), AE, QA, KW, EG, ZA, etc.
-_CURRENCY_BY_EXCHANGE: Dict[str, str] = {
-    # Americas
-    "US": "USD",
-    "CA": "CAD",
-    "MX": "MXN",
-    "BR": "BRL",
-    "AR": "ARS",
-    # EMEA - GBP
-    "UK": "GBP",
-    # EMEA - Euro zone
-    "FR": "EUR",
-    "DE": "EUR",
-    "NL": "EUR",
-    "BE": "EUR",
-    "ES": "EUR",
-    "IT": "EUR",
-    "AT": "EUR",
-    "IE": "EUR",
-    "PT": "EUR",
-    "FI": "EUR",
-    # EMEA - other
-    "CH": "CHF",
-    "DK": "DKK",
-    "SE": "SEK",
-    "NO": "NOK",
-    "PL": "PLN",
-    "CZ": "CZK",
-    "HU": "HUF",
-    "ZA": "ZAR",
-    "IL": "ILS",
-    "SA": "SAR",
-    "SAUDI": "SAR",
-    "AE": "AED",
-    "QA": "QAR",
-    "KW": "KWD",
-    "EG": "EGP",
-    # Asia Pacific
-    "JP": "JPY",
-    "HK": "HKD",
-    "CN": "CNY",
-    "IN": "INR",
-    "KR": "KRW",
-    "TW": "TWD",
-    "SG": "SGD",
-    "MY": "MYR",
-    "ID": "IDR",
-    "TH": "THB",
-    "VN": "VND",
-    "PH": "PHP",
-    "AU": "AUD",
-    "NZ": "NZD",
+# ISO 10383 MIC Code Mapping
+MIC_MAPPINGS: Dict[str, str] = {
+    "US": "XNYS", "NASDAQ": "XNAS", "CA": "XTSE", "MX": "XMEX", "BR": "BVMF",
+    "UK": "XLON", "FR": "XPAR", "DE": "XETR", "CH": "XSWX", "SA": "XSAU",
+    "AE": "XDFM", "JP": "XTKS", "HK": "XHKG", "CN": "XSHG", "IN": "XNSE",
+    "AU": "XASX", "KR": "XKRX", "SG": "XSES", "ZA": "XJSE", "KW": "XKUW",
+    "QA": "XDSM", "EG": "XCAI", "IL": "XTAE", "TW": "XTAI",
+    "NL": "XAMS", "BE": "XBRU", "ES": "XMAD", "IT": "XMIL",
+    "SE": "XSTO", "NO": "XOSL", "DK": "XCSE", "FI": "XHEL",
+    "PL": "XWAR", "AT": "XWBO", "IE": "XDUB", "NZ": "XNZE",
+    "MY": "XKLS", "ID": "XIDX", "TH": "XBKK", "VN": "XSTC", "PH": "XPHS",
 }
 
-# v7.1.0: per-index country override for major caret-prefixed indexes.
-# Without this, ^GSPC / ^FTSE / ^N225 all resolved to "Global" because
-# is_special_symbol short-circuits before exchange-suffix logic.
-_INDEX_COUNTRY: Dict[str, str] = {
-    "^GSPC": "United States",
-    "^DJI": "United States",
-    "^IXIC": "United States",
-    "^NDX": "United States",
-    "^RUT": "United States",
-    "^VIX": "United States",
-    "^FTSE": "United Kingdom",
-    "^GDAXI": "Germany",
-    "^FCHI": "France",
-    "^N225": "Japan",
-    "^HSI": "Hong Kong",
-    "^SSEC": "China",
-    "^TASI": "Saudi Arabia",
-    "^NOMU": "Saudi Arabia",
-    "^STOXX50E": "European Union",
-    "^STOXX": "European Union",
-    "^AXJO": "Australia",
-    "^NSEI": "India",
-    "^BSESN": "India",
-    "^KS11": "South Korea",
-    "^TWII": "Taiwan",
-    "^STI": "Singapore",
-    "^JKSE": "Indonesia",
-    "^KLSE": "Malaysia",
-    "^SET": "Thailand",
-    "^MERV": "Argentina",
-    "^BVSP": "Brazil",
-    "^MXX": "Mexico",
-    "^GSPTSE": "Canada",
-    "^TA125": "Israel",
-}
-
-# Index mappings
-# v7.0.0 fix: the bare 'NASDAQ' key was a footgun -- it made is_index('NASDAQ')
-# return True, so detect_asset_class('NASDAQ') returned INDEX. But NASDAQ is
-# primarily an exchange keyword (already in _EXCHANGE_SUFFIXES). Callers who
-# want the NASDAQ Composite index should use 'IXIC' or '^IXIC'.
-_INDEX_COMMON: Dict[str, str] = {
-    "SPX": "^GSPC", "SP500": "^GSPC", "DJI": "^DJI", "DOW": "^DJI",
-    "NDX": "^NDX", "IXIC": "^IXIC", "RUT": "^RUT", "FTSE": "^FTSE",
-    "DAX": "^GDAXI", "CAC": "^FCHI", "NIKKEI": "^N225", "N225": "^N225",
-    "HSI": "^HSI", "SSEC": "^SSEC", "TASI": "^TASI", "NOMU": "^NOMU", "VIX": "^VIX",
-}
-
-# Forex common pairs
-_FX_COMMON_PAIRS: Set[str] = {
-    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
-    "EURGBP", "EURJPY", "GBPJPY", "CHFJPY", "EURCHF", "GBPCHF", "AUDJPY",
-}
-
-# Commodity codes
-_COMMODITY_CODES: Dict[str, str] = {
-    "GC": "gold", "SI": "silver", "PL": "platinum", "PA": "palladium",
-    "CL": "wti_crude", "BZ": "brent_crude", "NG": "natural_gas", "HO": "heating_oil",
-    "RB": "gasoline", "ZC": "corn", "ZW": "wheat", "ZS": "soybeans",
-    "ZM": "soybean_meal", "ZL": "soybean_oil", "ZR": "rough_rice", "ZO": "oats",
-    "KE": "kc_wheat", "MW": "spring_wheat", "CC": "cocoa", "KC": "coffee",
-    "CT": "cotton", "OJ": "orange_juice", "SB": "sugar", "LB": "lumber",
-    "HG": "copper", "ALI": "aluminium", "NICKEL": "nickel", "ZINC": "zinc",
-    "LEAD": "lead", "TIN": "tin",
-}
-
-# Crypto common
-_CRYPTO_COMMON: Dict[str, str] = {
-    "BTC": "bitcoin", "ETH": "ethereum", "XRP": "ripple", "LTC": "litecoin",
-    "BCH": "bitcoin_cash", "ADA": "cardano", "DOT": "polkadot", "LINK": "chainlink",
-    "BNB": "binance", "XLM": "stellar", "DOGE": "dogecoin", "UNI": "uniswap",
-    "SOL": "solana", "MATIC": "polygon", "AVAX": "avalanche", "ATOM": "cosmos",
-    "ALGO": "algorand", "VET": "vechain", "FIL": "filecoin", "TRX": "tron",
-    "USDT": "tether", "USDC": "usd_coin", "SHIB": "shiba_inu", "LUNA": "terra",
-    # v7.0.0: a few more for detection robustness
-    "NEAR": "near", "APT": "aptos", "ARB": "arbitrum", "OP": "optimism",
-    "INJ": "injective", "SUI": "sui", "TON": "ton", "PEPE": "pepe",
-}
-
-# ETF common prefixes
-_ETF_COMMON_PREFIX: Set[str] = {
-    "SPY", "QQQ", "IVV", "VTI", "VOO", "BND", "EFA", "IWM", "AGG", "GLD", "SLV",
-}
+# Share class patterns
+CLASS_DASH_RE = re.compile(r"^([A-Z]+)-([A-Z])$", re.IGNORECASE)
+CLASS_DOT_RE = re.compile(r"^([A-Z]+)\.([A-Z])$", re.IGNORECASE)
 
 # Common prefixes to strip
-_COMMON_PREFIXES: Tuple[str, ...] = (
+COMMON_PREFIXES = (
     "TADAWUL:", "STOCK:", "TICKER:", "INDEX:", "NYSE:", "NASDAQ:", "OTC:",
     "LSE:", "TSX:", "ASX:", "HKEX:", "SGX:", "B3:", "JSE:", "DFM:", "ADX:",
     "FOREX:", "FX:", "CRYPTO:", "CC:", "FUT:", "COMM:", "INDX:", "ETF:",
 )
 
-# Common suffixes to strip
-_COMMON_SUFFIXES: Tuple[str, ...] = (
+# Common suffixes to strip (but not exchange suffixes)
+COMMON_SUFFIXES = (
     ".TADAWUL", ".STOCK", ".TICKER", ".INDEX",
 )
 
+ALLOWED_CHARS_RE = re.compile(r"^[A-Z0-9\.\-\^=\/\@\#]+$", re.IGNORECASE)
 
 # =============================================================================
-# Apply Custom Mappings from Config
+# Custom mappings from environment
 # =============================================================================
 
-_EXCHANGE_SUFFIXES.update(_CONFIG.exchange_map)
-_INDEX_COMMON.update(_CONFIG.index_map)
-_FX_COMMON_PAIRS.update({
-    k.upper().replace("/", "").replace("-", "")
-    for k in _CONFIG.fx_map.keys()
-})
-_COMMODITY_CODES.update({k.upper(): v for k, v in _CONFIG.commodity_map.items()})
-_CRYPTO_COMMON.update({k.upper(): v for k, v in _CONFIG.crypto_map.items()})
+CUSTOM_EXCHANGE_MAP = _env_dict("SYMBOL_EXCHANGE_MAP_JSON")
+CUSTOM_INDEX_MAP = _env_dict("SYMBOL_INDEX_MAP_JSON")
+CUSTOM_FX_MAP = _env_dict("SYMBOL_FX_MAP_JSON")
+CUSTOM_COMMODITY_MAP = _env_dict("SYMBOL_COMMODITY_MAP_JSON")
+CUSTOM_CRYPTO_MAP = _env_dict("SYMBOL_CRYPTO_MAP_JSON")
+CUSTOM_CURRENCY_MAP = _env_dict("SYMBOL_CURRENCY_MAP_JSON")
+CUSTOM_EXCHANGE_DISPLAY_MAP = _env_dict("SYMBOL_EXCHANGE_DISPLAY_MAP_JSON")
+CUSTOM_COUNTRY_DISPLAY_MAP = _env_dict("SYMBOL_COUNTRY_DISPLAY_MAP_JSON")
 
-_STRIP_PREFIXES = _COMMON_PREFIXES + _CONFIG.strip_prefixes
-_STRIP_SUFFIXES = _COMMON_SUFFIXES + _CONFIG.strip_suffixes
+if CUSTOM_EXCHANGE_MAP:
+    EXCHANGE_SUFFIXES.update(CUSTOM_EXCHANGE_MAP)
+if CUSTOM_INDEX_MAP:
+    INDEX_COMMON.update({str(k).upper(): str(v) for k, v in CUSTOM_INDEX_MAP.items()})
+if CUSTOM_FX_MAP:
+    FX_COMMON_PAIRS.update({str(k).upper().replace("/", "").replace("-", "") for k in CUSTOM_FX_MAP.keys()})
+if CUSTOM_COMMODITY_MAP:
+    COMMODITY_CODES.update({str(k).upper(): str(v) for k, v in CUSTOM_COMMODITY_MAP.items()})
+if CUSTOM_CRYPTO_MAP:
+    CRYPTO_COMMON.update({str(k).upper(): str(v) for k, v in CUSTOM_CRYPTO_MAP.items()})
+if CUSTOM_CURRENCY_MAP:
+    CURRENCY_BY_COUNTRY.update({str(k).upper(): str(v).upper() for k, v in CUSTOM_CURRENCY_MAP.items()})
+if CUSTOM_EXCHANGE_DISPLAY_MAP:
+    EXCHANGE_DISPLAY_NAMES.update({str(k).upper(): str(v) for k, v in CUSTOM_EXCHANGE_DISPLAY_MAP.items()})
+if CUSTOM_COUNTRY_DISPLAY_MAP:
+    COUNTRY_DISPLAY_NAMES.update({str(k).upper(): str(v) for k, v in CUSTOM_COUNTRY_DISPLAY_MAP.items()})
 
-
-# v7.0.0: precomputed reverse index for detect_market_type to avoid per-call
-# linear scan over MarketType with case-insensitive string compares.
-_MARKET_BY_CODE: Dict[str, MarketType] = {m.value.upper(): m for m in MarketType}
-
+EXTRA_STRIP_SUFFIXES = _env_list("NORMALIZE_STRIP_SUFFIXES")
+EXTRA_STRIP_PREFIXES = _env_list("NORMALIZE_STRIP_PREFIXES")
 
 # =============================================================================
-# Pure Utility Functions
+# Small utilities
 # =============================================================================
+
 
 def _unique_preserve_order(items: List[str]) -> List[str]:
-    """Deduplicate items while preserving order."""
     seen: Set[str] = set()
-    result: List[str] = []
-    for item in items:
-        if not item or item in seen:
+    out: List[str] = []
+    for x in items:
+        if not x:
             continue
-        seen.add(item)
-        result.append(item)
-    return result
-
-
-def _share_class_dot_to_dash(sym: str) -> str:
-    """
-    Convert a share-class DOT ticker to the DASH form (BRK.B -> BRK-B).
-
-    v7.2.0 helper. `normalize_symbol` canonicalizes share classes to the
-    dot form, but Yahoo Finance expects the dash form. Only fires when the
-    whole string is a `<ALPHA>.<SINGLE-LETTER>` share-class pattern; plain
-    tickers ("AAPL"), dash tickers ("EPI-A") and anything else are returned
-    unchanged.
-    """
-    if not sym:
-        return sym
-    m = CLASS_DOT_RE.match(sym)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
-    return sym
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
 
 
 # =============================================================================
@@ -822,13 +590,6 @@ def _share_class_dot_to_dash(sym: str) -> str:
 
 @lru_cache(maxsize=20000)
 def clean_unicode(text: str) -> str:
-    """
-    Clean Unicode text, normalize digits, remove hidden characters.
-
-    Examples:
-        clean_unicode("AAPL") -> "AAPL"
-        clean_unicode("٢٢٢٢") -> "2222"
-    """
     if not text:
         return ""
     s = str(text).strip()
@@ -843,20 +604,19 @@ def clean_unicode(text: str) -> str:
 
 
 @lru_cache(maxsize=20000)
-def strip_noise_prefix_suffix(text: str) -> str:
-    """Strip common noise prefixes and suffixes (one pass each)."""
-    if not text:
+def strip_noise_prefix_suffix(s: str) -> str:
+    if not s:
         return ""
-    s = text.upper().strip()
-    for prefix in _STRIP_PREFIXES:
-        if s.startswith(prefix.upper()):
-            s = s[len(prefix):].strip()
+    u = s.upper().strip()
+    for p in COMMON_PREFIXES + EXTRA_STRIP_PREFIXES:
+        if u.startswith(p.upper()):
+            u = u[len(p):].strip()
             break
-    for suffix in _STRIP_SUFFIXES:
-        if s.endswith(suffix.upper()):
-            s = s[:-len(suffix)].strip()
+    for suf in COMMON_SUFFIXES + EXTRA_STRIP_SUFFIXES:
+        if u.endswith(suf.upper()):
+            u = u[:-len(suf)].strip()
             break
-    return s
+    return u
 
 
 # =============================================================================
@@ -865,85 +625,55 @@ def strip_noise_prefix_suffix(text: str) -> str:
 
 @lru_cache(maxsize=20000)
 def looks_like_ksa(symbol: str) -> bool:
-    """
-    Check if symbol looks like a KSA (Saudi) symbol.
-
-    v7.1.0: also detects `.SAU` and `.SA` when the base is a pure 3-6
-    digit code (Tadawul format). `normalize_ksa_symbol` already knows
-    how to strip those suffixes, but `looks_like_ksa` previously only
-    accepted `.SR`, so `normalize_symbol("2222.SAU")` skipped the KSA
-    branch and returned the input unchanged. The pure-digit guard
-    keeps Brazilian `.SA` tickers (PETR4.SA, VALE3.SA) out -- they
-    have alphabetic prefixes and won't match `KSA_CODE_ONLY_RE`.
-    """
     s = clean_unicode(symbol).upper()
     if not s:
         return False
     if s.startswith("TADAWUL:"):
         return True
-    for suffix in (".SR", ".SAU", ".SA"):
-        if s.endswith(suffix):
-            code = s[:-len(suffix)].strip()
-            if KSA_CODE_ONLY_RE.match(code):
-                return True
+    if s.endswith(".SR"):
+        code = s[:-3].strip()
+        return bool(KSA_CODE_ONLY_RE.match(code))
     return bool(KSA_CODE_ONLY_RE.match(s))
 
 
 @lru_cache(maxsize=20000)
 def is_ksa(symbol: str) -> bool:
-    """Check if symbol is a KSA (Saudi) symbol."""
     s = clean_unicode(symbol).upper()
     if not s:
         return False
-    return bool(
-        KSA_TADAWUL_RE.match(s)
-        or KSA_SR_RE.match(s)
-        or KSA_CODE_ONLY_RE.match(s)
-    )
+    return bool(KSA_TADAWUL_RE.match(s) or KSA_SR_RE.match(s) or KSA_CODE_ONLY_RE.match(s))
 
 
 @lru_cache(maxsize=20000)
 def is_isin(symbol: str) -> bool:
-    """Check if symbol is an ISIN (International Securities Identification Number)."""
     return bool(ISIN_RE.match(clean_unicode(symbol).upper()))
 
 
 @lru_cache(maxsize=20000)
 def is_cusip(symbol: str) -> bool:
-    """Check if symbol is a CUSIP (Committee on Uniform Securities Identification Procedures)."""
     return bool(CUSIP_RE.match(clean_unicode(symbol).upper()))
 
 
 @lru_cache(maxsize=20000)
 def is_sedol(symbol: str) -> bool:
-    """Check if symbol is a SEDOL (Stock Exchange Daily Official List)."""
     return bool(SEDOL_RE.match(clean_unicode(symbol).upper()))
 
 
 @lru_cache(maxsize=20000)
 def is_option(symbol: str) -> bool:
-    """Check if symbol is an OCC option."""
     return bool(OCC_OPTION_RE.match(clean_unicode(symbol).upper()))
 
 
 def parse_occ_option(symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse OCC option symbol.
-
-    Returns:
-        Dict with underlying, expiration, type, strike or None
-    """
     s = clean_unicode(symbol).upper()
-    match = OCC_OPTION_RE.match(s)
-    if not match:
+    m = OCC_OPTION_RE.match(s)
+    if not m:
         return None
-
-    underlying, exp, right, strike_str = match.groups()
+    underlying, exp, right, strike_str = m.groups()
     try:
         exp_date = datetime.strptime(exp, "%y%m%d").date().isoformat()
     except Exception:
         return None
-
     return {
         "underlying": underlying,
         "expiration": exp_date,
@@ -954,88 +684,60 @@ def parse_occ_option(symbol: str) -> Optional[Dict[str, Any]]:
 
 @lru_cache(maxsize=20000)
 def is_index(symbol: str) -> bool:
-    """Check if symbol is an index."""
     s = clean_unicode(symbol).upper()
     if not s:
         return False
     if INDEX_CARET_RE.match(s) or INDEX_SUFFIX_RE.match(s):
         return True
-    return s in _INDEX_COMMON or s in set(_INDEX_COMMON.values())
-
-
-@lru_cache(maxsize=20000)
-def is_crypto(symbol: str) -> bool:
-    """Check if symbol is a cryptocurrency."""
-    s = clean_unicode(symbol).upper()
-    if not s:
-        return False
-    if CRYPTO_SUFFIX_RE.match(s):
-        return True
-    # Dash-form pairs (BTC-USD, ETH-USD): require the LEFT side to be a
-    # known crypto ticker so we don't misclassify FX pairs like EUR-USD.
-    dm = CRYPTO_DASH_RE.match(s)
-    if dm and dm.group(1).upper() in _CRYPTO_COMMON:
-        return True
-    base = s.split("-")[0] if "-" in s else s
-    return base in _CRYPTO_COMMON
+    return s in INDEX_COMMON or s in set(INDEX_COMMON.values())
 
 
 @lru_cache(maxsize=20000)
 def is_fx(symbol: str) -> bool:
-    """
-    Check if symbol is a forex pair.
-
-    v7.0.0: if the symbol has the 3-letter dash form AND the left side
-    is a known crypto ticker (like ETH-USD), treat as crypto, not FX.
-    """
     s = clean_unicode(symbol).upper()
     if not s:
         return False
-    if FX_EQUAL_RE.match(s) or FX_SLASH_RE.match(s) or FX_SUFFIX_RE.match(s):
-        return True
-    # Dash form: reject if left side is a known crypto
-    dm = FX_DASH_RE.match(s)
-    if dm:
-        left = dm.group(1).upper()
-        if left in _CRYPTO_COMMON:
-            return False
+    if FX_EQUAL_RE.match(s) or FX_SLASH_RE.match(s) or FX_DASH_RE.match(s) or FX_SUFFIX_RE.match(s):
         return True
     base = s.replace("=X", "").replace("/", "").replace("-", "")
-    return base in _FX_COMMON_PAIRS
+    return base in FX_COMMON_PAIRS
 
 
 @lru_cache(maxsize=20000)
 def is_commodity_future(symbol: str) -> bool:
-    """Check if symbol is a commodity future."""
     s = clean_unicode(symbol).upper()
     if not s:
         return False
     if FUTURE_EQUAL_RE.match(s) or FUTURE_SUFFIX_RE.match(s):
         return True
-    base = (
-        s.replace("=F", "")
-         .replace(".COMM", "")
-         .replace(".COM", "")
-         .replace(".FUT", "")
-    )
-    return base in _COMMODITY_CODES
+    base = s.replace("=F", "").replace(".COMM", "").replace(".COM", "").replace(".FUT", "")
+    return base in COMMODITY_CODES
+
+
+@lru_cache(maxsize=20000)
+def is_crypto(symbol: str) -> bool:
+    s = clean_unicode(symbol).upper()
+    if not s:
+        return False
+    if CRYPTO_DASH_RE.match(s) or CRYPTO_SUFFIX_RE.match(s):
+        return True
+    base = s.split("-")[0] if "-" in s else s
+    return base in CRYPTO_COMMON
 
 
 @lru_cache(maxsize=20000)
 def is_etf(symbol: str) -> bool:
-    """Check if symbol is an ETF."""
     s = clean_unicode(symbol).upper()
     if not s:
         return False
     if ETF_SUFFIX_RE.match(s):
         return True
     base = s.split(".")[0] if "." in s else s
-    return base in _ETF_COMMON_PREFIX
+    return base in ETF_COMMON_PREFIX
 
 
 @lru_cache(maxsize=20000)
 def is_special_symbol(symbol: str) -> bool:
-    """Check if symbol is a special symbol (index, forex, commodity, crypto, etc.)."""
     return any([
         is_index(symbol),
         is_fx(symbol),
@@ -1046,29 +748,56 @@ def is_special_symbol(symbol: str) -> bool:
     ])
 
 
+@lru_cache(maxsize=20000)
+def is_us_ticker_heuristic(symbol: str) -> bool:
+    """
+    Returns True only when the symbol clearly looks like a plain US ticker.
+    Conservative heuristic — caller should treat this as low-confidence inference
+    (the 'inferred_from' field in infer_symbol_metadata() will be set to
+    'us_heuristic' so warnings can be emitted by the consumer).
+
+    Rules:
+    - normalized symbol must be alphabetic, length 1..5
+    - no dots, no dashes, no special chars
+    - must not be a special symbol (index/fx/commodity/crypto/ISIN/option)
+    - must not be KSA
+    """
+    s = normalize_symbol(symbol)
+    if not s:
+        return False
+    if "." in s or "-" in s or "=" in s or "^" in s or "/" in s:
+        return False
+    if is_special_symbol(s) or is_ksa(s):
+        return False
+    if not s.isalpha():
+        return False
+    return 1 <= len(s) <= 5
+
+
 # =============================================================================
-# Exchange / Suffix Parsing
+# Exchange / suffix parsing (critical for correctness)
 # =============================================================================
 
 @lru_cache(maxsize=20000)
 def split_symbol_exchange(symbol: str) -> Tuple[str, Optional[str]]:
     """
-    Split symbol into (base, exchange_suffix) when the suffix is a real exchange suffix.
+    Split (base, exchange_suffix) ONLY when the suffix is a REAL exchange suffix
+    recognized in EXCHANGE_SUFFIXES, or KSA .SR.
 
     Examples:
-        "AAPL.US" -> ("AAPL", "US")
-        "2222.SR" -> ("2222", "SR")
-        "BRK.B" -> ("BRK.B", None)  # share class, NOT exchange suffix
-        "BRK.B.US" -> ("BRK.B", "US")
+      AAPL.US   -> ("AAPL", "US")
+      2222.SR   -> ("2222", "SR")
+      BRK.B     -> ("BRK.B", None)   (share class, NOT an exchange suffix)
+      BRK.B.US  -> ("BRK.B", "US")
     """
     s = normalize_symbol(symbol)
     if not s or "." not in s:
         return s, None
 
-    base, suffix = s.rsplit(".", 1)
-    key = f".{suffix.upper()}"
-    if key in _EXCHANGE_SUFFIXES:
-        return base, suffix.upper()
+    base, suf = s.rsplit(".", 1)
+    key = f".{suf.upper()}"
+    if key in EXCHANGE_SUFFIXES:
+        return base, suf.upper()
 
     # Not a known exchange suffix -> keep as part of base
     return s, None
@@ -1076,9 +805,8 @@ def split_symbol_exchange(symbol: str) -> Tuple[str, Optional[str]]:
 
 @lru_cache(maxsize=20000)
 def extract_exchange_code(symbol: str) -> Optional[str]:
-    """Extract exchange code from symbol."""
-    _, exchange = split_symbol_exchange(symbol)
-    return exchange
+    _, ex = split_symbol_exchange(symbol)
+    return ex
 
 
 # =============================================================================
@@ -1087,32 +815,24 @@ def extract_exchange_code(symbol: str) -> Optional[str]:
 
 @lru_cache(maxsize=20000)
 def detect_market_type(symbol: str) -> MarketType:
-    """
-    Detect market type for a symbol.
-
-    v7.0.0: uses precomputed `_MARKET_BY_CODE` dict instead of scanning the
-    full MarketType enum per call.
-    """
     s = normalize_symbol(symbol)
     if not s:
         return MarketType.GLOBAL
-
     if is_special_symbol(s):
         return MarketType.SPECIAL
     if is_ksa(s):
         return MarketType.KSA
 
-    _, exchange = split_symbol_exchange(s)
-    if exchange:
-        key = f".{exchange.upper()}"
-        market_code = _EXCHANGE_SUFFIXES.get(key, "")
-        if market_code:
-            hit = _MARKET_BY_CODE.get(market_code.upper())
-            if hit is not None:
-                return hit
+    _, ex = split_symbol_exchange(s)
+    if ex:
+        key = f".{ex.upper()}"
+        market_code = EXCHANGE_SUFFIXES.get(key, "")
+        for market in MarketType:
+            if market.value.upper() == market_code.upper():
+                return market
 
     # Heuristic for simple US tickers
-    if "." not in s and s.isalpha() and 1 <= len(s) <= 5:
+    if is_us_ticker_heuristic(s):
         return MarketType.US
 
     return MarketType.GLOBAL
@@ -1120,26 +840,18 @@ def detect_market_type(symbol: str) -> MarketType:
 
 @lru_cache(maxsize=20000)
 def detect_asset_class(symbol: str) -> AssetClass:
-    """
-    Detect asset class for a symbol.
-
-    v7.0.0 ordering: INDEX > CRYPTO > FX > COMMODITY > ETF > OPTION > REIT > ADR > EQUITY.
-    Crypto is checked before FX because dashed pairs like ETH-USD are
-    crypto, not forex (fixed via v7.0.0 is_fx/is_crypto refinement, but
-    the ordering change makes the intent explicit).
-    """
     s = normalize_symbol(symbol)
     if not s:
         return AssetClass.UNKNOWN
 
     if is_index(s):
         return AssetClass.INDEX
-    if is_crypto(s):
-        return AssetClass.CRYPTO
     if is_fx(s):
         return AssetClass.FOREX
     if is_commodity_future(s):
         return AssetClass.COMMODITY
+    if is_crypto(s):
+        return AssetClass.CRYPTO
     if is_etf(s):
         return AssetClass.ETF
     if is_option(s):
@@ -1154,9 +866,6 @@ def detect_asset_class(symbol: str) -> AssetClass:
 
 
 def validate_symbol(symbol: str) -> Tuple[SymbolQuality, Optional[str]]:
-    """
-    Validate a symbol and return (quality, normalized_symbol).
-    """
     try:
         s = clean_unicode(symbol)
         if not s:
@@ -1172,7 +881,7 @@ def validate_symbol(symbol: str) -> Tuple[SymbolQuality, Optional[str]]:
         if is_option(norm) or is_isin(norm) or is_cusip(norm):
             return SymbolQuality.EXCELLENT, norm
 
-        if len(norm) > 35:
+        if len(norm) < 1 or len(norm) > 35:
             return SymbolQuality.FAIR, norm
 
         if is_special_symbol(norm):
@@ -1184,12 +893,12 @@ def validate_symbol(symbol: str) -> Tuple[SymbolQuality, Optional[str]]:
             return SymbolQuality.GOOD, norm
 
         # If it has a known exchange suffix -> good
-        _, exchange = split_symbol_exchange(norm)
-        if exchange:
+        _, ex = split_symbol_exchange(norm)
+        if ex:
             return SymbolQuality.GOOD, norm
 
         # Plain US ticker heuristic
-        if norm.isalpha() and 1 <= len(norm) <= 5:
+        if is_us_ticker_heuristic(norm):
             return SymbolQuality.EXCELLENT, norm
 
         return SymbolQuality.FAIR, norm
@@ -1203,45 +912,41 @@ def validate_symbol(symbol: str) -> Tuple[SymbolQuality, Optional[str]]:
 
 @lru_cache(maxsize=20000)
 def normalize_ksa_symbol(symbol: str) -> str:
-    """Normalize KSA symbol to canonical format (e.g., "2222.SR")."""
     s = clean_unicode(symbol).upper()
     if not s:
         return ""
 
-    # Remove TADAWUL: prefix
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
 
-    # Remove common KSA-flavored suffixes
-    for suffix in (".TADAWUL", ".SA", ".SAU"):
-        if s.endswith(suffix):
-            s = s[:-len(suffix)].strip()
+    for suf in (".TADAWUL", ".SAU"):
+        if s.endswith(suf):
+            s = s[:-len(suf)].strip()
             break
 
-    # Already has .SR suffix
     if s.endswith(".SR"):
         code = s[:-3].strip()
         return f"{code}.SR" if KSA_CODE_ONLY_RE.match(code) else ""
 
-    # Numeric code only
     if KSA_CODE_ONLY_RE.match(s):
         return f"{s}.SR"
 
     return ""
 
 
+def _default_exchange() -> str:
+    # Used mainly for EODHD formatting and variants
+    return (_env_str("EODHD_DEFAULT_EXCHANGE", "US").upper() or "US").strip()
+
+
 @lru_cache(maxsize=40000)
 def normalize_symbol(symbol: str) -> str:
     """
-    Canonical "neutral" symbol normalization.
-
-    Rules:
-        - KSA          -> always ####.SR
-        - FX           -> EURUSD=X  (both slash AND dash forms canonicalized)
-        - Index alias  -> ^GSPC etc. when in _INDEX_COMMON
-        - INDX suffix  -> canonical ^ form when left side matches _INDEX_COMMON
-        - Share class  -> BRK.B (dash form converted to dot form)
-        - Equities     -> preserve as close to user intent as possible
+    Canonical "neutral" symbol:
+    - KSA -> always ####.SR
+    - Special -> normalized forms (FX -> EURUSD=X, indices -> ^GSPC)
+    - Equities -> keep as close as possible to user intent
+      (NO forced .US unless you enable it explicitly).
     """
     if not symbol:
         return ""
@@ -1256,35 +961,19 @@ def normalize_symbol(symbol: str) -> str:
 
     # Special symbols
     if is_special_symbol(u) and not is_isin(u) and not is_option(u):
-        # FX: slash form -> EURUSD=X
         if "/" in u and is_fx(u):
             a, b = u.split("/", 1)
             return f"{a}{b}=X"
-        # v7.0.0: FX dash form -> EURUSD=X  (v6 only handled slash)
-        fx_dm = FX_DASH_RE.match(u)
-        if fx_dm and is_fx(u):  # is_fx now rejects crypto dash pairs
-            return f"{fx_dm.group(1)}{fx_dm.group(2)}=X"
-        # Index alias: SPX -> ^GSPC
-        if not u.startswith("^") and is_index(u) and u in _INDEX_COMMON:
-            return _INDEX_COMMON[u]
-        # v7.0.0: INDX-suffix canonicalization -> ^GSPC when left matches
-        idx_sm = INDEX_SUFFIX_RE.match(u)
-        if idx_sm:
-            left = idx_sm.group(1).upper()
-            if left in _INDEX_COMMON:
-                return _INDEX_COMMON[left]
-            # No common-index mapping -> carp form as fallback
-            if not left.startswith("^"):
-                return f"^{left}"
-            return left
+        if not u.startswith("^") and is_index(u) and u in INDEX_COMMON:
+            return INDEX_COMMON[u]
         return u
 
-    # KSA canonicalization
+    # KSA canonicalization (must be early and final)
     if looks_like_ksa(u) or is_ksa(u):
         k = normalize_ksa_symbol(u)
         return k or u
 
-    # Share class: BRK-B -> BRK.B
+    # Share class BRK-B -> BRK.B
     if "-" in u:
         parts = u.split("-")
         if len(parts) == 2 and len(parts[1]) == 1 and parts[1].isalpha():
@@ -1292,42 +981,32 @@ def normalize_symbol(symbol: str) -> str:
 
     # Keep exchange suffix only if it is a known exchange suffix
     if "." in u:
-        base, suffix = u.rsplit(".", 1)
-        key = f".{suffix.upper()}"
-        if key in _EXCHANGE_SUFFIXES:
-            u = f"{base}.{suffix.upper()}"
+        base, suf = u.rsplit(".", 1)
+        key = f".{suf.upper()}"
+        if key in EXCHANGE_SUFFIXES:
+            u = f"{base}.{suf.upper()}"
 
-    # Final safe character filter
+    # Final safe char filter
     u = "".join(c for c in u if c.isalnum() or c in ".-^=/")
     u = u.strip(".-")
 
-    # Optional: force default exchange suffix for plain equities
-    if _CONFIG.default_equity_exchange_suffix:
+    # Optional: force default exchange suffix for plain equities (OFF by default)
+    default_equity_ex = _env_str("NORMALIZE_DEFAULT_EQUITY_EXCHANGE_SUFFIX", "").upper().strip()
+    if default_equity_ex:
         if "." not in u and not is_special_symbol(u) and not is_ksa(u):
             if u.isalpha() and 1 <= len(u) <= 8:
-                u = f"{u}.{_CONFIG.default_equity_exchange_suffix}"
+                u = f"{u}.{default_equity_ex}"
 
     return u
 
 
 def normalize_symbols_list(
     symbols: Union[str, List[str]],
+    *,
     limit: int = 0,
     unique: bool = True,
     validate: bool = False,
 ) -> List[str]:
-    """
-    Normalize a list of symbols.
-
-    Args:
-        symbols: String with delimiters or list of symbols
-        limit: Maximum number of symbols to return (0 = no limit)
-        unique: Whether to deduplicate symbols
-        validate: Whether to skip symbols classified INVALID or POOR
-
-    Returns:
-        List of normalized symbols
-    """
     if isinstance(symbols, str):
         parts = re.split(r"[\s,;|]+", symbols)
     else:
@@ -1336,15 +1015,15 @@ def normalize_symbols_list(
     result: List[str] = []
     seen: Set[str] = set()
 
-    for part in parts:
-        if not part or not str(part).strip():
+    for p in parts:
+        if not p or not str(p).strip():
             continue
-        norm = normalize_symbol(part)
+        norm = normalize_symbol(p)
         if not norm:
             continue
 
         if validate:
-            quality, _ = validate_symbol(part)
+            quality, _ = validate_symbol(p)
             if quality in (SymbolQuality.INVALID, SymbolQuality.POOR):
                 continue
 
@@ -1365,11 +1044,9 @@ def normalize_symbols_list(
 # Utility Functions
 # =============================================================================
 
-@lru_cache(maxsize=20000)
 def extract_base_symbol(symbol: str) -> str:
     """
-    Extract base symbol without exchange suffix.
-
+    Base symbol with *exchange suffix removed only when it's a real exchange suffix*.
     Does NOT remove share-class (BRK.B stays BRK.B).
     """
     s = normalize_symbol(symbol)
@@ -1380,13 +1057,14 @@ def extract_base_symbol(symbol: str) -> str:
     if is_ksa(s) and s.endswith(".SR"):
         return s
 
-    base, exchange = split_symbol_exchange(s)
-    return base if exchange else s
+    base, ex = split_symbol_exchange(s)
+    return base if ex else s
 
 
-@lru_cache(maxsize=20000)
 def standardize_share_class(symbol: str) -> str:
-    """Standardize share class notation (BRK-B -> BRK.B)."""
+    """
+    BRK-B -> BRK.B, BF-B -> BF.B
+    """
     s = normalize_symbol(symbol)
     if not s:
         return ""
@@ -1397,176 +1075,270 @@ def standardize_share_class(symbol: str) -> str:
     return s
 
 
-@lru_cache(maxsize=20000)
 def get_primary_exchange(symbol: str) -> Optional[str]:
     """
-    Get primary exchange for a symbol.
-
-    v7.1.0: handles US share-class tickers (BRK.B, BF.B, RDS.A) which
-    normalise to dot form, so split_symbol_exchange returns exchange=None
-    (because '.B' is not a registered exchange suffix), and the
-    `s.isalpha()` heuristic also fails (the dot makes isalpha() False).
-    Now: if the dot is a share-class delimiter and the root is a
-    plausible US ticker, route to "US".
+    Returns the COUNTRY code (e.g., "US", "UK", "KW", "JP") for the listing exchange.
+    NOTE: This is a *country* code, not the display name. Use get_exchange_display()
+    when you need the human-readable name like "Boursa Kuwait" or "JSE".
     """
     s = normalize_symbol(symbol)
     if not s:
         return None
-
     if is_ksa(s):
-        return "SAUDI"
-
-    _, exchange = split_symbol_exchange(s)
-    if exchange:
-        key = f".{exchange.upper()}"
-        return _EXCHANGE_SUFFIXES.get(key)
-
+        return "SA"
+    _, ex = split_symbol_exchange(s)
+    if ex:
+        key = f".{ex.upper()}"
+        return EXCHANGE_SUFFIXES.get(key, None)  # country code, e.g., "US", "KW", "JP"
     if is_special_symbol(s):
         return "SPECIAL"
-
-    # Plain US ticker heuristic
-    if s.isalpha() and 1 <= len(s) <= 5:
+    if is_us_ticker_heuristic(s):
         return "US"
-
-    # v7.1.0: share-class US ticker heuristic (BRK.B etc.).
-    cls_match = CLASS_DOT_RE.match(s)
-    if cls_match:
-        root = cls_match.group(1)
-        if 1 <= len(root) <= 5:
-            return "US"
-
     return None
 
 
-@lru_cache(maxsize=20000)
 def get_mic_code(symbol: str) -> Optional[str]:
-    """Get MIC (Market Identifier Code) for a symbol."""
-    exchange = get_primary_exchange(symbol)
-    if not exchange:
+    exch = get_primary_exchange(symbol)
+    if not exch:
         return None
-    if exchange == "SAUDI":
+    if exch == "SA":
         return "XSAU"
-    return _MIC_MAPPINGS.get(exchange)
+    return MIC_MAPPINGS.get(exch, None)
 
 
-@lru_cache(maxsize=20000)
 def get_currency_from_symbol(symbol: str) -> Optional[str]:
     """
-    Get currency for a symbol.
-
-    For FX pairs, returns the BASE currency (left side of the pair):
-    e.g. USDJPY=X -> "USD", EURGBP=X -> "EUR".
-
-    v7.1.0: replaced the inline US/UK/JP/EUR if-chain with a dict lookup
-    against `_CURRENCY_BY_EXCHANGE`, picking up 30+ markets that v7.0.0
-    silently returned None for: HK -> HKD, CN -> CNY, IN -> INR,
-    AU -> AUD, CA -> CAD, CH -> CHF, KR -> KRW, SG -> SGD, ZA -> ZAR,
-    AE -> AED, QA -> QAR, KW -> KWD, etc.
-
-    NOTE: this returns the LISTING currency only. It does NOT solve the
-    GBp-vs-GBP (pence vs pound) trap on UK listings -- that is a
-    price-scaling concern for the data engine / currency-normalization
-    layer, not a symbol concern.
+    v5.3.0: Uses the complete CURRENCY_BY_COUNTRY map. Returns None when the
+    currency cannot be determined — callers MUST NOT default to USD; instead
+    rely on provider-reported currency and emit a 'currency_unknown' warning.
     """
     s = normalize_symbol(symbol)
     if not s:
         return None
 
     if is_fx(s):
-        base = (
-            extract_base_symbol(s)
-            .replace("/", "")
-            .replace("-", "")
-            .replace("=X", "")
-        )
+        base = extract_base_symbol(s).replace("/", "").replace("-", "").replace("=X", "")
         return base[:3] if len(base) >= 3 else None
+
+    if is_crypto(s):
+        # crypto pairs like BTC-USD: quote currency is the second leg
+        if "-" in s:
+            quote = s.split("-", 1)[1].upper()
+            if len(quote) == 3:
+                return quote
+        return "USD"
 
     if is_ksa(s):
         return "SAR"
 
-    exchange = get_primary_exchange(s)
-    if exchange:
-        ccy = _CURRENCY_BY_EXCHANGE.get(exchange.upper())
-        if ccy:
-            return ccy
+    exch = get_primary_exchange(s)
+    if not exch or exch == "SPECIAL":
+        return None
 
-    return None
+    return CURRENCY_BY_COUNTRY.get(exch.upper())
 
 
-@lru_cache(maxsize=20000)
-def get_country_from_symbol(symbol: str) -> Optional[str]:
+def get_exchange_display(symbol: str) -> Optional[str]:
     """
-    Get the listing country for a symbol as a display-friendly name.
-
-    NEW in v7.1.0. Closes the audit gap where the data engine returned
-    "USA" for every non-`.SR` / non-`=X` / non-`=F` symbol -- mis-tagging
-    `.L` (UK), `.DE` (Germany), `.PA` (France), `.T` (Japan), `.HK`,
-    `.SS`, `.NS`, `.AX`, etc. as American.
-
-    Resolution order:
-        1. `_INDEX_COUNTRY` override for caret-prefixed major indexes
-           (^GSPC -> United States, ^FTSE -> United Kingdom, ^N225 -> Japan,
-           ^TASI -> Saudi Arabia, ...).
-        2. KSA (Saudi Arabia) by `is_ksa`.
-        3. "Global" for FX, crypto, commodity-future, ISIN, and option
-           symbols (anything classified by `is_special_symbol`) once the
-           index check has passed.
-        4. `_COUNTRY_BY_EXCHANGE` lookup keyed by `get_primary_exchange`.
-        5. Plain US ticker / US share-class heuristic.
-        6. None when nothing matches.
-
-    Returns:
-        Display-friendly English country name (e.g. "United Kingdom",
-        "Saudi Arabia", "United States", "Germany"), the literal string
-        "Global" for asset-class symbols whose listing country is
-        ambiguous or not meaningful, or None when the country cannot be
-        determined.
+    v5.3.0: Returns the human-readable exchange name to write to the sheet's
+    "Exchange" column. Examples:
+      AAPL       -> "NASDAQ/NYSE"
+      MABANEE.KW -> "Boursa Kuwait"
+      ANG.JSE    -> "JSE"
+      005930.KS  -> "KRX"
+      2222.SR    -> "Tadawul"
+    Returns None for special symbols (indices/FX/commodities/crypto) and for
+    symbols whose exchange cannot be determined.
     """
     s = normalize_symbol(symbol)
     if not s:
         return None
-
-    # 1. Major indexes have a known listing country
-    if s in _INDEX_COUNTRY:
-        return _INDEX_COUNTRY[s]
-
-    # 2. KSA shortcut (matches data engine's existing convention)
     if is_ksa(s):
-        return "Saudi Arabia"
-
-    # 3. Other special symbols: FX, crypto, commodity, ISIN, option
+        return "Tadawul"
     if is_special_symbol(s):
-        return "Global"
-
-    # 4. Exchange-suffix lookup (the audit fix - no more silent USA fallback)
-    exchange = get_primary_exchange(s)
-    if exchange:
-        country = _COUNTRY_BY_EXCHANGE.get(exchange.upper())
-        if country:
-            return country
-        # exchange code recognised but no country mapping -> still better
-        # than fabricating "USA"; surface the unknown rather than lie.
         return None
 
-    # 5. Plain US heuristic mirrors get_primary_exchange's fallback
-    if s.isalpha() and 1 <= len(s) <= 5:
-        return "United States"
+    exch = get_primary_exchange(s)
+    if not exch:
+        return None
+    return EXCHANGE_DISPLAY_NAMES.get(exch.upper())
 
-    cls_match = CLASS_DOT_RE.match(s)
-    if cls_match and 1 <= len(cls_match.group(1)) <= 5:
-        return "United States"
 
-    return None
+def get_country_from_symbol(symbol: str) -> Optional[str]:
+    """
+    v5.3.0: Returns the human-readable country name to write to the sheet's
+    "Country" column. Examples:
+      AAPL       -> "USA"
+      MABANEE.KW -> "Kuwait"
+      ANG.JSE    -> "South Africa"
+      2222.SR    -> "Saudi Arabia"
+    Returns None for special symbols and unknown listings.
+    """
+    s = normalize_symbol(symbol)
+    if not s:
+        return None
+    if is_ksa(s):
+        return "Saudi Arabia"
+    if is_special_symbol(s):
+        return None
+
+    exch = get_primary_exchange(s)
+    if not exch:
+        return None
+    return COUNTRY_DISPLAY_NAMES.get(exch.upper())
 
 
 @lru_cache(maxsize=20000)
 def market_hint_for(symbol: str) -> str:
-    """Get market hint for a symbol."""
     if is_ksa(symbol):
         return "KSA"
     if is_special_symbol(symbol):
         return "SPECIAL"
     return "GLOBAL"
+
+
+# =============================================================================
+# Composite metadata inference (v5.3.0 — SINGLE SOURCE OF TRUTH)
+# =============================================================================
+
+def infer_symbol_metadata(symbol: str) -> Dict[str, Optional[str]]:
+    """
+    SINGLE SOURCE OF TRUTH for symbol-derived metadata.
+
+    Consumers (enriched_quote, data_engine_v2) MUST call this once per symbol
+    and use the returned dict. They MUST NOT re-derive exchange / currency /
+    country independently — that is what caused the v5.2.0 sheet corruption.
+
+    Returns a dict with these keys (any may be None when not inferable):
+      - symbol_normalized : canonical symbol (e.g., '2222.SR', 'MABANEE.KW')
+      - exchange          : human-readable exchange name for the sheet
+      - exchange_code     : country code used internally (e.g., 'US', 'KW')
+      - currency          : ISO 4217 code (e.g., 'USD', 'KWD', 'SAR')
+      - country           : human-readable country name for the sheet
+      - country_code      : same as exchange_code (ISO-ish 2-letter)
+      - market_type       : MarketType enum value as string
+      - asset_class       : AssetClass enum value as string
+      - mic               : ISO 10383 Market Identifier Code
+      - inferred_from     : provenance — one of:
+          'ksa_pattern'      (KSA Tadawul ####.SR or TADAWUL: prefix)
+          'special_pattern'  (index/fx/commodity/crypto/option)
+          'exchange_suffix'  (e.g., .KW, .JSE, .L)
+          'us_heuristic'     (plain 1-5 letter alpha ticker — low confidence)
+          'none'             (could not infer; consumer must rely on provider)
+
+    Inference precedence: ksa_pattern > special_pattern > exchange_suffix
+    > us_heuristic > none.
+
+    Conservative behavior: when no rule matches, returns None for the
+    metadata fields. Consumers MUST NOT default missing currency to 'USD'
+    or missing exchange to 'NASDAQ/NYSE' — emit a warning instead.
+
+    Examples:
+      infer_symbol_metadata('AAPL')
+        -> exchange='NASDAQ/NYSE', currency='USD', country='USA',
+           country_code='US', inferred_from='us_heuristic'
+      infer_symbol_metadata('MABANEE.KW')
+        -> exchange='Boursa Kuwait', currency='KWD', country='Kuwait',
+           country_code='KW', inferred_from='exchange_suffix'
+      infer_symbol_metadata('2222.SR')
+        -> exchange='Tadawul', currency='SAR', country='Saudi Arabia',
+           country_code='SA', inferred_from='ksa_pattern'
+      infer_symbol_metadata('^GSPC')
+        -> market_type='special', asset_class='index',
+           inferred_from='special_pattern' (no exchange/currency/country)
+      infer_symbol_metadata('XYZ123')
+        -> all metadata None, inferred_from='none'
+    """
+    result: Dict[str, Optional[str]] = {
+        "symbol_normalized": None,
+        "exchange": None,
+        "exchange_code": None,
+        "currency": None,
+        "country": None,
+        "country_code": None,
+        "market_type": None,
+        "asset_class": None,
+        "mic": None,
+        "inferred_from": "none",
+    }
+
+    s = normalize_symbol(symbol)
+    if not s:
+        return result
+
+    result["symbol_normalized"] = s
+
+    # ---- Tier 1: KSA pattern -------------------------------------------------
+    if is_ksa(s):
+        result.update({
+            "exchange": "Tadawul",
+            "exchange_code": "SA",
+            "currency": "SAR",
+            "country": "Saudi Arabia",
+            "country_code": "SA",
+            "market_type": MarketType.KSA.value,
+            "asset_class": detect_asset_class(s).value,
+            "mic": "XSAU",
+            "inferred_from": "ksa_pattern",
+        })
+        return result
+
+    # ---- Tier 2: Special symbols (index / FX / commodity / crypto / option) -
+    if is_special_symbol(s):
+        currency = None
+        if is_fx(s):
+            currency = get_currency_from_symbol(s)
+        elif is_crypto(s):
+            currency = get_currency_from_symbol(s)
+        elif is_commodity_future(s):
+            currency = "USD"  # commodity futures quoted in USD by convention
+        # indices: currency depends on the index — leave None for caller to fill
+
+        result.update({
+            "market_type": MarketType.SPECIAL.value,
+            "asset_class": detect_asset_class(s).value,
+            "currency": currency,
+            "inferred_from": "special_pattern",
+        })
+        return result
+
+    # ---- Tier 3: Exchange suffix (.KW, .JSE, .L, etc.) ----------------------
+    _, ex_suffix = split_symbol_exchange(s)
+    if ex_suffix:
+        country_code = EXCHANGE_SUFFIXES.get(f".{ex_suffix}")
+        if country_code:
+            country_code_u = country_code.upper()
+            result.update({
+                "exchange": EXCHANGE_DISPLAY_NAMES.get(country_code_u),
+                "exchange_code": country_code_u,
+                "currency": CURRENCY_BY_COUNTRY.get(country_code_u),
+                "country": COUNTRY_DISPLAY_NAMES.get(country_code_u),
+                "country_code": country_code_u,
+                "market_type": detect_market_type(s).value,
+                "asset_class": detect_asset_class(s).value,
+                "mic": MIC_MAPPINGS.get(country_code_u),
+                "inferred_from": "exchange_suffix",
+            })
+            return result
+
+    # ---- Tier 4: Plain US ticker heuristic (low confidence) -----------------
+    if is_us_ticker_heuristic(s):
+        result.update({
+            "exchange": "NASDAQ/NYSE",
+            "exchange_code": "US",
+            "currency": "USD",
+            "country": "USA",
+            "country_code": "US",
+            "market_type": MarketType.US.value,
+            "asset_class": detect_asset_class(s).value,
+            "mic": "XNYS",
+            "inferred_from": "us_heuristic",
+        })
+        return result
+
+    # ---- Tier 5: Nothing matched — return Nones with asset_class best-effort
+    result["asset_class"] = detect_asset_class(s).value
+    return result
 
 
 # =============================================================================
@@ -1576,25 +1348,13 @@ def market_hint_for(symbol: str) -> str:
 @lru_cache(maxsize=20000)
 def to_yahoo_symbol(symbol: str) -> str:
     """
-    Convert symbol to Yahoo Finance format.
-
-    v7.2.0: equity exchange suffixes are now TRANSLATED to the exact
-    suffix Yahoo expects (via `_YAHOO_SUFFIX_MAP`) instead of being
-    echoed verbatim, and share-class DOT tickers are converted back to
-    Yahoo's DASH form.
-
-    Examples:
-        "AAPL"      -> "AAPL"
-        "AAPL.US"   -> "AAPL"
-        "AAPL.NYSE" -> "AAPL"
-        "III.LSE"   -> "III.L"
-        "BARC.L"    -> "BARC.L"
-        "7203.TYO"  -> "7203.T"
-        "BRK.B"     -> "BRK-B"
-        "BRK.B.US"  -> "BRK-B"
-        "2222.SR"   -> "2222.SR"
-        "EUR/USD"   -> "EURUSD=X"
-        "^GSPC"     -> "^GSPC"
+    Yahoo (yfinance) generally expects:
+      - US equities: AAPL (NOT AAPL.US)
+      - KSA: 2222.SR
+      - Indices: ^GSPC etc
+      - FX: EURUSD=X
+      - Futures: GC=F
+      - Crypto: BTC-USD
     """
     s = normalize_symbol(symbol)
     if not s:
@@ -1604,18 +1364,9 @@ def to_yahoo_symbol(symbol: str) -> str:
         return s if s.endswith(".SR") else f"{s}.SR"
 
     if is_index(s):
-        if s in _INDEX_COMMON:
-            return _INDEX_COMMON[s]
-        if s.startswith("^"):
-            return s
-        # Accept INDX-suffixed inputs as a safety net (normalize_symbol
-        # already canonicalizes them, but downstream may call this fn
-        # directly on a non-normalized input).
-        idx_sm = INDEX_SUFFIX_RE.match(s)
-        if idx_sm:
-            left = idx_sm.group(1).upper()
-            return _INDEX_COMMON.get(left, f"^{left}")
-        return f"^{s}"
+        if s in INDEX_COMMON:
+            return INDEX_COMMON[s]
+        return f"^{s}" if not s.startswith("^") else s
 
     if is_fx(s):
         base = extract_base_symbol(s).replace("/", "").replace("-", "")
@@ -1628,68 +1379,37 @@ def to_yahoo_symbol(symbol: str) -> str:
     if is_crypto(s):
         return s if "-" in s else f"{s}-USD"
 
-    # --- Equity ---------------------------------------------------------
-    # v7.2.0: translate the (possibly aliased) exchange suffix to the
-    # specific suffix Yahoo expects, and convert share-class DOT tickers
-    # back to Yahoo's DASH form.
-    base, raw_suffix = split_symbol_exchange(s)
-    if raw_suffix is not None:
-        yahoo_suffix = _YAHOO_SUFFIX_MAP.get(raw_suffix.upper())
-        if yahoo_suffix is not None:
-            base_out = _share_class_dot_to_dash(base)
-            return f"{base_out}{yahoo_suffix}" if yahoo_suffix else base_out
-        # Recognised by _EXCHANGE_SUFFIXES (e.g. a caller-added env
-        # suffix) but with no Yahoo mapping -> pass through unchanged.
-        return s
-
-    # No exchange suffix. Could still be a share-class DOT ticker (BRK.B).
-    return _share_class_dot_to_dash(s)
-
-
-@lru_cache(maxsize=20000)
-def to_finnhub_symbol(symbol: str) -> str:
-    """
-    Convert symbol to Finnhub format.
-
-    v7.2.0: strips ALL US exchange aliases (.NYSE/.N/.OQ/.NM/.NG), not
-    just the literal .US, so US-listed names always reach Finnhub as the
-    bare ticker.
-    """
-    s = normalize_symbol(symbol)
-    if not s:
-        return ""
-
-    if is_special_symbol(s):
-        return s
-
-    base, exchange = split_symbol_exchange(s)
-    if exchange:
-        # Any US-aliased suffix (.US/.NYSE/.N/.OQ/.NM/.NG) -> bare ticker.
-        if _EXCHANGE_SUFFIXES.get(f".{exchange.upper()}") == "US":
-            return base
+    # Strip known exchange suffix like .US for Yahoo equity
+    base, ex = split_symbol_exchange(s)
+    if ex == "US":
+        return base
 
     return s
 
 
 @lru_cache(maxsize=20000)
-def to_eodhd_symbol(symbol: str, default_exchange: Optional[str] = None) -> str:
+def to_finnhub_symbol(symbol: str) -> str:
+    s = normalize_symbol(symbol)
+    if not s:
+        return ""
+    if is_special_symbol(s):
+        return s
+
+    base, ex = split_symbol_exchange(s)
+    # Finnhub often wants plain ticker for US
+    if ex == "US":
+        return base
+    return s
+
+
+@lru_cache(maxsize=20000)
+def to_eodhd_symbol(symbol: str, *, default_exchange: Optional[str] = None) -> str:
     """
-    Convert symbol to EODHD format (TICKER.EXCHANGE).
+    EODHD typically expects Equity symbols as: TICKER.EXCHANGE (e.g., AAPL.US, 2222.SR)
 
-    v7.2.0: aliased exchange suffixes are now TRANSLATED to EODHD
-    exchange codes (via `_EODHD_SUFFIX_MAP`) instead of being echoed
-    verbatim. Yahoo-style short suffixes EODHD rejects (`.L`, `.NYSE`,
-    `.N`, `.OQ`, `.TYO`, ...) are mapped to EODHD's codes. Suffixes not
-    present in the map fall back to the raw suffix (pre-7.2.0 behaviour).
-
-    Examples:
-        "AAPL"      -> "AAPL.US"
-        "AAPL.NYSE" -> "AAPL.US"
-        "BARC.L"    -> "BARC.LSE"
-        "III.LSE"   -> "III.LSE"
-        "7203.TYO"  -> "7203.TSE"
-        "BRK.B"     -> "BRK.B.US"
-        "2222.SR"   -> "2222.SR"
+    v5.2.0 FIX (retained):
+    - Share-class tickers like BRK.B are NOT an exchange suffix.
+      We append the default exchange: BRK.B -> BRK.B.US
     """
     s = normalize_symbol(symbol)
     if not s:
@@ -1701,37 +1421,34 @@ def to_eodhd_symbol(symbol: str, default_exchange: Optional[str] = None) -> str:
     if is_ksa(s):
         return s if s.endswith(".SR") else f"{s}.SR"
 
-    base, raw_suffix = split_symbol_exchange(s)
-    if raw_suffix is not None:
-        # v7.2.0: map to EODHD's exchange code; unknown -> raw suffix.
-        eodhd_code = _EODHD_SUFFIX_MAP.get(raw_suffix.upper(), raw_suffix.upper())
-        return f"{base}.{eodhd_code}"
+    base, ex = split_symbol_exchange(s)
+    if ex:
+        # already has a real exchange suffix
+        return f"{base}.{ex}"
 
-    exchange = (default_exchange or _CONFIG.default_exchange).upper()
-    return f"{s}.{exchange}"
+    ex2 = (default_exchange or _default_exchange()).upper()
+    return f"{s}.{ex2}"
 
 
 @lru_cache(maxsize=20000)
 def to_bloomberg_symbol(symbol: str) -> str:
-    """Convert symbol to Bloomberg format."""
     s = normalize_symbol(symbol)
     if not s:
         return ""
-
     if is_special_symbol(s):
         return s
-
     if is_ksa(s):
+        # Bloomberg KSA commonly uses "AB"
         return f"{s.replace('.SR', '')} AB"
 
-    base, exchange = split_symbol_exchange(s)
-    if exchange:
+    base, ex = split_symbol_exchange(s)
+    if ex:
         bloomberg_ex = {
             "US": "US",
             "UK": "LN",
             "JP": "JP",
             "HK": "HK",
-        }.get(exchange.upper(), exchange.upper())
+        }.get(ex.upper(), ex.upper())
         return f"{base} {bloomberg_ex}"
 
     return f"{s} US"
@@ -1739,63 +1456,52 @@ def to_bloomberg_symbol(symbol: str) -> str:
 
 @lru_cache(maxsize=20000)
 def to_reuters_symbol(symbol: str) -> str:
-    """Convert symbol to Reuters format."""
     s = normalize_symbol(symbol)
     if not s:
         return ""
-
-    base, exchange = split_symbol_exchange(s)
-    if exchange:
-        if exchange.upper() == "NASDAQ":
+    base, ex = split_symbol_exchange(s)
+    if ex:
+        if ex.upper() == "NASDAQ":
             return f"{base}.OQ"
-        if exchange.upper() == "NYSE":
+        if ex.upper() == "NYSE":
             return f"{base}.N"
     return s
 
 
 @lru_cache(maxsize=20000)
 def to_google_symbol(symbol: str) -> str:
-    """Convert symbol to Google Finance format."""
     s = normalize_symbol(symbol)
     if not s:
         return ""
-
     if is_ksa(s):
         return f"TADAWUL:{s.replace('.SR', '')}"
 
-    base, exchange = split_symbol_exchange(s)
-    if exchange:
-        exchange_map = {
-            "US": "NYSE", "NASDAQ": "NASDAQ", "UK": "LON",
-            "JP": "TYO", "HK": "HKG",
-        }.get(exchange.upper(), exchange.upper())
+    base, ex = split_symbol_exchange(s)
+    if ex:
+        exchange_map = {"US": "NYSE", "NASDAQ": "NASDAQ", "UK": "LON", "JP": "TYO", "HK": "HKG"}.get(ex.upper(), ex.upper())
         return f"{exchange_map}:{base}"
     return s
 
 
 @lru_cache(maxsize=20000)
 def to_tradingview_symbol(symbol: str) -> str:
-    """Convert symbol to TradingView format."""
     s = normalize_symbol(symbol)
     if not s:
         return ""
-
     if is_ksa(s):
         return f"TADAWUL:{s.replace('.SR', '')}"
-
     if is_fx(s):
         return f"FX:{extract_base_symbol(s).replace('/', '').replace('-', '').replace('=X', '')}"
-
     if is_crypto(s):
         return f"BINANCE:{s.replace('-', '')}"
 
-    base, exchange = split_symbol_exchange(s)
-    if exchange:
+    base, ex = split_symbol_exchange(s)
+    if ex:
         exchange_map = {
             "UK": "LSE", "FR": "EURONEXT", "DE": "XETR",
             "JP": "TSE", "HK": "HKEX", "CN": "SSE",
             "AU": "ASX", "CA": "TSX", "US": "NASDAQ",
-        }.get(exchange.upper(), exchange.upper())
+        }.get(ex.upper(), ex.upper())
         return f"{exchange_map}:{base}"
 
     return f"NASDAQ:{s}"
@@ -1806,11 +1512,9 @@ def to_tradingview_symbol(symbol: str) -> str:
 # =============================================================================
 
 def symbol_variants(symbol: str) -> List[str]:
-    """Generate symbol variants for fallback lookups."""
     s = normalize_symbol(symbol)
     if not s:
         return []
-
     variants: List[str] = [s]
 
     if is_ksa(s):
@@ -1820,18 +1524,19 @@ def symbol_variants(symbol: str) -> List[str]:
 
     # Share class variations
     if "." in s:
-        base, exchange = split_symbol_exchange(s)
-        if exchange is None and CLASS_DOT_RE.match(s):
+        # if this is a share class (e.g., BRK.B) add dash version (BRK-B)
+        base, ex = split_symbol_exchange(s)
+        if ex is None and CLASS_DOT_RE.match(s):
             root, cls = s.rsplit(".", 1)
             variants.append(f"{root}-{cls}")
-        if exchange is not None and CLASS_DOT_RE.match(base):
+        if ex is not None and CLASS_DOT_RE.match(base):
             root, cls = base.rsplit(".", 1)
-            variants.extend([f"{root}-{cls}.{exchange}"])
+            variants.extend([f"{root}-{cls}.{ex}"])
 
     if "-" in s:
-        match = CLASS_DASH_RE.match(s)
-        if match:
-            root, cls = match.groups()
+        m = CLASS_DASH_RE.match(s)
+        if m:
+            root, cls = m.groups()
             variants.append(f"{root}.{cls}")
 
     # If no exchange suffix and not special, add common guesses
@@ -1842,7 +1547,6 @@ def symbol_variants(symbol: str) -> List[str]:
 
 
 def yahoo_symbol_variants(symbol: str) -> List[str]:
-    """Generate Yahoo Finance symbol variants."""
     s = normalize_symbol(symbol)
     if not s:
         return []
@@ -1857,10 +1561,11 @@ def yahoo_symbol_variants(symbol: str) -> List[str]:
         variants.extend([f"{code}.SR", code])
 
     # Share class conversions
-    base, exchange = split_symbol_exchange(s)
-    if exchange == "US":
-        variants.append(base)
-    if CLASS_DOT_RE.match(base) and exchange:
+    base, ex = split_symbol_exchange(s)
+    if ex == "US":
+        variants.append(base)  # AAPL.US -> AAPL for yahoo
+    if CLASS_DOT_RE.match(base) and ex:
+        # BRK.B.US -> yahoo expects BRK.B
         variants.append(base)
 
     if CLASS_DOT_RE.match(s):
@@ -1869,14 +1574,11 @@ def yahoo_symbol_variants(symbol: str) -> List[str]:
 
     if is_index(s) and not s.startswith("^"):
         variants.append(f"^{s}")
-
     if is_fx(s):
         b = extract_base_symbol(s).replace("=X", "")
         variants.extend([f"{b}=X", f"{b[:3]}/{b[3:]}"])
-
     if is_commodity_future(s):
         variants.append(f"{extract_base_symbol(s)}=F")
-
     if is_crypto(s) and "-" not in s:
         variants.append(f"{s}-USD")
 
@@ -1884,7 +1586,6 @@ def yahoo_symbol_variants(symbol: str) -> List[str]:
 
 
 def finnhub_symbol_variants(symbol: str) -> List[str]:
-    """Generate Finnhub symbol variants."""
     s = normalize_symbol(symbol)
     if not s:
         return []
@@ -1894,8 +1595,8 @@ def finnhub_symbol_variants(symbol: str) -> List[str]:
     if f:
         variants.append(f)
 
-    base, exchange = split_symbol_exchange(s)
-    if exchange and exchange != "US":
+    base, ex = split_symbol_exchange(s)
+    if ex and ex != "US":
         variants.append(base)
 
     if extract_exchange_code(s) is None and not is_ksa(s) and not is_special_symbol(s):
@@ -1904,16 +1605,20 @@ def finnhub_symbol_variants(symbol: str) -> List[str]:
     return _unique_preserve_order(variants)
 
 
-def eodhd_symbol_variants(symbol: str, default_exchange: Optional[str] = None) -> List[str]:
-    """Generate EODHD symbol variants."""
+def eodhd_symbol_variants(symbol: str, *, default_exchange: Optional[str] = None) -> List[str]:
+    """
+    EODHD variants are crucial when input is plain ticker:
+      AAPL -> AAPL.US (default)
+      BRK.B -> BRK.B.US and BRK-B.US
+    """
     s = normalize_symbol(symbol)
     if not s:
         return []
 
     variants: List[str] = []
-    exchange = (default_exchange or _CONFIG.default_exchange).upper()
+    ex = (default_exchange or _default_exchange()).upper()
 
-    e = to_eodhd_symbol(s, default_exchange=exchange)
+    e = to_eodhd_symbol(s, default_exchange=ex)
     if e:
         variants.append(e)
 
@@ -1922,44 +1627,42 @@ def eodhd_symbol_variants(symbol: str, default_exchange: Optional[str] = None) -
         variants.extend([f"{code}.SR", code])
         return _unique_preserve_order(variants)
 
-    # Include plain + base forms
+    # Include plain + base forms (useful if provider accepts)
     base = extract_base_symbol(s)
     if base and base != s:
         variants.append(base)
 
     # Ensure default exchange suffix exists for equity-like tickers
     if extract_exchange_code(s) is None and not is_special_symbol(s):
-        variants.extend([f"{s}.{exchange}"])
+        variants.extend([f"{s}.{ex}"])
 
     # Share class: BRK.B -> BRK-B.US and BRK.B.US
-    base2, exchange2 = split_symbol_exchange(s)
-    if exchange2 is None and CLASS_DOT_RE.match(s):
+    base2, ex2 = split_symbol_exchange(s)
+    if ex2 is None and CLASS_DOT_RE.match(s):
         root, cls = s.rsplit(".", 1)
-        variants.extend([f"{root}-{cls}.{exchange}", f"{root}.{cls}.{exchange}"])
-    elif exchange2 is not None and CLASS_DOT_RE.match(base2):
+        variants.extend([f"{root}-{cls}.{ex}", f"{root}.{cls}.{ex}"])
+    elif ex2 is not None and CLASS_DOT_RE.match(base2):
         root, cls = base2.rsplit(".", 1)
-        variants.extend([f"{root}-{cls}.{exchange2}", f"{root}.{cls}.{exchange2}"])
+        variants.extend([f"{root}-{cls}.{ex2}", f"{root}.{cls}.{ex2}"])
 
     # If dash share class was input, add dot version + suffix
     if CLASS_DASH_RE.match(s):
         root, cls = s.split("-", 1)
-        variants.extend([f"{root}.{cls}.{exchange}", f"{root}.{cls}"])
+        variants.extend([f"{root}.{cls}.{ex}", f"{root}.{cls}"])
 
     return _unique_preserve_order(variants)
 
 
 def bloomberg_symbol_variants(symbol: str) -> List[str]:
-    """Generate Bloomberg symbol variants."""
     s = normalize_symbol(symbol)
     if not s:
         return []
-
     variants: List[str] = []
     b = to_bloomberg_symbol(s)
     if b:
         variants.append(b)
 
-    if b and " " in b:
+    if " " in b:
         variants.append(b.replace(" ", ""))
         parts = b.split(" ")
         if len(parts) >= 2:
@@ -1969,42 +1672,28 @@ def bloomberg_symbol_variants(symbol: str) -> List[str]:
 
 
 def reuters_symbol_variants(symbol: str) -> List[str]:
-    """Generate Reuters symbol variants."""
     s = normalize_symbol(symbol)
     if not s:
         return []
-
     variants: List[str] = []
     r = to_reuters_symbol(s)
     if r:
         variants.append(r)
-
-    if r and "." in r:
+    if "." in r:
         variants.append(r.replace(".OQ", ".O").replace(".N", ""))
-
     return _unique_preserve_order(variants)
 
 
 # =============================================================================
-# Provider-aware Normalization
+# Provider-aware normalization (optional usage by engine)
 # =============================================================================
 
 @lru_cache(maxsize=40000)
-def normalize_symbol_for_provider(
-    symbol: str,
-    provider: str,
-    default_exchange: Optional[str] = None,
-) -> str:
+def normalize_symbol_for_provider(symbol: str, provider: str, *, default_exchange: Optional[str] = None) -> str:
     """
-    Normalize symbol for a specific provider.
+    Returns a provider-ready symbol without the caller needing to remember rules.
 
-    Args:
-        symbol: Input symbol
-        provider: Provider name (yahoo, finnhub, eodhd, google, tradingview)
-        default_exchange: Default exchange for EODHD
-
-    Returns:
-        Provider-ready symbol
+    provider examples: "yahoo", "finnhub", "eodhd", "google", "tradingview"
     """
     p = (provider or "").strip().lower()
     if p in {"yahoo", "yfinance"}:
@@ -2017,5 +1706,5 @@ def normalize_symbol_for_provider(
         return to_google_symbol(symbol)
     if p in {"tv", "tradingview"}:
         return to_tradingview_symbol(symbol)
-    # Fallback to neutral
+    # fallback: neutral
     return normalize_symbol(symbol)
