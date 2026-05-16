@@ -2,7 +2,7 @@
 # core/schemas.py
 """
 ================================================================================
-Core Schemas + Sheet Headers — v6.1.0 (REGISTRY-ALIGNED / CANONICAL 5-TIER)
+Core Schemas + Sheet Headers — v6.2.0 (MENA MARKETTYPE EXTENSION)
 ================================================================================
 
 Purpose
@@ -31,6 +31,37 @@ The 5 new "Insights" columns appended in schema_registry v2.6.0 are:
 They are produced by `core.insights_builder` v1.0.0 and consumed by the
 recommendation pipeline in `core.scoring` v5.1.0 + `core.reco_normalize`
 v7.1.0.
+
+v6.2.0 changes (what moved from v6.1.0)
+---------------------------------------
+- ADD: `MarketType.EGYPT` and `MarketType.ISRAEL` enum values. These were
+  the two regions missing from the enum after the May 2026 audit work
+  expanded coverage everywhere ELSE: `enriched_quote.py` v4.6.0
+  `_SUFFIX_TO_LOCALE` added `.EG`, `.EGX`, `.TA`, `.TASE`; the
+  `yahoo_chart_provider.py` v8.2.0 / `yahoo_fundamentals_provider.py`
+  v6.2.0 `_SUFFIX_TO_LOCALE_DEFAULTS` tables added the same; and
+  `symbols_reader.py` v1.2.0 canonicalizes `.EGX` -> `.EG` and `.TASE`
+  -> `.TA`. The MarketType enum was the last hold-out.
+  Without these members, any code constructing a UnifiedQuote with
+  `market="EGYPT"` or `market="ISRAEL"` got a pydantic ValidationError.
+  v6.2.0 closes that gap.
+- BUMP: `SCHEMAS_VERSION = "6.2.0"`.
+
+NOT changed (deliberate)
+------------------------
+- TURKEY (.IS), POLAND (.WA), and the other emerging-market suffixes
+  added to v4.6.0 `_SUFFIX_TO_LOCALE` are NOT added to MarketType here.
+  The enum's design is "GCC countries enumerated by name + broad
+  categories" -- EGYPT/ISRAEL fit that pattern (Middle East / MENA),
+  the European emerging markets do not. They flow through `MarketType
+  .GLOBAL` instead, which is the same path Yahoo-listed European
+  equities have always taken.
+- All other enum values preserved verbatim. AssetClass, Recommendation,
+  DataQuality, BadgeLevel are untouched.
+- All canonical header sets, validator counts, FIELD_ALIASES, and the
+  registry bridge are untouched.
+- UnifiedQuote schema is structurally identical -- the new enum
+  members just become legal values for the existing `market` field.
 
 v6.1.0 changes (what moved from v6.0.0)
 ---------------------------------------
@@ -148,7 +179,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "6.1.0"
+SCHEMAS_VERSION = "6.2.0"
 
 # =============================================================================
 # Enums
@@ -159,6 +190,10 @@ class MarketType(str, Enum):
     UAE = "UAE"
     QATAR = "QATAR"
     KUWAIT = "KUWAIT"
+    # v6.2.0: MENA extension (matches enriched_quote.py v4.6.0
+    # _SUFFIX_TO_LOCALE entries for .EG/.EGX and .TA/.TASE).
+    EGYPT = "EGYPT"
+    ISRAEL = "ISRAEL"
     US = "US"
     GLOBAL = "GLOBAL"
     COMMODITY = "COMMODITY"
