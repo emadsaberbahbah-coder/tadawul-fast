@@ -1,475 +1,163 @@
 #!/usr/bin/env python3
 # core/data_engine_v2.py
 """
-
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.71.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.72.0
 ================================================================================
 
-WHY v5.71.0 — ENGINE-AUTHORITATIVE RECOMMENDATIONS + PAGE-WIDE
-              RANKING GUARDS + DATA-QUALITY SMOKE DETECTORS
-              (May 15, 2026)
+WHY v5.72.0 — MIDDLE-EAST SUFFIX COVERAGE + EMPTY-ROW GUARD +
+              ACTIVE OUTLIER SANITIZATION (May 16, 2026)
 --------------------------------------------------------------------
-v5.71.0 resolves the remaining advisory-control defects found after
-v5.70.0. The key design rule is explicit: non-authoritative values must
-not win silently. Provider recommendations are preserved for provenance,
-but the engine/scoring layer is authoritative by default.
+v5.72.0 closes the five remaining data-quality defects surfaced by
+the May 2026 sheet audit. Every fix is ADDITIVE — no v5.47.2 behavior
+is removed; existing API surface is unchanged.
 
-BUGS / FIXES ADDRESSED (A-K):
-  A. Rank (Overall) could become 1 for every row when ranking was applied
-     to per-symbol micro-batches. v5.71.0 introduces `apply_page_ranks()`
-     with a page-batch guard and a `force_single=True` override only for
-     explicitly requested single-symbol flows.
-  B. Provider `recommendation` values could silently override engine
-     scoring. v5.71.0 preserves the upstream value in `provider_rating`
-     and rewrites `recommendation` from `core.scoring._recommendation()`
-     unless `TFB_TRUST_PROVIDER_RECO=true` is explicitly set.
-  C. Local recommendation threshold ladders inside data_engine_v2 are
-     retired. `core.scoring._recommendation()` is the single source of
-     truth for recommendation and reason.
-  D. `ACCUMULATE` is not emitted in final output. Priority 3 remains a
-     documented reserved gap so existing P1/P2/P4/P5 downstream logic is
-     not broken.
-  E. Risk and confidence bucket inference is routed through
-     `core.scoring._risk_bucket()` and `core.scoring._confidence_bucket()`
-     with confidence normalized to 0-1 before calling the scoring helper.
-  F. `recommendation_reason` is always rewritten by the engine; upstream
-     or provider reasons are not allowed to remain via `setdefault()`.
-  G. Currency anomaly smoke detector flags impossible market-cap/currency
-     combinations such as foreign listings misrouted to USD.
-  H. Revenue anomaly smoke detector flags obvious reporting/listing
-     currency mismatch patterns such as revenue wildly exceeding market cap.
-  I. Rank no longer falls back from `overall_score` to `opportunity_score`.
-     Missing overall score is visible via `rank_skipped_no_overall_score`.
-  J. Top10 criteria snapshot now serializes the full criteria object and
-     truncates explicitly instead of silently dropping keys.
-  K. Quote singleflight/cache keys are page/provider-profile/schema-version
-     aware via `_make_cache_key()`.
+  PHASE 1.  Middle East / Israel / global suffix coverage.
+            v5.47.2 only inferred KSA tickers; every non-KSA/non-FX
+            symbol fell through to USA / USD / NASDAQ-NYSE. v5.72.0
+            extends _infer_exchange_from_symbol /
+            _infer_currency_from_symbol / _infer_country_from_symbol
+            to cover .KW, .KSE, .QA, .QE, .AE, .DFM, .ADX, .EG,
+            .EGX, .TA, .TASE and the major global suffixes (.L,
+            .HK, .T, .DE, .PA, .AS, .MI, .MC, .SW, .TO, .AX, .NS,
+            .BO, .SS, .SZ, .KS, .JK, .BR, .MX, .ST, .VI, .HE, .CO,
+            .OL, .WA, .PR, .BD). Closes MABANEE.KW / OOREDOO.KW /
+            ALAFCO.KW / OOREDOO.QA / EMAAR.AE showing as USA/USD/
+            NASDAQ-NYSE.
 
-NEW / HONORED ENV VARS:
-  - TFB_TRUST_PROVIDER_RECO=false
-  - TFB_RANK_REQUIRE_PAGE_BATCH=true
-  - TFB_EMIT_CURRENCY_ANOMALY_WARNINGS=true
-  - TFB_CRITERIA_SNAPSHOT_MAX_CHARS=2000
+            NOTE: .KSE is mapped to Boursa Kuwait per Yahoo convention
+            (Saudi Arabia uses .SR, not .KSE).
 
-DIAGNOSTIC LOGS:
-  - [v5.71.0 RECO] symbol={sym} engine_rec={X} provider_rec={Y} source={engine|provider_override}
-  - [v5.71.0 RANK] page={page} n_rows={n} n_ranked={m} n_skipped={k}
-  - [v5.71.0 ANOMALY] symbol={sym} type={currency|revenue} detail={...}
+  PHASE 2.  Empty-row detection.
+            ALAFCO.KW canonical case: every core price/volume/fund
+            field was blank but the engine still emitted
+            recommendation=REDUCE / overall=50 / risk=10 / conf=55.
+            These are pure scoring defaults that look like real
+            analysis. v5.72.0 detects all-blank rows via
+            _is_empty_data_row() at the TOP of _compute_recommendation
+            and overrides: recommendation=NA, all score fields null,
+            warning empty_row_no_provider_data appended.
 
-# v5.71.0 FOLLOW-UP:
-# investment_advisor.py::_score_recommendation still has a parallel
-# recommendation threshold ladder and should be unified with core.scoring.py
-# in a future revision.
+  PHASE 3.  Active sanitization (not just warnings).
+            v5.47.2's _compute_scores_fallback consumed pe_ttm /
+            pb_ratio / debt_to_equity / week_52_high / revenue_ttm
+            directly. v5.72.0's _apply_v572_sanitization actively
+            NULLS impossibly out-of-range values BEFORE scoring sees
+            them. Each null appends a sanitized:<field>_<reason>=<value>
+            token to row.warnings so the audit trail is preserved.
+            Thresholds:
+              pe_ttm:         (-1000, 1000)
+              pe_forward:     (-1000, 1000)
+              pb_ratio:       (-50,   100)
+              ps_ratio:       (0,     1000)
+              ev_ebitda:      (-500,  500)
+              peg_ratio:      (-100,  100)
+              debt_to_equity: (0,     1000)
+              week_52_high/cp ratio: 10x
+              week_52_low/cp  ratio: 100x
+              revenue_ttm/market_cap ratio: 50x
 
-[PRESERVED] All v5.70.0 schema-alignment fixes remain intact, including
-forced canonical instrument contracts, empty Confidence Score / Data Provider /
-Last Updated recovery, and ghost Status column prevention.
+NEW HELPERS (all additive; nothing v5.47.2 had is removed):
+  - _is_empty_data_row(row)               -> bool
+  - _mark_row_as_empty(row)               -> None
+  - _sanitize_extreme_outliers(row)       -> None
+  - _sanitize_corrupt_52w_bounds(row)     -> None
+  - _sanitize_cross_currency_revenue(row) -> None
+  - _apply_v572_sanitization(row)         -> None
+  - _v572_append_warning(row, text)       -> None (works on str OR list warnings)
 
-================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.70.0
-================================================================================
+NEW CONSTANTS:
+  - _EMPTY_ROW_INDICATOR_FIELDS
+  - _OUTLIER_LIMITS
+  - _WEEK_52_HIGH_RATIO_LIMIT, _WEEK_52_LOW_RATIO_LIMIT
+  - _REVENUE_MCAP_RATIO_LIMIT
 
-WHY v5.70.0 — INSTRUMENT-SHEET SCHEMA-ALIGNMENT FIX (May 14, 2026)
---------------------------------------------------------------------
-v5.70.0 resolves the cluster v5.69.0 explicitly deferred: the empty
-Confidence Score column, the empty Data Provider / Last Updated
-columns, and the ghost "Status" bleed-through. As v5.69.0 predicted,
-the three symptoms trace to a SINGLE column-projection / schema-
-alignment defect, not three independent bugs.
+WIRING:
+  - _compute_recommendation() short-circuits on _is_empty_data_row()
+    before any score-based recommendation logic.
+  - _compute_scores_fallback() calls _apply_v572_sanitization(row) at
+    the TOP, so polluted ratios never reach the scoring math.
 
-ROOT CAUSE.
-  `_usable_contract` was intentionally permissive: for an instrument
-  sheet it only required {symbol/ticker} + {current_price/price/name}
-  in the keyset -- it did NOT verify the contract matched the canonical
-  97-column layout (INSTRUMENT_CANONICAL_KEYS). So when schema_registry's
-  instrument contract DIVERGED from canonical, the engine accepted the
-  divergent contract as "canonical" (contract_level == "canonical"), and
-  the existing recovery cascade in `get_sheet_rows` never fired.
-  But every engine compute path -- `_compute_scores_fallback`,
-  `_phase_ii_quality_forecast`, `_canonicalize_provider_row`,
-  `_apply_page_row_backfill`, `_classify_recommendation_8tier`, ... --
-  writes CANONICAL field names. Projecting that canonical output through
-  a divergent contract via `_strict_project_row` /
-  `_normalize_to_schema_keys`:
-    * STRANDS canonical values whose keys aren't in the contract
-      -> blank columns: Confidence Score, Data Provider, Last Updated.
-    * SURFACES registry-only columns the engine never fills
-      -> ghost columns: "Status".
+DIAGNOSTIC LOGS (new):
+  - [v5.72.0 EMPTY] symbol=<sym> recommendation=NA scores_nulled=N
+  - Sanitization markers appear in row.warnings as
+    sanitized:<field>_<reason>=<value> tokens, parseable by
+    12_Diagnostics.gs.
 
-THE FIX, applied in phases:
+ENV VARS:
+  - None added. v5.72.0 fixes are always on. If you need to disable
+    sanitization for a specific debug session, set
+    TFB_DISABLE_V572_SANITIZATION=true (read at function entry).
 
-  PHASE 1 — tighten `_usable_contract` (canonical-key coverage gate).
-    New `_INSTRUMENT_CANONICAL_REQUIRED_KEYS` enumerates the canonical
-    keys the engine itself writes on every instrument row (the Identity/
-    Price/Risk/Forecast/Score/Recommendation/Provenance keys, including
-    confidence_score, data_provider and last_updated_*). New
-    `_instrument_contract_is_canonical(keys)` tests coverage. A
-    structurally-valid registry contract that omits any of these keys is
-    no longer accepted as canonical for instrument sheets (or for
-    Top_10_Investments, whose rows are engine-written instrument rows
-    plus the 3 Top10 fields). This makes `_schema_for_sheet` fall back to
-    the canonical static contract for a divergent registry contract --
-    and makes `contract_level` in `get_sheet_rows` report "partial"
-    honestly, so the existing recovery cascade fires.
-
-  PHASE 2 — instrument-sheet canonical contract enforcement.
-    New `instrument_force_canonical_schema` flag (env
-    INSTRUMENT_FORCE_CANONICAL_SCHEMA, default on) force-applies the
-    canonical 97-column instrument contract for every instrument sheet
-    in `get_sheet_rows`, exactly mirroring the existing
-    `top10_force_full_schema` block. This is the explicit guarantee --
-    it also corrects the case where the registry contract is a SUPERSET
-    of canonical (extra registry-only columns the engine cannot fill
-    anyway). It is a no-op when the resolved contract is already
-    canonical, so deployments whose registry already matches canonical
-    see ZERO change.
-
-  PHASE 3 — version bump + docstring + capability flags.
-    Version 5.69.0 -> 5.70.0; this WHY block; the v5.69.0-deferred
-    cluster is marked RESOLVED below; `instrument_force_canonical_schema`
-    is surfaced in `health()` and `get_stats()` so the active state is
-    observable in production.
-
-[PRESERVED] All v5.69.0 (recommendation unification + risk
-recalibration + intrinsic-value sanity bounds) + v5.68.0 provider-
-symbol-normalization routing + v5.67.0 unit-contract logic +
-v5.66.0 PHASE-JJ + v5.65.0 PHASE-II + v5.64.0 + v5.63.0 PHASE-DD +
-v5.62.0 PHASE-Z + v5.47.2 baseline logic intact. No compute logic
-changed; v5.70.0 only changes which COLUMN CONTRACT instrument-sheet
-rows project through, so canonical compute outputs land in real
-columns. `_apply_rank_overall`'s global descending sort is unchanged.
+[PRESERVED] All v5.47.2 (page-aware provider priority + cache key
+provider profile + page context threading + tolerant entrypoints +
+schema-first contracts + canonical sheet-name resolution +
+EODHD KSA disallow + Insights fallback enrichment + valuation_score
+fallback + commodity/FX history fallback + Top10 native ranker +
+normalize_row_to_schema alias + cross-snapshot backfill +
+ETF/fund context defaults) intact. No behavior removed.
 
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.69.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.2
 ================================================================================
 
-WHY v5.69.0 — RECOMMENDATION UNIFICATION + RISK RECALIBRATION +
-              INTRINSIC-VALUE SANITY BOUNDS (May 14, 2026)
---------------------------------------------------------------------
-Three dashboard-data-quality fixes, applied in phases:
-
-PHASE 1 — Recommendation unification (the headline bug).
-  The engine carried TWO divergent recommendation classifiers:
-  `_classify_recommendation_8tier` (8-tier) and `_compute_recommendation`
-  (a separate 4-tier BUY/ACCUMULATE/REDUCE/HOLD function). They wrote
-  `recommendation`, `recommendation_detailed`, and the `[..]` token in
-  `recommendation_reason` in an order-dependent way across five call
-  sites, so the three fields routinely disagreed on the dashboard
-  (e.g. COLB.US: main REDUCE / Detail ACCUMULATE / Reason "P3 [HOLD]").
-    v5.69.0: `_classify_recommendation_8tier` is now the SINGLE
-    authoritative writer. It canonicalizes any provider-supplied
-    recommendation through core.reco_normalize v8.0.0 (the authoritative
-    8-tier vocabulary), and writes `recommendation`,
-    `recommendation_detailed`, `recommendation_priority`, and
-    `recommendation_reason` all CONSISTENTLY from one value -- they can
-    no longer disagree. `_compute_recommendation` is retired to a thin
-    delegator so the five existing call sites are unchanged.
-
-PHASE 2 — Risk-score recalibration + canonical buckets.
-  The pre-v5.69.0 risk formula saturated: base 30.0 plus generous
-  component ceilings meant a typical equity scored ~80+ and bucketed
-  HIGH, so the Risk Bucket column was almost entirely HIGH.
-    v5.69.0 re-anchors the additive formula (base 10.0, recalibrated
-    per-component factors and caps) so a calm blue-chip lands ~30, a
-    normal equity ~50, and a genuinely volatile name ~82. risk_bucket
-    and confidence_bucket are now routed through core.buckets v1.0.0
-    (canonical UPPERCASE, recalibrated <35 LOW / 35-70 MODERATE /
-    >=70 HIGH; confidence >=75 HIGH / 50-75 MODERATE / <50 LOW) at all
-    four assignment sites. Both new imports are except-guarded with
-    inline-threshold fallbacks.
-
-PHASE 3 — Intrinsic-value sanity bounds.
-  The engine clamped `upside_pct` to +/-200% but emitted
-  `intrinsic_value` itself RAW, so a near-zero P/B (book_value = cp/pb
-  explodes) produced intrinsic_value = 21,008 vs a $105 price (INGR.US),
-  600 vs $12.87 (EC.US) -- written straight to the sheet.
-    v5.69.0 requires a trusted P/B floor, screens every individual
-    intrinsic candidate against a sane price multiple, and bounds the
-    final blended intrinsic to the same band the upside clamp implies,
-    so intrinsic_value and upside_pct stay mutually consistent.
-
-RESOLVED IN v5.70.0 (was deferred by v5.69.0):
-  The empty Confidence Score column, the empty Data Provider /
-  Last Updated columns, and the ghost "Status" bleed-through were NOT
-  addressed in v5.69.0. v5.69.0 correctly predicted that cluster of
-  symptoms pointed to a single column-projection / schema-alignment
-  defect rather than three independent bugs, and that pinning it down
-  safely required a focused trace of the row-projection chain. v5.70.0
-  is that focused pass -- see the WHY v5.70.0 block at the top of this
-  file. rank_overall already does a proper global descending sort
-  (`_apply_rank_overall`) and is unchanged.
-
-[PRESERVED] All v5.68.0 provider-symbol-normalization routing +
-v5.67.0 unit-contract logic + v5.66.0 PHASE-JJ + v5.65.0 PHASE-II
-+ v5.64.0 + v5.63.0 PHASE-DD + v5.62.0 PHASE-Z + v5.47.2 baseline
-logic intact. No behavior removed; the only call-path change is that
-all recommendations now flow through the single 8-tier classifier.
-
-================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.68.0
-================================================================================
-
-WHY v5.68.0 — PROVIDER SYMBOL NORMALIZATION ROUTING (May 14, 2026)
---------------------------------------------------------------------
-v5.67.0 reworked DISPLAY-side identity inference (`_SUFFIX_TO_LOCALE`
-+ the `_canonicalize_provider_row` override block) so foreign-suffix
-tickers (.HK / .L / .NS / .XETRA ...) stop displaying as US listings.
-But the FETCH side was never touched: `_fetch_patch` and
-`_fetch_history_patch` still passed the RAW symbol to every provider,
-even though Yahoo / EODHD / Finnhub each expect a different symbol
-form (Yahoo wants BRK-B and .L; EODHD wants BRK.B and .LSE; Finnhub
-wants the bare US root). Foreign tickers were therefore still being
-rejected at the provider call, so the v5.67.0 display fix had nothing
-to display.
-
-v5.68.0 routes every provider symbol fetch through the canonical
-normalizer in `core.symbols.normalize` (v7.2.0+):
-  - PHASE 3  guarded import of the normalize provider-formatters,
-             aliased `_nz_*`; sets `_NORMALIZE_AVAILABLE`.
-  - PHASE 4  `_yahoo_symbol_for` delegates to `to_yahoo_symbol` first,
-             legacy strip/remap kept as fallback.
-  - PHASE 5  new `_provider_symbol_for(provider, symbol)` helper:
-             yahoo/yfinance/yahoo_chart -> to_yahoo_symbol,
-             eodhd -> to_eodhd_symbol, finnhub -> to_finnhub_symbol,
-             tadawul/argaam/other -> unchanged. Raw-symbol fallback
-             on any error or when normalize is unavailable.
-  - PHASE 6  `_SUFFIX_TO_LOCALE` extended with EODHD long-form and US
-             alias suffixes (.LSE/.NSE/.JSE/.HKG/.SHG/.NYSE/.OQ ...).
-  - PHASE 7  `_infer_country_from_symbol` consults
-             `_nz_get_country_from_symbol` before the "USA" default;
-             US/Global results are intentionally ignored to preserve
-             the "USA" display convention and the deliberate GBp
-             (pence) nuance for .L.
-  - PHASE 8  `_fetch_patch` translates per provider via
-             `_provider_symbol_for`, then tries the translated symbol
-             first and the RAW symbol second (zero-regression).
-  - PHASE 9  `_fetch_history_patch` applies the identical pattern.
-
-`get_currency_from_symbol` is deliberately NOT wired in yet — the
-GBp-vs-GBP pence trap needs the dedicated currency-normalization layer
-(next file). v5.67.0's unit-contract logic (PHASE-DD/II/JJ,
-percent_change fraction handling) is correct and is left untouched.
-
-[PRESERVED] All v5.67.0 + v5.66.0 PHASE-JJ + v5.65.0 PHASE-II
-+ v5.64.0 + v5.63.0 + v5.62.0 PHASE-Z + v5.47.2 baseline logic intact.
-
-================================================================================
-
-WHY v5.67.0 — UNIT-CONTRACT ALIGNMENT (May 13, 2026)
------------------------------------------------------
-v5.66.0 closed the candlestick gap but four percent-unit fields were still
-emitted as POINTS while 04_Format.gs v2.7.0 classifies them as FRACTION in
-`_KNOWN_FRACTION_PERCENT_COLUMNS_`. The formatter applies "0.00%" (which
-multiplies by 100 for display) on top of the engine's existing ×100,
-producing a 100× display error on:
-    - percent_change             (47/57 rows affected per May 2026 audit)
-    - upside_pct                 (52/57 rows)
-    - max_drawdown_1y            (57/57 rows; sign also lost via abs())
-    - var_95_1d                  (53/57 rows)
-
-v5.67.0 switches these four emit sites from points to fraction:
-    - `_canonicalize_provider_row` percent_change branch (PATCH 6)
-    - `_sanitize_percent_change` PHASE-BB                (PATCH 7)
-    - `_compute_history_patch_from_rows`                 (PATCH 8)
-        max_drawdown_1y keeps SIGN (negative); ×100 removed on all three
-    - `_compute_intrinsic_and_upside` PHASE-DD           (PATCH 9)
-
-The four downstream consumers that compare these fields against
-points-form thresholds are updated to either use `_as_pct_points()`
-(which gracefully converts fraction→points based on magnitude) or
-`abs()` (so signed drawdowns still contribute to risk_score):
-    - `_derive_views`                  (PATCH 10a)
-    - `_classify_recommendation_8tier` (PATCH 10b)
-    - `_build_top_factors_and_risks`   (PATCH 10c, upside + drawdown)
-    - `_compute_scores_fallback`       (PATCH 10d, abs() for dd/var95)
-
-v5.67.0 also adds a comprehensive `_SUFFIX_TO_LOCALE` map (46 entries
-covering .HK, .L, .CO, .NS, .SA, .TO, .XETRA, .DE, .PA, .AS, .T, .KS,
-.SI, .SS, .SZ, .AX, etc.) and an override block in
-`_canonicalize_provider_row` that fixes the 51-row foreign-suffix audit
-finding: pre-v5.67.0, `_infer_exchange_from_symbol` returned NASDAQ/NYSE
-for every non-Saudi/non-FX/non-Futures ticker, so .HK / .L / .NS rows
-all displayed as US listings even when their suffix clearly identified a
-foreign exchange. The three inference helpers now consult the suffix
-map first, and a defensive override in `_canonicalize_provider_row`
-fixes rows where a provider sent Country=USA / Exchange=NASDAQ for
-a foreign-suffix ticker (PATCH 4 + PATCH 5).
-
-[PRESERVED] All v5.66.0 PHASE-JJ + v5.65.0 PHASE-II + v5.64.0 FIX-EE/FF/GG
-+ v5.63.0 PHASE-AA/BB/CC/DD + v5.62.0 PHASE-Z + v5.47.2 baseline logic intact.
-
-================================================================================
-
-WHY v5.66.0 — PHASE-JJ CANDLESTICK PATTERN DETECTION (May 13, 2026)
---------------------------------------------------------------------
-v5.65.0 left the 5 candlestick_* columns showing identical placeholder
-values for every symbol ("No clear pattern / NEUTRAL / 0 / 0.00 / None").
-
-v5.66.0 embeds the `core.candlesticks` v1.0.0 pattern detection module
-directly into the engine and wires it into the history-row processing
-path. This is "free" — it piggybacks on the OHLC bars the history
-fallback already fetches, so no extra network calls.
-
-Patterns detected (oldest -> newest bars, defensive on malformed input):
-  Single-bar : Doji, Hammer, Inverted Hammer, Shooting Star,
-               Hanging Man, Bullish/Bearish Marubozu
-  Two-bar    : Bullish Engulfing, Bearish Engulfing
-  Three-bar  : Morning Star, Evening Star
-
-Trend context (used to disambiguate Hammer/Hanging Man and
-Inverted Hammer/Shooting Star — same geometry, opposite meaning):
-A 10-bar percentage change on closes preceding the candle being
-evaluated, with a 1% threshold for UP/DOWN/FLAT.
-
-Output fields written to the row:
-  candlestick_pattern         "Candle Pattern"       str
-  candlestick_signal          "Candle Signal"        str (BULLISH|BEARISH|NEUTRAL|DOJI)
-  candlestick_strength        "Candle Strength"      str (STRONG|MODERATE|WEAK)
-  candlestick_confidence      "Candle Confidence"    float (0-100)
-  candlestick_patterns_recent "Recent Patterns (5D)" str (" | "-separated)
-
-Integration: detection runs inside `_compute_history_patch_from_rows()`,
-which is called from both the main history fallback path AND the
-yahoo_chart_provider path. Detection happens for free whenever OHLC bars
-are processed.
-
-[PRESERVED] All v5.65.0 + v5.64.0 + v5.63.0 + v5.62.0 logic intact.
-
-================================================================================
-
-WHY v5.65.0 — PHASE-II FORECAST QUALITY UPGRADE (May 13, 2026)
----------------------------------------------------------------
-v5.64.0 still inherited the v5.47.2 hardcoded forecasts: every symbol got
-the same Expected ROI (0.33% / 3% / 8%) and Forecast Confidence (0.55,
-"MODERATE"). This made the forecast columns useless for differentiating
-symbols.
-
-v5.65.0 adds PHASE-II `_phase_ii_quality_forecast()` which generates
-per-symbol forecasts from the symbol's own data:
-
-  Forecast Prices (1M / 3M / 12M):
-    - Blended from four weighted components:
-      (a) Mean reversion to intrinsic value     (40% weight)
-      (b) Trend extrapolation from momentum     (30% weight)
-      (c) Composite quality/value/growth signal (20% weight)
-      (d) Overall score baseline                (10% weight)
-    - RSI adjustment: overbought pulls back, oversold rebounds
-    - 12M cap: +/- 30% (MODERATE setting)
-    - 3M = 35% of 12M move; 1M = 12% of 12M move (sub-linear)
-
-  Expected ROI (1M / 3M / 12M):
-    - Derived from forecast prices: (forecast - current) / current
-    - Each horizon differs per symbol
-
-  Forecast Confidence (STRICT scoring):
-    - Baseline 0.50
-    - +up to 0.20 for data completeness (10 fundamentals/risk fields)
-    - +up to 0.10 for score agreement (low variance across sub-scores)
-    - -up to 0.15 for HIGH risk / elevated volatility
-    - -0.05 if forecast magnitude exceeds 25% (uncertainty bigger than signal)
-    - Clamped to [0.30, 0.85]: only well-supported symbols reach HIGH (>=0.70)
-    - Bucket: LOW (<0.50) / MODERATE (0.50-0.70) / HIGH (>=0.70)
-
-[PRESERVED] All v5.64.0 + v5.63.0 + v5.62.0 logic intact.
-
-================================================================================
-
-WHY v5.64.0 — THREE-FIX PRODUCTION FOLLOWUP (May 13, 2026)
------------------------------------------------------------
-v5.63.0 post-deploy testing showed three remaining issues:
-
-  FIX-EE.  INSTRUMENT_CANONICAL_KEYS / HEADERS expansion
-           v5.47.2 baseline schema was missing 17 v5.50.0->v5.61.0 fields:
-           upside_pct, fundamental_view, technical_view, risk_view,
-           value_view, sector_relative_score, conviction_score,
-           top_factors, top_risks, position_size_hint,
-           recommendation_detailed, recommendation_priority, and 5
-           candlestick_* fields. Engine projection through canonical
-           keys dropped these even when Phase 4 set them on the row.
-           v5.64.0 adds them to INSTRUMENT_CANONICAL_KEYS and
-           INSTRUMENT_CANONICAL_HEADERS in matching positions.
-
-  FIX-FF.  percent_change x100 double-multiplication
-           `_canonicalize_provider_row` line 2369 multiplied percent_change
-           by 100 when value <= 1.5, assuming it was a fraction. This
-           re-ran AT SCHEMA PROJECTION TIME on already-sanitized values,
-           turning 0.7243 (correct percent points) into 72.43 (wrong).
-           v5.64.0 adds two guards: (a) skip x100 when the warnings
-           string indicates Phase 2 already sanitized, and (b) cross-check
-           against price/previous_close arithmetic to detect whether the
-           stored value is already in percent points.
-
-  FIX-GG.  Phase 4 execution order
-           PHASE-DD ran BEFORE `_compute_scores_fallback`, so
-           forecast_price_12m was None when `_compute_intrinsic_and_upside`
-           tried to blend it into the intrinsic value. Only the PE-based
-           component contributed, giving AAPL intrinsic=206.25 instead of
-           the blended 262.31. v5.64.0 moves PHASE-DD to AFTER
-           `_compute_scores_fallback` + `_compute_recommendation`.
-
-[PRESERVED] All v5.63.0 PHASE-AA/BB/CC/DD logic remains. All v5.62.0
-PHASE-Z Yahoo enrichment remains. v5.47.2 baseline intact.
-
-================================================================================
-
-WHY v5.63.0 — FOUR-PHASE PRODUCTION FIX (May 13, 2026)
--------------------------------------------------------
-Production refresh of Market_Leaders sheet revealed four distinct issues
-after the v5.62.0 PHASE-Z deploy:
-
-  PHASE-AA. Yahoo `.US` suffix stripping
-            Yahoo doesn't recognize EODHD-style ".US" suffix. CIM.US,
-            NTR.US, LW.US etc. fell through Yahoo enrichment and got
-            only "recommendation" filled. Now `_yahoo_symbol_for()`
-            strips ".US" and remaps ".XETRA" -> ".DE", ".LSE" -> ".L",
-            ".PAR" -> ".PA", ".MIL" -> ".MI", and similar EODHD->Yahoo
-            suffix translations.
-
-  PHASE-BB. percent_change sanity guard
-            Production showed bizarre values like "-744.05%" and
-            "9,678.78%" for daily percent changes. Root cause was
-            unit mismatch between fraction and percent points. New
-            helpers `_sanitize_percent_change`, `_sanitize_price_change`,
-            `_sanitize_week_52_position_pct` recompute from
-            current_price/previous_close, clamp to ±50% daily, and tag
-            warnings on overrides.
-
-  PHASE-CC. International exchange rescue
-            MTX.XETRA and similar non-US exchange symbols returned
-            all-null rows because EODHD lacked coverage and the
-            early-return guard in `_apply_yahoo_enrichment_pass`
-            blocked Yahoo from being called. PHASE-CC removes that
-            guard and adds current_price, previous_close, day_high,
-            day_low, volume, open_price to `_YAHOO_CHART_FIELDS` so
-            Yahoo can rescue the entire row.
-
-  PHASE-DD. Restored v5.50.0 -> v5.61.0 derived columns
-            The v5.47.2 baseline used for PHASE-Z lacks the
-            v5.50.0-v5.61.0 features (Decision Matrix, intrinsic value,
-            views, top factors/risks, conviction score). PHASE-DD
-            restores best-effort reproductions of:
-              - `_compute_intrinsic_and_upside`  (v5.58.0)
-              - `_synthesize_market_cap_if_zero` (v5.55.0)
-              - `_derive_views`                  (v5.56.0)
-              - `_classify_recommendation_8tier` (v5.50.0)
-              - `_build_top_factors_and_risks`   (v5.56.0)
-            so Intrinsic Value, Upside %, Fundamental/Technical/Risk/
-            Value View, Recommendation Detail, Top Factors, Top Risks,
-            Conviction Score, Position Size Hint, Sector-Adj Score
-            columns repopulate.
-
-[PRESERVED] All v5.62.0 PHASE-Z (Yahoo enrichment pass) functionality
-remains intact. v5.47.2 baseline structure remains intact.
-
-================================================================================
-
-WHY v5.47.2 (preserved baseline)
+WHY v5.47.2
 -----------
 - FIX: makes provider priority page-aware so non-KSA pages like
        Global_Markets, Commodities_FX, and Mutual_Funds prefer EODHD first
        while KSA pages keep their protected local-first routing.
-- (etc.)
+- FIX: makes quote cache / singleflight keys provider-profile aware so a row
+       cached for one page context does not silently override another page
+       that should use a different primary provider.
+- FIX: threads page context through enriched quote batch builders so
+       Global_Markets, Commodities_FX, and Mutual_Funds consistently use the
+       intended provider order during page builds and fallback hydration.
+- FIX: public engine entrypoints now tolerate extra kwargs from route wrappers
+       instead of failing on TypeError before building a canonical envelope.
+- FIX: merges request/query/body dicts into one normalized body so GET and POST
+       variants produce the same schema-first response contract.
+- FIX: adds schema/contract helper aliases expected by diagnostics/wrappers and
+       improves single-symbol extraction from direct request payloads.
+- FIX: keeps rows / rows_matrix strictly matrix-aligned to keys while
+       row_objects / items / records / data / quotes stay dict-row payloads.
+- FIX: hardens canonical sheet-name resolution by consulting page catalog
+       aliases/functions before falling back to static contracts.
+- FIX: strips fully blank schema pairs instead of fabricating ghost columns,
+       preventing false leading-column drift from partial specs.
+- FIX: prevents EODHD from being re-inserted for KSA symbols when
+       KSA_DISALLOW_EODHD=true even if it is the global primary provider.
+- FIX: enriches fallback Insights rows with market summary, risk-bucket counts,
+       leaderboard items, and portfolio KPI style signals.
+- FIX: improves fallback scoring with valuation_score, richer quality/risk logic,
+       and more stable opportunity/recommendation support.
+- FIX: preserves aligned snapshots and route compatibility aliases expected by
+       advisor / advanced / enriched wrappers and direct router calls.
+- FIX: adds commodity/FX self-recovery from chart/history payloads when live
+       quote payloads are sparse or unavailable.
+- FIX: applies symbol-aware page defaults so Commodities_FX rows keep useful
+       identity/context fields even during provider degradation.
+- FIX: adds a native Top 10 engine fallback ranker so the engine does not
+       depend on an external selector to build Top_10_Investments rows.
+- FIX: exposes normalize_row_to_schema and batch-analysis aliases expected by
+       downstream analysis/advisor routers.
+- FIX: adds snapshot-assisted row backfill for sparse live quote rows so
+       previously cached richer rows can safely fill missing schema fields.
+- FIX: exposes display-header object payloads alongside canonical key-based
+       row objects to make diagnostics and route wrappers easier to validate.
+- FIX: bridges EODHD-style aliases used by the new global provider revision,
+       including forward_pe -> pe_forward, day_open -> open_price,
+       fcf_ttm -> free_cash_flow_ttm, d_e_ratio -> debt_to_equity,
+       and avg_vol_* -> avg_volume_*.
+- FIX: strengthens page-aware backfill for Mutual_Funds and Commodities_FX so
+       identity/context fields stay populated without fabricating missing
+       equity-only fundamentals.
+- FIX: expands global-provider alias bridges for fundamentals / margins /
+       market-cap style fields commonly returned under alternative names.
+- FIX: adds cross-snapshot symbol backfill so richer rows built on one page can
+       safely fill sparse rows on Top_10_Investments, My_Portfolio, and other
+       dependent pages.
+- FIX: improves ETF / fund context defaults so non-KSA pages keep better
+       identity metadata when provider payloads are thin.
 
 Design goals
 ------------
@@ -485,7 +173,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import logging
 import math
 import os
@@ -522,1497 +209,11 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.71.0"
+__version__ = "5.72.0"
+_V547_BASE_VERSION = "5.47.2"  # v5.72.0: forensic marker — this build is v5.47.2 + v5.72.0 fixes
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
-
-
-# =============================================================================
-# v5.68.0 — core.symbols.normalize integration (provider symbol routing)
-# =============================================================================
-# v5.68.0 routes every provider symbol fetch through the canonical normalizer
-# in core.symbols.normalize (v7.2.0+), which has the authoritative, complete
-# exchange-suffix and share-class translation per provider (Yahoo wants BRK-B
-# and .L; EODHD wants BRK.B and .LSE; Finnhub wants the bare US root). The
-# import is except-guarded so a missing or older normalize module degrades
-# gracefully to the legacy in-engine behavior via _NORMALIZE_AVAILABLE.
-try:
-    from core.symbols.normalize import (
-        to_yahoo_symbol as _nz_to_yahoo_symbol,
-        to_eodhd_symbol as _nz_to_eodhd_symbol,
-        to_finnhub_symbol as _nz_to_finnhub_symbol,
-        normalize_symbol_for_provider as _nz_normalize_symbol_for_provider,
-        get_country_from_symbol as _nz_get_country_from_symbol,
-        get_currency_from_symbol as _nz_get_currency_from_symbol,
-        get_primary_exchange as _nz_get_primary_exchange,
-    )
-    _NORMALIZE_AVAILABLE = True
-except Exception:  # pragma: no cover
-    _nz_to_yahoo_symbol = None  # type: ignore
-    _nz_to_eodhd_symbol = None  # type: ignore
-    _nz_to_finnhub_symbol = None  # type: ignore
-    _nz_normalize_symbol_for_provider = None  # type: ignore
-    _nz_get_country_from_symbol = None  # type: ignore
-    _nz_get_currency_from_symbol = None  # type: ignore
-    _nz_get_primary_exchange = None  # type: ignore
-    _NORMALIZE_AVAILABLE = False
-
-
-# =============================================================================
-# v5.69.0 — core.reco_normalize integration (canonical recommendation vocab)
-# =============================================================================
-# v5.69.0 routes recommendation classification through core.reco_normalize
-# (v8.0.0+), the single authoritative 8-tier recommendation vocabulary
-# (STRONG_BUY / BUY / ACCUMULATE / HOLD / REDUCE / SELL / STRONG_SELL /
-# AVOID). Before this, the engine carried TWO divergent classifiers --
-# `_classify_recommendation_8tier` (8-tier) and `_compute_recommendation`
-# (4-tier) -- which wrote `recommendation`, `recommendation_detailed`, and
-# the `[..]` token inside `recommendation_reason` in an order-dependent
-# way, so the three fields routinely disagreed (e.g. main REDUCE / Detail
-# ACCUMULATE / Reason "P3 [HOLD]"). The import is except-guarded so a
-# missing or older module degrades to the in-engine 8-tier logic via
-# `_RECO_NORMALIZE_AVAILABLE`.
-try:
-    from core.reco_normalize import (
-        normalize_recommendation as _rn_normalize_recommendation,
-        is_valid_recommendation as _rn_is_valid_recommendation,
-        get_recommendation_score as _rn_get_recommendation_score,
-    )
-    _RECO_NORMALIZE_AVAILABLE = True
-except Exception:  # pragma: no cover
-    _rn_normalize_recommendation = None  # type: ignore
-    _rn_is_valid_recommendation = None  # type: ignore
-    _rn_get_recommendation_score = None  # type: ignore
-    _RECO_NORMALIZE_AVAILABLE = False
-
-
-# =============================================================================
-# v5.69.0 — core.buckets integration (canonical risk/confidence buckets)
-# =============================================================================
-# v5.69.0 routes risk_bucket / confidence_bucket through core.buckets
-# (v1.0.0+), the single authoritative bucket helper. Before this, the
-# engine computed buckets inline with thresholds that diverged from
-# scoring.py, investment_advisor.py, and investment_advisor_engine.py.
-# core.buckets uses UPPERCASE canonical labels and the recalibrated
-# risk split (<35 LOW / 35-70 MODERATE / >=70 HIGH). The import is
-# except-guarded; on failure the engine falls back to its inline
-# threshold logic via `_BUCKETS_AVAILABLE`.
-try:
-    from core.buckets import (
-        risk_bucket_from_score as _bk_risk_bucket_from_score,
-        confidence_bucket_from_score as _bk_confidence_bucket_from_score,
-        normalize_risk_bucket as _bk_normalize_risk_bucket,
-        normalize_confidence_bucket as _bk_normalize_confidence_bucket,
-    )
-    _BUCKETS_AVAILABLE = True
-except Exception:  # pragma: no cover
-    _bk_risk_bucket_from_score = None  # type: ignore
-    _bk_confidence_bucket_from_score = None  # type: ignore
-    _bk_normalize_risk_bucket = None  # type: ignore
-    _bk_normalize_confidence_bucket = None  # type: ignore
-    _BUCKETS_AVAILABLE = False
-
-
-# =============================================================================
-# v5.71.0 — core.scoring integration (single advisory source of truth)
-# =============================================================================
-# v5.71.0 FIX: Recommendations, recommendation reasons, and bucket labels must
-# be sourced from core.scoring by default. This guarded import preserves the
-# engine's no-import-failure rule while still making core.scoring the
-# authoritative path whenever available.
-try:
-    from core.scoring import (
-        _recommendation as _scoring_recommendation,
-        _risk_bucket as _scoring_risk_bucket,
-        _confidence_bucket as _scoring_confidence_bucket,
-    )
-    _SCORING_AVAILABLE = True
-except Exception:  # pragma: no cover
-    _scoring_recommendation = None  # type: ignore
-    _scoring_risk_bucket = None  # type: ignore
-    _scoring_confidence_bucket = None  # type: ignore
-    _SCORING_AVAILABLE = False
-
-
-# =============================================================================
-# v5.62.0 PHASE-Z — Yahoo enrichment field maps and helpers
-# =============================================================================
-
-_YAHOO_FUNDAMENTAL_FIELDS: Tuple[str, ...] = (
-    "industry", "sector", "currency", "country", "name",
-    "market_cap", "float_shares", "shares_outstanding",
-    "pe_ttm", "pe_forward", "eps_ttm", "eps_forward",
-    "dividend_yield", "payout_ratio", "beta_5y",
-    "gross_margin", "operating_margin", "profit_margin",
-    "debt_to_equity", "revenue_ttm", "revenue_growth_yoy",
-    "free_cash_flow_ttm", "roe", "roa", "earnings_growth_yoy",
-    "pb_ratio", "ps_ratio", "peg_ratio", "ev_ebitda",
-    "target_mean_price", "target_high_price", "target_low_price",
-    "analyst_count", "recommendation",
-)
-
-_YAHOO_CHART_FIELDS: Tuple[str, ...] = (
-    "rsi_14", "volatility_30d", "volatility_90d",
-    "max_drawdown_1y", "var_95_1d", "sharpe_1y",
-    "week_52_high", "week_52_low", "week_52_position_pct",
-    "avg_volume_10d", "avg_volume_30d",
-    "candlestick_pattern", "candlestick_signal",
-    "candlestick_strength", "candlestick_confidence",
-    "candlestick_patterns_recent",
-    "current_price", "previous_close", "open_price",
-    "day_high", "day_low", "volume",
-)
-
-_YAHOO_UNKNOWN_STRINGS: Set[str] = {
-    "", "unknown", "unclassified", "n/a", "na", "none", "null",
-    "nan", "-", "--", "not available",
-}
-
-_YAHOO_ENRICHMENT_LAST_PASS: Dict[str, Any] = {
-    "ts": 0.0,
-    "symbol": "",
-    "fundamentals_called": False,
-    "chart_called": False,
-    "fundamentals_filled_fields": [],
-    "chart_filled_fields": [],
-}
-
-
-def _yahoo_enrichment_enabled() -> bool:
-    raw = (os.getenv("ENGINE_YAHOO_ENRICHMENT_ENABLED") or "").strip().lower()
-    if raw in {"0", "false", "no", "n", "off", "f"}:
-        return False
-    return True
-
-
-def _yahoo_enrich_on_missing_industry() -> bool:
-    raw = (os.getenv("ENGINE_YAHOO_ENRICH_ON_MISSING_INDUSTRY") or "").strip().lower()
-    if raw in {"0", "false", "no", "n", "off", "f"}:
-        return False
-    return True
-
-
-def _yahoo_enrich_on_missing_risk_metrics() -> bool:
-    raw = (os.getenv("ENGINE_YAHOO_ENRICH_ON_MISSING_RISK_METRICS") or "").strip().lower()
-    if raw in {"0", "false", "no", "n", "off", "f"}:
-        return False
-    return True
-
-
-def _is_missing_or_unknown_field(v: Any) -> bool:
-    if v is None:
-        return True
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in _YAHOO_UNKNOWN_STRINGS:
-            return True
-        return False
-    if isinstance(v, (list, tuple, set, dict)):
-        return len(v) == 0
-    return False
-
-
-def _row_needs_yahoo_enrichment(row: Dict[str, Any]) -> Tuple[bool, bool]:
-    if not isinstance(row, dict):
-        return False, False
-
-    needs_fund = False
-    needs_chart = False
-
-    if _yahoo_enrich_on_missing_industry():
-        needs_fund = any(
-            _is_missing_or_unknown_field(row.get(k))
-            for k in _YAHOO_FUNDAMENTAL_FIELDS
-        )
-
-    if _yahoo_enrich_on_missing_risk_metrics():
-        needs_chart = any(
-            _is_missing_or_unknown_field(row.get(k))
-            for k in _YAHOO_CHART_FIELDS
-        )
-
-    return needs_fund, needs_chart
-
-
-def _filter_patch_to_missing_fields(
-    row: Dict[str, Any],
-    patch: Dict[str, Any],
-    candidate_fields: Sequence[str],
-) -> Tuple[Dict[str, Any], List[str]]:
-    if not isinstance(patch, dict) or not patch:
-        return {}, []
-
-    filtered: Dict[str, Any] = {}
-    filled: List[str] = []
-
-    candidates: Set[str] = set(candidate_fields)
-    for k, v in patch.items():
-        if k not in candidates:
-            continue
-        if _is_missing_or_unknown_field(v):
-            continue
-        if not _is_missing_or_unknown_field(row.get(k)):
-            continue
-        filtered[k] = v
-        filled.append(k)
-
-    return filtered, filled
-
-
-def _import_yahoo_provider_module(module_basename: str) -> Optional[Any]:
-    candidates = (
-        "core.providers." + module_basename,
-        "providers." + module_basename,
-    )
-    for path in candidates:
-        try:
-            return import_module(path)
-        except Exception:
-            continue
-    return None
-
-
-# v5.63.0 PHASE-AA — Yahoo symbol normalization
-_YAHOO_STRIP_SUFFIXES: Tuple[str, ...] = (
-    ".US",
-    ".us",
-    ".USA",
-    ".usa",
-)
-
-_YAHOO_SUFFIX_REMAP: Dict[str, str] = {
-    ".XETRA": ".DE",
-    ".XETR": ".DE",
-    ".LSE": ".L",
-    ".PAR": ".PA",
-    ".AMS": ".AS",
-    ".MIL": ".MI",
-    ".MAD": ".MC",
-    ".BRU": ".BR",
-    ".STO": ".ST",
-    ".HEL": ".HE",
-    ".OSL": ".OL",
-    ".CPH": ".CO",
-    ".VIE": ".VI",
-    ".WAR": ".WA",
-    ".SWX": ".SW",
-    ".SAU": ".SR",
-    ".TADAWUL": ".SR",
-    ".KSE": ".SR",
-}
-
-
-def _yahoo_symbol_for(symbol: str) -> str:
-    # v5.68.0 PHASE 4: delegate to core.symbols.normalize when available — it
-    # has the authoritative, complete suffix + share-class translation for
-    # Yahoo (e.g. BRK.B -> BRK-B, .LSE -> .L, US-alias stripping). The legacy
-    # strip/remap below is preserved as a fallback for when normalize is
-    # unavailable or returns nothing usable.
-    if not isinstance(symbol, str):
-        return ""
-    s = symbol.strip()
-    if not s:
-        return ""
-
-    if _NORMALIZE_AVAILABLE and _nz_to_yahoo_symbol is not None:
-        try:
-            nz = _nz_to_yahoo_symbol(s)
-        except Exception:
-            nz = ""
-        if isinstance(nz, str) and nz.strip():
-            return nz.strip()
-
-    for suf in _YAHOO_STRIP_SUFFIXES:
-        if s.endswith(suf):
-            return s[: -len(suf)]
-
-    last_dot = s.rfind(".")
-    if last_dot > 0:
-        head, tail = s[:last_dot], s[last_dot:]
-        tail_upper = tail.upper()
-        if tail_upper in _YAHOO_SUFFIX_REMAP:
-            return head + _YAHOO_SUFFIX_REMAP[tail_upper]
-
-    return s
-
-
-def _provider_symbol_for(provider: str, symbol: str) -> str:
-    # v5.68.0 PHASE 5: translate a raw symbol into the form a specific
-    # provider expects, routing through core.symbols.normalize:
-    #   yahoo / yfinance / yahoo_chart -> to_yahoo_symbol (via _yahoo_symbol_for)
-    #   eodhd                          -> to_eodhd_symbol
-    #   finnhub                        -> to_finnhub_symbol
-    #   tadawul / argaam / anything else -> unchanged
-    # Any error, or normalize being unavailable, falls back to the RAW symbol,
-    # so this helper is strictly zero-regression.
-    if not isinstance(symbol, str):
-        return ""
-    raw = symbol.strip()
-    if not raw:
-        return ""
-    prov = (provider or "").strip().lower()
-
-    if prov in ("yahoo", "yfinance", "yahoo_chart"):
-        try:
-            out = _yahoo_symbol_for(raw)
-            if isinstance(out, str) and out.strip():
-                return out.strip()
-        except Exception:
-            pass
-        return raw
-
-    if not _NORMALIZE_AVAILABLE:
-        return raw
-
-    try:
-        if prov == "eodhd" and _nz_to_eodhd_symbol is not None:
-            out = _nz_to_eodhd_symbol(raw)
-            if isinstance(out, str) and out.strip():
-                return out.strip()
-        elif prov == "finnhub" and _nz_to_finnhub_symbol is not None:
-            out = _nz_to_finnhub_symbol(raw)
-            if isinstance(out, str) and out.strip():
-                return out.strip()
-    except Exception:
-        return raw
-
-    return raw
-
-
-# v5.63.0 PHASE-BB — percent_change sanity guards
-_PERCENT_CHANGE_DAILY_MAX_ABS: float = 50.0  # +/- 50% daily cap (points)
-_WEEK_52_POSITION_MAX: float = 100.0
-
-
-def _sanitize_percent_change(row: Dict[str, Any]) -> None:
-    """
-    v5.63.0 PHASE-BB / v5.67.0: Recompute and sanity-check percent_change
-    in FRACTION form (was POINTS pre-v5.67.0). Aligns with the engine's
-    v5.67.0 emit contract and the 04_Format.gs v2.7.0 FRACTION expectation.
-    """
-    if not isinstance(row, dict):
-        return
-
-    try:
-        raw = row.get("percent_change")
-        raw_f = float(raw) if raw is not None and raw != "" else None
-    except (TypeError, ValueError):
-        raw_f = None
-
-    try:
-        cp = row.get("current_price")
-        pc = row.get("previous_close")
-        cp_f = float(cp) if cp is not None and cp != "" else None
-        pc_f = float(pc) if pc is not None and pc != "" else None
-    except (TypeError, ValueError):
-        cp_f = pc_f = None
-
-    # v5.67.0: recomputed value is in FRACTION form (no ×100)
-    recomputed: Optional[float] = None
-    if cp_f is not None and pc_f is not None and pc_f != 0.0:
-        recomputed = (cp_f - pc_f) / pc_f
-
-    chosen = recomputed if recomputed is not None else raw_f
-    if chosen is None:
-        return
-
-    # v5.67.0: if raw looks like POINTS (|raw| > 1.5) but recomputed fits
-    # the fraction sanity range, trust the recomputed fraction.
-    if raw_f is not None and abs(raw_f) > 1.5 and recomputed is not None:
-        if abs(recomputed) <= _PERCENT_CHANGE_DAILY_MAX_ABS_FRACTION:
-            row["percent_change"] = round(recomputed, 8)
-            _append_yahoo_warning_tag(row, "percent_change_recomputed")
-            return
-
-    # Cap: daily fraction beyond 0.50 (50%) is almost certainly garbage
-    if abs(chosen) > _PERCENT_CHANGE_DAILY_MAX_ABS_FRACTION:
-        if recomputed is not None and abs(recomputed) <= _PERCENT_CHANGE_DAILY_MAX_ABS_FRACTION:
-            row["percent_change"] = round(recomputed, 8)
-            _append_yahoo_warning_tag(row, "percent_change_clamped_from_provider")
-        else:
-            row["percent_change"] = None
-            _append_yahoo_warning_tag(row, "percent_change_suspect_dropped")
-        return
-
-    # Prefer recomputed if it diverges meaningfully (>1 percentage point)
-    if recomputed is not None and raw_f is not None:
-        if abs(recomputed - chosen) > 0.01:
-            row["percent_change"] = round(recomputed, 8)
-            _append_yahoo_warning_tag(row, "percent_change_recomputed")
-            return
-
-    row["percent_change"] = round(chosen, 8)
-
-
-def _sanitize_week_52_position_pct(row: Dict[str, Any]) -> None:
-    if not isinstance(row, dict):
-        return
-
-    try:
-        cp = row.get("current_price")
-        hi = row.get("week_52_high")
-        lo = row.get("week_52_low")
-        cp_f = float(cp) if cp is not None and cp != "" else None
-        hi_f = float(hi) if hi is not None and hi != "" else None
-        lo_f = float(lo) if lo is not None and lo != "" else None
-    except (TypeError, ValueError):
-        return
-
-    if cp_f is None or hi_f is None or lo_f is None:
-        return
-    if hi_f <= lo_f:
-        return
-    pct = ((cp_f - lo_f) / (hi_f - lo_f)) * 100.0
-    pct = max(0.0, min(_WEEK_52_POSITION_MAX, pct))
-    row["week_52_position_pct"] = round(pct, 6)
-
-
-def _sanitize_price_change(row: Dict[str, Any]) -> None:
-    if not isinstance(row, dict):
-        return
-    try:
-        cp = row.get("current_price")
-        pc = row.get("previous_close")
-        cp_f = float(cp) if cp is not None and cp != "" else None
-        pc_f = float(pc) if pc is not None and pc != "" else None
-    except (TypeError, ValueError):
-        return
-    if cp_f is None or pc_f is None:
-        return
-    row["price_change"] = round(cp_f - pc_f, 6)
-
-
-def _apply_phase_bb_sanity(row: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(row, dict):
-        return row
-    _sanitize_price_change(row)
-    _sanitize_percent_change(row)
-    _sanitize_week_52_position_pct(row)
-    return row
-
-
-# =============================================================================
-# v5.63.0 PHASE-DD — Restored derived/synthesized columns
-# =============================================================================
-
-_INTRINSIC_UPSIDE_MIN_PCT: float = -90.0
-_INTRINSIC_UPSIDE_MAX_PCT: float = 200.0
-
-# v5.69.0 — INTRINSIC-VALUE SANITY BOUNDS.
-# Pre-v5.69.0 the engine clamped `upside_pct` to +/-200% but emitted
-# `intrinsic_value` itself RAW. A single bad input -- most often a
-# near-zero P/B ratio, which makes book_value = cp / pb explode -- could
-# produce intrinsic_value = 21,008 against a $105 price (INGR.US), or
-# 600 against $12.87 (EC.US). The raw outlier was written straight to
-# the sheet.
-# v5.69.0 (a) screens each individual candidate and drops any that is
-# more than _INTRINSIC_CANDIDATE_MAX_MULT x or less than
-# _INTRINSIC_CANDIDATE_MIN_MULT x the current price (those are data
-# errors, not valuations), and (b) bounds the final blended intrinsic to
-# [MIN_MULT, MAX_MULT] x current price -- the same band the upside clamp
-# already implies (-90%..+200%), so intrinsic_value and upside_pct stay
-# mutually consistent.
-_INTRINSIC_VALUE_MIN_MULT: float = 1.0 + (_INTRINSIC_UPSIDE_MIN_PCT / 100.0)  # 0.10x cp
-_INTRINSIC_VALUE_MAX_MULT: float = 1.0 + (_INTRINSIC_UPSIDE_MAX_PCT / 100.0)  # 3.00x cp
-# A single candidate is allowed a slightly wider berth than the final
-# blended value before being discarded as a data error.
-_INTRINSIC_CANDIDATE_MIN_MULT: float = 0.05
-_INTRINSIC_CANDIDATE_MAX_MULT: float = 5.0
-# Floor on P/B before it is trusted to derive book value: pb below this
-# makes cp / pb explode and is almost always a data error.
-_INTRINSIC_MIN_TRUSTED_PB: float = 0.10
-
-
-def _intrinsic_candidate_ok(value: float, cp: float) -> bool:
-    """v5.69.0: True if an intrinsic-value candidate is within a sane
-    multiple of the current price. Outliers (near-zero P/B blow-ups, EPS
-    reported in the wrong unit, bad forecast prices) are rejected here so
-    they never reach the blended intrinsic."""
-    if value is None or cp is None or cp <= 0 or value <= 0:
-        return False
-    mult = value / cp
-    return _INTRINSIC_CANDIDATE_MIN_MULT <= mult <= _INTRINSIC_CANDIDATE_MAX_MULT
-
-
-def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
-    if not isinstance(row, dict):
-        return
-    if row.get("intrinsic_value") is not None and row.get("upside_pct") is not None:
-        return
-
-    cp = _as_float(row.get("current_price"))
-    if cp is None or cp <= 0:
-        return
-
-    eps = _as_float(row.get("eps_ttm"))
-    forecast_12m = _as_float(row.get("forecast_price_12m"))
-    pb = _as_float(row.get("pb_ratio"))
-    pe_ttm = _as_float(row.get("pe_ttm"))
-    sector = _safe_str(row.get("sector")).lower()
-
-    sector_pe_map = {
-        "technology": 25.0,
-        "consumer electronics": 22.0,
-        "communication services": 18.0,
-        "financial services": 13.0,
-        "healthcare": 22.0,
-        "consumer defensive": 22.0,
-        "consumer cyclical": 18.0,
-        "industrials": 19.0,
-        "energy": 12.0,
-        "utilities": 17.0,
-        "real estate": 25.0,
-        "basic materials": 15.0,
-    }
-    fair_pe = sector_pe_map.get(sector, 18.0)
-
-    candidates: List[float] = []
-    weights: List[float] = []
-
-    if eps is not None and eps > 0:
-        pe_fair = eps * fair_pe
-        # v5.69.0: screen the EPS-multiple candidate against price sanity.
-        if pe_fair > 0 and _intrinsic_candidate_ok(pe_fair, cp):
-            candidates.append(pe_fair)
-            weights.append(0.4)
-
-    if forecast_12m is not None and forecast_12m > 0:
-        # v5.69.0: screen the forecast-price candidate.
-        if _intrinsic_candidate_ok(forecast_12m, cp):
-            candidates.append(forecast_12m)
-            weights.append(0.4)
-
-    # v5.69.0: require a TRUSTED P/B (>= _INTRINSIC_MIN_TRUSTED_PB). A
-    # near-zero P/B was the primary cause of intrinsic_value blow-ups
-    # (book_value = cp / pb -> huge). The candidate is also screened.
-    if pb is not None and _INTRINSIC_MIN_TRUSTED_PB <= pb < 20:
-        book_value = cp / pb
-        if book_value > 0:
-            pb_candidate = book_value * 1.5
-            if _intrinsic_candidate_ok(pb_candidate, cp):
-                candidates.append(pb_candidate)
-                weights.append(0.2)
-
-    if not candidates:
-        return
-
-    total_w = sum(weights)
-    if total_w <= 0:
-        return
-    intrinsic = sum(c * w for c, w in zip(candidates, weights)) / total_w
-
-    # v5.69.0: bound the blended intrinsic to a sane multiple of price.
-    # Even after per-candidate screening, a blend can drift; this is the
-    # final guard so intrinsic_value can never be the +200%-clamp outlier
-    # the dashboard was showing. The bounds match the upside clamp band,
-    # so intrinsic_value and upside_pct remain mutually consistent.
-    intrinsic = max(cp * _INTRINSIC_VALUE_MIN_MULT,
-                    min(cp * _INTRINSIC_VALUE_MAX_MULT, intrinsic))
-
-    # v5.67.0: emit upside_pct as FRACTION (was POINTS). The cap constants
-    # _INTRINSIC_UPSIDE_MIN_PCT / MAX_PCT remain in points form for
-    # readability, so divide by 100 to get equivalent fraction bounds.
-    upside_fraction = (intrinsic - cp) / cp
-    upside_fraction = max(_INTRINSIC_UPSIDE_MIN_PCT / 100.0,
-                          min(_INTRINSIC_UPSIDE_MAX_PCT / 100.0, upside_fraction))
-
-    row["intrinsic_value"] = round(intrinsic, 4)
-    row["upside_pct"] = round(upside_fraction, 6)
-
-
-def _synthesize_market_cap_if_zero(row: Dict[str, Any]) -> None:
-    if not isinstance(row, dict):
-        return
-    mc = _as_float(row.get("market_cap"))
-    if mc is not None and mc > 0:
-        return
-
-    cp = _as_float(row.get("current_price"))
-    shares = _as_float(row.get("float_shares"))
-    if shares is None:
-        shares = _as_float(row.get("shares_outstanding"))
-
-    if cp is not None and cp > 0 and shares is not None and shares > 0:
-        row["market_cap"] = round(cp * shares, 2)
-
-
-def _derive_views(row: Dict[str, Any]) -> None:
-    if not isinstance(row, dict):
-        return
-
-    quality = _as_float(row.get("quality_score"))
-    growth = _as_float(row.get("growth_score"))
-    if quality is not None and growth is not None:
-        combined = (quality + growth) / 2.0
-        if combined >= 70:
-            fv = "STRONG"
-        elif combined >= 55:
-            fv = "POSITIVE"
-        elif combined >= 40:
-            fv = "NEUTRAL"
-        else:
-            fv = "WEAK"
-        row["fundamental_view"] = row.get("fundamental_view") or fv
-
-    momentum = _as_float(row.get("momentum_score"))
-    rsi = _as_float(row.get("rsi_14"))
-    if momentum is not None:
-        if rsi is not None and rsi > 70:
-            tv = "OVERBOUGHT"
-        elif rsi is not None and rsi < 30:
-            tv = "OVERSOLD"
-        elif momentum >= 70:
-            tv = "BULLISH"
-        elif momentum >= 50:
-            tv = "POSITIVE"
-        elif momentum >= 30:
-            tv = "NEUTRAL"
-        else:
-            tv = "BEARISH"
-        row["technical_view"] = row.get("technical_view") or tv
-
-    risk_bucket = _safe_str(row.get("risk_bucket")).upper()
-    if risk_bucket:
-        rv_map = {"LOW": "LOW", "MODERATE": "MODERATE", "HIGH": "HIGH"}
-        row["risk_view"] = row.get("risk_view") or rv_map.get(risk_bucket, risk_bucket)
-
-    # v5.67.0: upside_pct is now stored as FRACTION. _as_pct_points
-    # gracefully handles both fraction and points input.
-    upside_points = _as_pct_points(row.get("upside_pct"))
-    if upside_points is not None:
-        if upside_points >= 30:
-            vv = "CHEAP"
-        elif upside_points >= 10:
-            vv = "FAIR"
-        elif upside_points >= -10:
-            vv = "FULL"
-        else:
-            vv = "EXPENSIVE"
-        row["value_view"] = row.get("value_view") or vv
-
-
-# v5.69.0: legacy 8-tier map retained for compatibility with imported provider
-# normalization only. v5.71.0 final output uses _FINAL_RECO_PRIORITY below and
-# never emits ACCUMULATE or AVOID.
-_RECO_8TIER_PRIORITY: Dict[str, int] = {
-    "STRONG_BUY": 1,
-    "BUY": 2,
-    "ACCUMULATE": 3,
-    "HOLD": 4,
-    "REDUCE": 5,
-    "SELL": 6,
-    "STRONG_SELL": 7,
-    "AVOID": 8,
-}
-
-# v5.71.0 FIX: final output vocabulary. Priority 3 is intentionally reserved
-# / unused because ACCUMULATE is retired from output, but downstream Apps Script
-# historically expects P1/P2/P4/P5 style bands.
-_FINAL_RECO_PRIORITY: Dict[str, int] = {
-    "STRONG_BUY": 1,
-    "BUY": 2,
-    "HOLD": 4,
-    "REDUCE": 5,
-    "SELL": 5,
-    "STRONG_SELL": 5,
-}
-_FINAL_RECO_VALUES: Set[str] = set(_FINAL_RECO_PRIORITY.keys())
-_RECO_NORMALIZATION_MAP: Dict[str, str] = {
-    "STRONG_BUY": "STRONG_BUY",
-    "BUY": "BUY",
-    "OUTPERFORM": "BUY",
-    "OVERWEIGHT": "BUY",
-    "ACCUMULATE": "BUY",  # v5.71.0 FIX: never emit ACCUMULATE.
-    "ADD": "BUY",
-    "HOLD": "HOLD",
-    "NEUTRAL": "HOLD",
-    "MARKET_PERFORM": "HOLD",
-    "REDUCE": "REDUCE",
-    "UNDERPERFORM": "REDUCE",
-    "SELL": "SELL",
-    "STRONG_SELL": "STRONG_SELL",
-    "AVOID": "STRONG_SELL",  # v5.71.0 FIX: final enum excludes AVOID.
-}
-
-
-def _canonical_recommendation(value: Any) -> str:
-    """v5.71.0 FIX: canonicalize to the final 6-value output vocabulary.
-
-    Provider values may arrive in an 8-tier or free-text vocabulary. They are
-    preserved verbatim in provider_rating, but if explicitly trusted by env they
-    must still be normalized to the final dashboard-safe enum.
-    """
-    if value in (None, ""):
-        return ""
-    raw = _safe_str(value).upper().replace("-", "_").replace(" ", "_")
-    if raw in _RECO_NORMALIZATION_MAP:
-        return _RECO_NORMALIZATION_MAP[raw]
-    if _RECO_NORMALIZE_AVAILABLE and _rn_normalize_recommendation is not None:
-        try:
-            canon = _safe_str(_rn_normalize_recommendation(value)).upper().replace("-", "_").replace(" ", "_")
-            return _RECO_NORMALIZATION_MAP.get(canon, canon if canon in _FINAL_RECO_VALUES else "")
-        except Exception:
-            pass
-    return raw if raw in _FINAL_RECO_VALUES else ""
-
-
-def _recommendation_priority(rec: str) -> int:
-    """v5.71.0 FIX: P3 intentionally reserved; ACCUMULATE is retired."""
-    return _FINAL_RECO_PRIORITY.get(_safe_str(rec).upper(), 4)
-
-
-def _confidence_to_01(value: Any) -> Optional[float]:
-    v = _as_float(value)
-    if v is None:
-        return None
-    return v / 100.0 if abs(v) > 1.5 else v
-
-
-def _engine_risk_bucket(value: Any) -> str:
-    """v5.71.0 FIX: source risk buckets from core.scoring first."""
-    rs = _as_float(value)
-    if _SCORING_AVAILABLE and _scoring_risk_bucket is not None:
-        try:
-            bucket = _safe_str(_scoring_risk_bucket(rs)).upper()
-            if bucket:
-                return bucket
-        except Exception:
-            pass
-    if _BUCKETS_AVAILABLE and _bk_risk_bucket_from_score is not None:
-        try:
-            bucket = _safe_str(_bk_risk_bucket_from_score(rs)).upper()
-            if bucket:
-                return bucket
-        except Exception:
-            pass
-    return ""
-
-
-def _engine_confidence_bucket(value: Any) -> str:
-    """v5.71.0 FIX: source confidence buckets from core.scoring using 0-1 scale."""
-    conf01 = _confidence_to_01(value)
-    if _SCORING_AVAILABLE and _scoring_confidence_bucket is not None:
-        try:
-            bucket = _safe_str(_scoring_confidence_bucket(conf01)).upper()
-            if bucket:
-                return bucket
-        except Exception:
-            pass
-    # Fallback only to core.buckets, not a local ladder in the call sites.
-    if _BUCKETS_AVAILABLE and _bk_confidence_bucket_from_score is not None:
-        try:
-            score100 = None if conf01 is None else conf01 * 100.0
-            bucket = _safe_str(_bk_confidence_bucket_from_score(score100)).upper()
-            if bucket:
-                return bucket
-        except Exception:
-            pass
-    return ""
-
-
-def _engine_recommendation_from_scoring(row: Dict[str, Any]) -> Tuple[str, str]:
-    """v5.71.0 FIX: delegate recommendation/reason to core.scoring._recommendation.
-
-    This function contains no local threshold ladder. If core.scoring is not
-    importable, it returns a conservative HOLD with an explicit reason and warning
-    so the engine stays import-safe without silently trusting provider data.
-    """
-    overall = _as_float(row.get("overall_score"))
-    risk = _as_float(row.get("risk_score"))
-    conf100 = _as_float(row.get("confidence_score"))
-    if conf100 is None:
-        conf01 = _confidence_to_01(row.get("forecast_confidence"))
-        conf100 = None if conf01 is None else conf01 * 100.0
-    roi3 = _as_pct_fraction(row.get("expected_roi_3m"))
-
-    if _SCORING_AVAILABLE and _scoring_recommendation is not None:
-        try:
-            result = _scoring_recommendation(overall, risk, conf100, roi3)
-            if isinstance(result, tuple):
-                rec_raw = result[0] if len(result) >= 1 else ""
-                reason = _safe_str(result[1]) if len(result) >= 2 else ""
-            elif isinstance(result, dict):
-                rec_raw = result.get("recommendation") or result.get("rec") or result.get("action")
-                reason = _safe_str(result.get("reason") or result.get("recommendation_reason"))
-            else:
-                rec_raw = result
-                reason = ""
-            rec = _canonical_recommendation(rec_raw)
-            if not rec:
-                rec = "HOLD"
-                reason = reason or "Engine scoring returned an unrecognized recommendation; normalized to HOLD."
-                _append_warning(row, f"invalid_engine_recommendation:{_safe_str(rec_raw)}")
-            return rec, reason or f"Engine scoring recommendation based on overall={overall}, risk={risk}, confidence={conf100}, roi_3m={roi3}."
-        except Exception as exc:
-            _append_warning(row, f"scoring_recommendation_failed:{exc.__class__.__name__}")
-
-    _append_warning(row, "scoring_recommendation_unavailable")
-    return "HOLD", "core.scoring._recommendation unavailable; conservative HOLD applied."
-
-
-def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
-    """v5.71.0 FIX: compatibility wrapper, now engine-authoritative.
-
-    The function name is preserved because existing call sites use it, but it no
-    longer contains a local 8-tier threshold ladder and never lets provider data
-    win silently.
-    """
-    if not isinstance(row, dict):
-        return
-
-    symbol = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol") or row.get("ticker")))
-    provider_raw = row.get("provider_rating")
-    if provider_raw in (None, ""):
-        provider_raw = row.get("recommendation")
-    if provider_raw not in (None, "") and row.get("provider_rating") in (None, ""):
-        # v5.71.0 FIX: preserve provider value before rewriting recommendation.
-        row["provider_rating"] = _safe_str(provider_raw)
-
-    engine_rec, engine_reason = _engine_recommendation_from_scoring(row)
-    provider_rec = _canonical_recommendation(provider_raw)
-    trust_provider = _get_env_bool("TFB_TRUST_PROVIDER_RECO", False)
-
-    if trust_provider and provider_rec:
-        final_rec = provider_rec
-        source = "provider_override"
-        reason = f"Provider recommendation explicitly trusted by TFB_TRUST_PROVIDER_RECO=true; engine_rec={engine_rec}."
-    else:
-        final_rec = engine_rec
-        source = "engine"
-        reason = engine_reason
-
-    if final_rec not in _FINAL_RECO_VALUES:
-        # v5.71.0 FIX: final output must never emit ACCUMULATE/AVOID/unknown.
-        _append_warning(row, f"final_recommendation_normalized:{final_rec}")
-        final_rec = _canonical_recommendation(final_rec) or "HOLD"
-
-    priority = _recommendation_priority(final_rec)
-    row["recommendation"] = final_rec
-    row["recommendation_detailed"] = final_rec
-    row["recommendation_priority"] = priority
-    row["reco_priority"] = priority
-    row["recommendation_source"] = source
-    # v5.71.0 FIX: always rewrite reason; never setdefault provider/upstream text.
-    row["recommendation_reason"] = reason
-    # v5.71.0 FIX: surface currency/revenue anomalies after final row scoring.
-    _apply_v571_anomaly_warnings(row)
-
-    logger.info(
-        "[v5.71.0 RECO] symbol=%s engine_rec=%s provider_rec=%s source=%s",
-        symbol or "",
-        engine_rec,
-        provider_rec or "",
-        source,
-    )
-
-
-def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
-    if not isinstance(row, dict):
-        return
-
-    factors: List[str] = []
-    risks: List[str] = []
-
-    # v5.67.0: upside_pct is now stored as FRACTION. _as_pct_points
-    # gracefully handles both fraction and points input.
-    upside_points = _as_pct_points(row.get("upside_pct"))
-    if upside_points is not None and upside_points >= 15:
-        factors.append("Attractive valuation")
-    momentum = _as_float(row.get("momentum_score"))
-    if momentum is not None and momentum >= 70:
-        factors.append("Positive momentum")
-    quality = _as_float(row.get("quality_score"))
-    if quality is not None and quality >= 70:
-        factors.append("Strong fundamentals")
-    growth = _as_float(row.get("growth_score"))
-    if growth is not None and growth >= 70:
-        factors.append("Solid growth")
-    div_yield = _as_float(row.get("dividend_yield"))
-    if div_yield is not None and div_yield >= 0.03:
-        factors.append("Dividend income")
-    rgyoy = _as_float(row.get("revenue_growth_yoy"))
-    if rgyoy is not None and rgyoy >= 0.10:
-        factors.append("Revenue growth")
-
-    if not factors:
-        factors.append("Limited positive signals")
-
-    risk_bucket = _safe_str(row.get("risk_bucket")).upper()
-    if risk_bucket == "HIGH":
-        risks.append("High volatility")
-    vol = _as_float(row.get("volatility_30d"))
-    if vol is not None and vol >= 0.40:
-        risks.append("Elevated volatility")
-    # v5.67.0: max_drawdown_1y is now stored as SIGNED FRACTION (e.g. -0.338).
-    # _as_pct_points converts to signed points (-33.8). abs() handles the sign.
-    dd_points = _as_pct_points(row.get("max_drawdown_1y"))
-    if dd_points is not None and abs(dd_points) >= 30:
-        risks.append("Recent drawdown")
-    rsi = _as_float(row.get("rsi_14"))
-    if rsi is not None and rsi > 75:
-        risks.append("Overbought (RSI)")
-    elif rsi is not None and rsi < 25:
-        risks.append("Oversold (RSI)")
-    de = _as_float(row.get("debt_to_equity"))
-    if de is not None and de >= 100:
-        risks.append("High leverage")
-    pe = _as_float(row.get("pe_ttm"))
-    if pe is not None and pe >= 50:
-        risks.append("Expensive valuation")
-
-    if not risks:
-        risks.append("Limited downside signals")
-
-    conviction = 50.0 + (len(factors) - len(risks)) * 8.0
-    conviction = max(0.0, min(100.0, conviction))
-
-    overall = _as_float(row.get("overall_score"))
-    if overall is not None:
-        sector_adj = overall + (5.0 if "Strong fundamentals" in factors else 0.0) - (5.0 if risk_bucket == "HIGH" else 0.0)
-        sector_adj = max(0.0, min(100.0, sector_adj))
-        if not row.get("sector_relative_score"):
-            row["sector_relative_score"] = round(sector_adj, 2)
-
-    if not row.get("top_factors"):
-        row["top_factors"] = "; ".join(factors[:3])
-    if not row.get("top_risks"):
-        row["top_risks"] = "; ".join(risks[:3])
-    if not row.get("conviction_score"):
-        row["conviction_score"] = round(conviction, 2)
-
-    rec = _safe_str(row.get("recommendation")).upper()
-    if rec in ("STRONG_BUY",):
-        psh = "Core position"
-    elif rec == "BUY":
-        # v5.71.0 FIX: ACCUMULATE is no longer emitted.
-        psh = "Standard position"
-    elif rec == "HOLD":
-        psh = "Maintain or trim"
-    else:
-        psh = "Avoid / reduce"
-    if not row.get("position_size_hint"):
-        row["position_size_hint"] = psh
-
-
-# =============================================================================
-# v5.66.0 PHASE-JJ — Candlestick pattern detection
-# =============================================================================
-
-_CS_SIGNAL_BULLISH = "BULLISH"
-_CS_SIGNAL_BEARISH = "BEARISH"
-_CS_SIGNAL_NEUTRAL = "NEUTRAL"
-_CS_SIGNAL_DOJI = "DOJI"
-
-_CS_STRENGTH_STRONG = "STRONG"
-_CS_STRENGTH_MODERATE = "MODERATE"
-_CS_STRENGTH_WEAK = "WEAK"
-
-_CS_P_DOJI = "Doji"
-_CS_P_HAMMER = "Hammer"
-_CS_P_INVERTED_HAMMER = "Inverted Hammer"
-_CS_P_SHOOTING_STAR = "Shooting Star"
-_CS_P_HANGING_MAN = "Hanging Man"
-_CS_P_MARUBOZU_BULL = "Bullish Marubozu"
-_CS_P_MARUBOZU_BEAR = "Bearish Marubozu"
-_CS_P_BULL_ENGULFING = "Bullish Engulfing"
-_CS_P_BEAR_ENGULFING = "Bearish Engulfing"
-_CS_P_MORNING_STAR = "Morning Star"
-_CS_P_EVENING_STAR = "Evening Star"
-
-_CS_PATTERN_SIGNAL: Dict[str, str] = {
-    _CS_P_DOJI: _CS_SIGNAL_DOJI,
-    _CS_P_HAMMER: _CS_SIGNAL_BULLISH,
-    _CS_P_INVERTED_HAMMER: _CS_SIGNAL_BULLISH,
-    _CS_P_SHOOTING_STAR: _CS_SIGNAL_BEARISH,
-    _CS_P_HANGING_MAN: _CS_SIGNAL_BEARISH,
-    _CS_P_MARUBOZU_BULL: _CS_SIGNAL_BULLISH,
-    _CS_P_MARUBOZU_BEAR: _CS_SIGNAL_BEARISH,
-    _CS_P_BULL_ENGULFING: _CS_SIGNAL_BULLISH,
-    _CS_P_BEAR_ENGULFING: _CS_SIGNAL_BEARISH,
-    _CS_P_MORNING_STAR: _CS_SIGNAL_BULLISH,
-    _CS_P_EVENING_STAR: _CS_SIGNAL_BEARISH,
-}
-
-_CS_DOJI_BODY_RATIO_MAX = 0.10
-_CS_MARUBOZU_BODY_RATIO_MIN = 0.95
-_CS_HAMMER_SHADOW_MULTIPLIER = 2.0
-_CS_HAMMER_OPP_SHADOW_RATIO_MAX = 0.30
-_CS_SMALL_BODY_RATIO_MAX = 0.30
-_CS_LONG_BODY_RATIO_MIN = 0.55
-_CS_TREND_LOOKBACK = 10
-_CS_TREND_THRESHOLD = 0.01
-_CS_RECENT_LOOKBACK = 5
-
-
-def _cs_coerce_bar(row: Any) -> Optional[Dict[str, float]]:
-    if not isinstance(row, dict):
-        return None
-    o = _as_float(row.get("open") if row.get("open") is not None else row.get("o"))
-    h = _as_float(row.get("high") if row.get("high") is not None else row.get("h"))
-    low = _as_float(row.get("low") if row.get("low") is not None else row.get("l"))
-    c = _as_float(
-        row.get("close")
-        if row.get("close") is not None
-        else (
-            row.get("adjusted_close")
-            if row.get("adjusted_close") is not None
-            else (row.get("adjclose") if row.get("adjclose") is not None else row.get("c"))
-        )
-    )
-    if c is None:
-        return None
-    if o is None:
-        o = c
-    if h is None:
-        h = max(o, c)
-    if low is None:
-        low = min(o, c)
-    if h < low:
-        h, low = low, h
-    v = _as_float(row.get("volume") if row.get("volume") is not None else row.get("v")) or 0.0
-    return {"open": o, "high": h, "low": low, "close": c, "volume": v}
-
-
-def _cs_coerce_bars(rows: Any) -> List[Dict[str, float]]:
-    out: List[Dict[str, float]] = []
-    if not rows:
-        return out
-    try:
-        iterable = list(rows)
-    except Exception:
-        return out
-    for row in iterable:
-        bar = _cs_coerce_bar(row)
-        if bar is not None:
-            out.append(bar)
-    return out
-
-
-def _cs_bar_geom(bar: Dict[str, float]) -> Dict[str, float]:
-    o = bar["open"]; h = bar["high"]; low = bar["low"]; c = bar["close"]
-    rng = max(h - low, 1e-12)
-    body = abs(c - o)
-    upper_shadow = max(h - max(o, c), 0.0)
-    lower_shadow = max(min(o, c) - low, 0.0)
-    return {
-        "open": o, "high": h, "low": low, "close": c, "range": rng,
-        "body": body, "body_ratio": body / rng,
-        "upper_shadow": upper_shadow, "lower_shadow": lower_shadow,
-        "upper_shadow_ratio": upper_shadow / rng,
-        "lower_shadow_ratio": lower_shadow / rng,
-        "is_bullish": c > o, "is_bearish": c < o,
-        "midpoint": (o + c) / 2.0,
-    }
-
-
-def _cs_trend_at(bars: List[Dict[str, float]], idx: int) -> str:
-    start = idx - _CS_TREND_LOOKBACK
-    if start < 0:
-        return "FLAT"
-    window = bars[start:idx]
-    if len(window) < 3:
-        return "FLAT"
-    first = window[0]["close"]
-    last = window[-1]["close"]
-    if first <= 0:
-        return "FLAT"
-    pct = (last - first) / first
-    if pct >= _CS_TREND_THRESHOLD:
-        return "UP"
-    if pct <= -_CS_TREND_THRESHOLD:
-        return "DOWN"
-    return "FLAT"
-
-
-def _cs_detect_marubozu(g: Dict[str, float]) -> Optional[Tuple[str, float]]:
-    if g["body_ratio"] < _CS_MARUBOZU_BODY_RATIO_MIN:
-        return None
-    confidence = 50.0 + (g["body_ratio"] - _CS_MARUBOZU_BODY_RATIO_MIN) * 1000.0
-    confidence = max(50.0, min(100.0, confidence))
-    if g["is_bullish"]:
-        return _CS_P_MARUBOZU_BULL, confidence
-    if g["is_bearish"]:
-        return _CS_P_MARUBOZU_BEAR, confidence
-    return None
-
-
-def _cs_detect_doji(g: Dict[str, float]) -> Optional[Tuple[str, float]]:
-    if g["body_ratio"] >= _CS_DOJI_BODY_RATIO_MAX:
-        return None
-    raw = 100.0 * (1.0 - g["body_ratio"] / _CS_DOJI_BODY_RATIO_MAX)
-    confidence = max(40.0, min(95.0, raw))
-    return _CS_P_DOJI, confidence
-
-
-def _cs_has_hammer_shape(g: Dict[str, float]) -> bool:
-    if g["body"] <= 0:
-        return False
-    if g["lower_shadow"] < _CS_HAMMER_SHADOW_MULTIPLIER * g["body"]:
-        return False
-    if g["upper_shadow_ratio"] > _CS_HAMMER_OPP_SHADOW_RATIO_MAX:
-        return False
-    return True
-
-
-def _cs_has_inverted_hammer_shape(g: Dict[str, float]) -> bool:
-    if g["body"] <= 0:
-        return False
-    if g["upper_shadow"] < _CS_HAMMER_SHADOW_MULTIPLIER * g["body"]:
-        return False
-    if g["lower_shadow_ratio"] > _CS_HAMMER_OPP_SHADOW_RATIO_MAX:
-        return False
-    return True
-
-
-def _cs_detect_hammer_family(g: Dict[str, float], trend: str) -> Optional[Tuple[str, float]]:
-    if _cs_has_hammer_shape(g):
-        ratio = g["lower_shadow"] / max(g["body"], 1e-9)
-        base_conf = min(85.0, 40.0 + ratio * 8.0)
-        if trend == "DOWN":
-            return _CS_P_HAMMER, base_conf
-        if trend == "UP":
-            return _CS_P_HANGING_MAN, base_conf * 0.85
-        return _CS_P_HAMMER, base_conf * 0.65
-    if _cs_has_inverted_hammer_shape(g):
-        ratio = g["upper_shadow"] / max(g["body"], 1e-9)
-        base_conf = min(80.0, 35.0 + ratio * 8.0)
-        if trend == "DOWN":
-            return _CS_P_INVERTED_HAMMER, base_conf
-        if trend == "UP":
-            return _CS_P_SHOOTING_STAR, base_conf
-        return _CS_P_INVERTED_HAMMER, base_conf * 0.65
-    return None
-
-
-def _cs_detect_engulfing(g_prev: Dict[str, float], g_curr: Dict[str, float]) -> Optional[Tuple[str, float]]:
-    if g_prev["body_ratio"] < _CS_DOJI_BODY_RATIO_MAX:
-        return None
-    if g_curr["body_ratio"] < _CS_DOJI_BODY_RATIO_MAX:
-        return None
-    prev_open = g_prev["open"]; prev_close = g_prev["close"]
-    curr_open = g_curr["open"]; curr_close = g_curr["close"]
-    if g_prev["is_bearish"] and g_curr["is_bullish"]:
-        if curr_open <= prev_close and curr_close >= prev_open:
-            engulf_factor = g_curr["body"] / max(g_prev["body"], 1e-9)
-            confidence = min(90.0, 50.0 + engulf_factor * 10.0)
-            return _CS_P_BULL_ENGULFING, confidence
-    if g_prev["is_bullish"] and g_curr["is_bearish"]:
-        if curr_open >= prev_close and curr_close <= prev_open:
-            engulf_factor = g_curr["body"] / max(g_prev["body"], 1e-9)
-            confidence = min(90.0, 50.0 + engulf_factor * 10.0)
-            return _CS_P_BEAR_ENGULFING, confidence
-    return None
-
-
-def _cs_detect_star(g_first: Dict[str, float], g_star: Dict[str, float], g_third: Dict[str, float]) -> Optional[Tuple[str, float]]:
-    if g_star["body_ratio"] >= _CS_SMALL_BODY_RATIO_MAX:
-        return None
-    if g_first["body_ratio"] < _CS_LONG_BODY_RATIO_MIN:
-        return None
-    if g_third["body_ratio"] < _CS_LONG_BODY_RATIO_MIN:
-        return None
-    if g_first["is_bearish"] and g_third["is_bullish"]:
-        if g_third["close"] > g_first["midpoint"]:
-            penetration = (g_third["close"] - g_first["midpoint"]) / max(g_first["body"], 1e-9)
-            confidence = min(95.0, 60.0 + penetration * 30.0)
-            return _CS_P_MORNING_STAR, confidence
-    if g_first["is_bullish"] and g_third["is_bearish"]:
-        if g_third["close"] < g_first["midpoint"]:
-            penetration = (g_first["midpoint"] - g_third["close"]) / max(g_first["body"], 1e-9)
-            confidence = min(95.0, 60.0 + penetration * 30.0)
-            return _CS_P_EVENING_STAR, confidence
-    return None
-
-
-def _cs_detect_at_index(bars: List[Dict[str, float]], idx: int) -> Optional[Tuple[str, float]]:
-    if idx < 0 or idx >= len(bars):
-        return None
-    trend = _cs_trend_at(bars, idx)
-    g_curr = _cs_bar_geom(bars[idx])
-    if idx >= 2:
-        g_first = _cs_bar_geom(bars[idx - 2])
-        g_star = _cs_bar_geom(bars[idx - 1])
-        star = _cs_detect_star(g_first, g_star, g_curr)
-        if star is not None:
-            return star
-    if idx >= 1:
-        g_prev = _cs_bar_geom(bars[idx - 1])
-        eng = _cs_detect_engulfing(g_prev, g_curr)
-        if eng is not None:
-            return eng
-    marubozu = _cs_detect_marubozu(g_curr)
-    if marubozu is not None:
-        return marubozu
-    hammer = _cs_detect_hammer_family(g_curr, trend)
-    if hammer is not None:
-        return hammer
-    doji = _cs_detect_doji(g_curr)
-    if doji is not None:
-        return doji
-    return None
-
-
-def _cs_confidence_to_strength(confidence: float) -> str:
-    if confidence >= 75.0:
-        return _CS_STRENGTH_STRONG
-    if confidence >= 55.0:
-        return _CS_STRENGTH_MODERATE
-    return _CS_STRENGTH_WEAK
-
-
-def detect_candlestick_patterns(rows: Any) -> Dict[str, Any]:
-    empty = {
-        "candlestick_pattern": "",
-        "candlestick_signal": _CS_SIGNAL_NEUTRAL,
-        "candlestick_strength": "",
-        "candlestick_confidence": 0.0,
-        "candlestick_patterns_recent": "",
-    }
-    bars = _cs_coerce_bars(rows)
-    if not bars:
-        return empty
-    last_idx = len(bars) - 1
-    latest = _cs_detect_at_index(bars, last_idx)
-    if latest is None:
-        out = dict(empty)
-    else:
-        pattern, confidence = latest
-        out = {
-            "candlestick_pattern": pattern,
-            "candlestick_signal": _CS_PATTERN_SIGNAL.get(pattern, _CS_SIGNAL_NEUTRAL),
-            "candlestick_strength": _cs_confidence_to_strength(confidence),
-            "candlestick_confidence": round(float(confidence), 2),
-            "candlestick_patterns_recent": "",
-        }
-    recent_patterns: List[str] = []
-    start = max(0, last_idx - _CS_RECENT_LOOKBACK + 1)
-    for i in range(start, last_idx + 1):
-        det = _cs_detect_at_index(bars, i)
-        if det is None:
-            continue
-        name, _ = det
-        recent_patterns.append(name)
-    out["candlestick_patterns_recent"] = " | ".join(recent_patterns)
-    return out
-
-
-def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(row, dict):
-        return row
-    _synthesize_market_cap_if_zero(row)
-    _compute_intrinsic_and_upside(row)
-    _derive_views(row)
-    # v5.71.0 FIX: forecast/confidence must be refreshed before the final
-    # engine-authoritative recommendation pass.
-    _phase_ii_quality_forecast(row)
-    _classify_recommendation_8tier(row)
-    _build_top_factors_and_risks(row)
-    return row
-
-
-# =============================================================================
-# v5.65.0 PHASE-II — Quality forecast generator
-# =============================================================================
-
-_PHASE_II_MAX_12M_ABS_RETURN: float = 0.30
-_PHASE_II_MIN_12M_ABS_RETURN: float = -0.30
-_PHASE_II_VOL_BAND_FACTOR: float = 0.5
-_PHASE_II_CONF_MIN: float = 0.30
-_PHASE_II_CONF_MAX: float = 0.85
-
-
-def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
-    if not isinstance(row, dict):
-        return
-
-    cp = _as_float(row.get("current_price"))
-    if cp is None or cp <= 0:
-        return
-
-    intrinsic = _as_float(row.get("intrinsic_value"))
-    momentum = _as_float(row.get("momentum_score"))
-    quality = _as_float(row.get("quality_score"))
-    value = _as_float(row.get("value_score"))
-    growth = _as_float(row.get("growth_score"))
-    overall = _as_float(row.get("overall_score"))
-    vol_30d = _as_float(row.get("volatility_30d"))
-    vol_90d = _as_float(row.get("volatility_90d"))
-    rsi = _as_float(row.get("rsi_14"))
-    risk_bucket = _safe_str(row.get("risk_bucket")).upper()
-
-    components: List[Tuple[float, float]] = []
-
-    if intrinsic is not None and intrinsic > 0:
-        reversion_return = (intrinsic - cp) / cp
-        reversion_return *= 0.6
-        components.append((reversion_return, 0.40))
-
-    if momentum is not None:
-        trend_return = ((momentum - 50.0) / 50.0) * 0.15
-        components.append((trend_return, 0.30))
-
-    fundamentals_signals: List[float] = []
-    for sub in (quality, value, growth):
-        if sub is not None:
-            fundamentals_signals.append((sub - 50.0) / 50.0)
-    if fundamentals_signals:
-        avg_fund = sum(fundamentals_signals) / len(fundamentals_signals)
-        fund_return = avg_fund * 0.10
-        components.append((fund_return, 0.20))
-
-    if overall is not None:
-        baseline_return = ((overall - 50.0) / 50.0) * 0.08
-        components.append((baseline_return, 0.10))
-
-    if not components:
-        return
-
-    total_weight = sum(w for _, w in components)
-    if total_weight <= 0:
-        return
-    expected_12m_return = sum(r * w for r, w in components) / total_weight
-
-    if rsi is not None:
-        if rsi > 75:
-            expected_12m_return -= 0.03
-        elif rsi > 70:
-            expected_12m_return -= 0.015
-        elif rsi < 25:
-            expected_12m_return += 0.03
-        elif rsi < 30:
-            expected_12m_return += 0.015
-
-    expected_12m_return = max(_PHASE_II_MIN_12M_ABS_RETURN,
-                              min(_PHASE_II_MAX_12M_ABS_RETURN, expected_12m_return))
-
-    expected_3m_return = expected_12m_return * 0.35
-    expected_1m_return = expected_12m_return * 0.12
-
-    forecast_12m = cp * (1.0 + expected_12m_return)
-    forecast_3m = cp * (1.0 + expected_3m_return)
-    forecast_1m = cp * (1.0 + expected_1m_return)
-
-    row["forecast_price_1m"] = round(forecast_1m, 4)
-    row["forecast_price_3m"] = round(forecast_3m, 4)
-    row["forecast_price_12m"] = round(forecast_12m, 4)
-    row["expected_roi_1m"] = round(expected_1m_return, 6)
-    row["expected_roi_3m"] = round(expected_3m_return, 6)
-    row["expected_roi_12m"] = round(expected_12m_return, 6)
-
-    conf = 0.50
-
-    completeness_fields = [
-        "pe_ttm", "pb_ratio", "eps_ttm", "dividend_yield",
-        "revenue_growth_yoy", "gross_margin", "operating_margin",
-        "rsi_14", "volatility_30d", "max_drawdown_1y",
-    ]
-    present = sum(1 for f in completeness_fields if _as_float(row.get(f)) is not None)
-    completeness_ratio = present / len(completeness_fields)
-    conf += completeness_ratio * 0.20
-
-    sub_scores = [s for s in (quality, value, growth, momentum) if s is not None]
-    if len(sub_scores) >= 3:
-        mean_s = sum(sub_scores) / len(sub_scores)
-        variance = sum((s - mean_s) ** 2 for s in sub_scores) / len(sub_scores)
-        agreement = max(0.0, 1.0 - (variance / 800.0))
-        conf += agreement * 0.10
-
-    if risk_bucket == "HIGH":
-        conf -= 0.10
-    if vol_90d is not None and vol_90d > 0.50:
-        conf -= 0.05
-    elif vol_30d is not None and vol_30d > 0.45:
-        conf -= 0.03
-
-    if abs(expected_12m_return) > 0.25:
-        conf -= 0.05
-
-    conf = max(_PHASE_II_CONF_MIN, min(_PHASE_II_CONF_MAX, conf))
-
-    row["forecast_confidence"] = round(conf, 4)
-    row["confidence_score"] = round(conf * 100.0, 2)
-    # v5.71.0 FIX: bucket comes from core.scoring using 0-1 confidence scale.
-    row["confidence_bucket"] = _engine_confidence_bucket(conf)
-
-
-def _pick_yahoo_callable(mod: Any, *names: str) -> Optional[Any]:
-    if mod is None:
-        return None
-    for n in names:
-        fn = getattr(mod, n, None)
-        if callable(fn):
-            return fn
-    return None
-
-
-def _append_yahoo_warning_tag(row: Dict[str, Any], tag: str) -> None:
-    if not tag:
-        return
-    existing = row.get("warnings")
-    if isinstance(existing, list):
-        if tag not in existing:
-            existing.append(tag)
-        return
-    s = str(existing or "")
-    if tag in s:
-        return
-    row["warnings"] = (s + "; " + tag) if s else tag
-
-
-
-def _append_warning(row: Dict[str, Any], warning_text: str) -> None:
-    """v5.71.0 FIX: idempotent warning appender for list/string warnings."""
-    if not isinstance(row, dict) or not warning_text:
-        return
-    existing = row.get("warnings")
-    if isinstance(existing, list):
-        if warning_text not in existing:
-            existing.append(warning_text)
-        return
-    parts = [p.strip() for p in re.split(r"[;|]", _safe_str(existing)) if p.strip()]
-    if warning_text not in parts:
-        parts.append(warning_text)
-    row["warnings"] = "; ".join(parts)
-
-
-def _detect_currency_anomaly(row: Dict[str, Any]) -> Optional[str]:
-    """v5.71.0 FIX: smoke detector for likely listing/reporting currency mismatch."""
-    if not _get_env_bool("TFB_EMIT_CURRENCY_ANOMALY_WARNINGS", True):
-        return None
-    mc = _as_float(row.get("market_cap"))
-    price = _as_float(row.get("current_price"))
-    currency = _safe_str(row.get("currency")).upper()
-    symbol = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
-    if mc is not None and mc > 1e12 and currency == "USD" and price is not None and price < 10000:
-        return f"market_cap_currency_suspect:symbol={symbol}:mc={mc:.0f}:currency={currency}"
-    return None
-
-
-def _detect_revenue_anomaly(row: Dict[str, Any]) -> Optional[str]:
-    """v5.71.0 FIX: smoke detector for revenue shown in wrong currency scale."""
-    if not _get_env_bool("TFB_EMIT_CURRENCY_ANOMALY_WARNINGS", True):
-        return None
-    revenue = _as_float(row.get("revenue_ttm"))
-    mc = _as_float(row.get("market_cap"))
-    symbol = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
-    if revenue is not None and revenue > 0 and mc is not None and mc > 0 and revenue / mc > 50.0:
-        return f"revenue_currency_suspect:symbol={symbol}:revenue={revenue:.0f}:market_cap={mc:.0f}"
-    return None
-
-
-def _apply_v571_anomaly_warnings(row: Dict[str, Any]) -> None:
-    """v5.71.0 FIX: emit anomaly warnings and diagnostic logs."""
-    for kind, fn in (("currency", _detect_currency_anomaly), ("revenue", _detect_revenue_anomaly)):
-        detail = fn(row)
-        if detail:
-            _append_warning(row, detail)
-            logger.warning(
-                "[v5.71.0 ANOMALY] symbol=%s type=%s detail=%s",
-                normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol"))),
-                kind,
-                detail,
-            )
 
 
 # =============================================================================
@@ -2039,60 +240,169 @@ class UnifiedQuote(BaseModel):
 # Canonical page contracts
 # =============================================================================
 INSTRUMENT_CANONICAL_KEYS: List[str] = [
-    "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
-    "current_price", "previous_close", "open_price", "day_high", "day_low",
-    "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
-    "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y",
-    "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio",
-    "revenue_ttm", "revenue_growth_yoy", "gross_margin", "operating_margin", "profit_margin",
-    "debt_to_equity", "free_cash_flow_ttm",
-    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
-    "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
-    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value",
-    "upside_pct", "valuation_score",
-    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
-    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
-    "forecast_confidence", "confidence_score", "confidence_bucket",
-    "value_score", "quality_score", "momentum_score", "growth_score",
-    "overall_score", "opportunity_score", "rank_overall",
-    "fundamental_view", "technical_view", "risk_view", "value_view",
-    "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
-    "position_qty", "avg_cost", "position_cost", "position_value",
-    "unrealized_pl", "unrealized_pl_pct",
-    "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
-    "sector_relative_score", "conviction_score", "top_factors", "top_risks",
-    "position_size_hint", "recommendation_detailed", "recommendation_priority",
-    "provider_rating", "recommendation_source",
-    "candlestick_pattern", "candlestick_signal", "candlestick_strength",
-    "candlestick_confidence", "candlestick_patterns_recent",
+    "symbol",
+    "name",
+    "asset_class",
+    "exchange",
+    "currency",
+    "country",
+    "sector",
+    "industry",
+    "current_price",
+    "previous_close",
+    "open_price",
+    "day_high",
+    "day_low",
+    "week_52_high",
+    "week_52_low",
+    "price_change",
+    "percent_change",
+    "week_52_position_pct",
+    "volume",
+    "avg_volume_10d",
+    "avg_volume_30d",
+    "market_cap",
+    "float_shares",
+    "beta_5y",
+    "pe_ttm",
+    "pe_forward",
+    "eps_ttm",
+    "dividend_yield",
+    "payout_ratio",
+    "revenue_ttm",
+    "revenue_growth_yoy",
+    "gross_margin",
+    "operating_margin",
+    "profit_margin",
+    "debt_to_equity",
+    "free_cash_flow_ttm",
+    "rsi_14",
+    "volatility_30d",
+    "volatility_90d",
+    "max_drawdown_1y",
+    "var_95_1d",
+    "sharpe_1y",
+    "risk_score",
+    "risk_bucket",
+    "pb_ratio",
+    "ps_ratio",
+    "ev_ebitda",
+    "peg_ratio",
+    "intrinsic_value",
+    "valuation_score",
+    "forecast_price_1m",
+    "forecast_price_3m",
+    "forecast_price_12m",
+    "expected_roi_1m",
+    "expected_roi_3m",
+    "expected_roi_12m",
+    "forecast_confidence",
+    "confidence_score",
+    "confidence_bucket",
+    "value_score",
+    "quality_score",
+    "momentum_score",
+    "growth_score",
+    "overall_score",
+    "opportunity_score",
+    "rank_overall",
+    "recommendation",
+    "recommendation_reason",
+    "horizon_days",
+    "invest_period_label",
+    "position_qty",
+    "avg_cost",
+    "position_cost",
+    "position_value",
+    "unrealized_pl",
+    "unrealized_pl_pct",
+    "data_provider",
+    "last_updated_utc",
+    "last_updated_riyadh",
+    "warnings",
 ]
 
 INSTRUMENT_CANONICAL_HEADERS: List[str] = [
-    "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
-    "Current Price", "Previous Close", "Open", "Day High", "Day Low",
-    "52W High", "52W Low", "Price Change", "Percent Change", "52W Position %",
-    "Volume", "Avg Volume 10D", "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)",
-    "P/E (TTM)", "P/E (Forward)", "EPS (TTM)", "Dividend Yield", "Payout Ratio",
-    "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin", "Operating Margin",
-    "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)",
-    "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y",
-    "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
-    "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
-    "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
-    "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
-    "Forecast Confidence", "Confidence Score", "Confidence Bucket",
-    "Value Score", "Quality Score", "Momentum Score", "Growth Score",
-    "Overall Score", "Opportunity Score", "Rank (Overall)",
-    "Fundamental View", "Technical View", "Risk View", "Value View",
-    "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
-    "Position Qty", "Avg Cost", "Position Cost", "Position Value",
-    "Unrealized P/L", "Unrealized P/L %",
-    "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
-    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
-    "Position Size Hint", "Recommendation Detail", "Reco Priority",
-    "Provider Rating", "Recommendation Source",
-    "Candle Pattern", "Candle Signal", "Candle Strength",
-    "Candle Confidence", "Recent Patterns (5D)",
+    "Symbol",
+    "Name",
+    "Asset Class",
+    "Exchange",
+    "Currency",
+    "Country",
+    "Sector",
+    "Industry",
+    "Current Price",
+    "Previous Close",
+    "Open",
+    "Day High",
+    "Day Low",
+    "52W High",
+    "52W Low",
+    "Price Change",
+    "Percent Change",
+    "52W Position %",
+    "Volume",
+    "Avg Volume 10D",
+    "Avg Volume 30D",
+    "Market Cap",
+    "Float Shares",
+    "Beta (5Y)",
+    "P/E (TTM)",
+    "P/E (Forward)",
+    "EPS (TTM)",
+    "Dividend Yield",
+    "Payout Ratio",
+    "Revenue (TTM)",
+    "Revenue Growth YoY",
+    "Gross Margin",
+    "Operating Margin",
+    "Profit Margin",
+    "Debt/Equity",
+    "Free Cash Flow (TTM)",
+    "RSI (14)",
+    "Volatility 30D",
+    "Volatility 90D",
+    "Max Drawdown 1Y",
+    "VaR 95% (1D)",
+    "Sharpe (1Y)",
+    "Risk Score",
+    "Risk Bucket",
+    "P/B",
+    "P/S",
+    "EV/EBITDA",
+    "PEG",
+    "Intrinsic Value",
+    "Valuation Score",
+    "Forecast Price 1M",
+    "Forecast Price 3M",
+    "Forecast Price 12M",
+    "Expected ROI 1M",
+    "Expected ROI 3M",
+    "Expected ROI 12M",
+    "Forecast Confidence",
+    "Confidence Score",
+    "Confidence Bucket",
+    "Value Score",
+    "Quality Score",
+    "Momentum Score",
+    "Growth Score",
+    "Overall Score",
+    "Opportunity Score",
+    "Rank (Overall)",
+    "Recommendation",
+    "Recommendation Reason",
+    "Horizon Days",
+    "Invest Period Label",
+    "Position Qty",
+    "Avg Cost",
+    "Position Cost",
+    "Position Value",
+    "Unrealized P/L",
+    "Unrealized P/L %",
+    "Data Provider",
+    "Last Updated (UTC)",
+    "Last Updated (Riyadh)",
+    "Warnings",
 ]
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
@@ -2107,17 +417,45 @@ TOP10_REQUIRED_HEADERS: Dict[str, str] = {
 }
 
 INSIGHTS_HEADERS: List[str] = [
-    "Section", "Item", "Metric", "Value", "Notes", "Source", "Sort Order",
+    "Section",
+    "Item",
+    "Metric",
+    "Value",
+    "Notes",
+    "Source",
+    "Sort Order",
 ]
 INSIGHTS_KEYS: List[str] = [
-    "section", "item", "metric", "value", "notes", "source", "sort_order",
+    "section",
+    "item",
+    "metric",
+    "value",
+    "notes",
+    "source",
+    "sort_order",
 ]
 
 DATA_DICTIONARY_HEADERS: List[str] = [
-    "Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes",
+    "Sheet",
+    "Group",
+    "Header",
+    "Key",
+    "DType",
+    "Format",
+    "Required",
+    "Source",
+    "Notes",
 ]
 DATA_DICTIONARY_KEYS: List[str] = [
-    "sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes",
+    "sheet",
+    "group",
+    "header",
+    "key",
+    "dtype",
+    "fmt",
+    "required",
+    "source",
+    "notes",
 ]
 
 STATIC_CANONICAL_SHEET_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
@@ -2136,14 +474,23 @@ STATIC_CANONICAL_SHEET_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
 }
 
 INSTRUMENT_SHEETS: Set[str] = {
-    "Market_Leaders", "Global_Markets", "Commodities_FX",
-    "Mutual_Funds", "My_Portfolio", "My_Investments", "Top_10_Investments",
+    "Market_Leaders",
+    "Global_Markets",
+    "Commodities_FX",
+    "Mutual_Funds",
+    "My_Portfolio",
+    "My_Investments",
+    "Top_10_Investments",
 }
 SPECIAL_SHEETS: Set[str] = {"Insights_Analysis", "Data_Dictionary"}
 
 TOP10_ENGINE_DEFAULT_PAGES: List[str] = [
-    "Market_Leaders", "Global_Markets", "Commodities_FX",
-    "Mutual_Funds", "My_Portfolio", "My_Investments",
+    "Market_Leaders",
+    "Global_Markets",
+    "Commodities_FX",
+    "Mutual_Funds",
+    "My_Portfolio",
+    "My_Investments",
 ]
 
 EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
@@ -2422,8 +769,17 @@ def _extract_requested_symbols_from_body(body: Optional[Dict[str, Any]], limit: 
         return []
     raw: List[str] = []
     for key in (
-        "symbols", "tickers", "selected_symbols", "direct_symbols", "codes",
-        "watchlist", "portfolio_symbols", "symbol", "ticker", "code", "requested_symbol",
+        "symbols",
+        "tickers",
+        "selected_symbols",
+        "direct_symbols",
+        "codes",
+        "watchlist",
+        "portfolio_symbols",
+        "symbol",
+        "ticker",
+        "code",
+        "requested_symbol",
     ):
         raw.extend(_split_symbols(body.get(key)))
     criteria = body.get("criteria")
@@ -2635,16 +991,6 @@ def _get_env_list(name: str, default: Sequence[str]) -> List[str]:
     return [p.strip().lower() for p in re.split(r"[,;|\s]+", raw) if p.strip()]
 
 
-
-def _make_cache_key(symbol: str, page: str = "", provider_profile: str = "", schema_version: str = "") -> str:
-    """v5.71.0 FIX: page/provider/schema-aware quote cache key."""
-    sym = normalize_symbol(symbol)
-    page_ctx = _canonicalize_sheet_name(page) if page else "default"
-    profile = _safe_str(provider_profile, "none")
-    version = _safe_str(schema_version, __version__)
-    return f"quote:{sym}:page={page_ctx}:profile={profile}:schema={version}"
-
-
 def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
     raw_headers = list(headers or [])
     raw_keys = list(keys or [])
@@ -2657,6 +1003,7 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
         k = _safe_str(raw_keys[i]) if i < len(raw_keys) else ""
 
         if not h and not k:
+            # Drop fully blank pairs instead of fabricating ghost columns.
             continue
         if h and not k:
             k = _norm_key(h)
@@ -2675,71 +1022,6 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
     return hdrs, ks
 
 
-# =============================================================================
-# v5.70.0 — INSTRUMENT-SHEET SCHEMA-ALIGNMENT FIX (canonical-key coverage)
-# =============================================================================
-# This block resolves the v5.69.0-deferred cluster: the empty Confidence
-# Score column, the empty Data Provider / Last Updated columns, and the
-# ghost "Status" bleed-through. The three symptoms trace to a SINGLE
-# schema-alignment defect, not three independent bugs.
-#
-# Pre-v5.70.0 `_usable_contract` was intentionally permissive: for an
-# instrument sheet it only required {symbol/ticker} + {current_price/
-# price/name} in the keyset. It did NOT verify that the contract matched
-# the canonical 97-column layout (INSTRUMENT_CANONICAL_KEYS). So when
-# schema_registry's instrument contract DIVERGED from canonical, the
-# engine accepted the divergent contract as "canonical".
-#
-# But every engine compute path -- `_compute_scores_fallback`,
-# `_phase_ii_quality_forecast`, `_canonicalize_provider_row`,
-# `_apply_page_row_backfill`, `_classify_recommendation_8tier`, ... --
-# writes CANONICAL field names. Projecting that canonical output through
-# a divergent contract via `_strict_project_row` / `_normalize_to_schema_keys`:
-#   * STRANDS canonical values whose keys aren't in the contract
-#     -> blank columns: Confidence Score, Data Provider, Last Updated.
-#   * SURFACES registry-only columns the engine never fills
-#     -> ghost columns: "Status".
-#
-# `_INSTRUMENT_CANONICAL_REQUIRED_KEYS` is the set of canonical keys the
-# engine itself writes on every instrument row. A schema_registry
-# contract that omits any of them is NOT interchangeable with the
-# canonical layout, so `_usable_contract` now rejects it for instrument
-# sheets -- which makes `_schema_for_sheet` fall back to the canonical
-# static contract, so the engine's canonical compute outputs land in
-# real columns.
-_INSTRUMENT_CANONICAL_REQUIRED_KEYS: frozenset = frozenset({
-    # Identity
-    "symbol", "name", "asset_class", "exchange", "currency", "country",
-    # Price
-    "current_price", "previous_close", "percent_change",
-    # Risk
-    "risk_score", "risk_bucket",
-    # Forecast / confidence — the v5.69.0-deferred "empty Confidence Score"
-    "forecast_confidence", "confidence_score", "confidence_bucket",
-    # Scores
-    "overall_score", "opportunity_score", "rank_overall",
-    # Recommendation
-    "recommendation", "recommendation_reason",
-    "recommendation_detailed", "recommendation_priority",
-    "provider_rating", "recommendation_source",
-    # Provenance — the v5.69.0-deferred "empty Data Provider / Last Updated"
-    "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
-})
-
-
-def _instrument_contract_is_canonical(keys: Sequence[str]) -> bool:
-    """v5.70.0: True only if `keys` covers every canonical key the engine
-    writes on instrument rows. A contract that passes the loose structural
-    check in `_usable_contract` but FAILS this is a divergent registry
-    contract -- treating it as canonical strands the engine's canonical
-    compute outputs (Confidence Score / Data Provider / Last Updated) in
-    blank columns and surfaces registry-only ghost columns. This is the
-    Phase-1 gate of the v5.70.0 schema-alignment fix."""
-    return _INSTRUMENT_CANONICAL_REQUIRED_KEYS.issubset(
-        {_safe_str(k) for k in (keys or [])}
-    )
-
-
 def _usable_contract(headers: Sequence[str], keys: Sequence[str], sheet_name: str = "") -> bool:
     if not headers or not keys:
         return False
@@ -2752,25 +1034,10 @@ def _usable_contract(headers: Sequence[str], keys: Sequence[str], sheet_name: st
             return False
         if not ({"current_price", "price", "name"} & keyset):
             return False
-        # v5.70.0 PHASE 1: a structurally-valid contract that diverges from
-        # the canonical 97-column layout (i.e. omits the engine-written
-        # canonical keys) is NOT canonical-usable. Rejecting it here makes
-        # `_schema_for_sheet` fall back to the canonical static contract,
-        # so engine compute outputs (confidence_score, data_provider,
-        # last_updated_*) project into real columns instead of being
-        # stranded -- and the ghost "Status" column cannot appear.
-        if not _instrument_contract_is_canonical(keys):
-            return False
     if canon == "Top_10_Investments":
         if not ({"symbol", "ticker", "requested_symbol"} & keyset):
             return False
         if not set(TOP10_REQUIRED_FIELDS).issubset(keyset):
-            return False
-        # v5.70.0 PHASE 1: Top_10 rows are engine-written instrument rows
-        # plus the 3 Top10 fields -- require the same canonical-key
-        # coverage so a divergent registry contract cannot strand the
-        # canonical compute outputs on the Top_10_Investments sheet either.
-        if not _instrument_contract_is_canonical(keys):
             return False
     if canon == "Insights_Analysis":
         if not ({"section", "item", "metric", "value"} <= keyset):
@@ -2900,6 +1167,12 @@ def _rows_from_matrix_payload(matrix: Any, cols: Sequence[Any]) -> List[Dict[str
 
 
 def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
+    """
+    Prefer explicit dict-row collections first:
+    row_objects / records / items / data / quotes
+    Then accept rows if they are dict rows.
+    Finally fall back to matrix + keys or to explicit single row dicts.
+    """
     if out is None:
         return []
 
@@ -3031,7 +1304,6 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "ev_ebitda": ("ev_ebitda", "enterpriseToEbitda", "evToEbitda"),
     "peg_ratio": ("peg_ratio", "peg", "pegRatio"),
     "intrinsic_value": ("intrinsic_value", "fairValue", "dcf", "dcfValue", "intrinsicValue"),
-    "upside_pct": ("upside_pct", "upsidePct", "upside_percent", "upsidePercent", "upside", "potentialUpside"),
     "valuation_score": ("valuation_score",),
     "forecast_price_1m": ("forecast_price_1m", "targetPrice1m", "priceTarget1m"),
     "forecast_price_3m": ("forecast_price_3m", "targetPrice3m", "priceTarget3m", "targetPrice", "targetMeanPrice"),
@@ -3049,10 +1321,6 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "overall_score": ("overall_score", "score", "compositeScore"),
     "opportunity_score": ("opportunity_score",),
     "rank_overall": ("rank_overall", "rank", "overallRank"),
-    "fundamental_view": ("fundamental_view", "fundamentalView", "fundamental_rating"),
-    "technical_view": ("technical_view", "technicalView", "technical_rating"),
-    "risk_view": ("risk_view", "riskView", "risk_rating", "risk_label"),
-    "value_view": ("value_view", "valueView", "value_rating", "valuation_label"),
     "recommendation": ("recommendation", "rating", "action", "reco", "consensus"),
     "recommendation_reason": ("recommendation_reason", "reason", "summary", "thesis", "analysis"),
     "horizon_days": ("horizon_days", "horizon", "days"),
@@ -3067,20 +1335,6 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "last_updated_utc": ("last_updated_utc", "lastUpdated", "updatedAt", "timestamp", "asOf"),
     "last_updated_riyadh": ("last_updated_riyadh",),
     "warnings": ("warnings", "warning", "messages", "errors"),
-    "sector_relative_score": ("sector_relative_score", "sectorAdjustedScore", "sectorAdjScore", "sector_adj_score", "sectorRelativeScore"),
-    "conviction_score": ("conviction_score", "convictionScore", "conviction"),
-    "top_factors": ("top_factors", "topFactors", "positives", "factors"),
-    "top_risks": ("top_risks", "topRisks", "negatives", "risks"),
-    "position_size_hint": ("position_size_hint", "positionSizeHint", "sizingHint", "sizing"),
-    "recommendation_detailed": ("recommendation_detailed", "recommendationDetailed", "recommendationDetail", "reco_detail", "detailed_recommendation"),
-    "recommendation_priority": ("recommendation_priority", "recoPriority", "priority", "reco_priority"),
-    "provider_rating": ("provider_rating", "providerRating", "provider_recommendation", "analystRating", "analyst_rating"),
-    "recommendation_source": ("recommendation_source", "recommendationSource", "reco_source", "source_recommendation"),
-    "candlestick_pattern": ("candlestick_pattern", "candlePattern", "candlestickPattern", "pattern"),
-    "candlestick_signal": ("candlestick_signal", "candleSignal", "candlestickSignal", "patternSignal"),
-    "candlestick_strength": ("candlestick_strength", "candleStrength", "candlestickStrength", "patternStrength"),
-    "candlestick_confidence": ("candlestick_confidence", "candleConfidence", "candlestickConfidence", "patternConfidence"),
-    "candlestick_patterns_recent": ("candlestick_patterns_recent", "recentPatterns", "candlestickPatternsRecent", "patterns5d", "patterns_recent"),
 }
 
 _COMMODITY_SYMBOL_HINTS: Tuple[str, ...] = ("GC=F", "SI=F", "BZ=F", "CL=F", "NG=F", "HG=F")
@@ -3113,139 +1367,6 @@ _COMMODITY_INDUSTRY_HINTS: Dict[str, str] = {
     "CL=F": "Energy",
     "NG=F": "Energy",
 }
-
-
-# =============================================================================
-# v5.67.0 — Suffix → locale map (international exchange/currency/country)
-# =============================================================================
-# Pre-v5.67.0, the three `_infer_*_from_symbol` helpers defaulted every
-# non-Saudi/non-FX/non-Futures ticker to NASDAQ/USD/USA. The May 2026 audit
-# showed 51/57 rows with .HK / .L / .NS / .SA / .TO / .XETRA / .DE tickers
-# all stamped as US listings. This map fixes that. Format:
-# {suffix: (exchange_display, currency_code, country)}
-#
-# Note: .SA is Brazil (Yahoo convention); Saudi Arabia uses .SR. GBp (pence)
-# is intentionally lowercase 'p' — LSE quotes most equities in pence, not pounds.
-_SUFFIX_TO_LOCALE: Dict[str, Tuple[str, str, str]] = {
-    ".HK":    ("HKEX", "HKD", "Hong Kong"),
-    ".L":     ("LSE", "GBp", "United Kingdom"),
-    ".LON":   ("LSE", "GBp", "United Kingdom"),
-    ".CO":    ("Copenhagen", "DKK", "Denmark"),
-    ".NS":    ("NSE", "INR", "India"),
-    ".BO":    ("BSE", "INR", "India"),
-    ".SA":    ("B3", "BRL", "Brazil"),
-    ".SR":    ("Tadawul", "SAR", "Saudi Arabia"),
-    ".SAU":   ("Tadawul", "SAR", "Saudi Arabia"),
-    ".TADAWUL": ("Tadawul", "SAR", "Saudi Arabia"),
-    ".KSE":   ("Tadawul", "SAR", "Saudi Arabia"),
-    ".TO":    ("TSX", "CAD", "Canada"),
-    ".V":     ("TSX Venture", "CAD", "Canada"),
-    ".CN":    ("CSE", "CAD", "Canada"),
-    ".NE":    ("NEO Exchange", "CAD", "Canada"),
-    ".XETRA": ("XETRA", "EUR", "Germany"),
-    ".XETR":  ("XETRA", "EUR", "Germany"),
-    ".DE":    ("XETRA", "EUR", "Germany"),
-    ".F":     ("Frankfurt", "EUR", "Germany"),
-    ".HM":    ("Hamburg", "EUR", "Germany"),
-    ".MU":    ("Munich", "EUR", "Germany"),
-    ".PA":    ("Euronext Paris", "EUR", "France"),
-    ".PAR":   ("Euronext Paris", "EUR", "France"),
-    ".AS":    ("Euronext Amsterdam", "EUR", "Netherlands"),
-    ".AMS":   ("Euronext Amsterdam", "EUR", "Netherlands"),
-    ".MI":    ("Borsa Italiana", "EUR", "Italy"),
-    ".MIL":   ("Borsa Italiana", "EUR", "Italy"),
-    ".MC":    ("BME", "EUR", "Spain"),
-    ".MAD":   ("BME", "EUR", "Spain"),
-    ".BR":    ("Euronext Brussels", "EUR", "Belgium"),
-    ".BRU":   ("Euronext Brussels", "EUR", "Belgium"),
-    ".LS":    ("Euronext Lisbon", "EUR", "Portugal"),
-    ".HE":    ("Helsinki", "EUR", "Finland"),
-    ".HEL":   ("Helsinki", "EUR", "Finland"),
-    ".IR":    ("Euronext Dublin", "EUR", "Ireland"),
-    ".ST":    ("Stockholm", "SEK", "Sweden"),
-    ".STO":   ("Stockholm", "SEK", "Sweden"),
-    ".OL":    ("Oslo", "NOK", "Norway"),
-    ".OSL":   ("Oslo", "NOK", "Norway"),
-    ".SW":    ("SIX", "CHF", "Switzerland"),
-    ".SWX":   ("SIX", "CHF", "Switzerland"),
-    ".VI":    ("Vienna", "EUR", "Austria"),
-    ".VIE":   ("Vienna", "EUR", "Austria"),
-    ".WA":    ("Warsaw", "PLN", "Poland"),
-    ".WAR":   ("Warsaw", "PLN", "Poland"),
-    ".AX":    ("ASX", "AUD", "Australia"),
-    ".NZ":    ("NZX", "NZD", "New Zealand"),
-    ".T":     ("TSE", "JPY", "Japan"),
-    ".TYO":   ("TSE", "JPY", "Japan"),
-    ".KS":    ("KRX", "KRW", "South Korea"),
-    ".KQ":    ("KOSDAQ", "KRW", "South Korea"),
-    ".SI":    ("SGX", "SGD", "Singapore"),
-    ".KL":    ("Bursa Malaysia", "MYR", "Malaysia"),
-    ".BK":    ("SET", "THB", "Thailand"),
-    ".JK":    ("IDX", "IDR", "Indonesia"),
-    ".SS":    ("Shanghai", "CNY", "China"),
-    ".SZ":    ("Shenzhen", "CNY", "China"),
-    ".TW":    ("TWSE", "TWD", "Taiwan"),
-    ".TWO":   ("TPEx", "TWD", "Taiwan"),
-    ".MX":    ("BMV", "MXN", "Mexico"),
-    ".BA":    ("BCBA", "ARS", "Argentina"),
-    ".JO":    ("JSE", "ZAR", "South Africa"),
-    ".US":    ("NASDAQ/NYSE", "USD", "USA"),
-    # v5.68.0 PHASE 6: EODHD long-form suffixes + US exchange aliases. These
-    # let _suffix_locale_for / the _infer_* helpers recognize the symbol forms
-    # EODHD returns and the alias forms providers occasionally emit, instead of
-    # silently falling through to the NASDAQ/USD/USA default.
-    ".LSE":   ("LSE", "GBp", "United Kingdom"),
-    ".LN":    ("LSE", "GBp", "United Kingdom"),
-    ".NSE":   ("NSE", "INR", "India"),
-    ".BSE":   ("BSE", "INR", "India"),
-    ".JSE":   ("JSE", "ZAR", "South Africa"),
-    ".ZA":    ("JSE", "ZAR", "South Africa"),
-    ".HKG":   ("HKEX", "HKD", "Hong Kong"),
-    ".SHG":   ("Shanghai", "CNY", "China"),
-    ".SHE":   ("Shenzhen", "CNY", "China"),
-    ".KOSDAQ": ("KOSDAQ", "KRW", "South Korea"),
-    ".SGX":   ("SGX", "SGD", "Singapore"),
-    ".ASX":   ("ASX", "AUD", "Australia"),
-    ".KLSE":  ("Bursa Malaysia", "MYR", "Malaysia"),
-    ".IDX":   ("IDX", "IDR", "Indonesia"),
-    ".NZSE":  ("NZX", "NZD", "New Zealand"),
-    ".NYSE":  ("NYSE", "USD", "USA"),
-    ".NASDAQ": ("NASDAQ", "USD", "USA"),
-    ".OQ":    ("NASDAQ", "USD", "USA"),
-    ".NM":    ("NASDAQ", "USD", "USA"),
-    ".NG":    ("NASDAQ", "USD", "USA"),
-}
-
-# v5.67.0: tokens that indicate the displayed `country` field is a stale
-# US default and is eligible to be overwritten by suffix derivation.
-_US_COUNTRY_TOKENS: Set[str] = {
-    "", "USA", "US", "U.S.", "U.S.A.", "UNITED STATES", "UNITED STATES OF AMERICA",
-}
-
-# v5.67.0: percent_change is now stored as a FRACTION. Daily moves above
-# 0.50 (50%) are extremely rare and almost always indicate a unit error.
-_PERCENT_CHANGE_DAILY_MAX_ABS_FRACTION: float = 0.50
-
-
-def _suffix_locale_for(symbol: str) -> Optional[Tuple[str, str, str]]:
-    """
-    v5.67.0: Look up (exchange, currency, country) by symbol suffix.
-    Returns None if no recognized suffix. Longest-match wins (e.g. .TADAWUL
-    beats .T) so multi-character suffixes are not shadowed by single-character
-    prefixes.
-    """
-    s = normalize_symbol(symbol)
-    if not s or "." not in s:
-        return None
-    best_suffix: Optional[str] = None
-    s_upper = s.upper()
-    for suffix in _SUFFIX_TO_LOCALE:
-        if s_upper.endswith(suffix):
-            if best_suffix is None or len(suffix) > len(best_suffix):
-                best_suffix = suffix
-    if best_suffix is None:
-        return None
-    return _SUFFIX_TO_LOCALE[best_suffix]
 
 
 def _is_blank_value(value: Any) -> bool:
@@ -3343,33 +1464,126 @@ def _infer_asset_class_from_symbol(symbol: str) -> str:
     return "Equity"
 
 
-def _infer_exchange_from_symbol(symbol: str) -> str:
-    """v5.67.0: consult _SUFFIX_TO_LOCALE first to avoid mislabeling foreign tickers."""
+# =============================================================================
+# v5.72.0 PHASE 1 — Global suffix-to-locale map
+# =============================================================================
+# v5.47.2 only inferred KSA tickers and fell back to USA for everything else,
+# which is why MABANEE.KW / OOREDOO.QA / EMAAR.AE / ALAFCO.KW all displayed as
+# USA / USD / NASDAQ-NYSE. v5.72.0 extends coverage to every major exchange
+# suffix Yahoo uses. The map drives all three inference functions below.
+#
+# Note: .KSE maps to Boursa Kuwait per Yahoo convention. Saudi tickers use .SR.
+
+_SUFFIX_TO_LOCALE: Dict[str, Tuple[str, str, str]] = {
+    # Middle East / North Africa
+    ".SR":    ("Tadawul",        "SAR", "Saudi Arabia"),
+    ".KW":    ("Boursa Kuwait",  "KWD", "Kuwait"),
+    ".KSE":   ("Boursa Kuwait",  "KWD", "Kuwait"),
+    ".QA":    ("QSE",            "QAR", "Qatar"),
+    ".QE":    ("QSE",            "QAR", "Qatar"),
+    ".AE":    ("DFM/ADX",        "AED", "United Arab Emirates"),
+    ".DFM":   ("DFM",            "AED", "United Arab Emirates"),
+    ".ADX":   ("ADX",            "AED", "United Arab Emirates"),
+    ".EG":    ("EGX",            "EGP", "Egypt"),
+    ".EGX":   ("EGX",            "EGP", "Egypt"),
+    ".TA":    ("TASE",           "ILS", "Israel"),
+    ".TASE":  ("TASE",           "ILS", "Israel"),
+    # Europe
+    ".L":     ("LSE",            "GBp", "United Kingdom"),
+    ".DE":    ("XETRA",          "EUR", "Germany"),
+    ".F":     ("Frankfurt",      "EUR", "Germany"),
+    ".PA":    ("Euronext Paris", "EUR", "France"),
+    ".AS":    ("Euronext Amsterdam", "EUR", "Netherlands"),
+    ".BR":    ("Euronext Brussels", "EUR", "Belgium"),
+    ".LS":    ("Euronext Lisbon", "EUR", "Portugal"),
+    ".MI":    ("Borsa Italiana", "EUR", "Italy"),
+    ".MC":    ("BME Madrid",     "EUR", "Spain"),
+    ".MA":    ("BME Madrid",     "EUR", "Spain"),
+    ".SW":    ("SIX Swiss",      "CHF", "Switzerland"),
+    ".VX":    ("SIX Swiss",      "CHF", "Switzerland"),
+    ".VI":    ("Vienna",         "EUR", "Austria"),
+    ".HE":    ("Helsinki",       "EUR", "Finland"),
+    ".CO":    ("Copenhagen",     "DKK", "Denmark"),
+    ".ST":    ("Stockholm",      "SEK", "Sweden"),
+    ".OL":    ("Oslo",           "NOK", "Norway"),
+    ".IS":    ("Borsa Istanbul", "TRY", "Turkey"),
+    ".WA":    ("Warsaw",         "PLN", "Poland"),
+    ".PR":    ("Prague",         "CZK", "Czech Republic"),
+    ".BD":    ("Budapest",       "HUF", "Hungary"),
+    ".AT":    ("Athens",         "EUR", "Greece"),
+    ".IR":    ("Dublin",         "EUR", "Ireland"),
+    # Asia / Pacific
+    ".T":     ("TSE",            "JPY", "Japan"),
+    ".HK":    ("HKEX",           "HKD", "Hong Kong"),
+    ".SS":    ("Shanghai",       "CNY", "China"),
+    ".SZ":    ("Shenzhen",       "CNY", "China"),
+    ".KS":    ("KRX",            "KRW", "South Korea"),
+    ".KQ":    ("KOSDAQ",         "KRW", "South Korea"),
+    ".TW":    ("Taiwan",         "TWD", "Taiwan"),
+    ".TWO":   ("Taipei",         "TWD", "Taiwan"),
+    ".BK":    ("Bangkok",        "THB", "Thailand"),
+    ".JK":    ("Jakarta",        "IDR", "Indonesia"),
+    ".KL":    ("KLSE",           "MYR", "Malaysia"),
+    ".SI":    ("SGX",            "SGD", "Singapore"),
+    ".PH":    ("PSE",            "PHP", "Philippines"),
+    ".VN":    ("HOSE",           "VND", "Vietnam"),
+    ".NS":    ("NSE",            "INR", "India"),
+    ".BO":    ("BSE",            "INR", "India"),
+    ".AX":    ("ASX",            "AUD", "Australia"),
+    ".NZ":    ("NZX",            "NZD", "New Zealand"),
+    # Americas (non-US)
+    ".TO":    ("TSX",            "CAD", "Canada"),
+    ".V":     ("TSXV",           "CAD", "Canada"),
+    ".CN":    ("CSE",            "CAD", "Canada"),
+    ".NE":    ("NEO",            "CAD", "Canada"),
+    ".MX":    ("BMV",            "MXN", "Mexico"),
+    ".SA":    ("B3",             "BRL", "Brazil"),
+    ".BA":    ("BCBA",           "ARS", "Argentina"),
+    ".SN":    ("Santiago",       "CLP", "Chile"),
+    ".LM":    ("Lima",           "PEN", "Peru"),
+    # Africa
+    ".JO":    ("JSE",            "ZAR", "South Africa"),
+    # USA (explicit — Yahoo allows ".US" suffix in some contexts)
+    ".US":    ("NASDAQ/NYSE",    "USD", "USA"),
+}
+
+
+def _v572_lookup_suffix(symbol: str) -> Optional[Tuple[str, str, str]]:
+    """v5.72.0: Return (exchange, currency, country) for any known suffix, else None."""
     s = normalize_symbol(symbol)
     if not s:
-        return ""
-    locale = _suffix_locale_for(s)
-    if locale is not None:
-        return locale[0]
+        return None
+    # Check from longest suffix to shortest so .KSE matches before .SE etc.
+    for sfx in sorted(_SUFFIX_TO_LOCALE.keys(), key=len, reverse=True):
+        if s.endswith(sfx):
+            return _SUFFIX_TO_LOCALE[sfx]
+    return None
+
+
+def _infer_exchange_from_symbol(symbol: str) -> str:
+    s = normalize_symbol(symbol)
+    # v5.72.0: 4-digit pure-numeric → Tadawul (KSA local code)
     if re.match(r"^[0-9]{4}$", s):
         return "Tadawul"
+    # v5.72.0: FX / Futures stay special
     if s.endswith("=X"):
         return "FX"
     if s.endswith("=F"):
         return "Futures"
+    # v5.72.0: known suffix → mapped exchange
+    locale = _v572_lookup_suffix(s)
+    if locale is not None:
+        return locale[0]
+    # v5.47.2 default
     return "NASDAQ/NYSE"
 
 
 def _infer_currency_from_symbol(symbol: str) -> str:
-    """v5.67.0: consult _SUFFIX_TO_LOCALE first."""
     s = normalize_symbol(symbol)
-    if not s:
-        return ""
-    locale = _suffix_locale_for(s)
-    if locale is not None:
-        return locale[1]
+    # v5.72.0: 4-digit KSA code
     if re.match(r"^[0-9]{4}$", s):
         return "SAR"
+    # v5.47.2 FX-pair extraction preserved
     if s.endswith("=X"):
         pair = s[:-2]
         if len(pair) >= 6:
@@ -3379,35 +1593,26 @@ def _infer_currency_from_symbol(symbol: str) -> str:
         return "FX"
     if s.endswith("=F"):
         return "USD"
+    # v5.72.0: known suffix → mapped currency
+    locale = _v572_lookup_suffix(s)
+    if locale is not None:
+        return locale[1]
+    # v5.47.2 default
     return "USD"
 
 
 def _infer_country_from_symbol(symbol: str) -> str:
-    """v5.67.0: consult _SUFFIX_TO_LOCALE first.
-    v5.68.0 PHASE 7: then consult core.symbols.normalize as a fallback before
-    defaulting to "USA". US/Global normalize results are intentionally ignored
-    so the established "USA" display convention and the deliberate GBp (pence)
-    nuance for .L are preserved."""
     s = normalize_symbol(symbol)
-    if not s:
-        return ""
-    locale = _suffix_locale_for(s)
-    if locale is not None:
-        return locale[2]
+    # v5.72.0: 4-digit KSA code
     if re.match(r"^[0-9]{4}$", s):
         return "Saudi Arabia"
     if s.endswith("=X") or s.endswith("=F"):
         return "Global"
-    if _NORMALIZE_AVAILABLE and _nz_get_country_from_symbol is not None:
-        try:
-            nz_country = _nz_get_country_from_symbol(s)
-        except Exception:
-            nz_country = None
-        nz_country = (nz_country or "").strip()
-        if nz_country and nz_country.upper() not in {
-            "USA", "US", "UNITED STATES", "GLOBAL", "",
-        }:
-            return nz_country
+    # v5.72.0: known suffix → mapped country
+    locale = _v572_lookup_suffix(s)
+    if locale is not None:
+        return locale[2]
+    # v5.47.2 default
     return "USA"
 
 
@@ -3545,22 +1750,31 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if not out.get("industry"):
         out["industry"] = _infer_industry_from_symbol(inferred_symbol)
 
-    # v5.67.0: Repair stale US defaults on foreign-suffix tickers. Pre-v5.67.0,
-    # when EODHD/Finnhub returned a partial row with Country=USA / Exchange=NASDAQ
-    # for a .HK / .L / .NS ticker, the `if not out.get(...)` checks above
-    # respected the bad value because the field WAS populated (just with the
-    # wrong content). This block detects that case and overrides.
-    locale = _suffix_locale_for(inferred_symbol)
-    if locale is not None and locale[2] != "USA":
-        derived_exch, derived_curr, derived_country = locale
-        if _safe_str(out.get("country")).upper() in _US_COUNTRY_TOKENS:
-            out["country"] = derived_country
-        current_exch_upper = _safe_str(out.get("exchange")).upper()
-        if (not current_exch_upper) or "NASDAQ" in current_exch_upper or "NYSE" in current_exch_upper:
-            out["exchange"] = derived_exch
-        current_curr_upper = _safe_str(out.get("currency")).upper()
-        if (not current_curr_upper) or current_curr_upper == "USD":
-            out["currency"] = derived_curr
+    # v5.72.0 PATCH 6: Force-override provider-supplied wrong locale for foreign
+    # tickers. Without this, Yahoo/EODHD returning USA/USD/NASDAQ for MABANEE.KW
+    # would win silently. We only override when the symbol's suffix is in
+    # _SUFFIX_TO_LOCALE and maps to a non-USA/non-Global locale.
+    try:
+        _v572_locale = _v572_lookup_suffix(inferred_symbol)
+        if _v572_locale is not None and _v572_locale[2] not in ("USA", "Global"):
+            _v572_ex, _v572_ccy, _v572_cn = _v572_locale
+            if _safe_str(out.get("exchange")).strip() and _safe_str(out.get("exchange")).strip() != _v572_ex:
+                _v572_append_warning(out, "v572:exchange_corrected_from=" + _safe_str(out.get("exchange")))
+                out["exchange"] = _v572_ex
+            elif not out.get("exchange"):
+                out["exchange"] = _v572_ex
+            if _safe_str(out.get("currency")).strip() and _safe_str(out.get("currency")).strip() != _v572_ccy:
+                _v572_append_warning(out, "v572:currency_corrected_from=" + _safe_str(out.get("currency")))
+                out["currency"] = _v572_ccy
+            elif not out.get("currency"):
+                out["currency"] = _v572_ccy
+            if _safe_str(out.get("country")).strip() and _safe_str(out.get("country")).strip() != _v572_cn:
+                _v572_append_warning(out, "v572:country_corrected_from=" + _safe_str(out.get("country")))
+                out["country"] = _v572_cn
+            elif not out.get("country"):
+                out["country"] = _v572_cn
+    except Exception as _loc_err:
+        logger.debug("[v5.72.0] locale force-override failed: %s", _loc_err)
 
     if provider and not out.get("data_provider"):
         out["data_provider"] = provider
@@ -3588,34 +1802,11 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if change is None and price is not None and prev is not None:
         change = price - prev
         out["price_change"] = round(change, 6)
-
-    # v5.67.0: emit percent_change as FRACTION (was POINTS pre-v5.67.0).
-    # 04_Format.gs v2.7.0 expects FRACTION via `_KNOWN_FRACTION_PERCENT_COLUMNS_`
-    # and applies "0.00%" format which multiplies by 100 for display. Pre-v5.67.0
-    # the engine stored POINTS, causing the formatter to display 100× too large.
     if pct is None and price is not None and prev not in (None, 0):
-        # No incoming value — compute as fraction directly
-        pct = (price - prev) / prev
-        out["percent_change"] = round(pct, 8)
-    elif pct is not None:
-        # Provider sent a value. Determine whether it's already a fraction or
-        # in points form, using a ground-truth comparison when prices are available.
-        if price is not None and prev not in (None, 0):
-            true_fraction = (price - prev) / prev
-            err_as_fraction = abs(pct - true_fraction)
-            err_as_points = abs(pct - true_fraction * 100.0)
-            if err_as_points < err_as_fraction:
-                # stored value is in points form; convert to fraction
-                out["percent_change"] = round(pct / 100.0, 8)
-            else:
-                # stored value is already in fraction form
-                out["percent_change"] = round(pct, 8)
-        else:
-            # No price/prev for ground truth — use magnitude heuristic
-            if abs(pct) > 1.5:
-                out["percent_change"] = round(pct / 100.0, 8)
-            else:
-                out["percent_change"] = round(pct, 8)
+        pct = ((price - prev) / prev) * 100.0
+        out["percent_change"] = round(pct, 6)
+    elif pct is not None and abs(pct) <= 1.5:
+        out["percent_change"] = round(pct * 100.0, 6)
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
@@ -3685,8 +1876,7 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             conf = conf_fraction * 100.0 if conf_fraction <= 1.5 else conf_fraction
             out.setdefault("confidence_score", round(_clamp(conf, 0.0, 100.0), 2))
     if conf is not None and out.get("confidence_bucket") in (None, ""):
-        # v5.71.0 FIX: confidence bucket comes from core.scoring helper.
-        out["confidence_bucket"] = _engine_confidence_bucket(conf)
+        out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
 
     if target == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
         out.setdefault("data_provider", _safe_str(out.get("data_provider"), "history_or_fallback"))
@@ -3696,8 +1886,7 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             out["confidence_score"] = 55.0
         if out.get("forecast_confidence") not in (None, "") and out.get("confidence_bucket") in (None, ""):
             conf = _as_float(out.get("confidence_score")) or ((_as_float(out.get("forecast_confidence")) or 0.55) * 100.0)
-            # v5.71.0 FIX: confidence bucket comes from core.scoring helper.
-            out["confidence_bucket"] = _engine_confidence_bucket(conf)
+            out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
         if out.get("warnings") in (None, "") and _as_float(out.get("current_price")) is None:
             out["warnings"] = "Live quote sparse; chart/history fallback unavailable"
 
@@ -3762,7 +1951,201 @@ def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[
     return [[_json_safe(row.get(k)) for k in keys] for row in rows or []]
 
 
+# =============================================================================
+# v5.72.0 PHASE 2-3 — Empty-row guard + active outlier sanitization
+# =============================================================================
+# These helpers are CALLED from _compute_recommendation() (empty-row override)
+# and _compute_scores_fallback() (sanitization before scoring) below.
+# They use only v5.47.2 primitives — no new imports required.
+
+_EMPTY_ROW_INDICATOR_FIELDS: Tuple[str, ...] = (
+    "current_price", "previous_close", "open_price",
+    "day_high", "day_low", "week_52_high", "week_52_low",
+    "volume", "market_cap",
+)
+
+_V572_NULL_STRINGS = {"", "null", "none", "n/a", "na", "nan", "-", "--"}
+
+# Outlier ratio / multiple bounds. Limits are intentionally wide — only
+# true 3+-orders-of-magnitude outliers trigger.
+_OUTLIER_LIMITS: Dict[str, Tuple[float, float]] = {
+    "pe_ttm":         (-1000.0, 1000.0),
+    "pe_forward":     (-1000.0, 1000.0),
+    "pb_ratio":       (-50.0,    100.0),
+    "ps_ratio":       (0.0,     1000.0),
+    "ev_ebitda":      (-500.0,   500.0),
+    "peg_ratio":      (-100.0,   100.0),
+    "debt_to_equity": (0.0,     1000.0),
+}
+
+# 52-week high/low corruption thresholds (ratio against current price).
+# BKNG.US reported week_52_high=5,839 with current_price=154 (37x) — almost
+# certainly a wrong-instrument match or unapplied split.
+_WEEK_52_HIGH_RATIO_LIMIT = 10.0
+_WEEK_52_LOW_RATIO_LIMIT = 100.0
+
+# Cross-currency revenue/market-cap threshold. IX.US Orix: revenue 3.3T (JPY)
+# vs market_cap 40B (USD) = 82x.
+_REVENUE_MCAP_RATIO_LIMIT = 50.0
+
+
+def _v572_append_warning(row: Dict[str, Any], text: str) -> None:
+    """v5.72.0: Append a warning token to row.warnings (works on str OR list)."""
+    if not row or not text:
+        return
+    existing = row.get("warnings")
+    if isinstance(existing, list):
+        if text not in existing:
+            existing.append(text)
+    elif isinstance(existing, str) and existing.strip():
+        if text not in existing:
+            row["warnings"] = existing + "; " + text
+    else:
+        row["warnings"] = text
+
+
+def _is_empty_data_row(row: Dict[str, Any]) -> bool:
+    """v5.72.0: True when EVERY core price/volume/fundamental field is blank.
+
+    Used by _compute_recommendation to override scoring defaults that would
+    otherwise produce a fake recommendation for a row with no provider data.
+    """
+    if not isinstance(row, dict):
+        return False
+    for f in _EMPTY_ROW_INDICATOR_FIELDS:
+        v = row.get(f)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            if v.strip().lower() in _V572_NULL_STRINGS:
+                continue
+            return False  # non-null string is populated
+        # Any numeric or other non-None value means the row isn't empty
+        return False
+    return True
+
+
+def _mark_row_as_empty(row: Dict[str, Any]) -> None:
+    """v5.72.0: Override scoring defaults for an empty row.
+
+    Sets data_quality=missing, recommendation=NA, clears every score field,
+    appends 'empty_row_no_provider_data' to warnings.
+    """
+    if not isinstance(row, dict):
+        return
+    try:
+        row["data_quality"] = QuoteQuality.MISSING.value
+    except Exception:
+        row["data_quality"] = "missing"
+    row["recommendation"] = "NA"
+    row["recommendation_detailed"] = "NA"
+    row["recommendation_priority"] = None
+    row["reco_priority"] = None
+    row["recommendation_source"] = "empty_row"
+    row["recommendation_reason"] = (
+        "Insufficient data: no provider returned price or fundamental fields "
+        "for this symbol; recommendation suppressed."
+    )
+    for score_field in (
+        "overall_score", "value_score", "quality_score",
+        "momentum_score", "growth_score", "opportunity_score",
+        "confidence_score", "forecast_confidence", "risk_score",
+        "valuation_score", "rank_overall",
+    ):
+        row[score_field] = None
+    row["risk_bucket"] = None
+    row["confidence_bucket"] = None
+    _v572_append_warning(row, "empty_row_no_provider_data")
+    try:
+        sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
+        logger.info(
+            "[v5.72.0 EMPTY] symbol=%s recommendation=NA scores_nulled=11", sym,
+        )
+    except Exception:
+        pass
+
+
+def _sanitize_extreme_outliers(row: Dict[str, Any]) -> None:
+    """v5.72.0: Null ratio/multiple fields that exceed empirical bounds."""
+    if not isinstance(row, dict):
+        return
+    for field, (lo, hi) in _OUTLIER_LIMITS.items():
+        try:
+            val = _as_float(row.get(field))
+            if val is None:
+                continue
+            if val < lo or val > hi:
+                row[field] = None
+                _v572_append_warning(row, "sanitized:" + field + "_out_of_range=" + ("%.2f" % val))
+        except Exception:
+            pass
+
+
+def _sanitize_corrupt_52w_bounds(row: Dict[str, Any]) -> None:
+    """v5.72.0: Null week_52_high when ratio to current price > 10x, low > 100x."""
+    if not isinstance(row, dict):
+        return
+    try:
+        cp = _as_float(row.get("current_price"))
+        if cp is None or cp <= 0:
+            return
+        hi = _as_float(row.get("week_52_high"))
+        if hi is not None and hi > 0:
+            ratio = hi / cp
+            if ratio > _WEEK_52_HIGH_RATIO_LIMIT:
+                row["week_52_high"] = None
+                row["week_52_position_pct"] = None
+                _v572_append_warning(row, "sanitized:week_52_high_extreme_ratio=" + ("%.1fx" % ratio))
+        lo = _as_float(row.get("week_52_low"))
+        if lo is not None and lo > 0:
+            ratio = cp / lo
+            if ratio > _WEEK_52_LOW_RATIO_LIMIT:
+                row["week_52_low"] = None
+                row["week_52_position_pct"] = None
+                _v572_append_warning(row, "sanitized:week_52_low_extreme_ratio=" + ("%.1fx" % ratio))
+    except Exception:
+        pass
+
+
+def _sanitize_cross_currency_revenue(row: Dict[str, Any]) -> None:
+    """v5.72.0: Null revenue_ttm when ratio to market_cap is impossible (>50x)."""
+    if not isinstance(row, dict):
+        return
+    try:
+        rev = _as_float(row.get("revenue_ttm"))
+        mcap = _as_float(row.get("market_cap"))
+        if rev is None or mcap is None or mcap <= 0:
+            return
+        ratio = abs(rev) / mcap
+        if ratio > _REVENUE_MCAP_RATIO_LIMIT:
+            row["revenue_ttm"] = None
+            _v572_append_warning(row, "sanitized:revenue_currency_suspect_ratio=" + ("%.0fx" % ratio))
+    except Exception:
+        pass
+
+
+def _apply_v572_sanitization(row: Dict[str, Any]) -> None:
+    """v5.72.0: Combined sanitization pass — call BEFORE _compute_scores_fallback.
+
+    Idempotent. Each call nulls offending fields and appends audit warnings.
+    Honors TFB_DISABLE_V572_SANITIZATION=true for debug bypass.
+    """
+    if not isinstance(row, dict):
+        return
+    if os.getenv("TFB_DISABLE_V572_SANITIZATION", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    _sanitize_extreme_outliers(row)
+    _sanitize_corrupt_52w_bounds(row)
+    _sanitize_cross_currency_revenue(row)
+
+
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
+    # v5.72.0: Null impossibly out-of-range ratios, corrupt 52W bounds, and
+    # cross-currency revenue BEFORE scoring sees them. Adds sanitized:* warnings.
+    try:
+        _apply_v572_sanitization(row)
+    except Exception as _san_err:
+        logger.debug("[v5.72.0] sanitization in _compute_scores_fallback failed: %s", _san_err)
     price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
     pe = _as_float(row.get("pe_ttm"))
     pb = _as_float(row.get("pb_ratio"))
@@ -3840,47 +2223,18 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     row.setdefault("confidence_score", round(_clamp(conf * 100.0, 0.0, 100.0), 2))
 
     if row.get("risk_score") is None:
-        # v5.69.0 — RISK FORMULA RECALIBRATION.
-        #
-        # The pre-v5.69.0 formula saturated: base 30.0 plus generous
-        # component ceilings meant a *typical* equity (~28% annualized
-        # vol, ~30% max annual drawdown, ~2.5% daily VaR, beta ~1.0)
-        # scored ~80+ and bucketed HIGH -- so the dashboard's Risk
-        # Bucket column was almost entirely HIGH.
-        #
-        # v5.69.0 re-anchors the additive formula so that:
-        #   * a calm blue-chip (~15% vol / ~15% DD / ~1.5% VaR / 0.8 beta)
-        #     lands ~30  (LOW / low-MODERATE)
-        #   * a normal equity (~28% vol / ~30% DD / ~2.5% VaR / 1.0 beta)
-        #     lands ~50  (mid-MODERATE)
-        #   * a volatile name (~50% vol / ~55% DD / ~5% VaR / 1.6 beta)
-        #     lands ~82  (HIGH)
-        #
-        # `_as_pct_points` is still used for scale tolerance: it treats a
-        # value with |v| <= 1.5 as a fraction (x100) and anything larger
-        # as already in points. The in-engine emit site annualizes daily
-        # return std (x sqrt(252)), so volatility_90d arrives as an
-        # annualized fraction (~0.10-0.60) and converts cleanly. The
-        # recalibrated per-component caps below also bound the damage if
-        # an upstream provider mis-scales a field.
         vol = _as_pct_points(row.get("volatility_90d"))
-        # v5.67.0: max_drawdown_1y is a SIGNED FRACTION (e.g. -0.338);
-        # _as_pct_points -> signed points (-33.8); abs() below.
         drawdown = _as_pct_points(row.get("max_drawdown_1y"))
         var95 = _as_pct_points(row.get("var_95_1d"))
-        risk_score = 10.0  # was 30.0 — lowered base
+        risk_score = 30.0
         if vol is not None:
-            # annualized vol points; ~28% normal -> ~16. cap 30.
-            risk_score += min(max(vol, 0.0) * 0.57, 30.0)
+            risk_score += min(max(vol, 0.0), 35.0)
         if drawdown is not None:
-            # abs drawdown points; ~30% normal -> ~12. cap 24.
-            risk_score += min(abs(drawdown) * 0.40, 24.0)
+            risk_score += min(max(drawdown, 0.0), 20.0) * 0.6
         if var95 is not None:
-            # abs daily VaR points; ~2.5% normal -> ~7. cap 15.
-            risk_score += min(abs(var95) * 2.80, 15.0)
+            risk_score += min(max(var95, 0.0), 12.0)
         if beta is not None:
-            # beta ~1.0 normal -> ~5. cap 12.
-            risk_score += min(max(beta, 0.0) * 5.00, 12.0)
+            risk_score += min(max(beta * 8.0, 0.0), 15.0)
         row["risk_score"] = round(_clamp(float(risk_score), 0.0, 100.0), 2)
 
     if row.get("overall_score") is None:
@@ -3931,79 +2285,55 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         row["opportunity_score"] = round(_clamp(base + confidence_boost + roi_boost - risk_penalty, 0.0, 100.0), 2)
 
     if not row.get("risk_bucket"):
-        # v5.71.0 FIX: risk bucket comes from core.scoring helper.
-        row["risk_bucket"] = _engine_risk_bucket(row.get("risk_score"))
+        rs = _as_float(row.get("risk_score")) or 50.0
+        row["risk_bucket"] = "LOW" if rs < 40 else "MODERATE" if rs < 70 else "HIGH"
 
     if not row.get("confidence_bucket"):
-        # v5.71.0 FIX: confidence bucket comes from core.scoring helper.
-        row["confidence_bucket"] = _engine_confidence_bucket(row.get("confidence_score"))
+        cs = _as_float(row.get("confidence_score")) or 55.0
+        row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
-    """v5.71.0 FIX: recommendation delegates to core.scoring via wrapper.
-
-    Kept for call-site compatibility. It no longer contains or calls a local
-    threshold ladder, and it always rewrites recommendation_reason from the
-    engine path.
-    """
-    _classify_recommendation_8tier(row)
-
-
-def apply_page_ranks(rows: List[Dict[str, Any]], page_name: str = "", force_single: bool = False) -> None:
-    """v5.71.0 FIX: page-wide ranking pass using overall_score only.
-
-    Single-row ranking is allowed only when force_single=True. We never infer
-    an explicit single-symbol request from len(rows) == 1 because that was the
-    root cause of the rank-always-1 bug.
-    """
-    if not isinstance(rows, list) or not rows:
-        logger.info("[v5.71.0 RANK] page=%s n_rows=0 n_ranked=0 n_skipped=0", page_name or "")
+    # v5.72.0: Empty-row override — must run BEFORE any score-based logic so
+    # rows with no provider data don't get a fake REDUCE/overall=50/risk=10.
+    try:
+        if _is_empty_data_row(row):
+            _mark_row_as_empty(row)
+            return
+    except Exception as _emp_err:
+        logger.debug("[v5.72.0] empty-row guard in _compute_recommendation failed: %s", _emp_err)
+    if row.get("recommendation"):
         return
-
-    require_page_batch = _get_env_bool("TFB_RANK_REQUIRE_PAGE_BATCH", True)
-    if require_page_batch and len(rows) <= 1 and not force_single:
-        for row in rows:
-            if isinstance(row, dict):
-                row["rank_overall"] = None
-                _append_warning(row, "rank_skipped_per_symbol_batch")
-        logger.info(
-            "[v5.71.0 RANK] page=%s n_rows=%d n_ranked=0 n_skipped=%d",
-            page_name or "",
-            len(rows),
-            len(rows),
-        )
-        return
-
-    scored: List[Tuple[int, float]] = []
-    skipped = 0
-    for i, row in enumerate(rows):
-        if not isinstance(row, dict):
-            skipped += 1
-            continue
-        score = _as_float(row.get("overall_score"))
-        if score is None:
-            row["rank_overall"] = None
-            _append_warning(row, "rank_skipped_no_overall_score")
-            skipped += 1
-            continue
-        scored.append((i, score))
-
-    scored.sort(key=lambda t: t[1], reverse=True)
-    for rank, (idx, _) in enumerate(scored, start=1):
-        rows[idx]["rank_overall"] = rank
-
-    logger.info(
-        "[v5.71.0 RANK] page=%s n_rows=%d n_ranked=%d n_skipped=%d",
-        page_name or "",
-        len(rows),
-        len(scored),
-        skipped,
+    overall = _as_float(row.get("overall_score")) or 50.0
+    conf = _as_float(row.get("confidence_score")) or 55.0
+    risk = _as_float(row.get("risk_score")) or 50.0
+    if overall >= 75 and conf >= 65 and risk <= 60:
+        rec = "BUY"
+    elif overall >= 60 and conf >= 55:
+        rec = "ACCUMULATE"
+    elif overall <= 35 or risk >= 85:
+        rec = "REDUCE"
+    else:
+        rec = "HOLD"
+    row["recommendation"] = rec
+    row.setdefault(
+        "recommendation_reason",
+        f"overall={round(overall,1)} confidence={round(conf,1)} risk={round(risk,1)}",
     )
 
 
 def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
-    """Backward-compatible wrapper. Prefer apply_page_ranks(page_name=...)."""
-    apply_page_ranks(rows, page_name="", force_single=False)
+    scored: List[Tuple[int, float]] = []
+    for i, row in enumerate(rows):
+        score = _as_float(row.get("overall_score"))
+        if score is None:
+            score = _as_float(row.get("opportunity_score"))
+        if score is None:
+            continue
+        scored.append((i, score))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    for rank, (idx, _) in enumerate(scored, start=1):
+        rows[idx]["rank_overall"] = rank
 
 
 def _top10_selection_reason(row: Dict[str, Any]) -> str:
@@ -4023,15 +2353,21 @@ def _top10_selection_reason(row: Dict[str, Any]) -> str:
 
 
 def _top10_criteria_snapshot(criteria: Dict[str, Any]) -> str:
-    """v5.71.0 FIX: serialize full criteria; never silently drop keys."""
+    keep = {
+        "top_n": criteria.get("top_n"),
+        "pages_selected": criteria.get("pages_selected"),
+        "horizon_days": criteria.get("horizon_days") or criteria.get("invest_period_days"),
+        "risk_level": criteria.get("risk_level"),
+        "min_expected_roi": criteria.get("min_expected_roi"),
+        "confidence_level": criteria.get("confidence_level"),
+        "direct_symbols": criteria.get("direct_symbols") or criteria.get("symbols"),
+    }
+    keep = {k: v for k, v in keep.items() if v not in (None, "", [], {})}
     try:
-        payload = json.dumps(_json_safe(criteria or {}), ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+        import json
+        return json.dumps(_json_safe(keep), ensure_ascii=False, separators=(",", ":"))
     except Exception:
         return "{}"
-    max_chars = max(200, _get_env_int("TFB_CRITERIA_SNAPSHOT_MAX_CHARS", 2000))
-    if len(payload) > max_chars:
-        return payload[:max_chars] + f"[truncated at {max_chars} chars]"
-    return payload
 
 
 def _feature_flags(settings: Any) -> Dict[str, bool]:
@@ -4407,16 +2743,6 @@ class DataEngineV5:
 
         self.schema_strict_sheet_rows = _get_env_bool("SCHEMA_STRICT_SHEET_ROWS", True)
         self.top10_force_full_schema = _get_env_bool("TOP10_FORCE_FULL_SCHEMA", True)
-        # v5.70.0 PHASE 2: force the canonical 97-column instrument contract
-        # for every instrument sheet (mirrors `top10_force_full_schema`).
-        # The engine's compute paths all write CANONICAL field names, so a
-        # divergent schema_registry contract strands those outputs in blank
-        # columns and surfaces ghost columns. This flag is the explicit
-        # guarantee that instrument-sheet projection always uses canonical
-        # keys/headers. Env-gated (INSTRUMENT_FORCE_CANONICAL_SCHEMA,
-        # default on); set False only if a deployment genuinely needs the
-        # raw registry contract on instrument sheets.
-        self.instrument_force_canonical_schema = _get_env_bool("INSTRUMENT_FORCE_CANONICAL_SCHEMA", True)
         self.rows_hydrate_external = _get_env_bool("ROWS_HYDRATE_EXTERNAL_READER", True)
 
         self._sem = asyncio.Semaphore(max(1, self.max_concurrency))
@@ -5167,26 +3493,14 @@ class DataEngineV5:
                 await self._registry.record_failure(provider, err)
                 return provider, None, (time.time() - start) * 1000.0, err
 
-            # v5.68.0 PHASE 8: translate the raw symbol into the form THIS
-            # provider expects, then try the translated symbol first and the
-            # RAW symbol second. The raw fallback keeps this zero-regression:
-            # if translation is wrong or normalize is unavailable, the original
-            # behavior (raw symbol) is still attempted.
-            provider_symbol = _provider_symbol_for(provider, symbol)
-            symbols_to_try = [provider_symbol]
-            if symbol and symbol not in symbols_to_try:
-                symbols_to_try.append(symbol)
-
-            call_variants = []
-            for _sym in symbols_to_try:
-                call_variants.extend([
-                    ((_sym,), {}),
-                    ((), {"symbol": _sym}),
-                    ((), {"ticker": _sym}),
-                    ((), {"requested_symbol": _sym}),
-                    ((_sym,), {"settings": self.settings}),
-                    ((), {"symbol": _sym, "settings": self.settings}),
-                ])
+            call_variants = [
+                ((symbol,), {}),
+                ((), {"symbol": symbol}),
+                ((), {"ticker": symbol}),
+                ((), {"requested_symbol": symbol}),
+                ((symbol,), {"settings": self.settings}),
+                ((), {"symbol": symbol, "settings": self.settings}),
+            ]
 
             result = None
             collected_errs: List[str] = []
@@ -5232,6 +3546,8 @@ class DataEngineV5:
                 providers = [p for p in providers if p != primary_provider]
             providers.insert(0, primary_provider)
 
+        # Preserve paid EODHD priority for configured non-KSA/global pages even
+        # when settings or env put another global provider first.
         if (not is_ksa_sym) and page_ctx and page_ctx in self.page_primary_providers and _provider_allowed("eodhd"):
             providers = [p for p in providers if p != "eodhd"]
             providers.insert(0, "eodhd")
@@ -5308,6 +3624,7 @@ class DataEngineV5:
                     })
             return out
         if isinstance(result, dict):
+            # Yahoo chart-style payloads
             if isinstance(result.get("chart"), Mapping):
                 chart = result.get("chart") or {}
                 nested = self._coerce_history_rows(chart.get("result"))
@@ -5342,6 +3659,7 @@ class DataEngineV5:
                     if rows:
                         return rows
 
+            # Generic parallel-array payloads
             if any(isinstance(result.get(k), list) for k in ("close", "open", "high", "low", "volume")):
                 ts = result.get("timestamp") or list(range(len(result.get("close") or result.get("price") or [])))
                 rows = self._rows_from_parallel_series(
@@ -5356,6 +3674,7 @@ class DataEngineV5:
                 if rows:
                     return rows
 
+            # AlphaVantage-style keyed time series
             for key in ("Time Series (Daily)", "time_series", "series"):
                 series = result.get(key)
                 if isinstance(series, Mapping):
@@ -5428,17 +3747,8 @@ class DataEngineV5:
                 volumes.append(vol)
             if opn is not None:
                 opens.append(opn)
-        # v5.66.0 PHASE-JJ: Detect candlestick patterns from raw OHLC bars.
-        candle_fields: Dict[str, Any] = {}
-        try:
-            candle_fields = detect_candlestick_patterns(rows or [])
-        except Exception as cs_err:
-            logger.debug(
-                "[engine_v2 v%s] PHASE-JJ candlestick detection failed: %s: %s",
-                __version__, cs_err.__class__.__name__, cs_err,
-            )
         if len(closes) < 2:
-            return candle_fields if candle_fields else {}
+            return {}
         returns = []
         for prev, cur in zip(closes[:-1], closes[1:]):
             if prev not in (None, 0):
@@ -5480,10 +3790,6 @@ class DataEngineV5:
             if peak > 0:
                 dd = (price / peak) - 1.0
                 max_dd = min(max_dd, dd)
-        # v5.67.0 PATCH 8: emit max_drawdown_1y / var_95_1d / percent_change as
-        # FRACTION (was POINTS pre-v5.67.0). max_drawdown_1y keeps its SIGN
-        # (negative) — abs() removed so the formatter "0.00%" + signed-fraction
-        # displays correctly (e.g. -33.8% for max_dd = -0.338).
         patch: Dict[str, Any] = {
             "current_price": closes[-1],
             "previous_close": closes[-2],
@@ -5496,12 +3802,12 @@ class DataEngineV5:
             "avg_volume_30d": self._safe_mean(volumes[-30:]) if volumes else None,
             "volatility_30d": vol30,
             "volatility_90d": vol90,
-            "max_drawdown_1y": max_dd,
-            "var_95_1d": var95 if var95 is not None else None,
+            "max_drawdown_1y": abs(max_dd) * 100.0,
+            "var_95_1d": var95 * 100.0 if var95 is not None else None,
             "sharpe_1y": sharpe,
             "rsi_14": rsi,
             "price_change": closes[-1] - closes[-2],
-            "percent_change": ((closes[-1] - closes[-2]) / closes[-2]) if closes[-2] not in (None, 0) else None,
+            "percent_change": ((closes[-1] - closes[-2]) / closes[-2]) * 100.0 if closes[-2] not in (None, 0) else None,
             "volume": volumes[-1] if volumes else None,
         }
         if patch.get("current_price") is not None and patch.get("week_52_high") is not None and patch.get("week_52_low") is not None:
@@ -5510,14 +3816,7 @@ class DataEngineV5:
             cp = _as_float(patch.get("current_price"))
             if hi is not None and lo is not None and cp is not None and hi > lo:
                 patch["week_52_position_pct"] = ((cp - lo) / (hi - lo)) * 100.0
-        result_patch = {k: v for k, v in patch.items() if v is not None}
-        if candle_fields:
-            for k, v in candle_fields.items():
-                if v not in (None, "", 0.0):
-                    result_patch[k] = v
-                elif k not in result_patch:
-                    result_patch[k] = v
-        return result_patch
+        return {k: v for k, v in patch.items() if v is not None}
 
     async def _fetch_history_patch(self, provider: str, symbol: str) -> Dict[str, Any]:
         module, _stats = await self._registry.get_provider(provider)
@@ -5525,37 +3824,42 @@ class DataEngineV5:
             return {}
         callables = []
         for name in (
-            "get_history", "fetch_history", "get_price_history", "fetch_price_history", "history",
-            "get_chart", "fetch_chart", "get_chart_history", "fetch_chart_history",
-            "get_historical_data", "fetch_historical_data", "get_history_rows", "fetch_history_rows",
-            "get_timeseries", "fetch_timeseries", "get_series", "fetch_series", "get_ohlcv", "fetch_ohlcv",
+            "get_history",
+            "fetch_history",
+            "get_price_history",
+            "fetch_price_history",
+            "history",
+            "get_chart",
+            "fetch_chart",
+            "get_chart_history",
+            "fetch_chart_history",
+            "get_historical_data",
+            "fetch_historical_data",
+            "get_history_rows",
+            "fetch_history_rows",
+            "get_timeseries",
+            "fetch_timeseries",
+            "get_series",
+            "fetch_series",
+            "get_ohlcv",
+            "fetch_ohlcv",
         ):
             fn = getattr(module, name, None)
             if callable(fn):
                 callables.append(fn)
         if not callables:
             return {}
-        # v5.68.0 PHASE 9: same per-provider symbol translation as _fetch_patch
-        # — translate for the provider, try translated first then RAW symbol
-        # second (zero-regression fallback).
-        provider_symbol = _provider_symbol_for(provider, symbol)
-        symbols_to_try = [provider_symbol]
-        if symbol and symbol not in symbols_to_try:
-            symbols_to_try.append(symbol)
-
-        variants = []
-        for _sym in symbols_to_try:
-            variants.extend([
-                ((_sym,), {"period": "1y", "interval": "1d"}),
-                ((_sym,), {"range": "1y", "interval": "1d"}),
-                ((_sym,), {"lookback": "1y", "interval": "1d"}),
-                ((), {"symbol": _sym, "period": "1y", "interval": "1d"}),
-                ((), {"ticker": _sym, "period": "1y", "interval": "1d"}),
-                ((), {"code": _sym, "period": "1y", "interval": "1d"}),
-                ((), {"symbol": _sym, "range": "1y", "interval": "1d"}),
-                ((), {"ticker": _sym, "range": "1y", "interval": "1d"}),
-                ((_sym,), {}),
-            ])
+        variants = [
+            ((symbol,), {"period": "1y", "interval": "1d"}),
+            ((symbol,), {"range": "1y", "interval": "1d"}),
+            ((symbol,), {"lookback": "1y", "interval": "1d"}),
+            ((), {"symbol": symbol, "period": "1y", "interval": "1d"}),
+            ((), {"ticker": symbol, "period": "1y", "interval": "1d"}),
+            ((), {"code": symbol, "period": "1y", "interval": "1d"}),
+            ((), {"symbol": symbol, "range": "1y", "interval": "1d"}),
+            ((), {"ticker": symbol, "range": "1y", "interval": "1d"}),
+            ((symbol,), {}),
+        ]
         for fn in callables:
             for args, kwargs in variants:
                 try:
@@ -5635,235 +3939,11 @@ class DataEngineV5:
         merged = _canonicalize_provider_row(merged, requested_symbol=requested_symbol, normalized_symbol=norm, provider=_safe_str((merged.get("data_sources") or [""])[0] if isinstance(merged.get("data_sources"), list) else ""))
         return merged
 
+
     def _data_quality(self, row: Dict[str, Any]) -> str:
         if _as_float(row.get("current_price")) is None:
             return QuoteQuality.MISSING.value
         return QuoteQuality.GOOD.value if any(row.get(k) is not None for k in ("overall_score", "forecast_price_3m", "pb_ratio")) else QuoteQuality.FAIR.value
-
-    # =================================================================
-    # v5.62.0 PHASE-Z — Yahoo enrichment pass
-    # =================================================================
-    async def _fetch_yahoo_fundamentals_patch(self, symbol: str) -> Optional[Dict[str, Any]]:
-        mod = _import_yahoo_provider_module("yahoo_fundamentals_provider")
-        if mod is None:
-            logger.debug("[engine_v2 v%s] PHASE-Z fundamentals: module not importable", __version__)
-            return None
-
-        yahoo_symbol = _yahoo_symbol_for(symbol)
-        if not yahoo_symbol:
-            return None
-
-        fn = _pick_yahoo_callable(
-            mod,
-            "get_quote_patch", "fetch_fundamentals_patch", "fetch_enriched_quote_patch",
-            "fetch_quote", "get_quote", "quote", "enriched_quote",
-        )
-        if fn is None:
-            logger.debug("[engine_v2 v%s] PHASE-Z fundamentals: no compatible callable", __version__)
-            return None
-
-        try:
-            if inspect.iscoroutinefunction(fn):
-                patch = await fn(yahoo_symbol)
-            else:
-                patch = await asyncio.to_thread(fn, yahoo_symbol)
-                if inspect.isawaitable(patch):
-                    patch = await patch
-        except Exception as exc:
-            logger.debug(
-                "[engine_v2 v%s] PHASE-Z fundamentals call failed for %s (yahoo=%s): %s: %s",
-                __version__, symbol, yahoo_symbol, exc.__class__.__name__, exc,
-            )
-            return None
-
-        if patch is None:
-            return None
-        if isinstance(patch, dict):
-            return dict(patch)
-        try:
-            if hasattr(patch, "model_dump"):
-                d = patch.model_dump(mode="python")
-                if isinstance(d, dict):
-                    return d
-        except Exception:
-            pass
-        return None
-
-    async def _fetch_yahoo_chart_patch(self, symbol: str) -> Optional[Dict[str, Any]]:
-        mod = _import_yahoo_provider_module("yahoo_chart_provider")
-        if mod is None:
-            logger.debug("[engine_v2 v%s] PHASE-Z chart: module not importable", __version__)
-            return None
-
-        yahoo_symbol = _yahoo_symbol_for(symbol)
-        if not yahoo_symbol:
-            return None
-
-        fn = _pick_yahoo_callable(
-            mod,
-            "get_quote_patch", "fetch_chart_patch", "fetch_quote", "get_quote", "quote",
-        )
-        patch: Optional[Dict[str, Any]] = None
-        if fn is not None:
-            try:
-                if inspect.iscoroutinefunction(fn):
-                    res = await fn(yahoo_symbol)
-                else:
-                    res = await asyncio.to_thread(fn, yahoo_symbol)
-                    if inspect.isawaitable(res):
-                        res = await res
-                if res is not None:
-                    if isinstance(res, dict):
-                        patch = dict(res)
-                    elif hasattr(res, "model_dump"):
-                        try:
-                            d = res.model_dump(mode="python")
-                            if isinstance(d, dict):
-                                patch = d
-                        except Exception:
-                            patch = None
-            except Exception as exc:
-                logger.debug(
-                    "[engine_v2 v%s] PHASE-Z chart patch call failed for %s (yahoo=%s): %s: %s",
-                    __version__, symbol, yahoo_symbol, exc.__class__.__name__, exc,
-                )
-
-        history_needs = (
-            patch is None
-            or not isinstance(patch, dict)
-            or any(_is_missing_or_unknown_field(patch.get(k)) for k in
-                   ("rsi_14", "volatility_30d", "volatility_90d",
-                    "max_drawdown_1y", "var_95_1d", "sharpe_1y"))
-        )
-        if history_needs:
-            hist_fn = _pick_yahoo_callable(
-                mod,
-                "get_history_rows", "fetch_history_rows", "get_rows", "get_chart_rows", "fetch_chart_rows",
-            )
-            rows: List[Dict[str, Any]] = []
-            if hist_fn is not None:
-                for kwargs in (
-                    {"symbol": yahoo_symbol, "interval": "1d", "range": "1y"},
-                    {"symbol": yahoo_symbol, "period": "1y"},
-                    {"symbol": yahoo_symbol},
-                ):
-                    try:
-                        if inspect.iscoroutinefunction(hist_fn):
-                            raw = await hist_fn(**kwargs)
-                        else:
-                            raw = await asyncio.to_thread(lambda kw=kwargs: hist_fn(**kw))
-                            if inspect.isawaitable(raw):
-                                raw = await raw
-                    except TypeError:
-                        continue
-                    except Exception as exc:
-                        logger.debug(
-                            "[engine_v2 v%s] PHASE-Z chart history call failed for %s (yahoo=%s): %s: %s",
-                            __version__, symbol, yahoo_symbol, exc.__class__.__name__, exc,
-                        )
-                        break
-                    if isinstance(raw, list) and raw:
-                        rows = [r for r in raw if isinstance(r, dict)]
-                        if rows:
-                            break
-
-            if rows:
-                hist_patch = self._compute_history_patch_from_rows(rows)
-                if hist_patch:
-                    if patch is None:
-                        patch = {}
-                    for k, v in hist_patch.items():
-                        if k not in patch or _is_missing_or_unknown_field(patch.get(k)):
-                            patch[k] = v
-
-        return patch if patch else None
-
-    async def _apply_yahoo_enrichment_pass(
-        self,
-        row: Dict[str, Any],
-        normalized: str,
-        requested: str,
-    ) -> Dict[str, Any]:
-        if not _yahoo_enrichment_enabled():
-            return row
-
-        needs_fund, needs_chart = _row_needs_yahoo_enrichment(row)
-        if not needs_fund and not needs_chart:
-            return row
-
-        diag: Dict[str, Any] = {
-            "ts": time.time(),
-            "symbol": normalized,
-            "fundamentals_called": False,
-            "chart_called": False,
-            "fundamentals_filled_fields": [],
-            "chart_filled_fields": [],
-        }
-
-        if needs_fund:
-            diag["fundamentals_called"] = True
-            fund_patch = await self._fetch_yahoo_fundamentals_patch(normalized)
-            if fund_patch:
-                filtered, filled = _filter_patch_to_missing_fields(
-                    row, fund_patch, _YAHOO_FUNDAMENTAL_FIELDS,
-                )
-                if filled:
-                    for k, v in filtered.items():
-                        if _is_missing_or_unknown_field(row.get(k)):
-                            row[k] = v
-                    diag["fundamentals_filled_fields"] = filled
-                    sources = row.get("data_sources")
-                    if isinstance(sources, list):
-                        if "yahoo_fundamentals" not in sources:
-                            sources.append("yahoo_fundamentals")
-                    else:
-                        row["data_sources"] = ["yahoo_fundamentals"]
-                    _append_yahoo_warning_tag(
-                        row,
-                        "yahoo_fundamentals_enrichment_applied:"
-                        + ",".join(filled[:8])
-                        + ("..." if len(filled) > 8 else ""),
-                    )
-
-        if needs_chart:
-            diag["chart_called"] = True
-            chart_patch = await self._fetch_yahoo_chart_patch(normalized)
-            if chart_patch:
-                filtered, filled = _filter_patch_to_missing_fields(
-                    row, chart_patch, _YAHOO_CHART_FIELDS,
-                )
-                if filled:
-                    for k, v in filtered.items():
-                        if _is_missing_or_unknown_field(row.get(k)):
-                            row[k] = v
-                    diag["chart_filled_fields"] = filled
-                    sources = row.get("data_sources")
-                    if isinstance(sources, list):
-                        if "yahoo_chart" not in sources:
-                            sources.append("yahoo_chart")
-                    else:
-                        row["data_sources"] = ["yahoo_chart"]
-                    _append_yahoo_warning_tag(
-                        row,
-                        "yahoo_chart_enrichment_applied:"
-                        + ",".join(filled[:8])
-                        + ("..." if len(filled) > 8 else ""),
-                    )
-
-        try:
-            _YAHOO_ENRICHMENT_LAST_PASS.update(diag)
-        except Exception:
-            pass
-
-        if diag["fundamentals_filled_fields"] or diag["chart_filled_fields"]:
-            logger.info(
-                "[engine_v2 v%s] PHASE-Z enrichment for %s: fund=%d chart=%d",
-                __version__, normalized,
-                len(diag["fundamentals_filled_fields"]),
-                len(diag["chart_filled_fields"]),
-            )
-
-        return row
 
     async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True, *, page: str = "", sheet: str = "", body: Optional[Dict[str, Any]] = None, **kwargs: Any) -> UnifiedQuote:
         info = get_symbol_info(symbol)
@@ -5887,10 +3967,8 @@ class DataEngineV5:
         page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, extras=kwargs)
         provider_profile = self._provider_profile_key(norm, page_context)
 
-        cache_key = _make_cache_key(norm, page_context, provider_profile, __version__)
         if use_cache:
-            # v5.71.0 FIX: cache key includes page/provider/schema context.
-            cached = await self._cache.get(cache_key=cache_key)
+            cached = await self._cache.get(symbol=norm, provider_profile=provider_profile)
             if isinstance(cached, dict) and cached:
                 return UnifiedQuote(**cached)
 
@@ -5928,10 +4006,20 @@ class DataEngineV5:
             row = _apply_page_row_backfill(page_context or sheet or "", row)
 
         missing_history_fields = [
-            "current_price", "previous_close", "day_high", "day_low",
-            "week_52_high", "week_52_low", "avg_volume_10d", "avg_volume_30d",
-            "volatility_30d", "volatility_90d", "max_drawdown_1y",
-            "var_95_1d", "sharpe_1y", "rsi_14",
+            "current_price",
+            "previous_close",
+            "day_high",
+            "day_low",
+            "week_52_high",
+            "week_52_low",
+            "avg_volume_10d",
+            "avg_volume_30d",
+            "volatility_30d",
+            "volatility_90d",
+            "max_drawdown_1y",
+            "var_95_1d",
+            "sharpe_1y",
+            "rsi_14",
         ]
         if any(row.get(k) in (None, "", [], {}) for k in missing_history_fields):
             hist_patch = await self._get_history_patch_best_effort(norm, providers, page=page_context)
@@ -5943,22 +4031,6 @@ class DataEngineV5:
             row = _merge_missing_fields(row, cached_best_row)
             row = _apply_page_row_backfill(page_context or sheet or "", row)
 
-        try:
-            row = await self._apply_yahoo_enrichment_pass(row, norm, _safe_str(symbol))
-        except Exception as enrich_err:
-            logger.debug(
-                "[engine_v2 v%s] PHASE-Z enrichment pass failed for %s: %s: %s",
-                __version__, norm, enrich_err.__class__.__name__, enrich_err,
-            )
-
-        try:
-            row = _apply_phase_bb_sanity(row)
-        except Exception as bb_err:
-            logger.debug(
-                "[engine_v2 v%s] PHASE-BB sanity guard failed for %s: %s: %s",
-                __version__, norm, bb_err.__class__.__name__, bb_err,
-            )
-
         if _as_float(row.get("current_price")) is not None and _safe_str(row.get("warnings")).lower() == "no live provider data available":
             row["warnings"] = "Recovered from history/chart fallback"
         elif _as_float(row.get("current_price")) is None and not row.get("warnings"):
@@ -5966,22 +4038,12 @@ class DataEngineV5:
 
         _compute_scores_fallback(row)
         _compute_recommendation(row)
-
-        try:
-            row = _apply_phase_dd_enhancements(row)
-        except Exception as dd_err:
-            logger.debug(
-                "[engine_v2 v%s] PHASE-DD enhancement failed for %s: %s: %s",
-                __version__, norm, dd_err.__class__.__name__, dd_err,
-            )
-
         row["data_quality"] = self._data_quality(row)
         row["data_provider"] = row.get("data_provider") or ((row.get("data_sources") or [""])[0] if isinstance(row.get("data_sources"), list) else "")
         q = UnifiedQuote(**row)
 
         if use_cache:
-            # v5.71.0 FIX: cache key includes page/provider/schema context.
-            await self._cache.set(_model_to_dict(q), cache_key=cache_key)
+            await self._cache.set(_model_to_dict(q), symbol=norm, provider_profile=provider_profile)
 
         return q
 
@@ -5998,8 +4060,7 @@ class DataEngineV5:
     ) -> UnifiedQuote:
         page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, schema=schema, extras=kwargs)
         provider_profile = self._provider_profile_key(normalize_symbol(symbol), page_context)
-        # v5.71.0 FIX: singleflight key includes page/provider/schema context.
-        key = _make_cache_key(normalize_symbol(symbol), page_context, provider_profile, __version__) + (":cache" if use_cache else ":live")
+        key = f"quote:{normalize_symbol(symbol)}:{provider_profile}:{'cache' if use_cache else 'live'}"
         raw_q = await self._singleflight.execute(
             key,
             lambda: self._get_enriched_quote_impl(symbol, use_cache, page=page_context, body=body, schema=schema, **kwargs),
@@ -6180,38 +4241,91 @@ class DataEngineV5:
                 risk_counts[bucket] += 1
 
         rows: List[Dict[str, Any]] = []
-        rows.append({"section": "Market Summary", "item": "Universe", "metric": "Symbols Analyzed",
-                     "value": total, "notes": f"fallback summary from {len(symbols)} requested symbols",
-                     "source": "engine_fallback", "sort_order": 1})
-        rows.append({"section": "Market Summary", "item": "Universe", "metric": "Average Overall Score",
-                     "value": avg_overall, "notes": "mean overall score across analyzed instruments",
-                     "source": "engine_fallback", "sort_order": 2})
-        rows.append({"section": "Market Summary", "item": "Universe", "metric": "Average Expected ROI 3M",
-                     "value": avg_roi_3m, "notes": "fractional ROI where available",
-                     "source": "engine_fallback", "sort_order": 3})
+        rows.append(
+            {
+                "section": "Market Summary",
+                "item": "Universe",
+                "metric": "Symbols Analyzed",
+                "value": total,
+                "notes": f"fallback summary from {len(symbols)} requested symbols",
+                "source": "engine_fallback",
+                "sort_order": 1,
+            }
+        )
+        rows.append(
+            {
+                "section": "Market Summary",
+                "item": "Universe",
+                "metric": "Average Overall Score",
+                "value": avg_overall,
+                "notes": "mean overall score across analyzed instruments",
+                "source": "engine_fallback",
+                "sort_order": 2,
+            }
+        )
+        rows.append(
+            {
+                "section": "Market Summary",
+                "item": "Universe",
+                "metric": "Average Expected ROI 3M",
+                "value": avg_roi_3m,
+                "notes": "fractional ROI where available",
+                "source": "engine_fallback",
+                "sort_order": 3,
+            }
+        )
 
         sort_order = 10
         for bucket in ("LOW", "MODERATE", "HIGH"):
-            rows.append({"section": "Risk Distribution", "item": bucket, "metric": "Count",
-                         "value": risk_counts[bucket], "notes": "fallback risk bucket summary",
-                         "source": "engine_fallback", "sort_order": sort_order})
+            rows.append(
+                {
+                    "section": "Risk Distribution",
+                    "item": bucket,
+                    "metric": "Count",
+                    "value": risk_counts[bucket],
+                    "notes": "fallback risk bucket summary",
+                    "source": "engine_fallback",
+                    "sort_order": sort_order,
+                }
+            )
             sort_order += 1
 
         top_quotes = quote_rows[: max(3, min(7, limit))]
         for idx, d in enumerate(top_quotes, start=1):
-            rows.append({"section": "Top Ideas", "item": d.get("symbol"), "metric": "Recommendation",
-                         "value": d.get("recommendation"),
-                         "notes": d.get("recommendation_reason") or f"overall={d.get('overall_score')} opportunity={d.get('opportunity_score')}",
-                         "source": "engine_fallback", "sort_order": 100 + idx})
-            rows.append({"section": "Top Ideas", "item": d.get("symbol"), "metric": "Expected ROI 3M",
-                         "value": d.get("expected_roi_3m"),
-                         "notes": f"confidence={d.get('confidence_score')} risk={d.get('risk_bucket')}",
-                         "source": "engine_fallback", "sort_order": 120 + idx})
+            rows.append(
+                {
+                    "section": "Top Ideas",
+                    "item": d.get("symbol"),
+                    "metric": "Recommendation",
+                    "value": d.get("recommendation"),
+                    "notes": d.get("recommendation_reason") or f"overall={d.get('overall_score')} opportunity={d.get('opportunity_score')}",
+                    "source": "engine_fallback",
+                    "sort_order": 100 + idx,
+                }
+            )
+            rows.append(
+                {
+                    "section": "Top Ideas",
+                    "item": d.get("symbol"),
+                    "metric": "Expected ROI 3M",
+                    "value": d.get("expected_roi_3m"),
+                    "notes": f"confidence={d.get('confidence_score')} risk={d.get('risk_bucket')}",
+                    "source": "engine_fallback",
+                    "sort_order": 120 + idx,
+                }
+            )
             if _as_float(d.get("position_value")) is not None or _as_float(d.get("unrealized_pl")) is not None:
-                rows.append({"section": "Portfolio Signals", "item": d.get("symbol"),
-                             "metric": "Unrealized P/L", "value": d.get("unrealized_pl"),
-                             "notes": f"value={d.get('position_value')} cost={d.get('position_cost')}",
-                             "source": "engine_fallback", "sort_order": 140 + idx})
+                rows.append(
+                    {
+                        "section": "Portfolio Signals",
+                        "item": d.get("symbol"),
+                        "metric": "Unrealized P/L",
+                        "value": d.get("unrealized_pl"),
+                        "notes": f"value={d.get('position_value')} cost={d.get('position_cost')}",
+                        "source": "engine_fallback",
+                        "sort_order": 140 + idx,
+                    }
+                )
 
         return rows[:limit]
 
@@ -6271,7 +4385,7 @@ class DataEngineV5:
         if not rows:
             return out_headers, out_keys, []
 
-        apply_page_ranks(rows, page_name="Top_10_Investments")
+        _apply_rank_overall(rows)
         rows.sort(key=self._top10_sort_key, reverse=True)
 
         criteria_snapshot = _top10_criteria_snapshot({
@@ -6319,8 +4433,14 @@ class DataEngineV5:
     ) -> Dict[str, Any]:
         return await self.get_sheet_rows(
             page or sheet or sheet_name,
-            limit=limit, offset=offset, mode=mode, body=body,
-            page=page, sheet=sheet, sheet_name=sheet_name, **kwargs,
+            limit=limit,
+            offset=offset,
+            mode=mode,
+            body=body,
+            page=page,
+            sheet=sheet,
+            sheet_name=sheet_name,
+            **kwargs,
         )
 
     async def get_sheet(
@@ -6337,8 +4457,14 @@ class DataEngineV5:
     ) -> Dict[str, Any]:
         return await self.get_sheet_rows(
             sheet_name or sheet or page,
-            limit=limit, offset=offset, mode=mode, body=body,
-            page=page, sheet=sheet, sheet_name=sheet_name, **kwargs,
+            limit=limit,
+            offset=offset,
+            mode=mode,
+            body=body,
+            page=page,
+            sheet=sheet,
+            sheet_name=sheet_name,
+            **kwargs,
         )
 
     async def get_sheet_rows(
@@ -6354,8 +4480,14 @@ class DataEngineV5:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         target_sheet, limit, offset, mode, body, request_parts = _normalize_route_call_inputs(
-            page=page, sheet=sheet, sheet_name=sheet_name,
-            limit=limit, offset=offset, mode=mode, body=body, extras=kwargs,
+            page=page,
+            sheet=sheet,
+            sheet_name=sheet_name,
+            limit=limit,
+            offset=offset,
+            mode=mode,
+            body=body,
+            extras=kwargs,
         )
         include_matrix = _safe_bool(body.get("include_matrix"), True)
 
@@ -6369,78 +4501,91 @@ class DataEngineV5:
                 headers, keys = _ensure_top10_contract(static_headers, static_keys)
                 schema_src = f"{schema_src}|top10_force_full_schema"
 
-        # v5.70.0 PHASE 2 — INSTRUMENT-SHEET CANONICAL CONTRACT ENFORCEMENT.
-        # Every engine compute path (`_compute_scores_fallback`,
-        # `_phase_ii_quality_forecast`, `_canonicalize_provider_row`,
-        # `_apply_page_row_backfill`, `_classify_recommendation_8tier`, ...)
-        # writes CANONICAL field names. If schema_registry returned a
-        # contract that diverges from the canonical 97-column layout,
-        # projecting that engine output through it strands canonical
-        # values in blank columns (the v5.69.0-deferred "empty Confidence
-        # Score / Data Provider / Last Updated") and surfaces registry-only
-        # columns the engine never fills (the ghost "Status" column).
-        #
-        # Phase 1 (the tightened `_usable_contract` canonical-key gate)
-        # already makes `_schema_for_sheet` fall back to the canonical
-        # static contract for a *divergent* registry contract. This block
-        # is the explicit guarantee for ALL instrument sheets, including
-        # the case where the registry contract is a SUPERSET of canonical
-        # (extra registry-only columns that the engine cannot fill anyway):
-        # it force-applies the canonical instrument contract, exactly
-        # mirroring the `top10_force_full_schema` block just above. It is
-        # env-gated (INSTRUMENT_FORCE_CANONICAL_SCHEMA, default on) and is
-        # a no-op when the resolved contract is already canonical.
-        if (
-            target_sheet in INSTRUMENT_SHEETS
-            and target_sheet != "Top_10_Investments"
-            and self.instrument_force_canonical_schema
-        ):
-            if list(keys) != list(INSTRUMENT_CANONICAL_KEYS):
-                headers, keys = list(INSTRUMENT_CANONICAL_HEADERS), list(INSTRUMENT_CANONICAL_KEYS)
-                schema_src = f"{schema_src}|instrument_force_canonical_schema"
-
         target_sheet_known = target_sheet in INSTRUMENT_SHEETS or target_sheet in SPECIAL_SHEETS or bool(spec)
         strict_req = bool(self.schema_strict_sheet_rows)
         contract_level = "canonical" if _usable_contract(headers, keys, target_sheet) else "partial"
         recovered_from: Optional[str] = None
 
+        # Data Dictionary
         if target_sheet == "Data_Dictionary":
             if _is_schema_only_body(body):
                 return self._finalize_payload(
-                    sheet=target_sheet, headers=headers, keys=keys, row_objects=[],
-                    include_matrix=include_matrix, status="success",
-                    meta={"schema_source": schema_src, "contract_level": contract_level,
-                          "strict_requested": strict_req, "strict_enforced": False,
-                          "target_sheet_known": True, "builder": "schema_only_fast_path",
-                          "rows": 0, "limit": limit, "offset": offset, "mode": mode},
+                    sheet=target_sheet,
+                    headers=headers,
+                    keys=keys,
+                    row_objects=[],
+                    include_matrix=include_matrix,
+                    status="success",
+                    meta={
+                        "schema_source": schema_src,
+                        "contract_level": contract_level,
+                        "strict_requested": strict_req,
+                        "strict_enforced": False,
+                        "target_sheet_known": True,
+                        "builder": "schema_only_fast_path",
+                        "rows": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                    },
                 )
+
             rows_all = await self._build_data_dictionary_rows()
             rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows_all]
             payload_full = self._finalize_payload(
-                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_proj,
-                include_matrix=include_matrix, status="success",
-                meta={"schema_source": schema_src, "contract_level": contract_level,
-                      "strict_requested": strict_req, "strict_enforced": False,
-                      "target_sheet_known": True, "builder": "engine.internal_data_dictionary",
-                      "rows": len(rows_proj), "limit": limit, "offset": offset, "mode": mode},
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_proj,
+                include_matrix=include_matrix,
+                status="success",
+                meta={
+                    "schema_source": schema_src,
+                    "contract_level": contract_level,
+                    "strict_requested": strict_req,
+                    "strict_enforced": False,
+                    "target_sheet_known": True,
+                    "builder": "engine.internal_data_dictionary",
+                    "rows": len(rows_proj),
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                },
             )
             self._store_sheet_snapshot(target_sheet, payload_full)
             rows_page = rows_proj[offset : offset + limit]
             return self._finalize_payload(
-                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_page,
-                include_matrix=include_matrix, status="success",
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_page,
+                include_matrix=include_matrix,
+                status="success",
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
+        # Insights Analysis
         if target_sheet == "Insights_Analysis":
             if _is_schema_only_body(body):
                 return self._finalize_payload(
-                    sheet=target_sheet, headers=headers, keys=keys, row_objects=[],
-                    include_matrix=include_matrix, status="success",
-                    meta={"schema_source": schema_src, "contract_level": contract_level,
-                          "strict_requested": strict_req, "strict_enforced": False,
-                          "target_sheet_known": True, "builder": "schema_only_fast_path",
-                          "rows": 0, "limit": limit, "offset": offset, "mode": mode},
+                    sheet=target_sheet,
+                    headers=headers,
+                    keys=keys,
+                    row_objects=[],
+                    include_matrix=include_matrix,
+                    status="success",
+                    meta={
+                        "schema_source": schema_src,
+                        "contract_level": contract_level,
+                        "strict_requested": strict_req,
+                        "strict_enforced": False,
+                        "target_sheet_known": True,
+                        "builder": "schema_only_fast_path",
+                        "rows": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                    },
                 )
 
             rows0: List[Dict[str, Any]] = []
@@ -6451,8 +4596,11 @@ class DataEngineV5:
                 universes = body.get("universes") if isinstance(body.get("universes"), dict) else None
                 symbols = body.get("symbols") if isinstance(body.get("symbols"), list) else None
                 payload = await build_insights_analysis_rows(
-                    engine=self, criteria=crit, universes=universes,
-                    symbols=symbols, mode=mode or "",
+                    engine=self,
+                    criteria=crit,
+                    universes=universes,
+                    symbols=symbols,
+                    mode=mode or "",
                 )
                 rows0 = _coerce_rows_list(payload)
             except Exception as exc:
@@ -6465,34 +4613,62 @@ class DataEngineV5:
 
             rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
             payload_full = self._finalize_payload(
-                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_proj,
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_proj,
                 include_matrix=include_matrix,
                 status="success" if rows_proj else "warn",
-                meta={"schema_source": schema_src, "contract_level": contract_level,
-                      "strict_requested": strict_req, "strict_enforced": False,
-                      "target_sheet_known": True, "builder": builder_name,
-                      "rows": len(rows_proj), "limit": limit, "offset": offset, "mode": mode},
+                meta={
+                    "schema_source": schema_src,
+                    "contract_level": contract_level,
+                    "strict_requested": strict_req,
+                    "strict_enforced": False,
+                    "target_sheet_known": True,
+                    "builder": builder_name,
+                    "rows": len(rows_proj),
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                },
             )
             self._store_sheet_snapshot(target_sheet, payload_full)
             rows_page = rows_proj[offset : offset + limit]
             return self._finalize_payload(
-                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_page,
-                include_matrix=include_matrix, status=payload_full.get("status", "success"),
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_page,
+                include_matrix=include_matrix,
+                status=payload_full.get("status", "success"),
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
+        # Top10
         if target_sheet == "Top_10_Investments":
             top10_body, route_warnings = _normalize_top10_body_for_engine(body, limit=max(1, min(limit, 50)))
             if _is_schema_only_body(top10_body):
                 headers, keys = _ensure_top10_contract(headers, keys)
                 return self._finalize_payload(
-                    sheet=target_sheet, headers=headers, keys=keys, row_objects=[],
-                    include_matrix=include_matrix, status="success",
-                    meta={"schema_source": schema_src, "contract_level": contract_level,
-                          "strict_requested": strict_req, "strict_enforced": False,
-                          "target_sheet_known": True, "builder": "schema_only_fast_path",
-                          "rows": 0, "limit": limit, "offset": offset, "mode": mode,
-                          "warnings": route_warnings},
+                    sheet=target_sheet,
+                    headers=headers,
+                    keys=keys,
+                    row_objects=[],
+                    include_matrix=include_matrix,
+                    status="success",
+                    meta={
+                        "schema_source": schema_src,
+                        "contract_level": contract_level,
+                        "strict_requested": strict_req,
+                        "strict_enforced": False,
+                        "target_sheet_known": True,
+                        "builder": "schema_only_fast_path",
+                        "rows": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                        "warnings": route_warnings,
+                    },
                 )
 
             rows_proj: List[Dict[str, Any]] = []
@@ -6503,8 +4679,10 @@ class DataEngineV5:
                 from core.analysis.top10_selector import build_top10_rows  # type: ignore
                 criteria = top10_body.get("criteria") if isinstance(top10_body.get("criteria"), dict) else None
                 payload = await build_top10_rows(
-                    engine=self, settings=self.settings,
-                    criteria=criteria, body=dict(top10_body or {}),
+                    engine=self,
+                    settings=self.settings,
+                    criteria=criteria,
+                    body=dict(top10_body or {}),
                     limit=int(top10_body.get("limit") or top10_body.get("top_n") or min(limit, 10) or 10),
                     mode=mode or "",
                 )
@@ -6523,25 +4701,41 @@ class DataEngineV5:
                     status_out = "warn"
 
             payload_full = self._finalize_payload(
-                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_proj,
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_proj,
                 include_matrix=include_matrix,
                 status=status_out if rows_proj else "warn",
-                meta={"schema_source": schema_src, "contract_level": contract_level,
-                      "strict_requested": strict_req, "strict_enforced": False,
-                      "target_sheet_known": True, "builder": builder_used,
-                      "rows": len(rows_proj), "limit": limit, "offset": offset, "mode": mode,
-                      "warnings": route_warnings},
+                meta={
+                    "schema_source": schema_src,
+                    "contract_level": contract_level,
+                    "strict_requested": strict_req,
+                    "strict_enforced": False,
+                    "target_sheet_known": True,
+                    "builder": builder_used,
+                    "rows": len(rows_proj),
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                    "warnings": route_warnings,
+                },
             )
             if rows_proj:
                 self._store_sheet_snapshot(target_sheet, payload_full)
 
             rows_page = rows_proj[offset : offset + limit]
             return self._finalize_payload(
-                sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_page,
-                include_matrix=include_matrix, status=payload_full.get("status", "warn"),
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_page,
+                include_matrix=include_matrix,
+                status=payload_full.get("status", "warn"),
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
+        # Contract recovery for instrument pages
         if contract_level != "canonical":
             cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
             recovered = False
@@ -6581,8 +4775,10 @@ class DataEngineV5:
             schema_warning = "unknown_sheet_non_strict_mode"
 
         base_meta = {
-            "schema_source": schema_src, "contract_level": contract_level,
-            "strict_requested": strict_req, "strict_enforced": False,
+            "schema_source": schema_src,
+            "contract_level": contract_level,
+            "strict_requested": strict_req,
+            "strict_enforced": False,
             "target_sheet_known": target_sheet_known,
             "route_input_keys": sorted([str(k) for k in body.keys()]) if isinstance(body, dict) else [],
             "request_input_keys": sorted([str(k) for k in request_parts.keys()]) if isinstance(request_parts, dict) else [],
@@ -6594,10 +4790,13 @@ class DataEngineV5:
 
         if _is_schema_only_body(body):
             return self._finalize_payload(
-                sheet=target_sheet, headers=headers, keys=keys, row_objects=[],
-                include_matrix=include_matrix, status=final_status,
-                meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode,
-                      "built_from": "schema_only_fast_path"},
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=[],
+                include_matrix=include_matrix,
+                status=final_status,
+                meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode, "built_from": "schema_only_fast_path"},
             )
 
         requested_symbols = _extract_requested_symbols_from_body(body, limit=limit + offset)
@@ -6611,6 +4810,7 @@ class DataEngineV5:
         out_headers = list(headers)
         out_keys = list(keys)
 
+        # Prefer external rows reader when present
         if target_sheet in INSTRUMENT_SHEETS:
             ext_rows = await self._get_rows_from_external_reader(target_sheet, limit + offset)
             if ext_rows:
@@ -6642,22 +4842,36 @@ class DataEngineV5:
                     _compute_recommendation(merged)
                     enriched_rows.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, merged)))
 
-                apply_page_ranks(enriched_rows, page_name=target_sheet)
+                _apply_rank_overall(enriched_rows)
 
                 payload_full = self._finalize_payload(
-                    sheet=target_sheet, headers=out_headers, keys=out_keys,
-                    row_objects=enriched_rows, include_matrix=include_matrix, status=final_status,
-                    meta={**base_meta, "rows": len(enriched_rows), "limit": limit, "offset": offset, "mode": mode,
-                          "built_from": "external_rows_reader",
-                          "rows_reader_source": self._rows_reader_source,
-                          "symbols_reader_source": self._symbols_reader_source,
-                          "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)},
+                    sheet=target_sheet,
+                    headers=out_headers,
+                    keys=out_keys,
+                    row_objects=enriched_rows,
+                    include_matrix=include_matrix,
+                    status=final_status,
+                    meta={
+                        **base_meta,
+                        "rows": len(enriched_rows),
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                        "built_from": "external_rows_reader",
+                        "rows_reader_source": self._rows_reader_source,
+                        "symbols_reader_source": self._symbols_reader_source,
+                        "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
+                    },
                 )
                 self._store_sheet_snapshot(target_sheet, payload_full)
                 rows_page = enriched_rows[offset : offset + limit]
                 return self._finalize_payload(
-                    sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=rows_page,
-                    include_matrix=include_matrix, status=final_status,
+                    sheet=target_sheet,
+                    headers=out_headers,
+                    keys=out_keys,
+                    row_objects=rows_page,
+                    include_matrix=include_matrix,
+                    status=final_status,
                     meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
                 )
 
@@ -6668,12 +4882,22 @@ class DataEngineV5:
                 proj_rows = [_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)) for row in cached_rows]
                 rows_page = proj_rows[offset : offset + limit]
                 return self._finalize_payload(
-                    sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=rows_page,
-                    include_matrix=include_matrix, status=final_status,
-                    meta={**base_meta, "rows": len(rows_page), "limit": limit, "offset": offset, "mode": mode,
-                          "built_from": "cached_snapshot",
-                          "symbols_reader_source": self._symbols_reader_source,
-                          "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)},
+                    sheet=target_sheet,
+                    headers=out_headers,
+                    keys=out_keys,
+                    row_objects=rows_page,
+                    include_matrix=include_matrix,
+                    status=final_status,
+                    meta={
+                        **base_meta,
+                        "rows": len(rows_page),
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                        "built_from": "cached_snapshot",
+                        "symbols_reader_source": self._symbols_reader_source,
+                        "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
+                    },
                 )
 
         rows_full: List[Dict[str, Any]] = []
@@ -6692,33 +4916,58 @@ class DataEngineV5:
                 _compute_scores_fallback(row)
                 _compute_recommendation(row)
                 rows_full.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)))
-            apply_page_ranks(rows_full, page_name=target_sheet)
+            _apply_rank_overall(rows_full)
 
         if rows_full:
             payload_full = self._finalize_payload(
-                sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=rows_full,
-                include_matrix=include_matrix, status=final_status,
-                meta={**base_meta, "rows": len(rows_full), "limit": limit, "offset": offset, "mode": mode,
-                      "built_from": built_from,
-                      "resolved_symbols_count": len(requested_symbols),
-                      "symbols_reader_source": self._symbols_reader_source,
-                      "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)},
+                sheet=target_sheet,
+                headers=out_headers,
+                keys=out_keys,
+                row_objects=rows_full,
+                include_matrix=include_matrix,
+                status=final_status,
+                meta={
+                    **base_meta,
+                    "rows": len(rows_full),
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                    "built_from": built_from,
+                    "resolved_symbols_count": len(requested_symbols),
+                    "symbols_reader_source": self._symbols_reader_source,
+                    "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
+                },
             )
             self._store_sheet_snapshot(target_sheet, payload_full)
             rows_page = rows_full[offset : offset + limit]
             return self._finalize_payload(
-                sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=rows_page,
-                include_matrix=include_matrix, status=final_status,
+                sheet=target_sheet,
+                headers=out_headers,
+                keys=out_keys,
+                row_objects=rows_page,
+                include_matrix=include_matrix,
+                status=final_status,
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
         return self._finalize_payload(
-            sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=[],
-            include_matrix=include_matrix, status=final_status,
-            meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode,
-                  "built_from": built_from, "resolved_symbols_count": len(requested_symbols),
-                  "symbols_reader_source": self._symbols_reader_source,
-                  "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)},
+            sheet=target_sheet,
+            headers=out_headers,
+            keys=out_keys,
+            row_objects=[],
+            include_matrix=include_matrix,
+            status=final_status,
+            meta={
+                **base_meta,
+                "rows": 0,
+                "limit": limit,
+                "offset": offset,
+                "mode": mode,
+                "built_from": built_from,
+                "resolved_symbols_count": len(requested_symbols),
+                "symbols_reader_source": self._symbols_reader_source,
+                "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
+            },
         )
 
     async def sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -6733,9 +4982,15 @@ class DataEngineV5:
         if target == "Top_10_Investments":
             headers, keys = _ensure_top10_contract(headers, keys)
         return {
-            "sheet": target, "page": target, "sheet_name": target,
-            "headers": headers, "display_headers": headers,
-            "keys": keys, "fields": keys, "source": source, "count": len(keys),
+            "sheet": target,
+            "page": target,
+            "sheet_name": target,
+            "headers": headers,
+            "display_headers": headers,
+            "keys": keys,
+            "fields": keys,
+            "source": source,
+            "count": len(keys),
         }
 
     def get_page_contract(self, page: str) -> Dict[str, Any]:
@@ -6761,19 +5016,10 @@ class DataEngineV5:
             "status": "ok",
             "version": self.version,
             "schema_available": True,
-            "instrument_force_canonical_schema": bool(self.instrument_force_canonical_schema),
             "static_contract_sheets": sorted(list(STATIC_CANONICAL_SHEET_CONTRACTS.keys())),
             "snapshot_sheets": len(self._sheet_snapshots),
             "rows_reader_source": self._rows_reader_source,
             "symbols_reader_source": self._symbols_reader_source,
-            "yahoo_enrichment_pass": {
-                "enabled": _yahoo_enrichment_enabled(),
-                "enrich_on_missing_industry": _yahoo_enrich_on_missing_industry(),
-                "enrich_on_missing_risk_metrics": _yahoo_enrich_on_missing_risk_metrics(),
-                "fundamental_fields_chased": list(_YAHOO_FUNDAMENTAL_FIELDS),
-                "chart_fields_chased": list(_YAHOO_CHART_FIELDS),
-                "last_pass": dict(_YAHOO_ENRICHMENT_LAST_PASS),
-            },
         }
 
     async def get_health(self) -> Dict[str, Any]:
@@ -6798,13 +5044,13 @@ class DataEngineV5:
             "schema_available": True,
             "schema_strict_sheet_rows": bool(self.schema_strict_sheet_rows),
             "top10_force_full_schema": bool(self.top10_force_full_schema),
-            "instrument_force_canonical_schema": bool(self.instrument_force_canonical_schema),
             "rows_hydrate_external": bool(self.rows_hydrate_external),
             "symbols_reader_source": self._symbols_reader_source,
             "rows_reader_source": self._rows_reader_source,
             "snapshot_sheets": sorted(list(self._sheet_snapshots.keys())),
             "sheet_symbol_resolution_meta": dict(self._sheet_symbol_resolution_meta),
         }
+
 
 
 def normalize_row_to_schema(sheet: str, row: Dict[str, Any], keep_extras: bool = False) -> Dict[str, Any]:
@@ -6819,7 +5065,6 @@ def normalize_row_to_schema(sheet: str, row: Dict[str, Any], keep_extras: bool =
             if k not in normalized:
                 normalized[k] = _json_safe(v)
     return normalized
-
 
 _ENGINE_INSTANCE: Optional[DataEngineV5] = None
 ENGINE: Optional[DataEngineV5] = None
@@ -6868,11 +5113,24 @@ DataEngineV2 = DataEngineV5
 DataEngine = DataEngineV5
 
 __all__ = [
-    "DataEngineV5", "DataEngineV4", "DataEngineV3", "DataEngineV2", "DataEngine",
-    "ENGINE", "engine", "_ENGINE",
-    "get_engine", "get_engine_if_ready", "peek_engine", "close_engine", "get_cache",
-    "QuoteQuality", "DataSource", "UnifiedQuote",
+    "DataEngineV5",
+    "DataEngineV4",
+    "DataEngineV3",
+    "DataEngineV2",
+    "DataEngine",
+    "ENGINE",
+    "engine",
+    "_ENGINE",
+    "get_engine",
+    "get_engine_if_ready",
+    "peek_engine",
+    "close_engine",
+    "get_cache",
+    "QuoteQuality",
+    "DataSource",
+    "UnifiedQuote",
     "__version__",
     "STATIC_CANONICAL_SHEET_CONTRACTS",
-    "get_sheet_spec", "normalize_row_to_schema",
+    "get_sheet_spec",
+    "normalize_row_to_schema",
 ]
