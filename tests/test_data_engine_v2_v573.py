@@ -1,19 +1,26 @@
 """
-test_v573_engine.py — behavioral acceptance tests for data_engine_v2.py v5.73.0
+test_v5731_engine.py — behavioral acceptance tests for data_engine_v2.py v5.73.1
 
 Tests cover:
-  - The 19 acceptance tests enumerated in the audit's section 15
-  - 4 additional regressions identified in this session's dashboard analysis
-    and JSON probe (HCLTECH.NSE, EXE.US, ALAFCO.KW patterns)
+  - The 19 acceptance tests enumerated in the v5.73.0 audit's section 15
+    (all retained — v5.73.1 is a hotfix, not a feature change)
+  - 6 additional regressions from the v5.73.0 session's dashboard analysis
+  - 10 NEW v5.73.1 regression tests for the six post-deploy hotfixes:
+       Bug A (ROI unit ×100 inflation)
+       Bug B (confidence sequencing)
+       Bug C (recommendation/detail mismatch)
+       Bug D (sanitization not wired)
+       Bug E (cache key not wired)
+       Bug F (8-tier priority map)
+     plus three structural assertions (fundamentals-empty guard,
+     priority_band emission, _make_cache_key call site)
 
-Runs against a stub `core.scoring` (in this directory's `core/scoring.py`).
+Runs against a stub `core.scoring` in this workspace's `core/scoring.py`.
 The production deployment uses the real v5.3.0 scoring module.
 
 Invocation:
-    cd /home/claude/work
-    python3 test_v573_engine.py
-
-A non-zero exit code indicates at least one failure; details printed.
+    cd /home/claude/work_v5731
+    python3 test_v5731.py
 """
 from __future__ import annotations
 import os
@@ -21,7 +28,7 @@ import sys
 import traceback
 from typing import Any, Callable, Dict, List, Tuple
 
-sys.path.insert(0, "/home/claude/work")
+sys.path.insert(0, "/home/claude/work_v5731")
 
 # Import the engine under test
 from core import data_engine_v2 as de  # noqa: E402
@@ -467,6 +474,251 @@ def test_legacy_disable_env_honored() -> None:
 
 
 # ============================================================================
+# v5.73.1 — Six new regression tests for the post-deploy hotfix
+# ============================================================================
+
+def test_v5731_roi_unit_fraction_passed_correctly() -> None:
+    """Bug A regression: classifier must NOT inflate expected_roi_3m by 100×
+    when delegating to scoring. CINF.US had expected_roi_3m=0.018702 (1.87%),
+    and the v5.73.0 bug made the reason show 'roi3m=3.0%' or similar inflated
+    values. With the v5.73.1 delegation to apply_canonical_recommendation, the
+    reason string must reflect the actual fraction value formatted as a
+    percent."""
+    os.environ.pop("TFB_TRUST_PROVIDER_RECO", None)
+    # CINF.US-like values from the actual production JSON
+    row = make_normal_row(
+        overall_score=68.76,
+        risk_score=36.61,
+        confidence_score=77.52,
+        expected_roi_3m=0.018702,  # 1.87% in FRACTION form
+    )
+    de._classify_recommendation_8tier(row)
+    reason = row.get("recommendation_reason", "")
+    # Scoring stub's reason formatter shows roi3m=1.9% (rounded) for 0.018702 fraction.
+    # The KEY assertion: reason must NOT contain inflated values like '187.0%',
+    # '1870.0%', '3.0%', or any percent value much larger than the actual ROI.
+    assert "187.0%" not in reason, f"100× inflation regression: {reason!r}"
+    assert "1870.0%" not in reason, f"10000× inflation regression: {reason!r}"
+    # The legitimate formatted roi3m should be around 1.9% (rounded from 1.8702)
+    assert "1.9%" in reason or "1.87%" in reason or "1.8%" in reason, (
+        f"Expected roi3m close to 1.87% in reason, got: {reason!r}"
+    )
+
+
+def test_v5731_confidence_sequencing_uses_actual_value() -> None:
+    """Bug B regression: when confidence_score is set on the row, the
+    recommendation reason must reflect it — NOT a default 55.0. v5.73.0
+    classified before scoring finalized confidence, so reasons showed
+    'conf=55.0' even when the actual confidence_score was 77.52."""
+    os.environ.pop("TFB_TRUST_PROVIDER_RECO", None)
+    row = make_normal_row(
+        overall_score=68.76,
+        risk_score=36.61,
+        confidence_score=77.52,
+        expected_roi_3m=0.018702,
+    )
+    de._classify_recommendation_8tier(row)
+    reason = row.get("recommendation_reason", "")
+    assert "conf=77.5" in reason or "conf=77.52" in reason, (
+        f"Expected reason to reflect actual conf=77.52, got: {reason!r}"
+    )
+    assert "conf=55.0" not in reason, (
+        f"v5.73.0 default-conf=55 regression: {reason!r}"
+    )
+
+
+def test_v5731_confidence_falls_back_to_forecast_confidence() -> None:
+    """When confidence_score is None but forecast_confidence is set,
+    apply_canonical_recommendation falls back to forecast_confidence × 100.
+    Tests the stub stub behavior (mirrors scoring.py v5.3.0)."""
+    os.environ.pop("TFB_TRUST_PROVIDER_RECO", None)
+    row = make_normal_row(
+        overall_score=70.0,
+        risk_score=40.0,
+        expected_roi_3m=0.15,
+    )
+    row.pop("confidence_score", None)
+    row["forecast_confidence"] = 0.85  # 0-1 form → should be read as 85.0
+    de._classify_recommendation_8tier(row)
+    reason = row.get("recommendation_reason", "")
+    # With the fallback, conf should appear as ~85, not 55 (the default)
+    assert "conf=85" in reason or "conf=84" in reason or "conf=86" in reason, (
+        f"Expected conf in 84-86 range from forecast_confidence fallback, got: {reason!r}"
+    )
+
+
+def test_v5731_recommendation_and_detail_always_match() -> None:
+    """Bug C regression: recommendation_detailed must equal recommendation
+    after every call to _classify_recommendation_8tier. GPOR.US/SD.US had
+    Recommendation=HOLD with Recommendation Detail=BUY in v5.73.0."""
+    os.environ.pop("TFB_TRUST_PROVIDER_RECO", None)
+    for overall in (35, 50, 70, 85):
+        for risk in (30, 60, 90):
+            for conf in (40, 70, 90):
+                for roi3 in (-0.10, 0.0, 0.15, 0.30):
+                    row = make_normal_row(
+                        overall_score=overall,
+                        risk_score=risk,
+                        confidence_score=conf,
+                        expected_roi_3m=roi3,
+                    )
+                    de._classify_recommendation_8tier(row)
+                    rec = row.get("recommendation")
+                    detail = row.get("recommendation_detailed")
+                    assert rec == detail, (
+                        f"Recommendation/Detail mismatch at overall={overall} "
+                        f"risk={risk} conf={conf} roi3={roi3}: "
+                        f"rec={rec!r} detail={detail!r}"
+                    )
+
+
+def test_v5731_safety_recall_after_phase_dd() -> None:
+    """The safety re-call in _apply_phase_dd_enhancements must invoke
+    _classify_recommendation_8tier AFTER Phase-II runs (it's also called
+    before, so total = 2 invocations per row). This is the structural fix
+    for Bug B (confidence sequencing): the first call sees pre-Phase-II
+    scores; the second sees the final post-Phase-II scores."""
+    os.environ.pop("TFB_TRUST_PROVIDER_RECO", None)
+
+    # Monkey-patch the classifier with a call-counting wrapper.
+    original_fn = de._classify_recommendation_8tier
+    call_count = [0]
+
+    def counting_classifier(row):
+        call_count[0] += 1
+        return original_fn(row)
+
+    de._classify_recommendation_8tier = counting_classifier
+    try:
+        row = make_normal_row(
+            overall_score=72.0,
+            risk_score=45.0,
+            confidence_score=70.0,
+            expected_roi_3m=0.15,
+            intrinsic_value=110.0,  # provide intrinsic so Phase-II doesn't void it
+        )
+        de._apply_phase_dd_enhancements(row)
+        # _classify_recommendation_8tier must be called exactly twice:
+        # once before _phase_ii_quality_forecast, once after (the safety re-call).
+        assert call_count[0] == 2, (
+            f"Expected 2 classifier calls (pre+post Phase-II safety re-call); "
+            f"got {call_count[0]}. The v5.73.1 safety re-call may not be wired."
+        )
+    finally:
+        de._classify_recommendation_8tier = original_fn
+
+
+def test_v5731_fundamentals_empty_triggers_guard() -> None:
+    """v5.73.1 empty-row guard refinement: rows with price data but NO
+    fundamentals (the KAR.US / ZOMATO.NSE / HINDUNILVR.NSE pattern) must
+    trigger the empty-row guard. v5.73.0 missed these because price was
+    populated."""
+    # Price block populated, fundamentals all None
+    row = {
+        "symbol": "ZOMATO.NSE",
+        "current_price": 250.0,
+        "previous_close": 248.5,
+        "day_high": 252.0,
+        "day_low": 247.0,
+        "week_52_high": 280.0,
+        "week_52_low": 180.0,
+        "rsi_14": 55.0,
+        "volatility_30d": 0.20,
+        # market_cap, revenue_ttm, eps_ttm, pe_ttm all absent
+    }
+    assert de._is_empty_data_row(row) is True, (
+        f"v5.73.1 fundamentals-empty guard failed to fire on price-only row: "
+        f"_is_empty_data_row returned False"
+    )
+
+    # Sanity: a row with ANY populated fundamental does NOT trigger
+    row_with_fund = dict(row)
+    row_with_fund["market_cap"] = 1_000_000_000.0
+    assert de._is_empty_data_row(row_with_fund) is False, (
+        f"v5.73.1 guard fired on row WITH market_cap populated — too aggressive"
+    )
+
+
+def test_v5731_priority_map_is_6tier() -> None:
+    """Bug F regression: _RECO_8TIER_PRIORITY must use the 6-tier scoring.py
+    mapping. SELL and STRONG_SELL must both map to 5, not 6/7."""
+    assert de._RECO_8TIER_PRIORITY["STRONG_BUY"] == 1
+    assert de._RECO_8TIER_PRIORITY["BUY"] == 2
+    assert de._RECO_8TIER_PRIORITY["HOLD"] == 4
+    assert de._RECO_8TIER_PRIORITY["REDUCE"] == 5
+    assert de._RECO_8TIER_PRIORITY["SELL"] == 5
+    assert de._RECO_8TIER_PRIORITY["STRONG_SELL"] == 5
+    # P3 is intentionally reserved as a gap — no recommendation maps there
+    assert 3 not in de._RECO_8TIER_PRIORITY.values()
+
+
+def test_v5731_sanitization_is_wired() -> None:
+    """Bug D regression: _apply_v572_sanitization must be called inside
+    _compute_scores_fallback. We can verify by feeding a polluted row through
+    the fallback path and checking that the sanitized:* warning appears."""
+    os.environ.pop("TFB_DISABLE_V572_SANITIZATION", None)
+    row = {
+        "symbol": "BOX.US",
+        "current_price": 30.0,
+        "market_cap": 4_000_000_000.0,
+        "revenue_ttm": 1_000_000_000.0,
+        "eps_ttm": 0.5,
+        "pe_ttm": 60.0,
+        "pb_ratio": 5.0,
+        "ps_ratio": 4.0,
+        "debt_to_equity": 2048.0,  # extreme outlier — should be nulled
+        "ev_ebitda": 25.0,
+    }
+    de._compute_scores_fallback(row)
+    warnings = row.get("warnings", "")
+    assert isinstance(warnings, str)
+    assert "sanitized:" in warnings, (
+        f"Expected 'sanitized:' tag in warnings after _compute_scores_fallback "
+        f"on polluted row; got warnings={warnings!r}"
+    )
+    # The extreme debt_to_equity should be nulled
+    assert row.get("debt_to_equity") is None, (
+        f"Expected debt_to_equity nulled by sanitization; got {row.get('debt_to_equity')}"
+    )
+
+
+def test_v5731_recommendation_priority_band_emitted() -> None:
+    """Bug C/F regression: recommendation_priority_band must be set after
+    classification when scoring.apply_canonical_recommendation is available.
+    CINF.US JSON showed this field as null in v5.73.0, indicating my classifier
+    fix wasn't actually wired into the runtime path."""
+    os.environ.pop("TFB_TRUST_PROVIDER_RECO", None)
+    row = make_normal_row(
+        overall_score=75.0,
+        risk_score=40.0,
+        confidence_score=75.0,
+        expected_roi_3m=0.15,
+    )
+    de._classify_recommendation_8tier(row)
+    band = row.get("recommendation_priority_band")
+    assert band in ("P1", "P2", "P3", "P4", "P5"), (
+        f"Expected recommendation_priority_band in P1..P5, got {band!r}"
+    )
+
+
+def test_v5731_singleflight_key_uses_make_cache_key() -> None:
+    """Bug E regression: the singleflight key construction site must call
+    _make_cache_key (which includes schema version), not the legacy 3-component
+    string. Verified by reading the engine source."""
+    import inspect
+    src = inspect.getsource(de.DataEngineV2.get_enriched_quote)
+    # Legacy pattern that must NOT appear
+    legacy = 'f"quote:{normalize_symbol(symbol)}:{provider_profile}:'
+    assert legacy not in src, (
+        f"Legacy 3-component singleflight key still present in get_enriched_quote"
+    )
+    # v5.73.1 pattern that MUST appear
+    assert "_make_cache_key(" in src, (
+        f"_make_cache_key call missing from get_enriched_quote"
+    )
+
+
+# ============================================================================
 # Test runner
 # ============================================================================
 
@@ -503,6 +755,18 @@ ALL_TESTS = [
     ("test_fraction_to_points_helper", test_fraction_to_points_helper),
     ("test_sanitization_can_be_disabled", test_sanitization_can_be_disabled),
     ("test_legacy_disable_env_honored", test_legacy_disable_env_honored),
+
+    # v5.73.1 — Six new regression tests for the post-deploy hotfix
+    ("test_v5731_roi_unit_fraction_passed_correctly", test_v5731_roi_unit_fraction_passed_correctly),
+    ("test_v5731_confidence_sequencing_uses_actual_value", test_v5731_confidence_sequencing_uses_actual_value),
+    ("test_v5731_confidence_falls_back_to_forecast_confidence", test_v5731_confidence_falls_back_to_forecast_confidence),
+    ("test_v5731_recommendation_and_detail_always_match", test_v5731_recommendation_and_detail_always_match),
+    ("test_v5731_safety_recall_after_phase_dd", test_v5731_safety_recall_after_phase_dd),
+    ("test_v5731_fundamentals_empty_triggers_guard", test_v5731_fundamentals_empty_triggers_guard),
+    ("test_v5731_priority_map_is_6tier", test_v5731_priority_map_is_6tier),
+    ("test_v5731_sanitization_is_wired", test_v5731_sanitization_is_wired),
+    ("test_v5731_recommendation_priority_band_emitted", test_v5731_recommendation_priority_band_emitted),
+    ("test_v5731_singleflight_key_uses_make_cache_key", test_v5731_singleflight_key_uses_make_cache_key),
 ]
 
 
@@ -511,7 +775,7 @@ if __name__ == "__main__":
         run_test(name, fn)
 
     print("\n" + "=" * 78)
-    print(f"v5.73.0 BEHAVIORAL TEST SUITE — {de.__version__}")
+    print(f"v5.73.1 BEHAVIORAL TEST SUITE — {de.__version__}")
     print("=" * 78)
     passed = sum(1 for _, ok, _ in _RESULTS if ok)
     failed = sum(1 for _, ok, _ in _RESULTS if not ok)
