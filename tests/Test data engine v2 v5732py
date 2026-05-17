@@ -718,6 +718,55 @@ def test_v5731_singleflight_key_uses_make_cache_key() -> None:
     )
 
 
+def test_v5732_persistent_cache_includes_schema_version() -> None:
+    """v5.73.2 — Bug regression: the persistent cache get/set must include the
+    schema version in the provider_profile so v5.73.0 / v5.73.1 cached rows
+    cannot leak forward into v5.73.2.
+
+    The v5.73.1 dashboard refresh showed ~50% of rows still had v5.73.0 broken
+    reasons because the persistent cache returned them directly (bypassing the
+    v5.73.1 classifier). v5.73.2 fixes this by encoding _SCHEMA_VERSION into
+    the provider_profile string at both the GET site (line ~6506) and the SET
+    site (line ~6596). Both sites must use the SAME versioned string."""
+    import inspect
+    src = inspect.getsource(de.DataEngineV2._get_enriched_quote_impl)
+
+    # The versioned_provider_profile string must be declared.
+    assert "versioned_provider_profile" in src, (
+        "v5.73.2 versioned_provider_profile declaration missing from "
+        "_get_enriched_quote_impl"
+    )
+    assert "_SCHEMA_VERSION" in src, (
+        "v5.73.2 cache-bust must reference _SCHEMA_VERSION in the versioned "
+        "provider_profile string"
+    )
+
+    # The legacy unversioned cache calls must NOT appear.
+    legacy_get = "self._cache.get(symbol=norm, provider_profile=provider_profile)"
+    legacy_set = "self._cache.set(_model_to_dict(q), symbol=norm, provider_profile=provider_profile)"
+    assert legacy_get not in src, (
+        "v5.73.2 regression: legacy unversioned cache GET call still present "
+        "at line 6506. v5.73.0 cache entries will leak forward."
+    )
+    assert legacy_set not in src, (
+        "v5.73.2 regression: legacy unversioned cache SET call still present "
+        "at line 6596. New entries will be written under legacy keys that GET "
+        "cannot read, effectively disabling the persistent cache."
+    )
+
+    # Both versioned calls MUST appear (paired GET + SET).
+    versioned_get = "self._cache.get(symbol=norm, provider_profile=versioned_provider_profile)"
+    versioned_set = "self._cache.set(_model_to_dict(q), symbol=norm, provider_profile=versioned_provider_profile)"
+    assert versioned_get in src, (
+        "v5.73.2 versioned cache GET call missing from _get_enriched_quote_impl"
+    )
+    assert versioned_set in src, (
+        "v5.73.2 versioned cache SET call missing from _get_enriched_quote_impl. "
+        "Without a matching SET, GET would always miss and the cache would be "
+        "write-disabled."
+    )
+
+
 # ============================================================================
 # Test runner
 # ============================================================================
@@ -767,6 +816,9 @@ ALL_TESTS = [
     ("test_v5731_sanitization_is_wired", test_v5731_sanitization_is_wired),
     ("test_v5731_recommendation_priority_band_emitted", test_v5731_recommendation_priority_band_emitted),
     ("test_v5731_singleflight_key_uses_make_cache_key", test_v5731_singleflight_key_uses_make_cache_key),
+
+    # v5.73.2 — Single regression test for the persistent cache schema-version fix
+    ("test_v5732_persistent_cache_includes_schema_version", test_v5732_persistent_cache_includes_schema_version),
 ]
 
 
