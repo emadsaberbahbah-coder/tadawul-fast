@@ -2,7 +2,104 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.73.1
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.73.2
+================================================================================
+
+WHY v5.73.2 — CACHE-INVALIDATION HOTFIX FOR v5.73.1 (May 17, 2026)
+------------------------------------------------------------------
+v5.73.2 is a single-line-of-intent surgical fix over v5.73.1. The v5.73.1
+deployment at 06:41 UTC fixed the recommendation classifier correctly,
+but the post-deploy dashboard refresh showed inconsistent results across
+the 200-row Market_Leaders sweep:
+
+  - Half the rows showed v5.73.1-correct outputs (CINF.US roi3m=1.9%,
+    MO roi3m=2.5%, TDC.US roi3m=5.6%, HLF.US roi3m=10.5%, AXS.US roi3m=3.6%
+    matched their actual Expected ROI 3M columns).
+  - The other half showed unchanged v5.73.0-broken outputs (SEB-A.ST
+    roi3m=80.9% while sheet showed 0.81%, MCD roi3m=28.6% while sheet
+    showed 0.29%, SAM.US roi3m=53.5% while sheet showed 0.54%, DEO.US
+    roi3m=133.8% while sheet showed 1.34%, PTT-R.BK roi3m=150.0% while
+    sheet showed 1.50%, UNP.US roi3m=-134.9% while sheet showed -1.35%).
+  - GPOR.US and SD.US still showed Recommendation=HOLD with
+    Detail=BUY, Reason="BUY: ...", Priority=2.
+  - Foreign tickers with fundamentals-empty data (KAR.US, ZOMATO.NSE,
+    HINDUNILVR.NSE, ITC.NSE, FI.US, EBR.US, CIVI.US, CSWI.US) still
+    received fabricated overall=50.x scores and REDUCE recommendations
+    instead of the v5.73.1 empty-row HOLD.
+
+Root cause: persistent cache leak. v5.73.1 schema-versioned the
+**singleflight** key (line ~6450 in v5.73.1) via `_make_cache_key`, but
+the **persistent cache** at lines 6506 (GET) and 6596 (SET) still used
+the legacy 2-component key shape `(symbol, provider_profile)`. A row
+cached under v5.73.0 hits line 6506, returns directly via
+`UnifiedQuote(**cached)`, and bypasses `_apply_phase_dd_enhancements`
+entirely — so the new classifier, the new empty-row guard, and the
+atomic detail/recommendation write never run on it.
+
+The pattern in the v5.73.1 dashboard refresh proves it: rows whose
+v5.73.0 cache entries had expired (or were never cached) got fresh
+fetches and went through v5.73.1's classifier, producing correct reasons;
+rows whose v5.73.0 cache entries were still warm got returned from the
+persistent cache and kept their v5.73.0 broken reasons. Bug A's
+fix-or-no-fix pattern correlated exactly with the heuristic boundary in
+scoring.py's `_as_roi_fraction` — but the deeper cause was that those
+rows simply never reached scoring.py at all on this refresh.
+
+v5.73.2 CHANGES vs v5.73.1
+  Single fix at two paired sites: lines 6506 (GET) and 6596 (SET) in
+  `_get_enriched_quote_impl`. The `provider_profile` string passed to
+  the cache backend is now versioned:
+
+      versioned_provider_profile = f"{provider_profile}|sv={_SCHEMA_VERSION}"
+
+  Both GET and SET use this same versioned string. The cache backend
+  treats it as a brand-new key namespace. Every v5.73.0 cache entry
+  becomes unreachable; the first read after deploy misses, the engine
+  rebuilds the row through the full v5.73.2 pipeline (including the
+  classifier with atomic detail/recommendation write, the
+  fundamentals-empty guard, and the safety re-call after Phase-II), and
+  the new row is written back under the v5.73.2 key. After one full
+  refresh cycle, the cache stabilizes under v5.73.2-shape entries.
+
+  No backend API change. The cache implementation receives a longer
+  string; it has always been free-form. The two write sites are paired
+  with the read site so the cache stays functional rather than becoming
+  effectively write-only.
+
+DEFERRED — separate releases (unchanged from v5.73.1 deferral list):
+  - Apps Script writer fix for Data Provider / Last Updated UTC / Last
+    Updated Riyadh columns (engine emits these correctly; their blank
+    state on the dashboard is an Apps Script projection issue).
+  - yahoo_fundamentals_provider.py failure on foreign tickers (`*.NSE`,
+    `*.XETRA`, `*.LSE`, `*.JSE`, `*.SA`, `*.BMV`). The fundamentals
+    provider only manages to retrieve the analyst recommendation for
+    these symbols. After v5.73.2 deploys, foreign-ticker rows will
+    correctly trigger the empty-row guard and emit HOLD instead of
+    REDUCE — that addresses the user-visible symptom even though the
+    underlying provider gap persists.
+  - core.scoring threshold recalibration. The ~80% REDUCE distribution
+    is partly Bug A (now resolved for fresh fetches) and partly a
+    threshold-calibration question for the scoring.py owner.
+  - Schema expansion 97 → 103 with `recommendation_priority_band` as a
+    required canonical column (currently blank in the dashboard
+    Priority Band column for all rows because the canonical projection
+    strips it).
+  - Investigate the downstream writer responsible for the
+    Recommendation=HOLD / Detail=BUY mismatch on GPOR.US and SD.US in
+    the v5.73.1 refresh. v5.73.2's cache bust will reveal whether the
+    mismatch was purely a cache artifact (in which case it disappears
+    after a clean refresh) or whether a real downstream writer
+    selectively overwrites only `recommendation`. If it disappears with
+    v5.73.2, no further action; if it persists, it gets its own
+    targeted fix in v5.73.3.
+
+PRESERVED — strictly:
+  All v5.73.1 architectural deltas (classifier delegation to
+  `apply_canonical_recommendation`, safety re-call after Phase-II,
+  fundamentals-empty guard, 6-tier priority map, sanitization wired
+  into `_compute_scores_fallback`, `_make_cache_key` wired at
+  singleflight) and the entire v5.73.0 / v5.70.0 foundation.
+
 ================================================================================
 
 WHY v5.73.1 — POST-DEPLOY HOTFIX FOR v5.73.0 (May 17, 2026)
@@ -701,7 +798,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.73.1"
+__version__ = "5.73.2"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -6502,8 +6599,25 @@ class DataEngineV5:
         page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, extras=kwargs)
         provider_profile = self._provider_profile_key(norm, page_context)
 
+        # v5.73.2 — Persistent cache key MUST include the engine schema version.
+        # v5.73.1 only schema-versioned the singleflight key (memory-only); the
+        # persistent cache lookup below still used the legacy 2-component key
+        # (symbol, provider_profile), so v5.73.0-shape cached rows leaked into
+        # v5.73.1 and bypassed the new classifier, empty-row guard, and atomic
+        # detail/recommendation write. The v5.73.1 dashboard refresh showed the
+        # consequence: ~50% of rows still had v5.73.0 reasons (roi3m=80.9% on
+        # SEB-A.ST, roi3m=150.0% on PTT-R.BK, etc.), and GPOR.US/SD.US still had
+        # Recommendation=HOLD with Detail=BUY because they were cache hits.
+        #
+        # Encoding _SCHEMA_VERSION into the provider_profile string forces every
+        # v5.73.0 cache key to miss on first read after deploy, triggering fresh
+        # fetches across the board. After one full refresh, the cache stabilizes
+        # under v5.73.2-shape entries. This breaks the leak surgically without
+        # changing the cache backend API.
+        versioned_provider_profile = f"{provider_profile}|sv={_SCHEMA_VERSION}"
+
         if use_cache:
-            cached = await self._cache.get(symbol=norm, provider_profile=provider_profile)
+            cached = await self._cache.get(symbol=norm, provider_profile=versioned_provider_profile)
             if isinstance(cached, dict) and cached:
                 return UnifiedQuote(**cached)
 
@@ -6593,7 +6707,11 @@ class DataEngineV5:
         q = UnifiedQuote(**row)
 
         if use_cache:
-            await self._cache.set(_model_to_dict(q), symbol=norm, provider_profile=provider_profile)
+            # v5.73.2: SET uses the same schema-versioned provider_profile as
+            # GET so new entries land under the v5.73.2 key namespace. Without
+            # this, GET would always miss and SET would write under legacy
+            # keys that GET could never read — effectively disabling the cache.
+            await self._cache.set(_model_to_dict(q), symbol=norm, provider_profile=versioned_provider_profile)
 
         return q
 
