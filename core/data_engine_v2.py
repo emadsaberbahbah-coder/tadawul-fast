@@ -2,7 +2,159 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.73.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.73.1
+================================================================================
+
+WHY v5.73.1 — POST-DEPLOY HOTFIX FOR v5.73.0 (May 17, 2026)
+-----------------------------------------------------------
+v5.73.1 is a targeted hotfix over v5.73.0. After v5.73.0 was deployed at
+05:17 UTC and a full 200-row Market_Leaders refresh ran successfully, a
+post-deployment audit of both the dashboard and a clean single-symbol
+CINF.US API probe surfaced six bugs in the deployed engine. v5.73.1
+addresses all six in a single `data_engine_v2.py` revision; nothing else
+in the project changes.
+
+The CINF.US JSON evidence was decisive: every "blank dashboard column"
+flagged by the audit (Confidence Score, Data Provider, Last Updated UTC
+and Riyadh) was confirmed POPULATED in the engine's JSON output. Those
+remaining dashboard blanks are an Apps Script writer bug (`05_Refresh.gs`
+/ `06_Market_Leaders.gs`), NOT an engine bug, and are deferred to a
+separate release. v5.73.1 fixes only the bugs that are actually in the
+engine.
+
+v5.73.1 CHANGES vs v5.73.0
+  Bug A — `expected_roi_3m` 100× inflation in recommendation_reason.
+    v5.73.0's `_classify_recommendation_8tier` called
+    `roi3 = _fraction_to_points(row.get("expected_roi_3m"))` before
+    passing to `core.scoring._recommendation`. But scoring.py v5.3.0
+    expects ROI as a FRACTION (its thresholds are 0.25 / 0.12, i.e.
+    25% / 12% in fraction form). The unit mismatch trickled into two
+    places: the recommendation logic (treated 1.5% ROI as 150%, often
+    tripping high thresholds spuriously) and the displayed reason
+    string (scoring.py's `_fmt_roi3_component` then double-ish formatted
+    the inflated value, showing "150.0%" / "80.9%" / "133.8%" etc. on
+    rows where actual roi3m was 0.5%–1.5%).
+    Fix: rewrite `_classify_recommendation_8tier` to delegate to
+    `scoring.apply_canonical_recommendation(row, overwrite=True)`,
+    which takes the row directly, reads `expected_roi_3m` as a FRACTION,
+    and routes it correctly through `compute_recommendation` and the
+    reason formatter. Confirmed across all 200 dashboard rows from the
+    deployed test.
+
+  Bug B — confidence sequencing: classification used `conf=55.0` even
+  when final `confidence_score=77.52`.
+    The CINF.US JSON proved this: its `recommendation_reason` showed
+    `conf=55.0 roi3m=3.0%` while the same response had
+    `confidence_score=77.52` and `expected_roi_3m=0.018702`. The cause
+    was call-order: `_classify_recommendation_8tier` ran INSIDE
+    `_apply_phase_dd_enhancements` BEFORE `_phase_ii_quality_forecast`
+    completed. Phase-II is what finalizes `expected_roi_3m` and
+    `forecast_confidence` on the row; the classifier saw the
+    pre-Phase-II values and froze a stale reason string.
+    Fix: add a safety re-call to `_classify_recommendation_8tier` at
+    the END of `_apply_phase_dd_enhancements`, AFTER Phase-II runs.
+    Combined with delegation to `apply_canonical_recommendation` (which
+    is itself idempotent under `overwrite=True`), this ensures the
+    final recommendation reads the final scores. The first
+    classification call is retained for downstream code that depends
+    on `recommendation` being set during view derivation.
+
+  Bug C — `recommendation` vs `recommendation_detailed` mismatch on
+  GPOR.US and SD.US.
+    Both rows showed Recommendation=HOLD, Recommendation Detail=BUY,
+    Reason="BUY: ...", Reco Priority=2. The classifier wrote a
+    consistent tuple, but a downstream path overwrote only
+    `recommendation` (leaving Detail/Reason/Priority intact at BUY).
+    The Phase-II refinement of ROI/confidence would change the
+    classification outcome, but only the main `recommendation` field
+    was updated.
+    Fix: the safety re-call in `_apply_phase_dd_enhancements` writes
+    `recommendation`, `recommendation_detailed`, `recommendation_reason`,
+    `recommendation_priority`, and `recommendation_priority_band`
+    atomically from the final post-Phase-II scores, eliminating the
+    field divergence.
+
+  Bug D — `_apply_v572_sanitization` was defined but never called.
+    v5.73.0 shipped the sanitization function but did not wire it into
+    the runtime scoring path. The 200-row dashboard audit confirmed
+    zero `sanitized:*` warning tags despite obvious polluted ratios
+    (BOX.US D/E=2048, INFY.NS EV/EBITDA=1022, MO P/B=-38).
+    Fix: invoke `_apply_v572_sanitization(row)` at the top of
+    `_compute_scores_fallback`. Each sanitized field appends a
+    `sanitized:<field>` tag to the row's warnings so audit can see
+    which rows were cleaned.
+
+  Bug E — `_make_cache_key` was defined but never called.
+    v5.73.0 added the schema-versioned cache-key helper but the
+    runtime singleflight site (line ~6450 in v5.73.0) still used
+    the legacy 3-component key:
+        `quote:{normalize_symbol(symbol)}:{provider_profile}:{cache|live}`
+    No schema version, no page context. A v5.73.0-shape cache entry
+    could leak forward into a v5.73.1 deployment and silently bypass
+    the recommendation fix.
+    Fix: replace the legacy key construction with
+    `_make_cache_key(symbol, page_context, provider_profile,
+    _SCHEMA_VERSION, mode=...)` at the singleflight call site.
+
+  Bug F — `_RECO_8TIER_PRIORITY` map emitted priority=6 for SELL and
+  priority=7 for STRONG_SELL.
+    Conflicted with `core.scoring._compute_priority` which collapses
+    to a 6-tier P1/P2/P4/P5 mapping (P3 reserved as a gap-band). The
+    dashboard's "Reco Priority" column showed 6 for SELL rows and 7
+    for STRONG_SELL, divergent from scoring.py's contract.
+    Fix: collapse `_RECO_8TIER_PRIORITY` to the 6-tier mapping:
+        STRONG_BUY=1, BUY=2, HOLD=4, REDUCE/SELL/STRONG_SELL=5
+        ACCUMULATE → 2, AVOID → 5 (legacy aliases kept as defensive
+        fallback; they would have been collapsed before reaching this
+        map via `_v573_collapse_to_canonical_enum`).
+
+  Additional refinement: empty-row guard now also fires when
+  fundamentals are missing.
+    v5.73.0's `_is_empty_data_row` required ALL THREE blocks
+    (price/fundamental/derived) to be empty. The 200-row dashboard
+    confirmed this missed ~27 foreign-ticker rows (KAR.US,
+    ZOMATO.NSE, KOTAKBANK.NSE, HINDUNILVR.NSE, TITAN.NSE, ITC.NSE,
+    COALINDIA.NSE, DMART.NSE, INDIGO.NSE, BRITANNIA.NSE, SUNPHARMA.NSE,
+    TCS.NSE, POWERGRID.NSE, PRX.JSE, NPN.JSE, SGE.LSE, RKT.LSE,
+    SMIN.LSE, TLX.XETRA, HEN3.XETRA, MUV2.XETRA, HNR1.XETRA, ELET3.SA,
+    EBR.US, FI.US, CIVI.US, CSWI.US) where Yahoo Finance fetched the
+    price block but failed on fundamentals (only
+    `yahoo_fundamentals_enrichment_applied:recommendation` appeared in
+    warnings). These rows received a fabricated mid-50s overall_score
+    from `_compute_scores_fallback` and a REDUCE recommendation built
+    on top of nothing real.
+    Fix: `_is_empty_data_row` now ALSO fires when the fundamental
+    block is empty regardless of price/derived state. The strict check
+    requires all four fundamental keys (`market_cap`, `revenue_ttm`,
+    `eps_ttm`, `pe_ttm`) to be null/zero. One populated fundamental
+    is sufficient to proceed through normal scoring.
+
+DEFERRED — separate releases:
+  - Apps Script writer fix for blank Confidence Score / Data Provider /
+    Last Updated columns. The engine emits these fields correctly; the
+    fix goes in `05_Refresh.gs` / `06_Market_Leaders.gs`.
+  - yahoo_fundamentals_provider.py failure on foreign tickers
+    (`*.NSE`, `*.XETRA`, `*.LSE`, `*.JSE`, `*.SA`, `*.BMV`). The
+    fundamentals provider only manages to retrieve the analyst
+    recommendation for these symbols; this is upstream of the engine.
+  - core.scoring threshold recalibration. The 200-row dashboard showed
+    ~80% REDUCE distribution — partly Bug A (now fixed), partly a
+    threshold-calibration question for the scoring.py owner.
+  - Schema expansion 97 → 103 with `provider_rating`,
+    `recommendation_source`, `scoring_errors`, `scoring_schema_version`,
+    `opportunity_source`, and `reco_priority` as required canonical
+    columns. Per the locked Q5 answer this remains coordinated with the
+    Apps Script + schemas.py release.
+
+PRESERVED — strictly:
+  All v5.73.0 architectural deltas (core.scoring delegation, 6-tier
+  vocabulary, provider_rating, recommendation_source, empty-row guard,
+  rank fallback removal, top10 criteria snapshot serialization,
+  schema-aware cache key infrastructure, MENA suffix mappings,
+  `_fraction_to_points` infrastructure preserved as future-proofing
+  even though it is no longer called from the classifier) and the
+  entire v5.70.0 schema-alignment foundation.
+
 ================================================================================
 
 WHY v5.73.0 — REBASE OF v5.71-EQUIVALENT FIXES ONTO v5.70.0 + SELECTIVE
@@ -549,7 +701,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.73.0"
+__version__ = "5.73.1"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -627,6 +779,23 @@ try:
         _risk_bucket as _scoring_risk_bucket,
         _confidence_bucket as _scoring_confidence_bucket,
     )
+    # v5.73.1: also import apply_canonical_recommendation. It is the
+    # authoritative drop-in helper that scoring.py v5.3.0 provides:
+    # reads scores from the row at call time (so late-call sequencing
+    # works correctly even when scoring runs after a first
+    # classification pass), falls back from confidence_score to
+    # forecast_confidence when needed, treats expected_roi_3m as
+    # FRACTION (fixing the v5.73.0 _fraction_to_points unit bug), and
+    # writes recommendation + recommendation_reason +
+    # recommendation_priority_band + recommendation_source atomically.
+    try:
+        from core.scoring import (
+            apply_canonical_recommendation as _scoring_apply_canonical,
+        )
+        _SCORING_APPLY_CANONICAL_AVAILABLE = True
+    except Exception:
+        _scoring_apply_canonical = None  # type: ignore
+        _SCORING_APPLY_CANONICAL_AVAILABLE = False
     try:
         from core.scoring import RECOMMENDATION_ENUM as _SCORING_RECOMMENDATION_ENUM
     except Exception:  # enum is optional surface; tolerate absence
@@ -638,6 +807,8 @@ except Exception:  # pragma: no cover
     _scoring_recommendation = None  # type: ignore
     _scoring_risk_bucket = None  # type: ignore
     _scoring_confidence_bucket = None  # type: ignore
+    _scoring_apply_canonical = None  # type: ignore
+    _SCORING_APPLY_CANONICAL_AVAILABLE = False
     _SCORING_RECOMMENDATION_ENUM = (
         "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL",
     )
@@ -1285,19 +1456,22 @@ def _derive_views(row: Dict[str, Any]) -> None:
         row["value_view"] = row.get("value_view") or vv
 
 
-# v5.69.0: canonical 8-tier priority map (best -> worst == priority 1 -> 8).
-# Mirrors core.reco_normalize's ordering. Used to derive a consistent
-# recommendation_priority whether the recommendation came from this
-# engine's score-based classifier or from an upstream provider string.
+# v5.73.1: 6-tier priority map aligned with core.scoring v5.3.0's _compute_priority
+# (P1..P5 with P3 reserved as a gap-band). The legacy 8-tier map emitted priority=6
+# for SELL and priority=7 for STRONG_SELL on the dashboard, which conflicted with
+# scoring.py's canonical mapping. Final canonical enum is 6-tier and ACCUMULATE /
+# AVOID are never emitted (collapsed to BUY / STRONG_SELL in
+# `_v573_collapse_to_canonical_enum`). The legacy aliases are kept in this map
+# only as a defensive fallback in case an un-collapsed value slips through.
 _RECO_8TIER_PRIORITY: Dict[str, int] = {
-    "STRONG_BUY": 1,
-    "BUY": 2,
-    "ACCUMULATE": 3,
-    "HOLD": 4,
-    "REDUCE": 5,
-    "SELL": 6,
-    "STRONG_SELL": 7,
-    "AVOID": 8,
+    "STRONG_BUY":  1,   # P1 — high-conviction buy
+    "BUY":         2,   # P2 — normal-conviction buy
+    "ACCUMULATE":  2,   # legacy alias (would have been collapsed to BUY)
+    "HOLD":        4,   # P4 — default neutral (P3 intentionally reserved as a gap)
+    "REDUCE":      5,   # P5 — exit/trim
+    "SELL":        5,   # P5 — exit
+    "STRONG_SELL": 5,   # P5 — urgent exit
+    "AVOID":       5,   # legacy alias (would have been collapsed to STRONG_SELL)
 }
 
 
@@ -1328,30 +1502,64 @@ def _recommendation_priority(rec: str) -> int:
 
 
 def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
-    """v5.73.0 — SINGLE AUTHORITATIVE recommendation writer.
+    """v5.73.1 — SINGLE AUTHORITATIVE recommendation writer.
 
-    Architectural contract:
-      1. Empty-row guard fires first. If `_is_empty_data_row(row)` is
-         True, the row gets recommendation=HOLD,
-         recommendation_source="empty_row", and the canonical reason.
-         No scoring math runs.
-      2. Provider rating capture. Any upstream `recommendation` value
-         is canonicalized to the 6-tier enum (ACCUMULATE -> BUY,
-         AVOID -> STRONG_SELL) and stored in `provider_rating`. The
-         provider value is allowed to win the final recommendation
-         only when env TFB_TRUST_PROVIDER_RECO=true. Default is False.
-      3. Engine path: delegate to core.scoring._recommendation with
-         (overall_score, risk_score, confidence_score-in-points,
-         expected_roi_3m-in-points). recommendation_source="engine".
-      4. Fallback: if core.scoring is unavailable, emit a conservative
-         HOLD with recommendation_source="scoring_unavailable". The
-         old local BUY/ACCUMULATE/REDUCE/HOLD ladder is intentionally
-         NOT resurrected — silent regression is worse than HOLD.
-      5. recommendation_reason is always rewritten by the final
-         decision source. No upstream reason is preserved.
+    v5.73.1 fixes three v5.73.0 bugs surfaced by the post-deployment audit
+    of the live CINF.US single-symbol JSON:
 
-    Final output vocabulary: STRONG_BUY / BUY / HOLD / REDUCE / SELL /
-    STRONG_SELL. ACCUMULATE and AVOID are never emitted.
+      Bug A (ROI unit ×100 inflation): v5.73.0 called
+        `roi3 = _fraction_to_points(row.get("expected_roi_3m"))` before passing
+        to core.scoring._recommendation. But core.scoring v5.3.0 expects
+        expected_roi_3m as a FRACTION (thresholds are 0.25 / 0.12), and its
+        reason formatter also ×100s small fractions for display. The net effect
+        was 100× inflated ROI in both the recommendation logic and the displayed
+        reason string. Visible on rows where actual roi3m < 1.5% (SEB-A.ST 0.81%
+        showed reason 80.9%, PTT-R.BK 1.50% showed 150.0%, etc.).
+
+      Bug B (confidence sequencing): v5.73.0 called this classifier before
+        scoring finalized confidence_score on the row, so classification used
+        the default 55.0 even when the final confidence was 77.52. Visible in
+        the CINF.US JSON where the reason string said `conf=55.0` while
+        confidence_score on the same row was 77.52.
+
+      Bug C (recommendation_detailed mismatch): v5.73.0 wrote
+        `recommendation_detailed = rec` correctly here, but a downstream
+        legacy path was overwriting only `recommendation` after this writer
+        ran, leaving Detail and Reason pointing at the previous (BUY) result
+        while Recommendation became HOLD. Affected GPOR.US and SD.US on the
+        live dashboard.
+
+    Fix strategy — delegate to scoring.apply_canonical_recommendation:
+      core.scoring v5.3.0 provides apply_canonical_recommendation, which is
+      a complete drop-in: it reads scores from the row at call time (so it
+      sees the final ROI/confidence even when called late), falls back from
+      confidence_score to forecast_confidence×100 when confidence isn't yet
+      populated, treats expected_roi_3m as a FRACTION (no unit conversion
+      needed), runs the same coherence guard and reason alignment as
+      compute_scores, and writes recommendation +
+      recommendation_priority_band + recommendation_source atomically.
+
+      After delegation, we also write `recommendation_detailed = recommendation`
+      so the Apps Script Detail column matches the Recommendation column
+      (closing Bug C), and override `recommendation_source = "engine"` to
+      preserve the v5.73.0 source-vocabulary contract (engine /
+      provider_override / empty_row / scoring_unavailable).
+
+    Architectural contract preserved from v5.73.0:
+      1. Empty-row guard fires first. If `_is_empty_data_row(row)` is True,
+         the row gets HOLD with recommendation_source="empty_row".
+      2. Provider rating capture into `provider_rating` for audit, regardless
+         of whether the provider value wins.
+      3. Provider override allowed only when TFB_TRUST_PROVIDER_RECO=true.
+      4. Conservative HOLD fallback with recommendation_source=
+         "scoring_unavailable" if core.scoring is missing. NO local ladder.
+      5. Final vocabulary: STRONG_BUY / BUY / HOLD / REDUCE / SELL / STRONG_SELL.
+
+    Idempotency: This function is safe to call multiple times on the same row.
+    apply_canonical_recommendation is invoked with overwrite=True so each call
+    re-derives from the current scores. Callers that want the final post-Phase-II
+    recommendation should ensure this runs after Phase-II completes — the safety
+    re-call at the end of `_apply_phase_dd_enhancements` enforces that.
     """
     if not isinstance(row, dict):
         return
@@ -1365,77 +1573,96 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     raw_upstream = row.get("recommendation")
     provider_canon = _v573_collapse_to_canonical_enum(raw_upstream)
     if provider_canon:
-        # Preserve the canonicalized provider value in provider_rating
-        # regardless of whether it wins the final recommendation.
         row["provider_rating"] = provider_canon
     elif raw_upstream not in (None, ""):
-        # Store the raw upstream string when canonicalization fails so
-        # downstream audit can see what the provider returned.
         row["provider_rating"] = _safe_str(raw_upstream)
 
-    # Determine whether the provider value is allowed to override the
-    # engine. Default per Q2 is False.
     trust_provider = _v573_trust_provider_reco()
     provider_wins = bool(provider_canon) and trust_provider
 
-    # -- Step 3: engine path via core.scoring -----------------------
+    # v5.73.1 sequencing safety: clear any stale `recommendation_source` set
+    # by an earlier classification pass on the same row, so
+    # apply_canonical_recommendation does not idempotency-skip on its own
+    # provenance tag. We invoke with overwrite=True anyway, but clearing the
+    # field also keeps the row state self-consistent if some other code path
+    # reads it between this clear and the final write.
+    row["recommendation_source"] = ""
+
     rec: str = ""
     reason: str = ""
     source: str = ""
+    priority_band: str = ""
 
+    # -- Step 3a: provider override path (rare) ---------------------
     if provider_wins:
         rec = provider_canon
         source = "provider_override"
         reason = (
             f"{rec}: Provider rating accepted via TFB_TRUST_PROVIDER_RECO override."
         )
-    elif _CORE_SCORING_AVAILABLE and _scoring_recommendation is not None:
-        overall = _as_float(row.get("overall_score"))
-        risk = _as_float(row.get("risk_score"))
-        conf = _as_float(row.get("confidence_score"))
-        # core.scoring._recommendation takes confidence in 0-100 form.
-        # If confidence_score is in 0-1, scale up.
-        conf100: Optional[float] = None
-        if conf is not None:
-            conf100 = conf * 100.0 if 0.0 <= conf <= 1.5 else conf
-        # ROI in points: expected_roi_3m is FRACTION per v5.67.0 contract.
-        roi3 = _fraction_to_points(row.get("expected_roi_3m"))
+        # Build a local priority band aligned with scoring.py's _compute_priority.
+        if rec == "STRONG_BUY":
+            priority_band = "P1"
+        elif rec == "BUY":
+            priority_band = "P2"
+        elif rec == "STRONG_SELL":
+            priority_band = "P1"
+        elif rec in ("SELL", "REDUCE"):
+            priority_band = "P5"
+        else:
+            priority_band = "P4"
+
+    # -- Step 3b: engine path via scoring.apply_canonical_recommendation
+    elif _CORE_SCORING_AVAILABLE and _SCORING_APPLY_CANONICAL_AVAILABLE \
+            and _scoring_apply_canonical is not None:
         try:
-            result = _scoring_recommendation(overall, risk, conf100, roi3)
+            # overwrite=True: always recompute. The row's scores may have
+            # been updated by Phase-II between the first classification pass
+            # and this call. We want the final recommendation to reflect the
+            # final scores, not a frozen earlier classification.
+            patch = _scoring_apply_canonical(row, overwrite=True)
         except Exception as exc:
-            result = None
-            row.setdefault("scoring_errors", []).append(
-                f"core.scoring._recommendation: {type(exc).__name__}: {exc}"
-            ) if isinstance(row.get("scoring_errors"), list) else row.update({
-                "scoring_errors": [f"core.scoring._recommendation: {type(exc).__name__}: {exc}"],
-            })
-        if result is not None:
-            try:
-                rec_raw, reason_raw = result  # type: ignore[misc]
-            except Exception:
-                # Unexpected return shape: fall through to fallback.
-                rec_raw, reason_raw = ("", "")
+            patch = None
+            err = f"core.scoring.apply_canonical_recommendation: {type(exc).__name__}: {exc}"
+            errs = row.get("scoring_errors")
+            if isinstance(errs, list):
+                errs.append(err)
+            else:
+                row["scoring_errors"] = [err]
+
+        if patch and isinstance(patch, dict):
+            rec_raw = patch.get("recommendation")
             rec_canon = _v573_collapse_to_canonical_enum(rec_raw)
             if rec_canon:
                 rec = rec_canon
                 source = "engine"
-                reason = _safe_str(reason_raw) or f"{rec}: Engine classification via core.scoring."
+                reason = _safe_str(patch.get("recommendation_reason")) or \
+                    f"{rec}: Engine classification via core.scoring."
+                priority_band = _safe_str(patch.get("recommendation_priority_band"))
 
+    # -- Step 3c: fallback HOLD when scoring is unavailable ---------
     if not rec:
-        # Either core.scoring unavailable, returned an unknown value,
-        # or raised. Emit conservative HOLD. Do NOT fall back to a
-        # local ladder — that is the silent-regression pattern v5.71.0
-        # closed.
+        # Either core.scoring missing, returned an unknown value, or raised.
+        # Conservative HOLD. Do NOT resurrect the local ladder (v5.71.0 lesson).
         rec = "HOLD"
         source = "scoring_unavailable"
         reason = "HOLD: core.scoring unavailable; conservative fallback applied."
+        priority_band = "P4"
 
-    # -- Step 4: write the final row fields -------------------------
+    # -- Step 4: write the final row fields atomically --------------
+    # `recommendation` and `recommendation_detailed` are written together so
+    # they cannot diverge (Bug C). recommendation_source is forced to the
+    # engine's source-vocabulary contract (engine / provider_override /
+    # empty_row / scoring_unavailable), NOT scoring.py's
+    # "scoring.py v5.3.0" tag — that tag is informative but not in our
+    # vocabulary.
     row["recommendation"] = rec
     row["recommendation_detailed"] = rec
     row["recommendation_source"] = source
     row["recommendation_reason"] = reason
     row["recommendation_priority"] = _recommendation_priority(rec)
+    if priority_band:
+        row["recommendation_priority_band"] = priority_band
 
     # Scoring schema version stamp (informational; not yet a required
     # canonical column).
@@ -1840,6 +2067,17 @@ def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
     _classify_recommendation_8tier(row)
     _build_top_factors_and_risks(row)
     _phase_ii_quality_forecast(row)
+    # v5.73.1 SAFETY RE-CALL: re-run the classifier AFTER Phase-II completes.
+    # Phase-II refines expected_roi_3m, forecast_confidence, and related fields;
+    # without this re-call the recommendation would be frozen against pre-Phase-II
+    # values (the v5.73.0 sequencing bug observed in the CINF.US JSON, which
+    # showed conf=55.0 in the reason despite confidence_score=77.52 being the
+    # final value). The re-call is idempotent — apply_canonical_recommendation
+    # is invoked with overwrite=True inside _classify_recommendation_8tier — so
+    # it is safe to call here regardless of whether the first call succeeded.
+    # This also corrects the GPOR.US/SD.US Recommendation-vs-Detail mismatch by
+    # rewriting both fields atomically from the final post-Phase-II scores.
+    _classify_recommendation_8tier(row)
     return row
 
 
@@ -2328,31 +2566,70 @@ _EMPTY_ROW_DERIVED_KEYS: Tuple[str, ...] = (
 
 
 def _is_empty_data_row(row: Mapping[str, Any]) -> bool:
-    """Return True when the row has no usable provider data.
+    """v5.73.1 — Return True when the row has no usable provider data for
+    scoring. Two cases qualify as "empty":
 
-    Heuristic: ZERO non-null/non-zero values across the price block,
-    fundamental block, AND derived block. A row that has even ONE
-    populated value among these blocks is considered non-empty and
-    proceeds through normal scoring.
+      1. **All-block empty (legacy v5.73.0 case)**: zero populated values
+         across the price block, fundamental block, AND derived block. This
+         is the case for symbols where the provider returned nothing at all
+         (e.g. invalid ticker, complete API failure).
+
+      2. **Fundamentals-empty (new v5.73.1 case)**: zero populated values in
+         the fundamental block, regardless of whether price/derived blocks
+         are populated. This catches rows like KAR.US, ZOMATO.NSE,
+         HINDUNILVR.NSE, PRX.JSE, SGE.LSE, TLX.XETRA, etc. — symbols where
+         Yahoo Finance fetched the price but failed to fetch fundamentals
+         (only `yahoo_fundamentals_enrichment_applied:recommendation`
+         appears in warnings, no other applied fields). v5.73.0's all-block
+         heuristic missed these because price data was populated. They
+         received a fabricated mid-50s overall_score from
+         _compute_scores_fallback and a REDUCE recommendation built on top
+         of nothing real.
+
+         The fundamentals-empty branch is strict: it ONLY fires when ALL
+         four fundamental keys (market_cap, revenue_ttm, eps_ttm, pe_ttm)
+         are null or zero. A row with even one populated fundamental
+         proceeds through normal scoring.
+
+         IMPORTANT: This branch is GATED by the presence of price data —
+         if both price AND fundamentals are empty, that's case (1) and the
+         row is empty for any reason; if neither price nor fundamentals
+         are empty, it's a normal row. The new case-2 logic only changes
+         behavior for the "price-yes, fundamentals-no" combination, which
+         is the new empty-row class.
     """
     if not isinstance(row, Mapping):
         return False
-    pop = 0
-    for k in _EMPTY_ROW_PRICE_KEYS + _EMPTY_ROW_FUNDAMENTAL_KEYS + _EMPTY_ROW_DERIVED_KEYS:
-        v = row.get(k)
+
+    def _has_value(key: str) -> bool:
+        v = row.get(key)
         if v is None:
-            continue
+            return False
         if isinstance(v, str) and not v.strip():
-            continue
+            return False
         fv = _as_float(v)
         if fv is None:
-            # Non-numeric string with content -> populated
-            pop += 1
-        elif fv != 0.0:
-            pop += 1
-        if pop >= 1:
-            return False
-    return True
+            # Non-numeric string with content counts as populated.
+            return True
+        return fv != 0.0
+
+    price_pop = sum(1 for k in _EMPTY_ROW_PRICE_KEYS if _has_value(k))
+    fund_pop = sum(1 for k in _EMPTY_ROW_FUNDAMENTAL_KEYS if _has_value(k))
+    derived_pop = sum(1 for k in _EMPTY_ROW_DERIVED_KEYS if _has_value(k))
+
+    # Case 1: legacy all-empty.
+    if price_pop == 0 and fund_pop == 0 and derived_pop == 0:
+        return True
+
+    # Case 2 (v5.73.1): fundamentals empty. Fires regardless of price/derived
+    # populated state. Rows in this case are price-only enrichment failures
+    # and cannot be reliably scored on fundamentals (would yield fabricated
+    # mid-50s overall_score with REDUCE recommendation). Conservative HOLD
+    # is the correct outcome.
+    if fund_pop == 0:
+        return True
+
+    return False
 
 
 def _mark_row_as_empty(row: Dict[str, Any]) -> None:
@@ -4047,6 +4324,33 @@ def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[
 
 
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
+    # v5.73.1: wire _apply_v572_sanitization at the top of the scoring fallback
+    # so polluted financial ratios get nulled BEFORE scoring runs against them.
+    # The function returns a dict counting how many of each kind of value was
+    # sanitized; the per-row counts are merged into the row as sanitized:* tags
+    # via _v573_append_warning so downstream audit can see which rows were
+    # cleaned.
+    #
+    # Without this wiring, v5.73.0 was silently scoring rows like BOX.US with
+    # D/E=2048, INFY.NS with EV/EBITDA=1022, and MO with P/B=-38 — yielding
+    # implausible scores anchored on poisoned ratios. The function was already
+    # defined in v5.72.0 but never called.
+    try:
+        sanitized_counts = _apply_v572_sanitization(row)
+    except Exception as exc:
+        sanitized_counts = None
+        # Don't block scoring on a sanitization error; just record it.
+        err = f"_apply_v572_sanitization: {type(exc).__name__}: {exc}"
+        errs = row.get("scoring_errors")
+        if isinstance(errs, list):
+            errs.append(err)
+        else:
+            row["scoring_errors"] = [err]
+    if sanitized_counts and isinstance(sanitized_counts, dict):
+        for ratio_name, count in sanitized_counts.items():
+            if count and isinstance(count, (int, float)) and count > 0:
+                _v573_append_warning(row, f"sanitized:{ratio_name}")
+
     price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
     pe = _as_float(row.get("pe_ttm"))
     pb = _as_float(row.get("pb_ratio"))
@@ -6306,7 +6610,19 @@ class DataEngineV5:
     ) -> UnifiedQuote:
         page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, schema=schema, extras=kwargs)
         provider_profile = self._provider_profile_key(normalize_symbol(symbol), page_context)
-        key = f"quote:{normalize_symbol(symbol)}:{provider_profile}:{'cache' if use_cache else 'live'}"
+        # v5.73.1: route the singleflight key through _make_cache_key so the
+        # schema version and page context are baked into the cache identity.
+        # v5.73.0 defined _make_cache_key but never called it; this is the
+        # primary call site. Without schema-versioned keys, a v5.73.0-shape
+        # cache entry can be silently returned by a v5.73.1 engine and bypass
+        # the recommendation fix entirely.
+        key = _make_cache_key(
+            normalize_symbol(symbol),
+            page_context,
+            provider_profile,
+            _SCHEMA_VERSION,
+            mode="cache" if use_cache else "live",
+        )
         raw_q = await self._singleflight.execute(
             key,
             lambda: self._get_enriched_quote_impl(symbol, use_cache, page=page_context, body=body, schema=schema, **kwargs),
