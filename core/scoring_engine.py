@@ -2,8 +2,8 @@
 # core/scoring_engine.py
 """
 ================================================================================
-Scoring Engine -- v3.4.4
-(THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.2.8+
+Scoring Engine -- v3.5.0
+(THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.4.2+
  AND core.reco_normalize v7.2.0+)
 ================================================================================
 
@@ -14,199 +14,178 @@ this module routes those imports to the canonical implementations in
 `core.scoring`.
 
 ================================================================================
-================================================================================
-v3.4.4 changes (vs v3.4.3)  --  FIELD-NAME COLLISION FIX SYNC
-================================================================================
-
-core.scoring v5.2.7 -> v5.2.8 renamed its canonical-priority row field
-to avoid a collision with the schema v2.7.0 / data_engine_v2 v5.60.0
-Decision Matrix surface, which also emits a row field named
-`recommendation_priority` but with different semantics (int 1..8 for
-which 8-tier classifier rule fired, vs. string "P1".."P5" for the
-canonical priority band).
-
-v3.4.4 syncs the bridge to the new field name. Purely additive /
-mechanical:
-
-  Phase A -- Header docstring sync: reference core.scoring v5.2.8+
-             as the canonical floor.
-
-  Phase B -- Row-field constant rename:
-               _V527_CASCADE_BRIDGE_FIELDS  ->  _V528_CASCADE_BRIDGE_FIELDS
-             Element rename inside the tuple:
-               "recommendation_priority"    ->  "recommendation_priority_band"
-             "recommendation_source" element unchanged.
-
-  Phase C -- get_degradation_report() field rename:
-               "v527_cascade_bridge_fields" ->  "v528_cascade_bridge_fields"
-             Type and shape unchanged (tuple of row-field strings).
-
-  Phase D -- Re-exported helper signatures unchanged:
-               derive_canonical_recommendation, apply_canonical_recommendation,
-               RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES,
-               PRIO_P1..PRIO_P5
-             All getattr() fallbacks preserved verbatim.
-
-  Phase E -- is_cascade_bridged() helper unchanged. The
-             _CASCADE_BRIDGE_SYMBOLS tuple still tracks the same 9
-             symbols (the API surface didn't change, only the
-             row-field NAME that compute_scores emits).
-
-  Phase F -- Version bump 3.4.3 -> 3.4.4.
-
-[PRESERVED -- strictly]
-  - Every v3.4.3 public name remains exported.
-  - is_view_aware, is_audit_hardened, is_reco_rule_id_aware,
-    is_cascade_bridged all unchanged.
-  - All v3.4.2 / v3.4.1 / v3.4.0 surface preserved.
-  - The RECOMMENDATION_SOURCE_TAG constant re-exported from
-    core.scoring auto-tracks v5.2.8 ("scoring.py v5.2.8") via the
-    f-string in core.scoring; bridge consumers comparing against the
-    constant get the right value automatically.
-
-No API consumer needs to change unless they were reading the field
-key by literal `"recommendation_priority"` -- which downstream
-investment_advisor_engine, data_engine_v2, and Apps Script
-04_Format.gs callers will be updated to do, all of which are still
-pending behind this bridge update.
-
-================================================================================
-v3.4.3 changes (vs v3.4.2)  --  v5.2.7 CASCADE-BRIDGE AWARENESS
+v3.5.0 changes (vs v3.4.4)  --  v5.4.2 / v5.5.0 ALIGNMENT
 ================================================================================
 
-v3.4.2 documented core.scoring v5.2.5 as the canonical floor. Since
-then core.scoring has advanced one more revision:
+core.scoring has advanced through v5.3.0 -> v5.4.0 -> v5.4.1 -> v5.4.2
+-> v5.5.0 since v3.4.4 was cut. The bridge was operating correctly
+against all of those versions thanks to the getattr() fallback
+pattern, but was under-advertising the new surface (downstream
+modules importing via the bridge could not reach symbols added since
+v5.2.8). v3.5.0 closes that gap.
 
-  core.scoring v5.2.7 (May 13 2026 -- CASCADE-DISCREPANCY FIX):
-    Closes the structural cascade-discrepancy surfaced by the May 13
-    audit (24 of 140 rows showing top-line `Recommendation` disagreeing
-    with the bracketed [VERDICT] inside `Recommendation Detail`).
-    Makes core.scoring the SINGLE SOURCE OF TRUTH for the recommendation
-    label, with provenance tracking so downstream engines
-    (investment_advisor_engine, data_engine_v2) can detect a
-    canonically-scored row and skip parallel re-computation.
+What advanced in core.scoring since v5.2.8
+-------------------------------------------
+  v5.3.0: Compatibility wrappers for data_engine_v2 v5.71.0
+            (_recommendation, _risk_bucket, _confidence_bucket).
+            Closed final recommendation enum
+            (STRONG_BUY/BUY/HOLD/REDUCE/SELL/STRONG_SELL exported as
+            RECOMMENDATION_ENUM). Module-level threshold constants
+            (RISK_BUCKET_THRESHOLDS, CONFIDENCE_BUCKET_THRESHOLDS).
+            Nullable overall_score for insufficient inputs.
+            opportunity_source field with provenance. New
+            compute_opportunity_score_with_source helper.
+            scoring_schema_version field.
 
-    Two new public functions:
-      * derive_canonical_recommendation(row, *, settings=None)
-            -> (recommendation, reason, priority)
-        Read the canonical (recommendation, reason, priority) triple
-        from a row that has already been scored. Lightweight -- does
-        NOT re-run the full compute_scores pipeline (no
-        insights_builder, no sector batch pass).
-      * apply_canonical_recommendation(row, *, settings=None, overwrite=False)
-            -> patch dict
-        Drop-in replacement for legacy `_compute_recommendation` and
-        `_recommendation_from_scores` calls scattered in downstream
-        engines. The `overwrite=False` mode is idempotent (returns {}
-        when the row already carries the provenance tag).
+  v5.4.0: Horizon-aware ROI selection. Forecast patch full overwrite
+            (clears stale ROI). Valuation ratio-only fallback.
+            Provider sanity (dividend yield, debt/equity).
+            recommendation_detail field. derive_risk_view now
+            delegates to risk_bucket (single source of truth).
 
-    New module-level constants:
-      * RECOMMENDATION_SOURCE_TAG -- f"scoring.py v{__version__}"
-        emitted into row["recommendation_source"] for provenance.
-      * CANONICAL_PRIORITIES -- tuple ("P1", "P2", "P3", "P4", "P5")
-      * PRIO_P1..PRIO_P5 -- individual enum constants
+  v5.4.1: recommendation_detail rebuild after batch insights pass.
+            _active_roi_for_horizon truthful FALLBACK labels.
+            ScoringEngine clones DEFAULT_SCORING_WEIGHTS /
+            DEFAULT_FORECAST_PARAMETERS. risk_moderate_threshold
+            compat alias property. -0.70 unit-mismatch floor.
 
-    Two new row fields produced by compute_scores / score_row /
-    enrich_with_scores:
-      * recommendation_priority_band   (str; "P1".."P5" bucket)
-      * recommendation_source     (str; provenance tag)
+  v5.4.2: Mid-text legacy label substitution narrowed to finance
+            jargon (no longer corrupts narrative containing common
+            English words like WATCH / ACCUMULATE / NEUTRAL).
 
-    The scoring math, recommendation ladder, coherence guard, and
-    insights_builder integration are all unchanged from v5.2.6.
+  v5.5.0: Env-tunable bucket thresholds (SCORING_RISK_LOW,
+            SCORING_RISK_HIGH, SCORING_CONFIDENCE_MODERATE,
+            SCORING_CONFIDENCE_HIGH). scoring_errors deduplication
+            in compute_scores. opportunity_source granularity
+            (valuation_only_fallback / momentum_only_fallback /
+            both_present_fallback / roi_based / insufficient).
+            Public diagnostic helpers get_canonical_thresholds() and
+            get_canonical_state() for ops tooling.
 
-v3.4.3 closes the bridge's awareness of the v5.2.7 cascade-bridge
-rollout. No new public function signatures introduced by the bridge
-itself -- the cross-stack additions are simple passthroughs (new
-helpers re-exported, new row fields documented). The bridge exposes
-them via introspection helpers and the degradation report.
+Bridge changes in v3.5.0
+------------------------
 
-  Phase A -- Header docstring sync: reference core.scoring v5.2.7+ as
-             canonical floor. Enumerate v5.2.7 cascade-bridge surface.
+  Phase A -- Header docstring sync: reference core.scoring v5.4.2+
+             (or v5.5.0+) as canonical floor. Enumerate the new
+             public surface.
 
-  Phase B -- Re-export the v5.2.7 cascade-bridge symbols:
-               * derive_canonical_recommendation (function)
-               * apply_canonical_recommendation (function)
-               * RECOMMENDATION_SOURCE_TAG (str constant)
-               * CANONICAL_PRIORITIES (tuple)
-               * PRIO_P1, PRIO_P2, PRIO_P3, PRIO_P4, PRIO_P5 (str constants)
-             All fetched via getattr with None fallback so a deployment
-             still running core.scoring v5.2.0-v5.2.6 gets a working
-             bridge with degraded-mode report rather than ImportError.
+  Phase B -- Re-export new public symbols (all via getattr() fallback
+             so a deployment still on a pre-v5.4.2 core.scoring gets
+             a working bridge with degraded-mode report rather than
+             ImportError):
+               * RECOMMENDATION_ENUM           (v5.3.0+)
+               * RISK_BUCKET_THRESHOLDS        (v5.3.0+)
+               * CONFIDENCE_BUCKET_THRESHOLDS  (v5.3.0+)
+               * BUCKETS_CANONICAL             (v5.2.9+)
+               * compute_opportunity_score_with_source  (v5.3.0+)
+               * get_canonical_thresholds      (v5.5.0+)
+               * get_canonical_state           (v5.5.0+)
+               * DEFAULT_SCORING_WEIGHTS       (alias completion of
+                                                DEFAULT_WEIGHTS)
+               * DEFAULT_FORECAST_PARAMETERS   (alias completion of
+                                                DEFAULT_FORECASTS)
 
-  Phase C -- NEW _V528_CASCADE_BRIDGE_FIELDS tuple listing the two
-             additional row fields produced by compute_scores in
-             v5.2.7+: recommendation_priority_band, recommendation_source.
-             Mirror to _V525_ENRICHMENT_FIELDS. Callers introspect via
-             this constant to know what fields to expect from
-             canonically-scored rows. Added to __all__.
+  Phase C -- Re-export the private compatibility wrappers added in
+             v5.3.0 for data_engine_v2 v5.71.0, in case any consumer
+             imports them via the bridge:
+               * _recommendation
+               * _risk_bucket
+               * _confidence_bucket
 
-  Phase D -- NEW _CASCADE_BRIDGE_SYMBOLS tuple tracking the v5.2.7
-             surface in the degradation report. Optional category
-             (not required for bridge function); reports separately so
-             a deployment running pre-v5.2.7 still gets a working
-             bridge with a degraded-mode flag rather than ImportError.
+  Phase D -- NEW _V540_DETAIL_FIELDS tuple listing the row fields
+             added in v5.3.0 / v5.4.0 that are not already in
+             _V525_ENRICHMENT_FIELDS or _V528_CASCADE_BRIDGE_FIELDS:
+               * recommendation_detail   (v5.4.0+; "P# [VERDICT]: ...")
+               * scoring_schema_version  (v5.3.0+; equals SCORING_VERSION)
+               * opportunity_source      (v5.3.0+; provenance tag)
+             Mirror of the existing _V525 / _V528 field-contract
+             constants.
 
-  Phase E -- NEW is_cascade_bridged() helper, mirror of is_view_aware,
-             is_audit_hardened, is_reco_rule_id_aware. Quick boolean
-             for "are we on core.scoring v5.2.7+?".
+  Phase E -- NEW _BUCKET_ALIGNMENT_SYMBOLS tuple tracking the v5.3.0+
+             bucket-canonical public surface. Tracked separately from
+             the cascade-bridge symbols so a deployment running
+             v5.2.7-v5.2.9 still gets a working bridge with a
+             partial-alignment flag.
 
-  Phase F -- Extended get_degradation_report():
-               * cascade_bridge_symbols: {symbol: present_bool}
-               * missing_cascade_bridge: [symbols]
-               * cascade_bridge_enabled: bool
-               * v528_cascade_bridge_fields: tuple
+  Phase F -- NEW is_bucket_aligned() helper, mirror of is_view_aware,
+             is_audit_hardened, is_reco_rule_id_aware,
+             is_cascade_bridged. Quick boolean for
+             "are we on core.scoring v5.3.0+ with the canonical bucket
+             surface?"
+
+  Phase G -- Extended get_degradation_report():
+               * bucket_alignment_symbols: {symbol: present_bool}
+               * missing_bucket_alignment: [symbols]
+               * bucket_alignment_enabled: bool
+               * risk_thresholds: tuple  (actual resolved values at
+                                          core.scoring import time)
+               * confidence_thresholds: tuple  (same)
+               * buckets_canonical_enabled: bool  (mirrors
+                                                   BUCKETS_CANONICAL)
+               * v540_detail_fields: tuple
              Existing report fields preserved verbatim.
 
-  Phase G -- Version bump 3.4.2 -> 3.4.3.
+  Phase H -- Version bump 3.4.4 -> 3.5.0. Minor bump because the
+             public re-export surface widens; no breaking changes
+             and no removals.
 
 [PRESERVED -- strictly]
-  - All v3.4.2 features: __version__ alias, _V525_ENRICHMENT_FIELDS,
-    _RECO_RULE_ID_SYMBOLS, is_reco_rule_id_aware().
-  - All v3.4.1 features: score_views_completeness re-export,
-    _AUDIT_HARDENING_SYMBOLS category, is_audit_hardened().
-  - All v3.4.0 features: view-derivation symbol re-exports
-    (derive_fundamental_view, derive_technical_view, derive_risk_view,
-    derive_value_view) and view-awareness reporting.
-  - All v3.3.x and earlier public API surface.
-  - No removals from __all__. New optional helpers and tracking
-    categories only.
+  - Every v3.4.4 public name remains exported.
+  - is_view_aware, is_audit_hardened, is_reco_rule_id_aware,
+    is_cascade_bridged all unchanged.
+  - _V525_ENRICHMENT_FIELDS unchanged.
+  - _V528_CASCADE_BRIDGE_FIELDS unchanged (this is the v5.2.8 field-
+    rename marker, not a generic "current contract" handle; renaming
+    it to _V542_* would break callers that already read it).
+  - RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5
+    auto-track core.scoring's __version__ via its f-string.
 
-API surface (additions in v3.4.3):
-  - derive_canonical_recommendation, apply_canonical_recommendation
-  - RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES
-  - PRIO_P1, PRIO_P2, PRIO_P3, PRIO_P4, PRIO_P5
-  - _V528_CASCADE_BRIDGE_FIELDS (private constant)
-  - is_cascade_bridged (bridge-level helper)
-
-================================================================================
-v3.4.2 changes (preserved verbatim)
-================================================================================
-- __version__ = VERSION alias (TFB module convention).
-- _V525_ENRICHMENT_FIELDS tuple (conviction_score, top_factors,
-  top_risks, position_size_hint).
-- _RECO_RULE_ID_SYMBOLS tuple tracking reco_normalize v7.2.0 surface.
-- is_reco_rule_id_aware() helper.
-- Extended get_degradation_report() with reco_rule_id tracking.
+API surface (additions in v3.5.0):
+  - RECOMMENDATION_ENUM, RISK_BUCKET_THRESHOLDS,
+    CONFIDENCE_BUCKET_THRESHOLDS, BUCKETS_CANONICAL,
+    compute_opportunity_score_with_source
+  - get_canonical_thresholds, get_canonical_state (v5.5.0)
+  - DEFAULT_SCORING_WEIGHTS, DEFAULT_FORECAST_PARAMETERS
+    (alias completion)
+  - _recommendation, _risk_bucket, _confidence_bucket (private compat)
+  - _V540_DETAIL_FIELDS (private constant)
+  - _BUCKET_ALIGNMENT_SYMBOLS (private constant)
+  - is_bucket_aligned (bridge-level helper)
 
 ================================================================================
-v3.4.1 changes (preserved verbatim)
+v3.4.4 changes (preserved verbatim)
 ================================================================================
-- score_views_completeness re-export from core.scoring v5.2.0+.
-- _AUDIT_HARDENING_SYMBOLS tracking category.
-- is_audit_hardened() helper.
+Field-name collision fix sync: core.scoring v5.2.7 -> v5.2.8 renamed
+the canonical-priority row field from `recommendation_priority` to
+`recommendation_priority_band` to avoid collision with the schema
+v2.7.0 / data_engine_v2 v5.60.0 Decision Matrix surface, which also
+emits a row field named `recommendation_priority` but with different
+semantics (int 1..8 for which 8-tier classifier rule fired, vs
+string "P1".."P5" for the canonical priority band). The bridge
+synced to this rename: _V527_CASCADE_BRIDGE_FIELDS ->
+_V528_CASCADE_BRIDGE_FIELDS, element rename inside the tuple,
+get_degradation_report() field rename.
 
 ================================================================================
-v3.4.0 changes (preserved)
+v3.4.3 changes (preserved verbatim)
 ================================================================================
-- Recognize the four view-derivation symbols added in core.scoring
-  v5.0.0 (derive_fundamental_view, derive_technical_view,
-  derive_risk_view, derive_value_view) and surface them via
-  __all__ + the degradation report.
+v5.2.7 cascade-bridge awareness: re-export of
+derive_canonical_recommendation, apply_canonical_recommendation,
+RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5.
+_V527/_V528_CASCADE_BRIDGE_FIELDS tuple. _CASCADE_BRIDGE_SYMBOLS
+category and is_cascade_bridged() helper. Extended
+get_degradation_report() with cascade-bridge tracking.
 
 ================================================================================
-v3.3.0 and earlier
+v3.4.2 and earlier (preserved verbatim)
 ================================================================================
-Bridge contract for the v4.x scoring family. Preserved unchanged.
+- __version__ = VERSION alias (v3.4.2).
+- _V525_ENRICHMENT_FIELDS, _RECO_RULE_ID_SYMBOLS,
+  is_reco_rule_id_aware() (v3.4.2).
+- score_views_completeness re-export, _AUDIT_HARDENING_SYMBOLS,
+  is_audit_hardened() (v3.4.1).
+- Four view-derivation symbols and view-awareness reporting (v3.4.0).
+- Bridge contract for the v4.x scoring family (v3.3.x and earlier).
 
 API surface (preserved exports):
 - VERSION, __version__
@@ -229,14 +208,19 @@ API surface (preserved exports):
 - score_views_completeness
 - ScoringError, InvalidHorizonError, MissingDataError
 - get_degradation_report, is_view_aware, is_audit_hardened,
-  is_reco_rule_id_aware, is_cascade_bridged [v3.4.3]
+  is_reco_rule_id_aware, is_cascade_bridged, is_bucket_aligned [v3.5.0]
 - _V525_ENRICHMENT_FIELDS
-- _V528_CASCADE_BRIDGE_FIELDS [v3.4.3]
-- derive_canonical_recommendation [v3.4.3]
-- apply_canonical_recommendation [v3.4.3]
-- RECOMMENDATION_SOURCE_TAG [v3.4.3]
-- CANONICAL_PRIORITIES [v3.4.3]
-- PRIO_P1, PRIO_P2, PRIO_P3, PRIO_P4, PRIO_P5 [v3.4.3]
+- _V528_CASCADE_BRIDGE_FIELDS
+- _V540_DETAIL_FIELDS [v3.5.0]
+- derive_canonical_recommendation, apply_canonical_recommendation
+- RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES
+- PRIO_P1..PRIO_P5
+- RECOMMENDATION_ENUM, RISK_BUCKET_THRESHOLDS,
+  CONFIDENCE_BUCKET_THRESHOLDS, BUCKETS_CANONICAL [v3.5.0]
+- compute_opportunity_score_with_source [v3.5.0]
+- get_canonical_thresholds, get_canonical_state [v3.5.0]
+- DEFAULT_SCORING_WEIGHTS, DEFAULT_FORECAST_PARAMETERS [v3.5.0]
+- _recommendation, _risk_bucket, _confidence_bucket [v3.5.0]
 ================================================================================
 """
 
@@ -253,7 +237,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # ---------------------------------------------------------------------------
 
-VERSION = "3.4.4"
+VERSION = "3.5.0"
 # v3.4.2 Phase B (preserved): __version__ alias matches TFB module
 # convention used by core.scoring v5.2.5+, core.reco_normalize v7.2.0+,
 # and insights_builder v7.0.0.
@@ -316,9 +300,20 @@ ScoreWeights = _core_scoring.ScoreWeights
 ScoringWeights = _core_scoring.ScoringWeights
 ForecastParameters = _core_scoring.ForecastParameters
 
-# Defaults
+# Defaults (v3.4.x preserved short aliases)
 DEFAULT_WEIGHTS = _core_scoring.DEFAULT_WEIGHTS
 DEFAULT_FORECASTS = _core_scoring.DEFAULT_FORECASTS
+
+# v3.5.0 Phase B: alias completion. core.scoring v5.3.0+ exposes both
+# DEFAULT_SCORING_WEIGHTS (canonical name) and DEFAULT_WEIGHTS (alias)
+# pointing at the same ScoreWeights() instance. We re-export both so
+# downstream code that uses either name reaches the bridge symbol
+# table successfully. getattr() fallback handles deployments on
+# older core.scoring releases that only expose the short name.
+DEFAULT_SCORING_WEIGHTS = getattr(_core_scoring, "DEFAULT_SCORING_WEIGHTS", DEFAULT_WEIGHTS)
+DEFAULT_FORECAST_PARAMETERS = getattr(
+    _core_scoring, "DEFAULT_FORECAST_PARAMETERS", DEFAULT_FORECASTS,
+)
 
 # Engine class (object-style API)
 ScoringEngine = _core_scoring.ScoringEngine
@@ -341,6 +336,17 @@ compute_quality_score = _core_scoring.compute_quality_score
 compute_risk_score = _core_scoring.compute_risk_score
 compute_opportunity_score = _core_scoring.compute_opportunity_score
 compute_confidence_score = _core_scoring.compute_confidence_score
+
+# v3.5.0 Phase B: opportunity score with provenance source tag
+# (v5.3.0+). Returns (score, source_tag) where source_tag is one of
+# "roi_based" / "valuation_only_fallback" / "momentum_only_fallback" /
+# "both_present_fallback" / "insufficient". The three "_fallback"
+# variants are v5.5.0 granularity over the prior single
+# "valuation_momentum_fallback" tag. Getattr fallback so pre-v5.3.0
+# deployments still load this bridge cleanly.
+compute_opportunity_score_with_source = getattr(
+    _core_scoring, "compute_opportunity_score_with_source", None,
+)
 
 # Signal helpers
 rsi_signal = _core_scoring.rsi_signal
@@ -370,9 +376,43 @@ compute_recommendation = _core_scoring.compute_recommendation
 normalize_recommendation_code = _core_scoring.normalize_recommendation_code
 CANONICAL_RECOMMENDATION_CODES = _core_scoring.CANONICAL_RECOMMENDATION_CODES
 
+# v3.5.0 Phase B: closed final recommendation enum (v5.3.0+). Same
+# tuple as CANONICAL_RECOMMENDATION_CODES; surfaced under its public
+# name for symmetry with the upstream contract. getattr() fallback
+# for pre-v5.3.0 deployments.
+RECOMMENDATION_ENUM = getattr(_core_scoring, "RECOMMENDATION_ENUM", CANONICAL_RECOMMENDATION_CODES)
+
 # Buckets
 risk_bucket = _core_scoring.risk_bucket
 confidence_bucket = _core_scoring.confidence_bucket
+
+# v3.5.0 Phase B: module-level threshold constants (v5.3.0+). Surfaced
+# so audit / diagnostic tooling can read the canonical thresholds
+# without parsing env vars or guessing. Each is a tuple (low, high)
+# for risk (0-100 scale) and (moderate_floor, high_floor) for
+# confidence (0-1 fraction). getattr() fallback returns None for
+# pre-v5.3.0 deployments; consumers should treat None as
+# "thresholds not exposed" and fall back to risk_bucket()/
+# confidence_bucket() calls directly.
+RISK_BUCKET_THRESHOLDS = getattr(_core_scoring, "RISK_BUCKET_THRESHOLDS", None)
+CONFIDENCE_BUCKET_THRESHOLDS = getattr(_core_scoring, "CONFIDENCE_BUCKET_THRESHOLDS", None)
+
+# v3.5.0 Phase B: canonical-bucket availability flag (v5.2.9+). True
+# when core.scoring is routing its bucket helpers through core.buckets
+# rather than the local fallback; False otherwise. None when the
+# core.scoring deployment predates the flag entirely.
+BUCKETS_CANONICAL = getattr(_core_scoring, "BUCKETS_CANONICAL", None)
+
+# v3.5.0 Phase B: v5.5.0 ops diagnostic helpers. Both are no-arg
+# functions returning a dict. get_canonical_thresholds() returns
+# just the resolved threshold pairs + env-override flags;
+# get_canonical_state() returns a full ops snapshot (version, source
+# tag, BUCKETS_CANONICAL, thresholds, env-override flags,
+# recommendation_enum, canonical_priorities, active ScoringConfig).
+# Both are intended for diagnostic / audit tooling that needs to
+# confirm what the running scoring process is actually using.
+get_canonical_thresholds = getattr(_core_scoring, "get_canonical_thresholds", None)
+get_canonical_state = getattr(_core_scoring, "get_canonical_state", None)
 
 # Main scoring entry points
 compute_scores = _core_scoring.compute_scores
@@ -387,6 +427,26 @@ score_and_rank_rows = _core_scoring.score_and_rank_rows
 
 
 # =============================================================================
+# v3.5.0 Phase C — Private compatibility wrappers (defensive re-export)
+# =============================================================================
+#
+# core.scoring v5.3.0 introduced three private-prefixed wrappers
+# specifically so data_engine_v2 v5.71.0 could import them without
+# falling back to conservative HOLD defaults. The canonical import
+# target is `from core.scoring import _recommendation, _risk_bucket,
+# _confidence_bucket`, but we re-export them via the bridge too in
+# case any module imports them from `core.scoring_engine` instead.
+#
+# All getattr() so pre-v5.3.0 deployments load this bridge cleanly
+# with None values rather than AttributeError at import time. The
+# bucket_alignment degradation report flags pre-v5.3.0 deployments.
+
+_recommendation = getattr(_core_scoring, "_recommendation", None)
+_risk_bucket = getattr(_core_scoring, "_risk_bucket", None)
+_confidence_bucket = getattr(_core_scoring, "_confidence_bucket", None)
+
+
+# =============================================================================
 # v3.4.3 Phase B — Re-export core.scoring v5.2.7+ cascade-bridge symbols
 # =============================================================================
 #
@@ -398,16 +458,6 @@ score_and_rank_rows = _core_scoring.score_and_rank_rows
 # All getattr() fallbacks so a deployment still running core.scoring
 # v5.2.0-v5.2.6 gets None values and a clean degradation report,
 # rather than an ImportError that would brick the bridge entirely.
-#
-# Consumers downstream:
-#   - investment_advisor_engine (drop-in replacement for
-#     _recommendation_from_scores via apply_canonical_recommendation)
-#   - data_engine_v2 (drop-in replacement for _compute_recommendation
-#     via the same call)
-#   - Apps Script 04_Format.gs (priority bucket read from
-#     row["recommendation_priority_band"] instead of recomputed locally)
-#   - Top10 / Insights pages (canonical reason text with priority
-#     prefix)
 
 derive_canonical_recommendation = getattr(
     _core_scoring, "derive_canonical_recommendation", None,
@@ -440,13 +490,6 @@ PRIO_P5 = getattr(_core_scoring, "PRIO_P5", None)
 # / score_row / enrich_with_scores. They are dict entries on the
 # returned row, not standalone functions, so they don't need
 # re-export. But callers benefit from knowing what to expect.
-# This constant lets downstream code introspect the field contract
-# without re-deriving the names from scratch.
-#
-# Consumers downstream:
-#   - insights_builder v7.0.0 Phase B (Top Picks enrichment)
-#   - top10_selector (when it advances)
-#   - any future advisor / portfolio-allocation layer
 
 _V525_ENRICHMENT_FIELDS: Tuple[str, ...] = (
     "conviction_score",     # float, 0-100
@@ -457,31 +500,63 @@ _V525_ENRICHMENT_FIELDS: Tuple[str, ...] = (
 
 
 # =============================================================================
-# v3.4.3 Phase C — v5.2.7 cascade-bridge row-field contract (NEW)
+# v3.4.3 Phase C — v5.2.7/v5.2.8 cascade-bridge row-field contract (PRESERVED)
 # =============================================================================
 #
 # core.scoring v5.2.7 adds two row fields produced by compute_scores
-# / score_row / enrich_with_scores. Mirror to _V525_ENRICHMENT_FIELDS.
-# These are dict entries on the returned row, set centrally by
-# _compute_priority + the RECOMMENDATION_SOURCE_TAG constant so the
-# top-line Recommendation column and the downstream Recommendation
-# Detail formatter cannot diverge by construction.
-#
-# Consumers downstream:
-#   - investment_advisor_engine: reads recommendation_source to decide
-#     whether to recompute (idempotency guard)
-#   - data_engine_v2: same idempotency guard for its
-#     _compute_recommendation path
-#   - Apps Script 04_Format.gs: reads recommendation_priority_band to build
-#     the "P# [VERDICT]: Fund X | Tech Y | Risk Z | Val W" Detail
-#     string
-#   - audit_data_quality: correlates recommendation_priority_band against
-#     its own AlertPriority enum for cross-stack audit reports
-#   - Diagnostic_Report sheet: groups rows by recommendation_priority_band
+# / score_row / enrich_with_scores. v5.2.8 renamed the first one to
+# resolve a collision with schema v2.7.0. Mirror to
+# _V525_ENRICHMENT_FIELDS.
 
 _V528_CASCADE_BRIDGE_FIELDS: Tuple[str, ...] = (
     "recommendation_priority_band",  # str; "P1".."P5" canonical priority bucket
-    "recommendation_source",    # str; "scoring.py v5.2.7" provenance tag
+    "recommendation_source",    # str; "scoring.py vX.Y.Z" provenance tag
+)
+
+
+# =============================================================================
+# v3.5.0 Phase D — v5.3.0+/v5.4.0+ detail-field contract (NEW)
+# =============================================================================
+#
+# core.scoring v5.3.0 and v5.4.0 added three additional row fields
+# produced by compute_scores that are not in _V525 or _V528 above.
+# Tracked separately so consumers can introspect "what fields does
+# a row carry after v5.4.0+ scoring" without re-deriving from scratch.
+#
+#   recommendation_detail   (v5.4.0+):
+#       Format: "P# [VERDICT]: <structured reason>"
+#       Built from priority + canonical_rec + structured_reason at the
+#       end of compute_scores. Rebuilt by score_and_rank_rows after
+#       the batch insights pass so it cannot become stale.
+#
+#   scoring_schema_version  (v5.3.0+):
+#       String equal to core.scoring.SCORING_VERSION. Useful for
+#       cache invalidation: if a row's recorded version doesn't match
+#       the running version, the row should be re-scored.
+#
+#   opportunity_source      (v5.3.0+; granularity added in v5.5.0):
+#       Provenance tag on the opportunity_score field. One of:
+#         - "roi_based"
+#         - "valuation_only_fallback"   (v5.5.0+)
+#         - "momentum_only_fallback"    (v5.5.0+)
+#         - "both_present_fallback"     (v5.5.0+)
+#         - "valuation_momentum_fallback"  (v5.3.0-v5.4.2, legacy)
+#         - "insufficient"
+#       Pre-v5.5.0 deployments emit the legacy single fallback tag.
+#
+# Consumers downstream:
+#   - Apps Script 04_Format.gs: reads recommendation_detail directly
+#     instead of reconstructing it from rec + priority + reason.
+#   - audit_data_quality / Diagnostic_Report: groups by
+#     opportunity_source for "where do opportunity scores come from"
+#     audits.
+#   - Any cache layer: invalidates rows whose scoring_schema_version
+#     doesn't match the running SCORING_VERSION.
+
+_V540_DETAIL_FIELDS: Tuple[str, ...] = (
+    "recommendation_detail",      # str; "P# [VERDICT]: reason"  (v5.4.0+)
+    "scoring_schema_version",     # str; equals SCORING_VERSION  (v5.3.0+)
+    "opportunity_source",         # str; opportunity provenance  (v5.3.0+)
 )
 
 
@@ -493,7 +568,8 @@ _V528_CASCADE_BRIDGE_FIELDS: Tuple[str, ...] = (
 # which fell back. Useful for diagnosing whether the deployed
 # scoring_engine is properly wired up to the v5.0.0+ view-aware logic
 # AND the v5.2.0+ audit-hardening surface AND the v5.2.7+ cascade-
-# bridge surface, vs an older scoring module.
+# bridge surface AND the v5.3.0+ bucket-alignment surface, vs an
+# older scoring module.
 
 # v5.0.0-era contract: bridge requires these to function at all.
 # Missing any of them is "degraded mode".
@@ -520,8 +596,6 @@ _REQUIRED_CORE_SYMBOLS: Tuple[str, ...] = (
 )
 
 # View-derivation symbols added in scoring v5.0.0 / scoring_engine v3.4.0.
-# Missing any of these means "running pre-v5.0.0 -- no view-aware
-# recommendations". Bridge still works but capabilities are reduced.
 _VIEW_SYMBOLS: Tuple[str, ...] = (
     "derive_fundamental_view",
     "derive_technical_view",
@@ -530,20 +604,11 @@ _VIEW_SYMBOLS: Tuple[str, ...] = (
 )
 
 # v3.4.1: Audit-hardening symbols added in scoring v5.2.0+.
-# Missing any of these means "running v5.0.0-v5.1.x -- view-aware but
-# without the audit-driven verification surface". Bridge still works
-# but operators lose some diagnostic capabilities.
 _AUDIT_HARDENING_SYMBOLS: Tuple[str, ...] = (
     "score_views_completeness",
 )
 
 # v3.4.2 Phase D: reco_normalize v7.2.0+ rule_id introspection symbols.
-# Missing means "running reco_normalize v7.0.0-v7.1.x -- 5-tier
-# vocabulary works but rule_id introspection isn't available".
-# Optional category: bridge function not affected. We track a
-# representative subset of the RULE_ID_* constants rather than all
-# 14 (any one of them being present means all 14 are present since
-# they're defined together in reco_normalize v7.2.0).
 _RECO_RULE_ID_SYMBOLS: Tuple[str, ...] = (
     "recommendation_from_views_with_rule_id",
     "RULE_ID_INSUFFICIENT_DATA_NO_SIGNALS",
@@ -553,15 +618,6 @@ _RECO_RULE_ID_SYMBOLS: Tuple[str, ...] = (
 )
 
 # v3.4.3 Phase D: core.scoring v5.2.7+ cascade-bridge symbols.
-# Missing any of these means "running pre-v5.2.7 -- top-line and
-# Detail recommendations may disagree because downstream engines
-# (investment_advisor_engine, data_engine_v2) lack a single canonical
-# source to read from". Optional category: bridge function not
-# affected; reports separately so a deployment running v5.2.0-v5.2.6
-# still gets a working bridge with a degraded-mode flag rather than
-# an ImportError. We track a representative subset of the new
-# surface (any one of them being present means all of them are
-# present since they're defined together in core.scoring v5.2.7).
 _CASCADE_BRIDGE_SYMBOLS: Tuple[str, ...] = (
     "derive_canonical_recommendation",
     "apply_canonical_recommendation",
@@ -572,6 +628,28 @@ _CASCADE_BRIDGE_SYMBOLS: Tuple[str, ...] = (
     "PRIO_P3",
     "PRIO_P4",
     "PRIO_P5",
+)
+
+# v3.5.0 Phase E: core.scoring v5.3.0+ bucket-alignment surface.
+# Tracks the public bucket-canonical contract. v5.2.9 introduced
+# BUCKETS_CANONICAL alone; v5.3.0 added the threshold constants, the
+# closed recommendation enum, and the opportunity-source helper.
+# v5.5.0 added the two diagnostic helpers. Missing any of these
+# means "running pre-v5.5.0 -- bucket math may be inline rather than
+# canonical, and ops cannot inspect resolved thresholds via the
+# diagnostic helpers". Optional category: the bridge still functions,
+# but downstream audit/diagnostic tooling loses introspection.
+_BUCKET_ALIGNMENT_SYMBOLS: Tuple[str, ...] = (
+    "RECOMMENDATION_ENUM",
+    "RISK_BUCKET_THRESHOLDS",
+    "CONFIDENCE_BUCKET_THRESHOLDS",
+    "BUCKETS_CANONICAL",
+    "compute_opportunity_score_with_source",
+    "_recommendation",
+    "_risk_bucket",
+    "_confidence_bucket",
+    "get_canonical_thresholds",
+    "get_canonical_state",
 )
 
 _REQUIRED_RECO_SYMBOLS: Tuple[str, ...] = (
@@ -601,25 +679,34 @@ def get_degradation_report() -> Dict[str, Any]:
         v7.2.0+ rule_id introspection (added v3.4.2)
       - cascade_bridge_symbols: dict of {symbol: present_bool} for
         v5.2.7+ canonical recommendation source-of-truth (added v3.4.3)
+      - bucket_alignment_symbols: dict of {symbol: present_bool} for
+        v5.3.0+ canonical bucket surface (added v3.5.0)
+      - risk_thresholds: tuple or None (the actual values resolved at
+        import time; surfaced for ops diagnostic; added v3.5.0)
+      - confidence_thresholds: tuple or None (same; added v3.5.0)
+      - buckets_canonical_enabled: bool or None (mirrors
+        BUCKETS_CANONICAL; True when core.scoring is routing through
+        core.buckets; added v3.5.0)
       - v525_enrichment_fields: tuple of row field names produced by
         compute_scores in v5.2.5+ (added v3.4.2)
       - v528_cascade_bridge_fields: tuple of row field names produced
-        by compute_scores in v5.2.7+ (added v3.4.3)
+        by compute_scores in v5.2.7+ / v5.2.8 (added v3.4.3)
+      - v540_detail_fields: tuple of row field names produced by
+        compute_scores in v5.3.0+ / v5.4.0+ (added v3.5.0)
       - import_log: list of successful/failed import attempts
-      - missing_critical: list of missing CRITICAL symbols (degraded mode)
-      - missing_view: list of missing view derivers (running pre-v5.0.0
-        scoring module without view-aware logic)
+      - missing_critical: list of missing CRITICAL symbols
+      - missing_view: list of missing view derivers
       - missing_audit_hardening: list of missing v5.2.0+ helpers
-        (running v5.0.0-v5.1.x scoring without audit-driven
-        verification surface)
-      - missing_reco_rule_id: list of missing v7.2.0+ helpers (added v3.4.2)
+      - missing_reco: list of missing reco symbols
+      - missing_reco_rule_id: list of missing v7.2.0+ helpers
       - missing_cascade_bridge: list of missing v5.2.7+ helpers
-        (running pre-v5.2.7 scoring without cascade-bridge surface;
-        added v3.4.3)
+      - missing_bucket_alignment: list of missing v5.3.0+ helpers
+        (added v3.5.0)
       - view_aware_recommendation_enabled: bool (v3.4.0+)
       - audit_hardening_enabled: bool (v3.4.1+)
       - reco_rule_id_aware_enabled: bool (v3.4.2+)
       - cascade_bridge_enabled: bool (v3.4.3+)
+      - bucket_alignment_enabled: bool (v3.5.0+)
 
     Returns:
         Dict[str, Any]: The degradation report.
@@ -627,15 +714,16 @@ def get_degradation_report() -> Dict[str, Any]:
     core_present = {sym: hasattr(_core_scoring, sym) for sym in _REQUIRED_CORE_SYMBOLS}
     view_present = {sym: hasattr(_core_scoring, sym) for sym in _VIEW_SYMBOLS}
     audit_present = {sym: hasattr(_core_scoring, sym) for sym in _AUDIT_HARDENING_SYMBOLS}
-    # v3.4.3 Phase F: track cascade-bridge surface.
     cascade_present = {
         sym: hasattr(_core_scoring, sym) for sym in _CASCADE_BRIDGE_SYMBOLS
+    }
+    # v3.5.0 Phase G: track bucket-alignment surface.
+    bucket_align_present = {
+        sym: hasattr(_core_scoring, sym) for sym in _BUCKET_ALIGNMENT_SYMBOLS
     }
 
     if _reco_normalize is not None:
         reco_present = {sym: hasattr(_reco_normalize, sym) for sym in _REQUIRED_RECO_SYMBOLS}
-        # v3.4.2 Phase D: track rule_id surface separately so a v7.0.0-v7.1.x
-        # deployment isn't reported as "missing critical".
         reco_rule_id_present = {
             sym: hasattr(_reco_normalize, sym) for sym in _RECO_RULE_ID_SYMBOLS
         }
@@ -650,8 +738,26 @@ def get_degradation_report() -> Dict[str, Any]:
     missing_audit_hardening = [sym for sym, ok in audit_present.items() if not ok]
     missing_reco = [sym for sym, ok in reco_present.items() if not ok]
     missing_reco_rule_id = [sym for sym, ok in reco_rule_id_present.items() if not ok]
-    # v3.4.3 Phase F: missing cascade-bridge symbols.
     missing_cascade_bridge = [sym for sym, ok in cascade_present.items() if not ok]
+    # v3.5.0 Phase G: missing bucket-alignment list.
+    missing_bucket_alignment = [
+        sym for sym, ok in bucket_align_present.items() if not ok
+    ]
+
+    # v3.5.0 Phase G: surface actual resolved threshold values for ops
+    # diagnostic. None means "deployed core.scoring predates v5.3.0".
+    risk_thresholds_resolved: Optional[Tuple[float, ...]] = None
+    confidence_thresholds_resolved: Optional[Tuple[float, ...]] = None
+    if RISK_BUCKET_THRESHOLDS is not None:
+        try:
+            risk_thresholds_resolved = tuple(RISK_BUCKET_THRESHOLDS)
+        except Exception:
+            risk_thresholds_resolved = None
+    if CONFIDENCE_BUCKET_THRESHOLDS is not None:
+        try:
+            confidence_thresholds_resolved = tuple(CONFIDENCE_BUCKET_THRESHOLDS)
+        except Exception:
+            confidence_thresholds_resolved = None
 
     return {
         "bridge_version": VERSION,
@@ -662,24 +768,28 @@ def get_degradation_report() -> Dict[str, Any]:
         "audit_hardening_symbols": audit_present,
         "reco_symbols": reco_present,
         "reco_rule_id_symbols": reco_rule_id_present,
-        # v3.4.3 Phase F: cascade-bridge surface report.
         "cascade_bridge_symbols": cascade_present,
-        # v3.4.2 Phase C: surface the v5.2.5 enrichment field contract so
-        # downstream consumers (insights_builder, top10_selector, etc.)
-        # can introspect what fields compute_scores produces.
+        # v3.5.0 Phase G: bucket-alignment report.
+        "bucket_alignment_symbols": bucket_align_present,
+        # v3.5.0 Phase G: actual resolved threshold values.
+        "risk_thresholds": risk_thresholds_resolved,
+        "confidence_thresholds": confidence_thresholds_resolved,
+        "buckets_canonical_enabled": (
+            None if BUCKETS_CANONICAL is None else bool(BUCKETS_CANONICAL)
+        ),
         "v525_enrichment_fields": tuple(_V525_ENRICHMENT_FIELDS),
-        # v3.4.3 Phase C: surface the v5.2.7 cascade-bridge field contract
-        # so downstream consumers (investment_advisor_engine,
-        # data_engine_v2, Apps Script 04_Format.gs) can introspect.
         "v528_cascade_bridge_fields": tuple(_V528_CASCADE_BRIDGE_FIELDS),
+        # v3.5.0 Phase D: surface the v5.3.0+/v5.4.0+ detail field contract.
+        "v540_detail_fields": tuple(_V540_DETAIL_FIELDS),
         "import_log": list(_import_attempt_log),
         "missing_critical": missing_critical,
         "missing_view": missing_view,
         "missing_audit_hardening": missing_audit_hardening,
         "missing_reco": missing_reco,
         "missing_reco_rule_id": missing_reco_rule_id,
-        # v3.4.3 Phase F: missing cascade-bridge list.
         "missing_cascade_bridge": missing_cascade_bridge,
+        # v3.5.0 Phase G: missing bucket-alignment list.
+        "missing_bucket_alignment": missing_bucket_alignment,
         "view_aware_recommendation_enabled": (
             len(missing_view) == 0
             and "recommendation_from_views" in reco_present
@@ -687,8 +797,9 @@ def get_degradation_report() -> Dict[str, Any]:
         ),
         "audit_hardening_enabled": len(missing_audit_hardening) == 0,
         "reco_rule_id_aware_enabled": len(missing_reco_rule_id) == 0,
-        # v3.4.3 Phase F: cascade-bridge enabled flag.
         "cascade_bridge_enabled": len(missing_cascade_bridge) == 0,
+        # v3.5.0 Phase G: bucket-alignment enabled flag.
+        "bucket_alignment_enabled": len(missing_bucket_alignment) == 0,
     }
 
 
@@ -712,17 +823,6 @@ def is_audit_hardened() -> bool:
 
     Returns False if core.scoring lacks any v5.2.0+ helpers
     (currently: score_views_completeness). Mirror of is_view_aware().
-
-    Note: this checks for the v5.2.0+ public API surface. The v5.2.3
-    behavioural hardenings (no-fabricated-confidence, recommendation
-    coherence guard, risk penalty rebalance, revenue-collapse
-    haircut, forecast unit-mismatch guard, illiquid skip) plus the
-    v5.2.4 cross-stack tags (engine_dropped_valuation, provider_error)
-    plus the v5.2.5 enrichment field production (conviction_score,
-    top_factors, top_risks, position_size_hint) plus the v5.2.6
-    shape-aware upside detection are behaviour-only changes and
-    cannot be detected by symbol presence alone. Use SCORING_VERSION
-    for that.
     """
     return get_degradation_report().get("audit_hardening_enabled", False)
 
@@ -738,14 +838,7 @@ def is_reco_rule_id_aware() -> bool:
       - the four representative RULE_ID_* constants
       - the bridge can't reach core.reco_normalize at all
 
-    Mirror of is_view_aware() and is_audit_hardened(). Useful for
-    audit pipelines that want to surface rule_id information when
-    available without crashing on older reco_normalize deployments.
-
-    Note: the v7.2.0 conviction floor env-vars
-    (RECO_STRONG_BUY_CONVICTION_FLOOR / RECO_BUY_CONVICTION_FLOOR)
-    are behaviour-only -- check RECO_NORMALIZE version directly via
-    the degradation report's `reco_normalize_version` field.
+    Mirror of is_view_aware() and is_audit_hardened().
     """
     return get_degradation_report().get("reco_rule_id_aware_enabled", False)
 
@@ -762,26 +855,43 @@ def is_cascade_bridged() -> bool:
       - RECOMMENDATION_SOURCE_TAG (str constant)
       - CANONICAL_PRIORITIES (tuple)
       - PRIO_P1..PRIO_P5 (str constants)
-
-    Mirror of is_view_aware(), is_audit_hardened(),
-    is_reco_rule_id_aware(). The downstream engines
-    (investment_advisor_engine, data_engine_v2) call this to decide
-    whether to use the canonical apply_canonical_recommendation call
-    or fall back to their own recommendation derivation logic.
-
-    Returns True when the cascade-bridge surface is fully present,
-    meaning the top-line `Recommendation` column and the downstream
-    `Recommendation Detail` priority bucket are guaranteed to agree
-    on canonically-scored rows.
-
-    Note: the v5.2.7 behavioural change (compute_scores emits
-    recommendation_priority_band + recommendation_source on every row)
-    is signalled by the presence of these row fields; check
-    `_V528_CASCADE_BRIDGE_FIELDS` against a sample compute_scores
-    output dict to verify the actual emission, not just the symbol
-    surface.
     """
     return get_degradation_report().get("cascade_bridge_enabled", False)
+
+
+def is_bucket_aligned() -> bool:
+    """
+    v3.5.0 Phase F: Quick boolean check: is the deployed pipeline
+    running core.scoring v5.3.0+/v5.5.0+ with the canonical bucket
+    surface fully present?
+
+    Returns True when core.scoring exposes ALL of:
+      - RECOMMENDATION_ENUM (closed final recommendation tuple)
+      - RISK_BUCKET_THRESHOLDS / CONFIDENCE_BUCKET_THRESHOLDS
+      - BUCKETS_CANONICAL flag
+      - compute_opportunity_score_with_source
+      - _recommendation / _risk_bucket / _confidence_bucket (private
+        compat wrappers required by data_engine_v2 v5.71.0)
+      - get_canonical_thresholds / get_canonical_state (v5.5.0 ops
+        diagnostic helpers)
+
+    Mirror of is_view_aware(), is_audit_hardened(),
+    is_reco_rule_id_aware(), is_cascade_bridged(). A False result is
+    not a fatal degradation; the bridge function is unaffected. But
+    audit / diagnostic tooling that relies on the bucket-alignment
+    surface (e.g. reading RISK_BUCKET_THRESHOLDS directly to verify
+    35/70 alignment across the stack, or calling
+    get_canonical_state() to confirm env tuning took effect) needs
+    this flag to be True.
+
+    Note: BUCKETS_CANONICAL is a separate concept -- it indicates
+    whether core.scoring is routing its bucket helpers through
+    core.buckets at runtime. is_bucket_aligned() concerns the public
+    SYMBOL SURFACE; BUCKETS_CANONICAL concerns the RUNTIME BEHAVIOR.
+    Both can be True, both can be False, or one can be True without
+    the other.
+    """
+    return get_degradation_report().get("bucket_alignment_enabled", False)
 
 
 # =============================================================================
@@ -820,7 +930,6 @@ def _legacy_scoring_engine_init(*args: Any, **kwargs: Any) -> ScoringEngine:
 __all__ = [
     # Version
     "VERSION",
-    # v3.4.2 Phase B: __version__ alias
     "__version__",
     "SCORING_VERSION",
     # Enums
@@ -836,6 +945,9 @@ __all__ = [
     # Defaults
     "DEFAULT_WEIGHTS",
     "DEFAULT_FORECASTS",
+    # v3.5.0 Phase B: default alias completion
+    "DEFAULT_SCORING_WEIGHTS",
+    "DEFAULT_FORECAST_PARAMETERS",
     # Horizon
     "detect_horizon",
     "get_weights_for_horizon",
@@ -848,6 +960,8 @@ __all__ = [
     "compute_risk_score",
     "compute_opportunity_score",
     "compute_confidence_score",
+    # v3.5.0 Phase B: opportunity score with provenance source
+    "compute_opportunity_score_with_source",
     # Signals
     "rsi_signal",
     "short_term_signal",
@@ -864,17 +978,32 @@ __all__ = [
     "score_views_completeness",
     # v3.4.2 Phase C: v5.2.5 enrichment field contract
     "_V525_ENRICHMENT_FIELDS",
-    # v3.4.3 Phase C: v5.2.7 cascade-bridge field contract
+    # v3.4.3 Phase C: v5.2.7/v5.2.8 cascade-bridge field contract
     "_V528_CASCADE_BRIDGE_FIELDS",
+    # v3.5.0 Phase D: v5.3.0+/v5.4.0+ detail field contract
+    "_V540_DETAIL_FIELDS",
     # Periods
     "invest_period_label",
     # Recommendation
     "compute_recommendation",
     "normalize_recommendation_code",
     "CANONICAL_RECOMMENDATION_CODES",
+    # v3.5.0 Phase B: closed final recommendation enum
+    "RECOMMENDATION_ENUM",
     # Buckets
     "risk_bucket",
     "confidence_bucket",
+    # v3.5.0 Phase B: bucket threshold constants + canonical flag
+    "RISK_BUCKET_THRESHOLDS",
+    "CONFIDENCE_BUCKET_THRESHOLDS",
+    "BUCKETS_CANONICAL",
+    # v3.5.0 Phase B: v5.5.0 ops diagnostic helpers
+    "get_canonical_thresholds",
+    "get_canonical_state",
+    # v3.5.0 Phase C: private compat wrappers (data_engine_v2 v5.71.0)
+    "_recommendation",
+    "_risk_bucket",
+    "_confidence_bucket",
     # Main entry points
     "compute_scores",
     "score_row",
@@ -898,10 +1027,10 @@ __all__ = [
     "get_degradation_report",
     "is_view_aware",
     "is_audit_hardened",
-    # v3.4.2 Phase E: reco_normalize v7.2.0 awareness
     "is_reco_rule_id_aware",
-    # v3.4.3 Phase E: core.scoring v5.2.7 cascade-bridge awareness
     "is_cascade_bridged",
+    # v3.5.0 Phase F: bucket-alignment awareness helper
+    "is_bucket_aligned",
     # Exceptions
     "ScoringError",
     "InvalidHorizonError",
