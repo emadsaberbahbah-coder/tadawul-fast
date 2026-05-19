@@ -5,6 +5,60 @@
 Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.73.2
 ================================================================================
 
+================================================================================
+WHY v5.74.0 — SCORING SEQUENCE + ASSET-AWARE EMPTY GUARD + SCHEMA EXPANSION
+----------------------------------------------------------------------------
+v5.74.0 is a controlled production patch over v5.73.2. It preserves the
+v5.73.2 persistent-cache invalidation fix and applies only the remaining
+orchestration and projection fixes surfaced by the post-deploy audit.
+
+v5.74.0 CHANGES vs v5.73.2
+  Issue 1 — scoring sequence and stale recommendation outputs.
+    The quote pipeline now prepares intrinsic/upside and Phase-II forecast
+    inputs before the authoritative scoring pass, then clears stale
+    recommendation detail/reason/priority/source fields immediately before each
+    final recommendation rewrite. This removes the window where a downstream
+    reader could see a recommendation tuple built on default confidence or
+    pre-forecast ROI. The legacy local scoring entry point is retained only as a
+    compatibility delegator; the new _compute_scores_canonical_first path tries
+    core.scoring.compute_scores first and falls back to the local engine scorer
+    only if the canonical scorer is unavailable or raises.
+
+  Issue 2 — asset-aware empty-row guard.
+    The fundamentals-empty guard remains active for equity rows, including
+    foreign equities where provider fundamentals failed, but it no longer marks
+    FX pairs, futures, commodities, ETFs, funds, mutual funds, indices, or the
+    Commodities_FX / Mutual_Funds pages as empty merely because equity
+    fundamentals such as EPS, P/E, revenue, or market cap are absent.
+
+  Issue 3 — canonical schema expansion 97 -> 106.
+    The instrument schema now projects the nine scoring/provenance fields used
+    by the v5.74.0 engine and core.scoring v5.4.2 contract:
+      provider_rating, recommendation_source, recommendation_priority_band,
+      scoring_recommendation_source, scoring_schema_version, scoring_errors,
+      opportunity_source, overall_score_raw, overall_penalty_factor.
+    The fields are added consistently to INSTRUMENT_CANONICAL_KEYS,
+    INSTRUMENT_CANONICAL_HEADERS, _INSTRUMENT_CANONICAL_REQUIRED_KEYS, and
+    _CANONICAL_FIELD_ALIASES so projection, schema enforcement, and sheet output
+    stay aligned.
+
+  Issue 4 — scoring provenance preservation.
+    The engine continues to use its own recommendation_source vocabulary
+    (engine / provider_override / empty_row / scoring_unavailable), but the
+    scoring.py provenance tag is preserved separately in
+    scoring_recommendation_source. Additional scoring.py diagnostics are kept
+    when present: scoring_errors, scoring_schema_version, opportunity_source,
+    overall_score_raw, and overall_penalty_factor.
+
+PRESERVED — strictly:
+  The v5.73.2 cache namespace fix, _make_cache_key and versioned_provider_profile
+  pairing, provider recommendation trust gate, canonical 6-tier vocabulary,
+  v5.67.0 unit-contract behavior, v5.68.0 provider symbol normalization,
+  v5.70.0 schema-alignment behavior, v5.73.0 sanitization bounds, and the
+  legacy all-empty guard remain intact.
+
+================================================================================
+
 WHY v5.73.2 — CACHE-INVALIDATION HOTFIX FOR v5.73.1 (May 17, 2026)
 ------------------------------------------------------------------
 v5.73.2 is a single-line-of-intent surgical fix over v5.73.1. The v5.73.1
@@ -798,7 +852,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.73.2"
+__version__ = "5.74.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -899,13 +953,21 @@ try:
         _SCORING_RECOMMENDATION_ENUM = (
             "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL",
         )
+    try:
+        from core.scoring import compute_scores as _scoring_compute_scores
+        _SCORING_COMPUTE_SCORES_AVAILABLE = True
+    except Exception:
+        _scoring_compute_scores = None  # type: ignore
+        _SCORING_COMPUTE_SCORES_AVAILABLE = False
     _CORE_SCORING_AVAILABLE = True
 except Exception:  # pragma: no cover
     _scoring_recommendation = None  # type: ignore
     _scoring_risk_bucket = None  # type: ignore
     _scoring_confidence_bucket = None  # type: ignore
+    _scoring_compute_scores = None  # type: ignore
     _scoring_apply_canonical = None  # type: ignore
     _SCORING_APPLY_CANONICAL_AVAILABLE = False
+    _SCORING_COMPUTE_SCORES_AVAILABLE = False
     _SCORING_RECOMMENDATION_ENUM = (
         "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL",
     )
@@ -1728,6 +1790,7 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
                 row["scoring_errors"] = [err]
 
         if patch and isinstance(patch, dict):
+            _preserve_scoring_provenance(row, patch)
             rec_raw = patch.get("recommendation")
             rec_canon = _v573_collapse_to_canonical_enum(rec_raw)
             if rec_canon:
@@ -2158,23 +2221,28 @@ def detect_candlestick_patterns(rows: Any) -> Dict[str, Any]:
 def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(row, dict):
         return row
+
+    # v5.74.0 sequencing: data enrichment first, recommendation last.
+    # This function may be called before scoring and again after scoring.
+    # Before scoring it prepares intrinsic/upside and Phase-II forecast inputs.
+    # After scoring it derives views, writes the final recommendation, and
+    # rebuilds factors/risks from the final scored state.
     _synthesize_market_cap_if_zero(row)
     _compute_intrinsic_and_upside(row)
-    _derive_views(row)
-    _classify_recommendation_8tier(row)
-    _build_top_factors_and_risks(row)
     _phase_ii_quality_forecast(row)
-    # v5.73.1 SAFETY RE-CALL: re-run the classifier AFTER Phase-II completes.
-    # Phase-II refines expected_roi_3m, forecast_confidence, and related fields;
-    # without this re-call the recommendation would be frozen against pre-Phase-II
-    # values (the v5.73.0 sequencing bug observed in the CINF.US JSON, which
-    # showed conf=55.0 in the reason despite confidence_score=77.52 being the
-    # final value). The re-call is idempotent — apply_canonical_recommendation
-    # is invoked with overwrite=True inside _classify_recommendation_8tier — so
-    # it is safe to call here regardless of whether the first call succeeded.
-    # This also corrects the GPOR.US/SD.US Recommendation-vs-Detail mismatch by
-    # rewriting both fields atomically from the final post-Phase-II scores.
-    _classify_recommendation_8tier(row)
+
+    has_scores = any(
+        _as_float(row.get(k)) is not None
+        for k in ("overall_score", "valuation_score", "quality_score", "momentum_score", "opportunity_score")
+    )
+    if has_scores:
+        _derive_views(row)
+        _clear_recommendation_output_fields(row)
+        _classify_recommendation_8tier(row)
+        _build_top_factors_and_risks(row)
+        _clear_recommendation_output_fields(row)
+        _classify_recommendation_8tier(row)
+
     return row
 
 
@@ -2378,6 +2446,11 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
     "sector_relative_score", "conviction_score", "top_factors", "top_risks",
     "position_size_hint", "recommendation_detailed", "recommendation_priority",
+
+    "provider_rating", "recommendation_source",
+    "recommendation_priority_band", "scoring_recommendation_source",
+    "scoring_schema_version", "scoring_errors", "opportunity_source",
+    "overall_score_raw", "overall_penalty_factor",
     "candlestick_pattern", "candlestick_signal", "candlestick_strength",
     "candlestick_confidence", "candlestick_patterns_recent",
 ]
@@ -2410,6 +2483,11 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
     "Position Size Hint", "Recommendation Detail", "Reco Priority",
+
+    "Provider Rating", "Recommendation Source",
+    "Priority Band", "Scoring Reco Source",
+    "Scoring Schema Version", "Scoring Errors", "Opportunity Source",
+    "Overall Score (Raw)", "Overall Penalty Factor",
     "Candle Pattern", "Candle Signal", "Candle Strength",
     "Candle Confidence", "Recent Patterns (5D)",
 ]
@@ -2662,6 +2740,150 @@ _EMPTY_ROW_DERIVED_KEYS: Tuple[str, ...] = (
 )
 
 
+
+
+# =============================================================================
+# v5.74.0 — canonical scoring orchestration helpers
+# =============================================================================
+
+def _clear_recommendation_output_fields(row: Dict[str, Any]) -> None:
+    """Clear stale recommendation outputs before a fresh final rewrite.
+
+    This deliberately does NOT clear row["recommendation"]. The classifier reads
+    an upstream provider value from that field to populate provider_rating before
+    overwriting the final engine recommendation. Clearing it here would erase
+    provider-rating audit evidence.
+    """
+    if not isinstance(row, dict):
+        return
+    for key in (
+        "recommendation_detailed",
+        "recommendation_detail",
+        "recommendation_reason",
+        "recommendation_priority",
+        "recommendation_priority_band",
+        "recommendation_source",
+    ):
+        row.pop(key, None)
+
+
+def _coerce_scoring_errors_for_sheet(value: Any) -> Optional[str]:
+    """Return scoring_errors in sheet-safe string form."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, (list, tuple, set)):
+        parts = [_safe_str(v) for v in value if _safe_str(v)]
+        return "; ".join(parts) if parts else None
+    text = _safe_str(value)
+    return text or None
+
+
+def _preserve_scoring_provenance(row: Dict[str, Any], patch: Mapping[str, Any]) -> None:
+    """Preserve scoring.py provenance separately from engine source vocabulary."""
+    if not isinstance(row, dict) or not isinstance(patch, Mapping):
+        return
+
+    src = patch.get("recommendation_source")
+    if src:
+        row["scoring_recommendation_source"] = _safe_str(src)
+
+    errors_text = _coerce_scoring_errors_for_sheet(patch.get("scoring_errors"))
+    if errors_text:
+        row["scoring_errors"] = errors_text
+
+    for key in (
+        "scoring_schema_version",
+        "opportunity_source",
+        "overall_score_raw",
+        "overall_penalty_factor",
+    ):
+        if key in patch and patch.get(key) is not None:
+            row[key] = _json_safe(patch.get(key))
+
+
+def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
+    """Compute scores using core.scoring first; use local scoring only as fallback.
+
+    The canonical scorer may emit recommendation fields, but the engine remains
+    the final recommendation writer. Preserve upstream row["recommendation"] so
+    _classify_recommendation_8tier can still capture provider_rating correctly.
+    """
+    if not isinstance(row, dict):
+        return
+
+    if _SCORING_COMPUTE_SCORES_AVAILABLE and _scoring_compute_scores is not None:
+        try:
+            patch = _scoring_compute_scores(row)
+            if isinstance(patch, Mapping) and patch:
+                recommendation_owned_keys = {
+                    "recommendation",
+                    "recommendation_detailed",
+                    "recommendation_detail",
+                    "recommendation_reason",
+                    "recommendation_priority",
+                    "recommendation_priority_band",
+                    "recommendation_source",
+                }
+                safe_patch = {
+                    str(k): _json_safe(v)
+                    for k, v in patch.items()
+                    if str(k) not in recommendation_owned_keys
+                }
+                row.update(safe_patch)
+                _preserve_scoring_provenance(row, patch)
+                return
+        except Exception as exc:
+            logger.debug(
+                "[engine_v2 v%s] canonical scoring failed for %s: %s: %s",
+                __version__,
+                _safe_str(row.get("symbol") or row.get("requested_symbol") or row.get("ticker"), "UNKNOWN"),
+                exc.__class__.__name__,
+                exc,
+            )
+            existing = row.get("scoring_errors")
+            msg = f"canonical_scoring_failed:{type(exc).__name__}"
+            existing_text = _coerce_scoring_errors_for_sheet(existing)
+            row["scoring_errors"] = (existing_text + "; " + msg) if existing_text else msg
+
+    _compute_scores_local_fallback(row)
+
+
+def _compute_scores_fallback(row: Dict[str, Any]) -> None:
+    """Backward-compatible v5.74.0 delegator.
+
+    Older call sites may still import or call _compute_scores_fallback. Route
+    them through the canonical-first contract instead of the local scorer.
+    """
+    _compute_scores_canonical_first(row)
+
+
+def _empty_row_fundamentals_exempt(row: Mapping[str, Any]) -> bool:
+    """True when equity fundamentals are not required for the instrument."""
+    if not isinstance(row, Mapping):
+        return False
+
+    symbol = _safe_str(
+        row.get("symbol") or row.get("requested_symbol") or row.get("ticker")
+    ).upper()
+    asset_class = _safe_str(row.get("asset_class") or row.get("assetClass")).strip().lower()
+    page = _canonicalize_sheet_name(
+        _safe_str(row.get("_page_context") or row.get("page") or row.get("sheet") or row.get("sheet_name"))
+    )
+
+    if symbol.endswith("=X") or symbol.endswith("=F"):
+        return True
+    if asset_class in {
+        "fx", "currency", "currencies", "commodity", "commodities",
+        "future", "futures", "etf", "fund", "mutual fund", "mutual_fund",
+        "index", "indices",
+    }:
+        return True
+    if page in {"Commodities_FX", "Mutual_Funds"}:
+        return True
+    return False
+
 def _is_empty_data_row(row: Mapping[str, Any]) -> bool:
     """v5.73.1 — Return True when the row has no usable provider data for
     scoring. Two cases qualify as "empty":
@@ -2717,6 +2939,12 @@ def _is_empty_data_row(row: Mapping[str, Any]) -> bool:
     # Case 1: legacy all-empty.
     if price_pop == 0 and fund_pop == 0 and derived_pop == 0:
         return True
+
+    # v5.74.0: FX, commodities, ETFs, funds and similar instruments can be
+    # valid without equity fundamentals. Do not trigger the fundamentals-empty
+    # guard for those rows; only the all-empty guard above should suppress them.
+    if _empty_row_fundamentals_exempt(row):
+        return False
 
     # Case 2 (v5.73.1): fundamentals empty. Fires regardless of price/derived
     # populated state. Rows in this case are price-only enrichment failures
@@ -3352,6 +3580,11 @@ _INSTRUMENT_CANONICAL_REQUIRED_KEYS: frozenset = frozenset({
     # Recommendation
     "recommendation", "recommendation_reason",
     "recommendation_detailed", "recommendation_priority",
+
+    "provider_rating", "recommendation_source",
+    "recommendation_priority_band", "scoring_recommendation_source",
+    "scoring_schema_version", "scoring_errors", "opportunity_source",
+    "overall_score_raw", "overall_penalty_factor",
     # Provenance — the v5.69.0-deferred "empty Data Provider / Last Updated"
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
 })
@@ -3704,6 +3937,16 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "position_size_hint": ("position_size_hint", "positionSizeHint", "sizingHint", "sizing"),
     "recommendation_detailed": ("recommendation_detailed", "recommendationDetailed", "recommendationDetail", "reco_detail", "detailed_recommendation"),
     "recommendation_priority": ("recommendation_priority", "recoPriority", "priority", "reco_priority"),
+
+    "provider_rating": ("provider_rating", "providerRating", "provider_recommendation", "providerRecommendation"),
+    "recommendation_source": ("recommendation_source", "recommendationSource", "reco_source", "source_recommendation"),
+    "recommendation_priority_band": ("recommendation_priority_band", "priority_band", "recoPriorityBand", "recommendationPriorityBand"),
+    "scoring_recommendation_source": ("scoring_recommendation_source", "scoringRecommendationSource", "scoring_source", "scoringSource"),
+    "scoring_schema_version": ("scoring_schema_version", "scoringSchemaVersion", "scoreSchemaVersion"),
+    "scoring_errors": ("scoring_errors", "scoringErrors", "score_errors", "scoreErrors"),
+    "opportunity_source": ("opportunity_source", "opportunitySource"),
+    "overall_score_raw": ("overall_score_raw", "overallScoreRaw"),
+    "overall_penalty_factor": ("overall_penalty_factor", "overallPenaltyFactor"),
     "candlestick_pattern": ("candlestick_pattern", "candlePattern", "candlestickPattern", "pattern"),
     "candlestick_signal": ("candlestick_signal", "candleSignal", "candlestickSignal", "patternSignal"),
     "candlestick_strength": ("candlestick_strength", "candleStrength", "candlestickStrength", "patternStrength"),
@@ -4420,7 +4663,7 @@ def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[
     return [[_json_safe(row.get(k)) for k in keys] for row in rows or []]
 
 
-def _compute_scores_fallback(row: Dict[str, Any]) -> None:
+def _compute_scores_local_fallback(row: Dict[str, Any]) -> None:
     # v5.73.1: wire _apply_v572_sanitization at the top of the scoring fallback
     # so polluted financial ratios get nulled BEFORE scoring runs against them.
     # The function returns a dict counting how many of each kind of value was
@@ -4648,19 +4891,8 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
-    """v5.69.0 — RETIRED as an independent classifier.
-
-    This used to be a second, divergent 4-tier classifier (BUY /
-    ACCUMULATE / REDUCE / HOLD only) that competed with
-    `_classify_recommendation_8tier` and produced the
-    main-vs-Detail-vs-Reason disagreement seen on the dashboard.
-
-    It is kept as a thin delegator so the five existing call sites do
-    not need to change: every recommendation now flows through the
-    SINGLE authoritative 8-tier classifier, which also routes through
-    core.reco_normalize. Calling this on a row that already has a
-    consistent recommendation is idempotent.
-    """
+    """v5.74.0 — single canonical recommendation delegator."""
+    _clear_recommendation_output_fields(row)
     _classify_recommendation_8tier(row)
 
 
@@ -6592,7 +6824,8 @@ class DataEngineV5:
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
             row = _apply_symbol_context_defaults(row, symbol=_safe_str(symbol))
-            _compute_scores_fallback(row)
+            _compute_scores_canonical_first(row)
+            _clear_recommendation_output_fields(row)
             _compute_recommendation(row)
             return UnifiedQuote(**row)
 
@@ -6691,7 +6924,17 @@ class DataEngineV5:
         elif _as_float(row.get("current_price")) is None and not row.get("warnings"):
             row["warnings"] = "No live quote payload and no usable history fallback"
 
-        _compute_scores_fallback(row)
+        # v5.74.0: prepare intrinsic/upside and Phase-II forecast before final scoring.
+        try:
+            row = _apply_phase_dd_enhancements(row)
+        except Exception as dd_prepare_err:
+            logger.debug(
+                "[engine_v2 v%s] PHASE-DD pre-score enhancement failed for %s: %s: %s",
+                __version__, norm, dd_prepare_err.__class__.__name__, dd_prepare_err,
+            )
+
+        _compute_scores_canonical_first(row)
+        _clear_recommendation_output_fields(row)
         _compute_recommendation(row)
 
         try:
@@ -7005,7 +7248,8 @@ class DataEngineV5:
         for q in quotes:
             row = _model_to_dict(q)
             row = _apply_page_row_backfill("Top_10_Investments", row)
-            _compute_scores_fallback(row)
+            _compute_scores_canonical_first(row)
+            _clear_recommendation_output_fields(row)
             _compute_recommendation(row)
             rows.append(row)
 
@@ -7379,7 +7623,8 @@ class DataEngineV5:
                     if sym and sym in quote_map:
                         merged = _merge_missing_fields(merged, quote_map[sym])
                     merged = _apply_page_row_backfill(target_sheet, merged)
-                    _compute_scores_fallback(merged)
+                    _compute_scores_canonical_first(merged)
+                    _clear_recommendation_output_fields(merged)
                     _compute_recommendation(merged)
                     enriched_rows.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, merged)))
 
@@ -7430,7 +7675,8 @@ class DataEngineV5:
                 if best_snapshot_row:
                     row = _merge_missing_fields(row, best_snapshot_row)
                 row = _apply_page_row_backfill(target_sheet, row)
-                _compute_scores_fallback(row)
+                _compute_scores_canonical_first(row)
+                _clear_recommendation_output_fields(row)
                 _compute_recommendation(row)
                 rows_full.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)))
             _apply_rank_overall(rows_full)
