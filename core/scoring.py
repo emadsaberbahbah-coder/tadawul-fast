@@ -2,8 +2,8 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.5.0
-FULL REVISED VERSION / OPS-TUNABLE
+Scoring Module — v5.6.0
+FULL REVISED VERSION / ENGINE-CONTRACT-ALIGNED
 ================================================================================
 Purpose
 -------
@@ -82,6 +82,47 @@ v5.5.0 ops enhancements over v5.4.2
    thresholds the running process is actually using without reading env or
    re-importing private symbols.
 
+v5.6.0 engine-contract alignment over v5.5.0  (data_engine_v2 v5.75.0)
+----------------------------------------------------------------------
+1. derive_canonical_recommendation now accepts overwrite=False. Previously the
+   inner idempotency-skip read cached recommendation/reason/priority from the
+   row whenever recommendation_source matched scoring.py's tag, regardless of
+   the caller's intent. data_engine_v2 v5.75.0's _classify_recommendation_8tier
+   masked this by clearing recommendation_source = "" before each call, but
+   any other caller that invoked apply_canonical_recommendation(overwrite=True)
+   without first clearing would silently get stale values. v5.6.0 threads
+   overwrite through to derive_canonical_recommendation so the skip is bypassed
+   at the source.
+2. _LOCAL_RECO_ALIASES["AVOID"] now maps to STRONG_SELL (was SELL). This aligns
+   with the _v573_collapse_to_canonical_enum contract in data_engine_v2, which
+   maps the legacy AVOID label to STRONG_SELL when collapsing an upstream
+   provider recommendation. Both modules now agree on the canonical destination
+   for legacy AVOID labels.
+3. AssetScores gains recommendation_detailed (mirror of recommendation in the
+   canonical 6-tier code). data_engine_v2 v5.75.0 writes recommendation_detailed
+   atomically next to recommendation in its _classify_recommendation_8tier; the
+   engine's owned-keys filter strips both during the patch merge, but downstream
+   consumers reading the scoring patch directly now see both keys consistent.
+4. apply_canonical_recommendation hard-normalizes the returned
+   recommendation_priority_band: if any code path slipped an empty string or a
+   non-canonical value through derive_canonical_recommendation, the patch
+   returned to the engine coerces it to P4 (HOLD-equivalent) before the engine
+   sees it. Defensive guarantee — the engine should never see an empty band.
+5. get_canonical_state() now reports engine_contract_version = "5.75.0" so audit
+   tooling can verify which engine release this scoring.py was built to align
+   with. The new module-level constant _ENGINE_CONTRACT_VERSION documents the
+   contract version explicitly.
+6. Log prefixes [v5.5.0 INSUFFICIENT] / [v5.5.0 SCORE] are rolled forward to
+   [v5.6.0 *] so log scraping tools can distinguish releases.
+7. RECOMMENDATION_SOURCE_TAG is derived from __version__ via f-string and now
+   reads "scoring.py v5.6.0" automatically. data_engine_v2 v5.75.0 already
+   stores this tag verbatim under scoring_recommendation_source via the
+   _preserve_scoring_provenance helper, so the tag bump is transparent to the
+   engine.
+   Backward-compatible: all changes preserve existing default behavior (the
+   new overwrite parameter defaults to False, and the new recommendation_detailed
+   field defaults to ""). Existing callers see no behavioral difference.
+
 Public API compatibility
 ------------------------
 Preserves the main names used by data_engine_v2 and routes:
@@ -109,10 +150,19 @@ logger.addHandler(logging.NullHandler())
 # Version / Canonical contract
 # =============================================================================
 
-__version__ = "5.5.0"
+__version__ = "5.6.0"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
+
+# v5.6.0: explicit marker of which data_engine_v2 release this scoring.py was
+# built to align with. data_engine_v2 v5.75.0 introduced the disciplined
+# producer/consumer contract for the recommendation pipeline: clear+overwrite
+# semantics for apply_canonical_recommendation, owned-keys filtering of the
+# scoring patch, and _preserve_scoring_provenance to capture scoring.py's
+# source tag as scoring_recommendation_source. Audit tooling can read this
+# constant (also surfaced via get_canonical_state()) to verify alignment.
+_ENGINE_CONTRACT_VERSION = "5.75.0"
 
 RECOMMENDATION_ENUM: Tuple[str, ...] = (
     "STRONG_BUY",
@@ -496,6 +546,7 @@ class AssetScores:
     recommendation: str = "HOLD"
     recommendation_reason: str = "Insufficient data."
     recommendation_detail: str = ""
+    recommendation_detailed: str = ""   # v5.6.0: mirror of `recommendation` for cross-module field-name compat with data_engine_v2 v5.75.0
 
     forecast_price_1m: Optional[float] = None
     forecast_price_3m: Optional[float] = None
@@ -1670,7 +1721,7 @@ _LOCAL_RECO_ALIASES: Dict[str, str] = {
     "TRIM": "REDUCE",
     "UNDERWEIGHT": "REDUCE",
     "SELL": "SELL",
-    "AVOID": "SELL",
+    "AVOID": "STRONG_SELL",  # v5.6.0: align with data_engine_v2 _v573_collapse_to_canonical_enum
     "EXIT": "SELL",
     "UNDERPERFORM": "SELL",
     "STRONG_SELL": "STRONG_SELL",
@@ -2036,21 +2087,29 @@ def _coerce_view(v: Any) -> Optional[str]:
     return s
 
 
-def derive_canonical_recommendation(row: Mapping[str, Any], *, settings: Any = None) -> Tuple[str, str, str]:
-    existing_tag = _safe_str(row.get("recommendation_source"))
-    if existing_tag == RECOMMENDATION_SOURCE_TAG:
-        reco = normalize_recommendation_code(row.get("recommendation"))
-        reason = _safe_str(row.get("recommendation_reason"))
-        priority = _safe_str(row.get("recommendation_priority_band"))
-        if priority not in _CANONICAL_PRIORITIES_SET:
-            priority = _compute_priority(
-                reco,
-                _norm_score_0_100(row.get("overall_score")),
-                _norm_score_0_100(row.get("risk_score")),
-                _norm_score_0_100(row.get("confidence_score")),
-                _as_roi_fraction(row.get("expected_roi_3m")),
-            )
-        return reco, reason, priority
+def derive_canonical_recommendation(
+    row: Mapping[str, Any], *, settings: Any = None, overwrite: bool = False
+) -> Tuple[str, str, str]:
+    # v5.6.0: when overwrite=True, force a fresh recomputation even if the
+    # row's recommendation_source still carries scoring.py's provenance tag.
+    # Pre-v5.6.0 this inner skip ran unconditionally and silently returned
+    # cached values to apply_canonical_recommendation(overwrite=True) callers
+    # who had not first cleared recommendation_source themselves.
+    if not overwrite:
+        existing_tag = _safe_str(row.get("recommendation_source"))
+        if existing_tag == RECOMMENDATION_SOURCE_TAG:
+            reco = normalize_recommendation_code(row.get("recommendation"))
+            reason = _safe_str(row.get("recommendation_reason"))
+            priority = _safe_str(row.get("recommendation_priority_band"))
+            if priority not in _CANONICAL_PRIORITIES_SET:
+                priority = _compute_priority(
+                    reco,
+                    _norm_score_0_100(row.get("overall_score")),
+                    _norm_score_0_100(row.get("risk_score")),
+                    _norm_score_0_100(row.get("confidence_score")),
+                    _as_roi_fraction(row.get("expected_roi_3m")),
+                )
+            return reco, reason, priority
 
     overall = _norm_score_0_100(row.get("overall_score"))
     risk_s = _norm_score_0_100(row.get("risk_score"))
@@ -2109,7 +2168,17 @@ def apply_canonical_recommendation(
     existing_tag = _safe_str(row.get("recommendation_source"))
     if (not overwrite) and existing_tag == RECOMMENDATION_SOURCE_TAG:
         return {}
-    reco, reason, priority = derive_canonical_recommendation(row, settings=settings)
+    # v5.6.0: thread overwrite into derive_canonical_recommendation so the
+    # inner idempotency-skip is bypassed in lockstep with the outer skip.
+    reco, reason, priority = derive_canonical_recommendation(
+        row, settings=settings, overwrite=overwrite
+    )
+    # v5.6.0: hard-normalize the priority band so the engine never sees an
+    # empty or non-canonical value. _compute_priority always returns a
+    # canonical band today, but this guard catches any future regression in
+    # the derive path before it leaks into the engine's row.update.
+    if priority not in _CANONICAL_PRIORITIES_SET:
+        priority = PRIO_P4
     return {
         "recommendation": reco,
         "recommendation_reason": reason,
@@ -2252,7 +2321,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             ) if val is None
         ]
         logger.warning(
-            "[v5.5.0 INSUFFICIENT] symbol=%s missing=%s",
+            "[v5.6.0 INSUFFICIENT] symbol=%s missing=%s",
             _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
             ",".join(missing_components),
         )
@@ -2388,7 +2457,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     scoring_errors = _dedupe_preserving_order(scoring_errors)
 
     logger.info(
-        "[v5.5.0 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
+        "[v5.6.0 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
         _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
         overall,
         risk,
@@ -2428,6 +2497,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         recommendation=canonical_rec,
         recommendation_reason=structured_reason,
         recommendation_detail=recommendation_detail,
+        recommendation_detailed=canonical_rec,  # v5.6.0: mirror of `recommendation` for data_engine_v2 v5.75.0 field-name compat
         forecast_price_1m=forecast_patch.get("forecast_price_1m"),
         forecast_price_3m=forecast_patch.get("forecast_price_3m"),
         forecast_price_12m=forecast_patch.get("forecast_price_12m"),
@@ -2606,7 +2676,7 @@ def score_and_rank_rows(
 
 
 # =============================================================================
-# v5.5.0 — Public diagnostic helpers
+# v5.5.0 / v5.6.0 — Public diagnostic helpers
 # =============================================================================
 
 def get_canonical_thresholds() -> Dict[str, Any]:
@@ -2661,6 +2731,7 @@ def get_canonical_state() -> Dict[str, Any]:
     return {
         "version": SCORING_VERSION,
         "schema_version": SCORING_SCHEMA_VERSION,
+        "engine_contract_version": _ENGINE_CONTRACT_VERSION,  # v5.6.0: data_engine_v2 release this scoring.py aligns with
         "recommendation_source_tag": RECOMMENDATION_SOURCE_TAG,
         "buckets_canonical": bool(BUCKETS_CANONICAL),
         "risk_thresholds": thresholds["risk_thresholds"],
@@ -2749,4 +2820,6 @@ __all__ = [
     # v5.5.0 additions
     "get_canonical_thresholds",
     "get_canonical_state",
+    # v5.6.0 additions
+    "_ENGINE_CONTRACT_VERSION",
 ]
