@@ -2,9 +2,9 @@
 # core/scoring_engine.py
 """
 ================================================================================
-Scoring Engine -- v3.5.0
-(THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.4.2+
- AND core.reco_normalize v7.2.0+)
+Scoring Engine -- v3.6.0
+(THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.7.0+
+ AND core.reco_normalize v8.0.0+)
 ================================================================================
 
 This module is a pure compatibility shim. All scoring logic lives in
@@ -14,7 +14,213 @@ this module routes those imports to the canonical implementations in
 `core.scoring`.
 
 ================================================================================
-v3.5.0 changes (vs v3.4.4)  --  v5.4.2 / v5.5.0 ALIGNMENT
+v3.6.0 changes (vs v3.5.0)  --  v5.6.0 / v5.7.0 / v8.0.0 ALIGNMENT
+================================================================================
+
+core.scoring has advanced through v5.6.0 -> v5.7.0 since v3.5.0 was
+cut, and core.reco_normalize has advanced from v7.2.1 to v8.0.0. The
+bridge was operating correctly against all of those versions thanks
+to the getattr() fallback pattern, but was under-advertising the
+new surface:
+
+  - the v5.6.0 / v5.7.0 contract-version markers
+    (_ENGINE_CONTRACT_VERSION, _RECO_NORMALIZE_CONTRACT_VERSION) are
+    not re-exported, so audit tooling reading the bridge cannot
+    reach them
+  - the v5.6.0 row field `recommendation_detailed` is not in any
+    field-contract tuple, so consumers introspecting the post-
+    compute_scores schema via the bridge miss it
+  - the v8.0.0 reco_normalize vocabulary expansion (ACCUMULATE,
+    STRONG_SELL, AVOID added as canonical tiers; new RULE_ID_*
+    constants; WORST_ORDINAL widened to 7) is invisible to the
+    degradation report -- it shows 8-tier RECOMMENDATION_ENUM through
+    the existing bucket-alignment check, but cannot distinguish a
+    deployment with reco_normalize v8.0.0 (8-tier-aware) from one
+    where scoring.py v5.7.0 emits 8 tiers but reco_normalize is
+    still on v7.2.x (vocabulary mismatch -- ACCUMULATE / AVOID
+    round-trip back through normalize_recommendation_code()
+    incorrectly).
+
+v3.6.0 closes those three gaps. No removals; strictly additive.
+
+What advanced in core.scoring since v5.5.0
+-------------------------------------------
+  v5.6.0: data_engine_v2 v5.75.0 engine-contract alignment.
+            derive_canonical_recommendation accepts overwrite=False
+            and threads it through (was unconditionally honoring
+            the inner idempotency-skip). _LOCAL_RECO_ALIASES["AVOID"]
+            -> STRONG_SELL (cross-stack alignment for collapse).
+            AssetScores gains recommendation_detailed (mirror of
+            recommendation for field-name compat). Hard-normalize
+            recommendation_priority_band -> P4 if any path returned
+            a non-canonical value. get_canonical_state() reports
+            engine_contract_version = "5.75.0". RECOMMENDATION_SOURCE_TAG
+            auto-bumps via __version__ f-string.
+
+  v5.7.0: core.reco_normalize v8.0.0 vocabulary expansion.
+            RECOMMENDATION_ENUM widened 6 tiers -> 8 tiers, adding
+            ACCUMULATE (between BUY and HOLD) and AVOID (after
+            STRONG_SELL). Signal enum widened symmetrically.
+            _LOCAL_RECO_ALIASES: ACCUMULATE -> ACCUMULATE (was BUY),
+            AVOID -> AVOID (was STRONG_SELL); v5.6.0's collapse is
+            obsolete now that AVOID is its own canonical tier. New
+            scale-in synonyms (SCALE_IN, BUILD_POSITION, PHASE_IN,
+            etc) routing to ACCUMULATE; new uninvestable synonyms
+            (UNINVESTABLE, DO_NOT_BUY, BLACKLIST, STAY_AWAY, etc)
+            routing to AVOID. compute_recommendation() ladder gains
+            AVOID branches at the top (score < 15 OR
+            bearish/bearish/expensive view consensus); the two
+            former "Watch / accumulate candidate" HOLD branches
+            (MONTH and LONG horizons) become ACCUMULATE proper,
+            thresholds preserved verbatim. STRONG_SELL reason text
+            tightened from "require urgent exit or avoidance" to
+            "require urgent exit" -- AVOID is now distinct.
+            _compute_priority() gains AVOID -> P1, ACCUMULATE -> P3.
+            Position-size hint fallback gains ACCUMULATE / AVOID
+            cases; SELL/STRONG_SELL hint tightened from "Exit or
+            avoid" to "Exit position". New module constant
+            _RECO_NORMALIZE_CONTRACT_VERSION = "8.0.0" surfaced via
+            get_canonical_state() as reco_normalize_contract_version.
+
+What advanced in core.reco_normalize since v7.2.1
+--------------------------------------------------
+  v8.0.0: 8-tier canonical vocabulary. The Recommendation enum gains
+            ACCUMULATE (ordinal 2, between BUY and HOLD),
+            STRONG_SELL (ordinal 6, between SELL and AVOID), and
+            AVOID (ordinal 7, the new worst tier). to_score() range
+            widened from 0-4 to 0-7; WORST_ORDINAL exported as a
+            symbolic literal (== 7). from_score() / _parse_numeric_rating
+            re-banded for 8 tiers on the 0-100 and 0-1 scales.
+            _classify_views_with_rule_id() can emit all 8 tiers; four
+            new RULE_ID_* constants cover the new branches
+            (ACCUMULATE_BULLISH_MODERATE, DOWNGRADED_ACCUMULATE_TO_HOLD,
+            HARD_STRONG_SELL_DOUBLE_BEARISH, AVOID_UNINVESTABLE).
+            New multilingual sets (AR/FR/ES/DE/PT) for ACCUMULATE
+            and AVOID idioms. _PAT_AVOID_NEGATED distinguishes a
+            genuine "not avoid" from AVOID idioms like "DO NOT BUY"
+            where the embedded NOT/NEVER is intrinsic to the AVOID
+            meaning. Conviction floor cascade extended: ACCUMULATE
+            with conviction < BUY floor downgrades to HOLD.
+
+Bridge changes in v3.6.0
+------------------------
+
+  Phase A -- Header docstring sync: floor moves to core.scoring v5.7.0+
+             and core.reco_normalize v8.0.0+. Older versions still load
+             cleanly via the getattr() fallback pattern; the degradation
+             report flags them.
+
+  Phase B -- Re-export the v5.6.0 / v5.7.0 contract-version markers
+             (all via getattr() fallback so a deployment on pre-v5.6.0
+             core.scoring still loads cleanly):
+               * _ENGINE_CONTRACT_VERSION         (v5.6.0+;
+                                                   value "5.75.0" --
+                                                   data_engine_v2 release
+                                                   scoring.py aligns with)
+               * _RECO_NORMALIZE_CONTRACT_VERSION (v5.7.0+;
+                                                   value "8.0.0" --
+                                                   reco_normalize release
+                                                   scoring.py aligns with)
+             Audit tooling can read these via the bridge to verify
+             cross-stack alignment without separately importing scoring.
+
+  Phase C -- NEW _V570_FIELDS tuple listing the row fields added in
+             v5.6.0 / v5.7.0 that are not in _V525 / _V528 / _V540:
+               * recommendation_detailed  (v5.6.0+; mirror of
+                                            `recommendation` for
+                                            field-name compat with
+                                            data_engine_v2 v5.75.0)
+             Mirror of the existing _V525 / _V528 / _V540 field-
+             contract constants. No removals from prior tuples.
+
+  Phase D -- NEW _CONTRACT_VERSION_SYMBOLS tuple tracking the v5.6.0+/
+             v5.7.0+ contract-marker surface. Tracked separately from
+             _BUCKET_ALIGNMENT_SYMBOLS so a deployment running v5.3.0-
+             v5.5.x (full bucket alignment but no contract markers
+             yet) still gets a working bridge with a partial-alignment
+             flag.
+
+  Phase E -- NEW _RECO_8TIER_SYMBOLS tuple tracking the v8.0.0
+             vocabulary-expansion surface in core.reco_normalize:
+               * RECO_ACCUMULATE / RECO_STRONG_SELL / RECO_AVOID
+                 (module-level string constants)
+               * WORST_ORDINAL                       (== 7 in v8.0.0)
+               * RULE_ID_ACCUMULATE_BULLISH_MODERATE,
+                 RULE_ID_DOWNGRADED_ACCUMULATE_TO_HOLD,
+                 RULE_ID_HARD_STRONG_SELL_DOUBLE_BEARISH,
+                 RULE_ID_AVOID_UNINVESTABLE        (the four new
+                                                    v8.0.0 RULE_IDs)
+             Tracked on the reco_normalize side, not core.scoring.
+
+  Phase F -- NEW is_contract_versioned() helper: returns True when
+             both contract markers are present on core.scoring.
+             Mirror of is_view_aware, is_audit_hardened,
+             is_reco_rule_id_aware, is_cascade_bridged,
+             is_bucket_aligned.
+
+             NEW is_reco_8tier_aware() helper: returns True when
+             both:
+               (a) core.scoring's RECOMMENDATION_ENUM contains all 8
+                   canonical tiers (verifies the v5.7.0 vocabulary
+                   expansion actually landed; a deployment can have
+                   RECOMMENDATION_ENUM as a tuple but with only 6
+                   members if still on v5.6.0 or earlier)
+               (b) core.reco_normalize exposes the v8.0.0
+                   vocabulary symbols (RECO_ACCUMULATE, RECO_AVOID,
+                   WORST_ORDINAL, and the four new RULE_ID_* constants)
+             Both must be true for the full stack to be 8-tier-aware
+             in lockstep. A False from this helper while
+             is_bucket_aligned() is True indicates a partial
+             rollout -- scoring may emit ACCUMULATE/AVOID while
+             reco_normalize cannot represent them, or vice versa.
+
+  Phase G -- Extended get_degradation_report():
+               * engine_contract_version: str or None  (the actual
+                 value from _ENGINE_CONTRACT_VERSION marker on
+                 core.scoring; not just symbol presence)
+               * reco_normalize_contract_version: str or None  (same
+                 for the v5.7.0 marker)
+               * recommendation_enum: tuple  (the actual resolved
+                 enum tuple, so audit tooling can verify the v5.7.0
+                 expansion -- 6 tiers vs 8 tiers -- without
+                 separately importing core.scoring)
+               * contract_versioned_symbols: {symbol: present_bool}
+               * missing_contract_versioned: [symbols]
+               * contract_versioned_enabled: bool
+               * reco_8tier_symbols: {symbol: present_bool}
+               * missing_reco_8tier: [symbols]
+               * reco_8tier_aware_enabled: bool
+               * v570_fields: tuple  (mirror of v540_detail_fields)
+             Existing report fields preserved verbatim.
+
+  Phase H -- Version bump 3.5.0 -> 3.6.0. Minor bump because the
+             public re-export surface widens; no breaking changes
+             and no removals.
+
+[PRESERVED -- strictly]
+  - Every v3.5.0 public name remains exported.
+  - is_view_aware, is_audit_hardened, is_reco_rule_id_aware,
+    is_cascade_bridged, is_bucket_aligned all unchanged.
+  - _V525_ENRICHMENT_FIELDS / _V528_CASCADE_BRIDGE_FIELDS /
+    _V540_DETAIL_FIELDS unchanged.
+  - _BUCKET_ALIGNMENT_SYMBOLS unchanged (additions in v3.6.0 go
+    into separate _CONTRACT_VERSION_SYMBOLS and _RECO_8TIER_SYMBOLS
+    tuples so a deployment on v5.3.0-v5.5.x still passes the
+    is_bucket_aligned() check).
+  - RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5
+    auto-track core.scoring's __version__ via its f-string.
+
+API surface (additions in v3.6.0):
+  - _ENGINE_CONTRACT_VERSION, _RECO_NORMALIZE_CONTRACT_VERSION
+    (re-exports of the v5.6.0 / v5.7.0 contract markers)
+  - _V570_FIELDS (private constant)
+  - _CONTRACT_VERSION_SYMBOLS (private constant)
+  - _RECO_8TIER_SYMBOLS (private constant)
+  - is_contract_versioned (bridge-level helper)
+  - is_reco_8tier_aware (bridge-level helper)
+
+================================================================================
+v3.5.0 changes (preserved verbatim)
 ================================================================================
 
 core.scoring has advanced through v5.3.0 -> v5.4.0 -> v5.4.1 -> v5.4.2
@@ -22,7 +228,7 @@ core.scoring has advanced through v5.3.0 -> v5.4.0 -> v5.4.1 -> v5.4.2
 against all of those versions thanks to the getattr() fallback
 pattern, but was under-advertising the new surface (downstream
 modules importing via the bridge could not reach symbols added since
-v5.2.8). v3.5.0 closes that gap.
+v5.2.8). v3.5.0 closed that gap.
 
 What advanced in core.scoring since v5.2.8
 -------------------------------------------
@@ -237,7 +443,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # ---------------------------------------------------------------------------
 
-VERSION = "3.5.0"
+VERSION = "3.6.0"
 # v3.4.2 Phase B (preserved): __version__ alias matches TFB module
 # convention used by core.scoring v5.2.5+, core.reco_normalize v7.2.0+,
 # and insights_builder v7.0.0.
@@ -447,6 +653,36 @@ _confidence_bucket = getattr(_core_scoring, "_confidence_bucket", None)
 
 
 # =============================================================================
+# v3.6.0 Phase B — Re-export core.scoring v5.6.0+/v5.7.0+ contract markers
+# =============================================================================
+#
+# core.scoring v5.6.0 introduced _ENGINE_CONTRACT_VERSION ("5.75.0") to
+# document which data_engine_v2 release scoring.py was built to align
+# with. v5.7.0 introduced _RECO_NORMALIZE_CONTRACT_VERSION ("8.0.0") to
+# document which core.reco_normalize release scoring.py was built to
+# align with. Both are surfaced via core.scoring.get_canonical_state()
+# under the keys engine_contract_version and reco_normalize_contract_version
+# respectively.
+#
+# Re-exporting via the bridge so audit tooling that connects through
+# scoring_engine (e.g. investment_advisor_engine, data_engine_v2) can
+# inspect both markers without separately importing core.scoring.
+#
+# All getattr() with a None default. A None value here means
+# "deployed core.scoring predates the marker"; consumers should treat
+# None as "unknown / pre-marker era" and fall back to inspecting
+# SCORING_VERSION directly. The contract_versioned degradation flag
+# captures which markers are missing.
+
+_ENGINE_CONTRACT_VERSION = getattr(
+    _core_scoring, "_ENGINE_CONTRACT_VERSION", None,
+)
+_RECO_NORMALIZE_CONTRACT_VERSION = getattr(
+    _core_scoring, "_RECO_NORMALIZE_CONTRACT_VERSION", None,
+)
+
+
+# =============================================================================
 # v3.4.3 Phase B — Re-export core.scoring v5.2.7+ cascade-bridge symbols
 # =============================================================================
 #
@@ -561,6 +797,48 @@ _V540_DETAIL_FIELDS: Tuple[str, ...] = (
 
 
 # =============================================================================
+# v3.6.0 Phase C — v5.6.0+/v5.7.0+ row-field contract (NEW)
+# =============================================================================
+#
+# core.scoring v5.6.0 added one additional row field produced by
+# compute_scores that is not in _V525 / _V528 / _V540 above.
+# Tracked separately so consumers can introspect "what fields does a
+# row carry after v5.6.0+ scoring" without re-deriving from scratch.
+#
+#   recommendation_detailed  (v5.6.0+):
+#       Mirror of `recommendation`. Always carries the same canonical
+#       8-tier code as `recommendation` (STRONG_BUY / BUY / ACCUMULATE
+#       / HOLD / REDUCE / SELL / STRONG_SELL / AVOID after v5.7.0).
+#       data_engine_v2 v5.75.0 writes both atomically in
+#       _classify_recommendation_8tier and treats them as a single
+#       unit during the patch merge. The mirror exists for field-
+#       name compatibility with consumers that read
+#       `recommendation_detailed` directly (some Apps Script reads,
+#       and the schema_registry v2.11.0+ documents both columns).
+#
+# Consumers downstream:
+#   - schema_registry v2.11.0+: documents recommendation_detailed
+#     alongside recommendation; both columns carry the same value
+#     by invariant.
+#   - data_engine_v2 v5.75.0+: writes the mirror atomically; the
+#     owned-keys filter strips both during the patch merge so the
+#     producer/consumer contract is preserved.
+#   - Apps Script 04_Format.gs: may read either column; both render
+#     the same canonical token.
+#
+# Note: this tuple lists only the v5.6.0+ row-field additions. The
+# v5.7.0 release expanded the value domain of `recommendation` and
+# `recommendation_detailed` from 6 tiers to 8 but did not introduce
+# new row fields. The vocabulary expansion is captured by
+# is_reco_8tier_aware() (a content check on RECOMMENDATION_ENUM), not
+# by a field-contract tuple.
+
+_V570_FIELDS: Tuple[str, ...] = (
+    "recommendation_detailed",    # str; mirror of `recommendation`  (v5.6.0+)
+)
+
+
+# =============================================================================
 # Degradation Report
 # =============================================================================
 #
@@ -652,6 +930,64 @@ _BUCKET_ALIGNMENT_SYMBOLS: Tuple[str, ...] = (
     "get_canonical_state",
 )
 
+# v3.6.0 Phase D: core.scoring v5.6.0+/v5.7.0+ contract-version surface.
+# Tracks the two markers that document which downstream contracts
+# scoring.py was built against. _ENGINE_CONTRACT_VERSION (v5.6.0+)
+# names the data_engine_v2 release; _RECO_NORMALIZE_CONTRACT_VERSION
+# (v5.7.0+) names the core.reco_normalize release.
+#
+# Tracked separately from _BUCKET_ALIGNMENT_SYMBOLS so a deployment
+# on v5.3.0-v5.5.x (full bucket-canonical surface but no contract
+# markers yet) still passes is_bucket_aligned() while honestly
+# reporting that contract-version introspection is unavailable.
+#
+# Missing either marker means the deployed core.scoring is on
+# pre-v5.6.0 (engine marker absent) or pre-v5.7.0 (reco_normalize
+# marker absent). The bridge function is unaffected -- this is
+# diagnostic surface only.
+_CONTRACT_VERSION_SYMBOLS: Tuple[str, ...] = (
+    "_ENGINE_CONTRACT_VERSION",
+    "_RECO_NORMALIZE_CONTRACT_VERSION",
+)
+
+# v3.6.0 Phase E: core.reco_normalize v8.0.0+ vocabulary-expansion
+# surface. Tracks the symbols added when the canonical recommendation
+# enum was widened from 5 tiers to 8.
+#
+# RECO_ACCUMULATE / RECO_STRONG_SELL / RECO_AVOID are the new
+# module-level string constants that complete the 8-tier value set
+# (the existing RECO_BUY / RECO_HOLD / RECO_REDUCE / RECO_SELL /
+# RECO_STRONG_BUY were preserved from v7.x). WORST_ORDINAL is a
+# symbolic literal (== 7 in v8.0.0; was 4 in v7.x) so downstream
+# code never has to hard-code the worst-tier ordinal.
+#
+# The four RULE_ID_* constants cover the new branches in
+# _classify_views_with_rule_id(): ACCUMULATE_BULLISH_MODERATE
+# (scale-in branch, between BUY and HOLD), DOWNGRADED_ACCUMULATE_TO_HOLD
+# (conviction floor cascade for ACCUMULATE),
+# HARD_STRONG_SELL_DOUBLE_BEARISH (escalation from SELL when
+# double-bearish compounds with high risk or very weak score), and
+# AVOID_UNINVESTABLE (the uninvestable branch -- score < 15 or
+# bearish-bearish-expensive).
+#
+# Missing any of these symbols means the deployed core.reco_normalize
+# is on pre-v8.0.0. A False from the resulting is_reco_8tier_aware()
+# helper while is_bucket_aligned() is True indicates a partial
+# rollout (scoring.py v5.7.0+ emits 8 tiers but reco_normalize is
+# still on v7.2.x and cannot represent ACCUMULATE/AVOID) -- a
+# vocabulary mismatch that would silently round-trip incorrectly
+# through normalize_recommendation_code().
+_RECO_8TIER_SYMBOLS: Tuple[str, ...] = (
+    "RECO_ACCUMULATE",
+    "RECO_STRONG_SELL",
+    "RECO_AVOID",
+    "WORST_ORDINAL",
+    "RULE_ID_ACCUMULATE_BULLISH_MODERATE",
+    "RULE_ID_DOWNGRADED_ACCUMULATE_TO_HOLD",
+    "RULE_ID_HARD_STRONG_SELL_DOUBLE_BEARISH",
+    "RULE_ID_AVOID_UNINVESTABLE",
+)
+
 _REQUIRED_RECO_SYMBOLS: Tuple[str, ...] = (
     "Recommendation",
     "normalize_recommendation",
@@ -669,6 +1005,16 @@ def get_degradation_report() -> Dict[str, Any]:
       - bridge_version: this module's VERSION
       - scoring_version: the version of core.scoring that resolved
       - reco_normalize_version: the version of core.reco_normalize
+      - engine_contract_version: str or None (the actual value of
+        core.scoring._ENGINE_CONTRACT_VERSION; "5.75.0" in v5.6.0+;
+        None when the marker is absent or set to None; added v3.6.0)
+      - reco_normalize_contract_version: str or None (the actual
+        value of core.scoring._RECO_NORMALIZE_CONTRACT_VERSION;
+        "8.0.0" in v5.7.0+; None when absent; added v3.6.0)
+      - recommendation_enum: tuple or None (the actual resolved
+        RECOMMENDATION_ENUM tuple, so audit tooling can verify the
+        v5.7.0 vocabulary expansion -- 6 tiers vs 8 tiers -- without
+        re-importing core.scoring directly; added v3.6.0)
       - core_symbols: dict of {symbol: present_bool} for required scoring symbols
       - view_symbols: dict of {symbol: present_bool} for view derivers
         (added v3.4.0)
@@ -681,6 +1027,10 @@ def get_degradation_report() -> Dict[str, Any]:
         v5.2.7+ canonical recommendation source-of-truth (added v3.4.3)
       - bucket_alignment_symbols: dict of {symbol: present_bool} for
         v5.3.0+ canonical bucket surface (added v3.5.0)
+      - contract_versioned_symbols: dict of {symbol: present_bool}
+        for v5.6.0+/v5.7.0+ contract-version markers (added v3.6.0)
+      - reco_8tier_symbols: dict of {symbol: present_bool} for
+        core.reco_normalize v8.0.0+ vocabulary expansion (added v3.6.0)
       - risk_thresholds: tuple or None (the actual values resolved at
         import time; surfaced for ops diagnostic; added v3.5.0)
       - confidence_thresholds: tuple or None (same; added v3.5.0)
@@ -693,6 +1043,8 @@ def get_degradation_report() -> Dict[str, Any]:
         by compute_scores in v5.2.7+ / v5.2.8 (added v3.4.3)
       - v540_detail_fields: tuple of row field names produced by
         compute_scores in v5.3.0+ / v5.4.0+ (added v3.5.0)
+      - v570_fields: tuple of row field names produced by
+        compute_scores in v5.6.0+ (added v3.6.0)
       - import_log: list of successful/failed import attempts
       - missing_critical: list of missing CRITICAL symbols
       - missing_view: list of missing view derivers
@@ -702,11 +1054,18 @@ def get_degradation_report() -> Dict[str, Any]:
       - missing_cascade_bridge: list of missing v5.2.7+ helpers
       - missing_bucket_alignment: list of missing v5.3.0+ helpers
         (added v3.5.0)
+      - missing_contract_versioned: list of missing v5.6.0+/v5.7.0+
+        markers (added v3.6.0)
+      - missing_reco_8tier: list of missing reco_normalize v8.0.0+
+        vocabulary symbols (added v3.6.0)
       - view_aware_recommendation_enabled: bool (v3.4.0+)
       - audit_hardening_enabled: bool (v3.4.1+)
       - reco_rule_id_aware_enabled: bool (v3.4.2+)
       - cascade_bridge_enabled: bool (v3.4.3+)
       - bucket_alignment_enabled: bool (v3.5.0+)
+      - contract_versioned_enabled: bool (v3.6.0+)
+      - reco_8tier_aware_enabled: bool (v3.6.0+; content check on
+        RECOMMENDATION_ENUM plus symbol check on reco_normalize side)
 
     Returns:
         Dict[str, Any]: The degradation report.
@@ -721,16 +1080,25 @@ def get_degradation_report() -> Dict[str, Any]:
     bucket_align_present = {
         sym: hasattr(_core_scoring, sym) for sym in _BUCKET_ALIGNMENT_SYMBOLS
     }
+    # v3.6.0 Phase G: track contract-version-marker surface (core.scoring side).
+    contract_version_present = {
+        sym: hasattr(_core_scoring, sym) for sym in _CONTRACT_VERSION_SYMBOLS
+    }
 
     if _reco_normalize is not None:
         reco_present = {sym: hasattr(_reco_normalize, sym) for sym in _REQUIRED_RECO_SYMBOLS}
         reco_rule_id_present = {
             sym: hasattr(_reco_normalize, sym) for sym in _RECO_RULE_ID_SYMBOLS
         }
+        # v3.6.0 Phase G: track 8-tier vocabulary-expansion surface (reco_normalize side).
+        reco_8tier_present = {
+            sym: hasattr(_reco_normalize, sym) for sym in _RECO_8TIER_SYMBOLS
+        }
         reco_version = getattr(_reco_normalize, "VERSION", "unknown")
     else:
         reco_present = {sym: False for sym in _REQUIRED_RECO_SYMBOLS}
         reco_rule_id_present = {sym: False for sym in _RECO_RULE_ID_SYMBOLS}
+        reco_8tier_present = {sym: False for sym in _RECO_8TIER_SYMBOLS}
         reco_version = "missing"
 
     missing_critical = [sym for sym, ok in core_present.items() if not ok]
@@ -742,6 +1110,14 @@ def get_degradation_report() -> Dict[str, Any]:
     # v3.5.0 Phase G: missing bucket-alignment list.
     missing_bucket_alignment = [
         sym for sym, ok in bucket_align_present.items() if not ok
+    ]
+    # v3.6.0 Phase G: missing contract-version-marker list.
+    missing_contract_versioned = [
+        sym for sym, ok in contract_version_present.items() if not ok
+    ]
+    # v3.6.0 Phase G: missing 8-tier-vocabulary list.
+    missing_reco_8tier = [
+        sym for sym, ok in reco_8tier_present.items() if not ok
     ]
 
     # v3.5.0 Phase G: surface actual resolved threshold values for ops
@@ -759,10 +1135,58 @@ def get_degradation_report() -> Dict[str, Any]:
         except Exception:
             confidence_thresholds_resolved = None
 
+    # v3.6.0 Phase G: surface the actual resolved RECOMMENDATION_ENUM
+    # tuple so audit tooling can verify the v5.7.0 vocabulary expansion
+    # actually landed (6 tiers vs 8 tiers) without re-importing
+    # core.scoring directly. None when the deployed core.scoring
+    # predates v5.3.0 (the symbol itself is absent).
+    recommendation_enum_resolved: Optional[Tuple[str, ...]] = None
+    if RECOMMENDATION_ENUM is not None:
+        try:
+            recommendation_enum_resolved = tuple(RECOMMENDATION_ENUM)
+        except Exception:
+            recommendation_enum_resolved = None
+
+    # v3.6.0 Phase G: surface the actual resolved contract-marker
+    # values, not just symbol presence. _ENGINE_CONTRACT_VERSION is
+    # "5.75.0" in scoring.py v5.6.0+; _RECO_NORMALIZE_CONTRACT_VERSION
+    # is "8.0.0" in scoring.py v5.7.0+. None means the marker is
+    # absent (or set to None) on the deployed core.scoring.
+    engine_contract_version_resolved: Optional[str] = (
+        _ENGINE_CONTRACT_VERSION if isinstance(_ENGINE_CONTRACT_VERSION, str)
+        else None
+    )
+    reco_normalize_contract_version_resolved: Optional[str] = (
+        _RECO_NORMALIZE_CONTRACT_VERSION
+        if isinstance(_RECO_NORMALIZE_CONTRACT_VERSION, str)
+        else None
+    )
+
+    # v3.6.0 Phase G: derive the 8-tier-vocabulary content check. This
+    # is intentionally a CONTENT check on the resolved enum, not a
+    # symbol-presence check on RECOMMENDATION_ENUM. A deployment on
+    # core.scoring v5.6.0 has RECOMMENDATION_ENUM defined as a tuple
+    # but with only 6 members; that should NOT pass the 8-tier check.
+    # A deployment on core.scoring v5.7.0+ has all 8 canonical tiers
+    # in the tuple.
+    enum_has_accumulate_and_avoid = bool(
+        recommendation_enum_resolved is not None
+        and "ACCUMULATE" in recommendation_enum_resolved
+        and "AVOID" in recommendation_enum_resolved
+    )
+    reco_8tier_aware_enabled = (
+        enum_has_accumulate_and_avoid and len(missing_reco_8tier) == 0
+    )
+
     return {
         "bridge_version": VERSION,
         "scoring_version": SCORING_VERSION,
         "reco_normalize_version": reco_version,
+        # v3.6.0 Phase G: resolved contract-marker values for cross-stack audit.
+        "engine_contract_version": engine_contract_version_resolved,
+        "reco_normalize_contract_version": reco_normalize_contract_version_resolved,
+        # v3.6.0 Phase G: resolved enum tuple so audit can verify 6-tier vs 8-tier.
+        "recommendation_enum": recommendation_enum_resolved,
         "core_symbols": core_present,
         "view_symbols": view_present,
         "audit_hardening_symbols": audit_present,
@@ -771,6 +1195,10 @@ def get_degradation_report() -> Dict[str, Any]:
         "cascade_bridge_symbols": cascade_present,
         # v3.5.0 Phase G: bucket-alignment report.
         "bucket_alignment_symbols": bucket_align_present,
+        # v3.6.0 Phase G: contract-version-marker presence map.
+        "contract_versioned_symbols": contract_version_present,
+        # v3.6.0 Phase G: 8-tier-vocabulary presence map.
+        "reco_8tier_symbols": reco_8tier_present,
         # v3.5.0 Phase G: actual resolved threshold values.
         "risk_thresholds": risk_thresholds_resolved,
         "confidence_thresholds": confidence_thresholds_resolved,
@@ -781,6 +1209,8 @@ def get_degradation_report() -> Dict[str, Any]:
         "v528_cascade_bridge_fields": tuple(_V528_CASCADE_BRIDGE_FIELDS),
         # v3.5.0 Phase D: surface the v5.3.0+/v5.4.0+ detail field contract.
         "v540_detail_fields": tuple(_V540_DETAIL_FIELDS),
+        # v3.6.0 Phase G: surface the v5.6.0+/v5.7.0+ field contract.
+        "v570_fields": tuple(_V570_FIELDS),
         "import_log": list(_import_attempt_log),
         "missing_critical": missing_critical,
         "missing_view": missing_view,
@@ -790,6 +1220,10 @@ def get_degradation_report() -> Dict[str, Any]:
         "missing_cascade_bridge": missing_cascade_bridge,
         # v3.5.0 Phase G: missing bucket-alignment list.
         "missing_bucket_alignment": missing_bucket_alignment,
+        # v3.6.0 Phase G: missing contract-version-marker list.
+        "missing_contract_versioned": missing_contract_versioned,
+        # v3.6.0 Phase G: missing 8-tier-vocabulary list.
+        "missing_reco_8tier": missing_reco_8tier,
         "view_aware_recommendation_enabled": (
             len(missing_view) == 0
             and "recommendation_from_views" in reco_present
@@ -800,6 +1234,10 @@ def get_degradation_report() -> Dict[str, Any]:
         "cascade_bridge_enabled": len(missing_cascade_bridge) == 0,
         # v3.5.0 Phase G: bucket-alignment enabled flag.
         "bucket_alignment_enabled": len(missing_bucket_alignment) == 0,
+        # v3.6.0 Phase G: contract-versioned enabled flag.
+        "contract_versioned_enabled": len(missing_contract_versioned) == 0,
+        # v3.6.0 Phase G: 8-tier-vocabulary enabled flag (content + symbol check).
+        "reco_8tier_aware_enabled": reco_8tier_aware_enabled,
     }
 
 
@@ -892,6 +1330,78 @@ def is_bucket_aligned() -> bool:
     the other.
     """
     return get_degradation_report().get("bucket_alignment_enabled", False)
+
+
+def is_contract_versioned() -> bool:
+    """
+    v3.6.0 Phase F: Quick boolean check: does the deployed
+    core.scoring expose both contract-version markers?
+
+    Returns True when core.scoring exposes ALL of:
+      - _ENGINE_CONTRACT_VERSION   (added in core.scoring v5.6.0;
+                                    documents which data_engine_v2
+                                    release scoring.py was built to
+                                    align with -- value "5.75.0")
+      - _RECO_NORMALIZE_CONTRACT_VERSION  (added in core.scoring
+                                           v5.7.0; documents which
+                                           core.reco_normalize release
+                                           scoring.py was built to
+                                           align with -- value "8.0.0")
+
+    Mirror of is_view_aware(), is_audit_hardened(),
+    is_reco_rule_id_aware(), is_cascade_bridged(), is_bucket_aligned().
+    A False result is not a fatal degradation; the bridge function is
+    unaffected. But audit / diagnostic tooling that reads the resolved
+    values via the degradation report (engine_contract_version,
+    reco_normalize_contract_version) needs this flag to be True to
+    trust those keys carry meaningful strings rather than None.
+
+    Note: the markers themselves carry version *strings* that name the
+    counterpart contract release. The degradation report surfaces both
+    via top-level engine_contract_version / reco_normalize_contract_version
+    keys -- read those, not just this boolean -- when full alignment
+    verification is required.
+    """
+    return get_degradation_report().get("contract_versioned_enabled", False)
+
+
+def is_reco_8tier_aware() -> bool:
+    """
+    v3.6.0 Phase F: Quick boolean check: is the full stack on the
+    8-tier canonical vocabulary?
+
+    Returns True when BOTH:
+      (a) core.scoring's RECOMMENDATION_ENUM contains the v5.7.0
+          additions ACCUMULATE and AVOID, AND
+      (b) core.reco_normalize v8.0.0+ exposes the vocabulary-
+          expansion symbols (RECO_ACCUMULATE, RECO_STRONG_SELL,
+          RECO_AVOID, WORST_ORDINAL, and the four new RULE_ID_*
+          constants).
+
+    Both conditions must hold for the full stack to be 8-tier-aware
+    in lockstep. A False from this helper while is_bucket_aligned()
+    is True indicates a partial rollout:
+      - scoring on v5.7.0+ (8-tier enum) but reco_normalize stuck on
+        v7.2.x (cannot represent ACCUMULATE/AVOID) -- vocabulary
+        round-trip through normalize_recommendation_code() will
+        silently collapse the new tiers back to BUY/STRONG_SELL
+      - scoring on pre-v5.7.0 (6-tier enum) but reco_normalize on
+        v8.0.0+ -- reco_normalize emits ACCUMULATE/AVOID and scoring
+        cannot accept them; normalize_recommendation_code() would
+        collapse via its alias table.
+
+    Either direction of mismatch is silent corruption of the
+    recommendation pipeline at the contract boundary. Operators
+    upgrading the stack should verify this flag flips True after
+    deploying both modules.
+
+    Note: this is a CONTENT check on RECOMMENDATION_ENUM (does it
+    literally contain "ACCUMULATE" and "AVOID"?) plus a SYMBOL check
+    on the reco_normalize side. It is not satisfied by simply having
+    RECOMMENDATION_ENUM exposed -- that symbol exists in core.scoring
+    v5.3.0+ but with only 6 tiers in v5.3.0-v5.6.0.
+    """
+    return get_degradation_report().get("reco_8tier_aware_enabled", False)
 
 
 # =============================================================================
@@ -1031,6 +1541,14 @@ __all__ = [
     "is_cascade_bridged",
     # v3.5.0 Phase F: bucket-alignment awareness helper
     "is_bucket_aligned",
+    # v3.6.0 Phase F: contract-version + 8-tier-vocabulary helpers
+    "is_contract_versioned",
+    "is_reco_8tier_aware",
+    # v3.6.0 Phase B: contract-version-marker re-exports
+    "_ENGINE_CONTRACT_VERSION",
+    "_RECO_NORMALIZE_CONTRACT_VERSION",
+    # v3.6.0 Phase C: v5.6.0+/v5.7.0+ field contract
+    "_V570_FIELDS",
     # Exceptions
     "ScoringError",
     "InvalidHorizonError",
