@@ -2,11 +2,11 @@
 # core/sheets/schema_registry.py
 """
 ================================================================================
-Schema Registry — v2.10.0
+Schema Registry — v2.11.0
 (CANONICAL / SHEET-FIRST / STARTUP-SAFE / ALIAS-HARDENED / VIEW-AWARE FAMILY /
  INSIGHTS-EXTENDED / DECISION-MATRIX / CANDLESTICK-AWARE /
  CONVICTION-CRITERIA-EXTENDED / CANONICAL-RECO-PROVENANCE /
- ENGINE-V5.74.0-ALIGNED)
+ ENGINE-V5.75.0-ALIGNED / SCORING-V5.6.0-ALIGNED / EQ-V4.7.0-ALIGNED)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -104,13 +104,33 @@ canonically-scored rows and skip parallel recomputation.
     fields coexist by design and are NOT interchangeable.
   - recommendation_source: provenance tag. The canonical idempotency
     check used by apply_canonical_recommendation() and downstream engines
-    (investment_advisor_engine v3.6.0+, data_engine_v2 v5.74.0) reads
+    (investment_advisor_engine v3.6.0+, data_engine_v2 v5.75.0) reads
     this field to decide whether to recompute or short-circuit on
-    already-canonicalized rows. The engine v5.74.0 vocabulary for this
+    already-canonicalized rows. The engine v5.75.0 vocabulary for this
     field is engine / provider_override / empty_row / scoring_unavailable
     (set by _classify_recommendation_8tier()); the scoring.py provenance
     tag is preserved SEPARATELY as `scoring_recommendation_source` in
-    the new "Scoring v5.74" group to avoid collision.
+    the "Scoring v5.74" group to avoid collision.
+
+    v2.11.0 addition: enriched_quote.py v4.7.0's _detect_and_mark_empty_row
+    also writes `"empty_row"` directly into this field as part of its
+    post-engine empty-row clear (full atomic-write field reset). The
+    write is idempotent with the engine's own empty-row branch and uses
+    the same vocabulary token, so engine-vocabulary readers see a
+    consistent empty state regardless of which layer detected it.
+
+    v2.11.0 contract note (engine v5.75.0): apply_canonical_recommendation()
+    now correctly forces recomputation when overwrite=True even if
+    recommendation_source already carries scoring.py's tag. Pre-v5.6.0
+    the inner derive_canonical_recommendation() had an unconditional
+    idempotency-skip that masked the bug whenever the engine cleared
+    the source field first; v5.6.0 threads overwrite through so the
+    skip is bypassed at the source. The engine v5.75.0's
+    _classify_recommendation_8tier() and _compute_scores_canonical_first()
+    use clear+overwrite semantics: recommendation_source is set to ""
+    before each scoring patch merge, and the patch is filtered through
+    recommendation_owned_keys to prevent the scoring layer's source tag
+    from overwriting the engine's vocabulary value.
 
 The seven "Scoring v5.74" columns (provider_rating,
 scoring_recommendation_source, scoring_schema_version, scoring_errors,
@@ -212,7 +232,77 @@ Downstream consumers:
 Changelog
 ================================================================================
 
-v2.10.0 (current)  --  ENGINE-V5.74.0-ALIGNMENT / 7-NEW-SCHEMA-FIELDS
+v2.11.0 (current)  --  CROSS-STACK-SYNC / NO-SCHEMA-CHANGE
+- DOCSTRING-ONLY release. Column count, validation logic, and exports
+  are unchanged from v2.10.0 (still 106 instrument / 109 Top10 / 7
+  Insights / 9 Data_Dictionary). What moved is the cross-stack version
+  references and the semantics of several fields whose producers shipped
+  refinements that didn't change the schema shape.
+- SEMANTIC CORRECTION: `recommendation_detailed` (Decision group). Per
+  v2.7.0/v2.10.0 docstring this was the "8-tier Decision Matrix verdict"
+  with eight distinct tokens including SPECULATIVE_BUY / ACCUMULATE.
+  Reality in core.data_engine_v2 v5.75.0 + core.scoring v5.6.0: it is
+  written ATOMICALLY as a mirror of `recommendation` -- the value space
+  is the canonical 6-tier enum, not a pre-collapse intermediate.
+  data_engine_v2 v5.75.0's _classify_recommendation_8tier() does
+  `row["recommendation_detailed"] = rec` immediately after writing
+  `row["recommendation"] = rec`; scoring.py v5.6.0 added
+  AssetScores.recommendation_detailed as a NEW field (mirror of
+  recommendation in the canonical 6-tier code). The "richer than" framing
+  was technically accurate ONLY in the v5.50.0 / v5.74.0 pre-collapse
+  era when the 8-tier intermediate was briefly surfaced as the
+  detailed value. v2.11.0 corrects the field docstring to describe
+  current behaviour.
+- CROSS-STACK SYNC: docstring updated to reference the May 2026
+  cross-stack family at its current revisions:
+    core.data_engine_v2 v5.74.0 -> v5.75.0 (LANDED): producer/consumer
+      contract for the recommendation pipeline (clear+overwrite semantics
+      in apply_canonical_recommendation, owned-keys filtering of the
+      scoring patch, _preserve_scoring_provenance to capture scoring.py's
+      source tag as scoring_recommendation_source). No new fields.
+    core.scoring v5.4.2 -> v5.6.0 (LANDED): adds recommendation_detailed
+      as an AssetScores field (mirror of recommendation), aligns AVOID
+      legacy alias to STRONG_SELL to match data_engine_v2's
+      _v573_collapse_to_canonical_enum, fixes derive_canonical_recommendation
+      to honour overwrite=True, hard-normalizes returned priority bands
+      to canonical P1..P5. Exposes _ENGINE_CONTRACT_VERSION="5.75.0" via
+      get_canonical_state().
+    core.enriched_quote v4.6.0 -> v4.7.0 (LANDED): _detect_and_mark_empty_row
+      now clears the FULL v5.75.0/v5.6.0 atomic-write field set
+      (recommendation_detailed, recommendation_priority_band,
+      recommendation_priority, scoring_recommendation_source,
+      scoring_schema_version, scoring_errors, overall_score_raw,
+      overall_penalty_factor, opportunity_source, conviction_score,
+      sector_relative_score, top_factors, top_risks, position_size_hint,
+      recommendation_detail), and writes
+      recommendation_source = "empty_row" using the engine vocabulary
+      from this registry's Canonical Reco group. Also adds
+      _normalize_scoring_errors_field() for defense-in-depth list->string
+      coercion of scoring_errors when rows bypass the engine's
+      _coerce_scoring_errors_for_sheet() (direct scoring path, snapshot
+      replay).
+- TYPICAL-VALUE BUMP: `scoring_recommendation_source` field docstring
+  previously cited "scoring.py v5.4.2" as the typical value; updated
+  to "scoring.py v5.6.0".
+- AVOID-ALIAS DISAMBIGUATION: documented in the Recommendation column
+  notes that the AVOID legacy alias now resolves differently in the
+  two normalization layers:
+    - core.reco_normalize v7.2.0:  AVOID -> SELL
+      (upstream provider-recommendation normalization)
+    - core.scoring v5.6.0:         AVOID -> STRONG_SELL
+      (scoring-output canonicalization, aligned with
+       data_engine_v2's _v573_collapse_to_canonical_enum)
+  Both are correct for their domain. reco_normalize handles legacy
+  provider strings where AVOID often means a moderate "do not buy"
+  recommendation; scoring.py and the engine handle internal
+  canonicalization where AVOID is treated as the most negative token
+  (STRONG_SELL-equivalent). Downstream consumers should be aware of
+  the two-layer asymmetry.
+- COLUMN COUNTS UNCHANGED: 106 instrument, 109 Top10, 7 Insights,
+  9 Data_Dictionary. No structural schema change. Validation unchanged.
+- BUMP: SCHEMA_VERSION 2.10.0 -> 2.11.0.
+
+v2.10.0  --  ENGINE-V5.74.0-ALIGNMENT / 7-NEW-SCHEMA-FIELDS
 - NEW: "Scoring v5.74" column group (7 columns, appended at END of the
   instrument schema):
     1. provider_rating                 (float, 0.00,    provider)
@@ -402,11 +492,11 @@ __all__ = [
     "validate_schema_registry",
 ]
 
-SCHEMA_VERSION = "2.10.0"
-# v2.8.0 Phase C: TFB module-version convention alias (mirrors scoring
-# v5.4.2+, reco_normalize v7.2.0, insights_builder v7.0.0, scoring_engine
-# v3.4.4, top10_selector v4.11.0, criteria_model v3.1.0,
-# data_engine_v2 v5.74.0).
+SCHEMA_VERSION = "2.11.0"
+# TFB module-version convention alias (mirrors scoring v5.6.0,
+# data_engine_v2 v5.75.0, enriched_quote v4.7.0, reco_normalize v7.2.0,
+# insights_builder v7.0.0, scoring_engine v3.4.4, top10_selector v4.11.0,
+# criteria_model v3.1.0). Originally introduced in v2.8.0 Phase C.
 __version__ = SCHEMA_VERSION
 
 
@@ -856,11 +946,22 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "5-tier canonical token: STRONG_BUY / BUY / HOLD / REDUCE / SELL. "
         "Set by core.reco_normalize v7.2.0 with conviction-floor downgrade "
         "applied (env: RECO_STRONG_BUY_CONVICTION_FLOOR=60, "
-        "RECO_BUY_CONVICTION_FLOOR=45). AVOID input now maps to SELL (fixed "
-        "in v7.2.0 Phase E; was REDUCE in v7.1.0). v5.2.8 cascade-bridge: "
-        "this field is now keyed to recommendation_source (see Canonical "
-        "Reco group) so downstream engines can detect canonically-scored "
-        "rows and skip parallel recomputation.",
+        "RECO_BUY_CONVICTION_FLOOR=45). v5.2.8 cascade-bridge: this field "
+        "is now keyed to recommendation_source (see Canonical Reco group) "
+        "so downstream engines can detect canonically-scored rows and skip "
+        "parallel recomputation. v2.11.0 note: AVOID legacy alias resolves "
+        "asymmetrically across the two normalization layers, by design:\n"
+        "  - core.reco_normalize v7.2.0:  AVOID -> SELL\n"
+        "    (provider-input normalization layer; AVOID often means a "
+        "moderate 'do not buy' in legacy provider feeds)\n"
+        "  - core.scoring v5.6.0:         AVOID -> STRONG_SELL\n"
+        "    (scoring-output canonicalization, aligned with "
+        "data_engine_v2's _v573_collapse_to_canonical_enum where AVOID "
+        "is treated as the most negative token)\n"
+        "Both behaviours are intentional. The v5.6.0 alignment closed a "
+        "drift between scoring.py and the engine where the same legacy "
+        "AVOID label was being canonicalized to two different tokens "
+        "depending on which layer canonicalized first.",
     )
     add(
         "Recommendation", "Recommendation Reason", "recommendation_reason",
@@ -964,11 +1065,17 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     add(
         "Decision", "Recommendation Detail", "recommendation_detailed",
         "str", "text", False, "model",
-        "8-tier Decision Matrix verdict: STRONG_BUY / BUY / SPECULATIVE_BUY / "
-        "ACCUMULATE / HOLD / REDUCE / SELL / STRONG_SELL. Richer than the "
-        "canonical 5-tier `recommendation` field which collapses these via "
-        "core.data_engine_v2 v5.74.0 _RECOMMENDATION_COLLAPSE_MAP. Empty when "
-        "`recommendation` is set upstream by core.scoring -> core.reco_normalize.",
+        "Canonical 6-tier mirror of `recommendation`: STRONG_BUY / BUY / "
+        "HOLD / REDUCE / SELL / STRONG_SELL. Written atomically next to "
+        "`recommendation` by core.data_engine_v2 v5.75.0 "
+        "_classify_recommendation_8tier() so the two fields cannot diverge. "
+        "Also written by core.scoring v5.6.0 (AssetScores.recommendation_detailed). "
+        "Historical note: in v5.50.0..v5.74.0 the engine briefly surfaced the "
+        "pre-collapse 8-tier intermediate value here (SPECULATIVE_BUY / "
+        "ACCUMULATE / STRONG_SELL etc); v5.75.0 normalized this back to a "
+        "canonical mirror so downstream consumers reading either field see the "
+        "same token. Empty when `recommendation` is set upstream by "
+        "core.scoring -> core.reco_normalize.",
     )
     add(
         "Decision", "Reco Priority", "recommendation_priority",
@@ -1113,10 +1220,11 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "SEPARATELY from the engine's `recommendation_source` field in "
         "the Canonical Reco group (which uses the vocabulary "
         "engine/provider_override/empty_row/scoring_unavailable). "
-        "Captured by core.data_engine_v2 v5.74.0 _preserve_scoring_provenance() "
+        "Captured by core.data_engine_v2 v5.75.0 _preserve_scoring_provenance() "
         "from the canonical compute_scores() patch. Typical value: "
-        "'scoring.py v5.4.2' or similar version-tagged string. "
-        "DISTINCT from `recommendation_source`.",
+        "'scoring.py v5.6.0' (the f-string is rendered from "
+        "scoring.py's __version__, so it tracks scoring releases "
+        "automatically). DISTINCT from `recommendation_source`.",
     )
     add(
         "Scoring v5.74", "Scoring Schema Version", "scoring_schema_version",
