@@ -3,10 +3,82 @@
 """
 core/enriched_quote.py
 ===============================================================================
-TFB Enriched Quote Core — v4.6.0 (CROSS-CURRENCY-GATE / STALE-WARN-STRIP / SUFFIX-EXPAND)
-========================================================================================
+TFB Enriched Quote Core — v4.7.0 (ENGINE-CONTRACT-ALIGNED / EMPTY-ROW-FULL-CLEAR / SCORING-ERRORS-NORMALIZED)
+==============================================================================================================
 CORE-ONLY • SCHEMA-FIRST • PAGE-CANONICAL • SPECIAL-PAGE SAFE • ENGINE-TOLERANT
 JSON-SAFE • SYNC/ASYNC SAFE • ROUTE-FRIENDLY • LIGHTWEIGHT • IMPORT-SAFE
+
+v4.7.0 engine-contract alignment over v4.6.0  (data_engine_v2 v5.75.0 / scoring.py v5.6.0)
+------------------------------------------------------------------------------------------
+
+This release aligns the post-engine sheet projection with the producer/consumer
+recommendation contract introduced in data_engine_v2 v5.75.0 and surfaced via
+scoring.py v5.6.0. Two latent display bugs and one defensive normalization are
+fixed; the canonical schema_registry remains the system of record.
+
+- FIX [HIGH]: `_detect_and_mark_empty_row()` now clears the FULL set of
+  recommendation/scoring fields written atomically by data_engine_v2 v5.75.0's
+  _classify_recommendation_8tier (recommendation_detailed, recommendation_source,
+  recommendation_priority, recommendation_priority_band, scoring_recommendation_source,
+  scoring_schema_version, scoring_errors, recommendation_detail) plus the
+  scoring.py v5.6.0 atomic fields (overall_score_raw, overall_penalty_factor,
+  opportunity_source, conviction_score, sector_relative_score, top_factors,
+  top_risks, position_size_hint). Pre-v4.7.0, when a row was marked MISSING/NA,
+  the sheet would display `recommendation = "NA"` next to a stale
+  `recommendation_detailed = "BUY"` plus stale priority bands and scoring
+  provenance, breaking the visual contract that empty rows show no signal.
+  `recommendation_source` is now set to the engine vocabulary value `"empty_row"`
+  rather than left at the previous scoring.py tag, so engine-vocabulary readers
+  see the row's empty state in their own language.
+
+- FIX [MED]: NEW `_normalize_scoring_errors_field()` helper. scoring.py v5.6.0
+  emits `scoring_errors` as List[str]; data_engine_v2 v5.75.0 coerces it to a
+  "; "-joined string via _coerce_scoring_errors_for_sheet before merging. If
+  enriched_quote.py is ever called with a row that bypassed the engine's
+  coercion (direct scoring path, third-party caller, snapshot replay), the
+  list would land in the sheet as `['err1', 'err2']` Python repr. The new
+  helper is symmetric to _normalize_warnings_field, runs in the same pipeline
+  position (after _normalize_warnings_field, inside the instrument-shaped
+  block), and is idempotent — a string stays a string, a list joins with "; ",
+  empty/null fields become None.
+
+- ALIGN: `_FALLBACK_INSTRUMENT_KEYS` / `_FALLBACK_INSTRUMENT_HEADERS` extended
+  with 23 new keys reflecting the data_engine_v2 v5.75.0 / scoring.py v5.6.0
+  canonical contract: recommendation_detailed, recommendation_source,
+  recommendation_priority, recommendation_priority_band,
+  scoring_recommendation_source, scoring_schema_version, scoring_errors,
+  overall_score_raw, overall_penalty_factor, opportunity_source,
+  conviction_score, sector_relative_score, top_factors, top_risks,
+  position_size_hint, recommendation_detail, short_term_signal, rsi_signal,
+  horizon_label, horizon_days_effective, day_range_position, volume_ratio,
+  provider_rating. This is defense-in-depth: schema_registry remains the SSOT
+  and is queried first; the fallback path only runs if the registry is
+  unavailable, in which case the engine row would otherwise drop these fields
+  during schema_projection.
+
+- ALIGN: New module-level constants `_ENGINE_CONTRACT_VERSION = "5.75.0"` and
+  `_SCORING_CONTRACT_VERSION = "5.6.0"` document which engine/scoring releases
+  this enriched_quote.py was built to align with. The envelope's meta_extra
+  now surfaces both, so audit tooling can verify alignment end-to-end without
+  re-importing private symbols (mirrors the get_canonical_state() pattern in
+  scoring.py v5.6.0).
+
+- WIRING: `normalize_rows()` pipeline gains ONE new step:
+        ... (steps 1-8b from v4.6.0 unchanged) ...
+        9.  _normalize_warnings_field           (existing v4.3.0)
+        9b. _normalize_scoring_errors_field     (NEW v4.7.0)
+        10. _ensure_provenance_fields           (existing v4.4.0)
+        11. _detect_and_mark_empty_row          (existing v4.5.0, EXPANDED v4.7.0)
+        11b. _strip_stale_warnings              (existing v4.6.0 — runs LAST)
+        12. top10-specific normalization        (existing)
+        13. schema_projection                   (existing)
+
+- MODULE_VERSION bumped to "4.7.0".
+
+Public API preserved verbatim from v4.6.0: every exported name still resolves
+to the same callable with the same signature. No call-site changes. Adds 1 new
+private helper, 2 new constants, and 23 fallback-schema entries; the rest of
+the file is byte-identical to v4.6.0.
 
 v4.6.0 changes (what moved from v4.5.0)
 ---------------------------------------
@@ -203,7 +275,17 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-MODULE_VERSION = "4.6.0"
+MODULE_VERSION = "4.7.0"
+
+# v4.7.0: explicit markers of which engine/scoring releases this enriched_quote.py
+# was built to align with. data_engine_v2 v5.75.0 introduced the disciplined
+# producer/consumer contract for the recommendation pipeline; scoring.py v5.6.0
+# added recommendation_detailed plus engine-contract-version diagnostics. These
+# constants are surfaced in the envelope's meta_extra so audit tooling can
+# verify alignment end-to-end without re-importing private symbols (mirrors
+# the get_canonical_state() pattern in scoring.py v5.6.0).
+_ENGINE_CONTRACT_VERSION = "5.75.0"
+_SCORING_CONTRACT_VERSION = "5.6.0"
 
 # =============================================================================
 # v4.5.0: Optional import of single-source-of-truth metadata inference
@@ -950,6 +1032,69 @@ def _normalize_warnings_field(row: Dict[str, Any]) -> None:
         row["warnings"] = None
 
 
+# =============================================================================
+# v4.7.0: scoring_errors coercion helper
+# =============================================================================
+#
+# scoring.py v5.6.0 emits `scoring_errors` as List[str]. data_engine_v2 v5.75.0
+# coerces this to a "; "-joined string via _coerce_scoring_errors_for_sheet
+# before merging the scoring patch into the row, so engine-routed rows arrive
+# at enriched_quote.py with a string already in place.
+#
+# If enriched_quote.py is ever called with a row that bypassed the engine's
+# coercion (direct scoring path, third-party caller, snapshot replay, raw
+# scoring.compute_scores() output), the list would land in the sheet as
+# `['err1', 'err2']` Python repr. This helper is symmetric to
+# _normalize_warnings_field and idempotent — a string stays a string, a list
+# joins with "; ", empty/null fields become None.
+#
+# Runs in normalize_rows() at pipeline position 9b (after _normalize_warnings_field,
+# inside the instrument_shaped block, before _ensure_provenance_fields).
+
+def _normalize_scoring_errors_field(row: Dict[str, Any]) -> None:
+    """
+    Coerce row['scoring_errors'] to a "; "-joined string (v4.7.0).
+
+    Operates in-place. Returns nothing. No exception escapes. Idempotent:
+    a string already in "; "-joined form stays unchanged; a list is joined;
+    empty/null becomes None.
+    """
+    if not isinstance(row, dict):
+        return
+    if "scoring_errors" not in row:
+        return
+    try:
+        se = row.get("scoring_errors")
+        if se is None:
+            return
+        if isinstance(se, str):
+            s = se.strip()
+            row["scoring_errors"] = s if s else None
+            return
+        if isinstance(se, (list, tuple, set)):
+            parts: List[str] = []
+            seen: set = set()
+            for item in se:
+                if item is None:
+                    continue
+                try:
+                    s = str(item).strip()
+                except Exception:
+                    continue
+                if s and s.lower() not in {"none", "null", "nil"} and s not in seen:
+                    seen.add(s)
+                    parts.append(s)
+            row["scoring_errors"] = "; ".join(parts) if parts else None
+            return
+        try:
+            s = str(se).strip()
+            row["scoring_errors"] = s if s else None
+        except Exception:
+            row["scoring_errors"] = None
+    except Exception:
+        pass
+
+
 def _derive_missing_fields(row: Dict[str, Any]) -> None:
     if not isinstance(row, dict):
         return
@@ -1442,6 +1587,16 @@ def _detect_and_mark_empty_row(row: Dict[str, Any]) -> None:
             "Insufficient data: no provider returned price or fundamental "
             "fields for this symbol"
         )
+        # v4.7.0: clear the v5.75.0 atomic-write fields so the sheet does not
+        # display a stale recommendation_detailed = "BUY" alongside
+        # recommendation = "NA". Also write the engine-vocabulary
+        # recommendation_source = "empty_row" so the source field reflects the
+        # actual cause (per data_engine_v2 v5.75.0's _classify_recommendation_8tier
+        # source vocabulary: engine / provider_override / empty_row /
+        # scoring_unavailable).
+        row["recommendation_detailed"] = "NA"
+        row["recommendation_detail"] = ""
+        row["recommendation_source"] = "empty_row"
         for score_field in (
             "overall_score",
             "value_score",
@@ -1454,6 +1609,21 @@ def _detect_and_mark_empty_row(row: Dict[str, Any]) -> None:
             "risk_score",
             "valuation_score",
             "rank_overall",
+            # v4.7.0: new fields from scoring.py v5.6.0 / data_engine_v2 v5.75.0
+            # contract that must NOT show stale values on an empty row.
+            "overall_score_raw",
+            "overall_penalty_factor",
+            "opportunity_source",
+            "conviction_score",
+            "sector_relative_score",
+            "recommendation_priority_band",
+            "recommendation_priority",
+            "scoring_recommendation_source",
+            "scoring_schema_version",
+            "scoring_errors",
+            "top_factors",
+            "top_risks",
+            "position_size_hint",
         ):
             try:
                 row[score_field] = None
@@ -1953,7 +2123,24 @@ _FALLBACK_INSTRUMENT_KEYS: List[str] = [
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
     "position_qty", "avg_cost", "position_cost", "position_value",
     "unrealized_pl", "unrealized_pl_pct",
-    "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    "data_provider", "last_updated_utc", "last_updated_riyadh",
+    # v4.7.0: data_engine_v2 v5.75.0 / scoring.py v5.6.0 contract fields.
+    # schema_registry remains the SSOT for the canonical 106-field projection;
+    # this fallback list is defense-in-depth for the rare path where the
+    # registry is unavailable. Insertion order is BEFORE `warnings` so that
+    # the canonical "Warnings" column stays the last sheet column.
+    "recommendation_detailed", "recommendation_source",
+    "recommendation_priority", "recommendation_priority_band",
+    "scoring_recommendation_source", "scoring_schema_version", "scoring_errors",
+    "overall_score_raw", "overall_penalty_factor", "opportunity_source",
+    "conviction_score", "sector_relative_score",
+    "top_factors", "top_risks", "position_size_hint",
+    "recommendation_detail",
+    "short_term_signal", "rsi_signal",
+    "horizon_label", "horizon_days_effective",
+    "day_range_position", "volume_ratio",
+    "provider_rating",
+    "warnings",
 ]
 
 _FALLBACK_INSTRUMENT_HEADERS: List[str] = [
@@ -1976,7 +2163,20 @@ _FALLBACK_INSTRUMENT_HEADERS: List[str] = [
     "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
     "Position Qty", "Avg Cost", "Position Cost", "Position Value",
     "Unrealized P/L", "Unrealized P/L %",
-    "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)",
+    # v4.7.0 additions (paired 1:1 with _FALLBACK_INSTRUMENT_KEYS above)
+    "Recommendation Detailed", "Recommendation Source",
+    "Recommendation Priority", "Recommendation Priority Band",
+    "Scoring Recommendation Source", "Scoring Schema Version", "Scoring Errors",
+    "Overall Score Raw", "Overall Penalty Factor", "Opportunity Source",
+    "Conviction Score", "Sector Relative Score",
+    "Top Factors", "Top Risks", "Position Size Hint",
+    "Recommendation Detail",
+    "Short Term Signal", "RSI Signal",
+    "Horizon Label", "Horizon Days Effective",
+    "Day Range Position", "Volume Ratio",
+    "Provider Rating",
+    "Warnings",
 ]
 
 _FALLBACK_TOP10_EXTRA_KEYS: List[str] = [
@@ -2152,7 +2352,7 @@ def normalize_rows(
     page: str,
 ) -> List[Dict[str, Any]]:
     """
-    v4.6.0 pipeline order for instrument-shaped pages:
+    v4.7.0 pipeline order for instrument-shaped pages:
         1.  _strip_internal_fields              (v4.2.0)
         2.  symbol/ticker alias                 (existing)
         3.  _derive_metadata_from_normalize     (v4.5.0)
@@ -2161,11 +2361,12 @@ def normalize_rows(
         6.  _sanitize_outliers                  (v4.5.0)
         7.  _sanitize_price_consistency         (v4.5.0)
         8.  _check_revenue_currency_units       (v4.5.0)
-        8b. _check_market_cap_currency_units    (v4.6.0 NEW)
+        8b. _check_market_cap_currency_units    (v4.6.0)
         9.  _normalize_warnings_field           (v4.3.0)
+        9b. _normalize_scoring_errors_field     (v4.7.0 NEW)
         10. _ensure_provenance_fields           (v4.4.0)
-        11. _detect_and_mark_empty_row          (v4.5.0)
-        11b. _strip_stale_warnings              (v4.6.0 NEW — runs LAST)
+        11. _detect_and_mark_empty_row          (v4.5.0, EXPANDED v4.7.0)
+        11b. _strip_stale_warnings              (v4.6.0 — runs LAST)
         12. top10-specific normalization        (existing)
         13. schema_projection                   (existing)
     """
@@ -2188,6 +2389,7 @@ def normalize_rows(
             _check_market_cap_currency_units(rd)
         _normalize_warnings_field(rd)
         if instrument_shaped:
+            _normalize_scoring_errors_field(rd)
             _ensure_provenance_fields(rd)
             _detect_and_mark_empty_row(rd)
             _strip_stale_warnings(rd)
@@ -3101,6 +3303,10 @@ async def build_enriched_quote_payload(
             "engine_type": type(engine_obj).__name__ if engine_obj is not None else "none",
             "source_meta_keys": sorted(list(source_meta.keys())) if isinstance(source_meta, Mapping) else [],
             "normalize_ssot_available": _infer_symbol_metadata is not None,
+            # v4.7.0: contract version markers — audit tooling reads these to
+            # verify data_engine_v2 / scoring.py / enriched_quote.py alignment.
+            "engine_contract_version": _ENGINE_CONTRACT_VERSION,
+            "scoring_contract_version": _SCORING_CONTRACT_VERSION,
         },
     )
 
