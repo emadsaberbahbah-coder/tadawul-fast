@@ -2,12 +2,108 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.6.0
-FULL REVISED VERSION / ENGINE-CONTRACT-ALIGNED
+Scoring Module — v5.7.0
+FULL REVISED VERSION / RECO-VOCABULARY-EXPANSION-ALIGNED
 ================================================================================
 Purpose
 -------
 Canonical scoring and recommendation source for Tadawul Fast Bridge.
+
+v5.7.0 reco-vocabulary expansion alignment over v5.6.0  (reco_normalize v8.0.0)
+-------------------------------------------------------------------------------
+MAJOR: the canonical RECOMMENDATION_ENUM is expanded from 6 tiers to 8 to align
+with core.reco_normalize v8.0.0's 8-tier canonical vocabulary. Previously
+scoring.py could only represent six of the eight tiers, so when reco_normalize
+v8.0.0 began emitting ACCUMULATE and AVOID, routing those values through
+normalize_recommendation_code() silently re-collapsed ACCUMULATE into BUY
+(via _LOCAL_RECO_ALIASES) and AVOID into STRONG_SELL (the v5.6.0 fix that is
+now itself obsolete). v5.7.0 removes that lossy collapse.
+
+Canonical tiers (best -> worst):
+    STRONG_BUY, BUY, ACCUMULATE, HOLD, REDUCE, SELL, STRONG_SELL, AVOID
+
+1. ENUM EXPANSION
+   RECOMMENDATION_ENUM gains ACCUMULATE and AVOID. The Signal enum (used by
+   short_term_signal) is extended symmetrically for vocabulary consistency,
+   even though short_term_signal itself still emits only the BUY/HOLD/SELL
+   subset relevant to short-horizon technical setups.
+
+2. ALIAS TABLE UPDATE
+   _LOCAL_RECO_ALIASES["ACCUMULATE"] -> ACCUMULATE  (was BUY)
+   _LOCAL_RECO_ALIASES["AVOID"]      -> AVOID       (was STRONG_SELL in v5.6.0)
+   New aliases: SCALE_IN / SCALEIN / SCALING_IN / BUILD_POSITION -> ACCUMULATE;
+   DO_NOT_BUY / DONOTBUY / UNINVESTABLE / STAY_AWAY -> AVOID. The v5.6.0
+   "AVOID -> STRONG_SELL" alignment is now obsolete: data_engine_v2 v5.75.0's
+   _v573_collapse_to_canonical_enum and reco_normalize v8.0.0 both treat
+   AVOID as its own canonical tier in the 8-tier vocabulary.
+
+3. RECOMMENDATION LADDER EXTENDED
+   compute_recommendation() gains two new branches:
+     - AVOID at the top of the ladder: fires when overall score is critically
+       low (< 15) OR when fundamental_view == BEARISH AND technical_view ==
+       BEARISH AND value_view == EXPENSIVE (the "uninvestable" pattern from
+       reco_normalize v8.0.0's _classify_views_with_rule_id).
+     - ACCUMULATE replaces the two "Watch / accumulate candidate" HOLD
+       branches (MONTH and LONG horizons), where moderate ROI and score were
+       previously forced to round to HOLD because ACCUMULATE didn't exist.
+       Numeric thresholds are preserved verbatim — only the emitted tier
+       changes, from HOLD with "accumulate candidate" prose to ACCUMULATE
+       proper. STRONG_BUY / BUY / HOLD / REDUCE / SELL / STRONG_SELL
+       branch conditions are unchanged. The STRONG_SELL reason text is
+       tightened from "require urgent exit or avoidance" to "require urgent
+       exit" since AVOID is now a distinct tier.
+
+4. PRIORITY BAND MAPPING
+   _compute_priority() gains cases for the new tiers:
+     - ACCUMULATE -> P3 (same band as a normal BUY; the action is still a
+       buy, just gradual)
+     - AVOID      -> P1 (same band as STRONG_SELL; both are urgent —
+       STRONG_SELL says "exit now", AVOID says "exit now and never re-enter")
+   The P1..P5 band vocabulary is unchanged; schema_registry v2.11.0's
+   documentation of the band as P1..P5 remains accurate.
+
+5. POSITION-SIZE HINT FALLBACKS
+   The fallback hint logic in compute_scores() (used when insights_builder
+   does not return a hint) gains:
+     - ACCUMULATE -> "Scale in gradually / partial position"
+     - AVOID      -> "Avoid entirely / do not enter or hold"
+   The "Exit or avoid" hint for SELL/STRONG_SELL is tightened to "Exit
+   position" so it does not overlap semantically with the new AVOID tier.
+
+6. CONTRACT VERSION MARKER
+   New module constant _RECO_NORMALIZE_CONTRACT_VERSION = "8.0.0", surfaced
+   in get_canonical_state() as reco_normalize_contract_version. Audit
+   tooling can read this to verify which reco_normalize release scoring.py
+   was built to align with (mirrors the _ENGINE_CONTRACT_VERSION pattern
+   from v5.6.0).
+
+7. LOG PREFIXES
+   [v5.6.0 INSUFFICIENT] / [v5.6.0 SCORE] roll forward to [v5.7.0 *] so log
+   scraping tools can distinguish releases.
+
+8. RECOMMENDATION_SOURCE_TAG auto-bump
+   Derived from __version__ via f-string; now reads "scoring.py v5.7.0"
+   automatically. data_engine_v2 v5.75.0's _preserve_scoring_provenance
+   stores this tag verbatim under scoring_recommendation_source, so the
+   bump is transparent to the engine.
+
+Backward-compatible: existing consumers that previously saw at most six
+tiers will now occasionally see ACCUMULATE or AVOID. Any consumer with a
+hard-coded 6-tier allow-list must widen to the full 8-tier set
+(reference CANONICAL_RECOMMENDATION_CODES). The recommendation_detailed
+field (mirror of recommendation, introduced in v5.6.0) inherits the
+widened domain; AssetScores.recommendation and AssetScores.recommendation_detailed
+are both typed as str and accept any canonical tier.
+
+Migration follow-ons (separate scope):
+- schema_registry v2.11.0's Recommendation column docstring says "5-tier
+  canonical token"; needs a v2.12.0 update for the 8-tier vocabulary.
+- v2.11.0's AVOID-asymmetry note (reco_normalize AVOID->SELL vs scoring
+  AVOID->STRONG_SELL) is now stale: both layers route AVOID to AVOID.
+- data_engine_v2 v5.75.0's _v573_collapse_to_canonical_enum decides
+  whether the SHEET sees the 8-tier vocabulary or stays collapsed at the
+  boundary. scoring.py widening does not change sheet output until
+  data_engine_v2 v5.76.0 decides whether to widen the collapse map.
 
 Key fixes versus v5.3.0
 -----------------------
@@ -23,9 +119,12 @@ Key fixes versus v5.3.0
    forecast/fair-value inputs are missing.
 6. Provider sanity checks: dividend yield, debt/equity, percentage-like fields,
    and suspicious currency-sensitive values are normalized/flagged defensively.
-7. Conservative but usable recommendation ladder: final enum remains closed
-   to STRONG_BUY/BUY/HOLD/REDUCE/SELL/STRONG_SELL, while detail/position hint
-   can surface WATCH / ACCUMULATE CANDIDATE wording.
+7. Recommendation ladder: v5.7.0 expands the final enum to the full 8-tier
+   canonical vocabulary (STRONG_BUY / BUY / ACCUMULATE / HOLD / REDUCE /
+   SELL / STRONG_SELL / AVOID). Earlier releases noted the enum was "closed
+   to STRONG_BUY/BUY/HOLD/REDUCE/SELL/STRONG_SELL while detail/position hint
+   can surface WATCH / ACCUMULATE CANDIDATE wording" — that workaround is
+   no longer needed; ACCUMULATE is now a first-class tier.
 8. Ranking remains a full-dataset operation; do not rank partial refresh batches
    unless the caller intentionally wants local batch ranks.
 
@@ -150,7 +249,7 @@ logger.addHandler(logging.NullHandler())
 # Version / Canonical contract
 # =============================================================================
 
-__version__ = "5.6.0"
+__version__ = "5.7.0"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -164,13 +263,26 @@ RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
 # constant (also surfaced via get_canonical_state()) to verify alignment.
 _ENGINE_CONTRACT_VERSION = "5.75.0"
 
+# v5.7.0: explicit marker of which core.reco_normalize release this scoring.py
+# was built to align with. reco_normalize v8.0.0 widened the canonical
+# recommendation vocabulary from 6 tiers to 8 (added ACCUMULATE between BUY
+# and HOLD, plus STRONG_SELL and AVOID as the worst-case tiers). The
+# Recommendation enum, view-aware _classify_views_with_rule_id resolver,
+# to_score() ordinal range (0-7), from_score() banding, _LOCAL_RECO_ALIASES
+# mappings, _apply_negation softening rules, and conviction-floor cascade all
+# track this contract. Audit tooling reads this constant via
+# get_canonical_state() to verify alignment.
+_RECO_NORMALIZE_CONTRACT_VERSION = "8.0.0"
+
 RECOMMENDATION_ENUM: Tuple[str, ...] = (
     "STRONG_BUY",
     "BUY",
+    "ACCUMULATE",   # v5.7.0: new tier between BUY and HOLD (scale-in, gradual entry)
     "HOLD",
     "REDUCE",
     "SELL",
     "STRONG_SELL",
+    "AVOID",        # v5.7.0: new worst-case tier ("do not hold and do not enter")
 )
 CANONICAL_RECOMMENDATION_CODES: Tuple[str, ...] = RECOMMENDATION_ENUM
 _CANONICAL_RECO: Set[str] = set(CANONICAL_RECOMMENDATION_CODES)
@@ -364,10 +476,12 @@ class Horizon(str, Enum):
 class Signal(str, Enum):
     STRONG_BUY = "STRONG_BUY"
     BUY = "BUY"
+    ACCUMULATE = "ACCUMULATE"   # v5.7.0: vocabulary parity with RECOMMENDATION_ENUM
     HOLD = "HOLD"
     REDUCE = "REDUCE"
     SELL = "SELL"
     STRONG_SELL = "STRONG_SELL"
+    AVOID = "AVOID"             # v5.7.0: vocabulary parity with RECOMMENDATION_ENUM
 
 
 class RSISignal(str, Enum):
@@ -1708,10 +1822,24 @@ _LOCAL_RECO_ALIASES: Dict[str, str] = {
     "CONVICTION_BUY": "STRONG_BUY",
     "TOP_PICK": "STRONG_BUY",
     "BUY": "BUY",
-    "ACCUMULATE": "BUY",
     "ADD": "BUY",
     "OUTPERFORM": "BUY",
     "OVERWEIGHT": "BUY",
+    # v5.7.0: ACCUMULATE is now its own canonical tier in the 8-tier
+    # vocabulary, no longer collapsed into BUY. Vendor labels that signal
+    # "scale in" / "build position gradually" route here.
+    "ACCUMULATE": "ACCUMULATE",
+    "ACCUMULATION": "ACCUMULATE",
+    "SCALE_IN": "ACCUMULATE",
+    "SCALEIN": "ACCUMULATE",
+    "SCALE IN": "ACCUMULATE",
+    "SCALING_IN": "ACCUMULATE",
+    "BUILD_POSITION": "ACCUMULATE",
+    "BUILDPOSITION": "ACCUMULATE",
+    "START_POSITION": "ACCUMULATE",
+    "PARTIAL_BUY": "ACCUMULATE",
+    "PHASE_IN": "ACCUMULATE",
+    "GRADUAL_BUY": "ACCUMULATE",
     "HOLD": "HOLD",
     "NEUTRAL": "HOLD",
     "MAINTAIN": "HOLD",
@@ -1721,12 +1849,33 @@ _LOCAL_RECO_ALIASES: Dict[str, str] = {
     "TRIM": "REDUCE",
     "UNDERWEIGHT": "REDUCE",
     "SELL": "SELL",
-    "AVOID": "STRONG_SELL",  # v5.6.0: align with data_engine_v2 _v573_collapse_to_canonical_enum
     "EXIT": "SELL",
     "UNDERPERFORM": "SELL",
     "STRONG_SELL": "STRONG_SELL",
     "STRONGSELL": "STRONG_SELL",
     "STRONG SELL": "STRONG_SELL",
+    # v5.7.0: AVOID is now its own canonical tier ("do not hold and do not
+    # enter"). The v5.6.0 mapping AVOID -> STRONG_SELL is reversed: both
+    # core.reco_normalize v8.0.0 and data_engine_v2's
+    # _v573_collapse_to_canonical_enum (v5.76.0+, when widened) now treat
+    # AVOID as a distinct destination. Synonyms route legacy vendor
+    # "uninvestable / do-not-buy" idioms here.
+    "AVOID": "AVOID",
+    "AVOIDANCE": "AVOID",
+    "DO_NOT_BUY": "AVOID",
+    "DONOTBUY": "AVOID",
+    "DO NOT BUY": "AVOID",
+    "DO_NOT_ENTER": "AVOID",
+    "DO_NOT_INVEST": "AVOID",
+    "STAY_AWAY": "AVOID",
+    "UNINVESTABLE": "AVOID",
+    "NOT_INVESTABLE": "AVOID",
+    "BLACKLIST": "AVOID",
+    "BLACKLISTED": "AVOID",
+    "NEVER_BUY": "AVOID",
+    "STEER_CLEAR": "AVOID",
+    "NO_GO": "AVOID",
+    "NOGO": "AVOID",
 }
 
 _TRAILING_ARROW_RE = re.compile(
@@ -1984,8 +2133,39 @@ def compute_recommendation(
     # First: confidence/risk controls.
     if c < 35.0:
         return _reason("HOLD", f"Low confidence ({_round(c, 1)}%) prevents a reliable action signal.")
+
+    # v5.7.0: AVOID branches — uninvestable. Mirrors reco_normalize v8.0.0's
+    # _classify_views_with_rule_id: a critically low overall score floors
+    # to AVOID, and a fundamentals+technicals+valuation BEARISH/BEARISH/
+    # EXPENSIVE consensus is the canonical "do not hold and do not enter"
+    # pattern. Both branches must check before STRONG_SELL — AVOID is the
+    # strictly worst tier, and a row that qualifies for AVOID would
+    # otherwise pass into the STRONG_SELL branch and lose the distinction
+    # between "exit urgently" and "exit urgently AND never re-enter".
+    if o < 15.0:
+        return _reason(
+            "AVOID",
+            f"Overall score critically low ({_round(o, 1)}) — uninvestable, "
+            f"do not enter or hold.",
+        )
+    fund_v_norm = (fundamental_view or "").upper().strip()
+    tech_v_norm = (technical_view or "").upper().strip()
+    val_v_norm = (value_view or "").upper().strip()
+    if (
+        fund_v_norm == "BEARISH"
+        and tech_v_norm == "BEARISH"
+        and val_v_norm == "EXPENSIVE"
+    ):
+        return _reason(
+            "AVOID",
+            "Bearish fundamentals AND bearish technicals on an expensive "
+            "valuation — uninvestable, do not enter or hold.",
+        )
+
     if r >= 90.0 and (c < 45.0 or o < 45.0):
-        return _reason("STRONG_SELL", "Extreme risk and weak support require urgent exit or avoidance.")
+        # v5.7.0: tightened text — "or avoidance" removed because AVOID is
+        # now a distinct tier with its own checks above.
+        return _reason("STRONG_SELL", "Extreme risk and weak support require urgent exit.")
     if r >= 85.0 and o < 55.0:
         return _reason("SELL", "Very high risk overrides the score profile.")
     if r >= 75.0 and o < 70.0:
@@ -2007,7 +2187,15 @@ def compute_recommendation(
         if active >= 0.10 and c >= 60 and r <= 65 and o >= 68 and (v >= 55 or q >= 70):
             return _reason("BUY", f"Positive {active_label} expected return with acceptable confidence and risk.")
         if active >= 0.06 and c >= 60 and r <= 70 and o >= 65:
-            return _reason("HOLD", f"Watch / accumulate candidate, but {active_label} return or risk is not strong enough for BUY.")
+            # v5.7.0: was HOLD with "Watch / accumulate candidate" prose.
+            # Numeric thresholds preserved verbatim; only the emitted tier
+            # changes now that ACCUMULATE is a first-class canonical tier.
+            return _reason(
+                "ACCUMULATE",
+                f"Scale in / accumulate — moderate {active_label} return "
+                f"(score {_round(o, 1)}) supports a gradual position, but is "
+                f"below the BUY threshold for a full entry.",
+            )
     else:
         # Month/default route.
         if active >= 0.18 and c >= 70 and r <= 55 and o >= 76:
@@ -2015,7 +2203,15 @@ def compute_recommendation(
         if active >= 0.07 and c >= 60 and r <= 60 and o >= 68:
             return _reason("BUY", f"Positive {active_label} expected return with acceptable confidence and risk.")
         if active >= 0.04 and c >= 60 and r <= 65 and o >= 65:
-            return _reason("HOLD", f"Watch / accumulate candidate, but {active_label} return is below BUY threshold.")
+            # v5.7.0: was HOLD with "Watch / accumulate candidate" prose.
+            # Numeric thresholds preserved verbatim; only the emitted tier
+            # changes now that ACCUMULATE is a first-class canonical tier.
+            return _reason(
+                "ACCUMULATE",
+                f"Scale in / accumulate — moderate {active_label} return "
+                f"(score {_round(o, 1)}) supports a gradual position, but is "
+                f"below the BUY threshold for a full entry.",
+            )
 
     # Quality fallback: allows good companies to remain HOLD instead of REDUCE.
     if o >= 70 and c >= 60 and r <= 70:
@@ -2047,12 +2243,22 @@ def _compute_priority(
     r = risk if risk is not None else 50.0
     c = confidence100 if confidence100 is not None else 55.0
     canon = normalize_recommendation_code(reco or "HOLD")
+    # v5.7.0: AVOID is P1-urgency (same as STRONG_SELL). Both say "act now";
+    # the canonical tier carries the distinction between "exit now" and
+    # "exit now AND never re-enter".
+    if canon == "AVOID":
+        return PRIO_P1
     if canon == "STRONG_SELL":
         return PRIO_P1
     if canon == "STRONG_BUY":
         return PRIO_P2
     if canon == "BUY":
         return PRIO_P2 if (o >= 78 and c >= 70 and r <= 60) else PRIO_P3
+    # v5.7.0: ACCUMULATE shares the normal-BUY priority band. The action is
+    # still a buy, just gradual; the canonical tier carries the "scale in"
+    # nuance vs a full-entry BUY.
+    if canon == "ACCUMULATE":
+        return PRIO_P3
     if canon == "REDUCE":
         return PRIO_P1 if (r >= 90 and c < 45) else PRIO_P5
     if canon == "SELL":
@@ -2321,7 +2527,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             ) if val is None
         ]
         logger.warning(
-            "[v5.6.0 INSUFFICIENT] symbol=%s missing=%s",
+            "[v5.7.0 INSUFFICIENT] symbol=%s missing=%s",
             _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
             ",".join(missing_components),
         )
@@ -2441,12 +2647,20 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     if not pos_hint:
         if canonical_rec in {"STRONG_BUY", "BUY"}:
             pos_hint = "Add gradually / accumulate"
+        elif canonical_rec == "ACCUMULATE":
+            # v5.7.0: ACCUMULATE is its own tier — explicit "scale in" hint.
+            pos_hint = "Scale in gradually / partial position"
         elif canonical_rec == "HOLD" and overall is not None and overall >= 65:
             pos_hint = "Maintain / watch for better entry"
         elif canonical_rec == "REDUCE":
             pos_hint = "Avoid new exposure / reduce"
         elif canonical_rec in {"SELL", "STRONG_SELL"}:
-            pos_hint = "Exit or avoid"
+            # v5.7.0: tightened from "Exit or avoid" — AVOID is now a
+            # distinct tier with its own hint below.
+            pos_hint = "Exit position"
+        elif canonical_rec == "AVOID":
+            # v5.7.0: explicit uninvestable hint, distinct from SELL.
+            pos_hint = "Avoid entirely / do not enter or hold"
         else:
             pos_hint = "Maintain"
 
@@ -2457,7 +2671,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     scoring_errors = _dedupe_preserving_order(scoring_errors)
 
     logger.info(
-        "[v5.6.0 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
+        "[v5.7.0 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
         _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
         overall,
         risk,
@@ -2732,6 +2946,7 @@ def get_canonical_state() -> Dict[str, Any]:
         "version": SCORING_VERSION,
         "schema_version": SCORING_SCHEMA_VERSION,
         "engine_contract_version": _ENGINE_CONTRACT_VERSION,  # v5.6.0: data_engine_v2 release this scoring.py aligns with
+        "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,  # v5.7.0: reco_normalize release this scoring.py aligns with
         "recommendation_source_tag": RECOMMENDATION_SOURCE_TAG,
         "buckets_canonical": bool(BUCKETS_CANONICAL),
         "risk_thresholds": thresholds["risk_thresholds"],
@@ -2822,4 +3037,6 @@ __all__ = [
     "get_canonical_state",
     # v5.6.0 additions
     "_ENGINE_CONTRACT_VERSION",
+    # v5.7.0 additions
+    "_RECO_NORMALIZE_CONTRACT_VERSION",
 ]
