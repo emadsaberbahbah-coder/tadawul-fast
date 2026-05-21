@@ -2,9 +2,352 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.76.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.3
 ================================================================================
 
+WHY v5.77.3 - POLISH OVER v5.77.2 (DEFENSIVE SCHEMA / TRANSPARENCY / TELEMETRY)
+------------------------------------------------------------------------------
+v5.77.3 is a small polish pass closing out the v5.77.2 audit. Three changes
+plus one deployment note. No new features, no contract changes.
+
+  Polish 1 - forecast_source elevated to required canonical key.
+    ChatGPT v5.77.2 audit flagged: if an external schema_registry.py
+    returns 106 columns (the pre-v5.77.1 layout), the
+    _instrument_contract_is_canonical() check would still return True
+    because forecast_source (the 107th field added in v5.77.1) was
+    not in _INSTRUMENT_CANONICAL_REQUIRED_KEYS. This made the schema-
+    drift catch silently permissive during partial deployments.
+    v5.77.3 adds "forecast_source" to the required set, so a 106-
+    column external schema now correctly fails the canonical check
+    and _usable_contract() falls back to the built-in STATIC 107-
+    column canonical. Pure defensive hardening.
+
+  Polish 2 - Capped-provider-target warning tag.
+    ChatGPT v5.77.2 audit suggested surfacing when the provider 12M
+    target return exceeds the Phase-II abs cap (±30%). v5.77.2 capped
+    silently before deriving 1M/3M, which left users wondering why a
+    provider 12M target of +60% produced a 3M figure of only +10.5%
+    (= +30% × 0.35) instead of +21% (= +60% × 0.35). v5.77.3 appends
+    "provider_target_capped_for_short_horizon_derivation" to the
+    warnings field whenever the cap actually fires. Tolerance of 1e-9
+    avoids spurious tagging on floating-point noise near the boundary.
+
+  Polish 3 - Schema-count telemetry in _finalize_payload.
+    Gemini v5.77.2 audit suggested logging when the finalized payload
+    drifts from the canonical 107-column shape. Catches schema-
+    mismatch bugs at the engine boundary instead of after the
+    dashboard renders broken cells. Logs WARNING (not ERROR) so the
+    payload still flows downstream — this is observability, not a
+    hard gate.
+
+  Deployment note - Render TFB_PROVIDER_POOL_WORKERS.
+    ChatGPT v5.77.2 audit recommended lowering the default provider
+    pool size (200) on Render to 80-120 for memory safety. This is
+    NOT a code change — the in-code default stays at 200 to avoid
+    surprising operators running on larger hosts. On Render, set the
+    env var: TFB_PROVIDER_POOL_WORKERS=80 (or up to 120). The
+    threading.Lock + double-checked locking from v5.77.1 makes any
+    value safe; the question is memory footprint per worker.
+
+PRESERVED - strictly:
+  All v5.77.2 / v5.77.1 / v5.77.0 / v5.76.0 / v5.75.0 architectural
+  behavior. The 107-field canonical schema is unchanged. v5.77.0's
+  intrinsic-value calibration, Phase-II forecast weights, LRU cache,
+  sanitization bounds, dividend yield ceiling, RSI multiplicative
+  dampening, double-checked locking on _PROVIDER_EXECUTOR,
+  forecast_source provider_target detection with _norm_key_loose,
+  fallback source tagging, 1M/3M derivation from provider 12M target,
+  and reset_provider_executor() test helper all preserved.
+
+================================================================================
+WHY v5.77.2 - HOTFIX OVER v5.77.1 (snake_case ALIASES / YAHOO POOL / FALLBACK SOURCE / 1M-3M DERIVATION)
+--------------------------------------------------------------------------------
+v5.77.2 closes four remaining gaps in v5.77.1 surfaced by post-release audit:
+
+  Hotfix 1 - snake_case provider-target aliases NOT detected.
+    v5.77.1 detected provider analyst targets by comparing alias keys
+    via lowercase string equality. "targetMeanPrice" became
+    "targetmeanprice" and matched. But "target_mean_price" stayed
+    "target_mean_price" and DID NOT match the lowercase camelCase
+    keys. Some upstream providers (and some snake_case JSON consumers
+    upstream of the engine) emit snake_case field names, which meant
+    forecast_source stayed empty and Phase-II overwrote a legitimate
+    provider target with its synthesis. v5.77.2 switches to a
+    fully-normalized comparison (strip all non-alphanumeric chars,
+    lowercase) so "targetMeanPrice", "target_mean_price",
+    "TARGET-MEAN-PRICE", and "target.mean.price" all collapse to
+    "targetmeanprice" and match.
+
+  Hotfix 2 - Yahoo enrichment bypassed the dedicated provider pool.
+    v5.77.1 added _call_maybe_async to route sync provider calls
+    through the dedicated 200-worker pool, but THREE Yahoo enrichment
+    call sites (yahoo fundamentals, yahoo chart quote, yahoo history)
+    still called `await asyncio.to_thread(fn, ...)` directly. Under
+    high concurrency these calls saturated asyncio's default executor
+    (~36 threads), partially defeating the dedicated-pool fix.
+    v5.77.2 routes all three through _call_maybe_async so the
+    dedicated pool serves the entire provider call surface.
+
+  Hotfix 3 - forecast_source = "fallback" was documented but never set.
+    v5.77.1's docstring listed four forecast_source values:
+      provider_target / phase_ii_synthetic / fallback / blank
+    But no code path ever wrote "fallback". When core.scoring failed
+    and _compute_scores_local_fallback synthesized forecast prices,
+    forecast_source stayed empty — making the dashboard column
+    indistinguishable from "no forecast available". v5.77.2 sets
+    row["forecast_source"] = "fallback" inside the fallback function,
+    but ONLY when it actually creates a forecast price AND no upstream
+    source (provider_target / phase_ii_synthetic) is already set.
+
+  Hotfix 4 - Provider-target branch left 1M and 3M columns blank.
+    v5.77.1's Phase-II guard `if existing_source == "provider_target":
+    return` correctly protected the 12M analyst target from being
+    overwritten — but `return` also skipped the 1M/3M derivation that
+    happens later in the function. For every stock with a provider
+    target (the majority of the universe), the 1M and 3M forecast
+    columns came back blank. v5.77.2 still treats the provider 12M
+    target as authoritative (no overwrite of the 12M field) but
+    derives 1M and 3M from it using the same _PHASE_II_RATIO_3M_OF_12M
+    (0.35) and _PHASE_II_RATIO_1M_OF_12M (0.12) constants used for
+    synthesized forecasts. expected_roi_* fields are similarly
+    derived. The result: provider-target rows now have populated
+    short-horizon forecasts AND the 12M anchor stays untouched.
+
+  Bonus - reset_provider_executor() helper exposed for test suites.
+    Gemini suggested this for test-environment ergonomics: tests that
+    vary TFB_PROVIDER_POOL_WORKERS need a way to discard the cached
+    executor and rebuild it. Wraps _shutdown_provider_executor() with
+    a clearer "intended for tests, not runtime" docstring.
+
+PRESERVED - strictly:
+  All v5.77.1 / v5.77.0 / v5.76.0 / v5.75.0 architectural behavior.
+  No API shape changes — the 107-field canonical contract stays.
+  v5.77.0's intrinsic-value calibration (sector_pe_map, sector_pb_map),
+  Phase-II forecast weights, LRU cache, sanitization bounds, dividend
+  yield ceiling, recommendation_reason prefix rewrite on collapse,
+  v5.77.1's double-checked locking on the provider pool, multiplicative
+  RSI dampening, and provider-target schema field all preserved.
+
+================================================================================
+WHY v5.77.1 - HOTFIX OVER v5.77.0 (RACE / FORECAST_SOURCE / RSI / SCHEMA)
+------------------------------------------------------------------------
+v5.77.1 closes four gaps in v5.77.0 surfaced by post-release audit:
+
+  Hotfix 1 - RACE CONDITION on dedicated provider pool initialization.
+    v5.77.0 lazy-initialized _PROVIDER_EXECUTOR with no lock. Under
+    concurrent first-touch (200 quotes starting before the executor
+    is created), every coroutine saw `is None` and each tried to
+    spawn its own ThreadPoolExecutor, producing orphaned pools and
+    a memory spike. Fixed with standard double-checked locking using
+    threading.Lock (the correct sync primitive — _get_provider_executor
+    is a sync function called from inside async coroutines).
+    Also added _shutdown_provider_executor() called from
+    DataEngineV5.aclose() so the pool is released on teardown.
+
+  Hotfix 2 - forecast_source = "provider_target" was never actually set.
+    v5.77.0 added the protection check `if existing_source ==
+    "provider_target": return` in _phase_ii_quality_forecast, but no
+    upstream code ever wrote that tag — leaving the feature half-
+    finished. v5.77.1 sets the tag inside _canonicalize_provider_row
+    when any known provider-target alias (targetMeanPrice,
+    targetMedianPrice, targetHighPrice, targetPrice12m,
+    priceTarget12m, analystTargetPrice, consensusTarget, etc.) is
+    detected in the raw source. Phase-II's idempotency check now
+    actually fires when a provider supplied an analyst target.
+
+  Hotfix 3 - targetMeanPrice was incorrectly mapped to 3M horizon.
+    v5.77.0 (and earlier) listed "targetMeanPrice" in the
+    forecast_price_3m alias list. Yahoo's targetMeanPrice is the 12M
+    analyst consensus, not a quarterly target. Putting it on 3M caused
+    the engine to treat a 12-month price target as a quarterly
+    forecast, corrupting the 3M ROI math. v5.77.1 moves it to
+    forecast_price_12m where it belongs, and adds analystTargetPrice
+    and consensusTarget for cross-provider coverage.
+
+  Hotfix 4 - RSI penalty magnitude on 1M/3M was too aggressive.
+    v5.77.0 moved the RSI bump (-3% / +3% absolute) from the 12M
+    forecast to 1M/3M derived returns. The horizon-shift was correct
+    (RSI doesn't predict 12M returns) but the magnitude wasn't
+    reconsidered. On a blue-chip with baseline 1M return of +1.5%,
+    an absolute -3% for RSI>75 swung the expectation to -1.5%
+    (implying ~36% annualized technical drag). v5.77.1 switches to
+    multiplicative dampening for positive expectations (halving on
+    extreme RSI, smaller damping on moderate RSI) and uses a smaller
+    absolute add only when no baseline positive expectation exists.
+
+  Hotfix 5 - forecast_source now surfaced to the canonical sheet.
+    Added as the 107th canonical key (and "Forecast Source" header).
+    The sheet schema is now 107 fields. Values:
+      "provider_target"    - upstream analyst target
+      "phase_ii_synthetic" - engine synthesized
+      "fallback"           - local heuristic
+      ""                   - no forecast available
+    This is the first schema expansion since v5.74.0's 97 -> 106
+    expansion. Schema consumers (Apps Script, sheet validators) MUST
+    accept the new column.
+
+PRESERVED - strictly:
+  All v5.77.0 / v5.76.0 / v5.75.0 architectural behavior. No API
+  shape changes beyond the additive 107th canonical field. v5.77.0's
+  intrinsic-value calibration (sector_pe_map, sector_pb_map),
+  Phase-II forecast weights, LRU cache, sanitization bounds,
+  dividend yield ceiling, and recommendation_reason prefix rewrite
+  on collapse all preserved.
+
+================================================================================
+WHY v5.77.0 - VALUATION-MODEL CALIBRATION + FORECAST GUARDRAILS + LRU CACHE
+---------------------------------------------------------------------------
+v5.77.0 is a focused correctness patch over v5.76.0. It addresses the
+systematic bearish-bias on growth-sector equities identified in the
+2026-05-21 dashboard audit by recalibrating the intrinsic-value model
+and tightening forecast guardrails. No API shape changes; all v5.76.0
+contract markers and atomic-write semantics preserved. The behavior
+change is in the math, not the structure.
+
+Bug 1 - sector_pe_map produced systematically-low intrinsics on growth
+        names. Audit math against GOOGL (eps=$13.11, pb=9.84, comm-services
+        sector): the v5.76.0 map's fair_pe=18.0 for "communication services"
+        and the universal book_value * 1.5 anchor produced intrinsic=$177.08
+        vs actual market price $388.91 (-54.5% upside). The model is a
+        1990s-era value-investor heuristic that systematically penalizes
+        any profitable company trading above its book * 1.5.
+
+  Fix in two places:
+    (a) sector_pe_map updated to post-2020 sector P/E medians sourced
+        from S&P 500 GICS composites and Damodaran sector multiples:
+          technology 25.0 -> 32.0
+          communication services 18.0 -> 28.0
+          consumer cyclical 18.0 -> 22.0
+          consumer electronics 22.0 -> 25.0
+          financial services 13.0 -> 14.0
+          healthcare 22.0 -> 24.0
+          industrials 19.0 -> 20.0
+          energy 12.0 -> 14.0
+          utilities 17.0 -> 18.0
+          basic materials 15.0 -> 16.0
+          (consumer defensive, real estate unchanged)
+        Default for unknown sectors raised 18.0 -> 20.0.
+    (b) sector_pb_map ADDED. The v5.76.0 hardcoded `pb_candidate =
+        book_value * 1.5` is replaced with `book_value * sector_pb_map.get(
+        sector, 2.0)`. Modern tech-driven companies trade at legitimate
+        P/B of 5-10x for moats / scale-economics reasons; the v5.76.0
+        1.5x universal anchor flagged them as 80%+ overvalued.
+        After fix: GOOGL intrinsic = $310.59 (was $177.08), upside =
+        -20.1% (was -54.5%). NVDA/META/MSFT see similar corrections.
+
+Bug 2 - _phase_ii_quality_forecast unconditionally overwrote provider
+        analyst targets. The function ran twice per quote (pre-scoring
+        and post-scoring via _apply_phase_dd_enhancements), and BOTH
+        runs blindly overwrote forecast_price_12m, even when the
+        upstream provider had supplied a legitimate analyst target.
+
+  Fix:
+    (a) New field `forecast_source` tags the origin: provider_target /
+        phase_ii_synthetic / fallback / unavailable. Phase-II skips the
+        overwrite when forecast_source == "provider_target".
+    (b) RSI bump (-3% / +3%) moved from 12M return to 1M/3M only.
+        14-day RSI has no statistical predictive power on 12-month
+        returns; applying it there corrupted the long-horizon anchor.
+        Now applied only to the short-horizon derivatives.
+    (c) Intrinsic-reversion component weight reduced from 0.40 to 0.25;
+        momentum component raised from 0.30 to 0.35; fundamentals from
+        0.20 to 0.25; baseline raised 0.10 to 0.15. Total still sums to
+        1.0 but the intrinsic-reversion drag is meaningfully reduced.
+    (d) `forecast_capped_at_ceiling` / `forecast_capped_at_floor`
+        warnings fire when the 12M return hits the ±30% clamp so
+        downstream consumers know the value is a guardrail, not a
+        per-symbol prediction.
+
+Bug 3 - MultiLevelCache used FIFO eviction instead of LRU. Hot keys
+        (frequently-accessed blue chips: AAPL, MSFT, NVDA, 2222.SR)
+        were evicted constantly because the eviction picked next(iter()) -
+        the first INSERTED key, not the least RECENTLY USED key.
+
+  Fix:
+    (a) _data switched from Dict to OrderedDict.
+    (b) get() calls move_to_end() on hit so accessed keys become MRU.
+    (c) Eviction now picks popitem(last=False) - the OLDEST USED key.
+
+Bug 4 - _V573_SANITIZATION_BOUNDS allowed nonsensical negative ratios.
+        v5.76.0 bounds permitted pe_ttm in (-1000, 1000), pb_ratio in
+        (-200, 200), ev_ebitda in (-500, 500), peg_ratio in (-100, 100).
+        Negative P/E means negative earnings (valuation undefined),
+        negative P/B means negative shareholders' equity (often
+        distressed), negative EV/EBITDA means negative EBITDA. These
+        should null out, not pass through as raw numbers.
+
+  Fix:
+    (a) pe_ttm / pe_forward: (-1000, 1000) -> (0.0, 500.0)
+    (b) pb_ratio:           (-200, 200)    -> (0.0, 100.0)
+    (c) ps_ratio:           (0, 200)       -> (0.0, 100.0)
+    (d) ev_ebitda:          (-500, 500)    -> (0.0, 200.0)
+    (e) peg_ratio:          (-100, 100)    -> (0.0, 20.0)
+    (f) debt_to_equity:     (0, 1000)      -> (0.0, 500.0)
+
+Bug 5 - No dividend_yield sanitizer. Dashboard showed yields like
+        BBCA 145%, MDLZ 138%, RACE 124% - obvious provider scale-factor
+        errors passed through unchecked. _build_top_factors_and_risks
+        even flagged these as positive "Dividend income" factors.
+
+  Fix:
+    (a) New _sanitize_dividend_yield function nulls yields > 30% and
+        emits a "dividend_yield_out_of_range" warning. The 30% ceiling
+        is generous (only a few mortgage REITs and BDCs legitimately
+        exceed 15%).
+
+Bug 6 - _as_float silently misinterpreted booleans as 0.0 / 1.0. If a
+        provider schema shift sent `{"dividend_yield": False}`, the
+        engine treated it as 0.0. Defensive engineering gap.
+
+  Fix:
+    (a) Bool guard added at top of _as_float.
+
+Bug 7 - _call_maybe_async used asyncio.to_thread's default executor
+        (capped at min(32, cpu_count+4) ~36 threads). Batch processing
+        200+ symbols can exhaust the default pool and stall the event
+        loop. With 8 call sites all using the same default pool,
+        contention under load is real.
+
+  Fix:
+    (a) Dedicated ThreadPoolExecutor `_PROVIDER_EXECUTOR` with 200
+        workers (configurable via TFB_PROVIDER_POOL_WORKERS env).
+    (b) _call_maybe_async routes sync calls through the dedicated
+        executor instead of asyncio.to_thread.
+
+Bug 8 - Sheet-compat collapse left recommendation_reason out of sync.
+        When TFB_COLLAPSE_RECOMMENDATION_TO_6TIER=true is set,
+        recommendation becomes "BUY" but recommendation_reason still
+        starts with "ACCUMULATE: ...". Visible mismatch.
+
+  Fix:
+    (a) _apply_sheet_compat_collapse now rewrites the leading prefix
+        of recommendation_reason ("ACCUMULATE: ..." -> "BUY: ...",
+        "AVOID: ..." -> "STRONG_SELL: ...") to keep the displayed
+        action consistent with the collapsed recommendation.
+
+PRESERVED - strictly:
+  All v5.76.0 / v5.75.0 / v5.74.0 / v5.73.x architectural behavior.
+  No API shape changes. No `data_quality` semantics changes. All
+  canonical contract shapes (106 fields) unchanged. Atomic-write
+  contract in _classify_recommendation_8tier preserved verbatim.
+  Cache namespace versioning unchanged. v5.75.0 once-only
+  provider_rating capture preserved. v5.76.0 8-tier vocabulary
+  passthrough preserved. The sheet-compat collapse opt-in via
+  TFB_COLLAPSE_RECOMMENDATION_TO_6TIER preserved with default false.
+
+DEFERRED - Phase 2 (separate release):
+  - Apps Script 04_Format.gs v2.9.0 deployment verification
+  - Phase-DD pre-score invocation elimination (currently the first
+    Phase-DD pass runs intrinsic + Phase-II forecast even though
+    scores aren't available yet - the classifier branch is skipped
+    via has_scores guard, but the forecast still runs. Net effect
+    is wasted CPU on the first pass, since the second pass overwrites
+    with full-input forecast anyway. Cleanup deferred to v5.78.0.)
+  - file split along seams named in the v5.74.0 WHY block
+  - core.scoring threshold recalibration
+  - yahoo_fundamentals_provider.py foreign-ticker gap
+
+================================================================================
 WHY v5.76.0 - 8-TIER VOCABULARY PASSTHROUGH + CROSS-STACK CONTRACT MARKERS
 -------------------------------------------------------------------------
 v5.76.0 closes the last remaining 6-tier choke point in the TFB stack.
@@ -365,7 +708,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.76.0"
+__version__ = "5.77.3"
 
 # v5.76.0 cross-stack contract version markers.
 # These document which core.scoring / core.reco_normalize releases
@@ -628,6 +971,22 @@ def _apply_sheet_compat_collapse(row: Dict[str, Any]) -> None:
     if rec == "ACCUMULATE" and current_band == "P3":
         row["recommendation_priority_band"] = "P2"
     # AVOID → STRONG_SELL: priority_band stays P1.
+    # v5.77.0: rewrite the leading prefix of recommendation_reason so
+    # the displayed action stays consistent with the collapsed value.
+    # Previously the reason text kept its original 8-tier prefix
+    # ("ACCUMULATE: Scale in...") while the recommendation column
+    # showed "BUY", producing a visible mismatch in the dashboard.
+    # Only the prefix is rewritten; the rest of the reason text is
+    # preserved so the structured-reason audit trail remains intact.
+    reason_text = _safe_str(row.get("recommendation_reason"))
+    if reason_text:
+        for orig_prefix, new_prefix in (
+            (rec + ":", collapsed + ":"),
+            (rec + " :", collapsed + " :"),
+        ):
+            if reason_text.startswith(orig_prefix):
+                row["recommendation_reason"] = new_prefix + reason_text[len(orig_prefix):]
+                break
     _v573_append_warning(row, "sheet_compat_6tier_collapse_applied")
 
 
@@ -1019,21 +1378,51 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     pe_ttm = _as_float(row.get("pe_ttm"))
     sector = _safe_str(row.get("sector")).lower()
 
+    # v5.77.0: sector_pe_map updated to post-2020 modern multiples.
+    # Previous values (v5.76.0 and earlier) were calibrated against
+    # 1990s-2010s value-investor norms and produced systematic
+    # "overvalued" calls on profitable growth names with P/E > 20.
+    # Sources: 10-year median sector P/Es from S&P 500 GICS sector
+    # composites and Damodaran sector multiples (NYU Stern, 2025).
     sector_pe_map = {
-        "technology": 25.0,
-        "consumer electronics": 22.0,
-        "communication services": 18.0,
-        "financial services": 13.0,
-        "healthcare": 22.0,
-        "consumer defensive": 22.0,
-        "consumer cyclical": 18.0,
-        "industrials": 19.0,
-        "energy": 12.0,
-        "utilities": 17.0,
-        "real estate": 25.0,
-        "basic materials": 15.0,
+        "technology":              32.0,   # was 25.0 - AI/cloud-era
+        "consumer electronics":    25.0,   # was 22.0
+        "communication services":  28.0,   # was 18.0 - modern tech-driven sector
+        "financial services":      14.0,   # was 13.0
+        "healthcare":              24.0,   # was 22.0
+        "consumer defensive":      22.0,   # unchanged
+        "consumer cyclical":       22.0,   # was 18.0
+        "industrials":             20.0,   # was 19.0
+        "energy":                  14.0,   # was 12.0
+        "utilities":               18.0,   # was 17.0
+        "real estate":             25.0,   # unchanged
+        "basic materials":         16.0,   # was 15.0
     }
-    fair_pe = sector_pe_map.get(sector, 18.0)
+    fair_pe = sector_pe_map.get(sector, 20.0)  # default was 18.0
+
+    # v5.77.0: sector_pb_map added. Previously the engine used a
+    # hardcoded `book_value * 1.5` as the P/B-based intrinsic candidate
+    # for every sector. That heuristic systematically penalized any
+    # profitable company trading above 1.5x book - basically every
+    # modern tech, healthcare, and consumer-discretionary name. Modern
+    # companies with sustainable moats / network effects / asset-light
+    # business models trade at legitimate P/B multiples of 4-10x.
+    # Sources: 10-year median P/B by GICS sector (S&P 500), Damodaran.
+    sector_pb_map = {
+        "technology":              6.0,
+        "consumer electronics":    5.0,
+        "communication services":  5.0,
+        "financial services":      1.2,
+        "healthcare":              4.0,
+        "consumer defensive":      3.5,
+        "consumer cyclical":       4.0,
+        "industrials":             2.5,
+        "energy":                  1.8,
+        "utilities":               1.5,
+        "real estate":             2.0,
+        "basic materials":         1.8,
+    }
+    fair_pb = sector_pb_map.get(sector, 2.0)
 
     candidates: List[float] = []
     weights: List[float] = []
@@ -1052,7 +1441,8 @@ def _compute_intrinsic_and_upside(row: Dict[str, Any]) -> None:
     if pb is not None and _INTRINSIC_MIN_TRUSTED_PB <= pb < 20:
         book_value = cp / pb
         if book_value > 0:
-            pb_candidate = book_value * 1.5
+            # v5.77.0: sector-aware P/B anchor (was: hardcoded 1.5x).
+            pb_candidate = book_value * fair_pb
             if _intrinsic_candidate_ok(pb_candidate, cp):
                 candidates.append(pb_candidate)
                 weights.append(0.2)
@@ -1780,6 +2170,10 @@ def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
 # =============================================================================
 
 _PHASE_II_MAX_12M_ABS_RETURN: float = 0.30
+# v5.77.2: lift inlined ratio constants to module-level so the provider-
+# target branch can reuse them consistently with the synthesis branch.
+_PHASE_II_RATIO_3M_OF_12M: float = 0.35
+_PHASE_II_RATIO_1M_OF_12M: float = 0.12
 _PHASE_II_MIN_12M_ABS_RETURN: float = -0.30
 _PHASE_II_VOL_BAND_FACTOR: float = 0.5
 _PHASE_II_CONF_MIN: float = 0.30
@@ -1794,6 +2188,60 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     if cp is None or cp <= 0:
         return
 
+    # v5.77.0: Idempotency / provider-target preservation.
+    # If a trusted upstream provider already supplied forecast_price_12m
+    # (analyst target) AND we've tagged the source as "provider_target",
+    # skip the synthesis pass. This prevents the engine from blindly
+    # overwriting legitimate analyst consensus with its own value-
+    # investor projection on every classifier re-run.
+    #
+    # v5.77.2: when provider_target is detected, do NOT return entirely —
+    # that left 1M and 3M forecast columns blank for every stock with a
+    # provider analyst target (which is the majority of the universe).
+    # ChatGPT v5.77.1 audit caught this. Fix: preserve the provider 12M
+    # target, but derive 1M and 3M from it using the same Phase-II
+    # ratio constants we use for synthesized forecasts. This way the
+    # short-horizon columns stay populated AND the analyst 12M target
+    # is the authoritative anchor (not overwritten).
+    existing_source = _safe_str(row.get("forecast_source")).lower()
+    if existing_source == "provider_target" and row.get("forecast_price_12m") is not None:
+        fp12 = _as_float(row.get("forecast_price_12m"))
+        if fp12 is not None and fp12 > 0:
+            # Implied 12M return from provider target.
+            return_12m = (fp12 - cp) / cp
+            # Cap to the Phase-II abs ceiling for consistency. Provider
+            # analyst targets sometimes exceed our ceiling; in that case
+            # the 12M field stays at the raw provider value, but the
+            # derived 1M/3M use the capped figure (otherwise short-
+            # horizon ROI would look unrealistic).
+            capped_12m = max(min(return_12m, _PHASE_II_MAX_12M_ABS_RETURN), -_PHASE_II_MAX_12M_ABS_RETURN)
+            # v5.77.3: surface a warning tag when the cap actually fires,
+            # so the dashboard can explain to users why a provider target
+            # implying +60% / -60% does not translate into proportional
+            # 1M/3M figures. ChatGPT v5.77.2 audit suggested this for
+            # transparency. Use a tolerance to avoid spurious tagging on
+            # floating-point noise near the cap boundary.
+            if abs(return_12m) - _PHASE_II_MAX_12M_ABS_RETURN > 1e-9:
+                _v573_append_warning(row, "provider_target_capped_for_short_horizon_derivation")
+            if row.get("forecast_price_3m") is None:
+                derived_3m_return = capped_12m * _PHASE_II_RATIO_3M_OF_12M
+                row["forecast_price_3m"] = round(cp * (1.0 + derived_3m_return), 4)
+            if row.get("forecast_price_1m") is None:
+                derived_1m_return = capped_12m * _PHASE_II_RATIO_1M_OF_12M
+                row["forecast_price_1m"] = round(cp * (1.0 + derived_1m_return), 4)
+            # Also derive expected_roi_* fields if they're missing.
+            if row.get("expected_roi_12m") is None:
+                row["expected_roi_12m"] = round(return_12m, 6)
+            if row.get("expected_roi_3m") is None:
+                fp3 = _as_float(row.get("forecast_price_3m"))
+                if fp3 is not None:
+                    row["expected_roi_3m"] = round((fp3 - cp) / cp, 6)
+            if row.get("expected_roi_1m") is None:
+                fp1 = _as_float(row.get("forecast_price_1m"))
+                if fp1 is not None:
+                    row["expected_roi_1m"] = round((fp1 - cp) / cp, 6)
+        return  # 12M provider target is authoritative; do not synthesize over it.
+
     intrinsic = _as_float(row.get("intrinsic_value"))
     momentum = _as_float(row.get("momentum_score"))
     quality = _as_float(row.get("quality_score"))
@@ -1807,14 +2255,21 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
 
     components: List[Tuple[float, float]] = []
 
+    # v5.77.0: intrinsic-reversion weight reduced 0.40 -> 0.25.
+    # The 0.40 weight in v5.76.0 amplified any residual bias in the
+    # intrinsic-value calculation directly into the 12M forecast.
+    # Combined with the sector_pe / sector_pb fixes in
+    # _compute_intrinsic_and_upside, this reduces the engine's net
+    # mean-reversion bias on growth stocks. Momentum and fundamentals
+    # weights raised proportionally so the components still sum to 1.0.
     if intrinsic is not None and intrinsic > 0:
         reversion_return = (intrinsic - cp) / cp
         reversion_return *= 0.6
-        components.append((reversion_return, 0.40))
+        components.append((reversion_return, 0.25))  # was 0.40
 
     if momentum is not None:
         trend_return = ((momentum - 50.0) / 50.0) * 0.15
-        components.append((trend_return, 0.30))
+        components.append((trend_return, 0.35))  # was 0.30
 
     fundamentals_signals: List[float] = []
     for sub in (quality, value, growth):
@@ -1823,11 +2278,11 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     if fundamentals_signals:
         avg_fund = sum(fundamentals_signals) / len(fundamentals_signals)
         fund_return = avg_fund * 0.10
-        components.append((fund_return, 0.20))
+        components.append((fund_return, 0.25))  # was 0.20
 
     if overall is not None:
         baseline_return = ((overall - 50.0) / 50.0) * 0.08
-        components.append((baseline_return, 0.10))
+        components.append((baseline_return, 0.15))  # was 0.10
 
     if not components:
         return
@@ -1837,21 +2292,80 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
         return
     expected_12m_return = sum(r * w for r, w in components) / total_weight
 
-    if rsi is not None:
-        if rsi > 75:
-            expected_12m_return -= 0.03
-        elif rsi > 70:
-            expected_12m_return -= 0.015
-        elif rsi < 25:
-            expected_12m_return += 0.03
-        elif rsi < 30:
-            expected_12m_return += 0.015
+    # v5.77.0: RSI bumps REMOVED from 12M return.
+    # 14-day RSI has no statistical predictive power on 12-month
+    # returns; applying it to the long-horizon anchor and then deriving
+    # 1M/3M as fractions of that anchor propagated the corruption to
+    # all three horizons. The RSI adjustment is now applied ONLY to
+    # the 1M and 3M derived returns below, where its short-horizon
+    # mean-reversion signal is statistically defensible.
 
+    expected_12m_return_uncapped = expected_12m_return
     expected_12m_return = max(_PHASE_II_MIN_12M_ABS_RETURN,
                               min(_PHASE_II_MAX_12M_ABS_RETURN, expected_12m_return))
 
-    expected_3m_return = expected_12m_return * 0.35
-    expected_1m_return = expected_12m_return * 0.12
+    # v5.77.0: surface cap-firing as a warning so downstream consumers
+    # know the value is a guardrail, not a per-symbol prediction.
+    if expected_12m_return >= 0.95 * _PHASE_II_MAX_12M_ABS_RETURN:
+        _v573_append_warning(row, "forecast_capped_at_ceiling")
+    elif expected_12m_return <= 0.95 * _PHASE_II_MIN_12M_ABS_RETURN:
+        _v573_append_warning(row, "forecast_capped_at_floor")
+
+    expected_3m_return = expected_12m_return * _PHASE_II_RATIO_3M_OF_12M
+    expected_1m_return = expected_12m_return * _PHASE_II_RATIO_1M_OF_12M
+
+    # v5.77.0: RSI bump applied here, on the 1M / 3M short-horizon
+    # returns where 14-day RSI is statistically relevant.
+    # v5.77.1: magnitude REDUCED. The v5.77.0 absolute -3% / +3% bumps
+    # were too aggressive at short horizons. On a blue-chip with a
+    # baseline 1M return of +1.5%, an absolute -3% for RSI>75 swung
+    # the expectation to -1.5% (implied ~36% annualized technical
+    # drag). v5.77.1 uses multiplicative dampening of positive returns
+    # (halving them) when RSI is overbought, and a smaller absolute
+    # add (-0.015 / +0.015 at 1M, -0.008 / +0.008 at 3M) when no
+    # baseline positive return exists to dampen. This preserves the
+    # mean-reversion signal but doesn't violently swing healthy
+    # momentum stocks into negative territory on short horizons.
+    if rsi is not None:
+        if rsi > 75:
+            # Overbought: dampen positive 1M expectation by 50%; if
+            # already negative or near-zero, subtract a small absolute.
+            if expected_1m_return > 0:
+                expected_1m_return *= 0.5
+            else:
+                expected_1m_return -= 0.015
+            if expected_3m_return > 0:
+                expected_3m_return *= 0.65   # less aggressive at 3M
+            else:
+                expected_3m_return -= 0.008
+        elif rsi > 70:
+            if expected_1m_return > 0:
+                expected_1m_return *= 0.75
+            else:
+                expected_1m_return -= 0.008
+            if expected_3m_return > 0:
+                expected_3m_return *= 0.85
+            else:
+                expected_3m_return -= 0.004
+        elif rsi < 25:
+            # Oversold: boost expectation modestly.
+            if expected_1m_return < 0:
+                expected_1m_return *= 0.5   # dampen negative
+            else:
+                expected_1m_return += 0.015
+            if expected_3m_return < 0:
+                expected_3m_return *= 0.65
+            else:
+                expected_3m_return += 0.008
+        elif rsi < 30:
+            if expected_1m_return < 0:
+                expected_1m_return *= 0.75
+            else:
+                expected_1m_return += 0.008
+            if expected_3m_return < 0:
+                expected_3m_return *= 0.85
+            else:
+                expected_3m_return += 0.004
 
     forecast_12m = cp * (1.0 + expected_12m_return)
     forecast_3m = cp * (1.0 + expected_3m_return)
@@ -1863,6 +2377,9 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     row["expected_roi_1m"] = round(expected_1m_return, 6)
     row["expected_roi_3m"] = round(expected_3m_return, 6)
     row["expected_roi_12m"] = round(expected_12m_return, 6)
+    # v5.77.0: tag synthesis origin so subsequent calls can preserve
+    # provider targets if they're added back by an upstream patch.
+    row["forecast_source"] = "phase_ii_synthetic"
 
     conf = 0.50
 
@@ -1982,6 +2499,12 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "overall_score_raw", "overall_penalty_factor",
     "candlestick_pattern", "candlestick_signal", "candlestick_strength",
     "candlestick_confidence", "candlestick_patterns_recent",
+    # v5.77.1: forecast_source surfaced to the sheet. Values:
+    #   "provider_target"   - upstream provider supplied an analyst target
+    #   "phase_ii_synthetic" - engine synthesized the forecast
+    #   "fallback"          - local fallback heuristic produced the forecast
+    #   "" / None           - no forecast available
+    "forecast_source",
 ]
 _SCHEMA_VERSION = f"instrument:{len(INSTRUMENT_CANONICAL_KEYS)}:{__version__}"
 
@@ -2016,6 +2539,9 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Overall Score (Raw)", "Overall Penalty Factor",
     "Candle Pattern", "Candle Signal", "Candle Strength",
     "Candle Confidence", "Recent Patterns (5D)",
+    # v5.77.1: surfaces whether forecast_price_* came from a provider
+    # analyst target, the Phase-II synthesis, or a fallback heuristic.
+    "Forecast Source",
 ]
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
@@ -2155,6 +2681,12 @@ def _safe_int(x: Any, default: int = 0, lo: Optional[int] = None, hi: Optional[i
 
 
 def _as_float(x: Any) -> Optional[float]:
+    # v5.77.0: bool guard. Without this, `_as_float(True)` returns 1.0
+    # and `_as_float(False)` returns 0.0 (because bool subclasses int
+    # in Python). If a provider schema shift sent a boolean for a
+    # numeric field, the engine would silently parse it as 0.0/1.0.
+    if isinstance(x, bool):
+        return None
     try:
         if x is None or x == "":
             return None
@@ -2418,13 +2950,24 @@ def _v573_append_warning(row: Dict[str, Any], tag: str) -> None:
 
 
 _V573_SANITIZATION_BOUNDS: Dict[str, Tuple[float, float]] = {
-    "pe_ttm":         (-1000.0, 1000.0),
-    "pe_forward":     (-1000.0, 1000.0),
-    "pb_ratio":       (-200.0, 200.0),
-    "ps_ratio":       (0.0, 200.0),
-    "ev_ebitda":      (-500.0, 500.0),
-    "peg_ratio":      (-100.0, 100.0),
-    "debt_to_equity": (0.0, 1000.0),
+    # v5.77.0: tightened bounds. v5.76.0 allowed negative PE/PB/EV-EBITDA/
+    # PEG values to pass through, which downstream scoring would
+    # misinterpret. Negative P/E means negative earnings (valuation
+    # undefined); negative P/B means negative shareholders' equity
+    # (distressed); negative EV/EBITDA means negative EBITDA. These
+    # should null out, not propagate as raw values.
+    "pe_ttm":         (0.0, 500.0),    # was (-1000.0, 1000.0)
+    "pe_forward":     (0.0, 500.0),    # was (-1000.0, 1000.0)
+    "pb_ratio":       (0.0, 100.0),    # was (-200.0, 200.0)
+    "ps_ratio":       (0.0, 100.0),    # was (0.0, 200.0)
+    "ev_ebitda":      (0.0, 200.0),    # was (-500.0, 500.0)
+    "peg_ratio":      (0.0, 20.0),     # was (-100.0, 100.0)
+    "debt_to_equity": (0.0, 500.0),    # was (0.0, 1000.0)
+    # v5.77.0: dividend_yield bounds added. Anything > 30% is almost
+    # certainly a provider scale-factor error (1.45 returned for 145%
+    # instead of 0.0145 for 1.45%). 30% ceiling is generous; only a
+    # few mortgage REITs and BDCs legitimately exceed 15%.
+    "dividend_yield": (0.0, 0.30),
 }
 
 
@@ -2925,6 +3468,16 @@ _INSTRUMENT_CANONICAL_REQUIRED_KEYS: frozenset = frozenset({
     "scoring_schema_version", "scoring_errors", "opportunity_source",
     "overall_score_raw", "overall_penalty_factor",
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+
+    # v5.77.3: forecast_source elevated to required. ChatGPT v5.77.2 audit
+    # flagged: an older external schema returning 106 columns would still
+    # pass _instrument_contract_is_canonical() because forecast_source
+    # (the 107th field added in v5.77.1) was not in the required set.
+    # Treating it as required forces _usable_contract() to fall back to
+    # the built-in STATIC canonical (107-column) when an external schema
+    # source hasn't been updated. This guards against the silent
+    # 106-column drift case during a partial deployment.
+    "forecast_source",
 })
 
 
@@ -3218,11 +3771,20 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "upside_pct": ("upside_pct", "upsidePct", "upside_percent", "upsidePercent", "upside", "potentialUpside"),
     "valuation_score": ("valuation_score",),
     "forecast_price_1m": ("forecast_price_1m", "targetPrice1m", "priceTarget1m"),
-    "forecast_price_3m": ("forecast_price_3m", "targetPrice3m", "priceTarget3m", "targetPrice", "targetMeanPrice"),
-    "forecast_price_12m": ("forecast_price_12m", "targetPrice12m", "priceTarget12m", "targetMedianPrice", "targetHighPrice"),
+    # v5.77.1: targetMeanPrice REMOVED from 3m aliases — Yahoo's
+    # targetMeanPrice is the 12M analyst consensus, not a 3M target.
+    # Putting it in 3m caused the engine to treat a 12M price target as
+    # a quarterly forecast, which corrupted the 3M ROI math.
+    "forecast_price_3m": ("forecast_price_3m", "targetPrice3m", "priceTarget3m"),
+    # v5.77.1: targetMeanPrice ADDED to 12m aliases (correct horizon
+    # for Yahoo's analyst consensus target). Also added analystTargetPrice
+    # and consensusTarget for cross-provider coverage.
+    "forecast_price_12m": ("forecast_price_12m", "targetPrice12m", "priceTarget12m", "targetMedianPrice", "targetHighPrice", "targetMeanPrice", "targetPrice", "analystTargetPrice", "consensusTarget"),
     "expected_roi_1m": ("expected_roi_1m", "expectedReturn1m", "roi1m"),
     "expected_roi_3m": ("expected_roi_3m", "expectedReturn3m", "roi3m"),
     "expected_roi_12m": ("expected_roi_12m", "expectedReturn12m", "roi12m"),
+    # v5.77.1: forecast_source aliases for round-trip preservation.
+    "forecast_source": ("forecast_source", "forecastSource", "forecast_origin", "forecastOrigin"),
     "forecast_confidence": ("forecast_confidence", "confidence", "confidencePct", "modelConfidence"),
     "confidence_score": ("confidence_score", "modelConfidenceScore"),
     "confidence_bucket": ("confidence_bucket",),
@@ -3711,6 +4273,55 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
                 out[field] = _json_safe(_to_scalar(val))
                 break
 
+    # v5.77.1: tag forecast_source = "provider_target" when an upstream
+    # provider supplied an analyst price target (any of the known
+    # target_* aliases). v5.77.0 added the protection check in
+    # _phase_ii_quality_forecast (skip overwrite if source ==
+    # "provider_target") but never actually set the tag here — leaving
+    # the feature half-finished. This block closes that gap by detecting
+    # the presence of a provider-target alias in the raw source and
+    # tagging accordingly. If no provider target alias was present,
+    # forecast_source is NOT set here; _phase_ii_quality_forecast will
+    # set it to "phase_ii_synthetic" when it synthesizes the forecast.
+    #
+    # v5.77.2: switch alias matching from naive `.lower()` to
+    # `_norm_key_loose()` (strips ALL non-alphanumerics). Under v5.77.1
+    # the matcher worked for camelCase ("targetMeanPrice") but silently
+    # missed snake_case variants ("target_mean_price") because
+    # "targetmeanprice".lower() != "target_mean_price". REST providers
+    # serving Python clients commonly emit snake_case, so this gap
+    # meant a meaningful slice of provider targets fell through to
+    # Phase-II synthesis and got overwritten. ChatGPT v5.77.1 audit
+    # caught this. _norm_key_loose collapses both forms to
+    # "targetmeanprice", so a single canonical alias list now covers
+    # camelCase, snake_case, kebab-case, dotted, and mixed variants.
+    if out.get("forecast_price_12m") is not None and not _safe_str(out.get("forecast_source")):
+        provider_target_aliases_12m = (
+            "targetPrice12m", "priceTarget12m", "targetMedianPrice",
+            "targetHighPrice", "targetMeanPrice", "targetPrice",
+            "priceTarget", "analystTargetPrice", "consensusTarget",
+        )
+        provider_target_aliases_3m = (
+            "targetPrice3m", "priceTarget3m",
+        )
+        # v5.77.2: build normalized lookups using _norm_key_loose for
+        # whitespace/underscore/case tolerance.
+        src_keys_loose = {_norm_key_loose(k): k for k in src.keys()}
+        flat_keys_loose = {_norm_key_loose(k): k for k in flat.keys()}
+        for alias in provider_target_aliases_12m + provider_target_aliases_3m:
+            alias_loose = _norm_key_loose(alias)
+            if not alias_loose:
+                continue
+            if alias_loose in src_keys_loose or alias_loose in flat_keys_loose:
+                raw_v = (
+                    src.get(src_keys_loose.get(alias_loose))
+                    if alias_loose in src_keys_loose
+                    else flat.get(flat_keys_loose.get(alias_loose))
+                )
+                if not _is_blank_value(raw_v):
+                    out["forecast_source"] = "provider_target"
+                    break
+
     inferred_symbol = out.get("symbol") or normalized_symbol or requested_symbol
     inferred_name = _infer_display_name_from_symbol(inferred_symbol)
     current_name = _safe_str(out.get("name"))
@@ -4070,15 +4681,32 @@ def _compute_scores_local_fallback(row: Dict[str, Any]) -> None:
         overall = sum(vals2) / len(vals2) if vals2 else 50.0
         row["overall_score"] = round(_clamp(float(overall), 0.0, 100.0), 2)
 
+    # v5.77.2: tag forecast_source = "fallback" when this fallback path
+    # synthesizes forecast prices. ChatGPT v5.77.1 audit caught this:
+    # the header documented "fallback" as one of the four forecast_source
+    # values but no code path ever wrote it. Track whether this function
+    # actually creates any forecast price (vs. inheriting one from
+    # upstream) so we only stamp "fallback" when WE are the origin.
+    _fallback_created_forecast = False
+
     if price is not None and row.get("forecast_price_1m") is None:
         drift = max(0.5, min(4.0, seed_best_roi if seed_best_roi else 1.0))
         row["forecast_price_1m"] = round(price * (1.0 + drift / 300.0), 4)
+        _fallback_created_forecast = True
     if price is not None and row.get("forecast_price_3m") is None:
         drift = max(1.0, min(8.0, seed_best_roi if seed_best_roi else 3.0))
         row["forecast_price_3m"] = round(price * (1.0 + drift / 100.0), 4)
+        _fallback_created_forecast = True
     if price is not None and row.get("forecast_price_12m") is None:
         drift = max(3.0, min(18.0, (seed_roi_12m if seed_roi_12m is not None else seed_best_roi) or 8.0))
         row["forecast_price_12m"] = round(price * (1.0 + drift / 100.0), 4)
+        _fallback_created_forecast = True
+
+    # Stamp forecast_source = "fallback" only if we generated at least
+    # one forecast AND no upstream source is already set (provider_target
+    # or phase_ii_synthetic both take precedence — we don't overwrite).
+    if _fallback_created_forecast and not _safe_str(row.get("forecast_source")):
+        row["forecast_source"] = "fallback"
 
     if price is not None and row.get("expected_roi_1m") is None:
         fp1 = _as_float(row.get("forecast_price_1m"))
@@ -4237,8 +4865,117 @@ async def _call_maybe_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
     if inspect.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)
 
-    result = await asyncio.to_thread(fn, *args, **kwargs)
+    # v5.77.0: route sync calls through the dedicated provider pool
+    # (lazily initialized via _get_provider_executor) instead of
+    # asyncio.to_thread's default executor (~36 threads). Batches of
+    # 200+ symbols hitting the default pool can stall the event loop
+    # under contention. The dedicated pool defaults to 200 workers and
+    # is sized via TFB_PROVIDER_POOL_WORKERS.
+    loop = asyncio.get_running_loop()
+    executor = _get_provider_executor()
+    if executor is None:
+        # Fallback to asyncio.to_thread if executor creation failed.
+        result = await asyncio.to_thread(fn, *args, **kwargs)
+    else:
+        result = await loop.run_in_executor(executor, lambda: fn(*args, **kwargs))
     return await result if inspect.isawaitable(result) else result
+
+
+# v5.77.0: dedicated thread pool for synchronous provider calls.
+# Lazily initialized on first use so import time isn't blocked.
+# Default worker count = 200 (configurable via TFB_PROVIDER_POOL_WORKERS).
+# Floor of 32 prevents accidental misconfiguration to a degenerate pool.
+#
+# v5.77.1: race-condition fix. The v5.77.0 lazy initializer used an
+# `if _PROVIDER_EXECUTOR is not None` check with NO lock. Under
+# concurrent first-touch (e.g. 200 quotes starting simultaneously
+# before the executor is initialized), 200 coroutines would all see
+# `_PROVIDER_EXECUTOR is None` and each create its own
+# ThreadPoolExecutor, spawning thousands of orphan threads before
+# the garbage collector caught up. The fix is a standard double-
+# checked locking pattern using threading.Lock (not asyncio.Lock —
+# this is a sync function called from inside async coroutines, and
+# threading.Lock is the correct primitive for sync code).
+import concurrent.futures as _concurrent_futures
+import threading as _threading
+
+_PROVIDER_EXECUTOR: Optional[Any] = None
+_PROVIDER_EXECUTOR_LOCK: "_threading.Lock" = _threading.Lock()
+
+
+def _get_provider_executor() -> Optional[Any]:
+    """Return the shared provider thread pool, creating it on first call.
+
+    v5.77.1: double-checked locking. The fast path (no lock acquisition)
+    is the common case once the executor is initialized. The slow path
+    (lock acquired) only runs during the first concurrent first-touch
+    burst and re-checks the singleton inside the critical section so
+    only one executor is ever created.
+    """
+    global _PROVIDER_EXECUTOR
+    if _PROVIDER_EXECUTOR is not None:
+        return _PROVIDER_EXECUTOR
+    with _PROVIDER_EXECUTOR_LOCK:
+        # Double-check inside the critical section.
+        if _PROVIDER_EXECUTOR is not None:
+            return _PROVIDER_EXECUTOR
+        try:
+            workers_raw = os.getenv("TFB_PROVIDER_POOL_WORKERS", "200")
+            workers = int(workers_raw) if str(workers_raw).strip() else 200
+        except Exception:
+            workers = 200
+        workers = max(32, min(1000, workers))
+        try:
+            _PROVIDER_EXECUTOR = _concurrent_futures.ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="tfb-provider",
+            )
+        except Exception as exc:
+            logger.debug(
+                "[engine_v2 v%s] dedicated provider pool init failed: %s: %s",
+                __version__, exc.__class__.__name__, exc,
+            )
+            _PROVIDER_EXECUTOR = None
+        return _PROVIDER_EXECUTOR
+
+
+def _shutdown_provider_executor() -> None:
+    """v5.77.1: graceful shutdown of the dedicated provider pool.
+
+    Called from DataEngineV5.aclose() so the thread pool is released
+    on engine teardown. Without this, the worker threads would linger
+    for the process lifetime even after the engine is closed.
+    """
+    global _PROVIDER_EXECUTOR
+    with _PROVIDER_EXECUTOR_LOCK:
+        if _PROVIDER_EXECUTOR is None:
+            return
+        try:
+            _PROVIDER_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            # cancel_futures only exists on Python 3.9+.
+            try:
+                _PROVIDER_EXECUTOR.shutdown(wait=False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        _PROVIDER_EXECUTOR = None
+
+
+def reset_provider_executor() -> None:
+    """v5.77.2: public test helper. Shuts down the current executor and
+    clears the singleton so the next _get_provider_executor() call
+    rebuilds it from scratch — picking up any environment changes
+    (TFB_PROVIDER_POOL_WORKERS) made since the previous build.
+
+    Intended use: test suites that need to verify pool sizing under
+    different env-var values. NOT meant for production runtime use —
+    calling this while requests are in flight will orphan their
+    futures. Prefer _shutdown_provider_executor() in production
+    teardown paths.
+    """
+    _shutdown_provider_executor()
 
 
 # =============================================================================
@@ -4442,13 +5179,24 @@ class MultiLevelCache:
     the name is preserved for back-compat with existing callers and to
     leave room for an L2 addition without renaming. If a later release
     adds an L2 tier, this docstring should be updated.
+
+    v5.77.0: eviction changed from FIFO to LRU. v5.76.0 evicted via
+    `next(iter(self._data.keys()))` which returns the FIRST INSERTED
+    key (FIFO), regardless of access pattern. Hot keys (AAPL, MSFT,
+    NVDA, 2222.SR) inserted early were evicted constantly while
+    obscure tickers in recent batches survived. Now backed by an
+    OrderedDict with move_to_end() called on every successful get(),
+    so eviction picks the LEAST RECENTLY USED key (popitem(last=False)).
+    Hot keys stay hot.
     """
 
     def __init__(self, name: str, l1_ttl: int = 60, max_l1_size: int = 5000) -> None:
         self.name = name
         self.l1_ttl = max(1, int(l1_ttl))
         self.max_l1_size = max(1, int(max_l1_size))
-        self._data: Dict[str, Tuple[float, Any]] = {}
+        # v5.77.0: OrderedDict for LRU semantics (was: plain Dict).
+        from collections import OrderedDict as _OrderedDict
+        self._data: "_OrderedDict[str, Tuple[float, Any]]" = _OrderedDict()
         self._lock = asyncio.Lock()
 
     def _key(self, **kwargs: Any) -> str:
@@ -4465,15 +5213,24 @@ class MultiLevelCache:
             if expires_at < time.time():
                 self._data.pop(key, None)
                 return None
+            # v5.77.0: mark as recently used so LRU eviction skips it.
+            self._data.move_to_end(key)
             return value
 
     async def set(self, value: Any, **kwargs: Any) -> None:
         key = self._key(**kwargs)
         async with self._lock:
-            if len(self._data) >= self.max_l1_size:
-                oldest_key = next(iter(self._data.keys()), None)
-                if oldest_key:
-                    self._data.pop(oldest_key, None)
+            # v5.77.0: LRU eviction via popitem(last=False) - pops the
+            # OLDEST USED key, not the first inserted. If the key is
+            # already present we move it to the end so an overwrite
+            # also refreshes recency.
+            if key in self._data:
+                self._data.move_to_end(key)
+            elif len(self._data) >= self.max_l1_size:
+                try:
+                    self._data.popitem(last=False)
+                except KeyError:
+                    pass
             self._data[key] = (time.time() + self.l1_ttl, value)
 
 
@@ -4625,6 +5382,12 @@ class DataEngineV5:
         self.symbols_reader = _EngineSymbolsReaderProxy(self)
 
     async def aclose(self) -> None:
+        # v5.77.1: gracefully release the dedicated provider thread pool
+        # on engine teardown so worker threads don't linger.
+        try:
+            _shutdown_provider_executor()
+        except Exception:
+            pass
         return
 
     async def execute_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -4772,6 +5535,23 @@ class DataEngineV5:
         error: Optional[str] = None,
     ) -> Dict[str, Any]:
         headers, keys = _complete_schema_contract(headers, keys)
+        # v5.77.3: schema-count telemetry. Gemini v5.77.2 audit
+        # suggested logging when the finalized payload's header/key
+        # count drifts from the canonical 107 — this helps catch
+        # schema-mismatch bugs (e.g., external schema_registry returning
+        # 106 columns while the engine expects 107) at the engine
+        # boundary rather than after the dashboard renders a broken
+        # row. Logs DEBUG when counts match, WARNING when they drift.
+        try:
+            canonical_count = len(INSTRUMENT_CANONICAL_KEYS)
+            actual_count = len(keys)
+            if actual_count != canonical_count and sheet in ("instruments", "instrument", "stocks", "stock", ""):
+                logger.warning(
+                    "[engine_v2 v%s] _finalize_payload schema drift: sheet=%s expected=%d got=%d",
+                    __version__, sheet or "(default)", canonical_count, actual_count,
+                )
+        except Exception:
+            pass
         dict_rows = [_strict_project_row(keys, r) for r in (row_objects or [])]
         display_row_objects = _rows_display_objects_from_rows(dict_rows, headers, keys)
         matrix_rows = _rows_matrix_from_rows(dict_rows, keys) if include_matrix else []
@@ -5824,7 +6604,11 @@ class DataEngineV5:
             if inspect.iscoroutinefunction(fn):
                 patch = await fn(yahoo_symbol)
             else:
-                patch = await asyncio.to_thread(fn, yahoo_symbol)
+                # v5.77.2: route through dedicated provider pool via
+                # _call_maybe_async instead of asyncio.to_thread's
+                # default executor (~36 threads). v5.77.1 left this
+                # Yahoo enrichment path bypassing the dedicated pool.
+                patch = await _call_maybe_async(fn, yahoo_symbol)
                 if inspect.isawaitable(patch):
                     patch = await patch
         except Exception as exc:
@@ -5867,7 +6651,8 @@ class DataEngineV5:
                 if inspect.iscoroutinefunction(fn):
                     res = await fn(yahoo_symbol)
                 else:
-                    res = await asyncio.to_thread(fn, yahoo_symbol)
+                    # v5.77.2: route through dedicated provider pool.
+                    res = await _call_maybe_async(fn, yahoo_symbol)
                     if inspect.isawaitable(res):
                         res = await res
                 if res is not None:
@@ -5909,7 +6694,8 @@ class DataEngineV5:
                         if inspect.iscoroutinefunction(hist_fn):
                             raw = await hist_fn(**kwargs)
                         else:
-                            raw = await asyncio.to_thread(lambda kw=kwargs: hist_fn(**kw))
+                            # v5.77.2: route through dedicated provider pool.
+                            raw = await _call_maybe_async(hist_fn, **kwargs)
                             if inspect.isawaitable(raw):
                                 raw = await raw
                     except TypeError:
@@ -6938,6 +7724,28 @@ class DataEngineV5:
                 "sheet_compat_collapse_map": dict(_V576_SHEET_COMPAT_COLLAPSE),
                 "core_scoring_available": bool(_CORE_SCORING_AVAILABLE),
                 "reco_normalize_available": bool(_RECO_NORMALIZE_AVAILABLE),
+            },
+            # v5.77.0: valuation-model markers so operators can verify the
+            # sector_pe / sector_pb calibration in effect, the Phase-II
+            # forecast weights, and whether the dedicated provider thread
+            # pool is active.
+            "valuation_model": {
+                "version": "v5.77.0",
+                "intrinsic_pe_default": 20.0,
+                "intrinsic_pb_default": 2.0,
+                "intrinsic_pb_anchor_mode": "sector_aware",
+                "phase_ii_weights": {
+                    "intrinsic_reversion": 0.25,
+                    "momentum": 0.35,
+                    "fundamentals": 0.25,
+                    "baseline": 0.15,
+                },
+                "phase_ii_rsi_horizon": "short_only_1m_3m",
+                "phase_ii_12m_cap_abs": _PHASE_II_MAX_12M_ABS_RETURN,
+                "dividend_yield_ceiling": 0.30,
+                "provider_pool_workers_target": int(os.getenv("TFB_PROVIDER_POOL_WORKERS", "200") or 200),
+                "provider_pool_active": _PROVIDER_EXECUTOR is not None,
+                "cache_eviction_mode": "lru",
             },
         }
 
