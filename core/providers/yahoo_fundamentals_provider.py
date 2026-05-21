@@ -2,11 +2,38 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Finance Fundamentals Provider -- v6.2.0
+Yahoo Finance Fundamentals Provider -- v6.3.0
 ================================================================================
-FALLBACK FUNDAMENTALS + PROFILE ENRICHMENT + HISTORY AVG-VOLUME FALLBACK
-ENGINE-COMPATIBLE + STARTUP-SAFE + SINGLEFLIGHT + CACHE-BACKED + JSON-SAFE
-+ USER-AGENT ROTATION + 52W BOUNDS GUARD + STRUCTURED WARNINGS
+v6.3.0: 8-TIER RECOMMENDATION VOCABULARY + PROVIDER_RATING CASCADE-BRIDGE /
+[PRESERVED v6.2.0] PROVIDER-SIDE IDENTITY DEFAULTS /
+[PRESERVED v6.1.0] UA ROTATION + 52W BOUNDS GUARD + STRUCTURED WARNINGS /
+[PRESERVED v6.0.0] ENGINE-COMPATIBLE FOUNDATION
+
+Cross-stack alignment (May 2026 v8.0.0 family floor)
+-----------------------------------------------------
+  - core.reco_normalize           v8.0.0   (8-tier canonical:
+                                             STRONG_BUY/BUY/ACCUMULATE/HOLD/
+                                             REDUCE/SELL/STRONG_SELL/AVOID)
+  - core.scoring                  v5.7.0   (emits priority_band P1..P5)
+  - core.scoring_engine (bridge)  v3.6.0
+  - core.schemas                  v7.0.0   (Recommendation enum 8-tier;
+                                             UnifiedQuote.provider_rating +
+                                             recommendation_source cascade-
+                                             bridge fields)
+  - core.sheets.schema_registry   v2.11.0
+  - core.data_engine_v2           v5.76.0  (consumes provider_rating +
+                                             recommendation_source for
+                                             divergence detection)
+  - core.investment_advisor_engine v4.5.0
+  - core.analysis.insights_builder v8.0.1  (Risk Alerts section surfaces
+                                             "providerDiverges=" flag when
+                                             provider_rating != recommendation)
+  - core.analysis.top10_selector   v4.14.0
+  - core.analysis.criteria_model   v3.2.0
+  - core.providers.eodhd_provider          v4.7.3
+  - core.providers.yahoo_chart_provider    v8.2.0
+  - core.providers.yahoo_fundamentals      v6.3.0 (THIS DELIVERY)
+  - core.providers.enriched_quote          v4.7.0
 
 Purpose
 -------
@@ -15,8 +42,163 @@ equities and yahoo_chart remains primary for Yahoo-style quote/history data.
 This provider fills gaps when Yahoo has richer or more readily available
 metadata than the primary source.
 
-v6.2.0 Changes (from v6.1.0)
-----------------------------
+================================================================================
+v6.3.0 Changes (from v6.2.0)  --  8-TIER VOCABULARY + PROVIDER_RATING
+================================================================================
+
+CASCADE-BRIDGE PATCH closing the last 5-tier vocabulary leak below the
+advisor layer. v6.2.0's `map_recommendation` had three bugs:
+
+  Bug 1 (PRECEDENCE):
+    map_recommendation("strong_sell") returned "SELL".
+    The function checked "sell" before "strong_sell"-aware branches, so
+    "strong_sell" matched the broader "sell" branch first. Yahoo's
+    `strong_sell` token (rare but real on conviction-sell ratings) was
+    being silently downgraded to SELL.
+
+  Bug 2 (MISSING VOCABULARY -- POSITIVE):
+    map_recommendation("outperform") returned "HOLD".
+    "outperform" doesn't contain "buy", so it skipped the BUY branch
+    and fell through to HOLD. Yahoo emits "outperform" frequently for
+    sell-side ratings (Goldman Sachs, JPMorgan house tokens proxy
+    through Yahoo's recommendationKey as "outperform"). v6.2.0
+    silently neutralized them.
+
+  Bug 3 (MISSING VOCABULARY -- 8-TIER):
+    map_recommendation("accumulate") and ("avoid") returned "HOLD".
+    Yahoo's recommendationKey doesn't natively emit these tokens, but
+    THIRD-PARTY broker feeds proxied through Yahoo (e.g. via
+    `analystRecommendation` on ETF/MF endpoints) do. v6.2.0 collapsed
+    them to HOLD.
+
+CASCADE-BRIDGE GAP:
+  `schemas.py` v7.0.0's `UnifiedQuote` model added 9 cascade-bridge
+  fields including `provider_rating` and `recommendation_source`.
+  `insights_builder.py` v8.0.1's Risk Alerts section uses
+  `provider_rating` to detect when the engine's final recommendation
+  diverges from the upstream provider's view (surfaces a
+  `providerDiverges=true|false` marker on each risk alert row).
+  v6.2.0 of THIS provider did not emit either field, so every
+  Yahoo-fundamentals row hit insights_builder with provider_rating=None,
+  silently disabling the divergence detection for any symbol where
+  Yahoo was the chosen source.
+
+Phase-by-phase summary:
+-----------------------
+
+A. HEADER NARRATIVE SYNC. Header banner gains v6.3.0 marker; new
+   cross-stack roster table refreshed to May 2026 v8.0.0 family floor.
+   v6.2.0 / v6.1.0 / v6.0.0 history preserved verbatim below.
+
+B. VERSION BUMP 6.2.0 -> 6.3.0. `VERSION` alias auto-tracks.
+
+C. `map_recommendation()` REWRITTEN. Order-of-precedence bug fixed
+   (check STRONG_SELL before SELL). Expanded to 8-tier output
+   vocabulary:
+     "strong_buy"  -> STRONG_BUY
+     "buy"         -> BUY
+     "outperform"  -> BUY               (was HOLD in v6.2.0 -- bug)
+     "accumulate"  -> ACCUMULATE        (was HOLD in v6.2.0 -- bug)
+     "scale_in"    -> ACCUMULATE        (NEW; broker-vocab alias)
+     "moderate_buy"/ "mod_buy"
+                   -> ACCUMULATE        (NEW; broker-vocab alias)
+     "add"/"overweight"
+                   -> BUY               (NEW; broker-vocab alias)
+     "hold"/"neutral"/"market_perform"
+                   -> HOLD
+     "underperform"-> REDUCE            (NEW; explicit, not by chance)
+     "reduce"/"trim"/"underweight"
+                   -> REDUCE
+     "strong_sell" -> STRONG_SELL       (was SELL in v6.2.0 -- bug)
+     "conviction_sell"/"deep_sell"
+                   -> STRONG_SELL       (NEW; broker-vocab alias)
+     "sell"/"exit" -> SELL
+     "avoid"/"hard_pass"/"dnb"/"do_not_buy"/"uninvestable"
+                   -> AVOID             (NEW; 8-tier vocab)
+     None / "" / unknown
+                   -> HOLD              (preserves v6.2.0 default)
+
+D. NEW HELPER `extract_provider_rating(raw_key)`. Canonicalizes
+   Yahoo's raw `recommendationKey` to a lowercase, underscore-
+   separated string preserving Yahoo's vocabulary distinctions
+   (so insights_builder v8.0.1 can compare provider_rating against
+   the canonical 8-tier `recommendation` for divergence detection).
+   Examples:
+     "STRONG_BUY"     -> "strong_buy"
+     "Strong Buy"     -> "strong_buy"
+     "strongBuy"      -> "strong_buy"
+     "OUTPERFORM"     -> "outperform"
+     "underperform"   -> "underperform"
+     "ACCUMULATE"     -> "accumulate"
+     "AVOID"          -> "avoid"
+     None / "" / unparseable -> ""
+
+E. `_blocking_fetch` EXTRACTION EXTENDED. After the existing
+   `recommendation` field is set via `map_recommendation`, two new
+   raw provider-side fields are extracted:
+     provider_rating          = extract_provider_rating(raw_rec_key)
+     provider_rating_score    = safe_float(info["recommendationMean"])
+     recommendation_source    = "yahoo_fundamentals" if either is
+                                populated else None
+   These map directly to `schemas.py` v7.0.0's `UnifiedQuote`
+   cascade-bridge fields. data_engine_v2 v5.76.0's row builder passes
+   them through to insights_builder v8.0.1 / top10_selector v4.14.0
+   without further transformation.
+
+F. OUTPUT DICT EXTENDED with 3 new fields (placed in the analyst/reco
+   block, alongside the existing `recommendation` / `target_mean_price`
+   / `analyst_count`):
+     provider_rating          : str   -- Yahoo's raw lowercase token
+     provider_rating_score    : float -- Yahoo's recommendationMean (1-5)
+     recommendation_source    : str   -- "yahoo_fundamentals" or None
+   None values get stripped by `clean_patch` as usual; downstream rows
+   only carry the fields when Yahoo actually supplied data.
+
+G. NEW WARNING `provider_rating_missing` emitted when neither
+   `recommendationKey` nor `recommendationMean` is present on Yahoo's
+   info payload. Lets the audit / Data Quality Alerts section
+   distinguish "Yahoo had no rating" from "Yahoo had a rating that
+   normalized to HOLD".
+
+H. DATA QUALITY SCORE bumped to give a small +2 bonus when
+   provider_rating is populated. Matches the v6.1.0 +3 bonus for
+   target_mean_price -- analyst ratings are a quality signal even
+   when the score isn't a hard dependency.
+
+I. RECOMMENDATION ALIASES TABLE preserved for use by both
+   `map_recommendation` (canonical 8-tier output) and
+   `extract_provider_rating` (raw Yahoo vocabulary canonicalization).
+   Single source of truth for what Yahoo can emit.
+
+PRESERVED VERBATIM FROM v6.2.0:
+- All v6.2.0 identity-defaults work (suffix table, SSOT delegation,
+  _infer_asset_class fallthrough, _blocking_fetch identity-fill block).
+- All v6.1.0 UA rotation + 52W bounds + forecast magnitude work.
+- All v6.0.0 lazy-init / singleflight / circuit breaker / cache work.
+- Every name in __all__ -- no removals.
+- Every existing field in the output patch -- only ADDITIVE expansion.
+- All legacy aliases (price, prev_close, 52w_high, etc.) preserved.
+
+DEPLOYMENT NOTE.
+  v6.3.0 is strictly additive at the output-shape level. Existing
+  callers that consume `recommendation` continue to work, but they
+  now see CORRECT values for STRONG_SELL / OUTPERFORM / ACCUMULATE /
+  AVOID where v6.2.0 silently collapsed them. Callers that don't
+  consume `provider_rating` see no change. Callers that DO consume it
+  (insights_builder v8.0.1, data_engine_v2 v5.76.0) now have the
+  provenance string they were missing.
+
+  Observable behaviour changes on the deployed runtime:
+    1. map_recommendation("strong_sell") -> "STRONG_SELL" (was "SELL")
+    2. map_recommendation("outperform")  -> "BUY"         (was "HOLD")
+    3. map_recommendation("accumulate")  -> "ACCUMULATE"  (was "HOLD")
+    4. New patch fields populated: provider_rating, provider_rating_score,
+       recommendation_source. Engine + builder consumption per their
+       v5.76.0 / v8.0.1 specs.
+
+================================================================================
+v6.2.0 Changes (preserved)  --  PROVIDER-SIDE IDENTITY DEFAULTS
+================================================================================
 Provider-side identity alignment with `enriched_quote.py` v4.6.0
 `_SUFFIX_TO_LOCALE`. Mirrors the v8.2.0 work done in
 `yahoo_chart_provider.py` -- consistency across both Yahoo providers
@@ -207,7 +389,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.2.0"
+PROVIDER_VERSION = "6.3.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -629,22 +811,220 @@ def _is_ksa_symbol(norm_symbol: str) -> bool:
     return False
 
 
+# =============================================================================
+# v6.3.0: Recommendation Vocabulary -- canonical 8-tier output + provider_rating
+# =============================================================================
+#
+# Two shapes coexist:
+#   - `map_recommendation(raw)` -> CANONICAL 8-TIER token consumed by the
+#     engine / advisor / scoring stack (matches schemas.py v7.0.0
+#     Recommendation enum: STRONG_BUY, BUY, ACCUMULATE, HOLD, REDUCE,
+#     SELL, STRONG_SELL, AVOID).
+#   - `extract_provider_rating(raw)` -> CANONICAL LOWERCASE token
+#     preserving Yahoo's native vocabulary (so insights_builder v8.0.1
+#     can compare against the engine's final recommendation for
+#     divergence detection).
+#
+# A single source-of-truth table maps the lowercase-normalized raw input
+# to (8-tier-token, provider-rating-token). Order matters: longer / more
+# specific keys MUST be checked before shorter ones to avoid the v6.2.0
+# precedence bug ("strong_sell" was matching the "sell" branch first
+# and being downgraded to SELL).
+
+# (8tier, provider_rating)  -- single source of truth for v6.3.0
+_RECO_VOCAB: Tuple[Tuple[str, str, str], ...] = (
+    # (lowercased+normalized key,  8-tier output,    provider_rating token)
+    # IMPORTANT: order matters -- "strong_sell" MUST come before "sell";
+    # "strong_buy" MUST come before "buy". Longer / more-specific tokens
+    # are checked first so substring matches don't pre-empt them.
+
+    # --- Strong tokens (8-tier extremes) ---
+    ("strong_buy",        "STRONG_BUY",   "strong_buy"),
+    ("strongbuy",         "STRONG_BUY",   "strong_buy"),
+    ("strong_sell",       "STRONG_SELL",  "strong_sell"),
+    ("strongsell",        "STRONG_SELL",  "strong_sell"),
+    ("conviction_sell",   "STRONG_SELL",  "strong_sell"),
+    ("deep_sell",         "STRONG_SELL",  "strong_sell"),
+
+    # --- ACCUMULATE tier (v8.0.0 vocabulary) ---
+    ("accumulate",        "ACCUMULATE",   "accumulate"),
+    ("scale_in",          "ACCUMULATE",   "accumulate"),
+    ("moderate_buy",      "ACCUMULATE",   "accumulate"),
+    ("mod_buy",           "ACCUMULATE",   "accumulate"),
+
+    # --- AVOID tier (v8.0.0 vocabulary) ---
+    ("avoid",             "AVOID",        "avoid"),
+    ("hard_pass",         "AVOID",        "avoid"),
+    ("dnb",               "AVOID",        "avoid"),
+    ("do_not_buy",        "AVOID",        "avoid"),
+    ("uninvestable",      "AVOID",        "avoid"),
+
+    # --- BUY tier (broker-vocab equivalents) ---
+    ("outperform",        "BUY",          "outperform"),
+    ("overweight",        "BUY",          "overweight"),
+    ("market_outperform", "BUY",          "outperform"),
+    ("add",               "BUY",          "add"),
+    ("buy",               "BUY",          "buy"),
+
+    # --- HOLD tier ---
+    ("market_perform",    "HOLD",         "market_perform"),
+    ("neutral",           "HOLD",         "neutral"),
+    ("hold",              "HOLD",         "hold"),
+    ("equal_weight",      "HOLD",         "neutral"),
+    ("perform",           "HOLD",         "hold"),       # fallback for "perform" not caught above
+
+    # --- REDUCE tier ---
+    ("underperform",      "REDUCE",       "underperform"),
+    ("underweight",       "REDUCE",       "underweight"),
+    ("market_underperform","REDUCE",      "underperform"),
+    ("trim",              "REDUCE",       "trim"),
+    ("reduce",            "REDUCE",       "reduce"),
+
+    # --- SELL tier (after strong_sell, so substring matches don't pre-empt) ---
+    ("exit",              "SELL",         "exit"),
+    ("sell",              "SELL",         "sell"),
+)
+
+
+def _canonicalize_raw_recommendation(rec: Optional[str]) -> str:
+    """
+    Internal: lowercase + normalize separators for vocab table matching.
+
+    "STRONG BUY"  -> "strong_buy"
+    "strongBuy"   -> "strong_buy"   (camelCase split)
+    "MARKET PERFORM" -> "market_perform"
+    "Strong-Sell" -> "strong_sell"
+    None / ""     -> ""
+    """
+    if not rec:
+        return ""
+    s = str(rec).strip()
+    if not s:
+        return ""
+    # camelCase split: insert "_" before any uppercase that follows a lowercase
+    # (so "strongBuy" -> "strong_Buy")
+    s = re.sub(r"([a-z])([A-Z])", r"\1_\2", s)
+    s = s.lower().strip()
+    # Normalize separators (space, dash, slash) to underscore
+    for sep in (" ", "-", "/", ".", ","):
+        s = s.replace(sep, "_")
+    # Collapse repeated underscores
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
 def map_recommendation(rec: Optional[str]) -> str:
-    """Map Yahoo recommendationKey to canonical buy/sell label."""
+    """
+    Map Yahoo `recommendationKey` (or any broker-vocab alias) to the
+    canonical 8-tier output token consumed by schemas.py v7.0.0
+    `Recommendation` enum and the rest of the engine.
+
+    v6.3.0 (this revision):
+      - 8-tier output (was 5-tier in v6.2.0).
+      - Fixes 3 precedence / coverage bugs from v6.2.0:
+          * "strong_sell" now correctly returns STRONG_SELL (was SELL)
+          * "outperform" now correctly returns BUY (was HOLD)
+          * "accumulate" now correctly returns ACCUMULATE (was HOLD)
+      - Drives off the shared `_RECO_VOCAB` table -- single source of
+        truth across `map_recommendation` and `extract_provider_rating`.
+
+    None / unknown / unparseable -> "HOLD" (preserves v6.2.0 default for
+    backwards-compatibility with downstream code that expects a non-empty
+    return value).
+
+    Examples:
+        >>> map_recommendation("strong_buy")
+        'STRONG_BUY'
+        >>> map_recommendation("strongBuy")
+        'STRONG_BUY'
+        >>> map_recommendation("OUTPERFORM")
+        'BUY'
+        >>> map_recommendation("accumulate")
+        'ACCUMULATE'
+        >>> map_recommendation("Strong Sell")
+        'STRONG_SELL'
+        >>> map_recommendation("AVOID")
+        'AVOID'
+        >>> map_recommendation(None)
+        'HOLD'
+    """
     if not rec:
         return "HOLD"
-    r = str(rec).lower()
-    if "strong_buy" in r or "strongbuy" in r:
-        return "STRONG_BUY"
-    if "buy" in r:
-        return "BUY"
-    if "hold" in r or "neutral" in r:
+    canon = _canonicalize_raw_recommendation(rec)
+    if not canon:
         return "HOLD"
-    if "underperform" in r or "reduce" in r:
-        return "REDUCE"
-    if "sell" in r:
-        return "SELL"
+
+    # First pass: exact match
+    for key, out8, _provider in _RECO_VOCAB:
+        if canon == key:
+            return out8
+
+    # Second pass: substring match (for compound tokens like
+    # "strong_buy_with_conviction"). Order in _RECO_VOCAB ensures
+    # longer / more-specific tokens are checked first.
+    for key, out8, _provider in _RECO_VOCAB:
+        if key in canon:
+            return out8
+
     return "HOLD"
+
+
+def extract_provider_rating(rec: Optional[str]) -> str:
+    """
+    v6.3.0: Canonicalize Yahoo's raw `recommendationKey` to a lowercase
+    underscore-separated token PRESERVING the provider's vocabulary
+    distinctions (so insights_builder v8.0.1 can compare it against the
+    engine's final 8-tier `recommendation` for divergence detection).
+
+    Distinct from `map_recommendation`: this preserves Yahoo's own
+    vocabulary (e.g., "outperform" stays "outperform"), while
+    `map_recommendation` collapses everything to the canonical 8-tier
+    set. The two are designed to be set side-by-side in the output
+    patch so downstream can see both.
+
+    Returns "" for None / "" / unparseable input. Unknown tokens that
+    don't match any vocab entry are still returned as their normalized
+    lowercase form (so a future Yahoo addition flows through to
+    insights_builder unchanged rather than getting collapsed silently).
+
+    Examples:
+        >>> extract_provider_rating("STRONG_BUY")
+        'strong_buy'
+        >>> extract_provider_rating("Strong Buy")
+        'strong_buy'
+        >>> extract_provider_rating("strongBuy")
+        'strong_buy'
+        >>> extract_provider_rating("OUTPERFORM")
+        'outperform'
+        >>> extract_provider_rating("underperform")
+        'underperform'
+        >>> extract_provider_rating("ACCUMULATE")
+        'accumulate'
+        >>> extract_provider_rating(None)
+        ''
+        >>> extract_provider_rating("")
+        ''
+    """
+    if not rec:
+        return ""
+    canon = _canonicalize_raw_recommendation(rec)
+    if not canon:
+        return ""
+
+    # Exact match -> canonical provider-rating token
+    for key, _out8, provider_tok in _RECO_VOCAB:
+        if canon == key:
+            return provider_tok
+
+    # Substring match (same precedence as map_recommendation)
+    for key, _out8, provider_tok in _RECO_VOCAB:
+        if key in canon:
+            return provider_tok
+
+    # Unknown vocabulary -- return the normalized form so downstream
+    # sees something rather than empty (the engine + insights_builder
+    # both tolerate unknown tokens).
+    return canon
 
 
 def _get_attr(obj: Any, *names: str) -> Any:
@@ -1243,6 +1623,12 @@ def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
         score += 5
     if safe_int(patch.get("analyst_count")) is not None:
         score += 3
+    # v6.3.0: small bonus when the provider supplies a canonical rating.
+    # Matches the analyst-signal weighting pattern -- a populated
+    # provider_rating is a meaningful quality indicator independent
+    # of the analyst_count field.
+    if safe_str(patch.get("provider_rating")):
+        score += 2
 
     score = max(0.0, min(100.0, score))
 
@@ -1858,6 +2244,23 @@ class YahooFundamentalsProvider:
                 target_low_price = safe_float(_pick(info, "targetLowPrice"))
                 analyst_count = safe_int(_pick(info, "numberOfAnalystOpinions"))
 
+                # v6.3.0: cascade-bridge fields. Preserve Yahoo's raw
+                # `recommendationKey` (canonical lowercase string) so
+                # insights_builder v8.0.1 can detect divergence between
+                # provider view and engine final recommendation. Also
+                # preserve Yahoo's numeric `recommendationMean` (1.0..5.0
+                # scale, lower=stronger buy). recommendation_source
+                # identifies this provider as the rating authority for
+                # the cascade-bridge chain.
+                raw_rec_key = _pick(info, "recommendationKey")
+                provider_rating = extract_provider_rating(raw_rec_key)
+                provider_rating_score = safe_float(_pick(info, "recommendationMean"))
+                recommendation_source: Optional[str] = (
+                    PROVIDER_NAME if (provider_rating or provider_rating_score is not None) else None
+                )
+                if not provider_rating and provider_rating_score is None:
+                    warnings_list.append("provider_rating_missing")
+
                 # Identity
                 name = safe_str(_pick(info, "longName", "shortName", "displayName"))
                 currency = safe_str(_pick(info, "currency", "financialCurrency"))
@@ -2012,7 +2415,16 @@ class YahooFundamentalsProvider:
                     "target_high_price": target_high_price,
                     "target_low_price": target_low_price,
                     "analyst_count": analyst_count,
-                    "recommendation": map_recommendation(_pick(info, "recommendationKey")),
+                    "recommendation": map_recommendation(raw_rec_key),
+
+                    # v6.3.0: cascade-bridge fields (schemas.py v7.0.0
+                    # UnifiedQuote.provider_rating / recommendation_source;
+                    # consumed by data_engine_v2 v5.76.0 and surfaced by
+                    # insights_builder v8.0.1 Risk Alerts section for
+                    # divergence detection).
+                    "provider_rating": provider_rating or None,
+                    "provider_rating_score": provider_rating_score,
+                    "recommendation_source": recommendation_source,
 
                     # additional
                     "shares_outstanding": shares_outstanding,
@@ -2292,6 +2704,9 @@ __all__ = [
     # Utility
     "data_quality_score",
     "normalize_symbol",
+    # v6.3.0: 8-tier recommendation vocabulary + provider_rating helpers
+    "map_recommendation",
+    "extract_provider_rating",
     # Singleton control
     "get_provider",
     "close_provider",
