@@ -2,9 +2,64 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.3
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.5
 ================================================================================
 
+WHY v5.77.5 - DOCSTRING ACCURACY (NO CODE CHANGE)
+-------------------------------------------------
+v5.77.5 is a documentation-only fix. The runtime behavior is byte-for-byte
+identical to v5.77.4. No redeploy is required if v5.77.4 is already live;
+this can be picked up on the next deployment cycle.
+
+  Fix - _apply_sheet_compat_collapse docstring no longer contradicts code.
+    The function's docstring listed `recommendation_reason` under "Fields
+    NOT modified" with a rationale about preserving the structured-reason
+    audit trail. That was accurate as of v5.76.0 but stale after v5.77.0,
+    which added the leading-prefix rewrite (so the displayed action stays
+    consistent with the collapsed value — "ACCUMULATE: Scale in..." now
+    becomes "BUY: Scale in..." when collapsed). The behavior is correct
+    and intentional; only the documentation was out of date. ChatGPT
+    v5.77.4 audit caught this. v5.77.5 moves `recommendation_reason` to
+    the modified-fields list with a precise description of WHAT is
+    changed (leading prefix only) and WHY (visible mismatch fix from
+    v5.77.0), and the audit-trail preservation rationale stays attached
+    to the remaining structured-reason text.
+
+PRESERVED - strictly:
+  Everything. No code paths changed. All v5.77.4 / v5.77.3 / v5.77.2 /
+  v5.77.1 / v5.77.0 behavior, math, contracts, and API shapes preserved
+  exactly. The only file delta is the docstring block inside one
+  function definition.
+
+================================================================================
+WHY v5.77.4 - TELEMETRY ACTIVATION (TINY FIX)
+---------------------------------------------
+v5.77.4 is a one-line correctness fix on top of v5.77.3.
+
+  Fix - Schema-drift telemetry now actually fires on real sheets.
+    v5.77.3's _finalize_payload telemetry gated the WARNING on
+    `sheet in ("instruments", "instrument", "stocks", "stock", "")`
+    — but those are placeholder names that NEVER appear in the TFB
+    deployment. The real sheets are Market_Leaders, Global_Markets,
+    Commodities_FX, Mutual_Funds, My_Portfolio, My_Investments,
+    Top_10_Investments. ChatGPT v5.77.3 audit caught this: the
+    telemetry was effectively dead code in production.
+
+    v5.77.4 routes the sheet name through the existing
+    `_canonicalize_sheet_name()` helper and checks membership in
+    the existing INSTRUMENT_SHEETS set — the same predicate already
+    used elsewhere in this module for recovery and emergency-symbol
+    paths. Now the WARNING fires correctly on instrument sheets
+    while SPECIAL_SHEETS (Insights_Analysis, Data_Dictionary) which
+    have their own schemas are correctly excluded.
+
+PRESERVED - strictly:
+  All v5.77.3 / v5.77.2 / v5.77.1 / v5.77.0 architectural behavior.
+  No contract changes, no math changes, no API changes. This release
+  exists solely so the telemetry added in v5.77.3 actually does
+  something useful.
+
+================================================================================
 WHY v5.77.3 - POLISH OVER v5.77.2 (DEFENSIVE SCHEMA / TRANSPARENCY / TELEMETRY)
 ------------------------------------------------------------------------------
 v5.77.3 is a small polish pass closing out the v5.77.2 audit. Three changes
@@ -708,7 +763,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.77.3"
+__version__ = "5.77.5"
 
 # v5.76.0 cross-stack contract version markers.
 # These document which core.scoring / core.reco_normalize releases
@@ -931,13 +986,20 @@ def _apply_sheet_compat_collapse(row: Dict[str, Any]) -> None:
       * recommendation_detailed:        same as recommendation (mirror)
       * recommendation_priority:        re-derived from the collapsed value
       * recommendation_priority_band:   re-derived from the collapsed value
+      * recommendation_reason:          leading prefix only (e.g.
+                                        "ACCUMULATE: Scale in..." → "BUY:
+                                        Scale in..."). The rest of the
+                                        reason text is preserved so the
+                                        structured-reason audit trail
+                                        remains intact. Added in v5.77.0
+                                        to fix the visible mismatch where
+                                        the recommendation column showed
+                                        "BUY" while the reason column
+                                        still led with "ACCUMULATE:".
 
     Fields NOT modified:
       * provider_rating          (audit evidence; the upstream provider's value)
       * recommendation_source    (engine / provider_override / etc; unaffected)
-      * recommendation_reason    (free-form text; references the 8-tier
-                                  decision but renaming inline would distort
-                                  the structured-reason audit trail)
       * scoring_recommendation_source (scoring.py provenance tag preserved)
 
     The 8-tier source value is still inferable via priority_band (P3
@@ -5541,15 +5603,30 @@ class DataEngineV5:
         # schema-mismatch bugs (e.g., external schema_registry returning
         # 106 columns while the engine expects 107) at the engine
         # boundary rather than after the dashboard renders a broken
-        # row. Logs DEBUG when counts match, WARNING when they drift.
+        # row. Logs WARNING when counts drift on instrument sheets;
+        # special sheets (Insights_Analysis, Data_Dictionary) have
+        # their own schemas and are correctly excluded.
+        #
+        # v5.77.4: ChatGPT v5.77.3 audit caught that the v5.77.3 filter
+        # used placeholder names ("instruments", "stocks", "") that
+        # never match TFB's actual sheet names (Market_Leaders,
+        # Global_Markets, etc.), so the telemetry never fired in
+        # production. Fixed by routing through the existing
+        # _canonicalize_sheet_name() helper and checking membership
+        # in the existing INSTRUMENT_SHEETS set. This is the correct
+        # predicate and was already used elsewhere in this module
+        # (e.g., recovery and emergency-symbol paths).
         try:
             canonical_count = len(INSTRUMENT_CANONICAL_KEYS)
             actual_count = len(keys)
-            if actual_count != canonical_count and sheet in ("instruments", "instrument", "stocks", "stock", ""):
-                logger.warning(
-                    "[engine_v2 v%s] _finalize_payload schema drift: sheet=%s expected=%d got=%d",
-                    __version__, sheet or "(default)", canonical_count, actual_count,
-                )
+            if actual_count != canonical_count:
+                canonical_sheet = _canonicalize_sheet_name(sheet)
+                if canonical_sheet in INSTRUMENT_SHEETS:
+                    logger.warning(
+                        "[engine_v2 v%s] _finalize_payload schema drift: sheet=%s (canonical=%s) expected=%d got=%d",
+                        __version__, sheet or "(unset)", canonical_sheet,
+                        canonical_count, actual_count,
+                    )
         except Exception:
             pass
         dict_rows = [_strict_project_row(keys, r) for r in (row_objects or [])]
