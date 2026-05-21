@@ -2,10 +2,121 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.4.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.5.0)
 ===========================================================
 
-Why this revision (v6.4.0 vs v6.3.0)
+Why this revision (v6.5.0 vs v6.4.0)
+-------------------------------------
+8-TIER RECOMMENDATION VOCABULARY (rebased on v6.4.0's endpoint canonical-
+ization). Closes the last 5-tier vocabulary leak in the Python codebase.
+Every other consumer of `recommendation` tokens (engine, advisor, scoring,
+insights_builder, top10_selector, schemas, yahoo_fundamentals_provider)
+has been on the canonical 8-tier vocabulary since the May 2026 v8.0.0
+family rollout — only this analytics tooling still spoke 5-tier.
+
+Two real impacts on v6.4.0 (now fixed):
+
+  Impact 1 (HISTORICAL LOG MISCATEGORIZATION).
+    Loading historical Top10 logs at `PerformanceRecord.from_sheet_row`
+    calls `_parse_enum_value(RecommendationType, rec_raw, HOLD)`. For
+    any historical entry with `Entry Recommendation = "ACCUMULATE"`,
+    `"REDUCE"`, or `"AVOID"`, v6.4.0's 5-tier enum had no match —
+    `_parse_enum_value` fell back to the default HOLD. The entry was
+    SILENTLY MISCATEGORIZED in every subsequent analytic: win-rate, ROI
+    averages, Sharpe/Sortino by band — all computed against the wrong
+    tier. Any report grouped by recommendation showed inflated HOLD
+    counts and missing ACCUMULATE/REDUCE/AVOID bands entirely.
+
+  Impact 2 (NEW-ROW MISCLASSIFICATION).
+    `_recommendation_from_row` classified rows from the live Top10
+    feed via substring matching (`if "BUY" in s`, etc.). The 5-tier
+    branches matched STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL but had no
+    ACCUMULATE/REDUCE/AVOID branches, and broker-vocab aliases like
+    OUTPERFORM/OVERWEIGHT/UNDERPERFORM also fell through to HOLD.
+    Same silent-collapse bug as Impact 1, just on the read-side path.
+
+v6.5.0 closes both gaps without touching anything else:
+
+  v6.5.0 A  `RecommendationType` enum EXPANDED from 5 to 8 members.
+       Existing members (STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL) preserved
+       byte-identical so any serialized state from v6.4.0 (pickles,
+       JSON exports, CSV cells, Sheets rows) still deserializes. Three
+       new members appended:
+         ACCUMULATE = "ACCUMULATE"
+         REDUCE     = "REDUCE"
+         AVOID      = "AVOID"
+       Matches schemas.py v7.0.0's `Recommendation` enum vocabulary
+       exactly (the engine's canonical authority). `_parse_enum_value`
+       continues to work without changes — its existing whitespace /
+       underscore / hyphen normalization handles "ACCUMULATE", "REDUCE",
+       "AVOID" naturally via the `enum_cls(s)` constructor call.
+
+  v6.5.0 B  `_recommendation_from_row` REWRITTEN.
+       Precedence-ordered substring matching — longer / more specific
+       tokens checked first to prevent the silent-collapse bug. Drives
+       off the same vocabulary table used by yahoo_fundamentals_provider
+       v6.3.0's `map_recommendation`, so historical rows ingested from
+       either source classify identically:
+         "STRONG BUY" / "STRONG_BUY" / "STRONGBUY"          -> STRONG_BUY
+         "STRONG SELL" / "STRONG_SELL" / "STRONGSELL"       -> STRONG_SELL
+         "CONVICTION SELL" / "DEEP SELL"                    -> STRONG_SELL
+         "ACCUMULATE" / "SCALE IN" / "SCALE_IN"             -> ACCUMULATE
+         "MODERATE BUY" / "MOD BUY"                         -> ACCUMULATE
+         "AVOID" / "HARD PASS" / "DO NOT BUY" / "DNB"       -> AVOID
+         "UNINVESTABLE"                                     -> AVOID
+         "OUTPERFORM" / "OVERWEIGHT" / "ADD"                -> BUY
+         "BUY"                                              -> BUY
+         "MARKET PERFORM" / "NEUTRAL" / "EQUAL WEIGHT"      -> HOLD
+         "HOLD"                                             -> HOLD
+         "UNDERPERFORM" / "UNDERWEIGHT" / "REDUCE" / "TRIM" -> REDUCE
+         "EXIT"                                             -> SELL
+         "SELL"                                             -> SELL
+         unknown / blank                                    -> HOLD
+
+  v6.5.0 C  Cross-stack roster (May 2026 v8.0.0 family floor) documented
+       in the header below.
+
+  v6.5.0 D  SCRIPT_VERSION bumped 6.4.0 -> 6.5.0; SERVICE_VERSION follows.
+
+[PRESERVED — strictly] All v6.4.0 endpoint-canonicalization work
+(/v1/advanced/top10-investments, /v1/enriched/quotes with format=items,
+tolerant _extract_rows_from_envelope, /quotes legacy fallback chain,
+/v1/enriched/sheet-rows + /v1/analysis/sheet-rows fallbacks); all v6.4.0
+hardening (lazy _CPU_EXECUTOR, wait=True+cancel_futures shutdown,
+realized_roi/unrealized_roi None coercion before format spec, _TRUTHY/
+_FALSY vocabulary, _env_bool/_env_int/_env_csv helpers, SERVICE_VERSION
+alias, TRACK_* env var defaults for every CLI flag, _resolve_spreadsheet_id
+returns "" instead of raising); the full PerformanceRecord dataclass
+schema (it gains 3 new valid values for `entry_recommendation` but the
+field name and type are unchanged); every external-facing CLI argument;
+the Performance_Log sheet's 27-column HEADERS contract; daemon mode +
+signal handling. v6.5.0 is PURELY ADDITIVE at the vocabulary level —
+no removals, no renames. Historical performance logs written by v6.4.0
+deserialize byte-identically; ACCUMULATE/REDUCE/AVOID rows now resolve
+to their correct tier instead of silent HOLD.
+
+Cross-stack alignment (May 2026 v8.0.0 family floor)
+----------------------------------------------------
+  - core.reco_normalize             v8.0.0
+  - core.scoring                    v5.7.0
+  - core.scoring_engine             v3.6.0
+  - core.enriched_quote             v4.7.0
+  - core.schemas                    v7.0.0  (Recommendation enum 8-tier
+                                              -- canonical authority)
+  - core.sheets.schema_registry     v2.11.0
+  - core.data_engine_v2             v5.76.0
+  - core.investment_advisor_engine  v4.5.0
+  - core.analysis.insights_builder  v8.0.1
+  - core.analysis.top10_selector    v4.14.0
+  - core.analysis.criteria_model    v3.2.0
+  - core.providers.yahoo_fundamentals  v6.3.0
+  - core.providers.yahoo_chart         v8.2.0  (no rating surface)
+  - core.providers.eodhd               v4.6.0+ (no rating surface)
+  - scripts.track_performance          v6.5.0  (THIS DELIVERY)
+
+===========================================================
+
+Why this revision (v6.4.0 vs v6.3.0)  [PRESERVED BELOW VERBATIM]
 -------------------------------------
 - 🔑 FIX CRITICAL: `/v1/analysis/top10` does NOT exist in this project.
     Canonical endpoints are `POST /v1/advanced/top10-investments` and
@@ -130,8 +241,8 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.4.0"
-SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias
+SCRIPT_VERSION = "6.5.0"
+SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias (preserved in v6.5.0)
 SCRIPT_NAME = "PerformanceTracker"
 
 
@@ -558,11 +669,36 @@ class HorizonType(str, Enum):
 
 
 class RecommendationType(str, Enum):
+    """
+    8-tier recommendation vocabulary (v6.5.0).
+
+    Aligned with schemas.py v7.0.0 `Recommendation` enum -- the engine's
+    canonical authority. Tier ordering (most-positive to most-negative):
+      STRONG_BUY > BUY > ACCUMULATE > HOLD > REDUCE > SELL > STRONG_SELL > AVOID
+
+    Member order below preserves v6.4.0's first five members byte-
+    identical so any serialized state (pickles / JSON exports / CSV
+    cells / Sheets rows) written by v6.4.0 continues to deserialize
+    without change. The three new members (ACCUMULATE / REDUCE / AVOID)
+    are appended at the end.
+
+    Enum value strings use plain ASCII upper-case with a space for
+    multi-word tiers ("STRONG BUY", "STRONG SELL") -- matching v6.4.0's
+    convention. `_parse_enum_value` handles "STRONG_BUY" / "STRONG-BUY" /
+    "STRONGBUY" / "strong buy" via its existing normalization
+    (replace "_"->" ", replace "-"->" ", strip, upper) without any
+    changes required to that helper.
+    """
+    # v6.4.0 vocabulary -- preserved byte-identical for backwards compat.
     STRONG_BUY = "STRONG BUY"
     BUY = "BUY"
     HOLD = "HOLD"
     SELL = "SELL"
     STRONG_SELL = "STRONG SELL"
+    # v6.5.0 8-tier additions (appended at the end -- pickle order-stable).
+    ACCUMULATE = "ACCUMULATE"
+    REDUCE = "REDUCE"
+    AVOID = "AVOID"
 
 
 def _parse_enum_value(enum_cls: Any, raw: Any, default: Any) -> Any:
@@ -1736,17 +1872,120 @@ class PerformanceTrackerApp:
         return tgt_price, tgt_roi
 
     def _recommendation_from_row(self, row: Dict[str, Any]) -> RecommendationType:
-        s = _safe_str(row.get("recommendation")).upper()
-        if "STRONG" in s and "BUY" in s:
+        """
+        v6.5.0: classify a Top10 row's `recommendation` field into the
+        canonical 8-tier `RecommendationType`. Substring-match-based with
+        a precedence-ordered table -- longer / more specific tokens are
+        checked first to prevent the v6.4.0 silent-collapse bug where
+        ACCUMULATE / OUTPERFORM / REDUCE / AVOID all fell through to HOLD.
+
+        Vocabulary table (order matters):
+          "STRONG BUY" / "STRONG_BUY" / "STRONGBUY"          -> STRONG_BUY
+          "STRONG SELL" / "STRONG_SELL" / "STRONGSELL"       -> STRONG_SELL
+          "CONVICTION SELL" / "DEEP SELL"                    -> STRONG_SELL
+          "ACCUMULATE" / "SCALE IN" / "SCALE_IN"             -> ACCUMULATE
+          "MODERATE BUY" / "MOD BUY"                         -> ACCUMULATE
+          "AVOID" / "HARD PASS" / "DO NOT BUY" / "DNB"       -> AVOID
+          "UNINVESTABLE"                                     -> AVOID
+          "OUTPERFORM" / "OVERWEIGHT" / "ADD"                -> BUY
+          "BUY"                                              -> BUY
+          "MARKET PERFORM" / "NEUTRAL" / "EQUAL WEIGHT"      -> HOLD
+          "HOLD"                                             -> HOLD
+          "UNDERPERFORM" / "UNDERWEIGHT" / "REDUCE" / "TRIM" -> REDUCE
+          "EXIT"                                             -> SELL
+          "SELL"                                             -> SELL
+          unknown / blank                                    -> HOLD
+
+        Aligned byte-for-byte with yahoo_fundamentals_provider v6.3.0's
+        `map_recommendation` precedence so historical rows ingested
+        from either source classify identically.
+        """
+        raw = _safe_str(row.get("recommendation")).upper()
+        if not raw:
+            return RecommendationType.HOLD
+
+        # Normalize separators so "STRONG_BUY" / "STRONG-BUY" / "STRONGBUY"
+        # all reduce to a form that matches the substring checks below.
+        s = raw.replace("_", " ").replace("-", " ").replace("/", " ")
+        # Collapse internal runs of whitespace
+        while "  " in s:
+            s = s.replace("  ", " ")
+        s = s.strip()
+
+        # No-separator form for tokens like "STRONGBUY" / "STRONGSELL".
+        s_nospace = s.replace(" ", "")
+
+        # --- Tier 1: STRONG_BUY / STRONG_SELL (longest tokens first) ---
+        if ("STRONG" in s and "BUY" in s) or "STRONGBUY" in s_nospace:
             return RecommendationType.STRONG_BUY
+        if (
+            ("STRONG" in s and "SELL" in s)
+            or "STRONGSELL" in s_nospace
+            or "CONVICTION SELL" in s
+            or "DEEP SELL" in s
+        ):
+            return RecommendationType.STRONG_SELL
+
+        # --- Tier 2: ACCUMULATE (broker-vocab variants) ---
+        # Checked BEFORE plain BUY so "MODERATE BUY" routes to ACCUMULATE,
+        # not BUY. Also covers "SCALE IN" which has no "BUY" substring.
+        if (
+            "ACCUMULATE" in s
+            or "SCALE IN" in s
+            or "MODERATE BUY" in s
+            or "MOD BUY" in s
+        ):
+            return RecommendationType.ACCUMULATE
+
+        # --- Tier 3: AVOID (no substring conflict, but place high so a
+        # row labelled "AVOID THIS STOCK" doesn't accidentally hit a
+        # later branch). ---
+        if (
+            "AVOID" in s
+            or "HARD PASS" in s
+            or "DO NOT BUY" in s
+            or s == "DNB"
+            or "UNINVESTABLE" in s
+        ):
+            return RecommendationType.AVOID
+
+        # --- Tier 4: BUY (with broker-vocab aliases) ---
+        # OUTPERFORM / OVERWEIGHT / ADD all route to BUY -- v6.4.0
+        # collapsed them silently to HOLD because none contain "BUY".
+        if "OUTPERFORM" in s or "OVERWEIGHT" in s:
+            return RecommendationType.BUY
+        if s == "ADD" or " ADD " in (" " + s + " "):
+            # Word-boundary check for "ADD" to avoid false positives on
+            # tokens like "ADDITIONAL".
+            return RecommendationType.BUY
         if "BUY" in s:
             return RecommendationType.BUY
-        if "STRONG" in s and "SELL" in s:
-            return RecommendationType.STRONG_SELL
-        if "SELL" in s:
+
+        # --- Tier 5: REDUCE (with broker-vocab aliases). Checked BEFORE
+        # plain SELL so "UNDERPERFORM" routes to REDUCE, not the
+        # fallthrough. ---
+        if (
+            "UNDERPERFORM" in s
+            or "UNDERWEIGHT" in s
+            or "REDUCE" in s
+            or "TRIM" in s
+        ):
+            return RecommendationType.REDUCE
+
+        # --- Tier 6: SELL (the catch-all for any remaining sell variant) ---
+        if "EXIT" in s or "SELL" in s:
             return RecommendationType.SELL
-        if "HOLD" in s:
+
+        # --- Tier 7: HOLD aliases ---
+        if (
+            "HOLD" in s
+            or "MARKET PERFORM" in s
+            or "NEUTRAL" in s
+            or "EQUAL WEIGHT" in s
+        ):
             return RecommendationType.HOLD
+
+        # Unknown vocabulary -- preserves v6.4.0's HOLD default.
         return RecommendationType.HOLD
 
     async def record_from_top10(
