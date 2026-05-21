@@ -2,9 +2,144 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.75.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.76.0
 ================================================================================
 
+WHY v5.76.0 - 8-TIER VOCABULARY PASSTHROUGH + CROSS-STACK CONTRACT MARKERS
+-------------------------------------------------------------------------
+v5.76.0 closes the last remaining 6-tier choke point in the TFB stack.
+Every other module in the family is already on the 8-tier canonical
+vocabulary (ACCUMULATE / STRONG_SELL / AVOID added):
+  - core.reco_normalize          v8.0.0
+  - core.scoring                  v5.7.0
+  - core.scoring_engine (bridge) v3.6.0
+  - core.sheets.schema_registry  v2.11.0
+
+v5.75.0 was the lone holdout. Its `_V573_RECOMMENDATION_ENUM` was the
+6-tier set (STRONG_BUY / BUY / HOLD / REDUCE / SELL / STRONG_SELL), and
+`_V573_LEGACY_COLLAPSE = {ACCUMULATE: BUY, AVOID: STRONG_SELL}` was
+applied unconditionally by `_v573_collapse_to_canonical_enum` to every
+recommendation flowing through the classifier. The result: when
+scoring.py v5.7.0 correctly emitted ACCUMULATE for a moderate-bullish
+scale-in signal, the engine silently rewrote it back to BUY before the
+row was written to the sheet. The new ACCUMULATE / AVOID distinctions
+that scoring v5.7.0 and reco_normalize v8.0.0 worked hard to produce
+were destroyed at the engine boundary.
+
+v5.76.0 routes the 8-tier vocabulary through end-to-end by default
+and provides an explicit opt-in for callers that still need the 6-tier
+projection (Apps Script renderers, legacy dashboards). No removals;
+all v5.73.x / v5.74.0 / v5.75.0 symbols preserved with their names
+intact. The behavior change is gated by env so a deployment without
+the new env flag set behaves exactly as v5.75.0 did *except* that
+ACCUMULATE/AVOID no longer collapse — which is the whole point.
+
+What changes in v5.76.0
+-----------------------
+
+  Phase A — Header docstring sync. Floor moves to scoring.py v5.7.0+
+            and reco_normalize v8.0.0+ as documented above.
+
+  Phase B — `__version__` bumped 5.75.0 → 5.76.0. New module-level
+            constants surface the cross-stack contract alignment:
+              * _SCORING_CONTRACT_VERSION         = "5.7.0"
+              * _RECO_NORMALIZE_CONTRACT_VERSION  = "8.0.0"
+            Both are echoed in health() and get_stats() output so
+            ops tooling can verify cross-stack lockstep without
+            importing each module separately.
+
+  Phase C — 8-tier vocabulary as the canonical interior representation.
+              * `_V573_RECOMMENDATION_ENUM` expanded from 6 tiers to 8:
+                STRONG_BUY / BUY / ACCUMULATE / HOLD / REDUCE / SELL /
+                STRONG_SELL / AVOID.
+              * `_V573_LEGACY_COLLAPSE` becomes the empty dict by
+                default. The symbol is preserved (its name is referenced
+                by some external integrations, so deleting it would
+                break import compatibility), and its semantics are
+                clearly documented as "no longer applied by default."
+              * `_v573_collapse_to_canonical_enum` updated to
+                canonicalize TO the 8-tier set rather than collapse
+                DOWN to the 6-tier set. The function name is preserved
+                for back-compat; its docstring documents the v5.76.0
+                semantics change.
+              * Fallback `_SCORING_RECOMMENDATION_ENUM` (used when
+                core.scoring can't be imported) widened from 6 tiers
+                to 8.
+
+  Phase D — Sheet-compatibility opt-in via env flag:
+              `TFB_COLLAPSE_RECOMMENDATION_TO_6TIER` (default: false).
+              When set, `_apply_sheet_compat_collapse(row)` is called
+              at the end of `_classify_recommendation_8tier` to map
+              ACCUMULATE → BUY and AVOID → STRONG_SELL on the
+              recommendation / recommendation_detailed /
+              recommendation_priority / recommendation_priority_band
+              fields. The provider_rating audit field is NOT collapsed
+              (it carries the upstream value, not the engine's output).
+              This lets callers that haven't yet migrated their
+              renderer code (Apps Script 04_Format.gs at time of cut)
+              continue to receive only the legacy 6 tokens until
+              they're ready.
+
+  Phase E — Provider override priority bands extended for 8 tiers.
+              In `_classify_recommendation_8tier` Step 3a (the rare
+              path where TFB_TRUST_PROVIDER_RECO=true accepts the
+              provider's rating verbatim), the priority_band mapping
+              gains:
+                * ACCUMULATE → P3   (between BUY=P2 and HOLD=P4)
+                * AVOID      → P1   (urgent exit, like STRONG_SELL)
+              Pre-existing mappings (STRONG_BUY=P1, BUY=P2,
+              STRONG_SELL=P1, SELL/REDUCE=P5, else P4) preserved
+              verbatim.
+
+  Phase F — `_RECO_8TIER_PRIORITY` integer-rank alignment.
+              ACCUMULATE moves from rank 2 (legacy collapse equivalent
+              of BUY) to rank 3 — sitting between BUY=2 and HOLD=4 in
+              the 8-tier ordinal table. AVOID stays at rank 5 alongside
+              STRONG_SELL/SELL/REDUCE. The two are still distinguished
+              by priority_band (AVOID=P1, REDUCE=P5) — that's the
+              urgency axis; the integer rank is the conviction axis.
+
+  Phase G — `_recommendation_priority` debug log wording updated.
+              Previously warned that ACCUMULATE/AVOID arriving in the
+              priority map signaled an upstream canonicalization miss
+              (because they were supposed to collapse upstream). In
+              v5.76.0 those values are first-class and the warning is
+              dropped. The defensive fallback `_RECO_8TIER_PRIORITY`
+              entries for ACCUMULATE/AVOID stay but no longer
+              indicate a bug.
+
+  Phase H — `_compute_recommendation` simplified. The redundant
+              `_clear_recommendation_output_fields(row)` call is
+              removed (the v5.75.0 classifier self-clears at entry).
+              The clearing helper itself is preserved as a public
+              symbol for any external caller that still references it.
+
+  Phase I — Health and stats endpoints surface the contract markers.
+              `health()` adds an "8tier_alignment" block with
+              scoring_contract_version, reco_normalize_contract_version,
+              sheet_collapse_to_6tier_enabled, and a list of the 8
+              canonical tiers. `get_stats()` mirrors the same block.
+
+PRESERVED — strictly
+  All v5.75.0 / v5.74.0 / v5.73.x architectural behavior. No API shape
+  changes. No `data_quality` semantics changes. All canonical contract
+  shapes (97 + 9 = 106 fields) unchanged. Cache namespace versioning
+  unchanged. The v5.75.0 atomic-write contract in
+  `_classify_recommendation_8tier` is preserved (Steps 2a/2b/3a/3b/3c/4
+  in the same order; the only changes are at Step 3a's priority-band
+  table and a new optional Step 4b for the sheet-compat collapse).
+  v5.75.0's once-only provider_rating capture is preserved verbatim.
+
+DEFERRED — Phase 2 (separate release)
+  - Apps Script 04_Format.gs update to render ACCUMULATE/AVOID natively
+    (color, icon, tooltip). Until then, operators wanting old-style
+    sheets set TFB_COLLAPSE_RECOMMENDATION_TO_6TIER=true.
+  - `data_quality` semantics rework (Phase 1.5).
+  - File split along seams named in the v5.74.0 WHY block.
+  - `yahoo_fundamentals_provider.py` foreign-ticker gap.
+  - `core.scoring` threshold recalibration.
+
+================================================================================
 WHY v5.75.0 - NAME FALLBACK FIX + RECOMMENDATION GOVERNANCE TIGHTENING
 ----------------------------------------------------------------------
 v5.75.0 is a focused quality patch over v5.74.0. It fixes two production
@@ -230,7 +365,18 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.75.0"
+__version__ = "5.76.0"
+
+# v5.76.0 cross-stack contract version markers.
+# These document which core.scoring / core.reco_normalize releases
+# v5.76.0 was built to align with. They are READ symbolically by the
+# health() and get_stats() endpoints so operators can verify that the
+# running data_engine_v2 build is in lockstep with the rest of the
+# stack, without separately importing each module. Mirror of the
+# markers core.scoring v5.7.0 publishes as _ENGINE_CONTRACT_VERSION /
+# _RECO_NORMALIZE_CONTRACT_VERSION.
+_SCORING_CONTRACT_VERSION: str = "5.7.0"
+_RECO_NORMALIZE_CONTRACT_VERSION: str = "8.0.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -297,8 +443,10 @@ try:
     try:
         from core.scoring import RECOMMENDATION_ENUM as _SCORING_RECOMMENDATION_ENUM
     except Exception:
+        # v5.76.0: 8-tier fallback. ACCUMULATE / AVOID added.
         _SCORING_RECOMMENDATION_ENUM = (
-            "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL",
+            "STRONG_BUY", "BUY", "ACCUMULATE", "HOLD",
+            "REDUCE", "SELL", "STRONG_SELL", "AVOID",
         )
     try:
         from core.scoring import compute_scores as _scoring_compute_scores
@@ -315,19 +463,66 @@ except Exception:  # pragma: no cover
     _scoring_apply_canonical = None  # type: ignore
     _SCORING_APPLY_CANONICAL_AVAILABLE = False
     _SCORING_COMPUTE_SCORES_AVAILABLE = False
+    # v5.76.0: 8-tier fallback when core.scoring is entirely unavailable.
     _SCORING_RECOMMENDATION_ENUM = (
-        "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL",
+        "STRONG_BUY", "BUY", "ACCUMULATE", "HOLD",
+        "REDUCE", "SELL", "STRONG_SELL", "AVOID",
     )
     _CORE_SCORING_AVAILABLE = False
 
+# v5.76.0: 8-tier canonical recommendation vocabulary. Mirror of the
+# RECOMMENDATION_ENUM tuple exported by core.scoring v5.7.0+ and the
+# Recommendation enum in core.reco_normalize v8.0.0+.
+# ACCUMULATE sits between BUY and HOLD (a scale-in / moderate-bullish
+# call); AVOID sits below STRONG_SELL (uninvestable / hard pass).
+# Despite the historical _V573_* name, this set is the v5.76.0 contract.
+# The name is preserved so external modules that imported the symbol
+# don't break at module load.
 _V573_RECOMMENDATION_ENUM = frozenset({
-    "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL",
+    "STRONG_BUY", "BUY", "ACCUMULATE", "HOLD",
+    "REDUCE", "SELL", "STRONG_SELL", "AVOID",
 })
 
-_V573_LEGACY_COLLAPSE: Dict[str, str] = {
+# v5.76.0: legacy collapse map. v5.73.0 — v5.75.0 used this to fold
+# ACCUMULATE → BUY and AVOID → STRONG_SELL at the engine boundary,
+# back when downstream consumers (sheets, Apps Script renderers) were
+# 6-tier-only. v5.76.0 makes those tiers first-class so the default
+# collapse map is empty. The symbol is preserved (some external
+# integrations referenced it by name) and the dict can be repopulated
+# by a caller that explicitly wants the legacy behavior — though the
+# recommended path is to set TFB_COLLAPSE_RECOMMENDATION_TO_6TIER=true
+# and let `_apply_sheet_compat_collapse()` handle it cleanly.
+_V573_LEGACY_COLLAPSE: Dict[str, str] = {}
+
+# v5.76.0: opt-in sheet-compatibility 6-tier collapse. When enabled
+# via env, applied AT THE END of _classify_recommendation_8tier so
+# the row's recommendation / recommendation_detailed /
+# recommendation_priority / recommendation_priority_band fields are
+# coerced from the 8-tier canonical down to the legacy 6-tier set
+# right before they leave the engine. Internal pipeline (view
+# derivation, factor building, position size hint) operates on the
+# 8-tier value first; only the *output-facing* fields are collapsed.
+# provider_rating is NOT collapsed — it's audit evidence of what the
+# upstream provider said.
+_V576_SHEET_COMPAT_COLLAPSE: Dict[str, str] = {
     "ACCUMULATE": "BUY",
     "AVOID":      "STRONG_SELL",
 }
+
+
+def _sheet_collapse_to_6tier_enabled() -> bool:
+    """v5.76.0: True when TFB_COLLAPSE_RECOMMENDATION_TO_6TIER is set.
+
+    Controls whether `_apply_sheet_compat_collapse(row)` runs at the
+    end of `_classify_recommendation_8tier`. Default False — the
+    engine emits the full 8-tier vocabulary so it matches scoring.py
+    v5.7.0+, reco_normalize v8.0.0+, schema_registry v2.11.0+, and
+    scoring_engine v3.6.0+. Set True for callers whose downstream
+    renderers (Apps Script 04_Format.gs at time of cut) haven't been
+    updated to handle ACCUMULATE / AVOID natively.
+    """
+    raw = os.getenv("TFB_COLLAPSE_RECOMMENDATION_TO_6TIER", "")
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on", "enabled")
 
 
 def _v573_trust_provider_reco() -> bool:
@@ -336,25 +531,104 @@ def _v573_trust_provider_reco() -> bool:
 
 
 def _v573_collapse_to_canonical_enum(value: Any) -> str:
+    """v5.76.0: Canonicalize to the 8-tier vocabulary.
+
+    Despite the historical `_collapse_` name, this no longer collapses
+    ACCUMULATE → BUY or AVOID → STRONG_SELL. It accepts any input
+    string (case / whitespace / dash / underscore variations, plus
+    reco_normalize-recognized aliases like SCALE_IN → ACCUMULATE,
+    UNINVESTABLE → AVOID, etc.) and returns the canonical 8-tier
+    code, or "" if the input is not recognizable.
+
+    The function name is preserved for back-compat (some external
+    modules reference it by name). The behavioral change is gated by
+    the data shape: _V573_RECOMMENDATION_ENUM is now the 8-tier set
+    and _V573_LEGACY_COLLAPSE is empty by default, so the
+    canonicalization lattice routes everything to 8 tiers.
+
+    Sheet-compatibility 6-tier collapse is applied separately by
+    _apply_sheet_compat_collapse(row) when the
+    TFB_COLLAPSE_RECOMMENDATION_TO_6TIER env flag is set — never
+    inside this function.
+    """
     if value is None:
         return ""
     s = _safe_str(value).strip().upper().replace(" ", "_").replace("-", "_")
     if not s:
         return ""
-    if s in _V573_LEGACY_COLLAPSE:
-        return _V573_LEGACY_COLLAPSE[s]
+    # Direct match against the 8-tier canonical set. This is now the
+    # primary path; the _V573_LEGACY_COLLAPSE lookup below is a no-op
+    # when the dict is empty (its v5.76.0 default), but the code path
+    # is preserved so an external caller can repopulate
+    # _V573_LEGACY_COLLAPSE if they explicitly want legacy behavior.
     if s in _V573_RECOMMENDATION_ENUM:
         return s
+    if s in _V573_LEGACY_COLLAPSE:
+        return _V573_LEGACY_COLLAPSE[s]
     if _RECO_NORMALIZE_AVAILABLE and _rn_normalize_recommendation is not None:
         try:
             canon = _safe_str(_rn_normalize_recommendation(value)).upper()
-            if canon in _V573_LEGACY_COLLAPSE:
-                return _V573_LEGACY_COLLAPSE[canon]
             if canon in _V573_RECOMMENDATION_ENUM:
                 return canon
+            if canon in _V573_LEGACY_COLLAPSE:
+                return _V573_LEGACY_COLLAPSE[canon]
         except Exception:
             pass
     return ""
+
+
+def _apply_sheet_compat_collapse(row: Dict[str, Any]) -> None:
+    """v5.76.0: Sheet-compatibility 6-tier output collapse.
+
+    When TFB_COLLAPSE_RECOMMENDATION_TO_6TIER=true is set, the engine
+    rewrites the *output-facing* recommendation fields from the 8-tier
+    canonical to the legacy 6-tier set just before the row leaves the
+    classifier. Specifically:
+      * recommendation:                 ACCUMULATE → BUY, AVOID → STRONG_SELL
+      * recommendation_detailed:        same as recommendation (mirror)
+      * recommendation_priority:        re-derived from the collapsed value
+      * recommendation_priority_band:   re-derived from the collapsed value
+
+    Fields NOT modified:
+      * provider_rating          (audit evidence; the upstream provider's value)
+      * recommendation_source    (engine / provider_override / etc; unaffected)
+      * recommendation_reason    (free-form text; references the 8-tier
+                                  decision but renaming inline would distort
+                                  the structured-reason audit trail)
+      * scoring_recommendation_source (scoring.py provenance tag preserved)
+
+    The 8-tier source value is still inferable via priority_band (P3
+    suggested ACCUMULATE; P1 with non-STRONG_SELL reason suggested
+    AVOID), but the renderer-facing column carries only the legacy 6.
+
+    Intended for callers whose downstream sheet renderer (Apps Script
+    04_Format.gs) hasn't been updated to handle ACCUMULATE / AVOID
+    natively. Once 04_Format.gs gains 8-tier rendering, the env flag
+    can be unset and ACCUMULATE / AVOID flow through to the sheet
+    unmodified.
+    """
+    if not isinstance(row, dict):
+        return
+    rec = _safe_str(row.get("recommendation")).upper()
+    if rec not in _V576_SHEET_COMPAT_COLLAPSE:
+        return  # already 6-tier or unrecognized; no-op.
+
+    collapsed = _V576_SHEET_COMPAT_COLLAPSE[rec]
+    row["recommendation"] = collapsed
+    row["recommendation_detailed"] = collapsed
+    # Re-derive priority integer from the collapsed value so the int
+    # rank matches what's now in the recommendation column.
+    row["recommendation_priority"] = _recommendation_priority(collapsed)
+    # Re-derive priority_band from the collapsed value. The 8-tier
+    # band mappings: STRONG_BUY=P1, BUY=P2, ACCUMULATE=P3, HOLD=P4,
+    # REDUCE=P5, SELL=P5, STRONG_SELL=P1, AVOID=P1. After collapse:
+    #   ACCUMULATE→BUY     P3 → P2
+    #   AVOID→STRONG_SELL  P1 → P1 (no change)
+    current_band = _safe_str(row.get("recommendation_priority_band"))
+    if rec == "ACCUMULATE" and current_band == "P3":
+        row["recommendation_priority_band"] = "P2"
+    # AVOID → STRONG_SELL: priority_band stays P1.
+    _v573_append_warning(row, "sheet_compat_6tier_collapse_applied")
 
 
 # =============================================================================
@@ -872,9 +1146,15 @@ def _derive_views(row: Dict[str, Any]) -> None:
 
 
 _RECO_8TIER_PRIORITY: Dict[str, int] = {
+    # v5.76.0: integer rank table aligned with the 8-tier ordinal contract
+    # in core.reco_normalize v8.0.0. Rank 1 = highest conviction
+    # (STRONG_BUY) ... 5 = highest urgency-to-exit (REDUCE / SELL /
+    # STRONG_SELL / AVOID). The urgency axis (P1..P5 priority_band) is
+    # tracked separately: STRONG_BUY=P1, BUY=P2, ACCUMULATE=P3, HOLD=P4,
+    # REDUCE=P5, SELL=P5, STRONG_SELL=P1, AVOID=P1.
     "STRONG_BUY":  1,
     "BUY":         2,
-    "ACCUMULATE":  2,
+    "ACCUMULATE":  3,   # v5.76.0: was 2; now sits between BUY=2 and HOLD=4
     "HOLD":        4,
     "REDUCE":      5,
     "SELL":        5,
@@ -898,22 +1178,24 @@ def _canonical_recommendation(value: Any) -> str:
 
 
 def _recommendation_priority(rec: str) -> int:
-    """v5.69.0: priority 1 (best) .. 5 (worst) for a canonical recommendation.
-    Unknown -> 4 (HOLD-equivalent neutral).
+    """v5.69.0: integer rank 1 (best) .. 5 (worst) for a canonical
+    recommendation. Unknown -> 4 (HOLD-equivalent neutral).
 
-    v5.75.0: emits a debug log when a legacy ACCUMULATE/AVOID value reaches
-    the map - signals an upstream canonicalization miss (those values are
-    supposed to be collapsed to BUY/STRONG_SELL via
-    _v573_collapse_to_canonical_enum before they get here).
+    v5.76.0: ACCUMULATE and AVOID are first-class entries in the
+    8-tier table (rank 3 and rank 5 respectively). The v5.75.0 debug
+    warning that fired when ACCUMULATE/AVOID reached this map has
+    been dropped — those values are no longer "legacy un-collapsed
+    values that signal an upstream bug"; they're expected outputs
+    from scoring.py v5.7.0+ and reco_normalize v8.0.0+.
+
+    Note: this is the int-rank axis (conviction). The string
+    priority_band axis (urgency, P1..P5) is computed separately by
+    core.scoring.apply_canonical_recommendation and stored in
+    row["recommendation_priority_band"]. Both AVOID and STRONG_SELL
+    have int rank 5 (worst conviction) but priority_band P1 (urgent
+    exit) — the two axes encode different concerns.
     """
     key = _safe_str(rec).upper()
-    if key in ("ACCUMULATE", "AVOID"):
-        logger.debug(
-            "[engine_v2 v%s] _recommendation_priority received un-collapsed "
-            "legacy value %r; falling back to defensive priority. Upstream "
-            "canonicalization should have collapsed this to BUY/STRONG_SELL.",
-            __version__, key,
-        )
     return _RECO_8TIER_PRIORITY.get(key, 4)
 
 
@@ -993,11 +1275,18 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
         reason = (
             f"{rec}: Provider rating accepted via TFB_TRUST_PROVIDER_RECO override."
         )
+        # v5.76.0: priority_band table extended for the 8-tier vocabulary.
+        # STRONG_BUY=P1, BUY=P2, ACCUMULATE=P3 (new), HOLD=P4 (else),
+        # REDUCE/SELL=P5, STRONG_SELL=P1, AVOID=P1 (new — urgent exit).
         if rec == "STRONG_BUY":
             priority_band = "P1"
         elif rec == "BUY":
             priority_band = "P2"
+        elif rec == "ACCUMULATE":
+            priority_band = "P3"
         elif rec == "STRONG_SELL":
+            priority_band = "P1"
+        elif rec == "AVOID":
             priority_band = "P1"
         elif rec in ("SELL", "REDUCE"):
             priority_band = "P5"
@@ -1052,6 +1341,18 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     row["recommendation_reason"] = reason
     row["recommendation_priority"] = _recommendation_priority(rec)
     row["recommendation_priority_band"] = priority_band  # may be ""; that is fine
+
+    # -- Step 4b (v5.76.0): optional sheet-compatibility 6-tier collapse ----
+    # Default: disabled. When TFB_COLLAPSE_RECOMMENDATION_TO_6TIER=true is
+    # set, the recommendation / recommendation_detailed /
+    # recommendation_priority / recommendation_priority_band fields are
+    # rewritten from the 8-tier canonical down to the legacy 6-tier set
+    # (ACCUMULATE → BUY, AVOID → STRONG_SELL) so callers whose
+    # downstream renderer hasn't been updated to handle ACCUMULATE/AVOID
+    # continue to receive only the legacy tokens. provider_rating and
+    # the scoring.py provenance fields are NOT touched.
+    if _sheet_collapse_to_6tier_enabled():
+        _apply_sheet_compat_collapse(row)
 
     # Scoring schema version stamp (informational; not yet a required
     # canonical column).
@@ -3832,8 +4133,17 @@ def _compute_scores_local_fallback(row: Dict[str, Any]) -> None:
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
-    """v5.74.0 — single canonical recommendation delegator."""
-    _clear_recommendation_output_fields(row)
+    """v5.74.0 / v5.75.0 / v5.76.0 — single canonical recommendation
+    delegator.
+
+    v5.76.0: redundant `_clear_recommendation_output_fields(row)` call
+    removed. The v5.75.0 `_classify_recommendation_8tier` self-clears
+    its six recommendation output fields at entry (Step 2a), so the
+    explicit clear in this delegator was a no-op that only added
+    noise to traces. The `_clear_recommendation_output_fields` helper
+    is still defined and exported for any external caller that still
+    references it.
+    """
     _classify_recommendation_8tier(row)
 
 
@@ -6614,6 +6924,21 @@ class DataEngineV5:
                 "chart_fields_chased": list(_YAHOO_CHART_FIELDS),
                 "last_pass": dict(_YAHOO_ENRICHMENT_LAST_PASS),
             },
+            # v5.76.0: cross-stack 8-tier alignment snapshot. Operators can
+            # check this block to verify scoring.py / reco_normalize /
+            # data_engine_v2 are all in lockstep on the 8-tier vocabulary
+            # and to confirm whether the sheet-compat opt-in collapse is
+            # currently active.
+            "8tier_alignment": {
+                "scoring_contract_version": _SCORING_CONTRACT_VERSION,
+                "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
+                "scoring_recommendation_enum": tuple(_SCORING_RECOMMENDATION_ENUM),
+                "engine_recommendation_enum": tuple(sorted(_V573_RECOMMENDATION_ENUM)),
+                "sheet_collapse_to_6tier_enabled": _sheet_collapse_to_6tier_enabled(),
+                "sheet_compat_collapse_map": dict(_V576_SHEET_COMPAT_COLLAPSE),
+                "core_scoring_available": bool(_CORE_SCORING_AVAILABLE),
+                "reco_normalize_available": bool(_RECO_NORMALIZE_AVAILABLE),
+            },
         }
 
     async def get_health(self) -> Dict[str, Any]:
@@ -6644,6 +6969,16 @@ class DataEngineV5:
             "rows_reader_source": self._rows_reader_source,
             "snapshot_sheets": sorted(list(self._sheet_snapshots.keys())),
             "sheet_symbol_resolution_meta": dict(self._sheet_symbol_resolution_meta),
+            # v5.76.0: mirror of health()'s 8tier_alignment block so
+            # operators have a single endpoint that reports both stats
+            # and contract alignment.
+            "8tier_alignment": {
+                "scoring_contract_version": _SCORING_CONTRACT_VERSION,
+                "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
+                "sheet_collapse_to_6tier_enabled": _sheet_collapse_to_6tier_enabled(),
+                "core_scoring_available": bool(_CORE_SCORING_AVAILABLE),
+                "reco_normalize_available": bool(_RECO_NORMALIZE_AVAILABLE),
+            },
         }
 
 
