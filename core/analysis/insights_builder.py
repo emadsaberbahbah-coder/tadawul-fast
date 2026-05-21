@@ -2,8 +2,11 @@
 """
 core/analysis/insights_builder.py
 ================================================================================
-Insights Analysis Builder -- v8.0.0
-(8-TIER VOCABULARY + PRIORITY-BAND CONSUMPTION + CASCADE-BRIDGE SURFACING /
+Insights Analysis Builder -- v8.0.1
+(v8.0.1 PATCH: top10_selector v4.14.0 family-floor sync + criteria-forwarding
+ bug fix + top10 v8tier meta surfacing /
+ [PRESERVED v8.0.0] 8-TIER VOCABULARY + PRIORITY-BAND CONSUMPTION +
+ CASCADE-BRIDGE SURFACING /
  [PRESERVED v7.0.0] CROSS-STACK SIGNAL ENRICHMENT + DATA-QUALITY ALERTS /
  [PRESERVED v6.0.0] SCHEMA-CORRECT 7-COL / TIMESTAMP-FIX /
  SIGNAL-PRIORITY-PRESERVED / V5-V7 ALIGNED)
@@ -42,9 +45,84 @@ Aligned with the May 2026 cross-stack family floor:
   - core.data_engine_v2          v5.76.0  (8-tier passthrough, 106-col schema,
                                             cascade-bridge + provenance fields)
   - core.investment_advisor_engine v4.5.0 (8-tier routed)
-  - core.analysis.top10_selector v4.13.0  (canonical-bucket routed)
+  - core.analysis.top10_selector v4.14.0  (8-tier vocabulary aware,
+                                            priority-band routed,
+                                            cascade-bridge ready)
   - providers eodhd v4.7.3, yahoo_fundamentals v6.1.0, yahoo_chart v8.2.0,
               enriched_quote v4.7.0
+
+================================================================================
+v8.0.1 changes (vs v8.0.0)  --  CROSS-STACK SYNC + CRITERIA-FORWARDING FIX
+================================================================================
+
+THREE-PHASE PATCH. Strictly additive at the runtime contract level; no
+public API changes; no behaviour change unless the operator was already
+relying on v3.1.0+ hard filters reaching top10_selector through
+insights_builder (in which case v8.0.0 silently dropped them — v8.0.1
+is the fix).
+
+Phase A. CROSS-STACK FAMILY-FLOOR SYNC.
+  top10_selector v4.13.0 -> v4.14.0 in the header cross-stack family
+  block. Reflects the May 2026 family floor after the v4.14.0 selector
+  delivery: 8-tier vocabulary aware, priority-band routed,
+  cascade-bridge ready.
+
+Phase B. _normalize_criteria CRITERIA-FORWARDING FIX. v8.0.0's
+  `_normalize_criteria()` returned a fresh dict containing only an
+  insights-specific set of keys. Any v3.1.0 or v3.2.0 hard-filter
+  field passed in by the operator (min_conviction_score,
+  exclude_engine_dropped_valuation, exclude_forecast_unavailable,
+  exclude_provider_errors, exclude_avoid_recommendations,
+  min_priority_band, reco_8tier_strict) was SILENTLY DROPPED before
+  reaching top10_selector through `_fetch_top10_payload`. This was a
+  latent bug that pre-existed v8.0.0 — v3.1.0 fields were also
+  silently dropped in v7.0.0.
+
+  v8.0.1 forwards all 7 hard-filter fields through normalization,
+  with shape-correct coercion that mirrors top10_selector v4.14.0's
+  own `_collect_criteria_from_inputs`:
+    - min_conviction_score (float, fraction OR percent input)
+    - min_conviction          (legacy alias preserved)
+    - exclude_engine_dropped_valuation (bool)
+    - exclude_forecast_unavailable     (bool)
+    - exclude_provider_errors          (bool)
+    - exclude_avoid_recommendations    (bool, v3.2.0 forward-compat)
+    - min_priority_band                (str, "P1".."P5" or "")
+    - reco_8tier_strict                (bool, v3.2.0 forward-compat)
+
+  Defaults stay OFF / 0 / "" so v3.1.0 / v3.2.0-unaware callers see
+  zero behaviour change.
+
+Phase C. TOP10-SELECTOR v4.14.0 META SURFACING. `_fetch_top10_payload`
+  now captures the v4.14.0 meta block when present and propagates four
+  fields into the Insights response meta:
+    - reco_8tier_aware       -> top10_reco_8tier_aware
+    - applied_v310_filters   -> top10_applied_v310_filters
+    - applied_v8tier_filters -> top10_applied_v8tier_filters
+    - data_quality_summary   -> top10_data_quality_summary
+                                  (the v4.14.0-extended one with
+                                  avoid_count / accumulate_count /
+                                  strong_sell_count / reco_8tier_seen /
+                                  priority_band_seen / etc.)
+  Ops dashboards consuming Insights meta can verify cross-stack
+  8-tier alignment without a separate top10 call.
+
+Phase D. VERSION BUMP 8.0.0 -> 8.0.1. `__version__` alias auto-tracks.
+  `__all__` unchanged.
+
+PRESERVED VERBATIM FROM v8.0.0:
+  - All 8-tier vocabulary signal constants and membership sets
+    (Phase B / C / D / E / F / G / H / I)
+  - `_reco_to_signal()` 8-tier mapping
+  - `_priority_band_to_insights_priority()` helper
+  - `_extract_scoring_enrichment()` 9-field shape
+  - `_row_has_8tier_recommendation()` helper
+  - Risk Alerts sub-section for AVOID / STRONG_SELL recommendations
+  - Short-Term Opportunities ACCUMULATE qualifier
+  - Capability flags (`reco_8tier_seen`, `priority_band_seen`) in meta
+  - All v7.0.0 Data Quality Alerts logic
+  - All v6.0.0 fixes (7-col schema, signal-in-notes)
+  - All v5.0.0 mechanics (async timeouts, build budget)
 
 ================================================================================
 v8.0.0 changes (vs v7.0.0)  --  8-TIER VOCABULARY + PRIORITY-BAND CONSUMPTION
@@ -293,10 +371,12 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "8.0.0"
+INSIGHTS_BUILDER_VERSION = "8.0.1"
 # v7.0.0 Phase H: align with TFB module convention
 # v8.0.0: 8-tier vocabulary alignment + recommendation_priority_band
-# consumption + cascade-bridge field surfacing. See header docstring.
+# consumption + cascade-bridge field surfacing.
+# v8.0.1: top10_selector v4.14.0 cross-stack sync + criteria-forwarding
+# fix + top10 v4.14.0 meta surfacing. See header docstring for details.
 __version__ = INSIGHTS_BUILDER_VERSION
 
 # Riyadh timezone (UTC+3, no DST)
@@ -1138,6 +1218,51 @@ def _normalize_criteria(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if top_n is None or top_n <= 0:
         top_n = 10
 
+    # v8.0.1 Phase B: criteria-forwarding fix. Pull the v3.1.0 + v3.2.0
+    # hard-filter fields out of the incoming criteria dict so they survive
+    # the rebuild below and reach top10_selector v4.14.0 through
+    # `_fetch_top10_payload`. Shape coercion mirrors top10_selector's own
+    # `_collect_criteria_from_inputs` so the two normalizers agree.
+    #
+    # min_conviction_score (v3.1.0): float, 0..100. Accept fractional
+    # input ("0.60") as percentage (60).
+    mcs_raw = c.get("min_conviction_score")
+    if mcs_raw is None:
+        mcs_raw = c.get("min_conviction")
+    mcs_val = _as_float(mcs_raw)
+    if mcs_val is not None:
+        if 0.0 < mcs_val <= 1.0:
+            mcs_val = mcs_val * 100.0
+        mcs_val = _clamp(mcs_val, 0.0, 100.0)
+    else:
+        mcs_val = 0.0
+
+    # min_priority_band (v3.2.0): canonicalize to "P1".."P5" or "".
+    raw_band = _safe_str(c.get("min_priority_band")).upper().replace(" ", "")
+    raw_band = raw_band.replace("-", "").replace("_", "")
+    canon_band = ""
+    if raw_band.isdigit():
+        try:
+            n = int(raw_band)
+            if 1 <= n <= 5:
+                canon_band = f"P{n}"
+        except Exception:
+            pass
+    elif len(raw_band) == 2 and raw_band[0] == "P" and raw_band[1].isdigit():
+        try:
+            n = int(raw_band[1])
+            if 1 <= n <= 5:
+                canon_band = f"P{n}"
+        except Exception:
+            pass
+    elif raw_band.startswith("BAND") and len(raw_band) == 5 and raw_band[4].isdigit():
+        try:
+            n = int(raw_band[4])
+            if 1 <= n <= 5:
+                canon_band = f"P{n}"
+        except Exception:
+            pass
+
     return {
         "risk_level": _safe_str(c.get("risk_level") or "Moderate"),
         "confidence_level": _safe_str(c.get("confidence_level") or "High"),
@@ -1163,6 +1288,24 @@ def _normalize_criteria(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "include_macro_signals": _to_bool(c.get("include_macro_signals", True), True),
         # v7.0.0 Phase A: NEW section flag (default True)
         "include_data_quality_alerts": _to_bool(c.get("include_data_quality_alerts", True), True),
+        # v8.0.1 Phase B: criteria_model v3.1.0 hard-filter fields forwarded
+        # to top10_selector. Defaults stay 0 / False so v2.7.0-era callers
+        # see zero behaviour change.
+        "min_conviction_score": mcs_val,
+        "min_conviction": mcs_val,
+        "exclude_engine_dropped_valuation": _to_bool(
+            c.get("exclude_engine_dropped_valuation"), False),
+        "exclude_forecast_unavailable": _to_bool(
+            c.get("exclude_forecast_unavailable"), False),
+        "exclude_provider_errors": _to_bool(
+            c.get("exclude_provider_errors"), False),
+        # v8.0.1 Phase B: criteria_model v3.2.0 forward-compat fields. Top10
+        # selector v4.14.0 already consumes these; criteria_model v3.2.0
+        # will land them as canonical pydantic fields. Defaults off.
+        "exclude_avoid_recommendations": _to_bool(
+            c.get("exclude_avoid_recommendations"), False),
+        "min_priority_band": canon_band,
+        "reco_8tier_strict": _to_bool(c.get("reco_8tier_strict"), False),
     }
 
 
@@ -2838,7 +2981,8 @@ async def build_insights_analysis_rows(
             notes=(
                 f"core/analysis/insights_builder.py v{INSIGHTS_BUILDER_VERSION} -- "
                 f"7-col schema (registry v2.11.0) + 8-tier vocabulary + "
-                f"priority-band consumption + cascade-bridge surfacing"
+                f"priority-band consumption + cascade-bridge surfacing + "
+                f"top10_selector v4.14.0 family-floor sync"
             ),
             last_updated_riyadh=timestamp,
         ))
@@ -2979,6 +3123,8 @@ async def build_insights_analysis_rows(
                 rows.extend(_build_top_picks_rows(
                     ctx, {"symbols": top10_symbols}, top10_quotes=top10_quotes,
                 ))
+    else:
+        top10_payload = {}
 
     if do_risk_alerts and ctx.all_quotes:
         rows.extend(_build_risk_alert_rows(ctx, ctx.all_quotes))
@@ -3035,6 +3181,28 @@ async def build_insights_analysis_rows(
         if isinstance(r, Mapping)
     )
 
+    # v8.0.1 Phase C: top10_selector v4.14.0 meta surfacing. The selector
+    # emits a `reco_8tier_aware` capability flag, parallel
+    # `applied_v310_filters` / `applied_v8tier_filters` audit blocks, and
+    # an extended `data_quality_summary` block (with avoid_count /
+    # accumulate_count / strong_sell_count / reco_8tier_seen /
+    # priority_band_seen counts). We propagate them under `top10_*` keys
+    # so ops dashboards consuming Insights meta can verify whole-stack
+    # 8-tier alignment without a separate top10 call.
+    top10_meta = top10_payload.get("meta", {}) if isinstance(top10_payload, dict) else {}
+    if not isinstance(top10_meta, dict):
+        top10_meta = {}
+    top10_reco_8tier_aware = bool(top10_meta.get("reco_8tier_aware", False))
+    top10_applied_v310_filters = top10_meta.get("applied_v310_filters") or {}
+    if not isinstance(top10_applied_v310_filters, dict):
+        top10_applied_v310_filters = {}
+    top10_applied_v8tier_filters = top10_meta.get("applied_v8tier_filters") or {}
+    if not isinstance(top10_applied_v8tier_filters, dict):
+        top10_applied_v8tier_filters = {}
+    top10_dq_summary = top10_meta.get("data_quality_summary") or {}
+    if not isinstance(top10_dq_summary, dict):
+        top10_dq_summary = {}
+
     return {
         "status": "partial" if warnings else "success",
         "page": "Insights_Analysis",
@@ -3057,6 +3225,11 @@ async def build_insights_analysis_rows(
             # v8.0.0 Phase I: 8-tier vocabulary + priority-band capability flags
             "reco_8tier_seen": reco_8tier_seen,
             "priority_band_seen": priority_band_seen,
+            # v8.0.1 Phase C: top10_selector v4.14.0 meta passthrough.
+            "top10_reco_8tier_aware": top10_reco_8tier_aware,
+            "top10_applied_v310_filters": top10_applied_v310_filters,
+            "top10_applied_v8tier_filters": top10_applied_v8tier_filters,
+            "top10_data_quality_summary": top10_dq_summary,
         },
     }
 
