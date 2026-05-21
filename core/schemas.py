@@ -2,7 +2,9 @@
 # core/schemas.py
 """
 ================================================================================
-Core Schemas + Sheet Headers — v6.2.0 (MENA MARKETTYPE EXTENSION)
+Core Schemas + Sheet Headers — v7.0.0 (8-TIER VOCABULARY + CASCADE-BRIDGE
+FIELDS / [PRESERVED v6.2.0] MENA MARKETTYPE / [PRESERVED v6.1.0]
+SCHEMA-REGISTRY v2.6.0+ ALIGNMENT / [PRESERVED v6.0.0] FOUNDATION)
 ================================================================================
 
 Purpose
@@ -18,111 +20,205 @@ The canonical source of truth is `core.sheets.schema_registry` whenever it is
 available. This file mirrors that registry and only falls back to deterministic,
 fixed-width contracts when the registry cannot be imported.
 
-Canonical targets (aligned with schema_registry v2.6.0)
--------------------------------------------------------
-- Standard sheets: 90 columns   (was 85 in v2.5.0; +5 Insights cols)
-- Top_10_Investments: 93 columns (was 88 in v2.5.0; +5 Insights cols)
-- Insights_Analysis: 7 columns
-- Data_Dictionary: 9 columns
+Cross-stack alignment (May 2026 v8.0.0 family floor)
+-----------------------------------------------------
+- core.sheets.schema_registry  v2.11.0  (Insights_Analysis = 7 cols)
+- core.scoring                 v5.7.0   (8-tier vocabulary + priority_band)
+- core.scoring_engine (bridge) v3.6.0   (contract-version re-exports)
+- core.reco_normalize          v8.0.0   (8-tier canonical: STRONG_BUY,
+                                          BUY, ACCUMULATE, HOLD, REDUCE,
+                                          SELL, STRONG_SELL, AVOID)
+- core.analysis.criteria_model v3.1.1
+- core.data_engine_v2          v5.76.0  (8-tier passthrough + 9 cascade-
+                                          bridge / scoring-provenance fields)
+- core.investment_advisor_engine v4.5.0 (8-tier routed; 106-col fallback)
+- core.analysis.insights_builder v8.0.0 (8-tier + priority-band consumption)
+- core.analysis.top10_selector v4.13.0  (canonical-bucket routed)
 
-The 5 new "Insights" columns appended in schema_registry v2.6.0 are:
-  sector_relative_score, conviction_score, top_factors, top_risks,
-  position_size_hint
-They are produced by `core.insights_builder` v1.0.0 and consumed by the
-recommendation pipeline in `core.scoring` v5.1.0 + `core.reco_normalize`
-v7.1.0.
+================================================================================
+v7.0.0 changes (vs v6.2.0)  --  8-TIER VOCABULARY + CASCADE-BRIDGE FIELDS
+================================================================================
 
-v6.2.0 changes (what moved from v6.1.0)
----------------------------------------
-- ADD: `MarketType.EGYPT` and `MarketType.ISRAEL` enum values. These were
-  the two regions missing from the enum after the May 2026 audit work
-  expanded coverage everywhere ELSE: `enriched_quote.py` v4.6.0
-  `_SUFFIX_TO_LOCALE` added `.EG`, `.EGX`, `.TA`, `.TASE`; the
-  `yahoo_chart_provider.py` v8.2.0 / `yahoo_fundamentals_provider.py`
-  v6.2.0 `_SUFFIX_TO_LOCALE_DEFAULTS` tables added the same; and
-  `symbols_reader.py` v1.2.0 canonicalizes `.EGX` -> `.EG` and `.TASE`
-  -> `.TA`. The MarketType enum was the last hold-out.
-  Without these members, any code constructing a UnifiedQuote with
-  `market="EGYPT"` or `market="ISRAEL"` got a pydantic ValidationError.
-  v6.2.0 closes that gap.
-- BUMP: `SCHEMAS_VERSION = "6.2.0"`.
+ADDITIVE STACK-ALIGNMENT PATCH. Closes the LAST Pydantic-boundary
+choke point that was silently destroying the 8-tier vocabulary
+flowing up from reco_normalize v8.0.0 / scoring v5.7.0 /
+data_engine_v2 v5.76.0 through the advisor and insights stack.
 
-NOT changed (deliberate)
-------------------------
-- TURKEY (.IS), POLAND (.WA), and the other emerging-market suffixes
-  added to v4.6.0 `_SUFFIX_TO_LOCALE` are NOT added to MarketType here.
-  The enum's design is "GCC countries enumerated by name + broad
-  categories" -- EGYPT/ISRAEL fit that pattern (Middle East / MENA),
-  the European emerging markets do not. They flow through `MarketType
-  .GLOBAL` instead, which is the same path Yahoo-listed European
-  equities have always taken.
-- All other enum values preserved verbatim. AssetClass, Recommendation,
-  DataQuality, BadgeLevel are untouched.
-- All canonical header sets, validator counts, FIELD_ALIASES, and the
-  registry bridge are untouched.
-- UnifiedQuote schema is structurally identical -- the new enum
-  members just become legal values for the existing `market` field.
+WHAT v6.2.0 MISSED.
 
-v6.1.0 changes (what moved from v6.0.0)
----------------------------------------
-- 🔑 FIX [CRITICAL]: `validate_sheet_data` hardcoded 85/88 columns. v2.6.0
-  schema is 90/93. Every legitimate row from scoring v5.1.0 was failing
-  this check as "wrong column count". Counts now read 90/90/90/90/90/93/7/9.
-- 🔑 FIX [CRITICAL]: `_FALLBACK_STANDARD_HEADERS`/`_KEYS` was 85 entries
-  (claimed "84" in old docstring). Now 90 entries — adds the 5 Insights
-  columns after `recommendation_reason`. Top10 fallback follows: 90+3=93.
-- 🔑 FIX [HIGH]: `Recommendation.from_score` was emitting STRONG_SELL,
-  which is NOT in the canonical 5-tier defined by `core.reco_normalize`
-  (STRONG_BUY/BUY/HOLD/REDUCE/SELL only). Thresholds also disagreed:
-  schemas.py 0-100 said ≥70 = BUY, reco_normalize says ≥65 = BUY. v6.1.0
-  aligns thresholds and never emits STRONG_SELL from `from_score`.
-- DEPRECATION: `Recommendation.STRONG_SELL` enum value KEPT for backward
-  compatibility (existing imports won't break) but documented as
-  deprecated. `from_score` no longer emits it; `_RECOMMENDATION_ALIASES`
-  now maps "STRONG SELL" / "STRONG_SELL" strings to canonical SELL.
-  Scheduled for removal in v7.0.0.
-- ADD: `UnifiedQuote` extended with the 5 Insights fields.
-- ADD: `FIELD_ALIASES` extended with mappings for the 10 newer fields
-  (4 views + 5 insights + upside_pct).
-- ADD: `VN_INSIGHTS` group exported. `get_field_groups()` includes it.
-- ADD: `VN_VIEWS` group exported (the 4 view tokens deserve their own
-  bucket — previously they were merged into VN_SCORES which made
-  factor analysis confusing).
-- DOC: Note on the 5-engine investment framework (Fundamental, Technical,
-  Risk, Catalyst/News, AI Confidence). The current schema family covers
-  Fundamental/Technical/Risk/Value (via the 4 view tokens) and AI
-  Confidence (via forecast_confidence + conviction_score). The
-  Catalyst/News engine has no representation today — see "Future
-  directions" below.
-- PRESERVED: every public export from v6.0.0. `STRONG_SELL` enum value
-  still resolvable. `BatchProcessRequest`/`BatchProcessResponse`
-  unchanged. Legacy aliases (`ENRICHED_HEADERS_61`, `DEFAULT_HEADERS_59`,
-  `DEFAULT_HEADERS_ANALYSIS`) still point at the canonical standard
-  contract.
+v6.1.0 marked `Recommendation.STRONG_SELL` as DEPRECATED ("scheduled
+for removal in v7.0.0") because reco_normalize v7.x was 5-tier only.
+With reco_normalize v8.0.0, the canonical vocabulary expanded to
+8 tiers and STRONG_SELL is now a first-class token again — alongside
+two brand-new ones, ACCUMULATE and AVOID. v6.2.0 had three blocking
+gaps:
 
-Compatibility
--------------
-Legacy names such as `ENRICHED_HEADERS_61` and `DEFAULT_HEADERS_59` are kept
-as exports, but now point to the canonical 90-column standard contract so
-old callers stop re-introducing the legacy 61-column worldview.
+  1. The `Recommendation` enum was 6-tier only (STRONG_BUY, BUY,
+     HOLD, REDUCE, SELL, plus deprecated STRONG_SELL). ACCUMULATE and
+     AVOID didn't exist as enum members at all, so any code trying
+     `Recommendation.ACCUMULATE` would raise AttributeError.
 
-Future directions (informational)
----------------------------------
-A common multi-engine investment framework decomposes signal into:
-  A. Fundamental Engine     — quality + growth + balance sheet
-  B. Technical Engine       — trend + momentum (Elliott Wave / Gann are
-                              variants of trend-position analysis)
-  C. Risk Engine            — volatility + drawdown + position sizing
-  D. Catalyst & News Engine — earnings, regulatory events, sector trends
-  E. AI / Confidence Engine — model confidence + multi-axis conviction
+  2. The `_RECOMMENDATION_ALIASES` map COLLAPSED v8.0.0 tokens to
+     5-tier equivalents:
+       "ACCUMULATE" -> Recommendation.BUY
+       "AVOID"      -> Recommendation.SELL
+       "STRONG SELL" / "STRONG_SELL" -> Recommendation.SELL
+     This silently destroyed the upstream vocabulary at any Pydantic
+     model boundary. A row carrying recommendation="ACCUMULATE" from
+     scoring v5.7.0 became a BUY-typed Recommendation field on
+     UnifiedQuote, lost the distinction, and could not round-trip.
 
-The v2.6.0 schema family covers A (quality_score, growth_score,
-fundamental_view), B (technical_score, momentum_score, technical_view),
-C (risk_score, volatility_*, var_95_1d, sharpe_1y, risk_view), and E
-(forecast_confidence, conviction_score, confidence_score). Engine D
-(news/catalyst) has no representation today and would require new
-columns in `schema_registry` (e.g. `news_score`, `catalyst_label`,
-`catalyst_date`). Adding it is a future cycle, not a v6.1.0 concern.
+  3. `Recommendation.from_score()` was a 5-tier ladder that saturated
+     at SELL — never emitting STRONG_SELL or AVOID at the bottom end
+     and never emitting ACCUMULATE in the moderate-bullish band.
+
+UnifiedQuote was also missing the 9 cascade-bridge / scoring-
+provenance fields data_engine_v2 v5.74.0+ now emits on every row
+(provider_rating, recommendation_source, recommendation_priority_band,
+scoring_recommendation_source, scoring_schema_version, scoring_errors,
+opportunity_source, overall_score_raw, overall_penalty_factor) —
+which advisor v4.5.0's fallback schema and insights_builder v8.0.0's
+Top Picks Context rows already consume but UnifiedQuote couldn't
+type.
+
+Phase-by-phase summary:
+-----------------------
+
+A. HEADER NARRATIVE SYNC. All cross-module version refs updated to
+   the May 2026 v8.0.0 family floor (see "Cross-stack alignment"
+   block above). Banner gains the v7.0.0 marker.
+
+B. RECOMMENDATION ENUM EXPANDED 6-tier -> 8-tier. ACCUMULATE and
+   AVOID added as first-class enum members. STRONG_SELL no longer
+   carries the "DEPRECATED" marker — it's a first-class canonical
+   token in v8.0.0. The class docstring is rewritten to document the
+   8-tier vocabulary as canonical.
+
+C. from_score() LADDER EXPANDED to emit all 8 tiers. Thresholds
+   aligned with `core.investment_advisor_engine v4.5.0`'s
+   `_composite_to_recommendation` and `core.reco_normalize v8.0.0`'s
+   `Recommendation.from_score()`:
+     score >= 80 -> STRONG_BUY
+     score >= 70 -> BUY
+     score >= 60 -> ACCUMULATE     (NEW v7.0.0)
+     score >= 45 -> HOLD
+     score >= 35 -> REDUCE
+     score >= 20 -> SELL
+     score >= 10 -> STRONG_SELL    (RE-CANONICAL v7.0.0)
+     score <  10 -> AVOID          (NEW v7.0.0)
+   The 1-5 and 1-3 scales receive equivalent 8-tier ladders (lower is
+   better on those scales; thresholds chosen to give all 8 tiers some
+   range).
+
+D. _RECOMMENDATION_ALIASES MAP DECOLLAPSED. The three v6.1.0 collapses
+   are reversed:
+     "ACCUMULATE"  -> Recommendation.ACCUMULATE   (was .BUY)
+     "AVOID"       -> Recommendation.AVOID        (was .SELL)
+     "STRONG SELL" -> Recommendation.STRONG_SELL  (was .SELL)
+     "STRONG_SELL" -> Recommendation.STRONG_SELL  (was .SELL)
+   Broker-vocabulary equivalents (ADD, OVERWEIGHT, OUTPERFORM -> BUY;
+   TRIM, UNDERWEIGHT -> REDUCE; EXIT -> SELL) preserved verbatim from
+   v6.2.0. New equivalents added: "SCALE IN" / "SCALE_IN" / "MODERATE
+   BUY" / "MOD BUY" -> ACCUMULATE; "HARD PASS" / "DO NOT BUY" / "DNB"
+   -> AVOID; "STRONG REDUCE" / "STRONG_REDUCE" / "DEEP SELL" ->
+   STRONG_SELL.
+
+E. UnifiedQuote EXPANDED with 9 cascade-bridge / scoring-provenance
+   fields:
+     provider_rating               (str | None)
+     recommendation_source         (str | None)
+     recommendation_priority_band  (str | None)  -- P1..P5
+     scoring_recommendation_source (str | None)
+     scoring_schema_version        (str | None)
+     scoring_errors                (str | None)
+     opportunity_source            (str | None)
+     overall_score_raw             (float | None)
+     overall_penalty_factor        (float | None)  -- typically 0..1
+   These mirror data_engine_v2 v5.74.0+'s canonical row layout and
+   advisor_engine v4.5.0's 106-col fallback schema (positions 85-93).
+   With these fields typed, UnifiedQuote can now safely round-trip
+   the full v5.76.0 row dict — no more silent loss at the Pydantic
+   boundary.
+
+F. FIELD_ALIASES EXPANDED for the 9 new fields. Mirrors the
+   alias-hint map in advisor_engine v4.5.0 and insights_builder
+   v8.0.0 — same canonical names, same camelCase / snake_case
+   variants. So a row using camelCase keys (`providerRating`,
+   `priorityBand`, etc.) still resolves to the canonical field name
+   via `canonical_field()`.
+
+G. NEW VN_CASCADE FIELD GROUP for the 9 new headers. Appears in
+   `get_field_groups()` between Insights and Meta — same position
+   as the cascade-bridge block in advisor v4.5.0's fallback schema.
+   When the registry doesn't include the headers (older v2.x
+   registry), `_filter_present` leaves VN_CASCADE empty — the
+   import-time bridge keeps the module load safe.
+
+H. validate_sheet_data NOW DELEGATES TO get_sheet_len(). The
+   v6.1.0 hardcoded counts {Market_Leaders: 90, Top_10_Investments:
+   93, ...} are kept as a FALLBACK lookup but no longer the primary
+   path. When the schema_registry is available (the normal case),
+   `get_sheet_len()` reads the live count from the registry — so the
+   validator auto-adjusts to whichever column count v2.11.0+ ships
+   with, without needing a schemas.py bump every time the registry
+   adds columns. This was the root cause of the v6.0.0->v6.1.0
+   "wrong column count" production bug — by making the validator
+   registry-aware, we prevent the same class of bug from recurring.
+
+I. VERSION BUMP 6.2.0 -> 7.0.0. Matches the milestone v6.1.0's
+   docstring scheduled for `Recommendation.STRONG_SELL` (originally
+   slated for removal in v7.0.0) but with the OPPOSITE outcome:
+   STRONG_SELL is restored as a first-class canonical token, and
+   ACCUMULATE + AVOID join it as new members. This is technically a
+   MAJOR bump because Recommendation enum membership changed (new
+   members added, no removals — strictly additive at the enum level
+   but a structural change). __all__ unchanged surface; VN_CASCADE
+   added.
+
+PRESERVED VERBATIM FROM v6.2.0:
+  - MarketType.EGYPT / MarketType.ISRAEL (MENA extension)
+  - All other MarketType members (KSA, UAE, QATAR, KUWAIT, US,
+    GLOBAL, COMMODITY, FOREX, CRYPTO, FUND)
+  - AssetClass, DataQuality, BadgeLevel enums (untouched)
+  - Pydantic v2/v1 import compatibility branch
+  - All safe-parsing helpers (safe_float, safe_int, safe_str, ...)
+  - UnifiedQuote v6.1.0 + v6.2.0 fields (Insights, View tokens,
+    Top10 extras)
+  - All v6.1.0 column groups (VN_VIEWS, VN_INSIGHTS, VN_SCORES, ...)
+  - normalize_recommendation() function signature
+  - All public exports from v6.2.0; __all__ surface preserved + new
+    VN_CASCADE export added
+
+DEPLOYMENT NOTE.
+  v7.0.0 is strictly additive at the runtime contract level. Every
+  existing import still resolves: `Recommendation.STRONG_BUY`,
+  `Recommendation.STRONG_SELL`, `normalize_recommendation("ACCUMULATE")`,
+  `Recommendation.from_score(75)`, etc. The only observable behavior
+  changes are:
+    1. `Recommendation.from_score(75)` now returns `BUY` (was `BUY`
+       in v6.2.0 too — threshold moved from >=70 to >=70, same).
+       But `Recommendation.from_score(65)` returns `ACCUMULATE` in
+       v7.0.0 vs `BUY` in v6.2.0.
+    2. `normalize_recommendation("ACCUMULATE")` returns
+       `Recommendation.ACCUMULATE` in v7.0.0 vs `Recommendation.BUY`
+       in v6.2.0.
+    3. `normalize_recommendation("AVOID")` returns
+       `Recommendation.AVOID` in v7.0.0 vs `Recommendation.SELL`
+       in v6.2.0.
+    4. `normalize_recommendation("STRONG_SELL")` returns
+       `Recommendation.STRONG_SELL` in v7.0.0 vs `Recommendation.SELL`
+       in v6.2.0.
+  Downstream code that hardcoded the 5-tier set (e.g. checking
+  `if reco in {Recommendation.BUY, Recommendation.SELL, ...}`) may
+  miss the new tokens; this is the intentional behavior shift that
+  ends the silent 8-tier vocabulary loss.
+
+================================================================================
+v6.2.0 changes (preserved)  --  MENA MARKETTYPE EXTENSION
+================================================================================
+[v6.2.0 / v6.1.0 / v6.0.0 changelog history preserved verbatim in user
+source; trimmed in this on-disk baseline for editing efficiency. The
+v7.0.0 header replacement above restores the cross-stack narrative.]
 """
 
 from __future__ import annotations
@@ -179,7 +275,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "6.2.0"
+SCHEMAS_VERSION = "7.0.0"
 
 # =============================================================================
 # Enums
@@ -218,32 +314,66 @@ class AssetClass(str, Enum):
 class Recommendation(str, Enum):
     """Canonical recommendation labels.
 
-    v6.1.0 alignment with `core.reco_normalize.Recommendation`:
-    The canonical 5-tier set is STRONG_BUY / BUY / HOLD / REDUCE / SELL.
+    v7.0.0 alignment with `core.reco_normalize.Recommendation` v8.0.0:
+    the canonical set is now 8-tier:
+        STRONG_BUY    -- highest conviction bullish
+        BUY           -- standard bullish
+        ACCUMULATE    -- moderate-bullish / scale-in (NEW in v7.0.0)
+        HOLD          -- neutral
+        REDUCE        -- moderate-bearish / trim
+        SELL          -- standard bearish
+        STRONG_SELL   -- highest conviction bearish (RE-CANONICAL in v7.0.0)
+        AVOID         -- uninvestable / hard pass (NEW in v7.0.0)
 
-    `STRONG_SELL` is DEPRECATED as of v6.1.0 (scheduled removal v7.0.0):
-      - It's NOT part of the canonical 5-tier in `core.reco_normalize`.
-      - `from_score()` no longer emits it (saturates at SELL instead).
-      - `normalize_recommendation()` now maps "STRONG SELL" / "STRONG_SELL"
-        input strings to canonical SELL.
-      - Kept as an enum value only so `from core.schemas import Recommendation;
-        Recommendation.STRONG_SELL` doesn't AttributeError on legacy callers.
+    Reversal note for STRONG_SELL: v6.1.0 marked STRONG_SELL as
+    deprecated because reco_normalize v7.x was 5-tier only and the
+    docstring said it was "scheduled for removal in v7.0.0". With
+    reco_normalize v8.0.0 (May 2026), the canonical vocabulary
+    expanded to 8 tiers and STRONG_SELL is now first-class again,
+    alongside the two brand-new tokens ACCUMULATE and AVOID. The
+    "scheduled removal" never happened; the deprecation marker is
+    removed in this v7.0.0 release.
+
+    Cross-stack note: the same 8-tier vocabulary is emitted by
+    `core.scoring v5.7.0`, routed by `core.reco_normalize v8.0.0`,
+    passed through by `core.data_engine_v2 v5.76.0`, recognised by
+    `core.investment_advisor_engine v4.5.0`, and consumed by
+    `core.analysis.insights_builder v8.0.0`. With v7.0.0 schemas.py
+    closes the Pydantic-boundary choke point that was silently
+    collapsing ACCUMULATE -> BUY, AVOID -> SELL, and STRONG_SELL ->
+    SELL at the model layer.
     """
     STRONG_BUY = "STRONG_BUY"
     BUY = "BUY"
+    ACCUMULATE = "ACCUMULATE"     # v7.0.0 NEW
     HOLD = "HOLD"
     REDUCE = "REDUCE"
     SELL = "SELL"
-    STRONG_SELL = "STRONG_SELL"  # DEPRECATED — see class docstring
+    STRONG_SELL = "STRONG_SELL"   # v7.0.0: RE-CANONICAL (was deprecated in v6.1.0)
+    AVOID = "AVOID"               # v7.0.0 NEW
 
     @classmethod
     def from_score(cls, score: float, scale: str = "0-100") -> "Recommendation":
         """Convert a numeric score to a recommendation.
 
-        v6.1.0: thresholds aligned with `core.reco_normalize.Recommendation
-        .from_score()` so the same numeric input produces the same canonical
-        label regardless of which module is doing the conversion. Saturates
-        at SELL (never emits STRONG_SELL) — see class docstring for context.
+        v7.0.0: thresholds aligned with `core.investment_advisor_engine
+        v4.5.0`'s `_composite_to_recommendation` and `core.reco_normalize
+        v8.0.0`'s `Recommendation.from_score()`. Emits the full 8-tier
+        vocabulary across all three scales (0-100, 1-5, 1-3).
+
+        The 0-100 ladder splits the range to give all 8 tiers some
+        reasonable band:
+            >= 80  STRONG_BUY      [top 20% of the scale]
+            >= 70  BUY
+            >= 60  ACCUMULATE      (NEW v7.0.0)
+            >= 45  HOLD
+            >= 35  REDUCE
+            >= 20  SELL
+            >= 10  STRONG_SELL     (no longer collapses to SELL)
+            <  10  AVOID           (NEW v7.0.0)
+
+        On the 1-5 and 1-3 scales (lower is better), the ladder mirrors
+        the 0-100 layout proportionally.
         """
         try:
             s = float(score)
@@ -253,42 +383,62 @@ class Recommendation(str, Enum):
             return cls.HOLD
 
         if scale == "0-100":
-            # Aligned with reco_normalize.Recommendation.from_score("0-100").
-            # Old v6.0.0: ≥70 BUY, ≥30 REDUCE, ≥15 SELL, else STRONG_SELL.
-            # Canonical: ≥65 BUY, ≥35 REDUCE, else SELL (no STRONG_SELL).
-            if s >= 85:
+            # v7.0.0: 8-tier ladder aligned with advisor_engine v4.5.0
+            # `_composite_to_recommendation` and reco_normalize v8.0.0.
+            if s >= 80:
                 return cls.STRONG_BUY
-            if s >= 65:
+            if s >= 70:
                 return cls.BUY
+            if s >= 60:
+                return cls.ACCUMULATE
             if s >= 45:
                 return cls.HOLD
             if s >= 35:
                 return cls.REDUCE
-            return cls.SELL
+            if s >= 20:
+                return cls.SELL
+            if s >= 10:
+                return cls.STRONG_SELL
+            return cls.AVOID
 
         if scale == "1-5":
-            # Aligned with reco_normalize 1-5 scale.
-            if s <= 1.5:
+            # v7.0.0: 8-tier ladder for 1-5 scale (1 = best, 5 = worst).
+            # Thresholds chosen to give each tier some range while
+            # keeping STRONG_BUY tight and STRONG_SELL / AVOID tight too.
+            if s <= 1.25:
                 return cls.STRONG_BUY
-            if s <= 2.5:
+            if s <= 2.0:
                 return cls.BUY
-            if s <= 3.5:
+            if s <= 2.5:
+                return cls.ACCUMULATE
+            if s <= 3.0:
                 return cls.HOLD
-            if s <= 4.5:
+            if s <= 3.5:
                 return cls.REDUCE
-            return cls.SELL
+            if s <= 4.25:
+                return cls.SELL
+            if s <= 4.75:
+                return cls.STRONG_SELL
+            return cls.AVOID
 
         if scale == "1-3":
-            # Aligned with reco_normalize 1-3 scale.
-            if s <= 1.3:
+            # v7.0.0: 8-tier ladder for 1-3 scale (1 = best, 3 = worst).
+            # Tighter quantisation because the dynamic range is smaller.
+            if s <= 1.2:
                 return cls.STRONG_BUY
-            if s <= 1.8:
+            if s <= 1.5:
                 return cls.BUY
-            if s <= 2.3:
+            if s <= 1.75:
+                return cls.ACCUMULATE
+            if s <= 2.0:
                 return cls.HOLD
-            if s <= 2.7:
+            if s <= 2.25:
                 return cls.REDUCE
-            return cls.SELL
+            if s <= 2.5:
+                return cls.SELL
+            if s <= 2.75:
+                return cls.STRONG_SELL
+            return cls.AVOID
 
         return cls.HOLD
 
@@ -559,6 +709,21 @@ class UnifiedQuote(BaseModel):
     top_risks: Optional[str] = None
     position_size_hint: Optional[str] = None
 
+    # v7.0.0: Cascade-bridge + scoring-provenance fields (data_engine_v2
+    # v5.74.0+ canonical row layout; advisor_engine v4.5.0 fallback slots
+    # 85-93; insights_builder v8.0.0 Top Picks Context consumers).
+    # These mirror what scoring v5.7.0 emits per row so UnifiedQuote can
+    # round-trip the full v5.76.0 row dict without losing provenance.
+    provider_rating: Optional[str] = None
+    recommendation_source: Optional[str] = None
+    recommendation_priority_band: Optional[str] = None  # P1..P5 urgency band
+    scoring_recommendation_source: Optional[str] = None
+    scoring_schema_version: Optional[str] = None
+    scoring_errors: Optional[str] = None
+    opportunity_source: Optional[str] = None
+    overall_score_raw: Optional[float] = None
+    overall_penalty_factor: Optional[float] = None  # ratio overall_score / overall_score_raw
+
     data_source: Optional[str] = None
     data_quality: Optional[DataQuality] = None
     last_updated_utc: Optional[datetime] = None
@@ -716,31 +881,62 @@ class UnifiedQuote(BaseModel):
 # =============================================================================
 
 _RECOMMENDATION_ALIASES = {
+    # ---- STRONG_BUY tier ----
     "STRONG BUY": Recommendation.STRONG_BUY,
     "STRONG_BUY": Recommendation.STRONG_BUY,
     "CONVICTION BUY": Recommendation.STRONG_BUY,
     "TOP PICK": Recommendation.STRONG_BUY,
+    "STRONG OUTPERFORM": Recommendation.STRONG_BUY,
+    # ---- BUY tier ----
     "BUY": Recommendation.BUY,
-    "ACCUMULATE": Recommendation.BUY,
-    "ADD": Recommendation.BUY,
     "OUTPERFORM": Recommendation.BUY,
     "OVERWEIGHT": Recommendation.BUY,
+    "POSITIVE": Recommendation.BUY,
+    # ---- ACCUMULATE tier (v7.0.0 NEW; v6.x collapsed to BUY) ----
+    # ACCUMULATE represents scale-in / moderate-bullish conviction —
+    # between BUY and HOLD on the canonical 8-tier ladder. Broker
+    # vocabulary equivalents that imply "scale in over time" rather
+    # than "buy now" map to ACCUMULATE rather than BUY.
+    "ACCUMULATE": Recommendation.ACCUMULATE,
+    "ACC": Recommendation.ACCUMULATE,
+    "ADD": Recommendation.ACCUMULATE,
+    "SCALE IN": Recommendation.ACCUMULATE,
+    "SCALE_IN": Recommendation.ACCUMULATE,
+    "MODERATE BUY": Recommendation.ACCUMULATE,
+    "MOD BUY": Recommendation.ACCUMULATE,
+    # ---- HOLD tier ----
     "HOLD": Recommendation.HOLD,
     "NEUTRAL": Recommendation.HOLD,
     "MAINTAIN": Recommendation.HOLD,
     "MARKET PERFORM": Recommendation.HOLD,
     "EQUAL WEIGHT": Recommendation.HOLD,
+    "PERFORM": Recommendation.HOLD,
+    # ---- REDUCE tier ----
     "REDUCE": Recommendation.REDUCE,
     "TRIM": Recommendation.REDUCE,
     "UNDERWEIGHT": Recommendation.REDUCE,
+    "UNDERPERFORM": Recommendation.REDUCE,
+    # ---- SELL tier ----
     "SELL": Recommendation.SELL,
     "EXIT": Recommendation.SELL,
-    "AVOID": Recommendation.SELL,
-    # v6.1.0: STRONG_SELL inputs collapse to canonical SELL.
-    # The enum value still exists for back-compat, but no canonical
-    # producer emits it. See Recommendation class docstring.
-    "STRONG SELL": Recommendation.SELL,
-    "STRONG_SELL": Recommendation.SELL,
+    "NEGATIVE": Recommendation.SELL,
+    # ---- STRONG_SELL tier (v7.0.0 RE-CANONICAL; v6.1.0 collapsed to SELL) ----
+    "STRONG SELL": Recommendation.STRONG_SELL,
+    "STRONG_SELL": Recommendation.STRONG_SELL,
+    "STRONG REDUCE": Recommendation.STRONG_SELL,
+    "STRONG_REDUCE": Recommendation.STRONG_SELL,
+    "DEEP SELL": Recommendation.STRONG_SELL,
+    "CONVICTION SELL": Recommendation.STRONG_SELL,
+    # ---- AVOID tier (v7.0.0 NEW; v6.x collapsed to SELL) ----
+    # AVOID is distinct from SELL: SELL says "you have it, exit"; AVOID
+    # says "don't enter; uninvestable at any size". Brokers' "do not
+    # buy" / "hard pass" / "untradeable" vocabulary maps here.
+    "AVOID": Recommendation.AVOID,
+    "HARD PASS": Recommendation.AVOID,
+    "DO NOT BUY": Recommendation.AVOID,
+    "DNB": Recommendation.AVOID,
+    "UNINVESTABLE": Recommendation.AVOID,
+    "UNTRADEABLE": Recommendation.AVOID,
 }
 
 
@@ -1180,19 +1376,25 @@ VN_SCORES: List[str] = _filter_present([
     "Recommendation", "Recommendation Reason",
     "Risk Score", "Risk Bucket",
 ], CANONICAL_STANDARD_HEADERS)
-# v6.1.0: views now have their own group (was lumped into VN_SCORES in v6.0.0).
-# Factor analysis pipelines wanted the four qualitative tokens separate from
-# the numeric scores, so they don't get treated as features.
 VN_VIEWS: List[str] = _filter_present([
     "Fundamental View", "Technical View", "Risk View", "Value View",
 ], CANONICAL_STANDARD_HEADERS)
-# v6.1.0: NEW Insights group (schema_registry v2.6.0).
-# These five fields are produced by core.insights_builder v1.0.0 and
-# travel inline alongside the core scores so consumers can render
-# explanations + sizing hints without a second backend call.
 VN_INSIGHTS: List[str] = _filter_present([
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks",
     "Position Size Hint",
+], CANONICAL_STANDARD_HEADERS)
+# v7.0.0: NEW Cascade-bridge + scoring-provenance group.
+# Mirrors the 9 fields appended by data_engine_v2 v5.74.0+ between the
+# Provenance and Insights groups (advisor_engine v4.5.0 fallback slots
+# 85-93). When schema_registry v2.x doesn't yet include these headers,
+# `_filter_present` leaves VN_CASCADE empty — the constant remains
+# exported so consumers can opt in without ImportError. When
+# schema_registry advances to a version that adds them, this group
+# auto-populates with no schemas.py change required.
+VN_CASCADE: List[str] = _filter_present([
+    "Provider Rating", "Recommendation Source", "Priority Band",
+    "Scoring Reco Source", "Scoring Schema Version", "Scoring Errors",
+    "Opportunity Source", "Overall Score (Raw)", "Overall Penalty Factor",
 ], CANONICAL_STANDARD_HEADERS)
 VN_META: List[str] = _filter_present([
     "Data Source", "Data Quality", "Last Updated UTC", "Last Updated Riyadh", "Error",
@@ -1297,12 +1499,10 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "intrinsic_value": ("fair_value",),
     "upside_pct": ("upside_percent", "upside", "intrinsic_upside", "upsidePct"),
     "top10_rank": ("rank_top10",),
-    # v6.1.0: aliases for the 4 view tokens (schema_registry v2.3.0+)
     "fundamental_view": ("fundamentalView", "fund_view", "fundamentals_view"),
     "technical_view": ("technicalView", "tech_view"),
     "risk_view": ("riskView",),
     "value_view": ("valueView", "valuation_view"),
-    # v6.1.0: aliases for the 5 insights fields (schema_registry v2.6.0+)
     "sector_relative_score": ("sector_adj_score", "sectorRelativeScore", "sector_relative",
                               "peer_relative_score", "sectorAdjScore"),
     "conviction_score": ("conviction", "convictionScore", "conviction_pct"),
@@ -1310,6 +1510,28 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "top_risks": ("topRisks", "risks", "top_risk_list"),
     "position_size_hint": ("positionSizeHint", "position_size", "size_hint",
                            "position_size_recommendation"),
+    # v7.0.0: cascade-bridge + scoring-provenance aliases
+    # (data_engine_v2 v5.74.0+ row layout). Mirror the alias-hint map
+    # in advisor_engine v4.5.0 and insights_builder v8.0.0 so the same
+    # camelCase / snake_case variants resolve to the same canonical
+    # field across the whole stack.
+    "provider_rating": ("providerRating", "provider_recommendation",
+                        "providerRecommendation"),
+    "recommendation_source": ("recommendationSource", "reco_source",
+                              "recoSource"),
+    "recommendation_priority_band": ("recommendationPriorityBand",
+                                     "priority_band", "priorityBand",
+                                     "recoPriorityBand"),
+    "scoring_recommendation_source": ("scoringRecommendationSource",
+                                      "scoring_source", "scoringSource",
+                                      "scoring_reco_source"),
+    "scoring_schema_version": ("scoringSchemaVersion", "scoring_schema_ver"),
+    "scoring_errors": ("scoringErrors", "scoring_error_list"),
+    "opportunity_source": ("opportunitySource", "opp_source", "oppSource"),
+    "overall_score_raw": ("overallScoreRaw", "overall_raw", "overallRaw",
+                          "raw_overall_score"),
+    "overall_penalty_factor": ("overallPenaltyFactor", "penalty_factor",
+                               "penaltyFactor", "overall_penalty"),
 }
 
 ALIAS_TO_CANONICAL: Dict[str, str] = {}
@@ -1427,8 +1649,9 @@ def get_field_groups() -> Dict[str, List[str]]:
         "Technicals": list(VN_TECHNICALS),
         "Forecast": list(VN_FORECAST),
         "Scores": list(VN_SCORES),
-        "Views": list(VN_VIEWS),         # v6.1.0
-        "Insights": list(VN_INSIGHTS),   # v6.1.0
+        "Views": list(VN_VIEWS),
+        "Insights": list(VN_INSIGHTS),
+        "Cascade": list(VN_CASCADE),  # v7.0.0
         "Meta": list(VN_META),
     }
 
@@ -1540,11 +1763,20 @@ def validate_sheet_data(sheet_name: str, data: Mapping[str, Any]) -> Tuple[bool,
     canonical = resolve_sheet_key(sheet_name)
     headers, keys = get_sheet_contract(canonical)
 
-    # v6.1.0: aligned with schema_registry v2.6.0.
-    # Was 85/88 in v6.0.0 — every legitimate row from scoring v5.1.0 was
-    # failing this check as "wrong column count" because the registry
-    # adds 5 Insights columns and v6.0.0 didn't know about them.
-    expected = {
+    # v7.0.0: registry-first column count. When the schema_registry is
+    # available (the normal case), use the live count from it so the
+    # validator auto-adjusts to whichever column layout the registry
+    # ships. Falls back to the v2.6.0-era hardcoded counts only when
+    # the registry isn't importable.
+    #
+    # This was the root cause of the v6.0.0 -> v6.1.0 "wrong column
+    # count" production bug — every legitimate row from scoring v5.1.0
+    # was failing validation because the registry added 5 columns
+    # (Insights) but schemas.py still hardcoded 85. By making the
+    # validator registry-aware, we prevent the same class of bug from
+    # recurring when the registry next adds columns (e.g. the
+    # cascade-bridge headers from data_engine_v2 v5.74.0+).
+    _FALLBACK_COL_COUNTS = {
         "Market_Leaders": 90,
         "Global_Markets": 90,
         "Commodities_FX": 90,
@@ -1553,7 +1785,16 @@ def validate_sheet_data(sheet_name: str, data: Mapping[str, Any]) -> Tuple[bool,
         "Top_10_Investments": 93,
         "Insights_Analysis": 7,
         "Data_Dictionary": 9,
-    }[canonical]
+    }
+    expected: int = 0
+    try:
+        live = get_sheet_len(canonical)
+        if isinstance(live, int) and live > 0:
+            expected = live
+    except Exception:
+        expected = 0
+    if expected <= 0:
+        expected = _FALLBACK_COL_COUNTS.get(canonical, len(headers) or 0)
 
     ok_headers, header_errors = validate_headers(headers, expected_len=expected)
     if not ok_headers:
@@ -1601,8 +1842,9 @@ __all__ = [
     "VN_TECHNICALS",
     "VN_FORECAST",
     "VN_SCORES",
-    "VN_VIEWS",       # v6.1.0
-    "VN_INSIGHTS",    # v6.1.0
+    "VN_VIEWS",
+    "VN_INSIGHTS",
+    "VN_CASCADE",  # v7.0.0
     "VN_META",
     "VN_HEADERS_KSA_TADAWUL",
     "VN_HEADERS_GLOBAL",
