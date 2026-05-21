@@ -2,8 +2,11 @@
 """
 core/analysis/criteria_model.py
 ================================================================================
-Advisor Criteria Model -- v3.1.1
-(CROSS-STACK CONVICTION + DATA-QUALITY CRITERIA, V2-ONLY, SCENARIO-TABLE)
+Advisor Criteria Model -- v3.2.0
+(v3.2.0: 8-TIER VOCABULARY + PRIORITY-BAND CRITERIA + RECO_8TIER_STRICT /
+ [PRESERVED v3.1.1] TOP10_SELECTOR v4.12.0 ALIGNMENT /
+ [PRESERVED v3.1.0] CROSS-STACK CONVICTION + DATA-QUALITY CRITERIA /
+ [PRESERVED v3.0.0] V2-ONLY, SCENARIO-TABLE)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -13,8 +16,236 @@ Single validated source-of-truth for advisor criteria embedded in the
 Insights_Analysis top block (key/value rows) and shared by
 Top_10_Investments.
 
+Cross-stack alignment (May 2026 v8.0.0 family floor)
+-----------------------------------------------------
+  - core.scoring                 v5.7.0   (8-tier vocabulary + priority_band)
+  - core.scoring_engine (bridge) v3.6.0   (contract-version re-exports)
+  - core.reco_normalize          v8.0.0   (8-tier canonical: STRONG_BUY,
+                                            BUY, ACCUMULATE, HOLD, REDUCE,
+                                            SELL, STRONG_SELL, AVOID)
+  - core.schemas                 v7.0.0   (Recommendation enum 8-tier;
+                                            UnifiedQuote cascade-bridge)
+  - core.sheets.schema_registry  v2.11.0  (Insights_Analysis = 7 cols)
+  - core.data_engine_v2          v5.76.0  (8-tier passthrough + cascade-
+                                            bridge / provenance fields)
+  - core.investment_advisor_engine v4.5.0 (8-tier routed)
+  - core.analysis.insights_builder v8.0.1 (8-tier + priority-band + top10
+                                            v4.14.0 meta surfacing +
+                                            criteria-forwarding fix)
+  - core.analysis.top10_selector v4.14.0  (8-tier vocabulary aware,
+                                            priority-band routed,
+                                            cascade-bridge ready;
+                                            consumes all 3 v3.2.0 fields)
+  - core.analysis.criteria_model v3.2.0   (THIS DELIVERY)
+  - providers eodhd v4.7.3, yahoo_fundamentals v6.1.0, yahoo_chart v8.2.0,
+              enriched_quote v4.7.0
+
 ================================================================================
-v3.1.1 Changes (from v3.1.0)  --  TOP10_SELECTOR v4.12.0 ALIGNMENT
+v3.2.0 Changes (from v3.1.1)  --  8-TIER VOCABULARY + PRIORITY-BAND CRITERIA
+================================================================================
+
+ADDITIVE STACK-ALIGNMENT PATCH. Closes the LAST criteria-surface gap
+preventing operators from expressing the full 8-tier policy surface
+that top10_selector v4.14.0 + insights_builder v8.0.1 already consume.
+
+The selector v4.14.0 delivery activated 3 NEW hard-filter codepaths in
+its `_passes_filters_with_reason()`:
+  - exclude_avoid_recommendations -- drop rows with recommendation=AVOID
+  - min_priority_band             -- drop rows below an urgency floor
+                                      ("P1".."P5" or "" for no filter)
+  - reco_8tier_strict             -- drop rows whose recommendation
+                                      cannot be normalized to canonical
+                                      8-tier
+But until v3.2.0, the criteria_model surface had no way to express
+those choices through a typed contract. Operators had to inject them
+as bare dict keys, which bypassed validation. v3.2.0 lands them as
+first-class AdvisorCriteria fields with full validator coverage,
+KV-map fuzzy aliases, scenario-preset wiring, and ScenarioSpec
+surfacing.
+
+All v3.2.0 changes are ADDITIVE WITH DEFAULTS -- no field removals, no
+validator changes for existing fields, no breaking API changes.
+Existing callers see identical behaviour.
+
+Phase-by-phase summary:
+-----------------------
+
+A. NARRATIVE SYNC. Header banner gains v3.2.0 marker; cross-stack
+   roster table refreshed to May 2026 v8.0.0 family floor (scoring
+   v5.7.0, reco_normalize v8.0.0, schemas v7.0.0, schema_registry
+   v2.11.0, data_engine_v2 v5.76.0, advisor_engine v4.5.0,
+   insights_builder v8.0.1, top10_selector v4.14.0). v3.1.1 / v3.1.0 /
+   v3.0.0 history preserved verbatim below.
+
+B. NEW PRIORITY-BAND VOCABULARY CONSTANTS.
+     PRIORITY_BAND_VALUES -- public frozenset ("P1".."P5"); added to
+                              __all__ so callers (UI components, audit
+                              reports, top10_selector tests) can read
+                              the canonical set without hardcoding.
+     _PRIORITY_BAND_CANONICAL -- private alias used by the validator.
+     _normalize_priority_band(value) -- private helper that canonicalizes
+                              raw input to "P1".."P5" or "". Accepts:
+                                "P1" / "p1" / "p 1"           -> "P1"
+                                1 / "1" / 1.0                  -> "P1"
+                                "BAND 1" / "band_1" / "BAND-1" -> "P1"
+                                None / "" / unparseable        -> ""
+                              Mirrors top10_selector v4.14.0's
+                              `_normalize_priority_band` and
+                              insights_builder v8.0.1's
+                              `_normalize_criteria` canonicalization.
+
+C. THREE NEW AdvisorCriteria FIELDS, all default OFF / "" (so v3.1.x
+   callers see ZERO behaviour change):
+
+     exclude_avoid_recommendations : bool = False
+        Drop rows whose recommendation normalizes to "AVOID". When
+        True, top10_selector v4.14.0's filter pipeline removes those
+        rows from the candidate pool. AVOID is the engine's hardest
+        "do not touch" call from reco_normalize v8.0.0 / scoring
+        v5.7.0. Note: even when this flag is False, AVOID rows are
+        naturally pushed out of Top10 by the selector's tiebreak
+        bump (_RECO_TIEBREAK_BUMPS["AVOID"] = -8.0); the flag lets
+        operators enforce the exclusion as a hard contract rather
+        than a soft demotion.
+
+     min_priority_band : str = ""    (canonicalized "P1".."P5" or "")
+        Drop rows whose recommendation_priority_band (scoring v5.7.0
+        emits P1..P5) is below the configured floor. "P1" is the
+        strictest (only most-urgent picks); "P5" admits everything.
+        Empty string = no filter (preserves v3.1.x semantics). Validator
+        canonicalizes lowercase, numeric (1..5), and "BAND_N" variants.
+
+     reco_8tier_strict : bool = False
+        When True, drop any row whose `recommendation` field cannot be
+        normalized to one of the 8 canonical tokens (STRONG_BUY, BUY,
+        ACCUMULATE, HOLD, REDUCE, SELL, STRONG_SELL, AVOID). Useful for
+        operators who want to enforce that the upstream stack is fully
+        on the v8.0.0 vocabulary -- when a row appears with an
+        unknown / malformed token, it's a sign the cascade-bridge has
+        a regression. Default False so transient upstream noise
+        doesn't drop candidates from production Top10.
+
+D. NEW VALIDATORS for the 3 new fields:
+     - `_validate_exclusion_flag` extended to ALSO cover
+       `exclude_avoid_recommendations` and `reco_8tier_strict` (both
+       default False; matches the v3.1.0 exclusion-flag pattern).
+     - NEW `_validate_priority_band` (mode="before") routes raw input
+       through `_normalize_priority_band` and returns "" on unparseable
+       input rather than raising. Mirrors the silent-coercion
+       contract that top10_selector v4.14.0 and insights_builder
+       v8.0.1 already follow downstream.
+
+E. KV-MAP FACTORY ALIASES extended in `from_kv_map`:
+     exclude_avoid_recommendations:
+        "exclude_avoid_recommendations", "exclude avoid recommendations",
+        "exclude avoid", "excludeAvoidRecommendations" (camelCase),
+        "drop avoid", "no avoid", "no_avoid_picks"
+     min_priority_band:
+        "min_priority_band", "min priority band", "priority band",
+        "priorityBand" (camelCase), "minPriorityBand" (camelCase),
+        "recoPriorityBand" (camelCase), "priority_band", "band floor",
+        "min urgency band"
+     reco_8tier_strict:
+        "reco_8tier_strict", "reco 8tier strict", "reco_strict_8tier",
+        "reco8TierStrict" (camelCase), "recoStrict" (camelCase),
+        "strict 8tier", "strict_8tier", "reco strict"
+
+F. _SCENARIO_PRESETS extended with 3 new keys per scenario. Defaults
+   chosen to align with each scenario's existing data-quality posture:
+
+     Conservative:
+       exclude_avoid_recommendations = True    (hard exclude AVOID)
+       min_priority_band             = "P3"    (P1/P2/P3 only;
+                                                ACCUMULATE-or-better
+                                                urgency floor)
+       reco_8tier_strict             = True    (enforce clean 8-tier
+                                                vocabulary on every
+                                                candidate)
+
+     Moderate:
+       exclude_avoid_recommendations = True    (still exclude AVOID
+                                                even at moderate risk
+                                                tolerance; AVOID is
+                                                "do not touch" not
+                                                "high risk reward")
+       min_priority_band             = ""      (no band floor; let
+                                                conviction_score and
+                                                technical signals
+                                                rank candidates)
+       reco_8tier_strict             = False   (accept noisy upstream)
+
+     Aggressive:
+       exclude_avoid_recommendations = False   (operators chasing the
+                                                opportunity tail may
+                                                want to see AVOID rows
+                                                surfaced for manual
+                                                override review)
+       min_priority_band             = ""      (no band floor)
+       reco_8tier_strict             = False   (accept noisy upstream)
+
+G. ScenarioSpec DATACLASS EXTENDED with 3 new fields (all default
+   OFF / "" preserving v3.1.x existing-caller behaviour):
+     exclude_avoid_recommendations: bool = False
+     min_priority_band            : str = ""
+     reco_8tier_strict            : bool = False
+   Validator block in `__post_init__` checks min_priority_band is "" or
+   one of "P1".."P5" (so a Spec built directly by a caller without going
+   through `build_scenario_specs` still gets validated).
+
+H. build_scenario_specs() NOTES STRING EXTENDED. When any of the 3
+   new flags is active for a scenario, the notes string gains a
+   trailing "8-tier: ..." block surfacing the policy. So
+   insights_builder v8.0.1's Risk Scenarios section auto-renders
+   the 8-tier policy without needing a separate fetch.
+
+I. VERSION BUMP 3.1.1 -> 3.2.0. `__version__` alias auto-tracks.
+   `__all__` augmented with `PRIORITY_BAND_VALUES` (new public symbol;
+   no removals).
+
+PRESERVED VERBATIM FROM v3.1.1:
+- All 4 v3.1.0 fields (min_conviction_score + 3 v3.1.0 exclusion bool
+  flags) and their validators
+- All v3.0.0 bug fixes (max_risk_score=0, thread-safety,
+  top10_enabled-as-integer non-override)
+- v3.1.0 _SCENARIO_PRESETS conviction + 3-exclusion defaults per scenario
+- v3.1.0 KV map aliases for the 4 hard-filter fields
+- v3.1.0 ScenarioSpec dataclass + its validation
+- v3.1.0 env-tunable conviction floor helpers (get_strong_buy_/
+  get_buy_conviction_floor()) and their RECO_*_FLOOR env knobs
+- All v3.0.0 Pydantic v2-only contract (no v1 fallback)
+
+DEPLOYMENT NOTE.
+  v3.2.0 is strictly additive. Every existing caller continues to work
+  unchanged. The 3 new fields are off by default so a v3.1.x KV map
+  parses identically. The new fields only activate when an operator
+  sends them through the criteria payload (whether via from_kv_map's
+  new aliases, direct AdvisorCriteria(...) construction, or the
+  Conservative / Moderate scenario presets).
+
+  End-to-end flow under v3.2.0:
+
+    Operator -> Insights_Analysis sheet (top block) /
+                Top_10_Investments criteria payload
+              |
+              v
+    criteria_model.AdvisorCriteria.from_kv_map(...)  [v3.2.0]
+              |
+              v
+    insights_builder._normalize_criteria()           [v8.0.1
+              |                                       forwards
+              v                                       all 7
+    top10_selector._collect_criteria_from_inputs()   [v4.14.0
+              |                                       consumes]
+              v
+    top10_selector._passes_filters_with_reason()
+      -> exclude_avoid_recommendations  HARD filter
+      -> min_priority_band              HARD filter
+      -> reco_8tier_strict              HARD filter
+
+  All 3 fields are now fully wired end-to-end.
+
+================================================================================
+v3.1.1 Changes (preserved)  --  TOP10_SELECTOR v4.12.0 ALIGNMENT
 ================================================================================
 
 METADATA-ONLY PATCH on top of v3.1.0. No field additions. No validator
@@ -256,11 +487,15 @@ except ImportError as _exc:  # pragma: no cover
 # Constants
 # ---------------------------------------------------------------------------
 
-CRITERIA_MODEL_VERSION = "3.1.1"
+CRITERIA_MODEL_VERSION = "3.2.0"
 # v3.1.0 Phase F: TFB module-version convention alias.
 # v3.1.1: top10_selector advanced v4.11.0 -> v4.12.0 (now actively
 # consumes the 4 hard-filter fields this module defines); sibling-version
 # references refreshed in docstring.
+# v3.2.0: 3 NEW 8-tier vocabulary fields landed (exclude_avoid_recommendations,
+# min_priority_band, reco_8tier_strict). top10_selector v4.14.0 +
+# insights_builder v8.0.1 are now active consumers. See header docstring
+# for full Phase A..I changelog.
 __version__ = CRITERIA_MODEL_VERSION
 
 # Valid signal values for Insights_Analysis Signal column
@@ -273,6 +508,107 @@ SIGNAL_VALUES: FrozenSet[str] = frozenset({
 
 # Scenario labels for risk scenarios section
 SCENARIO_LABELS: Tuple[str, ...] = ("Conservative", "Moderate", "Aggressive")
+
+
+# ---------------------------------------------------------------------------
+# v3.2.0 -- Priority-band vocabulary (scoring v5.7.0 / 8-tier alignment)
+# ---------------------------------------------------------------------------
+#
+# scoring v5.7.0 emits `recommendation_priority_band` per row with the
+# canonical 5-tier vocabulary P1..P5 (P1 = most urgent, P5 = least
+# urgent). data_engine_v2 v5.74.0+ passes the field through to every
+# enriched quote row; insights_builder v8.0.1 and top10_selector
+# v4.14.0 both consume it.
+#
+# v3.2.0 exposes the canonical band set + a coercion helper as the
+# SINGLE source of truth for the vocabulary -- so callers (operators,
+# audit reports, sheet KV blocks, dashboards) and downstream consumers
+# all agree on what counts as a valid band string.
+
+PRIORITY_BAND_VALUES: FrozenSet[str] = frozenset({"P1", "P2", "P3", "P4", "P5"})
+"""
+v3.2.0: public frozenset of canonical priority-band tokens.
+
+Same five values emitted by scoring v5.7.0's `recommendation_priority_band`
+field. Exposed here so callers can validate input without hardcoding the
+list and without importing scoring.
+"""
+
+# Private alias (kept for internal stability; PRIORITY_BAND_VALUES is the
+# public symbol).
+_PRIORITY_BAND_CANONICAL: FrozenSet[str] = PRIORITY_BAND_VALUES
+
+
+def _normalize_priority_band(value: Any) -> str:
+    """
+    v3.2.0: Canonicalize a raw priority-band input to "P1".."P5" or "".
+
+    Accepts (case- and whitespace-tolerant):
+      - None / "" / unparseable / NaN  -> ""  (no filter)
+      - "P1" / "p1" / " P 1 "          -> "P1"
+      - 1 / 1.0 / "1"                  -> "P1"
+      - "BAND_1" / "band 1" / "BAND-1" -> "P1"
+      - any int 1..5                   -> "P{n}"
+
+    Out-of-range numerics (0, 6, 99) return "" rather than raising.
+    Mirrors top10_selector v4.14.0's `_normalize_priority_band` and the
+    insights_builder v8.0.1 `_normalize_criteria` canonicalization so all
+    three modules agree on what coerces to what.
+    """
+    if value is None:
+        return ""
+    # Reject negative numbers early so e.g. -1 doesn't get stripped to "1".
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value < 0:
+            return ""
+    # Strip whitespace, uppercase, drop internal whitespace + separators
+    raw = _to_string(value).upper()
+    if not raw:
+        return ""
+    # Reject negative string forms ("-1", " - 2 ") for the same reason
+    if raw.lstrip().startswith("-"):
+        return ""
+    # Drop separators (whitespace, dash, underscore) to enable
+    # tolerant matching against "BAND 1" / "BAND-1" / "P 1" etc.
+    compact = "".join(ch for ch in raw if ch not in (" ", "-", "_"))
+    if not compact:
+        return ""
+
+    # Direct canonical hit ("P1".."P5")
+    if compact in _PRIORITY_BAND_CANONICAL:
+        return compact
+
+    # Numeric (string of digits or numeric coercion)
+    if compact.isdigit():
+        try:
+            n = int(compact)
+            if 1 <= n <= 5:
+                return f"P{n}"
+        except (ValueError, TypeError):
+            return ""
+
+    # "BAND1".."BAND5" (after separator stripping)
+    if compact.startswith("BAND") and len(compact) >= 5:
+        tail = compact[4:]
+        if tail.isdigit():
+            try:
+                n = int(tail)
+                if 1 <= n <= 5:
+                    return f"P{n}"
+            except (ValueError, TypeError):
+                return ""
+
+    # Numeric float (e.g., raw value 2.0)
+    f = _to_float(value, None)
+    if f is not None:
+        try:
+            n = int(f)
+            if 1 <= n <= 5 and float(n) == f:
+                return f"P{n}"
+        except (ValueError, TypeError):
+            pass
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -923,6 +1259,50 @@ class AdvisorCriteria(BaseModel):
         ),
     )
 
+    # --- v3.2.0 NEW: 8-tier vocabulary + priority-band hard filters ---
+    # All default OFF / "" (preserves v3.1.x semantics; opt-in filtering).
+    # Map to top10_selector v4.14.0 + insights_builder v8.0.1 consumption.
+
+    exclude_avoid_recommendations: bool = Field(
+        default=False,
+        description=(
+            "v3.2.0: Drop rows whose recommendation normalizes to 'AVOID'. "
+            "AVOID is the hardest 'do not touch' call emitted by "
+            "reco_normalize v8.0.0 / scoring v5.7.0. When True, "
+            "top10_selector v4.14.0 hard-removes those rows from the "
+            "candidate pool. Default False because the selector's "
+            "tiebreak bump already pushes AVOID rows out of the top "
+            "ranks naturally (_RECO_TIEBREAK_BUMPS['AVOID']=-8.0); "
+            "operators only need this flag when they want the exclusion "
+            "as a hard contract rather than a soft demotion."
+        ),
+    )
+    min_priority_band: str = Field(
+        default="",
+        description=(
+            "v3.2.0: Minimum urgency band for candidate inclusion. "
+            "scoring v5.7.0 emits `recommendation_priority_band` per row "
+            "with values P1..P5 (P1=most urgent, P5=least). When set to "
+            "e.g. 'P3', top10_selector v4.14.0 drops rows whose band "
+            "ranks below the floor. '' (default) = no filter; preserves "
+            "v3.1.x semantics. Validator canonicalizes lowercase / "
+            "numeric / BAND_N variants."
+        ),
+    )
+    reco_8tier_strict: bool = Field(
+        default=False,
+        description=(
+            "v3.2.0: When True, drop rows whose `recommendation` field "
+            "cannot be normalized to one of the 8 canonical tokens "
+            "(STRONG_BUY, BUY, ACCUMULATE, HOLD, REDUCE, SELL, "
+            "STRONG_SELL, AVOID). Useful when operators want to enforce "
+            "that the upstream stack is fully on the v8.0.0 vocabulary; "
+            "a row with an unknown / malformed token is a sign that the "
+            "cascade-bridge has regressed. Default False so transient "
+            "upstream noise doesn't quietly drop candidates."
+        ),
+    )
+
     # --- Provenance ---
     source_page: str = Field(default="Insights_Analysis")
     source_block: str = Field(default="top_block")
@@ -939,6 +1319,11 @@ class AdvisorCriteria(BaseModel):
                     "max_risk_score": 60.0,
                     "min_conviction_score": 60.0,
                     "exclude_forecast_unavailable": True,
+                    # v3.2.0 example fields (off by default, shown here for
+                    # schema-doc completeness):
+                    "exclude_avoid_recommendations": True,
+                    "min_priority_band": "P3",
+                    "reco_8tier_strict": False,
                 }
             ]
         },
@@ -1036,6 +1421,10 @@ class AdvisorCriteria(BaseModel):
         "exclude_engine_dropped_valuation",
         "exclude_forecast_unavailable",
         "exclude_provider_errors",
+        # v3.2.0: extend to cover the 2 new bool exclusion flags.
+        # Same default-False semantics (opt-in filtering).
+        "exclude_avoid_recommendations",
+        "reco_8tier_strict",
         mode="before",
     )
     @classmethod
@@ -1047,8 +1436,26 @@ class AdvisorCriteria(BaseModel):
         section flags (where the default-on behaviour is desirable).
         Exclusion flags default off so v3.0.0 callers see identical
         behaviour.
+
+        v3.2.0: extended to also cover `exclude_avoid_recommendations`
+        and `reco_8tier_strict` -- same default-off, opt-in semantics.
         """
         return _to_bool(v, False)
+
+    @field_validator("min_priority_band", mode="before")
+    @classmethod
+    def _validate_priority_band(cls, v: Any) -> str:
+        """
+        v3.2.0: Canonicalize raw priority-band input to "P1".."P5" or "".
+
+        Routes through the module-level `_normalize_priority_band` helper
+        which is also consumed by top10_selector v4.14.0's filter
+        pipeline and insights_builder v8.0.1's `_normalize_criteria`.
+        Unparseable / out-of-range / None inputs return "" silently;
+        the validator never raises (matching the silent-coercion
+        contract the rest of the stack already follows).
+        """
+        return _normalize_priority_band(v)
 
     @model_validator(mode="after")
     def _finalize(self) -> "AdvisorCriteria":
@@ -1172,6 +1579,13 @@ class AdvisorCriteria(BaseModel):
                     "exclude_forecast_unavailable", False),
                 exclude_provider_errors=preset.get(
                     "exclude_provider_errors", False),
+                # v3.2.0: NEW 8-tier + priority-band fields (defaults
+                # preserved when preset doesn't override; preserves
+                # v3.1.x existing-caller behaviour).
+                exclude_avoid_recommendations=preset.get(
+                    "exclude_avoid_recommendations", False),
+                min_priority_band=preset.get("min_priority_band", ""),
+                reco_8tier_strict=preset.get("reco_8tier_strict", False),
                 amount=self.amount,
                 pages_selected=base_pages,
                 top_n=base_top_n,
@@ -1299,6 +1713,27 @@ class AdvisorCriteria(BaseModel):
                 "exclude_provider_errors",
                 "exclude provider errors", "exclude_provider_errs",
                 "exclude provider error", "drop provider errors",
+            ),
+            # v3.2.0 Phase E: 8-tier vocabulary + priority-band field aliases
+            "exclude_avoid_recommendations": pick(
+                "exclude_avoid_recommendations",
+                "exclude avoid recommendations", "exclude avoid",
+                "excludeAvoidRecommendations",
+                "exclude avoid recos", "drop avoid",
+                "no avoid", "no_avoid_picks", "no avoid picks",
+            ),
+            "min_priority_band": pick(
+                "min_priority_band", "min priority band",
+                "priority band", "priority_band",
+                "priorityBand", "minPriorityBand", "recoPriorityBand",
+                "band floor", "band_floor",
+                "min urgency band", "min urgency",
+            ),
+            "reco_8tier_strict": pick(
+                "reco_8tier_strict", "reco 8tier strict",
+                "reco_strict_8tier", "reco8TierStrict", "recoStrict",
+                "strict 8tier", "strict_8tier",
+                "reco strict", "strict reco vocabulary",
             ),
             "amount": pick(
                 "amount", "invest amount", "investment amount",
@@ -1442,6 +1877,14 @@ _SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "exclude_engine_dropped_valuation": True,
         "exclude_forecast_unavailable": True,
         "exclude_provider_errors": True,
+        # v3.2.0: Conservative enforces the full 8-tier policy surface.
+        # AVOID is hard-excluded; the urgency floor is set to P3 so only
+        # actively-recommended picks (P1/P2/P3) qualify; reco_8tier_strict
+        # ensures any candidate with a malformed recommendation token
+        # is dropped (a regression-detection contract for upstream).
+        "exclude_avoid_recommendations": True,
+        "min_priority_band": "P3",
+        "reco_8tier_strict": True,
     },
     "Moderate": {
         "risk_level": "Moderate",
@@ -1457,14 +1900,22 @@ _SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "exclude_engine_dropped_valuation": False,
         "exclude_forecast_unavailable": True,
         "exclude_provider_errors": False,
+        # v3.2.0: Moderate still hard-excludes AVOID (it's "do not touch"
+        # not "high risk reward"). No urgency band floor -- let
+        # conviction + technical signals rank candidates. Strict
+        # 8-tier enforcement is OFF (accept upstream noise at moderate
+        # risk tolerance).
+        "exclude_avoid_recommendations": True,
+        "min_priority_band": "",
+        "reco_8tier_strict": False,
     },
     "Aggressive": {
         "risk_level": "High",
         "confidence_level": "Low",
         "required_return_pct": 0.20,
         "min_expected_roi_pct": 0.15,
-        "min_ai_confidence": 0.45,
         "max_risk_score": 80.0,
+        "min_ai_confidence": 0.45,
         # v3.1.0: Aggressive accepts lower conviction (30 = HOLD-tier
         # downgrades from BUY) and no data-quality exclusions to maximize
         # the candidate pool. Operators see upstream caveats in the
@@ -1473,6 +1924,13 @@ _SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
         "exclude_engine_dropped_valuation": False,
         "exclude_forecast_unavailable": False,
         "exclude_provider_errors": False,
+        # v3.2.0: Aggressive accepts the FULL candidate surface, including
+        # AVOID-tagged rows -- operators chasing opportunity-tail signal
+        # may want to see them surfaced for manual override review. No
+        # urgency floor, no strict 8-tier enforcement.
+        "exclude_avoid_recommendations": False,
+        "min_priority_band": "",
+        "reco_8tier_strict": False,
     },
 }
 
@@ -1501,6 +1959,15 @@ class ScenarioSpec:
     (insights_builder v7.0.0's Risk Scenarios section reads only label /
     signal / notes; the new fields surface through the notes string and
     via direct attribute access for callers that need the policy).
+
+    v3.2.0: gained THREE more fields with defaults:
+        exclude_avoid_recommendations : drop AVOID-recommendation rows
+        min_priority_band             : minimum urgency band ("P1".."P5")
+        reco_8tier_strict             : drop non-8-tier recommendations
+    Same backwards-compat contract: defaults preserve v3.1.x semantics.
+    insights_builder v8.0.1's Risk Scenarios section continues to read
+    only label / signal / notes; the 3 new fields surface through the
+    extended notes string and via direct attribute access.
     """
     label: str
     signal: str
@@ -1514,6 +1981,10 @@ class ScenarioSpec:
     exclude_engine_drops: bool = False
     exclude_forecast_unavail: bool = False
     exclude_provider_errors: bool = False
+    # v3.2.0 NEW: 8-tier vocabulary + priority-band fields
+    exclude_avoid_recommendations: bool = False
+    min_priority_band: str = ""
+    reco_8tier_strict: bool = False
     notes: str = field(default="")
 
     def __post_init__(self) -> None:
@@ -1532,6 +2003,17 @@ class ScenarioSpec:
             raise ValueError(
                 f"min_conviction must be between 0 and 100: {self.min_conviction}"
             )
+        # v3.2.0: validate min_priority_band. Accept "" (no filter) or
+        # one of the canonical P1..P5 tokens. Direct callers that bypass
+        # `build_scenario_specs` still get rejected for malformed bands
+        # (build_scenario_specs always passes the canonicalized value
+        # from AdvisorCriteria.min_priority_band so this rarely fires
+        # in practice -- it's a contract guard for direct construction).
+        if self.min_priority_band and self.min_priority_band not in PRIORITY_BAND_VALUES:
+            raise ValueError(
+                f"min_priority_band must be empty or one of P1..P5: "
+                f"{self.min_priority_band!r}"
+            )
 
 
 def build_scenario_specs(criteria: AdvisorCriteria) -> List[ScenarioSpec]:
@@ -1540,10 +2022,17 @@ def build_scenario_specs(criteria: AdvisorCriteria) -> List[ScenarioSpec]:
 
     v3.1.0: the notes string now also surfaces the conviction floor and
     any data-quality exclusion policy active for the scenario.
+
+    v3.2.0: the notes string additionally surfaces the 8-tier vocabulary
+    policy (AVOID exclusion, urgency-band floor, strict 8-tier flag)
+    when any of the 3 new fields is active. Note ordering preserved:
+    v3.1.0's "Exclude: ..." suffix comes first; v3.2.0's "8-tier: ..."
+    suffix appends after it.
     """
     specs: List[ScenarioSpec] = []
     for variant in criteria.to_scenario_variants():
-        # Build the exclusion-policy suffix (only when at least one flag is on)
+        # Build the v3.1.0 exclusion-policy suffix
+        # (only when at least one data-quality flag is on)
         exclude_parts: List[str] = []
         if variant.exclude_engine_dropped_valuation:
             exclude_parts.append("engine-drops")
@@ -1553,6 +2042,19 @@ def build_scenario_specs(criteria: AdvisorCriteria) -> List[ScenarioSpec]:
             exclude_parts.append("provider-errs")
         exclude_suffix = f" | Exclude: {', '.join(exclude_parts)}" if exclude_parts else ""
 
+        # v3.2.0: build the 8-tier policy suffix. Only emit when at
+        # least one v3.2.0 field is active so the v3.1.x notes shape
+        # is preserved verbatim for scenarios that don't use the new
+        # surface.
+        tier_parts: List[str] = []
+        if variant.exclude_avoid_recommendations:
+            tier_parts.append("no-AVOID")
+        if variant.min_priority_band:
+            tier_parts.append(f">={variant.min_priority_band}")
+        if variant.reco_8tier_strict:
+            tier_parts.append("strict-8tier")
+        tier_suffix = f" | 8-tier: {', '.join(tier_parts)}" if tier_parts else ""
+
         notes = (
             f"Risk ceiling: {variant.max_risk_score:.0f} | "
             f"Min ROI: {variant.min_expected_roi_pct * 100:.1f}% | "
@@ -1560,6 +2062,7 @@ def build_scenario_specs(criteria: AdvisorCriteria) -> List[ScenarioSpec]:
             f"Min Conviction: {variant.min_conviction_score:.0f} | "
             f"Horizon: {variant.horizon}"
             f"{exclude_suffix}"
+            f"{tier_suffix}"
         )
 
         specs.append(ScenarioSpec(
@@ -1575,6 +2078,10 @@ def build_scenario_specs(criteria: AdvisorCriteria) -> List[ScenarioSpec]:
             exclude_engine_drops=variant.exclude_engine_dropped_valuation,
             exclude_forecast_unavail=variant.exclude_forecast_unavailable,
             exclude_provider_errors=variant.exclude_provider_errors,
+            # v3.2.0: new fields
+            exclude_avoid_recommendations=variant.exclude_avoid_recommendations,
+            min_priority_band=variant.min_priority_band,
+            reco_8tier_strict=variant.reco_8tier_strict,
             notes=notes,
         ))
     return specs
@@ -1611,6 +2118,8 @@ __all__ = [
     # Constants
     "SCENARIO_LABELS",
     "SIGNAL_VALUES",
+    # v3.2.0: 8-tier priority-band vocabulary (public)
+    "PRIORITY_BAND_VALUES",
     # Enums
     "RiskLevel",
     "ConfidenceLevel",
