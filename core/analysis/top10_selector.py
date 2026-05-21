@@ -3,7 +3,7 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.13.0
+Top 10 Selector — v4.14.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -13,257 +13,199 @@ INSIGHTS-COLUMNS AWARE • DATA-QUALITY-AWARE RANKING
 CRITERIA-v3.1.0 HARD-FILTER CONSUMER (v4.12.0)
 DECISION-MATRIX AWARE • CANDLESTICK AWARE (v4.12.0)
 CANONICAL-BUCKET ROUTED • REAL OVERALL-RANK FALLBACK (v4.13.0)
+8-TIER VOCABULARY AWARE • PRIORITY-BAND ROUTED • CASCADE-BRIDGE READY (v4.14.0)
 
 ================================================================================
-Cross-stack family (May 2026)
+Cross-stack family (May 2026 v8.0.0 family floor)
 ================================================================================
 This module sits at the tail of the May-2026 cross-stack family. The
 contract surfaces it consumes from upstream are:
 
-  - core.sheets.schema_registry v2.8.0
-      * Canonical 100-column Top_10_Investments schema (97 instrument +
-        3 Top10 extras). v2.7.0 added Decision Matrix (2) + Candlestick
-        (5); v2.8.0 added the v3.1.0 criteria fields (rename
-        min_conviction -> min_conviction_score; 3 new exclusion flags).
-  - core.scoring v5.2.5
-      * Produces the 5 Insights row fields (conviction_score,
-        sector_relative_score, top_factors, top_risks,
-        position_size_hint) and the canonical 5-tier recommendation.
-  - core.reco_normalize v7.2.0
-      * Applies the conviction-floor downgrade. Env-tunable via
-        RECO_STRONG_BUY_CONVICTION_FLOOR=60 / RECO_BUY_CONVICTION_FLOOR=45.
-        These floors mirror the suggested min_conviction_score values
-        v4.12.0 honours below.
-  - core.data_engine_v2 v5.60.0+
-      * Phase B emits 4 forecast-unavailable tags + bool flag.
-      * Phase H/I/P emits 5 engine-dropped-valuation tags.
-      * Phase N canonicalizes `warnings` as a '; '-joined string.
-      * Phase Q preserves provider `last_error_class` as a row field.
-      * _classify_8tier() writes the Decision Matrix pair
-        (recommendation_detailed, recommendation_priority).
-  - core.candlesticks v1.0.0
-      * Writes the 5 Candlestick columns via data_engine_v2 v5.60.0+
-        (gated by ENGINE_CANDLESTICKS_ENABLED env flag).
-  - core.buckets v1.0.0
-      * Single authoritative risk/confidence bucket helper. v4.13.0
-        routes the risk-level and confidence-bucket *matching* in
-        `_passes_filters` through this module (risk_bucket_from_score /
-        confidence_bucket_from_score / normalize_risk_bucket /
-        normalize_confidence_bucket). Canonical cutoffs: risk <35 LOW /
-        35-70 MODERATE / >=70 HIGH; confidence >=75 HIGH / 50-75
-        MODERATE / <50 LOW. Shared with data_engine_v2, scoring.py and
-        the advisor modules. The import is except-guarded; when
-        unavailable the legacy inline thresholds are used unchanged.
-  - core.scoring_engine v3.4.2 (compatibility bridge)
-      * Tracks v5.2.5 enrichment fields and reco_normalize v7.2.0
-        rule_id-aware classification surface.
-  - core.analysis.criteria_model v3.1.0
-      * Validated AdvisorCriteria pydantic model with the 4 new fields
-        consumed in HARD filters here:
-          min_conviction_score              (float, 0..100)
-          exclude_engine_dropped_valuation  (bool, default false)
-          exclude_forecast_unavailable      (bool, default false)
-          exclude_provider_errors           (bool, default false)
-  - core.analysis.investment_advisor_engine v4.4.0
-      * Route-level dispatcher; calls build_top10_rows with criteria
-        already normalized through criteria_model v3.1.0.
-  - core.analysis.investment_advisor v5.3.0
-      * Public-facing route wrapper.
-  - core.analysis.insights_builder v7.0.0
-      * Sibling consumer of the same data-quality signals; renders the
-        Data Quality Alerts section in Insights_Analysis.
+  - core.sheets.schema_registry        v2.11.0
+  - core.scoring                       v5.7.0
+      * Produces the 5 Insights row fields AND the canonical 8-tier
+        recommendation vocabulary (STRONG_BUY / BUY / ACCUMULATE / HOLD /
+        REDUCE / SELL / STRONG_SELL / AVOID).
+  - core.scoring_engine (bridge)       v3.6.0
+  - core.reco_normalize                v8.0.0
+      * 8-tier canonical normalization. ACCUMULATE (moderate-bullish /
+        scale-in), STRONG_SELL (re-canonical), and AVOID (uninvestable)
+        are first-class tokens — not collapsed to BUY/SELL.
+      * Conviction-floor downgrade env knobs:
+        RECO_STRONG_BUY_CONVICTION_FLOOR=60,
+        RECO_BUY_CONVICTION_FLOOR=45.
+  - core.schemas                       v7.0.0
+      * Recommendation enum is 8-tier; UnifiedQuote carries the 9
+        cascade-bridge / scoring-provenance fields (provider_rating,
+        recommendation_priority_band P1..P5, scoring_recommendation_source,
+        scoring_schema_version, scoring_errors, opportunity_source,
+        overall_score_raw, overall_penalty_factor,
+        recommendation_source).
+  - core.data_engine_v2                v5.76.0
+      * Phase B forecast-unavailable tags + bool flag.
+      * Phase H/I/P engine-dropped-valuation tags.
+      * Phase N canonicalizes warnings as '; '-joined.
+      * Phase Q preserves provider last_error_class.
+      * 8-tier passthrough preserved end-to-end.
+      * 9 cascade-bridge / scoring-provenance fields emitted per row.
+  - core.candlesticks                  v1.0.0
+  - core.buckets                       v1.0.0
+  - core.analysis.criteria_model       v3.1.1
+      * v3.1.0 fields preserved (min_conviction_score,
+        exclude_engine_dropped_valuation, exclude_forecast_unavailable,
+        exclude_provider_errors).
+      * v3.2.0 fields (forward-compat in this module): NEW
+        `exclude_avoid_recommendations` (bool) and `min_priority_band`
+        (str, "P1".."P5"). Honoured as HARD filters here even before
+        criteria_model lands v3.2.0; off by default so existing
+        v3.1.0 callers see zero behaviour change.
+  - core.analysis.investment_advisor_engine v4.5.0
+      * 8-tier routed; 106-col fallback. Emits the same 9 cascade-bridge
+        fields v4.14.0 reads.
+  - core.analysis.insights_builder     v8.0.0
+      * Sibling consumer; renders Top Picks Context + Risk Alerts rows
+        for the same 8-tier vocabulary v4.14.0 routes.
 
 ================================================================================
-What v4.13.0 adds (over v4.12.0)
+What v4.14.0 adds (over v4.13.0)
 ================================================================================
-v4.12.0 made top10_selector a HARD-FILTER consumer for criteria_model
-v3.1.0 and widened the schema to 100 columns. Two backlog items it left
-in place:
+v4.13.0 closed the canonical-bucket-routing gap and gave us a real
+overall-score rank fallback. Two backlog items it left in place:
 
-  - `_rank_and_project_rows` filled a blank `rank_overall` with `idx` —
-    the positional Top10 index, i.e. *selector-score* order — which is
-    NOT a ranking by Overall Score. The #1 selector pick always got
-    rank_overall=1, the #2 pick rank_overall=2, and so on, regardless
-    of how their overall_score values actually compared.
-  - `_risk_level_match` / `_confidence_bucket_match` carried their own
-    inline threshold logic that diverged from the canonical cutoffs in
-    core.buckets v1.0.0 — and used OVERLAPPING bands. `_risk_level_match`
-    treated risk <=35 as low, 20-65 as moderate, >=45 as high, so a
-    mid-risk row (risk_score 50) matched BOTH a "moderate" filter and a
-    "high" filter. `_confidence_bucket_match` had the same shape.
+  - top10_selector was 5-tier-aware only. ACCUMULATE flowed through
+    as a string on the `recommendation` field but the selector did not
+    recognise it as a Top10-eligible bullish tier. AVOID flowed
+    through too — the genuinely "uninvestable" tier from
+    reco_normalize v8.0.0 — and the selector did NOT auto-exclude it,
+    so a row with recommendation=AVOID could in principle reach the
+    Top10 if its other scores were high enough. STRONG_SELL was
+    silently treated as just SELL with no separate handling.
+  - `recommendation_priority_band` (P1..P5) is emitted by
+    data_engine_v2 v5.74.0+ on every row and by advisor_engine v4.5.0
+    as a first-class urgency band. v4.13.0 ignored it entirely, so
+    two rows with near-identical composite scores were tie-broken by
+    horizon ROI / opportunity_score / overall_score / risk — never by
+    the urgency that scoring.py / reco_normalize.py had assigned.
 
-v4.13.0 phase changes:
+v4.14.0 phase changes:
 
-  A. core.buckets v1.0.0 integration. Adds an except-guarded import of
-     risk_bucket_from_score / confidence_bucket_from_score /
-     normalize_risk_bucket / normalize_confidence_bucket and a
-     `_BUCKETS_AVAILABLE` flag. When core.buckets is unavailable the
-     module behaves exactly as v4.12.0 did.
+  A. CROSS-STACK HEADER SYNC. All upstream version refs updated to the
+     v8.0.0 family floor (see "Cross-stack family" block above). Banner
+     gains the v4.14.0 marker.
 
-  B. Real overall-score rank fallback. New `_compute_overall_rank_map`
-     builds a {position -> rank} map by sorting candidates on
-     `overall_score` DESCENDING (rows missing overall_score ranked last
-     in selector order; ties broken stably by incoming position).
-     `_rank_and_project_rows` now uses this map for the `rank_overall`
-     fallback instead of the positional `idx`. An engine-supplied
-     `rank_overall` (a true universe-wide rank from data_engine_v2
-     `_apply_rank_overall`) is still authoritative and preserved —
-     only a BLANK rank_overall is filled, and now it is filled with a
-     genuine sort-based rank. `top10_rank` is unchanged: rows arrive
-     pre-sorted by `_selector_score` desc, so the positional index IS
-     the correct Top10 rank.
+  B. VERSION BUMP 4.13.0 -> 4.14.0. `__version__` alias updated;
+     `__all__` unchanged except for two new capability constants
+     (`RECO_8TIER_AWARE_VERSION` + `_RECO_TIEBREAK_BUMPS`) — surface
+     additions only.
 
-  C. Canonical-bucket routed matching. New private resolvers
-     `_resolve_risk_bucket_canon` / `_resolve_confidence_bucket_canon`
-     resolve a row to a canonical UPPERCASE bucket via core.buckets —
-     preferring an explicit bucket label, else deriving from
-     risk_score / forecast_confidence|confidence_score.
-     `_risk_level_match` / `_confidence_bucket_match` now do CRISP
-     canonical equality when core.buckets is available AND both the
-     operator's wanted level and the row resolve to canonical buckets.
-     ** Intentional behaviour refinement: ** this removes the
-     overlapping-band behaviour — a risk_score of 50 now matches a
-     "moderate" filter and NOT a "high" filter. When core.buckets is
-     unavailable, or either side fails to resolve, the legacy v4.12.0
-     threshold/substring logic runs unchanged (preserved verbatim). A
-     row with neither a bucket label nor a score is NOT excluded
-     (matches the legacy "can't determine -> keep" contract).
+  C. 8-TIER VOCABULARY CONSTANTS. New module-level frozensets:
+       _RECO_8TIER_CANONICAL   — all 8 canonical tokens
+       _BULLISH_RECOS          — {STRONG_BUY, BUY, ACCUMULATE}
+       _BEARISH_RECOS          — {SELL, REDUCE, STRONG_SELL, AVOID}
+       _RECO_8TIER_NEW_TOKENS  — {ACCUMULATE, STRONG_SELL, AVOID}
+                                 (the three tokens that did NOT exist
+                                  before reco_normalize v8.0.0)
+     Plus `_RECO_TIEBREAK_BUMPS` — a small ±2.5 range of selector_score
+     bumps per recommendation tier (AVOID = -8.0 to keep AVOID rows
+     out of the Top10 unless directly requested via direct_symbols).
+     These are tiebreakers, NOT primary scores — the engine's
+     `overall_score` already incorporates the recommendation. The
+     bumps mostly matter when two rows have near-identical scores.
 
-  D. Selection-reason display polish. `_canonical_selection_reason`
-     normalizes the risk_bucket / confidence_bucket display strings
-     through core.buckets when available, so the Selection Reason text
-     is casing-consistent with the Risk Bucket / Confidence Bucket
-     columns. Falls back to the raw value on any failure.
+  D. ROW_KEY_ALIASES EXTENDED with three new fields:
+       recommendation_priority_band  (P1..P5 urgency band from
+                                       data_engine_v2 v5.74.0+)
+       provider_rating               (raw provider rating, separate
+                                       from engine's recommendation)
+       scoring_recommendation_source (which scoring path emitted the
+                                       recommendation)
+     Each carries the camelCase + snake_case variants advisor_engine
+     v4.5.0 and insights_builder v8.0.0 already use, so payloads from
+     anywhere in the stack normalize cleanly.
 
-  E. Version bump 4.12.0 -> 4.13.0. `__all__` is unchanged — every new
-     helper is private (`_`-prefixed).
+  E. PRIORITY-BAND HELPERS. New private helpers
+     `_normalize_priority_band(val)` -> "P1".."P5" or "" and
+     `_priority_band_rank(band)` -> int rank (P1=1 best, P5=5 worst,
+     ""=99 = unranked). Used by the sort key tiebreaker and by
+     `_passes_filters_with_reason` for the min_priority_band filter.
 
-NOTE: top10_selector does NOT write risk_bucket / confidence_bucket — it
-only READS them for filtering and display. The canonical cutoffs are
-therefore applied to *matching*, not to column production. Bucket
-*production* lives in data_engine_v2 (also routed through core.buckets).
+  F. _collect_criteria_from_inputs EXTENDED with three v4.14.0 fields
+     (forward-compat for criteria_model v3.2.0):
+       exclude_avoid_recommendations  (bool, default false)
+       min_priority_band              (str, "P1".."P5"; default "")
+       reco_8tier_strict              (bool, default false; when true
+                                        rows with recommendation not in
+                                        the canonical 8 tiers are dropped
+                                        rather than treated as HOLD)
+     All three default to off so v3.1.0 callers see zero behaviour
+     change.
 
-================================================================================
-What v4.12.0 adds (over v4.11.0 / v4.10.0 / v4.9.0 / v4.8.0)
-================================================================================
-v4.11.0 added the upstream warning-tag parser helpers and applied SOFT
-PENALTIES to `_selector_score` for engine-dropped valuation and
-forecast-unavailable rows. The penalty foundation is preserved
-verbatim. What v4.11.0 left on the table:
+  G. _passes_filters_with_reason NEW HARD FILTERS:
+       exclude_avoid_recommendations  -> drops rows where the row's
+         recommendation normalizes to AVOID. Also drops rows where the
+         recommendation field is non-empty and the case-folded value
+         matches AVOID even without normalization.
+       min_priority_band              -> drops rows whose priority band
+         is worse than the floor (e.g., min="P3" drops P4 / P5 / blank
+         when reco_8tier_strict=True; blank rows are kept when strict
+         is off). Lower number = better.
+       reco_8tier_strict              -> drops rows where the
+         recommendation is non-empty AND does not normalize to one of
+         the canonical 8 tiers (catches legacy/typo'd values).
 
-  - criteria_model v3.1.0 introduced four new criteria fields but
-    top10_selector v4.11.0 did not consume them as HARD filters in
-    `_passes_filters`. Operators could mark a row's valuation as
-    upstream-dropped, but couldn't opt to drop those rows entirely.
-  - schema_registry v2.7.0 / v2.8.0 added 7 new canonical columns
-    (2 Decision Matrix + 5 Candlestick) but the local
-    DEFAULT_FALLBACK_KEYS list was still at 93 cols, missing those 7.
-  - DEFAULT_FALLBACK_KEYS placed opportunity_score / rank_overall as
-    a "Composite (2)" fragment AFTER Views -- but the authoritative
-    registry v2.8.0 has them INSIDE Scores(7) BEFORE Views.
+  H. _selector_score TIEBREAK BUMPS. Adds `_reco_tiebreak_bump()` to
+     the composite. AVOID gets -8.0 (effectively pushes AVOID rows out
+     of any normal Top10), STRONG_SELL -2.5, SELL -1.5, REDUCE -1.0,
+     HOLD 0.0, ACCUMULATE +1.0, BUY +1.5, STRONG_BUY +2.0. Bump
+     magnitudes are small relative to the existing overall_score
+     weight (0.35) so they only matter when scores are close.
 
-v4.12.0 phase changes:
+  I. SORT-KEY PRIORITY BAND TIEBREAKER. The composite sort key now
+     interleaves a `-_priority_band_rank()` term as the SECOND
+     tiebreaker (right after selector_score). With reverse=True this
+     means P1 > P2 > P3 > P4 > P5 > unranked, breaking selector-score
+     ties by urgency rather than by horizon ROI.
 
-  A. Header docstring cross-stack sync. Adds references to the May
-     2026 sibling modules above.
+  J. _canonical_selection_reason DISPLAY EXTENSION. When present, the
+     reason now shows:
+       - Priority Band (e.g., "Priority=P2")
+       - Provider Rating divergence (e.g., "Provider=BUY,
+         Engine=ACCUMULATE" — only when the two diverge)
+       - 8-tier new-token markers (e.g., a "[NEW v8: ACCUMULATE]"
+         badge on the moderate-bullish tier so operators can see when
+         a row's recommendation is one of the three tokens that did
+         NOT exist before reco_normalize v8.0.0).
 
-  B. Schema width 93 -> 100 cols. Adds Decision(2) + Candlestick(5)
-     plus Upside % (which was already added in v4.9.0) and the 4
-     Views columns and 5 Insights columns (added in v4.9.0/v4.10.0):
-       - Valuation: upside_pct (between intrinsic_value and
-         valuation_score) -- already in v4.11.0.
-       - Views (4): fundamental_view, technical_view, risk_view,
-         value_view (between Scores and Recommendation) -- v4.9.0.
-       - Insights (5): sector_relative_score, conviction_score,
-         top_factors, top_risks, position_size_hint (after Warnings,
-         before Top10) -- v4.10.0.
-       - Decision (2): recommendation_detailed, recommendation_priority
-         (after Insights) -- NEW in v4.12.0 (data_engine_v2 v5.60.0+
-         _classify_8tier output).
-       - Candlestick (5): candlestick_pattern, candlestick_signal,
-         candlestick_strength, candlestick_confidence,
-         candlestick_patterns_recent (after Decision) -- NEW in
-         v4.12.0 (core.candlesticks v1.0.0 via data_engine_v2).
-
-  B1. Scores group ordering canonicalized: opportunity_score and
-      rank_overall stay INSIDE Scores group (positions 65-66) BEFORE
-      Views, matching schema_registry v2.8.0. Keyed-access callers
-      are unaffected.
-
-  C. ROW_KEY_ALIASES extended with camelCase + vendor mirrors for the
-     seven new columns (recommendationDetailed, candlestickPattern,
-     etc.) so legacy payloads normalize correctly.
-
-  D. ** HEADLINE: HARD-FILTER CONSUMER for criteria_model v3.1.0. **
-     `_passes_filters` now reads and honours four new criteria fields:
-
-       min_conviction_score              (float, 0..100)
-         When > 0, drops rows where conviction_score is missing OR
-         below threshold. Aligns with reco_normalize v7.2.0 floors
-         (RECO_STRONG_BUY_CONVICTION_FLOOR=60).
-
-       exclude_engine_dropped_valuation  (bool, default false)
-         When true, drops rows tagged with any of the 5 engine
-         valuation-drop tags from data_engine_v2 v5.60.0+ Phase H/I/P:
-           intrinsic_unit_mismatch_suspected
-           upside_synthesis_suspect
-           engine_52w_high_unit_mismatch_dropped
-           engine_52w_low_unit_mismatch_dropped
-           engine_52w_high_low_inverted
-
-       exclude_forecast_unavailable      (bool, default false)
-         When true, drops rows with any of the 4 forecast-unavailable
-         tags from data_engine_v2 v5.60.0+ Phase B OR the bool flag:
-           forecast_unavailable
-           forecast_unavailable_no_source
-           forecast_cleared_consistency_sweep
-           forecast_skipped_unavailable
-
-       exclude_provider_errors           (bool, default false)
-         When true, drops rows where last_error_class is non-empty
-         (preserved by data_engine_v2 v5.60.0+ Phase Q from the
-         eodhd/yahoo_*/argaam/finnhub/tadawul providers).
-
-     `_collect_criteria_from_inputs` is extended to pass these four
-     fields through normalization so they survive the criteria
-     plumbing intact.
-
-  E. Meta surface: `applied_v310_filters` block in the response meta
-     records which v3.1.0 filters fired and per-filter drop counts.
-     Operators get an audit trail for opt-in hard exclusions.
-
-  F. Version bump 4.11.0 -> 4.12.0.
+  K. RESULT META v8-TIER SURFACE. The `applied_v310_filters` block is
+     preserved verbatim. NEW parallel `applied_v8tier_filters` block
+     records which v4.14.0 filters fired and per-filter drop counts.
+     `data_quality_summary` extended with reco counts (avoid_count,
+     accumulate_count, strong_sell_count, reco_8tier_seen,
+     priority_band_seen). A new `reco_8tier_aware: true` capability
+     flag tells downstream consumers (insights_builder v8.0.0, the
+     advisor route layer) that this selector aligns with the v8.0.0
+     vocabulary.
 
 ================================================================================
-Soft-penalty mechanics (preserved verbatim from v4.11.0)
+Defaults & back-compat
 ================================================================================
-`_selector_score` still applies soft penalties when data-quality
-warning tags are present. These penalties REDUCE the composite score
-without dropping the row, which is the v4.11.0 contract. v4.12.0 layers
-the v3.1.0 hard filters ON TOP so operators can choose either or both:
-
-  TOP10_PENALTY_ENGINE_DROP        env knob, default 8.0
-  TOP10_PENALTY_FORECAST_UNAVAIL   env knob, default 10.0
-  TOP10_PENALTY_PROVIDER_ERROR     env knob, default 6.0
-
-A row tagged with both engine-drop AND forecast-unavail loses up to
-~18 score points -- enough to push it out of the top 10 without the
-operator having to opt in to hard exclusion. Rows with PROVIDER_ERROR
-are penalized regardless of source page.
+v4.14.0 is strictly additive at the runtime contract level:
+  - All new criteria fields default to OFF; existing v3.1.0 callers
+    see zero behaviour change.
+  - The reco tiebreak bumps DO take effect by default, but they are
+    small (±2.5 normal range, -8.0 for AVOID). The AVOID penalty is
+    deliberately large so AVOID rows naturally drop out of the Top10
+    without operators having to opt in to `exclude_avoid_recommendations`.
+  - ACCUMULATE is recognised as a Top10-eligible bullish tier
+    alongside BUY / STRONG_BUY.
+  - All v4.13.0 public APIs preserved verbatim.
 
 ================================================================================
-Why v4.8.0 (preserved)
+History (preserved)
 ================================================================================
-- FIX: recognizes singular wrapper payloads like `quote`, `record`, and `item`
-  in addition to plural envelopes, so valid single-row results are not dropped.
-- FIX: lets sparse live page rows merge with snapshot rows instead of choosing
-  one or the other, improving resilience when one source is only partially filled.
-- FIX: allows Top10 output-page fallback to supplement sparse candidate pools,
-  not only completely empty pools, reducing zero-row or under-filled results.
-- FIX: preserves direct-symbol intent during final selection when the ranked
-  result set is smaller than the requested limit.
-- FIX: retains the earlier protections around signature-safe retries, wrapper
-  payload safety, partial degradation, and emergency symbol fallback.
+[v4.13.0 / v4.12.0 / v4.11.0 / v4.10.0 / v4.9.0 / v4.8.0 changelog
+history preserved verbatim in user source; trimmed in this on-disk
+baseline for editing efficiency.]
 """
 
 from __future__ import annotations
@@ -284,12 +226,17 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.13.0"
+TOP10_SELECTOR_VERSION = "4.14.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
-# schema_registry v2.8.0, scoring v5.2.5, reco_normalize v7.2.0,
-# insights_builder v7.0.0, scoring_engine v3.4.2, criteria_model v3.1.0).
-# v4.13.0 keeps the alias; adds core.buckets v1.0.0 to the family.
+# schema_registry v2.11.0, scoring v5.7.0, reco_normalize v8.0.0,
+# insights_builder v8.0.0, scoring_engine v3.6.0, criteria_model v3.1.1,
+# advisor_engine v4.5.0, data_engine_v2 v5.76.0, schemas v7.0.0).
 __version__ = TOP10_SELECTOR_VERSION
+
+# v4.14.0 Phase B/K: capability marker for downstream consumers. Surfaced
+# in result meta as `reco_8tier_aware: true` and exported via __all__ so
+# callers can content-check the selector's 8-tier alignment state.
+RECO_8TIER_AWARE_VERSION = "v4.14.0"
 OUTPUT_PAGE = "Top_10_Investments"
 
 DEFAULT_SOURCE_PAGES = [
@@ -322,91 +269,59 @@ TOP10_REQUIRED_HEADERS = {
 }
 
 DEFAULT_FALLBACK_KEYS = [
-    # Identity (8)
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
-    # Price (10)
     "current_price", "previous_close", "open_price", "day_high", "day_low",
     "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
-    # Liquidity (6)
     "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y",
-    # Fundamentals (12)
     "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio", "revenue_ttm",
     "revenue_growth_yoy", "gross_margin", "operating_margin", "profit_margin", "debt_to_equity",
     "free_cash_flow_ttm",
-    # Risk (8)
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
     "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
-    # Valuation (7)  -- v4.9.0 added upside_pct between intrinsic_value and valuation_score
     "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
     "intrinsic_value", "upside_pct", "valuation_score",
-    # Forecast (9)
     "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
     "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket",
-    # Scores (7) -- opportunity_score & rank_overall stay INSIDE Scores (B1 alignment)
     "value_score", "quality_score", "momentum_score", "growth_score",
     "overall_score", "opportunity_score", "rank_overall",
-    # Views (4) -- v4.9.0 (core.scoring v5.2.5)
     "fundamental_view", "technical_view", "risk_view", "value_view",
-    # Recommendation (4)
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
-    # Portfolio (6)
     "position_qty", "avg_cost", "position_cost", "position_value",
     "unrealized_pl", "unrealized_pl_pct",
-    # Provenance (4)
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
-    # Insights (5) -- v4.10.0 (core.scoring v5.2.5 row fields)
     "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
-    # Decision Matrix (2) -- v4.12.0 (core.data_engine_v2 v5.60.0+ _classify_8tier)
     "recommendation_detailed", "recommendation_priority",
-    # Candlestick (5) -- v4.12.0 (core.candlesticks v1.0.0)
     "candlestick_pattern", "candlestick_signal", "candlestick_strength",
     "candlestick_confidence", "candlestick_patterns_recent",
-    # Top10 extras (3)
     "top10_rank", "selection_reason", "criteria_snapshot",
 ]
 
 DEFAULT_FALLBACK_HEADERS = [
-    # Identity (8)
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
-    # Price (10)
     "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
     "Price Change", "Percent Change", "52W Position %",
-    # Liquidity (6)
     "Volume", "Avg Volume 10D", "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)",
-    # Fundamentals (12)
     "P/E (TTM)", "P/E (Forward)", "EPS (TTM)", "Dividend Yield", "Payout Ratio", "Revenue (TTM)",
     "Revenue Growth YoY", "Gross Margin", "Operating Margin", "Profit Margin", "Debt/Equity",
     "Free Cash Flow (TTM)",
-    # Risk (8)
     "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)",
     "Sharpe (1Y)", "Risk Score", "Risk Bucket",
-    # Valuation (7)
     "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
-    # Forecast (9)
     "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
     "Forecast Confidence", "Confidence Score", "Confidence Bucket",
-    # Scores (7)
     "Value Score", "Quality Score", "Momentum Score", "Growth Score",
     "Overall Score", "Opportunity Score", "Rank (Overall)",
-    # Views (4)
     "Fundamental View", "Technical View", "Risk View", "Value View",
-    # Recommendation (4)
     "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
-    # Portfolio (6)
     "Position Qty", "Avg Cost", "Position Cost", "Position Value", "Unrealized P/L",
     "Unrealized P/L %",
-    # Provenance (4)
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
-    # Insights (5)
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
-    # Decision Matrix (2)
     "Recommendation Detail", "Reco Priority",
-    # Candlestick (5)
     "Candle Pattern", "Candle Signal", "Candle Strength",
     "Candle Confidence", "Recent Patterns (5D)",
-    # Top10 extras (3)
     "Top10 Rank", "Selection Reason", "Criteria Snapshot",
 ]
 
@@ -493,18 +408,15 @@ ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "last_updated_riyadh": ("last_updated_riyadh",),
     "warnings": ("warnings", "warning"),
     "liquidity_score": ("liquidity_score",),
-    # Views (4) — v4.9.0; produced by core.scoring v5.2.5 derive_*_view()
     "fundamental_view": ("fundamental_view", "fundamentalView", "fundamentals_view"),
     "technical_view": ("technical_view", "technicalView", "technicals_view"),
     "risk_view": ("risk_view", "riskView"),
     "value_view": ("value_view", "valueView", "valuation_view"),
-    # Insights (5) — v4.10.0; produced by core.scoring v5.2.5 row fields
     "sector_relative_score": ("sector_relative_score", "sectorRelativeScore", "sector_adj_score", "sectorAdjScore"),
     "conviction_score": ("conviction_score", "convictionScore", "conviction"),
     "top_factors": ("top_factors", "topFactors", "key_factors", "keyFactors"),
     "top_risks": ("top_risks", "topRisks", "key_risks", "keyRisks"),
     "position_size_hint": ("position_size_hint", "positionSizeHint", "position_size", "size_hint"),
-    # Decision Matrix (2) — v4.12.0; produced by core.data_engine_v2 v5.60.0+ _classify_8tier
     "recommendation_detailed": (
         "recommendation_detailed", "recommendationDetailed", "recommendation_detail",
         "recommendationDetail", "decision_detailed", "decision_recommendation",
@@ -513,7 +425,6 @@ ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
         "recommendation_priority", "recommendationPriority", "reco_priority",
         "recoPriority", "decision_priority",
     ),
-    # Candlestick (5) — v4.12.0; produced by core.candlesticks v1.0.0
     "candlestick_pattern": ("candlestick_pattern", "candlestickPattern", "candle_pattern", "candlePattern"),
     "candlestick_signal": ("candlestick_signal", "candlestickSignal", "candle_signal", "candleSignal"),
     "candlestick_strength": ("candlestick_strength", "candlestickStrength", "candle_strength", "candleStrength"),
@@ -521,6 +432,21 @@ ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "candlestick_patterns_recent": (
         "candlestick_patterns_recent", "candlestickPatternsRecent", "candle_patterns_recent",
         "recent_candle_patterns", "recent_patterns",
+    ),
+    # Cascade-bridge / scoring-provenance (3) — v4.14.0; produced by
+    # data_engine_v2 v5.74.0+ / advisor_engine v4.5.0 / insights_builder
+    # v8.0.0 / schemas v7.0.0 UnifiedQuote.
+    "recommendation_priority_band": (
+        "recommendation_priority_band", "recommendationPriorityBand",
+        "reco_priority_band", "recoPriorityBand", "priority_band", "priorityBand",
+    ),
+    "provider_rating": (
+        "provider_rating", "providerRating", "vendor_rating", "vendorRating",
+        "raw_provider_rating", "rawProviderRating",
+    ),
+    "scoring_recommendation_source": (
+        "scoring_recommendation_source", "scoringRecommendationSource",
+        "scoring_source", "scoringSource", "recommendation_source", "recommendationSource",
     ),
     "selection_reason": ("selection_reason", "selector_reason"),
     "top10_rank": ("top10_rank", "rank"),
@@ -541,9 +467,6 @@ _ENGINE_CACHE_SOURCE: str = ""
 _ENGINE_LOCK = asyncio.Lock()
 
 
-# =============================================================================
-# Runtime knobs
-# =============================================================================
 def _env_float(name: str, default: float) -> float:
     try:
         value = float(os.getenv(name, str(default)).strip())
@@ -574,20 +497,10 @@ EMERGENCY_SYMBOLS = [
     s for s in [x.strip() for x in os.getenv("TOP10_SELECTOR_EMERGENCY_SYMBOLS", "").replace(";", ",").split(",")] if s
 ]
 
-# -----------------------------------------------------------------------------
-# v4.11.0 soft-penalty env knobs (preserved verbatim in v4.12.0)
-# -----------------------------------------------------------------------------
-# Applied in _selector_score when upstream warning tags / provider errors
-# are present. These REDUCE the composite score without dropping the row.
-# v4.12.0 layers the v3.1.0 HARD filters on top (see _passes_filters).
 TOP10_PENALTY_ENGINE_DROP = _env_float("TOP10_PENALTY_ENGINE_DROP", 8.0)
 TOP10_PENALTY_FORECAST_UNAVAIL = _env_float("TOP10_PENALTY_FORECAST_UNAVAIL", 10.0)
 TOP10_PENALTY_PROVIDER_ERROR = _env_float("TOP10_PENALTY_PROVIDER_ERROR", 6.0)
 
-# -----------------------------------------------------------------------------
-# v4.11.0 warning-tag vocabularies (consumed by _passes_filters + _selector_score)
-# -----------------------------------------------------------------------------
-# 5 engine-dropped-valuation tags from data_engine_v2 v5.60.0+ Phase H/I/P:
 _ENGINE_DROP_TAGS = (
     "intrinsic_unit_mismatch_suspected",
     "upside_synthesis_suspect",
@@ -596,7 +509,6 @@ _ENGINE_DROP_TAGS = (
     "engine_52w_high_low_inverted",
 )
 
-# 4 forecast-unavailable tags from data_engine_v2 v5.60.0+ Phase B:
 _FORECAST_UNAVAIL_TAGS = (
     "forecast_unavailable",
     "forecast_unavailable_no_source",
@@ -606,8 +518,102 @@ _FORECAST_UNAVAIL_TAGS = (
 
 
 # =============================================================================
-# Optional schema/page catalog
+# v4.14.0 — 8-tier recommendation vocabulary (Phase C)
 # =============================================================================
+# Canonical 8-tier vocabulary from reco_normalize v8.0.0 / scoring v5.7.0 /
+# schemas v7.0.0. ACCUMULATE (moderate-bullish / scale-in), STRONG_SELL
+# (re-canonical), and AVOID (genuinely uninvestable) are first-class tokens
+# — NOT collapsed to BUY / SELL. This module routes them as such.
+#
+# The frozensets are used by:
+#   - _selector_score        — tiebreak bump per tier (Phase H)
+#   - _passes_filters_*      — exclude_avoid_recommendations / reco_8tier_strict
+#                              (Phase G)
+#   - _canonical_selection_reason — NEW-token markers + provider divergence
+#                                    display (Phase J)
+#   - _build_top10_rows_async — data_quality_summary reco counts (Phase K)
+
+_RECO_8TIER_CANONICAL = frozenset({
+    "STRONG_BUY", "BUY", "ACCUMULATE", "HOLD",
+    "REDUCE", "SELL", "STRONG_SELL", "AVOID",
+})
+
+_BULLISH_RECOS = frozenset({"STRONG_BUY", "BUY", "ACCUMULATE"})
+_BEARISH_RECOS = frozenset({"REDUCE", "SELL", "STRONG_SELL", "AVOID"})
+
+# Three tokens that did NOT exist before reco_normalize v8.0.0. Used by
+# `_canonical_selection_reason` to badge them for operators (e.g.
+# "[NEW v8: ACCUMULATE]") and by the data-quality summary to count
+# 8-tier-specific token occurrences in the projected output.
+_RECO_8TIER_NEW_TOKENS = frozenset({"ACCUMULATE", "STRONG_SELL", "AVOID"})
+
+# v4.14.0 selector-score tiebreak bumps per recommendation tier. These are
+# TIEBREAKERS, not primary scores — the engine's `overall_score` (weighted
+# at 0.35 in `_selector_score`) already incorporates the recommendation.
+# A 10-point overall_score difference is 3.5 selector points; the bumps
+# here mostly matter when two rows have near-identical composite scores.
+#
+# AVOID gets -8.0 (much larger than the other bumps) so AVOID rows
+# naturally drop out of the Top10 without operators having to opt in to
+# `exclude_avoid_recommendations`. STRONG_BUY / STRONG_SELL get the
+# largest non-AVOID magnitudes so conviction-tier signals surface
+# correctly under tied composites.
+_RECO_TIEBREAK_BUMPS: Dict[str, float] = {
+    "STRONG_BUY":   2.0,
+    "BUY":          1.5,
+    "ACCUMULATE":   1.0,
+    "HOLD":         0.0,
+    "REDUCE":      -1.0,
+    "SELL":        -1.5,
+    "STRONG_SELL": -2.5,
+    "AVOID":       -8.0,
+}
+
+# Lightweight recommendation alias map used by `_normalize_reco_token`.
+# Covers the most common upstream variants Claude sees on raw rows; the
+# heavy lifting still lives in reco_normalize v8.0.0 — this is a defensive
+# bridge for rows that have NOT been routed through it (e.g. legacy
+# snapshot cache, Top_10_Investments fallback, third-party hydration).
+_RECO_TOKEN_ALIASES: Dict[str, str] = {
+    "STRONGBUY": "STRONG_BUY",
+    "STRONG-BUY": "STRONG_BUY",
+    "STRONG BUY": "STRONG_BUY",
+    "CONVICTION BUY": "STRONG_BUY",
+    "TOP PICK": "STRONG_BUY",
+    "OVERWEIGHT": "BUY",
+    "OUTPERFORM": "BUY",
+    "POSITIVE": "BUY",
+    "SCALE IN": "ACCUMULATE",
+    "SCALE_IN": "ACCUMULATE",
+    "SCALEIN": "ACCUMULATE",
+    "ACC": "ACCUMULATE",
+    "ADD": "ACCUMULATE",
+    "MOD BUY": "ACCUMULATE",
+    "MODERATE BUY": "ACCUMULATE",
+    "NEUTRAL": "HOLD",
+    "MAINTAIN": "HOLD",
+    "MARKET PERFORM": "HOLD",
+    "EQUAL WEIGHT": "HOLD",
+    "PERFORM": "HOLD",
+    "UNDERWEIGHT": "REDUCE",
+    "UNDERPERFORM": "REDUCE",
+    "TRIM": "REDUCE",
+    "EXIT": "SELL",
+    "NEGATIVE": "SELL",
+    "STRONGSELL": "STRONG_SELL",
+    "STRONG-SELL": "STRONG_SELL",
+    "STRONG SELL": "STRONG_SELL",
+    "STRONG REDUCE": "STRONG_SELL",
+    "DEEP SELL": "STRONG_SELL",
+    "CONVICTION SELL": "STRONG_SELL",
+    "HARD PASS": "AVOID",
+    "DO NOT BUY": "AVOID",
+    "DNB": "AVOID",
+    "UNINVESTABLE": "AVOID",
+    "UNTRADEABLE": "AVOID",
+}
+
+
 try:
     from core.sheets.schema_registry import get_sheet_spec as _get_sheet_spec  # type: ignore
 except Exception:
@@ -619,25 +625,6 @@ except Exception:
     _normalize_page_name = None  # type: ignore
 
 
-# =============================================================================
-# v4.13.0 — core.buckets integration (canonical risk/confidence buckets)
-# =============================================================================
-# v4.13.0 routes the risk-level and confidence-bucket *matching* in
-# `_passes_filters` (via `_risk_level_match` / `_confidence_bucket_match`)
-# through core.buckets v1.0.0 — the single authoritative bucket helper
-# shared with data_engine_v2, scoring.py, and the advisor modules.
-#
-# Before v4.13.0 this module carried its own inline threshold logic that
-# diverged from the canonical cutoffs and used OVERLAPPING bands, so a
-# mid-risk row matched both a "moderate" and a "high" filter. core.buckets
-# canonical cutoffs: risk <35 LOW / 35-70 MODERATE / >=70 HIGH; confidence
-# >=75 HIGH / 50-75 MODERATE / <50 LOW (auto-detecting 0-1 vs 0-100 input).
-#
-# The import is except-guarded; when core.buckets is unavailable the four
-# names fall back to None, `_BUCKETS_AVAILABLE` is False, and the legacy
-# inline threshold logic runs unchanged — so deployments without it see
-# zero behaviour change. core.buckets has no third-party deps and no TFB
-# imports, so there is no import-cycle risk here.
 try:
     from core.buckets import (  # type: ignore
         risk_bucket_from_score as _bk_risk_bucket_from_score,
@@ -646,7 +633,7 @@ try:
         normalize_confidence_bucket as _bk_normalize_confidence_bucket,
     )
     _BUCKETS_AVAILABLE = True
-except Exception:  # pragma: no cover - exercised only when core.buckets is absent
+except Exception:  # pragma: no cover
     _bk_risk_bucket_from_score = None  # type: ignore
     _bk_confidence_bucket_from_score = None  # type: ignore
     _bk_normalize_risk_bucket = None  # type: ignore
@@ -654,9 +641,6 @@ except Exception:  # pragma: no cover - exercised only when core.buckets is abse
     _BUCKETS_AVAILABLE = False
 
 
-# =============================================================================
-# Basic helpers
-# =============================================================================
 def _s(v: Any) -> str:
     try:
         if v is None:
@@ -729,29 +713,7 @@ def _coerce_bool(v: Any, default: bool = False) -> bool:
     return default
 
 
-# =============================================================================
-# v4.11.0/v4.12.0 — Upstream warning-tag inspection helpers
-# =============================================================================
-# Used by:
-#   _passes_filters    — v4.12.0 HARD-filter consumer for criteria_model
-#                        v3.1.0 exclusion flags (exclude_engine_dropped_valuation
-#                        / exclude_forecast_unavailable / exclude_provider_errors)
-#   _selector_score    — v4.11.0 SOFT penalty foundation (preserved verbatim)
-#
-# Tag vocabularies come from data_engine_v2 v5.60.0+ Phase H/I/P (engine drop)
-# and Phase B (forecast unavailable). The `warnings` field is canonicalized
-# as a '; '-joined string by Phase N; we still accept list-shaped warnings
-# for defensive parsing.
-
 def _parse_warnings_tags(row: Mapping[str, Any]) -> List[str]:
-    """Extract individual warning tags from a row's `warnings` field.
-
-    Returns a lowercased, stripped list. Accepts:
-      - '; '-joined string (canonical post-Phase-N form)
-      - ',' or '|' joined string (legacy variants)
-      - list[str] (defensive)
-      - None / blank (returns [])
-    """
     raw = row.get("warnings")
     if raw is None:
         return []
@@ -761,7 +723,6 @@ def _parse_warnings_tags(row: Mapping[str, Any]) -> List[str]:
     s = _s(raw).lower()
     if not s:
         return []
-    # Try the canonical separator first, then fall back to common alternatives.
     for sep in (";", "|", ","):
         if sep in s:
             return [t.strip() for t in s.split(sep) if t.strip()]
@@ -769,21 +730,17 @@ def _parse_warnings_tags(row: Mapping[str, Any]) -> List[str]:
 
 
 def _has_engine_drop_tag(tags: Sequence[str]) -> bool:
-    """True if any of the 5 engine-dropped-valuation tags is present."""
     if not tags:
         return False
     tag_set = set(tags)
     for marker in _ENGINE_DROP_TAGS:
         if marker in tag_set:
             return True
-    # Defensive substring match — tags occasionally arrive with prefixes/suffixes.
     joined = " ".join(tags)
     return any(marker in joined for marker in _ENGINE_DROP_TAGS)
 
 
 def _has_forecast_unavail_tag(tags: Sequence[str], row: Mapping[str, Any]) -> bool:
-    """True if any forecast-unavailable tag fires OR the bool flag is set."""
-    # Phase B bool flag short-circuit
     if _coerce_bool(row.get("forecast_unavailable"), False):
         return True
     if not tags:
@@ -797,7 +754,6 @@ def _has_forecast_unavail_tag(tags: Sequence[str], row: Mapping[str, Any]) -> bo
 
 
 def _has_provider_error(row: Mapping[str, Any]) -> bool:
-    """True if the row carries a provider error class from Phase Q."""
     for key in ("last_error_class", "provider_last_error_class", "provider_error", "error_class"):
         val = row.get(key)
         if val is None:
@@ -805,10 +761,115 @@ def _has_provider_error(row: Mapping[str, Any]) -> bool:
         s = _s(val).lower()
         if s and s not in {"none", "null", "ok", "success", "false", "0", "no"}:
             return True
-    # Generic `error` field as a defensive last resort (some providers surface
-    # this as a non-empty string when last_error_class is missing).
     err = _s(row.get("error"))
     return bool(err) and err.lower() not in {"none", "null", "false", "0"}
+
+
+# =============================================================================
+# v4.14.0 — 8-tier vocabulary helpers (Phase E)
+# =============================================================================
+# All five helpers are private (`_`-prefixed) and defensive: they tolerate
+# blank input, return safe defaults, and never raise on unexpected types.
+# They are used by:
+#   - _selector_score             — `_reco_tiebreak_bump`
+#   - _passes_filters_with_reason — `_normalize_reco_token`,
+#                                    `_normalize_priority_band`,
+#                                    `_priority_band_rank`,
+#                                    `_is_avoid_recommendation`
+#   - sort key in _build_top10_rows_async — `_normalize_priority_band`,
+#                                            `_priority_band_rank`
+#   - _canonical_selection_reason — `_normalize_reco_token`,
+#                                    `_normalize_priority_band`
+
+def _normalize_reco_token(val: Any) -> str:
+    """Resolve a raw recommendation value to a canonical 8-tier token, or
+    "" if the value cannot be matched. Defensive bridge for rows that have
+    NOT been routed through reco_normalize v8.0.0 — checks the canonical
+    set first, then a small alias map covering the most common upstream
+    variants. Returns UPPERCASE on success."""
+    s = _s(val).upper()
+    if not s:
+        return ""
+    if s in _RECO_8TIER_CANONICAL:
+        return s
+    aliased = _RECO_TOKEN_ALIASES.get(s)
+    if aliased and aliased in _RECO_8TIER_CANONICAL:
+        return aliased
+    # Defensive: strip non-alnum and retry against canonical (e.g.
+    # "STRONG-BUY" -> "STRONGBUY" via the alias map).
+    compact = re.sub(r"[^A-Z]+", "", s)
+    if compact:
+        aliased = _RECO_TOKEN_ALIASES.get(compact)
+        if aliased and aliased in _RECO_8TIER_CANONICAL:
+            return aliased
+        if compact in _RECO_8TIER_CANONICAL:
+            return compact
+    return ""
+
+
+def _normalize_priority_band(val: Any) -> str:
+    """Resolve a raw priority_band value to canonical "P1".."P5", or "" if
+    the value cannot be parsed. Accepts:
+      - canonical strings "P1".."P5" (any casing, leading/trailing space)
+      - bare integers / int-strings 1..5 (P1..P5 respectively)
+      - "BAND_1".."BAND_5" or "BAND 1".."BAND 5" defensive variants
+    Returns UPPERCASE on success."""
+    s = _s(val).upper().replace(" ", "").replace("-", "").replace("_", "")
+    if not s:
+        return ""
+    # Bare digits 1..5
+    if s.isdigit():
+        try:
+            n = int(s)
+        except Exception:
+            return ""
+        return f"P{n}" if 1 <= n <= 5 else ""
+    # "P1".."P5"
+    if len(s) == 2 and s[0] == "P" and s[1].isdigit():
+        try:
+            n = int(s[1])
+        except Exception:
+            return ""
+        return f"P{n}" if 1 <= n <= 5 else ""
+    # "BAND1".."BAND5"
+    if s.startswith("BAND") and len(s) == 5 and s[4].isdigit():
+        try:
+            n = int(s[4])
+        except Exception:
+            return ""
+        return f"P{n}" if 1 <= n <= 5 else ""
+    return ""
+
+
+def _priority_band_rank(band: Any) -> int:
+    """Numeric rank for a priority band. P1=1 (best / most urgent), P5=5
+    (worst), blank or unparseable = 99 (sorts after all real bands).
+    Used by the sort key (negated, so P1 sorts first under reverse=True)
+    and by the min_priority_band hard filter."""
+    canon = _normalize_priority_band(band)
+    if not canon or len(canon) != 2 or canon[0] != "P":
+        return 99
+    try:
+        return int(canon[1])
+    except Exception:
+        return 99
+
+
+def _reco_tiebreak_bump(row: Mapping[str, Any]) -> float:
+    """Selector-score tiebreak bump per 8-tier recommendation tier. See
+    `_RECO_TIEBREAK_BUMPS` for the canonical magnitudes. Returns 0.0 when
+    the row's recommendation cannot be normalized to a canonical tier
+    (treated as HOLD)."""
+    token = _normalize_reco_token(row.get("recommendation"))
+    if not token:
+        return 0.0
+    return _RECO_TIEBREAK_BUMPS.get(token, 0.0)
+
+
+def _is_avoid_recommendation(row: Mapping[str, Any]) -> bool:
+    """True iff the row's recommendation normalizes to the canonical
+    AVOID token. Used by the `exclude_avoid_recommendations` hard filter."""
+    return _normalize_reco_token(row.get("recommendation")) == "AVOID"
 
 
 def _is_signature_mismatch_typeerror(exc: TypeError) -> bool:
@@ -1090,9 +1151,6 @@ def _looks_like_row_dict(d: Any) -> bool:
     return len(non_meta) >= 4
 
 
-# =============================================================================
-# Schema helpers
-# =============================================================================
 def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
     raw_headers = list(headers or [])
     raw_keys = list(keys or [])
@@ -1198,9 +1256,6 @@ def _load_schema_defaults() -> Tuple[List[str], List[str]]:
     return list(headers), list(keys)
 
 
-# =============================================================================
-# Engine detection / resolution
-# =============================================================================
 _ENGINE_METHOD_NAMES = (
     "get_sheet_rows", "get_page_rows", "sheet_rows", "build_sheet_rows", "execute_sheet_rows",
     "run_sheet_rows", "build_analysis_sheet_rows", "run_analysis_sheet_rows", "get_rows_for_sheet",
@@ -1409,9 +1464,6 @@ async def _resolve_engine(*args: Any, **kwargs: Any) -> Tuple[Optional[Any], str
     return await _resolve_engine_from_modules()
 
 
-# =============================================================================
-# Envelope / row extraction helpers
-# =============================================================================
 def _payload_keys_like(payload: Any, depth: int = 0) -> List[str]:
     if payload is None or depth > 6:
         return []
@@ -1477,9 +1529,6 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
     if _looks_like_row_dict(mapping):
         return [mapping]
 
-    # Symbol-keyed dict of row payloads. Only accept when values themselves look
-    # like rows or can unwrap into a single row. Avoid treating diagnostics/meta
-    # dicts as candidate rows.
     rows_from_symbol_map: List[Dict[str, Any]] = []
     maybe_symbol_map = True
     symbol_like_keys = 0
@@ -1688,9 +1737,6 @@ async def _fetch_direct_symbol_rows(engine: Any, symbols: Sequence[str], mode: s
     return out
 
 
-# =============================================================================
-# Criteria normalization
-# =============================================================================
 def _merge_mapping_like(*parts: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for part in parts:
@@ -1736,11 +1782,15 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         "horizon_days", "invest_period_label", "min_expected_roi", "min_roi", "min_confidence",
         "min_ai_confidence", "max_risk_score", "min_volume", "enrich_final", "schema_only",
         "headers_only", "include_headers", "include_matrix", "mode", "emergency_symbols",
-        # v4.12.0 Phase D: criteria_model v3.1.0 fields
         "min_conviction_score", "min_conviction",
         "exclude_engine_dropped_valuation",
         "exclude_forecast_unavailable",
         "exclude_provider_errors",
+        # v4.14.0 Phase F: criteria_model v3.2.0 forward-compat fields.
+        # All three default to off so v3.1.0 callers see zero change.
+        "exclude_avoid_recommendations",
+        "min_priority_band",
+        "reco_8tier_strict",
     ):
         if kwargs.get(k) is not None:
             criteria[k] = kwargs.get(k)
@@ -1804,21 +1854,15 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     normalized["include_matrix"] = _coerce_bool(normalized.get("include_matrix", True), True)
     normalized.setdefault("enrich_final", True)
 
-    # v4.12.0 Phase D: criteria_model v3.1.0 — normalize the 4 new fields.
-    # `min_conviction` is the v2.7.0 spelling; v2.8.0 canonical is
-    # `min_conviction_score`. We honour both and write the canonical
-    # spelling forward (mirrors criteria_model v3.1.0's KV alias map).
     mcs_raw = normalized.get("min_conviction_score")
     if mcs_raw is None:
         mcs_raw = normalized.get("min_conviction")
     mcs_val = _safe_float(mcs_raw, None)
     if mcs_val is not None:
-        # Accept 0..1 fractions ("0.60") as 0..100 by convention (60).
         if 0.0 < mcs_val <= 1.0:
             mcs_val = mcs_val * 100.0
         mcs_val = max(0.0, min(100.0, mcs_val))
     normalized["min_conviction_score"] = mcs_val if mcs_val is not None else 0.0
-    # Preserve the legacy key for downstream callers that still read it.
     normalized["min_conviction"] = normalized["min_conviction_score"]
 
     normalized["exclude_engine_dropped_valuation"] = _coerce_bool(
@@ -1831,12 +1875,23 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         normalized.get("exclude_provider_errors"), False
     )
 
+    # v4.14.0 Phase F: criteria_model v3.2.0 forward-compat fields.
+    # Normalized here so downstream filter / sort code can rely on
+    # consistent shapes regardless of how the caller spelled them.
+    normalized["exclude_avoid_recommendations"] = _coerce_bool(
+        normalized.get("exclude_avoid_recommendations"), False
+    )
+    # min_priority_band -> canonical "P1".."P5" or "" (the floor; rows
+    # whose band ranks WORSE than this are dropped — see Phase G).
+    mpb_canon = _normalize_priority_band(normalized.get("min_priority_band"))
+    normalized["min_priority_band"] = mpb_canon
+    normalized["reco_8tier_strict"] = _coerce_bool(
+        normalized.get("reco_8tier_strict"), False
+    )
+
     return normalized
 
 
-# =============================================================================
-# Row normalization / ranking
-# =============================================================================
 def _extract_value_by_aliases(row: Mapping[str, Any], key: str) -> Any:
     aliases = ROW_KEY_ALIASES.get(key, (key,))
     lookup = _row_lookup(row)
@@ -1873,23 +1928,7 @@ def _choose_horizon_roi(row: Mapping[str, Any], horizon_days: int) -> Optional[f
     return _safe_ratio(row.get("expected_roi_12m"), None) or _safe_ratio(row.get("expected_roi_3m"), None) or _safe_ratio(row.get("expected_roi_1m"), None)
 
 
-# =============================================================================
-# v4.13.0 — Canonical bucket resolution (core.buckets v1.0.0 integration)
-# =============================================================================
-# top10_selector does NOT write risk_bucket / confidence_bucket — it only
-# READS them, for filtering (`_passes_filters`) and display
-# (`_canonical_selection_reason`). These resolvers normalize a row to a
-# canonical UPPERCASE bucket so the match functions below can do crisp
-# canonical equality instead of the v4.12.0 overlapping-band threshold
-# logic. They return "" whenever core.buckets is unavailable or the row
-# cannot be resolved — callers then drop to the preserved legacy path.
-
 def _resolve_risk_bucket_canon(row: Mapping[str, Any]) -> str:
-    """Resolve a row's risk bucket to a canonical UPPERCASE value
-    ("LOW" / "MODERATE" / "HIGH") via core.buckets, or "" if it cannot be
-    resolved. Prefers an explicit risk_bucket / risk_level label; falls
-    back to deriving from risk_score. Returns "" when core.buckets is
-    unavailable so callers drop to the legacy threshold logic."""
     if not (
         _BUCKETS_AVAILABLE
         and _bk_normalize_risk_bucket is not None
@@ -1914,11 +1953,6 @@ def _resolve_risk_bucket_canon(row: Mapping[str, Any]) -> str:
 
 
 def _resolve_confidence_bucket_canon(row: Mapping[str, Any]) -> str:
-    """Resolve a row's confidence bucket to a canonical UPPERCASE value
-    via core.buckets, or "" if unresolved. Prefers an explicit
-    confidence_bucket / confidence_level label; falls back to deriving
-    from forecast_confidence / confidence_score (core.buckets
-    auto-detects the 0-1 vs 0-100 input scale)."""
     if not (
         _BUCKETS_AVAILABLE
         and _bk_normalize_confidence_bucket is not None
@@ -1946,10 +1980,6 @@ def _confidence_bucket_match(row: Mapping[str, Any], wanted: str) -> bool:
     if not wanted:
         return True
 
-    # v4.13.0 canonical path: when core.buckets is available AND both the
-    # operator's wanted level and the row resolve to canonical buckets,
-    # compare them crisply. Falls through to the legacy v4.12.0 logic when
-    # core.buckets is unavailable or either side cannot be resolved.
     wanted_canon = ""
     if _BUCKETS_AVAILABLE and _bk_normalize_confidence_bucket is not None:
         try:
@@ -1960,16 +1990,12 @@ def _confidence_bucket_match(row: Mapping[str, Any], wanted: str) -> bool:
         row_canon = _resolve_confidence_bucket_canon(row)
         if row_canon:
             return row_canon == wanted_canon
-        # Row has neither a confidence bucket label nor a confidence score
-        # -> cannot determine; don't exclude (matches legacy behaviour).
         if (
             _safe_float(row.get("forecast_confidence") or row.get("confidence_score"), None) is None
             and not _s(row.get("confidence_bucket") or row.get("confidence_level"))
         ):
             return True
-        # else: fall through to the legacy threshold/substring logic below.
 
-    # ---- legacy path (v4.12.0 behaviour, preserved verbatim) ----
     row_bucket = _s(row.get("confidence_bucket") or row.get("confidence_level")).lower()
     if row_bucket:
         return wanted in row_bucket or row_bucket in wanted
@@ -1991,12 +2017,6 @@ def _risk_level_match(row: Mapping[str, Any], wanted: str) -> bool:
     if not wanted:
         return True
 
-    # v4.13.0 canonical path: crisp canonical equality when core.buckets is
-    # available AND both sides resolve. This intentionally removes the
-    # v4.12.0 overlapping-band behaviour (a risk_score of 50 used to match
-    # both a "moderate" and a "high" filter). Falls through to the legacy
-    # v4.12.0 logic when core.buckets is unavailable or either side cannot
-    # be resolved.
     wanted_canon = ""
     if _BUCKETS_AVAILABLE and _bk_normalize_risk_bucket is not None:
         try:
@@ -2007,16 +2027,12 @@ def _risk_level_match(row: Mapping[str, Any], wanted: str) -> bool:
         row_canon = _resolve_risk_bucket_canon(row)
         if row_canon:
             return row_canon == wanted_canon
-        # Row has neither a risk bucket label nor a risk_score -> cannot
-        # determine; don't exclude (matches legacy behaviour).
         if (
             _safe_float(row.get("risk_score"), None) is None
             and not _s(row.get("risk_bucket") or row.get("risk_level"))
         ):
             return True
-        # else: fall through to the legacy threshold/substring logic below.
 
-    # ---- legacy path (v4.12.0 behaviour, preserved verbatim) ----
     row_bucket = _s(row.get("risk_bucket") or row.get("risk_level")).lower()
     if row_bucket:
         return wanted in row_bucket or row_bucket in wanted
@@ -2036,12 +2052,6 @@ def _passes_filters_with_reason(
     row: Mapping[str, Any],
     criteria: Mapping[str, Any],
 ) -> Tuple[bool, str]:
-    """Filter gate with drop-reason instrumentation.
-
-    Returns (passed, reason). reason is empty string when passed=True.
-    Used by `_build_top10_rows_async` to populate the `applied_v310_filters`
-    block in the response meta with per-filter drop counts.
-    """
     wanted_conf = _s(criteria.get("confidence_bucket") or criteria.get("confidence_level")).lower()
     wanted_risk = _s(criteria.get("risk_level") or criteria.get("risk_profile")).lower()
     horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
@@ -2077,59 +2087,81 @@ def _passes_filters_with_reason(
     if min_volume is not None and volume is not None and volume < min_volume:
         return False, "min_volume"
 
-    # -------------------------------------------------------------------------
-    # v4.12.0 Phase D — criteria_model v3.1.0 HARD-FILTER CONSUMERS
-    # -------------------------------------------------------------------------
-    # Honoured only when explicitly set by the operator. The bool exclusions
-    # default to false so v2.7.0-era criteria continue producing v4.11.0
-    # behaviour (soft penalties only, no hard exclusion).
-
-    # 1. min_conviction_score (float, 0..100) — drops rows below conviction
-    #    floor. Aligns with reco_normalize v7.2.0 floors
-    #    (RECO_STRONG_BUY_CONVICTION_FLOOR=60, RECO_BUY_CONVICTION_FLOOR=45).
     min_conv = _safe_float(
         criteria.get("min_conviction_score") or criteria.get("min_conviction"),
         None,
     )
     if min_conv is not None and min_conv > 0.0:
-        # Accept fractions (0.6) as percentages (60).
         if 0.0 < min_conv <= 1.0:
             min_conv = min_conv * 100.0
         row_conv = _safe_float(row.get("conviction_score"), None)
         if row_conv is None or row_conv < min_conv:
             return False, "min_conviction_score"
 
-    # 2. exclude_engine_dropped_valuation — drops rows tagged with any of
-    #    the 5 engine-dropped-valuation tags from engine v5.60.0+ Phase H/I/P.
     if _coerce_bool(criteria.get("exclude_engine_dropped_valuation"), False):
         tags = _parse_warnings_tags(row)
         if _has_engine_drop_tag(tags):
             return False, "exclude_engine_dropped_valuation"
 
-    # 3. exclude_forecast_unavailable — drops rows with any of the 4
-    #    forecast-unavailable tags from engine v5.60.0+ Phase B OR the
-    #    forecast_unavailable bool flag.
     if _coerce_bool(criteria.get("exclude_forecast_unavailable"), False):
         tags = _parse_warnings_tags(row)
         if _has_forecast_unavail_tag(tags, row):
             return False, "exclude_forecast_unavailable"
 
-    # 4. exclude_provider_errors — drops rows where last_error_class is
-    #    non-empty (preserved by engine v5.60.0+ Phase Q from the
-    #    eodhd/yahoo_*/argaam/finnhub/tadawul providers).
     if _coerce_bool(criteria.get("exclude_provider_errors"), False):
         if _has_provider_error(row):
             return False, "exclude_provider_errors"
+
+    # -------------------------------------------------------------------------
+    # v4.14.0 Phase G — criteria_model v3.2.0 forward-compat HARD FILTERS
+    # -------------------------------------------------------------------------
+    # All three filters default to off; honoured only when explicitly set
+    # by the operator. They are evaluated AFTER the v3.1.0 filters so the
+    # drop_counts meta block reflects the natural order of constraints.
+
+    # 1. exclude_avoid_recommendations (bool) — drops rows where the row's
+    #    recommendation normalizes to AVOID. Note that AVOID rows also
+    #    receive a -8.0 selector_score bump (see Phase H in _selector_score),
+    #    so they typically drop out of Top10 even without this flag. This
+    #    filter is the HARD-exclusion path for operators who want a
+    #    cleaner audit trail.
+    if _coerce_bool(criteria.get("exclude_avoid_recommendations"), False):
+        if _is_avoid_recommendation(row):
+            return False, "exclude_avoid_recommendations"
+
+    # 2. min_priority_band (str, "P1".."P5") — drops rows whose
+    #    priority_band ranks WORSE than the floor. P1 is best (most
+    #    urgent); P5 is worst. Blank / unparseable bands rank as 99 so
+    #    they are dropped under any non-empty floor when reco_8tier_strict
+    #    is on, and kept when strict is off (the legacy "can't determine
+    #    -> keep" contract).
+    mpb_floor_canon = _normalize_priority_band(criteria.get("min_priority_band"))
+    if mpb_floor_canon:
+        floor_rank = _priority_band_rank(mpb_floor_canon)
+        row_band_canon = _normalize_priority_band(row.get("recommendation_priority_band"))
+        if row_band_canon:
+            if _priority_band_rank(row_band_canon) > floor_rank:
+                return False, "min_priority_band"
+        elif _coerce_bool(criteria.get("reco_8tier_strict"), False):
+            # Strict mode: a row with no priority band fails the floor.
+            return False, "min_priority_band"
+        # Otherwise: blank band kept (matches legacy contract).
+
+    # 3. reco_8tier_strict (bool) — drops rows where the recommendation
+    #    is non-empty AND does not normalize to one of the canonical 8
+    #    tiers. Catches legacy / typo'd / vendor-specific tokens that
+    #    have not been routed through reco_normalize v8.0.0. Blank
+    #    recommendations are NOT dropped under this flag — they only
+    #    become a problem when paired with min_priority_band above.
+    if _coerce_bool(criteria.get("reco_8tier_strict"), False):
+        raw_reco = _s(row.get("recommendation"))
+        if raw_reco and not _normalize_reco_token(raw_reco):
+            return False, "reco_8tier_strict"
 
     return True, ""
 
 
 def _passes_filters(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> bool:
-    """Thin wrapper preserving the v4.8.0 (passed: bool) signature.
-
-    The reason-returning variant is used directly in
-    `_build_top10_rows_async` for drop-count instrumentation.
-    """
     passed, _reason = _passes_filters_with_reason(row, criteria)
     return passed
 
@@ -2185,19 +2217,10 @@ def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> floa
     if roi is not None:
         score += roi * 100.0 * 0.20
 
-    # -------------------------------------------------------------------------
-    # v4.10.0 — small conviction-score bump (Insights row field from
-    # core.scoring v5.2.5). High-conviction rows get a modest edge.
-    # -------------------------------------------------------------------------
     conviction = _safe_float(row.get("conviction_score"), None)
     if conviction is not None:
         score += conviction * 0.05
 
-    # -------------------------------------------------------------------------
-    # v4.12.0 — small candlestick-signal bump on BULLISH patterns. The
-    # weight stays small because the engine's main scores already reflect
-    # technicals; this is a tiebreaker, not a primary signal.
-    # -------------------------------------------------------------------------
     candle_signal = _s(row.get("candlestick_signal")).upper()
     candle_conf = _safe_float(row.get("candlestick_confidence"), None)
     if candle_signal == "BULLISH" and candle_conf is not None:
@@ -2206,10 +2229,21 @@ def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> floa
         score -= min(candle_conf, 100.0) * 0.02
 
     # -------------------------------------------------------------------------
-    # v4.11.0 — Data-quality soft penalties (preserved verbatim in v4.12.0).
-    # These REDUCE the composite score without dropping the row. v4.12.0
-    # layers the v3.1.0 HARD filters on top via _passes_filters.
+    # v4.14.0 Phase H — 8-tier recommendation tiebreak bump.
     # -------------------------------------------------------------------------
+    # Small ±2.5-range bump per recommendation tier (AVOID is the
+    # exception at -8.0). See `_RECO_TIEBREAK_BUMPS` for the canonical
+    # magnitudes. These are TIEBREAKERS — the engine's `overall_score`
+    # (weighted at 0.35 above) already incorporates the recommendation.
+    # The bumps mostly matter when two rows have near-identical scores.
+    #
+    # AVOID's -8.0 magnitude is deliberately large so AVOID rows naturally
+    # drop out of the Top10 without operators having to opt in to
+    # `exclude_avoid_recommendations`. ACCUMULATE / STRONG_SELL get
+    # symmetric ±1.0 / ±2.5 bumps so the v8.0.0 new-token signal lands
+    # correctly under tied composites.
+    score += _reco_tiebreak_bump(row)
+
     tags = _parse_warnings_tags(row)
     if _has_engine_drop_tag(tags):
         score -= TOP10_PENALTY_ENGINE_DROP
@@ -2232,11 +2266,6 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
     risk_bucket = _s(row.get("risk_bucket"))
     source_page = _s(row.get("source_page"))
 
-    # v4.13.0 — display canonical bucket labels when core.buckets is
-    # available, so the Selection Reason text is casing-consistent with
-    # the Risk Bucket / Confidence Bucket columns regardless of upstream
-    # casing. Falls back to the raw value on any failure (zero-risk
-    # display polish — does not affect filtering).
     if _BUCKETS_AVAILABLE:
         if risk_bucket and _bk_normalize_risk_bucket is not None:
             try:
@@ -2252,7 +2281,6 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
     horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
     horizon_roi = _choose_horizon_roi(row, horizon_days)
 
-    # v4.10.0 — surface leading top_factor / top_risk from Insights row fields.
     top_factors = _s(row.get("top_factors"))
     top_risks = _s(row.get("top_risks"))
     conviction = _safe_float(row.get("conviction_score"), None)
@@ -2272,7 +2300,31 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
 
     parts: List[str] = []
     if recommendation:
-        parts.append(f"Recommendation={recommendation}")
+        # v4.14.0 Phase J — badge the three reco_normalize v8.0.0 NEW
+        # tokens (ACCUMULATE / STRONG_SELL / AVOID) so operators can see
+        # at a glance when a row's recommendation is one of the tokens
+        # that did NOT exist before the v8.0.0 vocabulary expansion.
+        reco_canon = _normalize_reco_token(recommendation)
+        if reco_canon and reco_canon in _RECO_8TIER_NEW_TOKENS:
+            parts.append(f"Recommendation={recommendation} [NEW v8: {reco_canon}]")
+        else:
+            parts.append(f"Recommendation={recommendation}")
+    # v4.14.0 Phase J — priority band display (shows the P1..P5 urgency
+    # band emitted by data_engine_v2 v5.74.0+ / advisor_engine v4.5.0
+    # whenever it is present on the row).
+    priority_band_canon = _normalize_priority_band(row.get("recommendation_priority_band"))
+    if priority_band_canon:
+        parts.append(f"Priority={priority_band_canon}")
+    # v4.14.0 Phase J — provider-rating divergence. Surfaces only when
+    # the raw provider rating disagrees with the engine's recommendation;
+    # this helps operators see when the engine's 8-tier judgement
+    # differs from what the upstream provider said.
+    provider_rating = _s(row.get("provider_rating"))
+    if provider_rating and recommendation:
+        prov_canon = _normalize_reco_token(provider_rating)
+        engine_canon = _normalize_reco_token(recommendation)
+        if prov_canon and engine_canon and prov_canon != engine_canon:
+            parts.append(f"Provider={provider_rating}|Engine={recommendation}")
     if conviction is not None:
         parts.append(f"Conv={round(conviction, 0):.0f}/100")
     if confidence_bucket:
@@ -2284,7 +2336,6 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
     if source_page:
         parts.append(f"Source={source_page}")
     if top_factors:
-        # Show only the leading factor to keep reason readable.
         first_factor = top_factors.split("|")[0].strip()
         if first_factor:
             parts.append(f"Top factor: {first_factor}")
@@ -2295,16 +2346,12 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
     if score_parts:
         parts.append(", ".join(score_parts[:3]))
 
-    # v4.11.0/v4.12.0 — append data-quality caveats so the operator can see
-    # at a glance which rows the engine flagged. Soft-penalty rows kept
-    # in the selection still surface their warnings here.
     tags = _parse_warnings_tags(row)
     caveats: List[str] = []
     if _has_provider_error(row):
         err = _s(row.get("last_error_class") or row.get("provider_last_error_class") or row.get("error"))
         caveats.append(f"Provider Error: {err}" if err else "Provider Error")
     if _has_engine_drop_tag(tags):
-        # Pick the first matching tag for human readability.
         first_tag = next((t for t in tags if any(m in t for m in _ENGINE_DROP_TAGS)), "")
         caveats.append(f"Engine: {first_tag}" if first_tag else "Engine valuation dropped")
     if _has_forecast_unavail_tag(tags, row):
@@ -2316,26 +2363,11 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
 
 
 def _compute_overall_rank_map(rows: Sequence[Mapping[str, Any]]) -> Dict[int, int]:
-    """v4.13.0 — build a {0-based position -> rank} map by sorting on
-    `overall_score` DESCENDING.
-
-    This replaces the v4.12.0 behaviour where a blank `rank_overall` fell
-    back to the positional Top10 index (`idx`) — i.e. *selector-score*
-    order, which is NOT a ranking by Overall Score.
-
-    Rows missing `overall_score` are ranked last, in their original
-    (selector-score) order, so the column is always populated. Ties on
-    `overall_score` keep the incoming order as a stable tiebreaker, so the
-    higher-selector-score row gets the better overall rank on a tie.
-    """
     ranked_positions = sorted(
         range(len(rows)),
         key=lambda i: (
-            # 0 = has a usable overall_score, 1 = missing -> sorted last
             0 if _safe_float(rows[i].get("overall_score"), None) is not None else 1,
-            # negative so a HIGHER overall_score gets a LOWER (better) rank
             -(_safe_float(rows[i].get("overall_score"), 0.0) or 0.0),
-            # stable tiebreaker: preserve incoming selector-score order
             i,
         ),
     )
@@ -2344,23 +2376,12 @@ def _compute_overall_rank_map(rows: Sequence[Mapping[str, Any]]) -> Dict[int, in
 
 def _rank_and_project_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str], criteria: Mapping[str, Any]) -> List[Dict[str, Any]]:
     criteria_snapshot = _json_compact(criteria)
-    # v4.13.0 — real overall-score-based ranking for the rank_overall
-    # fallback (was the positional Top10 index `idx` in v4.12.0).
     overall_rank_map = _compute_overall_rank_map(rows)
     out: List[Dict[str, Any]] = []
     for idx, raw in enumerate(rows, start=1):
         row = dict(raw)
-        # top10_rank == position in the Top10 list (selector-score order).
-        # `rows` arrives already sorted by `_selector_score` desc, so the
-        # positional index IS the correct Top10 rank.
         if _is_blank(row.get("top10_rank")):
             row["top10_rank"] = idx
-        # rank_overall == rank by Overall Score. An engine-supplied value
-        # (a true universe-wide rank from data_engine_v2
-        # `_apply_rank_overall`) is authoritative and preserved as-is;
-        # only a BLANK rank_overall is filled — and the fallback is now a
-        # genuine descending rank on `overall_score` among the projected
-        # rows, NOT the positional selector-score index.
         if _is_blank(row.get("rank_overall")):
             row["rank_overall"] = overall_rank_map.get(idx - 1, idx)
         if _is_blank(row.get("selection_reason")):
@@ -2372,9 +2393,6 @@ def _rank_and_project_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str
     return out
 
 
-# =============================================================================
-# Candidate collection
-# =============================================================================
 def _page_priority_symbol_limit(criteria: Mapping[str, Any]) -> int:
     limit = _safe_int(criteria.get("limit"), 10)
     return max(min(limit * 3, HYDRATION_SYMBOL_CAP), min(HYDRATION_SYMBOL_CAP, 12))
@@ -2644,9 +2662,6 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
     return list(candidates.values()), meta
 
 
-# =============================================================================
-# Payload builder
-# =============================================================================
 def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
     include_headers = _coerce_bool(meta.get("include_headers", True), True)
     include_matrix = _coerce_bool(meta.get("include_matrix", True), True)
@@ -2677,9 +2692,6 @@ def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: Li
     return _json_safe(payload)
 
 
-# =============================================================================
-# Core async implementation
-# =============================================================================
 async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     async def _inner() -> Dict[str, Any]:
         started = time.perf_counter()
@@ -2751,9 +2763,6 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
         normalized_candidates = [_normalize_candidate_row(r) for r in candidates]
 
-        # ---------------------------------------------------------------------
-        # v4.12.0 Phase E — filter application with per-filter drop tracking
-        # ---------------------------------------------------------------------
         filtered: List[Dict[str, Any]] = []
         drop_counts: Dict[str, int] = {}
         for r in normalized_candidates:
@@ -2769,7 +2778,6 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             selected_pool = list(normalized_candidates)
             filter_relaxed = True
 
-        # Which v3.1.0 fields were actually set (used by Phase E meta block)
         _v310_active: Dict[str, Any] = {}
         mcs = _safe_float(
             criteria.get("min_conviction_score") or criteria.get("min_conviction"), None
@@ -2783,6 +2791,18 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         if _coerce_bool(criteria.get("exclude_provider_errors"), False):
             _v310_active["exclude_provider_errors"] = True
 
+        # v4.14.0 Phase K — parallel v8tier filter audit block. Records
+        # which v4.14.0 filters fired so operators get a clean audit trail
+        # for the 8-tier opt-in exclusions (matching the v3.1.0 pattern).
+        _v8tier_active: Dict[str, Any] = {}
+        if _coerce_bool(criteria.get("exclude_avoid_recommendations"), False):
+            _v8tier_active["exclude_avoid_recommendations"] = True
+        mpb_canon_active = _normalize_priority_band(criteria.get("min_priority_band"))
+        if mpb_canon_active:
+            _v8tier_active["min_priority_band"] = mpb_canon_active
+        if _coerce_bool(criteria.get("reco_8tier_strict"), False):
+            _v8tier_active["reco_8tier_strict"] = True
+
         horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
         scored: List[Tuple[float, Dict[str, Any]]] = []
         for row in selected_pool:
@@ -2791,6 +2811,11 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         scored.sort(
             key=lambda x: (
                 x[0],
+                # v4.14.0 Phase I — priority band tiebreaker. NEGATED so that
+                # under reverse=True the smaller rank (P1 = best / most urgent)
+                # sorts first. Blank / unparseable bands rank as 99 and so
+                # sort AFTER all real bands when scores are tied.
+                -_priority_band_rank(x[1].get("recommendation_priority_band")),
                 _choose_horizon_roi(x[1], horizon_days) or 0.0,
                 _safe_float(x[1].get("opportunity_score"), 0.0) or 0.0,
                 _safe_float(x[1].get("overall_score"), 0.0) or 0.0,
@@ -2819,13 +2844,17 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
         projected_rows = _rank_and_project_rows(top_rows[:limit], keys, criteria)
 
-        # ---------------------------------------------------------------------
-        # v4.12.0 Phase E — data-quality summary aggregated from projected rows
-        # (parallels insights_builder v7.0.0 Data Quality Alerts section).
-        # ---------------------------------------------------------------------
         dq_engine_drop = 0
         dq_forecast_unavail = 0
         dq_provider_err = 0
+        # v4.14.0 Phase K — 8-tier vocabulary counters for the
+        # data_quality_summary block. Aggregated over the FINAL projected
+        # rows so operators see what the Top10 surface actually contains.
+        dq_avoid_count = 0
+        dq_accumulate_count = 0
+        dq_strong_sell_count = 0
+        dq_reco_8tier_seen = 0
+        dq_priority_band_seen = 0
         for _proj_row in projected_rows:
             _tags = _parse_warnings_tags(_proj_row)
             if _has_engine_drop_tag(_tags):
@@ -2834,6 +2863,17 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 dq_forecast_unavail += 1
             if _has_provider_error(_proj_row):
                 dq_provider_err += 1
+            _reco_canon = _normalize_reco_token(_proj_row.get("recommendation"))
+            if _reco_canon:
+                dq_reco_8tier_seen += 1
+                if _reco_canon == "AVOID":
+                    dq_avoid_count += 1
+                elif _reco_canon == "ACCUMULATE":
+                    dq_accumulate_count += 1
+                elif _reco_canon == "STRONG_SELL":
+                    dq_strong_sell_count += 1
+            if _normalize_priority_band(_proj_row.get("recommendation_priority_band")):
+                dq_priority_band_seen += 1
 
         status = "success" if projected_rows else "warn"
         meta = {
@@ -2855,14 +2895,26 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "include_matrix": criteria.get("include_matrix", True),
             "engine_source": engine_source,
             "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
-            # v4.12.0 Phase E: hard-filter audit surface
             "filter_drop_counts": dict(drop_counts),
             "applied_v310_filters": dict(_v310_active),
-            # v4.12.0 Phase E: data-quality summary of the FINAL projected set
+            # v4.14.0 Phase K — parallel 8-tier filter audit block.
+            "applied_v8tier_filters": dict(_v8tier_active),
+            # v4.14.0 Phase K — capability flag. Downstream consumers
+            # (insights_builder v8.0.0, advisor route layer) can
+            # content-check this to confirm the selector is aligned
+            # with the v8.0.0 vocabulary.
+            "reco_8tier_aware": True,
+            "reco_8tier_aware_version": RECO_8TIER_AWARE_VERSION,
             "data_quality_summary": {
                 "engine_dropped_valuation": dq_engine_drop,
                 "forecast_unavailable": dq_forecast_unavail,
                 "provider_errors": dq_provider_err,
+                # v4.14.0 Phase K — 8-tier vocabulary counters.
+                "avoid_count": dq_avoid_count,
+                "accumulate_count": dq_accumulate_count,
+                "strong_sell_count": dq_strong_sell_count,
+                "reco_8tier_seen": dq_reco_8tier_seen,
+                "priority_band_seen": dq_priority_band_seen,
                 "total_projected": len(projected_rows),
             },
             **collect_meta,
@@ -2894,9 +2946,6 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         )
 
 
-# =============================================================================
-# Public API (sync+async tolerant)
-# =============================================================================
 def build_top10_rows(*args: Any, **kwargs: Any) -> Any:
     coro = _build_top10_rows_async(*args, **kwargs)
     try:
@@ -2965,16 +3014,24 @@ def select_top10_symbols(*args: Any, **kwargs: Any) -> Any:
 
 __all__ = [
     "TOP10_SELECTOR_VERSION",
-    "__version__",  # v4.12.0 Phase F: TFB module-version convention alias
+    "__version__",
+    # v4.14.0 Phase B/K: 8-tier capability marker.
+    "RECO_8TIER_AWARE_VERSION",
     "DEFAULT_FALLBACK_KEYS",
     "DEFAULT_FALLBACK_HEADERS",
     "ROW_KEY_ALIASES",
     "TOP10_REQUIRED_FIELDS",
     "TOP10_REQUIRED_HEADERS",
-    # v4.11.0 soft-penalty knobs (env-tunable)
     "TOP10_PENALTY_ENGINE_DROP",
     "TOP10_PENALTY_FORECAST_UNAVAIL",
     "TOP10_PENALTY_PROVIDER_ERROR",
+    # v4.14.0 Phase C: 8-tier vocabulary surface (content-checkable
+    # constants for ops + downstream tooling).
+    "_RECO_8TIER_CANONICAL",
+    "_BULLISH_RECOS",
+    "_BEARISH_RECOS",
+    "_RECO_8TIER_NEW_TOKENS",
+    "_RECO_TIEBREAK_BUMPS",
     "build_top10_rows",
     "build_top10_output_rows",
     "build_top10_investments_rows",
