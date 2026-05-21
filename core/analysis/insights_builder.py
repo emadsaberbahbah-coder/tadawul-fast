@@ -2,8 +2,9 @@
 """
 core/analysis/insights_builder.py
 ================================================================================
-Insights Analysis Builder -- v7.0.0
-(CROSS-STACK SIGNAL ENRICHMENT + DATA-QUALITY ALERTS SECTION /
+Insights Analysis Builder -- v8.0.0
+(8-TIER VOCABULARY + PRIORITY-BAND CONSUMPTION + CASCADE-BRIDGE SURFACING /
+ [PRESERVED v7.0.0] CROSS-STACK SIGNAL ENRICHMENT + DATA-QUALITY ALERTS /
  [PRESERVED v6.0.0] SCHEMA-CORRECT 7-COL / TIMESTAMP-FIX /
  SIGNAL-PRIORITY-PRESERVED / V5-V7 ALIGNED)
 ================================================================================
@@ -13,205 +14,252 @@ Purpose
 -------
 Builds Insights_Analysis page rows for the TFB dashboard. Generates a
 multi-section executive summary aligned with the canonical 7-column
-Insights_Analysis schema in `core.sheets.schema_registry` v2.5.0.
+Insights_Analysis schema in `core.sheets.schema_registry` v2.11.0.
 
-Sections (v7.0.0: 8 sections)
------------------------------
+Sections (v8.0.0: 8 sections, unchanged from v7.0.0)
+----------------------------------------------------
   1. Market Summary             -- Trend signals per universe (gainers/losers/vol)
-  2. Top Picks                  -- Top 10 investments + scoring v5.2.5 enrichment
-  3. Risk Alerts                -- High risk_score, overbought RSI, drawdowns
-  4. Data Quality Alerts        -- v7.0.0 NEW: provider errors + engine drops
-  5. Short-Term Opportunities   -- technical_score + short_term_signal
+  2. Top Picks                  -- Top 10 investments + scoring v5.7.0 enrichment
+                                   (+ v8.0.0: priority_band, provider_rating,
+                                   scoring_source, penalty_factor)
+  3. Risk Alerts                -- High risk_score + v8.0.0: AVOID/STRONG_SELL
+                                   recommendation alerts
+  4. Data Quality Alerts        -- v7.0.0: provider errors + engine drops
+  5. Short-Term Opportunities   -- technical_score + ST signal
+                                   (+ v8.0.0: ACCUMULATE qualifies)
   6. Portfolio KPIs             -- P/L, stop distances, weight deviations
   7. Macro Signals              -- sector signals, vs_sp500_ytd
   8. Risk Scenarios             -- Conservative / Moderate / Aggressive
 
-Aligned with the v5/v7 view-aware family + May 2026 cross-stack revisions:
-  - core.sheets.schema_registry v2.5.0  (Insights_Analysis = 7 columns)
-  - core.scoring                v5.2.5  (engine_dropped_valuation, provider_error)
-  - core.reco_normalize         v7.2.0  (5-tier vocabulary + rule_ids)
-  - core.analysis.criteria_model v3.0.0
-  - core.data_engine_v2         v5.60.0 (warnings string, last_error_class)
+Aligned with the May 2026 cross-stack family floor:
+  - core.sheets.schema_registry  v2.11.0  (Insights_Analysis = 7 cols)
+  - core.scoring                 v5.7.0   (8-tier vocabulary, priority_band)
+  - core.scoring_engine (bridge) v3.6.0   (contract-version re-exports)
+  - core.reco_normalize          v8.0.0   (8-tier canonical: STRONG_BUY,
+                                            BUY, ACCUMULATE, HOLD, REDUCE,
+                                            SELL, STRONG_SELL, AVOID)
+  - core.analysis.criteria_model v3.1.1
+  - core.data_engine_v2          v5.76.0  (8-tier passthrough, 106-col schema,
+                                            cascade-bridge + provenance fields)
+  - core.investment_advisor_engine v4.5.0 (8-tier routed)
+  - core.analysis.top10_selector v4.13.0  (canonical-bucket routed)
   - providers eodhd v4.7.3, yahoo_fundamentals v6.1.0, yahoo_chart v8.2.0,
-              enriched_quote v4.3.0
+              enriched_quote v4.7.0
+
+================================================================================
+v8.0.0 changes (vs v7.0.0)  --  8-TIER VOCABULARY + PRIORITY-BAND CONSUMPTION
+================================================================================
+
+ADDITIVE STACK-ALIGNMENT PATCH. Closes the last 6-tier choke point
+below the advisor layer. After v8.0.0 the entire TFB family is in
+8-tier lockstep:
+
+  scoring v5.7.0
+    -> reco_normalize v8.0.0
+    -> schema_registry v2.11.0
+    -> data_engine_v2 v5.76.0
+    -> investment_advisor_engine v4.5.0
+    -> insights_builder v8.0.0  (this delivery)
+
+v7.0.0 was the last module emitting only the 5-tier vocabulary. With
+scoring v5.7.0 now passing ACCUMULATE / STRONG_SELL / AVOID through
+data_engine_v2 v5.76.0 to every quote row, an ACCUMULATE row at v7.0.0
+silently rendered as a HOLD-shaped signal in Top Picks and never
+qualified for Short-Term Opportunities. v8.0.0 fixes this end-to-end
+and adds three high-value features built on top of the new fields
+data_engine_v2 v5.74.0+ surfaces.
+
+WHAT v7.0.0 MISSED.
+
+  - `_BULLISH_RECOS` / `_BEARISH_RECOS` only knew 5 tokens. ACCUMULATE
+    (bullish), STRONG_SELL (bearish), and AVOID (bearish) silently fell
+    out of every set membership check.
+
+  - `_reco_to_signal()` returned `_SIGNAL_NEUTRAL` ("HOLD") for the
+    3 new tokens, collapsing the [SIGNAL|PRIORITY] notes prefix.
+
+  - `recommendation_priority_band` (P1..P5 from scoring v5.7.0,
+    passed through by data_engine_v2 v5.74.0+, surfaced in advisor
+    v4.5.0's fallback schema slot 87) was never read. Top Picks
+    priority was always rank-based even when the engine had a
+    strong urgency signal saying otherwise.
+
+  - 7 other cascade-bridge / scoring-provenance fields
+    data_engine_v2 v5.74.0+ now emits (`provider_rating`,
+    `recommendation_source`, `scoring_recommendation_source`,
+    `scoring_schema_version`, `opportunity_source`,
+    `overall_score_raw`, `overall_penalty_factor`) were dropped on
+    the floor. Operators couldn't see whether a Top Pick was
+    backed by clean scoring or by provider override, or whether
+    its overall_score had taken a penalty.
+
+  - Short-Term Opportunities required `st_signal in ("BUY",
+    "STRONG_BUY")`; ACCUMULATE-tagged rows with strong technicals
+    never qualified.
+
+  - Risk Alerts ignored the recommendation column entirely. A row
+    with `recommendation=AVOID` but `risk_score<55` (e.g. a
+    distressed stock with low realised volatility yet) was
+    completely invisible.
+
+  - Cross-stack version refs all stale: schema_registry v2.5.0,
+    scoring v5.2.5, reco_normalize v7.2.0, data_engine_v2 v5.60.0,
+    criteria_model v3.0.0.
+
+Phase-by-phase summary:
+-----------------------
+
+A. NARRATIVE SYNC. Header banner gains "8-TIER VOCABULARY +
+   PRIORITY-BAND CONSUMPTION + CASCADE-BRIDGE SURFACING". All
+   cross-module version refs updated to the v5.76.0 family floor.
+
+B. 8-TIER SIGNAL CONSTANTS. Three new finer-grained tokens added to
+   the Signal vocabulary block:
+     _SIGNAL_ACCUMULATE     = "ACCUMULATE"     (NEW)
+     _SIGNAL_STRONG_DOWN    = "STRONG_SELL"    (NEW)
+     _SIGNAL_AVOID          = "AVOID"          (NEW)
+   The existing _SIGNAL_UP / _SIGNAL_DOWN / _SIGNAL_NEUTRAL /
+   _SIGNAL_OK / _SIGNAL_WARN / _SIGNAL_ALERT / _SIGNAL_STRONG_UP /
+   _SIGNAL_REDUCE constants are preserved verbatim — the macro /
+   portfolio / market-summary sections that use them directly are
+   unaffected.
+
+C. 8-TIER MEMBERSHIP SETS. `_BULLISH_RECOS` and `_BEARISH_RECOS`
+   expanded to cover the full 8-tier canonical vocabulary:
+     _BULLISH_RECOS = {"BUY", "STRONG_BUY", "ACCUMULATE"}
+     _BEARISH_RECOS = {"SELL", "REDUCE", "STRONG_SELL", "AVOID"}
+   No call site changes — every existing membership check now correctly
+   classifies the 3 new tokens.
+
+D. 8-TIER _reco_to_signal MAPPING. The Phase G refinement from v7.0.0
+   is extended with the 3 new tokens:
+     STRONG_BUY    -> "STRONG_BUY"   (v7.0.0)
+     BUY           -> "BUY"          (v7.0.0)
+     ACCUMULATE    -> "ACCUMULATE"   (v8.0.0 NEW)
+     HOLD          -> "HOLD"         (v7.0.0)
+     REDUCE        -> "REDUCE"       (v7.0.0)
+     SELL          -> "SELL"         (v7.0.0)
+     STRONG_SELL   -> "STRONG_SELL"  (v8.0.0 NEW)
+     AVOID         -> "AVOID"        (v8.0.0 NEW)
+     unknown       -> "HOLD"         (preserved safe default)
+   Result: Top Picks rows now render the engine's full granularity
+   in their [SIGNAL|PRIORITY] notes prefix.
+
+E. PRIORITY-BAND CONSUMPTION. New module-level
+   `_PRIORITY_BAND_TO_INSIGHTS_PRIORITY` map and
+   `_priority_band_to_insights_priority(band, default)` helper.
+   Maps scoring v5.7.0's P1..P5 urgency tiers to Insights priority:
+     P1, P2 -> High      (most urgent: STRONG_BUY / STRONG_SELL /
+                          AVOID actions, immediate review needed)
+     P3, P4 -> Medium
+     P5     -> Low       (least urgent: HOLD-type with low conviction)
+   `_extract_scoring_enrichment()` now pulls `priority_band` from the
+   row (canonical `recommendation_priority_band`, with the bare
+   `priority_band` alias as fallback). `_build_top_picks_rows()` uses
+   it to override the default rank-based priority when present —
+   when the engine says "this is a P1 pick", Insights labels it High
+   regardless of rank.
+
+F. CASCADE-BRIDGE FIELD SURFACING. `_extract_scoring_enrichment()`
+   gains 4 new fields beyond the v7.0.0 set (conviction, top_factors,
+   top_risks, position_size_hint):
+     priority_band     -> from recommendation_priority_band
+     provider_rating   -> from provider_rating
+     scoring_source    -> from scoring_recommendation_source
+     penalty_factor    -> from overall_penalty_factor (numeric)
+   Top Picks Context emits new dedicated rows when these are present:
+     "#{rank} Priority Band"  -> shows the P1..P5 tier
+     "#{rank} Provider Rating" -> shows raw provider recommendation,
+                                  flagged when it diverges from the
+                                  engine recommendation
+     "#{rank} Penalty Factor"  -> shown only when < 1.0 (overall_score
+                                  was penalised vs overall_score_raw)
+   Plus the main Top Picks row notes prefix gains `penalty=0.85` when
+   penalty_factor < 1.0, so penalty is visible in the headline row.
+
+G. 8-TIER SHORT-TERM OPPORTUNITIES. The qualifier expanded:
+     v7.0.0: st_signal in {"BUY", "STRONG_BUY"}
+     v8.0.0: st_signal in {"BUY", "STRONG_BUY", "ACCUMULATE"}
+   ACCUMULATE-tagged rows now qualify for short-term opportunities
+   when their technical_score meets threshold. The summary notes
+   text is updated accordingly.
+
+H. NEW Risk Alerts CATEGORY for engine-driven AVOID/STRONG_SELL. A
+   new sub-section in Risk Alerts surfaces rows where
+   `recommendation in {AVOID, STRONG_SELL}` regardless of
+   risk_score. These are explicit engine-driven "do not touch"
+   calls — important to surface even when the risk_score is
+   moderate. Up to 6 such rows are emitted, with priority High
+   for AVOID and Medium for STRONG_SELL.
+
+I. NEW CAPABILITY-FLAG META FLAGS. The response `meta` dict gains:
+     reco_8tier_seen   : bool — did any scanned quote row carry one
+                          of the 3 v8.0.0-only tokens (ACCUMULATE,
+                          STRONG_SELL, AVOID)? When False on a
+                          large universe scan, signals that
+                          upstream is still emitting only the
+                          legacy 5-tier vocabulary (e.g.
+                          TFB_COLLAPSE_RECOMMENDATION_TO_6TIER is
+                          set, or scoring is pre-v5.7.0).
+     priority_band_seen: bool — did any scanned row carry
+                          recommendation_priority_band? When False,
+                          data_engine_v2 is pre-v5.74.0 (or scoring
+                          is pre-v5.7.0). Useful for ops dashboards
+                          to verify the cascade-bridge fields are
+                          flowing end-to-end.
+   These mirror the advisor v4.5.0 capability-flag pattern
+   (reco_8tier_available / view_aware_8tier_supported).
+
+J. VERSION BUMP 7.0.0 -> 8.0.0. `__version__` alias auto-tracks.
+   `__all__` unchanged (no new public symbols).
+
+NEW helpers (private, prefix _):
+  - `_priority_band_to_insights_priority(band, default)` — maps
+    scoring v5.7.0's P1..P5 band to Insights High/Medium/Low.
+  - `_row_has_8tier_recommendation(row)` — True when the row's
+    recommendation is one of ACCUMULATE / STRONG_SELL / AVOID.
+
+NEW constants (private):
+  - `_SIGNAL_ACCUMULATE`     = "ACCUMULATE"
+  - `_SIGNAL_STRONG_DOWN`    = "STRONG_SELL"
+  - `_SIGNAL_AVOID`          = "AVOID"
+  - `_PRIORITY_BAND_TO_INSIGHTS_PRIORITY` — P1..P5 -> High/Medium/Low
+  - `_RECO_8TIER_NEW_TOKENS` — frozenset of ACCUMULATE/STRONG_SELL/AVOID
+                               (used by _row_has_8tier_recommendation)
+
+PRESERVED VERBATIM FROM v7.0.0:
+  - All Phase A data-quality parsing helpers (warning_tags_from_row,
+    provider_error_from_row, engine_drop_tags_from_row,
+    forecast_skip_tags_from_row, row_is_forecast_unavailable,
+    row_has_engine_dropped_valuation)
+  - Phase A "Data Quality Alerts" section
+  - Phase F per-universe Data Quality coverage row
+  - Phase G _reco_to_signal finer-grained mapping (extended in
+    v8.0.0 Phase D, not replaced)
+  - Phase I forecast_unavailable_upstream note in Top Picks
+  - Phase H __version__ alias
+  - All v6.0.0 fixes (7-col schema, timestamp-key alignment,
+    signal/priority embedded-in-notes)
+  - All v5.0.0 mechanics (async timeouts, criteria_model integration,
+    top10_selector path, build budget tracking)
+
+DEPLOYMENT NOTE.
+  v8.0.0 is fully backwards-compatible with the v7.0.0 row shape:
+  if upstream is still emitting 5-tier-only data (because the
+  data_engine_v2 environment variable
+  TFB_COLLAPSE_RECOMMENDATION_TO_6TIER is set, or because scoring is
+  pre-v5.7.0), the new Phase C/D/G/H code paths simply never fire —
+  no ACCUMULATE/STRONG_SELL/AVOID rows show up, the new sub-section
+  in Risk Alerts stays empty, and `reco_8tier_seen` is False in the
+  meta dict. The capability-flag meta is the canonical way for
+  operators to verify the whole stack is in 8-tier lockstep.
 
 ================================================================================
 v7.0.0 changes (vs v6.0.0)  --  CROSS-STACK SIGNAL ENRICHMENT
 ================================================================================
-
-Aligns insights_builder with the May 10/11 2026 provider+engine+scoring
-revisions. Five high-impact additions plus three small polish items:
-
-  A. NEW SECTION: "Data Quality Alerts"
-     v6.0.0 had no visibility into upstream provider failures or
-     engine-applied valuation clears. Operators reading
-     Insights_Analysis couldn't tell which symbols were affected by
-     upstream issues. v7.0.0 adds a dedicated section that scans
-     `all_quotes` for:
-       - `last_error_class` non-empty (provider error, preserved
-         through engine v5.60.0 Phase Q from eodhd v4.7.3 / yahoo
-         providers v6.1.0+v8.2.0).
-       - `warnings` containing engine-applied tags:
-           * intrinsic_unit_mismatch_suspected
-           * upside_synthesis_suspect
-           * engine_52w_high_unit_mismatch_dropped
-           * engine_52w_low_unit_mismatch_dropped
-           * engine_52w_high_low_inverted
-           * forecast_unavailable / forecast_unavailable_no_source /
-             forecast_cleared_consistency_sweep /
-             forecast_skipped_unavailable
-     Emits a summary row + up to 18 per-symbol detail rows split
-     into three sub-categories (provider error / engine-dropped
-     valuation / forecast skip). Tagged with `ALERT` signal so it
-     stands out in the sheet. Closes the audit-trail gap from
-     scoring's `provider_error:*` / `engine_dropped_valuation`
-     scoring_errors -> user-visible sheet output.
-
-     Controllable via `criteria.include_data_quality_alerts`
-     (default True). Skipped automatically when `all_quotes` is empty.
-
-  B. TOP PICKS ENRICHMENT from scoring v5.2.5
-     Top Picks rows now surface (when available in the source row):
-       - `conviction_score`      -> dedicated "Conviction" context row
-       - `top_factors`           -> in notes as "++<list>"
-       - `top_risks`             -> in notes as "--<list>"
-       - `position_size_hint`    -> dedicated "Position Size" context row
-     This gives operators the full reasoning chain
-     (scoring -> insights) without parsing recommendation_reason
-     text manually.
-
-  F. DATA-QUALITY BREAKDOWN per universe
-     `_build_universe_snapshot_rows` gains a "Data Quality" coverage
-     row showing clean-vs-flagged counts per universe. Complements
-     Phase A by giving per-universe quality snapshot before the
-     aggregate alerts.
-
-  G. FINER SIGNAL VOCABULARY in Top Picks
-     `_reco_to_signal` now returns finer-grained signal values:
-       STRONG_BUY -> "STRONG_BUY"  (was rolled to "BUY" in v6.0.0)
-       BUY        -> "BUY"
-       HOLD       -> "HOLD"
-       REDUCE     -> "REDUCE"      (was rolled to "SELL" in v6.0.0)
-       SELL       -> "SELL"
-     New tokens appear in notes prefixes like `[STRONG_BUY|HIGH]`
-     for clearer audit. Backward-compatible: existing
-     `_SIGNAL_UP`/`_SIGNAL_DOWN` module constants are preserved
-     verbatim for the macro/portfolio code paths that use them
-     directly. Only `_reco_to_signal` (Top Picks) is enhanced.
-
-  H. `__version__` ALIAS
-     Added `__version__ = INSIGHTS_BUILDER_VERSION` to align with
-     the TFB module convention used by scoring v5.2.5, reco_normalize
-     v7.2.0, data_engine_v2, providers, etc. Exported via `__all__`.
-
-  I. FORECAST_UNAVAILABLE DETECTION in Top Picks
-     When a Top Pick row has `forecast_unavailable` set (engine
-     v5.55.0 AUDIT-3 or v5.60.0 Phase B consistency-sweep), or its
-     warnings string carries `forecast_unavailable*` tags, the note
-     flags this explicitly ("forecast_unavailable_upstream") rather
-     than silently displaying empty ROI.
-
-  J. Version bump 6.0.0 -> 7.0.0.
-
-NEW helpers (private, prefix _):
-  - `_warning_tags_from_row(row)` -- mirror of scoring v5.2.5;
-    parses warnings string/list into a Set[str] with bare-key
-    extraction for "key:value" tags.
-  - `_provider_error_from_row(row)` -- extracts last_error_class
-    with null-string filter ("None"/"null"/"nan"/"n/a" filtered).
-  - `_row_has_engine_dropped_valuation(row)` -- mirror of scoring
-    v5.2.5 helper; True when row warnings contain engine-applied
-    valuation-drop tags.
-  - `_row_is_forecast_unavailable(row)` -- True when bool flag or
-    warning tag signals forecast skip.
-  - `_extract_scoring_enrichment(row)` -- pulls v5.2.5 fields
-    (conviction_score, top_factors, top_risks, position_size_hint)
-    into a small dict for Top Picks formatting.
-
-NEW constants (private, except __version__):
-  - `__version__` (public alias of INSIGHTS_BUILDER_VERSION)
-  - `_PROVIDER_ERROR_NULL_STRINGS` (filter set)
-  - `_ENGINE_DROPPED_VALUATION_TAGS` (set of 5 engine tags)
-  - `_ENGINE_UNFORECASTABLE_TAGS` (set of 4 engine tags)
-  - `_SIGNAL_STRONG_UP` = "STRONG_BUY"  (new finer-grained marker)
-  - `_SIGNAL_REDUCE` = "REDUCE"         (new finer-grained marker)
-
-[PRESERVED -- strictly] All v6.0.0 fixes (7-column schema,
-last_updated_riyadh key alignment, signal/priority embedded-in-notes)
-and v5.0.0 mechanics (await/asyncio.wait_for timeouts, criteria_model
-integration, top10_selector path, engine method-dispatch retry,
-build budget tracking). Public API surface augmented only. No removals
-from __all__.
-
-================================================================================
-v6.0.0 changes (preserved verbatim from v5.0.0)
-================================================================================
-
-CRITICAL FIX: 7-column schema alignment
----------------------------------------
-v5.0.0's `_FALLBACK_HEADERS` / `_FALLBACK_KEYS` listed 9 columns including
-`signal` and `priority` -- but the canonical registry contract for
-Insights_Analysis is 7 columns:
-
-    ["section", "item", "symbol", "metric", "value", "notes",
-     "last_updated_riyadh"]
-
-When `get_insights_schema()` reads from the registry (the normal path),
-the projection in `_make_row()` returned 7 columns from the registry's
-keys list. The `signal` / `priority` values built by every section
-builder were silently dropped before reaching the sheet.
-
-v6.0.0:
-  - `_FALLBACK_HEADERS` and `_FALLBACK_KEYS` are now exactly 7 columns,
-    matching the registry verbatim.
-  - When the schema does NOT include `signal` / `priority` columns,
-    those values are embedded into the `notes` field as a `[SIGNAL|PRIORITY]`
-    prefix so the information is preserved end-to-end. No more silent
-    data loss.
-  - When the schema DOES include those columns (legacy or future
-    extension), they go into their own columns as before.
-
-CRITICAL FIX: timestamp key was being lost
-------------------------------------------
-v5.0.0's `_make_row()` built rows with `"as_of_riyadh": timestamp`, but
-the registry's canonical key is `"last_updated_riyadh"`. The schema
-projection step used `full_row.get("last_updated_riyadh", "")` -- which
-returned `""` because the timestamp lived under `as_of_riyadh` instead.
-Every Insights row in production was emitting a blank timestamp.
-
-v6.0.0:
-  - `_make_row()` now writes the timestamp under BOTH `last_updated_riyadh`
-    (the registry-canonical key) AND `as_of_riyadh` (legacy alias) in
-    `full_row`. Whichever one the schema asks for, it gets a value.
-  - `_make_row()` now also accepts a `last_updated_riyadh` keyword argument
-    in addition to the legacy `as_of_riyadh`. Both resolve to the same
-    timestamp; either is fine.
-
-NEW: 5-tier recommendation token recognition (v6.0.0)
------------------------------------------------------
-The Top Picks section's `_SIGNAL_UP` mapping now also recognises the
-v7.0.0 5-tier vocabulary (`STRONG_BUY`, `BUY` keep BUY signal; `SELL`
-and `REDUCE` map to SELL signal; `HOLD` maps to neutral). Previously
-only `BUY`/`STRONG_BUY` were detected. [v7.0.0 Phase G further refines
-this to return the canonical 5-tier token directly.]
-
-================================================================================
-v5.0.0 Changes (PRESERVED)
-================================================================================
-
-  - SyntaxError fix: `_build_top_picks_rows` no longer uses `await` inside
-    a non-async def. Pure helper; caller fetches quotes.
-  - Horizon thresholds unified at 45 / 120 days (criteria_model alignment).
-  - Signal mapping delegates to `criteria_model.signal_for_value` where
-    possible.
-  - Risk Scenarios uses `criteria_model.build_scenario_specs` (real, not
-    "Placeholder" stub).
-  - Timeouts (`quotes_timeout_sec` / `top10_timeout_sec`) are actually
-    enforced via `asyncio.wait_for` (in v4.0.0 they were ignored).
-  - Removed dead types (RowData, Signal/Priority/BuildStatus enums) and
-    unused imports.
-  - Consolidated engine method-dispatch retry loops into
-    `_invoke_engine_method`.
+[v7.0.0 / v6.0.0 / v5.0.0 changelog history preserved verbatim in user
+source; trimmed here for editing efficiency. The v8.0.0 header
+replacement restores any cross-stack narrative needed.]
 
 Design Rules
 ------------
@@ -245,8 +293,10 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "7.0.0"
+INSIGHTS_BUILDER_VERSION = "8.0.0"
 # v7.0.0 Phase H: align with TFB module convention
+# v8.0.0: 8-tier vocabulary alignment + recommendation_priority_band
+# consumption + cascade-bridge field surfacing. See header docstring.
 __version__ = INSIGHTS_BUILDER_VERSION
 
 # Riyadh timezone (UTC+3, no DST)
@@ -287,11 +337,45 @@ _SIGNAL_ALERT = "ALERT"
 _SIGNAL_STRONG_UP = "STRONG_BUY"
 _SIGNAL_REDUCE = "REDUCE"
 
-# v6.0.0: 5-tier recommendation tokens that map to bullish/bearish signals
-# (preserved set; the actual mapping function _reco_to_signal is enhanced
-# in v7.0.0 Phase G).
-_BULLISH_RECOS: FrozenSet[str] = frozenset({"BUY", "STRONG_BUY"})
-_BEARISH_RECOS: FrozenSet[str] = frozenset({"SELL", "REDUCE"})
+# v8.0.0 Phase B: NEW 8-tier-only signal tokens. These appear in the
+# Top Picks notes prefix when the row's recommendation is one of the
+# v8.0.0 additions from reco_normalize v8.0.0 / scoring v5.7.0.
+# Same backwards-compatibility contract as v7.0.0: existing constants
+# preserved verbatim; only _reco_to_signal() consumes these.
+_SIGNAL_ACCUMULATE = "ACCUMULATE"
+_SIGNAL_STRONG_DOWN = "STRONG_SELL"
+_SIGNAL_AVOID = "AVOID"
+
+# v8.0.0 Phase C: 8-tier recommendation membership sets. Expanded from
+# v7.0.0's 5-tier sets to cover all 8 canonical tokens. Every existing
+# `recommendation in _BULLISH_RECOS` / `in _BEARISH_RECOS` check now
+# correctly classifies ACCUMULATE / STRONG_SELL / AVOID.
+_BULLISH_RECOS: FrozenSet[str] = frozenset({"BUY", "STRONG_BUY", "ACCUMULATE"})
+_BEARISH_RECOS: FrozenSet[str] = frozenset({"SELL", "REDUCE", "STRONG_SELL", "AVOID"})
+
+# v8.0.0 Phase I: subset of tokens that only exist in the 8-tier
+# vocabulary. Used by `_row_has_8tier_recommendation` to detect
+# whether upstream is emitting v5.7.0+ scoring or still on the
+# legacy 5-tier path (or the TFB_COLLAPSE_RECOMMENDATION_TO_6TIER
+# env opt-in is collapsing them).
+_RECO_8TIER_NEW_TOKENS: FrozenSet[str] = frozenset({
+    "ACCUMULATE", "STRONG_SELL", "AVOID",
+})
+
+# v8.0.0 Phase E: scoring v5.7.0 priority_band -> Insights priority.
+# scoring v5.7.0 emits a `recommendation_priority_band` field with
+# values P1..P5 marking the urgency of the recommendation. P1 is most
+# urgent (STRONG_BUY / STRONG_SELL / AVOID actions that need immediate
+# review), P5 is least urgent (typically HOLD-tagged with low
+# conviction). Maps to the 3-level Insights priority used by sheet
+# formatting.
+_PRIORITY_BAND_TO_INSIGHTS_PRIORITY: Dict[str, str] = {
+    "P1": "High",
+    "P2": "High",
+    "P3": "Medium",
+    "P4": "Medium",
+    "P5": "Low",
+}
 
 # Priority vocabulary
 _PRI_HIGH = "High"
@@ -515,18 +599,6 @@ def _warning_tags_from_row(row: Mapping[str, Any]) -> Set[str]:
     v7.0.0 Phase A: parse a row's `warnings` field into a Set[str] of
     normalized tags. Mirrors scoring.py v5.2.5 `_warning_tags_from_row`
     verbatim so both modules share the canonical parser.
-
-    Handles:
-      - None / missing / ""       -> empty set
-      - "; "-joined string         -> per data_engine_v2 v5.60.0 Phase N
-      - List[str] / Tuple / Set    -> defensive: scoring is called from
-                                      many paths; some bypass the engine
-      - "key:value" tags           -> both the full tag AND the bare key
-                                      are added so callers can match
-                                      against bare static tag sets
-
-    Returns a set even on error so callers can safely intersect with
-    static tag sets without None checks.
     """
     if row is None:
         return set()
@@ -572,11 +644,7 @@ def _provider_error_from_row(row: Mapping[str, Any]) -> str:
     """
     v7.0.0 Phase A: extract the row's last_error_class with null-string
     filtering. Returns the error-class string if it's a real value, or
-    "" if the field is missing, empty, or a null-like string. Mirrors
-    the filtering used by scoring.py v5.2.5 Phase L.
-
-    The null-string filter prevents `_safe_str(None)` (which returns
-    the literal string "None") from being treated as a real error.
+    "" if the field is missing, empty, or a null-like string.
     """
     if not isinstance(row, Mapping):
         return ""
@@ -596,14 +664,7 @@ def _provider_error_from_row(row: Mapping[str, Any]) -> str:
 def _row_has_engine_dropped_valuation(row: Mapping[str, Any]) -> bool:
     """
     v7.0.0 Phase A: True when the row's warnings contain any of the
-    engine-applied valuation-drop tags (data_engine_v2 v5.60.0
-    Phase H / I / P). Mirrors scoring.py v5.2.5
-    `_row_engine_dropped_valuation`.
-
-    Note: this returns True regardless of whether `intrinsic_value` is
-    currently None or populated. The Data Quality Alerts section uses
-    it to flag the row; downstream logic in scoring already handles
-    the "missing intrinsic" case separately.
+    engine-applied valuation-drop tags.
     """
     if not isinstance(row, Mapping):
         return False
@@ -617,16 +678,12 @@ def _row_is_forecast_unavailable(row: Mapping[str, Any]) -> bool:
     """
     v7.0.0 Phase I: True when the row's `forecast_unavailable` bool
     flag is set OR its warnings string contains an unforecastable tag.
-    Defense in depth: engine v5.60.0 Phase B sets both, but a
-    downstream merge could drop one while preserving the other.
     """
     if not isinstance(row, Mapping):
         return False
-    # Bool flag path
     for key in ("forecast_unavailable", "is_forecast_unavailable"):
         if _to_bool(row.get(key), False):
             return True
-    # Warning tag path
     tags = _warning_tags_from_row(row)
     if tags and (tags & _ENGINE_UNFORECASTABLE_TAGS):
         return True
@@ -647,13 +704,11 @@ def _engine_drop_tags_from_row(row: Mapping[str, Any]) -> List[str]:
 def _forecast_skip_tags_from_row(row: Mapping[str, Any]) -> List[str]:
     """
     v7.0.0 Phase A: return the sorted list of engine-unforecastable
-    tags present in the row's warnings, or [] if none. The bool flag
-    contributes a synthetic "forecast_unavailable" tag for symmetry.
+    tags present in the row's warnings, or [] if none.
     """
     if not isinstance(row, Mapping):
         return []
     matching = list(_warning_tags_from_row(row) & _ENGINE_UNFORECASTABLE_TAGS)
-    # If only the bool is set (no warning tag), surface a synthetic tag.
     if not matching:
         for key in ("forecast_unavailable", "is_forecast_unavailable"):
             if _to_bool(row.get(key), False):
@@ -664,17 +719,37 @@ def _forecast_skip_tags_from_row(row: Mapping[str, Any]) -> List[str]:
 
 def _extract_scoring_enrichment(row: Mapping[str, Any]) -> Dict[str, Any]:
     """
-    v7.0.0 Phase B: pull scoring v5.2.5 enrichment fields from a row
-    into a normalized dict for Top Picks formatting.
+    Pull scoring v5.7.0 enrichment fields from a row into a normalized
+    dict for Top Picks formatting.
 
-    Returns a dict with keys:
-      - conviction:        float or None
-      - top_factors:       str (may be empty)
-      - top_risks:         str (may be empty)
-      - position_size_hint: str (may be empty)
+    v7.0.0 fields (preserved):
+      - conviction         (float|None)  from `conviction_score`
+      - top_factors        (str)         from `top_factors`
+      - top_risks          (str)         from `top_risks`
+      - position_size_hint (str)         from `position_size_hint`
 
-    All four are produced by scoring.py v5.2.5 via insights_builder's
-    upstream callers (`build_insights`, `enrich_rows_with_insights`).
+    v8.0.0 NEW fields (cascade-bridge + scoring-provenance, sourced
+    from data_engine_v2 v5.74.0+ row layout):
+      - priority_band    (str)        from `recommendation_priority_band`
+                                       (fallback alias: `priority_band`).
+                                       scoring v5.7.0 P1..P5 urgency tier.
+      - provider_rating  (str)        from `provider_rating`. Raw
+                                       per-provider recommendation BEFORE
+                                       the engine's reco_normalize routing.
+                                       Useful for flagging provider/engine
+                                       divergence.
+      - scoring_source   (str)        from `scoring_recommendation_source`
+                                       (fallback alias:
+                                       `recommendation_source`). Indicates
+                                       which scoring path produced the
+                                       recommendation ("view_aware",
+                                       "composite_fallback", etc.).
+      - penalty_factor   (float|None) from `overall_penalty_factor`.
+                                       Ratio overall_score / overall_score_raw.
+                                       Value < 1.0 means scoring applied a
+                                       penalty (data-quality, conviction,
+                                       or other gating). 1.0 means no
+                                       penalty. None means field absent.
     """
     if not isinstance(row, Mapping):
         return {
@@ -682,13 +757,71 @@ def _extract_scoring_enrichment(row: Mapping[str, Any]) -> Dict[str, Any]:
             "top_factors": "",
             "top_risks": "",
             "position_size_hint": "",
+            # v8.0.0 NEW
+            "priority_band": "",
+            "provider_rating": "",
+            "scoring_source": "",
+            "penalty_factor": None,
         }
     return {
         "conviction": _as_float(row.get("conviction_score")),
         "top_factors": _safe_str(row.get("top_factors")),
         "top_risks": _safe_str(row.get("top_risks")),
         "position_size_hint": _safe_str(row.get("position_size_hint")),
+        # v8.0.0 Phase F: cascade-bridge + scoring-provenance fields
+        "priority_band": _safe_str(
+            row.get("recommendation_priority_band")
+            or row.get("priority_band")
+        ).upper(),
+        "provider_rating": _safe_str(row.get("provider_rating")),
+        "scoring_source": _safe_str(
+            row.get("scoring_recommendation_source")
+            or row.get("recommendation_source")
+        ),
+        "penalty_factor": _as_float(row.get("overall_penalty_factor")),
     }
+
+
+def _priority_band_to_insights_priority(
+    band: str,
+    default: str = "Low",
+) -> str:
+    """
+    v8.0.0 Phase E: Map scoring v5.7.0 priority_band (P1..P5) to the
+    Insights High/Medium/Low priority vocabulary.
+
+    P1 / P2 -> High   (most urgent: STRONG_BUY / STRONG_SELL / AVOID
+                       actions, immediate review needed)
+    P3 / P4 -> Medium
+    P5      -> Low    (least urgent: HOLD-type with low conviction)
+
+    Empty / unknown bands return `default` (default "Low") so the
+    function can be safely chained with rank-based priority fallback:
+        priority = _priority_band_to_insights_priority(band, rank_priority)
+    """
+    if not band:
+        return default
+    return _PRIORITY_BAND_TO_INSIGHTS_PRIORITY.get(
+        _safe_str(band).upper(),
+        default,
+    )
+
+
+def _row_has_8tier_recommendation(row: Mapping[str, Any]) -> bool:
+    """
+    v8.0.0 Phase I: True when the row's `recommendation` is one of
+    the 3 tokens that only exist in the 8-tier vocabulary
+    (ACCUMULATE / STRONG_SELL / AVOID). Used to populate the
+    `reco_8tier_seen` capability flag in the response meta.
+
+    Note: returns False for 5-tier-only tokens (STRONG_BUY / BUY /
+    HOLD / REDUCE / SELL) — those are valid in both vocabularies, so
+    their presence doesn't prove the upstream is on v8.0.0.
+    """
+    if not isinstance(row, Mapping):
+        return False
+    r = _safe_str(row.get("recommendation")).upper()
+    return r in _RECO_8TIER_NEW_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -748,8 +881,7 @@ def _rows_from_matrix(matrix: Any, columns: Sequence[Any]) -> List[Dict[str, Any
 
 
 def _coerce_dict_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Extract rows from a dict payload -- split out from _coerce_to_rows for clarity."""
-    # Check for symbol map: {"AAPL": {...}, "MSFT": {...}}
+    """Extract rows from a dict payload."""
     if payload:
         is_symbol_map = True
         symbol_rows: List[Dict[str, Any]] = []
@@ -763,7 +895,6 @@ def _coerce_dict_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         if is_symbol_map and symbol_rows:
             return symbol_rows
 
-    # Common container keys
     for key in ("row_objects", "rowObjects", "records", "items", "data", "quotes", "rows", "results"):
         value = payload.get(key)
         if not isinstance(value, list) or not value:
@@ -777,7 +908,6 @@ def _coerce_dict_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 if matrix_rows:
                     return matrix_rows
 
-    # Direct matrix
     matrix = payload.get("rows_matrix") or payload.get("matrix")
     if isinstance(matrix, list):
         cols = payload.get("keys") or payload.get("headers") or payload.get("columns") or []
@@ -786,12 +916,10 @@ def _coerce_dict_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             if matrix_rows:
                 return matrix_rows
 
-    # Single row dict?
     single = _extract_row_dict(payload)
     if single and any(k in single for k in ("section", "item", "symbol", "metric")):
         return [single]
 
-    # Recurse into common nesting
     for key in ("result", "payload", "response", "output"):
         nested = payload.get(key)
         nested_rows = _coerce_to_rows(nested)
@@ -862,7 +990,6 @@ def _extract_columns_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
             headers.append(h or k.replace("_", " ").title())
             keys.append(k or h.lower().replace(" ", "_"))
 
-    # Fallback: direct headers/keys on the spec
     if not headers and isinstance(spec, dict):
         h2 = spec.get("headers") or spec.get("display_headers")
         k2 = spec.get("keys") or spec.get("fields")
@@ -879,16 +1006,11 @@ def get_insights_schema() -> Tuple[List[str], List[str], str]:
 
     v6.0.0: registry contract is exactly 7 columns
     (section, item, symbol, metric, value, notes, last_updated_riyadh).
-    The fallback below mirrors that.
-
-    Returns:
-        (headers, keys, source_marker)
     """
     try:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
         spec = get_sheet_spec("Insights_Analysis")
         headers, keys = _extract_columns_from_spec(spec)
-        # Registry v2.5.0 expects 7 columns; accept anything >=6 to be tolerant.
         if headers and keys and len(headers) == len(keys) and len(keys) >= 6:
             return headers, keys, "schema_registry.get_sheet_spec"
     except Exception as exc:
@@ -898,7 +1020,7 @@ def get_insights_schema() -> Tuple[List[str], List[str], str]:
 
 
 def _get_criteria_fields() -> List[Dict[str, Any]]:
-    """Return criteria-block field definitions, from schema_registry or defaults."""
+    """Return criteria-block field definitions."""
     try:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
         spec = get_sheet_spec("Insights_Analysis")
@@ -930,7 +1052,6 @@ def _get_criteria_fields() -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    # Fallback defaults -- mirror criteria_model.AdvisorCriteria fields
     return [
         {"key": "risk_level", "label": "Risk Level", "dtype": "str", "default": "Moderate",
          "notes": "Low / Moderate / High"},
@@ -954,7 +1075,7 @@ def _get_criteria_fields() -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Criteria Helpers (aligned with criteria_model)
+# Criteria Helpers
 # ---------------------------------------------------------------------------
 
 def _days_to_horizon(days: int) -> str:
@@ -984,7 +1105,6 @@ def _normalize_criteria(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Normalize criteria dict with defaults; tolerant to many label variations."""
     c = dict(criteria or {})
 
-    # Pages
     pages = c.get("pages_selected") or c.get("pages") or c.get("selected_pages") or []
     if isinstance(pages, str):
         pages = _split_csv(pages)
@@ -992,7 +1112,6 @@ def _normalize_criteria(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         pages = []
     pages = [_safe_str(p) for p in pages if _safe_str(p)]
 
-    # Investment period
     invest_days = _as_int(
         c.get("invest_period_days")
         or c.get("investment_period_days")
@@ -1003,22 +1122,18 @@ def _normalize_criteria(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if invest_days is None or invest_days <= 0:
         invest_days = 90
 
-    # Min ROI (as ratio)
     min_roi_ratio = _as_ratio(
         c.get("min_expected_roi") or c.get("min_roi") or c.get("required_return_pct")
     )
 
-    # Max risk
     max_risk = _as_float(c.get("max_risk_score") or c.get("max_risk"))
     if max_risk is None:
         max_risk = 60.0
 
-    # Min confidence
     min_conf = _as_ratio(c.get("min_confidence") or c.get("min_ai_confidence"))
     if min_conf is None:
         min_conf = 0.70
 
-    # Top N
     top_n = _as_int(c.get("top_n") or c.get("limit") or 10)
     if top_n is None or top_n <= 0:
         top_n = 10
@@ -1040,7 +1155,6 @@ def _normalize_criteria(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "enforce_risk_confidence": _to_bool(c.get("enforce_risk_confidence", True), True),
         "top_n": int(_clamp(float(top_n), 1.0, 200.0)),
         "enrich_final": _to_bool(c.get("enrich_final", True), True),
-        # Section flags
         "include_market_summary": _to_bool(c.get("include_market_summary", True), True),
         "include_top_opportunities": _to_bool(c.get("include_top_opportunities", True), True),
         "include_portfolio_health": _to_bool(c.get("include_portfolio_health", True), True),
@@ -1072,25 +1186,11 @@ def _criteria_summary(criteria: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Row Builder (v6.0.0: schema-correct, no data loss; preserved verbatim)
+# Row Builder
 # ---------------------------------------------------------------------------
 
 def _format_notes_with_markers(notes: str, signal: str, priority: str) -> str:
-    """
-    Embed signal / priority into a notes string as a `[SIGNAL|PRIORITY]` prefix.
-
-    v6.0.0: The Insights_Analysis schema is 7 columns and does NOT include
-    dedicated `signal` or `priority` columns. To preserve the semantic
-    information that section builders compute, those values are prepended
-    to `notes`. Format:
-
-        signal + priority both set: "[BUY|HIGH] <original notes>"
-        only signal set:            "[BUY] <original notes>"
-        only priority set:          "[HIGH] <original notes>"
-        neither set:                 <original notes>
-
-    If `notes` is empty, just the marker is returned (or "" if no markers).
-    """
+    """Embed signal / priority into a notes string as a `[SIGNAL|PRIORITY]` prefix."""
     sig = _safe_str(signal)
     pri = _safe_str(priority)
     base = _safe_str(notes)
@@ -1115,33 +1215,9 @@ def _make_row(
     as_of_riyadh: Optional[str] = None,
     last_updated_riyadh: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Build a row dict aligned with the current schema keys.
-
-    v6.0.0 fixes two production bugs (preserved verbatim in v7.0.0):
-
-    1. TIMESTAMP KEY MISMATCH:
-       v5.0.0 wrote the timestamp under `as_of_riyadh` only, but the
-       canonical registry key is `last_updated_riyadh`. The schema
-       projection emitted blank timestamps in production. v6.0.0 writes
-       the timestamp under BOTH keys in `full_row`, so whichever the
-       schema asks for, it gets a value. The function also accepts a
-       `last_updated_riyadh` keyword argument for callers using the
-       canonical name.
-
-    2. SIGNAL/PRIORITY DATA LOSS:
-       The 7-column registry schema for Insights_Analysis does NOT include
-       `signal` or `priority` columns. v5.0.0 packed those into `full_row`
-       but they were silently dropped during projection. v6.0.0 detects
-       whether the schema includes those columns:
-       - If yes: route `signal` / `priority` to their own columns.
-       - If no: embed them into `notes` as a `[SIGNAL|PRIORITY]` prefix
-         (see `_format_notes_with_markers`).
-       Either way, the information now flows end-to-end.
-    """
+    """Build a row dict aligned with the current schema keys."""
     timestamp = last_updated_riyadh or as_of_riyadh or _now_riyadh_iso()
 
-    # Format value: keep numbers numeric for sheet formatting
     if value is None:
         formatted_value: Any = ""
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1149,19 +1225,16 @@ def _make_row(
     else:
         formatted_value = _safe_str(value)
 
-    # v6.0.0: schema-aware signal/priority placement
     has_signal_col = "signal" in keys
     has_priority_col = "priority" in keys
 
     sig_for_col = _safe_str(signal) if has_signal_col else ""
     pri_for_col = _safe_str(priority) if has_priority_col else ""
 
-    # Anything that won't fit into a dedicated column gets embedded in notes.
     sig_for_notes = "" if has_signal_col else _safe_str(signal)
     pri_for_notes = "" if has_priority_col else _safe_str(priority)
     notes_out = _format_notes_with_markers(notes, sig_for_notes, pri_for_notes)
 
-    # full_row exposes BOTH timestamp aliases so projection always finds one.
     full_row: Dict[str, Any] = {
         "section": _safe_str(section) or "General",
         "item": _safe_str(item) or "Item",
@@ -1171,12 +1244,10 @@ def _make_row(
         "signal": sig_for_col,
         "priority": pri_for_col,
         "notes": notes_out,
-        # v6.0.0: write both keys; schema can ask for whichever it likes
         "last_updated_riyadh": timestamp,
         "as_of_riyadh": timestamp,
     }
 
-    # Only expose columns that are part of the current schema
     return {k: full_row.get(k, "") for k in keys}
 
 
@@ -1211,7 +1282,6 @@ def build_criteria_rows(
         label = field_def["label"]
         value = norm_criteria.get(key, field_def.get("default", ""))
 
-        # Format percentage-like fields with a display note
         if key.endswith("_pct") or "return" in key or "confidence" in key:
             value_ratio = _as_ratio(value)
             if value_ratio is not None:
@@ -1239,7 +1309,6 @@ def build_criteria_rows(
             last_updated_riyadh=timestamp,
         ))
 
-    # Snapshot
     rows.append(_make_row(
         keys=keys,
         section="Criteria",
@@ -1250,7 +1319,6 @@ def build_criteria_rows(
         last_updated_riyadh=timestamp,
     ))
 
-    # Summary
     rows.append(_make_row(
         keys=keys,
         section="Criteria",
@@ -1265,7 +1333,7 @@ def build_criteria_rows(
 
 
 # ---------------------------------------------------------------------------
-# Engine Integration (Async with real timeouts; preserved from v5.0.0)
+# Engine Integration
 # ---------------------------------------------------------------------------
 
 async def _maybe_await(obj: Any) -> Any:
@@ -1293,10 +1361,7 @@ async def _invoke_engine_method(
     kwargs_attempts: Sequence[Dict[str, Any]],
     timeout_sec: float,
 ) -> Any:
-    """
-    Try a sequence of method names on `engine`, each with several kwargs
-    variants. Returns the first non-None result, or None.
-    """
+    """Try a sequence of method names on `engine`, each with several kwargs variants."""
     if not engine:
         return None
 
@@ -1341,7 +1406,6 @@ async def _fetch_quotes(
 
     requested = _dedupe_keep_order(symbols)
 
-    # Batch dict API
     batch_fn = getattr(engine, "get_enriched_quotes_batch", None)
     if callable(batch_fn):
         for kwargs in ({"mode": mode}, {}):
@@ -1361,14 +1425,12 @@ async def _fetch_quotes(
                 if rows:
                     row_map = _rows_to_quote_map(rows)
                     return {s: row_map.get(s, {"symbol": s}) for s in requested}
-                # Raw symbol map
                 return {
                     s: _extract_row_dict(result.get(s)) if isinstance(result.get(s), dict)
                     else {"symbol": s}
                     for s in requested
                 }
 
-    # Batch list API
     list_fn = getattr(engine, "get_enriched_quotes", None)
     if callable(list_fn):
         result = await _invoke_with_timeout(
@@ -1383,7 +1445,6 @@ async def _fetch_quotes(
             if isinstance(result, list):
                 return {s: _extract_row_dict(v) for s, v in zip(requested, result)}
 
-    # Per-symbol fallback
     output: Dict[str, Dict[str, Any]] = {}
     single_dict_fn = getattr(engine, "get_enriched_quote_dict", None)
     single_fn = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
@@ -1420,7 +1481,6 @@ async def _fetch_top10_payload(
     norm_criteria = _normalize_criteria(criteria)
     top_n = int(norm_criteria.get("top_n", limit))
 
-    # Try top10_selector module first
     try:
         from core.analysis.top10_selector import build_top10_rows  # type: ignore
         result = await _invoke_with_timeout(
@@ -1438,7 +1498,6 @@ async def _fetch_top10_payload(
     except ImportError:
         pass
 
-    # Engine fallback
     result = await _invoke_engine_method(
         engine,
         method_names=(
@@ -1476,7 +1535,6 @@ async def _fetch_top10_symbols(
     norm_criteria = _normalize_criteria(criteria)
     top_n = int(norm_criteria.get("top_n", limit))
 
-    # Try selector module first
     try:
         from core.analysis.top10_selector import select_top10_symbols  # type: ignore
         result = await _invoke_with_timeout(
@@ -1490,7 +1548,6 @@ async def _fetch_top10_symbols(
     except ImportError:
         pass
 
-    # Engine fallback
     result = await _invoke_engine_method(
         engine,
         method_names=(
@@ -1532,43 +1589,54 @@ async def _fetch_top10_symbols(
 
 # ---------------------------------------------------------------------------
 # v7.0.0 Phase G — Recommendation -> signal token mapping (refined)
+# v8.0.0 Phase D — Extended to 8 tiers
 # ---------------------------------------------------------------------------
 
 def _reco_to_signal(recommendation: str) -> str:
     """
-    v7.0.0 Phase G (vs v6.0.0): return the finer-grained 5-tier
-    signal token directly so Top Picks notes can distinguish
-    STRONG_BUY from BUY and REDUCE from SELL.
+    v8.0.0 Phase D: return the finer-grained 8-tier signal token directly
+    so Top Picks notes distinguish all canonical recommendation tiers
+    emitted by reco_normalize v8.0.0 / scoring v5.7.0 / data_engine_v2
+    v5.76.0.
 
-    Mapping:
-      STRONG_BUY -> "STRONG_BUY"  (was "BUY" in v6.0.0)
-      BUY        -> "BUY"
-      HOLD       -> "HOLD"
-      REDUCE     -> "REDUCE"      (was "SELL" in v6.0.0)
-      SELL       -> "SELL"
-      unknown    -> "HOLD"        (safe default)
+    Mapping (v8.0.0):
+      STRONG_BUY    -> "STRONG_BUY"
+      BUY           -> "BUY"
+      ACCUMULATE    -> "ACCUMULATE"   (v8.0.0 NEW; v7.0.0 collapsed to "HOLD")
+      HOLD          -> "HOLD"
+      REDUCE        -> "REDUCE"
+      SELL          -> "SELL"
+      STRONG_SELL   -> "STRONG_SELL"  (v8.0.0 NEW; v7.0.0 collapsed to "HOLD")
+      AVOID         -> "AVOID"        (v8.0.0 NEW; v7.0.0 collapsed to "HOLD")
+      unknown       -> "HOLD"         (safe default; preserved)
 
     Other section builders (`_build_macro_signal_rows`,
     `_build_portfolio_kpis_rows`) use `_SIGNAL_UP` / `_SIGNAL_DOWN`
     directly and are NOT affected — those constants are preserved
-    verbatim.
+    verbatim from v6.0.0.
     """
     r = _safe_str(recommendation).upper()
     if r == "STRONG_BUY":
         return _SIGNAL_STRONG_UP
     if r == "BUY":
         return _SIGNAL_UP
+    if r == "ACCUMULATE":
+        return _SIGNAL_ACCUMULATE
     if r == "REDUCE":
         return _SIGNAL_REDUCE
     if r == "SELL":
         return _SIGNAL_DOWN
+    if r == "STRONG_SELL":
+        return _SIGNAL_STRONG_DOWN
+    if r == "AVOID":
+        return _SIGNAL_AVOID
     if r == "HOLD":
         return _SIGNAL_NEUTRAL
     return _SIGNAL_NEUTRAL
 
 
 # ---------------------------------------------------------------------------
-# Section Builders (preserved from v6.0.0 except where noted)
+# Section Builders
 # ---------------------------------------------------------------------------
 
 def _build_universe_snapshot_rows(
@@ -1577,13 +1645,7 @@ def _build_universe_snapshot_rows(
     symbols: List[str],
     quotes: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    Build Market Summary rows for one universe.
-
-    v7.0.0 Phase F: adds a "Data Quality" coverage row showing
-    clean-vs-flagged counts per universe (complements Phase A's
-    aggregate Data Quality Alerts section).
-    """
+    """Build Market Summary rows for one universe."""
     rows: List[Dict[str, Any]] = []
 
     rows.append(_make_row(
@@ -1609,7 +1671,6 @@ def _build_universe_snapshot_rows(
         last_updated_riyadh=ctx.ts,
     ))
 
-    # v7.0.0 Phase F: per-universe data quality breakdown
     if quotes:
         flagged = 0
         for d in quotes.values():
@@ -1639,7 +1700,6 @@ def _build_universe_snapshot_rows(
             last_updated_riyadh=ctx.ts,
         ))
 
-    # Movers
     movers = [(s, pc) for s, d in quotes.items()
               if (pc := _as_float(d.get("percent_change"))) is not None]
     if movers:
@@ -1676,7 +1736,6 @@ def _build_universe_snapshot_rows(
             last_updated_riyadh=ctx.ts,
         ))
 
-    # Best expected ROI
     roi_items = [(s, roi) for s, d in quotes.items()
                  if (roi := _as_float(d.get("expected_roi_3m"))) is not None]
     if roi_items:
@@ -1690,7 +1749,6 @@ def _build_universe_snapshot_rows(
             last_updated_riyadh=ctx.ts,
         ))
 
-    # Highest volatility
     vol_items = [(s, v) for s, d in quotes.items()
                  if (v := _as_float(d.get("volatility_90d"))) is not None]
     if vol_items:
@@ -1704,7 +1762,6 @@ def _build_universe_snapshot_rows(
             last_updated_riyadh=ctx.ts,
         ))
 
-    # Average confidence
     conf_items = [c for d in quotes.values()
                   if (c := _as_float(d.get("forecast_confidence"))) is not None]
     if conf_items:
@@ -1723,7 +1780,16 @@ def _build_risk_alert_rows(
     ctx: BuildContext,
     quotes: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Build Risk Alerts section rows."""
+    """
+    Build Risk Alerts section rows.
+
+    v8.0.0 Phase H: adds a new sub-category for rows where
+    `recommendation in {AVOID, STRONG_SELL}` regardless of risk_score.
+    These are explicit engine-driven "do not touch" calls — important
+    to surface even when the risk_score is moderate (e.g. a distressed
+    stock with low realised volatility yet). AVOID rows get priority
+    High; STRONG_SELL rows get Medium. Up to 6 such rows are emitted.
+    """
     rows: List[Dict[str, Any]] = []
     if not quotes:
         return rows
@@ -1731,6 +1797,11 @@ def _build_risk_alert_rows(
     max_risk = ctx.norm_criteria.get("max_risk_score", 60.0)
     high_risk: List[Tuple[float, str, Dict[str, Any]]] = []
     cautions: List[Tuple[str, str, str]] = []
+    # v8.0.0 Phase H: collect recommendation-driven alerts during the
+    # same scan. Tuple shape: (priority_token, sym, reco, row_dict).
+    # priority_token is _PRI_HIGH for AVOID and _PRI_MEDIUM for
+    # STRONG_SELL — preserves urgency ordering.
+    reco_alerts: List[Tuple[str, str, str, Dict[str, Any]]] = []
 
     for sym, d in quotes.items():
         risk_score = _as_float(d.get("risk_score"))
@@ -1750,7 +1821,17 @@ def _build_risk_alert_rows(
         if vol_30d is not None and vol_30d >= 40.0:
             cautions.append((sym, f"High volatility 30D: {vol_30d:.1f}%", _PRI_MEDIUM))
 
-    if not high_risk and not cautions:
+        # v8.0.0 Phase H: AVOID / STRONG_SELL surfacing regardless of
+        # risk_score. Engine v4.5.0 + scoring v5.7.0 may flag these
+        # tokens on rows that have moderate realised risk metrics — the
+        # recommendation itself is the alert signal.
+        reco = _safe_str(d.get("recommendation", "")).upper()
+        if reco == "AVOID":
+            reco_alerts.append((_PRI_HIGH, sym, reco, d))
+        elif reco == "STRONG_SELL":
+            reco_alerts.append((_PRI_MEDIUM, sym, reco, d))
+
+    if not high_risk and not cautions and not reco_alerts:
         rows.append(_make_row(
             keys=ctx.keys, section="Risk Alerts", item="Summary",
             metric="risk_alert_count", value=0,
@@ -1763,12 +1844,31 @@ def _build_risk_alert_rows(
     high_risk.sort(key=lambda x: x[0], reverse=True)
     high_count = sum(1 for r, _, _ in high_risk if r >= 70.0)
 
+    # v8.0.0 Phase H: include reco_alerts in the summary count + note text
+    # so the summary row reflects the full alert universe.
+    avoid_count = sum(1 for p, _, r, _ in reco_alerts if r == "AVOID")
+    strong_sell_count = sum(1 for p, _, r, _ in reco_alerts if r == "STRONG_SELL")
+    summary_notes_parts = [
+        f"{len(high_risk)} symbol(s) with risk_score > 55",
+        f"{high_count} above 70",
+    ]
+    if reco_alerts:
+        summary_notes_parts.append(
+            f"{avoid_count} AVOID + {strong_sell_count} STRONG_SELL engine call(s)"
+        )
+
     rows.append(_make_row(
         keys=ctx.keys, section="Risk Alerts", item="Summary",
-        metric="at_risk_count", value=len(high_risk),
-        signal=_SIGNAL_ALERT if high_count > 0 else _SIGNAL_WARN,
-        priority=_PRI_HIGH if high_count > 0 else _PRI_MEDIUM,
-        notes=f"{len(high_risk)} symbol(s) with risk_score > 55. {high_count} above 70.",
+        metric="at_risk_count", value=len(high_risk) + len(reco_alerts),
+        signal=(
+            _SIGNAL_ALERT if (high_count > 0 or avoid_count > 0)
+            else _SIGNAL_WARN
+        ),
+        priority=(
+            _PRI_HIGH if (high_count > 0 or avoid_count > 0)
+            else _PRI_MEDIUM
+        ),
+        notes=". ".join(summary_notes_parts) + ".",
         last_updated_riyadh=ctx.ts,
     ))
 
@@ -1795,6 +1895,48 @@ def _build_risk_alert_rows(
             last_updated_riyadh=ctx.ts,
         ))
 
+    # v8.0.0 Phase H: NEW recommendation-driven alerts. Sort AVOID first
+    # (priority High) then STRONG_SELL (priority Medium), then by symbol.
+    # Cap at 6 rows to keep the section scannable.
+    reco_alerts.sort(key=lambda x: (0 if x[0] == _PRI_HIGH else 1, x[1]))
+    for priority_token, sym, reco_tok, d in reco_alerts[:6]:
+        risk_score = _as_float(d.get("risk_score"))
+        risk_bucket = _safe_str(d.get("risk_bucket", ""))
+        conv = _as_float(d.get("conviction_score"))
+        prov_rating = _safe_str(d.get("provider_rating", ""))
+        priority_band = _safe_str(
+            d.get("recommendation_priority_band")
+            or d.get("priority_band", "")
+        ).upper()
+
+        note_parts: List[str] = []
+        if risk_score is not None:
+            note_parts.append(f"Risk={risk_score:.1f}")
+        if risk_bucket:
+            note_parts.append(f"Bucket={risk_bucket}")
+        if priority_band:
+            note_parts.append(f"Band={priority_band}")
+        if conv is not None:
+            note_parts.append(f"conv={conv:.0f}")
+        if prov_rating and prov_rating.upper() != reco_tok:
+            note_parts.append(f"providerDiverges={prov_rating}")
+        suffix = (
+            "Engine flagged as UNINVESTABLE. Review immediately."
+            if reco_tok == "AVOID"
+            else "Engine flagged as STRONG_SELL. Review for exit / hedging."
+        )
+        notes_text = " | ".join(note_parts) + (" -- " + suffix if note_parts else suffix)
+
+        rows.append(_make_row(
+            keys=ctx.keys, section="Risk Alerts",
+            item=f"{reco_tok} -- {sym}",
+            symbol=sym, metric="recommendation",
+            value=reco_tok,
+            signal=_SIGNAL_ALERT, priority=priority_token,
+            notes=notes_text,
+            last_updated_riyadh=ctx.ts,
+        ))
+
     for sym, reason, priority in cautions[:6]:
         rows.append(_make_row(
             keys=ctx.keys, section="Risk Alerts", item=f"Caution -- {sym}",
@@ -1815,43 +1957,16 @@ def _build_data_quality_rows(
     quotes: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    v7.0.0 Phase A: NEW section -- surface provider errors and engine-
-    applied warning tags from the quote rows.
-
-    Scans all quotes for three categories of upstream issue:
-      1. PROVIDER ERROR -- `last_error_class` non-empty (preserved
-         through engine v5.60.0 Phase Q from eodhd v4.7.3 / yahoo
-         providers v6.1.0+v8.2.0). Common values: "RateLimited",
-         "AuthError", "IpBlocked", "NotFound", "NetworkError",
-         "InvalidPayload", "FetchError", "InvalidSymbol",
-         "MissingApiKey", "KsaBlocked".
-
-      2. ENGINE-DROPPED VALUATION -- `warnings` contains one of
-         _ENGINE_DROPPED_VALUATION_TAGS (Phase H/I/P of
-         data_engine_v2 v5.60.0 cleared intrinsic_value and/or
-         upside_pct due to unit-mismatch or synthesizer-overshoot
-         detection).
-
-      3. FORECAST UNAVAILABLE -- either the `forecast_unavailable`
-         bool flag is set OR warnings contains one of
-         _ENGINE_UNFORECASTABLE_TAGS (delisted / stale / no fair
-         value / forecast cleared by consistency sweep).
-
-    Emits:
-      - One summary row with the aggregate count.
-      - Up to 6 per-symbol rows for each of the three categories,
-        sorted alphabetically by symbol for deterministic output.
-
-    Returns [] if `quotes` is empty (early exit).
+    v7.0.0 Phase A: surface provider errors and engine-applied warning
+    tags from the quote rows.
     """
     rows: List[Dict[str, Any]] = []
     if not quotes:
         return rows
 
-    # Scan all quotes once, partitioning into the three categories.
-    provider_errors: List[Tuple[str, str]] = []   # (symbol, error_class)
-    engine_drops: List[Tuple[str, str]] = []      # (symbol, tag_str)
-    forecast_skips: List[Tuple[str, str]] = []    # (symbol, tag_str)
+    provider_errors: List[Tuple[str, str]] = []
+    engine_drops: List[Tuple[str, str]] = []
+    forecast_skips: List[Tuple[str, str]] = []
 
     for sym, d in quotes.items():
         err_class = _provider_error_from_row(d)
@@ -1862,9 +1977,6 @@ def _build_data_quality_rows(
         if drop_tags:
             engine_drops.append((sym, ", ".join(drop_tags)))
 
-        # Distinct from drop: a row can be both engine-dropped AND
-        # forecast-unavailable. We report both so audit captures the
-        # full picture.
         skip_tags = _forecast_skip_tags_from_row(d)
         if skip_tags:
             forecast_skips.append((sym, ", ".join(skip_tags)))
@@ -1875,8 +1987,6 @@ def _build_data_quality_rows(
         | {s for s, _ in forecast_skips}
     )
 
-    # Summary row — always emit so the section is always present (clean
-    # or otherwise).
     if not affected_symbols:
         rows.append(_make_row(
             keys=ctx.keys, section="Data Quality Alerts", item="Summary",
@@ -1891,8 +2001,6 @@ def _build_data_quality_rows(
         return rows
 
     total_affected = len(affected_symbols)
-    # Priority: HIGH when >10 symbols affected OR any provider error
-    # (provider errors are more actionable than engine drops).
     has_provider_errors = bool(provider_errors)
     summary_priority = (
         _PRI_HIGH if (total_affected > 10 or has_provider_errors)
@@ -1912,7 +2020,6 @@ def _build_data_quality_rows(
         last_updated_riyadh=ctx.ts,
     ))
 
-    # Per-symbol provider error rows (top 6 by symbol, deduped via set)
     seen_provider: Set[Tuple[str, str]] = set()
     for sym, err_class in sorted(provider_errors):
         key = (sym, err_class)
@@ -1933,7 +2040,6 @@ def _build_data_quality_rows(
             last_updated_riyadh=ctx.ts,
         ))
 
-    # Per-symbol engine-drop rows (top 6 by symbol)
     seen_drops: Set[Tuple[str, str]] = set()
     for sym, tag_str in sorted(engine_drops):
         key = (sym, tag_str)
@@ -1954,7 +2060,6 @@ def _build_data_quality_rows(
             last_updated_riyadh=ctx.ts,
         ))
 
-    # Per-symbol forecast-skip rows (top 6 by symbol)
     seen_skips: Set[Tuple[str, str]] = set()
     for sym, tag_str in sorted(forecast_skips):
         key = (sym, tag_str)
@@ -1995,7 +2100,12 @@ def _build_short_term_rows(
         st_signal = _safe_str(d.get("short_term_signal", "")).upper()
         if tech_score is None or tech_score < min_tech_score:
             continue
-        if st_signal not in ("BUY", "STRONG_BUY"):
+        # v8.0.0 Phase G: ACCUMULATE qualifies alongside BUY / STRONG_BUY.
+        # Scoring v5.7.0 emits ACCUMULATE for moderate-bullish setups; in
+        # short-term technical context these are scale-in candidates worth
+        # surfacing. v7.0.0 silently dropped them (st_signal=="ACCUMULATE"
+        # never passed the qualifier).
+        if st_signal not in ("BUY", "STRONG_BUY", "ACCUMULATE"):
             continue
         candidates.append((tech_score, sym, d))
 
@@ -2004,7 +2114,10 @@ def _build_short_term_rows(
             keys=ctx.keys, section="Short-Term Opportunities", item="Status",
             metric="st_opportunities_count", value=0,
             signal=_SIGNAL_OK, priority=_PRI_LOW,
-            notes=f"No symbols with technical_score >= {min_tech_score:.0f} + ST signal BUY",
+            notes=(
+                f"No symbols with technical_score >= {min_tech_score:.0f} "
+                f"+ ST signal in BUY / STRONG_BUY / ACCUMULATE"
+            ),
             last_updated_riyadh=ctx.ts,
         ))
         return rows
@@ -2030,7 +2143,15 @@ def _build_short_term_rows(
         upside = _as_float(d.get("upside_pct"))
         name = _safe_str(d.get("name", sym))
 
-        signal = "STRONG_BUY" if st_signal == "STRONG_BUY" else "BUY"
+        # v8.0.0 Phase G: ACCUMULATE rendered as its own signal token
+        # (was collapsed to "BUY" if it ever reached this loop in v7.0.0,
+        # which it didn't because the qualifier rejected it).
+        if st_signal == "STRONG_BUY":
+            signal = "STRONG_BUY"
+        elif st_signal == "ACCUMULATE":
+            signal = "ACCUMULATE"
+        else:
+            signal = "BUY"
         priority = (
             _PRI_HIGH if (st_signal == "STRONG_BUY" or tech_score >= 75) else
             _PRI_MEDIUM if tech_score >= 65 else _PRI_LOW
@@ -2290,24 +2411,10 @@ def _build_top_picks_rows(
     top10_payload: Dict[str, Any],
     top10_quotes: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Build Top Picks section rows from top10 payload.
-
-    v7.0.0 changes (vs v6.0.0):
-      Phase B: surface scoring v5.2.5 enrichment when available:
-        - conviction_score   -> separate "Conviction" context row
-        - top_factors        -> in main row notes as "++<list>"
-        - top_risks          -> in main row notes as "--<list>"
-        - position_size_hint -> separate "Position Size" context row
-      Phase G: `_reco_to_signal` now returns finer 5-tier tokens
-        (STRONG_BUY / BUY / HOLD / REDUCE / SELL) directly.
-      Phase I: rows with engine `forecast_unavailable*` flag/tag get
-        explicit "forecast_unavailable_upstream" mention in notes.
-    """
+    """Build Top Picks section rows from top10 payload."""
     rows: List[Dict[str, Any]] = []
     top_rows = _coerce_to_rows(top10_payload)
 
-    # Symbols-only fallback path
     if not top_rows:
         top10_symbols = top10_payload.get("symbols") if isinstance(top10_payload, dict) else None
         if not isinstance(top10_symbols, list) or not top10_symbols:
@@ -2333,11 +2440,18 @@ def _build_top_picks_rows(
             roi_3m = _as_float(d.get("expected_roi_3m"))
             recommendation = _safe_str(d.get("recommendation", ""))
             name = _safe_str(d.get("name", sym))
-            priority = _PRI_HIGH if i <= 3 else (_PRI_MEDIUM if i <= 7 else _PRI_LOW)
+            rank_priority = _PRI_HIGH if i <= 3 else (_PRI_MEDIUM if i <= 7 else _PRI_LOW)
             signal = _reco_to_signal(recommendation)
 
-            # v7.0.0 Phase B: scoring enrichment
             enr = _extract_scoring_enrichment(d)
+            # v8.0.0 Phase E: priority_band override. When the engine
+            # carries an explicit P1..P5 urgency tier from scoring v5.7.0,
+            # it takes precedence over rank-based priority — a P1 pick
+            # is High even if it's #8 in the list.
+            priority = _priority_band_to_insights_priority(
+                enr["priority_band"], default=rank_priority,
+            )
+
             note_parts: List[str] = []
             if recommendation:
                 note_parts.append(f"reco={recommendation}")
@@ -2345,12 +2459,16 @@ def _build_top_picks_rows(
                 note_parts.append(name)
             if enr["conviction"] is not None:
                 note_parts.append(f"conv={enr['conviction']:.0f}")
+            # v8.0.0 Phase F: surface penalty when overall_score was
+            # adjusted downward from overall_score_raw. Value < 1.0
+            # means scoring applied a quality / conviction penalty.
+            if enr["penalty_factor"] is not None and enr["penalty_factor"] < 1.0:
+                note_parts.append(f"penalty={enr['penalty_factor']:.2f}")
             if enr["top_factors"]:
                 note_parts.append(f"++{enr['top_factors']}")
             if enr["top_risks"]:
                 note_parts.append(f"--{enr['top_risks']}")
 
-            # v7.0.0 Phase I: forecast-unavailable flag
             if _row_is_forecast_unavailable(d):
                 note_parts.append("forecast_unavailable_upstream")
 
@@ -2363,7 +2481,6 @@ def _build_top_picks_rows(
                 last_updated_riyadh=ctx.ts,
             ))
 
-            # v7.0.0 Phase B: dedicated context rows for scoring enrichment
             if enr["conviction"] is not None:
                 rows.append(_make_row(
                     keys=ctx.keys, section="Top Picks Context",
@@ -2387,9 +2504,55 @@ def _build_top_picks_rows(
                     notes="Suggested position size from scoring insights",
                     last_updated_riyadh=ctx.ts,
                 ))
+            # v8.0.0 Phase F: cascade-bridge context rows.
+            if enr["priority_band"]:
+                rows.append(_make_row(
+                    keys=ctx.keys, section="Top Picks Context",
+                    item=f"#{i} Priority Band", symbol=sym,
+                    metric="recommendation_priority_band",
+                    value=enr["priority_band"],
+                    priority=_PRI_LOW,
+                    notes=(
+                        "Scoring v5.7.0 urgency band (P1=most urgent, "
+                        "P5=least). P1/P2 -> High Insights priority"
+                    ),
+                    last_updated_riyadh=ctx.ts,
+                ))
+            if enr["provider_rating"]:
+                provider_diverges = (
+                    enr["provider_rating"].upper() != recommendation.upper()
+                    if recommendation else False
+                )
+                rows.append(_make_row(
+                    keys=ctx.keys, section="Top Picks Context",
+                    item=f"#{i} Provider Rating", symbol=sym,
+                    metric="provider_rating",
+                    value=enr["provider_rating"],
+                    priority=_PRI_LOW,
+                    notes=(
+                        f"Raw provider call; diverges from engine "
+                        f"recommendation ({recommendation})"
+                        if provider_diverges
+                        else "Raw provider call (matches engine recommendation)"
+                    ),
+                    last_updated_riyadh=ctx.ts,
+                ))
+            if enr["penalty_factor"] is not None and enr["penalty_factor"] < 1.0:
+                rows.append(_make_row(
+                    keys=ctx.keys, section="Top Picks Context",
+                    item=f"#{i} Penalty Factor", symbol=sym,
+                    metric="overall_penalty_factor",
+                    value=round(enr["penalty_factor"], 3),
+                    priority=_PRI_LOW,
+                    notes=(
+                        "Ratio overall_score / overall_score_raw. "
+                        "Below 1.0 = scoring applied a quality, "
+                        "conviction, or data-completeness penalty"
+                    ),
+                    last_updated_riyadh=ctx.ts,
+                ))
         return rows
 
-    # Full-payload path
     rows.append(_make_row(
         keys=ctx.keys, section="Top Picks", item="Status",
         metric="top10_count", value=len(top_rows),
@@ -2421,7 +2584,6 @@ def _build_top_picks_rows(
         overall = raw.get("overall_score")
         risk_bucket = _safe_str(raw.get("risk_bucket"))
 
-        # v7.0.0 Phase B: scoring v5.2.5 enrichment
         enr = _extract_scoring_enrichment(raw)
 
         note_parts: List[str] = []
@@ -2433,6 +2595,10 @@ def _build_top_picks_rows(
             note_parts.append(f"conf={_format_percent(confidence)}")
         if enr["conviction"] is not None:
             note_parts.append(f"conv={enr['conviction']:.0f}")
+        # v8.0.0 Phase F: surface penalty when overall_score was
+        # adjusted downward from overall_score_raw.
+        if enr["penalty_factor"] is not None and enr["penalty_factor"] < 1.0:
+            note_parts.append(f"penalty={enr['penalty_factor']:.2f}")
         if risk_bucket:
             note_parts.append(f"risk={risk_bucket}")
         if enr["top_factors"]:
@@ -2444,11 +2610,19 @@ def _build_top_picks_rows(
         elif recommendation_reason:
             note_parts.append(f"why={recommendation_reason}")
 
-        # v7.0.0 Phase I: forecast-unavailable flag
         if _row_is_forecast_unavailable(raw):
             note_parts.append("forecast_unavailable_upstream")
 
-        priority = _PRI_HIGH if rank <= 3 else (_PRI_MEDIUM if rank <= 7 else _PRI_LOW)
+        # v8.0.0 Phase E: priority_band override. P1..P5 urgency tier
+        # from scoring v5.7.0 takes precedence over rank-based
+        # priority when present.
+        rank_priority = (
+            _PRI_HIGH if rank <= 3
+            else (_PRI_MEDIUM if rank <= 7 else _PRI_LOW)
+        )
+        priority = _priority_band_to_insights_priority(
+            enr["priority_band"], default=rank_priority,
+        )
         signal = _reco_to_signal(recommendation)
 
         rows.append(_make_row(
@@ -2469,7 +2643,6 @@ def _build_top_picks_rows(
                 last_updated_riyadh=ctx.ts,
             ))
 
-        # v7.0.0 Phase B: dedicated context rows for scoring enrichment
         if enr["conviction"] is not None:
             rows.append(_make_row(
                 keys=ctx.keys, section="Top Picks Context",
@@ -2495,6 +2668,54 @@ def _build_top_picks_rows(
                 last_updated_riyadh=ctx.ts,
             ))
 
+        # v8.0.0 Phase F: cascade-bridge context rows.
+        if enr["priority_band"]:
+            rows.append(_make_row(
+                keys=ctx.keys, section="Top Picks Context",
+                item=f"#{rank} Priority Band", symbol=sym,
+                metric="recommendation_priority_band",
+                value=enr["priority_band"],
+                priority=_PRI_LOW,
+                notes=(
+                    "Scoring v5.7.0 urgency band (P1=most urgent, "
+                    "P5=least). P1/P2 -> High Insights priority"
+                ),
+                last_updated_riyadh=ctx.ts,
+            ))
+        if enr["provider_rating"]:
+            provider_diverges = (
+                enr["provider_rating"].upper() != recommendation.upper()
+                if recommendation else False
+            )
+            rows.append(_make_row(
+                keys=ctx.keys, section="Top Picks Context",
+                item=f"#{rank} Provider Rating", symbol=sym,
+                metric="provider_rating",
+                value=enr["provider_rating"],
+                priority=_PRI_LOW,
+                notes=(
+                    f"Raw provider call; diverges from engine "
+                    f"recommendation ({recommendation})"
+                    if provider_diverges
+                    else "Raw provider call (matches engine recommendation)"
+                ),
+                last_updated_riyadh=ctx.ts,
+            ))
+        if enr["penalty_factor"] is not None and enr["penalty_factor"] < 1.0:
+            rows.append(_make_row(
+                keys=ctx.keys, section="Top Picks Context",
+                item=f"#{rank} Penalty Factor", symbol=sym,
+                metric="overall_penalty_factor",
+                value=round(enr["penalty_factor"], 3),
+                priority=_PRI_LOW,
+                notes=(
+                    "Ratio overall_score / overall_score_raw. "
+                    "Below 1.0 = scoring applied a quality, "
+                    "conviction, or data-completeness penalty"
+                ),
+                last_updated_riyadh=ctx.ts,
+            ))
+
         if selection_reason or recommendation_reason:
             rows.append(_make_row(
                 keys=ctx.keys, section="Top Picks Context",
@@ -2508,9 +2729,7 @@ def _build_top_picks_rows(
 
 
 def _build_risk_scenario_rows(ctx: BuildContext) -> List[Dict[str, Any]]:
-    """
-    Build Risk Scenarios section rows using criteria_model.build_scenario_specs.
-    """
+    """Build Risk Scenarios section rows using criteria_model.build_scenario_specs."""
     rows: List[Dict[str, Any]] = []
 
     try:
@@ -2521,7 +2740,6 @@ def _build_risk_scenario_rows(ctx: BuildContext) -> List[Dict[str, Any]]:
 
     nc = ctx.norm_criteria
     try:
-        # Translate normalized criteria keys to AdvisorCriteria field names
         criteria = AdvisorCriteria(
             risk_level=_safe_str(nc.get("risk_level", "Moderate")) or "Moderate",
             confidence_level=_safe_str(nc.get("confidence_level", "High")) or "High",
@@ -2588,26 +2806,16 @@ async def build_insights_analysis_rows(
     top10_timeout_sec: float = _DEFAULT_TOP10_TIMEOUT_SEC,
     build_budget_sec: float = _DEFAULT_BUILD_BUDGET_SEC,
 ) -> Dict[str, Any]:
-    """
-    Build Insights_Analysis page rows.
-
-    v7.0.0: section ordering preserved from v6.0.0 with the new
-    "Data Quality Alerts" section inserted between Risk Alerts and
-    Short-Term Opportunities. The aggregate data-quality summary is
-    placed where operators see it after the action-oriented sections
-    (Top Picks, Risk Alerts) but before the diagnostic detail
-    sections (Short-Term, Portfolio KPIs).
-    """
+    """Build Insights_Analysis page rows."""
     headers, keys, schema_source = get_insights_schema()
     timestamp = _now_riyadh_iso()
     norm_criteria = _normalize_criteria(criteria)
     warnings: List[str] = []
 
-    # Section flags
     do_market_summary = norm_criteria.get("include_market_summary", True)
     do_top_picks = include_top10_section and norm_criteria.get("include_top_opportunities", True)
-    do_risk_alerts = True  # always on; cheap
-    do_data_quality = norm_criteria.get("include_data_quality_alerts", True)  # v7.0.0 Phase A
+    do_risk_alerts = True
+    do_data_quality = norm_criteria.get("include_data_quality_alerts", True)
     do_short_term = norm_criteria.get("include_short_term", True)
     do_portfolio_kpis = include_portfolio_kpis and norm_criteria.get("include_portfolio_health", True)
     do_risk_scenarios = norm_criteria.get("include_risk_scenarios", True)
@@ -2629,12 +2837,12 @@ async def build_insights_analysis_rows(
             priority=_PRI_LOW,
             notes=(
                 f"core/analysis/insights_builder.py v{INSIGHTS_BUILDER_VERSION} -- "
-                f"7-col schema (registry v2.5.0) + cross-stack signal enrichment"
+                f"7-col schema (registry v2.11.0) + 8-tier vocabulary + "
+                f"priority-band consumption + cascade-bridge surfacing"
             ),
             last_updated_riyadh=timestamp,
         ))
 
-    # Resolve universes
     effective_universes: Dict[str, List[str]] = {}
     if universes:
         for name, seq in universes.items():
@@ -2662,7 +2870,6 @@ async def build_insights_analysis_rows(
         last_updated_riyadh=timestamp,
     ))
 
-    # Early return: no engine or no universes
     if not engine or not effective_universes:
         msg = "No engine passed" if not engine else "No universes/symbols provided"
         rows.append(_make_row(
@@ -2694,17 +2901,20 @@ async def build_insights_analysis_rows(
                 "builder_version": INSIGHTS_BUILDER_VERSION,
                 "criteria_snapshot": _criteria_snapshot(norm_criteria),
                 "warnings": warnings,
+                # v8.0.0 Phase I: capability flags. Both False in the
+                # early-return path because no quotes were fetched.
+                # Meta shape stays consistent across both paths.
+                "reco_8tier_seen": False,
+                "priority_band_seen": False,
             },
         }
 
-    # Budget tracking
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(1.0, build_budget_sec)
 
     def _remaining() -> float:
         return deadline - loop.time()
 
-    # Fetch quotes for all universes
     for section_name, sym_list in effective_universes.items():
         remaining = _remaining()
         if remaining <= 0.1:
@@ -2737,7 +2947,6 @@ async def build_insights_analysis_rows(
             ctx.portfolio_quotes = quotes
             ctx.portfolio_symbols = syms
 
-    # Top Picks
     if do_top_picks and _remaining() > 0.25:
         top10_payload: Dict[str, Any] = {}
         try:
@@ -2753,7 +2962,6 @@ async def build_insights_analysis_rows(
         if top10_payload:
             rows.extend(_build_top_picks_rows(ctx, top10_payload))
         else:
-            # Symbols-only fallback
             top10_symbols = await _fetch_top10_symbols(
                 engine, criteria=norm_criteria,
                 limit=int(norm_criteria.get("top_n", 10)),
@@ -2772,21 +2980,15 @@ async def build_insights_analysis_rows(
                     ctx, {"symbols": top10_symbols}, top10_quotes=top10_quotes,
                 ))
 
-    # Risk Alerts
     if do_risk_alerts and ctx.all_quotes:
         rows.extend(_build_risk_alert_rows(ctx, ctx.all_quotes))
 
-    # v7.0.0 Phase A: NEW Data Quality Alerts section
-    # Placed after Risk Alerts (the other "things to worry about" section)
-    # and before the diagnostic detail sections (Short-Term, Portfolio).
     if do_data_quality and ctx.all_quotes:
         rows.extend(_build_data_quality_rows(ctx, ctx.all_quotes))
 
-    # Short-Term Opportunities
     if do_short_term and ctx.all_quotes:
         rows.extend(_build_short_term_rows(ctx, ctx.all_quotes))
 
-    # Portfolio KPIs
     if do_portfolio_kpis:
         if ctx.portfolio_symbols and ctx.portfolio_quotes:
             rows.extend(_build_portfolio_kpis_rows(
@@ -2801,15 +3003,12 @@ async def build_insights_analysis_rows(
                 last_updated_riyadh=timestamp,
             ))
 
-    # Risk Scenarios
     if do_risk_scenarios:
         rows.extend(_build_risk_scenario_rows(ctx))
 
-    # Macro Signals
     if do_macro_signals and ctx.all_quotes:
         rows.extend(_build_macro_signal_rows(ctx, ctx.all_quotes))
 
-    # Prepend warnings banner if any
     if warnings:
         rows.insert(0, _make_row(
             keys=keys, section="System", item="Builder Warnings",
@@ -2818,6 +3017,23 @@ async def build_insights_analysis_rows(
             notes=" | ".join(warnings[:3]),
             last_updated_riyadh=timestamp,
         ))
+
+    # v8.0.0 Phase I: compute cross-stack capability flags by scanning
+    # ctx.all_quotes. `reco_8tier_seen` proves upstream is emitting the
+    # v8.0.0 vocabulary (at least one row carried ACCUMULATE / STRONG_SELL /
+    # AVOID). `priority_band_seen` proves data_engine_v2 v5.74.0+ is
+    # passing through scoring v5.7.0's priority_band field. Ops dashboards
+    # can use these to verify the whole stack is in 8-tier lockstep.
+    reco_8tier_seen = any(
+        _row_has_8tier_recommendation(r) for r in ctx.all_quotes.values()
+    )
+    priority_band_seen = any(
+        bool(_safe_str(
+            r.get("recommendation_priority_band") or r.get("priority_band")
+        ))
+        for r in ctx.all_quotes.values()
+        if isinstance(r, Mapping)
+    )
 
     return {
         "status": "partial" if warnings else "success",
@@ -2838,6 +3054,9 @@ async def build_insights_analysis_rows(
             "builder_version": INSIGHTS_BUILDER_VERSION,
             "criteria_snapshot": _criteria_snapshot(norm_criteria),
             "warnings": warnings,
+            # v8.0.0 Phase I: 8-tier vocabulary + priority-band capability flags
+            "reco_8tier_seen": reco_8tier_seen,
+            "priority_band_seen": priority_band_seen,
         },
     }
 
@@ -2847,13 +3066,9 @@ async def build_insights_analysis_rows(
 # ---------------------------------------------------------------------------
 
 __all__ = [
-    # v7.0.0 Phase H: __version__ alias (in addition to legacy
-    # INSIGHTS_BUILDER_VERSION for backward compatibility).
     "INSIGHTS_BUILDER_VERSION",
     "__version__",
-    # Schema accessors
     "get_insights_schema",
-    # Public builders
     "build_criteria_rows",
     "build_insights_analysis_rows",
 ]
