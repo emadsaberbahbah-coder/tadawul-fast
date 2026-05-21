@@ -3,7 +3,7 @@
 """
 core/investment_advisor_engine.py
 ================================================================================
-INVESTMENT ADVISOR ENGINE — v4.4.2 (CANONICAL-BUCKET ROUTING via core.buckets v1.0.0)
+INVESTMENT ADVISOR ENGINE — v4.5.0 (8-TIER VOCABULARY + 106-COL FALLBACK)
 ================================================================================
 SYNC-EXPORT SAFE • ASYNC-INTERNAL • EXPORT-HARDENED • ROUTE-TOLERANT
 ENGINE-AWARE • PAGE-CATALOG NORMALIZED • TOP10-BUILDER FIRST
@@ -12,7 +12,172 @@ ADVISOR + SHEET-ROWS SAFE • JSON-SAFE • 502-RESISTANT • MATRIX/ROW-OBJECT 
 INSIGHTS-COLUMNS AWARE (v2.6.0+) • DECISION/CANDLESTICK AWARE (v2.7.0+) •
 CONVICTION-FLOOR DELEGATION (v7.2.0+) •
 CRITERIA-v3.1.0 HARD-FILTER DELEGATION (v4.4.1+, via top10_selector v4.13.0) •
-CANONICAL-BUCKET ROUTED (v4.4.2+, via core.buckets v1.0.0)
+CANONICAL-BUCKET ROUTED (v4.4.2+, via core.buckets v1.0.0) •
+8-TIER VOCABULARY ROUTED (v4.5.0+, via reco_normalize v8.0.0)
+
+================================================================================
+v4.5.0 changes (8-TIER VOCABULARY + 106-COL FALLBACK SCHEMA)
+================================================================================
+
+ADDITIVE STACK-ALIGNMENT PATCH. Closes the last 6-tier choke point in
+the advisor stack. Every other module in the TFB family is now on the
+8-tier canonical vocabulary:
+
+  - core.reco_normalize          v8.0.0   (8-tier canonical + 4 new RULE_IDs)
+  - core.scoring                 v5.7.0   (emits 8 tiers + priority_band)
+  - core.scoring_engine (bridge) v3.6.0   (re-exports contract versions)
+  - core.sheets.schema_registry  v2.11.0  (recommendation_detailed mirror)
+  - core.data_engine_v2          v5.76.0  (8-tier passthrough + sheet-compat
+                                           opt-in collapse)
+
+v4.4.2 was the lone holdout in the advisor stack:
+  - `RECO_*` imports pulled only 5 tokens (RECO_STRONG_BUY / RECO_BUY /
+    RECO_HOLD / RECO_REDUCE / RECO_SELL); the fallback when
+    reco_normalize was unimportable also only defined those 5.
+  - `_composite_to_recommendation` ladder only emitted 5 tiers
+    (STRONG_BUY / BUY / HOLD / REDUCE / SELL). When the view-aware
+    delegate was unavailable, the advisor produced a vocabulary that
+    diverged from what scoring v5.7.0, data_engine_v2 v5.76.0, and
+    schema_registry v2.11.0 documented.
+  - Fallback schema width was 97 columns; data_engine_v2 v5.74.0+
+    emits 106 columns. When the engine fell back, rows lost 9 fields
+    (provider_rating, recommendation_source,
+    recommendation_priority_band, scoring_recommendation_source,
+    scoring_schema_version, scoring_errors, opportunity_source,
+    overall_score_raw, overall_penalty_factor) downstream consumers
+    might be reading.
+  - No `view_aware_8tier_supported` meta flag to mirror the existing
+    `view_aware_conviction_supported` capability flag.
+
+v4.5.0 closes all four gaps additively. No removals; all v4.4.x /
+v4.3.0 / v4.2.0 symbols preserved by name.
+
+Phase-by-phase summary:
+-----------------------
+
+A. NARRATIVE SYNC. Header banner gains the "8-TIER VOCABULARY ROUTED
+   (v4.5.0+, via reco_normalize v8.0.0)" marker line. All cross-module
+   version references in this docstring updated to the current floor:
+     data_engine_v2  v5.60.0+ -> v5.76.0
+     reco_normalize  v7.2.0   -> v8.0.0
+     scoring         v5.2.5   -> v5.7.0
+     schema_registry v2.8.0   -> v2.11.0
+     scoring_engine  v3.4.2   -> v3.6.0
+   Older internal references (v4.4.x phase descriptions) remain
+   untouched — they document historical work.
+
+B. RECO_* IMPORTS EXPANDED. The try-import block now requests the 3
+   new tokens introduced by reco_normalize v8.0.0:
+     RECO_STRONG_SELL    (was inferred via _composite ladder as
+                          last-resort "SELL"; now a first-class tier)
+     RECO_ACCUMULATE     (NEW; sits between BUY and HOLD — scale-in
+                          / moderate-bullish call)
+     RECO_AVOID          (NEW; sits below STRONG_SELL — uninvestable
+                          / hard pass; shares priority_band P1 with
+                          STRONG_SELL for urgency)
+   The ImportError fallback defines all 8 tokens as string literals so
+   the module loads cleanly when reco_normalize is absent. A new
+   `_RECO_8TIER_AVAILABLE` flag (mirrors the existing `_BUCKETS_AVAILABLE`
+   / `_VIEW_AWARE_AVAILABLE` pattern) is True iff all 8 RECO_* tokens
+   resolved successfully from the live module.
+
+C. COMPOSITE LADDER EXPANDED 5-TIER -> 8-TIER. `_composite_to_recommendation`
+   now emits all 8 canonical tiers when the view-aware delegate is
+   unavailable. Thresholds chosen to be coarse but vocabulary-complete:
+     composite >= 80   -> STRONG_BUY
+     composite >= 70   -> BUY
+     composite >= 60   -> ACCUMULATE   (NEW; v4.4.2 collapsed to BUY)
+     composite >= 45   -> HOLD
+     composite >= 35   -> REDUCE
+     composite >= 20   -> SELL
+     composite >= 10   -> STRONG_SELL  (NEW; v4.4.2 collapsed to SELL)
+     composite <  10   -> AVOID        (NEW)
+   The view-aware delegate (reco_normalize v8.0.0+) remains the
+   PRIMARY recommendation source — it already understands the full
+   8-tier vocabulary and runs first via `_score_recommendation`. The
+   composite ladder is only the LAST-RESORT fallback when the
+   delegate is genuinely unimportable, so its specific thresholds
+   only affect deployments without reco_normalize.
+
+D. FALLBACK SCHEMA EXPANDED 97 -> 106 COLS. The 9 cascade-bridge +
+   scoring-provenance fields data_engine_v2 v5.74.0+ added are now
+   appended to `_GENERIC_FALLBACK_KEYS` / `_GENERIC_FALLBACK_HEADERS`
+   between the existing Provenance group and the Insights group:
+     provider_rating               -> "Provider Rating"
+     recommendation_source         -> "Recommendation Source"
+     recommendation_priority_band  -> "Priority Band"
+     scoring_recommendation_source -> "Scoring Reco Source"
+     scoring_schema_version        -> "Scoring Schema Version"
+     scoring_errors                -> "Scoring Errors"
+     opportunity_source            -> "Opportunity Source"
+     overall_score_raw             -> "Overall Score (Raw)"
+     overall_penalty_factor        -> "Overall Penalty Factor"
+   This brings the advisor fallback in line with data_engine_v2
+   v5.76.0's canonical 106-field contract. Top_10_Investments
+   auto-derives to 109 cols (106 + 3 extras). POSITION-AWARE callers
+   that hardcoded v4.4.x's fallback indices 86-90 (the Insights group)
+   will see those fields shift to positions 95-99 — KEY-AWARE callers
+   (the recommended pattern) are unaffected.
+
+E. ALIAS HINTS EXPANDED FOR THE 9 NEW FIELDS. Cross-vendor + camelCase
+   variants are folded into the canonical names by
+   `_row_value_for_aliases`:
+     provider_rating:               ["providerRating", "provider_recommendation"]
+     recommendation_source:         ["recommendationSource", "reco_source"]
+     recommendation_priority_band:  ["priority_band", "recoPriorityBand"]
+     scoring_recommendation_source: ["scoringRecommendationSource",
+                                     "scoring_source"]
+     scoring_schema_version:        ["scoringSchemaVersion"]
+     opportunity_source:            ["opportunitySource"]
+     overall_score_raw:             ["overallScoreRaw", "overall_raw"]
+     overall_penalty_factor:        ["overallPenaltyFactor",
+                                     "penalty_factor"]
+     scoring_errors:                (already present in v4.4.0 Phase C;
+                                     no change)
+
+F. META CAPABILITY FLAGS EXPANDED. `_normalize_engine_result` meta
+   now carries:
+     view_aware_8tier_supported  : bool (NEW v4.5.0) — does the
+                                   view-aware delegate AND the
+                                   reco_normalize module both support
+                                   the full 8-tier vocabulary? True
+                                   iff _VIEW_AWARE_AVAILABLE AND
+                                   _RECO_8TIER_AVAILABLE.
+     reco_8tier_available        : bool (NEW v4.5.0) — were all 8
+                                   RECO_* tokens imported successfully?
+   These mirror the existing `view_aware_conviction_supported`
+   capability flag, giving an ops dashboard a single endpoint to
+   verify the whole stack is in 8-tier lockstep.
+
+G. VERSION BUMP 4.4.2 -> 4.5.0. Minor bump because the public
+   _composite_to_recommendation surface changed (returns a wider set
+   of tokens) and the fallback schema width changed. `__version__`
+   alias auto-tracks. `__all__` unchanged (no new public symbols).
+
+PRESERVED VERBATIM FROM v4.4.2:
+  - All v4.4.2 core.buckets v1.0.0 bucket-routing behavior
+    (`_risk_bucket_from_row` / `_confidence_bucket_from_row`)
+  - All v4.4.1 / v4.4.0 / v4.3.0 / v4.2.0 architectural deltas
+  - `_score_recommendation` v4.4.0 Phase D conviction-aware delegation
+    (still passes `conviction_score` to reco_normalize v8.0.0+; v8.0.0
+    accepts it via the same kwarg as v7.2.0)
+  - All public API surfaces, factory functions, sync wrappers
+  - Snapshot cache + status="warn" handling
+  - Engine resolution order (delegates DOWN to data_engine_v2, never
+    UP to the orchestrator, never to itself)
+
+DEPLOYMENT NOTE.
+  Default behavior changes: when scoring v5.7.0 emits ACCUMULATE or
+  AVOID (now passed through by data_engine_v2 v5.76.0), the advisor
+  no longer collapses those tokens in any path. Operators whose
+  downstream renderers (Apps Script 04_Format.gs) haven't been
+  updated to handle the new tokens have two options:
+    (1) Update 04_Format.gs to render ACCUMULATE / AVOID natively,
+        then land this engine — the recommended path.
+    (2) Set TFB_COLLAPSE_RECOMMENDATION_TO_6TIER=true on the Render
+        service. This is the data_engine_v2 v5.76.0 env opt-in that
+        collapses the tokens at the engine boundary. The advisor will
+        then receive only the legacy 6 tokens and proceed unchanged.
 
 ================================================================================
 v4.4.2 changes (CANONICAL-BUCKET ROUTING via core.buckets v1.0.0)
@@ -363,14 +528,24 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-INVESTMENT_ADVISOR_ENGINE_VERSION = "4.4.2"
+INVESTMENT_ADVISOR_ENGINE_VERSION = "4.5.0"
 # v4.4.0 Phase E: TFB module-version convention alias (mirrors scoring
-# v5.2.5, reco_normalize v7.2.0, insights_builder v7.0.0, scoring_engine
-# v3.4.2, top10_selector v4.13.0, criteria_model v3.1.0, schema_registry
-# v2.8.0, core.buckets v1.0.0).
+# v5.7.0, reco_normalize v8.0.0, insights_builder v7.0.0, scoring_engine
+# v3.6.0, top10_selector v4.13.0, criteria_model v3.1.0, schema_registry
+# v2.11.0, core.buckets v1.0.0, data_engine_v2 v5.76.0).
 # v4.4.1: top10_selector advanced 4.11.0 -> 4.12.0; alignment updated here.
 # v4.4.2: _risk_bucket_from_row / _confidence_bucket_from_row routed
 # through core.buckets v1.0.0 (canonical bucket helper).
+# v4.5.0: 8-tier vocabulary alignment with scoring v5.7.0 + reco_normalize
+# v8.0.0 + data_engine_v2 v5.76.0. ACCUMULATE and AVOID tokens are now
+# first-class everywhere in the advisor stack:
+#   - RECO_STRONG_SELL / RECO_ACCUMULATE / RECO_AVOID imported (with
+#     string-literal fallbacks when reco_normalize v8.0.0 is unavailable)
+#   - _composite_to_recommendation expanded from 5 tiers to 8 tiers
+#   - 9 cascade-bridge + scoring-provenance fields added to the fallback
+#     schema (97 -> 106 cols; matches data_engine_v2 v5.76.0 canonical)
+#   - 9 alias entries added to _FIELD_ALIAS_HINTS for those fields
+#   - view_aware_8tier_supported and reco_8tier_available meta flags
 __version__ = INVESTMENT_ADVISOR_ENGINE_VERSION
 
 
@@ -378,20 +553,59 @@ __version__ = INVESTMENT_ADVISOR_ENGINE_VERSION
 # Recommendation Constants
 # =============================================================================
 
+# v4.5.0: 8-tier vocabulary alignment with reco_normalize v8.0.0. The
+# v8.0.0 release added three new canonical tokens:
+#   RECO_ACCUMULATE     — moderate-bullish / scale-in (between BUY and HOLD)
+#   RECO_STRONG_SELL    — strongly bearish (between SELL and AVOID)
+#   RECO_AVOID          — uninvestable / hard pass (below STRONG_SELL)
+# These are first-class tiers throughout scoring v5.7.0, data_engine_v2
+# v5.76.0, and schema_registry v2.11.0. The advisor needs to recognise
+# them so it can (a) re-emit them when downstream consumers ask for
+# recommendation routing, (b) detect at runtime whether the full 8-tier
+# vocabulary is wired (via _RECO_8TIER_AVAILABLE) and surface that
+# capability in result meta.
+#
+# Import strategy: try-import all 8 tokens. If reco_normalize v8.0.0 is
+# unimportable OR is the legacy v7.x release that lacks the new tokens,
+# define the missing names as string literals so module load never
+# fails. _RECO_8TIER_AVAILABLE tracks whether all 8 imports resolved
+# from the live module (vs. fell back to string literals).
+_RECO_8TIER_AVAILABLE: bool = False
 try:
     from core.reco_normalize import (  # type: ignore
         RECO_STRONG_BUY,
         RECO_BUY,
+        RECO_ACCUMULATE,
         RECO_HOLD,
         RECO_REDUCE,
         RECO_SELL,
+        RECO_STRONG_SELL,
+        RECO_AVOID,
     )
+    _RECO_8TIER_AVAILABLE = True
 except ImportError:
-    RECO_STRONG_BUY = "STRONG_BUY"
-    RECO_BUY = "BUY"
-    RECO_HOLD = "HOLD"
-    RECO_REDUCE = "REDUCE"
-    RECO_SELL = "SELL"
+    # Legacy v7.x reco_normalize (5 tokens) OR module entirely absent.
+    # Try the legacy 5-token import; fall back to string literals for
+    # whichever tokens are missing.
+    try:
+        from core.reco_normalize import (  # type: ignore
+            RECO_STRONG_BUY,
+            RECO_BUY,
+            RECO_HOLD,
+            RECO_REDUCE,
+            RECO_SELL,
+        )
+    except ImportError:
+        RECO_STRONG_BUY = "STRONG_BUY"
+        RECO_BUY = "BUY"
+        RECO_HOLD = "HOLD"
+        RECO_REDUCE = "REDUCE"
+        RECO_SELL = "SELL"
+    # The 3 v8.0.0 additions — string literals when reco_normalize lacks them.
+    RECO_ACCUMULATE = "ACCUMULATE"
+    RECO_STRONG_SELL = "STRONG_SELL"
+    RECO_AVOID = "AVOID"
+    _RECO_8TIER_AVAILABLE = False
 
 
 # =============================================================================
@@ -635,7 +849,7 @@ TOP10_BUILDER_FN_CANDIDATES = (
 
 
 # =============================================================================
-# Canonical fallback schemas — aligned with core.sheets.schema_registry v2.8.0
+# Canonical fallback schemas — aligned with core.sheets.schema_registry v2.11.0
 # =============================================================================
 #
 # v4.4.0 Phase B: 97 instrument columns (was 90 in v4.3.0). Added 7
@@ -646,22 +860,32 @@ TOP10_BUILDER_FN_CANDIDATES = (
 # INSIDE the Scores group (positions 66-67), BEFORE Views. v4.3.0 had
 # them AFTER Views in a "Composite ranking" group at positions 70-71.
 #
-# Column groups and counts (running total):
-#   Identity (8)       ->  8
-#   Price (10)         -> 18
-#   Liquidity (6)      -> 24
-#   Fundamentals (12)  -> 36
-#   Risk (8)           -> 44
-#   Valuation (7)      -> 51
-#   Forecast (9)       -> 60
-#   Scores (7)         -> 67   (v4.4.0: includes opportunity + rank_overall)
-#   Views (4)          -> 71
-#   Recommendation (4) -> 75
-#   Portfolio (6)      -> 81
-#   Provenance (4)     -> 85
-#   Insights (5)       -> 90
-#   Decision (2)       -> 92   (NEW in v4.4.0; aligned with v2.7.0+)
-#   Candlestick (5)    -> 97   (NEW in v4.4.0; aligned with v2.7.0+)
+# v4.5.0: 106 instrument columns (was 97 in v4.4.x). Added 9 fields
+# between the Provenance group and the Insights group, mirroring
+# data_engine_v2 v5.74.0+'s canonical contract. Insights / Decision /
+# Candlestick blocks shift to positions 95-99 / 100-101 / 102-106.
+# KEY-AWARE callers unaffected; POSITION-AWARE callers reading from
+# index >=86 will see a shift of +9.
+#
+# Column groups and counts (running total) for v4.5.0:
+#   Identity (8)                    ->   8
+#   Price (10)                      ->  18
+#   Liquidity (6)                   ->  24
+#   Fundamentals (12)               ->  36
+#   Risk (8)                        ->  44
+#   Valuation (7)                   ->  51
+#   Forecast (9)                    ->  60
+#   Scores (7)                      ->  67
+#   Views (4)                       ->  71
+#   Recommendation (4)              ->  75
+#   Portfolio (6)                   ->  81
+#   Provenance (4)                  ->  85
+#   Cascade-bridge + provenance (9) ->  94   (NEW in v4.5.0)
+#   Insights (5)                    ->  99
+#   Decision (2)                    -> 101
+#   Candlestick (5)                 -> 106
+#
+# Top_10_Investments auto-derives to 109 cols (106 + 3 extras).
 
 _GENERIC_FALLBACK_KEYS: List[str] = [
     # Identity (8)
@@ -698,6 +922,18 @@ _GENERIC_FALLBACK_KEYS: List[str] = [
     "unrealized_pl", "unrealized_pl_pct",
     # Provenance (4)
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    # Cascade-bridge + Scoring-provenance (9) — v4.5.0 (NEW); aligned with
+    # data_engine_v2 v5.74.0+ / v5.76.0 canonical contract. These fields
+    # carry recommendation provenance (which provider/scoring path
+    # produced the row's recommendation), the priority band classifier
+    # (P1..P5 urgency tier from scoring v5.7.0), the scoring schema
+    # version + error list, the opportunity-source indicator, and the
+    # raw vs. penalty-adjusted overall score so downstream consumers
+    # (top10_selector v4.13.0, insights_builder v7.0.0) can audit the
+    # cascade. data_engine_v2 v5.76.0 emits all 9 unconditionally.
+    "provider_rating", "recommendation_source", "recommendation_priority_band",
+    "scoring_recommendation_source", "scoring_schema_version", "scoring_errors",
+    "opportunity_source", "overall_score_raw", "overall_penalty_factor",
     # Insights (5) — Wave 3 / v2.6.0, produced by core.scoring v5.2.5 as
     # row fields (sector_relative_score additionally uses an optional
     # sector cohort; the other four are derived from the fully-scored row).
@@ -748,6 +984,10 @@ _GENERIC_FALLBACK_HEADERS: List[str] = [
     "Unrealized P/L", "Unrealized P/L %",
     # Provenance (4)
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    # Cascade-bridge + Scoring-provenance (9) — v4.5.0 (NEW)
+    "Provider Rating", "Recommendation Source", "Priority Band",
+    "Scoring Reco Source", "Scoring Schema Version", "Scoring Errors",
+    "Opportunity Source", "Overall Score (Raw)", "Overall Penalty Factor",
     # Insights (5)
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
     # Decision Matrix (2) — v4.4.0 Phase B
@@ -900,6 +1140,39 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     ],
     "scoring_errors": [
         "scoringErrors", "scoring_error_list",
+    ],
+    # v4.5.0 NEW: cascade-bridge + scoring-provenance aliases.
+    # These mirror data_engine_v2 v5.74.0+'s alias map so the advisor's
+    # `_row_value_for_aliases` can fold cross-vendor / camelCase variants
+    # into the canonical names even when an upstream emitter uses a
+    # different casing convention.
+    "provider_rating": [
+        "providerRating", "provider_recommendation", "providerRecommendation",
+    ],
+    "recommendation_source": [
+        "recommendationSource", "reco_source", "recoSource",
+    ],
+    "recommendation_priority_band": [
+        "recommendationPriorityBand", "priority_band", "priorityBand",
+        "recoPriorityBand",
+    ],
+    "scoring_recommendation_source": [
+        "scoringRecommendationSource", "scoring_source", "scoringSource",
+        "scoring_reco_source",
+    ],
+    "scoring_schema_version": [
+        "scoringSchemaVersion", "scoring_schema_ver",
+    ],
+    "opportunity_source": [
+        "opportunitySource", "opp_source", "oppSource",
+    ],
+    "overall_score_raw": [
+        "overallScoreRaw", "overall_raw", "overallRaw",
+        "raw_overall_score",
+    ],
+    "overall_penalty_factor": [
+        "overallPenaltyFactor", "penalty_factor", "penaltyFactor",
+        "overall_penalty",
     ],
 }
 
@@ -2167,20 +2440,44 @@ def _resolve_roi_for_scoring(row: Mapping[str, Any], horizon: str = "3m") -> Opt
 
 
 def _composite_to_recommendation(composite: float) -> Tuple[str, str]:
-    """v4.2.0: only used as fallback when reco_normalize is unavailable.
+    """v4.5.0: Last-resort fallback when reco_normalize is unavailable.
 
-    Same threshold buckets as v4.1.0 — composite-based, NOT view-aware.
-    Kept symmetric with advisor v5.1.1 fallback path.
+    Composite-based, NOT view-aware. v4.5.0 expands the ladder from
+    5 tiers to 8 tiers to align with the canonical vocabulary emitted
+    by reco_normalize v8.0.0 / scoring v5.7.0 / data_engine_v2 v5.76.0:
+
+      composite >= 80   -> STRONG_BUY    (high score / strong upside)
+      composite >= 70   -> BUY           (favorable / scale-in)
+      composite >= 60   -> ACCUMULATE    (NEW v4.5.0; moderate-bullish)
+      composite >= 45   -> HOLD          (balanced / wait for confirmation)
+      composite >= 35   -> REDUCE        (weak / elevated risk)
+      composite >= 20   -> SELL          (unfavorable risk-reward)
+      composite >= 10   -> STRONG_SELL   (NEW v4.5.0; strongly bearish)
+      composite <  10   -> AVOID         (NEW v4.5.0; uninvestable)
+
+    Note: this fallback path is only reached when the view-aware
+    delegate (reco_normalize.recommendation_from_views) is genuinely
+    unimportable. In the normal deployment with reco_normalize v8.0.0
+    available, `_score_recommendation` delegates to the view-aware
+    function which already understands all 8 tiers natively.
+
+    v4.4.x preserved verbatim from v4.1.0 thresholds (5-tier).
     """
-    if composite >= 70:
+    if composite >= 80:
         return RECO_STRONG_BUY, "High score / attractive upside"
-    if composite >= 55:
+    if composite >= 70:
         return RECO_BUY, "Favorable score / acceptable risk"
+    if composite >= 60:
+        return RECO_ACCUMULATE, "Moderate-bullish / scale-in candidate"
     if composite >= 45:
         return RECO_HOLD, "Balanced score / wait for confirmation"
-    if composite >= 30:
+    if composite >= 35:
         return RECO_REDUCE, "Weak score / elevated risk"
-    return RECO_SELL, "Low score / unfavorable risk-reward"
+    if composite >= 20:
+        return RECO_SELL, "Low score / unfavorable risk-reward"
+    if composite >= 10:
+        return RECO_STRONG_SELL, "Very low score / strong bearish signal"
+    return RECO_AVOID, "Extremely weak score / uninvestable"
 
 
 def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
@@ -2823,6 +3120,19 @@ async def _normalize_engine_result(
             # consistent with data_engine_v2 v5.69.0+, top10_selector
             # v4.13.0+, and the advisor orchestrator v5.3.2+.
             "buckets_canonical": _BUCKETS_AVAILABLE,
+            # v4.5.0: 8-tier vocabulary availability. `reco_8tier_available`
+            # signals whether all 8 RECO_* tokens were imported from a live
+            # reco_normalize module (v8.0.0+). `view_aware_8tier_supported`
+            # additionally requires the view-aware delegate to be resolved
+            # — when True, downstream consumers can rely on the engine to
+            # emit ACCUMULATE / STRONG_SELL / AVOID via the view-aware
+            # path. When False, the advisor still recognises all 8 tokens
+            # (via string-literal fallbacks) but can only emit them
+            # through `_composite_to_recommendation`'s last-resort ladder.
+            "reco_8tier_available": _RECO_8TIER_AVAILABLE,
+            "view_aware_8tier_supported": (
+                _VIEW_AWARE_AVAILABLE and _RECO_8TIER_AVAILABLE
+            ),
             "timestamp_utc": _now_utc_iso(),
             "offset": max(0, _to_int(offset, DEFAULT_OFFSET)),
             "limit": max(1, _to_int(limit, DEFAULT_LIMIT)),
