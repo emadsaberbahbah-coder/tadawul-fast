@@ -2,8 +2,74 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.9
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.11
 ================================================================================
+
+WHY v5.77.11 - DYNAMIC DIAGNOSTIC LABELS (COSMETIC, NO FUNCTIONAL CHANGE)
+------------------------------------------------------------------------
+v5.77.11 addresses the lone cosmetic note from the v5.77.10 audit: the
+CLASSIFIER and RANK diagnostic log labels were hard-coded as
+`[v5.77.6 CLASSIFIER]` and `[v5.77.6 RANK]` since their introduction.
+Every version bump from v5.77.7 through v5.77.10 widened the gap between
+the module-load banner version and the diagnostic label version, making
+Render logs read confusingly like
+
+    [engine_v2 v5.77.10] module loaded; canonical_schema=107
+    [v5.77.6 RANK] total=140 scored=140 skipped_no_score=0
+
+The labels are now interpolated from __version__, so they automatically
+track the deployed engine version. After v5.77.11 deploys you'll see:
+
+    [engine_v2 v5.77.11] module loaded; canonical_schema=107
+    [v5.77.11 RANK] total=140 scored=140 skipped_no_score=0
+    [v5.77.11 CLASSIFIER] sym=AAPL rec=BUY detail=BUY src=... band=P2 ...
+
+Why dynamic instead of literal `v5.77.11`: future version bumps no longer
+need to remember to update these strings. The historical WHY blocks below
+still reference [v5.77.6 CLASSIFIER] / [v5.77.6 RANK] because those
+identify WHEN the diagnostics were added — that's accurate v5.77.6
+history, not a current-runtime label.
+
+No functional change. All v5.77.6 through v5.77.10 behavior preserved.
+
+WHY v5.77.10 - YAHOO NEEDS-CHECK FULLY NARROWED TO CANONICAL CORE FUNDAMENTALS
+-----------------------------------------------------------------------------
+v5.77.10 closes the perf gap the v5.77.9 audit caught. v5.77.9 narrowed the
+Yahoo needs-check by removing engine-computed forecast fields, but the post-
+v5.77.9 audit pointed out it still left in nine Yahoo-only fields that:
+  - are NOT in the 107-field canonical schema, and
+  - are NEVER populated by non-Yahoo providers (EODHD, Finnhub, Tadawul,
+    Argaam, etc.) so they're persistently missing on every row.
+
+Because _row_needs_yahoo_enrichment() uses any(), one persistently-missing
+field is enough to flip `needs_fund` to True on every refresh. With those
+nine fields included, EVERY row triggered a Yahoo fundamentals call — even
+rows with fully-populated core fundamentals — defeating the v5.77.9 fix.
+
+The nine offenders removed in v5.77.10:
+  shares_outstanding, eps_forward, roe, roa, earnings_growth_yoy,
+  target_mean_price, target_high_price, target_low_price, analyst_count
+
+The v5.77.10 needs-check is now exactly 24 canonical core fundamentals that
+any reasonable provider supplies (identity/classification, market structure
+floats, P/E + EPS + dividend, margins, debt, revenue, cash flow, P/B + P/S +
+PEG + EV/EBITDA). When the row has these populated, Yahoo isn't called.
+
+The FILTER list (`_YAHOO_FUNDAMENTAL_FIELDS`, broad) is unchanged — Yahoo
+analyst-target enrichment etc. still flows through when Yahoo IS called.
+
+VERIFICATION
+------------
+A realistic EODHD-style row (full core fundamentals, no Yahoo-only extras)
+now returns `needs_fund=False`. The v5.77.9 synthetic-overpopulated test
+that "passed" was misleading; the v5.77.10 test uses a realistic shape.
+
+DEPLOYMENT
+----------
+After deploy, the Render startup log should show:
+  [engine_v2 v5.77.10] module loaded; canonical_schema=107
+
+All v5.77.6 / v5.77.7 / v5.77.8 / v5.77.9 fixes are preserved.
 
 WHY v5.77.9 - YAHOO NEEDS-CHECK NARROWED + ROUTE-DISCIPLINE DOCS
 ---------------------------------------------------------------
@@ -285,7 +351,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.77.9"
+__version__ = "5.77.11"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -508,34 +574,41 @@ _YAHOO_FUNDAMENTAL_FIELDS: Tuple[str, ...] = (
     "analyst_count", "recommendation",
 )
 
-# v5.77.9: NARROWER subset used by _row_needs_yahoo_enrichment() to decide
-# whether to call Yahoo for fundamentals. The full _YAHOO_FUNDAMENTAL_FIELDS
-# set (above) is correct for the post-canon FILTER pass — it lists every
-# field the filter is willing to accept from a Yahoo response. But it's the
-# WRONG set for the needs-check, because v5.77.8 added engine-computed
-# forecast/ROI fields (forecast_price_*m, expected_roi_*m, forecast_source).
-# Those fields are intentionally absent at enrichment time — they're produced
-# later by _phase_ii_quality_forecast inside _apply_phase_dd_enhancements.
-# Including them in the needs-check makes the function report "needs Yahoo"
-# for EVERY row, including rows that already have complete fundamentals.
-# Result: a Yahoo round-trip per symbol on every refresh of a 140-row page,
-# even when no Yahoo data was actually missing.
+# v5.77.9 + v5.77.10: NARROWER subset used by _row_needs_yahoo_enrichment() to
+# decide whether to call Yahoo for fundamentals. The full _YAHOO_FUNDAMENTAL_FIELDS
+# set (above) is correct for the post-canon FILTER pass — it lists every field
+# the filter is willing to accept from a Yahoo response. But it's the WRONG set
+# for the needs-check.
 #
-# v5.77.9 fixes this by checking only fields that are genuinely PROVIDER-
-# sourced (not engine-computed): identity/classification, market structure,
-# fundamentals ratios, growth/margins, and analyst targets (raw names only,
-# since the canonical forecast_price_*m names are reserved for engine output).
+# v5.77.9 removed engine-computed forecast fields (forecast_price_*m,
+# expected_roi_*m, forecast_source) — those are produced LATER in the pipeline
+# by _phase_ii_quality_forecast and are intentionally absent at enrichment time.
+#
+# v5.77.10 goes further: also removes Yahoo-only fields that are NOT in the
+# 107-field canonical schema and are NEVER populated by non-Yahoo providers
+# like EODHD / Finnhub / Tadawul / Argaam. The post-v5.77.9 audit caught that
+# the v5.77.9 list still included nine such fields:
+#     shares_outstanding, eps_forward, roe, roa, earnings_growth_yoy,
+#     target_mean_price, target_high_price, target_low_price, analyst_count
+# Because _row_needs_yahoo_enrichment uses any(), a single persistently-missing
+# field is enough to flip needs_fund to True on every refresh. With those nine
+# included, EVERY row triggered a Yahoo call — even rows with fully-populated
+# core fundamentals — defeating the entire v5.77.9 perf fix.
+#
+# The list below is the auditor's recommendation: 24 canonical core fundamentals
+# that any reasonable provider supplies. If these are populated, the row has
+# enough data; Yahoo isn't called. The FILTER list below still accepts all the
+# Yahoo extras when Yahoo IS called, so legitimate analyst-target enrichment
+# still flows through.
 _YAHOO_FUNDAMENTAL_NEEDS_CHECK_FIELDS: Tuple[str, ...] = (
     "industry", "sector", "currency", "country", "name",
-    "market_cap", "float_shares", "shares_outstanding",
-    "pe_ttm", "pe_forward", "eps_ttm", "eps_forward",
+    "market_cap", "float_shares",
+    "pe_ttm", "pe_forward", "eps_ttm",
     "dividend_yield", "payout_ratio", "beta_5y",
     "gross_margin", "operating_margin", "profit_margin",
     "debt_to_equity", "revenue_ttm", "revenue_growth_yoy",
-    "free_cash_flow_ttm", "roe", "roa", "earnings_growth_yoy",
+    "free_cash_flow_ttm",
     "pb_ratio", "ps_ratio", "peg_ratio", "ev_ebitda",
-    "target_mean_price", "target_high_price", "target_low_price",
-    "analyst_count",
 )
 
 _YAHOO_CHART_FIELDS: Tuple[str, ...] = (
@@ -1178,12 +1251,16 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     row["recommendation_priority"] = _recommendation_priority(rec)
     row["recommendation_priority_band"] = priority_band  # may be ""; that is fine
 
-    # -- v5.77.6 PATCH 4a: diagnostic log line on Step 4 atomic write
-    # Gated behind INFO level so cost is ~zero at WARNING/ERROR.
+    # -- v5.77.6 PATCH 4a (label made dynamic in v5.77.11): diagnostic log line
+    # on Step 4 atomic write. Gated behind INFO level so cost is ~zero at
+    # WARNING/ERROR. The label embeds __version__ so it always reflects the
+    # deployed engine version (was hard-coded "v5.77.6" through v5.77.10 —
+    # see audit note on stale label tags).
     if logger.isEnabledFor(logging.INFO):
         try:
             logger.info(
-                "[v5.77.6 CLASSIFIER] sym=%s rec=%s detail=%s src=%s band=%s prio=%s prov_rating=%s",
+                "[v%s CLASSIFIER] sym=%s rec=%s detail=%s src=%s band=%s prio=%s prov_rating=%s",
+                __version__,
                 _safe_str(row.get("symbol") or row.get("requested_symbol"), "?"),
                 rec, rec, source, priority_band,
                 _recommendation_priority(rec),
@@ -4244,14 +4321,16 @@ def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
         rows[idx]["rank_overall"] = rank
 
     # v5.77.6 RANK observability — emit once per call, gated on INFO.
+    # v5.77.11: label is now dynamic via __version__ so it always reflects
+    # the deployed engine version.
     if logger.isEnabledFor(logging.INFO):
         try:
             total = len(rows) if rows is not None else 0
             scored_count = len(scored)
             skipped_no_score = total - scored_count
             logger.info(
-                "[v5.77.6 RANK] total=%d scored=%d skipped_no_score=%d",
-                total, scored_count, skipped_no_score,
+                "[v%s RANK] total=%d scored=%d skipped_no_score=%d",
+                __version__, total, scored_count, skipped_no_score,
             )
         except Exception:
             pass
@@ -4725,7 +4804,7 @@ class _EngineSymbolsReaderProxy:
 # DataEngineV5 — the main orchestrator
 # =============================================================================
 class DataEngineV5:
-    """Global-first data orchestrator (v5.77.9)."""
+    """Global-first data orchestrator (v5.77.11)."""
 
     def __init__(
         self,
@@ -5816,7 +5895,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.77.9",  # v5.77.9: Yahoo needs-check narrowed (avoid over-trigger from engine-computed forecasts)
+                "version": "v5.77.11",  # v5.77.11: dynamic diagnostic-label versions (cosmetic)
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
@@ -5990,18 +6069,18 @@ __all__ = [
 
 
 # =============================================================================
-# v5.77.9 module-load INFO banner
+# v5.77.11 module-load INFO banner
 # -----------------------------------------------------------------------------
 # Emitted exactly once when this module is loaded. Confirms in the Render
-# startup log that v5.77.9 is actually live — if the banner shows an older
-# version (or doesn't appear at all), the deploy didn't pick up the new file
-# and the bug-fix patches aren't active.
+# startup log that v5.77.11 is actually live. Uses __version__ so this label
+# is also automatically in sync with the constant — same approach now used
+# by the CLASSIFIER and RANK diagnostic logs (see v5.77.11 WHY block).
 # =============================================================================
 if logger.isEnabledFor(logging.INFO):
     try:
         logger.info(
-            "[engine_v2 v5.77.9] module loaded; canonical_schema=%d",
-            len(INSTRUMENT_CANONICAL_KEYS),
+            "[engine_v2 v%s] module loaded; canonical_schema=%d",
+            __version__, len(INSTRUMENT_CANONICAL_KEYS),
         )
     except Exception:
         pass
