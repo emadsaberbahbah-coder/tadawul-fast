@@ -2,8 +2,104 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.7
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.9
 ================================================================================
+
+WHY v5.77.9 - YAHOO NEEDS-CHECK NARROWED + ROUTE-DISCIPLINE DOCS
+---------------------------------------------------------------
+v5.77.9 closes the last performance footnote from the v5.77.8 audit and
+hardens the engine's docs against a route-side trap that no engine-side
+fix can eliminate.
+
+  Fix 1 - YAHOO ENRICHMENT OVER-TRIGGER (perf regression introduced in v5.77.8)
+    To make Yahoo enrichment actually fill data, v5.77.8 widened
+    _YAHOO_FUNDAMENTAL_FIELDS to include canonical forecast names
+    (forecast_price_1m / forecast_price_3m / forecast_price_12m, plus
+    expected_roi_*m and forecast_source). That was correct for the
+    post-canon FILTER pass — those names are how the Yahoo response lands
+    after _canonicalize_provider_row() runs.
+    BUT _row_needs_yahoo_enrichment() uses the same whitelist to decide
+    whether to call Yahoo at all. Forecast fields are engine-computed
+    LATER in the pipeline (by _phase_ii_quality_forecast inside
+    _apply_phase_dd_enhancements), so they're guaranteed missing at
+    enrichment time. The result: every row reports `needs_fund=True`
+    regardless of whether actual fundamentals are missing, and Yahoo
+    gets a round-trip per symbol on every refresh of a 140-row page.
+    Fix: introduce _YAHOO_FUNDAMENTAL_NEEDS_CHECK_FIELDS — the same
+    whitelist with forecast / ROI / forecast_source removed — and use it
+    only in the needs-check. The full _YAHOO_FUNDAMENTAL_FIELDS set still
+    gates the filter pass. Net effect: Yahoo is called only when actual
+    provider-sourced fundamentals are missing.
+
+  Doc 1 - ROUTE-DISCIPLINE WARNING ON ENGINE ALIASES
+    The v5.77.8 audit's remaining caveat: even after `get_engine()` syncs
+    `ENGINE` / `engine` / `_ENGINE`, a route doing
+        from core.data_engine_v2 import ENGINE
+    at module load captures `None` and never sees the update. This is
+    Python import semantics, not an engine bug — no fix exists on this
+    side. v5.77.9 adds an unmissable comment block on the alias
+    declarations explaining the trap, showing the correct async + sync
+    access patterns, and explicitly calling out the import form to AVOID.
+    Anyone reading the engine to learn how to use it will see this
+    warning at the same time they see the names.
+
+DEPLOYMENT
+----------
+After deploy, the Render startup log should show:
+  [engine_v2 v5.77.9] module loaded; canonical_schema=107
+
+All v5.77.6 / v5.77.7 / v5.77.8 fixes are preserved. The CLASSIFIER + RANK
+diagnostic logs still emit; per-symbol enrichment failures still warn-log
+and produce degraded-but-projectable rows.
+
+WHY v5.77.8 - YAHOO CANONICALIZATION + ENGINE ALIAS SYNC + DEGRADED-ROW DEFAULTS
+-------------------------------------------------------------------------------
+v5.77.8 addresses four polish items the post-v5.77.7 audit caught. None of them
+were runtime blockers, but each one weakened the engine's effective behavior:
+
+  Fix 1 - YAHOO ENRICHMENT EFFECTIVENESS (silent no-op for most fields)
+    v5.77.7 fixed the Yahoo TypeError chain, but the enrichment pass still
+    filtered the RAW Yahoo response (camelCase: `marketCap`, `trailingPE`,
+    `targetMeanPrice`, `shortName`) against a whitelist using CANONICAL names
+    (`market_cap`, `pe_ttm`, `target_mean_price`, `name`). Nearly every key
+    Yahoo returned was discarded before reaching the row. Fix: run each
+    patch through `_canonicalize_provider_row()` first — the same path
+    every other provider uses — so the whitelist sees snake_case keys.
+    Effect: Yahoo fundamentals + chart enrichment now actually fills the
+    fields it's supposed to fill.
+
+  Fix 2 - MODULE-LEVEL ENGINE ALIAS DRIFT (legacy imports got permanent None)
+    `ENGINE = _ENGINE_INSTANCE` / `engine = _ENGINE_INSTANCE` / `_ENGINE = _ENGINE_INSTANCE`
+    were bound at module load time, when `_ENGINE_INSTANCE` was still None.
+    They never updated when `get_engine()` later instantiated the engine, so
+    any route doing `from core.data_engine_v2 import ENGINE` got a permanent
+    `None`. Fix: `get_engine()` now updates the aliases under the same lock
+    that creates `_ENGINE_INSTANCE`; `close_engine()` clears them. The
+    canonical accessor is still `await get_engine()` (or
+    `get_engine_if_ready()` from sync code), but the alias footgun is gone.
+
+  Fix 3 - DEGRADED-ROW SPARSENESS (per-symbol failures left columns blank)
+    v5.77.7's degraded-row payload had only symbol / provider / warnings /
+    timestamps. When projected through the 107-column schema, the
+    Recommendation / Reco Source / Reco Reason / Priority / Band /
+    Confidence Bucket columns came out empty. Fix: degraded rows now
+    carry `recommendation = "HOLD"`, `recommendation_source = "enrichment_failed"`,
+    `recommendation_reason = "HOLD: quote enrichment failed; not actionable."`,
+    `recommendation_priority = 4`, `recommendation_priority_band = "P4"`,
+    `confidence_bucket = "LOW"`. risk_bucket / risk_score stay None — we
+    don't fabricate a risk classification from no data.
+
+  Fix 4 - CLASS DOCSTRING CONSISTENCY (cosmetic)
+    The DataEngineV5 class docstring still read "(v5.77.6)" after the
+    v5.77.7 bump. Updated to "(v5.77.8)".
+
+DEPLOYMENT
+----------
+After deploy, the Render startup log should show:
+  [engine_v2 v5.77.8] module loaded; canonical_schema=107
+
+The v5.77.6 diagnostic logs (CLASSIFIER, RANK) still emit as designed.
+The v5.77.7 warning log on per-symbol enrichment failures still fires.
 
 WHY v5.77.7 - YAHOO ENRICHMENT + SINGLEFLIGHT + BATCH FAILURE ISOLATION
 ----------------------------------------------------------------------
@@ -189,7 +285,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.77.7"
+__version__ = "5.77.9"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -400,8 +496,46 @@ _YAHOO_FUNDAMENTAL_FIELDS: Tuple[str, ...] = (
     "debt_to_equity", "revenue_ttm", "revenue_growth_yoy",
     "free_cash_flow_ttm", "roe", "roa", "earnings_growth_yoy",
     "pb_ratio", "ps_ratio", "peg_ratio", "ev_ebitda",
+    # v5.77.8: also accept the post-canonicalization forecast_price_*m names
+    # alongside the legacy target_*_price names. The alias map collapses
+    # targetMeanPrice / targetHighPrice / targetMedianPrice into
+    # forecast_price_12m at canonicalization, so without these the filter
+    # silently drops the analyst-target enrichment Yahoo just delivered.
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+    "forecast_source",
     "target_mean_price", "target_high_price", "target_low_price",
     "analyst_count", "recommendation",
+)
+
+# v5.77.9: NARROWER subset used by _row_needs_yahoo_enrichment() to decide
+# whether to call Yahoo for fundamentals. The full _YAHOO_FUNDAMENTAL_FIELDS
+# set (above) is correct for the post-canon FILTER pass — it lists every
+# field the filter is willing to accept from a Yahoo response. But it's the
+# WRONG set for the needs-check, because v5.77.8 added engine-computed
+# forecast/ROI fields (forecast_price_*m, expected_roi_*m, forecast_source).
+# Those fields are intentionally absent at enrichment time — they're produced
+# later by _phase_ii_quality_forecast inside _apply_phase_dd_enhancements.
+# Including them in the needs-check makes the function report "needs Yahoo"
+# for EVERY row, including rows that already have complete fundamentals.
+# Result: a Yahoo round-trip per symbol on every refresh of a 140-row page,
+# even when no Yahoo data was actually missing.
+#
+# v5.77.9 fixes this by checking only fields that are genuinely PROVIDER-
+# sourced (not engine-computed): identity/classification, market structure,
+# fundamentals ratios, growth/margins, and analyst targets (raw names only,
+# since the canonical forecast_price_*m names are reserved for engine output).
+_YAHOO_FUNDAMENTAL_NEEDS_CHECK_FIELDS: Tuple[str, ...] = (
+    "industry", "sector", "currency", "country", "name",
+    "market_cap", "float_shares", "shares_outstanding",
+    "pe_ttm", "pe_forward", "eps_ttm", "eps_forward",
+    "dividend_yield", "payout_ratio", "beta_5y",
+    "gross_margin", "operating_margin", "profit_margin",
+    "debt_to_equity", "revenue_ttm", "revenue_growth_yoy",
+    "free_cash_flow_ttm", "roe", "roa", "earnings_growth_yoy",
+    "pb_ratio", "ps_ratio", "peg_ratio", "ev_ebitda",
+    "target_mean_price", "target_high_price", "target_low_price",
+    "analyst_count",
 )
 
 _YAHOO_CHART_FIELDS: Tuple[str, ...] = (
@@ -475,7 +609,7 @@ def _row_needs_yahoo_enrichment(row: Dict[str, Any]) -> Tuple[bool, bool]:
     if _yahoo_enrich_on_missing_industry():
         needs_fund = any(
             _is_missing_or_unknown_field(row.get(k))
-            for k in _YAHOO_FUNDAMENTAL_FIELDS
+            for k in _YAHOO_FUNDAMENTAL_NEEDS_CHECK_FIELDS
         )
 
     if _yahoo_enrich_on_missing_risk_metrics():
@@ -2977,7 +3111,7 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "beta_5y": ("beta_5y", "beta", "beta5Y", "Beta", "beta5Year"),
     "pe_ttm": ("pe_ttm", "trailingPE", "peRatio", "priceEarningsTTM", "pe", "PERatio", "PriceEarningsTTM", "peTTM"),
     "pe_forward": ("pe_forward", "forward_pe", "forwardPE", "forwardPe", "ForwardPE", "ForwardPERatio", "forwardPERatio"),
-    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM"),
+    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM", "epsTrailingTwelveMonths", "epsCurrentYear"),
     "dividend_yield": ("dividend_yield", "dividendYield", "trailingAnnualDividendYield", "distributionYield", "DividendYield", "forwardAnnualDividendYield", "Yield"),
     "payout_ratio": ("payout_ratio", "payoutRatio", "PayoutRatio", "payout", "PayoutRatioTTM"),
     "revenue_ttm": ("revenue_ttm", "totalRevenue", "revenueTTM", "revenue", "RevenueTTM", "TotalRevenueTTM", "Revenue", "SalesTTM"),
@@ -4591,7 +4725,7 @@ class _EngineSymbolsReaderProxy:
 # DataEngineV5 — the main orchestrator
 # =============================================================================
 class DataEngineV5:
-    """Global-first data orchestrator (v5.77.6)."""
+    """Global-first data orchestrator (v5.77.9)."""
 
     def __init__(
         self,
@@ -5167,25 +5301,38 @@ class DataEngineV5:
         return self._compute_history_patch_from_rows(rows)
 
     async def _apply_yahoo_enrichment_pass(self, row: Dict[str, Any], symbol: str, page: str = "") -> Dict[str, Any]:
-        # v5.77.7: full fix for the enrichment-pass signature mismatches.
-        #   - `_row_needs_yahoo_enrichment` returns a (needs_fund, needs_chart) tuple;
-        #     in v5.77.6 it was used as a bare boolean, which always evaluated truthy,
-        #     so the early-return never fired and the chart pass always ran.
-        #   - `_filter_patch_to_missing_fields` takes (row, patch, candidate_fields)
-        #     and returns (filtered, filled). In v5.77.6 it was called with 2 args
-        #     and the returned tuple was used as a dict in self._merge — TypeError.
-        # The chart pass re-evaluates `needs_chart` against the row AFTER the
-        # fundamentals pass, since a successful fundamentals fill can satisfy
-        # some chart-track fields too (e.g. when beta is shipped on fundamentals).
+        # v5.77.7: signature-mismatch fixes (see WHY v5.77.7 block at top of file).
+        # v5.77.8: canonicalize each Yahoo patch BEFORE running it through the
+        # missing-field filter. v5.77.7 still passed the raw Yahoo response
+        # (camelCase keys: `marketCap`, `trailingPE`, `targetMeanPrice`,
+        # `shortName`, ...) into `_filter_patch_to_missing_fields()`, which
+        # only kept fields whose key matched the canonical whitelist
+        # (`market_cap`, `pe_ttm`, `target_mean_price`, `name`, ...). Result:
+        # the filter rejected nearly everything Yahoo returned and the
+        # enrichment was effectively a no-op. Canonicalizing first runs
+        # the raw keys through `_CANONICAL_FIELD_ALIASES` so they land on
+        # the snake_case names the whitelist expects.
         needs_fund, needs_chart = _row_needs_yahoo_enrichment(row)
         if not (needs_fund or needs_chart):
             return row
 
+        sym_for_canon = normalize_symbol(symbol) or normalize_symbol(
+            _safe_str(row.get("symbol") or row.get("requested_symbol"))
+        )
+
         if needs_fund:
             patch = await self._fetch_yahoo_fundamentals_patch(symbol, page)
             if patch:
+                # v5.77.8: canonicalize the raw provider response so the
+                # missing-field filter can match its canonical-name whitelist.
+                canon_patch = _canonicalize_provider_row(
+                    patch,
+                    requested_symbol=sym_for_canon,
+                    normalized_symbol=sym_for_canon,
+                    provider="yahoo_fundamentals",
+                )
                 filtered, filled = _filter_patch_to_missing_fields(
-                    row, patch, _YAHOO_FUNDAMENTAL_FIELDS,
+                    row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
                 )
                 if filtered:
                     row = self._merge(row, filtered)
@@ -5196,8 +5343,14 @@ class DataEngineV5:
         if needs_chart:
             chart_patch = await self._fetch_yahoo_chart_patch(symbol, page)
             if chart_patch:
+                canon_chart = _canonicalize_provider_row(
+                    chart_patch,
+                    requested_symbol=sym_for_canon,
+                    normalized_symbol=sym_for_canon,
+                    provider="yahoo_chart",
+                )
                 filtered, filled = _filter_patch_to_missing_fields(
-                    row, chart_patch, _YAHOO_CHART_FIELDS,
+                    row, canon_chart, _YAHOO_CHART_FIELDS,
                 )
                 if filtered:
                     row = self._merge(row, filtered)
@@ -5315,11 +5468,24 @@ class DataEngineV5:
                     "[engine_v2 v%s] enriched_quote failed for %s on page=%s: %s: %s",
                     __version__, sym, page or "?", r.__class__.__name__, r,
                 )
+                # v5.77.8: degraded rows now carry conservative recommendation
+                # defaults so the sheet projects something actionable (HOLD with
+                # an explicit "enrichment_failed" source) instead of leaving the
+                # Recommendation / Reco Source / Reco Reason / Priority / Band /
+                # Confidence Bucket columns blank. risk_bucket and risk_score
+                # stay None because we have no actual data to assign them from.
                 degraded = {
                     "symbol": sym,
                     "requested_symbol": sym,
                     "data_provider": "fallback_error",
                     "warnings": f"enrichment_failed:{r.__class__.__name__}",
+                    "recommendation": "HOLD",
+                    "recommendation_detailed": "HOLD",
+                    "recommendation_source": "enrichment_failed",
+                    "recommendation_reason": "HOLD: quote enrichment failed; not actionable.",
+                    "recommendation_priority": 4,
+                    "recommendation_priority_band": "P4",
+                    "confidence_bucket": "LOW",
                     "last_updated_utc": _now_utc_iso(),
                     "last_updated_riyadh": _now_riyadh_iso(),
                 }
@@ -5650,7 +5816,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.77.7",  # v5.77.7: Yahoo enrichment + SingleFlight + batch-failure fixes
+                "version": "v5.77.9",  # v5.77.9: Yahoo needs-check narrowed (avoid over-trigger from engine-computed forecasts)
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
@@ -5701,7 +5867,13 @@ async def get_engine(
     providers: Optional[Sequence[Any]] = None,
     cache_ttl_seconds: Optional[int] = None,
 ) -> DataEngineV5:
-    global _ENGINE_INSTANCE
+    # v5.77.8: keep module-level ENGINE/engine/_ENGINE aliases in sync. Earlier
+    # versions bound those at module load time when _ENGINE_INSTANCE was still
+    # None, and never updated them — so `from core.data_engine_v2 import ENGINE`
+    # gave routes a permanent `None`. We still recommend `await get_engine()` or
+    # `get_engine_if_ready()` as the canonical accessors, but updating the
+    # aliases removes the silent-None footgun for legacy imports.
+    global _ENGINE_INSTANCE, ENGINE, engine, _ENGINE
     if _ENGINE_INSTANCE is not None:
         return _ENGINE_INSTANCE
     async with _ENGINE_LOCK:
@@ -5714,17 +5886,25 @@ async def get_engine(
             providers=providers,
             cache_ttl_seconds=cache_ttl_seconds,
         )
+        ENGINE = _ENGINE_INSTANCE
+        engine = _ENGINE_INSTANCE
+        _ENGINE = _ENGINE_INSTANCE
         return _ENGINE_INSTANCE
 
 
 async def close_engine() -> None:
-    global _ENGINE_INSTANCE
+    # v5.77.8: clear the module-level aliases alongside _ENGINE_INSTANCE so
+    # post-close imports correctly see None and re-initialize on next request.
+    global _ENGINE_INSTANCE, ENGINE, engine, _ENGINE
     if _ENGINE_INSTANCE is None:
         return
     try:
         await _ENGINE_INSTANCE.aclose()
     finally:
         _ENGINE_INSTANCE = None
+        ENGINE = None
+        engine = None
+        _ENGINE = None
 
 
 def get_engine_if_ready() -> Optional[DataEngineV5]:
@@ -5741,10 +5921,47 @@ def get_cache() -> Optional[MultiLevelCache]:
     return _ENGINE_INSTANCE._cache
 
 
-# Module-level synonyms (some routes import `ENGINE` directly).
-ENGINE = _ENGINE_INSTANCE
-engine = _ENGINE_INSTANCE
-_ENGINE = _ENGINE_INSTANCE
+# =============================================================================
+# Module-level engine handles — read this carefully if you write routes
+# -----------------------------------------------------------------------------
+# `ENGINE`, `engine`, and `_ENGINE` are convenience aliases for code that has
+# a synchronous context and a strong guarantee the engine is already
+# initialized (e.g. a request handler running after FastAPI startup). They are
+# kept in sync by `get_engine()` / `close_engine()`.
+#
+# *** ROUTE DISCIPLINE — IMPORTANT ***
+# Python's `from X import Y` captures the VALUE of `Y` at import time. If a
+# route does
+#
+#     from core.data_engine_v2 import ENGINE
+#
+# at module load — before `get_engine()` has run — that route will hold a
+# permanent reference to `None`, and no amount of reassignment inside this
+# module can rebind the name in the route's namespace. This is a Python
+# semantics fact, not an engine bug. The fix lives in the route, not here.
+#
+# Use ONE of these patterns in route code:
+#
+#     # ASYNC (preferred):
+#     engine = await get_engine()
+#     rows = await engine.get_sheet_rows("Global_Markets")
+#
+#     # SYNC fallback (only if you already know the engine is up):
+#     from core import data_engine_v2 as _engine_module
+#     engine = _engine_module.ENGINE          # fresh attribute lookup each call
+#     if engine is None:
+#         raise RuntimeError("Engine not initialized")
+#
+# Do NOT use:
+#     from core.data_engine_v2 import ENGINE  # captures None at import time
+#
+# (The audit consensus has flagged this in prior reviews; this comment
+#  exists so anyone touching the engine sees the warning at the same time
+#  they see the names being defined.)
+# =============================================================================
+ENGINE: Optional[DataEngineV5] = _ENGINE_INSTANCE
+engine: Optional[DataEngineV5] = _ENGINE_INSTANCE
+_ENGINE: Optional[DataEngineV5] = _ENGINE_INSTANCE
 
 
 # =============================================================================
@@ -5773,17 +5990,17 @@ __all__ = [
 
 
 # =============================================================================
-# v5.77.7 module-load INFO banner
+# v5.77.9 module-load INFO banner
 # -----------------------------------------------------------------------------
 # Emitted exactly once when this module is loaded. Confirms in the Render
-# startup log that v5.77.7 is actually live — if the banner shows an older
+# startup log that v5.77.9 is actually live — if the banner shows an older
 # version (or doesn't appear at all), the deploy didn't pick up the new file
 # and the bug-fix patches aren't active.
 # =============================================================================
 if logger.isEnabledFor(logging.INFO):
     try:
         logger.info(
-            "[engine_v2 v5.77.7] module loaded; canonical_schema=%d",
+            "[engine_v2 v5.77.9] module loaded; canonical_schema=%d",
             len(INSTRUMENT_CANONICAL_KEYS),
         )
     except Exception:
