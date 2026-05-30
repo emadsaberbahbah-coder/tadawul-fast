@@ -2,8 +2,192 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.14
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.17
 ================================================================================
+
+WHY v5.77.17 - PROVIDER-OVERRIDE IDEMPOTENCY (closes the v5.77.16 asymmetry)
+----------------------------------------------------------------------------
+The v5.77.16 audit accepted the duplicate-classification fix but caught one
+remaining asymmetry. v5.77.16 stopped an engine-written recommendation from
+being CAPTURED as provider_rating, but the `provider_wins` decision was still
+computed from `provider_canon`, which was derived from row["recommendation"]
+regardless of who wrote it:
+
+    raw_upstream  = row.get("recommendation")          # could be engine-written
+    provider_canon = _v573_collapse_to_canonical_enum(raw_upstream)
+    provider_wins  = bool(provider_canon) and trust_provider
+
+So if the classifier were invoked again on a row whose recommendation the
+engine had already written (e.g. "BUY"), and TFB_TRUST_PROVIDER_RECO=1, then
+provider_canon="BUY" and provider_wins=True — Step 3a would stamp
+source="provider_override" and reason "Provider rating accepted via
+TFB_TRUST_PROVIDER_RECO override." on what is actually an engine
+recommendation. (In the v5.77.16 single-pass orchestration recommendation_source
+is unset at classify time, so this does not fire in the normal flow — it is a
+latent defect that surfaces only with the trust flag on AND a re-invocation,
+which is exactly the class of bug the v5.77.16 idempotency guard set out to
+eliminate.)
+
+THE FIX
+-------
+When _reco_is_engine_written is True, derive provider_canon from the already
+-captured provider_rating field instead of from row["recommendation"]:
+
+    if _reco_is_engine_written:
+        provider_canon = _v573_collapse_to_canonical_enum(row.get("provider_rating"))
+    else:
+        provider_canon = _v573_collapse_to_canonical_enum(raw_upstream)
+
+Now provider_wins depends only on a REAL upstream provider rating:
+  - engine-written reco, no real provider rating -> provider_canon="" ->
+    provider_wins=False -> no false override (source stays engine/engine_local_score).
+  - engine-written reco, real provider rating present (captured on an earlier
+    pass) -> provider_canon=<real rating> -> with trust on, the override is
+    legitimate and intended.
+  - first pass (not engine-written) -> unchanged behavior.
+
+Together with the v5.77.16 capture guard, the classifier is now fully
+idempotent for BOTH provider_rating capture AND the provider-override
+decision, with or without TFB_TRUST_PROVIDER_RECO enabled.
+
+No schema changes. No contract changes. No math changes. All v5.77.14
+(fundamentals picker), v5.77.15 (master switch + score fallback), and v5.77.16
+(single classification + capture guard) behavior preserved. Provider symbol
+routing still intentionally NOT added (providers self-normalize); the
+.NS/.T/.KS/.DE/.AX EODHD suffix gap remains a core.symbols.normalize change
+tracked separately.
+
+WHY v5.77.16 - DUPLICATE CLASSIFICATION FIX (provider_rating corruption)
+------------------------------------------------------------------------
+The v5.77.15 audit found a real state bug. In _get_enriched_quote_impl the
+final block ran:
+
+    _compute_scores_canonical_first(merged)
+    _apply_phase_dd_enhancements(merged)   # already classifies (has_scores)
+    _compute_recommendation(merged)        # classifies AGAIN
+
+_apply_phase_dd_enhancements() calls _classify_recommendation_8tier() when
+scores are present, and _compute_recommendation() is just a thin wrapper
+that calls the same classifier — so the classifier ran TWICE per row.
+
+The corruption: _classify_recommendation_8tier Step 2b captures the upstream
+provider rating from row["recommendation"] into provider_rating, guarded by
+"only if provider_rating is still blank". That guard is enough when the
+provider actually supplied a rating (captured on pass 1, skipped on pass 2).
+But when the provider supplied NO rating:
+  - Pass 1: provider_rating stays blank; Step 4 writes the ENGINE's
+    recommendation into row["recommendation"] (e.g. "BUY").
+  - Pass 2: Step 2b reads row["recommendation"] == "BUY" (the engine's own
+    output), sees provider_rating still blank, and captures "BUY" as
+    provider_rating.
+Result: Provider Rating on the dashboard showed an engine-generated value
+masquerading as a real provider signal. Reproduced before the fix:
+    after _apply_phase_dd_enhancements : rec=BUY  provider_rating=(blank)
+    after _compute_recommendation      : rec=BUY  provider_rating=BUY   <-- bug
+
+THE FIX (three parts, defense-in-depth)
+  1. Removed the redundant _compute_recommendation(merged) call in
+     _get_enriched_quote_impl. Classification now happens exactly once.
+  2. _apply_phase_dd_enhancements() now calls the classifier UNCONDITIONALLY
+     (it was gated behind has_scores; the removed _compute_recommendation
+     previously provided the always-run guarantee for the rare "data but no
+     computed scores" row). _derive_views / _build_top_factors_and_risks
+     stay gated on has_scores; the classifier internally handles the
+     no-score case via its Step 3d HOLD fallback.
+  3. Hardened _classify_recommendation_8tier so the provider_rating capture
+     is idempotent: it now records the prior recommendation_source before the
+     Step 2a self-clear and refuses to capture row["recommendation"] as
+     provider_rating when that source is engine-written (see
+     _ENGINE_WRITTEN_RECO_SOURCES). So even if the classifier is ever invoked
+     twice again (from any call path), it will not mistake the engine's own
+     recommendation for a provider rating.
+
+After the fix, a row with no provider rating keeps provider_rating blank
+through any number of classifier passes, and a row WITH a genuine provider
+rating (e.g. STRONG_BUY) retains it while the engine recommendation is
+computed independently.
+
+No schema changes. No contract changes. No math changes. The v5.77.14
+fundamentals picker fix and the v5.77.15 master-switch guard + score-based
+local fallback are all preserved. Provider symbol routing remains
+intentionally NOT added (providers self-normalize — see v5.77.15 block); the
+.NS/.T/.KS/.DE/.AX EODHD suffix gap is a core.symbols.normalize change tracked
+separately.
+
+WHY v5.77.15 - AUDIT FOLLOW-UP: MASTER GUARD + LOCAL SCORE FALLBACK
+------------------------------------------------------------------
+v5.77.15 applies two of the three fixes from the v5.77.14 audit. The third
+audit item (provider symbol routing) was investigated and deliberately NOT
+applied — see the "REJECTED" note below for the evidence.
+
+  Fix 1 - YAHOO MASTER-SWITCH GUARD (doc/code mismatch)
+    The v5.77.14 docs (and the v5.77.14 operational note) said the Yahoo
+    enrichment pass is gated by ENGINE_YAHOO_ENRICHMENT_ENABLED. It was not:
+    `_yahoo_enrichment_enabled()` existed but was never called anywhere, so
+    setting that env var to 0/false/off did NOT disable enrichment. (The
+    sub-flags ENGINE_YAHOO_ENRICH_ON_MISSING_INDUSTRY /
+    ENGINE_YAHOO_ENRICH_ON_MISSING_RISK_METRICS were honored inside
+    _row_needs_yahoo_enrichment, but the master switch was dead code.)
+    v5.77.15 adds `if not _yahoo_enrichment_enabled(): return row` as the
+    first runtime statement of `_apply_yahoo_enrichment_pass`, so the
+    documented master switch is now real and short-circuits the whole pass
+    before any needs-check or provider round-trip. NOTE: this also corrects
+    the v5.77.14 operational note — with the switch now wired, leaving it
+    UNSET (or "1"/"true") keeps enrichment ON, which is what the v5.77.14
+    fundamentals fix needs; only an explicit 0/false/off disables it.
+
+  Fix 2 - SCORE-BASED LOCAL RECO FALLBACK (less conservative degraded mode)
+    `_classify_recommendation_8tier` Step 3c previously stamped HOLD /
+    source="scoring_unavailable" whenever the engine path (Step 3b via
+    core.scoring.apply_canonical_recommendation) produced no recommendation.
+    But by that point _compute_scores_canonical_first /
+    _compute_scores_local_fallback have usually already produced a real
+    overall_score. Flattening a genuinely strong or weak row to HOLD throws
+    that signal away. v5.77.15 inserts a score-based map BEFORE the HOLD
+    fallback (Step 3c), using the audit's thresholds:
+        >=85 STRONG_BUY  >=70 BUY  >=60 ACCUMULATE  >=50 HOLD
+        >=40 REDUCE      >=30 SELL  <30 STRONG_SELL
+    tagged source="engine_local_score" (visible in the Reco Source column),
+    with priority bands mirroring the provider-override philosophy
+    (STRONG_SELL high-priority P1; SELL/REDUCE P5). The conservative HOLD
+    (now Step 3d, source="scoring_unavailable") still fires only when there
+    is genuinely no usable overall_score. This is a fallback-only change: in
+    production the engine path (Step 3b) is available, so this path is not
+    even reached — it only improves the degraded mode.
+
+  REJECTED (with evidence) - Audit item: route _fetch_patch /
+    _fetch_history_patch through `_provider_symbol_for()`.
+    The audit observed that `_provider_symbol_for()` is defined but unused
+    and that `_fetch_patch` calls providers with the raw symbol, and inferred
+    a symbol-routing bug. Investigation of the provider modules shows the
+    opposite: EVERY provider self-normalizes the raw symbol at its own entry
+    point, each with provider-specific context the engine's generic helper
+    does not carry —
+        * eodhd_provider.fetch_quote -> normalize_eodhd_symbol(...) ->
+          to_eodhd_symbol(sym, default_exchange=_default_exchange())
+        * finnhub_provider.fetch_quote -> normalize_finnhub_symbol(...) ->
+          to_finnhub_symbol(...)
+        * tadawul_provider.fetch_quote_patch -> normalize_ksa_symbol(...)
+        * argaam_provider.get_quote/fetch_quote -> normalize_ksa_symbol(...)
+    Passing the RAW symbol is therefore the correct contract. Routing through
+    the engine's `_provider_symbol_for` would DOUBLE-normalize: e.g. the
+    engine would call to_eodhd_symbol(sym) WITHOUT default_exchange, then
+    EODHD would call to_eodhd_symbol(...) WITH default_exchange on the result
+    — divergent output and a real risk of breaking the international tickers
+    that currently price correctly (.PA/.SW/.ST/.CO/.SA/.TW/.TO/.MX). The
+    genuine international-symbol gap the audit is worried about (.NS/.T/.KS/
+    .DE/.AX returning no EODHD price) is a `to_eodhd_symbol` suffix-mapping
+    issue inside core.symbols.normalize, and the fix belongs THERE — it then
+    flows through automatically because EODHD already calls to_eodhd_symbol
+    internally. That normalize.py change is tracked as a separate delivery
+    and is intentionally out of scope for this engine file. (Yahoo is the one
+    provider the engine pre-converts, via `_yahoo_symbol_for` in the two
+    dedicated Yahoo helpers; that is pre-existing, near-idempotent, and
+    unchanged here.)
+
+No schema changes. No contract changes. No math changes. The only behavioral
+deltas from v5.77.14 are the two fixes above; the v5.77.14 fundamentals
+picker fix and all v5.77.6-v5.77.13 behavior are preserved.
 
 WHY v5.77.14 - FUNDAMENTALS ACQUISITION FIX (the universal-SELL root cause)
 ---------------------------------------------------------------------------
@@ -476,7 +660,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.77.14"
+__version__ = "5.77.17"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -1271,6 +1455,23 @@ def _recommendation_priority(rec: str) -> int:
     return _RECO_8TIER_PRIORITY.get(key, 4)
 
 
+# v5.77.16: recommendation_source values the ENGINE itself writes. When a row
+# carries one of these from a prior classifier pass, its `recommendation` field
+# holds an engine-generated value, not an upstream provider rating — so the
+# classifier must not re-capture it as provider_rating. ("provider_override" is
+# included because in that path provider_rating is already captured before the
+# override, so re-capture is both unnecessary and would be a no-op under the
+# existing `if not provider_rating` guard.)
+_ENGINE_WRITTEN_RECO_SOURCES: frozenset = frozenset({
+    "engine",
+    "engine_local_score",
+    "scoring_unavailable",
+    "provider_override",
+    "enrichment_failed",
+    "empty_row",
+})
+
+
 def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     """v5.75.0 — SINGLE AUTHORITATIVE recommendation writer (atomic, idempotent).
 
@@ -1287,6 +1488,20 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
         return
 
     # -- Step 2a: SELF-CLEAR (v5.75.0) ------------------------------
+    # v5.77.16: capture the prior recommendation_source BEFORE clearing it.
+    # If the row's current `recommendation` was written by the engine on an
+    # earlier classifier pass (source in _ENGINE_WRITTEN_RECO_SOURCES), the
+    # value sitting in row["recommendation"] is NOT an upstream provider
+    # rating and must NOT be captured as provider_rating in Step 2b. Without
+    # this, a second classifier pass over the same row (e.g. the v5.77.15
+    # _apply_phase_dd_enhancements + _compute_recommendation double-call)
+    # would mistake the engine's own recommendation for a provider signal and
+    # stamp provider_rating = <engine recommendation>. The double-call itself
+    # is removed in v5.77.16; this guard additionally makes the capture
+    # idempotent so any future re-invocation stays safe.
+    _prior_reco_source = _safe_str(row.get("recommendation_source"))
+    _reco_is_engine_written = _prior_reco_source in _ENGINE_WRITTEN_RECO_SOURCES
+
     for _stale_key in (
         "recommendation_detailed",
         "recommendation_detail",
@@ -1297,10 +1512,25 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
     ):
         row.pop(_stale_key, None)
 
-    # -- Step 2b: provider rating capture (v5.75.0: ONCE-ONLY) ------
+    # -- Step 2b: provider rating capture (v5.75.0: ONCE-ONLY; v5.77.16:
+    #             never from an engine-written recommendation) ------------
+    # v5.77.17: provider_canon must reflect a REAL upstream provider rating,
+    # never an engine-written one. When the row's recommendation was written
+    # by the engine on an earlier pass (_reco_is_engine_written), derive
+    # provider_canon from the already-captured provider_rating field instead
+    # of from row["recommendation"]. Otherwise an engine-written "BUY" would
+    # still flow into provider_canon and — with TFB_TRUST_PROVIDER_RECO=1 —
+    # make provider_wins True, letting Step 3a stamp source="provider_override"
+    # on what is actually an engine recommendation. v5.77.16 stopped the engine
+    # value from being CAPTURED as provider_rating; v5.77.17 also stops it from
+    # driving the override decision, so the whole classifier is idempotent even
+    # with the trust flag enabled.
     raw_upstream = row.get("recommendation")
-    provider_canon = _v573_collapse_to_canonical_enum(raw_upstream)
-    if not _safe_str(row.get("provider_rating")):
+    if _reco_is_engine_written:
+        provider_canon = _v573_collapse_to_canonical_enum(row.get("provider_rating"))
+    else:
+        provider_canon = _v573_collapse_to_canonical_enum(raw_upstream)
+    if not _safe_str(row.get("provider_rating")) and not _reco_is_engine_written:
         if provider_canon:
             row["provider_rating"] = provider_canon
         elif raw_upstream not in (None, ""):
@@ -1361,11 +1591,56 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
                     f"{rec}: Engine classification via core.scoring."
                 priority_band = _safe_str(patch.get("recommendation_priority_band"))
 
-    # -- Step 3c: fallback HOLD when scoring is unavailable ---------
+    # -- Step 3c: score-based local fallback, then conservative HOLD ----
+    # v5.77.15: when the engine path (Step 3b) produced no recommendation —
+    # because core.scoring is unavailable or apply_canonical_recommendation
+    # returned nothing — do NOT blindly stamp HOLD if the row already carries
+    # a real overall_score from _compute_scores_canonical_first /
+    # _compute_scores_local_fallback. Map that score to the 8-tier vocabulary
+    # so a genuinely strong (or weak) row is not flattened to HOLD. The source
+    # is tagged "engine_local_score" so this degraded-mode path stays visible
+    # in the Reco Source column for diagnostics. Only when there is no usable
+    # overall_score do we fall through to the conservative HOLD below.
+    if not rec:
+        _ov = _as_float(row.get("overall_score"))
+        if _ov is not None:
+            if _ov >= 85.0:
+                rec = "STRONG_BUY"
+            elif _ov >= 70.0:
+                rec = "BUY"
+            elif _ov >= 60.0:
+                rec = "ACCUMULATE"
+            elif _ov >= 50.0:
+                rec = "HOLD"
+            elif _ov >= 40.0:
+                rec = "REDUCE"
+            elif _ov >= 30.0:
+                rec = "SELL"
+            else:
+                rec = "STRONG_SELL"
+            source = "engine_local_score"
+            reason = (
+                f"{rec}: Local score-based classification (overall_score="
+                f"{round(_ov, 2)}); core.scoring canonical path unavailable."
+            )
+            if rec == "STRONG_BUY":
+                priority_band = "P1"
+            elif rec == "BUY":
+                priority_band = "P2"
+            elif rec == "ACCUMULATE":
+                priority_band = "P3"
+            elif rec == "STRONG_SELL":
+                priority_band = "P1"
+            elif rec in ("SELL", "REDUCE"):
+                priority_band = "P5"
+            else:
+                priority_band = "P4"
+
+    # -- Step 3d: conservative HOLD when there is no usable score -------
     if not rec:
         rec = "HOLD"
         source = "scoring_unavailable"
-        reason = "HOLD: core.scoring unavailable; conservative fallback applied."
+        reason = "HOLD: core.scoring unavailable and no usable overall_score; conservative fallback applied."
         priority_band = "P4"
 
     # -- Step 4: write the final row fields atomically --------------
@@ -1798,9 +2073,19 @@ def _apply_phase_dd_enhancements(row: Dict[str, Any]) -> Dict[str, Any]:
         _as_float(row.get(k)) is not None
         for k in ("overall_score", "valuation_score", "quality_score", "momentum_score", "opportunity_score")
     )
+    # v5.77.16: classification now runs unconditionally (it internally handles
+    # the no-score case via its Step 3d HOLD fallback). Previously it was gated
+    # behind has_scores, and the orchestrator's separate _compute_recommendation
+    # call supplied the always-run guarantee. With that redundant call removed
+    # in v5.77.16, the classifier must run here for every non-empty row so a row
+    # that has data but (rarely) no computed scores still gets a recommendation
+    # instead of going out blank. _derive_views and _build_top_factors_and_risks
+    # still require scores, and _build_top_factors_and_risks must run AFTER the
+    # classifier because it reads row["recommendation"] for position_size_hint.
     if has_scores:
         _derive_views(row)
-        _classify_recommendation_8tier(row)
+    _classify_recommendation_8tier(row)
+    if has_scores:
         _build_top_factors_and_risks(row)
 
     return row
@@ -4968,7 +5253,7 @@ class _EngineSymbolsReaderProxy:
 # DataEngineV5 — the main orchestrator
 # =============================================================================
 class DataEngineV5:
-    """Global-first data orchestrator (v5.77.14)."""
+    """Global-first data orchestrator (v5.77.17)."""
 
     def __init__(
         self,
@@ -5565,6 +5850,15 @@ class DataEngineV5:
         # enrichment was effectively a no-op. Canonicalizing first runs
         # the raw keys through `_CANONICAL_FIELD_ALIASES` so they land on
         # the snake_case names the whitelist expects.
+        # v5.77.15: honor the documented master switch. Before v5.77.15,
+        # _yahoo_enrichment_enabled() was defined but never called, so
+        # ENGINE_YAHOO_ENRICHMENT_ENABLED=0/false/off did NOT actually disable
+        # the pass (the doc/code mismatch the audit caught). With this guard,
+        # setting that env var off cleanly short-circuits the entire pass
+        # before any needs-check or provider round-trip runs.
+        if not _yahoo_enrichment_enabled():
+            return row
+
         needs_fund, needs_chart = _row_needs_yahoo_enrichment(row)
         if not (needs_fund or needs_chart):
             return row
@@ -5672,10 +5966,16 @@ class DataEngineV5:
             merged = _apply_phase_bb_sanity(merged)
 
             # Final scoring + recommendation.
+            # v5.77.16: _apply_phase_dd_enhancements now performs the single
+            # authoritative classification (it calls _classify_recommendation_8tier
+            # unconditionally). The previous extra _compute_recommendation(merged)
+            # call here ran the classifier a SECOND time, which — when the row had
+            # no upstream provider rating — captured the engine's own recommendation
+            # as provider_rating on the second pass. Removed; classification happens
+            # exactly once now.
             if not _is_empty_data_row(merged):
                 _compute_scores_canonical_first(merged)
                 _apply_phase_dd_enhancements(merged)
-                _compute_recommendation(merged)
             else:
                 _mark_row_as_empty(merged)
 
@@ -6069,7 +6369,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.77.14",  # v5.77.14: Yahoo fundamentals picker name-match fix (universal-SELL root cause)
+                "version": "v5.77.17",  # v5.77.17: provider_wins no longer fires on an engine-written reco (full classifier idempotency, even with TFB_TRUST_PROVIDER_RECO=1)
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
