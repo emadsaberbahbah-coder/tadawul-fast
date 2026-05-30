@@ -2,361 +2,40 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Finance Fundamentals Provider -- v6.3.0
+Yahoo Finance Fundamentals Provider -- v6.3.1
 ================================================================================
-v6.3.0: 8-TIER RECOMMENDATION VOCABULARY + PROVIDER_RATING CASCADE-BRIDGE /
-[PRESERVED v6.2.0] PROVIDER-SIDE IDENTITY DEFAULTS /
-[PRESERVED v6.1.0] UA ROTATION + 52W BOUNDS GUARD + STRUCTURED WARNINGS /
-[PRESERVED v6.0.0] ENGINE-COMPATIBLE FOUNDATION
+v6.3.1 hotfix (over v6.3.0). Four audit fixes; output shape additive-only:
 
-Cross-stack alignment (May 2026 v8.0.0 family floor)
------------------------------------------------------
-  - core.reco_normalize           v8.0.0   (8-tier canonical:
-                                             STRONG_BUY/BUY/ACCUMULATE/HOLD/
-                                             REDUCE/SELL/STRONG_SELL/AVOID)
-  - core.scoring                  v5.7.0   (emits priority_band P1..P5)
-  - core.scoring_engine (bridge)  v3.6.0
-  - core.schemas                  v7.0.0   (Recommendation enum 8-tier;
-                                             UnifiedQuote.provider_rating +
-                                             recommendation_source cascade-
-                                             bridge fields)
-  - core.sheets.schema_registry   v2.11.0
-  - core.data_engine_v2           v5.76.0  (consumes provider_rating +
-                                             recommendation_source for
-                                             divergence detection)
-  - core.investment_advisor_engine v4.5.0
-  - core.analysis.insights_builder v8.0.1  (Risk Alerts section surfaces
-                                             "providerDiverges=" flag when
-                                             provider_rating != recommendation)
-  - core.analysis.top10_selector   v4.14.0
-  - core.analysis.criteria_model   v3.2.0
-  - core.providers.eodhd_provider          v4.7.3
-  - core.providers.yahoo_chart_provider    v8.2.0
-  - core.providers.yahoo_fundamentals      v6.3.0 (THIS DELIVERY)
-  - core.providers.enriched_quote          v4.7.0
+  1. (HIGH) No false default HOLD. v6.3.0's _blocking_fetch always set
+     "recommendation": map_recommendation(raw_rec_key); since
+     map_recommendation(None) -> "HOLD", a symbol with NO Yahoo
+     recommendationKey emitted a fake HOLD that data_engine_v2 could
+     capture as a provider rating (reopening the v5.77.17 corruption).
+     Now: recommendation is emitted ONLY when Yahoo supplied a real
+     rating key (else None -> stripped by clean_patch -> field absent).
 
-Purpose
--------
-Fallback fundamentals/profile source. EODHD remains primary for global
+  2. (MED) Substring precedence. map_recommendation("underperform_rating")
+     returned HOLD because the generic "perform" token was tested before
+     "underperform". The substring pass now iterates a length-descending
+     view of the vocab (_RECO_VOCAB_BY_LEN) so longer/more-specific tokens
+     win. Exact-match pass is unchanged. Same fix in extract_provider_rating.
+
+  3. (MED/HIGH) SSOT symbol formatting for the yfinance call. The symbol
+     sent to yf.Ticker came from this file's local normalize_symbol, which
+     passes EODHD-style suffixes (.NSE/.XETRA/.AU/.KO) straight through --
+     Yahoo can't resolve those, so international fundamentals came back
+     empty. Now binds to_yahoo_symbol from the same normalize SSOT used
+     for identity, with a local EODHD->Yahoo suffix-remap fallback if the
+     import fails, and uses it for the ACTUAL yfinance symbol. Output
+     keeps requested_symbol/symbol = canonical; provider_symbol = the
+     Yahoo-formatted symbol actually queried.
+
+  4. (OPTIONAL) Added EODHD-format .AU (ASX) and .KO (KRX) to the local
+     _SUFFIX_TO_LOCALE_DEFAULTS fallback table (it already had .AX/.KS).
+
+Purpose: Fallback fundamentals/profile source. EODHD remains primary for global
 equities and yahoo_chart remains primary for Yahoo-style quote/history data.
-This provider fills gaps when Yahoo has richer or more readily available
-metadata than the primary source.
-
-================================================================================
-v6.3.0 Changes (from v6.2.0)  --  8-TIER VOCABULARY + PROVIDER_RATING
-================================================================================
-
-CASCADE-BRIDGE PATCH closing the last 5-tier vocabulary leak below the
-advisor layer. v6.2.0's `map_recommendation` had three bugs:
-
-  Bug 1 (PRECEDENCE):
-    map_recommendation("strong_sell") returned "SELL".
-    The function checked "sell" before "strong_sell"-aware branches, so
-    "strong_sell" matched the broader "sell" branch first. Yahoo's
-    `strong_sell` token (rare but real on conviction-sell ratings) was
-    being silently downgraded to SELL.
-
-  Bug 2 (MISSING VOCABULARY -- POSITIVE):
-    map_recommendation("outperform") returned "HOLD".
-    "outperform" doesn't contain "buy", so it skipped the BUY branch
-    and fell through to HOLD. Yahoo emits "outperform" frequently for
-    sell-side ratings (Goldman Sachs, JPMorgan house tokens proxy
-    through Yahoo's recommendationKey as "outperform"). v6.2.0
-    silently neutralized them.
-
-  Bug 3 (MISSING VOCABULARY -- 8-TIER):
-    map_recommendation("accumulate") and ("avoid") returned "HOLD".
-    Yahoo's recommendationKey doesn't natively emit these tokens, but
-    THIRD-PARTY broker feeds proxied through Yahoo (e.g. via
-    `analystRecommendation` on ETF/MF endpoints) do. v6.2.0 collapsed
-    them to HOLD.
-
-CASCADE-BRIDGE GAP:
-  `schemas.py` v7.0.0's `UnifiedQuote` model added 9 cascade-bridge
-  fields including `provider_rating` and `recommendation_source`.
-  `insights_builder.py` v8.0.1's Risk Alerts section uses
-  `provider_rating` to detect when the engine's final recommendation
-  diverges from the upstream provider's view (surfaces a
-  `providerDiverges=true|false` marker on each risk alert row).
-  v6.2.0 of THIS provider did not emit either field, so every
-  Yahoo-fundamentals row hit insights_builder with provider_rating=None,
-  silently disabling the divergence detection for any symbol where
-  Yahoo was the chosen source.
-
-Phase-by-phase summary:
------------------------
-
-A. HEADER NARRATIVE SYNC. Header banner gains v6.3.0 marker; new
-   cross-stack roster table refreshed to May 2026 v8.0.0 family floor.
-   v6.2.0 / v6.1.0 / v6.0.0 history preserved verbatim below.
-
-B. VERSION BUMP 6.2.0 -> 6.3.0. `VERSION` alias auto-tracks.
-
-C. `map_recommendation()` REWRITTEN. Order-of-precedence bug fixed
-   (check STRONG_SELL before SELL). Expanded to 8-tier output
-   vocabulary:
-     "strong_buy"  -> STRONG_BUY
-     "buy"         -> BUY
-     "outperform"  -> BUY               (was HOLD in v6.2.0 -- bug)
-     "accumulate"  -> ACCUMULATE        (was HOLD in v6.2.0 -- bug)
-     "scale_in"    -> ACCUMULATE        (NEW; broker-vocab alias)
-     "moderate_buy"/ "mod_buy"
-                   -> ACCUMULATE        (NEW; broker-vocab alias)
-     "add"/"overweight"
-                   -> BUY               (NEW; broker-vocab alias)
-     "hold"/"neutral"/"market_perform"
-                   -> HOLD
-     "underperform"-> REDUCE            (NEW; explicit, not by chance)
-     "reduce"/"trim"/"underweight"
-                   -> REDUCE
-     "strong_sell" -> STRONG_SELL       (was SELL in v6.2.0 -- bug)
-     "conviction_sell"/"deep_sell"
-                   -> STRONG_SELL       (NEW; broker-vocab alias)
-     "sell"/"exit" -> SELL
-     "avoid"/"hard_pass"/"dnb"/"do_not_buy"/"uninvestable"
-                   -> AVOID             (NEW; 8-tier vocab)
-     None / "" / unknown
-                   -> HOLD              (preserves v6.2.0 default)
-
-D. NEW HELPER `extract_provider_rating(raw_key)`. Canonicalizes
-   Yahoo's raw `recommendationKey` to a lowercase, underscore-
-   separated string preserving Yahoo's vocabulary distinctions
-   (so insights_builder v8.0.1 can compare provider_rating against
-   the canonical 8-tier `recommendation` for divergence detection).
-   Examples:
-     "STRONG_BUY"     -> "strong_buy"
-     "Strong Buy"     -> "strong_buy"
-     "strongBuy"      -> "strong_buy"
-     "OUTPERFORM"     -> "outperform"
-     "underperform"   -> "underperform"
-     "ACCUMULATE"     -> "accumulate"
-     "AVOID"          -> "avoid"
-     None / "" / unparseable -> ""
-
-E. `_blocking_fetch` EXTRACTION EXTENDED. After the existing
-   `recommendation` field is set via `map_recommendation`, two new
-   raw provider-side fields are extracted:
-     provider_rating          = extract_provider_rating(raw_rec_key)
-     provider_rating_score    = safe_float(info["recommendationMean"])
-     recommendation_source    = "yahoo_fundamentals" if either is
-                                populated else None
-   These map directly to `schemas.py` v7.0.0's `UnifiedQuote`
-   cascade-bridge fields. data_engine_v2 v5.76.0's row builder passes
-   them through to insights_builder v8.0.1 / top10_selector v4.14.0
-   without further transformation.
-
-F. OUTPUT DICT EXTENDED with 3 new fields (placed in the analyst/reco
-   block, alongside the existing `recommendation` / `target_mean_price`
-   / `analyst_count`):
-     provider_rating          : str   -- Yahoo's raw lowercase token
-     provider_rating_score    : float -- Yahoo's recommendationMean (1-5)
-     recommendation_source    : str   -- "yahoo_fundamentals" or None
-   None values get stripped by `clean_patch` as usual; downstream rows
-   only carry the fields when Yahoo actually supplied data.
-
-G. NEW WARNING `provider_rating_missing` emitted when neither
-   `recommendationKey` nor `recommendationMean` is present on Yahoo's
-   info payload. Lets the audit / Data Quality Alerts section
-   distinguish "Yahoo had no rating" from "Yahoo had a rating that
-   normalized to HOLD".
-
-H. DATA QUALITY SCORE bumped to give a small +2 bonus when
-   provider_rating is populated. Matches the v6.1.0 +3 bonus for
-   target_mean_price -- analyst ratings are a quality signal even
-   when the score isn't a hard dependency.
-
-I. RECOMMENDATION ALIASES TABLE preserved for use by both
-   `map_recommendation` (canonical 8-tier output) and
-   `extract_provider_rating` (raw Yahoo vocabulary canonicalization).
-   Single source of truth for what Yahoo can emit.
-
-PRESERVED VERBATIM FROM v6.2.0:
-- All v6.2.0 identity-defaults work (suffix table, SSOT delegation,
-  _infer_asset_class fallthrough, _blocking_fetch identity-fill block).
-- All v6.1.0 UA rotation + 52W bounds + forecast magnitude work.
-- All v6.0.0 lazy-init / singleflight / circuit breaker / cache work.
-- Every name in __all__ -- no removals.
-- Every existing field in the output patch -- only ADDITIVE expansion.
-- All legacy aliases (price, prev_close, 52w_high, etc.) preserved.
-
-DEPLOYMENT NOTE.
-  v6.3.0 is strictly additive at the output-shape level. Existing
-  callers that consume `recommendation` continue to work, but they
-  now see CORRECT values for STRONG_SELL / OUTPERFORM / ACCUMULATE /
-  AVOID where v6.2.0 silently collapsed them. Callers that don't
-  consume `provider_rating` see no change. Callers that DO consume it
-  (insights_builder v8.0.1, data_engine_v2 v5.76.0) now have the
-  provenance string they were missing.
-
-  Observable behaviour changes on the deployed runtime:
-    1. map_recommendation("strong_sell") -> "STRONG_SELL" (was "SELL")
-    2. map_recommendation("outperform")  -> "BUY"         (was "HOLD")
-    3. map_recommendation("accumulate")  -> "ACCUMULATE"  (was "HOLD")
-    4. New patch fields populated: provider_rating, provider_rating_score,
-       recommendation_source. Engine + builder consumption per their
-       v5.76.0 / v8.0.1 specs.
-
-================================================================================
-v6.2.0 Changes (preserved)  --  PROVIDER-SIDE IDENTITY DEFAULTS
-================================================================================
-Provider-side identity alignment with `enriched_quote.py` v4.6.0
-`_SUFFIX_TO_LOCALE`. Mirrors the v8.2.0 work done in
-`yahoo_chart_provider.py` -- consistency across both Yahoo providers
-means the downstream normalization stage has a uniform contract to
-rely on.
-
-Background: even with v6.1.0's UA rotation, Yahoo's `info` payload
-still occasionally lacks `country` / `currency` / `exchange` for
-delayed feeds, ADRs, and listings on less-trafficked exchanges
-(Boursa Kuwait, Qatar Stock Exchange, EGX, TASE, etc.). v6.1.0
-flagged these with `currency_missing_from_provider` warnings but did
-not fill the fields. v4.6.0's downstream repair then had to do the
-work -- and for tickers Yahoo had partially populated, the repair
-had to override stale US defaults.
-
-v6.2.0 fills the gap at the source so the downstream stage sees a
-fully-populated row and has nothing left to repair.
-
-New:
-  - `_infer_symbol_metadata_external`: optional binding to
-    `normalize.infer_symbol_metadata()` (the v5.3.0+ SSOT used by
-    `enriched_quote.py` v4.6.0 and `yahoo_chart_provider.py` v8.2.0).
-    When the import succeeds, the provider delegates to it for
-    identity inference.
-  - `_SUFFIX_TO_LOCALE_DEFAULTS`: 68-entry mapping of Yahoo suffixes
-    to `(exchange, currency, country)` -- byte-aligned with
-    `yahoo_chart_provider.py` v8.2.0. Covers GCC (.KW/.QA/.AE/.DFM/
-    .ADX/.SR/.EG), MENA (.TA/.TASE/.IS), Europe (.L/.DE/.PA/.AS/.MI/
-    .MC/.BR/.LS/.HE/.ST/.OL/.SW/.CO/.IR/.WA/.VI/.PR/.BD/.AT),
-    Asia-Pacific (.HK/.NS/.NSE/.BO/.T/.TYO/.KS/.KQ/.SI/.KL/.BK/.JK/
-    .SS/.SZ/.TW/.TWO/.AX/.NZ), Americas (.SA/.MX/.BA/.TO/.V/.CN/.NE/
-    .SN/.LM), Africa (.JO/.JSE).
-  - `_identity_defaults_for_symbol(norm_symbol)`: returns a dict with
-    `exchange`, `currency`, `country`, `asset_class` keys derived from
-    the symbol's structure. Resolution order: special patterns (=F
-    -> Future, =X -> Currency, ^ -> Index) first; SSOT delegation;
-    longest-match suffix; plain-alpha-as-US-equity convention;
-    finally all None for unknown formats.
-
-  Note: asset_class casing matches THIS file's convention
-  ("Equity" / "Future" / "Currency" / "Index" -- mixed case), NOT
-  the chart provider's UPPERCASE ("EQUITY" / "FX"). The chart and
-  fundamentals providers historically use different casings; we
-  preserve each file's contract.
-
-Modified:
-  - `_infer_asset_class`: when Yahoo's `quoteType` is blank, falls
-    through to `_identity_defaults_for_symbol` so 60+ stock-exchange
-    suffixes return "Equity" (v6.1.0 only handled .SR / =F / =X).
-  - `_blocking_fetch` identity block: after extracting Yahoo's
-    `currency` / `country` / `exchange` / `asset_class`, fills any
-    blanks from `_identity_defaults_for_symbol(norm_symbol)`.
-    Yahoo's explicit values always win when present. The existing
-    `currency_missing_from_provider` warning is naturally suppressed
-    when the field gets filled from the suffix table (the warning
-    block runs AFTER the fill and checks final state).
-
-Bumped:
-  - `PROVIDER_VERSION = "6.2.0"`.
-
-NOT changed (deliberate):
-  - v6.1.0 UA rotation, exponential backoff, 52W bounds validation,
-    forecast magnitude check -- all preserved verbatim.
-  - Patch shape is purely additive in behaviour: fields that were
-    `None` in v6.1.0 may now be populated from the suffix table.
-    No fields renamed, no fields removed. Downstream consumers see
-    more data, never less.
-  - `industry_missing_from_provider` / `sector_missing_from_provider`
-    warnings still fire when Yahoo can't supply those fields -- the
-    suffix table doesn't know industry or sector, so the original
-    audit signal stays.
-
-v6.1.0 Changes (from v6.0.0)
-----------------------------
-Resilience (HTTP 403 / 429 from Yahoo):
-  - USER-AGENT ROTATION. Production audit (May 2026) showed widespread
-    blank Industry / Sector / Forward P/E / Dividend Yield columns
-    across Global_Markets and Market_Leaders, caused by Yahoo's edge
-    layer returning HTTP 403 to requests carrying the default
-    python-urllib User-Agent. v6.1.0 mirrors yahoo_chart_provider v8.2.0:
-    constructs a `requests.Session` carrying one of 8 modern browser UA
-    strings (Chrome / Firefox / Safari on Win / Mac / Linux) and passes
-    it to `yf.Ticker(symbol, session=session)`. The UA is re-rotated on
-    every retry. Gracefully degrades to bare `yf.Ticker(symbol)` when
-    `requests` is unavailable, when the running yfinance doesn't accept
-    the `session` kwarg, or when `YF_USER_AGENT_ROTATION=0`.
-  - EXPONENTIAL BACKOFF WITH JITTER. v6.0.0 retried 4 times with a flat
-    0.5s sleep and no detection of rate-limit signals. v6.1.0 uses
-    base = min(8.0, 0.5 * 2**attempt) with 25% jitter, doubles the
-    cooldown when the error string contains 403/429/forbidden/rate-limit
-    markers, and rotates the session UA between attempts.
-  - Retry count is now configurable via `YF_RETRY_ATTEMPTS`.
-
-Data accuracy (currency-mismatch guard):
-  - 52W BOUNDS VALIDATION. Yahoo's `info` block occasionally returns
-    `fiftyTwoWeekHigh` / `fiftyTwoWeekLow` in a foreign listing's
-    currency while `current_price` is correctly in the primary
-    listing's currency (BP.US, RIO.US, BRK-B.US, CHT.US, ASR.US,
-    ZTO.US, PRU.L all showed this in the May 2026 audit). v6.1.0
-    validates both info-derived and history-derived bounds via the
-    |candidate / current_price| ratio (default suspect thresholds:
-    >= 8.0 or <= 0.125), drops the offender, and falls back to the
-    in-range source when one is available. Same logic as
-    yahoo_chart_provider v8.2.0 -- consistent across both Yahoo
-    providers so the engine sees uniform behavior.
-  - FORECAST MAGNITUDE SANITY. `forecast_price_12m` (built from
-    `target_mean_price`) is now compared against `current_price`; if
-    the ratio is outside [0.1, 10] the forecast and its dependent
-    `expected_roi_12m` are both dropped (with the matching
-    `forecast_magnitude_suspect` warning). Yahoo analyst targets
-    occasionally arrive in the wrong currency for dual-listings.
-
-Observability:
-  - STRUCTURED `warnings: List[str]` IN OUTPUT. Same channel as
-    yahoo_chart_provider v8.2.0. Examples emitted:
-      `info_empty`, `history_empty`, `industry_missing_from_provider`,
-      `sector_missing_from_provider`, `currency_missing_from_provider`,
-      `week_52_high_unit_mismatch_dropped`,
-      `week_52_high_used_history_fallback`,
-      `week_52_high_history_unit_mismatch_dropped`,
-      `forecast_magnitude_suspect`,
-      `current_price_outside_52w_range`,
-      `fetch_failed:<ExceptionClass>`.
-    `enriched_quote.py` v4.3.0 already coerces these into the
-    "; "-joined string the sheet's Warnings column expects.
-  - `last_error_class` recorded on full-fail returns for diagnostics.
-
-Configuration:
-  - New env vars (all default ON for production parity with chart v8.2.0):
-      YF_USER_AGENT_ROTATION  (default: 1)   enable session-based UA rotation
-      YF_PRICE_SANITY_GUARD   (default: 1)   enable 52W bounds validation
-      YF_RETRY_ATTEMPTS       (default: 4)   per-fetch retry cap
-      YF_PRICE_RATIO_HIGH     (default: 8.0) suspect-ratio upper threshold
-      YF_PRICE_RATIO_LOW      (default: 0.125) suspect-ratio lower threshold
-
-v6.0.0 Changes (PRESERVED verbatim)
------------------------------------
-Bug fixes from v5.5.0:
-  - `self.enabled` is now a proper @property backed by `_configured()`.
-  - `self.semaphore` is lazy-initialized and actually acquired in fetches.
-  - `fetch_fundamentals_batch` accepts a `concurrency` parameter and
-    gates tasks through an asyncio.Semaphore.
-  - Rate-limiter token acquisition moved INSIDE the singleflight callback.
-  - Module-level `_INSTANCE` eager instantiation replaced with lazy
-    `get_provider()` / `close_provider()`.
-  - All intra-class asyncio primitives lazy-init on first async use.
-
-Preserved for backward compatibility:
-  - Every name in __all__.
-  - All env variable names and defaults from v6.0.0.
-  - Patch shape (all fundamental/price/analyst fields and legacy aliases:
-    price, prev_close, open, change, change_pct, 52w_high, 52w_low,
-    forward_pe, pb, ps, peg, net_margin, revenue_growth,
-    dividend_yield_percent).
-  - DataQuality enum values.
-  - Redis cache support.
-  - Prometheus metrics shape.
-================================================================================
+(Header changelog condensed for working copy; behaviour preserved verbatim.)
 """
 
 from __future__ import annotations
@@ -389,7 +68,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.3.0"
+PROVIDER_VERSION = "6.3.1"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -400,16 +79,12 @@ _ARABIC_DIGITS = str.maketrans("\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667
 _K_M_B_T_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMBT])$", re.IGNORECASE)
 _K_M_B_T_MULT = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
 
-# v6.1.0: defaults for new resilience + accuracy settings
 DEFAULT_USER_AGENT_ROTATION = True
 DEFAULT_PRICE_SANITY_GUARD = True
 DEFAULT_RETRY_ATTEMPTS = 4
 DEFAULT_PRICE_RATIO_HIGH = 8.0
 DEFAULT_PRICE_RATIO_LOW = 0.125
 
-# v6.1.0: rotated User-Agent pool (modern browsers, ~Q1 2026). Identical
-# to yahoo_chart_provider v8.2.0 -- consistency across both Yahoo providers
-# makes server-side rate-limit identification predictable.
 _USER_AGENTS: Tuple[str, ...] = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -429,8 +104,6 @@ _USER_AGENTS: Tuple[str, ...] = (
     "Firefox/121.0",
 )
 
-# v6.1.0: substring markers used to detect rate-limit / auth errors in
-# yfinance exception text (it doesn't expose status codes cleanly).
 _RATE_LIMIT_MARKERS: Tuple[str, ...] = (
     "403", "429", "forbidden", "rate limit", "too many requests",
     "unauthorized", "401",
@@ -461,10 +134,6 @@ except ImportError:
     yf = None  # type: ignore[assignment]
     _HAS_YFINANCE = False
 
-# v6.1.0: `requests` is required for UA-rotation sessions. It's pulled in
-# transitively by yfinance, so this should always be available in any
-# environment where the provider can function -- but we degrade gracefully
-# if it's not.
 try:
     import requests  # type: ignore
     _HAS_REQUESTS = True
@@ -476,15 +145,9 @@ except ImportError:
 # =============================================================================
 # v6.2.0: Optional Identity SSOT (normalize.py v5.3.0+)
 # =============================================================================
-#
-# The PRIMARY path for symbol -> (exchange, currency, country) inference
-# delegates to core/symbols/normalize.py::infer_symbol_metadata() -- the
-# same SSOT used by enriched_quote.py v4.6.0 and yahoo_chart_provider.py
-# v8.2.0. When that import fails (running against an older normalize.py,
-# or no core package on path), we fall through to the local
-# _SUFFIX_TO_LOCALE_DEFAULTS table further down in this module.
 
 _infer_symbol_metadata_external: Optional[Callable[[str], Dict[str, Any]]] = None
+_to_yahoo_symbol_external: Optional[Callable[[str], str]] = None
 for _norm_path in (
     "core.symbols.normalize",
     "core.normalize",
@@ -496,11 +159,63 @@ for _norm_path in (
         _fn_v62 = getattr(_norm_mod_v62, "infer_symbol_metadata", None)
         if callable(_fn_v62):
             _infer_symbol_metadata_external = _fn_v62
+            # v6.3.1: bind to_yahoo_symbol from the SAME module so the
+            # yfinance call uses Yahoo-format suffixes (.NS/.DE/...).
+            _fn_y = getattr(_norm_mod_v62, "to_yahoo_symbol", None)
+            if callable(_fn_y):
+                _to_yahoo_symbol_external = _fn_y
             break
     except ImportError:
         continue
     except Exception:
         continue
+
+
+# v6.3.1: local EODHD->Yahoo suffix remap, used ONLY as a fallback for the
+# actual yfinance symbol when the normalize SSOT (to_yahoo_symbol) can't be
+# imported. Keeps the provider self-sufficient: an import failure must not
+# silently send Yahoo a suffix it can't resolve. Only the genuinely-divergent
+# suffixes are listed; everything else passes through unchanged.
+_EODHD_TO_YAHOO_LOCAL: Dict[str, str] = {
+    "NSE": "NS",     # India NSE   -> Yahoo .NS
+    "BSE": "BO",     # India BSE   -> Yahoo .BO
+    "XETRA": "DE",   # Germany     -> Yahoo .DE
+    "AU": "AX",      # Australia   -> Yahoo .AX
+    "KO": "KS",      # Korea KOSPI -> Yahoo .KS
+}
+
+
+def _local_to_yahoo_symbol(norm_symbol: str) -> str:
+    """Fallback EODHD->Yahoo remap (used only when the SSOT import failed)."""
+    s = (norm_symbol or "").strip()
+    if not s or "." not in s:
+        return s
+    base, _, suf = s.rpartition(".")
+    if not base:
+        return s
+    remapped = _EODHD_TO_YAHOO_LOCAL.get(suf.upper())
+    return f"{base}.{remapped}" if remapped else s
+
+
+def _to_yahoo_provider_symbol(norm_symbol: str) -> str:
+    """
+    v6.3.1: Yahoo-format symbol for the ACTUAL yf.Ticker call.
+
+    Prefers the normalize SSOT (to_yahoo_symbol); falls back to the local
+    suffix remap above. Never returns empty -- if everything fails, the
+    original normalized symbol is returned unchanged (status-quo behaviour).
+    """
+    s = (norm_symbol or "").strip()
+    if not s:
+        return s
+    if _to_yahoo_symbol_external is not None:
+        try:
+            y = _to_yahoo_symbol_external(s)
+            if y:
+                return y
+        except Exception:
+            pass
+    return _local_to_yahoo_symbol(s)
 
 
 # =============================================================================
@@ -579,7 +294,6 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _configured() -> bool:
-    """Return True if the provider is enabled and yfinance is available."""
     return _env_bool("YF_ENABLED", True) and _HAS_YFINANCE
 
 
@@ -627,7 +341,6 @@ def _redis_url() -> str:
     return _env_str("REDIS_URL", "redis://localhost:6379/0")
 
 
-# v6.1.0: env helpers for new settings
 def _user_agent_rotation() -> bool:
     return _env_bool("YF_USER_AGENT_ROTATION", DEFAULT_USER_AGENT_ROTATION) and _HAS_REQUESTS
 
@@ -655,7 +368,6 @@ def _price_ratio_low() -> float:
 # =============================================================================
 
 def _utc_iso(dt: Optional[datetime] = None) -> str:
-    """Get UTC time in ISO format."""
     d = dt or datetime.now(timezone.utc)
     if d.tzinfo is None:
         d = d.replace(tzinfo=timezone.utc)
@@ -663,7 +375,6 @@ def _utc_iso(dt: Optional[datetime] = None) -> str:
 
 
 def _riyadh_iso(dt: Optional[datetime] = None) -> str:
-    """Get Riyadh time (UTC+3) in ISO format."""
     tz = timezone(timedelta(hours=3))
     d = dt or datetime.now(tz)
     if d.tzinfo is None:
@@ -672,7 +383,6 @@ def _riyadh_iso(dt: Optional[datetime] = None) -> str:
 
 
 def safe_str(x: Any) -> Optional[str]:
-    """Safely convert to non-empty stripped string; None for empty."""
     if x is None:
         return None
     s = str(x).strip()
@@ -680,7 +390,6 @@ def safe_str(x: Any) -> Optional[str]:
 
 
 def safe_float(x: Any) -> Optional[float]:
-    """Safely convert to float; handles Arabic digits, K/M/B/T, parens-negative."""
     if x is None:
         return None
     try:
@@ -717,19 +426,11 @@ def safe_float(x: Any) -> Optional[float]:
 
 
 def safe_int(x: Any) -> Optional[int]:
-    """Safely convert to int."""
     f = safe_float(x)
     return int(round(f)) if f is not None else None
 
 
 def _as_fraction(x: Any) -> Optional[float]:
-    """
-    Convert percent-like value to ratio using the abs>1.5 heuristic.
-
-    Yahoo returns margins/yields inconsistently (sometimes ratios like
-    0.025, sometimes percents like 2.5). The heuristic: if |v| > 1.5,
-    divide by 100; else return as-is.
-    """
     v = safe_float(x)
     if v is None:
         return None
@@ -737,7 +438,6 @@ def _as_fraction(x: Any) -> Optional[float]:
 
 
 def _pct_from_ratio(numerator: Any, denominator: Any) -> Optional[float]:
-    """Compute ratio = numerator / denominator (None-safe, zero-safe)."""
     a = safe_float(numerator)
     b = safe_float(denominator)
     if a is None or b is None or b == 0:
@@ -746,19 +446,12 @@ def _pct_from_ratio(numerator: Any, denominator: Any) -> Optional[float]:
 
 
 def clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove None and whitespace-only-string values from a patch dict.
-
-    v6.1.0: preserves a non-empty `warnings` list even though its presence
-    means the field "exists" -- caller code in enriched_quote.py expects
-    to see the list intact.
-    """
     out: Dict[str, Any] = {}
     for k, v in (p or {}).items():
         if v is None:
             continue
         if isinstance(v, str) and not v.strip():
             continue
-        # Preserve non-empty warnings list explicitly
         if k == "warnings" and isinstance(v, list):
             if v:
                 out[k] = v
@@ -768,18 +461,6 @@ def clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def normalize_symbol(symbol: str) -> str:
-    """
-    Normalize symbol to Yahoo Finance format.
-
-    Strips prefixes (TADAWUL:, SAUDI:, KSA:, ETF:, INDEX:) and suffixes
-    (.TADAWUL, .SAUDI, .KSA), then appends .SR for numeric KSA codes.
-
-    Examples:
-        "2222"           -> "2222.SR"
-        "2222.SR"        -> "2222.SR"
-        "TADAWUL:2222"   -> "2222.SR"
-        "AAPL"           -> "AAPL"
-    """
     s = (symbol or "").strip()
     if not s:
         return ""
@@ -803,7 +484,6 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def _is_ksa_symbol(norm_symbol: str) -> bool:
-    """Check if symbol is a normalized KSA symbol (ends in .SR with numeric code)."""
     u = (norm_symbol or "").strip().upper()
     if u.endswith(".SR"):
         code = u[:-3]
@@ -814,30 +494,9 @@ def _is_ksa_symbol(norm_symbol: str) -> bool:
 # =============================================================================
 # v6.3.0: Recommendation Vocabulary -- canonical 8-tier output + provider_rating
 # =============================================================================
-#
-# Two shapes coexist:
-#   - `map_recommendation(raw)` -> CANONICAL 8-TIER token consumed by the
-#     engine / advisor / scoring stack (matches schemas.py v7.0.0
-#     Recommendation enum: STRONG_BUY, BUY, ACCUMULATE, HOLD, REDUCE,
-#     SELL, STRONG_SELL, AVOID).
-#   - `extract_provider_rating(raw)` -> CANONICAL LOWERCASE token
-#     preserving Yahoo's native vocabulary (so insights_builder v8.0.1
-#     can compare against the engine's final recommendation for
-#     divergence detection).
-#
-# A single source-of-truth table maps the lowercase-normalized raw input
-# to (8-tier-token, provider-rating-token). Order matters: longer / more
-# specific keys MUST be checked before shorter ones to avoid the v6.2.0
-# precedence bug ("strong_sell" was matching the "sell" branch first
-# and being downgraded to SELL).
 
 # (8tier, provider_rating)  -- single source of truth for v6.3.0
 _RECO_VOCAB: Tuple[Tuple[str, str, str], ...] = (
-    # (lowercased+normalized key,  8-tier output,    provider_rating token)
-    # IMPORTANT: order matters -- "strong_sell" MUST come before "sell";
-    # "strong_buy" MUST come before "buy". Longer / more-specific tokens
-    # are checked first so substring matches don't pre-empt them.
-
     # --- Strong tokens (8-tier extremes) ---
     ("strong_buy",        "STRONG_BUY",   "strong_buy"),
     ("strongbuy",         "STRONG_BUY",   "strong_buy"),
@@ -885,69 +544,31 @@ _RECO_VOCAB: Tuple[Tuple[str, str, str], ...] = (
     ("sell",              "SELL",         "sell"),
 )
 
+# v6.3.1: length-descending view of the vocab used ONLY by the substring
+# pass, so longer/more-specific tokens are matched before shorter ones that
+# are substrings of them ("underperform" before "perform", "market_outperform"
+# before "outperform"/"perform"). The exact-match pass still iterates
+# _RECO_VOCAB in declaration order.
+_RECO_VOCAB_BY_LEN: Tuple[Tuple[str, str, str], ...] = tuple(
+    sorted(_RECO_VOCAB, key=lambda t: len(t[0]), reverse=True)
+)
+
 
 def _canonicalize_raw_recommendation(rec: Optional[str]) -> str:
-    """
-    Internal: lowercase + normalize separators for vocab table matching.
-
-    "STRONG BUY"  -> "strong_buy"
-    "strongBuy"   -> "strong_buy"   (camelCase split)
-    "MARKET PERFORM" -> "market_perform"
-    "Strong-Sell" -> "strong_sell"
-    None / ""     -> ""
-    """
     if not rec:
         return ""
     s = str(rec).strip()
     if not s:
         return ""
-    # camelCase split: insert "_" before any uppercase that follows a lowercase
-    # (so "strongBuy" -> "strong_Buy")
     s = re.sub(r"([a-z])([A-Z])", r"\1_\2", s)
     s = s.lower().strip()
-    # Normalize separators (space, dash, slash) to underscore
     for sep in (" ", "-", "/", ".", ","):
         s = s.replace(sep, "_")
-    # Collapse repeated underscores
     s = re.sub(r"_+", "_", s).strip("_")
     return s
 
 
 def map_recommendation(rec: Optional[str]) -> str:
-    """
-    Map Yahoo `recommendationKey` (or any broker-vocab alias) to the
-    canonical 8-tier output token consumed by schemas.py v7.0.0
-    `Recommendation` enum and the rest of the engine.
-
-    v6.3.0 (this revision):
-      - 8-tier output (was 5-tier in v6.2.0).
-      - Fixes 3 precedence / coverage bugs from v6.2.0:
-          * "strong_sell" now correctly returns STRONG_SELL (was SELL)
-          * "outperform" now correctly returns BUY (was HOLD)
-          * "accumulate" now correctly returns ACCUMULATE (was HOLD)
-      - Drives off the shared `_RECO_VOCAB` table -- single source of
-        truth across `map_recommendation` and `extract_provider_rating`.
-
-    None / unknown / unparseable -> "HOLD" (preserves v6.2.0 default for
-    backwards-compatibility with downstream code that expects a non-empty
-    return value).
-
-    Examples:
-        >>> map_recommendation("strong_buy")
-        'STRONG_BUY'
-        >>> map_recommendation("strongBuy")
-        'STRONG_BUY'
-        >>> map_recommendation("OUTPERFORM")
-        'BUY'
-        >>> map_recommendation("accumulate")
-        'ACCUMULATE'
-        >>> map_recommendation("Strong Sell")
-        'STRONG_SELL'
-        >>> map_recommendation("AVOID")
-        'AVOID'
-        >>> map_recommendation(None)
-        'HOLD'
-    """
     if not rec:
         return "HOLD"
     canon = _canonicalize_raw_recommendation(rec)
@@ -960,9 +581,9 @@ def map_recommendation(rec: Optional[str]) -> str:
             return out8
 
     # Second pass: substring match (for compound tokens like
-    # "strong_buy_with_conviction"). Order in _RECO_VOCAB ensures
-    # longer / more-specific tokens are checked first.
-    for key, out8, _provider in _RECO_VOCAB:
+    # "strong_buy_with_conviction"). v6.3.1: iterate length-descending so
+    # "underperform" beats "perform", "market_outperform" beats "outperform".
+    for key, out8, _provider in _RECO_VOCAB_BY_LEN:
         if key in canon:
             return out8
 
@@ -970,65 +591,24 @@ def map_recommendation(rec: Optional[str]) -> str:
 
 
 def extract_provider_rating(rec: Optional[str]) -> str:
-    """
-    v6.3.0: Canonicalize Yahoo's raw `recommendationKey` to a lowercase
-    underscore-separated token PRESERVING the provider's vocabulary
-    distinctions (so insights_builder v8.0.1 can compare it against the
-    engine's final 8-tier `recommendation` for divergence detection).
-
-    Distinct from `map_recommendation`: this preserves Yahoo's own
-    vocabulary (e.g., "outperform" stays "outperform"), while
-    `map_recommendation` collapses everything to the canonical 8-tier
-    set. The two are designed to be set side-by-side in the output
-    patch so downstream can see both.
-
-    Returns "" for None / "" / unparseable input. Unknown tokens that
-    don't match any vocab entry are still returned as their normalized
-    lowercase form (so a future Yahoo addition flows through to
-    insights_builder unchanged rather than getting collapsed silently).
-
-    Examples:
-        >>> extract_provider_rating("STRONG_BUY")
-        'strong_buy'
-        >>> extract_provider_rating("Strong Buy")
-        'strong_buy'
-        >>> extract_provider_rating("strongBuy")
-        'strong_buy'
-        >>> extract_provider_rating("OUTPERFORM")
-        'outperform'
-        >>> extract_provider_rating("underperform")
-        'underperform'
-        >>> extract_provider_rating("ACCUMULATE")
-        'accumulate'
-        >>> extract_provider_rating(None)
-        ''
-        >>> extract_provider_rating("")
-        ''
-    """
     if not rec:
         return ""
     canon = _canonicalize_raw_recommendation(rec)
     if not canon:
         return ""
 
-    # Exact match -> canonical provider-rating token
     for key, _out8, provider_tok in _RECO_VOCAB:
         if canon == key:
             return provider_tok
 
-    # Substring match (same precedence as map_recommendation)
-    for key, _out8, provider_tok in _RECO_VOCAB:
+    for key, _out8, provider_tok in _RECO_VOCAB_BY_LEN:
         if key in canon:
             return provider_tok
 
-    # Unknown vocabulary -- return the normalized form so downstream
-    # sees something rather than empty (the engine + insights_builder
-    # both tolerate unknown tokens).
     return canon
 
 
 def _get_attr(obj: Any, *names: str) -> Any:
-    """Get attribute or dict-key by multiple possible names."""
     if obj is None:
         return None
     for name in names:
@@ -1043,7 +623,6 @@ def _get_attr(obj: Any, *names: str) -> Any:
 
 
 def _pick(info: Dict[str, Any], *names: str) -> Any:
-    """Pick first existing key from dict (matches on presence, not truthiness)."""
     for name in names:
         if name in info:
             return info.get(name)
@@ -1051,7 +630,6 @@ def _pick(info: Dict[str, Any], *names: str) -> Any:
 
 
 def _coalesce(*vals: Any) -> Any:
-    """Return first non-None non-empty-string value."""
     for v in vals:
         if v is None:
             continue
@@ -1064,11 +642,6 @@ def _coalesce(*vals: Any) -> Any:
 # =============================================================================
 # v6.2.0: Identity Defaults Table (suffix -> exchange/currency/country)
 # =============================================================================
-#
-# Byte-aligned with enriched_quote.py v4.6.0 _SUFFIX_TO_LOCALE and
-# yahoo_chart_provider.py v8.2.0 _SUFFIX_TO_LOCALE_DEFAULTS. Used as
-# fallback when the normalize.py SSOT (`_infer_symbol_metadata_external`)
-# is unavailable.
 
 _SUFFIX_TO_LOCALE_DEFAULTS: Dict[str, Tuple[str, str, str]] = {
     # Hong Kong
@@ -1113,11 +686,13 @@ _SUFFIX_TO_LOCALE_DEFAULTS: Dict[str, Tuple[str, str, str]] = {
     ".SW":    ("SIX",                     "CHF", "Switzerland"),
     # Oceania
     ".AX":    ("ASX",                     "AUD", "Australia"),
+    ".AU":    ("ASX",                     "AUD", "Australia"),   # v6.3.1: EODHD-format Australia
     ".NZ":    ("NZX",                     "NZD", "New Zealand"),
     # Japan / Korea / SE Asia
     ".T":     ("TSE",                     "JPY", "Japan"),
     ".TYO":   ("TSE",                     "JPY", "Japan"),
     ".KS":    ("KRX",                     "KRW", "South Korea"),
+    ".KO":    ("KRX",                     "KRW", "South Korea"),   # v6.3.1: EODHD-format Korea
     ".KQ":    ("KOSDAQ",                  "KRW", "South Korea"),
     ".SI":    ("SGX",                     "SGD", "Singapore"),
     ".KL":    ("Bursa Malaysia",          "MYR", "Malaysia"),
@@ -1163,34 +738,11 @@ _SUFFIX_TO_LOCALE_DEFAULTS: Dict[str, Tuple[str, str, str]] = {
 
 
 def _identity_defaults_for_symbol(norm_symbol: str) -> Dict[str, Optional[str]]:
-    """
-    Return identity defaults (exchange / currency / country / asset_class)
-    derived purely from the normalized symbol's structure (v6.2.0).
-
-    Asset-class values match THIS file's convention ("Equity" / "Future" /
-    "Currency" / "Index" -- mixed case), NOT the chart provider's
-    UPPERCASE convention.
-
-    Resolution order (first match wins):
-      1. Empty / None             -> all None
-      2. `...=F` futures          -> NYMEX / USD / USA / Future
-      3. `...=X` FX pairs         -> CCY / None / None / Currency
-      4. `^...` indices           -> INDEX / None / None / Index
-      5. SSOT (normalize.py)      -> mapped to this file's casing
-      6. Longest-match suffix in  -> (exchange, currency, country) / Equity
-         _SUFFIX_TO_LOCALE_DEFAULTS
-      7. Plain alpha, no dot      -> NASDAQ/NYSE / USD / USA / Equity
-      8. Unknown                  -> all None (don't guess)
-
-    Used by `_infer_asset_class` and the `_blocking_fetch` identity block
-    when Yahoo's `info` payload doesn't supply the relevant field.
-    """
     if not norm_symbol:
         return {"exchange": None, "currency": None, "country": None, "asset_class": None}
 
     s = norm_symbol.strip().upper()
 
-    # Special patterns (these don't appear in _SUFFIX_TO_LOCALE_DEFAULTS)
     if s.endswith("=F"):
         return {"exchange": "NYMEX", "currency": "USD", "country": "USA", "asset_class": "Future"}
     if s.endswith("=X"):
@@ -1198,8 +750,6 @@ def _identity_defaults_for_symbol(norm_symbol: str) -> Dict[str, Optional[str]]:
     if s.startswith("^"):
         return {"exchange": "INDEX", "currency": None, "country": None, "asset_class": "Index"}
 
-    # SSOT path (normalize.py v5.3.0+) when available. Map the SSOT's
-    # asset_class to this file's casing convention.
     if _infer_symbol_metadata_external is not None:
         try:
             meta = _infer_symbol_metadata_external(s)
@@ -1232,7 +782,6 @@ def _identity_defaults_for_symbol(norm_symbol: str) -> Dict[str, Optional[str]]:
         except Exception:
             pass
 
-    # Local table fallback: longest matching suffix wins
     best_suffix: Optional[str] = None
     for suf in _SUFFIX_TO_LOCALE_DEFAULTS:
         if s.endswith(suf):
@@ -1247,7 +796,6 @@ def _identity_defaults_for_symbol(norm_symbol: str) -> Dict[str, Optional[str]]:
             "asset_class": "Equity",
         }
 
-    # Plain alpha with no dot -> US equity by Yahoo convention
     if "." not in s:
         return {
             "exchange": "NASDAQ/NYSE",
@@ -1256,22 +804,10 @@ def _identity_defaults_for_symbol(norm_symbol: str) -> Dict[str, Optional[str]]:
             "asset_class": "Equity",
         }
 
-    # Unknown suffix -> don't guess
     return {"exchange": None, "currency": None, "country": None, "asset_class": None}
 
 
 def _infer_asset_class(info: Dict[str, Any], norm_symbol: str) -> Optional[str]:
-    """
-    Infer asset class from info dict and symbol suffix.
-
-    Priority order (v6.2.0):
-      1. Yahoo `info.quoteType` (or `info.instrumentType` / `info.typeDisp`)
-         when present, mapped through the casing table below.
-      2. v6.2.0: fall through to `_identity_defaults_for_symbol` which
-         covers 60+ stock-exchange suffixes (all return "Equity") plus
-         the futures (Future) / FX (Currency) / index (Index) special
-         patterns. Replaces v6.1.0's hand-coded .SR / =F / =X checks.
-    """
     q = safe_str(_pick(info, "quoteType", "instrumentType", "typeDisp"))
     if q:
         qn = q.strip().upper().replace(" ", "_")
@@ -1290,8 +826,6 @@ def _infer_asset_class(info: Dict[str, Any], norm_symbol: str) -> Optional[str]:
         if qn in mapping:
             return mapping[qn]
 
-    # v6.2.0: suffix-table fallthrough (replaces v6.1.0's hand-coded
-    # .SR / =F / =X / _is_ksa_symbol checks; covers same patterns + 60 more)
     defaults = _identity_defaults_for_symbol(norm_symbol)
     return defaults.get("asset_class")
 
@@ -1301,25 +835,10 @@ def _infer_asset_class(info: Dict[str, Any], norm_symbol: str) -> Optional[str]:
 # =============================================================================
 
 def _pick_random_ua() -> str:
-    """Pick a User-Agent string uniformly at random from the pool."""
     return random.choice(_USER_AGENTS)
 
 
 def _create_yf_session(use_rotation: bool) -> Optional[Any]:
-    """
-    Create a requests.Session pre-loaded with a rotated browser User-Agent.
-
-    Returns None if:
-      - requests is not installed, OR
-      - `use_rotation` is False (e.g. YF_USER_AGENT_ROTATION=0).
-
-    The session is suitable to pass into yfinance:
-        yf.Ticker(symbol, session=_create_yf_session(True))
-
-    Newer yfinance versions accept the `session` kwarg and route their
-    underlying HTTP calls through it; older versions ignore it (we wrap
-    the constructor in try/except to handle that).
-    """
     if not use_rotation or not _HAS_REQUESTS or requests is None:
         return None
     try:
@@ -1347,7 +866,6 @@ def _create_yf_session(use_rotation: bool) -> Optional[Any]:
 
 
 def _rotate_session_ua(session: Any) -> None:
-    """Rotate the User-Agent header on an existing session (in-place)."""
     if session is None:
         return
     try:
@@ -1357,7 +875,6 @@ def _rotate_session_ua(session: Any) -> None:
 
 
 def _is_rate_limit_error(err: Optional[BaseException]) -> bool:
-    """Heuristic: does the error string look like a 403 / 429 / rate-limit?"""
     if err is None:
         return False
     try:
@@ -1368,11 +885,6 @@ def _is_rate_limit_error(err: Optional[BaseException]) -> bool:
 
 
 def _construct_ticker(symbol: str, session: Any) -> Any:
-    """
-    Construct a yf.Ticker. Try with `session=` first (newer yfinance);
-    fall back to positional-only construction if the kwarg is rejected.
-    Returns None when yfinance itself is unavailable.
-    """
     if yf is None:
         return None
     if session is None:
@@ -1380,7 +892,6 @@ def _construct_ticker(symbol: str, session: Any) -> Any:
     try:
         return yf.Ticker(symbol, session=session)
     except TypeError:
-        # Older yfinance: doesn't accept session kwarg
         return yf.Ticker(symbol)
     except Exception as exc:
         logger.debug("yf.Ticker(%s, session=...) failed (%s); retrying bare",
@@ -1402,13 +913,6 @@ def _is_suspect_price_ratio(
     ratio_high: float = DEFAULT_PRICE_RATIO_HIGH,
     ratio_low: float = DEFAULT_PRICE_RATIO_LOW,
 ) -> bool:
-    """
-    Return True if `candidate` is suspiciously far from `ref` (likely a
-    currency/scale mismatch -- e.g. GBX value paired with a USD reference).
-
-    Both must be positive finite floats. Caller supplies thresholds; the
-    defaults [0.125, 8.0] match yahoo_chart_provider v8.2.0.
-    """
     if ref is None or candidate is None:
         return False
     if ref <= 0 or candidate <= 0:
@@ -1428,17 +932,6 @@ def _validate_52w_bounds(
     ratio_high: float = DEFAULT_PRICE_RATIO_HIGH,
     ratio_low: float = DEFAULT_PRICE_RATIO_LOW,
 ) -> Tuple[Optional[float], Optional[float], List[str]]:
-    """
-    Validate 52W high/low against `current_price` for unit consistency.
-
-    Same logic as yahoo_chart_provider v8.2.0:
-      1. If info-provided bound is suspect, try history-derived as fallback.
-      2. If history-derived is also suspect (or info was chosen), drop -> None.
-      3. If high < low after validation, swap them.
-      4. Flag current_price > 5% outside [low, high].
-
-    Returns: (validated_high, validated_low, warnings)
-    """
     warnings: List[str] = []
 
     if not enabled:
@@ -1511,12 +1004,10 @@ def _validate_52w_bounds(
     else:
         lo = None
 
-    # Sanity: high >= low
     if hi is not None and lo is not None and hi < lo:
         warnings.append("week_52_high_low_inverted")
         hi, lo = lo, hi
 
-    # Informational: current price should sit in the validated band
     if hi is not None and cp > hi * 1.05:
         warnings.append("current_price_outside_52w_range")
     elif lo is not None and cp < lo * 0.95:
@@ -1533,10 +1024,6 @@ def _validate_forecast_magnitude(
     ratio_high: float = DEFAULT_PRICE_RATIO_HIGH,
     ratio_low: float = DEFAULT_PRICE_RATIO_LOW,
 ) -> Tuple[Optional[float], List[str]]:
-    """
-    Drop the forecast price when its ratio to the current price is
-    outside the suspect band. Returns (validated_forecast_price, warnings).
-    """
     warnings: List[str] = []
     if not enabled:
         return forecast_price, warnings
@@ -1558,7 +1045,6 @@ def _validate_forecast_magnitude(
 # =============================================================================
 
 class DataQuality(str, Enum):
-    """Data quality levels."""
     EXCELLENT = "EXCELLENT"
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
@@ -1569,7 +1055,6 @@ class DataQuality(str, Enum):
 
 
 def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
-    """Score data quality based on field completeness; returns (quality, score 0-100)."""
     score = 0.0
 
     if safe_str(patch.get("symbol")):
@@ -1623,10 +1108,6 @@ def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
         score += 5
     if safe_int(patch.get("analyst_count")) is not None:
         score += 3
-    # v6.3.0: small bonus when the provider supplies a canonical rating.
-    # Matches the analyst-signal weighting pattern -- a populated
-    # provider_rating is a meaningful quality indicator independent
-    # of the analyst_count field.
     if safe_str(patch.get("provider_rating")):
         score += 2
 
@@ -1649,7 +1130,6 @@ def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
 
 @dataclass(slots=True)
 class CacheStats:
-    """Cache statistics."""
     hits: int = 0
     misses: int = 0
     sets: int = 0
@@ -1667,8 +1147,6 @@ class CacheStats:
 
 
 class AdvancedCache:
-    """Async LRU+TTL cache with optional Redis L2."""
-
     def __init__(self, name: str, maxsize: int, ttl: float, use_redis: bool, redis_url: str):
         self.name = name
         self.maxsize = max(50, int(maxsize))
@@ -1677,7 +1155,7 @@ class AdvancedCache:
         self.redis_url = redis_url
         self._mem: Dict[str, Tuple[Any, float]] = {}
         self._touch: Dict[str, float] = {}
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock: Optional[asyncio.Lock] = None
         self.stats = CacheStats()
         self._redis: Any = None
         if self.use_redis:
@@ -1706,7 +1184,6 @@ class AdvancedCache:
         self.stats.evictions += 1
 
     async def get(self, prefix: str) -> Optional[Any]:
-        """Get value from cache (memory first, then Redis)."""
         k = self._key(prefix)
         now = time.monotonic()
         async with self._get_lock():
@@ -1739,7 +1216,6 @@ class AdvancedCache:
         return None
 
     async def set(self, prefix: str, value: Any, ttl: Optional[float] = None) -> None:
-        """Set value in cache (memory + Redis)."""
         k = self._key(prefix)
         exp = time.monotonic() + float(ttl or self.ttl)
         now = time.monotonic()
@@ -1759,7 +1235,6 @@ class AdvancedCache:
                 pass
 
     async def close(self) -> None:
-        """Close Redis connection if open."""
         if self.use_redis and self._redis:
             try:
                 await self._redis.close()
@@ -1768,20 +1243,17 @@ class AdvancedCache:
         self._redis = None
 
     async def size(self) -> int:
-        """Current memory cache size."""
         async with self._get_lock():
             return len(self._mem)
 
 
 class TokenBucket:
-    """Token bucket rate limiter."""
-
     def __init__(self, rate_per_sec: float):
         self.rate = max(0.0, float(rate_per_sec))
         self.capacity = max(1.0, self.rate * 2.0) if self.rate > 0 else 1.0
         self.tokens = self.capacity
         self.last = time.monotonic()
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock: Optional[asyncio.Lock] = None
 
     def _get_lock(self) -> asyncio.Lock:
         if self._lock is None:
@@ -1789,7 +1261,6 @@ class TokenBucket:
         return self._lock
 
     async def wait_and_acquire(self, tokens: float = 1.0) -> None:
-        """Wait until `tokens` are available, then deduct them."""
         if self.rate <= 0:
             return
         need = float(tokens)
@@ -1806,7 +1277,6 @@ class TokenBucket:
 
 
 class CircuitState(Enum):
-    """Circuit breaker states."""
     CLOSED = "closed"
     HALF_OPEN = "half_open"
     OPEN = "open"
@@ -1817,7 +1287,6 @@ class CircuitState(Enum):
 
 @dataclass(slots=True)
 class CircuitBreakerStats:
-    """Circuit breaker statistics."""
     state: CircuitState = CircuitState.CLOSED
     failures: int = 0
     successes: int = 0
@@ -1827,12 +1296,10 @@ class CircuitBreakerStats:
 
 
 class AdvancedCircuitBreaker:
-    """Circuit breaker with half-open probes."""
-
     def __init__(self, fail_threshold: int, cooldown_sec: float):
         self.fail_threshold = max(1, int(fail_threshold))
         self.stats = CircuitBreakerStats(cooldown_sec=float(cooldown_sec))
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock: Optional[asyncio.Lock] = None
         self._half_open_probe_used = False
 
     def _get_lock(self) -> asyncio.Lock:
@@ -1841,7 +1308,6 @@ class AdvancedCircuitBreaker:
         return self._lock
 
     async def allow_request(self) -> bool:
-        """Return True if request is allowed through."""
         if not _cb_enabled():
             return True
         async with self._get_lock():
@@ -1865,7 +1331,6 @@ class AdvancedCircuitBreaker:
             return False
 
     async def on_success(self) -> None:
-        """Record a successful request."""
         if not _cb_enabled():
             return
         async with self._get_lock():
@@ -1876,7 +1341,6 @@ class AdvancedCircuitBreaker:
             yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
 
     async def on_failure(self, status_code: int = 500) -> None:
-        """Record a failed request (may open the breaker)."""
         if not _cb_enabled():
             return
         async with self._get_lock():
@@ -1895,7 +1359,6 @@ class AdvancedCircuitBreaker:
             yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get circuit breaker statistics snapshot."""
         s = self.stats
         return {
             "state": s.state.value,
@@ -1909,10 +1372,8 @@ class AdvancedCircuitBreaker:
 
 
 class SingleFlight:
-    """Deduplicate concurrent requests for the same key."""
-
     def __init__(self) -> None:
-        self._lock: Optional[asyncio.Lock] = None  # lazy
+        self._lock: Optional[asyncio.Lock] = None
         self._futs: Dict[str, asyncio.Future] = {}
 
     def _get_lock(self) -> asyncio.Lock:
@@ -1921,7 +1382,6 @@ class SingleFlight:
         return self._lock
 
     async def run(self, key: str, coro_fn: Callable[[], Awaitable[Any]]) -> Any:
-        """Execute coroutine; concurrent callers for the same key share the result."""
         owner = False
         lock = self._get_lock()
         async with lock:
@@ -1952,8 +1412,6 @@ class SingleFlight:
 
 @dataclass(slots=True)
 class YahooFundamentalsProvider:
-    """Async provider for Yahoo Finance fundamentals."""
-
     name: str = PROVIDER_NAME
 
     timeout_sec: float = field(init=False)
@@ -1964,7 +1422,6 @@ class YahooFundamentalsProvider:
     singleflight: SingleFlight = field(init=False)
     fund_cache: AdvancedCache = field(init=False)
     err_cache: AdvancedCache = field(init=False)
-    # v6.1.0: resilience + accuracy settings (read once at init)
     user_agent_rotation: bool = field(init=False)
     price_sanity_guard: bool = field(init=False)
     retry_attempts: int = field(init=False)
@@ -1995,7 +1452,6 @@ class YahooFundamentalsProvider:
             use_redis=_enable_redis(),
             redis_url=_redis_url(),
         )
-        # v6.1.0
         self.user_agent_rotation = _user_agent_rotation()
         self.price_sanity_guard = _price_sanity_guard()
         self.retry_attempts = _retry_attempts()
@@ -2020,11 +1476,9 @@ class YahooFundamentalsProvider:
 
     @property
     def enabled(self) -> bool:
-        """Return True if YF_ENABLED and yfinance is installed."""
         return _configured()
 
     def _get_semaphore(self) -> asyncio.Semaphore:
-        """Lazy-initialize the concurrency-gating semaphore."""
         if self.semaphore is None:
             self.semaphore = asyncio.Semaphore(self.max_concurrency)
         return self.semaphore
@@ -2037,7 +1491,6 @@ class YahooFundamentalsProvider:
         period: str = "3mo",
         interval: str = "1d",
     ) -> List[Dict[str, Any]]:
-        """Fetch history rows from a yfinance Ticker (blocking)."""
         rows: List[Dict[str, Any]] = []
         try:
             hist = ticker.history(period=period, interval=interval, auto_adjust=False)
@@ -2064,7 +1517,6 @@ class YahooFundamentalsProvider:
         self,
         rows: Iterable[Dict[str, Any]],
     ) -> Tuple[Optional[float], Optional[float]]:
-        """Compute trailing 10d / 30d average volume from history rows."""
         vols = [safe_float(r.get("volume")) for r in rows]
         clean = [float(v) for v in vols if v is not None and v >= 0]
         if not clean:
@@ -2077,7 +1529,6 @@ class YahooFundamentalsProvider:
         self,
         rows: Iterable[Dict[str, Any]],
     ) -> Tuple[Optional[float], Optional[float]]:
-        """Compute 52-week high/low from history rows."""
         highs = [safe_float(r.get("high")) for r in rows]
         lows = [safe_float(r.get("low")) for r in rows]
         hs = [float(v) for v in highs if v is not None]
@@ -2087,18 +1538,6 @@ class YahooFundamentalsProvider:
     # -- Blocking fetch (runs in ThreadPoolExecutor) ---------------------
 
     def _blocking_fetch(self, norm_symbol: str) -> Dict[str, Any]:
-        """
-        Blocking yfinance fetch. Called via loop.run_in_executor.
-
-        v6.1.0:
-          - Uses a UA-rotated requests.Session for yf.Ticker.
-          - Retries up to `self.retry_attempts` times with exponential
-            backoff and 25% jitter; doubles cooldown on rate-limit
-            signals; rotates UA between attempts.
-          - Emits structured `warnings: List[str]` and `last_error_class`.
-          - Validates 52W bounds via the currency-mismatch guard.
-          - Validates forecast magnitude.
-        """
         warnings_list: List[str] = []
         if not _HAS_YFINANCE or yf is None:
             warnings_list.append("yfinance_not_installed")
@@ -2110,13 +1549,18 @@ class YahooFundamentalsProvider:
             }
 
         session = _create_yf_session(self.user_agent_rotation)
+        # v6.3.1: the symbol actually sent to Yahoo must be in Yahoo's suffix
+        # format (.NS/.DE/.AX/.KS), not the EODHD/canonical form -- otherwise
+        # international fundamentals come back empty. Output fields still report
+        # the canonical norm_symbol; provider_symbol records what was queried.
+        provider_symbol = _to_yahoo_provider_symbol(norm_symbol)
         max_attempts = max(1, int(self.retry_attempts))
         last_exc: Optional[BaseException] = None
         last_err_class: str = ""
 
         for attempt in range(max_attempts):
             try:
-                t = _construct_ticker(norm_symbol, session)
+                t = _construct_ticker(provider_symbol, session)
                 if t is None:
                     last_err_class = "RuntimeError"
                     last_exc = RuntimeError("yf_ticker_construct_failed")
@@ -2162,10 +1606,6 @@ class YahooFundamentalsProvider:
                     safe_float(_pick(info, "dayLow", "regularMarketDayLow")),
                 )
 
-                # 52W: collect raw info-derived AND history-derived, then
-                # pass both into the validator. v6.0.0 used _coalesce which
-                # silently preferred info even when info was in the wrong
-                # currency.
                 info_52w_high = _coalesce(
                     safe_float(_get_attr(fast_info, "fifty_two_week_high", "fiftyTwoWeekHigh", "week52High")),
                     safe_float(_pick(info, "fiftyTwoWeekHigh", "week52High")),
@@ -2244,17 +1684,16 @@ class YahooFundamentalsProvider:
                 target_low_price = safe_float(_pick(info, "targetLowPrice"))
                 analyst_count = safe_int(_pick(info, "numberOfAnalystOpinions"))
 
-                # v6.3.0: cascade-bridge fields. Preserve Yahoo's raw
-                # `recommendationKey` (canonical lowercase string) so
-                # insights_builder v8.0.1 can detect divergence between
-                # provider view and engine final recommendation. Also
-                # preserve Yahoo's numeric `recommendationMean` (1.0..5.0
-                # scale, lower=stronger buy). recommendation_source
-                # identifies this provider as the rating authority for
-                # the cascade-bridge chain.
+                # v6.3.0: cascade-bridge fields.
                 raw_rec_key = _pick(info, "recommendationKey")
                 provider_rating = extract_provider_rating(raw_rec_key)
                 provider_rating_score = safe_float(_pick(info, "recommendationMean"))
+                # v6.3.1: emit a canonical recommendation ONLY when Yahoo
+                # actually supplied a rating key. Otherwise leave it None so
+                # clean_patch strips it -- a missing Yahoo rating must NOT
+                # become a fake "HOLD" that data_engine_v2 could capture as a
+                # provider override (reopening the v5.77.17 corruption).
+                recommendation = map_recommendation(raw_rec_key) if provider_rating else None
                 recommendation_source: Optional[str] = (
                     PROVIDER_NAME if (provider_rating or provider_rating_score is not None) else None
                 )
@@ -2270,13 +1709,7 @@ class YahooFundamentalsProvider:
                 industry = safe_str(_pick(info, "industry"))
                 asset_class = _infer_asset_class(info, norm_symbol)
 
-                # v6.2.0: when Yahoo doesn't supply currency / country /
-                # exchange / asset_class, fall through to suffix-derived
-                # defaults aligned with enriched_quote.py v4.6.0. Yahoo's
-                # explicit values always win when present. The
-                # v6.1.0 warnings block below runs AFTER this fill and
-                # checks the FINAL state, so `currency_missing_from_provider`
-                # is naturally suppressed when the field gets filled.
+                # v6.2.0: identity defaults fill
                 _identity_defaults = _identity_defaults_for_symbol(norm_symbol)
                 if currency is None and _identity_defaults.get("currency"):
                     currency = _identity_defaults["currency"]
@@ -2306,7 +1739,6 @@ class YahooFundamentalsProvider:
                 short_ratio = safe_float(_pick(info, "shortRatio"))
                 short_percent = _as_fraction(_pick(info, "shortPercentOfFloat"))
 
-                # Fill margins from ratios if Yahoo didn't supply direct fields
                 if gross_margin is None:
                     gross_margin = _pct_from_ratio(_pick(info, "grossProfits"), revenue_ttm)
                 if operating_margin is None:
@@ -2341,8 +1773,6 @@ class YahooFundamentalsProvider:
                         forecast_method = "analyst_consensus"
                         ac = analyst_count or 1
                         forecast_confidence = min(0.95, 0.40 + (ac * 0.05))
-                    # If validation dropped the forecast, both fields stay None;
-                    # the warning explains why.
 
                 # Dedupe warnings while preserving order
                 seen_w: set = set()
@@ -2355,7 +1785,7 @@ class YahooFundamentalsProvider:
                 out: Dict[str, Any] = {
                     "requested_symbol": norm_symbol,
                     "symbol": norm_symbol,
-                    "provider_symbol": norm_symbol,
+                    "provider_symbol": provider_symbol,
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
                     "data_sources": [PROVIDER_NAME],
@@ -2415,13 +1845,9 @@ class YahooFundamentalsProvider:
                     "target_high_price": target_high_price,
                     "target_low_price": target_low_price,
                     "analyst_count": analyst_count,
-                    "recommendation": map_recommendation(raw_rec_key),
+                    "recommendation": recommendation,
 
-                    # v6.3.0: cascade-bridge fields (schemas.py v7.0.0
-                    # UnifiedQuote.provider_rating / recommendation_source;
-                    # consumed by data_engine_v2 v5.76.0 and surfaced by
-                    # insights_builder v8.0.1 Risk Alerts section for
-                    # divergence detection).
+                    # v6.3.0: cascade-bridge fields
                     "provider_rating": provider_rating or None,
                     "provider_rating_score": provider_rating_score,
                     "recommendation_source": recommendation_source,
@@ -2483,8 +1909,6 @@ class YahooFundamentalsProvider:
                 last_exc = exc
                 last_err_class = type(exc).__name__
 
-                # v6.1.0: exponential backoff with jitter; doubled cooldown
-                # on rate-limit signals; UA rotation between attempts.
                 base = min(8.0, 0.5 * (2 ** attempt))
                 if _is_rate_limit_error(exc):
                     base = min(16.0, base * 2.0)
@@ -2492,7 +1916,6 @@ class YahooFundamentalsProvider:
                 time.sleep(sleep_for)
                 _rotate_session_ua(session)
 
-        # All attempts exhausted
         if last_exc is not None:
             logger.warning("Yahoo fundamentals fetch failed for %s after %d attempts: %s",
                            norm_symbol, max_attempts, last_exc)
@@ -2508,7 +1931,6 @@ class YahooFundamentalsProvider:
     # -- Async fetch API -----------------------------------------------------
 
     async def fetch_fundamentals(self, symbol: str) -> Dict[str, Any]:
-        """Fetch fundamentals for a single symbol (cache + singleflight + circuit breaker)."""
         if not self.enabled or not symbol:
             return {}
 
@@ -2532,7 +1954,6 @@ class YahooFundamentalsProvider:
                 try:
                     res = await loop.run_in_executor(None, self._blocking_fetch, norm)
                     if "error" in res and res.get("data_quality") == DataQuality.ERROR.value:
-                        # v6.1.0: classify error for circuit breaker cooldown bump
                         last_cls = (res.get("last_error_class") or "").lower()
                         is_rate_limited = any(m in last_cls for m in ("403", "429"))
                         await self.circuit_breaker.on_failure(
@@ -2560,7 +1981,6 @@ class YahooFundamentalsProvider:
         symbols: List[str],
         concurrency: Optional[int] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """Batch fetch fundamentals for multiple symbols."""
         if not symbols:
             return {}
 
@@ -2585,7 +2005,6 @@ class YahooFundamentalsProvider:
         return results
 
     async def close(self) -> None:
-        """Close provider resources (Redis connections)."""
         try:
             await self.fund_cache.close()
         except Exception as exc:
@@ -2612,7 +2031,6 @@ def _get_provider_lock() -> asyncio.Lock:
 
 
 async def get_provider() -> YahooFundamentalsProvider:
-    """Get (or create) the singleton YahooFundamentalsProvider instance."""
     global _PROVIDER_INSTANCE
     if _PROVIDER_INSTANCE is not None:
         return _PROVIDER_INSTANCE
@@ -2623,7 +2041,6 @@ async def get_provider() -> YahooFundamentalsProvider:
 
 
 async def close_provider() -> None:
-    """Close and reset the singleton provider."""
     global _PROVIDER_INSTANCE
     if _PROVIDER_INSTANCE is not None:
         await _PROVIDER_INSTANCE.close()
@@ -2635,7 +2052,6 @@ async def close_provider() -> None:
 # =============================================================================
 
 async def fetch_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Fetch fundamentals patch for a symbol."""
     if args or kwargs:
         logger.debug("fetch_fundamentals_patch(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
     provider = await get_provider()
@@ -2643,36 +2059,26 @@ async def fetch_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Di
 
 
 async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Alias for fetch_fundamentals_patch."""
     return await fetch_fundamentals_patch(symbol, *args, **kwargs)
 
 
 async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Alias for fetch_fundamentals_patch."""
     return await fetch_fundamentals_patch(symbol, *args, **kwargs)
 
 
 async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Alias for fetch_fundamentals_patch."""
     return await fetch_fundamentals_patch(symbol, *args, **kwargs)
 
 
 async def quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Alias for fetch_fundamentals_patch."""
     return await fetch_fundamentals_patch(symbol, *args, **kwargs)
 
 
 async def enriched_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Alias for fetch_fundamentals_patch."""
     return await fetch_fundamentals_patch(symbol, *args, **kwargs)
 
 
-# v6.1.0: get_quote_patch alias for engine pick-order parity with
-# eodhd_provider v4.9.1. The engine's _pick_provider_callable prefers
-# "get_quote_patch" first; older Yahoo fundamentals callers may have
-# relied on fetch_fundamentals_patch.
 async def get_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Alias for fetch_fundamentals_patch (engine pick-order parity)."""
     return await fetch_fundamentals_patch(symbol, *args, **kwargs)
 
 
@@ -2681,7 +2087,6 @@ async def fetch_quotes(
     concurrency: Optional[int] = None,
     **kwargs: Any,
 ) -> Dict[str, Dict[str, Any]]:
-    """Batch fetch fundamentals for multiple symbols."""
     if kwargs:
         logger.debug("fetch_quotes: ignoring kwargs=%r", kwargs)
     provider = await get_provider()
@@ -2693,24 +2098,18 @@ async def fetch_quotes(
 # =============================================================================
 
 __all__ = [
-    # Metadata
     "PROVIDER_NAME",
     "PROVIDER_VERSION",
     "VERSION",
     "PROVIDER_BATCH_SUPPORTED",
-    # Classes
     "YahooFundamentalsProvider",
     "DataQuality",
-    # Utility
     "data_quality_score",
     "normalize_symbol",
-    # v6.3.0: 8-tier recommendation vocabulary + provider_rating helpers
     "map_recommendation",
     "extract_provider_rating",
-    # Singleton control
     "get_provider",
     "close_provider",
-    # Engine-facing functions
     "fetch_fundamentals_patch",
     "fetch_enriched_quote_patch",
     "fetch_quote",
