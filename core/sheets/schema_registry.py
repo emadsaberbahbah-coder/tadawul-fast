@@ -2,452 +2,94 @@
 # core/sheets/schema_registry.py
 """
 ================================================================================
-Schema Registry — v2.11.0
-(CANONICAL / SHEET-FIRST / STARTUP-SAFE / ALIAS-HARDENED / VIEW-AWARE FAMILY /
- INSIGHTS-EXTENDED / DECISION-MATRIX / CANDLESTICK-AWARE /
- CONVICTION-CRITERIA-EXTENDED / CANONICAL-RECO-PROVENANCE /
- ENGINE-V5.75.0-ALIGNED / SCORING-V5.6.0-ALIGNED / EQ-V4.7.0-ALIGNED)
+Schema Registry — v2.12.0
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-This module is the SINGLE source of truth for every sheet's column schema:
-- Exact header order (authoritative)
-- Column metadata (group, header, key, dtype, fmt, required, source, notes)
-- Sheet registry:
-    Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds,
-    My_Portfolio, Insights_Analysis, Top_10_Investments, Data_Dictionary
+SINGLE source of truth for every sheet's column schema (exact header order,
+column metadata, sheet registry). Sheets: Market_Leaders, Global_Markets,
+Commodities_FX, Mutual_Funds, My_Portfolio, Insights_Analysis,
+Top_10_Investments, Data_Dictionary.
 
-Hard rules:
-- No KSA_Tadawul (removed completely)
-- Sheet-rows endpoints MUST return full schema length using these keys
-- Missing values are allowed (null/empty), but columns MUST exist
-- No network calls. Import-safe.
+Hard rules: no KSA_Tadawul; sheet-rows endpoints must return full schema
+length using these keys; missing values allowed (null/empty) but columns MUST
+exist; no network calls; import-safe.
 
-Special sheets (must NOT fall back to the canonical instrument schema):
-- Insights_Analysis: 7 columns (plus criteria_fields metadata)
-- Top_10_Investments: canonical + 3 Top10 extras
-- Data_Dictionary: 9 columns (generated from registry)
+(The verbose pre-v2.12.0 cross-module changelog is condensed in this working
+copy; ALL code, validation logic, and per-column notes are preserved verbatim
+except where the v2.12.0 changelog below states otherwise.)
 
 ================================================================================
-Cross-module integration (May 2026 cross-stack family)
+v2.12.0  --  ENGINE-V5.77.17-ALIGNMENT  (the registry now MIRRORS the accepted
+            data_engine_v2 v5.77.17 instrument contract, key-for-key and
+            header-for-header, in EXACT order)
 ================================================================================
+This release stops the registry from validating only against its own internal
+constants and instead realigns it to the locked engine contract
+(data_engine_v2 v5.77.17 INSTRUMENT_CANONICAL_KEYS / INSTRUMENT_CANONICAL_HEADERS
+/ INSIGHTS_KEYS / INSIGHTS_HEADERS). Verified order-exact against that engine.
 
-The four "Views" columns (Fundamental / Technical / Risk / Value) are the
-contract between the scoring engine and the recommendation engine:
+1. NEW COLUMN: forecast_source (group "Forecast", header "Forecast Source",
+   key "forecast_source", str/text, source "model/system"). This is the
+   engine's 107th canonical key (added in engine v5.77.1, elevated to a
+   required canonical key in v5.77.3). It records forecast provenance:
+   "provider_target" (engine honoured an upstream analyst target),
+   "phase_ii_synthetic" (engine synthesized the forecast), or "fallback"
+   (engine fallback path created it). Appended as the FINAL canonical column.
+   -> instrument 106 -> 107, Top10 109 -> 110.
 
-  - core.scoring v5.2.8 derives them via derive_fundamental_view(),
-    derive_technical_view(), derive_risk_view(), derive_value_view() and
-    writes them to AssetScores. v5.2.5 also produces the four "Insights"
-    enrichment row fields (conviction_score, top_factors, top_risks,
-    position_size_hint), the canonical 5-tier recommendation, and the
-    scoring_errors field (provider_error:* / engine_dropped_valuation).
-    v5.2.7+ also emits the canonical priority band + provenance pair
-    (see "Canonical Reco" group below).
-  - core.reco_normalize v7.2.0 consumes them via Recommendation.from_views()
-    / recommendation_from_views() / recommendation_from_views_with_rule_id()
-    to apply the 5-tier priority cascade with EXPENSIVE/double-bearish
-    vetoes AND the conviction-floor downgrade. Conviction floors are
-    env-tunable via:
-        RECO_STRONG_BUY_CONVICTION_FLOOR (default 60.0)
-        RECO_BUY_CONVICTION_FLOOR        (default 45.0)
-    Below these floors, STRONG_BUY downgrades to BUY and BUY to HOLD.
-    v7.2.0 also fixed the AVOID-as-token mapping (now -> SELL, was
-    REDUCE) and introduced 14 RULE_ID_* constants for downstream audit.
-    Phase D added conviction-badge de-duplication so the conviction
-    badge does not appear twice in the recommendation reason when
-    upstream callers already include it.
+2. TAIL REORDER to match the engine's exact key order. The engine places the
+   scoring/provenance block BEFORE the candlestick block and ends with
+   forecast_source. Pre-v2.12.0 the registry emitted candlestick BEFORE the
+   Canonical-Reco / Scoring-v5.74 fields. The emit order is now:
+     recommendation_detailed, recommendation_priority,
+     provider_rating, recommendation_source, recommendation_priority_band,
+     scoring_recommendation_source, scoring_schema_version, scoring_errors,
+     opportunity_source, overall_score_raw, overall_penalty_factor,
+     candlestick_pattern, candlestick_signal, candlestick_strength,
+     candlestick_confidence, candlestick_patterns_recent,
+     forecast_source.
+   The COLUMN ORDER (keys + headers) is the contract; the `group` labels
+   ("Canonical Reco" / "Scoring v5.74" / "Candlestick" / "Decision") are
+   retained as field metadata even though they are now physically interleaved
+   (group is descriptive only and does not affect projection/order).
 
-The five "Insights" columns (sector_relative_score, conviction_score,
-top_factors, top_risks, position_size_hint, added in v2.6.0) are produced
-by core.scoring v5.2.5 as row fields on AssetScores (sector_relative_score
-uses an optional sector cohort; the other four are derived from the same
-fully-scored row that produces the recommendation). core.insights_builder
-v7.0.0 consumes them for the Top Picks section AND surfaces a NEW Data
-Quality Alerts section that aggregates the v5.60.0 engine warnings
-(engine-dropped valuation tags + forecast_unavailable tags + provider
-errors).
+3. HEADER FIX: recommendation_source header "Reco Source" -> "Recommendation
+   Source" to match the engine's INSTRUMENT_CANONICAL_HEADERS. (This was the
+   ONLY body header that differed from the engine; all other 105 headers
+   already matched.)
 
-The two "Decision Matrix" columns (recommendation_detailed,
-recommendation_priority, added in v2.7.0) are produced by
-core.data_engine_v2 v5.74.0 via the 8-tier classifier
-_classify_recommendation_8tier(). The canonical 5-tier `recommendation`
-field is preserved unchanged; the detailed/priority pair adds richer
-granularity (STRONG_SELL, SPECULATIVE_BUY, ACCUMULATE) that collapses
-back to the canonical token via _RECOMMENDATION_COLLAPSE_MAP. These two
-columns may be EMPTY when `recommendation` is set upstream by
-core.scoring -> core.reco_normalize, to avoid implying a detailed
-verdict that may disagree with the canonical one.
+4. INSIGHTS_ANALYSIS RECONCILED TO THE ENGINE CONTRACT (behavioral change):
+   was [Section, Item, Symbol, Metric, Value, Notes, Last Updated (Riyadh)]
+   keyed (section, item, symbol, metric, value, notes, last_updated_riyadh);
+   now [Section, Item, Metric, Value, Notes, Source, Sort Order] keyed
+   (section, item, metric, value, notes, source, sort_order) to match the
+   engine's INSIGHTS_KEYS / INSIGHTS_HEADERS. Column COUNT stays 7. Direction
+   chosen per the audit: the engine is the locked contract, so the registry
+   adopts it. NOTE: this drops `symbol` and `last_updated_riyadh` and adds
+   `source` and `sort_order` — insights_builder, the Insights route, and any
+   Apps Script reading the Insights page must use the engine keys.
 
-The five "Candlestick" columns (candlestick_pattern, candlestick_signal,
-candlestick_strength, candlestick_confidence, candlestick_patterns_recent,
-added in v2.7.0) are produced by core.candlesticks v1.0.0 when invoked
-from core.data_engine_v2 v5.74.0 on OHLC history rows. Detection is
-BEST-EFFORT and OPTIONAL (gated by the ENGINE_CANDLESTICKS_ENABLED env
-flag); when the candlesticks module is unavailable or detection raises,
-these five columns stay null.
+5. DOC UPDATES for the accepted scoring.py v5.7.1 8-tier vocabulary
+   (STRONG_BUY / BUY / ACCUMULATE / HOLD / REDUCE / SELL / STRONG_SELL /
+   AVOID): the Recommendation note no longer says "5-tier", the
+   Recommendation Detail note no longer says "6-tier mirror", and the stale
+   AVOID-asymmetry / "scoring.py v5.6.0" references are updated to v5.7.1
+   (AVOID is now its own canonical tier in scoring.py, not collapsed to
+   STRONG_SELL).
 
-The two "Canonical Reco" columns (recommendation_priority_band,
-recommendation_source, added in v2.9.0) are produced by core.scoring
-v5.2.8 as row fields on AssetScores and emitted by compute_scores()
-plus the public helpers derive_canonical_recommendation() and
-apply_canonical_recommendation(). They close the May 13 2026 cascade-
-discrepancy bug where the top-line `Recommendation` column disagreed
-with the bracketed [VERDICT] embedded in `Recommendation Detail`
-because two recommendation engines were running concurrently with
-different thresholds. Now there is a single canonical source of truth
-(scoring.py) with a provenance tag so downstream consumers can detect
-canonically-scored rows and skip parallel recomputation.
+6. NEW EXPORT: FORECAST_SOURCE_COLUMN_KEYS = ("forecast_source",), and a
+   matching validation check that the column is present on instrument sheets
+   and Top_10_Investments (mirrors the existing VIEW/INSIGHTS/DECISION/
+   CANDLESTICK/CANONICAL_RECO/SCORING_V574 enforcement). All prior required-
+   column checks are retained (their keys are unchanged, only reordered).
 
-  - recommendation_priority_band: P1..P5 priority band of the canonical
-    5-tier recommendation, DISTINCT from `recommendation_priority`
-    (Decision group: int 1..8 for which 8-tier rule fired). The two
-    fields coexist by design and are NOT interchangeable.
-  - recommendation_source: provenance tag. The canonical idempotency
-    check used by apply_canonical_recommendation() and downstream engines
-    (investment_advisor_engine v3.6.0+, data_engine_v2 v5.75.0) reads
-    this field to decide whether to recompute or short-circuit on
-    already-canonicalized rows. The engine v5.75.0 vocabulary for this
-    field is engine / provider_override / empty_row / scoring_unavailable
-    (set by _classify_recommendation_8tier()); the scoring.py provenance
-    tag is preserved SEPARATELY as `scoring_recommendation_source` in
-    the "Scoring v5.74" group to avoid collision.
+7. BUMP: SCHEMA_VERSION 2.11.0 -> 2.12.0; _CANONICAL_INSTRUMENT_COLS 106 ->
+   107; _TOP10_TOTAL_COLS 109 -> 110.
 
-    v2.11.0 addition: enriched_quote.py v4.7.0's _detect_and_mark_empty_row
-    also writes `"empty_row"` directly into this field as part of its
-    post-engine empty-row clear (full atomic-write field reset). The
-    write is idempotent with the engine's own empty-row branch and uses
-    the same vocabulary token, so engine-vocabulary readers see a
-    consistent empty state regardless of which layer detected it.
-
-    v2.11.0 contract note (engine v5.75.0): apply_canonical_recommendation()
-    now correctly forces recomputation when overwrite=True even if
-    recommendation_source already carries scoring.py's tag. Pre-v5.6.0
-    the inner derive_canonical_recommendation() had an unconditional
-    idempotency-skip that masked the bug whenever the engine cleared
-    the source field first; v5.6.0 threads overwrite through so the
-    skip is bypassed at the source. The engine v5.75.0's
-    _classify_recommendation_8tier() and _compute_scores_canonical_first()
-    use clear+overwrite semantics: recommendation_source is set to ""
-    before each scoring patch merge, and the patch is filtered through
-    recommendation_owned_keys to prevent the scoring layer's source tag
-    from overwriting the engine's vocabulary value.
-
-The seven "Scoring v5.74" columns (provider_rating,
-scoring_recommendation_source, scoring_schema_version, scoring_errors,
-opportunity_source, overall_score_raw, overall_penalty_factor, added
-in v2.10.0) align this registry with core.data_engine_v2 v5.74.0's
-expanded INSTRUMENT_CANONICAL_KEYS (97 -> 106). Produced by core.scoring
-v5.4.2+ as patch fields on the row dict emitted by compute_scores(),
-and preserved into the final row by core.data_engine_v2 v5.74.0 via
-_compute_scores_canonical_first() + _preserve_scoring_provenance() +
-_coerce_scoring_errors_for_sheet(). They close three gaps:
-
-  1. The v5.74.0 engine writes these on every row, but the v2.9.0
-     registry did not know about them -- so the Data_Dictionary sheet
-     was silently missing seven columns and any Apps Script writer
-     using header-mapped projection would skip them.
-  2. The engine's recommendation_source vocabulary (engine /
-     provider_override / empty_row / scoring_unavailable) and the
-     scoring.py recommendation_source tag (scoring.py vX.Y.Z) coexist
-     by routing the scoring.py value to scoring_recommendation_source.
-  3. The composite overall_score is now decomposed into the raw score
-     and the data-quality penalty factor, surfacing why a row's final
-     score may be lower than its component scores suggest.
-
-Downstream consumers:
-  - core.data_engine_v2 v5.74.0 (LANDED) is the new origin of these
-    fields. The canonical-first scoring wrapper
-    _compute_scores_canonical_first() calls core.scoring.compute_scores()
-    first, runs _preserve_scoring_provenance() to capture the seven
-    fields onto the row, then falls back to the local engine scorer
-    only on canonical-scorer failure. Asset-aware empty-row guard
-    _empty_row_fundamentals_exempt() also lands in v5.74.0 (FX, futures,
-    commodities, ETFs, funds, indices exempt from fundamentals-empty
-    check).
-  - Apps Script 03_Schema.gs + 04_Format.gs (pending) need to add the
-    seven new columns to the canonical column list and define number
-    formats for overall_score_raw (0.00), overall_penalty_factor
-    (0.0000), provider_rating (0.00). Text format for the four string
-    fields.
-
-Insights_Analysis CRITERIA block (v2.8.0): the criteria_fields tuple
-is the source of truth for the key/value rows rendered at the top of the
-Insights_Analysis sheet. core.analysis.criteria_model v3.1.0 reads these
-into the validated AdvisorCriteria pydantic model via from_kv_map() and
-from_rows(). v2.8.0 adds four entries aligned with criteria_model v3.1.0:
-    min_conviction_score             (was: min_conviction in v2.6.0/v2.7.0)
-    exclude_engine_dropped_valuation (NEW)
-    exclude_forecast_unavailable     (NEW)
-    exclude_provider_errors          (NEW)
-
-Upstream warning surface (v5.74.0 engine + v5.4.2 scoring):
-  - engine v5.74.0 emits the 5 engine-dropped-valuation tags into the
-    canonicalized `warnings` string ('; '-joined):
-      intrinsic_unit_mismatch_suspected,
-      upside_synthesis_suspect,
-      engine_52w_high_unit_mismatch_dropped,
-      engine_52w_low_unit_mismatch_dropped,
-      engine_52w_high_low_inverted
-  - engine v5.74.0 emits the 4 forecast-unavailable tags + bool flag:
-    forecast_unavailable, forecast_unavailable_no_source,
-    forecast_cleared_consistency_sweep, forecast_skipped_unavailable
-  - engine v5.74.0 preserves provider `last_error_class` from the
-    eodhd/yahoo_fundamentals/yahoo_chart/argaam/finnhub/tadawul
-    providers as an internal row field (NOT a schema column; surfaced
-    via the warnings parser helpers in scoring v5.4.2 / insights_builder
-    v7.0.0 / top10_selector v4.11.0).
-  - engine v5.74.0 NEW: writes scoring_errors as a '; '-joined string
-    coerced from list/tuple/set form. Routed through
-    _coerce_scoring_errors_for_sheet() to guarantee sheet-safe output.
-
-Downstream consumers:
-  - core.scoring_engine v3.4.4 (compatibility bridge) tracks
-    _V525_ENRICHMENT_FIELDS, _V528_CASCADE_BRIDGE_FIELDS,
-    _RECO_RULE_ID_SYMBOLS, and exposes is_reco_rule_id_aware() and
-    is_cascade_bridged() helpers for callers that need to detect
-    the v7.2.0+ rule_id-aware classification surface OR the v5.2.8+
-    canonical-priority-band surface.
-  - core.analysis.top10_selector v4.11.0 applies soft data-quality
-    penalties (env: TOP10_PENALTY_ENGINE_DROP=8.0,
-    TOP10_PENALTY_FORECAST_UNAVAIL=10.0) when warnings indicate
-    upstream data quality issues, and surfaces a data_quality_summary
-    in route response meta.
-  - core.analysis.insights_builder v7.0.0 renders the NEW Data Quality
-    Alerts section that aggregates these signals across the candidate
-    pool.
-  - core.investment_advisor_engine v3.6.0 (pending) replaces its
-    parallel `_recommendation_from_scores` ladder with
-    scoring_engine.apply_canonical_recommendation(row, overwrite=False)
-    — drop-in idempotent replacement keyed on recommendation_source.
-  - core.data_engine_v2 v5.74.0 (LANDED) replaced `_compute_recommendation`
-    with `_compute_scores_canonical_first()` that calls
-    core.scoring.compute_scores() canonically-first. Asset-aware empty
-    guard, scoring provenance preservation, and schema expansion
-    97 -> 106 all land together.
-  - Apps Script 04_Format.gs reads `recommendation_priority_band`
-    directly to build the `P# [VERDICT]:` Detail string for the
-    Recommendation Detail column, instead of recomputing locally.
-
-================================================================================
-Changelog
-================================================================================
-
-v2.11.0 (current)  --  CROSS-STACK-SYNC / NO-SCHEMA-CHANGE
-- DOCSTRING-ONLY release. Column count, validation logic, and exports
-  are unchanged from v2.10.0 (still 106 instrument / 109 Top10 / 7
-  Insights / 9 Data_Dictionary). What moved is the cross-stack version
-  references and the semantics of several fields whose producers shipped
-  refinements that didn't change the schema shape.
-- SEMANTIC CORRECTION: `recommendation_detailed` (Decision group). Per
-  v2.7.0/v2.10.0 docstring this was the "8-tier Decision Matrix verdict"
-  with eight distinct tokens including SPECULATIVE_BUY / ACCUMULATE.
-  Reality in core.data_engine_v2 v5.75.0 + core.scoring v5.6.0: it is
-  written ATOMICALLY as a mirror of `recommendation` -- the value space
-  is the canonical 6-tier enum, not a pre-collapse intermediate.
-  data_engine_v2 v5.75.0's _classify_recommendation_8tier() does
-  `row["recommendation_detailed"] = rec` immediately after writing
-  `row["recommendation"] = rec`; scoring.py v5.6.0 added
-  AssetScores.recommendation_detailed as a NEW field (mirror of
-  recommendation in the canonical 6-tier code). The "richer than" framing
-  was technically accurate ONLY in the v5.50.0 / v5.74.0 pre-collapse
-  era when the 8-tier intermediate was briefly surfaced as the
-  detailed value. v2.11.0 corrects the field docstring to describe
-  current behaviour.
-- CROSS-STACK SYNC: docstring updated to reference the May 2026
-  cross-stack family at its current revisions:
-    core.data_engine_v2 v5.74.0 -> v5.75.0 (LANDED): producer/consumer
-      contract for the recommendation pipeline (clear+overwrite semantics
-      in apply_canonical_recommendation, owned-keys filtering of the
-      scoring patch, _preserve_scoring_provenance to capture scoring.py's
-      source tag as scoring_recommendation_source). No new fields.
-    core.scoring v5.4.2 -> v5.6.0 (LANDED): adds recommendation_detailed
-      as an AssetScores field (mirror of recommendation), aligns AVOID
-      legacy alias to STRONG_SELL to match data_engine_v2's
-      _v573_collapse_to_canonical_enum, fixes derive_canonical_recommendation
-      to honour overwrite=True, hard-normalizes returned priority bands
-      to canonical P1..P5. Exposes _ENGINE_CONTRACT_VERSION="5.75.0" via
-      get_canonical_state().
-    core.enriched_quote v4.6.0 -> v4.7.0 (LANDED): _detect_and_mark_empty_row
-      now clears the FULL v5.75.0/v5.6.0 atomic-write field set
-      (recommendation_detailed, recommendation_priority_band,
-      recommendation_priority, scoring_recommendation_source,
-      scoring_schema_version, scoring_errors, overall_score_raw,
-      overall_penalty_factor, opportunity_source, conviction_score,
-      sector_relative_score, top_factors, top_risks, position_size_hint,
-      recommendation_detail), and writes
-      recommendation_source = "empty_row" using the engine vocabulary
-      from this registry's Canonical Reco group. Also adds
-      _normalize_scoring_errors_field() for defense-in-depth list->string
-      coercion of scoring_errors when rows bypass the engine's
-      _coerce_scoring_errors_for_sheet() (direct scoring path, snapshot
-      replay).
-- TYPICAL-VALUE BUMP: `scoring_recommendation_source` field docstring
-  previously cited "scoring.py v5.4.2" as the typical value; updated
-  to "scoring.py v5.6.0".
-- AVOID-ALIAS DISAMBIGUATION: documented in the Recommendation column
-  notes that the AVOID legacy alias now resolves differently in the
-  two normalization layers:
-    - core.reco_normalize v7.2.0:  AVOID -> SELL
-      (upstream provider-recommendation normalization)
-    - core.scoring v5.6.0:         AVOID -> STRONG_SELL
-      (scoring-output canonicalization, aligned with
-       data_engine_v2's _v573_collapse_to_canonical_enum)
-  Both are correct for their domain. reco_normalize handles legacy
-  provider strings where AVOID often means a moderate "do not buy"
-  recommendation; scoring.py and the engine handle internal
-  canonicalization where AVOID is treated as the most negative token
-  (STRONG_SELL-equivalent). Downstream consumers should be aware of
-  the two-layer asymmetry.
-- COLUMN COUNTS UNCHANGED: 106 instrument, 109 Top10, 7 Insights,
-  9 Data_Dictionary. No structural schema change. Validation unchanged.
-- BUMP: SCHEMA_VERSION 2.10.0 -> 2.11.0.
-
-v2.10.0  --  ENGINE-V5.74.0-ALIGNMENT / 7-NEW-SCHEMA-FIELDS
-- NEW: "Scoring v5.74" column group (7 columns, appended at END of the
-  instrument schema):
-    1. provider_rating                 (float, 0.00,    provider)
-    2. scoring_recommendation_source   (str,   text,    system)
-    3. scoring_schema_version          (str,   text,    system)
-    4. scoring_errors                  (str,   text,    system)
-    5. opportunity_source              (str,   text,    model)
-    6. overall_score_raw               (float, 0.00,    model)
-    7. overall_penalty_factor          (float, 0.0000,  model)
-  Aligned with core.data_engine_v2 v5.74.0's INSTRUMENT_CANONICAL_KEYS
-  expansion (97 -> 106). Two of the nine v5.74.0 fields were already
-  present in v2.9.0's Canonical Reco group (recommendation_priority_band,
-  recommendation_source), so only SEVEN net-new columns are added.
-- BUMP: instrument_table column count 99 -> 106; Top10 102 -> 109.
-- NEW EXPORT: `SCORING_V574_COLUMN_KEYS`.
-- NEW VALIDATION: instrument_table now requires the seven new Scoring
-  v5.74 columns. Same enforcement applied to Top_10_Investments.
-- DISAMBIGUATION: `scoring_recommendation_source` (Scoring v5.74 group)
-  is DISTINCT from `recommendation_source` (Canonical Reco group). The
-  engine v5.74.0 uses recommendation_source for its own vocabulary
-  (engine / provider_override / empty_row / scoring_unavailable) and
-  routes scoring.py's separate provenance tag to
-  scoring_recommendation_source. Both fields coexist by design.
-- SYNC: docstring updated to reference May 2026 cross-stack family:
-    core.data_engine_v2 v5.61.0 (pending) -> v5.74.0 (LANDED): canonical-
-      first scoring wrapper, asset-aware empty guard, scoring provenance
-      preservation, schema 97 -> 106.
-    core.scoring v5.2.8 -> v5.4.2+: emits 7 new patch fields on the
-      compute_scores() output row dict.
-- BUMP: SCHEMA_VERSION 2.9.0 -> 2.10.0.
-
-v2.9.0  --  CANONICAL-RECO-PROVENANCE / CASCADE-FIX SCHEMA SUPPORT
-- NEW: "Canonical Reco" column group (2 columns, appended at END of the
-  instrument schema):
-    1. recommendation_priority_band (str,   text,  model)
-    2. recommendation_source        (str,   text,  system)
-  Produced by core.scoring v5.2.8 as row fields on AssetScores and
-  emitted by compute_scores() / derive_canonical_recommendation() /
-  apply_canonical_recommendation(). Closes the May 13 2026 cascade-
-  discrepancy bug.
-- BUMP: instrument_table column count 97 -> 99; Top10 100 -> 102.
-- NEW EXPORT: `CANONICAL_RECO_COLUMN_KEYS`.
-- NEW VALIDATION: instrument_table now requires the two new Canonical
-  Reco columns. Same enforcement applied to Top_10_Investments.
-- DISAMBIGUATION: `recommendation_priority_band` (str, "P1".."P5") is
-  DISTINCT from `recommendation_priority` (Decision group, int 1..8 for
-  which 8-tier rule fired). Both coexist intentionally. The May 13 2026
-  audit identified a forward-looking name collision and resolved it by
-  renaming the canonical-priority-band field to its current name in
-  scoring.py v5.2.8.
-- SYNC: docstring updated to reference May 2026 cross-stack family:
-    core.scoring v5.2.5 -> v5.2.8
-    core.scoring_engine v3.4.2 -> v3.4.4
-- DOC: documented the new canonical-reco-provenance surface and the
-  pending downstream consumers (investment_advisor_engine v3.6.0,
-  data_engine_v2 v5.61.0, Apps Script 04_Format.gs).
-- BUMP: SCHEMA_VERSION 2.8.0 -> 2.9.0.
-
-v2.8.0  --  CONVICTION-CRITERIA-EXTENDED / CROSS-STACK SYNC
-- RENAME: criteria_fields key 'min_conviction' -> 'min_conviction_score'
-  for alignment with criteria_model v3.1.0's canonical field name.
-  Backwards-compatible: criteria_model v3.1.0's KV alias map accepts
-  both 'min_conviction' and 'min_conviction_score'.
-- NEW criteria_fields entries (v3.1.0 data-quality exclusions):
-    exclude_engine_dropped_valuation (bool, default 'false')
-    exclude_forecast_unavailable     (bool, default 'false')
-    exclude_provider_errors          (bool, default 'false')
-- SYNC: docstring updated to reference May 2026 cross-stack family:
-    core.scoring v5.1.0 -> v5.2.5
-    core.reco_normalize v7.1.0 -> v7.2.0
-    core.insights_builder v1.0.0 -> v7.0.0
-    core.data_engine_v2 v5.50.0+ -> v5.60.0+
-  Plus new references to:
-    core.scoring_engine v3.4.2 (compatibility bridge)
-    core.analysis.top10_selector v4.11.0 (consumer)
-    core.analysis.criteria_model v3.1.0 (criteria data model)
-- DOC: corrected attribution for the 5 Insights row fields -- they are
-  produced by core.scoring v5.2.5 (not core.insights_builder v1.0.0 as
-  the v2.7.0 docstring claimed).
-- DOC: documented env-tunable conviction floors
-  (RECO_STRONG_BUY_CONVICTION_FLOOR=60, RECO_BUY_CONVICTION_FLOOR=45)
-  consumed by reco_normalize v7.2.0 and mirrored in criteria_model
-  v3.1.0's get_strong_buy_conviction_floor() / get_buy_conviction_floor()
-  helpers.
-- DOC: documented the upstream warning surface from engine v5.60.0
-  (5 engine-dropped tags, 4 forecast-unavailable tags + bool, plus
-  preserved last_error_class as an internal row field).
-- NEW EXPORT: __version__ alias = SCHEMA_VERSION (TFB module
-  convention used by all v5/v7 family modules).
-- COLUMN COUNTS UNCHANGED: 97 instrument, 100 Top10, 7 Insights,
-  9 Data_Dictionary. No structural schema change.
-- BUMP: SCHEMA_VERSION 2.7.0 -> 2.8.0.
-
-v2.7.0
-- NEW: "Decision Matrix" column group (2 columns, appended at END):
-    1. recommendation_detailed (str, text, model)
-    2. recommendation_priority (int, 0,    model)
-  Aligns with core.data_engine_v2 v5.50.0+'s 8-tier Decision Matrix
-  classifier. The canonical `recommendation` 5-tier field is unchanged.
-- NEW: "Candlestick" column group (5 columns, appended at END):
-    1. candlestick_pattern         (str,   text,  derived)
-    2. candlestick_signal          (str,   text,  derived)
-    3. candlestick_strength        (str,   text,  derived)
-    4. candlestick_confidence      (float, 0.00,  derived)
-    5. candlestick_patterns_recent (str,   text,  derived)
-  Aligns with core.candlesticks v1.0.0 + core.data_engine_v2 v5.50.0+'s
-  candlestick wiring. 10 patterns supported (Doji, Hammer, Inverted
-  Hammer, Shooting Star, Hanging Man, Bullish/Bearish Marubozu,
-  Bullish/Bearish Engulfing, Morning Star, Evening Star).
-- BUMP: instrument_table column count 90 -> 97; Top10 93 -> 100.
-- NEW EXPORTS: `DECISION_COLUMN_KEYS`, `CANDLESTICK_COLUMN_KEYS`.
-- NEW VALIDATION: instrument_table now requires the seven new columns
-  (2 Decision + 5 Candlestick) AND all prior required columns (Views,
-  Insights). Same enforcement applied to Top_10_Investments.
-
-v2.6.0
-- NEW: "Insights" column group at the END of the canonical schema. Five
-  columns added (canonical 85 -> 90; Top10 88 -> 93):
-    1. sector_relative_score (float, 0-100, model)
-    2. conviction_score      (float, 0-100, model)
-    3. top_factors           (str,  text,    derived)
-    4. top_risks             (str,  text,    derived)
-    5. position_size_hint    (str,  text,    derived)
-- NEW EXPORT: `INSIGHTS_COLUMN_KEYS`.
-- NEW VALIDATION: instrument_table now requires the five Insights columns
-  AND the four View columns. Both are enforced at validation time.
-- DOC: Cross-module integration note expanded to cover insights_builder.
-
-v2.5.0
-- Version aligned with the view-aware recommendation family.
-- NEW EXPORT: `VIEW_COLUMN_KEYS`.
-- DOC sharpening on `value_view`, `risk_view`, `Upside %`.
-
-v2.4.0
-- Added `Upside %` (key: `upside_pct`) to the Valuation group.
-- Bumped instrument_table 84 -> 85 and Top10 87 -> 88.
-
-v2.3.0
-- Added the four "Views" columns (Fundamental / Technical / Risk / Value).
-
-v2.2.0
-- Top10 extras sanitized as a fragment.
-- Startup-safe validation (STRICT_SCHEMA_VALIDATION=1 to raise).
-- Stable sheet-name aliases.
-- Snapshot digest captures groups / formats / required flags.
+Deploy AFTER data_engine_v2 v5.77.17 (this registry now mirrors that engine's
+contract). Coordinate the Insights_Analysis key change (item 4) with
+insights_builder / the Insights route / Apps Script before relying on it.
 ================================================================================
 """
 
@@ -475,6 +117,8 @@ __all__ = [
     "CANONICAL_RECO_COLUMN_KEYS",
     # v2.10.0: 7 new fields aligning registry with engine v5.74.0
     "SCORING_V574_COLUMN_KEYS",
+    # v2.12.0: final canonical key (engine v5.77.17)
+    "FORECAST_SOURCE_COLUMN_KEYS",
     "SCHEMA_VALIDATED_OK",
     "SCHEMA_VALIDATION_ERRORS",
     "list_sheets",
@@ -492,7 +136,7 @@ __all__ = [
     "validate_schema_registry",
 ]
 
-SCHEMA_VERSION = "2.11.0"
+SCHEMA_VERSION = "2.12.0"
 # TFB module-version convention alias (mirrors scoring v5.6.0,
 # data_engine_v2 v5.75.0, enriched_quote v4.7.0, reco_normalize v7.2.0,
 # insights_builder v7.0.0, scoring_engine v3.4.4, top10_selector v4.11.0,
@@ -526,15 +170,16 @@ INSIGHTS_COLUMN_KEYS: Tuple[str, ...] = (
 
 
 # v2.7.0: Decision Matrix column keys, produced by core.data_engine_v2
-# v5.74.0's 8-tier classifier. The canonical 5-tier `recommendation`
-# field is preserved unchanged; this pair adds richer detail and a
-# numeric priority. May be EMPTY when `recommendation` is upstream-set.
+# v5.74.0's 8-tier classifier. The canonical `recommendation` field
+# (8-tier as of core.scoring v5.7.1) is preserved unchanged; this pair
+# adds richer detail and a numeric priority. May be EMPTY when
+# `recommendation` is upstream-set.
 #
 # IMPORTANT NAMING DISAMBIGUATION:
 #   - DECISION_COLUMN_KEYS[1] == "recommendation_priority" (int 1..8)
 #     The 8-tier classifier rule priority -- which rule fired.
 #   - CANONICAL_RECO_COLUMN_KEYS[0] == "recommendation_priority_band" (str P1..P5)
-#     The canonical 5-tier priority band from core.scoring v5.2.8.
+#     The canonical priority band (P1..P5) from core.scoring v5.7.1.
 # These two are DIFFERENT FIELDS with DIFFERENT SEMANTICS and coexist
 # by design.
 DECISION_COLUMN_KEYS: Tuple[str, ...] = (
@@ -590,25 +235,7 @@ CANONICAL_RECO_COLUMN_KEYS: Tuple[str, ...] = (
 # _coerce_scoring_errors_for_sheet().
 #
 # These seven fields expand the instrument schema from 99 -> 106 columns
-# to align with the v5.74.0 engine's INSTRUMENT_CANONICAL_KEYS. Field
-# breakdown:
-#   - provider_rating:               provider analyst-rating numeric
-#                                    (used by _classify_recommendation_8tier
-#                                    for provider_override logic)
-#   - scoring_recommendation_source: scoring.py's own recommendation_source
-#                                    tag, preserved SEPARATELY from the
-#                                    engine's `recommendation_source`
-#                                    (Canonical Reco group) which uses
-#                                    a different vocabulary
-#   - scoring_schema_version:        schema version tag from core.scoring
-#                                    at compute time
-#   - scoring_errors:                "; "-joined error string from scoring
-#                                    (coerced from list/tuple/set form)
-#   - opportunity_source:            provenance of opportunity_score
-#                                    (canonical/local/fallback branch)
-#   - overall_score_raw:             pre-penalty composite score
-#   - overall_penalty_factor:        penalty multiplier 0.0-1.0 applied
-#                                    to raw -> final overall_score
+# to align with the v5.74.0 engine's INSTRUMENT_CANONICAL_KEYS.
 SCORING_V574_COLUMN_KEYS: Tuple[str, ...] = (
     "provider_rating",
     "scoring_recommendation_source",
@@ -617,6 +244,19 @@ SCORING_V574_COLUMN_KEYS: Tuple[str, ...] = (
     "opportunity_source",
     "overall_score_raw",
     "overall_penalty_factor",
+)
+
+
+# v2.12.0: the engine's 107th / final canonical key. Produced by
+# core.data_engine_v2 v5.77.17 (added v5.77.1, elevated to a required
+# canonical key in v5.77.3 _INSTRUMENT_CANONICAL_REQUIRED_KEYS). Records
+# forecast provenance: "provider_target" (engine honoured an upstream
+# analyst target), "phase_ii_synthetic" (engine synthesized the forecast),
+# or "fallback" (engine fallback path created it). Empty/absent when no
+# forecast was produced. Appended as the FINAL canonical column so all
+# prior positional indices are preserved.
+FORECAST_SOURCE_COLUMN_KEYS: Tuple[str, ...] = (
+    "forecast_source",
 )
 
 
@@ -646,10 +286,10 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
 
 # Canonical column counts (centralized so the docstring, validation code,
 # and any downstream sanity-checkers agree on a single source of truth).
-# v2.10.0: bumped 99 -> 106 instrument, 102 -> 109 Top10 for the new
-# "Scoring v5.74" column group (7 columns appended at end).
-_CANONICAL_INSTRUMENT_COLS = 106  # 99 + 7 Scoring v5.74
-_TOP10_TOTAL_COLS = 109           # 106 + 3 Top10 extras
+# v2.12.0: bumped 106 -> 107 instrument, 109 -> 110 Top10 for the new
+# forecast_source column (engine v5.77.17), appended at end.
+_CANONICAL_INSTRUMENT_COLS = 107  # 106 + 1 forecast_source (v2.12.0)
+_TOP10_TOTAL_COLS = 110           # 107 + 3 Top10 extras
 _INSIGHTS_ANALYSIS_COLS = 7
 _DATA_DICTIONARY_COLS = 9
 
@@ -753,10 +393,11 @@ def _sanitize_sheet(spec: SheetSpec) -> SheetSpec:
 
 def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     """
-    Canonical 106 columns used by:
+    Canonical 107 columns used by:
       Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds, My_Portfolio
 
-    Column groups and counts (running total):
+    v2.12.0: realigned to data_engine_v2 v5.77.17's INSTRUMENT_CANONICAL_KEYS
+    (verified order-exact). Emit order and running totals:
       Identity (8)         ->   8
       Price (10)           ->  18
       Liquidity (6)        ->  24
@@ -771,25 +412,23 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
       Provenance (4)       ->  85
       Insights (5)         ->  90   (added v2.6.0)
       Decision (2)         ->  92   (added v2.7.0)
-      Candlestick (5)      ->  97   (added v2.7.0)
-      Canonical Reco (2)   ->  99   (added v2.9.0)
-      Scoring v5.74 (7)    -> 106   (added v2.10.0)
+      Provider Rating (1)  ->  93   (Scoring v5.74 group; engine places it here)
+      Canonical Reco (2)   ->  95   (recommendation_source, then priority_band)
+      Scoring v5.74 (6)    -> 101   (remaining scoring/provenance fields)
+      Candlestick (5)      -> 106   (engine places candlestick AFTER scoring)
+      Forecast Source (1)  -> 107   (added v2.12.0; engine's final canonical key)
 
     IMPORTANT:
-    - Keep keys stable.
-    - Add only at the END to preserve compatibility, OR bump SCHEMA_VERSION
-      AND coordinate with core.scoring / core.reco_normalize / both
-      investment_advisor* modules and their fallback column lists.
-    - v2.10.0: added the "Scoring v5.74" group (7 columns) at end of the
-      canonical block to align with core.data_engine_v2 v5.74.0's
-      INSTRUMENT_CANONICAL_KEYS (97 -> 106). All v2.9.0 positional
-      indices unchanged for the prior 99 columns; the new septet
-      occupies positions 100-106.
-    - v2.9.0: added the "Canonical Reco" group (2 columns) at end of the
-      canonical block. Decision (2) + Candlestick (5) groups from v2.7.0
-      preserved at their original positions. All v2.7.0 / v2.8.0
-      positional indices unchanged for the prior 97 columns; the new
-      pair occupies positions 98-99.
+    - Keep keys stable. The COLUMN ORDER (keys + headers) is the contract and
+      now mirrors data_engine_v2 v5.77.17 exactly; do not reorder without
+      re-checking against that engine.
+    - `group` labels are descriptive field metadata only. As of v2.12.0 the
+      Canonical-Reco and Scoring-v5.74 groups are physically interleaved to
+      match the engine's key order; this is intentional and does not affect
+      projection or column order.
+    - Add only at the END (after forecast_source) to preserve compatibility,
+      OR bump SCHEMA_VERSION AND coordinate with the engine + core.scoring +
+      core.reco_normalize + Apps Script.
     """
     cols: List[ColumnSpec] = []
 
@@ -903,16 +542,6 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     add("Scores", "Rank (Overall)", "rank_overall", "int", "0", False, "derived", "Rank within page/universe.")
 
     # Views (4) -> total 71   (added v2.3.0)
-    #
-    # The four View columns are derived from the underlying scores by
-    # core.scoring v5.2.8 (functions: derive_fundamental_view,
-    # derive_technical_view, derive_risk_view, derive_value_view) and
-    # then consumed by core.reco_normalize v7.2.0's view-aware 5-tier
-    # rule cascade in Recommendation.from_views() /
-    # recommendation_from_views() / recommendation_from_views_with_rule_id().
-    # Moving these columns or renaming their keys requires coordinated
-    # changes in those modules AND in both investment_advisor*.py
-    # fallback alias maps.
     add(
         "Views", "Fundamental View", "fundamental_view",
         "str", "text", False, "derived",
@@ -943,25 +572,21 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     add(
         "Recommendation", "Recommendation", "recommendation",
         "str", "text", False, "model/derived",
-        "5-tier canonical token: STRONG_BUY / BUY / HOLD / REDUCE / SELL. "
-        "Set by core.reco_normalize v7.2.0 with conviction-floor downgrade "
-        "applied (env: RECO_STRONG_BUY_CONVICTION_FLOOR=60, "
-        "RECO_BUY_CONVICTION_FLOOR=45). v5.2.8 cascade-bridge: this field "
-        "is now keyed to recommendation_source (see Canonical Reco group) "
-        "so downstream engines can detect canonically-scored rows and skip "
-        "parallel recomputation. v2.11.0 note: AVOID legacy alias resolves "
-        "asymmetrically across the two normalization layers, by design:\n"
-        "  - core.reco_normalize v7.2.0:  AVOID -> SELL\n"
-        "    (provider-input normalization layer; AVOID often means a "
-        "moderate 'do not buy' in legacy provider feeds)\n"
-        "  - core.scoring v5.6.0:         AVOID -> STRONG_SELL\n"
-        "    (scoring-output canonicalization, aligned with "
-        "data_engine_v2's _v573_collapse_to_canonical_enum where AVOID "
-        "is treated as the most negative token)\n"
-        "Both behaviours are intentional. The v5.6.0 alignment closed a "
-        "drift between scoring.py and the engine where the same legacy "
-        "AVOID label was being canonicalized to two different tokens "
-        "depending on which layer canonicalized first.",
+        "8-tier canonical token (best -> worst): STRONG_BUY / BUY / "
+        "ACCUMULATE / HOLD / REDUCE / SELL / STRONG_SELL / AVOID. Widened "
+        "from 5 tiers by core.scoring v5.7.1 + core.reco_normalize v8.0.0 "
+        "(ACCUMULATE added between BUY and HOLD; AVOID added as the worst-case "
+        "'do not enter or hold' tier). Conviction-floor downgrade still applies "
+        "(env: RECO_STRONG_BUY_CONVICTION_FLOOR=60, RECO_BUY_CONVICTION_FLOOR=45). "
+        "Keyed to recommendation_source (see Canonical Reco group) so downstream "
+        "engines can detect canonically-scored rows and skip parallel "
+        "recomputation. v2.12.0 note on the legacy AVOID alias: as of "
+        "core.scoring v5.7.1, AVOID is its OWN canonical tier and is NO LONGER "
+        "collapsed to STRONG_SELL (the v5.6.0 AVOID->STRONG_SELL alias was "
+        "removed). core.reco_normalize v8.0.0 likewise treats AVOID as a "
+        "distinct tier. The earlier two-layer asymmetry (reco_normalize "
+        "AVOID->SELL vs scoring AVOID->STRONG_SELL) is therefore resolved: "
+        "both layers now route AVOID to AVOID.",
     )
     add(
         "Recommendation", "Recommendation Reason", "recommendation_reason",
@@ -997,17 +622,6 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     )
 
     # Insights (5) -> total 90  (added v2.6.0)
-    #
-    # The five Insights columns are produced by core.scoring v5.2.5 as
-    # row fields on AssetScores (sector_relative_score additionally uses
-    # an optional sector cohort; conviction_score / top_factors /
-    # top_risks / position_size_hint are derived from the same fully-
-    # scored row that produces the recommendation). Conviction is fed
-    # back into core.reco_normalize v7.2.0's Recommendation.from_views()
-    # to enforce conviction-floor downgrades (env-tunable via
-    # RECO_STRONG_BUY_CONVICTION_FLOOR / RECO_BUY_CONVICTION_FLOOR).
-    # core.insights_builder v7.0.0 consumes these for the Top Picks
-    # section.
     add(
         "Insights", "Sector-Adj Score", "sector_relative_score",
         "float", "0.00", False, "model",
@@ -1046,36 +660,29 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "STRONG_BUY. (core.scoring v5.2.5)",
     )
 
+    # ----- v2.12.0: tail emitted in EXACT data_engine_v2 v5.77.17 key order -----
+    # Engine order after Insights (pos 90): Decision pair, then the
+    # scoring/provenance block (provider_rating, recommendation_source,
+    # recommendation_priority_band, then the remaining Scoring-v5.74 fields),
+    # then the candlestick block, then forecast_source. The `group` labels
+    # ("Decision" / "Scoring v5.74" / "Canonical Reco" / "Candlestick") are
+    # retained as descriptive field metadata even though Canonical-Reco and
+    # Scoring-v5.74 are now physically interleaved — group is descriptive only
+    # and does not affect column order or row projection.
+
     # Decision Matrix (2) -> total 92  (added v2.7.0)
-    #
-    # Produced by core.data_engine_v2 v5.74.0's 8-tier classifier
-    # _classify_recommendation_8tier(). The canonical 5-tier
-    # `recommendation` field above is preserved unchanged; this pair adds
-    # richer detail and a numeric priority. May be EMPTY when
-    # `recommendation` is set upstream by core.scoring ->
-    # core.reco_normalize, to avoid implying a detailed verdict that may
-    # disagree with the canonical.
-    #
-    # NAMING DISAMBIGUATION:
-    #   - recommendation_priority (THIS group): int 1..8, the 8-tier
-    #     classifier rule that fired.
-    #   - recommendation_priority_band (Canonical Reco group): str
-    #     "P1".."P5", the canonical 5-tier priority band.
-    # Different fields, different semantics, coexist by design.
     add(
         "Decision", "Recommendation Detail", "recommendation_detailed",
         "str", "text", False, "model",
-        "Canonical 6-tier mirror of `recommendation`: STRONG_BUY / BUY / "
-        "HOLD / REDUCE / SELL / STRONG_SELL. Written atomically next to "
-        "`recommendation` by core.data_engine_v2 v5.75.0 "
+        "Canonical 8-tier mirror of `recommendation`: STRONG_BUY / BUY / "
+        "ACCUMULATE / HOLD / REDUCE / SELL / STRONG_SELL / AVOID. Written "
+        "atomically next to `recommendation` by core.data_engine_v2 v5.77.17 "
         "_classify_recommendation_8tier() so the two fields cannot diverge. "
-        "Also written by core.scoring v5.6.0 (AssetScores.recommendation_detailed). "
-        "Historical note: in v5.50.0..v5.74.0 the engine briefly surfaced the "
-        "pre-collapse 8-tier intermediate value here (SPECULATIVE_BUY / "
-        "ACCUMULATE / STRONG_SELL etc); v5.75.0 normalized this back to a "
-        "canonical mirror so downstream consumers reading either field see the "
-        "same token. Empty when `recommendation` is set upstream by "
-        "core.scoring -> core.reco_normalize.",
+        "Also written by core.scoring v5.7.1 (AssetScores.recommendation_detailed). "
+        "v5.7.1 widened the canonical vocabulary from 6 tiers to 8 (ACCUMULATE "
+        "between BUY and HOLD; AVOID as the worst-case 'do not enter or hold' "
+        "tier, no longer collapsed to STRONG_SELL). Empty when `recommendation` "
+        "is set upstream by core.scoring -> core.reco_normalize.",
     )
     add(
         "Decision", "Reco Priority", "recommendation_priority",
@@ -1094,116 +701,7 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "group, str P1..P5).",
     )
 
-    # Candlestick (5) -> total 97  (added v2.7.0)
-    #
-    # Produced by core.candlesticks v1.0.0 when invoked from
-    # core.data_engine_v2 v5.74.0 on OHLC history rows. Detection is
-    # BEST-EFFORT and OPTIONAL: when the candlesticks module is
-    # unavailable, when the env flag ENGINE_CANDLESTICKS_ENABLED is
-    # disabled, or when detection raises, all five columns stay null.
-    # 10 patterns supported: Doji, Hammer, Inverted Hammer,
-    # Shooting Star, Hanging Man, Bullish/Bearish Marubozu,
-    # Bullish/Bearish Engulfing, Morning Star, Evening Star.
-    add(
-        "Candlestick", "Candle Pattern", "candlestick_pattern",
-        "str", "text", False, "derived",
-        "Latest candlestick pattern detected (e.g. 'Bullish Engulfing', 'Hammer', "
-        "'Doji'). Empty when no pattern fires or insufficient OHLC history. "
-        "(core.candlesticks.detect_patterns)",
-    )
-    add(
-        "Candlestick", "Candle Signal", "candlestick_signal",
-        "str", "text", False, "derived",
-        "Pattern signal: BULLISH / BEARISH / NEUTRAL / DOJI. Defaults to "
-        "NEUTRAL when no pattern detected.",
-    )
-    add(
-        "Candlestick", "Candle Strength", "candlestick_strength",
-        "str", "text", False, "derived",
-        "Pattern strength bucket: STRONG (confidence >= 75) / "
-        "MODERATE (>= 55) / WEAK (< 55). Empty when no pattern detected.",
-    )
-    add(
-        "Candlestick", "Candle Confidence", "candlestick_confidence",
-        "float", "0.00", False, "derived",
-        "Pattern confidence 0-100 derived from how comfortably the geometric "
-        "criteria are met for the detected pattern. Conservative scoring.",
-    )
-    add(
-        "Candlestick", "Recent Patterns (5D)", "candlestick_patterns_recent",
-        "str", "text", False, "derived",
-        "Pipe-separated list of pattern names detected across the last 5 "
-        "trading bars, oldest -> newest. Helps spot pattern clusters / "
-        "confirmations. Empty when no patterns in the window.",
-    )
-
-    # Canonical Reco (2) -> total 99  (added v2.9.0)
-    #
-    # The two Canonical Reco columns are produced by core.scoring v5.2.8
-    # as row fields on AssetScores and emitted by compute_scores() plus
-    # the public helpers derive_canonical_recommendation() and
-    # apply_canonical_recommendation(). These close the May 13 2026
-    # cascade-discrepancy bug by providing a single canonical source of
-    # truth for the recommendation priority band (P1..P5) and a
-    # provenance tag that downstream engines (investment_advisor_engine
-    # v3.6.0+, data_engine_v2 v5.74.0) read to skip parallel
-    # recomputation.
-    #
-    # The pair is logically tied to the canonical `recommendation` field
-    # above (Recommendation group, position 72) but appended at the end
-    # to preserve positional indices for the prior 97 columns.
-    #
-    # v2.10.0 NOTE: The `recommendation_source` field here holds the
-    # ENGINE vocabulary (engine / provider_override / empty_row /
-    # scoring_unavailable) set by core.data_engine_v2 v5.74.0
-    # _classify_recommendation_8tier(). The scoring.py provenance tag
-    # is preserved SEPARATELY as `scoring_recommendation_source` in the
-    # new "Scoring v5.74" group below.
-    add(
-        "Canonical Reco", "Priority Band", "recommendation_priority_band",
-        "str", "text", False, "model",
-        "Canonical 5-tier priority band of the `recommendation` field: "
-        "P1 / P2 / P3 / P4 / P5. Computed by core.scoring v5.2.8 "
-        "_compute_priority() centrally, so the top-line Recommendation "
-        "column and any downstream P# [VERDICT] formatter (Apps Script "
-        "04_Format.gs) cannot diverge by construction. DISTINCT from "
-        "recommendation_priority (Decision group, int 1..8 for which "
-        "8-tier rule fired). The two fields coexist by design.",
-    )
-    add(
-        "Canonical Reco", "Reco Source", "recommendation_source",
-        "str", "text", False, "system",
-        "Engine recommendation provenance tag set by core.data_engine_v2 "
-        "v5.74.0 _classify_recommendation_8tier(). Vocabulary: "
-        "'engine' (engine-classified), 'provider_override' (provider "
-        "rating took precedence), 'empty_row' (asset-aware empty guard "
-        "fired), 'scoring_unavailable' (fallback path). DISTINCT from "
-        "`scoring_recommendation_source` (Scoring v5.74 group), which "
-        "holds the scoring.py provenance tag emitted by compute_scores(). "
-        "Used by scoring_engine.apply_canonical_recommendation() as the "
-        "idempotency key.",
-    )
-
-    # Scoring v5.74 (7) -> total 106  (added v2.10.0)
-    #
-    # The seven Scoring v5.74 columns expand the canonical schema to
-    # align with core.data_engine_v2 v5.74.0's INSTRUMENT_CANONICAL_KEYS
-    # (97 -> 106). They are produced by core.scoring v5.4.2+ as patch
-    # fields on the row dict emitted by compute_scores(), and preserved
-    # into the final row by core.data_engine_v2 v5.74.0 via:
-    #   - _compute_scores_canonical_first(): calls core.scoring.compute_scores
-    #     first, falls back to the local engine scorer on canonical
-    #     failure. Filters recommendation_owned_keys before row.update().
-    #   - _preserve_scoring_provenance(): captures the seven new fields
-    #     onto the row, routing scoring.py's recommendation_source to
-    #     scoring_recommendation_source so it does not collide with the
-    #     engine's recommendation_source vocabulary.
-    #   - _coerce_scoring_errors_for_sheet(): coerces list/tuple/set
-    #     scoring_errors into a "; "-joined sheet-safe string.
-    #
-    # Appended at the END of the canonical schema to preserve positional
-    # indices for the prior 99 columns. New septet occupies positions
-    # 100-106.
+    # Provider Rating (Scoring v5.74) -> total 93  (engine places it here, before reco source)
     add(
         "Scoring v5.74", "Provider Rating", "provider_rating",
         "float", "0.00", False, "provider",
@@ -1213,6 +711,38 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "branch when the engine's own score disagrees with the provider "
         "analyst consensus by a configured margin.",
     )
+
+    # Canonical Reco (2) -> total 95  (engine order: source THEN band)
+    add(
+        "Canonical Reco", "Recommendation Source", "recommendation_source",
+        "str", "text", False, "system",
+        "Engine recommendation provenance tag set by core.data_engine_v2 "
+        "v5.74.0 _classify_recommendation_8tier(). Vocabulary: "
+        "'engine' (engine-classified), 'provider_override' (provider "
+        "rating took precedence), 'empty_row' (asset-aware empty guard "
+        "fired), 'scoring_unavailable' (fallback path). DISTINCT from "
+        "`scoring_recommendation_source` (Scoring v5.74 group), which "
+        "holds the scoring.py provenance tag emitted by compute_scores(). "
+        "Used by scoring_engine.apply_canonical_recommendation() as the "
+        "idempotency key. v2.12.0: header aligned to the engine's "
+        "INSTRUMENT_CANONICAL_HEADERS ('Recommendation Source', was "
+        "'Reco Source').",
+    )
+    add(
+        "Canonical Reco", "Priority Band", "recommendation_priority_band",
+        "str", "text", False, "model",
+        "Canonical priority band (P1 / P2 / P3 / P4 / P5) of the "
+        "`recommendation` field. Computed by core.scoring v5.7.1 "
+        "_compute_priority() centrally, so the top-line Recommendation "
+        "column and any downstream P# [VERDICT] formatter (Apps Script "
+        "04_Format.gs) cannot diverge by construction. DISTINCT from "
+        "recommendation_priority (Decision group, int 1..8 for which "
+        "8-tier rule fired). The two fields coexist by design. Under the "
+        "v5.7.1 8-tier vocabulary, AVOID and STRONG_SELL both map to P1; "
+        "ACCUMULATE shares the normal-BUY band (P3).",
+    )
+
+    # Scoring v5.74 (remaining 6) -> total 101
     add(
         "Scoring v5.74", "Scoring Reco Source", "scoring_recommendation_source",
         "str", "text", False, "system",
@@ -1222,7 +752,7 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "engine/provider_override/empty_row/scoring_unavailable). "
         "Captured by core.data_engine_v2 v5.75.0 _preserve_scoring_provenance() "
         "from the canonical compute_scores() patch. Typical value: "
-        "'scoring.py v5.6.0' (the f-string is rendered from "
+        "'scoring.py v5.7.1' (the f-string is rendered from "
         "scoring.py's __version__, so it tracks scoring releases "
         "automatically). DISTINCT from `recommendation_source`.",
     )
@@ -1271,6 +801,53 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "penalty. Surfaces alongside warnings to explain score divergence.",
     )
 
+    # Candlestick (5) -> total 106  (engine places candlestick AFTER scoring/provenance)
+    add(
+        "Candlestick", "Candle Pattern", "candlestick_pattern",
+        "str", "text", False, "derived",
+        "Latest candlestick pattern detected (e.g. 'Bullish Engulfing', 'Hammer', "
+        "'Doji'). Empty when no pattern fires or insufficient OHLC history. "
+        "(core.candlesticks.detect_patterns)",
+    )
+    add(
+        "Candlestick", "Candle Signal", "candlestick_signal",
+        "str", "text", False, "derived",
+        "Pattern signal: BULLISH / BEARISH / NEUTRAL / DOJI. Defaults to "
+        "NEUTRAL when no pattern detected.",
+    )
+    add(
+        "Candlestick", "Candle Strength", "candlestick_strength",
+        "str", "text", False, "derived",
+        "Pattern strength bucket: STRONG (confidence >= 75) / "
+        "MODERATE (>= 55) / WEAK (< 55). Empty when no pattern detected.",
+    )
+    add(
+        "Candlestick", "Candle Confidence", "candlestick_confidence",
+        "float", "0.00", False, "derived",
+        "Pattern confidence 0-100 derived from how comfortably the geometric "
+        "criteria are met for the detected pattern. Conservative scoring.",
+    )
+    add(
+        "Candlestick", "Recent Patterns (5D)", "candlestick_patterns_recent",
+        "str", "text", False, "derived",
+        "Pipe-separated list of pattern names detected across the last 5 "
+        "trading bars, oldest -> newest. Helps spot pattern clusters / "
+        "confirmations. Empty when no patterns in the window.",
+    )
+
+    # Forecast Source (1) -> total 107  (v2.12.0; engine's final canonical key)
+    add(
+        "Forecast", "Forecast Source", "forecast_source",
+        "str", "text", False, "model/system",
+        "Forecast provenance set by core.data_engine_v2 v5.77.17: "
+        "'provider_target' (engine honoured an upstream analyst target), "
+        "'phase_ii_synthetic' (engine synthesized the forecast), or "
+        "'fallback' (engine fallback path created it). Empty when no forecast "
+        "was produced for the row. The engine's 107th / final canonical key "
+        "(added v5.77.1; elevated to a required canonical key in v5.77.3 "
+        "_INSTRUMENT_CANONICAL_REQUIRED_KEYS).",
+    )
+
     return tuple(cols)
 
 
@@ -1314,14 +891,23 @@ def _top10_extra_columns() -> Tuple[ColumnSpec, ...]:
 
 
 def _insights_columns() -> Tuple[ColumnSpec, ...]:
+    # v2.12.0: reconciled to data_engine_v2 v5.77.17's INSIGHTS_KEYS /
+    # INSIGHTS_HEADERS. Previously this was
+    # [Section, Item, Symbol, Metric, Value, Notes, Last Updated (Riyadh)];
+    # the engine's static contract is
+    # [Section, Item, Metric, Value, Notes, Source, Sort Order]. Since the
+    # engine is the locked contract, the registry adopts it. Column COUNT
+    # stays 7. BEHAVIORAL CHANGE: drops `symbol` + `last_updated_riyadh`,
+    # adds `source` + `sort_order` — insights_builder, the Insights route,
+    # and any Apps Script reading the Insights page must use these keys.
     cols = (
         ColumnSpec("Insights", "Section", "section", "str", "text", True, "system", "e.g., Market Leaders Top 7, Portfolio Summary, Data Quality Alerts (insights_builder v7.0.0)."),
         ColumnSpec("Insights", "Item", "item", "str", "text", True, "system", "Row label within section."),
-        ColumnSpec("Insights", "Symbol", "symbol", "str", "text", False, "derived", "If insight is symbol-specific."),
         ColumnSpec("Insights", "Metric", "metric", "str", "text", False, "system", "Metric name."),
         ColumnSpec("Insights", "Value", "value", "str", "text", False, "system", "Apps Script friendly value."),
         ColumnSpec("Insights", "Notes", "notes", "str", "text", False, "system", "Extra notes / explanation."),
-        ColumnSpec("Provenance", "Last Updated (Riyadh)", "last_updated_riyadh", "datetime", "yyyy-mm-dd hh:mm:ss", False, "system", "Timestamp."),
+        ColumnSpec("Insights", "Source", "source", "str", "text", False, "system", "Origin of the insight (module/provider/section that produced it)."),
+        ColumnSpec("Insights", "Sort Order", "sort_order", "int", "0", False, "system", "Stable ordering index for rows within the sheet."),
     )
     return _sanitize_columns("Insights_Analysis", "insights_analysis", cols, enforce_symbol_first=False)
 
@@ -1329,23 +915,8 @@ def _insights_columns() -> Tuple[ColumnSpec, ...]:
 def _insights_criteria_fields() -> Tuple[CriteriaField, ...]:
     """
     Criteria block rendered at the top of Insights_Analysis as key/value rows.
-
-    v2.8.0 changes (aligned with core.analysis.criteria_model v3.1.0):
-      - RENAME: 'min_conviction' -> 'min_conviction_score' (canonical
-                field name in criteria_model v3.1.0). Backwards-compatible
-                because criteria_model v3.1.0's KV alias map accepts both
-                spellings.
-      - NEW:    exclude_engine_dropped_valuation (bool, default 'false')
-      - NEW:    exclude_forecast_unavailable     (bool, default 'false')
-      - NEW:    exclude_provider_errors          (bool, default 'false')
-
-    Field count: 9 (v2.7.0) -> 12 (v2.8.0). All three new fields default
-    to 'false' so v2.7.0 sheets that lack them get the v3.0.0 semantics
-    (no data-quality exclusions). Operators opt in by changing the value
-    to a truthy token ('true', 'yes', '1', 'on').
-
-    v2.9.0: no changes to criteria_fields. Field count remains 12.
-    v2.10.0: no changes to criteria_fields. Field count remains 12.
+    v2.8.0: 12 fields (aligned with core.analysis.criteria_model v3.1.0).
+    v2.9.0/v2.10.0: no changes to criteria_fields. Field count remains 12.
     """
     return (
         CriteriaField("risk_level", "Risk Level", "str", "Moderate", "Low / Moderate / High."),
@@ -1357,10 +928,6 @@ def _insights_criteria_fields() -> Tuple[CriteriaField, ...]:
         CriteriaField("min_expected_roi_pct", "Min Expected ROI %", "pct", "0.00", "Filter floor for expected ROI."),
         CriteriaField("max_risk_score", "Max Risk Score", "float", "60", "Filter ceiling for risk score."),
         CriteriaField("min_ai_confidence", "Min AI Confidence", "float", "0.60", "Filter floor for forecast_confidence/confidence_score."),
-        # v2.8.0: renamed from 'min_conviction' for criteria_model v3.1.0
-        # canonical-name alignment. Backwards-compatible: criteria_model
-        # v3.1.0's KV alias map accepts both 'min_conviction' and
-        # 'min_conviction_score' as input keys.
         CriteriaField(
             "min_conviction_score", "Min Conviction Score", "float", "0",
             "Filter floor for conviction_score (0-100). 0 disables. "
@@ -1368,7 +935,6 @@ def _insights_criteria_fields() -> Tuple[CriteriaField, ...]:
             "STRONG_BUY downgrade floor, 45 mirrors BUY downgrade floor. "
             "(was 'min_conviction' in v2.6.0/v2.7.0)",
         ),
-        # v2.8.0 NEW: data-quality exclusion flags from criteria_model v3.1.0
         CriteriaField(
             "exclude_engine_dropped_valuation", "Exclude Engine-Dropped Valuation",
             "bool", "false",
@@ -1460,7 +1026,7 @@ _RAW_SCHEMA_REGISTRY: Dict[str, SheetSpec] = {
         columns=_sanitize_columns(
             "Top_10_Investments",
             "instrument_table",
-            _CANONICAL_COLUMNS + _top10_extra_columns(),  # 109 columns in v2.10.0+
+            _CANONICAL_COLUMNS + _top10_extra_columns(),  # 110 columns in v2.12.0+
             enforce_symbol_first=True,
         ),
         notes="Criteria-driven selection. Canonical columns + Top10 extras.",
@@ -1782,42 +1348,24 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
                     f"The recommendation pipeline (core.reco_normalize v7.2.0 "
                     f"recommendation_from_views) depends on these."
                 )
-            # v2.6.0+: Insights columns required — produced by
-            # core.scoring v5.2.5 and consumed by reco_normalize v7.2.0
-            # conviction-floor downgrade + insights_builder v7.0.0.
             missing_insights = [k for k in INSIGHTS_COLUMN_KEYS if k not in spec_keys]
             if missing_insights:
                 raise ValueError(
                     f"[{sheet_name}] Missing required insights column(s): {missing_insights}. "
                     f"core.scoring v5.2.5 writes these as row fields."
                 )
-            # v2.7.0+: Decision Matrix columns required for schema
-            # alignment with core.data_engine_v2 v5.74.0. Values may be
-            # empty (when `recommendation` is upstream-set), but the
-            # COLUMNS must exist so the engine can populate them.
             missing_decision = [k for k in DECISION_COLUMN_KEYS if k not in spec_keys]
             if missing_decision:
                 raise ValueError(
                     f"[{sheet_name}] Missing required decision matrix column(s): {missing_decision}. "
                     f"core.data_engine_v2 v5.74.0 writes these via _classify_recommendation_8tier()."
                 )
-            # v2.7.0+: Candlestick columns required for schema alignment
-            # with core.candlesticks v1.0.0. Values may be empty (when
-            # detection is disabled / unavailable), but the COLUMNS must
-            # exist.
             missing_candlestick = [k for k in CANDLESTICK_COLUMN_KEYS if k not in spec_keys]
             if missing_candlestick:
                 raise ValueError(
                     f"[{sheet_name}] Missing required candlestick column(s): {missing_candlestick}. "
                     f"core.candlesticks.detect_patterns writes these via core.data_engine_v2 v5.74.0."
                 )
-            # v2.9.0+: Canonical Reco columns required for schema
-            # alignment with core.scoring v5.2.8. The values are
-            # written by compute_scores() on every row and by
-            # apply_canonical_recommendation() on backfilled rows;
-            # both reach the row dict via the cascade-bridge surface.
-            # `recommendation_priority_band` is DISTINCT from
-            # `recommendation_priority` (Decision group).
             missing_canonical_reco = [k for k in CANONICAL_RECO_COLUMN_KEYS if k not in spec_keys]
             if missing_canonical_reco:
                 raise ValueError(
@@ -1825,14 +1373,6 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
                     f"{missing_canonical_reco}. core.scoring v5.2.8 writes these "
                     f"via compute_scores() and apply_canonical_recommendation()."
                 )
-            # v2.10.0+: Scoring v5.74 columns required for schema
-            # alignment with core.data_engine_v2 v5.74.0. The values are
-            # written by _compute_scores_canonical_first() +
-            # _preserve_scoring_provenance() +
-            # _coerce_scoring_errors_for_sheet() on every row. These
-            # seven fields are the net-new schema delta between v5.73.2
-            # (97 fields) and v5.74.0 (106 fields), minus the two
-            # already present in the v2.9.0 Canonical Reco group.
             missing_scoring_v574 = [k for k in SCORING_V574_COLUMN_KEYS if k not in spec_keys]
             if missing_scoring_v574:
                 raise ValueError(
@@ -1840,6 +1380,15 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
                     f"{missing_scoring_v574}. core.data_engine_v2 v5.74.0 writes "
                     f"these via _compute_scores_canonical_first() and "
                     f"_preserve_scoring_provenance()."
+                )
+            # v2.12.0+: forecast_source required for schema alignment with
+            # core.data_engine_v2 v5.77.17 (107th / final canonical key).
+            missing_forecast_source = [k for k in FORECAST_SOURCE_COLUMN_KEYS if k not in spec_keys]
+            if missing_forecast_source:
+                raise ValueError(
+                    f"[{sheet_name}] Missing required forecast source column(s): "
+                    f"{missing_forecast_source}. core.data_engine_v2 v5.77.17 "
+                    f"writes this as the final canonical key."
                 )
 
         if sheet_name == "Top_10_Investments":
@@ -1872,21 +1421,24 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
                 raise ValueError(
                     f"[Top_10_Investments] Missing required candlestick column(s): {missing_candlestick}."
                 )
-            # v2.9.0+: Canonical Reco columns required for Top_10_Investments
-            # too (same rationale as the instrument_table sheets).
             missing_canonical_reco = [k for k in CANONICAL_RECO_COLUMN_KEYS if k not in spec_keys]
             if missing_canonical_reco:
                 raise ValueError(
                     f"[Top_10_Investments] Missing required canonical reco column(s): "
                     f"{missing_canonical_reco}."
                 )
-            # v2.10.0+: Scoring v5.74 columns required for Top_10_Investments
-            # too (same rationale as the instrument_table sheets).
             missing_scoring_v574 = [k for k in SCORING_V574_COLUMN_KEYS if k not in spec_keys]
             if missing_scoring_v574:
                 raise ValueError(
                     f"[Top_10_Investments] Missing required Scoring v5.74 column(s): "
                     f"{missing_scoring_v574}."
+                )
+            # v2.12.0+: forecast_source required for Top_10_Investments too.
+            missing_forecast_source = [k for k in FORECAST_SOURCE_COLUMN_KEYS if k not in spec_keys]
+            if missing_forecast_source:
+                raise ValueError(
+                    f"[Top_10_Investments] Missing required forecast source column(s): "
+                    f"{missing_forecast_source}."
                 )
 
         if sheet_name == "Insights_Analysis":
