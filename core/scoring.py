@@ -2,8 +2,8 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.7.1
-FULL REVISED VERSION / RECO-VOCABULARY-EXPANSION-ALIGNED
+Scoring Module — v5.7.2
+FULL REVISED VERSION / CONFIDENCE-PENALTY-NEUTRAL-POINT
 ================================================================================
 Canonical scoring and recommendation source for Tadawul Fast Bridge.
 (Top changelog condensed for working copy; code + inline comments verbatim.)
@@ -37,6 +37,45 @@ v5.7.1 hotfix (over v5.7.0) — UNDERPERFORM cross-stack alignment:
      the surfaced marker with the deployed engine release).
   5. __version__ -> "5.7.1" (RECOMMENDATION_SOURCE_TAG auto-tracks to
      "scoring.py v5.7.1"); [v5.7.0 *] log prefixes roll to [v5.7.1 *].
+
+v5.7.2 — confidence-penalty neutral point (recommendation-collapse fix):
+  Problem: the overall-score penalty multiplied every row by risk_pen * conf_pen.
+  The confidence term, 1 - strength*(1-conf01)*0.75, is driven by a confidence
+  value that is in practice a near-constant data-quality proxy (~0.61-0.63 on
+  the large majority of rows). Penalizing on a near-constant does not
+  discriminate between rows — it simply translates the whole distribution down
+  by a uniform ~10%, parking most post-penalty scores in the 50-63 band. With
+  the recommendation ladder's BUY gate at overall>=68 and HOLD at >=65, that
+  uniform shift collapsed almost the entire universe onto the
+  "overall>=50 -> REDUCE" fallback (observed: ~80% REDUCE, zero BUY/ACCUMULATE).
+
+  Fix (this file only): give the confidence penalty a NEUTRAL POINT.
+    1. New config field ScoringConfig.confidence_penalty_neutral (default 0.60),
+       env-tunable via SCORING_CONFIDENCE_NEUTRAL; mirrored on ScoreWeights and
+       passed through normalize(); clamped to [0,1] in the per-call override path.
+    2. conf_pen now penalizes ONLY confidence BELOW the neutral point. The
+       shortfall is normalized by the neutral point, so the MAXIMUM markdown at
+       conf01==0 is unchanged from v5.7.1 (strength*0.75); the only behavioral
+       difference is that "normal" confidence (>= neutral) now takes conf_pen==1.0
+       instead of a uniform haircut. Genuinely low-confidence rows are still
+       marked down, progressively.
+
+  UNCHANGED (deliberately, to keep the distribution shift attributable to one
+  cause): the risk penalty and its strength; ALL risk-override rails
+  (r>=75 -> REDUCE, r>=85 -> SELL, r>=90 -> STRONG_SELL) which still fire
+  regardless of score; every recommendation threshold (BUY>=68, HOLD>=65,
+  REDUCE>=50, etc.); the AVOID branches; and the OUTPUT CONTRACT — no columns
+  added, removed, or reordered, so engine v5.77.17 and schema_registry v2.12.0
+  remain compatible with no coordinated change.
+
+  __version__ -> "5.7.2" (RECOMMENDATION_SOURCE_TAG -> "scoring.py v5.7.2",
+  SCORING_SCHEMA_VERSION -> "5.7.2"; [v5.7.1 *] log prefixes roll to [v5.7.2 *]).
+
+  CALIBRATION NOTE: this re-centers the score distribution; it does NOT validate
+  that the resulting labels predict forward returns. The neutral point (0.60)
+  is a calibration parameter — confirm the live recommendation distribution
+  spreads sensibly, and treat label CORRECTNESS as still pending a ground-truth
+  backtest.
 ================================================================================
 """
 
@@ -58,7 +97,7 @@ logger.addHandler(logging.NullHandler())
 # Version / Canonical contract
 # =============================================================================
 
-__version__ = "5.7.1"
+__version__ = "5.7.2"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -301,8 +340,12 @@ class ScoringConfig:
 
     risk_penalty_strength: float = 0.36
     confidence_penalty_strength: float = 0.38
-
-    risk_low_threshold: float = RISK_BUCKET_THRESHOLDS[0]
+    # v5.7.2: confidence-penalty neutral point (0..1 fraction). Confidence at or
+    # ABOVE this fraction incurs NO confidence penalty; only confidence below it
+    # is marked down (ramped, normalized by this point). Stops a near-constant
+    # confidence proxy (~0.62 on most rows) from applying a uniform haircut that
+    # pushed the whole universe under the BUY gate. Tunable: SCORING_CONFIDENCE_NEUTRAL.
+    confidence_penalty_neutral: float = 0.60
     risk_high_threshold: float = RISK_BUCKET_THRESHOLDS[1]
     confidence_low_to_moderate: float = CONFIDENCE_BUCKET_THRESHOLDS[0]
     confidence_high: float = CONFIDENCE_BUCKET_THRESHOLDS[1]
@@ -326,6 +369,7 @@ class ScoringConfig:
             default_technical=_env_float("SCORING_W_TECHNICAL", 0.00),
             risk_penalty_strength=_env_float("SCORING_RISK_PENALTY", 0.36),
             confidence_penalty_strength=_env_float("SCORING_CONFIDENCE_PENALTY", 0.38),
+            confidence_penalty_neutral=_env_float("SCORING_CONFIDENCE_NEUTRAL", 0.60),
         )
 
 
@@ -347,6 +391,7 @@ class ScoreWeights:
     w_technical: float = _CONFIG.default_technical
     risk_penalty_strength: float = _CONFIG.risk_penalty_strength
     confidence_penalty_strength: float = _CONFIG.confidence_penalty_strength
+    confidence_penalty_neutral: float = _CONFIG.confidence_penalty_neutral
 
     def normalize(self) -> "ScoreWeights":
         total = (
@@ -364,6 +409,7 @@ class ScoreWeights:
             w_technical=self.w_technical / total,
             risk_penalty_strength=self.risk_penalty_strength,
             confidence_penalty_strength=self.confidence_penalty_strength,
+            confidence_penalty_neutral=self.confidence_penalty_neutral,
         )
 
     def as_factor_weights_map(self) -> Dict[str, float]:
@@ -743,6 +789,7 @@ def get_weights_for_horizon(horizon: Horizon, settings: Any = None) -> ScoreWeig
     result = replace(base)
     result.risk_penalty_strength = _clamp(_try("risk_penalty_strength", result.risk_penalty_strength), 0.0, 1.0)
     result.confidence_penalty_strength = _clamp(_try("confidence_penalty_strength", result.confidence_penalty_strength), 0.0, 1.0)
+    result.confidence_penalty_neutral = _clamp(_try("confidence_penalty_neutral", result.confidence_penalty_neutral), 0.0, 1.0)
     return result.normalize()
 
 
@@ -2258,7 +2305,19 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         risk01 = (risk / 100.0) if risk is not None else 0.50
         conf01_used = conf01 if conf01 is not None else 0.55
         risk_pen = _clamp(1.0 - weights.risk_penalty_strength * (risk01 * 0.65), 0.0, 1.0)
-        conf_pen = _clamp(1.0 - weights.confidence_penalty_strength * ((1.0 - conf01_used) * 0.75), 0.0, 1.0)
+        # v5.7.2: only confidence BELOW the neutral point is penalized; "normal"
+        # confidence (>= neutral) yields conf_pen == 1.0. The shortfall is
+        # normalized by the neutral point, so the MAXIMUM markdown at conf01==0
+        # is unchanged from v5.7.1 (strength * 0.75). The only behavioral change
+        # is that the typical ~0.62 confidence proxy now lands at/above neutral
+        # and is NOT marked down, instead of taking a uniform haircut that
+        # pushed the whole universe under the BUY gate.
+        _conf_neutral = weights.confidence_penalty_neutral
+        _conf_shortfall01 = (
+            _clamp((_conf_neutral - conf01_used) / _conf_neutral, 0.0, 1.0)
+            if _conf_neutral > 1e-9 else 0.0
+        )
+        conf_pen = _clamp(1.0 - weights.confidence_penalty_strength * (_conf_shortfall01 * 0.75), 0.0, 1.0)
         penalty_factor = _round(risk_pen * conf_pen, PENALTY_PRECISION)
         overall = _round(100.0 * _clamp(base01 * risk_pen * conf_pen, 0.0, 1.0), 2)
     else:
@@ -2283,7 +2342,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             ) if val is None
         ]
         logger.warning(
-            "[v5.7.1 INSUFFICIENT] symbol=%s missing=%s",
+            "[v5.7.2 INSUFFICIENT] symbol=%s missing=%s",
             _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
             ",".join(missing_components),
         )
@@ -2426,7 +2485,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     scoring_errors = _dedupe_preserving_order(scoring_errors)
 
     logger.info(
-        "[v5.7.1 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
+        "[v5.7.2 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
         _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
         overall,
         risk,
