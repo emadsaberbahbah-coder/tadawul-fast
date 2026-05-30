@@ -2,232 +2,41 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v5.7.0
+Scoring Module — v5.7.1
 FULL REVISED VERSION / RECO-VOCABULARY-EXPANSION-ALIGNED
 ================================================================================
-Purpose
--------
 Canonical scoring and recommendation source for Tadawul Fast Bridge.
-
-v5.7.0 reco-vocabulary expansion alignment over v5.6.0  (reco_normalize v8.0.0)
--------------------------------------------------------------------------------
-MAJOR: the canonical RECOMMENDATION_ENUM is expanded from 6 tiers to 8 to align
-with core.reco_normalize v8.0.0's 8-tier canonical vocabulary. Previously
-scoring.py could only represent six of the eight tiers, so when reco_normalize
-v8.0.0 began emitting ACCUMULATE and AVOID, routing those values through
-normalize_recommendation_code() silently re-collapsed ACCUMULATE into BUY
-(via _LOCAL_RECO_ALIASES) and AVOID into STRONG_SELL (the v5.6.0 fix that is
-now itself obsolete). v5.7.0 removes that lossy collapse.
+(Top changelog condensed for working copy; code + inline comments verbatim.)
 
 Canonical tiers (best -> worst):
     STRONG_BUY, BUY, ACCUMULATE, HOLD, REDUCE, SELL, STRONG_SELL, AVOID
 
-1. ENUM EXPANSION
-   RECOMMENDATION_ENUM gains ACCUMULATE and AVOID. The Signal enum (used by
-   short_term_signal) is extended symmetrically for vocabulary consistency,
-   even though short_term_signal itself still emits only the BUY/HOLD/SELL
-   subset relevant to short-horizon technical setups.
+v5.7.0 aligned the canonical RECOMMENDATION_ENUM to core.reco_normalize v8.0.0's
+8-tier vocabulary (added ACCUMULATE between BUY and HOLD; AVOID as worst tier),
+extended the recommendation ladder, priority bands, position-size hints, and
+alias tables accordingly.
 
-2. ALIAS TABLE UPDATE
-   _LOCAL_RECO_ALIASES["ACCUMULATE"] -> ACCUMULATE  (was BUY)
-   _LOCAL_RECO_ALIASES["AVOID"]      -> AVOID       (was STRONG_SELL in v5.6.0)
-   New aliases: SCALE_IN / SCALEIN / SCALING_IN / BUILD_POSITION -> ACCUMULATE;
-   DO_NOT_BUY / DONOTBUY / UNINVESTABLE / STAY_AWAY -> AVOID. The v5.6.0
-   "AVOID -> STRONG_SELL" alignment is now obsolete: data_engine_v2 v5.75.0's
-   _v573_collapse_to_canonical_enum and reco_normalize v8.0.0 both treat
-   AVOID as its own canonical tier in the 8-tier vocabulary.
-
-3. RECOMMENDATION LADDER EXTENDED
-   compute_recommendation() gains two new branches:
-     - AVOID at the top of the ladder: fires when overall score is critically
-       low (< 15) OR when fundamental_view == BEARISH AND technical_view ==
-       BEARISH AND value_view == EXPENSIVE (the "uninvestable" pattern from
-       reco_normalize v8.0.0's _classify_views_with_rule_id).
-     - ACCUMULATE replaces the two "Watch / accumulate candidate" HOLD
-       branches (MONTH and LONG horizons), where moderate ROI and score were
-       previously forced to round to HOLD because ACCUMULATE didn't exist.
-       Numeric thresholds are preserved verbatim — only the emitted tier
-       changes, from HOLD with "accumulate candidate" prose to ACCUMULATE
-       proper. STRONG_BUY / BUY / HOLD / REDUCE / SELL / STRONG_SELL
-       branch conditions are unchanged. The STRONG_SELL reason text is
-       tightened from "require urgent exit or avoidance" to "require urgent
-       exit" since AVOID is now a distinct tier.
-
-4. PRIORITY BAND MAPPING
-   _compute_priority() gains cases for the new tiers:
-     - ACCUMULATE -> P3 (same band as a normal BUY; the action is still a
-       buy, just gradual)
-     - AVOID      -> P1 (same band as STRONG_SELL; both are urgent —
-       STRONG_SELL says "exit now", AVOID says "exit now and never re-enter")
-   The P1..P5 band vocabulary is unchanged; schema_registry v2.11.0's
-   documentation of the band as P1..P5 remains accurate.
-
-5. POSITION-SIZE HINT FALLBACKS
-   The fallback hint logic in compute_scores() (used when insights_builder
-   does not return a hint) gains:
-     - ACCUMULATE -> "Scale in gradually / partial position"
-     - AVOID      -> "Avoid entirely / do not enter or hold"
-   The "Exit or avoid" hint for SELL/STRONG_SELL is tightened to "Exit
-   position" so it does not overlap semantically with the new AVOID tier.
-
-6. CONTRACT VERSION MARKER
-   New module constant _RECO_NORMALIZE_CONTRACT_VERSION = "8.0.0", surfaced
-   in get_canonical_state() as reco_normalize_contract_version. Audit
-   tooling can read this to verify which reco_normalize release scoring.py
-   was built to align with (mirrors the _ENGINE_CONTRACT_VERSION pattern
-   from v5.6.0).
-
-7. LOG PREFIXES
-   [v5.6.0 INSUFFICIENT] / [v5.6.0 SCORE] roll forward to [v5.7.0 *] so log
-   scraping tools can distinguish releases.
-
-8. RECOMMENDATION_SOURCE_TAG auto-bump
-   Derived from __version__ via f-string; now reads "scoring.py v5.7.0"
-   automatically. data_engine_v2 v5.75.0's _preserve_scoring_provenance
-   stores this tag verbatim under scoring_recommendation_source, so the
-   bump is transparent to the engine.
-
-Backward-compatible: existing consumers that previously saw at most six
-tiers will now occasionally see ACCUMULATE or AVOID. Any consumer with a
-hard-coded 6-tier allow-list must widen to the full 8-tier set
-(reference CANONICAL_RECOMMENDATION_CODES). The recommendation_detailed
-field (mirror of recommendation, introduced in v5.6.0) inherits the
-widened domain; AssetScores.recommendation and AssetScores.recommendation_detailed
-are both typed as str and accept any canonical tier.
-
-Migration follow-ons (separate scope):
-- schema_registry v2.11.0's Recommendation column docstring says "5-tier
-  canonical token"; needs a v2.12.0 update for the 8-tier vocabulary.
-- v2.11.0's AVOID-asymmetry note (reco_normalize AVOID->SELL vs scoring
-  AVOID->STRONG_SELL) is now stale: both layers route AVOID to AVOID.
-- data_engine_v2 v5.75.0's _v573_collapse_to_canonical_enum decides
-  whether the SHEET sees the 8-tier vocabulary or stays collapsed at the
-  boundary. scoring.py widening does not change sheet output until
-  data_engine_v2 v5.76.0 decides whether to widen the collapse map.
-
-Key fixes versus v5.3.0
------------------------
-1. Bucket consistency: risk_bucket(), confidence_bucket(), derive_risk_view(),
-   and derive_confidence_view-style outputs use one canonical threshold policy.
-2. Actual canonical bucket integration: when core.buckets exists, wrappers call it;
-   when unavailable, local fallback uses the same intended thresholds.
-3. Horizon-aware recommendation: long horizon uses 12M ROI/upside more heavily;
-   short horizon uses technical/momentum/1M ROI.
-4. Forecast clearing: forecast_patch is merged including None values so invalid
-   forecasts do not leave stale ROI/price values in the working row.
-5. Valuation fallback: ratio-based valuation can produce a score even when
-   forecast/fair-value inputs are missing.
-6. Provider sanity checks: dividend yield, debt/equity, percentage-like fields,
-   and suspicious currency-sensitive values are normalized/flagged defensively.
-7. Recommendation ladder: v5.7.0 expands the final enum to the full 8-tier
-   canonical vocabulary (STRONG_BUY / BUY / ACCUMULATE / HOLD / REDUCE /
-   SELL / STRONG_SELL / AVOID). Earlier releases noted the enum was "closed
-   to STRONG_BUY/BUY/HOLD/REDUCE/SELL/STRONG_SELL while detail/position hint
-   can surface WATCH / ACCUMULATE CANDIDATE wording" — that workaround is
-   no longer needed; ACCUMULATE is now a first-class tier.
-8. Ranking remains a full-dataset operation; do not rank partial refresh batches
-   unless the caller intentionally wants local batch ranks.
-
-
-
-v5.4.1 hotfix over v5.4.0
----------------------------
-1. Rebuilds recommendation_detail after the batch insights pass every time, so
-   Recommendation Detail cannot become stale when recommendation_reason changes.
-2. Makes _active_roi_for_horizon labels truthful on fallback paths: DAY/WEEK/MONTH
-   now report whether the active ROI came from 1M, 3M, 12M, UPSIDE, or fallback.
-3. Prevents ScoringEngine instances from sharing mutable module-default weight and
-   forecast objects by copying DEFAULT_SCORING_WEIGHTS / DEFAULT_FORECAST_PARAMETERS.
-4. Restores ScoringConfig.risk_moderate_threshold as a compatibility property that
-   aliases risk_high_threshold.
-5. Tightens the 12M unit-mismatch guard to avoid clearing legitimate severe
-   negative forecasts inside the configured min_roi_12m range.
-6. Restores mid-text legacy recommendation label normalization in reasons, but
-   uses a narrow safe alias list to avoid corrupting normal prose.
-
-v5.4.2 hotfix over v5.4.1
----------------------------
-1. Narrows mid-text recommendation-label substitution to finance-jargon terms only.
-   This prevents normal prose such as "Watch / accumulate candidate" from being
-   rewritten into misleading text like "HOLD / BUY candidate".
-2. Keeps full standalone-label normalization unchanged for normalize_recommendation_code()
-   and keeps trailing-arrow normalization for legacy reason endings.
-
-v5.5.0 ops enhancements over v5.4.2
------------------------------------
-1. Bucket thresholds are now env-tunable so deploy-level reconfiguration is
-   possible without forking the file. Supported env vars:
-     SCORING_RISK_LOW                 (default 35.0,  range 0..100)
-     SCORING_RISK_HIGH                (default 70.0,  range 0..100)
-     SCORING_CONFIDENCE_MODERATE      (default 0.45,  range 0..1)
-     SCORING_CONFIDENCE_HIGH          (default 0.75,  range 0..1)
-   Invalid combinations (low >= high, out of range) are rejected at import time
-   with a WARN log and the default pair is kept. derive_risk_view/risk_bucket/
-   confidence_bucket/ScoringConfig all use these resolved values transparently.
-2. scoring_errors are deduplicated at the end of compute_scores while preserving
-   first-seen order, so a downstream consumer cannot see the same provider tag
-   listed twice in the same row.
-3. opportunity_source now distinguishes which side of the val/mom fallback was
-   missing: "valuation_only_fallback", "momentum_only_fallback", and
-   "both_present_fallback" replace the prior single "valuation_momentum_fallback"
-   tag. "roi_based" and "insufficient" are unchanged.
-4. New public diagnostic helpers:
-     get_canonical_thresholds()   -> resolved risk/confidence threshold pairs
-                                     plus the env-override flag for each
-     get_canonical_state()        -> full ops snapshot: version, source tag,
-                                     buckets-canonical availability, thresholds,
-                                     and the active ScoringConfig
-   These are intended for audit/diagnostic tooling so it can confirm what
-   thresholds the running process is actually using without reading env or
-   re-importing private symbols.
-
-v5.6.0 engine-contract alignment over v5.5.0  (data_engine_v2 v5.75.0)
-----------------------------------------------------------------------
-1. derive_canonical_recommendation now accepts overwrite=False. Previously the
-   inner idempotency-skip read cached recommendation/reason/priority from the
-   row whenever recommendation_source matched scoring.py's tag, regardless of
-   the caller's intent. data_engine_v2 v5.75.0's _classify_recommendation_8tier
-   masked this by clearing recommendation_source = "" before each call, but
-   any other caller that invoked apply_canonical_recommendation(overwrite=True)
-   without first clearing would silently get stale values. v5.6.0 threads
-   overwrite through to derive_canonical_recommendation so the skip is bypassed
-   at the source.
-2. _LOCAL_RECO_ALIASES["AVOID"] now maps to STRONG_SELL (was SELL). This aligns
-   with the _v573_collapse_to_canonical_enum contract in data_engine_v2, which
-   maps the legacy AVOID label to STRONG_SELL when collapsing an upstream
-   provider recommendation. Both modules now agree on the canonical destination
-   for legacy AVOID labels.
-3. AssetScores gains recommendation_detailed (mirror of recommendation in the
-   canonical 6-tier code). data_engine_v2 v5.75.0 writes recommendation_detailed
-   atomically next to recommendation in its _classify_recommendation_8tier; the
-   engine's owned-keys filter strips both during the patch merge, but downstream
-   consumers reading the scoring patch directly now see both keys consistent.
-4. apply_canonical_recommendation hard-normalizes the returned
-   recommendation_priority_band: if any code path slipped an empty string or a
-   non-canonical value through derive_canonical_recommendation, the patch
-   returned to the engine coerces it to P4 (HOLD-equivalent) before the engine
-   sees it. Defensive guarantee — the engine should never see an empty band.
-5. get_canonical_state() now reports engine_contract_version = "5.75.0" so audit
-   tooling can verify which engine release this scoring.py was built to align
-   with. The new module-level constant _ENGINE_CONTRACT_VERSION documents the
-   contract version explicitly.
-6. Log prefixes [v5.5.0 INSUFFICIENT] / [v5.5.0 SCORE] are rolled forward to
-   [v5.6.0 *] so log scraping tools can distinguish releases.
-7. RECOMMENDATION_SOURCE_TAG is derived from __version__ via f-string and now
-   reads "scoring.py v5.6.0" automatically. data_engine_v2 v5.75.0 already
-   stores this tag verbatim under scoring_recommendation_source via the
-   _preserve_scoring_provenance helper, so the tag bump is transparent to the
-   engine.
-   Backward-compatible: all changes preserve existing default behavior (the
-   new overwrite parameter defaults to False, and the new recommendation_detailed
-   field defaults to ""). Existing callers see no behavioral difference.
-
-Public API compatibility
-------------------------
-Preserves the main names used by data_engine_v2 and routes:
-compute_scores, score_row, score_quote, enrich_with_scores, score_and_rank_rows,
-apply_canonical_recommendation, derive_canonical_recommendation,
-_compute private wrappers, bucket wrappers, classes, constants, and __all__.
+v5.7.1 hotfix (over v5.7.0) — UNDERPERFORM cross-stack alignment:
+  1. _LOCAL_RECO_ALIASES["UNDERPERFORM"]: SELL -> REDUCE. v5.7.0 mapped a
+     vendor/legacy "underperform" label to SELL, but the accepted
+     yahoo_fundamentals_provider v6.3.1 maps underperform -> REDUCE, and
+     standard sell-side convention treats underperform ~ underweight ~ reduce,
+     NOT a hard sell. This only affects normalization of EXTERNALLY-supplied
+     UNDERPERFORM labels; scoring.py's own ladder never emits "UNDERPERFORM"
+     (it emits canonical codes), so the engine's own SELL/STRONG_SELL logic
+     is unchanged.
+  2. Added _LOCAL_RECO_ALIASES["MARKET_UNDERPERFORM"] -> REDUCE and (sibling
+     parity, beyond the audit's ask) ["MARKET_OUTPERFORM"] -> BUY, matching
+     the provider's market_underperform/market_outperform vocabulary and the
+     existing OUTPERFORM->BUY / MARKET_PERFORM->HOLD entries.
+  3. _MID_TEXT_SAFE_ALIASES["UNDERPERFORM"]: SELL -> REDUCE (display-only prose
+     normalization), plus sibling MARKET_UNDERPERFORM->REDUCE /
+     MARKET_OUTPERFORM->BUY to match the existing MARKET_PERFORM->HOLD entry.
+  4. _ENGINE_CONTRACT_VERSION: "5.75.0" -> "5.77.17" (diagnostic marker only;
+     the producer/consumer contract is unchanged since 5.75.0, but this aligns
+     the surfaced marker with the deployed engine release).
+  5. __version__ -> "5.7.1" (RECOMMENDATION_SOURCE_TAG auto-tracks to
+     "scoring.py v5.7.1"); [v5.7.0 *] log prefixes roll to [v5.7.1 *].
 ================================================================================
 """
 
@@ -249,29 +58,13 @@ logger.addHandler(logging.NullHandler())
 # Version / Canonical contract
 # =============================================================================
 
-__version__ = "5.7.0"
+__version__ = "5.7.1"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
 
-# v5.6.0: explicit marker of which data_engine_v2 release this scoring.py was
-# built to align with. data_engine_v2 v5.75.0 introduced the disciplined
-# producer/consumer contract for the recommendation pipeline: clear+overwrite
-# semantics for apply_canonical_recommendation, owned-keys filtering of the
-# scoring patch, and _preserve_scoring_provenance to capture scoring.py's
-# source tag as scoring_recommendation_source. Audit tooling can read this
-# constant (also surfaced via get_canonical_state()) to verify alignment.
-_ENGINE_CONTRACT_VERSION = "5.75.0"
+_ENGINE_CONTRACT_VERSION = "5.77.17"
 
-# v5.7.0: explicit marker of which core.reco_normalize release this scoring.py
-# was built to align with. reco_normalize v8.0.0 widened the canonical
-# recommendation vocabulary from 6 tiers to 8 (added ACCUMULATE between BUY
-# and HOLD, plus STRONG_SELL and AVOID as the worst-case tiers). The
-# Recommendation enum, view-aware _classify_views_with_rule_id resolver,
-# to_score() ordinal range (0-7), from_score() banding, _LOCAL_RECO_ALIASES
-# mappings, _apply_negation softening rules, and conviction-floor cascade all
-# track this contract. Audit tooling reads this constant via
-# get_canonical_state() to verify alignment.
 _RECO_NORMALIZE_CONTRACT_VERSION = "8.0.0"
 
 RECOMMENDATION_ENUM: Tuple[str, ...] = (
@@ -287,16 +80,6 @@ RECOMMENDATION_ENUM: Tuple[str, ...] = (
 CANONICAL_RECOMMENDATION_CODES: Tuple[str, ...] = RECOMMENDATION_ENUM
 _CANONICAL_RECO: Set[str] = set(CANONICAL_RECOMMENDATION_CODES)
 
-# Canonical bucket thresholds used by local fallback and by derive_*_view.
-# Risk: lower is better. 0-35 LOW, 35-70 MODERATE, >=70 HIGH.
-# Confidence: 0-45 LOW, 45-75 MODERATE, >=75 HIGH.
-#
-# v5.5.0: these are the COMPILED-IN DEFAULTS. The module-level values below
-# may be overridden by environment variables at import time via
-# _resolve_bucket_thresholds_from_env(), which runs after the env helpers are
-# defined. The override flags _RISK_THRESHOLDS_FROM_ENV and
-# _CONF_THRESHOLDS_FROM_ENV record whether the env override took effect (used
-# by get_canonical_state() for ops diagnostics).
 RISK_BUCKET_THRESHOLDS: Tuple[float, float] = (35.0, 70.0)
 CONFIDENCE_BUCKET_THRESHOLDS: Tuple[float, float] = (0.45, 0.75)
 _RISK_THRESHOLDS_FROM_ENV: bool = False
@@ -358,23 +141,10 @@ def _strict_bucket_logs_enabled() -> bool:
 
 
 def _resolve_bucket_thresholds_from_env() -> None:
-    """v5.5.0: allow ops to tune bucket thresholds via env without forking the file.
-
-    Reads SCORING_RISK_LOW / SCORING_RISK_HIGH / SCORING_CONFIDENCE_MODERATE /
-    SCORING_CONFIDENCE_HIGH. Each pair must satisfy low < high and lie in the
-    valid range (risk 0-100, confidence 0-1). Invalid pairs are rejected with a
-    WARN log and the compiled-in defaults are retained.
-
-    Updates the module-level RISK_BUCKET_THRESHOLDS / CONFIDENCE_BUCKET_THRESHOLDS
-    tuples in place and records whether an env override actually took effect on
-    _RISK_THRESHOLDS_FROM_ENV / _CONF_THRESHOLDS_FROM_ENV. ScoringConfig field
-    defaults (which read these constants at class-definition time, later in the
-    file) will see the resolved values.
-    """
+    """v5.5.0: allow ops to tune bucket thresholds via env without forking the file."""
     global RISK_BUCKET_THRESHOLDS, CONFIDENCE_BUCKET_THRESHOLDS
     global _RISK_THRESHOLDS_FROM_ENV, _CONF_THRESHOLDS_FROM_ENV
 
-    # Detect whether the env actually carries values (vs falling back to default)
     risk_low_raw = os.getenv("SCORING_RISK_LOW")
     risk_high_raw = os.getenv("SCORING_RISK_HIGH")
     conf_mod_raw = os.getenv("SCORING_CONFIDENCE_MODERATE")
@@ -539,12 +309,7 @@ class ScoringConfig:
 
     @property
     def risk_moderate_threshold(self) -> float:
-        """Compatibility alias for callers that still read the old name.
-
-        v5.4.0 renamed the second risk cutoff to risk_high_threshold;
-        v5.4.1 restores this read-only alias so existing audit tooling and
-        Google Apps Script bridge checks do not fail with AttributeError.
-        """
+        """Compatibility alias for callers that still read the old name."""
         return self.risk_high_threshold
 
     @classmethod
@@ -768,12 +533,7 @@ def _safe_bool(value: Any) -> bool:
 
 
 def _dedupe_preserving_order(items: Sequence[Any]) -> List[Any]:
-    """v5.5.0: dedupe while preserving first-seen order.
-
-    Used to clean scoring_errors at the end of compute_scores so the same
-    provider tag cannot appear twice in the row's error list. Tolerant of
-    unhashable items: falls back to identity equality on a per-item basis.
-    """
+    """v5.5.0: dedupe while preserving first-seen order."""
     if not items:
         return []
     seen: Set[Any] = set()
@@ -1715,9 +1475,7 @@ def compute_opportunity_score_with_source(
         return _round(100.0 * _clamp(sum(w * v for w, v in parts) / max(1e-9, wsum), 0.0, 1.0), 2), "roi_based"
     if valuation is None and momentum is None:
         return None, "insufficient"
-    # v5.5.0: distinguish which side(s) of the val/mom fallback are real, so audit
-    # tooling can tell a partial fallback (one input fabricated to 50) apart from
-    # a true valuation+momentum blended fallback.
+    # v5.5.0: distinguish which side(s) of the val/mom fallback are real.
     if valuation is not None and momentum is None:
         source_tag = "valuation_only_fallback"
     elif valuation is None and momentum is not None:
@@ -1824,6 +1582,7 @@ _LOCAL_RECO_ALIASES: Dict[str, str] = {
     "BUY": "BUY",
     "ADD": "BUY",
     "OUTPERFORM": "BUY",
+    "MARKET_OUTPERFORM": "BUY",   # v5.7.1: sibling parity w/ provider market_outperform + OUTPERFORM
     "OVERWEIGHT": "BUY",
     # v5.7.0: ACCUMULATE is now its own canonical tier in the 8-tier
     # vocabulary, no longer collapsed into BUY. Vendor labels that signal
@@ -1848,9 +1607,15 @@ _LOCAL_RECO_ALIASES: Dict[str, str] = {
     "REDUCE": "REDUCE",
     "TRIM": "REDUCE",
     "UNDERWEIGHT": "REDUCE",
+    # v5.7.1: UNDERPERFORM -> REDUCE (was SELL). Aligns with
+    # yahoo_fundamentals_provider v6.3.1 (underperform -> REDUCE) and standard
+    # sell-side convention (underperform ~ underweight ~ reduce, not hard sell).
+    # Only affects normalization of externally-supplied labels; scoring.py's
+    # own ladder emits canonical codes and never emits "UNDERPERFORM".
+    "UNDERPERFORM": "REDUCE",
+    "MARKET_UNDERPERFORM": "REDUCE",   # v5.7.1: sibling parity w/ provider market_underperform
     "SELL": "SELL",
     "EXIT": "SELL",
-    "UNDERPERFORM": "SELL",
     "STRONG_SELL": "STRONG_SELL",
     "STRONGSELL": "STRONG_SELL",
     "STRONG SELL": "STRONG_SELL",
@@ -1889,10 +1654,6 @@ _TRAILING_ARROW_RE = re.compile(
 # arbitrary prose. Do NOT use the full _LOCAL_RECO_ALIASES here because common
 # English words such as WATCH, ADD, TRIM, AVOID, EXIT, NEUTRAL, and MAINTAIN can
 # appear naturally in explanatory text and should not be rewritten.
-#
-# Full alias normalization is still preserved in normalize_recommendation_code()
-# where the input is an extracted/standalone label. Trailing-arrow legacy labels
-# are still handled by _TRAILING_ARROW_RE in _align_reason_to_canonical_recommendation().
 _MID_TEXT_SAFE_ALIASES: Dict[str, str] = {
     "STRONGBUY": "STRONG_BUY",
     "STRONG BUY": "STRONG_BUY",
@@ -1903,8 +1664,14 @@ _MID_TEXT_SAFE_ALIASES: Dict[str, str] = {
     "TOP_PICK": "STRONG_BUY",
     "TOP PICK": "STRONG_BUY",
     "OUTPERFORM": "BUY",
+    "MARKET_OUTPERFORM": "BUY",
+    "MARKET OUTPERFORM": "BUY",
     "OVERWEIGHT": "BUY",
-    "UNDERPERFORM": "SELL",
+    # v5.7.1: UNDERPERFORM prose label -> REDUCE (was SELL), matching the
+    # _LOCAL_RECO_ALIASES retarget and the provider. Display-only.
+    "UNDERPERFORM": "REDUCE",
+    "MARKET_UNDERPERFORM": "REDUCE",
+    "MARKET UNDERPERFORM": "REDUCE",
     "UNDERWEIGHT": "REDUCE",
     "MARKET_PERFORM": "HOLD",
     "MARKET PERFORM": "HOLD",
@@ -2005,9 +1772,7 @@ def _align_reason_to_canonical_recommendation(reason: Optional[str], canonical_r
     text = str(reason)
     canonical = normalize_recommendation_code(canonical_rec or "HOLD")
 
-    # v5.4.2: normalize only safe finance-jargon labels inside prose. Common
-    # instruction words (WATCH/ADD/TRIM/AVOID/EXIT/NEUTRAL/MAINTAIN) are
-    # intentionally excluded to preserve narrative wording.
+    # v5.4.2: normalize only safe finance-jargon labels inside prose.
     for pattern, replacement in _LEGACY_LABEL_PATTERNS:
         text = pattern.sub(replacement, text)
 
@@ -2028,11 +1793,7 @@ def _active_roi_for_horizon(
     roi12: Optional[float],
     upside_pct: Optional[float],
 ) -> Tuple[Optional[float], str]:
-    """Return the ROI used for the recommendation plus a truthful label.
-
-    v5.4.1 fixes misleading labels on fallback paths. The label now describes
-    the actual source of the active ROI used in recommendation prose.
-    """
+    """Return the ROI used for the recommendation plus a truthful label."""
     if horizon == Horizon.DAY:
         if roi1 is not None:
             return roi1, "1M"
@@ -2298,9 +2059,6 @@ def derive_canonical_recommendation(
 ) -> Tuple[str, str, str]:
     # v5.6.0: when overwrite=True, force a fresh recomputation even if the
     # row's recommendation_source still carries scoring.py's provenance tag.
-    # Pre-v5.6.0 this inner skip ran unconditionally and silently returned
-    # cached values to apply_canonical_recommendation(overwrite=True) callers
-    # who had not first cleared recommendation_source themselves.
     if not overwrite:
         existing_tag = _safe_str(row.get("recommendation_source"))
         if existing_tag == RECOMMENDATION_SOURCE_TAG:
@@ -2380,9 +2138,7 @@ def apply_canonical_recommendation(
         row, settings=settings, overwrite=overwrite
     )
     # v5.6.0: hard-normalize the priority band so the engine never sees an
-    # empty or non-canonical value. _compute_priority always returns a
-    # canonical band today, but this guard catches any future regression in
-    # the derive path before it leaks into the engine's row.update.
+    # empty or non-canonical value.
     if priority not in _CANONICAL_PRIORITIES_SET:
         priority = PRIO_P4
     return {
@@ -2527,7 +2283,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             ) if val is None
         ]
         logger.warning(
-            "[v5.7.0 INSUFFICIENT] symbol=%s missing=%s",
+            "[v5.7.1 INSUFFICIENT] symbol=%s missing=%s",
             _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
             ",".join(missing_components),
         )
@@ -2666,12 +2422,11 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
 
     recommendation_detail = f"{priority} [{canonical_rec}]: {structured_reason}"
 
-    # v5.5.0: dedupe scoring_errors while preserving first-seen order so the
-    # same provider tag cannot appear twice in the row's error list.
+    # v5.5.0: dedupe scoring_errors while preserving first-seen order.
     scoring_errors = _dedupe_preserving_order(scoring_errors)
 
     logger.info(
-        "[v5.7.0 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
+        "[v5.7.1 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
         _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
         overall,
         risk,
@@ -2894,22 +2649,7 @@ def score_and_rank_rows(
 # =============================================================================
 
 def get_canonical_thresholds() -> Dict[str, Any]:
-    """Return the bucket thresholds the running process is actually using.
-
-    Useful for audit/diagnostic tooling to verify scoring.py is aligned with
-    other modules in the stack (data_engine_v2, investment_advisor) without
-    re-reading env vars or guessing.
-
-    Returns
-    -------
-    Dict[str, Any]
-        {
-          "risk_thresholds":           (low, high),       # 0-100 scale
-          "confidence_thresholds":     (moderate, high),  # 0-1 fraction
-          "risk_thresholds_from_env":  bool,
-          "confidence_thresholds_from_env": bool,
-        }
-    """
+    """Return the bucket thresholds the running process is actually using."""
     return {
         "risk_thresholds": tuple(RISK_BUCKET_THRESHOLDS),
         "confidence_thresholds": tuple(CONFIDENCE_BUCKET_THRESHOLDS),
@@ -2919,15 +2659,7 @@ def get_canonical_thresholds() -> Dict[str, Any]:
 
 
 def get_canonical_state() -> Dict[str, Any]:
-    """Return a full ops snapshot of scoring.py state.
-
-    Includes version, recommendation source tag, canonical bucket availability,
-    threshold settings, and the active ScoringConfig (as a plain dict via
-    asdict for JSON-friendliness).
-
-    This is the single entry-point audit/diagnostic tooling should call to
-    verify what the running scoring process is doing.
-    """
+    """Return a full ops snapshot of scoring.py state."""
     try:
         config_snapshot: Dict[str, Any] = asdict(_CONFIG)
     except Exception:
