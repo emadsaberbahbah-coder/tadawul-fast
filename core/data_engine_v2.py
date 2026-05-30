@@ -2,8 +2,61 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.12
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.14
 ================================================================================
+
+WHY v5.77.14 - FUNDAMENTALS ACQUISITION FIX (the universal-SELL root cause)
+---------------------------------------------------------------------------
+A deployed refresh produced a wall of REDUCE/SELL/AVOID across ~90 equity
+rows: every overall_score 11-53, every row tagged
+`opportunity_source = momentum_only_fallback`, every row carrying a
+`scoring_errors` entry of insufficient_scoring_inputs /
+forecast_skipped_unavailable, and an overall_penalty_factor of 0.70-0.83.
+Fundamentals (market_cap, pe_ttm, eps_ttm, dividend_yield, revenue_ttm,
+margins, pb_ratio, ps_ratio, ev_ebitda, peg_ratio, beta_5y, float_shares)
+were blank on every row except three EODHD-shaped rows.
+
+ROOT CAUSE
+----------
+This is NOT a scoring or classifier bug. The scores collapse because the
+rows reach scoring.py with price-only data and no fundamentals -> the
+completeness penalty fires and opportunity falls back to momentum-only ->
+scores land in the REDUCE/SELL band. The recommendation logic is then
+faithfully reporting a genuinely fundamentals-starved row.
+
+Fundamentals never arrive because the engine's ONLY fundamentals source at
+runtime is the Yahoo enrichment pass, and that pass could not find the
+provider's entry point. core.providers.yahoo_fundamentals_provider exposes
+its module-level callable as `fetch_fundamentals_patch`, but
+`_fetch_yahoo_fundamentals_patch()` asked `_pick_yahoo_callable()` only for
+get_fundamentals / fetch_fundamentals / fundamentals (+ *_async). None of
+those names exist on the module, so the picker returned None, the pass was
+a silent no-op, and fundamentals stayed blank on every equity row. (EODHD's
+fetch_quote returns price-only; its fundamentals live in a separate
+fetch_fundamentals method the engine's quote-only provider picker never
+calls - so Yahoo is the sole fundamentals path today.)
+
+THE FIX
+-------
+Add the provider's real entry point `fetch_fundamentals_patch` (and the
+combined `fetch_enriched_quote_patch`) as the FIRST candidates in the
+`_pick_yahoo_callable()` name list inside `_fetch_yahoo_fundamentals_patch`.
+This is the one functional change in v5.77.14. With it, the Yahoo
+fundamentals pass resolves, fundamentals populate, the completeness penalty
+stops firing on data-available rows, and recommendations spread back across
+the full vocabulary instead of collapsing to SELL.
+
+OPERATIONAL NOTE
+----------------
+The pass is still gated by ENGINE_YAHOO_ENRICHMENT_ENABLED. If that env var
+is set to 0/false/off, this fix does nothing because the entire enrichment
+pass is skipped before the picker runs. Confirm it is enabled (or unset) in
+the deploy environment.
+
+No schema changes. No contract changes. No math changes. All v5.77.6
+through v5.77.13 behavior preserved; the only delta from v5.77.12 is the
+two added candidate names in the Yahoo fundamentals picker (plus this WHY
+block, the version bump, and the health() valuation_model version string).
 
 WHY v5.77.12 - RECOMMENDATION/DETAIL DIVERGENCE: THE REAL ROOT CAUSE
 -------------------------------------------------------------------
@@ -423,7 +476,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.77.12"
+__version__ = "5.77.14"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4915,7 +4968,7 @@ class _EngineSymbolsReaderProxy:
 # DataEngineV5 — the main orchestrator
 # =============================================================================
 class DataEngineV5:
-    """Global-first data orchestrator (v5.77.12)."""
+    """Global-first data orchestrator (v5.77.14)."""
 
     def __init__(
         self,
@@ -5443,8 +5496,18 @@ class DataEngineV5:
         # accepts one positional). `page` is kept on this method's signature so
         # call sites that pass it still work; we just don't forward it.
         mod = _import_yahoo_provider_module("yahoo_fundamentals_provider")
+        # v5.77.14 FIX (the universal-SELL root cause): core.providers.
+        # yahoo_fundamentals_provider exposes its module-level entry point as
+        # `fetch_fundamentals_patch` (and the combined `fetch_enriched_quote_patch`),
+        # NOT get_fundamentals / fetch_fundamentals / fundamentals. Searching only
+        # the legacy names returned None, so this entire pass was a silent no-op
+        # and fundamentals never populated — every equity row then fell back to
+        # momentum-only scoring and collapsed into the SELL/REDUCE/AVOID band.
+        # List the provider's real names FIRST so the picker resolves; the legacy
+        # names remain as fallbacks for any alternate provider build.
         fn = _pick_yahoo_callable(
             mod,
+            "fetch_fundamentals_patch", "fetch_enriched_quote_patch",
             "get_fundamentals_async", "fetch_fundamentals_async",
             "get_fundamentals", "fetch_fundamentals",
             "fundamentals_async", "fundamentals",
@@ -6006,7 +6069,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.77.12",  # v5.77.12: empty-row over-trigger fix (recommendation/detail divergence root cause)
+                "version": "v5.77.14",  # v5.77.14: Yahoo fundamentals picker name-match fix (universal-SELL root cause)
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
@@ -6183,7 +6246,7 @@ __all__ = [
 # v5.77.11 module-load INFO banner
 # -----------------------------------------------------------------------------
 # Emitted exactly once when this module is loaded. Confirms in the Render
-# startup log that v5.77.11 is actually live. Uses __version__ so this label
+# startup log that the engine is actually live. Uses __version__ so this label
 # is also automatically in sync with the constant — same approach now used
 # by the CLASSIFIER and RANK diagnostic logs (see v5.77.11 WHY block).
 # =============================================================================
