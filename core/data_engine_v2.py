@@ -2,8 +2,80 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.11
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.12
 ================================================================================
+
+WHY v5.77.12 - RECOMMENDATION/DETAIL DIVERGENCE: THE REAL ROOT CAUSE
+-------------------------------------------------------------------
+After v5.77.11 deployed to Render, a refresh produced rows like:
+
+  NWSA.US  Recommendation=REDUCE  Reason="HOLD: Insufficient provider data; ...
+                                          recommendation suppressed / not actionable."
+                                  Recommendation Detail=HOLD
+                                  Reco Source=empty_row     Provider Rating=STRONG_BUY
+                                  Overall Score=54.67       Rank (Overall)=281
+  ITUB.US  Recommendation=SELL    Reason="HOLD: Insufficient ..."
+                                  Recommendation Detail=HOLD
+                                  Reco Source=empty_row     Provider Rating=HOLD
+                                  Overall Score=49.10
+  TELIA.ST Recommendation=SELL    Reason="HOLD: Insufficient ..."
+                                  Reco Source=empty_row     Provider Rating=STRONG_BUY
+                                  Overall Score=43.12
+
+Same pattern on every row: a real `recommendation` value (REDUCE/SELL/HOLD)
+mapped from `overall_score` (<50 -> SELL, 50-65 -> REDUCE, 66+ -> HOLD),
+but `recommendation_detail`, `recommendation_reason`, and `recommendation_source`
+all carried the empty-row stamp. The audit consensus has been pointing at
+`analysis_sheet_rows.py` as the source — and that route DOES have its own
+score->recommendation logic — but the engine itself was setting the stage
+for the divergence.
+
+ROOT CAUSE (engine side)
+------------------------
+`_is_empty_data_row()` returned True whenever `_EMPTY_ROW_FUNDAMENTAL_KEYS`
+(market_cap, revenue_ttm, eps_ttm, pe_ttm) were ALL missing, regardless of
+how much price + derived-technical data the row carried. For less-popular
+tickers where EODHD ships price+OHLC+history but no fundamentals (NWSA,
+IWR, FULT, EWG, CI, EIX, ET, 1398.HK, BARC.L, TELIA.ST, BNS.TO, ...) this
+fired on every row. That branch routed through `_mark_row_as_empty()`,
+which stamps recommendation_source="empty_row", recommendation="HOLD",
+recommendation_detailed="HOLD", recommendation_reason="HOLD: Insufficient
+provider data; recommendation suppressed / not actionable." — and skips
+the full scoring pipeline.
+
+But the canonical scoring path (scoring.py) still produced a real
+overall_score from the price+RSI+volatility data we DO have. Downstream
+post-processing then mapped that score back into a `recommendation`
+field — but didn't touch the related detail/reason/source/priority_band
+fields the engine had already stamped. The result was the visible
+divergence.
+
+THE FIX
+-------
+A row is empty only when it has NOTHING — no price, no fundamentals,
+AND no derived technicals. The previous `if fund_pop == 0: return True`
+short-circuit is removed. Rows with price + technicals now flow through
+the full pipeline (_compute_scores_canonical_first ->
+_apply_phase_dd_enhancements -> _compute_recommendation), and the v5.77.6
+classifier's Step 2a clears any stale recommendation fields before
+writing a consistent set on Step 4. The fundamentals-exempt branch
+(FX / commodities / ETFs / funds) is preserved as a no-op for
+documentation.
+
+EXPECTED EFFECT AFTER DEPLOY
+----------------------------
+On the next refresh, equity rows with price+derived data but no
+fundamentals should show:
+  - Recommendation, Recommendation Detail, Reason: all consistent
+    (e.g. all reflect REDUCE / SELL / HOLD as classified by overall_score)
+  - Reco Source: a real source ("composite_canonical" / "rules" / etc.),
+    NOT "empty_row"
+  - Warnings: no "empty_row_no_provider_data" tag
+  - "rank_skipped_no_overall_score" warning should disappear because
+    the row will have a real overall_score before _apply_rank_overall runs
+
+No schema changes. No contract changes. All v5.77.6 through v5.77.11
+fixes preserved.
 
 WHY v5.77.11 - DYNAMIC DIAGNOSTIC LABELS (COSMETIC, NO FUNCTIONAL CHANGE)
 ------------------------------------------------------------------------
@@ -351,7 +423,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.77.11"
+__version__ = "5.77.12"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -2346,6 +2418,40 @@ def _empty_row_fundamentals_exempt(row: Mapping[str, Any]) -> bool:
 
 
 def _is_empty_data_row(row: Mapping[str, Any]) -> bool:
+    """Decide whether a row has so little data that the engine should
+    short-circuit into `_mark_row_as_empty()` instead of running the full
+    scoring + classifier pipeline.
+
+    v5.77.12 fix
+    ------------
+    Previous versions returned True whenever the row's fundamental keys
+    (market_cap, revenue_ttm, eps_ttm, pe_ttm) were all missing — even
+    when the row had a complete price + OHLC payload and a full set of
+    derived technicals (RSI, volatility, drawdown, Sharpe, VaR). That
+    triggered `_mark_row_as_empty()`, which stamped the row with
+    `recommendation_source="empty_row"`, `recommendation="HOLD"`,
+    `recommendation_detailed="HOLD"`, and
+    `recommendation_reason="HOLD: Insufficient provider data; ..."`.
+
+    Downstream, the canonical scoring path still produced a real
+    `overall_score` from price+technicals (e.g. 54.67 for NWSA, 49.10
+    for ITUB, 43.12 for TELIA), and the route handler / post-processing
+    mapped that score to "REDUCE" (50-65) or "SELL" (<50) — writing
+    only the `recommendation` field, not the related detail/reason/
+    source/priority_band. Result: every row on the deployed dashboard
+    had `recommendation=REDUCE` (or SELL) but `recommendation_detail=HOLD`
+    and `reason="HOLD: Insufficient..."` — the recommendation/detail
+    divergence the audit consensus has been pointing at.
+
+    The fix: a row is empty only when it has NOTHING — no price, no
+    fundamentals, and no derived technicals. A row with price+RSI+
+    volatility (even if fundamentals are blank) gets the full pipeline,
+    and the v5.77.6 classifier's Step 2a auto-clears any stale
+    recommendation fields before re-populating them consistently. The
+    fundamentals-exempt branch (FX / commodities / ETFs / funds) is
+    preserved for documentation; the simpler primary rule already
+    covers those cases.
+    """
     if not isinstance(row, Mapping):
         return False
 
@@ -2364,14 +2470,19 @@ def _is_empty_data_row(row: Mapping[str, Any]) -> bool:
     fund_pop = sum(1 for k in _EMPTY_ROW_FUNDAMENTAL_KEYS if _has_value(k))
     derived_pop = sum(1 for k in _EMPTY_ROW_DERIVED_KEYS if _has_value(k))
 
+    # Truly empty: NO signal anywhere — no price, no fundamentals, no
+    # technicals. This catches provider failures, delisted symbols, and
+    # genuine garbage rows. Everything else gets the full pipeline.
     if price_pop == 0 and fund_pop == 0 and derived_pop == 0:
         return True
 
+    # Preserved for documentation: FX / commodities / ETFs / funds
+    # intentionally don't carry equity fundamentals. Under the v5.77.12
+    # rule this branch is a no-op (the rule above already returns False
+    # for any row with a populated price or derived metric), but keeping
+    # it makes the asset-class intent explicit for future maintainers.
     if _empty_row_fundamentals_exempt(row):
         return False
-
-    if fund_pop == 0:
-        return True
 
     return False
 
@@ -4804,7 +4915,7 @@ class _EngineSymbolsReaderProxy:
 # DataEngineV5 — the main orchestrator
 # =============================================================================
 class DataEngineV5:
-    """Global-first data orchestrator (v5.77.11)."""
+    """Global-first data orchestrator (v5.77.12)."""
 
     def __init__(
         self,
@@ -5895,7 +6006,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.77.11",  # v5.77.11: dynamic diagnostic-label versions (cosmetic)
+                "version": "v5.77.12",  # v5.77.12: empty-row over-trigger fix (recommendation/detail divergence root cause)
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
