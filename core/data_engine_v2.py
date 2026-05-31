@@ -2,8 +2,95 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.19
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.21
 ================================================================================
+
+WHY v5.77.21 - HARDENING (audit follow-up to v5.77.20)
+------------------------------------------------------
+Three small, low-risk hardening changes on top of the v5.77.20 fixes. None
+indicate a v5.77.20 defect; they close edge/fallback paths and guarantee
+internal consistency regardless of route or future re-ordering.
+
+  Fix C - RECONCILE get_page_rows() OUTPUT
+    v5.77.20 reconciled the recommendation family in _strict_project_row(),
+    which covers get_sheet_rows() / get_sheet() (the primary route path). But
+    get_page_rows() returns raw get_enriched_quotes() output with no strict
+    projection, and it sits in several route fallback candidate lists
+    (advanced_sheet_rows, top10_selector). It is only reached if get_sheet_rows()
+    throws for a page, but to make EVERY path safe, get_page_rows() now runs
+    _reconcile_recommendation_family() on each row before returning.
+
+  Fix D - RECOMPUTE expected_roi_* WHEN A PROVIDER TARGET IS CAPPED
+    In the normal pipeline _cap_provider_target_forecasts() runs BEFORE scoring,
+    so scoring recomputes ROI from the capped forecast and no stale ROI survives.
+    To make that guarantee independent of ordering (and correct when an
+    expected_roi_* value pre-exists), the cap now recomputes the matching
+    expected_roi_* immediately for EACH leg it caps -- per-leg and guarded, so an
+    absent 3M/1M leg is skipped rather than dereferenced. A capped forecast price
+    can never sit next to a stale (saturated) ROI.
+
+  Fix E - REFRESH A STALE GENERIC position_size_hint ON RECONCILE
+    _reconcile_recommendation_family() left position_size_hint untouched. It now
+    refreshes it when the hint is BLANK or is one of the four GENERIC fallback
+    strings ("Core position" / "Standard position" / "Maintain or trim" /
+    "Avoid / reduce") left over from a now-superseded recommendation. Richer
+    scoring-supplied text (e.g. "Scale in gradually / partial position") is
+    PRESERVED -- re-deriving it from the coarse map would downgrade the
+    dashboard, and it already reflects the authoritative detailed recommendation.
+
+VALIDATION (post-deploy)
+  - get_page_rows() rows: recommendation == recommendation_detailed.
+  - Any capped provider_target leg: forecast_price_*m and expected_roi_*m agree;
+    no 65.0/27.3/11.7 triplet.
+  - position_size_hint never blank for a recommended row and never a generic
+    string that contradicts the final recommendation; rich hints preserved.
+  - /health: version 5.77.21, valuation_model.version v5.77.21, schema 107.
+
+WHY v5.77.20 - RECOMMENDATION RECONCILIATION + PROVIDER-TARGET CAP (audit follow-up)
+-----------------------------------------------------------------------------------
+Two live-sheet defects from the v5.77.19 Global_Markets refresh audit:
+
+  Fix A - RECOMMENDATION FAMILY DESYNC (the "Recommendation != Detail" rows)
+    On the refreshed sheet the coarse `recommendation` column sometimes
+    disagreed with `recommendation_detailed`, `recommendation_reason`,
+    `recommendation_priority`, and `recommendation_priority_band` (e.g.
+    Recommendation=HOLD while Detail/Reason=ACCUMULATE; 3988.HK
+    Recommendation=HOLD while Detail=BUY; 207940.KS Recommendation=BUY while
+    Detail=HOLD). The classifier's Step-4 atomic write already sets
+    `recommendation` == `recommendation_detailed`, so any drift is introduced by
+    a later pass (or by the Apps Script sheet writer). v5.77.20 makes the engine
+    the single source of truth: `_reconcile_recommendation_family()` runs as the
+    LAST step inside `_strict_project_row()` -- the final transform before rows
+    leave the API -- forcing `recommendation` == `recommendation_detailed`,
+    re-deriving priority and band from that value, and rewriting the reason
+    prefix to match. (If an API-JSON diff shows the fields already agree at the
+    API boundary, the remaining drift is in the Apps Script writer, which must
+    map the Recommendation cell straight from the `recommendation` field.)
+
+  Fix B - PROVIDER-TARGET ROI SATURATION (the 65.0 / 27.3 / 11.7 triplet)
+    Rows such as TCEHY, VCEL, BILI, CHTR, MMS still showed the saturated
+    11.7 / 27.3 / 65.0 ROI triplet with forecast_price_12m left at the raw
+    analyst target (so the forecast price and the ROI disagreed). Root cause is
+    pipeline ORDER: _compute_scores_canonical_first() (core.scoring) runs BEFORE
+    Phase-II, reads forecast_price_12m == the raw provider target (e.g. TCEHY
+    97.67 vs price 54.62 = +78.8%, well inside the old 2.50x gate band), and
+    clamps the 12M ROI to its 0.65 ceiling then sub-splits 0.42/0.18. The
+    v5.77.18 gate could not catch it (target < 2.50x) and the Phase-II +/-30%
+    cap ran too late (it lives in Phase-II, AFTER scoring). v5.77.20 caps an
+    honored provider target to the engine's own Phase-II +/-30% ceiling in
+    `_cap_provider_target_forecasts()`, called from `_apply_phase_bb_sanity()` --
+    which runs BEFORE scoring -- so core.scoring never sees a >+30% forecast and
+    the forecast price stays consistent with the ROI. The ingestion gate default
+    TFB_PROVIDER_TARGET_MAX_MULT is also tightened 2.50 -> 1.50 as
+    defense-in-depth (still env-tunable). Engine-synthesized forecasts were
+    already +/-30%-bounded; this brings provider targets in line.
+
+VALIDATION (post-deploy)
+  - No row shows Recommendation != Recommendation Detail; reason prefix,
+    priority, and band all agree with the final recommendation.
+  - No provider_target row shows expected_roi_12m above the +/-30% ceiling or
+    the 65.0/27.3/11.7 triplet; forecast_price_12m and expected_roi_12m agree.
+  - /health: version 5.77.20, valuation_model.version v5.77.20, schema 107.
 
 WHY v5.77.19 - PROVIDER-TARGET GATE HARDENING (audit follow-up to v5.77.18)
 ---------------------------------------------------------------------------
@@ -765,7 +852,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.77.19"
+__version__ = "5.77.21"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -1337,6 +1424,10 @@ def _apply_phase_bb_sanity(row: Dict[str, Any]) -> Dict[str, Any]:
     _sanitize_price_change(row)
     _sanitize_percent_change(row)
     _sanitize_week_52_position_pct(row)
+    # v5.77.20 (Fix B): bound an honored provider target to the Phase-II +/-30%
+    # ceiling here, BEFORE _compute_scores_canonical_first() reads
+    # forecast_price_12m and clamps the ROI to its 0.65 saturation ceiling.
+    _cap_provider_target_forecasts(row)
     return row
 
 
@@ -1539,6 +1630,45 @@ _RECO_8TIER_PRIORITY: Dict[str, int] = {
     "AVOID":       5,
 }
 
+# v5.77.20: canonical recommendation -> priority-band map. Mirrors the inline
+# band logic in _classify_recommendation_8tier (Steps 3a/3c): the extreme
+# actionable tiers (both ends) are the most urgent (P1), and HOLD is the
+# neutral P4. Used by _reconcile_recommendation_family so the band can never
+# drift away from the final recommendation.
+_RECO_8TIER_BAND: Dict[str, str] = {
+    "STRONG_BUY":  "P1",
+    "BUY":         "P2",
+    "ACCUMULATE":  "P3",
+    "HOLD":        "P4",
+    "REDUCE":      "P5",
+    "SELL":        "P5",
+    "STRONG_SELL": "P1",
+    "AVOID":       "P1",
+}
+
+
+def _recommendation_band(rec: str) -> str:
+    """v5.77.20: priority band ('P1'..'P5') for a canonical recommendation."""
+    return _RECO_8TIER_BAND.get(_safe_str(rec).upper(), "P4")
+
+
+# v5.77.21 (Fix E): canonical recommendation -> GENERIC position-size hint. The
+# strings MUST match the fallback hints written in _build_top_factors_and_risks
+# so _reconcile_recommendation_family can recognize a generic hint that was
+# derived from a now-superseded recommendation and refresh it -- while leaving
+# any richer scoring-supplied text untouched.
+_PSH_BY_RECO: Dict[str, str] = {
+    "STRONG_BUY":  "Core position",
+    "BUY":         "Standard position",
+    "ACCUMULATE":  "Standard position",
+    "HOLD":        "Maintain or trim",
+    "REDUCE":      "Avoid / reduce",
+    "SELL":        "Avoid / reduce",
+    "STRONG_SELL": "Avoid / reduce",
+    "AVOID":       "Avoid / reduce",
+}
+_PSH_GENERIC_VALUES: frozenset = frozenset(_PSH_BY_RECO.values())
+
 
 def _canonical_recommendation(value: Any) -> str:
     if value in (None, ""):
@@ -1558,6 +1688,51 @@ def _recommendation_priority(rec: str) -> int:
     """v5.69.0/v5.76.0: integer rank 1 (best) .. 5 (worst)."""
     key = _safe_str(rec).upper()
     return _RECO_8TIER_PRIORITY.get(key, 4)
+
+
+def _reconcile_recommendation_family(row: Dict[str, Any]) -> None:
+    """v5.77.20 (Fix A): force the recommendation family to a single value.
+
+    The authoritative source is `recommendation_detailed` (the engine's detailed
+    decision, which the reason prefix, priority, band, and position-size hint all
+    track); `recommendation` is the field observed drifting on the refreshed
+    sheet. This runs as the FINAL step of _strict_project_row(), so whatever an
+    upstream pass or re-score left behind, the row that leaves the API has:
+        recommendation               == recommendation_detailed
+        recommendation_priority       = priority(final)
+        recommendation_priority_band  = band(final)
+        recommendation_reason prefix  == final
+    position_size_hint is refreshed by v5.77.21 (Fix E) ONLY when it is blank or
+    is a GENERIC fallback string that no longer matches `final` (i.e. it was
+    derived from a now-superseded recommendation); richer scoring-supplied text
+    is preserved. No-op when neither field holds a canonical recommendation
+    (special pages, empty rows).
+    """
+    if not isinstance(row, dict):
+        return
+    detailed = _canonical_recommendation(row.get("recommendation_detailed"))
+    coarse = _canonical_recommendation(row.get("recommendation"))
+    final = detailed or coarse
+    if not final:
+        return
+    row["recommendation"] = final
+    row["recommendation_detailed"] = final
+    row["recommendation_priority"] = _recommendation_priority(final)
+    row["recommendation_priority_band"] = _recommendation_band(final)
+    reason = _safe_str(row.get("recommendation_reason"))
+    if reason and ":" in reason:
+        head, _sep, tail = reason.partition(":")
+        head_canon = _canonical_recommendation(head.strip())
+        if head_canon and head_canon != final:
+            row["recommendation_reason"] = final + ":" + tail
+    # v5.77.21 (Fix E): keep position_size_hint consistent without clobbering
+    # richer scoring text. Refresh only a blank hint or a generic fallback hint
+    # that no longer matches the final recommendation.
+    expected_psh = _PSH_BY_RECO.get(final, "")
+    if expected_psh:
+        psh = _safe_str(row.get("position_size_hint")).strip()
+        if not psh or (psh in _PSH_GENERIC_VALUES and psh != expected_psh):
+            row["position_size_hint"] = expected_psh
 
 
 # v5.77.16: recommendation_source values the ENGINE itself writes. When a row
@@ -2220,6 +2395,61 @@ def _forecast_price_is_populated(v: Any) -> bool:
     """
     f = _as_float(v)
     return f is not None and f > 0.0
+
+
+def _cap_provider_target_forecasts(row: Dict[str, Any]) -> None:
+    """v5.77.20 (Fix B): cap an honored provider analyst target to the Phase-II
+    +/-30% ceiling BEFORE scoring reads it.
+
+    Pipeline order is _compute_scores_canonical_first() (core.scoring) -> then
+    _apply_phase_dd_enhancements() (Phase-II). core.scoring reads
+    forecast_price_12m and, when it implies a >+65% 12M return, clamps the ROI to
+    its 0.65 ceiling and sub-splits 0.42/0.18 -> the saturated 11.7/27.3/65.0
+    triplet, leaving forecast_price_12m at the raw target (so price and ROI
+    disagree). This helper -- invoked from _apply_phase_bb_sanity(), which runs
+    BEFORE scoring -- bounds each provider-target leg to the engine's own
+    Phase-II ceiling (12M +/-30%, with 3M/1M scaled by the same ratios Phase-II
+    uses), so core.scoring never sees a saturating value and the forecast price
+    stays consistent with the ROI. Only provider_target rows are touched;
+    engine-synthesized forecasts are produced capped already.
+
+    v5.77.21 (Fix D): for each leg actually capped, the matching expected_roi_*m
+    is recomputed immediately from the capped price (per-leg and guarded, so an
+    absent leg is skipped). This guarantees forecast<->ROI agreement even if an
+    expected_roi_* value pre-exists or scoring ordering changes.
+    """
+    if not isinstance(row, dict):
+        return
+    if _safe_str(row.get("forecast_source")).lower() != "provider_target":
+        return
+    cp = _as_float(row.get("current_price"))
+    if cp is None or cp <= 0:
+        return
+    legs = (
+        ("forecast_price_12m", "expected_roi_12m", _PHASE_II_MAX_12M_ABS_RETURN,
+         "provider_target_12m_capped_to_phase_ii_ceiling"),
+        ("forecast_price_3m", "expected_roi_3m", _PHASE_II_MAX_12M_ABS_RETURN * _PHASE_II_RATIO_3M_OF_12M,
+         "provider_target_3m_capped_to_phase_ii_ceiling"),
+        ("forecast_price_1m", "expected_roi_1m", _PHASE_II_MAX_12M_ABS_RETURN * _PHASE_II_RATIO_1M_OF_12M,
+         "provider_target_1m_capped_to_phase_ii_ceiling"),
+    )
+    for field, roi_field, cap_abs, tag in legs:
+        fp = _as_float(row.get(field))
+        if fp is None or fp <= 0:
+            continue
+        ret = (fp - cp) / cp
+        capped_ret = None
+        if ret > cap_abs:
+            capped_ret = cap_abs
+        elif ret < -cap_abs:
+            capped_ret = -cap_abs
+        if capped_ret is None:
+            continue
+        new_fp = round(cp * (1.0 + capped_ret), 4)
+        row[field] = new_fp
+        # v5.77.21 (Fix D): keep the matching ROI in lockstep with the capped price.
+        row[roi_field] = round((new_fp - cp) / cp, 6)
+        _v573_append_warning(row, tag)
 
 
 def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
@@ -4315,7 +4545,13 @@ def _coerce_datetime_like(value: Any) -> Optional[str]:
 # (band falls back to the defaults) so a config typo can never blank forecasts.
 # =============================================================================
 _PROVIDER_TARGET_MIN_MULT_DEFAULT: float = 0.40
-_PROVIDER_TARGET_MAX_MULT_DEFAULT: float = 2.50
+# v5.77.20: tightened 2.50 -> 1.50. A 12-month analyst target implying >+50%
+# upside is beyond what the engine treats as a literal forecast; drop it at
+# ingestion so Phase-II synthesizes a +/-30%-bounded forecast instead. Targets
+# that survive this band are still capped to the Phase-II +/-30% ceiling before
+# scoring (see _cap_provider_target_forecasts). Env-tunable via
+# TFB_PROVIDER_TARGET_MAX_MULT.
+_PROVIDER_TARGET_MAX_MULT_DEFAULT: float = 1.50
 
 
 def _provider_target_gate_enabled() -> bool:
@@ -4714,6 +4950,11 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    # v5.77.20 (Fix A): reconcile the recommendation family as the LAST thing
+    # before the row is projected to canonical keys -- this is the final transform
+    # before rows leave the API, so recommendation can never disagree with
+    # recommendation_detailed / reason / priority / band downstream.
+    _reconcile_recommendation_family(row)
     return {k: _json_safe(row.get(k)) for k in keys}
 
 
@@ -5573,7 +5814,7 @@ class _EngineSymbolsReaderProxy:
 # DataEngineV5 — the main orchestrator
 # =============================================================================
 class DataEngineV5:
-    """Global-first data orchestrator (v5.77.19)."""
+    """Global-first data orchestrator (v5.77.21)."""
 
     def __init__(
         self,
@@ -6485,7 +6726,14 @@ class DataEngineV5:
         if not symbols:
             return []
         symbols = symbols[max(0, int(offset)):max(0, int(offset)) + max(1, int(limit))]
-        return await self.get_enriched_quotes(symbols, canon)
+        rows = await self.get_enriched_quotes(symbols, canon)
+        # v5.77.21 (Fix C): get_page_rows bypasses _strict_project_row (where
+        # _reconcile_recommendation_family runs for get_sheet_rows). It sits in
+        # several route fallback candidate lists, so reconcile here too -- every
+        # path that returns rows then has recommendation == recommendation_detailed.
+        for _r in rows:
+            _reconcile_recommendation_family(_r)
+        return rows
 
     async def get_sheet(self, sheet: str, *, limit: int = 2000, offset: int = 0, **kwargs: Any) -> Dict[str, Any]:
         canon = _canonicalize_sheet_name(sheet)
@@ -6727,7 +6975,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.77.19",  # v5.77.19: provider-target gate hardening on the v5.77.18 ingestion gate -- (1) inject the row price as the gate reference on the Yahoo enrichment path so a price-less patch can't fail the gate open, (2) carry provider_target_implausible_dropped_* warnings through the enrichment filter, (3) honor a 3M-only provider target in Phase-II instead of overwriting it; gate still env-tunable via TFB_PROVIDER_TARGET_MIN_MULT / _MAX_MULT / _GATE_ENABLED
+                "version": "v5.77.21",  # v5.77.21 hardening on v5.77.20: (Fix C) get_page_rows() now runs _reconcile_recommendation_family() on its rows (it bypasses _strict_project_row and sits in route fallback chains); (Fix D) _cap_provider_target_forecasts() recomputes the matching expected_roi_*m for each leg it caps so a capped price never sits next to a stale/saturated ROI; (Fix E) _reconcile_recommendation_family() refreshes a blank or stale GENERIC position_size_hint to match the final recommendation while preserving richer scoring text. v5.77.20 base: (A) recommendation-family reconciliation at the API boundary, (B) provider-target +/-30% cap before scoring + gate max-mult 2.50 -> 1.50
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
