@@ -2,8 +2,113 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.17
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.19
 ================================================================================
+
+WHY v5.77.19 - PROVIDER-TARGET GATE HARDENING (audit follow-up to v5.77.18)
+---------------------------------------------------------------------------
+The v5.77.18 ingestion gate was accepted as directionally correct (it stops an
+out-of-band analyst target from being tagged forecast_source="provider_target"
+and saturating the +65.0 / +27.3 / +11.7 ROI triplet). The post-v5.77.18 audit
+found three hardening items; v5.77.19 applies all three. No schema/contract/math
+changes outside the three gated paths below.
+
+  Fix 1 - GATE FAIL-OPEN WHEN THE YAHOO PATCH LACKS A PRICE (highest priority)
+    _provider_target_is_plausible() is fail-open: with no price it returns True
+    so a sparse feed never blanks a genuine forecast. That is correct for the
+    primary provider pass (the patch carries its own current_price). But the
+    Yahoo enrichment pass canonicalizes the Yahoo *fundamentals* patch on its
+    OWN, and that patch frequently has targetMeanPrice but NO currentPrice — so
+    the gate saw price=None, failed open, and an implausible Yahoo target could
+    still tag provider_target on the merged row. Fix: before canonicalizing a
+    Yahoo patch, inject the already-known row price (current_price/price) into a
+    copy of the patch when the patch itself has none, so the gate judges the
+    Yahoo target against the real price. The injected price is never merged back
+    (current_price is gated out of the fundamentals whitelist; for the chart
+    whitelist the missing-field filter only fills a blank row price, so an
+    existing price is untouched).
+
+  Fix 2 - GATE DROP-WARNINGS LOST IN THE ENRICHMENT FILTER
+    The gate records provider_target_implausible_dropped_12m / _3m in warnings,
+    but warnings is not in _YAHOO_FUNDAMENTAL_FIELDS / _YAHOO_CHART_FIELDS, so on
+    the Yahoo path _filter_patch_to_missing_fields() discarded the tag and the
+    drop happened with no audit trail. Fix: after filtering, explicitly carry
+    any provider_target_implausible_dropped_* tag from the canonicalized patch
+    back onto the row via _merge_gate_drop_warnings().
+
+  Fix 3 - 3M-ONLY PROVIDER TARGET FELL THROUGH PHASE-II
+    _phase_ii_quality_forecast honored a provider_target only when
+    forecast_price_12m was populated. With the v5.77.18 gate this case is now
+    common: the 12M leg can be dropped as implausible while a plausible 3M leg
+    survives and the row stays tagged provider_target. The 12M-only guard then
+    fell through to full synthesis, OVERWRITING the surviving 3M provider target.
+    Fix: a dedicated 3M-only branch preserves the provider 3M value, derives the
+    1M leg from the capped 3M return, and synthesizes the missing 12M leg by
+    scaling the capped 3M return up to the 12M horizon (re-capped at +/-30%) —
+    instead of discarding the provider signal.
+
+VALIDATION (post-deploy)
+  - UHS-like (price 146, target 417): 12M dropped, no provider_target tag, no
+    +65/+27.3/+11.7 saturation.
+  - Normal (price 100, target 125): accepted, forecast_source=provider_target.
+  - No price in provider patch but row has price: gate still judges via row price.
+  - Dropped target: provider_target_implausible_dropped_* visible in warnings,
+    INCLUDING on the Yahoo enrichment path.
+  - 3M-only provider target: 3M preserved; 1M + 12M derived from it.
+  - /health: version 5.77.19, valuation_model.version v5.77.19, canonical_schema 107.
+
+WHY v5.77.18 - IMPLAUSIBLE PROVIDER-TARGET GATE (closes the saturated-upside bug)
+---------------------------------------------------------------------------------
+A deployed refresh showed the SAME upside triplet — Expected ROI 12M / 3M / 1M
+landing on +65.0 / +27.3 / +11.7 — saturating row after row. Traced end to end,
+the cause is an upstream analyst target that is wildly out of band versus price
+flowing through the pipeline UNCHECKED:
+
+    1. _canonicalize_provider_row maps a provider analyst target (any of
+       targetMeanPrice / targetHighPrice / targetMedianPrice / targetPrice /
+       analystTargetPrice / consensusTarget) into forecast_price_12m via
+       _CANONICAL_FIELD_ALIASES, then tags forecast_source = "provider_target".
+       Real case: UHS target 417 vs current price 146 = +185%.
+    2. _phase_ii_quality_forecast honors the provider_target tag and writes the
+       raw, UNCAPPED (fp12 - cp)/cp into expected_roi_12m (it only caps the
+       DERIVED 3M / 1M short horizons, not the 12M it inherits from the target).
+    3. core.scoring then clamps that +185% down to its own max_roi_12m (0.65)
+       and sub-splits via its 0.42 / 0.18 horizon ratios into exactly the
+       +65.0 / +27.3 / +11.7 triplet seen on the sheet.
+
+The engine's own Phase-II +/-30% cap (_PHASE_II_MAX_12M_ABS_RETURN) never gets
+to weigh in, because the provider_target branch short-circuits synthesis before
+the cap is applied, and scoring runs on the inherited target.
+
+THE FIX (single ingestion chokepoint)
+-------------------------------------
+Gate the target at INGESTION, inside _canonicalize_provider_row, BEFORE the
+provider_target tag is written. If the mapped target is outside a sane multiple
+of current price, DROP the implausible forecast_price_* value and DO NOT tag
+provider_target. With no tag and no forecast price, _phase_ii_quality_forecast
+falls through to full intrinsic + momentum + quality synthesis (capped at
++/-30%), and core.scoring then reads a sane forecast. Gating here is the one
+place that keeps the bad value out of BOTH Phase-II and scoring; gating in
+scoring alone would still leave the engine tagging the value as a provider
+target and Phase-II inheriting it.
+
+Tunable band (multiples of current price), read at call time so an env change
+takes effect without re-import:
+    TFB_PROVIDER_TARGET_MIN_MULT      default 0.40  -> reject target < 0.40 x price
+    TFB_PROVIDER_TARGET_MAX_MULT      default 2.50  -> reject target > 2.50 x price
+    TFB_PROVIDER_TARGET_GATE_ENABLED  default on    -> set 0/false/off to disable
+                                                       (restores pre-v5.77.18 behavior)
+
+Fail-open by design: when current price or the target is missing / non-positive
+the gate cannot judge and treats the target as plausible, so it never fabricates
+a rejection from absent data. No try/except swallows the gate decision — the
+skip path is explicit, INFO-logged ("[v5.77.18 TARGET-GATE] dropped ..."), and
+tagged in warnings (provider_target_implausible_dropped_12m / _3m).
+
+No schema changes. No contract changes. No math changes outside the gated path.
+All v5.77.6 through v5.77.17 behavior preserved; the only behavioral delta from
+v5.77.17 is the ingestion gate above (plus this WHY block, the version bump, and
+the health() valuation_model version string).
 
 WHY v5.77.17 - PROVIDER-OVERRIDE IDEMPOTENCY (closes the v5.77.16 asymmetry)
 ----------------------------------------------------------------------------
@@ -283,7 +388,7 @@ the full scoring pipeline.
 But the canonical scoring path (scoring.py) still produced a real
 overall_score from the price+RSI+volatility data we DO have. Downstream
 post-processing then mapped that score back into a `recommendation`
-field — but didn't touch the related detail/reason/source/priority_band
+field — but didn't touch the related detail/reason/source/priority
 fields the engine had already stamped. The result was the visible
 divergence.
 
@@ -660,7 +765,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.77.17"
+__version__ = "5.77.19"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -2157,6 +2262,54 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
                 fp1 = _as_float(row.get("forecast_price_1m"))
                 if fp1 is not None:
                     row["expected_roi_1m"] = round((fp1 - cp) / cp, 6)
+        return
+
+    # -------------------------------------------------------------------------
+    # v5.77.19 (Fix 3): 3M-only provider target.
+    # -------------------------------------------------------------------------
+    # The v5.77.18 gate can drop an implausible 12M leg while a plausible 3M leg
+    # survives, leaving the row tagged provider_target with ONLY
+    # forecast_price_3m populated (this is also the path for a provider that
+    # only ever supplied a 3M target). The 12M-only guard above would otherwise
+    # fall through to full synthesis and OVERWRITE that surviving provider 3M
+    # value. Honor it instead: preserve the provider 3M target, derive the 1M
+    # leg from the capped 3M return, and synthesize the missing 12M leg by
+    # scaling the capped 3M return up to the 12M horizon (re-capped at +/-30%
+    # so a near-band 3M target can't reintroduce an out-of-band 12M forecast).
+    if existing_source == "provider_target" and _forecast_price_is_populated(row.get("forecast_price_3m")):
+        fp3 = _as_float(row.get("forecast_price_3m"))
+        if fp3 is not None and fp3 > 0:
+            return_3m = (fp3 - cp) / cp
+            cap_3m = _PHASE_II_MAX_12M_ABS_RETURN * _PHASE_II_RATIO_3M_OF_12M
+            capped_3m = max(min(return_3m, cap_3m), -cap_3m)
+            if abs(return_3m) - cap_3m > 1e-9:
+                _v573_append_warning(row, "provider_target_3m_capped_for_short_horizon_derivation")
+            if not _forecast_price_is_populated(row.get("forecast_price_1m")):
+                # 1M return ~ capped 3M return scaled by (1M:12M)/(3M:12M).
+                if _PHASE_II_RATIO_3M_OF_12M > 0:
+                    ratio_1m_of_3m = _PHASE_II_RATIO_1M_OF_12M / _PHASE_II_RATIO_3M_OF_12M
+                else:
+                    ratio_1m_of_3m = 0.0
+                derived_1m_return = capped_3m * ratio_1m_of_3m
+                row["forecast_price_1m"] = round(cp * (1.0 + derived_1m_return), 4)
+            if not _forecast_price_is_populated(row.get("forecast_price_12m")):
+                # 12M return ~ capped 3M return scaled UP to the 12M horizon.
+                if _PHASE_II_RATIO_3M_OF_12M > 0:
+                    derived_12m_return = capped_3m / _PHASE_II_RATIO_3M_OF_12M
+                else:
+                    derived_12m_return = capped_3m
+                derived_12m_return = max(min(derived_12m_return, _PHASE_II_MAX_12M_ABS_RETURN), -_PHASE_II_MAX_12M_ABS_RETURN)
+                row["forecast_price_12m"] = round(cp * (1.0 + derived_12m_return), 4)
+            if row.get("expected_roi_3m") is None:
+                row["expected_roi_3m"] = round(return_3m, 6)
+            if row.get("expected_roi_1m") is None:
+                fp1 = _as_float(row.get("forecast_price_1m"))
+                if fp1 is not None:
+                    row["expected_roi_1m"] = round((fp1 - cp) / cp, 6)
+            if row.get("expected_roi_12m") is None:
+                fp12 = _as_float(row.get("forecast_price_12m"))
+                if fp12 is not None:
+                    row["expected_roi_12m"] = round((fp12 - cp) / cp, 6)
         return
 
     intrinsic = _as_float(row.get("intrinsic_value"))
@@ -4132,6 +4285,101 @@ def _coerce_datetime_like(value: Any) -> Optional[str]:
     return _safe_str(value) or None
 
 
+# =============================================================================
+# v5.77.18 — IMPLAUSIBLE PROVIDER-TARGET GATE helpers
+# -----------------------------------------------------------------------------
+# An upstream analyst 12M/3M target that is wildly out of band versus the
+# current price (real case: UHS target 417 vs price 146 = +185%) would
+# otherwise be mapped into forecast_price_12m by _canonicalize_provider_row,
+# tagged forecast_source="provider_target", and then honored UNCAPPED by
+# _phase_ii_quality_forecast (which writes the raw (fp12-cp)/cp into
+# expected_roi_12m and only caps the DERIVED 3M/1M legs). core.scoring then
+# clamps that +185% to its max_roi_12m=0.65 ceiling and sub-splits it into the
+# saturated +65.0 / +27.3 / +11.7 ROI triplet seen across the dashboard. The
+# engine's own Phase-II +/-30% cap (_PHASE_II_MAX_12M_ABS_RETURN) never fires
+# because the provider_target branch short-circuits synthesis entirely.
+#
+# These helpers let _canonicalize_provider_row validate a mapped target against
+# the current price BEFORE tagging provider_target. The band is a sane multiple
+# of the current price; targets outside it are dropped at ingestion so Phase-II
+# synthesis (which IS capped) produces the forecast and scoring reads a sane
+# value. This is the single ingestion chokepoint for the bug. Everything is
+# env-tunable and read at call time:
+#     TFB_PROVIDER_TARGET_MIN_MULT       (default 0.40)
+#     TFB_PROVIDER_TARGET_MAX_MULT       (default 2.50)
+#     TFB_PROVIDER_TARGET_GATE_ENABLED   (default on; 0/false/no/n/off/f turns
+#                                         the gate off and restores the exact
+#                                         pre-v5.77.18 tagging behavior)
+# Fail-open: if price or target is missing/non-positive, or the configured band
+# is degenerate (lo<=0, hi<=0, or lo>=hi), the target is treated as plausible
+# (band falls back to the defaults) so a config typo can never blank forecasts.
+# =============================================================================
+_PROVIDER_TARGET_MIN_MULT_DEFAULT: float = 0.40
+_PROVIDER_TARGET_MAX_MULT_DEFAULT: float = 2.50
+
+
+def _provider_target_gate_enabled() -> bool:
+    """v5.77.18: gate master switch. Off only for an explicit falsey value."""
+    raw = (os.getenv("TFB_PROVIDER_TARGET_GATE_ENABLED") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f"}:
+        return False
+    return True
+
+
+def _provider_target_band() -> Tuple[float, float]:
+    """v5.77.18: (min_mult, max_mult) read at call time; defaults on degenerate config."""
+    lo = _get_env_float("TFB_PROVIDER_TARGET_MIN_MULT", _PROVIDER_TARGET_MIN_MULT_DEFAULT)
+    hi = _get_env_float("TFB_PROVIDER_TARGET_MAX_MULT", _PROVIDER_TARGET_MAX_MULT_DEFAULT)
+    if lo <= 0 or hi <= 0 or lo >= hi:
+        return _PROVIDER_TARGET_MIN_MULT_DEFAULT, _PROVIDER_TARGET_MAX_MULT_DEFAULT
+    return lo, hi
+
+
+def _provider_target_is_plausible(current_price: Any, provider_target: Any) -> bool:
+    """v5.77.18: True if provider_target lies within [price*min_mult, price*max_mult].
+
+    Fail-open: returns True when price or target is missing or non-positive, so a
+    sparse / garbage feed never causes a genuine forecast to be dropped.
+    """
+    p = _as_float(current_price)
+    t = _as_float(provider_target)
+    if p is None or t is None or p <= 0 or t <= 0:
+        return True
+    lo, hi = _provider_target_band()
+    return (p * lo) <= t <= (p * hi)
+
+
+_GATE_DROP_WARNING_TAGS: Tuple[str, ...] = (
+    "provider_target_implausible_dropped_12m",
+    "provider_target_implausible_dropped_3m",
+)
+
+
+def _merge_gate_drop_warnings(row: Dict[str, Any], patch: Dict[str, Any]) -> None:
+    """v5.77.19 (Fix 2): carry provider-target-gate drop tags from a
+    canonicalized patch back onto the row.
+
+    The Yahoo enrichment path canonicalizes its patch (which runs the gate),
+    then narrows it with _filter_patch_to_missing_fields() against a data-field
+    whitelist that does NOT contain "warnings". Without this re-merge the gate
+    would drop an implausible Yahoo target but lose the audit trail
+    (provider_target_implausible_dropped_12m / _3m). Idempotent: relies on
+    _v573_append_warning(), which de-dupes existing tags.
+    """
+    if not isinstance(row, dict) or not isinstance(patch, dict):
+        return
+    raw = patch.get("warnings")
+    if isinstance(raw, (list, tuple, set)):
+        text = "; ".join(_safe_str(x) for x in raw if _safe_str(x))
+    else:
+        text = _safe_str(raw)
+    if not text:
+        return
+    for tag in _GATE_DROP_WARNING_TAGS:
+        if tag in text:
+            _v573_append_warning(row, tag)
+
+
 def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", normalized_symbol: str = "", provider: str = "") -> Dict[str, Any]:
     src = dict(row or {})
     flat = _flatten_scalar_fields(src)
@@ -4156,6 +4404,21 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     #          also get tagged "provider_target" — previously they were silently
     #          overwritten by Phase-II synthesis because the guard required
     #          forecast_price_12m to be populated.
+    # v5.77.18: IMPLAUSIBLE PROVIDER-TARGET GATE. Before tagging "provider_target",
+    #           validate each mapped target leg against the current price. A target
+    #           outside the sane band (see _provider_target_is_plausible) is DROPPED
+    #           here at ingestion — its forecast_price_*m is set back to None and a
+    #           warning tag recorded — and that leg does NOT contribute the
+    #           provider_target tag. With both legs dropped (or absent), forecast_source
+    #           stays unset, so _phase_ii_quality_forecast falls through to its capped
+    #           +/-30% synthesis instead of honoring the raw out-of-band target. A native
+    #           (non-analyst-alias) forecast_price_12m/3m never enters this block's drop
+    #           path: has_*_target is computed ONLY from the analyst-target alias lists,
+    #           so an engine/other forecast is left untouched and simply does not get the
+    #           provider_target tag (unchanged pre-v5.77.18 behavior). With the gate
+    #           disabled, both legs "survive" exactly as before and the tag is applied
+    #           whenever any analyst-target alias is present — byte-for-byte the old
+    #           behavior. UHS check: 417 > 146*2.5=365 -> dropped.
     if (out.get("forecast_price_12m") is not None or out.get("forecast_price_3m") is not None) \
             and not _safe_str(out.get("forecast_source")):
         provider_target_aliases_12m = (
@@ -4168,19 +4431,76 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         )
         src_keys_loose = {_norm_key_loose(k): k for k in src.keys()}
         flat_keys_loose = {_norm_key_loose(k): k for k in flat.keys()}
-        for alias in provider_target_aliases_12m + provider_target_aliases_3m:
-            alias_loose = _norm_key_loose(alias)
-            if not alias_loose:
-                continue
-            if alias_loose in src_keys_loose or alias_loose in flat_keys_loose:
-                raw_v = (
-                    src.get(src_keys_loose.get(alias_loose))
-                    if alias_loose in src_keys_loose
-                    else flat.get(flat_keys_loose.get(alias_loose))
-                )
-                if not _is_blank_value(raw_v):
-                    out["forecast_source"] = "provider_target"
-                    break
+
+        def _provider_target_alias_present(aliases: Tuple[str, ...]) -> bool:
+            for alias in aliases:
+                alias_loose = _norm_key_loose(alias)
+                if not alias_loose:
+                    continue
+                if alias_loose in src_keys_loose or alias_loose in flat_keys_loose:
+                    raw_v = (
+                        src.get(src_keys_loose.get(alias_loose))
+                        if alias_loose in src_keys_loose
+                        else flat.get(flat_keys_loose.get(alias_loose))
+                    )
+                    if not _is_blank_value(raw_v):
+                        return True
+            return False
+
+        has_12m_target = _provider_target_alias_present(provider_target_aliases_12m)
+        has_3m_target = _provider_target_alias_present(provider_target_aliases_3m)
+
+        gate_on = _provider_target_gate_enabled()
+        gate_price = out.get("current_price")
+        if _as_float(gate_price) is None:
+            gate_price = out.get("price")
+
+        plausible_target_survives = False
+
+        # 12M leg
+        if has_12m_target:
+            if gate_on and not _provider_target_is_plausible(gate_price, out.get("forecast_price_12m")):
+                if logger.isEnabledFor(logging.INFO):
+                    try:
+                        logger.info(
+                            "[v%s TARGET-GATE] dropped implausible 12M provider target "
+                            "sym=%s price=%s target=%s band=%s",
+                            __version__,
+                            _safe_str(out.get("symbol") or out.get("requested_symbol"), "?"),
+                            _safe_str(gate_price, "?"),
+                            _safe_str(out.get("forecast_price_12m"), "?"),
+                            _safe_str(_provider_target_band(), "?"),
+                        )
+                    except Exception:
+                        pass
+                out["forecast_price_12m"] = None
+                _v573_append_warning(out, "provider_target_implausible_dropped_12m")
+            else:
+                plausible_target_survives = True
+
+        # 3M leg
+        if has_3m_target:
+            if gate_on and not _provider_target_is_plausible(gate_price, out.get("forecast_price_3m")):
+                if logger.isEnabledFor(logging.INFO):
+                    try:
+                        logger.info(
+                            "[v%s TARGET-GATE] dropped implausible 3M provider target "
+                            "sym=%s price=%s target=%s band=%s",
+                            __version__,
+                            _safe_str(out.get("symbol") or out.get("requested_symbol"), "?"),
+                            _safe_str(gate_price, "?"),
+                            _safe_str(out.get("forecast_price_3m"), "?"),
+                            _safe_str(_provider_target_band(), "?"),
+                        )
+                    except Exception:
+                        pass
+                out["forecast_price_3m"] = None
+                _v573_append_warning(out, "provider_target_implausible_dropped_3m")
+            else:
+                plausible_target_survives = True
+
+        if plausible_target_survives:
+            out["forecast_source"] = "provider_target"
 
     inferred_symbol = out.get("symbol") or normalized_symbol or requested_symbol
     inferred_name = _infer_display_name_from_symbol(inferred_symbol)
@@ -5253,7 +5573,7 @@ class _EngineSymbolsReaderProxy:
 # DataEngineV5 — the main orchestrator
 # =============================================================================
 class DataEngineV5:
-    """Global-first data orchestrator (v5.77.17)."""
+    """Global-first data orchestrator (v5.77.19)."""
 
     def __init__(
         self,
@@ -5872,8 +6192,24 @@ class DataEngineV5:
             if patch:
                 # v5.77.8: canonicalize the raw provider response so the
                 # missing-field filter can match its canonical-name whitelist.
+                # v5.77.19 (Fix 1): the Yahoo fundamentals patch frequently
+                # carries targetMeanPrice but NO currentPrice, which would make
+                # the provider-target gate fail open. Inject the already-known
+                # row price into a COPY of the patch so the gate judges the
+                # Yahoo target against the real price. The injected price is not
+                # merged back: current_price is gated out of
+                # _YAHOO_FUNDAMENTAL_FIELDS, so the filter cannot carry it onto
+                # the row.
+                patch_for_canon = dict(patch)
+                ref_price = _as_float(row.get("current_price"))
+                if ref_price is None:
+                    ref_price = _as_float(row.get("price"))
+                if ref_price is not None \
+                        and _as_float(patch_for_canon.get("current_price")) is None \
+                        and _as_float(patch_for_canon.get("price")) is None:
+                    patch_for_canon["current_price"] = ref_price
                 canon_patch = _canonicalize_provider_row(
-                    patch,
+                    patch_for_canon,
                     requested_symbol=sym_for_canon,
                     normalized_symbol=sym_for_canon,
                     provider="yahoo_fundamentals",
@@ -5881,6 +6217,11 @@ class DataEngineV5:
                 filtered, filled = _filter_patch_to_missing_fields(
                     row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
                 )
+                # v5.77.19 (Fix 2): the missing-field filter drops everything
+                # not in the data whitelist, including the gate's
+                # provider_target_implausible_dropped_* tags. Carry those
+                # drop-audit tags back so the trail survives the enrichment.
+                _merge_gate_drop_warnings(row, canon_patch)
                 if filtered:
                     row = self._merge(row, filtered)
                     _append_yahoo_warning_tag(row, "yahoo_enrichment_applied")
@@ -5890,8 +6231,23 @@ class DataEngineV5:
         if needs_chart:
             chart_patch = await self._fetch_yahoo_chart_patch(symbol, page)
             if chart_patch:
+                # v5.77.19 (Fix 1): same reference-price injection as the
+                # fundamentals branch. The chart patch is technicals-only today
+                # (no analyst target), so the gate is normally a no-op here, but
+                # injecting the row price keeps the gate correct if a future
+                # chart patch ever carries a target. For _YAHOO_CHART_FIELDS the
+                # missing-field filter only fills a BLANK row price, so an
+                # existing current_price is never overwritten by the injection.
+                chart_for_canon = dict(chart_patch)
+                ref_price = _as_float(row.get("current_price"))
+                if ref_price is None:
+                    ref_price = _as_float(row.get("price"))
+                if ref_price is not None \
+                        and _as_float(chart_for_canon.get("current_price")) is None \
+                        and _as_float(chart_for_canon.get("price")) is None:
+                    chart_for_canon["current_price"] = ref_price
                 canon_chart = _canonicalize_provider_row(
-                    chart_patch,
+                    chart_for_canon,
                     requested_symbol=sym_for_canon,
                     normalized_symbol=sym_for_canon,
                     provider="yahoo_chart",
@@ -5899,6 +6255,8 @@ class DataEngineV5:
                 filtered, filled = _filter_patch_to_missing_fields(
                     row, canon_chart, _YAHOO_CHART_FIELDS,
                 )
+                # v5.77.19 (Fix 2): preserve any gate drop tags through the filter.
+                _merge_gate_drop_warnings(row, canon_chart)
                 if filtered:
                     row = self._merge(row, filtered)
                     _append_yahoo_warning_tag(row, "yahoo_chart_enrichment_applied")
@@ -6369,7 +6727,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.77.17",  # v5.77.17: provider_wins no longer fires on an engine-written reco (full classifier idempotency, even with TFB_TRUST_PROVIDER_RECO=1)
+                "version": "v5.77.19",  # v5.77.19: provider-target gate hardening on the v5.77.18 ingestion gate -- (1) inject the row price as the gate reference on the Yahoo enrichment path so a price-less patch can't fail the gate open, (2) carry provider_target_implausible_dropped_* warnings through the enrichment filter, (3) honor a 3M-only provider target in Phase-II instead of overwriting it; gate still env-tunable via TFB_PROVIDER_TARGET_MIN_MULT / _MAX_MULT / _GATE_ENABLED
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
