@@ -2,8 +2,119 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.21
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.23
 ================================================================================
+
+WHY v5.77.23 - AUDIT FOLLOW-UP: HINT CONTRADICTION + MISSING-PRICE GUARD + TOP10 FILTER
+---------------------------------------------------------------------------------------
+Three engine-only fixes from the v5.77.22 dashboard audit. None change the
+107-field schema or require an Apps Script change. (The audit's other items --
+a final investability-status column, a data-quality score, a forecast-
+reliability score, and a provider/engine-conflict flag -- are NEW emitted
+columns, i.e. a schema change that must be paired with the GAS 00_Config.gs
+header map + sheet writer; they are intentionally deferred to a coordinated
+backend+frontend delivery rather than bundled blind here. Asset-class-specific
+scoring lives in core.scoring, not this engine.)
+
+  Fix H - POSITION-HINT <-> RECOMMENDATION CONTRADICTION (audit item 2)
+    v5.77.21 (Fix E) refreshed only a BLANK or GENERIC stale position_size_hint.
+    The audit found a row that was ACCUMULATE while the hint read
+    "Hold existing position; no new capital" -- rich scoring text Fix E
+    (correctly) preserves, but which contradicts a BUY-family call. The fix is
+    NOT to blindly regenerate every rich hint -- that would downgrade a
+    CONSISTENT rich hint such as "Scale in gradually / partial position" to the
+    coarse generic and lose information. Instead, _reconcile_recommendation_family
+    now also refreshes a rich hint ONLY when its capital-action DIRECTION
+    contradicts the final recommendation: an ADD reco (BUY family) must not carry
+    a hold/trim/sell hint; a TRIM reco (SELL family) must not carry an add/build
+    hint. Direction is inferred from keyword tokens (_position_hint_contradicts_reco).
+    A consistent rich hint is left untouched.
+
+  Fix I - MISSING-CURRENT-PRICE NON-ACTIONABILITY GUARD (audit item 3)
+    Rows with fundamentals + technicals but NO current_price (e.g. Nintendo
+    7974.T, KDDI 9433.T, X.US, DAY.US) still received full BUY/REDUCE-family
+    recommendations even though there is no price to anchor ROI / forecast /
+    upside against. _classify_recommendation_8tier now applies a final Step 4c
+    guard: when current_price (and the price alias) are absent, it forces a
+    neutral, explicitly-labelled HOLD (source "price_unavailable", reason
+    "current price unavailable; recommendation not actionable"). Applied as the
+    final write so it is authoritative; _reconcile_recommendation_family then
+    sees HOLD == HOLD. Truly empty rows remain handled by _mark_row_as_empty.
+    Env-toggleable via TFB_MISSING_PRICE_HOLD_GUARD (default ON). (An explicit
+    BLOCKED status column is part of the deferred investability-gate delivery.)
+
+  Fix J - TOP 10 ELIGIBILITY FILTER (audit item 8)
+    A "Top 10 Investments" list should never surface a non-investable row. Both
+    Top 10 build paths (_build_top10_rows_fallback and the requested-symbols
+    path) now drop ineligible candidates BEFORE ranking: rows with no usable
+    current_price, or a REDUCE / SELL / STRONG_SELL / AVOID recommendation, are
+    excluded (_top10_row_is_eligible). The list degrades gracefully -- it may
+    return fewer than 10 rows rather than padding with sells. Env-toggleable via
+    TFB_TOP10_QUALITY_FILTER (default ON).
+
+VALIDATION (post-deploy)
+  - No BUY-family row shows a "hold existing / no new capital / trim" hint, and
+    no SELL-family row shows a "scale in / accumulate" hint; consistent rich
+    hints are unchanged.
+  - Rows with no current_price show HOLD / "not actionable" and are absent from
+    Top 10.
+  - Top 10 contains no REDUCE/SELL/STRONG_SELL/AVOID rows.
+  - /health: version 5.77.23, valuation_model.version v5.77.23, schema 107.
+
+WHY v5.77.22 - DATA-COMPLETENESS: 52-WEEK RANGE + ROLLING VOLUME + SUBUNIT MARKET CAP
+-------------------------------------------------------------------------------------
+Two correctness fixes from the live Global_Markets audit. Both are ENGINE-side;
+neither needs a provider or Apps Script change.
+
+  Fix F - 52-WEEK RANGE + ROLLING VOLUME AVERAGES (the universe-wide blanks)
+    On the deployed sheet, week_52_high / week_52_low / week_52_position_pct and
+    avg_volume_10d / avg_volume_30d were blank on EVERY row -- including clean
+    US large-caps (JPM, EOG) whose RSI / volatility / drawdown / VaR / Sharpe
+    DID populate. Root cause: the engine never calls the EODHD provider's
+    fetch_history_stats() (which computes these correctly). It calls
+    fetch_history() for RAW OHLC bars and runs them through its own
+    _compute_history_patch_from_rows() -- the SINGLE history-stats function used
+    by BOTH the EODHD raw-bar path and the Yahoo chart-enrichment path. That
+    function computed volatility / drawdown / VaR / Sharpe / RSI / candlesticks
+    but silently OMITTED the 52-week band and the 10D/30D average volume, so
+    those five fields had no source on any row. Fix F adds them to
+    _compute_history_patch_from_rows() (252-bar 52W window with close-series
+    fallback when intraday high/low bars are absent; trailing 10/30-bar mean
+    volume), mirroring the provider's own fetch_history_stats logic so both
+    providers agree. week_52_position_pct is also derived here and is further
+    re-derived by the existing _sanitize_week_52_position_pct() in
+    _apply_phase_bb_sanity() after the patch is merged. Fixing this one function
+    populates the columns on every history-fed path at once.
+
+  Fix G - SUBUNIT-CURRENCY MARKET-CAP NORMALIZATION (the ~100x .L inflation)
+    Every LSE (.L) name showed a market cap ~100x too large (Lloyds GBP 5.9T vs
+    ~GBP 59B; AstraZeneca GBP 21.4T vs ~GBP 214B; Prudential GBP 2.68T; Diageo
+    GBP 3.4T). These venues quote PRICE in a subunit (GBX/GBp pence; .JSE ZAC
+    cents; .TA ILA agorot), so a market_cap derived from that subunit price --
+    by the provider/Yahoo or by the engine's shares x price synthesis -- is
+    expressed in the subunit and is ~100x the conventional major-unit figure.
+    The _SUBUNIT_EXCHANGES handling the provider changelog references
+    (engine v5.60.0) is absent from the current engine. Fix G adds
+    _normalize_subunit_market_cap(): for a recognized subunit currency it
+    rescales market_cap by 100 to the MAJOR unit -- but ONLY when the value
+    actually looks subunit-scale, cross-checked against price[subunit] x shares,
+    so an already-correct major-unit value supplied by a provider is left
+    untouched (no double-correction). With no share count to verify against, the
+    value is flagged (market_cap_subunit_unverified_no_shares) and NOT divided.
+    PRICE stays in the subunit (that is how the venue quotes; the 52-week band,
+    day range, and forecasts are internally consistent there); revenue / FCF
+    come from statements already in the major unit and are untouched. Called
+    from _apply_phase_bb_sanity() (provider/Yahoo-supplied case) and the tail of
+    _synthesize_market_cap_if_zero() (synthesized case); idempotent via its own
+    warning tag. Env-toggleable: TFB_SUBUNIT_MARKET_CAP_NORMALIZE (default ON).
+
+VALIDATION (post-deploy)
+  - Global_Markets rows show populated 52W High / 52W Low / 52W Position % and
+    Avg Volume 10D / 30D wherever history is available (>=20 bars); current
+    price sits inside the 52-week band.
+  - .L names show major-unit market caps (Lloyds ~GBP 59B, AstraZeneca
+    ~GBP 214B); USD / major-unit rows are unchanged; no row is double-divided.
+  - /health: version 5.77.22, valuation_model.version v5.77.22, schema 107.
 
 WHY v5.77.21 - HARDENING (audit follow-up to v5.77.20)
 ------------------------------------------------------
@@ -852,7 +963,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.77.21"
+__version__ = "5.77.23"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -1418,12 +1529,105 @@ def _sanitize_price_change(row: Dict[str, Any]) -> None:
     row["price_change"] = round(cp_f - pc_f, 6)
 
 
+# =============================================================================
+# v5.77.22 (Fix G) — subunit-currency market-cap normalization
+# -----------------------------------------------------------------------------
+# Venues that quote PRICE in 1/100 of the major currency unit — LSE (.L ->
+# GBX/GBp pence), JSE (.JSE -> ZAC cents), TASE (.TA -> ILA agorot) — produce a
+# market_cap that, when derived from that subunit price (by the provider/Yahoo
+# or by the engine's shares x price synthesis), is ~100x the conventional
+# major-currency figure. On the deployed sheet every .L name was inflated
+# (Lloyds GBP 5.9T vs ~GBP 59B; AstraZeneca GBP 21.4T vs ~GBP 214B). We rescale
+# by the subunit factor (100) — but ONLY when the value actually looks
+# subunit-scale, cross-checked against price[subunit] x shares, so a correct
+# major-unit value supplied by a provider is never double-corrected. With no
+# share count to verify against we DO NOT divide; we just flag the row. PRICE
+# stays in the subunit (the venue quotes there; the 52-week band, day range and
+# forecasts are internally consistent in the subunit); revenue / FCF come from
+# statements already in the major unit and are untouched. Env-toggleable via
+# TFB_SUBUNIT_MARKET_CAP_NORMALIZE (default ON).
+# =============================================================================
+_SUBUNIT_PRICE_CURRENCY_FACTOR: float = 100.0
+
+# Matched case-sensitively so pence ("GBX"/"GBp") is caught while pounds ("GBP")
+# is left alone; likewise cents ("ZAC"/"ZAc") vs rand ("ZAR") and agorot
+# ("ILA"/"ILa") vs shekel ("ILS"). Covers both the engine suffix map (emits
+# "GBp") and the EODHD provider (canonicalizes to "GBX").
+_SUBUNIT_PRICE_CURRENCIES: frozenset = frozenset({
+    "GBX", "GBp",
+    "ZAC", "ZAc",
+    "ILA", "ILa",
+})
+
+_SUBUNIT_MC_RATIO_LO: float = 0.5
+_SUBUNIT_MC_RATIO_HI: float = 2.0
+
+
+def _subunit_market_cap_normalize_enabled() -> bool:
+    raw = (os.getenv("TFB_SUBUNIT_MARKET_CAP_NORMALIZE") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+def _normalize_subunit_market_cap(row: Dict[str, Any]) -> None:
+    """v5.77.22 (Fix G): express market_cap in the MAJOR currency unit for
+    subunit-quoted venues (pence/cents/agorot). See the section note above for
+    rationale and the price-implied cross-check that prevents double-correcting
+    an already-major value. Idempotent (guarded by its own warning tag) and a
+    no-op for major-unit currencies."""
+    if not isinstance(row, dict):
+        return
+    if not _subunit_market_cap_normalize_enabled():
+        return
+    if _safe_str(row.get("currency")) not in _SUBUNIT_PRICE_CURRENCIES:
+        return
+
+    # Idempotency: never divide twice within one pipeline run (the normalizer is
+    # invoked from both _apply_phase_bb_sanity and _synthesize_market_cap_if_zero).
+    raw_warn = row.get("warnings")
+    if isinstance(raw_warn, str):
+        if "market_cap_subunit_normalized_to_major" in raw_warn:
+            return
+    elif isinstance(raw_warn, (list, tuple, set)):
+        if "market_cap_subunit_normalized_to_major" in {_safe_str(x) for x in raw_warn}:
+            return
+
+    mc = _as_float(row.get("market_cap"))
+    if mc is None or mc <= 0:
+        return
+
+    cp = _as_float(row.get("current_price")) or _as_float(row.get("price"))
+    shares = _as_float(row.get("float_shares"))
+    if shares is None or shares <= 0:
+        shares = _as_float(row.get("shares_outstanding"))
+
+    if cp is not None and cp > 0 and shares is not None and shares > 0:
+        subunit_implied = cp * shares
+        if subunit_implied <= 0:
+            return
+        ratio = mc / subunit_implied
+        # mc ~ price[subunit] x shares -> subunit-scale -> rescale to major.
+        # mc ~ (price/100) x shares    -> already major  -> leave untouched.
+        if _SUBUNIT_MC_RATIO_LO <= ratio <= _SUBUNIT_MC_RATIO_HI:
+            row["market_cap"] = round(mc / _SUBUNIT_PRICE_CURRENCY_FACTOR, 2)
+            _v573_append_warning(row, "market_cap_subunit_normalized_to_major")
+        return
+
+    # No share count to verify scale against — do NOT divide blind; flag for review.
+    _v573_append_warning(row, "market_cap_subunit_unverified_no_shares")
+
+
 def _apply_phase_bb_sanity(row: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(row, dict):
         return row
     _sanitize_price_change(row)
     _sanitize_percent_change(row)
     _sanitize_week_52_position_pct(row)
+    # v5.77.22 (Fix G): rescale a subunit-quoted (GBX/GBp/ZAC/ILA) market cap to
+    # the major currency unit. Catches a provider/Yahoo-supplied value here; the
+    # synthesized-from-price case is handled inside _synthesize_market_cap_if_zero.
+    _normalize_subunit_market_cap(row)
     # v5.77.20 (Fix B): bound an honored provider target to the Phase-II +/-30%
     # ceiling here, BEFORE _compute_scores_canonical_first() reads
     # forecast_price_12m and clamps the ROI to its 0.65 saturation ceiling.
@@ -1564,6 +1768,12 @@ def _synthesize_market_cap_if_zero(row: Dict[str, Any]) -> None:
 
     if cp is not None and cp > 0 and shares is not None and shares > 0:
         row["market_cap"] = round(cp * shares, 2)
+        # v5.77.22 (Fix G): a cap synthesized from a subunit (GBX/GBp/ZAC/ILA)
+        # price is itself in the subunit; rescale it to the major unit. Idempotent
+        # and a no-op for major-unit currencies. (A provider/Yahoo-supplied cap is
+        # handled earlier in _apply_phase_bb_sanity; this covers the synth case,
+        # which is reached only when market_cap was absent, so no double-divide.)
+        _normalize_subunit_market_cap(row)
 
 
 def _derive_views(row: Dict[str, Any]) -> None:
@@ -1670,6 +1880,93 @@ _PSH_BY_RECO: Dict[str, str] = {
 _PSH_GENERIC_VALUES: frozenset = frozenset(_PSH_BY_RECO.values())
 
 
+# v5.77.23 (Fix H): position-size-hint <-> recommendation contradiction.
+# v5.77.21 (Fix E) refreshed only a BLANK or GENERIC stale hint; this adds
+# direction-based detection so a RICH hint that contradicts the final
+# recommendation is also refreshed, while a consistent rich hint is preserved.
+# Direction is the intended capital action implied by the recommendation.
+_RECO_DIRECTION: Dict[str, str] = {
+    "STRONG_BUY": "ADD", "BUY": "ADD", "ACCUMULATE": "ADD",
+    "HOLD":       "HOLD",
+    "REDUCE":     "TRIM", "SELL": "TRIM", "STRONG_SELL": "TRIM", "AVOID": "TRIM",
+}
+# Tokens signalling "do not add capital" (hold / trim / sell). A hint carrying
+# any of these contradicts a BUY-family (ADD) recommendation.
+_PSH_NON_ADD_TOKENS: Tuple[str, ...] = (
+    "hold existing", "no new capital", "do not add", "don't add",
+    "maintain", "trim", "reduce", "lighten", "exit", "sell", "close position",
+    "avoid",
+)
+# Tokens signalling "add / build a position". A hint carrying any of these
+# contradicts a SELL-family (TRIM) recommendation.
+_PSH_ADD_TOKENS: Tuple[str, ...] = (
+    "scale in", "accumulate", "add to", "add ", "build", "initiate",
+    "increase", "core position", "standard position", "starter", "partial position",
+)
+
+
+def _position_hint_contradicts_reco(hint: str, final_reco: str) -> bool:
+    """v5.77.23 (Fix H): True if a (non-blank) position_size_hint's capital-action
+    direction contradicts the final recommendation. An ADD reco (BUY family)
+    must not carry a hold/trim/sell hint; a TRIM reco (SELL family) must not
+    carry an add/build hint. HOLD recos are left flexible. Used by
+    _reconcile_recommendation_family to refresh a contradictory rich hint while
+    leaving a consistent rich hint untouched."""
+    h = _safe_str(hint).lower()
+    if not h:
+        return False
+    direction = _RECO_DIRECTION.get(_safe_str(final_reco).upper(), "")
+    if direction == "ADD":
+        has_non_add = any(tok in h for tok in _PSH_NON_ADD_TOKENS)
+        has_add = any(tok in h for tok in _PSH_ADD_TOKENS)
+        return has_non_add and not has_add
+    if direction == "TRIM":
+        return any(tok in h for tok in _PSH_ADD_TOKENS)
+    return False
+
+
+def _missing_price_hold_guard_enabled() -> bool:
+    """v5.77.23 (Fix I): master switch for the missing-current-price
+    non-actionability guard (default ON). Set TFB_MISSING_PRICE_HOLD_GUARD to
+    0/false/off to disable and restore pre-v5.77.23 behavior."""
+    raw = (os.getenv("TFB_MISSING_PRICE_HOLD_GUARD") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+# v5.77.23 (Fix J): recommendation families excluded from Top 10 selection.
+_TOP10_EXCLUDED_RECO_FAMILIES: frozenset = frozenset({
+    "REDUCE", "SELL", "STRONG_SELL", "AVOID",
+})
+
+
+def _top10_quality_filter_enabled() -> bool:
+    """v5.77.23 (Fix J): master switch for the Top 10 eligibility filter
+    (default ON). Set TFB_TOP10_QUALITY_FILTER to 0/false/off to disable."""
+    raw = (os.getenv("TFB_TOP10_QUALITY_FILTER") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
+    """v5.77.23 (Fix J): a Top 10 candidate must have a usable current price and
+    must NOT be a sell/avoid-family recommendation. Used to filter both Top 10
+    build paths. No-op when the filter is disabled."""
+    if not _top10_quality_filter_enabled():
+        return True
+    if not isinstance(row, dict):
+        return False
+    if _as_float(row.get("current_price")) is None and _as_float(row.get("price")) is None:
+        return False
+    rec = _canonical_recommendation(row.get("recommendation_detailed")) \
+        or _canonical_recommendation(row.get("recommendation"))
+    if rec in _TOP10_EXCLUDED_RECO_FAMILIES:
+        return False
+    return True
+
+
 def _canonical_recommendation(value: Any) -> str:
     if value in (None, ""):
         return ""
@@ -1732,6 +2029,13 @@ def _reconcile_recommendation_family(row: Dict[str, Any]) -> None:
     if expected_psh:
         psh = _safe_str(row.get("position_size_hint")).strip()
         if not psh or (psh in _PSH_GENERIC_VALUES and psh != expected_psh):
+            row["position_size_hint"] = expected_psh
+        # v5.77.23 (Fix H): also refresh a RICH hint whose capital-action
+        # direction contradicts the final recommendation (e.g. ACCUMULATE while
+        # the hint says "Hold existing position; no new capital"). A consistent
+        # rich hint (e.g. "Scale in gradually / partial position" on a BUY
+        # family) is preserved -- see _position_hint_contradicts_reco.
+        elif psh and _position_hint_contradicts_reco(psh, final):
             row["position_size_hint"] = expected_psh
 
 
@@ -1954,6 +2258,28 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
         _apply_sheet_compat_collapse(row)
 
     row.setdefault("scoring_schema_version", _SCHEMA_VERSION)
+
+    # -- Step 4c (v5.77.23, Fix I): missing-current-price non-actionability ----
+    # A row with no usable current_price cannot support a confident actionable
+    # call -- there is no price to anchor ROI / forecast / upside against -- so a
+    # BUY/SELL-family recommendation derived from fundamentals alone is
+    # misleading. Force a neutral, explicitly-labelled HOLD. Applied as the final
+    # write so it is authoritative; _reconcile_recommendation_family then sees
+    # HOLD == HOLD and re-derives a consistent priority / band / hint. Truly
+    # empty rows are already handled upstream by _mark_row_as_empty (Step 1).
+    # Env-toggleable via TFB_MISSING_PRICE_HOLD_GUARD (default ON).
+    if _missing_price_hold_guard_enabled() \
+            and _as_float(row.get("current_price")) is None \
+            and _as_float(row.get("price")) is None:
+        row["recommendation"] = "HOLD"
+        row["recommendation_detailed"] = "HOLD"
+        row["recommendation_source"] = "price_unavailable"
+        row["recommendation_reason"] = (
+            "HOLD: current price unavailable; recommendation not actionable."
+        )
+        row["recommendation_priority"] = _recommendation_priority("HOLD")
+        row["recommendation_priority_band"] = "P4"
+        _v573_append_warning(row, "recommendation_forced_hold_missing_price")
 
 
 def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
@@ -6272,6 +6598,55 @@ class DataEngineV5:
             rs = avg_gain / avg_loss
             patch["rsi_14"] = round(100.0 - (100.0 / (1.0 + rs)), 2)
 
+        # v5.77.22 (Fix F): 52-week range + rolling volume averages.
+        # These were the universe-wide blank columns from the audit. This is the
+        # SINGLE history-stats function the engine runs on BOTH the EODHD raw-bar
+        # path and the Yahoo chart path; prior versions computed RSI / volatility /
+        # drawdown / VaR / Sharpe here but silently omitted the 52-week band and
+        # the 10D/30D average volume, so week_52_high, week_52_low,
+        # week_52_position_pct, avg_volume_10d and avg_volume_30d were never
+        # populated for any row. Logic mirrors the EODHD provider's own
+        # fetch_history_stats (252-bar 52W window; trailing 10/30-bar mean volume)
+        # so both providers agree. week_52_position_pct is also derived by
+        # _sanitize_week_52_position_pct() in _apply_phase_bb_sanity() (which runs
+        # AFTER this patch is merged); we compute it here too so any consumer of
+        # the raw patch (without the sanity pass) still gets it.
+        win_52 = min(252, len(rows))
+        highs_52 = [
+            _as_float(r.get("high") if r.get("high") is not None else r.get("h"))
+            for r in rows[-win_52:]
+        ]
+        highs_52 = [h for h in highs_52 if h is not None and h > 0]
+        lows_52 = [
+            _as_float(r.get("low") if r.get("low") is not None else r.get("l"))
+            for r in rows[-win_52:]
+        ]
+        lows_52 = [lo for lo in lows_52 if lo is not None and lo > 0]
+        close_win = closes[-win_52:] if win_52 > 0 else closes
+        week_52_high = max(highs_52) if highs_52 else (max(close_win) if close_win else None)
+        week_52_low = min(lows_52) if lows_52 else (min(close_win) if close_win else None)
+        if week_52_high is not None and week_52_high > 0:
+            patch["week_52_high"] = round(week_52_high, 6)
+        if week_52_low is not None and week_52_low > 0:
+            patch["week_52_low"] = round(week_52_low, 6)
+        if (
+            week_52_high is not None and week_52_low is not None
+            and week_52_high > week_52_low and last_close is not None
+        ):
+            _pos = ((last_close - week_52_low) / (week_52_high - week_52_low)) * 100.0
+            patch["week_52_position_pct"] = round(max(0.0, min(100.0, _pos)), 6)
+
+        volumes = [
+            _as_float(r.get("volume") if r.get("volume") is not None else r.get("v"))
+            for r in rows
+        ]
+        volumes = [v for v in volumes if v is not None and v >= 0]
+        if volumes:
+            vol_10 = volumes[-10:] if len(volumes) >= 10 else volumes
+            vol_30 = volumes[-30:] if len(volumes) >= 30 else volumes
+            patch["avg_volume_10d"] = round(sum(vol_10) / len(vol_10), 2)
+            patch["avg_volume_30d"] = round(sum(vol_30) / len(vol_30), 2)
+
         if rows[-1].get("timestamp") and not patch.get("last_updated_utc"):
             patch["last_updated_utc"] = _coerce_datetime_like(rows[-1].get("timestamp"))
 
@@ -6708,6 +7083,11 @@ class DataEngineV5:
                     continue
                 seen.add(sym)
                 all_rows.append(row)
+        # v5.77.23 (Fix J): drop ineligible candidates (missing price, or a
+        # REDUCE/SELL/STRONG_SELL/AVOID recommendation) before ranking so the
+        # Top 10 never surfaces a non-investable row. Degrades gracefully (may
+        # return fewer than top_n). Env-toggleable.
+        all_rows = [r for r in all_rows if _top10_row_is_eligible(r)]
         all_rows.sort(key=self._top10_sort_key)
         top = all_rows[:max(1, int(top_n))]
         criteria_snapshot = _top10_criteria_snapshot(criteria)
@@ -6812,6 +7192,9 @@ class DataEngineV5:
             rows: List[Dict[str, Any]] = []
             if requested_symbols:
                 rows = await self.get_enriched_quotes(requested_symbols)
+                # v5.77.23 (Fix J): same Top 10 eligibility filter as the
+                # fallback path (missing price / sell-family excluded).
+                rows = [r for r in rows if _top10_row_is_eligible(r)]
                 rows.sort(key=self._top10_sort_key)
                 rows = rows[:requested_top_n]
                 criteria_snapshot = _top10_criteria_snapshot(criteria)
@@ -6975,7 +7358,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.77.21",  # v5.77.21 hardening on v5.77.20: (Fix C) get_page_rows() now runs _reconcile_recommendation_family() on its rows (it bypasses _strict_project_row and sits in route fallback chains); (Fix D) _cap_provider_target_forecasts() recomputes the matching expected_roi_*m for each leg it caps so a capped price never sits next to a stale/saturated ROI; (Fix E) _reconcile_recommendation_family() refreshes a blank or stale GENERIC position_size_hint to match the final recommendation while preserving richer scoring text. v5.77.20 base: (A) recommendation-family reconciliation at the API boundary, (B) provider-target +/-30% cap before scoring + gate max-mult 2.50 -> 1.50
+                "version": "v5.77.23",  # v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
