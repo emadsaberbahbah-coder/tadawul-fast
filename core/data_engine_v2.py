@@ -2,8 +2,59 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.77.23
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.78.0
 ================================================================================
+
+WHY v5.78.0 - INVESTABILITY GATE (SCHEMA 107 -> 115; PAIRS WITH 00_Config.gs v1.11.0)
+-------------------------------------------------------------------------------------
+The decision-readiness layer the dashboard audits kept asking for. This is a
+SCHEMA CHANGE: INSTRUMENT_CANONICAL_KEYS/HEADERS grow 107 -> 115 (Top_10 110 ->
+118), so it MUST deploy in lockstep with the frontend (00_Config.gs v1.11.0,
+which adds the matching HEADER_TO_KEY entries + expectedColumnCount bumps).
+Deploy the ENGINE FIRST, then the Config, then "Update Current Headers" per
+canonical page; otherwise the GAS 'min' column check (now expecting 115) fails
+against a 107-column response.
+
+  8 NEW CANONICAL COLUMNS (positions 108-115), all engine-derived:
+    108 data_quality_score          0-100 pts  completeness of price/history/
+                                               fundamentals/forecast/risk
+    109 forecast_reliability_score  0-100 pts  forecast_confidence penalised for
+                                               capped/dropped/synthetic/momentum/
+                                               missing-price forecasts
+    110 provider_engine_conflict    TRUE/FALSE provider rating vs engine direction
+    111 conflict_type               str        e.g. "Provider bullish / engine cautious"
+    112 final_decision_basis        str        "Engine" | "Engine (provider override)"
+    113 investability_status        str        INVESTABLE | WATCHLIST | BLOCKED
+    114 final_action                str        INVEST | WATCH | DO_NOT_INVEST
+    115 block_reason                str        why WATCHLIST/BLOCKED ("" when INVESTABLE)
+
+  GATE LOGIC (_apply_investability_gate, runs immediately after
+  _reconcile_recommendation_family at BOTH boundary call sites so it sees the
+  final reconciled recommendation):
+    BLOCKED  -> hard fail: no current price, OR no forecast at all, OR
+                data_quality_score below the hard floor (40).
+    WATCHLIST-> usable but not a buy-now: a REDUCE/SELL/STRONG_SELL/AVOID family
+                (tracked, final_action DO_NOT_INVEST), OR a HOLD, OR moderate
+                data quality (40-70), OR a BUY-family with fundamental gaps.
+    INVESTABLE-> price + forecast + dq>=70 + BUY-family.
+  Deliberately NOT over-blocking: capped-ROI rows and "provider BUY but engine
+  REDUCE" are NOT blocked (the engine REDUCE already handles the latter; the
+  conflict is surfaced as a FLAG, not a block). The gate makes the real D/E
+  (43-row) and FCF (42-row) gaps VISIBLE via data_quality_score WITHOUT changing
+  fetch behavior (the EODHD-fundamentals fetch tradeoff remains a separate, opt-in
+  decision). Env-toggleable via TFB_INVESTABILITY_GATE (default ON); disabled =>
+  the 8 columns emit blank.
+
+  PRECEDENCE: investability_status is added to _INSTRUMENT_CANONICAL_REQUIRED_KEYS
+  so the deployed schema_registry (v2.10.0 @ 106 cols, no gate keys) fails the
+  subset check in _instrument_contract_is_canonical -> the engine's static
+  115-column contract wins live. No change to schema_registry.py / schemas.py.
+
+VALIDATION (post-deploy)
+  - /health: version 5.78.0, schema 115; "Update Current Headers" widens canonical
+    pages to 115 cols (118 for Top10).
+  - No INVESTABLE row lacks a current price or a forecast; every BLOCKED row has a
+    block_reason; data_quality_score is lowest on the D/E + FCF-blank rows.
 
 WHY v5.77.23 - AUDIT FOLLOW-UP: HINT CONTRADICTION + MISSING-PRICE GUARD + TOP10 FILTER
 ---------------------------------------------------------------------------------------
@@ -963,7 +1014,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.77.23"
+__version__ = "5.78.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -1967,6 +2018,21 @@ def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
     return True
 
 
+# v5.78.0: Investability Gate thresholds (data_quality_score is 0-100 points).
+_GATE_DQ_HARD_FLOOR: float = 40.0       # below this => BLOCKED
+_GATE_DQ_INVESTABLE_MIN: float = 70.0   # at/above this (+ buy-family + price + forecast) => INVESTABLE
+
+
+def _investability_gate_enabled() -> bool:
+    """v5.78.0: master switch for the Investability Gate (default ON). Set
+    TFB_INVESTABILITY_GATE to 0/false/off to disable -- the 8 gate columns then
+    emit blank (the strict projector fills "")."""
+    raw = (os.getenv("TFB_INVESTABILITY_GATE") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
 def _canonical_recommendation(value: Any) -> str:
     if value in (None, ""):
         return ""
@@ -2037,6 +2103,124 @@ def _reconcile_recommendation_family(row: Dict[str, Any]) -> None:
         # family) is preserved -- see _position_hint_contradicts_reco.
         elif psh and _position_hint_contradicts_reco(psh, final):
             row["position_size_hint"] = expected_psh
+
+
+def _apply_investability_gate(row: Dict[str, Any]) -> None:
+    """v5.78.0: compute the decision-readiness layer (8 canonical columns).
+
+    Runs immediately AFTER _reconcile_recommendation_family at both boundary
+    call sites, so it sees the final reconciled recommendation plus all computed
+    price / forecast / score / warning fields. Writes:
+      data_quality_score, forecast_reliability_score (0-100 points),
+      provider_engine_conflict (TRUE/FALSE), conflict_type, final_decision_basis,
+      investability_status (INVESTABLE/WATCHLIST/BLOCKED), final_action
+      (INVEST/WATCH/DO_NOT_INVEST), block_reason.
+    No-op (leaves the 8 columns to be filled blank by the projector) when the
+    gate is disabled or the row is not a dict. Deliberately does NOT over-block:
+    a "provider bullish / engine cautious" disagreement is surfaced as a FLAG,
+    not a block, and capped-ROI rows are not benched.
+    """
+    if not isinstance(row, dict) or not _investability_gate_enabled():
+        return
+
+    cp = _as_float(row.get("current_price"))
+    if cp is None:
+        cp = _as_float(row.get("price"))
+    has_price = cp is not None and cp > 0.0
+
+    has_forecast = any(
+        _as_float(row.get(k)) is not None
+        for k in ("forecast_price_3m", "forecast_price_12m", "expected_roi_3m")
+    )
+    has_de = _as_float(row.get("debt_to_equity")) is not None
+    has_fcf = _as_float(row.get("free_cash_flow_ttm")) is not None
+
+    rec = _canonical_recommendation(row.get("recommendation_detailed")) \
+        or _canonical_recommendation(row.get("recommendation"))
+    warns = _safe_str(row.get("warnings")).lower()
+
+    # -- data_quality_score: weighted completeness across decision buckets ----
+    components = (
+        (25.0, has_price),
+        (8.0, _as_float(row.get("week_52_high")) is not None and _as_float(row.get("week_52_low")) is not None),
+        (7.0, _as_float(row.get("avg_volume_30d")) is not None or _as_float(row.get("volume")) is not None),
+        (15.0, sum(1 for k in ("pe_ttm", "eps_ttm", "market_cap") if _as_float(row.get(k)) is not None) >= 2),
+        (5.0, has_de),
+        (5.0, has_fcf),
+        (10.0, _as_float(row.get("volatility_30d")) is not None or _as_float(row.get("max_drawdown_1y")) is not None),
+        (12.0, has_forecast),
+        (8.0, _as_float(row.get("overall_score")) is not None),
+    )
+    total_w = sum(w for w, _ok in components)
+    got_w = sum(w for w, ok in components if ok)
+    dq = round(100.0 * got_w / total_w, 1) if total_w else 0.0
+
+    # -- forecast_reliability_score: confidence penalised for weak provenance --
+    fc = _as_float(row.get("forecast_confidence"))
+    if fc is not None and 0.0 <= fc <= 1.0:
+        rel = fc * 100.0
+    elif fc is not None:
+        rel = fc
+    else:
+        rel = 50.0
+    if not has_price:
+        rel -= 60.0
+    if not has_forecast:
+        rel -= 40.0
+    if "cap" in warns and ("forecast" in warns or "target" in warns or "roi" in warns):
+        rel -= 20.0
+    if "provider_target" in warns and ("drop" in warns or "reject" in warns):
+        rel -= 15.0
+    opp_src = _safe_str(row.get("opportunity_source")).lower()
+    fc_src = _safe_str(row.get("forecast_source")).lower()
+    if "momentum" in opp_src or "fallback" in opp_src:
+        rel -= 15.0
+    if "synthetic" in fc_src or "fallback" in fc_src or "momentum" in fc_src:
+        rel -= 15.0
+    rel = round(max(0.0, min(100.0, rel)), 1)
+
+    # -- provider vs engine conflict (a FLAG, not a block) --------------------
+    pr = _as_float(row.get("provider_rating"))
+    eng_dir = _RECO_DIRECTION.get(rec, "")
+    conflict, ctype = "FALSE", ""
+    if pr is not None and eng_dir:
+        if pr >= 3.5 and eng_dir in ("HOLD", "TRIM"):
+            conflict, ctype = "TRUE", "Provider bullish / engine cautious"
+        elif pr <= 2.5 and eng_dir == "ADD":
+            conflict, ctype = "TRUE", "Provider cautious / engine constructive"
+        else:
+            ctype = "Aligned"
+    basis = "Engine" if conflict == "FALSE" else "Engine (provider override)"
+
+    # -- investability status / final action / block reason -------------------
+    if not has_price:
+        status, action, reason = "BLOCKED", "DO_NOT_INVEST", "Missing current price"
+    elif not has_forecast:
+        status, action, reason = "BLOCKED", "DO_NOT_INVEST", "No forecast available"
+    elif dq < _GATE_DQ_HARD_FLOOR:
+        status, action, reason = "BLOCKED", "DO_NOT_INVEST", "Data quality below floor (%.0f)" % dq
+    elif rec in _TOP10_EXCLUDED_RECO_FAMILIES:
+        status, action, reason = "WATCHLIST", "DO_NOT_INVEST", "Engine recommends %s" % (rec or "reduce")
+    elif rec == "HOLD" or dq < _GATE_DQ_INVESTABLE_MIN or not (has_de and has_fcf):
+        status, action = "WATCHLIST", "WATCH"
+        if rec == "HOLD":
+            reason = "Engine neutral (HOLD)"
+        elif dq < _GATE_DQ_INVESTABLE_MIN:
+            reason = "Moderate data quality (%.0f)" % dq
+        else:
+            gaps = [g for g, ok in (("D/E", has_de), ("FCF", has_fcf)) if not ok]
+            reason = "Incomplete fundamentals (%s)" % ", ".join(gaps)
+    else:
+        status, action, reason = "INVESTABLE", "INVEST", ""
+
+    row["data_quality_score"] = dq
+    row["forecast_reliability_score"] = rel
+    row["provider_engine_conflict"] = conflict
+    row["conflict_type"] = ctype
+    row["final_decision_basis"] = basis
+    row["investability_status"] = status
+    row["final_action"] = action
+    row["block_reason"] = reason
 
 
 # v5.77.16: recommendation_source values the ENGINE itself writes. When a row
@@ -3092,6 +3276,18 @@ INSTRUMENT_CANONICAL_KEYS: List[str] = [
     "candlestick_pattern", "candlestick_signal", "candlestick_strength",
     "candlestick_confidence", "candlestick_patterns_recent",
     "forecast_source",
+    # v5.78.0 — Investability Gate (decision-readiness layer, positions 108-115).
+    # Aligned with 00_Config.gs v1.11.0 HEADER_TO_KEY (Investability group) and
+    # AUDIT-16. data_quality_score / forecast_reliability_score are 0-100 POINTS
+    # (NOT fractions -> excluded from DECIMAL_FRACTION_FIELDS, like overall_score).
+    "data_quality_score",
+    "forecast_reliability_score",
+    "provider_engine_conflict",
+    "conflict_type",
+    "final_decision_basis",
+    "investability_status",
+    "final_action",
+    "block_reason",
 ]
 _SCHEMA_VERSION = f"instrument:{len(INSTRUMENT_CANONICAL_KEYS)}:{__version__}"
 
@@ -3126,6 +3322,15 @@ INSTRUMENT_CANONICAL_HEADERS: List[str] = [
     "Candle Pattern", "Candle Signal", "Candle Strength",
     "Candle Confidence", "Recent Patterns (5D)",
     "Forecast Source",
+    # v5.78.0 — Investability Gate (positions 108-115), order matches keys above.
+    "Data Quality Score",
+    "Forecast Reliability Score",
+    "Provider/Engine Conflict",
+    "Conflict Type",
+    "Final Decision Basis",
+    "Investability Status",
+    "Final Action",
+    "Block Reason",
 ]
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
@@ -4079,6 +4284,11 @@ _INSTRUMENT_CANONICAL_REQUIRED_KEYS: frozenset = frozenset({
     "overall_score_raw", "overall_penalty_factor",
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
     "forecast_source",
+    # v5.78.0: one Investability Gate key in the required set so any registry
+    # predating the gate (e.g. schema_registry v2.10.0 @ 106 cols) fails the
+    # subset test in _instrument_contract_is_canonical and the static 115-col
+    # contract wins -- same precedence mechanism used for forecast_source.
+    "investability_status",
 })
 
 
@@ -5281,6 +5491,7 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     # before rows leave the API, so recommendation can never disagree with
     # recommendation_detailed / reason / priority / band downstream.
     _reconcile_recommendation_family(row)
+    _apply_investability_gate(row)  # v5.78.0: decision-readiness layer (8 cols)
     return {k: _json_safe(row.get(k)) for k in keys}
 
 
@@ -7113,6 +7324,7 @@ class DataEngineV5:
         # path that returns rows then has recommendation == recommendation_detailed.
         for _r in rows:
             _reconcile_recommendation_family(_r)
+            _apply_investability_gate(_r)  # v5.78.0: same boundary as _strict_project_row
         return rows
 
     async def get_sheet(self, sheet: str, *, limit: int = 2000, offset: int = 0, **kwargs: Any) -> Dict[str, Any]:
@@ -7358,7 +7570,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.77.23",  # v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
+                "version": "v5.78.0",  # v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
