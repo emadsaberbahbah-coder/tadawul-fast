@@ -2,8 +2,121 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.78.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.79.2
 ================================================================================
+
+WHY v5.79.2 - GATE LABELING + ASSET-CLASS DETECTION ROBUSTNESS
+--------------------------------------------------------------
+Two small engine-only refinements to the v5.78.0/v5.79.1 gate (NO schema change
+- still 115/115, 00_Config.gs v1.11.0 unaffected, no frontend redeploy).
+
+  Fix M - final_decision_basis no longer says "override" for a flagged conflict
+    A provider/engine conflict is surfaced as a FLAG; the engine recommendation
+    still drives investability_status (provider STRONG_BUY + engine REDUCE still
+    -> WATCHLIST). So the prior basis label "Engine (provider override)" was
+    misleading - nothing overrides the engine. It now reads
+    "Engine (provider conflict flagged)".
+
+  Fix N - asset-class exemption also honors a fund-vehicle INDUSTRY label
+    Fix L (v5.79.1) exempts ETFs / funds / commodities / FX / indices from the
+    D/E + FCF requirement by asset_class. But a provider can mislabel an ETF as
+    "Equity" at asset_class level while the engine still tags industry="ETF"
+    (symbol-hint path). fundamentals_apply now also exempts rows whose INDUSTRY
+    exactly matches a known fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES:
+    etf / fund / mutual fund / closed-end fund / exchange[- ]traded fund / money
+    market fund). Exact-match (not substring) so an operating company in e.g.
+    commodity trading or asset management is NOT mistakenly exempted.
+
+VALIDATION (post-deploy)
+  - A conflict row shows final_decision_basis = "Engine (provider conflict
+    flagged)" (no longer "provider override"); its investability_status still
+    follows the engine.
+  - An ETF mislabeled asset_class="Equity" but industry="ETF" can now reach
+    INVESTABLE on price + forecast without being benched for blank D/E + FCF.
+  - A real equity (e.g. industry "Specialty Chemicals", or a commodity-trading
+    operating company) still requires D/E + FCF as before.
+  - /health: version 5.79.2; schema still 115.
+
+WHY v5.79.1 - INVESTABILITY GATE REFINEMENTS (CONFLICT FLAG + ASSET-CLASS AWARE)
+--------------------------------------------------------------------------------
+Two engine-only fixes to the v5.78.0 gate (NO schema change - still 115/115, so
+00_Config.gs v1.11.0 is unaffected and no frontend redeploy is needed).
+
+  Fix K - provider/engine conflict flag now works with TEXT ratings
+    The gate compared provider_rating on a 0-5 numeric scale via _as_float().
+    But provider_rating is stored as TEXT in production (STRONG_BUY / BUY / HOLD
+    / SELL / ...), so _as_float() returned None and provider_engine_conflict was
+    permanently FALSE - a dead column. New _provider_rating_direction() maps a
+    rating to BULLISH / NEUTRAL / CAUTIOUS handling BOTH a text rating and a
+    numeric score, and the gate now compares that direction against the engine's
+    _RECO_DIRECTION. A real disagreement (e.g. provider STRONG_BUY vs engine
+    REDUCE) now surfaces as TRUE / "Provider bullish / engine cautious". Still a
+    FLAG, not a block.
+
+  Fix L - gate no longer over-blocks non-equity asset classes
+    The D/E + FCF requirement (and their 10 points of data_quality_score) only
+    makes sense for company equities. For ETFs, funds, commodities, FX, and
+    indices those metrics are N/A, so good baskets/instruments were stranded in
+    WATCHLIST for "Incomplete fundamentals (D/E, FCF)" and lost ~10 DQ points
+    unfairly. _GATE_FUNDAMENTALS_EXEMPT_TOKENS marks those classes; for them the
+    D/E + FCF completeness components drop out of data_quality_score entirely and
+    the INVESTABLE decision no longer requires D/E + FCF. Equities (including
+    banks and REITs, which DO carry leverage) are unchanged here; bank- and
+    REIT-specific quality metrics (P/B, ROE, NIM; FFO/AFFO) belong in
+    asset-class-specific SCORING (core/scoring.py), not this completeness gate.
+
+VALIDATION (post-deploy)
+  - A provider-bullish / engine-cautious row (e.g. provider STRONG_BUY, engine
+    REDUCE) now shows Provider/Engine Conflict = TRUE with a populated Conflict
+    Type; aligned rows show FALSE / "Aligned".
+  - A clean ETF or fund with price + forecast can reach INVESTABLE even with
+    blank Debt/Equity and Free Cash Flow; its Data Quality Score is no longer
+    docked for those N/A metrics.
+  - A normal equity missing D/E or FCF still routes to WATCHLIST as before.
+  - /health: version 5.79.1; schema still 115.
+
+WHY v5.79.0 - EODHD FUNDAMENTALS FALLBACK (DEBT/EQUITY + FREE CASH FLOW GAP)
+----------------------------------------------------------------------------
+Closes the Debt/Equity (~43 blank rows) and Free Cash Flow (~42 blank rows)
+data gap the audits flagged. Until now fundamentals were sourced ONLY from
+Yahoo (_apply_yahoo_enrichment_pass -> yahoo_fundamentals_provider); Yahoo
+leaves debt_to_equity and/or free_cash_flow_ttm blank on many non-US,
+financial, and ETF names. EODHD's fundamentals endpoint carries both (plus
+margins / revenue / float_shares), but the engine never consulted it on the
+quote path - the EODHD provider exposes NO module-level fundamentals wrapper
+(only EODHDClient.fetch_fundamentals and the heavy 3-call fetch_enriched_quote_patch).
+
+This matters more since v5.78.0: the investability gate reads has_de / has_fcf
+and routes rows missing them to WATCHLIST, so the blank fundamentals were
+actively benching otherwise-investable names and depressing data_quality_score.
+
+  Fix (Option A - surgical, engine-only, NO schema change, NO provider edit)
+    - _eodhd_fundamentals_fallback_enabled(): env TFB_EODHD_FUNDAMENTALS_FALLBACK
+      (default ON).
+    - _fetch_eodhd_fundamentals_patch(): pulls the EODHD module already loaded in
+      self._provider_registry["eodhd"]; prefers a module-level fundamentals
+      callable if a future provider build adds one, else uses get_client() +
+      EODHDClient.fetch_fundamentals (FUNDAMENTALS endpoint only = ONE call, not
+      the 3-call enriched patch). The client normalizes the symbol internally and
+      returns (patch, err); the tuple is unwrapped.
+    - _apply_eodhd_fundamentals_fallback(): runs in the enriched-quote factory
+      immediately AFTER the Yahoo enrichment pass and BEFORE phase-BB sanity /
+      scoring, so the filled fields feed quality scoring and the gate. It fetches
+      ONLY when debt_to_equity OR free_cash_flow_ttm is still blank (at most one
+      extra call per gap row) and fill-only-merges via
+      _filter_patch_to_missing_fields(_YAHOO_FUNDAMENTAL_FIELDS) - a value Yahoo
+      already supplied is never overwritten. Tag: eodhd_fundamentals_fallback_applied.
+
+  Net effect: D/E and FCF populate on the gap rows, data_quality_score rises, and
+  rows previously WATCHLIST-ed solely for "Incomplete fundamentals (D/E, FCF)" can
+  reach INVESTABLE. Schema unchanged at 115/115.
+
+VALIDATION (post-deploy)
+  - Spot-check a previously-blank financial / non-US name: Debt/Equity and Free
+    Cash Flow now populated; warnings carries eodhd_fundamentals_fallback_applied.
+  - Rows formerly "WATCHLIST - Incomplete fundamentals (D/E, FCF)" re-evaluate.
+  - /health: version 5.79.0; schema still 115. Toggle off via
+    TFB_EODHD_FUNDAMENTALS_FALLBACK=0 if EODHD quota is a concern.
 
 WHY v5.78.0 - INVESTABILITY GATE (SCHEMA 107 -> 115; PAIRS WITH 00_Config.gs v1.11.0)
 -------------------------------------------------------------------------------------
@@ -1014,7 +1127,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.78.0"
+__version__ = "5.79.2"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -1304,6 +1417,18 @@ _YAHOO_ENRICHMENT_LAST_PASS: Dict[str, Any] = {
 def _yahoo_enrichment_enabled() -> bool:
     raw = (os.getenv("ENGINE_YAHOO_ENRICHMENT_ENABLED") or "").strip().lower()
     if raw in {"0", "false", "no", "n", "off", "f"}:
+        return False
+    return True
+
+
+def _eodhd_fundamentals_fallback_enabled() -> bool:
+    """v5.79.0: master switch for the EODHD fundamentals fallback (default ON).
+    When ON, the enriched-quote factory consults EODHD's fundamentals endpoint
+    to fill debt_to_equity / free_cash_flow_ttm (and other still-blank
+    fundamentals) that Yahoo did not supply. Set TFB_EODHD_FUNDAMENTALS_FALLBACK
+    to 0/false/off to disable and restore pre-v5.79.0 (Yahoo-only) behavior."""
+    raw = (os.getenv("TFB_EODHD_FUNDAMENTALS_FALLBACK") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
         return False
     return True
 
@@ -2022,6 +2147,27 @@ def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
 _GATE_DQ_HARD_FLOOR: float = 40.0       # below this => BLOCKED
 _GATE_DQ_INVESTABLE_MIN: float = 70.0   # at/above this (+ buy-family + price + forecast) => INVESTABLE
 
+# v5.79.1: asset classes for which debt_to_equity / free_cash_flow are not
+# meaningful, so the investability gate must NOT require them (nor penalise
+# data_quality_score for their absence). ETFs / funds hold baskets; commodities,
+# FX, and indices have no company balance sheet. Banks and REITs are Equity-
+# classed and DO carry leverage, so they stay in the equity path here -- their
+# correct quality metrics (P/B, ROE, NIM for banks; FFO/AFFO for REITs) belong in
+# asset-class-specific SCORING (core/scoring.py), not this completeness gate.
+_GATE_FUNDAMENTALS_EXEMPT_TOKENS: Tuple[str, ...] = (
+    "etf", "fund", "commodity", "fx", "currency", "forex", "index",
+)
+
+# v5.79.2: known fund-vehicle INDUSTRY labels (exact match, lowercased). Catches
+# ETFs / funds a provider mislabeled as "Equity" at the asset_class level -- the
+# engine sets industry="ETF" for symbol-hinted ETFs even when the provider's
+# asset_class survived as "Equity". Exact-match (not substring) so an operating
+# company in e.g. commodity trading or an asset-management firm is NOT exempted.
+_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES: frozenset = frozenset({
+    "etf", "fund", "mutual fund", "closed-end fund",
+    "exchange traded fund", "exchange-traded fund", "money market fund",
+})
+
 
 def _investability_gate_enabled() -> bool:
     """v5.78.0: master switch for the Investability Gate (default ON). Set
@@ -2045,6 +2191,35 @@ def _canonical_recommendation(value: Any) -> str:
             pass
     raw = _safe_str(value).upper().replace("-", "_").replace(" ", "_")
     return raw if raw in _RECO_8TIER_PRIORITY else ""
+
+
+def _provider_rating_direction(value: Any) -> str:
+    """v5.79.1: map a provider rating to BULLISH / NEUTRAL / CAUTIOUS, handling
+    BOTH a 0-5 numeric analyst score AND a text rating (STRONG_BUY / BUY /
+    ACCUMULATE / HOLD / REDUCE / SELL / STRONG_SELL / AVOID). Returns "" when the
+    value is blank or unrecognized.
+
+    Why: in production provider_rating is stored as TEXT (e.g. "STRONG_BUY"), so
+    the gate's prior _as_float()-only comparison resolved to None and left
+    provider_engine_conflict permanently FALSE -- a dead column. Comparing
+    canonical DIRECTION restores the flag while still honoring a numeric score if
+    a provider ever supplies one.
+    """
+    num = _as_float(value)
+    if num is not None:
+        if num >= 3.5:
+            return "BULLISH"
+        if num <= 2.5:
+            return "CAUTIOUS"
+        return "NEUTRAL"
+    direction = _RECO_DIRECTION.get(_canonical_recommendation(value), "")
+    if direction == "ADD":
+        return "BULLISH"
+    if direction == "TRIM":
+        return "CAUTIOUS"
+    if direction == "HOLD":
+        return "NEUTRAL"
+    return ""
 
 
 def _recommendation_priority(rec: str) -> int:
@@ -2139,18 +2314,36 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         or _canonical_recommendation(row.get("recommendation"))
     warns = _safe_str(row.get("warnings")).lower()
 
+    # v5.79.1: debt_to_equity + free_cash_flow are only meaningful for company
+    # equities. For ETFs, funds, commodities, FX, and indices they are N/A, so
+    # they must neither be required for INVESTABLE nor counted against
+    # data_quality_score (otherwise good baskets/instruments are benched to
+    # WATCHLIST and their DQ is unfairly depressed by ~10 points).
+    asset_class = _safe_str(row.get("asset_class")).lower()
+    # v5.79.2: also exempt rows whose INDUSTRY is a known fund-vehicle label,
+    # catching ETFs a provider mislabeled as "Equity" at asset_class level.
+    # Exact-match on industry so a real operating company is not exempted.
+    industry = _safe_str(row.get("industry")).strip().lower()
+    fundamentals_apply = not (
+        any(tok in asset_class for tok in _GATE_FUNDAMENTALS_EXEMPT_TOKENS)
+        or industry in _GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES
+    )
+
     # -- data_quality_score: weighted completeness across decision buckets ----
-    components = (
+    components = [
         (25.0, has_price),
         (8.0, _as_float(row.get("week_52_high")) is not None and _as_float(row.get("week_52_low")) is not None),
         (7.0, _as_float(row.get("avg_volume_30d")) is not None or _as_float(row.get("volume")) is not None),
         (15.0, sum(1 for k in ("pe_ttm", "eps_ttm", "market_cap") if _as_float(row.get(k)) is not None) >= 2),
-        (5.0, has_de),
-        (5.0, has_fcf),
         (10.0, _as_float(row.get("volatility_30d")) is not None or _as_float(row.get("max_drawdown_1y")) is not None),
         (12.0, has_forecast),
         (8.0, _as_float(row.get("overall_score")) is not None),
-    )
+    ]
+    # D/E + FCF weights apply only where the asset class supports them; for
+    # exempt classes they drop out of both numerator and denominator.
+    if fundamentals_apply:
+        components.append((5.0, has_de))
+        components.append((5.0, has_fcf))
     total_w = sum(w for w, _ok in components)
     got_w = sum(w for w, ok in components if ok)
     dq = round(100.0 * got_w / total_w, 1) if total_w else 0.0
@@ -2180,17 +2373,26 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     rel = round(max(0.0, min(100.0, rel)), 1)
 
     # -- provider vs engine conflict (a FLAG, not a block) --------------------
-    pr = _as_float(row.get("provider_rating"))
+    # v5.79.1: compare canonical DIRECTION. provider_rating is stored as TEXT in
+    # production (BUY / STRONG_BUY / HOLD / SELL / ...), so the prior
+    # _as_float()-only comparison resolved to None and left this flag FALSE for
+    # every row. _provider_rating_direction handles both a text rating and a
+    # numeric analyst score.
+    prov_dir = _provider_rating_direction(row.get("provider_rating"))
     eng_dir = _RECO_DIRECTION.get(rec, "")
     conflict, ctype = "FALSE", ""
-    if pr is not None and eng_dir:
-        if pr >= 3.5 and eng_dir in ("HOLD", "TRIM"):
+    if prov_dir and eng_dir:
+        if prov_dir == "BULLISH" and eng_dir in ("HOLD", "TRIM"):
             conflict, ctype = "TRUE", "Provider bullish / engine cautious"
-        elif pr <= 2.5 and eng_dir == "ADD":
+        elif prov_dir == "CAUTIOUS" and eng_dir == "ADD":
             conflict, ctype = "TRUE", "Provider cautious / engine constructive"
         else:
             ctype = "Aligned"
-    basis = "Engine" if conflict == "FALSE" else "Engine (provider override)"
+    # v5.79.2: a conflict is FLAGGED, not acted on -- the engine recommendation
+    # still drives investability_status (e.g. provider STRONG_BUY + engine REDUCE
+    # still -> WATCHLIST), so "provider override" was misleading. Nothing
+    # overrides the engine here; label it as a flagged conflict.
+    basis = "Engine" if conflict == "FALSE" else "Engine (provider conflict flagged)"
 
     # -- investability status / final action / block reason -------------------
     if not has_price:
@@ -2201,7 +2403,7 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         status, action, reason = "BLOCKED", "DO_NOT_INVEST", "Data quality below floor (%.0f)" % dq
     elif rec in _TOP10_EXCLUDED_RECO_FAMILIES:
         status, action, reason = "WATCHLIST", "DO_NOT_INVEST", "Engine recommends %s" % (rec or "reduce")
-    elif rec == "HOLD" or dq < _GATE_DQ_INVESTABLE_MIN or not (has_de and has_fcf):
+    elif rec == "HOLD" or dq < _GATE_DQ_INVESTABLE_MIN or (fundamentals_apply and not (has_de and has_fcf)):
         status, action = "WATCHLIST", "WATCH"
         if rec == "HOLD":
             reason = "Engine neutral (HOLD)"
@@ -7089,6 +7291,80 @@ class DataEngineV5:
                     _append_yahoo_warning_tag(row, "yahoo_chart_enrichment_applied")
         return row
 
+    async def _fetch_eodhd_fundamentals_patch(self, symbol: str, page: str = "") -> Dict[str, Any]:
+        """v5.79.0: fetch EODHD fundamentals (debt_to_equity, free_cash_flow_ttm,
+        margins, revenue, float_shares, ...) as a FALLBACK source. The EODHD
+        provider exposes no module-level fundamentals wrapper (only the class
+        method EODHDClient.fetch_fundamentals and the heavy 3-call
+        fetch_enriched_quote_patch), so prefer a module-level fundamentals
+        callable if a future build adds one, else use get_client() +
+        client.fetch_fundamentals -- the FUNDAMENTALS endpoint only (one call).
+        The client normalizes the symbol internally (mirrors the working quote
+        path) and returns (patch, err); the tuple is unwrapped here."""
+        mod = self._provider_registry.get("eodhd")
+        if mod is None:
+            return {}
+        fn = _pick_provider_callable(
+            mod, "fetch_fundamentals_patch", "get_fundamentals", "fetch_fundamentals", "fundamentals",
+        )
+        try:
+            if fn is not None:
+                result = await _call_maybe_async(fn, symbol)
+            else:
+                get_client = getattr(mod, "get_client", None)
+                if not callable(get_client):
+                    return {}
+                client = await _call_maybe_async(get_client)
+                client_fn = getattr(client, "fetch_fundamentals", None)
+                if not callable(client_fn):
+                    return {}
+                result = await _call_maybe_async(client_fn, symbol)
+        except Exception as exc:
+            logger.debug(
+                "[engine_v2 v%s] eodhd fundamentals raised on %s: %s: %s",
+                __version__, symbol, exc.__class__.__name__, exc,
+            )
+            return {}
+        # EODHDClient.fetch_fundamentals returns (patch, err); a module-level
+        # wrapper (if present) returns a bare dict.
+        if isinstance(result, tuple):
+            result = result[0] if result else None
+        if isinstance(result, dict):
+            return result
+        return _model_to_dict(result)
+
+    async def _apply_eodhd_fundamentals_fallback(self, row: Dict[str, Any], symbol: str, page: str = "") -> Dict[str, Any]:
+        """v5.79.0: fill blank debt_to_equity / free_cash_flow_ttm (and any other
+        still-missing fundamentals in _YAHOO_FUNDAMENTAL_FIELDS) from EODHD when
+        Yahoo did not supply them. Fetches ONLY when a gap remains (so cost is at
+        most one extra call per gap row). Fill-only: _filter_patch_to_missing_fields
+        never overwrites a value already present on the row."""
+        if not _eodhd_fundamentals_fallback_enabled():
+            return row
+        if not isinstance(row, dict):
+            return row
+        # Gate on the exact gap this fallback exists to close.
+        if _as_float(row.get("debt_to_equity")) is not None \
+                and _as_float(row.get("free_cash_flow_ttm")) is not None:
+            return row
+        patch = await self._fetch_eodhd_fundamentals_patch(symbol, page)
+        if not patch:
+            return row
+        sym_for_canon = normalize_symbol(symbol) or normalize_symbol(
+            _safe_str(row.get("symbol") or row.get("requested_symbol"))
+        )
+        canon_patch = _canonicalize_provider_row(
+            patch, requested_symbol=sym_for_canon, normalized_symbol=sym_for_canon,
+            provider="eodhd_fundamentals",
+        )
+        filtered, _filled = _filter_patch_to_missing_fields(
+            row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
+        )
+        if filtered:
+            row = self._merge(row, filtered)
+            _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
+        return row
+
     # =========================================================================
     # Enriched quote orchestration
     # =========================================================================
@@ -7146,6 +7422,15 @@ class DataEngineV5:
 
             # Yahoo enrichment pass (filtered to truly-missing fields).
             merged = await self._apply_yahoo_enrichment_pass(merged, sym, page_ctx)
+
+            # v5.79.0: EODHD fundamentals fallback. Yahoo is the primary
+            # fundamentals source but leaves debt_to_equity / free_cash_flow_ttm
+            # blank on many non-US / financial / ETF names; EODHD's fundamentals
+            # endpoint carries both. Runs AFTER Yahoo (fill-only) and BEFORE
+            # phase-BB sanity + scoring, so the filled fields feed quality
+            # scoring and the investability gate. Fetches only when a gap
+            # remains. Env-toggleable (TFB_EODHD_FUNDAMENTALS_FALLBACK).
+            merged = await self._apply_eodhd_fundamentals_fallback(merged, sym, page_ctx)
 
             # Phase BB sanity normalization.
             merged = _apply_phase_bb_sanity(merged)
@@ -7570,7 +7855,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.78.0",  # v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
+                "version": "v5.79.2",  # v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
