@@ -2,8 +2,8 @@
 # core/scoring_engine.py
 """
 ================================================================================
-Scoring Engine -- v3.6.0
-(THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.7.0+
+Scoring Engine -- v3.7.0
+(THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.7.3+
  AND core.reco_normalize v8.0.0+)
 ================================================================================
 
@@ -12,6 +12,124 @@ This module is a pure compatibility shim. All scoring logic lives in
 `ScoringEngine`, `compute_scores`, etc. from `core.scoring_engine` --
 this module routes those imports to the canonical implementations in
 `core.scoring`.
+
+================================================================================
+v3.7.0 changes (vs v3.6.0)  --  core.scoring v5.7.1 / v5.7.2 / v5.7.3 ALIGNMENT
+================================================================================
+
+core.scoring has advanced v5.7.0 -> v5.7.1 -> v5.7.2 -> v5.7.3 since
+v3.6.0 was cut. The bridge was operating correctly against all of
+those releases (every new scoring symbol is internal to compute_scores
+or read dynamically via getattr), but was under-advertising the
+v5.7.3 asset-class surface in its diagnostic report.
+
+What advanced in core.scoring since v5.7.0
+-------------------------------------------
+  v5.7.1: UNDERPERFORM cross-stack realignment (UNDERPERFORM ->
+            REDUCE, was SELL; sibling MARKET_UNDERPERFORM /
+            MARKET_OUTPERFORM aliases). _ENGINE_CONTRACT_VERSION
+            advanced "5.75.0" -> "5.77.17" (diagnostic marker only;
+            the producer/consumer contract was unchanged). Affects
+            only normalization of externally-supplied labels; no row
+            field added and the recommendation enum is unchanged.
+
+  v5.7.2: Confidence-penalty NEUTRAL POINT (recommendation-collapse
+            fix). New ScoringConfig.confidence_penalty_neutral (0.60,
+            env SCORING_CONFIDENCE_NEUTRAL), mirrored on ScoreWeights
+            and threaded through normalize(). conf_pen now penalizes
+            only confidence BELOW the neutral point, so the typical
+            ~0.62 data-quality confidence proxy is no longer marked
+            down by a uniform haircut. Re-centers the score
+            distribution only; no row field added, contract unchanged.
+
+  v5.7.3: Asset-class-aware valuation & quality. New
+            _asset_class_for_scoring(row) -> BANK / REIT / FUND /
+            EQUITY, _reit_yield_value() (hump-shaped REIT dividend-
+            yield curve), and _asset_class_aware_scoring_enabled()
+            (env SCORING_ASSET_CLASS_AWARE, default ON). Banks drop
+            the debt/equity quality term and value on P/E + P/B;
+            REITs value on P/B + capped dividend yield; equity / fund
+            rows are byte-identical to v5.7.2. _ENGINE_CONTRACT_VERSION
+            advanced "5.77.17" -> "5.79.2" (diagnostic marker only;
+            the engine's 8 investability-gate columns are computed
+            DOWNSTREAM of scoring, so the producer/consumer field set
+            is unchanged). NO new AssetScores row field; the
+            RECOMMENDATION_ENUM is unchanged at 8 tiers.
+
+Why the bridge needed almost no change
+--------------------------------------
+  - The three v5.7.3 helpers are internal to compute_scores; no
+    downstream consumer imports them via the bridge, so they are
+    TRACKED for diagnostics (Phase B/C/D) rather than re-exported as
+    bridge names -- mirroring how _RECO_8TIER_SYMBOLS are tracked on
+    the reco_normalize side without being re-exported.
+  - _ENGINE_CONTRACT_VERSION is re-exported via getattr() (v3.6.0
+    Phase B), so the bridge already reports the live value "5.79.2"
+    against v5.7.3 with no code change; the degradation report's
+    engine_contract_version key reflects it automatically.
+  - v5.7.1/v5.7.2/v5.7.3 added NO new compute_scores row field and
+    did NOT widen RECOMMENDATION_ENUM, so there is no new
+    _V###_FIELDS contract tuple and is_reco_8tier_aware() is
+    unaffected (still an 8-tier content check).
+
+Bridge changes in v3.7.0
+------------------------
+
+  Phase A -- Header docstring sync: floor moves to core.scoring
+             v5.7.3+. Older versions still load cleanly via the
+             getattr() fallback pattern; the degradation report flags
+             them. Documents the _ENGINE_CONTRACT_VERSION value
+             progression 5.75.0 -> 5.77.17 -> 5.79.2.
+
+  Phase B -- NEW _ASSET_CLASS_SCORING_SYMBOLS tuple tracking the
+             v5.7.3 asset-class surface in core.scoring:
+               * _asset_class_for_scoring            (function)
+               * _reit_yield_value                   (function)
+               * _asset_class_aware_scoring_enabled  (function)
+             Tracked on the core.scoring side, separately from
+             _BUCKET_ALIGNMENT_SYMBOLS / _CONTRACT_VERSION_SYMBOLS, so
+             a deployment on v5.3.0-v5.7.2 (full bucket + contract
+             surface but no asset-class surface yet) still passes
+             is_bucket_aligned() / is_contract_versioned() while
+             honestly reporting that asset-class scoring is
+             unavailable. These are TRACKED only, not re-exported as
+             bridge names (no consumer imports them via the bridge).
+
+  Phase C -- NEW is_asset_class_aware() helper: returns True when
+             core.scoring exposes all three v5.7.3 asset-class
+             functions. Mirror of is_view_aware, is_audit_hardened,
+             is_reco_rule_id_aware, is_cascade_bridged,
+             is_bucket_aligned, is_contract_versioned,
+             is_reco_8tier_aware.
+
+  Phase D -- Extended get_degradation_report():
+               * asset_class_scoring_symbols: {symbol: present_bool}
+               * missing_asset_class_scoring: [symbols]
+               * asset_class_scoring_enabled: bool
+             Existing report fields preserved verbatim.
+
+  Phase E -- Version bump 3.6.0 -> 3.7.0. Minor bump because the
+             public re-export surface widens (is_asset_class_aware);
+             no breaking changes and no removals.
+
+[PRESERVED -- strictly]
+  - Every v3.6.0 public name remains exported.
+  - is_view_aware, is_audit_hardened, is_reco_rule_id_aware,
+    is_cascade_bridged, is_bucket_aligned, is_contract_versioned,
+    is_reco_8tier_aware all unchanged.
+  - _V525 / _V528 / _V540 / _V570 field-contract tuples unchanged
+    (v5.7.3 added no new row field).
+  - _BUCKET_ALIGNMENT_SYMBOLS / _CONTRACT_VERSION_SYMBOLS /
+    _RECO_8TIER_SYMBOLS unchanged (the v3.7.0 addition goes into a
+    separate _ASSET_CLASS_SCORING_SYMBOLS tuple).
+  - _ENGINE_CONTRACT_VERSION / _RECO_NORMALIZE_CONTRACT_VERSION
+    re-exports unchanged (read dynamically; now report 5.79.2 / 8.0.0).
+  - RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5
+    auto-track core.scoring's __version__ via its f-string.
+
+API surface (additions in v3.7.0):
+  - _ASSET_CLASS_SCORING_SYMBOLS (private constant)
+  - is_asset_class_aware (bridge-level helper)
 
 ================================================================================
 v3.6.0 changes (vs v3.5.0)  --  v5.6.0 / v5.7.0 / v8.0.0 ALIGNMENT
@@ -443,7 +561,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # ---------------------------------------------------------------------------
 
-VERSION = "3.6.0"
+VERSION = "3.7.0"
 # v3.4.2 Phase B (preserved): __version__ alias matches TFB module
 # convention used by core.scoring v5.2.5+, core.reco_normalize v7.2.0+,
 # and insights_builder v7.0.0.
@@ -950,6 +1068,37 @@ _CONTRACT_VERSION_SYMBOLS: Tuple[str, ...] = (
     "_RECO_NORMALIZE_CONTRACT_VERSION",
 )
 
+# v3.7.0 Phase B: core.scoring v5.7.3+ asset-class scoring surface.
+# Tracks the three functions introduced when valuation/quality became
+# asset-class aware. _asset_class_for_scoring(row) classifies a row as
+# BANK / REIT / FUND / EQUITY; _reit_yield_value() is the hump-shaped
+# REIT dividend-yield valuation curve; _asset_class_aware_scoring_enabled()
+# is the SCORING_ASSET_CLASS_AWARE master switch (default ON).
+#
+# Tracked on the core.scoring side, separately from
+# _BUCKET_ALIGNMENT_SYMBOLS and _CONTRACT_VERSION_SYMBOLS, so a
+# deployment on v5.3.0-v5.7.2 (full bucket + contract surface but no
+# asset-class surface yet) still passes is_bucket_aligned() and
+# is_contract_versioned() while honestly reporting that asset-class
+# scoring is unavailable.
+#
+# These are TRACKED for diagnostics only; they are NOT re-exported as
+# bridge names because no downstream consumer imports them via the
+# bridge (they are internal to compute_scores). This mirrors how the
+# _RECO_8TIER_SYMBOLS are tracked on the reco_normalize side without
+# being re-exported.
+#
+# Missing any of these means the deployed core.scoring is on
+# pre-v5.7.3. A False from is_asset_class_aware() while
+# is_bucket_aligned() is True indicates the stack has the canonical
+# bucket surface but banks/REITs are still being scored with the
+# generic equity multiples and the debt/equity quality penalty.
+_ASSET_CLASS_SCORING_SYMBOLS: Tuple[str, ...] = (
+    "_asset_class_for_scoring",
+    "_reit_yield_value",
+    "_asset_class_aware_scoring_enabled",
+)
+
 # v3.6.0 Phase E: core.reco_normalize v8.0.0+ vocabulary-expansion
 # surface. Tracks the symbols added when the canonical recommendation
 # enum was widened from 5 tiers to 8.
@@ -1031,6 +1180,9 @@ def get_degradation_report() -> Dict[str, Any]:
         for v5.6.0+/v5.7.0+ contract-version markers (added v3.6.0)
       - reco_8tier_symbols: dict of {symbol: present_bool} for
         core.reco_normalize v8.0.0+ vocabulary expansion (added v3.6.0)
+      - asset_class_scoring_symbols: dict of {symbol: present_bool}
+        for core.scoring v5.7.3+ asset-class scoring functions
+        (added v3.7.0)
       - risk_thresholds: tuple or None (the actual values resolved at
         import time; surfaced for ops diagnostic; added v3.5.0)
       - confidence_thresholds: tuple or None (same; added v3.5.0)
@@ -1058,6 +1210,8 @@ def get_degradation_report() -> Dict[str, Any]:
         markers (added v3.6.0)
       - missing_reco_8tier: list of missing reco_normalize v8.0.0+
         vocabulary symbols (added v3.6.0)
+      - missing_asset_class_scoring: list of missing core.scoring
+        v5.7.3+ asset-class functions (added v3.7.0)
       - view_aware_recommendation_enabled: bool (v3.4.0+)
       - audit_hardening_enabled: bool (v3.4.1+)
       - reco_rule_id_aware_enabled: bool (v3.4.2+)
@@ -1066,6 +1220,8 @@ def get_degradation_report() -> Dict[str, Any]:
       - contract_versioned_enabled: bool (v3.6.0+)
       - reco_8tier_aware_enabled: bool (v3.6.0+; content check on
         RECOMMENDATION_ENUM plus symbol check on reco_normalize side)
+      - asset_class_scoring_enabled: bool (v3.7.0+; True when
+        core.scoring exposes the v5.7.3 asset-class functions)
 
     Returns:
         Dict[str, Any]: The degradation report.
@@ -1083,6 +1239,10 @@ def get_degradation_report() -> Dict[str, Any]:
     # v3.6.0 Phase G: track contract-version-marker surface (core.scoring side).
     contract_version_present = {
         sym: hasattr(_core_scoring, sym) for sym in _CONTRACT_VERSION_SYMBOLS
+    }
+    # v3.7.0 Phase D: track asset-class scoring surface (core.scoring side).
+    asset_class_present = {
+        sym: hasattr(_core_scoring, sym) for sym in _ASSET_CLASS_SCORING_SYMBOLS
     }
 
     if _reco_normalize is not None:
@@ -1118,6 +1278,10 @@ def get_degradation_report() -> Dict[str, Any]:
     # v3.6.0 Phase G: missing 8-tier-vocabulary list.
     missing_reco_8tier = [
         sym for sym, ok in reco_8tier_present.items() if not ok
+    ]
+    # v3.7.0 Phase D: missing asset-class-scoring list.
+    missing_asset_class_scoring = [
+        sym for sym, ok in asset_class_present.items() if not ok
     ]
 
     # v3.5.0 Phase G: surface actual resolved threshold values for ops
@@ -1199,6 +1363,8 @@ def get_degradation_report() -> Dict[str, Any]:
         "contract_versioned_symbols": contract_version_present,
         # v3.6.0 Phase G: 8-tier-vocabulary presence map.
         "reco_8tier_symbols": reco_8tier_present,
+        # v3.7.0 Phase D: asset-class scoring presence map.
+        "asset_class_scoring_symbols": asset_class_present,
         # v3.5.0 Phase G: actual resolved threshold values.
         "risk_thresholds": risk_thresholds_resolved,
         "confidence_thresholds": confidence_thresholds_resolved,
@@ -1224,6 +1390,8 @@ def get_degradation_report() -> Dict[str, Any]:
         "missing_contract_versioned": missing_contract_versioned,
         # v3.6.0 Phase G: missing 8-tier-vocabulary list.
         "missing_reco_8tier": missing_reco_8tier,
+        # v3.7.0 Phase D: missing asset-class-scoring list.
+        "missing_asset_class_scoring": missing_asset_class_scoring,
         "view_aware_recommendation_enabled": (
             len(missing_view) == 0
             and "recommendation_from_views" in reco_present
@@ -1238,6 +1406,8 @@ def get_degradation_report() -> Dict[str, Any]:
         "contract_versioned_enabled": len(missing_contract_versioned) == 0,
         # v3.6.0 Phase G: 8-tier-vocabulary enabled flag (content + symbol check).
         "reco_8tier_aware_enabled": reco_8tier_aware_enabled,
+        # v3.7.0 Phase D: asset-class-scoring enabled flag.
+        "asset_class_scoring_enabled": len(missing_asset_class_scoring) == 0,
     }
 
 
@@ -1404,6 +1574,41 @@ def is_reco_8tier_aware() -> bool:
     return get_degradation_report().get("reco_8tier_aware_enabled", False)
 
 
+def is_asset_class_aware() -> bool:
+    """
+    v3.7.0 Phase C: Quick boolean check: does the deployed
+    core.scoring expose the v5.7.3 asset-class scoring surface?
+
+    Returns True when core.scoring exposes ALL of:
+      - _asset_class_for_scoring   (classifies a row as BANK / REIT /
+                                    FUND / EQUITY for scoring purposes)
+      - _reit_yield_value          (hump-shaped REIT dividend-yield
+                                    valuation curve)
+      - _asset_class_aware_scoring_enabled  (the SCORING_ASSET_CLASS_AWARE
+                                            env master switch)
+
+    Mirror of is_view_aware(), is_audit_hardened(),
+    is_reco_rule_id_aware(), is_cascade_bridged(), is_bucket_aligned(),
+    is_contract_versioned(), is_reco_8tier_aware(). A False result is
+    not a fatal degradation; the bridge function is unaffected.
+
+    A False from this helper while is_bucket_aligned() is True means
+    the stack has the canonical bucket surface but is on pre-v5.7.3
+    core.scoring -- banks and REITs are still being scored with the
+    generic equity multiples (P/S, PEG, EV/EBITDA) and the debt/equity
+    quality penalty that v5.7.3 removes for those asset classes.
+
+    Note: this is a SYMBOL-presence check on core.scoring only. It
+    confirms the asset-class functions exist; it does not assert the
+    SCORING_ASSET_CLASS_AWARE env switch is ON at runtime (that switch
+    defaults ON, and when OFF the functions are still present so this
+    helper still returns True -- bank/REIT rows simply score identically
+    to equity rows). Inspect get_canonical_state() for the live
+    env-toggle state when that distinction matters.
+    """
+    return get_degradation_report().get("asset_class_scoring_enabled", False)
+
+
 # =============================================================================
 # Deprecation warnings (preserved from prior versions)
 # =============================================================================
@@ -1544,6 +1749,8 @@ __all__ = [
     # v3.6.0 Phase F: contract-version + 8-tier-vocabulary helpers
     "is_contract_versioned",
     "is_reco_8tier_aware",
+    # v3.7.0 Phase C: asset-class-scoring awareness helper
+    "is_asset_class_aware",
     # v3.6.0 Phase B: contract-version-marker re-exports
     "_ENGINE_CONTRACT_VERSION",
     "_RECO_NORMALIZE_CONTRACT_VERSION",
