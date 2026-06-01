@@ -76,6 +76,61 @@ v5.7.2 — confidence-penalty neutral point (recommendation-collapse fix):
   is a calibration parameter — confirm the live recommendation distribution
   spreads sensibly, and treat label CORRECTNESS as still pending a ground-truth
   backtest.
+
+v5.7.3 — asset-class-aware valuation & quality (banks / REITs); contract-stable:
+  Problem (external audits): banks and REITs are scored with the SAME generic
+  equity multiples and the SAME debt/equity quality penalty as ordinary
+  companies. Both are wrong. A bank's structural leverage — and the
+  _normalize_debt_to_equity ">10 means percent" heuristic, which misfires on a
+  legitimate bank D/E — makes the debt/equity quality term pure noise for banks.
+  EV/EBITDA is undefined for financials and "sales" is not a meaningful
+  denominator for a bank, so P/S and EV/EBITDA misprice them. A REIT's earnings
+  are depressed by non-cash depreciation, so P/E is misleading; its NAV /
+  payout-coverage profile is far better read through P/B and a (sanity-capped)
+  dividend yield.
+
+  Fix (this file only; NO schema/contract change):
+    1. New _asset_class_for_scoring(row) -> BANK / REIT / FUND / EQUITY.
+       Detection mirrors the data_engine_v2 investability-gate vocabulary:
+       pooled-vehicle (FUND) tokens on asset_class + EXACT fund-industry labels
+       are checked FIRST (so a sector ETF that merely names a bank/REIT is never
+       scored with single-name multiples); then REIT ("reit" in
+       industry/asset_class); then BANK ("bank" in industry/asset_class); else
+       EQUITY. Missing asset_class AND industry -> EQUITY (the v5.7.2 path), so
+       the failure mode is "does nothing", never a misclassification.
+    2. compute_quality_score: for BANK and REIT the debt/equity component
+       (weight 0.10) is dropped from the financial-quality blend; ROE/ROA/
+       margins and the data-quality proxy are unchanged.
+    3. compute_valuation_score: the fixed 5-anchor list becomes asset-class
+       aware. BANK -> {P/E, P/B}; REIT -> {P/B, dividend-yield via the new
+       hump-shaped _reit_yield_value}; EQUITY/FUND -> the ORIGINAL five anchors
+       in the ORIGINAL order. Component weights, ROI/upside legs, fallbacks, and
+       clamps downstream are untouched, so EQUITY/FUND rows are byte-identical.
+    4. New _asset_class_aware_scoring_enabled() (env SCORING_ASSET_CLASS_AWARE,
+       default ON). When OFF, every row resolves to EQUITY and the output is
+       byte-identical to v5.7.2 — for A/B and instant rollback.
+
+  HARD CEILING (explicit): this does NOT add NIM / NPL / efficiency-ratio
+  (banks) or FFO / AFFO (REITs). Those need provider-sourced fields that do not
+  exist in the current quote/fundamentals payload; they are separate provider
+  work. This change only STOPS the metrics that provably MIS-score banks/REITs
+  and uses the right multiples within the existing field set.
+
+  UNCHANGED: every recommendation threshold and risk rail; the v5.7.2
+  confidence-penalty neutral point; all scoring of EQUITY and FUND rows; and the
+  OUTPUT CONTRACT — no AssetScores field added, removed, or reordered, so engine
+  v5.79.2 and schema_registry remain compatible with no coordinated change.
+
+  __version__ -> "5.7.3" (RECOMMENDATION_SOURCE_TAG -> "scoring.py v5.7.3",
+  SCORING_SCHEMA_VERSION -> "5.7.3"; [v5.7.2 *] log prefixes roll to [v5.7.3 *]).
+  _ENGINE_CONTRACT_VERSION -> "5.79.2" (diagnostic marker only; the producer/
+  consumer field set is unchanged — the engine's 8 investability-gate columns
+  are computed DOWNSTREAM of scoring, not by scoring).
+
+  CALIBRATION NOTE (carried forward): the v5.7.2 neutral point and now these
+  asset-class curves are calibration parameters. Confirm the live recommendation
+  distribution still spreads sensibly per asset class, and treat label
+  CORRECTNESS as still pending a ground-truth backtest.
 ================================================================================
 """
 
@@ -97,12 +152,12 @@ logger.addHandler(logging.NullHandler())
 # Version / Canonical contract
 # =============================================================================
 
-__version__ = "5.7.2"
+__version__ = "5.7.3"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
 
-_ENGINE_CONTRACT_VERSION = "5.77.17"
+_ENGINE_CONTRACT_VERSION = "5.79.2"
 
 _RECO_NORMALIZE_CONTRACT_VERSION = "8.0.0"
 
@@ -173,6 +228,12 @@ def _nullable_overall_enabled() -> bool:
 
 def _structured_reason_enabled() -> bool:
     return _env_text("TFB_SCORING_REASON_FORMAT", "structured").lower() != "legacy"
+
+
+def _asset_class_aware_scoring_enabled() -> bool:
+    # v5.7.3: master switch for bank/REIT-aware valuation & quality. Default ON.
+    # When OFF, every row scores via the equity path (byte-identical to v5.7.2).
+    return _env_bool("SCORING_ASSET_CLASS_AWARE", True)
 
 
 def _strict_bucket_logs_enabled() -> bool:
@@ -1245,6 +1306,84 @@ def derive_forecast_patch(row: Mapping[str, Any], forecasts: ForecastParameters)
 
 
 # =============================================================================
+# Asset-class detection (v5.7.3)
+# =============================================================================
+
+# Pooled-vehicle (FUND) tokens and exact industry labels mirror the
+# data_engine_v2 investability-gate vocabulary so the gate and scoring classify
+# the same rows the same way. asset_class is matched as a SUBSTRING; industry is
+# matched EXACTLY (an equity in "Commodity Trading" must not be mistaken for a
+# pooled vehicle — the same rule the gate's industry-exact exemption uses).
+_SCORING_FUND_ASSET_CLASS_TOKENS: Tuple[str, ...] = (
+    "etf",
+    "fund",
+    "index",
+)
+_SCORING_FUND_INDUSTRY_LABELS: frozenset = frozenset({
+    "etf",
+    "fund",
+    "mutual fund",
+    "closed-end fund",
+    "exchange traded fund",
+    "exchange-traded fund",
+    "money market fund",
+    "index fund",
+})
+
+
+def _asset_class_for_scoring(row: Mapping[str, Any]) -> str:
+    """v5.7.3: coarse asset-class label used ONLY to choose which valuation
+    multiples and quality components are meaningful. Returns one of
+    BANK / REIT / FUND / EQUITY.
+
+    Detection is deliberately conservative — a row only leaves the default
+    EQUITY path when its asset_class or industry clearly identifies it, and a
+    row with neither field present stays EQUITY (the v5.7.2 path). Pooled
+    vehicles (FUND) are detected FIRST so a sector ETF whose name mentions a
+    bank or REIT is never scored with single-name bank/REIT multiples.
+    """
+    asset_class = _safe_str(_get(row, "asset_class")).lower()
+    industry = _safe_str(_get(row, "industry", "industry_name", "sector_industry")).lower()
+
+    # 1) Pooled vehicles -> FUND (guards against bank/REIT misrouting).
+    if any(tok in asset_class for tok in _SCORING_FUND_ASSET_CLASS_TOKENS):
+        return "FUND"
+    if industry in _SCORING_FUND_INDUSTRY_LABELS:
+        return "FUND"
+
+    # 2) REIT (checked before BANK; it is the more specific label).
+    if "reit" in industry or "reit" in asset_class:
+        return "REIT"
+
+    # 3) Bank / lender.
+    if "bank" in industry or "bank" in asset_class:
+        return "BANK"
+
+    return "EQUITY"
+
+
+def _reit_yield_value(y: Optional[float]) -> Optional[float]:
+    """v5.7.3: hump-shaped valuation contribution from a REIT's dividend yield.
+    A moderate, well-covered yield (~4-8%) is the sweet spot for an income
+    vehicle; a near-zero yield is unattractive, and a very high yield usually
+    signals a distressed price or an unsustainable payout (a "yield trap"), so
+    the curve rises then falls. `y` is a fraction (0.04 == 4%); a None yield is
+    returned as None so it simply drops out of the valuation anchors.
+    """
+    if y is None or y < 0:
+        return None
+    if y <= 0.04:
+        val = 0.30 + (y / 0.04) * (0.90 - 0.30)           # 0.30 -> 0.90 across 0-4%
+    elif y <= 0.08:
+        val = 0.90                                         # healthy 4-8% plateau
+    elif y <= 0.14:
+        val = 0.90 - ((y - 0.08) / 0.06) * (0.90 - 0.30)   # 0.90 -> 0.30 across 8-14%
+    else:
+        val = 0.30 - ((y - 0.14) / 0.36) * (0.30 - 0.10)   # decline toward a floor
+    return _clamp(val, 0.10, 0.90)
+
+
+# =============================================================================
 # Component scoring
 # =============================================================================
 
@@ -1296,6 +1435,13 @@ def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
     net_margin = _as_fraction(_get(row, "profit_margin", "net_margin", "profitMargins"))
     de = _normalize_debt_to_equity(_get(row, "debt_to_equity", "debt_equity", "debtToEquity"))
 
+    # v5.7.3: for banks and REITs the debt/equity term is not a meaningful
+    # quality signal (structural leverage; the >10 percent-normalization
+    # heuristic also misfires on legitimate bank ratios), so it is dropped from
+    # the financial blend for those classes. Equity/Fund rows are unaffected.
+    _ac = _asset_class_for_scoring(row) if _asset_class_aware_scoring_enabled() else "EQUITY"
+    _de_applies = _ac not in {"BANK", "REIT"}
+
     has_any_financial = any(x is not None for x in (roe, roa, op_margin, net_margin, de))
     dq_label = str(_get(row, "data_quality") or "").strip().upper()
     dq_is_weak = dq_label in {"", "POOR", "STALE", "MISSING", "ERROR", "UNKNOWN"}
@@ -1314,7 +1460,7 @@ def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
         fin_parts.append((0.22, _clamp((op_margin - 0.05) / 0.35, 0.0, 1.0)))
     if net_margin is not None:
         fin_parts.append((0.18, _clamp((net_margin - 0.02) / 0.28, 0.0, 1.0)))
-    if de is not None:
+    if de is not None and _de_applies:
         fin_parts.append((0.10, _clamp(1.0 - (de / 3.0), 0.0, 1.0)))
 
     if fin_parts:
@@ -1387,15 +1533,32 @@ def compute_valuation_score(row: Mapping[str, Any]) -> Optional[float]:
     peg = _get_float(row, "peg_ratio", "peg")
     ev = _get_float(row, "ev_ebitda", "ev_to_ebitda")
 
-    anchors = [
-        v for v in (
+    # v5.7.3: asset-class-aware multiple anchors. Banks use only P/E and P/B
+    # (P/S and EV/EBITDA are not meaningful for financials); REITs use P/B and a
+    # hump-shaped dividend yield (P/E is depressed by non-cash depreciation).
+    # Equity and Fund rows keep the original five anchors in the original order,
+    # so their valuation score is byte-identical to v5.7.2.
+    _ac_val = _asset_class_for_scoring(row) if _asset_class_aware_scoring_enabled() else "EQUITY"
+    if _ac_val == "BANK":
+        anchor_vals: Tuple[Optional[float], ...] = (
+            _low_is_good(pe, 8.0, 35.0),
+            _low_is_good(pb, 0.8, 3.0),
+        )
+    elif _ac_val == "REIT":
+        _reit_y = _sanitize_dividend_yield(_get(row, "dividend_yield", "yield"))
+        anchor_vals = (
+            _low_is_good(pb, 0.6, 2.5),
+            _reit_yield_value(_reit_y),
+        )
+    else:
+        anchor_vals = (
             _low_is_good(pe, 8.0, 35.0),
             _low_is_good(pb, 0.8, 6.0),
             _low_is_good(ps, 1.0, 10.0),
             _low_is_good(peg, 0.8, 4.0),
             _low_is_good(ev, 6.0, 25.0),
-        ) if v is not None
-    ]
+        )
+    anchors = [v for v in anchor_vals if v is not None]
     anchor_avg = (sum(anchors) / len(anchors)) if anchors else None
 
     upside_n = _roi_norm(upside, 0.50)
@@ -2342,7 +2505,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             ) if val is None
         ]
         logger.warning(
-            "[v5.7.2 INSUFFICIENT] symbol=%s missing=%s",
+            "[v5.7.3 INSUFFICIENT] symbol=%s missing=%s",
             _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
             ",".join(missing_components),
         )
@@ -2485,7 +2648,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     scoring_errors = _dedupe_preserving_order(scoring_errors)
 
     logger.info(
-        "[v5.7.2 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
+        "[v5.7.3 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
         _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
         overall,
         risk,
