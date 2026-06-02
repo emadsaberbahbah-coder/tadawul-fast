@@ -2,7 +2,7 @@
 # core/sheets/schema_registry.py
 """
 ================================================================================
-Schema Registry — v2.12.0
+Schema Registry — v2.13.0
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -17,7 +17,61 @@ exist; no network calls; import-safe.
 
 (The verbose pre-v2.12.0 cross-module changelog is condensed in this working
 copy; ALL code, validation logic, and per-column notes are preserved verbatim
-except where the v2.12.0 changelog below states otherwise.)
+except where the v2.13.0 / v2.12.0 changelogs below state otherwise.)
+
+================================================================================
+v2.13.0  --  ENGINE-V5.79.2-ALIGNMENT  (adds the 8-column Investability Gate so
+            the registry mirrors the ACCEPTED data_engine_v2 v5.79.2 instrument
+            contract: 115 canonical keys/headers, Top10 118)
+================================================================================
+The registry was aligned to engine v5.77.17 (107 cols, see v2.12.0 below) but
+the ACCEPTED engine is v5.79.2, whose v5.78.0 Investability Gate appended 8
+decision-readiness columns at positions 108-115. The engine emits all 8 on every
+row, but because they were absent here they were projected OUT of every row and
+never reached the sheet (the sheet stopped at "Overall Penalty Factor"). This
+release adds them, order-exact and header-exact against data_engine_v2 v5.79.2
+INSTRUMENT_CANONICAL_KEYS / INSTRUMENT_CANONICAL_HEADERS (verified on disk).
+
+1. NEW COLUMNS (8), appended AFTER forecast_source as the FINAL canonical block
+   (positions 108-115), group "Investability". Keys/headers/value-types:
+     data_quality_score          "Data Quality Score"          float  0-100 POINTS
+     forecast_reliability_score   "Forecast Reliability Score"  float  0-100 POINTS
+     provider_engine_conflict     "Provider/Engine Conflict"    str    'TRUE'/'FALSE'
+     conflict_type                "Conflict Type"               str
+     final_decision_basis         "Final Decision Basis"        str
+     investability_status         "Investability Status"        str    INVESTABLE /
+                                                                 WATCHLIST / BLOCKED
+     final_action                 "Final Action"                str    INVEST / WATCH /
+                                                                 DO_NOT_INVEST
+     block_reason                 "Block Reason"                str
+   -> instrument 107 -> 115, Top10 110 -> 118.
+
+   VALUE-TYPE NOTES (verified against the engine's gate logic):
+     - data_quality_score / forecast_reliability_score are 0-100 POINTS, NOT
+       fractions (like overall_score). They must NOT be percent-formatted; the
+       engine excludes them from DECIMAL_FRACTION_FIELDS. Both are rounded to 1
+       decimal by the engine.
+     - provider_engine_conflict holds the TEXT 'TRUE' / 'FALSE' (the engine sets
+       the literal strings), NOT a Python bool -> dtype "str".
+     - A provider/engine conflict is FLAGGED only; it does NOT override the
+       engine recommendation (v5.79.2). The engine recommendation always drives
+       investability_status.
+
+2. NEW EXPORT: INVESTABILITY_GATE_COLUMN_KEYS = the 8 keys above, plus a matching
+   required-column validation check on instrument sheets AND Top_10_Investments
+   (mirrors the existing VIEW / INSIGHTS / DECISION / CANDLESTICK / CANONICAL_RECO
+   / SCORING_V574 / FORECAST_SOURCE enforcement). All prior required-column
+   checks are retained unchanged.
+
+3. BUMP: SCHEMA_VERSION 2.12.0 -> 2.13.0; _CANONICAL_INSTRUMENT_COLS 107 -> 115;
+   _TOP10_TOTAL_COLS 110 -> 118.
+
+Deploy AFTER (or together with) data_engine_v2 v5.79.2 (this registry now mirrors
+that engine's contract). After deploy, widen the sheets to 115 by re-running
+"Update Current Headers" (Apps Script updateHeadersOnly_ -> applyHeadersFromSchema_)
+AND/OR the Python ensure_headers_and_formatting() path, then refresh so the 8 new
+columns populate. The Apps Script 00_Config.gs HEADER_TO_KEY (Investability group,
+v1.11.0) must also be live so the GAS writer recognises the 8 new headers.
 
 ================================================================================
 v2.12.0  --  ENGINE-V5.77.17-ALIGNMENT  (the registry now MIRRORS the accepted
@@ -119,6 +173,8 @@ __all__ = [
     "SCORING_V574_COLUMN_KEYS",
     # v2.12.0: final canonical key (engine v5.77.17)
     "FORECAST_SOURCE_COLUMN_KEYS",
+    # v2.13.0: 8 investability-gate keys (engine v5.79.2)
+    "INVESTABILITY_GATE_COLUMN_KEYS",
     "SCHEMA_VALIDATED_OK",
     "SCHEMA_VALIDATION_ERRORS",
     "list_sheets",
@@ -136,7 +192,7 @@ __all__ = [
     "validate_schema_registry",
 ]
 
-SCHEMA_VERSION = "2.12.0"
+SCHEMA_VERSION = "2.13.0"
 # TFB module-version convention alias (mirrors scoring v5.6.0,
 # data_engine_v2 v5.75.0, enriched_quote v4.7.0, reco_normalize v7.2.0,
 # insights_builder v7.0.0, scoring_engine v3.4.4, top10_selector v4.11.0,
@@ -247,16 +303,42 @@ SCORING_V574_COLUMN_KEYS: Tuple[str, ...] = (
 )
 
 
-# v2.12.0: the engine's 107th / final canonical key. Produced by
+# v2.12.0: the engine's 107th / final pre-gate canonical key. Produced by
 # core.data_engine_v2 v5.77.17 (added v5.77.1, elevated to a required
 # canonical key in v5.77.3 _INSTRUMENT_CANONICAL_REQUIRED_KEYS). Records
 # forecast provenance: "provider_target" (engine honoured an upstream
 # analyst target), "phase_ii_synthetic" (engine synthesized the forecast),
 # or "fallback" (engine fallback path created it). Empty/absent when no
-# forecast was produced. Appended as the FINAL canonical column so all
-# prior positional indices are preserved.
+# forecast was produced. Appended after the candlestick block so all prior
+# positional indices are preserved.
 FORECAST_SOURCE_COLUMN_KEYS: Tuple[str, ...] = (
     "forecast_source",
+)
+
+
+# v2.13.0: Investability Gate column keys (decision-readiness layer).
+# Produced by core.data_engine_v2 v5.78.0+ (gate logic) and present on every
+# row emitted by the accepted engine v5.79.2. Appended AFTER forecast_source
+# as the FINAL canonical block (positions 108-115). Aligned with the engine's
+# INSTRUMENT_CANONICAL_KEYS / INSTRUMENT_CANONICAL_HEADERS and with
+# 00_Config.gs v1.11.0 HEADER_TO_KEY (Investability group) + AUDIT-16.
+#
+# VALUE-TYPE NOTES (verified against the engine gate logic):
+#   - data_quality_score / forecast_reliability_score are 0-100 POINTS (NOT
+#     fractions, like overall_score) -> NOT percent-formatted. Rounded to 1
+#     decimal by the engine.
+#   - provider_engine_conflict holds the TEXT 'TRUE' / 'FALSE' (the engine sets
+#     the literal strings), NOT a Python bool -> dtype "str".
+#   - A conflict is FLAGGED only; it does NOT override the engine (v5.79.2).
+INVESTABILITY_GATE_COLUMN_KEYS: Tuple[str, ...] = (
+    "data_quality_score",
+    "forecast_reliability_score",
+    "provider_engine_conflict",
+    "conflict_type",
+    "final_decision_basis",
+    "investability_status",
+    "final_action",
+    "block_reason",
 )
 
 
@@ -286,10 +368,10 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
 
 # Canonical column counts (centralized so the docstring, validation code,
 # and any downstream sanity-checkers agree on a single source of truth).
-# v2.12.0: bumped 106 -> 107 instrument, 109 -> 110 Top10 for the new
-# forecast_source column (engine v5.77.17), appended at end.
-_CANONICAL_INSTRUMENT_COLS = 107  # 106 + 1 forecast_source (v2.12.0)
-_TOP10_TOTAL_COLS = 110           # 107 + 3 Top10 extras
+# v2.13.0: bumped 107 -> 115 instrument, 110 -> 118 Top10 for the 8 new
+# investability-gate columns (engine v5.79.2), appended at end.
+_CANONICAL_INSTRUMENT_COLS = 115  # 107 + 8 investability gate (v2.13.0)
+_TOP10_TOTAL_COLS = 118           # 115 + 3 Top10 extras
 _INSIGHTS_ANALYSIS_COLS = 7
 _DATA_DICTIONARY_COLS = 9
 
@@ -388,16 +470,18 @@ def _sanitize_sheet(spec: SheetSpec) -> SheetSpec:
 
 
 # -----------------------------
-# Canonical columns (106 in v2.10.0+; was 99 in v2.9.0)
+# Canonical columns (115 in v2.13.0+; was 107 in v2.12.0)
 # -----------------------------
 
 def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     """
-    Canonical 107 columns used by:
+    Canonical 115 columns used by:
       Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds, My_Portfolio
 
-    v2.12.0: realigned to data_engine_v2 v5.77.17's INSTRUMENT_CANONICAL_KEYS
-    (verified order-exact). Emit order and running totals:
+    v2.13.0: realigned to data_engine_v2 v5.79.2's INSTRUMENT_CANONICAL_KEYS
+    (verified order-exact). v2.12.0 mirrored v5.77.17 (107 cols); v5.78.0
+    appended the 8-column Investability Gate at positions 108-115. Emit order
+    and running totals:
       Identity (8)         ->   8
       Price (10)           ->  18
       Liquidity (6)        ->  24
@@ -416,19 +500,21 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
       Canonical Reco (2)   ->  95   (recommendation_source, then priority_band)
       Scoring v5.74 (6)    -> 101   (remaining scoring/provenance fields)
       Candlestick (5)      -> 106   (engine places candlestick AFTER scoring)
-      Forecast Source (1)  -> 107   (added v2.12.0; engine's final canonical key)
+      Forecast Source (1)  -> 107   (added v2.12.0; engine's pre-gate final key)
+      Investability (8)    -> 115   (added v2.13.0; engine v5.79.2 decision-
+                                     readiness gate, positions 108-115)
 
     IMPORTANT:
     - Keep keys stable. The COLUMN ORDER (keys + headers) is the contract and
-      now mirrors data_engine_v2 v5.77.17 exactly; do not reorder without
+      now mirrors data_engine_v2 v5.79.2 exactly; do not reorder without
       re-checking against that engine.
     - `group` labels are descriptive field metadata only. As of v2.12.0 the
       Canonical-Reco and Scoring-v5.74 groups are physically interleaved to
       match the engine's key order; this is intentional and does not affect
       projection or column order.
-    - Add only at the END (after forecast_source) to preserve compatibility,
-      OR bump SCHEMA_VERSION AND coordinate with the engine + core.scoring +
-      core.reco_normalize + Apps Script.
+    - Add only at the END (after the Investability Gate block) to preserve
+      compatibility, OR bump SCHEMA_VERSION AND coordinate with the engine +
+      core.scoring + core.reco_normalize + Apps Script.
     """
     cols: List[ColumnSpec] = []
 
@@ -660,15 +746,16 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "STRONG_BUY. (core.scoring v5.2.5)",
     )
 
-    # ----- v2.12.0: tail emitted in EXACT data_engine_v2 v5.77.17 key order -----
+    # ----- v2.12.0: tail emitted in EXACT data_engine_v2 key order -----
     # Engine order after Insights (pos 90): Decision pair, then the
     # scoring/provenance block (provider_rating, recommendation_source,
     # recommendation_priority_band, then the remaining Scoring-v5.74 fields),
-    # then the candlestick block, then forecast_source. The `group` labels
-    # ("Decision" / "Scoring v5.74" / "Canonical Reco" / "Candlestick") are
-    # retained as descriptive field metadata even though Canonical-Reco and
-    # Scoring-v5.74 are now physically interleaved — group is descriptive only
-    # and does not affect column order or row projection.
+    # then the candlestick block, then forecast_source, then (v2.13.0) the
+    # Investability Gate block. The `group` labels ("Decision" / "Scoring v5.74"
+    # / "Canonical Reco" / "Candlestick" / "Investability") are retained as
+    # descriptive field metadata even though Canonical-Reco and Scoring-v5.74
+    # are now physically interleaved — group is descriptive only and does not
+    # affect column order or row projection.
 
     # Decision Matrix (2) -> total 92  (added v2.7.0)
     add(
@@ -835,7 +922,7 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "confirmations. Empty when no patterns in the window.",
     )
 
-    # Forecast Source (1) -> total 107  (v2.12.0; engine's final canonical key)
+    # Forecast Source (1) -> total 107  (v2.12.0; engine's pre-gate final key)
     add(
         "Forecast", "Forecast Source", "forecast_source",
         "str", "text", False, "model/system",
@@ -843,9 +930,92 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
         "'provider_target' (engine honoured an upstream analyst target), "
         "'phase_ii_synthetic' (engine synthesized the forecast), or "
         "'fallback' (engine fallback path created it). Empty when no forecast "
-        "was produced for the row. The engine's 107th / final canonical key "
-        "(added v5.77.1; elevated to a required canonical key in v5.77.3 "
-        "_INSTRUMENT_CANONICAL_REQUIRED_KEYS).",
+        "was produced for the row. The engine's 107th / final pre-gate "
+        "canonical key (added v5.77.1; elevated to a required canonical key "
+        "in v5.77.3 _INSTRUMENT_CANONICAL_REQUIRED_KEYS).",
+    )
+
+    # ----- v2.13.0: Investability Gate (8) -> total 115 -----
+    # Engine v5.79.2 (v5.78.0 gate) appends these AFTER forecast_source as the
+    # FINAL canonical block (positions 108-115), group "Investability".
+    # data_quality_score and forecast_reliability_score are 0-100 POINTS (NOT
+    # fractions, like overall_score) -> do NOT percent-format; the engine rounds
+    # them to 1 decimal. provider_engine_conflict holds the TEXT 'TRUE'/'FALSE'
+    # (the engine sets the literal strings), NOT a bool -> dtype "str". A
+    # provider/engine conflict is FLAGGED only; it does NOT override the engine
+    # recommendation (v5.79.2).
+    add(
+        "Investability", "Data Quality Score", "data_quality_score",
+        "float", "0.0", False, "model",
+        "Weighted data-completeness score 0-100 (POINTS, not a fraction) across "
+        "price, 52W range, volume, fundamentals, volatility, forecast, and "
+        "overall_score buckets. D/E + FCF weights apply only to asset classes "
+        "that support them (they drop out of both numerator and denominator "
+        "otherwise). Set by core.data_engine_v2 v5.78.0+ investability gate; "
+        "drives the BLOCKED hard-floor and WATCHLIST investable-minimum "
+        "thresholds. Rounded to 1 decimal.",
+    )
+    add(
+        "Investability", "Forecast Reliability Score", "forecast_reliability_score",
+        "float", "0.0", False, "model",
+        "Forecast confidence rebased to 0-100 (POINTS) then penalised for weak "
+        "provenance: missing price (-60), missing forecast (-40), capped "
+        "provider targets, dropped/rejected targets, and synthetic / fallback / "
+        "momentum opportunity_source or forecast_source. Clamped to 0-100, "
+        "rounded to 1 decimal. Set by core.data_engine_v2 v5.78.0+ "
+        "investability gate.",
+    )
+    add(
+        "Investability", "Provider/Engine Conflict", "provider_engine_conflict",
+        "str", "text", False, "model",
+        "TEXT flag 'TRUE' / 'FALSE' (NOT a bool). TRUE when the provider analyst "
+        "direction and the engine recommendation direction disagree (provider "
+        "bullish vs engine HOLD/TRIM, or provider cautious vs engine ADD). "
+        "v5.79.1 compares canonical DIRECTION so a TEXT provider_rating "
+        "(BUY / HOLD / SELL / ...) is handled (the prior numeric-only "
+        "comparison left this FALSE for every row). A conflict is FLAGGED only "
+        "and does NOT override the engine (v5.79.2).",
+    )
+    add(
+        "Investability", "Conflict Type", "conflict_type",
+        "str", "text", False, "model",
+        "Human-readable conflict descriptor paired with provider_engine_conflict: "
+        "'' (no comparison possible), 'Aligned', 'Provider bullish / engine "
+        "cautious', or 'Provider cautious / engine constructive'.",
+    )
+    add(
+        "Investability", "Final Decision Basis", "final_decision_basis",
+        "str", "text", False, "model",
+        "What drove the final action: 'Engine' normally, or 'Engine (provider "
+        "conflict flagged)' when provider_engine_conflict is TRUE. The engine "
+        "recommendation always drives investability_status; nothing overrides "
+        "it (v5.79.2).",
+    )
+    add(
+        "Investability", "Investability Status", "investability_status",
+        "str", "text", False, "model",
+        "Decision-readiness verdict: 'INVESTABLE', 'WATCHLIST', or 'BLOCKED'. "
+        "BLOCKED on missing price / missing forecast / data quality below the "
+        "hard floor. WATCHLIST on an excluded recommendation family, HOLD, "
+        "moderate data quality, or incomplete fundamentals (D/E + FCF where the "
+        "asset class requires them). INVESTABLE otherwise. Set by "
+        "core.data_engine_v2 v5.78.0+ investability gate.",
+    )
+    add(
+        "Investability", "Final Action", "final_action",
+        "str", "text", False, "model",
+        "Actionable verdict paired with investability_status: 'INVEST' "
+        "(INVESTABLE), 'WATCH' (WATCHLIST), or 'DO_NOT_INVEST' (BLOCKED or "
+        "excluded family). NOT financial advice.",
+    )
+    add(
+        "Investability", "Block Reason", "block_reason",
+        "str", "text", False, "model",
+        "Short explanation when investability_status is not INVESTABLE, e.g. "
+        "'Missing current price', 'No forecast available', 'Data quality below "
+        "floor (NN)', 'Engine recommends reduce', 'Engine neutral (HOLD)', "
+        "'Moderate data quality (NN)', 'Incomplete fundamentals (D/E, FCF)'. "
+        "Empty when INVESTABLE.",
     )
 
     return tuple(cols)
@@ -1026,7 +1196,7 @@ _RAW_SCHEMA_REGISTRY: Dict[str, SheetSpec] = {
         columns=_sanitize_columns(
             "Top_10_Investments",
             "instrument_table",
-            _CANONICAL_COLUMNS + _top10_extra_columns(),  # 110 columns in v2.12.0+
+            _CANONICAL_COLUMNS + _top10_extra_columns(),  # 118 columns in v2.13.0+
             enforce_symbol_first=True,
         ),
         notes="Criteria-driven selection. Canonical columns + Top10 extras.",
@@ -1382,13 +1552,22 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
                     f"_preserve_scoring_provenance()."
                 )
             # v2.12.0+: forecast_source required for schema alignment with
-            # core.data_engine_v2 v5.77.17 (107th / final canonical key).
+            # core.data_engine_v2 v5.77.17 (107th canonical key).
             missing_forecast_source = [k for k in FORECAST_SOURCE_COLUMN_KEYS if k not in spec_keys]
             if missing_forecast_source:
                 raise ValueError(
                     f"[{sheet_name}] Missing required forecast source column(s): "
                     f"{missing_forecast_source}. core.data_engine_v2 v5.77.17 "
-                    f"writes this as the final canonical key."
+                    f"writes this as the final pre-gate canonical key."
+                )
+            # v2.13.0+: investability gate required for alignment with
+            # core.data_engine_v2 v5.79.2 (8 columns, positions 108-115).
+            missing_investability_gate = [k for k in INVESTABILITY_GATE_COLUMN_KEYS if k not in spec_keys]
+            if missing_investability_gate:
+                raise ValueError(
+                    f"[{sheet_name}] Missing required investability gate column(s): "
+                    f"{missing_investability_gate}. core.data_engine_v2 v5.78.0+ "
+                    f"writes these as the decision-readiness layer (positions 108-115)."
                 )
 
         if sheet_name == "Top_10_Investments":
@@ -1439,6 +1618,13 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
                 raise ValueError(
                     f"[Top_10_Investments] Missing required forecast source column(s): "
                     f"{missing_forecast_source}."
+                )
+            # v2.13.0+: investability gate required for Top_10_Investments too.
+            missing_investability_gate = [k for k in INVESTABILITY_GATE_COLUMN_KEYS if k not in spec_keys]
+            if missing_investability_gate:
+                raise ValueError(
+                    f"[Top_10_Investments] Missing required investability gate column(s): "
+                    f"{missing_investability_gate}."
                 )
 
         if sheet_name == "Insights_Analysis":
