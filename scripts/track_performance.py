@@ -2,10 +2,72 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.5.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.6.0)
 ===========================================================
 
-Why this revision (v6.5.0 vs v6.4.0)
+Why this revision (v6.6.0 vs v6.5.0)
+-------------------------------------
+INVESTABILITY-GATE CAPTURE + SEGMENTATION. v6.5.0 snapshots the legacy
+signal at entry (recommendation / score / risk / confidence) but NOT the
+investability-gate verdict that data_engine_v2 v5.78+ now emits. So the
+tracker could report "BUY hit 58%" but never "INVESTABLE hit 64% vs
+WATCHLIST 41%" -- which is the ONLY question that validates the gate, and
+the only thing that turns the dashboard's estimated "reliability %" into a
+measured one. v6.6.0 closes that gap, purely additively:
+
+  v6.6.0 A  PerformanceRecord gains four ENTRY-snapshot fields, appended
+       at the END of the field list (defaults => any v6.5.0-serialized
+       row still deserializes; old rows carry blanks):
+         entry_data_quality            (data_quality_score at entry)
+         entry_forecast_reliability    (forecast_reliability_score)
+         entry_investability_status    (INVESTABLE / WATCHLIST / BLOCKED)
+         entry_final_action            (INVEST / WATCH / DO_NOT_INVEST)
+       to_dict / from_sheet_row carry them through JSON, CSV, and Sheets.
+
+  v6.6.0 B  record_from_top10 captures the four gate fields off each
+       Top10 row (engine emits them as canonical snake_case keys). Absent
+       on a pre-gate deploy -> safe zeros/blanks, no behavior change.
+
+  v6.6.0 C  PerformanceStore.HEADERS extended 27 -> 31, the four new
+       columns APPENDED at the end ("Entry Data Quality",
+       "Entry Forecast Reliability", "Entry Investability",
+       "Entry Final Action"). End-placement is mandatory: inserting
+       mid-list would re-map every historical 27-column row when read
+       back. _record_to_row writes the four extra cells in the same order.
+
+  v6.6.0 D  _ensure_headers HARDENED to actually widen an existing sheet.
+       v6.5.0 rewrote the header row only when cell A5 differed from
+       HEADERS[0] ("Record ID", which never changes), so a live
+       Performance_Log would NEVER gain the new columns -- and the values
+       written by _record_to_row at positions 28-31 would be re-read under
+       a stale 27-name header map and silently dropped on the next load.
+       v6.6.0 rewrites the header row whenever the live header differs from
+       HEADERS by length OR content, while seeding the zero summary block +
+       freeze ONLY on a brand-new sheet (so widening never wipes live KPIs).
+
+  v6.6.0 E  PerformanceSummary gains hit_rate_by_investability and
+       performance_by_investability; PerformanceAnalyzer.analyze fills
+       them by grouping matured outcomes by entry_investability_status
+       (win-rate, avg ROI, wins, losses, count per bucket). The
+       --analyze stdout adds a "Win-rate by investability:" line, and the
+       JSON/CSV exports carry the breakdown via summary.to_dict().
+
+  v6.6.0 F  SCRIPT_VERSION 6.5.0 -> 6.6.0 (SERVICE_VERSION follows).
+
+NOT in scope (deliberately): the gate fields are GOVERNANCE inputs, not
+predictions -- this revision measures the gate, it does not change any
+recommendation, forecast, or the engine. A meaningful hit-rate still
+requires matured records (a 1M number needs a month of data; 3M a
+quarter); no code shortens that. The summary SHEET block is intentionally
+left at its v6.5.0 A1:E13 layout (pre-existing region) -- investability
+KPIs surface via analyze() stdout + JSON/CSV, not by extending that block.
+
+[PRESERVED — strictly] All v6.5.0 8-tier vocabulary work and all v6.4.0
+endpoint-canonicalization + hardening. v6.6.0 is purely additive: no
+removals, no renames, no signature changes. Records written by v6.5.0
+load byte-identically (their four gate fields read blank).
+
+Why this revision (v6.5.0 vs v6.4.0)  [PRESERVED BELOW VERBATIM]
 -------------------------------------
 8-TIER RECOMMENDATION VOCABULARY (rebased on v6.4.0's endpoint canonical-
 ization). Closes the last 5-tier vocabulary leak in the Python codebase.
@@ -95,16 +157,16 @@ no removals, no renames. Historical performance logs written by v6.4.0
 deserialize byte-identically; ACCUMULATE/REDUCE/AVOID rows now resolve
 to their correct tier instead of silent HOLD.
 
-Cross-stack alignment (May 2026 v8.0.0 family floor)
+Cross-stack alignment (current floor)
 ----------------------------------------------------
   - core.reco_normalize             v8.0.0
-  - core.scoring                    v5.7.0
-  - core.scoring_engine             v3.6.0
+  - core.scoring                    v5.7.4
+  - core.scoring_engine             v3.7.0
   - core.enriched_quote             v4.7.0
   - core.schemas                    v7.0.0  (Recommendation enum 8-tier
                                               -- canonical authority)
-  - core.sheets.schema_registry     v2.11.0
-  - core.data_engine_v2             v5.76.0
+  - core.sheets.schema_registry     v2.13.0
+  - core.data_engine_v2             v5.79.4  (investability gate, 115 cols)
   - core.investment_advisor_engine  v4.5.0
   - core.analysis.insights_builder  v8.0.1
   - core.analysis.top10_selector    v4.14.0
@@ -112,7 +174,7 @@ Cross-stack alignment (May 2026 v8.0.0 family floor)
   - core.providers.yahoo_fundamentals  v6.3.0
   - core.providers.yahoo_chart         v8.2.0  (no rating surface)
   - core.providers.eodhd               v4.6.0+ (no rating surface)
-  - scripts.track_performance          v6.5.0  (THIS DELIVERY)
+  - scripts.track_performance          v6.6.0  (THIS DELIVERY)
 
 ===========================================================
 
@@ -241,8 +303,8 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.5.0"
-SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias (preserved in v6.5.0)
+SCRIPT_VERSION = "6.6.0"
+SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias (preserved)
 SCRIPT_NAME = "PerformanceTracker"
 
 
@@ -781,6 +843,20 @@ class PerformanceRecord:
     maturity_date: Optional[datetime] = None
     notes: str = ""
 
+    # v6.6.0: investability-gate snapshot captured at ENTRY (from
+    # data_engine_v2 v5.78+ gate output). Appended at the END of the
+    # dataclass field list so (a) the non-default-after-default ordering
+    # stays valid, (b) existing keyword construction is unaffected, and
+    # (c) any v6.5.0-serialized state still deserializes (old records
+    # simply carry blank gate fields). These let PerformanceAnalyzer
+    # segment win-rate by the gate's verdict -- i.e. measure whether
+    # INVESTABLE actually outperforms WATCHLIST, which is the whole point
+    # of the gate. NEVER reorder these above the existing fields.
+    entry_data_quality: float = 0.0
+    entry_forecast_reliability: float = 0.0
+    entry_investability_status: str = ""
+    entry_final_action: str = ""
+
     @property
     def key(self) -> str:
         return (
@@ -800,6 +876,11 @@ class PerformanceRecord:
             "entry_score": self.entry_score,
             "risk_bucket": self.entry_risk_bucket,
             "confidence": self.entry_confidence,
+            # v6.6.0: investability-gate snapshot (grouped with entry data).
+            "entry_data_quality": self.entry_data_quality,
+            "entry_forecast_reliability": self.entry_forecast_reliability,
+            "entry_investability_status": self.entry_investability_status,
+            "entry_final_action": self.entry_final_action,
             "origin_tab": self.origin_tab,
             "target_price": self.target_price,
             "target_roi_pct": self.target_roi,
@@ -894,6 +975,14 @@ class PerformanceRecord:
             last_updated=dt_upd.astimezone(timezone.utc),
             maturity_date=dt_mat,
             notes=_safe_str(get("Notes")),
+            # v6.6.0: read the investability-gate snapshot by header name.
+            # Absent on rows written before v6.6.0 -> safe zeros / blanks.
+            entry_data_quality=_safe_float(get("Entry Data Quality"), default=0.0),
+            entry_forecast_reliability=_safe_float(
+                get("Entry Forecast Reliability"), default=0.0
+            ),
+            entry_investability_status=_safe_str(get("Entry Investability") or ""),
+            entry_final_action=_safe_str(get("Entry Final Action") or ""),
         )
 
 
@@ -915,6 +1004,12 @@ class PerformanceSummary:
     win_rate: float = 0.0
     hit_rate_by_horizon: Dict[str, float] = field(default_factory=dict)
     performance_by_sector: Dict[str, Any] = field(default_factory=dict)
+    # v6.6.0: win-rate / ROI segmented by the ENTRY investability verdict.
+    # hit_rate_by_investability maps bucket -> win-rate %; the richer
+    # performance_by_investability maps bucket -> {win_rate, avg_roi, wins,
+    # losses, count}. Both empty until matured gate-tagged records exist.
+    hit_rate_by_investability: Dict[str, float] = field(default_factory=dict)
+    performance_by_investability: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1213,6 +1308,14 @@ class PerformanceStore:
         "Last Updated (Riyadh)",
         "Maturity Date",
         "Notes",
+        # v6.6.0: investability-gate snapshot columns -- APPENDED at the END
+        # so existing 27-column rows keep their positions (1-27) and load
+        # unchanged (old rows read these four as blank). NEVER insert mid-list:
+        # doing so would re-map every historical row when read back by name.
+        "Entry Data Quality",
+        "Entry Forecast Reliability",
+        "Entry Investability",
+        "Entry Final Action",
     ]
 
     def __init__(self, spreadsheet_id: str, sheet_name: str):
@@ -1288,11 +1391,27 @@ class PerformanceStore:
             existing = self.ws.row_values(self.START_ROW)
         except Exception:
             existing = []
-        if not existing or (existing and existing[0] != self.HEADERS[0]):
+        existing_norm = [str(h).strip() for h in (existing or [])]
+        header_missing = not existing_norm
+        # v6.6.0: widen/repair the header row whenever it differs from the
+        # canonical HEADERS by length OR content -- not only when cell A5
+        # changes. v6.5.0 compared existing[0] != HEADERS[0] ("Record ID",
+        # which never changes), so an existing 27-column Performance_Log would
+        # NEVER gain the 4 v6.6.0 gate columns, and the new values written by
+        # _record_to_row at positions 28-31 would be re-read under a stale
+        # 27-name header map and dropped on the next load.
+        header_mismatch = existing_norm != list(self.HEADERS)
+        if header_missing or header_mismatch:
             end_col = len(self.HEADERS)
             rng = _a1_range(1, self.START_ROW, end_col, self.START_ROW)
             self.ws.update(rng, [self.HEADERS])
 
+        # Seed the zero summary block + freeze ONLY on a brand-new sheet. On a
+        # header WIDENING of an existing populated sheet we must NOT touch the
+        # A1:E7 region or re-freeze -- that would wipe live KPIs. Widening the
+        # header row (row 5) is safe: data lives at row 6+, columns 1-27 keep
+        # their meaning, and the 4 appended columns are blank for old rows.
+        if header_missing:
             summary = [
                 ["Performance Summary", "", "", f"Generated: {RiyadhTime.format()}", ""],
                 ["Total Records", "0", "", "", ""],
@@ -1368,6 +1487,12 @@ class PerformanceStore:
             RiyadhTime.format(r.last_updated.astimezone(_RIYADH_TZ)),
             RiyadhTime.format(r.maturity_date) if r.maturity_date else "",
             r.notes or "",
+            # v6.6.0: investability-gate snapshot (positions 28-31; same order
+            # as the four appended HEADERS entries).
+            r.entry_data_quality,
+            r.entry_forecast_reliability,
+            r.entry_investability_status or "",
+            r.entry_final_action or "",
         ]
 
     def save_records(self, records: List[PerformanceRecord]) -> bool:
@@ -1599,6 +1724,33 @@ class PerformanceAnalyzer:
                 s.hit_rate_by_horizon[h] = (w / t * 100.0) if t else 0.0
 
             s.performance_by_sector = self.attr.by_sector(matured)
+
+            # v6.6.0: segment matured outcomes by the ENTRY investability
+            # verdict so the operator can answer the real question behind
+            # "95%": does an INVESTABLE pick actually outperform a WATCHLIST
+            # one? Buckets are the gate's own vocabulary (INVESTABLE /
+            # WATCHLIST / BLOCKED); records recorded before v6.6.0 (blank gate
+            # field) fall under "UNSPECIFIED" and are kept separate so they
+            # never dilute a gate bucket. win_rate is decided-only
+            # (wins / (wins + losses)), matching the overall win_rate.
+            inv_groups: Dict[str, List[PerformanceRecord]] = defaultdict(list)
+            for r in matured:
+                bucket = (r.entry_investability_status or "UNSPECIFIED").upper()
+                inv_groups[bucket].append(r)
+            for bucket, grp in inv_groups.items():
+                gw = sum(1 for r in grp if (r.realized_roi or 0.0) > 0)
+                gl = sum(1 for r in grp if (r.realized_roi or 0.0) < 0)
+                decided = gw + gl
+                grp_rois = [float(r.realized_roi or 0.0) for r in grp]
+                wr = (gw / decided * 100.0) if decided else 0.0
+                s.hit_rate_by_investability[bucket] = wr
+                s.performance_by_investability[bucket] = {
+                    "win_rate": wr,
+                    "avg_roi": (sum(grp_rois) / len(grp_rois)) if grp_rois else 0.0,
+                    "wins": float(gw),
+                    "losses": float(gl),
+                    "count": float(len(grp)),
+                }
 
             try:
                 perf_win_rate.set(float(s.win_rate))
@@ -2032,6 +2184,18 @@ class PerformanceTrackerApp:
                 _safe_float(conf, default=0.0) if conf is not None else None
             )
             rec = self._recommendation_from_row(row)
+
+            # v6.6.0: capture the investability-gate snapshot at entry. The
+            # engine (v5.78+) emits these as canonical snake_case keys on every
+            # Top10 row. On a pre-gate deploy they are absent -> safe zeros /
+            # blanks, so the record is still written, just without a gate tag.
+            entry_dq = _safe_float(row.get("data_quality_score"), default=0.0)
+            entry_frel = _safe_float(
+                row.get("forecast_reliability_score"), default=0.0
+            )
+            entry_inv_status = _safe_str(row.get("investability_status"))
+            entry_final_action = _safe_str(row.get("final_action"))
+
             origin = (
                 _safe_str(
                     row.get("source_page") or row.get("origin") or "Top_10_Investments"
@@ -2064,6 +2228,11 @@ class PerformanceTrackerApp:
                     current_price=entry_price,
                     unrealized_roi=0.0,
                     last_updated=_utc_now(),
+                    # v6.6.0: investability-gate snapshot at entry.
+                    entry_data_quality=entry_dq,
+                    entry_forecast_reliability=entry_frel,
+                    entry_investability_status=entry_inv_status,
+                    entry_final_action=entry_final_action,
                 )
                 if r.key not in existing_keys:
                     existing_keys.add(r.key)
@@ -2170,6 +2339,24 @@ class PerformanceTrackerApp:
                 f"| Sharpe: {summary.sharpe_ratio:.2f} "
                 f"| Sortino: {summary.sortino_ratio:.2f}"
             )
+            # v6.6.0: surface the investability segmentation -- the gate KPI
+            # that the whole "95%" question reduces to. Decided-only win-rate
+            # per bucket, with the matured sample size in parentheses.
+            if summary.hit_rate_by_investability:
+                inv_bits = ", ".join(
+                    "%s=%.0f%% (n=%d)"
+                    % (
+                        k,
+                        summary.hit_rate_by_investability[k],
+                        int(
+                            summary.performance_by_investability.get(k, {}).get(
+                                "count", 0
+                            )
+                        ),
+                    )
+                    for k in sorted(summary.hit_rate_by_investability.keys())
+                )
+                _out(f"Win-rate by investability: {inv_bits}")
 
         if self.args.simulate:
             matured = [
