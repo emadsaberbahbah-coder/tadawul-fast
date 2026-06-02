@@ -131,6 +131,49 @@ v5.7.3 — asset-class-aware valuation & quality (banks / REITs); contract-stabl
   asset-class curves are calibration parameters. Confirm the live recommendation
   distribution still spreads sensibly per asset class, and treat label
   CORRECTNESS as still pending a ground-truth backtest.
+
+v5.7.4 — recommendation recalibration (REDUCE-collapse fix); contract-stable:
+  Problem (observed live, 100-row sample): REDUCE dominated ~85% of rows. The
+  binding cause is the OVERALL-SCORE PENALTY, specifically its RISK leg. v5.7.2
+  gave the CONFIDENCE penalty a neutral point but the RISK penalty was left
+  firing linearly from risk==0, so even LOW-risk names (risk ~22-30) took a
+  ~5-7% haircut. That dragged a dozen-plus rows whose RAW score was >= 65 down
+  under the HOLD floor (e.g. SCHW raw 68.5 -> 64.4, MA 65.9 -> 62.5, RGLD
+  71.4 -> 64.2), and because BUY/ACCUMULATE gate on the SAME overall floor,
+  strong ROI / low risk could not rescue them -> REDUCE.
+
+  Fix (this file only; two independent, env-gated levers):
+    B (PRIMARY, ON by default, conservative): give the RISK penalty a neutral
+       point, mirroring the v5.7.2 confidence treatment. risk01 AT OR BELOW the
+       neutral point incurs NO markdown; only the EXCESS above it is penalized,
+       normalized by the span (1 - neutral) so the MAXIMUM markdown at
+       risk01==1.0 is IDENTICAL to v5.7.3. New field ScoringConfig.
+       risk_penalty_neutral (default 0.20), env SCORING_RISK_NEUTRAL.
+       SCORING_RISK_NEUTRAL=0 restores the EXACT v5.7.3 curve (instant
+       rollback). Net effect at default: low-risk raw>=~65 names move
+       REDUCE -> HOLD; mints no new BUYs; HIGH-risk names unchanged.
+    A (BACKUP, OFF by default): the recommendation overall floors are now
+       env-tunable module constants _RECO_HOLD_FLOOR / _RECO_ACCUM_FLOOR,
+       DEFAULTING TO 65.0 (the v5.7.3 value) so behavior is UNCHANGED unless
+       set. Lowering them (env SCORING_RECO_HOLD_FLOOR / SCORING_RECO_ACCUM_
+       FLOOR) lets genuinely-fine low-risk names sitting at raw 57-64 land
+       HOLD/ACCUMULATE instead of REDUCE. Enable only after validating the
+       full-sample before/after distribution.
+
+  UNCHANGED: every risk-override rail (STRONG_SELL / SELL / REDUCE / AVOID),
+  the BUY/STRONG_BUY thresholds, the confidence neutral point, all asset-class
+  valuation/quality curves, the 115-column output contract, and every emitted
+  key. risk_penalty_strength (0.36) and the 0.65 scale are untouched.
+
+  __version__ -> "5.7.4" (RECOMMENDATION_SOURCE_TAG -> "scoring.py v5.7.4",
+  SCORING_SCHEMA_VERSION -> "5.7.4"; [v5.7.3 *] log prefixes roll to [v5.7.4 *]).
+  _ENGINE_CONTRACT_VERSION UNCHANGED at "5.79.2" — the producer/consumer field
+  set and schema are identical; only calibration math changed.
+
+  CALIBRATION NOTE (carried forward): the neutral points and asset-class curves
+  remain calibration parameters; label CORRECTNESS is still pending a
+  ground-truth backtest. Lever A in particular is a portfolio-wide behavior
+  change — validate the before/after on the full sample before enabling it.
 ================================================================================
 """
 
@@ -152,7 +195,7 @@ logger.addHandler(logging.NullHandler())
 # Version / Canonical contract
 # =============================================================================
 
-__version__ = "5.7.3"
+__version__ = "5.7.4"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -407,6 +450,13 @@ class ScoringConfig:
     # confidence proxy (~0.62 on most rows) from applying a uniform haircut that
     # pushed the whole universe under the BUY gate. Tunable: SCORING_CONFIDENCE_NEUTRAL.
     confidence_penalty_neutral: float = 0.60
+    # v5.7.4: risk-penalty neutral point (0..1 fraction). Risk at or BELOW this
+    # fraction incurs NO risk markdown; only the EXCESS above it is penalized
+    # (ramped, normalized by 1 - neutral) so the MAXIMUM markdown at risk==1.0
+    # is unchanged from v5.7.3. Stops the risk penalty from haircutting LOW-risk
+    # names (~0.22-0.30) enough to drag a solid raw score under the HOLD floor.
+    # SCORING_RISK_NEUTRAL=0 restores the EXACT v5.7.3 curve (instant rollback).
+    risk_penalty_neutral: float = 0.20
     risk_high_threshold: float = RISK_BUCKET_THRESHOLDS[1]
     confidence_low_to_moderate: float = CONFIDENCE_BUCKET_THRESHOLDS[0]
     confidence_high: float = CONFIDENCE_BUCKET_THRESHOLDS[1]
@@ -431,10 +481,19 @@ class ScoringConfig:
             risk_penalty_strength=_env_float("SCORING_RISK_PENALTY", 0.36),
             confidence_penalty_strength=_env_float("SCORING_CONFIDENCE_PENALTY", 0.38),
             confidence_penalty_neutral=_env_float("SCORING_CONFIDENCE_NEUTRAL", 0.60),
+            risk_penalty_neutral=_env_float("SCORING_RISK_NEUTRAL", 0.20),
         )
 
 
 _CONFIG = ScoringConfig.from_env()
+# v5.7.4: recommendation overall-score floors (Option A), env-tunable and
+# DEFAULTING TO THE v5.7.3 VALUE (65.0) so this revision changes NOTHING unless
+# explicitly set. compute_recommendation reads these module constants in place
+# of the former literal 65, keeping its scalar signature intact. Lowering them
+# lets genuinely-fine low-risk names sitting at raw 57-64 land HOLD/ACCUMULATE
+# instead of REDUCE. Validate the full-sample before/after before enabling.
+_RECO_HOLD_FLOOR: float = _env_float("SCORING_RECO_HOLD_FLOOR", 65.0)
+_RECO_ACCUM_FLOOR: float = _env_float("SCORING_RECO_ACCUM_FLOOR", 65.0)
 _HORIZON_DAYS_CUTOFFS: Tuple[Tuple[int, Horizon], ...] = (
     (_CONFIG.day_threshold, Horizon.DAY),
     (_CONFIG.week_threshold, Horizon.WEEK),
@@ -453,6 +512,7 @@ class ScoreWeights:
     risk_penalty_strength: float = _CONFIG.risk_penalty_strength
     confidence_penalty_strength: float = _CONFIG.confidence_penalty_strength
     confidence_penalty_neutral: float = _CONFIG.confidence_penalty_neutral
+    risk_penalty_neutral: float = _CONFIG.risk_penalty_neutral
 
     def normalize(self) -> "ScoreWeights":
         total = (
@@ -471,6 +531,7 @@ class ScoreWeights:
             risk_penalty_strength=self.risk_penalty_strength,
             confidence_penalty_strength=self.confidence_penalty_strength,
             confidence_penalty_neutral=self.confidence_penalty_neutral,
+            risk_penalty_neutral=self.risk_penalty_neutral,
         )
 
     def as_factor_weights_map(self) -> Dict[str, float]:
@@ -851,6 +912,7 @@ def get_weights_for_horizon(horizon: Horizon, settings: Any = None) -> ScoreWeig
     result.risk_penalty_strength = _clamp(_try("risk_penalty_strength", result.risk_penalty_strength), 0.0, 1.0)
     result.confidence_penalty_strength = _clamp(_try("confidence_penalty_strength", result.confidence_penalty_strength), 0.0, 1.0)
     result.confidence_penalty_neutral = _clamp(_try("confidence_penalty_neutral", result.confidence_penalty_neutral), 0.0, 1.0)
+    result.risk_penalty_neutral = _clamp(_try("risk_penalty_neutral", result.risk_penalty_neutral), 0.0, 1.0)
     return result.normalize()
 
 
@@ -2157,7 +2219,7 @@ def compute_recommendation(
             return _reason("STRONG_BUY", f"High {active_label} expected return with strong confidence, valuation, and controlled risk.")
         if active >= 0.10 and c >= 60 and r <= 65 and o >= 68 and (v >= 55 or q >= 70):
             return _reason("BUY", f"Positive {active_label} expected return with acceptable confidence and risk.")
-        if active >= 0.06 and c >= 60 and r <= 70 and o >= 65:
+        if active >= 0.06 and c >= 60 and r <= 70 and o >= _RECO_ACCUM_FLOOR:
             # v5.7.0: was HOLD with "Watch / accumulate candidate" prose.
             # Numeric thresholds preserved verbatim; only the emitted tier
             # changes now that ACCUMULATE is a first-class canonical tier.
@@ -2173,7 +2235,7 @@ def compute_recommendation(
             return _reason("STRONG_BUY", f"High {active_label} expected return with strong confidence and controlled risk.")
         if active >= 0.07 and c >= 60 and r <= 60 and o >= 68:
             return _reason("BUY", f"Positive {active_label} expected return with acceptable confidence and risk.")
-        if active >= 0.04 and c >= 60 and r <= 65 and o >= 65:
+        if active >= 0.04 and c >= 60 and r <= 65 and o >= _RECO_ACCUM_FLOOR:
             # v5.7.0: was HOLD with "Watch / accumulate candidate" prose.
             # Numeric thresholds preserved verbatim; only the emitted tier
             # changes now that ACCUMULATE is a first-class canonical tier.
@@ -2187,7 +2249,7 @@ def compute_recommendation(
     # Quality fallback: allows good companies to remain HOLD instead of REDUCE.
     if o >= 70 and c >= 60 and r <= 70:
         return _reason("HOLD", "Strong profile, but expected return does not justify adding exposure now.")
-    if o >= 65:
+    if o >= _RECO_HOLD_FLOOR:
         return _reason("HOLD", "Score is acceptable but risk, confidence, or ROI does not justify adding exposure.")
     if o >= 50:
         return _reason("REDUCE", "Score is below preferred quality threshold.")
@@ -2467,7 +2529,18 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         overall_raw = _round(100.0 * _clamp(base01, 0.0, 1.0), 2)
         risk01 = (risk / 100.0) if risk is not None else 0.50
         conf01_used = conf01 if conf01 is not None else 0.55
-        risk_pen = _clamp(1.0 - weights.risk_penalty_strength * (risk01 * 0.65), 0.0, 1.0)
+        # v5.7.4: risk-penalty neutral point — mirrors the v5.7.2 confidence
+        # treatment. risk01 AT OR BELOW the neutral point incurs NO markdown;
+        # only the EXCESS above it is penalized, normalized by the span
+        # (1 - neutral) so the MAXIMUM markdown at risk01==1.0 is IDENTICAL to
+        # v5.7.3 (strength * 0.65). SCORING_RISK_NEUTRAL=0 makes excess == risk01
+        # and restores the exact v5.7.3 curve.
+        _risk_neutral = weights.risk_penalty_neutral
+        _risk_excess01 = (
+            _clamp((risk01 - _risk_neutral) / (1.0 - _risk_neutral), 0.0, 1.0)
+            if _risk_neutral < (1.0 - 1e-9) else 0.0
+        )
+        risk_pen = _clamp(1.0 - weights.risk_penalty_strength * (_risk_excess01 * 0.65), 0.0, 1.0)
         # v5.7.2: only confidence BELOW the neutral point is penalized; "normal"
         # confidence (>= neutral) yields conf_pen == 1.0. The shortfall is
         # normalized by the neutral point, so the MAXIMUM markdown at conf01==0
@@ -2505,7 +2578,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             ) if val is None
         ]
         logger.warning(
-            "[v5.7.3 INSUFFICIENT] symbol=%s missing=%s",
+            "[v5.7.4 INSUFFICIENT] symbol=%s missing=%s",
             _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
             ",".join(missing_components),
         )
@@ -2648,7 +2721,7 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     scoring_errors = _dedupe_preserving_order(scoring_errors)
 
     logger.info(
-        "[v5.7.3 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
+        "[v5.7.4 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
         _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
         overall,
         risk,
