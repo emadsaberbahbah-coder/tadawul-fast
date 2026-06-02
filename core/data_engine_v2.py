@@ -2,8 +2,102 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.79.2
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.79.4
 ================================================================================
+
+WHY v5.79.4 - STRICT FINAL-APPROVAL TIER (Fix P; the audits' "Final rule for 95%")
+----------------------------------------------------------------------------------
+One engine-only governance refinement. NO schema change (still 115/115, 00_Config
+v1.11.0 unaffected, no frontend redeploy). DEFAULT OFF.
+
+  WHAT IT IS: the dashboard audits ask that a row be treated as "approved to
+  invest" only when it clears a stricter bar than the base gate's
+  price+forecast+dq>=70+BUY-family. Fix P enforces that bar -- data quality >= 80,
+  forecast reliability >= 70, risk not HIGH, and no UNREVIEWED provider/engine
+  conflict -- as a tightening of the EXISTING gate fields inside
+  _apply_investability_gate. It runs immediately after the base verdict and can
+  ONLY demote a base-INVESTABLE / final_action=INVEST row to WATCHLIST / WATCH,
+  writing "Strict gate: <reasons>" into block_reason. It never promotes, never
+  relaxes, and adds NO new column -- the finer verdict rides on the existing
+  investability_status / final_action / block_reason. When the switch is off
+  (the default) the gate's verdict is byte-identical to v5.79.3.
+
+  WHAT IT IS NOT: this is decision GOVERNANCE, not prediction. It lowers the rate
+  of false "INVEST" calls by enforcing the audits' data/reliability/risk floors
+  and routes provider-conflict rows to human review (there is no "conflict
+  reviewed" field, so a live conflict is conservatively a strict fail). It does
+  NOT make any forecast more accurate. The "reliability %" the audits quote is an
+  ESTIMATE with no ground truth behind it; only a forward-return BACKTEST can turn
+  it into a measured number, and that belongs in scripts/track_performance.py plus
+  a Recommendation_History store -- NOT in this stateless per-request engine.
+  Likewise portfolio-exposure overlay (needs current holdings + a cross-row pass),
+  news/earnings/event risk (needs a calendar/news provider that is not wired), and
+  asset-class metrics (bank NIM/NPL, REIT FFO/AFFO, ETF tracking-error/AUM -- all
+  blocked on provider fields that do not exist) are deliberately OUT of scope for
+  this file.
+
+  SEQUENCE: get the 115-column gate visible, audit the BASE gate distribution
+  live first, THEN enable the strict tier so its effect is attributable. Env-gated
+  and fully reversible:
+        TFB_STRICT_INVEST_GATE             default OFF (1/true/on to enable)
+        TFB_STRICT_INVEST_DQ_MIN           default 80.0 (raise to 85 for the
+                                                         stricter audit bar)
+        TFB_STRICT_INVEST_RELIABILITY_MIN  default 70.0 (raise to 75)
+
+VALIDATION (post-deploy, with TFB_STRICT_INVEST_GATE=1)
+  - A base-INVESTABLE row with data_quality_score 72 now shows WATCHLIST / WATCH /
+    "Strict gate: data quality 72 < 80"; with dq 88 and reliability 80 it stays
+    INVESTABLE / INVEST.
+  - A row with provider_engine_conflict=TRUE no longer reads INVEST; it routes to
+    WATCH for review.
+  - With the switch OFF (default) the INVESTABLE/INVEST set is identical to
+    v5.79.3.
+  - /health: version 5.79.4; schema still 115.
+
+WHY v5.79.3 - ORDERING-PRESERVING PROVIDER-TARGET SOFT CAP (Fix O)
+------------------------------------------------------------------
+One engine-only forecast-quality fix. NO schema change (still 115/115, 00_Config
+v1.11.0 unaffected, no frontend redeploy). Independent of the v5.78.0 gate.
+
+  THE PROBLEM (live audit): the v5.77.20 (Fix B) provider-target cap bounds an
+  honored analyst target to the Phase-II +/-30% ceiling with a HARD clamp -- any
+  leg over the ceiling is pinned to EXACTLY +/-cap_abs. That stops ROI saturation
+  past the ceiling, but it also collapses every out-of-band target onto the SAME
+  forecast price and the SAME ROI: a +50% raw target, a +35% raw target and a
+  +31% raw target all became +30.00%. A large cluster of rows shared one identical
+  ROI triplet, so Expected ROI stopped DISCRIMINATING between names and the
+  cross-sectional ranking degraded. (The +/-30% magnitude itself was correct; the
+  loss of ORDERING was the defect.)
+
+  THE FIX (Fix O): replace the hard clamp with a MONOTONIC, BOUNDED soft
+  compression of the excess above the ceiling:
+        capped = cap_abs + band * (1 - exp(-excess / band))
+  Strictly increasing in the raw return (a stronger target still outranks a weaker
+  one -> ordering preserved) and bounded by cap_abs + band (a +200% target lands
+  just under ceiling + band, NOT at +200% -> magnitude controlled). In-band legs
+  (|ret| <= cap_abs) are UNTOUCHED -- byte-identical to v5.79.2. Each leg's band
+  scales with that leg's ceiling so 3M/1M compress proportionally to 12M. The
+  existing provider_target_*_capped_to_phase_ii_ceiling warning tags are kept
+  verbatim (grep/audit stability; the forecast_reliability_score penalty still
+  keys off "cap"/"target"). Env-gated and fully reversible:
+        TFB_PROVIDER_TARGET_SOFT_CAP       default ON  (0/false/off => exact
+                                                        v5.79.2 hard clamp)
+        TFB_PROVIDER_TARGET_SOFT_CAP_BAND  default 0.05 (12M headroom as a return
+                                                         fraction; auto-clamped to
+                                                         at most half the ceiling)
+  Trade-off: with the soft cap ON a provider-target row can read up to +35%
+  (ceiling + default band) where an engine-SYNTHESIZED forecast still caps at
+  +/-30%. That 5pp headroom is the deliberate, small, env-tunable price of
+  restoring ordering.
+
+VALIDATION (post-deploy)
+  - Two provider-target rows whose raw 12M targets differ above the ceiling (e.g.
+    +35% vs +50%) now show DIFFERENT, correctly-ordered Forecast Price 12M and
+    Expected ROI 12M (previously identical at +30.00%); both remain <= +35%.
+  - An in-band provider target (e.g. +18%) is unchanged vs v5.79.2.
+  - Set TFB_PROVIDER_TARGET_SOFT_CAP=0 to confirm the old hard-clamp triplet
+    returns exactly.
+  - /health: version 5.79.3; schema still 115.
 
 WHY v5.79.2 - GATE LABELING + ASSET-CLASS DETECTION ROBUSTNESS
 --------------------------------------------------------------
@@ -1127,7 +1221,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.79.2"
+__version__ = "5.79.4"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -2179,6 +2273,60 @@ def _investability_gate_enabled() -> bool:
     return True
 
 
+# =============================================================================
+# v5.79.4 (Fix P) — STRICT FINAL-APPROVAL TIER (the audits' "Final rule for 95%")
+# -----------------------------------------------------------------------------
+# The base gate (v5.78.0) calls a row INVESTABLE / final_action=INVEST on price +
+# forecast + dq>=70 + a BUY-family reco. The dashboard audits ask for a STRICTER
+# final-approval rule before a row is treated as "approved to invest": data
+# quality >= 80, forecast reliability >= 70, risk not HIGH, and no UNREVIEWED
+# provider/engine conflict. Fix P implements exactly that as a tightening of the
+# EXISTING gate fields -- it can only DEMOTE a base-INVESTABLE row to WATCHLIST /
+# WATCH with a "Strict gate: ..." reason; it never promotes, never relaxes, and
+# adds NO new column (schema stays 115/115, so no frontend/registry change).
+#
+# IMPORTANT -- this is decision GOVERNANCE, not prediction. It reduces false
+# "INVEST" calls by enforcing the audits' data/reliability/risk floors and routes
+# provider-conflict rows to human review (there is no "conflict reviewed" field in
+# the schema, so a live conflict is treated conservatively as a strict fail). It
+# does NOT make forecasts more accurate -- only a forward-return BACKTEST can
+# measure that, and that lives in scripts/track_performance.py + a
+# Recommendation_History store, NOT in this stateless engine.
+#
+# DEFAULT OFF. The correct sequence is: get the 115-column gate visible, audit the
+# BASE gate distribution live first, THEN enable the strict tier so its effect is
+# attributable. Env-gated and fully reversible:
+#   TFB_STRICT_INVEST_GATE             default OFF (1/true/on to enable)
+#   TFB_STRICT_INVEST_DQ_MIN           default 80.0  (audit doc-5 table; raise to
+#                                                     85 for doc-6's stricter bar)
+#   TFB_STRICT_INVEST_RELIABILITY_MIN  default 70.0  (raise to 75 for doc-6)
+# =============================================================================
+_STRICT_INVEST_DQ_MIN_DEFAULT: float = 80.0
+_STRICT_INVEST_RELIABILITY_MIN_DEFAULT: float = 70.0
+
+
+def _strict_invest_gate_enabled() -> bool:
+    """v5.79.4 (Fix P): master switch for the strict final-approval tier
+    (default OFF). Set TFB_STRICT_INVEST_GATE to 1/true/on to enable. When off,
+    the gate's INVESTABLE/INVEST verdict is byte-identical to v5.79.3."""
+    raw = (os.getenv("TFB_STRICT_INVEST_GATE") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "enabled", "enable"}
+
+
+def _strict_invest_dq_min() -> float:
+    """v5.79.4 (Fix P): minimum data_quality_score (0-100 pts) for INVEST under
+    the strict tier. Read at call time; non-positive falls back to the default."""
+    v = _get_env_float("TFB_STRICT_INVEST_DQ_MIN", _STRICT_INVEST_DQ_MIN_DEFAULT)
+    return v if (v is not None and v > 0) else _STRICT_INVEST_DQ_MIN_DEFAULT
+
+
+def _strict_invest_reliability_min() -> float:
+    """v5.79.4 (Fix P): minimum forecast_reliability_score (0-100 pts) for INVEST
+    under the strict tier. Read at call time; non-positive falls back to default."""
+    v = _get_env_float("TFB_STRICT_INVEST_RELIABILITY_MIN", _STRICT_INVEST_RELIABILITY_MIN_DEFAULT)
+    return v if (v is not None and v > 0) else _STRICT_INVEST_RELIABILITY_MIN_DEFAULT
+
+
 def _canonical_recommendation(value: Any) -> str:
     if value in (None, ""):
         return ""
@@ -2414,6 +2562,35 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
             reason = "Incomplete fundamentals (%s)" % ", ".join(gaps)
     else:
         status, action, reason = "INVESTABLE", "INVEST", ""
+
+    # -- v5.79.4 (Fix P): strict final-approval tier (default OFF) -------------
+    # Only acts on rows the BASE gate approved (INVESTABLE / INVEST). Enforces the
+    # audits' "Final rule for 95%": dq >= floor, reliability >= floor, risk not
+    # HIGH, and no UNREVIEWED provider/engine conflict. Any failure DEMOTES the
+    # row to WATCHLIST / WATCH with a "Strict gate: ..." reason. Never promotes,
+    # never relaxes, never touches the base verdict when disabled -> v5.79.3
+    # behavior is byte-identical with the switch off. Schema unchanged (no new
+    # column): the finer verdict is expressed through the existing
+    # investability_status / final_action / block_reason fields.
+    if _strict_invest_gate_enabled() and status == "INVESTABLE" and action == "INVEST":
+        risk_bucket = _safe_str(row.get("risk_bucket")).upper()
+        dq_floor = _strict_invest_dq_min()
+        rel_floor = _strict_invest_reliability_min()
+        strict_fails: List[str] = []
+        if dq < dq_floor:
+            strict_fails.append("data quality %.0f < %.0f" % (dq, dq_floor))
+        if rel < rel_floor:
+            strict_fails.append("forecast reliability %.0f < %.0f" % (rel, rel_floor))
+        if risk_bucket == "HIGH":
+            strict_fails.append("risk bucket HIGH")
+        # No "conflict reviewed" field exists in the schema, so a live conflict is
+        # treated conservatively as a strict fail (route to human review) rather
+        # than auto-approved. ctype "Aligned"/"" with conflict=="FALSE" passes.
+        if conflict == "TRUE":
+            strict_fails.append("unreviewed provider/engine conflict (%s)" % (ctype or "conflict"))
+        if strict_fails:
+            status, action = "WATCHLIST", "WATCH"
+            reason = "Strict gate: " + "; ".join(strict_fails)
 
     row["data_quality_score"] = dq
     row["forecast_reliability_score"] = rel
@@ -3109,6 +3286,77 @@ def _forecast_price_is_populated(v: Any) -> bool:
     return f is not None and f > 0.0
 
 
+# =============================================================================
+# v5.79.3 (Fix O) — ORDERING-PRESERVING PROVIDER-TARGET SOFT CAP
+# -----------------------------------------------------------------------------
+# v5.77.20 (Fix B) bounded an honored provider target to the Phase-II +/-30%
+# ceiling by a HARD clamp: any leg whose implied return exceeded the ceiling was
+# pinned to EXACTLY +/-cap_abs. That stops ROI saturation past the ceiling, but
+# it also collapses every out-of-band target to the identical forecast price and
+# the identical ROI -- so a +50% raw target, a +35% raw target, and a +31% raw
+# target all became +30.00% with the same forecast_price. The live audit saw
+# exactly this: a large cluster sharing one ROI triplet, and Expected ROI stopped
+# DISCRIMINATING between names -> cross-sectional ranking degraded.
+#
+# Fix O replaces the hard clamp with a MONOTONIC, BOUNDED soft compression of the
+# EXCESS above the ceiling: capped = cap_abs + band*(1 - exp(-excess/band)). This
+# is strictly increasing in the raw return (so a stronger target still ranks
+# above a weaker one -- ordering preserved) and is bounded by cap_abs + band (so
+# magnitude stays controlled; a +200% target lands just under ceiling + band, not
+# at +200%). In-band targets (|ret| <= cap_abs) are UNTOUCHED -- identical to
+# v5.79.2. The per-leg band scales with that leg's ceiling so the 3M/1M legs
+# compress proportionally to the 12M leg. The existing
+# provider_target_*_capped_to_phase_ii_ceiling warning tags are PRESERVED
+# verbatim (grep/audit stability + the forecast_reliability_score penalty still
+# keys off "cap"/"target"). Env-gated and fully reversible:
+#   TFB_PROVIDER_TARGET_SOFT_CAP        default ON  (0/false/off -> exact v5.79.2
+#                                                    hard clamp restored)
+#   TFB_PROVIDER_TARGET_SOFT_CAP_BAND   default 0.05 (12M headroom as a return
+#                                                     fraction; clamped to at most
+#                                                     half the ceiling)
+# NOTE: with the soft cap ON, a provider-target row can read up to +35% (ceiling
+# + default band) where an engine-SYNTHESIZED forecast still caps at +/-30%; that
+# 5pp headroom is the price of restoring ordering and is intentionally small and
+# env-tunable. Schema unchanged (no new columns).
+# =============================================================================
+_PROVIDER_TARGET_SOFT_CAP_BAND_DEFAULT: float = 0.05
+
+
+def _provider_target_soft_cap_enabled() -> bool:
+    """v5.79.3 (Fix O): master switch for the ordering-preserving provider-target
+    soft cap (default ON). Set TFB_PROVIDER_TARGET_SOFT_CAP to 0/false/off to
+    restore the exact v5.79.2 hard-clamp-to-ceiling behavior."""
+    raw = (os.getenv("TFB_PROVIDER_TARGET_SOFT_CAP") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+def _provider_target_soft_cap_band() -> float:
+    """v5.79.3 (Fix O): 12M headroom (as a return fraction) the soft cap adds above
+    the hard ceiling. The asymptote is _PHASE_II_MAX_12M_ABS_RETURN + this band.
+    Read at call time; clamped to (0, ceiling/2] so a config typo can never let an
+    out-of-band target inflate without bound. Env: TFB_PROVIDER_TARGET_SOFT_CAP_BAND."""
+    b = _get_env_float("TFB_PROVIDER_TARGET_SOFT_CAP_BAND", _PROVIDER_TARGET_SOFT_CAP_BAND_DEFAULT)
+    if b is None or b <= 0:
+        return _PROVIDER_TARGET_SOFT_CAP_BAND_DEFAULT
+    return min(b, _PHASE_II_MAX_12M_ABS_RETURN * 0.5)
+
+
+def _soft_compress_excess(excess: float, band: float) -> float:
+    """v5.79.3 (Fix O): map a non-negative excess-over-ceiling into [0, band) via
+    the monotonic saturating curve band*(1 - exp(-excess/band)). Strictly
+    increasing in excess (ordering preserved) and bounded by band (magnitude
+    controlled). Returns 0.0 for excess <= 0 (in-band legs untouched) or a
+    non-positive band (soft cap effectively off for that leg)."""
+    if excess <= 0.0 or band <= 0.0:
+        return 0.0
+    try:
+        return band * (1.0 - math.exp(-excess / band))
+    except (OverflowError, ValueError):
+        return band
+
+
 def _cap_provider_target_forecasts(row: Dict[str, Any]) -> None:
     """v5.77.20 (Fix B): cap an honored provider analyst target to the Phase-II
     +/-30% ceiling BEFORE scoring reads it.
@@ -3145,6 +3393,13 @@ def _cap_provider_target_forecasts(row: Dict[str, Any]) -> None:
         ("forecast_price_1m", "expected_roi_1m", _PHASE_II_MAX_12M_ABS_RETURN * _PHASE_II_RATIO_1M_OF_12M,
          "provider_target_1m_capped_to_phase_ii_ceiling"),
     )
+    # v5.79.3 (Fix O): soft-cap state, computed once per row. When enabled
+    # (default), an over-ceiling leg is mapped by a monotonic bounded compression
+    # of its excess instead of being pinned to exactly +/-cap_abs -- so distinct
+    # raw targets keep distinct (ordered) forecasts/ROIs. When disabled, the
+    # branch below reproduces the v5.79.2 hard clamp byte-for-byte.
+    _soft = _provider_target_soft_cap_enabled()
+    _band_12m = _provider_target_soft_cap_band() if _soft else 0.0
     for field, roi_field, cap_abs, tag in legs:
         fp = _as_float(row.get(field))
         if fp is None or fp <= 0:
@@ -3152,9 +3407,25 @@ def _cap_provider_target_forecasts(row: Dict[str, Any]) -> None:
         ret = (fp - cp) / cp
         capped_ret = None
         if ret > cap_abs:
-            capped_ret = cap_abs
+            if _soft:
+                # Per-leg band scales with this leg's ceiling so 3M/1M compress
+                # proportionally to 12M. excess = ret - cap_abs (> 0 here).
+                leg_band = (
+                    _band_12m * (cap_abs / _PHASE_II_MAX_12M_ABS_RETURN)
+                    if _PHASE_II_MAX_12M_ABS_RETURN > 0 else 0.0
+                )
+                capped_ret = cap_abs + _soft_compress_excess(ret - cap_abs, leg_band)
+            else:
+                capped_ret = cap_abs
         elif ret < -cap_abs:
-            capped_ret = -cap_abs
+            if _soft:
+                leg_band = (
+                    _band_12m * (cap_abs / _PHASE_II_MAX_12M_ABS_RETURN)
+                    if _PHASE_II_MAX_12M_ABS_RETURN > 0 else 0.0
+                )
+                capped_ret = -cap_abs - _soft_compress_excess((-ret) - cap_abs, leg_band)
+            else:
+                capped_ret = -cap_abs
         if capped_ret is None:
             continue
         new_fp = round(cp * (1.0 + capped_ret), 4)
@@ -6553,7 +6824,7 @@ class _EngineSymbolsReaderProxy:
 # DataEngineV5 — the main orchestrator
 # =============================================================================
 class DataEngineV5:
-    """Global-first data orchestrator (v5.77.21)."""
+    """Global-first data orchestrator (v5.79.4)."""
 
     def __init__(
         self,
@@ -7855,7 +8126,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.79.2",  # v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
+                "version": "v5.79.4",  # v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
