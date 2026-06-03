@@ -2,11 +2,75 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.1.0
+Advanced Analysis Root Owner — v4.2.0  (REGISTRY-DERIVED WIDTHS / TRACKS CANONICAL)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
-PROVIDER-HEALTH SURFACE • v5.61.0 / v4.8.0 FAMILY ALIGNMENT
+PROVIDER-HEALTH SURFACE • NO-HARDCODED-CLAMP • v5.78.0 GATE-AWARE
+
+WHY v4.2.0 — registry-derived contract widths (stop truncating Top_10)
+----------------------------------------------------------------------
+
+Cascade #2 of the width-tracking pass (sibling of analysis_sheet_rows
+v4.4.0). This route is the PRIMARY upstream the analysis_sheet_rows router
+calls (`root_proxy`, tried first for every page), and it pre-projects its
+`row_objects` onto the resolved contract keys before returning. v4.1.0
+carried a hard-coded Top_10 width of `83` in `_ensure_top10_contract`
+(`_pad_contract(hdrs, ks, 83)`), so once the engine/registry grew past 83
+columns, Top_10 was clamped back to 83 here — dropping the v5.78.0
+investability gate (forecast_source + 8 gate columns: data_quality_score,
+forecast_reliability_score, provider_engine_conflict, conflict_type,
+final_decision_basis, investability_status, final_action, block_reason)
+BEFORE the downstream router ever saw the rows.
+
+v4.2.0 removes every hard-coded width literal from the contract path and
+derives widths in two layers, identical to analysis_sheet_rows v4.4.0:
+  - RUNTIME (authoritative): `_expected_len(page)` prefers the live
+    registry's `get_sheet_len(page)`. This route now faithfully tracks
+    whatever width the deployed registry serves — 90 today, 115/118 once
+    the schema_registry pass (cascade #3) lands — with ZERO further edits.
+  - STATIC FALLBACK (offline only): every width derives from
+    `len(_CANONICAL_80_KEYS)`; Top_10 derives as `instrument_len +
+    _TOP10_EXTRA_COUNT`. Used only when the registry import fails entirely.
+
+CANONICAL ALIGNMENT: v4.1.0's static canonical was the older 80-column
+baseline (it pre-dated the v2.6.0 Insights group). v4.2.0 widens the static
+`_CANONICAL_80_*` to the same 90-column list the analysis_sheet_rows router
+carries (adds `upside_pct`, the 4 view columns, and the 5 Insights-group
+columns), so the two siblings emit an identical fallback contract. This is
+fallback-only — on the live path the registry contract is authoritative.
+
+NOTE ON VISIBILITY: like the downstream router, this route can only surface
+columns the registry NAMES; it does not fabricate the gate-column
+headers/keys. So the gate columns appear end-to-end only once
+`core.sheets.schema_registry` serves them (cascade #3). Until then this
+route tracks the registry's current width with no truncation.
+
+UNLIKE the downstream router, v4.1.0's `_normalize_external_payload` already
+threads the resolved `keys` straight through (no re-clamp), so there is NO
+third truncation point here — only `_ensure_top10_contract` needed fixing.
+
+v4.2.0 changes (from v4.1.0)
+----------------------------
+[FIX-A] `_EXPECTED_SHEET_LENGTHS` moved below the canonical lists and
+    derived from `len(_CANONICAL_80_KEYS)` (instrument + My_Investments),
+    `+_TOP10_EXTRA_COUNT` (Top_10), `len(...)` (insights/dictionary).
+    Static-fallback-only; runtime prefers the registry.
+[FIX-B] `_ensure_top10_contract` takes optional `target_len`; the literal
+    `83` is gone. Hard invariant: never truncates below canonical+extras.
+[FIX-C] `_resolve_contract` passes the registry-derived `expected_len` into
+    `_ensure_top10_contract`, so a 118-col registry result is preserved.
+[FIX-E] `_static_contract` and `_expected_len` use the derived widths
+    instead of the literals 83 / 7 / 9 / 80.
+[ALIGN] Static `_CANONICAL_80_*` widened 80 -> 90 to match
+    analysis_sheet_rows v4.4.0's canonical (fallback-contract parity).
+
+NO BEHAVIOR CHANGE on the instrument pages when the registry width is
+unchanged: `_pad_contract` already returned exactly `expected_len`. The
+change is purely "track the registry / stop clamping Top_10 / align the
+fallback canonical." ALL v4.1.0 provider-health machinery (ADD-B…H), the
+engine binding cascade (FIX-A of v4.1.0), and every endpoint are preserved
+verbatim.
 
 WHY v4.1.0 — SURFACE THE ENGINE'S PROVIDER-UNHEALTHY REGISTRY (May 12, 2026)
 ---------------------------------------------------------------------------
@@ -114,18 +178,19 @@ v4.1.0 changes (from v4.0.0)
       rows/rows_matrix/row_objects/items/records/data/quotes
     - Schema-safe local fallbacks for Top_10_Investments,
       Insights_Analysis, Data_Dictionary, and instrument pages
-    - 80-column canonical contract baseline (engine-side schema
+    - Canonical contract baseline (engine-side schema
       registry override remains authoritative when available)
     - Auth dispatch cascade preserved (6 attempt shapes)
     - JSON-safe coercion preserved
     - `_call_core_sheet_rows_best_effort` 7-candidate signature
       loop preserved
 
-May 2026 / v2.8.0 family alignment
-----------------------------------
+May 2026 / family alignment
+---------------------------
 This route aligns with:
-  - core.data_engine_v2          v5.61.0  (provider-unhealthy registry,
-                                            health() surface, PHASE-X)
+  - core.data_engine_v2          v5.78.0  (115-key canonical, Fix-K
+                                            investability gate; provider-
+                                            unhealthy registry, health())
   - core.providers.eodhd_provider v4.8.0   (circuit breaker, diagnose_health,
                                              get_provider_stats)
   - core.providers.yahoo_fundamentals_provider v6.1.0
@@ -135,12 +200,14 @@ This route aligns with:
   - core.reco_normalize           v7.2.0
   - core.insights_builder         v7.0.0
   - core.candlesticks             v1.0.0
+  - core.sheets.schema_registry   2.6.0*   (*90/93 live; pending bump to
+                                             115/118 in cascade #3)
+  - routes/analysis_sheet_rows    4.4.0    (downstream registry-derived router)
 
-New env variables (v4.1.0)
+New env variables (v4.2.0)
 --------------------------
-None. v4.1.0's behavior is gated by which engine binding wins (v2 vs
-legacy). If v2 is unavailable, the new provider_health fields simply
-omit from responses (graceful degradation).
+None. v4.2.0's width behavior is gated by which width the live registry
+serves; provider_health fields still omit gracefully if v2 is unavailable.
 
 Purpose
 -------
@@ -150,7 +217,7 @@ Owns the canonical root paths:
 - /schema/sheet-spec
 - /schema/pages
 - /schema/data-dictionary
-- /v1/schema/provider-health  [v4.1.0 NEW]
+- /v1/schema/provider-health  [v4.1.0]
 and their /v1/schema aliases.
 ================================================================================
 """
@@ -176,13 +243,13 @@ logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
 # =============================================================================
-# v4.1.0 — Version constant.
+# v4.2.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.1.0"
+ADVANCED_ANALYSIS_VERSION = "4.2.0"
 
 
 # =============================================================================
-# v4.1.0 [FIX-A — CRITICAL] Engine binding cascade.
+# v4.1.0 [FIX-A — CRITICAL] Engine binding cascade.  (preserved verbatim)
 #
 # v4.0.0 tried `core.data_engine.get_sheet_rows` (legacy) FIRST and
 # only fell back to `core.data_engine_v2` if the legacy import failed.
@@ -194,29 +261,14 @@ ADVANCED_ANALYSIS_VERSION = "4.1.0"
 # v4.1.0 inverts that preference. Cascading binding probe in order:
 #
 #   1. `core.data_engine_v2.get_engine()` — async or sync factory.
-#      Runtime-awaitable detection via `inspect.isawaitable()` so the
-#      adapter works whether `get_engine` returns the engine instance
-#      directly (v5.50.0+ sync) or returns a coroutine (older / future
-#      async builds). EXPECTED PRODUCTION PATH.
-#
 #   2. `core.data_engine_v2.get_engine_if_ready()` — sync ready-check
-#      with async-factory cold-start fallback. Belt-and-suspenders
-#      against the rare race where the v2 module is imported but the
-#      engine instance hasn't warmed yet.
-#
-#   3. `core.data_engine_v2.get_sheet_rows` — top-level module-level
-#      function. Doesn't exist in v5.61.0 (`get_sheet_rows` is a method
-#      on DataEngineV5) but we still probe in case a future build
-#      adds a convenience wrapper.
-#
-#   4. `core.data_engine.get_sheet_rows` — legacy adapter. Bug
-#      indicator if reached: v2 module is unavailable or broken.
-#      Logs WARNING — this branch loses v5.61.0 enrichment.
+#      with async-factory cold-start fallback.
+#   3. `core.data_engine_v2.get_sheet_rows` — top-level module-level fn.
+#   4. `core.data_engine.get_sheet_rows` — legacy adapter (bug indicator).
 #
 # Every step logs explicitly. The chosen binding is reflected in
 # CORE_GET_SHEET_ROWS_SOURCE and surfaces in every response's
-# meta.source field, making the live binding trivially observable
-# from production.
+# meta.source field.
 # =============================================================================
 CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
 core_get_sheet_rows = None  # type: ignore[assignment]
@@ -315,7 +367,7 @@ if core_get_sheet_rows is None:
 
 
 # =============================================================================
-# v4.1.0 [ADD-B/C] Provider-health snapshot helpers.
+# v4.1.0 [ADD-B/C] Provider-health snapshot helpers.  (preserved verbatim)
 #
 # These resolve the v2 engine instance directly (bypassing the
 # get_sheet_rows adapter) so we can call `engine.health()` and read
@@ -471,17 +523,12 @@ _INSIGHTS_PAGE = "Insights_Analysis"
 _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
-_EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 80,
-    "Global_Markets": 80,
-    "Commodities_FX": 80,
-    "Mutual_Funds": 80,
-    "My_Portfolio": 80,
-    "My_Investments": 80,
-    _TOP10_PAGE: 83,
-    _INSIGHTS_PAGE: 7,
-    _DICTIONARY_PAGE: 9,
-}
+# v4.2.0 [FIX-A]: _EXPECTED_SHEET_LENGTHS is now DERIVED from the canonical
+# list lengths and defined AFTER the canonical lists below (see the
+# "v4.2.0 derived contract widths" block). Static-fallback-only: _expected_len()
+# always prefers the live registry's get_sheet_len() first. Removing the early
+# hard-coded {80, 83, 7, 9} dict is what lets Top_10 track the canonical
+# instead of clamping to a frozen 83.
 
 _TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
@@ -537,6 +584,10 @@ except Exception:
 # (v4.1.0: the original legacy-first binding block was REMOVED here;
 # the v2-first cascade now lives at module top after the imports.)
 
+# v4.2.0 [ALIGN]: static canonical widened 80 -> 90 to match
+# analysis_sheet_rows v4.4.0 (adds Upside %, the 4 view columns, and the
+# 5 v2.6.0 Insights-group columns). Fallback-only — the live registry
+# contract remains authoritative at runtime.
 _CANONICAL_80_HEADERS: List[str] = [
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
     "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
@@ -546,13 +597,18 @@ _CANONICAL_80_HEADERS: List[str] = [
     "Operating Margin", "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)", "RSI (14)",
     "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)", "Sharpe (1Y)",
     "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value",
+    "Upside %",
     "Valuation Score", "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
     "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence",
     "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
-    "Growth Score", "Overall Score", "Opportunity Score", "Rank (Overall)", "Recommendation",
+    "Growth Score", "Overall Score",
+    "Fundamental View", "Technical View", "Risk View", "Value View",
+    "Opportunity Score", "Rank (Overall)", "Recommendation",
     "Recommendation Reason", "Horizon Days", "Invest Period Label", "Position Qty", "Avg Cost",
     "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
     "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    # v2.6.0 Insights group (Wave 3) — produced by core.insights_builder
+    "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
 ]
 _CANONICAL_80_KEYS: List[str] = [
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
@@ -563,18 +619,50 @@ _CANONICAL_80_KEYS: List[str] = [
     "gross_margin", "operating_margin", "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y",
     "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
-    "intrinsic_value", "valuation_score", "forecast_price_1m", "forecast_price_3m",
+    "intrinsic_value", "upside_pct", "valuation_score", "forecast_price_1m", "forecast_price_3m",
     "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket", "value_score", "quality_score",
-    "momentum_score", "growth_score", "overall_score", "opportunity_score", "rank_overall",
+    "momentum_score", "growth_score", "overall_score",
+    "fundamental_view", "technical_view", "risk_view", "value_view",
+    "opportunity_score", "rank_overall",
     "recommendation", "recommendation_reason", "horizon_days", "invest_period_label", "position_qty",
     "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    # v2.6.0 Insights group (Wave 3) — produced by core.insights_builder
+    "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
 ]
 _INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
 _INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
 _DICTIONARY_HEADERS = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
 _DICTIONARY_KEYS = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
+
+# =============================================================================
+# v4.2.0 derived contract widths (TRACKS CANONICAL — no hardcoded 80/83)
+# =============================================================================
+# Every instrument-page width (including My_Investments) derives from
+# len(_CANONICAL_80_KEYS); Top_10 derives as instrument_len + the Top_10
+# extras count. When the static canonical snapshot grows (e.g. synced to the
+# live 115-key registry during cascade #3), ALL of these auto-update with zero
+# further edits. At runtime _expected_len() still prefers the live registry's
+# get_sheet_len() over this static-fallback map, so the route faithfully tracks
+# whatever the deployed registry serves (90 today, 115/118 once #3 lands).
+_CANONICAL_INSTRUMENT_LEN: int = len(_CANONICAL_80_KEYS)
+_TOP10_EXTRA_COUNT: int = len(_TOP10_REQUIRED_FIELDS)
+_TOP10_STATIC_LEN: int = _CANONICAL_INSTRUMENT_LEN + _TOP10_EXTRA_COUNT
+_INSIGHTS_STATIC_LEN: int = len(_INSIGHTS_KEYS)
+_DICTIONARY_STATIC_LEN: int = len(_DICTIONARY_KEYS)
+
+_EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
+    "Market_Leaders": _CANONICAL_INSTRUMENT_LEN,
+    "Global_Markets": _CANONICAL_INSTRUMENT_LEN,
+    "Commodities_FX": _CANONICAL_INSTRUMENT_LEN,
+    "Mutual_Funds": _CANONICAL_INSTRUMENT_LEN,
+    "My_Portfolio": _CANONICAL_INSTRUMENT_LEN,
+    "My_Investments": _CANONICAL_INSTRUMENT_LEN,
+    _TOP10_PAGE: _TOP10_STATIC_LEN,
+    _INSIGHTS_PAGE: _INSIGHTS_STATIC_LEN,
+    _DICTIONARY_PAGE: _DICTIONARY_STATIC_LEN,
+}
 
 EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
     "Market_Leaders": ["2222.SR", "1120.SR", "2010.SR", "7010.SR", "AAPL", "MSFT", "NVDA", "GOOGL"],
@@ -914,28 +1002,53 @@ def _pad_contract(headers: Sequence[str], keys: Sequence[str], expected_len: int
         ks.append(f"{key_prefix}_{i}")
     return hdrs[:expected_len], ks[:expected_len]
 
-def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str], target_len: Optional[int] = None) -> Tuple[List[str], List[str]]:
+    """v4.2.0 [FIX-B]: append the 3 Top_10 extras, then pad to `target_len`.
+
+    The literal `83` clamp this function used to end with was the Top_10
+    truncation point: it silently dropped every column past index 83 —
+    including the v5.78.0 investability gate (forecast_source + 8 gate
+    columns) once the registry/canonical grew to 115. v4.2.0 removes it.
+
+    Width semantics:
+      - target_len is None  -> pad to the natural width (canonical + extras),
+        i.e. no truncation, no extra padding.
+      - target_len provided -> pad UP to it, but NEVER truncate below the
+        canonical+extras we already hold (hard anti-truncation invariant).
+    """
     hdrs, ks = _complete_schema_contract(headers, keys)
     for field in _TOP10_REQUIRED_FIELDS:
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, 83)
+    natural_len = len(ks)
+    if target_len is None:
+        effective_len = natural_len
+    else:
+        try:
+            effective_len = max(int(target_len), natural_len)
+        except Exception:
+            effective_len = natural_len
+    return _pad_contract(hdrs, ks, effective_len)
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
+    # v4.2.0 [FIX-E]: widths derived from list lengths (was literal 83/7/9/80).
     if page == _TOP10_PAGE:
-        h, k = _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS)
+        h, k = _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, target_len=_TOP10_STATIC_LEN)
         return h, k, "static_canonical_top10"
     if page == _INSIGHTS_PAGE:
-        h, k = _pad_contract(_INSIGHTS_HEADERS, _INSIGHTS_KEYS, 7)
+        h, k = _pad_contract(_INSIGHTS_HEADERS, _INSIGHTS_KEYS, _INSIGHTS_STATIC_LEN)
         return h, k, "static_canonical_insights"
     if page == _DICTIONARY_PAGE:
-        h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
+        h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, _DICTIONARY_STATIC_LEN)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, 80))
+    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, _CANONICAL_INSTRUMENT_LEN))
     return h, k, "static_canonical_instrument"
 
 def _expected_len(page: str) -> int:
+    # v4.2.0 [FIX-E]: runtime-authoritative — prefer the live registry's width
+    # so the route tracks whatever the deployed schema_registry serves. Falls
+    # back to the derived static map only when the registry is unavailable.
     if callable(get_sheet_len):
         try:
             n = int(get_sheet_len(page))  # type: ignore[misc]
@@ -943,7 +1056,7 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    return _EXPECTED_SHEET_LENGTHS.get(page, 80)
+    return _EXPECTED_SHEET_LENGTHS.get(page, _CANONICAL_INSTRUMENT_LEN)
 
 def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
     headers: List[str] = []
@@ -998,7 +1111,9 @@ def _resolve_contract(page: str) -> Tuple[List[str], List[str], Any, str]:
     if headers and keys:
         headers, keys = _complete_schema_contract(headers, keys)
         if page == _TOP10_PAGE:
-            headers, keys = _ensure_top10_contract(headers, keys)
+            # v4.2.0 [FIX-C]: pass the registry-derived width so a 118-col
+            # registry result is preserved (was clamped to the literal 83).
+            headers, keys = _ensure_top10_contract(headers, keys, target_len=expected_len)
         else:
             headers, keys = _pad_contract(headers, keys, expected_len)
         return headers, keys, spec, source
@@ -1432,6 +1547,12 @@ def _normalize_external_payload(
     success path carries the same `meta.provider_health` field as the
     fail-soft path. Also lifts systemic markers from row warnings into
     envelope-level `warnings`.
+
+    v4.2.0 note: `keys` here is the registry-derived contract from
+    `_resolve_contract` (115/118 once the registry is at the gate width).
+    Rows are projected onto `keys` directly — no re-clamp — so gate columns
+    survive whenever the registry serves them. This is why there is no
+    third truncation point in this route (unlike analysis_sheet_rows v4.4.0).
     """
     ext = dict(external_payload or {})
     hdrs = list(headers or [])
@@ -1509,7 +1630,8 @@ async def _run_advanced_sheet_rows_impl(
             include_matrix=include_matrix, request_id=request_id, started_at=start,
             mode=mode, status_out="success", error_out=None,
             meta={"dispatch": "schema_only", "schema_source": schema_source,
-                  "headers_only": headers_only, "schema_only": schema_only},
+                  "headers_only": headers_only, "schema_only": schema_only,
+                  "contract_len": len(keys)},
         )
 
     # v4.1.0 [ADD-E]: fetch provider_health snapshot ONCE per request.
@@ -1612,6 +1734,17 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
         "provider_health_endpoint_enabled": True,
         "provider_health_summary": provider_health_summary,
         "provider_unhealthy_count": provider_unhealthy_count,
+        # v4.2.0: expose the registry-derived contract widths this route is
+        # serving so operators can confirm whether Top_10 is at the full
+        # canonical width or still tracking a stale 90/93 registry.
+        "contract_widths": {
+            "instrument_static_fallback": _CANONICAL_INSTRUMENT_LEN,
+            "top10_static_fallback": _TOP10_STATIC_LEN,
+            "market_leaders_effective": _expected_len("Market_Leaders"),
+            "top10_effective": _expected_len(_TOP10_PAGE),
+            "insights_effective": _expected_len(_INSIGHTS_PAGE),
+            "dictionary_effective": _expected_len(_DICTIONARY_PAGE),
+        },
         "allowed_pages_count": len(_safe_allowed_pages()),
         "path": str(getattr(getattr(request, "url", None), "path", "")),
     })
@@ -1630,8 +1763,8 @@ async def schema_provider_health(request: Request) -> Dict[str, Any]:
     Response shape:
       {
         "status": "success" | "unavailable",
-        "version": "4.1.0",
-        "engine_version": "5.61.0",
+        "version": "4.2.0",
+        "engine_version": "5.78.0",
         "provider_health": {
           "unhealthy_markers": {
             "active": [{"provider": "eodhd", "ttl_remaining_sec": 247.3}],
@@ -1640,7 +1773,7 @@ async def schema_provider_health(request: Request) -> Dict[str, Any]:
             "skip_enabled": false,
             "default_ttl_sec": 300.0
           },
-          "engine_version": "5.61.0"
+          "engine_version": "5.78.0"
         },
         "timestamp_utc": "2026-05-12T10:24:31.482Z",
         "request_id": "...",
