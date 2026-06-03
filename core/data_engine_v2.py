@@ -2,8 +2,58 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.79.5
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.79.6
 ================================================================================
+
+WHY v5.79.6 - PROVIDER-NAME RESOLUTION (Fix R): 'yahoo' -> yahoo_chart_provider
+-------------------------------------------------------------------------------
+One engine-only correctness fix. NO schema change (still 115/115, 00_Config
+v1.11.0 unaffected, no frontend redeploy). No env flag.
+
+  THE BUG (live Render diagnosis, 2222.SR / Market_Leaders): the entire KSA
+  (.SR) book and the Commodities/FX (=F / =X) book arrived with a BLANK current
+  price -> forced HOLD / BLOCKED "Missing current price", even though Yahoo
+  prices these symbols perfectly (verified: yahoo_chart.fetch_quote('2222.SR')
+  -> current_price 27.38, data_quality EXCELLENT). Root cause is a provider-name
+  mismatch, NOT a missing provider or dead data source. The DEFAULT_* provider
+  lists name the Yahoo source 'yahoo', but ProviderRegistry.get resolves a name
+  by trying import paths with the suffixes _provider/_client/_quotes/_data ONLY
+  -- never _chart_provider. The on-disk module is yahoo_chart_provider.py, so
+  get('yahoo') returned None (added to _missing) while get('yahoo_chart')
+  returned the working module. _fetch_patch saw mod is None and returned {} with
+  NO log line, so on every page Yahoo was silently skipped. The other configured
+  providers do not cover the gap -- eodhd 404s on .SR and does not price =F/=X,
+  finnhub has no KSA/commodity coverage -- so those two books were starved. The
+  Top_10 page looked fine only because its /v1/advanced route reaches
+  yahoo_chart through a different path.
+
+  THE FIX (Fix R), three parts, all in this file:
+    1. ProviderRegistry now canonicalises a small alias map BEFORE resolution
+       (_PROVIDER_REGISTRY_ALIASES: 'yahoo' -> 'yahoo_chart', 'yfinance' ->
+       'yahoo_chart'), so any caller passing 'yahoo' reaches the real module.
+       Provably safe: the existing candidate loop already proves nothing else
+       resolves 'yahoo', so the alias cannot shadow a real module.
+    2. The DEFAULT_PROVIDERS / DEFAULT_KSA_PROVIDERS / DEFAULT_GLOBAL_PROVIDERS
+       lists now name 'yahoo_chart' directly, so the canonical name is correct
+       and the data_provider attribution on each row is accurate (no longer the
+       non-resolving 'yahoo' label).
+    3. Visibility: ProviderRegistry.get now logs ONE warning the first time a
+       provider name fails to resolve to any importable module (immediately
+       before adding it to _missing; bounded to once per name because _missing
+       short-circuits subsequent calls). This is the log line whose absence let
+       the bug hide -- a misconfigured provider name now surfaces loudly instead
+       of looking identical to a transient fetch failure.
+  No verdict logic, scoring, gate, or schema is touched; every prior fix is
+  preserved verbatim.
+
+VALIDATION (post-deploy)
+  - registry.get('yahoo') now returns the yahoo_chart module (not None);
+    _providers_for('Market_Leaders') -> ['eodhd','yahoo_chart','finnhub'].
+  - A KSA spot check prices: get_enriched_quote_dict('2222.SR','Market_Leaders')
+    now carries current_price ~27-28 with data_provider 'yahoo_chart', not
+    "recommendation_forced_hold_missing_price".
+  - Commodities/FX (=F / =X) rows populate current_price via yahoo_chart.
+  - /health: version 5.79.6; schema still 115.
 
 WHY v5.79.5 - GATE PRICE-COLUMN CONSISTENCY (Fix Q)
 ---------------------------------------------------
@@ -1255,7 +1305,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.79.5"
+__version__ = "5.79.6"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -3922,9 +3972,9 @@ PAGE_SYMBOL_ENV_KEYS: Dict[str, str] = {
     "Top_10_Investments": "TOP10_FALLBACK_SYMBOLS",
 }
 
-DEFAULT_PROVIDERS = ["eodhd", "yahoo", "finnhub"]
-DEFAULT_KSA_PROVIDERS = ["tadawul", "argaam", "yahoo"]
-DEFAULT_GLOBAL_PROVIDERS = ["eodhd", "yahoo", "finnhub"]
+DEFAULT_PROVIDERS = ["eodhd", "yahoo_chart", "finnhub"]
+DEFAULT_KSA_PROVIDERS = ["tadawul", "argaam", "yahoo_chart"]
+DEFAULT_GLOBAL_PROVIDERS = ["eodhd", "yahoo_chart", "finnhub"]
 NON_KSA_EODHD_PRIMARY_PAGES = {"Global_Markets", "Commodities_FX", "Mutual_Funds"}
 PAGE_PRIMARY_PROVIDER_DEFAULTS = {page: "eodhd" for page in NON_KSA_EODHD_PRIMARY_PAGES}
 PROVIDER_PRIORITIES = {
@@ -6801,6 +6851,21 @@ class MultiLevelCache:
 class ProviderRegistry:
     """Late-bound, optional provider module registry."""
 
+    # v5.79.6 (Fix R): logical provider-name -> importable module key. The
+    # DEFAULT_* lists historically named the Yahoo source 'yahoo', but the
+    # importable module is yahoo_chart_provider.py and the candidate-suffix loop
+    # in get() only tries _provider/_client/_quotes/_data (never _chart_provider),
+    # so 'yahoo' resolved to None and Yahoo was silently skipped on every page --
+    # starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices.
+    # Canonicalising here is provably safe: the candidate loop already proves
+    # nothing else resolves 'yahoo'/'yfinance', so the alias cannot shadow a real
+    # module. The DEFAULT_* lists were also updated to 'yahoo_chart' directly;
+    # this map remains as a safety net for any other caller passing 'yahoo'.
+    _ALIASES: Dict[str, str] = {
+        "yahoo": "yahoo_chart",
+        "yfinance": "yahoo_chart",
+    }
+
     def __init__(self) -> None:
         self._modules: Dict[str, Any] = {}
         self._missing: Set[str] = set()
@@ -6808,6 +6873,8 @@ class ProviderRegistry:
     def get(self, name: str) -> Optional[Any]:
         if not name:
             return None
+        # v5.79.6 (Fix R): resolve logical aliases before any lookup/caching.
+        name = self._ALIASES.get(name, name)
         if name in self._modules:
             return self._modules[name]
         if name in self._missing:
@@ -6824,6 +6891,15 @@ class ProviderRegistry:
                 return mod
             except Exception:
                 continue
+        # v5.79.6 (Fix R): surface an unresolved provider name exactly ONCE
+        # (subsequent calls short-circuit at the _missing check above). The
+        # absence of this line is what let the 'yahoo' mismatch hide in prod --
+        # a misconfigured provider name looked identical to a transient miss.
+        logger.warning(
+            "[engine_v2 v%s] ProviderRegistry: provider %r did not resolve to any "
+            "importable module; it will be skipped on every row until configured",
+            __version__, name,
+        )
         self._missing.add(name)
         return None
 
@@ -8171,7 +8247,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.79.5",  # v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
+                "version": "v5.79.6",  # v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
