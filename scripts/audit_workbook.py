@@ -2,9 +2,21 @@
 """
 scripts/audit_workbook.py
 ================================================================================
-TADAWUL FAST BRIDGE — OFFLINE WORKBOOK AUDITOR (v1.1.0)
+TADAWUL FAST BRIDGE — OFFLINE WORKBOOK AUDITOR (v1.2.0)
 ================================================================================
 Static / file-based / network-free / deterministic / engine-contract-aware
+
+HOW TO USE IT (the easy way — nothing to set up)
+------------------------------------------------
+  1. Open your Google Sheet -> File -> Download -> Microsoft Excel (.xlsx).
+  2. Run:  python audit_workbook.py
+That's it. The script installs what it needs, finds the file you just
+downloaded (it checks Downloads, Desktop, Documents, and the current folder),
+audits it, prints a plain-English report, and saves three report files into a
+"tfb_audit" folder. No flags, no pip, no paths to remember.
+
+If auto-detection ever picks the wrong file, point it at one directly:
+  python audit_workbook.py -w /path/to/your_export.xlsx
 
 Why this exists
 ---------------
@@ -17,37 +29,36 @@ drift, 52W coherence, subunit (GBp/ZAC/ILA) market-cap normalisation, structural
 fallback clusters, the v5.74+ investability gate, and sheet hygiene.
 
 It is ADDITIVE: it does not import, replace, or alter the live auditor or any
-core engine module. Pure stdlib + openpyxl. Import-safe. No I/O beyond reading
-the workbook and writing the report files you ask for.
+core engine module. Stdlib + openpyxl (auto-installed on first run). Import-safe.
 
 Design choices that prevent false positives
 --------------------------------------------
 - Field scale is per-field, not per-name. `Percent Change`, `Dividend Yield`,
-  margins, ROI, volatility, drawdown, VaR, `Upside %`, `Unrealized P/L %` are
-  stored as DECIMAL FRACTIONS (0.0374 == 3.74%). `52W Position %` and every
-  *Score* column are 0–100. `Overall Penalty Factor` is [0,1]. These three
-  classes are checked with different bounds — matching the engine's anti-percent
-  guards (overall_penalty_factor / data_quality_score / forecast_reliability_score
-  are NOT decimal-fraction fields).
-- "Real row" == non-empty Symbol. Trailing/interior blank rows (a downloaded
-  sheet may carry thousands of pre-formatted empty rows) are counted as HYGIENE,
-  never as data defects.
-- Field resolution is by HEADER NAME, so pages of differing width
-  (Top_10 = 83/85 cols, instrument pages = 115) all resolve correctly.
+  margins, ROI, volatility, `Upside %`, `Unrealized P/L %` are stored as DECIMAL
+  FRACTIONS (0.0374 == 3.74%). `52W Position %` and every *Score* column are
+  0–100. `Overall Penalty Factor` is [0,1]. These classes are checked with
+  different bounds — matching the engine's anti-percent guards.
+- `Max Drawdown 1Y` uses an inconsistent sign across pages in real exports, so
+  it is range-checked per row but only flagged when its sign convention is
+  *mixed within a page* (a comparability issue, not a per-row error).
+- Gate status/action coherence uses a data-validated contradiction deny-list,
+  so the intended WATCHLIST+DO_NOT_INVEST pairing is never flagged.
+- "Real row" == non-empty Symbol. Thousands of trailing pre-formatted blank
+  rows are counted as HYGIENE, never as data defects.
+- Field resolution is by HEADER NAME, so pages of differing width all resolve.
 
-CLI
----
-  python scripts/audit_workbook.py --workbook export.xlsx \
-      --json-out audit_report.json --csv-out audit_findings.csv
-  python scripts/audit_workbook.py --workbook export.xlsx --pages Global_Markets My_Portfolio
-  python scripts/audit_workbook.py --workbook export.xlsx --include-info --quiet
+Outputs (written automatically into ./tfb_audit/)
+-------------------------------------------------
+  audit_summary.txt   plain-English report, complete findings list
+  audit_report.json   machine-readable
+  audit_findings.csv  one row per finding (opens in Excel)
 
 Exit codes (stable)
 -------------------
   0 = clean (no WARN/HIGH/CRITICAL)
   1 = at least one WARN
   2 = at least one HIGH
-  3 = at least one CRITICAL
+  3 = at least one CRITICAL  (also used for "no workbook found")
 """
 
 from __future__ import annotations
@@ -63,13 +74,33 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-try:
-    from openpyxl import load_workbook
-except Exception as exc:  # pragma: no cover
-    print("FATAL: openpyxl is required (pip install openpyxl). Detail:", exc, file=sys.stderr)
-    raise
+def _ensure_openpyxl():
+    """Import openpyxl; if it isn't installed, install it automatically (one time)
+    so the user never has to run pip themselves."""
+    try:
+        from openpyxl import load_workbook as _lw
+        return _lw
+    except Exception:
+        pass
+    print("[setup] openpyxl not found — installing it for you (one-time)…")
+    import subprocess
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "openpyxl"]
+        )
+    except Exception as exc:  # pragma: no cover
+        print("FATAL: could not auto-install openpyxl. Run this once manually:\n"
+              "    %s -m pip install openpyxl\nDetail: %s" % (sys.executable, exc),
+              file=sys.stderr)
+        sys.exit(3)
+    from openpyxl import load_workbook as _lw  # retry after install
+    print("[setup] openpyxl installed.")
+    return _lw
 
-__version__ = "1.1.0"
+
+load_workbook = _ensure_openpyxl()
+
+__version__ = "1.2.0"
 
 # =============================================================================
 # Severity model
@@ -834,18 +865,20 @@ def write_csv(all_findings: List[Finding], path: str) -> None:
             w.writerow({c: d.get(c, "") for c in cols})
 
 
-def print_console(report: Dict[str, Any], include_info: bool) -> None:
+def _report_lines(report: Dict[str, Any], include_info: bool) -> List[str]:
+    """Build the human-readable report as a list of lines (used for both the
+    console and the saved .txt summary, so they never drift apart)."""
     g = report["global_severity_counts"]
-    print("=" * 78)
-    print("TFB OFFLINE WORKBOOK AUDITOR  v%s" % report["auditor_version"])
-    print("Workbook : %s" % report["workbook"])
-    print("Generated: %s" % report["generated_utc"])
-    print("=" * 78)
-    print("PER-PAGE SUMMARY")
-    print("-" * 78)
-    hdr = "%-20s %6s %6s %6s | %4s %4s %4s %4s" % (
-        "Page", "rows", "real", "empty", "INFO", "WARN", "HIGH", "CRIT")
-    print(hdr)
+    L: List[str] = []
+    L.append("=" * 78)
+    L.append("TFB OFFLINE WORKBOOK AUDITOR  v%s" % report["auditor_version"])
+    L.append("Workbook : %s" % report["workbook"])
+    L.append("Generated: %s" % report["generated_utc"])
+    L.append("=" * 78)
+    L.append("PER-PAGE SUMMARY")
+    L.append("-" * 78)
+    L.append("%-20s %6s %6s %6s | %4s %4s %4s %4s" % (
+        "Page", "rows", "real", "empty", "INFO", "WARN", "HIGH", "CRIT"))
     for s in report["page_summaries"]:
         sc = s["severity_counts"]
         gate = ""
@@ -854,60 +887,155 @@ def print_console(report: Dict[str, Any], include_info: bool) -> None:
                                      s.get("gate_status_distribution", {}))
         elif s.get("gate_present") is False:
             gate = "  gate:absent"
-        print("%-20s %6d %6d %6d | %4d %4d %4d %4d%s" % (
+        L.append("%-20s %6d %6d %6d | %4d %4d %4d %4d%s" % (
             s["page"], s["total_rows"], s["real_rows"], s["empty_rows"],
             sc[SEV_INFO], sc[SEV_WARN], sc[SEV_HIGH], sc[SEV_CRIT], gate))
-    print("-" * 78)
-    print("GLOBAL: INFO=%d  WARN=%d  HIGH=%d  CRITICAL=%d   (max severity: %s)" % (
+    L.append("-" * 78)
+    L.append("GLOBAL: INFO=%d  WARN=%d  HIGH=%d  CRITICAL=%d   (max severity: %s)" % (
         g[SEV_INFO], g[SEV_WARN], g[SEV_HIGH], g[SEV_CRIT], report["max_severity"]))
-    print("Finding codes:", json.dumps(report["global_finding_codes"], indent=0))
-    print("=" * 78)
+    L.append("Finding codes: " + json.dumps(report["global_finding_codes"]))
+    L.append("=" * 78)
 
-    # Top findings (suppress INFO unless asked).
     shown = [f for f in report["findings"]
              if include_info or f["severity"] != SEV_INFO]
     shown.sort(key=lambda f: (-_SEV_RANK[f["severity"]], f["page"], f["code"]))
     if shown:
-        print("FINDINGS (most severe first; %d shown)" % len(shown))
-        print("-" * 78)
-        for f in shown[:60]:
+        L.append("FINDINGS (most severe first; %d shown)" % len(shown))
+        L.append("-" * 78)
+        for f in shown:
             loc = ("row %s" % f["sheet_row"]) if f["sheet_row"] else "-"
             sym = (" [%s]" % f["symbol"]) if f["symbol"] else ""
-            print("[%-8s] %-22s %-20s %s%s — %s" % (
+            L.append("[%-8s] %-22s %-20s %s%s — %s" % (
                 f["severity"], f["code"], f["page"], loc, sym, f["message"]))
-        if len(shown) > 60:
-            print("… %d more (see CSV/JSON)." % (len(shown) - 60))
-    print("=" * 78)
+    else:
+        L.append("No findings at or above WARN. The workbook looks clean.")
+    L.append("=" * 78)
+    return L
+
+
+def print_console(report: Dict[str, Any], include_info: bool) -> None:
+    # Console caps the findings list; the saved .txt holds the complete list.
+    g = report["global_severity_counts"]
+    lines = _report_lines(report, include_info)
+    # Find where the FINDINGS section starts so we can cap just that part.
+    out: List[str] = []
+    in_findings = False
+    findings_emitted = 0
+    for ln in lines:
+        if ln.startswith("FINDINGS ("):
+            in_findings = True
+        if in_findings and ln.startswith("["):
+            findings_emitted += 1
+            if findings_emitted == 61:
+                out.append("… more findings — see the saved report files.")
+            if findings_emitted >= 61:
+                continue
+        out.append(ln)
+    print("\n".join(out))
+
+
+def write_summary_txt(report: Dict[str, Any], path: str, include_info: bool) -> None:
+    Path(path).write_text("\n".join(_report_lines(report, include_info)) + "\n",
+                          encoding="utf-8")
 
 
 # =============================================================================
 # CLI
 # =============================================================================
+def discover_workbook(explicit: Optional[str]) -> Optional[Path]:
+    """Find the workbook to audit.
+
+    If the user passed a path, use it. Otherwise look in the usual places a
+    downloaded sheet lands and pick the most recently modified .xlsx, so the
+    user can just run the script with no arguments after downloading.
+    """
+    if explicit:
+        p = Path(explicit).expanduser()
+        return p if p.exists() else None
+
+    home = Path.home()
+    search_dirs = [
+        Path.cwd(),
+        home / "Downloads",
+        home / "Desktop",
+        home / "Documents",
+        Path(__file__).resolve().parent,
+    ]
+    seen: set = set()
+    candidates: List[Path] = []
+    for d in search_dirs:
+        try:
+            if not d.exists() or d in seen:
+                continue
+            seen.add(d)
+            for f in d.glob("*.xlsx"):
+                # Skip Excel lock/temp files like "~$Book.xlsx".
+                if f.name.startswith("~$"):
+                    continue
+                candidates.append(f)
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    # Newest first.
+    candidates.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="TFB offline workbook auditor (static .xlsx).")
-    p.add_argument("--workbook", "-w", required=True, help="Path to exported .xlsx")
+    p = argparse.ArgumentParser(
+        description="TFB offline workbook auditor. Just run it after downloading "
+                    "the Google Sheet as Excel — it finds the file and writes the "
+                    "report automatically. All flags are optional.")
+    p.add_argument("--workbook", "-w", default=None,
+                   help="Path to the exported .xlsx (optional; auto-detected if omitted).")
     p.add_argument("--pages", nargs="*", default=None,
                    help="Subset of data pages to audit (default: all recognised).")
-    p.add_argument("--json-out", default=None, help="Write full JSON report here.")
-    p.add_argument("--csv-out", default=None, help="Write per-finding CSV here.")
+    p.add_argument("--out-dir", default=None,
+                   help="Folder for the report files (default: ./tfb_audit next to where you run it).")
+    p.add_argument("--json-out", default=None, help="Override the JSON report path.")
+    p.add_argument("--csv-out", default=None, help="Override the CSV findings path.")
     p.add_argument("--min-cluster", type=int, default=25,
                    help="Min identical-value count to flag a fallback cluster (default 25).")
     p.add_argument("--include-info", action="store_true",
-                   help="Show INFO findings in the console.")
+                   help="Show INFO findings in the console too.")
     p.add_argument("--quiet", action="store_true", help="Suppress the console report.")
     return p.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    wb_path = args.workbook
-    if not Path(wb_path).exists():
-        print("FATAL: workbook not found: %s" % wb_path, file=sys.stderr)
-        return 3
 
+    # 1) Find the workbook (explicit path, else auto-detect).
+    wb_file = discover_workbook(args.workbook)
+    if wb_file is None:
+        if args.workbook:
+            print("FATAL: workbook not found: %s" % args.workbook, file=sys.stderr)
+        else:
+            print("=" * 78, file=sys.stderr)
+            print("Couldn't find a workbook to audit.", file=sys.stderr)
+            print("Do this:", file=sys.stderr)
+            print("  1. Open your Google Sheet.", file=sys.stderr)
+            print("  2. File -> Download -> Microsoft Excel (.xlsx).", file=sys.stderr)
+            print("  3. Run this script again (it checks Downloads/Desktop/this folder).", file=sys.stderr)
+            print("Or point it straight at the file:", file=sys.stderr)
+            print("     python audit_workbook.py -w /path/to/your_export.xlsx", file=sys.stderr)
+            print("=" * 78, file=sys.stderr)
+        return 3
+    wb_path = str(wb_file)
+    if not args.quiet:
+        print("Auditing workbook: %s" % wb_path)
+
+    # 2) Decide where the report files go (auto-created).
+    out_dir = Path(args.out_dir).expanduser() if args.out_dir else (Path.cwd() / "tfb_audit")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = args.json_out or str(out_dir / "audit_report.json")
+    csv_path = args.csv_out or str(out_dir / "audit_findings.csv")
+    txt_path = str(out_dir / "audit_summary.txt")
+
+    # 3) Load and select pages.
     wb = load_workbook(wb_path, read_only=True, data_only=True)
     sheetnames = set(wb.sheetnames)
-
     if args.pages:
         targets = [p for p in args.pages if p in sheetnames]
         skipped = [p for p in args.pages if p not in sheetnames]
@@ -915,26 +1043,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("WARN: requested page not in workbook, skipping: %s" % s, file=sys.stderr)
     else:
         targets = [p for p in KNOWN_DATA_PAGES if p in sheetnames]
-
     if not targets:
-        print("FATAL: no recognised data pages found to audit.", file=sys.stderr)
+        print("FATAL: no recognised data pages found to audit. Sheets present: %s"
+              % sorted(sheetnames), file=sys.stderr)
         return 3
 
+    # 4) Audit.
     page_summaries: List[Dict[str, Any]] = []
     all_findings: List[Finding] = []
     for name in targets:
         summary, findings = audit_page(wb, name, args.min_cluster)
         page_summaries.append(summary)
         all_findings.extend(findings)
-
     report = build_report(wb_path, page_summaries, all_findings)
 
-    if args.json_out:
-        write_json(report, args.json_out)
-    if args.csv_out:
-        write_csv(all_findings, args.csv_out)
+    # 5) Always write all three report files.
+    write_json(report, json_path)
+    write_csv(all_findings, csv_path)
+    write_summary_txt(report, txt_path, include_info=True)
+
+    # 6) Console report + where-to-find-it footer.
     if not args.quiet:
         print_console(report, include_info=args.include_info)
+        print("Report files written to: %s" % out_dir)
+        print("  - audit_summary.txt   (plain-English, full findings list)")
+        print("  - audit_report.json   (machine-readable)")
+        print("  - audit_findings.csv  (one row per finding, open in Excel)")
+        verdict = report["max_severity"]
+        if verdict == SEV_CRIT:
+            print("VERDICT: CRITICAL — there are rows that can't be acted on. See the summary.")
+        elif verdict == SEV_HIGH:
+            print("VERDICT: HIGH — some values look wrong. See the summary.")
+        elif verdict == SEV_WARN:
+            print("VERDICT: WARN — minor/structural issues only.")
+        else:
+            print("VERDICT: CLEAN — nothing at or above WARN.")
 
     max_rank = _SEV_RANK[report["max_severity"]]
     return _EXIT_FOR_RANK.get(max_rank, 0)
