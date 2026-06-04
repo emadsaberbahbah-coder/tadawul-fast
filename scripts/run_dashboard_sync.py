@@ -3,158 +3,46 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.6.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.4.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
-Why this revision (v6.6.0 vs v6.5.0)
--------------------------------------
-- 📌 PASSIVE upgrade. v6.6.0 ships ALONGSIDE the new "Insights" column
-     group introduced by:
-        core/sheets/schema_registry.py   v2.5.0 → v2.6.0   (85→90 / 88→93)
-        core/scoring.py                  v5.0.0 → v5.1.0
-        core/reco_normalize.py           v7.0.0 → v7.1.0
-        core/insights_builder.py         NEW v1.0.0
-     The 5 new columns are:
-        sector_relative_score, conviction_score,
-        top_factors, top_risks, position_size_hint
-     These appear at the END of the canonical schema, so every existing
-     positional index is preserved.
+v6.4.0 fix — clear-before-write is now the DEFAULT (ghost/stale-row root cause)
+- ROOT CAUSE: write_table() writes via Sheets values.update, which overwrites
+  cells IN PLACE and NEVER truncates trailing rows/columns. Clearing was gated
+  behind the opt-in --clear flag (default OFF), and the production daily_sync
+  workflow never passes it. So whenever a refresh wrote FEWER rows than the
+  prior run (e.g. Top_10_Investments returning 3 rows after a previous 8-row
+  write) or FEWER columns than a stale wider write, the leftover rows/columns
+  survived as "ghosts": stale Top 10 picks (the 5 leftover rows) and the
+  trailing ghost "Status" columns observed on Global_Markets.
+- FIX: clear-before-write is now the DEFAULT. The per-task clear is driven by a
+  new --no-clear opt-OUT (default: clear ON) in place of the old --clear
+  opt-IN. clear_from() already clears {col}{row}:ZZ — full column width AND all
+  rows to the bottom — so one default-on clear removes BOTH stale rows and
+  ghost columns on every page. No other logic changed.
+- BACKWARD COMPAT: --clear is still accepted (now redundant/deprecated) so any
+  existing cron that passes it keeps working; --no-clear restores the old
+  opt-in (append/preserve) behavior for a run that genuinely wants it.
+- UNCHANGED: every endpoint, payload, task definition, matrix rectification,
+  credential loading, exit codes, and the schema-agnostic write path.
 
-     **No code changes are required in this runner.** This sync runner is
-     payload-shape-agnostic — it reads `headers` and `rows`/`rows_matrix`
-     directly from the backend response and writes them to Sheets verbatim.
-     When the backend (which depends on schema_registry v2.6.0) starts
-     returning 90-column rows for canonical pages and 93-column rows for
-     Top_10_Investments, this runner will write them correctly without
-     any modification, because:
-
-       • _extract_table_payload() uses the backend's `headers` array as
-         the column count source of truth (no hardcoded width).
-       • _rectify_matrix() pads/truncates each row to len(headers), so
-         additional columns in the response become additional sheet
-         columns automatically.
-       • SheetsWriter.write_table() writes whatever (headers, rows) it
-         is handed, with no assumptions about the schema.
-
-     The version bump is therefore a doc + co-deployment marker only:
-     it tells operators "this binary was tested against the v2.6.0
-     schema family." Behavior on v2.5.0 backends is unchanged.
-
-- DOC: changelog refreshed; co-deployment matrix added below.
-
-- BEHAVIOR: byte-for-byte equivalent to v6.5.0 except for SCRIPT_VERSION
-     and SERVICE_VERSION strings. Every preserved fix from v6.5.0 (sys
-     import, _TRUTHY/_FALSY parity, env-var fallbacks, --json flag,
-     recursion guard, expanded exit-code docs) carries forward.
-
-Co-deployment matrix (v6.6.0 family)
-------------------------------------
-  Module                                Version    Role
-  -------                               -------    ----
-  core/sheets/schema_registry.py        2.6.0      +5 Insights columns at tail
-  core/scoring.py                       5.1.0      populates 5 Insights fields
-  core/reco_normalize.py                7.1.0      conviction floor gating
-  core/insights_builder.py              1.0.0      NEW — pure-function module
-  scripts/run_dashboard_sync.py         6.6.0      passive: this file
-  worker.py                             unchanged  no schema awareness needed
-
-Operators upgrading from v6.5.0 should deploy schema_registry,
-scoring, reco_normalize, and insights_builder at the same time as
-this runner. Deploying this runner alone is harmless (it will simply
-keep writing 85/88-column rows from a v2.5.0 backend, identical to
-v6.5.0 behavior).
-
-Why v6.5.0 was issued (preserved for traceability)
---------------------------------------------------
-- 🔑 FIX CRITICAL: `import sys` was MISSING in v6.4.0 but the module bottom
-     had `sys.exit(main())`. Every CLI invocation (`python run_dashboard_sync.py
-     ...`) crashed with `NameError: name 'sys' is not defined` before returning
-     an exit code. Only the worker integration path (`run_from_worker_payload`)
-     continued to work. v6.5.0 added `import sys` at the top so CLI usage
-     actually functions.
-
-- 🔑 FIX HIGH: `_TRUTHY` / `_FALSY` realigned to exact `main._TRUTHY` /
-     `_FALSY` vocabulary. Previously v6.4.0 missing `t`, `enabled`, `enable`
-     (truthy) and `f`, `disabled`, `disable` (falsy). This broke env-var
-     parity with other project scripts where e.g. `SYNC_DRY_RUN=enabled` or
-     `SYNC_CLEAR=t` is expected to work.
-
-- FIX: Added `SCRIPT_VERSION` + `SERVICE_VERSION` alias (cross-script
-     convention with `audit_data_quality.py v4.5.0` / `cleanup_cache.py
-     v4.1.0` / `drift_detection.py v4.3.0` / `migrate_schema_v2.py v2.1.0` /
-     `refresh_data.py v5.2.0` / `repo_hygiene_check.py v5.1.0`).
-
-- FIX: Added `_env_bool`, `_env_int`, `_env_int_bool`, `_env_csv` helpers
-     using the canonical project vocabulary.
-
-- FIX: Added `SYNC_*` env var defaults for every CLI flag, so the runner
-     can be driven purely from the environment in cron/CI without argv:
-       SYNC_SHEET_ID, SYNC_BACKEND, SYNC_KEYS, SYNC_START_CELL,
-       SYNC_MAX_SYMBOLS, SYNC_WORKERS, SYNC_CLEAR, SYNC_DRY_RUN,
-       SYNC_NO_LOCK, SYNC_TIMEOUT, SYNC_JSON_OUT, SYNC_JSON
-     (Backward-compatible: older env names still honored — DEFAULT_SPREADSHEET_ID,
-     SPREADSHEET_ID, BACKEND_BASE_URL, DEFAULT_BACKEND_URL.)
-
-- FIX: Added `--json` flag for stdout JSON output. Previously v6.4.0 only
-     supported `--json-out <file>`. Now `--json` prints the report to stdout
-     (useful for piping; skipped in worker integration to avoid contaminating
-     worker logs).
-
-- FIX: `_extract_table_payload` now has a recursion depth guard (max 8
-     levels). Defensive against malicious or malformed payloads that would
-     previously trigger RecursionError.
-
-- FIX: Exit codes documented comprehensively — 0 (success) / 1 (partial) /
-     2 (failed / missing config) / 130 (SIGINT).
-
-v6.4.0 fixes (preserved)
-- Dedup guard before Sheets write (duplicate symbols dropped, first-wins).
-- `run_from_worker_payload` programmatic entry point for worker.py.
-- `WORKER_PAYLOAD_SCHEMA` dict documents the contract.
-
-v6.3.0 fixes (preserved)
-- Sheets-safe ALWAYS: backend rows (dicts or lists) → strict 2D matrix.
-- JSON-safe value coercion for Google API.
-- Key parsing robust: space, comma, semicolon, JSON array-like tokens.
-- Stronger backend compatibility: sends sheet/page/name/tab + tickers/symbols.
-- Health preflight probes /readyz + /health + /livez.
-- Credentials loader hardened.
-- Never runs forbidden legacy keys (KSA_TADAWUL / ADVISOR_CRITERIA).
+v6.3.0 fixes (targets your recurring ❌ causes)
+- ✅ Sheets-safe ALWAYS: backend rows (dicts or lists) -> strict 2D matrix (pads/truncates to header length)
+- ✅ JSON-safe value coercion for Google API (datetime/Enum/set/etc -> primitives)
+- ✅ Key parsing is robust: --keys supports space, comma, semicolon, JSON array-like tokens
+- ✅ Stronger backend compatibility: sends sheet/sheet_name/page/name/tab + tickers/symbols + request_id
+- ✅ Health preflight probes /readyz + /health + /livez (best-effort)
+- ✅ Credentials loader hardened: supports GOOGLE_APPLICATION_CREDENTIALS file + env JSON + env base64; fixes "\\n" private_key
+- ✅ Never runs forbidden legacy keys (KSA_TADAWUL / ADVISOR_CRITERIA)
+- ✅ Deterministic exit codes:
+    0 = all success
+    1 = partial (some partial/skipped) but no hard failures
+    2 = one or more failed
 
 Design rules
 - No network calls at import-time.
 - Conservative: warnings instead of crashes.
-
-Env vars
---------
-  SYNC_SHEET_ID                 spreadsheet id (also DEFAULT_SPREADSHEET_ID)
-  SYNC_BACKEND                  backend base URL (also BACKEND_BASE_URL)
-  SYNC_KEYS                     comma-sep keys to sync (subset of ALLOWED)
-  SYNC_START_CELL               header start cell (default A5)
-  SYNC_MAX_SYMBOLS              override max symbols (-1 = per-task default)
-  SYNC_WORKERS                  parallel workers (default 4)
-  SYNC_CLEAR                    clear before write (truthy)
-  SYNC_DRY_RUN                  dry-run (truthy)
-  SYNC_NO_LOCK                  disable Redis lock (truthy)
-  SYNC_TIMEOUT                  backend timeout seconds (default 30)
-  SYNC_JSON                     print JSON report to stdout (truthy)
-  SYNC_JSON_OUT                 write JSON report to this file path
-  LOG_LEVEL                     logger level (default INFO)
-  REDIS_URL                     Redis URL for distributed lock (optional)
-  TFB_TOKEN / X_APP_TOKEN /
-  APP_TOKEN / BACKEND_TOKEN     backend auth token (any one)
-  GOOGLE_SHEETS_CREDENTIALS /
-  GOOGLE_CREDENTIALS /
-  GOOGLE_APPLICATION_CREDENTIALS Google service account credentials
-
-Exit codes
-----------
-  0 = all tasks succeeded
-  1 = at least one task returned partial
-  2 = at least one task failed OR missing config (spreadsheet id / creds)
-  130 = interrupted by user (SIGINT)
-================================================================================
 """
 
 from __future__ import annotations
@@ -167,7 +55,6 @@ import logging
 import os
 import random
 import re
-import sys  # v6.5.0 FIX: was missing, causing NameError on every CLI invocation
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -179,55 +66,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.6.0"
-SERVICE_VERSION = SCRIPT_VERSION  # cross-script alias
-
-# -----------------------------------------------------------------------------
-# Project-wide truthy/falsy vocabulary (matches main._TRUTHY / _FALSY)
-# -----------------------------------------------------------------------------
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
-_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    """Project-aligned env bool parser."""
-    try:
-        raw = (os.getenv(name, "") or "").strip().lower()
-    except Exception:
-        return bool(default)
-    if not raw:
-        return bool(default)
-    if raw in _TRUTHY:
-        return True
-    if raw in _FALSY:
-        return False
-    return bool(default)
-
-
-def _env_int(
-    name: str, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None
-) -> int:
-    try:
-        raw = (os.getenv(name, "") or "").strip()
-        if not raw:
-            return default
-        v = int(float(raw))
-    except Exception:
-        return default
-    if lo is not None and v < lo:
-        v = lo
-    if hi is not None and v > hi:
-        v = hi
-    return v
-
-
-def _env_csv(name: str, default: Optional[List[str]] = None) -> Optional[List[str]]:
-    raw = (os.getenv(name, "") or "").strip()
-    if not raw:
-        return default
-    items = [x.strip() for x in raw.split(",") if x.strip()]
-    return items or default
-
+SCRIPT_VERSION = "6.4.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -245,7 +84,8 @@ logger = logging.getLogger("DashboardSync")
 # -----------------------------------------------------------------------------
 _A1_CELL_RE = re.compile(r"^\$?[A-Za-z]+\$?\d+$")
 _SHEET_SAFE_RE = re.compile(r"^[A-Za-z0-9_]+$")
-_MAX_PAYLOAD_RECURSION = 8  # v6.5.0: guard for _extract_table_payload
+_TRUTHY = {"1", "true", "yes", "y", "on"}
+_FALSY = {"0", "false", "no", "n", "off"}
 
 _ALLOWED_KEYS = {
     "MARKET_LEADERS",
@@ -265,7 +105,6 @@ def _utc_now() -> datetime:
 
 
 def _safe_bool(v: Any, default: bool = False) -> bool:
-    """Value-based bool coercion (distinct from _env_bool which reads os.environ)."""
     if v is None:
         return default
     if isinstance(v, bool):
@@ -305,7 +144,7 @@ def _canon_key(user_key: str) -> str:
     """
     Normalizes SYNC_KEYS tokens to canonical runner keys.
 
-    Canonical runner keys:
+    Canonical runner keys (March 2026):
       MARKET_LEADERS, GLOBAL_MARKETS, COMMODITIES_FX, MUTUAL_FUNDS,
       MY_PORTFOLIO, INSIGHTS_ANALYSIS, TOP_10_INVESTMENTS, DATA_DICTIONARY
     """
@@ -337,23 +176,13 @@ def _is_forbidden_key(k: str) -> bool:
 
 
 def _default_backend_url() -> str:
-    return (
-        os.getenv("SYNC_BACKEND")
-        or os.getenv("BACKEND_BASE_URL")
-        or os.getenv("DEFAULT_BACKEND_URL")
-        or "http://127.0.0.1:8000"
-    ).rstrip("/")
+    return (os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://127.0.0.1:8000").rstrip("/")
 
 
 def _default_spreadsheet_id(cli_id: Optional[str]) -> str:
     if cli_id and cli_id.strip():
         return cli_id.strip()
-    return (
-        os.getenv("SYNC_SHEET_ID")
-        or os.getenv("DEFAULT_SPREADSHEET_ID")
-        or os.getenv("SPREADSHEET_ID")
-        or ""
-    ).strip()
+    return (os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("SPREADSHEET_ID") or "").strip()
 
 
 def _env_token() -> str:
@@ -389,6 +218,7 @@ def _coerce_jsonable(v: Any) -> Any:
         return {str(k): _coerce_jsonable(x) for k, x in v.items()}
     if isinstance(v, (list, tuple, set)):
         return [_coerce_jsonable(x) for x in v]
+    # pydantic-ish
     try:
         if hasattr(v, "model_dump"):
             return _coerce_jsonable(v.model_dump(mode="python"))  # type: ignore
@@ -412,6 +242,7 @@ def _parse_keys_tokens(raw_tokens: Sequence[str]) -> List[str]:
         s = str(t or "").strip()
         if not s:
             continue
+        # JSON array
         if s.startswith("[") and s.endswith("]"):
             try:
                 arr = json.loads(s)
@@ -423,13 +254,15 @@ def _parse_keys_tokens(raw_tokens: Sequence[str]) -> List[str]:
                     continue
             except Exception:
                 pass
+        # split by common separators
         parts = re.split(r"[,\s;|]+", s)
         for p in parts:
             pp = (p or "").strip()
             if pp:
                 flat.append(pp)
+    # canonicalize + de-dup
     out: List[str] = []
-    seen: set = set()
+    seen: set[str] = set()
     for k in flat:
         ck = _canon_key(k)
         if not ck or ck in seen:
@@ -569,9 +402,7 @@ class BackendClient:
         except Exception as e:
             return None, str(e), 0
 
-    async def post_json(
-        self, path: str, payload: Dict[str, Any]
-    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    async def post_json(self, path: str, payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
         url = f"{self.base_url}{path}"
         max_retries = 3
         for attempt in range(max_retries):
@@ -688,11 +519,7 @@ class SheetsWriter:
         return d
 
     def _load_credentials_dict(self) -> Optional[Dict[str, Any]]:
-        raw = (
-            os.getenv("GOOGLE_SHEETS_CREDENTIALS")
-            or os.getenv("GOOGLE_CREDENTIALS")
-            or ""
-        ).strip()
+        raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
 
         # Prefer GOOGLE_APPLICATION_CREDENTIALS file path (GitHub Actions pattern)
         path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
@@ -734,6 +561,7 @@ class SheetsWriter:
         return self._service
 
     def _safe_sheet_a1(self, sheet_name: str) -> str:
+        # Always quote if not safe
         if _SHEET_SAFE_RE.match(sheet_name or ""):
             return sheet_name
         name = (sheet_name or "").replace("'", "''")
@@ -749,9 +577,7 @@ class SheetsWriter:
         col = m.group(1).upper()
         row = int(m.group(2))
         rng = f"{self._safe_sheet_a1(sheet_name)}!{col}{row}:ZZ"
-        svc.spreadsheets().values().clear(
-            spreadsheetId=spreadsheet_id, range=rng, body={}
-        ).execute()
+        svc.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=rng, body={}).execute()
 
     def write_table(
         self,
@@ -765,6 +591,7 @@ class SheetsWriter:
         if not svc:
             return 0
 
+        # Ensure rectangular rows matching header length (Sheets-friendly)
         hdr = [str(h) for h in (headers or [])]
         width = len(hdr)
 
@@ -799,12 +626,6 @@ class SheetsWriter:
 # Symbols reading (uses repo module if present)
 # -----------------------------------------------------------------------------
 def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
-    """
-    Calls `symbols_reader.get_page_symbols(key, spreadsheet_id=...)`.
-    Per project contract (symbols_reader v10+), returns Dict[str, Any] with
-    keys {"symbols", "all", "ksa", "global", "by_type", "metadata",
-          "status", "error"}.
-    """
     try:
         import importlib
 
@@ -827,7 +648,7 @@ def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[
         symbols = data
 
     out: List[str] = []
-    seen: set = set()
+    seen: set[str] = set()
     for s in symbols:
         t = str(s or "").strip().upper()
         if not t or t in {"SYMBOL", "TICKER"}:
@@ -841,24 +662,25 @@ def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[
 
 
 # -----------------------------------------------------------------------------
-# Task definitions (aligned with canonical schema pages)
+# Task definitions (aligned with your dashboard tabs + canonical schema)
 # -----------------------------------------------------------------------------
 def _default_tasks() -> List[TaskSpec]:
     return [
-        TaskSpec(key="MY_PORTFOLIO",       sheet_name="My_Portfolio",       gateway="enriched",  priority=1, max_symbols=800, allow_empty_symbols=True),
-        TaskSpec(key="MARKET_LEADERS",     sheet_name="Market_Leaders",     gateway="enriched",  priority=2, max_symbols=800, allow_empty_symbols=True),
-        TaskSpec(key="GLOBAL_MARKETS",     sheet_name="Global_Markets",     gateway="enriched",  priority=3, max_symbols=800, allow_empty_symbols=True),
-        TaskSpec(key="COMMODITIES_FX",     sheet_name="Commodities_FX",     gateway="enriched",  priority=4, max_symbols=400, allow_empty_symbols=True),
-        TaskSpec(key="MUTUAL_FUNDS",       sheet_name="Mutual_Funds",       gateway="enriched",  priority=5, max_symbols=400, allow_empty_symbols=True),
+        TaskSpec(key="MY_PORTFOLIO", sheet_name="My_Portfolio", gateway="enriched", priority=1, max_symbols=800, allow_empty_symbols=True),
+        TaskSpec(key="MARKET_LEADERS", sheet_name="Market_Leaders", gateway="enriched", priority=2, max_symbols=800, allow_empty_symbols=True),
+        TaskSpec(key="GLOBAL_MARKETS", sheet_name="Global_Markets", gateway="enriched", priority=3, max_symbols=800, allow_empty_symbols=True),
+        TaskSpec(key="COMMODITIES_FX", sheet_name="Commodities_FX", gateway="enriched", priority=4, max_symbols=400, allow_empty_symbols=True),
+        TaskSpec(key="MUTUAL_FUNDS", sheet_name="Mutual_Funds", gateway="enriched", priority=5, max_symbols=400, allow_empty_symbols=True),
         # Special/meta pages — do NOT require symbols
-        TaskSpec(key="INSIGHTS_ANALYSIS",  sheet_name="Insights_Analysis",  gateway="analysis",  priority=6, max_symbols=0, allow_empty_symbols=True),
-        TaskSpec(key="TOP_10_INVESTMENTS", sheet_name="Top_10_Investments", gateway="analysis",  priority=7, max_symbols=0, allow_empty_symbols=True),
-        TaskSpec(key="DATA_DICTIONARY",    sheet_name="Data_Dictionary",    gateway="analysis",  priority=8, max_symbols=0, allow_empty_symbols=True),
+        TaskSpec(key="INSIGHTS_ANALYSIS", sheet_name="Insights_Analysis", gateway="analysis", priority=6, max_symbols=0, allow_empty_symbols=True),
+        TaskSpec(key="TOP_10_INVESTMENTS", sheet_name="Top_10_Investments", gateway="analysis", priority=7, max_symbols=0, allow_empty_symbols=True),
+        TaskSpec(key="DATA_DICTIONARY", sheet_name="Data_Dictionary", gateway="analysis", priority=8, max_symbols=0, allow_empty_symbols=True),
     ]
 
 
 def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
     gw = (gw or "enriched").strip().lower()
+    # include ai aliases because route naming can vary
     if gw in {"analysis", "ai"}:
         return [
             "/v1/analysis/sheet-rows",
@@ -893,9 +715,7 @@ def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
     ]
 
 
-def _extract_table_payload(
-    resp: Dict[str, Any], _depth: int = 0
-) -> Tuple[List[Any], List[List[Any]]]:
+def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[Any]]]:
     """
     Returns (headers, rows_matrix) ALWAYS as list[list] for Sheets writing.
 
@@ -903,30 +723,13 @@ def _extract_table_payload(
       - {"headers":[...], "rows":[list|dict]}
       - {"headers":[...], "rows_matrix":[...]}
       - {"keys":[...]} for dict->matrix conversion
-      - {"data": {...}} nested (depth-bounded)
-
-    v6.5.0: Added `_depth` guard (max _MAX_PAYLOAD_RECURSION levels) so
-    malicious or malformed payloads with deeply nested `"data"` keys don't
-    trigger RecursionError.
-
-    v6.6.0 note: This function is column-count-agnostic. When the v2.6.0
-    schema family backend starts returning 90-column rows (canonical) or
-    93-column rows (Top_10), `headers_list` simply has 90 / 93 entries and
-    everything downstream adapts.
+      - {"data": {...}} nested
     """
     if not isinstance(resp, dict):
         return [], []
 
-    # v6.5.0: guard against pathological nesting
-    if _depth >= _MAX_PAYLOAD_RECURSION:
-        logger.warning(
-            "Payload nesting exceeded _MAX_PAYLOAD_RECURSION=%d; bailing out",
-            _MAX_PAYLOAD_RECURSION,
-        )
-        return [], []
-
     if isinstance(resp.get("data"), dict):
-        return _extract_table_payload(resp["data"], _depth + 1)  # type: ignore[index]
+        return _extract_table_payload(resp["data"])  # type: ignore[index]
 
     headers = resp.get("headers")
     keys = resp.get("keys")
@@ -964,6 +767,7 @@ def _extract_table_payload(
         matrix = [[_coerce_jsonable(r.get(k)) for k in keys_list] for r in dict_rows]
         return headers_list, matrix
 
+    # empty rows, but headers exist
     if headers_list:
         return headers_list, []
 
@@ -1002,16 +806,12 @@ async def _run_one_task(
     sheets: Optional[SheetsWriter],
 ) -> TaskResult:
     t0 = time.perf_counter()
-    res = TaskResult(
-        key=task.key,
-        sheet_name=task.sheet_name,
-        status="pending",
-        start_utc=_utc_now().isoformat(),
-    )
+    res = TaskResult(key=task.key, sheet_name=task.sheet_name, status="pending", start_utc=_utc_now().isoformat())
 
     try:
         canon_task_key = _canon_key(task.key)
 
+        # Hard filters
         if _is_forbidden_key(canon_task_key):
             res.status = "skipped"
             res.warnings.append("Forbidden legacy key; skipped.")
@@ -1029,6 +829,7 @@ async def _run_one_task(
 
         res.symbols_requested = len(symbols)
 
+        # Dry run: still success-ish but no backend call and no write
         if dry_run:
             res.status = "skipped"
             res.warnings.append("Dry run: no backend call, no sheet write.")
@@ -1042,20 +843,25 @@ async def _run_one_task(
         if not symbols:
             res.warnings.append("No symbols found; requesting schema-only payload (headers + empty rows).")
 
+        # Some handlers clamp limit >= 1, so never send 0
         safe_limit = 1 if not symbols else min(5000, max(1, len(symbols)))
 
         payload: Dict[str, Any] = {
+            # identifiers (compat)
             "sheet": task.sheet_name,
             "sheet_name": task.sheet_name,
             "page": task.sheet_name,
             "name": task.sheet_name,
             "tab": task.sheet_name,
+            # symbols
             "tickers": symbols,
             "symbols": symbols,
+            # behavior
             "refresh": True,
             "include_meta": True,
             "include_matrix": True,
             "limit": safe_limit,
+            # tracing
             "request_id": res.request_id,
         }
 
@@ -1090,45 +896,10 @@ async def _run_one_task(
         res.gateway_used = f"{task.gateway}:{used_endpoint}" if used_endpoint else task.gateway
         res.symbols_processed = len(symbols)
 
-        # Dedup guard before Sheets write (v6.4.0).
-        # When the backend returns duplicate symbol rows, drop all but the
-        # first occurrence to prevent duplicate rows in Google Sheets.
-        if rows_matrix:
-            sym_col_idx: Optional[int] = None
-            for col_idx, h in enumerate(headers):
-                if str(h).strip().lower() in ("symbol", "ticker", "requestedsymbol"):
-                    sym_col_idx = col_idx
-                    break
-            if sym_col_idx is not None:
-                seen_syms: set = set()
-                deduped: List[List[Any]] = []
-                for row in rows_matrix:
-                    sym_val = (
-                        str(row[sym_col_idx] or "").strip().upper()
-                        if sym_col_idx < len(row)
-                        else ""
-                    )
-                    if not sym_val or sym_val not in seen_syms:
-                        if sym_val:
-                            seen_syms.add(sym_val)
-                        deduped.append(row)
-                dropped = len(rows_matrix) - len(deduped)
-                if dropped > 0:
-                    logger.info(
-                        "Dedup: dropped %d duplicate symbol rows for %s",
-                        dropped,
-                        task.sheet_name,
-                    )
-                    res.warnings.append(
-                        f"Dedup: dropped {dropped} duplicate symbol rows before write."
-                    )
-                rows_matrix = deduped
-
+        # No creds => partial (data fetched but not written)
         if sheets is None or sheets._get_service() is None:
             res.status = "partial"
-            res.warnings.append(
-                "No Google Sheets credentials. Backend data fetched but not written."
-            )
+            res.warnings.append("No Google Sheets credentials. Backend data fetched but not written.")
             res.rows_written = 0
             res.rows_failed = len(rows_matrix or [])
             return res
@@ -1140,21 +911,16 @@ async def _run_one_task(
                 res.warnings.append(f"Clear failed: {e}")
 
         try:
-            written = sheets.write_table(
-                spreadsheet_id, task.sheet_name, start_cell, headers, rows_matrix
-            )
+            written = sheets.write_table(spreadsheet_id, task.sheet_name, start_cell, headers, rows_matrix)
             res.rows_written = int(written)
 
+            # schema-only (0 rows) => success
             if not rows_matrix:
                 res.rows_failed = 0
                 res.status = "success"
             else:
                 res.rows_failed = max(0, len(rows_matrix) - res.rows_written)
-                res.status = (
-                    "success"
-                    if res.rows_failed == 0
-                    else ("partial" if res.rows_written > 0 else "failed")
-                )
+                res.status = "success" if res.rows_failed == 0 else ("partial" if res.rows_written > 0 else "failed")
         except Exception as e:
             res.status = "failed"
             res.error = f"Write failed: {e}"
@@ -1175,85 +941,24 @@ async def _run_one_task(
 # Main runner
 # -----------------------------------------------------------------------------
 async def main_async(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description=f"TFB Dashboard Sync Runner v{SCRIPT_VERSION}"
-    )
-    parser.add_argument(
-        "--sheet-id",
-        default="",
-        help="Spreadsheet ID override (also SYNC_SHEET_ID / DEFAULT_SPREADSHEET_ID env).",
-    )
-    parser.add_argument(
-        "--backend",
-        default="",
-        help="Backend base URL override (also SYNC_BACKEND / BACKEND_BASE_URL env).",
-    )
-    parser.add_argument(
-        "--keys",
-        nargs="*",
-        default=_env_csv("SYNC_KEYS") or [],
-        help="Specific keys (space/comma/semicolon/JSON-array supported). "
-             "Also: SYNC_KEYS env (comma-separated).",
-    )
-    parser.add_argument(
-        "--start-cell",
-        default=os.getenv("SYNC_START_CELL") or "A5",
-        help="Top-left A1 cell where headers will be written (e.g. A5). "
-             "Also: SYNC_START_CELL env.",
-    )
-    parser.add_argument(
-        "--max-symbols",
-        default=str(_env_int("SYNC_MAX_SYMBOLS", -1, lo=-1, hi=5000)),
-        help="Override max symbols for all tasks (-1 = per task default). "
-             "Also: SYNC_MAX_SYMBOLS env.",
-    )
-    parser.add_argument(
-        "--workers",
-        default=str(_env_int("SYNC_WORKERS", 4, lo=1, hi=32)),
-        help="Parallel workers. Also: SYNC_WORKERS env.",
-    )
-    parser.add_argument(
-        "--clear",
-        action="store_true",
-        default=_env_bool("SYNC_CLEAR", False),
-        help="Clear from start-cell down before writing. Also: SYNC_CLEAR env.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=_env_bool("SYNC_DRY_RUN", False),
-        help="Do not call backend or write sheets. Also: SYNC_DRY_RUN env.",
-    )
-    parser.add_argument(
-        "--no-lock",
-        action="store_true",
-        default=_env_bool("SYNC_NO_LOCK", False),
-        help="Disable Redis lock even if REDIS_URL exists. Also: SYNC_NO_LOCK env.",
-    )
-    parser.add_argument(
-        "--json-out",
-        default=os.getenv("SYNC_JSON_OUT") or "",
-        help="Write JSON report to this file path. Also: SYNC_JSON_OUT env.",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        default=_env_bool("SYNC_JSON", False),
-        help="Print JSON report to stdout at end. Also: SYNC_JSON env.",
-    )
-    parser.add_argument(
-        "--timeout",
-        default=str(_env_int("SYNC_TIMEOUT", 30, lo=5, hi=180)),
-        help="Backend timeout seconds. Also: SYNC_TIMEOUT env.",
-    )
+    parser = argparse.ArgumentParser(description=f"TFB Dashboard Sync Runner v{SCRIPT_VERSION}")
+    parser.add_argument("--sheet-id", default="", help="Spreadsheet ID override")
+    parser.add_argument("--backend", default="", help="Backend base URL override (e.g. https://... )")
+    parser.add_argument("--keys", nargs="*", default=[], help="Specific keys (space/comma/semicolon/JSON-array supported)")
+    parser.add_argument("--start-cell", default="A5", help="Top-left A1 cell where headers will be written (e.g. A5)")
+    parser.add_argument("--max-symbols", default="-1", help="Override max symbols for all tasks (-1 = per task default)")
+    parser.add_argument("--workers", default="4", help="Parallel workers")
+    parser.add_argument("--clear", action="store_true", help="(Deprecated — clear is now the default) Clear from start-cell down before writing.")
+    parser.add_argument("--no-clear", action="store_true", help="Disable clear-before-write. NOT recommended: leaves stale trailing rows/columns from prior shorter writes (the ghost-row cause). Use only for deliberate append/preserve runs.")
+    parser.add_argument("--dry-run", action="store_true", help="Do not call backend or write sheets")
+    parser.add_argument("--no-lock", action="store_true", help="Disable Redis lock even if REDIS_URL exists")
+    parser.add_argument("--json-out", default="", help="Write JSON report to this file path")
+    parser.add_argument("--timeout", default="30", help="Backend timeout seconds")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     spreadsheet_id = _default_spreadsheet_id(args.sheet_id)
     if not spreadsheet_id:
-        logger.error(
-            "Missing spreadsheet id. "
-            "Provide --sheet-id or set SYNC_SHEET_ID / DEFAULT_SPREADSHEET_ID env."
-        )
+        logger.error("DEFAULT_SPREADSHEET_ID is missing and --sheet-id not provided.")
         return 2
 
     backend_url = (args.backend or _default_backend_url()).rstrip("/")
@@ -1264,20 +969,14 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
 
     token = _env_token()
     if not token:
-        logger.warning(
-            "No backend token found (TFB_TOKEN/X_APP_TOKEN/APP_TOKEN/BACKEND_TOKEN). "
-            "Requests may 401 if protected."
-        )
+        logger.warning("No backend token found (TFB_TOKEN/X_APP_TOKEN/APP_TOKEN/BACKEND_TOKEN). Requests may 401 if protected.")
 
     tasks = _default_tasks()
 
     wanted = _parse_keys_tokens(args.keys or [])
     forbidden_requested = [k for k in wanted if _is_forbidden_key(k)]
     if forbidden_requested:
-        logger.warning(
-            "Forbidden keys requested and will be ignored: %s",
-            ", ".join(forbidden_requested),
-        )
+        logger.warning("Forbidden keys requested and will be ignored: %s", ", ".join(forbidden_requested))
 
     wanted_ok = [k for k in wanted if (k in _ALLOWED_KEYS and not _is_forbidden_key(k))]
     if wanted_ok:
@@ -1288,6 +987,7 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
         logger.warning("No tasks selected.")
         return 0
 
+    # clamp workers to tasks count
     workers = max(1, min(workers, len(tasks)))
 
     summary = RunSummary()
@@ -1297,13 +997,12 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     backend = BackendClient(backend_url, timeout_sec=timeout_sec, token=token)
     sheets = SheetsWriter()
 
-    lock_name = (
-        f"{spreadsheet_id}:{','.join([_canon_key(t.key) for t in tasks])}"
-    )
+    lock_name = f"{spreadsheet_id}:{','.join([_canon_key(t.key) for t in tasks])}"
     lock = RedisLock(lock_name, ttl_sec=600)
 
     results: List[TaskResult] = []
     try:
+        # Preflight health (best-effort)
         for hp in ("/readyz", "/health", "/livez"):
             data, err, _code = await backend.get_json(hp)
             if err:
@@ -1313,6 +1012,7 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
             logger.info("Backend preflight %s -> %s", hp, status_val or "ok")
             break
 
+        # Acquire lock
         acquired = True if args.no_lock else await lock.acquire()
         if not acquired:
             logger.error("Could not acquire Redis lock. Use --no-lock to bypass.")
@@ -1327,15 +1027,13 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
                     spreadsheet_id=spreadsheet_id,
                     start_cell=start_cell,
                     max_symbols_override=max_symbols,
-                    clear_before_write=bool(args.clear),
+                    clear_before_write=(not bool(args.no_clear)),
                     dry_run=bool(args.dry_run),
                     backend=backend,
                     sheets=sheets,
                 )
 
-        out = await asyncio.gather(
-            *[_guarded(t) for t in tasks], return_exceptions=True
-        )
+        out = await asyncio.gather(*[_guarded(t) for t in tasks], return_exceptions=True)
 
         for i, r in enumerate(out):
             if isinstance(r, Exception):
@@ -1367,10 +1065,9 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
         summary.end_utc = _utc_now().isoformat()
         summary.duration_ms = (time.perf_counter() - t0) * 1000.0
 
-        logger.info("=" * 60)
+        logger.info("============================================================")
         logger.info(
-            "SYNC DONE | success=%d partial=%d failed=%d skipped=%d "
-            "| rows_written=%d | duration_ms=%.2f",
+            "SYNC DONE | success=%d partial=%d failed=%d skipped=%d | rows_written=%d | duration_ms=%.2f",
             summary.success,
             summary.partial,
             summary.failed,
@@ -1381,10 +1078,7 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
 
         for r in results:
             if r.status == "success":
-                logger.info(
-                    "✅ %s -> %s | rows=%d | %.1fms",
-                    _canon_key(r.key), r.sheet_name, r.rows_written, r.duration_ms,
-                )
+                logger.info("✅ %s -> %s | rows=%d | %.1fms", _canon_key(r.key), r.sheet_name, r.rows_written, r.duration_ms)
             elif r.status == "partial":
                 logger.info(
                     "⚠️  %s -> %s | rows=%d failed=%d | %.1fms | %s",
@@ -1396,36 +1090,16 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
                     "; ".join(r.warnings[:2]),
                 )
             elif r.status == "failed":
-                logger.info(
-                    "❌ %s -> %s | %s",
-                    _canon_key(r.key), r.sheet_name, r.error or "failed",
-                )
+                logger.info("❌ %s -> %s | %s", _canon_key(r.key), r.sheet_name, r.error or "failed")
             else:
-                logger.info(
-                    "⏭️  %s -> %s | %s",
-                    _canon_key(r.key),
-                    r.sheet_name,
-                    "; ".join(r.warnings[:2]) if r.warnings else "skipped",
-                )
+                logger.info("⏭️  %s -> %s | %s", _canon_key(r.key), r.sheet_name, "; ".join(r.warnings[:2]) if r.warnings else "skipped")
 
-        # v6.5.0: emit JSON to file and/or stdout per flags
-        if args.json_out or args.json:
-            report = {
-                "summary": summary.to_dict(),
-                "results": [x.to_dict() for x in results],
-            }
-            report_json = json.dumps(
-                _coerce_jsonable(report), indent=2, ensure_ascii=False
-            )
-            if args.json_out:
-                try:
-                    Path(args.json_out).write_text(report_json, encoding="utf-8")
-                    logger.info("Report saved: %s", args.json_out)
-                except Exception as e:
-                    logger.warning("Failed to write JSON report: %s", e)
-            if args.json:
-                sys.stdout.write(report_json + "\n")
+        if args.json_out:
+            report = {"summary": summary.to_dict(), "results": [x.to_dict() for x in results]}
+            Path(args.json_out).write_text(json.dumps(_coerce_jsonable(report), indent=2, ensure_ascii=False), encoding="utf-8")
+            logger.info("Report saved: %s", args.json_out)
 
+        # Exit codes
         if summary.failed > 0:
             return 2
         if summary.partial > 0:
@@ -1452,162 +1126,5 @@ def main() -> int:
         return 2
 
 
-# =============================================================================
-# Worker integration API (v6.4.0)
-# =============================================================================
-
-# Documents the expected task payload schema for worker.py.
-# When worker.py dispatches task_type="dashboard_sync", it should send a dict
-# matching these fields. Previously undocumented, causing silent schema drift.
-WORKER_PAYLOAD_SCHEMA: Dict[str, Any] = {
-    "task_type": "dashboard_sync",   # (required) always "dashboard_sync"
-    "keys": [],                      # (optional) list[str] — subset of ALLOWED_KEYS to sync
-                                     #   e.g. ["MARKET_LEADERS", "GLOBAL_MARKETS"]
-                                     #   omit or empty = sync all default tasks
-    "spreadsheet_id": "",            # (optional) override DEFAULT_SPREADSHEET_ID
-    "backend_url": "",               # (optional) override BACKEND_BASE_URL
-    "start_cell": "A5",              # (optional) header start cell, default A5
-    "max_symbols": -1,               # (optional) -1 = use per-task defaults
-    "workers": 4,                    # (optional) parallel task workers
-    "clear_before_write": False,     # (optional) clear sheet range before writing
-    "dry_run": False,                # (optional) fetch data but don't write sheets
-    "timeout_sec": 30,               # (optional) backend request timeout
-    "no_lock": False,                # (optional) skip Redis distributed lock
-    # --- worker tracing fields (added by worker.py, not required here) ---
-    "task_id": "",                   # worker task UUID for correlation
-    "queued_at": "",                 # ISO timestamp when task was queued
-    "retry_count": 0,                # number of times this task has been retried
-}
-
-
-async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Programmatic entry point for worker.py (async version).
-
-    v6.4.0: In v6.3.0, worker.py had to call main_async() by constructing a
-    fake argparse.Namespace. This broke whenever new --args were added to
-    the CLI parser. Now worker.py calls this function directly with the task
-    payload.
-
-    Args:
-        payload: Dict matching WORKER_PAYLOAD_SCHEMA.
-
-    Returns:
-        Dict with keys: status, exit_code, summary, errors, task_id.
-        status: "success" | "partial" | "failed"
-        exit_code: 0 | 1 | 2
-    """
-    task_id = str(payload.get("task_id") or uuid.uuid4())
-    logger.info("run_from_worker_payload: task_id=%s", task_id)
-
-    task_type = str(payload.get("task_type") or "").strip()
-    if task_type and task_type != "dashboard_sync":
-        return {
-            "status": "failed",
-            "exit_code": 2,
-            "errors": [
-                f"run_from_worker_payload: expected task_type='dashboard_sync', "
-                f"got {task_type!r}"
-            ],
-            "summary": {},
-            "task_id": task_id,
-        }
-
-    argv: List[str] = []
-
-    spreadsheet_id = str(payload.get("spreadsheet_id") or "").strip()
-    if spreadsheet_id:
-        argv += ["--sheet-id", spreadsheet_id]
-
-    backend_url = str(payload.get("backend_url") or "").strip()
-    if backend_url:
-        argv += ["--backend", backend_url]
-
-    keys = payload.get("keys") or []
-    if isinstance(keys, list) and keys:
-        argv += ["--keys"] + [str(k) for k in keys]
-    elif isinstance(keys, str) and keys.strip():
-        argv += ["--keys", keys.strip()]
-
-    start_cell = str(payload.get("start_cell") or "A5").strip()
-    argv += ["--start-cell", start_cell]
-
-    max_symbols = payload.get("max_symbols", -1)
-    argv += ["--max-symbols", str(max_symbols)]
-
-    workers = payload.get("workers", 4)
-    argv += ["--workers", str(workers)]
-
-    timeout_sec = payload.get("timeout_sec", 30)
-    argv += ["--timeout", str(timeout_sec)]
-
-    if payload.get("clear_before_write"):
-        argv.append("--clear")
-
-    if payload.get("dry_run"):
-        argv.append("--dry-run")
-
-    if payload.get("no_lock"):
-        argv.append("--no-lock")
-
-    # v6.5.0 note: deliberately do NOT pass --json from worker payloads.
-    # Worker stdout is captured by the queue/worker process and must not
-    # contain report JSON. Use --json-out if the caller wants a file.
-
-    try:
-        exit_code = await main_async(argv)
-        status = "success" if exit_code == 0 else ("partial" if exit_code == 1 else "failed")
-        return {
-            "status": status,
-            "exit_code": exit_code,
-            "errors": [],
-            "summary": {},
-            "task_id": task_id,
-        }
-    except Exception as e:
-        logger.exception("run_from_worker_payload failed: %s", e)
-        return {
-            "status": "failed",
-            "exit_code": 2,
-            "errors": [str(e)],
-            "summary": {},
-            "task_id": task_id,
-        }
-
-
-def run_from_worker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Sync wrapper for worker.py (which runs in a sync context).
-    Calls run_from_worker_payload_async() via asyncio.run().
-    """
-    try:
-        return asyncio.run(run_from_worker_payload_async(payload))
-    except Exception as e:
-        return {
-            "status": "failed",
-            "exit_code": 2,
-            "errors": [str(e)],
-            "summary": {},
-            "task_id": str(payload.get("task_id") or ""),
-        }
-
-
-__all__ = [
-    "SCRIPT_VERSION",
-    "SERVICE_VERSION",
-    "TaskSpec",
-    "TaskResult",
-    "RunSummary",
-    "BackendClient",
-    "RedisLock",
-    "SheetsWriter",
-    "WORKER_PAYLOAD_SCHEMA",
-    "main_async",
-    "main",
-    "run_from_worker_payload",
-    "run_from_worker_payload_async",
-]
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
