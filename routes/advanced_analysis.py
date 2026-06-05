@@ -2,212 +2,99 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.2.0  (REGISTRY-DERIVED WIDTHS / TRACKS CANONICAL)
+Advanced Analysis Root Owner — v4.3.0  (STATIC FALLBACK ALIGNED TO 115-KEY GATE)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
-GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
-PROVIDER-HEALTH SURFACE • NO-HARDCODED-CLAMP • v5.78.0 GATE-AWARE
+GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • REGISTRY-DERIVED WIDTHS •
+OWNER-ALIGNED • PROVIDER-HEALTH SURFACE • NO-HARDCODED-CLAMP • v5.79.2 GATE-AWARE
 
-WHY v4.2.0 — registry-derived contract widths (stop truncating Top_10)
-----------------------------------------------------------------------
+(The verbose pre-v4.3.0 cross-version changelog is condensed in this working
+copy; ALL code, the engine-binding cascade, the provider-health machinery, and
+every endpoint are preserved verbatim except where the v4.3.0 changelog below
+states otherwise.)
 
-Cascade #2 of the width-tracking pass (sibling of analysis_sheet_rows
-v4.4.0). This route is the PRIMARY upstream the analysis_sheet_rows router
-calls (`root_proxy`, tried first for every page), and it pre-projects its
-`row_objects` onto the resolved contract keys before returning. v4.1.0
-carried a hard-coded Top_10 width of `83` in `_ensure_top10_contract`
-(`_pad_contract(hdrs, ks, 83)`), so once the engine/registry grew past 83
-columns, Top_10 was clamped back to 83 here — dropping the v5.78.0
-investability gate (forecast_source + 8 gate columns: data_quality_score,
-forecast_reliability_score, provider_engine_conflict, conflict_type,
-final_decision_basis, investability_status, final_action, block_reason)
-BEFORE the downstream router ever saw the rows.
+WHY v4.3.0 — bring the OFFLINE fallback up to the live 115-key gate contract
+----------------------------------------------------------------------------
 
-v4.2.0 removes every hard-coded width literal from the contract path and
-derives widths in two layers, identical to analysis_sheet_rows v4.4.0:
-  - RUNTIME (authoritative): `_expected_len(page)` prefers the live
-    registry's `get_sheet_len(page)`. This route now faithfully tracks
-    whatever width the deployed registry serves — 90 today, 115/118 once
-    the schema_registry pass (cascade #3) lands — with ZERO further edits.
-  - STATIC FALLBACK (offline only): every width derives from
-    `len(_CANONICAL_80_KEYS)`; Top_10 derives as `instrument_len +
-    _TOP10_EXTRA_COUNT`. Used only when the registry import fails entirely.
+Cascade #3 (core.sheets.schema_registry -> v2.13.0) has LANDED: the registry
+now names the full 115-key instrument canonical (Top_10 = 118), including the
+v5.78.0 investability gate — forecast_source + 8 gate columns
+(data_quality_score, forecast_reliability_score, provider_engine_conflict,
+conflict_type, final_decision_basis, investability_status, final_action,
+block_reason). On the LIVE path this route already serves all of them, because
+v4.2.0 made every width registry-derived (`_expected_len` prefers
+`get_sheet_len`, `_resolve_contract` projects onto the registry's keys with no
+re-clamp). Nothing on the live path needed changing.
 
-CANONICAL ALIGNMENT: v4.1.0's static canonical was the older 80-column
-baseline (it pre-dated the v2.6.0 Insights group). v4.2.0 widens the static
-`_CANONICAL_80_*` to the same 90-column list the analysis_sheet_rows router
-carries (adds `upside_pct`, the 4 view columns, and the 5 Insights-group
-columns), so the two siblings emit an identical fallback contract. This is
-fallback-only — on the live path the registry contract is authoritative.
+The remaining gap was the route's STATIC FALLBACK. v4.2.0's static
+`_CANONICAL_80_*` was the 90-column baseline (it pre-dated forecast_source and
+the gate). That list is consumed ONLY when the registry import fails entirely —
+but on this deployment the registry-import-failure path is NOT hypothetical
+(the recurring "code didn't reach the container" issue). In that degraded mode
+v4.2.0 would silently emit a 90-column contract and drop the gate before the
+sheet ever saw it. v4.3.0 closes that: the static fallback is now the SAME
+115-key canonical the live registry serves, in EXACT engine/registry order, so
+the offline contract no longer regresses below the gate.
 
-NOTE ON VISIBILITY: like the downstream router, this route can only surface
-columns the registry NAMES; it does not fabricate the gate-column
-headers/keys. So the gate columns appear end-to-end only once
-`core.sheets.schema_registry` serves them (cascade #3). Until then this
-route tracks the registry's current width with no truncation.
-
-UNLIKE the downstream router, v4.1.0's `_normalize_external_payload` already
-threads the resolved `keys` straight through (no re-clamp), so there is NO
-third truncation point here — only `_ensure_top10_contract` needed fixing.
-
-v4.2.0 changes (from v4.1.0)
+v4.3.0 changes (from v4.2.0)
 ----------------------------
-[FIX-A] `_EXPECTED_SHEET_LENGTHS` moved below the canonical lists and
-    derived from `len(_CANONICAL_80_KEYS)` (instrument + My_Investments),
-    `+_TOP10_EXTRA_COUNT` (Top_10), `len(...)` (insights/dictionary).
-    Static-fallback-only; runtime prefers the registry.
-[FIX-B] `_ensure_top10_contract` takes optional `target_len`; the literal
-    `83` is gone. Hard invariant: never truncates below canonical+extras.
-[FIX-C] `_resolve_contract` passes the registry-derived `expected_len` into
-    `_ensure_top10_contract`, so a 118-col registry result is preserved.
-[FIX-E] `_static_contract` and `_expected_len` use the derived widths
-    instead of the literals 83 / 7 / 9 / 80.
-[ALIGN] Static `_CANONICAL_80_*` widened 80 -> 90 to match
-    analysis_sheet_rows v4.4.0's canonical (fallback-contract parity).
+[FIX-A] Static instrument canonical widened 90 -> 115 and REORDERED to match
+    data_engine_v2 v5.79.2 INSTRUMENT_CANONICAL_KEYS / schema_registry v2.13.0
+    exactly. This adds, after the prior 90: the Decision pair, Provider Rating,
+    the Canonical-Reco pair, the remaining Scoring-v5.74 fields, the Candlestick
+    block, forecast_source, and the 8-column Investability Gate. It also FIXES a
+    pre-existing fallback-only ordering slip in v4.2.0 (opportunity_score /
+    rank_overall now sit BEFORE the Views block, matching the engine's Scores
+    group). Verified: 115 keys, no dup keys/headers, gate at positions 108-115,
+    forecast_source at 107; Top_10 derives to 118.
+[FIX-B] The misleading `_CANONICAL_80_*` names are renamed to
+    `_CANONICAL_INSTRUMENT_HEADERS` / `_CANONICAL_INSTRUMENT_KEYS` (the literal
+    "80" was already doubly-stale at 90). All references updated. The derived
+    width block (`_CANONICAL_INSTRUMENT_LEN = len(...)`, `_TOP10_STATIC_LEN`)
+    now auto-resolves to 115 / 118 with no further edits.
+[FIX-C] Insights static fallback reconciled to the engine/registry contract.
+    schema_registry v2.12.0 reconciled Insights_Analysis from
+    [Section, Item, Symbol, Metric, Value, Notes, Last Updated (Riyadh)] to
+    [Section, Item, Metric, Value, Notes, Source, Sort Order]. v4.2.0's static
+    `_INSIGHTS_*` still carried the OLD keys (symbol / last_updated_riyadh).
+    v4.3.0 adopts the engine keys (section, item, metric, value, notes, source,
+    sort_order; count stays 7) AND updates `_build_insights_fallback_rows` to
+    emit them, so the offline Insights fallback aligns with the live contract.
 
-NO BEHAVIOR CHANGE on the instrument pages when the registry width is
-unchanged: `_pad_contract` already returned exactly `expected_len`. The
-change is purely "track the registry / stop clamping Top_10 / align the
-fallback canonical." ALL v4.1.0 provider-health machinery (ADD-B…H), the
-engine binding cascade (FIX-A of v4.1.0), and every endpoint are preserved
-verbatim.
+NO BEHAVIOR CHANGE on the live path. Width on every page is still taken from
+the registry first (`_expected_len` -> `get_sheet_len`); the rows are still
+projected onto the registry's keys with no re-clamp. v4.3.0 only changes what
+the route emits when the registry import is UNAVAILABLE — it now emits the full
+115-key gate contract instead of a 90-key subset. The Data_Dictionary static
+contract was already correct (9 cols) and is unchanged.
 
-WHY v4.1.0 — SURFACE THE ENGINE'S PROVIDER-UNHEALTHY REGISTRY (May 12, 2026)
----------------------------------------------------------------------------
-v5.61.0 of `core.data_engine_v2` consumes the new `provider_unhealthy:eodhd`
-warning marker from `eodhd_provider v4.8.0`'s circuit breaker and tracks
-which providers are currently being demoted/skipped via a module-level
-registry. The engine's `health()` now returns a `provider_unhealthy_markers`
-snapshot showing which providers are unhealthy and their TTL remaining.
+NOTE ON VISIBILITY: unchanged from v4.2.0 — this route surfaces whatever the
+live registry names. With the registry now at v2.13.0 (115/118), the gate
+columns flow end-to-end on the live path. The static fallback only matters when
+the registry import fails; v4.3.0 makes that fallback match too.
 
-v4.0.0 of this route had no surface for that information — every
-response on `/sheet-rows` carried per-row `warnings` strings but no
-envelope-level signal that the engine had detected a systemic provider
-outage and was routing around it. Operators monitoring `/v1/schema/health`
-saw only `adapter_available: true` regardless of whether the upstream
-data fetch was healthy or in fallback mode.
-
-v4.0.0 also had a second issue blocking any v5.x engine alignment: the
-engine binding cascade tried `core.data_engine` (legacy) BEFORE
-`core.data_engine_v2`. Since the legacy module always imports successfully
-on this deployment, v2 was never reached — meaning even with v5.61.0
-deployed, the route's responses came from the legacy adapter's
-unenriched pipeline. v4.1.0 inverts that preference (v2 first, legacy
-fallback) and uses runtime-awaitable detection so the adapter works
-whether `get_engine` is exported as a sync function (v5.50.0+) or as
-an async factory (older/future builds).
-
-v4.1.0 changes (from v4.0.0)
-----------------------------
-[FIX-A — CRITICAL] Engine binding inversion. v4.0.0 tried
-    `from core.data_engine import get_sheet_rows` (legacy) first; the
-    legacy module always imports, so the v2 fallback was never reached.
-    v4.1.0 cascades through patterns in preferred order:
-      1. `core.data_engine_v2.get_engine()` (runtime-await-aware adapter)
-      2. `core.data_engine_v2.get_engine_if_ready()` with cold-start fallback
-      3. `core.data_engine_v2.get_sheet_rows` (top-level fn — may not exist)
-      4. `core.data_engine.get_sheet_rows` (legacy — bug indicator if reached)
-    Each step logs explicitly. `CORE_GET_SHEET_ROWS_SOURCE` and the
-    response's `meta.source` field reveal which binding won.
-
-[ADD-B] NEW `_get_engine_for_health()` helper. Lazily resolves the
-    v2 engine instance for the new `health()` surface. Cached at
-    module level after first successful import. Returns None if v2
-    is unavailable (graceful degradation — health-snapshot fields
-    just omit from the response).
-
-[ADD-C] NEW `_extract_provider_health_snapshot()` helper. Calls
-    `engine.health()`, extracts `provider_unhealthy_markers` +
-    `engine_version`, returns a JSON-safe dict. Catches all
-    exceptions and returns `{"unavailable": True, "error_class": ...}`
-    on failure. Safe to call from any request path — total budget
-    is whatever `engine.health()` costs (single async call, no API).
-
-[ADD-D] NEW envelope field: `meta.provider_health`. The
-    `_payload_envelope` builder accepts an optional `provider_health`
-    kwarg and surfaces it under `meta.provider_health`. Shape:
-      {
-        "unhealthy_markers": {
-          "active": [{"provider": "eodhd", "ttl_remaining_sec": 247.3}],
-          "active_count": 1,
-          "demote_enabled": true,
-          "skip_enabled": false,
-          "default_ttl_sec": 300.0
-        },
-        "engine_version": "5.61.0"
-      }
-
-[ADD-E] `_run_advanced_sheet_rows_impl` fetches provider_health
-    once per request via `_extract_provider_health_snapshot()` and
-    passes it into both the success-path envelope (via `_normalize_
-    external_payload` meta_extra) AND the fail-soft envelope. So
-    every response — success, partial, or error — carries the
-    engine's current provider-health view at the moment of the
-    request.
-
-[ADD-F] Envelope-level warning lift. When any row in the response
-    carries `circuit_open` or `provider_unhealthy:<X>` in its
-    `warnings` string, the systemic markers are LIFTED into the
-    envelope's top-level `warnings` array (preserving per-row
-    warnings intact for the Sheet's Warnings column). One entry
-    per distinct marker:
-      "EODHD provider circuit open (engine routing to fallback chain)"
-    Makes the systemic signal visible at glance without parsing
-    every row.
-
-[ADD-G] NEW `/v1/schema/provider-health` endpoint. Dedicated
-    read-only GET. Returns the registry snapshot WITHOUT triggering
-    a sheet build. Cheap polling target for Apps Script
-    `12_Diagnostics.gs runFullDiagnosticSweep_()` — one HTTP call
-    instead of one-per-page.
-
-[ADD-H] `/health` and `/v1/schema/health` endpoint enhancement.
-    Added: `engine_version` (from v2 engine), `provider_health_
-    endpoint_enabled: true`, `provider_unhealthy_count` (the
-    engine's `active_count` — 0 healthy, N>0 when providers are
-    being demoted/skipped). Operators get a one-call boolean
-    indicator of upstream-provider health.
-
-[KEEP] Every v4.0.0 capability preserved:
-    - Root paths: /sheet-rows, /schema, /schema/sheet-spec,
-      /schema/pages, /schema/data-dictionary + /v1/schema aliases
-    - GET+POST merging with query/body param normalization
-    - schema_only / headers_only handling in both flows
-    - Canonical envelope shape:
-      headers/display_headers/sheet_headers/column_headers/keys/
-      rows/rows_matrix/row_objects/items/records/data/quotes
-    - Schema-safe local fallbacks for Top_10_Investments,
-      Insights_Analysis, Data_Dictionary, and instrument pages
-    - Canonical contract baseline (engine-side schema
-      registry override remains authoritative when available)
-    - Auth dispatch cascade preserved (6 attempt shapes)
-    - JSON-safe coercion preserved
-    - `_call_core_sheet_rows_best_effort` 7-candidate signature
-      loop preserved
-
-May 2026 / family alignment
----------------------------
+May/Jun 2026 / family alignment
+-------------------------------
 This route aligns with:
-  - core.data_engine_v2          v5.78.0  (115-key canonical, Fix-K
-                                            investability gate; provider-
-                                            unhealthy registry, health())
-  - core.providers.eodhd_provider v4.8.0   (circuit breaker, diagnose_health,
-                                             get_provider_stats)
-  - core.providers.yahoo_fundamentals_provider v6.1.0
-  - core.providers.yahoo_chart_provider        v8.2.0
-  - core.scoring                  v5.2.5
-  - core.scoring_engine           v3.4.2
-  - core.reco_normalize           v7.2.0
+  - core.data_engine_v2          v5.79.2  (115-key canonical, v5.78.0 gate;
+                                            provider-unhealthy registry, health())
+  - core.sheets.schema_registry  v2.13.0  (115/118 LIVE — gate columns named)
+  - core.providers.eodhd_provider v4.8.0   (circuit breaker, diagnose_health)
+  - core.scoring                  v5.7.1   (8-tier vocabulary incl. AVOID)
+  - core.reco_normalize           v8.0.0
   - core.insights_builder         v7.0.0
   - core.candlesticks             v1.0.0
-  - core.sheets.schema_registry   2.6.0*   (*90/93 live; pending bump to
-                                             115/118 in cascade #3)
   - routes/analysis_sheet_rows    4.4.0    (downstream registry-derived router)
 
-New env variables (v4.2.0)
---------------------------
-None. v4.2.0's width behavior is gated by which width the live registry
-serves; provider_health fields still omit gracefully if v2 is unavailable.
+WHY v4.2.0 (condensed) — removed every hard-coded width literal from the
+contract path so Top_10 stops clamping to 83; `_expected_len` prefers the live
+registry's `get_sheet_len`; `_ensure_top10_contract` gained an optional
+`target_len` with a hard anti-truncation invariant; `_resolve_contract` passes
+the registry-derived width through. WHY v4.1.0 (condensed) — inverted the
+engine binding cascade (v2 first, legacy fallback) so v5.x enrichment reaches
+the wire, and added the provider-health surface (`meta.provider_health`,
+`/v1/schema/provider-health`, envelope warning lift, health-endpoint counts).
+All of that machinery is preserved verbatim below.
 
 Purpose
 -------
@@ -217,7 +104,7 @@ Owns the canonical root paths:
 - /schema/sheet-spec
 - /schema/pages
 - /schema/data-dictionary
-- /v1/schema/provider-health  [v4.1.0]
+- /v1/schema/provider-health
 and their /v1/schema aliases.
 ================================================================================
 """
@@ -243,32 +130,29 @@ logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
 # =============================================================================
-# v4.2.0 — Version constant.
+# v4.3.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.2.0"
+ADVANCED_ANALYSIS_VERSION = "4.3.0"
 
 
 # =============================================================================
 # v4.1.0 [FIX-A — CRITICAL] Engine binding cascade.  (preserved verbatim)
 #
-# v4.0.0 tried `core.data_engine.get_sheet_rows` (legacy) FIRST and
-# only fell back to `core.data_engine_v2` if the legacy import failed.
-# Since legacy always imports successfully on this deployment, the v2
-# path was never reached and v5.61.0's enrichment (Decision Matrix,
-# Insights, Candlesticks, provider_unhealthy registry, ...) never
-# made it to the wire.
+# v4.0.0 tried `core.data_engine.get_sheet_rows` (legacy) FIRST and only fell
+# back to `core.data_engine_v2` if the legacy import failed. Since legacy always
+# imports successfully on this deployment, the v2 path was never reached and the
+# v5.x enrichment (Decision Matrix, Insights, Candlesticks, provider_unhealthy
+# registry, gate, ...) never made it to the wire.
 #
 # v4.1.0 inverts that preference. Cascading binding probe in order:
-#
 #   1. `core.data_engine_v2.get_engine()` — async or sync factory.
-#   2. `core.data_engine_v2.get_engine_if_ready()` — sync ready-check
-#      with async-factory cold-start fallback.
+#   2. `core.data_engine_v2.get_engine_if_ready()` — sync ready-check with
+#      async-factory cold-start fallback.
 #   3. `core.data_engine_v2.get_sheet_rows` — top-level module-level fn.
 #   4. `core.data_engine.get_sheet_rows` — legacy adapter (bug indicator).
 #
 # Every step logs explicitly. The chosen binding is reflected in
-# CORE_GET_SHEET_ROWS_SOURCE and surfaces in every response's
-# meta.source field.
+# CORE_GET_SHEET_ROWS_SOURCE and surfaces in every response's meta.source field.
 # =============================================================================
 CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
 core_get_sheet_rows = None  # type: ignore[assignment]
@@ -281,9 +165,9 @@ try:
         """v4.1.0: runtime-await-aware adapter for v2 engine factory.
 
         `core.data_engine_v2.get_engine` may be sync (v5.50.0+ behavior,
-        returns DataEngineV5 instance directly) or async (older or
-        future builds, returns a coroutine that resolves to the
-        instance). `inspect.isawaitable` distinguishes at runtime.
+        returns DataEngineV5 instance directly) or async (older or future
+        builds, returns a coroutine that resolves to the instance).
+        `inspect.isawaitable` distinguishes at runtime.
         """
         raw = _v2_get_engine()
         engine = await raw if inspect.isawaitable(raw) else raw
@@ -354,7 +238,7 @@ if core_get_sheet_rows is None:
         CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine.get_sheet_rows"
         logger.warning(
             "[advanced_analysis v%s] all v2 binding patterns failed; falling back to legacy core.data_engine "
-            "(this loses v5.61.0 enrichment including provider_unhealthy registry — investigate v2 exports)",
+            "(this loses v5.x enrichment including the investability gate — investigate v2 exports)",
             ADVANCED_ANALYSIS_VERSION,
         )
     except Exception as _legacy_err:
@@ -369,10 +253,9 @@ if core_get_sheet_rows is None:
 # =============================================================================
 # v4.1.0 [ADD-B/C] Provider-health snapshot helpers.  (preserved verbatim)
 #
-# These resolve the v2 engine instance directly (bypassing the
-# get_sheet_rows adapter) so we can call `engine.health()` and read
-# the v5.61.0 `provider_unhealthy_markers` field. Cached at module
-# level after first successful resolution.
+# These resolve the v2 engine instance directly (bypassing the get_sheet_rows
+# adapter) so we can call `engine.health()` and read the `provider_unhealthy_
+# markers` field. Cached at module level after first successful resolution.
 # =============================================================================
 _V2_ENGINE_HEALTH_FACTORY: Optional[Any] = None
 _V2_ENGINE_HEALTH_FACTORY_INITED: bool = False
@@ -381,9 +264,8 @@ _V2_ENGINE_HEALTH_FACTORY_INITED: bool = False
 def _resolve_v2_engine_factory() -> Optional[Any]:
     """v4.1.0: One-time resolution of the v2 engine factory callable.
 
-    Caches the result at module level. Returns None if v2 is
-    unavailable (graceful degradation — provider_health fields
-    simply omit from responses).
+    Caches the result at module level. Returns None if v2 is unavailable
+    (graceful degradation — provider_health fields simply omit from responses).
     """
     global _V2_ENGINE_HEALTH_FACTORY, _V2_ENGINE_HEALTH_FACTORY_INITED
     if _V2_ENGINE_HEALTH_FACTORY_INITED:
@@ -423,15 +305,9 @@ async def _get_v2_engine_instance() -> Optional[Any]:
 async def _extract_provider_health_snapshot() -> Dict[str, Any]:
     """v4.1.0 [ADD-C]: Fetch the engine's provider-health snapshot.
 
-    Calls `engine.health()` and extracts the v5.61.0
-    `provider_unhealthy_markers` field plus `engine_version`.
-    Returns a JSON-safe dict suitable for embedding in
+    Calls `engine.health()` and extracts the `provider_unhealthy_markers` field
+    plus `engine_version`. Returns a JSON-safe dict suitable for embedding in
     `meta.provider_health` or serving from the dedicated endpoint.
-
-    Failure shapes:
-      - v2 unavailable: {"unavailable": True, "reason": "v2_engine_not_bound"}
-      - health() raised: {"unavailable": True, "error_class": "...", "error_detail": "..."}
-      - health() returned no markers field: {"unavailable": True, "reason": "no_registry_in_health"}
 
     Never raises. Safe to call from any request path.
     """
@@ -459,7 +335,7 @@ async def _extract_provider_health_snapshot() -> Dict[str, Any]:
 
     markers = health.get("provider_unhealthy_markers")
     if markers is None:
-        # Older engine version (pre-v5.61.0) without the registry field.
+        # Older engine version without the registry field.
         return {
             "unavailable": True,
             "reason": "no_registry_in_health",
@@ -476,10 +352,10 @@ def _lift_systemic_warning_markers(row_objects: Sequence[Mapping[str, Any]]) -> 
     """v4.1.0 [ADD-F]: Lift systemic provider markers from row warnings
     into envelope-level warnings.
 
-    Scans each row's `warnings` field for the v5.61.0 markers:
-      - "circuit_open" → "Provider circuit open (engine routing to fallback chain)"
-      - "provider_unhealthy:<X>" → "Upstream provider unhealthy: <X> (engine routing around it)"
-      - "HTTP 403" → "Provider access issue (HTTP 403)"
+    Scans each row's `warnings` field for the markers:
+      - "circuit_open" -> "Provider circuit open (engine routing to fallback chain)"
+      - "provider_unhealthy:<X>" -> "Upstream provider unhealthy: <X> (engine routing around it)"
+      - "HTTP 403" -> "Provider access issue (HTTP 403)"
 
     Deduplicated. Per-row warnings are NOT modified — only lifted.
     Empty list if no markers found.
@@ -523,12 +399,11 @@ _INSIGHTS_PAGE = "Insights_Analysis"
 _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
-# v4.2.0 [FIX-A]: _EXPECTED_SHEET_LENGTHS is now DERIVED from the canonical
-# list lengths and defined AFTER the canonical lists below (see the
-# "v4.2.0 derived contract widths" block). Static-fallback-only: _expected_len()
-# always prefers the live registry's get_sheet_len() first. Removing the early
-# hard-coded {80, 83, 7, 9} dict is what lets Top_10 track the canonical
-# instead of clamping to a frozen 83.
+# v4.2.0 [FIX-A]: _EXPECTED_SHEET_LENGTHS is DERIVED from the canonical list
+# lengths and defined AFTER the canonical lists below (see the "v4.2.0 derived
+# contract widths" block). Static-fallback-only: _expected_len() always prefers
+# the live registry's get_sheet_len() first. v4.3.0 keeps this — the derived
+# values now resolve to 115 / 118 because the canonical list grew to 115.
 
 _TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
@@ -581,72 +456,151 @@ except Exception:
     def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
 
-# (v4.1.0: the original legacy-first binding block was REMOVED here;
-# the v2-first cascade now lives at module top after the imports.)
+# (v4.1.0: the original legacy-first binding block was REMOVED here; the
+# v2-first cascade now lives at module top after the imports.)
 
-# v4.2.0 [ALIGN]: static canonical widened 80 -> 90 to match
-# analysis_sheet_rows v4.4.0 (adds Upside %, the 4 view columns, and the
-# 5 v2.6.0 Insights-group columns). Fallback-only — the live registry
-# contract remains authoritative at runtime.
-_CANONICAL_80_HEADERS: List[str] = [
+# =============================================================================
+# v4.3.0 [FIX-A/B]: static instrument canonical = the LIVE 115-key contract.
+#
+# This list is the EXACT data_engine_v2 v5.79.2 INSTRUMENT_CANONICAL_* /
+# schema_registry v2.13.0 column order: 90 prior columns + Decision pair +
+# Provider Rating + Canonical-Reco pair + remaining Scoring-v5.74 + Candlestick
+# block + forecast_source + the 8-column Investability Gate (positions 108-115).
+# FALLBACK-ONLY — on the live path the registry contract is authoritative
+# (_expected_len -> get_sheet_len, _resolve_contract projects onto registry
+# keys). v4.3.0 widened/reordered it so the registry-DOWN path no longer
+# regresses below the gate. (Renamed from the misleading `_CANONICAL_80_*`.)
+# =============================================================================
+_CANONICAL_INSTRUMENT_HEADERS: List[str] = [
+    # Identity (8)
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
+    # Price (10) -> 18
     "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
-    "Price Change", "Percent Change", "52W Position %", "Volume", "Avg Volume 10D", "Avg Volume 30D",
-    "Market Cap", "Float Shares", "Beta (5Y)", "P/E (TTM)", "P/E (Forward)", "EPS (TTM)",
-    "Dividend Yield", "Payout Ratio", "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin",
-    "Operating Margin", "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)", "RSI (14)",
-    "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)", "Sharpe (1Y)",
-    "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value",
-    "Upside %",
-    "Valuation Score", "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
-    "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence",
-    "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
-    "Growth Score", "Overall Score",
+    "Price Change", "Percent Change", "52W Position %",
+    # Liquidity (6) -> 24
+    "Volume", "Avg Volume 10D", "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)",
+    # Fundamentals (12) -> 36
+    "P/E (TTM)", "P/E (Forward)", "EPS (TTM)", "Dividend Yield", "Payout Ratio", "Revenue (TTM)",
+    "Revenue Growth YoY", "Gross Margin", "Operating Margin", "Profit Margin", "Debt/Equity",
+    "Free Cash Flow (TTM)",
+    # Risk (8) -> 44
+    "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)", "Sharpe (1Y)",
+    "Risk Score", "Risk Bucket",
+    # Valuation (7) -> 51
+    "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value", "Upside %", "Valuation Score",
+    # Forecast (9) -> 60
+    "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M", "Expected ROI 1M",
+    "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence", "Confidence Score",
+    "Confidence Bucket",
+    # Scores (7) -> 67  (opportunity_score / rank_overall BEFORE views — engine order)
+    "Value Score", "Quality Score", "Momentum Score", "Growth Score", "Overall Score",
+    "Opportunity Score", "Rank (Overall)",
+    # Views (4) -> 71
     "Fundamental View", "Technical View", "Risk View", "Value View",
-    "Opportunity Score", "Rank (Overall)", "Recommendation",
-    "Recommendation Reason", "Horizon Days", "Invest Period Label", "Position Qty", "Avg Cost",
-    "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
-    "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
-    # v2.6.0 Insights group (Wave 3) — produced by core.insights_builder
+    # Recommendation (4) -> 75
+    "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
+    # Portfolio (6) -> 81
+    "Position Qty", "Avg Cost", "Position Cost", "Position Value", "Unrealized P/L",
+    "Unrealized P/L %",
+    # Provenance (4) -> 85
+    "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    # Insights (5) -> 90
     "Sector-Adj Score", "Conviction Score", "Top Factors", "Top Risks", "Position Size Hint",
+    # Decision (2) -> 92
+    "Recommendation Detail", "Reco Priority",
+    # Provider Rating (1) -> 93
+    "Provider Rating",
+    # Canonical Reco (2) -> 95
+    "Recommendation Source", "Priority Band",
+    # Scoring v5.74 remaining (6) -> 101
+    "Scoring Reco Source", "Scoring Schema Version", "Scoring Errors", "Opportunity Source",
+    "Overall Score (Raw)", "Overall Penalty Factor",
+    # Candlestick (5) -> 106
+    "Candle Pattern", "Candle Signal", "Candle Strength", "Candle Confidence",
+    "Recent Patterns (5D)",
+    # Forecast Source (1) -> 107
+    "Forecast Source",
+    # Investability Gate (8) -> 115
+    "Data Quality Score", "Forecast Reliability Score", "Provider/Engine Conflict",
+    "Conflict Type", "Final Decision Basis", "Investability Status", "Final Action",
+    "Block Reason",
 ]
-_CANONICAL_80_KEYS: List[str] = [
+_CANONICAL_INSTRUMENT_KEYS: List[str] = [
+    # Identity (8)
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
+    # Price (10) -> 18
     "current_price", "previous_close", "open_price", "day_high", "day_low", "week_52_high",
-    "week_52_low", "price_change", "percent_change", "week_52_position_pct", "volume",
-    "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y", "pe_ttm",
-    "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio", "revenue_ttm", "revenue_growth_yoy",
-    "gross_margin", "operating_margin", "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
+    "week_52_low", "price_change", "percent_change", "week_52_position_pct",
+    # Liquidity (6) -> 24
+    "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y",
+    # Fundamentals (12) -> 36
+    "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio", "revenue_ttm",
+    "revenue_growth_yoy", "gross_margin", "operating_margin", "profit_margin", "debt_to_equity",
+    "free_cash_flow_ttm",
+    # Risk (8) -> 44
     "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y",
-    "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
-    "intrinsic_value", "upside_pct", "valuation_score", "forecast_price_1m", "forecast_price_3m",
-    "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
-    "forecast_confidence", "confidence_score", "confidence_bucket", "value_score", "quality_score",
-    "momentum_score", "growth_score", "overall_score",
-    "fundamental_view", "technical_view", "risk_view", "value_view",
+    "risk_score", "risk_bucket",
+    # Valuation (7) -> 51
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value", "upside_pct",
+    "valuation_score",
+    # Forecast (9) -> 60
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "expected_roi_1m",
+    "expected_roi_3m", "expected_roi_12m", "forecast_confidence", "confidence_score",
+    "confidence_bucket",
+    # Scores (7) -> 67
+    "value_score", "quality_score", "momentum_score", "growth_score", "overall_score",
     "opportunity_score", "rank_overall",
-    "recommendation", "recommendation_reason", "horizon_days", "invest_period_label", "position_qty",
-    "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
+    # Views (4) -> 71
+    "fundamental_view", "technical_view", "risk_view", "value_view",
+    # Recommendation (4) -> 75
+    "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
+    # Portfolio (6) -> 81
+    "position_qty", "avg_cost", "position_cost", "position_value", "unrealized_pl",
+    "unrealized_pl_pct",
+    # Provenance (4) -> 85
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
-    # v2.6.0 Insights group (Wave 3) — produced by core.insights_builder
+    # Insights (5) -> 90
     "sector_relative_score", "conviction_score", "top_factors", "top_risks", "position_size_hint",
+    # Decision (2) -> 92
+    "recommendation_detailed", "recommendation_priority",
+    # Provider Rating (1) -> 93
+    "provider_rating",
+    # Canonical Reco (2) -> 95
+    "recommendation_source", "recommendation_priority_band",
+    # Scoring v5.74 remaining (6) -> 101
+    "scoring_recommendation_source", "scoring_schema_version", "scoring_errors",
+    "opportunity_source", "overall_score_raw", "overall_penalty_factor",
+    # Candlestick (5) -> 106
+    "candlestick_pattern", "candlestick_signal", "candlestick_strength", "candlestick_confidence",
+    "candlestick_patterns_recent",
+    # Forecast Source (1) -> 107
+    "forecast_source",
+    # Investability Gate (8) -> 115
+    "data_quality_score", "forecast_reliability_score", "provider_engine_conflict",
+    "conflict_type", "final_decision_basis", "investability_status", "final_action",
+    "block_reason",
 ]
-_INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
-_INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
+
+# v4.3.0 [FIX-C]: Insights static fallback reconciled to schema_registry v2.12.0+
+# / data_engine_v2 INSIGHTS_KEYS / INSIGHTS_HEADERS. Was the pre-v2.12.0
+# [Section, Item, Symbol, Metric, Value, Notes, Last Updated (Riyadh)]; now the
+# engine contract [Section, Item, Metric, Value, Notes, Source, Sort Order].
+# Count stays 7. Fallback-only — the live registry contract is authoritative.
+_INSIGHTS_HEADERS = ["Section", "Item", "Metric", "Value", "Notes", "Source", "Sort Order"]
+_INSIGHTS_KEYS = ["section", "item", "metric", "value", "notes", "source", "sort_order"]
 _DICTIONARY_HEADERS = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
 _DICTIONARY_KEYS = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
 
 # =============================================================================
-# v4.2.0 derived contract widths (TRACKS CANONICAL — no hardcoded 80/83)
+# v4.2.0 derived contract widths (TRACKS CANONICAL — no hardcoded 80/83/90/115)
 # =============================================================================
 # Every instrument-page width (including My_Investments) derives from
-# len(_CANONICAL_80_KEYS); Top_10 derives as instrument_len + the Top_10
-# extras count. When the static canonical snapshot grows (e.g. synced to the
-# live 115-key registry during cascade #3), ALL of these auto-update with zero
-# further edits. At runtime _expected_len() still prefers the live registry's
-# get_sheet_len() over this static-fallback map, so the route faithfully tracks
-# whatever the deployed registry serves (90 today, 115/118 once #3 lands).
-_CANONICAL_INSTRUMENT_LEN: int = len(_CANONICAL_80_KEYS)
+# len(_CANONICAL_INSTRUMENT_KEYS); Top_10 derives as instrument_len + the Top_10
+# extras count. v4.3.0 grew the canonical list to 115, so these auto-resolve to
+# 115 / 118 with no further edits. At runtime _expected_len() still prefers the
+# live registry's get_sheet_len() over this static-fallback map, so the route
+# faithfully tracks whatever the deployed registry serves.
+_CANONICAL_INSTRUMENT_LEN: int = len(_CANONICAL_INSTRUMENT_KEYS)
 _TOP10_EXTRA_COUNT: int = len(_TOP10_REQUIRED_FIELDS)
 _TOP10_STATIC_LEN: int = _CANONICAL_INSTRUMENT_LEN + _TOP10_EXTRA_COUNT
 _INSIGHTS_STATIC_LEN: int = len(_INSIGHTS_KEYS)
@@ -1006,9 +960,10 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str], target_l
     """v4.2.0 [FIX-B]: append the 3 Top_10 extras, then pad to `target_len`.
 
     The literal `83` clamp this function used to end with was the Top_10
-    truncation point: it silently dropped every column past index 83 —
-    including the v5.78.0 investability gate (forecast_source + 8 gate
-    columns) once the registry/canonical grew to 115. v4.2.0 removes it.
+    truncation point: it silently dropped every column past index 83 — including
+    the v5.78.0 investability gate (forecast_source + 8 gate columns) once the
+    registry/canonical grew to 115. v4.2.0 removed it; v4.3.0 keeps the same
+    contract.
 
     Width semantics:
       - target_len is None  -> pad to the natural width (canonical + extras),
@@ -1032,9 +987,9 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str], target_l
     return _pad_contract(hdrs, ks, effective_len)
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
-    # v4.2.0 [FIX-E]: widths derived from list lengths (was literal 83/7/9/80).
+    # v4.3.0: widths derived from the 115-key canonical list lengths.
     if page == _TOP10_PAGE:
-        h, k = _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, target_len=_TOP10_STATIC_LEN)
+        h, k = _ensure_top10_contract(_CANONICAL_INSTRUMENT_HEADERS, _CANONICAL_INSTRUMENT_KEYS, target_len=_TOP10_STATIC_LEN)
         return h, k, "static_canonical_top10"
     if page == _INSIGHTS_PAGE:
         h, k = _pad_contract(_INSIGHTS_HEADERS, _INSIGHTS_KEYS, _INSIGHTS_STATIC_LEN)
@@ -1042,7 +997,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, _DICTIONARY_STATIC_LEN)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, _CANONICAL_INSTRUMENT_LEN))
+    h, k = _pad_contract(_CANONICAL_INSTRUMENT_HEADERS, _CANONICAL_INSTRUMENT_KEYS, _EXPECTED_SHEET_LENGTHS.get(page, _CANONICAL_INSTRUMENT_LEN))
     return h, k, "static_canonical_instrument"
 
 def _expected_len(page: str) -> int:
@@ -1393,16 +1348,30 @@ def _build_dictionary_fallback_rows(*, page: str, headers: Sequence[str], keys: 
     return _slice(rows, limit=limit, offset=offset)
 
 def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
+    # v4.3.0 [FIX-C]: emit the engine/registry v2.12.0+ Insights keys
+    # (section, item, metric, value, notes, source, sort_order). Dropped the
+    # pre-v2.12.0 `symbol` / `last_updated_riyadh` fields; the requested symbol
+    # is folded into the row `item` so the fallback summary stays informative.
     symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
     if not symbols:
         symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(_INSIGHTS_PAGE, []) if _normalize_symbol_token(x)]
-    stamp = datetime.utcnow().isoformat()
+    src = "advanced_analysis.local_insights_fallback"
     rows: List[Dict[str, Any]] = [
-        {"section": "Coverage", "item": "Requested symbols", "symbol": "", "metric": "count", "value": len(symbols), "notes": "Local insights fallback summary", "last_updated_riyadh": stamp},
-        {"section": "Coverage", "item": "Universe sample", "symbol": "", "metric": "symbols", "value": ", ".join(symbols[:5]), "notes": "Sample of the symbols used by fallback mode", "last_updated_riyadh": stamp},
+        {"section": "Coverage", "item": "Requested symbols", "metric": "count", "value": len(symbols), "notes": "Local insights fallback summary", "source": src, "sort_order": 1},
+        {"section": "Coverage", "item": "Universe sample", "metric": "symbols", "value": ", ".join(symbols[:5]), "notes": "Sample of the symbols used by fallback mode", "source": src, "sort_order": 2},
     ]
+    next_order = 3
     for idx, sym in enumerate(symbols[: max(1, limit + offset)], start=1):
-        rows.append({"section": "Signals", "item": f"Fallback signal {idx}", "symbol": sym, "metric": "recommendation", "value": "Watch" if idx > 2 else "Accumulate", "notes": "Generated locally because upstream insights payload was unavailable", "last_updated_riyadh": stamp})
+        rows.append({
+            "section": "Signals",
+            "item": f"{sym} fallback signal",
+            "metric": "recommendation",
+            "value": "Watch" if idx > 2 else "Accumulate",
+            "notes": "Generated locally because upstream insights payload was unavailable",
+            "source": src,
+            "sort_order": next_order,
+        })
+        next_order += 1
     return _slice(rows, limit=limit, offset=offset)
 
 def _build_nonempty_failsoft_rows(*, page: str, headers: Sequence[str], keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int, top_n: int) -> List[Dict[str, Any]]:
@@ -1435,13 +1404,13 @@ def _payload_envelope(
     """Build the canonical sheet-rows envelope.
 
     v4.1.0 additions:
-      - `provider_health`: optional engine `health()` snapshot. Surfaced
-        under `meta.provider_health`. Pass the dict from
+      - `provider_health`: optional engine `health()` snapshot. Surfaced under
+        `meta.provider_health`. Pass the dict from
         `_extract_provider_health_snapshot()`.
-      - `lifted_warnings`: optional list of envelope-level warnings
-        lifted from row warnings via `_lift_systemic_warning_markers`.
-        Surfaced under the top-level `warnings` key (Apps Script
-        12_Diagnostics.gs can read this without scanning every row).
+      - `lifted_warnings`: optional list of envelope-level warnings lifted from
+        row warnings via `_lift_systemic_warning_markers`. Surfaced under the
+        top-level `warnings` key (Apps Script 12_Diagnostics.gs can read this
+        without scanning every row).
     """
     hdrs = list(headers or [])
     ks = list(keys or [])
@@ -1543,16 +1512,16 @@ def _normalize_external_payload(
 ) -> Dict[str, Any]:
     """Normalize an engine payload into the canonical envelope.
 
-    v4.1.0: forwards `provider_health` snapshot into the envelope so the
-    success path carries the same `meta.provider_health` field as the
-    fail-soft path. Also lifts systemic markers from row warnings into
-    envelope-level `warnings`.
+    v4.1.0: forwards `provider_health` snapshot into the envelope so the success
+    path carries the same `meta.provider_health` field as the fail-soft path.
+    Also lifts systemic markers from row warnings into envelope-level
+    `warnings`.
 
-    v4.2.0 note: `keys` here is the registry-derived contract from
-    `_resolve_contract` (115/118 once the registry is at the gate width).
-    Rows are projected onto `keys` directly — no re-clamp — so gate columns
-    survive whenever the registry serves them. This is why there is no
-    third truncation point in this route (unlike analysis_sheet_rows v4.4.0).
+    v4.2.0/v4.3.0 note: `keys` here is the registry-derived contract from
+    `_resolve_contract` (115/118 now that the registry is at v2.13.0). Rows are
+    projected onto `keys` directly — no re-clamp — so the gate columns survive
+    whenever the registry serves them. This is why there is no third truncation
+    point in this route (unlike analysis_sheet_rows v4.4.0).
     """
     ext = dict(external_payload or {})
     hdrs = list(headers or [])
@@ -1688,11 +1657,11 @@ async def _run_advanced_sheet_rows_impl(
 async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
     """v4.1.0: enhanced with engine_version + provider_health summary.
 
-    Operators monitoring this endpoint can now see at a glance whether
-    the upstream-provider chain is healthy:
-      - provider_unhealthy_count == 0 → all providers healthy
-      - provider_unhealthy_count > 0  → engine is demoting/skipping
-        at least one provider; check /v1/schema/provider-health for detail.
+    Operators monitoring this endpoint can now see at a glance whether the
+    upstream-provider chain is healthy:
+      - provider_unhealthy_count == 0 -> all providers healthy
+      - provider_unhealthy_count > 0  -> engine is demoting/skipping at least
+        one provider; check /v1/schema/provider-health for detail.
 
     Failures inside provider_health resolution are caught and surfaced as
     `provider_health_error`; the health endpoint itself never raises.
@@ -1734,9 +1703,10 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
         "provider_health_endpoint_enabled": True,
         "provider_health_summary": provider_health_summary,
         "provider_unhealthy_count": provider_unhealthy_count,
-        # v4.2.0: expose the registry-derived contract widths this route is
-        # serving so operators can confirm whether Top_10 is at the full
-        # canonical width or still tracking a stale 90/93 registry.
+        # v4.2.0/v4.3.0: expose the registry-derived contract widths this route
+        # is serving so operators can confirm whether Top_10 is at the full
+        # canonical width (118) or still tracking a stale registry. The static
+        # fallback values are now 115 / 118 (v4.3.0).
         "contract_widths": {
             "instrument_static_fallback": _CANONICAL_INSTRUMENT_LEN,
             "top10_static_fallback": _TOP10_STATIC_LEN,
@@ -1757,33 +1727,13 @@ async def schema_provider_health(request: Request) -> Dict[str, Any]:
 
     Returns the engine's `provider_unhealthy_markers` registry without
     triggering a sheet build. Cheap polling target for Apps Script
-    `12_Diagnostics.gs runFullDiagnosticSweep_()` — one HTTP call
-    instead of one-per-page to discover systemic provider outages.
-
-    Response shape:
-      {
-        "status": "success" | "unavailable",
-        "version": "4.2.0",
-        "engine_version": "5.78.0",
-        "provider_health": {
-          "unhealthy_markers": {
-            "active": [{"provider": "eodhd", "ttl_remaining_sec": 247.3}],
-            "active_count": 1,
-            "demote_enabled": true,
-            "skip_enabled": false,
-            "default_ttl_sec": 300.0
-          },
-          "engine_version": "5.78.0"
-        },
-        "timestamp_utc": "2026-05-12T10:24:31.482Z",
-        "request_id": "...",
-        "meta": { "source": "core.data_engine_v2.get_engine().health" }
-      }
+    `12_Diagnostics.gs runFullDiagnosticSweep_()` — one HTTP call instead of
+    one-per-page to discover systemic provider outages.
 
     On v2-engine-unavailable / no-registry-in-health, returns
-    `status: "unavailable"` with a `reason` field instead of raising.
-    Always returns 200; consumers should inspect the `status` field
-    rather than relying on HTTP codes.
+    `status: "unavailable"` with a `reason` field instead of raising. Always
+    returns 200; consumers should inspect the `status` field rather than
+    relying on HTTP codes.
     """
     request_id = str(uuid.uuid4())[:12]
     started = time.time()
