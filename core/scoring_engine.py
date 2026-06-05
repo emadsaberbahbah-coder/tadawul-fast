@@ -2,7 +2,7 @@
 # core/scoring_engine.py
 """
 ================================================================================
-Scoring Engine -- v3.7.0
+Scoring Engine -- v3.8.0
 (THIN COMPATIBILITY BRIDGE -- DELEGATES TO core.scoring v5.7.3+
  AND core.reco_normalize v8.0.0+)
 ================================================================================
@@ -14,118 +14,117 @@ this module routes those imports to the canonical implementations in
 `core.scoring`.
 
 ================================================================================
+v3.8.0 changes (vs v3.7.0)  --  CONTRACT-TEST PUBLIC-SURFACE ALIGNMENT
+================================================================================
+
+The scoring-engine contract test (test_scoring_engine_contract.py v2.1.0,
+TestScoringEngineContract.test_public_surface_exists) asserts:
+
+    self.assertTrue(hasattr(se, "SCORING_ENGINE_VERSION"))
+
+v3.7.0 exposed three version handles -- VERSION, __version__, and
+SCORING_VERSION (the resolved core.scoring version) -- but NOT
+`SCORING_ENGINE_VERSION`, so that single assertion failed and the whole
+public-surface test went red even though every other contract surface was
+satisfied (compute_scores / enrich_with_scores / AssetScores / ScoringEngine
+/ ScoringWeights / ForecastParameters are all present and exported).
+
+v3.8.0 closes that gap and nothing else:
+
+  Phase A -- NEW SCORING_ENGINE_VERSION module constant, an alias of VERSION
+             (this bridge's own version string). It names THIS module (the
+             scoring-engine bridge), distinct from SCORING_VERSION which
+             reports the resolved core.scoring version. Added to __all__.
+
+  Phase B -- Version bump 3.7.0 -> 3.8.0. Minor bump because the public
+             surface widens by one symbol (SCORING_ENGINE_VERSION); no
+             breaking changes and no removals.
+
+  Phase C -- Header docstring sync (this section). The pre-v3.6.0 changelog
+             is condensed in this working copy (it lives in source control);
+             ALL code, every re-export, every diagnostic tuple, and every
+             is_*() helper are preserved byte-identical from v3.7.0.
+
+VERSION-HANDLE SEMANTICS (so future maintainers don't collapse them):
+  - VERSION / __version__       -> this bridge module's version ("3.8.0")
+  - SCORING_ENGINE_VERSION      -> alias of VERSION (== this bridge's version);
+                                   the name the contract test checks
+  - SCORING_VERSION             -> the resolved core.scoring.__version__
+                                   (the UNDERLYING scoring implementation)
+
+[PRESERVED -- strictly]
+  - Every v3.7.0 public name remains exported (VERSION, __version__,
+    SCORING_VERSION all retained; SCORING_ENGINE_VERSION is purely additive).
+  - is_view_aware, is_audit_hardened, is_reco_rule_id_aware,
+    is_cascade_bridged, is_bucket_aligned, is_contract_versioned,
+    is_reco_8tier_aware, is_asset_class_aware -- all unchanged.
+  - _V525 / _V528 / _V540 / _V570 field-contract tuples unchanged.
+  - _BUCKET_ALIGNMENT_SYMBOLS / _CONTRACT_VERSION_SYMBOLS /
+    _ASSET_CLASS_SCORING_SYMBOLS / _RECO_8TIER_SYMBOLS unchanged.
+  - _ENGINE_CONTRACT_VERSION / _RECO_NORMALIZE_CONTRACT_VERSION re-exports
+    unchanged (read dynamically; report 5.79.2 / 8.0.0).
+  - get_degradation_report() output shape unchanged.
+  - RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5
+    auto-track core.scoring's __version__ via its f-string.
+
+API surface (additions in v3.8.0):
+  - SCORING_ENGINE_VERSION (module constant, alias of VERSION)
+
+================================================================================
 v3.7.0 changes (vs v3.6.0)  --  core.scoring v5.7.1 / v5.7.2 / v5.7.3 ALIGNMENT
 ================================================================================
 
-core.scoring has advanced v5.7.0 -> v5.7.1 -> v5.7.2 -> v5.7.3 since
-v3.6.0 was cut. The bridge was operating correctly against all of
-those releases (every new scoring symbol is internal to compute_scores
-or read dynamically via getattr), but was under-advertising the
+core.scoring advanced v5.7.0 -> v5.7.1 -> v5.7.2 -> v5.7.3 since v3.6.0. The
+bridge was already correct against all of them (every new scoring symbol is
+internal to compute_scores or read via getattr), but under-advertised the
 v5.7.3 asset-class surface in its diagnostic report.
 
 What advanced in core.scoring since v5.7.0
--------------------------------------------
-  v5.7.1: UNDERPERFORM cross-stack realignment (UNDERPERFORM ->
-            REDUCE, was SELL; sibling MARKET_UNDERPERFORM /
-            MARKET_OUTPERFORM aliases). _ENGINE_CONTRACT_VERSION
-            advanced "5.75.0" -> "5.77.17" (diagnostic marker only;
-            the producer/consumer contract was unchanged). Affects
-            only normalization of externally-supplied labels; no row
-            field added and the recommendation enum is unchanged.
-
-  v5.7.2: Confidence-penalty NEUTRAL POINT (recommendation-collapse
-            fix). New ScoringConfig.confidence_penalty_neutral (0.60,
-            env SCORING_CONFIDENCE_NEUTRAL), mirrored on ScoreWeights
-            and threaded through normalize(). conf_pen now penalizes
-            only confidence BELOW the neutral point, so the typical
-            ~0.62 data-quality confidence proxy is no longer marked
-            down by a uniform haircut. Re-centers the score
-            distribution only; no row field added, contract unchanged.
-
-  v5.7.3: Asset-class-aware valuation & quality. New
-            _asset_class_for_scoring(row) -> BANK / REIT / FUND /
-            EQUITY, _reit_yield_value() (hump-shaped REIT dividend-
-            yield curve), and _asset_class_aware_scoring_enabled()
-            (env SCORING_ASSET_CLASS_AWARE, default ON). Banks drop
-            the debt/equity quality term and value on P/E + P/B;
-            REITs value on P/B + capped dividend yield; equity / fund
-            rows are byte-identical to v5.7.2. _ENGINE_CONTRACT_VERSION
-            advanced "5.77.17" -> "5.79.2" (diagnostic marker only;
-            the engine's 8 investability-gate columns are computed
-            DOWNSTREAM of scoring, so the producer/consumer field set
-            is unchanged). NO new AssetScores row field; the
-            RECOMMENDATION_ENUM is unchanged at 8 tiers.
+  v5.7.1: UNDERPERFORM cross-stack realignment (UNDERPERFORM -> REDUCE, was
+            SELL; MARKET_UNDERPERFORM / MARKET_OUTPERFORM aliases).
+            _ENGINE_CONTRACT_VERSION "5.75.0" -> "5.77.17" (diagnostic marker
+            only). No row field added; recommendation enum unchanged.
+  v5.7.2: Confidence-penalty NEUTRAL POINT
+            (ScoringConfig.confidence_penalty_neutral 0.60, env
+            SCORING_CONFIDENCE_NEUTRAL). conf_pen now penalizes only confidence
+            BELOW the neutral point. Re-centers the distribution only; no row
+            field added, contract unchanged.
+  v5.7.3: Asset-class-aware valuation & quality. New _asset_class_for_scoring
+            (BANK / REIT / FUND / EQUITY), _reit_yield_value (hump-shaped REIT
+            dividend-yield curve), _asset_class_aware_scoring_enabled (env
+            SCORING_ASSET_CLASS_AWARE, default ON). Banks drop the debt/equity
+            quality term and value on P/E + P/B; REITs value on P/B + capped
+            dividend yield; equity/fund rows byte-identical to v5.7.2.
+            _ENGINE_CONTRACT_VERSION "5.77.17" -> "5.79.2" (diagnostic marker;
+            the engine's 8 investability-gate columns are computed DOWNSTREAM
+            of scoring, so the producer/consumer field set is unchanged). NO
+            new AssetScores row field; RECOMMENDATION_ENUM unchanged at 8 tiers.
 
 Why the bridge needed almost no change
---------------------------------------
-  - The three v5.7.3 helpers are internal to compute_scores; no
-    downstream consumer imports them via the bridge, so they are
-    TRACKED for diagnostics (Phase B/C/D) rather than re-exported as
-    bridge names -- mirroring how _RECO_8TIER_SYMBOLS are tracked on
-    the reco_normalize side without being re-exported.
-  - _ENGINE_CONTRACT_VERSION is re-exported via getattr() (v3.6.0
-    Phase B), so the bridge already reports the live value "5.79.2"
-    against v5.7.3 with no code change; the degradation report's
-    engine_contract_version key reflects it automatically.
-  - v5.7.1/v5.7.2/v5.7.3 added NO new compute_scores row field and
-    did NOT widen RECOMMENDATION_ENUM, so there is no new
-    _V###_FIELDS contract tuple and is_reco_8tier_aware() is
-    unaffected (still an 8-tier content check).
+  - The three v5.7.3 helpers are internal to compute_scores; no downstream
+    consumer imports them via the bridge, so they are TRACKED for diagnostics
+    rather than re-exported (mirroring how _RECO_8TIER_SYMBOLS are tracked on
+    the reco_normalize side without being re-exported).
+  - _ENGINE_CONTRACT_VERSION is re-exported via getattr() (v3.6.0 Phase B), so
+    the bridge already reports the live "5.79.2" against v5.7.3 with no code
+    change.
+  - v5.7.1/v5.7.2/v5.7.3 added NO new compute_scores row field and did NOT
+    widen RECOMMENDATION_ENUM, so there is no new _V###_FIELDS tuple and
+    is_reco_8tier_aware() is unaffected.
 
 Bridge changes in v3.7.0
-------------------------
+  Phase A -- Header docstring sync: floor moves to core.scoring v5.7.3+.
+  Phase B -- NEW _ASSET_CLASS_SCORING_SYMBOLS tuple tracking the v5.7.3
+             asset-class surface (_asset_class_for_scoring, _reit_yield_value,
+             _asset_class_aware_scoring_enabled). Tracked only, not re-exported.
+  Phase C -- NEW is_asset_class_aware() helper.
+  Phase D -- Extended get_degradation_report() with asset_class_scoring_symbols
+             / missing_asset_class_scoring / asset_class_scoring_enabled.
+  Phase E -- Version bump 3.6.0 -> 3.7.0.
 
-  Phase A -- Header docstring sync: floor moves to core.scoring
-             v5.7.3+. Older versions still load cleanly via the
-             getattr() fallback pattern; the degradation report flags
-             them. Documents the _ENGINE_CONTRACT_VERSION value
-             progression 5.75.0 -> 5.77.17 -> 5.79.2.
-
-  Phase B -- NEW _ASSET_CLASS_SCORING_SYMBOLS tuple tracking the
-             v5.7.3 asset-class surface in core.scoring:
-               * _asset_class_for_scoring            (function)
-               * _reit_yield_value                   (function)
-               * _asset_class_aware_scoring_enabled  (function)
-             Tracked on the core.scoring side, separately from
-             _BUCKET_ALIGNMENT_SYMBOLS / _CONTRACT_VERSION_SYMBOLS, so
-             a deployment on v5.3.0-v5.7.2 (full bucket + contract
-             surface but no asset-class surface yet) still passes
-             is_bucket_aligned() / is_contract_versioned() while
-             honestly reporting that asset-class scoring is
-             unavailable. These are TRACKED only, not re-exported as
-             bridge names (no consumer imports them via the bridge).
-
-  Phase C -- NEW is_asset_class_aware() helper: returns True when
-             core.scoring exposes all three v5.7.3 asset-class
-             functions. Mirror of is_view_aware, is_audit_hardened,
-             is_reco_rule_id_aware, is_cascade_bridged,
-             is_bucket_aligned, is_contract_versioned,
-             is_reco_8tier_aware.
-
-  Phase D -- Extended get_degradation_report():
-               * asset_class_scoring_symbols: {symbol: present_bool}
-               * missing_asset_class_scoring: [symbols]
-               * asset_class_scoring_enabled: bool
-             Existing report fields preserved verbatim.
-
-  Phase E -- Version bump 3.6.0 -> 3.7.0. Minor bump because the
-             public re-export surface widens (is_asset_class_aware);
-             no breaking changes and no removals.
-
-[PRESERVED -- strictly]
-  - Every v3.6.0 public name remains exported.
-  - is_view_aware, is_audit_hardened, is_reco_rule_id_aware,
-    is_cascade_bridged, is_bucket_aligned, is_contract_versioned,
-    is_reco_8tier_aware all unchanged.
-  - _V525 / _V528 / _V540 / _V570 field-contract tuples unchanged
-    (v5.7.3 added no new row field).
-  - _BUCKET_ALIGNMENT_SYMBOLS / _CONTRACT_VERSION_SYMBOLS /
-    _RECO_8TIER_SYMBOLS unchanged (the v3.7.0 addition goes into a
-    separate _ASSET_CLASS_SCORING_SYMBOLS tuple).
-  - _ENGINE_CONTRACT_VERSION / _RECO_NORMALIZE_CONTRACT_VERSION
-    re-exports unchanged (read dynamically; now report 5.79.2 / 8.0.0).
-  - RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5
-    auto-track core.scoring's __version__ via its f-string.
+[PRESERVED -- strictly] Every v3.6.0 public name; all is_*() helpers; the
+  _V### tuples; _BUCKET_ALIGNMENT_SYMBOLS / _CONTRACT_VERSION_SYMBOLS /
+  _RECO_8TIER_SYMBOLS; the contract-version re-exports.
 
 API surface (additions in v3.7.0):
   - _ASSET_CLASS_SCORING_SYMBOLS (private constant)
@@ -135,416 +134,107 @@ API surface (additions in v3.7.0):
 v3.6.0 changes (vs v3.5.0)  --  v5.6.0 / v5.7.0 / v8.0.0 ALIGNMENT
 ================================================================================
 
-core.scoring has advanced through v5.6.0 -> v5.7.0 since v3.5.0 was
-cut, and core.reco_normalize has advanced from v7.2.1 to v8.0.0. The
-bridge was operating correctly against all of those versions thanks
-to the getattr() fallback pattern, but was under-advertising the
-new surface:
+core.scoring advanced v5.6.0 -> v5.7.0 and core.reco_normalize v7.2.1 ->
+v8.0.0. The bridge was correct against all of them but under-advertised the
+new surface (contract-version markers, the v5.6.0 recommendation_detailed row
+field, the v8.0.0 reco_normalize vocabulary expansion). v3.6.0 closed those
+three gaps. No removals; strictly additive.
 
-  - the v5.6.0 / v5.7.0 contract-version markers
-    (_ENGINE_CONTRACT_VERSION, _RECO_NORMALIZE_CONTRACT_VERSION) are
-    not re-exported, so audit tooling reading the bridge cannot
-    reach them
-  - the v5.6.0 row field `recommendation_detailed` is not in any
-    field-contract tuple, so consumers introspecting the post-
-    compute_scores schema via the bridge miss it
-  - the v8.0.0 reco_normalize vocabulary expansion (ACCUMULATE,
-    STRONG_SELL, AVOID added as canonical tiers; new RULE_ID_*
-    constants; WORST_ORDINAL widened to 7) is invisible to the
-    degradation report -- it shows 8-tier RECOMMENDATION_ENUM through
-    the existing bucket-alignment check, but cannot distinguish a
-    deployment with reco_normalize v8.0.0 (8-tier-aware) from one
-    where scoring.py v5.7.0 emits 8 tiers but reco_normalize is
-    still on v7.2.x (vocabulary mismatch -- ACCUMULATE / AVOID
-    round-trip back through normalize_recommendation_code()
-    incorrectly).
-
-v3.6.0 closes those three gaps. No removals; strictly additive.
-
-What advanced in core.scoring since v5.5.0
--------------------------------------------
-  v5.6.0: data_engine_v2 v5.75.0 engine-contract alignment.
-            derive_canonical_recommendation accepts overwrite=False
-            and threads it through (was unconditionally honoring
-            the inner idempotency-skip). _LOCAL_RECO_ALIASES["AVOID"]
-            -> STRONG_SELL (cross-stack alignment for collapse).
-            AssetScores gains recommendation_detailed (mirror of
-            recommendation for field-name compat). Hard-normalize
-            recommendation_priority_band -> P4 if any path returned
-            a non-canonical value. get_canonical_state() reports
-            engine_contract_version = "5.75.0". RECOMMENDATION_SOURCE_TAG
-            auto-bumps via __version__ f-string.
-
-  v5.7.0: core.reco_normalize v8.0.0 vocabulary expansion.
-            RECOMMENDATION_ENUM widened 6 tiers -> 8 tiers, adding
-            ACCUMULATE (between BUY and HOLD) and AVOID (after
-            STRONG_SELL). Signal enum widened symmetrically.
-            _LOCAL_RECO_ALIASES: ACCUMULATE -> ACCUMULATE (was BUY),
-            AVOID -> AVOID (was STRONG_SELL); v5.6.0's collapse is
-            obsolete now that AVOID is its own canonical tier. New
-            scale-in synonyms (SCALE_IN, BUILD_POSITION, PHASE_IN,
-            etc) routing to ACCUMULATE; new uninvestable synonyms
-            (UNINVESTABLE, DO_NOT_BUY, BLACKLIST, STAY_AWAY, etc)
-            routing to AVOID. compute_recommendation() ladder gains
-            AVOID branches at the top (score < 15 OR
-            bearish/bearish/expensive view consensus); the two
-            former "Watch / accumulate candidate" HOLD branches
-            (MONTH and LONG horizons) become ACCUMULATE proper,
-            thresholds preserved verbatim. STRONG_SELL reason text
-            tightened from "require urgent exit or avoidance" to
-            "require urgent exit" -- AVOID is now distinct.
-            _compute_priority() gains AVOID -> P1, ACCUMULATE -> P3.
-            Position-size hint fallback gains ACCUMULATE / AVOID
-            cases; SELL/STRONG_SELL hint tightened from "Exit or
-            avoid" to "Exit position". New module constant
-            _RECO_NORMALIZE_CONTRACT_VERSION = "8.0.0" surfaced via
-            get_canonical_state() as reco_normalize_contract_version.
-
-What advanced in core.reco_normalize since v7.2.1
---------------------------------------------------
-  v8.0.0: 8-tier canonical vocabulary. The Recommendation enum gains
-            ACCUMULATE (ordinal 2, between BUY and HOLD),
-            STRONG_SELL (ordinal 6, between SELL and AVOID), and
-            AVOID (ordinal 7, the new worst tier). to_score() range
-            widened from 0-4 to 0-7; WORST_ORDINAL exported as a
-            symbolic literal (== 7). from_score() / _parse_numeric_rating
-            re-banded for 8 tiers on the 0-100 and 0-1 scales.
-            _classify_views_with_rule_id() can emit all 8 tiers; four
-            new RULE_ID_* constants cover the new branches
+  v5.6.0: derive_canonical_recommendation accepts overwrite=False;
+            _LOCAL_RECO_ALIASES["AVOID"] -> STRONG_SELL; AssetScores gains
+            recommendation_detailed (mirror of recommendation); hard-normalize
+            recommendation_priority_band -> P4 for non-canonical values;
+            engine_contract_version = "5.75.0".
+  v5.7.0: core.reco_normalize v8.0.0 vocabulary expansion. RECOMMENDATION_ENUM
+            6 -> 8 tiers (adds ACCUMULATE between BUY and HOLD, AVOID after
+            STRONG_SELL). _LOCAL_RECO_ALIASES: ACCUMULATE -> ACCUMULATE,
+            AVOID -> AVOID. compute_recommendation() ladder gains AVOID
+            branches at the top; the two "Watch / accumulate candidate" HOLD
+            branches become ACCUMULATE proper (thresholds preserved).
+            _compute_priority() gains AVOID -> P1, ACCUMULATE -> P3. New module
+            constant _RECO_NORMALIZE_CONTRACT_VERSION = "8.0.0".
+  reco_normalize v8.0.0: 8-tier canonical vocabulary; to_score() 0-4 -> 0-7;
+            WORST_ORDINAL == 7; four new RULE_ID_* constants
             (ACCUMULATE_BULLISH_MODERATE, DOWNGRADED_ACCUMULATE_TO_HOLD,
-            HARD_STRONG_SELL_DOUBLE_BEARISH, AVOID_UNINVESTABLE).
-            New multilingual sets (AR/FR/ES/DE/PT) for ACCUMULATE
-            and AVOID idioms. _PAT_AVOID_NEGATED distinguishes a
-            genuine "not avoid" from AVOID idioms like "DO NOT BUY"
-            where the embedded NOT/NEVER is intrinsic to the AVOID
-            meaning. Conviction floor cascade extended: ACCUMULATE
-            with conviction < BUY floor downgrades to HOLD.
+            HARD_STRONG_SELL_DOUBLE_BEARISH, AVOID_UNINVESTABLE); conviction
+            floor cascade extended (ACCUMULATE below BUY floor -> HOLD).
 
 Bridge changes in v3.6.0
-------------------------
-
-  Phase A -- Header docstring sync: floor moves to core.scoring v5.7.0+
-             and core.reco_normalize v8.0.0+. Older versions still load
-             cleanly via the getattr() fallback pattern; the degradation
-             report flags them.
-
-  Phase B -- Re-export the v5.6.0 / v5.7.0 contract-version markers
-             (all via getattr() fallback so a deployment on pre-v5.6.0
-             core.scoring still loads cleanly):
-               * _ENGINE_CONTRACT_VERSION         (v5.6.0+;
-                                                   value "5.75.0" --
-                                                   data_engine_v2 release
-                                                   scoring.py aligns with)
-               * _RECO_NORMALIZE_CONTRACT_VERSION (v5.7.0+;
-                                                   value "8.0.0" --
-                                                   reco_normalize release
-                                                   scoring.py aligns with)
-             Audit tooling can read these via the bridge to verify
-             cross-stack alignment without separately importing scoring.
-
-  Phase C -- NEW _V570_FIELDS tuple listing the row fields added in
-             v5.6.0 / v5.7.0 that are not in _V525 / _V528 / _V540:
-               * recommendation_detailed  (v5.6.0+; mirror of
-                                            `recommendation` for
-                                            field-name compat with
-                                            data_engine_v2 v5.75.0)
-             Mirror of the existing _V525 / _V528 / _V540 field-
-             contract constants. No removals from prior tuples.
-
-  Phase D -- NEW _CONTRACT_VERSION_SYMBOLS tuple tracking the v5.6.0+/
-             v5.7.0+ contract-marker surface. Tracked separately from
-             _BUCKET_ALIGNMENT_SYMBOLS so a deployment running v5.3.0-
-             v5.5.x (full bucket alignment but no contract markers
-             yet) still gets a working bridge with a partial-alignment
-             flag.
-
-  Phase E -- NEW _RECO_8TIER_SYMBOLS tuple tracking the v8.0.0
-             vocabulary-expansion surface in core.reco_normalize:
-               * RECO_ACCUMULATE / RECO_STRONG_SELL / RECO_AVOID
-                 (module-level string constants)
-               * WORST_ORDINAL                       (== 7 in v8.0.0)
-               * RULE_ID_ACCUMULATE_BULLISH_MODERATE,
-                 RULE_ID_DOWNGRADED_ACCUMULATE_TO_HOLD,
-                 RULE_ID_HARD_STRONG_SELL_DOUBLE_BEARISH,
-                 RULE_ID_AVOID_UNINVESTABLE        (the four new
-                                                    v8.0.0 RULE_IDs)
-             Tracked on the reco_normalize side, not core.scoring.
-
-  Phase F -- NEW is_contract_versioned() helper: returns True when
-             both contract markers are present on core.scoring.
-             Mirror of is_view_aware, is_audit_hardened,
-             is_reco_rule_id_aware, is_cascade_bridged,
-             is_bucket_aligned.
-
-             NEW is_reco_8tier_aware() helper: returns True when
-             both:
-               (a) core.scoring's RECOMMENDATION_ENUM contains all 8
-                   canonical tiers (verifies the v5.7.0 vocabulary
-                   expansion actually landed; a deployment can have
-                   RECOMMENDATION_ENUM as a tuple but with only 6
-                   members if still on v5.6.0 or earlier)
-               (b) core.reco_normalize exposes the v8.0.0
-                   vocabulary symbols (RECO_ACCUMULATE, RECO_AVOID,
-                   WORST_ORDINAL, and the four new RULE_ID_* constants)
-             Both must be true for the full stack to be 8-tier-aware
-             in lockstep. A False from this helper while
-             is_bucket_aligned() is True indicates a partial
-             rollout -- scoring may emit ACCUMULATE/AVOID while
-             reco_normalize cannot represent them, or vice versa.
-
-  Phase G -- Extended get_degradation_report():
-               * engine_contract_version: str or None  (the actual
-                 value from _ENGINE_CONTRACT_VERSION marker on
-                 core.scoring; not just symbol presence)
-               * reco_normalize_contract_version: str or None  (same
-                 for the v5.7.0 marker)
-               * recommendation_enum: tuple  (the actual resolved
-                 enum tuple, so audit tooling can verify the v5.7.0
-                 expansion -- 6 tiers vs 8 tiers -- without
-                 separately importing core.scoring)
-               * contract_versioned_symbols: {symbol: present_bool}
-               * missing_contract_versioned: [symbols]
-               * contract_versioned_enabled: bool
-               * reco_8tier_symbols: {symbol: present_bool}
-               * missing_reco_8tier: [symbols]
-               * reco_8tier_aware_enabled: bool
-               * v570_fields: tuple  (mirror of v540_detail_fields)
-             Existing report fields preserved verbatim.
-
-  Phase H -- Version bump 3.5.0 -> 3.6.0. Minor bump because the
-             public re-export surface widens; no breaking changes
-             and no removals.
-
-[PRESERVED -- strictly]
-  - Every v3.5.0 public name remains exported.
-  - is_view_aware, is_audit_hardened, is_reco_rule_id_aware,
-    is_cascade_bridged, is_bucket_aligned all unchanged.
-  - _V525_ENRICHMENT_FIELDS / _V528_CASCADE_BRIDGE_FIELDS /
-    _V540_DETAIL_FIELDS unchanged.
-  - _BUCKET_ALIGNMENT_SYMBOLS unchanged (additions in v3.6.0 go
-    into separate _CONTRACT_VERSION_SYMBOLS and _RECO_8TIER_SYMBOLS
-    tuples so a deployment on v5.3.0-v5.5.x still passes the
-    is_bucket_aligned() check).
-  - RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5
-    auto-track core.scoring's __version__ via its f-string.
+  Phase A -- Header docstring sync (floor v5.7.0+ / reco_normalize v8.0.0+).
+  Phase B -- Re-export _ENGINE_CONTRACT_VERSION (v5.6.0+) and
+             _RECO_NORMALIZE_CONTRACT_VERSION (v5.7.0+), both via getattr().
+  Phase C -- NEW _V570_FIELDS tuple (recommendation_detailed).
+  Phase D -- NEW _CONTRACT_VERSION_SYMBOLS tuple.
+  Phase E -- NEW _RECO_8TIER_SYMBOLS tuple (RECO_ACCUMULATE / RECO_STRONG_SELL
+             / RECO_AVOID / WORST_ORDINAL + the four new RULE_ID_*).
+  Phase F -- NEW is_contract_versioned() and is_reco_8tier_aware() helpers.
+  Phase G -- Extended get_degradation_report() with engine_contract_version,
+             reco_normalize_contract_version, recommendation_enum,
+             contract_versioned_symbols / missing / enabled,
+             reco_8tier_symbols / missing / enabled, v570_fields.
+  Phase H -- Version bump 3.5.0 -> 3.6.0.
 
 API surface (additions in v3.6.0):
   - _ENGINE_CONTRACT_VERSION, _RECO_NORMALIZE_CONTRACT_VERSION
-    (re-exports of the v5.6.0 / v5.7.0 contract markers)
-  - _V570_FIELDS (private constant)
-  - _CONTRACT_VERSION_SYMBOLS (private constant)
-  - _RECO_8TIER_SYMBOLS (private constant)
-  - is_contract_versioned (bridge-level helper)
-  - is_reco_8tier_aware (bridge-level helper)
+  - _V570_FIELDS, _CONTRACT_VERSION_SYMBOLS, _RECO_8TIER_SYMBOLS
+  - is_contract_versioned, is_reco_8tier_aware
 
 ================================================================================
-v3.5.0 changes (preserved verbatim)
+v3.5.0 and earlier (condensed -- full changelog in source control)
 ================================================================================
+  v3.5.0: Re-exported the v5.3.0+ bucket-canonical surface
+            (RECOMMENDATION_ENUM, RISK_BUCKET_THRESHOLDS,
+            CONFIDENCE_BUCKET_THRESHOLDS, BUCKETS_CANONICAL,
+            compute_opportunity_score_with_source, get_canonical_thresholds,
+            get_canonical_state, DEFAULT_SCORING_WEIGHTS /
+            DEFAULT_FORECAST_PARAMETERS alias completion, the _recommendation /
+            _risk_bucket / _confidence_bucket private compat wrappers). NEW
+            _V540_DETAIL_FIELDS, _BUCKET_ALIGNMENT_SYMBOLS, is_bucket_aligned().
+  v3.4.4: Synced the v5.2.7 -> v5.2.8 field rename
+            recommendation_priority -> recommendation_priority_band
+            (_V528_CASCADE_BRIDGE_FIELDS).
+  v3.4.3: v5.2.7 cascade-bridge awareness (derive_canonical_recommendation,
+            apply_canonical_recommendation, RECOMMENDATION_SOURCE_TAG,
+            CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5, is_cascade_bridged()).
+  v3.4.2: __version__ alias; _V525_ENRICHMENT_FIELDS; _RECO_RULE_ID_SYMBOLS;
+            is_reco_rule_id_aware().
+  v3.4.1: score_views_completeness re-export; is_audit_hardened().
+  v3.4.0: Four view-derivation symbols + view-awareness reporting.
+  v3.3.x and earlier: bridge contract for the v4.x scoring family.
 
-core.scoring has advanced through v5.3.0 -> v5.4.0 -> v5.4.1 -> v5.4.2
--> v5.5.0 since v3.4.4 was cut. The bridge was operating correctly
-against all of those versions thanks to the getattr() fallback
-pattern, but was under-advertising the new surface (downstream
-modules importing via the bridge could not reach symbols added since
-v5.2.8). v3.5.0 closed that gap.
-
-What advanced in core.scoring since v5.2.8
--------------------------------------------
-  v5.3.0: Compatibility wrappers for data_engine_v2 v5.71.0
-            (_recommendation, _risk_bucket, _confidence_bucket).
-            Closed final recommendation enum
-            (STRONG_BUY/BUY/HOLD/REDUCE/SELL/STRONG_SELL exported as
-            RECOMMENDATION_ENUM). Module-level threshold constants
-            (RISK_BUCKET_THRESHOLDS, CONFIDENCE_BUCKET_THRESHOLDS).
-            Nullable overall_score for insufficient inputs.
-            opportunity_source field with provenance. New
-            compute_opportunity_score_with_source helper.
-            scoring_schema_version field.
-
-  v5.4.0: Horizon-aware ROI selection. Forecast patch full overwrite
-            (clears stale ROI). Valuation ratio-only fallback.
-            Provider sanity (dividend yield, debt/equity).
-            recommendation_detail field. derive_risk_view now
-            delegates to risk_bucket (single source of truth).
-
-  v5.4.1: recommendation_detail rebuild after batch insights pass.
-            _active_roi_for_horizon truthful FALLBACK labels.
-            ScoringEngine clones DEFAULT_SCORING_WEIGHTS /
-            DEFAULT_FORECAST_PARAMETERS. risk_moderate_threshold
-            compat alias property. -0.70 unit-mismatch floor.
-
-  v5.4.2: Mid-text legacy label substitution narrowed to finance
-            jargon (no longer corrupts narrative containing common
-            English words like WATCH / ACCUMULATE / NEUTRAL).
-
-  v5.5.0: Env-tunable bucket thresholds (SCORING_RISK_LOW,
-            SCORING_RISK_HIGH, SCORING_CONFIDENCE_MODERATE,
-            SCORING_CONFIDENCE_HIGH). scoring_errors deduplication
-            in compute_scores. opportunity_source granularity
-            (valuation_only_fallback / momentum_only_fallback /
-            both_present_fallback / roi_based / insufficient).
-            Public diagnostic helpers get_canonical_thresholds() and
-            get_canonical_state() for ops tooling.
-
-Bridge changes in v3.5.0
-------------------------
-
-  Phase A -- Header docstring sync: reference core.scoring v5.4.2+
-             (or v5.5.0+) as canonical floor. Enumerate the new
-             public surface.
-
-  Phase B -- Re-export new public symbols (all via getattr() fallback
-             so a deployment still on a pre-v5.4.2 core.scoring gets
-             a working bridge with degraded-mode report rather than
-             ImportError):
-               * RECOMMENDATION_ENUM           (v5.3.0+)
-               * RISK_BUCKET_THRESHOLDS        (v5.3.0+)
-               * CONFIDENCE_BUCKET_THRESHOLDS  (v5.3.0+)
-               * BUCKETS_CANONICAL             (v5.2.9+)
-               * compute_opportunity_score_with_source  (v5.3.0+)
-               * get_canonical_thresholds      (v5.5.0+)
-               * get_canonical_state           (v5.5.0+)
-               * DEFAULT_SCORING_WEIGHTS       (alias completion of
-                                                DEFAULT_WEIGHTS)
-               * DEFAULT_FORECAST_PARAMETERS   (alias completion of
-                                                DEFAULT_FORECASTS)
-
-  Phase C -- Re-export the private compatibility wrappers added in
-             v5.3.0 for data_engine_v2 v5.71.0, in case any consumer
-             imports them via the bridge:
-               * _recommendation
-               * _risk_bucket
-               * _confidence_bucket
-
-  Phase D -- NEW _V540_DETAIL_FIELDS tuple listing the row fields
-             added in v5.3.0 / v5.4.0 that are not already in
-             _V525_ENRICHMENT_FIELDS or _V528_CASCADE_BRIDGE_FIELDS:
-               * recommendation_detail   (v5.4.0+; "P# [VERDICT]: ...")
-               * scoring_schema_version  (v5.3.0+; equals SCORING_VERSION)
-               * opportunity_source      (v5.3.0+; provenance tag)
-             Mirror of the existing _V525 / _V528 field-contract
-             constants.
-
-  Phase E -- NEW _BUCKET_ALIGNMENT_SYMBOLS tuple tracking the v5.3.0+
-             bucket-canonical public surface. Tracked separately from
-             the cascade-bridge symbols so a deployment running
-             v5.2.7-v5.2.9 still gets a working bridge with a
-             partial-alignment flag.
-
-  Phase F -- NEW is_bucket_aligned() helper, mirror of is_view_aware,
-             is_audit_hardened, is_reco_rule_id_aware,
-             is_cascade_bridged. Quick boolean for
-             "are we on core.scoring v5.3.0+ with the canonical bucket
-             surface?"
-
-  Phase G -- Extended get_degradation_report():
-               * bucket_alignment_symbols: {symbol: present_bool}
-               * missing_bucket_alignment: [symbols]
-               * bucket_alignment_enabled: bool
-               * risk_thresholds: tuple  (actual resolved values at
-                                          core.scoring import time)
-               * confidence_thresholds: tuple  (same)
-               * buckets_canonical_enabled: bool  (mirrors
-                                                   BUCKETS_CANONICAL)
-               * v540_detail_fields: tuple
-             Existing report fields preserved verbatim.
-
-  Phase H -- Version bump 3.4.4 -> 3.5.0. Minor bump because the
-             public re-export surface widens; no breaking changes
-             and no removals.
-
-[PRESERVED -- strictly]
-  - Every v3.4.4 public name remains exported.
-  - is_view_aware, is_audit_hardened, is_reco_rule_id_aware,
-    is_cascade_bridged all unchanged.
-  - _V525_ENRICHMENT_FIELDS unchanged.
-  - _V528_CASCADE_BRIDGE_FIELDS unchanged (this is the v5.2.8 field-
-    rename marker, not a generic "current contract" handle; renaming
-    it to _V542_* would break callers that already read it).
-  - RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5
-    auto-track core.scoring's __version__ via its f-string.
-
-API surface (additions in v3.5.0):
-  - RECOMMENDATION_ENUM, RISK_BUCKET_THRESHOLDS,
-    CONFIDENCE_BUCKET_THRESHOLDS, BUCKETS_CANONICAL,
-    compute_opportunity_score_with_source
-  - get_canonical_thresholds, get_canonical_state (v5.5.0)
-  - DEFAULT_SCORING_WEIGHTS, DEFAULT_FORECAST_PARAMETERS
-    (alias completion)
-  - _recommendation, _risk_bucket, _confidence_bucket (private compat)
-  - _V540_DETAIL_FIELDS (private constant)
-  - _BUCKET_ALIGNMENT_SYMBOLS (private constant)
-  - is_bucket_aligned (bridge-level helper)
-
-================================================================================
-v3.4.4 changes (preserved verbatim)
-================================================================================
-Field-name collision fix sync: core.scoring v5.2.7 -> v5.2.8 renamed
-the canonical-priority row field from `recommendation_priority` to
-`recommendation_priority_band` to avoid collision with the schema
-v2.7.0 / data_engine_v2 v5.60.0 Decision Matrix surface, which also
-emits a row field named `recommendation_priority` but with different
-semantics (int 1..8 for which 8-tier classifier rule fired, vs
-string "P1".."P5" for the canonical priority band). The bridge
-synced to this rename: _V527_CASCADE_BRIDGE_FIELDS ->
-_V528_CASCADE_BRIDGE_FIELDS, element rename inside the tuple,
-get_degradation_report() field rename.
-
-================================================================================
-v3.4.3 changes (preserved verbatim)
-================================================================================
-v5.2.7 cascade-bridge awareness: re-export of
-derive_canonical_recommendation, apply_canonical_recommendation,
-RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5.
-_V527/_V528_CASCADE_BRIDGE_FIELDS tuple. _CASCADE_BRIDGE_SYMBOLS
-category and is_cascade_bridged() helper. Extended
-get_degradation_report() with cascade-bridge tracking.
-
-================================================================================
-v3.4.2 and earlier (preserved verbatim)
-================================================================================
-- __version__ = VERSION alias (v3.4.2).
-- _V525_ENRICHMENT_FIELDS, _RECO_RULE_ID_SYMBOLS,
-  is_reco_rule_id_aware() (v3.4.2).
-- score_views_completeness re-export, _AUDIT_HARDENING_SYMBOLS,
-  is_audit_hardened() (v3.4.1).
-- Four view-derivation symbols and view-awareness reporting (v3.4.0).
-- Bridge contract for the v4.x scoring family (v3.3.x and earlier).
-
-API surface (preserved exports):
-- VERSION, __version__
-- ScoringEngine, AssetScores, ScoreWeights, ScoringWeights,
-  ForecastParameters, DEFAULT_WEIGHTS, DEFAULT_FORECASTS
-- Horizon, Signal, RSISignal
-- compute_scores, score_row, score_quote, enrich_with_scores
-- rank_rows_by_overall, assign_rank_overall, score_and_rank_rows
-- normalize_recommendation_code, CANONICAL_RECOMMENDATION_CODES
-- detect_horizon, get_weights_for_horizon
-- compute_technical_score, rsi_signal, short_term_signal
-- derive_upside_pct, derive_volume_ratio, derive_day_range_position
-- invest_period_label
-- compute_valuation_score, compute_growth_score, compute_momentum_score
-- compute_quality_score, compute_risk_score, compute_opportunity_score
-- compute_confidence_score, compute_recommendation
-- risk_bucket, confidence_bucket
-- derive_fundamental_view, derive_technical_view,
-  derive_risk_view, derive_value_view
-- score_views_completeness
-- ScoringError, InvalidHorizonError, MissingDataError
-- get_degradation_report, is_view_aware, is_audit_hardened,
-  is_reco_rule_id_aware, is_cascade_bridged, is_bucket_aligned [v3.5.0]
-- _V525_ENRICHMENT_FIELDS
-- _V528_CASCADE_BRIDGE_FIELDS
-- _V540_DETAIL_FIELDS [v3.5.0]
-- derive_canonical_recommendation, apply_canonical_recommendation
-- RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES
-- PRIO_P1..PRIO_P5
-- RECOMMENDATION_ENUM, RISK_BUCKET_THRESHOLDS,
-  CONFIDENCE_BUCKET_THRESHOLDS, BUCKETS_CANONICAL [v3.5.0]
-- compute_opportunity_score_with_source [v3.5.0]
-- get_canonical_thresholds, get_canonical_state [v3.5.0]
-- DEFAULT_SCORING_WEIGHTS, DEFAULT_FORECAST_PARAMETERS [v3.5.0]
-- _recommendation, _risk_bucket, _confidence_bucket [v3.5.0]
+API surface (preserved exports -- abbreviated):
+  - VERSION, __version__, SCORING_VERSION, SCORING_ENGINE_VERSION [v3.8.0]
+  - ScoringEngine, AssetScores, ScoreWeights, ScoringWeights,
+    ForecastParameters, DEFAULT_WEIGHTS, DEFAULT_FORECASTS,
+    DEFAULT_SCORING_WEIGHTS, DEFAULT_FORECAST_PARAMETERS
+  - Horizon, Signal, RSISignal
+  - compute_scores, score_row, score_quote, enrich_with_scores
+  - rank_rows_by_overall, assign_rank_overall, score_and_rank_rows
+  - normalize_recommendation_code, CANONICAL_RECOMMENDATION_CODES,
+    RECOMMENDATION_ENUM
+  - detect_horizon, get_weights_for_horizon
+  - compute_technical_score, rsi_signal, short_term_signal
+  - derive_upside_pct, derive_volume_ratio, derive_day_range_position
+  - invest_period_label
+  - compute_valuation_score, compute_growth_score, compute_momentum_score,
+    compute_quality_score, compute_risk_score, compute_opportunity_score,
+    compute_opportunity_score_with_source, compute_confidence_score,
+    compute_recommendation
+  - risk_bucket, confidence_bucket, RISK_BUCKET_THRESHOLDS,
+    CONFIDENCE_BUCKET_THRESHOLDS, BUCKETS_CANONICAL
+  - get_canonical_thresholds, get_canonical_state
+  - derive_fundamental_view, derive_technical_view, derive_risk_view,
+    derive_value_view, score_views_completeness
+  - derive_canonical_recommendation, apply_canonical_recommendation,
+    RECOMMENDATION_SOURCE_TAG, CANONICAL_PRIORITIES, PRIO_P1..PRIO_P5
+  - _recommendation, _risk_bucket, _confidence_bucket
+  - _ENGINE_CONTRACT_VERSION, _RECO_NORMALIZE_CONTRACT_VERSION
+  - _V525_ENRICHMENT_FIELDS, _V528_CASCADE_BRIDGE_FIELDS,
+    _V540_DETAIL_FIELDS, _V570_FIELDS
+  - ScoringError, InvalidHorizonError, MissingDataError
+  - get_degradation_report, is_view_aware, is_audit_hardened,
+    is_reco_rule_id_aware, is_cascade_bridged, is_bucket_aligned,
+    is_contract_versioned, is_reco_8tier_aware, is_asset_class_aware
 ================================================================================
 """
 
@@ -561,11 +251,16 @@ logger.addHandler(logging.NullHandler())
 # Version
 # ---------------------------------------------------------------------------
 
-VERSION = "3.7.0"
+VERSION = "3.8.0"
 # v3.4.2 Phase B (preserved): __version__ alias matches TFB module
 # convention used by core.scoring v5.2.5+, core.reco_normalize v7.2.0+,
 # and insights_builder v7.0.0.
 __version__ = VERSION
+# v3.8.0 Phase A: SCORING_ENGINE_VERSION names THIS bridge module (alias of
+# VERSION). Distinct from SCORING_VERSION (the resolved core.scoring version,
+# set below). The scoring-engine contract test asserts hasattr(se,
+# "SCORING_ENGINE_VERSION"); this is the symbol it checks. Additive only.
+SCORING_ENGINE_VERSION = VERSION
 
 
 # =============================================================================
@@ -1646,6 +1341,8 @@ __all__ = [
     # Version
     "VERSION",
     "__version__",
+    # v3.8.0 Phase A: bridge-version alias checked by the contract test.
+    "SCORING_ENGINE_VERSION",
     "SCORING_VERSION",
     # Enums
     "Horizon",
