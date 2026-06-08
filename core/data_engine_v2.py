@@ -2,8 +2,56 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.79.7
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.80.0
 ================================================================================
+
+WHY v5.80.0 - PORTFOLIO & INSIGHTS DECISION LAYER
+-------------------------------------------------------------------------------
+Turns the accepted market engine into a decision-support engine for My_Portfolio,
+plus a live Insights_Analysis. Market pages (Market_Leaders, Global_Markets,
+Commodities_FX, Mutual_Funds, My_Investments) stay 115/115 UNTOUCHED. Pairs with
+00_Config.gs v1.12.3 (My_Portfolio 115 -> 122) -- deploy in lockstep.
+
+  1. MY_PORTFOLIO 115 -> 122 (this page ONLY): the engine's canonical 115 already
+     carries the 6 position columns, so My_Portfolio appends a 7-field decision
+     block AFTER the 115 -- exactly the Top_10 (115+3) pattern. New columns:
+     Buy Date, Target Weight %, Actual Weight %, Weight Gap, Rebalance Action,
+     Investor Decision, User Notes. An import-time assertion
+     (_assert_portfolio_contract_disjoint) fails fast if the block ever collides
+     with the canonical keys or drifts off 122.
+
+  2. PORTFOLIO MATH + DECISION (_compute_portfolio_fields): the per-row position
+     math (position_cost/value/unrealized_pl/pct) already exists; this adds the
+     cross-sectional pass -- actual_weight = position_value / Sigma(book) * 100,
+     weight_gap = target - actual (PERCENT POINTS), and the verdict:
+       Rebalance Action (action_flag) = pure drift-only ADD/HOLD/REDUCE/SELL.
+       Investor Decision (decision)   = blended call (drift + engine reco +
+         forecast sign + risk): SELL on sell-family or negative-forecast-at-high-
+         risk; REDUCE on overweight+weak or negative-forecast at/above target;
+         ADD on underweight+constructive+not-negative+risk!=HIGH; else HOLD.
+     target_weight is seeded from TFB_PORTFOLIO_TARGETS (default 1120=40 / 4013=30
+     / 7020=30) only when the sheet leaves it blank. Band TFB_PORTFOLIO_REBALANCE_
+     BAND_PP (default 5.0pp); weak floor TFB_PORTFOLIO_WEAK_SCORE (default 60).
+     This is rule-based decision-SUPPORT keyed to the investor's OWN targets, NOT
+     a market call -- the engine-reco input is an unbacktested estimate.
+
+  3. INSIGHTS_ANALYSIS REBUILT (_build_insights_rows): replaces the 2-row version
+     stub with live sections -- Portfolio Summary (value / cost / P&L), Allocation
+     vs Target (per holding + decision), Market Opportunities (top INVESTABLE by
+     opportunity_score), and Data Quality (per-sheet rows-passing-DQ). Degrades to
+     the version stub only if the live build yields nothing.
+
+  4. TOP_10 TIGHTENED: _top10_row_is_eligible now also requires INVESTABLE (when
+     the gate has run) and rejects a buy-family row whose own governing forecast
+     ROI is negative (works even on the pre-gate direct path) -- closing the
+     Fix S / Fix J seam so Top_10 never ranks a "buy but expected to fall" name.
+
+  NOTE (flagged, NOT fixed here): the engine's canonical 115 and 00_Config.gs's
+  fallback 115 differ in 10 columns each way (engine has the 6 position + 4 view
+  columns; the Config fallback has analyst/signal/trend/meta columns). Masked
+  live because the frontend renders the engine's schema endpoint, but the Config
+  fallback would render the wrong 115 on a schema-fetch failure. A separate
+  reconciliation, out of this version's scope.
 
 WHY v5.79.7 - NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S)
 -------------------------------------------------------------------------------
@@ -1349,7 +1397,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.79.7"
+__version__ = "5.80.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -2351,7 +2399,13 @@ def _top10_quality_filter_enabled() -> bool:
 def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
     """v5.77.23 (Fix J): a Top 10 candidate must have a usable current price and
     must NOT be a sell/avoid-family recommendation. Used to filter both Top 10
-    build paths. No-op when the filter is disabled."""
+    build paths. No-op when the filter is disabled.
+
+    v5.80.0: also require the row to be INVESTABLE per the gate (when the gate
+    has run) AND reject a buy-family row whose own governing forecast ROI is
+    negative even when the gate has NOT run yet (the direct Top_10 path filters
+    before _strict_project_row). Closes the Fix S / Fix J seam where a
+    negative-forecast WATCHLIST name could still rank into the Top 10."""
     if not _top10_quality_filter_enabled():
         return True
     if not isinstance(row, dict):
@@ -2361,6 +2415,16 @@ def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
     rec = _canonical_recommendation(row.get("recommendation_detailed")) \
         or _canonical_recommendation(row.get("recommendation"))
     if rec in _TOP10_EXCLUDED_RECO_FAMILIES:
+        return False
+    # v5.80.0: negative-forecast buy-family rejection (works pre-gate).
+    if _RECO_DIRECTION.get(rec) == "ADD":
+        gov_roi = _gate_governing_forecast_roi(row)
+        if gov_roi is not None and gov_roi < 0.0:
+            return False
+    # v5.80.0: when the gate has run, require INVESTABLE (blank status =>
+    # gate disabled => fail open, unchanged from Fix J behaviour).
+    inv = _safe_str(row.get("investability_status")).upper()
+    if inv and inv != "INVESTABLE":
         return False
     return True
 
@@ -4026,6 +4090,37 @@ TOP10_REQUIRED_HEADERS: Dict[str, str] = {
     "criteria_snapshot": "Criteria Snapshot",
 }
 
+# v5.80.0 PORTFOLIO DECISION LAYER (My_Portfolio only): the engine's canonical
+# 115 ALREADY carries the 6 position columns (position_qty/avg_cost/position_cost/
+# position_value/unrealized_pl/unrealized_pl_pct at idx 75-80), so My_Portfolio
+# only needs a 7-field decision block appended AFTER the 115 -- exactly the
+# pattern Top_10 uses for its 3 extra fields (schema 118). My_Portfolio = 115 + 7
+# = 122. Manual (preserved from the sheet): buy_date, user_notes. Config/manual:
+# target_weight (filled from TFB_PORTFOLIO_TARGETS when blank). Computed live by
+# _compute_portfolio_fields: actual_weight, weight_gap, action_flag (rebalance
+# ADD/HOLD/REDUCE/SELL), decision (investor verdict). The 4 computed position
+# values (position_cost/value/unrealized_pl/pct) are filled in place on their
+# existing canonical columns. Keys here are disjoint from INSTRUMENT_CANONICAL_KEYS
+# (asserted at import by _assert_portfolio_contract_disjoint below).
+MY_PORTFOLIO_EXTRA_FIELDS: Tuple[str, ...] = (
+    "buy_date",
+    "target_weight",
+    "actual_weight",
+    "weight_gap",
+    "action_flag",
+    "decision",
+    "user_notes",
+)
+MY_PORTFOLIO_EXTRA_HEADERS: Dict[str, str] = {
+    "buy_date": "Buy Date",
+    "target_weight": "Target Weight %",
+    "actual_weight": "Actual Weight %",
+    "weight_gap": "Weight Gap",
+    "action_flag": "Rebalance Action",
+    "decision": "Investor Decision",
+    "user_notes": "User Notes",
+}
+
 INSIGHTS_HEADERS: List[str] = [
     "Section", "Item", "Metric", "Value", "Notes", "Source", "Sort Order",
 ]
@@ -4045,7 +4140,10 @@ STATIC_CANONICAL_SHEET_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
     "Global_Markets": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
     "Commodities_FX": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
     "Mutual_Funds": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
-    "My_Portfolio": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
+    "My_Portfolio": {
+        "headers": list(INSTRUMENT_CANONICAL_HEADERS) + [MY_PORTFOLIO_EXTRA_HEADERS[k] for k in MY_PORTFOLIO_EXTRA_FIELDS],
+        "keys": list(INSTRUMENT_CANONICAL_KEYS) + list(MY_PORTFOLIO_EXTRA_FIELDS),
+    },
     "My_Investments": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
     "Top_10_Investments": {
         "headers": list(INSTRUMENT_CANONICAL_HEADERS) + [TOP10_REQUIRED_HEADERS[k] for k in TOP10_REQUIRED_FIELDS],
@@ -4054,6 +4152,169 @@ STATIC_CANONICAL_SHEET_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
     "Insights_Analysis": {"headers": list(INSIGHTS_HEADERS), "keys": list(INSIGHTS_KEYS)},
     "Data_Dictionary": {"headers": list(DATA_DICTIONARY_HEADERS), "keys": list(DATA_DICTIONARY_KEYS)},
 }
+
+
+def _assert_portfolio_contract_disjoint() -> None:
+    """v5.80.0: fail fast at import if the My_Portfolio extension collides with
+    the canonical schema or drifts off 128. Keeps the appended portfolio block a
+    strict superset of the 115 canonical (never a silent overwrite)."""
+    canon = set(INSTRUMENT_CANONICAL_KEYS)
+    extra = set(MY_PORTFOLIO_EXTRA_FIELDS)
+    overlap = canon & extra
+    if overlap:
+        raise RuntimeError("My_Portfolio extra fields collide with canonical keys: %s" % sorted(overlap))
+    mp = STATIC_CANONICAL_SHEET_CONTRACTS["My_Portfolio"]
+    if not (len(mp["headers"]) == len(mp["keys"]) == len(INSTRUMENT_CANONICAL_KEYS) + len(MY_PORTFOLIO_EXTRA_FIELDS)):
+        raise RuntimeError(
+            "My_Portfolio contract width mismatch: headers=%d keys=%d expected=%d"
+            % (len(mp["headers"]), len(mp["keys"]), len(INSTRUMENT_CANONICAL_KEYS) + len(MY_PORTFOLIO_EXTRA_FIELDS))
+        )
+
+
+_assert_portfolio_contract_disjoint()
+
+
+# =============================================================================
+# v5.80.0 — PORTFOLIO DECISION LAYER (My_Portfolio only)
+# -----------------------------------------------------------------------------
+# Rule-based rebalancing keyed to the investor's OWN target weights. This is
+# decision-SUPPORT, not a market call: the engine-recommendation input is an
+# unbacktested estimate, and the investor owns the targets and the final action.
+# Weights are carried in PERCENT POINTS (40.0 == 40%) to match unrealized_pl_pct
+# and to keep the env config (TFB_PORTFOLIO_TARGETS) intuitive.
+# =============================================================================
+_PORTFOLIO_DEFAULT_TARGETS: Dict[str, float] = {
+    "1120.SR": 40.0,  # Al Rajhi Bank
+    "4013.SR": 30.0,  # Dr. Sulaiman Al Habib Medical Services Group
+    "7020.SR": 30.0,  # Etihad Etisalat (Mobily)
+}
+_PORTFOLIO_SELL_FAMILY: frozenset = frozenset({"SELL", "STRONG_SELL", "AVOID"})
+_PORTFOLIO_BUY_FAMILY: frozenset = frozenset({"STRONG_BUY", "BUY", "ACCUMULATE"})
+
+
+def _portfolio_target_weights() -> Dict[str, float]:
+    """v5.80.0: symbol -> target weight in PERCENT POINTS. Overridable via
+    TFB_PORTFOLIO_TARGETS ("1120.SR=40,4013.SR=30,7020.SR=30"); defaults to the
+    configured 40/30/30 book. A one-line retune, never a code change."""
+    raw = (os.getenv("TFB_PORTFOLIO_TARGETS") or "").strip()
+    if not raw:
+        return {normalize_symbol(k): v for k, v in _PORTFOLIO_DEFAULT_TARGETS.items()}
+    out: Dict[str, float] = {}
+    for pair in raw.replace(";", ",").split(","):
+        if "=" not in pair:
+            continue
+        k, _, v = pair.partition("=")
+        sym = normalize_symbol(k.strip())
+        val = _as_float(v.strip())
+        if sym and val is not None:
+            out[sym] = val
+    return out or {normalize_symbol(k): v for k, v in _PORTFOLIO_DEFAULT_TARGETS.items()}
+
+
+def _portfolio_rebalance_band_pp() -> float:
+    """v5.80.0: rebalance dead-band in percentage points (default 5.0). Inside
+    +/- band a holding is HOLD regardless of drift."""
+    v = _as_float(os.getenv("TFB_PORTFOLIO_REBALANCE_BAND_PP"))
+    return v if (v is not None and v >= 0.0) else 5.0
+
+
+def _portfolio_weak_score_threshold() -> float:
+    """v5.80.0: overall_score below this is a 'weak' signal (default 60)."""
+    v = _as_float(os.getenv("TFB_PORTFOLIO_WEAK_SCORE"))
+    return v if (v is not None and v > 0.0) else 60.0
+
+
+def _portfolio_decision(row: Dict[str, Any], gap: Optional[float], band: float, weak: float) -> str:
+    """v5.80.0: blended investor verdict for one holding, FIRST-MATCH wins. Maps
+    the engine's own signals plus the holding's drift from target to one of
+    SELL / REDUCE / ADD / HOLD. gap = target - actual (PERCENT POINTS); a
+    positive gap means UNDERweight, negative means OVERweight.
+
+      SELL   - engine sell-family (SELL/STRONG_SELL/AVOID), OR negative forecast
+               at HIGH risk.
+      REDUCE - overweight beyond band AND a weak signal; OR negative forecast on
+               a name already at/above its target weight.
+      ADD    - underweight beyond band AND constructive (buy-family or score >=
+               weak floor) AND not negative-forecast AND risk not HIGH.
+      HOLD   - everything else (near target, or constructive but on target).
+    """
+    rec = _canonical_recommendation(row.get("recommendation_detailed")) \
+        or _canonical_recommendation(row.get("recommendation"))
+    risk = _safe_str(row.get("risk_bucket")).upper()
+    score = _as_float(row.get("overall_score"))
+    gov_roi = _gate_governing_forecast_roi(row)
+    forecast_negative = gov_roi is not None and gov_roi < 0.0
+    overweight = gap is not None and gap < -band
+    underweight = gap is not None and gap > band
+    at_or_above_target = gap is not None and gap <= 0.0
+    weak_signal = (rec not in _PORTFOLIO_BUY_FAMILY) or (score is not None and score < weak)
+    constructive = (rec in _PORTFOLIO_BUY_FAMILY) or (score is not None and score >= weak)
+    if rec in _PORTFOLIO_SELL_FAMILY or (forecast_negative and risk == "HIGH"):
+        return "SELL"
+    if (overweight and weak_signal) or (forecast_negative and at_or_above_target):
+        return "REDUCE"
+    if underweight and constructive and (not forecast_negative) and risk != "HIGH":
+        return "ADD"
+    return "HOLD"
+
+
+def _portfolio_rebalance_action(gap: Optional[float], band: float) -> str:
+    """v5.80.0: pure drift-only rebalance action (ignores the engine signal) ->
+    the 'Rebalance Action' column. ADD if underweight beyond band, REDUCE if
+    overweight beyond band, else HOLD. (The blended call lives in 'decision'.)"""
+    if gap is None:
+        return "HOLD"
+    if gap > band:
+        return "ADD"
+    if gap < -band:
+        return "REDUCE"
+    return "HOLD"
+
+
+def _compute_portfolio_fields(rows: List[Dict[str, Any]]) -> None:
+    """v5.80.0: cross-sectional My_Portfolio pass. The per-row position math
+    (position_cost/value/unrealized_pl/pct) is already filled upstream; this
+    pass needs the WHOLE list to compute weights, so it runs once after the
+    per-row enrichment + gate. Fills target_weight (from config when the sheet
+    leaves it blank), actual_weight, weight_gap, action_flag (drift-only) and
+    decision (blended verdict). Weights are PERCENT POINTS. No-op on empty input;
+    never raises -- a bad row degrades to blank portfolio fields."""
+    if not rows:
+        return
+    try:
+        targets = _portfolio_target_weights()
+        band = _portfolio_rebalance_band_pp()
+        weak = _portfolio_weak_score_threshold()
+        total_mv = 0.0
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            mv = _as_float(r.get("position_value"))
+            if mv is not None and mv > 0.0:
+                total_mv += mv
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            sym = normalize_symbol(_safe_str(r.get("symbol") or r.get("requested_symbol")))
+            tw = _as_float(r.get("target_weight"))
+            if tw is None and sym in targets:
+                tw = targets[sym]
+                r["target_weight"] = round(tw, 4)
+            mv = _as_float(r.get("position_value"))
+            aw = round((mv / total_mv) * 100.0, 4) if (mv is not None and total_mv > 0.0) else None
+            if aw is not None:
+                r["actual_weight"] = aw
+            gap = round(tw - aw, 4) if (tw is not None and aw is not None) else None
+            if gap is not None:
+                r["weight_gap"] = gap
+            r["action_flag"] = _portfolio_rebalance_action(gap, band)
+            r["decision"] = _portfolio_decision(r, gap, band, weak)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "[engine_v2 v%s] _compute_portfolio_fields failed: %s: %s",
+            __version__, exc.__class__.__name__, exc,
+        )
+
 
 INSTRUMENT_SHEETS: Set[str] = {
     "Market_Leaders", "Global_Markets", "Commodities_FX",
@@ -8062,6 +8323,95 @@ class DataEngineV5:
              "notes": "", "source": "engine_v2", "sort_order": 2},
         ]
 
+    async def _build_insights_rows(self) -> List[Dict[str, Any]]:
+        """v5.80.0: rebuild Insights_Analysis from live portfolio + market data
+        instead of the 2-row version stub. Sections: Portfolio Summary,
+        Allocation vs Target (per holding + blended decision), Market
+        Opportunities (top INVESTABLE by opportunity_score across the market
+        pages), and Data Quality (per-sheet rows-passing-DQ roll-up). Falls back
+        to the version stub only if the live build yields nothing, so the page
+        never regresses to garbage (the frontend's INSIGHTS_KEEP_LAST_GOOD then
+        preserves the prior good snapshot)."""
+        rows: List[Dict[str, Any]] = []
+        order = {"n": 0}
+
+        def add(section: str, item: str, metric: str, value: Any, notes: str = "", source: str = "engine_v2") -> None:
+            order["n"] += 1
+            rows.append({
+                "section": section, "item": item, "metric": metric, "value": value,
+                "notes": notes, "source": source, "sort_order": order["n"],
+            })
+
+        market_pages = ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds"]
+        page_data: Dict[str, List[Dict[str, Any]]] = {}
+        for p in ["My_Portfolio"] + market_pages:
+            try:
+                page_data[p] = await self.get_page_rows(p, limit=300)
+            except Exception as exc:
+                logger.debug("[engine_v2 v%s] insights fetch %s failed: %s", __version__, p, exc)
+                page_data[p] = []
+
+        # ---- Portfolio Summary ----
+        pf = page_data.get("My_Portfolio", []) or []
+        _compute_portfolio_fields(pf)
+        tot_mv = sum((_as_float(r.get("position_value")) or 0.0) for r in pf if isinstance(r, dict))
+        tot_cost = sum((_as_float(r.get("position_cost")) or 0.0) for r in pf if isinstance(r, dict))
+        pl = tot_mv - tot_cost
+        pl_pct = (pl / tot_cost * 100.0) if tot_cost > 0 else None
+        held = [r for r in pf if isinstance(r, dict) and (_as_float(r.get("position_qty")) or 0.0) > 0.0]
+        add("Portfolio Summary", "Holdings", "count", len(held))
+        add("Portfolio Summary", "Total Market Value", "SAR", round(tot_mv, 2))
+        add("Portfolio Summary", "Total Cost", "SAR", round(tot_cost, 2))
+        add("Portfolio Summary", "Unrealized P/L", "SAR", round(pl, 2),
+            notes=("%+.2f%%" % pl_pct if pl_pct is not None else ""))
+
+        # ---- Allocation vs Target ----
+        for r in pf:
+            if not isinstance(r, dict):
+                continue
+            sym = _safe_str(r.get("symbol"))
+            if not sym:
+                continue
+            tw = _as_float(r.get("target_weight"))
+            aw = _as_float(r.get("actual_weight"))
+            gap = _as_float(r.get("weight_gap"))
+            dec = _safe_str(r.get("decision")) or "HOLD"
+            val = ("%.1f%% / %.1f%%" % (aw, tw)) if (aw is not None and tw is not None) else "n/a"
+            notes = ("%s; gap %+.1fpp" % (dec, gap)) if gap is not None else dec
+            add("Allocation vs Target", _safe_str(r.get("name")) or sym, "actual / target weight", val, notes=notes)
+
+        # ---- Market Opportunities (top INVESTABLE by opportunity_score) ----
+        opps: List[Tuple[str, Dict[str, Any]]] = []
+        for p in market_pages:
+            for r in page_data.get(p, []) or []:
+                if isinstance(r, dict) and _safe_str(r.get("investability_status")).upper() == "INVESTABLE":
+                    opps.append((p, r))
+        opps.sort(key=lambda pr: -(_as_float(pr[1].get("opportunity_score")) or 0.0))
+        if opps:
+            for p, r in opps[:5]:
+                sym = _safe_str(r.get("symbol"))
+                add("Market Opportunities", _safe_str(r.get("name")) or sym, "opportunity_score",
+                    round(_as_float(r.get("opportunity_score")) or 0.0, 1),
+                    notes="%s · %s" % (_safe_str(r.get("recommendation")), p))
+        else:
+            add("Market Opportunities", "None", "status", "No INVESTABLE rows this cycle")
+
+        # ---- Data Quality roll-up ----
+        for p in ["My_Portfolio"] + market_pages:
+            prows = page_data.get(p, []) or []
+            n = len(prows)
+            npass = sum(1 for r in prows if isinstance(r, dict) and (_as_float(r.get("data_quality_score")) or 0.0) >= 70.0)
+            status = "PASS" if (n and npass == n) else ("PARTIAL" if npass else "FAIL")
+            add("Data Quality", p, "rows >= 70 DQ", "%d/%d" % (npass, n), notes=status)
+
+        # ---- Coverage footer ----
+        add("Coverage", "Engine Version", "version", __version__, notes="Live")
+        add("Coverage", "Last Updated (UTC)", "timestamp", _now_utc_iso())
+
+        if len(rows) <= 2:
+            return self._build_insights_rows_fallback()
+        return rows
+
     def _top10_sort_key(self, row: Dict[str, Any]) -> Tuple[float, float, float]:
         return (
             -(_as_float(row.get("opportunity_score")) or 0.0),
@@ -8116,6 +8466,11 @@ class DataEngineV5:
         for _r in rows:
             _reconcile_recommendation_family(_r)
             _apply_investability_gate(_r)  # v5.78.0: same boundary as _strict_project_row
+        # v5.80.0: cross-sectional portfolio decision pass (weights + verdict).
+        # Runs once on the full holdings list after the per-row gate, so
+        # actual_weight/weight_gap see the whole book.
+        if canon == "My_Portfolio":
+            _compute_portfolio_fields(rows)
         return rows
 
     async def get_sheet(self, sheet: str, *, limit: int = 2000, offset: int = 0, **kwargs: Any) -> Dict[str, Any]:
@@ -8166,7 +8521,7 @@ class DataEngineV5:
 
         # Special pages
         if target_sheet == "Insights_Analysis":
-            rows = self._build_insights_rows_fallback()
+            rows = await self._build_insights_rows()
             return {
                 "rows": rows,
                 "rows_display": _rows_display_objects_from_rows(rows, headers, keys),
@@ -8297,6 +8652,10 @@ class DataEngineV5:
 
         # Final projection + ranking.
         rows = [_strict_project_row(keys, r) for r in rows]
+        # v5.80.0: portfolio decision pass for My_Portfolio (weights need the
+        # whole projected list; gate fields are already populated by projection).
+        if target_sheet == "My_Portfolio":
+            _compute_portfolio_fields(rows)
         _apply_rank_overall(rows)
 
         return {
@@ -8361,7 +8720,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.79.7",  # v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
+                "version": "v5.80.0",  # v5.80.0 PORTFOLIO & INSIGHTS DECISION LAYER: My_Portfolio 115->122 (this page only; +Buy Date/Target Weight %/Actual Weight %/Weight Gap/Rebalance Action/Investor Decision/User Notes, mirroring the Top_10 115+3 pattern); _compute_portfolio_fields fills actual_weight/weight_gap (PERCENT POINTS) + action_flag (drift-only ADD/HOLD/REDUCE/SELL) + decision (blended SELL/REDUCE/ADD/HOLD from drift+reco+forecast-sign+risk), target_weight seeded from TFB_PORTFOLIO_TARGETS (1120=40/4013=30/7020=30) when blank, band TFB_PORTFOLIO_REBALANCE_BAND_PP=5.0pp, weak floor TFB_PORTFOLIO_WEAK_SCORE=60; Insights_Analysis rebuilt from live portfolio+market data (Portfolio Summary/Allocation vs Target/Market Opportunities/Data Quality) replacing the 2-row stub; Top_10 eligibility now also requires INVESTABLE and rejects negative-forecast buy-family (closing the Fix S/Fix J seam). Market pages stay 115. Pairs with 00_Config.gs v1.12.3. v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
