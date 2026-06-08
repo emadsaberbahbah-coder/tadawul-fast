@@ -2,7 +2,7 @@
 # core/sheets/schema_registry.py
 """
 ================================================================================
-Schema Registry — v2.13.0
+Schema Registry — v2.14.0
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -19,6 +19,25 @@ exist; no network calls; import-safe.
 copy; ALL code, validation logic, and per-column notes are preserved verbatim
 except where the v2.13.0 / v2.12.0 changelogs below state otherwise.)
 
+================================================================================
+v2.14.0  --  MY_PORTFOLIO 115 -> 122  (adds a 7-field portfolio DECISION layer so
+            the registry mirrors data_engine_v2 v5.80.0's My_Portfolio contract;
+            this page ONLY -- all other instrument pages stay 115, Top10 stays 118)
+================================================================================
+The route layer is registry-first: every sheet-rows owner/bridge resolves widths
+via get_sheet_len / get_sheet_headers / get_sheet_keys. Before v2.14.0 the
+My_Portfolio SheetSpec used the plain 115 _CANONICAL_COLUMNS, so the 7 v5.80.0
+decision columns (buy_date, target_weight, actual_weight, weight_gap, action_flag,
+decision, user_notes) were projected OUT of every served row -- silent truncation
+to 115 on EVERY path (advanced_analysis, advanced_sheet_rows, analysis_sheet_rows,
+investment_advisor, advisor, enriched_quote), regardless of the engine emitting
+all 122. v2.14.0 appends those 7 as a fragment AFTER the 115 canonical -- exactly
+the pattern Top_10 uses for its 3 extras (118) -- and gives My_Portfolio its own
+122-width validation branch. Keys mirror the engine VERBATIM; a near-miss would
+re-truncate silently. Co-deploy with data_engine_v2 v5.80.0 (122) + 00_Config.gs
+v1.12.3 (122) -- this registry was the missing middle layer.
+BUMP: SCHEMA_VERSION 2.13.0 -> 2.14.0; adds _MY_PORTFOLIO_TOTAL_COLS=122.
+All v2.13.0 / v2.12.0 logic, validation, and per-column notes preserved verbatim.
 ================================================================================
 v2.13.0  --  ENGINE-V5.79.2-ALIGNMENT  (adds the 8-column Investability Gate so
             the registry mirrors the ACCEPTED data_engine_v2 v5.79.2 instrument
@@ -192,7 +211,7 @@ __all__ = [
     "validate_schema_registry",
 ]
 
-SCHEMA_VERSION = "2.13.0"
+SCHEMA_VERSION = "2.14.0"
 # TFB module-version convention alias (mirrors scoring v5.6.0,
 # data_engine_v2 v5.75.0, enriched_quote v4.7.0, reco_normalize v7.2.0,
 # insights_builder v7.0.0, scoring_engine v3.4.4, top10_selector v4.11.0,
@@ -372,6 +391,20 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
 # investability-gate columns (engine v5.79.2), appended at end.
 _CANONICAL_INSTRUMENT_COLS = 115  # 107 + 8 investability gate (v2.13.0)
 _TOP10_TOTAL_COLS = 118           # 115 + 3 Top10 extras
+# v2.14.0: My_Portfolio appends a 7-field decision layer AFTER the 115 canonical
+# (engine data_engine_v2 v5.80.0 MY_PORTFOLIO_EXTRA_FIELDS) -> 122. This page ONLY.
+_MY_PORTFOLIO_TOTAL_COLS = 122    # 115 + 7 portfolio decision extras
+# Keys MUST match data_engine_v2 v5.80.0 row keys verbatim, or the registry-first
+# route layer's _normalize_to_schema_keys projection drops them (silent re-truncation).
+_PORTFOLIO_EXTRA_COLUMN_KEYS: Tuple[str, ...] = (
+    "buy_date",
+    "target_weight",
+    "actual_weight",
+    "weight_gap",
+    "action_flag",
+    "decision",
+    "user_notes",
+)
 _INSIGHTS_ANALYSIS_COLS = 7
 _DATA_DICTIONARY_COLS = 9
 
@@ -1060,6 +1093,61 @@ def _top10_extra_columns() -> Tuple[ColumnSpec, ...]:
     )
 
 
+def _portfolio_extra_columns() -> Tuple[ColumnSpec, ...]:
+    """
+    7 extra columns for My_Portfolio (v2.14.0). Appended AFTER the 115 canonical
+    columns -> 122, exactly the append pattern Top_10 uses for its 3 extras (-> 118).
+    Keys/headers mirror data_engine_v2 v5.80.0 MY_PORTFOLIO_EXTRA_FIELDS /
+    MY_PORTFOLIO_EXTRA_HEADERS VERBATIM; the keys MUST match the engine row keys
+    exactly or the registry-first route layer (_normalize_to_schema_keys) drops
+    them on projection.
+
+    IMPORTANT: sanitize as a fragment (do NOT enforce symbol-first here).
+    """
+    cols = (
+        ColumnSpec(
+            "Portfolio", "Buy Date", "buy_date", "date", "yyyy-mm-dd", False, "sheet/user",
+            "Purchase date. Manual; preserved from the sheet (refresh never overwrites it).",
+        ),
+        ColumnSpec(
+            "Portfolio", "Target Weight %", "target_weight", "float", "0.00", False, "sheet/user",
+            "Desired portfolio weight in percent points (e.g. 40 = 40%). Seeded from "
+            "TFB_PORTFOLIO_TARGETS by data_engine_v2 v5.80.0 _compute_portfolio_fields "
+            "when the sheet leaves it blank.",
+        ),
+        ColumnSpec(
+            "Portfolio", "Actual Weight %", "actual_weight", "float", "0.00", False, "derived",
+            "Live weight = position_value / sum(portfolio book value) * 100 (percent "
+            "points). Computed cross-sectionally by _compute_portfolio_fields.",
+        ),
+        ColumnSpec(
+            "Portfolio", "Weight Gap", "weight_gap", "float", "0.00", False, "derived",
+            "target_weight - actual_weight in percent points (signed). Drives the "
+            "rebalance action.",
+        ),
+        ColumnSpec(
+            "Portfolio", "Rebalance Action", "action_flag", "str", "text", False, "derived",
+            "Pure drift-only verdict ADD/HOLD/REDUCE/SELL from weight_gap vs the rebalance "
+            "dead-band (TFB_PORTFOLIO_REBALANCE_BAND_PP, default 5.0pp). Ignores the engine signal.",
+        ),
+        ColumnSpec(
+            "Portfolio", "Investor Decision", "decision", "str", "text", False, "derived",
+            "Investor verdict from _compute_portfolio_fields (combines the drift action "
+            "with the row recommendation / investability gate).",
+        ),
+        ColumnSpec(
+            "Portfolio", "User Notes", "user_notes", "str", "text", False, "sheet/user",
+            "Free-text notes. Manual; preserved from the sheet (refresh never overwrites it).",
+        ),
+    )
+    return _sanitize_columns(
+        "My_Portfolio(PortfolioExtras)",
+        "portfolio_extras_fragment",
+        cols,
+        enforce_symbol_first=False,
+    )
+
+
 def _insights_columns() -> Tuple[ColumnSpec, ...]:
     # v2.12.0: reconciled to data_engine_v2 v5.77.17's INSIGHTS_KEYS /
     # INSIGHTS_HEADERS. Previously this was
@@ -1175,8 +1263,19 @@ _RAW_SCHEMA_REGISTRY: Dict[str, SheetSpec] = {
     "My_Portfolio": SheetSpec(
         sheet="My_Portfolio",
         kind="instrument_table",
-        columns=_CANONICAL_COLUMNS,
-        notes="User portfolio. Portfolio fields may be filled; others optional.",
+        columns=_sanitize_columns(
+            "My_Portfolio",
+            "instrument_table",
+            _CANONICAL_COLUMNS + _portfolio_extra_columns(),  # 122 columns in v2.14.0+
+            enforce_symbol_first=True,
+        ),
+        notes=(
+            "User portfolio. Canonical 115 + 7-field decision layer (v2.14.0, mirrors "
+            "data_engine_v2 v5.80.0). buy_date/user_notes manual (preserved from the "
+            "sheet); target_weight seeds from TFB_PORTFOLIO_TARGETS when blank; "
+            "actual_weight/weight_gap/action_flag/decision computed live by "
+            "_compute_portfolio_fields."
+        ),
     ),
     "Insights_Analysis": SheetSpec(
         sheet="Insights_Analysis",
@@ -1502,7 +1601,7 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
             seen_keys.add(col.key)
             seen_headers.add(col.header)
 
-        if sheet_name in {"Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"}:
+        if sheet_name in {"Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds"}:
             if len(spec.columns) != _CANONICAL_INSTRUMENT_COLS:
                 raise ValueError(
                     f"[{sheet_name}] instrument_table must be {_CANONICAL_INSTRUMENT_COLS} columns "
@@ -1625,6 +1724,52 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
                 raise ValueError(
                     f"[Top_10_Investments] Missing required investability gate column(s): "
                     f"{missing_investability_gate}."
+                )
+
+        if sheet_name == "My_Portfolio":
+            # v2.14.0: My_Portfolio = 115 canonical + 7 portfolio decision extras
+            # (mirrors data_engine_v2 v5.80.0). It is a strict SUPERSET of the 115,
+            # so it must still carry every canonical required column PLUS the 7
+            # extras -> _MY_PORTFOLIO_TOTAL_COLS. Same shape as the Top_10 branch.
+            if len(spec.columns) != _MY_PORTFOLIO_TOTAL_COLS:
+                raise ValueError(
+                    f"[My_Portfolio] must be {_MY_PORTFOLIO_TOTAL_COLS} columns "
+                    f"({_CANONICAL_INSTRUMENT_COLS} canonical + 7 portfolio decision) "
+                    f"in v{SCHEMA_VERSION}. Got: {len(spec.columns)}"
+                )
+            if spec.columns[0].key != "symbol":
+                raise ValueError("[My_Portfolio] First column must be 'symbol'.")
+            spec_keys = {c.key for c in spec.columns}
+            missing_views = [k for k in VIEW_COLUMN_KEYS if k not in spec_keys]
+            if missing_views:
+                raise ValueError(f"[My_Portfolio] Missing required view column(s): {missing_views}.")
+            missing_insights = [k for k in INSIGHTS_COLUMN_KEYS if k not in spec_keys]
+            if missing_insights:
+                raise ValueError(f"[My_Portfolio] Missing required insights column(s): {missing_insights}.")
+            missing_decision = [k for k in DECISION_COLUMN_KEYS if k not in spec_keys]
+            if missing_decision:
+                raise ValueError(f"[My_Portfolio] Missing required decision matrix column(s): {missing_decision}.")
+            missing_candlestick = [k for k in CANDLESTICK_COLUMN_KEYS if k not in spec_keys]
+            if missing_candlestick:
+                raise ValueError(f"[My_Portfolio] Missing required candlestick column(s): {missing_candlestick}.")
+            missing_canonical_reco = [k for k in CANONICAL_RECO_COLUMN_KEYS if k not in spec_keys]
+            if missing_canonical_reco:
+                raise ValueError(f"[My_Portfolio] Missing required canonical reco column(s): {missing_canonical_reco}.")
+            missing_scoring_v574 = [k for k in SCORING_V574_COLUMN_KEYS if k not in spec_keys]
+            if missing_scoring_v574:
+                raise ValueError(f"[My_Portfolio] Missing required Scoring v5.74 column(s): {missing_scoring_v574}.")
+            missing_forecast_source = [k for k in FORECAST_SOURCE_COLUMN_KEYS if k not in spec_keys]
+            if missing_forecast_source:
+                raise ValueError(f"[My_Portfolio] Missing required forecast source column(s): {missing_forecast_source}.")
+            missing_investability_gate = [k for k in INVESTABILITY_GATE_COLUMN_KEYS if k not in spec_keys]
+            if missing_investability_gate:
+                raise ValueError(f"[My_Portfolio] Missing required investability gate column(s): {missing_investability_gate}.")
+            missing_portfolio_extras = [k for k in _PORTFOLIO_EXTRA_COLUMN_KEYS if k not in spec_keys]
+            if missing_portfolio_extras:
+                raise ValueError(
+                    f"[My_Portfolio] Missing required portfolio decision column(s): "
+                    f"{missing_portfolio_extras}. data_engine_v2 v5.80.0 "
+                    f"_compute_portfolio_fields writes these (115 + 7 = 122)."
                 )
 
         if sheet_name == "Insights_Analysis":
