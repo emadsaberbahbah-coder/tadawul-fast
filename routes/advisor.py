@@ -2,7 +2,7 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.7.0
+ADVISOR ROUTER — v6.7.1
 ================================================================================
 SPECIAL-PAGE PROXY-FIRST • ROOT/ANALYSIS ALIGNED • SHORT-ADVISOR HARDENED •
 JSON-SAFE • GET+POST SAFE • FAIL-SOFT • CONTRACT-PROJECTED • ENGINE-TOLERANT
@@ -121,7 +121,7 @@ if _advisor_debug_enabled():
         pass
 
 
-ADVISOR_VERSION = "6.7.0"
+ADVISOR_VERSION = "6.7.1"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 DEFAULT_ADVISOR_PAGE = "Top_10_Investments"
@@ -140,14 +140,21 @@ DERIVED_PAGES = {"Top_10_Investments", "Insights_Analysis", "Data_Dictionary"}
 # 86-90 of instrument pages and 86-93 of Top_10_Investments when the registry
 # import failed — exactly the LayoutA-blanking class of bug fixed in
 # `05_Refresh.gs` v1.8.1 and `analysis_sheet_rows` v4.3.0 → v4.3.1.
+# v6.7.1 [FIX-9]: re-aligned to the live engine v5.80.0 STATIC_CANONICAL_SHEET_
+# CONTRACTS — instrument pages are 115 (the 90/93 here were a stale undercount
+# that would have truncated 25+ columns on a registry-import failure), Top_10 is
+# 118, and My_Portfolio is 122 (115 + the 7-field portfolio decision block). This
+# map is the registry-import-failure fallback only; the live path trims to the
+# engine's effective_headers, so this never fired in normal operation, but a
+# stale fallback is exactly the silent-truncation landmine to keep retired.
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
-    "Market_Leaders": 90,
-    "Global_Markets": 90,
-    "Commodities_FX": 90,
-    "Mutual_Funds": 90,
-    "My_Portfolio": 90,
+    "Market_Leaders": 115,
+    "Global_Markets": 115,
+    "Commodities_FX": 115,
+    "Mutual_Funds": 115,
+    "My_Portfolio": 122,
     "Insights_Analysis": 7,
-    "Top_10_Investments": 93,
+    "Top_10_Investments": 118,
     "Data_Dictionary": 9,
 }
 
