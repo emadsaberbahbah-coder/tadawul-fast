@@ -2,8 +2,52 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.79.6
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.79.7
 ================================================================================
+
+WHY v5.79.7 - NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S)
+-------------------------------------------------------------------------------
+One engine-only governance refinement to the v5.78.0 investability gate. NO
+schema change (still 115/115, 00_Config v1.11.0 unaffected, no frontend
+redeploy). DEFAULT ON, env-reversible.
+
+  THE GAP: the base gate (v5.78.0) marks a row INVESTABLE / INVEST on
+  price + forecast + data_quality>=70 + a BUY-family recommendation. It never
+  cross-checked the SIGN of the engine's own forecast. So a row the engine
+  recommends STRONG_BUY / BUY / ACCUMULATE could read INVESTABLE / INVEST while
+  its governing forecast ROI was NEGATIVE -- "buy this, we expect it to fall."
+  A self-contradiction the dashboard should never surface.
+
+  THE FIX (Fix S): _apply_investability_gate now computes the signed governing
+  forecast ROI (12M preferred, 3M fallback; derived from forecast_price vs
+  current price when an explicit expected_roi_* is absent -- all in FRACTION
+  units, matching how the engine stores expected_roi_*) and adds one verdict
+  branch: a BUY-family row whose governing ROI is determinable and strictly
+  negative is DEMOTED to WATCHLIST / WATCH with block_reason
+  "Negative forecast (expected ROI X.X%)". The branch sits AFTER the existing
+  HOLD / moderate-DQ / incomplete-fundamentals branch and BEFORE the final
+  INVESTABLE else, so it can only ever turn an otherwise-INVESTABLE row into a
+  WATCHLIST row -- it never promotes, never relaxes, and adds NO column. The
+  strict Fix P tier (which only acts on INVESTABLE/INVEST rows) simply sees a
+  WATCHLIST row and is a no-op on it, so the two are non-conflicting.
+
+  FAIL-OPEN + REVERSIBLE: when no forecast horizon is determinable the ROI is
+  None and the branch does not fire (verdict unchanged) -- an absent forecast
+  never fabricates a demotion. Env switch TFB_GATE_BLOCK_NEGATIVE_ROI
+  (default ON); set it to 0/false/off and the gate's verdict is byte-identical
+  to v5.79.6. Sign-only decision: scale/rounding of expected_roi does not
+  affect WHETHER a row is demoted, only the percentage printed in the reason.
+
+VALIDATION (post-deploy)
+  - A BUY/ACCUMULATE/STRONG_BUY row with expected_roi_12m < 0 (or a
+    forecast_price_12m below current price) now reads WATCHLIST / WATCH /
+    "Negative forecast (expected ROI -X.X%)" instead of INVESTABLE / INVEST.
+  - A BUY-family row with a positive governing ROI is unchanged (INVESTABLE).
+  - A HOLD / REDUCE / SELL / STRONG_SELL / AVOID row is unchanged (those never
+    reach the new branch).
+  - With TFB_GATE_BLOCK_NEGATIVE_ROI=0 the INVESTABLE/INVEST set is identical
+    to v5.79.6.
+  - /health: version 5.79.7; schema still 115.
 
 WHY v5.79.6 - PROVIDER-NAME RESOLUTION (Fix R): 'yahoo' -> yahoo_chart_provider
 -------------------------------------------------------------------------------
@@ -1305,7 +1349,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.79.6"
+__version__ = "5.79.7"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -2357,6 +2401,50 @@ def _investability_gate_enabled() -> bool:
     return True
 
 
+def _gate_block_negative_roi_enabled() -> bool:
+    """v5.79.7 (Fix S): master switch for the negative-forecast investability
+    demotion (default ON). When ON, a BUY-family row (STRONG_BUY / BUY /
+    ACCUMULATE) whose governing forecast ROI is determinable and strictly
+    negative is benched to WATCHLIST / WATCH instead of INVESTABLE / INVEST --
+    the engine should not call a row "investable" while its own forecast points
+    down. Set TFB_GATE_BLOCK_NEGATIVE_ROI to 0/false/off to restore the exact
+    v5.79.6 verdict (the demotion branch then never fires)."""
+    raw = (os.getenv("TFB_GATE_BLOCK_NEGATIVE_ROI") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+def _gate_governing_forecast_roi(row: Dict[str, Any]) -> Optional[float]:
+    """v5.79.7 (Fix S): return the signed governing forecast ROI as a FRACTION
+    (e.g. -0.12 for -12%), used by the negative-forecast demotion. Prefers the
+    explicit expected_roi_* fields -- which this engine stores as fractions
+    (see _phase_ii_quality_forecast / _compute_scores_local_fallback, which
+    assign (fp-cp)/cp) -- and falls back to deriving the ratio from
+    forecast_price vs current price when an ROI field is absent. 12M is the
+    governing horizon; the 3M leg is the fallback. Returns None when no horizon
+    can be determined, so the gate fails OPEN (verdict unchanged) rather than
+    fabricating a demotion from absent data."""
+    if not isinstance(row, dict):
+        return None
+    roi12 = _as_float(row.get("expected_roi_12m"))
+    if roi12 is not None:
+        return roi12
+    cp = _as_float(row.get("current_price"))
+    if cp is None:
+        cp = _as_float(row.get("price"))
+    fp12 = _as_float(row.get("forecast_price_12m"))
+    if cp is not None and cp > 0 and fp12 is not None and fp12 > 0:
+        return (fp12 - cp) / cp
+    roi3 = _as_float(row.get("expected_roi_3m"))
+    if roi3 is not None:
+        return roi3
+    fp3 = _as_float(row.get("forecast_price_3m"))
+    if cp is not None and cp > 0 and fp3 is not None and fp3 > 0:
+        return (fp3 - cp) / cp
+    return None
+
+
 # =============================================================================
 # v5.79.4 (Fix P) — STRICT FINAL-APPROVAL TIER (the audits' "Final rule for 95%")
 # -----------------------------------------------------------------------------
@@ -2637,6 +2725,23 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     # overrides the engine here; label it as a flagged conflict.
     basis = "Engine" if conflict == "FALSE" else "Engine (provider conflict flagged)"
 
+    # -- v5.79.7 (Fix S): negative-forecast demotion inputs -------------------
+    # gov_roi is the signed governing forecast ROI as a fraction (12M preferred,
+    # 3M fallback; derived from forecast_price vs current price when an ROI
+    # field is absent). forecast_negative fires ONLY for a BUY-family row
+    # (STRONG_BUY / BUY / ACCUMULATE, via _RECO_DIRECTION == "ADD") whose
+    # governing ROI is determinable and strictly negative -- a row the engine
+    # wants to buy while its own forecast points down. Gated by
+    # _gate_block_negative_roi_enabled() (default ON); when off, forecast_negative
+    # is always False and the verdict chain below is byte-identical to v5.79.6.
+    gov_roi = _gate_governing_forecast_roi(row)
+    forecast_negative = (
+        _gate_block_negative_roi_enabled()
+        and _RECO_DIRECTION.get(rec) == "ADD"
+        and gov_roi is not None
+        and gov_roi < 0.0
+    )
+
     # -- investability status / final action / block reason -------------------
     if not has_price:
         status, action, reason = "BLOCKED", "DO_NOT_INVEST", "Missing current price"
@@ -2655,6 +2760,15 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         else:
             gaps = [g for g, ok in (("D/E", has_de), ("FCF", has_fcf)) if not ok]
             reason = "Incomplete fundamentals (%s)" % ", ".join(gaps)
+    elif forecast_negative:
+        # v5.79.7 (Fix S): the engine recommends a BUY-family action but its own
+        # governing forecast ROI is negative -- do NOT call this INVESTABLE.
+        # Bench it to the watchlist with the signed ROI surfaced in block_reason.
+        # (Reached only when the row already cleared price + forecast + dq floor
+        # + dq>=INVESTABLE_MIN + fundamentals and is NOT HOLD / a sell-family /
+        # excluded reco, i.e. it would otherwise have been INVESTABLE.)
+        status, action = "WATCHLIST", "WATCH"
+        reason = "Negative forecast (expected ROI %.1f%%)" % (gov_roi * 100.0)
     else:
         status, action, reason = "INVESTABLE", "INVEST", ""
 
@@ -8247,7 +8361,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.79.6",  # v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
+                "version": "v5.79.7",  # v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
