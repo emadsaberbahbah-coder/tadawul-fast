@@ -3,7 +3,7 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.14.0
+Top 10 Selector — v4.15.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -14,198 +14,92 @@ CRITERIA-v3.1.0 HARD-FILTER CONSUMER (v4.12.0)
 DECISION-MATRIX AWARE • CANDLESTICK AWARE (v4.12.0)
 CANONICAL-BUCKET ROUTED • REAL OVERALL-RANK FALLBACK (v4.13.0)
 8-TIER VOCABULARY AWARE • PRIORITY-BAND ROUTED • CASCADE-BRIDGE READY (v4.14.0)
+PAGINATION-ENVELOPE SAFE • FULL-UNIVERSE INGEST • LIMIT-FILL BACKFILL (v4.15.0)
 
 ================================================================================
-Cross-stack family (May 2026 v8.0.0 family floor)
+What v4.15.0 fixes (over v4.14.0)  --  THE "8/5 NOT 10" BUG
 ================================================================================
-This module sits at the tail of the May-2026 cross-stack family. The
-contract surfaces it consumes from upstream are:
+Symptom: the live Top_10_Investments sheet returned only 5 (or 8) rows even
+though the engine scored a full universe per page. Root-caused on Render:
+`source_page_rows` showed exactly ONE row ingested per source page, and a
+direct `_fetch_page_rows` probe returned `1 rows  syms=[None]`.
 
-  - core.sheets.schema_registry        v2.11.0
-  - core.scoring                       v5.7.0
-      * Produces the 5 Insights row fields AND the canonical 8-tier
-        recommendation vocabulary (STRONG_BUY / BUY / ACCUMULATE / HOLD /
-        REDUCE / SELL / STRONG_SELL / AVOID).
-  - core.scoring_engine (bridge)       v3.6.0
-  - core.reco_normalize                v8.0.0
-      * 8-tier canonical normalization. ACCUMULATE (moderate-bullish /
-        scale-in), STRONG_SELL (re-canonical), and AVOID (uninvestable)
-        are first-class tokens — not collapsed to BUY/SELL.
-      * Conviction-floor downgrade env knobs:
-        RECO_STRONG_BUY_CONVICTION_FLOOR=60,
-        RECO_BUY_CONVICTION_FLOOR=45.
-  - core.schemas                       v7.0.0
-      * Recommendation enum is 8-tier; UnifiedQuote carries the 9
-        cascade-bridge / scoring-provenance fields (provider_rating,
-        recommendation_priority_band P1..P5, scoring_recommendation_source,
-        scoring_schema_version, scoring_errors, opportunity_source,
-        overall_score_raw, overall_penalty_factor,
-        recommendation_source).
-  - core.data_engine_v2                v5.76.0
-      * Phase B forecast-unavailable tags + bool flag.
-      * Phase H/I/P engine-dropped-valuation tags.
-      * Phase N canonicalizes warnings as '; '-joined.
-      * Phase Q preserves provider last_error_class.
-      * 8-tier passthrough preserved end-to-end.
-      * 9 cascade-bridge / scoring-provenance fields emitted per row.
-  - core.candlesticks                  v1.0.0
+Root cause (parser, in-module): `core.data_engine_v2.get_sheet_rows` returns a
+PAGINATION ENVELOPE shaped `{rows, rows_display, rows_matrix, limit, offset,
+total}`. `_looks_like_row_dict` misclassified that envelope as a SINGLE data
+row: it has no symbol/ticker, no top10_rank, and zero score-field hits, so it
+fell through to the `len(non_meta) >= 4` heuristic — and `WRAPPER_KEYS`
+listed `rows`/`rows_matrix` but NOT `rows_display`/`limit`/`offset`/`total`,
+leaving exactly 4 "non-meta" keys → True. `_extract_rows_like` then did
+`return [mapping]`, handing back the envelope itself as one (symbol-less) row
+instead of descending into `rows`. Five pages x 1 envelope-row = 5 candidates.
+
+v4.15.0 phase changes:
+
+  A. WRAPPER GUARD in `_looks_like_row_dict`. After the strong positive row
+     signals (symbol / ticker / top10_rank / selection_reason), a NEW guard
+     returns False when the mapping carries a row-container LIST under any of
+     rows / row_objects / records / items / results / quotes / data /
+     rows_matrix / matrix. Such a mapping is a wrapper/envelope, never a
+     single row. Symbol-bearing real rows still return True FIRST, so no
+     genuine row is ever reclassified.
+
+  B. WRAPPER_KEYS EXTENDED with pagination/envelope keys (rows_display, limit,
+     offset, total, page, page_size, page_count, per_page, next_offset,
+     has_more, pagination, generated_at, generated_at_utc, request_id,
+     duration_ms) as defense-in-depth so the field-count heuristic also can
+     no longer misfire on an envelope.
+
+  C. LIMIT-FILL BACKFILL in `_build_top10_rows_async`. Once the parser is
+     fixed the candidate universe is large enough to fill the Top10 normally,
+     but when operator criteria trim the passing pool below `limit`, the
+     selector now tops up to `limit` from the best-scoring NON-passing
+     candidates (investable rows always ranked first). Backfill rows are
+     flagged in `selection_reason` ("[BACKFILL: below criteria ...]") and
+     counted in meta as `backfilled_count` + `backfill_symbols`, so the gate
+     intent stays visible and auditable. Direct-symbol top-up (v4.13.0)
+     remains and runs first.
+
+  D. VERSION BUMP 4.14.0 -> 4.15.0. Cross-stack refs updated to the current
+     family floor. All v4.14.0 public APIs preserved verbatim; `__all__`
+     unchanged.
+
+================================================================================
+Cross-stack family (Jun 2026 floor)
+================================================================================
+  - core.sheets.schema_registry        v2.14.0
+  - core.scoring                       v5.7.4
+  - core.reco_normalize                v8.0.0   (8-tier canonical)
+  - core.schemas                       v7.0.0   (8-tier enum + 9 cascade-bridge
+                                                  fields on UnifiedQuote)
+  - core.data_engine_v2                v5.83.2  (115-col canonical; get_sheet_rows
+                                                  returns {rows, rows_display,
+                                                  rows_matrix, limit, offset,
+                                                  total} envelope)
   - core.buckets                       v1.0.0
   - core.analysis.criteria_model       v3.1.1
-      * v3.1.0 fields preserved (min_conviction_score,
-        exclude_engine_dropped_valuation, exclude_forecast_unavailable,
-        exclude_provider_errors).
-      * v3.2.0 fields (forward-compat in this module): NEW
-        `exclude_avoid_recommendations` (bool) and `min_priority_band`
-        (str, "P1".."P5"). Honoured as HARD filters here even before
-        criteria_model lands v3.2.0; off by default so existing
-        v3.1.0 callers see zero behaviour change.
   - core.analysis.investment_advisor_engine v4.5.0
-      * 8-tier routed; 106-col fallback. Emits the same 9 cascade-bridge
-        fields v4.14.0 reads.
-  - core.analysis.insights_builder     v8.0.0
-      * Sibling consumer; renders Top Picks Context + Risk Alerts rows
-        for the same 8-tier vocabulary v4.14.0 routes.
-
-================================================================================
-What v4.14.0 adds (over v4.13.0)
-================================================================================
-v4.13.0 closed the canonical-bucket-routing gap and gave us a real
-overall-score rank fallback. Two backlog items it left in place:
-
-  - top10_selector was 5-tier-aware only. ACCUMULATE flowed through
-    as a string on the `recommendation` field but the selector did not
-    recognise it as a Top10-eligible bullish tier. AVOID flowed
-    through too — the genuinely "uninvestable" tier from
-    reco_normalize v8.0.0 — and the selector did NOT auto-exclude it,
-    so a row with recommendation=AVOID could in principle reach the
-    Top10 if its other scores were high enough. STRONG_SELL was
-    silently treated as just SELL with no separate handling.
-  - `recommendation_priority_band` (P1..P5) is emitted by
-    data_engine_v2 v5.74.0+ on every row and by advisor_engine v4.5.0
-    as a first-class urgency band. v4.13.0 ignored it entirely, so
-    two rows with near-identical composite scores were tie-broken by
-    horizon ROI / opportunity_score / overall_score / risk — never by
-    the urgency that scoring.py / reco_normalize.py had assigned.
-
-v4.14.0 phase changes:
-
-  A. CROSS-STACK HEADER SYNC. All upstream version refs updated to the
-     v8.0.0 family floor (see "Cross-stack family" block above). Banner
-     gains the v4.14.0 marker.
-
-  B. VERSION BUMP 4.13.0 -> 4.14.0. `__version__` alias updated;
-     `__all__` unchanged except for two new capability constants
-     (`RECO_8TIER_AWARE_VERSION` + `_RECO_TIEBREAK_BUMPS`) — surface
-     additions only.
-
-  C. 8-TIER VOCABULARY CONSTANTS. New module-level frozensets:
-       _RECO_8TIER_CANONICAL   — all 8 canonical tokens
-       _BULLISH_RECOS          — {STRONG_BUY, BUY, ACCUMULATE}
-       _BEARISH_RECOS          — {SELL, REDUCE, STRONG_SELL, AVOID}
-       _RECO_8TIER_NEW_TOKENS  — {ACCUMULATE, STRONG_SELL, AVOID}
-                                 (the three tokens that did NOT exist
-                                  before reco_normalize v8.0.0)
-     Plus `_RECO_TIEBREAK_BUMPS` — a small ±2.5 range of selector_score
-     bumps per recommendation tier (AVOID = -8.0 to keep AVOID rows
-     out of the Top10 unless directly requested via direct_symbols).
-     These are tiebreakers, NOT primary scores — the engine's
-     `overall_score` already incorporates the recommendation. The
-     bumps mostly matter when two rows have near-identical scores.
-
-  D. ROW_KEY_ALIASES EXTENDED with three new fields:
-       recommendation_priority_band  (P1..P5 urgency band from
-                                       data_engine_v2 v5.74.0+)
-       provider_rating               (raw provider rating, separate
-                                       from engine's recommendation)
-       scoring_recommendation_source (which scoring path emitted the
-                                       recommendation)
-     Each carries the camelCase + snake_case variants advisor_engine
-     v4.5.0 and insights_builder v8.0.0 already use, so payloads from
-     anywhere in the stack normalize cleanly.
-
-  E. PRIORITY-BAND HELPERS. New private helpers
-     `_normalize_priority_band(val)` -> "P1".."P5" or "" and
-     `_priority_band_rank(band)` -> int rank (P1=1 best, P5=5 worst,
-     ""=99 = unranked). Used by the sort key tiebreaker and by
-     `_passes_filters_with_reason` for the min_priority_band filter.
-
-  F. _collect_criteria_from_inputs EXTENDED with three v4.14.0 fields
-     (forward-compat for criteria_model v3.2.0):
-       exclude_avoid_recommendations  (bool, default false)
-       min_priority_band              (str, "P1".."P5"; default "")
-       reco_8tier_strict              (bool, default false; when true
-                                        rows with recommendation not in
-                                        the canonical 8 tiers are dropped
-                                        rather than treated as HOLD)
-     All three default to off so v3.1.0 callers see zero behaviour
-     change.
-
-  G. _passes_filters_with_reason NEW HARD FILTERS:
-       exclude_avoid_recommendations  -> drops rows where the row's
-         recommendation normalizes to AVOID. Also drops rows where the
-         recommendation field is non-empty and the case-folded value
-         matches AVOID even without normalization.
-       min_priority_band              -> drops rows whose priority band
-         is worse than the floor (e.g., min="P3" drops P4 / P5 / blank
-         when reco_8tier_strict=True; blank rows are kept when strict
-         is off). Lower number = better.
-       reco_8tier_strict              -> drops rows where the
-         recommendation is non-empty AND does not normalize to one of
-         the canonical 8 tiers (catches legacy/typo'd values).
-
-  H. _selector_score TIEBREAK BUMPS. Adds `_reco_tiebreak_bump()` to
-     the composite. AVOID gets -8.0 (effectively pushes AVOID rows out
-     of any normal Top10), STRONG_SELL -2.5, SELL -1.5, REDUCE -1.0,
-     HOLD 0.0, ACCUMULATE +1.0, BUY +1.5, STRONG_BUY +2.0. Bump
-     magnitudes are small relative to the existing overall_score
-     weight (0.35) so they only matter when scores are close.
-
-  I. SORT-KEY PRIORITY BAND TIEBREAKER. The composite sort key now
-     interleaves a `-_priority_band_rank()` term as the SECOND
-     tiebreaker (right after selector_score). With reverse=True this
-     means P1 > P2 > P3 > P4 > P5 > unranked, breaking selector-score
-     ties by urgency rather than by horizon ROI.
-
-  J. _canonical_selection_reason DISPLAY EXTENSION. When present, the
-     reason now shows:
-       - Priority Band (e.g., "Priority=P2")
-       - Provider Rating divergence (e.g., "Provider=BUY,
-         Engine=ACCUMULATE" — only when the two diverge)
-       - 8-tier new-token markers (e.g., a "[NEW v8: ACCUMULATE]"
-         badge on the moderate-bullish tier so operators can see when
-         a row's recommendation is one of the three tokens that did
-         NOT exist before reco_normalize v8.0.0).
-
-  K. RESULT META v8-TIER SURFACE. The `applied_v310_filters` block is
-     preserved verbatim. NEW parallel `applied_v8tier_filters` block
-     records which v4.14.0 filters fired and per-filter drop counts.
-     `data_quality_summary` extended with reco counts (avoid_count,
-     accumulate_count, strong_sell_count, reco_8tier_seen,
-     priority_band_seen). A new `reco_8tier_aware: true` capability
-     flag tells downstream consumers (insights_builder v8.0.0, the
-     advisor route layer) that this selector aligns with the v8.0.0
-     vocabulary.
+  - core.analysis.insights_builder     v8.2.0   (sibling consumer of the same
+                                                  8-tier vocabulary + Top Picks)
 
 ================================================================================
 Defaults & back-compat
 ================================================================================
-v4.14.0 is strictly additive at the runtime contract level:
-  - All new criteria fields default to OFF; existing v3.1.0 callers
-    see zero behaviour change.
-  - The reco tiebreak bumps DO take effect by default, but they are
-    small (±2.5 normal range, -8.0 for AVOID). The AVOID penalty is
-    deliberately large so AVOID rows naturally drop out of the Top10
-    without operators having to opt in to `exclude_avoid_recommendations`.
-  - ACCUMULATE is recognised as a Top10-eligible bullish tier
-    alongside BUY / STRONG_BUY.
-  - All v4.13.0 public APIs preserved verbatim.
+v4.15.0 is additive at the runtime contract level:
+  - The parser fix only ADDS rows that were previously being dropped; no row
+    that v4.14.0 surfaced is removed.
+  - The limit-fill backfill only engages when the passing pool is short of
+    `limit`; with default/empty criteria nothing is filtered, so the backfill
+    is a no-op and the natural Top-N stands.
+  - All v4.14.0 public APIs preserved verbatim.
 
 ================================================================================
 History (preserved)
 ================================================================================
-[v4.13.0 / v4.12.0 / v4.11.0 / v4.10.0 / v4.9.0 / v4.8.0 changelog
-history preserved verbatim in user source; trimmed in this on-disk
-baseline for editing efficiency.]
+[v4.14.0 8-tier vocabulary / priority-band routing / cascade-bridge, and
+v4.13.0 / v4.12.0 / earlier changelog history preserved verbatim in prior
+source; trimmed in this baseline for editing efficiency per this file's
+established header convention.]
 """
 
 from __future__ import annotations
@@ -226,11 +120,11 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.14.0"
+TOP10_SELECTOR_VERSION = "4.15.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
-# schema_registry v2.11.0, scoring v5.7.0, reco_normalize v8.0.0,
-# insights_builder v8.0.0, scoring_engine v3.6.0, criteria_model v3.1.1,
-# advisor_engine v4.5.0, data_engine_v2 v5.76.0, schemas v7.0.0).
+# schema_registry v2.14.0, scoring v5.7.4, reco_normalize v8.0.0,
+# insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
+# data_engine_v2 v5.83.2, schemas v7.0.0).
 __version__ = TOP10_SELECTOR_VERSION
 
 # v4.14.0 Phase B/K: capability marker for downstream consumers. Surfaced
@@ -460,6 +354,16 @@ WRAPPER_KEYS = {
     "column_headers", "keys", "columns", "fields", "rows", "rows_matrix", "matrix", "row_objects", "records",
     "items", "item", "quotes", "quote", "data", "record", "result", "payload", "response", "output", "meta", "count", "version",
     "snapshot", "envelope", "content", "schema", "sheet_spec", "spec",
+    # v4.15.0 Phase B: pagination / envelope keys. data_engine_v2 v5.83.2's
+    # get_sheet_rows returns {rows, rows_display, rows_matrix, limit, offset,
+    # total}; without these in the denylist the `len(non_meta) >= 4`
+    # heuristic in _looks_like_row_dict misread the whole envelope as a
+    # single (symbol-less) row. Listed here as defense-in-depth alongside the
+    # Phase A structural wrapper guard.
+    "rows_display", "limit", "offset", "total", "page_size", "page_count",
+    "per_page", "next_offset", "has_more", "pagination",
+    "generated_at", "generated_at_utc", "generated_at_riyadh", "request_id",
+    "duration_ms", "route_owner", "ok",
 }
 
 _ENGINE_CACHE: Optional[Any] = None
@@ -520,19 +424,6 @@ _FORECAST_UNAVAIL_TAGS = (
 # =============================================================================
 # v4.14.0 — 8-tier recommendation vocabulary (Phase C)
 # =============================================================================
-# Canonical 8-tier vocabulary from reco_normalize v8.0.0 / scoring v5.7.0 /
-# schemas v7.0.0. ACCUMULATE (moderate-bullish / scale-in), STRONG_SELL
-# (re-canonical), and AVOID (genuinely uninvestable) are first-class tokens
-# — NOT collapsed to BUY / SELL. This module routes them as such.
-#
-# The frozensets are used by:
-#   - _selector_score        — tiebreak bump per tier (Phase H)
-#   - _passes_filters_*      — exclude_avoid_recommendations / reco_8tier_strict
-#                              (Phase G)
-#   - _canonical_selection_reason — NEW-token markers + provider divergence
-#                                    display (Phase J)
-#   - _build_top10_rows_async — data_quality_summary reco counts (Phase K)
-
 _RECO_8TIER_CANONICAL = frozenset({
     "STRONG_BUY", "BUY", "ACCUMULATE", "HOLD",
     "REDUCE", "SELL", "STRONG_SELL", "AVOID",
@@ -541,23 +432,8 @@ _RECO_8TIER_CANONICAL = frozenset({
 _BULLISH_RECOS = frozenset({"STRONG_BUY", "BUY", "ACCUMULATE"})
 _BEARISH_RECOS = frozenset({"REDUCE", "SELL", "STRONG_SELL", "AVOID"})
 
-# Three tokens that did NOT exist before reco_normalize v8.0.0. Used by
-# `_canonical_selection_reason` to badge them for operators (e.g.
-# "[NEW v8: ACCUMULATE]") and by the data-quality summary to count
-# 8-tier-specific token occurrences in the projected output.
 _RECO_8TIER_NEW_TOKENS = frozenset({"ACCUMULATE", "STRONG_SELL", "AVOID"})
 
-# v4.14.0 selector-score tiebreak bumps per recommendation tier. These are
-# TIEBREAKERS, not primary scores — the engine's `overall_score` (weighted
-# at 0.35 in `_selector_score`) already incorporates the recommendation.
-# A 10-point overall_score difference is 3.5 selector points; the bumps
-# here mostly matter when two rows have near-identical composite scores.
-#
-# AVOID gets -8.0 (much larger than the other bumps) so AVOID rows
-# naturally drop out of the Top10 without operators having to opt in to
-# `exclude_avoid_recommendations`. STRONG_BUY / STRONG_SELL get the
-# largest non-AVOID magnitudes so conviction-tier signals surface
-# correctly under tied composites.
 _RECO_TIEBREAK_BUMPS: Dict[str, float] = {
     "STRONG_BUY":   2.0,
     "BUY":          1.5,
@@ -569,11 +445,6 @@ _RECO_TIEBREAK_BUMPS: Dict[str, float] = {
     "AVOID":       -8.0,
 }
 
-# Lightweight recommendation alias map used by `_normalize_reco_token`.
-# Covers the most common upstream variants Claude sees on raw rows; the
-# heavy lifting still lives in reco_normalize v8.0.0 — this is a defensive
-# bridge for rows that have NOT been routed through it (e.g. legacy
-# snapshot cache, Top_10_Investments fallback, third-party hydration).
 _RECO_TOKEN_ALIASES: Dict[str, str] = {
     "STRONGBUY": "STRONG_BUY",
     "STRONG-BUY": "STRONG_BUY",
@@ -768,25 +639,9 @@ def _has_provider_error(row: Mapping[str, Any]) -> bool:
 # =============================================================================
 # v4.14.0 — 8-tier vocabulary helpers (Phase E)
 # =============================================================================
-# All five helpers are private (`_`-prefixed) and defensive: they tolerate
-# blank input, return safe defaults, and never raise on unexpected types.
-# They are used by:
-#   - _selector_score             — `_reco_tiebreak_bump`
-#   - _passes_filters_with_reason — `_normalize_reco_token`,
-#                                    `_normalize_priority_band`,
-#                                    `_priority_band_rank`,
-#                                    `_is_avoid_recommendation`
-#   - sort key in _build_top10_rows_async — `_normalize_priority_band`,
-#                                            `_priority_band_rank`
-#   - _canonical_selection_reason — `_normalize_reco_token`,
-#                                    `_normalize_priority_band`
 
 def _normalize_reco_token(val: Any) -> str:
-    """Resolve a raw recommendation value to a canonical 8-tier token, or
-    "" if the value cannot be matched. Defensive bridge for rows that have
-    NOT been routed through reco_normalize v8.0.0 — checks the canonical
-    set first, then a small alias map covering the most common upstream
-    variants. Returns UPPERCASE on success."""
+    """Resolve a raw recommendation value to a canonical 8-tier token, or ""."""
     s = _s(val).upper()
     if not s:
         return ""
@@ -795,8 +650,6 @@ def _normalize_reco_token(val: Any) -> str:
     aliased = _RECO_TOKEN_ALIASES.get(s)
     if aliased and aliased in _RECO_8TIER_CANONICAL:
         return aliased
-    # Defensive: strip non-alnum and retry against canonical (e.g.
-    # "STRONG-BUY" -> "STRONGBUY" via the alias map).
     compact = re.sub(r"[^A-Z]+", "", s)
     if compact:
         aliased = _RECO_TOKEN_ALIASES.get(compact)
@@ -808,30 +661,22 @@ def _normalize_reco_token(val: Any) -> str:
 
 
 def _normalize_priority_band(val: Any) -> str:
-    """Resolve a raw priority_band value to canonical "P1".."P5", or "" if
-    the value cannot be parsed. Accepts:
-      - canonical strings "P1".."P5" (any casing, leading/trailing space)
-      - bare integers / int-strings 1..5 (P1..P5 respectively)
-      - "BAND_1".."BAND_5" or "BAND 1".."BAND 5" defensive variants
-    Returns UPPERCASE on success."""
+    """Resolve a raw priority_band value to canonical "P1".."P5", or ""."""
     s = _s(val).upper().replace(" ", "").replace("-", "").replace("_", "")
     if not s:
         return ""
-    # Bare digits 1..5
     if s.isdigit():
         try:
             n = int(s)
         except Exception:
             return ""
         return f"P{n}" if 1 <= n <= 5 else ""
-    # "P1".."P5"
     if len(s) == 2 and s[0] == "P" and s[1].isdigit():
         try:
             n = int(s[1])
         except Exception:
             return ""
         return f"P{n}" if 1 <= n <= 5 else ""
-    # "BAND1".."BAND5"
     if s.startswith("BAND") and len(s) == 5 and s[4].isdigit():
         try:
             n = int(s[4])
@@ -842,10 +687,7 @@ def _normalize_priority_band(val: Any) -> str:
 
 
 def _priority_band_rank(band: Any) -> int:
-    """Numeric rank for a priority band. P1=1 (best / most urgent), P5=5
-    (worst), blank or unparseable = 99 (sorts after all real bands).
-    Used by the sort key (negated, so P1 sorts first under reverse=True)
-    and by the min_priority_band hard filter."""
+    """Numeric rank for a priority band. P1=1 (best), P5=5, blank=99."""
     canon = _normalize_priority_band(band)
     if not canon or len(canon) != 2 or canon[0] != "P":
         return 99
@@ -856,10 +698,7 @@ def _priority_band_rank(band: Any) -> int:
 
 
 def _reco_tiebreak_bump(row: Mapping[str, Any]) -> float:
-    """Selector-score tiebreak bump per 8-tier recommendation tier. See
-    `_RECO_TIEBREAK_BUMPS` for the canonical magnitudes. Returns 0.0 when
-    the row's recommendation cannot be normalized to a canonical tier
-    (treated as HOLD)."""
+    """Selector-score tiebreak bump per 8-tier recommendation tier."""
     token = _normalize_reco_token(row.get("recommendation"))
     if not token:
         return 0.0
@@ -867,8 +706,7 @@ def _reco_tiebreak_bump(row: Mapping[str, Any]) -> float:
 
 
 def _is_avoid_recommendation(row: Mapping[str, Any]) -> bool:
-    """True iff the row's recommendation normalizes to the canonical
-    AVOID token. Used by the `exclude_avoid_recommendations` hard filter."""
+    """True iff the row's recommendation normalizes to the canonical AVOID."""
     return _normalize_reco_token(row.get("recommendation")) == "AVOID"
 
 
@@ -1135,10 +973,29 @@ def _looks_like_row_dict(d: Any) -> bool:
     if not row:
         return False
     lookup = _row_lookup(row)
+    # Strong positive row signals win FIRST — a mapping that names a symbol /
+    # ticker / top10_rank / selection_reason is a data row even if it also
+    # happens to carry a stray list field.
     if any(token in lookup for token in ("symbol", "ticker", "requested_symbol", "code", "instrument")):
         return True
     if "top10rank" in lookup or "selectionreason" in lookup:
         return True
+    # v4.15.0 Phase A — WRAPPER GUARD. A mapping that carries a row-container
+    # LIST (rows / row_objects / records / items / results / quotes / data /
+    # rows_matrix / matrix / rows_display) is an envelope, NOT a single row.
+    # This stops data_engine_v2 v5.83.2's
+    # {rows, rows_display, rows_matrix, limit, offset, total} pagination
+    # envelope from being misclassified as one symbol-less row — the root
+    # cause of the v4.14.0 "5/8 not 10" bug, where `_extract_rows_like`
+    # returned `[envelope]` instead of descending into `rows`. The strong
+    # positive signals above run first, so a genuine symbol-bearing row is
+    # never reclassified by this guard.
+    for container in (
+        "rows", "row_objects", "records", "items", "results",
+        "quotes", "data", "rows_matrix", "matrix", "rows_display",
+    ):
+        if isinstance(row.get(container), list):
+            return False
     matched = 0
     for key in ("name", "current_price", "overall_score", "recommendation", "risk_score", "forecast_confidence"):
         for token in _canonical_key_variants(key):
@@ -1786,8 +1643,6 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         "exclude_engine_dropped_valuation",
         "exclude_forecast_unavailable",
         "exclude_provider_errors",
-        # v4.14.0 Phase F: criteria_model v3.2.0 forward-compat fields.
-        # All three default to off so v3.1.0 callers see zero change.
         "exclude_avoid_recommendations",
         "min_priority_band",
         "reco_8tier_strict",
@@ -1875,14 +1730,9 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         normalized.get("exclude_provider_errors"), False
     )
 
-    # v4.14.0 Phase F: criteria_model v3.2.0 forward-compat fields.
-    # Normalized here so downstream filter / sort code can rely on
-    # consistent shapes regardless of how the caller spelled them.
     normalized["exclude_avoid_recommendations"] = _coerce_bool(
         normalized.get("exclude_avoid_recommendations"), False
     )
-    # min_priority_band -> canonical "P1".."P5" or "" (the floor; rows
-    # whose band ranks WORSE than this are dropped — see Phase G).
     mpb_canon = _normalize_priority_band(normalized.get("min_priority_band"))
     normalized["min_priority_band"] = mpb_canon
     normalized["reco_8tier_strict"] = _coerce_bool(
@@ -2115,26 +1965,10 @@ def _passes_filters_with_reason(
     # -------------------------------------------------------------------------
     # v4.14.0 Phase G — criteria_model v3.2.0 forward-compat HARD FILTERS
     # -------------------------------------------------------------------------
-    # All three filters default to off; honoured only when explicitly set
-    # by the operator. They are evaluated AFTER the v3.1.0 filters so the
-    # drop_counts meta block reflects the natural order of constraints.
-
-    # 1. exclude_avoid_recommendations (bool) — drops rows where the row's
-    #    recommendation normalizes to AVOID. Note that AVOID rows also
-    #    receive a -8.0 selector_score bump (see Phase H in _selector_score),
-    #    so they typically drop out of Top10 even without this flag. This
-    #    filter is the HARD-exclusion path for operators who want a
-    #    cleaner audit trail.
     if _coerce_bool(criteria.get("exclude_avoid_recommendations"), False):
         if _is_avoid_recommendation(row):
             return False, "exclude_avoid_recommendations"
 
-    # 2. min_priority_band (str, "P1".."P5") — drops rows whose
-    #    priority_band ranks WORSE than the floor. P1 is best (most
-    #    urgent); P5 is worst. Blank / unparseable bands rank as 99 so
-    #    they are dropped under any non-empty floor when reco_8tier_strict
-    #    is on, and kept when strict is off (the legacy "can't determine
-    #    -> keep" contract).
     mpb_floor_canon = _normalize_priority_band(criteria.get("min_priority_band"))
     if mpb_floor_canon:
         floor_rank = _priority_band_rank(mpb_floor_canon)
@@ -2143,16 +1977,8 @@ def _passes_filters_with_reason(
             if _priority_band_rank(row_band_canon) > floor_rank:
                 return False, "min_priority_band"
         elif _coerce_bool(criteria.get("reco_8tier_strict"), False):
-            # Strict mode: a row with no priority band fails the floor.
             return False, "min_priority_band"
-        # Otherwise: blank band kept (matches legacy contract).
 
-    # 3. reco_8tier_strict (bool) — drops rows where the recommendation
-    #    is non-empty AND does not normalize to one of the canonical 8
-    #    tiers. Catches legacy / typo'd / vendor-specific tokens that
-    #    have not been routed through reco_normalize v8.0.0. Blank
-    #    recommendations are NOT dropped under this flag — they only
-    #    become a problem when paired with min_priority_band above.
     if _coerce_bool(criteria.get("reco_8tier_strict"), False):
         raw_reco = _s(row.get("recommendation"))
         if raw_reco and not _normalize_reco_token(raw_reco):
@@ -2228,20 +2054,7 @@ def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> floa
     elif candle_signal == "BEARISH" and candle_conf is not None:
         score -= min(candle_conf, 100.0) * 0.02
 
-    # -------------------------------------------------------------------------
     # v4.14.0 Phase H — 8-tier recommendation tiebreak bump.
-    # -------------------------------------------------------------------------
-    # Small ±2.5-range bump per recommendation tier (AVOID is the
-    # exception at -8.0). See `_RECO_TIEBREAK_BUMPS` for the canonical
-    # magnitudes. These are TIEBREAKERS — the engine's `overall_score`
-    # (weighted at 0.35 above) already incorporates the recommendation.
-    # The bumps mostly matter when two rows have near-identical scores.
-    #
-    # AVOID's -8.0 magnitude is deliberately large so AVOID rows naturally
-    # drop out of the Top10 without operators having to opt in to
-    # `exclude_avoid_recommendations`. ACCUMULATE / STRONG_SELL get
-    # symmetric ±1.0 / ±2.5 bumps so the v8.0.0 new-token signal lands
-    # correctly under tied composites.
     score += _reco_tiebreak_bump(row)
 
     tags = _parse_warnings_tags(row)
@@ -2842,6 +2655,59 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 if len(top_rows) >= limit:
                     break
 
+        # ---------------------------------------------------------------------
+        # v4.15.0 Phase C — LIMIT-FILL BACKFILL.
+        # ---------------------------------------------------------------------
+        # With the parser fix (Phase A) the candidate universe is normally
+        # large enough that the passing pool already supplies `limit` rows.
+        # But when operator criteria trim the passing pool below `limit`, the
+        # v4.14.0 code returned short (the only top-up was direct symbols).
+        # Here we top up to `limit` from the best-scoring REMAINING candidates
+        # (investable/passing rows are already in `top_rows`, ranked first).
+        # Backfill rows that fail the active criteria are flagged in
+        # `selection_reason` and counted in meta as `backfilled_count` /
+        # `backfill_symbols`, so the gate intent stays visible and auditable.
+        # The flag is pre-set here so `_rank_and_project_rows` (which only
+        # fills a BLANK selection_reason) preserves it.
+        backfill_symbols: List[str] = []
+        if len(top_rows) < limit:
+            seen_symbols = {
+                _normalize_symbol(r.get("symbol") or r.get("ticker"))
+                for r in top_rows
+                if _normalize_symbol(r.get("symbol") or r.get("ticker"))
+            }
+            remainder: List[Tuple[float, Dict[str, Any]]] = []
+            for cand in normalized_candidates:
+                sym = _normalize_symbol(cand.get("symbol") or cand.get("ticker"))
+                if not sym or sym in seen_symbols:
+                    continue
+                remainder.append((_selector_score(cand, criteria), dict(cand)))
+            remainder.sort(
+                key=lambda x: (
+                    x[0],
+                    -_priority_band_rank(x[1].get("recommendation_priority_band")),
+                    _choose_horizon_roi(x[1], horizon_days) or 0.0,
+                    _safe_float(x[1].get("opportunity_score"), 0.0) or 0.0,
+                    _safe_float(x[1].get("overall_score"), 0.0) or 0.0,
+                    _row_richness(x[1]),
+                ),
+                reverse=True,
+            )
+            for _bscore, cand in remainder:
+                sym = _normalize_symbol(cand.get("symbol") or cand.get("ticker"))
+                if not sym or sym in seen_symbols:
+                    continue
+                passed_bf, reason_bf = _passes_filters_with_reason(cand, criteria)
+                if not passed_bf:
+                    existing_reason = _s(cand.get("selection_reason"))
+                    tag = "[BACKFILL: below criteria" + (f" — {reason_bf}" if reason_bf else "") + "]"
+                    cand["selection_reason"] = (existing_reason + " " + tag).strip() if existing_reason else tag
+                    backfill_symbols.append(sym)
+                top_rows.append(cand)
+                seen_symbols.add(sym)
+                if len(top_rows) >= limit:
+                    break
+
         projected_rows = _rank_and_project_rows(top_rows[:limit], keys, criteria)
 
         dq_engine_drop = 0
@@ -2885,6 +2751,9 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "filtered_count": len(filtered),
             "selected_count": len(projected_rows),
             "filter_relaxed": filter_relaxed,
+            # v4.15.0 Phase C — limit-fill backfill audit.
+            "backfilled_count": len(backfill_symbols),
+            "backfill_symbols": list(backfill_symbols),
             "selected_symbols": [_s(r.get("symbol")) for r in projected_rows if _s(r.get("symbol"))],
             "selected_direct_symbols": [
                 _s(r.get("symbol"))
