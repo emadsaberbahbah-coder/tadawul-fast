@@ -2,6 +2,27 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
+Advanced Analysis Root Owner — v4.5.0  (SPECIAL-PAGE BUILDER DISPATCH — BRIDGE-FIX)
+================================================================================
+v4.5.0 [BRIDGE-FIX]: Top_10_Investments and Insights_Analysis now dispatch to
+their REAL builders on the happy path — mirroring the v4.4.0 Data_Dictionary
+pattern. Root cause of the "Top_10 shows the engine's 1 placeholder row /
+Insights shows the local fallback" symptom: the live engine.get_sheet_rows
+returns only a 1-row envelope for these DERIVED pages, which was non-empty and
+therefore pre-empted the real builders — so core.analysis.top10_selector
+(v4.15.0) and core.analysis.insights_builder (v8.2.0) were never invoked by the
+live route. v4.5.0 binds both builders at import (fail-soft, exactly like
+_build_dd_payload) and calls them BEFORE the generic engine path:
+  - Top_10_Investments  -> build_top10_rows(...)            -> dispatch=top10_selector_real
+  - Insights_Analysis   -> build_insights_analysis_rows(...) -> dispatch=insights_builder_real
+Both are awaited via _maybe_await (build_top10_rows returns a coroutine inside
+the running event loop — the exact bug that left it un-awaited), normalized
+through _normalize_external_payload, and used only when they yield usable rows;
+any unbound/empty/raising builder falls through to the engine path and then to
+the existing non-empty fallback, so this can ONLY help, never regress. Data_
+Dictionary is unchanged. Insights' happy path additionally requires
+insights_builder v8.2.0 to be deployed; until then it falls through fail-soft.
+================================================================================
 Advanced Analysis Root Owner — v4.4.0  (DATA_DICTIONARY CONTENT ROWS — DD-FIX)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
@@ -186,7 +207,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 # v4.3.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.4.0"
+ADVANCED_ANALYSIS_VERSION = "4.5.0"
 
 
 # =============================================================================
@@ -330,6 +351,59 @@ except Exception as _dd_err:
         "[advanced_analysis v%s] core.sheets.data_dictionary unavailable (%s); "
         "Data_Dictionary will use degraded self-description fallback",
         ADVANCED_ANALYSIS_VERSION, _dd_err,
+    )
+
+
+# =============================================================================
+# v4.5.0 [BRIDGE-FIX] Real Top_10 / Insights builder bindings.  (NEW in v4.5.0)
+#
+# These two pages are DERIVED (not direct instrument scans): the live engine's
+# get_sheet_rows returns only a 1-row envelope for them, which previously
+# pre-empted the real builders on the happy path. Binding the real builders
+# here (once, at import) lets _run_advanced_sheet_rows_impl dispatch to them
+# BEFORE the generic engine call — exactly the precedence Data_Dictionary
+# already enjoys via _build_dd_payload.
+#
+#   _build_top10_rows : core.analysis.top10_selector.build_top10_rows (v4.15.0)
+#       Returns the canonical Top_10 envelope ({rows, row_objects, headers,
+#       keys, meta, ...}). NOTE: inside a running event loop it returns a
+#       COROUTINE (its sync/async shim), so callers MUST _maybe_await it — the
+#       exact bug that left the live route serving the engine's 1 root row.
+#   _build_insights_rows : core.analysis.insights_builder.build_insights_analysis_rows
+#       (v8.2.0). Async; keyword-only. Returns the Insights_Analysis envelope.
+#
+# Fail-soft: if either import fails the binding stays None and that page falls
+# through to the engine path and then the existing non-empty fallback (no
+# regression vs v4.4.0).
+# =============================================================================
+_build_top10_rows = None  # type: ignore[assignment]
+try:
+    from core.analysis.top10_selector import build_top10_rows as _build_top10_rows  # type: ignore
+    logger.info(
+        "[advanced_analysis v%s] real Top_10 builder bound (core.analysis.top10_selector.build_top10_rows)",
+        ADVANCED_ANALYSIS_VERSION,
+    )
+except Exception as _t10_err:
+    _build_top10_rows = None  # type: ignore
+    logger.info(
+        "[advanced_analysis v%s] core.analysis.top10_selector unavailable (%s); "
+        "Top_10_Investments will use engine/fallback path",
+        ADVANCED_ANALYSIS_VERSION, _t10_err,
+    )
+
+_build_insights_rows = None  # type: ignore[assignment]
+try:
+    from core.analysis.insights_builder import build_insights_analysis_rows as _build_insights_rows  # type: ignore
+    logger.info(
+        "[advanced_analysis v%s] real Insights builder bound (core.analysis.insights_builder.build_insights_analysis_rows)",
+        ADVANCED_ANALYSIS_VERSION,
+    )
+except Exception as _ins_err:
+    _build_insights_rows = None  # type: ignore
+    logger.info(
+        "[advanced_analysis v%s] core.analysis.insights_builder unavailable (%s); "
+        "Insights_Analysis will use engine/fallback path",
+        ADVANCED_ANALYSIS_VERSION, _ins_err,
     )
 
 
@@ -1688,6 +1762,72 @@ def _normalize_external_payload(
         lifted_warnings=lifted or None,
     )
 
+async def _build_special_page_payload(
+    *,
+    page: str,
+    merged_body: Mapping[str, Any],
+    mode: str,
+    limit: int,
+    offset: int,
+    top_n: int,
+    requested_symbols: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    """v4.5.0 [BRIDGE-FIX]: invoke the REAL builder for a derived special page.
+
+    Returns the builder's raw envelope dict (to be projected by
+    `_normalize_external_payload`), or None when the page is not a
+    builder-backed special page, the builder is unbound, it raises, or it
+    yields nothing. NEVER raises — every failure degrades to None so the caller
+    falls through to the engine path and then the existing fallback.
+
+    Top_10: `build_top10_rows` returns a coroutine inside the running loop, so
+    we `_maybe_await` it (the un-awaited-coroutine bug fixed here). We pass
+    `symbols` only when the request explicitly supplied them, so a bare Top_10
+    request performs the full-universe selection rather than being constrained.
+
+    Insights: `build_insights_analysis_rows` is async + keyword-only; we hand it
+    the resolved v2 engine when available (it is engine-optional and will
+    self-resolve its universe otherwise).
+    """
+    try:
+        if page == _TOP10_PAGE and _build_top10_rows is not None:
+            kwargs: Dict[str, Any] = {"limit": max(top_n, limit), "mode": mode or ""}
+            syms = [s for s in (requested_symbols or []) if s]
+            if syms:
+                kwargs["symbols"] = list(syms)
+                kwargs["direct_symbols"] = list(syms)
+            res = _build_top10_rows(**kwargs)
+            res = await _maybe_await(res)
+            if isinstance(res, dict) and _extract_rows_like(res):
+                return res
+            return None
+
+        if page == _INSIGHTS_PAGE and _build_insights_rows is not None:
+            engine = None
+            try:
+                engine = await _get_v2_engine_instance()
+            except Exception:
+                engine = None
+            syms = [s for s in (requested_symbols or []) if s]
+            res = await _build_insights_rows(
+                engine=engine,
+                symbols=(list(syms) or None),
+                mode=mode or "",
+            )
+            if isinstance(res, dict) and _extract_rows_like(res):
+                return res
+            return None
+    except Exception as e:
+        logger.warning(
+            "[advanced_analysis v%s] special-page builder for %s failed (%s: %s); "
+            "falling through to engine/fallback path",
+            ADVANCED_ANALYSIS_VERSION, page, e.__class__.__name__, e,
+        )
+        return None
+
+    return None
+
+
 async def _run_advanced_sheet_rows_impl(
     request: Request,
     body: Dict[str, Any],
@@ -1740,6 +1880,38 @@ async def _run_advanced_sheet_rows_impl(
     # Forwarded into both success and fail-soft envelopes so every response
     # carries the engine's current view of provider health at request time.
     provider_health = await _extract_provider_health_snapshot()
+
+    # v4.5.0 [BRIDGE-FIX]: dispatch derived special pages to their REAL builders
+    # FIRST (mirrors the v4.4.0 Data_Dictionary precedence). The live engine
+    # returns only a 1-row envelope for Top_10 / Insights, which is non-empty
+    # and would otherwise pre-empt the real multi-row builder result. Fail-soft:
+    # a None return (unbound / empty / raised) falls straight through to the
+    # engine path below, then to the existing non-empty fallback.
+    if page in (_TOP10_PAGE, _INSIGHTS_PAGE):
+        special_payload = await _build_special_page_payload(
+            page=page, merged_body=merged_body, mode=mode or "",
+            limit=limit, offset=offset, top_n=top_n,
+            requested_symbols=requested_symbols,
+        )
+        if isinstance(special_payload, dict):
+            special_dispatch = "top10_selector_real" if page == _TOP10_PAGE else "insights_builder_real"
+            special_source = (
+                "core.analysis.top10_selector.build_top10_rows"
+                if page == _TOP10_PAGE
+                else "core.analysis.insights_builder.build_insights_analysis_rows"
+            )
+            normalized_special = _normalize_external_payload(
+                external_payload=special_payload, page=page, headers=headers, keys=keys,
+                include_matrix=include_matrix, request_id=request_id, started_at=start,
+                mode=mode, limit=limit, offset=offset, top_n=top_n,
+                requested_symbols=requested_symbols,
+                meta_extra={"schema_source": schema_source,
+                            "source": special_source,
+                            "dispatch": special_dispatch},
+                provider_health=provider_health,
+            )
+            if _extract_rows_like(normalized_special):
+                return normalized_special
 
     payload, source = await _call_core_sheet_rows_best_effort(
         page=page, limit=max(limit + offset, top_n), offset=0,
