@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.80.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.83.2
 ================================================================================
 
 WHY v5.80.0 - PORTFOLIO & INSIGHTS DECISION LAYER
@@ -1397,12 +1397,141 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.80.0"
+__version__ = "5.83.2"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
 _SCORING_CONTRACT_VERSION: str = "5.7.0"
 _RECO_NORMALIZE_CONTRACT_VERSION: str = "8.0.0"
+
+# =============================================================================
+# v5.83.0 — TOP_10 FULL-UNIVERSE COVERAGE (Fix Y) + INSIGHTS GOVERNANCE (Fix Z)
+#           + DATA_DICTIONARY METADATA (Fix AA)
+# -----------------------------------------------------------------------------
+# Targeted hotfix from the external audit. Still NO schema change (115/115),
+# still env-reversible. Addresses the three real engine findings.
+#
+#   Fix Y — TOP_10 FULL-UNIVERSE COVERAGE (P0).
+#     _build_top10_rows_fallback scanned only get_page_rows(page, limit=200), so
+#     in a large book (Global_Markets 1931) it saw just the first 200 symbols and
+#     missed qualified names -- the cause of Top_10 returning far fewer than 10.
+#     The bug bites harder now that the conservative gate (Fix T/V) scatters the
+#     ~41 INVESTABLE names across the whole universe. The scan limit is now
+#     TFB_TOP10_SCAN_LIMIT (default 3000, covers the current universe), so the
+#     fallback considers the full eligible set before filtering + ranking.
+#
+#   Fix Z — INSIGHTS FULL-UNIVERSE + GOVERNANCE (P1).
+#     _build_insights_rows sampled limit=300 per page (counts not full-universe).
+#     Now TFB_INSIGHTS_SCAN_LIMIT (default 2000) + a new Governance section:
+#     INVESTABLE/WATCHLIST/BLOCKED counts per market page, the Top_10 qualified
+#     pool (total INVESTABLE), rows-with-warnings, and price coverage -- the
+#     executive control rows the audit asked for.
+#
+#   Fix AA — DATA_DICTIONARY METADATA (P1).
+#     _build_data_dictionary_rows emitted dtype="auto"/fmt=""/required=True for
+#     every column. Now dtype/fmt are inferred from canonical key/header
+#     semantics, required is keyed off _INSTRUMENT_CANONICAL_REQUIRED_KEYS
+#     (+ TOP10_REQUIRED_FIELDS), and notes carry a governance hint. Dedicated
+#     owner/validation columns would need a wider Data_Dictionary schema -- out
+#     of scope here to preserve the column contracts.
+#
+#   VALIDATE: deploy -> __version__ 5.83.0, banner + health both v5.83.0. Rebuild
+#   Top_10: it now ranks the full INVESTABLE pool (returns 10, or states the pool
+#   is smaller via the Insights "Top_10 Qualified Pool" row). Insights shows the
+#   Governance section. Data_Dictionary shows real dtypes/formats/required flags.
+# =============================================================================
+# v5.82.0 — MARKET-REGIME TILT (Fix V) + IPO/THIN-HISTORY CAUTION (Fix W)
+#           + NEWS-VETO COVERAGE (Fix X)
+# -----------------------------------------------------------------------------
+# Builds on v5.81.0. Still NO schema change (115/115), still demote-only, still
+# env-reversible. Re-audit of v5.81.0 also closed a real coverage gap (Fix X).
+#
+#   Fix V — MARKET-REGIME TILT (default 'neutral' = exactly v5.81.0).
+#     An OPERATOR macro stance, NOT a fabricated market feed: the engine reads
+#     no index/breadth/VIX signal, so the "I expect the market to decline" view
+#     is expressed by setting TFB_MARKET_REGIME=bear. In bear the whole
+#     conservative gate tightens at once -- score floor 68->72
+#     (TFB_REGIME_BEAR_SCORE_DELTA), risk cap 45->40 (TFB_REGIME_BEAR_RISK_DELTA),
+#     and the news-veto sentiment floor -0.15->-0.05 (TFB_REGIME_BEAR_NEWS_DELTA,
+#     so even mildly negative coverage vetoes). 'bull' can loosen the floor
+#     (TFB_REGIME_BULL_SCORE_DELTA, default 0 -> no loosening unless you opt in).
+#     This is the lever for the "AI-IPO / broad-market pullback" worry: one env
+#     var makes the entire book defensive.
+#
+#   Fix W — IPO / THIN-HISTORY CAUTION (default ON).
+#     A newly-listed / IPO name has no usable 52-week range, so its trend,
+#     drawdown and trading band are unknowable. The engine carries no
+#     listing-date field, so "no 52W range" is the honest PROXY for "new/IPO or
+#     data-thin." Inside _apply_investability_gate (after Fix T, before the
+#     column writes) an otherwise-INVESTABLE row with missing/non-positive 52W
+#     bounds is benched to WATCHLIST/WATCH "Thin trading history (no 52W range)
+#     -- treat as new/IPO listing." Demote-only; an established name with a valid
+#     range is untouched. Reversible: TFB_THIN_HISTORY_GUARD=0.
+#     SCOPE NOTE (honest): this governs TRADEABLE tickers in the universe. A
+#     still-PRIVATE pre-IPO company (e.g. X / xAI) has no ticker, quote or
+#     forecast and is not in the universe -- the engine cannot evaluate it. Once
+#     such a name is public and in the universe it gets the full conservative +
+#     news + thin-history treatment.
+#
+#   Fix X — NEWS-VETO COVERAGE (audit fix).
+#     v5.81.0 ran the news veto only inside get_sheet_rows. get_page_rows (a
+#     route-fallback path that also feeds the Top_10 selector) ran the gate but
+#     NOT the veto, so a news-vetoed name could resurface there / rank into
+#     Top_10. The veto now also runs at the end of get_page_rows -> every
+#     INVESTABLE-serving path is consistent. (Conservative floor/Fix T was always
+#     universal -- it lives in the gate itself.)
+#
+#   VALIDATE: deploy -> __version__ 5.82.0. Default (neutral, news off): same as
+#   v5.81.0 plus any thin-history benches. Set TFB_MARKET_REGIME=bear -> INVESTABLE
+#   shrinks further (floor 72 / risk 40); demoted rows read "Conservative gate:
+#   overall NN < 72". Rollback the whole release: TFB_MARKET_REGIME=neutral +
+#   TFB_THIN_HISTORY_GUARD=0 + TFB_CONSERVATIVE_GATE=0 -> byte-identical to v5.80.0.
+# =============================================================================
+# v5.81.0 — CONSERVATIVE INVESTABLE FLOOR (Fix T) + NEWS VETO (Fix U)
+# -----------------------------------------------------------------------------
+# Two engine-only governance refinements that make the INVESTABLE book LEANER
+# and let market NEWS confirm/veto the final buy list. NO schema change (still
+# 115/115), both ride the EXISTING investability_status / final_action /
+# block_reason / warnings columns, both ONLY demote (never promote), both fully
+# env-reversible.
+#
+#   Fix T (default ON): a base-INVESTABLE/INVEST row must ALSO clear
+#     overall_score >= floor (68) AND risk_score <= cap (45), else it is benched
+#     to WATCHLIST/WATCH with block_reason "Conservative gate: ...". Runs inside
+#     _apply_investability_gate, AFTER the Fix P strict tier, BEFORE the column
+#     writes. risk_score absent -> only the score floor binds (fail-open on risk).
+#     Net at defaults: Global_Markets INVESTABLE ~415 -> ~41. Env:
+#     TFB_CONSERVATIVE_GATE (default ON; 0/false/off restores v5.80.0 exactly),
+#     TFB_CONSERVATIVE_GATE_SCORE_FLOOR (68.0), TFB_CONSERVATIVE_GATE_RISK_CAP (45.0).
+#
+#   Fix U (default OFF; network, opt-in): get_sheet_rows runs _apply_news_veto on
+#     the projected rows AFTER ranking. It collects ONLY the INVESTABLE candidates
+#     (~41 after Fix T -- never the full universe), fetches multi-source sentiment
+#     via core.news_intelligence.batch_news_intelligence, and DEMOTES any whose
+#     coverage is materially negative (sentiment < floor AND articles >= min) to
+#     WATCHLIST/WATCH -- appending "Negative news (sentiment X.XX, N articles)" to
+#     block_reason and tagging warnings 'news_veto_demoted'. Negative news vetoes;
+#     positive/neutral only confirms. Import-safe and fail-open: unavailable module
+#     or a failed fetch -> no-op, verdicts unchanged. Env: TFB_NEWS_VETO (default
+#     OFF; 1/true/on to enable), TFB_NEWS_VETO_SENTIMENT_FLOOR (-0.15),
+#     TFB_NEWS_VETO_MIN_ARTICLES (3).
+#
+#   WHY the gate layer (not scoring.py): the news fetch runs on ~41 post-gate
+#   candidates, not all 1931 rows, and the conservative direction stays strict
+#   (veto-only). scoring.py / scoring_engine.py / news_intelligence.py need NO
+#   change: the bridge auto-tracks scoring, the news engine is reused as-is via
+#   batch_news_intelligence, and the veto lives entirely here.
+# =============================================================================
+try:
+    from core.news_intelligence import batch_news_intelligence as _ni_batch_news
+    _NEWS_INTEL_AVAILABLE = True
+except Exception:  # pragma: no cover
+    try:
+        from news_intelligence import batch_news_intelligence as _ni_batch_news
+        _NEWS_INTEL_AVAILABLE = True
+    except Exception:
+        _ni_batch_news = None  # type: ignore
+        _NEWS_INTEL_AVAILABLE = False
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -2664,6 +2793,149 @@ def _reconcile_recommendation_family(row: Dict[str, Any]) -> None:
             row["position_size_hint"] = expected_psh
 
 
+# =============================================================================
+# v5.81.0 (Fix T / Fix U) + v5.82.0 (Fix V / Fix W): gate knobs
+# =============================================================================
+# Fix T conservative INVESTABLE floor.
+_CONSERVATIVE_GATE_SCORE_FLOOR_DEFAULT: float = 68.0
+_CONSERVATIVE_GATE_RISK_CAP_DEFAULT: float = 45.0
+# Fix U news veto. sentiment is the -1..1 score from core.news_intelligence.
+_NEWS_VETO_SENTIMENT_FLOOR_DEFAULT: float = -0.15
+_NEWS_VETO_MIN_ARTICLES_DEFAULT: int = 3
+# v5.82.0 (Fix V) market-regime tilt. This is an OPERATOR macro assumption
+# (TFB_MARKET_REGIME), NOT a fabricated market-data feed -- the engine does not
+# read an index/breadth/VIX signal. When you expect the market to decline you
+# set the regime to "bear" and the whole conservative gate tightens: the score
+# floor rises, the risk cap drops, and the news veto becomes stricter. Bull
+# loosens (by default 0pp -- stays conservative until you opt in). Deltas tunable.
+_REGIME_BEAR_SCORE_DELTA_DEFAULT: float = 4.0   # bear: floor 68 -> 72
+_REGIME_BEAR_RISK_DELTA_DEFAULT: float = 5.0    # bear: cap 45 -> 40
+_REGIME_BEAR_NEWS_DELTA_DEFAULT: float = 0.10   # bear: news floor -0.15 -> -0.05 (stricter)
+_REGIME_BULL_SCORE_DELTA_DEFAULT: float = 0.0   # bull: no loosening unless you set it
+
+
+def _conservative_gate_enabled() -> bool:
+    """v5.81.0 (Fix T): master switch for the conservative INVESTABLE floor
+    (default ON). Set TFB_CONSERVATIVE_GATE to 0/false/off to restore the exact
+    v5.80.0 INVESTABLE set."""
+    raw = (os.getenv("TFB_CONSERVATIVE_GATE") or "").strip().lower()
+    return raw not in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _market_regime() -> str:
+    """v5.82.0 (Fix V): operator macro stance from TFB_MARKET_REGIME -> one of
+    'bull' / 'neutral' / 'bear' (default 'neutral'). This is a deliberate human
+    assumption (e.g. "I expect a market decline"), not a measured signal."""
+    raw = (os.getenv("TFB_MARKET_REGIME") or "neutral").strip().lower()
+    if raw in {"bear", "bearish", "decline", "down", "risk_off", "defensive"}:
+        return "bear"
+    if raw in {"bull", "bullish", "up", "risk_on"}:
+        return "bull"
+    return "neutral"
+
+
+def _conservative_gate_score_floor() -> float:
+    """v5.81.0 (Fix T) + v5.82.0 (Fix V): minimum overall_score (0-100) to remain
+    INVESTABLE, tilted by market regime. Env TFB_CONSERVATIVE_GATE_SCORE_FLOOR;
+    bear adds TFB_REGIME_BEAR_SCORE_DELTA, bull subtracts TFB_REGIME_BULL_SCORE_DELTA."""
+    v = _get_env_float("TFB_CONSERVATIVE_GATE_SCORE_FLOOR", _CONSERVATIVE_GATE_SCORE_FLOOR_DEFAULT)
+    base = v if (v is not None and v > 0) else _CONSERVATIVE_GATE_SCORE_FLOOR_DEFAULT
+    reg = _market_regime()
+    if reg == "bear":
+        base += _get_env_float("TFB_REGIME_BEAR_SCORE_DELTA", _REGIME_BEAR_SCORE_DELTA_DEFAULT)
+    elif reg == "bull":
+        base -= _get_env_float("TFB_REGIME_BULL_SCORE_DELTA", _REGIME_BULL_SCORE_DELTA_DEFAULT)
+    return base
+
+
+def _conservative_gate_risk_cap() -> float:
+    """v5.81.0 (Fix T) + v5.82.0 (Fix V): maximum risk_score (0-100) to remain
+    INVESTABLE, tilted by market regime. Env TFB_CONSERVATIVE_GATE_RISK_CAP; bear
+    subtracts TFB_REGIME_BEAR_RISK_DELTA (a lower cap = stricter)."""
+    v = _get_env_float("TFB_CONSERVATIVE_GATE_RISK_CAP", _CONSERVATIVE_GATE_RISK_CAP_DEFAULT)
+    base = v if (v is not None and v > 0) else _CONSERVATIVE_GATE_RISK_CAP_DEFAULT
+    if _market_regime() == "bear":
+        base -= _get_env_float("TFB_REGIME_BEAR_RISK_DELTA", _REGIME_BEAR_RISK_DELTA_DEFAULT)
+    return base
+
+
+def _thin_history_guard_enabled() -> bool:
+    """v5.82.0 (Fix W): master switch for the IPO / thin-history caution
+    (default ON). Set TFB_THIN_HISTORY_GUARD to 0/false/off to disable."""
+    raw = (os.getenv("TFB_THIN_HISTORY_GUARD") or "").strip().lower()
+    return raw not in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _news_veto_enabled() -> bool:
+    """v5.81.0 (Fix U): master switch for the news veto (default OFF -- it makes
+    external news calls). Set TFB_NEWS_VETO=1/true/on to enable. Runs only on the
+    post-gate INVESTABLE candidates, never the full universe."""
+    raw = (os.getenv("TFB_NEWS_VETO") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "enabled", "enable"}
+
+
+def _news_veto_sentiment_floor() -> float:
+    """v5.81.0 (Fix U) + v5.82.0 (Fix V): sentiment (-1..1) at/below which negative
+    news demotes a candidate. Env TFB_NEWS_VETO_SENTIMENT_FLOOR; in a bear regime
+    TFB_REGIME_BEAR_NEWS_DELTA is ADDED (moves the floor toward 0 -> stricter, so
+    even mildly negative coverage vetoes)."""
+    base = _get_env_float("TFB_NEWS_VETO_SENTIMENT_FLOOR", _NEWS_VETO_SENTIMENT_FLOOR_DEFAULT)
+    if _market_regime() == "bear":
+        base += _get_env_float("TFB_REGIME_BEAR_NEWS_DELTA", _REGIME_BEAR_NEWS_DELTA_DEFAULT)
+    return base
+
+
+def _news_veto_min_articles() -> int:
+    """v5.81.0 (Fix U): minimum articles_analyzed before the veto will act, so a
+    single headline can't bench a name. Env TFB_NEWS_VETO_MIN_ARTICLES (default 3)."""
+    return _get_env_int("TFB_NEWS_VETO_MIN_ARTICLES", _NEWS_VETO_MIN_ARTICLES_DEFAULT)
+
+
+def _top10_scan_limit() -> int:
+    """v5.83.0 (Fix Y): rows per page the Top_10 fallback scans before filtering
+    + ranking. The old fixed limit=200 missed qualified names in large books
+    (e.g. Global_Markets 1931) -- the cause of Top_10 returning fewer than 10.
+    Default 3000 covers the current universe. Env TFB_TOP10_SCAN_LIMIT."""
+    v = _get_env_int("TFB_TOP10_SCAN_LIMIT", 3000)
+    return v if (v and v > 0) else 3000
+
+
+def _insights_scan_limit() -> int:
+    """v5.83.0 (Fix Z) + v5.83.2: rows per page the Insights builder scans so its
+    counts are full-universe-accurate (was a 300-row sample). Default raised to
+    3000 (matches the Top_10 scan) for headroom as the universe grows.
+    Env TFB_INSIGHTS_SCAN_LIMIT."""
+    v = _get_env_int("TFB_INSIGHTS_SCAN_LIMIT", 3000)
+    return v if (v and v > 0) else 3000
+
+
+def _dd_infer_dtype_fmt(key: str, header: str) -> Tuple[str, str]:
+    """v5.83.0 (Fix AA) + v5.83.1 (self-audit fix): infer a governance
+    (dtype, fmt) pair for a canonical column from its key/header semantics,
+    replacing the generic auto/blank. Heuristic, for the Data_Dictionary page
+    only -- never runtime coercion. Precedence: datetime -> bool -> percent ->
+    number -> string. Numeric/bool tokens are kept PRECISE so text columns are
+    not mis-typed: the v5.83.0 pass wrongly typed conflict_type (generic
+    'conflict'), the *_margin columns (missing token), and
+    recommendation_detailed / final_decision_basis / forecast_source (loose
+    ' de' / bare 'forecast'); all corrected here."""
+    k = (key or "").lower()
+    kh = (k + " " + (header or "")).lower()
+    if any(t in kh for t in ("timestamp", "datetime", "updated", "date", "time", "_at")):
+        return "datetime", "yyyy-mm-dd hh:mm"
+    if k.startswith("is_") or k.endswith("_flag") or k == "provider_engine_conflict":
+        return "bool", "TRUE/FALSE"
+    if any(t in kh for t in ("pct", "percent", "%", "roi", "yield", "weight", "drawdown", "margin")):
+        return "number", "0.0%"
+    if any(t in kh for t in ("score", "price", "ratio", "market_cap", "_cap", "volume", "sharpe",
+                             "beta", "rsi", "var_", "volatility", "eps", "fcf", "qty", "rank",
+                             "count", "articles", "sentiment", "week_52", "52w", "high", "low",
+                             "cost", "value", "revenue", "income", "target", "return", "growth",
+                             "price_change", "percent_change")):
+        return "number", "#,##0.00"
+    return "string", ""
+
+
 def _apply_investability_gate(row: Dict[str, Any]) -> None:
     """v5.78.0: compute the decision-readiness layer (8 canonical columns).
 
@@ -2864,6 +3136,43 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         if strict_fails:
             status, action = "WATCHLIST", "WATCH"
             reason = "Strict gate: " + "; ".join(strict_fails)
+
+    # -- v5.81.0 (Fix T): conservative INVESTABLE floor (default ON) -----------
+    # Only DEMOTES a base-INVESTABLE/INVEST row whose overall_score is below the
+    # floor (68) OR whose risk_score exceeds the cap (45). Never promotes/relaxes,
+    # adds NO column (schema 115). This is the lever that takes Global_Markets
+    # from ~21.5% INVESTABLE down to ~2% -- the conservative book asked for.
+    # Reversible: TFB_CONSERVATIVE_GATE=0 restores v5.80.0 exactly; tunable via
+    # TFB_CONSERVATIVE_GATE_SCORE_FLOOR / TFB_CONSERVATIVE_GATE_RISK_CAP.
+    # risk_score absent -> only the score floor binds (fail-open on risk).
+    if _conservative_gate_enabled() and status == "INVESTABLE" and action == "INVEST":
+        os_floor = _conservative_gate_score_floor()
+        risk_cap = _conservative_gate_risk_cap()
+        ov = _as_float(row.get("overall_score"))
+        rk = _as_float(row.get("risk_score"))
+        cons_fails: List[str] = []
+        if ov is None or ov < os_floor:
+            cons_fails.append("overall %.0f < %.0f" % (ov if ov is not None else 0.0, os_floor))
+        if rk is not None and rk > risk_cap:
+            cons_fails.append("risk %.0f > %.0f" % (rk, risk_cap))
+        if cons_fails:
+            status, action = "WATCHLIST", "WATCH"
+            reason = "Conservative gate: " + "; ".join(cons_fails)
+
+    # -- v5.82.0 (Fix W): IPO / thin-history caution (default ON) --------------
+    # A recently-listed / IPO name has no usable 52-week range yet, so the
+    # engine cannot judge its trend, drawdown or trading band. The engine carries
+    # no listing-date field, so "no 52W range" is the honest PROXY for "new/IPO
+    # listing or data-thin." Only DEMOTES an otherwise-INVESTABLE row whose 52W
+    # bounds are missing/non-positive -- it never blocks an established name that
+    # has a valid range, and composes after Fix T (won't fire if already demoted).
+    # Reversible: TFB_THIN_HISTORY_GUARD=0.
+    if _thin_history_guard_enabled() and status == "INVESTABLE" and action == "INVEST":
+        w_hi = _as_float(row.get("week_52_high"))
+        w_lo = _as_float(row.get("week_52_low"))
+        if not (w_hi is not None and w_lo is not None and w_hi > 0.0 and w_lo > 0.0):
+            status, action = "WATCHLIST", "WATCH"
+            reason = "Thin trading history (no 52W range) -- treat as new/IPO listing"
 
     row["data_quality_score"] = dq
     row["forecast_reliability_score"] = rel
@@ -8294,23 +8603,39 @@ class DataEngineV5:
     # Special-page builders
     # =========================================================================
     def _build_data_dictionary_rows(self) -> List[Dict[str, Any]]:
+        """v5.83.0 (Fix AA): real per-column governance metadata. dtype/fmt are
+        inferred from canonical key/header semantics (_dd_infer_dtype_fmt),
+        required is keyed off _INSTRUMENT_CANONICAL_REQUIRED_KEYS (+
+        TOP10_REQUIRED_FIELDS), and notes carry a governance hint -- replacing the
+        generic auto/blank/True placeholders. Dedicated owner/validation columns
+        would require widening the 9-column Data_Dictionary schema (out of scope
+        to preserve the column contracts)."""
         out: List[Dict[str, Any]] = []
+        top10_required = set(TOP10_REQUIRED_FIELDS)
         for sheet_name in _list_sheet_names_best_effort():
             try:
                 headers, keys = get_sheet_spec(sheet_name)
             except Exception:
                 continue
             for header, key in zip(headers, keys):
+                dtype, fmt = _dd_infer_dtype_fmt(key, header)
+                req = (key in _INSTRUMENT_CANONICAL_REQUIRED_KEYS) or (key in top10_required)
+                if fmt == "0.0%":
+                    note = "Percent/ratio (stored as fraction where applicable)"
+                elif req:
+                    note = "Required canonical field"
+                else:
+                    note = "Optional"
                 out.append({
                     "sheet": sheet_name,
                     "group": "Engine",
                     "header": header,
                     "key": key,
-                    "dtype": "auto",
-                    "fmt": "",
-                    "required": True,
+                    "dtype": dtype,
+                    "fmt": fmt,
+                    "required": bool(req),
                     "source": "engine_v2",
-                    "notes": "",
+                    "notes": note,
                 })
         return out
 
@@ -8346,7 +8671,7 @@ class DataEngineV5:
         page_data: Dict[str, List[Dict[str, Any]]] = {}
         for p in ["My_Portfolio"] + market_pages:
             try:
-                page_data[p] = await self.get_page_rows(p, limit=300)
+                page_data[p] = await self.get_page_rows(p, limit=_insights_scan_limit())
             except Exception as exc:
                 logger.debug("[engine_v2 v%s] insights fetch %s failed: %s", __version__, p, exc)
                 page_data[p] = []
@@ -8404,6 +8729,27 @@ class DataEngineV5:
             status = "PASS" if (n and npass == n) else ("PARTIAL" if npass else "FAIL")
             add("Data Quality", p, "rows >= 70 DQ", "%d/%d" % (npass, n), notes=status)
 
+        # ---- Governance (v5.83.0, Fix Z): decision-readiness control rows -----
+        # Full-universe (scan limit raised) counts the audit asked for: per-page
+        # INVESTABLE/WATCHLIST/BLOCKED, the Top_10 qualified pool, warnings, and
+        # price coverage. Cheap -- computed from page_data already fetched.
+        total_invest = 0
+        for p in market_pages:
+            prows = page_data.get(p, []) or []
+            n = len(prows)
+            inv = sum(1 for r in prows if isinstance(r, dict) and _safe_str(r.get("investability_status")).upper() == "INVESTABLE")
+            watch = sum(1 for r in prows if isinstance(r, dict) and _safe_str(r.get("investability_status")).upper() == "WATCHLIST")
+            blocked = sum(1 for r in prows if isinstance(r, dict) and _safe_str(r.get("investability_status")).upper() == "BLOCKED")
+            warned = sum(1 for r in prows if isinstance(r, dict) and _safe_str(r.get("warnings")).strip())
+            priced = sum(1 for r in prows if isinstance(r, dict) and (_as_float(r.get("current_price")) or 0.0) > 0.0)
+            total_invest += inv
+            add("Governance", p, "INVESTABLE / WATCHLIST / BLOCKED", "%d / %d / %d" % (inv, watch, blocked),
+                notes="%d/%d priced; %d warned" % (priced, n, warned))
+        add("Governance", "Top_10 Qualified Pool", "INVESTABLE across market pages", total_invest,
+            notes=("OK (>=10)" if total_invest >= 10 else "Fewer than 10 INVESTABLE this cycle"))
+        add("Governance", "Market Regime", "TFB_MARKET_REGIME", _market_regime(),
+            notes="bear tightens the gate; neutral = baseline")
+
         # ---- Coverage footer ----
         add("Coverage", "Engine Version", "version", __version__, notes="Live")
         add("Coverage", "Last Updated (UTC)", "timestamp", _now_utc_iso())
@@ -8426,7 +8772,7 @@ class DataEngineV5:
         seen: Set[str] = set()
         for page in pages:
             try:
-                page_rows = await self.get_page_rows(page, limit=200)
+                page_rows = await self.get_page_rows(page, limit=_top10_scan_limit())
             except Exception:
                 continue
             for row in page_rows:
@@ -8471,6 +8817,11 @@ class DataEngineV5:
         # actual_weight/weight_gap see the whole book.
         if canon == "My_Portfolio":
             _compute_portfolio_fields(rows)
+        # v5.82.0 (Fix X): get_page_rows is a route-fallback path AND feeds the
+        # Top_10 fallback selector; without this, a name the news veto would bench
+        # in get_sheet_rows could still surface here / rank into Top_10. Apply the
+        # same one-directional veto so every INVESTABLE-serving path is consistent.
+        await self._apply_news_veto(rows)
         return rows
 
     async def get_sheet(self, sheet: str, *, limit: int = 2000, offset: int = 0, **kwargs: Any) -> Dict[str, Any]:
@@ -8550,6 +8901,17 @@ class DataEngineV5:
             rows: List[Dict[str, Any]] = []
             if requested_symbols:
                 rows = await self.get_enriched_quotes(requested_symbols)
+                # v5.83.2 (Fix AB): gate the rows BEFORE the eligibility filter.
+                # get_enriched_quotes does NOT run the gate (it runs later in
+                # _strict_project_row), so without this _top10_row_is_eligible's
+                # INVESTABLE check was fail-open on this DIRECT path while the
+                # fallback path (via get_page_rows) enforced it -- an
+                # inconsistency the external audit caught. Reconcile + gate here
+                # (idempotent with the later projection) so the INVESTABLE
+                # requirement is actually applied on both Top_10 paths.
+                for _r in rows:
+                    _reconcile_recommendation_family(_r)
+                    _apply_investability_gate(_r)
                 # v5.77.23 (Fix J): same Top 10 eligibility filter as the
                 # fallback path (missing price / sell-family excluded).
                 rows = [r for r in rows if _top10_row_is_eligible(r)]
@@ -8565,6 +8927,7 @@ class DataEngineV5:
             rows = [_apply_page_row_backfill("Top_10_Investments", r) for r in rows]
             rows = [_strict_project_row(keys, r) for r in rows]
             _apply_rank_overall(rows)
+            await self._apply_news_veto(rows)
             return {
                 "rows": rows,
                 "rows_display": _rows_display_objects_from_rows(rows, headers, keys),
@@ -8657,6 +9020,7 @@ class DataEngineV5:
         if target_sheet == "My_Portfolio":
             _compute_portfolio_fields(rows)
         _apply_rank_overall(rows)
+        await self._apply_news_veto(rows)
 
         return {
             "rows": rows,
@@ -8720,7 +9084,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.80.0",  # v5.80.0 PORTFOLIO & INSIGHTS DECISION LAYER: My_Portfolio 115->122 (this page only; +Buy Date/Target Weight %/Actual Weight %/Weight Gap/Rebalance Action/Investor Decision/User Notes, mirroring the Top_10 115+3 pattern); _compute_portfolio_fields fills actual_weight/weight_gap (PERCENT POINTS) + action_flag (drift-only ADD/HOLD/REDUCE/SELL) + decision (blended SELL/REDUCE/ADD/HOLD from drift+reco+forecast-sign+risk), target_weight seeded from TFB_PORTFOLIO_TARGETS (1120=40/4013=30/7020=30) when blank, band TFB_PORTFOLIO_REBALANCE_BAND_PP=5.0pp, weak floor TFB_PORTFOLIO_WEAK_SCORE=60; Insights_Analysis rebuilt from live portfolio+market data (Portfolio Summary/Allocation vs Target/Market Opportunities/Data Quality) replacing the 2-row stub; Top_10 eligibility now also requires INVESTABLE and rejects negative-forecast buy-family (closing the Fix S/Fix J seam). Market pages stay 115. Pairs with 00_Config.gs v1.12.3. v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
+                "version": "v5.83.2",  # v5.80.0 PORTFOLIO & INSIGHTS DECISION LAYER: My_Portfolio 115->122 (this page only; +Buy Date/Target Weight %/Actual Weight %/Weight Gap/Rebalance Action/Investor Decision/User Notes, mirroring the Top_10 115+3 pattern); _compute_portfolio_fields fills actual_weight/weight_gap (PERCENT POINTS) + action_flag (drift-only ADD/HOLD/REDUCE/SELL) + decision (blended SELL/REDUCE/ADD/HOLD from drift+reco+forecast-sign+risk), target_weight seeded from TFB_PORTFOLIO_TARGETS (1120=40/4013=30/7020=30) when blank, band TFB_PORTFOLIO_REBALANCE_BAND_PP=5.0pp, weak floor TFB_PORTFOLIO_WEAK_SCORE=60; Insights_Analysis rebuilt from live portfolio+market data (Portfolio Summary/Allocation vs Target/Market Opportunities/Data Quality) replacing the 2-row stub; Top_10 eligibility now also requires INVESTABLE and rejects negative-forecast buy-family (closing the Fix S/Fix J seam). Market pages stay 115. Pairs with 00_Config.gs v1.12.3. v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
@@ -8747,6 +9111,88 @@ class DataEngineV5:
             "snapshot_symbols": len(self._symbol_snapshots),
             "version": __version__,
         }
+
+
+# =============================================================================
+# v5.81.0 (Fix U): news-veto methods, attached to DataEngineV5 below.
+# Defined at module level (then bound to the class) so the insertion needs no
+# in-class indentation surgery. self._apply_news_veto resolves to the bound
+# method at runtime, by which point this module is fully loaded.
+# =============================================================================
+async def _engine_fetch_news_sentiment_map(self, symbols, names=None):
+    """Batch news sentiment for the given symbols via
+    core.news_intelligence.batch_news_intelligence. Returns
+    {SYMBOL: (sentiment[-1..1], articles_analyzed)}. No-op (empty dict) when the
+    veto is off, the module is unavailable, or there are no symbols."""
+    if not (_news_veto_enabled() and _NEWS_INTEL_AVAILABLE and _ni_batch_news is not None and symbols):
+        return {}
+    names = names or {}
+    items = [{"symbol": s, "name": names.get(s, "")} for s in symbols if s]
+    if not items:
+        return {}
+    try:
+        result = await _ni_batch_news(items, include_articles=False)
+    except Exception as exc:  # pragma: no cover - network/runtime guard
+        logger.debug(
+            "[engine_v2 v%s] news veto fetch failed: %s: %s",
+            __version__, exc.__class__.__name__, exc,
+        )
+        return {}
+    out: Dict[str, Any] = {}
+    for it in (getattr(result, "items", None) or []):
+        if not isinstance(it, dict):
+            continue
+        sym = normalize_symbol(_safe_str(it.get("symbol")))
+        if not sym:
+            continue
+        out[sym] = (_as_float(it.get("sentiment")), _safe_int(it.get("articles_analyzed"), 0))
+    return out
+
+
+async def _engine_apply_news_veto(self, rows):
+    """v5.81.0 (Fix U): one-directional news veto. Runs ONLY on rows already
+    INVESTABLE (post Fix T, ~41), fetches their news sentiment, and DEMOTES any
+    whose coverage is materially negative (sentiment < floor AND articles >= min)
+    to WATCHLIST/WATCH -- appending the reason to block_reason and tagging
+    warnings 'news_veto_demoted'. Positive/neutral news only confirms (no
+    promotion). No-op when the veto is off. No schema change."""
+    if not _news_veto_enabled() or not rows or not _NEWS_INTEL_AVAILABLE:
+        return
+    cand = [
+        r for r in rows
+        if isinstance(r, dict) and _safe_str(r.get("investability_status")).upper() == "INVESTABLE"
+    ]
+    if not cand:
+        return
+    names: Dict[str, str] = {}
+    syms: List[str] = []
+    for r in cand:
+        s = normalize_symbol(_safe_str(r.get("symbol") or r.get("requested_symbol")))
+        if s:
+            syms.append(s)
+            names[s] = _safe_str(r.get("name"))
+    smap = await self._fetch_news_sentiment_map(syms, names)
+    if not smap:
+        return
+    floor = _news_veto_sentiment_floor()
+    min_art = _news_veto_min_articles()
+    for r in cand:
+        sym = normalize_symbol(_safe_str(r.get("symbol") or r.get("requested_symbol")))
+        entry = smap.get(sym)
+        if not entry:
+            continue
+        sent, cnt = entry
+        if sent is not None and cnt >= min_art and sent < floor:
+            r["investability_status"] = "WATCHLIST"
+            r["final_action"] = "WATCH"
+            prev = _safe_str(r.get("block_reason"))
+            note = "Negative news (sentiment %.2f, %d articles)" % (sent, cnt)
+            r["block_reason"] = (prev + "; " + note) if prev else note
+            _v573_append_warning(r, "news_veto_demoted")
+
+
+DataEngineV5._fetch_news_sentiment_map = _engine_fetch_news_sentiment_map
+DataEngineV5._apply_news_veto = _engine_apply_news_veto
 
 
 # =============================================================================
