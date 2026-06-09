@@ -2,7 +2,7 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.3.0  (STATIC FALLBACK ALIGNED TO 115-KEY GATE)
+Advanced Analysis Root Owner — v4.4.0  (DATA_DICTIONARY CONTENT ROWS — DD-FIX)
 ================================================================================
 ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • REGISTRY-DERIVED WIDTHS •
@@ -10,8 +10,62 @@ OWNER-ALIGNED • PROVIDER-HEALTH SURFACE • NO-HARDCODED-CLAMP • v5.79.2 GAT
 
 (The verbose pre-v4.3.0 cross-version changelog is condensed in this working
 copy; ALL code, the engine-binding cascade, the provider-health machinery, and
-every endpoint are preserved verbatim except where the v4.3.0 changelog below
-states otherwise.)
+every endpoint are preserved verbatim except where the v4.4.0 / v4.3.0 changelog
+below states otherwise.)
+
+WHY v4.4.0 — Data_Dictionary returned "200 success / 0 rows" (DD-FIX)
+---------------------------------------------------------------------
+
+Symptom: the Data_Dictionary page rendered as an empty sheet — the frontend
+received HTTP 200 with status "success" but zero content rows. Root cause was
+NOT data: it was routing. Two code paths feed Data_Dictionary, and the one the
+frontend hit served schema only.
+
+  - `/schema/data-dictionary` (endpoint `schema_data_dictionary`) called
+    `_schema_spec_payload(_DICTIONARY_PAGE)`, which returns ONLY the 9-column
+    schema (headers / keys / columns) and NEVER invokes any row builder. So it
+    returned exactly 0 rows BY DESIGN — matching the "exactly 0" symptom (the
+    `/sheet-rows` fail-soft path always emits >= 1 row, so exactly-0 pointed
+    here).
+  - The route's prior fail-soft `_build_dictionary_fallback_rows` produced a
+    DEGENERATE 9-row self-description (one row per the dictionary's OWN columns),
+    not the real per-column content across all sheets.
+
+The REAL Data_Dictionary content builder is
+`core.sheets.data_dictionary.build_data_dictionary_payload(format="rows")`
+(v3.2.0+). It is pure / import-safe — registry-only, no engine, no I/O, no
+network — and emits one row per schema column across every sheet, with keys
+already equal to this route's _DICTIONARY_KEYS
+(sheet, group, header, key, dtype, fmt, required, source, notes).
+
+v4.4.0 routes BOTH Data_Dictionary paths to that real builder, additively and
+fail-soft (works even when the engine has not reached the container, because
+the builder is pure):
+
+[DD-FIX (a)] Bind the real builder once at import:
+    `from core.sheets.data_dictionary import build_data_dictionary_payload as
+     _build_dd_payload` (fail-soft -> None on ImportError).
+[DD-FIX (b)] New helper `_real_data_dictionary_rows()` -> list[dict] from
+    `build_data_dictionary_payload(format="rows")` (reads row_objects, then
+    rows; fail-soft -> []).
+[DD-FIX (c)] `_build_dictionary_fallback_rows` now PREFERS the real rows
+    (normalized to the schema keys + sliced); the prior degenerate
+    self-description is kept ONLY as a last resort when the builder is
+    unavailable. This fixes `/sheet-rows?page=Data_Dictionary` (non-schema-only).
+[DD-FIX (d)] `schema_data_dictionary` now attaches the real content rows
+    (row_objects/items/records/data/quotes + rows/rows_matrix/matrix + count)
+    on top of the schema-spec payload, fail-soft to the prior schema-only
+    payload. This fixes `/schema/data-dictionary` and its /v1 alias.
+
+NO BEHAVIOR CHANGE elsewhere: every other endpoint, the engine-binding cascade,
+the provider-health surface, and the 115-key contract path are preserved
+verbatim from v4.3.0. The instrument/Top_10/Insights static fallbacks and all
+widths are unchanged. v4.4.0 is purely additive on the Data_Dictionary paths.
+
+NOTE ON THE ONE INFERENCE: the exact frontend caller for Data_Dictionary lives
+in `11_SpecialPages.gs` (not on disk this session). v4.4.0 fixes BOTH plausible
+callers — the schema-only endpoint AND the /sheet-rows page path — so the page
+populates regardless of which one the frontend uses.
 
 WHY v4.3.0 — bring the OFFLINE fallback up to the live 115-key gate contract
 ----------------------------------------------------------------------------
@@ -132,7 +186,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 # v4.3.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.3.0"
+ADVANCED_ANALYSIS_VERSION = "4.4.0"
 
 
 # =============================================================================
@@ -248,6 +302,35 @@ if core_get_sheet_rows is None:
             "[advanced_analysis v%s] BOTH v2 and legacy unavailable: legacy_err=%r",
             ADVANCED_ANALYSIS_VERSION, _legacy_err,
         )
+
+
+# =============================================================================
+# v4.4.0 [DD-FIX] Real Data_Dictionary builder binding.  (NEW in v4.4.0)
+#
+# The canonical Data_Dictionary CONTENT builder is core.sheets.data_dictionary
+# (v3.2.0+, `build_data_dictionary_payload`). It is pure / import-safe (no I/O,
+# no network, reads only the schema registry) and emits one row per schema
+# column across all sheets. Its row keys are EXACTLY the route's
+# _DICTIONARY_KEYS (sheet, group, header, key, dtype, fmt, required, source,
+# notes), so rows project onto the route contract with no remapping.
+#
+# Bound here once at import. Fail-soft: if the import fails, `_build_dd_payload`
+# stays None and the Data_Dictionary paths fall back to their prior behavior.
+# =============================================================================
+_build_dd_payload = None  # type: ignore[assignment]
+try:
+    from core.sheets.data_dictionary import build_data_dictionary_payload as _build_dd_payload  # type: ignore
+    logger.info(
+        "[advanced_analysis v%s] real Data_Dictionary builder bound (core.sheets.data_dictionary)",
+        ADVANCED_ANALYSIS_VERSION,
+    )
+except Exception as _dd_err:
+    _build_dd_payload = None  # type: ignore
+    logger.info(
+        "[advanced_analysis v%s] core.sheets.data_dictionary unavailable (%s); "
+        "Data_Dictionary will use degraded self-description fallback",
+        ADVANCED_ANALYSIS_VERSION, _dd_err,
+    )
 
 
 # =============================================================================
@@ -1331,7 +1414,56 @@ def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols
             row.setdefault("criteria_snapshot", "{}")
     return rows
 
+def _real_data_dictionary_rows() -> List[Dict[str, Any]]:
+    """v4.4.0 [DD-FIX]: rows from the real core.sheets.data_dictionary builder.
+
+    Returns the canonical Data_Dictionary content — one dict per schema column
+    across every sheet — using `build_data_dictionary_payload(format="rows")`.
+    The builder is pure / import-safe (registry-only; no engine, no I/O, no
+    network), so this path produces correct Data_Dictionary rows even when the
+    engine has not reached the container. Row keys already equal the route's
+    _DICTIONARY_KEYS (sheet, group, header, key, dtype, fmt, required, source,
+    notes), so no remapping is needed here.
+
+    Fail-soft: returns [] if the builder is unbound or raises, letting callers
+    fall back to their prior degraded behavior.
+    """
+    if not callable(_build_dd_payload):
+        return []
+    try:
+        payload = _build_dd_payload(format="rows")  # type: ignore[misc]
+    except Exception as e:
+        logger.warning(
+            "[advanced_analysis v%s] real Data_Dictionary builder raised: %s: %s",
+            ADVANCED_ANALYSIS_VERSION, e.__class__.__name__, e,
+        )
+        return []
+    if not isinstance(payload, Mapping):
+        return []
+    rows = payload.get("row_objects")
+    if not (isinstance(rows, list) and rows):
+        rows = payload.get("rows")
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        if isinstance(r, Mapping):
+            out.append(dict(r))
+    return out
+
 def _build_dictionary_fallback_rows(*, page: str, headers: Sequence[str], keys: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
+    # v4.4.0 [DD-FIX]: prefer the real registry-derived Data_Dictionary content
+    # (one row per schema column across all sheets) over the prior degraded
+    # self-description (which only described the dictionary's OWN 9 columns).
+    # The real builder is pure/import-safe, so this works even when the engine
+    # has not reached the container.
+    real_rows = _real_data_dictionary_rows()
+    if real_rows:
+        normalized = [
+            _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=r)
+            for r in real_rows
+        ]
+        return _slice(normalized, limit=limit, offset=offset)
+    # Last-resort degraded fallback (builder unavailable): self-description of
+    # the Data_Dictionary contract itself. Preserved verbatim from v4.3.0.
     rows: List[Dict[str, Any]] = []
     for idx, (header, key) in enumerate(zip(headers, keys), start=1):
         rows.append({
@@ -1810,11 +1942,50 @@ async def schema_sheet_spec_post(body: Dict[str, Any] = Body(default_factory=dic
 @router.get("/schema/data-dictionary")
 @router.get("/v1/schema/data-dictionary")
 async def schema_data_dictionary() -> Dict[str, Any]:
+    # v4.4.0 [DD-FIX (d)]: this endpoint previously returned a schema-only
+    # payload (headers + keys + columns, but ZERO content rows) — the
+    # "200 success / 0 rows" symptom the frontend was hitting. The real
+    # Data_Dictionary content (one row per schema column across every sheet) is
+    # now attached from the pure / import-safe core.sheets.data_dictionary
+    # builder via _real_data_dictionary_rows(). Row keys already equal
+    # _DICTIONARY_KEYS, but they are still projected through
+    # _normalize_to_schema_keys for header-fallback safety. Fail-soft: if the
+    # builder is unavailable or raises, the response degrades to the prior
+    # schema-only payload (never raises, never regresses below v4.3.0 behavior).
     payload = _schema_spec_payload(_DICTIONARY_PAGE)
     payload["page"] = _DICTIONARY_PAGE
     payload["sheet"] = _DICTIONARY_PAGE
     payload["sheet_name"] = _DICTIONARY_PAGE
-    return payload
+    try:
+        keys = payload.get("keys") or []
+        hdrs = payload.get("headers") or []
+        real_rows = _real_data_dictionary_rows()
+        if real_rows and keys:
+            normalized = [
+                _normalize_to_schema_keys(schema_keys=keys, schema_headers=hdrs, raw=r)
+                for r in real_rows
+            ]
+            matrix = _rows_to_matrix(normalized, keys)
+            payload["row_objects"] = normalized
+            payload["items"] = normalized
+            payload["records"] = normalized
+            payload["data"] = normalized
+            payload["quotes"] = normalized
+            payload["rows"] = matrix
+            payload["rows_matrix"] = matrix
+            payload["matrix"] = matrix
+            payload["count"] = len(normalized)
+            meta = payload.get("meta")
+            if isinstance(meta, dict):
+                meta["dispatch"] = "schema_data_dictionary_real_rows"
+                meta["row_source"] = "core.sheets.data_dictionary.build_data_dictionary_payload"
+                meta["count"] = len(normalized)
+    except Exception as e:
+        logger.warning(
+            "[advanced_analysis v%s] schema_data_dictionary real-rows attach failed: %s: %s",
+            ADVANCED_ANALYSIS_VERSION, e.__class__.__name__, e,
+        )
+    return _json_safe(payload)
 
 @router.get("/sheet-rows")
 async def root_sheet_rows_get(
