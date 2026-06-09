@@ -2,7 +2,10 @@
 """
 core/analysis/insights_builder.py
 ================================================================================
-Insights Analysis Builder -- v8.2.0
+Insights Analysis Builder -- v8.2.1
+(v8.2.1 DISPLAY FIX: Coverage / Data Quality VALUE cells render "{n} of {d}"
+ instead of "{n}/{d}", which Google Sheets was date-coercing to a serial
+ (e.g. "5/5" -> May 5 -> 46147). Display-only; row set/ordering/contract intact)
 (v8.2.0 LAYOUT/QUALITY: Executive Summary headline section + intentional,
  advisor-first row ordering via section-priority bands stamped into sort_order
  (row set unchanged, within-band emit order preserved) /
@@ -177,7 +180,15 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "8.2.0"
+INSIGHTS_BUILDER_VERSION = "8.2.1"
+# v8.2.1: coverage display-format fix. The Coverage / Data Quality rows emitted
+# their counts as "{n}/{d}" (e.g. "5/5"), which Google Sheets auto-coerces to a
+# date (M/D -> e.g. May 5 -> serial 46147) when the Value cell carries a number
+# format, so the sheet showed 46,147.00 instead of the coverage count. The three
+# coverage/clean-count VALUE emits in _build_universe_snapshot_rows now render as
+# "{n} of {d}" (non-coercible). Display-only; row set, ordering, contract, and the
+# longer "{n}/{d} symbol(s) with clean data" NOTE string (text, not coerced) are
+# all unchanged.
 # v8.2.0: layout/quality improvement on top of the v8.1.0 contract sync.
 # Adds an Executive Summary headline section and an intentional, advisor-first
 # row ordering (section-priority bands stamped into sort_order; row set
@@ -1617,13 +1628,13 @@ def _build_universe_snapshot_rows(
 
     rows.append(_make_row(
         keys=ctx.keys, section=section_name, item="Coverage",
-        metric="coverage_current_price", value=f"{coverage_price}/{len(symbols)}",
+        metric="coverage_current_price", value=f"{coverage_price} of {len(symbols)}",
         notes="Symbols with current_price available",
         last_updated_riyadh=ctx.ts,
     ))
     rows.append(_make_row(
         keys=ctx.keys, section=section_name, item="Coverage",
-        metric="coverage_percent_change", value=f"{coverage_change}/{len(symbols)}",
+        metric="coverage_percent_change", value=f"{coverage_change} of {len(symbols)}",
         notes="Symbols with percent_change available",
         last_updated_riyadh=ctx.ts,
     ))
@@ -1651,7 +1662,7 @@ def _build_universe_snapshot_rows(
             notes_text = f"All {len(quotes)} symbol(s) reporting clean data"
         rows.append(_make_row(
             keys=ctx.keys, section=section_name, item="Data Quality",
-            metric="data_quality_clean_count", value=f"{clean}/{len(quotes)}",
+            metric="data_quality_clean_count", value=f"{clean} of {len(quotes)}",
             signal=signal, priority=priority,
             notes=notes_text,
             last_updated_riyadh=ctx.ts,
