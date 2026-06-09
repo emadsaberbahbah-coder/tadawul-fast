@@ -2,14 +2,20 @@
 """
 core/analysis/insights_builder.py
 ================================================================================
-Insights Analysis Builder -- v8.0.1
-(v8.0.1 PATCH: top10_selector v4.14.0 family-floor sync + criteria-forwarding
- bug fix + top10 v8tier meta surfacing /
+Insights Analysis Builder -- v8.2.0
+(v8.2.0 LAYOUT/QUALITY: Executive Summary headline section + intentional,
+ advisor-first row ordering via section-priority bands stamped into sort_order
+ (row set unchanged, within-band emit order preserved) /
+ [PRESERVED v8.1.0 PATCH] LIVE 7-COL CONTRACT SYNC -- schema_registry v2.14.0
+ Insights_Analysis = [section, item, metric, value, notes, source, sort_order].
+ Populates the source + sort_order columns, preserves per-symbol identity under
+ the symbol-less contract, and aligns the registry-down fallback /
+ [PRESERVED v8.0.1] top10_selector v4.14.0 family-floor sync +
+ criteria-forwarding fix + top10 v4.14.0 meta surfacing /
  [PRESERVED v8.0.0] 8-TIER VOCABULARY + PRIORITY-BAND CONSUMPTION +
  CASCADE-BRIDGE SURFACING /
  [PRESERVED v7.0.0] CROSS-STACK SIGNAL ENRICHMENT + DATA-QUALITY ALERTS /
- [PRESERVED v6.0.0] SCHEMA-CORRECT 7-COL / TIMESTAMP-FIX /
- SIGNAL-PRIORITY-PRESERVED / V5-V7 ALIGNED)
+ [PRESERVED v6.0.0] 7-COL / TIMESTAMP-FIX / SIGNAL-PRIORITY-PRESERVED)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -17,334 +23,134 @@ Purpose
 -------
 Builds Insights_Analysis page rows for the TFB dashboard. Generates a
 multi-section executive summary aligned with the canonical 7-column
-Insights_Analysis schema in `core.sheets.schema_registry` v2.11.0.
+Insights_Analysis schema in `core.sheets.schema_registry`.
 
-Sections (v8.0.0: 8 sections, unchanged from v7.0.0)
-----------------------------------------------------
-  1. Market Summary             -- Trend signals per universe (gainers/losers/vol)
-  2. Top Picks                  -- Top 10 investments + scoring v5.7.0 enrichment
-                                   (+ v8.0.0: priority_band, provider_rating,
-                                   scoring_source, penalty_factor)
-  3. Risk Alerts                -- High risk_score + v8.0.0: AVOID/STRONG_SELL
-                                   recommendation alerts
-  4. Data Quality Alerts        -- v7.0.0: provider errors + engine drops
-  5. Short-Term Opportunities   -- technical_score + ST signal
-                                   (+ v8.0.0: ACCUMULATE qualifies)
-  6. Portfolio KPIs             -- P/L, stop distances, weight deviations
-  7. Macro Signals              -- sector signals, vs_sp500_ytd
-  8. Risk Scenarios             -- Conservative / Moderate / Aggressive
+LIVE CONTRACT (schema_registry v2.14.0)
+---------------------------------------
+  keys    = [section, item, metric, value, notes, source, sort_order]
+  headers = [Section, Item, Metric, Value, Notes, Source, Sort Order]
+  - source     -> Origin of the insight (module/provider/section that
+                  produced it). v2.11.0's `symbol` column was removed.
+  - sort_order -> Stable ordering index for rows within the sheet.
+                  v2.11.0's `last_updated_riyadh` column was removed.
 
-Aligned with the May 2026 cross-stack family floor:
-  - core.sheets.schema_registry  v2.11.0  (Insights_Analysis = 7 cols)
-  - core.scoring                 v5.7.0   (8-tier vocabulary, priority_band)
-  - core.scoring_engine (bridge) v3.6.0   (contract-version re-exports)
-  - core.reco_normalize          v8.0.0   (8-tier canonical: STRONG_BUY,
-                                            BUY, ACCUMULATE, HOLD, REDUCE,
-                                            SELL, STRONG_SELL, AVOID)
+Sections (8, unchanged from v7.0.0/v8.0.0)
+------------------------------------------
+  1. Market Summary    2. Top Picks    3. Risk Alerts
+  4. Data Quality Alerts    5. Short-Term Opportunities    6. Portfolio KPIs
+  7. Macro Signals    8. Risk Scenarios
+
+Cross-stack family floor (Jun 2026):
+  - core.sheets.schema_registry  v2.14.0  (Insights_Analysis = 7 cols:
+                                            section/item/metric/value/notes/
+                                            source/sort_order)
+  - core.data_engine_v2          v5.83.2  (115-col canonical, 8-tier
+                                            passthrough, cascade-bridge fields)
+  - core.scoring                 v5.7.x   (8-tier vocabulary, priority_band)
+  - core.reco_normalize          v8.0.0   (8-tier canonical)
   - core.analysis.criteria_model v3.1.1
-  - core.data_engine_v2          v5.76.0  (8-tier passthrough, 106-col schema,
-                                            cascade-bridge + provenance fields)
-  - core.investment_advisor_engine v4.5.0 (8-tier routed)
-  - core.analysis.top10_selector v4.14.0  (8-tier vocabulary aware,
-                                            priority-band routed,
-                                            cascade-bridge ready)
-  - providers eodhd v4.7.3, yahoo_fundamentals v6.1.0, yahoo_chart v8.2.0,
-              enriched_quote v4.7.0
+  - core.analysis.top10_selector v4.14.0  (8-tier aware, priority-band routed)
+  - routes/advanced_analysis     v4.4.0   (Insights static fallback already on
+                                            the source/sort_order shape)
 
 ================================================================================
-v8.0.1 changes (vs v8.0.0)  --  CROSS-STACK SYNC + CRITERIA-FORWARDING FIX
+v8.2.0 changes (vs v8.1.0)  --  LAYOUT / QUALITY
 ================================================================================
 
-THREE-PHASE PATCH. Strictly additive at the runtime contract level; no
-public API changes; no behaviour change unless the operator was already
-relying on v3.1.0+ hard filters reaching top10_selector through
-insights_builder (in which case v8.0.0 silently dropped them — v8.0.1
-is the fix).
+ADDITIVE + REORDERING. No section-builder logic changed; the row SET produced
+is identical to v8.1.0 plus the new Executive Summary rows. Verified against
+the live consumer (routes/advanced_sheet_rows), which projects row_objects in
+list order with NO re-sort -- so the row array order is the realized sheet
+order, and stamping that order into sort_order keeps the two consistent.
 
-Phase A. CROSS-STACK FAMILY-FLOOR SYNC.
-  top10_selector v4.13.0 -> v4.14.0 in the header cross-stack family
-  block. Reflects the May 2026 family floor after the v4.14.0 selector
-  delivery: 8-tier vocabulary aware, priority-band routed,
-  cascade-bridge ready.
+E1. EXECUTIVE SUMMARY SECTION. New `_build_executive_summary_rows` derives a
+  compact headline (Overview one-liner, Market Tone, Top Picks count + #1
+  highlight, Risk Alerts count, Short-Term count, Portfolio P/L, Data Quality
+  flags) from the ALREADY-BUILT section rows + ctx.all_quotes. Counts come from
+  the section builders' own output (single source of truth), so the headline
+  can never disagree with the detail rows below it. Returns [] on a degraded
+  run with no quotes (the partial/no-engine path does not emit it).
 
-Phase B. _normalize_criteria CRITERIA-FORWARDING FIX. v8.0.0's
-  `_normalize_criteria()` returned a fresh dict containing only an
-  insights-specific set of keys. Any v3.1.0 or v3.2.0 hard-filter
-  field passed in by the operator (min_conviction_score,
-  exclude_engine_dropped_valuation, exclude_forecast_unavailable,
-  exclude_provider_errors, exclude_avoid_recommendations,
-  min_priority_band, reco_8tier_strict) was SILENTLY DROPPED before
-  reaching top10_selector through `_fetch_top10_payload`. This was a
-  latent bug that pre-existed v8.0.0 — v3.1.0 fields were also
-  silently dropped in v7.0.0.
+E2. INTENTIONAL ROW ORDERING. `_finalize_insights_rows` now stable-sorts rows
+  into advisor-first section-priority bands (Executive Summary -> Criteria ->
+  Top Picks -> Risk Alerts -> Short-Term -> Portfolio -> Macro ->
+  Market-Summary universes -> Data Quality -> Risk Scenarios -> System;
+  Builder Warnings floats to the very top). Within a band, original emit order
+  is preserved, so the ranked #1..#N Top Picks order and the Top Picks /
+  Top Picks Context interleave are untouched. The resulting position is stamped
+  into sort_order. This replaces v8.1.0's incidental insertion-order index with
+  a deliberate layout while changing only ORDER, never the row set.
 
-  v8.0.1 forwards all 7 hard-filter fields through normalization,
-  with shape-correct coercion that mirrors top10_selector v4.14.0's
-  own `_collect_criteria_from_inputs`:
-    - min_conviction_score (float, fraction OR percent input)
-    - min_conviction          (legacy alias preserved)
-    - exclude_engine_dropped_valuation (bool)
-    - exclude_forecast_unavailable     (bool)
-    - exclude_provider_errors          (bool)
-    - exclude_avoid_recommendations    (bool, v3.2.0 forward-compat)
-    - min_priority_band                (str, "P1".."P5" or "")
-    - reco_8tier_strict                (bool, v3.2.0 forward-compat)
-
-  Defaults stay OFF / 0 / "" so v3.1.0 / v3.2.0-unaware callers see
-  zero behaviour change.
-
-Phase C. TOP10-SELECTOR v4.14.0 META SURFACING. `_fetch_top10_payload`
-  now captures the v4.14.0 meta block when present and propagates four
-  fields into the Insights response meta:
-    - reco_8tier_aware       -> top10_reco_8tier_aware
-    - applied_v310_filters   -> top10_applied_v310_filters
-    - applied_v8tier_filters -> top10_applied_v8tier_filters
-    - data_quality_summary   -> top10_data_quality_summary
-                                  (the v4.14.0-extended one with
-                                  avoid_count / accumulate_count /
-                                  strong_sell_count / reco_8tier_seen /
-                                  priority_band_seen / etc.)
-  Ops dashboards consuming Insights meta can verify cross-stack
-  8-tier alignment without a separate top10 call.
-
-Phase D. VERSION BUMP 8.0.0 -> 8.0.1. `__version__` alias auto-tracks.
-  `__all__` unchanged.
-
-PRESERVED VERBATIM FROM v8.0.0:
-  - All 8-tier vocabulary signal constants and membership sets
-    (Phase B / C / D / E / F / G / H / I)
-  - `_reco_to_signal()` 8-tier mapping
-  - `_priority_band_to_insights_priority()` helper
-  - `_extract_scoring_enrichment()` 9-field shape
-  - `_row_has_8tier_recommendation()` helper
-  - Risk Alerts sub-section for AVOID / STRONG_SELL recommendations
-  - Short-Term Opportunities ACCUMULATE qualifier
-  - Capability flags (`reco_8tier_seen`, `priority_band_seen`) in meta
-  - All v7.0.0 Data Quality Alerts logic
-  - All v6.0.0 fixes (7-col schema, signal-in-notes)
-  - All v5.0.0 mechanics (async timeouts, build budget)
+E3. VERSION BUMP 8.1.0 -> 8.2.0. Header + System "Builder Version" note
+  updated. Public API (`build_insights_analysis_rows`, `build_criteria_rows`,
+  `get_insights_schema`) unchanged; `_finalize_insights_rows` gained an
+  optional `universe_names` arg (defaulted, so the partial-path 2-arg call is
+  unaffected).
 
 ================================================================================
-v8.0.0 changes (vs v7.0.0)  --  8-TIER VOCABULARY + PRIORITY-BAND CONSUMPTION
+v8.1.0 changes (vs v8.0.1)  --  LIVE 7-COL CONTRACT SYNC
 ================================================================================
 
-ADDITIVE STACK-ALIGNMENT PATCH. Closes the last 6-tier choke point
-below the advisor layer. After v8.0.0 the entire TFB family is in
-8-tier lockstep:
+ADDITIVE / CONTRACT-CORRECTING PATCH. The live registry (v2.14.0) reconciled
+Insights_Analysis to [section, item, metric, value, notes, source, sort_order],
+dropping the v2.11.0-era `symbol` and `last_updated_riyadh` columns. v8.0.1's
+`_make_row` had internal slots for symbol / last_updated_riyadh but NONE for
+`source` or `sort_order`, so on the live contract every Insights row shipped
+those two columns BLANK, rows were emitted in insertion order with no stable
+index, and the `symbol` set on per-symbol rows was dropped on projection. The
+stale `_FALLBACK_*` lists also still named symbol/last_updated, so a
+registry-down container would emit the wrong 7-column shape.
 
-  scoring v5.7.0
-    -> reco_normalize v8.0.0
-    -> schema_registry v2.11.0
-    -> data_engine_v2 v5.76.0
-    -> investment_advisor_engine v4.5.0
-    -> insights_builder v8.0.0  (this delivery)
+Phase A. FALLBACK CONTRACT SYNC. `_FALLBACK_HEADERS` / `_FALLBACK_KEYS`
+  updated from the v2.11.0 [Section, Item, Symbol, Metric, Value, Notes,
+  Last Updated (Riyadh)] shape to the live v2.14.0 [Section, Item, Metric,
+  Value, Notes, Source, Sort Order] shape, so the registry-down fallback
+  matches the live contract (and routes/advanced_analysis v4.4.0's own
+  Insights static fallback).
 
-v7.0.0 was the last module emitting only the 5-tier vocabulary. With
-scoring v5.7.0 now passing ACCUMULATE / STRONG_SELL / AVOID through
-data_engine_v2 v5.76.0 to every quote row, an ACCUMULATE row at v7.0.0
-silently rendered as a HOLD-shaped signal in Top Picks and never
-qualified for Short-Term Opportunities. v8.0.0 fixes this end-to-end
-and adds three high-value features built on top of the new fields
-data_engine_v2 v5.74.0+ surfaces.
+Phase B. SYMBOL-IDENTITY PRESERVATION. `_make_row` now folds the per-row
+  `symbol` into the Item label ("Top Gainer -- AAPL") WHEN the active schema
+  has no dedicated `symbol` column AND the symbol is not already present in
+  the item text. Under the v2.14.0 symbol-less contract this keeps per-symbol
+  insights (Top Gainer/Loser, Best ROI, Highest Vol, ...) identifiable. On a
+  schema that still has a `symbol` column the fold is a no-op (the symbol goes
+  to its column as before). All ~60 existing `_make_row` call sites are
+  unchanged.
 
-WHAT v7.0.0 MISSED.
+Phase C. source + sort_order POPULATION. New `_finalize_insights_rows(rows,
+  keys)` stamps every row before return:
+    - sort_order -> monotonic 1..N in final display order (only when the
+      active schema has a `sort_order` column; left untouched otherwise).
+    - source     -> per-section provenance via `_SECTION_SOURCE_MAP`
+      (criteria->criteria_model, system->insights_builder,
+      top picks->top10_selector, portfolio->engine.portfolio, the
+      data-derived sections->engine.enriched_quotes, risk scenarios->
+      criteria_model), default insights_builder. Only fills `source` when the
+      column exists and the row left it empty.
+  Called in BOTH return paths (the engine/universes-empty partial return and
+  the full success/partial return) so every emitted row carries a stable
+  index and an origin.
 
-  - `_BULLISH_RECOS` / `_BEARISH_RECOS` only knew 5 tokens. ACCUMULATE
-    (bullish), STRONG_SELL (bearish), and AVOID (bearish) silently fell
-    out of every set membership check.
+Phase D. VERSION BUMP 8.0.1 -> 8.1.0. `__version__` auto-tracks. `__all__`
+  unchanged. Header cross-stack refs updated to the v2.14.0 / v5.83.2 floor.
 
-  - `_reco_to_signal()` returned `_SIGNAL_NEUTRAL` ("HOLD") for the
-    3 new tokens, collapsing the [SIGNAL|PRIORITY] notes prefix.
-
-  - `recommendation_priority_band` (P1..P5 from scoring v5.7.0,
-    passed through by data_engine_v2 v5.74.0+, surfaced in advisor
-    v4.5.0's fallback schema slot 87) was never read. Top Picks
-    priority was always rank-based even when the engine had a
-    strong urgency signal saying otherwise.
-
-  - 7 other cascade-bridge / scoring-provenance fields
-    data_engine_v2 v5.74.0+ now emits (`provider_rating`,
-    `recommendation_source`, `scoring_recommendation_source`,
-    `scoring_schema_version`, `opportunity_source`,
-    `overall_score_raw`, `overall_penalty_factor`) were dropped on
-    the floor. Operators couldn't see whether a Top Pick was
-    backed by clean scoring or by provider override, or whether
-    its overall_score had taken a penalty.
-
-  - Short-Term Opportunities required `st_signal in ("BUY",
-    "STRONG_BUY")`; ACCUMULATE-tagged rows with strong technicals
-    never qualified.
-
-  - Risk Alerts ignored the recommendation column entirely. A row
-    with `recommendation=AVOID` but `risk_score<55` (e.g. a
-    distressed stock with low realised volatility yet) was
-    completely invisible.
-
-  - Cross-stack version refs all stale: schema_registry v2.5.0,
-    scoring v5.2.5, reco_normalize v7.2.0, data_engine_v2 v5.60.0,
-    criteria_model v3.0.0.
-
-Phase-by-phase summary:
------------------------
-
-A. NARRATIVE SYNC. Header banner gains "8-TIER VOCABULARY +
-   PRIORITY-BAND CONSUMPTION + CASCADE-BRIDGE SURFACING". All
-   cross-module version refs updated to the v5.76.0 family floor.
-
-B. 8-TIER SIGNAL CONSTANTS. Three new finer-grained tokens added to
-   the Signal vocabulary block:
-     _SIGNAL_ACCUMULATE     = "ACCUMULATE"     (NEW)
-     _SIGNAL_STRONG_DOWN    = "STRONG_SELL"    (NEW)
-     _SIGNAL_AVOID          = "AVOID"          (NEW)
-   The existing _SIGNAL_UP / _SIGNAL_DOWN / _SIGNAL_NEUTRAL /
-   _SIGNAL_OK / _SIGNAL_WARN / _SIGNAL_ALERT / _SIGNAL_STRONG_UP /
-   _SIGNAL_REDUCE constants are preserved verbatim — the macro /
-   portfolio / market-summary sections that use them directly are
-   unaffected.
-
-C. 8-TIER MEMBERSHIP SETS. `_BULLISH_RECOS` and `_BEARISH_RECOS`
-   expanded to cover the full 8-tier canonical vocabulary:
-     _BULLISH_RECOS = {"BUY", "STRONG_BUY", "ACCUMULATE"}
-     _BEARISH_RECOS = {"SELL", "REDUCE", "STRONG_SELL", "AVOID"}
-   No call site changes — every existing membership check now correctly
-   classifies the 3 new tokens.
-
-D. 8-TIER _reco_to_signal MAPPING. The Phase G refinement from v7.0.0
-   is extended with the 3 new tokens:
-     STRONG_BUY    -> "STRONG_BUY"   (v7.0.0)
-     BUY           -> "BUY"          (v7.0.0)
-     ACCUMULATE    -> "ACCUMULATE"   (v8.0.0 NEW)
-     HOLD          -> "HOLD"         (v7.0.0)
-     REDUCE        -> "REDUCE"       (v7.0.0)
-     SELL          -> "SELL"         (v7.0.0)
-     STRONG_SELL   -> "STRONG_SELL"  (v8.0.0 NEW)
-     AVOID         -> "AVOID"        (v8.0.0 NEW)
-     unknown       -> "HOLD"         (preserved safe default)
-   Result: Top Picks rows now render the engine's full granularity
-   in their [SIGNAL|PRIORITY] notes prefix.
-
-E. PRIORITY-BAND CONSUMPTION. New module-level
-   `_PRIORITY_BAND_TO_INSIGHTS_PRIORITY` map and
-   `_priority_band_to_insights_priority(band, default)` helper.
-   Maps scoring v5.7.0's P1..P5 urgency tiers to Insights priority:
-     P1, P2 -> High      (most urgent: STRONG_BUY / STRONG_SELL /
-                          AVOID actions, immediate review needed)
-     P3, P4 -> Medium
-     P5     -> Low       (least urgent: HOLD-type with low conviction)
-   `_extract_scoring_enrichment()` now pulls `priority_band` from the
-   row (canonical `recommendation_priority_band`, with the bare
-   `priority_band` alias as fallback). `_build_top_picks_rows()` uses
-   it to override the default rank-based priority when present —
-   when the engine says "this is a P1 pick", Insights labels it High
-   regardless of rank.
-
-F. CASCADE-BRIDGE FIELD SURFACING. `_extract_scoring_enrichment()`
-   gains 4 new fields beyond the v7.0.0 set (conviction, top_factors,
-   top_risks, position_size_hint):
-     priority_band     -> from recommendation_priority_band
-     provider_rating   -> from provider_rating
-     scoring_source    -> from scoring_recommendation_source
-     penalty_factor    -> from overall_penalty_factor (numeric)
-   Top Picks Context emits new dedicated rows when these are present:
-     "#{rank} Priority Band"  -> shows the P1..P5 tier
-     "#{rank} Provider Rating" -> shows raw provider recommendation,
-                                  flagged when it diverges from the
-                                  engine recommendation
-     "#{rank} Penalty Factor"  -> shown only when < 1.0 (overall_score
-                                  was penalised vs overall_score_raw)
-   Plus the main Top Picks row notes prefix gains `penalty=0.85` when
-   penalty_factor < 1.0, so penalty is visible in the headline row.
-
-G. 8-TIER SHORT-TERM OPPORTUNITIES. The qualifier expanded:
-     v7.0.0: st_signal in {"BUY", "STRONG_BUY"}
-     v8.0.0: st_signal in {"BUY", "STRONG_BUY", "ACCUMULATE"}
-   ACCUMULATE-tagged rows now qualify for short-term opportunities
-   when their technical_score meets threshold. The summary notes
-   text is updated accordingly.
-
-H. NEW Risk Alerts CATEGORY for engine-driven AVOID/STRONG_SELL. A
-   new sub-section in Risk Alerts surfaces rows where
-   `recommendation in {AVOID, STRONG_SELL}` regardless of
-   risk_score. These are explicit engine-driven "do not touch"
-   calls — important to surface even when the risk_score is
-   moderate. Up to 6 such rows are emitted, with priority High
-   for AVOID and Medium for STRONG_SELL.
-
-I. NEW CAPABILITY-FLAG META FLAGS. The response `meta` dict gains:
-     reco_8tier_seen   : bool — did any scanned quote row carry one
-                          of the 3 v8.0.0-only tokens (ACCUMULATE,
-                          STRONG_SELL, AVOID)? When False on a
-                          large universe scan, signals that
-                          upstream is still emitting only the
-                          legacy 5-tier vocabulary (e.g.
-                          TFB_COLLAPSE_RECOMMENDATION_TO_6TIER is
-                          set, or scoring is pre-v5.7.0).
-     priority_band_seen: bool — did any scanned row carry
-                          recommendation_priority_band? When False,
-                          data_engine_v2 is pre-v5.74.0 (or scoring
-                          is pre-v5.7.0). Useful for ops dashboards
-                          to verify the cascade-bridge fields are
-                          flowing end-to-end.
-   These mirror the advisor v4.5.0 capability-flag pattern
-   (reco_8tier_available / view_aware_8tier_supported).
-
-J. VERSION BUMP 7.0.0 -> 8.0.0. `__version__` alias auto-tracks.
-   `__all__` unchanged (no new public symbols).
-
-NEW helpers (private, prefix _):
-  - `_priority_band_to_insights_priority(band, default)` — maps
-    scoring v5.7.0's P1..P5 band to Insights High/Medium/Low.
-  - `_row_has_8tier_recommendation(row)` — True when the row's
-    recommendation is one of ACCUMULATE / STRONG_SELL / AVOID.
-
-NEW constants (private):
-  - `_SIGNAL_ACCUMULATE`     = "ACCUMULATE"
-  - `_SIGNAL_STRONG_DOWN`    = "STRONG_SELL"
-  - `_SIGNAL_AVOID`          = "AVOID"
-  - `_PRIORITY_BAND_TO_INSIGHTS_PRIORITY` — P1..P5 -> High/Medium/Low
-  - `_RECO_8TIER_NEW_TOKENS` — frozenset of ACCUMULATE/STRONG_SELL/AVOID
-                               (used by _row_has_8tier_recommendation)
-
-PRESERVED VERBATIM FROM v7.0.0:
-  - All Phase A data-quality parsing helpers (warning_tags_from_row,
-    provider_error_from_row, engine_drop_tags_from_row,
-    forecast_skip_tags_from_row, row_is_forecast_unavailable,
-    row_has_engine_dropped_valuation)
-  - Phase A "Data Quality Alerts" section
-  - Phase F per-universe Data Quality coverage row
-  - Phase G _reco_to_signal finer-grained mapping (extended in
-    v8.0.0 Phase D, not replaced)
-  - Phase I forecast_unavailable_upstream note in Top Picks
-  - Phase H __version__ alias
-  - All v6.0.0 fixes (7-col schema, timestamp-key alignment,
-    signal/priority embedded-in-notes)
-  - All v5.0.0 mechanics (async timeouts, criteria_model integration,
-    top10_selector path, build budget tracking)
-
-DEPLOYMENT NOTE.
-  v8.0.0 is fully backwards-compatible with the v7.0.0 row shape:
-  if upstream is still emitting 5-tier-only data (because the
-  data_engine_v2 environment variable
-  TFB_COLLAPSE_RECOMMENDATION_TO_6TIER is set, or because scoring is
-  pre-v5.7.0), the new Phase C/D/G/H code paths simply never fire —
-  no ACCUMULATE/STRONG_SELL/AVOID rows show up, the new sub-section
-  in Risk Alerts stays empty, and `reco_8tier_seen` is False in the
-  meta dict. The capability-flag meta is the canonical way for
-  operators to verify the whole stack is in 8-tier lockstep.
-
-================================================================================
-v7.0.0 changes (vs v6.0.0)  --  CROSS-STACK SIGNAL ENRICHMENT
-================================================================================
-[v7.0.0 / v6.0.0 / v5.0.0 changelog history preserved verbatim in user
-source; trimmed here for editing efficiency. The v8.0.0 header
-replacement restores any cross-stack narrative needed.]
+PRESERVED VERBATIM FROM v8.0.1 / v8.0.0:
+  - All 8 section builders and their logic
+  - 8-tier vocabulary constants + membership sets + `_reco_to_signal`
+  - priority-band consumption (`_priority_band_to_insights_priority`)
+  - cascade-bridge field surfacing (`_extract_scoring_enrichment`)
+  - v8.0.1 criteria-forwarding fix in `_normalize_criteria`
+  - v8.0.1 top10_selector v4.14.0 meta surfacing in the response meta
+  - all v7.0.0 Data Quality Alerts logic, v6.0.0 7-col mechanics,
+    v5.0.0 async/budget mechanics
+  (Older v7/v6/v5 narrative changelog remains preserved in prior source, per
+   this file's established header-trimming convention.)
 
 Design Rules
 ------------
   - No network calls at import time
   - Best-effort engine access only; never raises for normal route execution
   - Returns schema-correct rows even when the engine is missing
-  - Thread-safe where applicable
   - Fully type-hinted
 ================================================================================
 """
@@ -371,30 +177,111 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "8.0.1"
-# v7.0.0 Phase H: align with TFB module convention
-# v8.0.0: 8-tier vocabulary alignment + recommendation_priority_band
-# consumption + cascade-bridge field surfacing.
-# v8.0.1: top10_selector v4.14.0 cross-stack sync + criteria-forwarding
-# fix + top10 v4.14.0 meta surfacing. See header docstring for details.
+INSIGHTS_BUILDER_VERSION = "8.2.0"
+# v8.2.0: layout/quality improvement on top of the v8.1.0 contract sync.
+# Adds an Executive Summary headline section and an intentional, advisor-first
+# row ordering (section-priority bands stamped into sort_order; row set
+# unchanged). v8.1.0: live 7-col contract sync (schema_registry v2.14.0 ->
+# section/item/metric/value/notes/source/sort_order); populates source +
+# sort_order, preserves per-symbol identity, aligns the registry-down fallback.
 __version__ = INSIGHTS_BUILDER_VERSION
 
 # Riyadh timezone (UTC+3, no DST)
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
-# Schema fallback: exactly 7 columns matching schema_registry v2.5.0's
-# Insights_Analysis spec. Do NOT add `signal` or `priority` columns here --
-# the registry treats those as info to be embedded in `notes` (handled by
-# `_make_row`). Do NOT rename `last_updated_riyadh` to `as_of_riyadh`; the
-# registry uses the former and sheet writers depend on it.
+# v8.1.0 Phase A: schema fallback synced to the LIVE schema_registry v2.14.0
+# Insights_Analysis contract. The v2.11.0-era `symbol` and
+# `last_updated_riyadh` columns were removed in favour of `source` and
+# `sort_order`. This fallback is consumed ONLY when the registry import is
+# unavailable; on the live path get_insights_schema() takes the registry's
+# spec first. Keeping it in sync means a registry-down container emits the
+# same 7-column shape the rest of the stack expects (and that
+# routes/advanced_analysis v4.4.0 emits in its own Insights fallback).
 _FALLBACK_HEADERS: List[str] = [
-    "Section", "Item", "Symbol", "Metric",
-    "Value", "Notes", "Last Updated (Riyadh)",
+    "Section", "Item", "Metric", "Value",
+    "Notes", "Source", "Sort Order",
 ]
 _FALLBACK_KEYS: List[str] = [
-    "section", "item", "symbol", "metric",
-    "value", "notes", "last_updated_riyadh",
+    "section", "item", "metric", "value",
+    "notes", "source", "sort_order",
 ]
+
+# v8.1.0 Phase C: per-section provenance for the `source` column. The registry
+# defines source as "Origin of the insight (module/provider/section that
+# produced it)". `_finalize_insights_rows` maps each row's section to its
+# producing module/provider. Sections not listed fall back to
+# "insights_builder". Keys are matched case-insensitively on a normalized
+# (lower, spaces/hyphens-stripped) section name so "Top Picks" and
+# "Top Picks Context" both resolve.
+_SECTION_SOURCE_MAP: Dict[str, str] = {
+    "executivesummary": "insights_builder",
+    "criteria": "criteria_model",
+    "system": "insights_builder",
+    "toppicks": "top10_selector",
+    "toppickscontext": "top10_selector",
+    "riskalerts": "engine.enriched_quotes",
+    "dataqualityalerts": "engine.enriched_quotes",
+    "shorttermopportunities": "engine.enriched_quotes",
+    "portfoliokpis": "engine.portfolio",
+    "macrosignals": "engine.enriched_quotes",
+    "riskscenarios": "criteria_model",
+}
+_DEFAULT_ROW_SOURCE = "insights_builder"
+
+
+def _section_source(section: str) -> str:
+    """v8.1.0 Phase C: resolve a section name to its provenance `source`."""
+    norm = "".join(ch for ch in _safe_str(section).lower() if ch.isalnum())
+    # Market-summary universe sections are dynamic (e.g. "Indices & Benchmarks",
+    # "Commodities & FX", "Selected Symbols") -- all engine-quote derived.
+    if norm in _SECTION_SOURCE_MAP:
+        return _SECTION_SOURCE_MAP[norm]
+    return "engine.enriched_quotes" if norm else _DEFAULT_ROW_SOURCE
+
+
+# v8.2.0 E2: intentional, advisor-first row ordering. `_finalize_insights_rows`
+# stable-sorts rows into these section-priority bands (lower = higher on the
+# sheet) and stamps the resulting position into sort_order, so the layout is
+# deliberate rather than incidental. Within a band, original emit order is
+# preserved (Top Picks ranked #1..#N order and the Top Picks / Top Picks
+# Context interleave stay intact, since both share band 20). The live consumer
+# (routes/advanced_sheet_rows) projects row_objects in list order with no
+# re-sort, so this array order is the realized sheet order.
+_BAND_WARNINGS = 0
+_BAND_MARKET_SUMMARY = 70
+_BAND_DEFAULT = 75
+_SECTION_BAND: Dict[str, int] = {
+    "executivesummary": 5,
+    "criteria": 10,
+    "toppicks": 20,
+    "toppickscontext": 20,   # same band as Top Picks -> preserves #N interleave
+    "riskalerts": 30,
+    "shorttermopportunities": 40,
+    "portfoliokpis": 50,
+    "macrosignals": 60,
+    "dataqualityalerts": 80,
+    "riskscenarios": 90,
+    "system": 100,
+}
+
+
+def _row_band(row: Mapping[str, Any], universe_norm: Set[str]) -> int:
+    """v8.2.0 E2: resolve a row to its display-priority band."""
+    if not isinstance(row, Mapping):
+        return _BAND_DEFAULT
+    section = _safe_str(row.get("section"))
+    item = _safe_str(row.get("item"))
+    norm = "".join(ch for ch in section.lower() if ch.isalnum())
+    # The Builder Warnings row lives under section "System" but must float to
+    # the very top of the sheet.
+    if norm == "system" and item == "Builder Warnings":
+        return _BAND_WARNINGS
+    if norm in _SECTION_BAND:
+        return _SECTION_BAND[norm]
+    if norm in universe_norm:
+        return _BAND_MARKET_SUMMARY
+    return _BAND_DEFAULT
+
 
 # ---------------------------------------------------------------------------
 # Signal vocabulary used as `notes` markers (NOT as separate columns).
@@ -409,46 +296,25 @@ _SIGNAL_OK = "INFO"
 _SIGNAL_WARN = "ALERT"
 _SIGNAL_ALERT = "ALERT"
 
-# v7.0.0 Phase G: NEW finer-grained signal tokens for Top Picks.
-# Used by _reco_to_signal() to distinguish STRONG_BUY from BUY and
-# REDUCE from SELL in the [SIGNAL|PRIORITY] notes prefix. Backward
-# compatible: existing _SIGNAL_UP / _SIGNAL_DOWN constants preserved
-# verbatim for the macro / portfolio sections that use them directly.
+# v7.0.0 Phase G: finer-grained signal tokens for Top Picks.
 _SIGNAL_STRONG_UP = "STRONG_BUY"
 _SIGNAL_REDUCE = "REDUCE"
 
-# v8.0.0 Phase B: NEW 8-tier-only signal tokens. These appear in the
-# Top Picks notes prefix when the row's recommendation is one of the
-# v8.0.0 additions from reco_normalize v8.0.0 / scoring v5.7.0.
-# Same backwards-compatibility contract as v7.0.0: existing constants
-# preserved verbatim; only _reco_to_signal() consumes these.
+# v8.0.0 Phase B: 8-tier-only signal tokens.
 _SIGNAL_ACCUMULATE = "ACCUMULATE"
 _SIGNAL_STRONG_DOWN = "STRONG_SELL"
 _SIGNAL_AVOID = "AVOID"
 
-# v8.0.0 Phase C: 8-tier recommendation membership sets. Expanded from
-# v7.0.0's 5-tier sets to cover all 8 canonical tokens. Every existing
-# `recommendation in _BULLISH_RECOS` / `in _BEARISH_RECOS` check now
-# correctly classifies ACCUMULATE / STRONG_SELL / AVOID.
+# v8.0.0 Phase C: 8-tier recommendation membership sets.
 _BULLISH_RECOS: FrozenSet[str] = frozenset({"BUY", "STRONG_BUY", "ACCUMULATE"})
 _BEARISH_RECOS: FrozenSet[str] = frozenset({"SELL", "REDUCE", "STRONG_SELL", "AVOID"})
 
-# v8.0.0 Phase I: subset of tokens that only exist in the 8-tier
-# vocabulary. Used by `_row_has_8tier_recommendation` to detect
-# whether upstream is emitting v5.7.0+ scoring or still on the
-# legacy 5-tier path (or the TFB_COLLAPSE_RECOMMENDATION_TO_6TIER
-# env opt-in is collapsing them).
+# v8.0.0 Phase I: subset of tokens that only exist in the 8-tier vocabulary.
 _RECO_8TIER_NEW_TOKENS: FrozenSet[str] = frozenset({
     "ACCUMULATE", "STRONG_SELL", "AVOID",
 })
 
 # v8.0.0 Phase E: scoring v5.7.0 priority_band -> Insights priority.
-# scoring v5.7.0 emits a `recommendation_priority_band` field with
-# values P1..P5 marking the urgency of the recommendation. P1 is most
-# urgent (STRONG_BUY / STRONG_SELL / AVOID actions that need immediate
-# review), P5 is least urgent (typically HOLD-tagged with low
-# conviction). Maps to the 3-level Insights priority used by sheet
-# formatting.
 _PRIORITY_BAND_TO_INSIGHTS_PRIORITY: Dict[str, str] = {
     "P1": "High",
     "P2": "High",
@@ -470,25 +336,13 @@ _DEFAULT_BUILD_BUDGET_SEC = 30.0
 
 
 # ---------------------------------------------------------------------------
-# v7.0.0 Phase A — Cross-stack data-quality tag sets and helpers
+# v7.0.0 Phase A — Cross-stack data-quality tag sets
 # ---------------------------------------------------------------------------
-#
-# These mirror the corresponding sets in scoring.py v5.2.5 verbatim so
-# both modules share the same canonical understanding of which warning
-# tags signal which kind of upstream issue. The provider error classes
-# come from eodhd_provider v4.7.3, yahoo_fundamentals_provider v6.1.0,
-# yahoo_chart_provider v8.2.0, and enriched_quote v4.3.0. The engine
-# warning tags come from data_engine_v2 v5.60.0 Phase H / I / P / B.
 
-# Strings that, even though non-empty, should be treated as "no error"
-# when found in last_error_class. Mirrors scoring.py v5.2.5 Phase L.
 _PROVIDER_ERROR_NULL_STRINGS: FrozenSet[str] = frozenset({
     "none", "null", "nil", "nan", "n/a", "na",
 })
 
-# Engine-applied warning tags that mean the engine cleared intrinsic_value
-# and/or upside_pct due to unit-mismatch or synthesizer-overshoot
-# detection. Mirrors scoring.py v5.2.5 _ENGINE_DROPPED_VALUATION_TAGS.
 _ENGINE_DROPPED_VALUATION_TAGS: FrozenSet[str] = frozenset({
     "intrinsic_unit_mismatch_suspected",
     "upside_synthesis_suspect",
@@ -497,8 +351,6 @@ _ENGINE_DROPPED_VALUATION_TAGS: FrozenSet[str] = frozenset({
     "engine_52w_high_low_inverted",
 })
 
-# Engine-emitted warning tags that mark a row as unforecastable.
-# Mirrors scoring.py v5.2.5 _ENGINE_UNFORECASTABLE_TAGS.
 _ENGINE_UNFORECASTABLE_TAGS: FrozenSet[str] = frozenset({
     "forecast_unavailable",
     "forecast_unavailable_no_source",
@@ -675,11 +527,7 @@ def _is_signature_mismatch(error: TypeError) -> bool:
 # ---------------------------------------------------------------------------
 
 def _warning_tags_from_row(row: Mapping[str, Any]) -> Set[str]:
-    """
-    v7.0.0 Phase A: parse a row's `warnings` field into a Set[str] of
-    normalized tags. Mirrors scoring.py v5.2.5 `_warning_tags_from_row`
-    verbatim so both modules share the canonical parser.
-    """
+    """Parse a row's `warnings` field into a Set[str] of normalized tags."""
     if row is None:
         return set()
     raw = row.get("warnings") if isinstance(row, Mapping) else None
@@ -721,11 +569,7 @@ def _warning_tags_from_row(row: Mapping[str, Any]) -> Set[str]:
 
 
 def _provider_error_from_row(row: Mapping[str, Any]) -> str:
-    """
-    v7.0.0 Phase A: extract the row's last_error_class with null-string
-    filtering. Returns the error-class string if it's a real value, or
-    "" if the field is missing, empty, or a null-like string.
-    """
+    """Extract the row's last_error_class with null-string filtering."""
     if not isinstance(row, Mapping):
         return ""
     for key in ("last_error_class", "lastErrorClass", "errorClass", "error_class"):
@@ -742,10 +586,7 @@ def _provider_error_from_row(row: Mapping[str, Any]) -> str:
 
 
 def _row_has_engine_dropped_valuation(row: Mapping[str, Any]) -> bool:
-    """
-    v7.0.0 Phase A: True when the row's warnings contain any of the
-    engine-applied valuation-drop tags.
-    """
+    """True when the row's warnings contain any engine-applied valuation-drop tag."""
     if not isinstance(row, Mapping):
         return False
     tags = _warning_tags_from_row(row)
@@ -755,10 +596,7 @@ def _row_has_engine_dropped_valuation(row: Mapping[str, Any]) -> bool:
 
 
 def _row_is_forecast_unavailable(row: Mapping[str, Any]) -> bool:
-    """
-    v7.0.0 Phase I: True when the row's `forecast_unavailable` bool
-    flag is set OR its warnings string contains an unforecastable tag.
-    """
+    """True when the row's forecast_unavailable flag is set OR warnings mark it."""
     if not isinstance(row, Mapping):
         return False
     for key in ("forecast_unavailable", "is_forecast_unavailable"):
@@ -771,10 +609,7 @@ def _row_is_forecast_unavailable(row: Mapping[str, Any]) -> bool:
 
 
 def _engine_drop_tags_from_row(row: Mapping[str, Any]) -> List[str]:
-    """
-    v7.0.0 Phase A: return the sorted list of engine-dropped-valuation
-    tags present in the row's warnings, or [] if none.
-    """
+    """Return the sorted list of engine-dropped-valuation tags, or []."""
     if not isinstance(row, Mapping):
         return []
     matching = _warning_tags_from_row(row) & _ENGINE_DROPPED_VALUATION_TAGS
@@ -782,10 +617,7 @@ def _engine_drop_tags_from_row(row: Mapping[str, Any]) -> List[str]:
 
 
 def _forecast_skip_tags_from_row(row: Mapping[str, Any]) -> List[str]:
-    """
-    v7.0.0 Phase A: return the sorted list of engine-unforecastable
-    tags present in the row's warnings, or [] if none.
-    """
+    """Return the sorted list of engine-unforecastable tags, or []."""
     if not isinstance(row, Mapping):
         return []
     matching = list(_warning_tags_from_row(row) & _ENGINE_UNFORECASTABLE_TAGS)
@@ -798,46 +630,13 @@ def _forecast_skip_tags_from_row(row: Mapping[str, Any]) -> List[str]:
 
 
 def _extract_scoring_enrichment(row: Mapping[str, Any]) -> Dict[str, Any]:
-    """
-    Pull scoring v5.7.0 enrichment fields from a row into a normalized
-    dict for Top Picks formatting.
-
-    v7.0.0 fields (preserved):
-      - conviction         (float|None)  from `conviction_score`
-      - top_factors        (str)         from `top_factors`
-      - top_risks          (str)         from `top_risks`
-      - position_size_hint (str)         from `position_size_hint`
-
-    v8.0.0 NEW fields (cascade-bridge + scoring-provenance, sourced
-    from data_engine_v2 v5.74.0+ row layout):
-      - priority_band    (str)        from `recommendation_priority_band`
-                                       (fallback alias: `priority_band`).
-                                       scoring v5.7.0 P1..P5 urgency tier.
-      - provider_rating  (str)        from `provider_rating`. Raw
-                                       per-provider recommendation BEFORE
-                                       the engine's reco_normalize routing.
-                                       Useful for flagging provider/engine
-                                       divergence.
-      - scoring_source   (str)        from `scoring_recommendation_source`
-                                       (fallback alias:
-                                       `recommendation_source`). Indicates
-                                       which scoring path produced the
-                                       recommendation ("view_aware",
-                                       "composite_fallback", etc.).
-      - penalty_factor   (float|None) from `overall_penalty_factor`.
-                                       Ratio overall_score / overall_score_raw.
-                                       Value < 1.0 means scoring applied a
-                                       penalty (data-quality, conviction,
-                                       or other gating). 1.0 means no
-                                       penalty. None means field absent.
-    """
+    """Pull scoring v5.7.0 enrichment + v8.0.0 cascade-bridge fields from a row."""
     if not isinstance(row, Mapping):
         return {
             "conviction": None,
             "top_factors": "",
             "top_risks": "",
             "position_size_hint": "",
-            # v8.0.0 NEW
             "priority_band": "",
             "provider_rating": "",
             "scoring_source": "",
@@ -848,7 +647,6 @@ def _extract_scoring_enrichment(row: Mapping[str, Any]) -> Dict[str, Any]:
         "top_factors": _safe_str(row.get("top_factors")),
         "top_risks": _safe_str(row.get("top_risks")),
         "position_size_hint": _safe_str(row.get("position_size_hint")),
-        # v8.0.0 Phase F: cascade-bridge + scoring-provenance fields
         "priority_band": _safe_str(
             row.get("recommendation_priority_band")
             or row.get("priority_band")
@@ -866,19 +664,7 @@ def _priority_band_to_insights_priority(
     band: str,
     default: str = "Low",
 ) -> str:
-    """
-    v8.0.0 Phase E: Map scoring v5.7.0 priority_band (P1..P5) to the
-    Insights High/Medium/Low priority vocabulary.
-
-    P1 / P2 -> High   (most urgent: STRONG_BUY / STRONG_SELL / AVOID
-                       actions, immediate review needed)
-    P3 / P4 -> Medium
-    P5      -> Low    (least urgent: HOLD-type with low conviction)
-
-    Empty / unknown bands return `default` (default "Low") so the
-    function can be safely chained with rank-based priority fallback:
-        priority = _priority_band_to_insights_priority(band, rank_priority)
-    """
+    """v8.0.0 Phase E: map scoring v5.7.0 priority_band (P1..P5) to Insights priority."""
     if not band:
         return default
     return _PRIORITY_BAND_TO_INSIGHTS_PRIORITY.get(
@@ -888,16 +674,7 @@ def _priority_band_to_insights_priority(
 
 
 def _row_has_8tier_recommendation(row: Mapping[str, Any]) -> bool:
-    """
-    v8.0.0 Phase I: True when the row's `recommendation` is one of
-    the 3 tokens that only exist in the 8-tier vocabulary
-    (ACCUMULATE / STRONG_SELL / AVOID). Used to populate the
-    `reco_8tier_seen` capability flag in the response meta.
-
-    Note: returns False for 5-tier-only tokens (STRONG_BUY / BUY /
-    HOLD / REDUCE / SELL) — those are valid in both vocabularies, so
-    their presence doesn't prove the upstream is on v8.0.0.
-    """
+    """v8.0.0 Phase I: True when row.recommendation is ACCUMULATE/STRONG_SELL/AVOID."""
     if not isinstance(row, Mapping):
         return False
     r = _safe_str(row.get("recommendation")).upper()
@@ -1084,8 +861,9 @@ def get_insights_schema() -> Tuple[List[str], List[str], str]:
     """
     Return the Insights_Analysis schema.
 
-    v6.0.0: registry contract is exactly 7 columns
-    (section, item, symbol, metric, value, notes, last_updated_riyadh).
+    Registry-first: takes the live schema_registry spec when available
+    (v2.14.0 -> [section, item, metric, value, notes, source, sort_order]).
+    Falls back to the v8.1.0-synced 7-col hardcoded contract otherwise.
     """
     try:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
@@ -1223,9 +1001,6 @@ def _normalize_criteria(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     # the rebuild below and reach top10_selector v4.14.0 through
     # `_fetch_top10_payload`. Shape coercion mirrors top10_selector's own
     # `_collect_criteria_from_inputs` so the two normalizers agree.
-    #
-    # min_conviction_score (v3.1.0): float, 0..100. Accept fractional
-    # input ("0.60") as percentage (60).
     mcs_raw = c.get("min_conviction_score")
     if mcs_raw is None:
         mcs_raw = c.get("min_conviction")
@@ -1299,9 +1074,7 @@ def _normalize_criteria(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             c.get("exclude_forecast_unavailable"), False),
         "exclude_provider_errors": _to_bool(
             c.get("exclude_provider_errors"), False),
-        # v8.0.1 Phase B: criteria_model v3.2.0 forward-compat fields. Top10
-        # selector v4.14.0 already consumes these; criteria_model v3.2.0
-        # will land them as canonical pydantic fields. Defaults off.
+        # v8.0.1 Phase B: criteria_model v3.2.0 forward-compat fields.
         "exclude_avoid_recommendations": _to_bool(
             c.get("exclude_avoid_recommendations"), False),
         "min_priority_band": canon_band,
@@ -1361,6 +1134,18 @@ def _make_row(
     """Build a row dict aligned with the current schema keys."""
     timestamp = last_updated_riyadh or as_of_riyadh or _now_riyadh_iso()
 
+    item_str = _safe_str(item) or "Item"
+    sym_str = _safe_str(symbol)
+    has_symbol_col = "symbol" in keys
+    # v8.1.0 Phase B: under the symbol-less v2.14.0 contract there is no
+    # `symbol` column to carry per-symbol identity. Fold the symbol into the
+    # Item label so per-symbol insights (Top Gainer/Loser, Best ROI, Highest
+    # Vol, ...) stay identifiable on the sheet. No-op when a `symbol` column
+    # exists (the symbol still routes to its own column) or the symbol is
+    # already present in the item text (most "X -- {sym}" items already are).
+    if sym_str and not has_symbol_col and sym_str not in item_str:
+        item_str = f"{item_str} -- {sym_str}"
+
     if value is None:
         formatted_value: Any = ""
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1380,8 +1165,8 @@ def _make_row(
 
     full_row: Dict[str, Any] = {
         "section": _safe_str(section) or "General",
-        "item": _safe_str(item) or "Item",
-        "symbol": _safe_str(symbol),
+        "item": item_str,
+        "symbol": sym_str,
         "metric": _safe_str(metric) or "metric",
         "value": formatted_value,
         "signal": sig_for_col,
@@ -1402,6 +1187,57 @@ def _rows_to_matrix(rows: Sequence[Dict[str, Any]], keys: Sequence[str]) -> List
         for row in rows
         if isinstance(row, dict)
     ]
+
+
+def _finalize_insights_rows(
+    rows: List[Dict[str, Any]],
+    keys: Sequence[str],
+    universe_names: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    v8.2.0 E2: order rows into advisor-first section bands, then stamp the
+    live-contract `source` + `sort_order` columns (v8.1.0 Phase C).
+
+    Ordering: stable-sort by (_row_band, original_emit_index). The row SET is
+    never changed -- only the order -- and within-band emit order is preserved,
+    so ranked / interleaved sub-sections keep their internal order. The live
+    consumer (routes/advanced_sheet_rows) projects row_objects in list order
+    with no re-sort, so this is the realized sheet layout.
+
+    Stamping (after ordering, so sort_order reflects the final position):
+      - sort_order -> monotonic 1..N in the ordered sequence (only when the
+        schema has a `sort_order` column).
+      - source     -> per-section provenance via `_section_source`, filled only
+        when the schema has a `source` column AND the row left it empty (so an
+        explicitly-set source is never overwritten).
+
+    Mutates the passed list in place (and returns it). Safe on a schema without
+    source/sort_order columns -- the band-ordering still applies, which is
+    correct for any flat-table contract.
+    """
+    universe_norm: Set[str] = set()
+    for u in (universe_names or []):
+        n = "".join(ch for ch in _safe_str(u).lower() if ch.isalnum())
+        if n:
+            universe_norm.add(n)
+
+    # Stable band ordering (the index key preserves within-band emit order).
+    indexed = list(enumerate(rows))
+    indexed.sort(key=lambda pair: (_row_band(pair[1], universe_norm), pair[0]))
+    rows[:] = [r for _, r in indexed]
+
+    has_sort = "sort_order" in keys
+    has_source = "source" in keys
+    if not has_sort and not has_source:
+        return rows
+    for idx, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            continue
+        if has_sort:
+            row["sort_order"] = idx
+        if has_source and not _safe_str(row.get("source")):
+            row["source"] = _section_source(row.get("section", ""))
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1731,33 +1567,11 @@ async def _fetch_top10_symbols(
 
 
 # ---------------------------------------------------------------------------
-# v7.0.0 Phase G — Recommendation -> signal token mapping (refined)
-# v8.0.0 Phase D — Extended to 8 tiers
+# v7.0.0 Phase G / v8.0.0 Phase D — Recommendation -> signal token mapping
 # ---------------------------------------------------------------------------
 
 def _reco_to_signal(recommendation: str) -> str:
-    """
-    v8.0.0 Phase D: return the finer-grained 8-tier signal token directly
-    so Top Picks notes distinguish all canonical recommendation tiers
-    emitted by reco_normalize v8.0.0 / scoring v5.7.0 / data_engine_v2
-    v5.76.0.
-
-    Mapping (v8.0.0):
-      STRONG_BUY    -> "STRONG_BUY"
-      BUY           -> "BUY"
-      ACCUMULATE    -> "ACCUMULATE"   (v8.0.0 NEW; v7.0.0 collapsed to "HOLD")
-      HOLD          -> "HOLD"
-      REDUCE        -> "REDUCE"
-      SELL          -> "SELL"
-      STRONG_SELL   -> "STRONG_SELL"  (v8.0.0 NEW; v7.0.0 collapsed to "HOLD")
-      AVOID         -> "AVOID"        (v8.0.0 NEW; v7.0.0 collapsed to "HOLD")
-      unknown       -> "HOLD"         (safe default; preserved)
-
-    Other section builders (`_build_macro_signal_rows`,
-    `_build_portfolio_kpis_rows`) use `_SIGNAL_UP` / `_SIGNAL_DOWN`
-    directly and are NOT affected — those constants are preserved
-    verbatim from v6.0.0.
-    """
+    """Return the finer-grained 8-tier signal token for a recommendation."""
     r = _safe_str(recommendation).upper()
     if r == "STRONG_BUY":
         return _SIGNAL_STRONG_UP
@@ -1923,16 +1737,7 @@ def _build_risk_alert_rows(
     ctx: BuildContext,
     quotes: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    Build Risk Alerts section rows.
-
-    v8.0.0 Phase H: adds a new sub-category for rows where
-    `recommendation in {AVOID, STRONG_SELL}` regardless of risk_score.
-    These are explicit engine-driven "do not touch" calls — important
-    to surface even when the risk_score is moderate (e.g. a distressed
-    stock with low realised volatility yet). AVOID rows get priority
-    High; STRONG_SELL rows get Medium. Up to 6 such rows are emitted.
-    """
+    """Build Risk Alerts section rows (v8.0.0 Phase H: + AVOID/STRONG_SELL sub-section)."""
     rows: List[Dict[str, Any]] = []
     if not quotes:
         return rows
@@ -1940,10 +1745,6 @@ def _build_risk_alert_rows(
     max_risk = ctx.norm_criteria.get("max_risk_score", 60.0)
     high_risk: List[Tuple[float, str, Dict[str, Any]]] = []
     cautions: List[Tuple[str, str, str]] = []
-    # v8.0.0 Phase H: collect recommendation-driven alerts during the
-    # same scan. Tuple shape: (priority_token, sym, reco, row_dict).
-    # priority_token is _PRI_HIGH for AVOID and _PRI_MEDIUM for
-    # STRONG_SELL — preserves urgency ordering.
     reco_alerts: List[Tuple[str, str, str, Dict[str, Any]]] = []
 
     for sym, d in quotes.items():
@@ -1964,10 +1765,6 @@ def _build_risk_alert_rows(
         if vol_30d is not None and vol_30d >= 40.0:
             cautions.append((sym, f"High volatility 30D: {vol_30d:.1f}%", _PRI_MEDIUM))
 
-        # v8.0.0 Phase H: AVOID / STRONG_SELL surfacing regardless of
-        # risk_score. Engine v4.5.0 + scoring v5.7.0 may flag these
-        # tokens on rows that have moderate realised risk metrics — the
-        # recommendation itself is the alert signal.
         reco = _safe_str(d.get("recommendation", "")).upper()
         if reco == "AVOID":
             reco_alerts.append((_PRI_HIGH, sym, reco, d))
@@ -1987,8 +1784,6 @@ def _build_risk_alert_rows(
     high_risk.sort(key=lambda x: x[0], reverse=True)
     high_count = sum(1 for r, _, _ in high_risk if r >= 70.0)
 
-    # v8.0.0 Phase H: include reco_alerts in the summary count + note text
-    # so the summary row reflects the full alert universe.
     avoid_count = sum(1 for p, _, r, _ in reco_alerts if r == "AVOID")
     strong_sell_count = sum(1 for p, _, r, _ in reco_alerts if r == "STRONG_SELL")
     summary_notes_parts = [
@@ -2038,9 +1833,6 @@ def _build_risk_alert_rows(
             last_updated_riyadh=ctx.ts,
         ))
 
-    # v8.0.0 Phase H: NEW recommendation-driven alerts. Sort AVOID first
-    # (priority High) then STRONG_SELL (priority Medium), then by symbol.
-    # Cap at 6 rows to keep the section scannable.
     reco_alerts.sort(key=lambda x: (0 if x[0] == _PRI_HIGH else 1, x[1]))
     for priority_token, sym, reco_tok, d in reco_alerts[:6]:
         risk_score = _as_float(d.get("risk_score"))
@@ -2092,17 +1884,14 @@ def _build_risk_alert_rows(
 
 
 # ---------------------------------------------------------------------------
-# v7.0.0 Phase A — NEW SECTION: Data Quality Alerts
+# v7.0.0 Phase A — Data Quality Alerts
 # ---------------------------------------------------------------------------
 
 def _build_data_quality_rows(
     ctx: BuildContext,
     quotes: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    v7.0.0 Phase A: surface provider errors and engine-applied warning
-    tags from the quote rows.
-    """
+    """Surface provider errors and engine-applied warning tags from quote rows."""
     rows: List[Dict[str, Any]] = []
     if not quotes:
         return rows
@@ -2232,7 +2021,7 @@ def _build_short_term_rows(
     min_tech_score: float = 58.0,
     max_items: int = 7,
 ) -> List[Dict[str, Any]]:
-    """Build Short-Term Opportunities section rows."""
+    """Build Short-Term Opportunities section rows (v8.0.0 Phase G: + ACCUMULATE)."""
     rows: List[Dict[str, Any]] = []
     if not quotes:
         return rows
@@ -2243,11 +2032,6 @@ def _build_short_term_rows(
         st_signal = _safe_str(d.get("short_term_signal", "")).upper()
         if tech_score is None or tech_score < min_tech_score:
             continue
-        # v8.0.0 Phase G: ACCUMULATE qualifies alongside BUY / STRONG_BUY.
-        # Scoring v5.7.0 emits ACCUMULATE for moderate-bullish setups; in
-        # short-term technical context these are scale-in candidates worth
-        # surfacing. v7.0.0 silently dropped them (st_signal=="ACCUMULATE"
-        # never passed the qualifier).
         if st_signal not in ("BUY", "STRONG_BUY", "ACCUMULATE"):
             continue
         candidates.append((tech_score, sym, d))
@@ -2286,9 +2070,6 @@ def _build_short_term_rows(
         upside = _as_float(d.get("upside_pct"))
         name = _safe_str(d.get("name", sym))
 
-        # v8.0.0 Phase G: ACCUMULATE rendered as its own signal token
-        # (was collapsed to "BUY" if it ever reached this loop in v7.0.0,
-        # which it didn't because the qualifier rejected it).
         if st_signal == "STRONG_BUY":
             signal = "STRONG_BUY"
         elif st_signal == "ACCUMULATE":
@@ -2587,10 +2368,6 @@ def _build_top_picks_rows(
             signal = _reco_to_signal(recommendation)
 
             enr = _extract_scoring_enrichment(d)
-            # v8.0.0 Phase E: priority_band override. When the engine
-            # carries an explicit P1..P5 urgency tier from scoring v5.7.0,
-            # it takes precedence over rank-based priority — a P1 pick
-            # is High even if it's #8 in the list.
             priority = _priority_band_to_insights_priority(
                 enr["priority_band"], default=rank_priority,
             )
@@ -2602,9 +2379,6 @@ def _build_top_picks_rows(
                 note_parts.append(name)
             if enr["conviction"] is not None:
                 note_parts.append(f"conv={enr['conviction']:.0f}")
-            # v8.0.0 Phase F: surface penalty when overall_score was
-            # adjusted downward from overall_score_raw. Value < 1.0
-            # means scoring applied a quality / conviction penalty.
             if enr["penalty_factor"] is not None and enr["penalty_factor"] < 1.0:
                 note_parts.append(f"penalty={enr['penalty_factor']:.2f}")
             if enr["top_factors"]:
@@ -2647,7 +2421,6 @@ def _build_top_picks_rows(
                     notes="Suggested position size from scoring insights",
                     last_updated_riyadh=ctx.ts,
                 ))
-            # v8.0.0 Phase F: cascade-bridge context rows.
             if enr["priority_band"]:
                 rows.append(_make_row(
                     keys=ctx.keys, section="Top Picks Context",
@@ -2738,8 +2511,6 @@ def _build_top_picks_rows(
             note_parts.append(f"conf={_format_percent(confidence)}")
         if enr["conviction"] is not None:
             note_parts.append(f"conv={enr['conviction']:.0f}")
-        # v8.0.0 Phase F: surface penalty when overall_score was
-        # adjusted downward from overall_score_raw.
         if enr["penalty_factor"] is not None and enr["penalty_factor"] < 1.0:
             note_parts.append(f"penalty={enr['penalty_factor']:.2f}")
         if risk_bucket:
@@ -2756,9 +2527,6 @@ def _build_top_picks_rows(
         if _row_is_forecast_unavailable(raw):
             note_parts.append("forecast_unavailable_upstream")
 
-        # v8.0.0 Phase E: priority_band override. P1..P5 urgency tier
-        # from scoring v5.7.0 takes precedence over rank-based
-        # priority when present.
         rank_priority = (
             _PRI_HIGH if rank <= 3
             else (_PRI_MEDIUM if rank <= 7 else _PRI_LOW)
@@ -2811,7 +2579,6 @@ def _build_top_picks_rows(
                 last_updated_riyadh=ctx.ts,
             ))
 
-        # v8.0.0 Phase F: cascade-bridge context rows.
         if enr["priority_band"]:
             rows.append(_make_row(
                 keys=ctx.keys, section="Top Picks Context",
@@ -2928,6 +2695,159 @@ def _default_universes() -> Dict[str, List[str]]:
     }
 
 
+def _build_executive_summary_rows(
+    ctx: BuildContext,
+    section_rows: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    v8.2.0 E1: derive a compact Executive Summary headline from the
+    already-built section rows + ctx.all_quotes.
+
+    Counts come from the section builders' own output (single source of truth
+    -- no threshold re-derivation), so the headline can never disagree with the
+    detail rows below it. Item-prefix predicates account for the v8.1.0
+    symbol-fold (e.g. a Top Pick "#1" may render as "#1 -- 2222.SR", but still
+    starts with "#"). Returns [] when there is nothing to summarize.
+    """
+    keys = ctx.keys
+    ts = ctx.ts
+    quotes = ctx.all_quotes
+    rows: List[Dict[str, Any]] = []
+
+    def _count(section: str, starts: Tuple[str, ...]) -> int:
+        s = section.lower()
+        return sum(
+            1 for r in section_rows
+            if isinstance(r, Mapping)
+            and _safe_str(r.get("section")).lower() == s
+            and _safe_str(r.get("item")).startswith(starts)
+        )
+
+    n_picks = _count("Top Picks", ("#",))
+    n_risk = _count("Risk Alerts", ("High Risk", "AVOID", "STRONG_SELL", "Caution"))
+    n_short = _count("Short-Term Opportunities", ("BUY", "STRONG_BUY", "ACCUMULATE"))
+    n_dq = _count("Data Quality Alerts", ("Provider Error", "Engine Dropped", "Forecast Unavailable"))
+
+    pcs = [
+        pc for d in quotes.values()
+        if isinstance(d, Mapping) and (pc := _as_float(d.get("percent_change"))) is not None
+    ]
+
+    # Nothing meaningful to headline (degraded run).
+    if not quotes and not n_picks and not n_risk and not n_short:
+        return rows
+
+    # Overview one-liner.
+    parts: List[str] = []
+    if n_picks:
+        parts.append(f"{n_picks} top pick(s)")
+    if n_risk:
+        parts.append(f"{n_risk} risk alert(s)")
+    if n_short:
+        parts.append(f"{n_short} short-term setup(s)")
+    if n_dq:
+        parts.append(f"{n_dq} data-quality flag(s)")
+    overview = " | ".join(parts) if parts else "No actionable signals this run"
+    rows.append(_make_row(
+        keys=keys, section="Executive Summary", item="Overview",
+        metric="headline", value=overview,
+        priority=_PRI_HIGH if (n_picks or n_risk) else _PRI_LOW,
+        notes=f"Snapshot across {len(quotes)} symbol(s) scanned this run",
+        last_updated_riyadh=ts,
+    ))
+
+    # Market tone.
+    if pcs:
+        avg = sum(pcs) / len(pcs)
+        if avg >= 0.3:
+            tone, sig = "Bullish", _SIGNAL_UP
+        elif avg <= -0.3:
+            tone, sig = "Bearish", _SIGNAL_DOWN
+        else:
+            tone, sig = "Neutral", _SIGNAL_NEUTRAL
+        rows.append(_make_row(
+            keys=keys, section="Executive Summary", item="Market Tone",
+            metric="avg_percent_change", value=_as_percent_points(avg),
+            signal=sig, priority=_PRI_MEDIUM,
+            notes=(
+                f"{tone} -- average move {_format_percent(avg)} "
+                f"across {len(pcs)} symbol(s) with data"
+            ),
+            last_updated_riyadh=ts,
+        ))
+
+    # Top pick highlight.
+    if n_picks:
+        first = next(
+            (r for r in section_rows
+             if isinstance(r, Mapping)
+             and _safe_str(r.get("section")) == "Top Picks"
+             and _safe_str(r.get("item")).startswith("#1")),
+            None,
+        )
+        note = f"{n_picks} ranked pick(s) -- see Top Picks"
+        if first is not None:
+            note = f"Top pick: {_safe_str(first.get('item'))} | " + note
+        rows.append(_make_row(
+            keys=keys, section="Executive Summary", item="Top Picks",
+            metric="top_picks_count", value=n_picks,
+            signal=_SIGNAL_UP, priority=_PRI_HIGH,
+            notes=note, last_updated_riyadh=ts,
+        ))
+
+    # Risk headline.
+    if n_risk:
+        rows.append(_make_row(
+            keys=keys, section="Executive Summary", item="Risk Alerts",
+            metric="risk_alert_count", value=n_risk,
+            signal=_SIGNAL_ALERT, priority=_PRI_HIGH,
+            notes=f"{n_risk} risk flag(s) raised -- review Risk Alerts before acting",
+            last_updated_riyadh=ts,
+        ))
+
+    # Short-term headline.
+    if n_short:
+        rows.append(_make_row(
+            keys=keys, section="Executive Summary", item="Short-Term Opportunities",
+            metric="short_term_count", value=n_short,
+            signal=_SIGNAL_UP, priority=_PRI_MEDIUM,
+            notes=f"{n_short} strong technical setup(s) -- see Short-Term Opportunities",
+            last_updated_riyadh=ts,
+        ))
+
+    # Portfolio P/L headline (only when positions exist).
+    pnl = next(
+        (r for r in section_rows
+         if isinstance(r, Mapping)
+         and _safe_str(r.get("section")) == "Portfolio KPIs"
+         and _safe_str(r.get("item")) == "Unrealized P/L"),
+        None,
+    )
+    if pnl is not None:
+        val = pnl.get("value")
+        fval = _as_float(val)
+        sig = _SIGNAL_OK if (fval is None or fval >= 0) else _SIGNAL_ALERT
+        rows.append(_make_row(
+            keys=keys, section="Executive Summary", item="Portfolio P/L",
+            metric="unrealized_pl", value=val,
+            signal=sig, priority=_PRI_MEDIUM,
+            notes="Unrealized P/L across open positions -- see Portfolio KPIs",
+            last_updated_riyadh=ts,
+        ))
+
+    # Data-quality headline.
+    if n_dq:
+        rows.append(_make_row(
+            keys=keys, section="Executive Summary", item="Data Quality",
+            metric="data_quality_flags", value=n_dq,
+            signal=_SIGNAL_WARN, priority=_PRI_MEDIUM,
+            notes=f"{n_dq} symbol(s) flagged -- interpret affected metrics with caution",
+            last_updated_riyadh=ts,
+        ))
+
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Main Builder
 # ---------------------------------------------------------------------------
@@ -2980,9 +2900,10 @@ async def build_insights_analysis_rows(
             priority=_PRI_LOW,
             notes=(
                 f"core/analysis/insights_builder.py v{INSIGHTS_BUILDER_VERSION} -- "
-                f"7-col schema (registry v2.11.0) + 8-tier vocabulary + "
-                f"priority-band consumption + cascade-bridge surfacing + "
-                f"top10_selector v4.14.0 family-floor sync"
+                f"7-col schema (registry v2.14.0: source/sort_order populated) + "
+                f"Executive Summary headline + advisor-first band ordering + "
+                f"8-tier vocabulary + priority-band consumption + "
+                f"cascade-bridge surfacing + top10_selector v4.14.0 family-floor sync"
             ),
             last_updated_riyadh=timestamp,
         ))
@@ -3026,6 +2947,8 @@ async def build_insights_analysis_rows(
         ))
         if do_risk_scenarios:
             rows.extend(_build_risk_scenario_rows(ctx))
+        # v8.1.0 Phase C: stamp source + sort_order on the partial path too.
+        rows = _finalize_insights_rows(rows, keys)
         return {
             "status": "partial",
             "page": "Insights_Analysis",
@@ -3045,9 +2968,6 @@ async def build_insights_analysis_rows(
                 "builder_version": INSIGHTS_BUILDER_VERSION,
                 "criteria_snapshot": _criteria_snapshot(norm_criteria),
                 "warnings": warnings,
-                # v8.0.0 Phase I: capability flags. Both False in the
-                # early-return path because no quotes were fetched.
-                # Meta shape stays consistent across both paths.
                 "reco_8tier_seen": False,
                 "priority_band_seen": False,
             },
@@ -3155,6 +3075,13 @@ async def build_insights_analysis_rows(
     if do_macro_signals and ctx.all_quotes:
         rows.extend(_build_macro_signal_rows(ctx, ctx.all_quotes))
 
+    # v8.2.0 E1: Executive Summary headline, derived from the built section
+    # rows (single source of truth -- counts mirror the detail rows). Appended
+    # here; the band-ordering in _finalize_insights_rows floats it to the top.
+    exec_rows = _build_executive_summary_rows(ctx, rows)
+    if exec_rows:
+        rows.extend(exec_rows)
+
     if warnings:
         rows.insert(0, _make_row(
             keys=keys, section="System", item="Builder Warnings",
@@ -3164,12 +3091,14 @@ async def build_insights_analysis_rows(
             last_updated_riyadh=timestamp,
         ))
 
-    # v8.0.0 Phase I: compute cross-stack capability flags by scanning
-    # ctx.all_quotes. `reco_8tier_seen` proves upstream is emitting the
-    # v8.0.0 vocabulary (at least one row carried ACCUMULATE / STRONG_SELL /
-    # AVOID). `priority_band_seen` proves data_engine_v2 v5.74.0+ is
-    # passing through scoring v5.7.0's priority_band field. Ops dashboards
-    # can use these to verify the whole stack is in 8-tier lockstep.
+    # v8.2.0 E2: order rows into advisor-first section bands, then stamp the
+    # v8.1.0 source (per-section provenance) + sort_order (monotonic 1..N in
+    # the final ordered sequence) columns.
+    rows = _finalize_insights_rows(
+        rows, keys, universe_names=list(effective_universes.keys()),
+    )
+
+    # v8.0.0 Phase I: cross-stack capability flags from ctx.all_quotes.
     reco_8tier_seen = any(
         _row_has_8tier_recommendation(r) for r in ctx.all_quotes.values()
     )
@@ -3181,14 +3110,7 @@ async def build_insights_analysis_rows(
         if isinstance(r, Mapping)
     )
 
-    # v8.0.1 Phase C: top10_selector v4.14.0 meta surfacing. The selector
-    # emits a `reco_8tier_aware` capability flag, parallel
-    # `applied_v310_filters` / `applied_v8tier_filters` audit blocks, and
-    # an extended `data_quality_summary` block (with avoid_count /
-    # accumulate_count / strong_sell_count / reco_8tier_seen /
-    # priority_band_seen counts). We propagate them under `top10_*` keys
-    # so ops dashboards consuming Insights meta can verify whole-stack
-    # 8-tier alignment without a separate top10 call.
+    # v8.0.1 Phase C: top10_selector v4.14.0 meta surfacing.
     top10_meta = top10_payload.get("meta", {}) if isinstance(top10_payload, dict) else {}
     if not isinstance(top10_meta, dict):
         top10_meta = {}
@@ -3222,10 +3144,8 @@ async def build_insights_analysis_rows(
             "builder_version": INSIGHTS_BUILDER_VERSION,
             "criteria_snapshot": _criteria_snapshot(norm_criteria),
             "warnings": warnings,
-            # v8.0.0 Phase I: 8-tier vocabulary + priority-band capability flags
             "reco_8tier_seen": reco_8tier_seen,
             "priority_band_seen": priority_band_seen,
-            # v8.0.1 Phase C: top10_selector v4.14.0 meta passthrough.
             "top10_reco_8tier_aware": top10_reco_8tier_aware,
             "top10_applied_v310_filters": top10_applied_v310_filters,
             "top10_applied_v8tier_filters": top10_applied_v8tier_filters,
