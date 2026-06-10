@@ -3,7 +3,7 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.15.0
+Top 10 Selector — v4.16.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -15,6 +15,92 @@ DECISION-MATRIX AWARE • CANDLESTICK AWARE (v4.12.0)
 CANONICAL-BUCKET ROUTED • REAL OVERALL-RANK FALLBACK (v4.13.0)
 8-TIER VOCABULARY AWARE • PRIORITY-BAND ROUTED • CASCADE-BRIDGE READY (v4.14.0)
 PAGINATION-ENVELOPE SAFE • FULL-UNIVERSE INGEST • LIMIT-FILL BACKFILL (v4.15.0)
+VINTAGE-PROTECTED MERGE • GATE-FIELD QUARANTINE • ADMISSION-FILTERED (v4.16.0)
+
+================================================================================
+What v4.16.0 fixes (over v4.15.0)  --  THE "STALE 46.4 RELIABILITY" BUG (Fix U)
+================================================================================
+Symptom: the live Top_10_Investments sheet showed PRE-Fix-S Forecast
+Reliability Scores (NVDA/META 46.4, MSFT 44.8) on rows whose Investability
+Status said INVESTABLE, while the SAME symbols on the Global_Markets source
+page (refreshed the same morning by data_engine_v2 v5.83.3) showed the
+POST-Fix-S values (71.5 / 70.4).  Audit date 2026-06-10; verified against
+the live workbook by diffing Top_10 vs Global_Markets per symbol.
+
+Root cause (merge vintage, in-module): the candidate pipeline merges rows
+from FIVE donors of very different freshness --
+
+    live page rows        (engine get_sheet_rows .......... fresh)
+    direct-symbol rows    (engine quote batch .............. fresh)
+    hydration rows        (engine quote batch .............. fresh)
+    page SNAPSHOT rows    (engine cached sheet snapshot .... possibly stale)
+    Top10 OUTPUT-PAGE
+      fallback rows       (the PREVIOUS Top_10 output ...... stale by design)
+
+-- but `_merge_row_prefer_richer` resolved every field by RICHNESS alone
+(non-blank field count).  A fully-populated stale snapshot / previous-output
+row (100+ filled fields) is almost always "richer" than a freshly fetched
+candidate row, so its old gate fields (forecast_reliability_score,
+investability_status, data_quality_score, ...) silently won the merge and
+were written back to the sheet.  Because the previous Top_10 output is
+itself a fallback donor, stale values could RE-ENTER the pool on every
+rebuild -- a self-referential staleness loop with no expiry.
+
+v4.16.0 phase changes:
+
+  A. ROW PROVENANCE TAGGING.  Every ingested row is tagged with an internal
+     `_row_provenance` rank at its fetch site: live page = 3, hydration /
+     direct-symbol = 3, emergency = 2, page snapshot = 1, Top10 output-page
+     fallback = 0.  The tag is internal-only: final projection copies ONLY
+     schema-contract keys, so it never reaches the sheet or the payload rows.
+     Untagged rows default to rank 3 (live) for back-compatibility with any
+     external caller that feeds rows directly.
+
+  B. PROVENANCE-AWARE MERGE (`_merge_row_provenance`).  When two rows for the
+     same symbol merge, the HIGHER-provenance row's non-blank values now win
+     unconditionally; the lower-provenance row may only fill blanks.  When
+     ranks are EQUAL the v4.15.0 prefer-richer behavior is preserved verbatim
+     (richer row's non-blank values win).  Two merge sites route through the
+     new merge (`_merge_symbol_row_lists`, `_collect_candidate_rows._put_row`);
+     the HYDRATION overlay in `_hydrate_page_rows` keeps its exact v4.15.0
+     semantics (enriched non-blank values always overwrite the base row) and
+     simply carries the max provenance rank forward, so a base row that was a
+     quarantined snapshot is upgraded to fresh once hydrated.
+
+  C. GATE-FIELD QUARANTINE for stale donors.  Rows arriving from the page
+     SNAPSHOT donor (rank 1) or the Top10 OUTPUT-PAGE fallback donor (rank 0)
+     have their gate-critical fields STRIPPED before entering the pool:
+     forecast_reliability_score, investability_status, data_quality_score,
+     provider_engine_conflict, scoring_errors (matched against snake_case,
+     camelCase, and display-header spellings via the canonical key matcher).
+     Principle: BLANK-OVER-STALE -- a visibly missing gate value is honest;
+     a stale one masquerades as measurement.  Stripped-field counts are
+     reported in meta (`gate_fields_quarantined_count`) so degraded runs
+     stay auditable.  Non-gate fields (price, scores, fundamentals) are NOT
+     stripped: stale-but-labeled context is still useful for ranking when
+     nothing fresher exists.
+
+  D. TOP10 ADMISSION FILTER (env-gated, DEFAULT ON;
+     `TFB_TOP10_ADMISSION_FILTER=0` disables).  A row cannot be SELECTED or
+     BACKFILLED into the final Top10 when any of these hold:
+       - current_price is blank or <= 0          (reason: missing_price)
+       - confidence (forecast_confidence falling back to confidence_score)
+         is blank or <= 0                        (reason: zero_confidence)
+       - warnings carry the engine tag
+         recommendation_forced_hold_missing_price (reason: forced_hold)
+     Root case from the 2026-06-10 audit: CPI.JSE sat in the live Top 10
+     with NO price, confidence 0.00, and a forced-HOLD tag.  Excluded rows
+     and their reasons are reported in meta (`admission_excluded`,
+     `admission_excluded_count`) and logged, so the filter is auditable and
+     reversible.  When the filter would empty the pool entirely, the
+     degraded-mode guarantee is preserved: the v4.15.0 relaxed-pool path
+     then operates on the admissible pool, and only if THAT is empty does
+     the payload degrade to zero rows exactly as v4.15.0 did.
+
+  E. VERSION BUMP 4.15.0 -> 4.16.0.  Cross-stack engine floor updated to
+     data_engine_v2 v5.83.3 (live, verified via Render shell import check).
+     All v4.15.0 public APIs preserved verbatim; `__all__` gains
+     GATE_CRITICAL_KEYS and TOP10_ADMISSION_FILTER_ENABLED only.
 
 ================================================================================
 What v4.15.0 fixes (over v4.14.0)  --  THE "8/5 NOT 10" BUG
@@ -72,7 +158,7 @@ Cross-stack family (Jun 2026 floor)
   - core.reco_normalize                v8.0.0   (8-tier canonical)
   - core.schemas                       v7.0.0   (8-tier enum + 9 cascade-bridge
                                                   fields on UnifiedQuote)
-  - core.data_engine_v2                v5.83.2  (115-col canonical; get_sheet_rows
+  - core.data_engine_v2                v5.83.3  (115-col canonical; get_sheet_rows
                                                   returns {rows, rows_display,
                                                   rows_matrix, limit, offset,
                                                   total} envelope)
@@ -120,7 +206,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.15.0"
+TOP10_SELECTOR_VERSION = "4.16.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.14.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -404,6 +490,40 @@ EMERGENCY_SYMBOLS = [
 TOP10_PENALTY_ENGINE_DROP = _env_float("TOP10_PENALTY_ENGINE_DROP", 8.0)
 TOP10_PENALTY_FORECAST_UNAVAIL = _env_float("TOP10_PENALTY_FORECAST_UNAVAIL", 10.0)
 TOP10_PENALTY_PROVIDER_ERROR = _env_float("TOP10_PENALTY_PROVIDER_ERROR", 6.0)
+
+# =============================================================================
+# v4.16.0 Phase A/C/D — vintage protection + admission filter knobs (Fix U)
+# =============================================================================
+# Row provenance ranks. Higher rank = fresher source. Assigned at each fetch
+# site; consumed by `_merge_row_provenance`. Internal-only (`_PROV_KEY` never
+# survives final projection because projection copies schema keys only).
+_PROV_LIVE = 3              # engine get_sheet_rows (live page fetch)
+_PROV_HYDRATED = 3          # engine quote batch (direct-symbol / hydration)
+_PROV_EMERGENCY = 2         # emergency-symbol fetch (fresh engine call)
+_PROV_SNAPSHOT = 1          # engine cached sheet snapshot (possibly stale)
+_PROV_OUTPUT_FALLBACK = 0   # previous Top_10 output page (stale by design)
+_PROV_KEY = "_row_provenance"
+
+# Gate-critical fields quarantined from stale donors (rank <= _PROV_SNAPSHOT).
+# These are the investability-gate outputs of data_engine_v2
+# `_apply_investability_gate`; a stale copy of any of them contradicts the
+# freshly computed gate decision (the exact defect verified 2026-06-10:
+# pre-Fix-S reliability 46.4/44.8 displayed beside post-Fix-S INVESTABLE).
+GATE_CRITICAL_KEYS: Tuple[str, ...] = (
+    "forecast_reliability_score",
+    "investability_status",
+    "data_quality_score",
+    "provider_engine_conflict",
+    "scoring_errors",
+)
+
+# Admission filter (Phase D). Default ON; set TFB_TOP10_ADMISSION_FILTER=0
+# to restore pre-v4.16.0 behavior. Reasons surfaced in meta + logs.
+TOP10_ADMISSION_FILTER_ENV = "TFB_TOP10_ADMISSION_FILTER"
+TOP10_ADMISSION_FILTER_ENABLED = (
+    os.getenv(TOP10_ADMISSION_FILTER_ENV, "1").strip().lower() in ("1", "true", "yes", "on")
+)
+_ADMISSION_FORCED_HOLD_TAG = "recommendation_forced_hold_missing_price"
 
 _ENGINE_DROP_TAGS = (
     "intrinsic_unit_mismatch_suspected",
@@ -2223,8 +2343,9 @@ def _merge_symbol_row_lists(primary: Sequence[Mapping[str, Any]], secondary: Seq
         if existing is None:
             merged[sym] = dict(row)
             return
-        richer, poorer = (row, existing) if _row_richness(row) >= _row_richness(existing) else (existing, row)
-        merged[sym] = _merge_row_prefer_richer(poorer, richer)
+        # v4.16.0 Phase B: provenance-aware merge. Equal-rank rows preserve
+        # the v4.15.0 prefer-richer behavior verbatim inside the helper.
+        merged[sym] = _merge_row_provenance(existing, row)
 
     for row in primary:
         _put(row)
@@ -2241,6 +2362,114 @@ def _merge_row_prefer_richer(base: Mapping[str, Any], update: Mapping[str, Any])
     return merged
 
 
+# =============================================================================
+# v4.16.0 Phase A/B/C/D helpers — vintage protection + admission (Fix U)
+# =============================================================================
+_GATE_CRITICAL_MATCH_CACHE: Optional[frozenset] = None
+
+
+def _gate_critical_match_set() -> frozenset:
+    """Canonical spellings of the gate-critical keys (snake / camel / compact).
+
+    Built once and cached. Uses the same `_header_to_key` / `_compact_key`
+    normalizers as the row-lookup machinery so any spelling an engine payload
+    or sheet header could produce is matched (e.g. forecast_reliability_score,
+    forecastReliabilityScore, "Forecast Reliability Score").
+    """
+    global _GATE_CRITICAL_MATCH_CACHE
+    if _GATE_CRITICAL_MATCH_CACHE is None:
+        tokens: set = set()
+        for key in GATE_CRITICAL_KEYS:
+            for variant in _canonical_key_variants(key):
+                tokens.add(variant)
+                tokens.add(_compact_key(variant))
+        _GATE_CRITICAL_MATCH_CACHE = frozenset(t for t in tokens if t)
+    return _GATE_CRITICAL_MATCH_CACHE
+
+
+def _strip_gate_critical_fields(row: Mapping[str, Any]) -> Tuple[Dict[str, Any], int]:
+    """Return a copy of `row` with gate-critical fields removed + strip count.
+
+    v4.16.0 Phase C. Applied to STALE donors only (page snapshot, Top10
+    output-page fallback) before they enter the candidate pool, so a stale
+    gate value can never masquerade as the engine's current gate decision.
+    BLANK-OVER-STALE: a missing reliability is honest; a stale one misleads.
+    """
+    match = _gate_critical_match_set()
+    cleaned: Dict[str, Any] = {}
+    stripped = 0
+    for key, value in dict(row).items():
+        raw = _s(key)
+        if raw and (
+            raw in match
+            or raw.lower() in match
+            or _header_to_key(raw) in match
+            or _compact_key(raw) in match
+        ):
+            stripped += 1
+            continue
+        cleaned[key] = value
+    return cleaned, stripped
+
+
+def _row_prov(row: Mapping[str, Any]) -> int:
+    """Provenance rank of a row. Untagged rows default to live (rank 3)."""
+    return _safe_int(row.get(_PROV_KEY), _PROV_LIVE)
+
+
+def _tag_provenance(row: Dict[str, Any], rank: int) -> Dict[str, Any]:
+    """Tag `row` in place with its provenance rank and return it."""
+    row[_PROV_KEY] = rank
+    return row
+
+
+def _merge_row_provenance(a: Mapping[str, Any], b: Mapping[str, Any]) -> Dict[str, Any]:
+    """Provenance-aware symbol merge (v4.16.0 Phase B).
+
+    Higher-provenance row's non-blank values win unconditionally; the
+    lower-provenance row may only fill blanks. On EQUAL ranks the v4.15.0
+    prefer-richer behavior is preserved verbatim: the richer row's non-blank
+    values overwrite the poorer row's. The merged row keeps the HIGHER rank,
+    so a candidate upgraded by a fresh donor stays protected in later merges.
+    """
+    rank_a, rank_b = _row_prov(a), _row_prov(b)
+    if rank_a == rank_b:
+        richer, poorer = (a, b) if _row_richness(a) >= _row_richness(b) else (b, a)
+        merged = _merge_row_prefer_richer(poorer, richer)
+        merged[_PROV_KEY] = rank_a
+        return merged
+    fresh, stale = (a, b) if rank_a > rank_b else (b, a)
+    merged = _merge_row_prefer_richer(stale, fresh)
+    merged[_PROV_KEY] = max(rank_a, rank_b)
+    return merged
+
+
+def _admission_check(row: Mapping[str, Any]) -> Tuple[bool, str]:
+    """Top10 admission gate (v4.16.0 Phase D). Returns (admissible, reason).
+
+    A row is NOT admissible to selection or backfill when:
+      - current_price is blank or <= 0                  -> "missing_price"
+      - confidence (forecast_confidence falling back to
+        confidence_score) is blank or <= 0              -> "zero_confidence"
+      - warnings carry recommendation_forced_hold_missing_price
+                                                        -> "forced_hold"
+    Verified defect case (2026-06-10): CPI.JSE in the live Top 10 with no
+    price, confidence 0.00, and the forced-HOLD tag.
+    """
+    price = _safe_float(row.get("current_price"), None)
+    if price is None or price <= 0.0:
+        return False, "missing_price"
+    conf = _safe_float(row.get("forecast_confidence"), None)
+    if conf is None:
+        conf = _safe_float(row.get("confidence_score"), None)
+    if conf is None or conf <= 0.0:
+        return False, "zero_confidence"
+    tags = _parse_warnings_tags(row)
+    if any(_ADMISSION_FORCED_HOLD_TAG in _s(t) for t in tags):
+        return False, "forced_hold"
+    return True, ""
+
+
 async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     meta: Dict[str, Any] = {
         "page": page,
@@ -2250,10 +2479,15 @@ async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) ->
         "merged_snapshot": False,
         "timed_out": False,
         "error": "",
+        # v4.16.0 Phase C audit counter.
+        "gate_fields_quarantined": 0,
     }
     try:
         rows = await asyncio.wait_for(_fetch_page_rows(engine, page, SOURCE_PAGE_LIMIT, mode), timeout=PAGE_TOTAL_TIMEOUT_SEC)
         meta["rows"] = len(rows)
+        # v4.16.0 Phase A: live page rows carry the freshest gate decision.
+        for _r in rows:
+            _tag_provenance(_r, _PROV_LIVE)
     except asyncio.TimeoutError:
         rows = []
         meta["timed_out"] = True
@@ -2268,6 +2502,18 @@ async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) ->
 
     try:
         snap_rows = await asyncio.wait_for(_fetch_page_snapshot_rows(engine, page), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 8.0))
+        # v4.16.0 Phase A/C: snapshot rows are a possibly-stale donor. Strip
+        # gate-critical fields (blank-over-stale) and tag rank 1 so they can
+        # fill blanks but never overwrite a fresh row's values.
+        if snap_rows:
+            quarantined: List[Dict[str, Any]] = []
+            stripped_total = 0
+            for _sr in snap_rows:
+                cleaned, stripped = _strip_gate_critical_fields(_sr)
+                stripped_total += stripped
+                quarantined.append(_tag_provenance(cleaned, _PROV_SNAPSHOT))
+            snap_rows = quarantined
+            meta["gate_fields_quarantined"] = stripped_total
         meta["snapshot_rows"] = len(snap_rows)
         meta["used_snapshot"] = bool(snap_rows)
         if rows and snap_rows:
@@ -2340,8 +2586,18 @@ async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str,
         sym = _normalize_symbol(normalized.get("symbol") or normalized.get("ticker"))
         if not sym:
             continue
+        # v4.16.0 Phase A: hydration rows are fresh engine quotes (rank 3).
+        # The v4.15.0 overlay semantics are preserved VERBATIM here: the
+        # enriched row's non-blank values always overwrite the base row
+        # (`_merge_row_prefer_richer(base, update)` with update = enriched).
+        # The merged row carries the max provenance rank so a base that was
+        # a quarantined snapshot (rank 1) is upgraded to fresh (rank 3).
+        _tag_provenance(normalized, _PROV_HYDRATED)
         if sym in row_map:
-            row_map[sym] = _merge_row_prefer_richer(row_map[sym], normalized)
+            base = row_map[sym]
+            merged = _merge_row_prefer_richer(base, normalized)
+            merged[_PROV_KEY] = max(_row_prov(base), _PROV_HYDRATED)
+            row_map[sym] = merged
         else:
             row_map[sym] = normalized
 
@@ -2366,6 +2622,9 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         "hydration_diagnostics": [],
         "partial_success": False,
         "used_emergency_symbols": False,
+        # v4.16.0 Phase C audit counters.
+        "gate_fields_quarantined_count": 0,
+        "quarantined_donor_sources": [],
     }
 
     candidates: Dict[str, Dict[str, Any]] = {}
@@ -2386,8 +2645,9 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         if existing is None:
             candidates[sym] = row
             return
-        richer, poorer = (row, existing) if _row_richness(row) >= _row_richness(existing) else (existing, row)
-        candidates[sym] = _merge_row_prefer_richer(poorer, richer)
+        # v4.16.0 Phase B: provenance-aware merge. Higher-provenance values
+        # win unconditionally; equal ranks preserve v4.15.0 prefer-richer.
+        candidates[sym] = _merge_row_provenance(existing, row)
 
     if direct_symbols:
         try:
@@ -2395,6 +2655,8 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
             meta["direct_symbol_rows"] = len(direct_rows)
             meta["partial_success"] = meta["partial_success"] or bool(direct_rows)
             for row in direct_rows:
+                # v4.16.0 Phase A: direct-symbol rows are fresh engine quotes.
+                _tag_provenance(row, _PROV_HYDRATED)
                 _put_row(row, "")
         except asyncio.TimeoutError:
             meta["direct_symbol_error"] = "direct_symbol_timeout"
@@ -2407,6 +2669,11 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         page_rows, page_meta = await _collect_page_rows_with_fallback(engine, page, mode)
         meta["source_page_rows"][page] = page_meta.get("rows", 0)
         meta["snapshot_rows"][page] = page_meta.get("snapshot_rows", 0)
+        # v4.16.0 Phase C: roll up snapshot-donor quarantine counts.
+        _q = _safe_int(page_meta.get("gate_fields_quarantined"), 0)
+        if _q > 0:
+            meta["gate_fields_quarantined_count"] += _q
+            meta["quarantined_donor_sources"].append(f"snapshot:{page}")
 
         hydrated_rows = page_rows
         hydration_meta: Dict[str, Any] = {"page": page}
@@ -2436,6 +2703,9 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
             meta["used_emergency_symbols"] = bool(emergency_rows)
             meta["emergency_symbol_rows"] = len(emergency_rows)
             for row in emergency_rows:
+                # v4.16.0 Phase A: emergency rows are fresh engine fetches
+                # (rank 2) — no quarantine, but they yield to rank-3 donors.
+                _tag_provenance(row, _PROV_EMERGENCY)
                 _put_row(row, "Emergency")
         except Exception as exc:
             meta["emergency_symbol_error"] = f"emergency_symbol_failed:{type(exc).__name__}"
@@ -2468,6 +2738,20 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
 
         if fallback_rows:
             meta["top10_output_fallback_used"] = True
+            # v4.16.0 Phase A/C: the previous Top_10 output is STALE BY
+            # DESIGN (rank 0) — the exact donor behind the self-referential
+            # staleness loop. Strip gate-critical fields (blank-over-stale)
+            # so old gate values can never re-enter the pool.
+            quarantined_fallback: List[Dict[str, Any]] = []
+            _fb_stripped = 0
+            for _fr in fallback_rows:
+                cleaned, stripped = _strip_gate_critical_fields(_fr)
+                _fb_stripped += stripped
+                quarantined_fallback.append(_tag_provenance(cleaned, _PROV_OUTPUT_FALLBACK))
+            fallback_rows = quarantined_fallback
+            if _fb_stripped > 0:
+                meta["gate_fields_quarantined_count"] += _fb_stripped
+                meta["quarantined_donor_sources"].append(f"output_fallback:{OUTPUT_PAGE}")
         for row in fallback_rows:
             _put_row(row, OUTPUT_PAGE)
 
@@ -2576,9 +2860,38 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
         normalized_candidates = [_normalize_candidate_row(r) for r in candidates]
 
+        # ---------------------------------------------------------------------
+        # v4.16.0 Phase D — TOP10 ADMISSION FILTER (env-gated, default ON).
+        # ---------------------------------------------------------------------
+        # Rows failing the admission check can neither be SELECTED nor
+        # BACKFILLED. The relaxed-pool degraded path below also operates on
+        # the admissible pool, so a price-less / zero-confidence / forced-HOLD
+        # row can never reach the sheet while the filter is on. Set
+        # TFB_TOP10_ADMISSION_FILTER=0 to restore pre-v4.16.0 behavior.
+        admission_excluded: List[Dict[str, str]] = []
+        if TOP10_ADMISSION_FILTER_ENABLED:
+            admissible_candidates: List[Dict[str, Any]] = []
+            for r in normalized_candidates:
+                admissible, why = _admission_check(r)
+                if admissible:
+                    admissible_candidates.append(r)
+                else:
+                    admission_excluded.append({
+                        "symbol": _s(r.get("symbol") or r.get("ticker")),
+                        "reason": why,
+                    })
+            if admission_excluded:
+                logger.info(
+                    "[v4.16.0 ADMIT] excluded=%d %s",
+                    len(admission_excluded),
+                    _json_compact(admission_excluded[:10]),
+                )
+        else:
+            admissible_candidates = list(normalized_candidates)
+
         filtered: List[Dict[str, Any]] = []
         drop_counts: Dict[str, int] = {}
-        for r in normalized_candidates:
+        for r in admissible_candidates:
             passed, reason = _passes_filters_with_reason(r, criteria)
             if passed:
                 filtered.append(r)
@@ -2587,8 +2900,8 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
         filter_relaxed = False
         selected_pool = filtered
-        if not selected_pool and normalized_candidates:
-            selected_pool = list(normalized_candidates)
+        if not selected_pool and admissible_candidates:
+            selected_pool = list(admissible_candidates)
             filter_relaxed = True
 
         _v310_active: Dict[str, Any] = {}
@@ -2677,7 +2990,9 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 if _normalize_symbol(r.get("symbol") or r.get("ticker"))
             }
             remainder: List[Tuple[float, Dict[str, Any]]] = []
-            for cand in normalized_candidates:
+            # v4.16.0 Phase D: backfill draws from the ADMISSIBLE pool only,
+            # so admission-excluded rows cannot re-enter via limit-fill.
+            for cand in admissible_candidates:
                 sym = _normalize_symbol(cand.get("symbol") or cand.get("ticker"))
                 if not sym or sym in seen_symbols:
                     continue
@@ -2754,6 +3069,16 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             # v4.15.0 Phase C — limit-fill backfill audit.
             "backfilled_count": len(backfill_symbols),
             "backfill_symbols": list(backfill_symbols),
+            # v4.16.0 Phase D — admission filter audit (Fix U).
+            "admission_filter_enabled": TOP10_ADMISSION_FILTER_ENABLED,
+            "admission_excluded_count": len(admission_excluded),
+            "admission_excluded": [dict(x) for x in admission_excluded[:25]],
+            # v4.16.0 Phase A — provenance of the FINAL projected rows
+            # (3=live/hydrated, 2=emergency, 1=snapshot, 0=output-fallback).
+            "selected_provenance_counts": {
+                str(rank): sum(1 for r in top_rows[:limit] if _row_prov(r) == rank)
+                for rank in (_PROV_LIVE, _PROV_EMERGENCY, _PROV_SNAPSHOT, _PROV_OUTPUT_FALLBACK)
+            },
             "selected_symbols": [_s(r.get("symbol")) for r in projected_rows if _s(r.get("symbol"))],
             "selected_direct_symbols": [
                 _s(r.get("symbol"))
@@ -2894,6 +3219,10 @@ __all__ = [
     "TOP10_PENALTY_ENGINE_DROP",
     "TOP10_PENALTY_FORECAST_UNAVAIL",
     "TOP10_PENALTY_PROVIDER_ERROR",
+    # v4.16.0 Fix U: vintage protection + admission filter surface.
+    "GATE_CRITICAL_KEYS",
+    "TOP10_ADMISSION_FILTER_ENABLED",
+    "TOP10_ADMISSION_FILTER_ENV",
     # v4.14.0 Phase C: 8-tier vocabulary surface (content-checkable
     # constants for ops + downstream tooling).
     "_RECO_8TIER_CANONICAL",
