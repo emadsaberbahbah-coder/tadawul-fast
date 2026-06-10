@@ -2,7 +2,110 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.83.3
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.84.0
+================================================================================
+
+WHY v5.84.0 - DECISION-GOVERNANCE TRANSPARENCY TAGS (Fix AA)
+-------------------------------------------------------------------------------
+Three engine-only transparency/sanitization refinements driven by the
+2026-06-10 workbook audit (Claude + external ChatGPT auditor, reconciled).
+NO schema change (still 115/115, 00_Config unaffected, no frontend redeploy),
+NO recommendation change, NO investability-verdict change: phases AA-1 and
+AA-2 only APPEND warnings tags, and AA-3 only clears a corrupt junk literal
+from forecast_source. Each phase is independently env-reversible.
+
+  AA-1  BEARISH-DIVERGENCE TAG (env TFB_DIVERGENCE_TAG, default ON;
+        threshold TFB_DIVERGENCE_ROI_MIN, default 0.25).
+        THE GAP: Fix S (v5.79.7) catches the bullish half of score/forecast
+        divergence (BUY-family + negative governing ROI -> WATCHLIST), but the
+        BEARISH half was invisible: the live audit found 114 Global_Markets +
+        4 Market_Leaders SELL/REDUCE rows whose own governing forecast ROI was
+        >= +25% (e.g. 3091.SR SELL with +53.7% modeled upside). That is not
+        necessarily wrong -- a weak-fundamentals name can deserve SELL despite
+        an optimistic compressed target -- so the engine must NOT flip the
+        recommendation; but the contradiction between the score path and the
+        forecast path is exactly what external auditors keep flagging, and it
+        deserves a visible, grep-able marker for review.
+        THE FIX: in _apply_investability_gate, AFTER the reliability and
+        verdict chain (so the tag can never feed back into rel/status within
+        the same pass), a TRIM-direction row (REDUCE/SELL/STRONG_SELL/AVOID
+        via _RECO_DIRECTION) whose signed governing forecast ROI
+        (_gate_governing_forecast_roi, the Fix S helper) is determinable and
+        >= the threshold gets warnings tag
+
+            bearish_reco_high_modeled_upside
+
+        Tag-only; investability_status for sell-family rows is WATCHLIST by
+        the existing _TOP10_EXCLUDED_RECO_FAMILIES branch regardless, so no
+        verdict can change. TAG-SUBSTRING SAFETY: the reliability penalties
+        scan the warnings STRING for "cap"+("forecast"|"target"|"roi") and
+        "provider_target"+("drop"|"reject"); the chosen tag contains NONE of
+        cap / forecast / target / roi / drop / reject, so a SECOND gate pass
+        over a tagged row computes the identical reliability (verified by
+        test T4 below). Fail-open: no determinable ROI -> no tag.
+
+  AA-2  CONFIDENCE-CLUSTER TAG (env TFB_CONF_CLUSTER_TAG, default ON;
+        cluster list TFB_CONF_CLUSTER_VALUES, default "66.41,64.82,63.23,58.0").
+        THE GAP: the live audit found confidence_score 66.41 on 900 (!) and
+        64.82 on 583 Global_Markets rows (~77% of the page), and 58.0 on 22
+        Mutual_Funds rows -- formula attractors that the Fix S2 WHY itself
+        calls "the engine's ~66% default". A sheet user reading "Confidence
+        66.41" cannot tell a measured value from the attractor; three of the
+        live Top 10 carried it. Per-row code cannot detect a CLUSTER (it
+        cannot see other rows), and the attractor values shift when the
+        confidence formula changes -- so this is an explicitly CONFIGURABLE,
+        explicitly SUSPECTED-not-proven marker, a stopgap until confidence
+        provenance lands at the source (core.scoring side, tracked on the
+        roadmap).
+        THE FIX: in the same post-verdict block, when round(confidence_score,2)
+        equals one of the configured cluster values, append warnings tag
+
+            confidence_default_suspected
+
+        Tag-only; no rec / gate / reliability effect (substring-safe like
+        AA-1). Downstream consumers that already honor min-confidence criteria
+        (advisor routes, top10_selector v4.16.0 meta) gain a per-row marker
+        they can filter or display. Deliberately NOT a demotion: Fix S2's
+        standing decision is that a default-confidence row with genuinely
+        high data quality may still be investable -- AA-2 makes the situation
+        visible without re-litigating that decision.
+
+  AA-3  FORECAST-SOURCE TYPE GUARD (env TFB_FC_SOURCE_TYPE_GUARD, default ON).
+        THE GAP: 4 live Global_Markets rows carried forecast_source = "1" --
+        a junk literal outside the engine vocabulary (provider_target /
+        phase_ii_synthetic / fallback), almost certainly an upstream field
+        bleed. A junk value silently skips the synthetic/fallback reliability
+        penalty (it matches no token) and reads as garbage on the sheet.
+        THE FIX: at the TOP of _apply_investability_gate (before fc_src is
+        consumed), when forecast_source is a bare junk literal -- digits-only
+        or one of true/false/none/null/nan (case-insensitive) -- clear the
+        field to "" and append warnings tag
+
+            fc_source_invalid_cleared
+
+        DELIBERATELY NARROW: only those exact junk shapes are cleared, so a
+        legitimate future vocabulary value is never touched. The tag avoids
+        the reliability-scan substrings (no "forecast"/"target"/"roi"/"cap"),
+        and clearing happens BEFORE the fc_src read so both gate passes see
+        the same (blank) value -- idempotent.
+
+  REVERSIBLE: TFB_DIVERGENCE_TAG=0 / TFB_CONF_CLUSTER_TAG=0 /
+  TFB_FC_SOURCE_TYPE_GUARD=0 each independently restore the exact v5.83.3
+  byte behavior for their phase. With all three off the engine output is
+  byte-identical to v5.83.3.
+
+VALIDATION (post-deploy)
+  - 3091.SR / 4009.SR (SELL, high modeled upside) carry
+    bearish_reco_high_modeled_upside; their recommendation, reliability and
+    investability_status are unchanged.
+  - GM rows at confidence 66.41 / 64.82 carry confidence_default_suspected;
+    Forecast Reliability identical to v5.83.3 for every row.
+  - The 4 forecast_source="1" rows read blank forecast_source +
+    fc_source_invalid_cleared.
+  - grep -c "bearish_reco_high_modeled_upside" on a GM export ~= 114 (audit
+    count, subject to market drift).
+  - /health: version 5.84.0; schema still 115.
+
 ================================================================================
 
 WHY v5.83.3 - FORECAST-RELIABILITY RECALIBRATION (Fix S2)
@@ -1451,7 +1554,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.83.3"
+__version__ = "5.84.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -2693,6 +2796,97 @@ def _gate_governing_forecast_roi(row: Dict[str, Any]) -> Optional[float]:
 
 
 # =============================================================================
+# v5.84.0 (Fix AA) — DECISION-GOVERNANCE TRANSPARENCY TAGS
+# -----------------------------------------------------------------------------
+# Three tag-only / sanitization helpers consumed by _apply_investability_gate.
+# None of them changes a recommendation, a verdict, or a reliability number —
+# see the v5.84.0 WHY block. Tags are SUBSTRING-SAFE against the reliability
+# warning scans ("cap"+("forecast"|"target"|"roi"), "provider_target"+
+# ("drop"|"reject")): none of the three tag strings contains any of those
+# tokens, so a second gate pass over a tagged row is byte-identical.
+# =============================================================================
+_AA_TAG_BEARISH_DIVERGENCE = "bearish_reco_high_modeled_upside"
+_AA_TAG_CONF_CLUSTER = "confidence_default_suspected"
+_AA_TAG_FC_SOURCE_CLEARED = "fc_source_invalid_cleared"
+
+_AA_FC_SOURCE_JUNK_LITERALS: frozenset = frozenset({"true", "false", "none", "null", "nan"})
+
+_AA_OFF_TOKENS = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _divergence_tag_enabled() -> bool:
+    """v5.84.0 (Fix AA-1): master switch for the bearish-divergence warnings
+    tag (default ON). Tag-only — never alters recommendation, reliability, or
+    investability. Set TFB_DIVERGENCE_TAG to 0/false/off to restore the exact
+    v5.83.3 warnings output for sell-family rows."""
+    raw = (os.getenv("TFB_DIVERGENCE_TAG") or "").strip().lower()
+    return raw not in _AA_OFF_TOKENS
+
+
+def _divergence_roi_min() -> float:
+    """v5.84.0 (Fix AA-1): governing-ROI threshold (FRACTION) at or above which
+    a TRIM-direction row is tagged. Default 0.25 (= +25%, the audit's review
+    bar). Env TFB_DIVERGENCE_ROI_MIN; non-numeric / non-positive values fall
+    back to the default so the tag can never fire on every bearish row."""
+    raw = (os.getenv("TFB_DIVERGENCE_ROI_MIN") or "").strip()
+    try:
+        v = float(raw)
+        if v > 0.0:
+            return v
+    except Exception:
+        pass
+    return 0.25
+
+
+def _conf_cluster_tag_enabled() -> bool:
+    """v5.84.0 (Fix AA-2): master switch for the confidence-cluster warnings
+    tag (default ON). Tag-only. Set TFB_CONF_CLUSTER_TAG to 0/false/off to
+    restore the exact v5.83.3 warnings output."""
+    raw = (os.getenv("TFB_CONF_CLUSTER_TAG") or "").strip().lower()
+    return raw not in _AA_OFF_TOKENS
+
+
+def _conf_cluster_values() -> frozenset:
+    """v5.84.0 (Fix AA-2): the configured confidence-score cluster values
+    (2-decimal points scale, e.g. 66.41). Env TFB_CONF_CLUSTER_VALUES as a
+    comma/semicolon list; defaults to the four attractors measured in the
+    2026-06-10 live audit (66.41 x900, 64.82 x583, 63.23 x84 on
+    Global_Markets; 58.0 x22 on Mutual_Funds). Unparseable entries are
+    skipped; an empty result disables the tag for that run."""
+    raw = (os.getenv("TFB_CONF_CLUSTER_VALUES") or "66.41,64.82,63.23,58.0").replace(";", ",")
+    out = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(round(float(part), 2))
+        except Exception:
+            continue
+    return frozenset(out)
+
+
+def _fc_source_type_guard_enabled() -> bool:
+    """v5.84.0 (Fix AA-3): master switch for the forecast_source junk-literal
+    guard (default ON). Set TFB_FC_SOURCE_TYPE_GUARD to 0/false/off to leave
+    forecast_source untouched (exact v5.83.3 behavior)."""
+    raw = (os.getenv("TFB_FC_SOURCE_TYPE_GUARD") or "").strip().lower()
+    return raw not in _AA_OFF_TOKENS
+
+
+def _fc_source_is_junk(value: Any) -> bool:
+    """v5.84.0 (Fix AA-3): True only for the exact junk shapes seen in the
+    live audit (digits-only, e.g. "1") or bool/None literals. DELIBERATELY
+    NARROW so a legitimate future vocabulary value is never cleared."""
+    s = _safe_str(value).strip().lower()
+    if not s:
+        return False
+    if s.isdigit():
+        return True
+    return s in _AA_FC_SOURCE_JUNK_LITERALS
+
+
+# =============================================================================
 # v5.79.4 (Fix P) — STRICT FINAL-APPROVAL TIER (the audits' "Final rule for 95%")
 # -----------------------------------------------------------------------------
 # The base gate (v5.78.0) calls a row INVESTABLE / final_action=INVEST on price +
@@ -3027,6 +3221,14 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     if not isinstance(row, dict) or not _investability_gate_enabled():
         return
 
+    # v5.84.0 (Fix AA-3): clear a junk forecast_source literal ("1", "true",
+    # "nan", ...) BEFORE fc_src is consumed below, so both gate passes see the
+    # same (blank) value — idempotent. Narrow by construction: only digit-only
+    # and bool/None literals are cleared; real vocabulary values are untouched.
+    if _fc_source_type_guard_enabled() and _fc_source_is_junk(row.get("forecast_source")):
+        row["forecast_source"] = ""
+        _v573_append_warning(row, _AA_TAG_FC_SOURCE_CLEARED)
+
     # v5.79.5 (Fix Q): the price check must agree with the column actually
     # projected to the sheet. "Current Price" maps to current_price; if a row
     # carries only the `price` alias (some fallback / external-row paths leave
@@ -3264,6 +3466,25 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         if not (w_hi is not None and w_lo is not None and w_hi > 0.0 and w_lo > 0.0):
             status, action = "WATCHLIST", "WATCH"
             reason = "Thin trading history (no 52W range) -- treat as new/IPO listing"
+
+    # -- v5.84.0 (Fix AA-1/AA-2): transparency tags, POST-verdict ---------------
+    # Placed after the reliability computation and the entire verdict chain so
+    # neither tag can feed back into rel/status within this pass; both tag
+    # strings avoid the reliability-scan substrings so a SECOND pass over the
+    # tagged row is also byte-identical (see the v5.84.0 WHY block).
+    # AA-1: a sell-family (TRIM) row whose own governing forecast ROI is
+    # strongly positive — the bearish mirror of Fix S — gets a review marker.
+    if _divergence_tag_enabled() and _RECO_DIRECTION.get(rec) == "TRIM":
+        _aa_roi = _gate_governing_forecast_roi(row)
+        if _aa_roi is not None and _aa_roi >= _divergence_roi_min():
+            _v573_append_warning(row, _AA_TAG_BEARISH_DIVERGENCE)
+    # AA-2: confidence sitting exactly on a configured formula-attractor value
+    # is marked SUSPECTED-default so sheet users and downstream filters can
+    # tell it from a measured score. No demotion (Fix S2 standing decision).
+    if _conf_cluster_tag_enabled():
+        _aa_conf = _as_float(row.get("confidence_score"))
+        if _aa_conf is not None and round(_aa_conf, 2) in _conf_cluster_values():
+            _v573_append_warning(row, _AA_TAG_CONF_CLUSTER)
 
     row["data_quality_score"] = dq
     row["forecast_reliability_score"] = rel
@@ -9175,7 +9396,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.83.3",  # v5.83.3 FORECAST-RELIABILITY RECALIBRATION (Fix S2, env-gated TFB_RELIABILITY_RECALIBRATION, default OFF -> forecast_reliability_score byte-identical to v5.83.2): _apply_investability_gate's reliability base optionally blends data_quality (0.7*forecast_confidence + 0.3*data_quality_score) and the soft-display-cap penalty for a provider target compressed to the Phase-II ceiling (_capped_to_phase_ii_ceiling) drops 20->5, while a DROPPED/REJECTED-as-implausible target still takes its independent -15; corrects the flat -20 that branded the highest-upside real-analyst names (NVDA/META/MSFT 46.4/46.4/44.8) as least reliable and pushed them below the 70 floor into Top_10 backfill (with the blend at dq=100 they land ~71.5/71.5/70.4). Adds NO column (schema 115). v5.80.0 PORTFOLIO & INSIGHTS DECISION LAYER: My_Portfolio 115->122 (this page only; +Buy Date/Target Weight %/Actual Weight %/Weight Gap/Rebalance Action/Investor Decision/User Notes, mirroring the Top_10 115+3 pattern); _compute_portfolio_fields fills actual_weight/weight_gap (PERCENT POINTS) + action_flag (drift-only ADD/HOLD/REDUCE/SELL) + decision (blended SELL/REDUCE/ADD/HOLD from drift+reco+forecast-sign+risk), target_weight seeded from TFB_PORTFOLIO_TARGETS (1120=40/4013=30/7020=30) when blank, band TFB_PORTFOLIO_REBALANCE_BAND_PP=5.0pp, weak floor TFB_PORTFOLIO_WEAK_SCORE=60; Insights_Analysis rebuilt from live portfolio+market data (Portfolio Summary/Allocation vs Target/Market Opportunities/Data Quality) replacing the 2-row stub; Top_10 eligibility now also requires INVESTABLE and rejects negative-forecast buy-family (closing the Fix S/Fix J seam). Market pages stay 115. Pairs with 00_Config.gs v1.12.3. v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
+                "version": "v5.84.0",  # v5.84.0 DECISION-GOVERNANCE TRANSPARENCY TAGS (Fix AA, three independently env-gated phases, ALL tag-only/sanitization -- NO recommendation, verdict, reliability, or schema change; with all three off the output is byte-identical to v5.83.3): (AA-1, TFB_DIVERGENCE_TAG default ON, threshold TFB_DIVERGENCE_ROI_MIN=0.25) a sell-family (TRIM-direction) row whose signed governing forecast ROI (_gate_governing_forecast_roi, the Fix S helper) is >= +25% gets warnings tag bearish_reco_high_modeled_upside -- the bearish mirror of Fix S, marking the 114 GM + 4 ML score/forecast contradictions from the 2026-06-10 audit for review without flipping any recommendation; (AA-2, TFB_CONF_CLUSTER_TAG default ON, list TFB_CONF_CLUSTER_VALUES=66.41,64.82,63.23,58.0) a row whose confidence_score sits exactly on a configured formula-attractor value gets warnings tag confidence_default_suspected, making the audit's 900x66.41 / 583x64.82 Global_Markets clusters visible per-row without demoting (Fix S2 standing decision preserved); (AA-3, TFB_FC_SOURCE_TYPE_GUARD default ON) a junk forecast_source literal (digits-only / true/false/none/null/nan -- the audit's 4 GM rows reading "1") is cleared to blank + tagged fc_source_invalid_cleared BEFORE fc_src is consumed, narrow by construction. All three tags avoid the reliability-scan substrings (cap/forecast/target/roi/drop/reject) so repeat gate passes are byte-identical. v5.83.3 FORECAST-RELIABILITY RECALIBRATION (Fix S2, env-gated TFB_RELIABILITY_RECALIBRATION, default OFF -> forecast_reliability_score byte-identical to v5.83.2): _apply_investability_gate's reliability base optionally blends data_quality (0.7*forecast_confidence + 0.3*data_quality_score) and the soft-display-cap penalty for a provider target compressed to the Phase-II ceiling (_capped_to_phase_ii_ceiling) drops 20->5, while a DROPPED/REJECTED-as-implausible target still takes its independent -15; corrects the flat -20 that branded the highest-upside real-analyst names (NVDA/META/MSFT 46.4/46.4/44.8) as least reliable and pushed them below the 70 floor into Top_10 backfill (with the blend at dq=100 they land ~71.5/71.5/70.4). Adds NO column (schema 115). v5.80.0 PORTFOLIO & INSIGHTS DECISION LAYER: My_Portfolio 115->122 (this page only; +Buy Date/Target Weight %/Actual Weight %/Weight Gap/Rebalance Action/Investor Decision/User Notes, mirroring the Top_10 115+3 pattern); _compute_portfolio_fields fills actual_weight/weight_gap (PERCENT POINTS) + action_flag (drift-only ADD/HOLD/REDUCE/SELL) + decision (blended SELL/REDUCE/ADD/HOLD from drift+reco+forecast-sign+risk), target_weight seeded from TFB_PORTFOLIO_TARGETS (1120=40/4013=30/7020=30) when blank, band TFB_PORTFOLIO_REBALANCE_BAND_PP=5.0pp, weak floor TFB_PORTFOLIO_WEAK_SCORE=60; Insights_Analysis rebuilt from live portfolio+market data (Portfolio Summary/Allocation vs Target/Market Opportunities/Data Quality) replacing the 2-row stub; Top_10 eligibility now also requires INVESTABLE and rejects negative-forecast buy-family (closing the Fix S/Fix J seam). Market pages stay 115. Pairs with 00_Config.gs v1.12.3. v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
