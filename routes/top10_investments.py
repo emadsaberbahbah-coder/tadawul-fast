@@ -2,7 +2,7 @@
 """
 routes/top10_investments.py
 ===============================================================================
-Top 10 Investments Routes — v4.2.0
+Top 10 Investments Routes — v4.3.0
 ===============================================================================
 PREFIX-ISOLATED • AUTH-OPTIONAL (ENV-GATED) • SCHEMA-REGISTRY SHIM • CORE-
 CONFIG-ALIGNED • ROUTE-OWNER ATTRIBUTED • STARTUP-SAFE
@@ -35,7 +35,26 @@ To enable this router in main.py, add one line to `_OPTIONAL_ROUTE_MODULES`:
 And optionally, to `_allowed_prefixes_for_key`:
     "top10_investments": ("/v1/top10",)
 
-Why this revision (v4.2.0 vs v4.1.0)
+Why this revision (v4.3.0 vs v4.2.0)
+-------------------------------------
+- ADD: [SELECTOR-BRIDGE] `_build_top10_from_request` now tries
+       `core.analysis.top10_selector.build_top10_rows` (v4.16.1+) FIRST,
+       before the internal blended pipeline — mirroring the
+       routes.advanced_analysis v4.5.0 bridge. The selector owns the
+       project's Top10 governance (vintage-protected merge, gate-field
+       quarantine, admission filter, priority-band ranking); this router's
+       internal pipeline predates all of it, so without the bridge a future
+       mount of this router would serve selector-bypassing rows. Selector
+       order is preserved (no _rank_top10_rows re-sort on the bridge path);
+       selector audit meta (admission_excluded_count,
+       gate_fields_quarantined_count, backfilled_count, provenance counts)
+       is surfaced under selector_* meta keys. Fail-soft: unbound / empty /
+       raising selector falls through to the exact v4.2.0 pipeline.
+       `force_fallback=true` and explicit `rows`/`data` input bypass the
+       bridge (unchanged semantics for both).
+- KEEP: everything else verbatim from v4.2.0.
+
+Why the v4.2.0 revision (vs v4.1.0)
 -------------------------------------
 - FIX: adds the `/v1/top10` router prefix. v4.1.0 declared paths like
        `/sheet-rows`, `/schema`, `/health`, `/` directly — these collide
@@ -111,7 +130,36 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-VERSION = "4.2.0"
+# =============================================================================
+# v4.3.0 [SELECTOR-BRIDGE] — bind the REAL Top10 builder
+# -----------------------------------------------------------------------------
+# core.analysis.top10_selector (v4.16.1+) is the project's authoritative Top10
+# pipeline: vintage-protected merge, gate-field quarantine, admission filter,
+# priority-band-aware ranking, limit-fill backfill. This standalone router's
+# internal blended pipeline predates all of that — so if this router is ever
+# mounted (it is NOT in main's controlled plan today), it would serve
+# selector-bypassing rows. v4.3.0 mirrors the routes.advanced_analysis v4.5.0
+# bridge: try the real selector FIRST, fall through to the internal pipeline
+# on any unbound / empty / raising result. Fail-soft only — can help, never
+# regress. Selector ordering is preserved (no _rank_top10_rows re-sort on the
+# bridge path).
+# =============================================================================
+_build_top10_rows_selector = None  # type: ignore[assignment]
+try:
+    from core.analysis.top10_selector import build_top10_rows as _build_top10_rows_selector  # type: ignore
+    logger.info(
+        "[top10_investments v%s] real Top10 builder bound (core.analysis.top10_selector.build_top10_rows)",
+        "4.3.0",
+    )
+except Exception as _sel_err:  # pragma: no cover
+    _build_top10_rows_selector = None  # type: ignore
+    logger.warning(
+        "[top10_investments v%s] core.analysis.top10_selector unavailable (%s); "
+        "internal blended pipeline will be used",
+        "4.3.0", _sel_err,
+    )
+
+VERSION = "4.3.0"
 ROUTE_OWNER_NAME = "top10_investments"
 ROUTE_FAMILY_NAME = "top10"
 PAGE_NAME = "Top_10_Investments"
@@ -1101,6 +1149,51 @@ async def _build_top10_from_request(req: Top10Request, *, request_id: str) -> Di
         meta["ranking_source"] = "direct_input_rows"
         meta["candidate_rows"] = len(filtered)
         return _build_envelope(top_rows, meta=meta, include_validation=req.include_validation, request_id=request_id)
+
+    # -------------------------------------------------------------------------
+    # v4.3.0 [SELECTOR-BRIDGE]: try the REAL selector first (fail-soft).
+    # -------------------------------------------------------------------------
+    # The selector owns vintage protection, gate-field quarantine, the
+    # admission filter, and priority-band ranking (top10_selector v4.16.1).
+    # Its row order is AUTHORITATIVE: no _rank_top10_rows re-sort here — rows
+    # are projected onto the schema and sliced only. Any failure (unbound,
+    # empty, exception) falls straight through to the v4.2.0 internal
+    # pipeline below, byte-identical to before.
+    if not req.force_fallback and _build_top10_rows_selector is not None:
+        try:
+            sel_kwargs: Dict[str, Any] = {"limit": requested_limit, "mode": req.mode or ""}
+            if symbols:
+                sel_kwargs["symbols"] = list(symbols)
+                sel_kwargs["direct_symbols"] = list(symbols)
+            if source_pages:
+                sel_kwargs["pages_selected"] = list(source_pages)
+            if req.min_confidence is not None:
+                sel_kwargs["min_confidence"] = req.min_confidence
+            if req.max_risk_score is not None:
+                sel_kwargs["max_risk_score"] = req.max_risk_score
+            sel_res = _build_top10_rows_selector(**sel_kwargs)
+            if inspect.isawaitable(sel_res):
+                sel_res = await sel_res
+            sel_rows = (sel_res or {}).get("rows") if isinstance(sel_res, dict) else None
+            if isinstance(sel_rows, list) and sel_rows:
+                projected_sel_rows = project_rows_to_schema(PAGE_NAME, sel_rows)[:requested_limit]
+                sel_meta = (sel_res.get("meta") or {}) if isinstance(sel_res, dict) else {}
+                meta["engine_used"] = True
+                meta["ranking_source"] = "core.analysis.top10_selector"
+                meta["selector_version"] = sel_res.get("version")
+                meta["candidate_rows"] = len(sel_rows)
+                for k in ("admission_filter_enabled", "admission_excluded_count",
+                          "gate_fields_quarantined_count", "backfilled_count",
+                          "selected_provenance_counts"):
+                    if k in sel_meta:
+                        meta[f"selector_{k}"] = sel_meta.get(k)
+                return _build_envelope(projected_sel_rows, meta=meta, include_validation=req.include_validation, request_id=request_id)
+        except Exception as sel_exc:
+            logger.warning(
+                "[top10_investments v%s] selector bridge failed (%s: %s); "
+                "falling through to internal pipeline",
+                VERSION, sel_exc.__class__.__name__, sel_exc,
+            )
 
     if not req.force_fallback:
         engine_rows, engine_meta = await _engine_fetch_page_rows(
