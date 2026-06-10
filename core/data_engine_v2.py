@@ -2,8 +2,81 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.84.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.85.0
 ================================================================================
+
+WHY v5.85.0 - HISTORY-GAP BACKFILL + ANALYST/TREND OUTPUT BLOCK (Fix AC / AD)
+-------------------------------------------------------------------------------
+Two fixes driven by the 2026-06-10 full-workbook audit (Claude, cross-checked
+against the live Render deployment). NO schema change (sheet stays 115/118;
+INSTRUMENT_CANONICAL_KEYS untouched; 00_Config unaffected), NO recommendation,
+scoring, reliability, or investability-verdict change. Both phases are
+independently env-reversible and fill-only.
+
+  AC    HISTORY-GAP BACKFILL (env TFB_HISTORY_GAP_BACKFILL, default ON).
+        THE GAP: the audit found Volatility 90D + Avg Volume 10D/30D blank on
+        100% of Market_Leaders (76/76, all data_provider=yahoo_chart), 100% of
+        Commodities_FX (75/75), and 61 Global_Markets rows -- while
+        Volatility 30D / Max Drawdown / 52W band WERE populated on the same
+        rows. Root cause is two-fold:
+          (a) the orchestrator's history-technicals block only fired when ALL
+              of rsi_14/volatility_30d/volatility_90d/max_drawdown_1y were
+              missing; a quote patch that carries vol30+maxdd (the yahoo_chart
+              quote path computes those from its own candles) suppressed the
+              history pass entirely, so the Fix F fields (vol90, avg volumes)
+              never got a chance to fill;
+          (b) _fetch_yahoo_chart_patch's callable picker listed only
+              get_chart/fetch_chart/get_history-style names, but the on-disk
+              yahoo_chart_provider module exposes fetch_history /
+              fetch_price_history / fetch_ohlc_history / fetch_prices (the
+              EXACT v5.77.14 name-mismatch bug class, on the chart side), so
+              the needs_chart enrichment resolved no callable and was a silent
+              no-op on every row.
+        THE FIX: (1) the history-technicals trigger now fires when ANY of
+        rsi_14 / volatility_30d / volatility_90d / max_drawdown_1y /
+        avg_volume_10d / avg_volume_30d is missing (gap-aware; merge remains
+        fill-only so populated fields are never overwritten; cache +
+        single-flight bound the extra fetch to one per symbol per TTL);
+        (2) _fetch_yahoo_chart_patch lists the provider's real names FIRST
+        (fetch_price_history, fetch_history, fetch_ohlc_history, fetch_prices)
+        with the legacy names kept as fallbacks; (3) _fetch_history_patch's
+        picker also gains fetch_price_history. With TFB_HISTORY_GAP_BACKFILL
+        off, the trigger reverts to the exact v5.84.0 all-four-missing rule.
+
+  AD    ANALYST/TREND OUTPUT BLOCK (env TFB_ANALYST_TREND_BLOCK, default ON).
+        THE GAP: the live sheet schema (schema_registry v2.13.x) carries eight
+        presentation columns -- Analyst Rating, Target Price,
+        Upside/Downside %, Signal, Trend 1M, Trend 3M, Trend 12M, ST Signal --
+        that the engine NEVER emitted (zero populated cells across 2,205
+        audited rows; grep on the live module confirmed no such keys). The
+        registry-driven projection in get_sheet_rows/_strict_project_row
+        already includes those keys, so the route renders blanks.
+        THE FIX: _apply_analyst_trend_block(row), called at the SAME final
+        boundaries as the investability gate (_strict_project_row +
+        get_page_rows), derives all eight fields from data the row already
+        carries -- NO new provider calls, fill-only, fail-open per field:
+          analyst_rating     <- provider_rating (canonical text);
+          target_price       <- target_mean_price (the post-sanitization
+                                provider consensus target);
+          upside_downside_pct<- (target/current - 1), FRACTION units to match
+                                upside_pct's convention;
+          trend_1m/3m/12m    <- UP/FLAT/DOWN from expected_roi_*m (fraction,
+                                +/-2% deadband; forecast_price_*m vs current
+                                as fallback);
+          signal             <- BUY/NEUTRAL/SELL from _RECO_DIRECTION of the
+                                final recommendation;
+          st_signal          <- OVERBOUGHT/OVERSOLD from rsi_14 (70/30), else
+                                candlestick_signal, else expected_roi_1m sign
+                                (+/-1% deadband) -> BULLISH/BEARISH/NEUTRAL.
+        Alias keys (analyst_recommendation, analyst_target_price,
+        upside_downside, overall_signal, short_term_signal) are emitted
+        alongside the primaries so a registry key-name variant still lands;
+        the projection strips whichever the spec does not list. Rows touched
+        get warnings tag analyst_trend_block_applied. TAG-SUBSTRING SAFETY:
+        the tag and all emitted VALUES avoid the reliability-scan substrings
+        (cap/forecast/target/roi/drop/reject -- note the scan inspects the
+        WARNINGS string only, and the tag contains none of them), so a second
+        gate pass over a touched row computes identical reliability.
 
 WHY v5.84.0 - DECISION-GOVERNANCE TRANSPARENCY TAGS (Fix AA)
 -------------------------------------------------------------------------------
@@ -1554,7 +1627,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.84.0"
+__version__ = "5.85.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -7049,6 +7122,150 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _history_gap_backfill_enabled() -> bool:
+    """v5.85.0 (Fix AC-1): master switch for the gap-aware history-technicals
+    trigger (default ON). Set TFB_HISTORY_GAP_BACKFILL to 0/false/off to
+    restore the exact v5.84.0 all-four-missing trigger."""
+    raw = (os.getenv("TFB_HISTORY_GAP_BACKFILL") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+def _analyst_trend_block_enabled() -> bool:
+    """v5.85.0 (Fix AD): master switch for the analyst/trend output block
+    (default ON). Set TFB_ANALYST_TREND_BLOCK to 0/false/off to disable and
+    restore the exact v5.84.0 output (the eight columns revert to blank)."""
+    raw = (os.getenv("TFB_ANALYST_TREND_BLOCK") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+def _trend_label_from_roi(roi_fraction: Optional[float], deadband: float = 0.02) -> str:
+    """UP / FLAT / DOWN from a signed FRACTION ROI with a symmetric deadband.
+    Fail-open: no determinable ROI -> empty string (column stays blank)."""
+    if roi_fraction is None:
+        return ""
+    if roi_fraction >= deadband:
+        return "UP"
+    if roi_fraction <= -deadband:
+        return "DOWN"
+    return "FLAT"
+
+
+def _horizon_roi_fraction(row: Dict[str, Any], roi_key: str, fc_key: str) -> Optional[float]:
+    """Signed fraction ROI for one horizon: expected_roi_* preferred,
+    forecast_price_* vs current_price as fallback. Mirrors the Fix S
+    governing-ROI derivation but per-horizon and read-only."""
+    roi = _as_float(row.get(roi_key))
+    if roi is not None:
+        return roi
+    fc = _as_float(row.get(fc_key))
+    px = _as_float(row.get("current_price"))
+    if px is None:
+        px = _as_float(row.get("price"))
+    if fc is not None and px not in (None, 0):
+        try:
+            return (fc / px) - 1.0
+        except Exception:
+            return None
+    return None
+
+
+def _apply_analyst_trend_block(row: Dict[str, Any]) -> None:
+    """v5.85.0 (Fix AD): populate the eight schema-defined presentation columns
+    the engine never emitted (Analyst Rating, Target Price, Upside/Downside %,
+    Signal, Trend 1M/3M/12M, ST Signal). Derivation-only -- NO provider calls;
+    every field is fill-only and fail-open (missing inputs leave the cell
+    blank). Runs at the same final row boundaries as the investability gate,
+    AFTER it, so nothing here can feed back into scoring, reliability, or the
+    verdict. Alias keys are emitted alongside the primaries so a schema_registry
+    key-name variant still lands; the canonical projection strips whichever
+    names the sheet spec does not list. Idempotent: a second pass over a
+    completed row changes nothing."""
+    if not _analyst_trend_block_enabled():
+        return
+    if not isinstance(row, dict):
+        return
+
+    touched = False
+
+    def _fill(key: str, value: Any, *aliases: str) -> None:
+        nonlocal touched
+        if value is None or value == "":
+            return
+        if row.get(key) in (None, ""):
+            row[key] = value
+            touched = True
+        for a in aliases:
+            if row.get(a) in (None, ""):
+                row[a] = value
+
+    # 1) Analyst Rating <- canonical provider rating text (STRONG_BUY/BUY/...).
+    provider_rating = _safe_str(row.get("provider_rating")).upper().replace(" ", "_")
+    if provider_rating in _RECO_DIRECTION:
+        _fill("analyst_rating", provider_rating, "analyst_recommendation")
+
+    # 2) Target Price <- post-sanitization provider consensus target.
+    tgt = _as_float(row.get("target_mean_price"))
+    px = _as_float(row.get("current_price"))
+    if px is None:
+        px = _as_float(row.get("price"))
+    if tgt is not None and tgt > 0:
+        _fill("target_price", round(tgt, 6), "analyst_target_price")
+        # 3) Upside/Downside % <- signed FRACTION (matches upside_pct units).
+        if px not in (None, 0):
+            try:
+                _fill(
+                    "upside_downside_pct",
+                    round((tgt / px) - 1.0, 6),
+                    "upside_downside",
+                )
+            except Exception:
+                pass
+
+    # 4-6) Trend 1M / 3M / 12M <- UP/FLAT/DOWN, +/-2% fraction deadband.
+    _fill("trend_1m", _trend_label_from_roi(
+        _horizon_roi_fraction(row, "expected_roi_1m", "forecast_price_1m")))
+    _fill("trend_3m", _trend_label_from_roi(
+        _horizon_roi_fraction(row, "expected_roi_3m", "forecast_price_3m")))
+    _fill("trend_12m", _trend_label_from_roi(
+        _horizon_roi_fraction(row, "expected_roi_12m", "forecast_price_12m")))
+
+    # 7) Signal <- direction family of the FINAL recommendation.
+    reco = _safe_str(row.get("recommendation")).upper().replace(" ", "_")
+    direction = _RECO_DIRECTION.get(reco, "")
+    if direction == "ADD":
+        _fill("signal", "BUY", "overall_signal")
+    elif direction == "TRIM":
+        _fill("signal", "SELL", "overall_signal")
+    elif direction == "HOLD":
+        _fill("signal", "NEUTRAL", "overall_signal")
+
+    # 8) ST Signal <- RSI extremes first, candlestick second, 1M momentum last.
+    st = ""
+    rsi = _as_float(row.get("rsi_14"))
+    if rsi is not None:
+        if rsi >= 70.0:
+            st = "OVERBOUGHT"
+        elif rsi <= 30.0:
+            st = "OVERSOLD"
+    if not st:
+        candle = _safe_str(row.get("candlestick_signal")).upper()
+        if candle in ("BULLISH", "BEARISH"):
+            st = candle
+    if not st:
+        roi1 = _horizon_roi_fraction(row, "expected_roi_1m", "forecast_price_1m")
+        if roi1 is not None:
+            st = "BULLISH" if roi1 >= 0.01 else ("BEARISH" if roi1 <= -0.01 else "NEUTRAL")
+    if st:
+        _fill("st_signal", st, "short_term_signal")
+
+    if touched:
+        _v573_append_warning(row, "analyst_trend_block_applied")
+
+
 def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
     # v5.77.20 (Fix A): reconcile the recommendation family as the LAST thing
     # before the row is projected to canonical keys -- this is the final transform
@@ -7056,6 +7273,7 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     # recommendation_detailed / reason / priority / band downstream.
     _reconcile_recommendation_family(row)
     _apply_investability_gate(row)  # v5.78.0: decision-readiness layer (8 cols)
+    _apply_analyst_trend_block(row)  # v5.85.0 (Fix AD): runs AFTER the gate, derivation-only
     return {k: _json_safe(row.get(k)) for k in keys}
 
 
@@ -8463,7 +8681,8 @@ class DataEngineV5:
         fn = _pick_provider_callable(
             mod,
             "get_history_async", "fetch_history_async", "get_history",
-            "fetch_history", "history_async", "history", "get_candles",
+            "fetch_history", "fetch_price_history", "fetch_ohlc_history",
+            "history_async", "history", "get_candles",
         )
         if fn is None:
             return {}
@@ -8552,8 +8771,17 @@ class DataEngineV5:
     async def _fetch_yahoo_chart_patch(self, symbol: str, page: str = "") -> Dict[str, Any]:
         # v5.77.7: pass module basename + drop page arg (see fundamentals patch).
         mod = _import_yahoo_provider_module("yahoo_chart_provider")
+        # v5.85.0 (Fix AC-2): the on-disk yahoo_chart_provider exposes its
+        # history entry points as fetch_history / fetch_price_history /
+        # fetch_ohlc_history / fetch_prices (ShimFunction names) -- NOT
+        # get_chart / fetch_chart / get_history. Searching only the legacy
+        # names returned None, so this entire needs_chart pass was a silent
+        # no-op (the exact v5.77.14 name-mismatch class, chart side). List the
+        # provider's real names FIRST; legacy names stay as fallbacks.
         fn = _pick_yahoo_callable(
             mod,
+            "fetch_price_history", "fetch_history",
+            "fetch_ohlc_history", "fetch_prices",
             "get_chart_async", "fetch_chart_async",
             "get_chart", "fetch_chart",
             "chart_async", "chart",
@@ -8798,10 +9026,29 @@ class DataEngineV5:
                     merged.setdefault("data_provider", _safe_str(snap.get("data_provider"), "snapshot"))
 
             # History technicals (RSI / volatility / max drawdown / candlesticks).
-            if not any(
-                _as_float(merged.get(k)) is not None
-                for k in ("rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y")
-            ):
+            # v5.85.0 (Fix AC-1): the trigger is now GAP-AWARE. The old rule
+            # fired only when ALL of rsi/vol30/vol90/maxdd were missing, so a
+            # quote patch carrying vol30+maxdd (the yahoo_chart quote path)
+            # suppressed this pass and the Fix F fields (volatility_90d,
+            # avg_volume_10d/30d) stayed blank page-wide (Market_Leaders 76/76,
+            # Commodities_FX 75/75 in the 2026-06-10 audit). _merge is
+            # fill-only, so re-running the patch can never overwrite populated
+            # fields. Env-reversible: TFB_HISTORY_GAP_BACKFILL off restores the
+            # exact v5.84.0 all-four-missing trigger.
+            if _history_gap_backfill_enabled():
+                _needs_hist = any(
+                    _as_float(merged.get(k)) is None
+                    for k in (
+                        "rsi_14", "volatility_30d", "volatility_90d",
+                        "max_drawdown_1y", "avg_volume_10d", "avg_volume_30d",
+                    )
+                )
+            else:
+                _needs_hist = not any(
+                    _as_float(merged.get(k)) is not None
+                    for k in ("rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y")
+                )
+            if _needs_hist:
                 hist_patch = await self._get_history_patch_best_effort(sym, page_ctx)
                 if hist_patch:
                     merged = self._merge(merged, hist_patch)
@@ -9124,6 +9371,7 @@ class DataEngineV5:
         for _r in rows:
             _reconcile_recommendation_family(_r)
             _apply_investability_gate(_r)  # v5.78.0: same boundary as _strict_project_row
+            _apply_analyst_trend_block(_r)  # v5.85.0 (Fix AD): same boundary as _strict_project_row
         # v5.80.0: cross-sectional portfolio decision pass (weights + verdict).
         # Runs once on the full holdings list after the per-row gate, so
         # actual_weight/weight_gap see the whole book.
@@ -9396,7 +9644,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.84.0",  # v5.84.0 DECISION-GOVERNANCE TRANSPARENCY TAGS (Fix AA, three independently env-gated phases, ALL tag-only/sanitization -- NO recommendation, verdict, reliability, or schema change; with all three off the output is byte-identical to v5.83.3): (AA-1, TFB_DIVERGENCE_TAG default ON, threshold TFB_DIVERGENCE_ROI_MIN=0.25) a sell-family (TRIM-direction) row whose signed governing forecast ROI (_gate_governing_forecast_roi, the Fix S helper) is >= +25% gets warnings tag bearish_reco_high_modeled_upside -- the bearish mirror of Fix S, marking the 114 GM + 4 ML score/forecast contradictions from the 2026-06-10 audit for review without flipping any recommendation; (AA-2, TFB_CONF_CLUSTER_TAG default ON, list TFB_CONF_CLUSTER_VALUES=66.41,64.82,63.23,58.0) a row whose confidence_score sits exactly on a configured formula-attractor value gets warnings tag confidence_default_suspected, making the audit's 900x66.41 / 583x64.82 Global_Markets clusters visible per-row without demoting (Fix S2 standing decision preserved); (AA-3, TFB_FC_SOURCE_TYPE_GUARD default ON) a junk forecast_source literal (digits-only / true/false/none/null/nan -- the audit's 4 GM rows reading "1") is cleared to blank + tagged fc_source_invalid_cleared BEFORE fc_src is consumed, narrow by construction. All three tags avoid the reliability-scan substrings (cap/forecast/target/roi/drop/reject) so repeat gate passes are byte-identical. v5.83.3 FORECAST-RELIABILITY RECALIBRATION (Fix S2, env-gated TFB_RELIABILITY_RECALIBRATION, default OFF -> forecast_reliability_score byte-identical to v5.83.2): _apply_investability_gate's reliability base optionally blends data_quality (0.7*forecast_confidence + 0.3*data_quality_score) and the soft-display-cap penalty for a provider target compressed to the Phase-II ceiling (_capped_to_phase_ii_ceiling) drops 20->5, while a DROPPED/REJECTED-as-implausible target still takes its independent -15; corrects the flat -20 that branded the highest-upside real-analyst names (NVDA/META/MSFT 46.4/46.4/44.8) as least reliable and pushed them below the 70 floor into Top_10 backfill (with the blend at dq=100 they land ~71.5/71.5/70.4). Adds NO column (schema 115). v5.80.0 PORTFOLIO & INSIGHTS DECISION LAYER: My_Portfolio 115->122 (this page only; +Buy Date/Target Weight %/Actual Weight %/Weight Gap/Rebalance Action/Investor Decision/User Notes, mirroring the Top_10 115+3 pattern); _compute_portfolio_fields fills actual_weight/weight_gap (PERCENT POINTS) + action_flag (drift-only ADD/HOLD/REDUCE/SELL) + decision (blended SELL/REDUCE/ADD/HOLD from drift+reco+forecast-sign+risk), target_weight seeded from TFB_PORTFOLIO_TARGETS (1120=40/4013=30/7020=30) when blank, band TFB_PORTFOLIO_REBALANCE_BAND_PP=5.0pp, weak floor TFB_PORTFOLIO_WEAK_SCORE=60; Insights_Analysis rebuilt from live portfolio+market data (Portfolio Summary/Allocation vs Target/Market Opportunities/Data Quality) replacing the 2-row stub; Top_10 eligibility now also requires INVESTABLE and rejects negative-forecast buy-family (closing the Fix S/Fix J seam). Market pages stay 115. Pairs with 00_Config.gs v1.12.3. v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
+                "version": "v5.85.0",  # v5.85.0 HISTORY-GAP BACKFILL + ANALYST/TREND OUTPUT BLOCK (Fix AC + AD, both env-gated default ON, both fill-only -- NO recommendation, verdict, reliability, scoring, or schema change; with both off the output is byte-identical to v5.84.0): (AC, TFB_HISTORY_GAP_BACKFILL) the orchestrator history-technicals trigger is gap-aware (fires when ANY of rsi_14/volatility_30d/volatility_90d/max_drawdown_1y/avg_volume_10d/avg_volume_30d is missing, was all-four-missing) and _fetch_yahoo_chart_patch + _fetch_history_patch pickers gain the yahoo_chart_provider's REAL entry-point names (fetch_price_history/fetch_history/fetch_ohlc_history/fetch_prices -- the v5.77.14 name-mismatch class on the chart side), closing the 2026-06-10 audit's 100%-blank Volatility 90D + Avg Volume 10D/30D on Market_Leaders (76/76) and Commodities_FX (75/75); (AD, TFB_ANALYST_TREND_BLOCK) _apply_analyst_trend_block at the _strict_project_row/get_page_rows boundaries (AFTER the gate) derives the eight schema-defined-but-never-emitted presentation columns -- analyst_rating<-provider_rating, target_price<-target_mean_price, upside_downside_pct (FRACTION, matches upside_pct), trend_1m/3m/12m UP/FLAT/DOWN from expected_roi_*m (+/-2% deadband, forecast_price fallback), signal BUY/NEUTRAL/SELL from _RECO_DIRECTION, st_signal RSI-extremes/candlestick/1M-momentum -- derivation-only, no provider calls, fill-only, fail-open, alias keys emitted, tag analyst_trend_block_applied (reliability-scan substring-safe). v5.84.0 DECISION-GOVERNANCE TRANSPARENCY TAGS (Fix AA, three independently env-gated phases, ALL tag-only/sanitization -- NO recommendation, verdict, reliability, or schema change; with all three off the output is byte-identical to v5.83.3): (AA-1, TFB_DIVERGENCE_TAG default ON, threshold TFB_DIVERGENCE_ROI_MIN=0.25) a sell-family (TRIM-direction) row whose signed governing forecast ROI (_gate_governing_forecast_roi, the Fix S helper) is >= +25% gets warnings tag bearish_reco_high_modeled_upside -- the bearish mirror of Fix S, marking the 114 GM + 4 ML score/forecast contradictions from the 2026-06-10 audit for review without flipping any recommendation; (AA-2, TFB_CONF_CLUSTER_TAG default ON, list TFB_CONF_CLUSTER_VALUES=66.41,64.82,63.23,58.0) a row whose confidence_score sits exactly on a configured formula-attractor value gets warnings tag confidence_default_suspected, making the audit's 900x66.41 / 583x64.82 Global_Markets clusters visible per-row without demoting (Fix S2 standing decision preserved); (AA-3, TFB_FC_SOURCE_TYPE_GUARD default ON) a junk forecast_source literal (digits-only / true/false/none/null/nan -- the audit's 4 GM rows reading "1") is cleared to blank + tagged fc_source_invalid_cleared BEFORE fc_src is consumed, narrow by construction. All three tags avoid the reliability-scan substrings (cap/forecast/target/roi/drop/reject) so repeat gate passes are byte-identical. v5.83.3 FORECAST-RELIABILITY RECALIBRATION (Fix S2, env-gated TFB_RELIABILITY_RECALIBRATION, default OFF -> forecast_reliability_score byte-identical to v5.83.2): _apply_investability_gate's reliability base optionally blends data_quality (0.7*forecast_confidence + 0.3*data_quality_score) and the soft-display-cap penalty for a provider target compressed to the Phase-II ceiling (_capped_to_phase_ii_ceiling) drops 20->5, while a DROPPED/REJECTED-as-implausible target still takes its independent -15; corrects the flat -20 that branded the highest-upside real-analyst names (NVDA/META/MSFT 46.4/46.4/44.8) as least reliable and pushed them below the 70 floor into Top_10 backfill (with the blend at dq=100 they land ~71.5/71.5/70.4). Adds NO column (schema 115). v5.80.0 PORTFOLIO & INSIGHTS DECISION LAYER: My_Portfolio 115->122 (this page only; +Buy Date/Target Weight %/Actual Weight %/Weight Gap/Rebalance Action/Investor Decision/User Notes, mirroring the Top_10 115+3 pattern); _compute_portfolio_fields fills actual_weight/weight_gap (PERCENT POINTS) + action_flag (drift-only ADD/HOLD/REDUCE/SELL) + decision (blended SELL/REDUCE/ADD/HOLD from drift+reco+forecast-sign+risk), target_weight seeded from TFB_PORTFOLIO_TARGETS (1120=40/4013=30/7020=30) when blank, band TFB_PORTFOLIO_REBALANCE_BAND_PP=5.0pp, weak floor TFB_PORTFOLIO_WEAK_SCORE=60; Insights_Analysis rebuilt from live portfolio+market data (Portfolio Summary/Allocation vs Target/Market Opportunities/Data Quality) replacing the 2-row stub; Top_10 eligibility now also requires INVESTABLE and rejects negative-forecast buy-family (closing the Fix S/Fix J seam). Market pages stay 115. Pairs with 00_Config.gs v1.12.3. v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
