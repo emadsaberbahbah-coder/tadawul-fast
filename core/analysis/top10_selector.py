@@ -3,7 +3,7 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.16.0
+Top 10 Selector — v4.16.1
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -16,6 +16,23 @@ CANONICAL-BUCKET ROUTED • REAL OVERALL-RANK FALLBACK (v4.13.0)
 8-TIER VOCABULARY AWARE • PRIORITY-BAND ROUTED • CASCADE-BRIDGE READY (v4.14.0)
 PAGINATION-ENVELOPE SAFE • FULL-UNIVERSE INGEST • LIMIT-FILL BACKFILL (v4.15.0)
 VINTAGE-PROTECTED MERGE • GATE-FIELD QUARANTINE • ADMISSION-FILTERED (v4.16.0)
+
+================================================================================
+What v4.16.1 fixes (over v4.16.0)  --  AUDIT FOLLOW-UP: FULL GATE WRITE-SET
+================================================================================
+Pre-deployment cross-file audit (2026-06-10, selector vs data_engine_v2
+v5.84.0): the v4.16.0 GATE_CRITICAL_KEYS quarantine covered 5 of the 9
+columns the engine's _apply_investability_gate actually writes. The four
+companion verdict columns -- conflict_type, final_decision_basis,
+final_action, block_reason (all present on the Top_10 118-column sheet) --
+could therefore still arrive STALE from a snapshot / output-fallback donor
+and sit beside a fresh investability_status: e.g. a stale
+final_action="INVEST" next to a fresh WATCHLIST, or an obsolete
+block_reason explaining a verdict that no longer exists. v4.16.1 extends
+GATE_CRITICAL_KEYS to the full write-set so all nine verdict columns
+travel as ONE vintage. No other change; v4.16.0 logic, tests, and public
+API are otherwise verbatim (never deployed -- v4.16.0 was superseded
+pre-deployment by this audit).
 
 ================================================================================
 What v4.16.0 fixes (over v4.15.0)  --  THE "STALE 46.4 RELIABILITY" BUG (Fix U)
@@ -206,7 +223,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.16.0"
+TOP10_SELECTOR_VERSION = "4.16.1"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.14.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -509,11 +526,22 @@ _PROV_KEY = "_row_provenance"
 # `_apply_investability_gate`; a stale copy of any of them contradicts the
 # freshly computed gate decision (the exact defect verified 2026-06-10:
 # pre-Fix-S reliability 46.4/44.8 displayed beside post-Fix-S INVESTABLE).
+# v4.16.1: extended to the FULL engine gate write-set. The cross-file audit
+# found the v4.16.0 list covered 5 of the 9 columns the engine gate writes,
+# leaving the companion verdict fields (conflict_type, final_decision_basis,
+# final_action, block_reason) able to arrive stale next to a fresh
+# investability_status -- e.g. a stale final_action="INVEST" or an obsolete
+# block_reason beside a fresh WATCHLIST. All 9 verdict columns (plus
+# scoring_errors) now travel as one vintage.
 GATE_CRITICAL_KEYS: Tuple[str, ...] = (
     "forecast_reliability_score",
     "investability_status",
     "data_quality_score",
     "provider_engine_conflict",
+    "conflict_type",
+    "final_decision_basis",
+    "final_action",
+    "block_reason",
     "scoring_errors",
 )
 
