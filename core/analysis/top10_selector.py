@@ -3,7 +3,7 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.16.1
+Top 10 Selector — v4.17.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -18,6 +18,25 @@ PAGINATION-ENVELOPE SAFE • FULL-UNIVERSE INGEST • LIMIT-FILL BACKFILL (v4.15
 VINTAGE-PROTECTED MERGE • GATE-FIELD QUARANTINE • ADMISSION-FILTERED (v4.16.0)
 
 ================================================================================
+What v4.17.0 fixes (over v4.16.1)  --  FIX V: FINAL-ROW GATE + KEY GUARANTEE
+=============================================================================
+Live shell audit (2026-06-10, post-v4.16.1 deploy) showed a real selector
+build returning rows with NO gate columns at all: hydrated enriched-quote
+rows never pass through the engine's investability gate (it runs on the
+sheet-row path), and the resolved projection contract lacked the gate keys.
+Fix U correctly stripped STALE donor verdicts, so the sheet's gate columns
+went from stale-wrong to blank. v4.17.0 completes the fix:
+  V-1: _ensure_gate_output_keys appends any missing gate output keys (and
+       forecast_source) with aligned canonical headers after schema
+       resolution, so fresh gate values cannot be dropped by projection.
+  V-2: _apply_final_gate runs core.data_engine_v2._apply_investability_gate
+       on each FINAL selected row immediately before projection — fresh
+       verdicts from the same hydrated data, restoring reliability parity
+       with Global_Markets (NVDA/META 71.5, MSFT 70.4 class of values).
+Both are fail-soft; TFB_TOP10_FINAL_GATE=0 restores v4.16.1 exactly.
+New meta: final_gate_enabled / final_gate_available / final_gate_applied /
+final_gate_errors / gate_keys_appended / projection_keys_count.
+
 What v4.16.1 fixes (over v4.16.0)  --  AUDIT FOLLOW-UP: FULL GATE WRITE-SET
 ================================================================================
 Pre-deployment cross-file audit (2026-06-10, selector vs data_engine_v2
@@ -214,16 +233,17 @@ import json
 import logging
 import math
 import os
+from collections import OrderedDict
 import re
 import sys
 import time
 from decimal import Decimal
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, MutableMapping
 
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.16.1"
+TOP10_SELECTOR_VERSION = "4.17.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.14.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -547,6 +567,102 @@ GATE_CRITICAL_KEYS: Tuple[str, ...] = (
 
 # Admission filter (Phase D). Default ON; set TFB_TOP10_ADMISSION_FILTER=0
 # to restore pre-v4.16.0 behavior. Reasons surfaced in meta + logs.
+# =============================================================================
+# v4.17.0 [FIX V] — FINAL-ROW GATE APPLICATION + GATE-KEY PROJECTION GUARANTEE
+# -----------------------------------------------------------------------------
+# WHY: Fix U (v4.16.x) quarantines STALE gate verdicts arriving on snapshot /
+# output-fallback donors — correct, but it exposed the other half of the
+# original C1 defect: freshly hydrated rows come from the engine's
+# enriched-quote path, which does NOT run the investability gate (the gate
+# runs on the engine's sheet-row path). Live evidence 2026-06-10: a real
+# selector build returned 10 rows with NO gate keys at all
+# (forecast_reliability_score / investability_status / final_action absent),
+# and the resolved projection contract itself lacked the gate columns. Net
+# sheet effect: Top_10 gate columns blank instead of stale-wrong.
+#
+# FIX V therefore does two things, both fail-soft and env-gated:
+#   V-1 `_ensure_gate_output_keys`: after schema resolution, append any
+#       missing gate output keys (+ forecast_source) WITH matching canonical
+#       headers, so projection cannot drop fresh gate values. Downstream
+#       routes re-project onto the registry's canonical 118-column order, so
+#       sheet column ORDER is governed there; the selector only guarantees
+#       the VALUES survive under canonical key names.
+#   V-2 `_apply_final_gate`: immediately before projection, run the engine's
+#       own `_apply_investability_gate` on each final selected row. This
+#       recomputes verdicts FRESH from the same hydrated data — the exact
+#       reliability-parity guarantee Fix S/Fix U exist to provide (e.g. NVDA
+#       71.5 on Top_10 == Global_Markets). The gate is idempotent and
+#       AA-tag-aware (v5.84.0), so repeated application is safe.
+# Kill switch: TFB_TOP10_FINAL_GATE=0 restores v4.16.1 behavior exactly.
+# =============================================================================
+TOP10_FINAL_GATE_ENV = "TFB_TOP10_FINAL_GATE"
+TOP10_FINAL_GATE_ENABLED = (
+    os.getenv(TOP10_FINAL_GATE_ENV, "1").strip().lower() in ("1", "true", "yes", "on")
+)
+# Gate output columns the projection must carry (canonical key -> sheet header).
+GATE_OUTPUT_KEY_HEADERS: "OrderedDict[str, str]" = OrderedDict(
+    (
+        ("forecast_source", "Forecast Source"),
+        ("forecast_reliability_score", "Forecast Reliability Score"),
+        ("investability_status", "Investability Status"),
+        ("data_quality_score", "Data Quality Score"),
+        ("provider_engine_conflict", "Provider Engine Conflict"),
+        ("conflict_type", "Conflict Type"),
+        ("final_decision_basis", "Final Decision Basis"),
+        ("final_action", "Final Action"),
+        ("block_reason", "Block Reason"),
+        ("scoring_errors", "Scoring Errors"),
+    )
+)
+
+
+def _ensure_gate_output_keys(headers: List[str], keys: List[str]) -> Tuple[List[str], List[str], int]:
+    """v4.17.0 [FIX V-1]: append missing gate output keys with aligned headers.
+
+    Returns (headers, keys, appended_count). Never raises; never reorders or
+    removes existing entries, so v4.16.1 contracts that already include the
+    gate columns (e.g. a registry-served 118) pass through unchanged.
+    """
+    hs, ks = list(headers or []), list(keys or [])
+    have = {_s(k).strip().lower() for k in ks}
+    appended = 0
+    for k, h in GATE_OUTPUT_KEY_HEADERS.items():
+        if k not in have:
+            ks.append(k)
+            hs.append(h)
+            appended += 1
+    return hs, ks, appended
+
+
+def _apply_final_gate(rows: Sequence[MutableMapping[str, Any]]) -> Tuple[int, int, bool]:
+    """v4.17.0 [FIX V-2]: run the engine investability gate on final rows.
+
+    Returns (applied_count, error_count, gate_available). Lazy import,
+    per-row try/except — any failure leaves that row exactly as it was.
+    """
+    if not TOP10_FINAL_GATE_ENABLED:
+        return 0, 0, False
+    gate_fn = None
+    try:
+        from core import data_engine_v2 as _e  # type: ignore
+        gate_fn = getattr(_e, "_apply_investability_gate", None)
+    except Exception:
+        gate_fn = None
+    if not callable(gate_fn):
+        return 0, 0, False
+    applied = 0
+    errors = 0
+    for row in rows:
+        if not isinstance(row, MutableMapping):
+            continue
+        try:
+            gate_fn(row)
+            applied += 1
+        except Exception:
+            errors += 1
+    return applied, errors, True
+
+
 TOP10_ADMISSION_FILTER_ENV = "TFB_TOP10_ADMISSION_FILTER"
 TOP10_ADMISSION_FILTER_ENABLED = (
     os.getenv(TOP10_ADMISSION_FILTER_ENV, "1").strip().lower() in ("1", "true", "yes", "on")
@@ -2821,6 +2937,8 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     async def _inner() -> Dict[str, Any]:
         started = time.perf_counter()
         headers, keys = _load_schema_defaults()
+        # v4.17.0 [FIX V-1]: guarantee gate output columns survive projection.
+        headers, keys, gate_keys_appended = _ensure_gate_output_keys(headers, keys)
         criteria = _collect_criteria_from_inputs(*args, **kwargs)
         mode = _s(kwargs.get("mode") or criteria.get("mode") or "")
         limit = max(1, _safe_int(criteria.get("limit") or kwargs.get("limit"), 10))
@@ -3051,6 +3169,12 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 if len(top_rows) >= limit:
                     break
 
+        # v4.17.0 [FIX V-2]: recompute gate verdicts FRESH on the final rows.
+        # Hydrated enriched-quote rows carry no gate fields (the gate runs on
+        # the engine's sheet-row path), and Fix U quarantined stale donor
+        # verdicts - so without this step Top_10 gate columns render blank.
+        final_gate_applied, final_gate_errors, final_gate_available = _apply_final_gate(top_rows[:limit])
+
         projected_rows = _rank_and_project_rows(top_rows[:limit], keys, criteria)
 
         dq_engine_drop = 0
@@ -3099,6 +3223,12 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "backfill_symbols": list(backfill_symbols),
             # v4.16.0 Phase D — admission filter audit (Fix U).
             "admission_filter_enabled": TOP10_ADMISSION_FILTER_ENABLED,
+            "final_gate_enabled": TOP10_FINAL_GATE_ENABLED,
+            "final_gate_available": final_gate_available,
+            "final_gate_applied": final_gate_applied,
+            "final_gate_errors": final_gate_errors,
+            "gate_keys_appended": gate_keys_appended,
+            "projection_keys_count": len(keys),
             "admission_excluded_count": len(admission_excluded),
             "admission_excluded": [dict(x) for x in admission_excluded[:25]],
             # v4.16.0 Phase A — provenance of the FINAL projected rows
@@ -3251,6 +3381,9 @@ __all__ = [
     "GATE_CRITICAL_KEYS",
     "TOP10_ADMISSION_FILTER_ENABLED",
     "TOP10_ADMISSION_FILTER_ENV",
+    "TOP10_FINAL_GATE_ENV",
+    "TOP10_FINAL_GATE_ENABLED",
+    "GATE_OUTPUT_KEY_HEADERS",
     # v4.14.0 Phase C: 8-tier vocabulary surface (content-checkable
     # constants for ops + downstream tooling).
     "_RECO_8TIER_CANONICAL",
