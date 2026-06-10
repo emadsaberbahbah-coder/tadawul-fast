@@ -2,8 +2,20 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.5.0  (SPECIAL-PAGE BUILDER DISPATCH — BRIDGE-FIX)
+Advanced Analysis Root Owner — v4.6.0  (SPECIAL-PAGE BUILDER DISPATCH — BRIDGE-FIX)
 ================================================================================
+v4.6.0 [ORDER-FIX]: the selector_real Top_10 path no longer re-sorts the
+selector's rows. _ensure_top10_rows gained preserve_order (default False);
+_normalize_external_payload threads top10_preserve_order, set True ONLY on the
+v4.5.0 special-page (selector_real) dispatch. Root cause of the live 2026-06-10
+audit finding "GC=F (HOLD) ranked #2 above ACCUMULATE names": the route's
+unconditional overall_score-first re-sort overwrote the selector's ranking
+(selector score, priority band, horizon ROI, direct-symbol order, backfill-last
+from top10_selector v4.15.0/v4.16.1) and re-stamped top10_rank. In preserve
+mode the route now only dedupes in selector order, slices, FILLS a blank rank,
+and fills blank selection_reason / criteria_snapshot. The engine and fail-soft
+Top_10 paths (no selector ordering to preserve) are byte-identical to v4.5.0.
+
 v4.5.0 [BRIDGE-FIX]: Top_10_Investments and Insights_Analysis now dispatch to
 their REAL builders on the happy path — mirroring the v4.4.0 Data_Dictionary
 pattern. Root cause of the "Top_10 shows the engine's 1 placeholder row /
@@ -207,7 +219,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 # v4.3.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.5.0"
+ADVANCED_ANALYSIS_VERSION = "4.6.0"
 
 
 # =============================================================================
@@ -1402,11 +1414,23 @@ def _top10_criteria_snapshot(row: Mapping[str, Any]) -> str:
     except Exception:
         return str(snapshot)
 
-def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: Sequence[str], top_n: int, schema_keys: Sequence[str], schema_headers: Sequence[str]) -> List[Dict[str, Any]]:
+def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: Sequence[str], top_n: int, schema_keys: Sequence[str], schema_headers: Sequence[str], preserve_order: bool = False) -> List[Dict[str, Any]]:
     normalized_rows = [_normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=(r or {})) for r in rows or []]
+    # v4.6.0 [ORDER-FIX]: when the rows came from the REAL selector
+    # (core.analysis.top10_selector), its ranking is authoritative — selector
+    # score, priority band, horizon ROI, direct-symbol ordering, and
+    # backfill-last placement (v4.15.0/v4.16.1). The pre-v4.6.0 unconditional
+    # re-sort by _top10_sort_key (overall_score-first) DESTROYED that order:
+    # live audit 2026-06-10 showed GC=F (HOLD, overall 69) re-sorted to rank 2
+    # above ACCUMULATE names, and a "[BACKFILL: below criteria]" row can jump
+    # above passing rows. In preserve mode: dedupe in GIVEN order (first
+    # occurrence wins), slice, and only FILL a blank top10_rank — never
+    # overwrite the selector's. The engine / fail-soft paths (no selector
+    # ordering to preserve) keep the exact prior sort behavior.
+    iterable = normalized_rows if preserve_order else sorted(normalized_rows, key=_top10_sort_key, reverse=True)
     deduped: List[Dict[str, Any]] = []
     seen = set()
-    for row in sorted(normalized_rows, key=_top10_sort_key, reverse=True):
+    for row in iterable:
         sym = _strip(row.get("symbol"))
         name = _strip(row.get("name"))
         key = sym or name or f"row_{len(deduped)+1}"
@@ -1416,7 +1440,11 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
         deduped.append(row)
     final_rows = deduped[:max(1, int(top_n))]
     for idx, row in enumerate(final_rows, start=1):
-        row["top10_rank"] = idx
+        if preserve_order:
+            if not _strip(row.get("top10_rank")) and not isinstance(row.get("top10_rank"), (int, float)):
+                row["top10_rank"] = idx
+        else:
+            row["top10_rank"] = idx
         if not _strip(row.get("selection_reason")):
             row["selection_reason"] = _top10_selection_reason(row)
         if not _strip(row.get("criteria_snapshot")):
@@ -1715,6 +1743,7 @@ def _normalize_external_payload(
     requested_symbols: Optional[Sequence[str]] = None,
     meta_extra: Optional[Dict[str, Any]] = None,
     provider_health: Optional[Mapping[str, Any]] = None,
+    top10_preserve_order: bool = False,
 ) -> Dict[str, Any]:
     """Normalize an engine payload into the canonical envelope.
 
@@ -1735,7 +1764,10 @@ def _normalize_external_payload(
     rows = _extract_rows_like(ext)
     normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
     if page == _TOP10_PAGE:
-        normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
+        # v4.6.0 [ORDER-FIX]: preserve selector ordering on the selector_real
+        # dispatch; engine/fallback rows keep the prior sort (see
+        # _ensure_top10_rows).
+        normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs, preserve_order=top10_preserve_order)
     normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
     status_out, error_out, ext_meta = _extract_status_error(ext)
     if not normalized_rows:
@@ -1909,6 +1941,7 @@ async def _run_advanced_sheet_rows_impl(
                             "source": special_source,
                             "dispatch": special_dispatch},
                 provider_health=provider_health,
+                top10_preserve_order=(page == _TOP10_PAGE),
             )
             if _extract_rows_like(normalized_special):
                 return normalized_special
