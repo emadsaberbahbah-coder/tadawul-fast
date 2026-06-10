@@ -2,7 +2,7 @@
 # core/sheets/schema_registry.py
 """
 ================================================================================
-Schema Registry — v2.14.0
+Schema Registry — v2.15.0
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -19,6 +19,46 @@ exist; no network calls; import-safe.
 copy; ALL code, validation logic, and per-column notes are preserved verbatim
 except where the v2.13.0 / v2.12.0 changelogs below state otherwise.)
 
+================================================================================
+v2.15.0  --  MARKET-PAGE CONTRACT REALIGNED TO THE PHYSICAL SHEETS (115 stays 115)
+================================================================================
+The 2026-06-10 live diff (registry sheet-spec endpoint vs the actual workbook
+header rows) proved the four market pages + Top_10 have been running on TWO
+DIFFERENT 115-column sets: the physical sheets carry Analyst Rating, Target
+Price, Upside/Downside %, Signal, Trend 1M/3M/12M, ST Signal (positions 68-75)
+plus Provider Secondary (111) and Row Source (114), while this registry still
+served the pre-v5.80.0 layout carrying the 4 View columns and the 6 position
+columns instead. Because the route layer is registry-first, the engine's
+analyst/trend values (data_engine_v2 v5.85.0 Fix AD) were projected OUT of
+every served row -- the audit's eight 100%-blank columns -- and conversely the
+View/position fields were served with no physical column to land in.
+
+v2.15.0 makes the PHYSICAL SHEET the authoritative layout for the market pages:
+
+1. NEW: _MARKET_SHEET_HEADER_ORDER (the verbatim 115-header physical order,
+   captured from the live workbook 2026-06-10) + _market_instrument_columns(),
+   which reuses every existing ColumnSpec VERBATIM by header lookup and adds 10
+   new specs: analyst_rating, target_price, upside_downside_pct (FRACTION,
+   matches upside_pct), signal, trend_1m/3m/12m, st_signal (all emitted by
+   data_engine_v2 v5.85.0 Fix AD), provider_secondary + row_source (reserved;
+   not yet engine-emitted, kept for physical alignment).
+2. Market_Leaders / Global_Markets / Commodities_FX / Mutual_Funds ->
+   _MARKET_COLUMNS (115). Top_10_Investments -> _MARKET_COLUMNS + the same 3
+   Top10 extras (118). My_Portfolio is UNTOUCHED: its physical sheet still
+   carries the View + position columns and was verified aligned to the
+   v2.14.0 contract (115 legacy canonical + 7 = 122).
+3. VALIDATION: the market-page and Top_10 branches no longer require
+   VIEW_COLUMN_KEYS (the Views are a My_Portfolio + engine-internal concern
+   now; reco_normalize consumes them from ENGINE ROWS pre-projection, not from
+   the sheet). Every other required group (insights, decision, candlestick,
+   canonical reco, Scoring v5.74, forecast_source, investability gate) is
+   present in the physical layout and stays enforced. My_Portfolio branch
+   unchanged verbatim.
+4. _CANONICAL_COLUMNS (the legacy layout) is preserved verbatim as the
+   My_Portfolio base and the registry-unavailable fallback contract.
+BUMP: SCHEMA_VERSION 2.14.0 -> 2.15.0. Widths unchanged: 115 / 118 / 122.
+Co-deploy note: data_engine_v2 must be >= v5.85.0 (Fix AD) or the 8 analyst
+columns stay blank (engine emits, registry now projects).
 ================================================================================
 v2.14.0  --  MY_PORTFOLIO 115 -> 122  (adds a 7-field portfolio DECISION layer so
             the registry mirrors data_engine_v2 v5.80.0's My_Portfolio contract;
@@ -211,7 +251,7 @@ __all__ = [
     "validate_schema_registry",
 ]
 
-SCHEMA_VERSION = "2.14.0"
+SCHEMA_VERSION = "2.15.0"
 # TFB module-version convention alias (mirrors scoring v5.6.0,
 # data_engine_v2 v5.75.0, enriched_quote v4.7.0, reco_normalize v7.2.0,
 # insights_builder v7.0.0, scoring_engine v3.4.4, top10_selector v4.11.0,
@@ -1062,6 +1102,138 @@ _CANONICAL_COLUMNS = _sanitize_columns(
 )
 
 
+# -----------------------------------------------------------------------------
+# v2.15.0 — MARKET-PAGE physical layout (Market_Leaders / Global_Markets /
+# Commodities_FX / Mutual_Funds, and the Top_10 base). The verbatim 115-header
+# order of the live workbook (captured 2026-06-10). Every header that also
+# exists in the legacy canonical reuses its ColumnSpec VERBATIM (group, dtype,
+# fmt, required, source, notes); only the 10 headers absent from the legacy
+# layout get new specs below. My_Portfolio stays on _CANONICAL_COLUMNS.
+# -----------------------------------------------------------------------------
+
+_MARKET_SHEET_HEADER_ORDER: Tuple[str, ...] = (
+    "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country",
+    "Sector", "Industry", "Current Price", "Previous Close", "Open",
+    "Day High", "Day Low", "52W High", "52W Low", "Price Change",
+    "Percent Change", "52W Position %", "Volume", "Avg Volume 10D",
+    "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)", "P/E (TTM)",
+    "P/E (Forward)", "EPS (TTM)", "Dividend Yield", "Payout Ratio",
+    "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin",
+    "Operating Margin", "Profit Margin", "Debt/Equity",
+    "Free Cash Flow (TTM)", "RSI (14)", "Volatility 30D", "Volatility 90D",
+    "Max Drawdown 1Y", "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score",
+    "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value",
+    "Upside %", "Valuation Score", "Forecast Price 1M", "Forecast Price 3M",
+    "Forecast Price 12M", "Expected ROI 1M", "Expected ROI 3M",
+    "Expected ROI 12M", "Forecast Confidence", "Confidence Score",
+    "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
+    "Growth Score", "Overall Score", "Opportunity Score", "Rank (Overall)",
+    "Analyst Rating", "Target Price", "Upside/Downside %", "Signal",
+    "Trend 1M", "Trend 3M", "Trend 12M", "ST Signal", "Recommendation",
+    "Recommendation Detail", "Recommendation Reason", "Reco Priority",
+    "Priority Band", "Recommendation Source", "Horizon Days",
+    "Invest Period Label", "Sector-Adj Score", "Conviction Score",
+    "Top Factors", "Top Risks", "Position Size Hint", "Candle Pattern",
+    "Candle Signal", "Candle Strength", "Candle Confidence",
+    "Recent Patterns (5D)", "Provider Rating", "Scoring Reco Source",
+    "Scoring Schema Version", "Scoring Errors", "Opportunity Source",
+    "Overall Score (Raw)", "Overall Penalty Factor", "Forecast Source",
+    "Data Quality Score", "Forecast Reliability Score",
+    "Provider/Engine Conflict", "Conflict Type", "Final Decision Basis",
+    "Investability Status", "Final Action", "Block Reason", "Data Provider",
+    "Provider Secondary", "Last Updated (UTC)", "Last Updated (Riyadh)",
+    "Row Source", "Warnings",
+)
+
+
+def _market_extra_column_specs() -> Dict[str, ColumnSpec]:
+    """v2.15.0: the 10 physical-sheet columns absent from the legacy canonical.
+    Keys MUST match data_engine_v2 v5.85.0 (Fix AD) row keys verbatim, or the
+    registry-first projection drops them (the exact failure this version fixes).
+    provider_secondary / row_source are reserved (not yet engine-emitted)."""
+    cols = (
+        ColumnSpec(
+            "Analyst", "Analyst Rating", "analyst_rating", "str", "text", False, "engine",
+            "Provider/analyst consensus rating, canonical text (STRONG_BUY/BUY/HOLD/...). "
+            "Emitted by data_engine_v2 v5.85.0 _apply_analyst_trend_block from provider_rating.",
+        ),
+        ColumnSpec(
+            "Analyst", "Target Price", "target_price", "float", "0.00", False, "engine",
+            "Provider consensus mean target (post-sanitization target_mean_price). "
+            "Blank when no provider target exists (fail-open).",
+        ),
+        ColumnSpec(
+            "Analyst", "Upside/Downside %", "upside_downside_pct", "pct", "0.00%", False, "derived",
+            "target_price / current_price - 1, signed FRACTION (matches upside_pct units).",
+        ),
+        ColumnSpec(
+            "Analyst", "Signal", "signal", "str", "text", False, "derived",
+            "BUY / NEUTRAL / SELL from the final recommendation's direction family "
+            "(_RECO_DIRECTION; engine v5.85.0 Fix AD).",
+        ),
+        ColumnSpec(
+            "Analyst", "Trend 1M", "trend_1m", "str", "text", False, "derived",
+            "UP / FLAT / DOWN from expected_roi_1m (fraction, +/-2% deadband; "
+            "forecast_price_1m vs current as fallback).",
+        ),
+        ColumnSpec(
+            "Analyst", "Trend 3M", "trend_3m", "str", "text", False, "derived",
+            "UP / FLAT / DOWN from expected_roi_3m (fraction, +/-2% deadband).",
+        ),
+        ColumnSpec(
+            "Analyst", "Trend 12M", "trend_12m", "str", "text", False, "derived",
+            "UP / FLAT / DOWN from expected_roi_12m (fraction, +/-2% deadband).",
+        ),
+        ColumnSpec(
+            "Analyst", "ST Signal", "st_signal", "str", "text", False, "derived",
+            "Short-term signal: OVERBOUGHT/OVERSOLD (RSI 70/30), else candlestick "
+            "signal, else 1M momentum sign (+/-1% deadband) -> BULLISH/BEARISH/NEUTRAL.",
+        ),
+        ColumnSpec(
+            "Provenance", "Provider Secondary", "provider_secondary", "str", "text", False, "system",
+            "Secondary data provider for the row. RESERVED: physical column exists; "
+            "engine emission not yet wired (blank is expected).",
+        ),
+        ColumnSpec(
+            "Provenance", "Row Source", "row_source", "str", "text", False, "system",
+            "Row origin marker (e.g. Top10 Engine). RESERVED on market pages; "
+            "populated by selected builders only.",
+        ),
+    )
+    return {c.header: c for c in cols}
+
+
+def _market_instrument_columns() -> Tuple[ColumnSpec, ...]:
+    """v2.15.0: assemble the market-page layout in the physical sheet order,
+    reusing legacy ColumnSpecs verbatim by header and adding the 10 new specs.
+    Self-checking: raises at import if any header cannot be resolved or the
+    final width is not _CANONICAL_INSTRUMENT_COLS."""
+    legacy_by_header: Dict[str, ColumnSpec] = {c.header: c for c in _CANONICAL_COLUMNS}
+    extras = _market_extra_column_specs()
+    out: List[ColumnSpec] = []
+    for header in _MARKET_SHEET_HEADER_ORDER:
+        spec = legacy_by_header.get(header) or extras.get(header)
+        if spec is None:
+            raise ValueError(
+                f"[MARKET] v2.15.0 header '{header}' resolves to no ColumnSpec "
+                f"(neither legacy canonical nor market extras)."
+            )
+        out.append(spec)
+    if len(out) != _CANONICAL_INSTRUMENT_COLS:
+        raise ValueError(
+            f"[MARKET] v2.15.0 layout must be {_CANONICAL_INSTRUMENT_COLS} columns; got {len(out)}."
+        )
+    return tuple(out)
+
+
+_MARKET_COLUMNS = _sanitize_columns(
+    "MARKET",
+    "instrument_table",
+    _market_instrument_columns(),
+    enforce_symbol_first=True,
+)
+
+
 def _top10_extra_columns() -> Tuple[ColumnSpec, ...]:
     """
     3 extra columns for Top_10_Investments.
@@ -1069,8 +1241,9 @@ def _top10_extra_columns() -> Tuple[ColumnSpec, ...]:
     """
     cols = (
         ColumnSpec(
-            "Top10", "Top10 Rank", "top10_rank", "int", "0", False, "derived",
-            "Rank within Top 10 selection (1-based, set by top10_selector v4.11.0).",
+            "Top10", "Top 10 Rank", "top10_rank", "int", "0", False, "derived",
+            "Rank within Top 10 selection (1-based, set by top10_selector v4.11.0). "
+            "v2.15.0: header aligned to the physical sheet ('Top 10 Rank', was 'Top10 Rank').",
         ),
         ColumnSpec(
             "Top10", "Selection Reason", "selection_reason", "str", "text", False, "model",
@@ -1239,25 +1412,25 @@ _RAW_SCHEMA_REGISTRY: Dict[str, SheetSpec] = {
     "Market_Leaders": SheetSpec(
         sheet="Market_Leaders",
         kind="instrument_table",
-        columns=_CANONICAL_COLUMNS,
+        columns=_MARKET_COLUMNS,  # v2.15.0: physical-sheet layout (analyst/trend block)
         notes="Primary watchlist / leaders universe. Canonical schema enforced.",
     ),
     "Global_Markets": SheetSpec(
         sheet="Global_Markets",
         kind="instrument_table",
-        columns=_CANONICAL_COLUMNS,
+        columns=_MARKET_COLUMNS,  # v2.15.0: physical-sheet layout (analyst/trend block)
         notes="Global indices/shares. Canonical schema enforced.",
     ),
     "Commodities_FX": SheetSpec(
         sheet="Commodities_FX",
         kind="instrument_table",
-        columns=_CANONICAL_COLUMNS,
+        columns=_MARKET_COLUMNS,  # v2.15.0: physical-sheet layout (analyst/trend block)
         notes="Commodities & FX tickers. Canonical schema enforced.",
     ),
     "Mutual_Funds": SheetSpec(
         sheet="Mutual_Funds",
         kind="instrument_table",
-        columns=_CANONICAL_COLUMNS,
+        columns=_MARKET_COLUMNS,  # v2.15.0: physical-sheet layout (analyst/trend block)
         notes="Funds/ETFs. Canonical schema enforced.",
     ),
     "My_Portfolio": SheetSpec(
@@ -1295,7 +1468,7 @@ _RAW_SCHEMA_REGISTRY: Dict[str, SheetSpec] = {
         columns=_sanitize_columns(
             "Top_10_Investments",
             "instrument_table",
-            _CANONICAL_COLUMNS + _top10_extra_columns(),  # 118 columns in v2.13.0+
+            _MARKET_COLUMNS + _top10_extra_columns(),  # 118 in v2.15.0+: physical market base + 3 Top10 extras
             enforce_symbol_first=True,
         ),
         notes="Criteria-driven selection. Canonical columns + Top10 extras.",
@@ -1610,13 +1783,14 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
             if spec.columns[0].key != "symbol":
                 raise ValueError(f"[{sheet_name}] First column must be 'symbol'.")
             spec_keys = {c.key for c in spec.columns}
-            missing_views = [k for k in VIEW_COLUMN_KEYS if k not in spec_keys]
-            if missing_views:
-                raise ValueError(
-                    f"[{sheet_name}] Missing required view column(s): {missing_views}. "
-                    f"The recommendation pipeline (core.reco_normalize v7.2.0 "
-                    f"recommendation_from_views) depends on these."
-                )
+            # v2.15.0: VIEW_COLUMN_KEYS are NO LONGER required on the market
+            # pages -- the physical sheets dropped the 4 View columns when the
+            # analyst/trend block was introduced (00_Config v1.12.x era), and
+            # reco_normalize's recommendation_from_views consumes the views
+            # from ENGINE ROWS before projection, never from the sheet. The
+            # views remain required on My_Portfolio (whose physical sheet
+            # still carries them) and remain in VIEW_COLUMN_KEYS for engine/
+            # downstream use.
             missing_insights = [k for k in INSIGHTS_COLUMN_KEYS if k not in spec_keys]
             if missing_insights:
                 raise ValueError(
@@ -1679,11 +1853,8 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
             if spec.columns[0].key != "symbol":
                 raise ValueError("[Top_10_Investments] First column must be 'symbol' (no blank leading column).")
             spec_keys = {c.key for c in spec.columns}
-            missing_views = [k for k in VIEW_COLUMN_KEYS if k not in spec_keys]
-            if missing_views:
-                raise ValueError(
-                    f"[Top_10_Investments] Missing required view column(s): {missing_views}."
-                )
+            # v2.15.0: views no longer required (market base dropped them;
+            # see the market-page branch note above). All other groups stay.
             missing_insights = [k for k in INSIGHTS_COLUMN_KEYS if k not in spec_keys]
             if missing_insights:
                 raise ValueError(
