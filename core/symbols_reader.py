@@ -7,6 +7,14 @@ TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v8.4.0)
 RENDER-ALIGNED | ENGINE-COMPATIBLE | SETTINGS-AWARE | SCHEMA-AWARE
 ASYNC-SAFE | CACHE-SAFE
 
+Why this revision (v8.4.3)
+- ✅ FIX (QUOTA): _resolve_actual_sheet_names queried nonexistent alias tabs
+  verbatim (3 doomed range reads each, ~9-12 reads/page), producing 400/404
+  noise and tripping the Sheets API 60-reads/min/user quota (HTTP 429
+  observed live, 2026-06-11). When the actual tab list is known, alias
+  candidates absent from it are now dropped; verbatim fallback survives only
+  when the tab list itself is unavailable. ~3-4x fewer reads per cold page.
+
 Why this revision (v8.4.2)
 - ✅ FIX (CRITICAL): header detection scanned ONLY the fixed spec.header_row
   (row 5) while live TFB pages keep headers on row 1 -- the probe landed on a
@@ -106,7 +114,7 @@ from typing import (
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "8.4.2"
+SCRIPT_VERSION = "8.4.3"
 
 
 # ---------------------------------------------------------------------------
@@ -1456,10 +1464,15 @@ async def _resolve_actual_sheet_names(spreadsheet_id: str, preferred_names: Sequ
                 if m not in seen:
                     resolved.append(m)
                     seen.add(m)
-        else:
-            if p not in seen:
-                resolved.append(p)
-                seen.add(p)
+        # WHY (v8.4.3): when the ACTUAL tab list is known, alias candidates
+        # that do not exist in it are DROPPED instead of queried verbatim.
+        # Previously every nonexistent alias ("Leaders", "Funds", "Portfolio",
+        # "World Markets", "FX & Commodities", ...) fired 3 doomed range reads
+        # apiece -- ~9-12 reads per page -- which produced 400/404 log noise
+        # and tripped the Sheets API 60-reads/min/user quota (HTTP 429
+        # observed live on Render, 2026-06-11). Verbatim fallback is kept
+        # ONLY when the tab list is unavailable (the `if not tabs` early
+        # return above), preserving v8.4.2 fail-soft behavior.
 
     return resolved
 
