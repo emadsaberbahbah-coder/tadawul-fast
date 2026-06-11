@@ -2,8 +2,28 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.6.0  (SPECIAL-PAGE BUILDER DISPATCH — BRIDGE-FIX)
+Advanced Analysis Root Owner — v4.7.0  (OPPORTUNITY-CANDIDATES ENDPOINT — OPP-ADD)
 ================================================================================
+v4.7.0 [OPP-ADD]: NEW endpoint POST /opportunity-candidates (+ /v1 alias) —
+Plan v5.0 Phase P3. Serves the FROZEN §5 zone payload for the rebuilt
+Top_10_Investments decision page by bridging the selector candidate pool into
+core.analysis.opportunity_builder v1.0.1 (hard gates §4.2, opportunity score
+§4.3, wealth math §4.4, L7 funding identity). The request body carries the GAS
+control-panel values (`criteria` — panel labels or snake_case, mapped via
+_OPP_CRITERIA_ALIASES and echoed back in meta.criteria_snapshot), `fx_rates`
+(read by GAS from _Lists_Config TFB_FX_LOOKUP — the backend never reads the
+spreadsheet), `portfolio` context (cash / pending proceeds / holdings),
+optional explicit `rows` (bypasses the selector — used by tests and replays),
+and `pool_limit`. Candidate pool: _build_top10_rows(limit=pool_limit, mode=…)
+via _maybe_await (same v4.5.0 binding + coroutine handling); selector meta
+(coverage / budget / timeouts / freshness) and versions are forwarded as
+upstream_meta so budget_exhausted surfaces as a Top_10 alert. Fail-soft
+end-to-end: builder unbound -> status "unavailable"; selector empty/unbound
+with no body rows -> the builder's honest "no_candidates" skeleton; nothing in
+the new path raises except auth 401. ALL v4.6.0 behavior — every endpoint, the
+dispatch chain, envelopes, widths — is preserved verbatim; v4.7.0 is purely
+additive.
+
 v4.6.0 [ORDER-FIX]: the selector_real Top_10 path no longer re-sorts the
 selector's rows. _ensure_top10_rows gained preserve_order (default False);
 _normalize_external_payload threads top10_preserve_order, set True ONLY on the
@@ -192,6 +212,7 @@ Owns the canonical root paths:
 - /schema/pages
 - /schema/data-dictionary
 - /v1/schema/provider-health
+- /opportunity-candidates
 and their /v1/schema aliases.
 ================================================================================
 """
@@ -217,9 +238,9 @@ logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
 # =============================================================================
-# v4.3.0 — Version constant.
+# v4.7.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.6.0"
+ADVANCED_ANALYSIS_VERSION = "4.7.0"
 
 
 # =============================================================================
@@ -416,6 +437,38 @@ except Exception as _ins_err:
         "[advanced_analysis v%s] core.analysis.insights_builder unavailable (%s); "
         "Insights_Analysis will use engine/fallback path",
         ADVANCED_ANALYSIS_VERSION, _ins_err,
+    )
+
+
+# =============================================================================
+# v4.7.0 [OPP-ADD] Opportunity builder binding.  (NEW in v4.7.0)
+#
+# core.analysis.opportunity_builder v1.0.1 (Plan v5.0 P2) is the pure-compute
+# intelligence layer for the rebuilt Top_10_Investments decision page: §4.2
+# hard gates -> verdicts, §4.3 opportunity score, §4.4 wealth math (SAR sizing
+# against Deployable Capital, L7 funding identity), and the FROZEN §5 zone
+# payload served by POST /opportunity-candidates below. Stdlib-only and
+# import-safe. Fail-soft: unbound -> the endpoint answers status="unavailable"
+# instead of raising; every other route is unaffected.
+# =============================================================================
+_build_opportunity_payload = None  # type: ignore[assignment]
+_OPP_BUILDER_VERSION: Optional[str] = None
+try:
+    from core.analysis.opportunity_builder import (  # type: ignore
+        OPPORTUNITY_BUILDER_VERSION as _OPP_BUILDER_VERSION,
+        build_opportunity_payload as _build_opportunity_payload,
+    )
+    logger.info(
+        "[advanced_analysis v%s] opportunity builder bound (core.analysis.opportunity_builder v%s)",
+        ADVANCED_ANALYSIS_VERSION, _OPP_BUILDER_VERSION,
+    )
+except Exception as _opp_err:
+    _build_opportunity_payload = None  # type: ignore
+    _OPP_BUILDER_VERSION = None
+    logger.info(
+        "[advanced_analysis v%s] core.analysis.opportunity_builder unavailable (%s); "
+        "/opportunity-candidates will answer status=unavailable",
+        ADVANCED_ANALYSIS_VERSION, _opp_err,
     )
 
 
@@ -2257,5 +2310,222 @@ async def root_sheet_rows_post(
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
     return await _run_advanced_sheet_rows_impl(request=request, body=body, mode=mode, include_matrix_q=include_matrix_q, token=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, x_request_id=x_request_id)
+
+
+# =============================================================================
+# v4.7.0 [OPP-ADD] POST /opportunity-candidates — Plan v5.0 §5 zone payload.
+#
+# Bridges the v4.5.0 selector binding (candidate pool) into the bound
+# opportunity builder (gates §4.2 / score §4.3 / wealth math §4.4 / L7
+# funding). The §5 payload shape is FROZEN by the builder; this endpoint only
+# adds meta.provider_health and meta.route (additive, inside meta). Fail-soft
+# everywhere except auth (401).
+# =============================================================================
+_OPP_CRITERIA_ALIASES: Dict[str, str] = {
+    "universescope": "universe_scope",
+    "maxselected": "max_selected",
+    "period": "period_months",
+    "periodmonths": "period_months",
+    "requiredroi": "required_roi_pct",
+    "requiredroipct": "required_roi_pct",
+    "requiredannualizedroi": "required_ann_roi_pct",
+    "requiredannualizedroipct": "required_ann_roi_pct",
+    "requiredannroipct": "required_ann_roi_pct",
+    "riskprofile": "risk_profile",
+    "minreliability": "min_reliability",
+    "mindataquality": "min_dq",
+    "mindq": "min_dq",
+    "minriskreward": "min_rr",
+    "minrr": "min_rr",
+    "maxrisklevel": "max_risk_level",
+    "allowconflict": "allow_conflict",
+    "allownegativenews": "allow_negative_news",
+    "allownegativesector": "allow_negative_sector",
+    "maxpersector": "max_per_sector",
+    "maxsector": "max_per_sector",
+    "maxpermarket": "max_per_market",
+    "maxmarket": "max_per_market",
+    "includeportfolioholdings": "include_portfolio_holdings",
+    "basecurrency": "base_currency",
+    "maxweightpct": "max_weight_pct",
+    "maxweight": "max_weight_pct",
+    "lotsize": "lot_size",
+    "nearmissn": "near_miss_n",
+    "reviewdays": "review_days",
+}
+
+
+def _opp_criteria_from_body(raw: Any) -> Dict[str, Any]:
+    """v4.7.0: map GAS control-panel labels ("Max Selected",
+    "T10: Required ROI %") or snake_case keys onto opportunity_builder
+    criteria keys. Unknown keys pass through snake_cased — the builder
+    ignores what it doesn't recognize, so this can't reject a panel."""
+    out: Dict[str, Any] = {}
+    if not isinstance(raw, Mapping):
+        return out
+    for k, v in raw.items():
+        token = _strip(k)
+        if not token:
+            continue
+        if token.lower().startswith("t10:"):
+            token = token[4:]
+        compact = re.sub(r"[^a-z0-9]+", "", token.lower())
+        key = _OPP_CRITERIA_ALIASES.get(compact) or _normalize_key_name(token)
+        if key:
+            out[key] = v
+    return out
+
+
+async def _opp_collect_pool(*, pool_limit: int, mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
+    """v4.7.0: candidate pool via the v4.5.0 selector binding.
+
+    Returns (rows, selector_meta, pool_source). pool_source is one of
+    selector / selector_empty / selector_error / selector_unbound. NEVER
+    raises — every failure degrades to an empty pool so the builder can
+    answer honestly ("no_candidates")."""
+    if _build_top10_rows is None:
+        return [], {}, "selector_unbound"
+    try:
+        res = _build_top10_rows(limit=pool_limit, mode=mode or "")
+        res = await _maybe_await(res)
+    except Exception as e:
+        logger.warning(
+            "[advanced_analysis v%s] opportunity pool: selector raised %s: %s",
+            ADVANCED_ANALYSIS_VERSION, e.__class__.__name__, e,
+        )
+        return [], {"error": "{}: {}".format(e.__class__.__name__, e)}, "selector_error"
+    if not isinstance(res, Mapping):
+        return [], {}, "selector_empty"
+    rows = _extract_rows_like(res)
+    meta = res.get("meta") if isinstance(res.get("meta"), Mapping) else {}
+    return rows, dict(meta or {}), ("selector" if rows else "selector_empty")
+
+
+@router.post("/opportunity-candidates")
+@router.post("/v1/opportunity-candidates")
+async def opportunity_candidates_post(
+    request: Request,
+    body: Dict[str, Any] = Body(default_factory=dict),
+    mode: str = Query(default=""),
+    token: Optional[str] = Query(default=None),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+) -> Dict[str, Any]:
+    """v4.7.0 [OPP-ADD]: §5 zone payload for the Top_10 decision page.
+
+    Body fields (all optional):
+      criteria   : dict — GAS panel values; labels or snake_case (see
+                   _opp_criteria_from_body). Echoed in meta.criteria_snapshot.
+      fx_rates   : dict ccy -> SAR rate, read by GAS from _Lists_Config
+                   TFB_FX_LOOKUP (the backend never reads the spreadsheet).
+      portfolio  : dict — cash_available_sar, pending_proceeds_sar,
+                   portfolio_value_sar, holdings[{symbol, sector, market,
+                   value_sar}].
+      rows       : explicit candidate rows (bypasses the selector pool —
+                   used by tests and GAS replays).
+      pool_limit : selector pool size (default 60, clamp 1..500).
+
+    Fail-soft: builder unbound -> status "unavailable"; selector failures
+    degrade to an empty pool; the only raise is auth (401).
+    """
+    start = time.time()
+    request_id = _strip(x_request_id) or str(uuid.uuid4())[:12]
+    try:
+        settings = get_settings_cached()
+    except Exception:
+        settings = None
+    auth_token = _extract_auth_token(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, settings=settings, request=request)
+    if not _auth_passed(request=request, settings=settings, auth_token=auth_token, authorization=authorization):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    merged_body = _merge_body_with_query(body, request)
+    criteria = _opp_criteria_from_body(merged_body.get("criteria"))
+    fx_rates = merged_body.get("fx_rates") if isinstance(merged_body.get("fx_rates"), Mapping) else {}
+    portfolio = merged_body.get("portfolio") if isinstance(merged_body.get("portfolio"), Mapping) else {}
+    pool_limit = max(1, min(500, _maybe_int(merged_body.get("pool_limit"), 60)))
+
+    if _build_opportunity_payload is None:
+        return _json_safe({
+            "version": None,
+            "status": "unavailable",
+            "message": "core.analysis.opportunity_builder not deployed",
+            "kpis": {}, "selected": [], "near_miss": [], "alerts": [],
+            "candidates_rows": [],
+            "meta": {
+                "criteria_snapshot": criteria,
+                "route": {
+                    "version": ADVANCED_ANALYSIS_VERSION,
+                    "request_id": request_id,
+                    "dispatch": "opportunity_candidates_unavailable",
+                    "duration_ms": round((time.time() - start) * 1000.0, 3),
+                },
+            },
+        })
+
+    explicit_rows = merged_body.get("rows")
+    if isinstance(explicit_rows, list) and explicit_rows and isinstance(explicit_rows[0], Mapping):
+        pool_rows: List[Dict[str, Any]] = [dict(r) for r in explicit_rows]
+        sel_meta: Dict[str, Any] = {}
+        pool_source = "body_rows"
+    else:
+        pool_rows, sel_meta, pool_source = await _opp_collect_pool(
+            pool_limit=pool_limit, mode=mode or _strip(merged_body.get("mode")),
+        )
+
+    provider_health = await _extract_provider_health_snapshot()
+    engine_version = provider_health.get("engine_version") if isinstance(provider_health, Mapping) else None
+
+    upstream_meta: Dict[str, Any] = {
+        "coverage": sel_meta.get("coverage"),
+        "budget": sel_meta.get("budget") or sel_meta.get("budget_meta"),
+        "timeouts": sel_meta.get("timeouts"),
+        "freshness": sel_meta.get("freshness") or sel_meta.get("data_as_of") or sel_meta.get("generated_at"),
+        "versions": {
+            "selector": sel_meta.get("selector_version") or sel_meta.get("version"),
+            "engine": engine_version,
+        },
+    }
+
+    try:
+        payload = _build_opportunity_payload(
+            pool_rows,
+            criteria=criteria,
+            portfolio=dict(portfolio or {}),
+            fx_rates=dict(fx_rates or {}),
+            upstream_meta=upstream_meta,
+        )
+    except Exception as e:
+        logger.warning(
+            "[advanced_analysis v%s] opportunity builder raised %s: %s",
+            ADVANCED_ANALYSIS_VERSION, e.__class__.__name__, e,
+        )
+        payload = {
+            "version": _OPP_BUILDER_VERSION,
+            "status": "error",
+            "message": "{}: {}".format(e.__class__.__name__, str(e)[:200]),
+            "kpis": {}, "selected": [], "near_miss": [], "alerts": [],
+            "candidates_rows": [],
+            "meta": {"criteria_snapshot": criteria},
+        }
+    if not isinstance(payload, dict):
+        payload = {"status": "error", "message": "builder returned non-dict",
+                   "kpis": {}, "selected": [], "near_miss": [], "alerts": [],
+                   "candidates_rows": [], "meta": {}}
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        payload["meta"] = meta
+    meta["provider_health"] = _json_safe(provider_health)
+    meta["route"] = {
+        "version": ADVANCED_ANALYSIS_VERSION,
+        "opportunity_builder_version": _OPP_BUILDER_VERSION,
+        "request_id": request_id,
+        "dispatch": "opportunity_candidates",
+        "pool": {"source": pool_source, "count": len(pool_rows), "pool_limit": pool_limit},
+        "duration_ms": round((time.time() - start) * 1000.0, 3),
+    }
+    return _json_safe(payload)
 
 __all__ = ["router", "ADVANCED_ANALYSIS_VERSION", "_run_advanced_sheet_rows_impl"]
