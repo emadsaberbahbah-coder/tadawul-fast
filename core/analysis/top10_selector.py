@@ -3,7 +3,7 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.17.0
+Top 10 Selector — v4.18.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -16,6 +16,128 @@ CANONICAL-BUCKET ROUTED • REAL OVERALL-RANK FALLBACK (v4.13.0)
 8-TIER VOCABULARY AWARE • PRIORITY-BAND ROUTED • CASCADE-BRIDGE READY (v4.14.0)
 PAGINATION-ENVELOPE SAFE • FULL-UNIVERSE INGEST • LIMIT-FILL BACKFILL (v4.15.0)
 VINTAGE-PROTECTED MERGE • GATE-FIELD QUARANTINE • ADMISSION-FILTERED (v4.16.0)
+FINAL-ROW GATE • GATE-KEY PROJECTION GUARANTEE (v4.17.0)
+GOLDEN-COMPOSITE RANKED • TIER-DISCIPLINED • SELL-CLASS SAFE
+RANK-INTEGRITY GUARANTEED • SECTOR-DIVERSIFIED (v4.18.0)
+
+================================================================================
+What v4.18.0 fixes/adds (over v4.17.0)  --  FIX W: GOLDEN COMPOSITE +
+TIER DISCIPLINE + RANK INTEGRITY + SECTOR DIVERSIFICATION
+================================================================================
+Live workbook audits (2026-06-10 / 2026-06-11, full-workbook diff + golden
+2,192-row offline re-rank) confirmed defects that survive v4.17.0, plus a
+structural ranking gap this release closes. All changes are fail-soft and
+individually kill-switchable.
+
+  W-1 GOLDEN COMPOSITE — reliability finally ranks (TFB_TOP10_GOLDEN_COMPOSITE,
+      default ON; =0 restores the v4.17.0 legacy score verbatim).
+      The v4.17.0 `_selector_score` never consumed
+      `forecast_reliability_score` — ironic, since Fix U/Fix V exist to make
+      that field FRESH on every candidate. The recalibrated base score is the
+      agreed golden composite over 0-100 components:
+          0.40 * overall_score
+        + 0.25 * forecast_reliability_score   (fallback: forecast_confidence)
+        + 0.20 * conviction_score
+        + 0.15 * horizon-ROI component        (0..100; ±35% ROI = full scale,
+                                               0% ROI = 50)
+        -  risk penalty: (risk_score - 50) * 0.30, capped at 15, only when
+           risk_score > 50.
+      Weights renormalize over the components actually PRESENT on a row, so a
+      missing conviction does not structurally sink a row against its peers.
+      The orthogonal nudges of the legacy score are retained on top with the
+      same magnitudes (8-tier reco bump, candlestick nudge, warnings
+      penalties, direct-symbol priority bump, richness bump) — EXCEPT the
+      legacy +conviction*0.05 nudge, which is omitted in golden mode because
+      conviction is now a first-class 20% component.
+
+  W-2 TIER DISCIPLINE + SELL-CLASS EXCLUSION.
+      (a) SELL-CLASS EXCLUSION (TFB_TOP10_EXCLUDE_SELL_CLASS, default ON):
+          rows whose recommendation normalizes to REDUCE / SELL /
+          STRONG_SELL / AVOID can NEVER appear on the Top 10 — not as picks
+          and not as backfill. v4.17.0's limit-fill could backfill a SELL
+          name into a "best investments" list whenever the passing pool ran
+          short (a real path with only ~51 INVESTABLE rows live). Excluded
+          rows are meta-audited (`sell_class_excluded*`). If exclusion
+          empties the pool entirely (all-SELL universe), the payload
+          honestly degrades toward zero rows rather than recommending SELLs.
+      (b) TIER SPLIT: Tier-1 = investability_status == INVESTABLE AND
+          reliability >= TFB_TOP10_TIER1_RELIABILITY_FLOOR (default 65).
+          Everything else admissible (WATCHLIST, BLOCKED-but-admissible,
+          low-reliability INVESTABLE, verdict-less) is Tier-2.
+      (c) FILL ORDER (four pools, each sorted by composite + the v4.17.0
+          tiebreak tuple):
+              1. Tier-1 rows passing operator criteria      (label "T1")
+              2. Tier-2 rows passing operator criteria      ("T2 BACKFILL[..]")
+              3. Tier-1 rows failing operator criteria      ("T1 BACKFILL[..]")
+              4. Tier-2 rows failing operator criteria      ("T2 BACKFILL[..]")
+          A Tier-2 row can therefore never outrank any Tier-1 PICK. Pool 2
+          ranks above pool 3 deliberately: a row the operator explicitly
+          filtered out (criteria fail) is a last resort even when Tier-1 —
+          operator intent outranks tier. Every non-pool-1 row carries an
+          explicit bracketed label with the tier reason and/or the failing
+          criterion, so the sheet is self-auditing.
+
+  W-3 CANDIDATE-WIDE FRESH GATE (supersedes the v4.17.0 final-rows-only
+      timing; same kill switch TFB_TOP10_FINAL_GATE).
+      v4.17.0 ran `_apply_investability_gate` on the 10 FINAL rows only —
+      AFTER selection — so tier/SELL decisions would have ranked on stale or
+      absent verdicts. v4.18.0 runs the same engine gate on ALL admissible
+      candidates BEFORE tiering and ranking. The gate is pure-CPU,
+      idempotent, and AA-tag-aware (engine v5.84.0+), so universe-wide
+      application is cheap and safe. `final_gate_*` meta keys are preserved;
+      `final_gate_scope` = "admissible_candidates" documents the new timing.
+
+  W-4 RANK INTEGRITY — the duplicate-rank corruption fix.
+      Root cause visible in this file: `_rank_and_project_rows` assigned
+      `top10_rank` only when BLANK, so rows ingested via the Top10
+      OUTPUT-PAGE fallback donor carried their OLD ranks into the new
+      build — two overlapping runs produced the observed 13-row sheet with
+      colliding ranks. v4.18.0 FORCE-overwrites `top10_rank = idx` and
+      recomputes `rank_overall` fresh on every build, unconditionally.
+      Contiguous unique ranks 1..N are now a structural guarantee of the
+      payload. (The GAS-side clear-before-write remains queued as
+      defense-in-depth for stale rows BELOW the new write window.)
+
+  W-5 SECTOR DIVERSIFICATION CAP (TFB_TOP10_SECTOR_CAP, default 4; 0
+      disables). Investment-director behavior: a Top 10 should not be ten
+      names from one sector. During fill, a row whose sector already holds
+      `cap` selections is deferred; if the pools cannot fill `limit`
+      otherwise, deferred rows re-enter in order (labeled
+      "[SECTOR-CAP RELAXED]") so the guarantee of a full list survives.
+      Audited via `sector_cap_deferred` / `sector_cap_relaxed` meta.
+
+  W-6 SELECTION-REASON TRANSPARENCY. The canonical reason now also carries
+      `Rel=NN/100` (the reliability that golden ranking actually used) and
+      `Gate=<investability_status>`, and every projected row's reason is
+      prefixed with its tier label from W-2c.
+
+  W-7 OUTPUT-FALLBACK TOP10-METADATA QUARANTINE. The previous-output donor
+      (provenance rank 0) now also has `top10_rank`, `selection_reason`, and
+      `criteria_snapshot` STRIPPED at ingest (in addition to the Fix U gate
+      quarantine): these are artifacts of a PREVIOUS selector run and are
+      stale by definition on re-ingest. Without this, a stale
+      selection_reason would survive the fill-if-blank path and be served
+      under a fresh tier label. Audited via `top10_metadata_stripped_count`.
+
+  REMOVED-AS-SUPERSEDED (behavior, not API): the v4.13.0 direct-symbol
+  top-up block and the v4.15.0 limit-fill backfill block are subsumed by the
+  four-pool tiered fill — pools 2-4 exhaust the full admissible candidate
+  set, and direct-symbol rows still float to the top of their pools via the
+  +140 priority bump. `backfilled_count` / `backfill_symbols` meta keys are
+  preserved and now mean "criteria-failing rows admitted with labels".
+
+Kill switches (all env, all independent):
+  TFB_TOP10_GOLDEN_COMPOSITE=0    -> v4.17.0 legacy selector score, verbatim
+  TFB_TOP10_EXCLUDE_SELL_CLASS=0  -> SELL-class rows may rank again
+  TFB_TOP10_SECTOR_CAP=0          -> no sector cap
+  TFB_TOP10_FINAL_GATE=0          -> no gate application (tiering then relies
+                                     on verdicts already present on rows)
+  TFB_TOP10_TIER1_RELIABILITY_FLOOR=<float> -> Tier-1 reliability bar (65)
+New meta: tier1_candidates / tier2_candidates / tier1_selected /
+tier2_selected / tier2_selected_symbols / sell_class_excluded(_count) /
+exclude_sell_class_enabled / golden_composite_enabled / composite_weights /
+tier1_reliability_floor / sector_cap / sector_cap_deferred /
+sector_cap_relaxed / final_gate_scope / top10_metadata_stripped_count.
 
 ================================================================================
 What v4.17.0 fixes (over v4.16.1)  --  FIX V: FINAL-ROW GATE + KEY GUARANTEE
@@ -33,6 +155,8 @@ went from stale-wrong to blank. v4.17.0 completes the fix:
        on each FINAL selected row immediately before projection — fresh
        verdicts from the same hydrated data, restoring reliability parity
        with Global_Markets (NVDA/META 71.5, MSFT 70.4 class of values).
+       [v4.18.0 W-3 widens the application scope to ALL admissible
+       candidates BEFORE tiering; the function and kill switch are the same.]
 Both are fail-soft; TFB_TOP10_FINAL_GATE=0 restores v4.16.1 exactly.
 New meta: final_gate_enabled / final_gate_available / final_gate_applied /
 final_gate_errors / gate_keys_appended / projection_keys_count.
@@ -181,6 +305,8 @@ v4.15.0 phase changes:
      counted in meta as `backfilled_count` + `backfill_symbols`, so the gate
      intent stays visible and auditable. Direct-symbol top-up (v4.13.0)
      remains and runs first.
+     [v4.18.0: both top-up blocks are superseded by the four-pool tiered
+     fill; meta keys preserved.]
 
   D. VERSION BUMP 4.14.0 -> 4.15.0. Cross-stack refs updated to the current
      family floor. All v4.14.0 public APIs preserved verbatim; `__all__`
@@ -189,13 +315,18 @@ v4.15.0 phase changes:
 ================================================================================
 Cross-stack family (Jun 2026 floor)
 ================================================================================
-  - core.sheets.schema_registry        v2.14.0
+  - core.sheets.schema_registry        v2.15.0  (115-col market layout +
+                                                  analyst/trend keys; Top_10
+                                                  118; My_Portfolio 122)
   - core.scoring                       v5.7.4
   - core.reco_normalize                v8.0.0   (8-tier canonical)
   - core.schemas                       v7.0.0   (8-tier enum + 9 cascade-bridge
                                                   fields on UnifiedQuote)
-  - core.data_engine_v2                v5.83.3  (115-col canonical; get_sheet_rows
-                                                  returns {rows, rows_display,
+  - core.data_engine_v2                v5.85.3  (115-col canonical; analyst/
+                                                  trend block Fix AD; registry
+                                                  projection seam Fix AE;
+                                                  get_sheet_rows returns
+                                                  {rows, rows_display,
                                                   rows_matrix, limit, offset,
                                                   total} envelope)
   - core.buckets                       v1.0.0
@@ -207,13 +338,15 @@ Cross-stack family (Jun 2026 floor)
 ================================================================================
 Defaults & back-compat
 ================================================================================
-v4.15.0 is additive at the runtime contract level:
-  - The parser fix only ADDS rows that were previously being dropped; no row
-    that v4.14.0 surfaced is removed.
-  - The limit-fill backfill only engages when the passing pool is short of
-    `limit`; with default/empty criteria nothing is filtered, so the backfill
-    is a no-op and the natural Top-N stands.
-  - All v4.14.0 public APIs preserved verbatim.
+v4.18.0 changes RANKING POLICY by default (golden composite, tier order,
+SELL-class exclusion, sector cap) — that is the point of the release — but
+every policy change carries its own kill switch restoring the prior
+behavior, and the runtime contract is unchanged:
+  - Payload shape, route entry points, and all public function names are
+    preserved verbatim.
+  - `top10_rank` is now ALWAYS 1..N contiguous (W-4); any consumer that
+    depended on stale preserved ranks was depending on the corruption bug.
+  - All v4.17.0 meta keys are preserved; v4.18.0 only ADDS keys.
 
 ================================================================================
 History (preserved)
@@ -243,11 +376,11 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.17.0"
+TOP10_SELECTOR_VERSION = "4.18.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
-# schema_registry v2.14.0, scoring v5.7.4, reco_normalize v8.0.0,
+# schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
-# data_engine_v2 v5.83.2, schemas v7.0.0).
+# data_engine_v2 v5.85.3, schemas v7.0.0).
 __version__ = TOP10_SELECTOR_VERSION
 
 # v4.14.0 Phase B/K: capability marker for downstream consumers. Surfaced
@@ -587,13 +720,15 @@ GATE_CRITICAL_KEYS: Tuple[str, ...] = (
 #       routes re-project onto the registry's canonical 118-column order, so
 #       sheet column ORDER is governed there; the selector only guarantees
 #       the VALUES survive under canonical key names.
-#   V-2 `_apply_final_gate`: immediately before projection, run the engine's
-#       own `_apply_investability_gate` on each final selected row. This
-#       recomputes verdicts FRESH from the same hydrated data — the exact
+#   V-2 `_apply_final_gate`: run the engine's own `_apply_investability_gate`
+#       to recompute verdicts FRESH from the same hydrated data — the exact
 #       reliability-parity guarantee Fix S/Fix U exist to provide (e.g. NVDA
 #       71.5 on Top_10 == Global_Markets). The gate is idempotent and
 #       AA-tag-aware (v5.84.0), so repeated application is safe.
-# Kill switch: TFB_TOP10_FINAL_GATE=0 restores v4.16.1 behavior exactly.
+#       [v4.18.0 FIX W-3: application scope widened from the FINAL selected
+#       rows to ALL admissible candidates BEFORE tiering, so the tier split
+#       and SELL-class exclusion rank on fresh verdicts. Same kill switch.]
+# Kill switch: TFB_TOP10_FINAL_GATE=0 disables gate application entirely.
 # =============================================================================
 TOP10_FINAL_GATE_ENV = "TFB_TOP10_FINAL_GATE"
 TOP10_FINAL_GATE_ENABLED = (
@@ -635,10 +770,14 @@ def _ensure_gate_output_keys(headers: List[str], keys: List[str]) -> Tuple[List[
 
 
 def _apply_final_gate(rows: Sequence[MutableMapping[str, Any]]) -> Tuple[int, int, bool]:
-    """v4.17.0 [FIX V-2]: run the engine investability gate on final rows.
+    """v4.17.0 [FIX V-2] / v4.18.0 [FIX W-3]: run the engine investability
+    gate on candidate rows.
 
-    Returns (applied_count, error_count, gate_available). Lazy import,
-    per-row try/except — any failure leaves that row exactly as it was.
+    v4.18.0 widened the call site from the FINAL selected rows to ALL
+    admissible candidates (pre-tiering), so tier classification and the
+    SELL-class exclusion operate on FRESH verdicts. The function itself is
+    unchanged: lazy import, per-row try/except — any failure leaves that row
+    exactly as it was. Returns (applied_count, error_count, gate_available).
     """
     if not TOP10_FINAL_GATE_ENABLED:
         return 0, 0, False
@@ -669,6 +808,59 @@ TOP10_ADMISSION_FILTER_ENABLED = (
 )
 _ADMISSION_FORCED_HOLD_TAG = "recommendation_forced_hold_missing_price"
 
+# =============================================================================
+# v4.18.0 [FIX W] — GOLDEN COMPOSITE + TIER DISCIPLINE + SECTOR CAP KNOBS
+# -----------------------------------------------------------------------------
+# WHY each knob exists is documented in the header (Fix W). All default ON /
+# active because they ARE the v4.18.0 ranking policy; each one restores the
+# prior behavior independently when disabled.
+# =============================================================================
+# W-1: golden composite ranking. =0 restores the v4.17.0 legacy selector
+# score VERBATIM (kept as `_selector_score_legacy`).
+TOP10_GOLDEN_COMPOSITE_ENV = "TFB_TOP10_GOLDEN_COMPOSITE"
+TOP10_GOLDEN_COMPOSITE_ENABLED = (
+    os.getenv(TOP10_GOLDEN_COMPOSITE_ENV, "1").strip().lower() in ("1", "true", "yes", "on")
+)
+# Golden composite weights over 0-100 components (renormalized over the
+# components actually present on a row). Echoed into meta for auditability.
+GOLDEN_COMPOSITE_WEIGHTS: Dict[str, float] = {
+    "overall_score": 0.40,
+    "forecast_reliability_score": 0.25,
+    "conviction_score": 0.20,
+    "horizon_roi": 0.15,
+}
+# Horizon-ROI -> 0..100 component mapping: 0% ROI = 50; ±35% ROI = full scale.
+GOLDEN_ROI_FULL_SCALE_PCT = 35.0
+# Risk penalty: only above this risk_score, linear slope, hard cap.
+GOLDEN_RISK_PENALTY_START = 50.0
+GOLDEN_RISK_PENALTY_SLOPE = 0.30
+GOLDEN_RISK_PENALTY_MAX = 15.0
+
+# W-2b: Tier-1 bar = INVESTABLE + reliability >= floor. (Note: _env_float
+# clamps to a 0.1 minimum, so the floor cannot be set to exactly 0; use a
+# small value like 1 to make the reliability bar effectively inert.)
+TOP10_TIER1_RELIABILITY_FLOOR = _env_float("TFB_TOP10_TIER1_RELIABILITY_FLOOR", 65.0)
+
+# W-2a: SELL-class exclusion. =0 restores pre-v4.18.0 behavior (SELL-class
+# rows may be selected / backfilled again).
+TOP10_EXCLUDE_SELL_CLASS_ENV = "TFB_TOP10_EXCLUDE_SELL_CLASS"
+TOP10_EXCLUDE_SELL_CLASS_ENABLED = (
+    os.getenv(TOP10_EXCLUDE_SELL_CLASS_ENV, "1").strip().lower() in ("1", "true", "yes", "on")
+)
+
+# W-5: sector diversification cap on the FINAL selection. 0 disables.
+TOP10_SECTOR_CAP = _env_int("TFB_TOP10_SECTOR_CAP", 4, minimum=0, maximum=10)
+
+# W-7: Top10-run metadata stripped from the OUTPUT-PAGE fallback donor at
+# ingest — these fields describe a PREVIOUS selector run and are stale by
+# definition when re-ingested (stale ranks were the W-4 corruption vector;
+# stale selection_reason/criteria_snapshot survive the fill-if-blank path).
+TOP10_METADATA_STRIP_KEYS: Tuple[str, ...] = (
+    "top10_rank",
+    "selection_reason",
+    "criteria_snapshot",
+)
+
 _ENGINE_DROP_TAGS = (
     "intrinsic_unit_mismatch_suspected",
     "upside_synthesis_suspect",
@@ -695,6 +887,14 @@ _RECO_8TIER_CANONICAL = frozenset({
 
 _BULLISH_RECOS = frozenset({"STRONG_BUY", "BUY", "ACCUMULATE"})
 _BEARISH_RECOS = frozenset({"REDUCE", "SELL", "STRONG_SELL", "AVOID"})
+
+# v4.18.0 [FIX W-2a]: the SELL class barred from the Top 10 (picks AND
+# backfill) while TFB_TOP10_EXCLUDE_SELL_CLASS is on. Deliberately the exact
+# bearish set: a "best investments to BUY now" surface must never carry a
+# name the engine says to exit or avoid. HOLD remains backfill-eligible
+# (labeled) — a HOLD can legitimately be the best available when the
+# bullish pool runs short; a SELL cannot.
+SELL_CLASS_RECOS = frozenset(_BEARISH_RECOS)
 
 _RECO_8TIER_NEW_TOKENS = frozenset({"ACCUMULATE", "STRONG_SELL", "AVOID"})
 
@@ -972,6 +1172,68 @@ def _reco_tiebreak_bump(row: Mapping[str, Any]) -> float:
 def _is_avoid_recommendation(row: Mapping[str, Any]) -> bool:
     """True iff the row's recommendation normalizes to the canonical AVOID."""
     return _normalize_reco_token(row.get("recommendation")) == "AVOID"
+
+
+# =============================================================================
+# v4.18.0 [FIX W] — tier-discipline helpers
+# =============================================================================
+
+def _row_reliability(row: Mapping[str, Any]) -> Optional[float]:
+    """v4.18.0 [FIX W-1 / W-2b]: the reliability the golden composite and the
+    Tier-1 bar actually use.
+
+    Prefers the engine gate's `forecast_reliability_score` (fresh on every
+    admissible candidate via W-3); falls back to forecast_confidence /
+    confidence_score when the gate value is absent (gate disabled or
+    degraded run), so ranking never silently zeroes a row for a missing
+    gate column. Fraction-scaled (0..1 -> 0..100) and clamped to 0..100.
+    """
+    rel = _safe_float(row.get("forecast_reliability_score"), None)
+    if rel is None:
+        rel = _safe_float(row.get("forecast_confidence"), None)
+        if rel is None:
+            rel = _safe_float(row.get("confidence_score"), None)
+    if rel is None:
+        return None
+    if 0.0 < rel <= 1.0:
+        rel *= 100.0
+    return max(0.0, min(100.0, rel))
+
+
+def _is_sell_class(row: Mapping[str, Any]) -> bool:
+    """v4.18.0 [FIX W-2a]: True iff the recommendation normalizes into the
+    SELL class (REDUCE / SELL / STRONG_SELL / AVOID)."""
+    return _normalize_reco_token(row.get("recommendation")) in SELL_CLASS_RECOS
+
+
+def _row_investability_status(row: Mapping[str, Any]) -> str:
+    """Uppercased investability_status, or "" when absent."""
+    return _s(row.get("investability_status")).upper()
+
+
+def _tier_of_row(row: Mapping[str, Any]) -> int:
+    """v4.18.0 [FIX W-2b]: 1 = INVESTABLE with reliability >= floor;
+    2 = everything else admissible (WATCHLIST / BLOCKED-but-admissible /
+    low-reliability INVESTABLE / verdict-less)."""
+    if _row_investability_status(row) == "INVESTABLE":
+        rel = _row_reliability(row)
+        if rel is not None and rel >= TOP10_TIER1_RELIABILITY_FLOOR:
+            return 1
+    return 2
+
+
+def _tier2_reason(row: Mapping[str, Any]) -> str:
+    """Short human label explaining why a selected row is Tier-2 (used in
+    the W-6 backfill label, so the sheet is self-auditing)."""
+    status = _row_investability_status(row)
+    if status and status != "INVESTABLE":
+        return status
+    rel = _row_reliability(row)
+    if status == "INVESTABLE" and rel is not None and rel < TOP10_TIER1_RELIABILITY_FLOOR:
+        return f"reliability {rel:.0f} < floor {TOP10_TIER1_RELIABILITY_FLOOR:.0f}"
+    if not status:
+        return "no investability verdict"
+    return "below Tier-1 bar"
 
 
 def _is_signature_mismatch_typeerror(exc: TypeError) -> bool:
@@ -2269,7 +2531,12 @@ def _direct_symbol_order_index(row: Mapping[str, Any], criteria: Mapping[str, An
         return None
 
 
-def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> float:
+def _selector_score_legacy(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> float:
+    """The v4.17.0 selector score, preserved VERBATIM (only renamed).
+
+    Active when TFB_TOP10_GOLDEN_COMPOSITE=0 — the W-1 kill switch restores
+    this exact ranking arithmetic.
+    """
     overall = _safe_float(row.get("overall_score"), None)
     opportunity = _safe_float(row.get("opportunity_score"), None)
     value = _safe_float(row.get("value_score"), None)
@@ -2335,6 +2602,96 @@ def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> floa
 
     score += min(_row_richness(row), 120) * 0.03
     return float(score)
+
+
+def _selector_score_golden(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> float:
+    """v4.18.0 [FIX W-1] — the golden composite base score.
+
+    0-100 weighted blend (weights renormalized over the components PRESENT
+    on the row, so a missing conviction does not structurally sink a row
+    against its peers):
+
+        0.40 * overall_score
+      + 0.25 * reliability   (_row_reliability: gate value, confidence
+                              fallback)
+      + 0.20 * conviction_score
+      + 0.15 * horizon-ROI component (0..100; 0% ROI = 50,
+                              ±GOLDEN_ROI_FULL_SCALE_PCT% = full scale)
+      -  risk penalty: (risk_score - 50) * 0.30 capped at 15, only when
+         risk_score > 50.
+
+    The legacy score's orthogonal nudges are retained with identical
+    magnitudes (candlestick, 8-tier reco bump, warnings penalties,
+    direct-symbol priority, richness) — EXCEPT the legacy
+    +conviction*0.05 nudge, omitted because conviction is now a
+    first-class 20% component.
+    """
+    horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
+    overall = _safe_float(row.get("overall_score"), None)
+    reliability = _row_reliability(row)
+    conviction = _safe_float(row.get("conviction_score"), None)
+    if conviction is not None:
+        if 0.0 < conviction <= 1.0:
+            conviction *= 100.0
+        conviction = max(0.0, min(100.0, conviction))
+    roi = _choose_horizon_roi(row, horizon_days)
+    roi_component: Optional[float] = None
+    if roi is not None:
+        roi_component = max(
+            0.0,
+            min(100.0, 50.0 + (roi * 100.0) * (50.0 / GOLDEN_ROI_FULL_SCALE_PCT)),
+        )
+
+    components = (
+        (overall, GOLDEN_COMPOSITE_WEIGHTS["overall_score"]),
+        (reliability, GOLDEN_COMPOSITE_WEIGHTS["forecast_reliability_score"]),
+        (conviction, GOLDEN_COMPOSITE_WEIGHTS["conviction_score"]),
+        (roi_component, GOLDEN_COMPOSITE_WEIGHTS["horizon_roi"]),
+    )
+    weight_sum = sum(w for v, w in components if v is not None)
+    if weight_sum > 0.0:
+        score = sum(v * w for v, w in components if v is not None) / weight_sum
+    else:
+        score = 0.0
+
+    risk = _safe_float(row.get("risk_score"), None)
+    if risk is not None and risk > GOLDEN_RISK_PENALTY_START:
+        score -= min(
+            GOLDEN_RISK_PENALTY_MAX,
+            (risk - GOLDEN_RISK_PENALTY_START) * GOLDEN_RISK_PENALTY_SLOPE,
+        )
+
+    candle_signal = _s(row.get("candlestick_signal")).upper()
+    candle_conf = _safe_float(row.get("candlestick_confidence"), None)
+    if candle_signal == "BULLISH" and candle_conf is not None:
+        score += min(candle_conf, 100.0) * 0.02
+    elif candle_signal == "BEARISH" and candle_conf is not None:
+        score -= min(candle_conf, 100.0) * 0.02
+
+    score += _reco_tiebreak_bump(row)
+
+    tags = _parse_warnings_tags(row)
+    if _has_engine_drop_tag(tags):
+        score -= TOP10_PENALTY_ENGINE_DROP
+    if _has_forecast_unavail_tag(tags, row):
+        score -= TOP10_PENALTY_FORECAST_UNAVAIL
+    if _has_provider_error(row):
+        score -= TOP10_PENALTY_PROVIDER_ERROR
+
+    direct_order_index = _direct_symbol_order_index(row, criteria)
+    if direct_order_index is not None:
+        score += max(0.0, 140.0 - float(direct_order_index * 2))
+
+    score += min(_row_richness(row), 120) * 0.03
+    return float(score)
+
+
+def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> float:
+    """Dispatcher (v4.18.0 W-1): golden composite by default; the verbatim
+    v4.17.0 legacy score when TFB_TOP10_GOLDEN_COMPOSITE=0."""
+    if TOP10_GOLDEN_COMPOSITE_ENABLED:
+        return _selector_score_golden(row, criteria)
+    return _selector_score_legacy(row, criteria)
 
 
 def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]) -> str:
@@ -2404,6 +2761,14 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
             parts.append(f"Provider={provider_rating}|Engine={recommendation}")
     if conviction is not None:
         parts.append(f"Conv={round(conviction, 0):.0f}/100")
+    # v4.18.0 [FIX W-6] — reliability + gate verdict transparency: the two
+    # values the golden composite and the tier split actually ranked on.
+    _rel_v = _row_reliability(row)
+    if _rel_v is not None:
+        parts.append(f"Rel={_rel_v:.0f}/100")
+    _gate_v = _s(row.get("investability_status"))
+    if _gate_v:
+        parts.append(f"Gate={_gate_v}")
     if confidence_bucket:
         parts.append(f"Confidence={confidence_bucket}")
     if risk_bucket:
@@ -2457,12 +2822,26 @@ def _rank_and_project_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str
     out: List[Dict[str, Any]] = []
     for idx, raw in enumerate(rows, start=1):
         row = dict(raw)
-        if _is_blank(row.get("top10_rank")):
-            row["top10_rank"] = idx
-        if _is_blank(row.get("rank_overall")):
-            row["rank_overall"] = overall_rank_map.get(idx - 1, idx)
+        # v4.18.0 [FIX W-4] RANK INTEGRITY: FORCE-overwrite ranks on every
+        # build (the v4.17.0 fill-if-blank let rows ingested via the Top10
+        # OUTPUT-PAGE fallback donor keep their OLD top10_rank — the root
+        # cause of the live 13-row duplicate-rank corruption, 2026-06-10).
+        # Contiguous unique 1..N is now a structural guarantee of the
+        # payload, and rank_overall is always THIS build's overall-score
+        # ordering, never an inherited one.
+        row["top10_rank"] = idx
+        row["rank_overall"] = overall_rank_map.get(idx - 1, idx)
         if _is_blank(row.get("selection_reason")):
             row["selection_reason"] = _canonical_selection_reason(row, criteria)
+        # v4.18.0 [FIX W-6]: prefix the tier / backfill label assembled by
+        # the fill stage (internal `_tier_label`; stripped by projection).
+        _label = _s(row.get("_tier_label"))
+        if _label:
+            _base_reason = _s(row.get("selection_reason"))
+            if _base_reason and not _base_reason.startswith(_label):
+                row["selection_reason"] = f"{_label} | {_base_reason}"
+            elif not _base_reason:
+                row["selection_reason"] = _label
         if _is_blank(row.get("criteria_snapshot")):
             row["criteria_snapshot"] = criteria_snapshot
         projected = {k: _json_safe(row.get(k)) for k in keys}
@@ -2540,6 +2919,51 @@ def _strip_gate_critical_fields(row: Mapping[str, Any]) -> Tuple[Dict[str, Any],
     BLANK-OVER-STALE: a missing reliability is honest; a stale one misleads.
     """
     match = _gate_critical_match_set()
+    cleaned: Dict[str, Any] = {}
+    stripped = 0
+    for key, value in dict(row).items():
+        raw = _s(key)
+        if raw and (
+            raw in match
+            or raw.lower() in match
+            or _header_to_key(raw) in match
+            or _compact_key(raw) in match
+        ):
+            stripped += 1
+            continue
+        cleaned[key] = value
+    return cleaned, stripped
+
+
+# =============================================================================
+# v4.18.0 [FIX W-7] — Top10-run metadata quarantine (output-fallback donor)
+# =============================================================================
+_TOP10_METADATA_MATCH_CACHE: Optional[frozenset] = None
+
+
+def _top10_metadata_match_set() -> frozenset:
+    """Canonical spellings of the Top10-run metadata keys (W-7). Mirrors the
+    gate-critical matcher so display-header spellings ("Top10 Rank",
+    "Selection Reason", "Criteria Snapshot") are caught too."""
+    global _TOP10_METADATA_MATCH_CACHE
+    if _TOP10_METADATA_MATCH_CACHE is None:
+        tokens: set = set()
+        for key in TOP10_METADATA_STRIP_KEYS:
+            for variant in _canonical_key_variants(key):
+                tokens.add(variant)
+                tokens.add(_compact_key(variant))
+        _TOP10_METADATA_MATCH_CACHE = frozenset(t for t in tokens if t)
+    return _TOP10_METADATA_MATCH_CACHE
+
+
+def _strip_top10_metadata(row: Mapping[str, Any]) -> Tuple[Dict[str, Any], int]:
+    """v4.18.0 [FIX W-7]: strip previous-run Top10 metadata (top10_rank /
+    selection_reason / criteria_snapshot) from the OUTPUT-PAGE fallback
+    donor at ingest. These fields describe a PREVIOUS selector run and are
+    stale by definition on re-ingest: stale ranks were the W-4 corruption
+    vector, and a stale selection_reason would otherwise survive the
+    fill-if-blank path and be served under a fresh tier label."""
+    match = _top10_metadata_match_set()
     cleaned: Dict[str, Any] = {}
     stripped = 0
     for key, value in dict(row).items():
@@ -2769,6 +3193,8 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         # v4.16.0 Phase C audit counters.
         "gate_fields_quarantined_count": 0,
         "quarantined_donor_sources": [],
+        # v4.18.0 [FIX W-7] audit counter.
+        "top10_metadata_stripped_count": 0,
     }
 
     candidates: Dict[str, Dict[str, Any]] = {}
@@ -2886,21 +3312,91 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
             # DESIGN (rank 0) — the exact donor behind the self-referential
             # staleness loop. Strip gate-critical fields (blank-over-stale)
             # so old gate values can never re-enter the pool.
+            # v4.18.0 [FIX W-7]: ALSO strip the previous run's Top10
+            # metadata (top10_rank / selection_reason / criteria_snapshot) —
+            # stale ranks were the W-4 corruption vector, and a stale
+            # selection_reason would survive the fill-if-blank path.
             quarantined_fallback: List[Dict[str, Any]] = []
             _fb_stripped = 0
+            _fb_meta_stripped = 0
             for _fr in fallback_rows:
                 cleaned, stripped = _strip_gate_critical_fields(_fr)
+                cleaned, meta_stripped = _strip_top10_metadata(cleaned)
                 _fb_stripped += stripped
+                _fb_meta_stripped += meta_stripped
                 quarantined_fallback.append(_tag_provenance(cleaned, _PROV_OUTPUT_FALLBACK))
             fallback_rows = quarantined_fallback
             if _fb_stripped > 0:
                 meta["gate_fields_quarantined_count"] += _fb_stripped
                 meta["quarantined_donor_sources"].append(f"output_fallback:{OUTPUT_PAGE}")
+            if _fb_meta_stripped > 0:
+                meta["top10_metadata_stripped_count"] += _fb_meta_stripped
         for row in fallback_rows:
             _put_row(row, OUTPUT_PAGE)
 
     meta["deduped_candidate_count"] = len(candidates)
     return list(candidates.values()), meta
+
+
+def _fill_top10_selection(
+    pools: Sequence[Sequence[Tuple[float, Dict[str, Any]]]],
+    limit: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """v4.18.0 [FIX W-2c / W-5] — tiered four-pool fill with sector cap.
+
+    `pools` arrive PRE-SORTED (composite + tiebreak tuple, best first) in
+    strict fill order: T1-pass, T2-pass, T1-fail, T2-fail. Rows are admitted
+    in that order, deduped by symbol, subject to the sector-diversification
+    cap (TOP10_SECTOR_CAP per lowercased sector; blank sector buckets as
+    "unknown"; 0 disables). Cap-deferred rows re-enter IN ORIGINAL ORDER on
+    a relaxation pass only when the pools cannot otherwise fill `limit`, so
+    a full list is still guaranteed; relaxed rows are flagged via the
+    internal `_sector_cap_relaxed` key for the W-6 label.
+    """
+    cap = TOP10_SECTOR_CAP
+    selected: List[Dict[str, Any]] = []
+    seen: set = set()
+    sector_counts: Dict[str, int] = {}
+    deferred: List[Dict[str, Any]] = []
+    fill_meta: Dict[str, Any] = {
+        "sector_cap": cap,
+        "sector_cap_deferred": 0,
+        "sector_cap_relaxed": 0,
+    }
+
+    def _sector_key(row: Mapping[str, Any]) -> str:
+        return _s(row.get("sector")).strip().lower() or "unknown"
+
+    def _admit(row: Dict[str, Any], relaxing: bool) -> bool:
+        sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
+        if not sym or sym in seen:
+            return False
+        sk = _sector_key(row)
+        if cap > 0 and sector_counts.get(sk, 0) >= cap:
+            if not relaxing:
+                deferred.append(row)
+                fill_meta["sector_cap_deferred"] += 1
+                return False
+            row["_sector_cap_relaxed"] = True
+            fill_meta["sector_cap_relaxed"] += 1
+        selected.append(row)
+        seen.add(sym)
+        sector_counts[sk] = sector_counts.get(sk, 0) + 1
+        return True
+
+    for pool in pools:
+        if len(selected) >= limit:
+            break
+        for _score, row in pool:
+            if len(selected) >= limit:
+                break
+            _admit(row, relaxing=False)
+    if len(selected) < limit and deferred:
+        for row in deferred:
+            if len(selected) >= limit:
+                break
+            _admit(row, relaxing=True)
+    return selected, fill_meta
 
 
 def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -3010,9 +3506,9 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         # v4.16.0 Phase D — TOP10 ADMISSION FILTER (env-gated, default ON).
         # ---------------------------------------------------------------------
         # Rows failing the admission check can neither be SELECTED nor
-        # BACKFILLED. The relaxed-pool degraded path below also operates on
-        # the admissible pool, so a price-less / zero-confidence / forced-HOLD
-        # row can never reach the sheet while the filter is on. Set
+        # BACKFILLED. The four-pool fill below operates on the admissible
+        # pool only, so a price-less / zero-confidence / forced-HOLD row can
+        # never reach the sheet while the filter is on. Set
         # TFB_TOP10_ADMISSION_FILTER=0 to restore pre-v4.16.0 behavior.
         admission_excluded: List[Dict[str, str]] = []
         if TOP10_ADMISSION_FILTER_ENABLED:
@@ -3035,20 +3531,41 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         else:
             admissible_candidates = list(normalized_candidates)
 
-        filtered: List[Dict[str, Any]] = []
-        drop_counts: Dict[str, int] = {}
-        for r in admissible_candidates:
-            passed, reason = _passes_filters_with_reason(r, criteria)
-            if passed:
-                filtered.append(r)
-            elif reason:
-                drop_counts[reason] = drop_counts.get(reason, 0) + 1
+        # ---------------------------------------------------------------------
+        # v4.18.0 [FIX W-3] — CANDIDATE-WIDE FRESH GATE (pre-tiering).
+        # ---------------------------------------------------------------------
+        # The engine investability gate runs on ALL admissible candidates
+        # BEFORE the tier split and SELL-class exclusion, so both decisions
+        # rank on fresh verdicts (v4.17.0 gated only the 10 FINAL rows —
+        # after selection). Pure-CPU, idempotent, AA-tag-aware (v5.84.0+).
+        final_gate_applied, final_gate_errors, final_gate_available = _apply_final_gate(admissible_candidates)
 
-        filter_relaxed = False
-        selected_pool = filtered
-        if not selected_pool and admissible_candidates:
-            selected_pool = list(admissible_candidates)
-            filter_relaxed = True
+        # ---------------------------------------------------------------------
+        # v4.18.0 [FIX W-2a] — SELL-CLASS EXCLUSION (env-gated, default ON).
+        # ---------------------------------------------------------------------
+        # A "best investments" surface must never carry a name the engine
+        # says to exit or avoid — not as a pick, not as backfill. If this
+        # empties the pool (all-SELL universe), the payload honestly
+        # degrades toward zero rows; see `all_candidates_sell_class`.
+        sell_class_excluded: List[Dict[str, str]] = []
+        if TOP10_EXCLUDE_SELL_CLASS_ENABLED:
+            selectable: List[Dict[str, Any]] = []
+            for r in admissible_candidates:
+                if _is_sell_class(r):
+                    sell_class_excluded.append({
+                        "symbol": _s(r.get("symbol") or r.get("ticker")),
+                        "recommendation": _s(r.get("recommendation")),
+                    })
+                else:
+                    selectable.append(r)
+            if sell_class_excluded:
+                logger.info(
+                    "[v4.18.0 SELLX] excluded=%d %s",
+                    len(sell_class_excluded),
+                    _json_compact(sell_class_excluded[:10]),
+                )
+        else:
+            selectable = list(admissible_candidates)
 
         _v310_active: Dict[str, Any] = {}
         mcs = _safe_float(
@@ -3075,105 +3592,101 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         if _coerce_bool(criteria.get("reco_8tier_strict"), False):
             _v8tier_active["reco_8tier_strict"] = True
 
+        # ---------------------------------------------------------------------
+        # v4.18.0 [FIX W-2b / W-2c] — TIER SPLIT + FOUR-POOL FILL ORDER.
+        # ---------------------------------------------------------------------
+        # Pools, each sorted best-first by composite + the v4.17.0 tiebreak
+        # tuple, filled strictly in this order:
+        #   1. Tier-1 + criteria pass   ("T1" — the real picks)
+        #   2. Tier-2 + criteria pass   (labeled backfill)
+        #   3. Tier-1 + criteria fail   (labeled backfill; operator intent
+        #                                outranks tier, hence below pool 2)
+        #   4. Tier-2 + criteria fail   (labeled backfill, last resort)
+        # This subsumes the v4.13.0 direct-symbol top-up and the v4.15.0
+        # limit-fill backfill: pools 2-4 exhaust the entire admissible set,
+        # and direct-symbol rows still float to the top of their pools via
+        # the +140 priority bump in the score.
         horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for row in selected_pool:
-            scored.append((_selector_score(row, criteria), dict(row)))
 
-        scored.sort(
-            key=lambda x: (
-                x[0],
+        def _pool_sort_key(item: Tuple[float, Dict[str, Any]]):
+            score, row = item
+            return (
+                score,
                 # v4.14.0 Phase I — priority band tiebreaker. NEGATED so that
-                # under reverse=True the smaller rank (P1 = best / most urgent)
-                # sorts first. Blank / unparseable bands rank as 99 and so
-                # sort AFTER all real bands when scores are tied.
-                -_priority_band_rank(x[1].get("recommendation_priority_band")),
-                _choose_horizon_roi(x[1], horizon_days) or 0.0,
-                _safe_float(x[1].get("opportunity_score"), 0.0) or 0.0,
-                _safe_float(x[1].get("overall_score"), 0.0) or 0.0,
-                _safe_float(x[1].get("forecast_confidence"), 0.0) or 0.0,
-                -(_safe_float(x[1].get("risk_score"), 999.0) or 999.0),
-                _safe_float(x[1].get("liquidity_score"), 0.0) or 0.0,
-                _row_richness(x[1]),
-            ),
-            reverse=True,
-        )
-
-        top_rows = [row for _, row in scored[:limit]]
-
-        if len(top_rows) < limit:
-            seen_symbols = {_normalize_symbol(r.get("symbol") or r.get("ticker")) for r in top_rows if _normalize_symbol(r.get("symbol") or r.get("ticker"))}
-            direct_rows = [row for _, row in scored if _direct_symbol_order_index(row, criteria) is not None]
-            direct_rows.sort(key=lambda row: _direct_symbol_order_index(row, criteria) if _direct_symbol_order_index(row, criteria) is not None else 999999)
-            for row in direct_rows:
-                sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
-                if not sym or sym in seen_symbols:
-                    continue
-                top_rows.append(row)
-                seen_symbols.add(sym)
-                if len(top_rows) >= limit:
-                    break
-
-        # ---------------------------------------------------------------------
-        # v4.15.0 Phase C — LIMIT-FILL BACKFILL.
-        # ---------------------------------------------------------------------
-        # With the parser fix (Phase A) the candidate universe is normally
-        # large enough that the passing pool already supplies `limit` rows.
-        # But when operator criteria trim the passing pool below `limit`, the
-        # v4.14.0 code returned short (the only top-up was direct symbols).
-        # Here we top up to `limit` from the best-scoring REMAINING candidates
-        # (investable/passing rows are already in `top_rows`, ranked first).
-        # Backfill rows that fail the active criteria are flagged in
-        # `selection_reason` and counted in meta as `backfilled_count` /
-        # `backfill_symbols`, so the gate intent stays visible and auditable.
-        # The flag is pre-set here so `_rank_and_project_rows` (which only
-        # fills a BLANK selection_reason) preserves it.
-        backfill_symbols: List[str] = []
-        if len(top_rows) < limit:
-            seen_symbols = {
-                _normalize_symbol(r.get("symbol") or r.get("ticker"))
-                for r in top_rows
-                if _normalize_symbol(r.get("symbol") or r.get("ticker"))
-            }
-            remainder: List[Tuple[float, Dict[str, Any]]] = []
-            # v4.16.0 Phase D: backfill draws from the ADMISSIBLE pool only,
-            # so admission-excluded rows cannot re-enter via limit-fill.
-            for cand in admissible_candidates:
-                sym = _normalize_symbol(cand.get("symbol") or cand.get("ticker"))
-                if not sym or sym in seen_symbols:
-                    continue
-                remainder.append((_selector_score(cand, criteria), dict(cand)))
-            remainder.sort(
-                key=lambda x: (
-                    x[0],
-                    -_priority_band_rank(x[1].get("recommendation_priority_band")),
-                    _choose_horizon_roi(x[1], horizon_days) or 0.0,
-                    _safe_float(x[1].get("opportunity_score"), 0.0) or 0.0,
-                    _safe_float(x[1].get("overall_score"), 0.0) or 0.0,
-                    _row_richness(x[1]),
-                ),
-                reverse=True,
+                # under reverse=True the smaller rank (P1 = best / most
+                # urgent) sorts first; blank bands rank 99 and sort last.
+                -_priority_band_rank(row.get("recommendation_priority_band")),
+                _choose_horizon_roi(row, horizon_days) or 0.0,
+                _safe_float(row.get("opportunity_score"), 0.0) or 0.0,
+                _safe_float(row.get("overall_score"), 0.0) or 0.0,
+                _safe_float(row.get("forecast_confidence"), 0.0) or 0.0,
+                -(_safe_float(row.get("risk_score"), 999.0) or 999.0),
+                _safe_float(row.get("liquidity_score"), 0.0) or 0.0,
+                _row_richness(row),
             )
-            for _bscore, cand in remainder:
-                sym = _normalize_symbol(cand.get("symbol") or cand.get("ticker"))
-                if not sym or sym in seen_symbols:
-                    continue
-                passed_bf, reason_bf = _passes_filters_with_reason(cand, criteria)
-                if not passed_bf:
-                    existing_reason = _s(cand.get("selection_reason"))
-                    tag = "[BACKFILL: below criteria" + (f" — {reason_bf}" if reason_bf else "") + "]"
-                    cand["selection_reason"] = (existing_reason + " " + tag).strip() if existing_reason else tag
-                    backfill_symbols.append(sym)
-                top_rows.append(cand)
-                seen_symbols.add(sym)
-                if len(top_rows) >= limit:
-                    break
 
-        # v4.17.0 [FIX V-2]: recompute gate verdicts FRESH on the final rows.
-        # Hydrated enriched-quote rows carry no gate fields (the gate runs on
-        # the engine's sheet-row path), and Fix U quarantined stale donor
-        # verdicts - so without this step Top_10 gate columns render blank.
-        final_gate_applied, final_gate_errors, final_gate_available = _apply_final_gate(top_rows[:limit])
+        t1_pass: List[Tuple[float, Dict[str, Any]]] = []
+        t2_pass: List[Tuple[float, Dict[str, Any]]] = []
+        t1_fail: List[Tuple[float, Dict[str, Any]]] = []
+        t2_fail: List[Tuple[float, Dict[str, Any]]] = []
+        drop_counts: Dict[str, int] = {}
+        tier1_candidates = 0
+        tier2_candidates = 0
+        for r in selectable:
+            passed, reason = _passes_filters_with_reason(r, criteria)
+            tier = _tier_of_row(r)
+            if tier == 1:
+                tier1_candidates += 1
+            else:
+                tier2_candidates += 1
+            rr = dict(r)
+            rr["_tier"] = tier
+            rr["_criteria_fail"] = "" if passed else (reason or "criteria")
+            entry = (_selector_score(rr, criteria), rr)
+            if passed:
+                (t1_pass if tier == 1 else t2_pass).append(entry)
+            else:
+                drop_key = reason or "criteria"
+                drop_counts[drop_key] = drop_counts.get(drop_key, 0) + 1
+                (t1_fail if tier == 1 else t2_fail).append(entry)
+
+        for _pool in (t1_pass, t2_pass, t1_fail, t2_fail):
+            _pool.sort(key=_pool_sort_key, reverse=True)
+
+        filtered_count = len(t1_pass) + len(t2_pass)
+        filter_relaxed = bool(selectable) and filtered_count == 0
+
+        top_rows, fill_meta = _fill_top10_selection((t1_pass, t2_pass, t1_fail, t2_fail), limit)
+
+        # v4.18.0 [FIX W-6] — assemble tier / backfill labels. Internal keys
+        # (_tier / _criteria_fail / _tier_label) never reach the sheet:
+        # projection copies schema-contract keys only.
+        backfill_symbols: List[str] = []
+        tier2_symbols: List[str] = []
+        for row in top_rows:
+            tier = _safe_int(row.get("_tier"), 2)
+            fail = _s(row.get("_criteria_fail"))
+            sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
+            if tier == 2 and sym:
+                tier2_symbols.append(sym)
+            if fail and sym:
+                backfill_symbols.append(sym)
+            if tier == 1 and not fail:
+                label = "T1"
+            else:
+                bits: List[str] = []
+                if tier == 2:
+                    bits.append(_tier2_reason(row))
+                if fail:
+                    bits.append(f"criteria: {fail}")
+                prefix = "T1 BACKFILL[" if tier == 1 else "T2 BACKFILL["
+                label = prefix + "; ".join(bits) + "]"
+            if row.pop("_sector_cap_relaxed", False):
+                label += " [SECTOR-CAP RELAXED]"
+            row["_tier_label"] = label
+
+        tier1_selected = sum(1 for r in top_rows if _safe_int(r.get("_tier"), 2) == 1)
+        tier2_selected = len(top_rows) - tier1_selected
 
         projected_rows = _rank_and_project_rows(top_rows[:limit], keys, criteria)
 
@@ -3215,10 +3728,11 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "selector_version": TOP10_SELECTOR_VERSION,
             "criteria_used": _json_safe(criteria),
             "candidate_count": len(normalized_candidates),
-            "filtered_count": len(filtered),
+            "filtered_count": filtered_count,
             "selected_count": len(projected_rows),
             "filter_relaxed": filter_relaxed,
-            # v4.15.0 Phase C — limit-fill backfill audit.
+            # v4.15.0 Phase C meta keys preserved; v4.18.0 meaning:
+            # criteria-failing rows admitted with explicit labels (pools 3/4).
             "backfilled_count": len(backfill_symbols),
             "backfill_symbols": list(backfill_symbols),
             # v4.16.0 Phase D — admission filter audit (Fix U).
@@ -3227,10 +3741,28 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "final_gate_available": final_gate_available,
             "final_gate_applied": final_gate_applied,
             "final_gate_errors": final_gate_errors,
+            # v4.18.0 [FIX W-3]: gate now runs on ALL admissible candidates
+            # BEFORE tiering (was: final selected rows only).
+            "final_gate_scope": "admissible_candidates",
             "gate_keys_appended": gate_keys_appended,
             "projection_keys_count": len(keys),
             "admission_excluded_count": len(admission_excluded),
             "admission_excluded": [dict(x) for x in admission_excluded[:25]],
+            # v4.18.0 [FIX W] audit surface.
+            "golden_composite_enabled": TOP10_GOLDEN_COMPOSITE_ENABLED,
+            "composite_weights": dict(GOLDEN_COMPOSITE_WEIGHTS) if TOP10_GOLDEN_COMPOSITE_ENABLED else "legacy",
+            "tier1_reliability_floor": TOP10_TIER1_RELIABILITY_FLOOR,
+            "tier1_candidates": tier1_candidates,
+            "tier2_candidates": tier2_candidates,
+            "tier1_selected": tier1_selected,
+            "tier2_selected": tier2_selected,
+            "tier2_selected_symbols": list(tier2_symbols),
+            "exclude_sell_class_enabled": TOP10_EXCLUDE_SELL_CLASS_ENABLED,
+            "sell_class_excluded_count": len(sell_class_excluded),
+            "sell_class_excluded": [dict(x) for x in sell_class_excluded[:25]],
+            "sector_cap": fill_meta.get("sector_cap"),
+            "sector_cap_deferred": fill_meta.get("sector_cap_deferred"),
+            "sector_cap_relaxed": fill_meta.get("sector_cap_relaxed"),
             # v4.16.0 Phase A — provenance of the FINAL projected rows
             # (3=live/hydrated, 2=emergency, 1=snapshot, 0=output-fallback).
             "selected_provenance_counts": {
@@ -3273,6 +3805,10 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         }
         if not projected_rows:
             meta["warning"] = "no_top10_rows_after_filtering"
+            if TOP10_EXCLUDE_SELL_CLASS_ENABLED and sell_class_excluded and not selectable:
+                # All admissible candidates were SELL-class: degrading to
+                # zero rows is deliberate (W-2a) — honest over harmful.
+                meta["warning"] = "all_candidates_sell_class"
 
         return _build_payload(status=status, headers=headers, keys=keys, rows=projected_rows, meta=meta)
 
@@ -3384,6 +3920,16 @@ __all__ = [
     "TOP10_FINAL_GATE_ENV",
     "TOP10_FINAL_GATE_ENABLED",
     "GATE_OUTPUT_KEY_HEADERS",
+    # v4.18.0 Fix W: golden composite + tier discipline surface.
+    "SELL_CLASS_RECOS",
+    "TOP10_EXCLUDE_SELL_CLASS_ENABLED",
+    "TOP10_EXCLUDE_SELL_CLASS_ENV",
+    "TOP10_TIER1_RELIABILITY_FLOOR",
+    "TOP10_SECTOR_CAP",
+    "TOP10_GOLDEN_COMPOSITE_ENABLED",
+    "TOP10_GOLDEN_COMPOSITE_ENV",
+    "GOLDEN_COMPOSITE_WEIGHTS",
+    "TOP10_METADATA_STRIP_KEYS",
     # v4.14.0 Phase C: 8-tier vocabulary surface (content-checkable
     # constants for ops + downstream tooling).
     "_RECO_8TIER_CANONICAL",
