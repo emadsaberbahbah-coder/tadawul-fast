@@ -2,8 +2,18 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.7.1  (OPPORTUNITY-CANDIDATES ENDPOINT — OPP-ADD)
+Advanced Analysis Root Owner — v4.7.2  (OPPORTUNITY-CANDIDATES ENDPOINT — OPP-ADD)
 ================================================================================
+v4.7.2 [META-MAP]: upstream_meta mapping aligned to the LIVE top10_selector
+v4.19.0 meta key names observed on 2026-06-12 acceptance: the selector emits
+page_coverage (not coverage), a boolean budget_exhausted (not a budget dict),
+and universe_starved. v4.7.1 looked only for coverage/budget/budget_meta, so
+every forwarded field arrived as None and the opportunity builder's
+budget_exhausted alert (Plan §4.2/§5) could never fire from the live
+selector. Mapping is fallback-chained (new keys first, old names kept) and a
+universe_starved flag is forwarded inside budget so the builder surfaces
+partial coverage honestly. No other change from v4.7.1.
+
 v4.7.1 [MOUNT-FIX]: registered POST /sheet-rows/opportunity-candidates as the
 EFFECTIVE path. Root cause of the v4.7.0 live 404: main.py (entry v8.11.2)
 mounts every router through a controlled clone-filter
@@ -253,9 +263,9 @@ logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
 # =============================================================================
-# v4.7.1 — Version constant.
+# v4.7.2 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.7.1"
+ADVANCED_ANALYSIS_VERSION = "4.7.2"
 
 
 # =============================================================================
@@ -2493,9 +2503,20 @@ async def opportunity_candidates_post(
     provider_health = await _extract_provider_health_snapshot()
     engine_version = provider_health.get("engine_version") if isinstance(provider_health, Mapping) else None
 
+    # v4.7.2 [META-MAP]: live selector v4.19.0 key names first, prior names as
+    # fallbacks. budget is normalized to a dict with an "exhausted" flag so the
+    # builder's budget alert logic fires from the live boolean.
+    _sel_budget = sel_meta.get("budget") or sel_meta.get("budget_meta")
+    if not isinstance(_sel_budget, Mapping):
+        _sel_budget = {}
+    _budget_norm: Dict[str, Any] = dict(_sel_budget)
+    if "exhausted" not in _budget_norm and sel_meta.get("budget_exhausted") is not None:
+        _budget_norm["exhausted"] = bool(sel_meta.get("budget_exhausted"))
+    if sel_meta.get("universe_starved") is not None:
+        _budget_norm.setdefault("universe_starved", bool(sel_meta.get("universe_starved")))
     upstream_meta: Dict[str, Any] = {
-        "coverage": sel_meta.get("coverage"),
-        "budget": sel_meta.get("budget") or sel_meta.get("budget_meta"),
+        "coverage": sel_meta.get("page_coverage") or sel_meta.get("coverage"),
+        "budget": _budget_norm or None,
         "timeouts": sel_meta.get("timeouts"),
         "freshness": sel_meta.get("freshness") or sel_meta.get("data_as_of") or sel_meta.get("generated_at"),
         "versions": {
