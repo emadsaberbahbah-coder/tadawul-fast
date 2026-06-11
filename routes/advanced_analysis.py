@@ -2,8 +2,22 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.7.0  (OPPORTUNITY-CANDIDATES ENDPOINT — OPP-ADD)
+Advanced Analysis Root Owner — v4.7.1  (OPPORTUNITY-CANDIDATES ENDPOINT — OPP-ADD)
 ================================================================================
+v4.7.1 [MOUNT-FIX]: registered POST /sheet-rows/opportunity-candidates as the
+EFFECTIVE path. Root cause of the v4.7.0 live 404: main.py (entry v8.11.2)
+mounts every router through a controlled clone-filter
+(_clone_filtered_router / _allowed_prefixes_for_key) that admits only paths
+under this module's allowlisted prefixes — ("/v1/schema", "/schema",
+"/sheet-rows") — so the bare /opportunity-candidates and
+/v1/opportunity-candidates registrations were silently filtered at mount
+(module imported and bound fine; the app simply never exposed the paths).
+The /sheet-rows-prefixed alias passes the existing filter with ZERO main.py
+changes. The two canonical paths are KEPT on the endpoint so they go live
+automatically if/when main's allowlist adds "/opportunity-candidates"; until
+then GAS (16_Decision_Top10.gs) must call /sheet-rows/opportunity-candidates.
+No other change from v4.7.0.
+
 v4.7.0 [OPP-ADD]: NEW endpoint POST /opportunity-candidates (+ /v1 alias) —
 Plan v5.0 Phase P3. Serves the FROZEN §5 zone payload for the rebuilt
 Top_10_Investments decision page by bridging the selector candidate pool into
@@ -212,7 +226,8 @@ Owns the canonical root paths:
 - /schema/pages
 - /schema/data-dictionary
 - /v1/schema/provider-health
-- /opportunity-candidates
+- /opportunity-candidates  (effective live path: /sheet-rows/opportunity-candidates;
+  see v4.7.1 [MOUNT-FIX] — main.py prefix filter)
 and their /v1/schema aliases.
 ================================================================================
 """
@@ -238,9 +253,9 @@ logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
 # =============================================================================
-# v4.7.0 — Version constant.
+# v4.7.1 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.7.0"
+ADVANCED_ANALYSIS_VERSION = "4.7.1"
 
 
 # =============================================================================
@@ -2401,6 +2416,7 @@ async def _opp_collect_pool(*, pool_limit: int, mode: str) -> Tuple[List[Dict[st
     return rows, dict(meta or {}), ("selector" if rows else "selector_empty")
 
 
+@router.post("/sheet-rows/opportunity-candidates")
 @router.post("/opportunity-candidates")
 @router.post("/v1/opportunity-candidates")
 async def opportunity_candidates_post(
