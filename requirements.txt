@@ -1,10 +1,26 @@
 # ============================================================================
-# TADAWUL FAST BRIDGE -- requirements.txt (v1.1.2)
+# TADAWUL FAST BRIDGE -- requirements.txt (v1.1.3)
 # ============================================================================
-# Main fix in this revision:
-# - Keep protobuf 5.26.1 for grpcio-status 1.64.3 compatibility
-# - Upgrade OpenTelemetry family from 1.27.0 / 0.48b0 to 1.28.0 / 0.49b0
-#   so protobuf 5.x is supported consistently
+# WHY this revision (2026-06-11):
+# - FIX: Render builds failed with "No matching distribution found for
+#   httpcore==1.0.9" -- pypi.org/simple/httpcore/ (the INDEX page only)
+#   timed out on 10 consecutive retries from Render's CDN edge, while
+#   every other index page and all wheel downloads from
+#   files.pythonhosted.org succeeded in the same build. httpcore is now
+#   pinned by DIRECT WHEEL URL, bypassing the broken index page entirely.
+#   Same version (1.0.9), same artifact, deterministic.
+#   REVERT PATH: once the CDN edge recovers, this line may be restored to
+#   "httpcore==1.0.9" -- both forms are stable; the URL pin is safe to keep.
+# - No other version changes: every pin below is carried forward verbatim
+#   from v1.1.2 (zero-regression rule).
+#
+# Carried from v1.1.2:
+# - protobuf 5.26.1 kept for grpcio-status 1.64.3 compatibility
+# - OpenTelemetry family at 1.28.0 / 0.49b0 (protobuf 5.x support)
+#
+# Conventions:
+# - Exact pins (==) everywhere by design: reproducible builds on Render.
+# - Platform markers exclude Linux-only wheels on Windows dev machines.
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -45,7 +61,9 @@ pyOpenSSL==24.3.0
 # HTTP clients
 # ----------------------------------------------------------------------------
 httpx==0.27.2
-httpcore==1.0.9
+# v1.1.3: direct wheel URL == httpcore 1.0.9 (see header). Satisfies
+# httpx 0.27.2's requirement httpcore>=1.0.0,<2.0.0.
+httpcore @ https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl
 h2==4.3.0
 requests==2.33.1
 aiohttp==3.13.5
@@ -75,7 +93,7 @@ googleapis-common-protos==1.64.0
 proto-plus==1.24.0
 
 # ----------------------------------------------------------------------------
-# Google APIs
+# Google APIs (Sheets pipeline)
 # ----------------------------------------------------------------------------
 google-api-python-client==2.194.0
 google-auth==2.49.2
@@ -93,7 +111,7 @@ hiredis==3.3.1
 aiomcache==0.8.2
 
 # ----------------------------------------------------------------------------
-# Observability (upgraded for protobuf 5.x compatibility)
+# Observability (protobuf 5.x compatible family)
 # ----------------------------------------------------------------------------
 prometheus-client==0.21.1
 opentelemetry-api==1.28.0
@@ -109,31 +127,41 @@ opentelemetry-exporter-otlp==1.28.0
 python-dotenv==1.0.1
 pyyaml==6.0.3
 
-# ----------------------------------------------------------------------------
-# Reserved / currently unused
-# ----------------------------------------------------------------------------
+# ============================================================================
+# Reserved / currently unused (kept pinned so enabling a feature never
+# triggers an unplanned resolver upgrade)
+# ============================================================================
+
+# --- Rate limiting -----------------------------------------------------------
 slowapi==0.1.9
 limits==3.14.1
 
+# --- Auth / passwords --------------------------------------------------------
 PyJWT==2.12.1
 passlib==1.7.4
 bcrypt==4.3.0
 
+# --- Structured logging ------------------------------------------------------
 structlog==24.4.0
 loguru==0.7.3
 
+# --- Retry / resilience ------------------------------------------------------
 tenacity==9.1.4
 backoff==2.2.1
 
+# --- Database ----------------------------------------------------------------
 sqlalchemy==2.0.49
 asyncpg==0.30.0
 
+# --- Error monitoring --------------------------------------------------------
 sentry-sdk==2.58.0
 
+# --- Scraping / feeds / NLP (news intelligence) ------------------------------
 beautifulsoup4==4.14.3
 lxml==5.4.0
 feedparser==6.0.12
 nltk==3.9.4
 
+# --- Async file / cache IO ---------------------------------------------------
 aiofiles==24.1.0
 aiocache==0.12.3
