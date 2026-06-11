@@ -3,7 +3,7 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.18.0
+Top 10 Selector — v4.19.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -19,6 +19,107 @@ VINTAGE-PROTECTED MERGE • GATE-FIELD QUARANTINE • ADMISSION-FILTERED (v4.16.
 FINAL-ROW GATE • GATE-KEY PROJECTION GUARANTEE (v4.17.0)
 GOLDEN-COMPOSITE RANKED • TIER-DISCIPLINED • SELL-CLASS SAFE
 RANK-INTEGRITY GUARANTEED • SECTOR-DIVERSIFIED (v4.18.0)
+BUDGET-GRACEFUL • DE-CLAMPED TIMEOUTS • COVERAGE-AUDITED
+ENRICHMENT-PROJECTION GUARANTEED (v4.19.0)
+
+================================================================================
+What v4.19.0 fixes/adds (over v4.18.0)  --  FIX X: GRACEFUL TOTAL BUDGET +
+DE-CLAMPED TIMEOUTS + COVERAGE AUDIT + ENRICHMENT PROJECTION
+================================================================================
+Live Render shell runs (2026-06-11, post universe fix, env TOTAL=70/PAGE=30/
+ENGINE=20) exposed the v4.18.0 failure shape this release closes: a COLD
+full-universe build hit the outer `asyncio.wait_for(_inner(), TOTAL)` wall at
+exactly 70.0s and returned rows:0 with NULL meta -- the hard cancel destroys
+every candidate already collected and every diagnostic. A selector whose
+degraded mode is "throw everything away silently" violates this module's own
+PARTIAL-DEGRADATION-SAFE charter. Separately, the live ML/Top_10 workbook
+diff confirmed an 18-column enrichment gap on organic selector rows (e.g.
+the selection_reason said Priority=P3 while the Priority Band COLUMN sat
+blank): values present on the row never survived projection because the
+exact-key copy has no alias fallback, and the fallback contract lacked the
+analyst/trend/scoring-provenance block entirely.
+
+  X-1 GRACEFUL TOTAL BUDGET (the rows:0 / null-meta fix).
+      The builder now computes an INTERNAL soft deadline:
+          deadline = start + (BUILDER_TOTAL_TIMEOUT_SEC
+                              - TFB_TOP10_TOTAL_RESERVE_SEC [default 6s])
+      The page loop checks remaining budget BEFORE each page, clamps every
+      data-path engine-call timeout to the remaining budget, and on
+      exhaustion BREAKS COLLECTION (meta: budget_exhausted=true,
+      pages_skipped=[...]) instead of being cancelled -- gating, tiering,
+      ranking, and projection then run on whatever was collected, so a
+      budget-bound run returns a PARTIAL ranked payload with FULL meta.
+      The outer wait_for survives only as a BACKSTOP at
+      TOTAL + TFB_TOP10_OUTER_GRACE_SEC (default 8s); reaching it means the
+      graceful path itself wedged, and its fallback payload now at least
+      carries the timeout-configuration block for diagnosis.
+
+  X-2 DE-CLAMPED HARDCODED TIMEOUT LITERALS. v4.14.0-era literal caps
+      (min(ENGINE,6/7/5), min(PAGE,8/10), min(TOTAL/2,12)) silently
+      overrode the operator's env configuration -- with ENGINE=20 live, a
+      cold snapshot call was still cut at 6s. All DATA-PATH call sites now
+      use the configured constant clamped only by the X-1 remaining budget
+      (`_budget_timeout`). The ONLY surviving literal clamp is the
+      engine-RESOLUTION probe `_safe_call_zero_arg` (min(ENGINE,6)), kept
+      deliberately: module scanning must stay cheap regardless of how
+      generous the data-path timeouts are. Defaults bump to the
+      live-proven values: ENGINE 8->20, PAGE 12->30, TOTAL 32->70 (env
+      still wins; a missing env no longer regresses to starvation values).
+
+  X-3 COVERAGE / STARVATION AUDIT. Per scanned page the selector now
+      records the page UNIVERSE size (engine get_page_symbols, fail-soft,
+      tightly budget-clamped) beside the rows actually ingested, plus a
+      computed page_coverage ratio and a global universe_starved flag (a
+      page with a non-empty universe yielding ZERO ingested rows). A cold
+      run that returns 3 rows is now visibly a STARVED run rather than
+      silently mistakable for a 3-instrument universe, and GM's
+      SOURCE_PAGE_LIMIT=80-of-1931 truncation is visible instead of
+      implicit.
+
+  X-4 18-COLUMN ENRICHMENT PROJECTION GUARANTEE.
+      (a) `_rank_and_project_rows` falls back to alias-aware extraction
+          (`_extract_value_by_aliases`) for any contract key whose
+          exact-key read is blank, so a value present under ANY known
+          spelling (snake / camelCase / display-header) survives
+          projection; exact-key values present are untouched.
+      (b) ROW_KEY_ALIASES gains the analyst/trend/scoring-provenance
+          block: analyst_rating, target_price, upside_downside_pct,
+          signal, trend_1m/3m/12m, st_signal, recommendation_source,
+          scoring_schema_version, scoring_errors, opportunity_source,
+          overall_score_raw, overall_penalty_factor, provider_secondary,
+          row_source, forecast_source.
+      (c) DEFAULT_FALLBACK_KEYS/HEADERS gain the same 18 columns,
+          appended before the Top10 trio (order-safe: the registry-served
+          118 governs live column order downstream, and the GAS writer
+          maps by header name in degraded fallback mode).
+
+  X-5 SOURCE ATTRIBUTION. New meta `selected_sources` maps each selected
+      symbol to the source_page that actually donated it, making the
+      Source= component of selection_reason independently auditable (the
+      2026-06-11 audit caught a Source=My_Portfolio mislabel minted in the
+      emergency-list era; with the universe fixed and the map exposed, any
+      recurrence is one glance away).
+
+  Operational note (deployment sequencing, unchanged by this fix): a COLD
+  full-universe build costs ~4.6 min of engine scoring and CANNOT fit any
+  budget inside Render's ~100s edge window. Production sequence remains:
+  GAS Refresh Market_Leaders (warms the worker's engine cache) ->
+  standalone Top_10 immediately, with NO redeploy in between (each deploy
+  wipes the in-process cache). With 2 gunicorn workers a request can land
+  on the cold sibling worker; X-1 turns that case from rows:0/null-meta
+  into a partial, fully-diagnosed payload.
+
+Knobs (env):
+  TFB_TOP10_TOTAL_RESERVE_SEC=<float> -> X-1 reserve (default 6; the slice
+                                         of TOTAL kept for gate/tier/rank/
+                                         project after collection stops)
+  TFB_TOP10_OUTER_GRACE_SEC=<float>   -> X-1 backstop grace (default 8)
+  (X-2/X-3/X-4/X-5 carry no kill switch: they only restore operator-
+  configured timeouts and widen honesty/coverage; there is no prior
+  behavior worth restoring.)
+New meta: budget_exhausted / pages_skipped / page_universe / page_coverage /
+universe_starved / selected_sources / timeouts{engine_call_sec, page_sec,
+total_sec, total_reserve_sec, outer_grace_sec}.
 
 ================================================================================
 What v4.18.0 fixes/adds (over v4.17.0)  --  FIX W: GOLDEN COMPOSITE +
@@ -376,7 +477,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.18.0"
+TOP10_SELECTOR_VERSION = "4.19.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -444,6 +545,16 @@ DEFAULT_FALLBACK_KEYS = [
     "recommendation_detailed", "recommendation_priority",
     "candlestick_pattern", "candlestick_signal", "candlestick_strength",
     "candlestick_confidence", "candlestick_patterns_recent",
+    # v4.19.0 [FIX X-4c] — analyst/trend/scoring-provenance block appended
+    # (order-safe: the registry-served 118 governs live column order
+    # downstream, and the GAS writer maps by header name in degraded
+    # fallback mode).
+    "analyst_rating", "target_price", "upside_downside_pct", "signal",
+    "trend_1m", "trend_3m", "trend_12m", "st_signal",
+    "recommendation_priority_band", "recommendation_source", "provider_rating",
+    "scoring_recommendation_source", "scoring_schema_version",
+    "opportunity_source", "overall_score_raw", "overall_penalty_factor",
+    "provider_secondary", "row_source",
     "top10_rank", "selection_reason", "criteria_snapshot",
 ]
 
@@ -472,6 +583,13 @@ DEFAULT_FALLBACK_HEADERS = [
     "Recommendation Detail", "Reco Priority",
     "Candle Pattern", "Candle Signal", "Candle Strength",
     "Candle Confidence", "Recent Patterns (5D)",
+    # v4.19.0 [FIX X-4c] — matching headers for the 18 appended keys.
+    "Analyst Rating", "Target Price", "Upside/Downside %", "Signal",
+    "Trend 1M", "Trend 3M", "Trend 12M", "ST Signal",
+    "Priority Band", "Recommendation Source", "Provider Rating",
+    "Scoring Reco Source", "Scoring Schema Version",
+    "Opportunity Source", "Overall Score (Raw)", "Overall Penalty Factor",
+    "Provider Secondary", "Row Source",
     "Top10 Rank", "Selection Reason", "Criteria Snapshot",
 ]
 
@@ -598,6 +716,25 @@ ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
         "scoring_recommendation_source", "scoringRecommendationSource",
         "scoring_source", "scoringSource", "recommendation_source", "recommendationSource",
     ),
+    # v4.19.0 [FIX X-4b] — analyst / trend / scoring-provenance block
+    # (engine v5.85.x Fix AD/AE columns; registry v2.15.0 115/118 layout).
+    "analyst_rating": ("analyst_rating", "analystRating", "analyst_recommendation", "analystRecommendation"),
+    "target_price": ("target_price", "targetPrice", "analyst_target_price", "provider_target_price", "price_target"),
+    "upside_downside_pct": ("upside_downside_pct", "upsideDownsidePct", "upside_downside", "target_upside_pct", "targetUpsidePct"),
+    "signal": ("signal", "engine_signal", "overall_signal"),
+    "trend_1m": ("trend_1m", "trend1m"),
+    "trend_3m": ("trend_3m", "trend3m"),
+    "trend_12m": ("trend_12m", "trend12m"),
+    "st_signal": ("st_signal", "stSignal", "short_term_signal", "shortTermSignal"),
+    "recommendation_source": ("recommendation_source", "recommendationSource", "reco_source", "recoSource"),
+    "scoring_schema_version": ("scoring_schema_version", "scoringSchemaVersion", "schema_version"),
+    "scoring_errors": ("scoring_errors", "scoringErrors"),
+    "opportunity_source": ("opportunity_source", "opportunitySource"),
+    "overall_score_raw": ("overall_score_raw", "overallScoreRaw", "raw_overall_score"),
+    "overall_penalty_factor": ("overall_penalty_factor", "overallPenaltyFactor", "penalty_factor"),
+    "provider_secondary": ("provider_secondary", "providerSecondary", "secondary_provider", "data_provider_secondary"),
+    "row_source": ("row_source", "rowSource"),
+    "forecast_source": ("forecast_source", "forecastSource"),
     "selection_reason": ("selection_reason", "selector_reason"),
     "top10_rank": ("top10_rank", "rank"),
     "criteria_snapshot": ("criteria_snapshot", "criteria_json"),
@@ -645,9 +782,38 @@ def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 100000) -
         return default
 
 
-ENGINE_CALL_TIMEOUT_SEC = _env_float("TFB_TOP10_ENGINE_CALL_TIMEOUT_SEC", 8.0)
-PAGE_TOTAL_TIMEOUT_SEC = _env_float("TFB_TOP10_PAGE_TIMEOUT_SEC", 12.0)
-BUILDER_TOTAL_TIMEOUT_SEC = _env_float("TFB_TOP10_TOTAL_TIMEOUT_SEC", 32.0)
+# v4.19.0 [FIX X-2]: defaults bumped to the live-proven values (Render env
+# 2026-06-11: ENGINE=20 / PAGE=30 / TOTAL=70). Env always wins; the bump
+# only protects deployments where the env vars are absent.
+ENGINE_CALL_TIMEOUT_SEC = _env_float("TFB_TOP10_ENGINE_CALL_TIMEOUT_SEC", 20.0)
+PAGE_TOTAL_TIMEOUT_SEC = _env_float("TFB_TOP10_PAGE_TIMEOUT_SEC", 30.0)
+BUILDER_TOTAL_TIMEOUT_SEC = _env_float("TFB_TOP10_TOTAL_TIMEOUT_SEC", 70.0)
+# v4.19.0 [FIX X-1]: graceful-budget knobs. The reserve is the slice of the
+# total budget kept back for gating / tiering / ranking / projection after
+# collection stops; the outer grace pushes the hard wait_for backstop past
+# the soft deadline so the graceful path always wins when it is functioning.
+BUILDER_TOTAL_RESERVE_SEC = _env_float("TFB_TOP10_TOTAL_RESERVE_SEC", 6.0)
+BUILDER_OUTER_GRACE_SEC = _env_float("TFB_TOP10_OUTER_GRACE_SEC", 8.0)
+# Minimum remaining soft budget (sec) worth starting another source page for.
+PAGE_LOOP_MIN_REMAINING_SEC = 3.0
+
+
+def _remaining_budget(deadline: Optional[float]) -> Optional[float]:
+    """v4.19.0 [FIX X-1]: seconds left until the soft deadline (monotonic
+    clock); None when no deadline is active (direct library callers)."""
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _budget_timeout(base: float, deadline: Optional[float], floor: float = 0.5) -> float:
+    """v4.19.0 [FIX X-1/X-2]: clamp a configured timeout to the remaining
+    soft budget. Never below `floor`, so a nearly-expired budget still lets
+    an in-flight cache hit return instead of raising instantly."""
+    rem = _remaining_budget(deadline)
+    if rem is None:
+        return base
+    return max(floor, min(base, rem))
 SOURCE_PAGE_LIMIT = _env_int("TOP10_SELECTOR_SOURCE_PAGE_LIMIT", 80, minimum=10, maximum=1000)
 HYDRATION_SYMBOL_CAP = _env_int("TOP10_SELECTOR_HYDRATION_SYMBOL_CAP", 30, minimum=5, maximum=250)
 MAX_SOURCE_PAGES = _env_int("TOP10_SELECTOR_MAX_SOURCE_PAGES", 5, minimum=1, maximum=20)
@@ -1756,6 +1922,9 @@ async def _call_with_timeout(fn: Callable[..., Any], *args: Any, timeout: float,
 
 
 async def _safe_call_zero_arg(fn: Callable[..., Any]) -> Any:
+    # v4.19.0 [FIX X-2]: the ONLY literal clamp deliberately KEPT — this is
+    # the engine-RESOLUTION probe (module scanning), not a data fetch, and
+    # must stay cheap no matter how generous the data-path timeouts are.
     try:
         return await _call_with_timeout(fn, timeout=min(ENGINE_CALL_TIMEOUT_SEC, 6.0))
     except TypeError:
@@ -2049,7 +2218,7 @@ async def _fetch_page_snapshot_rows(engine: Any, page: str) -> List[Dict[str, An
         engine,
         ("get_cached_sheet_snapshot", "get_sheet_snapshot", "get_cached_sheet_rows", "get_page_snapshot", "get_sheet_cache"),
         attempts,
-        timeout_seconds=min(ENGINE_CALL_TIMEOUT_SEC, 6.0),
+        timeout_seconds=ENGINE_CALL_TIMEOUT_SEC,  # v4.19.0 [FIX X-2] de-clamped (was min(...,6))
     )
     return _extract_rows_like(payload)
 
@@ -2075,7 +2244,7 @@ async def _fetch_direct_symbol_rows(engine: Any, symbols: Sequence[str], mode: s
             "get_quotes", "get_enriched_quote_batch", "get_symbol_quotes", "get_live_quotes",
         ),
         attempts,
-        timeout_seconds=min(ENGINE_CALL_TIMEOUT_SEC, 7.0),
+        timeout_seconds=ENGINE_CALL_TIMEOUT_SEC,  # v4.19.0 [FIX X-2] de-clamped (was min(...,7))
     )
     rows = _extract_rows_like(payload)
     if rows:
@@ -2104,7 +2273,7 @@ async def _fetch_direct_symbol_rows(engine: Any, symbols: Sequence[str], mode: s
             engine,
             ("get_enriched_quote", "get_quote", "get_quote_dict", "get_live_quote", "get_symbol_quote"),
             single_attempts,
-            timeout_seconds=min(ENGINE_CALL_TIMEOUT_SEC, 5.0),
+            timeout_seconds=ENGINE_CALL_TIMEOUT_SEC,  # v4.19.0 [FIX X-2] de-clamped (was min(...,5))
         )
         single_rows = _extract_rows_like(row_payload)
         if single_rows:
@@ -2844,7 +3013,20 @@ def _rank_and_project_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str
                 row["selection_reason"] = _label
         if _is_blank(row.get("criteria_snapshot")):
             row["criteria_snapshot"] = criteria_snapshot
-        projected = {k: _json_safe(row.get(k)) for k in keys}
+        # v4.19.0 [FIX X-4a]: alias-aware projection fallback. The exact-key
+        # copy dropped values living on the row under a variant spelling
+        # (camelCase / display-header) — the live 18-column enrichment gap
+        # (selection_reason said Priority=P3 while the Priority Band column
+        # sat blank). A BLANK exact read now falls back to
+        # _extract_value_by_aliases; present exact values are untouched.
+        projected: Dict[str, Any] = {}
+        for k in keys:
+            v = row.get(k)
+            if v is None or (isinstance(v, str) and not v.strip()):
+                _alt = _extract_value_by_aliases(row, k)
+                if _alt is not None:
+                    v = _alt
+            projected[k] = _json_safe(v)
         out.append(projected)
     return out
 
@@ -3038,7 +3220,37 @@ def _admission_check(row: Mapping[str, Any]) -> Tuple[bool, str]:
     return True, ""
 
 
-async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+async def _fetch_page_universe_size(engine: Any, page: str, deadline: Optional[float] = None) -> Optional[int]:
+    """v4.19.0 [FIX X-3]: page universe size for the coverage audit.
+
+    Fail-soft and tightly budget-clamped: this is bookkeeping, never worth
+    spending real budget on. Returns None when the engine has no symbol-list
+    surface or the call fails — coverage meta simply omits that page.
+    """
+    try:
+        payload = await _call_engine_method(
+            engine,
+            ("get_page_symbols", "get_symbols_for_page", "get_page_symbol_list", "list_page_symbols"),
+            [((page,), {}), ((), {"page": page}), ((), {"page_name": page}), ((), {"sheet_name": page}), ((), {"sheet": page})],
+            timeout_seconds=_budget_timeout(min(ENGINE_CALL_TIMEOUT_SEC, 5.0), deadline),
+        )
+    except Exception:
+        return None
+    if payload is None:
+        return None
+    if isinstance(payload, (list, tuple, set)):
+        return len([s for s in payload if _s(s)])
+    if isinstance(payload, Mapping):
+        for k in ("symbols", "tickers", "items", "data"):
+            v = payload.get(k)
+            if isinstance(v, (list, tuple, set)):
+                return len([s for s in v if _s(s)])
+        c = _safe_int(payload.get("count") or payload.get("total"), -1)
+        return c if c >= 0 else None
+    return None
+
+
+async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str, deadline: Optional[float] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     meta: Dict[str, Any] = {
         "page": page,
         "rows": 0,
@@ -3051,7 +3263,7 @@ async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) ->
         "gate_fields_quarantined": 0,
     }
     try:
-        rows = await asyncio.wait_for(_fetch_page_rows(engine, page, SOURCE_PAGE_LIMIT, mode), timeout=PAGE_TOTAL_TIMEOUT_SEC)
+        rows = await asyncio.wait_for(_fetch_page_rows(engine, page, SOURCE_PAGE_LIMIT, mode), timeout=_budget_timeout(PAGE_TOTAL_TIMEOUT_SEC, deadline))  # v4.19.0 [FIX X-1]
         meta["rows"] = len(rows)
         # v4.16.0 Phase A: live page rows carry the freshest gate decision.
         for _r in rows:
@@ -3069,7 +3281,7 @@ async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) ->
         return rows, meta
 
     try:
-        snap_rows = await asyncio.wait_for(_fetch_page_snapshot_rows(engine, page), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 8.0))
+        snap_rows = await asyncio.wait_for(_fetch_page_snapshot_rows(engine, page), timeout=_budget_timeout(PAGE_TOTAL_TIMEOUT_SEC, deadline))  # v4.19.0 [FIX X-1/X-2] de-clamped (was min(...,8))
         # v4.16.0 Phase A/C: snapshot rows are a possibly-stale donor. Strip
         # gate-critical fields (blank-over-stale) and tag rank 1 so they can
         # fill blanks but never overwrite a fresh row's values.
@@ -3101,7 +3313,7 @@ async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) ->
         return rows if rows else [], meta
 
 
-async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str, criteria: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str, criteria: Mapping[str, Any], deadline: Optional[float] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     meta: Dict[str, Any] = {
         "requested_symbols": 0,
         "enriched_rows": 0,
@@ -3129,7 +3341,7 @@ async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str,
         return rows, meta
 
     try:
-        enriched_rows = await asyncio.wait_for(_fetch_direct_symbol_rows(engine, symbols, mode), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 10.0))
+        enriched_rows = await asyncio.wait_for(_fetch_direct_symbol_rows(engine, symbols, mode), timeout=_budget_timeout(PAGE_TOTAL_TIMEOUT_SEC, deadline))  # v4.19.0 [FIX X-1/X-2] de-clamped (was min(...,10))
         meta["enriched_rows"] = len(enriched_rows)
         meta["hydration_used"] = bool(enriched_rows)
     except asyncio.TimeoutError:
@@ -3172,7 +3384,7 @@ async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str,
     return list(row_map.values()), meta
 
 
-async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode: str, deadline: Optional[float] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     direct_symbols = [_normalize_symbol(s) for s in _normalize_list(criteria.get("direct_symbols")) if _normalize_symbol(s)]
     emergency_symbols = _normalize_list(criteria.get("emergency_symbols"))
     pages = _safe_source_pages(_normalize_list(criteria.get("pages_selected")))
@@ -3195,6 +3407,12 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         "quarantined_donor_sources": [],
         # v4.18.0 [FIX W-7] audit counter.
         "top10_metadata_stripped_count": 0,
+        # v4.19.0 [FIX X-1/X-3] budget + coverage audit.
+        "budget_exhausted": False,
+        "pages_skipped": [],
+        "page_universe": {},
+        "page_coverage": {},
+        "universe_starved": False,
     }
 
     candidates: Dict[str, Dict[str, Any]] = {}
@@ -3221,7 +3439,7 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
 
     if direct_symbols:
         try:
-            direct_rows = await asyncio.wait_for(_fetch_direct_symbol_rows(engine, direct_symbols[:HYDRATION_SYMBOL_CAP], mode), timeout=min(BUILDER_TOTAL_TIMEOUT_SEC / 2.0, 12.0))
+            direct_rows = await asyncio.wait_for(_fetch_direct_symbol_rows(engine, direct_symbols[:HYDRATION_SYMBOL_CAP], mode), timeout=_budget_timeout(BUILDER_TOTAL_TIMEOUT_SEC / 2.0, deadline))  # v4.19.0 [FIX X-1/X-2] de-clamped (was min(...,12))
             meta["direct_symbol_rows"] = len(direct_rows)
             meta["partial_success"] = meta["partial_success"] or bool(direct_rows)
             for row in direct_rows:
@@ -3235,10 +3453,33 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
 
     early_stop_target = max(10, _safe_int(criteria.get("limit"), 10) * EARLY_STOP_MULTIPLIER)
 
-    for page in pages:
-        page_rows, page_meta = await _collect_page_rows_with_fallback(engine, page, mode)
+    for _page_idx, page in enumerate(pages):
+        # v4.19.0 [FIX X-1]: stop COLLECTING (not the build) when the soft
+        # budget is nearly spent — gating / tiering / ranking / projection
+        # then run on whatever has been collected, so the payload degrades
+        # to a PARTIAL ranked set with full meta instead of rows:0.
+        # The FIRST page is ALWAYS attempted regardless of remaining budget
+        # (its fetch timeout is itself budget-clamped via _budget_timeout,
+        # and the outer backstop still bounds the worst case): a guard that
+        # can skip page one reintroduces the very zero-row degradation this
+        # fix exists to eliminate whenever TOTAL - RESERVE <= the floor.
+        _rem = _remaining_budget(deadline)
+        if _page_idx > 0 and _rem is not None and _rem <= PAGE_LOOP_MIN_REMAINING_SEC:
+            meta["budget_exhausted"] = True
+            meta["pages_skipped"] = list(pages[_page_idx:])
+            logger.warning(
+                "[v4.19.0 BUDGET] soft budget exhausted before page=%s; skipping %s",
+                page, meta["pages_skipped"],
+            )
+            break
+        page_rows, page_meta = await _collect_page_rows_with_fallback(engine, page, mode, deadline)
         meta["source_page_rows"][page] = page_meta.get("rows", 0)
         meta["snapshot_rows"][page] = page_meta.get("snapshot_rows", 0)
+        # v4.19.0 [FIX X-3]: record the page universe size beside ingested
+        # rows so truncation / starvation is visible, never implicit.
+        _universe_size = await _fetch_page_universe_size(engine, page, deadline)
+        if _universe_size is not None:
+            meta["page_universe"][page] = _universe_size
         # v4.16.0 Phase C: roll up snapshot-donor quarantine counts.
         _q = _safe_int(page_meta.get("gate_fields_quarantined"), 0)
         if _q > 0:
@@ -3248,7 +3489,7 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         hydrated_rows = page_rows
         hydration_meta: Dict[str, Any] = {"page": page}
         if page_rows:
-            hydrated_rows, hydration_meta = await _hydrate_page_rows(engine, page_rows, mode, criteria)
+            hydrated_rows, hydration_meta = await _hydrate_page_rows(engine, page_rows, mode, criteria, deadline)
             hydration_meta["page"] = page
 
         meta["page_diagnostics"].append(_json_safe(page_meta))
@@ -3268,7 +3509,7 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         try:
             emergency_rows = await asyncio.wait_for(
                 _fetch_direct_symbol_rows(engine, emergency_symbols[:HYDRATION_SYMBOL_CAP], mode),
-                timeout=min(BUILDER_TOTAL_TIMEOUT_SEC / 2.0, 12.0),
+                timeout=_budget_timeout(BUILDER_TOTAL_TIMEOUT_SEC / 2.0, deadline),  # v4.19.0 [FIX X-1/X-2] de-clamped (was min(...,12))
             )
             meta["used_emergency_symbols"] = bool(emergency_rows)
             meta["emergency_symbol_rows"] = len(emergency_rows)
@@ -3285,7 +3526,7 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         try:
             fallback_rows = await asyncio.wait_for(
                 _fetch_page_rows(engine, OUTPUT_PAGE, max(30, fallback_target * 2), mode),
-                timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 10.0),
+                timeout=_budget_timeout(PAGE_TOTAL_TIMEOUT_SEC, deadline),  # v4.19.0 [FIX X-1/X-2] de-clamped (was min(...,10))
             )
             meta["top10_output_fallback_rows"] = len(fallback_rows)
         except asyncio.TimeoutError:
@@ -3297,7 +3538,7 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
 
         if not fallback_rows:
             try:
-                fallback_rows = await asyncio.wait_for(_fetch_page_snapshot_rows(engine, OUTPUT_PAGE), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 8.0))
+                fallback_rows = await asyncio.wait_for(_fetch_page_snapshot_rows(engine, OUTPUT_PAGE), timeout=_budget_timeout(PAGE_TOTAL_TIMEOUT_SEC, deadline))  # v4.19.0 [FIX X-1/X-2] de-clamped (was min(...,8))
                 meta["top10_output_snapshot_rows"] = len(fallback_rows)
             except asyncio.TimeoutError:
                 fallback_rows = []
@@ -3333,6 +3574,15 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
                 meta["top10_metadata_stripped_count"] += _fb_meta_stripped
         for row in fallback_rows:
             _put_row(row, OUTPUT_PAGE)
+
+    # v4.19.0 [FIX X-3]: coverage rollup — ingested vs universe per page,
+    # plus the global starvation flag (non-empty universe, zero ingested).
+    for _pg, _uni in meta["page_universe"].items():
+        _fetched = _safe_int(meta["source_page_rows"].get(_pg), 0)
+        if _uni and _uni > 0:
+            meta["page_coverage"][_pg] = round(min(1.0, _fetched / float(_uni)), 4)
+            if _fetched == 0:
+                meta["universe_starved"] = True
 
     meta["deduped_candidate_count"] = len(candidates)
     return list(candidates.values()), meta
@@ -3438,6 +3688,9 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         criteria = _collect_criteria_from_inputs(*args, **kwargs)
         mode = _s(kwargs.get("mode") or criteria.get("mode") or "")
         limit = max(1, _safe_int(criteria.get("limit") or kwargs.get("limit"), 10))
+        # v4.19.0 [FIX X-1]: internal soft deadline — collection self-budgets
+        # so the outer backstop never has to destroy a viable partial build.
+        deadline = time.monotonic() + max(1.0, BUILDER_TOTAL_TIMEOUT_SEC - BUILDER_TOTAL_RESERVE_SEC)
 
         if criteria.get("schema_only") or criteria.get("headers_only"):
             return _build_payload(
@@ -3479,7 +3732,7 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             )
 
         try:
-            candidates, collect_meta = await _collect_candidate_rows(engine, criteria, mode)
+            candidates, collect_meta = await _collect_candidate_rows(engine, criteria, mode, deadline)
         except Exception as exc:
             logger.warning("Top10 candidate collection failed: %s", exc, exc_info=True)
             return _build_payload(
@@ -3770,6 +4023,12 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 for rank in (_PROV_LIVE, _PROV_EMERGENCY, _PROV_SNAPSHOT, _PROV_OUTPUT_FALLBACK)
             },
             "selected_symbols": [_s(r.get("symbol")) for r in projected_rows if _s(r.get("symbol"))],
+            # v4.19.0 [FIX X-5]: symbol -> donating source_page, auditable.
+            "selected_sources": {
+                _s(r.get("symbol")): _s(r.get("source_page"))
+                for r in top_rows[:limit]
+                if _s(r.get("symbol"))
+            },
             "selected_direct_symbols": [
                 _s(r.get("symbol"))
                 for r in projected_rows
@@ -3778,6 +4037,14 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "include_headers": criteria.get("include_headers", True),
             "include_matrix": criteria.get("include_matrix", True),
             "engine_source": engine_source,
+            # v4.19.0 [FIX X-1/X-2]: effective timeout-configuration echo.
+            "timeouts": {
+                "engine_call_sec": ENGINE_CALL_TIMEOUT_SEC,
+                "page_sec": PAGE_TOTAL_TIMEOUT_SEC,
+                "total_sec": BUILDER_TOTAL_TIMEOUT_SEC,
+                "total_reserve_sec": BUILDER_TOTAL_RESERVE_SEC,
+                "outer_grace_sec": BUILDER_OUTER_GRACE_SEC,
+            },
             "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
             "filter_drop_counts": dict(drop_counts),
             "applied_v310_filters": dict(_v310_active),
@@ -3813,7 +4080,13 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         return _build_payload(status=status, headers=headers, keys=keys, rows=projected_rows, meta=meta)
 
     try:
-        return await asyncio.wait_for(_inner(), timeout=BUILDER_TOTAL_TIMEOUT_SEC)
+        # v4.19.0 [FIX X-1]: the hard wall is now a BACKSTOP behind the
+        # graceful internal deadline (TOTAL - reserve). Reaching it means
+        # the graceful path itself wedged (e.g. a non-cancellable engine
+        # call); the fallback below is the last resort, not the design.
+        return await asyncio.wait_for(
+            _inner(), timeout=BUILDER_TOTAL_TIMEOUT_SEC + BUILDER_OUTER_GRACE_SEC
+        )
     except asyncio.TimeoutError:
         headers, keys = _load_schema_defaults()
         criteria = _collect_criteria_from_inputs(*args, **kwargs)
@@ -3827,6 +4100,15 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 "dispatch": "top10_selector",
                 "selector_version": TOP10_SELECTOR_VERSION,
                 "warning": "builder_total_timeout",
+                # v4.19.0 [FIX X-1]: even the last-resort payload carries the
+                # timeout configuration for diagnosis.
+                "timeouts": {
+                    "engine_call_sec": ENGINE_CALL_TIMEOUT_SEC,
+                    "page_sec": PAGE_TOTAL_TIMEOUT_SEC,
+                    "total_sec": BUILDER_TOTAL_TIMEOUT_SEC,
+                    "total_reserve_sec": BUILDER_TOTAL_RESERVE_SEC,
+                    "outer_grace_sec": BUILDER_OUTER_GRACE_SEC,
+                },
                 "criteria_used": _json_safe(criteria),
                 "include_headers": criteria.get("include_headers", True),
                 "include_matrix": criteria.get("include_matrix", True),
@@ -3930,6 +4212,12 @@ __all__ = [
     "TOP10_GOLDEN_COMPOSITE_ENV",
     "GOLDEN_COMPOSITE_WEIGHTS",
     "TOP10_METADATA_STRIP_KEYS",
+    # v4.19.0 Fix X: budget / timeout surface.
+    "ENGINE_CALL_TIMEOUT_SEC",
+    "PAGE_TOTAL_TIMEOUT_SEC",
+    "BUILDER_TOTAL_TIMEOUT_SEC",
+    "BUILDER_TOTAL_RESERVE_SEC",
+    "BUILDER_OUTER_GRACE_SEC",
     # v4.14.0 Phase C: 8-tier vocabulary surface (content-checkable
     # constants for ops + downstream tooling).
     "_RECO_8TIER_CANONICAL",
