@@ -7,6 +7,17 @@ TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v8.4.0)
 RENDER-ALIGNED | ENGINE-COMPATIBLE | SETTINGS-AWARE | SCHEMA-AWARE
 ASYNC-SAFE | CACHE-SAFE
 
+Why this revision (v8.4.1)
+- ✅ FIX (CRITICAL): strip_value(None) returned the truthy string "None",
+  causing _default_spreadsheet_id() to short-circuit before reading the
+  DEFAULT_SPREADSHEET_ID / SPREADSHEET_ID env vars. Every Sheets API call
+  was issued against .../spreadsheets/None and 404'd (verified live on
+  Render, 2026-06-11). strip_value now normalizes None to "" so spreadsheet
+  ID resolution falls through settings -> env exactly as documented. This
+  also hardens coerce_bool / split_cell / normalize_name_key against
+  accidental "None" strings. No other behavior changed; v8.4.0 logic is
+  otherwise verbatim.
+
 Why this revision (v8.4.0)
 - ✅ FIX: Imports Sequence (was used but missing).
 - ✅ FIX: Reader is now settings-aware:
@@ -74,7 +85,7 @@ from typing import (
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "8.4.0"
+SCRIPT_VERSION = "8.4.1"
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +408,14 @@ _DEFAULT_SPREADSHEET_ID_ATTRS: Tuple[str, ...] = (
 
 
 def strip_value(v: Any) -> str:
+    # WHY (v8.4.1): str(None) == "None", a TRUTHY string. Before this guard,
+    # _default_spreadsheet_id() short-circuited on
+    # _spreadsheet_id_from_settings(None) -> strip_value(None) -> "None" and
+    # NEVER consulted the DEFAULT_SPREADSHEET_ID / SPREADSHEET_ID env vars,
+    # sending every Sheets API call to .../spreadsheets/None (HTTP 404).
+    # None must normalize to "" so the or-chain falls through to env.
+    if v is None:
+        return ""
     try:
         return str(v).strip()
     except Exception:
