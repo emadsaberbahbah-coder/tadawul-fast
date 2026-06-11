@@ -7,6 +7,27 @@ TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v8.4.0)
 RENDER-ALIGNED | ENGINE-COMPATIBLE | SETTINGS-AWARE | SCHEMA-AWARE
 ASYNC-SAFE | CACHE-SAFE
 
+Why this revision (v8.4.2)
+- ✅ FIX (CRITICAL): header detection scanned ONLY the fixed spec.header_row
+  (row 5) while live TFB pages keep headers on row 1 -- the probe landed on a
+  data row and failed every page. _detect_by_header now scans a row block
+  from row 1 through header_row+1 and reports the detected header row and
+  data start row via detection meta.
+- ✅ FIX (CRITICAL): discovery/extraction pinned to spec.start_row (6) sliced
+  off data rows 2-5 -- on Market_Leaders that dropped 4030.SR (row 2).
+  _discover_symbols_for_spec now honors the detected data_start_row for both
+  the column read and extraction. Sheets that genuinely use the legacy
+  header_row=5 layout keep their exact prior behavior.
+- ✅ FIX (CRITICAL): sheet-name -> page-key mapping let LATER registry
+  entries overwrite earlier ones, so the KSA backward alias (sheet_names
+  include Market_Leaders / My_Portfolio / Insights_Analysis) clobbered those
+  three resolutions; resolve_key("Market_Leaders") returned "KSA", whose
+  allowed_types=(KSA,) silently dropped every non-Saudi symbol (8 of 10
+  My_Portfolio holdings). Mapping is now FIRST-registration-wins; the KSA
+  alias remains reachable via its own key "KSA".
+- Verified live on Render 2026-06-11: v8.4.1 reads succeeded (auth + ID OK)
+  but yielded no symbols; engine fell back to EMERGENCY_PAGE_SYMBOLS.
+
 Why this revision (v8.4.1)
 - ✅ FIX (CRITICAL): strip_value(None) returned the truthy string "None",
   causing _default_spreadsheet_id() to short-circuit before reading the
@@ -85,7 +106,7 @@ from typing import (
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "8.4.1"
+SCRIPT_VERSION = "8.4.2"
 
 
 # ---------------------------------------------------------------------------
@@ -687,9 +708,21 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
 
 _SHEETNAME_TO_PAGEKEY: Dict[str, str] = {}
 for _pk, _spec in PAGE_REGISTRY.items():
+    # WHY (v8.4.2): a page's own key ALWAYS resolves to itself.
     _SHEETNAME_TO_PAGEKEY[normalize_name_key(_pk)] = _pk
+for _pk, _spec in PAGE_REGISTRY.items():
     for _nm in _spec.sheet_names:
-        _SHEETNAME_TO_PAGEKEY[normalize_name_key(_nm)] = _pk
+        # WHY (v8.4.2): FIRST registration wins. The build loop previously let
+        # later registry entries OVERWRITE earlier ones, so the KSA backward
+        # alias (whose sheet_names include Market_Leaders, My_Portfolio and
+        # Insights_Analysis) clobbered those mappings: resolve_key(
+        # "Market_Leaders") returned "KSA", whose allowed_types=(KSA,) silently
+        # dropped every non-Saudi symbol (verified: 8 of 10 My_Portfolio
+        # holdings vanished). Primary pages now keep their names; the KSA
+        # alias stays reachable via its own key "KSA".
+        _key = normalize_name_key(_nm)
+        if _key not in _SHEETNAME_TO_PAGEKEY:
+            _SHEETNAME_TO_PAGEKEY[_key] = _pk
 
 
 def resolve_key(key: str) -> str:
@@ -1178,38 +1211,61 @@ class ColumnDetectionEngine:
         sheet_name: str,
         spec: PageSpec,
     ) -> Tuple[Optional[str], float, Dict[str, Any]]:
-        range_a1 = f"{GoogleSheetsReader.safe_sheet_name(sheet_name)}!A{spec.header_row}:ZZ{spec.header_row}"
+        # WHY (v8.4.2): live TFB pages keep headers on ROW 1 with data from row 2,
+        # while PageSpec defaults assume header_row=5 / start_row=6 (legacy
+        # dashboard-block layout). The fixed single-row probe therefore landed on
+        # a DATA row and failed, and extraction pinned to spec.start_row sliced
+        # off data rows 2-5 (on Market_Leaders that includes 4030.SR at row 2 --
+        # verified live on Render, 2026-06-11). The probe now scans a row BLOCK
+        # from row 1 through max(header_row, 1) + 1 and reports the detected
+        # header row and data start row via detection meta so discovery and
+        # extraction follow the sheet's REAL layout. Sheets whose headers truly
+        # sit at spec.header_row keep their exact prior behavior (the block
+        # includes that row).
+        scan_to = max(int(spec.header_row or 1), 1) + 1
+        range_a1 = f"{GoogleSheetsReader.safe_sheet_name(sheet_name)}!A1:ZZ{scan_to}"
         values = await sheets_reader.read_range_async(spreadsheet_id, range_a1)
-        if not values or not values[0]:
+        if not values:
             return None, 0.0, {}
 
-        headers = [strip_value(h).upper() for h in values[0]]
         candidates = tuple(strip_value(c).upper() for c in spec.header_candidates)
 
-        for idx, header in enumerate(headers, 1):
-            if header in candidates:
-                return GoogleSheetsReader.col_to_letter(idx), 1.0, {
-                    "matched_header": header,
-                    "match": "exact",
-                }
+        # Pass 1: exact header match anywhere in the scanned block; top-most
+        # row wins so a real header row beats any coincidental data cell below.
+        for r_idx, row in enumerate(values, 1):
+            headers = [strip_value(h).upper() for h in (row or [])]
+            for idx, header in enumerate(headers, 1):
+                if header in candidates:
+                    return GoogleSheetsReader.col_to_letter(idx), 1.0, {
+                        "matched_header": header,
+                        "match": "exact",
+                        "header_row": r_idx,
+                        "data_start_row": r_idx + 1,
+                    }
 
-        best_score, best_col, best_match = 0.0, None, ""
-        for idx, header in enumerate(headers, 1):
-            if not header:
-                continue
-            for cand in candidates:
-                if cand and cand in header:
-                    score = len(cand) / max(1, len(header))
-                    if score > best_score:
-                        best_score = score
-                        best_col = GoogleSheetsReader.col_to_letter(idx)
-                        best_match = cand
+        # Pass 2: partial match (same scoring as v8.4.0), top-most row wins ties.
+        best_score, best_col, best_match, best_row = 0.0, None, "", 0
+        for r_idx, row in enumerate(values, 1):
+            headers = [strip_value(h).upper() for h in (row or [])]
+            for idx, header in enumerate(headers, 1):
+                if not header:
+                    continue
+                for cand in candidates:
+                    if cand and cand in header:
+                        score = len(cand) / max(1, len(header))
+                        if score > best_score:
+                            best_score = score
+                            best_col = GoogleSheetsReader.col_to_letter(idx)
+                            best_match = cand
+                            best_row = r_idx
 
         if best_col and best_score >= 0.5:
             return best_col, float(best_score), {
                 "matched_header": best_match,
                 "match": "partial",
                 "score": best_score,
+                "header_row": best_row,
+                "data_start_row": best_row + 1,
             }
 
         return None, 0.0, {}
@@ -1437,8 +1493,18 @@ async def _discover_symbols_for_spec(
         if not col:
             continue
 
-        end_row = spec.start_row + max(1, spec.max_rows) - 1
-        range_a1 = f"{GoogleSheetsReader.safe_sheet_name(sheet_name)}!{col}{spec.start_row}:{col}{end_row}"
+        # WHY (v8.4.2): honor the header-detected data start row when present so
+        # extraction begins immediately below the REAL header row instead of at
+        # the spec default (which dropped data rows above spec.start_row).
+        data_start_row = spec.start_row
+        try:
+            if isinstance(detect_meta, dict) and detect_meta.get("data_start_row"):
+                data_start_row = max(1, int(detect_meta["data_start_row"]))
+        except Exception:
+            data_start_row = spec.start_row
+
+        end_row = data_start_row + max(1, spec.max_rows) - 1
+        range_a1 = f"{GoogleSheetsReader.safe_sheet_name(sheet_name)}!{col}{data_start_row}:{col}{end_row}"
 
         values = await sheets_reader.read_range_async(spreadsheet_id, range_a1)
         if not values:
@@ -1447,7 +1513,7 @@ async def _discover_symbols_for_spec(
         symbols = extractor.extract_from_column(
             values,
             col,
-            start_row=spec.start_row,
+            start_row=data_start_row,
             origin=canonical_key,
             sheet_name=sheet_name,
             strategy=strategy,
