@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.0   (TFB Final Execution Plan v5.0 — Phase P2)
+Version: 1.0.1   (TFB Final Execution Plan v5.0 — Phase P2)
+
+v1.0.1 [ALIAS-FIX, P3 integration finding]: the live 115-key canonical
+(schema_registry v2.13.0 / route v4.6.0) emits `forecast_reliability_score`,
+`recommendation_detailed`, and `block_reason`; the v1.0.0 alias map missed
+those exact compact forms, so live selector rows would have shown reliability
+as missing and MAJOR-failed every candidate. Three aliases added; no other
+change.
 
 WHY THIS MODULE EXISTS
 ----------------------
@@ -87,7 +94,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.0"
+OPPORTUNITY_BUILDER_VERSION = "1.0.1"
 
 # ---------------------------------------------------------------------------
 # §4.1 control-panel defaults (mirrors _Lists_Config TFB_PANEL_DEFAULTS T10:*)
@@ -362,7 +369,7 @@ _FIELD_ALIASES = {
     "engine_roi_12m_pct": ("expectedroi12m", "expectedroi", "forecastroi12m",
                            "engineroi12m", "expectedroipct"),
     "reliability": ("reliabilityscore", "reliability", "rel",
-                    "forecastreliability"),
+                    "forecastreliability", "forecastreliabilityscore"),
     "dq": ("dataqualityscore", "dataquality", "dq", "dqscore",
            "dataqualitypct"),
     "risk_level": ("risklevel", "riskbucket", "riskband", "riskcategory"),
@@ -373,14 +380,15 @@ _FIELD_ALIASES = {
     "vol_30d_pct": ("volatility30d", "vol30d", "volatility30", "vol30"),
     "avg_volume_30d": ("avgvolume30d", "averagevolume30d", "avgvolume",
                        "avgvol30d"),
-    "recommendation": ("recommendationdetail", "recommendation", "reco",
-                       "recommendationcanonical"),
+    "recommendation": ("recommendationdetail", "recommendationdetailed",
+                       "recommendation", "reco", "recommendationcanonical"),
     "recommendation_reason": ("recommendationreason", "recoreason",
                               "advisornote", "reasoning"),
     "investability": ("investability", "investabilitystatus",
                       "investabilitygate", "gatestatus"),
     "investability_reasons": ("investabilityreasons", "gatereasons",
-                              "blockreasons", "investabilitynotes"),
+                              "blockreasons", "blockreason",
+                              "investabilitynotes"),
     "last_updated": ("lastupdatedutc", "lastupdated", "asof", "timestamp"),
     "data_provider": ("dataprovider", "provider", "primaryprovider"),
 }
