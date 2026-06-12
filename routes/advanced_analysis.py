@@ -2,8 +2,30 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.7.2  (OPPORTUNITY-CANDIDATES ENDPOINT — OPP-ADD)
+Advanced Analysis Root Owner — v4.8.0  (PORTFOLIO-ACTIONS ENDPOINT — PF-ADD)
 ================================================================================
+v4.8.0 [PF-ADD]: NEW endpoint POST /portfolio-actions (Plan v5.0 P5b,
+milestone M2) — bridges GAS-supplied My_Portfolio holdings rows into
+core.analysis.portfolio_actions v1.0.0 (P5): L3 action vocabulary
+(ADD/HOLD/TRIM/EXIT/BLOCK), v1.0.0-pinned action truth table, L7 funding
+identity (mode-aware via PF: Rebalance Mode), L8 advisor sentences, sector
+summary, and alerts. Registered on THREE paths, mirroring the v4.7.1
+mount-fix: /sheet-rows/portfolio-actions is the EFFECTIVE live path (main.py
+entry v8.11.2 _clone_filtered_router admits only the "/sheet-rows", "/schema",
+"/v1/schema" prefixes for this router); bare /portfolio-actions and
+/v1/portfolio-actions are registered for the future main allowlist. Body:
+`rows` (holdings dicts with the Top_10 pool display headers PLUS Quantity and
+Buy Price), `controls` (PF panel labels "PF: Cash Available SAR" etc. or
+snake_case, mapped via _PF_CONTROLS_ALIASES and echoed in
+meta.controls_snapshot), `fx_rates` (GAS-read TFB_FX_LOOKUP). There is NO
+selector pool path — holdings come exclusively from the spreadsheet (the
+backend never owns portfolio truth). Fail-soft: builder unbound -> status
+"unavailable" skeleton with the §-zone keys (kpis/actions/sector_summary/
+alerts); builder exceptions -> status "error"; the only raise on the new path
+is auth 401. ALL v4.7.2 behavior — every endpoint, the dispatch chain,
+envelopes, widths, the opportunity-candidates path — is preserved verbatim;
+v4.8.0 is purely additive.
+
 v4.7.2 [META-MAP]: upstream_meta mapping aligned to the LIVE top10_selector
 v4.19.0 meta key names observed on 2026-06-12 acceptance: the selector emits
 page_coverage (not coverage), a boolean budget_exhausted (not a budget dict),
@@ -238,6 +260,8 @@ Owns the canonical root paths:
 - /v1/schema/provider-health
 - /opportunity-candidates  (effective live path: /sheet-rows/opportunity-candidates;
   see v4.7.1 [MOUNT-FIX] — main.py prefix filter)
+- /portfolio-actions  (effective live path: /sheet-rows/portfolio-actions;
+  same mount-filter rationale — v4.8.0 [PF-ADD])
 and their /v1/schema aliases.
 ================================================================================
 """
@@ -263,9 +287,9 @@ logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
 # =============================================================================
-# v4.7.2 — Version constant.
+# v4.8.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.7.2"
+ADVANCED_ANALYSIS_VERSION = "4.8.0"
 
 
 # =============================================================================
@@ -494,6 +518,42 @@ except Exception as _opp_err:
         "[advanced_analysis v%s] core.analysis.opportunity_builder unavailable (%s); "
         "/opportunity-candidates will answer status=unavailable",
         ADVANCED_ANALYSIS_VERSION, _opp_err,
+    )
+
+
+# =============================================================================
+# v4.8.0 [PF-ADD] Portfolio actions binding.  (NEW in v4.8.0)
+#
+# core.analysis.portfolio_actions v1.0.0 (Plan v5.0 P5) is the pure-compute
+# action engine for the rebuilt My_Portfolio decision page: the v1.0.0-pinned
+# action truth table (BLOCK -> low-confidence cap -> EXIT -> TRIM -> ADD ->
+# HOLD), the L7 funding pass (Target-Cash floor, mode-aware proceeds,
+# cash-first funding with funds_from labels), L8 advisor sentences, sector
+# summary, and alerts. It DELEGATES all row normalization to
+# opportunity_builder (one implementation, two consumers) and degrades to its
+# own "unavailable" skeleton if that import fails — so this binding succeeding
+# does not guarantee full function; meta.versions reports both. Fail-soft:
+# unbound -> POST /portfolio-actions answers status="unavailable"; every other
+# route is unaffected.
+# =============================================================================
+_build_portfolio_actions = None  # type: ignore[assignment]
+_PF_ACTIONS_VERSION: Optional[str] = None
+try:
+    from core.analysis.portfolio_actions import (  # type: ignore
+        PORTFOLIO_ACTIONS_VERSION as _PF_ACTIONS_VERSION,
+        build_portfolio_actions as _build_portfolio_actions,
+    )
+    logger.info(
+        "[advanced_analysis v%s] portfolio actions bound (core.analysis.portfolio_actions v%s)",
+        ADVANCED_ANALYSIS_VERSION, _PF_ACTIONS_VERSION,
+    )
+except Exception as _pf_err:
+    _build_portfolio_actions = None  # type: ignore
+    _PF_ACTIONS_VERSION = None
+    logger.info(
+        "[advanced_analysis v%s] core.analysis.portfolio_actions unavailable (%s); "
+        "/portfolio-actions will answer status=unavailable",
+        ADVANCED_ANALYSIS_VERSION, _pf_err,
     )
 
 
@@ -2561,6 +2621,174 @@ async def opportunity_candidates_post(
         "request_id": request_id,
         "dispatch": "opportunity_candidates",
         "pool": {"source": pool_source, "count": len(pool_rows), "pool_limit": pool_limit},
+        "duration_ms": round((time.time() - start) * 1000.0, 3),
+    }
+    return _json_safe(payload)
+
+
+# =============================================================================
+# v4.8.0 [PF-ADD] POST /portfolio-actions — Plan v5.0 My_Portfolio payload.
+#
+# Bridges GAS-supplied holdings rows into the bound portfolio_actions builder
+# (action truth table / L7 funding / L8 advisor notes). The payload shape is
+# owned by the builder; this endpoint only adds meta.provider_health and
+# meta.route (additive, inside meta). No selector path — holdings come
+# exclusively from the spreadsheet. Fail-soft everywhere except auth (401).
+# =============================================================================
+_PF_CONTROLS_ALIASES: Dict[str, str] = {
+    "cashavailablesar": "cash_available_sar",
+    "cashavailable": "cash_available_sar",
+    "cashsar": "cash_available_sar",
+    "targetcash": "target_cash_pct",
+    "targetcashpct": "target_cash_pct",
+    "maxposition": "max_position_pct",
+    "maxpositionpct": "max_position_pct",
+    "maxsector": "max_sector_pct",
+    "maxsectorpct": "max_sector_pct",
+    "minreliabilitytoadd": "min_reliability_add",
+    "minreliability": "min_reliability_add",
+    "mindqtoadd": "min_dq_add",
+    "mindataqualitytoadd": "min_dq_add",
+    "mindataquality": "min_dq_add",
+    "mindq": "min_dq_add",
+    "rebalancemode": "rebalance_mode",
+    "addroipct": "add_roi_pct",
+    "addroi": "add_roi_pct",
+    "trimroipct": "trim_roi_pct",
+    "exitroipct": "exit_roi_pct",
+    "reviewdays": "review_days",
+    "lotsize": "lot_size",
+    "periodmonths": "period_months",
+    "period": "period_months",
+}
+
+
+def _pf_controls_from_body(raw: Any) -> Dict[str, Any]:
+    """v4.8.0: map GAS PF-panel labels ("PF: Cash Available SAR",
+    "PF: Rebalance Mode") or snake_case keys onto portfolio_actions controls
+    keys. Unknown keys pass through snake_cased — the builder ignores what it
+    doesn't recognize, so this can't reject a panel. NOTE: "minreliability"
+    intentionally maps differently here (min_reliability_add) than in
+    _OPP_CRITERIA_ALIASES (min_reliability) — separate panels, separate maps."""
+    out: Dict[str, Any] = {}
+    if not isinstance(raw, Mapping):
+        return out
+    for k, v in raw.items():
+        token = _strip(k)
+        if not token:
+            continue
+        if token.lower().startswith("pf:"):
+            token = token[3:]
+        compact = re.sub(r"[^a-z0-9]+", "", token.lower())
+        key = _PF_CONTROLS_ALIASES.get(compact) or _normalize_key_name(token)
+        if key:
+            out[key] = v
+    return out
+
+
+@router.post("/sheet-rows/portfolio-actions")
+@router.post("/portfolio-actions")
+@router.post("/v1/portfolio-actions")
+async def portfolio_actions_post(
+    request: Request,
+    body: Dict[str, Any] = Body(default_factory=dict),
+    token: Optional[str] = Query(default=None),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+) -> Dict[str, Any]:
+    """v4.8.0 [PF-ADD]: action payload for the My_Portfolio decision page.
+
+    Body fields:
+      rows     : holdings dicts from 10_My_Portfolio.gs — the Top_10 pool
+                 display headers PLUS "Quantity" and "Buy Price" (average
+                 cost, native ccy, from _Portfolio_CostBasis). Empty/absent
+                 rows -> the builder answers status="empty" honestly (L13).
+      controls : dict — PF panel values; labels or snake_case (see
+                 _pf_controls_from_body). Echoed in meta.controls_snapshot.
+      fx_rates : dict ccy -> SAR rate, read by GAS from _Lists_Config
+                 TFB_FX_LOOKUP (the backend never reads the spreadsheet).
+
+    Fail-soft: builder unbound -> status "unavailable"; builder exceptions ->
+    status "error" (inside the builder); the only raise is auth (401).
+    """
+    start = time.time()
+    request_id = _strip(x_request_id) or str(uuid.uuid4())[:12]
+    try:
+        settings = get_settings_cached()
+    except Exception:
+        settings = None
+    auth_token = _extract_auth_token(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, settings=settings, request=request)
+    if not _auth_passed(request=request, settings=settings, auth_token=auth_token, authorization=authorization):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    merged_body = _merge_body_with_query(body, request)
+    controls = _pf_controls_from_body(merged_body.get("controls"))
+    fx_rates = merged_body.get("fx_rates") if isinstance(merged_body.get("fx_rates"), Mapping) else {}
+    raw_rows = merged_body.get("rows")
+    holdings: List[Dict[str, Any]] = []
+    if isinstance(raw_rows, list):
+        holdings = [dict(r) for r in raw_rows if isinstance(r, Mapping)]
+
+    if _build_portfolio_actions is None:
+        return _json_safe({
+            "version": None,
+            "status": "unavailable",
+            "message": "core.analysis.portfolio_actions not deployed",
+            "kpis": {}, "actions": [], "sector_summary": [], "alerts": [],
+            "meta": {
+                "controls_snapshot": controls,
+                "route": {
+                    "version": ADVANCED_ANALYSIS_VERSION,
+                    "request_id": request_id,
+                    "dispatch": "portfolio_actions_unavailable",
+                    "duration_ms": round((time.time() - start) * 1000.0, 3),
+                },
+            },
+        })
+
+    provider_health = await _extract_provider_health_snapshot()
+    engine_version = provider_health.get("engine_version") if isinstance(provider_health, Mapping) else None
+    upstream_meta: Dict[str, Any] = {
+        "versions": {"engine": engine_version},
+        "rows_supplied_by": "gas_sheets",
+    }
+
+    try:
+        payload = _build_portfolio_actions(
+            holdings,
+            controls=controls,
+            fx_rates=dict(fx_rates or {}),
+            upstream_meta=upstream_meta,
+        )
+    except Exception as e:
+        logger.warning(
+            "[advanced_analysis v%s] portfolio actions builder raised %s: %s",
+            ADVANCED_ANALYSIS_VERSION, e.__class__.__name__, e,
+        )
+        payload = {
+            "version": _PF_ACTIONS_VERSION,
+            "status": "error",
+            "message": "{}: {}".format(e.__class__.__name__, str(e)[:200]),
+            "kpis": {}, "actions": [], "sector_summary": [], "alerts": [],
+            "meta": {"controls_snapshot": controls},
+        }
+    if not isinstance(payload, dict):
+        payload = {"status": "error", "message": "builder returned non-dict",
+                   "kpis": {}, "actions": [], "sector_summary": [],
+                   "alerts": [], "meta": {}}
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        payload["meta"] = meta
+    meta["provider_health"] = _json_safe(provider_health)
+    meta["route"] = {
+        "version": ADVANCED_ANALYSIS_VERSION,
+        "portfolio_actions_version": _PF_ACTIONS_VERSION,
+        "request_id": request_id,
+        "dispatch": "portfolio_actions",
+        "holdings": {"count": len(holdings)},
         "duration_ms": round((time.time() - start) * 1000.0, 3),
     }
     return _json_safe(payload)
