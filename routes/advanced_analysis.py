@@ -2,8 +2,26 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.8.0  (PORTFOLIO-ACTIONS ENDPOINT — PF-ADD)
+Advanced Analysis Root Owner — v4.9.0  (SECTOR TREND ENRICHMENT — TREND-ADD)
 ================================================================================
+v4.9.0 [TREND-ADD]: the opportunity-candidates pool is passed through
+core.analysis.trend_signals v1.0.0 (Plan v5.0 P9) BEFORE the builder runs.
+The module computes SECTOR TREND cross-sectionally from the pool itself
+(median Expected ROI 12M + sell-recommendation breadth per sector cohort —
+no external calls, no provider quota) and stamps 'Sector Trend' onto rows
+that do not already carry one, so the §4.2 Allow Negative Sector gate and
+the §4.3 sector_trend score component finally receive real signal instead
+of a universal "Unknown" (40, always passes). News trend is NOT fabricated —
+it stays Unknown until a news source lands; the enrichment meta reports
+news coverage honestly. ENV-GATED, DEFAULT OFF: set TFB_TREND_SIGNALS=1 to
+enable; when unset, rows pass through byte-identical to v4.8.0 and
+meta.route.trends reports {"enabled": false}. Enrichment summary (stamped /
+supplied / no_sector counts + per-sector classifications) is exposed at
+meta.route.trends on the opportunity endpoint. Fail-soft: module unbound or
+raising -> pool used unenriched, error noted in meta.route.trends. The
+portfolio-actions path is untouched (portfolio_actions does not consume
+trend fields). ALL v4.8.0 behavior is otherwise preserved verbatim.
+
 v4.8.0 [PF-ADD]: NEW endpoint POST /portfolio-actions (Plan v5.0 P5b,
 milestone M2) — bridges GAS-supplied My_Portfolio holdings rows into
 core.analysis.portfolio_actions v1.0.0 (P5): L3 action vocabulary
@@ -262,6 +280,7 @@ Owns the canonical root paths:
   see v4.7.1 [MOUNT-FIX] — main.py prefix filter)
 - /portfolio-actions  (effective live path: /sheet-rows/portfolio-actions;
   same mount-filter rationale — v4.8.0 [PF-ADD])
+  (opportunity pool is trend-enriched when TFB_TREND_SIGNALS=1 — v4.9.0)
 and their /v1/schema aliases.
 ================================================================================
 """
@@ -287,9 +306,9 @@ logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
 # =============================================================================
-# v4.8.0 — Version constant.
+# v4.9.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.8.0"
+ADVANCED_ANALYSIS_VERSION = "4.9.0"
 
 
 # =============================================================================
@@ -554,6 +573,37 @@ except Exception as _pf_err:
         "[advanced_analysis v%s] core.analysis.portfolio_actions unavailable (%s); "
         "/portfolio-actions will answer status=unavailable",
         ADVANCED_ANALYSIS_VERSION, _pf_err,
+    )
+
+
+# =============================================================================
+# v4.9.0 [TREND-ADD] Trend signals binding.  (NEW in v4.9.0)
+#
+# core.analysis.trend_signals v1.0.0 (Plan v5.0 P9) computes sector trend
+# cross-sectionally from the candidate pool (stdlib-only, deterministic,
+# no provider calls) and stamps rows the builder then consumes via its own
+# sector_trend aliases. Env-gated DEFAULT OFF (TFB_TREND_SIGNALS=1); the
+# module itself returns rows untouched when disabled. Fail-soft: unbound ->
+# the opportunity endpoint runs exactly as v4.8.0 did.
+# =============================================================================
+_enrich_rows_with_trends = None  # type: ignore[assignment]
+_TREND_SIGNALS_VERSION: Optional[str] = None
+try:
+    from core.analysis.trend_signals import (  # type: ignore
+        TREND_SIGNALS_VERSION as _TREND_SIGNALS_VERSION,
+        enrich_rows_with_trends as _enrich_rows_with_trends,
+    )
+    logger.info(
+        "[advanced_analysis v%s] trend signals bound (core.analysis.trend_signals v%s)",
+        ADVANCED_ANALYSIS_VERSION, _TREND_SIGNALS_VERSION,
+    )
+except Exception as _trend_err:
+    _enrich_rows_with_trends = None  # type: ignore
+    _TREND_SIGNALS_VERSION = None
+    logger.info(
+        "[advanced_analysis v%s] core.analysis.trend_signals unavailable (%s); "
+        "opportunity pool will not be trend-enriched",
+        ADVANCED_ANALYSIS_VERSION, _trend_err,
     )
 
 
@@ -2560,6 +2610,22 @@ async def opportunity_candidates_post(
             pool_limit=pool_limit, mode=mode or _strip(merged_body.get("mode")),
         )
 
+    # v4.9.0 [TREND-ADD]: cross-sectional sector-trend enrichment (env-gated
+    # inside the module; default OFF -> rows pass through untouched).
+    trends_meta: Dict[str, Any] = {"enabled": False, "bound": False}
+    if _enrich_rows_with_trends is not None:
+        try:
+            pool_rows, trends_meta = _enrich_rows_with_trends(pool_rows)
+            trends_meta = dict(trends_meta or {})
+            trends_meta["bound"] = True
+        except Exception as _te:
+            logger.warning(
+                "[advanced_analysis v%s] trend enrichment raised %s: %s — pool used unenriched",
+                ADVANCED_ANALYSIS_VERSION, _te.__class__.__name__, _te,
+            )
+            trends_meta = {"enabled": False, "bound": True,
+                           "error": "{}: {}".format(_te.__class__.__name__, str(_te)[:160])}
+
     provider_health = await _extract_provider_health_snapshot()
     engine_version = provider_health.get("engine_version") if isinstance(provider_health, Mapping) else None
 
@@ -2621,6 +2687,7 @@ async def opportunity_candidates_post(
         "request_id": request_id,
         "dispatch": "opportunity_candidates",
         "pool": {"source": pool_source, "count": len(pool_rows), "pool_limit": pool_limit},
+        "trends": _json_safe(trends_meta),
         "duration_ms": round((time.time() - start) * 1000.0, 3),
     }
     return _json_safe(payload)
