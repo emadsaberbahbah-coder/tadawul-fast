@@ -2,11 +2,30 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.7.1
+ADVISOR ROUTER — v6.7.2
 ================================================================================
 SPECIAL-PAGE PROXY-FIRST • ROOT/ANALYSIS ALIGNED • SHORT-ADVISOR HARDENED •
 JSON-SAFE • GET+POST SAFE • FAIL-SOFT • CONTRACT-PROJECTED • ENGINE-TOLERANT
 DIAGNOSTIC-EMITTING • V2.6.0-ALIGNED • UPSTREAM-META-PRESERVING
+
+v6.7.2 changes (from v6.7.1)
+----------------------------
+[FIX-10 MY_PORTFOLIO DECISION-BLOCK ENRICHMENT — HIGH] My_Portfolio is a
+    BASE_PAGE, so _run_advisor_logic resolves it via the analysis bridge FIRST
+    (first-win). But the engine's get_sheet_rows is the ONLY path that runs the
+    portfolio-decision pass (_compute_portfolio_fields: Position Cost / Value /
+    Unrealized P/L / % via engine Fix AF v5.85.4, plus Actual/Target Weight %,
+    Weight Gap, Rebalance Action, Investor Decision), and that path is never
+    reached for My_Portfolio. Live result: Position Qty + Avg Cost populate while
+    every derived position column AND the weight/action/decision columns are
+    blank on every holding. _ensure_tabular_shape now runs the engine's OWN
+    _compute_portfolio_fields on the projected My_Portfolio rows (display-header
+    rows translated to snake_case via the engine's canonical header<->key lists,
+    then computed values written back fill-only). Resolver-agnostic (every
+    resolver funnels through _ensure_tabular_shape), zero logic duplication, and
+    fully fail-soft (engine-import guard: if core.data_engine_v2 is unavailable
+    the bridge behaves exactly as in v6.7.1). My_Portfolio only -- every other
+    page is byte-identical.
 
 v6.7.0 changes (from v6.6.0)
 ----------------------------
@@ -121,7 +140,7 @@ if _advisor_debug_enabled():
         pass
 
 
-ADVISOR_VERSION = "6.7.1"
+ADVISOR_VERSION = "6.7.2"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 DEFAULT_ADVISOR_PAGE = "Top_10_Investments"
@@ -219,6 +238,74 @@ except Exception:
     is_open_mode = None  # type: ignore
     def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
+
+# =============================================================================
+# v6.7.2 [FIX-10]: My_Portfolio portfolio-decision enrichment bridge.
+# -----------------------------------------------------------------------------
+# My_Portfolio is a BASE_PAGE, so _run_advisor_logic resolves it via the
+# analysis bridge FIRST (first-win), and the engine's get_sheet_rows -- the ONLY
+# place that runs the portfolio-decision pass (_compute_portfolio_fields:
+# position_cost/value/unrealized_pl/pct via engine Fix AF, plus actual_weight,
+# weight_gap, action_flag, decision) -- is never reached. Result on the live
+# sheet: Position Qty + Avg Cost populate but Position Cost / Value / Unrealized
+# P/L / % AND the weight/action/decision columns are blank on every holding.
+#
+# Rather than re-route (risk: the engine's external-rows reader may differ from
+# the bridge's on the backend, which could change WHICH holdings show) or
+# duplicate the decision logic here (maintenance landmine), we import the
+# engine's OWN _compute_portfolio_fields and run the resolved rows through it
+# inside _ensure_tabular_shape -- so ANY resolver's My_Portfolio output gets the
+# portfolio block computed, the working holdings list is preserved, and there is
+# zero logic duplication. Fully guarded: if the engine import fails the bridge
+# stays exactly as-is (no enrichment, no crash). Header<->key translation is
+# built from the engine's own canonical lists (the source of truth), normalized
+# (strip+lower) so minor header-string drift can't silently break it.
+# =============================================================================
+try:
+    from core.data_engine_v2 import (  # type: ignore
+        _compute_portfolio_fields as _engine_compute_portfolio_fields,
+        INSTRUMENT_CANONICAL_HEADERS as _ENGINE_INSTRUMENT_HEADERS,
+        INSTRUMENT_CANONICAL_KEYS as _ENGINE_INSTRUMENT_KEYS,
+        MY_PORTFOLIO_EXTRA_HEADERS as _ENGINE_MP_EXTRA_HEADERS,
+        MY_PORTFOLIO_EXTRA_FIELDS as _ENGINE_MP_EXTRA_FIELDS,
+    )
+    _ENGINE_PORTFOLIO_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _engine_compute_portfolio_fields = None  # type: ignore
+    _ENGINE_INSTRUMENT_HEADERS = []  # type: ignore
+    _ENGINE_INSTRUMENT_KEYS = []  # type: ignore
+    _ENGINE_MP_EXTRA_HEADERS = {}  # type: ignore
+    _ENGINE_MP_EXTRA_FIELDS = ()  # type: ignore
+    _ENGINE_PORTFOLIO_AVAILABLE = False
+
+
+def _norm_header_(h: Any) -> str:
+    return str(h).strip().lower() if h is not None else ""
+
+
+def _build_mp_header_key_map() -> Dict[str, str]:
+    """v6.7.2 [FIX-10]: normalized display-header -> canonical snake_case key
+    map for My_Portfolio (115 instrument + 7 portfolio-decision), built from the
+    engine's own canonical lists so it can never drift from the engine."""
+    m: Dict[str, str] = {}
+    n = min(len(_ENGINE_INSTRUMENT_HEADERS), len(_ENGINE_INSTRUMENT_KEYS))
+    for i in range(n):
+        h = _norm_header_(_ENGINE_INSTRUMENT_HEADERS[i])
+        if h:
+            m[h] = _ENGINE_INSTRUMENT_KEYS[i]
+    for k in _ENGINE_MP_EXTRA_FIELDS:
+        h = _norm_header_(_ENGINE_MP_EXTRA_HEADERS.get(k))
+        if h:
+            m[h] = k
+    return m
+
+
+_MP_HEADER_KEY_MAP: Dict[str, str] = _build_mp_header_key_map() if _ENGINE_PORTFOLIO_AVAILABLE else {}
+# keys the engine portfolio pass COMPUTES (fill back onto blank display cells only)
+_MP_COMPUTED_KEYS: Tuple[str, ...] = (
+    "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
+    "target_weight", "actual_weight", "weight_gap", "action_flag", "decision",
+)
 
 _SCHEMA_HEADERS_CACHE: Dict[str, List[str]] = {}
 AUTH_ENV_TOKEN_NAMES: Tuple[str, ...] = (
@@ -983,11 +1070,78 @@ def _project_to_contract_headers(*, page: str, headers: List[str], row_objects: 
     return effective_headers, row_objects, rows_matrix
 
 
+def _enrich_my_portfolio_portfolio_fields(*, headers: List[str], row_objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """v6.7.2 [FIX-10]: run the engine's OWN _compute_portfolio_fields on the
+    resolved My_Portfolio rows so the position math (Position Cost / Value /
+    Unrealized P/L / %) AND the decision block (Target/Actual Weight %, Weight
+    Gap, Rebalance Action, Investor Decision) populate regardless of which
+    resolver served the rows -- the engine path is the ONLY place these are
+    computed, and the bridge that wins for My_Portfolio does not compute them.
+
+    row_objects are keyed by DISPLAY HEADERS. We translate to snake_case via the
+    engine's own header->key map, run the engine pass (cross-sectional -- it needs
+    the whole holdings list to compute weights), then write each COMPUTED value
+    back onto its display header. FILL-ONLY (never overwrites a value a resolver
+    already supplied) and fully FAIL-SOFT: engine unavailable, empty rows, header
+    drift, or any exception simply returns row_objects untouched."""
+    if not (_ENGINE_PORTFOLIO_AVAILABLE and _engine_compute_portfolio_fields and row_objects):
+        return row_objects
+    hk = _MP_HEADER_KEY_MAP
+    if not hk:
+        return row_objects
+    try:
+        # display-header rows -> snake_case rows the engine understands
+        snake_rows: List[Dict[str, Any]] = []
+        for ro in row_objects:
+            sr: Dict[str, Any] = {}
+            for h, v in ro.items():
+                k = hk.get(_norm_header_(h))
+                if k:
+                    sr[k] = v
+            snake_rows.append(sr)
+        # cross-sectional engine pass: mutates snake_rows in place, never raises
+        _engine_compute_portfolio_fields(snake_rows)
+        # normalized-header -> actual display header (as present on the rows)
+        norm_to_display: Dict[str, str] = {}
+        for h in (headers or []):
+            norm_to_display[_norm_header_(h)] = h
+        # computed snake key -> normalized header (from the engine's own map)
+        key_to_norm_header: Dict[str, str] = {}
+        for hnorm, k in hk.items():
+            key_to_norm_header.setdefault(k, hnorm)
+        # write computed values back onto blank display cells (fill-only)
+        for ro, sr in zip(row_objects, snake_rows):
+            for ck in _MP_COMPUTED_KEYS:
+                hnorm = key_to_norm_header.get(ck)
+                if not hnorm:
+                    continue
+                disp = norm_to_display.get(hnorm)
+                if not disp:
+                    continue
+                val = sr.get(ck)
+                if val is None:
+                    continue
+                cur = ro.get(disp)
+                if cur is None or cur == "":
+                    ro[disp] = val
+    except Exception:  # pragma: no cover - never break the response over enrichment
+        return row_objects
+    return row_objects
+
+
 def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any]:
     effective_headers: List[str] = _effective_headers_from_result(result)
     object_rows: List[Dict[str, Any]] = _extract_object_rows_any(result)
     matrix_rows: List[List[Any]] = _extract_matrix_rows_any(result)
     effective_headers, object_rows, matrix_rows = _project_to_contract_headers(page=page, headers=effective_headers, row_objects=object_rows, rows_matrix=matrix_rows)
+    # v6.7.2 [FIX-10]: compute the My_Portfolio portfolio-decision block (position
+    # math + weights + action + decision) on the projected rows via the engine's
+    # own pass, then rebuild the matrix so rows_matrix reflects the filled values.
+    # Resolver-agnostic (every resolver funnels through here) and fill-only.
+    if page == "My_Portfolio" and object_rows:
+        object_rows = _enrich_my_portfolio_portfolio_fields(headers=effective_headers, row_objects=object_rows)
+        if effective_headers:
+            matrix_rows = _mapping_list_to_rows(object_rows, effective_headers)
     result["headers"] = effective_headers
     result["keys"] = list(effective_headers)
     result["display_headers"] = list(effective_headers)
