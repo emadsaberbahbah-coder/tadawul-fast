@@ -105,7 +105,28 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.2"
+OPPORTUNITY_BUILDER_VERSION = "1.0.3"
+
+# ---------------------------------------------------------------------------
+# v1.0.3 [FORECAST-GATE] — engine-forecast safety gate (env-gated, default ON)
+# ---------------------------------------------------------------------------
+# ROOT CAUSE (live 2026-06-13): a name can screen as a top INVEST ticket on
+# pure VALUATION upside — roi_pct = (target/intrinsic - price)/price — while
+# the engine's own 12-month forecast points DOWN. 4321.SR ranked #1 with a
+# "136% ROI" tag (intrinsic ~136% above price) even though Expected ROI 12M
+# was -20% and the source page rated it SELL. The engine forecast WAS
+# extracted (engine_roi_12m_pct) and carried in detail, but used in NO gate,
+# so a value-trap could become a sized BUY.
+#
+# FIX (preserves L5 — valuation stays the roi_pct basis; the engine forecast
+# is NOT substituted into roi_pct): a new "Forecast" gate fails MAJOR (=>
+# DO_NOT_INVEST, so the name appears in the audit / near-miss but never as a
+# selected ticket) when the engine 12M forecast ROI is below
+# min_engine_roi_pct. Default floor 0% blocks only names the engine forecasts
+# to LOSE money; Unknown forecast passes (News/Sector convention). The gate is
+# env-toggled by TFB_OPP_FORECAST_GATE (default ON) — set it to 0 to restore
+# byte-identical v1.0.2 behavior — and the floor is tunable via
+# TFB_OPP_MIN_ENGINE_ROI_PCT. Every other byte is carried forward verbatim.
 
 # ---------------------------------------------------------------------------
 # §4.1 control-panel defaults (mirrors _Lists_Config TFB_PANEL_DEFAULTS T10:*)
@@ -139,12 +160,15 @@ DEFAULT_CRITERIA = {
     "stop_max_pct": 35.0,
     "pf_max_sector_pct": 30.0,
     "max_candidates": 0,
+    # v1.0.3 forecast safety gate (env-tunable; see policy block)
+    "forecast_gate_enabled": True,
+    "min_engine_roi_pct": 0.0,
 }
 
 _CRITERIA_FLOAT_KEYS = (
     "required_roi_pct", "required_ann_roi_pct", "min_reliability", "min_dq",
     "min_rr", "max_weight_pct", "stop_floor_pct", "stop_vol_mult",
-    "stop_max_pct", "pf_max_sector_pct",
+    "stop_max_pct", "pf_max_sector_pct", "min_engine_roi_pct",
 )
 _CRITERIA_INT_KEYS = (
     "max_selected", "period_months", "max_per_sector", "max_per_market",
@@ -152,7 +176,7 @@ _CRITERIA_INT_KEYS = (
 )
 _CRITERIA_BOOL_KEYS = (
     "allow_conflict", "allow_negative_news", "allow_negative_sector",
-    "include_portfolio_holdings",
+    "include_portfolio_holdings", "forecast_gate_enabled",
 )
 
 # ---------------------------------------------------------------------------
@@ -189,9 +213,9 @@ DIVERSIFICATION_NO_CONTEXT = 60.0
 
 # §4.2 gate evaluation order (first fail in this order = headline failed_gate)
 GATE_ORDER = (
-    "Price", "FX", "Valuation", "ROI", "Annualized ROI", "Reliability",
-    "Data Quality", "Risk Level", "Risk/Reward", "Conflict", "News",
-    "Sector Trend", "Portfolio",
+    "Price", "FX", "Valuation", "ROI", "Annualized ROI", "Forecast",
+    "Reliability", "Data Quality", "Risk Level", "Risk/Reward", "Conflict",
+    "News", "Sector Trend", "Portfolio",
 )
 
 FAIL_MAJOR = "MAJOR"
@@ -255,6 +279,13 @@ def _env_enabled():
         "0", "false", "no", "off")
 
 
+def _env_forecast_gate():
+    """v1.0.3: engine-forecast safety gate toggle. Default ON; set
+    TFB_OPP_FORECAST_GATE=0 to restore byte-identical v1.0.2 behavior."""
+    return str(_env_str("TFB_OPP_FORECAST_GATE", "1")).strip().lower() not in (
+        "0", "false", "no", "off")
+
+
 def _env_overrides():
     """Mechanics block of criteria, env-tunable (policy block)."""
     return {
@@ -276,6 +307,10 @@ def _env_overrides():
                                    DEFAULT_CRITERIA["max_candidates"]),
         "pf_max_sector_pct": _env_float("TFB_OPP_PF_MAX_SECTOR_PCT",
                                         DEFAULT_CRITERIA["pf_max_sector_pct"]),
+        "min_engine_roi_pct": _env_float(
+            "TFB_OPP_MIN_ENGINE_ROI_PCT",
+            DEFAULT_CRITERIA["min_engine_roi_pct"]),
+        "forecast_gate_enabled": _env_forecast_gate(),
     }
 
 
@@ -638,6 +673,21 @@ def _gate(name, passed, fail_class, current, required, note=None):
             "current": current, "required": required, "note": note}
 
 
+def _engine_roi_to_pct(value):
+    """v1.0.3: normalize the engine 12M forecast ROI to a PERCENT for the
+    Forecast gate. Providers deliver it either as a ratio (e.g. -0.20) or a
+    percent (e.g. -20.0); |v| < 1.5 is treated as a ratio and scaled x100. The
+    sign — the only thing the default 0% floor depends on — is preserved
+    either way. Returns None when absent so 'Unknown passes'."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v * 100.0 if abs(v) < 1.5 else v
+
+
 def evaluate_gates(cand, criteria, held_symbols=None):
     """Per-row §4.2 gates in plan order. Diversification is selection-time
     (handled in the pick loop) and intentionally absent here."""
@@ -667,6 +717,24 @@ def evaluate_gates(cand, criteria, held_symbols=None):
     g.append(_gate("Annualized ROI", ann_ok, FAIL_NON_CRITICAL,
                    _round1(cand["ann_roi_pct"]),
                    ">= " + _fmt_num(criteria["required_ann_roi_pct"]) + "%"))
+
+    # v1.0.3 [FORECAST-GATE]: a "best investments to BUY" surface must never
+    # size a ticket the engine itself forecasts to fall. roi_pct is VALUATION
+    # upside (target/intrinsic vs price) and can disagree with the engine's
+    # 12M forecast; when the forecast is below the floor this gate fails MAJOR
+    # => DO_NOT_INVEST, so the name can appear in the audit / near-miss but
+    # never as a selected ticket. Unknown forecast passes (News/Sector
+    # convention). Floor default 0% blocks only forecast LOSSES; tune via
+    # min_engine_roi_pct. Appended ONLY when forecast_gate_enabled, so the gate
+    # list and verdict are byte-identical to v1.0.2 when TFB_OPP_FORECAST_GATE=0.
+    if criteria.get("forecast_gate_enabled"):
+        fcst_pct = _engine_roi_to_pct(cand.get("engine_roi_12m_pct"))
+        fcst_floor = criteria.get("min_engine_roi_pct", 0.0)
+        fcst_ok = fcst_pct is None or fcst_pct >= fcst_floor
+        g.append(_gate(
+            "Forecast", fcst_ok, FAIL_MAJOR,
+            ("Unknown" if fcst_pct is None else _round1(fcst_pct)),
+            ">= " + _fmt_num(fcst_floor) + "% engine 12M (Unknown passes)"))
 
     rel = cand["reliability"]
     min_rel = criteria["min_reliability"]
