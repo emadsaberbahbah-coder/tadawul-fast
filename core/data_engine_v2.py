@@ -2,8 +2,62 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.85.3
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.85.4
 ================================================================================
+
+WHY v5.85.4 - MY_PORTFOLIO POSITION MATH ON THE EXTERNAL-ROWS PATH (Fix AF)
+-------------------------------------------------------------------------------
+THE GAP (live My_Portfolio dump, 2026-06-13): every holding showed Position Qty
+and Avg Cost populated (the cost-basis seed lands correctly) while Position Cost,
+Position Value, Unrealized P/L and Unrealized P/L % were BLANK on every row. The
+weight columns (Actual Weight %, Weight Gap) were starved too, because the
+cross-sectional pass derives them from position_value.
+
+ROOT CAUSE: the per-row position math (position_cost/value/unrealized_pl/pct) is
+implemented ONLY inside _canonicalize_provider_row. That function runs on
+PROVIDER patches -- which never carry the user's manual position_qty / avg_cost
+(those are sheet-entered) -- and only on the engine-fetch factory path. But
+My_Portfolio is served through the EXTERNAL-ROWS path in get_sheet_rows: the
+manual Qty + Avg Cost arrive on the Google-Sheet row and are correctly PRESERVED
+through the merge (they sit in _V577_MANUAL_FIELDS, deliberately excluded from
+the live-overwrite whitelist) -- but nothing downstream ever multiplied them out.
+_compute_portfolio_fields then READ position_value to compute weights while never
+computing it, so position_value stayed blank, total_mv summed to 0, and
+actual_weight / weight_gap came out blank as well. The decision page
+(portfolio-actions route) was unaffected because it computes its own P&L; this
+gap only ever showed on the My_Portfolio holdings page itself.
+
+THE FIX (Fix AF): a new _compute_position_math(row) fills the four derived
+position columns from position_qty + avg_cost + current_price, with formulas and
+UNITS identical to _canonicalize_provider_row (position_value = qty*price,
+position_cost = qty*avg_cost, unrealized_pl = value - cost, unrealized_pl_pct =
+(pl/cost)*100 percent points) so a row computed here is byte-identical to one
+computed on the engine-fetch path -- the same field can never carry two scales.
+It is fill-only (never overwrites a value already present) and fail-open (missing
+qty / cost / price simply leaves the dependent column blank, never raises). It is
+called per-row at the TOP of _compute_portfolio_fields, BEFORE the total_mv loop,
+so the weight pass then sees real position_value. _compute_portfolio_fields runs
+ONLY for My_Portfolio (in get_sheet_rows after projection, and in get_page_rows),
+so every other page is byte-identical to v5.85.3. NO schema change (My_Portfolio
+stays 122; no new column). NO recommendation, gate, reliability, or scoring
+change.
+
+SCOPE NOTE (honest): this fixes the ENGINE path. If the advisor route that serves
+My_Portfolio builds and projects rows ITSELF and bypasses the engine's portfolio
+pass (the same registry-first bypass pattern documented in the Fix AD-2 / AE WHY
+blocks for the analysis route), the four columns could still read blank after
+deploy -- in which case the same _compute_position_math call must be added on the
+advisor route. The engine fix is necessary either way; confirm via the live dump.
+
+VALIDATION (post-deploy)
+  - My_Portfolio holdings (e.g. RCI.US qty 50 / avg cost 37.04): Position Cost
+    1852.00, Position Value = 50 x live price, Unrealized P/L and % populated and
+    consistent (value - cost; (pl/cost)*100).
+  - A holding with no live current_price yet shows Position Cost but blank
+    Position Value / P/L (fail-open, no error); a row with no qty is untouched.
+  - Actual Weight % / Weight Gap now populate because total_mv > 0.
+  - Every non-My_Portfolio page is byte-identical to v5.85.3.
+  - /health: version 5.85.4; schema still 115 (My_Portfolio 122).
 
 WHY v5.85.3 - REGISTRY LOOKUP ACTUALLY FINDS THE REGISTRY (Fix AE)
 -------------------------------------------------------------------------------
@@ -1685,7 +1739,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.85.3"
+__version__ = "5.85.4"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5023,17 +5077,80 @@ def _portfolio_rebalance_action(gap: Optional[float], band: float) -> str:
     return "HOLD"
 
 
+def _compute_position_math(row: Dict[str, Any]) -> None:
+    """v5.85.4 (Fix AF): fill the four DERIVED position columns
+    (position_cost, position_value, unrealized_pl, unrealized_pl_pct) from the
+    manually-entered position_qty + avg_cost and the live current_price.
+
+    WHY THIS EXISTS
+    ---------------
+    The per-row position math already lives in _canonicalize_provider_row, but
+    that runs on PROVIDER patches (which never carry the manual qty/cost) and
+    ONLY on the engine-fetch factory path. My_Portfolio is served through the
+    EXTERNAL-ROWS path in get_sheet_rows: the user's Position Qty + Avg Cost
+    arrive on the Google-Sheet row and are correctly PRESERVED through the merge
+    (they sit in _V577_MANUAL_FIELDS, deliberately excluded from the live
+    overwrite) -- but NOTHING downstream ever multiplied them out. So on the
+    deployed sheet every holding showed Position Qty + Avg Cost populated while
+    Position Cost / Position Value / Unrealized P/L / Unrealized P/L % were blank
+    on every row, AND because position_value was blank the cross-sectional weight
+    pass below saw total_mv == 0 and left actual_weight / weight_gap blank too.
+    This helper closes that gap.
+
+    CONTRACT
+    --------
+    Fill-only (never overwrites a value the sheet/provider already supplied) and
+    fail-open (a missing qty / cost / price simply leaves the dependent column
+    blank, never raises). The formulas + UNITS mirror _canonicalize_provider_row
+    EXACTLY, so a row computed here is identical to one computed on the
+    engine-fetch path -- the same field can therefore never carry two different
+    scales depending on which path served the row:
+        position_value     = qty * current_price
+        position_cost      = qty * avg_cost
+        unrealized_pl      = position_value - position_cost
+        unrealized_pl_pct  = (unrealized_pl / position_cost) * 100.0   (percent points)
+    """
+    if not isinstance(row, dict):
+        return
+    qty = _as_float(row.get("position_qty"))
+    avg_cost = _as_float(row.get("avg_cost"))
+    price = _as_float(row.get("current_price"))
+    if price is None:
+        price = _as_float(row.get("price"))
+    if qty is not None and price is not None and _as_float(row.get("position_value")) is None:
+        row["position_value"] = round(qty * price, 6)
+    if qty is not None and avg_cost is not None and _as_float(row.get("position_cost")) is None:
+        row["position_cost"] = round(qty * avg_cost, 6)
+    pos_val = _as_float(row.get("position_value"))
+    pos_cost = _as_float(row.get("position_cost"))
+    if pos_val is not None and pos_cost is not None and _as_float(row.get("unrealized_pl")) is None:
+        row["unrealized_pl"] = round(pos_val - pos_cost, 6)
+    upl = _as_float(row.get("unrealized_pl"))
+    if upl is not None and pos_cost not in (None, 0) and _as_float(row.get("unrealized_pl_pct")) is None:
+        row["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
+
+
 def _compute_portfolio_fields(rows: List[Dict[str, Any]]) -> None:
-    """v5.80.0: cross-sectional My_Portfolio pass. The per-row position math
-    (position_cost/value/unrealized_pl/pct) is already filled upstream; this
-    pass needs the WHOLE list to compute weights, so it runs once after the
-    per-row enrichment + gate. Fills target_weight (from config when the sheet
-    leaves it blank), actual_weight, weight_gap, action_flag (drift-only) and
-    decision (blended verdict). Weights are PERCENT POINTS. No-op on empty input;
-    never raises -- a bad row degrades to blank portfolio fields."""
+    """v5.80.0: cross-sectional My_Portfolio pass. v5.85.4 (Fix AF): the per-row
+    position math (position_cost/value/unrealized_pl/pct) is filled HERE first --
+    on the external-rows path that serves My_Portfolio nothing upstream computes
+    it (see _compute_position_math) -- because this pass needs position_value to
+    compute weights. Then, needing the WHOLE list, it fills target_weight (from
+    config when the sheet leaves it blank), actual_weight, weight_gap, action_flag
+    (drift-only) and decision (blended verdict). Weights are PERCENT POINTS. No-op
+    on empty input; never raises -- a bad row degrades to blank portfolio fields."""
     if not rows:
         return
     try:
+        # v5.85.4 (Fix AF): fill the four derived position columns from the
+        # manual qty/cost + live price BEFORE the total_mv loop below, which
+        # reads position_value. On the external-rows path nothing else multiplies
+        # the sheet's Position Qty x Avg Cost / current_price, so without this the
+        # holdings page showed blank Position Cost / Value / Unrealized P/L and
+        # the weight columns starved on total_mv == 0. Fill-only + fail-open.
+        for r in rows:
+            if isinstance(r, dict):
+                _compute_position_math(r)
         targets = _portfolio_target_weights()
         band = _portfolio_rebalance_band_pp()
         weak = _portfolio_weak_score_threshold()
@@ -9788,7 +9905,7 @@ class DataEngineV5:
             "scoring_contract_version": _SCORING_CONTRACT_VERSION,
             "reco_normalize_contract_version": _RECO_NORMALIZE_CONTRACT_VERSION,
             "valuation_model": {
-                "version": "v5.85.3",  # v5.85.3 REGISTRY LOOKUP ACTUALLY FINDS THE REGISTRY (Fix AE: _registry_sheet_lookup gains the registry's real API name get_sheet_spec, and _schema_columns_from_any reads tuple-of-ColumnSpec specs -- the engine had silently projected with its static legacy contract since the registry integration was written, which the v2.15.0 market realignment exposed; engine projections now follow the live registry). v5.85.2 ANALYST/TREND FIELDS SURVIVE THE EXTERNAL-ROWS MERGE (Fix AD-3: the 8 analyst/trend keys join _V577_LIVE_OVERWRITE_FIELDS so the fresh quote overwrites the sheet's blank/NaN cells on the external-rows path, and the block's fill-only blank check now treats float NaN + junk strings as blank -- closes the served None-with-tag contradiction the live trace exposed). v5.85.1 ANALYST/TREND BLOCK AT THE FACTORY (Fix AD-2: _apply_analyst_trend_block now also runs at the END of the enriched-quote factory pre-cache AND on the cache-hit return, because the registry-first route layer projects get_enriched_quotes rows itself and bypassed the v5.85.0 boundaries -- post-deploy spot check showed the 8 columns as None; boundary calls kept, fill-only + idempotent). v5.85.0 HISTORY-GAP BACKFILL + ANALYST/TREND OUTPUT BLOCK (Fix AC + AD, both env-gated default ON, both fill-only -- NO recommendation, verdict, reliability, scoring, or schema change; with both off the output is byte-identical to v5.84.0): (AC, TFB_HISTORY_GAP_BACKFILL) the orchestrator history-technicals trigger is gap-aware (fires when ANY of rsi_14/volatility_30d/volatility_90d/max_drawdown_1y/avg_volume_10d/avg_volume_30d is missing, was all-four-missing) and _fetch_yahoo_chart_patch + _fetch_history_patch pickers gain the yahoo_chart_provider's REAL entry-point names (fetch_price_history/fetch_history/fetch_ohlc_history/fetch_prices -- the v5.77.14 name-mismatch class on the chart side), closing the 2026-06-10 audit's 100%-blank Volatility 90D + Avg Volume 10D/30D on Market_Leaders (76/76) and Commodities_FX (75/75); (AD, TFB_ANALYST_TREND_BLOCK) _apply_analyst_trend_block at the _strict_project_row/get_page_rows boundaries (AFTER the gate) derives the eight schema-defined-but-never-emitted presentation columns -- analyst_rating<-provider_rating, target_price<-target_mean_price, upside_downside_pct (FRACTION, matches upside_pct), trend_1m/3m/12m UP/FLAT/DOWN from expected_roi_*m (+/-2% deadband, forecast_price fallback), signal BUY/NEUTRAL/SELL from _RECO_DIRECTION, st_signal RSI-extremes/candlestick/1M-momentum -- derivation-only, no provider calls, fill-only, fail-open, alias keys emitted, tag analyst_trend_block_applied (reliability-scan substring-safe). v5.84.0 DECISION-GOVERNANCE TRANSPARENCY TAGS (Fix AA, three independently env-gated phases, ALL tag-only/sanitization -- NO recommendation, verdict, reliability, or schema change; with all three off the output is byte-identical to v5.83.3): (AA-1, TFB_DIVERGENCE_TAG default ON, threshold TFB_DIVERGENCE_ROI_MIN=0.25) a sell-family (TRIM-direction) row whose signed governing forecast ROI (_gate_governing_forecast_roi, the Fix S helper) is >= +25% gets warnings tag bearish_reco_high_modeled_upside -- the bearish mirror of Fix S, marking the 114 GM + 4 ML score/forecast contradictions from the 2026-06-10 audit for review without flipping any recommendation; (AA-2, TFB_CONF_CLUSTER_TAG default ON, list TFB_CONF_CLUSTER_VALUES=66.41,64.82,63.23,58.0) a row whose confidence_score sits exactly on a configured formula-attractor value gets warnings tag confidence_default_suspected, making the audit's 900x66.41 / 583x64.82 Global_Markets clusters visible per-row without demoting (Fix S2 standing decision preserved); (AA-3, TFB_FC_SOURCE_TYPE_GUARD default ON) a junk forecast_source literal (digits-only / true/false/none/null/nan -- the audit's 4 GM rows reading "1") is cleared to blank + tagged fc_source_invalid_cleared BEFORE fc_src is consumed, narrow by construction. All three tags avoid the reliability-scan substrings (cap/forecast/target/roi/drop/reject) so repeat gate passes are byte-identical. v5.83.3 FORECAST-RELIABILITY RECALIBRATION (Fix S2, env-gated TFB_RELIABILITY_RECALIBRATION, default OFF -> forecast_reliability_score byte-identical to v5.83.2): _apply_investability_gate's reliability base optionally blends data_quality (0.7*forecast_confidence + 0.3*data_quality_score) and the soft-display-cap penalty for a provider target compressed to the Phase-II ceiling (_capped_to_phase_ii_ceiling) drops 20->5, while a DROPPED/REJECTED-as-implausible target still takes its independent -15; corrects the flat -20 that branded the highest-upside real-analyst names (NVDA/META/MSFT 46.4/46.4/44.8) as least reliable and pushed them below the 70 floor into Top_10 backfill (with the blend at dq=100 they land ~71.5/71.5/70.4). Adds NO column (schema 115). v5.80.0 PORTFOLIO & INSIGHTS DECISION LAYER: My_Portfolio 115->122 (this page only; +Buy Date/Target Weight %/Actual Weight %/Weight Gap/Rebalance Action/Investor Decision/User Notes, mirroring the Top_10 115+3 pattern); _compute_portfolio_fields fills actual_weight/weight_gap (PERCENT POINTS) + action_flag (drift-only ADD/HOLD/REDUCE/SELL) + decision (blended SELL/REDUCE/ADD/HOLD from drift+reco+forecast-sign+risk), target_weight seeded from TFB_PORTFOLIO_TARGETS (1120=40/4013=30/7020=30) when blank, band TFB_PORTFOLIO_REBALANCE_BAND_PP=5.0pp, weak floor TFB_PORTFOLIO_WEAK_SCORE=60; Insights_Analysis rebuilt from live portfolio+market data (Portfolio Summary/Allocation vs Target/Market Opportunities/Data Quality) replacing the 2-row stub; Top_10 eligibility now also requires INVESTABLE and rejects negative-forecast buy-family (closing the Fix S/Fix J seam). Market pages stay 115. Pairs with 00_Config.gs v1.12.3. v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
+                "version": "v5.85.4",  # v5.85.4 MY_PORTFOLIO POSITION MATH ON THE EXTERNAL-ROWS PATH (Fix AF): new _compute_position_math fills the four derived position columns (position_cost = qty*avg_cost, position_value = qty*current_price, unrealized_pl, unrealized_pl_pct in percent points) from the sheet's manual Position Qty + Avg Cost; called per-row at the TOP of _compute_portfolio_fields before the weight pass. Root cause: the position math lived only in _canonicalize_provider_row, which runs on provider patches (no manual qty/cost) and only on the engine-fetch path, while My_Portfolio is served via the EXTERNAL-ROWS path -- so qty/cost were preserved on the sheet row but never multiplied out, leaving Position Cost/Value/Unrealized P/L blank on every holding AND starving the weight columns (position_value blank -> total_mv 0 -> actual_weight/weight_gap blank). Fill-only + fail-open; formulas/units identical to _canonicalize_provider_row so both paths agree; runs only for My_Portfolio so every other page is byte-identical to v5.85.3. Adds NO column (My_Portfolio stays 122). v5.85.3 REGISTRY LOOKUP ACTUALLY FINDS THE REGISTRY (Fix AE: _registry_sheet_lookup gains the registry's real API name get_sheet_spec, and _schema_columns_from_any reads tuple-of-ColumnSpec specs -- the engine had silently projected with its static legacy contract since the registry integration was written, which the v2.15.0 market realignment exposed; engine projections now follow the live registry). v5.85.2 ANALYST/TREND FIELDS SURVIVE THE EXTERNAL-ROWS MERGE (Fix AD-3: the 8 analyst/trend keys join _V577_LIVE_OVERWRITE_FIELDS so the fresh quote overwrites the sheet's blank/NaN cells on the external-rows path, and the block's fill-only blank check now treats float NaN + junk strings as blank -- closes the served None-with-tag contradiction the live trace exposed). v5.85.1 ANALYST/TREND BLOCK AT THE FACTORY (Fix AD-2: _apply_analyst_trend_block now also runs at the END of the enriched-quote factory pre-cache AND on the cache-hit return, because the registry-first route layer projects get_enriched_quotes rows itself and bypassed the v5.85.0 boundaries -- post-deploy spot check showed the 8 columns as None; boundary calls kept, fill-only + idempotent). v5.85.0 HISTORY-GAP BACKFILL + ANALYST/TREND OUTPUT BLOCK (Fix AC + AD, both env-gated default ON, both fill-only -- NO recommendation, verdict, reliability, scoring, or schema change; with both off the output is byte-identical to v5.84.0): (AC, TFB_HISTORY_GAP_BACKFILL) the orchestrator history-technicals trigger is gap-aware (fires when ANY of rsi_14/volatility_30d/volatility_90d/max_drawdown_1y/avg_volume_10d/avg_volume_30d is missing, was all-four-missing) and _fetch_yahoo_chart_patch + _fetch_history_patch pickers gain the yahoo_chart_provider's REAL entry-point names (fetch_price_history/fetch_history/fetch_ohlc_history/fetch_prices -- the v5.77.14 name-mismatch class on the chart side), closing the 2026-06-10 audit's 100%-blank Volatility 90D + Avg Volume 10D/30D on Market_Leaders (76/76) and Commodities_FX (75/75); (AD, TFB_ANALYST_TREND_BLOCK) _apply_analyst_trend_block at the _strict_project_row/get_page_rows boundaries (AFTER the gate) derives the eight schema-defined-but-never-emitted presentation columns -- analyst_rating<-provider_rating, target_price<-target_mean_price, upside_downside_pct (FRACTION, matches upside_pct), trend_1m/3m/12m UP/FLAT/DOWN from expected_roi_*m (+/-2% deadband, forecast_price fallback), signal BUY/NEUTRAL/SELL from _RECO_DIRECTION, st_signal RSI-extremes/candlestick/1M-momentum -- derivation-only, no provider calls, fill-only, fail-open, alias keys emitted, tag analyst_trend_block_applied (reliability-scan substring-safe). v5.84.0 DECISION-GOVERNANCE TRANSPARENCY TAGS (Fix AA, three independently env-gated phases, ALL tag-only/sanitization -- NO recommendation, verdict, reliability, or schema change; with all three off the output is byte-identical to v5.83.3): (AA-1, TFB_DIVERGENCE_TAG default ON, threshold TFB_DIVERGENCE_ROI_MIN=0.25) a sell-family (TRIM-direction) row whose signed governing forecast ROI (_gate_governing_forecast_roi, the Fix S helper) is >= +25% gets warnings tag bearish_reco_high_modeled_upside -- the bearish mirror of Fix S, marking the 114 GM + 4 ML score/forecast contradictions from the 2026-06-10 audit for review without flipping any recommendation; (AA-2, TFB_CONF_CLUSTER_TAG default ON, list TFB_CONF_CLUSTER_VALUES=66.41,64.82,63.23,58.0) a row whose confidence_score sits exactly on a configured formula-attractor value gets warnings tag confidence_default_suspected, making the audit's 900x66.41 / 583x64.82 Global_Markets clusters visible per-row without demoting (Fix S2 standing decision preserved); (AA-3, TFB_FC_SOURCE_TYPE_GUARD default ON) a junk forecast_source literal (digits-only / true/false/none/null/nan -- the audit's 4 GM rows reading "1") is cleared to blank + tagged fc_source_invalid_cleared BEFORE fc_src is consumed, narrow by construction. All three tags avoid the reliability-scan substrings (cap/forecast/target/roi/drop/reject) so repeat gate passes are byte-identical. v5.83.3 FORECAST-RELIABILITY RECALIBRATION (Fix S2, env-gated TFB_RELIABILITY_RECALIBRATION, default OFF -> forecast_reliability_score byte-identical to v5.83.2): _apply_investability_gate's reliability base optionally blends data_quality (0.7*forecast_confidence + 0.3*data_quality_score) and the soft-display-cap penalty for a provider target compressed to the Phase-II ceiling (_capped_to_phase_ii_ceiling) drops 20->5, while a DROPPED/REJECTED-as-implausible target still takes its independent -15; corrects the flat -20 that branded the highest-upside real-analyst names (NVDA/META/MSFT 46.4/46.4/44.8) as least reliable and pushed them below the 70 floor into Top_10 backfill (with the blend at dq=100 they land ~71.5/71.5/70.4). Adds NO column (schema 115). v5.80.0 PORTFOLIO & INSIGHTS DECISION LAYER: My_Portfolio 115->122 (this page only; +Buy Date/Target Weight %/Actual Weight %/Weight Gap/Rebalance Action/Investor Decision/User Notes, mirroring the Top_10 115+3 pattern); _compute_portfolio_fields fills actual_weight/weight_gap (PERCENT POINTS) + action_flag (drift-only ADD/HOLD/REDUCE/SELL) + decision (blended SELL/REDUCE/ADD/HOLD from drift+reco+forecast-sign+risk), target_weight seeded from TFB_PORTFOLIO_TARGETS (1120=40/4013=30/7020=30) when blank, band TFB_PORTFOLIO_REBALANCE_BAND_PP=5.0pp, weak floor TFB_PORTFOLIO_WEAK_SCORE=60; Insights_Analysis rebuilt from live portfolio+market data (Portfolio Summary/Allocation vs Target/Market Opportunities/Data Quality) replacing the 2-row stub; Top_10 eligibility now also requires INVESTABLE and rejects negative-forecast buy-family (closing the Fix S/Fix J seam). Market pages stay 115. Pairs with 00_Config.gs v1.12.3. v5.79.7 NEGATIVE-FORECAST INVESTABILITY DEMOTION (Fix S): _apply_investability_gate demotes a BUY-family row (STRONG_BUY/BUY/ACCUMULATE) whose signed governing forecast ROI (12M preferred, 3M fallback, fraction units; derived from forecast_price vs current price when an expected_roi_* is absent) is strictly negative from INVESTABLE/INVEST to WATCHLIST/WATCH with block_reason "Negative forecast (expected ROI X.X%)"; the branch sits after the HOLD/moderate-DQ/incomplete-fundamentals branch and before the INVESTABLE else, so it ONLY ever demotes (never promotes/relaxes, adds NO column, schema 115); fail-open when no horizon is determinable; env TFB_GATE_BLOCK_NEGATIVE_ROI (default ON; 0/false/off restores the exact v5.79.6 verdict). v5.79.6 PROVIDER-NAME RESOLUTION (Fix R): ProviderRegistry canonicalizes a provider-alias map ('yahoo'/'yfinance' -> 'yahoo_chart') before lookup, the DEFAULT_PROVIDERS/DEFAULT_KSA_PROVIDERS/DEFAULT_GLOBAL_PROVIDERS lists name 'yahoo_chart' directly, and get() logs ONCE when a provider name fails to resolve. Root cause: the lists named 'yahoo' but the importable module is yahoo_chart_provider.py and the registry's candidate-suffix loop never tried _chart_provider, so get('yahoo') returned None and Yahoo was silently skipped on every page -- starving the KSA (.SR) and Commodities/FX (=F/=X) books of spot prices even though yahoo_chart.fetch_quote('2222.SR') returns 27.38/EXCELLENT. No schema/verdict/scoring change; schema 115. v5.79.5 GATE PRICE-COLUMN CONSISTENCY (Fix Q): _apply_investability_gate backfills current_price from the `price` alias before judging has_price, so an INVESTABLE/INVEST verdict can never sit next to a blank Current Price cell (closes the NBK.KW/GFH.KW/CPI.JSE/FOLD.US null-price-investable leak); a row with neither field still reads BLOCKED "Missing current price"; never overwrites an existing price, never changes a correct verdict; schema 115. v5.79.4 STRICT FINAL-APPROVAL TIER (Fix P, default OFF): _apply_investability_gate can DEMOTE a base-INVESTABLE/INVEST row to WATCHLIST/WATCH when it fails the audits' "Final rule" floors (dq>=80, forecast_reliability>=70, risk not HIGH, no unreviewed provider/engine conflict), writing "Strict gate: ..." into block_reason; never promotes/relaxes, adds NO column (schema 115), reversible via TFB_STRICT_INVEST_GATE (off) / TFB_STRICT_INVEST_DQ_MIN / TFB_STRICT_INVEST_RELIABILITY_MIN. Governance only, NOT prediction (backtest lives in scripts/track_performance.py). v5.79.3 PROVIDER-TARGET SOFT CAP (Fix O): _cap_provider_target_forecasts maps an over-ceiling provider target via a monotonic bounded soft compression (cap_abs + band*(1-exp(-excess/band)), default band 0.05) instead of a HARD clamp to +/-30%, so distinct out-of-band targets keep distinct ORDERED forecasts/ROIs and cross-sectional ranking no longer saturates; in-band targets untouched; env TFB_PROVIDER_TARGET_SOFT_CAP (default ON) / TFB_PROVIDER_TARGET_SOFT_CAP_BAND; warning tags + schema (115) unchanged. v5.79.2 GATE LABELING + DETECTION: (Fix M) final_decision_basis "Engine (provider conflict flagged)" instead of "(provider override)" since a conflict is flagged not acted on; (Fix N) fundamentals_apply also exempts rows whose industry is a fund-vehicle label (_GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES, exact-match) catching ETFs mislabeled Equity. schema unchanged 115. v5.79.1 GATE REFINEMENTS: (Fix K) provider_engine_conflict now compares canonical DIRECTION via _provider_rating_direction (provider_rating is TEXT in prod, so numeric-only path left it permanently FALSE); (Fix L) D/E+FCF gate requirement + DQ weights now asset-class-aware via _GATE_FUNDAMENTALS_EXEMPT_TOKENS (ETF/fund/commodity/FX/index exempt; equities incl banks/REITs unchanged). schema unchanged 115. v5.79.0 EODHD FUNDAMENTALS FALLBACK: _apply_eodhd_fundamentals_fallback fills blank debt_to_equity/free_cash_flow_ttm (+ other still-missing fundamentals) from EODHD's fundamentals endpoint AFTER Yahoo, BEFORE scoring/gate, fill-only, one extra call only on gap rows (env TFB_EODHD_FUNDAMENTALS_FALLBACK); schema unchanged 115. v5.78.0 INVESTABILITY GATE (schema 107->115; pairs w/ 00_Config.gs v1.11.0): _apply_investability_gate emits data_quality_score/forecast_reliability_score/provider_engine_conflict/conflict_type/final_decision_basis/investability_status/final_action/block_reason. PRIOR: v5.77.23 on v5.77.22: (Fix H) _reconcile_recommendation_family() now also refreshes a RICH position_size_hint whose direction contradicts the final reco (e.g. ACCUMULATE + "hold existing; no new capital") while preserving consistent rich hints; (Fix I) _classify_recommendation_8tier() forces a neutral HOLD when current_price is missing (not actionable); (Fix J) Top 10 build paths exclude missing-price and REDUCE/SELL/STRONG_SELL/AVOID rows. v5.77.22 base: (F) 52W range + rolling volume in _compute_history_patch_from_rows, (G) subunit GBX/GBp/ZAC/ILA market-cap normalization. v5.77.21 base: (C/D/E) reco-family reconciliation hardening; v5.77.20 base: (A/B) reconciliation + provider-target cap
                 "sectors_pe": len(_SECTOR_PE_MAP),
                 "sectors_pb": len(_SECTOR_PB_MAP),
             },
