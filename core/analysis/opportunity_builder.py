@@ -1,7 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.1   (TFB Final Execution Plan v5.0 — Phase P2)
+Version: 1.0.2   (TFB Final Execution Plan v5.0 — Phase P2)
+
+v1.0.2 [CONFLICT-PARSE FIX]: `_norm_conflict`'s free-text fallback matched
+"conflict" anywhere in the string, so descriptive negations — "No conflict",
+"no provider/engine conflict", "No Conflict Detected" — were read as conflict
+PRESENT and MAJOR-failed the Conflict gate (wrong DO_NOT_INVEST). Clean
+"Yes"/"No" already parsed correctly, so the live canonical's boolean
+`provider_engine_conflict` was unaffected; this hardens the path for any row
+that carries descriptive conflict text (e.g. an aliased `conflict_type`).
+Negation is now detected on the spaced original text so a genuine "notable
+conflict" still scores as a conflict. Bugfix, not env-gated (mirrors the GBp
+/100 precedent); only `_norm_conflict` changed.
 
 v1.0.1 [ALIAS-FIX, P3 integration finding]: the live 115-key canonical
 (schema_registry v2.13.0 / route v4.6.0) emits `forecast_reliability_score`,
@@ -94,7 +105,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.1"
+OPPORTUNITY_BUILDER_VERSION = "1.0.2"
 
 # ---------------------------------------------------------------------------
 # §4.1 control-panel defaults (mirrors _Lists_Config TFB_PANEL_DEFAULTS T10:*)
@@ -457,10 +468,19 @@ def _norm_conflict(v):
     nt = _norm_token(t)
     if nt in ("yes", "true", "1", "conflict", "flagged"):
         return True
-    if nt in ("no", "false", "0", "none", "clear", "ok"):
+    if nt in ("no", "false", "0", "none", "clear", "ok", "noconflict"):
         return False
-    # free-text flag fields: any mention of conflict counts
-    return "conflict" in nt or None
+    # free-text flag fields: a mention of "conflict" counts ONLY when it is
+    # not negated. Negation is checked on the spaced original (norm_token
+    # strips spaces, which would make "No conflict" indistinguishable from a
+    # real "conflict") so "notable conflict" stays a true conflict.
+    if "conflict" in nt:
+        low = " " + t.lower().replace("-", " ") + " "
+        negated = any(tok in low for tok in
+                      (" no ", " not ", " none ", " zero ", " without ",
+                       " free ", " absent "))
+        return False if negated else True
+    return None
 
 
 def _resolve_fx(currency_raw, fx_rates):
