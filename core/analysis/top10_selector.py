@@ -845,9 +845,26 @@ def _budget_timeout(base: float, deadline: Optional[float], floor: float = 0.5) 
 # the rows' existing scores; only the small finalist shortlist (~limit*3, see
 # _page_priority_symbol_limit) is ever hydrated, so 30/250 stays correct and safe.
 _FULL_UNIVERSE = _env_bool("TFB_TOP10_FULL_UNIVERSE", False)
+# v4.21.0 (Fix AF -- RESILIENT FETCH): live Render diagnosis showed Top_10
+# collapsing to 1 candidate while engine.get_sheet_rows(page, limit=20) returned
+# 20 full rows in seconds. Root cause: the selector fetches SOURCE_PAGE_LIMIT (80)
+# rows/page wrapped in a per-page wait_for; on a cold cache under Yahoo history
+# throttling the 80-row fetch (with ~60 uncached .SR names, each a throttled
+# retry) exceeds the page budget -> TimeoutError -> rows=[] -> the whole pool
+# collapses. TFB_TOP10_RESILIENT_FETCH lowers the per-page slice to a small
+# cache-friendly value (default 30, override TFB_TOP10_RESILIENT_PAGE_LIMIT) so
+# each page completes fast AND budget remains to cover all source pages. Default
+# OFF -> 80, byte-identical. Ignored under full-universe (operator owns that cost).
+_RESILIENT_FETCH = _env_bool("TFB_TOP10_RESILIENT_FETCH", False)
+_RESILIENT_PAGE_LIMIT = _env_int("TFB_TOP10_RESILIENT_PAGE_LIMIT", 30, minimum=5, maximum=200)
 _SRC_PAGE_MAX = 20000 if _FULL_UNIVERSE else 1000
 _SELECT_LIMIT_MAX = 20000 if _FULL_UNIVERSE else 200
-_SRC_PAGE_DFLT = 5000 if _FULL_UNIVERSE else 80
+if _FULL_UNIVERSE:
+    _SRC_PAGE_DFLT = 5000
+elif _RESILIENT_FETCH:
+    _SRC_PAGE_DFLT = _RESILIENT_PAGE_LIMIT
+else:
+    _SRC_PAGE_DFLT = 80
 _SELECT_LIMIT_DFLT = 3000 if _FULL_UNIVERSE else 50
 SOURCE_PAGE_LIMIT = _env_int("TOP10_SELECTOR_SOURCE_PAGE_LIMIT", _SRC_PAGE_DFLT, minimum=10, maximum=_SRC_PAGE_MAX)
 HYDRATION_SYMBOL_CAP = _env_int("TOP10_SELECTOR_HYDRATION_SYMBOL_CAP", 30, minimum=5, maximum=250)
