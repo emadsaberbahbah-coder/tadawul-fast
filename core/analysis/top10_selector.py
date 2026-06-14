@@ -782,6 +782,20 @@ def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 100000) -
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    # v4.20.0 (Fix AE): tri-state env flag reader (absent -> default), matching
+    # the data_engine_v2 convention so full-universe gating is consistent across
+    # the stack.
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 # v4.19.0 [FIX X-2]: defaults bumped to the live-proven values (Render env
 # 2026-06-11: ENGINE=20 / PAGE=30 / TOTAL=70). Env always wins; the bump
 # only protects deployments where the env vars are absent.
@@ -814,10 +828,31 @@ def _budget_timeout(base: float, deadline: Optional[float], floor: float = 0.5) 
     if rem is None:
         return base
     return max(floor, min(base, rem))
-SOURCE_PAGE_LIMIT = _env_int("TOP10_SELECTOR_SOURCE_PAGE_LIMIT", 80, minimum=10, maximum=1000)
+# v4.20.0 (Fix AE -- FULL-UNIVERSE SCAN): the selector's read/select ceilings
+# (SOURCE_PAGE_LIMIT max 1000, MAX_LIMIT max 200) bounded the candidate pool far
+# below the ~2,189-row live universe -- the root reason Top_10 "scanned 250"
+# while four pages held thousands. TFB_TOP10_FULL_UNIVERSE (default OFF) lifts
+# BOTH the ceilings AND the defaults for the READ path (SOURCE_PAGE_LIMIT) and
+# the RANK/SELECT path (MAX_LIMIT) in one switch, so the full universe is read
+# and ranked. When OFF every maximum/default below is identical to v4.19.0
+# (byte-identical). Explicit env vars still win within the (now higher) bounds.
+#
+# HYDRATION_SYMBOL_CAP is DELIBERATELY NOT scaled by full-universe. It bounds a
+# per-symbol fallback re-fetch loop (line ~2292: each iteration is a serial
+# engine call up to ENGINE_CALL_TIMEOUT_SEC), so a large value would risk a long
+# serial stall on the Render free tier whenever the batch quote path misses. The
+# full universe is *read* via SOURCE_PAGE_LIMIT and *ranked* via MAX_LIMIT using
+# the rows' existing scores; only the small finalist shortlist (~limit*3, see
+# _page_priority_symbol_limit) is ever hydrated, so 30/250 stays correct and safe.
+_FULL_UNIVERSE = _env_bool("TFB_TOP10_FULL_UNIVERSE", False)
+_SRC_PAGE_MAX = 20000 if _FULL_UNIVERSE else 1000
+_SELECT_LIMIT_MAX = 20000 if _FULL_UNIVERSE else 200
+_SRC_PAGE_DFLT = 5000 if _FULL_UNIVERSE else 80
+_SELECT_LIMIT_DFLT = 3000 if _FULL_UNIVERSE else 50
+SOURCE_PAGE_LIMIT = _env_int("TOP10_SELECTOR_SOURCE_PAGE_LIMIT", _SRC_PAGE_DFLT, minimum=10, maximum=_SRC_PAGE_MAX)
 HYDRATION_SYMBOL_CAP = _env_int("TOP10_SELECTOR_HYDRATION_SYMBOL_CAP", 30, minimum=5, maximum=250)
 MAX_SOURCE_PAGES = _env_int("TOP10_SELECTOR_MAX_SOURCE_PAGES", 5, minimum=1, maximum=20)
-MAX_LIMIT = _env_int("TOP10_SELECTOR_MAX_LIMIT", 50, minimum=1, maximum=200)
+MAX_LIMIT = _env_int("TOP10_SELECTOR_MAX_LIMIT", _SELECT_LIMIT_DFLT, minimum=1, maximum=_SELECT_LIMIT_MAX)
 EARLY_STOP_MULTIPLIER = _env_int("TOP10_SELECTOR_EARLY_STOP_MULTIPLIER", 6, minimum=2, maximum=20)
 EMERGENCY_SYMBOLS = [
     s for s in [x.strip() for x in os.getenv("TOP10_SELECTOR_EMERGENCY_SYMBOLS", "").replace(";", ",").split(",")] if s
