@@ -2580,7 +2580,20 @@ async def opportunity_candidates_post(
     criteria = _opp_criteria_from_body(merged_body.get("criteria"))
     fx_rates = merged_body.get("fx_rates") if isinstance(merged_body.get("fx_rates"), Mapping) else {}
     portfolio = merged_body.get("portfolio") if isinstance(merged_body.get("portfolio"), Mapping) else {}
-    pool_limit = max(1, min(500, _maybe_int(merged_body.get("pool_limit"), 60)))
+    # v8.12.0 (Fix AE -- FULL-UNIVERSE SCAN): pool_limit was clamped to a hard
+    # ceiling of 500, capping the candidate pool well below the ~2,189-row live
+    # universe even when the operator raised the panel's "Pool Limit" cell. The
+    # ceiling now follows TFB_TOP10_POOL_CEILING (explicit override) OR rises
+    # automatically to 20000 when TFB_TOP10_FULL_UNIVERSE is on, so the selector
+    # can ingest every page. Default (both unset) = 500, byte-identical clamp.
+    # NOTE: the panel "Pool Limit" operator cell still drives the actual count --
+    # set it to ~2200 (or blank to inherit the larger default) to scan all names.
+    _full_universe = (os.getenv("TFB_TOP10_FULL_UNIVERSE") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    _pool_ceiling = _maybe_int(os.getenv("TFB_TOP10_POOL_CEILING"), 20000 if _full_universe else 500)
+    if _pool_ceiling < 1:
+        _pool_ceiling = 20000 if _full_universe else 500
+    _pool_default = 3000 if _full_universe else 60
+    pool_limit = max(1, min(_pool_ceiling, _maybe_int(merged_body.get("pool_limit"), _pool_default)))
 
     if _build_opportunity_payload is None:
         return _json_safe({
