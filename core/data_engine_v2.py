@@ -1739,7 +1739,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.85.4"
+__version__ = "5.86.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -5688,6 +5688,15 @@ def _dedupe_keep_order(items: Sequence[Any]) -> List[Any]:
     return out
 
 
+def _page_dedupe_symbols_enabled() -> bool:
+    # v5.86.0 (Fix AE): gate for collapsing duplicate symbols within a page.
+    # Default OFF -> byte-identical (duplicates such as 3092.SR / 7030.SR /
+    # 4200.SR appearing twice on Market_Leaders from the portfolio overlay are
+    # left as-is). Set TFB_PAGE_DEDUPE_SYMBOLS=1 to emit one row per symbol.
+    raw = (os.getenv("TFB_PAGE_DEDUPE_SYMBOLS") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 def _page_catalog_candidates() -> List[Any]:
     modules: List[Any] = []
     for mod_path in ("core.sheets.page_catalog", "sheets.page_catalog"):
@@ -8654,6 +8663,21 @@ class DataEngineV5:
         return []
 
     async def _get_symbols_for_sheet_impl(self, page: str) -> List[str]:
+        # v5.86.0 (Fix AE): single dedup chokepoint for page symbols. Every
+        # public symbol accessor (get_page_symbols / list_symbols_for_page /
+        # get_sheet_symbols / ...) routes through here, so collapsing duplicates
+        # once fixes them on every page-build and Top_10 fallback path at the
+        # same time. Gated by TFB_PAGE_DEDUPE_SYMBOLS (default OFF -> the raw
+        # list is returned verbatim, byte-identical). My_Portfolio is EXEMPT:
+        # there a symbol can legitimately appear twice as two purchase lots, and
+        # collapsing them would corrupt position math. The duplicate-symbol bug
+        # this targets lives on the main equity pages (e.g. Market_Leaders).
+        _syms = await self._get_symbols_for_sheet_impl_raw(page)
+        if _page_dedupe_symbols_enabled() and _canonicalize_sheet_name(page) != "My_Portfolio":
+            return _dedupe_keep_order(_syms)
+        return _syms
+
+    async def _get_symbols_for_sheet_impl_raw(self, page: str) -> List[str]:
         canon = _canonicalize_sheet_name(page)
 
         reader = self._bind_symbols_reader()
