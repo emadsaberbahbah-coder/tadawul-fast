@@ -180,7 +180,7 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "8.2.1"
+INSIGHTS_BUILDER_VERSION = "8.3.0"
 # v8.2.1: coverage display-format fix. The Coverage / Data Quality rows emitted
 # their counts as "{n}/{d}" (e.g. "5/5"), which Google Sheets auto-coerces to a
 # date (M/D -> e.g. May 5 -> serial 46147) when the Value cell carries a number
@@ -501,6 +501,55 @@ def _split_csv(raw: str) -> List[str]:
 def _env_csv(name: str, default: str) -> List[str]:
     """Read a CSV-style environment variable."""
     return _split_csv(os.getenv(name, default))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """v8.3.0 (Fix AE): tri-state env flag reader (absent -> default)."""
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+# v8.3.0 (Fix AE): pages whose live symbols seed the insights equity universe.
+_INSIGHTS_EQUITY_PAGES_DEFAULT = "Market_Leaders,Global_Markets"
+
+
+def _insights_equity_universe_enabled() -> bool:
+    """v8.3.0 (Fix AE): gate for seeding the auto-universe from real equity
+    pages. Default OFF -> _default_universes() only (byte-identical)."""
+    return _env_bool("TFB_INSIGHTS_EQUITY_UNIVERSE", False)
+
+
+async def _resolve_equity_universes(engine: Any) -> Dict[str, List[str]]:
+    """v8.3.0 (Fix AE -- INSIGHTS EQUITY UNIVERSE): best-effort pull of the live
+    equity tickers from the engine's main pages so the insights snapshot covers
+    actual equities instead of only the 9 index/FX defaults (the root of the
+    "5 symbols scanned" symptom). Pages come from TFB_INSIGHTS_EQUITY_PAGES
+    (default Market_Leaders,Global_Markets). Any page that errors or returns
+    nothing is silently skipped; the per-universe symbol count is still bounded
+    downstream by max_symbols_per_universe and the build budget. Tolerates both
+    async and sync `list_symbols_for_page` engine variants."""
+    pages = _env_csv("TFB_INSIGHTS_EQUITY_PAGES", _INSIGHTS_EQUITY_PAGES_DEFAULT)
+    list_fn = getattr(engine, "list_symbols_for_page", None)
+    if not callable(list_fn):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for page in pages:
+        try:
+            res = list_fn(page)
+            if hasattr(res, "__await__"):
+                res = await res
+        except Exception:
+            res = None
+        syms = _dedupe_keep_order(res or [])
+        if syms:
+            out[page] = syms
+    return out
 
 
 def _compact_json(obj: Any) -> str:
@@ -2933,7 +2982,26 @@ async def build_insights_analysis_rows(
 
     auto_used = False
     if not effective_universes and engine and auto_universe_when_empty:
-        effective_universes.update(_default_universes())
+        # v8.3.0 (Fix AE -- INSIGHTS EQUITY UNIVERSE): the auto-resolve path used
+        # ONLY _default_universes() (9 index/FX symbols), so Insights_Analysis
+        # scanned a handful of names and never touched the ~2,189-row equity book
+        # -- the "5 symbols scanned" symptom. When TFB_INSIGHTS_EQUITY_UNIVERSE is
+        # on, also seed the live equity universe from the engine's main pages so
+        # the snapshot / risk / short-term sections see actual equities; the
+        # index/FX defaults are still kept (via setdefault) so macro/market rows
+        # keep rendering. Default OFF -> _default_universes() only, byte-identical.
+        if _insights_equity_universe_enabled():
+            try:
+                eq_universes = await _resolve_equity_universes(engine)
+            except Exception as exc:  # pragma: no cover - defensive
+                eq_universes = {}
+                warnings.append(f"Equity universe seed degraded: {exc}")
+            effective_universes.update(eq_universes)
+        if not effective_universes:
+            effective_universes.update(_default_universes())
+        else:
+            for _name, _seq in _default_universes().items():
+                effective_universes.setdefault(_name, _seq)
         auto_used = True
 
     build_ok = bool(engine) and bool(effective_universes)
