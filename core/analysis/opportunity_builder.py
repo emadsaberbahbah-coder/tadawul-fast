@@ -105,7 +105,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.3"
+OPPORTUNITY_BUILDER_VERSION = "1.0.4"
 
 # ---------------------------------------------------------------------------
 # v1.0.3 [FORECAST-GATE] — engine-forecast safety gate (env-gated, default ON)
@@ -127,6 +127,36 @@ OPPORTUNITY_BUILDER_VERSION = "1.0.3"
 # env-toggled by TFB_OPP_FORECAST_GATE (default ON) — set it to 0 to restore
 # byte-identical v1.0.2 behavior — and the floor is tunable via
 # TFB_OPP_MIN_ENGINE_ROI_PCT. Every other byte is carried forward verbatim.
+
+# ---------------------------------------------------------------------------
+# v1.0.4 [VALUATION-SANITY-GATE] — implausible-upside guard (env-gated, ON)
+# ---------------------------------------------------------------------------
+# ROOT CAUSE (live 2026-06-14): the ticket "ROI %" is pure valuation upside,
+# roi_pct = (ref - price)/price * 100 with ref = target_price (preferred) else
+# intrinsic_value. Both refs are produced upstream by the engine and are, for
+# a large swath of global names, systematically inflated: the engine's
+# intrinsic-value model is calibrated to permit fair value up to 3x price (its
+# _INTRINSIC_UPSIDE_MAX_PCT = 200) and estimates fair value from sector-average
+# P/E and P/B, so any name trading below its sector multiple screens as deeply
+# undervalued — hundreds of ordinary large-caps (VZ, HPQ, MKC, ...) show ~100%
+# "upside", and a separate analyst-target cluster sits at exactly 3x price
+# (200%). COL.MC surfaced as a 109.8% ticket (intrinsic 11.98 vs price 5.71).
+# The builder faithfully renders (ref-price)/price, so the garbage upstream
+# valuation flows straight onto the decision tickets.
+#
+# FIX (no change to the LOCKED engine; preserves L5 — valuation is still the
+# roi_pct basis and roi_pct itself is left intact for the audit grid): a new
+# "Valuation Sanity" gate fails MAJOR (=> DO_NOT_INVEST, so the name appears in
+# the audit / near-miss but is NEVER a selected ticket) when roi_pct exceeds
+# max_valuation_roi_pct. This catches BOTH inflated sources (intrinsic-based
+# and target-based) at the point the ticket is built. Default ceiling 80%
+# removes the implausible cluster while sparing genuine high-conviction value;
+# env-toggled by TFB_OPP_VALUATION_SANITY_GATE (default ON) — set it to 0 to
+# restore byte-identical v1.0.3 behavior — and the ceiling is tunable via
+# TFB_OPP_MAX_VALUATION_ROI_PCT. Every v1.0.3 byte is carried forward verbatim.
+# NOTE: this fixes the Top_10 decision page only; the same upstream inflation
+# also affects the engine's valuation/ROI columns on the market pages, which is
+# a separate (engine-side) change.
 
 # ---------------------------------------------------------------------------
 # §4.1 control-panel defaults (mirrors _Lists_Config TFB_PANEL_DEFAULTS T10:*)
@@ -163,12 +193,16 @@ DEFAULT_CRITERIA = {
     # v1.0.3 forecast safety gate (env-tunable; see policy block)
     "forecast_gate_enabled": True,
     "min_engine_roi_pct": 0.0,
+    # v1.0.4 valuation-sanity gate (env-tunable; see policy block)
+    "valuation_sanity_gate_enabled": True,
+    "max_valuation_roi_pct": 80.0,
 }
 
 _CRITERIA_FLOAT_KEYS = (
     "required_roi_pct", "required_ann_roi_pct", "min_reliability", "min_dq",
     "min_rr", "max_weight_pct", "stop_floor_pct", "stop_vol_mult",
     "stop_max_pct", "pf_max_sector_pct", "min_engine_roi_pct",
+    "max_valuation_roi_pct",
 )
 _CRITERIA_INT_KEYS = (
     "max_selected", "period_months", "max_per_sector", "max_per_market",
@@ -177,6 +211,7 @@ _CRITERIA_INT_KEYS = (
 _CRITERIA_BOOL_KEYS = (
     "allow_conflict", "allow_negative_news", "allow_negative_sector",
     "include_portfolio_holdings", "forecast_gate_enabled",
+    "valuation_sanity_gate_enabled",
 )
 
 # ---------------------------------------------------------------------------
@@ -286,6 +321,13 @@ def _env_forecast_gate():
         "0", "false", "no", "off")
 
 
+def _env_valuation_sanity_gate():
+    """v1.0.4: implausible-upside guard toggle. Default ON; set
+    TFB_OPP_VALUATION_SANITY_GATE=0 to restore byte-identical v1.0.3 behavior."""
+    return str(_env_str("TFB_OPP_VALUATION_SANITY_GATE", "1")).strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
 def _env_overrides():
     """Mechanics block of criteria, env-tunable (policy block)."""
     return {
@@ -311,6 +353,10 @@ def _env_overrides():
             "TFB_OPP_MIN_ENGINE_ROI_PCT",
             DEFAULT_CRITERIA["min_engine_roi_pct"]),
         "forecast_gate_enabled": _env_forecast_gate(),
+        "max_valuation_roi_pct": _env_float(
+            "TFB_OPP_MAX_VALUATION_ROI_PCT",
+            DEFAULT_CRITERIA["max_valuation_roi_pct"]),
+        "valuation_sanity_gate_enabled": _env_valuation_sanity_gate(),
     }
 
 
@@ -717,6 +763,24 @@ def evaluate_gates(cand, criteria, held_symbols=None):
     g.append(_gate("Annualized ROI", ann_ok, FAIL_NON_CRITICAL,
                    _round1(cand["ann_roi_pct"]),
                    ">= " + _fmt_num(criteria["required_ann_roi_pct"]) + "%"))
+
+    # v1.0.4 [VALUATION-SANITY-GATE]: the ticket roi_pct is pure valuation
+    # upside (ref/price); upstream the engine's intrinsic-value model permits
+    # fair value up to 3x price and a target cluster sits at exactly 3x, so a
+    # name can screen with an implausible 100-200% "upside". This gate fails
+    # MAJOR (=> DO_NOT_INVEST; appears in the audit / near-miss but never as a
+    # selected ticket) when roi_pct exceeds max_valuation_roi_pct, catching
+    # both inflated refs (intrinsic- and target-based) without altering roi_pct
+    # itself. Appended ONLY when valuation_sanity_gate_enabled, so the gate list
+    # and verdict are byte-identical to v1.0.3 when TFB_OPP_VALUATION_SANITY_GATE=0.
+    if criteria.get("valuation_sanity_gate_enabled"):
+        vmax = criteria.get("max_valuation_roi_pct", 80.0)
+        val_roi = cand["roi_pct"]
+        val_ok = val_roi is None or val_roi <= vmax
+        g.append(_gate(
+            "Valuation Sanity", val_ok, FAIL_MAJOR,
+            ("n/a" if val_roi is None else _round1(val_roi)),
+            "<= " + _fmt_num(vmax) + "% implied upside (valuation guard)"))
 
     # v1.0.3 [FORECAST-GATE]: a "best investments to BUY" surface must never
     # size a ticket the engine itself forecasts to fall. roi_pct is VALUATION
