@@ -180,7 +180,7 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "8.3.0"
+INSIGHTS_BUILDER_VERSION = "8.4.0"
 # v8.2.1: coverage display-format fix. The Coverage / Data Quality rows emitted
 # their counts as "{n}/{d}" (e.g. "5/5"), which Google Sheets auto-coerces to a
 # date (M/D -> e.g. May 5 -> serial 46147) when the Value cell carries a number
@@ -515,8 +515,29 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 100000) -> int:
+    """v8.4.0: integer env reader, clamped to [minimum, maximum]."""
+    try:
+        value = int(float((os.getenv(name) or str(default)).strip()))
+        return max(minimum, min(value, maximum))
+    except Exception:
+        return default
+
+
 # v8.3.0 (Fix AE): pages whose live symbols seed the insights equity universe.
 _INSIGHTS_EQUITY_PAGES_DEFAULT = "Market_Leaders,Global_Markets"
+# v8.4.0 (Fix AG -- EQUITY SAMPLE CAP): per-equity-universe symbol cap for the
+# insights snapshot. Each universe's market-summary runs its OWN bounded quote
+# fetch; pulling the full ~100 symbols/page across the newly-added equity
+# universes under provider throttling exhausts the 30s build budget and STARVES
+# the later sections (risk scenarios / macro / system) -- observed live as a
+# 44 -> 33 row DROP the moment the equity universe was enabled on a cold cache.
+# A market-summary aggregate (advancers / decliners / avg change) is fully
+# representative at a small sample, so each equity universe is capped to a
+# cache-friendly count, keeping every section within budget. Override via
+# TFB_INSIGHTS_EQUITY_MAX_SYMBOLS. Only touches the equity universes (themselves
+# gated by TFB_INSIGHTS_EQUITY_UNIVERSE) -> flag OFF = byte-identical.
+_INSIGHTS_EQUITY_MAX_SYMBOLS = _env_int("TFB_INSIGHTS_EQUITY_MAX_SYMBOLS", 25, minimum=3, maximum=200)
 
 
 def _insights_equity_universe_enabled() -> bool:
@@ -547,6 +568,10 @@ async def _resolve_equity_universes(engine: Any) -> Dict[str, List[str]]:
         except Exception:
             res = None
         syms = _dedupe_keep_order(res or [])
+        if _INSIGHTS_EQUITY_MAX_SYMBOLS > 0:
+            # v8.4.0 (Fix AG): cap the per-universe sample so the market-summary
+            # quote fetch stays within the build budget under provider throttling.
+            syms = syms[:_INSIGHTS_EQUITY_MAX_SYMBOLS]
         if syms:
             out[page] = syms
     return out
