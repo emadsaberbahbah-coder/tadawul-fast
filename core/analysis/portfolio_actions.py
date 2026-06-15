@@ -1,7 +1,28 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.0.0   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2)
+Version: 1.0.1   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2)
+
+v1.0.1 [ENGINE-ROI-DISPLAY]: each action row's "ROI %" is pure VALUATION upside
+(cand.roi_pct = (ref - price)/price, per L5, computed in opportunity_builder),
+while the engine's own 12-month forecast (cand.engine_roi_12m_pct) was carried
+only in detail.engine_forecast_roi_pct and shown NOWHERE on the page. A holding
+could therefore read 35% upside while the engine forecast for that name was
+~0%. The action verdict already considers the engine recommendation (the EXIT
+SELL-tier rule), so this is not a wrong-action risk; the defect is purely that
+the displayed ROI overstates expected return vs the engine's view and the
+spread is invisible. Mirrors the opportunity_builder v1.0.5 fix. FIX (env-gated,
+default OFF; no change to the action truth table, sizing, the L7 funding
+identity, or the actual P&L figures): when ON, each action row gains the
+normalized engine forecast (engine_roi_pct) and the valuation ROI under an
+explicit name (valuation_roi_pct); the advisor note states the engine 12M
+forecast and frames the displayed ROI as a TARGET, not a forecast; and
+detail.engine_forecast_roi_pct is normalized to percent (the raw field carried
+a ratio for ratio-form providers). The rendered roi_pct / ann_roi_pct and the
+actual pnl_sar / pnl_pct are LEFT INTACT. Toggle TFB_PF_ENGINE_ROI_DISPLAY=1 to
+enable; OFF restores byte-identical v1.0.0 behavior (only the version stamp
+changes). Note: My_Portfolio has no forecast "expected gain" to repoint — its
+gain columns are actual cost-vs-market P&L, unaffected here.
 
 WHY THIS MODULE EXISTS
 ----------------------
@@ -118,7 +139,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 
-PORTFOLIO_ACTIONS_VERSION = "1.0.0"
+PORTFOLIO_ACTIONS_VERSION = "1.0.1"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -167,6 +188,8 @@ DEFAULT_CONTROLS = {
     "lot_size": 1,
     "max_holdings": 0,
     "period_months": 12,
+    # v1.0.1 engine-forecast display (env-tunable; see policy block)
+    "engine_roi_display_enabled": False,
 }
 
 _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
@@ -174,6 +197,7 @@ _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
                    "add_roi_pct", "trim_roi_pct", "exit_roi_pct",
                    "valuation_trim_frac")
 _CONTROLS_INT = ("review_days", "lot_size", "max_holdings", "period_months")
+_CONTROLS_BOOL = ("engine_roi_display_enabled",)
 
 
 def _env_str(name, default):
@@ -200,6 +224,29 @@ def _env_enabled():
         "0", "false", "no", "off")
 
 
+def _env_engine_roi_display():
+    """v1.0.1: engine-forecast display toggle. Default OFF; set
+    TFB_PF_ENGINE_ROI_DISPLAY=1 to surface the engine 12M forecast on every
+    action row. OFF is byte-identical v1.0.0."""
+    return str(_env_str("TFB_PF_ENGINE_ROI_DISPLAY", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _engine_roi_to_pct(value):
+    """v1.0.1: normalize the engine 12M forecast ROI to a PERCENT (mirrors
+    opportunity_builder._engine_roi_to_pct, kept local so the consumed-surface
+    contract is unchanged). Providers deliver it as a ratio (e.g. -0.20) or a
+    percent (e.g. -20.0); |v| < 1.5 is treated as a ratio and scaled x100.
+    Returns None when absent so 'Unknown' stays Unknown."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v * 100.0 if abs(v) < 1.5 else v
+
+
 def _env_overrides():
     return {
         "add_roi_pct": _env_float("TFB_PF_ADD_ROI_PCT",
@@ -216,6 +263,7 @@ def _env_overrides():
         "lot_size": _env_int("TFB_PF_LOT_SIZE", DEFAULT_CONTROLS["lot_size"]),
         "max_holdings": _env_int("TFB_PF_MAX_HOLDINGS",
                                  DEFAULT_CONTROLS["max_holdings"]),
+        "engine_roi_display_enabled": _env_engine_roi_display(),
     }
 
 
@@ -235,6 +283,8 @@ def make_controls(overrides=None):
             f = _to_float(val)
             if f is not None:
                 ctl[k] = int(f)
+        elif k in _CONTROLS_BOOL:
+            ctl[k] = str(val).strip().lower() in ("1", "true", "yes", "on")
         else:
             ctl[k] = str(val).strip()
     if ctl["lot_size"] < 1:
@@ -590,7 +640,24 @@ def _advisor_sentence(entry, controls, review_date):
 def _action_row(entry, review_date, controls):
     cand = entry["cand"]
     fx = cand.get("fx_to_sar")
-    return {
+    # v1.0.1: surface the engine 12M forecast alongside (never substituted into)
+    # the valuation roi_pct. OFF => engine_pct stays None and every assignment
+    # below is byte-identical v1.0.0.
+    _eng_display = bool(controls.get("engine_roi_display_enabled"))
+    engine_pct = (_engine_roi_to_pct(cand.get("engine_roi_12m_pct"))
+                  if _eng_display else None)
+    detail_engine_roi = _round(cand.get("engine_roi_12m_pct"), 1)
+    note = _advisor_sentence(entry, controls, review_date)
+    if _eng_display:
+        detail_engine_roi = _round(engine_pct, 1)
+        if engine_pct is None:
+            note = note[:-1] + ("; engine 12M forecast: unavailable (ROI shown "
+                                "is a valuation target, not a forecast).")
+        else:
+            note = note[:-1] + ("; engine 12M forecast %s%% (ROI shown is a "
+                                "valuation target, not a forecast)."
+                                % _fmt(_round(engine_pct, 1)))
+    row = {
         "symbol": cand.get("symbol"),
         "name": cand.get("name"),
         "market": cand.get("market"),
@@ -620,13 +687,12 @@ def _action_row(entry, review_date, controls):
         "ann_roi_pct": _round(cand.get("ann_roi_pct"), 1),
         "reliability": _round(cand.get("reliability"), 1),
         "dq": _round(cand.get("dq"), 1),
-        "advisor_note": _advisor_sentence(entry, controls, review_date),
+        "advisor_note": note,
         "detail": {
             "valuation_basis": cand.get("valuation_basis"),
             "target_price": _round(cand.get("target_price")),
             "intrinsic_value": _round(cand.get("intrinsic_value")),
-            "engine_forecast_roi_pct": _round(
-                cand.get("engine_roi_12m_pct"), 1),
+            "engine_forecast_roi_pct": detail_engine_roi,
             "engine_recommendation": cand.get("recommendation"),
             "risk_level": cand.get("risk_level") or "Unknown",
             "news_trend": cand.get("news_trend"),
@@ -641,6 +707,10 @@ def _action_row(entry, review_date, controls):
             "review_date": review_date,
         },
     }
+    if _eng_display:
+        row["engine_roi_pct"] = _round(engine_pct, 1)
+        row["valuation_roi_pct"] = _round(cand.get("roi_pct"), 1)
+    return row
 
 
 def _json_sanitize(obj):
