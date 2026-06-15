@@ -2,11 +2,38 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.4.0  (V2.6.0-ALIGNED / 90-COL CONTRACT / WAVE 3)
+Analysis Sheet-Rows Router — v4.5.0  (V2.6.0-ALIGNED / 90-COL CONTRACT / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • GLOBAL-RANK
+GLOBAL-DEDUP
+
+WHY v4.5.0 — page-level symbol de-duplication [GLOBAL-DEDUP]
+-----------------------------------------------------------
+
+Same root cause as the v4.4.0 rank bug, one layer over: the engine de-dupes
+symbols only WITHIN each upstream batch, never across the whole page. So a
+symbol that lands in two different batches survives to the sheet twice -- the
+2026-06-15 audit found three Market_Leaders symbols duplicated (3092.SR,
+7030.SR, 4200.SR), each as a stale cached row PLUS a fresh fetch (two distinct
+snapshots, different prices and timestamps -- the signature of a pipeline
+emitting both, not a copy/paste artifact). A financial advisor seeing the same
+instrument twice, at two prices and two ranks, is a visible correctness defect.
+This router is the single funnel where the COMPLETE page exists before
+pagination, so v4.5.0 collapses duplicate-symbol rows here, keeping the FRESHEST
+copy of each symbol (by last_updated_utc; a dated row beats an undated one;
+ties keep the first appearance). It runs in _normalize_external_payload
+immediately BEFORE the global rank pass and BEFORE the slice -- so the rank pass
+never counts a symbol twice, and the surviving row keeps its first-appearance
+slot. The dedup key is the symbol only; rows without a symbol are never merged.
+Restricted to the four cross-sectional market pages (Market_Leaders /
+Global_Markets / Commodities_FX / Mutual_Funds) -- My_Portfolio (which may hold
+the same symbol in multiple lots) and Top_10 (own selector/dedup) are excluded,
+matching the rank pass's scope exactly. When dedup actually drops a row it logs
+one INFO line ([GLOBAL-DEDUP]) so the upstream anomaly is visible in Render logs
+without a sheet diff. Reversible: TFB_ANALYSIS_GLOBAL_DEDUP=0 passes all rows
+through unchanged -> byte-identical to v4.4.0.
 
 WHY v4.4.0 — page-level Rank (Overall) [GLOBAL-RANK]
 ----------------------------------------------------
@@ -164,7 +191,7 @@ import re
 import time
 import uuid
 from dataclasses import is_dataclass
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -241,7 +268,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.4.0"
+ANALYSIS_SHEET_ROWS_VERSION = "4.5.0"
 
 # v4.3.1 [FIX-1]: tracks which engine binding actually loaded. Updated at
 # request time inside _get_engine(). Surfaced in meta.engine_source on
@@ -1128,6 +1155,104 @@ def _apply_global_rank_overall(rows: List[Dict[str, Any]], page: str) -> int:
     return len(eligible)
 
 
+def _row_dedup_key(row: Dict[str, Any]) -> str:
+    """v4.5.0 [GLOBAL-DEDUP]: canonical symbol key for collapsing duplicate rows
+    on a market page. Empty when the row has no symbol -- such rows are never
+    merged (a missing symbol is not evidence two rows are the same instrument)."""
+    sym = row.get("symbol")
+    if sym is None:
+        return ""
+    return str(sym).strip().upper()
+
+
+def _row_freshness(row: Dict[str, Any]) -> Optional[datetime]:
+    """v4.5.0 [GLOBAL-DEDUP]: parse last_updated_utc to an aware datetime, used
+    to choose the freshest of two same-symbol rows. None when missing or
+    unparseable. Falls back to the `last_updated` alias; tolerates a trailing
+    'Z'; naive timestamps are assumed UTC so comparisons never raise."""
+    raw = row.get("last_updated_utc")
+    if raw in (None, ""):
+        raw = row.get("last_updated")
+    if raw in (None, ""):
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _dedup_is_fresher(candidate: Dict[str, Any], incumbent: Dict[str, Any]) -> bool:
+    """v4.5.0 [GLOBAL-DEDUP]: True iff `candidate` should replace `incumbent` as
+    the surviving row for a shared symbol. Freshness is by last_updated_utc; a
+    row with a known timestamp beats one without; equal/both-unknown keeps the
+    incumbent (stable -- the first appearance wins ties)."""
+    c = _row_freshness(candidate)
+    i = _row_freshness(incumbent)
+    if c is None and i is None:
+        return False
+    if i is None:
+        return True
+    if c is None:
+        return False
+    return c > i
+
+
+def _global_dedup_enabled() -> bool:
+    """v4.5.0 [GLOBAL-DEDUP]: master switch for page-level symbol de-duplication
+    (default ON). When OFF, every row passes through unchanged so the response is
+    byte-identical to v4.4.0. Set TFB_ANALYSIS_GLOBAL_DEDUP to 0/false/off."""
+    raw = (os.getenv("TFB_ANALYSIS_GLOBAL_DEDUP", "") or "").strip().lower()
+    return raw not in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _apply_global_symbol_dedup(rows: List[Dict[str, Any]], page: str) -> int:
+    """v4.5.0 [GLOBAL-DEDUP]: collapse duplicate-symbol rows ACROSS THE WHOLE
+    PAGE, keeping the freshest copy (by last_updated_utc) of each symbol, in
+    place on the supplied list. Returns the number of rows dropped (telemetry).
+
+    Must run on the COMPLETE page BEFORE the global rank pass and BEFORE any
+    slice. The engine de-dupes only within each upstream batch, so a symbol that
+    lands in two batches (typically a stale cached row plus a fresh fetch)
+    survives to here as a visible duplicate; collapsing first also stops the rank
+    pass from counting a symbol twice. The surviving row keeps the slot of the
+    symbol's FIRST appearance; only same-symbol duplicates are removed, and rows
+    without a symbol are never merged. No-op unless enabled AND the page is one of
+    the cross-sectional market pages."""
+    if not _global_dedup_enabled() or page not in _RANKED_MARKET_PAGES:
+        return 0
+    seen: Dict[str, int] = {}            # symbol key -> index in `kept`
+    kept: List[Dict[str, Any]] = []
+    dropped = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            kept.append(row)
+            continue
+        key = _row_dedup_key(row)
+        if not key:
+            kept.append(row)
+            continue
+        if key not in seen:
+            seen[key] = len(kept)
+            kept.append(row)
+            continue
+        # Duplicate symbol: keep whichever copy is fresher, at the original slot.
+        idx = seen[key]
+        if _dedup_is_fresher(row, kept[idx]):
+            kept[idx] = row
+        dropped += 1
+    if dropped:
+        rows[:] = kept                   # mutate the caller's list in place
+    return dropped
+
+
 def _key_variants(key: str) -> List[str]:
     k = _strip(key)
     if not k:
@@ -1714,6 +1839,23 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
     normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
     if page == _TOP10_PAGE:
         normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
+
+    # v4.5.0 [GLOBAL-DEDUP]: collapse duplicate-symbol rows over the FULL page,
+    # keeping the freshest copy of each symbol, BEFORE the rank pass (so a symbol
+    # is never ranked twice) and BEFORE the slice. The engine de-dupes only
+    # within each upstream batch, so cross-batch duplicates (typically a stale
+    # cached row + a fresh fetch) only collapse here. No-op off market pages or
+    # when TFB_ANALYSIS_GLOBAL_DEDUP is disabled. When it drops a row it logs one
+    # INFO line so the upstream anomaly is visible without a sheet diff.
+    _deduped_n = _apply_global_symbol_dedup(normalized_rows, page)
+    if _deduped_n:
+        try:
+            logger.info(
+                "[analysis_sheet_rows v%s] GLOBAL-DEDUP page=%r dropped=%d duplicate-symbol row(s)",
+                ANALYSIS_SHEET_ROWS_VERSION, page, _deduped_n,
+            )
+        except Exception:
+            pass
 
     # v4.4.0 [GLOBAL-RANK]: authoritative page-wide Rank (Overall) over the FULL
     # page, BEFORE the limit/offset slice -- so the whole page is ranked as one
