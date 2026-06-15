@@ -2,11 +2,35 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.3.1  (V2.6.0-ALIGNED / 90-COL CONTRACT / WAVE 3)
+Analysis Sheet-Rows Router — v4.4.0  (V2.6.0-ALIGNED / 90-COL CONTRACT / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
-DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE
+DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • GLOBAL-RANK
+
+WHY v4.4.0 — page-level Rank (Overall) [GLOBAL-RANK]
+----------------------------------------------------
+
+Market pages are assembled/served upstream in batches, and the engine's
+_apply_rank_overall ranks each batch independently. The sheet therefore
+showed the SAME Rank (Overall) value (1..N) repeated once per batch instead
+of a single cross-sectional ranking -- the 2026-06-15 audit found rank 1 on
+nine different Market_Leaders rows whose overall scores ran 41.7..74.3. This
+router is the single funnel where the COMPLETE page exists before pagination,
+so v4.4.0 re-ranks Rank (Overall) here, authoritatively, in one pass over the
+whole page (in _normalize_external_payload, immediately BEFORE the limit/offset
+slice). Eligibility mirrors the engine's own rule so the two never disagree: a
+row is ranked iff it has a numeric overall_score AND is not demoted by the
+engine's data-trust gate (the low_data_trust warnings tag, the only trust
+signal projected to this layer -- the engine's schema stays 115). Eligible
+rows are sorted by overall_score descending (stable on ties) and numbered
+1..N; every ineligible row's Rank (Overall) is blanked, preserving the
+engine's no-score AND v5.88.0 LOW-trust drops. Restricted to the four
+cross-sectional market pages (Market_Leaders / Global_Markets / Commodities_FX
+/ Mutual_Funds); My_Portfolio keeps its holding order and Top_10 uses
+top10_rank. rank_overall is the only field mutated. Reversible:
+TFB_ANALYSIS_GLOBAL_RANK=0 passes upstream rank_overall through unchanged ->
+byte-identical to v4.3.1.
 
 WHY v4.3.1 — diagnostic visibility + proxy hardening
 ----------------------------------------------------
@@ -217,7 +241,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.3.1"
+ANALYSIS_SHEET_ROWS_VERSION = "4.4.0"
 
 # v4.3.1 [FIX-1]: tracks which engine binding actually loaded. Updated at
 # request time inside _get_engine(). Surfaced in meta.engine_source on
@@ -250,6 +274,17 @@ _TOP10_PAGE = "Top_10_Investments"
 _INSIGHTS_PAGE = "Insights_Analysis"
 _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
+
+# v4.4.0 [GLOBAL-RANK]: the four cross-sectional market pages that carry a
+# page-wide Rank (Overall). My_Portfolio keeps its holding order, Top_10 uses
+# top10_rank, and Insights / Data_Dictionary are not ranked -- all excluded.
+_RANKED_MARKET_PAGES = {
+    "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
+}
+# v4.4.0 [GLOBAL-RANK]: data_engine_v2 v5.88.0 tags a LOW-trust row with this
+# token in `warnings`; this router preserves that row's blank Rank (Overall)
+# instead of re-ranking it (keeps the engine's trust drop intact).
+_LOW_TRUST_TAG = "low_data_trust"
 
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
     "Market_Leaders": 90,
@@ -1031,6 +1066,68 @@ def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[
     return rows[start:start + max(0, int(limit))]
 
 
+def _coerce_rank_score(value: Any) -> Optional[float]:
+    """v4.4.0 [GLOBAL-RANK]: parse overall_score to float for ranking.
+    None / blank / non-numeric / NaN -> None (row is then not ranked)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        f = float(value)
+        return f if f == f else None  # reject NaN
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        f = float(s.replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
+
+
+def _global_rank_enabled() -> bool:
+    """v4.4.0 [GLOBAL-RANK]: master switch for the page-level Rank (Overall)
+    pass (default ON). When OFF, rank_overall is passed through from upstream
+    unchanged so the response is byte-identical to v4.3.1. Set
+    TFB_ANALYSIS_GLOBAL_RANK to 0/false/off to disable."""
+    raw = (os.getenv("TFB_ANALYSIS_GLOBAL_RANK", "") or "").strip().lower()
+    return raw not in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _apply_global_rank_overall(rows: List[Dict[str, Any]], page: str) -> int:
+    """v4.4.0 [GLOBAL-RANK]: recompute Rank (Overall) ACROSS THE WHOLE PAGE in
+    one pass, in-place. Returns the number of rows ranked (for telemetry).
+
+    Must be called on the COMPLETE page BEFORE any limit/offset slice. A row is
+    ranked iff it has a numeric overall_score AND is not demoted by the engine's
+    data-trust gate (the low_data_trust warnings tag) -- mirroring the engine's
+    own _apply_rank_overall rule so the two layers never disagree. Eligible rows
+    are sorted by overall_score descending (stable on ties) and numbered 1..N;
+    every ineligible row's rank_overall is blanked, preserving the engine's
+    no-score and LOW-trust drops. Only rank_overall is mutated. No-op unless the
+    feature is enabled AND the page is one of the cross-sectional market pages."""
+    if not _global_rank_enabled() or page not in _RANKED_MARKET_PAGES:
+        return 0
+    eligible: List[Tuple[float, Dict[str, Any]]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        score = _coerce_rank_score(row.get("overall_score"))
+        warns = str(row.get("warnings") or "").lower()
+        if score is None or _LOW_TRUST_TAG in warns:
+            # Not rankable -> clear any per-batch rank it arrived with so the
+            # blank correctly signals "not ranked" (engine no-score / LOW-trust).
+            if "rank_overall" in row:
+                row["rank_overall"] = ""
+            continue
+        eligible.append((score, row))
+    # Stable sort by score descending (key is the float only -- never compares
+    # dict rows -- so ties preserve arrival order, matching the engine).
+    eligible.sort(key=lambda t: t[0], reverse=True)
+    for rank, (_score, row) in enumerate(eligible, start=1):
+        row["rank_overall"] = rank
+    return len(eligible)
+
+
 def _key_variants(key: str) -> List[str]:
     k = _strip(key)
     if not k:
@@ -1617,6 +1714,20 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
     normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
     if page == _TOP10_PAGE:
         normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
+
+    # v4.4.0 [GLOBAL-RANK]: authoritative page-wide Rank (Overall) over the FULL
+    # page, BEFORE the limit/offset slice -- so the whole page is ranked as one
+    # cross-section instead of per upstream batch. No-op off market pages or
+    # when TFB_ANALYSIS_GLOBAL_RANK is disabled.
+    _ranked_n = _apply_global_rank_overall(normalized_rows, page)
+    if _analysis_sheet_rows_debug_enabled() and _ranked_n:
+        try:
+            logger.debug(
+                "[analysis_sheet_rows v%s] GLOBAL-RANK page=%r ranked=%d of %d rows",
+                ANALYSIS_SHEET_ROWS_VERSION, page, _ranked_n, len(normalized_rows),
+            )
+        except Exception:
+            pass
 
     normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
     status_out, error_out, ext_meta = _extract_status_error(ext)
