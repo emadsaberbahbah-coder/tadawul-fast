@@ -1,8 +1,36 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.0.2   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
-                  Engineering Audit Phase 0 — cost-basis plausibility gate)
+Version: 1.0.3   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
+                  Engineering Audit Phase 0 — cost-basis + data-trust gates)
+
+v1.0.3 [PHASE0-DATA-TRUST-GATE]: opportunity_builder v1.0.6 added a Data-Trust
+gate that EXCLUDES sparse/stale Top_10 candidates, but My_Portfolio applied no
+such check — so the SAME name that is correctly dropped as a thin/stale
+candidate still produced a CONFIDENT action as a holding (5023.SR: thin 0/6
+secondary signals → ADD; a stale-priced holding → ADD on an old price). The
+audit's holding done-condition ("no holding produces a confident recommendation
+unless cost basis, symbol identity, quote freshness, and core data pass
+validation") was only half-met. FIX (default ON; reuses opportunity_builder's
+shared _data_trust_assessment so My_Portfolio and Top_10 apply byte-identical
+freshness + coverage logic — one implementation, two consumers — with a
+getattr guard + fail-open so an older builder simply disables the feature): a
+new step "1c" inside the never-overridden step-1 BLOCK gate withholds the
+action when the holding's quote is STALE (last_updated older than
+max_data_age_hours; acting on an old price is acting blind) — emitting
+"BLOCKED — stale quote (...); action withheld pending price refresh". THIN
+coverage (fewer than min_trust_fields of the six secondary signals) is, by
+default, FLAGGED via a low_data_coverage alert rather than blocked — because a
+holding's action is valuation-driven and the owner still needs guidance on a
+position they hold (this is the deliberate, documented divergence from the
+candidate side, where thin → exclude); set TFB_PF_BLOCK_THIN_COVERAGE=1 to also
+block thin holdings for strict parity. Per-run telemetry (assessed /
+stale_blocked / thin_flagged / thin_blocked) lands in meta.trust_gate. No change
+to the cost-basis gate, the action truth table, sizing, the L7 funding identity,
+P&L math, or the engine-ROI display toggle. OFF (TFB_PF_TRUST_GATE=0) restores
+v1.0.2 behavior — only the version stamp and the new controls-snapshot keys
+change. Forward-compatible: a future engine trust_level plugs into the same
+assessment without restructuring.
 
 v1.0.2 [PHASE0-COST-BASIS-GATE]: the step-1 BLOCK data gate validated
 PRESENCE only (price / fx / quantity not None). A holding could pass with
@@ -93,8 +121,11 @@ Evaluated in strict precedence; first match wins:
   1. BLOCK  — data gate: price OR fx OR quantity unusable (presence); OR, when
      the v1.0.2 cost-basis gate is ON (default), a held position's Buy Price is
      present-but-implausible (> 5x / < 0.2x current price, or zero/negative/
-     non-numeric). Never overridden. A MISSING Buy Price does NOT block unless
-     TFB_PF_BLOCK_MISSING_COST_BASIS=1.
+     non-numeric); OR, when the v1.0.3 data-trust gate is ON (default), the
+     holding's quote is STALE (last_updated older than max_data_age_hours) —
+     and, if TFB_PF_BLOCK_THIN_COVERAGE=1, also when coverage is THIN. Never
+     overridden. A MISSING Buy Price does NOT block unless
+     TFB_PF_BLOCK_MISSING_COST_BASIS=1; THIN coverage is otherwise an alert.
   2. Low-confidence cap (L8 analog): reliability < 60 caps any computed
      ADD/TRIM/EXIT down to HOLD ("manual review") — weak signals never trade.
   3. EXIT   — valuation ROI ≤ exit_roi_pct (default −15: price ≳17.6% above
@@ -164,6 +195,10 @@ ENV KILL-SWITCHES (read per call; explicit controls > env > defaults)
   TFB_PF_COST_MAX_RATIO   "5"    v1.0.2: Buy Price > this x price ⇒ BLOCK (high)
   TFB_PF_COST_MIN_RATIO   "0.2"  v1.0.2: Buy Price < this x price ⇒ BLOCK (low)
   TFB_PF_BLOCK_MISSING_COST_BASIS "0" v1.0.2: "1" ⇒ blank Buy Price also BLOCKs
+  TFB_PF_TRUST_GATE       "1"    v1.0.3: "0" ⇒ skip the data-trust (stale) gate
+  TFB_PF_MAX_DATA_AGE_HOURS "168" v1.0.3: stale quote older than this ⇒ BLOCK
+  TFB_PF_MIN_TRUST_FIELDS "2"    v1.0.3: fewer core signals ⇒ thin (alert)
+  TFB_PF_BLOCK_THIN_COVERAGE "0" v1.0.3: "1" ⇒ thin holdings also BLOCK
 
 HONESTY RULES (L13): zero ADDs, all-HOLD, empty holdings, unknown trends and
 None P&L are CORRECT outputs; nothing is upgraded or padded to fill space.
@@ -175,7 +210,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 
-PORTFOLIO_ACTIONS_VERSION = "1.0.2"
+PORTFOLIO_ACTIONS_VERSION = "1.0.3"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -207,6 +242,12 @@ _SELL_TIER = {"SELL", "STRONGSELL", "EXIT", "AVOID", "REDUCE"}
 # missing-basis exclusion can never drift apart if a reason is reworded.
 _CB_BLOCK_MARKER = "review cost basis"
 
+# v1.0.3: data-trust BLOCK reason markers (stale always blocks; thin blocks
+# only when block_thin_coverage). One predicate keeps the alert split + the
+# blocked_positions exclusion in lockstep with the reason strings.
+_STALE_BLOCK_MARKER = "stale quote"
+_THIN_BLOCK_MARKER = "thin data"
+
 REBALANCE_ADVISORY = "Advisory Only"
 REBALANCE_TARGETS = "Rebalance to Targets"
 REBALANCE_NEW_CASH = "New Cash Only"
@@ -236,15 +277,23 @@ DEFAULT_CONTROLS = {
     "cost_max_ratio": 5.0,
     "cost_min_ratio": 0.2,
     "block_missing_cost_basis": False,
+    # v1.0.3 data-trust gate (Phase 0 parity with opportunity_builder v1.0.6)
+    "trust_gate_enabled": True,
+    "max_data_age_hours": 168.0,
+    "min_trust_fields": 2,
+    "block_thin_coverage": False,
 }
 
 _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
                    "max_sector_pct", "min_reliability_add", "min_dq_add",
                    "add_roi_pct", "trim_roi_pct", "exit_roi_pct",
-                   "valuation_trim_frac", "cost_max_ratio", "cost_min_ratio")
-_CONTROLS_INT = ("review_days", "lot_size", "max_holdings", "period_months")
+                   "valuation_trim_frac", "cost_max_ratio", "cost_min_ratio",
+                   "max_data_age_hours")
+_CONTROLS_INT = ("review_days", "lot_size", "max_holdings", "period_months",
+                 "min_trust_fields")
 _CONTROLS_BOOL = ("engine_roi_display_enabled", "cost_basis_gate_enabled",
-                  "block_missing_cost_basis")
+                  "block_missing_cost_basis", "trust_gate_enabled",
+                  "block_thin_coverage")
 
 
 def _env_str(name, default):
@@ -283,6 +332,21 @@ def _env_block_missing_cost_basis():
     TFB_PF_BLOCK_MISSING_COST_BASIS=1 to BLOCK holdings whose Buy Price is
     blank (otherwise a missing basis is tolerated per the v1.0.0 contract)."""
     return str(_env_str("TFB_PF_BLOCK_MISSING_COST_BASIS", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _env_trust_gate():
+    """v1.0.3: master switch for the data-trust (stale-quote) BLOCK. Default ON;
+    set TFB_PF_TRUST_GATE=0 to restore v1.0.2 behavior (no trust assessment)."""
+    return str(_env_str("TFB_PF_TRUST_GATE", "1")).strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _env_block_thin_coverage():
+    """v1.0.3: strict-parity toggle. Default OFF (thin coverage is flagged via
+    the low_data_coverage alert, not blocked); set TFB_PF_BLOCK_THIN_COVERAGE=1
+    to also BLOCK thinly-covered holdings like the Top_10 candidate side."""
+    return str(_env_str("TFB_PF_BLOCK_THIN_COVERAGE", "0")).strip().lower() \
         in ("1", "true", "yes", "on")
 
 
@@ -332,6 +396,13 @@ def _env_overrides():
         "cost_min_ratio": _env_float("TFB_PF_COST_MIN_RATIO",
                                      DEFAULT_CONTROLS["cost_min_ratio"]),
         "block_missing_cost_basis": _env_block_missing_cost_basis(),
+        "trust_gate_enabled": _env_trust_gate(),
+        "max_data_age_hours": _env_float(
+            "TFB_PF_MAX_DATA_AGE_HOURS",
+            DEFAULT_CONTROLS["max_data_age_hours"]),
+        "min_trust_fields": _env_int(
+            "TFB_PF_MIN_TRUST_FIELDS", DEFAULT_CONTROLS["min_trust_fields"]),
+        "block_thin_coverage": _env_block_thin_coverage(),
     }
 
 
@@ -370,6 +441,11 @@ def make_controls(overrides=None):
     if ctl["cost_min_ratio"] >= ctl["cost_max_ratio"]:
         ctl["cost_min_ratio"] = DEFAULT_CONTROLS["cost_min_ratio"]
         ctl["cost_max_ratio"] = DEFAULT_CONTROLS["cost_max_ratio"]
+    # v1.0.3 data-trust threshold sanity
+    if ctl["max_data_age_hours"] <= 0:
+        ctl["max_data_age_hours"] = DEFAULT_CONTROLS["max_data_age_hours"]
+    if ctl["min_trust_fields"] < 0:
+        ctl["min_trust_fields"] = 0
     mode = str(ctl.get("rebalance_mode") or REBALANCE_ADVISORY)
     low = mode.strip().lower()
     if "new cash" in low:
@@ -482,6 +558,10 @@ def normalize_holding(row, fx_rates, controls):
     else:
         cand["pnl_sar"] = None
         cand["pnl_pct"] = None
+    # v1.0.3: internal-only trust detail (stale / thin / age / signals), shared
+    # with opportunity_builder. Never surfaced by _action_row; drives step 1c
+    # and the trust alerts/telemetry.
+    cand["_trust"] = _trust_assess(cand, controls)
     return cand
 
 
@@ -504,6 +584,44 @@ def _is_cost_basis_block(action, reason):
     (vs a presence/data-gate BLOCK). Single source of truth for the scrub +
     alert split."""
     return action == ACTION_BLOCK and _CB_BLOCK_MARKER in (reason or "").lower()
+
+
+def _is_stale_block(action, reason):
+    """v1.0.3: True iff this BLOCK was raised by the data-trust gate for a
+    STALE quote."""
+    return action == ACTION_BLOCK and _STALE_BLOCK_MARKER in (
+        reason or "").lower()
+
+
+def _is_trust_block(action, reason):
+    """v1.0.3: True iff this BLOCK was raised by the data-trust gate (stale or
+    thin). Used to exclude trust blocks from the presence (blocked_positions)
+    count."""
+    r = (reason or "").lower()
+    return action == ACTION_BLOCK and (
+        _STALE_BLOCK_MARKER in r or _THIN_BLOCK_MARKER in r)
+
+
+def _trust_assess(cand, controls):
+    """v1.0.3: the shared trust detail dict for a holding, or None when the
+    trust gate is disabled or the shared assessment is unavailable. REUSES
+    opportunity_builder._data_trust_assessment so My_Portfolio and Top_10 apply
+    identical freshness + coverage logic (one implementation, two consumers).
+    getattr-guarded + fail-open: an older builder without the helper, or any
+    error, yields None (the trust gate then withholds NO action)."""
+    if not controls.get("trust_gate_enabled"):
+        return None
+    assess = getattr(_ob, "_data_trust_assessment", None)
+    if assess is None:
+        return None
+    try:
+        _ok, _cur, detail = assess(cand, {
+            "max_data_age_hours": controls.get("max_data_age_hours"),
+            "min_trust_fields": controls.get("min_trust_fields"),
+        })
+        return detail
+    except Exception:
+        return None
 
 
 def _cost_basis_block_reason(avg_cost_raw, current_price, position_qty,
@@ -607,6 +725,27 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
             cand.get("quantity"), controls)
         if not cb_ok:
             return (ACTION_BLOCK, cb_reason, 0.0, None)
+
+    # 1c. BLOCK — data-trust (v1.0.3; Phase 0 parity with opportunity_builder
+    #     v1.0.6). The SAME name excluded as a sparse/stale Top_10 candidate
+    #     must not yield a confident action as a holding. Acting on a STALE
+    #     price is acting blind, so stale ALWAYS withholds the action; THIN
+    #     coverage withholds only when block_thin_coverage is set (default:
+    #     flagged via the low_data_coverage alert, since the action is
+    #     valuation-driven and the owner still needs guidance on a held
+    #     position). Detail is computed once in normalize_holding.
+    det = cand.get("_trust")
+    if det:
+        if det.get("stale"):
+            age_h = det.get("age_hours")
+            age_txt = "" if age_h is None else " (%dd old)" % int(age_h / 24.0)
+            return (ACTION_BLOCK,
+                    "BLOCKED — stale quote%s; action withheld pending price "
+                    "refresh" % age_txt, 0.0, None)
+        if det.get("thin") and controls.get("block_thin_coverage"):
+            return (ACTION_BLOCK,
+                    "BLOCKED — thin data (%d/6 core signals); action withheld"
+                    % int(det.get("signals_present") or 0), 0.0, None)
 
     roi = cand.get("roi_pct")
     reco = cand.get("recommendation")
@@ -1091,11 +1230,25 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     # never flagged twice.
     cb_blocked = sum(1 for e in entries
                      if _is_cost_basis_block(e["action"], e["action_reason"]))
-    _alert("blocked_positions", counts[ACTION_BLOCK] - cb_blocked,
+    # v1.0.3: data-trust block/flag counts (keyed off reason markers + the
+    # shared trust detail). Trust blocks are excluded from blocked_positions so
+    # each row carries exactly one accurate remediation.
+    trust_blocked = sum(1 for e in entries
+                        if _is_trust_block(e["action"], e["action_reason"]))
+    stale_blocked = sum(1 for e in entries
+                        if _is_stale_block(e["action"], e["action_reason"]))
+    thin_flagged = sum(1 for e in entries
+                       if (e["cand"].get("_trust") or {}).get("thin"))
+    _alert("blocked_positions", counts[ACTION_BLOCK] - cb_blocked - trust_blocked,
            "Fix missing price/FX/quantity for blocked rows")
     _alert("cost_basis_blocked", cb_blocked,
            "Correct the Buy Price on flagged holdings — implausible vs the "
            "current price")
+    _alert("stale_quote_blocked", stale_blocked,
+           "Refresh the quote on stale holdings — action withheld until the "
+           "price updates")
+    _alert("low_data_coverage", thin_flagged,
+           "Limited secondary data on these holdings — verify before acting")
     _alert("missing_cost_basis",
            sum(1 for e in entries
                if e["cand"].get("cost_sar") is None and
@@ -1155,6 +1308,19 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                 "opportunity_builder": getattr(
                     _ob, "OPPORTUNITY_BUILDER_VERSION", None),
                 "opportunity_builder_floor_ok": _ob_version_ok(),
+            },
+            "trust_gate": {
+                "enabled": bool(ctl.get("trust_gate_enabled")),
+                "available": getattr(
+                    _ob, "_data_trust_assessment", None) is not None,
+                "assessed": sum(1 for c in cands
+                                if c.get("_trust") is not None),
+                "stale_blocked": stale_blocked,
+                "thin_flagged": thin_flagged,
+                "thin_blocked": trust_blocked - stale_blocked,
+                "max_data_age_hours": ctl.get("max_data_age_hours"),
+                "min_trust_fields": ctl.get("min_trust_fields"),
+                "block_thin_coverage": bool(ctl.get("block_thin_coverage")),
             },
             "counts": {"rows_in": len(rows), "normalized": len(cands)},
             "upstream": upstream_meta or {},
