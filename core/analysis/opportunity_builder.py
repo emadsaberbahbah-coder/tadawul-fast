@@ -1,7 +1,32 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.2   (TFB Final Execution Plan v5.0 — Phase P2)
+Version: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P2)
+
+v1.0.5 [ENGINE-ROI-DISPLAY]: the executable ticket "ROI %" and "Exp Gain 12M"
+are PURE VALUATION upside — roi_pct = (ref - price)/price — while the engine's
+own 12-month forecast (engine_roi_12m_pct) was extracted and carried only in
+detail.engine_forecast_roi_pct and shown NOWHERE on the page. A selected
+ticket therefore advertised, e.g., 35% upside / a large SAR gain while the
+engine forecast for that name was ~0%. The picks are NOT traps (the v1.0.3
+Forecast gate already blocks engine-negative names from selection), but the
+HEADLINE number overstates expected return vs the engine's own view and hides
+the spread. FIX (env-gated, default OFF; no change to selection, ranking,
+gates, sizing, or the funding/identity contract): when ON, every ticket gains
+the normalized engine forecast (engine_roi_pct), an engine-based expected gain
+(engine_exp_gain_12m_sar), and the valuation figures under explicit names
+(valuation_roi_pct, valuation_exp_gain_12m_sar); the advisor note states the
+engine 12M forecast and frames the displayed upside as a TARGET, not a
+forecast; detail.engine_forecast_roi_pct is normalized to percent (the raw
+field carried a ratio for ratio-form providers); and kpis gains a parallel
+engine_expected_gain_12m_sar. The existing rendered roi_pct / ann_roi_pct /
+exp_gain_12m_sar and the kpis.expected_gain_12m_sar are LEFT INTACT so the
+"KPI gain == Σ ticket gains" reproducibility identity is preserved and the
+ROI%/Gain columns stay internally consistent; the engine figures are additive
+for the audit/API and for an optional dedicated "Engine ROI %" sheet column.
+Toggle TFB_OPP_ENGINE_ROI_DISPLAY=1 to enable; OFF restores byte-identical
+v1.0.4 behavior (only the version stamp changes). Every v1.0.4 byte carried
+forward verbatim.
 
 v1.0.2 [CONFLICT-PARSE FIX]: `_norm_conflict`'s free-text fallback matched
 "conflict" anywhere in the string, so descriptive negations — "No conflict",
@@ -105,7 +130,36 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.4"
+OPPORTUNITY_BUILDER_VERSION = "1.0.5"
+
+# ---------------------------------------------------------------------------
+# v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
+# ---------------------------------------------------------------------------
+# ROOT CAUSE (live 2026-06-15): the ticket "ROI %"/"Ann ROI %" and the derived
+# "Exp Gain 12M" are pure VALUATION upside (roi_pct = (ref - price)/price), and
+# the engine's own 12-month forecast (engine_roi_12m_pct) — already extracted
+# and carried in detail.engine_forecast_roi_pct since v1.0.3 — is rendered on
+# the page NOWHERE. A selected ticket can show 35% upside / a large SAR gain
+# while the engine forecasts ~0% for the same name. The Forecast gate (v1.0.3)
+# already prevents engine-NEGATIVE names from being selected, so these are not
+# value traps; the defect is purely that the HEADLINE number overstates
+# expected return vs the engine's view and the spread is invisible.
+#
+# FIX (preserves L5/L6/L7 and the funding/identity contract; no change to
+# selection, ranking, gates, or sizing): when the flag is ON, each ticket gains
+# engine_roi_pct (normalized %), engine_exp_gain_12m_sar (suggested ×
+# engine_roi_pct), and the valuation figures under explicit names
+# (valuation_roi_pct, valuation_exp_gain_12m_sar); the advisor note states the
+# engine 12M forecast and frames the displayed upside as a TARGET not a
+# forecast; detail.engine_forecast_roi_pct is normalized to percent; and kpis
+# gains a parallel engine_expected_gain_12m_sar. The existing rendered roi_pct /
+# ann_roi_pct / exp_gain_12m_sar and kpis.expected_gain_12m_sar are LEFT INTACT
+# (the "kpi gain == Σ ticket gains" identity holds; ROI%/Gain stay consistent),
+# so the engine figures are additive for the audit/API and for an optional
+# dedicated "Engine ROI %" sheet column. Env-toggled by
+# TFB_OPP_ENGINE_ROI_DISPLAY (default OFF) — set it to 1 to enable; OFF keeps
+# byte-identical v1.0.4 behavior (only the version stamp moves). Every v1.0.4
+# byte is carried forward verbatim.
 
 # ---------------------------------------------------------------------------
 # v1.0.3 [FORECAST-GATE] — engine-forecast safety gate (env-gated, default ON)
@@ -196,6 +250,8 @@ DEFAULT_CRITERIA = {
     # v1.0.4 valuation-sanity gate (env-tunable; see policy block)
     "valuation_sanity_gate_enabled": True,
     "max_valuation_roi_pct": 80.0,
+    # v1.0.5 engine-forecast display (env-tunable; see policy block)
+    "engine_roi_display_enabled": False,
 }
 
 _CRITERIA_FLOAT_KEYS = (
@@ -211,7 +267,7 @@ _CRITERIA_INT_KEYS = (
 _CRITERIA_BOOL_KEYS = (
     "allow_conflict", "allow_negative_news", "allow_negative_sector",
     "include_portfolio_holdings", "forecast_gate_enabled",
-    "valuation_sanity_gate_enabled",
+    "valuation_sanity_gate_enabled", "engine_roi_display_enabled",
 )
 
 # ---------------------------------------------------------------------------
@@ -328,6 +384,15 @@ def _env_valuation_sanity_gate():
         not in ("0", "false", "no", "off")
 
 
+def _env_engine_roi_display():
+    """v1.0.5: engine-forecast display toggle. Default OFF; set
+    TFB_OPP_ENGINE_ROI_DISPLAY=1 to surface the engine 12M forecast (and the
+    engine-based gain) on every ticket and in the kpis. OFF is byte-identical
+    v1.0.4."""
+    return str(_env_str("TFB_OPP_ENGINE_ROI_DISPLAY", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
 def _env_overrides():
     """Mechanics block of criteria, env-tunable (policy block)."""
     return {
@@ -357,6 +422,7 @@ def _env_overrides():
             "TFB_OPP_MAX_VALUATION_ROI_PCT",
             DEFAULT_CRITERIA["max_valuation_roi_pct"]),
         "valuation_sanity_gate_enabled": _env_valuation_sanity_gate(),
+        "engine_roi_display_enabled": _env_engine_roi_display(),
     }
 
 
@@ -1121,7 +1187,26 @@ def _build_ticket(rank, pick, criteria, review_date):
     suggested = round(pick["suggested_sar"], 0)
     ann = _round1(cand["ann_roi_pct"]) or 0.0
     exp_gain = round(suggested * ann / 100.0, 0)
-    return {
+    # v1.0.5: surface the engine 12M forecast alongside (never substituted into)
+    # the valuation roi_pct. OFF => engine_pct stays None and every assignment
+    # below is byte-identical v1.0.4.
+    _eng_display = bool(criteria.get("engine_roi_display_enabled"))
+    engine_pct = (_engine_roi_to_pct(cand["engine_roi_12m_pct"])
+                  if _eng_display else None)
+    detail_engine_roi = _round1(cand["engine_roi_12m_pct"])
+    note = _advisor_sentence(cand, suggested, pick["suggested_shares"], conf,
+                             review_date)
+    if _eng_display:
+        detail_engine_roi = _round1(engine_pct)
+        if engine_pct is None:
+            note = note + (" Engine 12M forecast: unavailable \u2014 the upside "
+                           "shown is a valuation target, not a forecast.")
+        else:
+            note = note + (" Engine 12M forecast "
+                           + _fmt_num(_round1(engine_pct))
+                           + "% \u2014 the upside shown is a valuation target, "
+                           "not a forecast.")
+    ticket = {
         "rank": rank,
         "symbol": cand["symbol"],
         "name": cand["name"],
@@ -1143,14 +1228,12 @@ def _build_ticket(rank, pick, criteria, review_date):
         "reliability": _round1(cand["reliability"]),
         "dq": _round1(cand["dq"]),
         "confidence_band": conf,
-        "advisor_note": _advisor_sentence(cand, suggested,
-                                          pick["suggested_shares"], conf,
-                                          review_date),
+        "advisor_note": note,
         "detail": {
             "target_price": _round2(cand["target_price"]),
             "intrinsic_value": _round2(cand["intrinsic_value"]),
             "valuation_basis": cand["valuation_basis"],
-            "engine_forecast_roi_pct": _round1(cand["engine_roi_12m_pct"]),
+            "engine_forecast_roi_pct": detail_engine_roi,
             "engine_recommendation": cand["recommendation"],
             "risk_level": cand["risk_level"] or "Unknown",
             "news_trend": cand["news_trend"],
@@ -1168,6 +1251,14 @@ def _build_ticket(rank, pick, criteria, review_date):
             "review_date": review_date,
         },
     }
+    if _eng_display:
+        engine_gain = (round(suggested * engine_pct / 100.0, 0)
+                       if engine_pct is not None else None)
+        ticket["engine_roi_pct"] = _round1(engine_pct)
+        ticket["valuation_roi_pct"] = _round1(cand["roi_pct"])
+        ticket["engine_exp_gain_12m_sar"] = engine_gain
+        ticket["valuation_exp_gain_12m_sar"] = ticket["exp_gain_12m_sar"]
+    return ticket
 
 
 def _key_risk(cand):
@@ -1394,6 +1485,13 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         "passed": len(invest),
         "capital_unallocated_sar": round(deployable - total_suggested, 0),
     }
+    # v1.0.5: parallel engine-based expected gain (additive; the valuation-based
+    # expected_gain_12m_sar above is left intact so kpi gain == Σ ticket gains).
+    if crit.get("engine_roi_display_enabled"):
+        _eng_gains = [t.get("engine_exp_gain_12m_sar") for t in tickets
+                      if t.get("engine_exp_gain_12m_sar") is not None]
+        kpis["engine_expected_gain_12m_sar"] = (
+            round(sum(_eng_gains), 0) if _eng_gains else None)
 
     near_miss = _near_miss_rows(audit, selected_syms, deferrals, crit)
     alerts = _build_alerts(audit, deployable, tickets, upstream_meta)
