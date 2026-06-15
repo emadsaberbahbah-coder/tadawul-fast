@@ -1,7 +1,35 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.0.1   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2)
+Version: 1.0.2   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
+                  Engineering Audit Phase 0 — cost-basis plausibility gate)
+
+v1.0.2 [PHASE0-COST-BASIS-GATE]: the step-1 BLOCK data gate validated
+PRESENCE only (price / fx / quantity not None). A holding could pass with
+Quantity AND Buy Price both present yet carry an absurd basis — BBD.US held
+4 sh at a recorded 250 against a ~2.50 quote (about 100x) — and the page then
+emitted a CONFIDENT ADD on a row whose P&L economics were garbage. Presence is
+not plausibility (Engineering Audit, Finding 2). FIX (default ON; kill-switch
+TFB_PF_COST_BASIS_GATE=0 restores v1.0.1 behavior — only the version stamp and
+the new controls-snapshot keys change): a plausibility step inside the step-1
+gate (still NEVER overridden) BLOCKs any action when a held position's buy
+price is present-but-implausible — greater than TFB_PF_COST_MAX_RATIO (default
+5) x or less than TFB_PF_COST_MIN_RATIO (default 0.2) x the current price, or
+present-but-zero/negative/non-numeric — emitting "BLOCKED — review cost basis
+(<specific reason>)" so the failing fact is visible on the row. A cost-basis
+BLOCK also marks the basis untrusted: its cost_sar / pnl_sar / pnl_pct are
+nulled so neither the row nor the portfolio KPIs aggregate a P&L derived from
+a basis we just rejected (market value, being price-based, is kept). A MISSING
+(blank) Buy Price deliberately keeps the v1.0.0 contract documented below
+("Missing Buy Price does NOT block an action"): the missing_cost_basis alert +
+None P&L already handle it honestly and the action is valuation-driven, not
+cost-driven — set TFB_PF_BLOCK_MISSING_COST_BASIS=1 to additionally block
+blank-basis holdings (strict-audit mode). A distinct "cost_basis_blocked" alert
+names the required fix; the existing "blocked_positions" alert now counts
+presence blocks only, and "missing_cost_basis" excludes cost-basis blocks to
+avoid double-flagging. No change to the action truth table thresholds, ADD
+sizing, the L7 funding identity, the displayed valuation ROI, or the v1.0.1
+engine-forecast display toggle.
 
 v1.0.1 [ENGINE-ROI-DISPLAY]: each action row's "ROI %" is pure VALUATION upside
 (cand.roi_pct = (ref - price)/price, per L5, computed in opportunity_builder),
@@ -62,7 +90,11 @@ ACTION TRUTH TABLE (v1.0.0 — pinned here for the external auditor; the plan
 fixes the vocabulary L3 and the funding identity L7, not these thresholds)
 ---------------------------------------------------------------------------
 Evaluated in strict precedence; first match wins:
-  1. BLOCK  — data gate: price OR fx OR quantity unusable. Never overridden.
+  1. BLOCK  — data gate: price OR fx OR quantity unusable (presence); OR, when
+     the v1.0.2 cost-basis gate is ON (default), a held position's Buy Price is
+     present-but-implausible (> 5x / < 0.2x current price, or zero/negative/
+     non-numeric). Never overridden. A MISSING Buy Price does NOT block unless
+     TFB_PF_BLOCK_MISSING_COST_BASIS=1.
   2. Low-confidence cap (L8 analog): reliability < 60 caps any computed
      ADD/TRIM/EXIT down to HOLD ("manual review") — weak signals never trade.
   3. EXIT   — valuation ROI ≤ exit_roi_pct (default −15: price ≳17.6% above
@@ -128,6 +160,10 @@ ENV KILL-SWITCHES (read per call; explicit controls > env > defaults)
   TFB_PF_REVIEW_DAYS      "30"   review-by horizon
   TFB_PF_LOT_SIZE         "1"    share lot rounding for ADD sizing
   TFB_PF_MAX_HOLDINGS     "0"    0 = unlimited; CPU safety clamp
+  TFB_PF_COST_BASIS_GATE  "1"    v1.0.2: "0" ⇒ skip cost-basis plausibility BLOCK
+  TFB_PF_COST_MAX_RATIO   "5"    v1.0.2: Buy Price > this x price ⇒ BLOCK (high)
+  TFB_PF_COST_MIN_RATIO   "0.2"  v1.0.2: Buy Price < this x price ⇒ BLOCK (low)
+  TFB_PF_BLOCK_MISSING_COST_BASIS "0" v1.0.2: "1" ⇒ blank Buy Price also BLOCKs
 
 HONESTY RULES (L13): zero ADDs, all-HOLD, empty holdings, unknown trends and
 None P&L are CORRECT outputs; nothing is upgraded or padded to fill space.
@@ -139,7 +175,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 
-PORTFOLIO_ACTIONS_VERSION = "1.0.1"
+PORTFOLIO_ACTIONS_VERSION = "1.0.2"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -166,6 +202,11 @@ ACTIONS = (ACTION_ADD, ACTION_HOLD, ACTION_TRIM, ACTION_EXIT, ACTION_BLOCK)
 
 _SELL_TIER = {"SELL", "STRONGSELL", "EXIT", "AVOID", "REDUCE"}
 
+# v1.0.2: every cost-basis BLOCK reason contains this marker. One predicate
+# (_is_cost_basis_block) keys off it so the scrub, the alert count, and the
+# missing-basis exclusion can never drift apart if a reason is reworded.
+_CB_BLOCK_MARKER = "review cost basis"
+
 REBALANCE_ADVISORY = "Advisory Only"
 REBALANCE_TARGETS = "Rebalance to Targets"
 REBALANCE_NEW_CASH = "New Cash Only"
@@ -190,14 +231,20 @@ DEFAULT_CONTROLS = {
     "period_months": 12,
     # v1.0.1 engine-forecast display (env-tunable; see policy block)
     "engine_roi_display_enabled": False,
+    # v1.0.2 cost-basis plausibility gate (Phase 0; env-tunable, see policy)
+    "cost_basis_gate_enabled": True,
+    "cost_max_ratio": 5.0,
+    "cost_min_ratio": 0.2,
+    "block_missing_cost_basis": False,
 }
 
 _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
                    "max_sector_pct", "min_reliability_add", "min_dq_add",
                    "add_roi_pct", "trim_roi_pct", "exit_roi_pct",
-                   "valuation_trim_frac")
+                   "valuation_trim_frac", "cost_max_ratio", "cost_min_ratio")
 _CONTROLS_INT = ("review_days", "lot_size", "max_holdings", "period_months")
-_CONTROLS_BOOL = ("engine_roi_display_enabled",)
+_CONTROLS_BOOL = ("engine_roi_display_enabled", "cost_basis_gate_enabled",
+                  "block_missing_cost_basis")
 
 
 def _env_str(name, default):
@@ -222,6 +269,21 @@ def _env_int(name, default):
 def _env_enabled():
     return str(_env_str("TFB_PF_ENABLED", "1")).strip().lower() not in (
         "0", "false", "no", "off")
+
+
+def _env_cost_basis_gate():
+    """v1.0.2: master switch for the cost-basis plausibility BLOCK. Default ON;
+    set TFB_PF_COST_BASIS_GATE=0 to restore v1.0.1 behavior (gate skipped)."""
+    return str(_env_str("TFB_PF_COST_BASIS_GATE", "1")).strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _env_block_missing_cost_basis():
+    """v1.0.2: strict-audit toggle. Default OFF; set
+    TFB_PF_BLOCK_MISSING_COST_BASIS=1 to BLOCK holdings whose Buy Price is
+    blank (otherwise a missing basis is tolerated per the v1.0.0 contract)."""
+    return str(_env_str("TFB_PF_BLOCK_MISSING_COST_BASIS", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
 
 
 def _env_engine_roi_display():
@@ -264,6 +326,12 @@ def _env_overrides():
         "max_holdings": _env_int("TFB_PF_MAX_HOLDINGS",
                                  DEFAULT_CONTROLS["max_holdings"]),
         "engine_roi_display_enabled": _env_engine_roi_display(),
+        "cost_basis_gate_enabled": _env_cost_basis_gate(),
+        "cost_max_ratio": _env_float("TFB_PF_COST_MAX_RATIO",
+                                     DEFAULT_CONTROLS["cost_max_ratio"]),
+        "cost_min_ratio": _env_float("TFB_PF_COST_MIN_RATIO",
+                                     DEFAULT_CONTROLS["cost_min_ratio"]),
+        "block_missing_cost_basis": _env_block_missing_cost_basis(),
     }
 
 
@@ -293,6 +361,15 @@ def make_controls(overrides=None):
         ctl["valuation_trim_frac"] = DEFAULT_CONTROLS["valuation_trim_frac"]
     if ctl["target_cash_pct"] < 0:
         ctl["target_cash_pct"] = 0.0
+    # v1.0.2: keep the plausibility band sane (high > 1x, low in (0,1),
+    # low < high); reset to defaults on any misconfiguration.
+    if ctl["cost_max_ratio"] <= 1.0:
+        ctl["cost_max_ratio"] = DEFAULT_CONTROLS["cost_max_ratio"]
+    if not (0.0 < ctl["cost_min_ratio"] < 1.0):
+        ctl["cost_min_ratio"] = DEFAULT_CONTROLS["cost_min_ratio"]
+    if ctl["cost_min_ratio"] >= ctl["cost_max_ratio"]:
+        ctl["cost_min_ratio"] = DEFAULT_CONTROLS["cost_min_ratio"]
+        ctl["cost_max_ratio"] = DEFAULT_CONTROLS["cost_max_ratio"]
     mode = str(ctl.get("rebalance_mode") or REBALANCE_ADVISORY)
     low = mode.strip().lower()
     if "new cash" in low:
@@ -315,6 +392,20 @@ def _to_float(v):
         return None
 
 
+def _pos_float(v):
+    """v1.0.2: finite, strictly-positive float or None (bool-guarded). Used by
+    the cost-basis gate so a 'present but zero/negative/non-numeric' value
+    coerces to None while genuine positive values pass through. Delegates the
+    parse to _to_float so coercion stays consistent with the rest of the
+    module."""
+    if isinstance(v, bool):
+        return None
+    f = _to_float(v)
+    if f is None or not math.isfinite(f) or f <= 0:
+        return None
+    return f
+
+
 def _ob_version_ok():
     if _ob is None:
         return False
@@ -335,25 +426,42 @@ _COST_KEYS = ("buyprice", "avgcost", "averagecost", "costbasis",
 
 
 def _position_fields(row):
-    """Extract Quantity / Buy Price from a raw row via normalized tokens."""
+    """Extract Quantity / Buy Price from a raw row via normalized tokens.
+
+    v1.0.2: also returns the RAW Buy Price cell (cost_raw) — the first present
+    (non-empty) value seen in any cost-alias column, pre-coercion — so the
+    cost-basis gate can tell an EMPTY cell (no basis, tolerated) from a
+    PRESENT-but-unparseable one ("N/A", "TBD" — a basis the user typed wrong,
+    which the gate should block). _to_float collapses both to None, so the raw
+    is the only thing that preserves the distinction. Returns (qty, cost,
+    cost_raw)."""
     qty = None
     cost = None
+    cost_raw = None
     for key, val in (row or {}).items():
         tok = _ob._norm_token(key) if _ob is not None else str(key).lower()
         if qty is None and tok in _QTY_KEYS:
             qty = _to_float(val)
-        elif cost is None and tok in _COST_KEYS:
-            cost = _to_float(val)
-    return qty, cost
+        elif tok in _COST_KEYS:
+            if cost_raw is None and val is not None and str(val).strip() != "":
+                cost_raw = val
+            if cost is None:
+                f = _to_float(val)
+                if f is not None:
+                    cost = f
+    return qty, cost, cost_raw
 
 
 def normalize_holding(row, fx_rates, controls):
     """opportunity_builder.normalize_candidate + position economics."""
     crit = _ob.make_criteria({"period_months": controls["period_months"]})
     cand = _ob.normalize_candidate(row, fx_rates, crit)
-    qty, avg_cost = _position_fields(row)
+    qty, avg_cost, avg_cost_raw = _position_fields(row)
     cand["quantity"] = qty
     cand["avg_cost"] = avg_cost
+    # v1.0.2: internal-only; never emitted in a row (kept for the gate's
+    # blank-vs-unparseable distinction). Not surfaced by _action_row.
+    cand["avg_cost_raw"] = avg_cost_raw
     fx = cand.get("fx_to_sar")
     price = cand.get("price")
     if (qty is not None and qty > 0 and price is not None and
@@ -391,6 +499,76 @@ def _is_sell_tier(recommendation):
     return False
 
 
+def _is_cost_basis_block(action, reason):
+    """v1.0.2: True iff this entry is a BLOCK raised by the cost-basis gate
+    (vs a presence/data-gate BLOCK). Single source of truth for the scrub +
+    alert split."""
+    return action == ACTION_BLOCK and _CB_BLOCK_MARKER in (reason or "").lower()
+
+
+def _cost_basis_block_reason(avg_cost_raw, current_price, position_qty,
+                             controls):
+    """v1.0.2 Phase-0 plausibility gate for a held position's cost basis.
+
+    Takes the RAW Buy Price cell (pre-coercion) as avg_cost_raw and coerces it
+    internally, so a present-but-unparseable value ("N/A") is distinguished
+    from an empty cell — _to_float upstream would otherwise collapse both to
+    None and hide the difference.
+
+    Returns (ok, reason): ok=False => the caller emits a BLOCK (step 1, never
+    overridden). Self-contained so audit_data_quality / future callers can
+    reuse the identical rule.
+
+    A position is 'held' only when position_qty is a finite number > 0; the
+    qty presence gate already enforces this upstream, re-checked here so the
+    helper is safe to reuse. Policy (controls-tunable):
+      • Buy Price present but zero/negative/non-numeric         -> BLOCK
+      • Buy Price present and > cost_max_ratio  × current price -> BLOCK (high)
+      • Buy Price present and < cost_min_ratio  × current price -> BLOCK (low)
+      • Buy Price MISSING (None/blank) -> BLOCK only when
+        block_missing_cost_basis is set; otherwise OK (documented v1.0.0
+        behaviour: missing_cost_basis alert + None P&L, action still valid).
+    """
+    if _pos_float(position_qty) is None:
+        return True, None  # no valid holding — the qty presence gate owns this
+
+    cost = _pos_float(avg_cost_raw)
+    if cost is None:
+        is_blank = (avg_cost_raw is None or
+                    (isinstance(avg_cost_raw, str) and
+                     avg_cost_raw.strip() == ""))
+        if is_blank:
+            if controls.get("block_missing_cost_basis"):
+                return (False,
+                        "BLOCKED — review cost basis (no buy price recorded "
+                        "for a held position)")
+            return True, None  # tolerated; missing_cost_basis alert handles it
+        return (False,
+                "BLOCKED — review cost basis (buy price is zero, negative, or "
+                "non-numeric while a holding exists)")
+
+    price = _pos_float(current_price)
+    if price is None:
+        return (False,
+                "BLOCKED — review cost basis (no usable current price to "
+                "validate the buy price against)")
+
+    max_r = controls.get("cost_max_ratio") or DEFAULT_CONTROLS["cost_max_ratio"]
+    min_r = controls.get("cost_min_ratio") or DEFAULT_CONTROLS["cost_min_ratio"]
+    ratio = cost / price
+    if ratio > max_r:
+        return (False,
+                "BLOCKED — review cost basis (buy price %s is %.1fx the "
+                "current price %s — likely a data-entry error)"
+                % (_fmt(cost), ratio, _fmt(price)))
+    if ratio < min_r:
+        return (False,
+                "BLOCKED — review cost basis (buy price %s is %.2fx the "
+                "current price %s — likely a data-entry error)"
+                % (_fmt(cost), ratio, _fmt(price)))
+    return True, None
+
+
 def decide_action(cand, controls, weight_pct, sector_weight_pct,
                   sector_excess_share_sar):
     """Pure: one holding → (action, reason, proceeds_sar, capped_from).
@@ -403,7 +581,7 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
     rel = cand.get("reliability")
     conf = _ob.confidence_band(rel) if _ob is not None else "Low"
 
-    # 1. BLOCK — data gate
+    # 1. BLOCK — data gate (presence: price / fx / quantity)
     missing = []
     if cand.get("price") is None:
         missing.append("price")
@@ -415,6 +593,20 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
         return (ACTION_BLOCK,
                 "Data gate: missing " + "/".join(missing) +
                 " — manual review required", 0.0, None)
+
+    # 1b. BLOCK — cost-basis plausibility (v1.0.2; Phase 0, Finding 2).
+    #     Presence (gate above) is not plausibility: a held position can pass
+    #     with qty AND buy price present yet carry an absurd basis (BBD: 250
+    #     against a ~2.50 quote = 100x → a confident ADD on garbage economics).
+    #     When ON (default) a present-but-implausible basis BLOCKs here, still
+    #     inside the never-overridden step-1 gate. A MISSING basis keeps the
+    #     v1.0.0 contract unless block_missing_cost_basis is set.
+    if controls.get("cost_basis_gate_enabled"):
+        cb_ok, cb_reason = _cost_basis_block_reason(
+            cand.get("avg_cost_raw"), cand.get("price"),
+            cand.get("quantity"), controls)
+        if not cb_ok:
+            return (ACTION_BLOCK, cb_reason, 0.0, None)
 
     roi = cand.get("roi_pct")
     reco = cand.get("recommendation")
@@ -828,6 +1020,17 @@ def _build(rows, ctl, fx_rates, upstream_meta):
             "funds_from": None, "_sector_room_sar": sec_room,
         })
 
+    # v1.0.2: a cost-basis BLOCK rejects the basis as untrusted — null its
+    # cost / P&L so neither the row (_action_row) nor the portfolio KPIs
+    # aggregate a figure derived from a basis we just rejected. Market value is
+    # price-based and stays. Mirrors the honest handling of a missing basis.
+    for e in entries:
+        if _is_cost_basis_block(e["action"], e["action_reason"]):
+            cb = e["cand"]
+            cb["cost_sar"] = None
+            cb["pnl_sar"] = None
+            cb["pnl_pct"] = None
+
     # Pass 3 — L7 funding
     deployable, proceeds_inc, adds_funded, cash_floor = fund_adds(
         entries, ctl, cash, total_value)
@@ -882,11 +1085,22 @@ def _build(rows, ctl, fx_rates, upstream_meta):
             alerts.append({"type": atype, "count": count,
                            "required_action": action_text})
 
-    _alert("blocked_positions", counts[ACTION_BLOCK],
+    # v1.0.2: split BLOCK alerts so the required action is accurate. Cost-basis
+    # blocks get their own alert; presence blocks keep theirs; missing_cost_
+    # basis excludes cost-basis blocks (whose cost was just nulled) so a row is
+    # never flagged twice.
+    cb_blocked = sum(1 for e in entries
+                     if _is_cost_basis_block(e["action"], e["action_reason"]))
+    _alert("blocked_positions", counts[ACTION_BLOCK] - cb_blocked,
            "Fix missing price/FX/quantity for blocked rows")
+    _alert("cost_basis_blocked", cb_blocked,
+           "Correct the Buy Price on flagged holdings — implausible vs the "
+           "current price")
     _alert("missing_cost_basis",
-           sum(1 for c in cands if c.get("cost_sar") is None and
-               c.get("market_value_sar") is not None),
+           sum(1 for e in entries
+               if e["cand"].get("cost_sar") is None and
+               e["cand"].get("market_value_sar") is not None and
+               not _is_cost_basis_block(e["action"], e["action_reason"])),
            "Fill Buy Price in _Portfolio_CostBasis for accurate P&L")
     _alert("over_position_cap",
            sum(1 for e in entries
