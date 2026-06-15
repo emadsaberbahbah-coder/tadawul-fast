@@ -1,7 +1,35 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P2)
+Version: 1.0.6   (TFB Final Execution Plan v5.0 — Phase P2;
+                 Engineering Audit Phase 0 — data-trust gate)
+
+v1.0.6 [DATA-TRUST-GATE]: the engine DETECTS thin/stale coverage (it captures
+each row's investability verdict + last_updated into cand.engine_gate) but
+that detection NEVER gated selection — engine_gate was carried and ignored,
+and there was no freshness or coverage check anywhere. The hard fields each
+have their own MAJOR gate (Price/FX/Valuation/ROI/DQ/R-R/Reliability), so a
+name that RANKS despite being sparse has those filled while the SECONDARY
+signals (risk_level, vol_30d, avg-volume/liquidity, recommendation, news/sector
+trend) are all Unknown — and the gates let Unknown pass by design ("until P9").
+5023.SR rode that path: warned upstream, then ranked, then held. Detection
+existed; it just never became a decision (Engineering Audit, Phase 0). FIX
+(default ON; mirrors the v1.0.3/v1.0.4 local-gate pattern — no engine change,
+no edit to L2/L5/L6/L7, scoring, sizing, or the verdict↔gate-trace contract):
+a new "Data Trust" gate fails MAJOR (=> DO_NOT_INVEST, so the name still
+appears in the audit grid / near-miss but is NEVER a selected ticket) when a
+candidate is STALE — last_updated older than max_data_age_hours (default 168h;
+an UNPARSEABLE/absent timestamp is never treated as stale, so freshness only
+fails on PROVEN staleness) — OR THINLY COVERED — fewer than min_trust_fields
+(default 2, deliberately conservative) of the six secondary signals present.
+The gate is appended ONLY when trust_gate_enabled, so the gate list and verdict
+are byte-identical to v1.0.5 when TFB_OPP_TRUST_GATE=0 (only the version stamp
+moves). Per-run telemetry (evaluated / blocked / blocked_stale / blocked_thin)
+is surfaced in meta.trust_gate and each gate carries trust_detail, so the
+exclusion's effect is measurable run-over-run and the coverage bar can be tuned
+from data rather than guessed. Forward-compatible: when data_engine_v2 later
+emits an explicit trust_level, this same gate absorbs it with no restructuring.
+Every v1.0.5 byte carried forward verbatim.
 
 v1.0.5 [ENGINE-ROI-DISPLAY]: the executable ticket "ROI %" and "Exp Gain 12M"
 are PURE VALUATION upside — roi_pct = (ref - price)/price — while the engine's
@@ -104,6 +132,9 @@ ENV KILL-SWITCHES (policy block — read per call, not at import)
   TFB_OPP_REVIEW_DAYS      "30"  review-by horizon for advisor sentence
   TFB_OPP_MAX_CANDIDATES   "0"   0 = unlimited; CPU safety clamp on input rows
   TFB_OPP_PF_MAX_SECTOR_PCT "30" post-action portfolio sector cap (§4.2)
+  TFB_OPP_TRUST_GATE       "1"   v1.0.6: "0" ⇒ skip the Data Trust MAJOR gate
+  TFB_OPP_MAX_DATA_AGE_HOURS "168" v1.0.6: last_updated older ⇒ stale ⇒ fail
+  TFB_OPP_MIN_TRUST_FIELDS "2"   v1.0.6: fewer core signals present ⇒ thin ⇒ fail
 Explicit `criteria` overrides > env > defaults.
 
 INTEGRATION
@@ -130,7 +161,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.5"
+OPPORTUNITY_BUILDER_VERSION = "1.0.6"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -213,6 +244,41 @@ OPPORTUNITY_BUILDER_VERSION = "1.0.5"
 # a separate (engine-side) change.
 
 # ---------------------------------------------------------------------------
+# v1.0.6 [DATA-TRUST-GATE] — sparse/stale exclusion (env-gated, default ON)
+# ---------------------------------------------------------------------------
+# ROOT CAUSE (live 2026-06-15): normalize_candidate already CAPTURES the
+# engine's own trust signals — investability verdict, block reasons, provider,
+# last_updated — into cand["engine_gate"], but evaluate_gates reads NONE of
+# them, and there is no freshness or coverage check at all. Each hard field has
+# its own MAJOR gate, so any name that survives to RANK has price / fx /
+# valuation / dq / r-r / reliability filled; what's left thin is the SECONDARY
+# signal set (risk_level, vol_30d, avg-volume→liquidity, recommendation,
+# news_trend, sector_trend), and the gates pass Unknown by design until P9. A
+# genuinely sparse row (5023.SR) therefore screens through: the engine warned
+# on it, the builder ranked it anyway, and the portfolio held it. The detection
+# was there; it never escalated into a selection decision.
+#
+# FIX (mirrors the v1.0.3 Forecast and v1.0.4 Valuation-Sanity gates — a local,
+# env-gated MAJOR gate; the LOCKED engine is untouched and L2/L5/L6/L7, the
+# score, the sizing, and the verdict↔gate-trace contract are all preserved): a
+# "Data Trust" gate fails MAJOR (=> DO_NOT_INVEST; the name shows in the audit
+# grid / near-miss but is NEVER selected) when the candidate is STALE
+# (engine_gate.last_updated older than max_data_age_hours — an unparseable or
+# absent timestamp is NOT treated as stale, so freshness fails only on PROVEN
+# staleness) OR THINLY COVERED (fewer than min_trust_fields of the six secondary
+# signals present). Defaults: 168h staleness (a wide net that spares weekend /
+# holiday gaps and only catches abandoned quotes) and a conservative coverage
+# floor of 2 (a typical good name carries ~4 of the six; a barren row carries
+# 0-1) so the day-one false-positive surface is small and the bar is tuned UP
+# from telemetry, not guessed. Per-run counts land in meta.trust_gate and each
+# gate carries trust_detail (stale / thin / age_hours / signals_present), so the
+# exclusion is measurable and auditable run-over-run. Env-toggled by
+# TFB_OPP_TRUST_GATE (default ON) — set it to 0 to restore byte-identical v1.0.5
+# behavior — with TFB_OPP_MAX_DATA_AGE_HOURS and TFB_OPP_MIN_TRUST_FIELDS
+# tuning the two thresholds. Forward-compatible: a future engine trust_level
+# plugs into this same gate without restructuring. Every v1.0.5 byte verbatim.
+
+# ---------------------------------------------------------------------------
 # §4.1 control-panel defaults (mirrors _Lists_Config TFB_PANEL_DEFAULTS T10:*)
 # ---------------------------------------------------------------------------
 
@@ -252,22 +318,28 @@ DEFAULT_CRITERIA = {
     "max_valuation_roi_pct": 80.0,
     # v1.0.5 engine-forecast display (env-tunable; see policy block)
     "engine_roi_display_enabled": False,
+    # v1.0.6 data-trust gate (env-tunable; see policy block)
+    "trust_gate_enabled": True,
+    "max_data_age_hours": 168.0,
+    "min_trust_fields": 2,
 }
 
 _CRITERIA_FLOAT_KEYS = (
     "required_roi_pct", "required_ann_roi_pct", "min_reliability", "min_dq",
     "min_rr", "max_weight_pct", "stop_floor_pct", "stop_vol_mult",
     "stop_max_pct", "pf_max_sector_pct", "min_engine_roi_pct",
-    "max_valuation_roi_pct",
+    "max_valuation_roi_pct", "max_data_age_hours",
 )
 _CRITERIA_INT_KEYS = (
     "max_selected", "period_months", "max_per_sector", "max_per_market",
     "lot_size", "near_miss_n", "review_days", "max_candidates",
+    "min_trust_fields",
 )
 _CRITERIA_BOOL_KEYS = (
     "allow_conflict", "allow_negative_news", "allow_negative_sector",
     "include_portfolio_holdings", "forecast_gate_enabled",
     "valuation_sanity_gate_enabled", "engine_roi_display_enabled",
+    "trust_gate_enabled",
 )
 
 # ---------------------------------------------------------------------------
@@ -305,8 +377,8 @@ DIVERSIFICATION_NO_CONTEXT = 60.0
 # §4.2 gate evaluation order (first fail in this order = headline failed_gate)
 GATE_ORDER = (
     "Price", "FX", "Valuation", "ROI", "Annualized ROI", "Forecast",
-    "Reliability", "Data Quality", "Risk Level", "Risk/Reward", "Conflict",
-    "News", "Sector Trend", "Portfolio",
+    "Reliability", "Data Quality", "Data Trust", "Risk Level", "Risk/Reward",
+    "Conflict", "News", "Sector Trend", "Portfolio",
 )
 
 FAIL_MAJOR = "MAJOR"
@@ -393,6 +465,14 @@ def _env_engine_roi_display():
         in ("1", "true", "yes", "on")
 
 
+def _env_trust_gate():
+    """v1.0.6: data-trust gate toggle. Default ON; set TFB_OPP_TRUST_GATE=0 to
+    restore byte-identical v1.0.5 behavior (the Data Trust gate is not
+    appended)."""
+    return str(_env_str("TFB_OPP_TRUST_GATE", "1")).strip().lower() not in (
+        "0", "false", "no", "off")
+
+
 def _env_overrides():
     """Mechanics block of criteria, env-tunable (policy block)."""
     return {
@@ -423,6 +503,13 @@ def _env_overrides():
             DEFAULT_CRITERIA["max_valuation_roi_pct"]),
         "valuation_sanity_gate_enabled": _env_valuation_sanity_gate(),
         "engine_roi_display_enabled": _env_engine_roi_display(),
+        "trust_gate_enabled": _env_trust_gate(),
+        "max_data_age_hours": _env_float(
+            "TFB_OPP_MAX_DATA_AGE_HOURS",
+            DEFAULT_CRITERIA["max_data_age_hours"]),
+        "min_trust_fields": _env_int(
+            "TFB_OPP_MIN_TRUST_FIELDS",
+            DEFAULT_CRITERIA["min_trust_fields"]),
     }
 
 
@@ -800,6 +887,98 @@ def _engine_roi_to_pct(value):
     return v * 100.0 if abs(v) < 1.5 else v
 
 
+# v1.0.6 [DATA-TRUST-GATE] helpers ------------------------------------------
+# The six secondary signals the gate measures for "thin coverage". The hard
+# fields already have their own MAJOR gates, so trust keys off what the engine
+# leaves Unknown on a sparse row. Trend fields read "Unknown" (never None) when
+# absent; the rest read None.
+_TRUST_SIGNAL_FIELDS = ("risk_level", "vol_30d_pct", "liquidity_sar",
+                        "recommendation", "news_trend", "sector_trend")
+
+
+def _trust_signal_count(cand):
+    """How many of the six secondary signals are actually present on a
+    candidate (Unknown trend == absent). Max 6; a typical good name carries
+    ~4, a barren row 0-1."""
+    n = 0
+    if cand.get("risk_level"):
+        n += 1
+    if cand.get("vol_30d_pct") is not None:
+        n += 1
+    if cand.get("liquidity_sar") is not None:  # avg_volume_30d presence proxy
+        n += 1
+    if cand.get("recommendation"):
+        n += 1
+    if cand.get("news_trend") not in (None, "Unknown"):
+        n += 1
+    if cand.get("sector_trend") not in (None, "Unknown"):
+        n += 1
+    return n
+
+
+def _parse_age_hours(last_updated_text):
+    """Age in hours (float) of an ISO-ish timestamp vs now(UTC), or None when
+    unparseable/absent so the freshness sub-check is SKIPPED (never a false
+    stale block). Naive timestamps are assumed UTC; a future timestamp (clock
+    skew) is treated as age 0, not stale. stdlib-only."""
+    if not last_updated_text:
+        return None
+    s = str(last_updated_text).strip()
+    if not s:
+        return None
+    iso = s.replace("Z", "+00:00").replace("z", "+00:00")
+    dt = None
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except (ValueError, TypeError):
+                continue
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+    return 0.0 if age < 0 else age
+
+
+def _data_trust_assessment(cand, criteria):
+    """v1.0.6 Phase-0 trust signal for a Top_10 candidate. Returns
+    (passed, current_str, detail). passed=False => the caller emits a MAJOR
+    'Data Trust' gate (=> DO_NOT_INVEST; audit/near-miss only, never selected).
+    Pure; never raises. Fails when the row is STALE (last_updated older than
+    max_data_age_hours; unparseable/absent is NOT stale) OR THINLY COVERED
+    (fewer than min_trust_fields of the six secondary signals present)."""
+    max_age = criteria.get("max_data_age_hours")
+    min_fields = int(criteria.get("min_trust_fields") or 0)
+    eng = cand.get("engine_gate") or {}
+    age_h = _parse_age_hours(eng.get("last_updated"))
+    stale = (max_age is not None and max_age > 0 and
+             age_h is not None and age_h > max_age)
+    present = _trust_signal_count(cand)
+    thin = present < min_fields
+    passed = not (stale or thin)
+    if passed:
+        cur = ("ok (%d/6 signals%s)"
+               % (present, "" if age_h is None
+                  else ", %.1fd old" % (age_h / 24.0)))
+    else:
+        bits = []
+        if stale:
+            bits.append("stale %.1fd" % (age_h / 24.0))
+        if thin:
+            bits.append("thin %d/6 signals" % present)
+        cur = "; ".join(bits)
+    detail = {"stale": bool(stale), "thin": bool(thin),
+              "age_hours": (None if age_h is None else round(age_h, 1)),
+              "signals_present": present}
+    return passed, cur, detail
+
+
 def evaluate_gates(cand, criteria, held_symbols=None):
     """Per-row §4.2 gates in plan order. Diversification is selection-time
     (handled in the pick loop) and intentionally absent here."""
@@ -883,6 +1062,27 @@ def evaluate_gates(cand, criteria, held_symbols=None):
     dq_ok = cand["dq"] is not None and cand["dq"] >= criteria["min_dq"]
     g.append(_gate("Data Quality", dq_ok, FAIL_MAJOR, _round1(cand["dq"]),
                    ">= " + _fmt_num(criteria["min_dq"])))
+
+    # v1.0.6 [DATA-TRUST-GATE]: the engine captures investability / last_updated
+    # into cand.engine_gate but it gated nothing, and there was no freshness or
+    # coverage check; a sparse row (hard fields filled, secondary signals all
+    # Unknown) screened straight through to ranking (5023.SR). This gate fails
+    # MAJOR (=> DO_NOT_INVEST; appears in audit / near-miss but never selected)
+    # when the row is STALE (last_updated older than max_data_age_hours;
+    # unparseable/absent is NOT stale) OR THINLY COVERED (fewer than
+    # min_trust_fields of the six secondary signals present). Appended ONLY when
+    # trust_gate_enabled, so the gate list and verdict are byte-identical to
+    # v1.0.5 when TFB_OPP_TRUST_GATE=0. trust_detail rides on the gate for the
+    # audit grid and meta.trust_gate telemetry.
+    if criteria.get("trust_gate_enabled"):
+        t_ok, t_cur, t_detail = _data_trust_assessment(cand, criteria)
+        tg = _gate(
+            "Data Trust", t_ok, FAIL_MAJOR, t_cur,
+            ("fresh (<= " + _fmt_num(criteria.get("max_data_age_hours")) +
+             "h) AND >= " + str(int(criteria.get("min_trust_fields") or 0)) +
+             "/6 core signals"))
+        tg["trust_detail"] = t_detail
+        g.append(tg)
 
     cap = _norm_risk(criteria["max_risk_level"]) or "Medium"
     risk = cand["risk_level"]
@@ -1403,6 +1603,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     # 1) normalize → gates → verdict → score (audit grid, 1:1 trace)
     audit = []
     gate_fail_counts = {}
+    trust_stats = {"evaluated": 0, "blocked": 0,
+                   "blocked_stale": 0, "blocked_thin": 0}
     for raw in rows:
         cand = normalize_candidate(raw, fx_rates, crit)
         gates = evaluate_gates(cand, crit, held)
@@ -1418,6 +1620,15 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                     g["gate"], {"MAJOR": 0, "NON_CRITICAL": 0,
                                 "STRUCTURAL": 0})
                 bucket[g["fail_class"]] += 1
+            if g["gate"] == "Data Trust":
+                trust_stats["evaluated"] += 1
+                td = g.get("trust_detail") or {}
+                if not g["passed"]:
+                    trust_stats["blocked"] += 1
+                    if td.get("stale"):
+                        trust_stats["blocked_stale"] += 1
+                    if td.get("thin"):
+                        trust_stats["blocked_thin"] += 1
         structural_block = any(g["fail_class"] == FAIL_STRUCTURAL
                                for g in gates)
         audit.append({
@@ -1505,6 +1716,15 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     meta = {
         "criteria_snapshot": crit,
         "gate_trace_counts": gate_fail_counts,
+        "trust_gate": {
+            "enabled": bool(crit.get("trust_gate_enabled")),
+            "max_data_age_hours": crit.get("max_data_age_hours"),
+            "min_trust_fields": crit.get("min_trust_fields"),
+            "evaluated": trust_stats["evaluated"],
+            "blocked": trust_stats["blocked"],
+            "blocked_stale": trust_stats["blocked_stale"],
+            "blocked_thin": trust_stats["blocked_thin"],
+        },
         "coverage": meta_in.get("coverage"),
         "budget": meta_in.get("budget"),
         "timeouts": meta_in.get("timeouts"),
@@ -1575,6 +1795,12 @@ def _skeleton(status, message, criteria):
         "candidates_rows": [],
         "meta": {"criteria_snapshot": criteria,
                  "gate_trace_counts": {},
+                 "trust_gate": {
+                     "enabled": bool(criteria.get("trust_gate_enabled")),
+                     "max_data_age_hours": criteria.get("max_data_age_hours"),
+                     "min_trust_fields": criteria.get("min_trust_fields"),
+                     "evaluated": 0, "blocked": 0,
+                     "blocked_stale": 0, "blocked_thin": 0},
                  "coverage": None, "budget": None, "timeouts": None,
                  "freshness": None,
                  "versions": {"opportunity_builder":
