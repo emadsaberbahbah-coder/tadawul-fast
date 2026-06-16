@@ -475,23 +475,25 @@ jobs:
             exit 1
           fi
 
-          # --- Scoped --clear: split SYNC_KEYS so the regenerable pages are
-          # cleared before write (kills the stale+fresh duplicate rows that
-          # in-place writes leave behind when the row set shrinks/reorders),
-          # while MY_PORTFOLIO is written WITHOUT --clear. My_Portfolio's
-          # Qty/Avg Cost are manually entered; a --clear before a partial/empty
-          # fetch would erase those rows permanently, so in-place overwrite is
-          # the safe path for that one page.
-          CLEAR_KEYS=""
+          # --- Clear scoping: run_dashboard_sync.py CLEARS each page before
+          # write by DEFAULT (this kills the stale+fresh duplicate rows that a
+          # partial in-place write leaves behind when the row set shrinks or
+          # reorders). That default is correct for the regenerable pages, but
+          # DANGEROUS for MY_PORTFOLIO: its Qty/Avg Cost are entered by hand, so
+          # a clear before a partial/empty fetch would wipe holdings
+          # permanently. MY_PORTFOLIO is therefore run with --no-clear (in-place
+          # overwrite); every other page keeps the default clear. Split
+          # SYNC_KEYS into those two groups.
+          DEFAULT_KEYS=""
           PORTFOLIO_KEYS=""
           for k in $SYNC_KEYS; do
             if [ "$k" = "MY_PORTFOLIO" ]; then
               PORTFOLIO_KEYS="$PORTFOLIO_KEYS $k"
             else
-              CLEAR_KEYS="$CLEAR_KEYS $k"
+              DEFAULT_KEYS="$DEFAULT_KEYS $k"
             fi
           done
-          CLEAR_KEYS="$(echo $CLEAR_KEYS | xargs || true)"
+          DEFAULT_KEYS="$(echo $DEFAULT_KEYS | xargs || true)"
           PORTFOLIO_KEYS="$(echo $PORTFOLIO_KEYS | xargs || true)"
 
           DRY_RUN_FLAG=""
@@ -512,7 +514,7 @@ jobs:
           : > "$LOG_FILE"
 
           run_sync_group() {
-            # $1 = extra flag (--clear or ""); $2 = space-separated keys
+            # $1 = extra flag (--no-clear or ""); $2 = space-separated keys
             local EXTRA="$1"; local KEYS="$2"
             [ -z "$KEYS" ] && return 0
             local -a C=(python scripts/run_dashboard_sync.py --backend "$TARGET_URL" --sheet-id "$TARGET_SHEET_ID" --keys $KEYS)
@@ -526,9 +528,9 @@ jobs:
           START_TIME="$(date +%s)"
           EXIT_CODE=0
           set +e
-          run_sync_group "" "$PORTFOLIO_KEYS"; rc=$?
+          run_sync_group "--no-clear" "$PORTFOLIO_KEYS"; rc=$?
           [ "$rc" -gt "$EXIT_CODE" ] && EXIT_CODE="$rc"
-          run_sync_group "--clear" "$CLEAR_KEYS"; rc=$?
+          run_sync_group "" "$DEFAULT_KEYS"; rc=$?
           [ "$rc" -gt "$EXIT_CODE" ] && EXIT_CODE="$rc"
           set -e
           END_TIME="$(date +%s)"
