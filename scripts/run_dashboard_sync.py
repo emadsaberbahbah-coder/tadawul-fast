@@ -3,9 +3,50 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.4.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.5.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.5.0 fix — My_Portfolio manual-cell write guard (irreversible-loss prevention)
+- WHY: My_Portfolio carries user-authored ("manual") inputs that live ONLY in
+  the sheet and are NEVER re-derivable from a market feed — position quantity
+  and average cost (and, downstream, the position math computed from them). The
+  backend echoes those cells back in the sync payload after reading them via the
+  engine's sheet rows-reader. If that upstream read transiently misses (a Sheets
+  API hiccup, a cold reader), the payload returns those manual cells BLANK while
+  the live sheet still holds the real values. A normal write then overwrites the
+  user's real Qty/Avg Cost with blanks — irreversible data loss.
+- FIX: before writing My_Portfolio (and ONLY My_Portfolio), the runner now
+  independently re-reads the live sheet and checks whether any symbol that
+  currently HAS manual data (Qty / Avg Cost) would be regressed to BLANK by the
+  outgoing payload. If so — or if that verification read itself cannot be
+  trusted — the write is SKIPPED for this cycle (status=partial + warning).
+  Nothing is cleared, nothing is written; the existing row (manual inputs AND
+  the computed columns derived from them) is preserved whole and self-heals on
+  the next healthy sync.
+- WHY WHOLE-ROW SKIP (not per-cell merge): the upstream rows-reader reads the
+  grid in a single call — it gets every row or none. On a miss, the manual
+  inputs AND their computed columns (position value / unrealized P&L) blank out
+  together. A per-cell merge would keep Qty/Avg Cost but still write a BLANK
+  position value against a FRESH price — a misleading, internally-inconsistent
+  half-row. Skipping the whole write keeps the row consistent and correct.
+- SCOPE / SAFETY:
+    * Applies to My_Portfolio only; every other page is byte-for-byte unchanged.
+    * Gated by TFB_SYNC_MANUAL_GUARD (default ON; set 0/false/off to disable —
+      disabling restores pre-v6.5.0 write-through behavior exactly).
+    * Pages overridable via TFB_SYNC_MANUAL_GUARD_PAGES (comma-separated list).
+    * Fail-safe: any uncertainty (read error, unmappable header/symbol column,
+      missing manual columns on the payload) skips the write to protect existing
+      data — the guard NEVER writes blind. A persistently-skipping My_Portfolio
+      therefore means the guard is protecting data, not losing it; check the
+      "[v6.5.0 PORTFOLIO-GUARD]" log line for the specific reason.
+    * Robust to layout: the verification read locates the header row by content
+      (symbol + manual columns), so a header at row 1 OR at the A5 default with
+      title rows above are both handled, and column reorder is tolerated via
+      normalized header-name matching.
+- UNCHANGED: every endpoint, payload, task definition, matrix rectification,
+  credential loading, exit codes, the clear-before-write default, and the
+  schema-agnostic write path.
 
 v6.4.0 fix — clear-before-write is now the DEFAULT (ghost/stale-row root cause)
 - ROOT CAUSE: write_table() writes via Sheets values.update, which overwrites
@@ -66,7 +107,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.4.0"
+SCRIPT_VERSION = "6.5.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -621,6 +662,219 @@ class SheetsWriter:
 
         return max(0, len(values) - (1 if hdr else 0))
 
+    def read_values(
+        self,
+        spreadsheet_id: str,
+        sheet_name: str,
+        a1_range: str = "A1:EZ2000",
+    ) -> Optional[List[List[Any]]]:
+        """
+        Read a rectangular block of UNFORMATTED cell values from a sheet.
+
+        Returns the list of rows on success (possibly an empty list when the
+        sheet/range holds no data), or None on ANY failure (no service, API
+        error) so callers can distinguish 'sheet is empty' (->[]) from 'read
+        could not be performed' (->None). The write service account has full
+        spreadsheets scope (read + write), so this reuses the same service the
+        writer already builds.
+        """
+        svc = self._get_service()
+        if not svc:
+            return None
+        try:
+            rng = f"{self._safe_sheet_a1(sheet_name)}!{a1_range}"
+            resp = svc.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=rng,
+                majorDimension="ROWS",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute()
+            vals = resp.get("values", [])
+            return vals if isinstance(vals, list) else []
+        except Exception:
+            return None
+
+
+# -----------------------------------------------------------------------------
+# My_Portfolio manual-cell write guard (v6.5.0)
+#
+# Prevents an upstream read miss (blank Qty/Avg Cost in the payload) from
+# overwriting the user's real, irreplaceable manual inputs on the live sheet.
+# Degraded-payload detection -> whole-write skip. See module docstring for the
+# full rationale. Fail-safe: any uncertainty skips the write to protect data.
+# -----------------------------------------------------------------------------
+_GUARD_TAG = "[v6.5.0 PORTFOLIO-GUARD]"
+
+# Default page(s) the guard protects. Overridable via env (comma list).
+_GUARD_DEFAULT_PAGES = ("My_Portfolio",)
+
+# High-confidence, unambiguously user-authored columns used as the degradation
+# sentinel. Deliberately limited to the position-math INPUTS (quantity +
+# average cost): their blanking is the exact symptom of an upstream read miss,
+# and they are never produced by a market feed (so a fresh payload that has
+# them blank — while the sheet still holds them — is a reliable failure signal).
+_GUARD_SENTINEL_ALIASES = frozenset({
+    # quantity
+    "qty", "positionqty", "quantity", "positionquantity", "shares", "units",
+    # average cost / entry price
+    "avgcost", "averagecost", "avgcostprice", "positionavgcost",
+    "avgprice", "averageprice", "costbasis", "avgbuyprice", "averagebuyprice",
+})
+
+# Symbol/identifier column aliases (for row matching across payload <-> sheet).
+_GUARD_SYMBOL_ALIASES = frozenset({
+    "symbol", "ticker", "tickersymbol", "symbolticker", "code", "instrument",
+})
+
+
+def _guard_norm(s: Any) -> str:
+    """Lowercase + strip non-alphanumerics (matches rows_reader normalization)."""
+    return re.sub(r"[^a-z0-9]+", "", str(s if s is not None else "").lower())
+
+
+def _guard_is_blank(v: Any) -> bool:
+    """A cell is blank iff it is None or a whitespace-only string. 0 is NOT blank."""
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return v.strip() == ""
+    return False
+
+
+def _guard_pages() -> set:
+    raw = (os.getenv("TFB_SYNC_MANUAL_GUARD_PAGES") or "").strip()
+    pages = [p.strip() for p in raw.split(",") if p.strip()] if raw else list(_GUARD_DEFAULT_PAGES)
+    return {_guard_norm(p) for p in pages}
+
+
+def _guard_enabled() -> bool:
+    return (os.getenv("TFB_SYNC_MANUAL_GUARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _guard_should_apply(sheet_name: str) -> bool:
+    """True iff the guard is enabled AND this page is in the protected set."""
+    if not _guard_enabled():
+        return False
+    return _guard_norm(sheet_name) in _guard_pages()
+
+
+def _guard_find_col(header_row: List[Any], aliases: frozenset) -> int:
+    """Index of the first header whose normalized name is in aliases, else -1."""
+    for i, h in enumerate(header_row or []):
+        if _guard_norm(h) in aliases:
+            return i
+    return -1
+
+
+def _guard_find_header_row(grid: List[List[Any]]) -> int:
+    """
+    Locate the header row within the first rows of a sheet read. Robust to any
+    title/branding rows above the header (e.g. a header written at the A5
+    default). The header is the first row that contains BOTH a symbol column and
+    at least one sentinel (manual) column. Returns the row index, or -1.
+    """
+    scan = min(len(grid or []), 15)
+    for r in range(scan):
+        row = grid[r] if isinstance(grid[r], list) else []
+        if _guard_find_col(row, _GUARD_SYMBOL_ALIASES) >= 0 and _guard_find_col(row, _GUARD_SENTINEL_ALIASES) >= 0:
+            return r
+    return -1
+
+
+def _portfolio_write_guard(
+    sheets: "SheetsWriter",
+    spreadsheet_id: str,
+    sheet_name: str,
+    headers: List[Any],
+    rows_matrix: List[List[Any]],
+) -> Tuple[bool, str]:
+    """
+    Decide whether it is safe to write a manual-input page (My_Portfolio) now.
+
+    Returns (allow_write, note):
+      - (True,  "")    -> safe; proceed with the normal write.
+      - (True,  note)  -> safe; proceed; note is informational only.
+      - (False, note)  -> NOT safe; SKIP the write to protect manual cells.
+
+    The guard reads the live sheet independently of the engine's reader and
+    refuses the write if any symbol that currently holds Qty/Avg Cost would be
+    blanked by the outgoing payload, or if the verification read cannot be
+    trusted (fail-safe -> skip, never write blind).
+    """
+    # Locate sentinel + symbol columns on the OUTGOING payload.
+    out_sym_idx = _guard_find_col(headers, _GUARD_SYMBOL_ALIASES)
+    out_sentinels = [i for i, h in enumerate(headers or []) if _guard_norm(h) in _GUARD_SENTINEL_ALIASES]
+    if out_sym_idx < 0 or not out_sentinels:
+        return (False, f"{_GUARD_TAG} skip: outgoing {sheet_name} payload is missing a symbol or manual (Qty/Avg Cost) column; write skipped to protect manual cells.")
+
+    # Read the live sheet (independent of the engine's reader path).
+    grid = sheets.read_values(spreadsheet_id, sheet_name) if sheets is not None else None
+    if grid is None:
+        return (False, f"{_GUARD_TAG} skip: could not read live {sheet_name} to verify manual cells; write skipped to protect data.")
+    if not grid:
+        # Read succeeded but sheet is empty (first write) -> nothing to lose.
+        return (True, "")
+
+    hdr_idx = _guard_find_header_row(grid)
+    if hdr_idx < 0:
+        return (False, f"{_GUARD_TAG} skip: could not locate a header row in live {sheet_name}; write skipped to protect data.")
+
+    ex_header = grid[hdr_idx] if isinstance(grid[hdr_idx], list) else []
+    ex_sym_idx = _guard_find_col(ex_header, _GUARD_SYMBOL_ALIASES)
+    if ex_sym_idx < 0:
+        return (False, f"{_GUARD_TAG} skip: live {sheet_name} header has no symbol column; write skipped to protect data.")
+
+    # Map existing sentinel columns by normalized header name so the comparison
+    # is like-for-like even if column ORDER differs between writes.
+    ex_sentinel_by_norm: Dict[str, int] = {}
+    for i, h in enumerate(ex_header):
+        n = _guard_norm(h)
+        if n in _GUARD_SENTINEL_ALIASES and n not in ex_sentinel_by_norm:
+            ex_sentinel_by_norm[n] = i
+
+    # Build {SYMBOL -> {sentinel_norm -> populated?}} from existing data rows.
+    existing: Dict[str, Dict[str, bool]] = {}
+    for r in range(hdr_idx + 1, len(grid)):
+        row = grid[r] if isinstance(grid[r], list) else []
+        if ex_sym_idx >= len(row):
+            continue
+        sym = str(row[ex_sym_idx]).strip().upper()
+        if not sym:
+            continue
+        flags: Dict[str, bool] = {}
+        for n, ci in ex_sentinel_by_norm.items():
+            val = row[ci] if ci < len(row) else None
+            flags[n] = not _guard_is_blank(val)
+        existing[sym] = flags
+
+    if not existing:
+        # No existing holdings carry manual data -> nothing to lose.
+        return (True, "")
+
+    # Normalized name for each outgoing sentinel column (for like-for-like cmp).
+    out_sentinel_norm = {i: _guard_norm(headers[i]) for i in out_sentinels}
+
+    regressed: List[str] = []
+    for row in rows_matrix or []:
+        if out_sym_idx >= len(row):
+            continue
+        sym = str(row[out_sym_idx]).strip().upper()
+        if not sym or sym not in existing:
+            continue
+        ex_flags = existing[sym]
+        for i, n in out_sentinel_norm.items():
+            new_blank = _guard_is_blank(row[i]) if i < len(row) else True
+            if new_blank and ex_flags.get(n, False):
+                regressed.append(sym)
+                break
+
+    if regressed:
+        uniq = sorted(set(regressed))
+        shown = ", ".join(uniq[:8]) + (" …" if len(uniq) > 8 else "")
+        return (False, f"{_GUARD_TAG} skip: outgoing payload would blank existing Qty/Avg Cost for {len(uniq)} holding(s) [{shown}]; write skipped to protect manual cells (self-heals on next healthy sync).")
+
+    return (True, "")
+
 
 # -----------------------------------------------------------------------------
 # Symbols reading (uses repo module if present)
@@ -903,6 +1157,26 @@ async def _run_one_task(
             res.rows_written = 0
             res.rows_failed = len(rows_matrix or [])
             return res
+
+        # --- My_Portfolio manual-cell write guard (v6.5.0) -------------------
+        # Independently verify this write will not blank user-authored Qty/Avg
+        # Cost on the live sheet. On ANY doubt, skip the write (the existing row
+        # is preserved whole and self-heals on the next healthy sync). Placed
+        # BEFORE the clear/write so a skip performs neither — never clear-then-
+        # skip. Scoped to manual pages; gated by TFB_SYNC_MANUAL_GUARD.
+        if rows_matrix and _guard_should_apply(task.sheet_name):
+            allow_write, guard_note = _portfolio_write_guard(
+                sheets, spreadsheet_id, task.sheet_name, headers, rows_matrix
+            )
+            if guard_note:
+                res.warnings.append(guard_note)
+                logger.warning(guard_note)
+            if not allow_write:
+                res.status = "partial"
+                res.rows_written = 0
+                res.rows_failed = len(rows_matrix or [])
+                return res
+        # ---------------------------------------------------------------------
 
         if clear_before_write:
             try:
