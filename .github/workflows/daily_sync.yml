@@ -475,13 +475,28 @@ jobs:
             exit 1
           fi
 
-          CMD=(python scripts/run_dashboard_sync.py)
-          CMD+=(--backend "$TARGET_URL")
-          CMD+=(--sheet-id "$TARGET_SHEET_ID")
-          CMD+=(--keys $SYNC_KEYS)
+          # --- Scoped --clear: split SYNC_KEYS so the regenerable pages are
+          # cleared before write (kills the stale+fresh duplicate rows that
+          # in-place writes leave behind when the row set shrinks/reorders),
+          # while MY_PORTFOLIO is written WITHOUT --clear. My_Portfolio's
+          # Qty/Avg Cost are manually entered; a --clear before a partial/empty
+          # fetch would erase those rows permanently, so in-place overwrite is
+          # the safe path for that one page.
+          CLEAR_KEYS=""
+          PORTFOLIO_KEYS=""
+          for k in $SYNC_KEYS; do
+            if [ "$k" = "MY_PORTFOLIO" ]; then
+              PORTFOLIO_KEYS="$PORTFOLIO_KEYS $k"
+            else
+              CLEAR_KEYS="$CLEAR_KEYS $k"
+            fi
+          done
+          CLEAR_KEYS="$(echo $CLEAR_KEYS | xargs || true)"
+          PORTFOLIO_KEYS="$(echo $PORTFOLIO_KEYS | xargs || true)"
 
+          DRY_RUN_FLAG=""
           if [[ "${RUN_MODE:-full_sync}" == "health_only" ]]; then
-            CMD+=(--dry-run)
+            DRY_RUN_FLAG="--dry-run"
           fi
 
           if [[ "${ENABLE_DEBUG:-false}" == "true" ]]; then
@@ -490,15 +505,32 @@ jobs:
           fi
 
           echo "⏱️ Start Time: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          echo "📋 Command: ${CMD[*]}"
 
           set -o pipefail
           TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
           LOG_FILE="sync_${TIMESTAMP}.log"
+          : > "$LOG_FILE"
+
+          run_sync_group() {
+            # $1 = extra flag (--clear or ""); $2 = space-separated keys
+            local EXTRA="$1"; local KEYS="$2"
+            [ -z "$KEYS" ] && return 0
+            local -a C=(python scripts/run_dashboard_sync.py --backend "$TARGET_URL" --sheet-id "$TARGET_SHEET_ID" --keys $KEYS)
+            [ -n "$EXTRA" ] && C+=("$EXTRA")
+            [ -n "$DRY_RUN_FLAG" ] && C+=("$DRY_RUN_FLAG")
+            echo "📋 Command: ${C[*]}"
+            "${C[@]}" 2>&1 | tee -a "$LOG_FILE"
+            return "${PIPESTATUS[0]}"
+          }
 
           START_TIME="$(date +%s)"
-          "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
-          EXIT_CODE=$?
+          EXIT_CODE=0
+          set +e
+          run_sync_group "" "$PORTFOLIO_KEYS"; rc=$?
+          [ "$rc" -gt "$EXIT_CODE" ] && EXIT_CODE="$rc"
+          run_sync_group "--clear" "$CLEAR_KEYS"; rc=$?
+          [ "$rc" -gt "$EXIT_CODE" ] && EXIT_CODE="$rc"
+          set -e
           END_TIME="$(date +%s)"
           DURATION=$((END_TIME - START_TIME))
 
