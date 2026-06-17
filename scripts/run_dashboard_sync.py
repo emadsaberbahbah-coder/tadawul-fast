@@ -3,9 +3,39 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.5.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.6.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.6.0 fix — decision-owned (cockpit) page guard (Top_10 clobber prevention)
+- WHY: Top_10_Investments is a DECISION-OWNED page — the user records BUY /
+  decision state in its decision columns (the cockpit), and data_engine_v2
+  already serves a FRESH Top_10 on demand via the route (advanced_analysis ->
+  top10_selector.build_top10_rows). GAS protects the page from refresh-overwrite
+  with isDecisionOwnedPage_ (00_Config.gs), but the Python daily sync had a
+  TOP_10_INVESTMENTS write task that bypassed that guard: with clear-before-write
+  the default (v6.4.0), every cycle CLEARED the sheet and rewrote it WITHOUT the
+  user's decision cells — clobbering the cockpit's decisions daily. A cross-layer
+  gap: the guard existed in GAS but had no Python-side enforcement.
+- FIX: a Python-side mirror of isDecisionOwnedPage_. A decision-owned page is
+  SKIPPED in the Hard-filters block — BEFORE the symbol read, the backend fetch
+  (the expensive selector build), the clear, and the write — so nothing is
+  fetched, cleared, or written for it. The page's last-good rows + the user's
+  decisions are left intact, and it refreshes on demand via the route.
+- WHY PAGE-LEVEL SKIP (not the column-merge of the v6.5.0 My_Portfolio guard):
+  the WHOLE Top_10 page is cockpit-owned and is re-derivable on demand by the
+  engine, so the sync has no business writing any of it — unlike My_Portfolio,
+  whose manual INPUT columns must be preserved while the rest is refreshed.
+- SCOPE / SAFETY:
+    * Applies to Top_10_Investments only; every other page is byte-for-byte
+      unchanged. status="skipped" (NOT partial), so the daily exit code stays 0.
+    * Gated by TFB_SYNC_DECISION_GUARD (default ON; set 0/false/off/no to restore
+      the v6.5.0 write-through of decision pages exactly).
+    * Pages overridable via TFB_SYNC_DECISION_GUARD_PAGES (comma-separated list).
+    * Check the "[v6.6.0 DECISION-GUARD]" log line for the per-page skip reason.
+- UNCHANGED: every endpoint, payload, the My_Portfolio guard, other task
+  definitions, matrix rectification, credential loading, exit codes, the
+  clear-before-write default, and the schema-agnostic write path.
 
 v6.5.0 fix — My_Portfolio manual-cell write guard (irreversible-loss prevention)
 - WHY: My_Portfolio carries user-authored ("manual") inputs that live ONLY in
@@ -107,7 +137,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.5.0"
+SCRIPT_VERSION = "6.6.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -726,6 +756,20 @@ _GUARD_SYMBOL_ALIASES = frozenset({
     "symbol", "ticker", "tickersymbol", "symbolticker", "code", "instrument",
 })
 
+# -----------------------------------------------------------------------------
+# Decision-owned (cockpit) page guard (v6.6.0)
+# -----------------------------------------------------------------------------
+# Python-side mirror of the GAS isDecisionOwnedPage_ guard (00_Config.gs). A
+# decision-owned page (Top_10_Investments) carries cockpit-authored decision
+# columns AND is served fresh on demand by data_engine_v2 via the route, so the
+# daily sync must NOT write (and clear) it — doing so blanks the user's
+# decisions every cycle. Unlike the column-level My_Portfolio guard, the WHOLE
+# page is owned, so the guard is a page-level SKIP taken before any fetch/write.
+_DECISION_GUARD_TAG = "[v6.6.0 DECISION-GUARD]"
+
+# Default decision-owned page(s). Overridable via env (comma list).
+_DECISION_GUARD_DEFAULT_PAGES = ("Top_10_Investments",)
+
 
 def _guard_norm(s: Any) -> str:
     """Lowercase + strip non-alphanumerics (matches rows_reader normalization)."""
@@ -756,6 +800,32 @@ def _guard_should_apply(sheet_name: str) -> bool:
     if not _guard_enabled():
         return False
     return _guard_norm(sheet_name) in _guard_pages()
+
+
+def _decision_guard_enabled() -> bool:
+    """Decision-owned-page guard master switch. Default ON; set
+    TFB_SYNC_DECISION_GUARD=0/false/off/no to restore the v6.5.0 behavior
+    (the daily sync writes decision-owned pages again)."""
+    return (os.getenv("TFB_SYNC_DECISION_GUARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _decision_guard_pages() -> set:
+    """Decision-owned (cockpit) page set. Overridable via
+    TFB_SYNC_DECISION_GUARD_PAGES (comma-separated); defaults to
+    Top_10_Investments."""
+    raw = (os.getenv("TFB_SYNC_DECISION_GUARD_PAGES") or "").strip()
+    pages = [p.strip() for p in raw.split(",") if p.strip()] if raw else list(_DECISION_GUARD_DEFAULT_PAGES)
+    return {_guard_norm(p) for p in pages}
+
+
+def _decision_guard_should_skip(sheet_name: str) -> bool:
+    """True iff the decision-owned-page guard is enabled AND this page is
+    cockpit/decision-owned. Python-side mirror of the GAS isDecisionOwnedPage_
+    guard: the daily sync must not write (and clear) a page the user owns, or
+    it blanks the cockpit's decision cells."""
+    if not _decision_guard_enabled():
+        return False
+    return _guard_norm(sheet_name) in _decision_guard_pages()
 
 
 def _guard_find_col(header_row: List[Any], aliases: frozenset) -> int:
@@ -1073,6 +1143,29 @@ async def _run_one_task(
         if canon_task_key not in _ALLOWED_KEYS:
             res.status = "skipped"
             res.warnings.append(f"Unknown key {canon_task_key}; skipped.")
+            return res
+
+        # Decision-owned (cockpit) page guard (v6.6.0): Top_10_Investments is
+        # owned by the cockpit — the user records BUY / decision state in its
+        # decision columns, and data_engine_v2 serves a fresh Top_10 on demand
+        # via the route, so the daily sync must NOT write (and clear) this page
+        # or it blanks those decisions every cycle. Python-side mirror of the
+        # GAS isDecisionOwnedPage_ guard (00_Config.gs); previously the guard
+        # lived only in GAS and the sync bypassed it. Skip is taken HERE, before
+        # the symbol read / backend fetch / write, so nothing is fetched,
+        # cleared, or written. status="skipped" (not partial) keeps the daily
+        # exit code at 0. Reversible: TFB_SYNC_DECISION_GUARD=0 restores the
+        # v6.5.0 write (pages overridable via TFB_SYNC_DECISION_GUARD_PAGES).
+        if _decision_guard_should_skip(task.sheet_name):
+            res.status = "skipped"
+            note = (
+                f"{_DECISION_GUARD_TAG} {task.sheet_name} is decision-owned "
+                f"(cockpit); daily sync write skipped to protect decision cells "
+                f"— it refreshes on demand via the route. Set "
+                f"TFB_SYNC_DECISION_GUARD=0 to override."
+            )
+            res.warnings.append(note)
+            logger.info(note)
             return res
 
         max_syms = max_symbols_override if max_symbols_override >= 0 else task.max_symbols
