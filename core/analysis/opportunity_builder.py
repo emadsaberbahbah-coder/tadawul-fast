@@ -1,8 +1,32 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.7   (TFB Final Execution Plan v5.0 — Phase P2;
-                 Engineering Audit Phase 0 — investability gate + GATE_ORDER fix)
+Version: 1.0.8   (TFB Final Execution Plan v5.0 — Phase P2;
+                 Engineering Audit Phase 0 — investability gate default-OFF + GATE_ORDER fix)
+
+v1.0.8 [INVESTABILITY-GATE DEFAULT-OFF — live-evidence correction]: a live
+Top_10 build (2026-06-18, selector v4.19.0 + engine v5.91.0) disproved the
+v1.0.7 premise. v1.0.7 assumed the Investability gate would be a NO-OP in the
+normal path because rows reaching the builder are already INVESTABLE. They are
+NOT: top10_selector deliberately TIER-2 BACKFILLS — when fewer than `limit`
+INVESTABLE names clear Tier-1 (it found only 5 of 10), it fills the remainder
+with its best WATCHLIST / low-reliability rows, each carrying an explicit tier
+label. The live run selected 5 Tier-2 names into the Top 10 (4 WATCHLIST:
+NVDA / CNX / NEM / VRTX at reliability 70-75, plus TCOM as a low-reliability
+INVESTABLE). The selector OWNS the Top_10_Investments page; the builder feeds a
+SEPARATE opportunity-candidates surface. So a default-ON Investability gate
+would MAJOR-fail those 4 WATCHLIST names out of the opportunity surface while
+they remain on the Top_10 page — an un-asked-for divergence between two views.
+DECISION: ship the gate DEFAULT OFF (TFB_OPP_INVESTABILITY_GATE / criteria
+investability_gate_enabled both default off). It is now an explicit OPT-IN for
+an operator who wants strict INVESTABLE-only executable tickets; with it off the
+gate list and verdict are byte-identical to v1.0.6. The v1.0.7 GATE_ORDER fix
+(Valuation Sanity + Investability placed at their true positions) is RETAINED
+and active — pure ordering metadata, no behavior change. Also bumps
+OPPORTUNITY_BUILDER_VERSION, which v1.0.7 left at "1.0.6" by oversight (the
+header said 1.0.7 but the reported constant did not). The honest framing holds:
+this gate is a DISCLOSED, reversible policy choice, not a silent override of the
+selector's deliberate full-list design.
 
 v1.0.7 [INVESTABILITY-GATE + GATE_ORDER-FIX]: two Phase-0 corrections.
 (1) INVESTABILITY GATE — the engine's authoritative verdict
@@ -23,9 +47,11 @@ selected ticket) when the engine verdict is WATCHLIST or BLOCKED. INVESTABLE, or
 a blank/unrecognized token, PASSES (fail-open + traced, so a row that simply
 never carried the field is never penalized). Appended ONLY when
 investability_gate_enabled, so the gate list and verdict are byte-identical to
-v1.0.6 when TFB_OPP_INVESTABILITY_GATE=0. In the normal pre-filtered engine path
-every row is already INVESTABLE so the gate is a NO-OP (selection unchanged); it
-bites only on a non-INVESTABLE row that would otherwise have slipped through.
+v1.0.6 when TFB_OPP_INVESTABILITY_GATE=0. [v1.0.8 CORRECTION: the v1.0.7 claim
+here that this gate is a NO-OP "in the normal pre-filtered engine path" is FALSE
+— a live build proved the selector backfills Tier-2 (WATCHLIST / low-reliability)
+rows, so the gate WOULD drop real selections. v1.0.8 therefore ships it DEFAULT
+OFF; see the v1.0.8 note above.]
 This also makes the engine's v5.91.0 reliability-calibration flow coherent end
 to end: the calibrated forecast_reliability_score the builder reads (the tiered
 Reliability gate >=70 pass / >=Min-15 WATCH / below MAJOR, the confidence band,
@@ -170,7 +196,7 @@ ENV KILL-SWITCHES (policy block — read per call, not at import)
   TFB_OPP_TRUST_GATE       "1"   v1.0.6: "0" ⇒ skip the Data Trust MAJOR gate
   TFB_OPP_MAX_DATA_AGE_HOURS "168" v1.0.6: last_updated older ⇒ stale ⇒ fail
   TFB_OPP_MIN_TRUST_FIELDS "2"   v1.0.6: fewer core signals present ⇒ thin ⇒ fail
-  TFB_OPP_INVESTABILITY_GATE "1" v1.0.7: "0" ⇒ skip the Investability MAJOR gate
+  TFB_OPP_INVESTABILITY_GATE "0" v1.0.8: "1" ⇒ add Investability MAJOR gate (opt-in)
 Explicit `criteria` overrides > env > defaults.
 
 INTEGRATION
@@ -197,7 +223,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.6"
+OPPORTUNITY_BUILDER_VERSION = "1.0.8"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -359,7 +385,9 @@ DEFAULT_CRITERIA = {
     "max_data_age_hours": 168.0,
     "min_trust_fields": 2,
     # v1.0.7 investability gate (env-tunable; see policy block)
-    "investability_gate_enabled": True,
+    # v1.0.8: DEFAULT OFF (opt-in) — the selector backfills Tier-2 rows, so
+    # default-ON would diverge the opportunity surface from the Top_10 page.
+    "investability_gate_enabled": False,
 }
 
 _CRITERIA_FLOAT_KEYS = (
@@ -512,12 +540,13 @@ def _env_trust_gate():
 
 
 def _env_investability_gate():
-    """v1.0.7: engine-investability gate toggle. Default ON; set
-    TFB_OPP_INVESTABILITY_GATE=0 to restore byte-identical v1.0.6 behavior (the
-    Investability gate is not appended)."""
+    """v1.0.7 gate; v1.0.8: DEFAULT OFF (opt-in). Set
+    TFB_OPP_INVESTABILITY_GATE=1 to append the Investability MAJOR gate
+    (strict INVESTABLE-only executable tickets). Off => byte-identical to
+    v1.0.6 selection."""
     return str(_env_str(
-        "TFB_OPP_INVESTABILITY_GATE", "1")).strip().lower() not in (
-        "0", "false", "no", "off")
+        "TFB_OPP_INVESTABILITY_GATE", "0")).strip().lower() in (
+        "1", "true", "yes", "on", "enabled", "enable")
 
 
 def _env_overrides():
