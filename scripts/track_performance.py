@@ -2,8 +2,68 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.7.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.8.0)
 ===========================================================
+
+Why this revision (v6.8.0 vs v6.7.0)
+-------------------------------------
+RELIABILITY CALIBRATION — the "Measure" step of the project's Calibration &
+Self-Correction Loop, folded IN HERE rather than shipped as a separate
+sidecar. This file already owns and loads Performance_Log (matured, gate-
+tagged records) and Signal_History (daily verdicts); calibration is just
+"analyse those same matured records against their realized outcomes," so it
+belongs alongside PerformanceAnalyzer and reuses the rows already in memory —
+no second tool, no duplicate sheet I/O.
+
+The engine (data_engine_v2) STATES a forecast_reliability_score /
+investability verdict and its own WHY-blocks admit, verbatim, that this is
+"an unbacktested ESTIMATE — only a forward-return backtest can [ground it]."
+Nothing ever read outcomes back. v6.8.0 closes that loop, honestly:
+
+  v6.8.0 A  wilson_interval / shrink_factor — pure calibration math. Wilson
+       score interval (not normal-approx) because it stays in [0,100] and is
+       honest at the small n this project lives at; a sample-shrunk
+       calibration factor (1 + (raw-1)*n/(n+K)) so a 3-record bucket cannot
+       assert a large correction.
+
+  v6.8.0 B  CalibrationBucket / CalibrationReport models + ReliabilityCalibrator:
+       realized win-rate vs stated confidence, broken out by investability
+       bucket, stated-reliability band, recommendation tier, and horizon —
+       each with a Wilson 95% interval and a minimum-sample gate (below
+       min-sample decided outcomes the point estimate is SUPPRESSED as
+       misleading and labelled). Plus a Brier score (with an explicit "if
+       reliability is read as P(win)" caveat), a monotonicity check (does
+       higher stated reliability -> higher realized win-rate?), and an
+       INVESTABLE-vs-WATCHLIST discrimination check (do their intervals
+       actually separate, or just overlap?).
+
+  v6.8.0 C  Wiring: --analyze (gated TRACK_CALIBRATION, default ON) and the
+       new --calibrate flag print a CALIBRATION block built from the records
+       already loaded this cycle (zero extra I/O); the current verdict-
+       stability mix is derived from the signal-trends already computed.
+       --export writes <base>_calibration.json. Knobs: CAL_MIN_SAMPLE
+       (default 10), CAL_SHRINKAGE_K (default 20).
+
+  v6.8.0 D  SCRIPT_VERSION 6.7.0 -> 6.8.0; __all__ exports the new public
+       symbols.
+
+The honest line (why this survives an adversarial audit):
+  * YES — calibrate and DISCLOSE stated confidence vs realized outcomes.
+  * NO  — auto-tune the pick/score weights to past outcomes. On a handful of
+    matured picks that is fitting noise; it manufactures false confidence.
+    The advisory calibration factor is REPORTED, clamped, sample-shrunk, and
+    NEVER applied to any recommendation/score/gate/reliability. Applying a
+    haircut is a separate, default-OFF, engine-side phase — not this file.
+
+Honest default state: until Performance_Log accumulates >= min-sample MATURED
+records, the report says "INSUFFICIENT EVIDENCE — start the clock." Correct
+behavior, not a bug — the engine's confidence stays an unbacktested estimate
+exactly until enough outcomes exist to measure it.
+
+[PRESERVED — strictly] All v6.7.0 day-to-day action-trend, all v6.6.0
+investability-gate capture/segmentation, all v6.5.0 8-tier vocabulary, all
+v6.4.0 hardening. v6.8.0 is purely additive: no removals, no renames, no
+breaking signatures. Records/snapshots from prior versions load identically.
 
 Why this revision (v6.7.0 vs v6.6.0)
 -------------------------------------
@@ -230,7 +290,7 @@ Cross-stack alignment (current floor)
   - core.providers.yahoo_fundamentals  v6.3.0
   - core.providers.yahoo_chart         v8.2.0  (no rating surface)
   - core.providers.eodhd               v4.6.0+ (no rating surface)
-  - scripts.track_performance          v6.7.0  (THIS DELIVERY)
+  - scripts.track_performance          v6.8.0  (THIS DELIVERY)
 
 ===========================================================
 
@@ -359,7 +419,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.7.0"
+SCRIPT_VERSION = "6.8.0"
 SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias (preserved)
 SCRIPT_NAME = "PerformanceTracker"
 
@@ -669,6 +729,38 @@ def _col_to_a1(col: int) -> str:
 
 def _a1_range(start_col: int, start_row: int, end_col: int, end_row: int) -> str:
     return f"{_col_to_a1(start_col)}{start_row}:{_col_to_a1(end_col)}{end_row}"
+
+
+# ---------------------------------------------------------------------------
+# v6.8.0: calibration math (pure, unit-tested)
+# ---------------------------------------------------------------------------
+_Z95 = 1.959963984540054  # 95% two-sided normal quantile
+
+
+def wilson_interval(wins: int, decided: int, z: float = _Z95) -> Tuple[float, float]:
+    """Wilson score interval for a binomial proportion, returned as PERCENT.
+    Stays inside [0,100] and is honest at small n. (0,0) when decided==0."""
+    n = int(decided)
+    if n <= 0:
+        return 0.0, 0.0
+    w = max(0, min(int(wins), n))
+    p = w / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2.0 * n)) / denom
+    half = (z * math.sqrt((p * (1.0 - p) / n) + (z2 / (4.0 * n * n)))) / denom
+    lo = max(0.0, min(100.0, (center - half) * 100.0))
+    hi = max(0.0, min(100.0, (center + half) * 100.0))
+    return round(lo, 1), round(hi, 1)
+
+
+def shrink_factor(raw: float, decided: int, k: int) -> float:
+    """Shrink a raw calibration factor toward 1.0 by sample size:
+    1 + (raw-1) * n/(n+k). Small n -> ~1.0 (no correction asserted)."""
+    n = max(0, int(decided))
+    if n <= 0:
+        return 1.0
+    return 1.0 + (raw - 1.0) * (n / (n + max(1, int(k))))
 
 
 class FullJitterBackoff:
@@ -1186,6 +1278,57 @@ class SignalTrend:
     flip_count: int
     stability: str           # STABLE / DRIFTING / CHOPPY / NEW
     summary_label: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# =============================================================================
+# v6.8.0 — Reliability calibration models
+# =============================================================================
+@dataclass
+class CalibrationBucket:
+    name: str
+    n: int
+    decided: int
+    wins: int
+    losses: int
+    breakeven: int
+    realized_win_rate: float        # wins/decided (%), 0.0 if decided==0
+    ci_low: float                   # Wilson 95% low (%)
+    ci_high: float                  # Wilson 95% high (%)
+    mean_realized_roi: float
+    mean_claimed_reliability: float
+    claimed_win_rate: float         # mean stated reliability read as implied P(win) %
+    calibration_factor_raw: float       # ADVISORY (realized/claimed, clamped)
+    calibration_factor_shrunk: float    # ADVISORY, sample-shrunk; NEVER applied
+    sufficient: bool                # decided >= min_sample
+    note: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CalibrationReport:
+    generated_riyadh: str
+    total_records: int
+    matured_records: int
+    decided_records: int
+    min_sample: int
+    shrinkage_k: int
+    global_sufficient: bool
+    headline: str
+    brier_score: Optional[float]
+    brier_baseline: float
+    by_investability: List[CalibrationBucket] = field(default_factory=list)
+    by_reliability_band: List[CalibrationBucket] = field(default_factory=list)
+    by_recommendation: List[CalibrationBucket] = field(default_factory=list)
+    by_horizon: List[CalibrationBucket] = field(default_factory=list)
+    monotonic_reliability: Optional[bool] = None
+    discrimination_note: str = ""
+    signal_trend_mix: Dict[str, int] = field(default_factory=dict)
+    advisory_note: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -2260,6 +2403,259 @@ class SignalTrendAnalyzer:
 
 
 # =============================================================================
+# v6.8.0 — Reliability calibrator (Measure step of the self-correction loop)
+# =============================================================================
+class ReliabilityCalibrator:
+    """
+    Measures whether the engine's STATED reliability / investability verdict
+    actually tracks REALIZED outcomes, with honest small-sample uncertainty.
+    Pure compute over matured PerformanceRecords (reused from the cycle's
+    already-loaded rows). DISCLOSES the gap; never auto-tunes anything.
+    """
+    # (lo_inclusive, hi_exclusive, label) over stated reliability 0..100
+    RELIABILITY_BANDS: List[Tuple[float, float, str]] = [
+        (0.0, 50.0, "0-50"),
+        (50.0, 70.0, "50-70"),
+        (70.0, 85.0, "70-85"),
+        (85.0, 100.01, "85-100"),
+    ]
+
+    _ADVISORY = (
+        "Calibration factors are ADVISORY and NOT applied to any "
+        "recommendation, score, gate, or stated reliability. They treat mean "
+        "stated reliability as an implied win-probability (the engine does not "
+        "strictly define it that way) and are shrunk toward 1.0 by sample size. "
+        "Read them as 'how optimistic was the stated confidence vs outcomes,' "
+        "not a precise correction. Applying a haircut is a separate, default-OFF, "
+        "engine-side phase."
+    )
+
+    def __init__(self, min_sample: int = 10, shrink_k: int = 20):
+        self.min_sample = max(1, int(min_sample))
+        self.shrink_k = max(1, int(shrink_k))
+
+    def _bucket(self, name: str, recs: List[PerformanceRecord]) -> CalibrationBucket:
+        n = len(recs)
+        rois = [
+            _safe_float(r.realized_roi, default=0.0)
+            for r in recs if r.realized_roi is not None
+        ]
+        wins = sum(1 for v in rois if v > 0.0)
+        losses = sum(1 for v in rois if v < 0.0)
+        breakeven = len(rois) - wins - losses
+        decided = wins + losses
+        wr = (wins / decided * 100.0) if decided else 0.0
+        lo, hi = wilson_interval(wins, decided)
+        mean_roi = (sum(rois) / len(rois)) if rois else 0.0
+        rels = [_safe_float(r.entry_forecast_reliability, default=0.0) for r in recs]
+        mean_rel = (sum(rels) / len(rels)) if rels else 0.0
+        claimed_wr = mean_rel  # stated reliability is already on a 0..100 scale
+
+        if decided >= 1 and claimed_wr > 0.0:
+            raw = max(0.1, min(2.0, wr / claimed_wr))
+        else:
+            raw = 1.0
+        shrunk = round(shrink_factor(raw, decided, self.shrink_k), 3)
+
+        sufficient = decided >= self.min_sample
+        note = "" if sufficient else f"insufficient (decided={decided} < {self.min_sample})"
+        return CalibrationBucket(
+            name=name, n=n, decided=decided, wins=wins, losses=losses,
+            breakeven=breakeven, realized_win_rate=round(wr, 1),
+            ci_low=lo, ci_high=hi, mean_realized_roi=round(mean_roi, 2),
+            mean_claimed_reliability=round(mean_rel, 1),
+            claimed_win_rate=round(claimed_wr, 1),
+            calibration_factor_raw=round(raw, 3),
+            calibration_factor_shrunk=shrunk,
+            sufficient=sufficient, note=note,
+        )
+
+    def _brier(self, matured: List[PerformanceRecord]) -> Optional[float]:
+        pts: List[float] = []
+        for r in matured:
+            v = r.realized_roi
+            if v is None or v == 0.0:
+                continue  # decided-only
+            p = max(0.0, min(1.0, _safe_float(r.entry_forecast_reliability, 0.0) / 100.0))
+            o = 1.0 if v > 0.0 else 0.0
+            pts.append((p - o) ** 2)
+        return round(sum(pts) / len(pts), 4) if pts else None
+
+    def _discrimination(self, inv: Optional[CalibrationBucket],
+                        watch: Optional[CalibrationBucket]) -> str:
+        if inv is None or watch is None:
+            return "INVESTABLE/WATCHLIST discrimination: one or both buckets absent."
+        if not inv.sufficient or not watch.sufficient:
+            return (
+                "INVESTABLE/WATCHLIST discrimination: insufficient sample "
+                f"(INVESTABLE decided={inv.decided}, WATCHLIST decided={watch.decided})."
+            )
+        if inv.ci_low > watch.ci_high:
+            return (
+                f"INVESTABLE significantly outperforms WATCHLIST "
+                f"(INVESTABLE {inv.realized_win_rate}% CI[{inv.ci_low},{inv.ci_high}] "
+                f"vs WATCHLIST {watch.realized_win_rate}% CI[{watch.ci_low},{watch.ci_high}])."
+            )
+        if watch.ci_low > inv.ci_high:
+            return (
+                "WARNING: WATCHLIST outperforms INVESTABLE in this sample -- the "
+                "gate is inverted here; investigate before trusting the split."
+            )
+        return (
+            f"INVESTABLE vs WATCHLIST not yet statistically distinguishable "
+            f"(CIs overlap: INVESTABLE[{inv.ci_low},{inv.ci_high}] "
+            f"WATCHLIST[{watch.ci_low},{watch.ci_high}])."
+        )
+
+    def calibrate(self, records: List[PerformanceRecord],
+                  signal_mix: Optional[Dict[str, int]] = None) -> CalibrationReport:
+        matured = [
+            r for r in records
+            if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
+        ]
+        total = len(records)
+        decided_total = sum(1 for r in matured if (r.realized_roi or 0.0) != 0.0)
+        global_sufficient = decided_total >= self.min_sample
+
+        inv_groups: Dict[str, List[PerformanceRecord]] = defaultdict(list)
+        for r in matured:
+            inv_groups[(r.entry_investability_status or "UNSPECIFIED").upper()].append(r)
+        by_inv = [self._bucket(k, v) for k, v in sorted(inv_groups.items())]
+
+        by_band: List[CalibrationBucket] = []
+        for lo, hi, label in self.RELIABILITY_BANDS:
+            grp = [
+                r for r in matured
+                if lo <= _safe_float(r.entry_forecast_reliability, 0.0) < hi
+            ]
+            by_band.append(self._bucket(label, grp))
+
+        rec_groups: Dict[str, List[PerformanceRecord]] = defaultdict(list)
+        for r in matured:
+            rec_groups[r.entry_recommendation.value].append(r)
+        by_rec = [self._bucket(k, v) for k, v in sorted(rec_groups.items())]
+
+        hz_groups: Dict[str, List[PerformanceRecord]] = defaultdict(list)
+        for r in matured:
+            hz_groups[r.horizon.value].append(r)
+        by_hz = [self._bucket(k, v) for k, v in sorted(hz_groups.items())]
+
+        ordered = [b for b in by_band if b.decided > 0]
+        monotonic: Optional[bool] = None
+        if len(ordered) >= 2:
+            monotonic = all(
+                ordered[i].realized_win_rate <= ordered[i + 1].realized_win_rate + 1e-9
+                for i in range(len(ordered) - 1)
+            )
+
+        inv_map = {b.name: b for b in by_inv}
+        disc = self._discrimination(inv_map.get("INVESTABLE"), inv_map.get("WATCHLIST"))
+        brier = self._brier(matured)
+
+        if not matured:
+            headline = (
+                "INSUFFICIENT EVIDENCE -- 0 matured records. The engine's stated "
+                "reliability remains an unbacktested estimate; start the clock "
+                "(run --record daily, let picks mature)."
+            )
+        elif not global_sufficient:
+            headline = (
+                f"INSUFFICIENT EVIDENCE -- {decided_total} decided outcome(s) "
+                f"(need >= {self.min_sample}). Point estimates suppressed where "
+                f"thin; intervals reflect the (wide) uncertainty."
+            )
+        else:
+            headline = (
+                f"Calibration on {decided_total} decided outcome(s) across "
+                f"{len(matured)} matured record(s)."
+            )
+
+        return CalibrationReport(
+            generated_riyadh=RiyadhTime.format(),
+            total_records=total,
+            matured_records=len(matured),
+            decided_records=decided_total,
+            min_sample=self.min_sample,
+            shrinkage_k=self.shrink_k,
+            global_sufficient=global_sufficient,
+            headline=headline,
+            brier_score=brier,
+            brier_baseline=0.25,
+            by_investability=by_inv,
+            by_reliability_band=by_band,
+            by_recommendation=by_rec,
+            by_horizon=by_hz,
+            monotonic_reliability=monotonic,
+            discrimination_note=disc,
+            signal_trend_mix=dict(signal_mix or {}),
+            advisory_note=self._ADVISORY,
+        )
+
+
+def _fmt_cal_bucket(b: CalibrationBucket) -> str:
+    if b.decided == 0:
+        return f"  {b.name:<14} n={b.n:<3} no decided outcomes yet"
+    point = f"{b.realized_win_rate:5.1f}%" if b.sufficient else "  (thin)"
+    star = "" if b.sufficient else "  <-- insufficient"
+    return (
+        f"  {b.name:<14} n={b.n:<3} decided={b.decided:<3} "
+        f"win={point} CI[{b.ci_low:.0f},{b.ci_high:.0f}] "
+        f"claim~{b.claimed_win_rate:4.0f}% roi={b.mean_realized_roi:+6.2f}% "
+        f"factor*{b.calibration_factor_shrunk:.2f}{star}"
+    )
+
+
+def render_calibration_report(rep: CalibrationReport, verbose: bool = False) -> None:
+    _out("=" * 66)
+    _out(f"RELIABILITY CALIBRATION   {rep.generated_riyadh}")
+    _out("=" * 66)
+    _out(rep.headline)
+    _out(
+        f"records: total={rep.total_records}  matured={rep.matured_records}  "
+        f"decided={rep.decided_records}  min_sample={rep.min_sample}  "
+        f"shrink_k={rep.shrinkage_k}"
+    )
+    if rep.brier_score is not None:
+        verdict = ("better than coin-flip" if rep.brier_score < rep.brier_baseline
+                   else "no better than coin-flip")
+        _out(
+            f"Brier (if reliability read as P(win)): {rep.brier_score} "
+            f"vs {rep.brier_baseline} baseline -> {verdict}"
+        )
+    _out("")
+    _out("By investability bucket:")
+    for b in rep.by_investability:
+        _out(_fmt_cal_bucket(b))
+    _out(f"  {rep.discrimination_note}")
+    _out("")
+    _out("By stated-reliability band:")
+    for b in rep.by_reliability_band:
+        _out(_fmt_cal_bucket(b))
+    if rep.monotonic_reliability is True:
+        _out("  monotonic: higher stated reliability -> higher realized win-rate (good).")
+    elif rep.monotonic_reliability is False:
+        _out("  NOT monotonic: stated reliability does not cleanly separate winners here.")
+    else:
+        _out("  monotonicity: insufficient populated bands to assess.")
+    if verbose:
+        _out("")
+        _out("By recommendation tier:")
+        for b in rep.by_recommendation:
+            _out(_fmt_cal_bucket(b))
+        _out("")
+        _out("By horizon:")
+        for b in rep.by_horizon:
+            _out(_fmt_cal_bucket(b))
+    if rep.signal_trend_mix:
+        mix = ", ".join(f"{k}:{v}" for k, v in sorted(rep.signal_trend_mix.items()))
+        _out("")
+        _out(f"Current verdict-stability mix (Signal_History): {mix}")
+    _out("")
+    _out("NOTE: " + rep.advisory_note)
+    _out("=" * 66)
+
+
+# =============================================================================
 # Reporting
 # =============================================================================
 class ReportGenerator:
@@ -2458,6 +2854,16 @@ class PerformanceTrackerApp:
                 logger.error("SignalHistoryStore unavailable: %s", e)
                 self.signal_store = None
         self.trend_analyzer = SignalTrendAnalyzer()
+
+        # v6.8.0: reliability calibration (Measure step). Reuses the cycle's
+        # already-loaded records -- no extra I/O. Gated, default ON.
+        self.calibration_enabled = _env_bool("TRACK_CALIBRATION", True)
+        self.cal_min_sample = max(1, int(
+            getattr(self.args, "min_sample", None)
+            or _env_int("CAL_MIN_SAMPLE", 10, lo=1)
+        ))
+        self.cal_shrink_k = _env_int("CAL_SHRINKAGE_K", 20, lo=1)
+        self.calibrator = ReliabilityCalibrator(self.cal_min_sample, self.cal_shrink_k)
 
         self.stop_event = Event()
 
@@ -2853,6 +3259,20 @@ class PerformanceTrackerApp:
             return []
         return self.trend_analyzer.analyze(snaps, window=self.trend_window)
 
+    def _compute_calibration(
+        self,
+        records: List[PerformanceRecord],
+        signal_trends: List[SignalTrend],
+    ) -> CalibrationReport:
+        # v6.8.0: derive the verdict-stability mix from the trends already
+        # computed this cycle (no extra load), then calibrate the in-memory
+        # matured records.
+        mix: Dict[str, int] = {}
+        for t in signal_trends or []:
+            d = str(getattr(t, "action_direction", "") or "?")
+            mix[d] = mix.get(d, 0) + 1
+        return self.calibrator.calibrate(records, signal_mix=mix)
+
     async def audit_active_records(
         self, records: List[PerformanceRecord]
     ) -> List[PerformanceRecord]:
@@ -2951,14 +3371,24 @@ class PerformanceTrackerApp:
             pass
 
         # v6.7.0: compute day-to-day action-trends once (reused by --analyze
-        # stdout and --export json). Empty unless Signal_History has data.
+        # stdout, --calibrate mix, and --export json). Empty unless
+        # Signal_History has data.
         signal_trends: List[SignalTrend] = []
         if (
-            (self.args.analyze or self.args.export)
+            (self.args.analyze or self.args.export or self.args.calibrate)
             and self.signal_history_enabled
             and self.signal_store is not None
         ):
             signal_trends = await self._compute_signal_trends()
+
+        # v6.8.0: reliability calibration on the records already loaded this
+        # cycle (no extra I/O). Built when a consumer asks for it.
+        calibration: Optional[CalibrationReport] = None
+        if (
+            self.calibration_enabled
+            and (self.args.analyze or self.args.calibrate or self.args.export)
+        ):
+            calibration = self._compute_calibration(records, signal_trends)
 
         if self.args.analyze:
             if self.store.is_available():
@@ -3017,6 +3447,12 @@ class PerformanceTrackerApp:
                         f"[{t.stability}, {t.n_observations} obs, flips={t.flip_count}]"
                     )
 
+        # v6.8.0: render reliability calibration once (under --analyze or
+        # --calibrate), from the report built above.
+        if calibration is not None and (self.args.analyze or self.args.calibrate):
+            _out("")
+            render_calibration_report(calibration, verbose=bool(self.args.verbose))
+
         if self.args.simulate:
             matured = [
                 r
@@ -3062,6 +3498,15 @@ class PerformanceTrackerApp:
                     _out(f"Signal-trend export: {out_base}_signal_trends.json")
                 except Exception as e:
                     logger.warning("signal-trend export failed: %s", e)
+            if calibration is not None:
+                try:
+                    Path(out_base + "_calibration.json").write_text(
+                        json_dumps(calibration.to_dict(), indent=2),
+                        encoding="utf-8",
+                    )
+                    _out(f"Calibration export: {out_base}_calibration.json")
+                except Exception as e:
+                    logger.warning("calibration export failed: %s", e)
             _out(f"Export complete: {out_base}.* ({fmt})")
 
         return 0
@@ -3140,6 +3585,25 @@ def create_parser() -> argparse.ArgumentParser:
         help="Export performance report (also TRACK_EXPORT env).",
     )
     p.add_argument(
+        "--calibrate",
+        action="store_true",
+        default=_env_bool("TRACK_CALIBRATE", False),
+        help=(
+            "Print the reliability-calibration report (realized vs stated "
+            "confidence, Wilson intervals, sample-gated). Also runs under "
+            "--analyze unless TRACK_CALIBRATION=0. Env: TRACK_CALIBRATE."
+        ),
+    )
+    p.add_argument(
+        "--min-sample",
+        type=int,
+        default=_env_int("CAL_MIN_SAMPLE", 10, lo=1),
+        help=(
+            "Min decided outcomes before a calibration point estimate is "
+            "shown (default 10; env CAL_MIN_SAMPLE)."
+        ),
+    )
+    p.add_argument(
         "--daemon",
         action="store_true",
         default=_env_bool("TRACK_DAEMON", False),
@@ -3206,7 +3670,8 @@ async def async_main() -> int:
 
     # If nothing selected, show help
     if not any(
-        [args.record, args.audit, args.analyze, args.simulate, args.export, args.daemon]
+        [args.record, args.audit, args.analyze, args.simulate, args.export,
+         args.calibrate, args.daemon]
     ):
         _out(create_parser().format_help())
         return 0
@@ -3276,6 +3741,12 @@ __all__ = [
     "SignalHistoryStore",
     "SignalTrend",
     "SignalTrendAnalyzer",
+    "wilson_interval",
+    "shrink_factor",
+    "CalibrationBucket",
+    "CalibrationReport",
+    "ReliabilityCalibrator",
+    "render_calibration_report",
     "PerformanceTrackerApp",
     "create_parser",
     "main",
