@@ -2,8 +2,64 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.6.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.7.0)
 ===========================================================
+
+Why this revision (v6.7.0 vs v6.6.0)
+-------------------------------------
+DAY-TO-DAY ACTION-TREND TRACKING (Layer 2). v6.6.0 measures whether a
+pick PANNED OUT at a horizon (1M/3M); it has no memory of how the
+engine's verdict for a symbol MOVED day to day. So it can say "INVESTABLE
+hit 64%" but never "4030.SR has been BUY and strengthening for 6 straight
+days" vs "flipped to BUY only yesterday" -- the confirmation / early-
+warning signal that separates a confirmed trend from one-day noise.
+v6.7.0 adds that, purely additively, on the existing daily-snapshot
+backbone:
+
+  v6.7.0 A  New SignalSnapshot model + Signal_History tab: one verdict
+       snapshot per decision symbol PER DAY (recommendation / final action /
+       investability / overall score / forecast reliability / data quality /
+       risk / price). Keyed symbol|YYYYMMDD (Riyadh) -> idempotent on a
+       same-day re-run (first verdict of the day wins).
+
+  v6.7.0 B  New SignalHistoryStore (gspread, row-1 header / row-2 data,
+       same hardened-header + best-effort auth pattern as PerformanceStore;
+       self-contained, adds NO change to PerformanceStore). append_snapshots
+       writes only unseen symbol-day keys.
+
+  v6.7.0 C  New SignalTrendAnalyzer + SignalTrend: per-symbol trajectory
+       over a rolling window (default 5) -- days_in_current_action, action
+       direction (STRENGTHENING / WEAKENING / STABLE / FLIPPED / NEW via the
+       canonical 8-tier rank with HOLD as the side-flip midline), score
+       slope (pts/snapshot), distinct actions, flip count, stability
+       (STABLE / DRIFTING / CHOPPY). DESCRIPTIVE ONLY -- it characterises the
+       engine's own verdict movement and predicts nothing.
+
+  v6.7.0 D  Wiring: --record fetches the Top10 universe ONCE and feeds both
+       the pick recorder AND the daily snapshot logger (no second backend
+       call, no added edge pressure -- record_from_top10 gained an optional
+       pre-fetched-rows arg; default None preserves self-fetch). --analyze
+       prints an "ACTION-TREND" block; --export writes
+       <base>_signal_trends.json. All gated by TRACK_SIGNAL_HISTORY
+       (default ON; kill-switch =0), sheet TRACK_SIGNAL_SHEET (default
+       Signal_History), window TRACK_TREND_WINDOW (default 5).
+
+  v6.7.0 E  SCRIPT_VERSION 6.6.0 -> 6.7.0 (SERVICE_VERSION follows);
+       __all__ exports the four new public symbols.
+
+NOT in scope (deliberately): this measures and describes the verdict
+trajectory; it does NOT change any recommendation, forecast, gate, or the
+engine, and it sharpens no 12-month prediction. Trend direction needs >=2
+days of accumulated Signal_History to mean anything (day 1 shows NEW) --
+the value is starting the daily clock. Surfacing trends ON Top_10 is a
+GAS-side follow-on; this delivery records + analyzes them. Rendering the
+day-to-day candle STRUCTURE (Layer 1) is separate engine work, not here.
+
+[PRESERVED — strictly] All v6.6.0 investability-gate capture/segmentation,
+all v6.5.0 8-tier vocabulary, all v6.4.0 endpoint-canonicalization +
+hardening. v6.7.0 is purely additive: no removals, no renames, no breaking
+signature changes (record_from_top10's new arg is optional). Records and
+snapshots written by prior versions load byte-identically.
 
 Why this revision (v6.6.0 vs v6.5.0)
 -------------------------------------
@@ -174,7 +230,7 @@ Cross-stack alignment (current floor)
   - core.providers.yahoo_fundamentals  v6.3.0
   - core.providers.yahoo_chart         v8.2.0  (no rating surface)
   - core.providers.eodhd               v4.6.0+ (no rating surface)
-  - scripts.track_performance          v6.6.0  (THIS DELIVERY)
+  - scripts.track_performance          v6.7.0  (THIS DELIVERY)
 
 ===========================================================
 
@@ -303,7 +359,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.6.0"
+SCRIPT_VERSION = "6.7.0"
 SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias (preserved)
 SCRIPT_NAME = "PerformanceTracker"
 
@@ -1016,6 +1072,126 @@ class PerformanceSummary:
 
 
 # =============================================================================
+# v6.7.0 — Day-to-day ACTION-TREND models (Signal_History)
+# =============================================================================
+@dataclass(slots=True)
+class SignalSnapshot:
+    """
+    One per decision symbol PER DAY: the day's standing verdict (action /
+    recommendation / score / gate). Distinct in purpose from
+    PerformanceRecord -- a PerformanceRecord is opened ONCE per pick and
+    matured at a horizon; a SignalSnapshot is logged EVERY day so the
+    trajectory of the verdict itself (strengthening / weakening / stable /
+    flipped) can be read day to day. Keyed symbol|YYYYMMDD (Riyadh) so a
+    re-run on the same day is idempotent (first verdict of the day wins;
+    see SignalHistoryStore.append_snapshots).
+    """
+    snapshot_id: str
+    symbol: str
+    date_recorded: datetime
+    recommendation: RecommendationType
+    final_action: str
+    investability_status: str
+    overall_score: float
+    forecast_reliability: float
+    data_quality: float
+    risk_score: float
+    price: float
+    origin_tab: str
+    recorded_at: datetime = field(default_factory=_utc_now)
+
+    @property
+    def date_key(self) -> str:
+        return self.date_recorded.astimezone(_RIYADH_TZ).strftime("%Y%m%d")
+
+    @property
+    def key(self) -> str:
+        return f"{self.symbol}|{self.date_key}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "key": self.key,
+            "symbol": self.symbol,
+            "date_riyadh": RiyadhTime.format(self.date_recorded, fmt="%Y-%m-%d"),
+            "recorded_at_riyadh": RiyadhTime.format(
+                self.recorded_at.astimezone(_RIYADH_TZ)
+            ),
+            "recommendation": self.recommendation.value,
+            "final_action": self.final_action,
+            "investability_status": self.investability_status,
+            "overall_score": self.overall_score,
+            "forecast_reliability": self.forecast_reliability,
+            "data_quality": self.data_quality,
+            "risk_score": self.risk_score,
+            "price": self.price,
+            "origin_tab": self.origin_tab,
+        }
+
+    @classmethod
+    def from_sheet_row(cls, row: List[Any], headers: List[str]) -> "SignalSnapshot":
+        hmap = {str(h).strip(): i for i, h in enumerate(headers)}
+
+        def get(name: str) -> Any:
+            idx = hmap.get(name)
+            if idx is None or idx < 0 or idx >= len(row):
+                return None
+            return row[idx]
+
+        dt_rec = RiyadhTime.parse(_safe_str(get("Date (Riyadh)"))) or RiyadhTime.now()
+        dt_at = RiyadhTime.parse(_safe_str(get("Recorded At (Riyadh)"))) or dt_rec
+        rec = _parse_enum_value(
+            RecommendationType,
+            _safe_str(get("Recommendation")) or "HOLD",
+            RecommendationType.HOLD,
+        )
+        return cls(
+            snapshot_id=_safe_str(get("Snapshot ID")) or str(uuid.uuid4()),
+            symbol=_safe_str(get("Symbol")).upper(),
+            date_recorded=dt_rec,
+            recommendation=rec,
+            final_action=_safe_str(get("Final Action")),
+            investability_status=_safe_str(get("Investability")),
+            overall_score=_safe_float(get("Overall Score"), default=0.0),
+            forecast_reliability=_safe_float(get("Forecast Reliability"), default=0.0),
+            data_quality=_safe_float(get("Data Quality"), default=0.0),
+            risk_score=_safe_float(get("Risk Score"), default=0.0),
+            price=_safe_float(get("Price"), default=0.0),
+            origin_tab=_safe_str(get("Origin Tab")) or "Top_10_Investments",
+            recorded_at=dt_at.astimezone(timezone.utc),
+        )
+
+
+@dataclass(slots=True)
+class SignalTrend:
+    """
+    Per-symbol day-to-day trajectory derived from its SignalSnapshot
+    history. PURELY DESCRIPTIVE -- it characterises how the engine's own
+    verdict has moved over the recent window; it makes no price prediction.
+    Its value is confirmation (a multi-day-stable action is more trustworthy
+    than a one-day flip) and early warning (a verdict decaying day over day
+    flags thesis erosion before any 1M/3M maturity check fires).
+    """
+    symbol: str
+    n_observations: int
+    window: int
+    current_action: str
+    current_investability: str
+    latest_score: float
+    latest_date: str
+    days_in_current_action: int
+    action_direction: str   # STRENGTHENING / WEAKENING / STABLE / FLIPPED / NEW
+    score_slope: float       # score points per snapshot over the window
+    distinct_actions: int
+    flip_count: int
+    stability: str           # STABLE / DRIFTING / CHOPPY / NEW
+    summary_label: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# =============================================================================
 # Backend Client (optional)
 # =============================================================================
 # v6.4.0: canonical endpoint chains.
@@ -1569,6 +1745,198 @@ class PerformanceStore:
 
 
 # =============================================================================
+# v6.7.0 — Signal_History store (Google Sheets) — best-effort, gspread-based
+# =============================================================================
+class SignalHistoryStore:
+    """
+    Best-effort gspread store for the day-to-day action-trend log. Mirrors
+    PerformanceStore's auth + hardened-header pattern but uses a simple
+    row-1 header / row-2 data layout (no KPI summary block). Self-contained:
+    duplicates the small credential loader so this class adds NO change to
+    PerformanceStore. Idempotent per symbol-per-day on append.
+    """
+    SHEET_DEFAULT = "Signal_History"
+    START_ROW = 1   # headers at row 1, data from row 2
+    DATA_ROW0 = 2
+
+    HEADERS = [
+        "Snapshot ID",
+        "Key",
+        "Symbol",
+        "Date (Riyadh)",
+        "Recorded At (Riyadh)",
+        "Recommendation",
+        "Final Action",
+        "Investability",
+        "Overall Score",
+        "Forecast Reliability",
+        "Data Quality",
+        "Risk Score",
+        "Price",
+        "Origin Tab",
+    ]
+
+    def __init__(self, spreadsheet_id: str, sheet_name: str):
+        self.spreadsheet_id = spreadsheet_id
+        self.sheet_name = sheet_name or self.SHEET_DEFAULT
+        self.backoff = FullJitterBackoff()
+        self.cache_keys: set = set()
+        self.cache_lock = Lock()
+
+        self.gc = None
+        self.sheet = None
+        self.ws = None
+        self._init_sheet()
+
+    def _load_sa_credentials_best_effort(self) -> Optional[Any]:
+        raw = (
+            os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+            or os.getenv("GOOGLE_CREDENTIALS")
+            or ""
+        ).strip()
+        if not raw:
+            return None
+        s = raw
+        if not s.startswith("{"):
+            try:
+                dec = base64.b64decode(s).decode("utf-8", errors="replace").strip()
+                if dec.startswith("{"):
+                    s = dec
+            except Exception:
+                pass
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict) and service_account is not None:
+                return service_account.Credentials.from_service_account_info(
+                    obj,
+                    scopes=["https://www.googleapis.com/auth/spreadsheets"],
+                )
+        except Exception:
+            return None
+        return None
+
+    def _init_sheet(self) -> None:
+        if not GSPREAD_AVAILABLE or gspread is None:
+            return
+        try:
+            creds = self._load_sa_credentials_best_effort()
+            if creds:
+                self.gc = gspread.authorize(creds)
+            else:
+                self.gc = gspread.service_account()
+            self.sheet = self.gc.open_by_key(self.spreadsheet_id)
+            try:
+                self.ws = self.sheet.worksheet(self.sheet_name)
+            except Exception:
+                self.ws = self.sheet.add_worksheet(
+                    title=self.sheet_name, rows=4000, cols=40
+                )
+            self.backoff.execute_sync(self._ensure_headers)
+        except Exception as e:
+            logger.error("SignalHistoryStore init failed: %s", e)
+            self.gc = None
+            self.sheet = None
+            self.ws = None
+
+    def _ensure_headers(self) -> None:
+        if not self.ws:
+            return
+        try:
+            existing = self.ws.row_values(self.START_ROW)
+        except Exception:
+            existing = []
+        existing_norm = [str(h).strip() for h in (existing or [])]
+        # Widen/repair the header row whenever it differs from canonical
+        # HEADERS by length OR content (same discipline as PerformanceStore).
+        if existing_norm != list(self.HEADERS):
+            end_col = len(self.HEADERS)
+            rng = _a1_range(1, self.START_ROW, end_col, self.START_ROW)
+            self.ws.update(rng, [self.HEADERS])
+            try:
+                self.ws.freeze(rows=self.START_ROW)
+            except Exception:
+                pass
+
+    def is_available(self) -> bool:
+        return bool(self.ws)
+
+    def load_snapshots(self, max_records: int = 20000) -> List[SignalSnapshot]:
+        if not self.ws:
+            return []
+        end_row = self.DATA_ROW0 + max(0, int(max_records)) - 1
+        end_col = len(self.HEADERS)
+        rng = _a1_range(1, self.DATA_ROW0, end_col, end_row)
+
+        def _load() -> List[List[Any]]:
+            return self.ws.get(rng)  # type: ignore
+
+        try:
+            rows = self.backoff.execute_sync(_load)
+        except Exception as e:
+            logger.error("Failed to load signal snapshots: %s", e)
+            return []
+        out: List[SignalSnapshot] = []
+        with self.cache_lock:
+            self.cache_keys.clear()
+            for r in rows or []:
+                if not r or not _safe_str(r[0]):
+                    continue
+                padded = list(r) + [""] * max(0, len(self.HEADERS) - len(r))
+                snap = SignalSnapshot.from_sheet_row(padded, self.HEADERS)
+                if snap.symbol:
+                    out.append(snap)
+                    self.cache_keys.add(snap.key)
+        return out
+
+    def _snapshot_to_row(self, s: SignalSnapshot) -> List[Any]:
+        return [
+            s.snapshot_id,
+            s.key,
+            s.symbol,
+            RiyadhTime.format(s.date_recorded, fmt="%Y-%m-%d"),
+            RiyadhTime.format(s.recorded_at.astimezone(_RIYADH_TZ)),
+            s.recommendation.value,
+            s.final_action or "",
+            s.investability_status or "",
+            s.overall_score,
+            s.forecast_reliability,
+            s.data_quality,
+            s.risk_score,
+            s.price,
+            s.origin_tab or "",
+        ]
+
+    def append_snapshots(self, snaps: List[SignalSnapshot]) -> int:
+        """Append only snapshots whose key isn't already present (idempotent
+        per symbol-per-day). Returns the count actually written."""
+        if not self.ws:
+            return 0
+        with self.cache_lock:
+            existing = set(self.cache_keys)
+        seen_now: set = set()
+        new: List[SignalSnapshot] = []
+        for s in snaps:
+            if s.key in existing or s.key in seen_now:
+                continue
+            seen_now.add(s.key)
+            new.append(s)
+        if not new:
+            return 0
+        rows = [self._snapshot_to_row(s) for s in new]
+        try:
+            self.backoff.execute_sync(
+                lambda: self.ws.append_rows(rows, value_input_option="RAW")  # type: ignore
+            )
+            with self.cache_lock:
+                for s in new:
+                    self.cache_keys.add(s.key)
+            return len(new)
+        except Exception as e:
+            logger.error("Failed to append signal snapshots: %s", e)
+            return 0
+
+
+# =============================================================================
 # Analytics
 # =============================================================================
 class RiskCalculator:
@@ -1761,6 +2129,137 @@ class PerformanceAnalyzer:
 
 
 # =============================================================================
+# v6.7.0 — Action-trend analyzer (day-to-day verdict trajectory)
+# =============================================================================
+class SignalTrendAnalyzer:
+    """
+    Turns a flat SignalSnapshot history into per-symbol day-to-day
+    trajectories. DESCRIPTIVE ONLY -- characterises how the engine's verdict
+    moved; predicts nothing. Tier ranks follow the canonical ordering
+    STRONG_BUY > BUY > ACCUMULATE > HOLD > REDUCE > SELL > STRONG_SELL >
+    AVOID; HOLD is the neutral midline used for side-flip detection.
+    """
+    _RANK: Dict[str, int] = {
+        RecommendationType.STRONG_BUY.value: 8,
+        RecommendationType.BUY.value: 7,
+        RecommendationType.ACCUMULATE.value: 6,
+        RecommendationType.HOLD.value: 5,
+        RecommendationType.REDUCE.value: 4,
+        RecommendationType.SELL.value: 3,
+        RecommendationType.STRONG_SELL.value: 2,
+        RecommendationType.AVOID.value: 1,
+    }
+    _NEUTRAL = 5  # HOLD rank
+
+    def _rank(self, rec_value: str) -> int:
+        return self._RANK.get(rec_value, self._NEUTRAL)
+
+    def _side(self, rec_value: str) -> int:
+        r = self._rank(rec_value) - self._NEUTRAL
+        return 1 if r > 0 else (-1 if r < 0 else 0)
+
+    def analyze(
+        self, snapshots: List[SignalSnapshot], window: int = 5
+    ) -> List[SignalTrend]:
+        window = max(2, int(window))
+        by_sym: Dict[str, List[SignalSnapshot]] = defaultdict(list)
+        for s in snapshots:
+            if s.symbol:
+                by_sym[s.symbol].append(s)
+
+        trends: List[SignalTrend] = []
+        for sym, snaps in by_sym.items():
+            snaps_sorted = sorted(snaps, key=lambda x: x.date_recorded)
+            n = len(snaps_sorted)
+            latest = snaps_sorted[-1]
+            win = snaps_sorted[-window:]
+            recs = [s.recommendation.value for s in win]
+            scores = [float(s.overall_score) for s in win]
+
+            # snapshots (days, at the daily cadence) the latest action has
+            # held, counting back from the most recent.
+            days_in = 1
+            for prev in reversed(snaps_sorted[:-1]):
+                if prev.recommendation.value == latest.recommendation.value:
+                    days_in += 1
+                else:
+                    break
+
+            distinct = len(set(recs))
+            sides = [self._side(r) for r in recs]
+            nonzero = [x for x in sides if x != 0]
+            flip_count = sum(
+                1 for i in range(1, len(nonzero)) if nonzero[i] != nonzero[i - 1]
+            )
+
+            # slope of overall_score over the window (least squares if numpy,
+            # else endpoint slope) -- points per snapshot.
+            slope = 0.0
+            if len(scores) >= 2:
+                if NUMPY_AVAILABLE and np is not None:
+                    xs = np.arange(len(scores), dtype=float)
+                    ys = np.asarray(scores, dtype=float)
+                    try:
+                        slope = float(np.polyfit(xs, ys, 1)[0])
+                    except Exception:
+                        slope = (scores[-1] - scores[0]) / (len(scores) - 1)
+                else:
+                    slope = (scores[-1] - scores[0]) / (len(scores) - 1)
+
+            if n < 2:
+                direction = "NEW"
+            elif distinct == 1:
+                direction = "STABLE"
+            elif flip_count > 0:
+                direction = "FLIPPED"
+            else:
+                net = self._rank(recs[-1]) - self._rank(recs[0])
+                direction = (
+                    "STRENGTHENING" if net > 0
+                    else "WEAKENING" if net < 0
+                    else "STABLE"
+                )
+
+            if n < 2:
+                stability = "NEW"
+            elif flip_count >= 1:
+                stability = "CHOPPY"
+            elif distinct == 1:
+                stability = "STABLE"
+            else:
+                stability = "DRIFTING"
+
+            arrow = "↑" if slope > 0.05 else ("↓" if slope < -0.05 else "→")
+            label = (
+                f"{latest.recommendation.value} · "
+                f"{direction.lower()} {days_in}d · score {arrow}"
+            )
+
+            trends.append(
+                SignalTrend(
+                    symbol=sym,
+                    n_observations=n,
+                    window=min(window, n),
+                    current_action=latest.recommendation.value,
+                    current_investability=latest.investability_status,
+                    latest_score=float(latest.overall_score),
+                    latest_date=RiyadhTime.format(latest.date_recorded, fmt="%Y-%m-%d"),
+                    days_in_current_action=days_in,
+                    action_direction=direction,
+                    score_slope=round(slope, 4),
+                    distinct_actions=distinct,
+                    flip_count=flip_count,
+                    stability=stability,
+                    summary_label=label,
+                )
+            )
+
+        # newest activity first, then symbol
+        trends.sort(key=lambda t: (t.latest_date, t.symbol), reverse=True)
+        return trends
+
+
+# =============================================================================
 # Reporting
 # =============================================================================
 class ReportGenerator:
@@ -1941,6 +2440,24 @@ class PerformanceTrackerApp:
             base_url=self._backend_base_url(),
             token=self._backend_token(),
         )
+
+        # v6.7.0: day-to-day action-trend (Signal_History). Env-gated,
+        # default ON (kill-switch TRACK_SIGNAL_HISTORY=0). Reuses the same
+        # spreadsheet; a separate tab. The trend window is snapshot-based
+        # (one snapshot per symbol per day at the intended daily cadence).
+        self.signal_history_enabled = _env_bool("TRACK_SIGNAL_HISTORY", True)
+        self.trend_window = _env_int("TRACK_TREND_WINDOW", 5, lo=2, hi=60)
+        self.signal_store: Optional[SignalHistoryStore] = None
+        if self.signal_history_enabled:
+            try:
+                self.signal_store = SignalHistoryStore(
+                    self.spreadsheet_id,
+                    os.getenv("TRACK_SIGNAL_SHEET", SignalHistoryStore.SHEET_DEFAULT),
+                )
+            except Exception as e:
+                logger.error("SignalHistoryStore unavailable: %s", e)
+                self.signal_store = None
+        self.trend_analyzer = SignalTrendAnalyzer()
 
         self.stop_event = Event()
 
@@ -2141,23 +2658,33 @@ class PerformanceTrackerApp:
         return RecommendationType.HOLD
 
     async def record_from_top10(
-        self, existing: List[PerformanceRecord]
+        self,
+        existing: List[PerformanceRecord],
+        rows: Optional[List[Dict[str, Any]]] = None,
     ) -> List[PerformanceRecord]:
-        if not self.backend.base_url:
-            return []
-
-        rows, meta = await self.backend.get_top10_rows(criteria_overrides=None)
-        if not rows:
-            if meta.get("error"):
-                logger.warning(
-                    "record_from_top10: no rows (%s)", meta.get("error")
-                )
-            return []
-        logger.info(
-            "record_from_top10: %d rows from %s",
-            len(rows),
-            meta.get("endpoint") or "unknown",
-        )
+        # v6.7.0: accept pre-fetched rows so run_once can fetch the Top10
+        # universe ONCE and feed both the pick recorder and the daily
+        # signal-snapshot logger -- no second backend call, no added edge
+        # pressure. rows=None preserves the original self-fetch behavior.
+        if rows is None:
+            if not self.backend.base_url:
+                return []
+            rows, meta = await self.backend.get_top10_rows(criteria_overrides=None)
+            if not rows:
+                if meta.get("error"):
+                    logger.warning(
+                        "record_from_top10: no rows (%s)", meta.get("error")
+                    )
+                return []
+            logger.info(
+                "record_from_top10: %d rows from %s",
+                len(rows),
+                meta.get("endpoint") or "unknown",
+            )
+        else:
+            if not rows:
+                return []
+            logger.info("record_from_top10: %d rows (pre-fetched)", len(rows))
 
         existing_keys = set(r.key for r in existing)
         now = RiyadhTime.now()
@@ -2240,6 +2767,92 @@ class PerformanceTrackerApp:
 
         return new_records
 
+    def _build_signal_snapshots(
+        self, rows: List[Dict[str, Any]]
+    ) -> List[SignalSnapshot]:
+        now = RiyadhTime.now()
+        out: List[SignalSnapshot] = []
+        seen: set = set()
+        for row in rows or []:
+            sym = _safe_str(row.get("symbol")).upper()
+            if not sym:
+                continue
+            price = _safe_float(
+                row.get("current_price") or row.get("price"), default=0.0
+            )
+            rec = self._recommendation_from_row(row)
+            origin = (
+                _safe_str(
+                    row.get("source_page") or row.get("origin") or "Top_10_Investments"
+                )
+                or "Top_10_Investments"
+            )
+            snap = SignalSnapshot(
+                snapshot_id=str(uuid.uuid4()),
+                symbol=sym,
+                date_recorded=now,
+                recommendation=rec,
+                final_action=_safe_str(row.get("final_action")),
+                investability_status=_safe_str(row.get("investability_status")),
+                overall_score=_safe_float(row.get("overall_score"), default=0.0),
+                forecast_reliability=_safe_float(
+                    row.get("forecast_reliability_score"), default=0.0
+                ),
+                data_quality=_safe_float(row.get("data_quality_score"), default=0.0),
+                risk_score=_safe_float(row.get("risk_score"), default=0.0),
+                price=price,
+                origin_tab=origin,
+            )
+            if snap.key in seen:
+                continue
+            seen.add(snap.key)
+            out.append(snap)
+        return out
+
+    async def record_signal_snapshots(self, rows: List[Dict[str, Any]]) -> int:
+        # v6.7.0: log one daily verdict snapshot per decision symbol from the
+        # ALREADY-FETCHED Top10 rows. Idempotent per symbol-per-day. Best
+        # effort: a Sheets hiccup here must never break --record/--audit.
+        if not self.signal_history_enabled or self.signal_store is None:
+            return 0
+        if not self.signal_store.is_available():
+            return 0
+        snaps = self._build_signal_snapshots(rows)
+        if not snaps:
+            return 0
+        loop = asyncio.get_running_loop()
+        try:
+            written = await loop.run_in_executor(
+                _get_executor(), self.signal_store.append_snapshots, snaps
+            )
+        except Exception as e:
+            logger.error("record_signal_snapshots failed: %s", e)
+            return 0
+        if written:
+            logger.info(
+                "record_signal_snapshots: wrote %d new daily snapshot(s)", written
+            )
+        return int(written or 0)
+
+    async def _compute_signal_trends(self) -> List[SignalTrend]:
+        if not self.signal_history_enabled or self.signal_store is None:
+            return []
+        if not self.signal_store.is_available():
+            return []
+        loop = asyncio.get_running_loop()
+        try:
+            snaps = await loop.run_in_executor(
+                _get_executor(),
+                self.signal_store.load_snapshots,
+                int(self.args.max_records or 20000),
+            )
+        except Exception as e:
+            logger.error("load_snapshots failed: %s", e)
+            return []
+        if not snaps:
+            return []
+        return self.trend_analyzer.analyze(snaps, window=self.trend_window)
+
     async def audit_active_records(
         self, records: List[PerformanceRecord]
     ) -> List[PerformanceRecord]:
@@ -2293,13 +2906,32 @@ class PerformanceTrackerApp:
             records = []
 
         if self.args.record:
-            new = await self.record_from_top10(records)
+            # v6.7.0: fetch the Top10 universe once, feed both pipelines.
+            prefetched: Optional[List[Dict[str, Any]]] = None
+            if (
+                self.signal_history_enabled
+                and self.signal_store is not None
+                and self.backend.base_url
+            ):
+                try:
+                    prefetched, _pf_meta = await self.backend.get_top10_rows(
+                        criteria_overrides=None
+                    )
+                except Exception as e:
+                    logger.warning("Top10 prefetch failed: %s", e)
+                    prefetched = None
+
+            new = await self.record_from_top10(records, rows=prefetched)
             if new and self.store.is_available():
                 ok = await loop.run_in_executor(
                     _get_executor(), self.store.append_records, new
                 )
                 if ok:
                     records.extend(new)
+
+            # v6.7.0: log today's verdict snapshot per decision symbol.
+            if prefetched is not None:
+                await self.record_signal_snapshots(prefetched)
 
         if self.args.audit:
             records = await self.audit_active_records(records)
@@ -2317,6 +2949,16 @@ class PerformanceTrackerApp:
             perf_records_processed.inc(len(records))
         except Exception:
             pass
+
+        # v6.7.0: compute day-to-day action-trends once (reused by --analyze
+        # stdout and --export json). Empty unless Signal_History has data.
+        signal_trends: List[SignalTrend] = []
+        if (
+            (self.args.analyze or self.args.export)
+            and self.signal_history_enabled
+            and self.signal_store is not None
+        ):
+            signal_trends = await self._compute_signal_trends()
 
         if self.args.analyze:
             if self.store.is_available():
@@ -2358,6 +3000,23 @@ class PerformanceTrackerApp:
                 )
                 _out(f"Win-rate by investability: {inv_bits}")
 
+            # v6.7.0: day-to-day action-trend across decision symbols. Reads
+            # the Signal_History accumulated by --record. Needs >=2 days of
+            # history to characterise direction; day 1 shows NEW.
+            if signal_trends:
+                _out("-" * 66)
+                _out(
+                    f"ACTION-TREND (day-to-day, window={self.trend_window}) "
+                    f"— {len(signal_trends)} symbol(s)"
+                )
+                latest_day = signal_trends[0].latest_date
+                shown = [t for t in signal_trends if t.latest_date == latest_day][:20]
+                for t in shown:
+                    _out(
+                        f"  {t.symbol:<12} {t.summary_label}  "
+                        f"[{t.stability}, {t.n_observations} obs, flips={t.flip_count}]"
+                    )
+
         if self.args.simulate:
             matured = [
                 r
@@ -2394,6 +3053,15 @@ class PerformanceTrackerApp:
                 self.reporter.generate_csv(records, out_base + ".csv")
             if fmt in {"html", "all"}:
                 self.reporter.generate_html(records, summary, out_base + ".html")
+            if signal_trends:
+                try:
+                    Path(out_base + "_signal_trends.json").write_text(
+                        json_dumps([t.to_dict() for t in signal_trends], indent=2),
+                        encoding="utf-8",
+                    )
+                    _out(f"Signal-trend export: {out_base}_signal_trends.json")
+                except Exception as e:
+                    logger.warning("signal-trend export failed: %s", e)
             _out(f"Export complete: {out_base}.* ({fmt})")
 
         return 0
@@ -2604,6 +3272,10 @@ __all__ = [
     "PerformanceStore",
     "PerformanceAnalyzer",
     "ReportGenerator",
+    "SignalSnapshot",
+    "SignalHistoryStore",
+    "SignalTrend",
+    "SignalTrendAnalyzer",
     "PerformanceTrackerApp",
     "create_parser",
     "main",
