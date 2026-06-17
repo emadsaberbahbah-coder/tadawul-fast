@@ -1,10 +1,45 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.6   (TFB Final Execution Plan v5.0 — Phase P2;
-                 Engineering Audit Phase 0 — data-trust gate)
+Version: 1.0.7   (TFB Final Execution Plan v5.0 — Phase P2;
+                 Engineering Audit Phase 0 — investability gate + GATE_ORDER fix)
 
-v1.0.6 [DATA-TRUST-GATE]: the engine DETECTS thin/stale coverage (it captures
+v1.0.7 [INVESTABILITY-GATE + GATE_ORDER-FIX]: two Phase-0 corrections.
+(1) INVESTABILITY GATE — the engine's authoritative verdict
+(investability_status in INVESTABLE / WATCHLIST / BLOCKED) was captured into
+cand.engine_gate.investability (v1.0.6 itself noted "engine_gate was carried
+and ignored") but no gate ever enforced it: the builder re-derived its own
+truth-table and could therefore SELECT a name the engine had benched to
+WATCHLIST or BLOCKED whenever the builder's independent gates happened to pass.
+In the live engine Top_10 path data_engine_v2._top10_row_is_eligible already
+requires INVESTABLE, so the gap is COVERED there and latent — but the
+engine<->builder verdict contract was implicit, and any path that feeds the
+builder an unfiltered candidate set (a broader selector ingest, a manual call)
+had no backstop. FIX (default ON; mirrors the v1.0.3/v1.0.4/v1.0.6 local-gate
+pattern — no engine change, no edit to L2/L5/L6/L7, scoring, sizing, or the
+verdict<->gate-trace contract): a new "Investability" gate fails MAJOR (=>
+DO_NOT_INVEST; the name still shows in the audit grid / near-miss but is NEVER a
+selected ticket) when the engine verdict is WATCHLIST or BLOCKED. INVESTABLE, or
+a blank/unrecognized token, PASSES (fail-open + traced, so a row that simply
+never carried the field is never penalized). Appended ONLY when
+investability_gate_enabled, so the gate list and verdict are byte-identical to
+v1.0.6 when TFB_OPP_INVESTABILITY_GATE=0. In the normal pre-filtered engine path
+every row is already INVESTABLE so the gate is a NO-OP (selection unchanged); it
+bites only on a non-INVESTABLE row that would otherwise have slipped through.
+This also makes the engine's v5.91.0 reliability-calibration flow coherent end
+to end: the calibrated forecast_reliability_score the builder reads (the tiered
+Reliability gate >=70 pass / >=Min-15 WATCH / below MAJOR, the confidence band,
+and the score's reliability component) and this verdict gate now agree on the
+same engine source of truth.
+(2) GATE_ORDER FIX — the v1.0.4 "Valuation Sanity" gate is appended in
+evaluate_gates but was never added to GATE_ORDER, so first_failed_gate fell back
+to sort-order 99 for it and could mis-attribute the near-miss "failed_gate" when
+a row failed Valuation Sanity alongside a later gate. "Valuation Sanity" (and
+the new "Investability") now sit in GATE_ORDER at their true append positions,
+so near-miss attribution is correct. Pure ordering metadata — no verdict, gate,
+score, or sizing change. Every v1.0.6 byte carried forward verbatim.
+
+
 each row's investability verdict + last_updated into cand.engine_gate) but
 that detection NEVER gated selection — engine_gate was carried and ignored,
 and there was no freshness or coverage check anywhere. The hard fields each
@@ -135,6 +170,7 @@ ENV KILL-SWITCHES (policy block — read per call, not at import)
   TFB_OPP_TRUST_GATE       "1"   v1.0.6: "0" ⇒ skip the Data Trust MAJOR gate
   TFB_OPP_MAX_DATA_AGE_HOURS "168" v1.0.6: last_updated older ⇒ stale ⇒ fail
   TFB_OPP_MIN_TRUST_FIELDS "2"   v1.0.6: fewer core signals present ⇒ thin ⇒ fail
+  TFB_OPP_INVESTABILITY_GATE "1" v1.0.7: "0" ⇒ skip the Investability MAJOR gate
 Explicit `criteria` overrides > env > defaults.
 
 INTEGRATION
@@ -322,6 +358,8 @@ DEFAULT_CRITERIA = {
     "trust_gate_enabled": True,
     "max_data_age_hours": 168.0,
     "min_trust_fields": 2,
+    # v1.0.7 investability gate (env-tunable; see policy block)
+    "investability_gate_enabled": True,
 }
 
 _CRITERIA_FLOAT_KEYS = (
@@ -339,7 +377,7 @@ _CRITERIA_BOOL_KEYS = (
     "allow_conflict", "allow_negative_news", "allow_negative_sector",
     "include_portfolio_holdings", "forecast_gate_enabled",
     "valuation_sanity_gate_enabled", "engine_roi_display_enabled",
-    "trust_gate_enabled",
+    "trust_gate_enabled", "investability_gate_enabled",
 )
 
 # ---------------------------------------------------------------------------
@@ -376,9 +414,9 @@ DIVERSIFICATION_NO_CONTEXT = 60.0
 
 # §4.2 gate evaluation order (first fail in this order = headline failed_gate)
 GATE_ORDER = (
-    "Price", "FX", "Valuation", "ROI", "Annualized ROI", "Forecast",
-    "Reliability", "Data Quality", "Data Trust", "Risk Level", "Risk/Reward",
-    "Conflict", "News", "Sector Trend", "Portfolio",
+    "Price", "FX", "Valuation", "ROI", "Annualized ROI", "Valuation Sanity",
+    "Forecast", "Reliability", "Data Quality", "Data Trust", "Investability",
+    "Risk Level", "Risk/Reward", "Conflict", "News", "Sector Trend", "Portfolio",
 )
 
 FAIL_MAJOR = "MAJOR"
@@ -473,6 +511,15 @@ def _env_trust_gate():
         "0", "false", "no", "off")
 
 
+def _env_investability_gate():
+    """v1.0.7: engine-investability gate toggle. Default ON; set
+    TFB_OPP_INVESTABILITY_GATE=0 to restore byte-identical v1.0.6 behavior (the
+    Investability gate is not appended)."""
+    return str(_env_str(
+        "TFB_OPP_INVESTABILITY_GATE", "1")).strip().lower() not in (
+        "0", "false", "no", "off")
+
+
 def _env_overrides():
     """Mechanics block of criteria, env-tunable (policy block)."""
     return {
@@ -510,6 +557,7 @@ def _env_overrides():
         "min_trust_fields": _env_int(
             "TFB_OPP_MIN_TRUST_FIELDS",
             DEFAULT_CRITERIA["min_trust_fields"]),
+        "investability_gate_enabled": _env_investability_gate(),
     }
 
 
@@ -1083,6 +1131,29 @@ def evaluate_gates(cand, criteria, held_symbols=None):
              "/6 core signals"))
         tg["trust_detail"] = t_detail
         g.append(tg)
+
+    # v1.0.7 [INVESTABILITY-GATE]: enforce the engine's authoritative verdict.
+    # normalize_candidate captures investability_status into
+    # cand.engine_gate.investability but, before v1.0.7, evaluate_gates
+    # re-derived its own truth-table and never read it — so a name the engine
+    # benched (WATCHLIST/BLOCKED) could still be SELECTED if the builder's
+    # independent gates happened to pass. The live engine Top_10 path already
+    # requires INVESTABLE (data_engine_v2._top10_row_is_eligible), so this is a
+    # defense-in-depth backstop + an EXPLICIT engine<->builder contract for any
+    # path that feeds an unfiltered set. Fails MAJOR (=> DO_NOT_INVEST; shows in
+    # audit / near-miss, never selected) on WATCHLIST or BLOCKED; INVESTABLE or
+    # a blank/unrecognized token PASSES (fail-open + traced). Appended ONLY when
+    # investability_gate_enabled, so the gate list + verdict are byte-identical
+    # to v1.0.6 when TFB_OPP_INVESTABILITY_GATE=0; a no-op on a pre-filtered
+    # (all-INVESTABLE) input.
+    if criteria.get("investability_gate_enabled"):
+        inv_raw = (cand.get("engine_gate") or {}).get("investability")
+        inv_norm = _norm_token(_to_text(inv_raw) or "")
+        inv_ok = inv_norm not in ("watchlist", "blocked")
+        g.append(_gate(
+            "Investability", inv_ok, FAIL_MAJOR,
+            (_to_text(inv_raw) or "Unknown"),
+            "engine verdict INVESTABLE (blank/Unknown passes)"))
 
     cap = _norm_risk(criteria["max_risk_level"]) or "Medium"
     risk = cand["risk_level"]
