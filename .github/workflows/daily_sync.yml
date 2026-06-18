@@ -544,7 +544,14 @@ jobs:
             echo "rate_limited=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if grep -qiE "AuthenticationError|InvalidGrant|401 Unauthorized|403 Forbidden" "$LOG_FILE"; then
+          # Auth/permission scan (hardened 2026-06-18): the original pattern only
+          # matched HTTP-style text ("403 Forbidden" / "401 Unauthorized"), which
+          # the gspread / Google API client does NOT emit — its 403 surfaces as
+          # "does not have permission" / "PERMISSION_DENIED" / "[403]". That gap is
+          # why a standing read-only-service-account 403 could slip past this net.
+          # Added the real gspread signatures, kept auth-specific (403/401 only) so
+          # a 429/500 APIError can't false-trip this and fail the job.
+          if grep -qiE "AuthenticationError|InvalidGrant|401 Unauthorized|403 Forbidden|does not have permission|PERMISSION_DENIED|\[401\]|\[403\]" "$LOG_FILE"; then
             echo "::error::Google Sheets authentication/permission issue detected."
             EXIT_CODE=1
           fi
