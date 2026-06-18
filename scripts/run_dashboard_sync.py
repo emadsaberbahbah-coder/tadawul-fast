@@ -3,9 +3,35 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.7.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.8.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.8.0 fix — non-scalar cell write (list/dict cells 400 the page write)
+- WHY: the Google Sheets values API (valueInputOption=RAW) rejects any cell that
+  is a list or dict ("Invalid values[r][c]: list_value ..."). The backend emits
+  a few STRUCTURED columns for instrument rows — confirmed live: column 96,
+  "Scoring Errors", is a Python list (usually empty []). The matrix path
+  (_extract_table_payload's rows_matrix branch) returned cells verbatim and
+  _rectify_matrix only padded width, so a list cell reached the API untouched.
+  This stayed HIDDEN while the v6.6.0 limit:1 bug truncated every page-driven
+  page to a single row whose structured cells happened to be benign; once
+  v6.7.0 let the FULL pages through, the first row carrying a list cell 400-ed
+  the whole write (Market_Leaders / Global_Markets / Commodities_FX failed;
+  Mutual_Funds passed only because its rows had no list there). A latent
+  data-shape bug surfaced — not caused — by the v6.7.0 fix.
+- FIX: a per-cell scalar flatten (_cell_to_scalar) applied in _rectify_matrix —
+  the single common choke point both the rows_matrix and rows[dict] paths pass
+  through before the write, so one edit covers both. Empty list/dict -> "" (a
+  clean empty cell); list of scalars -> "a, b, c"; nested -> compact JSON;
+  scalars / None / Enum / datetime handled as _coerce_jsonable handles them.
+- SCOPE / SAFETY:
+    * Pure correctness: a list/dict cell is NEVER a valid Sheets RAW write, so
+      there is no prior behavior to preserve (the prior behavior is a hard 400).
+      Deliberately NOT env-gated for that reason. Widths, the limit policy, every
+      endpoint/payload key, the My_Portfolio + decision guards, credentials, and
+      exit codes are all byte-for-byte unchanged.
+- UNCHANGED: everything in v6.7.0 below.
 
 v6.7.0 fix — page-driven limit truncation (single-row pages)
 - WHY: the page-driven pages (Market_Leaders, Global_Markets, Commodities_FX,
@@ -163,7 +189,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.7.0"
+SCRIPT_VERSION = "6.8.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1133,16 +1159,73 @@ def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[A
     return [], []
 
 
+def _cell_to_scalar(v: Any) -> Any:
+    """Flatten a single value to a Google-Sheets-writable SCALAR.
+
+    The Sheets values API (valueInputOption=RAW) rejects any cell whose value is
+    a list or dict ("Invalid values[r][c]: list_value ..."). The backend emits a
+    few structured columns for instrument rows (e.g. "Scoring Errors", a list),
+    and the matrix path returned them verbatim — so once a page sent more than
+    the single truncated row, the whole write 400-ed on the first structured
+    cell. This flattens any non-scalar to a readable string; scalars, None,
+    Enums, and datetimes are treated as _coerce_jsonable treats them.
+      - empty list/tuple/set/dict -> "" (clean empty cell, e.g. no errors)
+      - list of scalars           -> "a, b, c"
+      - nested list / dict        -> compact JSON (never crashes the write)
+    """
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, Enum):
+        return _cell_to_scalar(v.value)
+    if isinstance(v, (datetime, date)):
+        try:
+            return v.isoformat()
+        except Exception:
+            return str(v)
+    if isinstance(v, (list, tuple, set)):
+        seq = list(v)
+        if not seq:
+            return ""
+        if all(x is None or isinstance(x, (str, int, float, bool)) for x in seq):
+            return ", ".join("" if x is None else str(x) for x in seq)
+        try:
+            return json.dumps(seq, ensure_ascii=False, default=str)
+        except Exception:
+            return str(seq)
+    if isinstance(v, dict):
+        if not v:
+            return ""
+        try:
+            return json.dumps(v, ensure_ascii=False, default=str)
+        except Exception:
+            return str(v)
+    try:
+        if hasattr(v, "model_dump"):
+            return _cell_to_scalar(v.model_dump(mode="python"))  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return str(v)
+
+
 def _rectify_matrix(headers: List[Any], matrix: List[List[Any]]) -> List[List[Any]]:
-    """Pad/truncate each row to match header length."""
+    """Pad/truncate each row to header length AND flatten every cell to a
+    Sheets-writable scalar.
+
+    v6.8.0: the per-cell scalar pass (_cell_to_scalar) is NEW. _rectify_matrix is
+    the single common choke point both the rows_matrix path and the rows[dict]
+    path pass through before the write (see _run_one_task), so the flatten lives
+    here and covers both. The Sheets RAW write rejects list/dict cells; the
+    backend's structured columns (e.g. "Scoring Errors") were 400-ing the page
+    write once >1 row was sent. Scalars/None are unchanged; widths are unchanged.
+    """
     width = len(headers or [])
     if width <= 0:
-        return [list(r) for r in (matrix or []) if isinstance(r, list)]
+        return [[_cell_to_scalar(c) for c in r] for r in (matrix or []) if isinstance(r, list)]
     out: List[List[Any]] = []
     for r in matrix or []:
         if not isinstance(r, list):
             continue
-        rr = list(r)
+        rr = [_cell_to_scalar(c) for c in r]
         if len(rr) < width:
             rr = rr + [None] * (width - len(rr))
         elif len(rr) > width:
