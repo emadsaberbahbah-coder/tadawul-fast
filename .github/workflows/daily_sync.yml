@@ -622,9 +622,29 @@ jobs:
           if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
             export GOOGLE_SHEETS_CREDENTIALS="$(cat "$GOOGLE_APPLICATION_CREDENTIALS")"
           fi
+          # Visibility (2026-06-18): the previous '|| echo non-fatal' hid a
+          # standing Sheets 403 — the service account lacked Editor on the
+          # spreadsheet — for an unknown number of runs. Performance_Log was
+          # never created and the calibration clock never started, all behind a
+          # green check. Critically, track_performance CATCHES a
+          # PerformanceStore/SignalHistoryStore init failure internally and still
+          # EXITS 0, so the exit code alone is NOT trustworthy. This step stays
+          # NON-FATAL (continue-on-error above — a tracking hiccup must never
+          # fail the sync) but now makes a failure VISIBLE: capture the exit
+          # code AND scan the run log for write/permission failure signatures,
+          # emitting ::error:: in either case so it can't hide again.
+          set +e
           python scripts/track_performance.py --record --audit --analyze \
-            --sheet-id "$TARGET_SHEET_ID" \
-            || echo "::warning::track_performance returned non-zero (non-fatal)"
+            --sheet-id "$TARGET_SHEET_ID" 2>&1 | tee /tmp/track_performance.log
+          TRACK_RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$TRACK_RC" -ne 0 ]; then
+            echo "::error::track_performance exited ${TRACK_RC} — recording likely failed (see log above)."
+          elif grep -qiE "init failed|does not have permission|APIError|\[40[13]\]" /tmp/track_performance.log; then
+            echo "::error::track_performance exited 0 but logged a Sheets write/permission error — Performance_Log may not be updating (verify the service account still has Editor on the spreadsheet). See log above."
+          else
+            echo "::notice::track_performance completed cleanly; Performance_Log / Signal_History updated."
+          fi
 
       # -------------------------------------------------------------------------
       # 📊 Capture Per-Step Metrics (optional JSON emitted by sync runner)
