@@ -2,8 +2,35 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.8.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.9.0)
 ===========================================================
+
+Why this revision (v6.9.0 vs v6.8.0)
+-------------------------------------
+TOP10 FETCH REPOINT — the calibration clock was recording ZERO picks despite
+the sheet machinery working. Root cause (diagnosed live, not guessed): --record
+fetched from /v1/advanced/top10-investments, an `investment_advisor` endpoint
+that bridges to advanced_analysis under a 20s server-side cap. A cold full
+Top_10 build takes ~50-90s, so that bridge TIMES OUT every call and returns
+HTTP 200 with status="partial" and zero rows — which the tracker faithfully
+recorded as nothing. The advanced_analysis /sheet-rows route runs the SAME
+build with no cap and returns the full populated page (confirmed live: 200,
+status="success", 50 rows). Fixes here, all in the BackendClient fetch layer
+(no change to recording, scoring, snapshots, or schema):
+  - /sheet-rows is now the PREFERRED Top10 endpoint; the advisor endpoints are
+    kept as fallbacks. Per-endpoint request body (/sheet-rows wants
+    {"page": <page>}; advisor wants criteria).
+  - EMPTY-200 FALL-THROUGH: a 200 with zero rows (a timed-out partial) no longer
+    counts as success — it falls through to the next endpoint. Closes the
+    v6.4.0 gap where the first non-error response, even empty, stopped the chain.
+  - Client fetch timeout raised 45s -> 100s (the full build exceeds 45s).
+  - Fully reversible: TRACK_TOP10_ENDPOINTS / TRACK_TOP10_PAGE /
+    TRACK_TOP10_TIMEOUT_SEC. Set TRACK_TOP10_ENDPOINTS to the old advisor-first
+    chain to restore v6.8.0 behavior exactly.
+GSPREAD 6.x DEPRECATION FIX — all five worksheet.update(range, values) calls
+switched to the named-arg form update(values=, range_name=). gspread 6.2.1 is
+live and warns on the old positional order; a future 7.x makes it a hard error
+that would silently kill recording again. Behavior-identical on 6.x.
 
 Why this revision (v6.8.0 vs v6.7.0)
 -------------------------------------
@@ -419,7 +446,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.8.0"
+SCRIPT_VERSION = "6.9.0"
 SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias (preserved)
 SCRIPT_NAME = "PerformanceTracker"
 
@@ -1337,14 +1364,55 @@ class CalibrationReport:
 # =============================================================================
 # Backend Client (optional)
 # =============================================================================
-# v6.4.0: canonical endpoint chains.
-# Top10: preferred -> fallback -> legacy (non-existent in this repo but kept
-# in case a custom deployment genuinely exposes /v1/analysis/top10).
-_TOP10_ENDPOINTS: Tuple[str, ...] = (
-    "/v1/advanced/top10-investments",
-    "/v1/advanced/top10",
-    "/v1/analysis/top10",  # legacy fallback; usually 404 — see v6.3.0 bug note
+# v6.9.0: canonical Top10 endpoint chain — REORDERED to fix empty recording.
+# The advisor endpoints (/v1/advanced/top10-investments, /v1/advanced/top10)
+# bridge to advanced_analysis under a 20s SERVER-SIDE cap (meta
+# bridge_timeout_sec=20.0). A cold full Top_10 build takes ~50-90s, so that
+# bridge almost always TIMES OUT and returns HTTP 200 with status="partial" and
+# ZERO rows (meta bridge_call_outcome="timeout"). track_performance then
+# recorded nothing. The advanced_analysis /sheet-rows route runs the SAME build
+# with no such cap and returns the full populated page (confirmed live: HTTP 200,
+# status="success", 50 rows). So /sheet-rows is now PREFERRED; the advisor
+# endpoints are kept as fallbacks. NOTE: /sheet-rows takes a DIFFERENT request
+# body ({"page": <page>}) than the advisor endpoints (criteria) — get_top10_rows
+# selects the body per-endpoint. Chain + page + client timeout are env-overridable
+# (set TRACK_TOP10_ENDPOINTS to the old advisor-first chain to fully revert).
+_TOP10_PAGE_DEFAULT = "Top_10_Investments"
+_TOP10_ENDPOINTS_DEFAULT: Tuple[str, ...] = (
+    "/sheet-rows",                     # advanced_analysis; full page, no 20s cap (PREFERRED)
+    "/v1/advanced/sheet-rows",         # alias of the above
+    "/v1/advanced/top10-investments",  # advisor; subject to the 20s bridge cap (fallback)
+    "/v1/advanced/top10",              # advisor alias
+    "/v1/analysis/top10",              # legacy; usually 404 — see v6.3.0 bug note
 )
+# Back-compat alias (kept in case anything imports the old name).
+_TOP10_ENDPOINTS = _TOP10_ENDPOINTS_DEFAULT
+
+try:
+    # /sheet-rows runs the full ~50-90s build synchronously, so the CLIENT
+    # timeout must exceed it (the old 45s would cut a healthy build off). The
+    # advisor fallbacks return their partial at ~20s regardless, so one higher
+    # ceiling is safe for the whole chain.
+    _TOP10_FETCH_TIMEOUT_SEC = float(os.getenv("TRACK_TOP10_TIMEOUT_SEC", "100") or "100")
+except Exception:
+    _TOP10_FETCH_TIMEOUT_SEC = 100.0
+
+
+def _top10_endpoints() -> Tuple[str, ...]:
+    """v6.9.0: the Top10 endpoint chain. Override via TRACK_TOP10_ENDPOINTS
+    (comma-separated); set it to the old advisor-first chain to revert."""
+    raw = (os.getenv("TRACK_TOP10_ENDPOINTS") or "").strip()
+    if raw:
+        eps = tuple(e.strip() for e in raw.split(",") if e.strip())
+        if eps:
+            return eps
+    return _TOP10_ENDPOINTS_DEFAULT
+
+
+def _top10_page() -> str:
+    """v6.9.0: page name sent in the body to /sheet-rows endpoints. Override
+    via TRACK_TOP10_PAGE."""
+    return (os.getenv("TRACK_TOP10_PAGE") or _TOP10_PAGE_DEFAULT).strip() or _TOP10_PAGE_DEFAULT
 
 # Quotes: preferred -> fallbacks.
 _QUOTES_ENDPOINT_PRIMARY = "/v1/enriched/quotes"
@@ -1444,28 +1512,48 @@ class BackendClient:
         self, criteria_overrides: Optional[Dict[str, Any]] = None
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
-        v6.4.0: tries canonical endpoints in order.
-          1) /v1/advanced/top10-investments  (preferred)
-          2) /v1/advanced/top10              (alias of 1)
-          3) /v1/analysis/top10              (legacy fallback)
+        v6.9.0: tries the canonical endpoint chain in order, PREFERRING the
+        advanced_analysis /sheet-rows route (full populated page, no 20s advisor
+        bridge cap) and falling back to the advisor endpoints. Two fixes vs
+        v6.4.0:
+          (1) PER-ENDPOINT body — a /sheet-rows endpoint expects {"page": <page>};
+              the advisor endpoints expect the criteria overrides.
+          (2) EMPTY-200 FALL-THROUGH — a 200 carrying ZERO rows (e.g. the advisor
+              bridge timing out to status="partial") no longer counts as success;
+              it falls through to the next endpoint. Any error likewise falls
+              through (the chain is heterogeneous, so a broken first endpoint
+              must still reach the working fallback).
+        Chain / page / timeout overridable via TRACK_TOP10_ENDPOINTS /
+        TRACK_TOP10_PAGE / TRACK_TOP10_TIMEOUT_SEC.
         """
-        body = dict(criteria_overrides or {})
+        criteria_body = dict(criteria_overrides or {})
+        page = _top10_page()
         last_err: Optional[str] = None
-        for endpoint in _TOP10_ENDPOINTS:
-            data, err, code = await self.post_json(endpoint, body, timeout_sec=45.0)
+        for endpoint in _top10_endpoints():
+            # (1) choose the body matching this endpoint's contract.
+            body: Dict[str, Any] = {"page": page} if endpoint.endswith("/sheet-rows") else criteria_body
+            data, err, code = await self.post_json(endpoint, body, timeout_sec=_TOP10_FETCH_TIMEOUT_SEC)
             if isinstance(data, dict) and not err:
                 rows = _extract_rows_from_envelope(data)
-                meta = dict(data.get("meta") or {})
-                meta["ok"] = True
-                meta["endpoint"] = endpoint
-                meta["count"] = len(rows)
-                return rows, meta
+                if rows:
+                    meta = dict(data.get("meta") or {})
+                    meta["ok"] = True
+                    meta["endpoint"] = endpoint
+                    meta["count"] = len(rows)
+                    return rows, meta
+                # (2) 200 but no rows — record why, then try the next endpoint.
+                dmeta = data.get("meta") or {}
+                last_err = (
+                    f"{endpoint}: 200/{data.get('status')} but 0 rows "
+                    f"(outcome={dmeta.get('bridge_call_outcome')}, "
+                    f"warnings={dmeta.get('warnings')})"
+                )
+                continue
             if err:
+                # v6.9.0: fall through on ANY error (incl. non-404) so the
+                # working fallback is still reached. (v6.4.0 returned here.)
                 last_err = f"{endpoint}: {err}"
-                # Only keep trying on 404 (not-found) — other errors (auth,
-                # 500) likely mean the endpoint exists but errored.
-                if code and code not in (0, 404):
-                    return [], {"ok": False, "error": last_err, "endpoint": endpoint}
+                continue
         return [], {"ok": False, "error": last_err or "no_data", "endpoint": None}
 
     async def fetch_prices(self, symbols: List[str]) -> Dict[str, float]:
@@ -1723,7 +1811,7 @@ class PerformanceStore:
         if header_missing or header_mismatch:
             end_col = len(self.HEADERS)
             rng = _a1_range(1, self.START_ROW, end_col, self.START_ROW)
-            self.ws.update(rng, [self.HEADERS])
+            self.ws.update(values=[self.HEADERS], range_name=rng)
 
         # Seed the zero summary block + freeze ONLY on a brand-new sheet. On a
         # header WIDENING of an existing populated sheet we must NOT touch the
@@ -1741,7 +1829,7 @@ class PerformanceStore:
                 ["Sharpe Ratio", "0", "", "", ""],
             ]
             try:
-                self.ws.update("A1:E7", summary)
+                self.ws.update(values=summary, range_name="A1:E7")
                 self.ws.freeze(rows=self.START_ROW)
             except Exception:
                 pass
@@ -1828,7 +1916,7 @@ class PerformanceStore:
                 write_rng = _a1_range(
                     1, self.DATA_ROW0, end_col, self.DATA_ROW0 + len(data) - 1
                 )
-                self.ws.update(write_rng, data)  # type: ignore
+                self.ws.update(values=data, range_name=write_rng)  # type: ignore
 
         try:
             self.backoff.execute_sync(_save)
@@ -1881,7 +1969,7 @@ class PerformanceStore:
             ["Sortino Ratio", f"{summary.sortino_ratio:.2f}", "", "", ""],
         ]
         try:
-            self.backoff.execute_sync(lambda: self.ws.update("A1:E13", block))  # type: ignore
+            self.backoff.execute_sync(lambda: self.ws.update(values=block, range_name="A1:E13"))  # type: ignore
             return True
         except Exception:
             return False
@@ -1994,7 +2082,7 @@ class SignalHistoryStore:
         if existing_norm != list(self.HEADERS):
             end_col = len(self.HEADERS)
             rng = _a1_range(1, self.START_ROW, end_col, self.START_ROW)
-            self.ws.update(rng, [self.HEADERS])
+            self.ws.update(values=[self.HEADERS], range_name=rng)
             try:
                 self.ws.freeze(rows=self.START_ROW)
             except Exception:
