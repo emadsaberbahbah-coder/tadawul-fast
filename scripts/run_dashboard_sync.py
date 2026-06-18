@@ -3,9 +3,35 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.6.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.7.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.7.0 fix — page-driven limit truncation (single-row pages)
+- WHY: the page-driven pages (Market_Leaders, Global_Markets, Commodities_FX,
+  Mutual_Funds) have NO symbol source — their symbol list resolves empty every
+  run. In _run_one_task the limit was computed as
+  `safe_limit = 1 if not symbols else min(5000, max(1, len(symbols)))`, on the
+  assumption that empty symbols meant a "schema-only" request (headers only).
+  But these pages are served by the enriched endpoint via the `page` field,
+  which returns the page's OWN rows and honors `limit` as a row cap — so
+  limit:1 silently truncated each page to a SINGLE written row. Confirmed live:
+  the same endpoint + body returned 8 Market_Leaders rows at limit:800 but 1 row
+  at limit:1; the request/parse/write path was otherwise byte-clean (the
+  extractor and matrix rectifier preserve every row). A request-shape bug, not a
+  data, parse, or backend bug.
+- FIX: split the limit policy. Symbols present -> unchanged (cap at the symbol
+  count, ceiling 5000). Symbols empty -> send the task's configured cap
+  (max_symbols, e.g. 800/400; a high 5000 ceiling when max_symbols=0 for the
+  analysis meta pages) so the full page returns. Still never sends literal 0.
+- SCOPE / SAFETY:
+    * Only the empty-symbol limit changes; the symbol path, every endpoint,
+      payload key, the My_Portfolio + decision guards, matrix rectification, the
+      clear-before-write default, credential loading, and exit codes are all
+      byte-for-byte unchanged.
+    * Gated by TFB_SYNC_PAGE_LIMIT_FIX (default ON; set 0/false/off/no to restore
+      the v6.6.0 limit:1 EXACTLY).
+- UNCHANGED: everything in v6.6.0 below.
 
 v6.6.0 fix — decision-owned (cockpit) page guard (Top_10 clobber prevention)
 - WHY: Top_10_Investments is a DECISION-OWNED page — the user records BUY /
@@ -137,7 +163,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.6.0"
+SCRIPT_VERSION = "6.7.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -828,6 +854,15 @@ def _decision_guard_should_skip(sheet_name: str) -> bool:
     return _guard_norm(sheet_name) in _decision_guard_pages()
 
 
+def _page_limit_fix_enabled() -> bool:
+    """Page-driven limit fix (v6.7.0) master switch. Default ON; set
+    TFB_SYNC_PAGE_LIMIT_FIX=0/false/off/no to restore the v6.6.0 behavior
+    (an empty symbol list sends limit:1, which silently truncates every
+    page-driven page — Market_Leaders, Global_Markets, Commodities_FX,
+    Mutual_Funds — to a single written row)."""
+    return (os.getenv("TFB_SYNC_PAGE_LIMIT_FIX") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
 def _guard_find_col(header_row: List[Any], aliases: frozenset) -> int:
     """Index of the first header whose normalized name is in aliases, else -1."""
     for i, h in enumerate(header_row or []):
@@ -1188,10 +1223,30 @@ async def _run_one_task(
             return res
 
         if not symbols:
-            res.warnings.append("No symbols found; requesting schema-only payload (headers + empty rows).")
+            res.warnings.append(
+                "No symbols found; sending a page-driven request (the endpoint "
+                "returns the page's own rows, capped by `limit`)."
+            )
 
-        # Some handlers clamp limit >= 1, so never send 0
-        safe_limit = 1 if not symbols else min(5000, max(1, len(symbols)))
+        # Limit policy.
+        #   symbols present -> cap at the symbol count (ceiling 5000).
+        #   symbols EMPTY    -> PAGE-DRIVEN request. The enriched endpoint serves
+        #     the page's own content (via the `page` field) and honors `limit`
+        #     as a ROW CAP on it. v6.6.0 sent limit:1 here, on the (wrong)
+        #     assumption that empty symbols meant "schema-only" — but the
+        #     page-driven pages (Market_Leaders, Global_Markets, Commodities_FX,
+        #     Mutual_Funds) DO have rows, so limit:1 silently truncated each to a
+        #     SINGLE written row (confirmed live: Market_Leaders returned 8 rows
+        #     at limit:800 vs 1 row at limit:1). Send the task's configured cap
+        #     instead (high ceiling when max_symbols=0), so the full page
+        #     returns. Never sends literal 0.
+        #     Reversible: TFB_SYNC_PAGE_LIMIT_FIX=0 restores the v6.6.0 limit:1.
+        if symbols:
+            safe_limit = min(5000, max(1, len(symbols)))
+        elif _page_limit_fix_enabled():
+            safe_limit = task.max_symbols if (task.max_symbols and task.max_symbols > 0) else 5000
+        else:
+            safe_limit = 1  # v6.6.0 behavior (kill-switch)
 
         payload: Dict[str, Any] = {
             # identifiers (compat)
