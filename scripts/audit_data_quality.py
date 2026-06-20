@@ -2,9 +2,22 @@
 """
 scripts/audit_data_quality.py
 ================================================================================
-TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.7.0)
+TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.8.0)
 ================================================================================
 Aligned • Production-safe • Engine-compatible • Async-safe exports • Deterministic
+
+What's new in v4.8.0  —  ENGINE v5.93.0 GHOST-TICKER DISCLOSURE ALIGNMENT
+- 🔑 GHOST_TICKER: data_engine_v2 v5.93.0 emits a new "name_unresolved"
+      warning on a PRICED row whose display name never resolved (blank, or
+      still equal to its own symbol — the ghost signature, e.g. 5023.SR
+      rendered with name == "5023.SR"). v4.8.0 wires it into the engine-
+      warning surfacing path: "name_unresolved" → GHOST_TICKER (MEDIUM), so a
+      priced-but-unidentified instrument appears as a named audit issue and
+      rolls into the summary issue_counts instead of hiding inside the
+      engine's broad low_data_trust demotion. This is a DISCLOSURE surface —
+      the engine's trust system already withholds the row from Rank (Overall);
+      the audit issue makes the condition explicit and reviewable. Remediation
+      points at ticker validity / the symbol identity table, P2.
 
 What's improved vs v4.6.0  —  ENGINE v5.72.0 + ENRICHED_QUOTE v4.6.0 ALIGNMENT
 - 🔑 ALIGN: data_engine_v2 v5.72.0 (May 2026 audit) + enriched_quote v4.6.0
@@ -175,7 +188,7 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-SERVICE_VERSION = "4.7.0"
+SERVICE_VERSION = "4.8.0"
 SCRIPT_VERSION = SERVICE_VERSION  # v4.5.0: alias for cross-script consistency
 
 logger = logging.getLogger("TFB.Audit")
@@ -284,6 +297,10 @@ _ENGINE_WARNING_TO_ISSUE: Dict[str, str] = {
     "market_cap_currency_suspect":          "MARKET_CAP_CURRENCY_SUSPECT",
     "revenue_currency_suspect":             "REVENUE_CURRENCY_SUSPECT",
     "quote_current_price_missing":          "QUOTE_PRICE_MISSING",
+    # v4.8.0: engine v5.93.0 ghost-ticker disclosure tag -- a PRICED row whose
+    # display name never resolved (blank or == symbol, e.g. 5023.SR). Surfaces
+    # as a GHOST_TICKER issue in the audit report + summary issue_counts.
+    "name_unresolved":                      "GHOST_TICKER",
 }
 
 
@@ -1199,6 +1216,16 @@ def _remediation_for_issues(issues: List[str]) -> List[RemediationAction]:
                     automated=False,
                 )
             )
+        elif i == "GHOST_TICKER":
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Priced instrument with no resolved display name (name blank or == symbol, e.g. 5023.SR). Verify the ticker is valid and actively traded on its exchange; if it is a real instrument, the provider lacks a name mapping — add it to the symbol identity table. The engine's trust system already withholds this row from Rank (Overall), so this is a disclosure flag, not a live decision leak. If the symbol itself is wrong, correct it at the source (symbols_reader / the page's symbol list).",
+                    priority=AlertPriority.P2,
+                    estimated_time_minutes=15,
+                    automated=False,
+                )
+            )
         elif i == "PROVIDER_VALUE_SANITIZED":
             actions.append(
                 RemediationAction(
@@ -1333,6 +1360,8 @@ _SEVERITY_MEDIUM_TAGS: Set[str] = {
     "MARKET_CAP_CURRENCY_SUSPECT",
     "REVENUE_CURRENCY_SUSPECT",
     "QUOTE_PRICE_MISSING",
+    # v4.8.0 — priced but no resolved identity (engine name_unresolved)
+    "GHOST_TICKER",
 }
 _SEVERITY_LOW_TAGS: Set[str] = {
     "PROVIDER_PERCENT_RECOMPUTED",
