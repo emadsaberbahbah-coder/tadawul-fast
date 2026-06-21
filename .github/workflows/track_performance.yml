@@ -1,0 +1,231 @@
+name: 📈 TFB Performance Clock (record + audit + calibrate)
+
+# =============================================================================
+# WHY THIS EXISTS
+# -----------------------------------------------------------------------------
+# scripts/track_performance.py is the project's performance / action-trend /
+# reliability-calibration engine (v6.9.0). It only does useful work when it is
+# RUN on a schedule: --record captures each decision symbol's daily pick +
+# verdict snapshot (Performance_Log + Signal_History), --audit matures active
+# picks against realized prices, and --analyze/--calibrate read those matured
+# records back to measure stated-vs-realized reliability.
+#
+# The existing daily_sync workflow runs ONLY scripts/run_dashboard_sync.py — it
+# never calls track_performance. So the clock was never started: Performance_Log
+# and Signal_History stay empty, every action-trend reads "NEW", and calibration
+# reads "INSUFFICIENT EVIDENCE — start the clock." This workflow starts it.
+#
+# CADENCE: ONCE DAILY (14:00 UTC = 17:00 Riyadh, after the Tadawul close). The
+# tracker is idempotent per day — PerformanceRecord.key is symbol|horizon|YYYYMMDD
+# and SignalSnapshot.key is symbol|YYYYMMDD, so a same-day re-run writes nothing
+# new. It is therefore safe to re-run manually, and a daily (not 15-minute)
+# cadence is deliberate: each calendar day contributes exactly one snapshot, and
+# the ~50-90s cold Top_10 build is not worth running 96×/day.
+#
+# This workflow does NOT touch the 15-minute dashboard sync and changes no
+# application code. It is fully reversible: disable or delete this file and the
+# clock simply stops advancing (existing records are untouched).
+# =============================================================================
+
+on:
+  # Production scheduler — once daily after the Riyadh close.
+  schedule:
+    - cron: "0 14 * * *"
+
+  # Manual trigger — use this to START THE CLOCK immediately and to verify the
+  # wiring without waiting for 14:00 UTC.
+  workflow_dispatch:
+    inputs:
+      backend_url:
+        description: "🌐 Backend URL override (optional)"
+        required: false
+        type: string
+      sheet_id:
+        description: "📊 Spreadsheet ID override (optional)"
+        required: false
+        type: string
+      run_audit:
+        description: "🔁 Also --audit (mature active picks)"
+        required: false
+        default: true
+        type: boolean
+      enable_debug:
+        description: "🐛 LOG_LEVEL=DEBUG"
+        required: false
+        default: false
+        type: boolean
+
+# Never overlap two clock runs (a cold Top_10 build can take ~90s).
+concurrency:
+  group: tfb-performance-clock
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  performance-clock:
+    name: 📈 Record · Audit · Calibrate
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 25
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+            requirements.ml.txt
+
+      - name: 📦 Install Dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f "requirements.render.txt" ]; then
+            python -m pip install -r requirements.render.txt
+          elif [ -f "requirements.txt" ]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "::error::No requirements file found (requirements.render.txt or requirements.txt)."
+            exit 1
+          fi
+
+      - name: 🔎 Resolve configuration
+        id: cfg
+        env:
+          INPUT_URL: ${{ github.event.inputs.backend_url }}
+          INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
+          VAR_URL: ${{ vars.BACKEND_BASE_URL }}
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          set -euo pipefail
+          get_val() { for v in "$@"; do if [[ -n "${v:-}" && "$v" != "null" ]]; then echo "$v"; return 0; fi; done; return 0; }
+
+          URL="$(get_val "${INPUT_URL:-}" "${VAR_URL:-}" "https://tadawul-fast-bridge.onrender.com")"
+          URL="${URL%/}"
+          if [[ ! "$URL" =~ ^https?:// ]]; then echo "::error::Invalid backend URL: $URL"; exit 1; fi
+          echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
+
+          SHEET="$(get_val "${INPUT_SHEET:-}" "${VAR_SHEET:-}")"
+          if [[ -z "${SHEET:-}" ]]; then
+            echo "::error::Spreadsheet ID empty. Set vars.DEFAULT_SPREADSHEET_ID or pass the sheet_id input."
+            exit 1
+          fi
+          echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
+          echo "✅ Backend: $URL"
+          echo "✅ Sheet:   $SHEET"
+
+      - name: 💓 Backend readiness (best-effort)
+        run: |
+          set -euo pipefail
+          for ep in /readyz /health /livez; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$TARGET_URL$ep" || echo 000)"
+            if [[ "$code" =~ ^2 ]]; then echo "✅ Healthy via $ep ($code)"; exit 0; fi
+          done
+          echo "::warning::Backend health probe did not return 2xx — a cold Render dyno may still wake on the first call."
+
+      - name: 📈 Run performance clock
+        id: run_clock
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          # The tracker reads these directly (BackendClient + best-effort SA auth):
+          BACKEND_BASE_URL: ${{ env.TARGET_URL }}
+          DEFAULT_SPREADSHEET_ID: ${{ env.TARGET_SHEET_ID }}
+          TRACK_SHEET_ID: ${{ env.TARGET_SHEET_ID }}
+          # GOOGLE_SHEETS_CREDENTIALS accepts JSON *or* base64(JSON); prefer the
+          # plain secret, fall back to the _B64 variant if that is the one set.
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "scripts/track_performance.py" ]; then
+            echo "::error::Missing scripts/track_performance.py"
+            exit 1
+          fi
+          if [[ -z "${GOOGLE_SHEETS_CREDENTIALS:-}" ]]; then
+            echo "::error::No Google credentials. Set secret GOOGLE_SHEETS_CREDENTIALS (JSON) or GOOGLE_SHEETS_CREDENTIALS_B64."
+            exit 1
+          fi
+
+          if [[ "${{ github.event.inputs.enable_debug }}" == "true" ]]; then
+            export LOG_LEVEL=DEBUG
+          fi
+
+          # --record : capture today's picks + per-symbol verdict snapshots
+          # --audit  : mature active picks against realized prices (default ON;
+          #            without it picks never resolve to win/loss, so calibration
+          #            never gets decided outcomes)
+          # --analyze: action-trend block + reliability calibration (calibration
+          #            also runs here unless TRACK_CALIBRATION=0)
+          # --export : write <base>_*.json (perf / signal_trends / calibration)
+          AUDIT_FLAG="--audit"
+          if [[ "${{ github.event.inputs.run_audit }}" == "false" ]]; then AUDIT_FLAG=""; fi
+
+          CMD=(python scripts/track_performance.py
+               --sheet-id "$TARGET_SHEET_ID"
+               --record $AUDIT_FLAG --analyze --export)
+
+          echo "📋 ${CMD[*]}"
+          TS="$(date +%Y%m%d_%H%M%S)"
+          LOG="perf_clock_${TS}.log"
+          set -o pipefail
+          "${CMD[@]}" 2>&1 | tee "$LOG"
+
+          # Surface the honest "start the clock" / "insufficient evidence" lines
+          # in the job log so a non-technical owner can see the clock state.
+          if grep -qiE "INSUFFICIENT EVIDENCE|start the clock" "$LOG"; then
+            echo "::notice::Calibration says INSUFFICIENT EVIDENCE — expected until enough matured records accumulate (first 1M cohort ~30 days after the first --record)."
+          fi
+
+      - name: 📤 Upload reports + log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfb-performance-clock-${{ github.run_id }}
+          path: |
+            perf_clock_*.log
+            *_performance*.json
+            *_signal_trends.json
+            *_calibration.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: 📝 Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          RIYADH="$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
+          ICON="$([[ "${{ job.status }}" == "success" ]] && echo '✅ SUCCESS' || echo '❌ FAILED')"
+          {
+            echo "# 📈 TFB Performance Clock"
+            echo ""
+            echo "| Field | Value |"
+            echo "| :--- | :--- |"
+            echo "| Status | $ICON |"
+            echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo "| Time (Riyadh) | \`$RIYADH\` |"
+            echo "| Backend | \`${TARGET_URL:-?}\` |"
+            echo "| Sheet | \`${TARGET_SHEET_ID:-?}\` |"
+            echo ""
+            echo "Records + snapshots are idempotent per day; re-running is safe."
+          } >> "$GITHUB_STEP_SUMMARY"
