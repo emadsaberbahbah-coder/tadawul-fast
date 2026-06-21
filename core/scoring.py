@@ -174,6 +174,20 @@ v5.7.4 — recommendation recalibration (REDUCE-collapse fix); contract-stable:
   remain calibration parameters; label CORRECTNESS is still pending a
   ground-truth backtest. Lever A in particular is a portfolio-wide behavior
   change — validate the before/after on the full sample before enabling it.
+
+  __version__ -> "5.8.0" (Strategy #1, Phase 3 — STRUCTURAL MOMENTUM, the only
+  VERDICT-MOVING candle phase; env TFB_CANDLE_STRUCTURE_MOMENTUM default OFF ->
+  compute_momentum_score byte-identical to v5.7.4). compute_momentum_score now
+  ends by calling _apply_structural_momentum(row, base): for rows the engine
+  tagged _decision_symbol (Top_10 / holdings / Market_Leaders) and that carry a
+  candle_structure bias, the structural read is mapped to 0-100 and BLENDED with
+  the RSI/price momentum (weight TFB_CANDLE_STRUCTURE_MOMENTUM_WEIGHT, default
+  0.6; 1.0 == full replace) — the Strategy's "replace the momentum_score/RSI
+  shortcut for decision symbols." It then flows through the existing weighted
+  overall_score -> recommendation (single authoritative path, no new column,
+  pure + fail-open). OFF / non-decision row / absent candle_structure -> exact
+  v5.7.4 momentum. Reversible: unset the env var. Pairs with engine v5.97.0,
+  which stamps _decision_symbol. Label CORRECTNESS pending the same backtest.
 ================================================================================
 """
 
@@ -195,7 +209,7 @@ logger.addHandler(logging.NullHandler())
 # Version / Canonical contract
 # =============================================================================
 
-__version__ = "5.7.4"
+__version__ = "5.8.0"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -1653,6 +1667,76 @@ def compute_growth_score(row: Mapping[str, Any]) -> Optional[float]:
     return _round(_clamp(((g + 0.30) / 0.60) * 100.0, 0.0, 100.0), 2)
 
 
+# ---------------------------------------------------------------------------
+# v5.8.0 (Strategy #1, Phase 3): structural candlestick read -> momentum.
+# VERDICT-MOVING and DEFAULT-OFF. When TFB_CANDLE_STRUCTURE_MOMENTUM is unset
+# (or a row is not a decision symbol / carries no candle_structure), momentum is
+# byte-identical to v5.7.4. When on, the multi-day structural bias the engine
+# computes (candle_structure) BLENDS into the momentum component for decision
+# symbols only -- the Strategy's "replace the momentum_score/RSI shortcut" --
+# and flows through the existing weighted overall_score -> recommendation. The
+# structural read is a multi-day TREND signal, so it belongs in momentum (not
+# the intraday technical score).
+# ---------------------------------------------------------------------------
+_STRUCT_MOMENTUM_MAP: Dict[str, float] = {
+    "STRONG_BULLISH": 88.0,
+    "BULLISH": 70.0,
+    "WEAK_BULLISH": 56.0,   # uptrend NOT confirmed -> only mildly positive
+    "NEUTRAL": 50.0,
+    "WEAK_BEARISH": 44.0,
+    "BEARISH": 30.0,
+    "STRONG_BEARISH": 12.0,
+}
+
+
+def _candle_structure_momentum_enabled() -> bool:
+    """v5.8.0 (Phase 3): master switch for the structural momentum blend.
+    Default OFF -> compute_momentum_score is byte-identical to v5.7.4."""
+    return _env_bool("TFB_CANDLE_STRUCTURE_MOMENTUM", False)
+
+
+def _candle_structure_momentum_weight() -> float:
+    """v5.8.0 (Phase 3): blend weight of structure vs. the RSI/price momentum
+    (0..1; default 0.6 -> structure-led but RSI/price still contributes).
+    TFB_CANDLE_STRUCTURE_MOMENTUM_WEIGHT=1.0 makes it a full replace."""
+    return _clamp(_env_float("TFB_CANDLE_STRUCTURE_MOMENTUM_WEIGHT", 0.6), 0.0, 1.0)
+
+
+def _candle_structure_to_momentum(bias: Any) -> Optional[float]:
+    """Map a fused candle_structure bias to a 0-100 momentum value. Returns None
+    for INSUFFICIENT / blank / unknown -> no override (falls back to base)."""
+    if bias is None:
+        return None
+    return _STRUCT_MOMENTUM_MAP.get(str(bias).strip().upper())
+
+
+def _is_decision_symbol_row(row: Mapping[str, Any]) -> bool:
+    """True only when the engine tagged this row as a decision symbol
+    (Top_10 / holdings / Market_Leaders). Robust to bool / str forms."""
+    v = _get(row, "_decision_symbol", "decision_symbol")
+    if v is True:
+        return True
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _apply_structural_momentum(row: Mapping[str, Any], base: Optional[float]) -> Optional[float]:
+    """v5.8.0 (Phase 3): blend the structural read into momentum for decision
+    symbols. Fail-open and gated: OFF / non-decision / no candle_structure ->
+    returns `base` unchanged (so the scorer stays byte-identical to v5.7.4)."""
+    if not _candle_structure_momentum_enabled():
+        return base
+    if not _is_decision_symbol_row(row):
+        return base
+    struct = _candle_structure_to_momentum(_get(row, "candle_structure"))
+    if struct is None:
+        return base
+    if base is None:
+        return _round(_clamp(struct, 0.0, 100.0), 2)
+    w = _candle_structure_momentum_weight()
+    blended = w * struct + (1.0 - w) * base
+    return _round(_clamp(blended, 0.0, 100.0), 2)
+
+
 def compute_momentum_score(row: Mapping[str, Any]) -> Optional[float]:
     pct = _as_roi_fraction(_get(row, "percent_change", "change_pct", "change_percent"))
     rsi = _get_float(row, "rsi_14", "rsi", "rsi14")
@@ -1672,10 +1756,15 @@ def compute_momentum_score(row: Mapping[str, Any]) -> Optional[float]:
     if vol_r is not None:
         parts.append((0.10, _clamp((vol_r - 0.5) / 1.5, 0.0, 1.0)))
     if not parts:
-        return None
-    wsum = sum(w for w, _ in parts)
-    score_01 = sum(w * v for w, v in parts) / max(1e-9, wsum)
-    return _round(100.0 * _clamp(score_01, 0.0, 1.0), 2)
+        base: Optional[float] = None
+    else:
+        wsum = sum(w for w, _ in parts)
+        score_01 = sum(w * v for w, v in parts) / max(1e-9, wsum)
+        base = _round(100.0 * _clamp(score_01, 0.0, 1.0), 2)
+    # v5.8.0 (Phase 3): blend the structural candle read into momentum for
+    # DECISION symbols only (engine stamps _decision_symbol). Gated OFF by
+    # default -> returns `base` unchanged (byte-identical RSI/price momentum).
+    return _apply_structural_momentum(row, base)
 
 
 def compute_risk_score(row: Mapping[str, Any]) -> Optional[float]:
