@@ -1,8 +1,44 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.0.3   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
-                  Engineering Audit Phase 0 — cost-basis + data-trust gates)
+Version: 1.0.4   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
+                  Engineering Audit Phase 1 — identity (ghost-ticker) gate,
+                  env-gated DEFAULT-OFF)
+
+v1.0.4 [PHASE1-IDENTITY-GATE]: the audit's ghost-ticker class (live case
+5023.SR — Name merely repeats the Symbol, no fundamentals, TP1/TP2 = 0,
+reliability 24) slipped past every existing step-1 gate: presence passes (price/
+fx/qty all present), the cost-basis gate passes (its basis is CLEAN at ~1.0x),
+and the trust gate only FLAGS thin coverage by default. With no valuation
+anchor it then falls to a HOLD ("No valuation reference") — or, on a sell-tier
+reco, is capped EXIT->HOLD by the low-confidence rule — and is rendered as a
+confident-looking HOLD on a position whose very identity is unverifiable. The
+audit's holding done-condition ("no holding produces a confident recommendation
+unless cost basis, symbol IDENTITY, quote freshness, and core data pass
+validation") was still missing the identity leg. FIX (DEFAULT OFF — opt-in,
+unlike the sibling cost-basis/trust gates which default ON, so enabling it is a
+deliberate, separately-verifiable step; kill-switch is simply leaving
+TFB_PF_IDENTITY_GATE unset/0): a new step "1d" inside the never-overridden
+step-1 BLOCK gate withholds the action when a held position's identity is
+unverifiable — a conservative AND of three INDEPENDENT signals so a thinly-
+covered but real holding is never blocked: (1) Name blank or Name == Symbol
+(normalized; a blank name folds to the symbol upstream), AND (2) no valuation
+anchor (valuation_basis is None — neither target price nor intrinsic value, so
+ROI and TP levels are absent), AND (3) reliability missing or below
+TFB_PF_IDENTITY_MIN_RELIABILITY (default 50). It emits "BLOCKED — review
+identity (...); ghost-ticker class, action withheld pending data review", so the
+failing facts are visible on the row and the BLOCK lands BEFORE the low-
+confidence cap could mint a HOLD. Unlike the cost-basis gate, the P&L is NOT
+nulled — the basis may be perfectly clean (5023.SR's is); only the action is
+withheld, since the defect is identity, not economics. A distinct
+"identity_blocked" alert names the fix; identity blocks are excluded from the
+presence "blocked_positions" count so each row carries exactly one accurate
+remediation. The check (_identity_unverifiable) is self-contained and fail-open
+(if opportunity_builder's _norm_token is unavailable it never blocks). OFF
+(TFB_PF_IDENTITY_GATE unset/0) restores byte-identical v1.0.3 behavior — only
+the version stamp and the new controls-snapshot keys change. No change to the
+cost-basis gate, the data-trust gate, the action truth table thresholds,
+sizing, the L7 funding identity, P&L math, or the engine-ROI display toggle.
 
 v1.0.3 [PHASE0-DATA-TRUST-GATE]: opportunity_builder v1.0.6 added a Data-Trust
 gate that EXCLUDES sparse/stale Top_10 candidates, but My_Portfolio applied no
@@ -210,7 +246,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 
-PORTFOLIO_ACTIONS_VERSION = "1.0.3"
+PORTFOLIO_ACTIONS_VERSION = "1.0.4"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -248,6 +284,11 @@ _CB_BLOCK_MARKER = "review cost basis"
 _STALE_BLOCK_MARKER = "stale quote"
 _THIN_BLOCK_MARKER = "thin data"
 
+# v1.0.4: identity-gate BLOCK marker (the 5023.SR ghost-ticker class). One
+# predicate (_is_identity_block) keys off it so the alert split and the
+# blocked_positions exclusion stay in lockstep with the reason string.
+_IDENTITY_BLOCK_MARKER = "review identity"
+
 REBALANCE_ADVISORY = "Advisory Only"
 REBALANCE_TARGETS = "Rebalance to Targets"
 REBALANCE_NEW_CASH = "New Cash Only"
@@ -282,18 +323,26 @@ DEFAULT_CONTROLS = {
     "max_data_age_hours": 168.0,
     "min_trust_fields": 2,
     "block_thin_coverage": False,
+    # v1.0.4 identity gate (Phase 1; the 5023.SR ghost-ticker class). DEFAULT
+    # OFF (opt-in) — unlike the sibling cost-basis/trust gates which default ON
+    # — so enabling it is a deliberate, separately-verifiable step. When ON, a
+    # held position with an unverifiable identity (name mirrors the symbol AND
+    # no valuation anchor AND reliability below identity_min_reliability) is
+    # BLOCKed at step 1 instead of being capped to a confident-looking HOLD.
+    "identity_gate_enabled": False,
+    "identity_min_reliability": 50.0,
 }
 
 _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
                    "max_sector_pct", "min_reliability_add", "min_dq_add",
                    "add_roi_pct", "trim_roi_pct", "exit_roi_pct",
                    "valuation_trim_frac", "cost_max_ratio", "cost_min_ratio",
-                   "max_data_age_hours")
+                   "max_data_age_hours", "identity_min_reliability")
 _CONTROLS_INT = ("review_days", "lot_size", "max_holdings", "period_months",
                  "min_trust_fields")
 _CONTROLS_BOOL = ("engine_roi_display_enabled", "cost_basis_gate_enabled",
                   "block_missing_cost_basis", "trust_gate_enabled",
-                  "block_thin_coverage")
+                  "block_thin_coverage", "identity_gate_enabled")
 
 
 def _env_str(name, default):
@@ -350,6 +399,15 @@ def _env_block_thin_coverage():
         in ("1", "true", "yes", "on")
 
 
+def _env_identity_gate():
+    """v1.0.4: master switch for the identity (ghost-ticker) BLOCK. DEFAULT OFF
+    (opt-in) — set TFB_PF_IDENTITY_GATE=1 to BLOCK a held position whose
+    identity is unverifiable (name mirrors the symbol AND no valuation anchor
+    AND reliability below the floor). OFF restores v1.0.3 behavior exactly."""
+    return str(_env_str("TFB_PF_IDENTITY_GATE", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
 def _env_engine_roi_display():
     """v1.0.1: engine-forecast display toggle. Default OFF; set
     TFB_PF_ENGINE_ROI_DISPLAY=1 to surface the engine 12M forecast on every
@@ -403,6 +461,10 @@ def _env_overrides():
         "min_trust_fields": _env_int(
             "TFB_PF_MIN_TRUST_FIELDS", DEFAULT_CONTROLS["min_trust_fields"]),
         "block_thin_coverage": _env_block_thin_coverage(),
+        "identity_gate_enabled": _env_identity_gate(),
+        "identity_min_reliability": _env_float(
+            "TFB_PF_IDENTITY_MIN_RELIABILITY",
+            DEFAULT_CONTROLS["identity_min_reliability"]),
     }
 
 
@@ -446,6 +508,10 @@ def make_controls(overrides=None):
         ctl["max_data_age_hours"] = DEFAULT_CONTROLS["max_data_age_hours"]
     if ctl["min_trust_fields"] < 0:
         ctl["min_trust_fields"] = 0
+    # v1.0.4 identity floor sanity: keep the reliability floor in [0, 100].
+    if not (0.0 <= ctl["identity_min_reliability"] <= 100.0):
+        ctl["identity_min_reliability"] = (
+            DEFAULT_CONTROLS["identity_min_reliability"])
     mode = str(ctl.get("rebalance_mode") or REBALANCE_ADVISORY)
     low = mode.strip().lower()
     if "new cash" in low:
@@ -602,6 +668,14 @@ def _is_trust_block(action, reason):
         _STALE_BLOCK_MARKER in r or _THIN_BLOCK_MARKER in r)
 
 
+def _is_identity_block(action, reason):
+    """v1.0.4: True iff this BLOCK was raised by the identity (ghost-ticker)
+    gate. Keeps the alert split + the blocked_positions exclusion in lockstep
+    with the reason string."""
+    return action == ACTION_BLOCK and _IDENTITY_BLOCK_MARKER in (
+        reason or "").lower()
+
+
 def _trust_assess(cand, controls):
     """v1.0.3: the shared trust detail dict for a holding, or None when the
     trust gate is disabled or the shared assessment is unavailable. REUSES
@@ -687,6 +761,56 @@ def _cost_basis_block_reason(avg_cost_raw, current_price, position_qty,
     return True, None
 
 
+def _identity_unverifiable(cand, controls):
+    """v1.0.4 Phase-1 identity gate for the ghost-ticker class (live case:
+    5023.SR — a held row whose Name merely repeats the Symbol, that carries no
+    valuation anchor at all, and that the engine itself rates low-reliability;
+    it currently slips past every presence/cost/trust gate and is rendered as a
+    confident-looking HOLD).
+
+    Returns (ok, reason): ok=False => the caller emits a BLOCK at step 1 (never
+    overridden), so the row never reaches the EXIT/TRIM/ADD/HOLD cascade and is
+    never capped to HOLD. Self-contained so audit_data_quality / future callers
+    can reuse the identical rule.
+
+    Conservative AND of three INDEPENDENT signals, so a thinly-covered but real
+    holding (a genuine name, OR a real valuation, OR decent reliability) is
+    never blocked:
+      1. identity placeholder — Name blank OR Name == Symbol (normalized).
+         (normalize_candidate already substitutes Symbol for a blank Name, so a
+         blank name surfaces here as Name == Symbol.)
+      2. no valuation anchor  — valuation_basis is None: neither a target price
+         nor an intrinsic value, so ROI and the TP levels are absent.
+      3. low engine trust     — reliability is missing OR below
+         identity_min_reliability (default 50).
+    Fail-open: if opportunity_builder (_norm_token) is unavailable the identity
+    cannot be assessed, so it returns OK (never blocks) — mirroring the module's
+    fail-soft contract.
+    """
+    if _ob is None:
+        return True, None  # cannot normalize tokens → never block (fail-open)
+    nsym = _ob._norm_token(cand.get("symbol"))
+    nname = _ob._norm_token(cand.get("name"))
+    # 1. identity placeholder (blank name folds to symbol upstream)
+    if nname and nname != nsym:
+        return True, None
+    # 2. no valuation anchor
+    if cand.get("valuation_basis") is not None:
+        return True, None
+    # 3. low engine trust
+    rel = cand.get("reliability")
+    floor = controls.get("identity_min_reliability")
+    if floor is None:
+        floor = DEFAULT_CONTROLS["identity_min_reliability"]
+    if rel is not None and rel >= floor:
+        return True, None
+    rel_txt = "n/a" if rel is None else _fmt(rel)
+    return (False,
+            "BLOCKED — review identity (name mirrors the symbol, no valuation "
+            "reference, reliability %s); ghost-ticker class, action withheld "
+            "pending data review" % rel_txt)
+
+
 def decide_action(cand, controls, weight_pct, sector_weight_pct,
                   sector_excess_share_sar):
     """Pure: one holding → (action, reason, proceeds_sar, capped_from).
@@ -746,6 +870,20 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
             return (ACTION_BLOCK,
                     "BLOCKED — thin data (%d/6 core signals); action withheld"
                     % int(det.get("signals_present") or 0), 0.0, None)
+
+    # 1d. BLOCK — identity gate (v1.0.4; Phase 1, the 5023.SR ghost-ticker
+    #     class). A held row whose Name only repeats the Symbol, that carries
+    #     no valuation anchor, and that the engine rates low-reliability has an
+    #     unverifiable identity — it must not be rendered as a confident HOLD.
+    #     When ON (DEFAULT OFF, opt-in) it BLOCKs here, still inside the
+    #     never-overridden step-1 gate, BEFORE the low-confidence cap below
+    #     could turn it into a HOLD. The cost basis itself may be clean, so
+    #     (unlike the cost-basis gate) the P&L is NOT nulled — only the action
+    #     is withheld. Conservative AND-of-three signals; fail-open.
+    if controls.get("identity_gate_enabled"):
+        id_ok, id_reason = _identity_unverifiable(cand, controls)
+        if not id_ok:
+            return (ACTION_BLOCK, id_reason, 0.0, None)
 
     roi = cand.get("roi_pct")
     reco = cand.get("recommendation")
@@ -1239,11 +1377,21 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                         if _is_stale_block(e["action"], e["action_reason"]))
     thin_flagged = sum(1 for e in entries
                        if (e["cand"].get("_trust") or {}).get("thin"))
-    _alert("blocked_positions", counts[ACTION_BLOCK] - cb_blocked - trust_blocked,
+    # v1.0.4: identity (ghost-ticker) blocks are excluded from blocked_positions
+    # so each row carries exactly one accurate remediation.
+    identity_blocked = sum(1 for e in entries
+                           if _is_identity_block(e["action"],
+                                                 e["action_reason"]))
+    _alert("blocked_positions",
+           counts[ACTION_BLOCK] - cb_blocked - trust_blocked
+           - identity_blocked,
            "Fix missing price/FX/quantity for blocked rows")
     _alert("cost_basis_blocked", cb_blocked,
            "Correct the Buy Price on flagged holdings — implausible vs the "
            "current price")
+    _alert("identity_blocked", identity_blocked,
+           "Verify the instrument identity on flagged holdings (name/symbol, "
+           "fundamentals) — action withheld as a ghost-ticker until resolved")
     _alert("stale_quote_blocked", stale_blocked,
            "Refresh the quote on stale holdings — action withheld until the "
            "price updates")
