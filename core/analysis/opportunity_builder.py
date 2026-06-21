@@ -1,8 +1,48 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.8   (TFB Final Execution Plan v5.0 — Phase P2;
-                 Engineering Audit Phase 0 — investability gate default-OFF + GATE_ORDER fix)
+Version: 1.0.9   (TFB Final Execution Plan v5.0 — Phase P2;
+                 Engineering Audit Phase 1 — unfunded-ticket reclass + optional
+                 engine-ROI ordering, both env-gated DEFAULT-OFF)
+
+v1.0.9 [UNFUNDED-WATCH + ENGINE-ROI-ORDERING — two Phase-1 corrections, each
+env-gated and DEFAULT OFF; OFF => byte-identical v1.0.8 selection, sizing,
+ranking, KPIs, near-miss, alerts, and verdict<->gate-trace contract. Every
+v1.0.8 byte carried forward verbatim].
+
+(1) UNFUNDED-WATCH (TFB_OPP_UNFUNDED_WATCH / criteria unfunded_watch_enabled,
+default OFF). The greedy §4.4 sizer funds picks top-down until deployable
+capital is exhausted; a pick reached after exhaustion is still appended to the
+selected list with suggested_sar = 0 and rendered as an INVEST ticket showing
+"no size (no deployable capital)". The live 2026-06-21 build did exactly this:
+SAN.PA and MDT were counted in "Selected 10/10" while sized at 0 SAR — the
+headline over-counted executable tickets, and a 0-SAR row advertised INVEST.
+The picks are NOT wrong (they passed every gate and ranked); they simply were
+not funded. FIX (default OFF): when ON, a 0-SAR pick is NOT an executable
+ticket — it is removed from `selected` (so selected_count and the SELECTED
+section header count only funded tickets), tagged in the audit grid with an
+"Unfunded — cash exhausted" deferral (selected = No), surfaced as a WATCH
+near-miss under a "Funding" gate with an explicit how-to-fund note, and counted
+in a new unfunded_candidates alert. The L7 funding identity is preserved
+(unfunded picks contributed 0 to Σ suggested and Σ gain, so deployable −
+Σ suggested and kpi gain == Σ ticket gains are unchanged); only the count and
+the row's classification move. This is the honest reading: an unfunded name is
+a WATCH idea, not an executed position.
+
+(2) ENGINE-ROI-ORDERING (TFB_OPP_RANK_BY_ENGINE_ROI / criteria
+rank_by_engine_roi_enabled, default OFF). The displayed ticket "ROI %" is a
+valuation TARGET capped at max_valuation_roi_pct (so it clusters near the cap,
+e.g. ~35%), while the engine's own 12M forecast (engine_roi_12m_pct, surfaced
+since v1.0.5 when TFB_OPP_ENGINE_ROI_DISPLAY=1) carries the real differentiation
+(15.8–30.4% across the live picks). The selection pool, however, was ordered by
+opportunity_score alone. FIX (default OFF): when ON, the INVEST pool is ordered
+by the normalized engine forecast (desc) as the PRIMARY key, with
+opportunity_score / ann_roi / symbol as tie-breakers, so the names the engine
+forecasts highest are funded first. A missing/unparseable forecast sorts last
+(never invents a rank). This is a DISCLOSED, reversible ordering policy — it
+changes which names are funded first, not any gate or verdict; OFF restores the
+exact v1.0.8 opportunity_score-primary order. Recommend enabling only alongside
+TFB_OPP_ENGINE_ROI_DISPLAY so the basis for the order is visible on the page.
 
 v1.0.8 [INVESTABILITY-GATE DEFAULT-OFF — live-evidence correction]: a live
 Top_10 build (2026-06-18, selector v4.19.0 + engine v5.91.0) disproved the
@@ -223,7 +263,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.8"
+OPPORTUNITY_BUILDER_VERSION = "1.0.9"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -388,6 +428,20 @@ DEFAULT_CRITERIA = {
     # v1.0.8: DEFAULT OFF (opt-in) — the selector backfills Tier-2 rows, so
     # default-ON would diverge the opportunity surface from the Top_10 page.
     "investability_gate_enabled": False,
+    # v1.0.9: DEFAULT OFF (opt-in). When ON, a sized ticket whose suggested
+    # SAR is 0 (capital exhausted before it could be funded) is NOT counted as
+    # a selected/executable ticket: it is removed from `selected`, excluded
+    # from selected_count, and surfaced as a WATCH near-miss ("Funding" gate)
+    # plus an unfunded_candidates alert. OFF => byte-identical v1.0.8 (every
+    # pick — funded or 0-SAR — remains a selected ticket and is counted).
+    "unfunded_watch_enabled": False,
+    # v1.0.9: DEFAULT OFF (opt-in). When ON, the INVEST selection pool is
+    # ordered by the engine's normalized 12M forecast (engine_roi_12m_pct,
+    # desc) as the PRIMARY key — opportunity_score / ann_roi / symbol remain
+    # the tie-breakers — so the names the engine forecasts highest are funded
+    # first. OFF => byte-identical v1.0.8 ordering (opportunity_score primary).
+    # A missing/unparseable engine forecast sorts last (never invents a rank).
+    "rank_by_engine_roi_enabled": False,
 }
 
 _CRITERIA_FLOAT_KEYS = (
@@ -406,6 +460,7 @@ _CRITERIA_BOOL_KEYS = (
     "include_portfolio_holdings", "forecast_gate_enabled",
     "valuation_sanity_gate_enabled", "engine_roi_display_enabled",
     "trust_gate_enabled", "investability_gate_enabled",
+    "unfunded_watch_enabled", "rank_by_engine_roi_enabled",
 )
 
 # ---------------------------------------------------------------------------
@@ -549,6 +604,27 @@ def _env_investability_gate():
         "1", "true", "yes", "on", "enabled", "enable")
 
 
+def _env_unfunded_watch():
+    """v1.0.9: unfunded-ticket reclassification toggle. Default OFF; set
+    TFB_OPP_UNFUNDED_WATCH=1 so a 0-SAR (capital-exhausted) pick is reclassed
+    WATCH (near-miss, "Funding" gate) instead of counting as a selected
+    executable ticket. OFF => byte-identical v1.0.8 (0-SAR picks stay selected
+    and counted)."""
+    return str(_env_str("TFB_OPP_UNFUNDED_WATCH", "0")).strip().lower() in (
+        "1", "true", "yes", "on", "enabled", "enable")
+
+
+def _env_rank_by_engine_roi():
+    """v1.0.9: selection-ordering toggle. Default OFF; set
+    TFB_OPP_RANK_BY_ENGINE_ROI=1 to order the INVEST pool by the engine's
+    normalized 12M forecast (desc) as the primary key (opportunity_score /
+    ann_roi / symbol remain tie-breakers). OFF => byte-identical v1.0.8
+    ordering (opportunity_score primary)."""
+    return str(_env_str(
+        "TFB_OPP_RANK_BY_ENGINE_ROI", "0")).strip().lower() in (
+        "1", "true", "yes", "on", "enabled", "enable")
+
+
 def _env_overrides():
     """Mechanics block of criteria, env-tunable (policy block)."""
     return {
@@ -587,6 +663,8 @@ def _env_overrides():
             "TFB_OPP_MIN_TRUST_FIELDS",
             DEFAULT_CRITERIA["min_trust_fields"]),
         "investability_gate_enabled": _env_investability_gate(),
+        "unfunded_watch_enabled": _env_unfunded_watch(),
+        "rank_by_engine_roi_enabled": _env_rank_by_engine_roi(),
     }
 
 
@@ -1764,16 +1842,38 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     # 2) selection pool: INVEST verdict, not structurally blocked, by score
     invest = [a for a in audit
               if a["verdict"] == VERDICT_INVEST and not a["structural_block"]]
-    invest.sort(key=lambda a: (-(a["opportunity_score"] or 0.0),
-                               -(a["_cand"]["ann_roi_pct"] or 0.0),
-                               a["symbol"]))
+    # v1.0.9: optional engine-ROI ordering (default OFF => the original
+    # opportunity_score-primary sort is byte-identical). When ON, the engine's
+    # normalized 12M forecast is the primary key; opportunity_score / ann_roi /
+    # symbol stay as tie-breakers. A missing/unparseable forecast sorts last.
+    if crit.get("rank_by_engine_roi_enabled"):
+        def _rank_engine_key(a):
+            _er = _engine_roi_to_pct(a["_cand"]["engine_roi_12m_pct"])
+            _er = _er if _er is not None else float("-inf")
+            return (-_er, -(a["opportunity_score"] or 0.0),
+                    -(a["_cand"]["ann_roi_pct"] or 0.0), a["symbol"])
+        invest.sort(key=_rank_engine_key)
+    else:
+        invest.sort(key=lambda a: (-(a["opportunity_score"] or 0.0),
+                                   -(a["_cand"]["ann_roi_pct"] or 0.0),
+                                   a["symbol"]))
     picks, deferrals, deployable, remaining = _select_and_size(
         [a["_cand"] for a in invest], crit, pf, sector_ctx)
 
     review_date = (datetime.now(timezone.utc) +
                    timedelta(days=crit["review_days"])).date().isoformat()
+    # v1.0.9: when unfunded_watch is ON, a 0-SAR pick (capital exhausted before
+    # it could be funded) is NOT an executable ticket — it is removed from
+    # `selected`, excluded from the count, and reclassed as a WATCH near-miss.
+    # OFF => funded_picks == picks and unfunded_picks == [] (byte-identical).
+    if crit.get("unfunded_watch_enabled"):
+        funded_picks = [p for p in picks if (p["suggested_sar"] or 0) > 0]
+        unfunded_picks = [p for p in picks if (p["suggested_sar"] or 0) <= 0]
+    else:
+        funded_picks = picks
+        unfunded_picks = []
     tickets = [_build_ticket(i + 1, p, crit, review_date)
-               for i, p in enumerate(picks)]
+               for i, p in enumerate(funded_picks)]
     selected_syms = {t["symbol"] for t in tickets}
     by_symbol = {a["symbol"]: a for a in audit}
     for sym in selected_syms:
@@ -1781,6 +1881,28 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     for sym, reason in deferrals.items():
         if sym in by_symbol:
             by_symbol[sym]["deferral"] = reason
+    # v1.0.9: tag unfunded picks in the audit grid and build their WATCH
+    # near-miss rows (empty list when the flag is OFF).
+    unfunded_syms = set()
+    unfunded_nm = []
+    for p in unfunded_picks:
+        usym = p["cand"]["symbol"]
+        unfunded_syms.add(usym)
+        if usym in by_symbol and not by_symbol[usym]["deferral"]:
+            by_symbol[usym]["deferral"] = (
+                "Unfunded \u2014 passed all gates and ranked, but deployable "
+                "capital was exhausted before funding")
+        unfunded_nm.append({
+            "symbol": usym,
+            "failed_gate": "Funding",
+            "current": "0 SAR (capital exhausted)",
+            "required": "deployable capital to fund \u2265 1 lot",
+            "verdict": VERDICT_WATCH,
+            "improve_note": (
+                "Passed every gate and was selected by rank, but cash ran out "
+                "before this name could be funded \u2014 add Cash Available "
+                "(or lower Max Selected) to fund it."),
+        })
 
     # 3) kpis (L7 funding identity: unallocated = deployable − Σ suggested)
     total_suggested = sum(t["suggested_sar"] for t in tickets)
@@ -1804,8 +1926,21 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         kpis["engine_expected_gain_12m_sar"] = (
             round(sum(_eng_gains), 0) if _eng_gains else None)
 
-    near_miss = _near_miss_rows(audit, selected_syms, deferrals, crit)
+    near_miss = unfunded_nm + _near_miss_rows(
+        audit, selected_syms | unfunded_syms, deferrals, crit)
     alerts = _build_alerts(audit, deployable, tickets, upstream_meta)
+    # v1.0.9: surface the capital-exhausted tail as an explicit alert (no-op
+    # when unfunded_watch is OFF, since unfunded_nm is empty).
+    if unfunded_nm:
+        alerts.append({
+            "type": "unfunded_candidates",
+            "count": len(unfunded_nm),
+            "required_action": (
+                "These name(s) passed every gate and ranked, but deployable "
+                "capital was exhausted before funding \u2014 increase Cash "
+                "Available (or reduce Max Selected). Shown as WATCH, not "
+                "executable tickets."),
+        })
 
     # 4) audit grid sorted by score; strip internals
     audit.sort(key=lambda a: (-(a["opportunity_score"] or 0.0), a["symbol"]))
