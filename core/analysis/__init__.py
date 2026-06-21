@@ -2,22 +2,34 @@
 # core/analysis/__init__.py
 """
 ================================================================================
-core.analysis -- Analysis Package Initializer v3.0.0
+core.analysis -- Analysis Package Initializer v3.1.0
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-This package contains the analysis and selection engines:
+This package contains the analysis, selection, and decision engines:
 
   insights_builder.py    -- Insights_Analysis page builder (executive layout)
                             Sections: Market Summary, Risk Scenarios,
                             Top Opportunities, Portfolio Health.
-                            Schema: 10 columns (Section/Category/Item/Symbol/
-                                                Metric/Value/Signal/Score/
-                                                Notes/Last Updated)
+                            Schema: 7 columns (Section / Item / Metric / Value
+                                               / Notes / Source / Sort Order)
+                            (v8.x 7-col contract; the legacy 10-col layout with
+                             Symbol / Signal / Score / Last Updated is retired.)
 
   top10_selector.py      -- Top_10_Investments selector engine
                             Criteria-driven composite scoring and ranking.
-                            Schema: 83 columns (80 canonical + 3 Top10 extras)
+                            Output width is registry-derived (schema_registry);
+                            the selector adds its Top10 ranking extras on top of
+                            the canonical market layout.
+
+  opportunity_builder.py -- Opportunity engine for the Top_10 decision cockpit
+                            (gates, sizing, verdicts; build_opportunity_payload).
+
+  portfolio_actions.py   -- Action engine for My_Portfolio
+                            (ADD/HOLD/TRIM/EXIT/BLOCK; build_portfolio_actions).
+
+  trend_signals.py       -- Cross-sectional sector-trend enrichment
+                            (enrich_rows_with_trends / compute_sector_trends).
 
 Public API (all lazy-loaded on first access):
 
@@ -29,10 +41,19 @@ Public API (all lazy-loaded on first access):
   # Top 10 Selector (core.analysis.top10_selector)
   build_top10_rows(engine, symbols=None, criteria=None, ...) -> List[Dict]
 
+  # Decision engines (v3.1.0)
+  build_opportunity_payload(rows, criteria=None, portfolio=None, ...) -> Dict
+  build_portfolio_actions(rows, controls=None, fx_rates=None, ...) -> Dict
+  enrich_rows_with_trends(rows) -> Tuple[List[Dict], Dict]
+  compute_sector_trends(rows) -> Dict[str, Dict[str, Any]]
+
   # Version constants
-  INSIGHTS_BUILDER_VERSION -> str
-  TOP10_SELECTOR_VERSION   -> str
-  __version__              -> str ("3.0.0")
+  INSIGHTS_BUILDER_VERSION    -> str
+  TOP10_SELECTOR_VERSION      -> str
+  OPPORTUNITY_BUILDER_VERSION -> str
+  PORTFOLIO_ACTIONS_VERSION   -> str
+  TREND_SIGNALS_VERSION       -> str
+  __version__                 -> str ("3.1.0")
 
   # Introspection
   get_available_engines()  -> List[str]
@@ -74,13 +95,23 @@ if TYPE_CHECKING:
         get_insights_schema,
     )
     from core.analysis.top10_selector import build_top10_rows  # noqa: F401
+    from core.analysis.opportunity_builder import (  # noqa: F401
+        build_opportunity_payload,
+    )
+    from core.analysis.portfolio_actions import (  # noqa: F401
+        build_portfolio_actions,
+    )
+    from core.analysis.trend_signals import (  # noqa: F401
+        compute_sector_trends,
+        enrich_rows_with_trends,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Package metadata
 # ---------------------------------------------------------------------------
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 __all__ = [
     # Insights Builder API
@@ -89,9 +120,18 @@ __all__ = [
     "build_criteria_rows",
     # Top 10 Selector API
     "build_top10_rows",
+    # Opportunity / Portfolio action engines (v3.1.0)
+    "build_opportunity_payload",
+    "build_portfolio_actions",
+    # Trend signals (v3.1.0)
+    "enrich_rows_with_trends",
+    "compute_sector_trends",
     # Version constants
     "INSIGHTS_BUILDER_VERSION",
     "TOP10_SELECTOR_VERSION",
+    "OPPORTUNITY_BUILDER_VERSION",
+    "PORTFOLIO_ACTIONS_VERSION",
+    "TREND_SIGNALS_VERSION",
     "__version__",
     # Introspection helpers
     "get_available_engines",
@@ -121,6 +161,23 @@ _LAZY_CALLABLES: Dict[str, Tuple[str, str]] = {
     "build_top10_rows": (
         "core.analysis.top10_selector", "build_top10_rows",
     ),
+    # v3.1.0: the decision-path engines were missing from the lazy API even
+    # though they live in this package and are used in production. Submodule
+    # imports (from core.analysis import opportunity_builder) always worked, so
+    # this is purely additive — it exposes the convenience names and makes the
+    # introspection helpers below report the real engine set.
+    "build_opportunity_payload": (
+        "core.analysis.opportunity_builder", "build_opportunity_payload",
+    ),
+    "build_portfolio_actions": (
+        "core.analysis.portfolio_actions", "build_portfolio_actions",
+    ),
+    "enrich_rows_with_trends": (
+        "core.analysis.trend_signals", "enrich_rows_with_trends",
+    ),
+    "compute_sector_trends": (
+        "core.analysis.trend_signals", "compute_sector_trends",
+    ),
 }
 
 _LAZY_VERSIONS: Dict[str, Tuple[str, str]] = {
@@ -130,11 +187,23 @@ _LAZY_VERSIONS: Dict[str, Tuple[str, str]] = {
     "TOP10_SELECTOR_VERSION": (
         "core.analysis.top10_selector", "TOP10_SELECTOR_VERSION",
     ),
+    "OPPORTUNITY_BUILDER_VERSION": (
+        "core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
+    ),
+    "PORTFOLIO_ACTIONS_VERSION": (
+        "core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
+    ),
+    "TREND_SIGNALS_VERSION": (
+        "core.analysis.trend_signals", "TREND_SIGNALS_VERSION",
+    ),
 }
 
 _ENGINE_MODULES: Dict[str, str] = {
-    "insights_builder": "core.analysis.insights_builder",
-    "top10_selector":   "core.analysis.top10_selector",
+    "insights_builder":    "core.analysis.insights_builder",
+    "top10_selector":      "core.analysis.top10_selector",
+    "opportunity_builder": "core.analysis.opportunity_builder",
+    "portfolio_actions":   "core.analysis.portfolio_actions",
+    "trend_signals":       "core.analysis.trend_signals",
 }
 
 
@@ -254,6 +323,15 @@ def get_package_metadata() -> Dict[str, Any]:
         ),
         "top10_selector_version": _resolve_version(
             *_LAZY_VERSIONS["TOP10_SELECTOR_VERSION"]
+        ),
+        "opportunity_builder_version": _resolve_version(
+            *_LAZY_VERSIONS["OPPORTUNITY_BUILDER_VERSION"]
+        ),
+        "portfolio_actions_version": _resolve_version(
+            *_LAZY_VERSIONS["PORTFOLIO_ACTIONS_VERSION"]
+        ),
+        "trend_signals_version": _resolve_version(
+            *_LAZY_VERSIONS["TREND_SIGNALS_VERSION"]
         ),
         "available_engines": get_available_engines(),
         "public_api": list(__all__),
