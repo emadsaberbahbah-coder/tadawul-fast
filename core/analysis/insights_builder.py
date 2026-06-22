@@ -180,7 +180,34 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "8.4.0"
+INSIGHTS_BUILDER_VERSION = "8.6.0"
+# v8.5.0 - STRUCTURAL SIGNALS DISCLOSURE (Strategy #1, Phase 2b; env-gated,
+# default-OFF). Surfaces the engine's structural candlestick backbone
+# (data_engine_v2 >= v5.95.0: analyze_candle_structure -> candle_structure /
+# _trend / _swings / _volume / _bodywick / _gap / _summary) as a read-only
+# "Structural Signals" section on the Insights_Analysis panel. WHY HERE: those
+# seven candle_structure_* fields are INTERNAL -- the 115-key sheet projection
+# strips them, so they never reach Top_10 / Market_Leaders / My_Portfolio. They
+# DO ride, un-projected, on the get_enriched_quotes dict this builder already
+# consumes (engine returns the impl dict verbatim; see _get_enriched_quote_impl
+# / get_enriched_quotes), so this is a PURE insights_builder change -- no engine
+# edit, no schema column, no carry mechanism, the 115/118/122 contracts are
+# untouched. CONTAINMENT / REVERSIBILITY: the whole section is behind
+# TFB_INSIGHTS_STRUCTURE (default OFF). When OFF, _build_structural_signal_rows
+# is never invoked (call site is flag-guarded), the new _SECTION_BAND entry is
+# never consulted (no row normalizes to "structuralsignals"), and the row set /
+# ordering / contract are byte-identical to v8.4.0. COVERAGE IS MADE VISIBLE:
+# candle_structure is computed by the engine only when its history-technicals
+# pass runs that cycle (gated on rsi/vol/maxdd being missing -- engine Finding
+# 2), so a decision symbol carrying live RSI may have NO structural read on a
+# given refresh. The summary row reports "<k> of <n> decision symbols carry a
+# structural read this cycle" and names the fallback, so the panel doubles as
+# the coverage diagnostic (far better than scraping DEBUG STRUCT logs). HONEST
+# FRAMING (carried into the notes): this read improves ENTRY TIMING, SIGNAL
+# CONFIRMATION, and THESIS-DECAY EARLY-WARNING (WEAK_* = trend contradicted by
+# weak volume / indecisive bodies) -- it is NOT a 12M forecast and moves no
+# verdict (presentation only; scoring is untouched). Named candlestick patterns
+# remain labeled context on top of this structural backbone, not the signal.
 # v8.2.1: coverage display-format fix. The Coverage / Data Quality rows emitted
 # their counts as "{n}/{d}" (e.g. "5/5"), which Google Sheets auto-coerces to a
 # date (M/D -> e.g. May 5 -> serial 46147) when the Value cell carries a number
@@ -268,6 +295,7 @@ _SECTION_BAND: Dict[str, int] = {
     "toppickscontext": 20,   # same band as Top Picks -> preserves #N interleave
     "riskalerts": 30,
     "shorttermopportunities": 40,
+    "structuralsignals": 45,   # v8.5.0 Phase 2b: candle-structure disclosure
     "portfoliokpis": 50,
     "macrosignals": 60,
     "dataqualityalerts": 80,
@@ -544,6 +572,23 @@ def _insights_equity_universe_enabled() -> bool:
     """v8.3.0 (Fix AE): gate for seeding the auto-universe from real equity
     pages. Default OFF -> _default_universes() only (byte-identical)."""
     return _env_bool("TFB_INSIGHTS_EQUITY_UNIVERSE", False)
+
+
+def _insights_structure_enabled() -> bool:
+    """v8.5.0 (Phase 2b): gate for the Structural Signals disclosure section.
+    Default OFF -> _build_structural_signal_rows is never invoked and the row
+    set is byte-identical to v8.4.0. Reads the engine's internal candle_structure
+    fields (present on the un-projected enriched-quote dict when the engine's
+    TFB_CANDLE_STRUCTURE pass ran for that symbol this cycle)."""
+    return _env_bool("TFB_INSIGHTS_STRUCTURE", False)
+
+
+def _insights_flow_enabled() -> bool:
+    """v8.6.0 (Strategy item (a)): gate for the Flow Signals disclosure section.
+    Default OFF -> _build_flow_signal_rows returns [] and the row set is
+    byte-identical to v8.5.0. Reads the engine's flow_* fields, which only exist
+    when the engine TFB_FLOW gate is on; a safe no-op otherwise."""
+    return _env_bool("TFB_INSIGHTS_FLOW", False)
 
 
 async def _resolve_equity_universes(engine: Any) -> Dict[str, List[str]]:
@@ -2100,6 +2145,350 @@ def _build_data_quality_rows(
     return rows
 
 
+_STRUCTURE_BIAS_RANK: Dict[str, int] = {
+    "STRONG_BULLISH": 6, "STRONG_BEARISH": 6,
+    "WEAK_BULLISH": 5, "WEAK_BEARISH": 5,   # early warnings float up for review
+    "BULLISH": 4, "BEARISH": 4,
+    "NEUTRAL": 1,
+}
+
+
+def _structure_bias_to_signal_priority(bias: str) -> Tuple[str, str]:
+    """v8.5.0 (Phase 2b): map a fused candle_structure bias to a display signal
+    + attention priority. WEAK_* is an EARLY-WARNING state (trend contradicted
+    by weak volume / indecisive bodies) -> ALERT + High so it surfaces for
+    review rather than being buried. Presentation only; no verdict effect."""
+    b = _safe_str(bias).upper()
+    if b == "STRONG_BULLISH":
+        return _SIGNAL_STRONG_UP, _PRI_HIGH
+    if b == "BULLISH":
+        return _SIGNAL_UP, _PRI_MEDIUM
+    if b == "STRONG_BEARISH":
+        return _SIGNAL_STRONG_DOWN, _PRI_HIGH
+    if b == "BEARISH":
+        return _SIGNAL_DOWN, _PRI_MEDIUM
+    if b in ("WEAK_BULLISH", "WEAK_BEARISH"):
+        return _SIGNAL_WARN, _PRI_HIGH
+    if b == "NEUTRAL":
+        return _SIGNAL_NEUTRAL, _PRI_LOW
+    return _SIGNAL_OK, _PRI_LOW
+
+
+def _build_structural_signal_rows(
+    ctx: BuildContext,
+    quotes: Dict[str, Dict[str, Any]],
+    decision_symbols: Optional[Sequence[str]] = None,
+    max_items: int = 15,
+) -> List[Dict[str, Any]]:
+    """v8.5.0 (Strategy #1, Phase 2b): read-only 'Structural Signals' section.
+
+    Surfaces the engine's structural candlestick backbone (candle_structure /
+    _trend / _swings / _volume / _bodywick / _gap / _summary). Those fields ride
+    on the un-projected enriched-quote dict but are stripped from every sheet
+    projection, so this panel is the only place they become visible. Scoped to
+    decision symbols when a decision set is resolvable; coverage (how many
+    decision symbols actually carry a structural read this cycle) is reported
+    explicitly so the section doubles as the coverage diagnostic. The read is for
+    entry timing / signal confirmation / thesis-decay early-warning -- NOT a
+    forecast, and it moves no verdict.
+
+    Default-OFF via TFB_INSIGHTS_STRUCTURE: when disabled this returns [] and the
+    row set is byte-identical to v8.4.0."""
+    if not _insights_structure_enabled():
+        return []
+    rows: List[Dict[str, Any]] = []
+    if not quotes:
+        return rows
+
+    decision_set = {_safe_str(s).upper() for s in (decision_symbols or []) if _safe_str(s)}
+
+    def _is_decision(sym: str) -> bool:
+        # With a resolved decision set, scope to it; otherwise (no portfolio /
+        # no top picks this build) fall back to "any symbol carrying a read" so
+        # the section still surfaces something.
+        return (not decision_set) or (_safe_str(sym).upper() in decision_set)
+
+    structured: List[Tuple[int, str, Dict[str, Any], str]] = []
+    decision_total = 0
+    decision_without_structure = 0
+    for sym, d in quotes.items():
+        if not isinstance(d, dict):
+            continue
+        in_decision = _safe_str(sym).upper() in decision_set
+        if in_decision:
+            decision_total += 1
+        bias = _safe_str(d.get("candle_structure")).upper()
+        has_struct = bool(bias) and bias != "INSUFFICIENT"
+        if not has_struct:
+            if in_decision:
+                decision_without_structure += 1
+            continue
+        if not _is_decision(sym):
+            continue
+        structured.append((_STRUCTURE_BIAS_RANK.get(bias, 2), sym, d, bias))
+
+    if not structured:
+        # Make the absence legible: explain the coverage gap rather than emit
+        # nothing (which would look like the section silently failed).
+        if decision_set and decision_total > 0:
+            note = (
+                f"0 of {decision_total} decision symbol(s) carry a structural read "
+                f"this cycle. candle_structure is computed only when the engine's "
+                f"history-technicals pass runs (gated on missing RSI/volatility); "
+                f"symbols with live RSI fall back to RSI + named candlestick pattern. "
+                f"Enable engine TFB_CANDLE_STRUCTURE and refresh to populate."
+            )
+        else:
+            note = (
+                "No symbols carry a structural read this cycle (engine "
+                "TFB_CANDLE_STRUCTURE off, or history-technicals pass did not run)."
+            )
+        rows.append(_make_row(
+            keys=ctx.keys, section="Structural Signals", item="Status",
+            metric="structural_read_count", value=0,
+            signal=_SIGNAL_OK, priority=_PRI_LOW,
+            notes=note, last_updated_riyadh=ctx.ts,
+        ))
+        return rows
+
+    n_strong = sum(1 for r, _s, _d, _b in structured if r == 6)
+    n_weak = sum(1 for _r, _s, _d, b in structured if b.startswith("WEAK_"))
+    if decision_set:
+        cov = (
+            f"{len(structured)} of {decision_total} decision symbol(s) carry a "
+            f"structural read this cycle"
+        )
+        if decision_without_structure:
+            cov += (
+                f"; {decision_without_structure} fell back to RSI + named pattern "
+                f"(history-technicals pass not run -- live RSI present)"
+            )
+    else:
+        cov = f"{len(structured)} symbol(s) carry a structural read this cycle"
+    summary_note = (
+        f"{cov}. Structural backbone = multi-day swing structure + volume "
+        f"confirmation + body/wick geometry + gaps; named patterns are labeled "
+        f"context on top. Use for entry timing, signal confirmation, and "
+        f"thesis-decay early-warning (WEAK_* = trend contradicted by weak volume "
+        f"/ indecisive bodies) -- NOT a 12M forecast; no verdict effect."
+    )
+    rows.append(_make_row(
+        keys=ctx.keys, section="Structural Signals", item="Summary",
+        metric="structural_read_count", value=len(structured),
+        signal=(_SIGNAL_WARN if n_weak else _SIGNAL_OK),
+        priority=(_PRI_HIGH if (n_strong or n_weak) else _PRI_MEDIUM),
+        notes=summary_note, last_updated_riyadh=ctx.ts,
+    ))
+
+    # Strongest reads + early-warnings first.
+    structured.sort(key=lambda x: x[0], reverse=True)
+    for _rank, sym, d, bias in structured[:max_items]:
+        name = _safe_str(d.get("name", sym)) or sym
+        trend = _safe_str(d.get("candle_structure_trend"))
+        swings = _safe_str(d.get("candle_structure_swings"))
+        volume = _safe_str(d.get("candle_structure_volume"))
+        body = _safe_str(d.get("candle_structure_bodywick"))
+        gap = _safe_str(d.get("candle_structure_gap"))
+        summary = _safe_str(d.get("candle_structure_summary"))
+        signal, priority = _structure_bias_to_signal_priority(bias)
+
+        decomp_parts: List[str] = []
+        if trend:
+            decomp_parts.append(f"trend={trend}")
+        if swings:
+            decomp_parts.append(f"swings={swings}")
+        if volume:
+            decomp_parts.append(f"vol={volume}")
+        if body:
+            decomp_parts.append(f"body={body}")
+        if gap:
+            decomp_parts.append(f"gap={gap}")
+        decomp = " ".join(decomp_parts)
+
+        note_bits: List[str] = []
+        if summary:
+            note_bits.append(summary)
+        if decomp:
+            note_bits.append(decomp)
+        if bias.startswith("WEAK_"):
+            note_bits.append("EARLY WARNING: trend not confirmed by volume/bodies")
+        note = " | ".join(note_bits) if note_bits else "Structural read."
+
+        rows.append(_make_row(
+            keys=ctx.keys, section="Structural Signals", item=name, symbol=sym,
+            metric="candle_structure", value=bias,
+            signal=signal, priority=priority,
+            notes=note, last_updated_riyadh=ctx.ts,
+        ))
+
+    return rows
+
+
+_FLOW_BIAS_RANK: Dict[str, int] = {
+    "STRONG_ACCUMULATION": 6, "STRONG_DISTRIBUTION": 6,
+    "WEAK_ACCUMULATION": 5, "WEAK_DISTRIBUTION": 5,   # contradicted reads float up for review
+    "ACCUMULATION": 4, "DISTRIBUTION": 4,
+    "NEUTRAL": 1,
+}
+
+
+def _flow_bias_to_signal_priority(bias: str) -> Tuple[str, str]:
+    """v8.6.0 (Strategy item (a)): map a fused flow bias to a display signal +
+    attention priority. WEAK_* is a CONTRADICTED state (net pressure fought by
+    the money-flow trend / inflection) -> ALERT + High so it surfaces for review.
+    Presentation only; no verdict effect."""
+    b = _safe_str(bias).upper()
+    if b == "STRONG_ACCUMULATION":
+        return _SIGNAL_STRONG_UP, _PRI_HIGH
+    if b == "ACCUMULATION":
+        return _SIGNAL_ACCUMULATE, _PRI_MEDIUM
+    if b == "STRONG_DISTRIBUTION":
+        return _SIGNAL_STRONG_DOWN, _PRI_HIGH
+    if b == "DISTRIBUTION":
+        return _SIGNAL_REDUCE, _PRI_MEDIUM
+    if b in ("WEAK_ACCUMULATION", "WEAK_DISTRIBUTION"):
+        return _SIGNAL_WARN, _PRI_HIGH
+    if b == "NEUTRAL":
+        return _SIGNAL_NEUTRAL, _PRI_LOW
+    return _SIGNAL_OK, _PRI_LOW
+
+
+def _build_flow_signal_rows(
+    ctx: BuildContext,
+    quotes: Dict[str, Dict[str, Any]],
+    decision_symbols: Optional[Sequence[str]] = None,
+    max_items: int = 15,
+) -> List[Dict[str, Any]]:
+    """v8.6.0 (Strategy item (a)): read-only 'Flow Signals' section.
+
+    Surfaces the engine's buyers-vs-sellers read (flow / flow_pressure /
+    flow_ad_trend / flow_inflection / flow_summary). Those fields ride on the
+    un-projected enriched-quote dict but are stripped from every sheet
+    projection, so this panel is the only place they become visible. Scoped to
+    decision symbols when a decision set is resolvable; coverage (how many
+    decision symbols actually carry a flow read this cycle) is reported
+    explicitly so the section doubles as the coverage diagnostic. The read is a
+    CURRENT-STATE supply/demand inference for entry timing / conviction
+    confirmation -- NOT order-flow prediction, NOT a forecast.
+
+    Default-OFF via TFB_INSIGHTS_FLOW: when disabled this returns [] and the row
+    set is byte-identical to v8.5.0."""
+    if not _insights_flow_enabled():
+        return []
+    rows: List[Dict[str, Any]] = []
+    if not quotes:
+        return rows
+
+    decision_set = {_safe_str(s).upper() for s in (decision_symbols or []) if _safe_str(s)}
+
+    def _is_decision(sym: str) -> bool:
+        return (not decision_set) or (_safe_str(sym).upper() in decision_set)
+
+    flowed: List[Tuple[int, str, Dict[str, Any], str]] = []
+    decision_total = 0
+    decision_without_flow = 0
+    for sym, d in quotes.items():
+        if not isinstance(d, dict):
+            continue
+        in_decision = _safe_str(sym).upper() in decision_set
+        if in_decision:
+            decision_total += 1
+        bias = _safe_str(d.get("flow")).upper()
+        has_flow = bool(bias) and bias != "INSUFFICIENT"
+        if not has_flow:
+            if in_decision:
+                decision_without_flow += 1
+            continue
+        if not _is_decision(sym):
+            continue
+        flowed.append((_FLOW_BIAS_RANK.get(bias, 2), sym, d, bias))
+
+    if not flowed:
+        # Make the absence legible rather than emitting nothing.
+        if decision_set and decision_total > 0:
+            note = (
+                f"0 of {decision_total} decision symbol(s) carry a flow read this "
+                f"cycle. flow_* is computed only when the engine's history pass runs "
+                f"AND the bars carry volume; enable engine TFB_FLOW and refresh to "
+                f"populate (no-volume symbols stay INSUFFICIENT by design)."
+            )
+        else:
+            note = (
+                "No symbols carry a flow read this cycle (engine TFB_FLOW off, or no "
+                "volume in the history bars)."
+            )
+        rows.append(_make_row(
+            keys=ctx.keys, section="Flow Signals", item="Status",
+            metric="flow_read_count", value=0,
+            signal=_SIGNAL_OK, priority=_PRI_LOW,
+            notes=note, last_updated_riyadh=ctx.ts,
+        ))
+        return rows
+
+    n_strong = sum(1 for r, _s, _d, _b in flowed if r == 6)
+    n_weak = sum(1 for _r, _s, _d, b in flowed if b.startswith("WEAK_"))
+    if decision_set:
+        cov = (
+            f"{len(flowed)} of {decision_total} decision symbol(s) carry a flow "
+            f"read this cycle"
+        )
+        if decision_without_flow:
+            cov += f"; {decision_without_flow} had no usable volume (INSUFFICIENT)"
+    else:
+        cov = f"{len(flowed)} symbol(s) carry a flow read this cycle"
+    summary_note = (
+        f"{cov}. Flow = Chaikin Money Flow (volume-weighted close location) + "
+        f"money-flow trend + support/resistance inflection, fused into "
+        f"accumulation/distribution. A CURRENT-STATE buyers-vs-sellers read for "
+        f"entry timing and conviction (WEAK_* = pressure contradicted by trend / "
+        f"inflection) -- NOT order-flow prediction, NOT a 12M forecast."
+    )
+    rows.append(_make_row(
+        keys=ctx.keys, section="Flow Signals", item="Summary",
+        metric="flow_read_count", value=len(flowed),
+        signal=(_SIGNAL_WARN if n_weak else _SIGNAL_OK),
+        priority=(_PRI_HIGH if (n_strong or n_weak) else _PRI_MEDIUM),
+        notes=summary_note, last_updated_riyadh=ctx.ts,
+    ))
+
+    # Strongest reads + early-warnings first.
+    flowed.sort(key=lambda x: x[0], reverse=True)
+    for _rank, sym, d, bias in flowed[:max_items]:
+        name = _safe_str(d.get("name", sym)) or sym
+        pressure = _safe_str(d.get("flow_pressure"))
+        ad_trend = _safe_str(d.get("flow_ad_trend"))
+        inflection = _safe_str(d.get("flow_inflection"))
+        summary = _safe_str(d.get("flow_summary"))
+        signal, priority = _flow_bias_to_signal_priority(bias)
+
+        decomp_parts: List[str] = []
+        if pressure:
+            decomp_parts.append(f"cmf={pressure}")
+        if ad_trend:
+            decomp_parts.append(f"trend={ad_trend}")
+        if inflection:
+            decomp_parts.append(f"pos={inflection}")
+        decomp = " ".join(decomp_parts)
+
+        note_bits: List[str] = []
+        if summary:
+            note_bits.append(summary)
+        elif decomp:
+            note_bits.append(decomp)
+        if bias.startswith("WEAK_"):
+            note_bits.append("EARLY WARNING: net pressure contradicted by trend/inflection")
+        note = " | ".join(note_bits) if note_bits else "Flow read."
+
+        rows.append(_make_row(
+            keys=ctx.keys, section="Flow Signals", item=name, symbol=sym,
+            metric="flow", value=bias,
+            signal=signal, priority=priority,
+            notes=note, last_updated_riyadh=ctx.ts,
+        ))
+
+    return rows
+
+
 def _build_short_term_rows(
     ctx: BuildContext,
     quotes: Dict[str, Dict[str, Any]],
@@ -3158,6 +3547,32 @@ async def build_insights_analysis_rows(
 
     if do_short_term and ctx.all_quotes:
         rows.extend(_build_short_term_rows(ctx, ctx.all_quotes))
+
+    if _insights_structure_enabled() and ctx.all_quotes:
+        # v8.5.0 Phase 2b: decision symbols = current holdings + top picks.
+        # Flag-guarded so OFF is byte-identical (this block never runs).
+        _decision_syms: List[str] = list(ctx.portfolio_symbols)
+        try:
+            _t10 = top10_payload.get("symbols") if isinstance(top10_payload, dict) else None
+            if isinstance(_t10, list):
+                _decision_syms.extend(_safe_str(s) for s in _t10 if _safe_str(s))
+        except Exception:
+            pass
+        rows.extend(_build_structural_signal_rows(ctx, ctx.all_quotes, _decision_syms))
+
+    if _insights_flow_enabled() and ctx.all_quotes:
+        # v8.6.0 (Strategy item (a)): decision symbols = current holdings + top
+        # picks. Computed independently of the structural block so the flow panel
+        # works even with TFB_INSIGHTS_STRUCTURE off. Flag-guarded so OFF is
+        # byte-identical (this block never runs).
+        _flow_decision_syms: List[str] = list(ctx.portfolio_symbols)
+        try:
+            _t10f = top10_payload.get("symbols") if isinstance(top10_payload, dict) else None
+            if isinstance(_t10f, list):
+                _flow_decision_syms.extend(_safe_str(s) for s in _t10f if _safe_str(s))
+        except Exception:
+            pass
+        rows.extend(_build_flow_signal_rows(ctx, ctx.all_quotes, _flow_decision_syms))
 
     if do_portfolio_kpis:
         if ctx.portfolio_symbols and ctx.portfolio_quotes:
