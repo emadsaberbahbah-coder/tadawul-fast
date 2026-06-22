@@ -99,12 +99,14 @@ async def main(hist=None):
     except Exception:
         from data_engine_v2 import analyze_flow, analyze_candle_structure
 
-    recs = []  # (flow_val, candle_val, {h: roi})
+    from collections import Counter
+    # per-symbol ordered records so we can build NON-OVERLAPPING samples
+    per_sym = {}   # sym -> [(flow_val, candle_val, {h: roi}), ...] in day order
     ftal, ctal = Counter(), Counter()
     minh = min(HORIZONS)
     for s, bars in hist.items():
         closes = [_close(b) for b in bars]
-        n = len(bars)
+        n = len(bars); seq = []
         for d in range(MIN_WIN, n - minh):
             fv = str((analyze_flow(bars[:d+1]) or {}).get("flow") or "").upper()
             cv = str((analyze_candle_structure(bars[:d+1]) or {}).get("candle_structure") or "").upper()
@@ -113,29 +115,43 @@ async def main(hist=None):
             for h in HORIZONS:
                 if d + h < n and c0 and closes[d+h]:
                     rois[h] = (closes[d+h] - c0) / c0 * 100.0
-            recs.append((fv, cv, rois))
+            seq.append((fv, cv, rois))
+        per_sym[s] = seq
 
     print("\nFLOW vocabulary:", dict(ftal.most_common()))
     print("CANDLE vocabulary:", dict(ctal.most_common()))
 
-    def evaluate(idx, trig, bullish, h):
-        sig, base = [], []
-        for r in recs:
-            rois = r[2]
-            if h not in rois: continue
-            (sig if r[idx] == trig else base).append(rois[h])
-        n = len(sig)
-        if n < MIN_SAMPLE:
-            return ("thin", n, 0.0, 0.0, 0.0, 0.0)
-        ms = sum(sig) / n
-        mb = (sum(base) / len(base)) if base else 0.0
+    N_TESTS = 32
+    BONF_T = 2.94   # ~one-sided 0.05/32 family-wise; the honest bar for 32 tests
+
+    def evaluate(idx_field, trig, bullish, h):
+        sig_o, base_o = [], []   # overlapping (all days) -> unbiased eff/hit
+        sig_i, base_i = [], []   # non-overlapping -> honest t
+        for seq in per_sym.values():
+            # overlapping
+            for rec in seq:
+                if h in rec[2]:
+                    (sig_o if rec[idx_field] == trig else base_o).append(rec[2][h])
+            # non-overlapping: advance cursor by h whenever a usable day is consumed
+            i = 0; L = len(seq)
+            while i < L:
+                rec = seq[i]
+                if h in rec[2]:
+                    (sig_i if rec[idx_field] == trig else base_i).append(rec[2][h])
+                    i += h
+                else:
+                    i += 1
+        n_o = len(sig_o)
+        if n_o == 0:
+            return ("thin", 0, 0, 0.0, 0.0, 0.0)
+        ms = sum(sig_o)/n_o
+        mb = (sum(base_o)/len(base_o)) if base_o else 0.0
         eff = (ms - mb) * 100.0
-        hits = sum(1 for x in sig if (x > 0 if bullish else x < 0))
-        hr = hits / n * 100.0
-        lo, hi = T.wilson_interval(hits, n)
-        t = T._welch_t(sig, base)
-        ok = (eff >= MIN_EFF and t >= MIN_T) if bullish else (eff <= -MIN_EFF and t <= -MIN_T)
-        return ("ACCEPT" if ok else "reject", n, hr, lo, eff, t)
+        hits = sum(1 for x in sig_o if (x > 0 if bullish else x < 0))
+        hr = hits/n_o*100.0
+        n_i = len(sig_i)
+        t_i = T._welch_t(sig_i, base_i) if n_i >= 2 else 0.0
+        return ("ok", n_o, n_i, hr, eff, t_i)
 
     GRID = [
         ("flow", 0, "ACCUMULATION", True), ("flow", 0, "STRONG_ACCUMULATION", True),
@@ -143,16 +159,36 @@ async def main(hist=None):
         ("candle", 1, "BULLISH", True), ("candle", 1, "STRONG_BULLISH", True),
         ("candle", 1, "BEARISH", False), ("candle", 1, "STRONG_BEARISH", False),
     ]
-    print("\n%-7s %-20s %3s %5s %5s %5s %8s %6s" %
-          ("factor","trigger","H","n","hit%","loCI","eff_bps","t"))
-    print("-" * 66)
-    for fac, idx, trig, bull in GRID:
+    print("\n(non-overlapping t = honest; ACCEPT needs eff>=50bps in-dir, |t_indep|>=2.0; * = survives 32-test Bonferroni |t|>=2.94)")
+    print("\n%-7s %-20s %3s %6s %6s %5s %8s %8s" %
+          ("factor","trigger","H","n_all","n_indep","hit%","eff_bps","t_indep"))
+    print("-" * 74)
+    survivors = []
+    for fac, idxf, trig, bull in GRID:
         for h in HORIZONS:
-            st, n, hr, lo, eff, t = evaluate(idx, trig, bull, h)
-            mark = "  <== ACCEPT" if st == "ACCEPT" else ("  (thin)" if st == "thin" else "")
-            tdisp = (">99" if t > 99 else ("<-99" if t < -99 else "%6.2f" % t))
-            print("%-7s %-20s %3d %5d %5.0f %5.0f %8.0f %6s%s" %
-                  (fac, trig, h, n, hr, lo, eff, tdisp, mark))
+            st, n_o, n_i, hr, eff, t_i = evaluate(idxf, trig, bull, h)
+            if st == "thin":
+                print("%-7s %-20s %3d %6s %6s %5s %8s %8s" % (fac, trig, h, "-","-","-","-","-"))
+                continue
+            eff_ok = (eff >= MIN_EFF) if bull else (eff <= -MIN_EFF)
+            t_ok = (t_i >= 2.0) if bull else (t_i <= -2.0)
+            t_bonf = (t_i >= BONF_T) if bull else (t_i <= -BONF_T)
+            thin_i = n_i < MIN_SAMPLE
+            if thin_i:
+                mark = "  (indep thin)"
+            elif eff_ok and t_ok and t_bonf:
+                mark = "  <== ACCEPT *"; survivors.append((fac,trig,h,eff,t_i,"robust"))
+            elif eff_ok and t_ok:
+                mark = "  <== accept (sub-Bonferroni)"; survivors.append((fac,trig,h,eff,t_i,"marginal"))
+            else:
+                mark = ""
+            td = (">99" if t_i > 99 else ("<-99" if t_i < -99 else "%8.2f" % t_i))
+            print("%-7s %-20s %3d %6d %6d %5.0f %8.0f %8s%s" %
+                  (fac, trig, h, n_o, n_i, hr, eff, td, mark))
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    print("\nSURVIVORS:")
+    if not survivors:
+        print("  NONE pass eff>=50bps + |t_indep|>=2.0 -> no robust forward edge.")
+    else:
+        for fac,trig,h,eff,t_i,grade in survivors:
+            print("  %-7s %-20s H=%-3d eff=%+.0fbps t_indep=%+.2f  [%s]" % (fac,trig,h,eff,t_i,grade))
