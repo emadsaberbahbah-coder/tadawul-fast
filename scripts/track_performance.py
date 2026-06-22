@@ -449,7 +449,29 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.10.1"
+SCRIPT_VERSION = "6.11.0"
+# v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
+#   to v6.10.1). Two independently-gated corrections, both proven on the live
+#   KSA+US grid before folding here:
+#   (1) NON-OVERLAPPING t-stat [env TFB_BACKTEST_NONOVERLAP=1, or run_backtest(
+#       ..., nonoverlap=True)]: the existing verdict pools EVERY day, so at long
+#       horizons consecutive forward-return windows overlap (h-1)/h and the t-stat
+#       is massively inflated -- a throwaway grid showed 4 "ACCEPTs" at t~2 that
+#       ALL collapsed (t -> 0.0-0.4, n_indep 1-17) once windows were made
+#       independent. When ON, the verdict is re-decided on independent windows
+#       (advance the cursor by h whenever a window is consumed); the 't-stat'
+#       column then carries the HONEST (independent) statistic and Notes disclose
+#       both it and the inflated overlapping value. Optional multiple-testing
+#       floor via TFB_BACKTEST_TSTAT_FLOOR (e.g. 2.94 for a 32-test Bonferroni
+#       bar) raises the effective |t| threshold in this mode only.
+#   (2) DEEP KSA HISTORY [env TFB_BACKTEST_KSA_YF=1]: yahoo_chart's shim defaults
+#       to period=1mo so .SR tickers returned only ~22 bars -- too few for any
+#       horizon, silently making the "KSA+US" backtest ~98% US. When ON, symbols
+#       that come back shallow (< TFB_BACKTEST_KSA_MIN_BARS, default 60) are
+#       re-pulled directly from yfinance at period=2y (~505 KSA bars), the same
+#       working source the grid used. US stays on EODHD. Both flags MUST be set
+#       to 1 before testing (b)/(c) rotation hypotheses, or the harness will
+#       over-accept exactly the way the lenient grid did.
 SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias (preserved)
 SCRIPT_NAME = "PerformanceTracker"
 
@@ -3072,6 +3094,39 @@ def default_hypotheses() -> List[Hypothesis]:
     ]
 
 
+def _yf_deep_history(sym: str, period: str = "2y") -> List[Dict[str, Any]]:
+    """v6.11.0: direct yfinance pull at an explicit multi-year depth. Used ONLY
+    when TFB_BACKTEST_KSA_YF is enabled and a symbol came back shallow from the
+    normal provider chain. yfinance understands Tadawul '.SR' tickers and returns
+    ~505 daily bars at period='2y'; this bypasses the yahoo_chart shim's 1mo
+    default that capped KSA history at ~22 bars. '.US' tickers fail here (yfinance
+    wants bare US tickers) which is fine -- EODHD already serves US at full depth.
+    Returns [] on any failure (fail-soft); bars are lowercase OHLCV dicts the same
+    shape _bt_bar_close() and make_trigger_fn() already consume."""
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception:
+        return []
+    try:
+        df = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=False)
+    except Exception:
+        return []
+    if df is None or getattr(df, "empty", True):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for idx, r in df.iterrows():
+        try:
+            rows.append({
+                "date": idx.strftime("%Y-%m-%d"),
+                "open": float(r["Open"]), "high": float(r["High"]),
+                "low": float(r["Low"]), "close": float(r["Close"]),
+                "volume": float(r.get("Volume", 0) or 0),
+            })
+        except Exception:
+            continue
+    return rows
+
+
 def _bt_bar_close(bar: Dict[str, Any]) -> Optional[float]:
     """Adjusted close preferred (EODHD EOD), else close. Positive floats only."""
     for k in ("adjusted_close", "adjclose", "close", "c"):
@@ -3137,15 +3192,32 @@ def run_backtest(
     history_by_symbol: Dict[str, List[Dict[str, Any]]],
     trigger_fn: Optional[Callable[[List[Dict[str, Any]]], bool]] = None,
     min_window: int = 12,
+    *,
+    nonoverlap: Optional[bool] = None,
+    tstat_floor: Optional[float] = None,
 ) -> Hypothesis:
     """Event-study backtest of a single hypothesis. PURE: takes per-symbol bar
     history (date-ASCENDING EOD dicts) + a trigger_fn, returns a COPY of the
     hypothesis with result fields filled. trigger_fn(bars[:D+1]) -> bool is
     evaluated with NO lookahead; the forward horizon-day return is the outcome.
-    Signal days are compared against NON-trigger days (the conditional lift)."""
+    Signal days are compared against NON-trigger days (the conditional lift).
+
+    v6.11.0: when `nonoverlap` (env TFB_BACKTEST_NONOVERLAP) is set, the verdict
+    is re-decided on INDEPENDENT (non-overlapping) windows so long-horizon
+    t-stats are not inflated by autocorrelated overlapping returns; the optional
+    `tstat_floor` (env TFB_BACKTEST_TSTAT_FLOOR) raises the |t| bar for
+    multiple-testing. When False, behaviour is byte-identical to v6.10.1."""
     import copy as _copy
     hyp = _copy.copy(hypothesis)
     hyp.last_backtest_utc = _utc_now().isoformat()
+
+    # v6.11.0: resolve hardening toggles. Default to env so the weekly cron picks
+    # them up; pass explicitly in tests. nonoverlap=False => block below is fully
+    # skipped and the verdict is identical to v6.10.1.
+    if nonoverlap is None:
+        nonoverlap = _env_bool("TFB_BACKTEST_NONOVERLAP", False)
+    if tstat_floor is None:
+        tstat_floor = _env_float("TFB_BACKTEST_TSTAT_FLOOR", 0.0)
 
     if trigger_fn is None:
         trigger_fn = make_trigger_fn(hypothesis)
@@ -3158,6 +3230,8 @@ def run_backtest(
     bullish = hypothesis.direction == HypothesisDirection.BULLISH
     signal_rois: List[float] = []
     baseline_rois: List[float] = []
+    signal_indep: List[float] = []      # v6.11.0: independent (non-overlapping) windows
+    baseline_indep: List[float] = []
     universe = 0
     max_hist = 0
 
@@ -3177,6 +3251,23 @@ def run_backtest(
                 signal_rois.append(roi)
             else:
                 baseline_rois.append(roi)
+        if nonoverlap:
+            # v6.11.0: independent windows -- advance the cursor by h whenever a
+            # usable window is consumed so no two outcomes share return periods.
+            i = min_window
+            limit = len(bars) - h
+            while i < limit:
+                c0 = closes[i]
+                ch = closes[i + h]
+                if c0 is None or ch is None or c0 <= 0:
+                    i += 1
+                    continue
+                roi = (ch - c0) / c0 * 100.0
+                if trigger_fn(bars[: i + 1]):
+                    signal_indep.append(roi)
+                else:
+                    baseline_indep.append(roi)
+                i += h
 
     hyp.universe_size = universe
     hyp.history_days = max_hist
@@ -3211,6 +3302,37 @@ def run_backtest(
         hyp.status = HypothesisStatus.REJECTED
         hyp.notes = "no edge in direction: effect %+.0f bps, t=%+.2f (need %s%.0f bps & |t|>=%.1f)" % (
             hyp.effect_bps, hyp.t_stat, "" if bullish else "-", hypothesis.min_effect_bps, hypothesis.min_tstat)
+
+    if nonoverlap:
+        # v6.11.0: HONEST re-verdict on independent windows. The overlapping
+        # t-stat above is kept only for disclosure; the decision AND the stored
+        # 't-stat' field switch to the non-overlapping statistic, which is not
+        # inflated by autocorrelation at long horizons. Reached only when the
+        # overlapping sample already cleared min_sample (so lo/hi are defined).
+        overlap_t = hyp.t_stat
+        n_indep = len(signal_indep)
+        t_indep = _welch_t(signal_indep, baseline_indep) if n_indep >= 2 else 0.0
+        eff_min_t = max(float(hypothesis.min_tstat), float(tstat_floor or 0.0))
+        hyp.t_stat = t_indep   # column now carries the decision-relevant statistic
+        t_ok_i = (t_indep >= eff_min_t) if bullish else (t_indep <= -eff_min_t)
+        bar_txt = "%s%.0f bps & |t_indep|>=%.2f" % (
+            "" if bullish else "-", hypothesis.min_effect_bps, eff_min_t)
+        if n_indep < max(1, hypothesis.min_sample):
+            hyp.status = HypothesisStatus.INSUFFICIENT_DATA
+            hyp.notes = ("indep-window thin: n_indep=%d (< min %d) -- overlapping "
+                         "t=%+.2f NOT trusted (autocorrelated)"
+                         % (n_indep, hypothesis.min_sample, overlap_t))
+        elif eff_ok and t_ok_i:
+            hyp.status = HypothesisStatus.ACCEPTED
+            hyp.notes = ("edge confirmed (independent windows): effect %+.0f bps, "
+                         "t_indep=%+.2f, n_indep=%d, hit %.0f%% [%.0f-%.0f] [overlap t=%+.2f]"
+                         % (hyp.effect_bps, t_indep, n_indep, hyp.hit_rate, lo, hi, overlap_t))
+        else:
+            hyp.status = HypothesisStatus.REJECTED
+            hyp.notes = ("no robust edge (independent windows): effect %+.0f bps, "
+                         "t_indep=%+.2f, n_indep=%d (need %s) [overlap t=%+.2f inflated]"
+                         % (hyp.effect_bps, t_indep, n_indep, bar_txt, overlap_t))
+
     return hyp
 
 
@@ -4195,10 +4317,17 @@ class PerformanceTrackerApp:
                     return bars
             return None
 
+        # v6.11.0: deep-KSA fallback config (default OFF -> routing identical to
+        # v6.10.1). When on, shallow/missing symbols are re-pulled from yfinance.
+        ksa_yf = _env_bool("TFB_BACKTEST_KSA_YF", False)
+        ksa_min_bars = _env_int("TFB_BACKTEST_KSA_MIN_BARS", 60, lo=20, hi=400)
+        ksa_period = (os.getenv("TFB_BACKTEST_KSA_YF_PERIOD", "2y") or "2y").strip() or "2y"
+
         sem = asyncio.Semaphore(max(1, _env_int("BACKTEST_CONCURRENCY", 6, lo=1, hi=16)))
 
         async def _one(sym: str) -> None:
             async with sem:
+                chosen: Optional[List[Dict[str, Any]]] = None
                 for mod in providers:
                     try:
                         bars = await _fetch_from(mod, sym)
@@ -4209,9 +4338,23 @@ class PerformanceTrackerApp:
                         )
                         bars = None
                     if bars:
-                        out[sym] = _sort_bars(bars)
-                        return
-                logger.warning("no history for %s from any provider", sym)
+                        chosen = bars
+                        break
+                # v6.11.0: shallow/missing (chiefly .SR capped at ~22 bars by the
+                # yahoo_chart shim) -> pull deep from yfinance at period=2y and keep
+                # whichever source is deeper. Skipped entirely when ksa_yf is OFF.
+                if ksa_yf and (chosen is None or len(chosen) < ksa_min_bars):
+                    try:
+                        yb = await asyncio.get_event_loop().run_in_executor(
+                            None, _yf_deep_history, sym, ksa_period)
+                    except Exception:
+                        yb = None
+                    if yb and (chosen is None or len(yb) > len(chosen)):
+                        chosen = yb
+                if chosen:
+                    out[sym] = _sort_bars(chosen)
+                else:
+                    logger.warning("no history for %s from any provider", sym)
 
         await asyncio.gather(*[_one(s) for s in symbols], return_exceptions=True)
         return out
