@@ -1,35 +1,51 @@
 name: backtest-harness
 
-# Weekly hypothesis backtest. Backtests are expensive and their inputs (years of
-# history) move slowly, so daily is wasteful -- weekly is plenty. Manual dispatch
-# is available any time. This is SEPARATE from track_performance.yml (the daily
-# forward-tracking clock); it only registers + backtests hypotheses and writes
-# the Hypothesis_Registry tab. It never touches Performance_Log.
+# Weekly hypothesis backtest -- the Strategy's evidence gate. Registers the
+# flow/candle hypotheses and backtests them against historical OHLCV, writing
+# the Hypothesis_Registry tab. SEPARATE from track_performance.yml (the daily
+# forward-tracking clock); it never touches Performance_Log.
+#
+# Environment mirrors the proven Tadawul sync workflow: PYTHONPATH=workspace so
+# the local engine + EODHD provider import, and requirements.render.txt is the
+# canonical dependency set (falling back to requirements.txt).
 
 on:
   schedule:
-    - cron: "0 13 * * 0"   # Sundays 13:00 UTC (16:00 Riyadh)
+    - cron: "0 13 * * 0"          # Sundays 13:00 UTC (16:00 Riyadh)
   workflow_dispatch:
     inputs:
       sheet_id:
-        description: "Spreadsheet ID (blank -> DEFAULT_SPREADSHEET_ID variable)"
+        description: "Spreadsheet ID (blank -> vars.DEFAULT_SPREADSHEET_ID)"
         required: false
+        type: string
         default: ""
       hypothesis:
         description: "Backtest only this hypothesis id (blank -> all testable)"
         required: false
+        type: string
         default: ""
       backtest_days:
-        description: "History window in days (default 730)"
+        description: "History window in days"
         required: false
+        type: string
         default: "730"
 
 permissions:
   contents: read
 
 concurrency:
-  group: backtest-harness
+  group: backtest-harness-${{ github.ref }}
   cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  TZ: Asia/Riyadh
 
 jobs:
   backtest:
@@ -38,36 +54,67 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Set up Python
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+            requirements.ml.txt
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          set -euo pipefail
+          echo "::group::Pip install"
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f "requirements.render.txt" ]; then
+            python -m pip install -r requirements.render.txt
+          elif [ -f "requirements.txt" ]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "::error::No requirements file found (requirements.render.txt or requirements.txt)."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Resolve spreadsheet ID
+        env:
+          INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          set -euo pipefail
+          SHEET="${INPUT_SHEET:-}"
+          if [ -z "${SHEET}" ]; then SHEET="${VAR_SHEET:-}"; fi
+          if [ -z "${SHEET}" ]; then
+            echo "::error::Spreadsheet ID is empty. Set vars.DEFAULT_SPREADSHEET_ID or pass the sheet_id input."
+            exit 1
+          fi
+          echo "TARGET_SHEET_ID=${SHEET}" >> "$GITHUB_ENV"
+          echo "Sheet ID resolved."
 
       - name: Run backtest harness
         env:
-          # Sheets write (Hypothesis_Registry) -- same secret as the daily tracker
+          PYTHONPATH: ${{ github.workspace }}
+          # Sheets write (Hypothesis_Registry) -- same secret as the daily tracker.
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-          # Spreadsheet target -- dispatch input wins, else the repo variable
-          DEFAULT_SPREADSHEET_ID: ${{ github.event.inputs.sheet_id != '' && github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
-          TRACK_SHEET_ID: ${{ github.event.inputs.sheet_id != '' && github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
-          # Historical OHLCV source -- EODHD is primary; REQUIRED for the backtest
+          # Historical OHLCV source -- EODHD is primary; REQUIRED for the backtest.
           EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
-          # Optional knobs (fall through to code defaults if unset)
+          # Optional knobs (fall through to code defaults when blank).
           BACKTEST_HISTORY_DAYS: ${{ github.event.inputs.backtest_days }}
           TRACK_HYPOTHESIS: ${{ github.event.inputs.hypothesis }}
-          # Acceptance thresholds (documented; defaults shown)
           BACKTEST_MIN_SAMPLE: "30"
           BACKTEST_MIN_EFFECT_BPS: "50"
           BACKTEST_MIN_TSTAT: "2.0"
-          PYTHONUNBUFFERED: "1"
         run: |
+          set -euo pipefail
           python scripts/track_performance.py \
+            --sheet-id "${TARGET_SHEET_ID}" \
             --register-hypotheses \
             --backtest \
             --verbose
