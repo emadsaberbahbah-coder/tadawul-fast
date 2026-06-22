@@ -192,3 +192,7 @@ async def main(hist=None):
     else:
         for fac,trig,h,eff,t_i,grade in survivors:
             print("  %-7s %-20s H=%-3d eff=%+.0fbps t_indep=%+.2f  [%s]" % (fac,trig,h,eff,t_i,grade))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
