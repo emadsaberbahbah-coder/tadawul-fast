@@ -14,35 +14,67 @@ MIN_WIN = 12
 MIN_EFF = 50.0
 MIN_T = 2.0
 
+def _yf_history(sym, period="2y"):
+    """Direct yfinance pull with an explicit 2y depth. yfinance understands
+    Tadawul '.SR' symbols; this bypasses the provider shim's 1mo default that
+    capped KSA history at ~22 bars. '.US' symbols fail here (yfinance wants bare
+    tickers) but EODHD already covers US, so that's fine."""
+    try:
+        import yfinance as yf
+    except Exception:
+        return []
+    try:
+        df = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=False)
+    except Exception:
+        return []
+    if df is None or getattr(df, "empty", True):
+        return []
+    rows = []
+    for idx, r in df.iterrows():
+        try:
+            rows.append({
+                "date": idx.strftime("%Y-%m-%d"),
+                "open": float(r["Open"]), "high": float(r["High"]),
+                "low": float(r["Low"]), "close": float(r["Close"]),
+                "volume": float(r.get("Volume", 0) or 0),
+            })
+        except Exception:
+            continue
+    return rows
+
+
 async def _fetch_history(symbols, days):
+    """US -> EODHD (deep, reliable). KSA -> yfinance direct @ period=2y (the
+    only deep source for Tadawul). Takes whichever returns more bars."""
     out = {}
-    provs = []
-    for dotted, bare in [("core.providers.yahoo_chart_provider","yahoo_chart_provider"),
-                         ("core.providers.eodhd_provider","eodhd_provider")]:
-        m = None
-        for p in (dotted, bare):
-            try:
-                m = __import__(p, fromlist=["fetch_history"]); break
-            except Exception:
-                continue
-        if m: provs.append(m)
+    eod = None
+    for p in ("core.providers.eodhd_provider", "eodhd_provider"):
+        try:
+            eod = __import__(p, fromlist=["fetch_history"]); break
+        except Exception:
+            continue
+    loop = asyncio.get_event_loop()
     sem = asyncio.Semaphore(6)
+
     async def one(s):
         async with sem:
-            for m in provs:
-                for fn in ("fetch_history","fetch_price_history"):
-                    f = getattr(m, fn, None)
-                    if not f: continue
-                    try:
-                        bars = await f(s, days=days)
-                    except TypeError:
-                        try: bars = await f(s)
-                        except Exception: continue
-                    except Exception:
-                        continue
-                    if isinstance(bars, list) and bars:
-                        out[s] = sorted(bars, key=lambda r: str((r or {}).get("date") or ""))
-                        return
+            bars = []
+            # try EODHD first (covers US with full depth; 404s on .SR)
+            if eod is not None and hasattr(eod, "fetch_history"):
+                try:
+                    b = await eod.fetch_history(s, days=days)
+                    if isinstance(b, list):
+                        bars = b
+                except Exception:
+                    bars = []
+            # if shallow/missing (i.e. KSA), pull 2y direct from yfinance
+            if len(bars) < 60:
+                yb = await loop.run_in_executor(None, _yf_history, s)
+                if yb and len(yb) >= len(bars):
+                    bars = yb
+            if bars:
+                out[s] = sorted(bars, key=lambda r: str((r or {}).get("date") or ""))
+
     await asyncio.gather(*[one(s) for s in symbols])
     return out
 
