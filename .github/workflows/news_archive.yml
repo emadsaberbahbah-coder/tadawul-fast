@@ -1,0 +1,107 @@
+name: news-archive
+
+# Daily news/sentiment snapshot -- the forward-collection clock for Strategy
+# items (b) news->sector and (c) theme rotation. Appends one row per symbol per
+# day to the News_Archive tab. SEPARATE from track_performance.yml and
+# backtest_harness.yml. No provider API key needed (news_intelligence uses
+# Google-News RSS); only sheet creds + a spreadsheet id.
+#
+# Env mirrors the proven Tadawul workflow: PYTHONPATH=workspace so the local
+# news engine imports, and requirements.render.txt is the canonical dep set.
+
+on:
+  schedule:
+    - cron: "0 14 * * *"          # daily 14:00 UTC (17:00 Riyadh, after Tadawul close)
+  workflow_dispatch:
+    inputs:
+      sheet_id:
+        description: "Spreadsheet ID (blank -> vars.DEFAULT_SPREADSHEET_ID)"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Fetch + print only, do not write the sheet"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: news-archive-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  TZ: Asia/Riyadh
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+            requirements.ml.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          echo "::group::Pip install"
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f "requirements.render.txt" ]; then
+            python -m pip install -r requirements.render.txt
+          elif [ -f "requirements.txt" ]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "::error::No requirements file found (requirements.render.txt or requirements.txt)."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Resolve spreadsheet ID
+        env:
+          INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          set -euo pipefail
+          SHEET="${INPUT_SHEET:-}"
+          if [ -z "${SHEET}" ]; then SHEET="${VAR_SHEET:-}"; fi
+          if [ -z "${SHEET}" ]; then
+            echo "::error::Spreadsheet ID is empty. Set vars.DEFAULT_SPREADSHEET_ID or pass the sheet_id input."
+            exit 1
+          fi
+          echo "TARGET_SHEET_ID=${SHEET}" >> "$GITHUB_ENV"
+          echo "Sheet ID resolved."
+
+      - name: Collect news archive
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          # Optional: override the universe without touching code.
+          NEWS_ARCHIVE_UNIVERSE: ${{ vars.NEWS_ARCHIVE_UNIVERSE }}
+          NEWS_ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          python scripts/news_archive_collector.py \
+            --sheet-id "${TARGET_SHEET_ID}" \
+            --verbose
