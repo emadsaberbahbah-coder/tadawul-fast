@@ -446,7 +446,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.9.0"
+SCRIPT_VERSION = "6.10.0"
 SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias (preserved)
 SCRIPT_NAME = "PerformanceTracker"
 
@@ -2909,6 +2909,436 @@ class ReportGenerator:
 # =============================================================================
 # Orchestrator
 # =============================================================================
+# =============================================================================
+# BACKTEST HARNESS (Strategy: evidence-gating). v6.10.0
+# -----------------------------------------------------------------------------
+# A registered-hypothesis + forward-return backtest framework -- the GATE the
+# Strategy requires: a signal may only influence a recommendation once it is
+# registered as a hypothesis AND a backtest shows it had edge on historical data.
+#
+# WHAT IT TESTS NOW: the PRICE_STRUCTURE factors already shipped (flow / candle
+# structure). It re-runs the LIVE engine reads (analyze_flow /
+# analyze_candle_structure) on rolling historical OHLCV windows -- validating the
+# ACTUAL production logic, not a reimplementation -- and measures whether the
+# trigger (e.g. flow == STRONG_ACCUMULATION) preceded forward returns in the
+# hypothesised direction, vs the non-trigger baseline (the conditional lift).
+#
+# NO LOOKAHEAD: the trigger at day D is computed from bars[:D+1] only; the
+# forward return is measured D -> D+horizon. HONEST: a backtest measures PAST
+# edge, never a future guarantee. Results carry sample size + a Wilson hit-rate
+# CI + a Welch t-stat; a thin sample yields INSUFFICIENT_DATA, never a verdict.
+#
+# RESERVED: EVENT_SECTOR / THEME_ROTATION hypotheses are defined but NOT yet
+# testable -- they need a historical event/theme archive that does not exist
+# (news_intelligence is real-time, no archive). They plug into the SAME
+# run_backtest once such an archive accumulates.
+# =============================================================================
+
+
+class HypothesisType(str, Enum):
+    PRICE_STRUCTURE = "PRICE_STRUCTURE"
+    EVENT_SECTOR = "EVENT_SECTOR"        # reserved -- needs historical event archive
+    THEME_ROTATION = "THEME_ROTATION"    # reserved -- needs historical theme archive
+
+
+class HypothesisStatus(str, Enum):
+    REGISTERED = "REGISTERED"                 # never backtested
+    ACCEPTED = "ACCEPTED"                     # edge confirmed -> MAY influence a recommendation
+    REJECTED = "REJECTED"                     # backtested, no edge in the hypothesised direction
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"   # too few trigger events to decide
+    ERROR = "ERROR"                           # backtest could not run (e.g. no engine / no history)
+
+
+class HypothesisDirection(str, Enum):
+    BULLISH = "BULLISH"     # trigger should precede POSITIVE forward return
+    BEARISH = "BEARISH"     # trigger should precede NEGATIVE forward return
+
+
+# Default acceptance thresholds (env-overridable; per-run override via the CLI).
+_BT_MIN_SAMPLE = _env_int("BACKTEST_MIN_SAMPLE", 30, lo=5)
+_BT_MIN_EFFECT_BPS = _env_float("BACKTEST_MIN_EFFECT_BPS", 50.0)   # signal must beat baseline by >= this, signed by direction
+_BT_MIN_TSTAT = _env_float("BACKTEST_MIN_TSTAT", 2.0)             # ~95% one-sided significance
+_BT_DEFAULT_DAYS = _env_int("BACKTEST_HISTORY_DAYS", 730, lo=120, hi=5000)
+
+
+@dataclass
+class Hypothesis:
+    hypothesis_id: str
+    name: str
+    hypothesis_type: HypothesisType
+    source_field: str          # INTERNAL engine field the trigger reads (e.g. "flow", "candle_structure")
+    trigger_value: str         # value that fires the trigger (e.g. "STRONG_ACCUMULATION")
+    direction: HypothesisDirection
+    horizon_days: int = 20
+    min_sample: int = _BT_MIN_SAMPLE
+    min_effect_bps: float = _BT_MIN_EFFECT_BPS
+    min_tstat: float = _BT_MIN_TSTAT
+    # --- result fields (filled by run_backtest) ---
+    status: HypothesisStatus = HypothesisStatus.REGISTERED
+    sample_size: int = 0
+    hit_count: int = 0
+    hit_rate: float = 0.0
+    hit_rate_lo: float = 0.0
+    hit_rate_hi: float = 0.0
+    mean_signal_roi: float = 0.0
+    mean_baseline_roi: float = 0.0
+    effect_bps: float = 0.0
+    t_stat: float = 0.0
+    universe_size: int = 0
+    history_days: int = 0
+    last_backtest_utc: str = ""
+    notes: str = ""
+
+    @property
+    def key(self) -> str:
+        return self.hypothesis_id
+
+    def to_row(self) -> List[Any]:
+        return [
+            self.hypothesis_id, self.name, self.hypothesis_type.value,
+            self.source_field, self.trigger_value, self.direction.value,
+            self.horizon_days, self.min_sample, round(self.min_effect_bps, 1),
+            round(self.min_tstat, 2), self.status.value,
+            self.sample_size, self.hit_count, round(self.hit_rate, 1),
+            round(self.hit_rate_lo, 1), round(self.hit_rate_hi, 1),
+            round(self.mean_signal_roi, 3), round(self.mean_baseline_roi, 3),
+            round(self.effect_bps, 1), round(self.t_stat, 2),
+            self.universe_size, self.history_days, self.last_backtest_utc,
+            self.notes,
+        ]
+
+    @classmethod
+    def from_row(cls, row: List[Any], headers: List[str]) -> "Hypothesis":
+        hmap = {str(h).strip(): i for i, h in enumerate(headers)}
+
+        def g(name: str, default: Any = "") -> Any:
+            idx = hmap.get(name)
+            if idx is None or idx < 0 or idx >= len(row):
+                return default
+            return row[idx]
+
+        htype = _parse_enum_value(HypothesisType, g("Type"), HypothesisType.PRICE_STRUCTURE)
+        hdir = _parse_enum_value(HypothesisDirection, g("Direction"), HypothesisDirection.BULLISH)
+        hstat = _parse_enum_value(HypothesisStatus, g("Status"), HypothesisStatus.REGISTERED)
+        return cls(
+            hypothesis_id=_safe_str(g("Hypothesis ID")),
+            name=_safe_str(g("Name")),
+            hypothesis_type=htype,
+            source_field=_safe_str(g("Source Field")),
+            trigger_value=_safe_str(g("Trigger Value")),
+            direction=hdir,
+            horizon_days=int(_safe_float(g("Horizon (days)"), 20)),
+            min_sample=int(_safe_float(g("Min Sample"), _BT_MIN_SAMPLE)),
+            min_effect_bps=_safe_float(g("Min Effect (bps)"), _BT_MIN_EFFECT_BPS),
+            min_tstat=_safe_float(g("Min t-stat"), _BT_MIN_TSTAT),
+            status=hstat,
+            sample_size=int(_safe_float(g("Sample Size"), 0)),
+            hit_count=int(_safe_float(g("Hit Count"), 0)),
+            hit_rate=_safe_float(g("Hit Rate %"), 0.0),
+            hit_rate_lo=_safe_float(g("Hit Rate Lo %"), 0.0),
+            hit_rate_hi=_safe_float(g("Hit Rate Hi %"), 0.0),
+            mean_signal_roi=_safe_float(g("Mean Signal ROI %"), 0.0),
+            mean_baseline_roi=_safe_float(g("Mean Baseline ROI %"), 0.0),
+            effect_bps=_safe_float(g("Effect (bps)"), 0.0),
+            t_stat=_safe_float(g("t-stat"), 0.0),
+            universe_size=int(_safe_float(g("Universe Size"), 0)),
+            history_days=int(_safe_float(g("History Days"), 0)),
+            last_backtest_utc=_safe_str(g("Last Backtest (UTC)")),
+            notes=_safe_str(g("Notes")),
+        )
+
+
+def default_hypotheses() -> List[Hypothesis]:
+    """The flow + candle-structure factors already shipped, as registered
+    hypotheses to validate against history. STRONG reads only -- the high-
+    conviction tails where edge, if any, should be clearest."""
+    h = 20
+    return [
+        Hypothesis("FLOW_STRONG_ACCUM", "Flow strong accumulation precedes upside",
+                   HypothesisType.PRICE_STRUCTURE, "flow", "STRONG_ACCUMULATION",
+                   HypothesisDirection.BULLISH, horizon_days=h),
+        Hypothesis("FLOW_STRONG_DISTR", "Flow strong distribution precedes downside",
+                   HypothesisType.PRICE_STRUCTURE, "flow", "STRONG_DISTRIBUTION",
+                   HypothesisDirection.BEARISH, horizon_days=h),
+        Hypothesis("CANDLE_STRONG_BULL", "Structure strong-bullish precedes upside",
+                   HypothesisType.PRICE_STRUCTURE, "candle_structure", "STRONG_BULLISH",
+                   HypothesisDirection.BULLISH, horizon_days=h),
+        Hypothesis("CANDLE_STRONG_BEAR", "Structure strong-bearish precedes downside",
+                   HypothesisType.PRICE_STRUCTURE, "candle_structure", "STRONG_BEARISH",
+                   HypothesisDirection.BEARISH, horizon_days=h),
+    ]
+
+
+def _bt_bar_close(bar: Dict[str, Any]) -> Optional[float]:
+    """Adjusted close preferred (EODHD EOD), else close. Positive floats only."""
+    for k in ("adjusted_close", "adjclose", "close", "c"):
+        if isinstance(bar, dict) and bar.get(k) is not None:
+            v = _safe_float(bar.get(k), default=float("nan"))
+            if v == v and v > 0:
+                return v
+    return None
+
+
+def make_trigger_fn(hypothesis: Hypothesis) -> Optional[Callable[[List[Dict[str, Any]]], bool]]:
+    """Build the trigger evaluator that re-runs the LIVE engine read on a window
+    of bars and returns True when the engine field == the hypothesis trigger.
+    Imports the engine lazily; returns None if the engine is unavailable (caller
+    marks the hypothesis ERROR rather than crashing)."""
+    field = hypothesis.source_field
+    want = (hypothesis.trigger_value or "").strip().upper()
+    try:
+        if field == "flow":
+            from core.data_engine_v2 import analyze_flow as _read
+        elif field == "candle_structure":
+            from core.data_engine_v2 import analyze_candle_structure as _read
+        else:
+            return None
+    except Exception:
+        try:
+            if field == "flow":
+                from data_engine_v2 import analyze_flow as _read  # type: ignore
+            elif field == "candle_structure":
+                from data_engine_v2 import analyze_candle_structure as _read  # type: ignore
+            else:
+                return None
+        except Exception:
+            return None
+
+    def _trigger(bars: List[Dict[str, Any]]) -> bool:
+        try:
+            out = _read(bars)
+            return _safe_str(out.get(field)).upper() == want
+        except Exception:
+            return False
+
+    return _trigger
+
+
+def _welch_t(a: List[float], b: List[float]) -> float:
+    """Welch's t-statistic for mean(a) - mean(b). 0.0 when undefined."""
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return 0.0
+    ma = sum(a) / na
+    mb = sum(b) / nb
+    va = sum((x - ma) ** 2 for x in a) / (na - 1)
+    vb = sum((x - mb) ** 2 for x in b) / (nb - 1)
+    denom = math.sqrt(va / na + vb / nb)
+    if denom <= 0:
+        return 0.0
+    return (ma - mb) / denom
+
+
+def run_backtest(
+    hypothesis: Hypothesis,
+    history_by_symbol: Dict[str, List[Dict[str, Any]]],
+    trigger_fn: Optional[Callable[[List[Dict[str, Any]]], bool]] = None,
+    min_window: int = 12,
+) -> Hypothesis:
+    """Event-study backtest of a single hypothesis. PURE: takes per-symbol bar
+    history (date-ASCENDING EOD dicts) + a trigger_fn, returns a COPY of the
+    hypothesis with result fields filled. trigger_fn(bars[:D+1]) -> bool is
+    evaluated with NO lookahead; the forward horizon-day return is the outcome.
+    Signal days are compared against NON-trigger days (the conditional lift)."""
+    import copy as _copy
+    hyp = _copy.copy(hypothesis)
+    hyp.last_backtest_utc = _utc_now().isoformat()
+
+    if trigger_fn is None:
+        trigger_fn = make_trigger_fn(hypothesis)
+    if trigger_fn is None:
+        hyp.status = HypothesisStatus.ERROR
+        hyp.notes = "engine trigger unavailable (no analyze_%s)" % hypothesis.source_field
+        return hyp
+
+    h = max(1, int(hypothesis.horizon_days))
+    bullish = hypothesis.direction == HypothesisDirection.BULLISH
+    signal_rois: List[float] = []
+    baseline_rois: List[float] = []
+    universe = 0
+    max_hist = 0
+
+    for _sym, bars in (history_by_symbol or {}).items():
+        if not isinstance(bars, list) or len(bars) < (min_window + h + 1):
+            continue
+        max_hist = max(max_hist, len(bars))
+        closes = [_bt_bar_close(b) for b in bars]
+        universe += 1
+        for d in range(min_window, len(bars) - h):
+            c0 = closes[d]
+            ch = closes[d + h]
+            if c0 is None or ch is None or c0 <= 0:
+                continue
+            roi = (ch - c0) / c0 * 100.0   # percent
+            if trigger_fn(bars[: d + 1]):
+                signal_rois.append(roi)
+            else:
+                baseline_rois.append(roi)
+
+    hyp.universe_size = universe
+    hyp.history_days = max_hist
+    n = len(signal_rois)
+    hyp.sample_size = n
+
+    if n > 0:
+        hyp.mean_signal_roi = sum(signal_rois) / n
+    if baseline_rois:
+        hyp.mean_baseline_roi = sum(baseline_rois) / len(baseline_rois)
+
+    if n < max(1, hypothesis.min_sample):
+        hyp.status = HypothesisStatus.INSUFFICIENT_DATA
+        hyp.notes = "%d trigger events (< min %d); no verdict" % (n, hypothesis.min_sample)
+        return hyp
+
+    hyp.effect_bps = (hyp.mean_signal_roi - hyp.mean_baseline_roi) * 100.0   # 1% ROI = 100 bps
+    hits = sum(1 for r in signal_rois if (r > 0 if bullish else r < 0))
+    hyp.hit_count = hits
+    hyp.hit_rate = hits / n * 100.0
+    lo, hi = wilson_interval(hits, n)
+    hyp.hit_rate_lo, hyp.hit_rate_hi = lo, hi
+    hyp.t_stat = _welch_t(signal_rois, baseline_rois)
+
+    eff_ok = (hyp.effect_bps >= hypothesis.min_effect_bps) if bullish else (hyp.effect_bps <= -hypothesis.min_effect_bps)
+    t_ok = (hyp.t_stat >= hypothesis.min_tstat) if bullish else (hyp.t_stat <= -hypothesis.min_tstat)
+    if eff_ok and t_ok:
+        hyp.status = HypothesisStatus.ACCEPTED
+        hyp.notes = "edge confirmed: effect %+.0f bps, t=%+.2f, hit %.0f%% [%.0f-%.0f]" % (
+            hyp.effect_bps, hyp.t_stat, hyp.hit_rate, lo, hi)
+    else:
+        hyp.status = HypothesisStatus.REJECTED
+        hyp.notes = "no edge in direction: effect %+.0f bps, t=%+.2f (need %s%.0f bps & |t|>=%.1f)" % (
+            hyp.effect_bps, hyp.t_stat, "" if bullish else "-", hypothesis.min_effect_bps, hypothesis.min_tstat)
+    return hyp
+
+
+class HypothesisRegistry:
+    """Sheets-backed store for hypotheses + their latest backtest result.
+    Mirrors PerformanceStore's IO pattern (own tab Hypothesis_Registry).
+    Best-effort: the backtest still runs in-memory when gspread is unavailable."""
+    SHEET_DEFAULT = "Hypothesis_Registry"
+    START_ROW = 5
+    DATA_ROW0 = 6
+    HEADERS = [
+        "Hypothesis ID", "Name", "Type", "Source Field", "Trigger Value",
+        "Direction", "Horizon (days)", "Min Sample", "Min Effect (bps)",
+        "Min t-stat", "Status", "Sample Size", "Hit Count", "Hit Rate %",
+        "Hit Rate Lo %", "Hit Rate Hi %", "Mean Signal ROI %",
+        "Mean Baseline ROI %", "Effect (bps)", "t-stat", "Universe Size",
+        "History Days", "Last Backtest (UTC)", "Notes",
+    ]
+
+    def __init__(self, spreadsheet_id: str, sheet_name: str = ""):
+        self.spreadsheet_id = spreadsheet_id
+        self.sheet_name = sheet_name or self.SHEET_DEFAULT
+        self.backoff = FullJitterBackoff()
+        self.gc = None
+        self.sheet = None
+        self.ws = None
+        self._init_sheet()
+
+    def _load_sa_credentials_best_effort(self) -> Optional[Any]:
+        raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+        if not raw:
+            return None
+        s = raw
+        if not s.startswith("{"):
+            try:
+                dec = base64.b64decode(s).decode("utf-8", errors="replace").strip()
+                if dec.startswith("{"):
+                    s = dec
+            except Exception:
+                pass
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict) and service_account is not None:
+                return service_account.Credentials.from_service_account_info(
+                    obj, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        except Exception:
+            return None
+        return None
+
+    def _init_sheet(self) -> None:
+        if not GSPREAD_AVAILABLE or gspread is None:
+            return
+        try:
+            creds = self._load_sa_credentials_best_effort()
+            self.gc = gspread.authorize(creds) if creds else gspread.service_account()
+            self.sheet = self.gc.open_by_key(self.spreadsheet_id)
+            try:
+                self.ws = self.sheet.worksheet(self.sheet_name)
+            except Exception:
+                self.ws = self.sheet.add_worksheet(title=self.sheet_name, rows=200, cols=40)
+            self.backoff.execute_sync(self._ensure_headers)
+        except Exception as e:
+            logger.error("HypothesisRegistry init failed: %s", e)
+            self.gc = None
+            self.sheet = None
+            self.ws = None
+
+    def _ensure_headers(self) -> None:
+        if not self.ws:
+            return
+        try:
+            existing = self.ws.row_values(self.START_ROW)
+        except Exception:
+            existing = []
+        if [str(x).strip() for x in existing[: len(self.HEADERS)]] != self.HEADERS:
+            rng = _a1_range(1, self.START_ROW, len(self.HEADERS), self.START_ROW)
+            self.backoff.execute_sync(
+                lambda: self.ws.update(values=[self.HEADERS], range_name=rng))
+
+    def is_available(self) -> bool:
+        return self.ws is not None
+
+    def load(self) -> List["Hypothesis"]:
+        if not self.ws:
+            return []
+        try:
+            rows = self.ws.get_all_values()
+        except Exception:
+            return []
+        if len(rows) < self.DATA_ROW0:
+            return []
+        headers = rows[self.START_ROW - 1] if len(rows) >= self.START_ROW else self.HEADERS
+        out: List[Hypothesis] = []
+        for row in rows[self.DATA_ROW0 - 1:]:
+            if not any(str(c).strip() for c in row):
+                continue
+            try:
+                out.append(Hypothesis.from_row(row, headers))
+            except Exception:
+                continue
+        return out
+
+    def save(self, hypotheses: List["Hypothesis"]) -> bool:
+        if not self.ws:
+            return False
+        end_col = len(self.HEADERS)
+        data = [h.to_row() for h in hypotheses]
+
+        def _save() -> None:
+            self.ws.batch_clear([_a1_range(1, self.DATA_ROW0, end_col, 10000)])
+            if data:
+                self.ws.update(
+                    values=data,
+                    range_name=_a1_range(1, self.DATA_ROW0, end_col, self.DATA_ROW0 + len(data) - 1))
+
+        try:
+            self.backoff.execute_sync(_save)
+            return True
+        except Exception as e:
+            logger.error("Failed to save hypotheses: %s", e)
+            return False
+
+    def register_defaults(self, existing: Optional[List["Hypothesis"]] = None) -> List["Hypothesis"]:
+        """Merge default hypotheses in, preserving any already-present (by id)."""
+        cur = {h.hypothesis_id: h for h in (existing or [])}
+        for d in default_hypotheses():
+            if d.hypothesis_id not in cur:
+                cur[d.hypothesis_id] = d
+        return list(cur.values())
+
+
 class PerformanceTrackerApp:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -3599,6 +4029,128 @@ class PerformanceTrackerApp:
 
         return 0
 
+    # =========================================================================
+    # v6.10.0 BACKTEST HARNESS MODE (distinct from the forward-tracking path).
+    # Reads historical OHLCV (EODHD) + the LIVE engine reads; writes
+    # Hypothesis_Registry. Touches NEITHER Performance_Log NOR the record/audit
+    # flow -- this is the evidence gate the Strategy requires before any
+    # event/theme factor may influence a recommendation.
+    # =========================================================================
+    async def run_backtest_mode(self) -> int:
+        registry = HypothesisRegistry(
+            self.spreadsheet_id,
+            os.getenv("TRACK_HYPOTHESIS_SHEET", "Hypothesis_Registry"),
+        )
+        existing = registry.load() if registry.is_available() else []
+
+        if getattr(self.args, "register_hypotheses", False):
+            merged = registry.register_defaults(existing)
+            if registry.is_available():
+                registry.save(merged)
+            _out("[backtest] registered %d hypotheses (%d new)\n" % (
+                len(merged), max(0, len(merged) - len(existing))))
+            existing = merged
+
+        if not existing:
+            existing = default_hypotheses()
+            _out("[backtest] registry empty/unavailable -> %d in-memory defaults\n" % len(existing))
+
+        if getattr(self.args, "list_hypotheses", False) and not self.args.backtest:
+            for h in existing:
+                _out("  %-20s %-16s %-22s %-8s %s\n" % (
+                    h.hypothesis_id, h.hypothesis_type.value, h.trigger_value,
+                    h.direction.value, h.status.value))
+            return 0
+
+        if not self.args.backtest:
+            return 0
+
+        want_id = (getattr(self.args, "hypothesis", "") or "").strip().upper()
+        selected = [h for h in existing if (not want_id or h.hypothesis_id.upper() == want_id)]
+        testable = [h for h in selected if h.hypothesis_type == HypothesisType.PRICE_STRUCTURE]
+        for h in (h for h in selected if h.hypothesis_type != HypothesisType.PRICE_STRUCTURE):
+            _out("[backtest] SKIP %s (%s not yet testable -- needs a historical archive)\n" % (
+                h.hypothesis_id, h.hypothesis_type.value))
+        if not testable:
+            _out("[backtest] no testable (PRICE_STRUCTURE) hypotheses selected\n")
+            return 0
+
+        days = int(getattr(self.args, "backtest_days", 0) or _BT_DEFAULT_DAYS)
+        universe = self._backtest_universe()
+        _out("[backtest] fetching %d days history for %d symbols...\n" % (days, len(universe)))
+        history = await self._fetch_backtest_history(universe, days)
+        got = sum(1 for v in history.values() if v)
+        _out("[backtest] history fetched for %d/%d symbols\n" % (got, len(universe)))
+        if got == 0:
+            _out("[backtest] no history -> aborting (EODHD unavailable?)\n")
+            return 1
+
+        loop = asyncio.get_running_loop()
+        results: List[Hypothesis] = []
+        for h in testable:
+            res = await loop.run_in_executor(_get_executor(), run_backtest, h, history)
+            results.append(res)
+            _out("  %-20s %-18s n=%-5d hit=%.0f%% [%.0f-%.0f] eff=%+.0fbps t=%+.2f\n" % (
+                res.hypothesis_id, res.status.value, res.sample_size,
+                res.hit_rate, res.hit_rate_lo, res.hit_rate_hi,
+                res.effect_bps, res.t_stat))
+
+        if registry.is_available():
+            by_id = {h.hypothesis_id: h for h in existing}
+            for r in results:
+                by_id[r.hypothesis_id] = r
+            registry.save(list(by_id.values()))
+            _out("[backtest] results written to %s\n" % registry.sheet_name)
+
+        accepted = [r for r in results if r.status == HypothesisStatus.ACCEPTED]
+        _out("[backtest] ACCEPTED %d/%d (only ACCEPTED may influence a recommendation)\n" % (
+            len(accepted), len(results)))
+        return 0
+
+    def _backtest_universe(self) -> List[str]:
+        """Symbols to backtest over. Env TRACK_BACKTEST_UNIVERSE (CSV) or a
+        liquid KSA+US default for statistical power."""
+        env = _env_csv("TRACK_BACKTEST_UNIVERSE", None)
+        if env:
+            return [s.strip().upper() for s in env if s.strip()]
+        return [
+            "1120.SR", "2222.SR", "1180.SR", "2010.SR", "7010.SR", "1211.SR",
+            "4013.SR", "1010.SR", "2350.SR", "4002.SR",
+            "AAPL.US", "MSFT.US", "NVDA.US", "JPM.US", "INTC.US", "T.US",
+        ]
+
+    async def _fetch_backtest_history(
+        self, symbols: List[str], days: int
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Fetch long OHLCV history per symbol via the EODHD provider directly
+        (the backend exposes no history endpoint). Concurrency-limited; fail-soft
+        per symbol."""
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        _eod = None
+        for _modpath in ("core.providers.eodhd_provider", "eodhd_provider"):
+            try:
+                _eod = __import__(_modpath, fromlist=["fetch_history"])
+                break
+            except Exception:
+                continue
+        if _eod is None or not hasattr(_eod, "fetch_history"):
+            logger.error("eodhd_provider import failed -- cannot fetch history")
+            return out
+
+        sem = asyncio.Semaphore(max(1, _env_int("BACKTEST_CONCURRENCY", 6, lo=1, hi=16)))
+
+        async def _one(sym: str) -> None:
+            async with sem:
+                try:
+                    bars = await _eod.fetch_history(sym, days=days)
+                    if isinstance(bars, list) and bars:
+                        out[sym] = bars
+                except Exception as e:
+                    logger.warning("history fetch failed for %s: %s", sym, e)
+
+        await asyncio.gather(*[_one(s) for s in symbols], return_exceptions=True)
+        return out
+
     async def run_daemon(self) -> int:
         interval = max(30, int(self.args.interval or 3600))
         _out(f"Daemon mode ON (interval={interval}s). Press Ctrl+C to stop.")
@@ -3748,6 +4300,39 @@ def create_parser() -> argparse.ArgumentParser:
         default=_env_bool("TRACK_VERBOSE", False),
         help="Verbose logs (also TRACK_VERBOSE env).",
     )
+    p.add_argument(
+        "--backtest",
+        action="store_true",
+        default=_env_bool("TRACK_BACKTEST", False),
+        help=(
+            "Run the hypothesis backtest harness: a forward-return event study "
+            "on historical OHLCV that re-runs the live engine reads (flow / "
+            "candle structure) with no lookahead. Env TRACK_BACKTEST."
+        ),
+    )
+    p.add_argument(
+        "--register-hypotheses",
+        action="store_true",
+        default=_env_bool("TRACK_REGISTER_HYPOTHESES", False),
+        help="Seed the default flow/candle hypotheses into Hypothesis_Registry (idempotent).",
+    )
+    p.add_argument(
+        "--list-hypotheses",
+        action="store_true",
+        default=_env_bool("TRACK_LIST_HYPOTHESES", False),
+        help="List registered hypotheses + their latest status, then stop.",
+    )
+    p.add_argument(
+        "--hypothesis",
+        default=os.getenv("TRACK_HYPOTHESIS", "") or "",
+        help="Backtest only this hypothesis id (default: all testable).",
+    )
+    p.add_argument(
+        "--backtest-days",
+        type=int,
+        default=_env_int("BACKTEST_HISTORY_DAYS", 730, lo=120, hi=5000),
+        help="History window (days) for the backtest (default 730; env BACKTEST_HISTORY_DAYS).",
+    )
     return p
 
 
@@ -3759,7 +4344,8 @@ async def async_main() -> int:
     # If nothing selected, show help
     if not any(
         [args.record, args.audit, args.analyze, args.simulate, args.export,
-         args.calibrate, args.daemon]
+         args.calibrate, args.daemon, args.backtest, args.register_hypotheses,
+         args.list_hypotheses]
     ):
         _out(create_parser().format_help())
         return 0
@@ -3788,6 +4374,8 @@ async def async_main() -> int:
         pass
 
     try:
+        if args.backtest or args.register_hypotheses or args.list_hypotheses:
+            return await app.run_backtest_mode()
         if args.daemon:
             return await app.run_daemon()
         return await app.run_once()
@@ -3835,6 +4423,14 @@ __all__ = [
     "CalibrationReport",
     "ReliabilityCalibrator",
     "render_calibration_report",
+    "HypothesisType",
+    "HypothesisStatus",
+    "HypothesisDirection",
+    "Hypothesis",
+    "HypothesisRegistry",
+    "default_hypotheses",
+    "make_trigger_fn",
+    "run_backtest",
     "PerformanceTrackerApp",
     "create_parser",
     "main",
