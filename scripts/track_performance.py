@@ -22,6 +22,9 @@ status="success", 50 rows). Fixes here, all in the BackendClient fetch layer
     {"page": <page>}; advisor wants criteria).
   - EMPTY-200 FALL-THROUGH: a 200 with zero rows (a timed-out partial) no longer
     counts as success — it falls through to the next endpoint. Closes the
+  v6.10.1 D  Backtest history now routes yahoo_chart FIRST then EODHD (was
+             EODHD-only, which 404'd every .SR ticker and dropped the whole KSA
+             book). Bars date-sorted ascending for provider-safe no-lookahead.
     v6.4.0 gap where the first non-error response, even empty, stopped the chain.
   - Client fetch timeout raised 45s -> 100s (the full build exceeds 45s).
   - Fully reversible: TRACK_TOP10_ENDPOINTS / TRACK_TOP10_PAGE /
@@ -446,7 +449,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.10.0"
+SCRIPT_VERSION = "6.10.1"
 SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias (preserved)
 SCRIPT_NAME = "PerformanceTracker"
 
@@ -4122,31 +4125,93 @@ class PerformanceTrackerApp:
     async def _fetch_backtest_history(
         self, symbols: List[str], days: int
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """Fetch long OHLCV history per symbol via the EODHD provider directly
-        (the backend exposes no history endpoint). Concurrency-limited; fail-soft
-        per symbol."""
+        """Fetch long OHLCV history per symbol using the SAME provider preference
+        the live engine uses: yahoo_chart FIRST (serves Tadawul .SR with volume),
+        EODHD as fallback. The backend exposes no history endpoint.
+
+        v6.10.1: was EODHD-only -- EODHD returns 404 for every .SR ticker (no
+        Tadawul EOD coverage on this plan), which silently dropped the ENTIRE KSA
+        book from the backtest (only US names survived). Routing yahoo-first means
+        the backtest reads the same bars the live flow/candle path already sees,
+        so a verdict actually transfers to production. Each symbol's bars are
+        date-sorted ASCENDING so the no-lookahead walk is correct regardless of
+        provider ordering. Concurrency-limited; fail-soft per symbol and provider.
+        """
         out: Dict[str, List[Dict[str, Any]]] = {}
-        _eod = None
-        for _modpath in ("core.providers.eodhd_provider", "eodhd_provider"):
-            try:
-                _eod = __import__(_modpath, fromlist=["fetch_history"])
-                break
-            except Exception:
-                continue
-        if _eod is None or not hasattr(_eod, "fetch_history"):
-            logger.error("eodhd_provider import failed -- cannot fetch history")
+
+        # provider modules in engine-preference order; import lazily, tolerate
+        # absence of either.
+        provider_specs = [
+            ("core.providers.yahoo_chart_provider", "yahoo_chart_provider"),
+            ("core.providers.eodhd_provider", "eodhd_provider"),
+        ]
+        providers: List[Any] = []
+        for _dotted, _bare in provider_specs:
+            _mod = None
+            for _path in (_dotted, _bare):
+                try:
+                    _mod = __import__(_path, fromlist=["fetch_history"])
+                    break
+                except Exception:
+                    continue
+            if _mod is not None:
+                providers.append(_mod)
+        if not providers:
+            logger.error("no history provider importable -- cannot fetch history")
             return out
+
+        _hist_fns = ("fetch_history", "fetch_price_history", "fetch_ohlc_history")
+
+        def _sort_bars(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            # ISO 'YYYY-MM-DD' date strings sort lexically == chronologically.
+            try:
+                return sorted(
+                    bars,
+                    key=lambda r: str(
+                        (r or {}).get("date")
+                        or (r or {}).get("datetime")
+                        or (r or {}).get("timestamp")
+                        or ""
+                    ),
+                )
+            except Exception:
+                return bars
+
+        async def _fetch_from(mod: Any, sym: str) -> Optional[List[Dict[str, Any]]]:
+            for _fn_name in _hist_fns:
+                fn = getattr(mod, _fn_name, None)
+                if fn is None:
+                    continue
+                try:
+                    bars = await fn(sym, days=days)
+                except TypeError:
+                    try:
+                        bars = await fn(sym)
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+                if isinstance(bars, list) and bars:
+                    return bars
+            return None
 
         sem = asyncio.Semaphore(max(1, _env_int("BACKTEST_CONCURRENCY", 6, lo=1, hi=16)))
 
         async def _one(sym: str) -> None:
             async with sem:
-                try:
-                    bars = await _eod.fetch_history(sym, days=days)
-                    if isinstance(bars, list) and bars:
-                        out[sym] = bars
-                except Exception as e:
-                    logger.warning("history fetch failed for %s: %s", sym, e)
+                for mod in providers:
+                    try:
+                        bars = await _fetch_from(mod, sym)
+                    except Exception as e:
+                        logger.warning(
+                            "history fetch error %s via %s: %s",
+                            sym, getattr(mod, "__name__", mod), e,
+                        )
+                        bars = None
+                    if bars:
+                        out[sym] = _sort_bars(bars)
+                        return
+                logger.warning("no history for %s from any provider", sym)
 
         await asyncio.gather(*[_one(s) for s in symbols], return_exceptions=True)
         return out
