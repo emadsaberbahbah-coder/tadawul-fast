@@ -1,0 +1,73 @@
+name: backtest-harness
+
+# Weekly hypothesis backtest. Backtests are expensive and their inputs (years of
+# history) move slowly, so daily is wasteful -- weekly is plenty. Manual dispatch
+# is available any time. This is SEPARATE from track_performance.yml (the daily
+# forward-tracking clock); it only registers + backtests hypotheses and writes
+# the Hypothesis_Registry tab. It never touches Performance_Log.
+
+on:
+  schedule:
+    - cron: "0 13 * * 0"   # Sundays 13:00 UTC (16:00 Riyadh)
+  workflow_dispatch:
+    inputs:
+      sheet_id:
+        description: "Spreadsheet ID (blank -> DEFAULT_SPREADSHEET_ID variable)"
+        required: false
+        default: ""
+      hypothesis:
+        description: "Backtest only this hypothesis id (blank -> all testable)"
+        required: false
+        default: ""
+      backtest_days:
+        description: "History window in days (default 730)"
+        required: false
+        default: "730"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backtest-harness
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run backtest harness
+        env:
+          # Sheets write (Hypothesis_Registry) -- same secret as the daily tracker
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          # Spreadsheet target -- dispatch input wins, else the repo variable
+          DEFAULT_SPREADSHEET_ID: ${{ github.event.inputs.sheet_id != '' && github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
+          TRACK_SHEET_ID: ${{ github.event.inputs.sheet_id != '' && github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
+          # Historical OHLCV source -- EODHD is primary; REQUIRED for the backtest
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+          # Optional knobs (fall through to code defaults if unset)
+          BACKTEST_HISTORY_DAYS: ${{ github.event.inputs.backtest_days }}
+          TRACK_HYPOTHESIS: ${{ github.event.inputs.hypothesis }}
+          # Acceptance thresholds (documented; defaults shown)
+          BACKTEST_MIN_SAMPLE: "30"
+          BACKTEST_MIN_EFFECT_BPS: "50"
+          BACKTEST_MIN_TSTAT: "2.0"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python scripts/track_performance.py \
+            --register-hypotheses \
+            --backtest \
+            --verbose
