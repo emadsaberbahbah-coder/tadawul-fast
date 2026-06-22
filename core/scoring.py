@@ -209,7 +209,7 @@ logger.addHandler(logging.NullHandler())
 # Version / Canonical contract
 # =============================================================================
 
-__version__ = "5.8.0"
+__version__ = "5.9.0"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -523,6 +523,11 @@ class ScoreWeights:
     w_growth: float = _CONFIG.default_growth
     w_opportunity: float = _CONFIG.default_opportunity
     w_technical: float = _CONFIG.default_technical
+    # v5.9.0 (Flow factor): weight of the buyers-vs-sellers flow_score. Default
+    # 0.0 -> the flow factor is INERT and every weighted score is byte-identical
+    # to v5.8.0. compute_scores sets this (and renormalizes) only when
+    # TFB_FLOW_SCORE is on AND the row is a decision symbol carrying a flow read.
+    w_flow: float = 0.0
     risk_penalty_strength: float = _CONFIG.risk_penalty_strength
     confidence_penalty_strength: float = _CONFIG.confidence_penalty_strength
     confidence_penalty_neutral: float = _CONFIG.confidence_penalty_neutral
@@ -531,7 +536,8 @@ class ScoreWeights:
     def normalize(self) -> "ScoreWeights":
         total = (
             self.w_valuation + self.w_momentum + self.w_quality +
-            self.w_growth + self.w_opportunity + self.w_technical
+            self.w_growth + self.w_opportunity + self.w_technical +
+            self.w_flow
         )
         if total <= 0:
             return self
@@ -542,6 +548,7 @@ class ScoreWeights:
             w_growth=self.w_growth / total,
             w_opportunity=self.w_opportunity / total,
             w_technical=self.w_technical / total,
+            w_flow=self.w_flow / total,
             risk_penalty_strength=self.risk_penalty_strength,
             confidence_penalty_strength=self.confidence_penalty_strength,
             confidence_penalty_neutral=self.confidence_penalty_neutral,
@@ -556,6 +563,7 @@ class ScoreWeights:
             "growth_score": self.w_growth,
             "opportunity_score": self.w_opportunity,
             "technical_score": self.w_technical,
+            "flow_score": self.w_flow,
         }
 
 
@@ -1767,6 +1775,54 @@ def compute_momentum_score(row: Mapping[str, Any]) -> Optional[float]:
     return _apply_structural_momentum(row, base)
 
 
+# ---------------------------------------------------------------------------
+# v5.9.0 FLOW SCORING FACTOR (Strategy item (a) -- buyers vs sellers). The
+# engine's analyze_flow writes a CURRENT-STATE supply/demand read (the fused
+# bias) to the INTERNAL `flow` field. Here it is mapped to a 0-100 flow_score
+# and -- when enabled and the row is a decision symbol -- promoted to a
+# FIRST-CLASS, separately-weighted factor in compute_scores (w_flow, which
+# renormalizes the other weights). Kept a DISTINCT factor (not folded into
+# momentum) so its contribution is honestly weighted and fully auditable, and so
+# it does NOT double-count the structural candle read that already rides in
+# momentum. Default OFF -> compute_flow_score is never consulted and every score
+# is byte-identical to v5.8.0.
+# ---------------------------------------------------------------------------
+_FLOW_SCORE_MAP: Dict[str, float] = {
+    "STRONG_ACCUMULATION": 85.0,
+    "ACCUMULATION": 68.0,
+    "WEAK_ACCUMULATION": 56.0,   # buying not confirmed -> only mildly positive
+    "NEUTRAL": 50.0,
+    "WEAK_DISTRIBUTION": 44.0,
+    "DISTRIBUTION": 32.0,
+    "STRONG_DISTRIBUTION": 15.0,
+}
+
+
+def _flow_score_enabled() -> bool:
+    """v5.9.0: master switch for promoting the flow read to a weighted scoring
+    factor. Default OFF -> compute_scores leaves w_flow at 0.0 and overall_score
+    is byte-identical to v5.8.0. Requires the engine TFB_FLOW gate on (that is
+    what populates `flow`); a safe no-op when the field is absent."""
+    return _env_bool("TFB_FLOW_SCORE", False)
+
+
+def _flow_score_weight() -> float:
+    """v5.9.0: the weight w_flow the flow factor takes in the (renormalized)
+    overall_score blend when enabled. Default 0.10 (a refinement, not a driver),
+    clamped to a sane 0..0.5. Set TFB_FLOW_SCORE_WEIGHT to tune live (no redeploy)."""
+    return _clamp(_env_float("TFB_FLOW_SCORE_WEIGHT", 0.10), 0.0, 0.5)
+
+
+def compute_flow_score(row: Mapping[str, Any]) -> Optional[float]:
+    """Map the engine's fused flow bias (INTERNAL `flow` field) to a 0-100
+    score. Returns None for INSUFFICIENT / blank / unknown -> no flow factor
+    (the weight stays 0 and the blend is unaffected)."""
+    bias = _get(row, "flow", "flow_bias")
+    if bias is None:
+        return None
+    return _FLOW_SCORE_MAP.get(str(bias).strip().upper())
+
+
 def compute_risk_score(row: Mapping[str, Any]) -> Optional[float]:
     vol90 = _as_fraction(_get(row, "volatility_90d"))
     dd1y = _as_fraction(_get(row, "max_drawdown_1y"))
@@ -2594,6 +2650,19 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     rsi_val = _get_float(working, "rsi_14", "rsi", "rsi14")
     rsi_sig = rsi_signal(rsi_val)
 
+    # v5.9.0 (Flow factor): when enabled AND this is a decision symbol carrying a
+    # flow read, promote flow to a first-class weighted factor and RENORMALIZE the
+    # other weights (so the blend still sums to 1.0). OFF / non-decision symbol /
+    # no flow read -> flow_score is None, w_flow stays 0.0, and the base_parts
+    # blend below is byte-identical to v5.8.0.
+    flow_score = (
+        compute_flow_score(working)
+        if (_flow_score_enabled() and _is_decision_symbol_row(working))
+        else None
+    )
+    if flow_score is not None and weights.w_flow <= 0.0:
+        weights = replace(weights, w_flow=_flow_score_weight()).normalize()
+
     base_parts: List[Tuple[float, float]] = []
     if weights.w_technical > 0 and tech_score is not None:
         base_parts.append((weights.w_technical, tech_score / 100.0))
@@ -2607,6 +2676,8 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         base_parts.append((weights.w_growth, growth / 100.0))
     if weights.w_opportunity > 0 and opportunity is not None:
         base_parts.append((weights.w_opportunity, opportunity / 100.0))
+    if weights.w_flow > 0 and flow_score is not None:
+        base_parts.append((weights.w_flow, flow_score / 100.0))
 
     overall: Optional[float]
     overall_raw: Optional[float]
