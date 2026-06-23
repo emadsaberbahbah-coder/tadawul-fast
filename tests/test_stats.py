@@ -229,6 +229,40 @@ def test_outputs_json_serializable():
         json.dumps(obj)  # must not raise
 
 
+# --- Section 5b: magnitude / effect-size power --------------------------------
+
+def test_cohens_d_required_n_textbook():
+    # one-sample t, medium effect d=0.5, alpha .05 two-sided, power .8 -> ~34
+    assert abs(S.cohens_d_required_n(0.5) - 34) <= 2
+
+
+def test_min_detectable_cohens_d_roundtrip():
+    n = S.cohens_d_required_n(0.5)
+    d = S.min_detectable_cohens_d(n)
+    assert approx(d, 0.5, 0.03)
+
+
+def test_magnitude_testability():
+    # common trigger, ample events, medium effect -> testable
+    ok = S.magnitude_testability_report(total_windows=252, trigger_rate=0.20,
+                                        plausible_d=0.5)
+    assert ok["verdict"] == "TESTABLE"
+    # rare trigger -> too few events even for a medium effect
+    bad = S.magnitude_testability_report(total_windows=63, trigger_rate=0.03,
+                                         plausible_d=0.5)
+    assert bad["verdict"] == "UNTESTABLE_BY_DESIGN"
+
+
+def test_magnitude_far_more_powerful_than_proportion():
+    # same scenario: magnitude test needs far fewer events than the proportion test
+    n_mag = S.cohens_d_required_n(0.5)             # ~34 events
+    n_prop = S.required_n_two_prop(0.5, 0.6)       # ~388 events
+    assert n_mag < n_prop / 5
+
+
+# --- end magnitude tests ------------------------------------------------------
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0
