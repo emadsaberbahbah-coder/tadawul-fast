@@ -345,6 +345,30 @@ except Exception:  # pragma: no cover
 
 
 # =============================================================================
+# Wire 1 -- Guarded core.quality_gates import (cost-basis plausibility)
+# =============================================================================
+# Default-OFF data-trust gate. When TFB_QUALITY_GATES=1 and core.quality_gates
+# is importable, a holding whose cost basis is implausible vs its current price
+# is forced to a conservative HOLD with a "BLOCKED -- review cost basis" reason,
+# so an absurd cost basis can never read as ACCUMULATE/BUY. Scoped to holdings
+# (only runs when a real avg_cost is present); opportunity rows are unaffected.
+# Import is except-guarded; absence simply disables the gate (no behavior change).
+try:  # pragma: no cover - import availability depends on deployment package
+    from core.quality_gates import (  # type: ignore
+        cost_basis_plausibility as _cost_basis_plausibility,
+    )
+    _QUALITY_GATES_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _cost_basis_plausibility = None  # type: ignore[assignment]
+    _QUALITY_GATES_AVAILABLE = False
+
+
+def _quality_gates_on() -> bool:
+    # OFF by default -> byte-identical behavior until explicitly enabled.
+    return _QUALITY_GATES_AVAILABLE and _env_bool("TFB_QUALITY_GATES", False)
+
+
+# =============================================================================
 # Constants
 # =============================================================================
 
@@ -2088,6 +2112,33 @@ def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
     every existing call site, including data_engine_v2 fallback consumers.
     """
     symbol = _to_string(row.get("symbol") or row.get("ticker") or "") or "UNKNOWN"
+
+    # Wire 1 (TFB_QUALITY_GATES, default OFF): block an implausible cost basis
+    # BEFORE scoring, so a corrupt cost basis can never produce ACCUMULATE/BUY.
+    # Scoped to holdings -- only runs when a real avg_cost is present, so
+    # opportunity rows (no cost basis) are unaffected. Enum-safe: returns the
+    # canonical HOLD with the block surfaced in the reason text.
+    if _quality_gates_on() and not _is_blank(row.get("avg_cost")):
+        try:
+            _cb = _cost_basis_plausibility(
+                row.get("avg_cost"),
+                row.get("current_price"),
+                quantity=row.get("position_qty"),
+            )
+            if _cb.get("verdict") == "BLOCKED":
+                _block_reason = str(_cb.get("reason", ""))
+                if isinstance(row, MutableMapping):
+                    row["cost_basis_block_reason"] = _block_reason
+                logger.warning(
+                    "[QUALITY_GATES] symbol=%s cost-basis BLOCKED method=%s",
+                    symbol, _cb.get("method"),
+                )
+                return RECO_HOLD, "HOLD: BLOCKED -- review cost basis | " + _block_reason, 0.0
+        except Exception as _exc:  # never let the gate break advising
+            logger.warning(
+                "[QUALITY_GATES] symbol=%s gate skipped error=%s",
+                symbol, type(_exc).__name__,
+            )
 
     # v5.4.0 FIX: Extract canonical scoring inputs.
     overall = _get_score(row, "overall_score", "score", "overall", "totalscore", "compositeScore")
