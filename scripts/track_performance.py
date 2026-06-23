@@ -5,6 +5,24 @@ scripts/track_performance.py
 TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.9.0)
 ===========================================================
 
+Why this revision (v6.12.0 vs v6.11.0)
+--------------------------------------
+INFORMATION COEFFICIENT (disclosure-only, env-gated default OFF). The reliability
+calibrator already reports a Brier score, per-band realized win-rates, a binary
+band-monotonicity flag, and an INVESTABLE-vs-WATCHLIST CI discrimination test --
+but nothing that measures, continuously, whether the engine's own `entry_score`
+rank-orders realized returns. v6.12.0 adds exactly that: a Spearman rank
+correlation of entry_score vs realized_roi over DECIDED records, with a t-stat
+and t-distribution p-value (reused from core.stats.information_coefficient, which
+ships in the same commit). It is strictly more data-efficient than hit-rate -- it
+uses every decided pick, not only STRONG-labelled ones -- which directly helps the
+current small-sample regime. ENTIRELY ADDITIVE and disclosure-only: it feeds NO
+recommendation, score, gate, or reliability number, mirroring the existing
+"measure, never auto-apply" calibration stance. Gated behind TFB_HARNESS_IC
+(default OFF); computed only when core.stats is importable and there are >= 3
+decided outcomes, otherwise the report's IC fields stay None and every other
+metric is byte-identical. Reverts by leaving TFB_HARNESS_IC unset.
+
 Why this revision (v6.9.0 vs v6.8.0)
 -------------------------------------
 TOP10 FETCH REPOINT — the calibration clock was recording ZERO picks despite
@@ -449,7 +467,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.11.0"
+SCRIPT_VERSION = "6.12.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -660,6 +678,22 @@ try:
     import google_sheets_service as sheets_service  # type: ignore
 except Exception:
     sheets_service = None
+
+# core.stats -- Information Coefficient for the reliability calibrator (v6.12.0).
+# Best-effort, in the same style as the project imports above and AFTER the path
+# setup. If core.stats is not importable (e.g. this file run in isolation), IC is
+# simply not computed and every other calibration metric is unaffected.
+# Disclosure-only: it changes no recommendation, score, or gate.
+try:
+    from core.stats import information_coefficient as _information_coefficient  # type: ignore
+    _IC_AVAILABLE = True
+except Exception:
+    try:
+        from stats import information_coefficient as _information_coefficient  # type: ignore
+        _IC_AVAILABLE = True
+    except Exception:
+        _information_coefficient = None  # type: ignore
+        _IC_AVAILABLE = False
 
 
 # =============================================================================
@@ -1379,6 +1413,13 @@ class CalibrationReport:
     by_horizon: List[CalibrationBucket] = field(default_factory=list)
     monotonic_reliability: Optional[bool] = None
     discrimination_note: str = ""
+    # v6.12.0: Information Coefficient -- rank-correlation of entry_score vs
+    # realized_roi across decided records (disclosure-only; stays None unless
+    # TFB_HARNESS_IC is enabled and there are >= 3 decided outcomes).
+    information_coefficient: Optional[float] = None
+    ic_t_stat: Optional[float] = None
+    ic_p_value: Optional[float] = None
+    ic_n: int = 0
     signal_trend_mix: Dict[str, int] = field(default_factory=dict)
     advisory_note: str = ""
 
@@ -2665,6 +2706,43 @@ class ReliabilityCalibrator:
         disc = self._discrimination(inv_map.get("INVESTABLE"), inv_map.get("WATCHLIST"))
         brier = self._brier(matured)
 
+        # v6.12.0: Information Coefficient (disclosure-only, env-gated default OFF).
+        # Rank-correlation of the continuous entry_score against realized_roi over
+        # DECIDED records -- a more data-efficient "does the score carry signal?"
+        # measure than the binary band-monotonicity flag, using every decided pick
+        # rather than only STRONG-labelled ones. Never feeds any recommendation,
+        # score, gate, or reliability number.
+        ic_val: Optional[float] = None
+        ic_t: Optional[float] = None
+        ic_p: Optional[float] = None
+        ic_n: int = 0
+        if (_IC_AVAILABLE and _information_coefficient is not None
+                and _env_bool("TFB_HARNESS_IC", False)):
+            _ic_scores: List[float] = []
+            _ic_rets: List[float] = []
+            for r in matured:
+                rr = r.realized_roi
+                if rr is None or rr == 0.0:
+                    continue  # decided-only, mirroring _brier
+                _ic_scores.append(_safe_float(r.entry_score, 0.0))
+                _ic_rets.append(_safe_float(rr, 0.0))
+            if len(_ic_scores) >= 3:
+                try:
+                    _ic_res = _information_coefficient(_ic_scores, _ic_rets)
+                    _raw = _ic_res.get("ic")
+                    if isinstance(_raw, (int, float)) and _raw == _raw:  # finite, NaN-safe
+                        ic_val = round(float(_raw), 4)
+                        _t = _ic_res.get("t_stat")
+                        _p = _ic_res.get("p_value")
+                        ic_t = (round(float(_t), 3)
+                                if isinstance(_t, (int, float)) and _t == _t else None)
+                        ic_p = (round(float(_p), 4)
+                                if isinstance(_p, (int, float)) and _p == _p else None)
+                        ic_n = int(_ic_res.get("n", len(_ic_scores)) or 0)
+                except Exception:
+                    ic_val = ic_t = ic_p = None
+                    ic_n = 0
+
         if not matured:
             headline = (
                 "INSUFFICIENT EVIDENCE -- 0 matured records. The engine's stated "
@@ -2700,6 +2778,10 @@ class ReliabilityCalibrator:
             by_horizon=by_hz,
             monotonic_reliability=monotonic,
             discrimination_note=disc,
+            information_coefficient=ic_val,
+            ic_t_stat=ic_t,
+            ic_p_value=ic_p,
+            ic_n=ic_n,
             signal_trend_mix=dict(signal_mix or {}),
             advisory_note=self._ADVISORY,
         )
@@ -2750,6 +2832,15 @@ def render_calibration_report(rep: CalibrationReport, verbose: bool = False) -> 
         _out("  NOT monotonic: stated reliability does not cleanly separate winners here.")
     else:
         _out("  monotonicity: insufficient populated bands to assess.")
+    if rep.information_coefficient is not None:
+        _sig = ""
+        if rep.ic_p_value is not None:
+            _sig = " (p<0.05, significant)" if rep.ic_p_value < 0.05 else " (n.s.)"
+        _out(
+            f"  Information Coefficient (entry_score vs realized_roi): "
+            f"{rep.information_coefficient:+.4f} over n={rep.ic_n}{_sig} -- "
+            f"rank-correlation; >0 means higher scores ranked higher returns."
+        )
     if verbose:
         _out("")
         _out("By recommendation tier:")
