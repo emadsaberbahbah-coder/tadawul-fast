@@ -2,10 +2,23 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization — v5.3.1 (ENTERPRISE ALIGNED + METADATA INFERENCE)
+Symbol Normalization — v5.3.2 (ENTERPRISE ALIGNED + METADATA INFERENCE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
+
+v5.3.2 (over v5.3.1):
+- FIX to_yahoo_symbol() US dual-class shares: BRK.B / BF.B / HEI.A / CRD.A are
+  canonicalized to the DOT form, but Yahoo/yfinance uses the DASH form (BRK-B).
+  to_yahoo_symbol now converts the unambiguous LETTERS.LETTER share-class pattern
+  to dashes, but ONLY when split_symbol_exchange found NO exchange suffix -- so
+  foreign single-letter suffixes (VOD.L / RIO.L) keep their dot and are never
+  affected. This matters because to_yahoo_symbol is the provider-routing SSOT
+  used by data_engine_v2 (v5.68.0) and yahoo_fundamentals_provider, so the dot
+  form was reaching live Yahoo lookups for class-share names (e.g. BRK-B).
+  Env-gated DEFAULT OFF (TFB_YAHOO_SHARE_CLASS_DASH=1); with the flag unset the
+  output is byte-identical to v5.3.1. Validate one ticker (e.g. BRK-B) on Render,
+  then enable.
 
 v5.3.1 hotfix (over v5.3.0):
 - FIX commodity Yahoo formatting: GC=F no longer becomes GC=F=F.
@@ -44,7 +57,7 @@ except Exception:
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-__version__ = "5.3.1"
+__version__ = "5.3.2"
 
 __all__ = [
     "MarketType",
@@ -256,6 +269,12 @@ KSA_TADAWUL_RE = re.compile(r"^TADAWUL:(\d{3,6})(\.SR)?$", re.IGNORECASE)
 ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$", re.IGNORECASE)
 CUSIP_RE = re.compile(r"^[0-9A-Z]{9}$", re.IGNORECASE)
 SEDOL_RE = re.compile(r"^[0-9BCDFGHJKLMNPQRSTVWXYZ]{7}$", re.IGNORECASE)
+
+# v5.3.2: US dual-class share pattern (BRK.B / BF.B / HEI.A / CRD.A). Yahoo uses
+# the DASH form for these (BRK-B). to_yahoo_symbol converts ONLY this exact
+# pattern, and ONLY when no exchange suffix was detected (see to_yahoo_symbol),
+# so foreign single-letter suffixes (VOD.L, RIO.L) are never touched.
+US_SHARE_CLASS_DOT_RE = re.compile(r"^[A-Z]{1,5}\.[A-Z]$", re.IGNORECASE)
 
 OCC_OPTION_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$", re.IGNORECASE)
 
@@ -1202,6 +1221,19 @@ def to_yahoo_symbol(symbol: str) -> str:
         yahoo_ex = _EODHD_TO_YAHOO_SUFFIX.get(ex.upper())
         if yahoo_ex:
             return f"{base}.{yahoo_ex}"
+
+    # v5.3.2: US dual-class shares use the DASH form on Yahoo (BRK.B -> BRK-B).
+    # normalize_symbol canonicalizes to the DOT form, but Yahoo/yfinance expects
+    # the dash. Reached ONLY when split_symbol_exchange found no exchange suffix
+    # (ex is falsy); foreign single-letter suffixes (VOD.L, RIO.L) carry a real
+    # ex and returned above, so they are never touched here. Convert ONLY the
+    # unambiguous LETTERS.LETTER share-class pattern, so every other fallthrough
+    # symbol (AAPL, ^GSPC, ...) is byte-identical. Env-gated DEFAULT OFF
+    # (TFB_YAHOO_SHARE_CLASS_DASH=1): validate one ticker (e.g. BRK-B) on Render,
+    # then enable. Reversible: unset the flag -> v5.3.1 output exactly.
+    if (not ex) and _env_bool("TFB_YAHOO_SHARE_CLASS_DASH", False) \
+            and US_SHARE_CLASS_DOT_RE.match(s):
+        return s.replace(".", "-")
 
     return s
 
