@@ -2,9 +2,9 @@
 # Foundation test CI for the statistics + decision-layer modules.
 #
 # WHY THIS EXISTS
-#   core/stats.py, core/quality_gates.py and scripts/calibrator.py are verified
-#   today, but nothing runs their suites automatically — the next unrelated
-#   change could silently break them. This job keeps the foundations green.
+#   core/stats.py and core/quality_gates.py are verified today, but nothing runs
+#   their suites automatically — the next unrelated change could silently break
+#   them. This job keeps the foundations green.
 #
 # WHY THE INSTALL IS DELIBERATELY LEAN
 #   Only numpy (the production pin) + pytest are installed — no scipy, gspread,
@@ -13,9 +13,17 @@
 #   absent) that run in the lean web image. If these pass with nothing but
 #   numpy, they pass everywhere.
 #
-#   It runs ONLY the three foundation suites, not the whole tests/ directory,
-#   so it does not pull in the heavy live-dependent tests (pandas, credentials,
+#   It runs ONLY the foundation suites, not the whole tests/ directory, so it
+#   does not pull in the heavy live-dependent tests (pandas, credentials,
 #   provider I/O). Those belong to a separate, heavier workflow.
+#
+# MAINTENANCE NOTE
+#   Earlier revisions also gated core/investment_advisor.py + scripts/calibrator.py
+#   and their suites (test_calibrator.py, test_advisor_cost_basis_gate.py). Those
+#   modules/tests were removed from the repo (calibrator superseded by the live
+#   ReliabilityCalibrator in scripts/track_performance.py; the orphaned advisor
+#   module deleted). All references to them are dropped here so the workflow no
+#   longer fails on missing files.
 
 name: foundations-tests
 
@@ -24,23 +32,15 @@ on:
     paths:
       - 'core/stats.py'
       - 'core/quality_gates.py'
-      - 'core/investment_advisor.py'
-      - 'scripts/calibrator.py'
       - 'tests/test_stats.py'
       - 'tests/test_quality_gates.py'
-      - 'tests/test_calibrator.py'
-      - 'tests/test_advisor_cost_basis_gate.py'
       - '.github/workflows/tests.yml'
   pull_request:
     paths:
       - 'core/stats.py'
       - 'core/quality_gates.py'
-      - 'core/investment_advisor.py'
-      - 'scripts/calibrator.py'
       - 'tests/test_stats.py'
       - 'tests/test_quality_gates.py'
-      - 'tests/test_calibrator.py'
-      - 'tests/test_advisor_cost_basis_gate.py'
   workflow_dispatch: {}
 
 jobs:
@@ -61,7 +61,7 @@ jobs:
           python -m pip install "numpy>=1.26.4,<2.0.0" pytest
 
       - name: Syntax gate (compile foundations)
-        run: python -m py_compile core/stats.py core/quality_gates.py core/investment_advisor.py scripts/calibrator.py
+        run: python -m py_compile core/stats.py core/quality_gates.py
 
       - name: Run foundation test suites
         env:
@@ -69,6 +69,4 @@ jobs:
         run: |
           python -m pytest -q \
             tests/test_stats.py \
-            tests/test_quality_gates.py \
-            tests/test_calibrator.py \
-            tests/test_advisor_cost_basis_gate.py
+            tests/test_quality_gates.py
