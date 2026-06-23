@@ -1,5 +1,5 @@
 # ============================================================================
-# TADAWUL FAST BRIDGE -- RENDER BLUEPRINT (v1.1.0)
+# TADAWUL FAST BRIDGE -- RENDER BLUEPRINT (v1.1.1)
 # ============================================================================
 # Aligned with:
 #   - main.py v8.11.1        (SERVICE_VERSION, LOG_JSON reader, canonical auth)
@@ -7,6 +7,19 @@
 #   - env.py v7.8.1          (feature flags, cache backend, percent mode)
 #   - worker.py v4.3.0       (SERVICE_VERSION cross-module alias)
 #   - Procfile, start_web.sh (canonical entrypoints)
+#
+# Changes vs v1.1.0
+# -----------------
+#   [HIGH]   FIX silent no-op env vars: GUNICORN_KEEPALIVE -> UVICORN_KEEPALIVE
+#            and GUNICORN_TIMEOUT -> TFB_TIMEOUT. start_web.sh v2.6.0 reads the
+#            UVICORN_*/TFB_* names, NOT GUNICORN_*, so the old keys were set but
+#            never applied. Effect: keepalive now honors the intended 30s (was
+#            silently defaulting to 10s); timeout unchanged (180 == the default).
+#            Same class as the v1.1.0 JSON_LOGS / credentials fixes.
+#   [LOW]    Bumped APP_VERSION / SERVICE_VERSION 8.11.1 -> 8.11.2 to match the
+#            deployed main.py v8.11.2.
+#   [INFO]   REDIS_HOST / REDIS_PORT are redundant (app connects via REDIS_URL);
+#            left in place as harmless diagnostics.
 #
 # Changes vs v1.0.0 (uploaded baseline)
 # --------------------------------------
@@ -120,12 +133,12 @@ services:
       - key: APP_NAME
         value: Tadawul Fast Bridge
       - key: APP_VERSION
-        value: "8.11.1"
+        value: "8.11.2"
       # v1.1.0: cross-module canonical alias (main.py v8.11.1, config.py v7.3.0,
       # env.py v7.8.1, worker.py v4.3.0). env.py from_env() reads this as a
       # fallback for APP_VERSION too.
       - key: SERVICE_VERSION
-        value: "8.11.1"
+        value: "8.11.2"
       - key: TZ
         value: Asia/Riyadh
 
@@ -152,9 +165,9 @@ services:
       # ----------------------------------------------------------------------
       - key: WEB_CONCURRENCY
         value: "2"
-      - key: GUNICORN_TIMEOUT
+      - key: TFB_TIMEOUT
         value: "180"
-      - key: GUNICORN_KEEPALIVE
+      - key: UVICORN_KEEPALIVE
         value: "30"
 
       # ----------------------------------------------------------------------
