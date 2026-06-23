@@ -38,6 +38,25 @@ DESIGN PRINCIPLES (same as core.stats / the Calibrator)
 * Thresholds are documented heuristics, NOT magic numbers; the principled
   cost-basis check (MAD vs a price history) is preferred when history is given,
   with the ratio check as the assumption-light fallback.
+
+CHANGELOG
+---------
+v1.0.1
+  - Field-map aligned to the live row schema (Phase 1 of adoption). This module
+    is NOT yet on the live decision path, so this is config-only and changes no
+    running behavior. Specifically:
+      * dq_score now resolves the primary live field "data_quality_score"
+        (previously only "data_quality"/"quality_score" matched, so the actual
+        column would have been missed on a live row).
+      * sparse_flag now also recognizes the engine's banded "low_data_trust"
+        tag (data_engine_v2 v5.88.0), so a row the engine already marks
+        low-trust is excluded here too.
+    NOTE: the live schema carries no quote-age-in-hours field, so the (soft)
+    freshness check is currently a no-op by design -- left in place for
+    forward-compatibility, not a defect.
+v1.0.0
+  - Initial data-trust & plausibility decision layer (cost_basis_plausibility,
+    trust_level, evaluate_holding).
 """
 
 from __future__ import annotations
@@ -49,7 +68,7 @@ try:
 except Exception:  # pragma: no cover - standalone/test fallback
     import stats as st  # type: ignore
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # =============================================================================
 # CONFIG  ===  CONFIRM AGAINST THE LIVE ROW SCHEMA
@@ -64,10 +83,11 @@ DEFAULT_FIELD_MAP: Dict[str, List[str]] = {
     "avg_cost": ["avg_cost", "cost_basis", "average_cost", "buy_price",
                  "entry_price", "cost"],
     "quantity": ["quantity", "qty", "shares", "position_qty", "units", "position"],
-    "dq_score": ["dq", "data_quality", "dq_score", "quality_score", "dqscore"],
+    "dq_score": ["data_quality_score", "dq", "data_quality", "dq_score",
+                 "quality_score", "dqscore", "data_quality_band"],
     "age_hours": ["age_hours", "quote_age_hours", "staleness_hours"],
     "sparse_flag": ["sparse", "momentum_only", "is_sparse", "data_sparse",
-                    "fallback", "momentum_only_fallback"],
+                    "fallback", "momentum_only_fallback", "low_data_trust"],
     "fundamentals_present": ["fundamentals_present", "has_fundamentals"],
 }
 
