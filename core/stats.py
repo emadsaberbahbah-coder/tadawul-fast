@@ -68,7 +68,7 @@ except Exception:
     _scipy_stats = None  # type: ignore
     SCIPY_AVAILABLE = False
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     # distribution helpers
@@ -91,6 +91,10 @@ __all__ = [
     "min_detectable_effect",
     "effective_sample_size",
     "testability_report",
+    # power / testability — magnitude (CAR event studies)
+    "cohens_d_required_n",
+    "min_detectable_cohens_d",
+    "magnitude_testability_report",
     # signal strength
     "information_coefficient",
     # calibration
@@ -608,6 +612,91 @@ def testability_report(total_windows: float, trigger_rate: float, base_rate: flo
         "total_windows": float(total_windows),
         "trigger_rate": float(trigger_rate),
         "base_rate": float(base_rate),
+        "alpha": float(alpha),
+        "power": float(power),
+        "recommendation": rec,
+    }
+
+
+# -----------------------------------------------------------------------------
+# 5b) Magnitude / effect-size power  ===  FOR CAR EVENT STUDIES
+# -----------------------------------------------------------------------------
+# testability_report() above models a PROPORTION test (does the post-event
+# directional hit-rate differ from baseline). A news->sector event study is far
+# more powerful when it tests CAR MAGNITUDE (a one-sample t-test on cumulative
+# abnormal returns), because it uses how much the sector moved, not just the
+# sign. These helpers plan that magnitude test via Cohen's d = mean_CAR / sd_CAR.
+
+def cohens_d_required_n(d: float, alpha: float = 0.05, power: float = 0.8,
+                        two_sided: bool = True) -> float:
+    """
+    Number of events needed for a one-sample t-test to detect a standardized
+    effect size `d` (= mean CAR / cross-sectional sd of CAR) at the given alpha
+    and power. Normal approximation with the standard small-sample correction.
+    Returns +inf for d == 0.
+    """
+    d = abs(float(d))
+    if d == 0.0:
+        return float("inf")
+    za = normal_ppf(1.0 - alpha / 2.0) if two_sided else normal_ppf(1.0 - alpha)
+    zb = normal_ppf(power)
+    n = ((za + zb) / d) ** 2 + (za * za) / 2.0
+    return math.ceil(n)
+
+
+def min_detectable_cohens_d(n: float, alpha: float = 0.05, power: float = 0.8,
+                            two_sided: bool = True) -> float:
+    """
+    Smallest standardized effect size detectable with `n` events at the given
+    power (inverse of cohens_d_required_n). NaN if n is too small to support any
+    effect.
+    """
+    n = float(n)
+    za = normal_ppf(1.0 - alpha / 2.0) if two_sided else normal_ppf(1.0 - alpha)
+    zb = normal_ppf(power)
+    denom = n - (za * za) / 2.0
+    if denom <= 0:
+        return _NAN
+    return (za + zb) / math.sqrt(denom)
+
+
+def magnitude_testability_report(total_windows: float, trigger_rate: float,
+                                 plausible_d: float, alpha: float = 0.05,
+                                 power: float = 0.8, two_sided: bool = True
+                                 ) -> Dict[str, Any]:
+    """
+    Pre-registration gate for a CAR-magnitude event-study hypothesis — the
+    magnitude analogue of testability_report(). Combines the effective number of
+    events with the minimum detectable Cohen's d to deliver a verdict.
+
+    plausible_d is the smallest standardized CAR effect worth detecting (e.g.
+    0.5 = a medium, reasonably consistent sector response).
+
+    Returns dict: verdict ("TESTABLE" | "UNTESTABLE_BY_DESIGN"), effective_n,
+    min_detectable_d, plausible_d, required_n, and a recommendation.
+    """
+    n_eff = effective_sample_size(total_windows, trigger_rate)
+    mdd = min_detectable_cohens_d(n_eff, alpha, power, two_sided)
+    required = cohens_d_required_n(plausible_d, alpha, power, two_sided)
+    testable = math.isfinite(mdd) and (mdd <= plausible_d)
+    verdict = "TESTABLE" if testable else "UNTESTABLE_BY_DESIGN"
+    if testable:
+        rec = ("A CAR effect of the plausible size is detectable with the "
+               "expected number of events.")
+    else:
+        rec = ("Underpowered for the magnitude test: accumulate more events "
+               "(longer window or a more common trigger), or this only resolves "
+               "for a larger, more consistent effect. Test CAR magnitude, not "
+               "direction — it needs far fewer events.")
+    return {
+        "verdict": verdict,
+        "testable": bool(testable),
+        "effective_n": float(n_eff),
+        "min_detectable_d": (None if not math.isfinite(mdd) else float(mdd)),
+        "plausible_d": float(plausible_d),
+        "required_n": (None if not math.isfinite(required) else float(required)),
+        "total_windows": float(total_windows),
+        "trigger_rate": float(trigger_rate),
         "alpha": float(alpha),
         "power": float(power),
         "recommendation": rec,
