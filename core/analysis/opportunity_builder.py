@@ -1,9 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.11  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.0.12  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering, both env-gated DEFAULT-OFF)
+
+v1.0.12 [ENGINE-ROI-AUDIT — surface the engine's normalized 12M forecast on
+every candidates_rows audit record via one new field, engine_roi_pct, so the
+GAS audit grid can render an "Engine ROI %" column across ALL QUALIFIED /
+CANDIDATES instead of only on the 8 selected tickets. The value is the SAME
+normalization the Forecast gate tests against (_engine_roi_to_pct of
+engine_roi_12m_pct), so the column equals the number the gate compares to
+min_engine_roi_pct — making the gate floor tunable from the visible
+target-vs-forecast divergence rather than a guess. PURELY ADDITIVE: exactly
+one dict key added to the per-candidate audit record; ZERO functions added or
+removed; ZERO gate / scoring / sizing / selection / ordering change; output is
+byte-identical except for the new key. Missing/unparseable forecast => None
+(renders blank), never invents a number.]
 
 v1.0.11 [MARKET-CAP CANONICALIZATION — diversification correctness fix.
 THE BUG: the per-market cap (criteria max_per_market) keyed market_counts on
@@ -298,7 +311,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.11"
+OPPORTUNITY_BUILDER_VERSION = "1.0.12"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1909,6 +1922,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                                " vs " + str(ff["required"])) if ff else None,
             "structural_block": structural_block,
             "engine_gate": cand["engine_gate"],
+            "engine_roi_pct": _round1(_engine_roi_to_pct(cand["engine_roi_12m_pct"])),
             "selected": False,
             "deferral": None,
             "_cand": cand,
