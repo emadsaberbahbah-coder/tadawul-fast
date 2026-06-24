@@ -1,9 +1,31 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.9   (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.0.11  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering, both env-gated DEFAULT-OFF)
+
+v1.0.11 [MARKET-CAP CANONICALIZATION — diversification correctness fix.
+THE BUG: the per-market cap (criteria max_per_market) keyed market_counts on
+the raw market string, so the SAME venue written two ways — "NYSE/NASDAQ" vs
+"NASDAQ/NYSE" — landed in two separate buckets and each filled its own cap.
+Live evidence (full-universe run, max_per_market=4): SELECTED held 6 US names
+(TTEK/UHS/BAH/GPOR as "NYSE/NASDAQ" = 4, plus META/NVDA as "NASDAQ/NYSE" = 2),
+bypassing the cap of 4 and starving non-US diversification. THE FIX: a new
+canonical cap key _market_cap_key() splits the market on "/", trims+uppercases
+each token, sorts, and rejoins, so both spellings map to one bucket; single-
+token markets (SAU, Tokyo, HKEX, ...) are unaffected. ONLY the cap counter key
+is canonicalized — the DISPLAYED market string (cand["market"], every rendered
+row) is byte-identical, so no schema/column/display change. Env-gated with a
+KILL-SWITCH, DEFAULT ON (TFB_OPP_CANON_MARKET, set =0 to restore byte-identical
+v1.0.10 per-spelling counting). One helper + one gate added (2 new defs); all
+v1.0.10 functions carried verbatim, none removed. Nothing else changes:
+scoring, sizing, gates, ordering, KPIs, near-miss, alerts, and the audit cap
+are all untouched.]
+
+v1.0.10 [AUDIT-CAP — env-gated written-audit ceiling (TFB_OPP_AUDIT_ROWS_MAX,
+DEFAULT 0 = unlimited = byte-identical v1.0.9); see the inline block at the
+candidates_rows assembly. No selection/scoring/sizing change.]
 
 v1.0.9 [UNFUNDED-WATCH + ENGINE-ROI-ORDERING — two Phase-1 corrections, each
 env-gated and DEFAULT OFF; OFF => byte-identical v1.0.8 selection, sizing,
@@ -244,6 +266,12 @@ ENV KILL-SWITCHES (policy block — read per call, not at import)
                                  inside the GAS/Sheets write limit. Decisions
                                  are unaffected — only the low-score tail is
                                  dropped from the WRITTEN audit.
+  TFB_OPP_CANON_MARKET     "1"   v1.0.11: KILL-SWITCH, default ON. Canonicalizes
+                                 the per-market cap key so a venue written two
+                                 ways ("NYSE/NASDAQ" vs "NASDAQ/NYSE") counts as
+                                 ONE market against max_per_market. "0" restores
+                                 byte-identical v1.0.10 per-spelling counting.
+                                 The displayed market string is never altered.
 Explicit `criteria` overrides > env > defaults.
 
 INTEGRATION
@@ -270,7 +298,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.10"
+OPPORTUNITY_BUILDER_VERSION = "1.0.11"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -640,6 +668,15 @@ def _env_rank_by_engine_roi():
     return str(_env_str(
         "TFB_OPP_RANK_BY_ENGINE_ROI", "0")).strip().lower() in (
         "1", "true", "yes", "on", "enabled", "enable")
+
+
+def _env_canon_market():
+    """v1.0.11: per-market cap canonicalization toggle. KILL-SWITCH, default ON;
+    set TFB_OPP_CANON_MARKET=0 to restore byte-identical v1.0.10 behavior (the
+    per-market diversification cap keys on the raw market string, so a venue
+    written two ways counts as two separate markets)."""
+    return str(_env_str("TFB_OPP_CANON_MARKET", "1")).strip().lower() not in (
+        "0", "false", "no", "off")
 
 
 def _env_overrides():
@@ -1493,6 +1530,21 @@ def _funds_from(suggested, cash_left, proceeds_left):
     return label, cash_left - from_cash, proceeds_left - from_proceeds
 
 
+def _market_cap_key(market):
+    """v1.0.11: canonical key for the per-market diversification cap so the same
+    venue written two ways (e.g. 'NYSE/NASDAQ' vs 'NASDAQ/NYSE') counts as ONE
+    market. Splits on '/', trims+uppercases each token, sorts, and rejoins;
+    single-token markets are returned trimmed+uppercased unchanged. This affects
+    ONLY the cap counter key — the displayed market string is never altered."""
+    s = "" if market is None else str(market)
+    parts = [p.strip().upper() for p in s.split("/")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return s.strip().upper()
+    parts.sort()
+    return "/".join(parts)
+
+
 def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     """L2 cap + §4.2 diversification (selection-time, defer) + §4.4 sizing.
     Returns (tickets_raw, deferrals{symbol: reason})."""
@@ -1502,6 +1554,7 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     cash_left, proceeds_left = pf["cash"], pf["proceeds"]
 
     sector_counts, market_counts = {}, {}
+    canon_market = _env_canon_market()  # v1.0.11 kill-switch (default ON)
     pf_sector_sar = dict(sector_ctx["sectors"])
     picked, deferrals = [], {}
 
@@ -1509,13 +1562,16 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         if len(picked) >= criteria["max_selected"]:
             break
         sec, mkt = cand["sector"], cand["market"]
+        # v1.0.11: canonical cap key so "NYSE/NASDAQ" and "NASDAQ/NYSE" count as
+        # one market (kill-switch off => raw string, byte-identical v1.0.10).
+        mkt_key = _market_cap_key(mkt) if canon_market else mkt
         if sector_counts.get(sec, 0) >= criteria["max_per_sector"]:
             deferrals[cand["symbol"]] = (
                 "Diversification: sector cap " +
                 str(criteria["max_per_sector"]) + "/" +
                 str(criteria["max_per_sector"]) + " (" + sec + ")")
             continue
-        if market_counts.get(mkt, 0) >= criteria["max_per_market"]:
+        if market_counts.get(mkt_key, 0) >= criteria["max_per_market"]:
             deferrals[cand["symbol"]] = (
                 "Diversification: market cap reached (" + mkt + ")")
             continue
@@ -1536,7 +1592,7 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
             suggested, cash_left, proceeds_left)
         remaining -= suggested
         sector_counts[sec] = sector_counts.get(sec, 0) + 1
-        market_counts[mkt] = market_counts.get(mkt, 0) + 1
+        market_counts[mkt_key] = market_counts.get(mkt_key, 0) + 1
         pf_sector_sar[sec] = pf_sector_sar.get(sec, 0.0) + suggested
         picked.append({"cand": cand, "suggested_sar": suggested,
                        "suggested_shares": shares,
