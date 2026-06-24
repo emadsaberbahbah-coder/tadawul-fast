@@ -237,6 +237,13 @@ ENV KILL-SWITCHES (policy block — read per call, not at import)
   TFB_OPP_MAX_DATA_AGE_HOURS "168" v1.0.6: last_updated older ⇒ stale ⇒ fail
   TFB_OPP_MIN_TRUST_FIELDS "2"   v1.0.6: fewer core signals present ⇒ thin ⇒ fail
   TFB_OPP_INVESTABILITY_GATE "0" v1.0.8: "1" ⇒ add Investability MAJOR gate (opt-in)
+  TFB_OPP_AUDIT_ROWS_MAX   "0"   v1.0.10: 0 = unlimited; >0 caps the written
+                                 candidates_rows audit grid to N highest-score
+                                 rows (selected / INVEST-qualified / near-miss
+                                 always kept) so a full-universe scan stays
+                                 inside the GAS/Sheets write limit. Decisions
+                                 are unaffected — only the low-score tail is
+                                 dropped from the WRITTEN audit.
 Explicit `criteria` overrides > env > defaults.
 
 INTEGRATION
@@ -263,7 +270,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.9"
+OPPORTUNITY_BUILDER_VERSION = "1.0.10"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -442,6 +449,16 @@ DEFAULT_CRITERIA = {
     # first. OFF => byte-identical v1.0.8 ordering (opportunity_score primary).
     # A missing/unparseable engine forecast sorts last (never invents a rank).
     "rank_by_engine_roi_enabled": False,
+    # v1.0.10: DEFAULT 0 = unlimited (byte-identical). When >0, the
+    # candidates_rows audit grid that GAS writes back to the sheet is capped
+    # to this many rows so a full-universe scan stays inside the GAS/Sheets
+    # write limit. The cap is applied AFTER `selected`, `near_miss`, `alerts`
+    # and the `scanned` KPI are computed from the FULL pool, and it ALWAYS
+    # retains every selected, INVEST-qualified and near-miss row plus the next
+    # highest-score rows up to the cap — only the low-score DO_NOT_INVEST /
+    # WATCH tail is dropped from the WRITTEN audit. SELECTED / ALL-QUALIFIED /
+    # NEAR-MISS are never truncated. 0 => byte-identical v1.0.9 (full audit).
+    "audit_rows_max": 0,
 }
 
 _CRITERIA_FLOAT_KEYS = (
@@ -453,7 +470,7 @@ _CRITERIA_FLOAT_KEYS = (
 _CRITERIA_INT_KEYS = (
     "max_selected", "period_months", "max_per_sector", "max_per_market",
     "lot_size", "near_miss_n", "review_days", "max_candidates",
-    "min_trust_fields",
+    "min_trust_fields", "audit_rows_max",
 )
 _CRITERIA_BOOL_KEYS = (
     "allow_conflict", "allow_negative_news", "allow_negative_sector",
@@ -665,6 +682,8 @@ def _env_overrides():
         "investability_gate_enabled": _env_investability_gate(),
         "unfunded_watch_enabled": _env_unfunded_watch(),
         "rank_by_engine_roi_enabled": _env_rank_by_engine_roi(),
+        "audit_rows_max": _env_int("TFB_OPP_AUDIT_ROWS_MAX",
+                                   DEFAULT_CRITERIA["audit_rows_max"]),
     }
 
 
@@ -1946,6 +1965,28 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     audit.sort(key=lambda a: (-(a["opportunity_score"] or 0.0), a["symbol"]))
     for a in audit:
         a.pop("_cand", None)
+
+    # v1.0.10 [AUDIT-CAP]: optional ceiling on the WRITTEN candidates_rows
+    # audit grid so a full-universe scan stays inside the GAS/Sheets write
+    # limit. `selected` (tickets), `near_miss`, `alerts` and kpis["scanned"]
+    # above were all computed from the FULL pool, so capping here shrinks ONLY
+    # the written audit. Every selected, INVEST-qualified and near-miss row is
+    # retained; remaining slots are filled by the next highest-scoring rows, so
+    # the only rows dropped are the low-score DO_NOT_INVEST / WATCH tail.
+    # 0 => unlimited (byte-identical v1.0.9 — full audit returned).
+    _audit_cap = crit.get("audit_rows_max") or 0
+    if _audit_cap > 0 and len(audit) > _audit_cap:
+        _nm_syms = {r.get("symbol") for r in near_miss if isinstance(r, dict)}
+        _keep_syms = set(selected_syms) | set(unfunded_syms) | _nm_syms
+        _must, _rest = [], []
+        for a in audit:
+            if a.get("symbol") in _keep_syms or a.get("verdict") == VERDICT_INVEST:
+                _must.append(a)
+            else:
+                _rest.append(a)
+        _room = _audit_cap - len(_must)
+        audit = _must + (_rest[:_room] if _room > 0 else [])
+        audit.sort(key=lambda a: (-(a["opportunity_score"] or 0.0), a["symbol"]))
 
     meta_in = upstream_meta or {}
     meta = {
