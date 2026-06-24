@@ -1,330 +1,158 @@
-# ============================================================================
-# TADAWUL FAST BRIDGE -- RENDER BLUEPRINT (v1.1.1)
-# ============================================================================
-# Aligned with:
-#   - main.py v8.11.1        (SERVICE_VERSION, LOG_JSON reader, canonical auth)
-#   - config.py v7.3.0       (8-value _TRUTHY/_FALSY, auth env vars)
-#   - env.py v7.8.1          (feature flags, cache backend, percent mode)
-#   - worker.py v4.3.0       (SERVICE_VERSION cross-module alias)
-#   - Procfile, start_web.sh (canonical entrypoints)
+name: 📰 TFB News Archive Collector
+
+# =============================================================================
+# Forward-collection clock for Strategy items (b) news->sector and (c) theme
+# rotation. Runs news_archive_collector.py ONCE DAILY, snapshots per-symbol
+# sentiment for a STABLE universe, and APPENDS one row/symbol/day to the
+# News_Archive tab. Idempotent per Riyadh-date (safe to re-run / re-trigger).
 #
-# Changes vs v1.1.0
-# -----------------
-#   [HIGH]   FIX silent no-op env vars: GUNICORN_KEEPALIVE -> UVICORN_KEEPALIVE
-#            and GUNICORN_TIMEOUT -> TFB_TIMEOUT. start_web.sh v2.6.0 reads the
-#            UVICORN_*/TFB_* names, NOT GUNICORN_*, so the old keys were set but
-#            never applied. Effect: keepalive now honors the intended 30s (was
-#            silently defaulting to 10s); timeout unchanged (180 == the default).
-#            Same class as the v1.1.0 JSON_LOGS / credentials fixes.
-#   [LOW]    Bumped APP_VERSION / SERVICE_VERSION 8.11.1 -> 8.11.2 to match the
-#            deployed main.py v8.11.2.
-#   [INFO]   REDIS_HOST / REDIS_PORT are redundant (app connects via REDIS_URL);
-#            left in place as harmless diagnostics.
+# Standalone: writes to Google Sheets directly via gspread; does NOT call the
+# backend, so it works even if the Render service is asleep or mid-deploy.
 #
-# Changes vs v1.0.0 (uploaded baseline)
-# --------------------------------------
-#   [CRITICAL] JSON_LOGS -> LOG_JSON (main.py/config.py read LOG_JSON, the old
-#              name silently did NOTHING).
-#   [CRITICAL] GOOGLE_SERVICE_ACCOUNT_JSON -> GOOGLE_SHEETS_CREDENTIALS
-#              (env.py v7.8.1 doesn't recognize the old name; Google Sheets
-#              auth was failing silently). See migration notes at end.
-#   [CRITICAL] Added FUNDAMENTALS_ENABLED="true". Default in env.py is False;
-#              unset means all P/E, Market Cap, Sector, ROE columns render as
-#              blank in Google Sheets output.
-#   [HIGH]     Added CACHE_BACKEND=redis. Default is "memory"; with Redis
-#              provisioned but the flag unset, the service paid for Redis but
-#              never used it.
-#   [HIGH]     Added SERVICE_VERSION (cross-module canonical alias).
-#   [MEDIUM]   Made COMPUTATIONS/SCORING/TECHNICALS/FORECASTING explicit
-#              (defaults already true but explicit = audit-friendly).
-#   [MEDIUM]   Added TFB_PERCENT_MODE=points explicit.
-#   [MEDIUM]   Added DEFAULT_SPREADSHEET_ID (sync:false).
-#   [MEDIUM]   Added buildFilter to skip rebuilds on docs-only changes.
-#   [LOW]      Added AUTH_HEADER_NAME explicit.
-#   [LOW]      Added BACKUP_APP_TOKEN (sync:false) for zero-downtime rotation.
-#   [LOW]      Added APP_VERSION to match SERVICE_VERSION.
-#   [LOW]      Added PRESTART_MOUNT_ROUTES / INIT_ENGINE_ON_BOOT explicit.
-#   [LOW]      Added ROUTES_STRICT_IMPORT=false (explicit default; flip to
-#              "true" once you've verified all routes mount cleanly).
-#   [INFO]     Added header comment block + inline section comments.
+# WHY: news_intelligence produces sentiment in real time and discards it. You
+# cannot backtest "negative sector news precedes underperformance" or "a theme
+# precedes rotation" without a HISTORICAL series. This is that series. Value
+# accrues over months -- once enough banks, (b)/(c) run through the same
+# run_backtest gate as Performance_Log and only THEN may move a recommendation.
+# Every day not collected is a day of history you never get back.
 #
-# Preserved from v1.0.0
-# ---------------------
-#   - Redis keyvalue service (Frankfurt, starter plan, allkeys-lru)
-#   - Web service (python runtime, Frankfurt, starter plan, main branch)
-#   - Build command (pip upgrade + install + chmod +x)
-#   - startCommand: ./scripts/start_web.sh
-#   - healthCheckPath: /readyz
-#   - autoDeployTrigger: commit
-#   - Redis URL/host/port wired via fromService
-#   - All sync:false secrets (APP_TOKEN, API keys)
-#   - PYTHONUNBUFFERED, PIP_NO_CACHE_DIR, WEB_CONCURRENCY, GUNICORN_* tuning
-# ============================================================================
+# REQUIRED GitHub config (the first two ALREADY EXIST for daily_sync.yml):
+#   secrets.GOOGLE_SHEETS_CREDENTIALS   service-account JSON (raw or base64)
+#   vars.DEFAULT_SPREADSHEET_ID         production spreadsheet id
+#   vars.NEWS_ARCHIVE_UNIVERSE          OPTIONAL stable symbol list (space or
+#                                       comma separated). Unset -> the script's
+#                                       built-in 16-symbol KSA+US default is used.
+# =============================================================================
 
-previews:
-  generation: off
+on:
+  # Daily at 17:00 UTC = 20:00 Riyadh (after KSA close, into the US session).
+  # Adjust the time freely; consistency matters more than the exact hour.
+  schedule:
+    - cron: "0 17 * * *"
 
-services:
+  # Manual trigger. Run with dry_run=true the FIRST time to verify the fetch
+  # without writing to the sheet, then run normally (or wait for the schedule).
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (fetch + print sentiment, NO sheet write)"
+        required: false
+        default: false
+        type: boolean
+      universe:
+        description: "Override universe for this run (space/comma separated)"
+        required: false
+        type: string
 
-  # --------------------------------------------------------------------------
-  # Redis keyvalue store (used by cache backend + deduplication)
-  # --------------------------------------------------------------------------
-  - type: keyvalue
-    name: tadawul-fast-bridge-redis
-    region: frankfurt
-    plan: starter
-    ipAllowList: []
-    maxmemoryPolicy: allkeys-lru
+concurrency:
+  group: news-archive-${{ github.ref }}
+  cancel-in-progress: false
 
-  # --------------------------------------------------------------------------
-  # Web service -- FastAPI entrypoint (main.py)
-  # --------------------------------------------------------------------------
-  - type: web
-    name: tadawul-fast-bridge
-    runtime: python
-    branch: main
-    region: frankfurt
-    plan: starter
-    rootDir: .
-    autoDeployTrigger: commit
+permissions:
+  contents: read
 
-    # v1.1.0: skip rebuilds on docs-only + example-file commits to save
-    # build minutes and deploy time.
-    buildFilter:
-      paths:
-        - "**/*.py"
-        - "requirements.txt"
-        - "requirements-*.txt"
-        - "pyproject.toml"
-        - "poetry.lock"
-        - "uv.lock"
-        - "scripts/**/*.sh"
-        - "scripts/**/*.py"
-        - "render.yaml"
-        - "Procfile"
-        - "runtime.txt"
-        - ".python-version"
-      ignoredPaths:
-        - "**/*.md"
-        - "docs/**"
-        - "**/*.example.*"
-        - ".env.example"
-        - ".gitignore"
-        - ".github/**"
-        - "notebooks/**"
-        - "data/samples/**"
-        - "data/examples/**"
+defaults:
+  run:
+    shell: bash
 
-    buildCommand: |
-      python -m pip install --upgrade pip setuptools wheel
-      pip install -r requirements.txt
-      chmod +x scripts/start_web.sh
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: "1"
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
-    startCommand: ./scripts/start_web.sh
-    healthCheckPath: /readyz
+jobs:
+  collect-news-archive:
+    name: 📰 Collect daily news sentiment
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
 
-    envVars:
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
 
-      # ----------------------------------------------------------------------
-      # Core app identity
-      # ----------------------------------------------------------------------
-      - key: APP_ENV
-        value: production
-      - key: APP_NAME
-        value: Tadawul Fast Bridge
-      - key: APP_VERSION
-        value: "8.11.2"
-      # v1.1.0: cross-module canonical alias (main.py v8.11.1, config.py v7.3.0,
-      # env.py v7.8.1, worker.py v4.3.0). env.py from_env() reads this as a
-      # fallback for APP_VERSION too.
-      - key: SERVICE_VERSION
-        value: "8.11.2"
-      - key: TZ
-        value: Asia/Riyadh
+      - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+            requirements.ml.txt
 
-      # ----------------------------------------------------------------------
-      # Python runtime tuning
-      # ----------------------------------------------------------------------
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: PYTHONDONTWRITEBYTECODE
-        value: "1"
-      - key: PIP_NO_CACHE_DIR
-        value: "1"
+      - name: 📦 Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f "requirements.render.txt" ]; then
+            python -m pip install -r requirements.render.txt
+          elif [ -f "requirements.txt" ]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "::error::No requirements file found (requirements.render.txt or requirements.txt)."
+            exit 1
+          fi
+          # The collector writes via gspread + google-auth; ensure both exist.
+          python -c "import gspread, google.auth" 2>/dev/null \
+            || python -m pip install -q gspread google-auth
 
-      # ----------------------------------------------------------------------
-      # Logging (v1.1.0 FIX: JSON_LOGS -> LOG_JSON)
-      # ----------------------------------------------------------------------
-      - key: LOG_LEVEL
-        value: INFO
-      - key: LOG_JSON
-        value: "true"
+      - name: 📰 Run News Archive Collector
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          NEWS_ARCHIVE_UNIVERSE: ${{ vars.NEWS_ARCHIVE_UNIVERSE }}
+          NEWS_ARCHIVE_SHEET: News_Archive
+          # Scheduled runs ALWAYS write; the manual dry_run input overrides below.
+          NEWS_ARCHIVE_DRY_RUN: "false"
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_UNIVERSE: ${{ github.event.inputs.universe }}
+        run: |
+          set -euo pipefail
 
-      # ----------------------------------------------------------------------
-      # Gunicorn / Uvicorn concurrency
-      # ----------------------------------------------------------------------
-      - key: WEB_CONCURRENCY
-        value: "2"
-      - key: TFB_TIMEOUT
-        value: "180"
-      - key: UVICORN_KEEPALIVE
-        value: "30"
+          if [[ -z "${GOOGLE_SHEETS_CREDENTIALS:-}" ]]; then
+            echo "::error::secrets.GOOGLE_SHEETS_CREDENTIALS is empty -- set it in repo/environment secrets."
+            exit 1
+          fi
+          if [[ -z "${DEFAULT_SPREADSHEET_ID:-}" ]]; then
+            echo "::error::vars.DEFAULT_SPREADSHEET_ID is empty -- set it in repo variables."
+            exit 1
+          fi
 
-      # ----------------------------------------------------------------------
-      # Redis connection (auto-populated from the keyvalue service above)
-      # ----------------------------------------------------------------------
-      - key: REDIS_URL
-        fromService:
-          type: keyvalue
-          name: tadawul-fast-bridge-redis
-          property: connectionString
-      - key: REDIS_HOST
-        fromService:
-          type: keyvalue
-          name: tadawul-fast-bridge-redis
-          property: host
-      - key: REDIS_PORT
-        fromService:
-          type: keyvalue
-          name: tadawul-fast-bridge-redis
-          property: port
+          # Locate the collector (repo root or scripts/).
+          if [ -f "news_archive_collector.py" ]; then
+            COLLECTOR="news_archive_collector.py"
+          elif [ -f "scripts/news_archive_collector.py" ]; then
+            COLLECTOR="scripts/news_archive_collector.py"
+          else
+            echo "::error::news_archive_collector.py not found (looked in root and scripts/)."
+            exit 1
+          fi
+          echo "📄 Collector: $COLLECTOR"
 
-      # v1.1.0: use Redis for the app cache since it's provisioned above.
-      # env.py v7.8.1 validate() warns if CACHE_BACKEND=redis but REDIS_URL
-      # is missing, so this pairing is the explicit-correct setup.
-      - key: CACHE_BACKEND
-        value: redis
+          CMD=(python "$COLLECTOR" --sheet-id "$DEFAULT_SPREADSHEET_ID")
 
-      # ----------------------------------------------------------------------
-      # Feature flags (v1.1.0: explicit values per env.py v7.8.1 audit)
-      # ----------------------------------------------------------------------
-      # CRITICAL: FUNDAMENTALS_ENABLED default is False in env.py. Without
-      # this set to "true", all fundamentals (P/E, Market Cap, Sector, ROE,
-      # etc.) render as BLANK in Google Sheets output.
-      - key: FUNDAMENTALS_ENABLED
-        value: "true"
-      - key: COMPUTATIONS_ENABLED
-        value: "true"
-      - key: SCORING_ENABLED
-        value: "true"
-      - key: TECHNICALS_ENABLED
-        value: "true"
-      - key: FORECASTING_ENABLED
-        value: "true"
-      - key: AI_ANALYSIS_ENABLED
-        value: "true"
-      - key: ADVANCED_ANALYSIS_ENABLED
-        value: "true"
-      - key: ADVISOR_ENABLED
-        value: "true"
+          # Manual DRY-RUN override (the schedule never sets this).
+          if [[ "${INPUT_DRY_RUN:-false}" == "true" ]]; then
+            CMD+=(--dry-run)
+            echo "🧪 Manual DRY-RUN -- no sheet write this run."
+          fi
 
-      # Percent display format used by setup_sheet_headers v1 +
-      # downstream sheet rendering. "points" (e.g., 125) vs "fraction" (1.25).
-      - key: TFB_PERCENT_MODE
-        value: points
+          # Optional per-run universe override (commas normalized to spaces).
+          if [[ -n "${INPUT_UNIVERSE:-}" ]]; then
+            UNI="${INPUT_UNIVERSE//,/ }"
+            # shellcheck disable=SC2206
+            EXTRA=(${UNI})
+            CMD+=(--universe "${EXTRA[@]}")
+            echo "🎯 Universe override: ${EXTRA[*]}"
+          fi
 
-      # ----------------------------------------------------------------------
-      # Rate limiting + HTTP tuning (explicit defaults for audit)
-      # ----------------------------------------------------------------------
-      - key: RATE_LIMIT_ENABLED
-        value: "true"
-      - key: MAX_REQUESTS_PER_MINUTE
-        value: "240"
-      - key: HTTP_TIMEOUT_SEC
-        value: "45"
-
-      # ----------------------------------------------------------------------
-      # FastAPI entrypoint behavior (main.py v8.11.1)
-      # ----------------------------------------------------------------------
-      - key: PRESTART_MOUNT_ROUTES
-        value: "true"
-      - key: INIT_ENGINE_ON_BOOT
-        value: "true"
-      # Flip to "true" once you've verified all route modules mount cleanly
-      # on a previous deploy. Leaving "false" keeps boots non-fatal on route
-      # mounting edge cases.
-      - key: INIT_ENGINE_STRICT
-        value: "false"
-      - key: ROUTES_STRICT_IMPORT
-        value: "false"
-      - key: ENABLE_SWAGGER
-        value: "true"
-      - key: ENABLE_REDOC
-        value: "true"
-
-      # ----------------------------------------------------------------------
-      # Auth configuration
-      # ----------------------------------------------------------------------
-      - key: AUTH_HEADER_NAME
-        value: X-APP-TOKEN
-      - key: REQUIRE_AUTH
-        value: "true"
-      - key: OPEN_MODE
-        value: "false"
-      - key: ALLOW_QUERY_TOKEN
-        value: "false"
-      - key: APP_TOKEN
-        sync: false
-      # Optional rotation token -- both APP_TOKEN and BACKUP_APP_TOKEN are
-      # accepted simultaneously, enabling zero-downtime key rotation.
-      - key: BACKUP_APP_TOKEN
-        sync: false
-
-      # ----------------------------------------------------------------------
-      # Provider API keys (all sync:false -- set in the Render dashboard)
-      # ----------------------------------------------------------------------
-      - key: EODHD_API_KEY
-        sync: false
-      - key: FINNHUB_API_KEY
-        sync: false
-      - key: ALPHA_VANTAGE_API_KEY
-        sync: false
-      # Optional additional providers (env.py auto-detects ENABLED_PROVIDERS
-      # based on which keys are present; no need to set ENABLED_PROVIDERS
-      # explicitly unless you want a specific order).
-      # - key: FMP_API_KEY
-      #   sync: false
-      # - key: TWELVEDATA_API_KEY
-      #   sync: false
-      # - key: MARKETSTACK_API_KEY
-      #   sync: false
-
-      # KSA-region providers (auto-detected if URLs are set)
-      # - key: ARGAAM_QUOTE_URL
-      #   sync: false
-      # - key: TADAWUL_QUOTE_URL
-      #   sync: false
-
-      # ----------------------------------------------------------------------
-      # OpenAI (currently unused by any TFB module -- kept for future work)
-      # ----------------------------------------------------------------------
-      - key: OPENAI_API_KEY
-        sync: false
-
-      # ----------------------------------------------------------------------
-      # Google Sheets integration
-      # (v1.1.0 FIX: GOOGLE_SERVICE_ACCOUNT_JSON -> GOOGLE_SHEETS_CREDENTIALS)
-      # env.py v7.8.1 resolve_google_credentials() accepts these keys:
-      #   GOOGLE_CREDENTIALS_DICT, GOOGLE_SHEETS_CREDENTIALS, GOOGLE_CREDENTIALS,
-      #   GOOGLE_SHEETS_CREDENTIALS_B64, GOOGLE_CREDENTIALS_B64,
-      #   GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_SHEETS_CREDENTIALS_FILE,
-      #   GOOGLE_CREDENTIALS_FILE.
-      # `GOOGLE_SERVICE_ACCOUNT_JSON` (old v1.0.0 name) was NOT in the list,
-      # so Google auth was failing silently.
-      # ----------------------------------------------------------------------
-      - key: GOOGLE_SHEETS_CREDENTIALS
-        sync: false
-      - key: DEFAULT_SPREADSHEET_ID
-        sync: false
-      # Optional Apps Script webhook (for push-style sheet updates)
-      # - key: GOOGLE_APPS_SCRIPT_URL
-      #   sync: false
-
-      # ----------------------------------------------------------------------
-      # CORS (empty = closed; set to "*" via ENABLE_CORS_ALL_ORIGINS=true if
-      # you need browser access from other origins)
-      # ----------------------------------------------------------------------
-      - key: ENABLE_CORS_ALL_ORIGINS
-        value: "false"
-      - key: CORS_ORIGINS
-        value: ""
+          echo "⏱️ Start: $(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "📋 Command: ${CMD[*]}"
+          "${CMD[@]}"
+          echo "✅ News archive collection finished."
