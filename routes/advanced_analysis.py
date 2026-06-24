@@ -2,8 +2,29 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.9.0  (SECTOR TREND ENRICHMENT — TREND-ADD)
+Advanced Analysis Root Owner — v4.10.0  (LIVE NEWS DISPLAY — NEWS-DISPLAY)
 ================================================================================
+v4.10.0 [NEWS-DISPLAY]: the opportunity-candidates News column is filled with
+LIVE per-symbol sentiment from core.news_intelligence for the SURFACED decision
+symbols (selected + near_miss + the top candidates_rows, capped). DISPLAY-ONLY
+BY CONSTRUCTION: the builder runs FIRST and its scoring / gating / selection are
+finalized with news_trend='Unknown' EXACTLY as in v4.9.0 -> selection is
+byte-identical to NEWS_DISPLAY off. AFTER the build, _attach_news_display()
+overwrites only the displayed `news_trend` label (and adds news_sentiment /
+news_confidence / news_articles) on the OUTPUT rows whose symbol was fetched.
+No input row is mutated, so the News GATE (Negative -> fail) and the §4.3
+news_trend score NEVER fire on live data -- that news->action coupling is a
+registered hypothesis that must clear a backtest (the News_Archive collector)
+before it may influence a recommendation; until then news is informational.
+ENV-GATED, DEFAULT OFF: TFB_NEWS_DISPLAY=1 to enable (unset -> no fetch, no
+mutation, byte-identical to v4.9.0). Bounded by TFB_NEWS_DISPLAY_MAX (default
+60 symbols) and time-boxed by TFB_NEWS_DISPLAY_TIMEOUT_S (default 25.0s) to
+protect the Render edge timeout; label thresholds TFB_NEWS_DISPLAY_POS (+0.15)
+/ TFB_NEWS_DISPLAY_NEG (-0.15). Fail-soft: news_intelligence unbound, a fetch
+error, or a timeout -> rows stay Unknown, reason noted in
+meta.route.news_display. opportunity_builder is UNCHANGED (it already emits
+news_trend). ALL v4.9.0 behavior is otherwise preserved verbatim.
+
 v4.9.0 [TREND-ADD]: the opportunity-candidates pool is passed through
 core.analysis.trend_signals v1.0.0 (Plan v5.0 P9) BEFORE the builder runs.
 The module computes SECTOR TREND cross-sectionally from the pool itself
@@ -287,6 +308,7 @@ and their /v1/schema aliases.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -306,9 +328,9 @@ logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
 # =============================================================================
-# v4.9.0 — Version constant.
+# v4.10.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.9.0"
+ADVANCED_ANALYSIS_VERSION = "4.10.0"
 
 
 # =============================================================================
@@ -538,6 +560,184 @@ except Exception as _opp_err:
         "/opportunity-candidates will answer status=unavailable",
         ADVANCED_ANALYSIS_VERSION, _opp_err,
     )
+
+
+# =============================================================================
+# v4.10.0 [NEWS-DISPLAY] Live news sentiment for the surfaced decision symbols.
+#
+# core.news_intelligence (v5.x, Google-News RSS, no provider key) is bound here
+# and used DISPLAY-ONLY: it runs AFTER the opportunity builder and only fills
+# the `news_trend` label on OUTPUT rows. It never mutates an input row, so the
+# builder's News gate / news_trend score / selection are byte-identical to
+# NEWS_DISPLAY off. Fail-soft: unbound or erroring -> rows stay Unknown.
+# =============================================================================
+_ni_batch_news = None  # type: ignore[assignment]
+_NEWS_DISPLAY_AVAILABLE = False
+try:
+    from core.news_intelligence import batch_news_intelligence as _ni_batch_news  # type: ignore
+    _NEWS_DISPLAY_AVAILABLE = True
+    logger.info("[advanced_analysis v%s] news_intelligence bound (core.news_intelligence)",
+                ADVANCED_ANALYSIS_VERSION)
+except Exception:
+    try:
+        from news_intelligence import batch_news_intelligence as _ni_batch_news  # type: ignore
+        _NEWS_DISPLAY_AVAILABLE = True
+        logger.info("[advanced_analysis v%s] news_intelligence bound (news_intelligence)",
+                    ADVANCED_ANALYSIS_VERSION)
+    except Exception as _ni_err:
+        _ni_batch_news = None  # type: ignore
+        _NEWS_DISPLAY_AVAILABLE = False
+        logger.info(
+            "[advanced_analysis v%s] core.news_intelligence unavailable (%s); "
+            "News column stays Unknown even when TFB_NEWS_DISPLAY=1",
+            ADVANCED_ANALYSIS_VERSION, _ni_err,
+        )
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    """1/true/yes/y/on -> True; empty -> default. Matches the route's existing
+    inline env idiom (see ALLOW_QUERY_TOKEN / TFB_TOP10_FULL_UNIVERSE)."""
+    v = (os.getenv(name) or "").strip().lower()
+    if not v:
+        return default
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _env_num(name: str, default: float) -> float:
+    try:
+        raw = (os.getenv(name) or "").strip()
+        return float(raw) if raw else float(default)
+    except Exception:
+        return float(default)
+
+
+def _news_display_enabled() -> bool:
+    return _env_truthy("TFB_NEWS_DISPLAY", False)
+
+
+def _news_display_max() -> int:
+    n = int(_env_num("TFB_NEWS_DISPLAY_MAX", 60.0))
+    return max(1, min(400, n))
+
+
+def _news_label(sentiment: Optional[float]) -> str:
+    """Map a [-1..1] sentiment to the builder's Positive/Neutral/Negative
+    vocabulary; None/non-numeric -> Unknown. Thresholds are env-tunable."""
+    if sentiment is None:
+        return "Unknown"
+    try:
+        s = float(sentiment)
+    except Exception:
+        return "Unknown"
+    if s >= _env_num("TFB_NEWS_DISPLAY_POS", 0.15):
+        return "Positive"
+    if s <= _env_num("TFB_NEWS_DISPLAY_NEG", -0.15):
+        return "Negative"
+    return "Neutral"
+
+
+def _news_safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _news_safe_int(x: Any) -> int:
+    try:
+        return int(float(x))
+    except Exception:
+        return 0
+
+
+async def _attach_news_display(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """v4.10.0 [NEWS-DISPLAY]: fill the News column for the SURFACED decision
+    symbols (selected + near_miss + candidates_rows) with live sentiment.
+
+    DISPLAY-ONLY: called AFTER the builder; mutates only the displayed
+    `news_trend` label (plus news_sentiment / news_confidence / news_articles)
+    on the OUTPUT row dicts. The builder's scoring / gating / selection already
+    ran on the un-mutated input pool and are unchanged. Bounded to
+    TFB_NEWS_DISPLAY_MAX symbols and time-boxed; any failure leaves rows
+    Unknown. Returns a meta dict for meta.route.news_display.
+    """
+    cap = _news_display_max()
+    meta: Dict[str, Any] = {"enabled": True, "bound": bool(_NEWS_DISPLAY_AVAILABLE),
+                            "fetched": 0, "labeled": 0, "cap": cap}
+    if not (_NEWS_DISPLAY_AVAILABLE and _ni_batch_news is not None):
+        meta["bound"] = False
+        return meta
+
+    buckets: List[List[Any]] = []
+    for key in ("selected", "near_miss", "candidates_rows"):
+        v = payload.get(key)
+        if isinstance(v, list) and v:
+            buckets.append(v)
+    if not buckets:
+        return meta
+
+    # Symbol fetch list in priority order (selected first, then near_miss, then
+    # the candidates_rows tail), deduped and capped.
+    name_by_sym: Dict[str, str] = {}
+    ordered_syms: List[str] = []
+    for bucket in buckets:
+        for row in bucket:
+            if not isinstance(row, dict):
+                continue
+            sym = _strip(row.get("symbol") or row.get("requested_symbol")).upper()
+            if not sym or sym in name_by_sym:
+                continue
+            name_by_sym[sym] = _strip(row.get("name"))
+            ordered_syms.append(sym)
+    want = ordered_syms[:cap]
+    if not want:
+        return meta
+
+    items = [{"symbol": s, "name": name_by_sym.get(s, "")} for s in want]
+    try:
+        batch = await asyncio.wait_for(
+            _ni_batch_news(items, include_articles=False),
+            timeout=_env_num("TFB_NEWS_DISPLAY_TIMEOUT_S", 25.0),
+        )
+    except Exception as exc:  # timeout or runtime/network guard
+        meta["error"] = "{}: {}".format(exc.__class__.__name__, str(exc)[:160])
+        return meta
+
+    results = getattr(batch, "items", None) or []
+    smap: Dict[str, Dict[str, Any]] = {}
+    for it in results:
+        if not isinstance(it, dict):
+            continue
+        sym = _strip(it.get("symbol")).upper()
+        if not sym:
+            continue
+        sent = _news_safe_float(it.get("sentiment"))
+        smap[sym] = {
+            "label": _news_label(sent),
+            "sentiment": sent,
+            "confidence": _news_safe_float(it.get("confidence")),
+            "articles": _news_safe_int(it.get("articles_analyzed")),
+        }
+    meta["fetched"] = len(smap)
+
+    labeled = 0
+    for bucket in buckets:
+        for row in bucket:
+            if not isinstance(row, dict):
+                continue
+            sym = _strip(row.get("symbol") or row.get("requested_symbol")).upper()
+            ent = smap.get(sym)
+            if not ent or ent["label"] == "Unknown":
+                continue
+            row["news_trend"] = ent["label"]
+            row["news_sentiment"] = ent["sentiment"]
+            row["news_confidence"] = ent["confidence"]
+            row["news_articles"] = ent["articles"]
+            labeled += 1
+    meta["labeled"] = labeled
+    return meta
 
 
 # =============================================================================
@@ -2694,6 +2894,16 @@ async def opportunity_candidates_post(
         meta = {}
         payload["meta"] = meta
     meta["provider_health"] = _json_safe(provider_health)
+    # v4.10.0 [NEWS-DISPLAY]: fill the News column for the surfaced decision
+    # symbols (display-only; the builder's selection above is already final).
+    # Env-gated default OFF -> no fetch, no mutation, byte-identical to v4.9.0.
+    news_display_meta: Dict[str, Any] = {"enabled": False}
+    if _news_display_enabled():
+        try:
+            news_display_meta = await _attach_news_display(payload)
+        except Exception as _nde:
+            news_display_meta = {"enabled": True,
+                                 "error": "{}: {}".format(_nde.__class__.__name__, str(_nde)[:160])}
     meta["route"] = {
         "version": ADVANCED_ANALYSIS_VERSION,
         "opportunity_builder_version": _OPP_BUILDER_VERSION,
@@ -2701,6 +2911,7 @@ async def opportunity_candidates_post(
         "dispatch": "opportunity_candidates",
         "pool": {"source": pool_source, "count": len(pool_rows), "pool_limit": pool_limit},
         "trends": _json_safe(trends_meta),
+        "news_display": _json_safe(news_display_meta),
         "duration_ms": round((time.time() - start) * 1000.0, 3),
     }
     return _json_safe(payload)
