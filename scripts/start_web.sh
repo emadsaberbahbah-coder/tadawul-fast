@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/start_web.sh
 # ==============================================================================
-# TADAWUL FAST BRIDGE — RENDER WEB START SCRIPT (v2.6.0)
+# TADAWUL FAST BRIDGE — RENDER WEB START SCRIPT (v2.6.1)
 # ==============================================================================
 # Purpose
 # - Render-safe startup path
@@ -10,6 +10,17 @@
 # - Default-safe `PORT` (10000, matching `main.py` fallback) when absent —
 #   does NOT hard-fail outside Render so the script works for local dev
 # - Conservative defaults for heavy FastAPI startup
+#
+# Why this revision (v2.6.1 vs v2.6.0)
+# -------------------------------------
+# - DOC: Scrubbed stale `render.yaml` references. This repo has NO Render
+#     Blueprint. The `tfb-server` env vars (PORT, WEB_CONCURRENCY, WORKERS_MAX,
+#     UVICORN_*) and the /readyz health check are configured in the Render
+#     DASHBOARD, not a render.yaml file. The old comments attributed them to a
+#     "render.yaml envVarGroup" that does not exist — the root render.yaml was
+#     an inert, misplaced GitHub Actions workflow (now deleted). NO behavioral
+#     change: every env var name and all resolution logic is byte-identical;
+#     only comments and --help text were corrected.
 #
 # Why this revision (v2.6.0 vs v2.5.0)
 # -------------------------------------
@@ -22,7 +33,7 @@
 #     is unchanged.
 #
 # - 🔑 FIX HIGH: Aligned env var names with the project-canonical
-#     `tfb-server` envVarGroup from `render.yaml`:
+#     `tfb-server` env group (configured in the Render dashboard):
 #       UVICORN_KEEPALIVE, UVICORN_GRACEFUL_TIMEOUT, UVICORN_BACKLOG,
 #       WEB_CONCURRENCY, WORKERS_MAX
 #     v2.5.0 read only `TFB_KEEPALIVE`/`TFB_GRACEFUL_TIMEOUT`/`TFB_WORKERS`
@@ -45,11 +56,11 @@
 # - FIX: `PYTHONPATH` now includes app dir so imports work after `cd`.
 # - FIX: Added `--help` / `-h` to print the resolved gunicorn command line
 #     without starting the server — useful for config debugging.
-# - FIX: Documented readiness path (`/readyz`) expected by render.yaml.
+# - FIX: Documented readiness path (`/readyz`) — the Render health check.
 #
 # Environment
 # -----------
-# Authoritative (set in render.yaml envVarGroup `tfb-server`):
+# Authoritative (set in the Render dashboard, env group `tfb-server`):
 #   PORT                      TCP port (Render injects this; defaults 10000)
 #   HOST                      bind address (default 0.0.0.0)
 #   WEB_CONCURRENCY           worker count (default 1)
@@ -69,13 +80,14 @@
 #   TFB_ACCESS_LOG, TFB_WORKER_CLASS, TFB_WORKER_TMP_DIR,
 #   TFB_MAX_REQUESTS, TFB_MAX_REQUESTS_JITTER, TFB_LOG_LEVEL
 #
-# Expected render.yaml integration
+# Expected Render service config (Render dashboard — this repo has NO
+# render.yaml Blueprint)
 # --------------------------------
-#   startCommand: |
+#   Start Command:
 #     set -euo pipefail
 #     chmod +x scripts/start_web.sh
 #     exec ./scripts/start_web.sh
-#   healthCheckPath: /readyz   (ensure main.py exposes this route)
+#   Health Check Path: /readyz   (ensure main.py exposes this route)
 #
 # Exit codes
 # ----------
@@ -90,7 +102,7 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-readonly SCRIPT_VERSION="2.6.0"
+readonly SCRIPT_VERSION="2.6.1"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -204,14 +216,14 @@ Usage:
   ./scripts/start_web.sh --print-plan    # print resolved gunicorn command
                                          # line and exit WITHOUT launching
 
-Primary env vars (aligned with render.yaml envVarGroup 'tfb-server'):
+Primary env vars (aligned with the Render dashboard 'tfb-server' env group):
   PORT, HOST, WEB_CONCURRENCY, WORKERS_MAX,
   UVICORN_KEEPALIVE, UVICORN_GRACEFUL_TIMEOUT, UVICORN_BACKLOG,
   LOG_LEVEL, APP_MODULE, APP_DIR
 
 Legacy TFB_* names still honored. See header of this script for full list.
 
-Health check path (render.yaml): /readyz
+Health check path (Render dashboard): /readyz
 EOF
   exit 2
 fi
@@ -238,8 +250,8 @@ else
   PORT="$(as_int "$PORT" 10000)"
 fi
 
-# Workers: prefer WEB_CONCURRENCY (render.yaml canonical), then TFB_WORKERS.
-# Hard-cap by WORKERS_MAX (render.yaml canonical) with fallback 8.
+# Workers: prefer WEB_CONCURRENCY (Render canonical), then TFB_WORKERS.
+# Hard-cap by WORKERS_MAX (Render canonical) with fallback 8.
 _WORKERS_MAX="$(as_int "${WORKERS_MAX:-${WORKERS_MAX_DEFAULT:-}}" 8)"
 WORKERS="$(clamp_range "${WEB_CONCURRENCY:-${TFB_WORKERS:-}}" 1 "$_WORKERS_MAX" 1)"
 
