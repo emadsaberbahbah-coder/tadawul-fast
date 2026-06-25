@@ -2,8 +2,28 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.96.1
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.99.0
 ================================================================================
+
+WHY v5.99.0 - TWO UPSTREAM DATA-CORRECTNESS FIXES (both env-gated, default ON,
+              byte-identical when off; no schema/verdict-contract change)
+-------------------------------------------------------------------------------
+Fix AK - BOURSA KUWAIT (.KW) FILS -> KWD. The feed quotes .KW prices in fils but
+  labels the venue "KWD"; the sheet FX_LOOKUP carries a KWD-level rate, so every
+  .KW price was rendered 1000x too high (#1 ticket ZAIN showed ~2 sh @ ~7,205 SAR
+  vs the real ~2,000 sh @ ~7.2 SAR). Unlike GBX/ZAC/ILA this is NOT a recognised
+  subunit code and is /1000 not /100, so the trigger is the .KW SYMBOL SUFFIX, not
+  the currency string. _normalize_kuwait_fils_price() divides the price-magnitude
+  fields by 1000 (currency stays "KWD" so the existing KWD->SAR rate then yields
+  correct SAR); runs FIRST in _apply_phase_bb_sanity so derived prices inherit it.
+  Gate TFB_KW_FILS_NORMALIZE. ROI%/R-R/cash unchanged (scale-invariant).
+Fix AL - KSA SECTOR (.SR) "Saudi Market" -> real GICS. _infer_sector_from_symbol
+  returned the literal market name "Saudi Market" as the SECTOR fallback for every
+  .SR name (KSA fundamentals carry no GICS sector), collapsing all Saudi names into
+  one diversification bucket and capping total Saudi selection at max_per_sector.
+  A curated symbol->GICS map (_KSA_SYMBOL_SECTOR) now resolves the major liquid
+  Tadawul constituents; ambiguous/long-tail names -> "" (honest unknown, never the
+  market name). Gate TFB_KSA_SECTOR_MAP.
 
 WHY v5.96.1 - CROSS-CHECK FIX: BODY/WICK LABEL PRECEDENCE (ALL v5.96.0 logic
               carried; structural read only -- still env-gated, still no schema/
@@ -2010,7 +2030,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.98.0"
+__version__ = "5.99.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -2806,9 +2826,100 @@ def _normalize_subunit_market_cap(row: Dict[str, Any]) -> None:
     _v573_append_warning(row, "market_cap_subunit_unverified_no_shares")
 
 
+# =============================================================================
+# v5.99.0 (Fix AK) — BOURSA KUWAIT FILS -> KWD PRICE NORMALIZATION
+# -----------------------------------------------------------------------------
+# Boursa Kuwait (.KW) quotes arrive from the active feed in FILS (1 KWD = 1000
+# fils) but are LABELLED "KWD", and the sheet FX_LOOKUP carries a KWD-level
+# KWD->SAR rate (~12.13). So price[fils] x rate[KWD] = SAR is 1000x too high:
+# ZAIN.KW showed 594 -> 7,204.62 SAR/share (594 x 12.129) and a 2-share ticket
+# for a stock that really trades ~0.55 KWD (~7 SAR). The SAR price, the share
+# count, and every per-share level (entry/stop/TP1/TP2) were 1000x wrong. The
+# ROI%, R/R and cash figures SURVIVED because the 1000x cancels in every ratio.
+#
+# This is NOT the GBX/ZAC/ILA subunit case handled by _normalize_subunit_market_cap
+# above: (a) the venue is labelled with the MAJOR code "KWD" (not a recognised
+# subunit code), so the suffix/currency machinery never flags it; and (b) fils is
+# /1000, not /100. The robust signal is therefore the SYMBOL SUFFIX (.KW), not the
+# currency string. We divide the price-MAGNITUDE fields by 1000 to express them in
+# KWD, and LEAVE currency = "KWD" so the existing KWD->SAR rate then yields the
+# correct SAR. market_cap is NOT divided (the feed reports it in the major unit,
+# KWD); volume / shares / all *_pct / ratios are inherently scale-invariant.
+#
+# Placement: FIRST transform in _apply_phase_bb_sanity (which runs BEFORE
+# _compute_scores_canonical_first and _apply_phase_dd_enhancements), so every
+# engine-DERIVED price (forecast_price_*, intrinsic_value) is computed from the
+# already-KWD current_price and inherits the correct unit automatically; any
+# PROVIDER-supplied forecast/target present at intake is divided here too, before
+# _cap_provider_target_forecasts reads it. Idempotent (own warning tag).
+# Reversible: TFB_KW_FILS_NORMALIZE in {0,false,no,n,off,f,disabled,disable}
+# -> .KW rows byte-identical to v5.98.0. Default ON. NON-.KW rows are byte-
+# identical regardless of the switch (the function no-ops unless symbol ends .KW).
+# =============================================================================
+_KW_FILS_PER_KWD: float = 1000.0
+
+# Price-MAGNITUDE fields only (per-share levels + absolute price deltas). Lists
+# both canonical names and the provider aliases that may still be present at the
+# phase-BB intake point. Excludes market_cap, volume, shares, and every ratio /
+# percent / score (scale-invariant or already in the major unit).
+_KW_FILS_PRICE_FIELDS: Tuple[str, ...] = (
+    "current_price", "previous_close", "open_price", "day_high", "day_low",
+    "week_52_high", "week_52_low", "price_change", "intrinsic_value",
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+    # provider aliases that may linger before canonicalization maps them:
+    "price", "open", "high", "low", "close", "day_open", "target_price", "change",
+)
+
+
+def _kuwait_fils_normalize_enabled() -> bool:
+    raw = (os.getenv("TFB_KW_FILS_NORMALIZE") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+def _normalize_kuwait_fils_price(row: Dict[str, Any]) -> None:
+    """v5.99.0 (Fix AK): express Boursa Kuwait (.KW) price-magnitude fields in the
+    MAJOR currency unit (KWD) by dividing the fils-quoted values by 1000. Keyed on
+    the Boursa Kuwait symbol suffix (.KW / .KSE) — the feed labels the venue "KWD"
+    while quoting fils, so the currency string is not a reliable trigger. Idempotent
+    and a strict no-op for any symbol that is not a Boursa Kuwait listing."""
+    if not isinstance(row, dict):
+        return
+    if not _kuwait_fils_normalize_enabled():
+        return
+    sym = _safe_str(row.get("symbol")).upper()
+    if not (sym.endswith(".KW") or sym.endswith(".KSE")):
+        return
+
+    # Idempotency: never divide twice within one pipeline run.
+    raw_warn = row.get("warnings")
+    if isinstance(raw_warn, str):
+        if "kw_fils_price_normalized_to_kwd" in raw_warn:
+            return
+    elif isinstance(raw_warn, (list, tuple, set)):
+        if "kw_fils_price_normalized_to_kwd" in {_safe_str(x) for x in raw_warn}:
+            return
+
+    touched = False
+    for field in _KW_FILS_PRICE_FIELDS:
+        v = _as_float(row.get(field))
+        if v is None:
+            continue
+        row[field] = round(v / _KW_FILS_PER_KWD, 6)
+        touched = True
+
+    if touched:
+        _v573_append_warning(row, "kw_fils_price_normalized_to_kwd")
+
+
 def _apply_phase_bb_sanity(row: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(row, dict):
         return row
+    # v5.99.0 (Fix AK): rebase Boursa Kuwait (.KW) fils-quoted prices to KWD FIRST,
+    # so the price sanitizers, the provider-target cap below, and every downstream
+    # derived price (scores/forecast/intrinsic phases) all see the major-unit value.
+    _normalize_kuwait_fils_price(row)
     _sanitize_price_change(row)
     _sanitize_percent_change(row)
     _sanitize_week_52_position_pct(row)
@@ -8061,6 +8172,145 @@ def _infer_country_from_symbol(symbol: str) -> str:
     return "USA"
 
 
+# =============================================================================
+# v5.99.0 (Fix AL) — KSA SYMBOL -> GICS SECTOR MAP (stop emitting the MARKET name
+# "Saudi Market" into the SECTOR field)
+# -----------------------------------------------------------------------------
+# KSA provider fundamentals carry no GICS sector, so _infer_sector_from_symbol
+# fell back to the literal "Saudi Market" for EVERY .SR / 4-digit name. That is a
+# MARKET label, not a sector: it collapsed all ~all Saudi names into ONE sector
+# bucket, so the opportunity diversifier's max_per_sector=2 capped TOTAL Saudi
+# selection at 2 (e.g. 1831 staffing + 4030 shipping took both slots and 2320 /
+# banks / 2020 were blocked "sector cap 2/2 (Saudi Market)"). Blanking it to "" is
+# NOT enough on its own (it just relocates the collision to an empty bucket), so
+# this provides a deterministic symbol->GICS map for the major liquid Tadawul
+# constituents; unmapped (long-tail) names return "" — an HONEST unknown, never
+# the market name. Result: banks compete within Financials, petrochems within
+# Materials, etc., so a single max_per_sector no longer throttles the whole home
+# market. Curated to NAMES WITH AN UNAMBIGUOUS GICS SECTOR; genuinely mixed names
+# (e.g. integrated refiners, diversified holdings) are deliberately omitted -> "".
+# Long-term fix remains real provider/Argaam sector data.
+# Reversible: TFB_KSA_SECTOR_MAP in {0,false,no,n,off,f,disabled,disable} -> the
+# fallback returns "Saudi Market" exactly as v5.98.0 (byte-identical). Default ON.
+# =============================================================================
+_KSA_SYMBOL_SECTOR: Dict[str, str] = {
+    # --- Financials: banks ---
+    "1010": "Financials", "1020": "Financials", "1030": "Financials",
+    "1050": "Financials", "1060": "Financials", "1080": "Financials",
+    "1120": "Financials", "1140": "Financials", "1150": "Financials",
+    "1180": "Financials",
+    # --- Financials: exchange / diversified financials ---
+    "1111": "Financials", "4081": "Financials", "4280": "Financials",
+    "1182": "Financials", "1183": "Financials",
+    # --- Financials: insurance (8xxx) ---
+    "8010": "Financials", "8012": "Financials", "8020": "Financials",
+    "8030": "Financials", "8040": "Financials", "8050": "Financials",
+    "8060": "Financials", "8070": "Financials", "8100": "Financials",
+    "8120": "Financials", "8150": "Financials", "8160": "Financials",
+    "8170": "Financials", "8180": "Financials", "8190": "Financials",
+    "8200": "Financials", "8210": "Financials", "8230": "Financials",
+    "8240": "Financials", "8250": "Financials", "8260": "Financials",
+    "8270": "Financials", "8280": "Financials", "8300": "Financials",
+    "8310": "Financials", "8311": "Financials",
+    # --- Energy ---
+    "2222": "Energy", "2381": "Energy", "2382": "Energy",
+    # --- Materials: petrochemicals / chemicals ---
+    "2010": "Materials", "2020": "Materials", "2060": "Materials",
+    "2090": "Materials", "2150": "Materials", "2170": "Materials",
+    "2180": "Materials", "2200": "Materials", "2210": "Materials",
+    "2250": "Materials", "2290": "Materials", "2300": "Materials",
+    "2310": "Materials", "2330": "Materials", "2350": "Materials",
+    "2360": "Materials", "1201": "Materials", "1202": "Materials",
+    "1210": "Materials",
+    # --- Materials: mining / steel ---
+    "1211": "Materials", "1301": "Materials", "1304": "Materials",
+    "1320": "Materials", "1322": "Materials",
+    # --- Materials: cement ---
+    "3001": "Materials", "3004": "Materials", "3005": "Materials",
+    "3010": "Materials", "3020": "Materials", "3030": "Materials",
+    "3040": "Materials", "3050": "Materials", "3060": "Materials",
+    "3080": "Materials", "3090": "Materials", "3091": "Materials",
+    "3092": "Materials",
+    # --- Industrials ---
+    "1831": "Industrials", "1833": "Industrials", "4030": "Industrials",
+    "4031": "Industrials", "4040": "Industrials", "4110": "Industrials",
+    "4261": "Industrials", "1303": "Industrials", "2110": "Industrials",
+    "4142": "Industrials",
+    # --- Consumer Staples ---
+    "2280": "Consumer Staples", "2270": "Consumer Staples",
+    "2050": "Consumer Staples", "6010": "Consumer Staples",
+    "6001": "Consumer Staples", "6040": "Consumer Staples",
+    "4001": "Consumer Staples", "4006": "Consumer Staples",
+    "4051": "Consumer Staples", "2100": "Consumer Staples",
+    # --- Consumer Discretionary ---
+    "4190": "Consumer Discretionary", "4003": "Consumer Discretionary",
+    "1810": "Consumer Discretionary", "4011": "Consumer Discretionary",
+    "4240": "Consumer Discretionary", "6002": "Consumer Discretionary",
+    "6004": "Consumer Discretionary", "4290": "Consumer Discretionary",
+    "4192": "Consumer Discretionary",
+    # --- Health Care ---
+    "4002": "Health Care", "4004": "Health Care", "4005": "Health Care",
+    "4007": "Health Care", "4013": "Health Care", "4014": "Health Care",
+    "4017": "Health Care", "2070": "Health Care",
+    # --- Communication Services ---
+    "7010": "Communication Services", "7020": "Communication Services",
+    "7030": "Communication Services", "7040": "Communication Services",
+    "4210": "Communication Services", "4070": "Communication Services",
+    "4071": "Communication Services", "4072": "Communication Services",
+    # --- Information Technology ---
+    "7200": "Information Technology", "7201": "Information Technology",
+    "7202": "Information Technology", "7203": "Information Technology",
+    "7204": "Information Technology",
+    # --- Utilities ---
+    "5110": "Utilities", "2082": "Utilities", "2083": "Utilities",
+    # --- Real Estate (developers + REITs) ---
+    "4020": "Real Estate", "4090": "Real Estate", "4100": "Real Estate",
+    "4150": "Real Estate", "4220": "Real Estate", "4250": "Real Estate",
+    "4300": "Real Estate", "4310": "Real Estate", "4320": "Real Estate",
+    "4321": "Real Estate", "4322": "Real Estate", "4323": "Real Estate",
+    "4330": "Real Estate", "4331": "Real Estate", "4332": "Real Estate",
+    "4333": "Real Estate", "4334": "Real Estate", "4335": "Real Estate",
+    "4336": "Real Estate", "4337": "Real Estate", "4338": "Real Estate",
+    "4339": "Real Estate", "4340": "Real Estate", "4342": "Real Estate",
+    "4344": "Real Estate", "4345": "Real Estate", "4346": "Real Estate",
+    "4347": "Real Estate", "4348": "Real Estate",
+    # --- v5.99.0 review-pass additions: verified against the live Market_Leaders
+    #     company names (shrinks the unmapped in-universe residual 24 -> ~10). ---
+    "1321": "Materials",            # East Pipes Integrated (steel pipes)
+    "1323": "Materials",            # United Carton Industries (packaging)
+    "2220": "Materials",            # National Metal Manufacturing & Casting
+    "2081": "Industrials",          # Alkhorayef Water & Power Technologies
+    "4143": "Industrials",          # Al Taiseer Group / TALCO Industrial
+    "4008": "Consumer Discretionary",  # SACO (hardware retail)
+    "4161": "Consumer Staples",     # BinDawood Holding (grocery retail)
+    "4162": "Consumer Staples",     # Almunajem Foods (food distribution)
+    "4164": "Consumer Staples",     # Nahdi Medical (drug retail -> GICS Staples)
+    "4009": "Health Care",          # Middle East Healthcare (Saudi German)
+    "4015": "Health Care",          # Jamjoom Pharmaceuticals
+    "4016": "Health Care",          # Middle East Pharmaceutical (Avalon)
+    "4018": "Health Care",          # Almoosa Health
+    "4019": "Health Care",          # Specialized Medical Company
+}
+
+
+def _ksa_sector_map_enabled() -> bool:
+    raw = (os.getenv("TFB_KSA_SECTOR_MAP") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+def _ksa_sector_for_symbol(s: str) -> str:
+    """v5.99.0 (Fix AL): resolve a KSA symbol to its GICS sector. Gate OFF -> the
+    legacy literal "Saudi Market" (byte-identical to v5.98.0). Gate ON -> the
+    curated sector, or "" (honest unknown) for an unmapped long-tail name — never
+    the market name. `s` is already normalize_symbol'd."""
+    if not _ksa_sector_map_enabled():
+        return "Saudi Market"
+    code = s[:-3] if s.endswith(".SR") else s
+    return _KSA_SYMBOL_SECTOR.get(code, "")
+
+
 def _infer_sector_from_symbol(symbol: str) -> str:
     s = normalize_symbol(symbol)
     if s.endswith("=X"):
@@ -8070,7 +8320,7 @@ def _infer_sector_from_symbol(symbol: str) -> str:
     if s in _ETF_SYMBOL_HINTS:
         return "Broad Market"
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
-        return "Saudi Market"
+        return _ksa_sector_for_symbol(s)
     return ""
 
 
