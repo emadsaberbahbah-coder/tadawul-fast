@@ -2,11 +2,44 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.15.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.16.0
 ================================================================================
 BRIDGE-FIRST • ROOT-OWNER ALIGNED • TOP10 FAIL-SOFT • STARTUP-SAFE
 AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE • SCHEMA v2.6.0
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • EXCEPTION-MESSAGE-CAPTURE
+
+WHY v2.16.0 — schema-contract realignment to the live registry (v2.15.0)
+-------------------------------------------------------------------------------
+The v2.14.0 build froze KNOWN_CANONICAL_HEADER_COUNTS and the fallback
+schemas at the v2.6.0 contract (90 / 93). schema_registry has since advanced
+to v2.15.0 (115 / 118 / 122), so whenever schema_registry import fails this
+router served a 90/93 schema against 115/118 live sheets — silently dropping
+25 instrument / 25 Top10 columns. (Audit finding C2.)
+
+- 🔑 FIX [CRITICAL]: KNOWN_CANONICAL_HEADER_COUNTS realigned v2.6.0 -> v2.15.0:
+     market pages 90 -> 115, My_Portfolio 90 -> 122, Top_10_Investments 93 -> 118
+     (Insights 7 / Data_Dictionary 9 unchanged).
+- 🔑 FIX [CRITICAL]: _CANONICAL_TOP10_SCHEMA_FALLBACK regenerated to the full
+     v2.15.0 layout (118 entries) DIRECTLY FROM schema_registry (machine-extracted,
+     not hand-typed). _CANONICAL_INSTRUMENT_SCHEMA_FALLBACK stays
+     _CANONICAL_TOP10_SCHEMA_FALLBACK[:-3] (115; verified top10[:-3] == instrument).
+- 🔑 FIX [HIGH]: NEW _CANONICAL_MY_PORTFOLIO_SCHEMA_FALLBACK (122 entries,
+     registry-extracted) + routing branch. Previously My_Portfolio fell through to
+     the instrument fallback — wrong, because my_portfolio[:115] != instrument — so
+     a registry failure would have served the wrong My_Portfolio layout.
+- 🔑 FIX [HIGH]: _load_schema_defaults no longer SILENTLY swallows a
+     schema_registry failure (the old `except Exception: pass`). It now logs a loud
+     WARNING naming the page + reason before serving the static fallback, so
+     degraded-mode contract drift is visible instead of hidden.
+- FIX: import-time consistency assertion added for My_Portfolio (122).
+- DOC: dependency matrix updated (schema_registry 2.6.0/90/93 -> 2.15.0/115/118/122).
+- KNOWN LIMITATION (flagged, NOT changed here): _CANONICAL_INSIGHTS_SCHEMA_FALLBACK
+     content diverges from the registry (file: symbol / last_updated_riyadh;
+     registry: source / sort_order) although both are width 7, so the length asserts
+     never caught it. Left untouched pending confirmation of whether the registry or
+     the live Insights sheet is authoritative. The permanent cure for this whole
+     class is to DERIVE the fallback from the registry at load (deferred refactor) —
+     length asserts cannot catch content drift.
 
 WHY v2.15.0 — diagnostic visibility + bridge exception capture
 --------------------------------------------------------------
@@ -115,7 +148,7 @@ Co-deployment matrix (Wave 2A)
 ------------------------------
   Module                                Version    Notes
   -------                               -------    -----
-  core/sheets/schema_registry.py        2.6.0      90/93/7/9 column layout
+  core/sheets/schema_registry.py        2.15.0     115/118/122/7/9 layout
   core/scoring.py                       5.1.0      View + Insights producer
   core/reco_normalize.py                7.1.0      conviction-floor gating
   core/insights_builder.py              1.0.0      pure-function module
@@ -157,6 +190,7 @@ ROUTE_OWNER_NAME = "investment_advisor"
 TOP10_PAGE_NAME = "Top_10_Investments"
 INSIGHTS_PAGE_NAME = "Insights_Analysis"
 DATA_DICTIONARY_PAGE_NAME = "Data_Dictionary"
+MY_PORTFOLIO_PAGE_NAME = "My_Portfolio"
 
 BASE_SOURCE_PAGES: Tuple[str, ...] = (
     "Market_Leaders",
@@ -168,13 +202,13 @@ BASE_SOURCE_PAGES: Tuple[str, ...] = (
 SOURCE_PAGES_SET = set(BASE_SOURCE_PAGES)
 
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
-    "Market_Leaders": 90,
-    "Global_Markets": 90,
-    "Commodities_FX": 90,
-    "Mutual_Funds": 90,
-    "My_Portfolio": 90,
+    "Market_Leaders": 115,
+    "Global_Markets": 115,
+    "Commodities_FX": 115,
+    "Mutual_Funds": 115,
+    "My_Portfolio": 122,
     "Insights_Analysis": 7,
-    "Top_10_Investments": 93,
+    "Top_10_Investments": 118,
     "Data_Dictionary": 9,
 }
 
@@ -272,103 +306,250 @@ except Exception:  # pragma: no cover
 
 
 _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
-    ("symbol", "Symbol"),
-    ("name", "Name"),
-    ("asset_class", "Asset Class"),
-    ("exchange", "Exchange"),
-    ("currency", "Currency"),
-    ("country", "Country"),
-    ("sector", "Sector"),
-    ("industry", "Industry"),
-    ("current_price", "Current Price"),
-    ("previous_close", "Previous Close"),
-    ("open_price", "Open"),
-    ("day_high", "Day High"),
-    ("day_low", "Day Low"),
-    ("week_52_high", "52W High"),
-    ("week_52_low", "52W Low"),
-    ("price_change", "Price Change"),
-    ("percent_change", "Percent Change"),
-    ("week_52_position_pct", "52W Position %"),
-    ("volume", "Volume"),
-    ("avg_volume_10d", "Avg Volume 10D"),
-    ("avg_volume_30d", "Avg Volume 30D"),
-    ("market_cap", "Market Cap"),
-    ("float_shares", "Float Shares"),
-    ("beta_5y", "Beta (5Y)"),
-    ("pe_ttm", "P/E (TTM)"),
-    ("pe_forward", "P/E (Forward)"),
-    ("eps_ttm", "EPS (TTM)"),
-    ("dividend_yield", "Dividend Yield"),
-    ("payout_ratio", "Payout Ratio"),
-    ("revenue_ttm", "Revenue (TTM)"),
-    ("revenue_growth_yoy", "Revenue Growth YoY"),
-    ("gross_margin", "Gross Margin"),
-    ("operating_margin", "Operating Margin"),
-    ("profit_margin", "Profit Margin"),
-    ("debt_to_equity", "Debt/Equity"),
-    ("free_cash_flow_ttm", "Free Cash Flow (TTM)"),
-    ("rsi_14", "RSI (14)"),
-    ("volatility_30d", "Volatility 30D"),
-    ("volatility_90d", "Volatility 90D"),
-    ("max_drawdown_1y", "Max Drawdown 1Y"),
-    ("var_95_1d", "VaR 95% (1D)"),
-    ("sharpe_1y", "Sharpe (1Y)"),
-    ("risk_score", "Risk Score"),
-    ("risk_bucket", "Risk Bucket"),
-    ("pb_ratio", "P/B"),
-    ("ps_ratio", "P/S"),
-    ("ev_ebitda", "EV/EBITDA"),
-    ("peg_ratio", "PEG"),
-    ("intrinsic_value", "Intrinsic Value"),
-    ("upside_pct", "Upside %"),
-    ("valuation_score", "Valuation Score"),
-    ("forecast_price_1m", "Forecast Price 1M"),
-    ("forecast_price_3m", "Forecast Price 3M"),
-    ("forecast_price_12m", "Forecast Price 12M"),
-    ("expected_roi_1m", "Expected ROI 1M"),
-    ("expected_roi_3m", "Expected ROI 3M"),
-    ("expected_roi_12m", "Expected ROI 12M"),
-    ("forecast_confidence", "Forecast Confidence"),
-    ("confidence_score", "Confidence Score"),
-    ("confidence_bucket", "Confidence Bucket"),
-    ("value_score", "Value Score"),
-    ("quality_score", "Quality Score"),
-    ("momentum_score", "Momentum Score"),
-    ("growth_score", "Growth Score"),
-    ("overall_score", "Overall Score"),
-    ("opportunity_score", "Opportunity Score"),
-    ("rank_overall", "Rank (Overall)"),
-    # Views (4) — added schema v2.3.0; consumed by reco_normalize.from_views
-    ("fundamental_view", "Fundamental View"),
-    ("technical_view", "Technical View"),
-    ("risk_view", "Risk View"),
-    ("value_view", "Value View"),
-    ("recommendation", "Recommendation"),
-    ("recommendation_reason", "Recommendation Reason"),
-    ("horizon_days", "Horizon Days"),
-    ("invest_period_label", "Invest Period Label"),
-    ("position_qty", "Position Qty"),
-    ("avg_cost", "Avg Cost"),
-    ("position_cost", "Position Cost"),
-    ("position_value", "Position Value"),
-    ("unrealized_pl", "Unrealized P/L"),
-    ("unrealized_pl_pct", "Unrealized P/L %"),
-    ("data_provider", "Data Provider"),
-    ("last_updated_utc", "Last Updated (UTC)"),
-    ("last_updated_riyadh", "Last Updated (Riyadh)"),
-    ("warnings", "Warnings"),
-    # Insights (5) — added schema v2.6.0; produced by core.insights_builder
-    ("sector_relative_score", "Sector-Adj Score"),
-    ("conviction_score", "Conviction Score"),
-    ("top_factors", "Top Factors"),
-    ("top_risks", "Top Risks"),
-    ("position_size_hint", "Position Size Hint"),
-    ("top10_rank", "Top10 Rank"),
-    ("selection_reason", "Selection Reason"),
-    ("criteria_snapshot", "Criteria Snapshot"),
+    ('symbol', 'Symbol'),
+    ('name', 'Name'),
+    ('asset_class', 'Asset Class'),
+    ('exchange', 'Exchange'),
+    ('currency', 'Currency'),
+    ('country', 'Country'),
+    ('sector', 'Sector'),
+    ('industry', 'Industry'),
+    ('current_price', 'Current Price'),
+    ('previous_close', 'Previous Close'),
+    ('open_price', 'Open'),
+    ('day_high', 'Day High'),
+    ('day_low', 'Day Low'),
+    ('week_52_high', '52W High'),
+    ('week_52_low', '52W Low'),
+    ('price_change', 'Price Change'),
+    ('percent_change', 'Percent Change'),
+    ('week_52_position_pct', '52W Position %'),
+    ('volume', 'Volume'),
+    ('avg_volume_10d', 'Avg Volume 10D'),
+    ('avg_volume_30d', 'Avg Volume 30D'),
+    ('market_cap', 'Market Cap'),
+    ('float_shares', 'Float Shares'),
+    ('beta_5y', 'Beta (5Y)'),
+    ('pe_ttm', 'P/E (TTM)'),
+    ('pe_forward', 'P/E (Forward)'),
+    ('eps_ttm', 'EPS (TTM)'),
+    ('dividend_yield', 'Dividend Yield'),
+    ('payout_ratio', 'Payout Ratio'),
+    ('revenue_ttm', 'Revenue (TTM)'),
+    ('revenue_growth_yoy', 'Revenue Growth YoY'),
+    ('gross_margin', 'Gross Margin'),
+    ('operating_margin', 'Operating Margin'),
+    ('profit_margin', 'Profit Margin'),
+    ('debt_to_equity', 'Debt/Equity'),
+    ('free_cash_flow_ttm', 'Free Cash Flow (TTM)'),
+    ('rsi_14', 'RSI (14)'),
+    ('volatility_30d', 'Volatility 30D'),
+    ('volatility_90d', 'Volatility 90D'),
+    ('max_drawdown_1y', 'Max Drawdown 1Y'),
+    ('var_95_1d', 'VaR 95% (1D)'),
+    ('sharpe_1y', 'Sharpe (1Y)'),
+    ('risk_score', 'Risk Score'),
+    ('risk_bucket', 'Risk Bucket'),
+    ('pb_ratio', 'P/B'),
+    ('ps_ratio', 'P/S'),
+    ('ev_ebitda', 'EV/EBITDA'),
+    ('peg_ratio', 'PEG'),
+    ('intrinsic_value', 'Intrinsic Value'),
+    ('upside_pct', 'Upside %'),
+    ('valuation_score', 'Valuation Score'),
+    ('forecast_price_1m', 'Forecast Price 1M'),
+    ('forecast_price_3m', 'Forecast Price 3M'),
+    ('forecast_price_12m', 'Forecast Price 12M'),
+    ('expected_roi_1m', 'Expected ROI 1M'),
+    ('expected_roi_3m', 'Expected ROI 3M'),
+    ('expected_roi_12m', 'Expected ROI 12M'),
+    ('forecast_confidence', 'Forecast Confidence'),
+    ('confidence_score', 'Confidence Score'),
+    ('confidence_bucket', 'Confidence Bucket'),
+    ('value_score', 'Value Score'),
+    ('quality_score', 'Quality Score'),
+    ('momentum_score', 'Momentum Score'),
+    ('growth_score', 'Growth Score'),
+    ('overall_score', 'Overall Score'),
+    ('opportunity_score', 'Opportunity Score'),
+    ('rank_overall', 'Rank (Overall)'),
+    ('analyst_rating', 'Analyst Rating'),
+    ('target_price', 'Target Price'),
+    ('upside_downside_pct', 'Upside/Downside %'),
+    ('signal', 'Signal'),
+    ('trend_1m', 'Trend 1M'),
+    ('trend_3m', 'Trend 3M'),
+    ('trend_12m', 'Trend 12M'),
+    ('st_signal', 'ST Signal'),
+    ('recommendation', 'Recommendation'),
+    ('recommendation_detailed', 'Recommendation Detail'),
+    ('recommendation_reason', 'Recommendation Reason'),
+    ('recommendation_priority', 'Reco Priority'),
+    ('recommendation_priority_band', 'Priority Band'),
+    ('recommendation_source', 'Recommendation Source'),
+    ('horizon_days', 'Horizon Days'),
+    ('invest_period_label', 'Invest Period Label'),
+    ('sector_relative_score', 'Sector-Adj Score'),
+    ('conviction_score', 'Conviction Score'),
+    ('top_factors', 'Top Factors'),
+    ('top_risks', 'Top Risks'),
+    ('position_size_hint', 'Position Size Hint'),
+    ('candlestick_pattern', 'Candle Pattern'),
+    ('candlestick_signal', 'Candle Signal'),
+    ('candlestick_strength', 'Candle Strength'),
+    ('candlestick_confidence', 'Candle Confidence'),
+    ('candlestick_patterns_recent', 'Recent Patterns (5D)'),
+    ('provider_rating', 'Provider Rating'),
+    ('scoring_recommendation_source', 'Scoring Reco Source'),
+    ('scoring_schema_version', 'Scoring Schema Version'),
+    ('scoring_errors', 'Scoring Errors'),
+    ('opportunity_source', 'Opportunity Source'),
+    ('overall_score_raw', 'Overall Score (Raw)'),
+    ('overall_penalty_factor', 'Overall Penalty Factor'),
+    ('forecast_source', 'Forecast Source'),
+    ('data_quality_score', 'Data Quality Score'),
+    ('forecast_reliability_score', 'Forecast Reliability Score'),
+    ('provider_engine_conflict', 'Provider/Engine Conflict'),
+    ('conflict_type', 'Conflict Type'),
+    ('final_decision_basis', 'Final Decision Basis'),
+    ('investability_status', 'Investability Status'),
+    ('final_action', 'Final Action'),
+    ('block_reason', 'Block Reason'),
+    ('data_provider', 'Data Provider'),
+    ('provider_secondary', 'Provider Secondary'),
+    ('last_updated_utc', 'Last Updated (UTC)'),
+    ('last_updated_riyadh', 'Last Updated (Riyadh)'),
+    ('row_source', 'Row Source'),
+    ('warnings', 'Warnings'),
+    ('top10_rank', 'Top 10 Rank'),
+    ('selection_reason', 'Selection Reason'),
+    ('criteria_snapshot', 'Criteria Snapshot'),
 ]
 _CANONICAL_INSTRUMENT_SCHEMA_FALLBACK: List[Tuple[str, str]] = _CANONICAL_TOP10_SCHEMA_FALLBACK[:-3]
+_CANONICAL_MY_PORTFOLIO_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
+    ('symbol', 'Symbol'),
+    ('name', 'Name'),
+    ('asset_class', 'Asset Class'),
+    ('exchange', 'Exchange'),
+    ('currency', 'Currency'),
+    ('country', 'Country'),
+    ('sector', 'Sector'),
+    ('industry', 'Industry'),
+    ('current_price', 'Current Price'),
+    ('previous_close', 'Previous Close'),
+    ('open_price', 'Open'),
+    ('day_high', 'Day High'),
+    ('day_low', 'Day Low'),
+    ('week_52_high', '52W High'),
+    ('week_52_low', '52W Low'),
+    ('price_change', 'Price Change'),
+    ('percent_change', 'Percent Change'),
+    ('week_52_position_pct', '52W Position %'),
+    ('volume', 'Volume'),
+    ('avg_volume_10d', 'Avg Volume 10D'),
+    ('avg_volume_30d', 'Avg Volume 30D'),
+    ('market_cap', 'Market Cap'),
+    ('float_shares', 'Float Shares'),
+    ('beta_5y', 'Beta (5Y)'),
+    ('pe_ttm', 'P/E (TTM)'),
+    ('pe_forward', 'P/E (Forward)'),
+    ('eps_ttm', 'EPS (TTM)'),
+    ('dividend_yield', 'Dividend Yield'),
+    ('payout_ratio', 'Payout Ratio'),
+    ('revenue_ttm', 'Revenue (TTM)'),
+    ('revenue_growth_yoy', 'Revenue Growth YoY'),
+    ('gross_margin', 'Gross Margin'),
+    ('operating_margin', 'Operating Margin'),
+    ('profit_margin', 'Profit Margin'),
+    ('debt_to_equity', 'Debt/Equity'),
+    ('free_cash_flow_ttm', 'Free Cash Flow (TTM)'),
+    ('rsi_14', 'RSI (14)'),
+    ('volatility_30d', 'Volatility 30D'),
+    ('volatility_90d', 'Volatility 90D'),
+    ('max_drawdown_1y', 'Max Drawdown 1Y'),
+    ('var_95_1d', 'VaR 95% (1D)'),
+    ('sharpe_1y', 'Sharpe (1Y)'),
+    ('risk_score', 'Risk Score'),
+    ('risk_bucket', 'Risk Bucket'),
+    ('pb_ratio', 'P/B'),
+    ('ps_ratio', 'P/S'),
+    ('ev_ebitda', 'EV/EBITDA'),
+    ('peg_ratio', 'PEG'),
+    ('intrinsic_value', 'Intrinsic Value'),
+    ('upside_pct', 'Upside %'),
+    ('valuation_score', 'Valuation Score'),
+    ('forecast_price_1m', 'Forecast Price 1M'),
+    ('forecast_price_3m', 'Forecast Price 3M'),
+    ('forecast_price_12m', 'Forecast Price 12M'),
+    ('expected_roi_1m', 'Expected ROI 1M'),
+    ('expected_roi_3m', 'Expected ROI 3M'),
+    ('expected_roi_12m', 'Expected ROI 12M'),
+    ('forecast_confidence', 'Forecast Confidence'),
+    ('confidence_score', 'Confidence Score'),
+    ('confidence_bucket', 'Confidence Bucket'),
+    ('value_score', 'Value Score'),
+    ('quality_score', 'Quality Score'),
+    ('momentum_score', 'Momentum Score'),
+    ('growth_score', 'Growth Score'),
+    ('overall_score', 'Overall Score'),
+    ('opportunity_score', 'Opportunity Score'),
+    ('rank_overall', 'Rank (Overall)'),
+    ('fundamental_view', 'Fundamental View'),
+    ('technical_view', 'Technical View'),
+    ('risk_view', 'Risk View'),
+    ('value_view', 'Value View'),
+    ('recommendation', 'Recommendation'),
+    ('recommendation_reason', 'Recommendation Reason'),
+    ('horizon_days', 'Horizon Days'),
+    ('invest_period_label', 'Invest Period Label'),
+    ('position_qty', 'Position Qty'),
+    ('avg_cost', 'Avg Cost'),
+    ('position_cost', 'Position Cost'),
+    ('position_value', 'Position Value'),
+    ('unrealized_pl', 'Unrealized P/L'),
+    ('unrealized_pl_pct', 'Unrealized P/L %'),
+    ('data_provider', 'Data Provider'),
+    ('last_updated_utc', 'Last Updated (UTC)'),
+    ('last_updated_riyadh', 'Last Updated (Riyadh)'),
+    ('warnings', 'Warnings'),
+    ('sector_relative_score', 'Sector-Adj Score'),
+    ('conviction_score', 'Conviction Score'),
+    ('top_factors', 'Top Factors'),
+    ('top_risks', 'Top Risks'),
+    ('position_size_hint', 'Position Size Hint'),
+    ('recommendation_detailed', 'Recommendation Detail'),
+    ('recommendation_priority', 'Reco Priority'),
+    ('provider_rating', 'Provider Rating'),
+    ('recommendation_source', 'Recommendation Source'),
+    ('recommendation_priority_band', 'Priority Band'),
+    ('scoring_recommendation_source', 'Scoring Reco Source'),
+    ('scoring_schema_version', 'Scoring Schema Version'),
+    ('scoring_errors', 'Scoring Errors'),
+    ('opportunity_source', 'Opportunity Source'),
+    ('overall_score_raw', 'Overall Score (Raw)'),
+    ('overall_penalty_factor', 'Overall Penalty Factor'),
+    ('candlestick_pattern', 'Candle Pattern'),
+    ('candlestick_signal', 'Candle Signal'),
+    ('candlestick_strength', 'Candle Strength'),
+    ('candlestick_confidence', 'Candle Confidence'),
+    ('candlestick_patterns_recent', 'Recent Patterns (5D)'),
+    ('forecast_source', 'Forecast Source'),
+    ('data_quality_score', 'Data Quality Score'),
+    ('forecast_reliability_score', 'Forecast Reliability Score'),
+    ('provider_engine_conflict', 'Provider/Engine Conflict'),
+    ('conflict_type', 'Conflict Type'),
+    ('final_decision_basis', 'Final Decision Basis'),
+    ('investability_status', 'Investability Status'),
+    ('final_action', 'Final Action'),
+    ('block_reason', 'Block Reason'),
+    ('buy_date', 'Buy Date'),
+    ('target_weight', 'Target Weight %'),
+    ('actual_weight', 'Actual Weight %'),
+    ('weight_gap', 'Weight Gap'),
+    ('action_flag', 'Rebalance Action'),
+    ('decision', 'Investor Decision'),
+    ('user_notes', 'User Notes'),
+]
 _CANONICAL_INSIGHTS_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("section", "Section"),
     ("item", "Item"),
@@ -421,6 +602,13 @@ assert _FALLBACK_TOP10_LEN == KNOWN_CANONICAL_HEADER_COUNTS["Top_10_Investments"
     "Fallback Top10 schema has {} entries, but KNOWN_CANONICAL_HEADER_COUNTS "
     "says {}. Update both together.".format(
         _FALLBACK_TOP10_LEN, KNOWN_CANONICAL_HEADER_COUNTS["Top_10_Investments"]
+    )
+)
+_FALLBACK_MY_PORTFOLIO_LEN = len(_CANONICAL_MY_PORTFOLIO_SCHEMA_FALLBACK)
+assert _FALLBACK_MY_PORTFOLIO_LEN == KNOWN_CANONICAL_HEADER_COUNTS["My_Portfolio"], (
+    "Fallback My_Portfolio schema has {} entries, but KNOWN_CANONICAL_HEADER_COUNTS "
+    "says {}. Update both together.".format(
+        _FALLBACK_MY_PORTFOLIO_LEN, KNOWN_CANONICAL_HEADER_COUNTS["My_Portfolio"]
     )
 )
 
@@ -623,6 +811,8 @@ def _schema_fallback_for_page(page: str) -> Tuple[List[str], List[str]]:
         schema = _CANONICAL_INSIGHTS_SCHEMA_FALLBACK
     elif family == "data_dictionary":
         schema = _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK
+    elif _normalize_page_name(page) == MY_PORTFOLIO_PAGE_NAME:
+        schema = _CANONICAL_MY_PORTFOLIO_SCHEMA_FALLBACK
     else:
         schema = _CANONICAL_INSTRUMENT_SCHEMA_FALLBACK
     return [h for _, h in schema], [k for k, _ in schema]
@@ -675,6 +865,7 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
         headers, keys = _SCHEMA_CACHE[page]
         return list(headers), list(keys)
 
+    _fallback_reason = "unknown"
     try:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
 
@@ -683,9 +874,16 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
         if headers and keys:
             _SCHEMA_CACHE[page] = (list(headers), list(keys))
             return headers, keys
-    except Exception:
-        pass
+        _fallback_reason = "schema_registry returned empty headers/keys"
+    except Exception as exc:
+        _fallback_reason = "schema_registry import/lookup raised: %s" % (exc,)
 
+    logger.warning(
+        "[investment_advisor v2.16.0] schema_registry unavailable for page=%r "
+        "(%s); serving STATIC fallback schema (v2.15.0 contract). Live sheet "
+        "width may differ if the registry has advanced.",
+        page, _fallback_reason,
+    )
     headers, keys = _schema_fallback_for_page(page)
     _SCHEMA_CACHE[page] = (list(headers), list(keys))
     return headers, keys
