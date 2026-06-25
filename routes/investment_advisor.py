@@ -2,11 +2,30 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.16.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.16.1
 ================================================================================
 BRIDGE-FIRST • ROOT-OWNER ALIGNED • TOP10 FAIL-SOFT • STARTUP-SAFE
 AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE • SCHEMA v2.6.0
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • EXCEPTION-MESSAGE-CAPTURE
+
+WHY v2.16.1 — Insights fallback content fix + version-constant correction
+-------------------------------------------------------------------------------
+Two fixes on top of v2.16.0:
+
+- 🔑 FIX [HIGH]: _CANONICAL_INSIGHTS_SCHEMA_FALLBACK content corrected. v2.16.0
+     left it at the retired v2.2.0 shape (symbol / last_updated_riyadh). Verified
+     against core.analysis.insights_builder (the module that WRITES the sheet) and
+     schema_registry v2.15.0: the live Insights_Analysis contract is
+     [section, item, metric, value, notes, source, sort_order] -- `symbol` and
+     `last_updated_riyadh` were removed back in v2.11.0. Fallback now matches, so a
+     registry-down fallback serves the correct degraded-mode Insights contract.
+     Both shapes are width 7, which is why the import-time length asserts never
+     caught it -- content drift is invisible to a length check.
+- 🔑 FIX [MEDIUM]: INVESTMENT_ADVISOR_VERSION bumped 2.15.0 -> 2.16.1. v2.16.0
+     bumped the docstring title but left this runtime constant at 2.15.0, so
+     /v1/advanced/health and /meta (and every meta.version) still reported 2.15.0
+     -- making the deploy unverifiable from the endpoint. Now the reported version
+     tracks the file. Confirm deploy via /v1/advanced/health -> "version":"2.16.1".
 
 WHY v2.16.0 — schema-contract realignment to the live registry (v2.15.0)
 -------------------------------------------------------------------------------
@@ -33,7 +52,7 @@ router served a 90/93 schema against 115/118 live sheets — silently dropping
      degraded-mode contract drift is visible instead of hidden.
 - FIX: import-time consistency assertion added for My_Portfolio (122).
 - DOC: dependency matrix updated (schema_registry 2.6.0/90/93 -> 2.15.0/115/118/122).
-- KNOWN LIMITATION (flagged, NOT changed here): _CANONICAL_INSIGHTS_SCHEMA_FALLBACK
+- KNOWN LIMITATION [RESOLVED in v2.16.1, see above]: _CANONICAL_INSIGHTS_SCHEMA_FALLBACK
      content diverges from the registry (file: symbol / last_updated_riyadh;
      registry: source / sort_order) although both are width 7, so the length asserts
      never caught it. Left untouched pending confirmation of whether the registry or
@@ -183,7 +202,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.15.0"
+INVESTMENT_ADVISOR_VERSION = "2.16.1"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -553,11 +572,11 @@ _CANONICAL_MY_PORTFOLIO_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
 _CANONICAL_INSIGHTS_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("section", "Section"),
     ("item", "Item"),
-    ("symbol", "Symbol"),
     ("metric", "Metric"),
     ("value", "Value"),
     ("notes", "Notes"),
-    ("last_updated_riyadh", "Last Updated (Riyadh)"),
+    ("source", "Source"),
+    ("sort_order", "Sort Order"),
 ]
 _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("sheet", "Sheet"),
@@ -879,7 +898,7 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
         _fallback_reason = "schema_registry import/lookup raised: %s" % (exc,)
 
     logger.warning(
-        "[investment_advisor v2.16.0] schema_registry unavailable for page=%r "
+        "[investment_advisor v2.16.1] schema_registry unavailable for page=%r "
         "(%s); serving STATIC fallback schema (v2.15.0 contract). Live sheet "
         "width may differ if the registry has advanced.",
         page, _fallback_reason,
