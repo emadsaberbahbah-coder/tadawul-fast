@@ -19,6 +19,11 @@ on:
         required: false
         type: string
         default: ""
+      universe:
+        description: "Override universe for THIS run (space/comma separated; blank -> vars.NEWS_ARCHIVE_UNIVERSE)"
+        required: false
+        type: string
+        default: ""
       dry_run:
         description: "Fetch + print only, do not write the sheet"
         required: false
@@ -97,11 +102,23 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-          # Optional: override the universe without touching code.
+          # Universe: scheduled runs use vars.NEWS_ARCHIVE_UNIVERSE; a manual
+          # run may override it per-run via the `universe` input, normalized and
+          # passed as --universe in the run step (CLI > env in resolve_universe).
           NEWS_ARCHIVE_UNIVERSE: ${{ vars.NEWS_ARCHIVE_UNIVERSE }}
+          INPUT_UNIVERSE: ${{ github.event.inputs.universe }}
           NEWS_ARCHIVE_DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
           set -euo pipefail
-          python scripts/news_archive_collector.py \
-            --sheet-id "${TARGET_SHEET_ID}" \
-            --verbose
+          CMD=(python scripts/news_archive_collector.py --sheet-id "${TARGET_SHEET_ID}" --verbose)
+          # Per-run universe override (workflow_dispatch only). Accepts space-
+          # OR comma-separated symbols; normalized to the --universe flag, which
+          # takes precedence over NEWS_ARCHIVE_UNIVERSE. Scheduled runs leave
+          # INPUT_UNIVERSE empty and fall back to the env var.
+          if [[ -n "${INPUT_UNIVERSE:-}" ]]; then
+            UNI="${INPUT_UNIVERSE//,/ }"
+            read -ra UNI_TOKENS <<< "${UNI}"
+            CMD+=(--universe "${UNI_TOKENS[@]}")
+            echo "Universe override (${#UNI_TOKENS[@]} symbols): ${UNI_TOKENS[*]}"
+          fi
+          "${CMD[@]}"
