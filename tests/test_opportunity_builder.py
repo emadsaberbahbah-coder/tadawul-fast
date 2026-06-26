@@ -2,7 +2,7 @@
 """
 tests/test_opportunity_builder.py
 ================================================================================
-OPPORTUNITY BUILDER CONTRACT TESTS — v1.0.0  (HARDENED / CI-FRIENDLY / NO-PRINT)
+OPPORTUNITY BUILDER CONTRACT TESTS — v1.1.0  (HARDENED / CI-FRIENDLY / NO-PRINT)
 ================================================================================
 Emad Bahbah – Tadawul Fast Bridge
 
@@ -11,6 +11,18 @@ the §4.2 hard-gate truth table, the §4.3 score-weight invariant, the §4.4
 wealth math + L7 funding identity, the verdict<->gate-trace contract, the
 §5 frozen zone payload, and the v1.0.2 conflict-parse fix (regression guard so
 "No conflict" can never silently flip back to blocking).
+
+v1.1.0 — regression coverage for the funding/selection gates that now run in
+production (previously verified only by ad-hoc scripts):
+  * v1.0.9 engine-ROI ordering (TFB_OPP_RANK_BY_ENGINE_ROI) — enabling it
+    reorders the INVEST pool by the engine 12M forecast; OFF is unchanged.
+  * v1.0.9 unfunded-watch (TFB_OPP_UNFUNDED_WATCH) — a 0-SAR (capital-exhausted)
+    pick becomes a WATCH near-miss, not a 0-SAR "executable" ticket.
+  * v1.0.14 minimum-ticket floor (TFB_OPP_MIN_TICKET_SAR) — a sub-floor ticket
+    is deferred (not funded); OFF (floor 0) funds it as before; criteria
+    accept + negative-clamp + default-OFF.
+  * v1.0.15 floor near-miss labeling — a floor deferral surfaces as a "Funding"
+    near-miss, never mislabeled as a diversification cap.
 
 WHY v1.0.0
 - stdlib unittest only (no network, no prints, CI-friendly) — matches
@@ -237,6 +249,106 @@ class TestOpportunityBuilderContract(unittest.TestCase):
             self.assertEqual(a.get("verdict"), "DO_NOT_INVEST")
             self.assertEqual((a.get("first_fail") or {}).get("gate"),
                              "Conflict")
+
+    # -- v1.0.14 minimum-ticket floor (TFB_OPP_MIN_TICKET_SAR) -------------
+
+    def _floor_scenario(self, min_ticket: float) -> Dict[str, Any]:
+        # max_weight 100% so the first name absorbs most cash, leaving a small
+        # remainder that the greedy sizer would spend on a 2-share scrap.
+        rows = [_row(symbol="AAA.SR", sector="SecA",
+                     current_price=300.0, intrinsic_value=390.0),
+                _row(symbol="BBB.SR", sector="SecB",
+                     current_price=50.0, intrinsic_value=65.0)]
+        return ob.build_opportunity_payload(
+            rows,
+            criteria={"max_weight_pct": 100.0, "max_selected": 5,
+                      "min_ticket_sar": min_ticket},
+            portfolio={"cash_available_sar": 10300})
+
+    def test_min_ticket_floor_defers_subfloor_ticket(self) -> None:
+        p = self._floor_scenario(1000.0)
+        sel = {t["symbol"] for t in p["selected"]}
+        self.assertIn("AAA.SR", sel, "properly-sized ticket must fund")
+        self.assertNotIn("BBB.SR", sel, "sub-floor ticket must NOT fund")
+        bbb = next(a for a in p["candidates_rows"] if a["symbol"] == "BBB.SR")
+        self.assertIn("minimum ticket floor", (bbb.get("deferral") or ""),
+                      "sub-floor name must carry the floor deferral reason")
+
+    def test_min_ticket_floor_off_funds_subfloor(self) -> None:
+        # OFF (floor 0): the same scrap IS funded -> parity with pre-floor.
+        sel = {t["symbol"] for t in self._floor_scenario(0.0)["selected"]}
+        self.assertIn("BBB.SR", sel,
+                      "with the floor OFF the sub-floor ticket funds (parity)")
+
+    def test_min_ticket_floor_criteria_accept_and_clamp(self) -> None:
+        self.assertEqual(
+            ob.make_criteria({"min_ticket_sar": 1500}).get("min_ticket_sar"),
+            1500.0)
+        self.assertEqual(  # negative clamps to 0 (OFF)
+            ob.make_criteria({"min_ticket_sar": -5}).get("min_ticket_sar"),
+            0.0)
+        self.assertEqual(  # default OFF
+            ob.make_criteria().get("min_ticket_sar"), 0.0)
+
+    # -- v1.0.15 floor near-miss labeling ----------------------------------
+
+    def test_floor_near_miss_labeled_funding_not_diversification(self) -> None:
+        nm = {n["symbol"]: n for n in self._floor_scenario(1000.0)["near_miss"]}
+        self.assertIn("BBB.SR", nm,
+                      "sub-floor name should surface in near_miss")
+        self.assertEqual(
+            nm["BBB.SR"]["failed_gate"], "Funding",
+            "a floor deferral must be a Funding near-miss, not Diversification")
+        self.assertIn("minimum ticket floor", nm["BBB.SR"]["required"])
+
+    # -- v1.0.9 engine-ROI ordering (TFB_OPP_RANK_BY_ENGINE_ROI) -----------
+
+    def test_engine_roi_ranking_reorders_when_enabled(self) -> None:
+        # Identical opportunity_score (equal valuation upside), but ZZZ has the
+        # higher engine 12M forecast. OFF -> symbol-tiebreak order (AAA first);
+        # ON  -> engine-forecast order (ZZZ first).
+        rows = [_row(symbol="AAA.SR", sector="SecA", expected_roi_12m=12.0),
+                _row(symbol="ZZZ.SR", sector="SecZ", expected_roi_12m=30.0)]
+        port = {"cash_available_sar": 500000}
+        off = ob.build_opportunity_payload(
+            rows, criteria={"max_selected": 5,
+                            "rank_by_engine_roi_enabled": False},
+            portfolio=port)
+        on = ob.build_opportunity_payload(
+            rows, criteria={"max_selected": 5,
+                            "rank_by_engine_roi_enabled": True},
+            portfolio=port)
+        self.assertEqual([t["symbol"] for t in off["selected"]],
+                         ["AAA.SR", "ZZZ.SR"], "OFF: opportunity_score order")
+        self.assertEqual([t["symbol"] for t in on["selected"]],
+                         ["ZZZ.SR", "AAA.SR"], "ON: engine-forecast order")
+
+    def test_engine_roi_ranking_criteria_accept(self) -> None:
+        self.assertFalse(
+            ob.make_criteria().get("rank_by_engine_roi_enabled"))
+        self.assertTrue(
+            ob.make_criteria({"rank_by_engine_roi_enabled": True}).get(
+                "rank_by_engine_roi_enabled"))
+
+    # -- v1.0.9 unfunded-watch (capital exhausted, TFB_OPP_UNFUNDED_WATCH) --
+
+    def test_unfunded_watch_reclasses_zero_sar_pick_to_watch(self) -> None:
+        # First name consumes all cash exactly; the next INVEST name sizes to
+        # 0 SAR. ON -> a WATCH near-miss, not a 0-SAR "executable" ticket.
+        rows = [_row(symbol="AAA.SR", sector="SecA", current_price=100.0),
+                _row(symbol="BBB.SR", sector="SecB", current_price=100.0)]
+        p = ob.build_opportunity_payload(
+            rows,
+            criteria={"max_weight_pct": 100.0, "max_selected": 5,
+                      "unfunded_watch_enabled": True},
+            portfolio={"cash_available_sar": 10000})
+        sel = {t["symbol"] for t in p["selected"]}
+        self.assertIn("AAA.SR", sel)
+        self.assertNotIn("BBB.SR", sel,
+                         "a 0-SAR pick must not be an executable ticket")
+        nm = {n["symbol"]: n for n in p["near_miss"]}
+        self.assertEqual(nm.get("BBB.SR", {}).get("failed_gate"), "Funding")
+        self.assertEqual(nm.get("BBB.SR", {}).get("verdict"), "WATCH")
 
     # -- robustness ---------------------------------------------------------
 
