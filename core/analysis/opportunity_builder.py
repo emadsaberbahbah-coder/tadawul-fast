@@ -1,9 +1,33 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.13  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.0.14  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
-                 engine-ROI ordering, both env-gated DEFAULT-OFF)
+                 engine-ROI ordering + minimum-ticket floor, all env-gated
+                 DEFAULT-OFF)
+
+v1.0.14 [MINIMUM-TICKET FLOOR — env-gated DEFAULT-OFF (TFB_OPP_MIN_TICKET_SAR).
+WHY: the greedy §4.4 sizer funds picks top-down until deployable capital is
+exhausted. With the engine-ROI reorder (v1.0.9) packing the high-forecast names
+first, the last few hundred SAR of cash were still spent on the next ranked
+names, producing 1-2 share "executable tickets" worth a token amount (live
+2026-06-27 build: G.US 214 SAR / 2 sh, BHC.US 75 SAR / 4 sh) sitting beside the
+properly-sized ~15k positions. A sub-floor scrap is not an executable position.
+FIX (default OFF when min_ticket_sar <= 0 => byte-identical v1.0.13): when
+min_ticket_sar > 0, a sized ticket whose suggested SAR is 0 < x < floor is NOT
+appended as a funded ticket — it is deferred with an explicit "below minimum
+ticket floor" reason (selected = No), exactly like the diversification-cap
+deferrals. Because `remaining` only shrinks as funding proceeds, once it drops
+below the floor every later pick is sub-floor too and is likewise deferred, so
+the greedy tail of scraps stops and the funded list holds only properly-sized
+tickets. suggested == 0 (capital FULLY exhausted) is intentionally left to the
+existing v1.0.9 unfunded_watch path; this floor covers the 0 < x < floor band
+it did not. Recommend enabling alongside TFB_OPP_UNFUNDED_WATCH so both the
+0-SAR and sub-floor bands reclass consistently. SAR-only by design: a
+share-count floor would wrongly cut a legitimate large-SAR position in a
+high-priced name (e.g. one share of an 11,000-SAR stock). One new criterion key
+(min_ticket_sar) + one env read + one clamp + one guarded block in
+_select_and_size; every v1.0.13 function carried verbatim, none removed.
 
 v1.0.13 [DIVERSIFIER SECTOR-QUALITY — env-gated DEFAULT-OFF. Two related
 selection-time corrections behind ONE switch, TFB_OPP_SECTOR_NORMALIZE.
@@ -338,7 +362,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.13"
+OPPORTUNITY_BUILDER_VERSION = "1.0.14"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -480,6 +504,13 @@ DEFAULT_CRITERIA = {
     # sizing / mechanics (env-overridable; see policy block)
     "max_weight_pct": 15.0,
     "lot_size": 1,
+    # v1.0.14: minimum executable-ticket floor in SAR. DEFAULT 0.0 = OFF
+    # (byte-identical). When >0, a sized ticket whose suggested SAR is below
+    # this floor is NOT rendered as an executable ticket — it is deferred with
+    # a "below minimum ticket floor" reason (selected = No), so the greedy
+    # sizer stops spending the last scraps of cash on sub-floor 1-2 share
+    # positions and the funded list contains only properly-sized tickets.
+    "min_ticket_sar": 0.0,
     "near_miss_n": 10,
     "review_days": 30,
     "stop_floor_pct": 8.0,
@@ -533,7 +564,7 @@ _CRITERIA_FLOAT_KEYS = (
     "required_roi_pct", "required_ann_roi_pct", "min_reliability", "min_dq",
     "min_rr", "max_weight_pct", "stop_floor_pct", "stop_vol_mult",
     "stop_max_pct", "pf_max_sector_pct", "min_engine_roi_pct",
-    "max_valuation_roi_pct", "max_data_age_hours",
+    "max_valuation_roi_pct", "max_data_age_hours", "min_ticket_sar",
 )
 _CRITERIA_INT_KEYS = (
     "max_selected", "period_months", "max_per_sector", "max_per_market",
@@ -795,6 +826,9 @@ def _env_overrides():
         "investability_gate_enabled": _env_investability_gate(),
         "unfunded_watch_enabled": _env_unfunded_watch(),
         "rank_by_engine_roi_enabled": _env_rank_by_engine_roi(),
+        "min_ticket_sar": _env_float(
+            "TFB_OPP_MIN_TICKET_SAR",
+            DEFAULT_CRITERIA["min_ticket_sar"]),
         "audit_rows_max": _env_int("TFB_OPP_AUDIT_ROWS_MAX",
                                    DEFAULT_CRITERIA["audit_rows_max"]),
     }
@@ -826,6 +860,8 @@ def make_criteria(overrides=None):
         crit["lot_size"] = 1
     if crit["period_months"] < 1:
         crit["period_months"] = 1
+    if crit.get("min_ticket_sar", 0.0) < 0:
+        crit["min_ticket_sar"] = 0.0
     return crit
 
 
@@ -1659,6 +1695,19 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                 "Diversification: market cap reached (" + mkt + ")")
             continue
         suggested, shares = _size_one(cand, criteria, budget_base, remaining)
+        # v1.0.14: minimum-ticket floor (OFF when min_ticket_sar <= 0). A sized
+        # ticket below the floor is not a meaningful executable position (e.g.
+        # 75 SAR / 4 sh from the last scraps of cash). Defer it instead of
+        # funding it; `remaining` only shrinks, so once it falls below the floor
+        # every later pick is sub-floor too and is likewise deferred. suggested
+        # == 0 (capital fully exhausted) is intentionally left to the existing
+        # unfunded_watch path; this floor handles the 0 < suggested < min band.
+        _min_ticket = criteria.get("min_ticket_sar", 0.0) or 0.0
+        if _min_ticket > 0.0 and 0.0 < suggested < _min_ticket:
+            deferrals[cand["symbol"]] = (
+                "Unfunded \u2014 sized ticket " + _fmt_sar(suggested) +
+                " below minimum ticket floor " + _fmt_sar(_min_ticket))
+            continue
         # §4.2 combined post-action portfolio sector cap (only if sized & ctx)
         if (suggested > 0 and pf["portfolio_value"] > 0 and
                 sector_ctx["available"]):
