@@ -17,6 +17,13 @@
 #   does not pull in the heavy live-dependent tests (pandas, credentials,
 #   provider I/O). Those belong to a separate, heavier workflow.
 #
+#   core/analysis/opportunity_builder.py is included here because it is pure
+#   stdlib (json/math/os/re/datetime — no numpy, pandas, or I/O), so its
+#   contract suite runs in the same lean image. This guards the funding /
+#   selection gates that now run in production (engine-ROI ordering, the
+#   minimum-ticket floor, unfunded-watch, and the floor near-miss labeling)
+#   against a silent regression.
+#
 # MAINTENANCE NOTE
 #   Earlier revisions also gated core/investment_advisor.py + scripts/calibrator.py
 #   and their suites (test_calibrator.py, test_advisor_cost_basis_gate.py). Those
@@ -32,15 +39,19 @@ on:
     paths:
       - 'core/stats.py'
       - 'core/quality_gates.py'
+      - 'core/analysis/opportunity_builder.py'
       - 'tests/test_stats.py'
       - 'tests/test_quality_gates.py'
+      - 'tests/test_opportunity_builder.py'
       - '.github/workflows/tests.yml'
   pull_request:
     paths:
       - 'core/stats.py'
       - 'core/quality_gates.py'
+      - 'core/analysis/opportunity_builder.py'
       - 'tests/test_stats.py'
       - 'tests/test_quality_gates.py'
+      - 'tests/test_opportunity_builder.py'
   workflow_dispatch: {}
 
 jobs:
@@ -61,7 +72,7 @@ jobs:
           python -m pip install "numpy>=1.26.4,<2.0.0" pytest
 
       - name: Syntax gate (compile foundations)
-        run: python -m py_compile core/stats.py core/quality_gates.py
+        run: python -m py_compile core/stats.py core/quality_gates.py core/analysis/opportunity_builder.py
 
       - name: Run foundation test suites
         env:
@@ -69,4 +80,5 @@ jobs:
         run: |
           python -m pytest -q \
             tests/test_stats.py \
-            tests/test_quality_gates.py
+            tests/test_quality_gates.py \
+            tests/test_opportunity_builder.py
