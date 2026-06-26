@@ -2,8 +2,41 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.99.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.99.1
 ================================================================================
+
+WHY v5.99.1 - FINANCIALS FUNDAMENTALS EXEMPTION (Fix AM; env-gated, DEFAULT OFF
+              -> verdicts / data_quality_score / ranks byte-identical to v5.99.0
+              when off; no schema change, schema stays 115)
+-------------------------------------------------------------------------------
+Fix AM - SAUDI BANKS PERMANENTLY BENCHED BY THE D/E+FCF GATE WITH NO DATA PATH.
+  The investability gate requires debt_to_equity AND free_cash_flow for every
+  Equity-classed row (v5.79.1 deliberately KEPT banks/REITs in that path, on the
+  reasoning that they carry real leverage and their proper metrics -- P/B, ROE,
+  NIM / FFO -- belong in asset-class SCORING, not this completeness gate). That
+  reasoning assumes D/E and FCF are OBTAINABLE. For Saudi (.SR) banks they are
+  not: Yahoo reports neither, and the EODHD fundamentals fallback (v5.79.0) has
+  ZERO Saudi coverage. Result: SNB (1180), Alinma (1150), Saudi Awwal/SAB (1060)
+  and Banque Saudi Fransi (1050) -- each of which the engine's OWN read rates
+  ACCUMULATE -- are demoted to WATCH for "Incomplete fundamentals (D/E, FCF)"
+  with no remediation possible, regardless of merit, and the INVESTABLE funnel
+  is starved to a handful of names. This is the dashboard's single largest
+  benching, and it is a data-availability artefact, not a quality judgement.
+  FIX: a new default-OFF switch (_gate_financials_fundamentals_exempt_enabled,
+  env TFB_GATE_FINANCIALS_FUNDAMENTALS_EXEMPT) extends fundamentals_apply so a
+  FINANCIALS-sector row (_row_is_financials_sector: sector reads as financials in
+  either vocabulary -- GICS "Financials" from _KSA_SYMBOL_SECTOR or Yahoo
+  "Financial Services" -- or names banking/insurance) gets the SAME treatment
+  ETFs/funds/commodities/FX/indices already get: D/E+FCF drop out of both the
+  INVESTABLE requirement AND the DQ completeness components. It reuses the
+  existing exemption mechanism end-to-end (one added clause), so EVERY other gate
+  still governs the row -- the negative-forecast demotion (Fix S), the DQ floor,
+  reco-family, risk, and the strict final-approval tier (Fix P) all still apply.
+  This is a PRAGMATIC override for the no-data reality, NOT a claim that leverage
+  is irrelevant to a bank; the correct long-term fix remains bank-specific
+  quality metrics in core/scoring.py. DEFAULT OFF because it reverses a
+  deliberate v5.79.1 decision -- enable explicitly after review. Reversible:
+  unset TFB_GATE_FINANCIALS_FUNDAMENTALS_EXEMPT -> v5.99.0 verdict exactly.
 
 WHY v5.99.0 - TWO UPSTREAM DATA-CORRECTNESS FIXES (both env-gated, default ON,
               byte-identical when off; no schema/verdict-contract change)
@@ -2030,7 +2063,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.99.0"
+__version__ = "5.99.1"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -3371,6 +3404,17 @@ _GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES: frozenset = frozenset({
     "exchange traded fund", "exchange-traded fund", "money market fund",
 })
 
+# v5.99.1 (Fix AM): sector tokens that mark a FINANCIALS row (bank / insurer /
+# diversified financial) across BOTH provider vocabularies -- GICS "Financials"
+# (the _KSA_SYMBOL_SECTOR label) and Yahoo "Financial Services" -- plus bank /
+# insurance industry words. Substring-matched against the lowercased sector so a
+# capitalization or vocabulary difference still resolves. "financ" alone covers
+# "financials" and "financial services"; "bank"/"insur" catch granular labels.
+# Used ONLY by the default-OFF financials fundamentals exemption below.
+_GATE_FINANCIALS_SECTOR_TOKENS: Tuple[str, ...] = (
+    "financ", "bank", "insur",
+)
+
 
 def _investability_gate_enabled() -> bool:
     """v5.78.0: master switch for the Investability Gate (default ON). Set
@@ -3394,6 +3438,45 @@ def _gate_block_negative_roi_enabled() -> bool:
     if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
         return False
     return True
+
+
+def _gate_financials_fundamentals_exempt_enabled() -> bool:
+    """v5.99.1 (Fix AM): when ON, a FINANCIALS-sector row (bank / insurer /
+    diversified financial) is exempted from the D/E + FCF completeness
+    requirement -- the same treatment _GATE_FUNDAMENTALS_EXEMPT_TOKENS already
+    gives ETFs / funds / commodities / FX / indices. DEFAULT OFF -> verdicts,
+    data_quality_score and ranks are byte-identical to v5.99.0 (the financials
+    branch of fundamentals_apply never fires).
+
+    WHY this exists (and why it is OFF by default): the v5.79.1 design
+    deliberately KEPT banks / REITs in the D/E+FCF path, on the rationale that
+    they are Equity-classed, carry real leverage, and their correct metrics
+    (P/B, ROE, NIM / FFO) belong in asset-class-specific SCORING, not this
+    completeness gate. That rationale assumes D/E and FCF are OBTAINABLE. For
+    Saudi (.SR) banks they are not: Yahoo reports neither, and the EODHD
+    fundamentals fallback (v5.79.0) has zero Saudi coverage -- so EVERY Saudi
+    bank is benched to WATCH for "Incomplete fundamentals (D/E, FCF)" with NO
+    remediation path, regardless of merit, and the INVESTABLE funnel is starved.
+    This switch is a PRAGMATIC override for that no-data reality; it is NOT a
+    claim that leverage is irrelevant to a bank. The proper fix remains
+    bank-specific quality metrics in core/scoring.py. With it ON, the engine's
+    OWN recommendation governs a financials row while every OTHER gate still
+    applies (negative-forecast demotion, the DQ floor, reco-family, risk, the
+    strict final-approval tier). Set TFB_GATE_FINANCIALS_FUNDAMENTALS_EXEMPT to
+    1/true/on/yes to enable; unset to restore the v5.99.0 verdict exactly."""
+    raw = (os.getenv("TFB_GATE_FINANCIALS_FUNDAMENTALS_EXEMPT") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "enabled", "enable"}
+
+
+def _row_is_financials_sector(row: Dict[str, Any]) -> bool:
+    """v5.99.1 (Fix AM): True when the row's sector reads as financials in
+    either provider vocabulary (GICS "Financials" / Yahoo "Financial Services")
+    or names banking / insurance. Pure, fail-safe -- a blank sector returns
+    False so a row with no sector is never accidentally exempted."""
+    sector = _safe_str(row.get("sector")).lower()
+    if not sector:
+        return False
+    return any(tok in sector for tok in _GATE_FINANCIALS_SECTOR_TOKENS)
 
 
 def _gate_governing_forecast_roi(row: Dict[str, Any]) -> Optional[float]:
@@ -4228,6 +4311,11 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     fundamentals_apply = not (
         any(tok in asset_class for tok in _GATE_FUNDAMENTALS_EXEMPT_TOKENS)
         or industry in _GATE_FUNDAMENTALS_EXEMPT_INDUSTRIES
+        # v5.99.1 (Fix AM): optional, DEFAULT-OFF financials-sector exemption --
+        # banks/insurers have no obtainable D/E+FCF on the Saudi book (see
+        # _gate_financials_fundamentals_exempt_enabled). OFF -> this clause is
+        # False, so fundamentals_apply is byte-identical to v5.99.0.
+        or (_gate_financials_fundamentals_exempt_enabled() and _row_is_financials_sector(row))
     )
 
     # -- data_quality_score: weighted completeness across decision buckets ----
