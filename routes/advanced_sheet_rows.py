@@ -1,178 +1,123 @@
 #!/usr/bin/env python3
-# routes/analysis_sheet_rows.py
+# routes/advanced_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.5.1  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
+ADVANCED Sheet-Rows Router — RETIRED ORPHAN (NOT MOUNTED) — v4.4.0
+================================================================================
+THIS FILE IS NOT THE LIVE ANALYSIS ROUTER. DO NOT CONFUSE THE TWO.
+
+  • This module  = routes/advanced_sheet_rows.py   (RETIRED / orphan).
+  • The LIVE sheet-rows routers are:
+        routes/analysis_sheet_rows.py    (owns /v1/analysis/sheet-rows; v4.5.1+)
+        routes/advanced_analysis.py      (owns /sheet-rows, /v1/schema/...)
+
+main.py v8.11.2 REMOVED `routes.advanced_sheet_rows` from the controlled route
+plan, so NOTHING in this file is mounted at runtime. It is retained ONLY so that
+legacy string-based resolver fallbacks referencing
+"routes.advanced_sheet_rows._run_advanced_sheet_rows_impl" still import cleanly;
+those fallbacks sit AFTER `routes.advanced_analysis` in every resolver chain, so
+this code is effectively never reached. The body below is kept BYTE-FOR-BYTE at
+v4.4.0 — only the header identity (filename comment, this banner, and the version
+constant name) was corrected — so there is zero behavioural drift.
+
+>>> IF YOU ARE EDITING SHEET-ROWS CONTRACT LOGIC, you want
+>>> routes/analysis_sheet_rows.py (currently v4.5.1), NOT this file. <<<
+
+(Historical note: this module began life as a copy of the analysis router, which
+is why its internal log lines and the legacy header still read "Analysis". That
+copy lineage is exactly what caused a file-naming mix-up; this identity block
+exists to make sure it never happens again.)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
-DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • GLOBAL-RANK
-GLOBAL-DEDUP
+DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • NO-HARDCODED-CLAMP
 
-WHY v4.5.1 — Top_10 contract no longer clamped to the stale 93-col width
------------------------------------------------------------------------
+WHY v4.4.0 — registry-derived contract widths (stop truncating Top_10)
+----------------------------------------------------------------------
 
-`_resolve_contract` read the live registry correctly (118 columns for
-Top_10_Investments via schema_registry.helpers) but then passed the result
-through `_ensure_top10_contract`, whose `_pad_contract(..., 93)` TRUNCATED the
-118 columns to a hardcoded 93-column width left over from the schema_registry
-v2.6.0 era. The truncated 93 then failed the `expected_len` (=118) guard, so the
-function silently fell back to the static 93-column Top_10 contract -- dropping
-`recommendation`, `recommendation_reason`, and the entire analyst/decision block
-from /v1/analysis/sheet-rows (GET + POST). Every other sheet-rows endpoint
-(advisor, advanced, enriched, root) already returned the full 118; only this
-router clamped. v4.5.1 keeps the registry-resolved Top_10 contract intact: it
-ensures the three Top10 special fields are present (defensive; the registry
-already includes them) and pads to the registry-derived `expected_len` (118)
-rather than the hardcoded 93. Registry-hit path only; the static fallback
-(registry-unavailable degraded mode) is unchanged. No other page is affected and
-no functions were added or removed.
+Root problem this release fixes: the router carried HARD-CODED column
+widths (instrument 90, Top_10 93). The live engine grew to v5.78.0 = 115
+canonical keys (Fix K added `forecast_source` + the 8 investability-gate
+columns: data_quality_score, forecast_reliability_score,
+provider_engine_conflict, conflict_type, final_decision_basis,
+investability_status, final_action, block_reason). With the width frozen at
+90/93, columns 91-115 — the ENTIRE investability gate — were silently
+sliced off before reaching the sheet, even when the registry served them.
 
-WHY v4.5.0 — page-level symbol de-duplication [GLOBAL-DEDUP]
------------------------------------------------------------
+Top_10 was the worst offender: it had THREE independent truncation points,
+all clamping to the literal `93`:
+  (1) `_ensure_top10_contract` ended with `_pad_contract(hdrs, ks, 93)`.
+  (2) `_resolve_contract` then required `len == expected_len`; a 118-col
+      registry result clamped to 93 failed that check and fell THROUGH to
+      the static 93-col fallback — discarding the registry entirely.
+  (3) `_normalize_external_payload` RE-clamped already-correct headers back
+      to 93 via `_ensure_top10_contract(hdrs, ks)` with no width.
 
-Same root cause as the v4.4.0 rank bug, one layer over: the engine de-dupes
-symbols only WITHIN each upstream batch, never across the whole page. So a
-symbol that lands in two different batches survives to the sheet twice -- the
-2026-06-15 audit found three Market_Leaders symbols duplicated (3092.SR,
-7030.SR, 4200.SR), each as a stale cached row PLUS a fresh fetch (two distinct
-snapshots, different prices and timestamps -- the signature of a pipeline
-emitting both, not a copy/paste artifact). A financial advisor seeing the same
-instrument twice, at two prices and two ranks, is a visible correctness defect.
-This router is the single funnel where the COMPLETE page exists before
-pagination, so v4.5.0 collapses duplicate-symbol rows here, keeping the FRESHEST
-copy of each symbol (by last_updated_utc; a dated row beats an undated one;
-ties keep the first appearance). It runs in _normalize_external_payload
-immediately BEFORE the global rank pass and BEFORE the slice -- so the rank pass
-never counts a symbol twice, and the surviving row keeps its first-appearance
-slot. The dedup key is the symbol only; rows without a symbol are never merged.
-Restricted to the four cross-sectional market pages (Market_Leaders /
-Global_Markets / Commodities_FX / Mutual_Funds) -- My_Portfolio (which may hold
-the same symbol in multiple lots) and Top_10 (own selector/dedup) are excluded,
-matching the rank pass's scope exactly. When dedup actually drops a row it logs
-one INFO line ([GLOBAL-DEDUP]) so the upstream anomaly is visible in Render logs
-without a sheet diff. Reversible: TFB_ANALYSIS_GLOBAL_DEDUP=0 passes all rows
-through unchanged -> byte-identical to v4.4.0.
+v4.4.0 removes every hard-coded width literal from the contract path and
+derives widths in two layers:
+  - RUNTIME (authoritative): `_expected_len(page)` prefers the live
+    registry's `get_sheet_len(page)`. The router now faithfully passes
+    through whatever the deployed registry serves — 90 today, 115/118 once
+    the schema_registry pass (cascade #3) lands — with ZERO further edits.
+  - STATIC FALLBACK (offline only): every width derives from
+    `len(_CANONICAL_80_KEYS)`; Top_10 derives as `instrument_len +
+    _TOP10_EXTRA_COUNT`. The static snapshot is used ONLY when the registry
+    import fails entirely. When that snapshot is later synced to the live
+    115-key list (during cascade #3), all derived widths auto-update.
 
-WHY v4.4.0 — page-level Rank (Overall) [GLOBAL-RANK]
-----------------------------------------------------
+NOTE ON VISIBILITY: this router can only surface columns the registry (or
+the static fallback) actually NAMES. It does not — and must not — fabricate
+the 25 gate-column headers/keys. So the gate columns become visible on the
+sheet once `core.sheets.schema_registry` serves them (cascade #3). Until
+then this router faithfully tracks the registry's current width with no
+truncation and no fabricated placeholders. `_ensure_top10_contract` now also
+guarantees it will NEVER truncate below the canonical+extras it already
+holds, regardless of the target width passed in.
 
-Market pages are assembled/served upstream in batches, and the engine's
-_apply_rank_overall ranks each batch independently. The sheet therefore
-showed the SAME Rank (Overall) value (1..N) repeated once per batch instead
-of a single cross-sectional ranking -- the 2026-06-15 audit found rank 1 on
-nine different Market_Leaders rows whose overall scores ran 41.7..74.3. This
-router is the single funnel where the COMPLETE page exists before pagination,
-so v4.4.0 re-ranks Rank (Overall) here, authoritatively, in one pass over the
-whole page (in _normalize_external_payload, immediately BEFORE the limit/offset
-slice). Eligibility mirrors the engine's own rule so the two never disagree: a
-row is ranked iff it has a numeric overall_score AND is not demoted by the
-engine's data-trust gate (the low_data_trust warnings tag, the only trust
-signal projected to this layer -- the engine's schema stays 115). Eligible
-rows are sorted by overall_score descending (stable on ties) and numbered
-1..N; every ineligible row's Rank (Overall) is blanked, preserving the
-engine's no-score AND v5.88.0 LOW-trust drops. Restricted to the four
-cross-sectional market pages (Market_Leaders / Global_Markets / Commodities_FX
-/ Mutual_Funds); My_Portfolio keeps its holding order and Top_10 uses
-top10_rank. rank_overall is the only field mutated. Reversible:
-TFB_ANALYSIS_GLOBAL_RANK=0 passes upstream rank_overall through unchanged ->
-byte-identical to v4.3.1.
-
-WHY v4.3.1 — diagnostic visibility + proxy hardening
-----------------------------------------------------
-
-This router is a multi-tier dispatcher: root_proxy (advanced_analysis) →
-adapter (core.data_engine_v2.get_sheet_rows) → engine-direct → local
-fail-soft. Each tier has its own failure modes, but in v4.3.0 the
-dispatcher's response only said which tier "won" — not WHY the tiers
-that lost lost. When the response was a placeholder fallback, debugging
-required reading server logs to find out which tier failed and how.
-
-v4.3.1 makes every tier's outcome visible in `meta` so you can see the
-full delegation chain from one request without log access. The same
-hardening pattern we applied to advanced_analysis v4.3.4, data_engine_v2
-v5.51.0, enriched_quote v8.4.0, and investment_advisor v2.15.0.
-
-v4.3.1 changes (from v4.3.0)
+v4.4.0 changes (from v4.3.1)
 ----------------------------
+[FIX-A] `_EXPECTED_SHEET_LENGTHS` moved below the canonical lists and
+    derived from `len(_CANONICAL_80_KEYS)` / `len(_INSIGHTS_KEYS)` /
+    `len(_DICTIONARY_KEYS)`; Top_10 = `_CANONICAL_INSTRUMENT_LEN +
+    _TOP10_EXTRA_COUNT`. Static-fallback-only; runtime prefers the registry.
+[FIX-B] `_ensure_top10_contract` takes optional `target_len`; the literal
+    `93` is gone. Hard invariant: never truncates below canonical+extras.
+[FIX-C] `_resolve_contract` passes the registry-derived `expected_len` into
+    `_ensure_top10_contract`, so a 118-col registry result is preserved
+    rather than clamped-then-discarded.
+[FIX-D] `_normalize_external_payload` passes `_expected_len(page)` into
+    `_ensure_top10_contract` (was an unwidth'd re-clamp to 93).
+[FIX-E] `_static_contract` and `_expected_len` use the derived widths
+    instead of the literals 90 / 93 / 7 / 9.
 
-[FIX-1] Module-level CORE_ENGINE_SOURCE constant + explicit `_get_engine`
-    cascade. Previously `_get_engine` returned `(engine, source)` tuple
-    but the source string was constructed inline and didn't survive
-    across requests. v4.3.1 stores the live binding in CORE_ENGINE_SOURCE
-    (separate from the existing CORE_GET_SHEET_ROWS_SOURCE for the
-    adapter) and uses an explicit cascade that prefers
-    `core.data_engine_v2.get_engine()` first, then `get_engine_if_ready()`,
-    then legacy. Mirrors the pattern from advanced_analysis v4.3.1.
+NO BEHAVIOR CHANGE on the instrument pages when the registry width is
+unchanged: `_pad_contract` already returned exactly `expected_len`, so those
+paths are byte-equivalent at 90. The change is purely "track the registry /
+stop clamping Top_10." All v4.3.1 diagnostic visibility is preserved verbatim.
 
-[FIX-2] `_call_core_sheet_rows_best_effort` now returns
-    `(payload, source, call_summary, outcome_label)`. v4.3.0 returned
-    just `(payload, source)` and discarded all per-attempt diagnostic.
-    v4.3.1 captures each call attempt's outcome (success | typeerror |
-    error) with full error_class + error_message. Surfaces in
-    `meta.adapter_call_summary` and `meta.adapter_call_outcome`.
-
-[FIX-3] `_proxy_callable` adds asyncio.wait_for timeout. v4.3.0 had no
-    timeout — a hung downstream proxy (advanced_analysis,
-    advanced_sheet_rows) would hang the entire request indefinitely.
-    Configurable via TFB_ANALYSIS_PROXY_TIMEOUT_SEC env (default 25s).
-    Also captures full exception class + message (was just str(e)).
-
-[FIX-4] `_fetch_analysis_rows` returns `(results, diagnostic)` tuple
-    with `engine_method_used` and `engine_method_summary` (per-method
-    outcome with error_class and error_message). v4.3.0 returned just
-    the results dict and lost which method actually produced data —
-    making it impossible to tell from the response whether the engine
-    used `get_enriched_quotes_batch` (preferred) or fell through to
-    per-symbol `get_quote_dict` (slower path).
-
-[FIX-5] `_normalize_external_payload` and the dispatcher tier-handling
-    code preserve `upstream_call_summary`, `upstream_call_outcome`,
-    `upstream_call_status` from advanced_analysis v4.3.4's bridge
-    metadata. v4.3.0 used `final_meta = dict(ext_meta or {})` which
-    preserved them already, but v4.3.1 makes the preservation explicit
-    and also copies `bridge_call_outcome`, `bridge_call_summary`,
-    `bridge_error` from investment_advisor v2.15.0's response shape.
-
-[FIX-6] Diagnostic logging. `[analysis_sheet_rows v4.3.1]` prefix on
-    warnings. ANALYSIS_SHEET_ROWS_DEBUG=1 enables DEBUG level.
-
-NO BUSINESS LOGIC CHANGED. v4.3.0 callers continue to work unchanged.
-v4.3.0's schema-alignment work (90/93/7/9 column counts, view + insights
-columns, Wave 3 alignment) is preserved verbatim. Conservative
-placeholders, internal-field stripping, density-aware quality scoring,
-"warn" status handling — all preserved.
-
-Verification after deploy
--------------------------
-1. `/v1/analysis/health` will show `adapter_source` (existed in v4.3.0)
-   plus a new `engine_source` showing the live engine binding.
-2. `/v1/analysis/sheet-rows?sheet=Market_Leaders&limit=1` — when the
-   root_proxy fails, the response now contains:
-     - `meta.proxy_call_outcome` (success | timeout | raised | missing)
-     - `meta.proxy_error` (full message, not just class name)
-     - `meta.adapter_call_summary` (per-attempt outcomes)
-     - `meta.adapter_call_outcome`
-     - `meta.engine_method_used` (which engine method actually worked)
-     - `meta.engine_method_summary`
-3. When advanced_analysis v4.3.4 returns rows, its
-   `meta.upstream_call_summary` / `meta.upstream_call_outcome` continue
-   to flow through unchanged.
+v4.3.1 changes (preserved verbatim)
+-----------------------------------
+[FIX-1] Module-level CORE_ENGINE_SOURCE + explicit `_get_engine` cascade.
+[FIX-2] `_call_core_sheet_rows_best_effort` returns
+    `(payload, source, call_summary, outcome_label)`.
+[FIX-3] `_proxy_callable` adds asyncio.wait_for timeout + full error capture
+    (TFB_ANALYSIS_PROXY_TIMEOUT_SEC, default 25s).
+[FIX-4] `_fetch_analysis_rows` returns `(results, diagnostic)` with
+    `engine_method_used` / `engine_method_summary`.
+[FIX-5] Upstream diagnostic meta (`upstream_call_*`, `bridge_call_*`)
+    preserved end-to-end.
+[FIX-6] `[analysis_sheet_rows v4.x]` diagnostic logging; ANALYSIS_SHEET_ROWS_DEBUG=1.
 
 WHY v4.3.0 (preserved verbatim)
 -------------------------------
-- BUMP: static fallback contract widened from 85 → 90 columns to align
-    with `core.sheets.schema_registry` v2.6.0 (Wave 1).
-- BUMP: `_EXPECTED_SHEET_LENGTHS` instrument pages 85 → 90, Top10 88 → 93.
-- BUMP: `_static_contract` instrument padding 85 → 90.
-- BUMP: `_ensure_top10_contract` padding 88 → 93.
-- BUMP: `_expected_len` default 85 → 90.
-- KEEP: every v4.2.0 fix preserved unchanged.
+- BUMP: static fallback contract widened 85 -> 90 (schema_registry v2.6.0, Wave 1).
+- BUMP: `_EXPECTED_SHEET_LENGTHS` instrument 85 -> 90, Top10 88 -> 93.
+- BUMP: `_static_contract` instrument 85 -> 90; `_ensure_top10_contract` 88 -> 93.
+- KEEP: every v4.2.0 fix preserved.
 
 WHY v4.2.0 (preserved verbatim)
 -------------------------------
-- FIX [HIGH]: static fallback contract widened from 80 → 85 columns
-    aligned with `core.sheets.schema_registry` v2.5.0+.
+- FIX [HIGH]: static fallback contract widened 80 -> 85 (schema_registry v2.5.0+).
 
 WHY v4.1.2 (preserved verbatim)
 -------------------------------
@@ -180,20 +125,20 @@ WHY v4.1.2 (preserved verbatim)
     values (no fake numerics); internal-field stripping; "warn" status
     handling; page+body context to engine; density-aware quality scoring.
 
-Co-deployment matrix (Wave 2A + Wave 3)
----------------------------------------
+Co-deployment matrix (Wave 2A + Wave 3 + Fix-K gate)
+----------------------------------------------------
   Module                                Version    Notes
   -------                               -------    -----
-  core/sheets/schema_registry.py        2.6.0      90/93/7/9 column layout
+  core/data_engine_v2.py                5.78.0     115 canonical keys (Fix K gate)
+  core/sheets/schema_registry.py        2.6.0*     *90/93 live; pending bump to 115/118 (cascade #3)
   core/scoring.py                       5.1.0      View + Insights producer
   core/reco_normalize.py                7.1.0      conviction-floor gating
   core/insights_builder.py              1.0.0      pure-function module
   core/investment_advisor.py            5.2.0      v2.6.0 fallback schemas
-  core/data_engine_v2.py                5.51.0     hardened structured errors
-  routes/advanced_analysis.py           4.3.4      diagnostic-emitting bridge
+  routes/advanced_analysis.py           4.x*       *pending registry-derived widths (cascade #2)
   routes/enriched_quote.py              8.4.0      v2-binding cascade
   routes/investment_advisor.py          2.15.0     bridge-error capture
-  routes/analysis_sheet_rows.py         4.3.1      this file
+  routes/analysis_sheet_rows.py         4.4.0      this file — registry-derived, tracks canonical
 ================================================================================
 """
 
@@ -210,7 +155,7 @@ import re
 import time
 import uuid
 from dataclasses import is_dataclass
-from datetime import date, datetime, time as dt_time, timezone
+from datetime import date, datetime, time as dt_time
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -287,7 +232,13 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.5.1"
+# Canonical, clearly-named identity for THIS module (routes/advanced_sheet_rows).
+ADVANCED_SHEET_ROWS_VERSION = "4.4.0"
+# Backward-compat alias: this file began as a copy of the analysis router, so its
+# internal log lines and the response 'version' field reference
+# ANALYSIS_SHEET_ROWS_VERSION (14 references below). Keep it as an alias so none
+# of them break; the module's TRUE identity is ADVANCED_SHEET_ROWS_VERSION above.
+ANALYSIS_SHEET_ROWS_VERSION = ADVANCED_SHEET_ROWS_VERSION
 
 # v4.3.1 [FIX-1]: tracks which engine binding actually loaded. Updated at
 # request time inside _get_engine(). Surfaced in meta.engine_source on
@@ -321,27 +272,13 @@ _INSIGHTS_PAGE = "Insights_Analysis"
 _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
-# v4.4.0 [GLOBAL-RANK]: the four cross-sectional market pages that carry a
-# page-wide Rank (Overall). My_Portfolio keeps its holding order, Top_10 uses
-# top10_rank, and Insights / Data_Dictionary are not ranked -- all excluded.
-_RANKED_MARKET_PAGES = {
-    "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
-}
-# v4.4.0 [GLOBAL-RANK]: data_engine_v2 v5.88.0 tags a LOW-trust row with this
-# token in `warnings`; this router preserves that row's blank Rank (Overall)
-# instead of re-ranking it (keeps the engine's trust drop intact).
-_LOW_TRUST_TAG = "low_data_trust"
-
-_EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 90,
-    "Global_Markets": 90,
-    "Commodities_FX": 90,
-    "Mutual_Funds": 90,
-    "My_Portfolio": 90,
-    _TOP10_PAGE: 93,
-    _INSIGHTS_PAGE: 7,
-    _DICTIONARY_PAGE: 9,
-}
+# v4.4.0 [FIX-A]: _EXPECTED_SHEET_LENGTHS is now DERIVED from the canonical
+# list lengths and defined AFTER the canonical lists below (see the
+# "v4.4.0 derived contract widths" block). It is a STATIC-FALLBACK ONLY map:
+# _expected_len() always prefers the live registry's get_sheet_len() first,
+# so these values are used only when the registry is unavailable. Removing
+# the early hard-coded {90, 93, 7, 9} dict is what lets Top_10 track the
+# canonical instead of clamping to a frozen 93.
 
 _TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
@@ -486,6 +423,34 @@ _INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last
 
 _DICTIONARY_HEADERS = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
 _DICTIONARY_KEYS = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
+
+# =============================================================================
+# v4.4.0 derived contract widths (TRACKS CANONICAL — no hardcoded 90/93)
+# =============================================================================
+# Every instrument-page width derives from len(_CANONICAL_80_KEYS); Top_10
+# derives as instrument_len + the Top_10 extras count. When the static
+# canonical snapshot grows (e.g. synced to the live 115-key registry during
+# the schema_registry pass / cascade #3), ALL of these auto-update with zero
+# further edits to this router. At runtime _expected_len() still prefers the
+# live registry's get_sheet_len() over this static-fallback map, so the
+# router faithfully tracks whatever the deployed registry serves (90 today,
+# 115/118 once the registry pass lands).
+_CANONICAL_INSTRUMENT_LEN: int = len(_CANONICAL_80_KEYS)
+_TOP10_EXTRA_COUNT: int = len(_TOP10_REQUIRED_FIELDS)
+_TOP10_STATIC_LEN: int = _CANONICAL_INSTRUMENT_LEN + _TOP10_EXTRA_COUNT
+_INSIGHTS_STATIC_LEN: int = len(_INSIGHTS_KEYS)
+_DICTIONARY_STATIC_LEN: int = len(_DICTIONARY_KEYS)
+
+_EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
+    "Market_Leaders": _CANONICAL_INSTRUMENT_LEN,
+    "Global_Markets": _CANONICAL_INSTRUMENT_LEN,
+    "Commodities_FX": _CANONICAL_INSTRUMENT_LEN,
+    "Mutual_Funds": _CANONICAL_INSTRUMENT_LEN,
+    "My_Portfolio": _CANONICAL_INSTRUMENT_LEN,
+    _TOP10_PAGE: _TOP10_STATIC_LEN,
+    _INSIGHTS_PAGE: _INSIGHTS_STATIC_LEN,
+    _DICTIONARY_PAGE: _DICTIONARY_STATIC_LEN,
+}
 
 EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
     "Market_Leaders": ["2222.SR", "1120.SR", "2010.SR", "7010.SR", "AAPL", "MSFT", "NVDA", "GOOGL"],
@@ -974,30 +939,63 @@ def _pad_contract(headers: Sequence[str], keys: Sequence[str], expected_len: int
     return hdrs[:expected_len], ks[:expected_len]
 
 
-def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str], target_len: Optional[int] = None) -> Tuple[List[str], List[str]]:
+    """v4.4.0 [FIX-B]: append the 3 Top_10 extras, then pad to `target_len`.
+
+    The literal `93` clamp this function used to end with was the PRIMARY
+    Top_10 truncation point: it silently dropped every column past index 93
+    — including the entire v5.78.0 investability gate (forecast_source + 8
+    gate columns) once the registry/canonical grew to 115. v4.4.0 removes
+    the literal.
+
+    Width semantics:
+      - target_len is None  -> pad to the natural width (canonical + extras),
+        i.e. no truncation, no extra padding.
+      - target_len provided -> pad UP to it, but NEVER truncate below the
+        canonical+extras we already hold. This is the hard anti-truncation
+        invariant: even if a caller passes a stale/too-small width (e.g. 93
+        against a 115-col canonical), real columns are preserved.
+
+    Callers that need a specific width (registry-derived in _resolve_contract
+    / _normalize_external_payload, or static-fallback-derived in
+    _static_contract) pass it explicitly so the contract tracks the live
+    schema instead of a frozen constant.
+    """
     hdrs, ks = _complete_schema_contract(headers, keys)
     for field in _TOP10_REQUIRED_FIELDS:
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, 93)
+    natural_len = len(ks)
+    if target_len is None:
+        effective_len = natural_len
+    else:
+        try:
+            effective_len = max(int(target_len), natural_len)
+        except Exception:
+            effective_len = natural_len
+    return _pad_contract(hdrs, ks, effective_len)
 
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
+    # v4.4.0 [FIX-E]: widths derived from list lengths (was literal 90/93/7/9).
     if page == _TOP10_PAGE:
-        h, k = _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS)
+        h, k = _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, target_len=_TOP10_STATIC_LEN)
         return h, k, "static_canonical_top10"
     if page == _INSIGHTS_PAGE:
-        h, k = _pad_contract(_INSIGHTS_HEADERS, _INSIGHTS_KEYS, 7)
+        h, k = _pad_contract(_INSIGHTS_HEADERS, _INSIGHTS_KEYS, _INSIGHTS_STATIC_LEN)
         return h, k, "static_canonical_insights"
     if page == _DICTIONARY_PAGE:
-        h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
+        h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, _DICTIONARY_STATIC_LEN)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, 90)
+    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, _CANONICAL_INSTRUMENT_LEN)
     return h, k, "static_canonical_instrument"
 
 
 def _expected_len(page: str) -> int:
+    # v4.4.0: runtime-authoritative — prefer the live registry's width so the
+    # router tracks whatever the deployed schema_registry serves. Falls back
+    # to the derived static map only when the registry is unavailable.
     if callable(get_sheet_len):
         try:
             n = int(get_sheet_len(page))  # type: ignore[misc]
@@ -1005,7 +1003,7 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    return _EXPECTED_SHEET_LENGTHS.get(page, 90)
+    return _EXPECTED_SHEET_LENGTHS.get(page, _CANONICAL_INSTRUMENT_LEN)
 
 
 def _schema_columns_from_any(spec: Any) -> List[Any]:
@@ -1089,20 +1087,10 @@ def _resolve_contract(page: str) -> Tuple[List[str], List[str], Any, str]:
     if headers and keys:
         headers, keys = _complete_schema_contract(headers, keys)
         if page == _TOP10_PAGE:
-            # v4.5.1 FIX: the registry now provides the FULL Top_10 contract
-            # (118 columns incl. the Top10 special fields). The legacy
-            # _ensure_top10_contract() padded/clamped to a hardcoded 93-column
-            # width, which TRUNCATED the registry's 118 columns and then failed
-            # the expected_len (=118) guard below -- silently falling back to the
-            # stale 93-column static contract, dropping recommendation /
-            # recommendation_reason / the analyst block on /v1/analysis/sheet-rows.
-            # Ensure the required Top10 fields exist (defensive; the registry
-            # already includes them), then pad to the registry-derived length.
-            for _f in _TOP10_REQUIRED_FIELDS:
-                if _f not in keys:
-                    keys.append(_f)
-                    headers.append(_TOP10_REQUIRED_HEADERS[_f])
-            headers, keys = _pad_contract(headers, keys, expected_len)
+            # v4.4.0 [FIX-C]: pass the registry-derived width so a 118-col
+            # registry result is preserved (was clamped to 93, then the
+            # len-check failed and discarded the registry entirely).
+            headers, keys = _ensure_top10_contract(headers, keys, target_len=expected_len)
         else:
             headers, keys = _pad_contract(headers, keys, expected_len)
         if len(headers) == expected_len and len(keys) == expected_len:
@@ -1123,166 +1111,6 @@ def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[
     if limit <= 0:
         return rows[start:]
     return rows[start:start + max(0, int(limit))]
-
-
-def _coerce_rank_score(value: Any) -> Optional[float]:
-    """v4.4.0 [GLOBAL-RANK]: parse overall_score to float for ranking.
-    None / blank / non-numeric / NaN -> None (row is then not ranked)."""
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        f = float(value)
-        return f if f == f else None  # reject NaN
-    s = str(value).strip()
-    if not s:
-        return None
-    try:
-        f = float(s.replace(",", ""))
-    except (TypeError, ValueError):
-        return None
-    return f if f == f else None
-
-
-def _global_rank_enabled() -> bool:
-    """v4.4.0 [GLOBAL-RANK]: master switch for the page-level Rank (Overall)
-    pass (default ON). When OFF, rank_overall is passed through from upstream
-    unchanged so the response is byte-identical to v4.3.1. Set
-    TFB_ANALYSIS_GLOBAL_RANK to 0/false/off to disable."""
-    raw = (os.getenv("TFB_ANALYSIS_GLOBAL_RANK", "") or "").strip().lower()
-    return raw not in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
-
-
-def _apply_global_rank_overall(rows: List[Dict[str, Any]], page: str) -> int:
-    """v4.4.0 [GLOBAL-RANK]: recompute Rank (Overall) ACROSS THE WHOLE PAGE in
-    one pass, in-place. Returns the number of rows ranked (for telemetry).
-
-    Must be called on the COMPLETE page BEFORE any limit/offset slice. A row is
-    ranked iff it has a numeric overall_score AND is not demoted by the engine's
-    data-trust gate (the low_data_trust warnings tag) -- mirroring the engine's
-    own _apply_rank_overall rule so the two layers never disagree. Eligible rows
-    are sorted by overall_score descending (stable on ties) and numbered 1..N;
-    every ineligible row's rank_overall is blanked, preserving the engine's
-    no-score and LOW-trust drops. Only rank_overall is mutated. No-op unless the
-    feature is enabled AND the page is one of the cross-sectional market pages."""
-    if not _global_rank_enabled() or page not in _RANKED_MARKET_PAGES:
-        return 0
-    eligible: List[Tuple[float, Dict[str, Any]]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        score = _coerce_rank_score(row.get("overall_score"))
-        warns = str(row.get("warnings") or "").lower()
-        if score is None or _LOW_TRUST_TAG in warns:
-            # Not rankable -> clear any per-batch rank it arrived with so the
-            # blank correctly signals "not ranked" (engine no-score / LOW-trust).
-            if "rank_overall" in row:
-                row["rank_overall"] = ""
-            continue
-        eligible.append((score, row))
-    # Stable sort by score descending (key is the float only -- never compares
-    # dict rows -- so ties preserve arrival order, matching the engine).
-    eligible.sort(key=lambda t: t[0], reverse=True)
-    for rank, (_score, row) in enumerate(eligible, start=1):
-        row["rank_overall"] = rank
-    return len(eligible)
-
-
-def _row_dedup_key(row: Dict[str, Any]) -> str:
-    """v4.5.0 [GLOBAL-DEDUP]: canonical symbol key for collapsing duplicate rows
-    on a market page. Empty when the row has no symbol -- such rows are never
-    merged (a missing symbol is not evidence two rows are the same instrument)."""
-    sym = row.get("symbol")
-    if sym is None:
-        return ""
-    return str(sym).strip().upper()
-
-
-def _row_freshness(row: Dict[str, Any]) -> Optional[datetime]:
-    """v4.5.0 [GLOBAL-DEDUP]: parse last_updated_utc to an aware datetime, used
-    to choose the freshest of two same-symbol rows. None when missing or
-    unparseable. Falls back to the `last_updated` alias; tolerates a trailing
-    'Z'; naive timestamps are assumed UTC so comparisons never raise."""
-    raw = row.get("last_updated_utc")
-    if raw in (None, ""):
-        raw = row.get("last_updated")
-    if raw in (None, ""):
-        return None
-    s = str(raw).strip()
-    if not s:
-        return None
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(s)
-    except (TypeError, ValueError):
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _dedup_is_fresher(candidate: Dict[str, Any], incumbent: Dict[str, Any]) -> bool:
-    """v4.5.0 [GLOBAL-DEDUP]: True iff `candidate` should replace `incumbent` as
-    the surviving row for a shared symbol. Freshness is by last_updated_utc; a
-    row with a known timestamp beats one without; equal/both-unknown keeps the
-    incumbent (stable -- the first appearance wins ties)."""
-    c = _row_freshness(candidate)
-    i = _row_freshness(incumbent)
-    if c is None and i is None:
-        return False
-    if i is None:
-        return True
-    if c is None:
-        return False
-    return c > i
-
-
-def _global_dedup_enabled() -> bool:
-    """v4.5.0 [GLOBAL-DEDUP]: master switch for page-level symbol de-duplication
-    (default ON). When OFF, every row passes through unchanged so the response is
-    byte-identical to v4.4.0. Set TFB_ANALYSIS_GLOBAL_DEDUP to 0/false/off."""
-    raw = (os.getenv("TFB_ANALYSIS_GLOBAL_DEDUP", "") or "").strip().lower()
-    return raw not in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
-
-
-def _apply_global_symbol_dedup(rows: List[Dict[str, Any]], page: str) -> int:
-    """v4.5.0 [GLOBAL-DEDUP]: collapse duplicate-symbol rows ACROSS THE WHOLE
-    PAGE, keeping the freshest copy (by last_updated_utc) of each symbol, in
-    place on the supplied list. Returns the number of rows dropped (telemetry).
-
-    Must run on the COMPLETE page BEFORE the global rank pass and BEFORE any
-    slice. The engine de-dupes only within each upstream batch, so a symbol that
-    lands in two batches (typically a stale cached row plus a fresh fetch)
-    survives to here as a visible duplicate; collapsing first also stops the rank
-    pass from counting a symbol twice. The surviving row keeps the slot of the
-    symbol's FIRST appearance; only same-symbol duplicates are removed, and rows
-    without a symbol are never merged. No-op unless enabled AND the page is one of
-    the cross-sectional market pages."""
-    if not _global_dedup_enabled() or page not in _RANKED_MARKET_PAGES:
-        return 0
-    seen: Dict[str, int] = {}            # symbol key -> index in `kept`
-    kept: List[Dict[str, Any]] = []
-    dropped = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            kept.append(row)
-            continue
-        key = _row_dedup_key(row)
-        if not key:
-            kept.append(row)
-            continue
-        if key not in seen:
-            seen[key] = len(kept)
-            kept.append(row)
-            continue
-        # Duplicate symbol: keep whichever copy is fresher, at the original slot.
-        idx = seen[key]
-        if _dedup_is_fresher(row, kept[idx]):
-            kept[idx] = row
-        dropped += 1
-    if dropped:
-        rows[:] = kept                   # mutate the caller's list in place
-    return dropped
 
 
 def _key_variants(key: str) -> List[str]:
@@ -1859,16 +1687,9 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
     ks = list(keys or payload_keys or [])
 
     if page == _TOP10_PAGE:
-        # v4.5.1 FIX: do NOT clamp to the hardcoded 93-col width here either
-        # (this is the path that actually shapes the emitted payload). The
-        # caller passes the registry-resolved 118-col contract; ensure the three
-        # Top10 special fields exist, then pad to the registry-derived
-        # expected length rather than the stale 93. (See header WHY v4.5.1.)
-        for _f in _TOP10_REQUIRED_FIELDS:
-            if _f not in ks:
-                ks.append(_f)
-                hdrs.append(_TOP10_REQUIRED_HEADERS[_f])
-        hdrs, ks = _pad_contract(hdrs, ks, _expected_len(page))
+        # v4.4.0 [FIX-D]: pass the registry-derived width (was an unwidth'd
+        # re-clamp to the literal 93, the third Top_10 truncation point).
+        hdrs, ks = _ensure_top10_contract(hdrs, ks, target_len=_expected_len(page))
     else:
         hdrs, ks = _pad_contract(hdrs, ks, _expected_len(page))
 
@@ -1880,37 +1701,6 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
     normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
     if page == _TOP10_PAGE:
         normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
-
-    # v4.5.0 [GLOBAL-DEDUP]: collapse duplicate-symbol rows over the FULL page,
-    # keeping the freshest copy of each symbol, BEFORE the rank pass (so a symbol
-    # is never ranked twice) and BEFORE the slice. The engine de-dupes only
-    # within each upstream batch, so cross-batch duplicates (typically a stale
-    # cached row + a fresh fetch) only collapse here. No-op off market pages or
-    # when TFB_ANALYSIS_GLOBAL_DEDUP is disabled. When it drops a row it logs one
-    # INFO line so the upstream anomaly is visible without a sheet diff.
-    _deduped_n = _apply_global_symbol_dedup(normalized_rows, page)
-    if _deduped_n:
-        try:
-            logger.info(
-                "[analysis_sheet_rows v%s] GLOBAL-DEDUP page=%r dropped=%d duplicate-symbol row(s)",
-                ANALYSIS_SHEET_ROWS_VERSION, page, _deduped_n,
-            )
-        except Exception:
-            pass
-
-    # v4.4.0 [GLOBAL-RANK]: authoritative page-wide Rank (Overall) over the FULL
-    # page, BEFORE the limit/offset slice -- so the whole page is ranked as one
-    # cross-section instead of per upstream batch. No-op off market pages or
-    # when TFB_ANALYSIS_GLOBAL_RANK is disabled.
-    _ranked_n = _apply_global_rank_overall(normalized_rows, page)
-    if _analysis_sheet_rows_debug_enabled() and _ranked_n:
-        try:
-            logger.debug(
-                "[analysis_sheet_rows v%s] GLOBAL-RANK page=%r ranked=%d of %d rows",
-                ANALYSIS_SHEET_ROWS_VERSION, page, _ranked_n, len(normalized_rows),
-            )
-        except Exception:
-            pass
 
     normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
     status_out, error_out, ext_meta = _extract_status_error(ext)
@@ -2135,21 +1925,15 @@ def _ordered_payload_candidates(page: str, root_payload: Optional[Dict[str, Any]
 async def _get_engine(request: Request) -> Tuple[Optional[Any], str]:
     """v4.3.1 [FIX-1]: explicit engine binding with source tracking.
 
-    v4.3.0 walked through bindings with a generic loop. v4.3.1 explicitly
-    probes core.data_engine_v2 FIRST (the v5.51.0 engine with hardening),
-    tracks the live binding in module-level CORE_ENGINE_SOURCE, and
-    returns it via tuple. Surfaced via meta.engine_source on every
-    response. Mirrors the pattern from advanced_analysis v4.3.1,
-    enriched_quote v8.4.0, and investment_advisor v2.15.0.
+    Probes core.data_engine_v2 FIRST (the v5.51.0+ engine with hardening),
+    tracks the live binding in module-level CORE_ENGINE_SOURCE, and returns
+    it via tuple. Surfaced via meta.engine_source on every response.
 
     Cascade order (most-preferred first):
       1. request.app.state.engine|data_engine|quote_engine|cache_engine
       2. core.data_engine_v2.get_engine() — async factory
       3. core.data_engine_v2.get_engine_if_ready() — sync ready-check
       4. core.data_engine.get_engine() — legacy fallback (BUG INDICATOR)
-
-    Returns: (engine, source_string) where source_string is the live
-    binding identifier (also stored in module-level CORE_ENGINE_SOURCE).
     """
     global CORE_ENGINE_SOURCE
 
@@ -2218,7 +2002,7 @@ async def _get_engine(request: Request) -> Tuple[Optional[Any], str]:
                 try:
                     logger.warning(
                         "[analysis_sheet_rows v%s] all v2 binding patterns failed; using legacy "
-                        "core.data_engine (this loses v5.51.0 enrichment — investigate v2 exports)",
+                        "core.data_engine (this loses v5.51.0+ enrichment — investigate v2 exports)",
                         ANALYSIS_SHEET_ROWS_VERSION,
                     )
                 except Exception:
@@ -2250,18 +2034,11 @@ def _dict_is_symbol_map(d: Dict[str, Any], symbols: Sequence[str]) -> bool:
 # v4.3.1 [FIX-4] _fetch_analysis_rows returns (results, diagnostic) tuple
 # =============================================================================
 async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, settings: Any, schema: Any, page: str = "", body: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """v4.3.1 [FIX-4]: now returns (results_map, diagnostic) tuple.
+    """v4.3.1 [FIX-4]: returns (results_map, diagnostic) tuple.
 
-    diagnostic has:
-      - engine_method_used (str | None) — which method actually returned data
-      - engine_method_summary (list[dict]) — per-method outcome:
-          {method, outcome: success_*/missing/typeerror/empty/raised,
-           error_class?, error_message?}
-      - engine_source (str) — the live engine binding from CORE_ENGINE_SOURCE
-
-    Mirrors the pattern from enriched_quote v8.4.0's _fetch_analysis_rows.
+    diagnostic: engine_method_used / engine_method_summary / engine_source.
     Same preferred-method order and per-symbol fallback logic as v4.3.0,
-    just with full per-attempt diagnostic capture.
+    with full per-attempt diagnostic capture.
     """
     diagnostic: Dict[str, Any] = {
         "engine_method_used": None,
@@ -2430,14 +2207,8 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, se
 async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], List[Dict[str, Any]], str]:
     """v4.3.1 [FIX-2]: returns (payload, source, call_summary, outcome).
 
-    call_summary: per-attempt list with outcome (success | typeerror |
-    error), kwargs_keys, error_class?, error_message?
-
-    outcome: one of:
-      - "success"                       — payload returned (may be dict)
-      - "all_signatures_typed_mismatch" — every variant raised TypeError
-      - "raised"                        — non-TypeError raised; captured
-      - "adapter_unavailable"           — core_get_sheet_rows is None
+    outcome: success | all_signatures_typed_mismatch | raised |
+    adapter_unavailable | no_attempts_executed.
     """
     if core_get_sheet_rows is None:
         return None, None, [], "adapter_unavailable"
@@ -2469,7 +2240,6 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
                 return res, "core:get_sheet_rows", call_summary, "success"
             if isinstance(res, list):
                 return {"row_objects": res}, "core:get_sheet_rows", call_summary, "success"
-            # Other types — return as-is wrapped if possible
             return None, "core:get_sheet_rows", call_summary, "success"
         except TypeError as e:
             call_summary.append({
@@ -2515,18 +2285,11 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
 # v4.3.1 [FIX-3] Proxy call with timeout + better error capture
 # =============================================================================
 async def _proxy_callable(*, module_names: Sequence[str], function_name: str, request: Request, body: Dict[str, Any], mode: str, include_matrix_q: Optional[bool], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str], x_request_id: Optional[str], page: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    """v4.3.1 [FIX-3]: adds asyncio.wait_for timeout + full error capture.
+    """v4.3.1 [FIX-3]: asyncio.wait_for timeout + full error capture.
 
-    v4.3.0 had no timeout — a hung downstream proxy hung the entire request.
-    v4.3.1 wraps the call in asyncio.wait_for with TFB_ANALYSIS_PROXY_TIMEOUT_SEC
-    (default 25s). Also captures full exception class + message (was just str(e)).
-
-    meta keys added by v4.3.1:
-      - proxy_call_outcome: success | timeout | raised | missing_callable |
-        non_dict_result | import_failed
-      - proxy_error: full "ClassName: message" string (was just message)
-      - proxy_error_class: just the exception class name
-      - proxy_timeout_sec: the timeout used
+    meta keys: proxy_call_outcome (success | timeout | raised |
+    missing_callable | non_dict_result | import_failed), proxy_error,
+    proxy_error_class, proxy_timeout_sec.
     """
     timeout_sec = _analysis_proxy_timeout_sec()
     meta: Dict[str, Any] = {
@@ -2686,6 +2449,17 @@ async def analysis_sheet_rows_health(request: Request) -> Dict[str, Any]:
         "allowed_pages_count": len(_safe_allowed_pages()),
         "auth": auth_summary,
         "path": str(getattr(getattr(request, "url", None), "path", "")),
+        # v4.4.0: expose the registry-derived contract widths the router is
+        # serving so operators can confirm at-a-glance whether Top_10 is at
+        # the full canonical width or still tracking a stale 90/93 registry.
+        "contract_widths": {
+            "instrument_static_fallback": _CANONICAL_INSTRUMENT_LEN,
+            "top10_static_fallback": _TOP10_STATIC_LEN,
+            "market_leaders_effective": _expected_len("Market_Leaders"),
+            "top10_effective": _expected_len(_TOP10_PAGE),
+            "insights_effective": _expected_len(_INSIGHTS_PAGE),
+            "dictionary_effective": _expected_len(_DICTIONARY_PAGE),
+        },
         "proxy_targets": [
             "routes.advanced_analysis._run_advanced_sheet_rows_impl",
             "routes.advanced_sheet_rows._run_advanced_sheet_rows_impl",
@@ -2754,6 +2528,10 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                 "schema_only": schema_only,
                 "engine_source": engine_source,
                 "adapter_source": CORE_GET_SHEET_ROWS_SOURCE,
+                # v4.4.0: surface the resolved width so schema-only callers
+                # (e.g. setup_sheet_headers) can confirm they're getting the
+                # full canonical, not a clamped contract.
+                "contract_len": len(keys),
             },
         )
 
