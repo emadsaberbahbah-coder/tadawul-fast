@@ -956,10 +956,21 @@ def test_insights_schema_matches_live_version():
                 "should have been replaced in schema_registry v3.4.0."
             )
     else:
-        # Baseline: v2.2.0 has 7 columns ending in last_updated_riyadh
-        for required_key in ("section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"):
+        # Baseline (current key/value REPORT schema, registry v2.15.0):
+        # Insights_Analysis is a Section / Item / Metric / Value / Notes /
+        # Source / Sort Order report page -- it is NOT a per-symbol page. The
+        # earlier v2.2.0 shape (which carried `symbol` + `last_updated_riyadh`)
+        # was retired during the v2.x line; the current 7-column report schema
+        # carries `source` + `sort_order` instead.
+        for required_key in ("section", "item", "metric", "value", "notes", "source", "sort_order"):
             assert required_key in keys, (
-                f"Insights_Analysis (v2.x) missing baseline key '{required_key}'. "
+                f"Insights_Analysis (report schema) missing baseline key "
+                f"'{required_key}'. Detected SCHEMA_VERSION={caps['version_str']}."
+            )
+        for retired_key in ("symbol", "last_updated_riyadh"):
+            assert retired_key not in keys, (
+                f"Insights_Analysis still carries retired per-symbol key "
+                f"'{retired_key}'; the report schema dropped it. "
                 f"Detected SCHEMA_VERSION={caps['version_str']}."
             )
 
@@ -1038,38 +1049,54 @@ def test_schema_pages_endpoint_returns_required_sheets(monkeypatch: pytest.Monke
 def test_sheet_spec_endpoint_is_reachable_and_schema_shaped(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    """v9.3.1: /v1/schema/sheet-spec serves ONE sheet per call (flat contract).
+
+    The GET endpoint returns a single sheet's spec with `headers`/`keys` at the
+    TOP LEVEL (defaulting to the first required sheet when no page is given). It
+    does NOT return an all-sheets map under a `data` envelope -- that pre-v4.10.0
+    expectation is stale (the endpoint 400s on ?page=ALL and ignores ?all=true).
+    To cover every required sheet we request each one explicitly via ?page=.
+    """
     sr = _load_schema_module()
     app = _build_test_app(monkeypatch, sr)
 
     from fastapi.testclient import TestClient
 
     with TestClient(app) as client:
+        # Default (no page) -- must be reachable and flat-shaped.
         r = client.get("/v1/schema/sheet-spec", headers=_auth_headers())
         assert r.status_code == 200, (
             f"/v1/schema/sheet-spec failed: {r.status_code} {r.text[:300]}"
         )
-
         data = r.json()
-        payload = data.get("data") if isinstance(data, dict) else None
-        assert isinstance(
-            payload, (dict, list)
-        ), f"Unexpected /sheet-spec payload type: {type(payload)}"
+        assert isinstance(data, dict), (
+            f"Unexpected /sheet-spec payload type: {type(data)}"
+        )
+        assert isinstance(data.get("headers"), list) and isinstance(
+            data.get("keys"), list
+        ), "/sheet-spec default response missing top-level headers/keys lists"
 
-        if isinstance(payload, dict):
-            for sheet in REQUIRED_SHEETS:
-                assert sheet in payload, f"/sheet-spec missing sheet '{sheet}'"
-                spec = payload[sheet]
-                assert isinstance(spec, dict), (
-                    f"/sheet-spec entry for '{sheet}' is not dict"
-                )
-                headers = spec.get("headers") or []
-                keys = spec.get("keys") or []
-                assert headers == _schema_sheet_headers(sr, sheet), (
-                    f"/sheet-spec headers mismatch for '{sheet}'"
-                )
-                assert keys == _schema_sheet_keys(sr, sheet), (
-                    f"/sheet-spec keys mismatch for '{sheet}'"
-                )
+        # Per-sheet coverage: each required sheet's spec must match the registry.
+        for sheet in REQUIRED_SHEETS:
+            rp = client.get(
+                f"/v1/schema/sheet-spec?page={sheet}", headers=_auth_headers()
+            )
+            assert rp.status_code == 200, (
+                f"/v1/schema/sheet-spec?page={sheet} failed: "
+                f"{rp.status_code} {rp.text[:300]}"
+            )
+            spec = rp.json()
+            assert isinstance(spec, dict), (
+                f"/sheet-spec response for '{sheet}' is not a dict"
+            )
+            headers = spec.get("headers") or []
+            keys = spec.get("keys") or []
+            assert headers == _schema_sheet_headers(sr, sheet), (
+                f"/sheet-spec headers mismatch for '{sheet}'"
+            )
+            assert keys == _schema_sheet_keys(sr, sheet), (
+                f"/sheet-spec keys mismatch for '{sheet}'"
+            )
 
 
 def test_data_dictionary_endpoint_has_9_column_contract(
