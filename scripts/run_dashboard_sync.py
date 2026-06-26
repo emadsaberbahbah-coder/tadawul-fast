@@ -3,9 +3,52 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.8.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.9.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.9.0 fix — empty-rows wipe guard (silent clear-then-blank on provider outage)
+- WHY: the four page-driven data pages (Market_Leaders, Global_Markets,
+  Commodities_FX, Mutual_Funds) plus My_Portfolio ALWAYS return rows on a healthy
+  run. The fetch loop in _run_one_task guards on HEADERS, not rows
+  (`if not headers: failed/return`), and _extract_table_payload has an explicit
+  "empty rows, but headers exist -> return headers_list, []" branch. So when the
+  backend returns a well-formed envelope with the schema headers but ZERO data
+  rows — exactly what a provider/Yahoo outage produces, where every symbol on the
+  page fails to fetch yet the header envelope (from the schema registry) is intact
+  — `headers` is truthy, the loop "succeeds", and control falls through to
+  clear-before-write (default ON). clear_from() wipes {col}{row}:ZZ, write_table()
+  writes headers only, and `if not rows_matrix: status="success"` reports the
+  BLANKING as a SUCCESS. Result: an unattended daily_sync can clear Market_Leaders
+  (or even My_Portfolio, whose manual-cell guard at
+  `if rows_matrix and _guard_should_apply(...)` is itself bypassed by empty rows)
+  to a single header row, and log it green. Market_Leaders is the worst-exposed
+  page: Yahoo is its ONLY Saudi source, so a Yahoo hiccup is the exact trigger.
+- FIX: a per-task `expects_rows` flag (TaskSpec, DEFAULT True) marks pages that
+  MUST have data rows when healthy. In _run_one_task, placed BEFORE the clear so a
+  skip performs NEITHER clear nor write, a page with expects_rows=True that fetched
+  0 rows is SKIPPED (status="skipped", rows_written=0) with a warning — its
+  last-good rows are preserved and self-heal on the next healthy sync, instead of
+  being blanked. Mirrors the script's existing pre-clear protective-skip pattern
+  (the My_Portfolio and decision-owned guards).
+- SCOPE / SAFETY:
+    * The empty-rows skip changes behavior ONLY for expects_rows=True pages that
+      return 0 data rows. The five data pages (My_Portfolio, Market_Leaders,
+      Global_Markets, Commodities_FX, Mutual_Funds) are explicitly marked
+      expects_rows=True; they never legitimately write headers-only via the daily
+      sync (first-time header setup is setup_sheet_headers.py's job, not this
+      runner's). The default is True, so the meta pages (Insights_Analysis,
+      Data_Dictionary) are ALSO protected — on an empty fetch they keep last-good
+      rows rather than blank; Top_10_Investments is page-skipped by the
+      decision-owned guard before the empty guard is ever reached. The
+      "schema-only success" code path is retained intact for any future page that
+      sets expects_rows=False deliberately.
+    * Healthy runs (>=1 data row) are byte-for-byte unchanged: same fetch, same
+      limit policy, same My_Portfolio + decision guards, same clear-before-write,
+      same matrix rectification, same write_table, same exit codes.
+    * Gated by TFB_SYNC_EMPTY_GUARD (default ON; set 0/false/off/no to restore the
+      v6.8.0 behavior EXACTLY — clear-then-blank-and-report-success on empty).
+- UNCHANGED: everything in v6.8.0 below.
 
 v6.8.0 fix — non-scalar cell write (list/dict cells 400 the page write)
 - WHY: the Google Sheets values API (valueInputOption=RAW) rejects any cell that
@@ -189,7 +232,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.8.0"
+SCRIPT_VERSION = "6.9.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -406,6 +449,11 @@ class TaskSpec:
     priority: int = 5
     max_symbols: int = 500
     allow_empty_symbols: bool = True  # allow schema-only write when symbols list is empty
+    expects_rows: bool = True         # v6.9.0: page MUST have data rows when healthy.
+                                      # headers + 0 rows => failed fetch => skip clear+write
+                                      # (preserve last-good) instead of blanking the tab.
+                                      # Default True (protect); set False only for a page that
+                                      # legitimately writes headers-only via the daily sync.
 
 
 @dataclass(slots=True)
@@ -889,6 +937,16 @@ def _page_limit_fix_enabled() -> bool:
     return (os.getenv("TFB_SYNC_PAGE_LIMIT_FIX") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
+def _empty_guard_enabled() -> bool:
+    """Empty-rows wipe guard (v6.9.0) master switch. Default ON; set
+    TFB_SYNC_EMPTY_GUARD=0/false/off/no to restore the v6.8.0 behavior (a page
+    that returns headers + 0 data rows is CLEARED and rewritten headers-only,
+    blanking the tab and reporting status="success"). With the guard ON, a
+    TaskSpec(expects_rows=True) page that fetched 0 rows skips the clear AND the
+    write, preserving last-good rows; it self-heals on the next healthy sync."""
+    return (os.getenv("TFB_SYNC_EMPTY_GUARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
 def _guard_find_col(header_row: List[Any], aliases: frozenset) -> int:
     """Index of the first header whose normalized name is in aliases, else -1."""
     for i, h in enumerate(header_row or []):
@@ -1051,11 +1109,11 @@ def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[
 # -----------------------------------------------------------------------------
 def _default_tasks() -> List[TaskSpec]:
     return [
-        TaskSpec(key="MY_PORTFOLIO", sheet_name="My_Portfolio", gateway="enriched", priority=1, max_symbols=800, allow_empty_symbols=True),
-        TaskSpec(key="MARKET_LEADERS", sheet_name="Market_Leaders", gateway="enriched", priority=2, max_symbols=800, allow_empty_symbols=True),
-        TaskSpec(key="GLOBAL_MARKETS", sheet_name="Global_Markets", gateway="enriched", priority=3, max_symbols=800, allow_empty_symbols=True),
-        TaskSpec(key="COMMODITIES_FX", sheet_name="Commodities_FX", gateway="enriched", priority=4, max_symbols=400, allow_empty_symbols=True),
-        TaskSpec(key="MUTUAL_FUNDS", sheet_name="Mutual_Funds", gateway="enriched", priority=5, max_symbols=400, allow_empty_symbols=True),
+        TaskSpec(key="MY_PORTFOLIO", sheet_name="My_Portfolio", gateway="enriched", priority=1, max_symbols=800, allow_empty_symbols=True, expects_rows=True),
+        TaskSpec(key="MARKET_LEADERS", sheet_name="Market_Leaders", gateway="enriched", priority=2, max_symbols=800, allow_empty_symbols=True, expects_rows=True),
+        TaskSpec(key="GLOBAL_MARKETS", sheet_name="Global_Markets", gateway="enriched", priority=3, max_symbols=800, allow_empty_symbols=True, expects_rows=True),
+        TaskSpec(key="COMMODITIES_FX", sheet_name="Commodities_FX", gateway="enriched", priority=4, max_symbols=400, allow_empty_symbols=True, expects_rows=True),
+        TaskSpec(key="MUTUAL_FUNDS", sheet_name="Mutual_Funds", gateway="enriched", priority=5, max_symbols=400, allow_empty_symbols=True, expects_rows=True),
         # Special/meta pages — do NOT require symbols
         TaskSpec(key="INSIGHTS_ANALYSIS", sheet_name="Insights_Analysis", gateway="analysis", priority=6, max_symbols=0, allow_empty_symbols=True),
         TaskSpec(key="TOP_10_INVESTMENTS", sheet_name="Top_10_Investments", gateway="analysis", priority=7, max_symbols=0, allow_empty_symbols=True),
@@ -1407,6 +1465,29 @@ async def _run_one_task(
                 res.rows_written = 0
                 res.rows_failed = len(rows_matrix or [])
                 return res
+        # ---------------------------------------------------------------------
+
+        # --- Empty-rows wipe guard (v6.9.0) ---------------------------------
+        # A page that EXPECTS rows but came back with headers + ZERO data rows
+        # means the fetch degenerated (e.g., a provider/Yahoo outage where every
+        # symbol on the page failed) — NOT a legitimate result. The original code
+        # fell through to clear-before-write and wrote headers-only, BLANKING the
+        # tab and reporting status="success". Placed BEFORE the clear so a skip
+        # performs NEITHER clear nor write — last-good rows are preserved and
+        # self-heal on the next healthy sync. Gated by TFB_SYNC_EMPTY_GUARD
+        # (default ON); set 0/false/off/no to restore the v6.8.0 behavior.
+        if task.expects_rows and (not rows_matrix) and _empty_guard_enabled():
+            msg = (
+                f"Empty fetch (headers present, 0 data rows) on '{task.sheet_name}', "
+                f"which expects rows. Skipping clear+write to PRESERVE last-good rows; "
+                f"self-heals on the next healthy sync."
+            )
+            res.status = "skipped"
+            res.rows_written = 0
+            res.rows_failed = 0
+            res.warnings.append(msg)
+            logger.warning(msg)
+            return res
         # ---------------------------------------------------------------------
 
         if clear_before_write:
