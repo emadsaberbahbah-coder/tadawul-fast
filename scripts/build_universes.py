@@ -30,6 +30,52 @@ Usage (Render Shell, from the repo root):
   python3 scripts/build_universes.py
   python3 scripts/build_universes.py --max-global 2500 --out /tmp/universes
 Then paste each CSV's SYMBOL column into the matching tab.
+
+===========================================================================
+CHANGELOG / SAFETY UPDATE
+===========================================================================
+v1.1.0 (2026-06-26) — EMPTY-UNIVERSE WIPE GUARD
+  Everything above this line is preserved verbatim as the original intent. The
+  reality below overrides the "guarantees every symbol is one EODHD can resolve"
+  premise FOR SAUDI ONLY, and makes the script refuse to emit a CSV that could
+  wipe a populated tab.
+
+  WHAT WENT WRONG (root cause, evidence-based):
+    EODHD carries ZERO Saudi coverage on the current plan. Verified 2026-06-26
+    against BOTH EODHD hosts (the live env pins EODHD_BASE_URL=eodhd.com; the
+    code default is eodhistoricaldata.com):
+        real-time/2222.SR  (Aramco, most-traded Saudi stock) -> "Ticker Not Found"
+        real-time/1120.SR  (Al Rajhi)                         -> "Ticker Not Found"
+        exchange-symbol-list/SR                               -> "Exchange Not Found."
+    Same wall track_performance.py already hit and patched in v6.10.1
+    ("EODHD returns 404 for every .SR ticker").
+
+  THE LANDMINE THIS GUARD REMOVES:
+    fetch_exchange_symbols("SR") raises (non-JSON / 404), main() swallows it and
+    sets sr=[], build_from_symbols([]) returns [], and the ORIGINAL code called
+    write_csv() UNCONDITIONALLY -> it wrote universe_Market_Leaders.csv and
+    universe_Mutual_Funds.csv containing ONLY a header row, zero symbols. The
+    closing instructions still said "Paste each file's SYMBOL column into the
+    matching tab." Following that pastes an empty column and WIPES the ~230-name
+    Saudi universe (and the Mutual_Funds tab).
+
+  THE FIX:
+    - safe_write_csv() refuses to write any page whose row count is below a sane
+      floor (_MIN_EXPECTED). An empty / header-only CSV is NEVER written, for ANY
+      page (this also protects Global_Markets if the US screener/list ever fails).
+    - The SR-empty case prints an explicit, honest diagnostic instead of a silent
+      "0 Saudi common stocks".
+    - Pages that are skipped are tracked; the closing paste-instructions list ONLY
+      pages that were actually written, and main() returns non-zero if any
+      expected page was skipped, so the failure is impossible to miss.
+
+  WHAT THIS DOES NOT (AND CANNOT) DO:
+    It cannot regenerate the Saudi universe. No provider currently available can
+    hand over the full Saudi roster: EODHD-SR is gone, Yahoo has no
+    exchange-symbol-list endpoint (per-symbol lookups only), and Tadawul/Argaam
+    are unconfigured URL-template providers. Market_Leaders / Mutual_Funds must
+    therefore be maintained manually or from a Saudi-native source. Global_Markets
+    generation (US via EODHD) is unaffected and still works.
 """
 import os
 import sys
@@ -40,6 +86,18 @@ import argparse
 import urllib.parse
 import urllib.request
 import urllib.error
+
+BUILD_UNIVERSES_VERSION = "1.1.0"
+
+# Minimum sane row count per page. Below this, the source fetch almost certainly
+# failed (or returned a degenerate result), so we REFUSE to write a CSV that
+# could wipe a populated tab if pasted. An empty (header-only) CSV is never a
+# legitimate output of this script.
+_MIN_EXPECTED = {
+    "Market_Leaders": 50,    # ~230 in practice; < 50 => SR fetch failed
+    "Mutual_Funds": 1,       # few Saudi listed ETFs/REITs; 0 => SR fetch failed / none matched
+    "Global_Markets": 500,   # ~3000 in practice; < 500 => US fetch failed
+}
 
 # --------------------------------------------------------------------------- #
 # Config / env (mirrors eodhd_provider)
@@ -155,6 +213,27 @@ def write_csv(path, rows):
             w.writerow([s, n])
 
 
+def safe_write_csv(path, rows, page, written, skipped):
+    """Write a page's CSV ONLY if its row count clears the page sanity floor.
+
+    Refuses to emit an empty / suspiciously-small CSV that, if pasted into the
+    tab, would wipe a populated universe. Outcomes are recorded in the caller's
+    `written` / `skipped` lists as (page, n) tuples. Returns True if written.
+    """
+    floor = _MIN_EXPECTED.get(page, 1)
+    n = len(rows)
+    if n < floor:
+        print(f"  !! REFUSING to write {page}: got {n} rows (floor {floor}). "
+              f"An empty/too-small CSV would wipe a populated tab if pasted, so "
+              f"NOT writing {os.path.basename(path)}. Paste NOTHING for this tab.")
+        skipped.append((page, n))
+        return False
+    write_csv(path, rows)
+    print(f"  OK  {page}: {n} rows -> {os.path.basename(path)}")
+    written.append((page, n))
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -165,6 +244,8 @@ def main() -> int:
     ap.add_argument("--max-leaders", type=int, default=0, help="cap for Market_Leaders (0=all)")
     args = ap.parse_args()
 
+    print(f"build_universes v{BUILD_UNIVERSES_VERSION}")
+
     key = _key()
     if not key:
         print("ERROR: EODHD_API_KEY (or _API_TOKEN/_KEY) is not set in this environment.")
@@ -173,6 +254,8 @@ def main() -> int:
     os.makedirs(args.out, exist_ok=True)
     print(f"EODHD base={base}  out={args.out}")
 
+    written, skipped = [], []
+
     # ---- Saudi exchange (serves Market_Leaders + Mutual_Funds) -------------- #
     print("Fetching Saudi (SR) symbol list ...")
     try:
@@ -180,14 +263,20 @@ def main() -> int:
     except Exception as e:
         print(f"ERROR fetching SR list: {e}")
         sr = []
+    if not sr:
+        print("  !! EODHD returned NO Saudi symbols. This plan has zero Saudi (.SR)")
+        print("     coverage (exchange-symbol-list/SR -> 'Exchange Not Found'; even")
+        print("     Aramco 2222.SR -> 'Ticker Not Found'). Market_Leaders / Mutual_Funds")
+        print("     CANNOT be regenerated from EODHD and will be SKIPPED (not written),")
+        print("     so your existing tabs are left untouched. Maintain those tabs")
+        print("     manually or from a Saudi-native source.")
     leaders = build_from_symbols(sr, "SR", types={"Common Stock"},
                                  max_n=(args.max_leaders or None))
     funds = build_from_symbols(sr, "SR", types={"ETF", "FUND"})
-    write_csv(os.path.join(args.out, "universe_Market_Leaders.csv"), leaders)
-    write_csv(os.path.join(args.out, "universe_Mutual_Funds.csv"), funds)
-    print(f"  Market_Leaders : {len(leaders)} Saudi common stocks")
-    print(f"  Mutual_Funds   : {len(funds)} Saudi LISTED ETFs/REITs "
-          f"(open-end funds are not exchange-listed -> not available in any provider)")
+    safe_write_csv(os.path.join(args.out, "universe_Market_Leaders.csv"),
+                   leaders, "Market_Leaders", written, skipped)
+    safe_write_csv(os.path.join(args.out, "universe_Mutual_Funds.csv"),
+                   funds, "Mutual_Funds", written, skipped)
 
     # ---- Global_Markets: screener (top mkt-cap) then symbol-list fill ------- #
     print(f"Building Global_Markets (target {args.max_global}) ...")
@@ -209,14 +298,27 @@ def main() -> int:
                 have.add(s)
                 if len(glob) >= args.max_global:
                     break
-    write_csv(os.path.join(args.out, "universe_Global_Markets.csv"), glob)
-    print(f"  Global_Markets : {len(glob)} US names (cap {args.max_global})")
+    safe_write_csv(os.path.join(args.out, "universe_Global_Markets.csv"),
+                   glob, "Global_Markets", written, skipped)
 
-    print(f"\nDone. CSVs written to {args.out}.")
-    print("Paste each file's SYMBOL column into the matching tab (row-5 header = SYMBOL).")
-    print("IMPORTANT: load Global_Markets incrementally — try ~2500 first, confirm a full")
-    print("           scan completes inside the ~100s edge timeout, then raise toward 3000")
-    print("           (and raise LEGACY_MAX_SYMBOLS if it caps you below the row count).")
+    # ---- Summary + SAFE paste instructions --------------------------------- #
+    print(f"\nDone. Output folder: {args.out}")
+    if written:
+        print("WROTE (safe to paste each file's SYMBOL column into the matching tab,")
+        print("row-5 header = SYMBOL):")
+        for page, n in written:
+            print(f"    {page}: {n} rows -> universe_{page}.csv")
+        if any(p == "Global_Markets" for p, _ in written):
+            print("IMPORTANT: load Global_Markets incrementally — try ~2500 first, confirm a full")
+            print("           scan completes inside the ~100s edge timeout, then raise toward 3000")
+            print("           (and raise LEGACY_MAX_SYMBOLS if it caps you below the row count).")
+    if skipped:
+        print("\n!! SKIPPED (NOT written — do NOT paste anything for these tabs; your")
+        print("   existing tabs are intentionally left untouched):")
+        for page, n in skipped:
+            print(f"    {page}: only {n} rows (below sanity floor {_MIN_EXPECTED.get(page, 1)})")
+        print("   Returning non-zero because at least one expected page could not be built.")
+        return 1
     return 0
 
 
