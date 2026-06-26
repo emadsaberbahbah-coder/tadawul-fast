@@ -2,7 +2,7 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) -- v8.2.0
+Yahoo Chart Provider (Global + KSA History) -- v8.3.0
 ================================================================================
 
 Purpose
@@ -14,6 +14,51 @@ Provides financial market data from Yahoo Finance:
   - KSA symbol support (.SR suffix)
   - Risk statistics (volatility, drawdown, VaR, Sharpe, RSI)
   - Price forecasts using log-linear regression
+
+v8.3.0 Changes (from v8.2.0)
+----------------------------
+Bounded retry + backoff for Yahoo history rate-limiting. `fetch_history_raw`
+previously caught any exception from yfinance's `Ticker.history()` -- including
+the transient "Too Many Requests. Rate limited." throttle -- logged a warning,
+and returned `[]` with NO retry. A burst of history fetches (a full
+Market_Leaders scan fires 200+) trips Yahoo's limiter, so dozens of symbols
+lost their ENTIRE price history in a single pass. With no history the
+technical / momentum / volatility factors default and the composite score
+skews low, pushing otherwise-neutral names into SELL. The June 2026 funnel
+audit traced a large share of Market_Leaders being classified SELL
+substantially to this starvation.
+
+New:
+  - `DEFAULT_YF_HISTORY_RETRY_ATTEMPTS / _BASE_SEC / _CAP_SEC`: bounded defaults.
+  - `_yf_history_retry_enabled()`: reads `TFB_YF_HISTORY_RETRY` (default OFF).
+  - `_yf_history_retry_attempts()`: total attempts; returns 1 when the gate is
+    OFF (so the fetch path stays byte-identical to v8.2.0), else bounded [1,5].
+  - `_yf_history_retry_base_sec()` / `_yf_history_retry_cap_sec()`: bounded
+    backoff knobs ([0.05,3.0] / [0.1,8.0] seconds).
+  - `_is_rate_limit_error()`: matches only throttle messages so genuine
+    delisted / no-data symbols are NOT retried (they would never succeed).
+
+Modified:
+  - `fetch_history_raw._sync_fetch`: wrapped in a bounded attempt loop. Retries
+    fire ONLY on rate-limit errors, with exponential backoff + jitter capped
+    per attempt, so total added latency cannot run away against the ~100s
+    Render edge timeout. `time.sleep()` (not `asyncio.sleep`) is correct here --
+    the closure runs inside the shared ThreadPoolExecutor, off the event loop.
+
+Behavior when gate OFF (default): `_yf_history_retry_attempts()` == 1, the loop
+runs exactly once, and every path (success / empty / exception) returns inside
+that single iteration with the identical v8.2.0 warning text and return value.
+Zero behavioral change until `TFB_YF_HISTORY_RETRY` is explicitly enabled
+("deploy dark, enable explicitly").
+
+Bumped:
+  - `PROVIDER_VERSION = "8.3.0"`.
+
+NOT changed (deliberate):
+  - Direct Yahoo Chart API fallback for futures remains deferred.
+  - TokenBucket / CircuitBreaker / concurrency limiting untouched: this change
+    is a surgical retry on the history path only, not a concurrency rework.
+  - All v8.2.0 / v8.1.0 / v8.0.0 fixes preserved verbatim.
 
 v8.2.0 Changes (from v8.1.0)
 ----------------------------
@@ -181,6 +226,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import statistics
 import time
@@ -273,7 +319,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.2.0"
+PROVIDER_VERSION = "8.3.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -346,6 +392,92 @@ DEFAULT_CB_SUCCESS_THRESHOLD = 3
 DEFAULT_THREADPOOL_WORKERS = 6
 DEFAULT_HISTORY_PERIOD = "2y"
 DEFAULT_HISTORY_INTERVAL = "1d"
+
+# -----------------------------------------------------------------------------
+# v8.3.0: Yahoo history rate-limit retry (bounded, gated default-OFF)
+# -----------------------------------------------------------------------------
+# WHY: fetch_history_raw() previously caught ANY exception from
+# yfinance.Ticker.history() -- including Yahoo's transient "Too Many Requests.
+# Rate limited." -- logged a warning, and returned [] with no retry. A burst of
+# history fetches (a full Market_Leaders scan fires 200+) trips Yahoo's limiter,
+# so dozens of symbols lost their ENTIRE price history in one pass; with no
+# history the technical / momentum / volatility factors default and the score
+# skews low (-> SELL). This adds a bounded retry+backoff so transient throttling
+# is recovered instead of silently dropping data. Gated by TFB_YF_HISTORY_RETRY
+# (default OFF -> exactly one attempt, byte-identical to v8.2.0). Every knob is
+# bounded so retry latency cannot run away against the ~100s Render edge
+# timeout. Retries fire ONLY on rate-limit errors; genuine delisted/no-data
+# symbols still return [] on the first try.
+DEFAULT_YF_HISTORY_RETRY_ATTEMPTS = 3      # total tries when gate ON (1 try + 2 retries)
+DEFAULT_YF_HISTORY_RETRY_BASE_SEC = 0.5    # base backoff seconds (exponential)
+DEFAULT_YF_HISTORY_RETRY_CAP_SEC = 2.0     # per-attempt backoff ceiling (seconds)
+
+
+def _yf_history_retry_enabled() -> bool:
+    """True iff TFB_YF_HISTORY_RETRY is explicitly enabled (default OFF)."""
+    raw = (os.getenv("TFB_YF_HISTORY_RETRY") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _yf_history_retry_attempts() -> int:
+    """
+    Total history-fetch attempts. Returns 1 when the gate is OFF so the fetch
+    path is byte-identical to v8.2.0 (single attempt, no retry). When ON,
+    returns the configured count bounded to [1, 5].
+    """
+    if not _yf_history_retry_enabled():
+        return 1
+    try:
+        n = int(float(
+            (os.getenv("TFB_YF_HISTORY_RETRY_ATTEMPTS")
+             or str(DEFAULT_YF_HISTORY_RETRY_ATTEMPTS)).strip()
+        ))
+    except Exception:
+        n = DEFAULT_YF_HISTORY_RETRY_ATTEMPTS
+    return max(1, min(5, n))
+
+
+def _yf_history_retry_base_sec() -> float:
+    """Base backoff seconds (exponential), bounded to [0.05, 3.0]."""
+    try:
+        v = float(
+            (os.getenv("TFB_YF_HISTORY_RETRY_BASE_SEC")
+             or str(DEFAULT_YF_HISTORY_RETRY_BASE_SEC)).strip()
+        )
+    except Exception:
+        v = DEFAULT_YF_HISTORY_RETRY_BASE_SEC
+    return max(0.05, min(3.0, v))
+
+
+def _yf_history_retry_cap_sec() -> float:
+    """Per-attempt backoff ceiling in seconds, bounded to [0.1, 8.0]."""
+    try:
+        v = float(
+            (os.getenv("TFB_YF_HISTORY_RETRY_CAP_SEC")
+             or str(DEFAULT_YF_HISTORY_RETRY_CAP_SEC)).strip()
+        )
+    except Exception:
+        v = DEFAULT_YF_HISTORY_RETRY_CAP_SEC
+    return max(0.1, min(8.0, v))
+
+
+def _is_rate_limit_error(exc: Any) -> bool:
+    """
+    Heuristic: does this exception look like a Yahoo/yfinance rate-limit error?
+    yfinance raises with messages like "Too Many Requests. Rate limited. Try
+    after a while." We retry ONLY these; genuine delisted/no-data errors must
+    NOT be retried (they will never succeed and would waste the retry budget).
+    """
+    try:
+        msg = str(exc).lower()
+    except Exception:
+        return False
+    return (
+        "too many requests" in msg
+        or "rate limited" in msg
+        or "rate-limit" in msg
+        or "rate limit" in msg
+    )
 
 
 # =============================================================================
@@ -1736,29 +1868,54 @@ class YahooChartProvider:
             return []
 
         def _sync_fetch() -> List[Dict[str, Any]]:
-            try:
-                ticker = yf.Ticker(sym)
-                df = ticker.history(period=period, interval=interval)
-                if not _HAS_PANDAS or pd is None or df is None or df.empty:
+            # v8.3.0: bounded retry+backoff on Yahoo rate-limit ("Too Many
+            # Requests. Rate limited.") so transient throttling no longer
+            # silently drops a symbol's entire price history (which starved
+            # technical/momentum factors and depressed scores -> SELL). Gated by
+            # TFB_YF_HISTORY_RETRY (default OFF). When OFF, _yf_history_retry_
+            # attempts() returns 1 -> exactly one attempt and behavior is
+            # byte-identical to v8.2.0 (give up + warn on any exception). Retries
+            # fire ONLY on rate-limit errors; genuine delisted/no-data results
+            # return [] immediately as before. Delays are bounded (per-attempt
+            # cap + total attempts cap) so latency cannot run away against the
+            # Render edge timeout. time.sleep (not asyncio.sleep) is correct:
+            # this closure runs inside the shared executor, off the event loop.
+            _attempts = _yf_history_retry_attempts()
+            _base = _yf_history_retry_base_sec()
+            _cap = _yf_history_retry_cap_sec()
+            for _attempt in range(_attempts):
+                try:
+                    ticker = yf.Ticker(sym)
+                    df = ticker.history(period=period, interval=interval)
+                    if not _HAS_PANDAS or pd is None or df is None or df.empty:
+                        return []
+                    df = df.reset_index()
+                    rows: List[Dict[str, Any]] = []
+                    for _, row in df.iterrows():
+                        row_dict = row.to_dict()
+                        dt_val = row_dict.get("Date") or row_dict.get("Datetime")
+                        ts = _utc_iso(dt_val) if hasattr(dt_val, "to_pydatetime") else str(dt_val)
+                        rows.append({
+                            "timestamp": ts,
+                            "open": _safe_float(row_dict.get("Open")),
+                            "high": _safe_float(row_dict.get("High")),
+                            "low": _safe_float(row_dict.get("Low")),
+                            "close": _safe_float(row_dict.get("Close")),
+                            "volume": _safe_float(row_dict.get("Volume")),
+                        })
+                    return rows
+                except Exception as exc:
+                    if _is_rate_limit_error(exc) and _attempt < (_attempts - 1):
+                        _delay = min(_cap, _base * float(2 ** _attempt)) + random.uniform(0.0, _base)
+                        logger.info(
+                            "History rate-limited for %s; retry %d/%d after %.2fs",
+                            sym, _attempt + 1, _attempts - 1, _delay,
+                        )
+                        time.sleep(_delay)
+                        continue
+                    logger.warning("History fetch failed for %s: %s", sym, exc)
                     return []
-                df = df.reset_index()
-                rows: List[Dict[str, Any]] = []
-                for _, row in df.iterrows():
-                    row_dict = row.to_dict()
-                    dt_val = row_dict.get("Date") or row_dict.get("Datetime")
-                    ts = _utc_iso(dt_val) if hasattr(dt_val, "to_pydatetime") else str(dt_val)
-                    rows.append({
-                        "timestamp": ts,
-                        "open": _safe_float(row_dict.get("Open")),
-                        "high": _safe_float(row_dict.get("High")),
-                        "low": _safe_float(row_dict.get("Low")),
-                        "close": _safe_float(row_dict.get("Close")),
-                        "volume": _safe_float(row_dict.get("Volume")),
-                    })
-                return rows
-            except Exception as exc:
-                logger.warning("History fetch failed for %s: %s", sym, exc)
-                return []
+            return []  # defensive: attempts>=1 always returns inside the loop
 
         try:
             loop = asyncio.get_running_loop()
