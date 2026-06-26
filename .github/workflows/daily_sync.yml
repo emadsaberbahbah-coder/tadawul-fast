@@ -129,7 +129,7 @@ jobs:
             exit 1
           fi
 
-          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py
+          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py
           echo "::endgroup::"
 
   # =============================================================================
