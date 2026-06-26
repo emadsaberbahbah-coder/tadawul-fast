@@ -2,12 +2,31 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.5.0  (V2.6.0-ALIGNED / 90-COL CONTRACT / WAVE 3)
+Analysis Sheet-Rows Router — v4.5.1  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • GLOBAL-RANK
 GLOBAL-DEDUP
+
+WHY v4.5.1 — Top_10 contract no longer clamped to the stale 93-col width
+-----------------------------------------------------------------------
+
+`_resolve_contract` read the live registry correctly (118 columns for
+Top_10_Investments via schema_registry.helpers) but then passed the result
+through `_ensure_top10_contract`, whose `_pad_contract(..., 93)` TRUNCATED the
+118 columns to a hardcoded 93-column width left over from the schema_registry
+v2.6.0 era. The truncated 93 then failed the `expected_len` (=118) guard, so the
+function silently fell back to the static 93-column Top_10 contract -- dropping
+`recommendation`, `recommendation_reason`, and the entire analyst/decision block
+from /v1/analysis/sheet-rows (GET + POST). Every other sheet-rows endpoint
+(advisor, advanced, enriched, root) already returned the full 118; only this
+router clamped. v4.5.1 keeps the registry-resolved Top_10 contract intact: it
+ensures the three Top10 special fields are present (defensive; the registry
+already includes them) and pads to the registry-derived `expected_len` (118)
+rather than the hardcoded 93. Registry-hit path only; the static fallback
+(registry-unavailable degraded mode) is unchanged. No other page is affected and
+no functions were added or removed.
 
 WHY v4.5.0 — page-level symbol de-duplication [GLOBAL-DEDUP]
 -----------------------------------------------------------
@@ -268,7 +287,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.5.0"
+ANALYSIS_SHEET_ROWS_VERSION = "4.5.1"
 
 # v4.3.1 [FIX-1]: tracks which engine binding actually loaded. Updated at
 # request time inside _get_engine(). Surfaced in meta.engine_source on
@@ -1070,7 +1089,20 @@ def _resolve_contract(page: str) -> Tuple[List[str], List[str], Any, str]:
     if headers and keys:
         headers, keys = _complete_schema_contract(headers, keys)
         if page == _TOP10_PAGE:
-            headers, keys = _ensure_top10_contract(headers, keys)
+            # v4.5.1 FIX: the registry now provides the FULL Top_10 contract
+            # (118 columns incl. the Top10 special fields). The legacy
+            # _ensure_top10_contract() padded/clamped to a hardcoded 93-column
+            # width, which TRUNCATED the registry's 118 columns and then failed
+            # the expected_len (=118) guard below -- silently falling back to the
+            # stale 93-column static contract, dropping recommendation /
+            # recommendation_reason / the analyst block on /v1/analysis/sheet-rows.
+            # Ensure the required Top10 fields exist (defensive; the registry
+            # already includes them), then pad to the registry-derived length.
+            for _f in _TOP10_REQUIRED_FIELDS:
+                if _f not in keys:
+                    keys.append(_f)
+                    headers.append(_TOP10_REQUIRED_HEADERS[_f])
+            headers, keys = _pad_contract(headers, keys, expected_len)
         else:
             headers, keys = _pad_contract(headers, keys, expected_len)
         if len(headers) == expected_len and len(keys) == expected_len:
@@ -1827,7 +1859,16 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
     ks = list(keys or payload_keys or [])
 
     if page == _TOP10_PAGE:
-        hdrs, ks = _ensure_top10_contract(hdrs, ks)
+        # v4.5.1 FIX: do NOT clamp to the hardcoded 93-col width here either
+        # (this is the path that actually shapes the emitted payload). The
+        # caller passes the registry-resolved 118-col contract; ensure the three
+        # Top10 special fields exist, then pad to the registry-derived
+        # expected length rather than the stale 93. (See header WHY v4.5.1.)
+        for _f in _TOP10_REQUIRED_FIELDS:
+            if _f not in ks:
+                ks.append(_f)
+                hdrs.append(_TOP10_REQUIRED_HEADERS[_f])
+        hdrs, ks = _pad_contract(hdrs, ks, _expected_len(page))
     else:
         hdrs, ks = _pad_contract(hdrs, ks, _expected_len(page))
 
