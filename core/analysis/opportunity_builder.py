@@ -1,12 +1,31 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.14  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.0.15  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
-                 engine-ROI ordering + minimum-ticket floor, all env-gated
-                 DEFAULT-OFF)
+                 engine-ROI ordering + minimum-ticket floor + floor near-miss
+                 labeling, all env-gated DEFAULT-OFF)
 
-v1.0.14 [MINIMUM-TICKET FLOOR — env-gated DEFAULT-OFF (TFB_OPP_MIN_TICKET_SAR).
+v1.0.15 [FLOOR NEAR-MISS LABELING — display correctness, no gate change. WHY:
+v1.0.14's minimum-ticket floor records a sub-floor pick in the same `deferrals`
+dict the diversification caps use ("Unfunded — sized ticket X below minimum
+ticket floor Y"). _near_miss_rows classified EVERY deferred symbol as the
+"Diversification" gate with "within sector/market caps" / "deferred by
+diversification cap" — so a floor-deferred name that surfaced in NEAR MISS
+(e.g. 0939.HK, 2026-06-27 live) was mislabeled: the reason string was correct
+but the Failed-Gate column, the Required column, and the How-To-Qualify line all
+described a diversification cap it never hit. FIX: split the deferrals branch in
+_near_miss_rows — a deferral whose reason contains "minimum ticket floor" is
+classified as the "Funding" gate (Required = "fundable amount >= minimum ticket
+floor (Y SAR)", How-To = add Cash Available / lower Max Selected / lower the
+floor), consistent with the existing capital-exhausted Funding near-miss rows;
+all other deferrals keep the byte-identical diversification labeling. No gate,
+verdict, ticket, sizing or funding-identity change — purely the gate/required/
+how-to text for floor-deferred near-miss rows. Floor deferrals only exist when
+min_ticket_sar > 0, so with the floor OFF this branch is never taken =>
+byte-identical v1.0.14. No new functions; _near_miss_rows body only.
+
+
 WHY: the greedy §4.4 sizer funds picks top-down until deployable capital is
 exhausted. With the engine-ROI reorder (v1.0.9) packing the high-forecast names
 first, the last few hundred SAR of cash were still spent on the next ranked
@@ -362,7 +381,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.14"
+OPPORTUNITY_BUILDER_VERSION = "1.0.15"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1880,9 +1899,24 @@ def _near_miss_rows(audit, selected_syms, deferrals, criteria):
     rows = []
     for a in pool[:criteria["near_miss_n"]]:
         if a["symbol"] in deferrals:
-            gate, cur, req = "Diversification", deferrals[a["symbol"]], (
-                "within sector/market caps")
-            note = "Qualified (INVEST) \u2014 deferred by diversification cap"
+            _reason = deferrals[a["symbol"]]
+            # v1.0.15: a floor deferral (min-ticket floor, v1.0.14) is a FUNDING
+            # near-miss, not a diversification one — classify it distinctly so
+            # the gate / required / how-to columns are accurate. Real
+            # diversification deferrals keep their byte-identical labeling.
+            if "minimum ticket floor" in _reason:
+                gate, cur, req = "Funding", _reason, (
+                    "fundable amount \u2265 minimum ticket floor (" +
+                    _fmt_sar(criteria.get("min_ticket_sar", 0.0) or 0.0) + ")")
+                note = ("Qualified (INVEST) \u2014 ranked, but the fundable "
+                        "amount was below the minimum ticket floor; add Cash "
+                        "Available, lower Max Selected, or lower the floor to "
+                        "fund it.")
+            else:
+                gate, cur, req = "Diversification", _reason, (
+                    "within sector/market caps")
+                note = (
+                    "Qualified (INVEST) \u2014 deferred by diversification cap")
         elif a["verdict"] == VERDICT_INVEST:
             gate, cur, req = "Capacity", "rank beyond Max Selected", (
                 "Max Selected = " + str(criteria["max_selected"]))
