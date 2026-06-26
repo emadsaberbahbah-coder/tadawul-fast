@@ -2,11 +2,67 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.7.2
+ADVISOR ROUTER — v6.7.4
 ================================================================================
 SPECIAL-PAGE PROXY-FIRST • ROOT/ANALYSIS ALIGNED • SHORT-ADVISOR HARDENED •
 JSON-SAFE • GET+POST SAFE • FAIL-SOFT • CONTRACT-PROJECTED • ENGINE-TOLERANT
 DIAGNOSTIC-EMITTING • V2.6.0-ALIGNED • UPSTREAM-META-PRESERVING
+
+v6.7.4 changes (from v6.7.3)
+----------------------------
+[FIX-12 SHEET-ROWS CONTRACT PROJECTION — HIGH] Two coupled defects made the
+    sheet-rows `keys` field and the Top_10 column set violate the registry:
+      (a) `_ensure_tabular_shape` set `result["keys"] = list(effective_headers)`
+          -- i.e. it copied the Title-Case DISPLAY HEADERS into the `keys`
+          field. Consumers expecting snake_case keys (e.g. 'symbol') instead
+          got 'Symbol'.
+      (b) `_resolve_contract_headers` only understood Mapping-shaped specs, but
+          the registry returns a SheetSpec OBJECT (`.columns` of
+          ColumnSpec(header, key)). It therefore returned [] for every page, so
+          the projection could not enforce the registry contract and fell back
+          to the winning resolver's raw payload -- which for Top_10 was a
+          truncated 96-column set missing `recommendation` /
+          `recommendation_reason` (registry Top_10 = 118 columns incl. both).
+    Fix: parse the SheetSpec form into ordered (display_header, snake_key) pairs
+    (`_spec_to_pairs` / `_resolve_contract_pairs`), derive the response `keys`
+    from those pairs mapped onto the resolved headers
+    (`_contract_keys_for_headers`, with the engine's canonical instrument /
+    My_Portfolio maps as additive fallbacks and the header itself as last
+    resort), and gate the Top_10 special-column synthesis to the
+    contract-unavailable path (the registry contract already includes them).
+    Now Market_Leaders returns its 115 snake_case keys and Top_10 returns its
+    full 118 keys incl. recommendation/recommendation_reason, for every
+    resolver. Additive: four new module-level helpers, no functions removed, no
+    signatures changed. Caught by tests/test_schema_alignment.py v9.3.0
+    (test_sheet_rows_returns_exact_schema_headers_and_keys_for_each_sheet,
+    test_top10_sheet_rows_includes_baseline_special_headers).
+
+v6.7.3 changes (from v6.7.2)
+----------------------------
+[FIX-11 ANALYSIS-BRIDGE X_API_KEY — HIGH] _delegate_to_analysis_bridge omitted
+    the `x_api_key` argument when calling routes.analysis_sheet_rows
+    _analysis_sheet_rows_impl. As of analysis_sheet_rows v4.5.0 that impl
+    declares x_api_key as a required parameter (Optional[str], no default), so
+    EVERY tolerant-signature attempt raised TypeError ("missing ... x_api_key")
+    and the resolver recorded all_signatures_typeerror. Effect: the PRIMARY
+    analysis bridge (first-win for BASE_PAGEs) silently failed on every call and
+    the chain fell through to a degraded resolver — which emitted the sheet's
+    display HEADERS in the `keys` field (snake_case keys lost) and dropped
+    `recommendation` / `recommendation_reason` on Top_10_Investments. Now the
+    bridge sources x_api_key from the request header (the advisor route itself
+    authenticates via X-APP-TOKEN and does not capture X-API-KEY, so this is
+    None in normal operation) and threads it through in the impl's parameter
+    position, restoring the primary path. The fix has two parts: (1) the bridge
+    now includes x_api_key in its constructed kwargs, and (2)
+    _call_with_tolerant_signatures now issues its FIRST attempt faithfully
+    (verbatim kwargs, explicit None included) and only strips None on the
+    heuristic subset-probing fallbacks — previously the unconditional None-strip
+    dropped every None auth arg, so an impl whose Optional params lack defaults
+    could never bind. Both edits are body-only: no function signatures change,
+    both call sites and all six route handlers are byte-identical, and no
+    functions are added or removed. Caught by tests/test_schema_alignment.py
+    v9.3.0 (test_sheet_rows_returns_exact_schema_headers_and_keys_for_each_sheet,
+    test_top10_sheet_rows_includes_baseline_special_headers).
 
 v6.7.2 changes (from v6.7.1)
 ----------------------------
@@ -140,7 +196,7 @@ if _advisor_debug_enabled():
         pass
 
 
-ADVISOR_VERSION = "6.7.2"
+ADVISOR_VERSION = "6.7.4"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 DEFAULT_ADVISOR_PAGE = "Top_10_Investments"
@@ -870,7 +926,16 @@ async def _call_with_tolerant_signatures(
     call_summary: List[Dict[str, Any]] = []
 
     for idx, (call_args, call_kwargs) in enumerate(attempts):
-        call_kwargs = {k: v for k, v in call_kwargs.items() if v is not None}
+        # v6.7.3: the FIRST attempt is the caller's faithful, fully-constructed
+        # call -- pass it verbatim, including explicit None values for Optional
+        # parameters. Stripping None here previously dropped required-but-
+        # Optional args (token / x_app_token / x_api_key / authorization /
+        # x_request_id), so any impl whose Optional params lack defaults failed
+        # with "missing positional argument" and the resolver fell through to a
+        # degraded path. The heuristic subset-probing attempts (idx > 0) still
+        # strip None, since those deliberately try partial signatures.
+        if idx > 0:
+            call_kwargs = {k: v for k, v in call_kwargs.items() if v is not None}
         record: Dict[str, Any] = {
             "attempt_idx": idx,
             "args_count": len(call_args),
@@ -929,12 +994,72 @@ def _extract_headers_from_spec(spec: Any) -> List[str]:
     return []
 
 
-def _resolve_contract_headers(page: str) -> List[str]:
+# Registry-spec parsing ------------------------------------------------------
+# v6.7.4 [FIX-12]: the schema registry exposes each sheet as a SheetSpec OBJECT
+# (`.columns` -> list of ColumnSpec(header=..., key=...)), not a plain dict. The
+# previous resolver only understood Mapping specs, so it returned [] for every
+# page -- which meant the sheet-rows projection could never enforce the registry
+# contract and fell back to whatever the winning resolver emitted (display
+# HEADERS in the `keys` field; a truncated column set on Top_10). We now parse
+# the SheetSpec form into ordered (display_header, snake_key) pairs -- the single
+# source for both the response `headers` and the response `keys`.
+_SCHEMA_PAIRS_CACHE: Dict[str, List[Tuple[str, str]]] = {}
+
+
+def _spec_to_pairs(spec: Any) -> List[Tuple[str, str]]:
+    """Return ordered [(display_header, snake_key), ...] from a sheet spec.
+
+    Handles (in order): an object/dict carrying a `columns` list of
+    ColumnSpec-like entries exposing .header/.key (or 'header'/'key'); a dict
+    with parallel `headers` + `keys` lists; a dict with only `headers` (key
+    falls back to the header); and nested spec wrappers. Returns [] if nothing
+    usable is found."""
+    cols = getattr(spec, "columns", None)
+    if cols is None and isinstance(spec, Mapping):
+        cols = spec.get("columns")
+    if isinstance(cols, (list, tuple)) and cols:
+        pairs: List[Tuple[str, str]] = []
+        for c in cols:
+            h = getattr(c, "header", None)
+            k = getattr(c, "key", None)
+            if h is None and isinstance(c, Mapping):
+                h = c.get("header")
+                k = c.get("key")
+            hs = _strip(h)
+            ks = _strip(k) or hs
+            if hs:
+                pairs.append((hs, ks))
+        if pairs:
+            return pairs
+    if isinstance(spec, Mapping):
+        headers = spec.get("headers") or spec.get("display_headers")
+        keys = spec.get("keys")
+        if isinstance(headers, list) and headers:
+            hs = [_strip(x) for x in headers if _strip(x)]
+            if isinstance(keys, list) and len(keys) == len(hs):
+                ks = [(_strip(keys[i]) or hs[i]) for i in range(len(hs))]
+            else:
+                ks = list(hs)
+            return list(zip(hs, ks))
+        for nested_key in ("sheet", "spec", "schema", "contract", "definition"):
+            nested = spec.get(nested_key)
+            if nested is not None:
+                pairs = _spec_to_pairs(nested)
+                if pairs:
+                    return pairs
+    return []
+
+
+def _resolve_contract_pairs(page: str) -> List[Tuple[str, str]]:
+    """Resolve the registry's ordered (header, key) pairs for a page, cached.
+
+    Probes the same registry modules / accessors as the legacy header resolver
+    but understands the SheetSpec object form via _spec_to_pairs."""
     page = _canonicalize_page_name(page)
     if not page:
         return []
-    if page in _SCHEMA_HEADERS_CACHE:
-        return list(_SCHEMA_HEADERS_CACHE[page])
+    if page in _SCHEMA_PAIRS_CACHE:
+        return list(_SCHEMA_PAIRS_CACHE[page])
     for module_name in ("core.sheets.schema_registry", "core.schema_registry", "core.sheets.page_catalog"):
         module = _import_module_safely(module_name)
         if module is None:
@@ -946,10 +1071,10 @@ def _resolve_contract_headers(page: str) -> List[str]:
                     hit = spec_map.get(page) or spec_map.get(page.lower()) or spec_map.get(page.upper())
                 except Exception:
                     hit = None
-                headers = _extract_headers_from_spec(hit)
-                if headers:
-                    _SCHEMA_HEADERS_CACHE[page] = headers
-                    return list(headers)
+                pairs = _spec_to_pairs(hit)
+                if pairs:
+                    _SCHEMA_PAIRS_CACHE[page] = pairs
+                    return list(pairs)
         for fn_name in ("get_sheet_spec", "get_schema_for_sheet", "get_schema", "resolve_sheet_spec", "resolve_sheet_schema", "get_contract_for_sheet"):
             fn = getattr(module, fn_name, None)
             if not callable(fn):
@@ -961,11 +1086,51 @@ def _resolve_contract_headers(page: str) -> List[str]:
                     continue
                 except Exception:
                     out = None
-                headers = _extract_headers_from_spec(out)
-                if headers:
-                    _SCHEMA_HEADERS_CACHE[page] = headers
-                    return list(headers)
+                pairs = _spec_to_pairs(out)
+                if pairs:
+                    _SCHEMA_PAIRS_CACHE[page] = pairs
+                    return list(pairs)
     return []
+
+
+def _resolve_contract_headers(page: str) -> List[str]:
+    page = _canonicalize_page_name(page)
+    if not page:
+        return []
+    if page in _SCHEMA_HEADERS_CACHE:
+        return list(_SCHEMA_HEADERS_CACHE[page])
+    pairs = _resolve_contract_pairs(page)
+    if pairs:
+        headers = [h for h, _k in pairs]
+        _SCHEMA_HEADERS_CACHE[page] = headers
+        return list(headers)
+    return []
+
+
+def _resolve_contract_keys(page: str) -> List[str]:
+    pairs = _resolve_contract_pairs(page)
+    return [k for _h, k in pairs] if pairs else []
+
+
+def _contract_keys_for_headers(page: str, headers: List[str]) -> List[str]:
+    """Map an ordered list of DISPLAY headers to their snake_case keys for the
+    response `keys` field. Primary source: the registry contract pairs for the
+    page. Fallbacks (additive, never overriding the registry): the engine's
+    canonical instrument and My_Portfolio header->key maps. Last resort for an
+    unmapped header: the header string itself (preserves prior behaviour so an
+    unknown page can never regress to an empty/broken keys list)."""
+    hk: Dict[str, str] = {}
+    for h, k in _resolve_contract_pairs(page):
+        hk.setdefault(_norm_header_(h), k)
+    if _ENGINE_PORTFOLIO_AVAILABLE:
+        n = min(len(_ENGINE_INSTRUMENT_HEADERS), len(_ENGINE_INSTRUMENT_KEYS))
+        for i in range(n):
+            hk.setdefault(_norm_header_(_ENGINE_INSTRUMENT_HEADERS[i]), _ENGINE_INSTRUMENT_KEYS[i])
+        for k in _ENGINE_MP_EXTRA_FIELDS:
+            hh = _norm_header_(_ENGINE_MP_EXTRA_HEADERS.get(k))
+            if hh:
+                hk.setdefault(hh, k)
+    return [hk.get(_norm_header_(h), _strip(h)) for h in headers]
 
 
 def _contract_header_count(page: str) -> int:
@@ -1047,7 +1212,11 @@ def _extract_matrix_rows_any(result: Mapping[str, Any]) -> List[List[Any]]:
 def _project_to_contract_headers(*, page: str, headers: List[str], row_objects: List[Dict[str, Any]], rows_matrix: List[List[Any]]) -> Tuple[List[str], List[Dict[str, Any]], List[List[Any]]]:
     contract_headers = _resolve_contract_headers(page)
     effective_headers = list(contract_headers or headers or [])
-    if page == "Top_10_Investments":
+    if page == "Top_10_Investments" and not contract_headers:
+        # The registry Top_10 contract already includes the special columns
+        # (top10_rank / selection_reason / criteria_snapshot); only synthesise
+        # them when the contract could not be resolved, to avoid appending the
+        # snake-case keys onto a display-header list.
         effective_headers = _append_missing_headers(effective_headers, TOP10_SPECIAL_FIELDS)
     if not effective_headers and row_objects:
         seen: List[str] = []
@@ -1143,8 +1312,26 @@ def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any
         if effective_headers:
             matrix_rows = _mapping_list_to_rows(object_rows, effective_headers)
     result["headers"] = effective_headers
-    result["keys"] = list(effective_headers)
+    # v6.7.4 [FIX-12]: the response `keys` field must carry the snake_case column
+    # keys, not the display headers. Previously `keys = list(effective_headers)`
+    # copied the Title-Case headers into `keys`, so consumers (and the schema
+    # contract tests) saw 'Symbol' where 'symbol' was required.
+    contract_keys = _contract_keys_for_headers(page, effective_headers)
+    result["keys"] = contract_keys
     result["display_headers"] = list(effective_headers)
+    # v6.7.4 [FIX-12]: guarantee every row object exposes the FULL set of
+    # contract snake_case keys -- the sheet-rows contract is "every row carries
+    # every schema column". Additive and convention-preserving: copy a value
+    # from the matching display header when the row is display-keyed, default to
+    # None otherwise, and never drop a key a resolver already supplied (so
+    # display-keyed rows keep their display keys and the rows_matrix stays intact).
+    if object_rows and contract_keys:
+        _hdr_for_key = dict(zip(contract_keys, effective_headers)) if len(contract_keys) == len(effective_headers) else {}
+        for _row in object_rows:
+            for _ck in contract_keys:
+                if _ck not in _row:
+                    _disp = _hdr_for_key.get(_ck)
+                    _row[_ck] = _row.get(_disp) if (_disp is not None and _disp in _row) else None
     if object_rows:
         result["row_objects"] = object_rows
         result["items"] = object_rows
@@ -1458,6 +1645,18 @@ async def _delegate_to_analysis_bridge(*, request: Request, payload: Dict[str, A
         return None, out_meta
 
     page = _extract_page(payload)
+    # v6.7.3 FIX: analysis_sheet_rows v4.5.0's _analysis_sheet_rows_impl added a
+    # required `x_api_key` parameter (Optional[str], no default). The bridge
+    # previously omitted it, so EVERY tolerant-signature invocation raised
+    # TypeError ("missing ... x_api_key") -> all_signatures_typeerror -> the
+    # primary analysis bridge silently fell through to a degraded resolver
+    # (sheet headers emitted in the `keys` field; recommendation /
+    # recommendation_reason dropped on Top_10). The advisor route authenticates
+    # via X-APP-TOKEN and does not capture X-API-KEY, so this is None in normal
+    # operation; we still source it from the request header for forward-compat,
+    # coercing empty -> None to honour the Optional[str] contract.
+    _xak = _strip(request.headers.get("x-api-key")) if request is not None else ""
+    x_api_key = _xak or None
     result, call_summary, call_outcome = await _call_with_tolerant_signatures(
         impl,
         timeout_seconds=_resolver_timeout("bridge", page=page),
@@ -1468,6 +1667,7 @@ async def _delegate_to_analysis_bridge(*, request: Request, payload: Dict[str, A
             "include_matrix_q": _boolish(payload.get("include_matrix"), True),
             "token": token,
             "x_app_token": x_app_token,
+            "x_api_key": x_api_key,
             "authorization": authorization,
             "x_request_id": x_request_id,
         },
