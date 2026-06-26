@@ -1,9 +1,36 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.12  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.0.13  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering, both env-gated DEFAULT-OFF)
+
+v1.0.13 [DIVERSIFIER SECTOR-QUALITY — env-gated DEFAULT-OFF. Two related
+selection-time corrections behind ONE switch, TFB_OPP_SECTOR_NORMALIZE.
+WHY: the per-sector diversification cap (max_per_sector) buckets on the raw
+cand["sector"] string. Two data-quality leaks fragmented or mis-bucketed it.
+(a) A KSA name NOT in the _KSA_SYMBOL_SECTOR map (data_engine_v2) falls through
+to the provider's Yahoo sector vocabulary ("Basic Materials", "Healthcare",
+"Consumer Cyclical", "Consumer Defensive", "Technology", "Financial Services"),
+which are DIFFERENT strings from the GICS spellings the map uses ("Materials",
+"Health Care", "Consumer Discretionary", "Consumer Staples", "Information
+Technology", "Financials"). Because the cap compares exact strings, a Yahoo-
+vocab straggler forms its OWN cap bucket instead of counting against its GICS
+peers — so the sector cap silently under-counts and concentration leaks through.
+(b) A name with NO sector from any provider becomes "Unknown" (the `or
+"Unknown"` default); several such names then collide in a single "Unknown"
+bucket and are capped at max_per_sector as if they were one real sector, wrongly
+deferring good picks whose true (unknown) sectors may all differ.
+FIX (default OFF): when TFB_OPP_SECTOR_NORMALIZE=1 — (a) _normalize_sector()
+translates the six differing Yahoo spellings to GICS at the sector source (both
+the candidate view and the portfolio holdings), so stragglers bucket with their
+peers; (b) the "Unknown"/"" data-gap bucket is EXEMPT from the per-sector COUNT
+cap (an unknown sector is a data gap, not a concentration bucket). The post-
+action PORTFOLIO weight cap (pf_max_sector_pct) is deliberately left applied to
+"Unknown" — real-money concentration is still controlled. OFF => byte-identical
+v1.0.12 (raw sector strings, Unknown capped as before). Two new defs added
+(_env_sector_normalize, _normalize_sector) + one constant
+(_YAHOO_TO_GICS_SECTOR); all v1.0.12 functions carried verbatim, none removed.]
 
 v1.0.12 [ENGINE-ROI-AUDIT — surface the engine's normalized 12M forecast on
 every candidates_rows audit record via one new field, engine_roi_pct, so the
@@ -311,7 +338,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.12"
+OPPORTUNITY_BUILDER_VERSION = "1.0.13"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -670,6 +697,42 @@ def _env_unfunded_watch():
     and counted)."""
     return str(_env_str("TFB_OPP_UNFUNDED_WATCH", "0")).strip().lower() in (
         "1", "true", "yes", "on", "enabled", "enable")
+
+
+# v1.0.13: Yahoo-provider sector vocabulary -> GICS vocabulary. The
+# _KSA_SYMBOL_SECTOR map and the diversifier bucket on GICS strings; an unmapped
+# name whose sector fell through to the provider's Yahoo string (e.g.
+# "Basic Materials") otherwise fragments into its OWN cap bucket instead of
+# joining its GICS peers ("Materials"). Only these six spellings differ; every
+# other Yahoo sector string already equals its GICS counterpart.
+_YAHOO_TO_GICS_SECTOR = {
+    "Basic Materials": "Materials",
+    "Healthcare": "Health Care",
+    "Consumer Cyclical": "Consumer Discretionary",
+    "Consumer Defensive": "Consumer Staples",
+    "Technology": "Information Technology",
+    "Financial Services": "Financials",
+}
+
+
+def _env_sector_normalize():
+    """v1.0.13: diversifier sector-quality toggle. Default OFF; set
+    TFB_OPP_SECTOR_NORMALIZE=1 to (a) translate the six differing Yahoo-provider
+    sector spellings to the GICS vocabulary the map + diversifier bucket on, and
+    (b) exempt the "Unknown"/"" data-gap bucket from the per-sector COUNT cap (an
+    unknown sector is a data gap, not a real concentration bucket, so two unmapped
+    names are not capped as if they were one sector). The post-action PORTFOLIO
+    weight cap still applies to "Unknown". OFF => byte-identical v1.0.12."""
+    return str(_env_str("TFB_OPP_SECTOR_NORMALIZE", "0")).strip().lower() in (
+        "1", "true", "yes", "on", "enabled", "enable")
+
+
+def _normalize_sector(s):
+    """Yahoo->GICS sector translation (v1.0.13). Already-GICS strings and
+    "Unknown"/"" pass through unchanged. Gated by the CALLER via
+    _env_sector_normalize()."""
+    t = (s or "").strip()
+    return _YAHOO_TO_GICS_SECTOR.get(t, t)
 
 
 def _env_rank_by_engine_roi():
@@ -1046,7 +1109,9 @@ def normalize_candidate(row, fx_rates, criteria):
         "symbol": symbol,
         "name": _to_text(_field(view, "name")) or symbol,
         "market": _to_text(_field(view, "market")) or "Unknown",
-        "sector": _to_text(_field(view, "sector")) or "Unknown",
+        "sector": (_normalize_sector(_to_text(_field(view, "sector")))
+                   if _env_sector_normalize()
+                   else _to_text(_field(view, "sector"))) or "Unknown",
         "asset_class": _to_text(_field(view, "asset_class")),
         "currency": currency_raw,
         "fx_to_sar": fx,
@@ -1492,7 +1557,9 @@ def _normalize_portfolio(portfolio):
             continue
         holdings.append({
             "symbol": _to_text(h.get("symbol")) or "?",
-            "sector": _to_text(h.get("sector")) or "Unknown",
+            "sector": (_normalize_sector(_to_text(h.get("sector")))
+                       if _env_sector_normalize()
+                       else _to_text(h.get("sector"))) or "Unknown",
             "market": _to_text(h.get("market")) or "Unknown",
             "value_sar": _to_float(h.get("value_sar")) or 0.0,
         })
@@ -1578,7 +1645,10 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         # v1.0.11: canonical cap key so "NYSE/NASDAQ" and "NASDAQ/NYSE" count as
         # one market (kill-switch off => raw string, byte-identical v1.0.10).
         mkt_key = _market_cap_key(mkt) if canon_market else mkt
-        if sector_counts.get(sec, 0) >= criteria["max_per_sector"]:
+        sector_cap_hit = sector_counts.get(sec, 0) >= criteria["max_per_sector"]
+        if _env_sector_normalize() and sec in ("", "Unknown"):
+            sector_cap_hit = False  # v1.0.13: data-gap bucket is not a real sector
+        if sector_cap_hit:
             deferrals[cand["symbol"]] = (
                 "Diversification: sector cap " +
                 str(criteria["max_per_sector"]) + "/" +
