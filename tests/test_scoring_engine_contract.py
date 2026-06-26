@@ -456,19 +456,35 @@ class TestScoringEngineContract(unittest.TestCase):
             self.assertTrue(callable(getattr(se, name)), msg=f"Not callable: {name}")
 
     def test_scoring_engine_version_matches_core_scoring(self) -> None:
-        """v2.3.0: SCORING_ENGINE_VERSION must match core.scoring.__version__."""
+        """v3.0.1: the RESOLVED-CORE version must match core.scoring.__version__.
+
+        Per scoring_engine bridge v3.8.0, the bridge deliberately exposes TWO
+        distinct version symbols:
+          - SCORING_VERSION        -> the resolved core.scoring.__version__
+                                      (e.g. 5.9.0); this is the core-match invariant.
+          - SCORING_ENGINE_VERSION -> the bridge module's OWN version (e.g. 3.8.0),
+                                      intentionally independent of the core engine.
+        The pre-v3.8.0 assertion (SCORING_ENGINE_VERSION == core.__version__) was
+        retired by that change; asserting it now is a stale contract.
+        """
         if _core_scoring is None:
             self.skipTest("core.scoring could not be imported directly")
         self.assertEqual(
-            getattr(se, "SCORING_ENGINE_VERSION"),
+            getattr(se, "SCORING_VERSION"),
             getattr(_core_scoring, "__version__"),
-            msg="Bridge SCORING_ENGINE_VERSION diverged from core.scoring.__version__",
+            msg="Bridge SCORING_VERSION diverged from core.scoring.__version__",
         )
-        # VERSION alias must match SCORING_ENGINE_VERSION too.
+        # The bridge's own VERSION / __version__ / SCORING_ENGINE_VERSION trio
+        # must stay internally consistent (all three name the bridge module).
         self.assertEqual(
             getattr(se, "VERSION"),
             getattr(se, "SCORING_ENGINE_VERSION"),
             msg="VERSION alias diverged from SCORING_ENGINE_VERSION",
+        )
+        self.assertEqual(
+            getattr(se, "__version__"),
+            getattr(se, "SCORING_ENGINE_VERSION"),
+            msg="__version__ alias diverged from SCORING_ENGINE_VERSION",
         )
 
     def test_default_weights_and_forecasts_exported(self) -> None:
@@ -1002,37 +1018,64 @@ class TestScoringEngineContract(unittest.TestCase):
         _check_score_range_or_none(self, "overall_score", d["overall_score"])
 
     def test_scoring_engine_instance_attributes(self) -> None:
-        """v2.3.0: ScoringEngine.__init__ sets settings/weights/forecast_parameters."""
+        """v3.0.1: ScoringEngine.__init__ sets settings/weights/forecasts.
+
+        Per core.scoring v5.4.1, when kwargs are omitted, `weights` and
+        `forecasts` default to COPIES of the module-level defaults (so a single
+        engine instance cannot mutate the shared globals) -- they are therefore
+        NOT None. Only `settings` defaults to None. Note the forecast attribute
+        is named `forecasts` (the pre-v5.x `forecast_parameters` name is retired).
+        """
         engine = se.ScoringEngine()
-        # Defaults are None when kwargs not provided.
         self.assertTrue(hasattr(engine, "settings"))
         self.assertTrue(hasattr(engine, "weights"))
-        self.assertTrue(hasattr(engine, "forecast_parameters"))
+        self.assertTrue(hasattr(engine, "forecasts"))
+        # settings defaults None; weights/forecasts default to populated copies.
         self.assertIsNone(engine.settings)
-        self.assertIsNone(engine.weights)
-        self.assertIsNone(engine.forecast_parameters)
+        self.assertIsNotNone(engine.weights)
+        self.assertIsNotNone(engine.forecasts)
+        self.assertIsInstance(engine.weights, se.ScoreWeights)
+        self.assertIsInstance(engine.forecasts, se.ForecastParameters)
 
-        # Pass custom weights -- must be stored as given.
+        # Pass custom weights -- must be stored as given (identity preserved).
         custom_weights = se.ScoreWeights()
         engine2 = se.ScoringEngine(weights=custom_weights)
         self.assertIs(engine2.weights, custom_weights)
 
     def test_scoring_engine_has_all_method_delegates(self) -> None:
-        """v2.3.0: bridge's ScoringEngine delegates all 7 public methods."""
+        """v3.0.1: surface split between instance methods and module helpers.
+
+        The ScoringEngine INSTANCE exposes compute_scores / enrich_with_scores as
+        bound methods. The row- and ranking-level helpers (score_row, score_quote,
+        rank_rows_by_overall, assign_rank_overall, score_and_rank_rows) are
+        MODULE-level functions by design: the bridge re-exports them at module
+        scope and lists them in __all__; they are not instance-bound methods on
+        ScoringEngine. The pre-v3 expectation that all seven were instance methods
+        never matched the shipped core.scoring surface.
+        """
         engine = se.ScoringEngine()
-        for method_name in (
-            "compute_scores", "enrich_with_scores",
+        for method_name in ("compute_scores", "enrich_with_scores"):
+            self.assertTrue(
+                hasattr(engine, method_name),
+                msg=f"ScoringEngine missing instance method: {method_name}",
+            )
+            self.assertTrue(
+                callable(getattr(engine, method_name)),
+                msg=f"ScoringEngine.{method_name} is not callable",
+            )
+        # Module-level helpers re-exported by the bridge (see __all__).
+        for fn_name in (
             "score_row", "score_quote",
             "rank_rows_by_overall", "assign_rank_overall",
             "score_and_rank_rows",
         ):
             self.assertTrue(
-                hasattr(engine, method_name),
-                msg=f"ScoringEngine missing method: {method_name}",
+                hasattr(se, fn_name),
+                msg=f"bridge missing module-level helper: {fn_name}",
             )
             self.assertTrue(
-                callable(getattr(engine, method_name)),
-                msg=f"ScoringEngine.{method_name} is not callable",
+                callable(getattr(se, fn_name)),
+                msg=f"bridge.{fn_name} is not callable",
             )
 
     # -------------------- ScoringWeights / ScoreWeights --------------------
