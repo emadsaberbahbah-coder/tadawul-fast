@@ -3,9 +3,35 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.9.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.10.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.10.0 fix — Rank (Overall) / duplicate-symbol corrections actually reach the sheet
+- WHY: routes/analysis_sheet_rows.py already carries two verified page-level
+  corrections for the cross-sectional market pages — GLOBAL-RANK (v4.4.0:
+  _apply_global_rank_overall re-ranks Rank (Overall) across the WHOLE page in one
+  pass, default ON) and GLOBAL-DEDUP (v4.5.0: collapses duplicate-symbol rows,
+  default ON). Both run ONLY in the analysis router, "the single funnel where the
+  COMPLETE page exists before pagination". But this sync routes Market_Leaders,
+  Global_Markets, Commodities_FX and Mutual_Funds through gateway="enriched"
+  (/v1/enriched/sheet-rows), which has NEITHER pass — so the daily sheet showed
+  the SAME Rank (Overall) value repeated once per upstream fetch batch (a row with
+  overall 42 ranked 1 above a row with overall 67 ranked 2) and let duplicate
+  symbols survive. The fix was built and on by default; it was simply never on the
+  path the sync writes.
+- FIX (env-gated, DEFAULT OFF -> byte-identical v6.9.0 routing): a per-task
+  _effective_gateway() resolves the four cross-sectional market pages
+  (_RANKED_MARKET_PAGES, mirroring the analysis router's scope exactly) to the
+  "analysis" gateway when TFB_SYNC_MARKET_ANALYSIS_GATEWAY is enabled, so the
+  global rank + dedup passes run on what gets written. My_Portfolio (holding
+  order / multi-lot) and the meta pages are excluded. The analysis gateway's
+  endpoint-candidate chain ends at the enriched endpoints, so an analysis-route
+  outage falls back to the prior path (that page loses the rank/dedup for the
+  cycle — never a failed write). Two new helpers added
+  (_market_analysis_gateway_enabled, _effective_gateway) + one constant
+  (_RANKED_MARKET_PAGES); every v6.9.0 function carried verbatim, none removed.
+  Reversible: unset TFB_SYNC_MARKET_ANALYSIS_GATEWAY -> v6.9.0 routing exactly.
 
 v6.9.0 fix — empty-rows wipe guard (silent clear-then-blank on provider outage)
 - WHY: the four page-driven data pages (Market_Leaders, Global_Markets,
@@ -232,7 +258,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.9.0"
+SCRIPT_VERSION = "6.10.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1158,6 +1184,43 @@ def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
     ]
 
 
+# v6.10.0 [GLOBAL-RANK/DEDUP ROUTING]: the four cross-sectional market pages whose
+# Rank (Overall) must be ranked across the WHOLE page (and whose duplicate-symbol
+# rows must be collapsed). Those corrections live ONLY in the analysis router
+# (routes/analysis_sheet_rows.py: _apply_global_rank_overall v4.4.0 + the v4.5.0
+# global dedup, both default ON), which is the single funnel where the complete
+# page exists before pagination. Scope mirrors that router's ranked-market-page
+# scope exactly; My_Portfolio (holding order / multi-lot) and the meta pages are
+# intentionally excluded.
+_RANKED_MARKET_PAGES = frozenset({
+    "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
+})
+
+
+def _market_analysis_gateway_enabled() -> bool:
+    """v6.10.0: route the four cross-sectional market pages through the ANALYSIS
+    gateway (/v1/analysis/sheet-rows) instead of ENRICHED, so the analysis
+    router's page-level Global Rank (v4.4.0) and Global Dedup (v4.5.0) passes
+    actually run on the sheet the daily sync writes. DEFAULT OFF -> every task's
+    gateway is its configured value and the routing is byte-identical to v6.9.0.
+    Set TFB_SYNC_MARKET_ANALYSIS_GATEWAY to 1/true/on/yes to enable."""
+    raw = (os.getenv("TFB_SYNC_MARKET_ANALYSIS_GATEWAY", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "enabled", "enable"}
+
+
+def _effective_gateway(task: TaskSpec) -> str:
+    """v6.10.0: the gateway actually used for a task. When the market-analysis
+    routing toggle is ON, the four cross-sectional market pages resolve to
+    "analysis" (the router that carries the global rank + dedup passes); every
+    other page, and the OFF state, returns the task's configured gateway
+    unchanged. The "analysis" candidate chain ends at the enriched endpoints, so
+    an analysis-route outage falls back to the prior path (the page loses the
+    rank/dedup for that cycle -- never a failed write)."""
+    if _market_analysis_gateway_enabled() and task.sheet_name in _RANKED_MARKET_PAGES:
+        return "analysis"
+    return task.gateway
+
+
 def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[Any]]]:
     """
     Returns (headers, rows_matrix) ALWAYS as list[list] for Sheets writing.
@@ -1412,8 +1475,9 @@ async def _run_one_task(
         headers: List[Any] = []
         rows_matrix: List[List[Any]] = []
         used_endpoint: Optional[str] = None
+        eff_gw = _effective_gateway(task)  # v6.10.0: ranked market pages -> analysis when enabled
 
-        for ep in _endpoint_candidates_for_gateway(task.gateway):
+        for ep in _endpoint_candidates_for_gateway(eff_gw):
             data, err, _code = await backend.post_json(ep, payload)
             if err:
                 last_err = f"{ep} -> {err}"
@@ -1436,7 +1500,7 @@ async def _run_one_task(
             res.error = last_err or "All endpoints failed"
             return res
 
-        res.gateway_used = f"{task.gateway}:{used_endpoint}" if used_endpoint else task.gateway
+        res.gateway_used = f"{eff_gw}:{used_endpoint}" if used_endpoint else eff_gw
         res.symbols_processed = len(symbols)
 
         # No creds => partial (data fetched but not written)
