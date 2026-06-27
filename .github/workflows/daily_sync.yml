@@ -227,11 +227,17 @@ jobs:
             exit 1
           fi
 
-          # schema drift gate (warning-only for scheduler to avoid cron spam)
+          # schema drift gate (HARD — deterministic contract test, no live-data
+          # fetch, so a failure signals a real schema-contract drift, not a
+          # transient. A drift must BLOCK the sync rather than publish a
+          # schema-corrupted sheet with only a warning. Matches the
+          # score-contract gate above; under `set -euo pipefail` a non-zero
+          # pytest exit fails the job and stops the sync.)
           if [ -f "tests/test_schema_alignment.py" ]; then
-            python -m pytest -q tests/test_schema_alignment.py || echo "::warning::Schema alignment test failed (scheduler continues)."
+            python -m pytest -q tests/test_schema_alignment.py
           else
-            echo "::warning::tests/test_schema_alignment.py not found; schema drift gate not running in scheduler."
+            echo "::error::tests/test_schema_alignment.py not found; required schema drift gate is missing."
+            exit 1
           fi
           echo "::endgroup::"
 
