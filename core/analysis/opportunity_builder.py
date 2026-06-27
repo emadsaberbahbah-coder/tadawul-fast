@@ -1,12 +1,57 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.15  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.0.17  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
-                 labeling, all env-gated DEFAULT-OFF)
+                 labeling + issuer-level cross-listing dedup + duplicate-issuer
+                 near-miss labeling, all env-gated DEFAULT-OFF)
 
-v1.0.15 [FLOOR NEAR-MISS LABELING — display correctness, no gate change. WHY:
+v1.0.17 [DUPLICATE-ISSUER NEAR-MISS LABELING — display correctness, no gate
+change. WHY: v1.0.16's issuer dedup records a deferred cross-listing in the same
+`deferrals` dict ("Duplicate issuer — already funded {SYM}"), but _near_miss_rows
+only special-cased the floor reason — every other deferral fell through to the
+"Diversification" gate with "within sector/market caps" / "deferred by
+diversification cap". So a duplicate-issuer name surfacing in NEAR MISS (likely,
+since the deferred sibling carries a near-identical score) was mislabeled as a
+diversification cap it never hit — the exact bug class fixed for the floor in
+v1.0.15, reintroduced by the new deferral category not being wired into the
+classifier. FIX: add a branch in _near_miss_rows — a deferral containing
+"Duplicate issuer" is classified as the "Duplicate" gate (Required = "one listing
+per issuer", How-To = a higher-ranked listing of this issuer is already funded;
+cross-listing of the same company). All other deferrals keep byte-identical
+labeling. No gate, verdict, ticket, sizing or funding-identity change — purely
+the gate/required/how-to text for duplicate-issuer near-miss rows. Reachable only
+when issuer dedup is ON, so OFF => byte-identical v1.0.16. No new functions;
+_near_miss_rows body only.
+
+
+(TFB_OPP_ISSUER_DEDUP / criteria issuer_dedup_enabled). WHY: one company can
+list under several symbols — a true cross-listing (Takeda Tokyo 4502.T + NYSE
+ADR TAK.US) or a symbol-spelling twin on one exchange (BMW.DE + BMW.XETRA;
+MUV2.XETRA + MUV2.DE). Each occupied a separate Top_10 slot (2026-06-27 live),
+wasting selection capacity and concentrating one issuer. This sits one layer
+above the v1.0.11 market-cap canonicalization (which collapsed NYSE/NASDAQ vs
+NASDAQ/NYSE): now we collapse multiple SYMBOLS of one ISSUER. FIX (default OFF
+=> byte-identical v1.0.15): when enabled, the greedy selector keys each candidate
+to an issuer and, once an issuer is FUNDED, defers any later listing of the same
+issuer with a 'Duplicate issuer — already funded {SYM}' reason (the existing
+deferrals path; the duplicate stays a valid INVEST row in the audit, it just
+cannot take a second funded slot). HYBRID KEY: a curated override map
+(_ISSUER_DEDUP_MAP, default empty) wins first — it can FORCE-MERGE listings whose
+names diverge (e.g. an ADR named differently from the local line) or FORCE-SPLIT
+genuinely-distinct same-named issuers; otherwise the key is the normalized
+company name (legal suffixes + punctuation stripped), which already collapses the
+three live dupes because their names are identical across listings. SAFETY: a
+nameless row (name missing or == symbol) keys to its own symbol, so it can never
+false-merge into another issuer; the dropped duplicate is always shown with an
+explicit reason, never silently removed. KEYED AT FUNDING (not at first
+encounter): an issuer whose top-ranked symbol is sector-capped or floored is NOT
+pre-empted — a fundable listing of the same issuer can still be chosen. One new
+criterion key + one env reader + one issuer-key helper + a guarded check/record
+pair in _select_and_size; every v1.0.15 function carried verbatim, none removed.
+
+
 v1.0.14's minimum-ticket floor records a sub-floor pick in the same `deferrals`
 dict the diversification caps use ("Unfunded — sized ticket X below minimum
 ticket floor Y"). _near_miss_rows classified EVERY deferred symbol as the
@@ -381,7 +426,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.15"
+OPPORTUNITY_BUILDER_VERSION = "1.0.17"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -567,6 +612,10 @@ DEFAULT_CRITERIA = {
     # first. OFF => byte-identical v1.0.8 ordering (opportunity_score primary).
     # A missing/unparseable engine forecast sorts last (never invents a rank).
     "rank_by_engine_roi_enabled": False,
+    # v1.0.16: issuer-level cross-listing dedup. DEFAULT False = OFF
+    # (byte-identical). When True, a later listing of an already-funded issuer
+    # is deferred instead of taking a second Top_10 slot.
+    "issuer_dedup_enabled": False,
     # v1.0.10: DEFAULT 0 = unlimited (byte-identical). When >0, the
     # candidates_rows audit grid that GAS writes back to the sheet is capped
     # to this many rows so a full-universe scan stays inside the GAS/Sheets
@@ -596,6 +645,7 @@ _CRITERIA_BOOL_KEYS = (
     "valuation_sanity_gate_enabled", "engine_roi_display_enabled",
     "trust_gate_enabled", "investability_gate_enabled",
     "unfunded_watch_enabled", "rank_by_engine_roi_enabled",
+    "issuer_dedup_enabled",
 )
 
 # ---------------------------------------------------------------------------
@@ -796,6 +846,16 @@ def _env_rank_by_engine_roi():
         "1", "true", "yes", "on", "enabled", "enable")
 
 
+def _env_issuer_dedup():
+    """v1.0.16: issuer-level cross-listing dedup toggle. Default OFF; set
+    TFB_OPP_ISSUER_DEDUP=1 to collapse multiple symbols of one issuer (true
+    cross-listings or symbol-spelling twins) so a single issuer cannot occupy
+    more than one funded Top_10 slot. OFF => byte-identical v1.0.15."""
+    return str(_env_str(
+        "TFB_OPP_ISSUER_DEDUP", "0")).strip().lower() in (
+        "1", "true", "yes", "on", "enabled", "enable")
+
+
 def _env_canon_market():
     """v1.0.11: per-market cap canonicalization toggle. KILL-SWITCH, default ON;
     set TFB_OPP_CANON_MARKET=0 to restore byte-identical v1.0.10 behavior (the
@@ -845,6 +905,7 @@ def _env_overrides():
         "investability_gate_enabled": _env_investability_gate(),
         "unfunded_watch_enabled": _env_unfunded_watch(),
         "rank_by_engine_roi_enabled": _env_rank_by_engine_roi(),
+        "issuer_dedup_enabled": _env_issuer_dedup(),
         "min_ticket_sar": _env_float(
             "TFB_OPP_MIN_TICKET_SAR",
             DEFAULT_CRITERIA["min_ticket_sar"]),
@@ -1680,6 +1741,50 @@ def _market_cap_key(market):
     return "/".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# v1.0.16: issuer-level cross-listing dedup key (hybrid: curated override map
+# first, normalized company name otherwise). Used by _select_and_size only when
+# issuer_dedup_enabled is True.
+# ---------------------------------------------------------------------------
+# Override map (default EMPTY). A curator may add entries to:
+#   - FORCE-MERGE: point two symbols at the SAME id when their names diverge
+#     across listings (e.g. an ADR named differently from the local line).
+#   - FORCE-SPLIT: point a symbol at a UNIQUE id to stop a wrong merge of two
+#     genuinely-distinct issuers that happen to share a normalized name.
+# Empty => pure normalized-name behavior, which already collapses the live dupes
+# (Takeda 4502.T/TAK.US, BMW.DE/BMW.XETRA, MUV2.XETRA/MUV2.DE) because their
+# company names are identical across listings.
+_ISSUER_DEDUP_MAP = {}
+
+# Legal-form suffixes / connectors stripped before keying, so the same company
+# keys identically across exchanges regardless of local legal suffix.
+_ISSUER_SUFFIX_RE = re.compile(
+    r"\b("
+    r"incorporated|corporation|company|limited|holdings|holding|group|"
+    r"inc|corp|co|ltd|plc|llc|lp|"
+    r"ag|aktiengesellschaft|kgaa|se|nv|bv|sa|spa|ab|asa|oyj|oy|as|"
+    r"sab|adr|ads|the"
+    r")\b", re.IGNORECASE)
+
+
+def _issuer_key(cand):
+    """v1.0.16: stable issuer key for cross-listing dedup. Curated override map
+    wins (force-merge / force-split); otherwise a normalized company name with
+    legal suffixes and punctuation removed. Falls back to the symbol when the
+    name is missing or equals the symbol, so a nameless row can NEVER false-merge
+    into another issuer."""
+    sym = str(cand.get("symbol") or "").strip().upper()
+    if sym in _ISSUER_DEDUP_MAP:
+        return _ISSUER_DEDUP_MAP[sym]
+    name = str(cand.get("name") or "").strip()
+    if not name or name.upper() == sym:
+        return "sym:" + sym  # no usable name -> keyed to itself, never merges
+    k = _ISSUER_SUFFIX_RE.sub(" ", name.lower())
+    k = re.sub(r"[^a-z0-9]+", " ", k)   # drop punctuation / non-ascii to spaces
+    k = re.sub(r"\s+", " ", k).strip()
+    return ("name:" + k) if k else ("sym:" + sym)
+
+
 def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     """L2 cap + §4.2 diversification (selection-time, defer) + §4.4 sizing.
     Returns (tickets_raw, deferrals{symbol: reason})."""
@@ -1692,10 +1797,25 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
     canon_market = _env_canon_market()  # v1.0.11 kill-switch (default ON)
     pf_sector_sar = dict(sector_ctx["sectors"])
     picked, deferrals = [], {}
+    # v1.0.16: issuer-level cross-listing dedup (default OFF).
+    issuer_dedup = bool(criteria.get("issuer_dedup_enabled", False))
+    funded_issuers = {}
 
     for cand in invest_cands:
         if len(picked) >= criteria["max_selected"]:
             break
+        # v1.0.16: issuer-level cross-listing dedup (default OFF). Once an issuer
+        # is FUNDED, a later listing of the SAME issuer (e.g. Takeda 4502.T then
+        # TAK.US, or BMW.DE then BMW.XETRA) is deferred rather than taking a
+        # second slot. Keyed at funding (below), so an issuer whose top symbol
+        # was sector-capped or floored is not pre-empted from a fundable listing.
+        if issuer_dedup:
+            _ikey = _issuer_key(cand)
+            if _ikey in funded_issuers:
+                deferrals[cand["symbol"]] = (
+                    "Duplicate issuer \u2014 already funded " +
+                    funded_issuers[_ikey])
+                continue
         sec, mkt = cand["sector"], cand["market"]
         # v1.0.11: canonical cap key so "NYSE/NASDAQ" and "NASDAQ/NYSE" count as
         # one market (kill-switch off => raw string, byte-identical v1.0.10).
@@ -1748,6 +1868,8 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         picked.append({"cand": cand, "suggested_sar": suggested,
                        "suggested_shares": shares,
                        "funds_from": funds_label})
+        if issuer_dedup:
+            funded_issuers[_ikey] = cand["symbol"]
     return picked, deferrals, deployable, remaining
 
 
@@ -1912,6 +2034,15 @@ def _near_miss_rows(audit, selected_syms, deferrals, criteria):
                         "amount was below the minimum ticket floor; add Cash "
                         "Available, lower Max Selected, or lower the floor to "
                         "fund it.")
+            elif "Duplicate issuer" in _reason:
+                # v1.0.17: the v1.0.16 issuer-dedup adds a "Duplicate issuer"
+                # deferral to the same dict — classify it distinctly so it is
+                # not mislabeled as a diversification cap (same bug class as the
+                # v1.0.15 floor fix). Reachable only when issuer dedup is ON.
+                gate, cur, req = "Duplicate", _reason, "one listing per issuer"
+                note = ("Qualified (INVEST) \u2014 a higher-ranked listing of "
+                        "this issuer is already funded; this is a cross-listing "
+                        "of the same company, not a separate position.")
             else:
                 gate, cur, req = "Diversification", _reason, (
                     "within sector/market caps")
