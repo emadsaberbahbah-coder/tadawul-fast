@@ -2,7 +2,7 @@
 """
 tests/test_opportunity_builder.py
 ================================================================================
-OPPORTUNITY BUILDER CONTRACT TESTS — v1.1.0  (HARDENED / CI-FRIENDLY / NO-PRINT)
+OPPORTUNITY BUILDER CONTRACT TESTS — v1.3.0  (HARDENED / CI-FRIENDLY / NO-PRINT)
 ================================================================================
 Emad Bahbah – Tadawul Fast Bridge
 
@@ -23,6 +23,15 @@ production (previously verified only by ad-hoc scripts):
     accept + negative-clamp + default-OFF.
   * v1.0.15 floor near-miss labeling — a floor deferral surfaces as a "Funding"
     near-miss, never mislabeled as a diversification cap.
+
+v1.2.0 — coverage for v1.0.16 issuer-level cross-listing dedup
+(TFB_OPP_ISSUER_DEDUP): the issuer key collapses same-company listings and keeps
+distinct issuers apart; ON defers the duplicate listing ("Duplicate issuer");
+OFF funds both (parity); criteria accept + default-OFF.
+
+v1.3.0 — coverage for v1.0.17 duplicate-issuer near-miss labeling: a deferred
+cross-listing surfaces in NEAR MISS as the "Duplicate" gate, never mislabeled as
+a diversification cap.
 
 WHY v1.0.0
 - stdlib unittest only (no network, no prints, CI-friendly) — matches
@@ -349,6 +358,68 @@ class TestOpportunityBuilderContract(unittest.TestCase):
         nm = {n["symbol"]: n for n in p["near_miss"]}
         self.assertEqual(nm.get("BBB.SR", {}).get("failed_gate"), "Funding")
         self.assertEqual(nm.get("BBB.SR", {}).get("verdict"), "WATCH")
+
+    # -- v1.0.16 issuer-level cross-listing dedup (TFB_OPP_ISSUER_DEDUP) ----
+
+    def test_issuer_dedup_key_collapses_cross_listings(self) -> None:
+        # Same company under two symbols -> same key; distinct companies differ.
+        same = ob._issuer_key(
+            {"symbol": "4502.T",
+             "name": "Takeda Pharmaceutical Company Limited"})
+        adr = ob._issuer_key(
+            {"symbol": "TAK.US",
+             "name": "Takeda Pharmaceutical Company Limited"})
+        self.assertEqual(same, adr, "cross-listing must key identically")
+        other = ob._issuer_key(
+            {"symbol": "OTF.US", "name": "Blue Owl Technology Finance Corp."})
+        self.assertNotEqual(same, other, "distinct issuers must not collapse")
+        # nameless row keys to its own symbol (never false-merges)
+        self.assertEqual(
+            ob._issuer_key({"symbol": "5023.SR", "name": "5023.SR"}),
+            "sym:5023.SR")
+
+    def _twin_listing_payload(self, dedup: bool) -> Dict[str, Any]:
+        rows = [_row(symbol="4502.T",
+                     name="Takeda Pharmaceutical Company Limited"),
+                _row(symbol="TAK.US",
+                     name="Takeda Pharmaceutical Company Limited")]
+        return ob.build_opportunity_payload(
+            rows,
+            criteria={"issuer_dedup_enabled": dedup, "max_selected": 10},
+            portfolio={"cash_available_sar": 500000})
+
+    def test_issuer_dedup_defers_duplicate_when_enabled(self) -> None:
+        p = self._twin_listing_payload(True)
+        self.assertEqual(len(p["selected"]), 1,
+                         "only one listing of the issuer may be funded")
+        sel = {t["symbol"] for t in p["selected"]}
+        dup = next(a for a in p["candidates_rows"] if a["symbol"] not in sel)
+        self.assertIn("Duplicate issuer", (dup.get("deferral") or ""),
+                      "the other listing must defer as a duplicate issuer")
+
+    def test_issuer_dedup_off_keeps_both(self) -> None:
+        # OFF -> both listings funded (parity with pre-dedup v1.0.15).
+        self.assertEqual(
+            len(self._twin_listing_payload(False)["selected"]), 2)
+
+    def test_issuer_dedup_near_miss_labeled_duplicate(self) -> None:
+        # v1.0.17: the deferred cross-listing must surface in NEAR MISS as the
+        # "Duplicate" gate, never mislabeled as a diversification cap.
+        p = self._twin_listing_payload(True)
+        sel = {t["symbol"] for t in p["selected"]}
+        nm = {n["symbol"]: n for n in p["near_miss"]
+              if n["symbol"] not in sel}
+        self.assertTrue(nm, "deferred duplicate should surface in near_miss")
+        row = next(iter(nm.values()))
+        self.assertEqual(
+            row["failed_gate"], "Duplicate",
+            "duplicate-issuer near-miss must not be labeled 'Diversification'")
+        self.assertEqual(row["required"], "one listing per issuer")
+
+    def test_issuer_dedup_criteria_accept(self) -> None:
+        self.assertFalse(ob.make_criteria().get("issuer_dedup_enabled"))
+        self.assertTrue(ob.make_criteria(
+            {"issuer_dedup_enabled": True}).get("issuer_dedup_enabled"))
 
     # -- robustness ---------------------------------------------------------
 
