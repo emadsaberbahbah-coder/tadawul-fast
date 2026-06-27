@@ -1,11 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.17  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.0.18  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
-                 near-miss labeling, all env-gated DEFAULT-OFF)
+                 near-miss labeling, all env-gated DEFAULT-OFF;
+                 A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.0.18 [A2 SECTOR-MAP SINGLE-SOURCE — no behaviour change. WHY: the six-entry
+Yahoo->GICS sector map (_YAHOO_TO_GICS_SECTOR, added v1.0.13) was a PRIVATE copy
+in this file; top10_selector's W-5 cap (A2) needs the identical map, and two
+copies are exactly the cross-file taxonomy drift A2 exists to kill. The map now
+lives in core.sectors as the single source of truth and is imported here; the
+inline literal is retained ONLY as an import fallback. _normalize_sector(), the
+TFB_OPP_SECTOR_NORMALIZE gate and every downstream behaviour are unchanged --
+with core.sectors present (normal) the imported dict is byte-identical to the
+former literal, so verdicts/ranks/labels are identical. No functions added or
+removed; one literal converted to an import-with-fallback.]
 
 v1.0.17 [DUPLICATE-ISSUER NEAR-MISS LABELING — display correctness, no gate
 change. WHY: v1.0.16's issuer dedup records a deferred cross-listing in the same
@@ -426,7 +438,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.17"
+OPPORTUNITY_BUILDER_VERSION = "1.0.18"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -805,14 +817,25 @@ def _env_unfunded_watch():
 # "Basic Materials") otherwise fragments into its OWN cap bucket instead of
 # joining its GICS peers ("Materials"). Only these six spellings differ; every
 # other Yahoo sector string already equals its GICS counterpart.
-_YAHOO_TO_GICS_SECTOR = {
-    "Basic Materials": "Materials",
-    "Healthcare": "Health Care",
-    "Consumer Cyclical": "Consumer Discretionary",
-    "Consumer Defensive": "Consumer Staples",
-    "Technology": "Information Technology",
-    "Financial Services": "Financials",
-}
+#
+# v1.0.18 (A2): this map now lives in core.sectors as the SINGLE source of truth,
+# imported here and by top10_selector so the two decision tabs' sector
+# canonicalization can never drift. Behaviour is identical -- the same six
+# Yahoo->GICS pairs, consumed by the same _normalize_sector() under the same
+# TFB_OPP_SECTOR_NORMALIZE gate. The inline literal is retained ONLY as a
+# fallback so this module stays importable if core.sectors is ever unavailable;
+# in normal operation the imported dict is used and the literal is dead.
+try:
+    from core.sectors import YAHOO_TO_GICS_SECTOR as _YAHOO_TO_GICS_SECTOR  # type: ignore
+except Exception:  # pragma: no cover
+    _YAHOO_TO_GICS_SECTOR = {
+        "Basic Materials": "Materials",
+        "Healthcare": "Health Care",
+        "Consumer Cyclical": "Consumer Discretionary",
+        "Consumer Defensive": "Consumer Staples",
+        "Technology": "Information Technology",
+        "Financial Services": "Financials",
+    }
 
 
 def _env_sector_normalize():
