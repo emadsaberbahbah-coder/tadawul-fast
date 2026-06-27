@@ -3,7 +3,7 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.19.0
+Top 10 Selector — v4.20.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -21,7 +21,29 @@ GOLDEN-COMPOSITE RANKED • TIER-DISCIPLINED • SELL-CLASS SAFE
 RANK-INTEGRITY GUARANTEED • SECTOR-DIVERSIFIED (v4.18.0)
 BUDGET-GRACEFUL • DE-CLAMPED TIMEOUTS • COVERAGE-AUDITED
 ENRICHMENT-PROJECTION GUARANTEED (v4.19.0)
+SECTOR-TAXONOMY UNIFIED · YAHOO->GICS CAP CANON (v4.20.0)
 
+================================================================================
+What v4.20.0 fixes/adds (over v4.19.0)  --  A2: SECTOR-TAXONOMY UNIFICATION
+================================================================================
+TFB Track A / A2 (the audit's H2 "load-bearing" finding). The W-5 sector
+diversification cap keyed on the RAW provider sector string (lower-cased only),
+so the SAME economic sector under two provider vocabularies counted as two
+buckets and the cap leaked: a Saudi bank (GICS "Financials", from
+data_engine_v2._KSA_SYMBOL_SECTOR) and a US bank (Yahoo "Financial Services",
+raw from the Yahoo fundamentals provider) each took their OWN cap slot. Only six
+sector spellings differ between the two 11-sector taxonomies; every other name
+already matches across both.
+
+FIX (default OFF -> byte-identical v4.19.0): new gate TFB_TOP10_SECTOR_NORMALIZE.
+When ON, _sector_key() first canonicalizes the sector via
+core.sectors.normalize_sector (Yahoo->GICS, the SINGLE shared map -- the same
+canonical map opportunity_builder's TFB_OPP_SECTOR_NORMALIZE consumes, so the two
+tabs cannot drift) BEFORE lower-casing, so one economic sector occupies one
+bucket. Every remap is counted in fill_meta["sector_normalize"] and surfaced in
+result meta for audit. With the gate OFF the canon step returns the raw string
+unchanged, so output is byte-identical to v4.19.0; no functions removed; one
+constant + one import + one nested-helper line added.
 ================================================================================
 What v4.19.0 fixes/adds (over v4.18.0)  --  FIX X: GRACEFUL TOTAL BUDGET +
 DE-CLAMPED TIMEOUTS + COVERAGE AUDIT + ENRICHMENT PROJECTION
@@ -477,7 +499,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.19.0"
+TOP10_SELECTOR_VERSION = "4.20.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1069,6 +1091,15 @@ TOP10_EXCLUDE_SELL_CLASS_ENABLED = (
 # W-5: sector diversification cap on the FINAL selection. 0 disables.
 TOP10_SECTOR_CAP = _env_int("TFB_TOP10_SECTOR_CAP", 4, minimum=0, maximum=10)
 
+# v4.20.0 (A2): when ON, the W-5 sector cap keys on the CANONICAL (Yahoo->GICS)
+# sector so one economic sector occupies one bucket regardless of provider
+# vocabulary. DEFAULT OFF (deploy-dark) -> the cap keys on the raw sector exactly
+# as in v4.19.0. Requires core.sectors (imported above); if that import failed
+# the flag stays an inert no-op even when set. Recommended ON in production
+# together with TFB_OPP_SECTOR_NORMALIZE so BOTH decision tabs canonicalize
+# consistently.
+TOP10_SECTOR_NORMALIZE = _env_bool("TFB_TOP10_SECTOR_NORMALIZE", False)
+
 # W-7: Top10-run metadata stripped from the OUTPUT-PAGE fallback donor at
 # ingest — these fields describe a PREVIOUS selector run and are stale by
 # definition when re-ingested (stale ranks were the W-4 corruption vector;
@@ -1176,6 +1207,17 @@ try:
     from core.sheets.page_catalog import normalize_page_name as _normalize_page_name  # type: ignore
 except Exception:
     _normalize_page_name = None  # type: ignore
+
+
+# v4.20.0 (A2): canonical Yahoo->GICS sector map -- the SINGLE source of truth,
+# shared with opportunity_builder so the two decision tabs' sector caps cannot
+# drift apart. Defensive import: if the module is somehow absent, normalization
+# simply cannot engage (the gate below becomes an inert no-op) -- this file holds
+# NO duplicate copy of the map.
+try:
+    from core.sectors import normalize_sector as _canon_sector  # type: ignore
+except Exception:  # pragma: no cover
+    _canon_sector = None  # type: ignore
 
 
 try:
@@ -3666,8 +3708,24 @@ def _fill_top10_selection(
         "sector_cap_relaxed": 0,
     }
 
+    # v4.20.0 (A2): canonicalize the sector BEFORE keying the cap, so one economic
+    # sector occupies one bucket across provider vocabularies (Yahoo "Financial
+    # Services" and GICS "Financials" collapse to one). Gate OFF (default) -- or
+    # core.sectors unavailable -- leaves _norm_on False, and _sector_key then
+    # produces a byte-identical key to v4.19.0. Each remap is counted for audit.
+    _norm_on = bool(TOP10_SECTOR_NORMALIZE) and _canon_sector is not None
+    fill_meta["sector_normalize"] = {"enabled": _norm_on, "remaps": {}}
+
     def _sector_key(row: Mapping[str, Any]) -> str:
-        return _s(row.get("sector")).strip().lower() or "unknown"
+        raw = _s(row.get("sector"))
+        if _norm_on:
+            canon = _canon_sector(raw)
+            if raw and canon != raw:
+                _rm = fill_meta["sector_normalize"]["remaps"]
+                _k = raw + " -> " + canon
+                _rm[_k] = _rm.get(_k, 0) + 1
+            raw = canon
+        return raw.strip().lower() or "unknown"
 
     def _admit(row: Dict[str, Any], relaxing: bool) -> bool:
         sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
@@ -4068,6 +4126,7 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "sector_cap": fill_meta.get("sector_cap"),
             "sector_cap_deferred": fill_meta.get("sector_cap_deferred"),
             "sector_cap_relaxed": fill_meta.get("sector_cap_relaxed"),
+            "sector_normalize": fill_meta.get("sector_normalize"),
             # v4.16.0 Phase A — provenance of the FINAL projected rows
             # (3=live/hydrated, 2=emergency, 1=snapshot, 0=output-fallback).
             "selected_provenance_counts": {
@@ -4260,6 +4319,7 @@ __all__ = [
     "TOP10_EXCLUDE_SELL_CLASS_ENV",
     "TOP10_TIER1_RELIABILITY_FLOOR",
     "TOP10_SECTOR_CAP",
+    "TOP10_SECTOR_NORMALIZE",
     "TOP10_GOLDEN_COMPOSITE_ENABLED",
     "TOP10_GOLDEN_COMPOSITE_ENV",
     "GOLDEN_COMPOSITE_WEIGHTS",
