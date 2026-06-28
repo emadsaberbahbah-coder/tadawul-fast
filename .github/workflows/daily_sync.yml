@@ -272,6 +272,13 @@ jobs:
 
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+
+          # Merged here from a second, duplicate step-level env: block that made
+          # this workflow invalid (GitHub allows only ONE env: per step). These
+          # are consumed by the run script below; step env is available to the
+          # whole run regardless of block position, so this is behaviour-identical.
+          RAW_CREDS: ${{ github.event.inputs.google_creds_json }}
+          CREDS_PATH: ${{ runner.temp }}/google_credentials.json
         run: |
           set -euo pipefail
 
@@ -443,9 +450,6 @@ jobs:
           fi
 
           echo "::endgroup::"
-        env:
-          RAW_CREDS: ${{ github.event.inputs.google_creds_json }}
-          CREDS_PATH: ${{ runner.temp }}/google_credentials.json
 
       - name: 💓 Backend Health Check
         id: health_check
