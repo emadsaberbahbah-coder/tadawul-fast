@@ -293,11 +293,15 @@ jobs:
           }
 
           upper_underscore() {
-            # normalize to UPPER_SNAKE (spaces/dashes -> underscores, collapse)
+            # Normalize a LIST to space-separated UPPER_SNAKE keys. Dashes ->
+            # underscores; commas/semicolons/etc -> spaces. SPACES STAY as key
+            # separators. FIX: the prior ' -' -> '__' mapped the inter-key
+            # spaces to underscores too, mashing the whole list into ONE invalid
+            # token — which broke every full_sync (the default list included).
             echo "${1:-}" \
               | tr '[:lower:]' '[:upper:]' \
               | tr ',;|\n\r\t' '      ' \
-              | tr ' -' '__' \
+              | tr '-' '_' \
               | tr -s '_' \
               | xargs
           }
