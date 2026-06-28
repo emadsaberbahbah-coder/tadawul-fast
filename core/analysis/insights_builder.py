@@ -180,7 +180,38 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "8.6.0"
+INSIGHTS_BUILDER_VERSION = "8.7.0"
+# v8.7.0 - DECISION-SCOPE INSIGHTS (audit H1 / Track A A1; env-gated,
+# default-OFF). FIXES THE ONLY BROKEN USER PAGE. SYMPTOM: Insights_Analysis
+# scanned ~5 symbols, per-symbol detail came back empty, and stale rows
+# persisted. ROOT CAUSE: the equity seed (_resolve_equity_universes, gated by
+# TFB_INSIGHTS_EQUITY_UNIVERSE) took an ARBITRARY first-25 slice of
+# Market_Leaders+Global_Markets under a shared build budget -- the wrong names
+# (not the decision set) and, on a cold cache, too many to fetch before the
+# budget drained and later sections were skipped; with that gate OFF (the
+# production default) only the 9 index/FX _default_universes() were scanned,
+# which IS the "5 symbols" symptom. FIX: a new gate TFB_INSIGHTS_DECISION_SCOPE
+# seeds the scan from the actual DECISION SET instead -- Market_Leaders (the
+# live leaders book) + Top_10 (the current selection) + current holdings
+# (My_Portfolio) -- deduped and bounded by TFB_INSIGHTS_DECISION_MAX_SYMBOLS
+# (default 120). Concentrating the budget on exactly the symbols the
+# recommendations are built from fills ctx.all_quotes for every decision symbol
+# (so the per-symbol sections stop coming back empty), and a separate
+# My_Portfolio universe is also seeded so Portfolio KPIs bind their holdings.
+# WHY NO worker.py PRECOMPUTE: the 15-min refresh ALREADY runs off the user
+# request path (GitHub Actions cron -> run_dashboard_sync -> writes the sheet),
+# and the engine cache (MultiLevelCache) is in-process only -- not Redis -- so a
+# worker could not hand a precomputed result to the web route without leaning on
+# Redis as a durable store (it is an LRU eviction cache) or re-architecting to a
+# worker->sheet push. Scoping the on-endpoint scan to the decision set keeps the
+# fix surgical and within budget; raising the route/bridge timeout is the
+# secondary measure. CONTAINMENT / REVERSIBILITY: behind
+# TFB_INSIGHTS_DECISION_SCOPE (default OFF). When OFF, _resolve_decision_universe
+# is never called, the seed branch is byte-identical to v8.6.0 (equity-seed path
+# unchanged, then the index/FX defaults), and the row set / ordering / contract
+# are unchanged. AUDITABILITY: meta carries decision_scope_used + decision_set_size,
+# and when the scope is used a System coverage row reports the decision-set size
+# that was scanned.
 # v8.5.0 - STRUCTURAL SIGNALS DISCLOSURE (Strategy #1, Phase 2b; env-gated,
 # default-OFF). Surfaces the engine's structural candlestick backbone
 # (data_engine_v2 >= v5.95.0: analyze_candle_structure -> candle_structure /
@@ -567,11 +598,31 @@ _INSIGHTS_EQUITY_PAGES_DEFAULT = "Market_Leaders,Global_Markets"
 # gated by TFB_INSIGHTS_EQUITY_UNIVERSE) -> flag OFF = byte-identical.
 _INSIGHTS_EQUITY_MAX_SYMBOLS = _env_int("TFB_INSIGHTS_EQUITY_MAX_SYMBOLS", 25, minimum=3, maximum=200)
 
+# v8.7.0 (A1 -- DECISION-SCOPE INSIGHTS): bound for the unified decision-set
+# universe (Market_Leaders + Top_10 + current holdings). The audit-H1 symptom
+# ("5 symbols scanned, per-symbol detail empty, stale rows") came from the equity
+# seed slicing an arbitrary first-25 of Market_Leaders+Global_Markets under a
+# shared budget -- the wrong names, and too many to fetch on a cold cache.
+# Scoping the scan to the decision set concentrates the budget on exactly the
+# symbols the recommendations are built from; the bound keeps even a large
+# Market_Leaders book from blowing the build budget. Override via
+# TFB_INSIGHTS_DECISION_MAX_SYMBOLS. Only consulted when TFB_INSIGHTS_DECISION_SCOPE
+# is on -> flag OFF = byte-identical.
+_INSIGHTS_DECISION_MAX_SYMBOLS = _env_int("TFB_INSIGHTS_DECISION_MAX_SYMBOLS", 120, minimum=3, maximum=500)
+
 
 def _insights_equity_universe_enabled() -> bool:
     """v8.3.0 (Fix AE): gate for seeding the auto-universe from real equity
     pages. Default OFF -> _default_universes() only (byte-identical)."""
     return _env_bool("TFB_INSIGHTS_EQUITY_UNIVERSE", False)
+
+
+def _insights_decision_scope_enabled() -> bool:
+    """v8.7.0 (A1): gate to scope the Insights scan to the DECISION SET
+    (Market_Leaders + Top_10 + current holdings) instead of an arbitrary
+    top-of-page equity slice. Default OFF -> the v8.6.0 equity-seed / default
+    path runs unchanged (byte-identical)."""
+    return _env_bool("TFB_INSIGHTS_DECISION_SCOPE", False)
 
 
 def _insights_structure_enabled() -> bool:
@@ -619,6 +670,60 @@ async def _resolve_equity_universes(engine: Any) -> Dict[str, List[str]]:
             syms = syms[:_INSIGHTS_EQUITY_MAX_SYMBOLS]
         if syms:
             out[page] = syms
+    return out
+
+
+async def _resolve_decision_universe(engine: Any) -> Dict[str, List[str]]:
+    """v8.7.0 (A1 -- DECISION-SCOPE INSIGHTS): build the unified decision set the
+    recommendations are actually made on -- Market_Leaders (the live leaders
+    book) + Top_10 (the current selection) + current holdings (My_Portfolio) --
+    deduped and bounded by TFB_INSIGHTS_DECISION_MAX_SYMBOLS.
+
+    Returns up to two universes:
+      * "Decision Set" -- the union, fetched ONCE so every decision symbol gets a
+        per-symbol read in ctx.all_quotes (this is what fixes the empty-detail /
+        "5 symbols scanned" symptom: the budget is spent on the right names).
+      * "My_Portfolio" -- the holdings alone, so the Portfolio KPIs section binds
+        ctx.portfolio_symbols / ctx.portfolio_quotes exactly as on the legacy path.
+
+    Best-effort: any leg that errors or returns nothing is skipped and the union
+    is built from whatever resolved. Tolerates async/sync `list_symbols_for_page`
+    and an absent top10 selector. Returns {} only when nothing at all resolved,
+    so the caller cleanly falls back to the equity-seed / default path."""
+    list_fn = getattr(engine, "list_symbols_for_page", None)
+
+    async def _page_syms(page: str) -> List[str]:
+        if not callable(list_fn):
+            return []
+        try:
+            res = list_fn(page)
+            if hasattr(res, "__await__"):
+                res = await res
+        except Exception:
+            res = None
+        return _dedupe_keep_order(res or [])
+
+    leaders = await _page_syms("Market_Leaders")
+    holdings = await _page_syms("My_Portfolio")
+
+    top10: List[str] = []
+    try:
+        top10 = list(await _fetch_top10_symbols(
+            engine, limit=10, timeout_sec=_DEFAULT_TOP10_TIMEOUT_SEC,
+        ) or [])
+    except Exception:
+        top10 = []
+    top10 = [_safe_str(s) for s in top10 if _safe_str(s)]
+
+    union = _dedupe_keep_order(list(leaders) + list(top10) + list(holdings))
+    if _INSIGHTS_DECISION_MAX_SYMBOLS > 0:
+        union = union[:_INSIGHTS_DECISION_MAX_SYMBOLS]
+
+    out: Dict[str, List[str]] = {}
+    if union:
+        out["Decision Set"] = union
+    if holdings:
+        out["My_Portfolio"] = _dedupe_keep_order(holdings)
     return out
 
 
@@ -3395,6 +3500,11 @@ async def build_insights_analysis_rows(
             effective_universes["Selected Symbols"] = sym_list
 
     auto_used = False
+    # v8.7.0 (A1): records whether the scan was scoped to the decision set this
+    # build (surfaced in meta + a System coverage row). Always defined so both
+    # return paths can read it regardless of which seed branch ran.
+    _decision_scope_used = False
+    _decision_set_size = 0
     if not effective_universes and engine and auto_universe_when_empty:
         # v8.3.0 (Fix AE -- INSIGHTS EQUITY UNIVERSE): the auto-resolve path used
         # ONLY _default_universes() (9 index/FX symbols), so Insights_Analysis
@@ -3404,7 +3514,26 @@ async def build_insights_analysis_rows(
         # the snapshot / risk / short-term sections see actual equities; the
         # index/FX defaults are still kept (via setdefault) so macro/market rows
         # keep rendering. Default OFF -> _default_universes() only, byte-identical.
-        if _insights_equity_universe_enabled():
+        #
+        # v8.7.0 (A1 -- DECISION-SCOPE INSIGHTS): when TFB_INSIGHTS_DECISION_SCOPE
+        # is on, seed from the actual decision set (Market_Leaders + Top_10 +
+        # holdings) FIRST, so the build budget is spent on exactly the symbols the
+        # recommendations are made on (fixing the empty per-symbol detail). This
+        # takes precedence over the arbitrary equity-page slice; the equity-seed
+        # path remains as the fallback for when the decision-scope gate is off.
+        # Default OFF -> this branch never runs and the seed is byte-identical to
+        # v8.6.0.
+        if _insights_decision_scope_enabled():
+            try:
+                dec_universes = await _resolve_decision_universe(engine)
+            except Exception as exc:  # pragma: no cover - defensive
+                dec_universes = {}
+                warnings.append(f"Decision-scope universe seed degraded: {exc}")
+            if dec_universes:
+                effective_universes.update(dec_universes)
+                _decision_scope_used = True
+                _decision_set_size = len(dec_universes.get("Decision Set", []))
+        if not _decision_scope_used and _insights_equity_universe_enabled():
             try:
                 eq_universes = await _resolve_equity_universes(engine)
             except Exception as exc:  # pragma: no cover - defensive
@@ -3461,6 +3590,8 @@ async def build_insights_analysis_rows(
                 "builder_version": INSIGHTS_BUILDER_VERSION,
                 "criteria_snapshot": _criteria_snapshot(norm_criteria),
                 "warnings": warnings,
+                "decision_scope_used": _decision_scope_used,
+                "decision_set_size": _decision_set_size,
                 "reco_8tier_seen": False,
                 "priority_band_seen": False,
             },
@@ -3503,6 +3634,27 @@ async def build_insights_analysis_rows(
         if section_name.strip().lower() in {"my_portfolio", "portfolio", "my portfolio"}:
             ctx.portfolio_quotes = quotes
             ctx.portfolio_symbols = syms
+
+    # v8.7.0 (A1): when the scan was scoped to the decision set, emit a System
+    # coverage row so the panel doubles as the diagnostic -- how many decision
+    # symbols were seeded and how many quotes the scan actually pulled this cycle.
+    # Only emitted when the decision-scope gate is on (OFF -> byte-identical row
+    # set). Honest framing: the seeded count is the decision set; the scan total
+    # additionally includes the index/FX macro defaults.
+    if _decision_scope_used:
+        rows.append(_make_row(
+            keys=keys, section="System", item="Decision Scope",
+            metric="decision_scope_coverage",
+            value=f"{_decision_set_size} symbols",
+            signal=_SIGNAL_OK, priority=_PRI_LOW,
+            notes=(
+                f"Insights scan scoped to the decision set "
+                f"(Market_Leaders + Top_10 + holdings): {_decision_set_size} "
+                f"symbol(s) seeded; {len(ctx.all_quotes)} total quote(s) in scan "
+                f"(incl. index/FX macro). Gate TFB_INSIGHTS_DECISION_SCOPE."
+            ),
+            last_updated_riyadh=timestamp,
+        ))
 
     if do_top_picks and _remaining() > 0.25:
         top10_payload: Dict[str, Any] = {}
@@ -3663,6 +3815,8 @@ async def build_insights_analysis_rows(
             "builder_version": INSIGHTS_BUILDER_VERSION,
             "criteria_snapshot": _criteria_snapshot(norm_criteria),
             "warnings": warnings,
+            "decision_scope_used": _decision_scope_used,
+            "decision_set_size": _decision_set_size,
             "reco_8tier_seen": reco_8tier_seen,
             "priority_band_seen": priority_band_seen,
             "top10_reco_8tier_aware": top10_reco_8tier_aware,
