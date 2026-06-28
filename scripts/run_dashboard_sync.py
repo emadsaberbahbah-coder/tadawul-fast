@@ -258,7 +258,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.10.0"
+SCRIPT_VERSION = "6.14.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1094,6 +1094,187 @@ def _portfolio_write_guard(
 # -----------------------------------------------------------------------------
 # Symbols reading (uses repo module if present)
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# My_Portfolio rebuild from _Portfolio_CostBasis (v6.14.0)
+#
+# WHY: My_Portfolio's authoritative content is the user's manually-maintained
+# holdings — symbol, quantity, average (buy) cost — which live ONLY in the
+# _Portfolio_CostBasis tab. The page-driven enriched request (empty symbol
+# list) returns the backend's own default/page rows WITHOUT the user's
+# quantities, so the v6.5.0 guard correctly refuses every write (it would blank
+# Qty/Avg Cost). Net effect: My_Portfolio never refreshes.
+# FIX (gated OFF by TFB_PORTFOLIO_REBUILD): when enabled AND the task is
+# My_Portfolio, (1) source the symbol list from _Portfolio_CostBasis so the
+# backend returns enriched rows for the user's ACTUAL holdings with live
+# prices/recommendation; (2) inject the user's Qty + Avg Cost back into those
+# rows and recompute the position-math columns (MV / Cost / P&L) consistently
+# with a per-row FX derived from the payload's own Price vs Price-SAR — so the
+# guard passes and no internally-inconsistent half-row (fresh price against a
+# blank value) is ever written; (3) classify known sukuk / fixed-income
+# instruments so they are not framed by equity valuation columns.
+# SAFETY: applies to My_Portfolio only. On ANY uncertainty (cost basis
+# unreadable/empty, or the payload lacks a symbol / Qty / Avg-Cost column) the
+# rebuild NO-OPS and the existing page-driven flow + guard run unchanged — so a
+# failed rebuild can only fall back to the current (safe) blocked state, never
+# to corrupted data. The FX/position math reproduces the engine's own
+# Portfolio_Decision figures (unit-tested in tests/test_portfolio_rebuild.py).
+# Full fixed-income analytics (yield/duration/credit) are NOT claimed here;
+# sukuk are LABELED and held, not valued as equities.
+# -----------------------------------------------------------------------------
+_PORTFOLIO_REBUILD_TAG = "[v6.14.0 PORTFOLIO-REBUILD]"
+_COST_BASIS_SHEET = "_Portfolio_CostBasis"
+
+_CB_SYMBOL_ALIASES = frozenset({"symbol", "ticker", "code", "instrument"})
+_CB_QTY_ALIASES = frozenset({"quantity", "qty", "shares", "units", "positionqty", "positionquantity"})
+_CB_COST_ALIASES = frozenset({"buyprice", "avgcost", "averagecost", "avgbuyprice",
+                              "averagebuyprice", "costbasis", "avgcostprice", "cost", "price"})
+
+# Position-math columns recomputed after injection (alias-matched, normalized).
+_PM_QTY_ALIASES = frozenset({"qty", "quantity", "shares", "units", "positionqty", "positionquantity"})
+_PM_AVGCOST_ALIASES = frozenset({"avgcost", "averagecost", "avgcostprice", "positionavgcost",
+                                 "avgprice", "averageprice", "costbasis", "avgbuyprice", "averagebuyprice"})
+_PM_PRICE_ALIASES = frozenset({"price", "lastprice", "currentprice"})
+_PM_PRICESAR_ALIASES = frozenset({"pricesar"})
+_PM_MVSAR_ALIASES = frozenset({"mvsar", "marketvaluesar", "positionvaluesar", "positionvalue", "marketvalue"})
+_PM_COSTSAR_ALIASES = frozenset({"costsar"})
+_PM_PNLSAR_ALIASES = frozenset({"plsar", "pnlsar", "unrealizedplsar", "unrealizedpnlsar"})
+_PM_PNLPCT_ALIASES = frozenset({"plpct", "pnlpct"})
+_PM_ASSETCLASS_ALIASES = frozenset({"assetclass", "type", "instrumenttype", "class"})
+
+
+def _portfolio_rebuild_enabled() -> bool:
+    """My_Portfolio rebuild master switch. DEFAULT OFF; set
+    TFB_PORTFOLIO_REBUILD=1/true/on/yes to enable cost-basis-sourced refresh."""
+    return (os.getenv("TFB_PORTFOLIO_REBUILD") or "0").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _fixed_income_symbols() -> set:
+    """Symbols to classify as fixed income (sukuk/bonds) and exclude from the
+    equity sell/valuation framing. Comma-list override via
+    TFB_FIXED_INCOME_SYMBOLS; defaults to the known Cenomi Centers Sukuk."""
+    raw = (os.getenv("TFB_FIXED_INCOME_SYMBOLS") or "5023.SR").strip()
+    return {s.strip().upper() for s in raw.split(",") if s.strip()}
+
+
+def _pm_to_float(v: Any) -> Optional[float]:
+    try:
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            return None
+        return float(str(v).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def _find_pnl_pct_col(headers: List[Any]) -> int:
+    """Index of the P&L-percent column. Matches the unambiguous normalized
+    forms ('plpct'/'pnlpct'), OR a 'pl'/'pnl' header that visibly carries a '%'
+    (e.g. 'P&L %', which normalizes to 'pl' — so it must NOT be matched by the
+    bare 'pl' of a 'P&L' SAR column). Returns -1 if absent."""
+    for i, h in enumerate(headers or []):
+        n = _guard_norm(h)
+        if n in {"plpct", "pnlpct", "plpercent", "pnlpercent"}:
+            return i
+        if n in {"pl", "pnl"} and "%" in str(h if h is not None else ""):
+            return i
+    return -1
+
+
+def _read_cost_basis(sheets: "SheetsWriter", spreadsheet_id: str) -> Dict[str, Dict[str, float]]:
+    """Read _Portfolio_CostBasis -> {SYMBOL: {'qty': float, 'cost': float}}.
+    Returns {} on ANY failure so the caller no-ops the rebuild (fail-safe)."""
+    try:
+        grid = sheets.read_values(spreadsheet_id, _COST_BASIS_SHEET, "A1:Z200")
+    except Exception:
+        return {}
+    if not grid or not isinstance(grid, list) or len(grid) < 2:
+        return {}
+    header = grid[0] if isinstance(grid[0], list) else []
+    s_i = _guard_find_col(header, _CB_SYMBOL_ALIASES)
+    q_i = _guard_find_col(header, _CB_QTY_ALIASES)
+    c_i = _guard_find_col(header, _CB_COST_ALIASES)
+    if s_i < 0 or q_i < 0 or c_i < 0:
+        return {}
+    out: Dict[str, Dict[str, float]] = {}
+    for row in grid[1:]:
+        if not isinstance(row, list):
+            continue
+        sym = str(row[s_i]).strip().upper() if s_i < len(row) and row[s_i] is not None else ""
+        if not sym or sym in {"SYMBOL", "TICKER"}:
+            continue
+        qty = _pm_to_float(row[q_i]) if q_i < len(row) else None
+        cost = _pm_to_float(row[c_i]) if c_i < len(row) else None
+        if qty is None or cost is None:
+            continue
+        out[sym] = {"qty": qty, "cost": cost}
+    return out
+
+
+def _inject_portfolio_holdings(
+    headers: List[Any],
+    rows_matrix: List[List[Any]],
+    cost_basis: Dict[str, Dict[str, float]],
+) -> Tuple[List[List[Any]], int]:
+    """Inject the user's Qty + Avg Cost into the payload rows and recompute the
+    position-math columns (MV / Cost / P&L) consistently, using a per-row FX
+    derived from the payload's own Price vs Price-SAR. Pure function (no I/O) so
+    it is unit-testable. Returns (rows, injected_count). NO-OPS (returns input
+    unchanged) when the symbol / Qty / Avg-Cost columns are absent — the guard
+    then blocks the still-blank write, so the failure mode is the current safe
+    blocked state, never corrupted data."""
+    if not headers or not rows_matrix or not cost_basis:
+        return rows_matrix, 0
+    sym_i = _guard_find_col(headers, _GUARD_SYMBOL_ALIASES)
+    qty_i = _guard_find_col(headers, _PM_QTY_ALIASES)
+    avg_i = _guard_find_col(headers, _PM_AVGCOST_ALIASES)
+    if sym_i < 0 or qty_i < 0 or avg_i < 0:
+        return rows_matrix, 0  # cannot inject safely -> no-op
+    price_i = _guard_find_col(headers, _PM_PRICE_ALIASES)
+    psar_i = _guard_find_col(headers, _PM_PRICESAR_ALIASES)
+    mv_i = _guard_find_col(headers, _PM_MVSAR_ALIASES)
+    cost_i = _guard_find_col(headers, _PM_COSTSAR_ALIASES)
+    pnl_i = _guard_find_col(headers, _PM_PNLSAR_ALIASES)
+    pct_i = _find_pnl_pct_col(headers)
+    cls_i = _guard_find_col(headers, _PM_ASSETCLASS_ALIASES)
+    fi_syms = _fixed_income_symbols()
+
+    width = len(headers)
+    injected = 0
+    out: List[List[Any]] = []
+    for row in rows_matrix:
+        rr = list(row) if isinstance(row, list) else [row]
+        if len(rr) < width:
+            rr = rr + [None] * (width - len(rr))
+        sym = str(rr[sym_i]).strip().upper() if sym_i < len(rr) and rr[sym_i] is not None else ""
+        hold = cost_basis.get(sym)
+        if hold:
+            qty = hold["qty"]
+            buy = hold["cost"]
+            rr[qty_i] = qty
+            rr[avg_i] = buy
+            price = _pm_to_float(rr[price_i]) if price_i >= 0 else None
+            psar = _pm_to_float(rr[psar_i]) if psar_i >= 0 else None
+            # Per-row FX from the payload's own native vs SAR price; SAR rows -> 1.0
+            fx = (psar / price) if (price not in (None, 0) and psar not in (None, 0)) else 1.0
+            unit_sar = psar if psar not in (None, 0) else (price if price not in (None, 0) else None)
+            if unit_sar is not None:
+                mv_sar = qty * unit_sar
+                cost_sar = qty * buy * fx
+                pnl_sar = mv_sar - cost_sar
+                if mv_i >= 0:
+                    rr[mv_i] = round(mv_sar, 2)
+                if cost_i >= 0:
+                    rr[cost_i] = round(cost_sar, 2)
+                if pnl_i >= 0:
+                    rr[pnl_i] = round(pnl_sar, 2)
+                if pct_i >= 0 and cost_sar not in (None, 0):
+                    rr[pct_i] = round(pnl_sar / cost_sar * 100.0, 2)
+            if sym in fi_syms and cls_i >= 0:
+                rr[cls_i] = "Fixed Income / Sukuk"
+            injected += 1
+        out.append(rr)
+    return out, injected
+
+
 def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
     try:
         import importlib
@@ -1413,6 +1594,23 @@ async def _run_one_task(
         if max_syms != 0:
             symbols = _read_symbols(canon_task_key, spreadsheet_id, max_syms)
 
+        # v6.14.0: My_Portfolio rebuild — source symbols from the user's
+        # _Portfolio_CostBasis (the authoritative holdings) so the backend
+        # returns enriched rows for the ACTUAL holdings. Fail-safe: empty cost
+        # basis (unreadable/no creds) leaves the page-driven flow untouched.
+        _pf_cost_basis: Dict[str, Dict[str, float]] = {}
+        if (
+            _portfolio_rebuild_enabled()
+            and sheets is not None
+            and _guard_norm(task.sheet_name) == _guard_norm("My_Portfolio")
+        ):
+            _pf_cost_basis = _read_cost_basis(sheets, spreadsheet_id)
+            if _pf_cost_basis:
+                symbols = sorted(_pf_cost_basis.keys())
+                res.warnings.append(
+                    f"{_PORTFOLIO_REBUILD_TAG} sourced {len(symbols)} holding(s) from {_COST_BASIS_SHEET}"
+                )
+
         res.symbols_requested = len(symbols)
 
         # Dry run: still success-ish but no backend call and no write
@@ -1492,6 +1690,16 @@ async def _run_one_task(
                 continue
 
             rows_matrix = _rectify_matrix(headers, rows_matrix)
+            # v6.14.0: inject the user's Qty/Avg Cost from _Portfolio_CostBasis
+            # and recompute MV/Cost/P&L so the guard passes and no half-row is
+            # written. No-ops if columns absent (guard then blocks the still-
+            # blank write -> safe fall-back to the current blocked state).
+            if _pf_cost_basis and rows_matrix:
+                rows_matrix, _inj = _inject_portfolio_holdings(headers, rows_matrix, _pf_cost_basis)
+                if _inj:
+                    res.warnings.append(
+                        f"{_PORTFOLIO_REBUILD_TAG} injected Qty/Avg Cost + recomputed position math for {_inj} holding(s)"
+                    )
             used_endpoint = ep
             break
 
