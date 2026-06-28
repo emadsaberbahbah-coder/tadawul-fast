@@ -75,6 +75,13 @@ env:
   PYTHONUNBUFFERED: 1
   TZ: Asia/Riyadh
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). When "1", the
+  # My_Portfolio sync sources its symbols from _Portfolio_CostBasis, injects the
+  # user's Qty/Avg Cost, recomputes MV/Cost/P&L (FX-correct, reproduces the
+  # engine's Portfolio_Decision figures), and labels sukuk as fixed income — so
+  # the page refreshes and the v6.5.0 guard passes. KILL-SWITCH: set to "0" to
+  # revert instantly to the prior page-driven behavior (cost basis untouched).
+  TFB_PORTFOLIO_REBUILD: "1"
 
 jobs:
   # =============================================================================
