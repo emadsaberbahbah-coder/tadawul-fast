@@ -546,7 +546,15 @@ jobs:
             # $1 = extra flag (--no-clear or ""); $2 = space-separated keys
             local EXTRA="$1"; local KEYS="$2"
             [ -z "$KEYS" ] && return 0
-            local -a C=(python scripts/run_dashboard_sync.py --backend "$TARGET_URL" --sheet-id "$TARGET_SHEET_ID" --keys $KEYS)
+            # --start-cell A1: header at row 1, data row 2+. The script default
+            # is A5, which (combined with clear-from-start-cell-down) stranded an
+            # old header + 3 data rows in rows 1-4 of every list page. Writing at
+            # A1 clears A1:ZZ and rebuilds the page as one clean block, healing
+            # that orphan on the next run. All page-sync pages are header-at-row-1
+            # (Market_Leaders/Global_Markets/Commodities_FX/Mutual_Funds/Insights/
+            # Data_Dictionary/My_Portfolio); the cockpit pages (Top_10,
+            # Portfolio_Decision) are route-owned and skipped here, so unaffected.
+            local -a C=(python scripts/run_dashboard_sync.py --backend "$TARGET_URL" --sheet-id "$TARGET_SHEET_ID" --keys $KEYS --start-cell A1)
             [ -n "$EXTRA" ] && C+=("$EXTRA")
             [ -n "$DRY_RUN_FLAG" ] && C+=("$DRY_RUN_FLAG")
             echo "📋 Command: ${C[*]}"
