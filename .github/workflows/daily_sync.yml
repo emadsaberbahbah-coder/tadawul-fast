@@ -75,13 +75,12 @@ env:
   PYTHONUNBUFFERED: 1
   TZ: Asia/Riyadh
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). When "1", the
-  # My_Portfolio sync sources its symbols from _Portfolio_CostBasis, injects the
-  # user's Qty/Avg Cost, recomputes MV/Cost/P&L (FX-correct, reproduces the
-  # engine's Portfolio_Decision figures), and labels sukuk as fixed income — so
-  # the page refreshes and the v6.5.0 guard passes. KILL-SWITCH: set to "0" to
-  # revert instantly to the prior page-driven behavior (cost basis untouched).
-  TFB_PORTFOLIO_REBUILD: "1"
+  # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). DISARMED
+  # (set to "0"): the backend already builds My_Portfolio correctly from
+  # _Portfolio_CostBasis (confirmed live 2026-06-28 — 10 holdings with position
+  # math), so the sync-side rebuild is unnecessary AND its injection path has an
+  # FX bug for USD holdings. Kept at "0" so the dormant code can never activate.
+  TFB_PORTFOLIO_REBUILD: "0"
 
 jobs:
   # =============================================================================
