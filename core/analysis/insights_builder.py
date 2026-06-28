@@ -180,7 +180,18 @@ logger.addHandler(logging.NullHandler())
 # Constants
 # ---------------------------------------------------------------------------
 
-INSIGHTS_BUILDER_VERSION = "8.7.0"
+INSIGHTS_BUILDER_VERSION = "8.7.1"
+# v8.7.1 - DECISION-SCOPE ORDERING FIX (A1). Live verification showed the
+# Market_Leaders book is ~120 names -- large enough that the decision-set union,
+# previously ordered leaders-first, would hit TFB_INSIGHTS_DECISION_MAX_SYMBOLS
+# and truncate Top_10 (and potentially holdings) off the tail -- i.e. drop the
+# highest-priority decision symbols while keeping low-priority leaders.
+# _resolve_decision_universe now orders the union PRIORITY-FIRST (Top_10 +
+# holdings, then Market_Leaders) so the bound trims the leaders' tail instead.
+# Top_10 + holdings are now guaranteed a per-symbol read; leaders fill the
+# remaining budget (a leader trimmed from the Insights aggregate still has full
+# detail on its own Market_Leaders tab). Pure ordering change inside the v8.7.0
+# resolver; gate (TFB_INSIGHTS_DECISION_SCOPE) and OFF-path are unchanged.
 # v8.7.0 - DECISION-SCOPE INSIGHTS (audit H1 / Track A A1; env-gated,
 # default-OFF). FIXES THE ONLY BROKEN USER PAGE. SYMPTOM: Insights_Analysis
 # scanned ~5 symbols, per-symbol detail came back empty, and stale rows
@@ -715,7 +726,17 @@ async def _resolve_decision_universe(engine: Any) -> Dict[str, List[str]]:
         top10 = []
     top10 = [_safe_str(s) for s in top10 if _safe_str(s)]
 
-    union = _dedupe_keep_order(list(leaders) + list(top10) + list(holdings))
+    # v8.7.1 (A1): order the union PRIORITY-FIRST -- Top_10 + holdings ahead of
+    # Market_Leaders -- so that when Market_Leaders alone exceeds
+    # TFB_INSIGHTS_DECISION_MAX_SYMBOLS (live: the leaders book is ~120 names),
+    # the bound truncates the TAIL OF THE LEADERS rather than dropping the very
+    # symbols the recommendations are made on. Top_10 + holdings (always well
+    # under the bound) are therefore guaranteed a per-symbol read; the leaders
+    # fill whatever budget remains, and any leader trimmed from the Insights
+    # aggregate still has full detail on its own Market_Leaders tab. Holdings are
+    # additionally seeded as their own universe below (for Portfolio KPIs), so
+    # they are covered even if somehow trimmed here.
+    union = _dedupe_keep_order(list(top10) + list(holdings) + list(leaders))
     if _INSIGHTS_DECISION_MAX_SYMBOLS > 0:
         union = union[:_INSIGHTS_DECISION_MAX_SYMBOLS]
 
