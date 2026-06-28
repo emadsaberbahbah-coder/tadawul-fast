@@ -68,7 +68,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.3.1"
+PROVIDER_VERSION = "6.4.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -216,6 +216,56 @@ def _to_yahoo_provider_symbol(norm_symbol: str) -> str:
         except Exception:
             pass
     return _local_to_yahoo_symbol(s)
+
+
+# =============================================================================
+# Provider-identity guard (v6.4.0)
+# =============================================================================
+# WHY: yfinance's `info` is consumed without verifying it belongs to the symbol
+# we asked for. For some Tadawul instruments (e.g. the sukuk 5023.SR) Yahoo
+# returns a DIFFERENT company's record entirely -- in the live 2026-06-28 audit,
+# 5023.SR came back carrying Apple Inc.'s identity and fundamentals (name,
+# sector, $4.17T market cap, P/E, EPS) while the correct par price arrived
+# separately from yahoo_chart. The fundamentals block then wrote Apple's
+# identity onto the sukuk row. This guard compares the returned ticker against
+# the one queried and, on a CLEAR base-ticker mismatch, discards the wrong-
+# instrument `info` so the row falls back to its correct no-fundamentals state
+# (price-only) instead of impersonating another company.
+# SAFETY: conservative + gated. Only fires when BOTH the requested and returned
+# base tickers are present AND differ; a missing/own-symbol response is left
+# untouched (status-quo). Gated OFF by default (TFB_FUND_IDENTITY_GUARD) so it
+# cannot blank a valid holding's fundamentals until explicitly enabled and
+# verified on a live run; set the env to 1/true/on/yes to enable.
+
+def _fund_identity_guard_enabled() -> bool:
+    """Provider-identity guard master switch. DEFAULT OFF; set
+    TFB_FUND_IDENTITY_GUARD=1/true/on/yes to discard fundamentals when Yahoo
+    returns a different instrument than the one requested."""
+    return (os.getenv("TFB_FUND_IDENTITY_GUARD") or "0").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _ticker_identity_base(s: Any) -> str:
+    """Comparable base ticker: uppercase, drop the exchange suffix after the
+    LAST dot, strip non-alphanumerics. '5023.SR'->'5023', 'AAPL'->'AAPL',
+    'RCI.US'->'RCI', 'BRK-B'->'BRKB'. Empty string when nothing usable."""
+    t = str(s if s is not None else "").strip().upper()
+    if not t:
+        return ""
+    if "." in t:
+        t = t.rsplit(".", 1)[0]
+    return re.sub(r"[^A-Z0-9]", "", t)
+
+
+def _identity_mismatch(requested: str, returned: Any) -> bool:
+    """True iff the guard is enabled AND both base tickers are present AND they
+    clearly differ. Conservative: any absent side returns False (no discard)."""
+    if not _fund_identity_guard_enabled():
+        return False
+    req = _ticker_identity_base(requested)
+    ret = _ticker_identity_base(returned)
+    if not req or not ret:
+        return False
+    return req != ret
 
 
 # =============================================================================
@@ -1571,6 +1621,24 @@ class YahooFundamentalsProvider:
                     info = t.info or {}
                 except Exception:
                     info = {}
+
+                # v6.4.0 provider-identity guard: if Yahoo returned a different
+                # instrument than requested (e.g. 5023.SR -> Apple Inc.), discard
+                # the wrong-company `info` so the row does not impersonate it.
+                # Conservative + gated (TFB_FUND_IDENTITY_GUARD); no-ops unless a
+                # clear base-ticker mismatch is present.
+                if info:
+                    _returned_sym = _pick(info, "symbol", "underlyingSymbol", "quoteSymbol")
+                    if _identity_mismatch(provider_symbol, _returned_sym):
+                        warnings_list.append(
+                            f"provider_identity_mismatch:{_returned_sym}!={provider_symbol}_discarded"
+                        )
+                        logger.warning(
+                            "Yahoo fundamentals identity mismatch: requested %s, Yahoo returned %s "
+                            "-- discarding wrong-instrument info",
+                            provider_symbol, _returned_sym,
+                        )
+                        info = {}
 
                 try:
                     fast_info = getattr(t, "fast_info", None)
