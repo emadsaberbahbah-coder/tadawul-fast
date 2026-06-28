@@ -152,6 +152,14 @@ jobs:
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           DEFAULT_SPREADSHEET_ID: ${{ env.TARGET_SHEET_ID }}
           TRACK_SHEET_ID: ${{ env.TARGET_SHEET_ID }}
+          # v6.13.0 ACTIVATION — surface the action-trend trajectory to a
+          # user-visible Signal_Trends tab (one row per decision symbol:
+          # Direction STRENGTHENING/WEAKENING/STABLE/FLIPPED, Days In Action,
+          # Score Slope, Stability). The feature is default-OFF in the script;
+          # this single line turns it ON for the daily Performance Clock only
+          # (the correct cadence -- the 15-min sync would rewrite identical
+          # daily values 96x/day). Revert by removing this line or setting "0".
+          TFB_SIGNAL_TRENDS_TAB: "1"
           # GOOGLE_SHEETS_CREDENTIALS accepts JSON *or* base64(JSON); prefer the
           # plain secret, fall back to the _B64 variant if that is the one set.
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
