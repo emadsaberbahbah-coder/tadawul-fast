@@ -6,9 +6,24 @@ on:
   push:
     branches: [main, master]
 
-  # ✅ Production scheduler (UTC; Riyadh UTC+3)
+  # ✅ Production scheduler (UTC; Riyadh UTC+3) — GLOBAL-MARKET-AWARE, ~2-hourly.
+  # Refreshes whenever ANY tracked market is trading, and skips only when every
+  # market is closed. FX/commodities trade ~24h and the equity sessions
+  # (Asia → Europe → Tadawul → US) layer on top, so on weekdays the global
+  # market is effectively open around the clock — the night-shift markets
+  # (Tokyo/Sydney/FX) are covered, not skipped.
+  #   • Mon–Fri : FX/commodities 24h + Asia/Europe/Tadawul/US → 2-hourly, day & night
+  #   • Sunday  : Tadawul session (Riyadh 10:00–15:00) + FX reopen (~22:00 UTC)
+  #   • Saturday: skipped — every market is closed
+  # NOTE: cron cannot see HOLIDAYS or DST precisely — on a holiday the sync still
+  # fires but harmlessly (no price change to write). For exact per-market session
+  # handling (holidays/DST/half-days) a market-calendar guard step is the clean
+  # follow-up; this schedule gets ~95% of the value with zero added risk.
   schedule:
-    - cron: "0,15,30,45 * * * *"
+    # Mon–Fri: global markets effectively 24h (FX 24h + Asia/Europe/Tadawul/US)
+    - cron: "0 */2 * * 1-5"
+    # Sunday: Tadawul session (Riyadh 10:00/12:00/14:00) + FX reopen (22:00 UTC)
+    - cron: "0 7,9,11,22 * * 0"
 
   # ✅ Manual run
   workflow_dispatch:
