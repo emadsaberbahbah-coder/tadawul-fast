@@ -2,8 +2,36 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.9.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.13.0)
 ===========================================================
+
+Why this revision (v6.13.0 vs v6.12.0)
+--------------------------------------
+SURFACE THE ACTION-TREND TRAJECTORY (new Signal_Trends tab; env-gated
+TFB_SIGNAL_TRENDS_TAB, default OFF -> the --analyze path is byte-identical
+to v6.12.0). Since v6.7.0 this script has COMPUTED the full day-to-day
+trajectory for every decision symbol -- SignalTrend.action_direction
+(STRENGTHENING/WEAKENING/STABLE/FLIPPED/NEW), days_in_current_action,
+score_slope, flip_count, stability -- but only ever wrote it to an
+EPHEMERAL local <base>_signal_trends.json that the GitHub Actions runner
+discards at job end, and ONLY under --export, which the daily cron does
+NOT pass (it runs --record --audit --analyze). So the trajectory -- the
+entire value of the action-trend layer: confirmation that a multi-day
+STABLE verdict is more trustworthy than a one-day flip, and early warning
+that a verdict decaying day over day flags thesis erosion BEFORE any
+1M/3M maturity check fires -- never reached the user. v6.13.0 persists
+that SAME, already-computed trajectory to a user-visible Signal_Trends
+tab via a new SignalTrendStore that mirrors SignalHistoryStore's
+auth/header discipline. PURELY ADDITIVE: no new computation, and NO
+recommendation, score, gate, reliability, snapshot, or schema change.
+Unlike the append-only Signal_History snapshots, trends are a
+CURRENT-STATE view (one row per decision symbol, recomputed each cycle),
+so write_trends is a bounded REPLACE-ALL (overwrite the data region,
+clear any trailing stale rows) and the tab always shows each symbol's
+latest trajectory. Fail-open at every Sheets boundary -- it must NEVER
+break --record / --audit / --analyze. Reverts by leaving
+TFB_SIGNAL_TRENDS_TAB unset (the store is never constructed and
+write_trends never runs).
 
 Why this revision (v6.12.0 vs v6.11.0)
 --------------------------------------
@@ -467,7 +495,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.12.0"
+SCRIPT_VERSION = "6.13.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -2233,6 +2261,220 @@ class SignalHistoryStore:
             return 0
 
 
+class SignalTrendStore:
+    """
+    v6.13.0 — Best-effort gspread store that SURFACES the day-to-day
+    action-trend trajectory (already computed by SignalTrendAnalyzer via
+    _compute_signal_trends) to a user-visible Signal_Trends tab. Mirrors
+    SignalHistoryStore's auth + hardened-header pattern (row-1 header /
+    row-2 data) and, like it, duplicates the small credential loader so
+    this class adds NO change to PerformanceStore or SignalHistoryStore.
+
+    WHY THIS EXISTS: the trajectory the engine computes every cycle
+    (action_direction STRENGTHENING/WEAKENING/STABLE/FLIPPED, days in the
+    current action, score slope, flip count, stability) was only ever
+    written to an EPHEMERAL local <base>_signal_trends.json that the
+    GitHub Actions runner discards at job end -- and only under --export,
+    which the daily cron does not pass. So the trajectory never reached
+    the user. This store persists that SAME, already-computed trajectory
+    -- no new computation, NO recommendation/score/gate/reliability change
+    -- to a tab the user can read.
+
+    Unlike SignalHistoryStore (append-only daily snapshots, idempotent
+    per symbol-per-day), trends are a CURRENT-STATE view: one row per
+    decision symbol, recomputed each cycle. write_trends is therefore a
+    bounded REPLACE-ALL (overwrite the data region, clear any trailing
+    stale rows) so the tab always shows each symbol's latest trajectory.
+
+    Fail-open: any Sheets hiccup logs and returns 0; it must NEVER break
+    --record / --audit / --analyze.
+    """
+    SHEET_DEFAULT = "Signal_Trends"
+    START_ROW = 1   # headers at row 1, data from row 2
+    DATA_ROW0 = 2
+    SCAN_ROWS = 2000  # bounded existing-row probe for trailing-tail clear
+
+    HEADERS = [
+        "Symbol",
+        "Recorded At (Riyadh)",
+        "Current Action",
+        "Direction",                 # STRENGTHENING/WEAKENING/STABLE/FLIPPED/NEW
+        "Days In Action",
+        "Score Slope (pts/snap)",
+        "Stability",                 # STABLE/DRIFTING/CHOPPY/NEW
+        "Latest Score",
+        "Investability",
+        "Flip Count",
+        "Distinct Actions",
+        "Observations",
+        "Window",
+        "Latest Date",
+        "Summary",
+    ]
+
+    def __init__(self, spreadsheet_id: str, sheet_name: str):
+        self.spreadsheet_id = spreadsheet_id
+        self.sheet_name = sheet_name or self.SHEET_DEFAULT
+        self.backoff = FullJitterBackoff()
+        self.gc = None
+        self.sheet = None
+        self.ws = None
+        self._init_sheet()
+
+    def _load_sa_credentials_best_effort(self) -> Optional[Any]:
+        raw = (
+            os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+            or os.getenv("GOOGLE_CREDENTIALS")
+            or ""
+        ).strip()
+        if not raw:
+            return None
+        s = raw
+        if not s.startswith("{"):
+            try:
+                dec = base64.b64decode(s).decode("utf-8", errors="replace").strip()
+                if dec.startswith("{"):
+                    s = dec
+            except Exception:
+                pass
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict) and service_account is not None:
+                return service_account.Credentials.from_service_account_info(
+                    obj,
+                    scopes=["https://www.googleapis.com/auth/spreadsheets"],
+                )
+        except Exception:
+            return None
+        return None
+
+    def _init_sheet(self) -> None:
+        if not GSPREAD_AVAILABLE or gspread is None:
+            return
+        try:
+            creds = self._load_sa_credentials_best_effort()
+            if creds:
+                self.gc = gspread.authorize(creds)
+            else:
+                self.gc = gspread.service_account()
+            self.sheet = self.gc.open_by_key(self.spreadsheet_id)
+            try:
+                self.ws = self.sheet.worksheet(self.sheet_name)
+            except Exception:
+                self.ws = self.sheet.add_worksheet(
+                    title=self.sheet_name, rows=4000, cols=40
+                )
+            self.backoff.execute_sync(self._ensure_headers)
+        except Exception as e:
+            logger.error("SignalTrendStore init failed: %s", e)
+            self.gc = None
+            self.sheet = None
+            self.ws = None
+
+    def _ensure_headers(self) -> None:
+        if not self.ws:
+            return
+        try:
+            existing = self.ws.row_values(self.START_ROW)
+        except Exception:
+            existing = []
+        existing_norm = [str(h).strip() for h in (existing or [])]
+        if existing_norm != list(self.HEADERS):
+            end_col = len(self.HEADERS)
+            rng = _a1_range(1, self.START_ROW, end_col, self.START_ROW)
+            self.ws.update(values=[self.HEADERS], range_name=rng)
+            try:
+                self.ws.freeze(rows=self.START_ROW)
+            except Exception:
+                pass
+
+    def is_available(self) -> bool:
+        return bool(self.ws)
+
+    @staticmethod
+    def _num2(v: Any) -> Any:
+        try:
+            return round(float(v), 2)
+        except Exception:
+            return v
+
+    @staticmethod
+    def _int0(v: Any) -> int:
+        try:
+            return int(v or 0)
+        except Exception:
+            return 0
+
+    def _trend_to_row(self, t: "SignalTrend") -> List[Any]:
+        return [
+            t.symbol,
+            RiyadhTime.format(),
+            t.current_action or "",
+            t.action_direction or "",
+            self._int0(t.days_in_current_action),
+            self._num2(t.score_slope),
+            t.stability or "",
+            self._num2(t.latest_score),
+            t.current_investability or "",
+            self._int0(t.flip_count),
+            self._int0(t.distinct_actions),
+            self._int0(t.n_observations),
+            self._int0(t.window),
+            t.latest_date or "",
+            t.summary_label or "",
+        ]
+
+    def write_trends(self, trends: List["SignalTrend"]) -> int:
+        """Bounded replace-all: overwrite the data region with the current
+        per-symbol trajectories and clear any trailing stale rows. Returns
+        the number of trajectory rows written. Fail-open."""
+        if not self.ws:
+            return 0
+        try:
+            rows = [
+                self._trend_to_row(t)
+                for t in (trends or [])
+                if getattr(t, "symbol", "")
+            ]
+        except Exception as e:
+            logger.error("SignalTrendStore row build failed: %s", e)
+            return 0
+        end_col = len(self.HEADERS)
+        # best-effort count of existing data rows so a SMALLER new set does
+        # not leave a stale tail behind (replace-all semantics).
+        old_n = 0
+        try:
+            col_a = self.backoff.execute_sync(
+                lambda: self.ws.get(
+                    _a1_range(1, self.DATA_ROW0, 1,
+                              self.DATA_ROW0 + self.SCAN_ROWS - 1)
+                )
+            )
+            old_n = len([r for r in (col_a or []) if r and _safe_str(r[0])])
+        except Exception:
+            old_n = 0
+        try:
+            if rows:
+                rng = _a1_range(1, self.DATA_ROW0, end_col,
+                                self.DATA_ROW0 + len(rows) - 1)
+                self.backoff.execute_sync(
+                    lambda: self.ws.update(
+                        values=rows, range_name=rng, value_input_option="RAW"
+                    )
+                )
+            if old_n > len(rows):
+                clr = _a1_range(1, self.DATA_ROW0 + len(rows), end_col,
+                                self.DATA_ROW0 + old_n - 1)
+                try:
+                    self.backoff.execute_sync(lambda: self.ws.batch_clear([clr]))
+                except Exception:
+                    pass
+            return len(rows)
+        except Exception as e:
+            logger.error("Failed to write signal trends: %s", e)
+            return 0
+
+
 # =============================================================================
 # Analytics
 # =============================================================================
@@ -3589,6 +3831,28 @@ class PerformanceTrackerApp:
                 self.signal_store = None
         self.trend_analyzer = SignalTrendAnalyzer()
 
+        # v6.13.0: SURFACE the action-trend trajectory to a user-visible
+        # Signal_Trends tab (the already-computed SignalTrend, which prior
+        # versions wrote only to an ephemeral local JSON under --export).
+        # Separate kill-switch, default OFF -> with TFB_SIGNAL_TRENDS_TAB
+        # unset the store is never constructed and the analyze path is
+        # byte-identical to v6.12.0. Requires the snapshot history (the
+        # trend source), so it is additionally gated on signal_history.
+        self.signal_trends_enabled = _env_bool("TFB_SIGNAL_TRENDS_TAB", False)
+        self.signal_trend_store: Optional[SignalTrendStore] = None
+        if self.signal_trends_enabled and self.signal_history_enabled:
+            try:
+                self.signal_trend_store = SignalTrendStore(
+                    self.spreadsheet_id,
+                    os.getenv(
+                        "TFB_SIGNAL_TRENDS_SHEET",
+                        SignalTrendStore.SHEET_DEFAULT,
+                    ),
+                )
+            except Exception as e:
+                logger.error("SignalTrendStore unavailable: %s", e)
+                self.signal_trend_store = None
+
         # v6.8.0: reliability calibration (Measure step). Reuses the cycle's
         # already-loaded records -- no extra I/O. Gated, default ON.
         self.calibration_enabled = _env_bool("TRACK_CALIBRATION", True)
@@ -4114,6 +4378,29 @@ class PerformanceTrackerApp:
             and self.signal_store is not None
         ):
             signal_trends = await self._compute_signal_trends()
+            # v6.13.0: persist the just-computed trajectory to the
+            # user-visible Signal_Trends tab. Off the request path (cron),
+            # gated, fail-open -- a Sheets hiccup here must never break
+            # --analyze. No-op unless TFB_SIGNAL_TRENDS_TAB is set.
+            if (
+                self.signal_trends_enabled
+                and signal_trends
+                and self.signal_trend_store is not None
+                and self.signal_trend_store.is_available()
+            ):
+                try:
+                    _tl = asyncio.get_running_loop()
+                    _tw = await _tl.run_in_executor(
+                        _get_executor(),
+                        self.signal_trend_store.write_trends,
+                        signal_trends,
+                    )
+                    logger.info(
+                        "signal-trends tab: wrote %d trajectory row(s)",
+                        int(_tw or 0),
+                    )
+                except Exception as e:
+                    logger.error("signal-trends tab write failed: %s", e)
 
         # v6.8.0: reliability calibration on the records already loaded this
         # cycle (no extra I/O). Built when a consumer asks for it.
