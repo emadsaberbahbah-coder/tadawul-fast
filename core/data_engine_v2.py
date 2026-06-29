@@ -2,8 +2,52 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.99.1
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.100.0
 ================================================================================
+
+WHY v5.100.0 - STALE-IDENTITY CELL CLEAR ON THE EXTERNAL-ROWS MERGE (Fix AN;
+               env-gated TFB_CLEAR_STALE_IDENTITY, DEFAULT OFF -> _overwrite_
+               live_fields and every served/written row byte-identical to
+               v5.99.1 when off; no schema change, schema stays 115 / MP 122)
+-------------------------------------------------------------------------------
+Fix AN - A STALE IDENTITY/FUNDAMENTALS CELL WAS IMMORTAL ON THE SHEET.
+  _overwrite_live_fields (the external-rows live-quote merge that builds every
+  My_Portfolio / instrument-sheet row) used `if v in (None, "", [], {}):
+  continue` -- it can REPLACE a sheet value with a non-blank live value but can
+  never CLEAR one. For an instrument that genuinely has no identity/fundamentals
+  (a sukuk such as 5023.SR resolves with name=None, sector=None, market_cap=
+  None), an OLD value wrongly written on a prior sync -- e.g. the full "Apple
+  Inc." fundamentals record captured during a transient provider mix-up --
+  became PERMANENT: the engine emitted the correct None, the merge skipped it,
+  the sheet kept the stale record on every subsequent refresh. (Confirmed
+  2026-06-29: three deploys + two provider identity guards changed nothing
+  because the clean None never reached the cell; the Apple record lived only in
+  the Google-Sheet cells and had to be cleared by hand as a one-off.)
+
+  WHY THE SKIP-BLANK IS LOAD-BEARING (so the fix is NARROW, not a removal): the
+  SAME guard is exactly what stops a DEGRADED fetch (the CancelledError provider
+  outage observed the same day) from WIPING a whole holding's identity +
+  fundamentals to blank. A degraded quote carries data_provider="fallback_error"
+  / warnings "enrichment_failed:<Err>" and today omits the identity keys
+  entirely. So the clear fires ONLY when (a) the live quote is HEALTHY
+  (_live_quote_is_healthy: data_provider not fallback_error, recommendation_
+  source not enrichment_failed/empty_row, and no enrichment_failed/fallback_
+  error/CancelledError warning marker) AND (b) the key is in a NARROW
+  identity/fundamentals subset (_V5100_CLEARABLE_IDENTITY_FIELDS: name / sector /
+  industry + the provider-sourced fundamentals block). It deliberately NEVER
+  clears asset_class / exchange / currency / country (the engine resolves these
+  reliably) or any price / score / forecast / recommendation field (always
+  populated on a healthy quote, so a blank there is a problem, not a fact).
+
+  Env-gated, DEFAULT OFF: with TFB_CLEAR_STALE_IDENTITY unset, _overwrite_live_
+  fields is byte-identical to v5.99.1 (blank live values are always skipped).
+  Set TFB_CLEAR_STALE_IDENTITY=1 on Render to arm it; reversible by unsetting.
+  Pure + fail-safe: _live_quote_is_healthy returns False on any ambiguity
+  (preserve the sheet cell), and a non-clearable or non-blank field follows the
+  exact v5.99.1 path. Adds NO column. All v5.99.1 logic carried verbatim; this
+  delta is +2 module functions (_clear_stale_identity_enabled,
+  _live_quote_is_healthy) + 3 module constants + a guarded branch inside
+  _overwrite_live_fields. Nothing else changes.
 
 WHY v5.99.1 - FINANCIALS FUNDAMENTALS EXEMPTION (Fix AM; env-gated, DEFAULT OFF
               -> verdicts / data_quality_score / ranks byte-identical to v5.99.0
@@ -2063,7 +2107,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.99.1"
+__version__ = "5.100.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -9288,6 +9332,73 @@ _V577_MANUAL_FIELDS: frozenset = frozenset({
 })
 
 
+# =============================================================================
+# v5.100.0 STALE-IDENTITY CLEAR (Fix AN; env TFB_CLEAR_STALE_IDENTITY, default
+# OFF). See the module WHY block for the full rationale. In one line: a HEALTHY
+# live quote that resolves an identity/fundamentals field as BLANK should be
+# allowed to CLEAR a stale sheet cell (the immortal "Apple Inc." on 5023.SR),
+# but a DEGRADED/failed fetch's blanks must NEVER wipe the sheet. Default OFF
+# keeps _overwrite_live_fields byte-identical to v5.99.1.
+# =============================================================================
+def _clear_stale_identity_enabled() -> bool:
+    """v5.100.0: master switch for clearing a stale identity/fundamentals cell
+    when a HEALTHY live quote resolves the field as blank (default OFF). When
+    off, _overwrite_live_fields preserves the v5.99.1 skip-blank behavior
+    exactly. Set TFB_CLEAR_STALE_IDENTITY to 1/true/on to enable."""
+    raw = (os.getenv("TFB_CLEAR_STALE_IDENTITY") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "enabled", "enable"}
+
+
+# The NARROW subset of _V577_LIVE_OVERWRITE_FIELDS that a blank HEALTHY live
+# value may CLEAR. Scoped to identity + provider-sourced fundamentals -- exactly
+# the fields that carried the stale "Apple Inc." record on 5023.SR. Deliberately
+# EXCLUDES asset_class / exchange / currency / country (the engine resolves
+# these reliably -- never clear a known exchange/currency) and every
+# price/score/forecast/recommendation field (always populated on a healthy
+# quote, so a blank there signals a fetch problem, not a fact).
+_V5100_CLEARABLE_IDENTITY_FIELDS: frozenset = frozenset({
+    "name", "sector", "industry",
+    "market_cap", "float_shares", "beta_5y",
+    "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio",
+    "revenue_ttm", "revenue_growth_yoy", "gross_margin", "operating_margin",
+    "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
+})
+
+# Markers that mean the live quote is a DEGRADED/failed fetch (not a genuine
+# resolution), so its blanks must NEVER clear a sheet cell. Mirror the degraded-
+# quote shape built in get_enriched_quotes() (data_provider "fallback_error",
+# recommendation_source "enrichment_failed", warnings "enrichment_failed:<Err>")
+# and the empty-row marker from _mark_row_as_empty().
+_V5100_DEGRADED_PROVIDERS: frozenset = frozenset({"fallback_error"})
+_V5100_DEGRADED_RECO_SOURCES: frozenset = frozenset({"enrichment_failed", "empty_row"})
+_V5100_DEGRADED_WARNING_MARKERS: tuple = (
+    "enrichment_failed", "fallback_error", "cancellederror",
+)
+
+
+def _live_quote_is_healthy(live_row: Optional[Dict[str, Any]]) -> bool:
+    """v5.100.0: True when `live_row` is a genuinely-resolved engine quote (not
+    a degraded/failed fetch). Used to decide whether a BLANK live value is a
+    real "this instrument has no such field" fact (safe to clear the stale sheet
+    cell) or merely a fetch failure (must preserve the sheet cell). NOTE: the
+    name_unresolved / low_data_trust tags are NOT fetch failures -- a sukuk like
+    5023.SR resolves cleanly (data_provider yahoo_chart) yet carries them, so it
+    still counts as healthy and its stale identity is allowed to clear.
+    Fail-safe: any ambiguity / non-dict returns False (preserve)."""
+    if not isinstance(live_row, dict):
+        return False
+    if _safe_str(live_row.get("data_provider")).strip().lower() in _V5100_DEGRADED_PROVIDERS:
+        return False
+    if _safe_str(live_row.get("recommendation_source")).strip().lower() in _V5100_DEGRADED_RECO_SOURCES:
+        return False
+    warn = _safe_str(live_row.get("warnings")).lower()
+    for marker in _V5100_DEGRADED_WARNING_MARKERS:
+        if marker in warn:
+            return False
+    return True
+
+
 def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """v5.77.6: Whitelist-based live-quote overwrite for the external-rows path.
 
@@ -9301,14 +9412,29 @@ def _overwrite_live_fields(base_row: Dict[str, Any], live_row: Optional[Dict[str
     DataEngineV5.get_sheet_rows() invoke this for the live-quote merge,
     and keep using _merge_missing_fields() for snapshot / cache fallback
     merges (where the goal is to fill gaps, not to refresh data).
+
+    v5.100.0 (Fix AN): when TFB_CLEAR_STALE_IDENTITY is ON, a BLANK live value
+    for a key in _V5100_CLEARABLE_IDENTITY_FIELDS CLEARS the base cell -- but
+    ONLY when the live quote is healthy (_live_quote_is_healthy); a
+    degraded/failed quote's blanks still preserve the sheet value, and a
+    non-clearable field still preserves it. Default OFF -> a blank live value is
+    always skipped, byte-identical to v5.99.1.
     """
     out = dict(base_row or {})
     if not isinstance(live_row, dict):
         return out
+    # v5.100.0: a blank live value may CLEAR a stale identity/fundamentals cell,
+    # but ONLY when the flag is on AND the live quote is a healthy resolve (never
+    # on a degraded/failed fetch). Computed once per row. Default OFF -> clear_
+    # stale is False -> the inner branch never fires and this loop is byte-
+    # identical to v5.99.1 (every blank live value is skipped).
+    clear_stale = _clear_stale_identity_enabled() and _live_quote_is_healthy(live_row)
     for k, v in live_row.items():
         if k not in _V577_LIVE_OVERWRITE_FIELDS:
             continue
         if v in (None, "", [], {}):
+            if clear_stale and k in _V5100_CLEARABLE_IDENTITY_FIELDS:
+                out[k] = _json_safe(v)
             continue
         out[k] = _json_safe(v)
     return out
