@@ -7,6 +7,34 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.10.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.15.0 fix — Top_10 blank-header repair + decision-row reconciliation (no new features)
+- WHY (headers): the analysis route that serves Top_10_Investments returns a
+  header row of 118 EMPTY-STRING cells (verified on the live sheet + in
+  validate_dashboard.json: contract.header_match logs `extra: , , , ...`).
+  Written verbatim by this sync, that blanks every column title, so the
+  validator cannot map columns and reports top10.no_missing_price for ALL rows
+  even though the data rows ARE populated. FIX: for Top_10 only, rebuild the
+  header row from the canonical schema_registry headers, taking column ORDER
+  from the response's own `keys` when present (else canonical order when the
+  data width matches). FAIL-SAFE: if the schema/keys are unavailable or a safe
+  rebuild is impossible, the original headers are returned unchanged — so the
+  page can never be made worse than its current (blank) state. Lives entirely
+  in the writer; the backend route is NOT touched (cannot be verified from CI
+  without live providers). Gemini/DeepSeek/ChatGPT independently reached the
+  same diagnosis; this is the verified, fail-safe implementation.
+- WHY (reconcile): two integrity gates were failing on genuine cross-field
+  contradictions — a sell-family Recommendation still carrying Final
+  Action=INVEST (1211.SR), and a buy-family Recommendation carrying a non-empty
+  Block Reason (BBD.US, whose block is legitimate). FIX: a NEUTRAL sheet-level
+  reconciliation on the two decision pages (My_Portfolio, Top_10) that only
+  REMOVES contradictions — sell+INVEST -> Final Action HOLD; buy+block ->
+  Recommendation WATCH / Final Action HOLD. It never invents a BUY or SELL call
+  and never clears a real block. The engine still emits the raw values; the
+  engine-side root fix is a separate follow-up. REJECTED the uploaded
+  daily_sync_hotfix YAML: it sets the validator to continue-on-error (green over
+  a still-broken page), strips the hardened key/credential logic, and does NOT
+  actually repair the headers.
+
 v6.10.0 fix — Rank (Overall) / duplicate-symbol corrections actually reach the sheet
 - WHY: routes/analysis_sheet_rows.py already carries two verified page-level
   corrections for the cross-sectional market pages — GLOBAL-RANK (v4.4.0:
@@ -258,7 +286,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.14.0"
+SCRIPT_VERSION = "6.15.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1275,6 +1303,131 @@ def _inject_portfolio_holdings(
     return out, injected
 
 
+# =============================================================================
+# v6.15.0 — Top_10 header repair + decision-row reconciliation
+# =============================================================================
+_DECISION_RECONCILE_TAG = "[DECISION-RECONCILE]"
+_DECISION_RECONCILE_PAGES = frozenset({
+    _guard_norm("My_Portfolio"),
+    _guard_norm("Top_10_Investments"),
+})
+# normalized via _guard_norm (lowercase, alphanumerics only)
+_RECO_SELL_FAMILY = frozenset({"reduce", "sell", "strongsell", "avoid", "trim"})
+_RECO_BUY_FAMILY = frozenset({"buy", "strongbuy", "accumulate", "invest", "add"})
+_ACTION_INVEST_TOKENS = frozenset({"invest", "buy", "strongbuy", "accumulate", "add"})
+_RECO_COL_ALIASES = frozenset({"recommendation", "reco"})
+_ACTION_COL_ALIASES = frozenset({"finalaction", "action"})
+_BLOCK_COL_ALIASES = frozenset({"blockreason", "blockedreason", "blockreasons"})
+
+
+def _canonical_top10_schema() -> Tuple[List[str], List[str]]:
+    """Return (headers, keys) for Top_10_Investments from the schema registry,
+    or ([], []) on any failure (caller then no-ops -> fail-safe)."""
+    try:
+        from core.sheets import schema_registry as _sr  # optional dep; local import
+        gh = getattr(_sr, "get_sheet_headers", None)
+        gk = getattr(_sr, "get_sheet_keys", None)
+        if callable(gh) and callable(gk):
+            h = [str(x) for x in (gh("Top_10_Investments") or [])]
+            k = [str(x) for x in (gk("Top_10_Investments") or [])]
+            if h and k and len(h) == len(k):
+                return h, k
+    except Exception:
+        pass
+    return [], []
+
+
+def _repair_top10_headers(
+    headers: List[Any], data: Any, rows_matrix: List[List[Any]]
+) -> List[Any]:
+    """Rebuild a blank/short Top_10 header row from the canonical schema.
+
+    The analysis route can return a header row of empty-string cells for
+    Top_10; written verbatim this blanks every column title and breaks column
+    mapping (validator: all rows 'missing price'). Column ORDER is taken from
+    the response's own ``keys`` when present (each key mapped to its canonical
+    header); otherwise the canonical order is used, but only when the data width
+    matches the canonical width so titles line up with the columns.
+
+    FAIL-SAFE: returns the ORIGINAL headers unchanged when the schema is
+    unavailable or a safe rebuild is not possible -- it can never make the page
+    worse than the (already blank) current state.
+    """
+    canon_headers, canon_keys = _canonical_top10_schema()
+    if not canon_headers:
+        return headers  # schema unavailable -> keep original
+
+    cur = [str(h).strip() for h in (headers or [])]
+    nonblank = sum(1 for h in cur if h)
+    # Already healthy (right count, almost all labeled) -> keep as-is.
+    if len(cur) == len(canon_headers) and nonblank >= int(0.9 * len(canon_headers)):
+        return headers
+
+    # Prefer the response's own column keys for exact alignment.
+    keys: List[str] = []
+    if isinstance(data, dict) and isinstance(data.get("keys"), list):
+        keys = [str(k).strip() for k in data["keys"]]
+    key_to_header = dict(zip(canon_keys, canon_headers))
+    if keys and len(keys) == len(canon_keys) and all(k in key_to_header for k in keys):
+        return [key_to_header[k] for k in keys]
+
+    # No usable keys: fall back to canonical order, but ONLY when the data width
+    # matches the canonical width (else titles would not line up with columns).
+    width = 0
+    for r in (rows_matrix or []):
+        if isinstance(r, list):
+            width = len(r)
+            break
+    if (not rows_matrix) or width == len(canon_headers):
+        return list(canon_headers)
+    return headers  # width mismatch -> cannot align safely -> keep original
+
+
+def _reconcile_decision_rows(
+    headers: List[Any], rows_matrix: List[List[Any]]
+) -> Tuple[List[List[Any]], int]:
+    """Make the displayed decision columns self-consistent (neutral only).
+
+    Two invariants, matching the dashboard integrity gates:
+      1. A sell-family Recommendation must not still carry Final Action=INVEST
+         -> set Final Action to HOLD (neutral; not a sell call).
+      2. A buy-family Recommendation must not carry a non-empty Block Reason
+         -> demote Recommendation to WATCH and Final Action to HOLD (the block
+         is treated as legitimate; it is never cleared).
+
+    Returns (rows_matrix, changed_count). No-ops when columns are absent. The
+    two invariants are mutually exclusive per row (a reco cannot be both
+    families), so a row is reconciled by at most one rule.
+    """
+    reco_i = _guard_find_col(headers, _RECO_COL_ALIASES)
+    if reco_i < 0:
+        return rows_matrix, 0
+    action_i = _guard_find_col(headers, _ACTION_COL_ALIASES)
+    block_i = _guard_find_col(headers, _BLOCK_COL_ALIASES)
+
+    changed = 0
+    for row in rows_matrix:
+        if not isinstance(row, list) or reco_i >= len(row):
+            continue
+        reco = _guard_norm(row[reco_i])
+
+        # Invariant 1: sell-family reco + Final Action=INVEST -> HOLD
+        if action_i >= 0 and action_i < len(row) and reco in _RECO_SELL_FAMILY:
+            if _guard_norm(row[action_i]) in _ACTION_INVEST_TOKENS:
+                row[action_i] = "HOLD"
+                changed += 1
+
+        # Invariant 2: buy-family reco + non-empty Block Reason -> WATCH / HOLD
+        elif block_i >= 0 and block_i < len(row) and reco in _RECO_BUY_FAMILY:
+            if str(row[block_i]).strip():
+                row[reco_i] = "WATCH"
+                if action_i >= 0 and action_i < len(row):
+                    row[action_i] = "HOLD"
+                changed += 1
+
+    return rows_matrix, changed
+
+
 def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
     try:
         import importlib
@@ -1685,6 +1838,17 @@ async def _run_one_task(
                 continue
 
             headers, rows_matrix = _extract_table_payload(data)
+            # v6.15.0 TOP10-HEADER-REPAIR: the analysis route can return a blank
+            # header row for Top_10 (118 empty-string cells), which the writer
+            # would put on the sheet verbatim -> every column title blank ->
+            # validator cannot map columns -> "all rows missing price". Rebuild
+            # the header row from the canonical schema (using the response's own
+            # keys for column order) so columns are labeled correctly regardless
+            # of the route bug. FAIL-SAFE: returns headers unchanged when the
+            # schema/keys are unavailable, so it can never make the page worse
+            # than the (already blank) current state.
+            if _guard_norm(task.sheet_name) == _guard_norm("Top_10_Investments"):
+                headers = _repair_top10_headers(headers, data, rows_matrix)
             if not headers:
                 last_err = f"{ep} -> Missing headers"
                 continue
@@ -1699,6 +1863,20 @@ async def _run_one_task(
                 if _inj:
                     res.warnings.append(
                         f"{_PORTFOLIO_REBUILD_TAG} injected Qty/Avg Cost + recomputed position math for {_inj} holding(s)"
+                    )
+            # v6.15.0 DECISION-RECONCILE: keep the displayed decision columns
+            # self-consistent on the two decision pages (My_Portfolio, Top_10)
+            # so the integrity gates pass and the sheet never shows a
+            # contradiction. NEUTRAL — it only removes contradictions (sell-
+            # family reco still saying INVEST -> HOLD; buy-family reco carrying a
+            # real block_reason -> WATCH/HOLD). It never invents a BUY or SELL
+            # call. Engine still emits the raw values; engine-side root fix is a
+            # separate follow-up. No-ops when the columns are absent.
+            if _guard_norm(task.sheet_name) in _DECISION_RECONCILE_PAGES and rows_matrix:
+                rows_matrix, _rec = _reconcile_decision_rows(headers, rows_matrix)
+                if _rec:
+                    res.warnings.append(
+                        f"{_DECISION_RECONCILE_TAG} reconciled {_rec} contradictory decision row(s)"
                     )
             used_endpoint = ep
             break
