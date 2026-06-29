@@ -36,6 +36,23 @@ _REPO = Path(__file__).resolve().parents[1]
 _LOADED: dict = {}
 
 
+def _ver_at_least(actual, minimum) -> bool:
+    """True if dotted version `actual` is >= `minimum`, compared NUMERICALLY
+    component-by-component (so "1.0.18" >= "1.0.13" is True and "1.0.9" >=
+    "1.0.13" is False — unlike a string compare, which would get the latter
+    wrong). WHY (2026-06-29): the version pins below were `== "<introducing
+    version>"`, which froze each assertion to one exact release and turned every
+    legitimate forward bump into a red CI run (ob 1.0.13->1.0.18, rds
+    6.10.0->6.14.0 both tripped it). The intent of this regression net is "the
+    fix is PRESENT / not regressed below the version that shipped it", which is a
+    floor (>=), not an exact match. The behavior tests beside each pin still
+    assert the actual feature, so this only loosens the redundant version proxy.
+    """
+    def _t(v):
+        return tuple(int(p) for p in str(v).strip().split(".")[:3])
+    return _t(actual) >= _t(minimum)
+
+
 def _load_script(rel_path: str, mod_name: str):
     """Load a /scripts module by path (these are scripts, not packages)."""
     if mod_name in _LOADED:
@@ -68,8 +85,8 @@ def _ob():
     return ob
 
 
-def test_ob_version_is_1_0_13():
-    assert _ob().OPPORTUNITY_BUILDER_VERSION == "1.0.13"
+def test_ob_version_at_least_1_0_13():
+    assert _ver_at_least(_ob().OPPORTUNITY_BUILDER_VERSION, "1.0.13")
 
 
 def test_ob_normalize_sector_translates_yahoo_to_gics():
@@ -112,8 +129,8 @@ def _rds():
     return _load_script("scripts/run_dashboard_sync.py", "rds_under_test")
 
 
-def test_rds_version_is_6_10_0():
-    assert _rds().SCRIPT_VERSION == "6.10.0"
+def test_rds_version_at_least_6_10_0():
+    assert _ver_at_least(_rds().SCRIPT_VERSION, "6.10.0")
 
 
 def test_rds_ranked_market_pages_scope_exact():
@@ -193,8 +210,8 @@ def _bu():
     return _load_script("scripts/build_universes.py", "bu_under_test")
 
 
-def test_bu_version_is_1_1_0():
-    assert _bu().BUILD_UNIVERSES_VERSION == "1.1.0"
+def test_bu_version_at_least_1_1_0():
+    assert _ver_at_least(_bu().BUILD_UNIVERSES_VERSION, "1.1.0")
 
 
 def test_bu_safe_write_refuses_below_floor(tmp_path):
