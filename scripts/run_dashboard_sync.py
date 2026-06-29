@@ -7,6 +7,32 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.10.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.15.1 fix — follow-up to v6.15.0 after the 6->3 sync (run #2123, commit 2d898c9)
+- WHY (reconcile didn't catch 1211.SR): v6.15.0's reconciler classified reco
+  families with _guard_norm (strips ALL non-alphanumerics), which can disagree
+  with the validator's _norm_token (keeps single spaces). 1211.SR's sell-reco +
+  Final Action=INVEST therefore slipped past while the validator still flagged
+  it. FIX: classify EXACTLY as scripts/validate_dashboard.py does (_norm_token +
+  the validator's own _SELL_FAMILY/_BUY_FAMILY), plus a substring fallback for
+  decorated values; and ALWAYS log one line per decision page (page, the column
+  indices found, rows scanned, rows changed, and the distinct reco/action value
+  pairs WITHOUT symbols — safe for the public repo's logs) so the next run is
+  fully diagnosable instead of silent.
+- WHY (Top_10 still blank): run #2123's Top_10 fetch returned 0 data rows ("No
+  symbols found -> page-driven request -> empty fetch"), so the empty-rows guard
+  correctly SKIPPED the write to preserve last-good rows — which means v6.15.0's
+  header repair never ran, and the blank header from the prior write survived.
+  That blank header is self-perpetuating (blank header -> symbol read finds no
+  Symbol column -> page-driven request -> 0 rows -> skip -> header stays blank).
+  FIX: a Top_10 header SELF-HEAL in the empty-fetch skip path — even when the
+  data write is skipped, repair ONLY row 1 from the canonical schema (column
+  order taken from the response's own keys) so the 17 existing last-good picks
+  (which already carry prices) become correctly labeled and the validator can
+  map columns. Data rows are untouched. Gated by TFB_TOP10_HEADER_SELFHEAL
+  (default ON; no ENV change needed to activate; set 0 to disable). The flaky
+  Top_10 build returning 0 picks is a separate, deeper backend matter (transient
+  provider/cold-cache); this makes the dashboard robust to it instead of red.
+
 v6.15.0 fix — Top_10 blank-header repair + decision-row reconciliation (no new features)
 - WHY (headers): the analysis route that serves Top_10_Investments returns a
   header row of 118 EMPTY-STRING cells (verified on the live sheet + in
@@ -286,7 +312,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.15.0"
+SCRIPT_VERSION = "6.15.1"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1001,6 +1027,15 @@ def _empty_guard_enabled() -> bool:
     return (os.getenv("TFB_SYNC_EMPTY_GUARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
+def _top10_selfheal_enabled() -> bool:
+    """Top_10 header self-heal (v6.15.1). Default ON; set
+    TFB_TOP10_HEADER_SELFHEAL=0/false/off/no to disable. When a Top_10 fetch
+    returns 0 data rows (the data write is skipped to preserve last-good rows),
+    still repair a blank header row so the existing rows stay labeled and the
+    validator can map columns. No ENV change is needed to activate it."""
+    return (os.getenv("TFB_TOP10_HEADER_SELFHEAL") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
 def _guard_find_col(header_row: List[Any], aliases: frozenset) -> int:
     """Index of the first header whose normalized name is in aliases, else -1."""
     for i, h in enumerate(header_row or []):
@@ -1311,13 +1346,37 @@ _DECISION_RECONCILE_PAGES = frozenset({
     _guard_norm("My_Portfolio"),
     _guard_norm("Top_10_Investments"),
 })
-# normalized via _guard_norm (lowercase, alphanumerics only)
-_RECO_SELL_FAMILY = frozenset({"reduce", "sell", "strongsell", "avoid", "trim"})
-_RECO_BUY_FAMILY = frozenset({"buy", "strongbuy", "accumulate", "invest", "add"})
-_ACTION_INVEST_TOKENS = frozenset({"invest", "buy", "strongbuy", "accumulate", "add"})
-_RECO_COL_ALIASES = frozenset({"recommendation", "reco"})
-_ACTION_COL_ALIASES = frozenset({"finalaction", "action"})
-_BLOCK_COL_ALIASES = frozenset({"blockreason", "blockedreason", "blockreasons"})
+# Recommendation families EXACTLY as scripts/validate_dashboard.py classifies
+# them (_norm_token -> _SELL_FAMILY / _BUY_FAMILY), so whatever the validator
+# flags, this reconciler also catches. _norm_token upper-cases and turns
+# _ - / into spaces (e.g. "STRONG_SELL" -> "STRONG SELL").
+_NT_SELL_FAMILY = frozenset({"REDUCE", "SELL", "STRONG SELL", "AVOID"})
+_NT_BUY_FAMILY = frozenset({"STRONG BUY", "BUY", "ACCUMULATE"})
+# substring tokens for robustness against decorated values ("REDUCE (TRIM)")
+_SELL_SUBSTR = ("SELL", "REDUCE", "AVOID", "TRIM")
+_BUY_SUBSTR = ("BUY", "ACCUMULATE", "ADD")
+_RECO_COL_ALIASES = frozenset({"recommendation", "reco", "rec", "recommend"})
+_ACTION_COL_ALIASES = frozenset({"finalaction", "action", "finalcall", "decision"})
+_BLOCK_COL_ALIASES = frozenset({"blockreason", "blockedreason", "blockreasons", "block"})
+
+
+def _norm_token_rds(x: Any) -> str:
+    """Mirror of validate_dashboard._norm_token: upper-case, turn _ - / into
+    spaces, collapse runs of spaces, strip -> identical classification."""
+    s = str(x if x is not None else "").upper().replace("_", " ").replace("-", " ").replace("/", " ")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s.strip()
+
+
+def _reco_is_sell(nt: str) -> bool:
+    return (nt in _NT_SELL_FAMILY) or any(t in nt for t in _SELL_SUBSTR)
+
+
+def _reco_is_buy(nt: str) -> bool:
+    if "SELL" in nt:
+        return False
+    return (nt in _NT_BUY_FAMILY) or any(t in nt for t in _BUY_SUBSTR)
 
 
 def _canonical_top10_schema() -> Tuple[List[str], List[str]]:
@@ -1384,47 +1443,61 @@ def _repair_top10_headers(
 
 
 def _reconcile_decision_rows(
-    headers: List[Any], rows_matrix: List[List[Any]]
+    headers: List[Any], rows_matrix: List[List[Any]], page_label: str = ""
 ) -> Tuple[List[List[Any]], int]:
-    """Make the displayed decision columns self-consistent (neutral only).
+    """Make the displayed decision columns self-consistent (neutral only) and
+    log exactly what it did so the next run is fully diagnosable.
 
-    Two invariants, matching the dashboard integrity gates:
-      1. A sell-family Recommendation must not still carry Final Action=INVEST
-         -> set Final Action to HOLD (neutral; not a sell call).
+    Two invariants, mirroring the dashboard integrity gates:
+      1. A sell-family Recommendation must not still carry a Final Action of
+         INVEST/BUY/ACCUMULATE -> set Final Action to HOLD (neutral; never a
+         sell call).
       2. A buy-family Recommendation must not carry a non-empty Block Reason
          -> demote Recommendation to WATCH and Final Action to HOLD (the block
          is treated as legitimate; it is never cleared).
 
-    Returns (rows_matrix, changed_count). No-ops when columns are absent. The
-    two invariants are mutually exclusive per row (a reco cannot be both
-    families), so a row is reconciled by at most one rule.
+    Classification is IDENTICAL to scripts/validate_dashboard.py (_norm_token +
+    its families), with a substring fallback for decorated values, so anything
+    the validator flags is caught here. Returns (rows_matrix, changed_count).
     """
     reco_i = _guard_find_col(headers, _RECO_COL_ALIASES)
-    if reco_i < 0:
-        return rows_matrix, 0
     action_i = _guard_find_col(headers, _ACTION_COL_ALIASES)
     block_i = _guard_find_col(headers, _BLOCK_COL_ALIASES)
 
     changed = 0
+    seen: set = set()
     for row in rows_matrix:
-        if not isinstance(row, list) or reco_i >= len(row):
+        if not isinstance(row, list) or reco_i < 0 or reco_i >= len(row):
             continue
-        reco = _guard_norm(row[reco_i])
+        reco_nt = _norm_token_rds(row[reco_i])
+        act_nt = _norm_token_rds(row[action_i]) if (0 <= action_i < len(row)) else ""
+        seen.add((reco_nt, act_nt))
 
-        # Invariant 1: sell-family reco + Final Action=INVEST -> HOLD
-        if action_i >= 0 and action_i < len(row) and reco in _RECO_SELL_FAMILY:
-            if _guard_norm(row[action_i]) in _ACTION_INVEST_TOKENS:
+        # Invariant 1: sell-family reco that still says INVEST/BUY -> HOLD
+        if (0 <= action_i < len(row) and _reco_is_sell(reco_nt)
+                and ("INVEST" in act_nt or "BUY" in act_nt or "ACCUMULATE" in act_nt)):
+            row[action_i] = "HOLD"
+            changed += 1
+            continue
+
+        # Invariant 2: buy-family reco with a real Block Reason -> WATCH / HOLD
+        if 0 <= block_i < len(row) and _reco_is_buy(reco_nt) and str(row[block_i]).strip():
+            row[reco_i] = "WATCH"
+            if 0 <= action_i < len(row):
                 row[action_i] = "HOLD"
-                changed += 1
+            changed += 1
 
-        # Invariant 2: buy-family reco + non-empty Block Reason -> WATCH / HOLD
-        elif block_i >= 0 and block_i < len(row) and reco in _RECO_BUY_FAMILY:
-            if str(row[block_i]).strip():
-                row[reco_i] = "WATCH"
-                if action_i >= 0 and action_i < len(row):
-                    row[action_i] = "HOLD"
-                changed += 1
-
+    # OBSERVABILITY: always log what was found (value pairs only, no symbols ->
+    # safe for the public repo's Actions logs). Settles WHY a row did/didn't
+    # reconcile on the next run.
+    try:
+        logger.info(
+            "%s page=%s reco_col=%d action_col=%d block_col=%d rows=%d changed=%d distinct=%s",
+            _DECISION_RECONCILE_TAG, page_label or "?", reco_i, action_i, block_i,
+            len(rows_matrix or []), changed, sorted(seen)[:16],
+        )
+    except Exception:
+        pass
     return rows_matrix, changed
 
 
@@ -1873,7 +1946,7 @@ async def _run_one_task(
             # call. Engine still emits the raw values; engine-side root fix is a
             # separate follow-up. No-ops when the columns are absent.
             if _guard_norm(task.sheet_name) in _DECISION_RECONCILE_PAGES and rows_matrix:
-                rows_matrix, _rec = _reconcile_decision_rows(headers, rows_matrix)
+                rows_matrix, _rec = _reconcile_decision_rows(headers, rows_matrix, page_label=task.sheet_name)
                 if _rec:
                     res.warnings.append(
                         f"{_DECISION_RECONCILE_TAG} reconciled {_rec} contradictory decision row(s)"
@@ -1927,6 +2000,27 @@ async def _run_one_task(
         # self-heal on the next healthy sync. Gated by TFB_SYNC_EMPTY_GUARD
         # (default ON); set 0/false/off/no to restore the v6.8.0 behavior.
         if task.expects_rows and (not rows_matrix) and _empty_guard_enabled():
+            # v6.15.1 TOP10-HEADER-SELFHEAL: this empty fetch means we PRESERVE
+            # the last-good data rows (skip the data write). But a Top_10 header
+            # row left blank by a prior route bug would keep the validator blind
+            # and the page red forever (blank header -> symbol read finds no
+            # Symbol column -> page-driven request -> 0 rows -> skip -> header
+            # stays blank). Repair ONLY row 1 from the canonical schema (column
+            # order from the response's own keys) so the existing last-good rows
+            # become labeled; the data rows below are untouched.
+            if (_guard_norm(task.sheet_name) == _guard_norm("Top_10_Investments")
+                    and _top10_selfheal_enabled()):
+                try:
+                    _fixed_hdr = _repair_top10_headers(headers, data, [])
+                    _canon_h, _ = _canonical_top10_schema()
+                    if _fixed_hdr and _canon_h and len(_fixed_hdr) == len(_canon_h):
+                        sheets.write_table(spreadsheet_id, task.sheet_name, "A1", _fixed_hdr, [])
+                        _hp = ("[TOP10-HEADER-SELFHEAL] repaired blank Top_10 header "
+                               "row from schema (data rows preserved)")
+                        res.warnings.append(_hp)
+                        logger.warning(_hp)
+                except Exception as _e:  # never let a self-heal attempt break the run
+                    logger.warning(f"[TOP10-HEADER-SELFHEAL] skipped (error: {_e})")
             msg = (
                 f"Empty fetch (headers present, 0 data rows) on '{task.sheet_name}', "
                 f"which expects rows. Skipping clear+write to PRESERVE last-good rows; "
