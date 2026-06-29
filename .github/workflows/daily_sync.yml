@@ -96,6 +96,29 @@ env:
   # magnitude on <=3 rows, P&L ratio stays correct).
   # KILL-SWITCH: set back to "0" to revert to the (broken) page-driven default.
   TFB_PORTFOLIO_REBUILD: "1"
+  # Top_10_Investments refresh — decision guard DISABLED ("0").
+  # WHY (2026-06-29): Top_10 was frozen on the engine's 5 placeholder symbols
+  # (2222.SR/1120.SR/AAPL/MSFT/NVDA — no prices, missing the 8 analysis columns)
+  # because NOTHING wrote the page: the v6.6.0 DECISION-GUARD skips it in the sync
+  # (it treats the whole page as cockpit-owned) and no other workflow writes it.
+  # With the guard at "0" the sync builds and writes the REAL Top_10 picks every
+  # run, clearing the two Top_10 validation failures (top10.no_missing_price and
+  # contract.keys_present).
+  # SAFE because Top_10's served schema (118 cols) is ENTIRELY engine-generated —
+  # Top 10 Rank, Selection Reason, Criteria Snapshot + the standard analysis
+  # columns; it has NO user-authored columns (unlike My_Portfolio's Buy Date /
+  # Investor Decision / User Notes), and this page is READ-ONLY in use, so the
+  # clear-before-write loses nothing. The guard's only target is Top_10
+  # (_DECISION_GUARD_DEFAULT_PAGES = ("Top_10_Investments",)), so this changes NO
+  # other page, and the separate v6.5.0 My_Portfolio manual-cell guard is
+  # UNTOUCHED (My_Portfolio still runs --no-clear and stays protected).
+  # WATCH: the Top_10 build is ~50-90s and runs against Render's ~100s edge on
+  # each ~2h sync; if it times out, the v6.9.0 empty-rows guard preserves the
+  # last-good page (it will NOT write blanks). Verify the next sync shows real
+  # picks; if it times out repeatedly, move the Top_10 write to the proven
+  # once-daily --record path instead of the 2-hourly sync.
+  # KILL-SWITCH: unset or set to "1" to restore the v6.6.0 whole-page skip.
+  TFB_SYNC_DECISION_GUARD: "0"
 
 jobs:
   # =============================================================================
