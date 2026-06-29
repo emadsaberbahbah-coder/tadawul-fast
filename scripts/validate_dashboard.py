@@ -2,8 +2,64 @@
 # scripts/validate_dashboard.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.0.0)
+TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.1.0)
 ================================================================================
+
+================================================================================
+CHANGELOG
+================================================================================
+v1.1.0 (2026-06-29) — Top_10_Investments REMOVED FROM DEFAULT PAGE SCOPE
+--------------------------------------------------------------------------------
+WHY: Top_10_Investments was redesigned (16_Decision_Top10.gs) from a flat
+118-column ranked dump into a DECISION COCKPIT — a title / CONTROL-PANEL / KPI
+band in rows 1-15, then dynamic SELECTED / ALL QUALIFIED / NEAR MISS / DATA GAPS
+/ CANDIDATES grids whose columns (Symbol/Price/Score/Verdict/...) deliberately
+do NOT match the registry's canonical 118-column Top_10 schema. Two consequences
+made this validator's Top_10 audit a FALSE ALARM on every run:
+
+  1. _detect_header_row scans only the top `scan`=14 rows for the registry
+     headers. The cockpit's data-grid headers sit far below that (the CANDIDATES
+     header is ~row 40), so the read_range header detector finds nothing, the
+     literal-sheet path is abandoned, and the validator SILENTLY FALLS BACK to
+     core.data_engine_v2.get_sheet_rows("Top_10_Investments") — i.e. it audits
+     the engine's OWN placeholder Top_10 build, NOT the rendered cockpit. Proof
+     from the live 2026-06-29 run: top10.no_missing_price flagged 2222.SR,
+     1120.SR, AAPL, MSFT, NVDA as price-less while those exact rows carried
+     prices on the cockpit tab — two different row sources. And the failure's
+     own check name was `contract.keys_present` (the LOGICAL-path contract
+     check), which ONLY the get_sheet_rows fallback ever emits — confirming the
+     validator never read the literal cockpit.
+
+  2. The eight keys it reported missing (sector_relative_score, conviction_score,
+     top_factors, top_risks, position_size_hint, candlestick_pattern,
+     candlestick_signal, candlestick_strength) belong to the ABANDONED
+     118-column schema, which the cockpit no longer renders by design.
+
+So both Top_10 FAILs (contract.keys_present, top10.no_missing_price) were
+auditing a schema the page intentionally replaced, against a build the validator
+could not even read — failing the whole sync job over a tab the cockpit OWNS and
+carries its own audit for (NEAR MISS / DATA GAPS / CANDIDATES). Top_10 also has
+NO hand-entered columns to protect (unlike My_Portfolio).
+
+FIX: Top_10_Investments is removed from `_DEFAULT_PAGES` (commented, not deleted
+— one line to restore). The contract/gate/sanity pages that PASS are unchanged.
+check_top10() and the orchestrator's Top-10 branch are intentionally LEFT INTACT,
+so an explicit `--pages Top_10_Investments` (or a future cockpit-aware header
+scan) still runs the Top-10 checks on demand — NOTHING is removed.
+
+REVERSIBILITY: uncomment the Top_10_Investments line in _DEFAULT_PAGES (or pass
+--pages Top_10_Investments / set VALIDATE_PAGES) to restore prior behavior
+exactly.
+
+NOTE (out of scope of this file): daily_sync.yml currently sets
+TFB_SYNC_DECISION_GUARD="0", which would let the sync OVERWRITE the cockpit with
+a flat 118-col dump (to satisfy the OLD validator). It is inert only because
+DEFAULT_SYNC_KEYS omits TOP_10_INVESTMENTS. Keep it "1" if Top_10 is to remain
+the cockpit. No change is made here.
+
+v1.0.0 — initial release (see body docstring below).
+================================================================================
+
 Post-refresh "System_Validation" gate. Reads the LIVE rendered sheet and checks
 it against the DEPLOYED core.sheets.schema_registry, then asserts the
 investability-gate verdicts are internally consistent. Designed to run in CI /
@@ -115,7 +171,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 SERVICE_VERSION = SCRIPT_VERSION
 SCRIPT_NAME = "DashboardValidator"
 
@@ -742,7 +798,17 @@ _DEFAULT_PAGES = [
     "Commodities_FX",
     "Mutual_Funds",
     "My_Portfolio",
-    "Top_10_Investments",
+    # v1.1.0: Top_10_Investments REMOVED from the default page scope. It is a
+    # DECISION COCKPIT (16_Decision_Top10.gs), not the registry's 118-col dump:
+    # its data-grid headers sit ~row 40, below _detect_header_row's 14-row scan,
+    # so read_range can't find them and the validator silently audits the
+    # engine's placeholder build instead of the cockpit (full rationale in the
+    # CHANGELOG at top of file). The cockpit carries its own audit (NEAR MISS /
+    # DATA GAPS / CANDIDATES) and has no hand-entered columns to protect.
+    # check_top10() and the orchestrator's Top-10 branch are intentionally kept,
+    # so an explicit `--pages Top_10_Investments` still runs the Top-10 checks.
+    # REVERSIBLE: uncomment the next line to restore the prior behavior exactly.
+    # "Top_10_Investments",
 ]
 
 
