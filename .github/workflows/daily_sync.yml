@@ -75,12 +75,27 @@ env:
   PYTHONUNBUFFERED: 1
   TZ: Asia/Riyadh
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). DISARMED
-  # (set to "0"): the backend already builds My_Portfolio correctly from
-  # _Portfolio_CostBasis (confirmed live 2026-06-28 — 10 holdings with position
-  # math), so the sync-side rebuild is unnecessary AND its injection path has an
-  # FX bug for USD holdings. Kept at "0" so the dormant code can never activate.
-  TFB_PORTFOLIO_REBUILD: "0"
+  # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
+  # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
+  # already builds My_Portfolio correctly from _Portfolio_CostBasis") was WRONG,
+  # and disarming it BROKE the page. The page-driven enriched request (empty
+  # symbol list) returns the backend's DEFAULT page
+  # (_DEFAULT_SHEET_SYMBOLS["My_Portfolio"] = 2222.SR/AAPL/MSFT/QQQ/GC=F) with
+  # BLANK Qty/Avg Cost — NOT the holdings — so the v6.5.0 guard correctly refused
+  # to blank the manual cells and the write DEADLOCKED, leaving My_Portfolio stuck
+  # on junk symbols carrying mismatched cost basis (log: "No symbols found;
+  # sending a page-driven request ... PORTFOLIO-GUARD skip ... blank existing
+  # Qty/Avg Cost for 5 holding(s) [2222.SR, AAPL, GC=F, MSFT, QQQ]").
+  # The rebuild is what makes the request SYMBOL-DRIVEN: it sources the 10
+  # holdings from _Portfolio_CostBasis, injects the user's Qty/Avg Cost,
+  # recomputes SAR position math, and labels 5023.SR as Fixed Income / Sukuk — so
+  # the guard passes and the page actually writes. FX is per-row from the
+  # payload's own native-vs-SAR price (verified correct for USD holdings: e.g.
+  # RCI.US 50 @ $37.04 -> MV 6937.5 / Cost 6945 SAR); the only weak spot is a
+  # fx=1.0 fallback when a USD row lacks a native OR SAR price (cosmetic SAR
+  # magnitude on <=3 rows, P&L ratio stays correct).
+  # KILL-SWITCH: set back to "0" to revert to the (broken) page-driven default.
+  TFB_PORTFOLIO_REBUILD: "1"
 
 jobs:
   # =============================================================================
