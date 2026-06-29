@@ -7,6 +7,30 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.10.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.16.0 fix — market-page symbol read-back (fixes user-added symbols being wiped)
+- WHY (diagnosed + confirmed live 2026-06-29): the four market DATA pages
+  (Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds) had NO working
+  symbol source, so the backend served hardcoded _DEFAULT_SHEET_SYMBOLS
+  placeholders and the sync OVERWROTE any user-added symbols every ~2h cycle.
+  The live pages held an EXACT match to those placeholder sets, and the cause is
+  in _read_symbols(): the sync runs from the repo root, so `import symbols_reader`
+  binds the ROOT utility module, and getattr(mod, "get_page_symbols") /
+  getattr(mod, "get_universe") both return None there (neither name exists) ->
+  _read_symbols() returns [] on EVERY run.
+- FIX: read the symbols the user actually has on each market page (its Symbol
+  column) from the live sheet via the writer's own read service (the same proven
+  path as the My_Portfolio cost-basis rebuild) and refresh THAT list instead of
+  sending empty. User symbols persist; pages populate with the real universe;
+  Top_10 (which pools from these pages) is no longer starved.
+- SAFETY: fail-safe + env-gated. Any read failure / missing Symbol column / zero
+  symbols -> [] -> existing page-driven flow (defaults seed a genuinely empty
+  page; the v6.9.0 empty-rows guard still preserves the last-good page). The
+  read-back can only ADD the user's symbols; it never blanks a page. Default ON;
+  kill-switch TFB_MARKET_SYMBOL_READBACK=0. New helpers: _read_existing_page_symbols(),
+  _market_symbol_readback_enabled(), _market_readback_pages().
+- NOTE: _read_symbols() is left intact (now harmless dead weight for the market
+  pages; the read-back supersedes it) to keep the write-path change minimal.
+
 v6.15.1 fix — follow-up to v6.15.0 after the 6->3 sync (run #2123, commit 2d898c9)
 - WHY (reconcile didn't catch 1211.SR): v6.15.0's reconciler classified reco
   families with _guard_norm (strips ALL non-alphanumerics), which can disagree
@@ -312,7 +336,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.15.1"
+SCRIPT_VERSION = "6.16.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1501,6 +1525,102 @@ def _reconcile_decision_rows(
     return rows_matrix, changed
 
 
+# -----------------------------------------------------------------------------
+# Market-page symbol read-back (v6.16.0)
+# -----------------------------------------------------------------------------
+# See the v6.16.0 changelog at the top of this file for the full root-cause
+# write-up. In short: the four market DATA pages had no working symbol source
+# (_read_symbols() returns [] because the imported ROOT symbols_reader module
+# has neither get_page_symbols nor get_universe), so the backend served
+# hardcoded placeholder defaults and the sync overwrote any user-added symbols
+# every cycle. This reads the symbols the user actually has on the page (its
+# Symbol column) and refreshes THAT list instead of sending empty.
+#
+# FAIL-SAFE: the read-back can only ADD the user's symbols. Any read failure, a
+# missing Symbol column, or zero usable symbols returns [] and the caller keeps
+# the existing page-driven (empty-symbols) flow. It never blanks a page.
+# -----------------------------------------------------------------------------
+_MARKET_READBACK_TAG = "[v6.16.0 SYMBOL-READBACK]"
+
+# The page-driven DATA pages whose symbol list lives on the sheet itself.
+_MARKET_READBACK_DEFAULT_PAGES = (
+    "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
+)
+
+
+def _market_symbol_readback_enabled() -> bool:
+    """Market-page symbol read-back master switch. Default ON; set
+    TFB_MARKET_SYMBOL_READBACK=0/false/off/no to restore the prior behavior
+    (market pages resolve to backend placeholder defaults and user-added symbols
+    are overwritten every sync)."""
+    return (os.getenv("TFB_MARKET_SYMBOL_READBACK") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _market_readback_pages() -> set:
+    """Pages eligible for symbol read-back. Overridable via
+    TFB_MARKET_SYMBOL_READBACK_PAGES (comma-separated); defaults to the four
+    market data pages."""
+    raw = (os.getenv("TFB_MARKET_SYMBOL_READBACK_PAGES") or "").strip()
+    pages = [p.strip() for p in raw.split(",") if p.strip()] if raw else list(_MARKET_READBACK_DEFAULT_PAGES)
+    return {_guard_norm(p) for p in pages}
+
+
+def _read_existing_page_symbols(
+    sheets: "SheetsWriter",
+    spreadsheet_id: str,
+    sheet_name: str,
+    max_symbols: int,
+) -> List[str]:
+    """Read the user's existing symbols from a market page's Symbol column so
+    the sync refreshes them instead of overwriting with placeholder defaults.
+
+    Mirrors _read_cost_basis: reads a bounded block via the writer's own read
+    service (full spreadsheets scope), locates the header row + Symbol column
+    with the shared alias logic, then collects every non-blank, normalized,
+    de-duplicated symbol below it (capped at max_symbols). Market pages carry no
+    manual/sentinel columns, so a SYMBOL-ONLY header scan is used (not
+    _guard_find_header_row, which also requires a sentinel column).
+
+    FAIL-SAFE: returns [] on read failure (read_values -> None), a missing
+    Symbol column, or zero usable symbols, so the caller falls back to the
+    existing page-driven flow. Can only ADD the user's symbols; never blanks.
+    """
+    if sheets is None:
+        return []
+    grid = sheets.read_values(spreadsheet_id, sheet_name, "A1:E5000")
+    if not grid or not isinstance(grid, list):
+        return []
+    # Locate the header row (first row with a Symbol-like column) in the top rows.
+    sym_i = -1
+    hdr_r = -1
+    for r in range(min(len(grid), 25)):
+        row = grid[r] if isinstance(grid[r], list) else []
+        idx = _guard_find_col(row, _GUARD_SYMBOL_ALIASES)
+        if idx >= 0:
+            sym_i = idx
+            hdr_r = r
+            break
+    if sym_i < 0:
+        return []
+    out: List[str] = []
+    seen: set = set()
+    for row in grid[hdr_r + 1:]:
+        if not isinstance(row, list) or sym_i >= len(row):
+            continue
+        raw = row[sym_i]
+        if _guard_is_blank(raw):
+            continue
+        t = str(raw).strip().upper()
+        if not t or t in {"SYMBOL", "TICKER"}:
+            continue
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+        if max_symbols > 0 and len(out) >= max_symbols:
+            break
+    return out
+
+
 def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
     try:
         import importlib
@@ -1835,6 +1955,24 @@ async def _run_one_task(
                 symbols = sorted(_pf_cost_basis.keys())
                 res.warnings.append(
                     f"{_PORTFOLIO_REBUILD_TAG} sourced {len(symbols)} holding(s) from {_COST_BASIS_SHEET}"
+                )
+
+        # v6.16.0: Market-page symbol read-back — refresh the symbols the user
+        # has on the page instead of overwriting them with placeholder defaults.
+        # See the SYMBOL-READBACK block / v6.16.0 changelog for the root cause
+        # (_read_symbols returns [] because the imported root symbols_reader has
+        # no get_page_symbols / get_universe). Fail-safe: an empty read leaves
+        # the page-driven flow untouched; the read-back can only ADD symbols.
+        if (
+            _market_symbol_readback_enabled()
+            and sheets is not None
+            and _guard_norm(task.sheet_name) in _market_readback_pages()
+        ):
+            _existing_syms = _read_existing_page_symbols(sheets, spreadsheet_id, task.sheet_name, max_syms)
+            if _existing_syms:
+                symbols = _existing_syms
+                res.warnings.append(
+                    f"{_MARKET_READBACK_TAG} sourced {len(symbols)} symbol(s) from the {task.sheet_name} sheet"
                 )
 
         res.symbols_requested = len(symbols)
