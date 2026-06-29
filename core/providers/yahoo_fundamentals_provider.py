@@ -68,7 +68,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.4.0"
+PROVIDER_VERSION = "6.5.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -266,6 +266,117 @@ def _identity_mismatch(requested: str, returned: Any) -> bool:
     if not req or not ret:
         return False
     return req != ret
+
+
+# =============================================================================
+# v6.5.0 locale cross-check
+# =============================================================================
+# WHY (live 2026-06-29 audit): the v6.4.0 symbol-base guard only catches records
+# where Yahoo stamps a DIFFERENT ticker on the wrong-instrument `info`. With
+# TFB_FUND_IDENTITY_GUARD=1 already enabled, yf.Ticker("5023.SR").info returned
+# Apple Inc.'s full record (name, Technology sector, ~$4.17T market cap,
+# P/E/EPS/revenue) but carried info["symbol"] == "5023.SR" -- the REQUESTED
+# ticker -- so _identity_mismatch saw base "5023" == "5023" and passed the wrong
+# record straight through (that row showed NO provider_identity_mismatch warning,
+# confirming the symbol-base check never fired). A symbol-vs-symbol compare can
+# not detect a right-symbol / wrong-everything-else record.
+#
+# The robust, instrument-agnostic signal is LOCALE: an exchange-suffixed symbol
+# (".SR" -> Tadawul/SAR/Saudi Arabia) must not come back denominated in another
+# country's currency. Apple's record is USD/United States; the sukuk is
+# SAR/Saudi Arabia. The check discards `info` only when the suffix implies a
+# known locale AND the returned record clearly contradicts it.
+#
+# SAFETY (cannot blank a valid holding):
+#   * Only symbols whose suffix is in _SUFFIX_TO_LOCALE_DEFAULTS are checked.
+#     Plain US tickers, ".US", "=F"/"=X"/"^" carry no suffix-locale and are never
+#     locale-checked (they still get the v6.4.0 symbol-base check).
+#   * Currency is the primary signal and is decisive when present: GBp/GBX pence
+#     notation is normalized to GBP, so a London ".L" stock returning GBP rather
+#     than GBp is NOT a mismatch. All EUR suffixes share EUR.
+#   * Country is used ONLY as a fallback when the returned record has no
+#     currency, and US synonyms (USA/US/United States) are canonicalized, so a
+#     US record never trips against a US expectation.
+#   * Same master switch as v6.4.0 (TFB_FUND_IDENTITY_GUARD); OFF => None, no-op.
+# For the current book this fires on 5023.SR (USD/US vs SAR/Saudi) ONLY; every
+# real ".SR" holding returns SAR and is left untouched.
+
+def _norm_ccy_token(x: Any) -> str:
+    """Upper-case ISO currency token; collapse UK pence (GBp/GBX) to GBP so
+    pence and pounds compare equal. '' when nothing usable."""
+    t = re.sub(r"[^A-Z]", "", str(x if x is not None else "").strip().upper())
+    if not t:
+        return ""
+    if t == "GBX" or t.startswith("GBP"):
+        return "GBP"
+    return t
+
+
+_US_COUNTRY_TOKENS = {"US", "USA", "UNITEDSTATES", "UNITEDSTATESOFAMERICA"}
+
+
+def _norm_country_token(x: Any) -> str:
+    """Upper-case alphanumeric country token; canonicalize US synonyms. '' when
+    nothing usable."""
+    t = re.sub(r"[^A-Z0-9]", "", str(x if x is not None else "").strip().upper())
+    if not t:
+        return ""
+    if t in _US_COUNTRY_TOKENS:
+        return "US"
+    return t
+
+
+def _expected_locale_for_symbol(requested: str) -> Tuple[str, str]:
+    """(expected_currency, expected_country) implied by the symbol's exchange
+    suffix via _SUFFIX_TO_LOCALE_DEFAULTS, or ('', '') when the suffix carries no
+    known locale (US/plain, '=F', '=X', '^', or an unrecognized suffix). Longest
+    matching suffix wins."""
+    s = str(requested if requested is not None else "").strip().upper()
+    if not s or s.endswith("=F") or s.endswith("=X") or s.startswith("^"):
+        return "", ""
+    best_suffix: Optional[str] = None
+    for suf in _SUFFIX_TO_LOCALE_DEFAULTS:
+        if s.endswith(suf):
+            if best_suffix is None or len(suf) > len(best_suffix):
+                best_suffix = suf
+    if best_suffix is None:
+        return "", ""
+    _exch, curr, country = _SUFFIX_TO_LOCALE_DEFAULTS[best_suffix]
+    return _norm_ccy_token(curr), _norm_country_token(country)
+
+
+def _identity_locale_mismatch(requested: str, info: Dict[str, Any]) -> Optional[str]:
+    """Human-readable mismatch detail iff the guard is enabled, the requested
+    symbol's suffix implies a known locale, AND the returned record clearly
+    contradicts it -- decided on currency when the record has one, else on
+    country. None otherwise (any absent/ambiguous field => no mismatch)."""
+    if not _fund_identity_guard_enabled():
+        return None
+    if not isinstance(info, dict) or not info:
+        return None
+    exp_ccy, exp_country = _expected_locale_for_symbol(requested)
+    if not exp_ccy and not exp_country:
+        return None
+
+    ret_ccy = _norm_ccy_token(_pick(info, "currency", "financialCurrency"))
+    ret_country = _norm_country_token(_pick(info, "country"))
+
+    mismatch = False
+    if ret_ccy:
+        # currency present -> decisive (avoids country-spelling false positives)
+        mismatch = bool(exp_ccy and ret_ccy != exp_ccy)
+    elif exp_country and ret_country:
+        # no currency on the record -> fall back to country
+        mismatch = ret_country != exp_country
+
+    if not mismatch:
+        return None
+    ret_ccy_disp = safe_str(_pick(info, "currency", "financialCurrency")) or "?"
+    ret_ctry_disp = safe_str(_pick(info, "country")) or "?"
+    return (
+        f"{str(requested).strip().upper()}:returned[{ret_ccy_disp}/{ret_ctry_disp}]"
+        f"!=expected[{exp_ccy or '?'}]"
+    )
 
 
 # =============================================================================
@@ -1637,6 +1748,25 @@ class YahooFundamentalsProvider:
                             "Yahoo fundamentals identity mismatch: requested %s, Yahoo returned %s "
                             "-- discarding wrong-instrument info",
                             provider_symbol, _returned_sym,
+                        )
+                        info = {}
+
+                # v6.5.0 locale cross-check: catches the harder variant where
+                # Yahoo returns a wrong-instrument record but stamps the REQUESTED
+                # symbol on it (so the v6.4.0 symbol-base check above cannot fire),
+                # e.g. yf.Ticker("5023.SR").info returning Apple's USD/US record.
+                # Decided on the returned record's currency/country vs the locale
+                # implied by the symbol suffix; gated by the same env switch.
+                if info:
+                    _loc_detail = _identity_locale_mismatch(norm_symbol, info)
+                    if _loc_detail:
+                        warnings_list.append(
+                            f"provider_locale_mismatch:{_loc_detail}_discarded"
+                        )
+                        logger.warning(
+                            "Yahoo fundamentals locale mismatch for %s -- %s -- "
+                            "discarding wrong-instrument info",
+                            norm_symbol, _loc_detail,
                         )
                         info = {}
 
