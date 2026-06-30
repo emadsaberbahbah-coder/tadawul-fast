@@ -5,9 +5,9 @@ run_daily_brief.py — "Emad Bahbah — Daily Investment Brief" generator.
 
 WHAT THIS DOES
     Reads the production workbook's decision + opportunity + market pages and renders
-    a polished, color-coded HTML brief (the design approved 2026-06-30). It is
-    READ-ONLY: it never writes to the sheet. Delivery (email / WhatsApp) is a
-    SEPARATE step and is intentionally NOT in this file.
+    a polished, color-coded HTML brief (the design approved 2026-06-30), then OPTIONALLY
+    emails it (--send / TFB_BRIEF_SEND=1) over SMTP. Reading the sheet is READ-ONLY: it
+    never writes to the sheet. WhatsApp delivery is a separate, later step.
 
 WHY IT IS SHAPED THIS WAY
     * The same parser runs on (a) live `read_range` output and (b) a downloaded
@@ -25,16 +25,24 @@ ENV
     DEFAULT_SPREADSHEET_ID / SPREADSHEET_ID   production workbook id (live mode)
     TFB_BRIEF_OUTPUT_PATH                     output html path (default: ./daily_brief.html)
     TFB_BRIEF_LOCAL_XLSX                      if set, read pages from this xlsx instead of live
-    TFB_BRIEF_OWNER_NAME                      masthead name (default: "Emad Bahbah")
+    TFB_BRIEF_OWNER_NAME                      masthead/sender name (default: "Emad Bahbah")
+    --- delivery (only used with --send) ---
+    TFB_MAIL_FROM        sender address (the SMTP login)
+    TFB_MAIL_PASSWORD    SMTP app-password
+    TFB_MAIL_TO          recipient address (comma-separated for several)
+    TFB_MAIL_SMTP_HOST   default: smtp.gmail.com
+    TFB_MAIL_SMTP_PORT   default: 587 (STARTTLS); 465 uses implicit SSL
+    TFB_BRIEF_SEND       set to "1" to send without passing --send
 
 USAGE
-    python run_daily_brief.py                         # live (CI): reads sheet via read_range
+    python run_daily_brief.py                         # live (CI): read sheet, write html
+    python run_daily_brief.py --send                  # live: read sheet, write html, email it
     python run_daily_brief.py --xlsx file.xlsx        # local verification against a snapshot
     python run_daily_brief.py --xlsx file.xlsx --out brief.html
 """
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import datetime as _dt
@@ -575,6 +583,101 @@ def _page_row(name: str, info: Dict[str, Any]) -> str:
 
 
 # ----------------------------------------------------------------------------- #
+# Plaintext fallback + subject + delivery (only used with --send)
+# ----------------------------------------------------------------------------- #
+def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
+    """A concise plaintext alternative part (deliverability + non-HTML clients)."""
+    d = model["decision"]; t = model["top10"]
+    add = d["add"][0] if d["add"] else None
+    freed = d["freed_cash"]; dry = max(freed - (add["sar"] if add else 0.0), 0.0)
+    lines: List[str] = [
+        f"{owner} - Daily Investment Brief - {when:%A, %d %B %Y}",
+        "Local & global markets. Daily-horizon, decision support - not advice; verify before acting.",
+        "",
+        "TODAY'S ONE MOVE",
+    ]
+    if add:
+        lines.append(f"  Free ~{freed:,.0f} SAR (exit/trim below); add ~{add['sar']:,.0f} SAR of "
+                     f"{add['symbol']}; keep ~{dry:,.0f} SAR as dry powder for new buys.")
+    else:
+        lines.append("  No high-confidence portfolio action today.")
+    lines += ["", f"BOOK: {d['pl_pct']:+.1f}% overall ({d['mv']:,.0f} vs {d['cost']:,.0f} SAR)", ""]
+    if d["sell"]:
+        lines.append("EXIT:  " + "; ".join(f"{r['symbol']} ({_pct(r['pl'])})" for r in d["sell"]))
+    if d["trim"]:
+        lines.append("TRIM:  " + "; ".join(f"{r['symbol']} (~{r['sar']:,.0f} SAR)" for r in d["trim"]))
+    if d["add"]:
+        lines.append("ADD:   " + "; ".join(f"{r['symbol']} (~{r['sar']:,.0f} SAR)" for r in d["add"]))
+    if d["hold"]:
+        lines.append("HOLD (data too weak to act): " + ", ".join(r["symbol"] for r in d["hold"]))
+    if t["top"]:
+        lines += ["", "BEST NEW BUYS (to fair value; a target, not a forecast):"]
+        for i, p in enumerate(t["top"], 1):
+            lines.append(f"  {i}. {p['symbol']} {p['name'][:34]} - {_pct(p['roi'],0)} "
+                         f"[{p['market']}, reliability {_num_str(p['rel'])}, {p['conf']}]")
+    lines += ["", "When you can act (Riyadh): Tadawul 10:00-15:00 Sun-Thu - US 16:30-23:00 - "
+              "Europe ~10:00-19:30 - Tokyo/HK early morning.", ""]
+    return "\n".join(lines)
+
+
+def build_subject(model: Dict[str, Any], when: _dt.datetime) -> str:
+    d = model["decision"]
+    add = d["add"][0]["symbol"] if d["add"] else None
+    teaser = (f"free ~{d['freed_cash']:,.0f} SAR, add {add}"
+              if add and d["freed_cash"] else "portfolio + market update")
+    return f"Daily Investment Brief — {when:%d %b %Y} · {teaser}"
+
+
+def _mail_config() -> Dict[str, Any]:
+    return {
+        "host": (os.getenv("TFB_MAIL_SMTP_HOST") or "smtp.gmail.com").strip(),
+        "port": int((os.getenv("TFB_MAIL_SMTP_PORT") or "587").strip()),
+        "user": (os.getenv("TFB_MAIL_FROM") or "").strip(),
+        "password": (os.getenv("TFB_MAIL_PASSWORD") or "").strip(),
+        "to": (os.getenv("TFB_MAIL_TO") or "").strip(),
+        "from_name": os.getenv("TFB_BRIEF_OWNER_NAME", "Emad Bahbah"),
+    }
+
+
+def send_email(html_body: str, text_body: str, subject: str,
+               cfg: Optional[Dict[str, Any]] = None) -> None:
+    """Send the brief over SMTP (STARTTLS on 587 by default, implicit SSL on 465)."""
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+    from email.utils import formataddr, formatdate, make_msgid
+
+    cfg = cfg or _mail_config()
+    missing = [k for k in ("user", "password", "to") if not cfg.get(k)]
+    if missing:
+        raise RuntimeError("missing mail secrets: "
+                           + ", ".join({"user": "TFB_MAIL_FROM", "password": "TFB_MAIL_PASSWORD",
+                                        "to": "TFB_MAIL_TO"}[k] for k in missing))
+
+    recipients = [a.strip() for a in cfg["to"].replace(";", ",").split(",") if a.strip()]
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = formataddr((f'{cfg["from_name"]} — Investment Brief', cfg["user"]))
+    msg["To"] = ", ".join(recipients)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
+    msg.set_content(text_body or "Daily Investment Brief")
+    msg.add_alternative(html_body, subtype="html")
+
+    ctx = ssl.create_default_context()
+    if cfg["port"] == 465:
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=ctx, timeout=45) as s:
+            s.login(cfg["user"], cfg["password"])
+            s.send_message(msg, from_addr=cfg["user"], to_addrs=recipients)
+    else:
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=45) as s:
+            s.ehlo(); s.starttls(context=ctx); s.ehlo()
+            s.login(cfg["user"], cfg["password"])
+            s.send_message(msg, from_addr=cfg["user"], to_addrs=recipients)
+    sys.stderr.write(f"[brief] emailed -> {', '.join(recipients)}\n")
+
+
+# ----------------------------------------------------------------------------- #
 # Entry point
 # ----------------------------------------------------------------------------- #
 def generate(pages_data: Dict[str, List[List[Any]]], owner: str,
@@ -584,10 +687,13 @@ def generate(pages_data: Dict[str, List[List[Any]]], owner: str,
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Generate the Daily Investment Brief HTML.")
+    ap = argparse.ArgumentParser(description="Generate (and optionally email) the Daily Investment Brief.")
     ap.add_argument("--xlsx", default=os.getenv("TFB_BRIEF_LOCAL_XLSX", ""),
                     help="read pages from a local xlsx instead of the live sheet")
     ap.add_argument("--out", default=os.getenv("TFB_BRIEF_OUTPUT_PATH", "daily_brief.html"))
+    ap.add_argument("--send", action="store_true",
+                    default=(os.getenv("TFB_BRIEF_SEND", "").strip() == "1"),
+                    help="email the brief after rendering (needs TFB_MAIL_* secrets)")
     args = ap.parse_args(argv)
 
     owner = os.getenv("TFB_BRIEF_OWNER_NAME", "Emad Bahbah")
@@ -601,10 +707,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         pages = read_pages_live(sid, ALL_PAGES)
 
-    html_out = generate(pages, owner)
+    when = _dt.datetime.now()
+    model = build_model(pages)
+    html_out = render_html(model, owner, when)
+
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write(html_out)
     sys.stderr.write(f"[brief] wrote {len(html_out):,} bytes -> {args.out}\n")
+
+    if args.send:
+        text_out = render_text(model, owner, when)
+        subject = build_subject(model, when)
+        try:
+            send_email(html_out, text_out, subject)
+        except Exception as exc:
+            sys.stderr.write(f"[brief] ERROR sending email: {exc}\n")
+            return 3
     return 0
 
 
