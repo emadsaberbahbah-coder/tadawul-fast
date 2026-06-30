@@ -6,24 +6,22 @@ on:
   push:
     branches: [main, master]
 
-  # ✅ Production scheduler (UTC; Riyadh UTC+3) — GLOBAL-MARKET-AWARE, ~2-hourly.
-  # Refreshes whenever ANY tracked market is trading, and skips only when every
-  # market is closed. FX/commodities trade ~24h and the equity sessions
-  # (Asia → Europe → Tadawul → US) layer on top, so on weekdays the global
-  # market is effectively open around the clock — the night-shift markets
-  # (Tokyo/Sydney/FX) are covered, not skipped.
-  #   • Mon–Fri : FX/commodities 24h + Asia/Europe/Tadawul/US → 2-hourly, day & night
-  #   • Sunday  : Tadawul session (Riyadh 10:00–15:00) + FX reopen (~22:00 UTC)
-  #   • Saturday: skipped — every market is closed
-  # NOTE: cron cannot see HOLIDAYS or DST precisely — on a holiday the sync still
-  # fires but harmlessly (no price change to write). For exact per-market session
-  # handling (holidays/DST/half-days) a market-calendar guard step is the clean
-  # follow-up; this schedule gets ~95% of the value with zero added risk.
+  # ✅ Production scheduler (UTC; Riyadh UTC+3) — every 4 hours, every day.
+  # CHANGED 2026-06-30 from ~2-hourly to 4-hourly: each run now has more budget to
+  # finish ALL pages (Global_Markets is ~3,000 symbols) and leaves headroom for
+  # adding new symbols, while a single daily rule replaces the prior Mon–Fri +
+  # Sunday split. Riyadh fire times: 03:00, 07:00, 11:00, 15:00, 19:00, 23:00 — the
+  # 07:00 run precedes the 08:00 cockpit refresh and the 09:00 brief on EVERY
+  # trading day INCLUDING Sunday (previously Sunday's first sync was 10:00 Riyadh,
+  # AFTER the brief). FX/commodities trade ~24h, so the extra Saturday/holiday
+  # fires are harmless (equity rows unchanged, FX still moves).
+  # NOTE: cron cannot see HOLIDAYS/DST; a holiday run fires harmlessly. A
+  # market-calendar guard step remains the clean follow-up if exact per-market
+  # session handling is ever needed. NOTE: 4-hourly addresses cadence/headroom —
+  # it does NOT fix a run that FAILS to land (test-gate red, service-account 403,
+  # or the 25-min job cap being too short for a full sweep); check the Actions tab.
   schedule:
-    # Mon–Fri: global markets effectively 24h (FX 24h + Asia/Europe/Tadawul/US)
-    - cron: "0 */2 * * 1-5"
-    # Sunday: Tadawul session (Riyadh 10:00/12:00/14:00) + FX reopen (22:00 UTC)
-    - cron: "0 7,9,11,22 * * 0"
+    - cron: "0 */4 * * *"
 
   # ✅ Manual run
   workflow_dispatch:
