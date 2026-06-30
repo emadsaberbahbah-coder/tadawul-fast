@@ -2,8 +2,40 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.100.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.101.0
 ================================================================================
+
+WHY v5.101.0 - FIXED-INCOME / SUKUK CLASSIFICATION (Fix AO; env-gated
+               TFB_ENGINE_SUKUK_CLASS, DEFAULT ON -> set 0/false/off to restore
+               v5.100.0 exactly; no schema change, schema stays 115 / MP 122)
+-------------------------------------------------------------------------------
+Fix AO - A SUKUK WAS LABELLED + SCORED + RECOMMENDED AS AN EQUITY.
+  SYMPTOM: 5023.SR (Cenomi Centers Sukuk -- a fixed-income instrument held for
+  its ~8.27% yield, the user's income anchor and ~32% of book) renders on the
+  sheet as asset_class="EQUITY" with a low-reliability SELL / DO_NOT_INVEST.
+  ROOT CAUSE: the engine has NO fixed-income handling -- _infer_asset_class_
+  from_symbol returns "Equity" for every .SR / 4-digit code, the provider
+  quoteType is "EQUITY", and the row is then scored on equity metrics it does
+  not have (no D/E, no FCF, sparse fundamentals) -> a weak equity score ->
+  SELL. The daily sync ALREADY classifies these symbols as "Fixed Income /
+  Sukuk" (run_dashboard_sync._fixed_income_symbols, env TFB_FIXED_INCOME_
+  SYMBOLS default 5023.SR), so the on-demand engine path and the sync disagreed
+  on the same cell -- the asset_class flipped by whichever wrote last.
+  FIX: port the SAME classification into the engine. For symbols in
+  TFB_FIXED_INCOME_SYMBOLS (same env + default as the sync), Step 4d of the
+  recommendation classifier stamps asset_class="Fixed Income / Sukuk" and a
+  neutral HOLD (income instrument, not an equity trading signal), mirroring
+  Fix I's atomic final write so the investability gate re-derives a consistent
+  WATCH / WATCHLIST verdict; the fixed-income asset class is also added to the
+  D/E+FCF completeness-gate exemption so the sukuk is not penalised for lacking
+  equity fundamentals. NOT a fixed-income valuation model (out of scope) -- it
+  only stops the wrong equity SELL and fixes the label. asset_class survives to
+  projection because every later asset_class write is conditional-on-empty.
+  Matching the sync's existing behaviour, not a new feature. New helpers:
+  _sukuk_classification_enabled(), _fixed_income_symbols(), _row_is_fixed_
+  income(); new constant _FIXED_INCOME_ASSET_CLASS. Reversible: TFB_ENGINE_
+  SUKUK_CLASS in {0,false,off} -> v5.100.0 byte-identical.
+-------------------------------------------------------------------------------
 
 WHY v5.100.0 - STALE-IDENTITY CELL CLEAR ON THE EXTERNAL-ROWS MERGE (Fix AN;
                env-gated TFB_CLEAR_STALE_IDENTITY, DEFAULT OFF -> _overwrite_
@@ -2107,7 +2139,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.100.0"
+__version__ = "5.101.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -3375,6 +3407,45 @@ def _missing_price_hold_guard_enabled() -> bool:
     return True
 
 
+def _sukuk_classification_enabled() -> bool:
+    """v5.101.0 (Fix AO): master switch for fixed-income / sukuk classification
+    (default ON). For configured fixed-income symbols the engine stamps the
+    correct asset class and a neutral HOLD instead of scoring them on equity
+    metrics they lack. Set TFB_ENGINE_SUKUK_CLASS to 0/false/off to disable and
+    restore the v5.100.0 behavior (sukuk scored + labelled as equity)."""
+    raw = (os.getenv("TFB_ENGINE_SUKUK_CLASS") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+# v5.101.0 (Fix AO): canonical fixed-income asset-class label, matched to the
+# sync's run_dashboard_sync._fixed_income_symbols() classification so the engine
+# (on-demand refresh) and the daily sync agree on the same cell.
+_FIXED_INCOME_ASSET_CLASS = "Fixed Income / Sukuk"
+
+
+def _fixed_income_symbols() -> frozenset:
+    """Symbols treated as fixed income / sukuk. Read from TFB_FIXED_INCOME_SYMBOLS
+    (comma-separated), defaulting to the Cenomi Centers Sukuk (5023.SR) -- the
+    SAME env + default the daily sync uses, so both paths classify identically."""
+    raw = (os.getenv("TFB_FIXED_INCOME_SYMBOLS") or "5023.SR").strip()
+    out = set()
+    for tok in raw.split(","):
+        s = normalize_symbol(tok)
+        if s:
+            out.add(s)
+    return frozenset(out)
+
+
+def _row_is_fixed_income(row: Dict[str, Any]) -> bool:
+    """True iff the row's symbol is in the configured fixed-income set."""
+    if not isinstance(row, dict):
+        return False
+    s = normalize_symbol(_safe_str(row.get("symbol")))
+    return bool(s) and s in _fixed_income_symbols()
+
+
 # v5.77.23 (Fix J): recommendation families excluded from Top 10 selection.
 _TOP10_EXCLUDED_RECO_FAMILIES: frozenset = frozenset({
     "REDUCE", "SELL", "STRONG_SELL", "AVOID",
@@ -3436,6 +3507,7 @@ _GATE_DQ_INVESTABLE_MIN: float = 70.0   # at/above this (+ buy-family + price + 
 # asset-class-specific SCORING (core/scoring.py), not this completeness gate.
 _GATE_FUNDAMENTALS_EXEMPT_TOKENS: Tuple[str, ...] = (
     "etf", "fund", "commodity", "fx", "currency", "forex", "index",
+    "fixed income", "sukuk", "bond",  # v5.101.0 (Fix AO): non-equity, no D/E+FCF
 )
 
 # v5.79.2: known fund-vehicle INDUSTRY labels (exact match, lowercased). Catches
@@ -4877,6 +4949,31 @@ def _classify_recommendation_8tier(row: Dict[str, Any]) -> None:
         row["recommendation_priority"] = _recommendation_priority("HOLD")
         row["recommendation_priority_band"] = "P4"
         _v573_append_warning(row, "recommendation_forced_hold_missing_price")
+
+    # -- Step 4d (v5.101.0, Fix AO): fixed-income / sukuk non-equity reco -------
+    # The engine has no fixed-income scoring model, so a sukuk (e.g. 5023.SR) is
+    # scored on equity metrics it does not have and gets a low-reliability SELL
+    # on an income anchor held for yield. For configured fixed-income symbols
+    # (TFB_FIXED_INCOME_SYMBOLS, default 5023.SR -- the SAME env the daily sync
+    # uses) stamp the correct asset class and a neutral, explicitly-labelled HOLD
+    # (income instrument, not an equity trading signal). Mirrors Step 4c's atomic
+    # final write so it is authoritative; _reconcile_recommendation_family then
+    # sees HOLD == HOLD and the investability gate re-derives a consistent
+    # WATCH / WATCHLIST verdict (the fixed-income asset class is also exempt from
+    # the equity D/E+FCF completeness gate). asset_class survives to projection
+    # because every later asset_class write is conditional-on-empty.
+    # Env-toggleable via TFB_ENGINE_SUKUK_CLASS (default ON).
+    if _sukuk_classification_enabled() and _row_is_fixed_income(row):
+        row["asset_class"] = _FIXED_INCOME_ASSET_CLASS
+        row["recommendation"] = "HOLD"
+        row["recommendation_detailed"] = "HOLD"
+        row["recommendation_source"] = "fixed_income_sukuk"
+        row["recommendation_reason"] = (
+            "HOLD: fixed income / sukuk held for yield; equity-style scoring does not apply."
+        )
+        row["recommendation_priority"] = _recommendation_priority("HOLD")
+        row["recommendation_priority_band"] = "P4"
+        _v573_append_warning(row, "recommendation_fixed_income_sukuk")
 
 
 def _build_top_factors_and_risks(row: Dict[str, Any]) -> None:
