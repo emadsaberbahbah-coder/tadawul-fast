@@ -1,0 +1,126 @@
+name: 📧 TFB Decision Digest (email)
+
+# Sends the operator the best BUY / best SELL / best swap from the LATEST synced
+# sheet. Decoupled from the data sync on purpose: it only READS the sheet (no
+# provider load) and emails. Pairs with scripts/send_digest.py.
+
+on:
+  # 11:00 Riyadh (08:00 UTC) and 17:30 Riyadh (14:30 UTC).
+  # KSA has no DST, so 11:00 is ALWAYS 08:00 UTC. The US-tracking 17:30 slot is
+  # the SUMMER mapping; for winter (early Nov–early Mar) change "30 14" -> "30 15"
+  # (= 18:30 Riyadh) so it still lands ~after the US open.
+  # NOTE: GitHub cron can drift 5–15 min; fine for a daily digest, not exact.
+  schedule:
+    - cron: "0 8 * * *"
+    - cron: "30 14 * * *"
+
+  # Manual run. dry_run defaults to "true" so a manual click PREVIEWS (prints the
+  # email + resolved columns) and sends NOTHING unless you explicitly pick false.
+  # Scheduled runs ignore inputs, so they always send for real.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only (print, don't send)"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      session:
+        description: "Optional label, e.g. '11:00 Riyadh'"
+        required: false
+        type: string
+      sheet_id:
+        description: "Spreadsheet ID override (optional)"
+        required: false
+        type: string
+
+concurrency:
+  group: tfb-digest-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TZ: Asia/Riyadh
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  send-digest:
+    name: 📧 Send Digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install minimal deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # The digest only needs Google Sheets READ access — install the light
+          # client libs, not the full backend requirements. Fast (~20s).
+          python -m pip install google-api-python-client google-auth google-auth-httplib2
+
+      - name: 📧 Send digest
+        env:
+          # --- spreadsheet (same var the sync uses) ---
+          TARGET_SHEET_ID: ${{ github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
+
+          # --- Google Sheets read auth (reuses the sync's existing secret) ---
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+
+          # --- SMTP transport (ADD THESE in repo Settings → Secrets) ---
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_USE_TLS: ${{ vars.SMTP_USE_TLS || '1' }}
+          DIGEST_FROM: ${{ secrets.DIGEST_FROM }}
+          DIGEST_TO: ${{ secrets.DIGEST_TO }}
+
+          # --- behaviour (optional repo-var overrides; defaults are fine) ---
+          DIGEST_CANDIDATE_PAGES: ${{ vars.DIGEST_CANDIDATE_PAGES || 'Market_Leaders' }}
+          DIGEST_HOLDINGS_PAGE: ${{ vars.DIGEST_HOLDINGS_PAGE || 'My_Portfolio' }}
+          DIGEST_ENABLE: ${{ vars.DIGEST_ENABLE || '1' }}
+          DIGEST_SKIP_IF_EMPTY: ${{ vars.DIGEST_SKIP_IF_EMPTY || '0' }}
+
+          # --- inputs passed via env (safer than inline shell interpolation) ---
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_SESSION: ${{ github.event.inputs.session }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "scripts/send_digest.py" ]; then
+            echo "::error::scripts/send_digest.py not found — commit it first."
+            exit 1
+          fi
+          if [ -z "${TARGET_SHEET_ID:-}" ]; then
+            echo "::error::No spreadsheet id. Set repo variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+
+          ARGS=()
+          if [ "${INPUT_DRY_RUN:-}" = "true" ]; then
+            ARGS+=(--dry-run)
+            echo "Preview mode — no email will be sent."
+          fi
+          if [ -n "${INPUT_SESSION:-}" ]; then
+            ARGS+=(--session "$INPUT_SESSION")
+          fi
+
+          python scripts/send_digest.py "${ARGS[@]}"
