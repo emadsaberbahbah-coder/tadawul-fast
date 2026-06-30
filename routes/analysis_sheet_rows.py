@@ -137,6 +137,26 @@ v4.3.1 changes (from v4.3.0)
 [FIX-6] Diagnostic logging. `[analysis_sheet_rows v4.3.1]` prefix on
     warnings. ANALYSIS_SHEET_ROWS_DEBUG=1 enables DEBUG level.
 
+[FIX-7] (v4.6.0) ENGINE-CALL TIMEOUT. FIX-3 bounded the downstream PROXY
+    calls with asyncio.wait_for, but the ENGINE adapter call inside
+    `_call_core_sheet_rows_best_effort` (core_get_sheet_rows) still had
+    NO timeout. A hung engine get_sheet_rows (e.g. an awaited-but-untimed
+    provider call, or a heavy concurrent batch) therefore hung the whole
+    request until Render's gateway 502'd it -- the exact production symptom
+    seen in the scheduled-sync logs (POST /v1/analysis/sheet-rows -> 502
+    Bad Gateway, ~70s after the request, on all market pages at once,
+    leaving every page on stale last-good data). FIX-7 wraps the engine
+    call in asyncio.wait_for when TFB_ANALYSIS_ENGINE_TIMEOUT_SEC > 0; on
+    timeout it STOPS probing the other call signatures (each would hang
+    the same way) and returns payload=None with a distinct `engine_timeout`
+    outcome, so the caller falls through to the existing proxy/failsoft
+    fallback and returns a clean 200 instead of a gateway 502. DEFAULT 0 =
+    DISABLED = byte-identical to v4.5.1 (no wait_for wrap, no behaviour
+    change). NOTE: asyncio.wait_for can only interrupt at an await point,
+    so a hang inside SYNCHRONOUS engine code is NOT bounded by this -- that
+    class of hang must be fixed in the engine (provider-call timeouts).
+    This is the request-path resilience layer, not a data-source fix.
+
 NO BUSINESS LOGIC CHANGED. v4.3.0 callers continue to work unchanged.
 v4.3.0's schema-alignment work (90/93/7/9 column counts, view + insights
 columns, Wave 3 alignment) is preserved verbatim. Conservative
@@ -193,7 +213,7 @@ Co-deployment matrix (Wave 2A + Wave 3)
   routes/advanced_analysis.py           4.3.4      diagnostic-emitting bridge
   routes/enriched_quote.py              8.4.0      v2-binding cascade
   routes/investment_advisor.py          2.15.0     bridge-error capture
-  routes/analysis_sheet_rows.py         4.3.1      this file
+  routes/analysis_sheet_rows.py         4.6.0      this file
 ================================================================================
 """
 
@@ -287,7 +307,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.5.1"
+ANALYSIS_SHEET_ROWS_VERSION = "4.6.0"
 
 # v4.3.1 [FIX-1]: tracks which engine binding actually loaded. Updated at
 # request time inside _get_engine(). Surfaced in meta.engine_source on
@@ -312,6 +332,28 @@ def _analysis_proxy_timeout_sec() -> float:
     except Exception:
         pass
     return 25.0
+
+
+def _analysis_engine_timeout_sec() -> float:
+    """v4.6.0 [FIX-7]: configurable ENGINE-call timeout (seconds).
+
+    DEFAULT 0.0 = DISABLED -> the engine call is NOT wrapped in
+    asyncio.wait_for and behaviour is byte-identical to v4.5.1. Set
+    TFB_ANALYSIS_ENGINE_TIMEOUT_SEC to a positive value (clamped 1..120) to
+    bound a hung engine get_sheet_rows so it falls through to the
+    proxy/failsoft fallback instead of hanging until the gateway 502s.
+    Recommended: a few seconds UNDER Render's gateway timeout (e.g. 75-90).
+    """
+    try:
+        raw = (os.getenv("TFB_ANALYSIS_ENGINE_TIMEOUT_SEC", "") or "").strip()
+        if raw:
+            v = float(raw)
+            if v <= 0:
+                return 0.0
+            return max(1.0, min(120.0, v))
+    except Exception:
+        pass
+    return 0.0
 
 
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
@@ -2454,11 +2496,26 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
     call_summary: List[Dict[str, Any]] = []
     last_err: Optional[Exception] = None
 
+    _engine_to = _analysis_engine_timeout_sec()
     for attempt_idx, (args, kwargs) in enumerate(candidates):
         kwargs_keys = sorted(list(kwargs.keys()))[:15]
         try:
-            res = core_get_sheet_rows(*args, **kwargs)
-            res = await _maybe_await(res)
+            # v4.6.0 [FIX-7]: bound the ENGINE call. FIX-3 bounded the proxy
+            # calls; this engine get_sheet_rows call had no timeout, so a hung
+            # engine hung the whole request until the gateway 502'd it. When
+            # TFB_ANALYSIS_ENGINE_TIMEOUT_SEC > 0 the call is bounded and a
+            # timeout falls through to the proxy/failsoft fallback. The call
+            # itself still raises TypeError synchronously on a signature
+            # mismatch (before the await), so the TypeError cascade below is
+            # unchanged. _engine_to == 0 -> no wrap -> byte-identical to v4.5.1.
+            if _engine_to > 0.0:
+                res = await asyncio.wait_for(
+                    _maybe_await(core_get_sheet_rows(*args, **kwargs)),
+                    timeout=_engine_to,
+                )
+            else:
+                res = core_get_sheet_rows(*args, **kwargs)
+                res = await _maybe_await(res)
             call_summary.append({
                 "attempt_idx": attempt_idx,
                 "kwargs_keys": kwargs_keys,
@@ -2483,6 +2540,25 @@ async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: in
             last_err = e
             continue
         except Exception as e:
+            # v4.6.0 [FIX-7]: ONLY when WE imposed the engine bound, a timeout
+            # means the engine hung -- stop probing the other signatures (each
+            # would hang the same way) and fall through to the proxy/failsoft
+            # fallback. Gated on _engine_to so that with the flag OFF an engine-
+            # originated TimeoutError is handled exactly as in v4.5.1 (below).
+            if _engine_to > 0.0 and isinstance(e, asyncio.TimeoutError):
+                call_summary.append({
+                    "attempt_idx": attempt_idx,
+                    "kwargs_keys": kwargs_keys,
+                    "args_count": len(args),
+                    "outcome": "engine_timeout",
+                    "error_class": "TimeoutError",
+                    "error_message": "engine get_sheet_rows exceeded %.1fs" % _engine_to,
+                })
+                logger.warning(
+                    "[analysis_sheet_rows v%s] engine get_sheet_rows TIMEOUT after %.1fs on page=%s -- falling through to proxy/failsoft fallback",
+                    ANALYSIS_SHEET_ROWS_VERSION, _engine_to, page,
+                )
+                return None, "core:get_sheet_rows", call_summary, "engine_timeout"
             call_summary.append({
                 "attempt_idx": attempt_idx,
                 "kwargs_keys": kwargs_keys,
