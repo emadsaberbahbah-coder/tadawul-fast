@@ -1,0 +1,110 @@
+# =============================================================================
+# Daily Investment Brief — "Emad Bahbah" morning email
+# -----------------------------------------------------------------------------
+# WHAT: runs scripts/run_daily_brief.py --send, which reads the decision +
+#       opportunity + market pages from the production workbook (READ-ONLY) and
+#       emails a polished HTML brief.
+# WHEN: 06:00 UTC = 09:00 Asia/Riyadh, Sunday–Thursday (before Tadawul opens).
+#       GitHub cron is UTC; day-of-week 0-4 = Sun–Thu. Can also be run manually.
+# WHY shaped like this: it mirrors track_performance.yml exactly — same Python,
+#       same PYTHONPATH (so `integrations.*` / `core.*` imports resolve from a
+#       scripts/ file), same sheet-id source (repo variable DEFAULT_SPREADSHEET_ID)
+#       and same Google credential secret. Email transport adds three secrets:
+#       TFB_MAIL_FROM / TFB_MAIL_PASSWORD / TFB_MAIL_TO.
+# NOTE: this workflow only READS the sheet. It never writes, so it cannot affect
+#       the sync, the cockpits, or any page.
+# =============================================================================
+name: 📨 Daily Investment Brief
+
+on:
+  schedule:
+    # 06:00 UTC == 09:00 Asia/Riyadh, Sun–Thu (before Tadawul open).
+    - cron: "0 6 * * 0-4"
+  workflow_dispatch:
+    inputs:
+      send:
+        description: "Email the brief? (false = render only, no send)"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  brief:
+    name: 📨 Render & email the daily brief
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          if [[ -f requirements.render.txt ]]; then
+            python -m pip install -r requirements.render.txt
+          else
+            python -m pip install -r requirements.txt
+          fi
+
+      - name: 🔎 Resolve spreadsheet id
+        id: sheet
+        env:
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          SID="${VAR_SHEET:-}"
+          if [[ -z "$SID" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: 📨 Render & send brief
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          # GOOGLE_SHEETS_CREDENTIALS accepts JSON or base64(JSON); prefer the JSON secret.
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_BRIEF_OWNER_NAME: "Emad Bahbah"
+          TFB_MAIL_FROM: ${{ secrets.TFB_MAIL_FROM }}
+          TFB_MAIL_PASSWORD: ${{ secrets.TFB_MAIL_PASSWORD }}
+          TFB_MAIL_TO: ${{ secrets.TFB_MAIL_TO }}
+        run: |
+          if [[ -z "${GOOGLE_SHEETS_CREDENTIALS:-}" ]]; then
+            echo "::error::No Google credentials. Set secret GOOGLE_SHEETS_CREDENTIALS (JSON) or GOOGLE_SHEETS_CREDENTIALS_B64."
+            exit 1
+          fi
+          SEND_FLAG="--send"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.send }}" == "false" ]]; then
+            SEND_FLAG=""
+          fi
+          python scripts/run_daily_brief.py --out daily_brief.html $SEND_FLAG
+
+      - name: 📎 Upload rendered brief (for the record)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-brief-${{ github.run_id }}
+          path: daily_brief.html
+          if-no-files-found: ignore
+          retention-days: 14
