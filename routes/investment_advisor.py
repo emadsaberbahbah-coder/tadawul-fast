@@ -2,11 +2,49 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.16.1
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.17.0
 ================================================================================
 BRIDGE-FIRST • ROOT-OWNER ALIGNED • TOP10 FAIL-SOFT • STARTUP-SAFE
 AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE • SCHEMA v2.6.0
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • EXCEPTION-MESSAGE-CAPTURE
+
+WHY v2.17.0 — trust-gate warnings lifted to envelope level (no more silent
+"success" on an all-low-trust batch)
+-------------------------------------------------------------------------------
+WHY: diagnosed via a live in-process probe (2026-07-02) on Market_Leaders: the
+response read status="success", row_count=20, meta.warnings=[] -- yet the SAME
+request's engine log showed "[v5.101.0 RANK] total=20 scored=0 ... dropped_low_
+trust=20" and "[TRUST] ... low=20 med=0 high=0". core.data_engine_v2's
+_apply_rank_overall (v5.88.0) does NOT delete a LOW-trust row -- it withholds
+rank_overall and appends "rank_skipped_low_trust" onto THAT ROW's own
+`warnings` field (semicolon-delimited string; core.data_engine_v2._v573_append_
+warning). So the data itself is honest and schema-shaped -- the gap is that
+NOTHING in this router ever reads a row's `warnings` field and lifts it to the
+envelope. A caller (a human, the validator, a future automated check) that
+only inspects the top-level status/meta.warnings -- the normal, reasonable
+thing to do -- sees a clean "success" even when literally 100% of a batch
+failed to rank. routes.advanced_analysis has an analogous lift
+(_lift_systemic_warning_markers) for a DIFFERENT marker set
+(circuit_open/provider_unhealthy/HTTP 403); this is a new, adjacent lift for
+the RANK/TRUST markers, which that function does not cover either.
+
+FIX: new _lift_trust_warnings(rows) scans each row's `warnings` field for
+"rank_skipped_low_trust" and "rank_skipped_no_overall_score" (the two tags
+_apply_rank_overall emits), and _normalize_payload_from_bridge calls it right
+where the row list is already resolved for matrix-building. When either count
+is nonzero it (a) appends a human-readable line to meta.warnings via the
+EXISTING _append_warning helper (e.g. "20/20 rows skipped ranking: no
+Rank (Overall) assigned -- provider trust too low for this batch") and (b) adds
+a machine-readable meta.trust_summary = {"total": N, "low_trust": X,
+"no_overall_score": Y} so a future automated check (or validate_dashboard.py)
+can act on it without string-parsing. `status` is DELIBERATELY left untouched
+-- this is additive observability only, not a behavior change to what counts
+as a usable response, so nothing downstream that keys off status can regress.
+
+SCOPE: read-only over rows already in hand; no new provider/engine calls, no
+change to bridge selection, timeout, or fail-soft logic. ENV-GATED, DEFAULT ON
+(purely additive -- extra meta fields only, nothing removed/renamed): set
+TFB_ADV_LIFT_TRUST_WARNINGS=0 to revert to v2.16.1 (silent) behavior exactly.
 
 WHY v2.16.1 — Insights fallback content fix + version-constant correction
 -------------------------------------------------------------------------------
@@ -202,7 +240,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.16.1"
+INVESTMENT_ADVISOR_VERSION = "2.17.0"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -1423,6 +1461,48 @@ def _append_warning(meta: Dict[str, Any], warning: str) -> None:
     meta["warnings"] = warnings
 
 
+def _lift_trust_warnings(rows: Sequence[Any]) -> Dict[str, int]:
+    """v2.17.0: scan rows for core.data_engine_v2's RANK/TRUST skip markers and
+    return a count summary. See CHANGELOG for the full WHY.
+
+    core.data_engine_v2._apply_rank_overall (v5.88.0) never deletes a row; it
+    tags a withheld row's OWN `warnings` field (semicolon-delimited string, per
+    _v573_append_warning) with one of:
+      - "rank_skipped_low_trust"       -- trust_level=LOW, withheld from rank
+      - "rank_skipped_no_overall_score" -- no overall_score, withheld from rank
+
+    This function only reads; it never mutates a row. Tolerant of `warnings`
+    being a string, list/tuple/set, or absent.
+    """
+    total = 0
+    low_trust = 0
+    no_score = 0
+    for row in rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        total += 1
+        raw = row.get("warnings")
+        if raw is None:
+            continue
+        if isinstance(raw, (list, tuple, set)):
+            tags = {_s(w) for w in raw if _s(w)}
+        else:
+            tags = {p.strip() for p in _s(raw).split(";") if p.strip()}
+        if "rank_skipped_low_trust" in tags:
+            low_trust += 1
+        if "rank_skipped_no_overall_score" in tags:
+            no_score += 1
+    return {"total": total, "low_trust": low_trust, "no_overall_score": no_score}
+
+
+def _lift_trust_warnings_enabled() -> bool:
+    """Master switch for the v2.17.0 trust-warning lift. Default ON (purely
+    additive). Set TFB_ADV_LIFT_TRUST_WARNINGS=0 to revert to v2.16.1 (silent)
+    behavior exactly."""
+    v = (os.getenv("TFB_ADV_LIFT_TRUST_WARNINGS") or "").strip().lower()
+    return v not in {"0", "false", "off", "no"}
+
+
 def _normalize_payload_from_bridge(
     payload: Any,
     *,
@@ -1484,8 +1564,27 @@ def _normalize_payload_from_bridge(
     out["fields"] = out.get("fields") or keys
     out["columns"] = out.get("columns") or keys
 
+    rows_for_scan = out.get("rows") or out.get("row_objects") or out.get("records") or out.get("results") or []
+
+    # v2.17.0: lift RANK/TRUST skip markers to envelope level. See CHANGELOG.
+    # Additive only -- never touches `status` or the rows themselves.
+    if _lift_trust_warnings_enabled() and isinstance(rows_for_scan, list) and rows_for_scan:
+        trust_summary = _lift_trust_warnings(rows_for_scan)
+        if trust_summary["low_trust"] or trust_summary["no_overall_score"]:
+            out["meta"]["trust_summary"] = trust_summary
+            total = trust_summary["total"]
+            bits = []
+            if trust_summary["low_trust"]:
+                bits.append("{}/{} rows skipped ranking: no Rank (Overall) assigned "
+                            "(provider trust too low)".format(trust_summary["low_trust"], total))
+            if trust_summary["no_overall_score"]:
+                bits.append("{}/{} rows skipped ranking: no overall_score".format(
+                    trust_summary["no_overall_score"], total))
+            for bit in bits:
+                _append_warning(out["meta"], bit)
+
     if include_matrix and out.get("rows_matrix") is None:
-        rows = out.get("rows") or out.get("row_objects") or out.get("records") or out.get("results") or []
+        rows = rows_for_scan
         if isinstance(rows, list) and rows and isinstance(rows[0], Mapping):
             matrix = []
             for row in rows:
