@@ -119,7 +119,10 @@ env:
   # it (and your control-panel inputs) every run.
   TFB_SYNC_DECISION_GUARD: "1"
   # Market-page SYMBOL BATCHING (scripts/run_dashboard_sync.py v6.17.0). ARMED
-  # ("100"). WHY (2026-07-01, runs #2154/#2160): each market page was fetched in
+  # ("25", lowered from 100 — run #2164 showed /v1/analysis still 502'd at 100/
+  # batch, so the sync fell back to /v1/advanced which returns 0 rows; a smaller
+  # batch gives the row-returning analysis route a chance to answer in time).
+  # WHY (2026-07-01, runs #2154/#2160): each market page was fetched in
   # ONE request carrying its ENTIRE symbol set (Market_Leaders ~388,
   # Global_Markets ~3000). That burst makes the backend fan out hundreds of
   # Yahoo calls at once, which trips Yahoo's rate limit (429 -> 200 with 0 rows
@@ -135,7 +138,17 @@ env:
   # single-request behavior, byte-identical. TUNING: raise (e.g. "150") if a run
   # nears the 25-min job cap; optional companion TFB_SYNC_BATCH_DELAY_MS: "500"
   # adds a pause between batches for extra upstream cooldown.
-  TFB_SYNC_SYMBOL_BATCH_SIZE: "100"
+  TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
+  # Route the four market pages through the ANALYSIS gateway
+  # (/v1/analysis/sheet-rows) FIRST — the route that returns the full page of
+  # rows (plus the rank/dedup passes) — instead of the enriched chain that ends
+  # on /v1/advanced (the advisor route), which answers 200 but with 0 rows for a
+  # raw market list. Paired with the small batch size above so the analysis
+  # route can answer within Render's ~100s timeout instead of 502ing. Read by
+  # run_dashboard_sync.py (_effective_gateway); this is a GitHub/sync flag, NOT a
+  # Render backend var. Reversible: set "0" (or remove) to restore the
+  # per-page configured gateway.
+  TFB_SYNC_MARKET_ANALYSIS_GATEWAY: "1"
 
 jobs:
   # =============================================================================
