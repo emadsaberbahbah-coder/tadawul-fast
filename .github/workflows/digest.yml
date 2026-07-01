@@ -85,14 +85,22 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
 
-          # --- SMTP transport (ADD THESE in repo Settings → Secrets) ---
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          # --- SMTP transport (2026-07-02 REWIRE: reuse the PROVEN TFB_MAIL_*) ---
+          # WHY: the original wiring read six SMTP_*/DIGEST_* secrets that were
+          # never created in this repo, so every send silently had no transport.
+          # The Daily Investment Brief (daily_brief.yml) already emails
+          # successfully through the EXISTING TFB_MAIL_FROM / TFB_MAIL_PASSWORD /
+          # TFB_MAIL_TO secrets over smtp.gmail.com:587 STARTTLS — proven live
+          # (brief run #8, 2026-07-01, send step green; a send failure exits 3).
+          # Map the digest onto that same working transport verbatim. ZERO new
+          # secrets required; scripts/send_digest.py env names are unchanged.
+          SMTP_HOST: ${{ vars.TFB_MAIL_SMTP_HOST || 'smtp.gmail.com' }}
+          SMTP_PORT: ${{ vars.TFB_MAIL_SMTP_PORT || '587' }}
+          SMTP_USER: ${{ secrets.TFB_MAIL_FROM }}
+          SMTP_PASSWORD: ${{ secrets.TFB_MAIL_PASSWORD }}
           SMTP_USE_TLS: ${{ vars.SMTP_USE_TLS || '1' }}
-          DIGEST_FROM: ${{ secrets.DIGEST_FROM }}
-          DIGEST_TO: ${{ secrets.DIGEST_TO }}
+          DIGEST_FROM: ${{ secrets.TFB_MAIL_FROM }}
+          DIGEST_TO: ${{ secrets.TFB_MAIL_TO }}
 
           # --- behaviour (optional repo-var overrides; defaults are fine) ---
           DIGEST_CANDIDATE_PAGES: ${{ vars.DIGEST_CANDIDATE_PAGES || 'Market_Leaders' }}
