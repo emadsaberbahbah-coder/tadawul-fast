@@ -7,6 +7,42 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.10.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.17.0 fix — market-page SYMBOL BATCHING (fixes empty market pages + 502s under
+              Yahoo rate-limiting)
+- WHY (diagnosed + confirmed from the 2026-07-01 13:05 sync logs + a code trace
+  of data_engine_v2 v5.101.0): each market page was fetched in ONE request
+  carrying its ENTIRE symbol set (Market_Leaders ~388, Global_Markets ~3000).
+  That single burst makes the backend fan out hundreds of Yahoo history calls at
+  once, which (a) trips Yahoo's datacenter-IP rate limit (HTTP 429) so the
+  symbols return no price and the route hands back a 200 with ZERO data rows ->
+  the v6.9.0 empty-guard skips the write and the page shows STALE data, and (b)
+  exceeds Render's ~100s edge timeout on the analysis route -> HTTP 502. NOTE
+  the engine's trust gate does NOT delete rows (_apply_rank_overall only
+  WITHHOLDS a Rank (Overall) from a LOW-trust row; the row stays), so the empty
+  page is a fetch/throttle problem, and THIS (the sync request shape) is the
+  correct layer to fix — not a rewrite of the 12k-line engine.
+- FIX: when enabled, split a market page's symbol set into small SEQUENTIAL
+  batches and fetch each on its own request, accumulating the data rows. Each
+  request is light enough to finish inside the timeout (kills the 502) and the
+  calls are spread out so they are far less likely to 429 (recovers rows). The
+  combined (headers, rows) then flow into the SAME guards + single clear/write
+  as before. Default OFF -> byte-identical to v6.16.0. New env:
+  TFB_SYNC_SYMBOL_BATCH_SIZE (positive int enables; e.g. 100) and optional
+  TFB_SYNC_BATCH_DELAY_MS (default 0). Scope: the four _RANKED_MARKET_PAGES only,
+  and only when the page has MORE symbols than the batch size — My_Portfolio,
+  Top_10, meta pages, and empty-symbol page-driven requests are untouched.
+- KNOWN TRADE-OFF (documented, honest): the analysis route's page-level Global
+  Rank / Global Dedup passes run PER REQUEST, so with batching the Rank (Overall)
+  column is ranked WITHIN each batch, and duplicate symbols split across batches
+  are not collapsed. Per-symbol data (price / score / recommendation /
+  final_action) is correct regardless. This is a deliberate exchange: reliably
+  POPULATED pages with per-batch ranking, versus whole-page ranking that
+  currently 502s / returns empty. A client-side re-rank of the combined set is a
+  clean follow-up if whole-page Rank (Overall) is required.
+- New helpers: _symbol_batch_size(), _batch_delay_ms(), _should_batch_market_page(),
+  _fetch_market_rows_batched(). All v6.16.0 functions carried verbatim (none
+  removed); 4 added. No schema / payload-key / endpoint / guard change.
+
 v6.16.0 fix — market-page symbol read-back (fixes user-added symbols being wiped)
 - WHY (diagnosed + confirmed live 2026-06-29): the four market DATA pages
   (Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds) had NO working
@@ -336,7 +372,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.16.0"
+SCRIPT_VERSION = "6.17.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1748,6 +1784,133 @@ def _effective_gateway(task: TaskSpec) -> str:
     return task.gateway
 
 
+# ---------------------------------------------------------------------------
+# v6.17.0 [SYMBOL-BATCHING] — fetch a many-symbol market page in small batches.
+# ---------------------------------------------------------------------------
+# See the v6.17.0 header changelog for the full root cause. In short: one
+# request carrying a page's ENTIRE symbol set makes the backend burst hundreds
+# of Yahoo calls -> 429 (200 with 0 rows -> stale page) or Render ~100s timeout
+# (502). Splitting into small sequential batches makes each request light enough
+# to finish and spreads the upstream calls so they are far less likely to 429.
+# DEFAULT OFF: TFB_SYNC_SYMBOL_BATCH_SIZE unset/0 -> the original single-request
+# path runs unchanged. Scope is the four _RANKED_MARKET_PAGES only, and only
+# when a page has MORE symbols than the batch size.
+
+
+def _symbol_batch_size() -> int:
+    """v6.17.0: per-request symbol batch size for market pages. <=0 disables
+    batching (original single-request path). A positive N fetches the page in
+    batches of N. Non-numeric / unset -> 0 (OFF)."""
+    raw = (os.getenv("TFB_SYNC_SYMBOL_BATCH_SIZE", "") or "").strip()
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def _batch_delay_ms() -> int:
+    """v6.17.0: optional sleep (milliseconds) between market-page symbol batches
+    for extra upstream cooldown. Default 0 (no delay). Negative / non-numeric
+    -> 0."""
+    raw = (os.getenv("TFB_SYNC_BATCH_DELAY_MS", "") or "").strip()
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def _should_batch_market_page(task: TaskSpec, symbols: List[str]) -> bool:
+    """v6.17.0: batch this task iff batching is enabled, it is one of the
+    cross-sectional market pages, and it actually carries MORE symbols than the
+    batch size (otherwise one request already fits and the original path runs)."""
+    size = _symbol_batch_size()
+    if size <= 0:
+        return False
+    if task.sheet_name not in _RANKED_MARKET_PAGES:
+        return False
+    return bool(symbols) and len(symbols) > size
+
+
+async def _fetch_market_rows_batched(
+    backend: "BackendClient",
+    task: TaskSpec,
+    symbols: List[str],
+    base_payload: Dict[str, Any],
+    eff_gw: str,
+    res: "TaskResult",
+) -> Tuple[List[Any], List[List[Any]], Optional[str], Optional[str]]:
+    """v6.17.0: fetch `symbols` for a market page in small SEQUENTIAL batches,
+    accumulating the data rows, and return (headers, rows_matrix, used_endpoint,
+    last_err) with the SAME shape the inline single-request loop produces — so
+    the caller's guards + clear/write run unchanged on the combined result.
+
+    The endpoint is resolved on the FIRST answering batch and reused for the
+    rest (the 404-candidate cycling is not repeated per batch). Header + rectify
+    handling mirrors the inline loop; the pages this runs for are never
+    My_Portfolio / Top_10, so the portfolio-injection, decision-reconcile and
+    Top_10 header-repair steps are (by scope) no-ops and are intentionally not
+    duplicated here.
+    """
+    size = _symbol_batch_size()
+    delay_ms = _batch_delay_ms()
+    batches = [symbols[i:i + size] for i in range(0, len(symbols), size)]
+    candidates = _endpoint_candidates_for_gateway(eff_gw)
+
+    headers: List[Any] = []
+    combined: List[List[Any]] = []
+    used_endpoint: Optional[str] = None
+    last_err: Optional[str] = None
+    ok_batches = 0
+
+    for bi, batch in enumerate(batches):
+        p = dict(base_payload)
+        p["tickers"] = batch
+        p["symbols"] = batch
+        p["limit"] = min(5000, max(1, len(batch)))
+        p["request_id"] = f"{res.request_id}-b{bi + 1}"
+
+        # Reuse the resolved endpoint once one answers; only the first batch
+        # pays the candidate-cycling cost.
+        cand = [used_endpoint] if used_endpoint else candidates
+        b_headers: List[Any] = []
+        b_matrix: List[List[Any]] = []
+        for ep in cand:
+            data, err, _code = await backend.post_json(ep, p)
+            if err:
+                last_err = f"{ep} -> {err}"
+                continue
+            if not isinstance(data, dict):
+                last_err = f"{ep} -> Non-dict response"
+                continue
+            b_headers, b_matrix = _extract_table_payload(data)
+            if not b_headers:
+                last_err = f"{ep} -> Missing headers"
+                continue
+            b_matrix = _rectify_matrix(b_headers, b_matrix)
+            used_endpoint = ep
+            break
+
+        if b_headers:
+            if not headers:
+                headers = b_headers
+            if b_matrix:
+                combined.extend(b_matrix)
+            ok_batches += 1
+
+        if delay_ms > 0 and bi < len(batches) - 1:
+            await asyncio.sleep(delay_ms / 1000.0)
+
+    if headers:
+        res.warnings.append(
+            f"[SYMBOL-BATCH] fetched {len(symbols)} symbol(s) in "
+            f"{ok_batches}/{len(batches)} batch(es) of {size} via "
+            f"{used_endpoint or '?'}"
+        )
+    return headers, combined, used_endpoint, last_err
+
+
 def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[Any]]]:
     """
     Returns (headers, rows_matrix) ALWAYS as list[list] for Sheets writing.
@@ -2039,7 +2202,20 @@ async def _run_one_task(
         used_endpoint: Optional[str] = None
         eff_gw = _effective_gateway(task)  # v6.10.0: ranked market pages -> analysis when enabled
 
-        for ep in _endpoint_candidates_for_gateway(eff_gw):
+        # v6.17.0 [SYMBOL-BATCHING]: when enabled, a many-symbol market page is
+        # fetched in small SEQUENTIAL batches (see _fetch_market_rows_batched /
+        # the v6.17.0 changelog) and the combined (headers, rows_matrix) flow
+        # into the SAME guards + clear/write below. Default OFF ->
+        # _should_batch_market_page returns False and the original single-
+        # request candidate loop runs byte-identically (the `for ep in [...]`
+        # below evaluates its normal candidate list).
+        _use_batching = _should_batch_market_page(task, symbols)
+        if _use_batching:
+            headers, rows_matrix, used_endpoint, last_err = await _fetch_market_rows_batched(
+                backend, task, symbols, payload, eff_gw, res
+            )
+
+        for ep in ([] if _use_batching else _endpoint_candidates_for_gateway(eff_gw)):
             data, err, _code = await backend.post_json(ep, payload)
             if err:
                 last_err = f"{ep} -> {err}"
