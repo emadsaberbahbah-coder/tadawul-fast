@@ -216,8 +216,14 @@ def _is_blank(v: Any) -> bool:
     return s in ("", "-", "—", "none", "n/a", "na", "null", "0", "false", "no")
 
 
-BUY_ACTIONS = {"BUY", "STRONG BUY", "STRONGBUY", "ACCUMULATE", "ACCUM", "ADD"}
-SELL_ACTIONS = {"SELL", "STRONG SELL", "REDUCE", "TRIM", "AVOID", "EXIT"}
+# The dashboard's FINAL ACTION verdict vocabulary (authoritative investability
+# decision): INVEST / WATCH / DO_NOT_INVEST. INVEST already means "investable +
+# not blocked", so it needs no extra gate filtering. The raw-recommendation
+# words are kept as a FALLBACK for any page/version that exposes BUY/SELL text.
+INVEST_ACTION = "INVEST"
+DO_NOT_INVEST_ACTION = "DO_NOT_INVEST"
+RAW_BUY_ACTIONS = {"BUY", "STRONG BUY", "STRONGBUY", "ACCUMULATE", "ACCUM", "ADD"}
+RAW_SELL_ACTIONS = {"SELL", "STRONG SELL", "REDUCE", "TRIM", "AVOID", "EXIT"}
 
 
 # --------------------------------------------------------------------------- #
@@ -308,26 +314,37 @@ def _is_investable(r: Dict[str, Any]) -> bool:
 # selection
 # --------------------------------------------------------------------------- #
 def _pick_best_buy(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    pool = [
-        r
-        for r in candidates
-        if r["action"] in BUY_ACTIONS
+    def _score(r: Dict[str, Any]) -> float:
+        return r["score"] if r["score"] is not None else -1e9
+
+    # Primary: Final Action == INVEST (already the investable verdict).
+    invest = [
+        r for r in candidates
+        if r["action"] == INVEST_ACTION and (r["price"] is not None and r["price"] > 0)
+    ]
+    if invest:
+        return max(invest, key=_score)
+    # Fallback: raw BUY-family text, but only if investable and not blocked.
+    raw = [
+        r for r in candidates
+        if r["action"] in RAW_BUY_ACTIONS
         and _is_investable(r)
         and (r["price"] is not None and r["price"] > 0)
     ]
-    if not pool:
-        return None
-    # highest score wins; rows with no score sink to the bottom
-    return max(pool, key=lambda r: (r["score"] if r["score"] is not None else -1e9))
+    return max(raw, key=_score) if raw else None
 
 
 def _pick_best_sell(holdings: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    # You can only sell what you own -> SELL candidates come from holdings.
-    pool = [r for r in holdings if r["action"] in SELL_ACTIONS]
-    if not pool:
-        return None
-    # worst score = most urgent to exit
-    return min(pool, key=lambda r: (r["score"] if r["score"] is not None else 1e9))
+    def _score(r: Dict[str, Any]) -> float:
+        return r["score"] if r["score"] is not None else 1e9
+
+    # You can only sell what you own -> exit signals come from holdings.
+    # Primary: Final Action == DO_NOT_INVEST; fallback: raw SELL-family text.
+    dni = [r for r in holdings if r["action"] == DO_NOT_INVEST_ACTION]
+    if dni:
+        return min(dni, key=_score)   # worst score = most urgent exit
+    raw = [r for r in holdings if r["action"] in RAW_SELL_ACTIONS]
+    return min(raw, key=_score) if raw else None
 
 
 def _pick_best_swap(
