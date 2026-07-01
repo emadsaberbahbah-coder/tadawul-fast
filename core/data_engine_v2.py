@@ -2,8 +2,43 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.101.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.102.0
 ================================================================================
+
+WHY v5.102.0 - BUY-FAMILY / BLOCK_REASON COHERENCE (Fix AP; env-gated
+               TFB_GATE_RECO_COHERENCE, DEFAULT ON -> set 0/false/off to
+               restore v5.101.0 exactly; no schema change, 115 / MP 122)
+-------------------------------------------------------------------------------
+Fix AP - A BENCHED ROW COULD STILL READ "BUY".
+  SYMPTOM: validate_dashboard.py (registry 2.15.0) hard-fails the post-sync
+  gate.buy_has_no_block_reason check -- 351 rows across five pages where a
+  BUY-family recommendation (STRONG_BUY / BUY / ACCUMULATE) coexists with a
+  non-empty block_reason. Exit 2 on every throttled sync cycle.
+  ROOT CAUSE: _apply_investability_gate benches a BUY-family row by writing
+  block_reason and demoting investability_status / final_action -- but it never
+  touches the recommendation field. And because _reconcile_recommendation_
+  family runs BEFORE the gate at all three boundaries (_strict_project_row,
+  the get_page_rows loop, the Top_10 engine path), no later pass ever
+  re-reconciles the family against the gate's verdict. The row leaves the API
+  as recommendation=BUY + block_reason="..." -- exactly what the validator
+  (correctly) rejects as incoherent.
+  FIX: new _apply_reco_coherence(row), called immediately AFTER
+  _apply_investability_gate at ALL THREE boundary call sites (and BEFORE
+  _apply_analyst_trend_block, so the derived `signal` column reads the
+  coherent value). When block_reason is non-empty and recommendation or
+  recommendation_detailed is BUY-family, both are neutralized to HOLD and the
+  EXISTING _reconcile_recommendation_family single-source-of-truth reconciler
+  is re-run to refresh priority / band / reason-prefix / position_size_hint
+  consistently. DOWNGRADE-ONLY by construction: it never promotes, never
+  touches HOLD / sell-family rows, never clears block_reason, never changes
+  investability_status / final_action (the gate stays authoritative).
+  IDEMPOTENT: on a repeat gate pass the row is already HOLD -> no-op ->
+  byte-identical. Fail-open (any exception leaves the row untouched). Adds NO
+  column and NO warnings tag. New helpers: _gate_reco_coherence_enabled(),
+  _apply_reco_coherence(); new constant _RECO_COHERENCE_BUY_FAMILY.
+  Reversible: TFB_GATE_RECO_COHERENCE in {0,false,off} -> v5.101.0
+  byte-identical.
+-------------------------------------------------------------------------------
 
 WHY v5.101.0 - FIXED-INCOME / SUKUK CLASSIFICATION (Fix AO; env-gated
                TFB_ENGINE_SUKUK_CLASS, DEFAULT ON -> set 0/false/off to restore
@@ -2139,7 +2174,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.101.0"
+__version__ = "5.102.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4216,6 +4251,67 @@ def _reconcile_recommendation_family(row: Dict[str, Any]) -> None:
         # family) is preserved -- see _position_hint_contradicts_reco.
         elif psh and _position_hint_contradicts_reco(psh, final):
             row["position_size_hint"] = expected_psh
+
+
+# =============================================================================
+# v5.102.0 (Fix AP): BUY-family / block_reason coherence
+# =============================================================================
+_RECO_COHERENCE_BUY_FAMILY = ("STRONG_BUY", "BUY", "ACCUMULATE")
+
+
+def _gate_reco_coherence_enabled() -> bool:
+    """v5.102.0 (Fix AP): master switch for the BUY-family / block_reason
+    coherence pass (default ON). When ON, a row that the investability gate
+    benched (non-empty block_reason) can no longer leave the API with a
+    BUY-family recommendation -- it is neutralized to HOLD, because the engine
+    should not say "BUY" and "blocked" about the same row in the same breath
+    (validate_dashboard.py gate.buy_has_no_block_reason asserts exactly this).
+    Set TFB_GATE_RECO_COHERENCE to 0/false/off to restore the exact v5.101.0
+    output (the coherence pass then never fires)."""
+    raw = (os.getenv("TFB_GATE_RECO_COHERENCE") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+def _apply_reco_coherence(row: Dict[str, Any]) -> None:
+    """v5.102.0 (Fix AP): neutralize a BUY-family recommendation on a benched
+    row. Runs immediately AFTER _apply_investability_gate at every boundary
+    (and BEFORE _apply_analyst_trend_block, so the derived `signal` column is
+    computed from the coherent value).
+
+    Contract:
+      * fires ONLY when block_reason is non-empty AND recommendation or
+        recommendation_detailed is BUY-family (STRONG_BUY / BUY / ACCUMULATE);
+      * DOWNGRADE-ONLY: sets both fields to HOLD and re-runs the EXISTING
+        _reconcile_recommendation_family single-source-of-truth reconciler so
+        recommendation_priority / band / reason-prefix / position_size_hint
+        stay consistent -- no duplicated derivation logic;
+      * never promotes, never touches HOLD / sell-family rows, never clears
+        block_reason, never changes investability_status / final_action;
+      * IDEMPOTENT (second pass sees HOLD -> no-op) and fail-open (any
+        exception leaves the row untouched);
+      * adds NO column (schema stays 115 / MP 122) and NO warnings tag.
+    """
+    if not isinstance(row, dict):
+        return
+    if not _gate_reco_coherence_enabled():
+        return
+    try:
+        block = _safe_str(row.get("block_reason")).strip()
+        if not block:
+            return
+        reco = _canonical_recommendation(row.get("recommendation"))
+        detailed = _canonical_recommendation(row.get("recommendation_detailed"))
+        if (reco not in _RECO_COHERENCE_BUY_FAMILY) and (
+            detailed not in _RECO_COHERENCE_BUY_FAMILY
+        ):
+            return
+        row["recommendation"] = "HOLD"
+        row["recommendation_detailed"] = "HOLD"
+        _reconcile_recommendation_family(row)
+    except Exception:
+        return
 
 
 # =============================================================================
@@ -9259,6 +9355,7 @@ def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, A
     # recommendation_detailed / reason / priority / band downstream.
     _reconcile_recommendation_family(row)
     _apply_investability_gate(row)  # v5.78.0: decision-readiness layer (8 cols)
+    _apply_reco_coherence(row)  # v5.102.0 (Fix AP): benched row cannot stay BUY-family
     _apply_analyst_trend_block(row)  # v5.85.0 (Fix AD): runs AFTER the gate, derivation-only
     return {k: _json_safe(row.get(k)) for k in keys}
 
@@ -11640,6 +11737,7 @@ class DataEngineV5:
         for _r in rows:
             _reconcile_recommendation_family(_r)
             _apply_investability_gate(_r)  # v5.78.0: same boundary as _strict_project_row
+            _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
             _apply_analyst_trend_block(_r)  # v5.85.0 (Fix AD): same boundary as _strict_project_row
         # v5.80.0: cross-sectional portfolio decision pass (weights + verdict).
         # Runs once on the full holdings list after the per-row gate, so
@@ -11741,6 +11839,7 @@ class DataEngineV5:
                 for _r in rows:
                     _reconcile_recommendation_family(_r)
                     _apply_investability_gate(_r)
+                    _apply_reco_coherence(_r)  # v5.102.0 (Fix AP): same boundary as _strict_project_row
                 # v5.77.23 (Fix J): same Top 10 eligibility filter as the
                 # fallback path (missing price / sell-family excluded).
                 rows = [r for r in rows if _top10_row_is_eligible(r)]
