@@ -2,6 +2,34 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
+Advanced Analysis Root Owner — v4.11.0  (EDGE-TIMEOUT-GUARD)
+================================================================================
+v4.11.0 [EDGE-TIMEOUT-GUARD]: WHY -- diagnosed from the 2026-07-01 sync +
+Render logs: Market_Leaders/Global_Markets/Commodities_FX/Mutual_Funds batches
+were sometimes coming back as a raw connection failure (502) from the SYNC's
+point of view, even though this route already has a complete fail-soft design
+(_build_nonempty_failsoft_rows, existing) meant to ALWAYS return a non-empty,
+schema-shaped "partial" envelope on any upstream failure. Root cause:
+_call_core_sheet_rows_best_effort had NO internal time budget -- for a large
+or Yahoo-throttled batch (429 retries add up across hundreds of symbols) the
+engine call can run past Render's platform-level edge timeout (~100s). When
+the PLATFORM kills the request at the edge, this handler's fail-soft code
+never gets to execute -- the caller sees a bare connection failure, not the
+graceful envelope this route was designed to always return. FIX: the engine
+call is now wrapped in asyncio.wait_for with a budget safely under the edge
+timeout; on TimeoutError it falls through to the SAME existing fail-soft path
+used for every other failure mode (no new fail-soft logic -- the existing
+logic just gets a chance to run before the platform can kill the request).
+ENV-GATED, DEFAULT OFF (matches this file's convention): set
+TFB_ADV_ENGINE_CALL_TIMEOUT=1 to enable; TFB_ADV_ENGINE_CALL_TIMEOUT_S (default
+75.0) sets the budget in seconds. Unset -> byte-identical to v4.10.0.
+COMPLEMENTARY to (not a substitute for) run_dashboard_sync.py v6.17.0's
+TFB_SYNC_SYMBOL_BATCH_SIZE, which reduces the odds of hitting this ceiling at
+all by shrinking each request's symbol count -- this guard is defense-in-depth
+for whatever size request the caller actually sends. ALL v4.10.0 behavior is
+otherwise preserved verbatim; no route, schema, or fail-soft-content change.
+
+================================================================================
 Advanced Analysis Root Owner — v4.10.0  (LIVE NEWS DISPLAY — NEWS-DISPLAY)
 ================================================================================
 v4.10.0 [NEWS-DISPLAY]: the opportunity-candidates News column is filled with
@@ -328,9 +356,9 @@ logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
 # =============================================================================
-# v4.10.0 — Version constant.
+# v4.11.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.10.0"
+ADVANCED_ANALYSIS_VERSION = "4.11.0"
 
 
 # =============================================================================
@@ -613,6 +641,22 @@ def _env_num(name: str, default: float) -> float:
 
 def _news_display_enabled() -> bool:
     return _env_truthy("TFB_NEWS_DISPLAY", False)
+
+
+def _adv_engine_call_timeout_enabled() -> bool:
+    """v4.11.0 edge-timeout guard master switch. See CHANGELOG. Default OFF ->
+    byte-identical to v4.10.0 (unbounded engine call)."""
+    return _env_truthy("TFB_ADV_ENGINE_CALL_TIMEOUT", False)
+
+
+def _adv_engine_call_timeout_s() -> float:
+    """Budget (seconds) for the engine call when the guard is enabled. Default
+    75.0 -- comfortably under Render's ~100s edge timeout, leaving headroom
+    for auth/schema resolution + envelope serialization on either side of the
+    call. Clamped to a sane [5, 95] range so a bad env value can't disable the
+    protection (too high) or make every request fail-soft (too low)."""
+    v = _env_num("TFB_ADV_ENGINE_CALL_TIMEOUT_S", 75.0)
+    return max(5.0, min(95.0, v))
 
 
 def _news_display_max() -> int:
@@ -2334,10 +2378,36 @@ async def _run_advanced_sheet_rows_impl(
             if _extract_rows_like(normalized_special):
                 return normalized_special
 
-    payload, source = await _call_core_sheet_rows_best_effort(
-        page=page, limit=max(limit + offset, top_n), offset=0,
-        mode=mode or "", body=merged_body,
-    )
+    # v4.11.0 [EDGE-TIMEOUT-GUARD]: see CHANGELOG. Bound the engine call so a
+    # slow/throttled batch degrades to the EXISTING fail-soft path below
+    # instead of running until Render's platform-level edge timeout kills the
+    # whole request (which never gives this handler's fail-soft code a chance
+    # to run -- the caller just sees a raw connection failure). Default OFF ->
+    # the else-branch below is byte-identical to v4.10.0.
+    if _adv_engine_call_timeout_enabled():
+        try:
+            payload, source = await asyncio.wait_for(
+                _call_core_sheet_rows_best_effort(
+                    page=page, limit=max(limit + offset, top_n), offset=0,
+                    mode=mode or "", body=merged_body,
+                ),
+                timeout=_adv_engine_call_timeout_s(),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[advanced_analysis v%s] engine call timed out after %.1fs for page=%s "
+                "(edge-timeout guard); falling through to fail-soft",
+                ADVANCED_ANALYSIS_VERSION, _adv_engine_call_timeout_s(), page,
+            )
+            payload, source = (
+                {"status": "error", "error": "engine_call_timeout", "row_objects": []},
+                CORE_GET_SHEET_ROWS_SOURCE,
+            )
+    else:
+        payload, source = await _call_core_sheet_rows_best_effort(
+            page=page, limit=max(limit + offset, top_n), offset=0,
+            mode=mode or "", body=merged_body,
+        )
     if isinstance(payload, dict):
         normalized = _normalize_external_payload(
             external_payload=payload, page=page, headers=headers, keys=keys,
