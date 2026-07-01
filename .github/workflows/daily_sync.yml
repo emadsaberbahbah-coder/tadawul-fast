@@ -118,6 +118,24 @@ env:
   # Top_10_Investments is NOT being used as the cockpit, or the sync will clobber
   # it (and your control-panel inputs) every run.
   TFB_SYNC_DECISION_GUARD: "1"
+  # Market-page SYMBOL BATCHING (scripts/run_dashboard_sync.py v6.17.0). ARMED
+  # ("100"). WHY (2026-07-01, runs #2154/#2160): each market page was fetched in
+  # ONE request carrying its ENTIRE symbol set (Market_Leaders ~388,
+  # Global_Markets ~3000). That burst makes the backend fan out hundreds of
+  # Yahoo calls at once, which trips Yahoo's rate limit (429 -> 200 with 0 rows
+  # -> empty-guard preserves STALE data) and/or exceeds Render's ~100s edge
+  # timeout on the analysis route (-> HTTP 502). This value fetches each market
+  # page in batches of N symbols instead, so every request is light enough to
+  # finish inside the timeout (kills the 502) and the upstream calls are spread
+  # out (avoids the 429 that returned empty pages). Scope: the four market pages
+  # only, and only when a page has MORE than N symbols; My_Portfolio, Top_10 and
+  # the meta pages are untouched. TRADE-OFF: the page-level Rank (Overall) is
+  # then ranked WITHIN each batch (per-symbol price/score/recommendation stay
+  # correct). KILL-SWITCH: remove this line (or set "0") to restore the v6.16.0
+  # single-request behavior, byte-identical. TUNING: raise (e.g. "150") if a run
+  # nears the 25-min job cap; optional companion TFB_SYNC_BATCH_DELAY_MS: "500"
+  # adds a pause between batches for extra upstream cooldown.
+  TFB_SYNC_SYMBOL_BATCH_SIZE: "100"
 
 jobs:
   # =============================================================================
