@@ -2,12 +2,53 @@
 # scripts/validate_dashboard.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.1.0)
+TADAWUL FAST BRIDGE — DASHBOARD CONTRACT & GATE-INTEGRITY VALIDATOR (v1.2.0)
 ================================================================================
 
 ================================================================================
 CHANGELOG
 ================================================================================
+v1.2.0 (2026-07-01) — gate.buy_has_no_block_reason MADE GOVERNANCE-AWARE
+--------------------------------------------------------------------------------
+WHY: A live audit of the production workbook (2026-07-01) found 461 of the
+gate's 462 total flagged rows across Market_Leaders/Global_Markets/
+Mutual_Funds/My_Portfolio were NOT contradictions -- they were the engine's
+OWN Conservative gate correctly demoting a moderate-score BUY-family signal.
+Concrete example live on the sheet: My_Portfolio RCI.US carries
+Recommendation=ACCUMULATE (the raw signal) with Final Action=WATCH,
+Investability Status=WATCHLIST, and Block Reason="Conservative gate: overall
+65 < 68". The row is NOT actionable and will NOT be invested in -- final_action
+already says so. The gate as written reads only the raw Recommendation column,
+so it flagged the leftover BUY-family LABEL as a hard FAIL even though the
+engine's own governance layer (data_engine_v2's Conservative/Strict gates) had
+already withheld the row from action. This is a validator false positive on
+CORRECT two-layer behavior (Recommendation = raw signal, Final Action /
+Investability Status = governed decision), not a data-integrity defect --
+confirmed by cross-checking the actual Block Reason text on all 461: ~445 read
+"Conservative gate: overall NN < 68", the remainder "Incomplete fundamentals
+(D/E, FCF)" or (My_Portfolio) "Engine neutral (HOLD)" -- all engine-side
+demotions, none a raw contradiction.
+
+FIX: the check now only flags a BUY-family + block_reason row as a genuine
+gate violation when the row is STILL marked actionable/investable despite the
+block -- i.e. final_action == INVEST (preferred; falls back to
+investability_status == INVESTABLE when final_action isn't on the page). A
+BUY-family row correctly demoted to WATCH/WATCHLIST no longer fires. This is
+the real contradiction the check was meant to catch (a row the engine still
+intends to act on, yet also blocked) -- narrower, not weaker: it still fires
+on that case exactly as before.
+
+FAIL-SAFE WHEN GOVERNANCE STATE IS UNREADABLE: if a page carries block_reason
++ recommendation but exposes NEITHER final_action NOR investability_status
+(so governance state can't be determined at all), the check falls back to the
+prior v1.1.0 strict behavior (any BUY-family + block_reason = FAIL) rather
+than silently passing -- never masks a genuine gap in unknown data.
+
+REVERSIBILITY: set VALIDATE_GATE_BUY_BLOCK_STRICT=1 (or any truthy value) to
+force the prior v1.1.0 strict behavior on every page regardless of governance
+columns. Unset/0 (default) runs the v1.2.0 governance-aware check described
+above. No schema, contract, or other gate/sanity/top10 check is touched.
+
 v1.1.0 (2026-06-29) — Top_10_Investments REMOVED FROM DEFAULT PAGE SCOPE
 --------------------------------------------------------------------------------
 WHY: Top_10_Investments was redesigned (16_Decision_Top10.gs) from a flat
@@ -101,8 +142,13 @@ GATE INTEGRITY (hard fail; SKIPPED if the required columns are absent -- which
 the CONTRACT check will already have flagged):
   - INVESTABLE rows with no current price OR no 12M forecast
   - final_action == INVEST on a REDUCE / SELL / STRONG_SELL / AVOID reco
-  - BUY-family reco (STRONG_BUY / BUY / ACCUMULATE) carrying a non-empty
-    block_reason
+  - BUY-family reco (STRONG_BUY / BUY / ACCUMULATE) STILL MARKED ACTIONABLE
+    (final_action == INVEST, or investability_status == INVESTABLE when
+    final_action isn't on the page) while carrying a non-empty block_reason
+    (v1.2.0; a BUY-family row correctly demoted to WATCH/WATCHLIST by the
+    engine's own gate is NOT flagged -- see CHANGELOG. Falls back to the prior
+    strict "any block_reason" check when governance columns are both absent,
+    or when VALIDATE_GATE_BUY_BLOCK_STRICT is set)
   - provider_engine_conflict == TRUE with a blank conflict_type
 
 SANITY (warn):
@@ -147,6 +193,10 @@ ENVIRONMENT
   VALIDATE_JSON_OUT                            write JSON report to this path
   VALIDATE_WRITE_SHEET                         truthy = also write Dashboard_Audit tab
   VALIDATE_AUDIT_TAB                           audit tab name (default Dashboard_Audit)
+  VALIDATE_GATE_BUY_BLOCK_STRICT                truthy = force v1.1.0 strict
+                                                 buy_has_no_block_reason on
+                                                 every page (default off; see
+                                                 v1.2.0 CHANGELOG)
   GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS   service account (JSON or b64)
   LOG_LEVEL                                    logger level (default INFO)
 ================================================================================
@@ -171,7 +221,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 SERVICE_VERSION = SCRIPT_VERSION
 SCRIPT_NAME = "DashboardValidator"
 
@@ -659,17 +709,41 @@ def check_gate(page: str, k2h: Dict[str, str], actual_set: set, rows: List[Dict[
         out.append(CheckResult(page, "gate.no_invest_on_sell_reco", "SKIP",
                                detail="final_action or recommendation column not present"))
 
-    # 3) BUY-family reco carrying a non-empty block_reason
+    # 3) BUY-family reco STILL MARKED ACTIONABLE carrying a non-empty
+    #    block_reason (v1.2.0 -- see CHANGELOG). A BUY-family row the engine's
+    #    own Conservative/Strict gate has already demoted to WATCH/WATCHLIST
+    #    (final_action != INVEST / investability_status != INVESTABLE) is
+    #    CORRECTLY governed, not a contradiction -- only fire when the row is
+    #    STILL treated as actionable/investable despite the block. Falls back
+    #    to the prior v1.1.0 strict rule (any BUY-family + block_reason) when
+    #    neither governance column is present, or when
+    #    VALIDATE_GATE_BUY_BLOCK_STRICT is set -- fail-safe, never masks a
+    #    genuine gap when governance state can't be read.
     if _has_column(actual_set, k2h, _K_BLOCK) and _has_column(actual_set, k2h, _K_RECO):
+        has_action = _has_column(actual_set, k2h, _K_ACTION)
+        has_invest = _has_column(actual_set, k2h, _K_INVEST)
+        strict_mode = _env_bool("VALIDATE_GATE_BUY_BLOCK_STRICT", False) or not (has_action or has_invest)
         bad = []
         for r in rows:
             if _norm_token(_resolve(r, k2h, _K_RECO)) not in _BUY_FAMILY:
                 continue
-            if _safe_str(_resolve(r, k2h, _K_BLOCK)):
+            if not _safe_str(_resolve(r, k2h, _K_BLOCK)):
+                continue
+            if strict_mode:
                 bad.append(sym(r))
+                continue
+            # governance-aware: only a genuine contradiction if the row is
+            # STILL marked actionable/investable despite carrying the block.
+            if has_action:
+                still_actionable = _norm_token(_resolve(r, k2h, _K_ACTION)) == "INVEST"
+            else:
+                still_actionable = _norm_token(_resolve(r, k2h, _K_INVEST)) == "INVESTABLE"
+            if still_actionable:
+                bad.append(sym(r))
+        mode_note = "strict" if strict_mode else "governance-aware"
         out.append(CheckResult(page, "gate.buy_has_no_block_reason",
                                "FAIL" if bad else "PASS", count=len(bad), examples=bad,
-                               detail="BUY-family reco with a non-empty block_reason" if bad else ""))
+                               detail=(f"BUY-family reco still marked actionable with a non-empty block_reason [{mode_note}]" if bad else "")))
     else:
         out.append(CheckResult(page, "gate.buy_has_no_block_reason", "SKIP",
                                detail="block_reason or recommendation column not present"))
