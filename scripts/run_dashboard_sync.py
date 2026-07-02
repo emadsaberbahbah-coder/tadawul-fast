@@ -3,9 +3,44 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.10.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.18.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.18.0 fix — MARKET-GATEWAY OVERRIDE + CANCELLATION-SAFE WRITE-THEN-TRIM
+              (fixes the 2026-07-02 02:47 run: job cancelled at the 25-min
+              ceiling mid-run, leaving Mutual_Funds + Commodities_FX EMPTY and
+              Market_Leaders degraded)
+- WHY (diagnosed from the run-28554325006 sync log): with the Render env
+  TFB_ANALYSIS_ENGINE_TIMEOUT_SEC now deleted (the correct fix for the
+  placeholder-wipe), a BIG market-page request to /v1/analysis/sheet-rows runs
+  unbounded and dies as a gateway 502 (the documented pre-FIX-3 symptom).
+  Because TFB_SYNC_MARKET_ANALYSIS_GATEWAY=1 routes the four market pages
+  ANALYSIS-FIRST, every page paid 502s + a 404 candidate walk before landing on
+  /v1/advanced/sheet-rows 200 — the run blew past timeout-minutes:25 and GitHub
+  CANCELLED it. And the write path was clear_from() THEN write_table(): a
+  cancellation landing between the two leaves a CLEARED, NEVER-REWRITTEN page.
+  That is exactly how Mutual_Funds and Commodities_FX went empty.
+- FIX 1 (TFB_SYNC_MARKET_GATEWAY, default unset): a GENERIC market-page gateway
+  override consulted by _effective_gateway BEFORE the v6.10.0 boolean. Value
+  "advanced" routes the four ranked market pages /v1/advanced/sheet-rows-FIRST —
+  the endpoint that answered 200 on EVERY attempt in the failed run's log and
+  the same route the user's manual "Refresh" uses (his correctness reference).
+  "analysis" / "enriched" / "argaam" select those chains; unset/blank falls
+  through to the v6.10.0 boolean then the TaskSpec default (byte-identical
+  routing). Honest trade-off, stated: the analysis router's global-rank + dedup
+  passes do not run on the sync copy while "advanced" is selected; the analysis
+  endpoints remain fallback candidates in the advanced chain.
+- FIX 2 (TFB_SYNC_WRITE_THEN_TRIM, default ON): the clear-before-write pair is
+  reordered to WRITE-then-TRIM. write_table() (one atomic values.update)
+  overwrites the block in place FIRST; only then are the leftovers trimmed with
+  two targeted clears — the tail BELOW the new block (full width) and the tail
+  RIGHT of the header width (full depth). A cancellation now leaves either the
+  OLD page or the NEW page (worst case: new page + a stale tail that self-heals
+  on the next run) — NEVER an empty page. Set 0/false/off/no to restore the
+  exact v6.17.0 clear-then-write order. New helpers: _market_gateway_override,
+  _write_then_trim_enabled, _a1_col_to_idx, _idx_to_a1_col, _trim_after_write.
+  No schema / payload-key / endpoint-list / guard change.
 
 v6.17.0 fix — market-page SYMBOL BATCHING (fixes empty market pages + 502s under
               Yahoo rate-limiting)
@@ -372,7 +407,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.17.0"
+SCRIPT_VERSION = "6.18.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1771,6 +1806,82 @@ def _market_analysis_gateway_enabled() -> bool:
     return raw in {"1", "true", "yes", "y", "on", "enabled", "enable"}
 
 
+def _market_gateway_override() -> str:
+    """v6.18.0 (Fix 1): generic gateway override for the four ranked market
+    pages. TFB_SYNC_MARKET_GATEWAY set to one of analysis/advanced/enriched/
+    argaam selects that candidate chain for Market_Leaders / Global_Markets /
+    Commodities_FX / Mutual_Funds. Unset/blank/unknown -> "" (no override; the
+    v6.10.0 TFB_SYNC_MARKET_ANALYSIS_GATEWAY boolean then applies, and with
+    that off too the TaskSpec default routes — byte-identical to v6.17.0)."""
+    raw = (os.getenv("TFB_SYNC_MARKET_GATEWAY", "") or "").strip().lower()
+    return raw if raw in {"analysis", "ai", "advanced", "enriched", "argaam"} else ""
+
+
+def _write_then_trim_enabled() -> bool:
+    """v6.18.0 (Fix 2): cancellation-safe write ordering master switch. Default
+    ON: write_table() runs FIRST (one atomic values.update over the old block),
+    then the stale tail below/right of the new rectangle is trimmed. A job
+    cancellation can then never leave a cleared-but-unwritten (EMPTY) page —
+    the 2026-07-02 Mutual_Funds / Commodities_FX wipe. Set
+    TFB_SYNC_WRITE_THEN_TRIM=0/false/off/no to restore the exact v6.17.0
+    clear-then-write order."""
+    return (os.getenv("TFB_SYNC_WRITE_THEN_TRIM") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _a1_col_to_idx(col: str) -> int:
+    """v6.18.0: A -> 1, B -> 2, ..., Z -> 26, AA -> 27. Empty/invalid -> 1."""
+    n = 0
+    for ch in (col or "").strip().upper():
+        if not ("A" <= ch <= "Z"):
+            return 1
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n if n > 0 else 1
+
+
+def _idx_to_a1_col(idx: int) -> str:
+    """v6.18.0: 1 -> A, 26 -> Z, 27 -> AA. idx < 1 -> A."""
+    idx = int(idx) if idx and idx > 0 else 1
+    out = ""
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        out = chr(ord("A") + rem) + out
+    return out
+
+
+def _trim_after_write(
+    sheets: "SheetsWriter",
+    spreadsheet_id: str,
+    sheet_name: str,
+    start_cell: str,
+    n_header: int,
+    n_rows: int,
+    n_cols: int,
+) -> List[str]:
+    """v6.18.0 (Fix 2): after write_table() has overwritten the block in place,
+    clear ONLY the leftovers from a previously-larger table: (a) the tail BELOW
+    the new block, full width from the start column; (b) the tail RIGHT of the
+    new header width, full depth from the start row. Both are best-effort —
+    a failure is reported as a warning string, never raised, because the NEW
+    data is already on the sheet and a stale tail self-heals on the next run."""
+    warnings: List[str] = []
+    m = re.match(r"^\$?([A-Za-z]+)\$?(\d+)$", (start_cell or "").strip())
+    if not m:
+        return warnings
+    col0 = _a1_col_to_idx(m.group(1))
+    row0 = int(m.group(2))
+    below_row = row0 + max(0, int(n_header)) + max(0, int(n_rows))
+    try:
+        sheets.clear_from(spreadsheet_id, sheet_name, f"{_idx_to_a1_col(col0)}{below_row}")
+    except Exception as e:
+        warnings.append(f"Trim-below failed (stale tail rows may remain; self-heals next run): {e}")
+    if n_cols and n_cols > 0:
+        try:
+            sheets.clear_from(spreadsheet_id, sheet_name, f"{_idx_to_a1_col(col0 + int(n_cols))}{row0}")
+        except Exception as e:
+            warnings.append(f"Trim-right failed (stale tail columns may remain; self-heals next run): {e}")
+    return warnings
+
+
 def _effective_gateway(task: TaskSpec) -> str:
     """v6.10.0: the gateway actually used for a task. When the market-analysis
     routing toggle is ON, the four cross-sectional market pages resolve to
@@ -1779,6 +1890,11 @@ def _effective_gateway(task: TaskSpec) -> str:
     unchanged. The "analysis" candidate chain ends at the enriched endpoints, so
     an analysis-route outage falls back to the prior path (the page loses the
     rank/dedup for that cycle -- never a failed write)."""
+    # v6.18.0 (Fix 1): generic override wins when set; the v6.10.0 boolean and
+    # the TaskSpec default apply unchanged when it is unset/blank.
+    _ovr = _market_gateway_override()
+    if _ovr and task.sheet_name in _RANKED_MARKET_PAGES:
+        return _ovr
     if _market_analysis_gateway_enabled() and task.sheet_name in _RANKED_MARKET_PAGES:
         return "analysis"
     return task.gateway
@@ -2348,7 +2464,14 @@ async def _run_one_task(
             return res
         # ---------------------------------------------------------------------
 
-        if clear_before_write:
+        # v6.18.0 (Fix 2): cancellation-safe ordering. Legacy clear-then-write
+        # leaves an EMPTY page when the job dies between the two calls (the
+        # 2026-07-02 Mutual_Funds / Commodities_FX wipe). Default is now
+        # WRITE-then-TRIM: the atomic values.update overwrites in place first,
+        # then _trim_after_write clears only the stale tail below/right.
+        # TFB_SYNC_WRITE_THEN_TRIM=0 restores the exact v6.17.0 order.
+        _trim_mode = clear_before_write and _write_then_trim_enabled()
+        if clear_before_write and not _trim_mode:
             try:
                 sheets.clear_from(spreadsheet_id, task.sheet_name, start_cell)
             except Exception as e:
@@ -2357,6 +2480,15 @@ async def _run_one_task(
         try:
             written = sheets.write_table(spreadsheet_id, task.sheet_name, start_cell, headers, rows_matrix)
             res.rows_written = int(written)
+            if _trim_mode:
+                for _w in _trim_after_write(
+                    sheets, spreadsheet_id, task.sheet_name, start_cell,
+                    n_header=(1 if headers else 0),
+                    n_rows=len(rows_matrix or []),
+                    n_cols=len(headers or []),
+                ):
+                    res.warnings.append(_w)
+                    logger.warning(_w)
 
             # schema-only (0 rows) => success
             if not rows_matrix:
