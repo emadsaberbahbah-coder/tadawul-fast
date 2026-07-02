@@ -149,6 +149,15 @@ env:
   # Render backend var. Reversible: set "0" (or remove) to restore the
   # per-page configured gateway.
   TFB_SYNC_MARKET_ANALYSIS_GATEWAY: "1"
+  # (2026-07-02) v6.18.0 GENERIC market-gateway override — takes precedence over
+  # the boolean above. "advanced" routes the four market pages
+  # /v1/advanced/sheet-rows-FIRST: the endpoint that answered 200 on every
+  # attempt in the failed run-28554325006 log (the /v1/analysis route now 502s
+  # on big pages since the unbounded-engine change, and the resulting 404
+  # candidate walk blew the job past its 25-min ceiling — the cancellation that
+  # left Mutual_Funds/Commodities_FX empty). Same route as the manual sheet
+  # Refresh. Reversible: remove this line to fall back to the boolean above.
+  TFB_SYNC_MARKET_GATEWAY: "advanced"
 
 jobs:
   # =============================================================================
@@ -260,7 +269,11 @@ jobs:
     name: 🚀 Data Sync
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 25
+    # (2026-07-02) 25 -> 45: the 25-min ceiling CANCELLED run 28554325006
+    # mid-write and wiped two pages. v6.18.0's advanced-first routing makes the
+    # run much faster, but the ceiling must never again be the thing that kills
+    # a run between a clear and a write.
+    timeout-minutes: 45
     needs: preflight-validation
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight-validation.outputs.validated == 'true' }}
 
