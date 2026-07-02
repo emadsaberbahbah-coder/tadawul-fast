@@ -3,9 +3,35 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.18.1)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.18.2)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.18.2 fix — PARTIAL-FETCH SHRINK GUARD (the Market_Leaders universe ratchet)
+- WHY (diagnosed from the owner's two workbook exports of 2026-07-02): between
+  the 13:40 and 16:xx exports, Market_Leaders shrank 288 -> 163 symbols (-125,
+  all .SR) with no manual deletion. MECHANISM: the sync reads the page's OWN
+  Symbol column as its request universe; under midday Yahoo throttling some
+  v6.17.0 symbol-batches fail and only the successful batches' rows are
+  accumulated. The v6.9.0 empty-guard protects ONLY the zero-rows case — a
+  PARTIAL result (163 of 288) passes it, the shorter table is written, the
+  tail is trimmed, and because the sheet IS the symbol source the failed
+  symbols are gone PERMANENTLY. Each throttled cycle can ratchet the universe
+  smaller. That is a silent, compounding data loss.
+- FIX: a MIN-COVERAGE guard beside the empty-guard: when a page EXPECTS rows,
+  was requested with a concrete symbol list, and the fetch returned fewer than
+  TFB_SYNC_MIN_COVERAGE_PCT percent of the requested symbols (default 70),
+  the write is SKIPPED (status="skipped", neither write nor trim), the
+  last-good rows — including every symbol the throttled batches missed — are
+  preserved, and a warning names the coverage ratio. Self-heals on the next
+  healthy cycle exactly like the empty-guard. Legitimate small shrinks
+  (delistings, curation) pass untouched below the threshold. Page-driven
+  requests (no symbol list) and non-expects_rows pages are exempt (no
+  denominator / already covered). Set TFB_SYNC_MIN_COVERAGE_PCT=0 to disable
+  and restore v6.18.1 byte-identical behavior. New helper:
+  _min_coverage_pct(). RECOVERY of the already-lost 125 symbols is a one-time
+  sheet paste (the owner holds the extracted list); this guard prevents
+  recurrence, it cannot resurrect rows already trimmed.
 
 v6.18.1 fix — TRANSIENT-WRITE RETRY + GRID-LIMIT-SILENT TRIM (from the
               2026-07-02 09:02 run-28568344788 log: 4/5 pages green, exit 2)
@@ -429,7 +455,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.18.1"
+SCRIPT_VERSION = "6.18.2"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1151,6 +1177,19 @@ def _page_limit_fix_enabled() -> bool:
     page-driven page — Market_Leaders, Global_Markets, Commodities_FX,
     Mutual_Funds — to a single written row)."""
     return (os.getenv("TFB_SYNC_PAGE_LIMIT_FIX") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _min_coverage_pct() -> float:
+    """v6.18.2: minimum fetched-rows coverage (percent of REQUESTED symbols)
+    below which a partial fetch is treated like a degenerate one — the write
+    is skipped and last-good rows are preserved (the Market_Leaders 288->163
+    universe ratchet of 2026-07-02). Default 70. 0 disables the guard and
+    restores v6.18.1 behavior exactly."""
+    try:
+        v = float((os.getenv("TFB_SYNC_MIN_COVERAGE_PCT") or "70").strip())
+    except Exception:
+        v = 70.0
+    return max(0.0, min(100.0, v))
 
 
 def _empty_guard_enabled() -> bool:
@@ -2539,6 +2578,34 @@ async def _run_one_task(
                 f"Empty fetch (headers present, 0 data rows) on '{task.sheet_name}', "
                 f"which expects rows. Skipping clear+write to PRESERVE last-good rows; "
                 f"self-heals on the next healthy sync."
+            )
+            res.status = "skipped"
+            res.rows_written = 0
+            res.rows_failed = 0
+            res.warnings.append(msg)
+            logger.warning(msg)
+            return res
+        # ---------------------------------------------------------------------
+
+        # --- Partial-fetch shrink guard (v6.18.2) ----------------------------
+        # The empty-guard above catches ZERO rows; this catches the throttled
+        # PARTIAL fetch (some symbol-batches failed) that would otherwise write
+        # a shorter table, trim the tail, and — because the sheet is the symbol
+        # source — permanently delete the missed symbols (the 2026-07-02
+        # Market_Leaders 288->163 ratchet). Requested-symbol pages only; the
+        # write is skipped and last-good rows self-heal on the next healthy run.
+        _cov_floor = _min_coverage_pct()
+        if (task.expects_rows and _cov_floor > 0.0 and symbols
+                and rows_matrix is not None
+                and len(rows_matrix) < (len(symbols) * _cov_floor / 100.0)):
+            _cov = 100.0 * len(rows_matrix) / max(1, len(symbols))
+            msg = (
+                f"Partial fetch on '{task.sheet_name}': {len(rows_matrix)} row(s) "
+                f"for {len(symbols)} requested symbol(s) ({_cov:.0f}% coverage, "
+                f"floor {_cov_floor:.0f}%). Skipping write to PRESERVE last-good "
+                f"rows — writing this would permanently drop the missed symbols "
+                f"from the page (it is its own symbol source). Self-heals on the "
+                f"next healthy sync."
             )
             res.status = "skipped"
             res.rows_written = 0
