@@ -1,12 +1,33 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/opportunity_builder.py — Opportunity Engine for Top_10_Investments
-Version: 1.0.18  (TFB Final Execution Plan v5.0 — Phase P2;
+Version: 1.0.19  (TFB Final Execution Plan v5.0 — Phase P2;
                  Engineering Audit Phase 1 — unfunded-ticket reclass + optional
                  engine-ROI ordering + minimum-ticket floor + floor near-miss
                  labeling + issuer-level cross-listing dedup + duplicate-issuer
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
+
+v1.0.19 [PANEL-DEFAULT RECALIBRATION — Max Selected 3->10, Max Per Market
+4->10. WHY: the owner's standing instruction (2026-07-02) is a TEN-pick
+Selected list. Two DEFAULT_CRITERIA literals blocked that as the standard:
+"max_selected": 3 capped the list at three even when ten candidates qualified
+and were fundable, and "max_per_market": 4 made ten UNREACHABLE for the
+KSA-heavy universe regardless of max_selected (four picks from any one market
+was the hard ceiling). Both defaults now read 10; the secondary fallback in
+the empty-result KPI block (criteria.get("max_selected", 3)) is aligned to 10
+so an empty run reports the same ceiling. "max_per_sector" stays at 2 ON
+PURPOSE — it is the remaining diversification guard, and with 5+ qualifying
+sectors it does not block a ten-pick list; raise it via the panel cell only if
+the Selected list stalls short with a sector-cap audit reason. NOTE these are
+FALLBACK defaults: the _Lists_Config TFB_PANEL_DEFAULTS panel (T10: Max
+Selected / T10: Max Per Market) is sent with every cockpit refresh and always
+wins when present — the panel cells remain the runtime control and the
+reversibility path (set the cells back to 3 / 4 to restore the old behaviour
+without any deploy). No gates, no ranking logic, no schema change; every
+qualification / funding / min-ticket rule applies unchanged, so ten is a
+CEILING, never a forced fill. Two literals + one fallback changed; zero
+functions added or removed.]
 
 v1.0.18 [A2 SECTOR-MAP SINGLE-SOURCE — no behaviour change. WHY: the six-entry
 Yahoo->GICS sector map (_YAHOO_TO_GICS_SECTOR, added v1.0.13) was a PRIVATE copy
@@ -438,7 +459,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.18"
+OPPORTUNITY_BUILDER_VERSION = "1.0.19"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -561,7 +582,7 @@ OPPORTUNITY_BUILDER_VERSION = "1.0.18"
 
 DEFAULT_CRITERIA = {
     "universe_scope": "All Main Sheets",
-    "max_selected": 3,
+    "max_selected": 10,
     "period_months": 12,
     "required_roi_pct": 12.0,
     "required_ann_roi_pct": 10.0,
@@ -574,7 +595,7 @@ DEFAULT_CRITERIA = {
     "allow_negative_news": False,
     "allow_negative_sector": False,
     "max_per_sector": 2,
-    "max_per_market": 4,
+    "max_per_market": 10,
     "include_portfolio_holdings": False,
     "base_currency": "SAR",
     # sizing / mechanics (env-overridable; see policy block)
@@ -2439,7 +2460,7 @@ def _skeleton(status, message, criteria):
         "message": message,
         "kpis": {"deployable_sar": 0, "expected_gain_12m_sar": 0,
                  "selected_count": 0,
-                 "max_selected": criteria.get("max_selected", 3),
+                 "max_selected": criteria.get("max_selected", 10),
                  "blended_reliability": None, "blended_rr": None,
                  "scanned": 0, "passed": 0, "capital_unallocated_sar": 0},
         "selected": [],
