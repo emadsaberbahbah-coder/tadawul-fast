@@ -3,9 +3,31 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.18.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.18.1)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.18.1 fix — TRANSIENT-WRITE RETRY + GRID-LIMIT-SILENT TRIM (from the
+              2026-07-02 09:02 run-28568344788 log: 4/5 pages green, exit 2)
+- WHY 1: GLOBAL_MARKETS failed with "Write failed: EOF occurred in violation of
+  protocol (_ssl.c:2437)" — a transient SSL drop during the single ~3,000-row
+  values.update. write_table() had NO retry, so one dropped connection failed
+  the whole page (v6.18.0's write-then-trim correctly preserved the old rows —
+  under the old clear-then-write this same failure would have EMPTIED the tab).
+  FIX: write_table() retries the values.update up to TFB_SYNC_WRITE_RETRIES
+  times (default 3 attempts total) with 2s/5s backoff, ONLY when the error
+  matches a known-transient marker (SSL EOF, connection reset/aborted, timeout,
+  HTTP 429/500/502/503, Broken pipe). values.update is idempotent (same block,
+  same range) so a retry after an ambiguous EOF is safe. Non-transient errors
+  raise immediately, exactly as before. TFB_SYNC_WRITE_RETRIES=1 restores the
+  v6.18.0 single-attempt behavior byte-identically.
+- WHY 2: the v6.18.0 trim-right warned every run on exactly-115-column sheets:
+  "Range (Commodities_FX!DL1:ZZ) exceeds grid limits. Max columns: 115".
+  Trimming from column 116 of a 115-column grid is a NO-OP by definition —
+  nothing can be stale beyond the grid — but the Sheets API answers 400 instead
+  of succeeding quietly. FIX: _trim_after_write treats "exceeds grid limits"
+  as silent success for BOTH trims (below + right); every other trim failure
+  still surfaces as a warning. New helper: _is_transient_write_error.
 
 v6.18.0 fix — MARKET-GATEWAY OVERRIDE + CANCELLATION-SAFE WRITE-THEN-TRIM
               (fixes the 2026-07-02 02:47 run: job cancelled at the 25-min
@@ -407,7 +429,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.18.0"
+SCRIPT_VERSION = "6.18.1"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -958,12 +980,31 @@ class SheetsWriter:
 
         rng = f"{self._safe_sheet_a1(sheet_name)}!{start_a1}"
         body = {"majorDimension": "ROWS", "values": values}
-        svc.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=rng,
-            valueInputOption="RAW",
-            body=body,
-        ).execute()
+        # v6.18.1 (WHY 1): retry the atomic update on TRANSIENT transport
+        # failures only (SSL EOF, reset, timeout, 429/5xx). values.update is
+        # idempotent — same block, same range — so a retry after an ambiguous
+        # mid-response EOF cannot corrupt the sheet. Non-transient errors raise
+        # on the first attempt exactly as v6.18.0 did.
+        _attempts = _write_retry_attempts()
+        _backoffs = (2.0, 5.0, 5.0, 5.0)
+        for _try in range(_attempts):
+            try:
+                svc.spreadsheets().values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range=rng,
+                    valueInputOption="RAW",
+                    body=body,
+                ).execute()
+                break
+            except Exception as _we:
+                if _try + 1 >= _attempts or not _is_transient_write_error(_we):
+                    raise
+                logger.warning(
+                    f"write_table transient failure on '{sheet_name}' "
+                    f"(attempt {_try + 1}/{_attempts}); retrying in "
+                    f"{_backoffs[min(_try, len(_backoffs) - 1)]:.0f}s: {_we}"
+                )
+                time.sleep(_backoffs[min(_try, len(_backoffs) - 1)])
 
         return max(0, len(values) - (1 if hdr else 0))
 
@@ -1817,6 +1858,43 @@ def _market_gateway_override() -> str:
     return raw if raw in {"analysis", "ai", "advanced", "enriched", "argaam"} else ""
 
 
+_TRANSIENT_WRITE_MARKERS = (
+    "eof occurred",            # ssl.SSLEOFError text
+    "ssl",                     # generic ssl-layer failures
+    "connection reset",
+    "connection aborted",
+    "broken pipe",
+    "timed out",
+    "timeout",
+    "429",
+    "500",
+    "502",
+    "503",
+    "backend error",
+    "internal error",
+    "the service is currently unavailable",
+)
+
+
+def _is_transient_write_error(err: Exception) -> bool:
+    """v6.18.1 (WHY 1): True when a Sheets write failure looks like a transient
+    transport/quota condition worth retrying (SSL EOF, reset, timeout,
+    429/5xx). Conservative substring match on the error text; anything not
+    matching raises immediately as before."""
+    s = str(err or "").lower()
+    return any(m in s for m in _TRANSIENT_WRITE_MARKERS)
+
+
+def _write_retry_attempts() -> int:
+    """v6.18.1 (WHY 1): total values.update attempts (default 3; min 1, max 5).
+    TFB_SYNC_WRITE_RETRIES=1 restores the v6.18.0 single-attempt behavior."""
+    try:
+        n = int((os.getenv("TFB_SYNC_WRITE_RETRIES") or "3").strip())
+    except Exception:
+        n = 3
+    return max(1, min(5, n))
+
+
 def _write_then_trim_enabled() -> bool:
     """v6.18.0 (Fix 2): cancellation-safe write ordering master switch. Default
     ON: write_table() runs FIRST (one atomic values.update over the old block),
@@ -1870,15 +1948,21 @@ def _trim_after_write(
     col0 = _a1_col_to_idx(m.group(1))
     row0 = int(m.group(2))
     below_row = row0 + max(0, int(n_header)) + max(0, int(n_rows))
+    # v6.18.1 (WHY 2): a trim that starts BEYOND the sheet's grid is a no-op by
+    # definition (nothing can be stale outside the grid), but the Sheets API
+    # answers 400 "exceeds grid limits" instead of succeeding quietly. Treat
+    # that specific answer as silent success; every other failure still warns.
     try:
         sheets.clear_from(spreadsheet_id, sheet_name, f"{_idx_to_a1_col(col0)}{below_row}")
     except Exception as e:
-        warnings.append(f"Trim-below failed (stale tail rows may remain; self-heals next run): {e}")
+        if "exceeds grid limits" not in str(e).lower():
+            warnings.append(f"Trim-below failed (stale tail rows may remain; self-heals next run): {e}")
     if n_cols and n_cols > 0:
         try:
             sheets.clear_from(spreadsheet_id, sheet_name, f"{_idx_to_a1_col(col0 + int(n_cols))}{row0}")
         except Exception as e:
-            warnings.append(f"Trim-right failed (stale tail columns may remain; self-heals next run): {e}")
+            if "exceeds grid limits" not in str(e).lower():
+                warnings.append(f"Trim-right failed (stale tail columns may remain; self-heals next run): {e}")
     return warnings
 
 
