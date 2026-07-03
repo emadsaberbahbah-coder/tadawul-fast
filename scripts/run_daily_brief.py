@@ -34,6 +34,36 @@ ENV
     TFB_MAIL_SMTP_PORT   default: 587 (STARTTLS); 465 uses implicit SSL
     TFB_BRIEF_SEND       set to "1" to send without passing --send
 
+v1.3.0 — DECISION-GRADE VISUAL UPGRADE (owner request, 2026-07-03)
+    Adds email-safe visual analytics built ONLY from columns verified 100%%
+    populated in the live workbook (audit of the 2026-07-03 export):
+      * 1M / 3M / 12M OUTLOOK STRIP under every ADD action and every Best-new-buy
+        row: Expected ROI 1M/3M/12M + Forecast Price 1M/3M/12M + reliability,
+        color-coded. Framed honestly as the engine's valuation path — targets
+        with stated reliability, never predictions (per the TFB honest-framing
+        constraint; flow/candle signals carry no proven forward edge).
+      * "YOUR BOOK AT A GLANCE": a diverging P&L bar chart (one bar per holding,
+        red left / green right of a zero axis, scaled to the largest move) plus
+        each holding's weight — the fastest possible read of where the pain and
+        the winners sit.
+      * FUNDAMENTALS SNAPSHOT per Best-new-buy: EPS (TTM), Market Cap (compact
+        T/B/M), Dividend Yield, Profit Margin — the income-statement-level facts
+        available on the 115-column schema today (a full revenue->net-income
+        statement is NOT on the sheets; that would be backend work).
+      * 52-WEEK RANGE BAR per Best-new-buy: where today's price sits in the
+        52W range (position marker on a track).
+      * MARKET BREADTH BAR in the per-market strip (investable share of names).
+    TECHNIQUE: all "charts" are pure HTML/CSS table bars — email clients strip
+    JavaScript and SVG (Gmail especially), so scripted/vector charts silently
+    vanish; nested-table bars render in every major client with zero new
+    dependencies and no image attachments. New model layer:
+    extract_symbol_metrics() builds a symbol -> metrics lookup from My_Portfolio
+    + the four market pages (My_Portfolio wins on conflict); render helpers
+    _outlook_strip/_glance_block/_range52_bar/_fund_line/_mcap_compact/
+    _num_str2/_roi_color. Plaintext part gains matching 1M/3M lines. Every
+    existing section, the approved masthead design, and the v1.2.0 hero
+    variants are carried verbatim.
+
 v1.2.0 — NO-CANDIDATE HERO FIX
     When the decision layer produced no high-confidence ADD, the HTML hero still
     rendered the buy-day template with the em-dash placeholder: "then add —" /
@@ -54,7 +84,7 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import argparse
 import datetime as _dt
@@ -367,6 +397,58 @@ def extract_market_page(rows: List[List[Any]], top_n: int = 5) -> Dict[str, Any]
     return {"total": total, "invest": len(invest), "top": invest[:top_n]}
 
 
+def extract_symbol_metrics(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Dict[str, Any]]:
+    """v1.3.0: symbol -> metrics lookup for the visual sections.
+
+    Scans My_Portfolio FIRST (so a held name's own row wins), then the four
+    market pages, and collects the columns the 2026-07-03 export audit showed
+    fully populated: price, Expected ROI 1M/3M/12M, Forecast Price 1M/3M/12M,
+    reliability, EPS (TTM), Market Cap, Dividend Yield, Profit Margin, 52W
+    High/Low, Sector. Fail-safe: unreadable pages/columns simply contribute
+    nothing; a missing symbol renders no strip (never a broken layout)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    numeric = ("price", "roi1m", "roi3m", "roi12m", "fp1m", "fp3m", "fp12m",
+               "rel", "eps", "mcap", "divy", "margin", "hi52", "lo52")
+    for page in ["My_Portfolio"] + MARKET_PAGES:
+        rows = _pad(pages_data.get(page, []) or [])
+        h = _find_header(rows, ("symbol", "name"))
+        if h < 0:
+            continue
+        hdr = rows[h]
+        ci = {
+            "symbol": _col_index(hdr, "Symbol"),
+            "price": _col_index(hdr, "Current Price"),
+            "roi1m": _col_index(hdr, "Expected ROI 1M"),
+            "roi3m": _col_index(hdr, "Expected ROI 3M"),
+            "roi12m": _col_index(hdr, "Expected ROI 12M"),
+            "fp1m": _col_index(hdr, "Forecast Price 1M"),
+            "fp3m": _col_index(hdr, "Forecast Price 3M"),
+            "fp12m": _col_index(hdr, "Forecast Price 12M"),
+            "rel": _col_index(hdr, "Forecast Reliability Score"),
+            "eps": _col_index(hdr, "EPS (TTM)", "EPS"),
+            "mcap": _col_index(hdr, "Market Cap"),
+            "divy": _col_index(hdr, "Dividend Yield"),
+            "margin": _col_index(hdr, "Profit Margin"),
+            "hi52": _col_index(hdr, "52W High"),
+            "lo52": _col_index(hdr, "52W Low"),
+            "sector": _col_index(hdr, "Sector"),
+        }
+        if ci["symbol"] is None:
+            continue
+        for r in rows[h + 1:]:
+            sym = _s(_cell(r, ci["symbol"])).upper()
+            if not sym or sym == "SYMBOL":
+                continue
+            if sym in out:
+                continue
+            m: Dict[str, Any] = {}
+            for k in numeric:
+                m[k] = _num(_cell(r, ci[k]))
+            m["sector"] = _s(_cell(r, ci["sector"]))
+            out[sym] = m
+    return out
+
+
 # ----------------------------------------------------------------------------- #
 # Build model (parse all pages)
 # ----------------------------------------------------------------------------- #
@@ -375,7 +457,8 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     held = {r["symbol"].upper() for grp in ("sell", "trim", "add", "hold") for r in decision[grp]}
     top10 = extract_top10(pages_data.get(PAGE_TOP10, []), exclude=held)
     market = {p: extract_market_page(pages_data.get(p, [])) for p in MARKET_PAGES}
-    return {"decision": decision, "top10": top10, "market": market}
+    metrics = extract_symbol_metrics(pages_data)  # v1.3.0 visual sections
+    return {"decision": decision, "top10": top10, "market": market, "metrics": metrics}
 
 
 # ----------------------------------------------------------------------------- #
@@ -406,21 +489,147 @@ def _action_row(rec: Dict[str, Any], label: str, color: str, bg: str, border: st
       </td></tr></table>"""
 
 
-def _opp_row(rank: int, p: Dict[str, Any]) -> str:
+def _opp_row(rank: int, p: Dict[str, Any], metrics: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
     conf = p["conf"].title()
     cc = ADD_C if conf.lower() == "high" else (TRIM_C if conf.lower() in ("medium", "moderate") else "#888")
-    return f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:7px; background:#E9F5EF; border:1px solid #C7E4D5;"><tr>
-      <td style="padding:12px 12px; width:34px;"><div style="width:24px; height:24px; background:{ADD_C}; color:#fff; border-radius:50%; text-align:center; line-height:24px; font-family:{SANS}; font-size:12px; font-weight:bold;">{rank}</div></td>
-      <td style="padding:11px 6px; font-family:{SANS};"><div style="font-size:14px; color:#1A1A1A;"><strong>{_esc(p['symbol'])}</strong> <span style="color:#777; font-size:12px;">{_esc(p['name'])[:30]}</span></div><div style="font-size:11px; color:#8A8A8A; margin-top:2px;">{_esc(p['sector'])} · {_esc(p['market'])}</div></td>
-      <td align="right" style="padding:11px 14px; font-family:{SANS}; white-space:nowrap;"><div style="font-size:13px; color:#0E7C5A;"><strong>{_pct(p['roi'],0)} to fair value</strong></div><div style="font-size:11px; color:#888;">Reliability {_num_str(p['rel'])} · <span style="color:{cc};">{conf}</span></div></td></tr></table>"""
+    m = (metrics or {}).get(p["symbol"].upper())  # v1.3.0
+    extras = _fund_line(m) + _range52_bar(m)      # v1.3.0
+    return f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:0; background:#E9F5EF; border:1px solid #C7E4D5;"><tr>
+      <td style="padding:12px 12px; width:34px; vertical-align:top;"><div style="width:24px; height:24px; background:{ADD_C}; color:#fff; border-radius:50%; text-align:center; line-height:24px; font-family:{SANS}; font-size:12px; font-weight:bold;">{rank}</div></td>
+      <td style="padding:11px 6px; font-family:{SANS};"><div style="font-size:14px; color:#1A1A1A;"><strong>{_esc(p['symbol'])}</strong> <span style="color:#777; font-size:12px;">{_esc(p['name'])[:30]}</span></div><div style="font-size:11px; color:#8A8A8A; margin-top:2px;">{_esc(p['sector'])} · {_esc(p['market'])}</div>{extras}</td>
+      <td align="right" style="padding:11px 14px; font-family:{SANS}; white-space:nowrap; vertical-align:top;"><div style="font-size:13px; color:#0E7C5A;"><strong>{_pct(p['roi'],0)} to fair value</strong></div><div style="font-size:11px; color:#888;">Reliability {_num_str(p['rel'])} · <span style="color:{cc};">{conf}</span></div></td></tr></table>{_outlook_strip(m)}<div style="height:7px; font-size:0; line-height:0;">&nbsp;</div>"""
 
 
 def _num_str(x: Optional[float]) -> str:
     return "—" if x is None else f"{x:.0f}"
 
 
+def _num_str2(x: Optional[float]) -> str:
+    return "—" if x is None else f"{x:,.2f}"
+
+
+def _mcap_compact(x: Optional[float]) -> str:
+    """Compact market-cap: 3.2T / 850.4B / 45.0M."""
+    if x is None:
+        return "—"
+    ax = abs(x)
+    for div, suf in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if ax >= div:
+            return f"{x / div:,.1f}{suf}"
+    return f"{x:,.0f}"
+
+
+def _roi_color(x: Optional[float]) -> str:
+    if x is None:
+        return "#888"
+    v = x * 100.0 if abs(x) <= 1.5 else x
+    return ADD_C if v > 0 else (SELL_C if v < 0 else "#888")
+
+
+def _outlook_strip(m: Optional[Dict[str, Any]]) -> str:
+    """v1.3.0: 1M/3M/12M engine valuation path + reliability. HTML-only."""
+    if not m:
+        return ""
+    cells = []
+    for label, rk, fk in (("1M", "roi1m", "fp1m"), ("3M", "roi3m", "fp3m"), ("12M", "roi12m", "fp12m")):
+        roi, fp = m.get(rk), m.get(fk)
+        if roi is None and fp is None:
+            continue
+        cells.append(
+            f'<td width="27%" style="padding:7px 12px; font-family:{SANS}; border-right:1px solid #E3EBE6;">'
+            f'<div style="font-size:9px; color:#8A958E; letter-spacing:1.5px;">{label}&nbsp;OUTLOOK</div>'
+            f'<div style="font-size:13px; color:{_roi_color(roi)}; margin-top:1px;"><strong>{_pct(roi, 1)}</strong></div>'
+            f'<div style="font-size:10px; color:#9AA39C;">target {_num_str2(fp)}</div></td>')
+    if not cells:
+        return ""
+    rel = m.get("rel")
+    cells.append(
+        f'<td style="padding:7px 12px; font-family:{SANS};">'
+        f'<div style="font-size:9px; color:#8A958E; letter-spacing:1.5px;">RELIABILITY</div>'
+        f'<div style="font-size:13px; color:{STEEL}; margin-top:1px;"><strong>{_num_str(rel)}</strong></div>'
+        f'<div style="font-size:10px; color:#9AA39C;">valuation path, not a prediction</div></td>')
+    return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="margin:-6px 0 8px 0; background:#F7FBF9; border:1px solid #DCE8E0; border-top:0;">'
+            f'<tr>{"".join(cells)}</tr></table>')
+
+
+def _fund_line(m: Optional[Dict[str, Any]]) -> str:
+    """v1.3.0: income-statement-level facts available on the schema today."""
+    if not m:
+        return ""
+    bits = []
+    if m.get("eps") is not None:
+        bits.append(f"EPS (TTM) {_num_str2(m['eps'])}")
+    if m.get("mcap") is not None:
+        bits.append(f"Mkt cap {_mcap_compact(m['mcap'])}")
+    if m.get("divy") is not None:
+        bits.append(f"Div yield {_pct(m['divy'], 1).lstrip('+')}")
+    if m.get("margin") is not None:
+        bits.append(f"Profit margin {_pct(m['margin'], 1).lstrip('+')}")
+    if not bits:
+        return ""
+    return (f'<div style="font-family:{SANS}; font-size:11px; color:#6B7A6F; margin-top:4px;">'
+            f'{" &nbsp;·&nbsp; ".join(bits)}</div>')
+
+
+def _range52_bar(m: Optional[Dict[str, Any]]) -> str:
+    """v1.3.0: where today's price sits inside the 52W range (marker on a track)."""
+    if not m:
+        return ""
+    p, lo, hi = m.get("price"), m.get("lo52"), m.get("hi52")
+    if p is None or lo is None or hi is None or hi <= lo:
+        return ""
+    pos = max(0.0, min(1.0, (p - lo) / (hi - lo))) * 100.0
+    mpos = min(pos, 96.0)
+    return (f'<div style="margin-top:6px;">'
+            f'<div style="font-family:{SANS}; font-size:10px; color:#8A958E;">'
+            f'52W RANGE&nbsp; {lo:,.2f} — {hi:,.2f} &nbsp;·&nbsp; now {p:,.2f} ({pos:.0f}% of range)</div>'
+            f'<div style="height:6px; background:#E8E3D8; margin-top:3px; font-size:0; line-height:0;">'
+            f'<div style="margin-left:{mpos:.0f}%; width:10px; height:6px; background:{INK}; font-size:0; line-height:0;">&nbsp;</div>'
+            f'</div></div>')
+
+
+def _glance_block(d: Dict[str, Any]) -> str:
+    """v1.3.0: diverging unrealized-P&L bar per holding + weight column."""
+    holdings = d["sell"] + d["trim"] + d["add"] + d["hold"]
+
+    def v(r: Dict[str, Any]) -> float:
+        pl = r["pl"]
+        return pl * 100.0 if abs(pl) <= 1.5 else pl
+
+    rows = sorted([r for r in holdings if r.get("pl") is not None], key=v, reverse=True)
+    if not rows:
+        return ""
+    maxabs = max(abs(v(r)) for r in rows) or 1.0
+    trs = []
+    for r in rows:
+        val = v(r)
+        w = min(100.0, abs(val) / maxabs * 100.0)
+        neg = (f'<div style="margin-left:{max(0.0, 100 - w):.0f}%; width:{w:.0f}%; height:10px; '
+               f'background:{SELL_C}; font-size:0; line-height:0;">&nbsp;</div>') if val < 0 else ""
+        pos_ = (f'<div style="width:{max(w, 1.0):.0f}%; height:10px; background:{ADD_C}; '
+                f'font-size:0; line-height:0;">&nbsp;</div>') if val > 0 else ""
+        wt_s = _pct(r.get("weight"), 1).lstrip("+") if r.get("weight") is not None else "—"
+        col = SELL_C if val < 0 else ADD_C
+        trs.append(
+            f'<tr style="font-family:{SANS};">'
+            f'<td style="padding:5px 10px; font-size:12px; color:#1A1A1A; width:92px; border-bottom:1px solid #EFECE4;"><strong>{_esc(r["symbol"])}</strong></td>'
+            f'<td width="29%" style="padding:5px 0; border-bottom:1px solid #EFECE4; border-right:1px solid #C9C4B8;">{neg}</td>'
+            f'<td width="29%" style="padding:5px 0; border-bottom:1px solid #EFECE4;">{pos_}</td>'
+            f'<td align="right" style="padding:5px 10px; font-size:12px; color:{col}; width:66px; border-bottom:1px solid #EFECE4;"><strong>{val:+.1f}%</strong></td>'
+            f'<td align="right" style="padding:5px 10px; font-size:11px; color:#8A8A8A; width:56px; border-bottom:1px solid #EFECE4;">{wt_s}</td>'
+            f'</tr>')
+    return f"""
+  <tr><td style="padding:18px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:{INK}; border-bottom:2px solid {BRASS}; padding-bottom:6px;">Your book at a glance <span style="font-family:{SANS}; font-size:11px; color:#8C97A3; letter-spacing:0.5px;">UNREALIZED&nbsp;P&amp;L&nbsp;PER&nbsp;HOLDING&nbsp;·&nbsp;WEIGHT</span></div></td></tr>
+  <tr><td style="padding:10px 32px 0 32px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FCFBF7; border:1px solid #E6E1D6;">{''.join(trs)}</table>
+    <div style="font-family:{SANS}; font-size:10px; color:#A09B90; padding:5px 2px 0 2px;">Bars are scaled to the largest move ({maxabs:.0f}%). Right column is each name's share of the book.</div>
+  </td></tr>"""
+
+
 def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     d = model["decision"]; t = model["top10"]; mk = model["market"]
+    metrics = model.get("metrics", {}) or {}  # v1.3.0
     date_long = when.strftime("%A").rstrip()
     date_short = when.strftime("%d %B %Y")
 
@@ -482,12 +691,13 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     add_rows = "".join(
         _action_row(r, "ADD", ADD_C, "#E9F5EF", "#C7E4D5",
                     _add_reason(r), f'{_pct(r["eroi"],0)} outlook', f'now {_pct(r["weight"],1).lstrip("+")}', "#0E7C5A")
+        + _outlook_strip(metrics.get(r["symbol"].upper()))  # v1.3.0
         for r in d["add"])
 
     hold_rows = "".join(_hold_row(r) for r in d["hold"])
 
     # ---- opportunities ----
-    opp_rows = "".join(_opp_row(i + 1, p) for i, p in enumerate(t["top"]))
+    opp_rows = "".join(_opp_row(i + 1, p, metrics) for i, p in enumerate(t["top"]))
     rest_rows = "".join(_rest_row(market, names) for market, names in t["rest"].items()) if t["rest"] else ""
     rest_block = f"""
     <div style="font-family:{SERIF}; font-size:13px; color:#0E7C5A; margin:14px 2px 8px 2px;">Across the rest of your markets</div>
@@ -495,6 +705,9 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
     # ---- per-page strip ----
     page_rows = "".join(_page_row(name, mk[name]) for name in MARKET_PAGES)
+
+    # ---- v1.3.0: book-at-a-glance diverging P&L bars ----
+    glance_block = _glance_block(d)
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -531,6 +744,8 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     </td></tr></table>
   </td></tr>
 
+{glance_block}
+
   <tr><td style="padding:22px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:{INK}; border-bottom:2px solid {INK}; padding-bottom:6px;">Act now <span style="font-family:{SANS}; font-size:11px; color:#7E8AA0; letter-spacing:0.5px;">HIGH-CONFIDENCE CALLS</span></div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;">{sell_rows}{trim_rows}{add_rows}</td></tr>
 
@@ -542,7 +757,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
   <tr><td style="padding:20px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#0E7C5A; border-bottom:2px solid {ADD_C}; padding-bottom:6px;">Best new buys <span style="font-family:{SANS}; font-size:11px; color:#8A958E; letter-spacing:0.5px;">ALL MARKETS · WHERE YOUR DRY POWDER GOES</span></div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;">
-    <div style="font-family:{SANS}; font-size:12px; color:#555; line-height:1.6; margin-bottom:10px;">Ranked entry candidates you <strong>don't hold</strong>, screened across <strong>all your markets</strong>. The figure is the gap to estimated <strong>fair value — a valuation target, not a prediction</strong>; reliability and confidence show how much weight to give each. Full entry/stop/target levels are in your Top&nbsp;10 sheet.</div>
+    <div style="font-family:{SANS}; font-size:12px; color:#555; line-height:1.6; margin-bottom:10px;">Ranked entry candidates you <strong>don't hold</strong>, screened across <strong>all your markets</strong>. The figure is the gap to estimated <strong>fair value — a valuation target, not a prediction</strong>; reliability and confidence show how much weight to give each. The 1M&nbsp;/&nbsp;3M&nbsp;/&nbsp;12M strip under each name is the engine's valuation path with its stated reliability — <strong>targets, not predictions</strong>. Full entry/stop/target levels are in your Top&nbsp;10 sheet.</div>
     {opp_rows}{rest_block}
     <div style="font-family:{SANS}; font-size:11px; color:#A09B90; line-height:1.6; padding:8px 2px 0 2px; font-style:italic;">Live brief refreshes the full cross-market list each morning and always excludes names you hold.</div>
   </td></tr>
@@ -614,6 +829,15 @@ def _rest_row(market: str, names: List[Dict[str, Any]]) -> str:
     return f"""<tr style="font-family:{SANS};"><td style="padding:9px 14px; font-size:12px; color:#0E7C5A; font-weight:bold; width:110px; vertical-align:top; border-bottom:1px solid #E2EFE8;">{_esc(market)}</td><td style="padding:9px 14px; font-size:12px; color:#444; line-height:1.5; border-bottom:1px solid #E2EFE8;">{label}</td></tr>"""
 
 
+def _breadth_pct(info: Dict[str, Any]) -> float:
+    """v1.3.0: investable share of a market page for the breadth bar."""
+    total = info.get("total") or 0
+    inv = info.get("invest") or 0
+    if not total:
+        return 0.0
+    return max(0.0, min(100.0, inv / total * 100.0))
+
+
 def _page_row(name: str, info: Dict[str, Any]) -> str:
     pretty = name.replace("_", " ")
     inv = info["invest"]
@@ -628,7 +852,7 @@ def _page_row(name: str, info: Dict[str, Any]) -> str:
         names = ", ".join(_esc(t["name"].split()[0]) for t in info["top"][:5])
         note = f"Top names: {names}."
         ncol = "#555"
-    return f"""<tr style="font-family:{SANS};"><td style="padding:10px 14px; font-size:13px; color:#1A1A1A; vertical-align:top; border-bottom:1px solid #E8E3D8; width:150px;"><strong>{_esc(pretty)}</strong><br><span style="font-size:11px; color:#999;">{info['total']:,} names · {inv} investable</span></td><td style="padding:10px 14px; font-size:12px; color:{ncol}; line-height:1.5; border-bottom:1px solid #E8E3D8;">{note}</td></tr>"""
+    return f"""<tr style="font-family:{SANS};"><td style="padding:10px 14px; font-size:13px; color:#1A1A1A; vertical-align:top; border-bottom:1px solid #E8E3D8; width:150px;"><strong>{_esc(pretty)}</strong><br><span style="font-size:11px; color:#999;">{info['total']:,} names · {inv} investable</span><div style="height:5px; background:#E8E3D8; margin-top:5px; font-size:0; line-height:0;"><div style="width:{_breadth_pct(info):.0f}%; height:5px; background:{ADD_C}; font-size:0; line-height:0;">&nbsp;</div></div></td><td style="padding:10px 14px; font-size:12px; color:{ncol}; line-height:1.5; border-bottom:1px solid #E8E3D8;">{note}</td></tr>"""
 
 
 # ----------------------------------------------------------------------------- #
@@ -657,13 +881,23 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
         lines.append("TRIM:  " + "; ".join(f"{r['symbol']} (~{r['sar']:,.0f} SAR)" for r in d["trim"]))
     if d["add"]:
         lines.append("ADD:   " + "; ".join(f"{r['symbol']} (~{r['sar']:,.0f} SAR)" for r in d["add"]))
+        _mx = model.get("metrics", {}) or {}
+        for r in d["add"]:
+            _m = _mx.get(r["symbol"].upper())
+            if _m:
+                lines.append(f"       {r['symbol']} outlook: 1M {_pct(_m.get('roi1m'))} / "
+                             f"3M {_pct(_m.get('roi3m'))} / 12M {_pct(_m.get('roi12m'))} "
+                             f"(valuation path, reliability {_num_str(_m.get('rel'))})")
     if d["hold"]:
         lines.append("HOLD (data too weak to act): " + ", ".join(r["symbol"] for r in d["hold"]))
     if t["top"]:
         lines += ["", "BEST NEW BUYS (to fair value; a target, not a forecast):"]
+        _mx2 = model.get("metrics", {}) or {}
         for i, p in enumerate(t["top"], 1):
+            _m2 = _mx2.get(p["symbol"].upper())
+            _ol = (f" | 1M {_pct(_m2.get('roi1m'))} / 3M {_pct(_m2.get('roi3m'))}" if _m2 else "")
             lines.append(f"  {i}. {p['symbol']} {p['name'][:34]} - {_pct(p['roi'],0)} "
-                         f"[{p['market']}, reliability {_num_str(p['rel'])}, {p['conf']}]")
+                         f"[{p['market']}, reliability {_num_str(p['rel'])}, {p['conf']}]{_ol}")
     lines += ["", "When you can act (Riyadh): Tadawul 10:00-15:00 Sun-Thu - US 16:30-23:00 - "
               "Europe ~10:00-19:30 - Tokyo/HK early morning.", ""]
     return "\n".join(lines)
