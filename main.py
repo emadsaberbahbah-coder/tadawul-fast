@@ -2,12 +2,34 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.11.2)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.11.3)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+Why this revision (v8.11.3 vs v8.11.2)
+--------------------------------------
+- ADD: `engine_version` in _runtime_meta() -> exposed on every status payload
+    (/health, /healthz, /meta, /ping, /, /readyz, /livez and the /v1 aliases).
+    Background: the payload reported engine_present/engine_ready/engine_source
+    but never WHICH engine build is running. Verifying a deploy therefore
+    required a fresh Render Shell session (`import core.data_engine_v2; print
+    __version__`) or scrolling the deploy log for the module banner -- a
+    repeated operational cost, and a real ambiguity window while Render is
+    mid-rebuild (a "healthy" response can come from the OLD instance). One
+    browser hit on /health now answers it: entry_version proves THIS main.py
+    deployed; engine_version proves which data_engine_v2 build is live.
+- New helper _resolve_engine_version(engine_obj, engine_source): reads
+    __version__ (fallback ENGINE_VERSION) from the ALREADY-IMPORTED engine
+    module via sys.modules -- it never imports anything (zero side effects,
+    zero startup cost), falls back to the engine object's own __version__/
+    version attributes, and returns "" on any failure (pure + fail-safe:
+    the status payload can never break because of it).
+- ADD: APP_ENTRY_VERSION bumped to 8.11.3.
+- SAFE: every v8.11.2 field is preserved verbatim; this is one ADDITIVE key.
+    No route, mount-plan, middleware, auth, or engine-lifecycle change.
 
 Why this revision (v8.11.2 vs v8.11.1)
 --------------------------------------
@@ -195,7 +217,7 @@ class _StrictJSONResponse(JSONResponse):
 # =============================================================================
 # Version
 # =============================================================================
-APP_ENTRY_VERSION = "8.11.2"
+APP_ENTRY_VERSION = "8.11.3"
 # v8.11.1: Cross-module canonical alias (matches worker.py v4.3.0,
 # config.py v7.3.0, env.py v7.8.1, track_performance v6.4.0, etc.)
 SERVICE_VERSION = APP_ENTRY_VERSION
@@ -1449,6 +1471,32 @@ def _mount_routes_once(app: FastAPI, *, phase: str) -> Dict[str, Any]:
 # =============================================================================
 # Runtime metadata
 # =============================================================================
+def _resolve_engine_version(engine_obj: Any, engine_source: str) -> str:
+    """v8.11.3: best-effort engine build version for the status payloads.
+
+    Reads __version__ (fallback ENGINE_VERSION) from the already-imported
+    engine module via sys.modules -- never imports anything, so it has zero
+    side effects and zero cost when the engine is absent. Falls back to the
+    engine object's own __version__/version attributes. Pure + fail-safe:
+    returns "" on any problem; the health payload can never break here."""
+    try:
+        if engine_obj is None:
+            return ""
+        mod_name = str(engine_source or "")
+        if not mod_name:
+            mod_name = str(getattr(type(engine_obj), "__module__", "") or "")
+        if mod_name:
+            mod = sys.modules.get(mod_name)
+            if mod is not None:
+                v = getattr(mod, "__version__", "") or getattr(mod, "ENGINE_VERSION", "")
+                if v:
+                    return str(v)
+        v = getattr(engine_obj, "__version__", "") or getattr(engine_obj, "version", "")
+        return str(v or "")
+    except Exception:
+        return ""
+
+
 def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     snap: Dict[str, Any] = {}
     routes_mounted = False
@@ -1551,6 +1599,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "engine_present": engine_obj is not None,
         "engine_ready": engine_obj is not None and not engine_init_error,
         "engine_source": engine_source,
+        "engine_version": _resolve_engine_version(engine_obj, engine_source),
         "engine_init_error": engine_init_error,
         "startup_warnings": startup_warnings,
     }
