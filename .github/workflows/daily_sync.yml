@@ -73,91 +73,17 @@ env:
   PYTHONUNBUFFERED: 1
   TZ: Asia/Riyadh
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
-  # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
-  # already builds My_Portfolio correctly from _Portfolio_CostBasis") was WRONG,
-  # and disarming it BROKE the page. The page-driven enriched request (empty
-  # symbol list) returns the backend's DEFAULT page
-  # (_DEFAULT_SHEET_SYMBOLS["My_Portfolio"] = 2222.SR/AAPL/MSFT/QQQ/GC=F) with
-  # BLANK Qty/Avg Cost — NOT the holdings — so the v6.5.0 guard correctly refused
-  # to blank the manual cells and the write DEADLOCKED, leaving My_Portfolio stuck
-  # on junk symbols carrying mismatched cost basis (log: "No symbols found;
-  # sending a page-driven request ... PORTFOLIO-GUARD skip ... blank existing
-  # Qty/Avg Cost for 5 holding(s) [2222.SR, AAPL, GC=F, MSFT, QQQ]").
-  # The rebuild is what makes the request SYMBOL-DRIVEN: it sources the 10
-  # holdings from _Portfolio_CostBasis, injects the user's Qty/Avg Cost,
-  # recomputes SAR position math, and labels 5023.SR as Fixed Income / Sukuk — so
-  # the guard passes and the page actually writes. FX is per-row from the
-  # payload's own native-vs-SAR price (verified correct for USD holdings: e.g.
-  # RCI.US 50 @ $37.04 -> MV 6937.5 / Cost 6945 SAR); the only weak spot is a
-  # fx=1.0 fallback when a USD row lacks a native OR SAR price (cosmetic SAR
-  # magnitude on <=3 rows, P&L ratio stays correct).
-  # KILL-SWITCH: set back to "0" to revert to the (broken) page-driven default.
-  TFB_PORTFOLIO_REBUILD: "1"
-  # Top_10_Investments — decision guard ENABLED ("1"). [2026-06-29 corrected]
-  # SUPERSEDES the earlier "0" setting. That setting let the 2-hourly daily sync
-  # clear-and-rewrite Top_10_Investments as a flat engine page, on the premise
-  # that the page "has NO user-authored columns / is READ-ONLY in use." That
-  # premise is STALE: Top_10_Investments is now the DECISION COCKPIT rendered by
-  # 16_Decision_Top10.gs -- it carries operator-editable control-panel cells
-  # (Universe Scope, Max Selected, Required ROI, Min Reliability, Pool Limit,
-  # Pool Source, Cash Available, ...) plus the SELECTED / ALL-QUALIFIED /
-  # NEAR-MISS / CANDIDATES decision zones. A clear-before-write from the sync
-  # DESTROYS that cockpit and the operator control-panel inputs every run -- the
-  # same irreversible operator-input loss the v6.5.0 My_Portfolio guard prevents.
-  # FIX: guard ON ("1") so the sync SKIPS Top_10 entirely (no fetch, no clear, no
-  # write -- the guard's only target is Top_10, _DECISION_GUARD_DEFAULT_PAGES =
-  # ("Top_10_Investments",), so NO other page is affected and the My_Portfolio
-  # manual-cell guard is untouched). The cockpit refreshes ON DEMAND via the menu
-  # (refreshDecisionTop10), exactly like the My_Portfolio decision cockpit.
-  # NOTE: the "frozen on placeholder symbols" symptom that motivated "0" was just
-  # the cockpit not having been refreshed -- run "Refresh Decision Top 10" once to
-  # populate it with real picks; it then persists (like My_Portfolio) until you
-  # refresh again.
-  # KILL-SWITCH: set to "0" to restore the sync write-through -- but ONLY if
-  # Top_10_Investments is NOT being used as the cockpit, or the sync will clobber
-  # it (and your control-panel inputs) every run.
-  TFB_SYNC_DECISION_GUARD: "1"
-  # Market-page SYMBOL BATCHING (scripts/run_dashboard_sync.py v6.17.0). ARMED
-  # ("25", lowered from 100 — run #2164 showed /v1/analysis still 502'd at 100/
-  # batch, so the sync fell back to /v1/advanced which returns 0 rows; a smaller
-  # batch gives the row-returning analysis route a chance to answer in time).
-  # WHY (2026-07-01, runs #2154/#2160): each market page was fetched in
-  # ONE request carrying its ENTIRE symbol set (Market_Leaders ~388,
-  # Global_Markets ~3000). That burst makes the backend fan out hundreds of
-  # Yahoo calls at once, which trips Yahoo's rate limit (429 -> 200 with 0 rows
-  # -> empty-guard preserves STALE data) and/or exceeds Render's ~100s edge
-  # timeout on the analysis route (-> HTTP 502). This value fetches each market
-  # page in batches of N symbols instead, so every request is light enough to
-  # finish inside the timeout (kills the 502) and the upstream calls are spread
-  # out (avoids the 429 that returned empty pages). Scope: the four market pages
-  # only, and only when a page has MORE than N symbols; My_Portfolio, Top_10 and
-  # the meta pages are untouched. TRADE-OFF: the page-level Rank (Overall) is
-  # then ranked WITHIN each batch (per-symbol price/score/recommendation stay
-  # correct). KILL-SWITCH: remove this line (or set "0") to restore the v6.16.0
-  # single-request behavior, byte-identical. TUNING: raise (e.g. "150") if a run
-  # nears the 25-min job cap; optional companion TFB_SYNC_BATCH_DELAY_MS: "500"
-  # adds a pause between batches for extra upstream cooldown.
-  TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
-  # Route the four market pages through the ANALYSIS gateway
-  # (/v1/analysis/sheet-rows) FIRST — the route that returns the full page of
-  # rows (plus the rank/dedup passes) — instead of the enriched chain that ends
-  # on /v1/advanced (the advisor route), which answers 200 but with 0 rows for a
-  # raw market list. Paired with the small batch size above so the analysis
-  # route can answer within Render's ~100s timeout instead of 502ing. Read by
-  # run_dashboard_sync.py (_effective_gateway); this is a GitHub/sync flag, NOT a
-  # Render backend var. Reversible: set "0" (or remove) to restore the
-  # per-page configured gateway.
-  TFB_SYNC_MARKET_ANALYSIS_GATEWAY: "1"
-  # (2026-07-02) v6.18.0 GENERIC market-gateway override — takes precedence over
-  # the boolean above. "advanced" routes the four market pages
-  # /v1/advanced/sheet-rows-FIRST: the endpoint that answered 200 on every
-  # attempt in the failed run-28554325006 log (the /v1/analysis route now 502s
-  # on big pages since the unbounded-engine change, and the resulting 404
-  # candidate walk blew the job past its 25-min ceiling — the cancellation that
-  # left Mutual_Funds/Commodities_FX empty). Same route as the manual sheet
-  # Refresh. Reversible: remove this line to fall back to the boolean above.
-  TFB_SYNC_MARKET_GATEWAY: "advanced"
+  # (2026-07-03) SYNC-FLAG SCOPING: the five TFB_* sync behavior flags that
+  # lived here (TFB_PORTFOLIO_REBUILD, TFB_SYNC_DECISION_GUARD,
+  # TFB_SYNC_SYMBOL_BATCH_SIZE, TFB_SYNC_MARKET_ANALYSIS_GATEWAY,
+  # TFB_SYNC_MARKET_GATEWAY) moved VERBATIM to the sync-dashboard job's env.
+  # WHY: workflow-level env is inherited by EVERY job, including ci-tests —
+  # the ci-tests job therefore ran tests/test_recent_fixes.py with
+  # TFB_SYNC_MARKET_GATEWAY="advanced" leaked into its environment, and the
+  # two gateway-default tests failed on every push (red X on green syncs).
+  # Only scripts/run_dashboard_sync.py reads these flags, and it runs ONLY in
+  # the sync-dashboard job — scoping them there is byte-identical for the
+  # sync and gives the tests the clean environment they assert against.
 
 jobs:
   # =============================================================================
@@ -276,6 +202,96 @@ jobs:
     timeout-minutes: 45
     needs: preflight-validation
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight-validation.outputs.validated == 'true' }}
+
+    # (2026-07-03) SYNC-FLAG SCOPING — moved verbatim from the workflow-level
+    # env block (see the note there). Values and comments unchanged; only the
+    # scope changed so ci-tests no longer inherits sync behavior flags.
+    env:
+      # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
+      # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
+      # already builds My_Portfolio correctly from _Portfolio_CostBasis") was WRONG,
+      # and disarming it BROKE the page. The page-driven enriched request (empty
+      # symbol list) returns the backend's DEFAULT page
+      # (_DEFAULT_SHEET_SYMBOLS["My_Portfolio"] = 2222.SR/AAPL/MSFT/QQQ/GC=F) with
+      # BLANK Qty/Avg Cost — NOT the holdings — so the v6.5.0 guard correctly refused
+      # to blank the manual cells and the write DEADLOCKED, leaving My_Portfolio stuck
+      # on junk symbols carrying mismatched cost basis (log: "No symbols found;
+      # sending a page-driven request ... PORTFOLIO-GUARD skip ... blank existing
+      # Qty/Avg Cost for 5 holding(s) [2222.SR, AAPL, GC=F, MSFT, QQQ]").
+      # The rebuild is what makes the request SYMBOL-DRIVEN: it sources the 10
+      # holdings from _Portfolio_CostBasis, injects the user's Qty/Avg Cost,
+      # recomputes SAR position math, and labels 5023.SR as Fixed Income / Sukuk — so
+      # the guard passes and the page actually writes. FX is per-row from the
+      # payload's own native-vs-SAR price (verified correct for USD holdings: e.g.
+      # RCI.US 50 @ $37.04 -> MV 6937.5 / Cost 6945 SAR); the only weak spot is a
+      # fx=1.0 fallback when a USD row lacks a native OR SAR price (cosmetic SAR
+      # magnitude on <=3 rows, P&L ratio stays correct).
+      # KILL-SWITCH: set back to "0" to revert to the (broken) page-driven default.
+      TFB_PORTFOLIO_REBUILD: "1"
+      # Top_10_Investments — decision guard ENABLED ("1"). [2026-06-29 corrected]
+      # SUPERSEDES the earlier "0" setting. That setting let the 2-hourly daily sync
+      # clear-and-rewrite Top_10_Investments as a flat engine page, on the premise
+      # that the page "has NO user-authored columns / is READ-ONLY in use." That
+      # premise is STALE: Top_10_Investments is now the DECISION COCKPIT rendered by
+      # 16_Decision_Top10.gs -- it carries operator-editable control-panel cells
+      # (Universe Scope, Max Selected, Required ROI, Min Reliability, Pool Limit,
+      # Pool Source, Cash Available, ...) plus the SELECTED / ALL-QUALIFIED /
+      # NEAR-MISS / CANDIDATES decision zones. A clear-before-write from the sync
+      # DESTROYS that cockpit and the operator control-panel inputs every run -- the
+      # same irreversible operator-input loss the v6.5.0 My_Portfolio guard prevents.
+      # FIX: guard ON ("1") so the sync SKIPS Top_10 entirely (no fetch, no clear, no
+      # write -- the guard's only target is Top_10, _DECISION_GUARD_DEFAULT_PAGES =
+      # ("Top_10_Investments",), so NO other page is affected and the My_Portfolio
+      # manual-cell guard is untouched). The cockpit refreshes ON DEMAND via the menu
+      # (refreshDecisionTop10), exactly like the My_Portfolio decision cockpit.
+      # NOTE: the "frozen on placeholder symbols" symptom that motivated "0" was just
+      # the cockpit not having been refreshed -- run "Refresh Decision Top 10" once to
+      # populate it with real picks; it then persists (like My_Portfolio) until you
+      # refresh again.
+      # KILL-SWITCH: set to "0" to restore the sync write-through -- but ONLY if
+      # Top_10_Investments is NOT being used as the cockpit, or the sync will clobber
+      # it (and your control-panel inputs) every run.
+      TFB_SYNC_DECISION_GUARD: "1"
+      # Market-page SYMBOL BATCHING (scripts/run_dashboard_sync.py v6.17.0). ARMED
+      # ("25", lowered from 100 — run #2164 showed /v1/analysis still 502'd at 100/
+      # batch, so the sync fell back to /v1/advanced which returns 0 rows; a smaller
+      # batch gives the row-returning analysis route a chance to answer in time).
+      # WHY (2026-07-01, runs #2154/#2160): each market page was fetched in
+      # ONE request carrying its ENTIRE symbol set (Market_Leaders ~388,
+      # Global_Markets ~3000). That burst makes the backend fan out hundreds of
+      # Yahoo calls at once, which trips Yahoo's rate limit (429 -> 200 with 0 rows
+      # -> empty-guard preserves STALE data) and/or exceeds Render's ~100s edge
+      # timeout on the analysis route (-> HTTP 502). This value fetches each market
+      # page in batches of N symbols instead, so every request is light enough to
+      # finish inside the timeout (kills the 502) and the upstream calls are spread
+      # out (avoids the 429 that returned empty pages). Scope: the four market pages
+      # only, and only when a page has MORE than N symbols; My_Portfolio, Top_10 and
+      # the meta pages are untouched. TRADE-OFF: the page-level Rank (Overall) is
+      # then ranked WITHIN each batch (per-symbol price/score/recommendation stay
+      # correct). KILL-SWITCH: remove this line (or set "0") to restore the v6.16.0
+      # single-request behavior, byte-identical. TUNING: raise (e.g. "150") if a run
+      # nears the 25-min job cap; optional companion TFB_SYNC_BATCH_DELAY_MS: "500"
+      # adds a pause between batches for extra upstream cooldown.
+      TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
+      # Route the four market pages through the ANALYSIS gateway
+      # (/v1/analysis/sheet-rows) FIRST — the route that returns the full page of
+      # rows (plus the rank/dedup passes) — instead of the enriched chain that ends
+      # on /v1/advanced (the advisor route), which answers 200 but with 0 rows for a
+      # raw market list. Paired with the small batch size above so the analysis
+      # route can answer within Render's ~100s timeout instead of 502ing. Read by
+      # run_dashboard_sync.py (_effective_gateway); this is a GitHub/sync flag, NOT a
+      # Render backend var. Reversible: set "0" (or remove) to restore the
+      # per-page configured gateway.
+      TFB_SYNC_MARKET_ANALYSIS_GATEWAY: "1"
+      # (2026-07-02) v6.18.0 GENERIC market-gateway override — takes precedence over
+      # the boolean above. "advanced" routes the four market pages
+      # /v1/advanced/sheet-rows-FIRST: the endpoint that answered 200 on every
+      # attempt in the failed run-28554325006 log (the /v1/analysis route now 502s
+      # on big pages since the unbounded-engine change, and the resulting 404
+      # candidate walk blew the job past its 25-min ceiling — the cancellation that
+      # left Mutual_Funds/Commodities_FX empty). Same route as the manual sheet
+      # Refresh. Reversible: remove this line to fall back to the boolean above.
+      TFB_SYNC_MARKET_GATEWAY: "advanced"
 
     steps:
       - name: 📥 Secure Checkout
