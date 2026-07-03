@@ -2,8 +2,50 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.102.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.103.0
 ================================================================================
+
+WHY v5.103.0 - PRICE PROVENANCE HONESTY (Fix AQ; env-gated
+TFB_GATE_PRICE_STALENESS, default ON; 0/false/off/no restores the v5.102.0
+timestamps byte-identically)
+--------------------------------------------------------------------------
+ROOT CAUSE (live evidence 2026-07-03: Market_Leaders served 4030.SR at 32.44
+stamped "fresh" 02:57 UTC while the true Tadawul close was 36.04): when the
+live provider loop yields NO current_price (Yahoo midday throttle on the
+datacenter IP), the enriched-quote factory falls back in order to (a) the
+HISTORY patch - whose price is the last bar close - and (b) the in-memory
+SYMBOL SNAPSHOT - a row from an earlier run that can be DAYS old on a
+long-lived worker. Both fallbacks then flowed into the same stamp block,
+and _canonicalize_provider_row had already MINTED last_updated_utc/riyadh
+= now() onto the canonicalized history patch, so the row reached the sheet
+as "old price, fresh timestamp" - the exact dishonesty this fix kills.
+Because _V577_LIVE_OVERWRITE_FIELDS includes last_updated_utc /
+last_updated_riyadh / warnings, the same poisoned stamps also overwrote
+sheet rows on the external-rows (My_Portfolio) path.
+
+FIX (factory-scoped; DISCLOSURE-ONLY - no verdict, score, recommendation,
+rank, gate, or schema change; adds NO column):
+  1. The factory now TRACKS price provenance for the run: _live_priced
+     (a real provider quote carried the price) vs a fallback source
+     ("history" or "snapshot").
+  2. When the served price came from a FALLBACK source (gate ON):
+       - snapshot-priced rows carry the SNAPSHOT'S OWN original
+         last_updated_utc/riyadh (honest "last verified at T"),
+       - history-priced rows carry BLANK stamps (a bar close is not a
+         live verification; the minted now() is removed),
+       - the row is tagged in warnings with
+         price_unverified_live:<history|snapshot> (reliability-scan
+         substring-safe: no cap/forecast/target/roi/drop/reject token),
+     and the final blank-stamp mint is SKIPPED for exactly these rows, so
+     nothing re-freshens them.
+  3. Live-priced rows are byte-identical to v5.102.0 (provider timestamp
+     preferred at canonicalization, now() minted only when absent - a
+     fresh fetch at time T is honestly ~T).
+Consumers see the honesty automatically: the sync writes the old/blank
+stamp verbatim, validate_dashboard's Global_Markets completeness check
+surfaces missing stamps, and the Warnings column carries the tag. New
+helpers: _price_staleness_gate_enabled, _aq_append_warning. Everything
+else is byte-identical to v5.102.0.
 
 WHY v5.102.0 - BUY-FAMILY / BLOCK_REASON COHERENCE (Fix AP; env-gated
                TFB_GATE_RECO_COHERENCE, DEFAULT ON -> set 0/false/off to
@@ -2174,7 +2216,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.102.0"
+__version__ = "5.103.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -7760,6 +7802,33 @@ def _now_riyadh_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _price_staleness_gate_enabled() -> bool:
+    """v5.103.0 (Fix AQ) master switch. Default ON; set
+    TFB_GATE_PRICE_STALENESS=0/false/off/no to restore the v5.102.0
+    timestamp behavior byte-identically (fallback-priced rows minted
+    fresh now() stamps)."""
+    return (os.getenv("TFB_GATE_PRICE_STALENESS") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _aq_append_warning(row: Dict[str, Any], tag: str) -> None:
+    """v5.103.0 (Fix AQ): append a warnings tag, tolerating the field being
+    None/str/list. Never raises; never duplicates the tag (idempotent so a
+    cache-hit or repeat pass is byte-identical)."""
+    try:
+        cur = row.get("warnings")
+        if cur in (None, ""):
+            row["warnings"] = tag
+        elif isinstance(cur, list):
+            if tag not in cur:
+                cur.append(tag)
+        else:
+            s = str(cur)
+            if tag not in s:
+                row["warnings"] = (s + "; " + tag) if s.strip() else tag
+    except Exception:
+        pass
+
+
 def _safe_env(name: str, default: str = "") -> str:
     return _safe_str(os.getenv(name), default)
 
@@ -11346,6 +11415,15 @@ class DataEngineV5:
                 if _as_float(merged.get("current_price")) is not None:
                     break
 
+            # v5.103.0 (Fix AQ): record price provenance for this run. A price
+            # present HERE came from a real provider quote; anything filled by
+            # the history/snapshot fallbacks below is NOT a live verification
+            # and must not be stamped as one.
+            _live_priced = _as_float(merged.get("current_price")) is not None
+            _fallback_price_src = ""
+            _snap_lu_utc = ""
+            _snap_lu_riy = ""
+
             # History fallback when live failed.
             if _as_float(merged.get("current_price")) is None:
                 hist_patch = await self._get_history_patch_best_effort(sym, page_ctx)
@@ -11355,13 +11433,23 @@ class DataEngineV5:
                     )
                     merged = self._merge(merged, canon_hist)
                     merged.setdefault("data_provider", "history_or_fallback")
+                    # v5.103.0 (Fix AQ): the bar close is now the served price.
+                    if not _live_priced and _as_float(merged.get("current_price")) is not None:
+                        _fallback_price_src = "history"
 
             # Snapshot fallback.
             if _as_float(merged.get("current_price")) is None:
                 snap = await self._get_symbol_snapshot_row(page_ctx, sym) or await self._get_best_snapshot_row(sym)
                 if snap:
+                    # v5.103.0 (Fix AQ): capture the snapshot's ORIGINAL stamps
+                    # before the fill-only merge - they are the honest "last
+                    # verified" time for a snapshot-served price.
+                    _snap_lu_utc = _safe_str(snap.get("last_updated_utc"))
+                    _snap_lu_riy = _safe_str(snap.get("last_updated_riyadh"))
                     merged = _merge_missing_fields(merged, snap)
                     merged.setdefault("data_provider", _safe_str(snap.get("data_provider"), "snapshot"))
+                    if not _live_priced and _as_float(merged.get("current_price")) is not None:
+                        _fallback_price_src = "snapshot"
 
             # History technicals (RSI / volatility / max drawdown / candlesticks).
             # v5.85.0 (Fix AC-1): the trigger is now GAP-AWARE. The old rule
@@ -11452,9 +11540,33 @@ class DataEngineV5:
             if not _is_empty_data_row(merged):
                 _apply_analyst_trend_block(merged)
 
-            if not merged.get("last_updated_utc"):
+            # --- v5.103.0 (Fix AQ) PRICE PROVENANCE HONESTY -----------------
+            # A price served from a FALLBACK source must not wear a fresh
+            # timestamp. Snapshot-priced -> the snapshot's own original stamps
+            # (may be old: that IS the honest answer). History-priced -> blank
+            # stamps (the canonicalizer minted ~now onto the history patch; a
+            # bar close is not a live verification). Both get a warnings tag.
+            # Gate OFF, live-priced, empty rows, or no fallback price -> the
+            # v5.102.0 mint below runs byte-identically.
+            _aq_honest = (
+                _price_staleness_gate_enabled()
+                and (not _live_priced)
+                and bool(_fallback_price_src)
+                and _as_float(merged.get("current_price")) is not None
+                and not _is_empty_data_row(merged)
+            )
+            if _aq_honest:
+                if _fallback_price_src == "snapshot":
+                    merged["last_updated_utc"] = _snap_lu_utc
+                    merged["last_updated_riyadh"] = _snap_lu_riy
+                else:
+                    merged["last_updated_utc"] = ""
+                    merged["last_updated_riyadh"] = ""
+                _aq_append_warning(merged, "price_unverified_live:" + _fallback_price_src)
+
+            if not merged.get("last_updated_utc") and not _aq_honest:
                 merged["last_updated_utc"] = _now_utc_iso()
-            if not merged.get("last_updated_riyadh"):
+            if not merged.get("last_updated_riyadh") and not _aq_honest:
                 merged["last_updated_riyadh"] = _now_riyadh_iso()
 
             await self._cache.set(cache_key, merged)
