@@ -3,9 +3,41 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.18.2)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.19.1)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.19.1 fix — STRICT RESPONSE MEMBERSHIP (unrequested backend rows were
+  expanding the page universe)
+- WHY: the owner confirmed (2026-07-03) that NO universe CSV was pasted, yet
+  Global_Markets grew 749 -> 3,068 rows across GREEN runs and later collapsed
+  back to 775. With the manual-paste explanation eliminated, the only remaining
+  writer-side cause is the backend returning MORE rows than were requested
+  (a gateway/universe endpoint answering with its own symbol set on top of the
+  requested one). The sync wrote every returned row verbatim; because the sheet
+  IS the symbol source, each foreign row then became a REQUESTED symbol on the
+  next run — a one-way universe ratchet, and the direct feeder of the corrupt
+  Top_10 candidates. The deny filter (v6.19.0 WHY 2) only blocks the TICK
+  placeholder family; real-looking foreign symbols passed straight through.
+- FIX (TFB_SYNC_STRICT_MEMBERSHIP, default ON, =0/false/off/no to restore
+  v6.19.0 byte-identically): on requested-symbol pages, response rows whose
+  Symbol is NOT in the requested set are dropped BEFORE the guards run, with
+  the dropped symbols named in a [STRICT-MEMBERSHIP] warning. Ordering matters
+  and is deliberate: membership -> empty-guard -> shrink-guard -> persistence,
+  so (a) a fully-foreign response degenerates to the empty-guard's
+  preserve-last-good skip, (b) coverage %% is measured on REQUESTED rows only,
+  and (c) persistence still re-appends any requested symbol the backend missed.
+  Rows with a BLANK symbol cell are kept unchanged (never structural loss), and
+  pages that request no symbols (backend-computed pages like Top_10) are never
+  filtered — the guard is scoped exactly like persistence. The market-page
+  max_symbols cap stays at 800 ON PURPOSE: with no CSV paste, the organic
+  universe is ~750 and raising the cap would only widen the door this fix
+  closes.
+- New helpers: _strict_membership_enabled, _filter_rows_to_requested,
+  _STRICT_MEMBERSHIP_TAG. Integration is ONE block in _run_one_task, placed
+  after the no-credentials early return and before the My_Portfolio write
+  guard (so every guard evaluates the rows that will actually be written).
+  Everything else is byte-identical to v6.19.0.
 
 v6.19.0 fix — PER-SYMBOL PERSISTENCE + UNIVERSE JUNK FILTER (operator symbols
   were being deleted by GREEN runs)
@@ -484,7 +516,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.19.0"
+SCRIPT_VERSION = "6.19.1"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1813,6 +1845,65 @@ def _symbol_persistence_enabled() -> bool:
     return (os.getenv("TFB_SYNC_SYMBOL_PERSISTENCE") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
+_STRICT_MEMBERSHIP_TAG = "[v6.19.1 STRICT-MEMBERSHIP]"
+
+
+def _strict_membership_enabled() -> bool:
+    """v6.19.1 master switch. Default ON; set
+    TFB_SYNC_STRICT_MEMBERSHIP=0/false/off/no to restore the v6.19.0 behavior
+    exactly (every backend-returned row is written verbatim, so an unrequested
+    row expands the page universe on the next read-back)."""
+    return (os.getenv("TFB_SYNC_STRICT_MEMBERSHIP") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _filter_rows_to_requested(
+    headers: List[Any],
+    rows_matrix: List[List[Any]],
+    requested_symbols: List[str],
+) -> Tuple[List[List[Any]], List[str]]:
+    """v6.19.1: drop response rows whose Symbol is NOT in the requested set.
+
+    The backend can answer a requested-symbol fetch with EXTRA rows (its own
+    universe on top of the request). Writing them makes each foreign symbol a
+    requested symbol on the next run (the sheet is the symbol source) — the
+    749 -> 3,068 Global_Markets ratchet of 2026-07-02/03. This keeps only rows
+    carrying a requested symbol; the dropped (unique, normalized) symbols are
+    returned for the caller's [STRICT-MEMBERSHIP] warning.
+
+    FAIL-SAFE: returns the matrix unchanged (and []) when headers, rows, or the
+    requested set are empty, or when the Symbol column cannot be located in the
+    NEW headers (shared alias logic). Rows with a BLANK symbol cell are KEPT
+    unchanged — this filter can drop only a row that positively identifies
+    itself as an unrequested symbol, never a structural row."""
+    if not headers or not rows_matrix or not requested_symbols:
+        return rows_matrix, []
+    sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+    if sym_i < 0:
+        return rows_matrix, []
+    wanted: set = set()
+    for s in requested_symbols:
+        t = str(s or "").strip().upper()
+        if t:
+            wanted.add(t)
+    if not wanted:
+        return rows_matrix, []
+    kept_rows: List[List[Any]] = []
+    dropped: List[str] = []
+    dropped_seen: set = set()
+    for row in rows_matrix:
+        if not isinstance(row, list) or sym_i >= len(row) or _guard_is_blank(row[sym_i]):
+            kept_rows.append(row)
+            continue
+        t = str(row[sym_i]).strip().upper()
+        if t in wanted:
+            kept_rows.append(row)
+        else:
+            if t not in dropped_seen:
+                dropped_seen.add(t)
+                dropped.append(t)
+    return kept_rows, dropped
+
+
 def _universe_deny_patterns() -> List["re.Pattern[str]"]:
     """v6.19.0 (WHY 2): compiled deny-patterns for the read-back universe.
     TFB_SYNC_UNIVERSE_DENY is a comma-separated regex list matched (re.match,
@@ -2707,6 +2798,40 @@ async def _run_one_task(
             res.rows_written = 0
             res.rows_failed = len(rows_matrix or [])
             return res
+
+        # --- Strict response membership (v6.19.1) ----------------------------
+        # The backend can return MORE rows than were requested (gateway/universe
+        # over-return — the confirmed no-paste origin of the 749 -> 3,068
+        # Global_Markets ratchet). Every foreign row written becomes a REQUESTED
+        # symbol on the next run because the sheet is the symbol source. Drop
+        # unrequested rows BEFORE any guard runs, so the empty-guard catches a
+        # fully-foreign response, the shrink guard measures coverage on
+        # REQUESTED rows only, and persistence re-appends genuine misses.
+        # Scoped exactly like persistence (requested-symbol pages only); rows
+        # with a blank Symbol cell are kept; TFB_SYNC_STRICT_MEMBERSHIP=0
+        # restores v6.19.0 byte-identically. Never breaks the write path.
+        if (_strict_membership_enabled() and task.expects_rows and symbols
+                and rows_matrix and headers):
+            try:
+                _rows_before = len(rows_matrix)
+                rows_matrix, _foreign_syms = _filter_rows_to_requested(headers, rows_matrix, symbols)
+                _rows_dropped = _rows_before - len(rows_matrix)
+                if _rows_dropped > 0:
+                    _sm = (
+                        f"{_STRICT_MEMBERSHIP_TAG} dropped {_rows_dropped} unrequested "
+                        f"row(s) ({len(_foreign_syms)} foreign symbol(s)) returned by the "
+                        f"backend for '{task.sheet_name}' — requested {len(symbols)}, "
+                        f"kept {len(rows_matrix)}: {', '.join(_foreign_syms[:15])}"
+                        f"{'…' if len(_foreign_syms) > 15 else ''} — unrequested rows can "
+                        f"no longer expand the page universe."
+                    )
+                    res.warnings.append(_sm)
+                    logger.warning(_sm)
+            except Exception as _se:  # never let membership filtering break the write path
+                _sm = f"{_STRICT_MEMBERSHIP_TAG} skipped (error: {_se})"
+                res.warnings.append(_sm)
+                logger.warning(_sm)
+        # ---------------------------------------------------------------------
 
         # --- My_Portfolio manual-cell write guard (v6.5.0) -------------------
         # Independently verify this write will not blank user-authored Qty/Avg
