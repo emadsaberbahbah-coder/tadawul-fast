@@ -7,6 +7,35 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.18.2)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.19.0 fix — PER-SYMBOL PERSISTENCE + UNIVERSE JUNK FILTER (operator symbols
+  were being deleted by GREEN runs)
+- WHY 1 (SYMBOL PERSISTENCE): the v6.16.0 read-back guarantees operator-added
+  symbols are REQUESTED, and the v6.18.2 shrink guard blocks a write when
+  coverage falls below 70%% — but between 70%% and 99%% coverage the page is
+  rewritten from the response verbatim, so any requested symbol the backend
+  failed to return (Yahoo throttle, gateway universe gap) is silently dropped.
+  Because the sheet IS the symbol source, the drop is PERMANENT (observed
+  2026-07-03: operator additions vanishing across successful syncs). FIX
+  (TFB_SYNC_SYMBOL_PERSISTENCE, default ON, =0 to disable): right before the
+  write, every requested-but-missing symbol keeps its existing last-good row
+  (read from the live page, re-aligned to the new header order by header NAME);
+  the symbol therefore stays in the universe and self-heals on the next healthy
+  fetch. A fetch miss can no longer delete a requested symbol — only the
+  operator (or the junk filter below) can remove one. Preserved symbols are
+  named in a [SYMBOL-PERSISTENCE] warning on every affected run.
+- WHY 2 (UNIVERSE JUNK FILTER): persistence makes every sheet symbol immortal —
+  including garbage (the TICK000..TICK021 placeholder family that contaminated
+  Global_Markets and reached the Top_10 picks before the 2026-07-03 cleanup).
+  FIX (TFB_SYNC_UNIVERSE_DENY, default "^TICK\\d+", comma-separated regexes,
+  set to off/0/- to disable): deny-pattern symbols are dropped from the
+  read-back universe BEFORE the request and are never persisted, with every
+  drop counted in a [UNIVERSE-FILTER] warning. Junk cannot self-perpetuate
+  again; legitimate operator symbols are untouched.
+- New helpers: _symbol_persistence_enabled, _persist_missing_symbol_rows,
+  _universe_deny_patterns, _universe_junk, _SYMBOL_PERSISTENCE_TAG,
+  _UNIVERSE_FILTER_TAG. Integration is two blocks in _run_one_task (read-back
+  filter + pre-write persistence); disabled flags restore v6.18.2 byte-identical.
+
 v6.18.2 fix — PARTIAL-FETCH SHRINK GUARD (the Market_Leaders universe ratchet)
 - WHY (diagnosed from the owner's two workbook exports of 2026-07-02): between
   the 13:40 and 16:xx exports, Market_Leaders shrank 288 -> 163 symbols (-125,
@@ -455,7 +484,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.18.2"
+SCRIPT_VERSION = "6.19.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1772,6 +1801,146 @@ def _read_existing_page_symbols(
     return out
 
 
+_SYMBOL_PERSISTENCE_TAG = "[v6.19.0 SYMBOL-PERSISTENCE]"
+_UNIVERSE_FILTER_TAG = "[v6.19.0 UNIVERSE-FILTER]"
+
+
+def _symbol_persistence_enabled() -> bool:
+    """v6.19.0 (WHY 1) master switch. Default ON; set
+    TFB_SYNC_SYMBOL_PERSISTENCE=0/false/off/no to restore the v6.18.2 behavior
+    exactly (a requested symbol missing from the response is dropped from the
+    page — and, because the sheet is the symbol source, from the universe)."""
+    return (os.getenv("TFB_SYNC_SYMBOL_PERSISTENCE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _universe_deny_patterns() -> List["re.Pattern[str]"]:
+    """v6.19.0 (WHY 2): compiled deny-patterns for the read-back universe.
+    TFB_SYNC_UNIVERSE_DENY is a comma-separated regex list matched (re.match,
+    case-insensitive) against the NORMALIZED symbol. Unset -> the default
+    "^TICK\\d+" placeholder family; off/0/-/no/false -> filter disabled.
+    A malformed pattern is skipped with a warning instead of failing the run."""
+    raw = (os.getenv("TFB_SYNC_UNIVERSE_DENY") or "^TICK\\d+").strip()
+    if raw.lower() in {"", "0", "off", "no", "false", "-"}:
+        return []
+    pats: List["re.Pattern[str]"] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            pats.append(re.compile(part, re.IGNORECASE))
+        except re.error as e:
+            logger.warning(f"{_UNIVERSE_FILTER_TAG} bad deny pattern {part!r} skipped: {e}")
+    return pats
+
+
+def _universe_junk(symbol: str, pats: Optional[List["re.Pattern[str]"]] = None) -> bool:
+    """v6.19.0 (WHY 2): True when the symbol matches a deny pattern. Junk is
+    neither requested nor persisted, so it cannot self-perpetuate through the
+    sheet-is-the-universe loop again."""
+    t = str(symbol or "").strip().upper()
+    if not t:
+        return False
+    for pat in (pats if pats is not None else _universe_deny_patterns()):
+        if pat.match(t):
+            return True
+    return False
+
+
+def _persist_missing_symbol_rows(
+    sheets: "SheetsWriter",
+    spreadsheet_id: str,
+    sheet_name: str,
+    headers: List[Any],
+    rows_matrix: List[List[Any]],
+    requested_symbols: List[str],
+) -> Tuple[List[List[Any]], List[str]]:
+    """v6.19.0 (WHY 1): append the existing LAST-GOOD row of every requested
+    symbol that is absent from the fetched rows, so writing the response cannot
+    delete an operator symbol from the page (and therefore from the universe).
+
+    Mechanics: locate the Symbol column in the NEW headers (shared alias
+    logic); diff requested vs returned (normalized, junk excluded); read the
+    live page once via the writer's read service; re-align each preserved row
+    to the NEW header order by header NAME (a header missing from the old grid
+    yields ""), so a schema evolution cannot shift cells. Preserved rows are
+    appended below the fetched block; the next healthy fetch replaces them
+    in-place with fresh data.
+
+    FAIL-SAFE: returns the input matrix unchanged (and []) when the Symbol
+    column cannot be located, the page cannot be read, or nothing is missing.
+    Raising is reserved for the caller's try/except — any unexpected error
+    leaves the v6.18.2 write path untouched."""
+    kept: List[str] = []
+    if not headers or rows_matrix is None or not requested_symbols:
+        return rows_matrix, kept
+    new_sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+    if new_sym_i < 0:
+        return rows_matrix, kept
+
+    returned: set = set()
+    for row in rows_matrix:
+        if isinstance(row, list) and new_sym_i < len(row) and not _guard_is_blank(row[new_sym_i]):
+            returned.add(str(row[new_sym_i]).strip().upper())
+
+    _deny = _universe_deny_patterns()
+    missing: List[str] = []
+    seen_missing: set = set()
+    for s in requested_symbols:
+        t = str(s or "").strip().upper()
+        if not t or t in returned or t in seen_missing or _universe_junk(t, _deny):
+            continue
+        seen_missing.add(t)
+        missing.append(t)
+    if not missing:
+        return rows_matrix, kept
+
+    grid = sheets.read_values(spreadsheet_id, sheet_name, "A1:ZZ6000") if sheets is not None else None
+    if not grid or not isinstance(grid, list):
+        return rows_matrix, kept
+
+    # Locate the existing header row + Symbol column (same scan as the read-back).
+    old_sym_i = -1
+    hdr_r = -1
+    for r in range(min(len(grid), 25)):
+        row = grid[r] if isinstance(grid[r], list) else []
+        idx = _guard_find_col(row, _GUARD_SYMBOL_ALIASES)
+        if idx >= 0:
+            old_sym_i = idx
+            hdr_r = r
+            break
+    if old_sym_i < 0:
+        return rows_matrix, kept
+
+    def _hnorm(h: Any) -> str:
+        return str(h or "").strip().casefold()
+
+    old_headers = [(_hnorm(h)) for h in (grid[hdr_r] if isinstance(grid[hdr_r], list) else [])]
+    old_idx: Dict[str, int] = {}
+    for i, h in enumerate(old_headers):
+        if h and h not in old_idx:
+            old_idx[h] = i
+
+    missing_set = set(missing)
+    for row in grid[hdr_r + 1:]:
+        if not missing_set:
+            break
+        if not isinstance(row, list) or old_sym_i >= len(row) or _guard_is_blank(row[old_sym_i]):
+            continue
+        t = str(row[old_sym_i]).strip().upper()
+        if t not in missing_set:
+            continue
+        aligned: List[Any] = []
+        for h in headers:
+            j = old_idx.get(_hnorm(h), -1)
+            aligned.append(row[j] if 0 <= j < len(row) else "")
+        rows_matrix.append(aligned)
+        kept.append(t)
+        missing_set.discard(t)
+
+    return rows_matrix, kept
+
+
 def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
     try:
         import importlib
@@ -2371,6 +2540,22 @@ async def _run_one_task(
             and _guard_norm(task.sheet_name) in _market_readback_pages()
         ):
             _existing_syms = _read_existing_page_symbols(sheets, spreadsheet_id, task.sheet_name, max_syms)
+            # v6.19.0 (WHY 2): drop deny-pattern junk BEFORE it is requested —
+            # otherwise the persistence fix below would make it immortal.
+            if _existing_syms:
+                _deny_pats = _universe_deny_patterns()
+                if _deny_pats:
+                    _clean_syms = [s for s in _existing_syms if not _universe_junk(s, _deny_pats)]
+                    _n_dropped = len(_existing_syms) - len(_clean_syms)
+                    if _n_dropped:
+                        _fw = (
+                            f"{_UNIVERSE_FILTER_TAG} dropped {_n_dropped} deny-pattern "
+                            f"symbol(s) from the {task.sheet_name} read-back universe "
+                            f"(TFB_SYNC_UNIVERSE_DENY)."
+                        )
+                        res.warnings.append(_fw)
+                        logger.warning(_fw)
+                    _existing_syms = _clean_syms
             if _existing_syms:
                 symbols = _existing_syms
                 res.warnings.append(
@@ -2613,6 +2798,36 @@ async def _run_one_task(
             res.warnings.append(msg)
             logger.warning(msg)
             return res
+        # ---------------------------------------------------------------------
+
+        # --- Per-symbol persistence (v6.19.0, WHY 1) -------------------------
+        # The empty-guard blocks a ZERO-row write and the shrink guard blocks
+        # <70% coverage — but a 70-99% fetch still rewrote the page verbatim,
+        # silently deleting every requested symbol the backend missed (and,
+        # because the sheet is the symbol source, deleting it PERMANENTLY).
+        # Append the last-good row of each requested-but-missing symbol so a
+        # fetch miss can never remove an operator symbol; the next healthy
+        # fetch replaces the preserved row with fresh data in place.
+        if (_symbol_persistence_enabled() and task.expects_rows and symbols
+                and rows_matrix and headers and sheets is not None):
+            try:
+                rows_matrix, _kept_syms = _persist_missing_symbol_rows(
+                    sheets, spreadsheet_id, task.sheet_name, headers, rows_matrix, symbols
+                )
+                if _kept_syms:
+                    _pw = (
+                        f"{_SYMBOL_PERSISTENCE_TAG} preserved {len(_kept_syms)} "
+                        f"last-good row(s) for fetch-missed symbol(s) on "
+                        f"'{task.sheet_name}': {', '.join(_kept_syms[:15])}"
+                        f"{'…' if len(_kept_syms) > 15 else ''} — a fetch miss no "
+                        f"longer deletes a requested symbol."
+                    )
+                    res.warnings.append(_pw)
+                    logger.warning(_pw)
+            except Exception as _pe:  # never let persistence break the write path
+                _pw = f"{_SYMBOL_PERSISTENCE_TAG} skipped (error: {_pe})"
+                res.warnings.append(_pw)
+                logger.warning(_pw)
         # ---------------------------------------------------------------------
 
         # v6.18.0 (Fix 2): cancellation-safe ordering. Legacy clear-then-write
