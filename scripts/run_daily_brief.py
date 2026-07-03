@@ -34,6 +34,18 @@ ENV
     TFB_MAIL_SMTP_PORT   default: 587 (STARTTLS); 465 uses implicit SSL
     TFB_BRIEF_SEND       set to "1" to send without passing --send
 
+v1.2.0 — NO-CANDIDATE HERO FIX
+    When the decision layer produced no high-confidence ADD, the HTML hero still
+    rendered the buy-day template with the em-dash placeholder: "then add —" /
+    "Put ~0 SAR into —, the one buy the engine backs at high confidence" (and
+    the hidden inbox preheader read "add —"). The plaintext part and the subject
+    line already branched on the no-add case; the HTML hero now branches the
+    same way (three variants: buy day / free-cash-only day / no-action day),
+    and the exit/trim sentence is assembled from only the NON-EMPTY clauses so
+    an empty sell or trim list can no longer print "Exit the weak names (—)" or
+    "trim your overweight — back to cap". Rendering for a normal buy day is
+    unchanged. No contract, ENV, or CLI change.
+
 USAGE
     python run_daily_brief.py                         # live (CI): read sheet, write html
     python run_daily_brief.py --send                  # live: read sheet, write html, email it
@@ -42,7 +54,7 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import datetime as _dt
@@ -421,6 +433,43 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     trim_sym = d["trim"][0]["symbol"].split(".")[0] if d["trim"] else "—"
     add_sym = add["symbol"] if add else "—"
 
+    # v1.2.0: build the hero conditionally instead of always rendering the
+    # buy-day template. See the module docstring WHY block. The exit/trim
+    # sentence is assembled from only the non-empty clauses.
+    if d["sell"] and d["trim"]:
+        freed_sentence = (f'Exit the weak names (<strong>{_esc(sell_syms)}</strong>) and trim your '
+                          f'overweight <strong>{_esc(trim_sym)}</strong> back to cap')
+    elif d["sell"]:
+        freed_sentence = f'Exit the weak names (<strong>{_esc(sell_syms)}</strong>)'
+    elif d["trim"]:
+        freed_sentence = f'Trim your overweight <strong>{_esc(trim_sym)}</strong> back to cap'
+    else:
+        freed_sentence = ""
+
+    if add:
+        preheader = f"Today's move: free ~{_money(freed)} SAR, add {add_sym}, keep the rest as dry powder."
+        hero_title = (f'Free up <strong style="color:{INK};">~{_money(freed)}&nbsp;SAR</strong>, '
+                      f'then add <strong style="color:{ADD_C};">{_esc(add_sym)}</strong>')
+        hero_body = (f'{freed_sentence} — about <strong>{_money(freed)}&nbsp;SAR</strong> freed. '
+                     f'Put <strong>~{_money(add_sar)}&nbsp;SAR</strong> into {_esc(add_sym)}, the one buy '
+                     f'the engine backs at high confidence. The remaining <strong style="color:{INK};">'
+                     f'~{_money(dry)}&nbsp;SAR is dry powder</strong> for the new opportunities below.')
+    elif freed_sentence:
+        preheader = (f"Today's move: free ~{_money(freed)} SAR and hold it as dry powder — "
+                     f"no buy clears the bar today.")
+        hero_title = (f'Free up <strong style="color:{INK};">~{_money(freed)}&nbsp;SAR</strong> '
+                      f'and hold it as dry powder')
+        hero_body = (f'{freed_sentence} — about <strong>{_money(freed)}&nbsp;SAR</strong> freed. '
+                     f'<strong>No buy clears the engine\'s high-confidence bar today</strong>, so the '
+                     f'full <strong style="color:{INK};">~{_money(freed)}&nbsp;SAR stays as dry '
+                     f'powder</strong> for the new opportunities below.')
+    else:
+        preheader = "No high-confidence portfolio action today — review the opportunities inside."
+        hero_title = 'No portfolio action required today'
+        hero_body = ('Nothing in your book meets the high-confidence bar for action this morning, and '
+                     'no buy clears it either. Your holdings stay as they are; the opportunity list '
+                     'below is for monitoring.')
+
     # ---- action rows ----
     sell_rows = "".join(
         _action_row(r, "EXIT" if r else "EXIT", SELL_C, "#FBEEEC", "#EBD5D1",
@@ -451,7 +500,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{_esc(owner)} — Daily Investment Brief</title></head>
 <body style="margin:0; padding:0; background:#E7E4DC; -webkit-text-size-adjust:100%;">
-<div style="display:none; max-height:0; overflow:hidden; opacity:0; color:#E7E4DC; font-size:1px; line-height:1px;">Today's move: free ~{_money(freed)} SAR, add {add_sym}, keep the rest as dry powder.</div>
+<div style="display:none; max-height:0; overflow:hidden; opacity:0; color:#E7E4DC; font-size:1px; line-height:1px;">{preheader}</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#E7E4DC; padding:24px 12px;"><tr><td align="center">
 <table role="presentation" width="640" cellpadding="0" cellspacing="0" style="width:640px; max-width:640px; background:#FFFFFF; border:1px solid #D8D3C8;">
 
@@ -470,8 +519,8 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
   <tr><td style="padding:26px 32px 6px 32px;">
     <div style="font-family:{SANS}; font-size:11px; letter-spacing:2px; color:{INK}; font-weight:bold;">TODAY'S ONE MOVE</div>
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:10px; border:1px solid #C9D2C4; border-left:4px solid {ADD_C}; background:#F2F8F4;"><tr><td style="padding:18px 20px;">
-      <div style="font-family:{SERIF}; font-size:20px; color:#1A1A1A; line-height:1.4;">Free up <strong style="color:{INK};">~{_money(freed)}&nbsp;SAR</strong>, then add <strong style="color:{ADD_C};">{_esc(add_sym)}</strong></div>
-      <div style="font-family:{SANS}; font-size:14px; color:#4A4A4A; line-height:1.65; margin-top:8px;">Exit the weak names (<strong>{_esc(sell_syms)}</strong>) and trim your overweight <strong>{_esc(trim_sym)}</strong> back to cap — about <strong>{_money(freed)}&nbsp;SAR</strong> freed. Put <strong>~{_money(add_sar)}&nbsp;SAR</strong> into {_esc(add_sym)}, the one buy the engine backs at high confidence. The remaining <strong style="color:{INK};">~{_money(dry)}&nbsp;SAR is dry powder</strong> for the new opportunities below.</div>
+      <div style="font-family:{SERIF}; font-size:20px; color:#1A1A1A; line-height:1.4;">{hero_title}</div>
+      <div style="font-family:{SANS}; font-size:14px; color:#4A4A4A; line-height:1.65; margin-top:8px;">{hero_body}</div>
       <div style="font-family:{SANS}; font-size:12px; color:#888; line-height:1.6; margin-top:10px; padding-top:9px; border-top:1px dashed #CDD8CC;">All high-confidence calls. A plan for your decision, not an instruction.</div>
     </td></tr></table>
   </td></tr>
