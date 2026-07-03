@@ -3,9 +3,38 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.19.1)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.19.2)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.19.2 fix — MARKET-PAGE SYMBOL CAP ALIGNED TO THE EXPANDED UNIVERSE
+  (env-tunable TFB_SYNC_MAX_SYMBOLS_MARKET, default 2500)
+- WHY: on 2026-07-03 the owner deliberately expanded the universe by pasting
+  the TFB Symbol Expansion Pack (~1,284 Global_Markets additions + 500
+  Market_Leaders + CFX/MF additions). The hardcoded market-page caps
+  (800/800/400/400) then became the SYMBOL REMOVER: _read_symbols returns at
+  most max_symbols from the sheet, so symbols beyond the cap are never
+  REQUESTED — which means the v6.19.0 persistence guard cannot protect them
+  (it keeps requested-but-missing symbols only) — and the page write drops
+  them. Live fingerprint: Global_Markets pinned at EXACTLY 800 rows after
+  every run while ~2,050 were on the sheet. This deliberately reverses the
+  v6.19.1 decision to hold the cap at 800; that decision's premise ("no
+  universe CSV was pasted") no longer holds.
+- FIX: the four market pages' TaskSpec caps now come from
+  _market_symbol_cap(): TFB_SYNC_MAX_SYMBOLS_MARKET if set (clamped 1..5000),
+  else 2500 — sized to the expansion pack's documented ceiling with headroom.
+  My_Portfolio stays at 800 (its symbols come from _Portfolio_CostBasis, ~10
+  names; the cap is irrelevant there). The CLI --max-symbols override and the
+  safe_limit request ceiling flow from the same value automatically.
+- RUNTIME NOTE (watch item, not a change): ~2,050 Global_Markets symbols at
+  TFB_SYNC_SYMBOL_BATCH_SIZE=25 is ~82 backend requests for that page alone.
+  Morning windows absorb this easily; midday Yahoo throttle will yield partial
+  coverage — which is now NON-DESTRUCTIVE (shrink guard skips the write below
+  the coverage floor; persistence keeps last-good rows above it). If the
+  GitHub job starts brushing its 45-minute timeout, raise timeout-minutes in
+  daily_sync.yml or the batch size — do not lower this cap back.
+- New helper: _market_symbol_cap. Everything else is byte-identical to
+  v6.19.1.
 
 v6.19.1 fix — STRICT RESPONSE MEMBERSHIP (unrequested backend rows were
   expanding the page universe)
@@ -516,7 +545,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.19.1"
+SCRIPT_VERSION = "6.19.2"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2032,6 +2061,23 @@ def _persist_missing_symbol_rows(
     return rows_matrix, kept
 
 
+def _market_symbol_cap() -> int:
+    """v6.19.2: per-page symbol cap for the four MARKET pages (Market_Leaders,
+    Global_Markets, Commodities_FX, Mutual_Funds). Default 2500 — sized to the
+    Symbol Expansion Pack / build_universes documented ceiling with headroom —
+    override with TFB_SYNC_MAX_SYMBOLS_MARKET (clamped 1..5000). A cap SMALLER
+    than the sheet universe silently un-requests the overflow, and the
+    persistence guard can only protect REQUESTED symbols, so an undersized cap
+    acts as a symbol remover (the 2026-07-03 Global_Markets pin at exactly 800
+    rows). Fail-safe: any unparsable value falls back to 2500."""
+    raw = (os.getenv("TFB_SYNC_MAX_SYMBOLS_MARKET") or "").strip()
+    try:
+        v = int(raw) if raw else 2500
+    except Exception:
+        v = 2500
+    return max(1, min(v, 5000))
+
+
 def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
     try:
         import importlib
@@ -2074,10 +2120,10 @@ def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[
 def _default_tasks() -> List[TaskSpec]:
     return [
         TaskSpec(key="MY_PORTFOLIO", sheet_name="My_Portfolio", gateway="enriched", priority=1, max_symbols=800, allow_empty_symbols=True, expects_rows=True),
-        TaskSpec(key="MARKET_LEADERS", sheet_name="Market_Leaders", gateway="enriched", priority=2, max_symbols=800, allow_empty_symbols=True, expects_rows=True),
-        TaskSpec(key="GLOBAL_MARKETS", sheet_name="Global_Markets", gateway="enriched", priority=3, max_symbols=800, allow_empty_symbols=True, expects_rows=True),
-        TaskSpec(key="COMMODITIES_FX", sheet_name="Commodities_FX", gateway="enriched", priority=4, max_symbols=400, allow_empty_symbols=True, expects_rows=True),
-        TaskSpec(key="MUTUAL_FUNDS", sheet_name="Mutual_Funds", gateway="enriched", priority=5, max_symbols=400, allow_empty_symbols=True, expects_rows=True),
+        TaskSpec(key="MARKET_LEADERS", sheet_name="Market_Leaders", gateway="enriched", priority=2, max_symbols=_market_symbol_cap(), allow_empty_symbols=True, expects_rows=True),
+        TaskSpec(key="GLOBAL_MARKETS", sheet_name="Global_Markets", gateway="enriched", priority=3, max_symbols=_market_symbol_cap(), allow_empty_symbols=True, expects_rows=True),
+        TaskSpec(key="COMMODITIES_FX", sheet_name="Commodities_FX", gateway="enriched", priority=4, max_symbols=_market_symbol_cap(), allow_empty_symbols=True, expects_rows=True),
+        TaskSpec(key="MUTUAL_FUNDS", sheet_name="Mutual_Funds", gateway="enriched", priority=5, max_symbols=_market_symbol_cap(), allow_empty_symbols=True, expects_rows=True),
         # Special/meta pages — do NOT require symbols
         TaskSpec(key="INSIGHTS_ANALYSIS", sheet_name="Insights_Analysis", gateway="analysis", priority=6, max_symbols=0, allow_empty_symbols=True),
         TaskSpec(key="TOP_10_INVESTMENTS", sheet_name="Top_10_Investments", gateway="analysis", priority=7, max_symbols=0, allow_empty_symbols=True),
