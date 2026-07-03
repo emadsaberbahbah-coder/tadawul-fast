@@ -22,10 +22,16 @@ on:
     - cron: "0 6 * * 0-4"
   workflow_dispatch:
     inputs:
+      # 2026-07-03 PREVIEW-BY-DEFAULT: default was `true`, so every manual
+      # "Run workflow" click SENT a real email — each test/verification
+      # dispatch produced a duplicate brief in the inbox. Scheduled runs are
+      # untouched (they never read inputs and always send); a manual click now
+      # renders + uploads the HTML artifact only, unless send is explicitly
+      # ticked. Mirrors digest.yml's dry_run-by-default manual behavior.
       send:
-        description: "Email the brief? (false = render only, no send)"
+        description: "Actually email the brief? (default: preview only — renders the HTML artifact, sends nothing)"
         required: false
-        default: true
+        default: false
         type: boolean
 
 concurrency:
@@ -94,9 +100,14 @@ jobs:
             echo "::error::No Google credentials. Set secret GOOGLE_SHEETS_CREDENTIALS (JSON) or GOOGLE_SHEETS_CREDENTIALS_B64."
             exit 1
           fi
+          # 2026-07-03 PREVIEW-BY-DEFAULT: schedule always sends; a manual
+          # dispatch sends ONLY when send=true was explicitly chosen. Any other
+          # value (false, empty, missing) previews — safer than string-matching
+          # "false" alone, which would still send on an empty input.
           SEND_FLAG="--send"
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.send }}" == "false" ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.send }}" != "true" ]]; then
             SEND_FLAG=""
+            echo "Preview mode — rendering only, no email will be sent (set send=true to send)."
           fi
           python scripts/run_daily_brief.py --out daily_brief.html $SEND_FLAG
 
