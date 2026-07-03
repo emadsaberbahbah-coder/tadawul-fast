@@ -1,5 +1,5 @@
 # =============================================================================
-# TADAWUL FAST BRIDGE -- ENTERPRISE GITIGNORE (v7.0.2)
+# TADAWUL FAST BRIDGE -- ENTERPRISE GITIGNORE (v7.0.3)
 # =============================================================================
 #
 # QUANTUM EDITION | ZERO-TRUST SECURITY | CLOUD-NATIVE | NARROW-IGNORE POLICY
@@ -9,6 +9,17 @@
 # - Prefer narrow (root-anchored) ignores over broad (recursive) ignores
 # - Keep source and schema files tracked
 # - Ignore generated outputs, runtime state, credentials, and local-only artifacts
+#
+# v7.0.3 Changes (vs v7.0.2)
+# --------------------------
+# - ADD: `/daily_brief*.html` (root-anchored). scripts/run_daily_brief.py
+#     writes its rendered HTML to ./daily_brief.html by default
+#     (TFB_BRIEF_OUTPUT_PATH). In CI the file is uploaded as a workflow
+#     artifact and never committed, but a LOCAL run inside the repo
+#     followed by `git add .` would sweep the generated brief into the
+#     repository. Root-anchored so a curated sample under docs/ or
+#     examples/ would remain trackable.
+# - PRESERVED: every v7.0.2 rule and negation verbatim.
 #
 # v7.0.2 Changes (vs v7.0.1)
 # --------------------------
@@ -47,7 +58,7 @@
 #     credentials, Python artifacts, ML artifacts, IDE files, notebooks,
 #     and the final "DO NOT IGNORE SOURCE" allowlist.
 #
-# Version: 7.0.2
+# Version: 7.0.3
 # =============================================================================
 
 
@@ -80,6 +91,10 @@ drift_*.log
 # TFB background job DLQ dumps (when TFB_WORKER_DLQ_LOCAL=1)
 /tfb_background_jobs_dead*
 /tfb_dlq_*
+
+# Generated Daily Brief HTML (v7.0.3) -- run_daily_brief.py's local output;
+# CI uploads it as an artifact, it must never be committed.
+/daily_brief*.html
 
 # Runtime caches / temp (ROOT-ONLY -- v7.0.2 fix)
 /models/
@@ -647,7 +662,7 @@ Dockerfile.local
 # =============================================================================
 # FINAL SAFEGUARD
 # =============================================================================
-# This file is part of TADAWUL FAST BRIDGE v7.0.2
+# This file is part of TADAWUL FAST BRIDGE v7.0.3
 #
 # DO NOT remove without understanding the security implications.
 #
