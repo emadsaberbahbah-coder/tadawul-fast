@@ -2,10 +2,53 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.9.1 (ENGINE PICK-ORDER FIX + PER-FAILURE PROVIDER-UNHEALTHY
+EODHD Provider — v4.9.2 (RESPONSE IDENTITY GUARD + ENGINE PICK-ORDER FIX +
+                          PER-FAILURE PROVIDER-UNHEALTHY
                           SIGNAL + CIRCUIT BREAKER + HEALTH PROBE + SESSION
                           COUNTERS + MAY 2026 / v2.8.0 FAMILY ALIGNMENT)
 ================================================================================
+
+v4.9.2 — RESPONSE IDENTITY GUARD (Jul 4, 2026)
+-----------------------------------------------------------------------
+WHY: production sheets on 2026-07-04 carried ~425 Global_Markets rows
+(plus 52 Market_Leaders rows) where one company's full payload (name,
+price, fundamentals) sat under a DIFFERENT requested ticker — e.g.
+1080.SR (Arab National Bank) showing Grab Holdings, BIMAS.IS showing
+Uber, 4163.SR showing Comcast. Clean-room isolation + 11-symbol
+concurrent Render Shell tests reproduced NOTHING, and source audit of
+the engine fan-out, cache keys, snapshot store, and to_eodhd_symbol
+found no many-to-one collapse — the crossing is a rare wrong-response-
+to-caller event under production throttle-storm concurrency (HTTP/2
+retry layer), then AMPLIFIED into permanence by three cache layers
+(provider TTL cache, engine row cache, engine _store_sheet_snapshot
+last-good persistence) and by the sync's v6.19.0 symbol-persistence.
+Root-cause chasing at the transport layer is not verifiable from this
+codebase; the durable fix is a CHOKE-POINT GUARD: both parse paths
+currently IGNORE the identity the response itself declares (`code` on
+real-time, `General.Code`/`General.Exchange` on fundamentals) and stamp
+the requested symbol onto whatever payload arrived. v4.9.2 checks that
+declared identity against the requested normalized symbol and, on a
+definite mismatch, DROPS the payload: returns the standard
+_build_error_patch_with_geo error patch (so the engine falls through to
+its next provider / history exactly like any other EODHD failure),
+tags `provider_identity_mismatch:eodhd` in warnings for sheet-level
+visibility, logs a WARNING with got/want, and never writes the foreign
+payload into quote_cache / fund_cache — a crossed response can no
+longer poison the caches, the engine snapshots, or the sheet.
+
+  AO  NEW `_identity_guard_enabled()` env toggle and NEW pure helper
+       `_response_identity_mismatch(sym, code, exchange)` (lenient:
+       empty/absent declared identity -> no judgement; full-string OR
+       base-ticker match -> pass; only a definite base mismatch drops).
+       Guard wired into `fetch_quote` (checks payload `code`) and
+       `fetch_fundamentals` (checks `General.Code` + `General.Exchange`)
+       immediately after successful JSON, before any field extraction.
+       ENV-GATED, DEFAULT OFF: with TFB_EODHD_IDENTITY_GUARD unset/0 the
+       module is byte-identical to v4.9.1 in behavior. Health/circuit
+       counters are deliberately NOT touched on a mismatch (a crossed
+       response is not an EODHD auth/quota condition). Version bumps:
+       PROVIDER_VERSION="4.9.2", UA_DEFAULT updated, banner retitled.
+       Every v4.9.1 function carried verbatim; none removed; 2 added.
 
 v4.9.1 — ENGINE PICK-ORDER FIX (May 12, 2026)
 -----------------------------------------------------------------------
@@ -638,11 +681,11 @@ def _build_error_patch_with_geo(
 # v4.9.0 — Constants and version
 # =============================================================================
 
-PROVIDER_VERSION = "4.9.1"
+PROVIDER_VERSION = "4.9.2"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
-UA_DEFAULT = "TFB-EODHD/4.9.1 (Render)"
+UA_DEFAULT = "TFB-EODHD/4.9.2 (Render)"
 
 try:
     import orjson  # type: ignore
@@ -1194,6 +1237,45 @@ def _merge_warnings_inplace(target: Dict[str, Any], incoming: Any) -> None:
 # Symbol normalization (GLOBAL, incl. international)
 # (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
+def _identity_guard_enabled() -> bool:
+    """v4.9.2 AO: response-identity guard toggle. Default OFF; set
+    TFB_EODHD_IDENTITY_GUARD=1 to drop payloads whose self-declared
+    identity does not match the requested symbol. OFF => byte-identical
+    v4.9.1 behavior."""
+    return _env_str("TFB_EODHD_IDENTITY_GUARD", "0").strip().lower() in _TRUTHY
+
+
+def _response_identity_mismatch(
+    sym: str,
+    code: Any,
+    exchange: Any = None,
+) -> Optional[str]:
+    """v4.9.2 AO: compare the identity a payload DECLARES about itself
+    against the EODHD-normalized symbol we requested. Returns the
+    observed identity string on a DEFINITE mismatch, else None.
+
+    Lenient by design — this must never drop a genuine row:
+      * empty/absent `code`  -> None (no judgement; keep v4.9.1 path);
+      * full-string equality -> None;
+      * base-ticker equality (suffix drift only, e.g. requested
+        AAPL.US, declared AAPL) -> None;
+      * only a differing base ticker (e.g. requested 1080.SR, declared
+        GRAB / GRAB.US) -> mismatch.
+    """
+    code_s = ("" if code is None else str(code)).strip().upper()
+    if not code_s:
+        return None
+    req = (sym or "").strip().upper()
+    if not req or code_s == req:
+        return None
+    req_base = req.rsplit(".", 1)[0] if "." in req else req
+    code_base = code_s.rsplit(".", 1)[0] if "." in code_s else code_s
+    if code_base == req_base:
+        return None
+    ex_s = ("" if exchange is None else str(exchange)).strip().upper()
+    return f"{code_s}.{ex_s}" if (ex_s and "." not in code_s) else code_s
+
+
 def normalize_eodhd_symbol(symbol: str) -> str:
     s = (symbol or "").strip()
     if not s:
@@ -1741,6 +1823,24 @@ class EODHDClient:
                 # when the err indicates an auth-class failure.
                 return _build_error_patch_with_geo(sym_raw, sym, err or "bad_payload"), err or "bad_payload"
 
+            # v4.9.2 AO: response identity guard — the real-time payload
+            # declares which instrument it belongs to in `code`; a definite
+            # mismatch means this response is NOT ours (crossed under load).
+            # Drop it exactly like a fetch failure so the engine falls
+            # through, and never let it into quote_cache.
+            if _identity_guard_enabled():
+                _got = _response_identity_mismatch(sym, data.get("code"))
+                if _got:
+                    _err = f"identity_mismatch got={_got} want={sym}"
+                    logger.warning(
+                        "[eodhd v%s] real-time identity mismatch: requested %s got %s — payload dropped",
+                        PROVIDER_VERSION, sym, _got,
+                    )
+                    return _build_error_patch_with_geo(
+                        sym_raw, sym, _err,
+                        extra_warnings=["provider_identity_mismatch:eodhd"],
+                    ), _err
+
             close = safe_float(_first_present(data.get("close"), data.get("adjusted_close"), data.get("last"), data.get("price")))
             prev = safe_float(_first_present(data.get("previousClose"), data.get("previous_close"), data.get("prev_close")))
             open_px = safe_float(_first_present(data.get("open"), data.get("dayOpen"), data.get("day_open")))
@@ -1839,6 +1939,24 @@ class EODHDClient:
             splits = data.get("SplitsDividends") or {}
             etf_data = data.get("ETF_Data") or {}
             financials = data.get("Financials") or {}
+
+            # v4.9.2 AO: response identity guard — fundamentals declare
+            # their instrument in General.Code / General.Exchange; a definite
+            # mismatch means a crossed payload. Drop before extraction and
+            # never let it into fund_cache.
+            if _identity_guard_enabled():
+                _got = _response_identity_mismatch(
+                    sym, general.get("Code"), general.get("Exchange"))
+                if _got:
+                    _err = f"identity_mismatch got={_got} want={sym}"
+                    logger.warning(
+                        "[eodhd v%s] fundamentals identity mismatch: requested %s got %s — payload dropped",
+                        PROVIDER_VERSION, sym, _got,
+                    )
+                    return _build_error_patch_with_geo(
+                        sym_raw, sym, _err,
+                        extra_warnings=["provider_identity_mismatch:eodhd"],
+                    ), _err
 
             if not general and not highlights and not financials:
                 warnings_list.append("fundamentals_empty")
