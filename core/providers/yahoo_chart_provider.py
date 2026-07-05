@@ -15,6 +15,30 @@ Provides financial market data from Yahoo Finance:
   - Risk statistics (volatility, drawdown, VaR, Sharpe, RSI)
   - Price forecasts using log-linear regression
 
+v8.4.0 Changes (from v8.3.0) — YAHOO SYMBOL SSOT AT THE TICKER BOUNDARY
+------------------------------------------------------------------------
+Root cause of the 2026-07-05 quota blackout's Yahoo half: THIS provider
+handed yfinance the raw normalized symbol, so every `.US`-suffixed name
+(BBD.US / FER.US / RCI.US ... ~2,300 rows) 404'd on Yahoo by construction
+("possibly delisted" across the 5d/2y/1mo ladder) — Yahoo's free history
+was unreachable, pushing the gap-backfill onto PAID EODHD eod/history
+calls. yahoo_fundamentals_provider fixed the same class in v6.3.1; this
+file never got the fix (zero to_yahoo_symbol references before v8.4.0).
+
+  - The existing v8.2.0 SSOT import block now ALSO binds
+    `to_yahoo_symbol` from core/symbols/normalize.py.
+  - `_yc_yahoo_symbol(sym)` maps the symbol ONLY for the actual
+    `yf.Ticker(...)` calls (both sites); cache keys, metrics labels,
+    logs, and every returned payload keep the ORIGINAL symbol.
+  - Local fallback `_yc_local_to_yahoo` (used only when the SSOT import
+    fails) STRIPS `.US` to bare — the exact gap the fundamentals
+    provider's local map still has — and remaps the divergent suffixes
+    (NSE->NS, BSE->BO, XETRA->DE, AU->AX, KO->KS). Symbols containing
+    `=`, `^`, or `-` pass through untouched (FX/futures/indices/crypto).
+  - Kill-switch: TFB_YC_SYMBOL_MAP (default ON; 0/false/off restores
+    the v8.3.0 raw-symbol behavior byte-for-byte).
+  - `PROVIDER_VERSION = "8.4.0"`.
+
 v8.3.0 Changes (from v8.2.0)
 ----------------------------
 Bounded retry + backoff for Yahoo history rate-limiting. `fetch_history_raw`
@@ -290,6 +314,7 @@ except ImportError:
 # down in this module.
 
 _infer_symbol_metadata_external: Optional[Callable[[str], Dict[str, Any]]] = None
+_to_yahoo_symbol_external: Optional[Callable[[str], str]] = None  # v8.4.0
 for _norm_path in (
     "core.symbols.normalize",
     "core.normalize",
@@ -301,11 +326,61 @@ for _norm_path in (
         _fn_v82 = getattr(_norm_mod_v82, "infer_symbol_metadata", None)
         if callable(_fn_v82):
             _infer_symbol_metadata_external = _fn_v82
+            # v8.4.0: bind to_yahoo_symbol from the SAME module so the
+            # yf.Ticker call receives Yahoo-format symbols (BBD, not BBD.US).
+            _fn_y84 = getattr(_norm_mod_v82, "to_yahoo_symbol", None)
+            if callable(_fn_y84):
+                _to_yahoo_symbol_external = _fn_y84
             break
     except ImportError:
         continue
     except Exception:
         continue
+
+
+# v8.4.0: EODHD->Yahoo remap used ONLY when the SSOT import failed. Unlike
+# the fundamentals provider's local map, this one also strips the `.US`
+# suffix (Yahoo US tickers are bare) — the gap that caused the 404 storm.
+_YC_EODHD_TO_YAHOO_LOCAL: Dict[str, str] = {
+    "NSE": "NS",     # India NSE   -> Yahoo .NS
+    "BSE": "BO",     # India BSE   -> Yahoo .BO
+    "XETRA": "DE",   # Germany     -> Yahoo .DE
+    "AU": "AX",      # Australia   -> Yahoo .AX
+    "KO": "KS",      # Korea KOSPI -> Yahoo .KS
+}
+
+
+def _yc_local_to_yahoo(sym: str) -> str:
+    s = (sym or "").strip()
+    if not s or any(ch in s for ch in "=^-") or "." not in s:
+        return s
+    base, _, suf = s.rpartition(".")
+    if not base:
+        return s
+    su = suf.upper()
+    if su == "US":
+        return base
+    remapped = _YC_EODHD_TO_YAHOO_LOCAL.get(su)
+    return f"{base}.{remapped}" if remapped else s
+
+
+def _yc_yahoo_symbol(sym: str) -> str:
+    """v8.4.0: Yahoo-format symbol for the ACTUAL yf.Ticker call only.
+    Gated by TFB_YC_SYMBOL_MAP (default ON; 0/false/off -> raw passthrough,
+    byte-identical to v8.3.0). Never returns empty."""
+    s = (sym or "").strip()
+    if not s:
+        return s
+    if os.getenv("TFB_YC_SYMBOL_MAP", "1").strip().lower() in ("0", "false", "off"):
+        return s
+    if _to_yahoo_symbol_external is not None:
+        try:
+            y = _to_yahoo_symbol_external(s)
+            if y:
+                return y
+        except Exception:
+            pass
+    return _yc_local_to_yahoo(s)
 
 # =============================================================================
 # Logging
@@ -319,7 +394,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.3.0"
+PROVIDER_VERSION = "8.4.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -1501,7 +1576,7 @@ def _fetch_ticker_sync(
         return {}, {}, []
 
     try:
-        ticker = yf.Ticker(symbol)
+        ticker = yf.Ticker(_yc_yahoo_symbol(symbol))  # v8.4.0 SSOT map
 
         # Info: fast_info first, then full .info
         info_dict: Dict[str, Any] = {}
@@ -1885,7 +1960,7 @@ class YahooChartProvider:
             _cap = _yf_history_retry_cap_sec()
             for _attempt in range(_attempts):
                 try:
-                    ticker = yf.Ticker(sym)
+                    ticker = yf.Ticker(_yc_yahoo_symbol(sym))  # v8.4.0 SSOT map
                     df = ticker.history(period=period, interval=interval)
                     if not _HAS_PANDAS or pd is None or df is None or df.empty:
                         return []
