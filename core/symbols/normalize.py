@@ -2,10 +2,31 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization — v5.3.2 (ENTERPRISE ALIGNED + METADATA INFERENCE)
+Symbol Normalization — v5.4.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
+
+v5.4.0 (over v5.3.2) — EODHD FOREX mapping for Yahoo =X pairs (owner
+greenlight 2026-07-05; Forward-Looking/CFX reliability item):
+- ADD optional Yahoo-FX -> EODHD FOREX mapping in to_eodhd_symbol():
+  EURUSD=X -> EURUSD.FOREX and singles SAR=X -> USDSAR.FOREX (Yahoo's
+  XXX=X means USD/XXX, so 3-letter bases are prefixed USD; only strict
+  3- or 6-letter bases map — 4/5-letter =X shapes pass through unchanged).
+  WHY: =X symbols are Yahoo-only today and fail in the midday throttle
+  window (2026-07-04 audit: even EURUSD=X returned empty at 13:52); the
+  EODHD All-in-One plan already includes the FOREX virtual exchange, so
+  mapping gives every FX pair an EODHD-primary path with Yahoo untouched
+  as fallback (each provider still normalizes the ORIGINAL sheet symbol).
+- Env-gated DEFAULT OFF (TFB_EODHD_FX_MAP=1); with the flag unset the
+  output is byte-identical to v5.3.2 (verified across a full symbol-class
+  battery). NOTE: to_eodhd_symbol is lru_cached, so the flag is effectively
+  read once per symbol per process — Render restarts on ENV change, which
+  is the same semantics as the import-time CUSTOM_*_MAP env dicts.
+- SCOPE: =F commodity futures are deliberately NOT mapped — EODHD plan
+  coverage for .COMM is unverified; verify via Render Shell before any
+  future extension. VALIDATE before enabling in production: one live
+  EODHD request for EURUSD.FOREX from Render Shell confirms plan coverage.
 
 v5.3.2 (over v5.3.1):
 - FIX to_yahoo_symbol() US dual-class shares: BRK.B / BF.B / HEI.A / CRD.A are
@@ -57,7 +78,7 @@ except Exception:
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-__version__ = "5.3.2"
+__version__ = "5.4.0"
 
 __all__ = [
     "MarketType",
@@ -288,6 +309,10 @@ INDEX_COMMON: Dict[str, str] = {
 }
 
 FX_EQUAL_RE = re.compile(r"^([A-Z]{3,6})=[X]$", re.IGNORECASE)
+# v5.4.0: STRICT shape for the EODHD FOREX mapping only — exactly 3 (Yahoo
+# single, implied USD base) or exactly 6 (full pair) letters. Deliberately
+# narrower than FX_EQUAL_RE so 4/5-letter =X oddities never get mapped.
+_EODHD_FX_STRICT_RE = re.compile(r"^([A-Z]{3}|[A-Z]{6})=X$")
 FX_SLASH_RE = re.compile(r"^([A-Z]{3})/([A-Z]{3})$", re.IGNORECASE)
 FX_DASH_RE = re.compile(r"^([A-Z]{3})-([A-Z]{3})$", re.IGNORECASE)
 FX_SUFFIX_RE = re.compile(r"^([A-Z]{3,6})\.FOREX$", re.IGNORECASE)
@@ -1257,6 +1282,16 @@ def to_eodhd_symbol(symbol: str, *, default_exchange: Optional[str] = None) -> s
     s = normalize_symbol(symbol)
     if not s:
         return ""
+
+    # v5.4.0: optional Yahoo-FX -> EODHD FOREX mapping (TFB_EODHD_FX_MAP=1,
+    # default OFF -> byte-identical to v5.3.2). Must run BEFORE the
+    # is_special_symbol passthrough, which is what returns =X unchanged today.
+    if _env_bool("TFB_EODHD_FX_MAP", False):
+        _m = _EODHD_FX_STRICT_RE.match(s)
+        if _m:
+            _base = _m.group(1)
+            _pair = f"USD{_base}" if len(_base) == 3 else _base
+            return f"{_pair}.FOREX"
 
     if is_special_symbol(s):
         return s
