@@ -2,8 +2,39 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.14.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.15.0)
 ===========================================================
+
+Why this revision (v6.15.0 vs v6.14.0) — F1 WIRING: CONSUME Calendar_Events
+(owner greenlight 2026-07-05, Option B: sheet-as-bus, off the request path)
+
+v6.14.0 added the Days-To-Earnings/ExDiv columns but the Top10 endpoint rows
+carry no next_earnings_date / next_ex_div_date keys yet (adding them backend-
+side would put live calendar calls on the ~100s request path). Option B keeps
+the backend untouched: a daily Actions job (calendar_sync.yml ->
+scripts/run_calendar_sync.py -> core.providers.calendar_provider) publishes a
+small Calendar_Events tab, and THIS script — the consumer — reads it:
+
+  v6.15.0 A  _load_calendar_context(): best-effort read of the
+       Calendar_Events tab (name via TFB_CALENDAR_SHEET, default
+       "Calendar_Events") piggybacking the ALREADY-OPEN Signal_History
+       spreadsheet handle — zero new auth, zero new stores. Header-keyed
+       (Symbol / Next Earnings Date / Next Ex-Div Date); returns {} on any
+       problem (tab absent, gspread down, gate off) with one debug line.
+
+  v6.15.0 B  _merge_calendar_context(rows, ctx): pure helper that
+       setdefault()s the two keys onto each Top10 row — a backend-supplied
+       value ALWAYS wins if it ever appears, so future backend wiring can
+       supersede the sheet with no change here. Called once inside
+       record_signal_snapshots, before snapshots are built; the v6.14.0
+       _days_until math then fills the day columns exactly as tested.
+
+  v6.15.0 C  Gating unchanged: the whole path sits behind the existing
+       TRACK_EVENT_CONTEXT (default ON; =0 restores v6.14.0-blank behaviour
+       byte-for-byte) — no new flag. New ENV: TFB_CALENDAR_SHEET (name only).
+
+  v6.15.0 D  SCRIPT_VERSION 6.14.0 -> 6.15.0 (SERVICE_VERSION follows).
+       No function removed; all prior WHY-blocks carried verbatim.
 
 Why this revision (v6.14.0 vs v6.13.0) — F4: EVENT-CONTEXT CAPTURE
 (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F4)
@@ -487,6 +518,8 @@ Environment
   TRACK_VERBOSE            truthy = verbose logging
   TRACK_EVENT_CONTEXT      v6.14.0: populate the four Signal_History event-
                            context columns (default ON; =0 writes blanks)
+  TFB_CALENDAR_SHEET       v6.15.0: Calendar_Events tab name read for the
+                           earnings/ex-div dates (default Calendar_Events)
   BACKEND_BASE_URL /
   TFB_BASE_URL             TFB API base URL
   TFB_TOKEN / APP_TOKEN /
@@ -537,7 +570,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.14.0"
+SCRIPT_VERSION = "6.15.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -899,6 +932,33 @@ def _days_until(raw: Any) -> Optional[int]:
         return (dt.astimezone(_RIYADH_TZ).date() - today).days
     except Exception:
         return None
+
+
+def _merge_calendar_context(rows: List[Dict[str, Any]],
+                            ctx: Dict[str, Dict[str, Any]]) -> int:
+    """v6.15.0 (F1 wiring): setdefault next_earnings_date / next_ex_div_date
+    onto each row from the Calendar_Events context. Backend-supplied values
+    always win (setdefault). Returns how many rows received at least one key."""
+    if not rows or not ctx:
+        return 0
+    n = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        c = ctx.get(_safe_str(row.get("symbol")).upper())
+        if not c:
+            continue
+        hit = False
+        for k in ("next_earnings_date", "next_ex_div_date"):
+            v = c.get(k)
+            existing = row.get(k)
+            # NOTE: _safe_str(None) returns the string 'None' in this module,
+            # so the emptiness check must be explicit, not _safe_str-based.
+            if v and (existing is None or not str(existing).strip()):
+                row[k] = v
+                hit = True
+        n += 1 if hit else 0
+    return n
 
 
 def _col_to_a1(col: int) -> str:
@@ -4334,6 +4394,49 @@ class PerformanceTrackerApp:
             out.append(snap)
         return out
 
+    def _load_calendar_context(self) -> Dict[str, Dict[str, Any]]:
+        """v6.15.0 (F1 wiring): read the Calendar_Events tab written daily by
+        scripts/run_calendar_sync.py. Best-effort: piggybacks the already-open
+        Signal_History spreadsheet handle; ANY problem returns {} silently
+        (one debug line) — snapshots then behave exactly as v6.14.0."""
+        if not _env_bool("TRACK_EVENT_CONTEXT", True):
+            return {}
+        store = self.signal_store
+        if store is None or getattr(store, "sheet", None) is None:
+            return {}
+        tab = os.getenv("TFB_CALENDAR_SHEET", "Calendar_Events").strip() or "Calendar_Events"
+        try:
+            ws = store.sheet.worksheet(tab)
+            values = ws.get("A1:E2000") or []
+        except Exception as e:
+            logger.debug("calendar context unavailable (%s): %s", tab, e)
+            return {}
+        if not values:
+            return {}
+        hdr = [_safe_str(h) for h in values[0]]
+        hmap = {h: i for i, h in enumerate(hdr)}
+        ci_s = hmap.get("Symbol")
+        ci_e = hmap.get("Next Earnings Date")
+        ci_x = hmap.get("Next Ex-Div Date")
+        if ci_s is None:
+            return {}
+
+        def _cell_at(row: List[Any], idx: Optional[int]) -> str:
+            if idx is None or idx >= len(row):
+                return ""
+            return _safe_str(row[idx])
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in values[1:]:
+            sym = _cell_at(r, ci_s).upper()
+            if not sym:
+                continue
+            e, x = _cell_at(r, ci_e), _cell_at(r, ci_x)
+            if e or x:
+                out[sym] = {"next_earnings_date": e or None,
+                            "next_ex_div_date": x or None}
+        return out
+
     async def record_signal_snapshots(self, rows: List[Dict[str, Any]]) -> int:
         # v6.7.0: log one daily verdict snapshot per decision symbol from the
         # ALREADY-FETCHED Top10 rows. Idempotent per symbol-per-day. Best
@@ -4342,6 +4445,14 @@ class PerformanceTrackerApp:
             return 0
         if not self.signal_store.is_available():
             return 0
+        # v6.15.0 (F1 wiring): merge Calendar_Events dates into the rows so
+        # the v6.14.0 day columns fill. Best-effort; {} -> no-op.
+        try:
+            merged = _merge_calendar_context(rows, self._load_calendar_context())
+            if merged:
+                logger.info("calendar context merged onto %d row(s)", merged)
+        except Exception as e:
+            logger.debug("calendar context merge skipped: %s", e)
         snaps = self._build_signal_snapshots(rows)
         if not snaps:
             return 0
