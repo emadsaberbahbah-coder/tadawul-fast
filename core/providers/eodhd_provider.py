@@ -2,11 +2,31 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.9.2 (RESPONSE IDENTITY GUARD + ENGINE PICK-ORDER FIX +
+EODHD Provider — v4.11.0 (BAR-DATE DISCLOSURE ON HISTORY PATH + RESPONSE
+                          IDENTITY GUARD + ENGINE PICK-ORDER FIX +
                           PER-FAILURE PROVIDER-UNHEALTHY
                           SIGNAL + CIRCUIT BREAKER + HEALTH PROBE + SESSION
                           COUNTERS + MAY 2026 / v2.8.0 FAMILY ALIGNMENT)
 ================================================================================
+
+v4.11.0 — BAR-DATE DISCLOSURE ON THE HISTORY PATH (Fix AR support)
+-----------------------------------------------------------------------
+WHY: the 2026-07-05 audit verified EODHD serving months-old closes AS the
+live quote for non-US exchanges (4503.T 2,152 JPY vs 2,553.50 market,
+-15.7%; 0016.HK ~-16%) — rows that reached the sheet with DQ=100 and fresh
+stamps. The real-time path ALREADY discloses the payload's own time
+(`"timestamp"` from the response's timestamp/date fields, v-existing
+behavior, unchanged here); the internal HISTORY path did not — it set
+current_price from the last bar close and disclosed nothing about that
+bar's date, leaving the engine blind to its age.
+FIX (disclosure only — no price, order, guard, or flow change):
+  - The history-path patch now emits `"timestamp": last_hist_dt` (the
+    exchange-local YYYY-MM-DD of the last close used). The engine
+    (data_engine_v2 v5.104.0, Fix AR) canonicalizes both paths' timestamp
+    into `price_bar_ts` and gates on it (TFB_GATE_PROVIDER_BAR_AGE).
+    Engine gate OFF -> the field is inert; provider behavior is otherwise
+    byte-identical to v4.10.0.
+  - `PROVIDER_VERSION = "4.11.0"`.
 
 v4.9.2 — RESPONSE IDENTITY GUARD (Jul 4, 2026)
 -----------------------------------------------------------------------
@@ -711,7 +731,7 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.10.0"
+PROVIDER_VERSION = "4.11.0"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -2362,6 +2382,10 @@ class EODHDClient:
                     "symbol_normalized": sym,
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
+                    # v4.11.0 (Fix AR support): disclose the exchange-local
+                    # date of the last bar backing current_price so the
+                    # engine's bar-age gate can judge its freshness.
+                    "timestamp": last_hist_dt,
                     "current_price": last,
                     "price": last,
                     "previous_close": prev,
