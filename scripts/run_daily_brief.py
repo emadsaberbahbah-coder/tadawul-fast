@@ -33,6 +33,23 @@ ENV
     TFB_MAIL_SMTP_HOST   default: smtp.gmail.com
     TFB_MAIL_SMTP_PORT   default: 587 (STARTTLS); 465 uses implicit SSL
     TFB_BRIEF_SEND       set to "1" to send without passing --send
+    TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
+                         email and write it next to --out; "0" disables (kill-switch)
+
+v1.4.0 — PDF ATTACHMENT + END-OF-BRIEF ACTION SUMMARY (owner request, 2026-07-05)
+    * Every sent brief now ATTACHES a PDF copy of the recommendations:
+      portfolio actions table, best-new-buys table, and an ACTION SUMMARY
+      table at the end (counts, symbols, cash impact, book totals). Built
+      with reportlab (pure-python; installed by the workflow, NOT added to
+      Render requirements). Guarded end to end: if reportlab is missing or
+      the PDF build fails, the email still sends unchanged — delivery of
+      the brief is never blocked by the attachment.
+    * The same ACTION SUMMARY table is appended near the end of the HTML
+      email (before "When you can act") and to the plaintext part, so all
+      three formats close with the same at-a-glance decision table.
+    * Kill-switch: TFB_BRIEF_PDF=0 disables PDF generation + attachment.
+      Honest-framing language ("valuation targets, not predictions") is
+      carried into the PDF verbatim. All v1.3.0/v1.2.0 behavior unchanged.
 
 v1.3.0 — DECISION-GRADE VISUAL UPGRADE (owner request, 2026-07-03)
     Adds email-safe visual analytics built ONLY from columns verified 100%%
@@ -84,11 +101,12 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import argparse
 import datetime as _dt
 import html as _html
+import io
 import math
 import os
 import re
@@ -709,6 +727,9 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     # ---- v1.3.0: book-at-a-glance diverging P&L bars ----
     glance_block = _glance_block(d)
 
+    # ---- v1.4.0: end-of-brief action summary table ----
+    summary_table = _summary_table_html(model)
+
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{_esc(owner)} — Daily Investment Brief</title></head>
@@ -764,6 +785,8 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
   <tr><td style="padding:20px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#46535F; border-bottom:2px solid {HOLD_C}; padding-bottom:6px;">Across your market pages</div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F5F4F0; border:1px solid #E2DDD2;">{page_rows}</table></td></tr>
+
+{summary_table}
 
   <tr><td style="padding:18px 32px 0 32px;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{INK};"><tr><td style="padding:14px 18px; font-family:{SANS}; font-size:11px; color:#C7D0DC; line-height:1.8;">
@@ -858,6 +881,212 @@ def _page_row(name: str, info: Dict[str, Any]) -> str:
 # ----------------------------------------------------------------------------- #
 # Plaintext fallback + subject + delivery (only used with --send)
 # ----------------------------------------------------------------------------- #
+
+# ----------------------------------------------------------------------------- #
+# v1.4.0 — end-of-brief action summary (HTML) + PDF copy of the recommendations
+# ----------------------------------------------------------------------------- #
+def _grp_cash(recs: List[Dict[str, Any]]) -> float:
+    return sum((r.get("sar") or 0.0) for r in recs)
+
+
+def _summary_table_html(model: Dict[str, Any]) -> str:
+    """v1.4.0: compact ACTION SUMMARY table rendered at the end of the brief."""
+    d = model["decision"]; t = model["top10"]
+    groups = (("EXIT / SELL", d["sell"], SELL_C, True),
+              ("TRIM", d["trim"], TRIM_C, True),
+              ("ADD / BUY", d["add"], ADD_C, True),
+              ("HOLD", d["hold"], HOLD_C, False))
+    body = ""
+    for label, recs, color, cash in groups:
+        syms = ", ".join(_esc(r["symbol"]) for r in recs) or "&mdash;"
+        sar = _grp_cash(recs)
+        sar_s = f"~{sar:,.0f}" if (cash and sar) else "&mdash;"
+        body += (f'<tr>'
+                 f'<td style="padding:7px 10px; font-family:{SANS}; font-size:11px; font-weight:bold; color:{color}; white-space:nowrap; border-bottom:1px solid #E6E1D6;">{label}</td>'
+                 f'<td align="center" style="padding:7px 8px; font-family:{SANS}; font-size:11px; color:#3A3A3A; border-bottom:1px solid #E6E1D6;">{len(recs)}</td>'
+                 f'<td style="padding:7px 10px; font-family:{SANS}; font-size:11px; color:#3A3A3A; line-height:1.5; border-bottom:1px solid #E6E1D6;">{syms}</td>'
+                 f'<td align="right" style="padding:7px 10px; font-family:{SANS}; font-size:11px; color:#3A3A3A; white-space:nowrap; border-bottom:1px solid #E6E1D6;">{sar_s}</td>'
+                 f'</tr>')
+    buys = ", ".join(_esc(p["symbol"]) for p in t["top"]) or "&mdash;"
+    body += (f'<tr>'
+             f'<td style="padding:7px 10px; font-family:{SANS}; font-size:11px; font-weight:bold; color:{STEEL}; white-space:nowrap;">NEW BUY CANDIDATES</td>'
+             f'<td align="center" style="padding:7px 8px; font-family:{SANS}; font-size:11px; color:#3A3A3A;">{len(t["top"])}</td>'
+             f'<td style="padding:7px 10px; font-family:{SANS}; font-size:11px; color:#3A3A3A; line-height:1.5;">{buys}</td>'
+             f'<td align="right" style="padding:7px 10px; font-family:{SANS}; font-size:11px; color:#8C97A3;">&mdash;</td>'
+             f'</tr>')
+    pl = _pct(d.get("pl_pct")) if d.get("pl_pct") is not None else "&mdash;"
+    totals = (f'Book <strong>{_money(d["mv"])}&nbsp;SAR</strong> &nbsp;&middot;&nbsp; '
+              f'P&amp;L <strong>{pl}</strong> &nbsp;&middot;&nbsp; '
+              f'Freed cash <strong>~{_money(d["freed_cash"])}&nbsp;SAR</strong>')
+    return f"""  <tr><td style="padding:20px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:{INK}; border-bottom:2px solid {INK}; padding-bottom:6px;">Action summary <span style="font-family:{SANS}; font-size:11px; color:#7E8AA0; letter-spacing:0.5px;">EVERYTHING ABOVE, AT A GLANCE</span></div></td></tr>
+  <tr><td style="padding:10px 32px 0 32px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FBFAF7; border:1px solid #E6E1D6;">
+      <tr>
+        <td style="padding:7px 10px; font-family:{SANS}; font-size:10px; letter-spacing:1px; color:#FFFFFF; background:{INK};">ACTION</td>
+        <td align="center" style="padding:7px 8px; font-family:{SANS}; font-size:10px; letter-spacing:1px; color:#FFFFFF; background:{INK};">#</td>
+        <td style="padding:7px 10px; font-family:{SANS}; font-size:10px; letter-spacing:1px; color:#FFFFFF; background:{INK};">SYMBOLS</td>
+        <td align="right" style="padding:7px 10px; font-family:{SANS}; font-size:10px; letter-spacing:1px; color:#FFFFFF; background:{INK};">CASH&nbsp;(SAR)</td>
+      </tr>
+      {body}
+    </table>
+    <div style="font-family:{SANS}; font-size:11px; color:#5B6B7A; padding:8px 2px 0 2px;">{totals}</div>
+  </td></tr>"""
+
+
+def _pdf_txt(v: Any, limit: int = 64) -> str:
+    """Latin-1-safe text for reportlab core fonts (truncated, replaced)."""
+    s = _s(v)
+    if len(s) > limit:
+        s = s[: limit - 3] + "..."
+    return s.encode("latin-1", "replace").decode("latin-1")
+
+
+def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optional[bytes]:
+    """v1.4.0: PDF copy of the recommendations. Returns bytes, or None on any
+    failure (missing reportlab / build error) — the email must never be blocked
+    by the attachment."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import (HRFlowable, Paragraph, SimpleDocTemplate,
+                                        Spacer, Table, TableStyle)
+    except Exception as exc:  # pragma: no cover - environment dependent
+        sys.stderr.write(f"[brief] PDF skipped (reportlab unavailable: {exc}); "
+                         f"email will carry no attachment\n")
+        return None
+    try:
+        d = model["decision"]; t = model["top10"]
+        ink = colors.HexColor(INK); brass = colors.HexColor(BRASS)
+        grid = colors.HexColor("#D8D3C8"); zebra = colors.HexColor("#F6F4EF")
+        st_title = ParagraphStyle("title", fontName="Helvetica-Bold", fontSize=16,
+                                  textColor=ink, spaceAfter=2)
+        st_sub = ParagraphStyle("sub", fontName="Helvetica", fontSize=9,
+                                textColor=colors.HexColor("#5B6B7A"), spaceAfter=6)
+        st_h2 = ParagraphStyle("h2", fontName="Helvetica-Bold", fontSize=11.5,
+                               textColor=ink, spaceBefore=10, spaceAfter=3)
+        st_note = ParagraphStyle("note", fontName="Helvetica", fontSize=7.5,
+                                 textColor=colors.HexColor("#555555"), spaceAfter=4)
+        st_foot = ParagraphStyle("foot", fontName="Helvetica", fontSize=7,
+                                 textColor=colors.HexColor("#8A857A"), spaceBefore=10)
+
+        def _hr():
+            return HRFlowable(width="100%", thickness=0.8, color=brass, spaceAfter=5)
+
+        def _tstyle(action_colors: Optional[Dict[int, str]] = None) -> TableStyle:
+            cmds = [
+                ("BACKGROUND", (0, 0), (-1, 0), ink),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 7.5),
+                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 1), (-1, -1), 7.5),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("GRID", (0, 0), (-1, -1), 0.4, grid),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, zebra]),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]
+            for ridx, hexc in (action_colors or {}).items():
+                cmds.append(("TEXTCOLOR", (0, ridx), (0, ridx), colors.HexColor(hexc)))
+                cmds.append(("FONTNAME", (0, ridx), (0, ridx), "Helvetica-Bold"))
+            return TableStyle(cmds)
+
+        story: List[Any] = []
+        story.append(Paragraph(_pdf_txt(f"{owner} - Daily Investment Brief", 80), st_title))
+        story.append(Paragraph(_pdf_txt(f"{when:%A, %d %B %Y} - {when:%H:%M} Riyadh - "
+                                        f"recommendations copy (v{__version__})", 110), st_sub))
+        story.append(_hr())
+
+        # --- Portfolio actions ---
+        story.append(Paragraph("Portfolio actions (decision layer)", st_h2))
+        story.append(Paragraph("Actions come from the confidence-gated Portfolio_Decision "
+                               "layer. Daily-horizon decision support - not advice; verify "
+                               "before acting.", st_note))
+        hdr = ["Action", "Symbol", "Name", "P&L %", "Wt %", "ROI 12M", "Rel", "Note"]
+        rows: List[List[str]] = [hdr]
+        acolors: Dict[int, str] = {}
+        for label, recs, hexc in (("EXIT/SELL", d["sell"], SELL_C), ("TRIM", d["trim"], TRIM_C),
+                                  ("ADD", d["add"], ADD_C), ("HOLD", d["hold"], HOLD_C)):
+            for r in recs:
+                rows.append([label, _pdf_txt(r["symbol"], 12), _pdf_txt(r["name"], 30),
+                             _pct(r.get("pl")), _pct(r.get("weight"), 1).lstrip("+"),
+                             _pct(r.get("eroi")), _num_str(r.get("rel")),
+                             _pdf_txt(r.get("note"), 58)])
+                acolors[len(rows) - 1] = hexc
+        if len(rows) == 1:
+            rows.append(["-", "-", "no holdings parsed", "-", "-", "-", "-", "-"])
+        w = [18*mm, 18*mm, 38*mm, 12*mm, 11*mm, 14*mm, 10*mm, 59*mm]
+        story.append(Table(rows, colWidths=w, repeatRows=1, style=_tstyle(acolors)))
+
+        # --- Best new buys ---
+        story.append(Paragraph("Best new buys (all markets)", st_h2))
+        story.append(Paragraph("Ranked entry candidates you do not hold. The figure is the "
+                               "gap to estimated fair value - a valuation target, not a "
+                               "prediction; reliability and confidence show how much weight "
+                               "to give each.", st_note))
+        rows2: List[List[str]] = [["#", "Symbol", "Name", "Market", "Sector",
+                                   "To FV %", "Rel", "Conf"]]
+        n = 0
+        for p in t["top"]:
+            n += 1
+            rows2.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 30),
+                          _pdf_txt(p["market"], 14), _pdf_txt(p["sector"], 18),
+                          _pct(p.get("roi"), 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
+        for market, names in (t.get("rest") or {}).items():
+            for p in names:
+                n += 1
+                rows2.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 30),
+                              _pdf_txt(market, 14), _pdf_txt(p.get("sector"), 18),
+                              _pct(p.get("roi"), 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
+        if len(rows2) == 1:
+            rows2.append(["-", "-", "no funded candidates today", "-", "-", "-", "-", "-"])
+        w2 = [8*mm, 18*mm, 46*mm, 22*mm, 30*mm, 15*mm, 10*mm, 31*mm]
+        story.append(Table(rows2, colWidths=w2, repeatRows=1, style=_tstyle()))
+
+        # --- Action summary (END) ---
+        story.append(Paragraph("Action summary", st_h2))
+        rows3: List[List[str]] = [["ACTION", "#", "SYMBOLS", "CASH (SAR)"]]
+        acolors3: Dict[int, str] = {}
+        for label, recs, hexc, cash in (("EXIT / SELL", d["sell"], SELL_C, True),
+                                        ("TRIM", d["trim"], TRIM_C, True),
+                                        ("ADD / BUY", d["add"], ADD_C, True),
+                                        ("HOLD", d["hold"], HOLD_C, False)):
+            sar = _grp_cash(recs)
+            rows3.append([label, str(len(recs)),
+                          _pdf_txt(", ".join(r["symbol"] for r in recs) or "-", 88),
+                          (f"~{sar:,.0f}" if (cash and sar) else "-")])
+            acolors3[len(rows3) - 1] = hexc
+        rows3.append(["NEW BUY CANDIDATES", str(len(t["top"])),
+                      _pdf_txt(", ".join(p["symbol"] for p in t["top"]) or "-", 88), "-"])
+        acolors3[len(rows3) - 1] = STEEL
+        w3 = [34*mm, 8*mm, 106*mm, 32*mm]
+        story.append(Table(rows3, colWidths=w3, repeatRows=1, style=_tstyle(acolors3)))
+        pl = f"{d['pl_pct']:+.1f}%" if d.get("pl_pct") is not None else "-"
+        story.append(Paragraph(_pdf_txt(f"Book {d['mv']:,.0f} SAR  |  P&L {pl}  |  "
+                                        f"Freed cash ~{d['freed_cash']:,.0f} SAR", 120), st_note))
+
+        story.append(Paragraph("Prepared from your own screening engine for monitoring and "
+                               "decision support - not personalised financial advice or an "
+                               "instruction to trade. Recommendations are daily-horizon; "
+                               "modelled 12-month outlooks carry low-to-moderate reliability. "
+                               "You remain the decision-maker; verify before acting.", st_foot))
+
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15*mm, rightMargin=15*mm,
+                                topMargin=14*mm, bottomMargin=14*mm,
+                                title=f"Daily Investment Brief {when:%Y-%m-%d}",
+                                author=_pdf_txt(owner, 40))
+        doc.build(story)
+        return buf.getvalue()
+    except Exception as exc:
+        sys.stderr.write(f"[brief] PDF build failed ({exc}); email will carry no attachment\n")
+        return None
+
+
 def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     """A concise plaintext alternative part (deliverability + non-HTML clients)."""
     d = model["decision"]; t = model["top10"]
@@ -898,6 +1127,19 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
             _ol = (f" | 1M {_pct(_m2.get('roi1m'))} / 3M {_pct(_m2.get('roi3m'))}" if _m2 else "")
             lines.append(f"  {i}. {p['symbol']} {p['name'][:34]} - {_pct(p['roi'],0)} "
                          f"[{p['market']}, reliability {_num_str(p['rel'])}, {p['conf']}]{_ol}")
+    # v1.4.0: end-of-brief action summary (owner request 2026-07-05)
+    lines += ["", "ACTION SUMMARY"]
+    for label, grp, cash in (("EXIT/SELL", d["sell"], True), ("TRIM", d["trim"], True),
+                             ("ADD", d["add"], True), ("HOLD", d["hold"], False)):
+        if not grp:
+            continue
+        sar = _grp_cash(grp)
+        tail = f" (~{sar:,.0f} SAR)" if (cash and sar) else ""
+        lines.append(f"  {label}: {len(grp)} - " + ", ".join(r["symbol"] for r in grp) + tail)
+    if t["top"]:
+        lines.append(f"  NEW BUYS: {len(t['top'])} - " + ", ".join(p["symbol"] for p in t["top"]))
+    _pl = f"{d['pl_pct']:+.1f}%" if d.get("pl_pct") is not None else "-"
+    lines.append(f"  BOOK: {d['mv']:,.0f} SAR | P&L {_pl} | freed cash ~{d['freed_cash']:,.0f} SAR")
     lines += ["", "When you can act (Riyadh): Tadawul 10:00-15:00 Sun-Thu - US 16:30-23:00 - "
               "Europe ~10:00-19:30 - Tokyo/HK early morning.", ""]
     return "\n".join(lines)
@@ -923,7 +1165,9 @@ def _mail_config() -> Dict[str, Any]:
 
 
 def send_email(html_body: str, text_body: str, subject: str,
-               cfg: Optional[Dict[str, Any]] = None) -> None:
+               cfg: Optional[Dict[str, Any]] = None,
+               pdf_bytes: Optional[bytes] = None,
+               pdf_filename: str = "daily_brief.pdf") -> None:
     """Send the brief over SMTP (STARTTLS on 587 by default, implicit SSL on 465)."""
     import smtplib
     import ssl
@@ -946,6 +1190,9 @@ def send_email(html_body: str, text_body: str, subject: str,
     msg["Message-ID"] = make_msgid()
     msg.set_content(text_body or "Daily Investment Brief")
     msg.add_alternative(html_body, subtype="html")
+    if pdf_bytes:  # v1.4.0: PDF copy of the recommendations
+        msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf",
+                           filename=pdf_filename)
 
     ctx = ssl.create_default_context()
     if cfg["port"] == 465:
@@ -957,7 +1204,8 @@ def send_email(html_body: str, text_body: str, subject: str,
             s.ehlo(); s.starttls(context=ctx); s.ehlo()
             s.login(cfg["user"], cfg["password"])
             s.send_message(msg, from_addr=cfg["user"], to_addrs=recipients)
-    sys.stderr.write(f"[brief] emailed -> {', '.join(recipients)}\n")
+    sys.stderr.write(f"[brief] emailed -> {', '.join(recipients)}"
+                     + (f" (+ {pdf_filename})" if pdf_bytes else "") + "\n")
 
 
 # ----------------------------------------------------------------------------- #
@@ -998,11 +1246,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         fh.write(html_out)
     sys.stderr.write(f"[brief] wrote {len(html_out):,} bytes -> {args.out}\n")
 
+    # v1.4.0: PDF copy of the recommendations (owner request 2026-07-05).
+    # TFB_BRIEF_PDF=0 is the kill-switch; any failure degrades to no attachment.
+    pdf_bytes: Optional[bytes] = None
+    if (os.getenv("TFB_BRIEF_PDF", "1").strip() or "1") != "0":
+        pdf_bytes = render_pdf(model, owner, when)
+        if pdf_bytes:
+            pdf_path = (os.path.splitext(args.out)[0] or "daily_brief") + ".pdf"
+            try:
+                with open(pdf_path, "wb") as fh:
+                    fh.write(pdf_bytes)
+                sys.stderr.write(f"[brief] wrote {len(pdf_bytes):,} bytes -> {pdf_path}\n")
+            except OSError as exc:
+                sys.stderr.write(f"[brief] WARN: could not write {pdf_path}: {exc}\n")
+
     if args.send:
         text_out = render_text(model, owner, when)
         subject = build_subject(model, when)
         try:
-            send_email(html_out, text_out, subject)
+            send_email(html_out, text_out, subject,
+                       pdf_bytes=pdf_bytes,
+                       pdf_filename=f"Investment_Brief_{when:%Y-%m-%d_%H%M}.pdf")
         except Exception as exc:
             sys.stderr.write(f"[brief] ERROR sending email: {exc}\n")
             return 3
