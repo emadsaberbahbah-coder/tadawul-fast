@@ -459,7 +459,44 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
-OPPORTUNITY_BUILDER_VERSION = "1.0.19"
+# =============================================================================
+# v1.0.20 [ENGINE-PRIMARY-BASIS] — the 35%-cap-as-forecast honesty fix
+# (Engineering Audit Fix #3; env-gated TFB_OPP_PRIMARY_ROI_BASIS, DEFAULT
+# "valuation" = byte-identical v1.0.19)
+# =============================================================================
+# ROOT CAUSE (live 2026-07-05 audit): every qualified Top_10 row rendered
+# ROI % = Ann ROI % = exactly 35.0 and the KPI "Exp. Gain 12M" = 34,917 SAR
+# (~35% x deployed). The valuation reference is capped at
+# max_valuation_roi_pct (35), qualified names cluster AT the cap, and the
+# rendered primary roi_pct / ann_roi_pct / exp_gain_12m_sar / kpi are all
+# derived from that capped VALUATION figure — so the headline "expected
+# gain" is a cap artifact, not a forecast. Worst live case: INSW.US, engine
+# 12M forecast +12.7%, displayed ROI 35% and Gain 3,466 SAR (2.75x the
+# engine's own number). The v1.0.5 display fix surfaced the engine figures
+# ALONGSIDE but deliberately left the primary figures intact; this fix lets
+# the primary figures themselves speak the engine's forecast.
+# FIX: TFB_OPP_PRIMARY_ROI_BASIS = "valuation" (default) | "engine".
+#   basis="engine" (per ticket, when an engine 12M forecast EXISTS):
+#     roi_pct / ann_roi_pct <- normalized engine 12M %,
+#     exp_gain_12m_sar <- suggested x engine %/100 (the reproducibility
+#     contract exp_gain == suggested x displayed ann/100 HOLDS under both
+#     bases), valuation figures stay under explicit names
+#     (valuation_roi_pct / valuation_exp_gain_12m_sar — populated in this
+#     mode even if the v1.0.5 display flag is off), the advisor note frames
+#     the primary as the engine forecast and the entry/stop/TP ladder as
+#     valuation-based LEVELS, and ticket["primary_roi_basis"]="engine".
+#   Engine forecast ABSENT for a ticket -> that ticket honestly falls back
+#     to the valuation basis, notes it, and tags
+#     ticket["primary_roi_basis"]="valuation" (fail-open, never invents).
+#   kpis.expected_gain_12m_sar stays == SUM(ticket exp_gain) — the identity
+#     is preserved, the BASIS of the addends changes; a parallel
+#     kpis.valuation_expected_gain_12m_sar is added in engine mode.
+#   SELECTION, GATES, SIZING, ORDERING, STOP/TP LADDER: untouched — the cap
+#     still constrains the valuation TARGET and sizing math; it just no
+#     longer masquerades as the forecast.
+# KILL SWITCH: leave TFB_OPP_PRIMARY_ROI_BASIS unset (or "valuation") ->
+# byte-identical v1.0.19 payload.
+OPPORTUNITY_BUILDER_VERSION = "1.0.20"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -623,6 +660,9 @@ DEFAULT_CRITERIA = {
     "max_valuation_roi_pct": 80.0,
     # v1.0.5 engine-forecast display (env-tunable; see policy block)
     "engine_roi_display_enabled": False,
+    # v1.0.20: basis of the PRIMARY rendered roi/ann/gain figures + KPI.
+    # "valuation" (default, byte-identical) | "engine" (Fix #3 honesty mode).
+    "primary_roi_basis": "valuation",
     # v1.0.6 data-trust gate (env-tunable; see policy block)
     "trust_gate_enabled": True,
     "max_data_age_hours": 168.0,
@@ -804,6 +844,15 @@ def _env_engine_roi_display():
         in ("1", "true", "yes", "on")
 
 
+def _env_primary_roi_basis():
+    """v1.0.20: basis of the primary rendered ROI/gain figures. DEFAULT
+    "valuation" (byte-identical v1.0.19); set
+    TFB_OPP_PRIMARY_ROI_BASIS=engine to make the rendered roi_pct /
+    ann_roi_pct / exp_gain_12m_sar / KPI speak the engine 12M forecast."""
+    v = str(_env_str("TFB_OPP_PRIMARY_ROI_BASIS", "valuation")).strip().lower()
+    return "engine" if v == "engine" else "valuation"
+
+
 def _env_trust_gate():
     """v1.0.6: data-trust gate toggle. Default ON; set TFB_OPP_TRUST_GATE=0 to
     restore byte-identical v1.0.5 behavior (the Data Trust gate is not
@@ -939,6 +988,7 @@ def _env_overrides():
             DEFAULT_CRITERIA["max_valuation_roi_pct"]),
         "valuation_sanity_gate_enabled": _env_valuation_sanity_gate(),
         "engine_roi_display_enabled": _env_engine_roi_display(),
+        "primary_roi_basis": _env_primary_roi_basis(),
         "trust_gate_enabled": _env_trust_gate(),
         "max_data_age_hours": _env_float(
             "TFB_OPP_MAX_DATA_AGE_HOURS",
@@ -984,6 +1034,11 @@ def make_criteria(overrides=None):
         crit["lot_size"] = 1
     if crit["period_months"] < 1:
         crit["period_months"] = 1
+    # v1.0.20: fold any unknown basis literal to the safe default.
+    if str(crit.get("primary_roi_basis") or "").strip().lower() != "engine":
+        crit["primary_roi_basis"] = "valuation"
+    else:
+        crit["primary_roi_basis"] = "engine"
     if crit.get("min_ticket_sar", 0.0) < 0:
         crit["min_ticket_sar"] = 0.0
     return crit
@@ -1957,20 +2012,49 @@ def _build_ticket(rank, pick, criteria, review_date):
     suggested = round(pick["suggested_sar"], 0)
     ann = _round1(cand["ann_roi_pct"]) or 0.0
     exp_gain = round(suggested * ann / 100.0, 0)
+    # v1.0.20 (Fix #3): the swap happens AFTER the valuation figures are
+    # computed so both sets exist. Under the engine basis the reproducibility
+    # contract (exp_gain == suggested x displayed ann/100) HOLDS with
+    # ann = the engine 12M % (the sheet's "Ann ROI %" and "Gain 12M" columns
+    # are 12-month figures, exactly the engine forecast's native horizon).
+    _val_roi = _round1(cand["roi_pct"])
+    _val_ann = ann
+    _val_exp_gain = exp_gain
     # v1.0.5: surface the engine 12M forecast alongside (never substituted into)
     # the valuation roi_pct. OFF => engine_pct stays None and every assignment
     # below is byte-identical v1.0.4.
     _eng_display = bool(criteria.get("engine_roi_display_enabled"))
+    # v1.0.20 (Fix #3): engine-primary basis. Engine mode implies the v1.0.5
+    # enrichment (both figures always visible), so engine_pct is computed
+    # whenever EITHER switch is on. Default mode with display off keeps
+    # engine_pct None -> every assignment below is byte-identical v1.0.19.
+    _basis_engine = (str(criteria.get("primary_roi_basis") or "valuation")
+                     .strip().lower() == "engine")
+    if _basis_engine:
+        _eng_display = True
     engine_pct = (_engine_roi_to_pct(cand["engine_roi_12m_pct"])
                   if _eng_display else None)
+    # Per-ticket effective basis: engine mode falls back HONESTLY to the
+    # valuation basis when the engine forecast is absent (never invents).
+    _ticket_engine_primary = _basis_engine and engine_pct is not None
     detail_engine_roi = _round1(cand["engine_roi_12m_pct"])
     note = _advisor_sentence(cand, suggested, pick["suggested_shares"], conf,
                              review_date)
+    if _ticket_engine_primary:
+        ann = _round1(engine_pct) or 0.0
+        exp_gain = round(suggested * ann / 100.0, 0)
     if _eng_display:
         detail_engine_roi = _round1(engine_pct)
         if engine_pct is None:
             note = note + (" Engine 12M forecast: unavailable \u2014 the upside "
                            "shown is a valuation target, not a forecast.")
+        elif _ticket_engine_primary:
+            note = note + (" Primary ROI/gain are the engine 12M forecast ("
+                           + _fmt_num(_round1(engine_pct))
+                           + "%); valuation target "
+                           + _fmt_num(_val_roi)
+                           + "% \u2014 entry/stop/TP are valuation-based "
+                           "levels, not forecasts.")
         else:
             note = note + (" Engine 12M forecast "
                            + _fmt_num(_round1(engine_pct))
@@ -1992,8 +2076,10 @@ def _build_ticket(rank, pick, criteria, review_date):
         "stop_sar": _round2((cand["stop"] or 0) * fx if fx else None),
         "tp1_sar": _round2((cand["tp1"] or 0) * fx if fx else None),
         "tp2_sar": _round2((cand["tp2"] or 0) * fx if fx else None),
-        "roi_pct": _round1(cand["roi_pct"]),
-        "ann_roi_pct": _round1(cand["ann_roi_pct"]),
+        "roi_pct": (_round1(engine_pct) if _ticket_engine_primary
+                    else _val_roi),
+        "ann_roi_pct": (ann if _ticket_engine_primary
+                        else _round1(cand["ann_roi_pct"])),
         "exp_gain_12m_sar": round(exp_gain, 0),
         "reliability": _round1(cand["reliability"]),
         "dq": _round1(cand["dq"]),
@@ -2025,9 +2111,15 @@ def _build_ticket(rank, pick, criteria, review_date):
         engine_gain = (round(suggested * engine_pct / 100.0, 0)
                        if engine_pct is not None else None)
         ticket["engine_roi_pct"] = _round1(engine_pct)
-        ticket["valuation_roi_pct"] = _round1(cand["roi_pct"])
+        ticket["valuation_roi_pct"] = _val_roi
         ticket["engine_exp_gain_12m_sar"] = engine_gain
-        ticket["valuation_exp_gain_12m_sar"] = ticket["exp_gain_12m_sar"]
+        # v1.0.20: under the engine basis exp_gain_12m_sar IS the engine
+        # figure, so the valuation parallel must carry the true valuation
+        # gain (pre-swap), not a copy of the primary.
+        ticket["valuation_exp_gain_12m_sar"] = _val_exp_gain
+    if _basis_engine:
+        ticket["primary_roi_basis"] = ("engine" if _ticket_engine_primary
+                                       else "valuation")
     return ticket
 
 
@@ -2335,13 +2427,22 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         "passed": len(invest),
         "capital_unallocated_sar": round(deployable - total_suggested, 0),
     }
-    # v1.0.5: parallel engine-based expected gain (additive; the valuation-based
-    # expected_gain_12m_sar above is left intact so kpi gain == Σ ticket gains).
+    # v1.0.5: parallel engine-based expected gain (additive; the primary
+    # expected_gain_12m_sar above stays == Σ ticket exp_gain — v1.0.20 note:
+    # under TFB_OPP_PRIMARY_ROI_BASIS=engine the ADDENDS are engine-based, so
+    # the identity is preserved while the KPI stops being a 35%-cap artifact).
     if crit.get("engine_roi_display_enabled"):
         _eng_gains = [t.get("engine_exp_gain_12m_sar") for t in tickets
                       if t.get("engine_exp_gain_12m_sar") is not None]
         kpis["engine_expected_gain_12m_sar"] = (
             round(sum(_eng_gains), 0) if _eng_gains else None)
+    # v1.0.20: in engine mode also surface the valuation-based total under an
+    # explicit name so the target-vs-forecast spread is visible at KPI level.
+    if str(crit.get("primary_roi_basis") or "").strip().lower() == "engine":
+        _val_gains = [t.get("valuation_exp_gain_12m_sar") for t in tickets
+                      if t.get("valuation_exp_gain_12m_sar") is not None]
+        kpis["valuation_expected_gain_12m_sar"] = (
+            round(sum(_val_gains), 0) if _val_gains else None)
 
     near_miss = unfunded_nm + _near_miss_rows(
         audit, selected_syms | unfunded_syms, deferrals, crit)
