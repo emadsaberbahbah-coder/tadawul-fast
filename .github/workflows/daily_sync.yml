@@ -97,13 +97,13 @@ jobs:
 
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
@@ -199,7 +199,7 @@ jobs:
     # mid-write and wiped two pages. v6.18.0's advanced-first routing makes the
     # run much faster, but the ceiling must never again be the thing that kills
     # a run between a clear and a write.
-    timeout-minutes: 45
+    timeout-minutes: 75  # 2026-07-05: was 45; run #2236 cancelled mid-recovery during provider outage
     needs: preflight-validation
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight-validation.outputs.validated == 'true' }}
 
@@ -295,13 +295,13 @@ jobs:
 
     steps:
       - name: 📥 Secure Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
@@ -925,7 +925,7 @@ jobs:
       # -------------------------------------------------------------------------
       - name: 📤 Upload Logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: tadawul-sync-logs-${{ github.run_id }}
           path: |
