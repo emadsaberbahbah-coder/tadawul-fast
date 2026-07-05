@@ -2,8 +2,29 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) -- v8.3.0
+Yahoo Chart Provider (Global + KSA History) -- v8.5.0
 ================================================================================
+
+v8.5.0 Changes (from v8.4.0) — REPORT THE PRICE BAR'S OWN TIME (Fix AR support)
+------------------------------------------------------------------------
+WHY: the 2026-07-05 audit verified this provider serving weeks-old cached
+bars AS the current price for .SR mid-caps under datacenter throttle
+(1211.SR 58.90 vs 63.10 Argaam live; 3092.SR 22.77 vs 24.54) — with fresh
+last_updated stamps and no way for the engine to detect it, because the
+patch never disclosed WHEN the bar behind `current_price` actually traded.
+FIX (disclosure only — no price, field, or flow change):
+  - _enrich_data now emits `"timestamp"`: the ISO time of the bar/quote
+    backing `current_price`. Source selection is honest about origin:
+    (a) price from live info fields -> info/meta `regularMarketTime`
+        (epoch -> ISO), falling back to the last history bar's timestamp;
+    (b) price from the history fallback -> that last history bar's
+        timestamp (NOT regularMarketTime, which describes a quote the
+        price did not come from).
+  - The engine (data_engine_v2 v5.104.0, Fix AR) canonicalizes this into
+    `price_bar_ts` and gates on it (TFB_GATE_PROVIDER_BAR_AGE). With the
+    engine gate OFF the field is inert; provider behavior is otherwise
+    byte-identical to v8.4.0.
+  - `PROVIDER_VERSION = "8.5.0"`.
 
 Purpose
 -------
@@ -394,7 +415,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.4.0"
+PROVIDER_VERSION = "8.5.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -1648,10 +1669,36 @@ def _enrich_data(
     )
 
     # Fallback to history when live fields are missing
+    # v8.5.0 (Fix AR support): remember whether `price` came from the live
+    # info fields or the history fallback, so the reported bar time below
+    # describes the bar the price ACTUALLY came from.
+    _price_from_live_info = bool(price)
     if not price and history:
         price = history[-1].get("close")
         if not prev_close and len(history) > 1:
             prev_close = history[-2].get("close")
+
+    # v8.5.0 (Fix AR support): the ISO time of the bar/quote backing `price`.
+    # Live-info price -> regularMarketTime (info first, then history meta),
+    # epoch -> ISO; missing -> last history bar. History-fallback price ->
+    # that bar's own timestamp. Unresolvable -> None (engine skips the check).
+    price_bar_ts: Optional[str] = None
+    try:
+        if _price_from_live_info:
+            _rmt = _first_number(
+                info.get("regularMarketTime"),
+                (meta or {}).get("regularMarketTime"),
+            )
+            if _rmt and _rmt > 1e8:
+                if _rmt > 1e12:  # milliseconds
+                    _rmt = _rmt / 1000.0
+                price_bar_ts = _utc_iso(datetime.fromtimestamp(float(_rmt), tz=timezone.utc))
+        if not price_bar_ts and history:
+            _last_bar_ts = history[-1].get("timestamp")
+            if _last_bar_ts:
+                price_bar_ts = str(_last_bar_ts)
+    except Exception:
+        price_bar_ts = None
 
     percent_change = None
     if price and prev_close and prev_close > 0:
@@ -1754,6 +1801,10 @@ def _enrich_data(
         "data_quality": data_quality,
         "last_updated_utc": _utc_iso(),
         "last_updated_riyadh": _riyadh_iso(),
+        # v8.5.0 (Fix AR support): time of the bar/quote backing current_price.
+        # Canonicalized by the engine into price_bar_ts; inert when the engine
+        # gate is off. None -> dropped by the engine merge (no schema impact).
+        "timestamp": price_bar_ts,
         # Price fields
         "current_price": price,
         "price": price,
