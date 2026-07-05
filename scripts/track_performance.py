@@ -2,8 +2,48 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.13.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.14.0)
 ===========================================================
+
+Why this revision (v6.14.0 vs v6.13.0) — F4: EVENT-CONTEXT CAPTURE
+(owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F4)
+
+The 1M Performance_Log cohort matures ~2026-07-18 and the Calibrator will
+then start conditioning claimed-vs-realized reliability on context. Context
+that is not captured alongside each daily verdict can never be back-filled
+— every uncaptured day is conditioning history lost. v6.14.0 therefore adds
+four columns to Signal_History (and ONLY Signal_History; Performance_Log is
+deliberately untouched — a record's context is recoverable by joining
+symbol|date against the daily snapshots, so no record-schema churn):
+
+  v6.14.0 A  SignalSnapshot gains analyst_rating / target_price (captured
+       from the already-fetched Top10 row dicts when the backend supplies
+       them; header-keyed best-effort, blank when absent) and
+       days_to_earnings / days_to_exdiv (computed from next_earnings_date /
+       next_ex_div_date row keys IF present — these keys arrive with the
+       F1 calendar layer; until then the columns are schema-ready blanks,
+       never fabricated). analyst_rating/target_price are the raw series
+       from which Phase F2 revision deltas (H-REV-01) will be computed.
+
+  v6.14.0 B  SignalHistoryStore.HEADERS appends "Analyst Rating",
+       "Target Price", "Days To Earnings", "Days To ExDiv". The existing
+       _ensure_headers self-heal rewrites row 1 on first run (same
+       discipline as every prior widening); old data rows load fine via
+       the existing right-padding in load_snapshots. Header shape is NOT
+       env-gated (a per-env header would flip-flop the sheet row 1 between
+       runs); only VALUE population is gated.
+
+  v6.14.0 C  Gate: TRACK_EVENT_CONTEXT (default ON; kill-switch =0 writes
+       blanks in the four columns while leaving every prior column and all
+       other behaviour byte-identical). Default-ON matches the tracker's
+       TRACK_SIGNAL_HISTORY / TRACK_CALIBRATION precedent and the explicit
+       owner request that capture start before the Jul-18 maturity.
+
+  v6.14.0 D  New pure helper _days_until(raw) -> Optional[int]: Riyadh-date
+       day difference, None on blank/unparseable — no exceptions escape.
+
+  v6.14.0 E  SCRIPT_VERSION 6.13.0 -> 6.14.0 (SERVICE_VERSION follows).
+       No function removed; all prior WHY-blocks carried verbatim.
 
 Why this revision (v6.13.0 vs v6.12.0)
 --------------------------------------
@@ -445,6 +485,8 @@ Environment
   TRACK_OUTPUT             output file base path
   TRACK_INTERVAL           daemon interval seconds (default 3600)
   TRACK_VERBOSE            truthy = verbose logging
+  TRACK_EVENT_CONTEXT      v6.14.0: populate the four Signal_History event-
+                           context columns (default ON; =0 writes blanks)
   BACKEND_BASE_URL /
   TFB_BASE_URL             TFB API base URL
   TFB_TOKEN / APP_TOKEN /
@@ -495,7 +537,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.13.0"
+SCRIPT_VERSION = "6.14.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -827,6 +869,36 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return v
     except Exception:
         return float(default)
+
+
+def _days_until(raw: Any) -> Optional[int]:
+    """v6.14.0 (F4): whole days from today (Riyadh) until a date-like value.
+    Accepts date/datetime/ISO-ish strings; returns None on blank/unparseable
+    input — never raises. Negative values are valid (event already passed)."""
+    s = _safe_str(raw)
+    if not s:
+        return None
+    dt: Optional[datetime] = None
+    if isinstance(raw, datetime):
+        dt = raw
+    else:
+        for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+            try:
+                dt = datetime.strptime(s[: len(fmt) + 2].strip(), fmt)
+                break
+            except Exception:
+                continue
+        if dt is None:
+            dt = RiyadhTime.parse(s)
+    if dt is None:
+        return None
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_RIYADH_TZ)
+        today = RiyadhTime.now().astimezone(_RIYADH_TZ).date()
+        return (dt.astimezone(_RIYADH_TZ).date() - today).days
+    except Exception:
+        return None
 
 
 def _col_to_a1(col: int) -> str:
@@ -1305,6 +1377,11 @@ class SignalSnapshot:
     price: float
     origin_tab: str
     recorded_at: datetime = field(default_factory=_utc_now)
+    # v6.14.0 (F4) event-context capture — defaults keep old call sites valid
+    analyst_rating: str = ""
+    target_price: float = 0.0
+    days_to_earnings: Optional[int] = None
+    days_to_exdiv: Optional[int] = None
 
     @property
     def date_key(self) -> str:
@@ -1332,6 +1409,10 @@ class SignalSnapshot:
             "risk_score": self.risk_score,
             "price": self.price,
             "origin_tab": self.origin_tab,
+            "analyst_rating": self.analyst_rating,
+            "target_price": self.target_price,
+            "days_to_earnings": self.days_to_earnings,
+            "days_to_exdiv": self.days_to_exdiv,
         }
 
     @classmethod
@@ -1365,6 +1446,13 @@ class SignalSnapshot:
             price=_safe_float(get("Price"), default=0.0),
             origin_tab=_safe_str(get("Origin Tab")) or "Top_10_Investments",
             recorded_at=dt_at.astimezone(timezone.utc),
+            # v6.14.0 (F4): tolerate old (short) rows — blanks parse to defaults
+            analyst_rating=_safe_str(get("Analyst Rating")),
+            target_price=_safe_float(get("Target Price"), default=0.0),
+            days_to_earnings=(int(_safe_float(get("Days To Earnings")))
+                              if _safe_str(get("Days To Earnings")) else None),
+            days_to_exdiv=(int(_safe_float(get("Days To ExDiv")))
+                           if _safe_str(get("Days To ExDiv")) else None),
         )
 
 
@@ -2099,6 +2187,12 @@ class SignalHistoryStore:
         "Risk Score",
         "Price",
         "Origin Tab",
+        # v6.14.0 (F4) event-context columns — header shape is permanent;
+        # value population is gated by TRACK_EVENT_CONTEXT.
+        "Analyst Rating",
+        "Target Price",
+        "Days To Earnings",
+        "Days To ExDiv",
     ]
 
     def __init__(self, spreadsheet_id: str, sheet_name: str):
@@ -2229,6 +2323,10 @@ class SignalHistoryStore:
             s.risk_score,
             s.price,
             s.origin_tab or "",
+            s.analyst_rating or "",
+            s.target_price if s.target_price else "",
+            s.days_to_earnings if s.days_to_earnings is not None else "",
+            s.days_to_exdiv if s.days_to_exdiv is not None else "",
         ]
 
     def append_snapshots(self, snaps: List[SignalSnapshot]) -> int:
@@ -4191,6 +4289,25 @@ class PerformanceTrackerApp:
                 )
                 or "Top_10_Investments"
             )
+            # v6.14.0 (F4): event-context capture, gated (default ON).
+            # Best-effort header-keyed reads — blank when the backend row
+            # doesn't carry the key; days_to_* stay None until the F1
+            # calendar layer supplies next_earnings_date / next_ex_div_date.
+            if _env_bool("TRACK_EVENT_CONTEXT", True):
+                _arating = _safe_str(
+                    row.get("analyst_rating") or row.get("Analyst Rating")
+                )
+                _tprice = _safe_float(
+                    row.get("target_price") or row.get("Target Price"), default=0.0
+                )
+                _dte = _days_until(
+                    row.get("next_earnings_date") or row.get("Next Earnings Date")
+                )
+                _dtx = _days_until(
+                    row.get("next_ex_div_date") or row.get("Next Ex-Div Date")
+                )
+            else:
+                _arating, _tprice, _dte, _dtx = "", 0.0, None, None
             snap = SignalSnapshot(
                 snapshot_id=str(uuid.uuid4()),
                 symbol=sym,
@@ -4206,6 +4323,10 @@ class PerformanceTrackerApp:
                 risk_score=_safe_float(row.get("risk_score"), default=0.0),
                 price=price,
                 origin_tab=origin,
+                analyst_rating=_arating,
+                target_price=_tprice,
+                days_to_earnings=_dte,
+                days_to_exdiv=_dtx,
             )
             if snap.key in seen:
                 continue
