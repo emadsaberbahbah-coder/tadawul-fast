@@ -227,6 +227,22 @@ jobs:
       # fx=1.0 fallback when a USD row lacks a native OR SAR price (cosmetic SAR
       # magnitude on <=3 rows, P&L ratio stays correct).
       # KILL-SWITCH: set back to "0" to revert to the (broken) page-driven default.
+      # Cross-page price-delta guard (scripts/run_dashboard_sync.py v6.20.0,
+      # Engineering Audit Fix 1b). ARMED ("1").
+      # WHY (2026-07-05 audit): the SAME symbol carried wildly different prices
+      # on two pages written by the SAME run — 1211.SR at 17.73 on
+      # Market_Leaders vs 58.90 on Global_Markets (market truth that session:
+      # 63.10, Argaam) — with no alarm anywhere. The runner holds every page's
+      # final matrix in one process, so after all fetches it compares every
+      # symbol seen on 2+ pages and logs WARN lines for spreads above the
+      # threshold, plus one INFO summary ("[v6.20.0 XPAGE] report | ...").
+      # OBSERVE-AND-REPORT ONLY: writes, guards, ordering, and exit codes are
+      # untouched — the runner cannot know WHICH page is wrong, so it makes
+      # the disagreement loud instead of guessing. Companions (defaults shown,
+      # uncomment to tune): TFB_XPAGE_PRICE_DELTA_PCT: "2.0",
+      # TFB_XPAGE_MAX_REPORT: "50".
+      # KILL-SWITCH: set to "0" (or delete) to disable the check entirely.
+      TFB_XPAGE_PRICE_CHECK: "1"
       TFB_PORTFOLIO_REBUILD: "1"
       # Top_10_Investments — decision guard ENABLED ("1"). [2026-06-29 corrected]
       # SUPERSEDES the earlier "0" setting. That setting let the 2-hourly daily sync
