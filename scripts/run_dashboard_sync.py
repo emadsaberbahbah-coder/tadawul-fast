@@ -3,9 +3,46 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.19.2)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.20.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.20.0 fix — CROSS-PAGE PRICE-DELTA GUARD (Fix 1b; env-gated
+  TFB_XPAGE_PRICE_CHECK, DEFAULT OFF; threshold TFB_XPAGE_PRICE_DELTA_PCT,
+  default 2.0; report cap TFB_XPAGE_MAX_REPORT, default 50)
+- WHY: the 2026-07-05 workbook audit found the SAME symbol carrying wildly
+  different prices on two pages written by the SAME run — 1211.SR at 17.73
+  on Market_Leaders vs 58.90 on Global_Markets (market truth that session:
+  63.10), and 1120.SR at 43.28 vs 66.00 — with no alarm anywhere. The sync
+  runner is the only component that holds every page's final matrix in one
+  process, so it is the natural (and cheapest) place to detect intra-run
+  disagreement: a >2% same-symbol spread across pages means at least one
+  page is serving a stale, contaminated, or mis-mapped price. This is the
+  workbook-level complement to the engine's v5.104.0 bar-age gate (which
+  judges each row against the exchange calendar; this judges rows against
+  EACH OTHER).
+- FIX (observe-and-report only — writes, guards, ordering, exit codes all
+  byte-identical; OFF by default):
+  1. _xpage_collect(): after each task's final headers/matrix are ready
+     (immediately before the write step), harvest (page, symbol, price)
+     into a run-level map. Pages without a symbol or price column
+     (Insights_Analysis etc.) contribute nothing; blank/non-numeric/
+     non-positive prices are skipped. Read-only; wrapped so it can never
+     affect the write path. Runs in dry-run too (harvest reads the fetched
+     matrix, not the sheet).
+  2. _xpage_report(): after the task gather completes, for every symbol
+     seen on 2+ pages compute the max spread (hi-lo)/lo; spreads above the
+     threshold are logged as WARN lines (worst first, capped), plus one
+     INFO summary line with counts. The collector is cleared after the
+     report (re-entrant for in-process test harnesses).
+  3. Detection only, BY DESIGN: the runner cannot know which page is wrong,
+     so it does not mutate rows or block writes — it makes the disagreement
+     impossible to miss in the run log. Escalation (row tagging / write
+     blocking) stays a human decision after observing real-world hit rates.
+- New helpers: _xpage_check_enabled, _xpage_delta_threshold_pct,
+  _xpage_max_report, _xpage_collect, _xpage_report + module collector
+  _XPAGE_PRICES and _XPAGE_PRICE_ALIASES. Everything else is byte-identical
+  to v6.19.2.
 
 v6.19.2 fix — MARKET-PAGE SYMBOL CAP ALIGNED TO THE EXPANDED UNIVERSE
   (env-tunable TFB_SYNC_MAX_SYMBOLS_MARKET, default 2500)
@@ -545,7 +582,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.19.2"
+SCRIPT_VERSION = "6.20.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1232,6 +1269,124 @@ def _guard_should_apply(sheet_name: str) -> bool:
     if not _guard_enabled():
         return False
     return _guard_norm(sheet_name) in _guard_pages()
+
+
+# -----------------------------------------------------------------------------
+# Cross-page price-delta guard (v6.20.0, Fix 1b) — observe-and-report only
+# -----------------------------------------------------------------------------
+# The same symbol served with materially different prices on two pages in ONE
+# run (live fingerprint 2026-07-05: 1211.SR 17.73 on Market_Leaders vs 58.90
+# on Global_Markets) means at least one page is stale/contaminated. The runner
+# is the only place that sees every page's final matrix in-process, so it
+# detects and LOGS the disagreement; it deliberately does not decide which
+# page is wrong (no row mutation, no write blocking).
+_XPAGE_PRICE_ALIASES = frozenset({"currentprice", "price", "lastprice"})
+_XPAGE_PRICES: Dict[str, List[Tuple[str, float]]] = {}
+_XPAGE_TAG = "[v6.20.0 XPAGE]"
+
+
+def _xpage_check_enabled() -> bool:
+    """Master switch. DEFAULT OFF (backward-compatible); set
+    TFB_XPAGE_PRICE_CHECK=1/true/on/yes to enable. OFF -> no harvest, no
+    report line, v6.19.2 byte-identical."""
+    return (os.getenv("TFB_XPAGE_PRICE_CHECK") or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _xpage_delta_threshold_pct() -> float:
+    """Spread threshold in percent ((hi-lo)/lo*100). Default 2.0, clamped
+    0.1..100.0 — wide enough to ignore provider rounding / minor timing skew,
+    tight enough to catch every real staleness/contamination case seen live
+    (the smallest real offender observed was ~7%)."""
+    try:
+        v = float((os.getenv("TFB_XPAGE_PRICE_DELTA_PCT") or "2.0").strip())
+    except Exception:
+        v = 2.0
+    return max(0.1, min(100.0, v))
+
+
+def _xpage_max_report() -> int:
+    """Max WARN lines emitted (worst offenders first). Default 50, clamped 1..500."""
+    try:
+        v = int(float((os.getenv("TFB_XPAGE_MAX_REPORT") or "50").strip()))
+    except Exception:
+        v = 50
+    return max(1, min(500, v))
+
+
+def _xpage_collect(sheet_name: str, headers: List[Any], rows_matrix: List[List[Any]]) -> int:
+    """Harvest (page, symbol, price) from a task's FINAL matrix into the
+    run-level collector. Returns rows harvested. Pages lacking a symbol or
+    price column contribute 0. Never raises (caller also wraps)."""
+    try:
+        if not headers or not rows_matrix:
+            return 0
+        sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+        px_i = _guard_find_col(list(headers), _XPAGE_PRICE_ALIASES)
+        if sym_i < 0 or px_i < 0:
+            return 0
+        page = str(sheet_name or "").strip() or "?"
+        n = 0
+        hi_idx = max(sym_i, px_i)
+        for row in rows_matrix:
+            if not isinstance(row, (list, tuple)) or len(row) <= hi_idx:
+                continue
+            sym = str(row[sym_i] if row[sym_i] is not None else "").strip().upper()
+            if not sym:
+                continue
+            try:
+                px = float(row[px_i])
+            except Exception:
+                continue
+            if not (0.0 < px < 1e15):  # rejects 0/negative/NaN/inf
+                continue
+            _XPAGE_PRICES.setdefault(sym, []).append((page, px))
+            n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def _xpage_report() -> Tuple[Dict[str, int], List[str]]:
+    """Compare every symbol seen on 2+ pages; return (stats, warn_lines) and
+    CLEAR the collector (re-entrant). A symbol conflicts when its max spread
+    (hi-lo)/lo*100 exceeds the threshold. Lines are worst-first, capped."""
+    stats = {"pages": 0, "symbols": 0, "symbols_multi_page": 0, "conflicts": 0}
+    lines: List[str] = []
+    try:
+        thr = _xpage_delta_threshold_pct()
+        pages_seen: set = set()
+        conflicts: List[Tuple[float, str, List[Tuple[str, float]]]] = []
+        for sym, obs in _XPAGE_PRICES.items():
+            for pg, _px in obs:
+                pages_seen.add(pg)
+            by_page: Dict[str, float] = {}
+            for pg, px in obs:
+                by_page.setdefault(pg, px)  # first write per page wins
+            if len(by_page) < 2:
+                continue
+            stats["symbols_multi_page"] += 1
+            lo = min(by_page.values())
+            hi = max(by_page.values())
+            if lo <= 0.0:
+                continue
+            delta = (hi - lo) / lo * 100.0
+            if delta > thr:
+                conflicts.append((delta, sym, sorted(by_page.items())))
+        stats["pages"] = len(pages_seen)
+        stats["symbols"] = len(_XPAGE_PRICES)
+        stats["conflicts"] = len(conflicts)
+        conflicts.sort(key=lambda t: (-t[0], t[1]))
+        for delta, sym, pairs in conflicts[: _xpage_max_report()]:
+            detail = "; ".join("%s=%.6g" % (pg, px) for pg, px in pairs)
+            lines.append("%s %s spread=%.1f%% :: %s" % (_XPAGE_TAG, sym, delta, detail))
+    except Exception:
+        pass
+    finally:
+        try:
+            _XPAGE_PRICES.clear()
+        except Exception:
+            pass
+    return stats, lines
 
 
 def _decision_guard_enabled() -> bool:
@@ -3001,6 +3156,18 @@ async def _run_one_task(
                 logger.warning(_pw)
         # ---------------------------------------------------------------------
 
+        # v6.20.0 (Fix 1b): harvest (page, symbol, price) from the FINAL matrix
+        # for the cross-page price-delta report. Read-only; flag-gated; can
+        # never affect the write path. Runs in dry-run too (reads the fetched
+        # matrix, not the sheet).
+        if _xpage_check_enabled():
+            try:
+                _xn = _xpage_collect(task.sheet_name, headers, rows_matrix)
+                if _xn:
+                    logger.info("%s harvested %d priced rows from %s", _XPAGE_TAG, _xn, task.sheet_name)
+            except Exception as _xe:
+                logger.warning("%s harvest skipped for %s (error: %s)", _XPAGE_TAG, task.sheet_name, _xe)
+
         # v6.18.0 (Fix 2): cancellation-safe ordering. Legacy clear-then-write
         # leaves an EMPTY page when the job dies between the two calls (the
         # 2026-07-02 Mutual_Funds / Commodities_FX wipe). Default is now
@@ -3188,6 +3355,27 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
             summary.total_rows_written,
             summary.duration_ms,
         )
+
+        # v6.20.0 (Fix 1b): cross-page price-delta report. Observe-and-report
+        # only: exit code, results, and writes are untouched. One INFO summary
+        # (even at zero conflicts, for observability) + capped WARN lines,
+        # worst spread first.
+        if _xpage_check_enabled():
+            try:
+                _xstats, _xlines = _xpage_report()
+                logger.info(
+                    "%s report | pages=%d symbols=%d multi_page=%d conflicts=%d threshold=%.2f%%",
+                    _XPAGE_TAG,
+                    _xstats.get("pages", 0),
+                    _xstats.get("symbols", 0),
+                    _xstats.get("symbols_multi_page", 0),
+                    _xstats.get("conflicts", 0),
+                    _xpage_delta_threshold_pct(),
+                )
+                for _xl in _xlines:
+                    logger.warning(_xl)
+            except Exception as _xe:
+                logger.warning("%s report skipped (error: %s)", _XPAGE_TAG, _xe)
 
         for r in results:
             if r.status == "success":
