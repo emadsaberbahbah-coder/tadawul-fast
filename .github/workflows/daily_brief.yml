@@ -3,9 +3,22 @@
 # -----------------------------------------------------------------------------
 # WHAT: runs scripts/run_daily_brief.py --send, which reads the decision +
 #       opportunity + market pages from the production workbook (READ-ONLY) and
-#       emails a polished HTML brief.
-# WHEN: 06:00 UTC = 09:00 Asia/Riyadh, Sunday–Thursday (before Tadawul opens).
-#       GitHub cron is UTC; day-of-week 0-4 = Sun–Thu. Can also be run manually.
+#       emails a polished HTML brief. Script v1.4.0 also ATTACHES a PDF copy
+#       of the recommendations (needs reportlab, installed below for this job
+#       only — NOT added to Render requirements; TFB_BRIEF_PDF=0 disables).
+# WHEN: FOUR sends per day, Sunday–Thursday (GitHub cron is UTC; Riyadh = UTC+3,
+#       no DST in KSA so the Riyadh times hold year-round):
+#         07:30 UTC = 10:30 Riyadh — Tadawul just opened: local + GCC review
+#         10:30 UTC = 13:30 Riyadh — midday local + GCC review
+#         15:00 UTC = 18:00 Riyadh — evening: global/US session view
+#         19:00 UTC = 22:00 Riyadh — pre-US-close wrap
+#       Can also be run manually at any time (preview by default, see below).
+# WHY 4x (2026-07-05): owner request — single 09:00 Riyadh send replaced with
+#       the four decision-relevant checkpoints above. Day-of-week 0-4 = Sun–Thu
+#       kept for all four slots (Tadawul work-week). Note: this means no Friday
+#       evening brief while the US session trades, and Sunday evening briefs
+#       show Thursday's US closes; switch the last two crons to "* * 1-5" if
+#       US-day alignment is ever preferred.
 # WHY shaped like this: it mirrors track_performance.yml exactly — same Python,
 #       same PYTHONPATH (so `integrations.*` / `core.*` imports resolve from a
 #       scripts/ file), same sheet-id source (repo variable DEFAULT_SPREADSHEET_ID)
@@ -18,8 +31,14 @@ name: 📨 Daily Investment Brief
 
 on:
   schedule:
-    # 06:00 UTC == 09:00 Asia/Riyadh, Sun–Thu (before Tadawul open).
-    - cron: "0 6 * * 0-4"
+    # 07:30 UTC == 10:30 Asia/Riyadh, Sun–Thu — Tadawul open, local + GCC.
+    - cron: "30 7 * * 0-4"
+    # 10:30 UTC == 13:30 Asia/Riyadh, Sun–Thu — midday local + GCC.
+    - cron: "30 10 * * 0-4"
+    # 15:00 UTC == 18:00 Asia/Riyadh, Sun–Thu — evening global/US view.
+    - cron: "0 15 * * 0-4"
+    # 19:00 UTC == 22:00 Asia/Riyadh, Sun–Thu — pre-US-close wrap.
+    - cron: "0 19 * * 0-4"
   workflow_dispatch:
     inputs:
       # 2026-07-03 PREVIEW-BY-DEFAULT: default was `true`, so every manual
@@ -72,6 +91,8 @@ jobs:
           else
             python -m pip install -r requirements.txt
           fi
+          # v1.4.0 PDF attachment (brief job only — deliberately NOT in Render deps)
+          python -m pip install "reportlab>=4.0"
 
       - name: 🔎 Resolve spreadsheet id
         id: sheet
@@ -116,6 +137,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: daily-brief-${{ github.run_id }}
-          path: daily_brief.html
+          path: |
+            daily_brief.html
+            daily_brief.pdf
           if-no-files-found: ignore
           retention-days: 14
