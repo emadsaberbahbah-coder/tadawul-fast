@@ -2,8 +2,59 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.15.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.16.0)
 ===========================================================
+
+Why this revision (v6.16.0 vs v6.15.0) — DECISION-SYMBOL FORCED COVERAGE
+(Engineering Audit Fix #5; env-gated kill-switch
+TFB_TRACK_FORCE_DECISION_SYMBOLS, DEFAULT ON)
+
+The 2026-07-05 audit: Signal_History held ~50 snapshots/day but FIVE of the
+ten portfolio holdings (1835.SR, 3092.SR, 4150.SR, 5023.SR, 7030.SR) had
+ZERO snapshots ever, and fresh Top_10 picks (4503.T, ADAM.US, NMM.US,
+INSW.US) had none — precisely the symbols where day-to-day action-trend
+history matters most (three of the zero-history names carry live EXIT
+recommendations). ROOT CAUSE: run_once feeds BOTH pipelines (Performance_Log
+records + Signal_History snapshots) exclusively from get_top10_rows(), so
+any decision symbol outside the Top_10 candidate pool that day is
+structurally invisible — holdings on SELL/HOLD never qualify, so they are
+never recorded, and every day of the gap is trend data lost forever
+(strategy requirement #2 mandates daily recording for Top_10 + holdings).
+
+FIX (additive; both pipelines covered by one augmentation):
+  v6.16.0 A  _load_costbasis_symbols(spreadsheet_id): reads the Symbol
+       column of _Portfolio_CostBasis (tab name via TFB_TRACK_COSTBASIS_TAB)
+       on the ALREADY-CONFIGURED spreadsheet using the same SA-credential
+       pattern as the three existing stores. Fail-open: any problem -> []
+       with one debug line (a Sheets hiccup must never break --record).
+  v6.16.0 B  BackendClient.get_rows_for_symbols(symbols, page): POSTs
+       {"symbols": chunk, "page": page} in chunks of 25 to
+       TFB_TRACK_FORCE_ROWS_ENDPOINT (default /v1/analysis/sheet-rows —
+       the same engine boundary the dashboard sync uses, so forced rows
+       carry the full 115-field verdict shape) and aggregates via the
+       existing envelope extractor.
+  v6.16.0 C  _augment_with_decision_symbols(prefetched): priority set =
+       cost-basis holdings UNION TFB_TRACK_PRIORITY_SYMBOLS (csv, optional
+       extras, e.g. pinned picks); MISSING = priority − symbols already in
+       the prefetched Top_10 rows, capped at TFB_TRACK_FORCE_MAX (default
+       40, edge-timeout protection); fetched rows are deduped, tagged
+       origin="Decision_Coverage" (visible in Origin Tab), and appended.
+       RESILIENCE: on a total Top_10 fetch failure the augmentation still
+       returns the forced holdings rows, so snapshot day-continuity for
+       held names survives a Top_10 outage (previously the whole snapshot
+       day was silently lost).
+  v6.16.0 D  run_once wiring: one call between the Top_10 prefetch and the
+       two consumers, try/except fail-open. KILL SWITCH: with
+       TFB_TRACK_FORCE_DECISION_SYMBOLS=0 the call is skipped entirely and
+       v6.15.0 behavior (including None-on-failure semantics) is
+       byte-identical.
+  v6.16.0 E  SCRIPT_VERSION 6.15.0 -> 6.16.0 (SERVICE_VERSION follows).
+       No function removed; all prior WHY-blocks carried verbatim.
+       New ENV: TFB_TRACK_FORCE_DECISION_SYMBOLS ("1"),
+       TFB_TRACK_PRIORITY_SYMBOLS (csv, ""), TFB_TRACK_FORCE_MAX ("40"),
+       TFB_TRACK_FORCE_ROWS_ENDPOINT ("/v1/analysis/sheet-rows"),
+       TFB_TRACK_FORCE_ROWS_PAGE ("Market_Leaders"),
+       TFB_TRACK_COSTBASIS_TAB ("_Portfolio_CostBasis").
 
 Why this revision (v6.15.0 vs v6.14.0) — F1 WIRING: CONSUME Calendar_Events
 (owner greenlight 2026-07-05, Option B: sheet-as-bus, off the request path)
@@ -570,7 +621,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.15.0"
+SCRIPT_VERSION = "6.16.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -755,6 +806,83 @@ except Exception:
 # Optional project imports (best-effort)
 settings = None
 sheets_service = None
+
+
+# --- v6.16.0 (Fix #5): decision-symbol forced-coverage knobs -----------------
+def _force_decision_enabled() -> bool:
+    """Master switch. DEFAULT ON — enforces strategy requirement #2 (daily
+    recording for Top_10 + holdings). TFB_TRACK_FORCE_DECISION_SYMBOLS=0
+    restores v6.15.0 behavior byte-identically."""
+    return _env_bool("TFB_TRACK_FORCE_DECISION_SYMBOLS", True)
+
+
+def _force_extra_symbols() -> List[str]:
+    """Optional pinned extras (csv), unioned with the cost-basis holdings."""
+    return [s.strip().upper() for s in (_env_csv("TFB_TRACK_PRIORITY_SYMBOLS") or [])
+            if s and s.strip()]
+
+
+def _force_max() -> int:
+    """Cap on forced fetches per run (edge-timeout protection)."""
+    return _env_int("TFB_TRACK_FORCE_MAX", 40, lo=1, hi=200)
+
+
+def _force_rows_endpoint() -> str:
+    return (os.getenv("TFB_TRACK_FORCE_ROWS_ENDPOINT")
+            or "/v1/analysis/sheet-rows").strip() or "/v1/analysis/sheet-rows"
+
+
+def _force_rows_page() -> str:
+    return (os.getenv("TFB_TRACK_FORCE_ROWS_PAGE")
+            or "Market_Leaders").strip() or "Market_Leaders"
+
+
+def _costbasis_tab() -> str:
+    return (os.getenv("TFB_TRACK_COSTBASIS_TAB")
+            or "_Portfolio_CostBasis").strip() or "_Portfolio_CostBasis"
+
+
+def _load_costbasis_symbols(spreadsheet_id: str) -> List[str]:
+    """v6.16.0 (Fix #5): Symbol column of _Portfolio_CostBasis, uppercased,
+    deduped, header-skipped. Fail-open: ANY problem -> [] with a debug line
+    (a Sheets hiccup must never break --record). Mirrors the stores'
+    SA-credential pattern; runs in the executor (blocking gspread I/O)."""
+    if not spreadsheet_id or not GSPREAD_AVAILABLE or gspread is None:
+        return []
+    raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+           or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+    if not raw or service_account is None:
+        return []
+    s = raw
+    if not s.startswith("{"):
+        try:
+            dec = base64.b64decode(s).decode("utf-8", errors="replace").strip()
+            if dec.startswith("{"):
+                s = dec
+        except Exception:
+            pass
+    try:
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
+            return []
+        creds = service_account.Credentials.from_service_account_info(
+            obj, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(spreadsheet_id).worksheet(_costbasis_tab())
+        col = ws.col_values(1) or []
+        out: List[str] = []
+        seen: set = set()
+        for v in col:
+            sym = _safe_str(v).strip().upper()
+            if not sym or sym == "SYMBOL":
+                continue
+            if sym not in seen:
+                seen.add(sym)
+                out.append(sym)
+        return out
+    except Exception as e:
+        logger.debug("cost-basis symbol read skipped: %s", e)
+        return []
 
 
 def _ensure_project_root_on_path() -> None:
@@ -1797,6 +1925,37 @@ class BackendClient:
                 last_err = f"{endpoint}: {err}"
                 continue
         return [], {"ok": False, "error": last_err or "no_data", "endpoint": None}
+
+    async def get_rows_for_symbols(
+        self, symbols: List[str], page: str
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """v6.16.0 (Fix #5): full engine rows for an EXPLICIT symbol list —
+        the forced-coverage fetch for decision symbols outside the Top_10
+        pool. Chunks of 25 (the dashboard sync's proven batch size) against
+        TFB_TRACK_FORCE_ROWS_ENDPOINT; aggregates via the same envelope
+        extractor as get_top10_rows. Best-effort: chunk errors are recorded
+        in meta and the remaining chunks still run."""
+        syms = [s.strip().upper() for s in (symbols or []) if s and str(s).strip()]
+        syms = list(dict.fromkeys(syms))
+        if not syms or not self.base_url:
+            return [], {"ok": False, "error": "no_symbols_or_backend", "count": 0}
+        endpoint = _force_rows_endpoint()
+        rows: List[Dict[str, Any]] = []
+        errs: List[str] = []
+        for i in range(0, len(syms), 25):
+            chunk = syms[i:i + 25]
+            data, err, code = await self.post_json(
+                endpoint, {"symbols": chunk, "page": page},
+                timeout_sec=_TOP10_FETCH_TIMEOUT_SEC,
+            )
+            if err or not isinstance(data, dict):
+                errs.append("%s..+%d: %s" % (chunk[0], len(chunk) - 1, err or "bad_payload"))
+                continue
+            rows.extend(_extract_rows_from_envelope(data))
+        return rows, {
+            "ok": bool(rows), "endpoint": endpoint, "count": len(rows),
+            "requested": len(syms), "errors": errs or None,
+        }
 
     async def fetch_prices(self, symbols: List[str]) -> Dict[str, float]:
         syms = [s.strip().upper() for s in (symbols or []) if s and str(s).strip()]
@@ -4437,6 +4596,70 @@ class PerformanceTrackerApp:
                             "next_ex_div_date": x or None}
         return out
 
+    async def _augment_with_decision_symbols(
+        self, prefetched: Optional[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        """v6.16.0 (Fix #5): guarantee every decision symbol (cost-basis
+        holdings + pinned extras) is present in the row set that feeds BOTH
+        Performance_Log recording and Signal_History snapshots. Returns a
+        LIST even when prefetched is None, so a total Top_10 fetch failure
+        no longer silently loses the snapshot day for held names. Only
+        called when the master switch is ON (run_once gates it)."""
+        rows: List[Dict[str, Any]] = list(prefetched or [])
+        covered = {
+            _safe_str(r.get("symbol")).strip().upper()
+            for r in rows if _safe_str(r.get("symbol")).strip()
+        }
+        priority: set = set(_force_extra_symbols())
+        if self.spreadsheet_id:
+            loop = asyncio.get_running_loop()
+            try:
+                held = await loop.run_in_executor(
+                    _get_executor(), _load_costbasis_symbols, self.spreadsheet_id
+                )
+                priority |= set(held or [])
+            except Exception as e:
+                logger.warning("cost-basis holdings read failed: %s", e)
+        missing = sorted(s for s in priority if s and s not in covered)
+        if len(missing) > _force_max():
+            logger.warning(
+                "[v6.16.0 COVERAGE] %d missing decision symbols exceed cap %d; "
+                "forcing the first %d (raise TFB_TRACK_FORCE_MAX if intended)",
+                len(missing), _force_max(), _force_max(),
+            )
+            missing = missing[: _force_max()]
+        if not missing:
+            logger.info(
+                "[v6.16.0 COVERAGE] full: %d priority symbol(s) already in the "
+                "%d prefetched row(s)", len(priority), len(rows),
+            )
+            return rows
+        if not self.backend.base_url:
+            logger.warning(
+                "[v6.16.0 COVERAGE] %d decision symbol(s) missing but no "
+                "backend configured: %s", len(missing), ", ".join(missing),
+            )
+            return rows
+        fetched, meta = await self.backend.get_rows_for_symbols(
+            missing, _force_rows_page()
+        )
+        got: set = set()
+        for r in fetched:
+            sym = _safe_str(r.get("symbol")).strip().upper()
+            if not sym or sym in covered:
+                continue
+            r.setdefault("origin", "Decision_Coverage")
+            rows.append(r)
+            covered.add(sym)
+            got.add(sym)
+        unresolved = [s for s in missing if s not in got]
+        logger.info(
+            "[v6.16.0 COVERAGE] priority=%d prefetched=%d forced=%d fetched=%d "
+            "unresolved=%s", len(priority), len(rows) - len(got), len(missing),
+            len(got), ",".join(unresolved) if unresolved else "-",
+        )
+        return rows
+
     async def record_signal_snapshots(self, rows: List[Dict[str, Any]]) -> int:
         # v6.7.0: log one daily verdict snapshot per decision symbol from the
         # ALREADY-FETCHED Top10 rows. Idempotent per symbol-per-day. Best
@@ -4570,6 +4793,15 @@ class PerformanceTrackerApp:
                 except Exception as e:
                     logger.warning("Top10 prefetch failed: %s", e)
                     prefetched = None
+
+            # v6.16.0 (Fix #5): guarantee decision-symbol coverage for BOTH
+            # consumers below. Fail-open; kill switch skips the call entirely
+            # (v6.15.0 None-on-failure semantics preserved byte-identically).
+            if _force_decision_enabled():
+                try:
+                    prefetched = await self._augment_with_decision_symbols(prefetched)
+                except Exception as e:
+                    logger.warning("decision-symbol coverage failed: %s", e)
 
             new = await self.record_from_top10(records, rows=prefetched)
             if new and self.store.is_available():
