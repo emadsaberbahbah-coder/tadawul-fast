@@ -2,9 +2,17 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider — v1.0.0 (F1: FORWARD-LOOKING EVENT-CALENDAR LAYER)
+Calendar Provider — v1.0.1 (F1: FORWARD-LOOKING EVENT-CALENDAR LAYER)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
+
+v1.0.1 (over v1.0.0) — token-safe logging + log dedup:
+- The __main__ self-test silences httpx request logging (WARNING+): httpx's
+  INFO line prints the full request URL INCLUDING api_token, which surfaced
+  the key in the 2026-07-05 Render Shell contract check. The provider never
+  logs URLs itself; this closes the one path that did.
+- KSA-skip notice logs ONCE per fetch_event_context call (INFO); the
+  per-endpoint duplicates moved to DEBUG.
 
 WHAT THIS DOES
     Fetches known FUTURE FACTS — never predictions — from the EODHD Calendar /
@@ -68,7 +76,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -216,9 +224,9 @@ async def fetch_earnings_map(symbols: List[str],
     try:
         code_map, ksa = _split_symbols(symbols)
         if ksa:
-            logger.info("[calendar_provider v%s] KSA symbols skipped "
-                        "(EODHD has no Saudi coverage): %s",
-                        __version__, ",".join(sorted(ksa)))
+            logger.debug("[calendar_provider v%s] KSA symbols skipped "
+                         "(EODHD has no Saudi coverage): %s",
+                         __version__, ",".join(sorted(ksa)))
         if not code_map:
             return {}
         today = _today()
@@ -271,9 +279,9 @@ async def fetch_next_exdiv_map(symbols: List[str],
     try:
         code_map, ksa = _split_symbols(symbols)
         if ksa:
-            logger.info("[calendar_provider v%s] KSA symbols skipped "
-                        "(EODHD has no Saudi coverage): %s",
-                        __version__, ",".join(sorted(ksa)))
+            logger.debug("[calendar_provider v%s] KSA symbols skipped "
+                         "(EODHD has no Saudi coverage): %s",
+                         __version__, ",".join(sorted(ksa)))
         if not code_map:
             return {}
         today = _today()
@@ -361,6 +369,11 @@ async def fetch_event_context(symbols: List[str]) -> Dict[str, Dict[str, Optiona
     if not syms or not is_enabled():
         return base
     try:
+        ksa = sorted(s for s in syms if _is_ksa(s))
+        if ksa:  # v1.0.1: one notice per context call (sub-fns log at DEBUG)
+            logger.info("[calendar_provider v%s] KSA symbols carry no calendar "
+                        "data (EODHD has no Saudi coverage): %s",
+                        __version__, ",".join(ksa))
         earn, exdiv = await asyncio.gather(
             fetch_earnings_map(syms), fetch_next_exdiv_map(syms)
         )
@@ -404,6 +417,9 @@ def fetch_ipos_sync(days_ahead: int = 30) -> List[Dict[str, Any]]:
 # ----------------------------------------------------------------------------- #
 if __name__ == "__main__":  # pragma: no cover
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    # v1.0.1: httpx logs full request URLs at INFO — including api_token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     args = [a for a in sys.argv[1:] if a.strip()] or ["AAPL", "MSFT.US", "2222.SR"]
     print(f"calendar_provider v{__version__} | enabled={is_enabled()} "
           f"| base={_base_url()}")
