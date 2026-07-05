@@ -36,6 +36,31 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.5.0 — PDF REDESIGN + PORTFOLIO FINANCIALS (owner request, 2026-07-05)
+    * PDF fully redesigned: masthead band matching the email (ink/brass), a
+      KPI strip (book value, CURRENT ROI, freed cash, holdings, new buys),
+      right-aligned numerics, zebra tables, and page footers with numbers.
+    * NEW 'Portfolio — current ROI & key ratios' table: one row per holding
+      with Qty / Avg cost / Value / CURRENT ROI (Unrealized P/L %) next to
+      the engine's Expected ROI 12M, plus P/E, P/B, D/E, Dividend Yield and
+      Beta from the 115-column schema. Current ROI is colored red/green.
+    * NEW 'Income-statement snapshot (TTM)' table per holding: Revenue,
+      Revenue growth YoY, Gross/Operating/Net margins, EPS, Free Cash Flow.
+      HONEST SCOPE: these are the income-statement LINE ITEMS available on
+      the sheets; a full revenue->net-income statement is not on the
+      115-column schema (backend work if ever wanted).
+    * BUG FIX unlocking the above: ALL_PAGES never included My_Portfolio,
+      so v1.3.0's 'My_Portfolio wins' metric scan was a silent no-op (the
+      page was scanned but never fetched). My_Portfolio is now fetched
+      (both live and xlsx paths already tolerate a missing/failed page),
+      and extract_symbol_metrics() additionally collects Revenue (TTM),
+      Revenue Growth YoY, Gross/Operating margins, P/E (TTM/Fwd), P/B, P/S,
+      EV/EBITDA, PEG, Debt/Equity, FCF (TTM), Beta (5Y), Volatility 30D,
+      Sharpe (1Y), Payout Ratio, and the position columns Unrealized P/L %,
+      Position Qty, Avg Cost, Position Value. Missing values render as
+      dashes — never a broken layout. HTML email is unchanged (approved
+      design); the PDF is the deep-data artifact.
+
 v1.4.0 — PDF ATTACHMENT + END-OF-BRIEF ACTION SUMMARY (owner request, 2026-07-05)
     * Every sent brief now ATTACHES a PDF copy of the recommendations:
       portfolio actions table, best-new-buys table, and an ACTION SUMMARY
@@ -101,7 +126,7 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import argparse
 import datetime as _dt
@@ -118,8 +143,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # ----------------------------------------------------------------------------- #
 PAGE_DECISION = "Portfolio_Decision"
 PAGE_TOP10 = "Top_10_Investments"
+PAGE_PORTFOLIO = "My_Portfolio"  # v1.5.0: fetched for position ROI + ratios
 MARKET_PAGES = ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds"]
-ALL_PAGES = [PAGE_DECISION, PAGE_TOP10] + MARKET_PAGES
+ALL_PAGES = [PAGE_DECISION, PAGE_TOP10, PAGE_PORTFOLIO] + MARKET_PAGES
 
 VALID_ACTIONS = {"EXIT", "SELL", "TRIM", "REDUCE", "ADD", "BUY", "HOLD"}
 SELL_ACTIONS = {"EXIT", "SELL"}
@@ -426,8 +452,12 @@ def extract_symbol_metrics(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, 
     nothing; a missing symbol renders no strip (never a broken layout)."""
     out: Dict[str, Dict[str, Any]] = {}
     numeric = ("price", "roi1m", "roi3m", "roi12m", "fp1m", "fp3m", "fp12m",
-               "rel", "eps", "mcap", "divy", "margin", "hi52", "lo52")
-    for page in ["My_Portfolio"] + MARKET_PAGES:
+               "rel", "eps", "mcap", "divy", "margin", "hi52", "lo52",
+               # v1.5.0: ratios + income-statement line items + position columns
+               "rev", "revg", "gm", "om", "pe", "pef", "pb", "ps", "ev", "peg",
+               "de", "fcf", "beta", "vol30", "sharpe", "payout",
+               "uplpct", "qty", "avgcost", "pval")
+    for page in [PAGE_PORTFOLIO] + MARKET_PAGES:
         rows = _pad(pages_data.get(page, []) or [])
         h = _find_header(rows, ("symbol", "name"))
         if h < 0:
@@ -449,6 +479,27 @@ def extract_symbol_metrics(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, 
             "margin": _col_index(hdr, "Profit Margin"),
             "hi52": _col_index(hdr, "52W High"),
             "lo52": _col_index(hdr, "52W Low"),
+            # v1.5.0: ratios + income-statement line items + position columns
+            "rev": _col_index(hdr, "Revenue (TTM)"),
+            "revg": _col_index(hdr, "Revenue Growth YoY"),
+            "gm": _col_index(hdr, "Gross Margin"),
+            "om": _col_index(hdr, "Operating Margin"),
+            "pe": _col_index(hdr, "P/E (TTM)"),
+            "pef": _col_index(hdr, "P/E (Forward)"),
+            "pb": _col_index(hdr, "P/B"),
+            "ps": _col_index(hdr, "P/S"),
+            "ev": _col_index(hdr, "EV/EBITDA"),
+            "peg": _col_index(hdr, "PEG"),
+            "de": _col_index(hdr, "Debt/Equity"),
+            "fcf": _col_index(hdr, "Free Cash Flow (TTM)"),
+            "beta": _col_index(hdr, "Beta (5Y)"),
+            "vol30": _col_index(hdr, "Volatility 30D"),
+            "sharpe": _col_index(hdr, "Sharpe (1Y)"),
+            "payout": _col_index(hdr, "Payout Ratio"),
+            "uplpct": _col_index(hdr, "Unrealized P/L %"),
+            "qty": _col_index(hdr, "Position Qty"),
+            "avgcost": _col_index(hdr, "Avg Cost"),
+            "pval": _col_index(hdr, "Position Value"),
             "sector": _col_index(hdr, "Sector"),
         }
         if ci["symbol"] is None:
@@ -942,144 +993,250 @@ def _pdf_txt(v: Any, limit: int = 64) -> str:
 
 
 def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optional[bytes]:
-    """v1.4.0: PDF copy of the recommendations. Returns bytes, or None on any
-    failure (missing reportlab / build error) — the email must never be blocked
-    by the attachment."""
+    """v1.5.0: redesigned PDF copy of the recommendations, with portfolio
+    current-ROI/ratio and income-statement-snapshot tables. Returns bytes, or
+    None on any failure — the email must never be blocked by the attachment."""
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle
         from reportlab.lib.units import mm
-        from reportlab.platypus import (HRFlowable, Paragraph, SimpleDocTemplate,
-                                        Spacer, Table, TableStyle)
+        from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate,
+                                        Paragraph, Spacer, Table, TableStyle)
     except Exception as exc:  # pragma: no cover - environment dependent
         sys.stderr.write(f"[brief] PDF skipped (reportlab unavailable: {exc}); "
                          f"email will carry no attachment\n")
         return None
     try:
         d = model["decision"]; t = model["top10"]
+        mx: Dict[str, Dict[str, Any]] = model.get("metrics", {}) or {}
+        holdings = d["sell"] + d["trim"] + d["add"] + d["hold"]
+
         ink = colors.HexColor(INK); brass = colors.HexColor(BRASS)
-        grid = colors.HexColor("#D8D3C8"); zebra = colors.HexColor("#F6F4EF")
-        st_title = ParagraphStyle("title", fontName="Helvetica-Bold", fontSize=16,
-                                  textColor=ink, spaceAfter=2)
-        st_sub = ParagraphStyle("sub", fontName="Helvetica", fontSize=9,
-                                textColor=colors.HexColor("#5B6B7A"), spaceAfter=6)
-        st_h2 = ParagraphStyle("h2", fontName="Helvetica-Bold", fontSize=11.5,
-                               textColor=ink, spaceBefore=10, spaceAfter=3)
-        st_note = ParagraphStyle("note", fontName="Helvetica", fontSize=7.5,
-                                 textColor=colors.HexColor("#555555"), spaceAfter=4)
-        st_foot = ParagraphStyle("foot", fontName="Helvetica", fontSize=7,
-                                 textColor=colors.HexColor("#8A857A"), spaceBefore=10)
+        grid = colors.HexColor("#DAD5CA"); zebra = colors.HexColor("#F6F4EF")
+        gray6 = colors.HexColor("#5B6B7A"); paper = colors.HexColor("#FBFAF7")
+        red = colors.HexColor(SELL_C); green = colors.HexColor("#0E7C5A")
 
-        def _hr():
-            return HRFlowable(width="100%", thickness=0.8, color=brass, spaceAfter=5)
+        st_h2 = ParagraphStyle("h2", fontName="Helvetica-Bold", fontSize=11,
+                               textColor=ink, spaceBefore=11, spaceAfter=2)
+        st_note = ParagraphStyle("note", fontName="Helvetica", fontSize=7.2,
+                                 textColor=colors.HexColor("#666666"),
+                                 spaceAfter=4, leading=9.5)
+        st_foot = ParagraphStyle("foot", fontName="Helvetica", fontSize=6.8,
+                                 textColor=colors.HexColor("#8A857A"),
+                                 spaceBefore=12, leading=9)
 
-        def _tstyle(action_colors: Optional[Dict[int, str]] = None) -> TableStyle:
+        def _r(v: Optional[float], digits: int = 1) -> str:
+            return "-" if v is None else f"{v:,.{digits}f}"
+
+        def _mc(v: Optional[float]) -> str:
+            s = _mcap_compact(v)
+            return _pdf_txt(s if s and s != "\u2014" else "-", 12)
+
+        def _p(v: Optional[float], digits: int = 1) -> str:
+            return "-" if v is None else f"{v:+.{digits}f}%"
+
+        def _base(extra=None) -> TableStyle:
             cmds = [
                 ("BACKGROUND", (0, 0), (-1, 0), ink),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, 0), 7.5),
+                ("FONTSIZE", (0, 0), (-1, 0), 7),
                 ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                ("FONTSIZE", (0, 1), (-1, -1), 7.5),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("GRID", (0, 0), (-1, -1), 0.4, grid),
+                ("FONTSIZE", (0, 1), (-1, -1), 7),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LINEBELOW", (0, 0), (-1, 0), 0.9, brass),
+                ("GRID", (0, 0), (-1, -1), 0.35, grid),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, zebra]),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3.5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 3.5),
+                ("TOPPADDING", (0, 0), (-1, -1), 2.6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2.6),
             ]
-            for ridx, hexc in (action_colors or {}).items():
-                cmds.append(("TEXTCOLOR", (0, ridx), (0, ridx), colors.HexColor(hexc)))
-                cmds.append(("FONTNAME", (0, ridx), (0, ridx), "Helvetica-Bold"))
+            cmds += (extra or [])
             return TableStyle(cmds)
 
         story: List[Any] = []
-        story.append(Paragraph(_pdf_txt(f"{owner} - Daily Investment Brief", 80), st_title))
-        story.append(Paragraph(_pdf_txt(f"{when:%A, %d %B %Y} - {when:%H:%M} Riyadh - "
-                                        f"recommendations copy (v{__version__})", 110), st_sub))
-        story.append(_hr())
 
-        # --- Portfolio actions ---
-        story.append(Paragraph("Portfolio actions (decision layer)", st_h2))
-        story.append(Paragraph("Actions come from the confidence-gated Portfolio_Decision "
-                               "layer. Daily-horizon decision support - not advice; verify "
-                               "before acting.", st_note))
-        hdr = ["Action", "Symbol", "Name", "P&L %", "Wt %", "ROI 12M", "Rel", "Note"]
-        rows: List[List[str]] = [hdr]
-        acolors: Dict[int, str] = {}
+        # ---- masthead band (matches the email's ink/brass identity) ----
+        mast = Table(
+            [[Paragraph(f'<font color="#F4F1EA" size="15"><b>{_pdf_txt(owner, 40)}</b></font>'
+                        f'<br/><font color="{BRASS}" size="8">D A I L Y&nbsp;&nbsp;I N V E S T M E N T'
+                        f'&nbsp;&nbsp;B R I E F</font>',
+                        ParagraphStyle("m1", leading=13)),
+              Paragraph(f'<font color="#FFFFFF" size="9"><b>{when:%A}</b></font>'
+                        f'<br/><font color="#A9B4C4" size="8">{when:%d %B %Y} - {when:%H:%M} Riyadh'
+                        f'<br/>recommendations copy - v{__version__}</font>',
+                        ParagraphStyle("m2", alignment=2, leading=11))]],
+            colWidths=[118 * mm, 62 * mm],
+            style=TableStyle([("BACKGROUND", (0, 0), (-1, -1), ink),
+                              ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                              ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                              ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                              ("TOPPADDING", (0, 0), (-1, -1), 8),
+                              ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                              ("LINEBELOW", (0, 0), (-1, -1), 1.4, brass)]))
+        story.append(mast)
+        story.append(Spacer(0, 5))
+
+        # ---- KPI strip ----
+        pl = d.get("pl_pct")
+        kpis = [("BOOK VALUE", f"{d['mv']:,.0f} SAR", gray6),
+                ("CURRENT ROI", _p(pl), (green if (pl or 0) >= 0 else red)),
+                ("FREED CASH", f"~{d['freed_cash']:,.0f} SAR", gray6),
+                ("HOLDINGS", str(len(holdings)), gray6),
+                ("NEW BUYS", str(len(t["top"])), gray6)]
+        cells = [Paragraph(f'<font color="#7E8AA0" size="6">{k}</font><br/>'
+                           f'<font color="{v_c.hexval() if hasattr(v_c, "hexval") else INK}" size="10">'
+                           f'<b>{_pdf_txt(v, 20)}</b></font>',
+                           ParagraphStyle("kpi", leading=13, alignment=1))
+                 for k, v, v_c in kpis]
+        story.append(Table([cells], colWidths=[36 * mm] * 5,
+                           style=TableStyle([("BACKGROUND", (0, 0), (-1, -1), paper),
+                                             ("BOX", (0, 0), (-1, -1), 0.5, grid),
+                                             ("INNERGRID", (0, 0), (-1, -1), 0.5, grid),
+                                             ("TOPPADDING", (0, 0), (-1, -1), 5),
+                                             ("BOTTOMPADDING", (0, 0), (-1, -1), 5)])))
+
+        # ---- 1) Portfolio actions ----
+        story.append(Paragraph("1 - Portfolio actions (decision layer)", st_h2))
+        story.append(Paragraph("Actions come from the confidence-gated Portfolio_Decision layer. "
+                               "Daily-horizon decision support - not advice; verify before acting.",
+                               st_note))
+        rows: List[List[str]] = [["Action", "Symbol", "Name", "P&L %", "Wt %",
+                                  "ROI 12M", "Rel", "Note"]]
+        extra = []
         for label, recs, hexc in (("EXIT/SELL", d["sell"], SELL_C), ("TRIM", d["trim"], TRIM_C),
                                   ("ADD", d["add"], ADD_C), ("HOLD", d["hold"], HOLD_C)):
             for r in recs:
-                rows.append([label, _pdf_txt(r["symbol"], 12), _pdf_txt(r["name"], 30),
+                rows.append([label, _pdf_txt(r["symbol"], 12), _pdf_txt(r["name"], 28),
                              _pct(r.get("pl")), _pct(r.get("weight"), 1).lstrip("+"),
-                             _pct(r.get("eroi")), _num_str(r.get("rel")),
-                             _pdf_txt(r.get("note"), 58)])
-                acolors[len(rows) - 1] = hexc
+                             _pct(r.get("eroi")), _num_str(r.get("rel")), _pdf_txt(r.get("note"), 52)])
+                ri = len(rows) - 1
+                extra.append(("TEXTCOLOR", (0, ri), (0, ri), colors.HexColor(hexc)))
+                extra.append(("FONTNAME", (0, ri), (0, ri), "Helvetica-Bold"))
         if len(rows) == 1:
             rows.append(["-", "-", "no holdings parsed", "-", "-", "-", "-", "-"])
-        w = [18*mm, 18*mm, 38*mm, 12*mm, 11*mm, 14*mm, 10*mm, 59*mm]
-        story.append(Table(rows, colWidths=w, repeatRows=1, style=_tstyle(acolors)))
+        extra.append(("ALIGN", (3, 1), (6, -1), "RIGHT"))
+        story.append(Table(rows, colWidths=[17*mm, 17*mm, 36*mm, 12*mm, 10*mm, 13*mm, 9*mm, 66*mm],
+                           repeatRows=1, style=_base(extra)))
 
-        # --- Best new buys ---
-        story.append(Paragraph("Best new buys (all markets)", st_h2))
-        story.append(Paragraph("Ranked entry candidates you do not hold. The figure is the "
-                               "gap to estimated fair value - a valuation target, not a "
-                               "prediction; reliability and confidence show how much weight "
-                               "to give each.", st_note))
-        rows2: List[List[str]] = [["#", "Symbol", "Name", "Market", "Sector",
-                                   "To FV %", "Rel", "Conf"]]
+        # ---- 2) Portfolio — current ROI & key ratios ----
+        story.append(Paragraph("2 - Portfolio - current ROI &amp; key ratios", st_h2))
+        story.append(Paragraph("Current ROI is your ACTUAL unrealized P&amp;L on the position "
+                               "(from My_Portfolio); Exp ROI 12M is the engine's modelled outlook "
+                               "(low-to-moderate reliability). Ratios from the 115-column schema; "
+                               "dashes mean the sheet has no value for that name.", st_note))
+        rows2: List[List[str]] = [["Symbol", "Qty", "Avg cost", "Value", "Cur ROI",
+                                   "Exp 12M", "P/E", "P/B", "D/E", "Div %", "Beta"]]
+        extra2 = [("ALIGN", (1, 1), (-1, -1), "RIGHT")]
+        for r in holdings:
+            m = mx.get(r["symbol"].upper(), {}) or {}
+            cur = m.get("uplpct", r.get("pl"))
+            rows2.append([_pdf_txt(r["symbol"], 12), _r(m.get("qty"), 0), _r(m.get("avgcost"), 2),
+                          _r(m.get("pval"), 0), _p(cur), _p(r.get("eroi")),
+                          _r(m.get("pe")), _r(m.get("pb")), _r(m.get("de"), 2),
+                          _r(m.get("divy")), _r(m.get("beta"), 2)])
+            ri = len(rows2) - 1
+            extra2.append(("TEXTCOLOR", (4, ri), (4, ri), green if (cur or 0) >= 0 else red))
+            extra2.append(("FONTNAME", (4, ri), (4, ri), "Helvetica-Bold"))
+        if len(rows2) == 1:
+            rows2.append(["-"] * 11)
+        story.append(Table(rows2, colWidths=[22*mm, 13*mm, 17*mm, 21*mm, 16*mm, 16*mm,
+                                             13*mm, 13*mm, 13*mm, 13*mm, 13*mm],
+                           repeatRows=1, style=_base(extra2)))
+
+        # ---- 3) Income-statement snapshot (TTM) ----
+        story.append(Paragraph("3 - Income-statement snapshot (TTM) - portfolio", st_h2))
+        story.append(Paragraph("The income-statement LINE ITEMS available on the sheets today. "
+                               "A full revenue-to-net-income statement is not on the 115-column "
+                               "schema; adding one would be backend work.", st_note))
+        rows3: List[List[str]] = [["Symbol", "Revenue", "Rev YoY", "Gross %", "Oper %",
+                                   "Net %", "EPS", "FCF"]]
+        for r in holdings:
+            m = mx.get(r["symbol"].upper(), {}) or {}
+            rows3.append([_pdf_txt(r["symbol"], 12), _mc(m.get("rev")), _p(m.get("revg")),
+                          _r(m.get("gm")), _r(m.get("om")), _r(m.get("margin")),
+                          _r(m.get("eps"), 2), _mc(m.get("fcf"))])
+        if len(rows3) == 1:
+            rows3.append(["-"] * 8)
+        story.append(Table(rows3, colWidths=[24*mm, 26*mm, 20*mm, 20*mm, 20*mm, 20*mm, 20*mm, 30*mm],
+                           repeatRows=1,
+                           style=_base([("ALIGN", (1, 1), (-1, -1), "RIGHT")])))
+
+        # ---- 4) Best new buys ----
+        story.append(Paragraph("4 - Best new buys (all markets)", st_h2))
+        story.append(Paragraph("Ranked entry candidates you do not hold. The figure is the gap to "
+                               "estimated fair value - a valuation target, not a prediction; "
+                               "reliability and confidence show how much weight to give each.", st_note))
+        rows4: List[List[str]] = [["#", "Symbol", "Name", "Market", "Sector", "To FV %", "Rel", "Conf"]]
         n = 0
         for p in t["top"]:
             n += 1
-            rows2.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 30),
-                          _pdf_txt(p["market"], 14), _pdf_txt(p["sector"], 18),
+            rows4.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 28),
+                          _pdf_txt(p["market"], 14), _pdf_txt(p["sector"], 16),
                           _pct(p.get("roi"), 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
         for market, names in (t.get("rest") or {}).items():
             for p in names:
                 n += 1
-                rows2.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 30),
-                              _pdf_txt(market, 14), _pdf_txt(p.get("sector"), 18),
+                rows4.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 28),
+                              _pdf_txt(market, 14), _pdf_txt(p.get("sector"), 16),
                               _pct(p.get("roi"), 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
-        if len(rows2) == 1:
-            rows2.append(["-", "-", "no funded candidates today", "-", "-", "-", "-", "-"])
-        w2 = [8*mm, 18*mm, 46*mm, 22*mm, 30*mm, 15*mm, 10*mm, 31*mm]
-        story.append(Table(rows2, colWidths=w2, repeatRows=1, style=_tstyle()))
+        if len(rows4) == 1:
+            rows4.append(["-", "-", "no funded candidates today", "-", "-", "-", "-", "-"])
+        story.append(Table(rows4, colWidths=[7*mm, 17*mm, 45*mm, 21*mm, 28*mm, 14*mm, 9*mm, 39*mm],
+                           repeatRows=1,
+                           style=_base([("ALIGN", (5, 1), (6, -1), "RIGHT")])))
 
-        # --- Action summary (END) ---
-        story.append(Paragraph("Action summary", st_h2))
-        rows3: List[List[str]] = [["ACTION", "#", "SYMBOLS", "CASH (SAR)"]]
-        acolors3: Dict[int, str] = {}
+        # ---- 5) Action summary (END) ----
+        story.append(Paragraph("5 - Action summary", st_h2))
+        rows5: List[List[str]] = [["ACTION", "#", "SYMBOLS", "CASH (SAR)"]]
+        extra5 = [("ALIGN", (3, 1), (3, -1), "RIGHT")]
         for label, recs, hexc, cash in (("EXIT / SELL", d["sell"], SELL_C, True),
                                         ("TRIM", d["trim"], TRIM_C, True),
                                         ("ADD / BUY", d["add"], ADD_C, True),
                                         ("HOLD", d["hold"], HOLD_C, False)):
             sar = _grp_cash(recs)
-            rows3.append([label, str(len(recs)),
+            rows5.append([label, str(len(recs)),
                           _pdf_txt(", ".join(r["symbol"] for r in recs) or "-", 88),
                           (f"~{sar:,.0f}" if (cash and sar) else "-")])
-            acolors3[len(rows3) - 1] = hexc
-        rows3.append(["NEW BUY CANDIDATES", str(len(t["top"])),
+            ri = len(rows5) - 1
+            extra5.append(("TEXTCOLOR", (0, ri), (0, ri), colors.HexColor(hexc)))
+            extra5.append(("FONTNAME", (0, ri), (0, ri), "Helvetica-Bold"))
+        rows5.append(["NEW BUY CANDIDATES", str(len(t["top"])),
                       _pdf_txt(", ".join(p["symbol"] for p in t["top"]) or "-", 88), "-"])
-        acolors3[len(rows3) - 1] = STEEL
-        w3 = [34*mm, 8*mm, 106*mm, 32*mm]
-        story.append(Table(rows3, colWidths=w3, repeatRows=1, style=_tstyle(acolors3)))
-        pl = f"{d['pl_pct']:+.1f}%" if d.get("pl_pct") is not None else "-"
-        story.append(Paragraph(_pdf_txt(f"Book {d['mv']:,.0f} SAR  |  P&L {pl}  |  "
+        story.append(Table(rows5, colWidths=[34*mm, 8*mm, 106*mm, 32*mm], repeatRows=1,
+                           style=_base(extra5)))
+        story.append(Paragraph(_pdf_txt(f"Book {d['mv']:,.0f} SAR  |  Current ROI {_p(pl)}  |  "
                                         f"Freed cash ~{d['freed_cash']:,.0f} SAR", 120), st_note))
 
-        story.append(Paragraph("Prepared from your own screening engine for monitoring and "
-                               "decision support - not personalised financial advice or an "
-                               "instruction to trade. Recommendations are daily-horizon; "
-                               "modelled 12-month outlooks carry low-to-moderate reliability. "
-                               "You remain the decision-maker; verify before acting.", st_foot))
+        story.append(Paragraph("Prepared from your own screening engine for monitoring and decision "
+                               "support - not personalised financial advice or an instruction to "
+                               "trade. Recommendations are daily-horizon; modelled 12-month outlooks "
+                               "carry low-to-moderate reliability. You remain the decision-maker; "
+                               "verify before acting.", st_foot))
 
+        # ---- document with numbered page footer ----
         buf = io.BytesIO()
-        doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15*mm, rightMargin=15*mm,
-                                topMargin=14*mm, bottomMargin=14*mm,
-                                title=f"Daily Investment Brief {when:%Y-%m-%d}",
-                                author=_pdf_txt(owner, 40))
+        owner_footer = _pdf_txt(owner, 40)
+        stamp = f"{when:%d %b %Y %H:%M} Riyadh"
+
+        def _page_footer(canv, doc_):
+            canv.saveState()
+            canv.setStrokeColor(brass); canv.setLineWidth(0.6)
+            canv.line(15 * mm, 11 * mm, 195 * mm, 11 * mm)
+            canv.setFont("Helvetica", 6.5); canv.setFillColor(colors.HexColor("#8A857A"))
+            canv.drawString(15 * mm, 7.5 * mm, f"{owner_footer} - Daily Investment Brief - {stamp}")
+            canv.drawRightString(195 * mm, 7.5 * mm, f"Page {canv.getPageNumber()}")
+            canv.restoreState()
+
+        doc = BaseDocTemplate(buf, pagesize=A4,
+                              leftMargin=15 * mm, rightMargin=15 * mm,
+                              topMargin=12 * mm, bottomMargin=16 * mm,
+                              title=f"Daily Investment Brief {when:%Y-%m-%d}",
+                              author=owner_footer)
+        frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="body")
+        doc.addPageTemplates([PageTemplate(id="page", frames=[frame], onPage=_page_footer)])
         doc.build(story)
         return buf.getvalue()
     except Exception as exc:
