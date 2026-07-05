@@ -1,9 +1,40 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.0.4   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
-                  Engineering Audit Phase 1 — identity (ghost-ticker) gate,
-                  env-gated DEFAULT-OFF)
+Version: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
+                  Engineering Audit Fix #2 — valuation<->forecast conflict
+                  guard, env-gated DEFAULT-OFF)
+
+v1.0.5 [VF-CONFLICT-GUARD]: the 2026-07-05 audit's FER.US case: the valuation
+EXIT clause (rule 3, first leg) fires on valuation ROI alone — reference
+(target/intrinsic) 23% BELOW price -> ROI -23% <= -15% -> EXIT — while the
+engine's OWN view of the same holding said HOLD, 12M forecast +34.9%,
+reliability 78.8 (High). The page then rendered EXIT beside "Engine ROI
++34.9%", with TP1/TP2 below the stop (valuation targets under price), i.e.
+the flagship advisory page ordered the sale of the holding its own engine
+liked most. The v1.0.1 WHY claimed the valuation/forecast spread was "not a
+wrong-action risk" because the verdict "considers the engine recommendation"
+— but only the SELL direction is consulted; a strongly POSITIVE engine view
+never restrains a valuation-driven exit. Model-vs-model contradiction was
+auto-trading. FIX (DEFAULT OFF — opt-in via TFB_PF_VF_CONFLICT_GUARD=1;
+kill-switch is leaving it unset/0, which is byte-identical v1.0.4): a
+valuation-driven EXIT or valuation-driven TRIM (rule 4c ONLY — position-cap
+and sector-cap trims are risk-budget rules and are NEVER suppressed) is
+CONTRADICTED when ALL of: (a) engine 12M forecast ROI >= 
+TFB_PF_VF_CONFLICT_MIN_ENGINE_ROI (default 12, = the ADD/T10 Required ROI),
+(b) confidence band is not Low (the engine view itself is trustworthy —
+mirrors the existing L8 cap floor), and (c) the engine recommendation is not
+sell-tier (a sell-tier reco EXIT is engine-driven and always stands). A
+contradicted valuation action is WITHHELD: the holding falls through the
+normal chain (cap trims still win if breached) and, absent any other binding
+rule, lands HOLD with reason "Valuation/forecast conflict: valuation ROI X%
+vs engine 12M +Y% (reliability Z) — manual review" and capped_from set to
+the suppressed action. Contradictory strong signals never trade — the exact
+philosophy the low-confidence cap already applies to WEAK signals. New alert
+"valuation_forecast_conflict" counts these rows; low_confidence_capped now
+excludes them (marker split, same pattern as the v1.0.2/3/4 alert splits) so
+each row carries exactly one accurate remediation. No change to sizing, the
+L7 funding identity, P&L, BLOCK gates, or any sell-tier/cap-driven action.
 
 v1.0.4 [PHASE1-IDENTITY-GATE]: the audit's ghost-ticker class (live case
 5023.SR — Name merely repeats the Symbol, no fundamentals, TP1/TP2 = 0,
@@ -167,11 +198,16 @@ Evaluated in strict precedence; first match wins:
   3. EXIT   — valuation ROI ≤ exit_roi_pct (default −15: price ≳17.6% above
      reference) OR engine recommendation in the SELL tier
      (SELL/STRONG_SELL/EXIT/AVOID/REDUCE, case/space-insensitive).
+     v1.0.5: when TFB_PF_VF_CONFLICT_GUARD=1, the VALUATION leg is withheld
+     if the engine 12M forecast strongly contradicts it (see guard WHY);
+     the sell-tier leg always stands.
   4. TRIM   — (a) position weight > Max Position % → trim exactly to cap;
               (b) sector weight > Max Sector % → pro-rata share of the
                   sector excess across that sector's holdings;
               (c) valuation: exit_roi_pct < ROI ≤ trim_roi_pct (default −5)
                   → trim VALUATION_TRIM_FRAC (0.5) of the position.
+                  v1.0.5: leg (c) is withheld under the same conflict guard;
+                  cap legs (a)/(b) are never suppressed.
      Largest of (a)/(b)/(c) wins; proceeds_sar recorded.
   5. ADD    — reliability ≥ Min Reliability to Add AND dq ≥ Min DQ to Add
               AND valuation ROI ≥ add_roi_pct (default 12, = T10 Required
@@ -235,6 +271,10 @@ ENV KILL-SWITCHES (read per call; explicit controls > env > defaults)
   TFB_PF_MAX_DATA_AGE_HOURS "168" v1.0.3: stale quote older than this ⇒ BLOCK
   TFB_PF_MIN_TRUST_FIELDS "2"    v1.0.3: fewer core signals ⇒ thin (alert)
   TFB_PF_BLOCK_THIN_COVERAGE "0" v1.0.3: "1" ⇒ thin holdings also BLOCK
+  TFB_PF_VF_CONFLICT_GUARD "0"  v1.0.5: "1" ⇒ withhold valuation EXIT/TRIM
+                                 contradicted by the engine 12M forecast
+  TFB_PF_VF_CONFLICT_MIN_ENGINE_ROI "12" v1.0.5: engine-ROI floor (percent)
+                                 for a contradiction
 
 HONESTY RULES (L13): zero ADDs, all-HOLD, empty holdings, unknown trends and
 None P&L are CORRECT outputs; nothing is upgraded or padded to fill space.
@@ -246,7 +286,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 
-PORTFOLIO_ACTIONS_VERSION = "1.0.4"
+PORTFOLIO_ACTIONS_VERSION = "1.0.5"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -331,18 +371,26 @@ DEFAULT_CONTROLS = {
     # BLOCKed at step 1 instead of being capped to a confident-looking HOLD.
     "identity_gate_enabled": False,
     "identity_min_reliability": 50.0,
+    # v1.0.5 valuation<->forecast conflict guard (Fix #2; env-tunable, see
+    # policy block). DEFAULT OFF (opt-in). The float is the engine-12M-ROI
+    # floor (percent) above which a positive engine forecast contradicts a
+    # valuation-driven EXIT/TRIM.
+    "vf_conflict_guard_enabled": False,
+    "vf_conflict_min_engine_roi_pct": 12.0,
 }
 
 _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
                    "max_sector_pct", "min_reliability_add", "min_dq_add",
                    "add_roi_pct", "trim_roi_pct", "exit_roi_pct",
                    "valuation_trim_frac", "cost_max_ratio", "cost_min_ratio",
-                   "max_data_age_hours", "identity_min_reliability")
+                   "max_data_age_hours", "identity_min_reliability",
+                   "vf_conflict_min_engine_roi_pct")
 _CONTROLS_INT = ("review_days", "lot_size", "max_holdings", "period_months",
                  "min_trust_fields")
 _CONTROLS_BOOL = ("engine_roi_display_enabled", "cost_basis_gate_enabled",
                   "block_missing_cost_basis", "trust_gate_enabled",
-                  "block_thin_coverage", "identity_gate_enabled")
+                  "block_thin_coverage", "identity_gate_enabled",
+                  "vf_conflict_guard_enabled")
 
 
 def _env_str(name, default):
@@ -408,6 +456,15 @@ def _env_identity_gate():
         in ("1", "true", "yes", "on")
 
 
+def _env_vf_conflict_guard():
+    """v1.0.5: master switch for the valuation<->forecast conflict guard.
+    DEFAULT OFF (opt-in) — set TFB_PF_VF_CONFLICT_GUARD=1 to withhold a
+    valuation-driven EXIT/TRIM that the engine's own 12M forecast strongly
+    contradicts. OFF restores v1.0.4 behavior exactly."""
+    return str(_env_str("TFB_PF_VF_CONFLICT_GUARD", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
 def _env_engine_roi_display():
     """v1.0.1: engine-forecast display toggle. Default OFF; set
     TFB_PF_ENGINE_ROI_DISPLAY=1 to surface the engine 12M forecast on every
@@ -465,6 +522,10 @@ def _env_overrides():
         "identity_min_reliability": _env_float(
             "TFB_PF_IDENTITY_MIN_RELIABILITY",
             DEFAULT_CONTROLS["identity_min_reliability"]),
+        "vf_conflict_guard_enabled": _env_vf_conflict_guard(),
+        "vf_conflict_min_engine_roi_pct": _env_float(
+            "TFB_PF_VF_CONFLICT_MIN_ENGINE_ROI",
+            DEFAULT_CONTROLS["vf_conflict_min_engine_roi_pct"]),
     }
 
 
@@ -512,6 +573,10 @@ def make_controls(overrides=None):
     if not (0.0 <= ctl["identity_min_reliability"] <= 100.0):
         ctl["identity_min_reliability"] = (
             DEFAULT_CONTROLS["identity_min_reliability"])
+    # v1.0.5 conflict-floor sanity: keep the engine-ROI floor in [0, 100].
+    if not (0.0 <= ctl["vf_conflict_min_engine_roi_pct"] <= 100.0):
+        ctl["vf_conflict_min_engine_roi_pct"] = (
+            DEFAULT_CONTROLS["vf_conflict_min_engine_roi_pct"])
     mode = str(ctl.get("rebalance_mode") or REBALANCE_ADVISORY)
     low = mode.strip().lower()
     if "new cash" in low:
@@ -666,6 +731,18 @@ def _is_trust_block(action, reason):
     r = (reason or "").lower()
     return action == ACTION_BLOCK and (
         _STALE_BLOCK_MARKER in r or _THIN_BLOCK_MARKER in r)
+
+
+_VF_CONFLICT_MARKER = "valuation/forecast conflict"
+
+
+def _is_vf_conflict_hold(action, reason):
+    """v1.0.5: True iff this HOLD is a withheld valuation action under the
+    valuation<->forecast conflict guard. Keeps the alert split (excluded from
+    low_confidence_capped, counted by valuation_forecast_conflict) in lockstep
+    with the reason string."""
+    return action == ACTION_HOLD and _VF_CONFLICT_MARKER in (
+        reason or "").lower()
 
 
 def _is_identity_block(action, reason):
@@ -888,9 +965,37 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
     roi = cand.get("roi_pct")
     reco = cand.get("recommendation")
 
+    # v1.0.5 (Fix #2): valuation<->forecast conflict pre-check. A valuation-
+    # driven EXIT/TRIM is contradicted when the engine's OWN 12M forecast is
+    # strongly positive (>= floor), the engine view is trustworthy (band not
+    # Low), and the engine recommendation is not sell-tier. Contradictory
+    # strong signals never trade (FER.US live case: valuation ROI -23% vs
+    # engine +34.9% at reliability 78.8 -> EXIT fired blind). Guard OFF ->
+    # vf_conflict stays False and every branch below is byte-identical
+    # v1.0.4. Cap-driven trims are NEVER suppressed (risk budget != opinion).
+    vf_conflict = False
+    vf_suppressed = None
+    if (controls.get("vf_conflict_guard_enabled")
+            and roi is not None
+            and roi <= controls["trim_roi_pct"]
+            and conf != "Low"
+            and not _is_sell_tier(reco)):
+        _vf_engine_pct = _engine_roi_to_pct(cand.get("engine_roi_12m_pct"))
+        if (_vf_engine_pct is not None
+                and _vf_engine_pct >= controls["vf_conflict_min_engine_roi_pct"]):
+            vf_conflict = True
+            vf_suppressed = (ACTION_EXIT
+                             if roi <= controls["exit_roi_pct"]
+                             else ACTION_TRIM)
+            vf_reason = ("Valuation/forecast conflict: valuation ROI %.1f%% "
+                         "vs engine 12M %+.1f%% (reliability %s) — "
+                         "valuation-driven %s withheld, manual review"
+                         % (roi, _vf_engine_pct, _fmt(rel), vf_suppressed))
+
     # 3. EXIT
     exit_reason = None
-    if roi is not None and roi <= controls["exit_roi_pct"]:
+    if (roi is not None and roi <= controls["exit_roi_pct"]
+            and not vf_conflict):
         exit_reason = ("Valuation ROI %.1f%% <= exit threshold %.1f%%"
                        % (roi, controls["exit_roi_pct"]))
     elif _is_sell_tier(reco):
@@ -915,7 +1020,8 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
                       "Sector %.1f%% > Max Sector %.1f%% — pro-rata trim"
                       % (sector_weight_pct or 0.0,
                          controls["max_sector_pct"])))
-    if (roi is not None and roi <= controls["trim_roi_pct"] and mv):
+    if (roi is not None and roi <= controls["trim_roi_pct"] and mv
+            and not vf_conflict):
         trims.append((mv * controls["valuation_trim_frac"],
                       "Valuation ROI %.1f%% <= trim threshold %.1f%% — trim "
                       "%d%% of position"
@@ -957,6 +1063,12 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
                 0.0, None)
 
     # 6. HOLD — name the first binding fact
+    # v1.0.5 (Fix #2): a withheld valuation action that fell all the way
+    # through (no sell-tier exit, no cap trim, ADD impossible at negative
+    # ROI) lands here — the conflict IS the binding fact, and capped_from
+    # carries the suppressed action for the alert split.
+    if vf_conflict:
+        return (ACTION_HOLD, vf_reason, 0.0, vf_suppressed)
     if roi is None:
         why = "No valuation reference (target/intrinsic) — upside unknown"
     elif roi < controls["add_roi_pct"]:
@@ -1411,9 +1523,19 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     _alert("over_sector_cap",
            sum(1 for s in sector_summary if s["over_cap"]),
            "Review sector-cap trims")
+    # v1.0.5: conflict holds also carry capped_from (truthfully — the action
+    # WAS capped), so exclude them here and count them under their own alert;
+    # guard OFF -> zero conflict rows -> both counts byte-identical v1.0.4.
     _alert("low_confidence_capped",
-           sum(1 for e in entries if e.get("capped_from")),
+           sum(1 for e in entries
+               if e.get("capped_from") and
+               not _is_vf_conflict_hold(e["action"], e["action_reason"])),
            "Improve data reliability; actions were capped to HOLD")
+    _alert("valuation_forecast_conflict",
+           sum(1 for e in entries
+               if _is_vf_conflict_hold(e["action"], e["action_reason"])),
+           "Valuation model and engine forecast disagree strongly on flagged "
+           "holdings — resolve manually before selling")
     if (any(e["action"] == ACTION_ADD for e in entries) and
             adds_funded <= 0):
         _alert("no_deployable_capital", 1,
