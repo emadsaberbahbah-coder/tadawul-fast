@@ -2,8 +2,71 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.103.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.104.0
 ================================================================================
+
+WHY v5.104.0 - PROVIDER BAR-AGE HONESTY (Fix AR; env-gated
+TFB_GATE_PROVIDER_BAR_AGE, DEFAULT OFF; unset/0/false/off/no keeps v5.103.0
+byte-identical. Tolerance: TFB_BAR_AGE_MAX_SESSIONS, default 1)
+--------------------------------------------------------------------------
+ROOT CAUSE (live evidence 2026-07-05 audit, verified against Argaam /
+TradingEconomics same-day quotes): Fix AQ (v5.103.0) polices the FALLBACK
+paths (history/snapshot), but a price the provider itself serves as "live"
+is trusted unconditionally. In production that trust is misplaced in two
+verified ways:
+  (a) EODHD non-US exchanges served months-old closes as the live quote:
+      4503.T (Astellas) 2,152 JPY vs 2,553.50 market (-15.7%), 0016.HK
+      ~-16% - with DQ=100, Reliability 76.5+, fresh timestamps, zero
+      warnings. Top_10 ranks 1-2 were sized/stopped off these prices.
+  (b) Yahoo under datacenter throttle served weeks-old cached bars as the
+      current price for .SR mid-caps: 1211.SR 58.90 vs 63.10 Argaamlive
+      (-6.7%), 3092.SR 22.77 vs 24.54 (-7.2%). My_Portfolio P&L and the
+      Portfolio_Decision EXIT math ran on those prices.
+Fix AQ could not see either case because _live_priced=True: the provider
+DID return a quote - the quote itself was old. The provider KNOWS the bar
+time (EODHD real-time ships `timestamp`; Yahoo has regularMarketTime and
+the last history bar), but _canonicalize_provider_row consumed `timestamp`
+only as a last_updated_utc ALIAS where the provider's fresh now() mint wins
+- so the true bar date was read and then DISCARDED.
+
+FIX (disclosure + gate; adds NO sheet column - price_bar_ts is an internal
+row field the 115-column projector never emits):
+  1. NEW canonical field `price_bar_ts` (aliases: timestamp,
+     quote_timestamp, regularMarketTime, bar_date, price_bar_date) so the
+     provider-reported bar time SURVIVES canonicalization into the merged
+     row. Read-only alias reuse: last_updated_utc still resolves exactly
+     as before (field-first, mint wins) - byte-identical when gate is OFF.
+  2. NEW helpers (_bar_age_gate_enabled, _bar_age_max_sessions,
+     _parse_bar_ts, _bar_age_sessions, _bar_age_check) + a per-suffix
+     exchange session table (weekend set, UTC offset, local close hour:
+     .SR Sun-Thu 15:00 UTC+3; .T 15:00 UTC+9; .HK 16:00 UTC+8; .KS/.KQ,
+     .NS/.BO, .SS/.SZ, .L, EU suffixes, .JO, .AX, .NZ, .TO/.V, .SA, .MX;
+     default US 16:00 UTC-5). Session lag = count of completed trading
+     sessions strictly AFTER the bar's exchange-local date, up to the last
+     completed session "now". Exchange holidays are NOT modeled - the
+     default tolerance of 1 session absorbs single-holiday gaps (e.g. the
+     Jul-3-2026 US observed holiday), so lag > 1 means genuinely stale.
+     Indices (^...), futures (=F), FX (=X) and crypto (-USD) are SKIPPED
+     (continuous/synthetic sessions would false-positive).
+  3. Factory (Fix AR block, right after Fix AQ): gate ON + _live_priced +
+     bar lag > tolerance -> append warnings tag
+     `price_bar_stale:<bar-date>:<lag>s`. Timestamps are NOT touched
+     (the fetch time is true); the WARNING carries the bar's own date.
+     Fallback-priced rows are Fix AQ's jurisdiction and already tagged.
+  4. _apply_investability_gate (both changes gated by the same env flag):
+     (i) reliability penalty -30 for a price_bar_stale row (a stale "live"
+     price is weaker provenance than a soft-capped target, stronger signal
+     than a momentum fallback); (ii) hard demotion tier immediately after
+     the base verdict chain: status BLOCKED / final_action DO_NOT_INVEST /
+     block_reason "Stale price bar (provider data N session(s) old)" -
+     mirroring the "Missing current price" posture, because a months-old
+     price is epistemically NO price. Strict/Conservative/IPO tiers below
+     only act on INVESTABLE rows and are therefore untouched.
+  Idempotent by construction: the tag append is deduped by
+  _aq_append_warning; the gate re-derives the same verdict from the same
+  warnings on every boundary pass; cache-hit rows re-gate identically.
+KILL SWITCH: TFB_GATE_PROVIDER_BAR_AGE unset/0 -> no tag, no penalty, no
+demotion; v5.103.0 verdicts byte-identical (verified by behavioral test).
 
 WHY v5.103.0 - PRICE PROVENANCE HONESTY (Fix AQ; env-gated
 TFB_GATE_PRICE_STALENESS, default ON; 0/false/off/no restores the v5.102.0
@@ -2216,7 +2279,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.103.0"
+__version__ = "5.104.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4625,6 +4688,12 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         rel -= _soft_cap_penalty
     if "provider_target" in warns and ("drop" in warns or "reject" in warns):
         rel -= 15.0
+    # v5.104.0 (Fix AR): a "live" price whose own bar is older than the
+    # exchange's last completed session (beyond tolerance) is NOT verified
+    # provenance - penalize reliability harder than a soft-capped target.
+    # Gated: flag OFF -> no penalty (v5.103.0 byte-identical).
+    if _bar_age_gate_enabled() and "price_bar_stale" in warns:
+        rel -= 30.0
     opp_src = _safe_str(row.get("opportunity_source")).lower()
     fc_src = _safe_str(row.get("forecast_source")).lower()
     if "momentum" in opp_src or "fallback" in opp_src:
@@ -4701,6 +4770,22 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         reason = "Negative forecast (expected ROI %.1f%%)" % (gov_roi * 100.0)
     else:
         status, action, reason = "INVESTABLE", "INVEST", ""
+
+    # -- v5.104.0 (Fix AR): stale-provider-bar hard demotion (env-gated, ------
+    # default OFF). A price whose own bar is materially behind the exchange
+    # calendar is epistemically NO price - every downstream number (P&L,
+    # entry, stop, TP, ROI) computed from it is fiction. Mirror the
+    # "Missing current price" posture: BLOCKED / DO_NOT_INVEST, with the
+    # bar's session lag surfaced in block_reason. Runs AFTER the base chain
+    # so it overrides any verdict; the Strict/Conservative/IPO tiers below
+    # only act on INVESTABLE rows and are therefore unaffected. Idempotent:
+    # pure function of the row's warnings on every boundary pass.
+    if _bar_age_gate_enabled() and "price_bar_stale" in warns:
+        _ar_lag = _bar_stale_lag_from_warnings(warns)
+        status, action = "BLOCKED", "DO_NOT_INVEST"
+        reason = "Stale price bar (provider data %s session(s) old)" % (
+            _ar_lag if _ar_lag is not None else "several"
+        )
 
     # -- v5.79.4 (Fix P): strict final-approval tier (default OFF) -------------
     # Only acts on rows the BASE gate approved (INVESTABLE / INVEST). Enforces the
@@ -7810,6 +7895,191 @@ def _price_staleness_gate_enabled() -> bool:
     return (os.getenv("TFB_GATE_PRICE_STALENESS") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
+def _bar_age_gate_enabled() -> bool:
+    """v5.104.0 (Fix AR) master switch. DEFAULT OFF (backward-compatible);
+    set TFB_GATE_PROVIDER_BAR_AGE=1/true/on/yes to enable the provider
+    bar-age honesty gate. OFF -> no tag, no reliability penalty, no
+    demotion; v5.103.0 behavior byte-identical."""
+    return (os.getenv("TFB_GATE_PROVIDER_BAR_AGE") or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _bar_age_max_sessions() -> int:
+    """v5.104.0 (Fix AR): tolerated bar lag in completed trading sessions.
+    Default 1 (absorbs un-modeled single-day exchange holidays). Clamped 0..30."""
+    try:
+        v = int(float((os.getenv("TFB_BAR_AGE_MAX_SESSIONS") or "1").strip()))
+    except Exception:
+        v = 1
+    return max(0, min(30, v))
+
+
+# v5.104.0 (Fix AR): per-suffix exchange session table.
+# suffix -> (weekend weekday set [Mon=0..Sun=6], UTC offset hours, local close hour).
+# DST is deliberately ignored (±1h boundary noise is absorbed by the close-hour
+# margin + the session tolerance); exchange holidays are NOT modeled (see
+# _bar_age_max_sessions). Longest-suffix match wins; no match -> US default.
+_BAR_AGE_SESSION_TABLE: Dict[str, Tuple[frozenset, float, float]] = {
+    ".SR": (frozenset({4, 5}), 3.0, 15.0),     # Tadawul: Sun-Thu, closes 15:00 Riyadh
+    ".T": (frozenset({5, 6}), 9.0, 15.0),      # Tokyo
+    ".HK": (frozenset({5, 6}), 8.0, 16.0),     # Hong Kong
+    ".KS": (frozenset({5, 6}), 9.0, 15.5),     # Korea (KOSPI)
+    ".KQ": (frozenset({5, 6}), 9.0, 15.5),     # Korea (KOSDAQ)
+    ".NS": (frozenset({5, 6}), 5.5, 15.5),     # NSE India
+    ".BO": (frozenset({5, 6}), 5.5, 15.5),     # BSE India
+    ".SS": (frozenset({5, 6}), 8.0, 15.0),     # Shanghai
+    ".SZ": (frozenset({5, 6}), 8.0, 15.0),     # Shenzhen
+    ".L": (frozenset({5, 6}), 0.0, 16.5),      # London
+    ".PA": (frozenset({5, 6}), 1.0, 17.5),     # Paris
+    ".AS": (frozenset({5, 6}), 1.0, 17.5),     # Amsterdam
+    ".BR": (frozenset({5, 6}), 1.0, 17.5),     # Brussels
+    ".MI": (frozenset({5, 6}), 1.0, 17.5),     # Milan
+    ".MC": (frozenset({5, 6}), 1.0, 17.5),     # Madrid
+    ".DE": (frozenset({5, 6}), 1.0, 17.5),     # XETRA
+    ".F": (frozenset({5, 6}), 1.0, 17.5),      # Frankfurt floor
+    ".SW": (frozenset({5, 6}), 1.0, 17.5),     # SIX Swiss
+    ".ST": (frozenset({5, 6}), 1.0, 17.5),     # Stockholm
+    ".OL": (frozenset({5, 6}), 1.0, 16.5),     # Oslo
+    ".CO": (frozenset({5, 6}), 1.0, 17.0),     # Copenhagen
+    ".HE": (frozenset({5, 6}), 2.0, 18.5),     # Helsinki
+    ".JO": (frozenset({5, 6}), 2.0, 17.0),     # Johannesburg
+    ".AX": (frozenset({5, 6}), 10.0, 16.0),    # ASX
+    ".NZ": (frozenset({5, 6}), 12.0, 16.75),   # NZX
+    ".TO": (frozenset({5, 6}), -5.0, 16.0),    # Toronto
+    ".V": (frozenset({5, 6}), -5.0, 16.0),     # TSX Venture
+    ".SA": (frozenset({5, 6}), -3.0, 17.0),    # B3 Brazil
+    ".MX": (frozenset({5, 6}), -6.0, 15.0),    # BMV Mexico
+}
+_BAR_AGE_US_DEFAULT: Tuple[frozenset, float, float] = (frozenset({5, 6}), -5.0, 16.0)
+
+
+def _bar_age_session_params(symbol: str) -> Optional[Tuple[frozenset, float, float]]:
+    """Resolve session params for a symbol; None -> SKIP the check entirely
+    (indices, futures, FX, crypto: continuous or synthetic sessions would
+    false-positive against a cash-equity calendar)."""
+    s = _safe_str(symbol).strip().upper()
+    if not s or s.startswith("^") or "=" in s or s.endswith("-USD"):
+        return None
+    best: Optional[Tuple[frozenset, float, float]] = None
+    best_len = 0
+    for suf, params in _BAR_AGE_SESSION_TABLE.items():
+        if s.endswith(suf) and len(suf) > best_len:
+            best, best_len = params, len(suf)
+    if best is not None:
+        return best
+    return _BAR_AGE_US_DEFAULT
+
+
+def _parse_bar_ts(v: Any) -> Optional[Tuple[str, Any]]:
+    """v5.104.0 (Fix AR): parse a provider bar/quote time into
+    ("date", datetime.date)  - a date-only value (already exchange-local,
+                               e.g. EODHD history "YYYY-MM-DD"), or
+    ("dt", aware datetime)   - a point in time (epoch seconds/ms or ISO).
+    Returns None when unparseable. Never raises."""
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            ts = float(v)
+            if ts <= 0:
+                return None
+            if ts > 1e12:  # milliseconds
+                ts /= 1000.0
+            return ("dt", datetime.fromtimestamp(ts, tz=timezone.utc))
+        s = _safe_str(v).strip()
+        if not s:
+            return None
+        if s.isdigit():
+            ts = float(s)
+            if ts <= 0:
+                return None
+            if ts > 1e12:
+                ts /= 1000.0
+            return ("dt", datetime.fromtimestamp(ts, tz=timezone.utc))
+        core = s[:10]
+        if len(s) == 10 and core.count("-") == 2:
+            y, m, d = core.split("-")
+            return ("date", date(int(y), int(m), int(d)))
+        iso = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return ("dt", dt)
+    except Exception:
+        return None
+
+
+def _bar_age_sessions(symbol: str, parsed: Tuple[str, Any], now_utc: Optional[datetime] = None) -> Optional[int]:
+    """v5.104.0 (Fix AR): completed trading sessions strictly AFTER the bar's
+    exchange-local date, up to (and including) the last completed session as
+    of now. 0 = bar is the latest completed session (fresh). None = skip
+    (no calendar for this instrument class). Capped at 400. Never raises."""
+    try:
+        params = _bar_age_session_params(symbol)
+        if params is None:
+            return None
+        weekend, offset_h, close_h = params
+        now = now_utc or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        # Exchange-local "now" via epoch shift (no timedelta dependency).
+        local_now = datetime.fromtimestamp(now.timestamp() + offset_h * 3600.0, tz=timezone.utc)
+        local_date = local_now.date()
+        local_hour = local_now.hour + local_now.minute / 60.0
+        # Last completed session as of now.
+        o = local_date.toordinal()
+        if (local_date.weekday() in weekend) or (local_hour < close_h):
+            o -= 1
+        while date.fromordinal(o).weekday() in weekend:
+            o -= 1
+        last_completed = o
+        # Bar's exchange-local date.
+        kind, val = parsed
+        if kind == "date":
+            bar_local = val
+        else:
+            bar_local = datetime.fromtimestamp(val.timestamp() + offset_h * 3600.0, tz=timezone.utc).date()
+        b = bar_local.toordinal()
+        if b >= last_completed:
+            return 0
+        lag = 0
+        cur = last_completed
+        while cur > b and lag < 400:
+            if date.fromordinal(cur).weekday() not in weekend:
+                lag += 1
+            cur -= 1
+        return lag
+    except Exception:
+        return None
+
+
+def _bar_age_check(symbol: str, row: Dict[str, Any], now_utc: Optional[datetime] = None) -> Optional[Tuple[str, int]]:
+    """v5.104.0 (Fix AR): -> (bar_date_iso, lag_sessions) when the row's
+    provider-reported bar is older than the tolerance; None otherwise
+    (fresh, unparseable, absent, or calendar-exempt). Never raises."""
+    try:
+        parsed = _parse_bar_ts(row.get("price_bar_ts"))
+        if parsed is None:
+            return None
+        lag = _bar_age_sessions(symbol, parsed, now_utc=now_utc)
+        if lag is None or lag <= _bar_age_max_sessions():
+            return None
+        kind, val = parsed
+        bar_date_iso = val.isoformat() if kind == "date" else val.date().isoformat()
+        return (bar_date_iso, int(lag))
+    except Exception:
+        return None
+
+
+def _bar_stale_lag_from_warnings(warns_lower: str) -> Optional[int]:
+    """v5.104.0 (Fix AR): extract the session lag N from a
+    'price_bar_stale:<date>:<N>s' warnings tag. None when absent/malformed."""
+    try:
+        m = re.search(r"price_bar_stale:[0-9\-]{4,10}:(\d+)s", warns_lower or "")
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
 def _aq_append_warning(row: Dict[str, Any], tag: str) -> None:
     """v5.103.0 (Fix AQ): append a warnings tag, tolerating the field being
     None/str/list. Never raises; never duplicates the tag (idempotent so a
@@ -8233,6 +8503,10 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "data_provider": ("data_provider", "provider", "source", "dataProvider"),
     "last_updated_utc": ("last_updated_utc", "lastUpdated", "updatedAt", "timestamp", "asOf"),
     "last_updated_riyadh": ("last_updated_riyadh",),
+    # v5.104.0 (Fix AR): provider-reported bar/quote time. "timestamp" is ALSO an
+    # alias of last_updated_utc above; alias lookup is read-only, so both fields
+    # resolve independently and last_updated_utc behavior is unchanged.
+    "price_bar_ts": ("price_bar_ts", "timestamp", "quote_timestamp", "regularMarketTime", "bar_date", "price_bar_date"),
     "warnings": ("warnings", "warning", "messages", "errors"),
     "sector_relative_score": ("sector_relative_score", "sectorAdjustedScore", "sectorAdjScore", "sector_adj_score", "sectorRelativeScore"),
     "conviction_score": ("conviction_score", "convictionScore", "conviction"),
@@ -11563,6 +11837,27 @@ class DataEngineV5:
                     merged["last_updated_utc"] = ""
                     merged["last_updated_riyadh"] = ""
                 _aq_append_warning(merged, "price_unverified_live:" + _fallback_price_src)
+
+            # --- v5.104.0 (Fix AR) PROVIDER BAR-AGE HONESTY -----------------
+            # Fix AQ polices FALLBACK prices; this polices the provider's own
+            # "live" quote. A provider can serve a months-old close AS the
+            # current price (EODHD Tokyo/HK; Yahoo .SR under throttle) with a
+            # fresh mint - the bar's own time is the only witness. When the
+            # bar's exchange-local date is more than the tolerated number of
+            # completed sessions behind, tag the row; the investability gate
+            # (same env flag) demotes it and penalizes reliability. Timestamps
+            # are NOT touched here: the fetch time is true - the WARNING
+            # carries the bar's own date. Gate OFF / fallback-priced / empty /
+            # exempt instrument (index, futures, FX, crypto) / no bar ts ->
+            # nothing happens (v5.103.0 byte-identical).
+            if (
+                _bar_age_gate_enabled()
+                and _live_priced
+                and not _is_empty_data_row(merged)
+            ):
+                _ar_hit = _bar_age_check(sym, merged)
+                if _ar_hit is not None:
+                    _aq_append_warning(merged, "price_bar_stale:%s:%ds" % (_ar_hit[0], _ar_hit[1]))
 
             if not merged.get("last_updated_utc") and not _aq_honest:
                 merged["last_updated_utc"] = _now_utc_iso()
