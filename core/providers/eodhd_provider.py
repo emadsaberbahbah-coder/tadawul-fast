@@ -681,7 +681,37 @@ def _build_error_patch_with_geo(
 # v4.9.0 — Constants and version
 # =============================================================================
 
-PROVIDER_VERSION = "4.9.2"
+# =============================================================================
+# v4.10.0 — QUOTA-BLACKOUT HARDENING (owner greenlight 2026-07-05; full history
+# remains in the module docstring above, carried verbatim)
+# -----------------------------------------------------------------------------
+# WHY: 2026-07-05 the 100,000/day EODHD limit was fully exhausted and the
+# provider went dark for the rest of the day. Two structural contributors
+# lived HERE:
+#   (1) fund_cache maxsize was HARDCODED at 3,000 slots against a 4,400+
+#       symbol universe -> permanent eviction thrash, so 10x-billed
+#       fundamentals re-fetched all day (x2 gunicorn workers, and every
+#       deploy wiped all caches). quote/hist sizes had the same problem.
+#   (2) Nothing stopped the burn: the provider ran until EODHD refused it.
+# WHAT:
+#   A. Cache sizes are env-configurable with universe-sized defaults:
+#        EODHD_QUOTE_CACHE_MAX (default 8000)
+#        EODHD_FUND_CACHE_MAX  (default 6000)
+#        EODHD_HIST_CACHE_MAX  (default 6000)
+#      TTLs unchanged (already env-driven).
+#   B. Daily request-unit budget guard in _request_json:
+#        TFB_EODHD_DAILY_BUDGET (float units/day; DEFAULT 0 = disabled ->
+#        byte-identical to v4.9.2). Charged PER HTTP ATTEMPT (retries bill
+#        too), with fundamentals endpoints weighted 10 units to match
+#        EODHD billing, UTC-day rollover. On exhaustion the call returns
+#        (None, "eodhd_daily_budget_exhausted") -- an ordinary per-call
+#        failure, so the engine's existing fallback chain degrades
+#        gracefully instead of the account going blind at 100%.
+#      SEMANTICS: the counter is PER PROCESS (2 gunicorn workers => worst
+#      case ~2x the configured value) and resets on deploy; it is a safety
+#      rail, not accounting. Suggested starting value: 40000.
+# =============================================================================
+PROVIDER_VERSION = "4.10.0"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -1630,9 +1660,17 @@ class EODHDClient:
 
         self._sf = _SingleFlight()
 
-        self.quote_cache = _TTLCache(maxsize=6000, ttl_sec=_env_float("EODHD_QUOTE_TTL_SEC", 12.0, lo=1.0, hi=600.0))
-        self.fund_cache = _TTLCache(maxsize=3000, ttl_sec=_env_float("EODHD_FUND_TTL_SEC", 21600.0, lo=60.0, hi=86400.0))
-        self.hist_cache = _TTLCache(maxsize=2000, ttl_sec=_env_float("EODHD_HISTORY_TTL_SEC", 1800.0, lo=60.0, hi=86400.0))
+        # v4.10.0: cache sizes env-configurable; defaults sized to the universe.
+        self.quote_cache = _TTLCache(maxsize=_env_int("EODHD_QUOTE_CACHE_MAX", 8000, lo=500, hi=100000), ttl_sec=_env_float("EODHD_QUOTE_TTL_SEC", 12.0, lo=1.0, hi=600.0))
+        self.fund_cache = _TTLCache(maxsize=_env_int("EODHD_FUND_CACHE_MAX", 6000, lo=500, hi=100000), ttl_sec=_env_float("EODHD_FUND_TTL_SEC", 21600.0, lo=60.0, hi=86400.0))
+        self.hist_cache = _TTLCache(maxsize=_env_int("EODHD_HIST_CACHE_MAX", 6000, lo=500, hi=100000), ttl_sec=_env_float("EODHD_HISTORY_TTL_SEC", 1800.0, lo=60.0, hi=86400.0))
+        # v4.10.0: daily request-unit budget (0 = disabled). Per-process;
+        # fundamentals endpoints charge 10 units (EODHD billing parity).
+        self.daily_budget = _env_float("TFB_EODHD_DAILY_BUDGET", 0.0, lo=0.0, hi=10000000.0)
+        self._budget_used: float = 0.0
+        self._budget_day: str = ""
+        self._budget_warned: bool = False
+        self._budget_lock = asyncio.Lock()
 
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self.timeout_sec),
@@ -1645,7 +1683,7 @@ class EODHDClient:
             "EODHDClient v%s initialized | api_key_present=%s | rate=%s/s | burst=%s | "
             "concurrency=%s | retries=%s | sanity_guard=%s | ratio=[%s, %s] | "
             "circuit_breaker=%s threshold=%d backoff=%.0fs | "
-            "per_failure_unhealthy_signal=enabled",
+            "per_failure_unhealthy_signal=enabled | daily_budget=%s",
             PROVIDER_VERSION,
             bool(self.api_key),
             rps,
@@ -1658,6 +1696,7 @@ class EODHDClient:
             _circuit_breaker_enabled(),
             _circuit_auth_threshold(),
             _circuit_backoff_sec(),
+            (self.daily_budget if self.daily_budget > 0 else "off"),
         )
 
     def _base_params(self) -> Dict[str, str]:
@@ -1714,6 +1753,26 @@ class EODHDClient:
         async with self._sem:
             for attempt in range(max(1, self.retry_attempts + 1)):
                 await self._bucket.wait(1.0)
+                # v4.10.0: daily request-unit budget — charged per HTTP
+                # attempt (retries bill too); fundamentals weigh 10 units.
+                if self.daily_budget > 0:
+                    _units = 10.0 if "fundamentals" in endpoint.lower() else 1.0
+                    async with self._budget_lock:
+                        _day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        if _day != self._budget_day:
+                            self._budget_day = _day
+                            self._budget_used = 0.0
+                            self._budget_warned = False
+                        if self._budget_used + _units > self.daily_budget:
+                            if not self._budget_warned:
+                                logger.warning(
+                                    "[v4.10.0 BUDGET] daily EODHD request-unit "
+                                    "budget exhausted (%.0f/%.0f) — refusing "
+                                    "further calls until UTC midnight",
+                                    self._budget_used, self.daily_budget)
+                                self._budget_warned = True
+                            return None, "eodhd_daily_budget_exhausted"
+                        self._budget_used += _units
                 try:
                     r = await self._client.get(url, params=p)
                     sc = int(r.status_code)
