@@ -460,6 +460,33 @@ import re
 from datetime import datetime, timedelta, timezone
 
 # =============================================================================
+# v1.0.21 [QUALIFIED-GRID BASIS PARITY + HELD-SYMBOL VARIANT MATCH]
+# (Engineering Audit Fix #3 completion + Fix #4; two independent switches)
+# =============================================================================
+# (a) QUALIFIED-GRID BASIS PARITY — completes v1.0.20. The payload has TWO
+#     ROI-bearing surfaces: the SELECTED tickets (fixed in v1.0.20) and the
+#     candidates_rows audit grid ("ALL QUALIFIED" on the sheet). v1.0.20 left
+#     the grid's primary roi_pct/ann_roi_pct on the capped valuation basis,
+#     so under TFB_OPP_PRIMARY_ROI_BASIS=engine one page showed two tables
+#     with different meanings for the same "ROI %" header. Now, under the
+#     SAME switch (no new env), each audit record's primary roi_pct /
+#     ann_roi_pct speaks the engine 12M forecast when present (per-row
+#     honest fallback to valuation when absent, tagged primary_roi_basis),
+#     with valuation_roi_pct / valuation_ann_roi_pct parallels. cand fields,
+#     gates, verdicts, scoring, selection: untouched — this swaps the
+#     SERIALIZED record only. Default basis "valuation" -> byte-identical.
+# (b) HELD-SYMBOL VARIANT MATCH (Fix #4) — the live 2026-07-05 BBD case:
+#     "T10: Include Portfolio Holdings = No", portfolio holds BBD.US,
+#     Global_Markets carries the same listing as bare "BBD" -> the Portfolio
+#     gate's exact-match `cand["symbol"] in held` missed, and the selector
+#     recommended a 14,992-SAR NEW ticket in a name already held (541 GM
+#     symbols are bare-form; SHG has the same exposure). FIX: the held set
+#     is expanded to normalized variants (uppercased; X <-> X.US both
+#     directions; suffixed non-US symbols like 1211.SR get no variant) and
+#     the gate probes with the normalized symbol. DEFAULT ON — this enforces
+#     the documented meaning of an existing user control; kill switch
+#     TFB_OPP_HELD_MATCH_VARIANTS=0 restores exact-match byte-identically.
+# =============================================================================
 # v1.0.20 [ENGINE-PRIMARY-BASIS] — the 35%-cap-as-forecast honesty fix
 # (Engineering Audit Fix #3; env-gated TFB_OPP_PRIMARY_ROI_BASIS, DEFAULT
 # "valuation" = byte-identical v1.0.19)
@@ -496,7 +523,7 @@ from datetime import datetime, timedelta, timezone
 #     longer masquerades as the forecast.
 # KILL SWITCH: leave TFB_OPP_PRIMARY_ROI_BASIS unset (or "valuation") ->
 # byte-identical v1.0.19 payload.
-OPPORTUNITY_BUILDER_VERSION = "1.0.20"
+OPPORTUNITY_BUILDER_VERSION = "1.0.21"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -851,6 +878,35 @@ def _env_primary_roi_basis():
     ann_roi_pct / exp_gain_12m_sar / KPI speak the engine 12M forecast."""
     v = str(_env_str("TFB_OPP_PRIMARY_ROI_BASIS", "valuation")).strip().lower()
     return "engine" if v == "engine" else "valuation"
+
+
+def _env_held_variant_match():
+    """v1.0.21 (Fix #4): held-symbol variant matching for the Portfolio gate.
+    DEFAULT ON — enforces the documented meaning of "Include Portfolio
+    Holdings = No" across bare/.US symbol forms (the live BBD vs BBD.US
+    duplicate-ticket case). Set TFB_OPP_HELD_MATCH_VARIANTS=0 to restore
+    v1.0.20 exact-match behavior byte-identically."""
+    return str(_env_str("TFB_OPP_HELD_MATCH_VARIANTS", "1")).strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _symbol_variants(symbol):
+    """v1.0.21 (Fix #4): normalized membership variants for ONE symbol.
+    Uppercased/stripped; a bare US-style symbol also matches its .US form
+    and vice versa. Non-US suffixes (.SR/.T/.HK/...), indices (^), FX/
+    futures (=) and crypto (-USD) get NO cross-form variant — 1211.SR can
+    only ever match 1211.SR. Never raises; blank -> empty set."""
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return set()
+    out = {s}
+    if s.startswith("^") or "=" in s or s.endswith("-USD"):
+        return out
+    if s.endswith(".US"):
+        out.add(s[:-3])
+    elif "." not in s:
+        out.add(s + ".US")
+    return out
 
 
 def _env_trust_gate():
@@ -1642,7 +1698,9 @@ def evaluate_gates(cand, criteria, held_symbols=None):
                    "not Negative (Unknown passes)"))
 
     held_hit = (not criteria["include_portfolio_holdings"] and
-                cand["symbol"] in held)
+                (str(cand["symbol"] or "").strip().upper() in held
+                 if _env_held_variant_match()
+                 else cand["symbol"] in held))
     g.append(_gate("Portfolio", not held_hit, FAIL_STRUCTURAL,
                    "held" if held_hit else "not held",
                    "exclude holdings (Include Portfolio Holdings = No)"))
@@ -2285,6 +2343,15 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     pf = _normalize_portfolio(portfolio)
     sector_ctx = _sector_context(pf, crit)
     held = {h["symbol"] for h in pf["holdings"]}
+    # v1.0.21 (Fix #4): expand to normalized bare/.US variants so the
+    # Portfolio gate honors "Include Portfolio Holdings = No" regardless of
+    # which form a page carries (BBD vs BBD.US). Kill switch restores the
+    # exact-match set above unchanged.
+    if _env_held_variant_match():
+        _hv = set()
+        for _hs in held:
+            _hv |= _symbol_variants(_hs)
+        held = _hv
 
     # 1) normalize → gates → verdict → score (audit grid, 1:1 trace)
     audit = []
@@ -2325,6 +2392,8 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             "price_sar": _round2(cand["price_sar"]),
             "roi_pct": _round1(cand["roi_pct"]),
             "ann_roi_pct": _round1(cand["ann_roi_pct"]),
+            "valuation_roi_pct": _round1(cand["roi_pct"]),
+            "valuation_ann_roi_pct": _round1(cand["ann_roi_pct"]),
             "rr": _round2(cand["rr"]),
             "reliability": _round1(cand["reliability"]),
             "dq": _round1(cand["dq"]),
@@ -2347,6 +2416,21 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             "deferral": None,
             "_cand": cand,
         })
+        # v1.0.21 (Fix #3 completion): under the engine basis the audit
+        # record's PRIMARY roi/ann speak the engine 12M forecast (per-row
+        # fallback to valuation when absent) so the ALL QUALIFIED grid and
+        # the SELECTED tickets read the same language. The cand dict, gates,
+        # verdict and score above were computed BEFORE this swap and are
+        # untouched. Default basis "valuation" -> this block is inert.
+        if str(crit.get("primary_roi_basis") or "").strip().lower() == "engine":
+            _rec = audit[-1]
+            _rec_eng = _rec.get("engine_roi_pct")
+            if _rec_eng is not None:
+                _rec["roi_pct"] = _rec_eng
+                _rec["ann_roi_pct"] = _rec_eng
+                _rec["primary_roi_basis"] = "engine"
+            else:
+                _rec["primary_roi_basis"] = "valuation"
 
     # 2) selection pool: INVEST verdict, not structurally blocked, by score
     invest = [a for a in audit
