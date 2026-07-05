@@ -1,0 +1,109 @@
+# =============================================================================
+# Calendar Sync — writes the Calendar_Events tab (F1 wiring, Option B)
+# -----------------------------------------------------------------------------
+# WHAT: runs scripts/run_calendar_sync.py --write: harvests the decision
+#       symbols (Top_10_Investments + My_Portfolio), fetches next-earnings and
+#       next-ex-dividend dates from EODHD via core.providers.calendar_provider,
+#       and REPLACES the Calendar_Events tab. track_performance v6.15.0 reads
+#       that tab and merges the dates into Signal_History snapshots — this is
+#       how the "Days To Earnings"/"Days To ExDiv" columns fill.
+# WHEN: 05:15 UTC = 08:15 Riyadh, every day (calendar facts change at most
+#       daily; before the 08:15+ tracker/brief slots). Manual runs are
+#       DRY-RUN BY DEFAULT (print only) unless `write` is ticked — mirrors
+#       daily_brief.yml's preview-by-default manual behavior.
+# WHY off the request path: the Top10 build runs behind the ~100s Render edge
+#       timeout; live calendar calls there would risk it. This job runs in
+#       Actions, the backend and every route are untouched (zero Render
+#       changes). KSA symbols get blank dates by design (EODHD has no Saudi
+#       coverage) — nothing is faked.
+# SECRETS: GOOGLE_SHEETS_CREDENTIALS (existing) + EODHD_API_KEY (NEW GitHub
+#       secret — use the ROTATED token). TFB_CALENDAR_ENABLED=1 is scoped to
+#       this job only; the Render flag stays unset (no backend caller exists).
+# NOTE: this workflow WRITES exactly one tab (Calendar_Events) and reads two
+#       pages. It never touches universe pages, cockpits, or the sync.
+# =============================================================================
+name: 📅 Calendar Sync
+
+on:
+  schedule:
+    # 05:15 UTC == 08:15 Asia/Riyadh, daily.
+    - cron: "15 5 * * *"
+  workflow_dispatch:
+    inputs:
+      write:
+        description: "Actually write the Calendar_Events tab? (default: dry-run — prints the table, writes nothing)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: 1
+  TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  calendar:
+    name: 📅 Fetch & publish event calendar
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v7
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          if [[ -f requirements.render.txt ]]; then
+            python -m pip install -r requirements.render.txt
+          else
+            python -m pip install -r requirements.txt
+          fi
+
+      - name: 🔎 Resolve spreadsheet id
+        id: sheet
+        env:
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+        run: |
+          SID="${VAR_SHEET:-}"
+          if [[ -z "$SID" ]]; then
+            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+            exit 1
+          fi
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
+
+      - name: 📅 Run calendar sync
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+          TFB_CALENDAR_ENABLED: "1"
+        run: |
+          if [[ -z "${EODHD_API_KEY:-}" ]]; then
+            echo "::error::EODHD_API_KEY secret not set (add the rotated token in repo Settings → Secrets)."
+            exit 1
+          fi
+          # Schedule always writes; a manual dispatch writes ONLY when
+          # write=true was explicitly ticked (dry-run otherwise).
+          MODE="--write"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.write }}" != "true" ]]; then
+            MODE="--dry-run"
+            echo "Dry-run mode — printing the table, writing nothing (tick write=true to publish)."
+          fi
+          python scripts/run_calendar_sync.py $MODE
