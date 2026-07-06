@@ -243,6 +243,23 @@ jobs:
       # TFB_XPAGE_MAX_REPORT: "50".
       # KILL-SWITCH: set to "0" (or delete) to disable the check entirely.
       TFB_XPAGE_PRICE_CHECK: "1"
+      # Small-page launch order (scripts/run_dashboard_sync.py v6.21.0, Fix 6a).
+      # ARMED. WHY (confirmed live 2026-07-06): Mutual_Funds sat at ~44% live
+      # inside the full sync but priced 870/871 (99.9%) in a SOLO refresh —
+      # same symbols, same code. Root cause: ML(2)+GM(3) launch first and their
+      # ~4,500 symbols burn the provider budget window (Yahoo 401 storm + EODHD
+      # breaker), so the small pages at priorities 4-5 fetch into exhausted
+      # providers. This list launches the starved small pages FIRST; the
+      # cockpit tasks (Insights/Top_10/Data_Dictionary) always stay last
+      # regardless. KILL-SWITCH: delete the line -> v6.20.0 default order.
+      TFB_SYNC_PAGE_ORDER: "My_Portfolio,Mutual_Funds,Commodities_FX,Market_Leaders,Global_Markets"
+      # Bounded empty-row second pass (v6.21.0, Fix 6b). DISARMED ("0") on
+      # purpose: arm AFTER one ordered run confirms 6a, so attribution stays
+      # clean. When armed, rows with an empty price get ONE re-fetch pass
+      # (cap TFB_SYNC_EMPTY_RETRY_MAX "120"; optional cool-down
+      # TFB_SYNC_EMPTY_RETRY_DELAY_SEC "0"); splice is header-guarded and can
+      # never make a page worse.
+      TFB_SYNC_EMPTY_RETRY: "0"
       TFB_PORTFOLIO_REBUILD: "1"
       # Top_10_Investments — decision guard ENABLED ("1"). [2026-06-29 corrected]
       # SUPERSEDES the earlier "0" setting. That setting let the 2-hourly daily sync
