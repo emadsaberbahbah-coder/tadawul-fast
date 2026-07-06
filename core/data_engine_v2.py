@@ -2,8 +2,50 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.107.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.108.0
 ================================================================================
+
+WHY v5.108.0 - CROSS-PROVIDER PRICE VERIFICATION (Fix AR-5; env-gated
+TFB_XPROVIDER_VERIFY, DEFAULT OFF; threshold TFB_XPROVIDER_DELTA_PCT,
+default 3.0)
+--------------------------------------------------------------------------
+ROOT CAUSE (live shell probe 2026-07-06): 4503.T served by EODHD at 2,208
+with a bar witness of TODAY'S Tokyo close (06:30 UTC) and a coherent
+previous_close of 2,152 - while the market trades 2,553.50
+(TradingEconomics, same hour). The provider is not serving a stale bar
+with a fresh stamp; it is serving a CONSISTENT, DAILY-UPDATING, WRONG
+price series. The entire Fix AR family (bar-age gate, failover, boundary
+enforcement, truthful-witness) interrogates the CLOCK - and a consistent
+liar's clock is impeccable. The same pattern is suspected on the Yahoo
+datacenter feed for 1211.SR (mid-session witness, price below every
+external quote). No timestamp heuristic can catch this class. Only a
+second opinion can.
+
+FIX: after the factory obtains a LIVE price for an in-scope symbol, ask
+the NEXT provider in the page chain for its price and compare:
+  - scope: suffixed non-.US symbols (the international + .SR set where
+    the wrong-series pattern lives); indices/futures/FX/crypto exempt via
+    the existing _bar_age_session_params class test; bare/.US symbols
+    exempt (US real-time proven exact - ADAM.US to the cent).
+  - the alternate's patch is canonicalized; a priceless alternate (e.g.
+    the KSA-blocked EODHD shell) asserts nothing -> no tag, one line of
+    disclosure only.
+  - |a-b|/min(a,b) > threshold -> append
+    `xprovider_price_conflict:<provA>=<pxA>:<provB>=<pxB>:<delta>%` and
+    let the investability gate (same flag) demote: WATCHLIST / WATCH /
+    "Cross-provider price conflict (...)" + reliability -25. The engine
+    does NOT auto-pick a winner in v1 - a conflict is a fact, the choice
+    is a policy; the row is benched until a human or a corroborating
+    fix (bar-age, failover) resolves it. Agreement within threshold ->
+    `xprovider_verified:<provB>:<delta>%` (positive evidence, no gate
+    effect).
+  - cost: ONE extra provider fetch per in-scope live-priced symbol per
+    cache lifetime, in the factory only (boundary passes are pure math).
+    .SR symbols effectively cost nothing extra (the EODHD alternate is
+    the KSA-blocked shell). Yahoo exposure ~ the .T/.HK/.KS/EU set once
+    per TTL.
+KILL SWITCH: TFB_XPROVIDER_VERIFY unset/0 -> no verify fetch, no tags,
+v5.107.0 byte-identical.
 
 WHY v5.107.0 - PRICE-DELIVERER PROVENANCE ATTRIBUTION (Fix AT; env-gated
 kill switch TFB_PROVIDER_ATTRIBUTION_FIX, DEFAULT ON)
@@ -2376,7 +2418,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.107.0"
+__version__ = "5.108.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4816,6 +4858,11 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     # Gated: flag OFF -> no penalty (v5.103.0 byte-identical).
     if _bar_age_gate_enabled() and "price_bar_stale" in warns:
         rel -= 30.0
+    # v5.108.0 (Fix AR-5): two live providers materially disagreeing on the
+    # same symbol's price is weaker provenance than one stale bar - one of
+    # them is wrong and the engine does not yet know which.
+    if _xprovider_verify_enabled() and "xprovider_price_conflict" in warns:
+        rel -= 25.0
     opp_src = _safe_str(row.get("opportunity_source")).lower()
     fc_src = _safe_str(row.get("forecast_source")).lower()
     if "momentum" in opp_src or "fallback" in opp_src:
@@ -4908,6 +4955,29 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         reason = "Stale price bar (provider data %s session(s) old)" % (
             _ar_lag if _ar_lag is not None else "several"
         )
+
+    # -- v5.108.0 (Fix AR-5): cross-provider conflict bench (env-gated, -------
+    # default OFF). Two live sources disagree materially; the row is FACTS-
+    # UNCERTAIN, not facts-bad, so it is benched (WATCHLIST/WATCH), not
+    # blocked - and never promoted past the bar-stale tier above. The tag
+    # carries both prices so the sheet shows the disagreement verbatim.
+    if (
+        _xprovider_verify_enabled()
+        and "xprovider_price_conflict" in warns
+        and status != "BLOCKED"
+    ):
+        _ar5_m = re.search(
+            r"xprovider_price_conflict:([a-z_\-]+)=([0-9.eE+\-]+):([a-z_\-]+)=([0-9.eE+\-]+):([0-9.]+)%",
+            warns,
+        )
+        status, action = "WATCHLIST", "WATCH"
+        if _ar5_m:
+            reason = "Cross-provider price conflict (%s %s vs %s %s, %s%%)" % (
+                _ar5_m.group(1), _ar5_m.group(2), _ar5_m.group(3),
+                _ar5_m.group(4), _ar5_m.group(5),
+            )
+        else:
+            reason = "Cross-provider price conflict"
 
     # -- v5.79.4 (Fix P): strict final-approval tier (default OFF) -------------
     # Only acts on rows the BASE gate approved (INVESTABLE / INVEST). Enforces the
@@ -8048,6 +8118,81 @@ def _bar_age_failover_enabled() -> bool:
     before it is tagged and demoted. Only meaningful alongside
     TFB_GATE_PROVIDER_BAR_AGE=1 (the factory requires both)."""
     return (os.getenv("TFB_BAR_AGE_FAILOVER") or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _xprovider_verify_enabled() -> bool:
+    """v5.108.0 (Fix AR-5) master switch. DEFAULT OFF; TFB_XPROVIDER_VERIFY=1
+    arms the second-opinion price check for suffixed non-US symbols."""
+    return (os.getenv("TFB_XPROVIDER_VERIFY") or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _xprovider_delta_pct() -> float:
+    """Conflict threshold in percent (|a-b|/min). Default 3.0, clamped
+    0.5..50 - wide enough for cross-venue timing skew, tight enough to
+    catch every live wrong-series case (smallest observed: ~7%)."""
+    try:
+        v = float((os.getenv("TFB_XPROVIDER_DELTA_PCT") or "3.0").strip())
+    except Exception:
+        v = 3.0
+    return max(0.5, min(50.0, v))
+
+
+def _xprovider_in_scope(symbol: str) -> bool:
+    """v5.108.0 (Fix AR-5): suffixed non-.US symbols only, minus the
+    continuous/synthetic instrument classes the bar-age table already
+    exempts. Bare and .US symbols are out of scope (US real-time proven
+    exact to the cent)."""
+    s = _safe_str(symbol).strip().upper()
+    if not s or "." not in s or s.endswith(".US"):
+        return False
+    return _bar_age_session_params(s) is not None
+
+
+async def _xprovider_verify_attempt(
+    sym: str,
+    page_ctx: str,
+    merged: Dict[str, Any],
+    providers: List[str],
+    fetch_patch: Any,
+) -> Optional[str]:
+    """v5.108.0 (Fix AR-5): second-opinion price check. Returns the warnings
+    tag to append, or None (out of scope / no priced alternate). Mutates
+    nothing. Never raises; provider errors are treated as 'no opinion'."""
+    try:
+        px = _as_float(merged.get("current_price"))
+        if px is None or px <= 0 or not _xprovider_in_scope(sym):
+            return None
+        src_prov = _safe_str(merged.get("data_provider")).strip() or "unknown"
+        for prov in providers or []:
+            if _safe_str(prov).strip() == src_prov:
+                continue
+            try:
+                patch = await fetch_patch(prov, sym, page_ctx)
+            except Exception:
+                patch = None
+            if not patch:
+                continue
+            try:
+                canon = _canonicalize_provider_row(
+                    patch, requested_symbol=sym, normalized_symbol=sym, provider=prov,
+                )
+            except Exception:
+                continue
+            alt = _as_float(canon.get("current_price"))
+            if alt is None or alt <= 0:
+                continue
+            lo = min(px, alt)
+            if lo <= 0:
+                return None
+            delta = abs(px - alt) / lo * 100.0
+            if delta > _xprovider_delta_pct():
+                return "xprovider_price_conflict:%s=%.6g:%s=%.6g:%.1f%%" % (
+                    src_prov, px, prov, alt, delta,
+                )
+            return "xprovider_verified:%s:%.1f%%" % (prov, delta)
+        return None
+    except Exception:
+        return None
 
 
 # v5.105.0 (Fix AR-2): the ONLY fields a bar-age failover may overwrite.
@@ -11918,6 +12063,24 @@ class DataEngineV5:
                 )
                 if _ar2_tag:
                     _aq_append_warning(merged, _ar2_tag)
+
+            # --- v5.108.0 (Fix AR-5) CROSS-PROVIDER PRICE VERIFICATION -------
+            # A consistent wrong series defeats every clock-based check
+            # (4503.T: today's close-time witness on a price 13.5% below the
+            # market). For suffixed non-US symbols, ask the next provider for
+            # a second opinion; a material disagreement tags the row and the
+            # gate benches it - the engine does not auto-pick a winner.
+            if (
+                _xprovider_verify_enabled()
+                and _as_float(merged.get("current_price")) is not None
+                and not _is_empty_data_row(merged)
+                and "price_bar_stale" not in _safe_str(merged.get("warnings")).lower()
+            ):
+                _ar5_tag = await _xprovider_verify_attempt(
+                    sym, page_ctx, merged, self._providers_for(page_ctx), self._fetch_patch,
+                )
+                if _ar5_tag:
+                    _aq_append_warning(merged, _ar5_tag)
 
             # v5.103.0 (Fix AQ): record price provenance for this run. A price
             # present HERE came from a real provider quote; anything filled by
