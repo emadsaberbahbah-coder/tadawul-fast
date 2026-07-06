@@ -10,6 +10,20 @@ EODHD Provider — v4.12.0 (TRUTHFUL BAR WITNESS FOR NON-US SYMBOLS +
                           COUNTERS + MAY 2026 / v2.8.0 FAMILY ALIGNMENT)
 ================================================================================
 
+v4.12.1 — EVIDENCE CORRECTION (documentation only; ZERO code change)
+-----------------------------------------------------------------------
+RETRACTION: the v4.12.0 WHY below accuses this provider's real-time
+`timestamp` of "stamping FRESH on weeks-old prices" for 4503.T, citing
+TradingEconomics 2,553.50 as market truth. Exchange-primary sources
+(finance.yahoo.co.jp real-time 2026-07-06: 2,190.5, prev close 2,152 on
+07/03; Kabutan: 2,152.0 at the 07/03 close) prove the EODHD price AND
+its witness were both CORRECT — the 06:30 UTC stamp was a genuine Tokyo
+intraday tick time on a genuine price. The wrong series belonged to the
+external crawl anchors, not to EODHD. The v4.12.0 mechanism is retained
+(harmless; a truthful-ledger witness remains a sound default) but its
+motivating conviction is withdrawn. The provider is owed the record
+stating: for 4503.T it was truthful throughout.
+
 v4.12.0 — TRUTHFUL BAR WITNESS FOR NON-US SYMBOLS (Fix AR-4)
 -----------------------------------------------------------------------
 WHY (live conviction 2026-07-06, Render shell probe): 4503.T served at
@@ -759,7 +773,7 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.12.0"
+PROVIDER_VERSION = "4.12.1"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
