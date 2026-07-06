@@ -2,13 +2,81 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.12.0 (TRUTHFUL BAR WITNESS FOR NON-US SYMBOLS +
+EODHD Provider — v4.13.0 (CONTAMINATION DEFENSE: PROVIDER SENTINEL SCRUB +
+                          PREV-CLOSE COHERENCE GUARD + ENGINE PATCH-BIND
+                          REALIGNMENT)
+            carrying v4.12.0 (TRUTHFUL BAR WITNESS FOR NON-US SYMBOLS +
                           BAR-DATE DISCLOSURE ON HISTORY PATH + RESPONSE
                           IDENTITY GUARD + ENGINE PICK-ORDER FIX +
                           PER-FAILURE PROVIDER-UNHEALTHY
                           SIGNAL + CIRCUIT BREAKER + HEALTH PROBE + SESSION
                           COUNTERS + MAY 2026 / v2.8.0 FAMILY ALIGNMENT)
 ================================================================================
+
+v4.13.0 — CONTAMINATION DEFENSE (Fixes AS-1 / AS-2 / AS-3)
+-----------------------------------------------------------------------
+WHY (live workbook audit 2026-07-06, "Market_Share_Deepseek-V3" export
+v29, cross-checked against exchange-primary quotes the same day):
+
+AS-1 PROVIDER SENTINEL SCRUB (default ON, kill switch
+TFB_EODHD_SENTINEL_SCRUB=0). Live evidence: 000660.KS served
+previous_close=999999.9999 and week_52_high=999999.9999 while
+current_price=2,343,000 was EXACT to the won (Yahoo/Google same-day:
+close 2,343,000, prev 2,425,000, 52W high 2,987,000). Same corruption on
+207940.KS and 012450.KS — every KRW instrument whose true value crosses
+1,000,000. Downstream effect already in production: 207940.KS shipped a
+fabricated +40.5% daily percent_change (price vs the 999999.9999
+sentinel), poisoning momentum/volatility inputs. 999999.9999 is not a
+price any instrument prints — it is a provider-side field ceiling — so
+any float in [999999.0, 1000000.0) arriving in previous_close /
+week-52 bounds / day-range fields is dropped to None with a
+`eodhd_sentinel_dropped:<field>` warning. current_price is deliberately
+NOT scrubbed: genuine 7-digit KRW prices flow through it correctly and
+must keep doing so. Default ON is justified under the house rule (a fix
+that enforces an already-documented control): the v4.7.3 ZB price-sanity
+family already declares impossible price relationships droppable; a
+literal ceiling constant is the least ambiguous member of that class.
+
+AS-2 PREV-CLOSE COHERENCE GUARD (default OFF, enable with
+TFB_EODHD_COHERENCE_GUARD=1). Live evidence: Global_Markets rows written
+08:41–09:08 UTC today carry fields from DIFFERENT instruments inside one
+row — NESR.US: current_price 318.52 / previous_close 27.90 /
+percent_change −0.34% (consistent with none of the three); LDI.US:
+current_price 61.57 with previous_close 1.23 and a loanDepot-shaped 52W
+band. The v4.9.2 AO identity guard can only inspect `code` on the
+real-time and fundamentals legs; a crossed payload that echoes the
+requested code (or a crossed field pair assembled downstream) sails
+through. This guard applies the SAME suspect-ratio test the 52W guard
+already uses (v4.7.3 ZB thresholds) to the current_price ↔
+previous_close pair on the merged composite: on a definite unit-class
+disagreement it drops previous_close/prev_close AND the derived
+price_change/percent_change, tagging `previous_close_incoherent_dropped`
+so the row degrades honestly instead of shipping a fabricated day move.
+OFF by default because it is a new behavioral gate (house rule: optional
+behavior changes ship OFF); the operator flips it after review.
+
+AS-3 ENGINE PATCH-BIND REALIGNMENT (default OFF, enable with
+TFB_EODHD_ENGINE_PATCH_BIND=1). Live engine data_engine_v2 v5.108.1
+discovers this provider via `_pick_provider_callable(mod,
+"get_quote_async", "fetch_quote_async", "get_quote", "fetch_quote",
+"quote_async", "quote", "get_unified_quote", "fetch")` — the v4.9.1 AL
+alias `get_quote_patch` is NOT in that list, so the engine binds
+`get_quote`, which RAISES on error; the engine swallows the exception
+and receives `{}`. Net effect: the v4.9.0 AH per-failure
+`provider_unhealthy:eodhd` markers and every `_build_error_patch_with_geo`
+shell (including `provider_identity_mismatch:eodhd`) are DISCARDED on
+the engine path — the exact defect v4.9.1 documented has regressed via
+engine-side pick-order drift. This fix adds `get_quote_async` /
+`fetch_quote_async` module aliases that, when the flag is ON, return the
+patch dict (error shells intact, never raise); with the flag OFF they
+delegate to the legacy raise-on-err `quote()` so engine behavior is
+byte-identical to v4.12.1. OFF by default because restoring error shells
+interacts with engine Fix AT (provider-attribution): flip this only
+together with (or after) TFB_PROVIDER_ATTRIBUTION_FIX so a priceless
+shell cannot claim a row's provenance.
+
+Version: PROVIDER_VERSION = "4.13.0". All v4.12.x and earlier WHY blocks
+below are preserved verbatim. Zero functions removed (AST-verified).
 
 v4.12.1 — EVIDENCE CORRECTION (documentation only; ZERO code change)
 -----------------------------------------------------------------------
@@ -589,6 +657,42 @@ def _is_suspect_price_ratio(
     return ratio >= ratio_high or ratio <= ratio_low
 
 
+_EODHD_SENTINEL_LOW = 999999.0
+_EODHD_SENTINEL_HIGH = 1000000.0
+
+_SENTINEL_SCRUB_FIELDS: Tuple[str, ...] = (
+    "previous_close", "prev_close",
+    "week_52_high", "52w_high",
+    "week_52_low", "52w_low",
+    "day_high", "day_low",
+    "day_open", "open",
+)
+
+
+def _is_provider_sentinel(v: Any) -> bool:
+    """v4.13.0 AS-1: True when v is the EODHD field ceiling
+    (any float in [999999.0, 1000000.0) — live form 999999.9999)."""
+    f = safe_float(v)
+    return f is not None and _EODHD_SENTINEL_LOW <= f < _EODHD_SENTINEL_HIGH
+
+
+def _scrub_provider_sentinels(patch: Dict[str, Any]) -> List[str]:
+    """v4.13.0 AS-1: null out sentinel-valued fields in-place and return
+    the warning tags raised. NEVER touches current_price/price — genuine
+    7-digit KRW prices (000660.KS = 2,343,000, verified exact 2026-07-06)
+    flow through those keys and must keep doing so."""
+    tags: List[str] = []
+    if not isinstance(patch, dict):
+        return tags
+    for field in _SENTINEL_SCRUB_FIELDS:
+        if field in patch and _is_provider_sentinel(patch.get(field)):
+            patch[field] = None
+            tag = f"eodhd_sentinel_dropped:{field}"
+            if tag not in tags:
+                tags.append(tag)
+    return tags
+
+
 def _validate_52w_bounds_merged(
     merged: Dict[str, Any],
     *,
@@ -773,7 +877,7 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.12.1"
+PROVIDER_VERSION = "4.13.0"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -915,6 +1019,31 @@ def _price_ratio_low() -> float:
 
 _CIRCUIT_AUTH_THRESHOLD_DEFAULT = 8
 _CIRCUIT_BACKOFF_SEC_DEFAULT = 300.0
+
+
+def _sentinel_scrub_enabled() -> bool:
+    """v4.13.0 AS-1: provider-sentinel scrub toggle. Default ON;
+    set TFB_EODHD_SENTINEL_SCRUB=0 to restore v4.12.1 byte-identical
+    passthrough of the 999999.9999 field ceiling."""
+    return _env_str("TFB_EODHD_SENTINEL_SCRUB", "1").strip().lower() in _TRUTHY
+
+
+def _coherence_guard_enabled() -> bool:
+    """v4.13.0 AS-2: current_price↔previous_close coherence guard.
+    Default OFF; set TFB_EODHD_COHERENCE_GUARD=1 to drop a previous
+    close that disagrees with the served price by a unit-class ratio
+    (same thresholds as the v4.7.3 ZB 52W guard)."""
+    return _env_str("TFB_EODHD_COHERENCE_GUARD", "0").strip().lower() in _TRUTHY
+
+
+def _engine_patch_bind_enabled() -> bool:
+    """v4.13.0 AS-3: when ON, the module-level get_quote_async /
+    fetch_quote_async aliases return the patch dict (error shells and
+    warning markers intact, never raise) so engine v5.108.1's
+    _pick_provider_callable preference order receives them. OFF =
+    legacy raise-on-err delegation (engine sees {} on failure), byte-
+    identical to v4.12.1."""
+    return _env_str("TFB_EODHD_ENGINE_PATCH_BIND", "0").strip().lower() in _TRUTHY
 
 
 def _circuit_breaker_enabled() -> bool:
@@ -2031,6 +2160,23 @@ class EODHDClient:
                     "last_updated_riyadh": _riyadh_iso(),
                 }
             )
+            # v4.13.0 AS-1: drop provider field-ceiling sentinels
+            # (999999.9999 in prev-close / 52W / day-range fields) before
+            # the patch can enter quote_cache or reach the engine. Live
+            # case: 000660.KS previous_close=999999.9999 vs true
+            # 2,425,000 fabricated a +40.5%-class daily move on the
+            # KRW leaders (207940.KS shipped +40.5% to the sheet).
+            if _sentinel_scrub_enabled():
+                _as1_tags = _scrub_provider_sentinels(patch)
+                if _as1_tags:
+                    _merge_warnings_inplace(patch, _as1_tags)
+                    # derived day-move fields were computed against the
+                    # sentinel above — they are fabrications; drop them.
+                    if any(t.endswith(":previous_close") or t.endswith(":prev_close") for t in _as1_tags):
+                        patch["price_change"] = None
+                        patch["change"] = None
+                        patch["percent_change"] = None
+                        patch["change_pct"] = None
             await self.quote_cache.set(ck, patch)
             return patch, None
 
@@ -2680,6 +2826,44 @@ class EODHDClient:
             if pos is not None:
                 merged["week_52_position_pct"] = pos * 100.0
 
+        # ---- v4.13.0 AS-1: merged-level provider-sentinel scrub ----
+        # Belt-and-suspenders with the quote-leg scrub: the history leg
+        # and cross-key fills above can re-introduce a sentinel into the
+        # merged composite (e.g. week_52_high=999999.9999 on 207940.KS /
+        # 012450.KS / 000660.KS, verified against exchange-primary
+        # sources 2026-07-06).
+        if _sentinel_scrub_enabled():
+            _as1_merged_tags = _scrub_provider_sentinels(merged)
+            if _as1_merged_tags:
+                _merge_warnings_inplace(merged, _as1_merged_tags)
+                if any(t.endswith(":previous_close") or t.endswith(":prev_close") for t in _as1_merged_tags):
+                    merged["price_change"] = None
+                    merged["percent_change"] = None
+
+        # ---- v4.13.0 AS-2: current_price↔previous_close coherence ----
+        # A crossed payload can pair one instrument's price with another
+        # instrument's previous close (live 2026-07-06 GM batch:
+        # NESR.US cp=318.52 prev=27.90 pct=-0.34%; LDI.US cp=61.57
+        # prev=1.23). The identity guard cannot see this when `code`
+        # echoes the request. Reuse the ZB suspect-ratio test on the
+        # pair; on a definite unit-class disagreement drop the previous
+        # close AND the day-move fields derived from it.
+        if _coherence_guard_enabled():
+            _as2_cp = safe_float(merged.get("current_price"))
+            _as2_prev = safe_float(merged.get("previous_close"))
+            if (
+                _as2_cp is not None and _as2_cp > 0
+                and _as2_prev is not None and _as2_prev > 0
+                and _is_suspect_price_ratio(
+                    _as2_cp, _as2_prev, _price_ratio_high(), _price_ratio_low())
+            ):
+                merged["previous_close"] = None
+                merged["prev_close"] = None
+                merged["price_change"] = None
+                merged["percent_change"] = None
+                _merge_warnings_inplace(
+                    merged, ["previous_close_incoherent_dropped"])
+
         # ---- v4.7.3 ZB: merged-level 52W currency-sanity guard ----
         validation_warnings = _validate_52w_bounds_merged(
             merged,
@@ -2853,6 +3037,26 @@ async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
 
 async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await quote(symbol, *args, **kwargs)
+
+
+async def get_quote_async(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """v4.13.0 AS-3: engine v5.108.1 binds THIS name first
+    (_pick_provider_callable preference order). Flag ON -> return the
+    patch dict with error shells and provider_unhealthy /
+    provider_identity_mismatch markers intact (never raises). Flag OFF
+    -> delegate to the legacy raise-on-err quote() so the engine path
+    is byte-identical to v4.12.1."""
+    if _engine_patch_bind_enabled():
+        client = await get_client()
+        patch, _err = await client.fetch_quote(symbol)
+        return patch if isinstance(patch, dict) else {}
+    return await quote(symbol, *args, **kwargs)
+
+
+async def fetch_quote_async(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """v4.13.0 AS-3: second engine-preferred name; same contract as
+    get_quote_async."""
+    return await get_quote_async(symbol, *args, **kwargs)
 
 
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
