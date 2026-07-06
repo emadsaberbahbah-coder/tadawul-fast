@@ -3,9 +3,44 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.20.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.21.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.21.0 fix — SMALL-PAGE STARVATION (Fix #6: page-order override +
+  bounded empty-row retry; two INDEPENDENT env switches, both inert by
+  default: TFB_SYNC_PAGE_ORDER unset, TFB_SYNC_EMPTY_RETRY "0")
+- WHY (confirmed live 2026-07-06): the Mutual_Funds page sat at ~44% live
+  coverage inside the full sync (485 snapshot/fallback rows, flagship ETFs
+  MDY/VUG/IJR/VWO blocked "Missing current price") — yet a SOLO refresh of
+  the same page, same symbols, same code priced 870/871 rows (99.9%) in one
+  pass. Same signature on Commodities_FX (38% missing in-run). ROOT CAUSE:
+  _default_tasks() launches Market_Leaders(2) + Global_Markets(3) first;
+  under Semaphore(workers) the ~4,500 ML+GM symbols burn the provider
+  budget window (Yahoo datacenter 401 storm + EODHD breaker/backoff), so
+  the small pages at priorities 4-5 fetch into exhausted providers and the
+  honesty gates correctly write them as blocked. Sequencing problem, not a
+  pricing problem.
+- FIX 6a — TFB_SYNC_PAGE_ORDER (csv of sheet names or task keys): reorders
+  ONLY the enriched market tasks; listed pages take launch positions 1..k
+  in the given order, unlisted enriched tasks follow in their original
+  relative order, and the analysis/cockpit tasks (Insights, Top_10,
+  Data_Dictionary) keep their later priorities REGARDLESS — they must run
+  after all universes. Unknown tokens are logged and ignored. Unset ->
+  byte-identical v6.20.0 order. Recommended production value puts the
+  starved small pages ahead of the big two:
+  "My_Portfolio,Mutual_Funds,Commodities_FX,Market_Leaders,Global_Markets".
+- FIX 6b — TFB_SYNC_EMPTY_RETRY ("0" default): after a batched market fetch,
+  rows whose price cell is empty get ONE bounded re-fetch pass
+  (TFB_SYNC_EMPTY_RETRY_MAX, default 120 symbols; optional cool-down
+  TFB_SYNC_EMPTY_RETRY_DELAY_SEC, default 0, cap 120) through the SAME
+  batched fetcher; healed rows are spliced back BY SYMBOL only when the
+  retry returns the identical header row (a mismatch skips the splice with
+  a warning — the retry can never make a page worse). Second-line safety
+  for breaker-window casualties from ANY cause; arm it AFTER one ordered
+  run confirms 6a, so attribution stays clean.
+- New helpers: _page_order_override, _apply_page_order, _empty_retry_*,
+  _retry_empty_rows. Everything else byte-identical to v6.20.0.
 
 v6.20.0 fix — CROSS-PAGE PRICE-DELTA GUARD (Fix 1b; env-gated
   TFB_XPAGE_PRICE_CHECK, DEFAULT OFF; threshold TFB_XPAGE_PRICE_DELTA_PCT,
@@ -582,7 +617,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.20.0"
+SCRIPT_VERSION = "6.21.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1387,6 +1422,174 @@ def _xpage_report() -> Tuple[Dict[str, int], List[str]]:
         except Exception:
             pass
     return stats, lines
+
+
+# -----------------------------------------------------------------------------
+# Small-page starvation fixes (v6.21.0, Fix #6) — order override + empty retry
+# -----------------------------------------------------------------------------
+def _page_order_override() -> List[str]:
+    """v6.21.0 (6a): csv of sheet names / task keys from TFB_SYNC_PAGE_ORDER.
+    Unset/blank -> [] (byte-identical v6.20.0 launch order)."""
+    raw = (os.getenv("TFB_SYNC_PAGE_ORDER") or "").strip()
+    return [p.strip() for p in raw.split(",") if p.strip()] if raw else []
+
+
+def _apply_page_order(tasks: List["TaskSpec"]) -> List["TaskSpec"]:
+    """v6.21.0 (6a): reassign launch priorities for the ENRICHED market tasks
+    per the override list. Listed pages take positions 1..k in the given
+    order; unlisted enriched tasks follow in their original relative order;
+    analysis/cockpit tasks are untouched (their priorities 6+ keep them after
+    every universe). Unknown tokens -> one warning, ignored. Never raises."""
+    order = _page_order_override()
+    if not order:
+        return tasks
+    try:
+        def _tok(s: str) -> str:
+            return _guard_norm(s).replace("_", "")
+        want = [_tok(p) for p in order]
+        enriched = [t for t in tasks if t.gateway == "enriched"]
+        by_tok: Dict[str, "TaskSpec"] = {}
+        for t in enriched:
+            by_tok[_tok(t.sheet_name)] = t
+            by_tok[_tok(t.key)] = t
+        listed: List["TaskSpec"] = []
+        seen: set = set()
+        unknown: List[str] = []
+        for raw_tok, disp in zip(want, order):
+            t = by_tok.get(raw_tok)
+            if t is None:
+                unknown.append(disp)
+                continue
+            if id(t) not in seen:
+                seen.add(id(t))
+                listed.append(t)
+        if unknown:
+            logger.warning(
+                "[v6.21.0 ORDER] unknown page token(s) ignored: %s",
+                ", ".join(unknown),
+            )
+        if not listed:
+            return tasks
+        rest = [t for t in enriched if id(t) not in seen]
+        for i, t in enumerate(listed + rest, start=1):
+            t.priority = i
+        logger.info(
+            "[v6.21.0 ORDER] enriched launch order: %s",
+            " -> ".join(t.sheet_name for t in sorted(enriched, key=lambda x: x.priority)),
+        )
+    except Exception as e:
+        logger.warning("[v6.21.0 ORDER] override skipped (error: %s)", e)
+    return tasks
+
+
+def _empty_retry_enabled() -> bool:
+    """v6.21.0 (6b) master switch. DEFAULT OFF; TFB_SYNC_EMPTY_RETRY=1 arms
+    the one-shot re-fetch of empty-price rows after a batched market fetch."""
+    return (os.getenv("TFB_SYNC_EMPTY_RETRY") or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _empty_retry_max() -> int:
+    try:
+        v = int(float((os.getenv("TFB_SYNC_EMPTY_RETRY_MAX") or "120").strip()))
+    except Exception:
+        v = 120
+    return max(1, min(1000, v))
+
+
+def _empty_retry_delay_sec() -> float:
+    try:
+        v = float((os.getenv("TFB_SYNC_EMPTY_RETRY_DELAY_SEC") or "0").strip())
+    except Exception:
+        v = 0.0
+    return max(0.0, min(120.0, v))
+
+
+async def _retry_empty_rows(
+    backend: "BackendClient",
+    task: "TaskSpec",
+    headers: List[Any],
+    rows_matrix: List[List[Any]],
+    base_payload: Dict[str, Any],
+    eff_gw: str,
+    res: "TaskResult",
+    fetch_fn: Any = None,
+) -> Tuple[List[List[Any]], int]:
+    """v6.21.0 (6b): ONE bounded re-fetch pass for rows whose price cell is
+    empty/non-positive, splicing healed rows back BY SYMBOL. The splice only
+    happens when the retry returns the IDENTICAL header row — a mismatch
+    skips it with a warning, so the retry can never make the page worse.
+    Returns (rows_matrix, healed_count). Never raises."""
+    try:
+        if not headers or not rows_matrix:
+            return rows_matrix, 0
+        sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+        px_i = _guard_find_col(list(headers), _XPAGE_PRICE_ALIASES)
+        if sym_i < 0 or px_i < 0:
+            return rows_matrix, 0
+        hi = max(sym_i, px_i)
+
+        def _px_ok(row: List[Any]) -> bool:
+            try:
+                v = float(str(row[px_i]).replace(",", ""))
+                return 0.0 < v < 1e15
+            except Exception:
+                return False
+
+        empty_syms: List[str] = []
+        empty_pos: Dict[str, int] = {}
+        for pos, row in enumerate(rows_matrix):
+            if not isinstance(row, (list, tuple)) or len(row) <= hi:
+                continue
+            s = str(row[sym_i] or "").strip().upper()
+            if not s or _px_ok(list(row)):
+                continue
+            if s not in empty_pos:
+                empty_pos[s] = pos
+                empty_syms.append(s)
+        if not empty_syms:
+            return rows_matrix, 0
+        capped = empty_syms[: _empty_retry_max()]
+        delay = _empty_retry_delay_sec()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        _fetch = fetch_fn or _fetch_market_rows_batched
+        r_headers, r_matrix, _r_ep, _r_err = await _fetch(
+            backend, task, capped, dict(base_payload), eff_gw, res
+        )
+        if not r_matrix:
+            logger.info(
+                "[v6.21.0 RETRY] %s: %d empty row(s), retry returned nothing (%s)",
+                task.sheet_name, len(capped), _r_err or "no rows",
+            )
+            return rows_matrix, 0
+        if list(r_headers or []) != list(headers):
+            _w = ("[v6.21.0 RETRY] %s: header mismatch on retry — splice "
+                  "skipped (page left as fetched)" % task.sheet_name)
+            res.warnings.append(_w)
+            logger.warning(_w)
+            return rows_matrix, 0
+        healed = 0
+        for row in r_matrix:
+            if not isinstance(row, (list, tuple)) or len(row) <= hi:
+                continue
+            s = str(row[sym_i] or "").strip().upper()
+            pos = empty_pos.get(s)
+            if pos is None or not _px_ok(list(row)):
+                continue
+            rows_matrix[pos] = list(row)
+            healed += 1
+        logger.info(
+            "[v6.21.0 RETRY] %s: empties=%d retried=%d healed=%d",
+            task.sheet_name, len(empty_syms), len(capped), healed,
+        )
+        if healed:
+            res.warnings.append(
+                "[v6.21.0 RETRY] healed %d empty row(s) on second pass" % healed
+            )
+        return rows_matrix, healed
+    except Exception as e:
+        logger.warning("[v6.21.0 RETRY] %s skipped (error: %s)", task.sheet_name, e)
+        return rows_matrix, 0
 
 
 def _decision_guard_enabled() -> bool:
@@ -2930,6 +3133,13 @@ async def _run_one_task(
             headers, rows_matrix, used_endpoint, last_err = await _fetch_market_rows_batched(
                 backend, task, symbols, payload, eff_gw, res
             )
+            # v6.21.0 (6b): one bounded second pass for empty-price rows
+            # (breaker-window casualties). OFF by default; splice-by-symbol
+            # is header-guarded so it can never make the page worse.
+            if _empty_retry_enabled() and rows_matrix:
+                rows_matrix, _healed = await _retry_empty_rows(
+                    backend, task, headers, rows_matrix, payload, eff_gw, res
+                )
 
         for ep in ([] if _use_batching else _endpoint_candidates_for_gateway(eff_gw)):
             data, err, _code = await backend.post_json(ep, payload)
@@ -3252,6 +3462,9 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
         logger.warning("No backend token found (TFB_TOKEN/X_APP_TOKEN/APP_TOKEN/BACKEND_TOKEN). Requests may 401 if protected.")
 
     tasks = _default_tasks()
+    # v6.21.0 (6a): optional launch-order override for the enriched market
+    # tasks (starved small pages ahead of the big two). Unset -> unchanged.
+    tasks = _apply_page_order(tasks)
 
     wanted = _parse_keys_tokens(args.keys or [])
     forbidden_requested = [k for k in wanted if _is_forbidden_key(k)]
