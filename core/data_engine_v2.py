@@ -2,8 +2,31 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.108.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.108.1
 ================================================================================
+
+WHY v5.108.1 - EVIDENCE CORRECTION (documentation only; ZERO code change -
+the v5.108.0 bytecode behavior is byte-identical)
+--------------------------------------------------------------------------
+RETRACTION: the v5.108.0 WHY below convicts EODHD of serving a
+"CONSISTENT, DAILY-UPDATING, WRONG price series" for 4503.T, citing
+TradingEconomics at 2,553.50 as market truth. Exchange-primary sources
+(finance.yahoo.co.jp real-time, 2026-07-06 10:38 JST: 2,190.5 +1.79%,
+prev close 2,152 on 07/03; Kabutan TSE-delayed: 2,152.0 at the 07/03
+close) prove EODHD's series (2,152 -> ~2,208 intraday) was CORRECT the
+whole time. The stale/wrong series belonged to the EXTERNAL anchors
+(TradingEconomics / Investing.com crawl pages), not to the provider. The
+same anchor family falsely implicated 0016.HK. AR-5's first production
+act was therefore a correct EXONERATION: `xprovider_verified:...:0.0%`
+was two truthful feeds agreeing, not circularity.
+WHAT STANDS UNAFFECTED: SPLG (176-session bar per EODHD's own ledger),
+the 47 dead-fund catches (bar dates matching documented closures), the
+.SR staleness class (anchored on the Argaam live primary), and every
+mechanism shipped in v5.104.0-v5.108.0 - AR-5 remains the tool that
+convicts real divergence exactly because it can also exonerate.
+PROCESS RULE ADOPTED: external price verification uses exchange-primary
+or timestamped real-time sources only (JP: finance.yahoo.co.jp/Kabutan;
+SA: Argaam); never aggregator crawl pages.
 
 WHY v5.108.0 - CROSS-PROVIDER PRICE VERIFICATION (Fix AR-5; env-gated
 TFB_XPROVIDER_VERIFY, DEFAULT OFF; threshold TFB_XPROVIDER_DELTA_PCT,
@@ -2418,7 +2441,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.108.0"
+__version__ = "5.108.1"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
