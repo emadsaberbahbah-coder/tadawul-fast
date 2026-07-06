@@ -2,8 +2,49 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.104.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.105.0
 ================================================================================
+
+WHY v5.105.0 - BAR-AGE PROVIDER FAILOVER (Fix AR-2; env-gated
+TFB_BAR_AGE_FAILOVER, DEFAULT OFF; requires the Fix AR gate flag too -
+failover is a refinement of the gate, never a silent price swapper)
+--------------------------------------------------------------------------
+ROOT CAUSE (live evidence 2026-07-06, Mutual_Funds full-page run): Fix AR is
+honest but TERMINAL. The factory's provider loop breaks at the FIRST
+provider that returns a price; when that price rides a stale bar, the gate
+tags and blocks the row - end of story - even when the NEXT provider in the
+chain holds a fresh bar for the same symbol. Live receipts: SPLG (SPDR
+Portfolio S&P 500, one of the most liquid ETFs alive) blocked on an
+8-month-old EODHD bar (2025-10-30, 176 sessions); 4503.T / 0016.HK - the
+Top_10's #1 and #2 picks - blocked on months-old EODHD bars while Yahoo
+holds current Tokyo/HK data. Honest blocking protected the money; honest
+HEALING gets the row back.
+
+FIX (one targeted retry chain, fully disclosed):
+  1. NEW module fn _bar_age_failover_attempt(sym, page_ctx, merged,
+     providers, fetch_patch): when the merged live price trips
+     _bar_age_check, walk the REMAINING providers in page order; fetch,
+     canonicalize, and accept the first patch whose own bar passes the
+     age check. On success it surgically overwrites ONLY the price family
+     (_BAR_AGE_FAILOVER_FIELDS: current_price, previous_close, open_price,
+     day_high, day_low, volume, price_bar_ts) - fundamentals, targets,
+     52-week levels and everything else stay with their original sources -
+     sets data_provider to the healer, preserves the stale source in
+     provider_secondary, and returns the disclosure tag
+     `bar_age_failover:<from>-><to>:<old-lag>s`. No fresh bar anywhere ->
+     returns `bar_age_failover_exhausted:<tried>` and the row proceeds to
+     the Fix AR tag + demotion exactly as v5.104.0.
+  2. Factory wiring: one call between the provider loop and the Fix AQ
+     provenance block, guarded by BOTH _bar_age_gate_enabled() and
+     _bar_age_failover_enabled(). Cost profile: ZERO extra fetches for
+     fresh-bar rows (the age check is pure math); one to three targeted
+     fetches ONLY for gate-tripped symbols (a few dozen per run, so Yahoo
+     throttle exposure is negligible).
+  3. Warnings carry the full story either way; a healed row passes the
+     later Fix AR check (fresh bar) so no stale tag is added - the gate
+     and the failover can never both fire on one row.
+KILL SWITCH: TFB_BAR_AGE_FAILOVER unset/0 -> the helper is never called;
+v5.104.0 byte-identical. Gate flag off -> likewise (documented coupling).
 
 WHY v5.104.0 - PROVIDER BAR-AGE HONESTY (Fix AR; env-gated
 TFB_GATE_PROVIDER_BAR_AGE, DEFAULT OFF; unset/0/false/off/no keeps v5.103.0
@@ -2279,7 +2320,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.104.0"
+__version__ = "5.105.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -7913,6 +7954,75 @@ def _bar_age_max_sessions() -> int:
     return max(0, min(30, v))
 
 
+def _bar_age_failover_enabled() -> bool:
+    """v5.105.0 (Fix AR-2) switch. DEFAULT OFF; set TFB_BAR_AGE_FAILOVER=1
+    to let a gate-tripped row try the remaining providers for a fresh bar
+    before it is tagged and demoted. Only meaningful alongside
+    TFB_GATE_PROVIDER_BAR_AGE=1 (the factory requires both)."""
+    return (os.getenv("TFB_BAR_AGE_FAILOVER") or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+# v5.105.0 (Fix AR-2): the ONLY fields a bar-age failover may overwrite.
+# Deliberately the intraday price family + the bar witness; fundamentals,
+# analyst targets, 52-week levels etc. keep their original sources.
+_BAR_AGE_FAILOVER_FIELDS: Tuple[str, ...] = (
+    "current_price", "previous_close", "open_price",
+    "day_high", "day_low", "volume", "price_bar_ts",
+)
+
+
+async def _bar_age_failover_attempt(
+    sym: str,
+    page_ctx: str,
+    merged: Dict[str, Any],
+    providers: List[str],
+    fetch_patch: Any,
+) -> Optional[str]:
+    """v5.105.0 (Fix AR-2): heal a stale-bar live price from the remaining
+    providers. Returns the warnings tag to append:
+      - None                                  -> merged bar is fresh (no-op)
+      - 'bar_age_failover:<a>-><b>:<lag>s'    -> healed (merged MUTATED)
+      - 'bar_age_failover_exhausted:<tried>'  -> nobody had a fresh bar
+    Never raises; any provider error is treated as 'no patch'."""
+    try:
+        hit = _bar_age_check(sym, merged)
+        if hit is None:
+            return None
+        src_prov = _safe_str(merged.get("data_provider")).strip() or "unknown"
+        tried = 0
+        for prov in providers or []:
+            if _safe_str(prov).strip() == src_prov:
+                continue
+            tried += 1
+            try:
+                patch = await fetch_patch(prov, sym, page_ctx)
+            except Exception:
+                patch = None
+            if not patch:
+                continue
+            try:
+                canon = _canonicalize_provider_row(
+                    patch, requested_symbol=sym, normalized_symbol=sym, provider=prov,
+                )
+            except Exception:
+                continue
+            if _as_float(canon.get("current_price")) is None:
+                continue
+            if _bar_age_check(sym, canon) is not None:
+                continue  # this provider's bar is stale too
+            for f in _BAR_AGE_FAILOVER_FIELDS:
+                v = canon.get(f)
+                if v is not None and v != "":
+                    merged[f] = v
+            if not _safe_str(merged.get("provider_secondary")).strip():
+                merged["provider_secondary"] = src_prov
+            merged["data_provider"] = _safe_str(prov).strip() or merged.get("data_provider")
+            return "bar_age_failover:%s->%s:%ds" % (src_prov, prov, hit[1])
+        return "bar_age_failover_exhausted:%d" % tried
+    except Exception:
+        return None
+
+
 # v5.104.0 (Fix AR): per-suffix exchange session table.
 # suffix -> (weekend weekday set [Mon=0..Sun=6], UTC offset hours, local close hour).
 # DST is deliberately ignored (±1h boundary noise is absorbed by the close-hour
@@ -11688,6 +11798,26 @@ class DataEngineV5:
                 merged.setdefault("data_provider", provider_name)
                 if _as_float(merged.get("current_price")) is not None:
                     break
+
+            # --- v5.105.0 (Fix AR-2) BAR-AGE PROVIDER FAILOVER ---------------
+            # The loop above stops at the first provider with a price; when
+            # that price rides a stale bar, the remaining providers may hold
+            # a fresh one (SPLG / 4503.T / 0016.HK live cases). One targeted
+            # retry chain, fully disclosed in warnings; requires BOTH the
+            # Fix AR gate flag and the failover flag. Fresh-bar rows cost
+            # zero extra fetches (the age check is pure math). A healed row
+            # passes the later Fix AR check, so gate and failover can never
+            # both fire on one row.
+            if (
+                _bar_age_gate_enabled()
+                and _bar_age_failover_enabled()
+                and _as_float(merged.get("current_price")) is not None
+            ):
+                _ar2_tag = await _bar_age_failover_attempt(
+                    sym, page_ctx, merged, self._providers_for(page_ctx), self._fetch_patch,
+                )
+                if _ar2_tag:
+                    _aq_append_warning(merged, _ar2_tag)
 
             # v5.103.0 (Fix AQ): record price provenance for this run. A price
             # present HERE came from a real provider quote; anything filled by
