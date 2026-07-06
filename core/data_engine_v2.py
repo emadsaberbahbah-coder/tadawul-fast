@@ -2,8 +2,70 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.108.1
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.109.0
 ================================================================================
+
+WHY v5.109.0 - CONTAMINATION FIREWALL (Fixes AU-1 / AU-2 / AU-3)
+--------------------------------------------------------------------------
+Live workbook audit 2026-07-06 ("Market_Share_Deepseek-V3" export v29):
+126 symbols carry DIFFERENT company identities on different pages, with
+Market_Leaders / My_Portfolio holding the truth and Global_Markets the
+poison — 1120.SR served as "Motorola Solutions, Inc." @ 422.66 (true:
+Al Rajhi @ 65.75 on Market_Leaders), 4150.SR as "Sempra" @ 93.06 (true:
+Arriyadh Development @ 18.40 in the portfolio), 7010.SR as "UPS" @
+110.66 (true: STC @ 43.66), ROG.SW (Roche) named "Saudi Cement Company",
+0011.HK (Hang Seng Bank) named "Wolters Kluwer". Fields inside single
+rows come from DIFFERENT instruments (NESR.US: price 318.52 / prev
+27.90 / stored pct -0.34%), so the crossing enters at patch level, not
+as whole rows. Three engine-side gaps let it live:
+
+AU-1 ENGINE IDENTITY FIREWALL (default OFF; enable with
+TFB_ENGINE_IDENTITY_GUARD=1). _canonicalize_provider_row() force-stamps
+the REQUESTED symbol onto whatever payload arrives (symbol /
+symbol_normalized / requested_symbol are all overwritten), erasing the
+payload's declared identity before anything can check it. The only
+identity verification in the whole stack is eodhd_provider's in-house
+guard on two of its legs; every other provider module's output is
+trusted absolutely. Fix: _fetch_patch() — the single choke point through
+which the factory loop, the AR-2 bar-age failover, and the AR-5
+cross-provider verification all receive provider patches — now compares
+the patch's self-declared identity (symbol_normalized / symbol / code,
+BEFORE canonicalization) against the requested symbol using the same
+lenient rules as the provider guard, extended with alnum-collapse and
+leading-zero tolerance so 0016.HK==16.HK and BRK.B==BRK-B can never be
+dropped. A definite base-identity mismatch drops the patch with an
+observable warning log (v5.75.0 observable-swallow convention). OFF by
+default per house rule (new behavioral gate); flip after review.
+
+AU-2 SNAPSHOT PROVENANCE HONESTY + POISON REFUSAL. (a) The snapshot
+fallback previously did merged.setdefault("data_provider",
+snap["data_provider"]) — a snapshot-served row WEARS THE ORIGINAL
+PROVIDER'S NAME. Live effect: rows this engine served from stored
+snapshots carried "eodhd" / "history" labels (the 4150.SR "Sempra" row
+is stamped history @ 2026-07-05T21:00 via the Fix-AQ honest-timestamp
+path), which actively misled the audit toward the wrong layer. Under
+TFB_SNAPSHOT_PROVENANCE_LABEL=1 (default ON — this enforces the
+documented Fix-AQ/AT provenance-honesty control) a snapshot-served row
+is labeled "snapshot:<original_provider>" so the fallback is visible
+while the origin is preserved; =0 restores the byte-identical setdefault.
+(b) _store_sheet_snapshot() now refuses rows already convicted by the
+pipeline (identity_mismatch warnings, degraded fallback_error rows)
+under TFB_SNAPSHOT_POISON_REFUSAL=1 (default ON): a store that persists
+known-crossed rows re-serves them indefinitely as plausible-looking
+fallbacks — the exact mechanism that carried yesterday evening's poison
+into today's sheet.
+
+AU-3 DEGRADED-LABEL ROUTING (byte-identical by default). The degraded
+row built in get_enriched_quotes() stamps the literal string
+"fallback_error" into data_provider — an error class living in a
+provenance field; 77 such rows shipped to three pages on 2026-07-06 at
+08:23:06 UTC. The stamp now reads TFB_DEGRADED_PROVIDER_LABEL (default
+"fallback_error", so nothing changes until the operator opts in), and
+_V5100_DEGRADED_PROVIDERS recognizes BOTH the legacy literal and the
+configured label so health checks keep working across the transition.
+
+Version: __version__ = "5.109.0". All v5.108.x and earlier WHY blocks
+below are preserved verbatim. Zero functions removed (AST-verified).
 
 WHY v5.108.1 - EVIDENCE CORRECTION (documentation only; ZERO code change -
 the v5.108.0 bytecode behavior is byte-identical)
@@ -2441,7 +2503,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.108.1"
+__version__ = "5.109.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -8128,6 +8190,97 @@ def _bar_age_max_sessions() -> int:
     return max(0, min(30, v))
 
 
+def _engine_identity_guard_enabled() -> bool:
+    """v5.109.0 (Fix AU-1): engine-level provider-patch identity firewall.
+    Default OFF; set TFB_ENGINE_IDENTITY_GUARD=1 to drop provider patches
+    whose self-declared identity definitively mismatches the requested
+    symbol at _fetch_patch (the single choke point feeding the factory
+    loop, AR-2 failover, and AR-5 verification)."""
+    return os.getenv("TFB_ENGINE_IDENTITY_GUARD", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _snapshot_provenance_label_enabled() -> bool:
+    """v5.109.0 (Fix AU-2a): label snapshot-served rows
+    "snapshot:<orig_provider>" instead of inheriting the original
+    provider's name outright. Default ON (enforces the documented
+    Fix-AQ/AT provenance-honesty control); set
+    TFB_SNAPSHOT_PROVENANCE_LABEL=0 for the byte-identical v5.108.1
+    setdefault."""
+    return os.getenv("TFB_SNAPSHOT_PROVENANCE_LABEL", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _snapshot_poison_refusal_enabled() -> bool:
+    """v5.109.0 (Fix AU-2b): refuse to persist rows the pipeline already
+    convicted (identity_mismatch warnings / degraded fallback rows) into
+    the snapshot store. Default ON; TFB_SNAPSHOT_POISON_REFUSAL=0
+    restores unconditional storage."""
+    return os.getenv("TFB_SNAPSHOT_POISON_REFUSAL", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _degraded_provider_label() -> str:
+    """v5.109.0 (Fix AU-3): the data_provider stamp for degraded rows.
+    Default keeps the historical literal so behavior is byte-identical
+    until the operator sets TFB_DEGRADED_PROVIDER_LABEL."""
+    v = (os.getenv("TFB_DEGRADED_PROVIDER_LABEL", "") or "").strip()
+    return v or "fallback_error"
+
+
+def _au1_collapse(s: str) -> str:
+    """v5.109.0 (Fix AU-1): alnum-collapse one string segment; strip
+    leading zeros when the collapsed form is all-digit ('0016' -> '16')."""
+    tok = "".join(ch for ch in s if ch.isalnum())
+    if tok.isdigit():
+        tok = tok.lstrip("0") or "0"
+    return tok
+
+
+def _au1_identity_token_set(value: Any) -> set:
+    """v5.109.0 (Fix AU-1): lenient comparison-token SET for a symbol-ish
+    string: {collapse(full), collapse(base-before-last-dot)}. Using a set
+    of BOTH forms keeps dot-class US tickers safe — 'BRK.B' yields
+    {'BRKB', 'BRK'} and 'BRK-B' yields {'BRKB'}, which intersect, so the
+    guard can never drop a genuine class-share patch; '0016.HK' yields
+    {'0016HK', '16'} and '16.HK' yields {'16HK', '16'} (intersect on
+    '16'). Two different instruments ('1080.SR' vs 'GRAB.US') produce
+    fully disjoint sets. Empty in -> empty set."""
+    s = ("" if value is None else str(value)).strip().upper()
+    if not s:
+        return set()
+    toks = {_au1_collapse(s)}
+    if "." in s:
+        toks.add(_au1_collapse(s.rsplit(".", 1)[0]))
+    toks.discard("")
+    return toks
+
+
+def _engine_patch_identity_mismatch(requested: str, patch: Dict[str, Any]) -> Optional[str]:
+    """v5.109.0 (Fix AU-1): compare the identity a provider patch DECLARES
+    about itself against the symbol the engine requested. Lenient by
+    design — must never drop a genuine patch:
+      * no declared identity fields -> None (no judgement);
+      * any declared field whose token set INTERSECTS the requested
+        token set -> None;
+      * only when EVERY non-empty declared field is fully disjoint ->
+        return the first observed declared identity (definite crossing)."""
+    if not isinstance(patch, dict) or not patch:
+        return None
+    want = _au1_identity_token_set(requested)
+    if not want:
+        return None
+    declared: List[str] = []
+    for key in ("symbol_normalized", "symbol", "code", "requested_symbol"):
+        raw = patch.get(key)
+        s = ("" if raw is None else str(raw)).strip()
+        if s:
+            declared.append(s)
+    if not declared:
+        return None
+    for s in declared:
+        if _au1_identity_token_set(s) & want:
+            return None
+    return declared[0]
+
+
 def _provider_attribution_fix_enabled() -> bool:
     """v5.107.0 (Fix AT): attribute data_provider to the price deliverer,
     not the first patch-toucher. DEFAULT ON; TFB_PROVIDER_ATTRIBUTION_FIX=0
@@ -10273,7 +10426,10 @@ _V5100_CLEARABLE_IDENTITY_FIELDS: frozenset = frozenset({
 # quote shape built in get_enriched_quotes() (data_provider "fallback_error",
 # recommendation_source "enrichment_failed", warnings "enrichment_failed:<Err>")
 # and the empty-row marker from _mark_row_as_empty().
-_V5100_DEGRADED_PROVIDERS: frozenset = frozenset({"fallback_error"})
+_V5100_DEGRADED_PROVIDERS: frozenset = frozenset(
+    {"fallback_error",
+     ((os.getenv("TFB_DEGRADED_PROVIDER_LABEL", "") or "").strip().lower() or "fallback_error")}
+)
 _V5100_DEGRADED_RECO_SOURCES: frozenset = frozenset({"enrichment_failed", "empty_row"})
 _V5100_DEGRADED_WARNING_MARKERS: tuple = (
     "enrichment_failed", "fallback_error", "cancellederror",
@@ -11235,6 +11391,22 @@ class DataEngineV5:
     async def _store_sheet_snapshot(self, sheet: str, rows: Sequence[Dict[str, Any]]) -> None:
         canon = _canonicalize_sheet_name(sheet)
         snapshot = [dict(r) for r in (rows or []) if isinstance(r, dict)]
+        # v5.109.0 (Fix AU-2b): never persist rows the pipeline has already
+        # convicted — a poisoned snapshot re-serves crossed identities
+        # indefinitely as plausible-looking fallbacks (the mechanism that
+        # carried 2026-07-05 evening's crossed rows into the 2026-07-06
+        # sheet with honest-looking old stamps).
+        if _snapshot_poison_refusal_enabled() and snapshot:
+            _au2_deg = _degraded_provider_label().strip().lower()
+
+            def _au2_row_poisoned(_r: Dict[str, Any]) -> bool:
+                _w = _safe_str(_r.get("warnings")).lower()
+                if "identity_mismatch" in _w:
+                    return True
+                _dp = _safe_str(_r.get("data_provider")).strip().lower()
+                return _dp in ("fallback_error", _au2_deg)
+
+            snapshot = [r for r in snapshot if not _au2_row_poisoned(r)]
         async with self._snapshot_lock:
             if snapshot:
                 self._page_snapshots[canon] = snapshot
@@ -11489,9 +11661,27 @@ class DataEngineV5:
                 exc.__class__.__name__, exc,
             )
             return {}
-        if isinstance(result, dict):
-            return result
-        return _model_to_dict(result)
+        out = result if isinstance(result, dict) else _model_to_dict(result)
+        if not isinstance(out, dict):
+            return {}
+        # v5.109.0 (Fix AU-1): identity firewall at the single choke point.
+        # _canonicalize_provider_row downstream force-stamps the requested
+        # symbol onto whatever arrives, erasing the payload's declared
+        # identity — so the check must happen HERE, before canonicalization.
+        # Lenient token compare (alnum-collapse + leading-zero tolerance);
+        # a definite mismatch is dropped with an observable log per the
+        # v5.75.0 convention. Live conviction: 2026-07-06 Global_Markets
+        # rows carrying other instruments' names/prices (1120.SR as
+        # Motorola @ 422.66; NESR.US price 318.52 vs prev 27.90).
+        if _engine_identity_guard_enabled() and out:
+            _au1_got = _engine_patch_identity_mismatch(symbol, out)
+            if _au1_got:
+                logger.warning(
+                    "[engine_v2 v%s AU-1] provider %s returned crossed identity for %s: declared=%s — patch dropped",
+                    __version__, provider_name, symbol, _au1_got,
+                )
+                return {}
+        return out
 
     # =========================================================================
     # History helpers
@@ -12136,8 +12326,28 @@ class DataEngineV5:
                     # verified" time for a snapshot-served price.
                     _snap_lu_utc = _safe_str(snap.get("last_updated_utc"))
                     _snap_lu_riy = _safe_str(snap.get("last_updated_riyadh"))
+                    # v5.109.0 (Fix AU-2a): capture whether any LIVE provider
+                    # claimed this row BEFORE the snap fill — the masquerade
+                    # rides in through _merge_missing_fields itself, which
+                    # copies the snap's data_provider into the blank field
+                    # (the old setdefault below was already a no-op then).
+                    _au2_prior_dp = _safe_str(merged.get("data_provider")).strip()
                     merged = _merge_missing_fields(merged, snap)
-                    merged.setdefault("data_provider", _safe_str(snap.get("data_provider"), "snapshot"))
+                    # v5.109.0 (Fix AU-2a): a snapshot-served row must not
+                    # wear a live provider's name (live: 4150.SR "Sempra"
+                    # stamped history@2026-07-05T21:00; snapshot rows
+                    # inheriting "eodhd" misdirected the contamination
+                    # audit). When no live provider claimed the row, force
+                    # the honest label and keep the origin visible.
+                    if _snapshot_provenance_label_enabled():
+                        if not _au2_prior_dp:
+                            _au2_orig = _safe_str(snap.get("data_provider")).strip()
+                            if _au2_orig and _au2_orig.lower() != "snapshot" and not _au2_orig.lower().startswith("snapshot:"):
+                                merged["data_provider"] = "snapshot:" + _au2_orig
+                            else:
+                                merged["data_provider"] = "snapshot"
+                    else:
+                        merged.setdefault("data_provider", _safe_str(snap.get("data_provider"), "snapshot"))
                     if not _live_priced and _as_float(merged.get("current_price")) is not None:
                         _fallback_price_src = "snapshot"
 
@@ -12324,7 +12534,7 @@ class DataEngineV5:
                 degraded = {
                     "symbol": sym,
                     "requested_symbol": sym,
-                    "data_provider": "fallback_error",
+                    "data_provider": _degraded_provider_label(),
                     "warnings": f"enrichment_failed:{r.__class__.__name__}",
                     "recommendation": "HOLD",
                     "recommendation_detailed": "HOLD",
