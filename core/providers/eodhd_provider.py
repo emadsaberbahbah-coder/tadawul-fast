@@ -2,12 +2,40 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.11.0 (BAR-DATE DISCLOSURE ON HISTORY PATH + RESPONSE
+EODHD Provider — v4.12.0 (TRUTHFUL BAR WITNESS FOR NON-US SYMBOLS +
+                          BAR-DATE DISCLOSURE ON HISTORY PATH + RESPONSE
                           IDENTITY GUARD + ENGINE PICK-ORDER FIX +
                           PER-FAILURE PROVIDER-UNHEALTHY
                           SIGNAL + CIRCUIT BREAKER + HEALTH PROBE + SESSION
                           COUNTERS + MAY 2026 / v2.8.0 FAMILY ALIGNMENT)
 ================================================================================
+
+v4.12.0 — TRUTHFUL BAR WITNESS FOR NON-US SYMBOLS (Fix AR-4)
+-----------------------------------------------------------------------
+WHY (live conviction 2026-07-06, Render shell probe): 4503.T served at
+2,208 JPY — market 2,553.50 (TradingEconomics, same hour), -13.5% — with
+ZERO gate tags. The real-time payload's `timestamp` is EODHD's own
+"as-of" epoch and it stamps FRESH on weeks-old prices for non-US
+exchanges, so the engine's bar-age gate (which trusts the provider's
+self-reported bar time) is blind exactly where it is needed most. The
+party serving the stale price was also supplying the witness.
+FIX: the composite patch already carries `history_last_utc` — the date
+of the last bar in EODHD's OWN EOD ledger (fetched by the history-stats
+leg, cached at EODHD_HISTORY_TTL; ZERO new HTTP). For any symbol that is
+not `.US`, the shipped `timestamp` witness is now normalized AFTER the
+sub-patch merge:
+  - if the current witness is already DATE-shaped (YYYY-MM-DD — i.e. the
+    v4.11.0 history-path disclosure), it is trusted and kept;
+  - else if `history_last_utc` is date-shaped, it REPLACES the epoch —
+    the EOD ledger cannot stamp itself fresh;
+  - else the epoch witness is DROPPED: shipping no witness is honest
+    ignorance; shipping a lying one blinded the gate (4503.T case).
+US symbols keep the epoch unchanged (proven exact: ADAM.US to the cent).
+With a truthful witness, 4503.T trips the gate -> Fix AR-2 fails over to
+Yahoo -> real price or an honest block. KILL SWITCH:
+TFB_EODHD_EOD_WITNESS=0 restores the v4.11.0 witness byte-identically
+(DEFAULT ON — a witness known to lie must not be the default). Version
+constant bumped to 4.12.0.
 
 v4.11.0 — BAR-DATE DISCLOSURE ON THE HISTORY PATH (Fix AR support)
 -----------------------------------------------------------------------
@@ -731,7 +759,7 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.11.0"
+PROVIDER_VERSION = "4.12.0"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -825,6 +853,13 @@ def _ksa_blocked_by_default() -> bool:
 
 def _allow_ksa_override() -> bool:
     return _env_bool("ALLOW_EODHD_KSA", False) or _env_bool("EODHD_ALLOW_KSA", False)
+
+
+def _eod_witness_enabled() -> bool:
+    """v4.12.0 (Fix AR-4): truthful-bar-witness switch for non-US symbols.
+    DEFAULT ON; TFB_EODHD_EOD_WITNESS=0 restores the v4.11.0 self-stamped
+    epoch witness byte-identically."""
+    return _env_bool("TFB_EODHD_EOD_WITNESS", True)
 
 
 # v4.7.3 ZB: env helpers for the currency-sanity guard.
@@ -2585,6 +2620,26 @@ class EODHDClient:
             merged["open"] = merged.get("day_open")
         if merged.get("day_open") is None and merged.get("open") is not None:
             merged["day_open"] = merged.get("open")
+
+        # ---- v4.12.0 (Fix AR-4): truthful bar witness for non-US symbols ----
+        # The real-time `timestamp` epoch stamps fresh on stale non-US prices
+        # (4503.T at 2,208 vs 2,553.50 live, zero tags). Replace it with the
+        # EOD ledger's last bar date (`history_last_utc`, already in this
+        # merged patch — zero new HTTP); a date-shaped witness (the v4.11.0
+        # history-path disclosure) is already truthful and is kept; with no
+        # ledger date available the epoch is DROPPED — honest ignorance beats
+        # a lying witness. US symbols unchanged (epoch proven exact).
+        def _ar4_date_shaped(v: Any) -> bool:
+            s = safe_str(v).strip()
+            return len(s) >= 10 and s[:10].count("-") == 2 and s[:4].isdigit()
+
+        if _eod_witness_enabled() and not sym_norm.endswith(".US"):
+            if not _ar4_date_shaped(merged.get("timestamp")):
+                _ar4_wit = safe_str(merged.get("history_last_utc")).strip()
+                if _ar4_date_shaped(_ar4_wit):
+                    merged["timestamp"] = _ar4_wit[:10]
+                else:
+                    merged.pop("timestamp", None)
 
         if merged.get("market_cap") is None and merged.get("shares_outstanding") is not None and merged.get("current_price") is not None:
             try:
