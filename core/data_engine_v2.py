@@ -2,8 +2,40 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.105.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.106.0
 ================================================================================
+
+WHY v5.106.0 - BOUNDARY-TIME BAR-AGE ENFORCEMENT (Fix AR-3; SAME env flag
+as Fix AR - TFB_GATE_PROVIDER_BAR_AGE - no new switch; this is the same
+gate enforced at a second choke point)
+--------------------------------------------------------------------------
+ROOT CAUSE (live evidence 2026-07-06, Market_Leaders export): the Fix AR
+CHECK runs only in the factory, and the tag is what the investability gate
+demotes on. A row cached BEFORE the flag was armed carries no tag, so the
+boundary gate waves it through untouched for the row's whole cache
+lifetime. Live receipt: 1211.SR served at 58.90 (yahoo_chart cache, market
+63+ intraday), stamped 03:14 UTC - built pre-arming, cached, and displayed
+with DQ=100 / WATCHLIST hours AFTER the gate went live. KSA cache TTLs are
+deliberately long (throttle protection), so this immunity window is hours,
+not minutes - and it re-opens on every future flag flip or deploy race.
+The witness needed to convict is ALREADY in the cached row: v5.104.0's
+canonical `price_bar_ts` capture is unconditional (alias-table level), so
+pre-flag cached rows carry the bar time even though the factory never
+checked it.
+
+FIX: _apply_investability_gate now runs the SAME pure-math check at
+boundary time. Immediately after the warns snapshot: if the gate flag is
+on, the row has no `price_bar_stale` tag yet, is not fallback-priced
+(`price_unverified_live` absent - Fix AQ's jurisdiction), has a current
+price and a provider that is not history/snapshot, then _bar_age_check
+runs on the row itself. A hit appends the standard
+`price_bar_stale:<date>:<lag>s` tag (persisting on the cached dict, so it
+fires once and is idempotent thereafter) and refreshes the local `warns`
+snapshot - the EXISTING v5.104.0 reliability penalty and demotion tiers
+below then fire unchanged. No fetch happens at boundary (healing stays a
+factory concern - Fix AR-2); a cached stale row is BLOCKED, not silently
+re-priced. Gate flag off -> the block is skipped entirely; v5.105.0
+byte-identical.
 
 WHY v5.105.0 - BAR-AGE PROVIDER FAILOVER (Fix AR-2; env-gated
 TFB_BAR_AGE_FAILOVER, DEFAULT OFF; requires the Fix AR gate flag too -
@@ -2320,7 +2352,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.105.0"
+__version__ = "5.106.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4655,6 +4687,31 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
     rec = _canonical_recommendation(row.get("recommendation_detailed")) \
         or _canonical_recommendation(row.get("recommendation"))
     warns = _safe_str(row.get("warnings")).lower()
+
+    # -- v5.106.0 (Fix AR-3): boundary-time bar-age enforcement ---------------
+    # The factory check cannot reach rows cached before the flag was armed
+    # (live case: 1211.SR at 58.90, DQ=100, hours after arming). The cached
+    # row already carries price_bar_ts, so the same pure-math check runs
+    # HERE: a hit appends the standard tag (persisted on the cached dict ->
+    # idempotent) and refreshes the local warns snapshot so the existing
+    # v5.104.0 penalty + demotion tiers below fire unchanged. Fallback-priced
+    # rows (price_unverified_live) stay Fix AQ's jurisdiction; history/
+    # snapshot providers are skipped for the same reason. No fetch happens
+    # at boundary - healing remains a factory concern (Fix AR-2).
+    if (
+        _bar_age_gate_enabled()
+        and "price_bar_stale" not in warns
+        and "price_unverified_live" not in warns
+        and _as_float(row.get("current_price")) is not None
+        and _safe_str(row.get("data_provider")).strip().lower()
+            not in {"history", "snapshot", "history_or_fallback"}
+    ):
+        _ar3_hit = _bar_age_check(_safe_str(row.get("symbol")), row)
+        if _ar3_hit is not None:
+            _aq_append_warning(
+                row, "price_bar_stale:%s:%ds" % (_ar3_hit[0], _ar3_hit[1])
+            )
+            warns = _safe_str(row.get("warnings")).lower()
 
     # v5.79.1: debt_to_equity + free_cash_flow are only meaningful for company
     # equities. For ETFs, funds, commodities, FX, and indices they are N/A, so
