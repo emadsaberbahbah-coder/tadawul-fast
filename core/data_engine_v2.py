@@ -2,8 +2,32 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.106.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.107.0
 ================================================================================
+
+WHY v5.107.0 - PRICE-DELIVERER PROVENANCE ATTRIBUTION (Fix AT; env-gated
+kill switch TFB_PROVIDER_ATTRIBUTION_FIX, DEFAULT ON)
+--------------------------------------------------------------------------
+ROOT CAUSE (live 2026-07-06, Market_Leaders export vs Render probe): the
+factory loop stamps `data_provider` via setdefault on the FIRST provider
+whose canonical patch merged ANYTHING - including a priceless error shell.
+The KSA-blocked EODHD path returns exactly such a shell (symbol + error +
+warnings, no price), so it claims the provenance label, then Yahoo delivers
+the actual price and setdefault refuses to correct the name. Live receipt:
+1120.SR shown on the sheet as provider "eodhd" @ 60.97 while the SAME
+symbol on the quote probe priced 65.65 via yahoo_chart - the KSA guard was
+working the whole time; the LABEL was lying. This mislabel also poisoned
+the audit trail (a suspected "KSA routing bypass" that never existed) and
+misroutes any downstream logic keyed on data_provider.
+FIX: attribute `data_provider` to the provider whose merge DELIVERED the
+price - the setdefault fires only when data_provider is still unset AND
+current_price became non-null. Priceless contributors (fundamentals-only
+patches, error shells) no longer claim the row; the history/snapshot
+fallback labels below are untouched (they still setdefault when no live
+provider priced the row). Rows that NEVER obtain a price now show a blank
+provider instead of a false one - more honest, and exactly what the
+diagnostics should see. KILL SWITCH: TFB_PROVIDER_ATTRIBUTION_FIX=0
+restores the v5.106.0 first-toucher stamping byte-identically.
 
 WHY v5.106.0 - BOUNDARY-TIME BAR-AGE ENFORCEMENT (Fix AR-3; SAME env flag
 as Fix AR - TFB_GATE_PROVIDER_BAR_AGE - no new switch; this is the same
@@ -2352,7 +2376,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.106.0"
+__version__ = "5.107.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -8011,6 +8035,13 @@ def _bar_age_max_sessions() -> int:
     return max(0, min(30, v))
 
 
+def _provider_attribution_fix_enabled() -> bool:
+    """v5.107.0 (Fix AT): attribute data_provider to the price deliverer,
+    not the first patch-toucher. DEFAULT ON; TFB_PROVIDER_ATTRIBUTION_FIX=0
+    restores v5.106.0 first-toucher stamping byte-identically."""
+    return (os.getenv("TFB_PROVIDER_ATTRIBUTION_FIX") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
 def _bar_age_failover_enabled() -> bool:
     """v5.105.0 (Fix AR-2) switch. DEFAULT OFF; set TFB_BAR_AGE_FAILOVER=1
     to let a gate-tripped row try the remaining providers for a fresh bar
@@ -11852,7 +11883,19 @@ class DataEngineV5:
                     patch, requested_symbol=sym, normalized_symbol=sym, provider=provider_name,
                 )
                 merged = self._merge(merged, canon_patch)
-                merged.setdefault("data_provider", provider_name)
+                # v5.107.0 (Fix AT): the provenance label belongs to the
+                # provider that DELIVERED the price. A priceless error shell
+                # (KSA-blocked EODHD) must not claim a row Yahoo later prices
+                # (live: 1120.SR labeled "eodhd" @ 60.97 while yahoo_chart
+                # supplied 65.65). Kill switch restores first-toucher stamping.
+                if _provider_attribution_fix_enabled():
+                    if (
+                        not _safe_str(merged.get("data_provider")).strip()
+                        and _as_float(merged.get("current_price")) is not None
+                    ):
+                        merged["data_provider"] = provider_name
+                else:
+                    merged.setdefault("data_provider", provider_name)
                 if _as_float(merged.get("current_price")) is not None:
                     break
 
