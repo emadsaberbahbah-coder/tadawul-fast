@@ -2,8 +2,40 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.110.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.111.0
 ================================================================================
+
+WHY v5.111.0 - FINAL-ACTION BOUNDARY INVARIANT (Fix AW)
+--------------------------------------------------------------------------
+Live registry gate FAIL 2026-07-07 (run #2275): 4 Global_Markets rows
+(LPG.US, MRP.US, PINS, MOS) served final_action=INVEST on an engine SELL
+recommendation with EMPTY block_reason, while 1,758 sibling SELL rows were
+correctly vetoed. Forensics: at _apply_investability_gate time these rows
+read as BUY-family with non-negative ROI; a later write replaced
+recommendation/forecast with SELL/negative WITHOUT re-deriving the verdict
+— and the same workbook shows 94.7% of GM names transposed at constant
+25-multiple row offsets, proving the sheet-side chunk writer can layer two
+different rows' fields into one (the root defect lives in the .gs and is
+fixed there). The engine's duty is to make the INVEST-on-SELL state
+STRUCTURALLY unrepresentable at every exit, whatever upstream does.
+
+AW: _apply_analyst_trend_block — already executed at every boundary
+(factory end, cache-hit return, projection) — now enforces the invariant
+as its last act (TFB_FINAL_ACTION_INVARIANT, default ON: it enforces the
+registry-documented control gate.no_invest_on_sell_reco that failed in
+production today; =0 restores v5.110.0 byte-identically). When
+recommendation is in _TOP10_EXCLUDED_RECO_FAMILIES yet final_action reads
+INVEST: verdict is rewritten to WATCHLIST / DO_NOT_INVEST with block_reason
+"Engine recommends <rec> (final-boundary invariant)", the row is tagged
+final_action_invariant_applied, an observable WARNING logs symbol + prior
+state (telemetry to identify the true flipper in production), and when the
+provider rating direction opposes the SELL-family engine call while
+provider_engine_conflict still reads FALSE, the conflict pair is corrected
+to TRUE / "Direction". Idempotent (second pass is a no-op); non-violating
+rows byte-identical; never promotes.
+
+Version: __version__ = "5.111.0". All prior WHYs preserved verbatim.
+Zero functions removed (AST-verified).
 
 WHY v5.110.0 - FIREWALL COMPLETION: YAHOO SIDE-BAND + ENGINE COHERENCE
                 (Fixes AU-1b / AV)
@@ -2542,7 +2574,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.110.0"
+__version__ = "5.111.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -8366,6 +8398,53 @@ def _engine_apply_price_coherence(merged: Dict[str, Any]) -> Optional[str]:
     return "previous_close_incoherent_dropped:engine"
 
 
+def _final_action_invariant_enabled() -> bool:
+    """v5.111.0 (Fix AW): final-boundary INVEST-on-SELL invariant. Default
+    ON (enforces the registry-documented gate.no_invest_on_sell_reco that
+    failed live on 2026-07-07); TFB_FINAL_ACTION_INVARIANT=0 restores
+    v5.110.0 byte-identically."""
+    return os.getenv("TFB_FINAL_ACTION_INVARIANT", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _enforce_final_action_invariant(row: Dict[str, Any]) -> None:
+    """v5.111.0 (Fix AW): make final_action=INVEST on a SELL-family
+    recommendation unrepresentable at every boundary. Rewrites verdict,
+    writes/append block_reason, tags the row, corrects an obviously wrong
+    conflict pair, and logs prior state as flipper telemetry. Idempotent;
+    never promotes; fail-open on any anomaly."""
+    if not isinstance(row, dict) or not _final_action_invariant_enabled():
+        return
+    rec = _safe_str(row.get("recommendation")).strip().upper()
+    action = _safe_str(row.get("final_action")).strip().upper()
+    if action != "INVEST" or rec not in _TOP10_EXCLUDED_RECO_FAMILIES:
+        return
+    prior_status = _safe_str(row.get("investability_status"))
+    try:  # telemetry must never block enforcement
+        logger.warning(
+            "[engine_v2 v%s AW] final-boundary invariant fired: %s rec=%s had final_action=INVEST (status=%s, reco_source=%s) — demoted",
+            __version__, _safe_str(row.get("symbol") or row.get("requested_symbol"), "?"),
+            rec, prior_status, _safe_str(row.get("recommendation_source")),
+        )
+    except Exception:
+        pass
+    row["investability_status"] = "WATCHLIST"
+    row["final_action"] = "DO_NOT_INVEST"
+    _aw_reason = "Engine recommends %s (final-boundary invariant)" % rec
+    _aw_prev = _safe_str(row.get("block_reason")).strip()
+    row["block_reason"] = (_aw_prev + " | " + _aw_reason) if _aw_prev else _aw_reason
+    _aq_append_warning(row, "final_action_invariant_applied")
+    # conflict-pair correction: provider pushing ADD against an engine
+    # SELL-family call cannot honestly read FALSE/Aligned.
+    try:
+        _aw_dir = _provider_rating_direction(row.get("provider_rating"))
+    except Exception:
+        _aw_dir = None
+    if _aw_dir == "BULLISH" and _safe_str(row.get("provider_engine_conflict")).strip().upper() in ("FALSE", ""):
+        row["provider_engine_conflict"] = "TRUE"
+        if not _safe_str(row.get("conflict_type")).strip() or _safe_str(row.get("conflict_type")).strip().lower() == "aligned":
+            row["conflict_type"] = "Direction"
+
+
 def _provider_attribution_fix_enabled() -> bool:
     """v5.107.0 (Fix AT): attribute data_provider to the price deliverer,
     not the first patch-toucher. DEFAULT ON; TFB_PROVIDER_ATTRIBUTION_FIX=0
@@ -10182,6 +10261,13 @@ def _apply_analyst_trend_block(row: Dict[str, Any]) -> None:
     key-name variant still lands; the canonical projection strips whichever
     names the sheet spec does not list. Idempotent: a second pass over a
     completed row changes nothing."""
+    # v5.111.0 (Fix AW): FIRST act at every boundary (before any early
+    # return in this function) — enforce the INVEST-on-SELL invariant.
+    # This function is the one guaranteed executor on factory-end,
+    # cache-hit and projection paths, which is exactly why the invariant
+    # lives here (see the v5.111.0 WHY).
+    _enforce_final_action_invariant(row)
+
     if not _analyst_trend_block_enabled():
         return
     if not isinstance(row, dict):
@@ -10293,6 +10379,7 @@ def _apply_analyst_trend_block(row: Dict[str, Any]) -> None:
 
     if touched:
         _v573_append_warning(row, "analyst_trend_block_applied")
+
 
 
 def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
