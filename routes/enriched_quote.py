@@ -130,7 +130,44 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "8.4.0"
+ROUTER_VERSION = "8.5.0"
+
+def _pair_rows_to_symbols(symbols, rows):
+    """v8.5.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
+    requested symbols by each row's OWN declared symbol — NEVER by position.
+    WHY: the previous positional zip stamped Symbol=X onto row-Y's full payload
+    whenever the engine list came back shorter, reordered, or universe-shaped.
+    Live evidence (workbook export v31): 94.7% of Global_Markets names foreign,
+    whole 25-row response blocks sitting under other batches' symbols at
+    constant offsets — rows born crossed at exactly this pairing. A row that
+    does not declare a symbol is never guessed; its requested symbol is
+    returned in `unmatched` so the caller's per-symbol fallback (or the sync's
+    symbol-persistence) covers it honestly. Returns (mapping, unmatched)."""
+    want = {}
+    order = []
+    for s in symbols or []:
+        t = str(s or "").strip().upper()
+        if t and t not in want:
+            want[t] = s
+            order.append(t)
+    by_sym = {}
+    for r in rows or []:
+        if not isinstance(r, Mapping):
+            continue
+        raw = r.get("symbol") or r.get("requested_symbol") or r.get("Symbol") or r.get("ticker")
+        t = str(raw or "").strip().upper()
+        if t and t in want and t not in by_sym:
+            by_sym[t] = r
+    out = {}
+    unmatched = []
+    for t in order:
+        if t in by_sym:
+            out[want[t]] = by_sym[t]
+        else:
+            unmatched.append(want[t])
+    return out, unmatched
+
+
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
@@ -1483,14 +1520,26 @@ async def _fetch_analysis_rows(
                         diagnostic["engine_method_summary"].append({"method": method, "outcome": "success_nested_dict"})
                         return out, diagnostic
                 if isinstance(data, list):
-                    out = {s: (dict(r) if isinstance(r, Mapping) else {"symbol": s, "value": r}) for s, r in zip(symbols, data)}
+                    _paired, _unpaired = _pair_rows_to_symbols(symbols, data)
+                    if _unpaired:
+                        logger.warning(
+                            "[enriched_quote v%s] TRANSPOSITION FIREWALL: engine.%s returned %d row(s) for %d symbol(s); %d unmatched fall to per-symbol/persistence: %r",
+                            ROUTER_VERSION, method, len(data), len(symbols), len(_unpaired), _unpaired[:8],
+                        )
+                    out = {s: dict(r) for s, r in _paired.items()}
                     if out:
                         diagnostic["engine_method_used"] = method
                         diagnostic["engine_method_summary"].append({"method": method, "outcome": "success_nested_list"})
                         return out, diagnostic
                 method_outcome = "empty_mapping"
             elif isinstance(res, list):
-                out = {s: (dict(r) if isinstance(r, Mapping) else {"symbol": s, "value": r}) for s, r in zip(symbols, res)}
+                _paired, _unpaired = _pair_rows_to_symbols(symbols, res)
+                if _unpaired:
+                    logger.warning(
+                        "[enriched_quote v%s] TRANSPOSITION FIREWALL: engine.%s returned %d row(s) for %d symbol(s); %d unmatched fall to per-symbol/persistence: %r",
+                        ROUTER_VERSION, method, len(res), len(symbols), len(_unpaired), _unpaired[:8],
+                    )
+                out = {s: dict(r) for s, r in _paired.items()}
                 if out:
                     diagnostic["engine_method_used"] = method
                     diagnostic["engine_method_summary"].append({"method": method, "outcome": "success_list"})
