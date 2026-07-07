@@ -3,7 +3,7 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.20.0
+Top 10 Selector — v4.21.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
@@ -22,6 +22,63 @@ RANK-INTEGRITY GUARANTEED • SECTOR-DIVERSIFIED (v4.18.0)
 BUDGET-GRACEFUL • DE-CLAMPED TIMEOUTS • COVERAGE-AUDITED
 ENRICHMENT-PROJECTION GUARANTEED (v4.19.0)
 SECTOR-TAXONOMY UNIFIED · YAHOO->GICS CAP CANON (v4.20.0)
+SELECTION-STABILITY LAYER · MEMBERSHIP HYSTERESIS · DAY-KEYED (v4.21.0)
+
+================================================================================
+What v4.21.0 fixes/adds (over v4.20.0)  --  SELECTION-STABILITY LAYER
+================================================================================
+OPERATOR FINDING (Emad, 2026-07-07): the Top-10 reshuffles intraday and day to
+day; a list that churns cannot be traded without constant sell/buy round-trips.
+Root causes: (a) scores cluster near the cutoff, so tiny price moves flip ranks
+8-14; (b) every build was memoryless -- the selector re-decided membership from
+scratch each run.
+
+FIX: an OPT-IN membership-hysteresis layer applied AFTER the four-pool fill and
+BEFORE projection. Engaged ONLY when the caller passes `stability_state` (a
+mapping or JSON string; `{}` bootstraps) and/or a `stability` config mapping in
+the request body -- with neither present the build is BYTE-IDENTICAL to v4.20.0
+(no new columns, no meta keys, no behavior change). No new ENV vars.
+
+Rules (all knobs operator-tunable via `stability`: confirm_days=3, exit_days=3,
+rank_buffer=15, smooth_days=5):
+  - ENTRY CONFIRMATION: a challenger must appear in the RAW fill result on
+    `confirm_days` consecutive days before it may take a seat; until then it is
+    reported in meta.stability.audit.pending (for the NEAR-MISS zone).
+  - EXIT GRACE: an incumbent leaves only after missing the raw result on
+    `exit_days` consecutive days ("GRACE n/m missed" while holding).
+  - RANK-JITTER IMMUNITY: a day an incumbent misses the raw top-N but still
+    ranks <= rank_buffer across ALL pools does NOT count against it (the grace
+    counter pauses; it does not reset).
+  - DISPLACEMENT: with seats full, a CONFIRMED challenger replaces the weakest
+    incumbent only when its SMOOTHED score is higher — persistent superiority
+    displaces; noise never does. Fast-track fills never displace.
+  - HARD EXIT: a symbol absent from ALL pools (gated / SELL-class / dropped
+    upstream) exits IMMEDIATELY -- safety verdicts are never grace-held.
+  - CAPACITY EXIT: if `limit` shrinks, the lowest-smoothed incumbents beyond
+    the new seat count exit (audited as exited_capacity).
+  - FAST-TRACK FILL: empty seats (bootstrap / mass exits) fill from today's
+    raw order so the sheet never under-fills; flagged "FAST-TRACK".
+  - SMOOTHING & ORDER: members are ordered by the mean of the last
+    `smooth_days` daily composite points (score_smoothed); top10_rank therefore
+    follows the SMOOTHED order, not the instantaneous one.
+  - DAY-KEYED COUNTERS: all counters advance at most once per UTC date;
+    same-day re-runs refresh the day's score point and re-evaluate seating but
+    cannot advance confirmation/exit clocks -- intraday churn is structurally
+    removed (fast-track seat-fills and hard exits remain live intraday, by
+    design).
+State is round-tripped: the updated blob is returned in
+meta.stability.state; the caller (16_Decision_Top10.gs) persists it and posts
+it back on the next refresh. State is self-pruning (non-members idle >14 days
+drop; hard cap 400 symbols).
+Output columns (appended to headers/keys ONLY when engaged, mirroring the
+v4.17.0 gate-append pattern; `stability_keys_appended` echoed in meta):
+  Stability Status | Days In List | Entry Date | Score Smoothed |
+  Stability Trend.
+HONEST FRAMING: this improves ACTIONABILITY (turnover, entry timing, whipsaw
+resistance). It does NOT improve 12M forecast accuracy and claims nothing of
+the sort -- forecast quality remains gated on Performance_Log cohort maturity.
+Additive: five new pure functions + one constants block; no functions removed;
+no signatures changed; all v4.20.0 WHY blocks carried verbatim.
 
 ================================================================================
 What v4.20.0 fixes/adds (over v4.19.0)  --  A2: SECTOR-TAXONOMY UNIFICATION
@@ -483,6 +540,7 @@ established header convention.]
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import importlib
 import inspect
 import json
@@ -499,7 +557,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.20.0"
+TOP10_SELECTOR_VERSION = "4.21.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1002,6 +1060,48 @@ def _ensure_gate_output_keys(headers: List[str], keys: List[str]) -> Tuple[List[
     have = {_s(k).strip().lower() for k in ks}
     appended = 0
     for k, h in GATE_OUTPUT_KEY_HEADERS.items():
+        if k not in have:
+            ks.append(k)
+            hs.append(h)
+            appended += 1
+    return hs, ks, appended
+
+
+# =============================================================================
+# v4.21.0 — SELECTION STABILITY LAYER (membership hysteresis) — constants.
+# OPT-IN: engaged only when the request body carries `stability_state` and/or
+# a `stability` config mapping; with neither present, every code path below
+# is unreachable and the build is byte-identical to v4.20.0. No ENV vars.
+# =============================================================================
+STABILITY_OUTPUT_KEY_HEADERS: "OrderedDict[str, str]" = OrderedDict(
+    (
+        ("stability_status", "Stability Status"),
+        ("days_in_list", "Days In List"),
+        ("entry_date", "Entry Date"),
+        ("score_smoothed", "Score Smoothed"),
+        ("stability_trend", "Stability Trend"),
+    )
+)
+STABILITY_STATE_VERSION = 1
+STABILITY_DEFAULT_CONFIRM_DAYS = 3   # consecutive qualifying days before ENTRY
+STABILITY_DEFAULT_EXIT_DAYS = 3      # consecutive missed days before soft EXIT
+STABILITY_DEFAULT_RANK_BUFFER = 15   # all-pool rank <= buffer pauses the exit clock
+STABILITY_DEFAULT_SMOOTH_DAYS = 5    # score-history window for smoothing/order
+STABILITY_PRUNE_AFTER_DAYS = 14      # drop non-member state entries unseen this long
+STABILITY_MAX_STATE_SYMBOLS = 400    # hard state-size cap (members always kept)
+STABILITY_TREND_EPS = 2.0            # composite points; |delta| below = "steady"
+
+
+def _ensure_stability_output_keys(headers: List[str], keys: List[str]) -> Tuple[List[str], List[str], int]:
+    """v4.21.0: append the stability output columns (engaged builds only).
+
+    Mirrors _ensure_gate_output_keys byte-for-byte in behavior: additive,
+    order-preserving, never raises, no-op for keys already present.
+    """
+    hs, ks = list(headers or []), list(keys or [])
+    have = {_s(k).strip().lower() for k in ks}
+    appended = 0
+    for k, h in STABILITY_OUTPUT_KEY_HEADERS.items():
         if k not in have:
             ks.append(k)
             hs.append(h)
@@ -3759,6 +3859,384 @@ def _fill_top10_selection(
     return selected, fill_meta
 
 
+# =============================================================================
+# v4.21.0 — SELECTION STABILITY LAYER (membership hysteresis) — engine.
+# Pure functions: no I/O, no ENV, no engine access. See the banner WHY block
+# for the full rule set. All are unreachable unless the caller opted in.
+# =============================================================================
+def _stability_today_key() -> str:
+    """UTC calendar date key — counters advance at most once per key."""
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _stability_days_between(a: str, b: str) -> int:
+    """Whole days from ISO date `a` to ISO date `b` (floor 0; never raises)."""
+    try:
+        da = _dt.date.fromisoformat(_s(a).strip())
+        db = _dt.date.fromisoformat(_s(b).strip())
+        return max(0, (db - da).days)
+    except Exception:
+        return 0
+
+
+def _stability_knobs(criteria: Mapping[str, Any]) -> Optional[Dict[str, int]]:
+    """Return the clamped knob set when the caller opted in; else None.
+
+    Engagement = `stability_state` present (any value; ''/{} bootstraps) OR a
+    non-empty `stability` mapping. An explicit stability.enabled=false always
+    disengages (kill switch without removing the state blob).
+    """
+    raw_state = criteria.get("stability_state")
+    cfg_raw = criteria.get("stability")
+    cfg: Dict[str, Any] = dict(cfg_raw) if isinstance(cfg_raw, Mapping) else {}
+    if raw_state is None and not cfg:
+        return None
+    if "enabled" in cfg and not _coerce_bool(cfg.get("enabled"), True):
+        return None
+
+    def _k(name: str, default: int, lo: int, hi: int) -> int:
+        return max(lo, min(hi, _safe_int(cfg.get(name), default)))
+
+    return {
+        "confirm_days": _k("confirm_days", STABILITY_DEFAULT_CONFIRM_DAYS, 1, 30),
+        "exit_days": _k("exit_days", STABILITY_DEFAULT_EXIT_DAYS, 1, 30),
+        "rank_buffer": _k("rank_buffer", STABILITY_DEFAULT_RANK_BUFFER, 0, 500),
+        "smooth_days": _k("smooth_days", STABILITY_DEFAULT_SMOOTH_DAYS, 1, 30),
+    }
+
+
+def _stability_parse_state(raw: Any) -> Dict[str, Any]:
+    """Sanitize a caller-supplied state blob (mapping or JSON string).
+
+    Unknown shapes degrade to an empty state; never raises. Per-symbol fields:
+    ci (consecutive qualifying days), co (consecutive missed days, members),
+    member, since (entry ISO date), ls (last seen ISO date), hist (score pts).
+    """
+    obj: Any = raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s:
+            try:
+                obj = json.loads(s)
+            except Exception:
+                obj = {}
+        else:
+            obj = {}
+    if not isinstance(obj, Mapping):
+        obj = {}
+    out: Dict[str, Any] = {"v": STABILITY_STATE_VERSION, "date": _s(obj.get("date")).strip(), "symbols": {}}
+    syms = obj.get("symbols")
+    if isinstance(syms, Mapping):
+        for k, v in syms.items():
+            sym = _normalize_symbol(k)
+            if not sym or not isinstance(v, Mapping):
+                continue
+            hist: List[float] = []
+            hist_raw = v.get("hist")
+            if isinstance(hist_raw, (list, tuple)):
+                for h in hist_raw:
+                    f = _safe_float(h, None)
+                    if f is not None:
+                        hist.append(round(f, 4))
+            out["symbols"][sym] = {
+                "ci": max(0, _safe_int(v.get("ci"), 0)),
+                "co": max(0, _safe_int(v.get("co"), 0)),
+                "member": _coerce_bool(v.get("member"), False),
+                "since": _s(v.get("since")).strip(),
+                "ls": _s(v.get("ls")).strip(),
+                "hist": hist[-30:],
+            }
+    return out
+
+
+def _apply_selection_stability(
+    *,
+    raw_selected: Sequence[Dict[str, Any]],
+    pools: Sequence[Sequence[Tuple[float, Dict[str, Any]]]],
+    criteria: Mapping[str, Any],
+    knobs: Mapping[str, int],
+    limit: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Apply membership hysteresis to today's raw fill result.
+
+    `raw_selected` = _fill_top10_selection output (today's memoryless answer);
+    `pools` = the four pre-sorted pools (defines the all-pool global rank used
+    by the rank buffer, and supplies row objects for grace-held incumbents).
+    Returns (stable_rows, stability_meta); stability_meta["state"] is the
+    updated blob the caller must persist and post back next run.
+    """
+    today = _stability_today_key()
+    state = _stability_parse_state(criteria.get("stability_state"))
+    prev_date = state.get("date") or ""
+    day_advance = prev_date != today  # first-ever run (blank prev) also advances
+    symbols: Dict[str, Dict[str, Any]] = state["symbols"]
+    limit = max(1, int(limit))
+
+    # ---- all-pool row map + global rank (fill order = quality order) --------
+    sym2row: Dict[str, Dict[str, Any]] = {}
+    global_rank: Dict[str, int] = {}
+    rank = 0
+    for pool in pools:
+        for _score, row in pool:
+            sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
+            if not sym or sym in sym2row:
+                continue
+            rank += 1
+            sym2row[sym] = row
+            global_rank[sym] = rank
+
+    raw_syms: List[str] = []
+    raw_by_sym: Dict[str, Dict[str, Any]] = {}
+    for row in raw_selected:
+        sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
+        if sym and sym not in raw_by_sym:
+            raw_syms.append(sym)
+            raw_by_sym[sym] = row
+    raw_set = frozenset(raw_syms)
+
+    def _score_of(sym: str) -> Optional[float]:
+        row = raw_by_sym.get(sym) or sym2row.get(sym)
+        if row is None:
+            return None
+        v = _safe_float(row.get("overall_score"), None)
+        if v is None:
+            v = _safe_float(row.get("opportunity_score"), None)
+        return v
+
+    # ---- counter pass (day-keyed) -------------------------------------------
+    smooth_days = max(1, _safe_int(knobs.get("smooth_days"), STABILITY_DEFAULT_SMOOTH_DAYS))
+    rank_buffer = max(0, _safe_int(knobs.get("rank_buffer"), STABILITY_DEFAULT_RANK_BUFFER))
+    for sym in set(symbols) | raw_set:
+        st = symbols.get(sym)
+        if st is None:
+            st = {"ci": 0, "co": 0, "member": False, "since": "", "ls": "", "hist": []}
+            symbols[sym] = st
+        sc = _score_of(sym)
+        if day_advance:
+            if sym in raw_set:
+                st["ci"] = _safe_int(st.get("ci"), 0) + 1
+                st["co"] = 0
+            else:
+                st["ci"] = 0
+                if st.get("member"):
+                    r = global_rank.get(sym)
+                    within_buffer = rank_buffer > 0 and r is not None and r <= rank_buffer
+                    if not within_buffer:
+                        st["co"] = _safe_int(st.get("co"), 0) + 1
+                    # within buffer: rank-jitter immunity — the exit clock
+                    # PAUSES for the day (it does not reset).
+            if sc is not None:
+                hist = st.setdefault("hist", [])
+                hist.append(round(sc, 4))
+        else:
+            # Same-day re-run: clocks frozen; refresh the day's score point.
+            if sc is not None:
+                hist = st.setdefault("hist", [])
+                if hist:
+                    hist[-1] = round(sc, 4)
+                else:
+                    hist.append(round(sc, 4))
+        st["hist"] = (st.get("hist") or [])[-smooth_days:]
+        if sym in sym2row:
+            st["ls"] = today
+
+    # ---- membership pass ------------------------------------------------------
+    exited_hard: List[str] = []
+    exited_soft: List[str] = []
+    exited_capacity: List[str] = []
+    survivors: List[str] = []
+    for sym in [s for s, st in symbols.items() if st.get("member")]:
+        st = symbols[sym]
+        if sym not in sym2row:
+            # HARD EXIT: absent from every pool (gated / SELL-class / dropped
+            # upstream). Safety verdicts are never grace-held.
+            st["member"] = False
+            st["ci"] = 0
+            st["co"] = 0
+            exited_hard.append(sym)
+            continue
+        if _safe_int(st.get("co"), 0) >= _safe_int(knobs.get("exit_days"), STABILITY_DEFAULT_EXIT_DAYS):
+            st["member"] = False
+            st["ci"] = 0
+            st["co"] = 0
+            exited_soft.append(sym)
+            continue
+        survivors.append(sym)
+
+    def _smoothed(sym: str) -> float:
+        hist = symbols.get(sym, {}).get("hist") or []
+        if hist:
+            return sum(hist) / float(len(hist))
+        sc = _score_of(sym)
+        return sc if sc is not None else 0.0
+
+    raw_index = {s: i for i, s in enumerate(raw_syms)}
+    survivors.sort(key=lambda s: (-_smoothed(s), raw_index.get(s, 10 ** 6), global_rank.get(s, 10 ** 6)))
+    if len(survivors) > limit:
+        for sym in survivors[limit:]:
+            st = symbols[sym]
+            st["member"] = False
+            st["ci"] = 0
+            st["co"] = 0
+            exited_capacity.append(sym)
+        survivors = survivors[:limit]
+
+    final: List[str] = list(survivors)
+    entered: List[str] = []
+    exited_displaced: List[str] = []
+    fast_tracked: List[str] = []
+    confirm_days = _safe_int(knobs.get("confirm_days"), STABILITY_DEFAULT_CONFIRM_DAYS)
+    for sym in raw_syms:  # confirmed challengers, today's quality order
+        if sym in final:
+            continue
+        if _safe_int(symbols[sym].get("ci"), 0) < confirm_days:
+            continue
+        if len(final) < limit:
+            entered.append(sym)
+            final.append(sym)
+            continue
+        # DISPLACEMENT: seats full — a CONFIRMED challenger (persistent, not
+        # jitter) may replace the weakest incumbent it beats on the SMOOTHED
+        # score. Grace/buffer protect against noise, not against a
+        # demonstrably better replacement. Fast-track never displaces.
+        weakest = final[-1] if final else None
+        if weakest is not None and _smoothed(sym) > _smoothed(weakest):
+            final.pop()
+            st_w = symbols[weakest]
+            st_w["member"] = False
+            st_w["ci"] = 0
+            st_w["co"] = 0
+            exited_displaced.append(weakest)
+            entered.append(sym)
+            # keep `final` ordered: insert by smoothed among current members
+            final.append(sym)
+            final.sort(key=lambda s: (-_smoothed(s), raw_index.get(s, 10 ** 6), global_rank.get(s, 10 ** 6)))
+    for sym in raw_syms:  # fast-track fill: the sheet never under-fills
+        if len(final) >= limit:
+            break
+        if sym in final:
+            continue
+        fast_tracked.append(sym)
+        final.append(sym)
+
+    pending: List[Dict[str, Any]] = []
+    for sym in raw_syms:
+        st = symbols[sym]
+        if sym not in final and not st.get("member"):
+            pending.append({
+                "symbol": sym,
+                "confirmed_days": _safe_int(st.get("ci"), 0),
+                "required_days": confirm_days,
+            })
+
+    held_by_grace: List[Dict[str, Any]] = []
+    for sym in final:
+        st = symbols[sym]
+        if not st.get("member"):
+            st["member"] = True
+            st["since"] = today
+            st["co"] = 0
+        elif not st.get("since"):
+            st["since"] = today
+        if sym not in raw_set or _safe_int(st.get("co"), 0) > 0:
+            held_by_grace.append({
+                "symbol": sym,
+                "missed_days": _safe_int(st.get("co"), 0),
+                "exit_days": _safe_int(knobs.get("exit_days"), STABILITY_DEFAULT_EXIT_DAYS),
+                "all_pool_rank": global_rank.get(sym),
+            })
+
+    # ---- output rows (stability columns stamped; projection carries them) ---
+    exit_days = _safe_int(knobs.get("exit_days"), STABILITY_DEFAULT_EXIT_DAYS)
+    out_rows: List[Dict[str, Any]] = []
+    for sym in final:
+        src = raw_by_sym.get(sym) or sym2row.get(sym)
+        if src is None:  # structurally unreachable (final ⊆ sym2row); belt+braces
+            continue
+        row = dict(src)
+        st = symbols[sym]
+        hist = st.get("hist") or []
+        smoothed = round(sum(hist) / float(len(hist)), 2) if hist else None
+        if len(hist) >= 2:
+            delta = hist[-1] - hist[0]
+            if delta >= STABILITY_TREND_EPS:
+                trend = "improving"
+            elif delta <= -STABILITY_TREND_EPS:
+                trend = "declining"
+            else:
+                trend = "steady"
+        else:
+            trend = "n/a"
+        since = _s(st.get("since")) or today
+        days_in = _stability_days_between(since, today) + 1
+        if sym in fast_tracked:
+            status = "FAST-TRACK (day 1)"
+        elif sym in entered:
+            status = "NEW (confirmed %d/%d)" % (confirm_days, confirm_days)
+        elif sym not in raw_set or _safe_int(st.get("co"), 0) > 0:
+            status = "GRACE (%d/%d missed)" % (_safe_int(st.get("co"), 0), exit_days)
+        else:
+            status = "ACTIVE (day %d)" % days_in
+        row["stability_status"] = status
+        row["days_in_list"] = days_in
+        row["entry_date"] = since
+        row["score_smoothed"] = smoothed
+        row["stability_trend"] = trend
+        out_rows.append(row)
+
+    # ---- state hygiene: prune stale non-members, cap total size --------------
+    pruned = 0
+    for sym in list(symbols):
+        st = symbols[sym]
+        if st.get("member"):
+            continue
+        ls = _s(st.get("ls"))
+        if (not ls) or _stability_days_between(ls, today) > STABILITY_PRUNE_AFTER_DAYS:
+            symbols.pop(sym, None)
+            pruned += 1
+    if len(symbols) > STABILITY_MAX_STATE_SYMBOLS:
+        keep_order = sorted(
+            symbols.items(),
+            key=lambda kv: (not kv[1].get("member"), kv[1].get("ls") or "", kv[0]),
+        )
+        # members first, then most-recently-seen; drop the tail beyond the cap
+        keep_order = keep_order[: len(symbols)]
+        overflow = [k for k, _v in sorted(
+            ((k, v) for k, v in symbols.items() if not v.get("member")),
+            key=lambda kv: (kv[1].get("ls") or "", kv[0]),
+        )]
+        while len(symbols) > STABILITY_MAX_STATE_SYMBOLS and overflow:
+            victim = overflow.pop(0)
+            symbols.pop(victim, None)
+            pruned += 1
+
+    state["date"] = today
+    state["v"] = STABILITY_STATE_VERSION
+
+    stability_meta: Dict[str, Any] = {
+        "enabled": True,
+        "engine_version": TOP10_SELECTOR_VERSION,
+        "date": today,
+        "day_advanced": day_advance,
+        "knobs": dict(knobs),
+        "state": _json_safe(state),
+        "audit": {
+            "raw_top": list(raw_syms),
+            "final_order": list(final),
+            "entered": entered,
+            "fast_tracked": fast_tracked,
+            "exited_hard": exited_hard,
+            "exited_soft": exited_soft,
+            "exited_capacity": exited_capacity,
+            "exited_displaced": exited_displaced,
+            "held_by_grace": held_by_grace,
+            "pending": pending,
+            "state_pruned": pruned,
+        },
+    }
+    return out_rows, stability_meta
+
+
 def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
     include_headers = _coerce_bool(meta.get("include_headers", True), True)
     include_matrix = _coerce_bool(meta.get("include_matrix", True), True)
@@ -3796,6 +4274,13 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         # v4.17.0 [FIX V-1]: guarantee gate output columns survive projection.
         headers, keys, gate_keys_appended = _ensure_gate_output_keys(headers, keys)
         criteria = _collect_criteria_from_inputs(*args, **kwargs)
+        # v4.21.0: SELECTION STABILITY LAYER — opt-in via `stability_state` /
+        # `stability` in the request body. Disengaged (None) => every stability
+        # path below is skipped and the build is byte-identical to v4.20.0.
+        stability_knobs = _stability_knobs(criteria)
+        stability_keys_appended = 0
+        if stability_knobs is not None:
+            headers, keys, stability_keys_appended = _ensure_stability_output_keys(headers, keys)
         mode = _s(kwargs.get("mode") or criteria.get("mode") or "")
         limit = max(1, _safe_int(criteria.get("limit") or kwargs.get("limit"), 10))
         # v4.19.0 [FIX X-1]: internal soft deadline — collection self-budgets
@@ -4021,6 +4506,20 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
         top_rows, fill_meta = _fill_top10_selection((t1_pass, t2_pass, t1_fail, t2_fail), limit)
 
+        # v4.21.0: membership hysteresis over today's memoryless fill result.
+        # Grace-held incumbents re-enter from the pool row map (they still
+        # carry _tier/_criteria_fail, so the W-6 label pass below is intact);
+        # the returned order (smoothed, incumbency-first) becomes top10_rank.
+        stability_meta: Optional[Dict[str, Any]] = None
+        if stability_knobs is not None:
+            top_rows, stability_meta = _apply_selection_stability(
+                raw_selected=top_rows,
+                pools=(t1_pass, t2_pass, t1_fail, t2_fail),
+                criteria=criteria,
+                knobs=stability_knobs,
+                limit=limit,
+            )
+
         # v4.18.0 [FIX W-6] — assemble tier / backfill labels. Internal keys
         # (_tier / _criteria_fail / _tier_label) never reach the sheet:
         # projection copies schema-contract keys only.
@@ -4188,6 +4687,12 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 # zero rows is deliberate (W-2a) — honest over harmful.
                 meta["warning"] = "all_candidates_sell_class"
 
+        # v4.21.0: stability audit surface — engaged builds only, so the
+        # disengaged meta dict stays byte-identical to v4.20.0.
+        if stability_meta is not None:
+            meta["stability"] = stability_meta
+            meta["stability_keys_appended"] = stability_keys_appended
+
         return _build_payload(status=status, headers=headers, keys=keys, rows=projected_rows, meta=meta)
 
     try:
@@ -4313,6 +4818,13 @@ __all__ = [
     "TOP10_FINAL_GATE_ENV",
     "TOP10_FINAL_GATE_ENABLED",
     "GATE_OUTPUT_KEY_HEADERS",
+    # v4.21.0: selection-stability layer surface (opt-in hysteresis).
+    "STABILITY_OUTPUT_KEY_HEADERS",
+    "STABILITY_STATE_VERSION",
+    "STABILITY_DEFAULT_CONFIRM_DAYS",
+    "STABILITY_DEFAULT_EXIT_DAYS",
+    "STABILITY_DEFAULT_RANK_BUFFER",
+    "STABILITY_DEFAULT_SMOOTH_DAYS",
     # v4.18.0 Fix W: golden composite + tier discipline surface.
     "SELL_CLASS_RECOS",
     "TOP10_EXCLUDE_SELL_CLASS_ENABLED",
