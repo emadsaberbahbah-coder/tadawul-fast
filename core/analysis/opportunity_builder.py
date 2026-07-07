@@ -126,6 +126,26 @@ high-priced name (e.g. one share of an 11,000-SAR stock). One new criterion key
 (min_ticket_sar) + one env read + one clamp + one guarded block in
 _select_and_size; every v1.0.13 function carried verbatim, none removed.
 
+v1.0.22 [SECTOR-NORMALIZE DEFAULT ON + TP-LADDER COHERENCE — two fixes.
+FIX 1 (default flip): TFB_OPP_SECTOR_NORMALIZE now defaults ON (=0 is the
+kill switch, byte-identical v1.0.12 buckets). WHY: the v1.0.13 fix exists
+precisely for the live damage class still occurring with it dormant — the
+2026-07-06/07 audits show 5023.SR (sukuk, sector Unknown by nature) blocked
+over_sector_cap 2/2 (Unknown) on the Top_10 funnel: a DATA GAP consumed a
+real diversification slot and barred a fixed-income name for "concentration"
+in a sector that does not exist. Same documented-control rationale as the
+2026-07-07 provider-guard default flips: the control is documented in this
+file's own v1.0.13 WHY, was violated in production, and the switch is
+conservative by construction (the post-action PORTFOLIO weight cap still
+applies to Unknown — real-money concentration remains controlled).
+FIX 2 (TP-COHERENCE): the ticket ladder built TP1/TP2 whenever a reference
+target existed, including a target AT/BELOW price — printing an inverted
+BUY ladder (both TPs under entry) on any candidate whose surviving target
+sits below spot. The ladder now requires ref > price; otherwise TP fields
+stay blank (stop and the signed roi/RR math are untouched — the Forecast
+gate keeps judging the signed truth). ZERO functions added or removed;
+everything else byte-identical to v1.0.21.]
+
 v1.0.13 [DIVERSIFIER SECTOR-QUALITY — env-gated DEFAULT-OFF. Two related
 selection-time corrections behind ONE switch, TFB_OPP_SECTOR_NORMALIZE.
 WHY: the per-sector diversification cap (max_per_sector) buckets on the raw
@@ -151,7 +171,8 @@ action PORTFOLIO weight cap (pf_max_sector_pct) is deliberately left applied to
 "Unknown" — real-money concentration is still controlled. OFF => byte-identical
 v1.0.12 (raw sector strings, Unknown capped as before). Two new defs added
 (_env_sector_normalize, _normalize_sector) + one constant
-(_YAHOO_TO_GICS_SECTOR); all v1.0.12 functions carried verbatim, none removed.]
+(_YAHOO_TO_GICS_SECTOR); all v1.0.12 functions carried verbatim, none removed.
+v1.0.22 ADDENDUM: the default is now ON — see the v1.0.22 WHY at top.]
 
 v1.0.12 [ENGINE-ROI-AUDIT — surface the engine's normalized 12M forecast on
 every candidates_rows audit record via one new field, engine_roi_pct, so the
@@ -523,7 +544,7 @@ from datetime import datetime, timedelta, timezone
 #     longer masquerades as the forecast.
 # KILL SWITCH: leave TFB_OPP_PRIMARY_ROI_BASIS unset (or "valuation") ->
 # byte-identical v1.0.19 payload.
-OPPORTUNITY_BUILDER_VERSION = "1.0.21"
+OPPORTUNITY_BUILDER_VERSION = "1.0.22"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -966,13 +987,14 @@ except Exception:  # pragma: no cover
 
 def _env_sector_normalize():
     """v1.0.13: diversifier sector-quality toggle. Default OFF; set
-    TFB_OPP_SECTOR_NORMALIZE=1 to (a) translate the six differing Yahoo-provider
+    v1.0.22: DEFAULT ON (dormant fix + live 5023.SR damage — see WHY).
+    Set TFB_OPP_SECTOR_NORMALIZE=0 to restore raw buckets; =1 (or unset) to (a) translate the six differing Yahoo-provider
     sector spellings to the GICS vocabulary the map + diversifier bucket on, and
     (b) exempt the "Unknown"/"" data-gap bucket from the per-sector COUNT cap (an
     unknown sector is a data gap, not a real concentration bucket, so two unmapped
     names are not capped as if they were one sector). The post-action PORTFOLIO
     weight cap still applies to "Unknown". OFF => byte-identical v1.0.12."""
-    return str(_env_str("TFB_OPP_SECTOR_NORMALIZE", "0")).strip().lower() in (
+    return str(_env_str("TFB_OPP_SECTOR_NORMALIZE", "1")).strip().lower() in (
         "1", "true", "yes", "on", "enabled", "enable")
 
 
@@ -1358,7 +1380,11 @@ def normalize_candidate(row, fx_rates, criteria):
     stop = tp1 = tp2 = rr = None
     if price:
         stop = price * (1.0 - stop_pct / 100.0)
-        if ref:
+        # v1.0.22 (TP-COHERENCE): a reference target at/below price would
+        # print an inverted BUY ladder (TP1/TP2 under entry). Build the
+        # ladder only for a target strictly above price; otherwise the TP
+        # fields stay blank. Stop and the signed roi/RR math are untouched.
+        if ref and ref > price:
             tp1 = price + 0.5 * (ref - price)
             tp2 = ref
         if roi_pct is not None and stop_pct > 0:
