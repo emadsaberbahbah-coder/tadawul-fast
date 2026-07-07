@@ -2,8 +2,47 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.109.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.110.0
 ================================================================================
+
+WHY v5.110.0 - FIREWALL COMPLETION: YAHOO SIDE-BAND + ENGINE COHERENCE
+                (Fixes AU-1b / AV)
+--------------------------------------------------------------------------
+Live workbook audit 2026-07-07 (export v30): fresh wrong-company names on
+NESR.US / LDI.US / ROG.SW / 0011.HK and a crossed price on 7010.SR proved
+the v5.109.0 AU-1 firewall has a bypass: it sits inside _fetch_patch, but
+the Yahoo enrichment side-band (_fetch_yahoo_fundamentals_patch, feeding
+_apply_yahoo_enrichment_pass) reaches providers through its OWN picker and
+never crosses that choke point. Names entered the sheet through the exact
+lane the firewall does not watch.
+
+AU-1b YAHOO SIDE-BAND FIREWALL (same flag: TFB_ENGINE_IDENTITY_GUARD,
+default OFF). _fetch_yahoo_fundamentals_patch now runs the identical
+declared-identity check (token-set leniency: 0016.HK==16.HK, BRK.B==BRK-B,
+BBD==BBD.US) before returning the patch; conviction requires the declared
+identity to be disjoint from BOTH the canonical requested symbol AND its
+Yahoo-mapped form, so provider-side symbol formatting can never false-drop.
+A definite mismatch returns {} with an observable warning log. Honest
+scope note: _fetch_yahoo_chart_patch returns bare OHLC rows that carry NO
+identity echo, so it CANNOT be guarded here — that leg's defense is the
+provider-side v8.6.0 YC-2 metadata guard (deployed separately); the engine
+does not pretend to verify what the payload does not declare.
+
+AV ENGINE PRICE-COHERENCE TAG (TFB_ENGINE_PRICE_COHERENCE, default OFF;
+thresholds TFB_ENGINE_PRICE_RATIO_HIGH/LOW default 8.0/0.125). Provider-
+agnostic twin of eodhd AS-2, applied to the fully-merged row in the
+factory (after the provider loop, AR-2 failover and AR-5 verification, so
+it sees the row the sheet will see): when current_price and previous_close
+disagree by a unit-class ratio, the previous close and every day-move
+field derived from it (price_change/change/percent_change/change_pct) are
+dropped and the row is tagged previous_close_incoherent_dropped:engine —
+feeding the existing gate/reliability machinery instead of shipping a
+fabricated day move assembled from two instruments. Honest scope: at the
+default thresholds this catches the fils/cents class; the 7010.SR 2.5x
+crossing is caught upstream by identity guards, not by this ratio.
+
+Version: __version__ = "5.110.0". All v5.109.x and earlier WHY blocks
+preserved verbatim below. Zero functions removed (AST-verified).
 
 WHY v5.109.0 - CONTAMINATION FIREWALL (Fixes AU-1 / AU-2 / AU-3)
 --------------------------------------------------------------------------
@@ -2503,7 +2542,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.109.0"
+__version__ = "5.110.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -8281,6 +8320,52 @@ def _engine_patch_identity_mismatch(requested: str, patch: Dict[str, Any]) -> Op
     return declared[0]
 
 
+def _engine_price_coherence_enabled() -> bool:
+    """v5.110.0 (Fix AV): engine-level current_price<->previous_close
+    unit-class coherence tag on the fully-merged row. Default OFF; set
+    TFB_ENGINE_PRICE_COHERENCE=1 to enable."""
+    return os.getenv("TFB_ENGINE_PRICE_COHERENCE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _engine_coh_ratio_high() -> float:
+    try:
+        v = float(os.getenv("TFB_ENGINE_PRICE_RATIO_HIGH", "") or 8.0)
+    except Exception:
+        v = 8.0
+    return v if v > 1.0 else 8.0
+
+
+def _engine_coh_ratio_low() -> float:
+    try:
+        v = float(os.getenv("TFB_ENGINE_PRICE_RATIO_LOW", "") or 0.125)
+    except Exception:
+        v = 0.125
+    return v if 0.0 < v < 1.0 else 0.125
+
+
+def _engine_apply_price_coherence(merged: Dict[str, Any]) -> Optional[str]:
+    """v5.110.0 (Fix AV): when the merged row's current_price and
+    previous_close disagree by a unit-class ratio, drop the previous
+    close and every derived day-move field in place and return the
+    warning tag; else None. Never touches current_price."""
+    if not isinstance(merged, dict):
+        return None
+    cp = _as_float(merged.get("current_price"))
+    prev = _as_float(merged.get("previous_close"))
+    if prev is None:
+        prev = _as_float(merged.get("prev_close"))
+    if cp is None or prev is None or cp <= 0 or prev <= 0:
+        return None
+    ratio = cp / prev
+    if not (ratio >= _engine_coh_ratio_high() or ratio <= _engine_coh_ratio_low()):
+        return None
+    for k in ("previous_close", "prev_close", "price_change", "change",
+              "percent_change", "change_pct"):
+        if k in merged:
+            merged[k] = None
+    return "previous_close_incoherent_dropped:engine"
+
+
 def _provider_attribution_fix_enabled() -> bool:
     """v5.107.0 (Fix AT): attribute data_provider to the price deliverer,
     not the first patch-toucher. DEFAULT ON; TFB_PROVIDER_ATTRIBUTION_FIX=0
@@ -11994,9 +12079,25 @@ class DataEngineV5:
                 __version__, symbol, ysym, exc.__class__.__name__, exc,
             )
             return {}
-        if isinstance(result, dict):
-            return result
-        return _model_to_dict(result)
+        out = result if isinstance(result, dict) else _model_to_dict(result)
+        if not isinstance(out, dict):
+            return {}
+        # v5.110.0 (Fix AU-1b): the side-band that fed crossed NAMES onto
+        # the sheet (live 2026-07-07: NESR.US "Invesco Municipal Trust",
+        # LDI.US "Axalta") bypassed the _fetch_patch firewall entirely.
+        # Same check, same flag; conviction requires the declared identity
+        # to be disjoint from BOTH the canonical symbol AND its
+        # Yahoo-mapped form, so provider-side formatting cannot
+        # false-drop.
+        if _engine_identity_guard_enabled() and out:
+            _au1b_got = _engine_patch_identity_mismatch(symbol, out)
+            if _au1b_got and _engine_patch_identity_mismatch(ysym, out):
+                logger.warning(
+                    "[engine_v2 v%s AU-1b] yahoo fundamentals returned crossed identity for %s (yahoo=%s): declared=%s — patch dropped",
+                    __version__, symbol, ysym, _au1b_got,
+                )
+                return {}
+        return out
 
     async def _fetch_yahoo_chart_patch(self, symbol: str, page: str = "") -> Dict[str, Any]:
         # v5.77.7: pass module basename + drop page arg (see fundamentals patch).
@@ -12294,6 +12395,18 @@ class DataEngineV5:
                 )
                 if _ar5_tag:
                     _aq_append_warning(merged, _ar5_tag)
+
+            # --- v5.110.0 (Fix AV) ENGINE PRICE-COHERENCE TAG ---------------
+            # Provider-agnostic twin of eodhd AS-2 on the FULLY-MERGED row:
+            # a previous close from one instrument stitched under another
+            # instrument's price fabricates the day move (live 2026-07-07:
+            # NESR.US cp 318.52 / prev 27.90 shipped pct -0.34%). Drop the
+            # pair's derived fields and tag; gates and reliability see the
+            # tag through the normal warning channel. OFF => byte-identical.
+            if _engine_price_coherence_enabled() and not _is_empty_data_row(merged):
+                _av_tag = _engine_apply_price_coherence(merged)
+                if _av_tag:
+                    _aq_append_warning(merged, _av_tag)
 
             # v5.103.0 (Fix AQ): record price provenance for this run. A price
             # present HERE came from a real provider quote; anything filled by
