@@ -192,9 +192,34 @@ jobs:
           echo "validated=true" >> "$GITHUB_OUTPUT"
 
   sync-dashboard:
-    name: 🚀 Data Sync
+    # (2026-07-08) TWO-LEG MATRIX SPLIT — Global_Markets gets its own parallel
+    # leg. WHY: the universe grew to 6,500 symbols; at batch 25 that is ~260
+    # backend requests, well past what one leg can finish inside any sane
+    # ceiling, and GM (the largest page, launched LAST by the 6a order) was the
+    # page the timeout always cancelled. The matrix runs the SAME job body
+    # twice in parallel: leg "core-pages" = everything except GLOBAL_MARKETS;
+    # leg "global-markets" = GLOBAL_MARKETS alone. Key scoping happens in the
+    # "🎯 Scope Keys To Matrix Leg" step (AFTER Smart Configuration, so repo
+    # vars / dispatch inputs keep working unchanged); the GM leg staggers its
+    # start by matrix.stagger seconds so the two legs do not slam the
+    # providers in the same instant (Yahoo 429 mitigation). fail-fast is OFF —
+    # one leg's failure never cancels the other mid-write. Artifacts and the
+    # step summary are suffixed per leg. Everything else is verbatim.
+    name: 🚀 Data Sync (${{ matrix.group }})
     runs-on: ubuntu-latest
     environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: core-pages
+            keys_scope: exclude-gm
+            page_order: "My_Portfolio,Mutual_Funds,Commodities_FX,Market_Leaders"
+            stagger: "0"
+          - group: global-markets
+            keys_scope: only-gm
+            page_order: "Global_Markets"
+            stagger: "90"
     # (2026-07-02) 25 -> 45: the 25-min ceiling CANCELLED run 28554325006
     # mid-write and wiped two pages. v6.18.0's advanced-first routing makes the
     # run much faster, but the ceiling must never again be the thing that kills
@@ -252,7 +277,10 @@ jobs:
       # providers. This list launches the starved small pages FIRST; the
       # cockpit tasks (Insights/Top_10/Data_Dictionary) always stay last
       # regardless. KILL-SWITCH: delete the line -> v6.20.0 default order.
-      TFB_SYNC_PAGE_ORDER: "My_Portfolio,Mutual_Funds,Commodities_FX,Market_Leaders,Global_Markets"
+      # (2026-07-08) value now comes from the MATRIX LEG: the core leg keeps
+      # the starved-small-pages-first order (minus Global_Markets, which moved
+      # to its own leg); the GM leg is single-page. Same 6a mechanism.
+      TFB_SYNC_PAGE_ORDER: ${{ matrix.page_order }}
       # Bounded empty-row second pass (v6.21.0, Fix 6b). DISARMED ("0") on
       # purpose: arm AFTER one ordered run confirms 6a, so attribution stays
       # clean. When armed, rows with an empty price get ONE re-fetch pass
@@ -642,6 +670,33 @@ jobs:
           echo "health_status=degraded" >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
 
+      - name: 🎯 Scope Keys To Matrix Leg
+        run: |
+          set -euo pipefail
+          # (2026-07-08) Two-leg split: filter the FULLY-VALIDATED key set from
+          # Smart Configuration down to this leg's scope. Runs AFTER validation
+          # so repo vars / dispatch inputs / sanitization are untouched.
+          #   core-pages     -> everything except GLOBAL_MARKETS
+          #   global-markets -> GLOBAL_MARKETS only (empty on single_key runs
+          #                     that target another page: the sync step then
+          #                     no-ops with exit 0 — "No tasks selected").
+          if [[ "${{ matrix.keys_scope }}" == "only-gm" ]]; then
+            SCOPED="$(tr ' ' '\n' <<<"${SYNC_KEYS}" | grep -x 'GLOBAL_MARKETS' | xargs || true)"
+          else
+            SCOPED="$(tr ' ' '\n' <<<"${SYNC_KEYS}" | grep -vx 'GLOBAL_MARKETS' | xargs || true)"
+          fi
+          echo "SYNC_KEYS=$SCOPED" >> "$GITHUB_ENV"
+          echo "🎯 Leg ${{ matrix.group }} keys: ${SCOPED:-<none>}"
+          if [[ -z "$SCOPED" ]]; then
+            echo "::notice::Leg '${{ matrix.group }}' has no keys after scoping — the sync step will no-op (exit 0)."
+          fi
+          # Stagger the GM leg so both legs do not open their provider bursts
+          # in the same instant (Yahoo 429 mitigation). Core leg: 0s.
+          if [[ "${{ matrix.stagger }}" != "0" && -n "$SCOPED" ]]; then
+            echo "⏳ Staggering start by ${{ matrix.stagger }}s..."
+            sleep "${{ matrix.stagger }}"
+          fi
+
       - name: 🚀 Execute Dashboard Sync
         id: execute_sync
         env:
@@ -937,7 +992,7 @@ jobs:
 
           # Unquoted heredoc → bash expands $VARS natively; no sed needed.
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          # 🏦 Tadawul Dashboard Sync Report
+          # 🏦 Tadawul Dashboard Sync Report — leg: ${{ matrix.group }}
 
           ## 📋 Execution Overview
           | Metric | Value |
@@ -975,7 +1030,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: tadawul-sync-logs-${{ github.run_id }}
+          name: tadawul-sync-logs-${{ github.run_id }}-${{ matrix.group }}
           path: |
             sync_*.log
             sync_execution.log
