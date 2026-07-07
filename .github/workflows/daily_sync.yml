@@ -306,6 +306,21 @@ jobs:
       # nears the 25-min job cap; optional companion TFB_SYNC_BATCH_DELAY_MS: "500"
       # adds a pause between batches for extra upstream cooldown.
       TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
+      # Per-page symbol cap for the four MARKET pages (scripts/
+      # run_dashboard_sync.py v6.19.2 _market_symbol_cap). RAISED to the
+      # script's own clamp ceiling.
+      # WHY (2026-07-07 forensics): the script default is 2500. A cap SMALLER
+      # than the sheet universe silently UN-REQUESTS the overflow, and the
+      # v6.19.0 symbol-persistence guard can only protect REQUESTED symbols —
+      # so the default cap acted as a symbol REMOVER: Global_Markets pinned at
+      # ~2,500 after the Jul-5 universe reached ~3,500, and every restore past
+      # position 2,500 was silently dropped again on the next run (the macro
+      # symbol-loss ratchet). 5000 covers the full documented universe with
+      # headroom. NOTE: this lets the sync REQUEST past 2,500; the request
+      # list still comes from the sheet's Symbol column, so previously-lost
+      # symbols return only once pasted back / restored to the page.
+      # KILL-SWITCH: remove the line to fall back to the script default (2500).
+      TFB_SYNC_MAX_SYMBOLS_MARKET: "5000"
       # Route the four market pages through the ANALYSIS gateway
       # (/v1/analysis/sheet-rows) FIRST — the route that returns the full page of
       # rows (plus the rank/dedup passes) — instead of the enriched chain that ends
