@@ -2,6 +2,51 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
+Yahoo Finance Fundamentals Provider -- v6.6.0
+================================================================================
+v6.6.0 -- GUARD DEFAULT ON + FAST-INFO SUPPRESSION + OWN-HISTORY PRICE
+          COHERENCE (Fixes YF-1 / YF-1b / YF-2)
+--------------------------------------------------------------------------------
+WHY (live workbook audit 2026-07-07, "Market_Share_Deepseek-V3" export v30):
+fresh wrong-company names were written onto NESR.US ("Invesco Municipal
+Trust"), LDI.US ("Axalta"), ROG.SW ("BKV Corporation") and 0011.HK
+("BuzzFeed") with same-morning stamps -- the v6.4.0/v6.5.0 identity+locale
+guard that exists precisely for this class was sitting DEFAULT OFF and
+therefore did nothing in production while the damage recurred daily.
+
+YF-1 DEFAULT FLIP: TFB_FUND_IDENTITY_GUARD now defaults ON (=0 is the kill
+switch). Deliberate deviation from the OFF-first pattern, under the house
+rule that a fix enforcing an already-documented, actively-violated control
+may ship ON: the control is documented in this file's own v6.4.0/v6.5.0
+WHYs (plus eodhd AO and engine AU-1), the violation is live today, and the
+guard is conservative by construction (absent/own-symbol responses are
+never touched).
+
+YF-1b FAST-INFO SUPPRESSION: on an identity or locale mismatch the old code
+discarded `info` but left `fast_info` -- fetched from the SAME crossed
+session response set -- free to supply prices/52W into the patch. Both are
+now suppressed together, so a convicted response set contributes nothing.
+
+YF-2 OWN-HISTORY PRICE COHERENCE (TFB_FUND_PRICE_COHERENCE_GUARD, DEFAULT
+OFF; thresholds reuse YF_PRICE_RATIO_HIGH/LOW, 8.0/0.125): the live
+info/fast_info price is compared against this provider's OWN 3-month
+history last close (independent HTTP; two responses crossing to the SAME
+wrong instrument is vanishingly unlikely). A unit-class disagreement
+convicts the whole info+fast_info set (discard + provider_price_incoherent
+tag). Stated honestly: this catches fils/cents-class crossings; a
+same-locale record carrying a PLAUSIBLE price with a wrong name (today's
+NESR.US shape) has no in-provider invariant to test against and remains
+uncaught here -- the symbol-base and locale checks (now ON) are the
+operative defenses for that class, and they only catch it when Yahoo
+stamps a different ticker or a foreign locale on the record. Residual risk
+is documented, not hidden.
+
+Version: PROVIDER_VERSION = "6.6.0". All prior WHYs (in this header and in
+the guard-section comments below) preserved verbatim. Zero functions
+removed (AST-verified).
+================================================================================
+(v6.3.1 header retained below)
+================================================================================
 Yahoo Finance Fundamentals Provider -- v6.3.1
 ================================================================================
 v6.3.1 hotfix (over v6.3.0). Four audit fixes; output shape additive-only:
@@ -68,7 +113,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.5.0"
+PROVIDER_VERSION = "6.6.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -236,12 +281,24 @@ def _to_yahoo_provider_symbol(norm_symbol: str) -> str:
 # untouched (status-quo). Gated OFF by default (TFB_FUND_IDENTITY_GUARD) so it
 # cannot blank a valid holding's fundamentals until explicitly enabled and
 # verified on a live run; set the env to 1/true/on/yes to enable.
+# v6.6.0 ADDENDUM: after 9 days of verified-safe semantics and a live audit
+# showing daily wrong-name writes with the guard dormant, the default is now ON;
+# the env is retained as the kill switch (=0). See the v6.6.0 WHY at top of file.
 
 def _fund_identity_guard_enabled() -> bool:
-    """Provider-identity guard master switch. DEFAULT OFF; set
-    TFB_FUND_IDENTITY_GUARD=1/true/on/yes to discard fundamentals when Yahoo
-    returns a different instrument than the one requested."""
-    return (os.getenv("TFB_FUND_IDENTITY_GUARD") or "0").strip().lower() in {"1", "true", "on", "yes"}
+    """Provider-identity guard master switch. v6.6.0: DEFAULT ON -- the
+    2026-07-07 audit found fresh wrong-company names written daily while
+    this guard sat dormant. Set TFB_FUND_IDENTITY_GUARD=0/false/off/no to
+    disable (restores the pre-v6.6.0 unguarded behavior)."""
+    return (os.getenv("TFB_FUND_IDENTITY_GUARD") or "1").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _fund_price_coherence_enabled() -> bool:
+    """v6.6.0 YF-2: own-history price-coherence guard. DEFAULT OFF; set
+    TFB_FUND_PRICE_COHERENCE_GUARD=1 to convict an info/fast_info set whose
+    live price disagrees with this provider's own history last close by a
+    unit-class ratio (YF_PRICE_RATIO_HIGH/LOW thresholds)."""
+    return (os.getenv("TFB_FUND_PRICE_COHERENCE_GUARD") or "0").strip().lower() in {"1", "true", "on", "yes"}
 
 
 def _ticker_identity_base(s: Any) -> str:
@@ -1727,6 +1784,7 @@ class YahooFundamentalsProvider:
                     last_exc = RuntimeError("yf_ticker_construct_failed")
                     break
 
+                _ident_discarded = False  # v6.6.0 YF-1b
                 info: Dict[str, Any] = {}
                 try:
                     info = t.info or {}
@@ -1750,6 +1808,7 @@ class YahooFundamentalsProvider:
                             provider_symbol, _returned_sym,
                         )
                         info = {}
+                        _ident_discarded = True  # v6.6.0 YF-1b
 
                 # v6.5.0 locale cross-check: catches the harder variant where
                 # Yahoo returns a wrong-instrument record but stamps the REQUESTED
@@ -1769,15 +1828,59 @@ class YahooFundamentalsProvider:
                             norm_symbol, _loc_detail,
                         )
                         info = {}
+                        _ident_discarded = True  # v6.6.0 YF-1b
 
                 try:
-                    fast_info = getattr(t, "fast_info", None)
+                    # v6.6.0 YF-1b: a convicted response set must not keep
+                    # supplying prices through its sibling fast_info.
+                    fast_info = None if _ident_discarded else getattr(t, "fast_info", None)
                 except Exception:
                     fast_info = None
 
                 history_rows = self._history_rows(t, period="3mo", interval="1d")
                 hist_avg10, hist_avg30 = self._history_avg_volumes(history_rows)
                 hist_52w_high, hist_52w_low = self._history_52w(history_rows)
+
+                # v6.6.0 YF-2: own-history price coherence. Live price from
+                # the info/fast_info set vs this fetch's OWN last history
+                # close (independent HTTP). A unit-class disagreement
+                # convicts the whole set -- discard info AND fast_info so
+                # every downstream field falls to honest history/None.
+                if (
+                    _fund_price_coherence_enabled()
+                    and not _ident_discarded
+                    and history_rows
+                    and (info or fast_info is not None)
+                ):
+                    _yf2_px = _coalesce(
+                        safe_float(_get_attr(fast_info, "last_price", "lastPrice", "regularMarketPrice")),
+                        safe_float(_pick(info, "currentPrice", "regularMarketPrice")),
+                    )
+                    _yf2_last = None
+                    for _r in reversed(history_rows):
+                        _c = safe_float(_r.get("close"))
+                        if _c:
+                            _yf2_last = _c
+                            break
+                    if (
+                        _yf2_px is not None and _yf2_px > 0
+                        and _yf2_last is not None and _yf2_last > 0
+                        and _is_suspect_price_ratio(
+                            _yf2_px, _yf2_last,
+                            ratio_high=self.price_ratio_high,
+                            ratio_low=self.price_ratio_low)
+                    ):
+                        warnings_list.append(
+                            f"provider_price_incoherent:{_yf2_px}!={_yf2_last}_discarded"
+                        )
+                        logger.warning(
+                            "Yahoo fundamentals price incoherent for %s: info=%s vs own-history=%s "
+                            "-- discarding info+fast_info set",
+                            norm_symbol, _yf2_px, _yf2_last,
+                        )
+                        info = {}
+                        fast_info = None
+                        _ident_discarded = True
 
                 now_utc = _utc_iso()
                 now_riy = _riyadh_iso()
