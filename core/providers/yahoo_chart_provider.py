@@ -5,6 +5,63 @@
 Yahoo Chart Provider (Global + KSA History) -- v8.5.0
 ================================================================================
 
+v8.6.0 — RESPONSE-IDENTITY GUARD + PRICE-COHERENCE GUARD (Fixes YC-1/YC-2/YC-3)
+--------------------------------------------------------------------------------
+WHY (live workbook audit 2026-07-07, "Market_Share_Deepseek-V3" export v30):
+7010.SR (Saudi Telecom) was served current_price 17.32 against its own
+previous close 43.54 — a crossed instrument's price — with provider
+yahoo_chart and a fresh 03:50 UTC stamp. This provider consumed
+yfinance's `info` / history / metadata without ever verifying the
+response belongs to the symbol it asked for, and `_enrich_data` stamps
+the REQUESTED symbol onto whatever arrived, so neither the engine's
+AU-1 firewall (which trusts a provider's self-declared symbol) nor any
+downstream check could see the crossing. Under Render-IP throttling
+(429 retry storms) crossed responses are a live, recurring failure
+mode; identity verification for exactly this class is the documented
+house control (eodhd v4.9.2 AO, yahoo_fundamentals v6.4.0/v6.5.0,
+engine v5.109.0 AU-1) and it was violated in production this morning
+with direct decision impact.
+
+YC-1 RESPONSE-IDENTITY GUARD (TFB_CHART_IDENTITY_GUARD, DEFAULT ON,
+set =0 to kill). The chart response set declares its instrument in
+`info["symbol"]` / `info["underlyingSymbol"]` and in the history
+metadata's `symbol`. After the blocking fetch returns, every declared
+identity is compared (base-ticker, alnum-collapsed) against the
+Yahoo-mapped requested symbol. Lenient by construction: no declared
+identity -> pass; ANY declared field matching -> pass; only when every
+present declared identity differs is the response dropped (log +
+metric, nothing cached, engine falls through to the next provider).
+Shipping ON is a deliberate deviation from the OFF-first pattern and is
+justified under the house rule that a fix enforcing an
+already-documented, actively-violated control may default ON: the
+control is documented in three modules, the violation is live today,
+and the guard's no-declared/any-match semantics make a false drop of a
+genuine row structurally impossible short of Yahoo mislabeling its own
+payload.
+
+YC-2 HISTORY-LEG GUARD (same flag). `fetch_history_raw` feeds the
+engine's history/technicals path with bars that carry no symbol echo —
+but the history call lazily populates the ticker's metadata at ZERO
+extra HTTP, and that metadata declares `symbol`. The same base-ticker
+check now runs there; a definite mismatch returns [] instead of another
+instrument's price series.
+
+YC-3 PRICE-COHERENCE GUARD (TFB_CHART_PRICE_COHERENCE_GUARD, DEFAULT
+OFF; thresholds TFB_CHART_PRICE_RATIO_HIGH/LOW default 8.0/0.125,
+matching the eodhd ZB unit-class thresholds). When the live `info`
+price and this provider's OWN last history close (independent HTTP —
+two responses crossing to the SAME wrong instrument is vanishingly
+unlikely) disagree by a unit-class ratio, the live-price keys are
+stripped from `info` so the patch falls back to the history-grounded
+price, with a `chart_price_incoherent_dropped` warning. Stated
+honestly: at the default thresholds this catches fils/cents-class
+errors, NOT same-currency crossings like today's 17.32-vs-43.54
+(ratio 2.5x) — YC-1 is the fix for those; YC-3 is belt for the
+unit-class family only.
+
+Version: PROVIDER_VERSION = "8.6.0". All prior WHY blocks preserved
+verbatim below. Zero functions removed (AST-verified).
+
 v8.5.0 Changes (from v8.4.0) — REPORT THE PRICE BAR'S OWN TIME (Fix AR support)
 ------------------------------------------------------------------------
 WHY: the 2026-07-05 audit verified this provider serving weeks-old cached
@@ -415,7 +472,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.5.0"
+PROVIDER_VERSION = "8.6.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -507,6 +564,90 @@ DEFAULT_HISTORY_INTERVAL = "1d"
 DEFAULT_YF_HISTORY_RETRY_ATTEMPTS = 3      # total tries when gate ON (1 try + 2 retries)
 DEFAULT_YF_HISTORY_RETRY_BASE_SEC = 0.5    # base backoff seconds (exponential)
 DEFAULT_YF_HISTORY_RETRY_CAP_SEC = 2.0     # per-attempt backoff ceiling (seconds)
+
+
+def _yc_identity_guard_enabled() -> bool:
+    """v8.6.0 YC-1/YC-2: response-identity guard master switch.
+    DEFAULT ON (documented control, violated live 2026-07-07: 7010.SR
+    served a crossed price). Set TFB_CHART_IDENTITY_GUARD=0 to restore
+    v8.5.0 byte-identical passthrough."""
+    return (os.getenv("TFB_CHART_IDENTITY_GUARD") or "1").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _yc_coherence_guard_enabled() -> bool:
+    """v8.6.0 YC-3: live-info price vs own-history last close unit-class
+    coherence guard. DEFAULT OFF; set TFB_CHART_PRICE_COHERENCE_GUARD=1
+    to enable."""
+    return (os.getenv("TFB_CHART_PRICE_COHERENCE_GUARD") or "0").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _yc_coh_ratio_high() -> float:
+    try:
+        v = float(os.getenv("TFB_CHART_PRICE_RATIO_HIGH") or 8.0)
+    except Exception:
+        v = 8.0
+    return v if v > 1.0 else 8.0
+
+
+def _yc_coh_ratio_low() -> float:
+    try:
+        v = float(os.getenv("TFB_CHART_PRICE_RATIO_LOW") or 0.125)
+    except Exception:
+        v = 0.125
+    return v if 0.0 < v < 1.0 else 0.125
+
+
+def _yc_identity_base(s: Any) -> str:
+    """v8.6.0: comparable base ticker — uppercase, drop the suffix after
+    the LAST dot, strip non-alphanumerics, strip leading zeros when the
+    result is all-digit ('0016.HK' -> '16', 'BRK-B'/'BRK.B' -> 'BRKB'/'BRK'
+    both intersect via the full-string form below)."""
+    t = str(s if s is not None else "").strip().upper()
+    if not t:
+        return ""
+    out = set()
+    for cand in ({t, t.rsplit(".", 1)[0]} if "." in t else {t}):
+        tok = "".join(ch for ch in cand if ch.isalnum())
+        if tok.isdigit():
+            tok = tok.lstrip("0") or "0"
+        if tok:
+            out.add(tok)
+    return "|".join(sorted(out))
+
+
+def _yc_tokens(s: Any) -> set:
+    b = _yc_identity_base(s)
+    return set(b.split("|")) if b else set()
+
+
+def _yc_declared_identity_mismatch(
+    requested_yahoo: str,
+    info: Optional[Dict[str, Any]],
+    meta: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """v8.6.0 YC-1: compare every identity the response set declares about
+    itself against the requested (Yahoo-mapped) symbol. Lenient: nothing
+    declared -> None; any declared token-set intersecting the requested
+    token-set -> None; only when ALL present declared identities are
+    fully disjoint -> the first observed declared identity (definite
+    crossing)."""
+    want = _yc_tokens(requested_yahoo)
+    if not want:
+        return None
+    declared: List[str] = []
+    for src_d in (info, meta):
+        if isinstance(src_d, dict):
+            for key in ("symbol", "underlyingSymbol", "quoteSymbol"):
+                v = src_d.get(key)
+                s = str(v if v is not None else "").strip()
+                if s:
+                    declared.append(s)
+    if not declared:
+        return None
+    for s in declared:
+        if _yc_tokens(s) & want:
+            return None
+    return declared[0]
 
 
 def _yf_history_retry_enabled() -> bool:
@@ -1924,7 +2065,64 @@ class YahooChartProvider:
                     metrics.requests_total.labels(symbol=sym, op="enriched", status="error").inc()
                     return None
 
+                # v8.6.0 YC-1: response-identity guard. The response set
+                # declares its instrument in info.symbol/underlyingSymbol
+                # and meta.symbol; a definite base-ticker mismatch means
+                # this whole set is NOT ours (crossed under throttle —
+                # live 2026-07-07: 7010.SR served a foreign 17.32 price).
+                # Drop like a failed fetch: nothing cached, engine falls
+                # through. Circuit breaker untouched (crossed != down).
+                if _yc_identity_guard_enabled():
+                    _yc1_got = _yc_declared_identity_mismatch(
+                        _yc_yahoo_symbol(sym), info, meta)
+                    if _yc1_got:
+                        logger.warning(
+                            "[yahoo_chart v%s YC-1] identity mismatch: requested %s got %s — response dropped",
+                            PROVIDER_VERSION, sym, _yc1_got,
+                        )
+                        metrics.requests_total.labels(symbol=sym, op="enriched", status="identity_mismatch").inc()
+                        return None
+
+                # v8.6.0 YC-3: unit-class coherence — live info price vs
+                # this fetch's OWN last history close (independent HTTP).
+                # On a definite unit-class disagreement the live-price
+                # keys are stripped so the patch falls back to the
+                # history-grounded price. Belt for fils/cents-class
+                # errors only (see WHY); default OFF.
+                _yc3_tag = False
+                if _yc_coherence_guard_enabled() and isinstance(info, dict) and history:
+                    _yc3_px = _first_number(
+                        info.get("currentPrice"),
+                        info.get("regularMarketPrice"),
+                        info.get("lastPrice"),
+                    )
+                    _yc3_last = None
+                    for _h in reversed(history):
+                        if _h.get("close"):
+                            _yc3_last = _h["close"]
+                            break
+                    if _yc3_px and _yc3_last and _yc3_px > 0 and _yc3_last > 0:
+                        _r = _yc3_px / _yc3_last
+                        if _r >= _yc_coh_ratio_high() or _r <= _yc_coh_ratio_low():
+                            info = dict(info)
+                            for _k in ("currentPrice", "regularMarketPrice", "lastPrice",
+                                       "previousClose", "regularMarketPreviousClose"):
+                                info.pop(_k, None)
+                            _yc3_tag = True
+                            logger.warning(
+                                "[yahoo_chart v%s YC-3] price incoherent for %s: info=%s vs own-history=%s — live-price keys dropped",
+                                PROVIDER_VERSION, sym, _yc3_px, _yc3_last,
+                            )
+
                 result = _enrich_data(sym, info, meta, history)
+                if _yc3_tag and isinstance(result, dict):
+                    _w = result.get("warnings")
+                    if isinstance(_w, list):
+                        _w.append("chart_price_incoherent_dropped")
+                    elif isinstance(_w, str) and _w:
+                        result["warnings"] = _w + "; chart_price_incoherent_dropped"
+                    else:
+                        result["warnings"] = ["chart_price_incoherent_dropped"]
 
                 await self._circuit_breaker.record_success()
                 metrics.requests_total.labels(symbol=sym, op="enriched", status="ok").inc()
@@ -2013,6 +2211,22 @@ class YahooChartProvider:
                 try:
                     ticker = yf.Ticker(_yc_yahoo_symbol(sym))  # v8.4.0 SSOT map
                     df = ticker.history(period=period, interval=interval)
+                    # v8.6.0 YC-2: the history call lazily populates the
+                    # ticker's metadata (zero extra HTTP) and that metadata
+                    # declares `symbol` — the only identity witness bars
+                    # themselves lack. A definite mismatch means this price
+                    # series belongs to another instrument: return [] rather
+                    # than feed the engine's technicals a foreign series.
+                    if _yc_identity_guard_enabled():
+                        _yc2_meta = _safe_history_metadata(ticker)
+                        _yc2_got = _yc_declared_identity_mismatch(
+                            _yc_yahoo_symbol(sym), None, _yc2_meta)
+                        if _yc2_got:
+                            logger.warning(
+                                "[yahoo_chart v%s YC-2] history identity mismatch: requested %s got %s — series dropped",
+                                PROVIDER_VERSION, sym, _yc2_got,
+                            )
+                            return []
                     if not _HAS_PANDAS or pd is None or df is None or df.empty:
                         return []
                     df = df.reset_index()
