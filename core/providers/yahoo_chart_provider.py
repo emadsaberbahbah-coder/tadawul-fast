@@ -59,6 +59,47 @@ errors, NOT same-currency crossings like today's 17.32-vs-43.54
 (ratio 2.5x) — YC-1 is the fix for those; YC-3 is belt for the
 unit-class family only.
 
+Version: PROVIDER_VERSION = "8.7.0". All prior WHY blocks preserved
+verbatim. Zero functions removed (AST-verified).
+
+v8.7.0 — RAW CHART TRANSPORT + SILENT-NONE ELIMINATION (Fix YC-RAW)
+-----------------------------------------------------------------------
+WHY (live conviction, 2026-07-08 Render shell): fetch_quote('2222.SR')
+and ('1120.SR') both returned None with ZERO log lines even at
+logging.INFO — while a plain curl from the SAME box to
+query1.finance.yahoo.com/v8/finance/chart/2222.SR answered 200 with the
+full correct payload (regularMarketPrice 26.68 SAR). Production logs
+show the cause: the yfinance library's cookie+crumb handshake is
+refused ("401 Invalid Crumb" / "User is unable to access this
+feature"), so this provider's ONLY transport was dead — and the v36
+export shows the consequence: .SR rows served as snapshot:yahoo_chart
+(last-good fallback), i.e. the Saudi book coasting on stale prices.
+An older WHY in this very file (the FX empty-DataFrame note) had
+already prescribed the fix — "adding an httpx-based fallback to
+query1.finance.yahoo.com/v8/finance/chart/{SYMBOL}" — but it was never
+implemented.
+FIX (master switch TFB_YAHOO_RAW_CHART, default ON; 0/false/off
+restores the v8.6.0 yfinance-only flow byte-identically):
+  YC-RAW-1  A crumb-free raw transport (_raw_chart_fetch_triple over a
+            query1/query2 host ladder, browser UA, httpx — already a
+            production dependency) synthesizes the EXACT
+            (info, meta, history) triple _fetch_ticker_sync returns.
+            The entire existing pipeline is reused untouched: YC-1
+            identity guard reads the payload's own meta.symbol, YC-3
+            coherence, _enrich_data, cache, circuit breaker, token
+            bucket. Quotes AND history go raw-FIRST; any raw failure
+            logs its reason and falls through to the untouched
+            yfinance path (retry ladder preserved).
+  YC-RAW-2  SILENT-NONE ELIMINATION: the two paths that returned None
+            without a trace now speak — a circuit-OPEN denial logs one
+            WARNING per cooldown window (throttled via
+            _cb_deny_log_ts), and an empty response set logs one
+            transport-attributed WARNING before returning None.
+Scope: no schema change, no scoring change, no new columns; identity
+and coherence guards unchanged in semantics. yfinance stays installed
+and is still the fallback transport. Zero functions removed
+(AST-verified).
+
 Version: PROVIDER_VERSION = "8.6.0". All prior WHY blocks preserved
 verbatim below. Zero functions removed (AST-verified).
 
@@ -361,6 +402,16 @@ except ImportError:
     yf = None  # type: ignore[assignment]
     _HAS_YFINANCE = False
 
+# v8.7.0 (YC-RAW): httpx powers the crumb-free raw chart transport. Already
+# a production dependency (eodhd_provider). Guarded like yfinance so the
+# module imports cleanly without it (raw path then self-disables).
+try:
+    import httpx  # type: ignore
+    _HAS_HTTPX = True
+except ImportError:
+    httpx = None  # type: ignore[assignment]
+    _HAS_HTTPX = False
+
 # Prometheus metrics (optional)
 try:
     from prometheus_client import Counter, Gauge, Histogram, REGISTRY  # type: ignore
@@ -472,7 +523,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.6.0"
+PROVIDER_VERSION = "8.7.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -718,6 +769,146 @@ def _is_rate_limit_error(exc: Any) -> bool:
 
 
 # =============================================================================
+# v8.7.0 (Fix YC-RAW): RAW CHART TRANSPORT — crumb-free quotes & history
+# =============================================================================
+# The yfinance library authenticates via a cookie+crumb pair that Yahoo now
+# refuses to this datacenter IP (production log 2026-07-08: sustained
+# "401 Invalid Crumb" / "User is unable to access this feature"), while the
+# plain v8/finance/chart endpoint answers the SAME box with 200 and a full
+# correct payload (Render shell: 2222.SR -> regularMarketPrice 26.68 SAR).
+# This transport fetches that endpoint directly and synthesizes the exact
+# (info, meta, history) triple _fetch_ticker_sync produces, so the ENTIRE
+# existing pipeline — YC-1 identity guard, YC-3 coherence, _enrich_data,
+# cache, circuit breaker — is reused untouched. yfinance remains the
+# fallback transport. Master switch TFB_YAHOO_RAW_CHART (default ON);
+# set 0/false/off to restore the v8.6.0 yfinance-only flow byte-identically.
+
+_RAW_CHART_HOSTS: Tuple[str, ...] = (
+    "https://query1.finance.yahoo.com",
+    "https://query2.finance.yahoo.com",
+)
+_RAW_CHART_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+
+def _raw_chart_enabled() -> bool:
+    """v8.7.0 (YC-RAW): raw chart transport master switch. Default ON —
+    the yfinance transport is crumb-blocked in production and the raw
+    endpoint is the proven-alive path (esp. critical for .SR, where Yahoo
+    is the only viable source). TFB_YAHOO_RAW_CHART in {0,false,off}
+    restores the v8.6.0 yfinance-only flow byte-identically."""
+    return os.getenv("TFB_YAHOO_RAW_CHART", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+async def _raw_http_get_json(url: str, params: Dict[str, Any], timeout: float) -> Any:
+    """Single HTTP seam for the raw transport (tests monkeypatch this)."""
+    if not _HAS_HTTPX or httpx is None:
+        raise YahooFetchError("httpx_unavailable")
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=True,
+        headers={"User-Agent": _RAW_CHART_UA, "Accept": "application/json"},
+    ) as client:
+        resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            raise YahooFetchError(f"http_{resp.status_code}")
+        return resp.json()
+
+
+def _raw_chart_parse_triple(
+    ysym: str, data: Any,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    """Parse a v8/finance/chart payload into the (info, meta, history)
+    triple _fetch_ticker_sync returns, so downstream is transport-blind.
+    Pure; raises YahooFetchError on error/malformed payloads."""
+    chart = (data or {}).get("chart") if isinstance(data, dict) else None
+    if not isinstance(chart, dict):
+        raise YahooFetchError("malformed_payload")
+    err = chart.get("error")
+    if err:
+        code = err.get("code") if isinstance(err, dict) else str(err)
+        raise YahooFetchError(f"chart_error:{code}")
+    results = chart.get("result") or []
+    if not results or not isinstance(results[0], dict):
+        raise YahooFetchError("empty_result")
+    r0 = results[0]
+    meta_raw = r0.get("meta") or {}
+    if not isinstance(meta_raw, dict):
+        meta_raw = {}
+
+    prev_close = _first_number(
+        meta_raw.get("chartPreviousClose"),
+        meta_raw.get("previousClose"),
+        meta_raw.get("regularMarketPreviousClose"),
+    )
+    info: Dict[str, Any] = {
+        "symbol": _safe_str(meta_raw.get("symbol")) or ysym,
+        "regularMarketPrice": _safe_float(meta_raw.get("regularMarketPrice")),
+        "previousClose": prev_close,
+        "regularMarketPreviousClose": prev_close,
+        "currency": _safe_str(meta_raw.get("currency")),
+        "exchange": _safe_str(meta_raw.get("exchangeName")),
+        "fullExchangeName": _safe_str(meta_raw.get("fullExchangeName")),
+        "regularMarketDayHigh": _safe_float(meta_raw.get("regularMarketDayHigh")),
+        "regularMarketDayLow": _safe_float(meta_raw.get("regularMarketDayLow")),
+        "fiftyTwoWeekHigh": _safe_float(meta_raw.get("fiftyTwoWeekHigh")),
+        "fiftyTwoWeekLow": _safe_float(meta_raw.get("fiftyTwoWeekLow")),
+        "regularMarketVolume": _safe_float(meta_raw.get("regularMarketVolume")),
+        "regularMarketTime": meta_raw.get("regularMarketTime"),
+    }
+    info = {k: v for k, v in info.items() if v is not None}
+
+    history: List[Dict[str, Any]] = []
+    ts_list = r0.get("timestamp") or []
+    inds = r0.get("indicators") or {}
+    quotes = (inds.get("quote") or [{}])
+    q0 = quotes[0] if quotes and isinstance(quotes[0], dict) else {}
+    opens = q0.get("open") or []
+    highs = q0.get("high") or []
+    lows = q0.get("low") or []
+    closes = q0.get("close") or []
+    vols = q0.get("volume") or []
+    n = len(ts_list)
+    for i in range(n):
+        close_v = _safe_float(closes[i] if i < len(closes) else None)
+        if close_v is None:
+            continue
+        ts_raw = ts_list[i]
+        try:
+            dt = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
+            ts_iso = _utc_iso(dt)
+        except Exception:
+            ts_iso = str(ts_raw)
+        history.append({
+            "timestamp": ts_iso,
+            "open": _safe_float(opens[i] if i < len(opens) else None),
+            "high": _safe_float(highs[i] if i < len(highs) else None),
+            "low": _safe_float(lows[i] if i < len(lows) else None),
+            "close": close_v,
+            "volume": _safe_float(vols[i] if i < len(vols) else None),
+        })
+    return info, meta_raw, history
+
+
+async def _raw_chart_fetch_triple(
+    ysym: str, range_: str, interval: str, timeout: float,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    """Fetch the chart payload over the host ladder and parse the triple.
+    Raises YahooFetchError (with the LAST host's reason) on total failure."""
+    params = {"range": range_ or "1y", "interval": interval or "1d"}
+    last_exc: Optional[Exception] = None
+    for host in _RAW_CHART_HOSTS:
+        try:
+            data = await _raw_http_get_json(f"{host}/v8/finance/chart/{ysym}", params, timeout)
+            return _raw_chart_parse_triple(ysym, data)
+        except Exception as exc:  # noqa: BLE001 — ladder tries next host
+            last_exc = exc
+            continue
+    raise YahooFetchError(f"raw_chart_failed:{last_exc}")
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
@@ -771,7 +962,11 @@ class YahooConfig:
             except Exception:
                 return default
 
-        enabled = _env_bool("YAHOO_ENABLED", True) and _HAS_YFINANCE
+        # v8.7.0: availability is transport-agnostic — yfinance OR the raw
+        # chart transport can serve; the env kill-switch still rules all.
+        enabled = _env_bool("YAHOO_ENABLED", True) and (
+            _HAS_YFINANCE or (_raw_chart_enabled() and _HAS_HTTPX)
+        )
 
         return cls(
             enabled=enabled,
@@ -793,8 +988,10 @@ class YahooConfig:
 
     @property
     def is_available(self) -> bool:
-        """Return True if the provider can serve requests."""
-        return self.enabled and _HAS_YFINANCE
+        """Return True if the provider can serve requests.
+        v8.7.0: the raw chart transport is a full quote/history capability,
+        so availability no longer requires yfinance alone."""
+        return self.enabled and (_HAS_YFINANCE or (_raw_chart_enabled() and _HAS_HTTPX))
 
 
 # =============================================================================
@@ -2022,6 +2219,8 @@ class YahooChartProvider:
             max_workers=self.config.threadpool_workers,
             thread_name_prefix="YahooWorker",
         )
+        # v8.7.0: throttle marker so a CB-open storm logs once per cooldown.
+        self._cb_deny_log_ts: float = 0.0
 
     async def get_enriched_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get an enriched quote for a single symbol."""
@@ -2042,6 +2241,16 @@ class YahooChartProvider:
         metrics.cache_misses_total.labels(symbol=sym).inc()
 
         if not await self._circuit_breaker.allow():
+            # v8.7.0: a CB-open denial was a SILENT None (the exact probe
+            # symptom: RESULT None with zero log lines). Throttled to one
+            # line per cooldown window so a storm cannot flood the log.
+            _now_mono = time.monotonic()
+            if _now_mono - getattr(self, "_cb_deny_log_ts", 0.0) >= self.config.cb_cooldown_sec:
+                self._cb_deny_log_ts = _now_mono
+                logger.warning(
+                    "[yahoo_chart v%s] circuit OPEN — requests denied (incl. %s); retry after %.0fs cooldown",
+                    PROVIDER_VERSION, sym, self.config.cb_cooldown_sec,
+                )
             return None
 
         await self._token_bucket.acquire()
@@ -2051,18 +2260,48 @@ class YahooChartProvider:
             start_time = time.monotonic()
 
             try:
-                # v8.0.0: pass config-provided period/interval to the worker.
-                info, meta, history = await loop.run_in_executor(
-                    self._executor,
-                    _fetch_ticker_sync,
-                    sym,
-                    self.config.history_period,
-                    self.config.history_interval,
-                )
+                # v8.7.0 (YC-RAW): crumb-free raw chart transport FIRST.
+                # Synthesizes the same (info, meta, history) triple, so the
+                # YC-1/YC-3 guards and _enrich_data below run identically.
+                # Any raw failure logs its reason (no more silent None) and
+                # falls through to the untouched yfinance executor path.
+                info: Dict[str, Any] = {}
+                meta: Dict[str, Any] = {}
+                history: List[Dict[str, Any]] = []
+                _raw_ok = False
+                if _raw_chart_enabled() and _HAS_HTTPX:
+                    try:
+                        info, meta, history = await _raw_chart_fetch_triple(
+                            _yc_yahoo_symbol(sym),
+                            self.config.history_period,
+                            self.config.history_interval,
+                            self.config.timeout_sec,
+                        )
+                        _raw_ok = bool(info or history)
+                    except Exception as _raw_exc:
+                        logger.warning(
+                            "[yahoo_chart v%s YC-RAW] raw chart quote failed for %s: %s — falling back to yfinance",
+                            PROVIDER_VERSION, sym, _raw_exc,
+                        )
+                if not _raw_ok:
+                    # v8.0.0: pass config-provided period/interval to the worker.
+                    info, meta, history = await loop.run_in_executor(
+                        self._executor,
+                        _fetch_ticker_sync,
+                        sym,
+                        self.config.history_period,
+                        self.config.history_interval,
+                    )
 
                 if not info and not history:
                     await self._circuit_breaker.record_failure()
                     metrics.requests_total.labels(symbol=sym, op="enriched", status="error").inc()
+                    # v8.7.0: the empty-set outcome was the other silent
+                    # None. One observable line, transport-attributed.
+                    logger.warning(
+                        "[yahoo_chart v%s] empty response set for %s (transport=%s) — no quote served",
+                        PROVIDER_VERSION, sym, "raw_chart" if _raw_ok else "yfinance",
+                    )
                     return None
 
                 # v8.6.0 YC-1: response-identity guard. The response set
@@ -2184,11 +2423,43 @@ class YahooChartProvider:
         v8.0.0: this runs on the provider's SHARED executor instead of
         allocating a fresh ThreadPoolExecutor per call (v7.0.0 leaked threads).
         """
-        if not _HAS_YFINANCE or yf is None:
+        if (not _HAS_YFINANCE or yf is None) and not (_raw_chart_enabled() and _HAS_HTTPX):
             return []
 
         sym = normalize_symbol(symbol)
         if not sym:
+            return []
+
+        # v8.7.0 (YC-RAW): crumb-free raw chart history FIRST — same
+        # endpoint, same bar shape, YC-2-equivalent identity check on the
+        # payload's own meta.symbol. Any failure logs its reason and falls
+        # through to the untouched yfinance retry ladder below.
+        if _raw_chart_enabled() and _HAS_HTTPX:
+            try:
+                _r_info, _r_meta, _r_hist = await _raw_chart_fetch_triple(
+                    _yc_yahoo_symbol(sym), period, interval, self.config.timeout_sec,
+                )
+                if _yc_identity_guard_enabled():
+                    _r_got = _yc_declared_identity_mismatch(
+                        _yc_yahoo_symbol(sym), _r_info, _r_meta)
+                    if _r_got:
+                        logger.warning(
+                            "[yahoo_chart v%s YC-2/RAW] history identity mismatch: requested %s got %s — series dropped",
+                            PROVIDER_VERSION, sym, _r_got,
+                        )
+                        return []
+                if _r_hist:
+                    return _r_hist
+                logger.warning(
+                    "[yahoo_chart v%s YC-RAW] raw chart history empty for %s — falling back to yfinance",
+                    PROVIDER_VERSION, sym,
+                )
+            except Exception as _raw_exc:
+                logger.warning(
+                    "[yahoo_chart v%s YC-RAW] raw chart history failed for %s: %s — falling back to yfinance",
+                    PROVIDER_VERSION, sym, _raw_exc,
+                )
+        if not _HAS_YFINANCE or yf is None:
             return []
 
         def _sync_fetch() -> List[Dict[str, Any]]:
