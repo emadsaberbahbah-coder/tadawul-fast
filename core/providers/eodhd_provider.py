@@ -75,6 +75,46 @@ interacts with engine Fix AT (provider-attribution): flip this only
 together with (or after) TFB_PROVIDER_ATTRIBUTION_FIX so a priceless
 shell cannot claim a row's provenance.
 
+v4.14.0 — IDENTITY GUARD ACTIVE BY DEFAULT + UNDECLARED-IDENTITY
+QUARANTINE (Fix AO-3 / AO-4)
+-----------------------------------------------------------------------
+WHY (v36 audit conviction, 2026-07-08): freshly rebuilt sheet rows carried
+a correct per-symbol quote with a FOREIGN name/sector/market_cap (AAPL @
+310.66 named "Arbor Realty Trust" and, in a duplicate row, "Dropbox,
+Inc."). Engine-side the leak was the unguarded fundamentals-fallback
+channel (data_engine_v2 v5.112.0 Fix AW closes it). Provider-side audit
+of THIS file found the two co-roots:
+  AO-3  _identity_guard_enabled() shipped DEFAULT OFF
+        (TFB_EODHD_IDENTITY_GUARD, "0"), and no production ENV record
+        shows it ever flipped — the entire v4.9.2 crossed-response
+        defense (built from the 2026-07-04 ~425-row GM conviction) has
+        been INERT in production. Crossed payloads entered unchecked and
+        fund_cache's 6-hour TTL amplified each event into hours of
+        poisoned serves, re-seeding after every restart. FIX: default
+        flipped to ON, per the v4.12.0 precedent ("a witness known to
+        lie must not be the default"). Kill switch preserved:
+        TFB_EODHD_IDENTITY_GUARD=0 restores the unguarded v4.13.0 parse
+        byte-identically.
+  AO-4  Even guarded, the v4.9.2 helper is lenient by design: an
+        ABSENT General.Code -> "no judgement". Under the documented
+        throttle-storm partial payloads this lets a foreign
+        General.Name ride in with no way to convict it. FIX: an
+        undeclared payload now forfeits its identity fields — name /
+        exchange / currency / country / sector / industry are stripped
+        at a single pre-cache choke (numerics, the endpoint's purpose,
+        still flow) and the row is tagged eodhd_identity_unverified
+        (substring-safe: no cap/forecast/target/roi/drop/reject).
+        Mirrors engine Fix AW-2 so the seam is defended on both sides;
+        identity for such rows falls to the priced-provider patch, the
+        Yahoo pass, or an honest name_unresolved blank.
+Scope: fetch_quote untouched (real-time payloads carry no name — no
+identity to quarantine; a code-absent real-time price remains an
+accepted, documented residual). No schema, order, or flow change
+elsewhere. Zero functions removed (AST-verified).
+
+Version: PROVIDER_VERSION = "4.14.0". All v4.13.x and earlier WHY blocks
+below are preserved verbatim. Zero functions removed (AST-verified).
+
 Version: PROVIDER_VERSION = "4.13.0". All v4.12.x and earlier WHY blocks
 below are preserved verbatim. Zero functions removed (AST-verified).
 
@@ -877,7 +917,7 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.13.0"
+PROVIDER_VERSION = "4.14.0"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -1466,11 +1506,17 @@ def _merge_warnings_inplace(target: Dict[str, Any], incoming: Any) -> None:
 # (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 def _identity_guard_enabled() -> bool:
-    """v4.9.2 AO: response-identity guard toggle. Default OFF; set
-    TFB_EODHD_IDENTITY_GUARD=1 to drop payloads whose self-declared
-    identity does not match the requested symbol. OFF => byte-identical
-    v4.9.1 behavior."""
-    return _env_str("TFB_EODHD_IDENTITY_GUARD", "0").strip().lower() in _TRUTHY
+    """v4.9.2 AO: response-identity guard toggle. v4.14.0 (AO-3): DEFAULT
+    FLIPPED TO ON. The guard shipped default-OFF and no production ENV
+    record shows it ever flipped — meaning the provider's entire
+    crossed-response defense (built from the 2026-07-04 ~425-row GM
+    conviction) was inert while the 2026-07-08 v36 audit convicted fresh
+    crossed identities flowing through this exact channel. Per the
+    v4.12.0 precedent ("a witness known to lie must not be the default"):
+    a guard against CONVICTED production crossings must not default OFF.
+    Set TFB_EODHD_IDENTITY_GUARD=0 to restore the unguarded v4.13.0
+    parse byte-identically."""
+    return _env_str("TFB_EODHD_IDENTITY_GUARD", "1").strip().lower() in _TRUTHY
 
 
 def _response_identity_mismatch(
@@ -2218,6 +2264,14 @@ class EODHDClient:
             # their instrument in General.Code / General.Exchange; a definite
             # mismatch means a crossed payload. Drop before extraction and
             # never let it into fund_cache.
+            # v4.14.0 (AO-4): capture whether the payload DECLARED a code at
+            # all. The v4.9.2 helper is lenient by design (absent code -> no
+            # judgement), which under the documented throttle-storm partial
+            # payloads lets a foreign General.Name ride in unverifiable —
+            # the residual leak behind the v36 fresh crossed names. An
+            # undeclared payload keeps its numerics but forfeits its
+            # identity fields (stripped at the single pre-cache choke below).
+            _ao4_code_present = bool(str(general.get("Code") or "").strip())
             if _identity_guard_enabled():
                 _got = _response_identity_mismatch(
                     sym, general.get("Code"), general.get("Exchange"))
@@ -2231,6 +2285,8 @@ class EODHDClient:
                         sym_raw, sym, _err,
                         extra_warnings=["provider_identity_mismatch:eodhd"],
                     ), _err
+                if not _ao4_code_present:
+                    warnings_list.append("eodhd_identity_unverified")
 
             if not general and not highlights and not financials:
                 warnings_list.append("fundamentals_empty")
@@ -2422,6 +2478,16 @@ class EODHDClient:
                     "last_updated_riyadh": _riyadh_iso(),
                 }
             )
+            # v4.14.0 (AO-4): UNDECLARED-IDENTITY QUARANTINE — single
+            # pre-cache choke. A payload that declared no General.Code is
+            # identity-unverifiable: its numerics (the endpoint's purpose)
+            # flow, its identity fields do not. Mirrors engine-side Fix AW-2
+            # (data_engine_v2 v5.112.0) so the seam is defended on BOTH
+            # sides. Tag eodhd_identity_unverified (appended at the guard
+            # site above) is substring-safe for the reliability scan.
+            if _identity_guard_enabled() and not _ao4_code_present:
+                for _ao4_k in ("name", "exchange", "currency", "country", "sector", "industry"):
+                    patch.pop(_ao4_k, None)
             await self.fund_cache.set(ck, patch)
             return patch, None
 
