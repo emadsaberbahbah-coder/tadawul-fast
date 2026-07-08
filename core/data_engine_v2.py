@@ -34,6 +34,59 @@ provider_engine_conflict still reads FALSE, the conflict pair is corrected
 to TRUE / "Direction". Idempotent (second pass is a no-op); non-violating
 rows byte-identical; never promotes.
 
+WHY v5.112.0 - FUNDAMENTALS-CHANNEL IDENTITY FIREWALL (Fix AW)
+--------------------------------------------------------------
+Root cause (v36 audit, 2026-07-08): freshly rebuilt rows carried a CORRECT
+per-symbol quote with a FOREIGN name / sector / market_cap / pe (AAPL @
+310.66 named "Arbor Realty Trust" in one row and "Dropbox, Inc." in a
+duplicate — same Apple quote, two different foreign identities). Causal
+chain, proven in-code: (1) the priced provider path fills the quote but no
+name (EODHD real-time returns OHLC only); (2) the Yahoo enrichment pass —
+the intended name source — is throttled midday on Render's IP, leaving
+name blank; (3) _apply_eodhd_fundamentals_fallback (v5.79.0) fires on the
+D/E-or-FCF gap and merges a fundamentals patch through
+_filter_patch_to_missing_fields whose filter list _YAHOO_FUNDAMENTAL_FIELDS
+explicitly ADMITS identity fields (name/sector/industry/country/
+market_cap/pe_ttm) — and this is the ONLY patch channel with NO AU-1
+identity check; (4) _canonicalize_provider_row force-stamps the requested
+symbol (normalized_symbol argument wins), erasing the payload's own
+declared code before anything downstream could convict it. When EODHD
+answers the fundamentals call with another instrument's payload, the
+foreign identity fills the blanks over the correct quote — the exact
+hybrid the sheet shows, and AU-2b cannot refuse it from the snapshot store
+because no identity_mismatch tag was ever raised.
+FIX (one env master TFB_FUND_IDENTITY_GUARD, default ON; set 0/false/off
+to restore v5.111.0 byte-for-byte):
+  AW-1 REFUSAL AT THE SEAM: the AU-1 declared-identity check
+  (_engine_patch_identity_mismatch) now runs on the RAW fundamentals patch
+  BEFORE canonicalization erases its declaration. A definite disjoint
+  declaration refuses the whole patch with an observable WARNING log and a
+  per-row tag identity_patch_refused:eodhd_fundamentals (substring-safe:
+  contains no cap/forecast/target/roi/drop/reject, so repeat gate passes
+  stay byte-identical).
+  AW-2 IDENTITY QUARANTINE ON THE SIDE-CHANNEL: display-identity keys
+  (_AW_IDENTITY_QUARANTINE_KEYS: name/sector/industry/exchange/country/
+  currency/asset_class) are stripped from the filtered fill before merge —
+  an UNDECLARED payload passes AU-1 by lenient design, so identity must
+  simply never travel this channel. Numeric fundamentals (the fallback's
+  stated v5.79.0 purpose: debt_to_equity/free_cash_flow_ttm/margins) still
+  fill. A strip is tagged fund_identity_quarantined. Identity remains
+  sourced from the priced provider patch, the Yahoo pass, and
+  _infer_display_name_from_symbol — verified or static paths. A row left
+  nameless is honestly tagged by the existing v5.93.0 name_unresolved
+  disclosure instead of wearing a confidently wrong name.
+Scope: adds NO column (schema 115), touches NO score/verdict/reco/rank
+derivation, fill semantics unchanged for every other channel. Residual
+risk accepted + documented: crossed NUMERIC fundamentals from an
+undeclared payload can still fill (root fix belongs in eodhd_provider.py
+symbol mapping — next deliverable); rows are auditable via the two new
+tags. Reversible: TFB_FUND_IDENTITY_GUARD=0 -> v5.111.0 exactly.
+
+Version: __version__ = "5.112.0". All prior WHYs preserved verbatim.
+Zero functions removed (AST-verified).
+
+WHY v5.111.0 (header retained below verbatim)
+---------------------------------------------
 Version: __version__ = "5.111.0". All prior WHYs preserved verbatim.
 Zero functions removed (AST-verified).
 
@@ -2574,7 +2627,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.111.0"
+__version__ = "5.112.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -8352,6 +8405,30 @@ def _engine_patch_identity_mismatch(requested: str, patch: Dict[str, Any]) -> Op
     return declared[0]
 
 
+def _fund_identity_guard_enabled() -> bool:
+    """v5.112.0 (Fix AW): identity guard on the EODHD fundamentals fallback
+    channel — the ONLY patch channel that carried no AU-1 check while its
+    filter list (_YAHOO_FUNDAMENTAL_FIELDS) explicitly admits identity
+    fields (name/sector/industry/country/market_cap/pe_ttm). Default ON;
+    TFB_FUND_IDENTITY_GUARD in {0,false,off} restores the exact v5.111.0
+    merge byte-for-byte."""
+    return os.getenv("TFB_FUND_IDENTITY_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+# v5.112.0 (Fix AW-2): display-identity keys that may NEVER enter a row via
+# the fundamentals side-channel. The fallback's stated purpose (v5.79.0) is
+# numeric fundamentals (debt_to_equity / free_cash_flow_ttm / margins);
+# identity from an unverifiable side-channel is exactly the poison vector
+# the 2026-07-08 v36 audit convicted (fresh AAPL rows carrying Arbor
+# Realty / Dropbox names + foreign market caps over a correct Apple quote).
+# Identity stays sourced from the PRICED provider patch, the Yahoo
+# enrichment pass, and _infer_display_name_from_symbol — all verified or
+# static paths.
+_AW_IDENTITY_QUARANTINE_KEYS: Tuple[str, ...] = (
+    "name", "sector", "industry", "exchange", "country", "currency", "asset_class",
+)
+
+
 def _engine_price_coherence_enabled() -> bool:
     """v5.110.0 (Fix AV): engine-level current_price<->previous_close
     unit-class coherence tag on the fully-merged row. Default OFF; set
@@ -12384,6 +12461,22 @@ class DataEngineV5:
         patch = await self._fetch_eodhd_fundamentals_patch(symbol, page)
         if not patch:
             return row
+        # v5.112.0 (Fix AW-1): run the AU-1 declared-identity check on the RAW
+        # patch BEFORE _canonicalize_provider_row force-stamps the requested
+        # symbol and erases the payload's own declaration (the exact blindness
+        # the AU-1 comment documents). A definite disjoint declaration means
+        # EODHD answered for a DIFFERENT instrument — refuse the whole patch;
+        # the row is tagged (substring-safe: no cap/forecast/target/roi/
+        # drop/reject) so the refusal is auditable per-row, not just in logs.
+        if _fund_identity_guard_enabled():
+            _aw_got = _engine_patch_identity_mismatch(symbol, patch)
+            if _aw_got:
+                logger.warning(
+                    "[engine_v2 v%s AW-1] eodhd fundamentals returned crossed identity for %s: declared=%s — patch refused",
+                    __version__, symbol, _aw_got,
+                )
+                _v573_append_warning(row, "identity_patch_refused:eodhd_fundamentals")
+                return row
         sym_for_canon = normalize_symbol(symbol) or normalize_symbol(
             _safe_str(row.get("symbol") or row.get("requested_symbol"))
         )
@@ -12394,6 +12487,18 @@ class DataEngineV5:
         filtered, _filled = _filter_patch_to_missing_fields(
             row, canon_patch, _YAHOO_FUNDAMENTAL_FIELDS,
         )
+        # v5.112.0 (Fix AW-2): strip display-identity keys from the side-channel
+        # fill. An UNDECLARED payload passes AW-1 by lenient design (AU-1: "no
+        # declared identity fields -> no judgement"), so identity must simply
+        # never travel this channel: a blank name honestly tagged
+        # name_unresolved (v5.93.0 philosophy) beats a confidently wrong one.
+        # Numeric fundamentals (the fallback's v5.79.0 purpose) still fill.
+        if _fund_identity_guard_enabled() and filtered:
+            _aw_removed = [k for k in _AW_IDENTITY_QUARANTINE_KEYS if k in filtered]
+            for _aw_k in _aw_removed:
+                filtered.pop(_aw_k, None)
+            if _aw_removed:
+                _v573_append_warning(row, "fund_identity_quarantined")
         if filtered:
             row = self._merge(row, filtered)
             _v573_append_warning(row, "eodhd_fundamentals_fallback_applied")
