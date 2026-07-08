@@ -75,6 +75,27 @@ interacts with engine Fix AT (provider-attribution): flip this only
 together with (or after) TFB_PROVIDER_ATTRIBUTION_FIX so a priceless
 shell cannot claim a row's provenance.
 
+v4.14.1 — EVIDENCE CORRECTION (documentation only; ZERO code change)
+-----------------------------------------------------------------------
+CORRECTION: the v4.14.0 AO-3 WHY below states "no production ENV record
+shows it ever flipped". Emad verified in the Render dashboard
+(2026-07-08) that TFB_EODHD_IDENTITY_GUARD=1 IS set — the v4.9.2 guard
+WAS active in production. The record is corrected: the guard did its
+declared-mismatch job; the live provider-side leak was therefore the
+AO-4 leniency hole ALONE (throttle-storm partial payloads carrying a
+foreign General.Name with NO General.Code — unconvictable by design,
+cached 6h, matching the two independent foreign identities observed on
+the duplicated AAPL rows in the v36 audit). The AO-3 default flip is
+RETAINED as defense-in-depth hygiene — a safety control's shipped
+default should match its production requirement, and the explicit
+ENV=1 continues to govern regardless. AO-4 remains the operative fix.
+The _identity_guard_enabled docstring is corrected accordingly.
+Behavior is byte-identical to v4.14.0.
+
+Version: PROVIDER_VERSION = "4.14.1". All v4.14.0 and earlier WHY
+blocks below are preserved verbatim. Zero functions removed
+(AST-verified).
+
 v4.14.0 — IDENTITY GUARD ACTIVE BY DEFAULT + UNDECLARED-IDENTITY
 QUARANTINE (Fix AO-3 / AO-4)
 -----------------------------------------------------------------------
@@ -917,7 +938,7 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.14.0"
+PROVIDER_VERSION = "4.14.1"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -1506,16 +1527,15 @@ def _merge_warnings_inplace(target: Dict[str, Any], incoming: Any) -> None:
 # (PRESERVED byte-identical in v4.8.0 and v4.9.0)
 # =============================================================================
 def _identity_guard_enabled() -> bool:
-    """v4.9.2 AO: response-identity guard toggle. v4.14.0 (AO-3): DEFAULT
-    FLIPPED TO ON. The guard shipped default-OFF and no production ENV
-    record shows it ever flipped — meaning the provider's entire
-    crossed-response defense (built from the 2026-07-04 ~425-row GM
-    conviction) was inert while the 2026-07-08 v36 audit convicted fresh
-    crossed identities flowing through this exact channel. Per the
-    v4.12.0 precedent ("a witness known to lie must not be the default"):
-    a guard against CONVICTED production crossings must not default OFF.
-    Set TFB_EODHD_IDENTITY_GUARD=0 to restore the unguarded v4.13.0
-    parse byte-identically."""
+    """v4.9.2 AO: response-identity guard toggle. v4.14.0 (AO-3) flipped
+    the shipped default to ON; v4.14.1 corrects the record: production
+    verification (Render dashboard, 2026-07-08) confirmed
+    TFB_EODHD_IDENTITY_GUARD=1 was ALREADY set, so the guard was active
+    and the live leak was the AO-4 undeclared-payload hole alone. The
+    ON default is retained as hygiene — a safety control's default
+    should match its production requirement; an explicit ENV value
+    always governs. Set TFB_EODHD_IDENTITY_GUARD=0 to restore the
+    unguarded v4.13.0 parse byte-identically."""
     return _env_str("TFB_EODHD_IDENTITY_GUARD", "1").strip().lower() in _TRUTHY
 
 
