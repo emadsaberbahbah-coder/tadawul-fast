@@ -3,9 +3,29 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.22.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.22.1)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.22.1 hotfix — SAFE CHAIN IS ANALYSIS-ONLY (drops /v1/advanced/* from
+  the L1 market chains; same TFB_SYNC_SAFE_GATEWAYS switch, no new ENV)
+- WHY (Render log 2026-07-09 01:48 Riyadh, during a Yahoo 401 "Invalid
+  Crumb" storm): "POST /v1/advanced/sheet-rows 200" — the v6.22.0 safe
+  chain's SECOND candidate is not a harmless 404. main.py canonically
+  routes the whole /v1/advanced/* prefix to routes.investment_advisor
+  (v2.17.0), a live 2,396-line module with ZERO transposition/identity
+  firewall markers (verified against repo HEAD); the unmounted
+  routes/advanced_sheet_rows.py file even carries the literal positional
+  pattern `{s: r for s, r in zip(symbols, data)}`. One analysis hiccup on
+  the first batch pins used_endpoint to advanced for the WHOLE page — an
+  unverified funnel exactly where the safe chain promised a verified one.
+- FIX: in safe mode, BOTH the "analysis"/"ai" and the "advanced" gateway
+  chains now return the analysis endpoints only. An analysis outage yields
+  an empty fetch -> the existing empty/shrink guards preserve last-good
+  rows (the availability trade v6.22.0 already accepted, now applied
+  consistently). L3 IDENTITY-TRIPWIRE remains the last fuse regardless.
+  TFB_SYNC_SAFE_GATEWAYS=0 still restores the full v6.21.0 chains
+  byte-identically. Everything else byte-identical to v6.22.0.
 
 v6.22.0 fix — SYMBOL↔NAME TRANSPOSITION FIREWALL, WRITER SIDE (three
   independent layers; L1+L2+L3 default ON with kill-switches; no workflow
@@ -671,7 +691,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.22.0"
+SCRIPT_VERSION = "6.22.1"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2716,17 +2736,12 @@ def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
     # enriched/default chains below are not market chains and are untouched
     # (in safe mode the four market pages never resolve to them).
     if _safe_gateways_enabled():
-        if gw in {"analysis", "ai"}:
+        # v6.22.1: analysis endpoints ONLY. /v1/advanced/* is served live by
+        # routes.investment_advisor (v2.17.0) which carries no transposition
+        # firewall — confirmed serving 200s in the 2026-07-09 01:48 Riyadh
+        # Render log — so it cannot sit in the verified market chain.
+        if gw in {"analysis", "ai", "advanced"}:
             return [
-                "/v1/analysis/sheet-rows",
-                "/analysis/sheet-rows",
-                "/v1/advanced/sheet-rows",
-                "/advanced/sheet-rows",
-            ]
-        if gw == "advanced":
-            return [
-                "/v1/advanced/sheet-rows",
-                "/advanced/sheet-rows",
                 "/v1/analysis/sheet-rows",
                 "/analysis/sheet-rows",
             ]
