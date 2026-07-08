@@ -36,6 +36,45 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.6.0 — DISPLAY-CORRECTNESS FIVE-PACK (evidence: live email/PDF of
+  2026-07-08 23:21 vs workbook export v37; every fix verified against both)
+- B1 KILL VALUE-SNIFFING (the +150%/-100%/-140% bug): _pct(), the
+  _glance_block bar scaler and _roi_color multiplied any |x|<=1.5 by 100 on
+  the guess it was a fraction. In production it never is: read_pages_live
+  returns Sheets FORMATTED values ("1.49%" -> 1.49 percent-POINTS via _num's
+  %-strip), so the three true small P&Ls (1050.SR +1.49, 1180.SR -1.03,
+  5023.SR -1.37) rendered as +150.0/-100.0/-140.0 and stretched every bar
+  to a 150% scale. All three sites now treat inputs as POINTS, period.
+- B1b XLSX PARITY: the raw workbook stores those same columns as FRACTIONS
+  (0.0149), so the offline --xlsx verification path silently disagreed with
+  the live path — the origin of the sniffing. read_pages_xlsx now normalizes
+  the known percent-formatted columns (x100) at load so offline == live and
+  no renderer ever needs to guess units again.
+- B2 NATIVE-CURRENCY LABEL (PDF section 2): the Value column printed
+  Position Value in the row's native currency with no label next to a SAR
+  book total (FER 198, RCI 1,624, BBD 849 are USD -> RCI looked like 5.7%
+  of the book while it is 21.2%). Metrics now capture the Currency column
+  and the cell renders "1,624 USD" for non-SAR rows.
+- B3 TOP-NAMES CLEANUP ("Blackrock, Banco, The, East" / "Innoviva,,
+  Regency, Regency, ... WesBanco,."): the note used name.split()[0]
+  verbatim (leading articles, trailing commas) and never deduped invest
+  rows. extract_market_page now dedupes by symbol (best Opportunity Score
+  wins) and _short_name() strips punctuation, drops a leading "The", takes
+  up to two words (cap 18 chars) and falls back to the SYMBOL when the
+  name cell is blank.
+- B4 ONE-MOVE vs DECISION-LAYER CONTRADICTION: the hero said "add BBD.US,
+  ~1,422 SAR stays dry powder" while the decision layer itself deployed
+  2,482 across THREE adds. Hero, preheader, subject and the plaintext ONE
+  MOVE now report ALL funded adds with their total and the true remainder.
+- B5 ONE RELIABILITY PER CARD: the opportunity card header showed the
+  Top_10 screen Rel (88) while its own outlook strip showed the forecast
+  path reliability (85). The header now uses the SAME path reliability as
+  the strip when available (Top_10 Rel is the fallback), so a card never
+  argues with itself.
+- New helpers: _short_name, _val_ccy, _xlsx_normalize_units,
+  _XLSX_FRACTION_HEADERS. No functions removed; everything else
+  byte-identical to v1.5.0.
+
 v1.5.0 — PDF REDESIGN + PORTFOLIO FINANCIALS (owner request, 2026-07-05)
     * PDF fully redesigned: masthead band matching the email (ink/brass), a
       KPI strip (book value, CURRENT ROI, freed cash, holdings, new buys),
@@ -126,7 +165,7 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import argparse
 import datetime as _dt
@@ -177,15 +216,18 @@ def _num(v: Any) -> Optional[float]:
 
 
 def _pct(x: Optional[float], digits: int = 1) -> str:
-    """Render a fraction-or-percent value as a percent string.
+    """Render a percent-POINTS value (1.49 -> "+1.5%"). NO unit guessing.
 
-    Sheet values are stored inconsistently: P&L % as whole numbers (-20.0),
-    forecast ROI as fractions (0.568). We treat |x|<=1.5 as a fraction.
+    v1.6.0 (B1): the old |x|<=1.5 fraction heuristic turned the three real
+    small P&Ls of 2026-07-08 (+1.49 / -1.03 / -1.37) into +150/-100/-140 in
+    the sent brief. In production every percent-like cell arrives as POINTS:
+    read_pages_live returns Sheets FORMATTED values ("1.49%") and _num strips
+    the % sign. The offline xlsx path is normalized to the same convention in
+    read_pages_xlsx (_xlsx_normalize_units), so callers never pass fractions.
     """
     if x is None:
         return "—"
-    v = x * 100.0 if abs(x) <= 1.5 else x
-    return f"{v:+.{digits}f}%"
+    return f"{x:+.{digits}f}%"
 
 
 def _money(x: Optional[float]) -> str:
@@ -251,6 +293,42 @@ def read_pages_live(spreadsheet_id: str, pages: List[str]) -> Dict[str, List[Lis
     return out
 
 
+# v1.6.0 (B1b): columns the WORKBOOK stores as FRACTIONS (0.0149) but the
+# live Sheets API delivers as formatted percent-POINTS ("1.49%" -> 1.49).
+# read_pages_xlsx multiplies these by 100 at load so the offline path is
+# byte-equivalent to production and no renderer ever unit-guesses again.
+# (Verified per page against export v37: identical fraction storage on
+# My_Portfolio and all four market pages; Decision/Top_10 percent columns
+# are already points in the raw file and are NOT listed here.)
+_XLSX_FRACTION_HEADERS = frozenset({
+    "dividend yield", "profit margin", "gross margin", "operating margin",
+    "revenue growth yoy", "payout ratio", "expected roi 1m",
+    "expected roi 3m", "expected roi 12m", "unrealized p/l %",
+    "volatility 30d", "volatility 90d",
+})
+
+
+def _xlsx_normalize_units(rows: List[List[Any]]) -> List[List[Any]]:
+    """x100 the known fraction-stored percent columns (numeric cells only)."""
+    if not rows:
+        return rows
+    h = _find_header(rows, ("symbol", "name"))
+    if h < 0:
+        return rows
+    hdr = rows[h]
+    idxs = [i for i, c in enumerate(hdr)
+            if _s(c).strip().lower() in _XLSX_FRACTION_HEADERS]
+    if not idxs:
+        return rows
+    for r in rows[h + 1:]:
+        if not isinstance(r, list):
+            continue
+        for i in idxs:
+            if i < len(r) and isinstance(r[i], (int, float)) and not isinstance(r[i], bool):
+                r[i] = r[i] * 100.0
+    return rows
+
+
 def read_pages_xlsx(path: str, pages: List[str]) -> Dict[str, List[List[Any]]]:
     import pandas as pd  # local import: verification path only
 
@@ -259,7 +337,7 @@ def read_pages_xlsx(path: str, pages: List[str]) -> Dict[str, List[List[Any]]]:
     for p in pages:
         if p in xl.sheet_names:
             df = pd.read_excel(path, sheet_name=p, header=None, dtype=object)
-            out[p] = df.where(df.notna(), None).values.tolist()
+            out[p] = _xlsx_normalize_units(df.where(df.notna(), None).values.tolist())
         else:
             out[p] = []
     return out
@@ -438,7 +516,24 @@ def extract_market_page(rows: List[List[Any]], top_n: int = 5) -> Dict[str, Any]
                 "opp": _num(_cell(r, ci["opp"])) or 0.0,
             })
     invest.sort(key=lambda d: d["opp"], reverse=True)
-    return {"total": total, "invest": len(invest), "top": invest[:top_n]}
+    # v1.6.0 (B3): the poisoned/duplicated universe pages can carry the SAME
+    # company twice — either the literal symbol repeated, or the dual-listing
+    # convention pair (REG and REG.US both present; 82 such pairs counted on
+    # Market_Leaders in export v37) — which printed "Regency, Regency" in the
+    # 2026-07-08 brief. Dedupe AFTER the sort on the BASE symbol (a trailing
+    # ".US" stripped; other exchange suffixes are real distinct listings and
+    # are never touched) so the best Opportunity Score row represents it.
+    seen: set = set()
+    deduped: List[Dict[str, Any]] = []
+    for d_ in invest:
+        k = d_["symbol"].upper()
+        if k.endswith(".US"):
+            k = k[:-3]
+        if k in seen:
+            continue
+        seen.add(k)
+        deduped.append(d_)
+    return {"total": total, "invest": len(deduped), "top": deduped[:top_n]}
 
 
 def extract_symbol_metrics(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Dict[str, Any]]:
@@ -501,6 +596,8 @@ def extract_symbol_metrics(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, 
             "avgcost": _col_index(hdr, "Avg Cost"),
             "pval": _col_index(hdr, "Position Value"),
             "sector": _col_index(hdr, "Sector"),
+            # v1.6.0 (B2): needed to label native-currency Position Values.
+            "ccy": _col_index(hdr, "Currency"),
         }
         if ci["symbol"] is None:
             continue
@@ -514,6 +611,7 @@ def extract_symbol_metrics(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, 
             for k in numeric:
                 m[k] = _num(_cell(r, ci[k]))
             m["sector"] = _s(_cell(r, ci["sector"]))
+            m["ccy"] = _s(_cell(r, ci["ccy"])).upper()  # v1.6.0 (B2)
             out[sym] = m
     return out
 
@@ -563,10 +661,14 @@ def _opp_row(rank: int, p: Dict[str, Any], metrics: Optional[Dict[str, Dict[str,
     cc = ADD_C if conf.lower() == "high" else (TRIM_C if conf.lower() in ("medium", "moderate") else "#888")
     m = (metrics or {}).get(p["symbol"].upper())  # v1.3.0
     extras = _fund_line(m) + _range52_bar(m)      # v1.3.0
+    # v1.6.0 (B5): the card header and its outlook strip must quote the SAME
+    # reliability. Prefer the forecast-path score the strip shows; the Top_10
+    # screen Rel is only the fallback when the metrics row is missing.
+    rel_show = m.get("rel") if (m and m.get("rel") is not None) else p["rel"]
     return f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:0; background:#E9F5EF; border:1px solid #C7E4D5;"><tr>
       <td style="padding:12px 12px; width:34px; vertical-align:top;"><div style="width:24px; height:24px; background:{ADD_C}; color:#fff; border-radius:50%; text-align:center; line-height:24px; font-family:{SANS}; font-size:12px; font-weight:bold;">{rank}</div></td>
       <td style="padding:11px 6px; font-family:{SANS};"><div style="font-size:14px; color:#1A1A1A;"><strong>{_esc(p['symbol'])}</strong> <span style="color:#777; font-size:12px;">{_esc(p['name'])[:30]}</span></div><div style="font-size:11px; color:#8A8A8A; margin-top:2px;">{_esc(p['sector'])} · {_esc(p['market'])}</div>{extras}</td>
-      <td align="right" style="padding:11px 14px; font-family:{SANS}; white-space:nowrap; vertical-align:top;"><div style="font-size:13px; color:#0E7C5A;"><strong>{_pct(p['roi'],0)} to fair value</strong></div><div style="font-size:11px; color:#888;">Reliability {_num_str(p['rel'])} · <span style="color:{cc};">{conf}</span></div></td></tr></table>{_outlook_strip(m)}<div style="height:7px; font-size:0; line-height:0;">&nbsp;</div>"""
+      <td align="right" style="padding:11px 14px; font-family:{SANS}; white-space:nowrap; vertical-align:top;"><div style="font-size:13px; color:#0E7C5A;"><strong>{_pct(p['roi'],0)} to fair value</strong></div><div style="font-size:11px; color:#888;">Reliability {_num_str(rel_show)} · <span style="color:{cc};">{conf}</span></div></td></tr></table>{_outlook_strip(m)}<div style="height:7px; font-size:0; line-height:0;">&nbsp;</div>"""
 
 
 def _num_str(x: Optional[float]) -> str:
@@ -589,10 +691,10 @@ def _mcap_compact(x: Optional[float]) -> str:
 
 
 def _roi_color(x: Optional[float]) -> str:
+    # v1.6.0 (B1): input is percent-POINTS; sign alone decides the color.
     if x is None:
         return "#888"
-    v = x * 100.0 if abs(x) <= 1.5 else x
-    return ADD_C if v > 0 else (SELL_C if v < 0 else "#888")
+    return ADD_C if x > 0 else (SELL_C if x < 0 else "#888")
 
 
 def _outlook_strip(m: Optional[Dict[str, Any]]) -> str:
@@ -663,8 +765,9 @@ def _glance_block(d: Dict[str, Any]) -> str:
     holdings = d["sell"] + d["trim"] + d["add"] + d["hold"]
 
     def v(r: Dict[str, Any]) -> float:
-        pl = r["pl"]
-        return pl * 100.0 if abs(pl) <= 1.5 else pl
+        # v1.6.0 (B1): percent-POINTS as stored; the old <=1.5 fraction guess
+        # inflated real small P&Ls x100 and set the whole bar scale to 150%.
+        return float(r["pl"])
 
     rows = sorted([r for r in holdings if r.get("pl") is not None], key=v, reverse=True)
     if not rows:
@@ -703,13 +806,24 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     date_short = when.strftime("%d %B %Y")
 
     # ---- hero numbers ----
+    # v1.6.0 (B4): the hero used to narrate ONLY d["add"][0] and call the rest
+    # "dry powder" — while the decision layer it quotes was deploying that
+    # same cash across THREE adds (2026-07-08: "add BBD.US, ~1,422 dry" vs
+    # 2,482 deployed). The hero now reports every funded add, their total and
+    # the TRUE remainder, so the one-move card can never contradict the
+    # action table below it.
     freed = d["freed_cash"]
-    add = d["add"][0] if d["add"] else None
-    add_sar = add["sar"] if add else 0.0
-    dry = max(freed - add_sar, 0.0)
+    adds = d["add"]
+    add = adds[0] if adds else None
+    adds_total = sum((r.get("sar") or 0.0) for r in adds)
+    dry = max(freed - adds_total, 0.0)
     sell_syms = ", ".join(r["symbol"].split(".")[0] for r in d["sell"][:3]) or "—"
     trim_sym = d["trim"][0]["symbol"].split(".")[0] if d["trim"] else "—"
     add_sym = add["symbol"] if add else "—"
+    adds_syms = ", ".join(r["symbol"] for r in adds) or "—"
+    adds_list_html = ", ".join(
+        f'<strong style="color:{ADD_C};">{_esc(r["symbol"])}</strong>'
+        f'&nbsp;(~{_money(r.get("sar") or 0.0)})' for r in adds)
 
     # v1.2.0: build the hero conditionally instead of always rendering the
     # buy-day template. See the module docstring WHY block. The exit/trim
@@ -725,13 +839,22 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
         freed_sentence = ""
 
     if add:
-        preheader = f"Today's move: free ~{_money(freed)} SAR, add {add_sym}, keep the rest as dry powder."
+        _n_adds = len(adds)
+        _adds_word = add_sym if _n_adds == 1 else f"{_n_adds} adds"
+        preheader = (f"Today's move: free ~{_money(freed)} SAR, fund {_adds_word} "
+                     f"(~{_money(adds_total)} SAR)"
+                     + (f", keep ~{_money(dry)} SAR as dry powder." if dry >= 1 else "."))
         hero_title = (f'Free up <strong style="color:{INK};">~{_money(freed)}&nbsp;SAR</strong>, '
-                      f'then add <strong style="color:{ADD_C};">{_esc(add_sym)}</strong>')
+                      f'then fund <strong style="color:{ADD_C};">{_esc(_adds_word)}</strong>')
+        _dry_tail = (f' The remaining <strong style="color:{INK};">~{_money(dry)}&nbsp;SAR is '
+                     f'dry powder</strong> for the new opportunities below.'
+                     if dry >= 1 else
+                     ' That deploys the freed cash almost to the riyal — the new '
+                     'opportunities below are the next call on fresh capital.')
         hero_body = (f'{freed_sentence} — about <strong>{_money(freed)}&nbsp;SAR</strong> freed. '
-                     f'Put <strong>~{_money(add_sar)}&nbsp;SAR</strong> into {_esc(add_sym)}, the one buy '
-                     f'the engine backs at high confidence. The remaining <strong style="color:{INK};">'
-                     f'~{_money(dry)}&nbsp;SAR is dry powder</strong> for the new opportunities below.')
+                     f'The decision layer funds {adds_list_html} — '
+                     f'<strong>~{_money(adds_total)}&nbsp;SAR</strong> in total, every one a '
+                     f'high-confidence call.{_dry_tail}')
     elif freed_sentence:
         preheader = (f"Today's move: free ~{_money(freed)} SAR and hold it as dry powder — "
                      f"no buy clears the bar today.")
@@ -912,6 +1035,21 @@ def _breadth_pct(info: Dict[str, Any]) -> float:
     return max(0.0, min(100.0, inv / total * 100.0))
 
 
+def _short_name(name: str, symbol: str = "") -> str:
+    """v1.6.0 (B3): compact display name for the market-page strip.
+
+    The old name.split()[0] printed leading articles and trailing commas
+    verbatim ("The", "East", "Innoviva,", "WesBanco,."). Strip punctuation,
+    drop a leading "The", keep up to two words (18-char cap) and fall back
+    to the SYMBOL when the name cell is blank."""
+    words = [w.strip(" ,.;:—-") for w in _s(name).split()]
+    words = [w for w in words if w]
+    if words and words[0].lower() == "the":
+        words = words[1:]
+    short = " ".join(words[:2])[:18].rstrip(" ,.;:—-")
+    return short if short else _s(symbol)
+
+
 def _page_row(name: str, info: Dict[str, Any]) -> str:
     pretty = name.replace("_", " ")
     inv = info["invest"]
@@ -919,11 +1057,27 @@ def _page_row(name: str, info: Dict[str, Any]) -> str:
         note = "No signals clear the bar — <em>monitoring only</em>."
         ncol = "#777"
     elif inv <= 2:
-        nm = info["top"][0]["name"][:34] if info["top"] else ""
+        nm = (_short_name(info["top"][0]["name"], info["top"][0]["symbol"])
+              if info["top"] else "")
         note = f"Only {_esc(nm)} clears — effectively <em>monitoring only</em>."
         ncol = "#777"
     else:
-        names = ", ".join(_esc(t["name"].split()[0]) for t in info["top"][:5])
+        # v1.6.0 (B3): the strip lists NAMES, so repeats of the same display
+        # label collapse HERE (REGCP.US / REGCO.US are genuinely distinct
+        # preferred series of one issuer — real securities the data layer must
+        # keep — but "Regency Centers, Regency Centers" tells the reader
+        # nothing). Walk the ranked list, keep the first row per label.
+        _labels: List[str] = []
+        _seen_lbl: set = set()
+        for t in info["top"]:
+            _lbl = _short_name(t["name"], t["symbol"])
+            if _lbl.lower() in _seen_lbl:
+                continue
+            _seen_lbl.add(_lbl.lower())
+            _labels.append(_esc(_lbl))
+            if len(_labels) == 5:
+                break
+        names = ", ".join(_labels)
         note = f"Top names: {names}."
         ncol = "#555"
     return f"""<tr style="font-family:{SANS};"><td style="padding:10px 14px; font-size:13px; color:#1A1A1A; vertical-align:top; border-bottom:1px solid #E8E3D8; width:150px;"><strong>{_esc(pretty)}</strong><br><span style="font-size:11px; color:#999;">{info['total']:,} names · {inv} investable</span><div style="height:5px; background:#E8E3D8; margin-top:5px; font-size:0; line-height:0;"><div style="width:{_breadth_pct(info):.0f}%; height:5px; background:{ADD_C}; font-size:0; line-height:0;">&nbsp;</div></div></td><td style="padding:10px 14px; font-size:12px; color:{ncol}; line-height:1.5; border-bottom:1px solid #E8E3D8;">{note}</td></tr>"""
@@ -990,6 +1144,18 @@ def _pdf_txt(v: Any, limit: int = 64) -> str:
     if len(s) > limit:
         s = s[: limit - 3] + "..."
     return s.encode("latin-1", "replace").decode("latin-1")
+
+
+def _val_ccy(val_txt: str, ccy: str) -> str:
+    """v1.6.0 (B2): append the native currency code to a Position Value cell.
+
+    Position Value is stored in the ROW's currency (FER 198 / RCI 1,624 /
+    BBD 849 were USD) but sat unlabeled next to a SAR book total — RCI read
+    as 5.7% of the book when it is 21.2%. SAR (and blank) stay unadorned."""
+    c = _s(ccy).upper()
+    if not val_txt or val_txt == "-" or not c or c == "SAR":
+        return val_txt
+    return f"{val_txt} {c}"
 
 
 def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optional[bytes]:
@@ -1134,7 +1300,8 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
             m = mx.get(r["symbol"].upper(), {}) or {}
             cur = m.get("uplpct", r.get("pl"))
             rows2.append([_pdf_txt(r["symbol"], 12), _r(m.get("qty"), 0), _r(m.get("avgcost"), 2),
-                          _r(m.get("pval"), 0), _p(cur), _p(r.get("eroi")),
+                          _val_ccy(_r(m.get("pval"), 0), m.get("ccy") or ""),
+                          _p(cur), _p(r.get("eroi")),
                           _r(m.get("pe")), _r(m.get("pb")), _r(m.get("de"), 2),
                           _r(m.get("divy")), _r(m.get("beta"), 2)])
             ri = len(rows2) - 1
@@ -1248,7 +1415,9 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     """A concise plaintext alternative part (deliverability + non-HTML clients)."""
     d = model["decision"]; t = model["top10"]
     add = d["add"][0] if d["add"] else None
-    freed = d["freed_cash"]; dry = max(freed - (add["sar"] if add else 0.0), 0.0)
+    freed = d["freed_cash"]
+    _adds_total = sum((r.get("sar") or 0.0) for r in d["add"])
+    dry = max(freed - _adds_total, 0.0)  # v1.6.0 (B4): remainder after ALL adds
     lines: List[str] = [
         f"{owner} - Daily Investment Brief - {when:%A, %d %B %Y}",
         "Local & global markets. Daily-horizon, decision support - not advice; verify before acting.",
@@ -1256,8 +1425,11 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
         "TODAY'S ONE MOVE",
     ]
     if add:
-        lines.append(f"  Free ~{freed:,.0f} SAR (exit/trim below); add ~{add['sar']:,.0f} SAR of "
-                     f"{add['symbol']}; keep ~{dry:,.0f} SAR as dry powder for new buys.")
+        _adds_txt = ", ".join(f"{r['symbol']} ~{(r.get('sar') or 0.0):,.0f}" for r in d["add"])
+        _tail = (f"; keep ~{dry:,.0f} SAR as dry powder for new buys."
+                 if dry >= 1 else "; freed cash fully deployed.")
+        lines.append(f"  Free ~{freed:,.0f} SAR (exit/trim below); fund {_adds_txt} SAR"
+                     f" (~{_adds_total:,.0f} total){_tail}")
     else:
         lines.append("  No high-confidence portfolio action today.")
     lines += ["", f"BOOK: {d['pl_pct']:+.1f}% overall ({d['mv']:,.0f} vs {d['cost']:,.0f} SAR)", ""]
@@ -1304,7 +1476,9 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
 def build_subject(model: Dict[str, Any], when: _dt.datetime) -> str:
     d = model["decision"]
-    add = d["add"][0]["symbol"] if d["add"] else None
+    # v1.6.0 (B4): the subject named only the first add; name them all (cap 3).
+    _adds = [r["symbol"] for r in d["add"]]
+    add = ", ".join(_adds[:3]) + ("…" if len(_adds) > 3 else "") if _adds else None
     teaser = (f"free ~{d['freed_cash']:,.0f} SAR, add {add}"
               if add and d["freed_cash"] else "portfolio + market update")
     return f"Daily Investment Brief — {when:%d %b %Y} · {teaser}"
