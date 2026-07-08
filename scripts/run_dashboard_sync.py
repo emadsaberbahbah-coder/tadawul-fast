@@ -3,9 +3,63 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.21.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.22.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.22.0 fix — SYMBOL↔NAME TRANSPOSITION FIREWALL, WRITER SIDE (three
+  independent layers; L1+L2+L3 default ON with kill-switches; no workflow
+  ENV action required to arm them)
+- WHY (confirmed live 2026-07-08, evening export v37): between 17:30 and
+  18:12 UTC this runner rewrote 1,274/1,283 Market_Leaders rows (and then
+  Global_Markets) with symbol↔attribute TRANSPOSED payloads — 1010.SR
+  carried "AstraZeneca PLC", 1120.SR "Bruker Corporation", GOOGL "Arabia
+  Insurance Cooperative Company", 005930.KS "Bharti Airtel"; 8/19 known
+  Saudi anchors were foreign on ML and ~7/11 on GM — OVERWRITING a clean
+  GAS batch refresh completed 3h earlier. ROOT CAUSE: all four market
+  TaskSpecs default gateway="enriched", so the PRIMARY serving route is
+  /v1/enriched/sheet-rows, which carries NEITHER the analysis router's
+  transposition firewall (v4.7.0+) nor its rank/dedup passes (v6.13.0 WHY
+  block already documented "neither pass" for enriched); GAS refreshes go
+  through /v1/analysis/sheet-rows and stay clean. The writer then trusted
+  the rows verbatim: STRICT-MEMBERSHIP checks the Symbol cell only, so a
+  row with the RIGHT symbol and the WRONG attribute payload sails through.
+- L1 [SAFE-GATEWAYS] (TFB_SYNC_SAFE_GATEWAYS, default ON): the four
+  _RANKED_MARKET_PAGES resolve to the "analysis" gateway REGARDLESS of the
+  v6.10.0 boolean and the v6.18.0 override, and the market candidate
+  chains lose their unfirewalled tails (/v1/ai/*, /v1/enriched/*) — an
+  analysis outage now leaves the page on last-good rows via the existing
+  empty/shrink guards instead of accepting unfirewalled rows. Conscious
+  availability trade; =0 restores the v6.21.0 routing byte-identically.
+  My_Portfolio keeps its enriched gateway this build (122-col schema);
+  L3 covers its identity instead.
+- L2 [BATCH-IDENTITY] (TFB_SYNC_BATCH_IDENTITY, default ON): the batched
+  market fetcher now (a) drops any row whose Symbol is not in THAT
+  batch's requested set (cross-batch bleed), (b) collapses duplicate
+  symbols (first occurrence wins), (c) drops blank-symbol rows, and
+  (d) emits the combined matrix keyed BY SYMBOL in the REQUESTED order —
+  no positional concatenation survives. Fail-safe: Symbol column missing
+  from the response headers -> legacy extend() path unchanged. =0
+  restores v6.21.0 accumulation byte-identically.
+- L3 [IDENTITY-TRIPWIRE] (TFB_SYNC_IDENTITY_TRIPWIRE, default ON;
+  threshold TFB_SYNC_IDENTITY_MIN_FAILS, default 2; extra pairs via
+  TFB_SYNC_IDENTITY_ANCHORS_EXTRA "SYM=sub|sub,SYM2=sub"): before the
+  clear/write, verify the built-in Symbol->Name anchor pairs that are
+  PRESENT in the fetched matrix (1120.SR must contain "rajhi", 2222.SR
+  "aramco"/"saudi arabian oil", AAPL "apple", 005930.KS "samsung", ...).
+  >= threshold mismatches => the payload is transposed at the source =>
+  SKIP clear+write (status=skipped, last-good rows preserved, loud
+  logger.error naming up to 10 offending pairs) — the same preserve
+  semantics as the empty/shrink guards. Blank names never count as a
+  mismatch; a page with no anchors present is never blocked. This layer
+  would have BLOCKED tonight's ML write (>=5 anchor failures observed).
+- New helpers: _safe_gateways_enabled, _batch_identity_enabled,
+  _identity_tripwire_enabled, _identity_min_fails, _identity_extra_anchors,
+  _identity_anchor_map, _identity_anchor_scan, _GUARD_NAME_ALIASES,
+  _IDENTITY_ANCHORS. Touched: _effective_gateway,
+  _endpoint_candidates_for_gateway, _fetch_market_rows_batched,
+  _run_one_task (one inserted guard block). Everything else byte-identical
+  to v6.21.0; zero functions removed.
 
 v6.21.0 fix — SMALL-PAGE STARVATION (Fix #6: page-order override +
   bounded empty-row retry; two INDEPENDENT env switches, both inert by
@@ -617,7 +671,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.21.0"
+SCRIPT_VERSION = "6.22.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1258,6 +1312,11 @@ _GUARD_SENTINEL_ALIASES = frozenset({
 # Symbol/identifier column aliases (for row matching across payload <-> sheet).
 _GUARD_SYMBOL_ALIASES = frozenset({
     "symbol", "ticker", "tickersymbol", "symbolticker", "code", "instrument",
+})
+
+# Company-name column aliases (v6.22.0 — identity tripwire needs the Name cell).
+_GUARD_NAME_ALIASES = frozenset({
+    "name", "companyname", "company", "longname", "shortname", "securityname",
 })
 
 # -----------------------------------------------------------------------------
@@ -2291,6 +2350,163 @@ def _filter_rows_to_requested(
     return kept_rows, dropped
 
 
+# -----------------------------------------------------------------------------
+# v6.22.0 [IDENTITY] — Symbol<->Name transposition firewall, writer side
+# -----------------------------------------------------------------------------
+# See the v6.22.0 header changelog for the live root cause (2026-07-08:
+# enriched-gateway rows carried the requested SYMBOLS with FOREIGN attribute
+# payloads; membership filtering is symbol-cell-only and cannot see it).
+
+_IDENTITY_TAG = "[v6.22.0 IDENTITY-TRIPWIRE]"
+_BATCH_IDENTITY_TAG = "[v6.22.0 BATCH-IDENTITY]"
+_SAFE_GW_TAG = "[v6.22.0 SAFE-GATEWAYS]"
+
+# Built-in anchor pairs: symbol -> accepted casefolded substrings of the TRUE
+# company name. Curated for stability (official renames included, e.g. SABB ->
+# Saudi Awwal Bank). A pair only participates when the symbol is PRESENT in
+# the fetched matrix; a blank Name cell never counts as a mismatch.
+_IDENTITY_ANCHORS: Dict[str, Tuple[str, ...]] = {
+    # Saudi (Tadawul)
+    "1010.SR": ("riyad",),
+    "1050.SR": ("fransi",),
+    "1060.SR": ("awwal", "sabb"),
+    "1080.SR": ("arab national",),
+    "1120.SR": ("rajhi",),
+    "1150.SR": ("alinma",),
+    "1180.SR": ("saudi national bank", "snb"),
+    "1211.SR": ("maaden", "saudi arabian mining"),
+    "2010.SR": ("sabic", "saudi basic"),
+    "2222.SR": ("aramco", "saudi arabian oil"),
+    "2280.SR": ("almarai",),
+    "4030.SR": ("bahri", "national shipping"),
+    "7010.SR": ("stc", "saudi telecom"),
+    "7020.SR": ("etihad etisalat", "mobily"),
+    # US (plain + .US convention)
+    "AAPL": ("apple",), "AAPL.US": ("apple",),
+    "MSFT": ("microsoft",), "MSFT.US": ("microsoft",),
+    "NVDA": ("nvidia",), "NVDA.US": ("nvidia",),
+    "GOOGL": ("alphabet", "google"), "GOOGL.US": ("alphabet", "google"),
+    "AMZN": ("amazon",), "AMZN.US": ("amazon",),
+    "META": ("meta",), "META.US": ("meta",),
+    "JPM": ("jpmorgan", "jp morgan"), "JPM.US": ("jpmorgan", "jp morgan"),
+    "XOM": ("exxon",), "XOM.US": ("exxon",),
+    # International
+    "005930.KS": ("samsung",),
+    "7203.T": ("toyota",),
+    "2914.T": ("japan tobacco",),
+    "0700.HK": ("tencent",),
+    "0939.HK": ("china construction",),
+    "NESN.SW": ("nestl",),
+    "ASML": ("asml",), "ASML.US": ("asml",),
+}
+
+
+def _safe_gateways_enabled() -> bool:
+    """v6.22.0 L1 master switch. Default ON; set TFB_SYNC_SAFE_GATEWAYS=
+    0/false/off/no to restore the v6.21.0 gateway resolution + candidate
+    chains byte-identically (market pages may then serve from the
+    unfirewalled enriched/ai routes again — not recommended)."""
+    return (os.getenv("TFB_SYNC_SAFE_GATEWAYS") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _batch_identity_enabled() -> bool:
+    """v6.22.0 L2 master switch. Default ON; set TFB_SYNC_BATCH_IDENTITY=
+    0/false/off/no to restore the v6.21.0 positional batch accumulation
+    byte-identically."""
+    return (os.getenv("TFB_SYNC_BATCH_IDENTITY") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _identity_tripwire_enabled() -> bool:
+    """v6.22.0 L3 master switch. Default ON; set TFB_SYNC_IDENTITY_TRIPWIRE=
+    0/false/off/no to disable the pre-write anchor verification (not
+    recommended — this is the layer that blocks a transposed payload)."""
+    return (os.getenv("TFB_SYNC_IDENTITY_TRIPWIRE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _identity_min_fails() -> int:
+    """v6.22.0: anchor mismatches required to trip (default 2, floor 1,
+    cap 50). One odd corporate rename can never block a page; a transposed
+    payload fails many anchors at once (tonight's ML: >=5)."""
+    return _safe_int(os.getenv("TFB_SYNC_IDENTITY_MIN_FAILS"), 2, lo=1, hi=50)
+
+
+def _identity_extra_anchors() -> Dict[str, Tuple[str, ...]]:
+    """v6.22.0: operator-extendable pairs, csv of SYM=sub|sub entries in
+    TFB_SYNC_IDENTITY_ANCHORS_EXTRA (e.g. "2082.SR=acwa,4200.SR=aldrees").
+    Malformed entries are skipped with a warning instead of failing the run."""
+    raw = (os.getenv("TFB_SYNC_IDENTITY_ANCHORS_EXTRA") or "").strip()
+    out: Dict[str, Tuple[str, ...]] = {}
+    if not raw:
+        return out
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            logger.warning(f"{_IDENTITY_TAG} bad extra anchor {part!r} skipped (no '=')")
+            continue
+        sym, _, subs = part.partition("=")
+        sym = sym.strip().upper()
+        toks = tuple(t.strip().casefold() for t in subs.split("|") if t.strip())
+        if sym and toks:
+            out[sym] = toks
+        else:
+            logger.warning(f"{_IDENTITY_TAG} bad extra anchor {part!r} skipped")
+    return out
+
+
+def _identity_anchor_map() -> Dict[str, Tuple[str, ...]]:
+    """Built-in anchors overlaid with the operator's extra pairs."""
+    m = dict(_IDENTITY_ANCHORS)
+    m.update(_identity_extra_anchors())
+    return m
+
+
+def _identity_anchor_scan(
+    headers: List[Any],
+    rows_matrix: List[List[Any]],
+) -> Tuple[int, int, List[Tuple[str, str]]]:
+    """v6.22.0: verify anchor Symbol->Name pairs PRESENT in the matrix.
+
+    Returns (checked, ok, mismatches) where mismatches is a list of
+    (symbol, seen_name). Rules: first occurrence of a symbol wins; a blank
+    or missing Name cell is neither ok nor a mismatch (blank != crossed);
+    matching is casefolded substring against the anchor's accepted tokens.
+    FAIL-SAFE: (0, 0, []) when the Symbol or Name column cannot be located —
+    a page without both columns is never blocked by this layer."""
+    if not headers or not rows_matrix:
+        return 0, 0, []
+    sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+    name_i = _guard_find_col(list(headers), _GUARD_NAME_ALIASES)
+    if sym_i < 0 or name_i < 0:
+        return 0, 0, []
+    anchors = _identity_anchor_map()
+    hi = max(sym_i, name_i)
+    seen: set = set()
+    checked = ok = 0
+    bad: List[Tuple[str, str]] = []
+    for row in rows_matrix:
+        if not isinstance(row, (list, tuple)) or len(row) <= hi:
+            continue
+        s = str(row[sym_i] or "").strip().upper()
+        if not s or s in seen:
+            continue
+        toks = anchors.get(s)
+        if not toks:
+            continue
+        seen.add(s)
+        if _guard_is_blank(row[name_i]):
+            continue  # blank name: cannot confirm, must not condemn
+        nm = str(row[name_i]).strip()
+        checked += 1
+        low = nm.casefold()
+        if any(t in low for t in toks):
+            ok += 1
+        else:
+            bad.append((s, nm[:60]))
+    return checked, ok, bad
+
+
 def _universe_deny_patterns() -> List["re.Pattern[str]"]:
     """v6.19.0 (WHY 2): compiled deny-patterns for the read-back universe.
     TFB_SYNC_UNIVERSE_DENY is a comma-separated regex list matched (re.match,
@@ -2491,6 +2707,29 @@ def _default_tasks() -> List[TaskSpec]:
 
 def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
     gw = (gw or "enriched").strip().lower()
+    # v6.22.0 L1 [SAFE-GATEWAYS]: the market chains drop their unfirewalled
+    # tails (/v1/ai/*, /v1/enriched/*). An analysis outage then yields an
+    # empty fetch -> the existing empty/shrink guards PRESERVE last-good rows,
+    # instead of accepting rows from a route without the transposition
+    # firewall. Conscious availability trade; TFB_SYNC_SAFE_GATEWAYS=0
+    # restores the v6.21.0 chains byte-identically. The argaam and
+    # enriched/default chains below are not market chains and are untouched
+    # (in safe mode the four market pages never resolve to them).
+    if _safe_gateways_enabled():
+        if gw in {"analysis", "ai"}:
+            return [
+                "/v1/analysis/sheet-rows",
+                "/analysis/sheet-rows",
+                "/v1/advanced/sheet-rows",
+                "/advanced/sheet-rows",
+            ]
+        if gw == "advanced":
+            return [
+                "/v1/advanced/sheet-rows",
+                "/advanced/sheet-rows",
+                "/v1/analysis/sheet-rows",
+                "/analysis/sheet-rows",
+            ]
     # include ai aliases because route naming can vary
     if gw in {"analysis", "ai"}:
         return [
@@ -2677,6 +2916,13 @@ def _effective_gateway(task: TaskSpec) -> str:
     unchanged. The "analysis" candidate chain ends at the enriched endpoints, so
     an analysis-route outage falls back to the prior path (the page loses the
     rank/dedup for that cycle -- never a failed write)."""
+    # v6.22.0 L1 [SAFE-GATEWAYS]: the four ranked market pages resolve to the
+    # ANALYSIS gateway (the only market router carrying the transposition
+    # firewall) REGARDLESS of the v6.10.0 boolean and the v6.18.0 override —
+    # the 2026-07-08 poisoning entered exactly through the enriched default.
+    # TFB_SYNC_SAFE_GATEWAYS=0 restores the v6.21.0 precedence byte-identically.
+    if _safe_gateways_enabled() and task.sheet_name in _RANKED_MARKET_PAGES:
+        return "analysis"
     # v6.18.0 (Fix 1): generic override wins when set; the v6.10.0 boolean and
     # the TaskSpec default apply unchanged when it is unset/blank.
     _ovr = _market_gateway_override()
@@ -2767,6 +3013,14 @@ async def _fetch_market_rows_batched(
     last_err: Optional[str] = None
     ok_batches = 0
 
+    # v6.22.0 L2 [BATCH-IDENTITY]: accumulate BY SYMBOL instead of by position.
+    _idb_on = _batch_identity_enabled()
+    _idb_sym_i = -1          # resolved from the first answering batch's headers
+    _idb_by_sym: Dict[str, List[Any]] = {}
+    _idb_bleed = 0           # rows whose symbol is not in THAT batch's request
+    _idb_dupes = 0           # repeated symbol rows (first occurrence wins)
+    _idb_blank = 0           # rows with a blank symbol cell (unaddressable)
+
     for bi, batch in enumerate(batches):
         p = dict(base_payload)
         p["tickers"] = batch
@@ -2798,12 +3052,53 @@ async def _fetch_market_rows_batched(
         if b_headers:
             if not headers:
                 headers = b_headers
+                if _idb_on:
+                    _idb_sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
             if b_matrix:
-                combined.extend(b_matrix)
+                if _idb_on and _idb_sym_i >= 0:
+                    _batch_set = {str(t or "").strip().upper() for t in batch}
+                    _batch_set.discard("")
+                    for _row in b_matrix:
+                        if (not isinstance(_row, (list, tuple))
+                                or _idb_sym_i >= len(_row)
+                                or _guard_is_blank(_row[_idb_sym_i])):
+                            _idb_blank += 1
+                            continue
+                        _t = str(_row[_idb_sym_i]).strip().upper()
+                        if _t not in _batch_set:
+                            _idb_bleed += 1
+                            continue
+                        if _t in _idb_by_sym:
+                            _idb_dupes += 1
+                            continue
+                        _idb_by_sym[_t] = list(_row)
+                else:
+                    # v6.21.0 path: Symbol column missing (or L2 off) -> legacy
+                    # positional accumulation, byte-identical.
+                    combined.extend(b_matrix)
             ok_batches += 1
 
         if delay_ms > 0 and bi < len(batches) - 1:
             await asyncio.sleep(delay_ms / 1000.0)
+
+    # v6.22.0 L2: emit in the REQUESTED symbol order (no positional artifact
+    # can survive), falling through to the legacy `combined` when the Symbol
+    # column never resolved or the layer is off.
+    if _idb_on and _idb_sym_i >= 0:
+        combined = [
+            _idb_by_sym[t]
+            for t in (str(s or "").strip().upper() for s in symbols)
+            if t in _idb_by_sym
+        ]
+        if _idb_bleed or _idb_dupes or _idb_blank:
+            _iw = (
+                f"{_BATCH_IDENTITY_TAG} {task.sheet_name}: dropped "
+                f"{_idb_bleed} cross-batch row(s), {_idb_dupes} duplicate-symbol "
+                f"row(s), {_idb_blank} blank-symbol row(s); kept "
+                f"{len(combined)} by-symbol row(s) in requested order."
+            )
+            res.warnings.append(_iw)
+            logger.warning(_iw)
 
     if headers:
         res.warnings.append(
@@ -3242,6 +3537,52 @@ async def _run_one_task(
                 _sm = f"{_STRICT_MEMBERSHIP_TAG} skipped (error: {_se})"
                 res.warnings.append(_sm)
                 logger.warning(_sm)
+        # ---------------------------------------------------------------------
+
+        # --- Symbol<->Name identity tripwire (v6.22.0 L3) --------------------
+        # Live failure mode (2026-07-08 17:30-18:12 UTC): the response carried
+        # the REQUESTED symbols with attribute payloads belonging to OTHER
+        # symbols (ML 1010.SR="AstraZeneca PLC", GOOGL="Arabia Insurance
+        # Cooperative Company", ...). Membership filtering reads only the
+        # Symbol cell and cannot see it. Verify the built-in anchor pairs
+        # PRESENT in the fetched matrix; >= TFB_SYNC_IDENTITY_MIN_FAILS
+        # mismatches (default 2; tonight's ML showed >=5) means the payload is
+        # transposed at the source -> SKIP clear+write and PRESERVE last-good
+        # rows, exactly like the empty/shrink guards. Blank names never count;
+        # a page with no anchors present is never blocked. Scoped like
+        # membership (requested-symbol pages); TFB_SYNC_IDENTITY_TRIPWIRE=0
+        # disables (not recommended).
+        if (_identity_tripwire_enabled() and task.expects_rows and symbols
+                and rows_matrix and headers):
+            try:
+                _idn_checked, _idn_ok, _idn_bad = _identity_anchor_scan(headers, rows_matrix)
+                if _idn_checked:
+                    res.warnings.append(
+                        f"{_IDENTITY_TAG} {task.sheet_name}: anchors "
+                        f"checked={_idn_checked} ok={_idn_ok} "
+                        f"mismatched={len(_idn_bad)}"
+                    )
+                if len(_idn_bad) >= _identity_min_fails():
+                    _pairs = "; ".join(f"{_s}='{_n}'" for _s, _n in _idn_bad[:10])
+                    _msg = (
+                        f"{_IDENTITY_TAG} TRIPPED on '{task.sheet_name}': "
+                        f"{len(_idn_bad)}/{_idn_checked} identity anchors carry "
+                        f"a FOREIGN name ({_pairs}) — the response is "
+                        f"symbol<->attribute transposed at the source. Skipping "
+                        f"clear+write to PRESERVE last-good rows; the next "
+                        f"healthy sync self-heals. TFB_SYNC_IDENTITY_TRIPWIRE=0 "
+                        f"disables (not recommended)."
+                    )
+                    res.status = "skipped"
+                    res.rows_written = 0
+                    res.rows_failed = 0
+                    res.warnings.append(_msg)
+                    logger.error(_msg)
+                    return res
+            except Exception as _ie:  # never let the tripwire break the write path
+                _iw = f"{_IDENTITY_TAG} skipped (error: {_ie})"
+                res.warnings.append(_iw)
+                logger.warning(_iw)
         # ---------------------------------------------------------------------
 
         # --- My_Portfolio manual-cell write guard (v6.5.0) -------------------
