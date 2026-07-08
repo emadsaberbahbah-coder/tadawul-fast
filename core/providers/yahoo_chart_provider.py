@@ -59,8 +59,20 @@ errors, NOT same-currency crossings like today's 17.32-vs-43.54
 (ratio 2.5x) — YC-1 is the fix for those; YC-3 is belt for the
 unit-class family only.
 
-Version: PROVIDER_VERSION = "8.7.0". All prior WHY blocks preserved
+Version: PROVIDER_VERSION = "8.7.1". All prior WHY blocks preserved
 verbatim. Zero functions removed (AST-verified).
+
+v8.7.1 — RAW PREV-CLOSE SEMANTICS HOTFIX
+-----------------------------------------------------------------------
+WHY (live probe minutes after the v8.7.0 deploy): 2222.SR served
+previous_close 28.25 — ABOVE its own 52w high 27.96 — fabricating a
+-4.78% day move. Yahoo's meta.chartPreviousClose is the close before
+the REQUESTED WINDOW (the 2y history range here), not the prior
+session. The raw parser now prefers regularMarketPreviousClose, then
+the second-to-last history bar close (the true prior session), then
+plain previousClose; chartPreviousClose is consulted ONLY for intraday
+ranges (1d/5d) where its meaning coincides with the prior session.
+Parser-only change; transport, guards, and flow untouched.
 
 v8.7.0 — RAW CHART TRANSPORT + SILENT-NONE ELIMINATION (Fix YC-RAW)
 -----------------------------------------------------------------------
@@ -523,7 +535,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.7.0"
+PROVIDER_VERSION = "8.7.1"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -817,11 +829,20 @@ async def _raw_http_get_json(url: str, params: Dict[str, Any], timeout: float) -
 
 
 def _raw_chart_parse_triple(
-    ysym: str, data: Any,
+    ysym: str, data: Any, range_: str = "",
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
     """Parse a v8/finance/chart payload into the (info, meta, history)
     triple _fetch_ticker_sync returns, so downstream is transport-blind.
-    Pure; raises YahooFetchError on error/malformed payloads."""
+    Pure; raises YahooFetchError on error/malformed payloads.
+
+    v8.7.1 PREV-CLOSE SEMANTICS: Yahoo's meta.chartPreviousClose is the
+    close BEFORE THE REQUESTED WINDOW, not the prior session — on the 2y
+    history range it handed 2222.SR a "previous close" of 28.25 (above
+    its own 52w high 27.96), fabricating a -4.78% day move (live probe
+    2026-07-08). Priority is now: regularMarketPreviousClose (true
+    session field) -> second-to-last history bar close -> plain
+    previousClose -> chartPreviousClose ONLY for intraday ranges
+    (1d/5d), where its meaning coincides with the prior session."""
     chart = (data or {}).get("chart") if isinstance(data, dict) else None
     if not isinstance(chart, dict):
         raise YahooFetchError("malformed_payload")
@@ -836,28 +857,6 @@ def _raw_chart_parse_triple(
     meta_raw = r0.get("meta") or {}
     if not isinstance(meta_raw, dict):
         meta_raw = {}
-
-    prev_close = _first_number(
-        meta_raw.get("chartPreviousClose"),
-        meta_raw.get("previousClose"),
-        meta_raw.get("regularMarketPreviousClose"),
-    )
-    info: Dict[str, Any] = {
-        "symbol": _safe_str(meta_raw.get("symbol")) or ysym,
-        "regularMarketPrice": _safe_float(meta_raw.get("regularMarketPrice")),
-        "previousClose": prev_close,
-        "regularMarketPreviousClose": prev_close,
-        "currency": _safe_str(meta_raw.get("currency")),
-        "exchange": _safe_str(meta_raw.get("exchangeName")),
-        "fullExchangeName": _safe_str(meta_raw.get("fullExchangeName")),
-        "regularMarketDayHigh": _safe_float(meta_raw.get("regularMarketDayHigh")),
-        "regularMarketDayLow": _safe_float(meta_raw.get("regularMarketDayLow")),
-        "fiftyTwoWeekHigh": _safe_float(meta_raw.get("fiftyTwoWeekHigh")),
-        "fiftyTwoWeekLow": _safe_float(meta_raw.get("fiftyTwoWeekLow")),
-        "regularMarketVolume": _safe_float(meta_raw.get("regularMarketVolume")),
-        "regularMarketTime": meta_raw.get("regularMarketTime"),
-    }
-    info = {k: v for k, v in info.items() if v is not None}
 
     history: List[Dict[str, Any]] = []
     ts_list = r0.get("timestamp") or []
@@ -888,6 +887,31 @@ def _raw_chart_parse_triple(
             "close": close_v,
             "volume": _safe_float(vols[i] if i < len(vols) else None),
         })
+
+    prev_close = _first_number(meta_raw.get("regularMarketPreviousClose"))
+    if prev_close is None and len(history) >= 2:
+        prev_close = history[-2].get("close")
+    if prev_close is None:
+        prev_close = _first_number(meta_raw.get("previousClose"))
+    if prev_close is None and (range_ or "").strip().lower() in ("1d", "5d"):
+        prev_close = _first_number(meta_raw.get("chartPreviousClose"))
+
+    info: Dict[str, Any] = {
+        "symbol": _safe_str(meta_raw.get("symbol")) or ysym,
+        "regularMarketPrice": _safe_float(meta_raw.get("regularMarketPrice")),
+        "previousClose": prev_close,
+        "regularMarketPreviousClose": prev_close,
+        "currency": _safe_str(meta_raw.get("currency")),
+        "exchange": _safe_str(meta_raw.get("exchangeName")),
+        "fullExchangeName": _safe_str(meta_raw.get("fullExchangeName")),
+        "regularMarketDayHigh": _safe_float(meta_raw.get("regularMarketDayHigh")),
+        "regularMarketDayLow": _safe_float(meta_raw.get("regularMarketDayLow")),
+        "fiftyTwoWeekHigh": _safe_float(meta_raw.get("fiftyTwoWeekHigh")),
+        "fiftyTwoWeekLow": _safe_float(meta_raw.get("fiftyTwoWeekLow")),
+        "regularMarketVolume": _safe_float(meta_raw.get("regularMarketVolume")),
+        "regularMarketTime": meta_raw.get("regularMarketTime"),
+    }
+    info = {k: v for k, v in info.items() if v is not None}
     return info, meta_raw, history
 
 
@@ -901,7 +925,7 @@ async def _raw_chart_fetch_triple(
     for host in _RAW_CHART_HOSTS:
         try:
             data = await _raw_http_get_json(f"{host}/v8/finance/chart/{ysym}", params, timeout)
-            return _raw_chart_parse_triple(ysym, data)
+            return _raw_chart_parse_triple(ysym, data, range_)
         except Exception as exc:  # noqa: BLE001 — ladder tries next host
             last_exc = exc
             continue
