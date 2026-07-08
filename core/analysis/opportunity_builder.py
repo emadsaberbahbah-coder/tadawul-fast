@@ -544,7 +544,36 @@ from datetime import datetime, timedelta, timezone
 #     longer masquerades as the forecast.
 # KILL SWITCH: leave TFB_OPP_PRIMARY_ROI_BASIS unset (or "valuation") ->
 # byte-identical v1.0.19 payload.
-OPPORTUNITY_BUILDER_VERSION = "1.0.22"
+# =============================================================================
+# v1.0.23 (2026-07-08) — TP1 EXECUTION-PLAN ROI BASIS (new default "plan")
+# -----------------------------------------------------------------------------
+# WHY (operator conviction, live sheet 2026-07-08): the three rendered columns
+# ROI % / Engine ROI % / Ann ROI % showed ONE number three times. Mechanism:
+# qualified names cluster AT max_valuation_roi_pct (35) — the header's own
+# v1.0.20 note predicted this — while the engine's DISPLAYED 12M forecast is
+# independently ceiling-capped at the same 35 (engine v5.87.0 display cap +
+# the expected-roi cap audit measured 0 rows above 35), and a 12-month panel
+# period makes annualization the identity. Result: a 35/35/35 wall that says
+# nothing an investor can act on.
+# FIX: a third primary_roi_basis value "plan" — the TP1 EXECUTION plan the
+# ticket actually proposes: roi = (TP1 - entry)/entry (by construction half
+# the valuation upside, since TP1 = price + 0.5*(ref - price)), ann = that
+# plan compounded over the panel period (same formula as
+# normalize_candidate), exp_gain = suggested x ann/100 (reproducibility
+# contract preserved; KPI sum identity holds automatically), detail.rr =
+# plan/stop (the R/R of the plan you would actually run). Engine ROI % and
+# valuation_roi_pct parallels are ALWAYS emitted under this basis, so the
+# three columns finally mean three things: MY PLAN to first target / the
+# ENGINE's honest forecast / the plan ANNUALIZED. Honest fallback: a ticket
+# without a TP ladder (v1.0.22 TP-COHERENCE blanked it) renders the
+# valuation basis for that ticket and is stamped so. Selection, gates,
+# scoring, sizing, ordering: UNTOUCHED — this is display semantics only.
+# DEFAULT: "plan" (per the 2026-07-08 operator decision). Reversible:
+# TFB_OPP_PRIMARY_ROI_BASIS=valuation -> byte-identical v1.0.22 rendering;
+# =engine -> the v1.0.20 engine basis. All prior WHYs preserved verbatim.
+# Zero functions removed (AST-verified).
+# =============================================================================
+OPPORTUNITY_BUILDER_VERSION = "1.0.23"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -709,8 +738,9 @@ DEFAULT_CRITERIA = {
     # v1.0.5 engine-forecast display (env-tunable; see policy block)
     "engine_roi_display_enabled": False,
     # v1.0.20: basis of the PRIMARY rendered roi/ann/gain figures + KPI.
-    # "valuation" (default, byte-identical) | "engine" (Fix #3 honesty mode).
-    "primary_roi_basis": "valuation",
+    # v1.0.23: "plan" (TP1 execution plan, NEW DEFAULT per operator) |
+    # "engine" (Fix #3 honesty mode) | "valuation" (v1.0.19 rendering).
+    "primary_roi_basis": "plan",
     # v1.0.6 data-trust gate (env-tunable; see policy block)
     "trust_gate_enabled": True,
     "max_data_age_hours": 168.0,
@@ -893,12 +923,20 @@ def _env_engine_roi_display():
 
 
 def _env_primary_roi_basis():
-    """v1.0.20: basis of the primary rendered ROI/gain figures. DEFAULT
-    "valuation" (byte-identical v1.0.19); set
-    TFB_OPP_PRIMARY_ROI_BASIS=engine to make the rendered roi_pct /
-    ann_roi_pct / exp_gain_12m_sar / KPI speak the engine 12M forecast."""
-    v = str(_env_str("TFB_OPP_PRIMARY_ROI_BASIS", "valuation")).strip().lower()
-    return "engine" if v == "engine" else "valuation"
+    """v1.0.20: basis of the primary rendered ROI/gain figures. v1.0.23
+    adds "plan" (the TP1 execution plan: (TP1-entry)/entry) and makes it
+    the DEFAULT per the 2026-07-08 operator decision — the visible triple
+    ROI/Engine ROI/Ann ROI had collapsed into one number (the 35-cap wall
+    pinned both the capped valuation AND the capped engine display, and a
+    12-month period makes annualization the identity). "plan" gives the
+    three columns three honest meanings: my plan to first target / the
+    engine's forecast / the plan annualized. Set
+    TFB_OPP_PRIMARY_ROI_BASIS=valuation for the byte-identical v1.0.22
+    rendering, or =engine for the v1.0.20 engine basis."""
+    v = str(_env_str("TFB_OPP_PRIMARY_ROI_BASIS", "plan")).strip().lower()
+    if v in ("engine", "valuation", "plan"):
+        return v
+    return "plan"
 
 
 def _env_held_variant_match():
@@ -1113,10 +1151,11 @@ def make_criteria(overrides=None):
     if crit["period_months"] < 1:
         crit["period_months"] = 1
     # v1.0.20: fold any unknown basis literal to the safe default.
-    if str(crit.get("primary_roi_basis") or "").strip().lower() != "engine":
-        crit["primary_roi_basis"] = "valuation"
-    else:
-        crit["primary_roi_basis"] = "engine"
+    _prb = str(crit.get("primary_roi_basis") or "").strip().lower()
+    # v1.0.23: tri-value basis. Unknown/blank -> "plan" (the new default);
+    # "valuation" and "engine" restore the prior modes byte-identically.
+    crit["primary_roi_basis"] = (_prb if _prb in ("plan", "engine",
+                                                  "valuation") else "plan")
     if crit.get("min_ticket_sar", 0.0) < 0:
         crit["min_ticket_sar"] = 0.0
     return crit
@@ -2112,24 +2151,58 @@ def _build_ticket(rank, pick, criteria, review_date):
     # enrichment (both figures always visible), so engine_pct is computed
     # whenever EITHER switch is on. Default mode with display off keeps
     # engine_pct None -> every assignment below is byte-identical v1.0.19.
-    _basis_engine = (str(criteria.get("primary_roi_basis") or "valuation")
-                     .strip().lower() == "engine")
-    if _basis_engine:
+    _prb = str(criteria.get("primary_roi_basis") or "valuation").strip().lower()
+    _basis_engine = _prb == "engine"
+    # v1.0.23: TP1 execution-plan basis (the NEW default). Plan mode, like
+    # engine mode, implies both parallel figures are visible so the sheet's
+    # three ROI columns carry three DIFFERENT honest meanings.
+    _basis_plan = _prb == "plan"
+    if _basis_engine or _basis_plan:
         _eng_display = True
     engine_pct = (_engine_roi_to_pct(cand["engine_roi_12m_pct"])
                   if _eng_display else None)
+    # v1.0.23: per-ticket plan figures. Honest fallback: no TP ladder (the
+    # v1.0.22 TP-COHERENCE guard blanked it) -> plan undefined -> valuation
+    # basis for THIS ticket (never invents a plan).
+    _plan_roi = None
+    if (_basis_plan and cand["price"] and cand["tp1"]
+            and cand["price"] > 0):
+        _plan_roi = _round1(
+            (cand["tp1"] - cand["price"]) / cand["price"] * 100.0)
+    _ticket_plan_primary = _plan_roi is not None
     # Per-ticket effective basis: engine mode falls back HONESTLY to the
     # valuation basis when the engine forecast is absent (never invents).
-    _ticket_engine_primary = _basis_engine and engine_pct is not None
+    _ticket_engine_primary = ((not _ticket_plan_primary)
+                              and _basis_engine and engine_pct is not None)
     detail_engine_roi = _round1(cand["engine_roi_12m_pct"])
     note = _advisor_sentence(cand, suggested, pick["suggested_shares"], conf,
                              review_date)
+    if _ticket_plan_primary:
+        # Reproducibility contract preserved: exp_gain == suggested x
+        # displayed ann / 100, with ann = the PLAN ROI annualized over the
+        # panel period (same compound formula as normalize_candidate).
+        _pm = max(1, int(criteria["period_months"]))
+        _pd = _pm * DAYS_PER_MONTH
+        ann = (_round1((math.pow(1.0 + _plan_roi / 100.0, 365.0 / _pd)
+                        - 1.0) * 100.0)
+               if _plan_roi > -100.0 else 0.0) or 0.0
+        exp_gain = round(suggested * ann / 100.0, 0)
     if _ticket_engine_primary:
         ann = _round1(engine_pct) or 0.0
         exp_gain = round(suggested * ann / 100.0, 0)
     if _eng_display:
         detail_engine_roi = _round1(engine_pct)
-        if engine_pct is None:
+        if _ticket_plan_primary:
+            note = note + (" Primary ROI/gain are the TP1 execution plan ("
+                           + _fmt_num(_plan_roi)
+                           + "% to first target); engine 12M forecast "
+                           + (_fmt_num(_round1(engine_pct))
+                              if engine_pct is not None else "unavailable")
+                           + "%; full valuation target "
+                           + _fmt_num(_val_roi)
+                           + "% \u2014 entry/stop/TP are valuation-based "
+                           "levels, not forecasts.")
+        elif engine_pct is None:
             note = note + (" Engine 12M forecast: unavailable \u2014 the upside "
                            "shown is a valuation target, not a forecast.")
         elif _ticket_engine_primary:
@@ -2160,9 +2233,11 @@ def _build_ticket(rank, pick, criteria, review_date):
         "stop_sar": _round2((cand["stop"] or 0) * fx if fx else None),
         "tp1_sar": _round2((cand["tp1"] or 0) * fx if fx else None),
         "tp2_sar": _round2((cand["tp2"] or 0) * fx if fx else None),
-        "roi_pct": (_round1(engine_pct) if _ticket_engine_primary
+        "roi_pct": (_plan_roi if _ticket_plan_primary
+                    else _round1(engine_pct) if _ticket_engine_primary
                     else _val_roi),
-        "ann_roi_pct": (ann if _ticket_engine_primary
+        "ann_roi_pct": (ann if (_ticket_plan_primary
+                                or _ticket_engine_primary)
                         else _round1(cand["ann_roi_pct"])),
         "exp_gain_12m_sar": round(exp_gain, 0),
         "reliability": _round1(cand["reliability"]),
@@ -2181,7 +2256,13 @@ def _build_ticket(rank, pick, criteria, review_date):
             "max_weight_pct": criteria["max_weight_pct"],
             "stop_pct": _round1(cand["stop_pct"]),
             "mos_pct": _round1(cand["mos_pct"]),
-            "rr": _round2(cand["rr"]),
+            # v1.0.23: under the plan basis the decision R/R speaks the PLAN
+            # (plan ROI / stop distance); valuation R/R stays in cand for
+            # the audit grid. Other bases: byte-identical valuation R/R.
+            "rr": (_round2(_plan_roi / cand["stop_pct"])
+                   if (_ticket_plan_primary and cand["stop_pct"]
+                       and cand["stop_pct"] > 0)
+                   else _round2(cand["rr"])),
             "liquidity_sar": _round0(cand["liquidity_sar"]),
             "opportunity_score": cand.get("_score"),
             "score_components": cand.get("_components"),
@@ -2203,6 +2284,11 @@ def _build_ticket(rank, pick, criteria, review_date):
         ticket["valuation_exp_gain_12m_sar"] = _val_exp_gain
     if _basis_engine:
         ticket["primary_roi_basis"] = ("engine" if _ticket_engine_primary
+                                       else "valuation")
+    elif _basis_plan:
+        # v1.0.23: stamp the effective basis; a no-ladder fallback is
+        # labelled honestly as valuation for THIS ticket.
+        ticket["primary_roi_basis"] = ("plan" if _ticket_plan_primary
                                        else "valuation")
     return ticket
 
