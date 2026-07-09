@@ -3,9 +3,69 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.22.1)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.22.2)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.22.2 fix — SYMBOL-AMPUTATION HARD GUARDS (L4a READBACK-EMPTY-GUARD +
+  L4b PERSISTENCE-HARD-GUARD; both default ON with kill-switches; no
+  workflow ENV action required to arm them)
+- WHY (confirmed live overnight 2026-07-08/09, morning export 2026-07-09):
+  this runner rewrote Market_Leaders 1,278 -> 897 rows (-381 symbols,
+  including 2222.SR Saudi Aramco and 1010.SR Riyad Bank) and
+  Global_Markets 3,818 -> 3,668 (-150; 4030.SR Bahri erased from the
+  whole workbook) — the GAS batch engine caught it mid-write at 21:37
+  Riyadh: "concurrent writer detected (sheet changed mid-batch: rows
+  3818 -> 3668)". Because the sheet Symbol column is the symbol source,
+  every dropped row is PERMANENTLY out of the universe. Zero
+  [SYMBOL-PERSISTENCE] appends reached the written pages. TWO holes,
+  either one sufficient, both proven reachable during exactly that
+  window (concurrent GAS batch + Yahoo 401 "Invalid Crumb" storm):
+  (1) READBACK HOLE: _read_existing_page_symbols is FAIL-SAFE to [] on a
+      Sheets read failure, and all four market TaskSpecs carry
+      allow_empty_symbols=True — so one failed read at run start turns
+      the task into a PAGE-DRIVEN request (symbols=[]), which bypasses
+      EVERY symbol-scoped guard at once: the v6.18.2 shrink floor, the
+      v6.19.0 persistence, the v6.19.1 strict membership, and the
+      v6.22.0 L3 identity-tripwire scope. Whatever partial page the
+      backend returns is then written verbatim and trimmed.
+  (2) PERSISTENCE HOLE: _persist_missing_symbol_rows is itself FAIL-SAFE
+      — a read_values failure (or unlocatable header) returns the
+      SHRUNKEN matrix unchanged with NO exception, so the caller's
+      try/except never fires and the 70-99%-coverage write proceeds,
+      silently deleting every fetch-missed symbol.
+- FIX L4a [READBACK-EMPTY-GUARD]: on the four ranked market pages, when
+  the read-back is enabled and yields ZERO usable symbols, retry the
+  read ONCE; still zero -> SKIP the task (preserve last-good rows,
+  status="skipped") instead of falling through to the unguarded
+  page-driven rewrite. On these pages the sheet IS the symbol source, so
+  an empty read in production means the read failed or the sheet was
+  mid-rewrite — never a legitimate empty page. Bootstrap of a genuinely
+  empty page: run once with TFB_SYNC_READBACK_EMPTY_GUARD=0, or build
+  via GAS. Kill-switch: TFB_SYNC_READBACK_EMPTY_GUARD=0/false/off/no
+  restores the v6.22.1 page-driven fallback byte-identically.
+- FIX L4b [PERSISTENCE-HARD-GUARD]: after the persistence pass, VERIFY
+  THE OUTCOME on the four ranked market pages — recompute the requested
+  symbols still absent from the final matrix (deny-junk excluded, same
+  normalization as persistence). Any still-missing symbol means the
+  preservation degraded (read failure, header-scan failure, or
+  exception) -> SKIP clear+write and PRESERVE last-good rows, exactly
+  like the empty/shrink/tripwire guards. Outcome verification (not
+  exception-catching) is the point: hole (2) raises nothing. Invariant
+  is valid on these pages because every requested symbol came FROM the
+  sheet (read-back), so a last-good row exists for it by construction.
+  Scoped to _RANKED_MARKET_PAGES only (My_Portfolio keeps v6.22.1
+  semantics — a brand-new cost-basis holding legitimately has no
+  last-good row; its v6.5.0 manual guard already protects it). Runs only
+  while TFB_SYNC_SYMBOL_PERSISTENCE is ON (persistence deliberately OFF
+  restores the documented v6.18.2 drop behavior whole). Kill-switch:
+  TFB_SYNC_PERSISTENCE_HARD=0/false/off/no restores the v6.22.1
+  warn-and-continue byte-identically.
+- Availability trade, stated: a page can now SKIP a cycle (stay on
+  last-good rows) where v6.22.1 would have written a shrunken table.
+  That is the same trade the empty/shrink/identity guards already made:
+  stale-but-complete beats fresh-but-amputated, and it self-heals on the
+  next healthy run. Everything else byte-identical to v6.22.1.
 
 v6.22.1 hotfix — SAFE CHAIN IS ANALYSIS-ONLY (drops /v1/advanced/* from
   the L1 market chains; same TFB_SYNC_SAFE_GATEWAYS switch, no new ENV)
@@ -691,7 +751,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.22.1"
+SCRIPT_VERSION = "6.22.2"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2322,6 +2382,66 @@ def _strict_membership_enabled() -> bool:
     return (os.getenv("TFB_SYNC_STRICT_MEMBERSHIP") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
+_READBACK_EMPTY_TAG = "[v6.22.2 READBACK-EMPTY-GUARD]"
+_PERSISTENCE_HARD_TAG = "[v6.22.2 PERSISTENCE-HARD-GUARD]"
+
+
+def _readback_empty_guard_enabled() -> bool:
+    """v6.22.2 L4a master switch. Default ON; set
+    TFB_SYNC_READBACK_EMPTY_GUARD=0/false/off/no to restore the v6.22.1
+    behavior exactly (an empty/failed symbol read-back on a ranked market page
+    falls through to a page-driven request — the unguarded rewrite that
+    amputated ML 1,278 -> 897 overnight 2026-07-08/09)."""
+    return (os.getenv("TFB_SYNC_READBACK_EMPTY_GUARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _persistence_hard_enabled() -> bool:
+    """v6.22.2 L4b master switch. Default ON; set
+    TFB_SYNC_PERSISTENCE_HARD=0/false/off/no to restore the v6.22.1 behavior
+    exactly (a persistence pass that silently degrades — e.g. its own
+    read_values failure — lets the shrunken write proceed, deleting the
+    fetch-missed symbols from the page and therefore from the universe)."""
+    return (os.getenv("TFB_SYNC_PERSISTENCE_HARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _unpersisted_missing(
+    headers: List[Any],
+    rows_matrix: List[List[Any]],
+    requested_symbols: List[str],
+) -> List[str]:
+    """v6.22.2 L4b: the requested symbols STILL absent from the final matrix
+    AFTER the persistence pass — i.e. the symbols the write would delete.
+
+    Mirrors _persist_missing_symbol_rows' own diff exactly: Symbol column via
+    the shared alias logic on the NEW headers; normalization is
+    strip().upper(); deny-pattern junk is excluded (persistence deliberately
+    never preserves it, so it must not count as a failure here). Order follows
+    the requested list; duplicates collapse to one.
+
+    FAIL-SAFE: returns [] when headers/requested are empty or the Symbol
+    column cannot be located — the guard then never blocks a write the
+    persistence layer itself could not have protected (identical scope)."""
+    if not headers or not requested_symbols:
+        return []
+    sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+    if sym_i < 0:
+        return []
+    present: set = set()
+    for row in rows_matrix or []:
+        if isinstance(row, list) and sym_i < len(row) and not _guard_is_blank(row[sym_i]):
+            present.add(str(row[sym_i]).strip().upper())
+    _deny = _universe_deny_patterns()
+    out: List[str] = []
+    seen: set = set()
+    for s in requested_symbols:
+        t = str(s or "").strip().upper()
+        if not t or t in present or t in seen or _universe_junk(t, _deny):
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
 def _filter_rows_to_requested(
     headers: List[Any],
     rows_matrix: List[List[Any]],
@@ -3345,6 +3465,11 @@ async def _run_one_task(
             and _guard_norm(task.sheet_name) in _market_readback_pages()
         ):
             _existing_syms = _read_existing_page_symbols(sheets, spreadsheet_id, task.sheet_name, max_syms)
+            # v6.22.2 L4a: one immediate retry — a transient read hiccup
+            # (quota blip, concurrent GAS batch mid-write) must not cost the
+            # page its symbol source for the whole cycle.
+            if not _existing_syms and _readback_empty_guard_enabled():
+                _existing_syms = _read_existing_page_symbols(sheets, spreadsheet_id, task.sheet_name, max_syms)
             # v6.19.0 (WHY 2): drop deny-pattern junk BEFORE it is requested —
             # otherwise the persistence fix below would make it immortal.
             if _existing_syms:
@@ -3366,6 +3491,35 @@ async def _run_one_task(
                 res.warnings.append(
                     f"{_MARKET_READBACK_TAG} sourced {len(symbols)} symbol(s) from the {task.sheet_name} sheet"
                 )
+            elif _readback_empty_guard_enabled() and task.expects_rows:
+                # v6.22.2 L4a [READBACK-EMPTY-GUARD]: the sheet IS this page's
+                # symbol source; ZERO usable symbols after a retry means the
+                # read failed or the sheet was mid-rewrite (2026-07-08 21:37
+                # Riyadh: GAS "concurrent writer detected" during exactly this
+                # runner's window) — never a legitimate empty page. Falling
+                # through would issue a PAGE-DRIVEN request (symbols=[]) that
+                # bypasses the shrink floor, persistence, strict membership
+                # and the identity-tripwire scope all at once, then rewrite
+                # the page verbatim (the ML 1,278 -> 897 amputation). SKIP
+                # instead: no fetch, no clear, no write — last-good rows are
+                # preserved whole and self-heal on the next healthy run.
+                # Bootstrap a genuinely empty page with
+                # TFB_SYNC_READBACK_EMPTY_GUARD=0 (one run) or via GAS.
+                _rb_msg = (
+                    f"{_READBACK_EMPTY_TAG} '{task.sheet_name}' symbol read-back "
+                    f"returned 0 usable symbols after a retry — the sheet is this "
+                    f"page's symbol source, so a page-driven rewrite here can "
+                    f"amputate the universe. Skipping fetch+clear+write to "
+                    f"PRESERVE last-good rows; self-heals on the next healthy "
+                    f"sync. TFB_SYNC_READBACK_EMPTY_GUARD=0 disables (not "
+                    f"recommended)."
+                )
+                res.status = "skipped"
+                res.rows_written = 0
+                res.rows_failed = 0
+                res.warnings.append(_rb_msg)
+                logger.error(_rb_msg)
+                return res
 
         res.symbols_requested = len(symbols)
 
@@ -3720,6 +3874,53 @@ async def _run_one_task(
                 _pw = f"{_SYMBOL_PERSISTENCE_TAG} skipped (error: {_pe})"
                 res.warnings.append(_pw)
                 logger.warning(_pw)
+
+        # --- Persistence outcome verification (v6.22.2 L4b) ------------------
+        # _persist_missing_symbol_rows is FAIL-SAFE: its own read_values
+        # failure (or an unlocatable header) returns the SHRUNKEN matrix
+        # unchanged WITHOUT raising, so the try/except above never fires and a
+        # 70-99%-coverage write proceeds — permanently deleting every
+        # fetch-missed symbol (the sheet is the symbol source). Verify the
+        # OUTCOME instead of trusting the pass: any requested symbol still
+        # absent from the final matrix means the preservation degraded ->
+        # SKIP clear+write and PRESERVE last-good rows, exactly like the
+        # empty/shrink/tripwire guards. Valid on the ranked market pages
+        # because their requested symbols came FROM the sheet (read-back), so
+        # a last-good row exists for each by construction; My_Portfolio keeps
+        # v6.22.1 semantics (a brand-new cost-basis holding legitimately has
+        # no last-good row; its v6.5.0 manual guard already protects it).
+        # Runs only while persistence itself is ON — persistence deliberately
+        # OFF restores the documented v6.18.2 drop behavior whole.
+        # TFB_SYNC_PERSISTENCE_HARD=0 restores v6.22.1 warn-and-continue.
+        if (_persistence_hard_enabled() and _symbol_persistence_enabled()
+                and task.expects_rows and symbols and headers
+                and rows_matrix and sheets is not None
+                and task.sheet_name in _RANKED_MARKET_PAGES):
+            try:
+                _still_missing = _unpersisted_missing(headers, rows_matrix, symbols)
+            except Exception as _ve:  # never let verification break the write path
+                _still_missing = []
+                _vw = f"{_PERSISTENCE_HARD_TAG} verification skipped (error: {_ve})"
+                res.warnings.append(_vw)
+                logger.warning(_vw)
+            if _still_missing:
+                _hm = (
+                    f"{_PERSISTENCE_HARD_TAG} TRIPPED on '{task.sheet_name}': "
+                    f"{len(_still_missing)} requested symbol(s) are still absent "
+                    f"from the final matrix after the persistence pass "
+                    f"({', '.join(_still_missing[:15])}"
+                    f"{'…' if len(_still_missing) > 15 else ''}) — writing would "
+                    f"permanently delete them from the page (it is its own "
+                    f"symbol source). Skipping clear+write to PRESERVE last-good "
+                    f"rows; self-heals on the next healthy sync. "
+                    f"TFB_SYNC_PERSISTENCE_HARD=0 disables (not recommended)."
+                )
+                res.status = "skipped"
+                res.rows_written = 0
+                res.rows_failed = 0
+                res.warnings.append(_hm)
+                logger.error(_hm)
+                return res
         # ---------------------------------------------------------------------
 
         # v6.20.0 (Fix 1b): harvest (page, symbol, price) from the FINAL matrix
