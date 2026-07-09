@@ -1,60 +1,60 @@
-# =============================================================================
-# Daily Investment Brief — "Emad Bahbah" morning email
-# -----------------------------------------------------------------------------
-# WHAT: runs scripts/run_daily_brief.py --send, which reads the decision +
-#       opportunity + market pages from the production workbook (READ-ONLY) and
-#       emails a polished HTML brief. Script v1.4.0 also ATTACHES a PDF copy
-#       of the recommendations (needs reportlab, installed below for this job
-#       only — NOT added to Render requirements; TFB_BRIEF_PDF=0 disables).
-# WHEN: FOUR sends per day, Sunday–Thursday (GitHub cron is UTC; Riyadh = UTC+3,
-#       no DST in KSA so the Riyadh times hold year-round):
-#         07:30 UTC = 10:30 Riyadh — Tadawul just opened: local + GCC review
-#         10:30 UTC = 13:30 Riyadh — midday local + GCC review
-#         15:00 UTC = 18:00 Riyadh — evening: global/US session view
-#         19:00 UTC = 22:00 Riyadh — pre-US-close wrap
-#       Can also be run manually at any time (preview by default, see below).
-# WHY 4x (2026-07-05): owner request — single 09:00 Riyadh send replaced with
-#       the four decision-relevant checkpoints above. Day-of-week 0-4 = Sun–Thu
-#       kept for all four slots (Tadawul work-week). Note: this means no Friday
-#       evening brief while the US session trades, and Sunday evening briefs
-#       show Thursday's US closes; switch the last two crons to "* * 1-5" if
-#       US-day alignment is ever preferred.
-# WHY shaped like this: it mirrors track_performance.yml exactly — same Python,
-#       same PYTHONPATH (so `integrations.*` / `core.*` imports resolve from a
-#       scripts/ file), same sheet-id source (repo variable DEFAULT_SPREADSHEET_ID)
-#       and same Google credential secret. Email transport adds three secrets:
-#       TFB_MAIL_FROM / TFB_MAIL_PASSWORD / TFB_MAIL_TO.
-# NOTE: this workflow only READS the sheet. It never writes, so it cannot affect
-#       the sync, the cockpits, or any page.
-# =============================================================================
-name: 📨 Daily Investment Brief
+name: 📧 TFB Decision Digest (email)
+
+# Sends the operator the best BUY / best SELL / best swap from the LATEST synced
+# sheet. Decoupled from the data sync on purpose: it only READS the sheet (no
+# provider load) and emails. Pairs with scripts/send_digest.py.
 
 on:
+  # TARGET delivery: 09:30 Riyadh, 11:00 Riyadh, 17:30 Riyadh. KSA has no DST,
+  # so Riyadh times ALWAYS map to fixed UTC. 09:30 is meant to land just before
+  # the Tadawul open (10:00 Riyadh); the US-tracking 17:30 slot is the SUMMER
+  # mapping — for winter (early Nov-early Mar) shift both REQUEST and buffer
+  # together, i.e. "30 12"->"30 13" (still = 18:30 Riyadh target - 60min).
+  #
+  # 2026-07-09 BUFFER ADDED (Emad: emails must land at the agreed time):
+  # cron below fires 60 MIN BEFORE each target. WHY 60, not the old "5-15 min"
+  # assumption: this account's own measured delay on the sibling daily_brief.yml
+  # schedule, same day (2026-07-08, no incident on record), was 80/94/99 min
+  # late across its three checked sends -- routine queueing on this account
+  # runs ~60-100 min, not 5-15. A cron can only set the REQUEST time; GitHub's
+  # queue decides the actual start, so this absorbs the typical case, not a
+  # platform-wide incident (2026-07-09 04:34 UTC "Delays starting Actions
+  # runs" pushed sends 3+ hours late -- no fixed offset covers that; see the
+  # optional overdue-alert follow-up discussed with Emad instead).
+  # Content impact of firing early: none -- the digest always reads whatever
+  # is CURRENTLY in the sheet, it is not a time-locked snapshot, so an early
+  # request on a fast day is harmless, just marginally less fresh.
+  # REQUEST (fires) -> TARGET (intended landing):
+  #   05:30 UTC (08:30 Riyadh) -> 09:30 Riyadh
+  #   07:00 UTC (10:00 Riyadh) -> 11:00 Riyadh
+  #   13:30 UTC (16:30 Riyadh) -> 17:30 Riyadh
   schedule:
-    # 07:30 UTC == 10:30 Asia/Riyadh, Sun–Thu — Tadawul open, local + GCC.
-    - cron: "30 7 * * 0-4"
-    # 10:30 UTC == 13:30 Asia/Riyadh, Sun–Thu — midday local + GCC.
-    - cron: "30 10 * * 0-4"
-    # 15:00 UTC == 18:00 Asia/Riyadh, Sun–Thu — evening global/US view.
-    - cron: "0 15 * * 0-4"
-    # 19:00 UTC == 22:00 Asia/Riyadh, Sun–Thu — pre-US-close wrap.
-    - cron: "0 19 * * 0-4"
+    - cron: "30 5 * * *"
+    - cron: "0 7 * * *"
+    - cron: "30 13 * * *"
+
+  # Manual run. dry_run defaults to "true" so a manual click PREVIEWS (prints the
+  # email + resolved columns) and sends NOTHING unless you explicitly pick false.
+  # Scheduled runs ignore inputs, so they always send for real.
   workflow_dispatch:
     inputs:
-      # 2026-07-03 PREVIEW-BY-DEFAULT: default was `true`, so every manual
-      # "Run workflow" click SENT a real email — each test/verification
-      # dispatch produced a duplicate brief in the inbox. Scheduled runs are
-      # untouched (they never read inputs and always send); a manual click now
-      # renders + uploads the HTML artifact only, unless send is explicitly
-      # ticked. Mirrors digest.yml's dry_run-by-default manual behavior.
-      send:
-        description: "Actually email the brief? (default: preview only — renders the HTML artifact, sends nothing)"
+      dry_run:
+        description: "Preview only (print, don't send)"
         required: false
-        default: false
-        type: boolean
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      session:
+        description: "Optional label, e.g. '11:00 Riyadh'"
+        required: false
+        type: string
+      sheet_id:
+        description: "Spreadsheet ID override (optional)"
+        required: false
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: tfb-digest-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -65,80 +65,89 @@ defaults:
     shell: bash
 
 env:
-  PYTHON_VERSION: "3.11"
-  PYTHONUNBUFFERED: 1
   TZ: Asia/Riyadh
+  PYTHONUNBUFFERED: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  brief:
-    name: 📨 Render & email the daily brief
+  send-digest:
+    name: 📧 Send Digest
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - name: ⬇️ Checkout
-        uses: actions/checkout@v7
-
-      - name: 🐍 Set up Python
-        uses: actions/setup-python@v6
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: 📦 Install dependencies
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install minimal deps
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          if [[ -f requirements.render.txt ]]; then
-            python -m pip install -r requirements.render.txt
-          else
-            python -m pip install -r requirements.txt
-          fi
-          # v1.4.0 PDF attachment (brief job only — deliberately NOT in Render deps)
-          python -m pip install "reportlab>=4.0"
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # The digest only needs Google Sheets READ access — install the light
+          # client libs, not the full backend requirements. Fast (~20s).
+          python -m pip install google-api-python-client google-auth google-auth-httplib2
 
-      - name: 🔎 Resolve spreadsheet id
-        id: sheet
+      - name: 📧 Send digest
         env:
-          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          # --- spreadsheet (same var the sync uses) ---
+          TARGET_SHEET_ID: ${{ github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
+
+          # --- Google Sheets read auth (reuses the sync's existing secret) ---
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+
+          # --- SMTP transport (2026-07-02 REWIRE: reuse the PROVEN TFB_MAIL_*) ---
+          # WHY: the original wiring read six SMTP_*/DIGEST_* secrets that were
+          # never created in this repo, so every send silently had no transport.
+          # The Daily Investment Brief (daily_brief.yml) already emails
+          # successfully through the EXISTING TFB_MAIL_FROM / TFB_MAIL_PASSWORD /
+          # TFB_MAIL_TO secrets over smtp.gmail.com:587 STARTTLS — proven live
+          # (brief run #8, 2026-07-01, send step green; a send failure exits 3).
+          # Map the digest onto that same working transport verbatim. ZERO new
+          # secrets required; scripts/send_digest.py env names are unchanged.
+          SMTP_HOST: ${{ vars.TFB_MAIL_SMTP_HOST || 'smtp.gmail.com' }}
+          SMTP_PORT: ${{ vars.TFB_MAIL_SMTP_PORT || '587' }}
+          SMTP_USER: ${{ secrets.TFB_MAIL_FROM }}
+          SMTP_PASSWORD: ${{ secrets.TFB_MAIL_PASSWORD }}
+          SMTP_USE_TLS: ${{ vars.SMTP_USE_TLS || '1' }}
+          DIGEST_FROM: ${{ secrets.TFB_MAIL_FROM }}
+          DIGEST_TO: ${{ secrets.TFB_MAIL_TO }}
+
+          # --- behaviour (optional repo-var overrides; defaults are fine) ---
+          DIGEST_CANDIDATE_PAGES: ${{ vars.DIGEST_CANDIDATE_PAGES || 'Market_Leaders' }}
+          DIGEST_HOLDINGS_PAGE: ${{ vars.DIGEST_HOLDINGS_PAGE || 'My_Portfolio' }}
+          DIGEST_ENABLE: ${{ vars.DIGEST_ENABLE || '1' }}
+          DIGEST_SKIP_IF_EMPTY: ${{ vars.DIGEST_SKIP_IF_EMPTY || '0' }}
+
+          # --- inputs passed via env (safer than inline shell interpolation) ---
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_SESSION: ${{ github.event.inputs.session }}
         run: |
-          SID="${VAR_SHEET:-}"
-          if [[ -z "$SID" ]]; then
-            echo "::error::Spreadsheet ID empty. Set repository variable DEFAULT_SPREADSHEET_ID."
+          set -euo pipefail
+          if [ ! -f "scripts/send_digest.py" ]; then
+            echo "::error::scripts/send_digest.py not found — commit it first."
             exit 1
           fi
-          echo "sid=$SID" >> "$GITHUB_OUTPUT"
-
-      - name: 📨 Render & send brief
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-          DEFAULT_SPREADSHEET_ID: ${{ steps.sheet.outputs.sid }}
-          # GOOGLE_SHEETS_CREDENTIALS accepts JSON or base64(JSON); prefer the JSON secret.
-          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS != '' && secrets.GOOGLE_SHEETS_CREDENTIALS || secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
-          TFB_BRIEF_OWNER_NAME: "Emad Bahbah"
-          TFB_MAIL_FROM: ${{ secrets.TFB_MAIL_FROM }}
-          TFB_MAIL_PASSWORD: ${{ secrets.TFB_MAIL_PASSWORD }}
-          TFB_MAIL_TO: ${{ secrets.TFB_MAIL_TO }}
-        run: |
-          if [[ -z "${GOOGLE_SHEETS_CREDENTIALS:-}" ]]; then
-            echo "::error::No Google credentials. Set secret GOOGLE_SHEETS_CREDENTIALS (JSON) or GOOGLE_SHEETS_CREDENTIALS_B64."
+          if [ -z "${TARGET_SHEET_ID:-}" ]; then
+            echo "::error::No spreadsheet id. Set repo variable DEFAULT_SPREADSHEET_ID."
             exit 1
           fi
-          # 2026-07-03 PREVIEW-BY-DEFAULT: schedule always sends; a manual
-          # dispatch sends ONLY when send=true was explicitly chosen. Any other
-          # value (false, empty, missing) previews — safer than string-matching
-          # "false" alone, which would still send on an empty input.
-          SEND_FLAG="--send"
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.send }}" != "true" ]]; then
-            SEND_FLAG=""
-            echo "Preview mode — rendering only, no email will be sent (set send=true to send)."
-          fi
-          python scripts/run_daily_brief.py --out daily_brief.html $SEND_FLAG
 
-      - name: 📎 Upload rendered brief (for the record)
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: daily-brief-${{ github.run_id }}
-          path: |
-            daily_brief.html
-            daily_brief.pdf
-          if-no-files-found: ignore
-          retention-days: 14
+          ARGS=()
+          if [ "${INPUT_DRY_RUN:-}" = "true" ]; then
+            ARGS+=(--dry-run)
+            echo "Preview mode — no email will be sent."
+          fi
+          if [ -n "${INPUT_SESSION:-}" ]; then
+            ARGS+=(--session "$INPUT_SESSION")
+          fi
+
+          python scripts/send_digest.py "${ARGS[@]}"
