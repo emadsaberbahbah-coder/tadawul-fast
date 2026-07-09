@@ -5,16 +5,33 @@ name: 📧 TFB Decision Digest (email)
 # provider load) and emails. Pairs with scripts/send_digest.py.
 
 on:
-  # 09:30 Riyadh (06:30 UTC), 11:00 Riyadh (08:00 UTC) and 17:30 Riyadh
-  # (14:30 UTC). KSA has no DST, so Riyadh times ALWAYS map to fixed UTC.
-  # 09:30 lands just before the Tadawul open (10:00 Riyadh); the US-tracking
-  # 17:30 slot is the SUMMER mapping — for winter (early Nov–early Mar) change
-  # "30 14" -> "30 15" (= 18:30 Riyadh) so it still lands ~after the US open.
-  # NOTE: GitHub cron can drift 5–15 min; fine for a daily digest, not exact.
+  # TARGET delivery: 09:30 Riyadh, 11:00 Riyadh, 17:30 Riyadh. KSA has no DST,
+  # so Riyadh times ALWAYS map to fixed UTC. 09:30 is meant to land just before
+  # the Tadawul open (10:00 Riyadh); the US-tracking 17:30 slot is the SUMMER
+  # mapping — for winter (early Nov-early Mar) shift both REQUEST and buffer
+  # together, i.e. "30 12"->"30 13" (still = 18:30 Riyadh target - 60min).
+  #
+  # 2026-07-09 BUFFER ADDED (Emad: emails must land at the agreed time):
+  # cron below fires 60 MIN BEFORE each target. WHY 60, not the old "5-15 min"
+  # assumption: this account's own measured delay on the sibling daily_brief.yml
+  # schedule, same day (2026-07-08, no incident on record), was 80/94/99 min
+  # late across its three checked sends -- routine queueing on this account
+  # runs ~60-100 min, not 5-15. A cron can only set the REQUEST time; GitHub's
+  # queue decides the actual start, so this absorbs the typical case, not a
+  # platform-wide incident (2026-07-09 04:34 UTC "Delays starting Actions
+  # runs" pushed sends 3+ hours late -- no fixed offset covers that; see the
+  # optional overdue-alert follow-up discussed with Emad instead).
+  # Content impact of firing early: none -- the digest always reads whatever
+  # is CURRENTLY in the sheet, it is not a time-locked snapshot, so an early
+  # request on a fast day is harmless, just marginally less fresh.
+  # REQUEST (fires) -> TARGET (intended landing):
+  #   05:30 UTC (08:30 Riyadh) -> 09:30 Riyadh
+  #   07:00 UTC (10:00 Riyadh) -> 11:00 Riyadh
+  #   13:30 UTC (16:30 Riyadh) -> 17:30 Riyadh
   schedule:
-    - cron: "30 6 * * *"
-    - cron: "0 8 * * *"
-    - cron: "30 14 * * *"
+    - cron: "30 5 * * *"
+    - cron: "0 7 * * *"
+    - cron: "30 13 * * *"
 
   # Manual run. dry_run defaults to "true" so a manual click PREVIEWS (prints the
   # email + resolved columns) and sends NOTHING unless you explicitly pick false.
