@@ -107,9 +107,15 @@ def test_ob_normalize_sector_passthrough_for_gics_and_gaps():
         assert ob._normalize_sector(s) == (s or "").strip()
 
 
-def test_ob_sector_normalize_gate_default_off(monkeypatch):
+def test_ob_sector_normalize_gate_default_on(monkeypatch):
+    # 2026-07-09: was test_..._default_off, asserting False. opportunity_builder
+    # v1.0.22 deliberately flipped the default OFF->ON (dormant-bug fix + live
+    # 5023.SR damage -- see _env_sector_normalize's own docstring) and this test
+    # was never updated, so it has failed on every push-triggered CI run since
+    # v1.0.22 shipped (schedule-triggered runs skip ci-tests, so it went
+    # unnoticed). Asserting the CURRENT, already-shipped, already-safe default.
     monkeypatch.delenv("TFB_OPP_SECTOR_NORMALIZE", raising=False)
-    assert _ob()._env_sector_normalize() is False
+    assert _ob()._env_sector_normalize() is True
 
 
 def test_ob_sector_normalize_gate_on_recognized(monkeypatch):
@@ -147,8 +153,35 @@ def test_rds_gateway_off_is_byte_identical_routing(monkeypatch):
     """OFF: every task's effective gateway == its configured gateway."""
     rds = _rds()
     monkeypatch.delenv("TFB_SYNC_MARKET_ANALYSIS_GATEWAY", raising=False)
+    # 2026-07-09: v6.22.0 added TFB_SYNC_SAFE_GATEWAYS, an INDEPENDENT override
+    # that is default-ON and forces the four ranked pages to "analysis"
+    # regardless of the toggle above -- this test predates that and was never
+    # updated, so it failed on every push since v6.22.0 shipped (schedule runs
+    # skip ci-tests, so it went unnoticed). Disabling it here restores this
+    # test's original, narrower claim: with BOTH override mechanisms off, every
+    # task's gateway is its own configured value, byte-identical to v6.9.0.
+    # The safe-gateways-ON production default is covered separately below.
+    monkeypatch.setenv("TFB_SYNC_SAFE_GATEWAYS", "0")
     for t in rds._default_tasks():
         assert rds._effective_gateway(t) == t.gateway
+
+
+def test_rds_safe_gateways_default_on_reroutes_ranked_pages(monkeypatch):
+    # 2026-07-09 (new): the actual production default -- TFB_SYNC_SAFE_GATEWAYS
+    # unset (defaults ON) -- was not covered by any existing test. This is the
+    # v6.22.0 fix for the 2026-07-08 poisoning event: ranked pages must resolve
+    # to "analysis" (the only market router with the transposition firewall)
+    # even with the older v6.10.0 toggle left at its own default-off.
+    rds = _rds()
+    monkeypatch.delenv("TFB_SYNC_SAFE_GATEWAYS", raising=False)
+    monkeypatch.delenv("TFB_SYNC_MARKET_ANALYSIS_GATEWAY", raising=False)
+    monkeypatch.delenv("TFB_SYNC_MARKET_GATEWAY", raising=False)
+    for t in rds._default_tasks():
+        eff = rds._effective_gateway(t)
+        if t.sheet_name in _RANKED:
+            assert eff == "analysis", f"{t.sheet_name} should default to analysis (SAFE-GATEWAYS)"
+        else:
+            assert eff == t.gateway, f"{t.sheet_name} must keep its configured gateway"
 
 
 def test_rds_gateway_on_reroutes_only_the_four_market_pages(monkeypatch):
@@ -170,12 +203,36 @@ def test_rds_my_portfolio_never_rerouted(monkeypatch):
     assert rds._effective_gateway(mp[0]) == "enriched"
 
 
-def test_rds_analysis_gateway_targets_router_with_enriched_fallback():
+def test_rds_analysis_gateway_targets_router_with_enriched_fallback(monkeypatch):
+    # 2026-07-09: v6.22.1 deliberately made the SAFE-mode (default) analysis
+    # chain analysis-ONLY -- no enriched tail -- because /v1/advanced (the
+    # chain's old next hop) is unfirewalled; an analysis outage now PRESERVES
+    # last-good rows via the empty/shrink guards instead of falling back to an
+    # unsafe live route. This test predates that decision and was never
+    # updated, so it failed on every push since v6.22.1 shipped (schedule runs
+    # skip ci-tests, so it went unnoticed). Disabling safe-gateways here
+    # restores the legacy (v6.21.0) chain this test was written to check.
+    monkeypatch.setenv("TFB_SYNC_SAFE_GATEWAYS", "0")
     rds = _rds()
     cands = rds._endpoint_candidates_for_gateway("analysis")
     assert cands and cands[0] == "/v1/analysis/sheet-rows"
-    # the analysis chain must end at enriched so an analysis outage fails soft
+    # the legacy (safe-gateways-off) analysis chain must end at enriched so an
+    # analysis outage fails soft
     assert any("enriched" in c for c in cands)
+
+
+def test_rds_safe_gateways_default_on_analysis_chain_has_no_unfirewalled_fallback(monkeypatch):
+    # 2026-07-09 (new): the actual production default was not covered by any
+    # existing test. In SAFE mode the analysis chain must stay analysis-only --
+    # no /v1/advanced or /v1/enriched hop -- so a routing bug can never
+    # silently accept rows from an unfirewalled endpoint (routes.investment_
+    # advisor v2.17.0 carries no transposition firewall; confirmed serving
+    # 200s live, 2026-07-09 audit).
+    monkeypatch.delenv("TFB_SYNC_SAFE_GATEWAYS", raising=False)
+    rds = _rds()
+    cands = rds._endpoint_candidates_for_gateway("analysis")
+    assert cands and cands[0] == "/v1/analysis/sheet-rows"
+    assert not any("enriched" in c or "advanced" in c for c in cands)
 
 
 # --------------------------------------------------------------------------- #
