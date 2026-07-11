@@ -36,6 +36,39 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.7.0 — DATA-VINTAGE PROVENANCE + ISSUER-SIBLING FLAGS (evidence: the
+  2026-07-10 morning/evening workbook audits + the 13:26 Decision Digest)
+  (A) DATA VINTAGE. The pages this brief quotes carried three different
+      vintages at once on 2026-07-10 (ML 07-09→07-10 partial 721/897, GM
+      2,480×07-08 + 1,187×07-09, CFX/MF 07-09) — and nothing in the email
+      disclosed it, so a reader had no way to know a price was two days
+      old. New _page_vintage() reads each market page's 'Last Updated
+      (Riyadh)' column (UTC fallback) and the model now carries per-page
+      date histograms + the newest timestamp. Rendered three ways:
+      an amber DATA VINTAGE NOTICE banner at the top of the HTML when the
+      newest market-page update is older than TFB_BRIEF_STALE_HOURS
+      (default 24) at send time; a per-page 'Data: MM-DD×n · MM-DD×n'
+      line inside the market-pages strip; and a one-line DATA VINTAGE
+      summary in the plaintext part. Fail-safe: a page without the column
+      contributes nothing and nothing renders (v1.6.0 output byte-
+      identical). PDF unchanged by design (space-constrained card grid).
+  (B) ISSUER-SIBLING FLAGS. The 13:26 digest recommended BUY BBDO.US while
+      the book held BBD.US — same issuer (Banco Bradesco S.A.), different
+      ADR share class; the brief's own candidate lists can surface the
+      same trap (its held-exclusion is symbol-exact). build_model now
+      derives {normalized issuer name -> held symbols} from My_Portfolio
+      and annotates every candidate (top buys, rest-of-markets, per-page
+      top names) whose NAME matches a held issuer under a DIFFERENT
+      symbol. Rendered as an amber '⚠ Same issuer as held X — different
+      share class' line on the buy card, a '(sibling of held X)' suffix
+      in the rest-of-markets strip, a sentence in the market-pages strip,
+      and a '[same issuer as held X]' suffix in the plaintext buys list.
+      Name-blank rows never match; held symbols themselves are never
+      flagged. New helpers: _stale_hours_threshold, _page_vintage,
+      _issuer_key, _held_issuers (4 added, 0 removed); _opp_row/_rest_row/
+      _page_row/build_model/render_html/render_text extended; everything
+      else verbatim v1.6.0.
+
 v1.6.0 — DISPLAY-CORRECTNESS FIVE-PACK (evidence: live email/PDF of
   2026-07-08 23:21 vs workbook export v37; every fix verified against both)
 - B1 KILL VALUE-SNIFFING (the +150%/-100%/-140% bug): _pct(), the
@@ -165,7 +198,7 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 import argparse
 import datetime as _dt
@@ -437,6 +470,96 @@ def _infer_market(symbol: str, ccy: str = "", country: str = "") -> str:
     return _s(country) or "Global"
 
 
+# ----------------------------------------------------------------------------- #
+# v1.7.0 (A/B) — data-vintage + issuer-sibling helpers
+# ----------------------------------------------------------------------------- #
+_VINTAGE_COLS = ("Last Updated (Riyadh)", "Last Updated (UTC)", "Last Updated")
+_PAGE_ABBREV = {"Market_Leaders": "ML", "Global_Markets": "GM",
+                "Commodities_FX": "CFX", "Mutual_Funds": "MF"}
+
+
+def _stale_hours_threshold() -> float:
+    """v1.7.0 (A): banner threshold in hours (TFB_BRIEF_STALE_HOURS,
+    default 24, floor 1). Unparseable values fall back to 24."""
+    try:
+        return max(1.0, float(os.getenv("TFB_BRIEF_STALE_HOURS") or "24"))
+    except Exception:
+        return 24.0
+
+
+def _page_vintage(rows: List[List[Any]]) -> Dict[str, Any]:
+    """v1.7.0 (A): per-page data vintage from the 'Last Updated (Riyadh)'
+    column (UTC/plain fallbacks). Returns {"dates": [(YYYY-MM-DD, count)…
+    dominant-first], "latest_ts": datetime|None, "total": rows counted}.
+    Fail-safe: a page without the column (or without parseable stamps)
+    yields the empty shape and nothing renders downstream."""
+    rows = _pad(rows)
+    out: Dict[str, Any] = {"dates": [], "latest_ts": None, "total": 0}
+    h = _find_header(rows, ("symbol", "name"))
+    if h < 0:
+        return out
+    ci = _col_index(rows[h], *_VINTAGE_COLS)
+    si = _col_index(rows[h], "Symbol")
+    if ci is None:
+        return out
+    counts: Dict[str, int] = {}
+    latest: Optional[_dt.datetime] = None
+    n = 0
+    for r in rows[h + 1:]:
+        if si is not None and not _s(_cell(r, si)):
+            continue
+        raw = _s(_cell(r, ci))
+        if not re.match(r"^\d{4}-\d{2}-\d{2}", raw):
+            continue
+        d = raw[:10]
+        counts[d] = counts.get(d, 0) + 1
+        n += 1
+        ts: Optional[_dt.datetime] = None
+        try:
+            ts = _dt.datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            try:
+                ts = _dt.datetime.strptime(d, "%Y-%m-%d")
+            except Exception:
+                ts = None
+        if ts is not None and (latest is None or ts > latest):
+            latest = ts
+    out["dates"] = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    out["latest_ts"] = latest
+    out["total"] = n
+    return out
+
+
+def _issuer_key(name: Any) -> str:
+    """v1.7.0 (B): normalized issuer-name key — lowercase, alphanumerics
+    only, so 'Banco Bradesco S.A.' and 'BANCO BRADESCO SA' collide."""
+    return re.sub(r"[^a-z0-9]+", "", _s(name).lower())
+
+
+def _held_issuers(pages_data: Dict[str, List[List[Any]]]) -> Tuple[set, Dict[str, List[str]]]:
+    """v1.7.0 (B): (held symbol set, issuer key -> sorted held symbols)
+    from the My_Portfolio page (post-10 v1.5.9 this IS the ACTIVE ledger
+    book). Blank names contribute no issuer key. Fail-safe: an unreadable
+    page yields (set(), {}) and no candidate is ever flagged."""
+    rows = _pad(pages_data.get(PAGE_PORTFOLIO, []) or [])
+    syms: set = set()
+    names: Dict[str, List[str]] = {}
+    h = _find_header(rows, ("symbol", "name"))
+    if h < 0:
+        return syms, names
+    si = _col_index(rows[h], "Symbol")
+    ni = _col_index(rows[h], "Name")
+    for r in rows[h + 1:]:
+        sym = _s(_cell(r, si)).upper()
+        if not sym or sym == "SYMBOL":
+            continue
+        syms.add(sym)
+        k = _issuer_key(_cell(r, ni))
+        if k:
+            names.setdefault(k, []).append(sym)
+    return syms, {k: sorted(set(v)) for k, v in names.items()}
+
+
 def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
                   top_n: int = 5) -> Dict[str, Any]:
     """Parse Top_10_Investments funded picks (Advisor Note starts with INVEST)."""
@@ -625,7 +748,30 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     top10 = extract_top10(pages_data.get(PAGE_TOP10, []), exclude=held)
     market = {p: extract_market_page(pages_data.get(p, [])) for p in MARKET_PAGES}
     metrics = extract_symbol_metrics(pages_data)  # v1.3.0 visual sections
-    return {"decision": decision, "top10": top10, "market": market, "metrics": metrics}
+    # v1.7.0 (A): per-page data vintage for provenance rendering.
+    vintage = {p: _page_vintage(pages_data.get(p, []) or []) for p in MARKET_PAGES}
+    # v1.7.0 (B): flag candidates whose ISSUER is already held under a
+    # DIFFERENT symbol (share-class siblings, e.g. BBDO.US vs held BBD.US).
+    held_syms, held_names = _held_issuers(pages_data)
+    held_all = held | held_syms
+
+    def _annotate(items: List[Dict[str, Any]]) -> None:
+        for it in items:
+            sym = _s(it.get("symbol")).upper()
+            k = _issuer_key(it.get("name"))
+            if not k or not sym or sym in held_all:
+                continue
+            sibs = [x for x in held_names.get(k, []) if x != sym]
+            if sibs:
+                it["sibling"] = ", ".join(sibs)
+
+    _annotate(top10["top"])
+    for _names_ in top10["rest"].values():
+        _annotate(_names_)
+    for _pg_ in MARKET_PAGES:
+        _annotate(market[_pg_]["top"])
+    return {"decision": decision, "top10": top10, "market": market,
+            "metrics": metrics, "vintage": vintage}
 
 
 # ----------------------------------------------------------------------------- #
@@ -665,9 +811,13 @@ def _opp_row(rank: int, p: Dict[str, Any], metrics: Optional[Dict[str, Dict[str,
     # reliability. Prefer the forecast-path score the strip shows; the Top_10
     # screen Rel is only the fallback when the metrics row is missing.
     rel_show = m.get("rel") if (m and m.get("rel") is not None) else p["rel"]
+    # v1.7.0 (B): issuer-sibling warning line on the buy card.
+    sib = (f'<div style="font-size:11px; color:{TRIM_C}; margin-top:3px;">&#9888;&#65039; Same issuer as held '
+           f'<strong>{_esc(p.get("sibling"))}</strong> &mdash; different share class</div>'
+           ) if p.get("sibling") else ""
     return f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:0; background:#E9F5EF; border:1px solid #C7E4D5;"><tr>
       <td style="padding:12px 12px; width:34px; vertical-align:top;"><div style="width:24px; height:24px; background:{ADD_C}; color:#fff; border-radius:50%; text-align:center; line-height:24px; font-family:{SANS}; font-size:12px; font-weight:bold;">{rank}</div></td>
-      <td style="padding:11px 6px; font-family:{SANS};"><div style="font-size:14px; color:#1A1A1A;"><strong>{_esc(p['symbol'])}</strong> <span style="color:#777; font-size:12px;">{_esc(p['name'])[:30]}</span></div><div style="font-size:11px; color:#8A8A8A; margin-top:2px;">{_esc(p['sector'])} · {_esc(p['market'])}</div>{extras}</td>
+      <td style="padding:11px 6px; font-family:{SANS};"><div style="font-size:14px; color:#1A1A1A;"><strong>{_esc(p['symbol'])}</strong> <span style="color:#777; font-size:12px;">{_esc(p['name'])[:30]}</span></div><div style="font-size:11px; color:#8A8A8A; margin-top:2px;">{_esc(p['sector'])} · {_esc(p['market'])}</div>{sib}{extras}</td>
       <td align="right" style="padding:11px 14px; font-family:{SANS}; white-space:nowrap; vertical-align:top;"><div style="font-size:13px; color:#0E7C5A;"><strong>{_pct(p['roi'],0)} to fair value</strong></div><div style="font-size:11px; color:#888;">Reliability {_num_str(rel_show)} · <span style="color:{cc};">{conf}</span></div></td></tr></table>{_outlook_strip(m)}<div style="height:7px; font-size:0; line-height:0;">&nbsp;</div>"""
 
 
@@ -805,6 +955,29 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     date_long = when.strftime("%A").rstrip()
     date_short = when.strftime("%d %B %Y")
 
+    # v1.7.0 (A): DATA VINTAGE NOTICE — amber banner when the NEWEST market-
+    # page update is older than TFB_BRIEF_STALE_HOURS at send time. Naive
+    # Riyadh timestamps on both sides; fail-safe: no vintage -> no banner.
+    _vin_all = model.get("vintage", {}) or {}
+    _newest_ts = None
+    for _vv in _vin_all.values():
+        _ts = (_vv or {}).get("latest_ts")
+        if _ts is not None and (_newest_ts is None or _ts > _newest_ts):
+            _newest_ts = _ts
+    vintage_banner = ""
+    if _newest_ts is not None:
+        try:
+            _age_h = max(0.0, (when - _newest_ts).total_seconds() / 3600.0)
+        except Exception:
+            _age_h = 0.0
+        if _age_h >= _stale_hours_threshold():
+            vintage_banner = f"""
+  <tr><td style="padding:14px 32px 0 32px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FCF4E3; border:1px solid #E8D5A8; border-left:4px solid {TRIM_C};"><tr><td style="padding:11px 16px; font-family:{SANS}; font-size:12px; color:#7A5A17; line-height:1.6;">
+      <strong>Data vintage notice.</strong> The newest market-page update is {_newest_ts.strftime('%Y-%m-%d %H:%M')} Riyadh (&asymp;{_age_h:.0f}h before this brief). Prices and scores below reflect the last completed sync, not live quotes.
+    </td></tr></table>
+  </td></tr>"""
+
     # ---- hero numbers ----
     # v1.6.0 (B4): the hero used to narrate ONLY d["add"][0] and call the rest
     # "dry powder" — while the decision layer it quotes was deploying that
@@ -896,7 +1069,8 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F2F8F5; border:1px solid #D5E8DE;">{rest_rows}</table>""" if rest_rows else ""
 
     # ---- per-page strip ----
-    page_rows = "".join(_page_row(name, mk[name]) for name in MARKET_PAGES)
+    page_rows = "".join(_page_row(name, mk[name], (model.get("vintage", {}) or {}).get(name))
+                        for name in MARKET_PAGES)
 
     # ---- v1.3.0: book-at-a-glance diverging P&L bars ----
     glance_block = _glance_block(d)
@@ -923,6 +1097,8 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
       <td align="right" style="font-family:{SANS}; color:#A9B4C4; font-size:12px;">{date_long}<br>{date_short}<br><span style="color:#7E8AA0;">before market open</span></td>
     </tr></table>
   </td></tr>
+
+{vintage_banner}
 
   <tr><td style="padding:26px 32px 6px 32px;">
     <div style="font-family:{SANS}; font-size:11px; letter-spacing:2px; color:{INK}; font-weight:bold;">TODAY'S ONE MOVE</div>
@@ -1022,7 +1198,15 @@ def _hold_row(r: Dict[str, Any]) -> str:
 
 
 def _rest_row(market: str, names: List[Dict[str, Any]]) -> str:
-    label = ", ".join(f"<strong>{_esc(n['symbol'])}</strong>" for n in names[:4])
+    # v1.7.0 (B): per-name issuer-sibling suffix in the rest-of-markets strip.
+    parts: List[str] = []
+    for n in names[:4]:
+        piece = f"<strong>{_esc(n['symbol'])}</strong>"
+        if n.get("sibling"):
+            piece += (f' <span style="color:#B26B00; font-size:11px;">(sibling of held '
+                      f'{_esc(n["sibling"])})</span>')
+        parts.append(piece)
+    label = ", ".join(parts)
     return f"""<tr style="font-family:{SANS};"><td style="padding:9px 14px; font-size:12px; color:#0E7C5A; font-weight:bold; width:110px; vertical-align:top; border-bottom:1px solid #E2EFE8;">{_esc(market)}</td><td style="padding:9px 14px; font-size:12px; color:#444; line-height:1.5; border-bottom:1px solid #E2EFE8;">{label}</td></tr>"""
 
 
@@ -1050,9 +1234,23 @@ def _short_name(name: str, symbol: str = "") -> str:
     return short if short else _s(symbol)
 
 
-def _page_row(name: str, info: Dict[str, Any]) -> str:
+def _page_row(name: str, info: Dict[str, Any], vin: Optional[Dict[str, Any]] = None) -> str:
     pretty = name.replace("_", " ")
     inv = info["invest"]
+    # v1.7.0 (A): compact per-page data-vintage line (dominant dates first).
+    _vds = (vin or {}).get("dates") or []
+    vin_html = ""
+    if _vds:
+        _vtxt = " &middot; ".join(f"{d[5:]}&times;{c:,}" for d, c in _vds[:2])
+        vin_html = (f'<br><span style="font-size:10px; color:#B0AA9C;">Data: '
+                    f'{_vtxt}</span>')
+    # v1.7.0 (B): issuer-sibling sentence for this page's top names.
+    _sibs = [t for t in (info.get("top") or [])[:5] if t.get("sibling")]
+    sib_html = ""
+    if _sibs:
+        _s0 = _sibs[0]
+        sib_html = (f' <span style="color:#B26B00;">{_esc(_s0["symbol"])} is a share-class '
+                    f'sibling of held {_esc(_s0["sibling"])}.</span>')
     if inv == 0:
         note = "No signals clear the bar — <em>monitoring only</em>."
         ncol = "#777"
@@ -1080,7 +1278,8 @@ def _page_row(name: str, info: Dict[str, Any]) -> str:
         names = ", ".join(_labels)
         note = f"Top names: {names}."
         ncol = "#555"
-    return f"""<tr style="font-family:{SANS};"><td style="padding:10px 14px; font-size:13px; color:#1A1A1A; vertical-align:top; border-bottom:1px solid #E8E3D8; width:150px;"><strong>{_esc(pretty)}</strong><br><span style="font-size:11px; color:#999;">{info['total']:,} names · {inv} investable</span><div style="height:5px; background:#E8E3D8; margin-top:5px; font-size:0; line-height:0;"><div style="width:{_breadth_pct(info):.0f}%; height:5px; background:{ADD_C}; font-size:0; line-height:0;">&nbsp;</div></div></td><td style="padding:10px 14px; font-size:12px; color:{ncol}; line-height:1.5; border-bottom:1px solid #E8E3D8;">{note}</td></tr>"""
+    note += sib_html
+    return f"""<tr style="font-family:{SANS};"><td style="padding:10px 14px; font-size:13px; color:#1A1A1A; vertical-align:top; border-bottom:1px solid #E8E3D8; width:150px;"><strong>{_esc(pretty)}</strong><br><span style="font-size:11px; color:#999;">{info['total']:,} names · {inv} investable</span>{vin_html}<div style="height:5px; background:#E8E3D8; margin-top:5px; font-size:0; line-height:0;"><div style="width:{_breadth_pct(info):.0f}%; height:5px; background:{ADD_C}; font-size:0; line-height:0;">&nbsp;</div></div></td><td style="padding:10px 14px; font-size:12px; color:{ncol}; line-height:1.5; border-bottom:1px solid #E8E3D8;">{note}</td></tr>"""
 
 
 # ----------------------------------------------------------------------------- #
@@ -1433,6 +1632,17 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     else:
         lines.append("  No high-confidence portfolio action today.")
     lines += ["", f"BOOK: {d['pl_pct']:+.1f}% overall ({d['mv']:,.0f} vs {d['cost']:,.0f} SAR)", ""]
+    # v1.7.0 (A): one-line data-vintage summary (dominant dates per page).
+    _vin_t = model.get("vintage", {}) or {}
+    _vparts: List[str] = []
+    for _pg in MARKET_PAGES:
+        _vd = (_vin_t.get(_pg) or {}).get("dates") or []
+        if _vd:
+            _vparts.append(_PAGE_ABBREV.get(_pg, _pg) + " " +
+                           "/".join(f"{d[5:]}x{c}" for d, c in _vd[:2]))
+    if _vparts:
+        lines.append("DATA VINTAGE: " + "; ".join(_vparts))
+        lines.append("")
     if d["sell"]:
         lines.append("EXIT:  " + "; ".join(f"{r['symbol']} ({_pct(r['pl'])})" for r in d["sell"]))
     if d["trim"]:
@@ -1454,8 +1664,9 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
         for i, p in enumerate(t["top"], 1):
             _m2 = _mx2.get(p["symbol"].upper())
             _ol = (f" | 1M {_pct(_m2.get('roi1m'))} / 3M {_pct(_m2.get('roi3m'))}" if _m2 else "")
+            _sb = f" [same issuer as held {p['sibling']}]" if p.get("sibling") else ""
             lines.append(f"  {i}. {p['symbol']} {p['name'][:34]} - {_pct(p['roi'],0)} "
-                         f"[{p['market']}, reliability {_num_str(p['rel'])}, {p['conf']}]{_ol}")
+                         f"[{p['market']}, reliability {_num_str(p['rel'])}, {p['conf']}]{_ol}{_sb}")
     # v1.4.0: end-of-brief action summary (owner request 2026-07-05)
     lines += ["", "ACTION SUMMARY"]
     for label, grp, cash in (("EXIT/SELL", d["sell"], True), ("TRIM", d["trim"], True),
