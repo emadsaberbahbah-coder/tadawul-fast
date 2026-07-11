@@ -3,10 +3,43 @@
 """
 core/enriched_quote.py
 ===============================================================================
-TFB Enriched Quote Core — v4.7.0 (ENGINE-CONTRACT-ALIGNED / EMPTY-ROW-FULL-CLEAR / SCORING-ERRORS-NORMALIZED)
+TFB Enriched Quote Core — v4.8.0 (SUFFIX-TABLE-HARMONIZED / ENGINE-CONTRACT-ALIGNED / EMPTY-ROW-FULL-CLEAR)
 ==============================================================================================================
 CORE-ONLY • SCHEMA-FIRST • PAGE-CANONICAL • SPECIAL-PAGE SAFE • ENGINE-TOLERANT
 JSON-SAFE • SYNC/ASYNC SAFE • ROUTE-FRIENDLY • LIGHTWEIGHT • IMPORT-SAFE
+
+v4.8.0 suffix-table harmonization over v4.7.0  (pairs with data_engine_v2 v5.113.0 Fix AX)
+------------------------------------------------------------------------------------------
+
+The 2026-07-11 phased audit AST-diffed this module's _SUFFIX_TO_LOCALE
+against core/data_engine_v2.py's copy: the two had drifted BOTH ways.
+This module was the side that already classified .AT/.IS correctly (the
+engine side gained those six in v5.113.0); the engine side carried 31
+suffixes this module lacked (alternate vendor spellings such as .TADAWUL/
+.SAU, .NYSE/.NASDAQ/.OQ/.NM/.NG, .LN/.PAR/.AMS/.MIL/.MAD/.BRU/.STO/.HEL/
+.OSL/.SWX/.VIE/.WAR/.XETR, .HKG/.SHG/.SHE, .KOSDAQ/.SGX/.KLSE/.IDX/.ASX/
+.NZSE, .BSE, .ZA) plus eight shared keys with diverging values.
+
+- ADD: the 31 engine-side entries, tuples verbatim, as a tagged v4.8.0
+  block — a quote for AAPL.OQ or 2222.TADAWUL now derives the same locale
+  on this route as on the engine route.
+- ALIGN [7 labels]: .QA/.QE -> "Qatar Exchange" (was QSE), .VI -> "Vienna"
+  (was Wien), .WA -> "Warsaw" (was GPW), .AE -> ("ADX","AED","UAE") (was
+  DFM/ADX + long-form country), .DFM/.ADX country -> "UAE" — the pool
+  pages already display the engine vocabulary; both routes now speak it.
+- RULING [.KSE]: KEPT as ("Boursa Kuwait","KWD","Kuwait"). The engine side
+  maps .KSE to Tadawul/SAR (legacy alias); a full-workbook scan on the
+  2026-07-10 evening export found ZERO .KSE symbols anywhere, so the
+  conflict is dormant — the conventional Kuwait meaning stands here and
+  the engine-side divergence is documented in its v5.113.0 WHY, queued
+  for its next natural revision rather than a dedicated redeploy.
+- Table 68 -> 99 entries, byte-identical key set to the engine's. No key
+  contains an interior dot, so no key can be the tail of another —
+  longest-suffix resolution is structurally collision-free (harness-
+  proven). ZERO functions added or removed (AST-verified); lookup and
+  derivation logic untouched.
+
+MODULE_VERSION 4.7.0 -> 4.8.0.
 
 v4.7.0 engine-contract alignment over v4.6.0  (data_engine_v2 v5.75.0 / scoring.py v5.6.0)
 ------------------------------------------------------------------------------------------
@@ -275,7 +308,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-MODULE_VERSION = "4.7.0"
+MODULE_VERSION = "4.8.0"
 
 # v4.7.0: explicit markers of which engine/scoring releases this enriched_quote.py
 # was built to align with. data_engine_v2 v5.75.0 introduced the disciplined
@@ -526,24 +559,57 @@ _SUFFIX_TO_LOCALE: Dict[str, Tuple[str, str, str]] = {
     ".KW":    ("Boursa Kuwait",           "KWD", "Kuwait"),
     ".KSE":   ("Boursa Kuwait",           "KWD", "Kuwait"),
     ".JSE":   ("JSE",                     "ZAR", "South Africa"),
-    ".QA":    ("QSE",                     "QAR", "Qatar"),
-    ".QE":    ("QSE",                     "QAR", "Qatar"),
-    ".AE":    ("DFM/ADX",                 "AED", "United Arab Emirates"),
-    ".DFM":   ("DFM",                     "AED", "United Arab Emirates"),
-    ".ADX":   ("ADX",                     "AED", "United Arab Emirates"),
+    ".QA":    ("Qatar Exchange",          "QAR", "Qatar"),  # v4.8.0 align
+    ".QE":    ("Qatar Exchange",          "QAR", "Qatar"),  # v4.8.0 align
+    ".AE":    ("ADX",                     "AED", "UAE"),  # v4.8.0 align
+    ".DFM":   ("DFM",                     "AED", "UAE"),  # v4.8.0 align
+    ".ADX":   ("ADX",                     "AED", "UAE"),  # v4.8.0 align
     ".EG":    ("EGX",                     "EGP", "Egypt"),
     ".EGX":   ("EGX",                     "EGP", "Egypt"),
     ".TA":    ("TASE",                    "ILS", "Israel"),
     ".TASE":  ("TASE",                    "ILS", "Israel"),
     # ---- v4.6.0 expansion: emerging Europe, Latin America
     ".IS":    ("BIST",                    "TRY", "Turkey"),
-    ".WA":    ("GPW",                     "PLN", "Poland"),
-    ".VI":    ("Wien",                    "EUR", "Austria"),
+    ".WA":    ("Warsaw",                  "PLN", "Poland"),  # v4.8.0 align
+    ".VI":    ("Vienna",                  "EUR", "Austria"),  # v4.8.0 align
     ".PR":    ("PSE",                     "CZK", "Czech Republic"),
     ".BD":    ("BUX",                     "HUF", "Hungary"),
     ".AT":    ("ATHEX",                   "EUR", "Greece"),
     ".SN":    ("Santiago",                "CLP", "Chile"),
     ".LM":    ("Lima",                    "PEN", "Peru"),
+    # ---- v4.8.0 harmonization: the 31 engine-side entries (data_engine_v2
+    # v5.113.0 table), tuples verbatim — alternate vendor spellings + venues.
+    ".LN":    ("LSE",                     "GBp", "United Kingdom"),
+    ".BSE":   ("BSE",                     "INR", "India"),
+    ".SAU":   ("Tadawul",                 "SAR", "Saudi Arabia"),
+    ".TADAWUL": ("Tadawul",               "SAR", "Saudi Arabia"),
+    ".XETR":  ("XETRA",                   "EUR", "Germany"),
+    ".PAR":   ("Euronext Paris",          "EUR", "France"),
+    ".AMS":   ("Euronext Amsterdam",      "EUR", "Netherlands"),
+    ".MIL":   ("Borsa Italiana",          "EUR", "Italy"),
+    ".MAD":   ("BME",                     "EUR", "Spain"),
+    ".BRU":   ("Euronext Brussels",       "EUR", "Belgium"),
+    ".HEL":   ("Helsinki",                "EUR", "Finland"),
+    ".STO":   ("Stockholm",               "SEK", "Sweden"),
+    ".OSL":   ("Oslo",                    "NOK", "Norway"),
+    ".SWX":   ("SIX",                     "CHF", "Switzerland"),
+    ".VIE":   ("Vienna",                  "EUR", "Austria"),
+    ".WAR":   ("Warsaw",                  "PLN", "Poland"),
+    ".ASX":   ("ASX",                     "AUD", "Australia"),
+    ".NZSE":  ("NZX",                     "NZD", "New Zealand"),
+    ".HKG":   ("HKEX",                    "HKD", "Hong Kong"),
+    ".SHG":   ("Shanghai",                "CNY", "China"),
+    ".SHE":   ("Shenzhen",                "CNY", "China"),
+    ".KOSDAQ": ("KOSDAQ",                 "KRW", "South Korea"),
+    ".SGX":   ("SGX",                     "SGD", "Singapore"),
+    ".KLSE":  ("Bursa Malaysia",          "MYR", "Malaysia"),
+    ".IDX":   ("IDX",                     "IDR", "Indonesia"),
+    ".ZA":    ("JSE",                     "ZAR", "South Africa"),
+    ".NYSE":  ("NYSE",                    "USD", "USA"),
+    ".NASDAQ": ("NASDAQ",                 "USD", "USA"),
+    ".OQ":    ("NASDAQ",                  "USD", "USA"),
+    ".NM":    ("NASDAQ",                  "USD", "USA"),
+    ".NG":    ("NASDAQ",                  "USD", "USA"),
     # US suffix (used by some TFB providers)
     ".US":    ("NASDAQ/NYSE",             "USD", "USA"),
 }
