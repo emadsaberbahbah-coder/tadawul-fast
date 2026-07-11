@@ -2,8 +2,40 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.16.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.17.0)
 ===========================================================
+
+Why this revision (v6.17.0 vs v6.16.0) — MATURITY PRICE-INTEGRITY
+(fresh-price-or-hold; evidence: 2026-07-10 workbook audits, first 1M
+cohort maturing ~2026-07-18)
+  ROOT CAUSE. audit_active_records matured every past-due record on
+  WHATEVER unrealized_roi it carried: (a) a symbol whose price fetch
+  failed on maturity day matured on a STALE roi from the last successful
+  audit; (b) a symbol whose price was NEVER fetchable (the July symbol-
+  amputation class — 2222.SR/1010.SR-era records; delisted or renamed
+  tickers) carried the dataclass default unrealized_roi = 0.0 and matured
+  as a FAKE BREAKEVEN. Both silently poison the exact statistics the
+  2026-07-18 cohort exists to produce (hit rates, Brier, calibration).
+  v6.17.0 A  A record may transition ACTIVE -> MATURED only on a FRESH
+       positive price fetched THIS run (and entry_price > 0). Past-due
+       records without a fresh price stay ACTIVE and are retried on
+       every subsequent run — logged as 'maturity pending price'.
+  v6.17.0 B  After TFB_TRACK_MATURE_GRACE_DAYS (default 5, floor 0) days
+       past target_date with still no fresh price, the record becomes
+       PerformanceStatus.EXPIRED with realized_roi = None and outcome
+       'UNPRICED' (+ a tagged note). EXPIRED is an EXISTING enum value:
+       the sheet round-trips it, and every statistics consumer already
+       filters (status == MATURED and realized_roi is not None), so
+       unpriceable records are structurally invisible to the summary,
+       hit rates, calibrator, and Brier — no consumer changes needed.
+  v6.17.0 C  Kill-switch TFB_TRACK_MATURE_FRESH_ONLY=0/false/off/no runs
+       the v6.16.0 maturation block VERBATIM (stale/fake-breakeven
+       behavior restored whole). Default ON.
+  v6.17.0 D  Per-run integrity log line: matured-fresh / pending-price /
+       expired-unpriced counts with symbol samples, tag
+       [v6.17.0 MATURE-FRESH-ONLY]. New helpers:
+       _mature_fresh_only_enabled, _mature_grace_days (2 added, 0
+       removed, 0 signature changes; every other line verbatim v6.16.0).
 
 Why this revision (v6.16.0 vs v6.15.0) — DECISION-SYMBOL FORCED COVERAGE
 (Engineering Audit Fix #5; env-gated kill-switch
@@ -621,7 +653,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.16.0"
+SCRIPT_VERSION = "6.17.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -1222,6 +1254,30 @@ class RiyadhTime:
         if d.tzinfo is None:
             d = d.replace(tzinfo=cls._tz)
         return d.astimezone(cls._tz).strftime(fmt)
+
+
+# =============================================================================
+# v6.17.0 — maturity price-integrity switches
+# =============================================================================
+_MATURE_FRESH_TAG = "[v6.17.0 MATURE-FRESH-ONLY]"
+
+
+def _mature_fresh_only_enabled() -> bool:
+    """v6.17.0 (C) master switch. Default ON; set
+    TFB_TRACK_MATURE_FRESH_ONLY=0/false/off/no to restore the v6.16.0
+    maturation verbatim (past-due records mature on stale/default
+    unrealized_roi — the fake-breakeven behavior)."""
+    return (os.getenv("TFB_TRACK_MATURE_FRESH_ONLY") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _mature_grace_days() -> int:
+    """v6.17.0 (B): days past target_date a price-less record stays ACTIVE
+    (retried every run) before expiring UNPRICED. TFB_TRACK_MATURE_GRACE_DAYS,
+    default 5, floor 0; unparseable values fall back to 5."""
+    try:
+        return max(0, int(float(os.getenv("TFB_TRACK_MATURE_GRACE_DAYS") or "5")))
+    except Exception:
+        return 5
 
 
 # =============================================================================
@@ -4743,25 +4799,77 @@ class PerformanceTrackerApp:
         )
         now_r = RiyadhTime.now()
 
+        _fresh_only = _mature_fresh_only_enabled()
+        _grace_d = _mature_grace_days()
+        _n_matured = 0
+        _pending_syms: List[str] = []
+        _expired_syms: List[str] = []
+
         for r in active:
             px = float(price_map.get(r.symbol, 0.0))
-            if px > 0.0:
+            _fresh = px > 0.0
+            if _fresh:
                 r.current_price = px
                 if r.entry_price > 0:
                     r.unrealized_roi = (px / r.entry_price - 1.0) * 100.0
 
             if r.target_date and now_r >= r.target_date:
-                r.status = PerformanceStatus.MATURED
-                r.maturity_date = now_r
-                r.realized_roi = float(r.unrealized_roi)
-                if (r.realized_roi or 0.0) > 0:
-                    r.outcome = "WIN"
-                elif (r.realized_roi or 0.0) < 0:
-                    r.outcome = "LOSS"
+                if not _fresh_only:
+                    # v6.16.0 VERBATIM (kill-switch path): mature on whatever
+                    # unrealized_roi is stored — stale or default-0.0 included.
+                    r.status = PerformanceStatus.MATURED
+                    r.maturity_date = now_r
+                    r.realized_roi = float(r.unrealized_roi)
+                    if (r.realized_roi or 0.0) > 0:
+                        r.outcome = "WIN"
+                    elif (r.realized_roi or 0.0) < 0:
+                        r.outcome = "LOSS"
+                    else:
+                        r.outcome = "BREAKEVEN"
+                elif _fresh and r.entry_price > 0:
+                    # v6.17.0 (A): fresh positive price THIS run -> honest
+                    # maturation on today's realized number.
+                    r.status = PerformanceStatus.MATURED
+                    r.maturity_date = now_r
+                    r.realized_roi = float(r.unrealized_roi or 0.0)
+                    if (r.realized_roi or 0.0) > 0:
+                        r.outcome = "WIN"
+                    elif (r.realized_roi or 0.0) < 0:
+                        r.outcome = "LOSS"
+                    else:
+                        r.outcome = "BREAKEVEN"
+                    _n_matured += 1
                 else:
-                    r.outcome = "BREAKEVEN"
+                    # v6.17.0 (B): past due but no fresh price (or no usable
+                    # entry price) -> hold ACTIVE and retry, then expire
+                    # UNPRICED after the grace window. EXPIRED + realized None
+                    # is structurally excluded from every statistic.
+                    _overdue = (now_r - r.target_date).days
+                    if _overdue > _grace_d:
+                        r.status = PerformanceStatus.EXPIRED
+                        r.maturity_date = now_r
+                        r.realized_roi = None
+                        r.outcome = "UNPRICED"
+                        _note = (
+                            f"{_MATURE_FRESH_TAG} expired unpriced {_overdue}d "
+                            f"past target (no fresh price this run)"
+                        )
+                        r.notes = f"{r.notes} | {_note}" if r.notes else _note
+                        _expired_syms.append(r.symbol)
+                    else:
+                        _pending_syms.append(r.symbol)
 
             r.last_updated = _utc_now()
+
+        if _fresh_only and (_n_matured or _pending_syms or _expired_syms):
+            logger.info(
+                "%s matured-fresh=%d | pending-price=%d%s | expired-unpriced=%d%s",
+                _MATURE_FRESH_TAG, _n_matured,
+                len(_pending_syms),
+                f" ({', '.join(_pending_syms[:8])}{'…' if len(_pending_syms) > 8 else ''})" if _pending_syms else "",
+                len(_expired_syms),
+                f" ({', '.join(_expired_syms[:8])}{'…' if len(_expired_syms) > 8 else ''})" if _expired_syms else "",
+            )
 
         return records
 
