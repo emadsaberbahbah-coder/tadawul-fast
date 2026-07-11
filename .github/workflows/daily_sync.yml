@@ -224,7 +224,14 @@ jobs:
     # mid-write and wiped two pages. v6.18.0's advanced-first routing makes the
     # run much faster, but the ceiling must never again be the thing that kills
     # a run between a clear and a write.
-    timeout-minutes: 75  # 2026-07-05: was 45; run #2236 cancelled mid-recovery during provider outage
+    # 2026-07-11: was 75 (2026-07-05: was 45; run #2236 cancelled mid-recovery
+    # during provider outage). Runs #2330/#2331 proved the GM leg fetches ~133
+    # good batches in ~69 min and was killed at exactly 75:00 — BEFORE the
+    # single end-of-run write, turning an hour of fetched data into ZERO rows.
+    # 115 gives the leg ~80-min completion headroom; the in-process
+    # TFB_SYNC_TIME_BUDGET_SEC below guarantees a write long before this
+    # ceiling can ever land.
+    timeout-minutes: 115
     needs: preflight-validation
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight-validation.outputs.validated == 'true' }}
 
@@ -334,6 +341,17 @@ jobs:
       # nears the 25-min job cap; optional companion TFB_SYNC_BATCH_DELAY_MS: "500"
       # adds a pause between batches for extra upstream cooldown.
       TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
+      # v6.22.4 L5 [TIME-BUDGET] (2026-07-11, runs #2330/#2331 forensics): the
+      # runner stops fetching new batches once 3600s of wall clock are spent
+      # and PROCEEDS TO THE WRITE with the accumulated partial — the coverage
+      # floor skips a too-thin write, the v6.19.0 persistence pass preserves
+      # every non-fetched symbol's row, and v6.22.3 KEEP-LAST-GOOD stops error
+      # stubs from erasing good data. Paired with timeout-minutes: 115 above,
+      # an external kill can never again precede the write. At batch "25" the
+      # GM leg (~3,652 symbols = 147 batches) either finishes whole inside the
+      # ceiling or lands ~79% fresh + the rest preserved at minute 60.
+      # KILL-SWITCH: remove this line (or "0") for v6.22.3 behavior verbatim.
+      TFB_SYNC_TIME_BUDGET_SEC: "3600"
       # Per-page symbol cap for the four MARKET pages (scripts/
       # run_dashboard_sync.py v6.19.2 _market_symbol_cap). RAISED to the
       # script's own clamp ceiling.
