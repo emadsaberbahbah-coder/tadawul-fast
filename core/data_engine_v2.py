@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.111.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.113.0
 ================================================================================
 
 WHY v5.111.0 - FINAL-ACTION BOUNDARY INVARIANT (Fix AW)
@@ -33,6 +33,35 @@ provider rating direction opposes the SELL-family engine call while
 provider_engine_conflict still reads FALSE, the conflict pair is corrected
 to TRUE / "Direction". Idempotent (second pass is a no-op); non-violating
 rows byte-identical; never promotes.
+
+WHY v5.113.0 - SUFFIX LOCALE COMPLETION (.AT/.IS + 4) (Fix AX)
+--------------------------------------------------------------
+Root cause (2026-07-10/11 workbook audits): MOH.AT (Motor Oil Hellas,
+Athens) rode the Top_10 board for two sessions as ticket #6 (~14,956 SAR)
+priced as NASDAQ/NYSE in USD. _SUFFIX_TO_LOCALE (93 entries) carries no
+".AT" and no ".IS": _suffix_locale_for returns None and the
+_infer_exchange / _infer_currency fallbacks land on "NASDAQ/NYSE" / "USD"
+by design. routes/enriched_quote.py's OWN copy of the table already maps
+both correctly - the two copies drifted. A programmatic AST diff of the
+two tables shows exactly six entries present there and absent here.
+FIX (AX): the six entries are added verbatim from the enriched_quote
+table - .AT (ATHEX/EUR/Greece), .IS (BIST/TRY/Turkey), .BD (BUX/HUF/
+Hungary), .LM (Lima/PEN/Peru), .PR (PSE/CZK/Czech Republic), .SN
+(Santiago/CLP/Chile) - as a tagged block at the end of the dict. Lookup
+logic, fallbacks, the Yahoo strip/remap tables, and every other line are
+untouched; longest-suffix-wins resolution is unaffected (no new suffix is
+the tail of any existing one). Behavioral note: .IS symbols flip from
+wrong-USD to honest TRY; until a TRY rate exists in the workbook FX
+config those rows carry the missing_fx marker instead of a silently
+mispriced SAR conversion - correct, and the TRY addition is queued on the
+sheet side. Dict-only change: ZERO functions added or removed
+(AST-verified). Table harmonization in the other direction (31 entries +
+8 label conflicts incl. the .KSE Tadawul-vs-Kuwait conflict) is
+deliberately deferred to the enriched_quote phase pending an operator
+ruling.
+
+Version: __version__ = "5.113.0". All prior WHYs preserved verbatim.
+Zero functions removed (AST-verified).
 
 WHY v5.112.0 - FUNDAMENTALS-CHANNEL IDENTITY FIREWALL (Fix AW)
 --------------------------------------------------------------
@@ -2627,7 +2656,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.112.0"
+__version__ = "5.113.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -9420,6 +9449,14 @@ _SUFFIX_TO_LOCALE: Dict[str, Tuple[str, str, str]] = {
     ".EGX":   ("EGX", "EGP", "Egypt"),
     ".TA":    ("TASE", "ILS", "Israel"),
     ".TASE":  ("TASE", "ILS", "Israel"),
+    # v5.113.0 (Fix AX): completion from routes/enriched_quote.py's table -
+    # suffixes the fallback was silently misclassifying as NASDAQ/NYSE + USD.
+    ".AT":    ("ATHEX", "EUR", "Greece"),
+    ".IS":    ("BIST", "TRY", "Turkey"),
+    ".BD":    ("BUX", "HUF", "Hungary"),
+    ".LM":    ("Lima", "PEN", "Peru"),
+    ".PR":    ("PSE", "CZK", "Czech Republic"),
+    ".SN":    ("Santiago", "CLP", "Chile"),
 }
 
 _US_COUNTRY_TOKENS: Set[str] = {
