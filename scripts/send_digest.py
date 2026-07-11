@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-scripts/send_digest.py  —  TFB Post-Sync Digest (EMAIL ONLY, v1.0.0)
+scripts/send_digest.py  —  TFB Post-Sync Digest (EMAIL ONLY, v1.1.0)
 =====================================================================
 
 WHAT THIS IS
@@ -37,6 +37,31 @@ requires: action is BUY-family AND (investable is truthy, if that column exists)
 AND (block_reason empty, if that column exists) AND a usable price. This is the
 final-decision view, not the raw signal.
 
+WHY v1.1.0 — LEDGER-AWARE SELL + HELD-EXCLUSION + FRESHNESS (2026-07-11)
+------------------------------------------------------------------------
+Evidence: the 2026-07-10 13:26 digest. (D1) Best SELL fired on 1211.SR — a
+STALE My_Portfolio row for a position the Investment Ledger had already
+marked Inactive (sold). The page-level source is fixed by 10_My_Portfolio
+v1.5.9, but the digest reads pages independently and needs its own gate:
+holdings rows whose symbol is Inactive in _Portfolio_CostBasis (or whose
+Qty is <= 0) are no longer SELL/SWAP candidates. Fail-open: if the ledger
+page is unreadable the filter contributes nothing (v1.0.0 behavior), and
+DIGEST_LEDGER_FILTER=0 disables it outright. (D2) Best BUY had NO held
+awareness at all: it could recommend a symbol already in the book (NMM.US
+was INVEST on Market_Leaders while held) and did recommend BBDO.US while
+BBD.US — the same issuer, Banco Bradesco S.A., in a different ADR share
+class — was held. Exact-held symbols are now excluded from BUY candidacy
+(DIGEST_EXCLUDE_HELD=0 restores v1.0.0); a pick whose NAME matches a held
+issuer under a different symbol is kept but explicitly flagged '⚠ same
+issuer as held X — different share class'; and a SWAP whose sell and buy
+legs share one issuer (SELL BBD -> BUY BBDO churn) is suppressed. (D3)
+Zero freshness disclosure: nothing in the email said the quoted rows were
+days old (Global_Markets carried 07-08 vintages on 07-10). Each pick now
+shows its row's 'Last Updated (Riyadh)' stamp, stamps older than
+DIGEST_STALE_HOURS (default 24) are marked STALE, and a header notice
+appears when any shown pick is stale. All additions fail-safe: a missing
+column/timestamp simply renders nothing.
+
 SAFETY / OPERABILITY
 --------------------
 - Kill switch: DIGEST_ENABLE=0 -> exits 0 without sending.
@@ -55,6 +80,9 @@ ENV (all read at runtime; SMTP_* belong in GitHub Actions Secrets, NOT Render):
   DIGEST_CANDIDATE_PAGES="Market_Leaders"                   (BUY universe)
   DIGEST_HOLDINGS_PAGE="My_Portfolio"                       (SELL/SWAP universe)
   DIGEST_ENABLE=1   DIGEST_SKIP_IF_EMPTY=0                  (gates)
+  DIGEST_LEDGER_PAGE="_Portfolio_CostBasis"                 (v1.1.0 ledger tab)
+  DIGEST_LEDGER_FILTER=1   DIGEST_EXCLUDE_HELD=1            (v1.1.0 gates)
+  DIGEST_STALE_HOURS=24                                     (v1.1.0 freshness)
 """
 
 from __future__ import annotations
@@ -71,7 +99,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 RIYADH_TZ = timezone(timedelta(hours=3))  # Saudi Arabia is fixed UTC+3 (no DST).
 
@@ -241,6 +269,8 @@ FIELD_ALIASES: Dict[str, List[str]] = {
     "roi": ["expected roi 12m", "expected roi 3m", "expected roi 1m", "expected roi", "roi 12m", "roi"],
     "reason": ["recommendation reason", "reason", "rationale", "note", "comment"],
     "qty": ["qty", "quantity", "shares", "units", "position qty"],
+    # v1.1.0 (D3): row freshness stamp for the per-pick 'data as of' line.
+    "updated": ["last updated (riyadh)", "last updated (utc)", "last updated"],
 }
 
 
@@ -296,6 +326,7 @@ def _load_page(read_range, sheet_id: str, page: str) -> List[Dict[str, Any]]:
                 "roi": _to_float(cell("roi")),
                 "reason": str(cell("reason")).strip(),
                 "qty": _to_float(cell("qty")),
+                "updated": str(cell("updated")).strip(),  # v1.1.0 (D3)
             }
         )
     _log(f"'{page}': {len(rows)} symbol rows")
@@ -308,6 +339,150 @@ def _is_investable(r: Dict[str, Any]) -> bool:
     if r["has_block_col"] and not _is_blank(r["block_cell"]):
         return False
     return True
+
+
+# --------------------------------------------------------------------------- #
+# v1.1.0 helpers — ledger gate (D1), held/issuer awareness (D2), freshness (D3)
+# --------------------------------------------------------------------------- #
+_LEDGER_INACTIVE_TOKENS = {"inactive", "closed", "sold", "exited"}
+
+
+def _issuer_key(name: Any) -> str:
+    """v1.1.0 (D2): normalized issuer-name key — lowercase alphanumerics only,
+    so 'Banco Bradesco S.A.' and 'BANCO BRADESCO SA' collide."""
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+
+def _stale_hours() -> float:
+    """v1.1.0 (D3): DIGEST_STALE_HOURS, default 24, floor 1."""
+    try:
+        return max(1.0, float(_env("DIGEST_STALE_HOURS", "24") or "24"))
+    except Exception:
+        return 24.0
+
+
+def _parse_ts(raw: Any) -> Optional[datetime]:
+    """v1.1.0 (D3): parse a sheet 'Last Updated (Riyadh)' cell (naive
+    'YYYY-MM-DD HH:MM[:SS]' or date-only). None when unparseable."""
+    t = str(raw or "").strip()[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(t[: len(datetime.now().strftime(fmt))], fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _is_stale(r: Optional[Dict[str, Any]]) -> bool:
+    """v1.1.0 (D3): True iff the row carries a parseable stamp older than
+    DIGEST_STALE_HOURS (Riyadh clock). Unstamped rows are never 'stale' —
+    they simply render no data line."""
+    if not r:
+        return False
+    ts = _parse_ts(r.get("updated"))
+    if ts is None:
+        return False
+    now_r = datetime.now(RIYADH_TZ).replace(tzinfo=None)
+    return (now_r - ts).total_seconds() / 3600.0 >= _stale_hours()
+
+
+def _load_inactive_symbols(read_range, sheet_id: str) -> set:
+    """v1.1.0 (D1): symbols the Investment Ledger marks Inactive/closed.
+
+    Reads DIGEST_LEDGER_PAGE (default '_Portfolio_CostBasis', the 21_Portfolio_
+    Ledger v2 layout: banner/status/hint rows precede the header row), locates
+    the first row within the top 15 that carries BOTH a Symbol-like and a
+    Status-like header, and collects every symbol whose Status normalizes into
+    _LEDGER_INACTIVE_TOKENS. FAIL-OPEN by design: any read/layout problem
+    returns an empty set (v1.0.0 behavior) — this gate may only ever REMOVE a
+    known-closed position from SELL candidacy, never block the digest."""
+    if not _env_bool("DIGEST_LEDGER_FILTER", True):
+        _log("ledger filter disabled (DIGEST_LEDGER_FILTER=0)")
+        return set()
+    page = _env("DIGEST_LEDGER_PAGE", "_Portfolio_CostBasis") or "_Portfolio_CostBasis"
+    try:
+        values = read_range(sheet_id, f"'{page}'!A1:M200")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"WARN ledger '{page}' unreadable ({exc}) — SELL gate inactive")
+        return set()
+    if not values:
+        return set()
+    sym_i = st_i = hdr_r = -1
+    for r_i, row in enumerate(values[:15]):
+        cells = [_norm(c) for c in (row or [])]
+        try:
+            si = next(i for i, c in enumerate(cells) if c in ("symbol", "ticker", "code"))
+            ti = next(i for i, c in enumerate(cells) if c in ("status", "state", "lot status"))
+        except StopIteration:
+            continue
+        sym_i, st_i, hdr_r = si, ti, r_i
+        break
+    if sym_i < 0:
+        _log(f"WARN ledger '{page}': Symbol/Status header row not found — SELL gate inactive")
+        return set()
+    out: set = set()
+    for row in values[hdr_r + 1:]:
+        if not row or sym_i >= len(row):
+            continue
+        sym = str(row[sym_i] or "").strip().upper()
+        if not sym:
+            continue
+        status = _norm(row[st_i]) if st_i < len(row) else ""
+        if status in _LEDGER_INACTIVE_TOKENS:
+            out.add(sym)
+    _log(f"ledger '{page}': {len(out)} inactive symbol(s)" + (f" ({', '.join(sorted(out))})" if out else ""))
+    return out
+
+
+def _filter_holdings(rows: List[Dict[str, Any]], inactive: set) -> List[Dict[str, Any]]:
+    """v1.1.0 (D1): the SELL/SWAP universe = rows that are (a) not ledger-
+    Inactive and (b) not zero/negative Qty when the Qty column resolved.
+    Rows without a parseable Qty pass (blank cells must not hide a holding)."""
+    kept: List[Dict[str, Any]] = []
+    dropped: List[str] = []
+    for r in rows:
+        sym = r["symbol"].upper()
+        if sym in inactive:
+            dropped.append(f"{sym}(ledger-inactive)")
+            continue
+        q = r.get("qty")
+        if q is not None and q <= 0:
+            dropped.append(f"{sym}(qty<=0)")
+            continue
+        kept.append(r)
+    if dropped:
+        _log("holdings excluded from SELL/SWAP: " + ", ".join(dropped))
+    return kept
+
+
+def _held_issuers(holdings: List[Dict[str, Any]]) -> Tuple[set, Dict[str, List[str]]]:
+    """v1.1.0 (D2): (held symbol set, issuer-name key -> sorted held symbols)
+    from the FILTERED holdings (a ledger-retired zombie is not 'held')."""
+    syms: set = set()
+    names: Dict[str, List[str]] = {}
+    for r in holdings:
+        sym = r["symbol"].upper()
+        syms.add(sym)
+        k = _issuer_key(r.get("name"))
+        if k:
+            names.setdefault(k, []).append(sym)
+    return syms, {k: sorted(set(v)) for k, v in names.items()}
+
+
+def _annotate_sibling(pick: Optional[Dict[str, Any]],
+                      held_syms: set, held_names: Dict[str, List[str]]) -> None:
+    """v1.1.0 (D2): mark a BUY pick whose ISSUER is already held under a
+    different symbol (share-class sibling). Selection is unaffected — the
+    flag is disclosure, not exclusion."""
+    if not pick:
+        return
+    sym = pick["symbol"].upper()
+    k = _issuer_key(pick.get("name"))
+    if not k or sym in held_syms:
+        return
+    sibs = [x for x in held_names.get(k, []) if x != sym]
+    if sibs:
+        pick["sibling"] = ", ".join(sibs)
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +533,12 @@ def _pick_best_swap(
     # exited; swapping into something not materially stronger is just noise.
     if sb is not None and bb is not None and bb <= sb:
         return None
+    # v1.1.0 (D2): a swap whose two legs are the SAME issuer (SELL BBD.US ->
+    # BUY BBDO.US) is share-class churn, not a portfolio improvement.
+    ks, kb = _issuer_key(best_sell.get("name")), _issuer_key(best_buy.get("name"))
+    if ks and ks == kb:
+        _log(f"swap suppressed: {best_sell['symbol']} -> {best_buy['symbol']} share one issuer")
+        return None
     return (best_sell, best_buy)
 
 
@@ -384,9 +565,13 @@ def _line(label: str, r: Optional[Dict[str, Any]]) -> str:
         extra.append(f"score {_fmt_num(r['score'])}")
     if r["roi"] is not None:
         extra.append(f"ROI {_fmt_num(r['roi'], '%')}")
+    if r.get("updated"):  # v1.1.0 (D3)
+        extra.append(f"data {str(r['updated'])[:16]}" + (" STALE" if _is_stale(r) else ""))
     if extra:
         bits.append("[" + ", ".join(extra) + "]")
     s = f"{label}: " + " ".join(bits)
+    if r.get("sibling"):  # v1.1.0 (D2)
+        s += f"\n    \u26a0 same issuer as held {r['sibling']} — different share class"
     if r["reason"]:
         s += f"\n    {r['reason']}"
     return s
@@ -420,10 +605,17 @@ def _compose(
             f"(score {_fmt_num(s_in['score'])})"
         )
 
+    # v1.1.0 (D3): one visible notice when any shown pick rides stale data.
+    stale_note = ""
+    if _is_stale(best_buy) or _is_stale(best_sell):
+        stale_note = (f"\u26a0 DATA VINTAGE: at least one pick below is older than "
+                      f"{_stale_hours():.0f}h — prices reflect the last completed sync.")
+
     text = "\n".join(
         [
             f"TFB Decision Digest — {session}",
             f"Generated {now} Riyadh (from the latest synced dashboard).",
+            *([stale_note] if stale_note else []),
             "",
             _line("Best BUY ", best_buy),
             _line("Best SELL", best_sell),
@@ -441,7 +633,12 @@ def _compose(
         return (
             "<tr>"
             f"<td><b>{label}</b></td>"
-            f"<td>{r['symbol']}{(' — ' + r['name']) if r['name'] else ''}</td>"
+            f"<td>{r['symbol']}{(' — ' + r['name']) if r['name'] else ''}"
+            + (f"<div style='color:#B26B00;font-size:11px'>&#9888; same issuer as held {r['sibling']}"
+               f" — different share class</div>" if r.get("sibling") else "")
+            + (f"<div style='color:#888;font-size:11px'>data {str(r['updated'])[:16]}"
+               f"{' <b>STALE</b>' if _is_stale(r) else ''}</div>" if r.get("updated") else "")
+            + "</td>"
             f"<td>{r['action_raw'] or r['action']}</td>"
             f"<td>{_fmt_num(r['price'])}</td>"
             f"<td>{_fmt_num(r['score'])}{(' / ROI ' + _fmt_num(r['roi'], '%')) if r['roi'] is not None else ''}</td>"
@@ -452,7 +649,9 @@ def _compose(
         f"<div style='font-family:Arial,Helvetica,sans-serif;font-size:14px'>"
         f"<h2 style='margin:0 0 4px'>TFB Decision Digest</h2>"
         f"<div style='color:#555'>{session} · generated {now} Riyadh · latest synced dashboard</div>"
-        f"<table cellpadding='6' cellspacing='0' "
+        + (f"<div style='background:#FCF4E3;border:1px solid #E8D5A8;padding:8px 10px;"
+           f"margin-top:8px;color:#7A5A17;font-size:12px'>{stale_note}</div>" if stale_note else "")
+        + f"<table cellpadding='6' cellspacing='0' "
         f"style='border-collapse:collapse;margin-top:12px' border='1'>"
         f"<tr style='background:#f2f2f2'><th>Pick</th><th>Symbol</th>"
         f"<th>Action</th><th>Price</th><th>Score / ROI</th></tr>"
@@ -556,9 +755,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     candidates: List[Dict[str, Any]] = []
     for p in candidate_pages:
         candidates.extend(_load_page(read_range, sheet_id, p))
-    holdings = _load_page(read_range, sheet_id, holdings_page)
+    holdings_raw = _load_page(read_range, sheet_id, holdings_page)
 
-    best_buy = _pick_best_buy(candidates)
+    # v1.1.0 (D1): the SELL/SWAP universe is the ledger-ACTIVE book only.
+    inactive = _load_inactive_symbols(read_range, sheet_id)
+    holdings = _filter_holdings(holdings_raw, inactive)
+
+    # v1.1.0 (D2): BUY may not re-recommend a symbol already held; a held
+    # ISSUER under another symbol stays eligible but is flagged below.
+    held_syms, held_names = _held_issuers(holdings)
+    buy_pool = candidates
+    if _env_bool("DIGEST_EXCLUDE_HELD", True) and held_syms:
+        buy_pool = [c for c in candidates if c["symbol"].upper() not in held_syms]
+        n_excl = len(candidates) - len(buy_pool)
+        if n_excl:
+            _log(f"BUY pool: {n_excl} held symbol(s) excluded")
+
+    best_buy = _pick_best_buy(buy_pool)
+    _annotate_sibling(best_buy, held_syms, held_names)
     best_sell = _pick_best_sell(holdings)
     swap = _pick_best_swap(best_sell, best_buy)
 
