@@ -3,9 +3,44 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.22.3)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.22.4)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.22.4 fix — TIME-BUDGET GRACEFUL FINISH (L5 DEADLINE-OVER-KILL)
+- ROOT CAUSE (GitHub Actions runs #2330/#2331, artifacts read 2026-07-11):
+  the global-markets leg fetched ~133 successful backend batches over 69
+  minutes (3,652 symbols; 502/500 retry bursts and 60-150s slow batches in
+  between) and was then KILLED by the job-level timeout-minutes ceiling —
+  BEFORE the single end-of-run sheet write. 69 minutes of good data became
+  ZERO rows written, every night since the universe outgrew the ceiling.
+  A hard kill is the one failure mode no in-process guard can catch,
+  because the process simply stops existing.
+- FIX L5 [TIME-BUDGET]: an in-process wall-clock deadline the runner
+  respects BEFORE the kill can land. TFB_SYNC_TIME_BUDGET_SEC (default
+  0 = disabled, byte-identical v6.22.3 behavior; floor 60 when set)
+  measures from process start. Inside the batched market fetch
+  (_fetch_market_rows_batched — the production mode):
+    (a) BETWEEN batches: budget spent -> stop fetching, tagged warning,
+        and PROCEED TO THE WRITE with the accumulated partial. The
+        existing machinery then composes safely: the coverage floor
+        skips a too-thin write, the v6.19.0 persistence pass preserves
+        every non-fetched symbol's row, and L4c keeps error stubs from
+        erasing good data. A 90%-fetched Global_Markets now LANDS
+        instead of dying at 100%-minus-write.
+    (b) BEFORE a page's first batch: budget already spent -> the page is
+        skipped whole and the empty-fetch guards preserve it (identical
+        to a provider outage). Never interrupts mid-batch; the first
+        batch of a page is always allowed so headers can resolve.
+  Scope: the batched fetch path only — single-request mode is one HTTP
+  call and cannot be usefully interrupted (documented, unchanged).
+  Deployment note: set the env in the WORKFLOW (GitHub Actions env/vars,
+  not Render) — recommended TFB_SYNC_TIME_BUDGET_SEC=3600 with the job
+  ceiling at timeout-minutes: 115, so the runner always finishes and
+  writes ~15 min before any kill. New helpers: _time_budget_sec,
+  _time_budget_exceeded, _time_budget_left (+ module start anchor;
+  3 added, 0 removed, 0 signature changes; every other line verbatim
+  v6.22.3).
 
 v6.22.3 fix — KEEP-LAST-GOOD ROWS (L4c STALE-OVER-STUB SUBSTITUTION)
 - ROOT CAUSE (2026-07-10 morning + evening workbook audits): Global_Markets
@@ -781,7 +816,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.22.3"
+SCRIPT_VERSION = "6.22.4"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3257,6 +3292,38 @@ def _effective_gateway(task: TaskSpec) -> str:
 # when a page has MORE symbols than the batch size.
 
 
+_TIME_BUDGET_TAG = "[v6.22.4 TIME-BUDGET]"
+# The runner is a one-shot script: module import happens at process start,
+# so this anchor approximates the process birth time with zero plumbing.
+_TIME_BUDGET_START = time.monotonic()
+
+
+def _time_budget_sec() -> float:
+    """v6.22.4 L5: wall-clock budget in seconds (TFB_SYNC_TIME_BUDGET_SEC).
+    Default 0 = DISABLED (v6.22.3 behavior byte-identical). When set, floor
+    60s; unparseable values disable."""
+    raw = (os.getenv("TFB_SYNC_TIME_BUDGET_SEC", "") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        v = float(raw)
+    except Exception:
+        return 0.0
+    return 0.0 if v <= 0 else max(60.0, v)
+
+
+def _time_budget_left() -> float:
+    """Seconds remaining (inf when the budget is disabled)."""
+    b = _time_budget_sec()
+    if b <= 0:
+        return float("inf")
+    return b - (time.monotonic() - _TIME_BUDGET_START)
+
+
+def _time_budget_exceeded() -> bool:
+    return _time_budget_left() <= 0.0
+
+
 def _symbol_batch_size() -> int:
     """v6.17.0: per-request symbol batch size for market pages. <=0 disables
     batching (original single-request path). A positive N fetches the page in
@@ -3313,6 +3380,19 @@ async def _fetch_market_rows_batched(
     Top_10 header-repair steps are (by scope) no-ops and are intentionally not
     duplicated here.
     """
+    # v6.22.4 L5 [TIME-BUDGET]: a page whose fetch would START after the
+    # budget is spent is skipped whole -> the caller's empty-fetch guards
+    # PRESERVE its last-good rows (identical to a provider outage).
+    if _time_budget_exceeded():
+        _tw = (
+            f"{_TIME_BUDGET_TAG} {task.sheet_name}: budget "
+            f"{_time_budget_sec():.0f}s already exhausted before fetch — page "
+            f"skipped; last-good rows preserved by the empty-fetch guards."
+        )
+        res.warnings.append(_tw)
+        logger.warning(_tw)
+        return [], [], None, "time budget exhausted before fetch"
+
     size = _symbol_batch_size()
     delay_ms = _batch_delay_ms()
     batches = [symbols[i:i + size] for i in range(0, len(symbols), size)]
@@ -3333,6 +3413,21 @@ async def _fetch_market_rows_batched(
     _idb_blank = 0           # rows with a blank symbol cell (unaddressable)
 
     for bi, batch in enumerate(batches):
+        # v6.22.4 L5: deadline check BETWEEN batches — stop fetching and let
+        # the accumulated partial proceed to the write path (coverage floor +
+        # persistence + KEEP-LAST-GOOD then decide safely). Never mid-batch;
+        # the first batch is always allowed so headers can resolve.
+        if bi > 0 and _time_budget_exceeded():
+            _tw = (
+                f"{_TIME_BUDGET_TAG} {task.sheet_name}: budget "
+                f"{_time_budget_sec():.0f}s exhausted after {ok_batches}/"
+                f"{len(batches)} batch(es); proceeding to write with the "
+                f"partial fetch instead of losing it to a hard kill."
+            )
+            res.warnings.append(_tw)
+            logger.warning(_tw)
+            break
+
         p = dict(base_payload)
         p["tickers"] = batch
         p["symbols"] = batch
