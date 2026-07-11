@@ -3,9 +3,39 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.22.2)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.22.3)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.22.3 fix — KEEP-LAST-GOOD ROWS (L4c STALE-OVER-STUB SUBSTITUTION)
+- ROOT CAUSE (2026-07-10 morning + evening workbook audits): Global_Markets
+  carries 9 rows with Data Provider = fallback_error and Name/Price EMPTY
+  (NVDA, LLY, ADSK, ANET, ETN, KMI, EQT, MO, CHD). The v6.19.0 persistence
+  pass protects a symbol the backend OMITS — but a symbol the backend
+  answers WITH A DATA-FREE ERROR STUB is "present", passes every membership
+  guard, and the stub OVERWRITES the symbol's last good row. On the next
+  sync the stub is the baseline: a transient provider failure has become
+  permanent data loss, one symbol at a time.
+- FIX L4c [KEEP-LAST-GOOD]: on the ranked market pages, AFTER the
+  persistence pass and BEFORE the L4b membership verification, pre-scan the
+  final matrix for DATA-FREE stub rows — (a) Data Provider normalizing into
+  {fallback_error, error, unavailable, none} with no positive price, or
+  (b) blank Name AND no positive price. Zero stubs (every healthy sync) =
+  ZERO extra reads. Otherwise read the live page ONCE (the same A1:ZZ6000
+  read + header-NAME alignment as the persistence pass) and swap each stub
+  for the symbol's existing row IFF that row is GOOD (positive price,
+  provider not in the error set). A stub whose old row is also stub/absent
+  keeps the fresh stub — the guard can only substitute strictly better
+  data, never freeze an error in place. Deliberately conservative: an
+  error-tagged row that DOES carry a price keeps the fresh price.
+  Scope: _RANKED_MARKET_PAGES only (My_Portfolio semantics untouched).
+  Kill-switch TFB_SYNC_KEEP_LAST_GOOD=0/false/off/no restores v6.22.2
+  exactly. FAIL-SAFE + never-throws: any detection/read error keeps the
+  fetched matrix unchanged and appends a warning. Tag
+  [v6.22.3 KEEP-LAST-GOOD] in warnings/logs; the per-page warning lists the
+  substituted symbols. New helpers: _keep_last_good_enabled,
+  _klg_price_ok, _klg_provider_is_error, _keep_last_good_rows (4 added,
+  0 removed, 0 signature changes; every other line verbatim v6.22.2).
 
 v6.22.2 fix — SYMBOL-AMPUTATION HARD GUARDS (L4a READBACK-EMPTY-GUARD +
   L4b PERSISTENCE-HARD-GUARD; both default ON with kill-switches; no
@@ -751,7 +781,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.22.2"
+SCRIPT_VERSION = "6.22.3"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2442,6 +2472,152 @@ def _unpersisted_missing(
     return out
 
 
+_KEEP_LAST_GOOD_TAG = "[v6.22.3 KEEP-LAST-GOOD]"
+
+# Data-provider column aliases (normalized via _guard_norm).
+_KLG_PROVIDER_ALIASES = frozenset({
+    "dataprovider", "provider", "datasource", "source",
+})
+
+# Provider markers that identify a backend ERROR STUB (post-_guard_norm form:
+# 'fallback_error' -> 'fallbackerror'). A BLANK provider is NOT an error.
+_KLG_ERROR_PROVIDERS = frozenset({
+    "fallbackerror", "error", "unavailable", "none",
+})
+
+
+def _keep_last_good_enabled() -> bool:
+    """v6.22.3 L4c master switch. Default ON; set
+    TFB_SYNC_KEEP_LAST_GOOD=0/false/off/no to restore the v6.22.2 behavior
+    exactly (a backend error-stub row for a known symbol overwrites the
+    symbol's last good row — the Global_Markets fallback_error erosion
+    observed 2026-07-10)."""
+    return (os.getenv("TFB_SYNC_KEEP_LAST_GOOD") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _klg_price_ok(v: Any) -> bool:
+    """True iff the cell parses as a strictly positive number (comma/space
+    tolerant). Anything blank or unparseable is NOT a usable price."""
+    if _guard_is_blank(v):
+        return False
+    try:
+        return float(str(v).replace(",", "").strip()) > 0.0
+    except Exception:
+        return False
+
+
+def _klg_provider_is_error(v: Any) -> bool:
+    """True iff the Data Provider cell normalizes into the error-marker set
+    (blank normalizes to '' and is therefore NEVER an error marker)."""
+    return _guard_norm(v) in _KLG_ERROR_PROVIDERS
+
+
+def _keep_last_good_rows(
+    sheets: "SheetsWriter",
+    spreadsheet_id: str,
+    sheet_name: str,
+    headers: List[Any],
+    rows_matrix: List[List[Any]],
+) -> Tuple[List[List[Any]], List[str]]:
+    """v6.22.3 L4c: substitute each DATA-FREE stub row in the fetched matrix
+    with the symbol's existing last-good sheet row, re-aligned to the NEW
+    header order by header NAME (exactly like _persist_missing_symbol_rows).
+
+    STUB (conservative; both forms require NO positive price):
+      (a) Data Provider in _KLG_ERROR_PROVIDERS, or
+      (b) the Name cell is blank.
+    GOOD old row: positive price AND provider not in the error set. A stub
+    whose old row is missing or not good keeps the fresh stub — the guard
+    substitutes strictly better data or nothing.
+
+    ZERO-COST FAST PATH: the matrix is pre-scanned against the NEW headers;
+    with no stub present (every healthy sync) the function returns without
+    touching the network. FAIL-SAFE: returns the input matrix unchanged
+    (and []) when the Symbol/price columns cannot be located, the page
+    cannot be read, or nothing qualifies. Raising is reserved for the
+    caller's try/except."""
+    swapped: List[str] = []
+    if not headers or not rows_matrix:
+        return rows_matrix, swapped
+    sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+    px_i = _guard_find_col(list(headers), _XPAGE_PRICE_ALIASES)
+    if sym_i < 0 or px_i < 0:
+        return rows_matrix, swapped
+    prov_i = _guard_find_col(list(headers), _KLG_PROVIDER_ALIASES)
+    name_i = _guard_find_col(list(headers), _GUARD_NAME_ALIASES)
+
+    def _cell(row: List[Any], i: int) -> Any:
+        return row[i] if (0 <= i < len(row)) else ""
+
+    stub_rows: Dict[str, List[int]] = {}
+    for r_i, row in enumerate(rows_matrix):
+        if not isinstance(row, list) or sym_i >= len(row) or _guard_is_blank(row[sym_i]):
+            continue
+        if _klg_price_ok(_cell(row, px_i)):
+            continue  # carries a fresh price -> never a stub
+        is_err = prov_i >= 0 and _klg_provider_is_error(_cell(row, prov_i))
+        is_bare = name_i >= 0 and _guard_is_blank(_cell(row, name_i))
+        if not (is_err or is_bare):
+            continue
+        t = str(row[sym_i]).strip().upper()
+        stub_rows.setdefault(t, []).append(r_i)
+    if not stub_rows:
+        return rows_matrix, swapped
+
+    grid = sheets.read_values(spreadsheet_id, sheet_name, "A1:ZZ6000") if sheets is not None else None
+    if not grid or not isinstance(grid, list):
+        return rows_matrix, swapped
+
+    old_sym_i = -1
+    hdr_r = -1
+    for r in range(min(len(grid), 25)):
+        row = grid[r] if isinstance(grid[r], list) else []
+        idx = _guard_find_col(row, _GUARD_SYMBOL_ALIASES)
+        if idx >= 0:
+            old_sym_i = idx
+            hdr_r = r
+            break
+    if old_sym_i < 0:
+        return rows_matrix, swapped
+
+    def _hnorm(h: Any) -> str:
+        return str(h or "").strip().casefold()
+
+    old_headers_raw = grid[hdr_r] if isinstance(grid[hdr_r], list) else []
+    old_idx: Dict[str, int] = {}
+    for i, h in enumerate(old_headers_raw):
+        hn = _hnorm(h)
+        if hn and hn not in old_idx:
+            old_idx[hn] = i
+    old_px_i = _guard_find_col(list(old_headers_raw), _XPAGE_PRICE_ALIASES)
+    old_prov_i = _guard_find_col(list(old_headers_raw), _KLG_PROVIDER_ALIASES)
+    if old_px_i < 0:
+        return rows_matrix, swapped  # cannot certify an old row as GOOD without a price
+
+    pending = set(stub_rows.keys())
+    for row in grid[hdr_r + 1:]:
+        if not pending:
+            break
+        if not isinstance(row, list) or old_sym_i >= len(row) or _guard_is_blank(row[old_sym_i]):
+            continue
+        t = str(row[old_sym_i]).strip().upper()
+        if t not in pending:
+            continue
+        pending.discard(t)  # first occurrence wins; duplicate old rows are ignored
+        if not _klg_price_ok(row[old_px_i] if old_px_i < len(row) else ""):
+            continue  # old row not good -> keep the fresh stub
+        if 0 <= old_prov_i < len(row) and _klg_provider_is_error(row[old_prov_i]):
+            continue
+        aligned: List[Any] = []
+        for h in headers:
+            j = old_idx.get(_hnorm(h), -1)
+            aligned.append(row[j] if 0 <= j < len(row) else "")
+        for r_i in stub_rows[t]:
+            rows_matrix[r_i] = list(aligned)
+        swapped.append(t)
+    return rows_matrix, swapped
+
+
 def _filter_rows_to_requested(
     headers: List[Any],
     rows_matrix: List[List[Any]],
@@ -3874,6 +4050,37 @@ async def _run_one_task(
                 _pw = f"{_SYMBOL_PERSISTENCE_TAG} skipped (error: {_pe})"
                 res.warnings.append(_pw)
                 logger.warning(_pw)
+
+        # --- Keep-last-good substitution (v6.22.3 L4c) ------------------------
+        # Persistence protects a symbol the backend OMITS; a symbol answered
+        # with a DATA-FREE ERROR STUB is "present", passes every membership
+        # guard, and overwrites the last good row (the Global_Markets
+        # fallback_error erosion, 2026-07-10). Swap each stub for the symbol's
+        # existing GOOD row; a stub with no good predecessor stays fresh. Zero
+        # stubs (the normal healthy sync) costs zero extra reads.
+        # TFB_SYNC_KEEP_LAST_GOOD=0 restores v6.22.2 exactly.
+        if (_keep_last_good_enabled() and task.expects_rows
+                and rows_matrix and headers and sheets is not None
+                and task.sheet_name in _RANKED_MARKET_PAGES):
+            try:
+                rows_matrix, _klg_syms = _keep_last_good_rows(
+                    sheets, spreadsheet_id, task.sheet_name, headers, rows_matrix
+                )
+                if _klg_syms:
+                    _kw = (
+                        f"{_KEEP_LAST_GOOD_TAG} substituted {len(_klg_syms)} "
+                        f"error-stub row(s) with last-good data on "
+                        f"'{task.sheet_name}': {', '.join(_klg_syms[:15])}"
+                        f"{'…' if len(_klg_syms) > 15 else ''} — a backend error "
+                        f"stub no longer erases a symbol's data."
+                    )
+                    res.warnings.append(_kw)
+                    logger.warning(_kw)
+            except Exception as _ke:  # never let the guard break the write path
+                _kw = f"{_KEEP_LAST_GOOD_TAG} skipped (error: {_ke})"
+                res.warnings.append(_kw)
+                logger.warning(_kw)
+        # ----------------------------------------------------------------------
 
         # --- Persistence outcome verification (v6.22.2 L4b) ------------------
         # _persist_missing_symbol_rows is FAIL-SAFE: its own read_values
