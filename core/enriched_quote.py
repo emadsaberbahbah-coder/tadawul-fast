@@ -3,10 +3,60 @@
 """
 core/enriched_quote.py
 ===============================================================================
-TFB Enriched Quote Core — v4.8.0 (SUFFIX-TABLE-HARMONIZED / ENGINE-CONTRACT-ALIGNED / EMPTY-ROW-FULL-CLEAR)
+TFB Enriched Quote Core — v4.9.0 (STATIC-NAME-FALLBACK / SUFFIX-TABLE-HARMONIZED / ENGINE-CONTRACT-ALIGNED)
 ==============================================================================================================
 CORE-ONLY • SCHEMA-FIRST • PAGE-CANONICAL • SPECIAL-PAGE SAFE • ENGINE-TOLERANT
 JSON-SAFE • SYNC/ASYNC SAFE • ROUTE-FRIENDLY • LIGHTWEIGHT • IMPORT-SAFE
+
+v4.9.0 static name fallback over v4.8.0  (2026-07-12 morning-audit fix #3)
+--------------------------------------------------------------------------
+
+AUDIT EVIDENCE (v38 export, 2026-07-12): 5023.SR carried a live price on
+My_Portfolio / Portfolio_Decision but a BLANK Name on every refresh. Root
+cause is identity, not plumbing: 5023 is NOT an equity — it is "Arabian
+Centres Company Sukuk 1" (brand: Cenomi Centers), listed on Tadawul's
+Sukuk & Bonds Market on 2025-11-30, ISIN SA16DG0IEFJ6 (verified against
+the Saudi Exchange listing announcement and Argaam, 2026-07-12). Yahoo's
+equity name fields (longName/shortName) have nothing for debt-market
+instruments, so every provider pass leaves the name blank forever — a
+permanent identity gap the write guards correctly refuse to paper over
+(05_Refresh v1.14.0 deliberately passes fresh-price/blank-name rows).
+
+- NEW `_apply_static_name_fallback()` — pipeline position 5b (right after
+  `_derive_missing_fields`, inside the instrument-shaped block). Rules,
+  in order, and ONLY when `name` is blank:
+    1. In-row alias: `company_name` → `name` (the row's own data — always
+       on, not gated; some producers emit company_name only).
+    2. Static map lookup by uppercased symbol/ticker. On a hit the name
+       is filled and a `name_static_fallback` provenance warning is
+       appended via `_append_warning` (same convention as every other
+       normalizer — the sheet's Warnings column shows the fill happened).
+  A non-blank name is NEVER touched; an unknown symbol is a no-op.
+
+- NEW `_STATIC_NAME_SEED` — built-in reference entries. Ships with exactly
+  one row: 5023.SR → "Cenomi Centers Sukuk 1". Entries are added only
+  with a verified primary source; nothing here is ever guessed.
+
+- NEW ENV `TFB_STATIC_NAME_MAP` — operator extension WITHOUT a code
+  deploy: `SYM=Name;SYM2=Name2` (semicolon-separated; names may contain
+  commas; ENV entries override the seed). Parsed once at import by
+  `_load_static_name_map()`; malformed segments are skipped silently.
+
+- NEW ENV `TFB_STATIC_NAME_FALLBACK` — kill-switch for the STATIC-MAP
+  step only, default ON; 0/false/off restores exact v4.8.0 behavior
+  (the in-row company_name alias is the row's own data and stays).
+
+- EMPTY-ROW SAFETY (proven, not assumed): `name` is NOT in
+  `_EMPTY_ROW_INDICATOR_FIELDS` (price/volume/mcap only), so a static
+  name can never make an outage row look populated to
+  `_detect_and_mark_empty_row` — a fully-empty 5023.SR row still gets
+  data_quality=MISSING / recommendation=NA, now WITH its identity shown.
+  Position 5b also means the appended warning flows through the standard
+  warnings normalization (step 9) untouched.
+
+MODULE_VERSION 4.8.0 -> 4.9.0. One pipeline call added; ZERO existing
+functions removed or modified (AST-verified); lookup, derivation and
+projection logic untouched.
 
 v4.8.0 suffix-table harmonization over v4.7.0  (pairs with data_engine_v2 v5.113.0 Fix AX)
 ------------------------------------------------------------------------------------------
@@ -308,7 +358,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-MODULE_VERSION = "4.8.0"
+MODULE_VERSION = "4.9.0"
 
 # v4.7.0: explicit markers of which engine/scoring releases this enriched_quote.py
 # was built to align with. data_engine_v2 v5.75.0 introduced the disciplined
@@ -1157,6 +1207,98 @@ def _normalize_scoring_errors_field(row: Dict[str, Any]) -> None:
             row["scoring_errors"] = s if s else None
         except Exception:
             row["scoring_errors"] = None
+    except Exception:
+        pass
+
+
+# =============================================================================
+# v4.9.0: Static Name Fallback (5023.SR class)
+# =============================================================================
+#
+# Some listed instruments have NO name in any wired provider's equity feed.
+# The proven case is 5023.SR — "Arabian Centres Company Sukuk 1" (Cenomi
+# Centers), a Tadawul SUKUK & BONDS MARKET listing (2025-11-30, ISIN
+# SA16DG0IEFJ6): Yahoo longName/shortName are equity fields and return
+# nothing for it, so the Name column stayed blank on every refresh (v38
+# audit, 2026-07-12). This block supplies a LAST-RESORT reference name.
+#
+# Honesty rules:
+#   - fills ONLY a blank name; never overwrites provider data
+#   - every static fill appends a `name_static_fallback` warning so the
+#     sheet's Warnings column carries the provenance
+#   - seed entries require a verified primary source — never guessed
+#   - TFB_STATIC_NAME_MAP ("SYM=Name;SYM2=Name2") extends/overrides the
+#     seed without a code deploy; TFB_STATIC_NAME_FALLBACK=0 disables the
+#     static-map step (exact v4.8.0 behavior)
+
+_STATIC_NAME_FALLBACK_ENV = "TFB_STATIC_NAME_FALLBACK"
+_STATIC_NAME_MAP_ENV = "TFB_STATIC_NAME_MAP"
+
+_STATIC_NAME_SEED: Dict[str, str] = {
+    # Verified 2026-07-12: Saudi Exchange listing announcement + Argaam
+    # (listed 2025-11-30 on the Sukuk & Bonds Market, ISIN SA16DG0IEFJ6).
+    "5023.SR": "Cenomi Centers Sukuk 1",
+}
+
+
+def _load_static_name_map() -> Dict[str, str]:
+    """Seed + TFB_STATIC_NAME_MAP env extension (env wins on collision).
+
+    Format: ``SYM=Name;SYM2=Name2`` — semicolon-separated so names may
+    contain commas. Malformed segments are skipped; never raises.
+    """
+    out: Dict[str, str] = dict(_STATIC_NAME_SEED)
+    try:
+        raw = os.getenv(_STATIC_NAME_MAP_ENV, "") or ""
+        for part in raw.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            sym, _sep, nm = part.partition("=")
+            sym = sym.strip().upper()
+            nm = nm.strip()
+            if sym and nm:
+                out[sym] = nm
+    except Exception:
+        pass
+    return out
+
+
+_STATIC_NAME_MAP: Dict[str, str] = _load_static_name_map()
+_STATIC_NAME_FALLBACK_ENABLED: bool = _truthy(
+    os.getenv(_STATIC_NAME_FALLBACK_ENV, "1"), True
+)
+
+
+def _apply_static_name_fallback(row: Dict[str, Any]) -> None:
+    """v4.9.0 pipeline position 5b: fill a BLANK name, never overwrite.
+
+    Order: (1) in-row ``company_name`` alias — the row's own data, always
+    on; (2) static map by uppercased symbol/ticker — gated by
+    TFB_STATIC_NAME_FALLBACK, appends a ``name_static_fallback`` warning
+    on every fill. Unknown symbols and populated names are no-ops.
+    ``name`` is not an empty-row indicator field, so this can never mask
+    an outage row from _detect_and_mark_empty_row. Never raises.
+    """
+    if not isinstance(row, dict):
+        return
+    try:
+        if not _is_blank(row.get("name")):
+            return
+        company_name = _strip(row.get("company_name"))
+        if company_name:
+            row["name"] = company_name
+            return
+        if not _STATIC_NAME_FALLBACK_ENABLED:
+            return
+        sym = _strip(row.get("symbol") or row.get("ticker")).upper()
+        if not sym:
+            return
+        static_name = _STATIC_NAME_MAP.get(sym)
+        if not static_name:
+            return
+        row["name"] = static_name
+        _append_warning(row, "name_static_fallback")
     except Exception:
         pass
 
@@ -2424,6 +2566,7 @@ def normalize_rows(
         3.  _derive_metadata_from_normalize     (v4.5.0)
         4.  _normalize_percent_units            (v4.4.0)
         5.  _derive_missing_fields              (v4.3.0)
+        5b. _apply_static_name_fallback         (v4.9.0 NEW)
         6.  _sanitize_outliers                  (v4.5.0)
         7.  _sanitize_price_consistency         (v4.5.0)
         8.  _check_revenue_currency_units       (v4.5.0)
@@ -2449,6 +2592,7 @@ def normalize_rows(
             _derive_metadata_from_normalize(rd)
             _normalize_percent_units(rd)
             _derive_missing_fields(rd)
+            _apply_static_name_fallback(rd)
             _sanitize_outliers(rd)
             _sanitize_price_consistency(rd)
             _check_revenue_currency_units(rd)
