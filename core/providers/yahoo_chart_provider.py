@@ -59,7 +59,7 @@ errors, NOT same-currency crossings like today's 17.32-vs-43.54
 (ratio 2.5x) — YC-1 is the fix for those; YC-3 is belt for the
 unit-class family only.
 
-Version: PROVIDER_VERSION = "8.7.1". All prior WHY blocks preserved
+Version: PROVIDER_VERSION = "8.8.0". All prior WHY blocks preserved
 verbatim. Zero functions removed (AST-verified).
 
 v8.7.1 — RAW PREV-CLOSE SEMANTICS HOTFIX
@@ -73,6 +73,43 @@ the second-to-last history bar close (the true prior session), then
 plain previousClose; chartPreviousClose is consulted ONLY for intraday
 ranges (1d/5d) where its meaning coincides with the prior session.
 Parser-only change; transport, guards, and flow untouched.
+
+v8.8.0 — SPLIT-ADJUSTED HISTORY (Fix YC-ADJ) — the volatility-15,068 root cause
+--------------------------------------------------------------------------------
+WHY (evening audit 2026-07-12): the live universe carried Volatility 30D up to
+15,068 (== 1,506,800% annualised; 19 rows > 300%, 33 on the 90D). Profile:
+overwhelmingly .US micro-caps that are KNOWN reverse-splitters (Sphere 3D,
+Boxlight, ...). Mechanism: a 1-for-N reverse split multiplies the printed price
+by N overnight; on an UNADJUSTED series that is one fake +N00% daily return, and
+the annualised stdev explodes. data_engine_v2 v5.115.0 added a containment band
+(|vol| > 3.0 -> null). THIS is the cure at the source.
+
+THE SPLIT-BRAIN. This provider serves history over two transports:
+  raw chart  (_raw_chart_parse_triple, PRIMARY since v8.7.0) — read ONLY
+      indicators.quote[0] = UNADJUSTED prints. Yahoo ships the split-adjusted
+      series in indicators.adjclose[0].adjclose in the SAME payload; the
+      parser never looked at it.
+  yfinance   (fallback) — Ticker.history() defaults auto_adjust=True =
+      ADJUSTED.
+Same symbol, different series, depending on which transport happened to win.
+Every return-based downstream (volatility, drawdown, VaR, candle structure,
+momentum) inherits the coin flip.
+
+FIX (YC-ADJ-1): _raw_chart_parse_triple now reads indicators.adjclose and
+applies a PER-BAR factor k = adjclose/close to open, high, low and close —
+scaling all four by the same k preserves candle geometry (body/wick ratios)
+exactly; only the split discontinuity disappears. Volume is left as printed
+(share counts are real). Guards per bar: adjclose present, finite, > 0, close
+> 0, else k = 1 (that bar stays raw). adjclose absent from the payload
+entirely -> whole parse identical to v8.7.1 (fail-safe).
+
+FIX (YC-ADJ-2): both yfinance history call sites now pass auto_adjust=True
+EXPLICITLY. Zero behavior change today (it is the library default) — it pins
+the contract so a future yfinance default-flip cannot silently reopen the
+split-brain.
+
+KILL-SWITCH: TFB_YC_ADJUSTED_HISTORY=0/false/off/no restores the v8.7.1 raw
+parse byte-identically. Default ON. No ENV entry required.
 
 v8.7.0 — RAW CHART TRANSPORT + SILENT-NONE ELIMINATION (Fix YC-RAW)
 -----------------------------------------------------------------------
@@ -535,7 +572,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.7.1"
+PROVIDER_VERSION = "8.8.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -828,6 +865,13 @@ async def _raw_http_get_json(url: str, params: Dict[str, Any], timeout: float) -
         return resp.json()
 
 
+def _yc_adjusted_history_enabled() -> bool:
+    """v8.8.0 (YC-ADJ): split-adjusted raw history master switch. Default ON.
+    TFB_YC_ADJUSTED_HISTORY=0/false/off/no restores the v8.7.1 unadjusted
+    parse byte-identically."""
+    return (os.getenv("TFB_YC_ADJUSTED_HISTORY") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
 def _raw_chart_parse_triple(
     ysym: str, data: Any, range_: str = "",
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
@@ -868,11 +912,34 @@ def _raw_chart_parse_triple(
     lows = q0.get("low") or []
     closes = q0.get("close") or []
     vols = q0.get("volume") or []
+
+    # v8.8.0 (YC-ADJ-1): Yahoo ships the split/dividend-adjusted close series
+    # in indicators.adjclose[0].adjclose alongside the raw quote block. Reading
+    # only the raw block hands every reverse-splitter one fake +N00% daily
+    # return — the proven source of the Volatility-15,068 rows. Per bar:
+    # k = adj/close, applied to O/H/L/C alike so candle geometry is preserved
+    # exactly; volume stays as printed. Any per-bar doubt (missing / non-finite
+    # / <= 0) -> k = 1. adjclose absent entirely, or
+    # TFB_YC_ADJUSTED_HISTORY=0 -> v8.7.1 verbatim.
+    adjs: List[Any] = []
+    if _yc_adjusted_history_enabled():
+        adj_blocks = inds.get("adjclose") or []
+        a0 = adj_blocks[0] if adj_blocks and isinstance(adj_blocks[0], dict) else {}
+        adjs = a0.get("adjclose") or []
+
     n = len(ts_list)
     for i in range(n):
         close_v = _safe_float(closes[i] if i < len(closes) else None)
         if close_v is None:
             continue
+        k = 1.0
+        if adjs:
+            adj_v = _safe_float(adjs[i] if i < len(adjs) else None)
+            if adj_v is not None and adj_v > 0 and close_v > 0:
+                k = adj_v / close_v
+        open_v = _safe_float(opens[i] if i < len(opens) else None)
+        high_v = _safe_float(highs[i] if i < len(highs) else None)
+        low_v = _safe_float(lows[i] if i < len(lows) else None)
         ts_raw = ts_list[i]
         try:
             dt = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
@@ -881,10 +948,10 @@ def _raw_chart_parse_triple(
             ts_iso = str(ts_raw)
         history.append({
             "timestamp": ts_iso,
-            "open": _safe_float(opens[i] if i < len(opens) else None),
-            "high": _safe_float(highs[i] if i < len(highs) else None),
-            "low": _safe_float(lows[i] if i < len(lows) else None),
-            "close": close_v,
+            "open": open_v * k if open_v is not None else None,
+            "high": high_v * k if high_v is not None else None,
+            "low": low_v * k if low_v is not None else None,
+            "close": close_v * k,
             "volume": _safe_float(vols[i] if i < len(vols) else None),
         })
 
@@ -1980,7 +2047,10 @@ def _fetch_ticker_sync(
         # History (respects config-provided period/interval)
         history_list: List[Dict[str, Any]] = []
         try:
-            hist_df = ticker.history(period=period, interval=interval)
+            # v8.8.0 (YC-ADJ-2): auto_adjust pinned explicitly — library
+            # default today, but the raw transport now adjusts too and the two
+            # must never diverge again on a yfinance default-flip.
+            hist_df = ticker.history(period=period, interval=interval, auto_adjust=True)
             if (_HAS_PANDAS and pd is not None
                     and isinstance(hist_df, pd.DataFrame) and not hist_df.empty):
                 hist_df = hist_df.reset_index()
@@ -2505,7 +2575,7 @@ class YahooChartProvider:
             for _attempt in range(_attempts):
                 try:
                     ticker = yf.Ticker(_yc_yahoo_symbol(sym))  # v8.4.0 SSOT map
-                    df = ticker.history(period=period, interval=interval)
+                    df = ticker.history(period=period, interval=interval, auto_adjust=True)  # v8.8.0 YC-ADJ-2
                     # v8.6.0 YC-2: the history call lazily populates the
                     # ticker's metadata (zero extra HTTP) and that metadata
                     # declares `symbol` — the only identity witness bars
