@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.113.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.114.0
 ================================================================================
 
 WHY v5.111.0 - FINAL-ACTION BOUNDARY INVARIANT (Fix AW)
@@ -2656,7 +2656,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.113.0"
+__version__ = "5.114.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -7699,6 +7699,27 @@ def _compute_scores_canonical_first(row: Dict[str, Any]) -> None:
     if not isinstance(row, dict):
         return
 
+    # v5.114.0 [SANITIZE-PRIMARY]: the ONLY call to _apply_v572_sanitization used to
+    # live inside _compute_scores_local_fallback - and the canonical branch below
+    # `return`s the moment scoring succeeds, which in production is always. The net
+    # therefore never ran: 155 Market_Leaders rows carried a dividend_yield above
+    # this module's own (0, 0.30) ceiling, up to 149%, unchallenged. Hoisted here so
+    # it covers BOTH paths, and so scores are computed on SANITIZED inputs rather
+    # than after the fact. The fallback's existing call degrades to an idempotent
+    # second pass (an already-nulled field reads back None and is skipped - no
+    # duplicate warning). Never allowed to break scoring: failures are swallowed.
+    if _sanitize_primary_path_enabled():
+        try:
+            _apply_v572_sanitization(row)
+        except Exception as _sx:  # pragma: no cover - defensive
+            logger.debug(
+                "[engine_v2 v%s] primary-path sanitization failed for %s: %s: %s",
+                __version__,
+                _safe_str(row.get("symbol") or row.get("requested_symbol") or row.get("ticker"), "UNKNOWN"),
+                _sx.__class__.__name__,
+                _sx,
+            )
+
     if _SCORING_COMPUTE_SCORES_AVAILABLE and _scoring_compute_scores is not None:
         try:
             patch = _scoring_compute_scores(row)
@@ -7869,6 +7890,93 @@ def _v573_append_warning(row: Dict[str, Any], tag: str) -> None:
     row["warnings"] = "; ".join(parts)
 
 
+# =============================================================================
+# v5.114.0 - SANITIZATION: SIGN-AWARE BANDS + THE NET ACTUALLY IN THE WATER
+# =============================================================================
+# TWO defects, found in the 2026-07-12 evening audit.
+#
+# (1) THE NET WAS NEVER IN THE WATER. _apply_v572_sanitization() was called from
+#     _compute_scores_local_fallback() ONLY. But _compute_scores_canonical_first()
+#     `return`s early the moment canonical scoring succeeds - which in production
+#     is always - so the fallback (and therefore the sanitizer) never ran. That is
+#     why 155 Market_Leaders rows carried a dividend_yield above this module's OWN
+#     (0.0, 0.30) ceiling, up to 149%, entirely unchallenged. FIX: hoist the call
+#     to the TOP of _compute_scores_canonical_first, BEFORE the canonical branch,
+#     so it covers BOTH paths - and so scores are computed on sanitized inputs
+#     rather than after the fact. The fallback's existing call is left untouched:
+#     it degrades to a harmless idempotent second pass (an already-nulled field
+#     reads back None and is skipped, so no duplicate warning is appended).
+#
+# (2) THE BANDS WOULD HAVE DELETED LEGITIMATE DATA. _V573_SANITIZATION_BOUNDS uses
+#     lo=0.0 on ratios whose sign is MEANINGFUL. Measured against 909 clean
+#     Market_Leaders rows, arming it as written would have nulled:
+#
+#         ev_ebitda   96 negatives = 12.9% of the column
+#         pe_forward  46 negatives =  7.3%
+#         pb_ratio    37 negatives =  4.6%
+#
+#     None of those is an error. A negative EV/EBITDA means negative EBITDA - or a
+#     negative enterprise value, i.e. net cash exceeding market cap (PDD Holdings,
+#     Trip.com). A negative P/B means negative book value (AbbVie; also McDonald's,
+#     Starbucks, Boeing). A negative forward P/E means expected losses. Deleting
+#     them would have been a self-inflicted data-quality incident dressed up as a
+#     safety feature.
+#
+#     Separately, debt_to_equity is stored in PERCENT POINTS (live median 64.79 ==
+#     a 0.65x ratio), so the 500.0 ceiling was nulling banks at 5x+ leverage - the
+#     realistic ceiling is ~20x (2000).
+#
+# FIX: the ceiling becomes a MAGNITUDE trap wherever the sign carries information,
+# and stays a sign filter ONLY where a negative is physically impossible (a yield
+# cannot be negative; price/sales cannot be negative). Re-measured on the same 909
+# clean rows, the corrected spec nulls 0.3%-2.0% per field - a genuine outlier trap
+# rather than a shredder.
+#
+# SEQUENCING - READ THIS. dividend_yield is 26.1% out-of-band TODAY, but every one
+# of those rows is the eodhd_provider v4.14.1 unit bug (a percent-point value read
+# as a fraction => 100x). Once eodhd_provider v4.15.0 is live, 0.0% of dividend
+# yields fall outside (0, 0.30). SHIP v5.114.0 TOGETHER WITH eodhd v4.15.0. If this
+# file lands first the bad yields are NULLED rather than corrected - safer than
+# publishing 32% for a 0.32% payer, but the column goes blank until eodhd follows.
+#
+# KILL-SWITCHES (both default ON; no ENV entry required):
+#   TFB_SANITIZE_PRIMARY_PATH=0 -> sanitizer goes back to fallback-only (v5.113.0
+#                                  wiring, i.e. effectively never runs).
+#   TFB_SANITIZE_SIGN_AWARE=0   -> _sanitize_extreme_outliers reverts to the
+#                                  v5.113.0 _V573_SANITIZATION_BOUNDS byte-for-byte.
+# =============================================================================
+
+# field -> (negative_allowed, magnitude_ceiling)
+_V5114_SANITIZATION_SPEC: Dict[str, Tuple[bool, float]] = {
+    # sign is MEANINGFUL -> trap on |value| only, never on the sign
+    "pe_ttm":         (True,   500.0),   # negative P/E = loss-maker
+    "pe_forward":     (True,   500.0),   # negative fwd P/E = expected losses
+    "pb_ratio":       (True,   100.0),   # negative P/B = negative book value
+    "ev_ebitda":      (True,   200.0),   # negative EV/EBITDA = neg EBITDA, or net cash > mcap
+    "peg_ratio":      (True,    20.0),   # negative PEG = negative growth
+    "debt_to_equity": (True,  2000.0),   # PERCENT POINTS (median 64.79); 2000 == 20x leverage
+    # a negative here is physically impossible -> keep the sign filter
+    "ps_ratio":       (False,  100.0),   # revenue cannot be negative
+    "dividend_yield": (False,    0.30),  # a yield cannot be negative
+}
+
+
+def _sanitize_primary_path_enabled() -> bool:
+    """v5.114.0: run _apply_v572_sanitization on the PRIMARY scoring path, not just
+    the fallback nobody reaches. Default ON. TFB_SANITIZE_PRIMARY_PATH=0 restores the
+    v5.113.0 wiring (fallback-only == effectively never)."""
+    return (os.getenv("TFB_SANITIZE_PRIMARY_PATH") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _sanitize_sign_aware_enabled() -> bool:
+    """v5.114.0: use the sign-aware spec instead of the lo=0.0 bounds that would
+    delete every legitimate negative ratio. Default ON. TFB_SANITIZE_SIGN_AWARE=0
+    restores _V573_SANITIZATION_BOUNDS byte-identically."""
+    return (os.getenv("TFB_SANITIZE_SIGN_AWARE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+# v5.113.0 bounds. RETAINED VERBATIM as the TFB_SANITIZE_SIGN_AWARE=0 path.
+# Do NOT use in new code: lo=0.0 nulls legitimate negative ratios (see above).
 _V573_SANITIZATION_BOUNDS: Dict[str, Tuple[float, float]] = {
     "pe_ttm":         (0.0, 500.0),
     "pe_forward":     (0.0, 500.0),
@@ -7893,6 +8001,23 @@ def _sanitize_extreme_outliers(row: Dict[str, Any]) -> int:
     if not isinstance(row, dict):
         return 0
     nulled = 0
+
+    # v5.114.0: sign-aware. Trap on MAGNITUDE where the sign carries information
+    # (a negative P/E, P/B, EV/EBITDA or PEG is a real company, not a data error);
+    # keep the sign filter only where a negative is physically impossible.
+    if _sanitize_sign_aware_enabled():
+        for field, (neg_ok, ceiling) in _V5114_SANITIZATION_SPEC.items():
+            v = _as_float(row.get(field))
+            if v is None:
+                continue
+            out_of_range = (abs(v) > ceiling) if neg_ok else (v < 0.0 or v > ceiling)
+            if out_of_range:
+                row[field] = None
+                _v573_append_warning(row, f"sanitized:{field}_out_of_range")
+                nulled += 1
+        return nulled
+
+    # v5.113.0 path (TFB_SANITIZE_SIGN_AWARE=0) - byte-identical.
     for field, (lo, hi) in _V573_SANITIZATION_BOUNDS.items():
         v = _as_float(row.get(field))
         if v is None:
