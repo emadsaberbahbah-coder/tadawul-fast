@@ -2,6 +2,85 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
+EODHD Provider — v4.15.0 (UNIT-AWARE PERCENT CONVERSION: the magnitude guess
+                          that silently inflated every sub-1.5% value by 100x
+                          is retired)
+
+v4.15.0 — WHY (evening export 2026-07-12; proven from the sheet's OWN numbers)
+--------------------------------------------------------------------------------
+_frac_from_percentish() decided a value's UNIT from its MAGNITUDE:
+
+    if abs(f) > 1.5:  return f / 100.0      # "looks like percent points"
+    return f                                # "looks like a fraction already"
+
+A magnitude cannot carry a unit. EODHD's Highlights / SplitsDividends return
+these fields in PERCENT POINTS (4.93 == 4.93%), so the >1.5 branch is right for
+the common case and the <=1.5 branch is a silent 100x inflation of EVERY value
+whose true magnitude is under 1.5%:
+
+    dividend_yield 4.93 -> >1.5  -> /100  -> 0.0493 = 4.93%   CORRECT
+    dividend_yield 0.32 -> <=1.5 -> AS-IS -> 0.32   = 32.0%   *** 100x TOO BIG ***
+
+Measured on the live sheet, every row cross-checked against ITS OWN other columns
+(no external source required):
+
+  dividend_yield  vs (payout_ratio x eps / price):
+      204 / 515 rows (40%) overstated; median error 104.2x.
+      NMM.US states a 32.0% yield, yet its own payout (1.69%) x EPS (11.85) /
+      price (75.69) implies 0.26% — the row contradicts itself by 121x. NMM.US
+      was the largest ADD in that evening's brief (1,992 SAR, 95% of freed cash).
+  profit_margin   vs (EPS x MktCap/Price) / Revenue:
+      24 / 674 rows (4%) overstated; all ~100x; all eodhd.
+
+Break rate per field is just P(true value < 1.5%): dividend_yield fails 40% of
+the time (many equities yield under 1.5%), profit_margin only 4% (few firms run
+a sub-1.5% net margin). Fingerprint: the sheet's Dividend Yield has a hard
+ceiling at 1.4900 and Payout Ratio at exactly 1.5000 — NOTHING survives above the
+threshold, because anything above it is what gets divided.
+
+DIRECTION OF THE ERROR PROVES THE UNIT. A fraction source physically CANNOT
+produce a 100x-too-BIG value through this function: it either passes through
+correctly, or — if >1.5 — gets divided, making it 100x too SMALL. The existence
+of ~100x OVERSTATEMENTS therefore proves the source is percent points.
+
+v4.15.0 — THE TRAP A NAIVE FIX WALKS INTO
+--------------------------------------------------------------------------------
+"Just always divide by 100" would be WORSE than the bug. Every call site merges
+TWO sources with DIFFERENT units inside a single _first_present():
+
+    roe = _frac_from_percentish(_first_present(
+              highlights.get("ROE"),                     # PERCENT POINTS (15.3)
+              _safe_div(net_income_ttm, total_equity),   # TRUE FRACTION  (0.153)
+          ))
+
+_frac_from_percentish is not a sanity clamp — it is a unit RECONCILER forced to
+serve two units through one variable. Always-dividing would take every locally
+computed fallback (already a fraction) and make it 100x TOO SMALL, corrupting
+precisely the rows where EODHD's Highlights are absent and the local computation
+wins.
+
+v4.15.0 — THE FIX: convert each source at ITS OWN unit, BEFORE the merge
+--------------------------------------------------------------------------------
+NEW _pct_points_to_frac(v) : EODHD percent points -> fraction. ALWAYS /100.
+NEW _already_frac(v)       : a value THIS module computed by division -> as-is.
+NEW _pct_merge(pct, frac)  : the unit-aware merge. Provider value still wins;
+                             ONLY the unit handling changes.
+NEW _eodhd_unit_aware_enabled() : kill-switch.
+
+All 12 guessing sites now state their units explicitly. No magnitude test
+survives anywhere in the percent path.
+
+KILL-SWITCH: TFB_EODHD_UNIT_AWARE=0/false/off/no restores the v4.14.1 heuristic
+BYTE-IDENTICALLY — _frac_from_percentish is retained verbatim and becomes the sole
+code path when the switch is off. ZERO functions removed; 4 added.
+
+REPORTED SEPARATELY (not fixed here — it changes behavior across the whole
+universe and deserves its own review): data_engine_v2 defines
+_V573_SANITIZATION_BOUNDS["dividend_yield"] = (0.0, 0.30) — a band that would
+have NULLED all 155 out-of-range rows — but _apply_v572_sanitization() is called
+ONLY from _compute_scores_local_fallback(). The net is never in the water on the
+primary path. That is why a 32% yield reached the sheet unchallenged.
+
 EODHD Provider — v4.13.0 (CONTAMINATION DEFENSE: PROVIDER SENTINEL SCRUB +
                           PREV-CLOSE COHERENCE GUARD + ENGINE PATCH-BIND
                           REALIGNMENT)
@@ -938,7 +1017,7 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.14.1"
+PROVIDER_VERSION = "4.15.0"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -1439,12 +1518,62 @@ def _clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _frac_from_percentish(v: Any) -> Optional[float]:
+    """v4.14.1 magnitude heuristic. RETAINED VERBATIM as the kill-switch path
+    (TFB_EODHD_UNIT_AWARE=0). Superseded by _pct_merge in v4.15.0: a magnitude
+    cannot carry a unit, and this silently inflates every sub-1.5% value by 100x.
+    Do NOT call it from new code."""
     f = safe_float(v)
     if f is None:
         return None
     if abs(f) > 1.5:
         return f / 100.0
     return f
+
+
+def _eodhd_unit_aware_enabled() -> bool:
+    """v4.15.0 master switch. Default ON. TFB_EODHD_UNIT_AWARE=0/false/off/no
+    restores the v4.14.1 magnitude heuristic byte-identically on every percent
+    field."""
+    return (os.getenv("TFB_EODHD_UNIT_AWARE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _pct_points_to_frac(v: Any) -> Optional[float]:
+    """v4.15.0: EODHD Highlights / SplitsDividends PERCENT POINTS -> fraction.
+
+    ALWAYS divides by 100. There is deliberately no magnitude test: 0.32 from
+    EODHD means 0.32%, and the old heuristic read exactly that value as 32%.
+    """
+    f = safe_float(v)
+    if f is None:
+        return None
+    return f / 100.0
+
+
+def _already_frac(v: Any) -> Optional[float]:
+    """v4.15.0: a value THIS MODULE computed by division (gross_profit/revenue,
+    net_income/equity, latest/prev - 1.0, ...). It is a true fraction already, so
+    pass it through untouched. Named explicitly so the unit is DECLARED at the
+    call site rather than inferred from how large the number happens to be."""
+    return safe_float(v)
+
+
+def _pct_merge(pct_source: Any, frac_fallback: Any = None) -> Optional[float]:
+    """v4.15.0: the unit-aware merge replacing
+    `_frac_from_percentish(_first_present(pct_source, frac_fallback))`.
+
+        pct_source    — EODHD field, PERCENT POINTS   -> /100
+        frac_fallback — locally computed, TRUE FRACTION -> as-is
+
+    Preference order is unchanged from v4.14.1 (provider value wins; the local
+    computation is the fallback). ONLY the unit handling changes. Under
+    TFB_EODHD_UNIT_AWARE=0 this collapses to the v4.14.1 behavior exactly.
+    """
+    if not _eodhd_unit_aware_enabled():
+        return _frac_from_percentish(_first_present(pct_source, frac_fallback))
+    converted = _pct_points_to_frac(pct_source)
+    if converted is not None:
+        return converted
+    return _already_frac(frac_fallback)
 
 
 def _safe_div(a: Any, b: Any) -> Optional[float]:
@@ -2174,7 +2303,9 @@ class EODHDClient:
 
             if chg is None and close is not None and prev not in (None, 0.0):
                 chg = close - prev
-            change_frac = _frac_from_percentish(_first_present(data.get("change_p"), data.get("percent_change"), data.get("changePercent")))
+            # v4.15.0: EODHD's real-time change_p is PERCENT POINTS (1.23 == +1.23%).
+            # Under the old heuristic a sub-1.5% move (e.g. +0.8%) was stored as +80%.
+            change_frac = _pct_merge(_first_present(data.get("change_p"), data.get("percent_change"), data.get("changePercent")))
             if change_frac is None and close is not None and prev not in (None, 0.0):
                 change_frac = (close / prev) - 1.0
 
@@ -2374,8 +2505,12 @@ class EODHDClient:
                 ),
             )
             debt_to_equity = _safe_div(total_debt, total_equity)
-            roe = _frac_from_percentish(_first_present(highlights.get("ROE"), _safe_div(net_income_ttm, total_equity)))
-            roa = _frac_from_percentish(_first_present(highlights.get("ROA"), _safe_div(net_income_ttm, total_assets)))
+            # v4.15.0 UNIT-AWARE: highlights.ROE/ROA are PERCENT POINTS; the _safe_div
+            # fallbacks are TRUE FRACTIONS computed right here. Converting each at its
+            # OWN unit is the whole fix — the old single-heuristic form could not tell
+            # a 1.2 that meant "1.2% ROA" from a 1.2 that meant "120% ROA".
+            roe = _pct_merge(highlights.get("ROE"), _safe_div(net_income_ttm, total_equity))
+            roa = _pct_merge(highlights.get("ROA"), _safe_div(net_income_ttm, total_assets))
 
             shares_outstanding = safe_float(_first_present(shares.get("SharesOutstanding"), highlights.get("SharesOutstanding")))
             float_shares = safe_float(_first_present(shares.get("SharesFloat"), shares.get("FloatShares"), highlights.get("SharesFloat")))
@@ -2407,14 +2542,17 @@ class EODHDClient:
             if not sector_val:
                 warnings_list.append("sector_missing_from_provider")
 
-            dividend_yield = _frac_from_percentish(
+            # v4.15.0: all three yield sources are PERCENT POINTS. This is the field that
+            # broke hardest (40% of rows, median 104x) because so many equities yield
+            # under 1.5% and therefore fell into the old passthrough branch.
+            dividend_yield = _pct_merge(
                 _first_present(
                     splits.get("ForwardAnnualDividendYield"),
                     highlights.get("DividendYield"),
                     splits.get("TrailingAnnualDividendYield"),
                 )
             )
-            payout_ratio = _frac_from_percentish(_first_present(splits.get("PayoutRatio"), highlights.get("PayoutRatio")))
+            payout_ratio = _pct_merge(_first_present(splits.get("PayoutRatio"), highlights.get("PayoutRatio")))
 
             # ---- eps_ttm with v4.7.1 FIX-B fallback + v4.7.2 YD sanity bound ----
             _EPS_FALLBACK_CEILING = 500.0
@@ -2476,19 +2614,24 @@ class EODHDClient:
                     "payout_ratio": payout_ratio,
                     "roe": roe,
                     "roa": roa,
-                    "net_margin": _frac_from_percentish(_first_present(highlights.get("ProfitMargin"), profit_margin)),
-                    "revenue_growth": _frac_from_percentish(_first_present(highlights.get("RevenueGrowth"), revenue_growth_yoy)),
-                    "revenue_growth_yoy": _frac_from_percentish(_first_present(highlights.get("RevenueGrowth"), revenue_growth_yoy)),
-                    "earnings_growth": _frac_from_percentish(_first_present(highlights.get("EarningsGrowth"), earnings_growth)),
+                    # v4.15.0 UNIT-AWARE: highlights.* are PERCENT POINTS; profit_margin /
+                    # revenue_growth_yoy / earnings_growth are TRUE FRACTIONS this module
+                    # computed by division a few lines above. Each converted at its own unit.
+                    "net_margin": _pct_merge(highlights.get("ProfitMargin"), profit_margin),
+                    "revenue_growth": _pct_merge(highlights.get("RevenueGrowth"), revenue_growth_yoy),
+                    "revenue_growth_yoy": _pct_merge(highlights.get("RevenueGrowth"), revenue_growth_yoy),
+                    "earnings_growth": _pct_merge(highlights.get("EarningsGrowth"), earnings_growth),
                     "beta": safe_float(_first_present(tech.get("Beta"), highlights.get("Beta"))),
                     "beta_5y": safe_float(_first_present(tech.get("Beta"), highlights.get("Beta"))),
                     "week_52_high": week_52_high,
                     "week_52_low": week_52_low,
                     "revenue_ttm": revenue_ttm,
                     "revenue": revenue_ttm,
-                    "gross_margin": _frac_from_percentish(_first_present(highlights.get("GrossMargin"), gross_margin)),
-                    "operating_margin": _frac_from_percentish(_first_present(highlights.get("OperatingMargin"), operating_margin)),
-                    "profit_margin": _frac_from_percentish(_first_present(highlights.get("ProfitMargin"), profit_margin)),
+                    # v4.15.0 UNIT-AWARE (see above). profit_margin is the field whose 24
+                    # ~100x overstatements PROVED highlights.* is percent points.
+                    "gross_margin": _pct_merge(highlights.get("GrossMargin"), gross_margin),
+                    "operating_margin": _pct_merge(highlights.get("OperatingMargin"), operating_margin),
+                    "profit_margin": _pct_merge(highlights.get("ProfitMargin"), profit_margin),
                     "free_cash_flow_ttm": fcf_ttm,
                     "fcf_ttm": fcf_ttm,
                     "debt_to_equity": debt_to_equity,
