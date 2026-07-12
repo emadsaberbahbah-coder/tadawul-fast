@@ -3,9 +3,73 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.22.4)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.23.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.23.0 fix — L3b UNIVERSAL COHERENCE TRIPWIRE + L3 ANCHOR COVERAGE
+- WHY (evening export 2026-07-12, audited row-by-row): Global_Markets came
+  back 89.2% CHIMERIC and Mutual_Funds 33% chimeric, both written by the
+  07-12 sync. The v6.22.0 L3 anchor tripwire WOULD have caught GM (re-run
+  against the live sheet: 15/22 anchors carry a foreign name -> TRIPS), so
+  the writer that produced them was NOT v6.22.x. That is a deploy gap, not
+  a code gap, and it is fixed by committing + dispatching this file.
+  BUT the same audit exposed a REAL hole in L3 itself:
+
+      Market_Leaders   anchors checked=19  ok=19  mismatched=0   passes
+      Global_Markets   anchors checked=22  ok=7   mismatched=15  TRIPS
+      Commodities_FX   anchors checked=0   <-- ZERO COVERAGE
+      Mutual_Funds     anchors checked=0   <-- ZERO COVERAGE
+
+  _IDENTITY_ANCHORS held no commodity/FX/fund pairs, so the two pages it
+  could not see were the two it never checked. Mutual_Funds was in fact
+  POISONED (BND.US="PLUS Korea Manufacturing Core Alliance Index ETF",
+  AGG.US="iShares Residential and Multisector Real Estate ETF",
+  VEA.US="iShares Intermediate Muni Income Active ETF"; 10/30 verifiable
+  ETFs foreign) and BOTH existing layers were blind to it simultaneously.
+  Commodities_FX escaped only because the freeze accidentally protected it.
+  Anchor coverage on GM was 22 pairs against 3,762 rows — 0.6%. A curated
+  table will always lag the universe; it tripped this time by luck of which
+  symbols happen to be listed.
+
+- L3b [COHERENCE-TRIPWIRE] (TFB_SYNC_COHERENCE_TRIPWIRE, default ON;
+  TFB_SYNC_COHERENCE_MAX_BAD_PCT default 25; TFB_SYNC_COHERENCE_MIN_ROWS
+  default 50): a curation-free detector that needs no anchor table at all.
+  Every row states Current Price, EPS (TTM) and P/E (TTM) — and those are
+  NOT independent: P/E == Price / EPS. Crucially the three span the two
+  payload blocks that the transposition splits: Price comes from the QUOTE
+  block (symbol-keyed, verified correct in the audit) while EPS and P/E come
+  from the ENRICHMENT block (the block that gets misassigned). So a
+  transposed row breaks the identity BY CONSTRUCTION, whatever the symbol,
+  whatever the page, with no list to maintain. Measured on the live sheet:
+
+      Global_Markets 07-12 (sync-written)   2,037 / 2,283 incoherent = 89.2%
+      Global_Markets 07-08 (sync never hit)     0 /   164 incoherent =  0.0%
+      Market_Leaders (GAS-written, clean)       7 /   691 incoherent =  1.0%
+
+  The 1.0% ML residue is entirely the LSE pence convention (price in GBX,
+  EPS in GBP -> implied P/E is ~100x stated), so the scan treats an
+  implied/stated ratio in [50, 200] as COHERENT and never counts it. With a
+  25% trip threshold the separation is 89.2% vs 1.0% — a 3.5x margin either
+  side. Fail-safe throughout: a page with fewer than MIN_ROWS testable rows
+  is never judged (Commodities_FX has 4, Mutual_Funds has 0 — they cannot
+  form the ratio at all and are silently skipped, exactly like a page with
+  no anchors present). Rows with a missing/blank/zero/negative EPS or a
+  non-positive P/E are skipped, not condemned. On trip: SKIP clear+write and
+  PRESERVE last-good rows, identical semantics to L3.
+
+- L3 [ANCHOR COVERAGE] — _IDENTITY_ANCHORS gains 27 commodity/FX/index/fund
+  pairs so the two pages L3b structurally cannot cover (no EPS -> no ratio)
+  stop being invisible. EVERY added pair was verified against the live
+  2026-07-12 export before being written into the table: the 15 CFX pairs
+  all currently PASS (that page is clean-but-frozen, so they must not trip),
+  and the 12 MF pairs catch the live poisoning (AGG/BND/VEA/XLE/LQD/VNQ/
+  SCHD/VIG/VTV/BIL are foreign right now). No invented pairs — an anchor
+  whose expected name does not match the provider's real one would cause a
+  self-inflicted false trip and block a healthy write.
+
+- ZERO functions removed. L1/L2/L3/L4a/L4b/L4c/L5 all byte-identical.
+  TFB_SYNC_COHERENCE_TRIPWIRE=0 restores v6.22.4 behavior exactly.
 
 v6.22.4 fix — TIME-BUDGET GRACEFUL FINISH (L5 DEADLINE-OVER-KILL)
 - ROOT CAUSE (GitHub Actions runs #2330/#2331, artifacts read 2026-07-11):
@@ -816,7 +880,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.22.4"
+SCRIPT_VERSION = "6.23.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2711,6 +2775,7 @@ def _filter_rows_to_requested(
 _IDENTITY_TAG = "[v6.22.0 IDENTITY-TRIPWIRE]"
 _BATCH_IDENTITY_TAG = "[v6.22.0 BATCH-IDENTITY]"
 _SAFE_GW_TAG = "[v6.22.0 SAFE-GATEWAYS]"
+_COHERENCE_TAG = "[v6.23.0 COHERENCE-TRIPWIRE]"
 
 # Built-in anchor pairs: symbol -> accepted casefolded substrings of the TRUE
 # company name. Curated for stability (official renames included, e.g. SABB ->
@@ -2749,7 +2814,189 @@ _IDENTITY_ANCHORS: Dict[str, Tuple[str, ...]] = {
     "0939.HK": ("china construction",),
     "NESN.SW": ("nestl",),
     "ASML": ("asml",), "ASML.US": ("asml",),
+
+    # ---- v6.23.0: Commodities_FX coverage (L3 checked 0 anchors there) ----
+    # Every pair below was verified PASSING against the live 2026-07-12 export
+    # (that page is clean-but-frozen). An unverified pair would false-trip and
+    # block a healthy write, so nothing here is invented.
+    "GC=F": ("gold",),
+    "SI=F": ("silver",),
+    "CL=F": ("crude", "wti"),
+    "BZ=F": ("brent",),
+    "NG=F": ("natural gas",),
+    "HG=F": ("copper",),
+    "^GSPC": ("s&p 500",),
+    "^N225": ("nikkei",),
+    "^BSESN": ("sensex",),
+    "USO.US": ("oil fund", "united states oil"),
+    "UGA.US": ("gasoline",),
+    "CPER.US": ("copper",),
+    "OUNZ.US": ("gold",),
+    "EURUSD=X": ("eur/usd", "eurusd"),
+    "GBPUSD=X": ("gbp/usd", "gbpusd"),
+
+    # ---- v6.23.0: Mutual_Funds coverage (L3 checked 0 anchors there) ----
+    # Mutual_Funds has ZERO rows with an EPS/PE pair, so L3b cannot form the
+    # coherence ratio for it at all — anchors are the ONLY layer that can see
+    # this page. It was 33% poisoned in the 2026-07-12 export and both layers
+    # were blind simultaneously. The four PASSING pairs pin the page's health;
+    # the rest were FOREIGN on 07-12 and are exactly what must trip.
+    "SPY.US": ("s&p 500",),
+    "VOO.US": ("vanguard s&p 500",),
+    "QQQ.US": ("qqq",),
+    "VTI.US": ("total stock market",),
+    "IVV.US": ("core s&p 500",),
+    "GLD.US": ("gold",),
+    "AGG.US": ("aggregate bond",),
+    "BND.US": ("total bond",),
+    "VEA.US": ("ftse developed", "developed markets"),
+    "EFA.US": ("eafe",),
+    "IEMG.US": ("emerging markets",),
+    "TLT.US": ("treasury",),
 }
+
+
+# -----------------------------------------------------------------------------
+# v6.23.0 L3b — COHERENCE TRIPWIRE (curation-free transposition detector)
+# -----------------------------------------------------------------------------
+# The three columns below are NOT independent:  P/E (TTM) == Current Price / EPS.
+# They also straddle the exact seam the transposition splits: Current Price comes
+# from the QUOTE block (symbol-keyed, correct even in a poisoned payload) while
+# EPS and P/E come from the ENRICHMENT block (the block that gets misassigned).
+# A transposed row therefore breaks the identity BY CONSTRUCTION — no anchor
+# table, no curation, every symbol, every equity page.
+_COH_PRICE_ALIASES = frozenset({
+    "currentprice", "price", "lastprice", "lasttradeprice", "regularmarketprice",
+})
+_COH_EPS_ALIASES = frozenset({
+    "epsttm", "eps", "earningspershare", "epstrailingtwelvemonths", "epsbasicttm",
+})
+_COH_PE_ALIASES = frozenset({
+    "pettm", "pe", "peratio", "priceearnings", "priceearningsratio", "trailingpe",
+})
+
+# LSE and a few other venues quote PRICE in pence (GBX) while reporting EPS in
+# pounds (GBP). The implied ratio is then ~100x the stated P/E even though the
+# row is perfectly healthy (Tesco: px 471.8 GBX, EPS 0.27 GBP, stated P/E 17.47).
+# Treat an implied/stated ratio inside this window as COHERENT — never a mismatch.
+# This band is the entire reason clean Market_Leaders scores 1.0% and not 4%.
+_COH_FX_UNIT_LO = 50.0
+_COH_FX_UNIT_HI = 200.0
+# Relative tolerance on the identity itself (rounding, as-of skew between the
+# quote and the fundamentals snapshot).
+_COH_REL_TOL = 0.05
+
+
+def _coherence_enabled() -> bool:
+    """v6.23.0 L3b master switch. Default ON; TFB_SYNC_COHERENCE_TRIPWIRE=
+    0/false/off/no restores v6.22.4 behavior byte-identically."""
+    return (os.getenv("TFB_SYNC_COHERENCE_TRIPWIRE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _coherence_max_bad_pct() -> int:
+    """Percent of TESTABLE rows that may break the identity before the page is
+    judged transposed. Default 25. Measured separation on the 2026-07-12 export:
+    poisoned Global_Markets 89.2% vs clean Market_Leaders 1.0% — 25 sits with a
+    ~3.5x margin on both sides."""
+    return _safe_int(os.getenv("TFB_SYNC_COHERENCE_MAX_BAD_PCT"), 25, lo=1, hi=100)
+
+
+def _coherence_min_rows() -> int:
+    """Minimum TESTABLE rows before the scan is allowed to judge a page at all.
+    Default 50. FAIL-SAFE: Commodities_FX has 4 testable rows and Mutual_Funds
+    has 0 (funds/FX carry no EPS), so they are never blocked by this layer —
+    exactly like a page with no anchors present. Those two pages are covered by
+    the v6.23.0 L3 anchor expansion instead."""
+    return _safe_int(os.getenv("TFB_SYNC_COHERENCE_MIN_ROWS"), 50, lo=5, hi=1000000)
+
+
+def _coh_float(v: Any) -> Optional[float]:
+    """Tolerant numeric read: strips thousands separators, %, currency noise."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            f = float(v)
+        except Exception:
+            return None
+        return None if (f != f or f in (float("inf"), float("-inf"))) else f
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace(",", "").replace("%", "").replace("\u2212", "-").strip()
+    if s in {"-", "--", "\u2014", "N/A", "n/a", "NA", "null", "None"}:
+        return None
+    try:
+        f = float(s)
+    except Exception:
+        return None
+    return None if (f != f or f in (float("inf"), float("-inf"))) else f
+
+
+def _coherence_scan(
+    headers: List[Any],
+    rows_matrix: List[List[Any]],
+) -> Tuple[int, int, List[Tuple[str, float, float]]]:
+    """v6.23.0 L3b: verify P/E == Price / EPS row by row.
+
+    Returns (testable, incoherent, samples) where samples is a list of
+    (symbol, stated_pe, implied_pe) for the first few offenders.
+
+    A row is TESTABLE only when Price, EPS and P/E are all numerically present,
+    |EPS| >= 0.01 (below that the quotient explodes on rounding alone) and the
+    stated P/E is > 0 (a negative/zero P/E is a legitimate loss-maker convention,
+    not evidence of transposition). Everything else is SKIPPED, never condemned.
+
+    FAIL-SAFE: (0, 0, []) when any of the three columns cannot be located — a
+    page without the full triple is never blocked by this layer.
+    """
+    if not headers or not rows_matrix:
+        return 0, 0, []
+    hdr = list(headers)
+    px_i = _guard_find_col(hdr, _COH_PRICE_ALIASES)
+    eps_i = _guard_find_col(hdr, _COH_EPS_ALIASES)
+    pe_i = _guard_find_col(hdr, _COH_PE_ALIASES)
+    if px_i < 0 or eps_i < 0 or pe_i < 0:
+        return 0, 0, []
+    sym_i = _guard_find_col(hdr, _GUARD_SYMBOL_ALIASES)
+    hi = max(px_i, eps_i, pe_i)
+
+    testable = 0
+    bad = 0
+    samples: List[Tuple[str, float, float]] = []
+    for row in rows_matrix:
+        if not isinstance(row, (list, tuple)) or len(row) <= hi:
+            continue
+        px = _coh_float(row[px_i])
+        eps = _coh_float(row[eps_i])
+        pe = _coh_float(row[pe_i])
+        if px is None or eps is None or pe is None:
+            continue
+        if abs(eps) < 0.01 or pe <= 0.0 or px <= 0.0:
+            continue
+        testable += 1
+        implied = px / eps
+        if implied <= 0.0:
+            # price > 0 and eps > 0 cannot land here; a negative implied means
+            # eps < 0 while the provider still published a positive P/E. That is
+            # a provider quirk, not a transposition signature — skip it.
+            testable -= 1
+            continue
+        rel = abs(implied - pe) / abs(pe)
+        if rel < _COH_REL_TOL:
+            continue
+        ratio = implied / pe
+        if _COH_FX_UNIT_LO <= ratio <= _COH_FX_UNIT_HI:
+            continue  # GBX/GBP pence convention — healthy row, not a mismatch
+        bad += 1
+        if len(samples) < 8:
+            s = ""
+            if 0 <= sym_i < len(row):
+                s = str(row[sym_i] or "").strip().upper()
+            samples.append((s or "?", round(pe, 2), round(implied, 2)))
+    return testable, bad, samples
 
 
 def _safe_gateways_enabled() -> bool:
@@ -4023,6 +4270,62 @@ async def _run_one_task(
                 _iw = f"{_IDENTITY_TAG} skipped (error: {_ie})"
                 res.warnings.append(_iw)
                 logger.warning(_iw)
+        # ---------------------------------------------------------------------
+
+        # --- Coherence tripwire (v6.23.0 L3b) --------------------------------
+        # L3 can only see symbols someone thought to curate: on the 2026-07-12
+        # export it checked 19 anchors on Market_Leaders, 22 on Global_Markets
+        # (0.6% of 3,762 rows) and ZERO on Commodities_FX and Mutual_Funds — and
+        # Mutual_Funds was 33% poisoned while both layers looked straight past it.
+        # L3b needs no list. P/E == Price / EPS is an identity the payload states
+        # about itself, and the three fields straddle the seam the transposition
+        # splits (Price = quote block, correct; EPS + P/E = enrichment block,
+        # misassigned). Break rate on the live sheet: poisoned GM 89.2%, clean GM
+        # 07-08 rows 0.0%, clean ML 1.0% (pure GBX/GBP pence, excluded by the
+        # [50,200] unit band). Trip at >25% of testable rows. Pages that cannot
+        # form the ratio (< MIN_ROWS testable — funds/FX carry no EPS) are never
+        # judged. Same remedy as L3: skip clear+write, PRESERVE last-good rows.
+        # TFB_SYNC_COHERENCE_TRIPWIRE=0 disables (not recommended).
+        if (_coherence_enabled() and task.expects_rows and rows_matrix and headers):
+            try:
+                _coh_n, _coh_bad, _coh_ex = _coherence_scan(headers, rows_matrix)
+                _coh_min = _coherence_min_rows()
+                if _coh_n >= _coh_min:
+                    _coh_pct = (100.0 * _coh_bad / _coh_n) if _coh_n else 0.0
+                    res.warnings.append(
+                        f"{_COHERENCE_TAG} {task.sheet_name}: testable={_coh_n} "
+                        f"incoherent={_coh_bad} ({_coh_pct:.1f}%) "
+                        f"threshold={_coherence_max_bad_pct()}%"
+                    )
+                    if _coh_pct > float(_coherence_max_bad_pct()):
+                        _cex = "; ".join(
+                            f"{_s} statedPE={_p} impliedPE={_i}" for _s, _p, _i in _coh_ex[:6]
+                        )
+                        _cmsg = (
+                            f"{_COHERENCE_TAG} TRIPPED on '{task.sheet_name}': "
+                            f"{_coh_bad}/{_coh_n} testable rows ({_coh_pct:.1f}%) state a "
+                            f"P/E that does not equal Price/EPS ({_cex}) — the enrichment "
+                            f"block is symbol<->attribute transposed against the quote "
+                            f"block. Skipping clear+write to PRESERVE last-good rows; the "
+                            f"next healthy sync self-heals. "
+                            f"TFB_SYNC_COHERENCE_TRIPWIRE=0 disables (not recommended)."
+                        )
+                        res.status = "skipped"
+                        res.rows_written = 0
+                        res.rows_failed = 0
+                        res.warnings.append(_cmsg)
+                        logger.error(_cmsg)
+                        return res
+                else:
+                    res.warnings.append(
+                        f"{_COHERENCE_TAG} {task.sheet_name}: not judged "
+                        f"(testable={_coh_n} < min={_coh_min}; this page carries no "
+                        f"EPS/PE pair — L3 anchors cover it instead)"
+                    )
+            except Exception as _ce:  # never let the tripwire break the write path
+                _cw = f"{_COHERENCE_TAG} skipped (error: {_ce})"
+                res.warnings.append(_cw)
+                logger.warning(_cw)
         # ---------------------------------------------------------------------
 
         # --- My_Portfolio manual-cell write guard (v6.5.0) -------------------
