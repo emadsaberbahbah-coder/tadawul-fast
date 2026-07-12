@@ -36,6 +36,38 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.8.0 — MINIMUM TICKET SIZE (plan-level floor at the point of presentation)
+--------------------------------------------------------------------------------
+WHY (brief of 2026-07-12 19:03): the decision layer ordered "ADD BBD.US 1 sh
+(~14 SAR)" — a ticket whose brokerage commission exceeds the position on any
+broker. 1050.SR got 98 SAR. Economically meaningless tickets in an executable
+plan. The sizing is AUTHORED upstream (Portfolio_Decision's Advisor Note); this
+script parses and re-displays it — so the floor is enforced HERE, at the point
+where the plan becomes the email the operator executes. The upstream author
+gets the same rule in its own revision.
+
+RULE (_enforce_min_ticket, applied inside extract_decision after the parse):
+  floor = TFB_MIN_TICKET_SAR (default 200; <=0 disables the floor entirely and
+  restores v1.7.0 byte-identically).
+  * ADDs with sar >= floor are untouched.
+  * Each sub-floor ADD is FOLDED into the largest surviving ADD: cash is
+    conserved exactly (target.sar += small.sar); the target's share count is
+    re-derived from its own implied price when derivable (price = sar/shares),
+    else left as-is with the cash bump; the fold is written into the target's
+    `note` — which every renderer (HTML / text / PDF) already prints, so all
+    three formats stay consistent with ZERO renderer edits.
+  * If ALL ADDs are sub-floor and even their combined cash misses the floor,
+    they are dropped and recorded in out["dropped_small"]; the existing
+    no-high-confidence-ADD hero path renders (freed cash stays unallocated —
+    a 14-SAR order is not a plan).
+  Totals: freed_cash comes from SELL/TRIM only and is untouched; the sum of
+  ADD cash after folding equals the sum before (conservation asserted in the
+  harness on the live Sunday case: 14 + 98 + 1,992 folds to one 2,104-SAR
+  ticket).
+
+send_digest.py is deliberately NOT touched: it carries no ticket sizes (its
+Best-BUY is a name pick, not a cash amount), so there is nothing to floor.
+
 v1.7.0 — DATA-VINTAGE PROVENANCE + ISSUER-SIBLING FLAGS (evidence: the
   2026-07-10 morning/evening workbook audits + the 13:26 Decision Digest)
   (A) DATA VINTAGE. The pages this brief quotes carried three different
@@ -198,7 +230,7 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 import argparse
 import datetime as _dt
@@ -434,11 +466,66 @@ def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:
             out["freed_cash"] += rec["sar"] or 0.0
         elif action in ADD_ACTIONS:
             rec["shares"] = _note_shares(note)
-            out["add"].append(rec)
+            out["add"].append(rec)  # v1.8.0: floored post-loop by _enforce_min_ticket
         else:
             out["hold"].append(rec)
     out["pl_pct"] = ((out["mv"] - out["cost"]) / out["cost"] * 100.0) if out["cost"] else None
+    # v1.8.0: minimum executable ticket (default 200 SAR; TFB_MIN_TICKET_SAR=0 disables)
+    out["min_ticket"] = _min_ticket_sar()
+    out["add"], out["folded"], out["dropped_small"] = _enforce_min_ticket(out["add"])
     return out
+
+
+def _min_ticket_sar() -> float:
+    """v1.8.0: minimum executable ADD ticket in SAR. Default 200.
+    TFB_MIN_TICKET_SAR=0 (or any value <= 0) disables the floor and restores
+    the v1.7.0 pass-through byte-identically."""
+    raw = (os.getenv("TFB_MIN_TICKET_SAR") or "").strip()
+    try:
+        v = float(raw) if raw else 200.0
+    except Exception:
+        v = 200.0
+    return v
+
+
+def _enforce_min_ticket(adds: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Tuple[str, float, str]], List[Dict[str, Any]]]:
+    """v1.8.0: fold sub-floor ADD tickets into the largest surviving ADD.
+
+    Returns (kept_adds, folded, dropped_small) where folded is a list of
+    (from_symbol, sar, into_symbol). Cash is conserved: sum(sar) over kept ==
+    sum(sar) over input (unless everything is dropped). The fold is appended to
+    the target's `note`, which every renderer already prints."""
+    floor = _min_ticket_sar()
+    if floor <= 0 or not adds:
+        return adds, [], []
+    keep = [r for r in adds if (r.get("sar") or 0.0) >= floor]
+    small = [r for r in adds if (r.get("sar") or 0.0) < floor]
+    if not small:
+        return adds, [], []
+    if not keep:
+        # promote the largest small and try folding the rest into it
+        small.sort(key=lambda r: r.get("sar") or 0.0, reverse=True)
+        keep, small = [small[0]], small[1:]
+    folded: List[Tuple[str, float, str]] = []
+    target = max(keep, key=lambda r: r.get("sar") or 0.0)
+    t_sar = target.get("sar") or 0.0
+    t_sh = target.get("shares")
+    price = (t_sar / t_sh) if (t_sh and t_sar > 0) else None
+    for r in small:
+        s = r.get("sar") or 0.0
+        t_sar += s
+        folded.append((r.get("symbol") or "?", s, target.get("symbol") or "?"))
+    if folded:
+        target["sar"] = t_sar
+        if price and price > 0:
+            target["shares"] = max(1, int(round(t_sar / price)))
+        parts = ", ".join(f"+{s:,.0f} SAR from {sym}" for sym, s, _ in folded)
+        target["note"] = ((target.get("note") or "").rstrip() +
+                          f" | v1.8.0 min-ticket fold ({_min_ticket_sar():,.0f} SAR floor): {parts}").strip(" |")
+    if (target.get("sar") or 0.0) < floor:
+        # even the folded total misses the floor: a 14-SAR order is not a plan
+        return [], [], keep + small if isinstance(small, list) else keep
+    return keep, folded, []
 
 
 def _note_sar(note: str) -> float:
