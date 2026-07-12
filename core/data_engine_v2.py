@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.114.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.115.0
 ================================================================================
 
 WHY v5.111.0 - FINAL-ACTION BOUNDARY INVARIANT (Fix AW)
@@ -2656,7 +2656,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.114.0"
+__version__ = "5.115.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -7946,6 +7946,29 @@ def _v573_append_warning(row: Dict[str, Any], tag: str) -> None:
 #                                  v5.113.0 _V573_SANITIZATION_BOUNDS byte-for-byte.
 # =============================================================================
 
+# -----------------------------------------------------------------------------
+# v5.115.0 addendum - RISK-METRIC BANDS (unadjusted-split garbage)
+# -----------------------------------------------------------------------------
+# The 2026-07-12 audit found Volatility 30D up to 15,068 (== 1,506,800%
+# annualised; 19 rows above 300%, 33 on the 90D). Profile: overwhelmingly .US
+# micro-caps that are KNOWN reverse-splitters (Sphere 3D, Boxlight, ...) - an
+# UNADJUSTED SPLIT in the price history manufactures one fake +/-90x daily
+# return and the annualised stdev explodes. The ROOT fix belongs in the history
+# provider (split-adjusted closes) and is queued pending its live source; this
+# band stops the garbage from reaching scoring and the sheet REGARDLESS of
+# which provider produced it.
+#
+# Ceilings, validated against the live 4,662-row universe:
+#   volatility_30d / volatility_90d : 3.0  (300% annualised; live p95 = 0.88 -
+#        nothing legitimate is within 3x of the ceiling; nulls exactly the
+#        19 / 33 split-garbage rows and ZERO real ones)
+#   var_95_1d : |v| <= 0.5   (live |max| = 0.212; a 50% one-day 95% VaR does
+#        not exist outside a halted stock - impossible-value trap, sign kept:
+#        the negative loss convention covers 81% of rows)
+#   max_drawdown_1y : |v| <= 1.0  (a drawdown beyond -100% is arithmetically
+#        impossible; live |max| = 0.9997 sits legitimately just inside)
+# -----------------------------------------------------------------------------
+
 # field -> (negative_allowed, magnitude_ceiling)
 _V5114_SANITIZATION_SPEC: Dict[str, Tuple[bool, float]] = {
     # sign is MEANINGFUL -> trap on |value| only, never on the sign
@@ -7958,6 +7981,11 @@ _V5114_SANITIZATION_SPEC: Dict[str, Tuple[bool, float]] = {
     # a negative here is physically impossible -> keep the sign filter
     "ps_ratio":       (False,  100.0),   # revenue cannot be negative
     "dividend_yield": (False,    0.30),  # a yield cannot be negative
+    # v5.115.0 - risk metrics (unadjusted-split garbage; see addendum above)
+    "volatility_30d":  (False,   3.0),   # annualised; live p95=0.88, garbage >=3.7
+    "volatility_90d":  (False,   3.0),   # annualised; same profile
+    "var_95_1d":       (True,    0.5),   # sign = loss convention (81% negative)
+    "max_drawdown_1y": (True,    1.0),   # beyond -100% is arithmetically impossible
 }
 
 
