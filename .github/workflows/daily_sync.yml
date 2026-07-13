@@ -367,25 +367,28 @@ jobs:
       # symbols return only once pasted back / restored to the page.
       # KILL-SWITCH: remove the line to fall back to the script default (2500).
       TFB_SYNC_MAX_SYMBOLS_MARKET: "5000"
-      # Route the four market pages through the ANALYSIS gateway
-      # (/v1/analysis/sheet-rows) FIRST — the route that returns the full page of
-      # rows (plus the rank/dedup passes) — instead of the enriched chain that ends
-      # on /v1/advanced (the advisor route), which answers 200 but with 0 rows for a
-      # raw market list. Paired with the small batch size above so the analysis
-      # route can answer within Render's ~100s timeout instead of 502ing. Read by
-      # run_dashboard_sync.py (_effective_gateway); this is a GitHub/sync flag, NOT a
-      # Render backend var. Reversible: set "0" (or remove) to restore the
-      # per-page configured gateway.
-      TFB_SYNC_MARKET_ANALYSIS_GATEWAY: "1"
-      # (2026-07-02) v6.18.0 GENERIC market-gateway override — takes precedence over
-      # the boolean above. "advanced" routes the four market pages
-      # /v1/advanced/sheet-rows-FIRST: the endpoint that answered 200 on every
-      # attempt in the failed run-28554325006 log (the /v1/analysis route now 502s
-      # on big pages since the unbounded-engine change, and the resulting 404
-      # candidate walk blew the job past its 25-min ceiling — the cancellation that
-      # left Mutual_Funds/Commodities_FX empty). Same route as the manual sheet
-      # Refresh. Reversible: remove this line to fall back to the boolean above.
-      TFB_SYNC_MARKET_GATEWAY: "advanced"
+      # (2026-07-13) GATEWAY DECLARATION ALIGNED WITH ENFORCED REALITY.
+      # History: the boolean below (v6.10.0) routed the four market pages to
+      # /v1/analysis; a v6.18.0 override then forced "advanced" after a 25-min
+      # ceiling incident (run-28554325006). BOTH have been dead letters since
+      # run_dashboard_sync v6.22.0/v6.22.1: _effective_gateway forces the four
+      # ranked market pages to "analysis" REGARDLESS of these vars while
+      # TFB_SYNC_SAFE_GATEWAYS is ON (its default), and the safe candidate
+      # chain contains analysis endpoints ONLY — /v1/advanced/* carries no
+      # transposition firewall and was removed from the market chain (the
+      # 2026-07-08 poisoning entered through an unfirewalled route; the
+      # 2026-07-12/13 GM writes measured 63.6–89.2% transposed enrichment).
+      # The old "advanced" line therefore documented an intent the code
+      # deliberately refuses — the exact confusion the 2026-07-13 external
+      # audit flagged. Declaring "analysis" explicitly changes NOTHING today
+      # and keeps routing correct even if TFB_SYNC_SAFE_GATEWAYS is ever set
+      # to 0 for a diagnostic run. The 25-min-ceiling failure mode that
+      # motivated "advanced" is solved by its real fixes: timeout-minutes 115
+      # + TFB_SYNC_TIME_BUDGET_SEC 3600 (L5) + the small batch size above.
+      # Read by run_dashboard_sync.py (_effective_gateway); GitHub/sync flag,
+      # NOT a Render backend var. Reversible: restore the previous two-line
+      # form from git history.
+      TFB_SYNC_MARKET_GATEWAY: "analysis"
 
     steps:
       - name: 📥 Secure Checkout
