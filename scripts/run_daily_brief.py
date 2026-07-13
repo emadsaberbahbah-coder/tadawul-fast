@@ -36,6 +36,30 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.9.0 — FAIR-VALUE SATURATION MARKER (honest-display; evidence-driven)
+--------------------------------------------------------------------------
+EVIDENCE (2026-07-13 sent brief): all six Best-New-Buys candidates printed
+an identical "+18% to fair value" — traced to the sheet itself: the Top_10
+SELECTED grid carried ROI% = 17.5 on every row (ALL QUALIFIED carried a
+flat 35.0 = TFB_INTRINSIC_DISPLAY_MAX_PCT exactly). The engine's intrinsic
+ceiling (v5.87.0, deliberately ON in Render) is saturating universally, so
+the FV column reaches this brief carrying ZERO ranking information while
+LOOKING like six independent measurements. The brief must never present a
+clamped constant as if it differentiated.
+
+FIX — render-only, data untouched: _fv_saturation() detects a saturated
+column empirically (>= TFB_BRIEF_FV_SAT_MIN identical rounded values,
+default 3, that are also the column MAX — no hard-coded cap constant, so
+any future ceiling value is caught the same way); _fv_display() then
+renders each saturated value as ">=18%" and the buys section gains ONE
+footnote naming the cap. Applies to all three surfaces (HTML card, PDF
+table, text fallback). Mixed / genuinely differentiated columns render
+byte-identically to v1.8.0. Kill switch TFB_BRIEF_FV_CAP_MARKER
+(default ON; 0/false/off restores v1.8.0 output byte-identically).
+Per-horizon outlook strips were never clamped and are unchanged — they
+remain the differentiated view. ZERO functions removed; two pure helpers
+added.
+
 v1.8.0 — MINIMUM TICKET SIZE (plan-level floor at the point of presentation)
 --------------------------------------------------------------------------------
 WHY (brief of 2026-07-12 19:03): the decision layer ordered "ADD BBD.US 1 sh
@@ -230,7 +254,7 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 import argparse
 import datetime as _dt
@@ -889,7 +913,8 @@ def _action_row(rec: Dict[str, Any], label: str, color: str, bg: str, border: st
       </td></tr></table>"""
 
 
-def _opp_row(rank: int, p: Dict[str, Any], metrics: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+def _opp_row(rank: int, p: Dict[str, Any], metrics: Optional[Dict[str, Dict[str, Any]]] = None,
+             fv_sat: Optional[float] = None) -> str:
     conf = p["conf"].title()
     cc = ADD_C if conf.lower() == "high" else (TRIM_C if conf.lower() in ("medium", "moderate") else "#888")
     m = (metrics or {}).get(p["symbol"].upper())  # v1.3.0
@@ -905,11 +930,64 @@ def _opp_row(rank: int, p: Dict[str, Any], metrics: Optional[Dict[str, Dict[str,
     return f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:0; background:#E9F5EF; border:1px solid #C7E4D5;"><tr>
       <td style="padding:12px 12px; width:34px; vertical-align:top;"><div style="width:24px; height:24px; background:{ADD_C}; color:#fff; border-radius:50%; text-align:center; line-height:24px; font-family:{SANS}; font-size:12px; font-weight:bold;">{rank}</div></td>
       <td style="padding:11px 6px; font-family:{SANS};"><div style="font-size:14px; color:#1A1A1A;"><strong>{_esc(p['symbol'])}</strong> <span style="color:#777; font-size:12px;">{_esc(p['name'])[:30]}</span></div><div style="font-size:11px; color:#8A8A8A; margin-top:2px;">{_esc(p['sector'])} · {_esc(p['market'])}</div>{sib}{extras}</td>
-      <td align="right" style="padding:11px 14px; font-family:{SANS}; white-space:nowrap; vertical-align:top;"><div style="font-size:13px; color:#0E7C5A;"><strong>{_pct(p['roi'],0)} to fair value</strong></div><div style="font-size:11px; color:#888;">Reliability {_num_str(rel_show)} · <span style="color:{cc};">{conf}</span></div></td></tr></table>{_outlook_strip(m)}<div style="height:7px; font-size:0; line-height:0;">&nbsp;</div>"""
+      <td align="right" style="padding:11px 14px; font-family:{SANS}; white-space:nowrap; vertical-align:top;"><div style="font-size:13px; color:#0E7C5A;"><strong>{_fv_display(p['roi'], fv_sat, 0)} to fair value</strong></div><div style="font-size:11px; color:#888;">Reliability {_num_str(rel_show)} · <span style="color:{cc};">{conf}</span></div></td></tr></table>{_outlook_strip(m)}<div style="height:7px; font-size:0; line-height:0;">&nbsp;</div>"""
 
 
 def _num_str(x: Optional[float]) -> str:
     return "—" if x is None else f"{x:.0f}"
+
+
+def _fv_marker_enabled() -> bool:
+    """v1.9.0: kill switch for the fair-value saturation marker (default ON).
+    TFB_BRIEF_FV_CAP_MARKER in {0,false,no,off} restores v1.8.0 rendering
+    byte-identically."""
+    raw = (os.getenv("TFB_BRIEF_FV_CAP_MARKER") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _fv_saturation(picks: List[Dict[str, Any]]) -> Optional[float]:
+    """v1.9.0: empirical ceiling detection on the picks' roi column. Returns
+    the saturated value when >= TFB_BRIEF_FV_SAT_MIN picks (default 3,
+    floor 2) share the SAME rounded(0.1) roi AND that value is the column
+    maximum — the signature of an upstream display clamp (a genuine tie at
+    the top across 3+ independent names does not occur in practice; a
+    clamp produces exactly this shape every time). No hard-coded cap
+    constant: whatever ceiling the engine ENV sets, the shape is caught.
+    Returns None for mixed / unsaturated columns and when the marker is
+    switched off."""
+    if not _fv_marker_enabled():
+        return None
+    try:
+        min_n = int((os.getenv("TFB_BRIEF_FV_SAT_MIN") or "3").strip())
+    except Exception:
+        min_n = 3
+    if min_n < 2:
+        min_n = 2
+    vals = [round(float(p["roi"]), 1) for p in (picks or [])
+            if isinstance(p, dict) and p.get("roi") is not None]
+    if len(vals) < min_n:
+        return None
+    counts: Dict[float, int] = {}
+    for v in vals:
+        counts[v] = counts.get(v, 0) + 1
+    top = max(vals)
+    if counts.get(top, 0) >= min_n:
+        return top
+    return None
+
+
+def _fv_display(roi: Optional[float], sat: Optional[float],
+                digits: int = 0) -> str:
+    """v1.9.0: render one pick's fair-value gap. A value sitting ON the
+    detected ceiling renders as ">=X%" (the gap is AT LEAST this — the
+    clamp hides the rest); everything else renders exactly as v1.8.0
+    (_pct). None-safe."""
+    base = _pct(roi, digits)
+    if sat is None or roi is None:
+        return base
+    if round(float(roi), 1) == sat:
+        return "≥" + base.lstrip("+")
+    return base
 
 
 def _num_str2(x: Optional[float]) -> str:
@@ -1149,7 +1227,14 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     hold_rows = "".join(_hold_row(r) for r in d["hold"])
 
     # ---- opportunities ----
-    opp_rows = "".join(_opp_row(i + 1, p, metrics) for i, p in enumerate(t["top"]))
+    # v1.9.0: judge FV saturation on EVERYTHING shown (top + rest), once.
+    _all_shown = list(t["top"]) + [p for names in (t.get("rest") or {}).values()
+                                   for p in names]
+    _sat = _fv_saturation(_all_shown)
+    opp_rows = "".join(_opp_row(i + 1, p, metrics, _sat) for i, p in enumerate(t["top"]))
+    _sat_note = (f"""<div style="font-family:{SANS}; font-size:11px; color:#8A8A8A; margin:6px 2px 0 2px;">≥ marks values sitting on the engine's fair-value <strong>display ceiling</strong> — the true gap is <em>at least</em> the figure shown. The 1M&nbsp;/&nbsp;3M&nbsp;/&nbsp;12M strips remain fully differentiated.</div>"""
+                 ) if _sat is not None else ""
+    opp_rows += _sat_note
     rest_rows = "".join(_rest_row(market, names) for market, names in t["rest"].items()) if t["rest"] else ""
     rest_block = f"""
     <div style="font-family:{SERIF}; font-size:13px; color:#0E7C5A; margin:14px 2px 8px 2px;">Across the rest of your markets</div>
@@ -1622,21 +1707,29 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
         story.append(Paragraph("Ranked entry candidates you do not hold. The figure is the gap to "
                                "estimated fair value - a valuation target, not a prediction; "
                                "reliability and confidence show how much weight to give each.", st_note))
+        # v1.9.0: FV saturation judged once over everything listed here.
+        _pdf_all = list(t["top"]) + [p for names in (t.get("rest") or {}).values()
+                                     for p in names]
+        _sat4 = _fv_saturation(_pdf_all)
         rows4: List[List[str]] = [["#", "Symbol", "Name", "Market", "Sector", "To FV %", "Rel", "Conf"]]
         n = 0
         for p in t["top"]:
             n += 1
             rows4.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 28),
                           _pdf_txt(p["market"], 14), _pdf_txt(p["sector"], 16),
-                          _pct(p.get("roi"), 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
+                          _fv_display(p.get("roi"), _sat4, 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
         for market, names in (t.get("rest") or {}).items():
             for p in names:
                 n += 1
                 rows4.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 28),
                               _pdf_txt(market, 14), _pdf_txt(p.get("sector"), 16),
-                              _pct(p.get("roi"), 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
+                              _fv_display(p.get("roi"), _sat4, 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
         if len(rows4) == 1:
             rows4.append(["-", "-", "no funded candidates today", "-", "-", "-", "-", "-"])
+        if _sat4 is not None:
+            story.append(Paragraph("≥ = the engine's fair-value display ceiling; "
+                                   "the true gap is at least the figure shown. "
+                                   "1M/3M/12M outlooks remain differentiated.", st_note))
         story.append(Table(rows4, colWidths=[7*mm, 17*mm, 45*mm, 21*mm, 28*mm, 14*mm, 9*mm, 39*mm],
                            repeatRows=1,
                            style=_base([("ALIGN", (5, 1), (6, -1), "RIGHT")])))
@@ -1746,13 +1839,16 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     if d["hold"]:
         lines.append("HOLD (data too weak to act): " + ", ".join(r["symbol"] for r in d["hold"]))
     if t["top"]:
+        _sat_t = _fv_saturation(list(t["top"]))
         lines += ["", "BEST NEW BUYS (to fair value; a target, not a forecast):"]
+        if _sat_t is not None:
+            lines.append("  (>= marks the display ceiling - the gap is at least the shown figure)")
         _mx2 = model.get("metrics", {}) or {}
         for i, p in enumerate(t["top"], 1):
             _m2 = _mx2.get(p["symbol"].upper())
             _ol = (f" | 1M {_pct(_m2.get('roi1m'))} / 3M {_pct(_m2.get('roi3m'))}" if _m2 else "")
             _sb = f" [same issuer as held {p['sibling']}]" if p.get("sibling") else ""
-            lines.append(f"  {i}. {p['symbol']} {p['name'][:34]} - {_pct(p['roi'],0)} "
+            lines.append(f"  {i}. {p['symbol']} {p['name'][:34]} - {_fv_display(p['roi'], _sat_t, 0)} "
                          f"[{p['market']}, reliability {_num_str(p['rel'])}, {p['conf']}]{_ol}{_sb}")
     # v1.4.0: end-of-brief action summary (owner request 2026-07-05)
     lines += ["", "ACTION SUMMARY"]
