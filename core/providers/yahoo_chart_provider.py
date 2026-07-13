@@ -1,448 +1,222 @@
 #!/usr/bin/env python3
-# core/providers/yahoo_chart_provider.py
+# core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) -- v8.5.0
+Yahoo Finance Fundamentals Provider -- v6.7.0
 ================================================================================
+v6.7.0 -- YF-2 ON + TIGHT CROSS-RESPONSE BAND + DECLARED-IDENTITY ECHO
+          (Fixes YF-2b / YF-3 / YF-4)
+--------------------------------------------------------------------------------
+WHY (live workbook audit 2026-07-13, export v39 + repo forensics): the
+2026-07-12/13 sync-scale writes carried 63.6-89.2% transposed enrichment on
+Global_Markets -- SAME-LOCALE crossings the v6.6.0 guards structurally pass:
+GOOG served Gulfport Energy's name/EPS/PE (US<->US, Yahoo stamped the
+REQUESTED ticker, price plausible). The v6.6.0 header documented exactly
+this residual; today it is the live failure mode, so the residual shrinks:
 
-v8.6.0 — RESPONSE-IDENTITY GUARD + PRICE-COHERENCE GUARD (Fixes YC-1/YC-2/YC-3)
+YF-2b DEFAULT FLIP: TFB_FUND_PRICE_COHERENCE_GUARD now defaults ON (=0 is
+the kill switch) -- same house rule as YF-1: a documented control that the
+live failure class violates ships armed.
+
+YF-3 TIGHT CROSS-RESPONSE BAND: YF-2 compared info/fast_info price against
+this fetch's OWN history last close using the UNIT-CLASS thresholds
+(8.0/0.125) -- the live GOOG<->Gulfport crossing sits at 2.14x and sailed
+through. Two SAME-DAY responses for the SAME instrument cannot legitimately
+disagree 2x (a >100% one-day move; auto-adjusted history makes split days a
+non-class), so YF-2's conviction test now uses a dedicated tight band --
+TFB_FUND_PRICE_BAND_HIGH (default 2.0, floor 1.25) / TFB_FUND_PRICE_BAND_LOW
+(default 0.5, ceiling 0.8) -- while every OTHER consumer of the unit-class
+thresholds (52W bounds, sanity guard) keeps 8.0/0.125 untouched. Same
+conviction semantics: discard info AND fast_info, tag
+provider_price_incoherent, fall to honest history/None. Stated honestly:
+a crossing whose two instruments trade within 2x of each other still passes
+here -- the engine AY-2 / route RC / sync L3b layers (all shipped
+2026-07-13) own that residue via the P/E==Price/EPS invariant.
+
+YF-4 DECLARED-IDENTITY ECHO: the patch now carries the identity Yahoo's OWN
+response declared -- out["code"] = the raw symbol/underlyingSymbol Yahoo
+stamped -- captured BEFORE any conviction resets info. The engine's AU-1b
+raw-patch check reads exactly this key, so even with every provider-local
+guard kill-switched OFF the engine gets an independent second look; a
+response that declares the requested ticker echoes it back (harmless), and
+canonicalization is unaffected (the engine passes normalized_symbol
+explicitly). Belt-and-braces, zero behavior change on honest responses.
+
+Version: PROVIDER_VERSION = "6.7.0". All prior WHYs preserved verbatim.
+Zero functions removed; additions: _fund_price_band_high,
+_fund_price_band_low.
+================================================================================
+(v6.6.0 header retained below)
+================================================================================
+Yahoo Finance Fundamentals Provider -- v6.6.0
+================================================================================
+v6.6.0 -- GUARD DEFAULT ON + FAST-INFO SUPPRESSION + OWN-HISTORY PRICE
+          COHERENCE (Fixes YF-1 / YF-1b / YF-2)
 --------------------------------------------------------------------------------
 WHY (live workbook audit 2026-07-07, "Market_Share_Deepseek-V3" export v30):
-7010.SR (Saudi Telecom) was served current_price 17.32 against its own
-previous close 43.54 — a crossed instrument's price — with provider
-yahoo_chart and a fresh 03:50 UTC stamp. This provider consumed
-yfinance's `info` / history / metadata without ever verifying the
-response belongs to the symbol it asked for, and `_enrich_data` stamps
-the REQUESTED symbol onto whatever arrived, so neither the engine's
-AU-1 firewall (which trusts a provider's self-declared symbol) nor any
-downstream check could see the crossing. Under Render-IP throttling
-(429 retry storms) crossed responses are a live, recurring failure
-mode; identity verification for exactly this class is the documented
-house control (eodhd v4.9.2 AO, yahoo_fundamentals v6.4.0/v6.5.0,
-engine v5.109.0 AU-1) and it was violated in production this morning
-with direct decision impact.
+fresh wrong-company names were written onto NESR.US ("Invesco Municipal
+Trust"), LDI.US ("Axalta"), ROG.SW ("BKV Corporation") and 0011.HK
+("BuzzFeed") with same-morning stamps -- the v6.4.0/v6.5.0 identity+locale
+guard that exists precisely for this class was sitting DEFAULT OFF and
+therefore did nothing in production while the damage recurred daily.
 
-YC-1 RESPONSE-IDENTITY GUARD (TFB_CHART_IDENTITY_GUARD, DEFAULT ON,
-set =0 to kill). The chart response set declares its instrument in
-`info["symbol"]` / `info["underlyingSymbol"]` and in the history
-metadata's `symbol`. After the blocking fetch returns, every declared
-identity is compared (base-ticker, alnum-collapsed) against the
-Yahoo-mapped requested symbol. Lenient by construction: no declared
-identity -> pass; ANY declared field matching -> pass; only when every
-present declared identity differs is the response dropped (log +
-metric, nothing cached, engine falls through to the next provider).
-Shipping ON is a deliberate deviation from the OFF-first pattern and is
-justified under the house rule that a fix enforcing an
-already-documented, actively-violated control may default ON: the
-control is documented in three modules, the violation is live today,
-and the guard's no-declared/any-match semantics make a false drop of a
-genuine row structurally impossible short of Yahoo mislabeling its own
-payload.
+YF-1 DEFAULT FLIP: TFB_FUND_IDENTITY_GUARD now defaults ON (=0 is the kill
+switch). Deliberate deviation from the OFF-first pattern, under the house
+rule that a fix enforcing an already-documented, actively-violated control
+may ship ON: the control is documented in this file's own v6.4.0/v6.5.0
+WHYs (plus eodhd AO and engine AU-1), the violation is live today, and the
+guard is conservative by construction (absent/own-symbol responses are
+never touched).
 
-YC-2 HISTORY-LEG GUARD (same flag). `fetch_history_raw` feeds the
-engine's history/technicals path with bars that carry no symbol echo —
-but the history call lazily populates the ticker's metadata at ZERO
-extra HTTP, and that metadata declares `symbol`. The same base-ticker
-check now runs there; a definite mismatch returns [] instead of another
-instrument's price series.
+YF-1b FAST-INFO SUPPRESSION: on an identity or locale mismatch the old code
+discarded `info` but left `fast_info` -- fetched from the SAME crossed
+session response set -- free to supply prices/52W into the patch. Both are
+now suppressed together, so a convicted response set contributes nothing.
 
-YC-3 PRICE-COHERENCE GUARD (TFB_CHART_PRICE_COHERENCE_GUARD, DEFAULT
-OFF; thresholds TFB_CHART_PRICE_RATIO_HIGH/LOW default 8.0/0.125,
-matching the eodhd ZB unit-class thresholds). When the live `info`
-price and this provider's OWN last history close (independent HTTP —
-two responses crossing to the SAME wrong instrument is vanishingly
-unlikely) disagree by a unit-class ratio, the live-price keys are
-stripped from `info` so the patch falls back to the history-grounded
-price, with a `chart_price_incoherent_dropped` warning. Stated
-honestly: at the default thresholds this catches fils/cents-class
-errors, NOT same-currency crossings like today's 17.32-vs-43.54
-(ratio 2.5x) — YC-1 is the fix for those; YC-3 is belt for the
-unit-class family only.
+YF-2 OWN-HISTORY PRICE COHERENCE (TFB_FUND_PRICE_COHERENCE_GUARD, DEFAULT
+OFF; thresholds reuse YF_PRICE_RATIO_HIGH/LOW, 8.0/0.125): the live
+info/fast_info price is compared against this provider's OWN 3-month
+history last close (independent HTTP; two responses crossing to the SAME
+wrong instrument is vanishingly unlikely). A unit-class disagreement
+convicts the whole info+fast_info set (discard + provider_price_incoherent
+tag). Stated honestly: this catches fils/cents-class crossings; a
+same-locale record carrying a PLAUSIBLE price with a wrong name (today's
+NESR.US shape) has no in-provider invariant to test against and remains
+uncaught here -- the symbol-base and locale checks (now ON) are the
+operative defenses for that class, and they only catch it when Yahoo
+stamps a different ticker or a foreign locale on the record. Residual risk
+is documented, not hidden.
 
-Version: PROVIDER_VERSION = "8.8.0". All prior WHY blocks preserved
-verbatim. Zero functions removed (AST-verified).
-
-v8.7.1 — RAW PREV-CLOSE SEMANTICS HOTFIX
------------------------------------------------------------------------
-WHY (live probe minutes after the v8.7.0 deploy): 2222.SR served
-previous_close 28.25 — ABOVE its own 52w high 27.96 — fabricating a
--4.78% day move. Yahoo's meta.chartPreviousClose is the close before
-the REQUESTED WINDOW (the 2y history range here), not the prior
-session. The raw parser now prefers regularMarketPreviousClose, then
-the second-to-last history bar close (the true prior session), then
-plain previousClose; chartPreviousClose is consulted ONLY for intraday
-ranges (1d/5d) where its meaning coincides with the prior session.
-Parser-only change; transport, guards, and flow untouched.
-
-v8.8.0 — SPLIT-ADJUSTED HISTORY (Fix YC-ADJ) — the volatility-15,068 root cause
---------------------------------------------------------------------------------
-WHY (evening audit 2026-07-12): the live universe carried Volatility 30D up to
-15,068 (== 1,506,800% annualised; 19 rows > 300%, 33 on the 90D). Profile:
-overwhelmingly .US micro-caps that are KNOWN reverse-splitters (Sphere 3D,
-Boxlight, ...). Mechanism: a 1-for-N reverse split multiplies the printed price
-by N overnight; on an UNADJUSTED series that is one fake +N00% daily return, and
-the annualised stdev explodes. data_engine_v2 v5.115.0 added a containment band
-(|vol| > 3.0 -> null). THIS is the cure at the source.
-
-THE SPLIT-BRAIN. This provider serves history over two transports:
-  raw chart  (_raw_chart_parse_triple, PRIMARY since v8.7.0) — read ONLY
-      indicators.quote[0] = UNADJUSTED prints. Yahoo ships the split-adjusted
-      series in indicators.adjclose[0].adjclose in the SAME payload; the
-      parser never looked at it.
-  yfinance   (fallback) — Ticker.history() defaults auto_adjust=True =
-      ADJUSTED.
-Same symbol, different series, depending on which transport happened to win.
-Every return-based downstream (volatility, drawdown, VaR, candle structure,
-momentum) inherits the coin flip.
-
-FIX (YC-ADJ-1): _raw_chart_parse_triple now reads indicators.adjclose and
-applies a PER-BAR factor k = adjclose/close to open, high, low and close —
-scaling all four by the same k preserves candle geometry (body/wick ratios)
-exactly; only the split discontinuity disappears. Volume is left as printed
-(share counts are real). Guards per bar: adjclose present, finite, > 0, close
-> 0, else k = 1 (that bar stays raw). adjclose absent from the payload
-entirely -> whole parse identical to v8.7.1 (fail-safe).
-
-FIX (YC-ADJ-2): both yfinance history call sites now pass auto_adjust=True
-EXPLICITLY. Zero behavior change today (it is the library default) — it pins
-the contract so a future yfinance default-flip cannot silently reopen the
-split-brain.
-
-KILL-SWITCH: TFB_YC_ADJUSTED_HISTORY=0/false/off/no restores the v8.7.1 raw
-parse byte-identically. Default ON. No ENV entry required.
-
-v8.7.0 — RAW CHART TRANSPORT + SILENT-NONE ELIMINATION (Fix YC-RAW)
------------------------------------------------------------------------
-WHY (live conviction, 2026-07-08 Render shell): fetch_quote('2222.SR')
-and ('1120.SR') both returned None with ZERO log lines even at
-logging.INFO — while a plain curl from the SAME box to
-query1.finance.yahoo.com/v8/finance/chart/2222.SR answered 200 with the
-full correct payload (regularMarketPrice 26.68 SAR). Production logs
-show the cause: the yfinance library's cookie+crumb handshake is
-refused ("401 Invalid Crumb" / "User is unable to access this
-feature"), so this provider's ONLY transport was dead — and the v36
-export shows the consequence: .SR rows served as snapshot:yahoo_chart
-(last-good fallback), i.e. the Saudi book coasting on stale prices.
-An older WHY in this very file (the FX empty-DataFrame note) had
-already prescribed the fix — "adding an httpx-based fallback to
-query1.finance.yahoo.com/v8/finance/chart/{SYMBOL}" — but it was never
-implemented.
-FIX (master switch TFB_YAHOO_RAW_CHART, default ON; 0/false/off
-restores the v8.6.0 yfinance-only flow byte-identically):
-  YC-RAW-1  A crumb-free raw transport (_raw_chart_fetch_triple over a
-            query1/query2 host ladder, browser UA, httpx — already a
-            production dependency) synthesizes the EXACT
-            (info, meta, history) triple _fetch_ticker_sync returns.
-            The entire existing pipeline is reused untouched: YC-1
-            identity guard reads the payload's own meta.symbol, YC-3
-            coherence, _enrich_data, cache, circuit breaker, token
-            bucket. Quotes AND history go raw-FIRST; any raw failure
-            logs its reason and falls through to the untouched
-            yfinance path (retry ladder preserved).
-  YC-RAW-2  SILENT-NONE ELIMINATION: the two paths that returned None
-            without a trace now speak — a circuit-OPEN denial logs one
-            WARNING per cooldown window (throttled via
-            _cb_deny_log_ts), and an empty response set logs one
-            transport-attributed WARNING before returning None.
-Scope: no schema change, no scoring change, no new columns; identity
-and coherence guards unchanged in semantics. yfinance stays installed
-and is still the fallback transport. Zero functions removed
-(AST-verified).
-
-Version: PROVIDER_VERSION = "8.6.0". All prior WHY blocks preserved
-verbatim below. Zero functions removed (AST-verified).
-
-v8.5.0 Changes (from v8.4.0) — REPORT THE PRICE BAR'S OWN TIME (Fix AR support)
-------------------------------------------------------------------------
-WHY: the 2026-07-05 audit verified this provider serving weeks-old cached
-bars AS the current price for .SR mid-caps under datacenter throttle
-(1211.SR 58.90 vs 63.10 Argaam live; 3092.SR 22.77 vs 24.54) — with fresh
-last_updated stamps and no way for the engine to detect it, because the
-patch never disclosed WHEN the bar behind `current_price` actually traded.
-FIX (disclosure only — no price, field, or flow change):
-  - _enrich_data now emits `"timestamp"`: the ISO time of the bar/quote
-    backing `current_price`. Source selection is honest about origin:
-    (a) price from live info fields -> info/meta `regularMarketTime`
-        (epoch -> ISO), falling back to the last history bar's timestamp;
-    (b) price from the history fallback -> that last history bar's
-        timestamp (NOT regularMarketTime, which describes a quote the
-        price did not come from).
-  - The engine (data_engine_v2 v5.104.0, Fix AR) canonicalizes this into
-    `price_bar_ts` and gates on it (TFB_GATE_PROVIDER_BAR_AGE). With the
-    engine gate OFF the field is inert; provider behavior is otherwise
-    byte-identical to v8.4.0.
-  - `PROVIDER_VERSION = "8.5.0"`.
-
-Purpose
--------
-Provides financial market data from Yahoo Finance:
-  - Real-time quotes for global stocks, ETFs, indices, forex, commodities
-  - Historical OHLCV data with technical indicators
-  - Fundamental data (light) and financial metrics
-  - KSA symbol support (.SR suffix)
-  - Risk statistics (volatility, drawdown, VaR, Sharpe, RSI)
-  - Price forecasts using log-linear regression
-
-v8.4.0 Changes (from v8.3.0) — YAHOO SYMBOL SSOT AT THE TICKER BOUNDARY
-------------------------------------------------------------------------
-Root cause of the 2026-07-05 quota blackout's Yahoo half: THIS provider
-handed yfinance the raw normalized symbol, so every `.US`-suffixed name
-(BBD.US / FER.US / RCI.US ... ~2,300 rows) 404'd on Yahoo by construction
-("possibly delisted" across the 5d/2y/1mo ladder) — Yahoo's free history
-was unreachable, pushing the gap-backfill onto PAID EODHD eod/history
-calls. yahoo_fundamentals_provider fixed the same class in v6.3.1; this
-file never got the fix (zero to_yahoo_symbol references before v8.4.0).
-
-  - The existing v8.2.0 SSOT import block now ALSO binds
-    `to_yahoo_symbol` from core/symbols/normalize.py.
-  - `_yc_yahoo_symbol(sym)` maps the symbol ONLY for the actual
-    `yf.Ticker(...)` calls (both sites); cache keys, metrics labels,
-    logs, and every returned payload keep the ORIGINAL symbol.
-  - Local fallback `_yc_local_to_yahoo` (used only when the SSOT import
-    fails) STRIPS `.US` to bare — the exact gap the fundamentals
-    provider's local map still has — and remaps the divergent suffixes
-    (NSE->NS, BSE->BO, XETRA->DE, AU->AX, KO->KS). Symbols containing
-    `=`, `^`, or `-` pass through untouched (FX/futures/indices/crypto).
-  - Kill-switch: TFB_YC_SYMBOL_MAP (default ON; 0/false/off restores
-    the v8.3.0 raw-symbol behavior byte-for-byte).
-  - `PROVIDER_VERSION = "8.4.0"`.
-
-v8.3.0 Changes (from v8.2.0)
-----------------------------
-Bounded retry + backoff for Yahoo history rate-limiting. `fetch_history_raw`
-previously caught any exception from yfinance's `Ticker.history()` -- including
-the transient "Too Many Requests. Rate limited." throttle -- logged a warning,
-and returned `[]` with NO retry. A burst of history fetches (a full
-Market_Leaders scan fires 200+) trips Yahoo's limiter, so dozens of symbols
-lost their ENTIRE price history in a single pass. With no history the
-technical / momentum / volatility factors default and the composite score
-skews low, pushing otherwise-neutral names into SELL. The June 2026 funnel
-audit traced a large share of Market_Leaders being classified SELL
-substantially to this starvation.
-
-New:
-  - `DEFAULT_YF_HISTORY_RETRY_ATTEMPTS / _BASE_SEC / _CAP_SEC`: bounded defaults.
-  - `_yf_history_retry_enabled()`: reads `TFB_YF_HISTORY_RETRY` (default OFF).
-  - `_yf_history_retry_attempts()`: total attempts; returns 1 when the gate is
-    OFF (so the fetch path stays byte-identical to v8.2.0), else bounded [1,5].
-  - `_yf_history_retry_base_sec()` / `_yf_history_retry_cap_sec()`: bounded
-    backoff knobs ([0.05,3.0] / [0.1,8.0] seconds).
-  - `_is_rate_limit_error()`: matches only throttle messages so genuine
-    delisted / no-data symbols are NOT retried (they would never succeed).
-
-Modified:
-  - `fetch_history_raw._sync_fetch`: wrapped in a bounded attempt loop. Retries
-    fire ONLY on rate-limit errors, with exponential backoff + jitter capped
-    per attempt, so total added latency cannot run away against the ~100s
-    Render edge timeout. `time.sleep()` (not `asyncio.sleep`) is correct here --
-    the closure runs inside the shared ThreadPoolExecutor, off the event loop.
-
-Behavior when gate OFF (default): `_yf_history_retry_attempts()` == 1, the loop
-runs exactly once, and every path (success / empty / exception) returns inside
-that single iteration with the identical v8.2.0 warning text and return value.
-Zero behavioral change until `TFB_YF_HISTORY_RETRY` is explicitly enabled
-("deploy dark, enable explicitly").
-
-Bumped:
-  - `PROVIDER_VERSION = "8.3.0"`.
-
-NOT changed (deliberate):
-  - Direct Yahoo Chart API fallback for futures remains deferred.
-  - TokenBucket / CircuitBreaker / concurrency limiting untouched: this change
-    is a surgical retry on the history path only, not a concurrency rework.
-  - All v8.2.0 / v8.1.0 / v8.0.0 fixes preserved verbatim.
-
-v8.2.0 Changes (from v8.1.0)
-----------------------------
-Provider-side identity alignment with `enriched_quote.py` v4.6.0
-`_SUFFIX_TO_LOCALE`. Goal: when Yahoo's `info` payload doesn't return
-`exchange` / `currency` / `country` (delayed feeds, ADRs, quirky listings),
-the provider populates them from the symbol's suffix instead of leaving
-them blank. The downstream normalization stage in `enriched_quote.py`
-then has nothing left to repair.
-
-Background: the May 2026 Global_Markets audit showed Kuwait/Qatar/UAE/
-South Africa/Egypt/Israel listings (MABANEE.KW, OOREDOO.KW, ANG.JSE,
-MTN.JSE, etc.) reaching the sheet tagged as NASDAQ / USD / USA because
-Yahoo's `info.exchange`, `info.currency`, and `info.country` were
-empty for those tickers. The engine's defensive correction in
-`enriched_quote.py` v4.6.0 catches this downstream, but plugging the
-hole at the source is cleaner and gives a single point of audit.
-
-New:
-  - `_infer_symbol_metadata_external`: optional binding to
-    `normalize.infer_symbol_metadata()` (the v5.3.0+ SSOT used by
-    `enriched_quote.py` v4.6.0). When the import succeeds, the provider
-    delegates to it for identity inference.
-  - `_SUFFIX_TO_LOCALE_DEFAULTS`: 64-entry mapping of Yahoo suffixes
-    to `(exchange, currency, country)` — byte-identical structure to
-    enriched_quote v4.6.0 `_SUFFIX_TO_LOCALE`. Used as fallback when
-    normalize.py SSOT is unavailable. Covers GCC (.KW, .QA, .AE, .DFM,
-    .ADX, .SR, .EG, .EGX), MENA (.TA, .TASE, .IS), Europe (.L, .LSE,
-    .DE, .PA, .AS, .MI, .MC, .BR, .LS, .HE, .ST, .OL, .SW, .CO, .IR,
-    .WA, .VI, .PR, .BD, .AT), Asia-Pacific (.HK, .NS, .NSE, .BO, .T,
-    .TYO, .KS, .KQ, .SI, .KL, .BK, .JK, .SS, .SZ, .TW, .TWO, .AX, .NZ),
-    Americas (.SA, .MX, .BA, .TO, .V, .CN, .NE, .SN, .LM), and Africa
-    (.JO, .JSE).
-  - `_identity_defaults_for_symbol(symbol)`: returns a dict with
-    `exchange`, `currency`, `country`, `asset_class` keys derived from
-    the symbol's suffix structure. Resolution order: special patterns
-    (=F, =X, ^) first; then SSOT delegation; then longest-match suffix
-    in `_SUFFIX_TO_LOCALE_DEFAULTS`; then plain-alpha-as-US-equity
-    convention; finally all None for unknown formats.
-
-Modified:
-  - `_infer_asset_class`: when Yahoo's `quoteType` is blank, falls
-    through to `_identity_defaults_for_symbol` so 60+ stock-exchange
-    suffixes return `EQUITY` (previously only `.SR` did).
-  - `_infer_exchange`: same fallthrough for exchange-display names.
-    MABANEE.KW now returns "Boursa Kuwait" instead of None.
-  - `_enrich_data`: identity block now adds a `country` field to the
-    patch shape (NEW — was absent in v8.1.0) and fills blank
-    `currency` / `exchange` / `country` from the suffix-derived defaults
-    when Yahoo's `info` left them empty. Yahoo's own values always win
-    when present.
-
-Bumped:
-  - `PROVIDER_VERSION = "8.2.0"`.
-
-NOT changed (deliberate):
-  - v8.1.0 FX-symbol fix (bare 6-letter pairs -> `=X`) preserved verbatim.
-  - v8.0.0 fixes (period/interval config, shared executor, real metadata)
-    preserved verbatim.
-  - Direct Yahoo Chart API fallback for futures (deferred to v8.3.0).
-  - Patch shape is additive only: existing fields keep their values,
-    `country` is added. Downstream consumers see one more key, never
-    a missing or renamed one.
-
-v8.1.0 Changes (from v8.0.0)
-----------------------------
-Surgical FX-symbol fix. Tadawul Tracker user reported the entire
-Commodities_FX sheet was filling with placeholder rows for symbols like
-AUDCAD, EURUSD, USDSAR, NZDJPY, USDTRY -- the engine got `None` back
-from `fetch_enriched_quote` and `data_engine_v2._compute_scores_fallback`
-filled the gap with synthetic data (101/102/103-style forecasts and
-9700% ROIs).
-
-Root cause: `normalize_symbol("AUDCAD")` returned `"AUDCAD"` unchanged.
-Yahoo Finance requires the `=X` suffix for currency pairs, so
-`yf.Ticker("AUDCAD").history()` returned an empty DataFrame, which
-collapsed all the way back to the engine's placeholder fallback.
-
-Bug fix:
-  - `normalize_symbol` now detects bare 6-letter currency-pair tokens
-    (where both the base and quote are in a known-currency set) and
-    appends `=X` so yfinance can actually resolve them. KSA codes,
-    crypto pseudo-pairs (BTCUSD), already-suffixed FX (EURUSD=X),
-    futures (GC=F), indices (^GSPC), and US stocks remain untouched.
-
-New helpers:
-  - `_BARE_FX_RE`: compiled regex matching exactly six A-Z chars.
-  - `_KNOWN_CURRENCIES`: frozenset of ISO 4217 codes for currencies
-    that appear on Tadawul-tracked sheets and major global pairs.
-    Includes GCC currencies (SAR, AED, QAR, KWD, BHD, OMR), majors
-    (USD, EUR, GBP, JPY, CHF, CAD, AUD, NZD), regional emerging
-    (TRY, EGP, ILS, ZAR), and other commonly-traded codes.
-  - `_is_likely_fx_pair(symbol)`: returns True when both halves of a
-    6-letter token are recognized currencies. Two-half membership test
-    (rather than a string-prefix scan) keeps the function O(1) on the
-    32-currency table while staying safe against 6-letter US tickers
-    that happen to start with `USD` or end with `EUR`.
-
-Bumped:
-  - `PROVIDER_VERSION = "8.1.0"`.
-  - Module docstring now documents the v8.1.0 changes.
-
-NOT changed (deliberate scope limit):
-  - Direct Yahoo Chart API fallback for futures (=F symbols) is
-    deferred to v8.2.0. yfinance fails on Render's egress IP for
-    GC=F / SI=F / CL=F because Yahoo rate-limits those requests, and
-    fixing it requires adding an httpx-based fallback to
-    query1.finance.yahoo.com/v8/finance/chart/{SYMBOL} with proper
-    headers + JSON parsing. That is a 200+ line change. Keeping v8.1.0
-    surgical so the FX fix can ship and be verified independently.
-  - Placeholder injection in `data_engine_v2._compute_scores_fallback`
-    is upstream of this provider and lives in a different file.
-
-v8.0.0 Changes (carried over)
------------------------------
-Bug fixes:
-  - `_fetch_ticker_sync` now accepts period/interval from config. v7.0.0
-    had the fossil expression
-      period=_HAS_PANDAS and pd is not None and "YAHOO_HISTORY_PERIOD"
-             in globals() or "2y"
-    which always evaluated to the string literal "2y" -- regardless of
-    YahooConfig.history_period, YAHOO_HISTORY_PERIOD env var, or anything
-    else. `interval` was hardcoded "1d" too. Both are now config-driven.
-  - `_safe_history_metadata(None)` placeholder removed. v7.0.0 called this
-    with None (comment: "Placeholder"), got back {} every time, and fed
-    an empty dict to `_infer_asset_class` / `_infer_exchange`. Metadata is
-    now extracted from the live ticker inside `_fetch_ticker_sync` and
-    flowed through the pipeline.
-  - `fetch_history` no longer leaks a fresh `ThreadPoolExecutor` on every
-    call. Uses the provider's shared executor instead, and respects the
-    config's thread-pool sizing and shutdown semantics.
-  - Module-level `_PROVIDER_LOCK` is now lazy-initialized (parity with
-    other v6 providers).
-  - The `_trace` decorator used `@functools.wraps` without importing
-    `functools`. It was never applied, so this never fired -- but any
-    attempt to use it would raise NameError. Removed (was dead code).
-
-Cleanup:
-  - Removed unused imports: `cast`, `Union`, `functools`.
-  - Removed dead helpers: `_trace` decorator, `_TraceContext` class,
-    `_json_dumps` (defined but never called anywhere).
-  - `_safe_history_metadata` simplified: no longer loops over
-    single-element tuples.
-  - `_enrich_data` deduplicates the `_first_number` calls for
-    `open_price`/`open` (computed once).
-  - Early-return from `get_enriched_quote` when `normalize_symbol("")`
-    yields an empty string (avoids a pointless cache lookup).
-
-Preserved for backward compatibility:
-  - Every name in __all__.
-  - All environment variable names and defaults.
-  - Patch shape (all price, fundamentals, risk, forecast fields).
-  - Prometheus metrics integration (with DummyMetric fallback).
-  - Optional numpy/pandas/yfinance/orjson/prometheus/opentelemetry support.
-  - Provider singleton + engine-facing functions.
-  - KSA `.SR` symbol handling and Arabic-digit parsing.
+Version: PROVIDER_VERSION = "6.6.0". All prior WHYs (in this header and in
+the guard-section comments below) preserved verbatim. Zero functions
+removed (AST-verified).
 ================================================================================
+(v6.3.1 header retained below)
+================================================================================
+Yahoo Finance Fundamentals Provider -- v6.3.1
+================================================================================
+v6.3.1 hotfix (over v6.3.0). Four audit fixes; output shape additive-only:
+
+  1. (HIGH) No false default HOLD. v6.3.0's _blocking_fetch always set
+     "recommendation": map_recommendation(raw_rec_key); since
+     map_recommendation(None) -> "HOLD", a symbol with NO Yahoo
+     recommendationKey emitted a fake HOLD that data_engine_v2 could
+     capture as a provider rating (reopening the v5.77.17 corruption).
+     Now: recommendation is emitted ONLY when Yahoo supplied a real
+     rating key (else None -> stripped by clean_patch -> field absent).
+
+  2. (MED) Substring precedence. map_recommendation("underperform_rating")
+     returned HOLD because the generic "perform" token was tested before
+     "underperform". The substring pass now iterates a length-descending
+     view of the vocab (_RECO_VOCAB_BY_LEN) so longer/more-specific tokens
+     win. Exact-match pass is unchanged. Same fix in extract_provider_rating.
+
+  3. (MED/HIGH) SSOT symbol formatting for the yfinance call. The symbol
+     sent to yf.Ticker came from this file's local normalize_symbol, which
+     passes EODHD-style suffixes (.NSE/.XETRA/.AU/.KO) straight through --
+     Yahoo can't resolve those, so international fundamentals came back
+     empty. Now binds to_yahoo_symbol from the same normalize SSOT used
+     for identity, with a local EODHD->Yahoo suffix-remap fallback if the
+     import fails, and uses it for the ACTUAL yfinance symbol. Output
+     keeps requested_symbol/symbol = canonical; provider_symbol = the
+     Yahoo-formatted symbol actually queried.
+
+  4. (OPTIONAL) Added EODHD-format .AU (ASX) and .KO (KRX) to the local
+     _SUFFIX_TO_LOCALE_DEFAULTS fallback table (it already had .AX/.KS).
+
+Purpose: Fallback fundamentals/profile source. EODHD remains primary for global
+equities and yahoo_chart remains primary for Yahoo-style quote/history data.
+(Header changelog condensed for working copy; behaviour preserved verbatim.)
 """
 
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
+import hashlib
 import json
 import logging
 import math
 import os
+import pickle
 import random
 import re
-import statistics
 import time
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from enum import Enum
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logger = logging.getLogger("core.providers.yahoo_fundamentals_provider")
+logger.addHandler(logging.NullHandler())
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+PROVIDER_NAME = "yahoo_fundamentals"
+PROVIDER_VERSION = "6.7.0"
+VERSION = PROVIDER_VERSION
+PROVIDER_BATCH_SUPPORTED = True
+
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+_KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
+_ARABIC_DIGITS = str.maketrans("\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669", "0123456789")
+_K_M_B_T_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMBT])$", re.IGNORECASE)
+_K_M_B_T_MULT = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
+
+DEFAULT_USER_AGENT_ROTATION = True
+DEFAULT_PRICE_SANITY_GUARD = True
+DEFAULT_RETRY_ATTEMPTS = 4
+DEFAULT_PRICE_RATIO_HIGH = 8.0
+DEFAULT_PRICE_RATIO_LOW = 0.125
+
+_USER_AGENTS: Tuple[str, ...] = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 "
+    "Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.2210.144",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 "
+    "Firefox/121.0",
+)
+
+_RATE_LIMIT_MARKERS: Tuple[str, ...] = (
+    "403", "429", "forbidden", "rate limit", "too many requests",
+    "unauthorized", "401",
+)
 
 # =============================================================================
 # Optional Dependencies (prod-safe)
 # =============================================================================
 
 try:
-    import numpy as np  # type: ignore
-    _HAS_NUMPY = True
+    from redis.asyncio import Redis  # type: ignore
+    _REDIS_AVAILABLE = True
 except ImportError:
-    np = None  # type: ignore[assignment]
-    _HAS_NUMPY = False
+    Redis = None  # type: ignore[assignment]
+    _REDIS_AVAILABLE = False
 
 try:
-    import pandas as pd  # type: ignore
-    _HAS_PANDAS = True
+    from prometheus_client import Counter, Gauge, Histogram  # type: ignore
+    _PROMETHEUS_AVAILABLE = True
 except ImportError:
-    pd = None  # type: ignore[assignment]
-    _HAS_PANDAS = False
+    Counter = Gauge = Histogram = None  # type: ignore[assignment]
+    _PROMETHEUS_AVAILABLE = False
 
 try:
     import yfinance as yf  # type: ignore
@@ -451,48 +225,20 @@ except ImportError:
     yf = None  # type: ignore[assignment]
     _HAS_YFINANCE = False
 
-# v8.7.0 (YC-RAW): httpx powers the crumb-free raw chart transport. Already
-# a production dependency (eodhd_provider). Guarded like yfinance so the
-# module imports cleanly without it (raw path then self-disables).
 try:
-    import httpx  # type: ignore
-    _HAS_HTTPX = True
+    import requests  # type: ignore
+    _HAS_REQUESTS = True
 except ImportError:
-    httpx = None  # type: ignore[assignment]
-    _HAS_HTTPX = False
+    requests = None  # type: ignore[assignment]
+    _HAS_REQUESTS = False
 
-# Prometheus metrics (optional)
-try:
-    from prometheus_client import Counter, Gauge, Histogram, REGISTRY  # type: ignore
-    _HAS_PROM = True
-except ImportError:
-    Counter = None  # type: ignore[assignment]
-    Gauge = None  # type: ignore[assignment]
-    Histogram = None  # type: ignore[assignment]
-    REGISTRY = None  # type: ignore[assignment]
-    _HAS_PROM = False
-
-# OpenTelemetry (optional)
-try:
-    from opentelemetry import trace  # type: ignore
-    _HAS_OTEL = True
-except ImportError:
-    trace = None  # type: ignore[assignment]
-    _HAS_OTEL = False
 
 # =============================================================================
-# v8.2.0: Optional Identity SSOT (normalize.py v5.3.0+)
+# v6.2.0: Optional Identity SSOT (normalize.py v5.3.0+)
 # =============================================================================
-#
-# The PRIMARY path for symbol -> (exchange, currency, country) inference
-# delegates to core/symbols/normalize.py::infer_symbol_metadata() -- the
-# same SSOT used by enriched_quote.py v4.6.0. When that import fails
-# (running against an older normalize.py, or no core package on path),
-# we fall through to the local _SUFFIX_TO_LOCALE_DEFAULTS table further
-# down in this module.
 
 _infer_symbol_metadata_external: Optional[Callable[[str], Dict[str, Any]]] = None
-_to_yahoo_symbol_external: Optional[Callable[[str], str]] = None  # v8.4.0
+_to_yahoo_symbol_external: Optional[Callable[[str], str]] = None
 for _norm_path in (
     "core.symbols.normalize",
     "core.normalize",
@@ -500,15 +246,15 @@ for _norm_path in (
     "normalize",
 ):
     try:
-        _norm_mod_v82 = __import__(_norm_path, fromlist=["infer_symbol_metadata"])
-        _fn_v82 = getattr(_norm_mod_v82, "infer_symbol_metadata", None)
-        if callable(_fn_v82):
-            _infer_symbol_metadata_external = _fn_v82
-            # v8.4.0: bind to_yahoo_symbol from the SAME module so the
-            # yf.Ticker call receives Yahoo-format symbols (BBD, not BBD.US).
-            _fn_y84 = getattr(_norm_mod_v82, "to_yahoo_symbol", None)
-            if callable(_fn_y84):
-                _to_yahoo_symbol_external = _fn_y84
+        _norm_mod_v62 = __import__(_norm_path, fromlist=["infer_symbol_metadata"])
+        _fn_v62 = getattr(_norm_mod_v62, "infer_symbol_metadata", None)
+        if callable(_fn_v62):
+            _infer_symbol_metadata_external = _fn_v62
+            # v6.3.1: bind to_yahoo_symbol from the SAME module so the
+            # yfinance call uses Yahoo-format suffixes (.NS/.DE/...).
+            _fn_y = getattr(_norm_mod_v62, "to_yahoo_symbol", None)
+            if callable(_fn_y):
+                _to_yahoo_symbol_external = _fn_y
             break
     except ImportError:
         continue
@@ -516,10 +262,12 @@ for _norm_path in (
         continue
 
 
-# v8.4.0: EODHD->Yahoo remap used ONLY when the SSOT import failed. Unlike
-# the fundamentals provider's local map, this one also strips the `.US`
-# suffix (Yahoo US tickers are bare) — the gap that caused the 404 storm.
-_YC_EODHD_TO_YAHOO_LOCAL: Dict[str, str] = {
+# v6.3.1: local EODHD->Yahoo suffix remap, used ONLY as a fallback for the
+# actual yfinance symbol when the normalize SSOT (to_yahoo_symbol) can't be
+# imported. Keeps the provider self-sufficient: an import failure must not
+# silently send Yahoo a suffix it can't resolve. Only the genuinely-divergent
+# suffixes are listed; everything else passes through unchanged.
+_EODHD_TO_YAHOO_LOCAL: Dict[str, str] = {
     "NSE": "NS",     # India NSE   -> Yahoo .NS
     "BSE": "BO",     # India BSE   -> Yahoo .BO
     "XETRA": "DE",   # Germany     -> Yahoo .DE
@@ -528,28 +276,28 @@ _YC_EODHD_TO_YAHOO_LOCAL: Dict[str, str] = {
 }
 
 
-def _yc_local_to_yahoo(sym: str) -> str:
-    s = (sym or "").strip()
-    if not s or any(ch in s for ch in "=^-") or "." not in s:
+def _local_to_yahoo_symbol(norm_symbol: str) -> str:
+    """Fallback EODHD->Yahoo remap (used only when the SSOT import failed)."""
+    s = (norm_symbol or "").strip()
+    if not s or "." not in s:
         return s
     base, _, suf = s.rpartition(".")
     if not base:
         return s
-    su = suf.upper()
-    if su == "US":
-        return base
-    remapped = _YC_EODHD_TO_YAHOO_LOCAL.get(su)
+    remapped = _EODHD_TO_YAHOO_LOCAL.get(suf.upper())
     return f"{base}.{remapped}" if remapped else s
 
 
-def _yc_yahoo_symbol(sym: str) -> str:
-    """v8.4.0: Yahoo-format symbol for the ACTUAL yf.Ticker call only.
-    Gated by TFB_YC_SYMBOL_MAP (default ON; 0/false/off -> raw passthrough,
-    byte-identical to v8.3.0). Never returns empty."""
-    s = (sym or "").strip()
+def _to_yahoo_provider_symbol(norm_symbol: str) -> str:
+    """
+    v6.3.1: Yahoo-format symbol for the ACTUAL yf.Ticker call.
+
+    Prefers the normalize SSOT (to_yahoo_symbol); falls back to the local
+    suffix remap above. Never returns empty -- if everything fails, the
+    original normalized symbol is returned unchanged (status-quo behaviour).
+    """
+    s = (norm_symbol or "").strip()
     if not s:
-        return s
-    if os.getenv("TFB_YC_SYMBOL_MAP", "1").strip().lower() in ("0", "false", "off"):
         return s
     if _to_yahoo_symbol_external is not None:
         try:
@@ -558,1190 +306,629 @@ def _yc_yahoo_symbol(sym: str) -> str:
                 return y
         except Exception:
             pass
-    return _yc_local_to_yahoo(s)
+    return _local_to_yahoo_symbol(s)
+
 
 # =============================================================================
-# Logging
+# Provider-identity guard (v6.4.0)
 # =============================================================================
+# WHY: yfinance's `info` is consumed without verifying it belongs to the symbol
+# we asked for. For some Tadawul instruments (e.g. the sukuk 5023.SR) Yahoo
+# returns a DIFFERENT company's record entirely -- in the live 2026-06-28 audit,
+# 5023.SR came back carrying Apple Inc.'s identity and fundamentals (name,
+# sector, $4.17T market cap, P/E, EPS) while the correct par price arrived
+# separately from yahoo_chart. The fundamentals block then wrote Apple's
+# identity onto the sukuk row. This guard compares the returned ticker against
+# the one queried and, on a CLEAR base-ticker mismatch, discards the wrong-
+# instrument `info` so the row falls back to its correct no-fundamentals state
+# (price-only) instead of impersonating another company.
+# SAFETY: conservative + gated. Only fires when BOTH the requested and returned
+# base tickers are present AND differ; a missing/own-symbol response is left
+# untouched (status-quo). Gated OFF by default (TFB_FUND_IDENTITY_GUARD) so it
+# cannot blank a valid holding's fundamentals until explicitly enabled and
+# verified on a live run; set the env to 1/true/on/yes to enable.
+# v6.6.0 ADDENDUM: after 9 days of verified-safe semantics and a live audit
+# showing daily wrong-name writes with the guard dormant, the default is now ON;
+# the env is retained as the kill switch (=0). See the v6.6.0 WHY at top of file.
 
-logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())
-
-# =============================================================================
-# Constants
-# =============================================================================
-
-PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.8.0"
-VERSION = PROVIDER_VERSION
-PROVIDER_BATCH_SUPPORTED = True
-
-_RIYADH_TZ = timezone(timedelta(hours=3))
-
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
-_FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
-
-_KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
-_FX_PAIR_RE = re.compile(r"^([A-Z]{6})=X$")
-_ARABIC_DIGITS = str.maketrans("\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669", "0123456789")
-_K_M_B_T_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMBT])$", re.IGNORECASE)
-_K_M_B_T_MULT = {"K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0, "T": 1_000_000_000_000.0}
-
-# v8.1.0: bare-6-letter FX pair detection
-# ----------------------------------------
-# Regex matches symbols that are exactly six A-Z characters with nothing
-# else attached (no `=X`, no `=F`, no `.`, no digit).
-_BARE_FX_RE = re.compile(r"^[A-Z]{6}$")
-
-# ISO 4217 codes for currencies the Tadawul Tracker pages reference, plus
-# the global majors. A 6-letter token only converts to `=X` when BOTH the
-# 3-letter base and 3-letter quote are members of this set, which keeps
-# us safe from collisions with 6-letter US/global stock tickers.
-_KNOWN_CURRENCIES = frozenset({
-    # Majors
-    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD",
-    # GCC + regional
-    "SAR", "AED", "QAR", "KWD", "BHD", "OMR", "EGP", "TRY", "ILS",
-    # Asia
-    "CNY", "HKD", "SGD", "INR", "KRW", "THB", "MYR", "IDR", "PHP", "TWD",
-    # Other commonly-traded
-    "ZAR", "MXN", "BRL", "RUB", "PLN", "SEK", "NOK", "DKK", "CZK", "HUF",
-})
+def _fund_identity_guard_enabled() -> bool:
+    """Provider-identity guard master switch. v6.6.0: DEFAULT ON -- the
+    2026-07-07 audit found fresh wrong-company names written daily while
+    this guard sat dormant. Set TFB_FUND_IDENTITY_GUARD=0/false/off/no to
+    disable (restores the pre-v6.6.0 unguarded behavior)."""
+    return (os.getenv("TFB_FUND_IDENTITY_GUARD") or "1").strip().lower() in {"1", "true", "on", "yes"}
 
 
-def _is_likely_fx_pair(symbol: str) -> bool:
-    """
-    Detect a bare 6-letter currency pair token (e.g. ``AUDCAD``,
-    ``USDSAR``, ``EURJPY``). Returns True iff:
-
-      * `symbol` is exactly six A-Z characters, AND
-      * the first three (base) AND last three (quote) are both in
-        ``_KNOWN_CURRENCIES``.
-
-    Both-halves membership is what makes this safe: a 6-letter US stock
-    ticker would have to coincidentally split into two known ISO codes
-    AND both halves would have to match -- which doesn't happen for any
-    real ticker we've seen. KSA equities use the `.SR` suffix and never
-    reach this check (they hit `_KSA_CODE_RE` first). Crypto symbols
-    like ``BTCUSD`` are not matched because ``BTC`` is not an ISO 4217
-    currency code in our table.
-    """
-    if not _BARE_FX_RE.match(symbol):
-        return False
-    base = symbol[:3]
-    quote = symbol[3:]
-    return base in _KNOWN_CURRENCIES and quote in _KNOWN_CURRENCIES
+def _fund_price_coherence_enabled() -> bool:
+    """v6.6.0 YF-2 / v6.7.0 YF-2b: own-history price-coherence guard.
+    DEFAULT ON since v6.7.0 (the 2026-07-12/13 GM crossings ran with it
+    dark); set TFB_FUND_PRICE_COHERENCE_GUARD=0/false/off/no to disable.
+    v6.7.0 YF-3: conviction uses the TIGHT cross-response band
+    (_fund_price_band_high/low, default 2.0/0.5) -- two same-day responses
+    for the same instrument cannot legitimately disagree 2x."""
+    return (os.getenv("TFB_FUND_PRICE_COHERENCE_GUARD") or "1").strip().lower() in {"1", "true", "on", "yes"}
 
 
-DEFAULT_TIMEOUT_SEC = 20.0
-DEFAULT_QUOTE_TTL_SEC = 15.0
-DEFAULT_HISTORY_TTL_SEC = 300.0
-DEFAULT_MAX_CONCURRENCY = 24
-DEFAULT_RATE_LIMIT_PER_SEC = 10.0
-DEFAULT_RATE_LIMIT_BURST = 20
-DEFAULT_CB_FAIL_THRESHOLD = 6
-DEFAULT_CB_COOLDOWN_SEC = 30.0
-DEFAULT_CB_SUCCESS_THRESHOLD = 3
-DEFAULT_THREADPOOL_WORKERS = 6
-DEFAULT_HISTORY_PERIOD = "2y"
-DEFAULT_HISTORY_INTERVAL = "1d"
-
-# -----------------------------------------------------------------------------
-# v8.3.0: Yahoo history rate-limit retry (bounded, gated default-OFF)
-# -----------------------------------------------------------------------------
-# WHY: fetch_history_raw() previously caught ANY exception from
-# yfinance.Ticker.history() -- including Yahoo's transient "Too Many Requests.
-# Rate limited." -- logged a warning, and returned [] with no retry. A burst of
-# history fetches (a full Market_Leaders scan fires 200+) trips Yahoo's limiter,
-# so dozens of symbols lost their ENTIRE price history in one pass; with no
-# history the technical / momentum / volatility factors default and the score
-# skews low (-> SELL). This adds a bounded retry+backoff so transient throttling
-# is recovered instead of silently dropping data. Gated by TFB_YF_HISTORY_RETRY
-# (default OFF -> exactly one attempt, byte-identical to v8.2.0). Every knob is
-# bounded so retry latency cannot run away against the ~100s Render edge
-# timeout. Retries fire ONLY on rate-limit errors; genuine delisted/no-data
-# symbols still return [] on the first try.
-DEFAULT_YF_HISTORY_RETRY_ATTEMPTS = 3      # total tries when gate ON (1 try + 2 retries)
-DEFAULT_YF_HISTORY_RETRY_BASE_SEC = 0.5    # base backoff seconds (exponential)
-DEFAULT_YF_HISTORY_RETRY_CAP_SEC = 2.0     # per-attempt backoff ceiling (seconds)
-
-
-def _yc_identity_guard_enabled() -> bool:
-    """v8.6.0 YC-1/YC-2: response-identity guard master switch.
-    DEFAULT ON (documented control, violated live 2026-07-07: 7010.SR
-    served a crossed price). Set TFB_CHART_IDENTITY_GUARD=0 to restore
-    v8.5.0 byte-identical passthrough."""
-    return (os.getenv("TFB_CHART_IDENTITY_GUARD") or "1").strip().lower() in {"1", "true", "on", "yes"}
-
-
-def _yc_coherence_guard_enabled() -> bool:
-    """v8.6.0 YC-3: live-info price vs own-history last close unit-class
-    coherence guard. DEFAULT OFF; set TFB_CHART_PRICE_COHERENCE_GUARD=1
-    to enable."""
-    return (os.getenv("TFB_CHART_PRICE_COHERENCE_GUARD") or "0").strip().lower() in {"1", "true", "on", "yes"}
-
-
-def _yc_coh_ratio_high() -> float:
+def _fund_price_band_high() -> float:
+    """v6.7.0 YF-3: upper conviction ratio for YF-2's info-vs-own-history
+    check (default 2.0, floored at 1.25 so a mis-set env can never convict
+    an ordinary daily move). Distinct from YF_PRICE_RATIO_HIGH (8.0), which
+    keeps guarding the unit-class checks (52W bounds / sanity)."""
     try:
-        v = float(os.getenv("TFB_CHART_PRICE_RATIO_HIGH") or 8.0)
+        v = float(os.getenv("TFB_FUND_PRICE_BAND_HIGH", "") or 2.0)
     except Exception:
-        v = 8.0
-    return v if v > 1.0 else 8.0
+        v = 2.0
+    return v if v >= 1.25 else 1.25
 
 
-def _yc_coh_ratio_low() -> float:
+def _fund_price_band_low() -> float:
+    """v6.7.0 YF-3: lower conviction ratio (default 0.5, ceiling 0.8)."""
     try:
-        v = float(os.getenv("TFB_CHART_PRICE_RATIO_LOW") or 0.125)
+        v = float(os.getenv("TFB_FUND_PRICE_BAND_LOW", "") or 0.5)
     except Exception:
-        v = 0.125
-    return v if 0.0 < v < 1.0 else 0.125
+        v = 0.5
+    return v if 0.0 < v <= 0.8 else 0.5
 
 
-def _yc_identity_base(s: Any) -> str:
-    """v8.6.0: comparable base ticker — uppercase, drop the suffix after
-    the LAST dot, strip non-alphanumerics, strip leading zeros when the
-    result is all-digit ('0016.HK' -> '16', 'BRK-B'/'BRK.B' -> 'BRKB'/'BRK'
-    both intersect via the full-string form below)."""
+def _ticker_identity_base(s: Any) -> str:
+    """Comparable base ticker: uppercase, drop the exchange suffix after the
+    LAST dot, strip non-alphanumerics. '5023.SR'->'5023', 'AAPL'->'AAPL',
+    'RCI.US'->'RCI', 'BRK-B'->'BRKB'. Empty string when nothing usable."""
     t = str(s if s is not None else "").strip().upper()
     if not t:
         return ""
-    out = set()
-    for cand in ({t, t.rsplit(".", 1)[0]} if "." in t else {t}):
-        tok = "".join(ch for ch in cand if ch.isalnum())
-        if tok.isdigit():
-            tok = tok.lstrip("0") or "0"
-        if tok:
-            out.add(tok)
-    return "|".join(sorted(out))
+    if "." in t:
+        t = t.rsplit(".", 1)[0]
+    return re.sub(r"[^A-Z0-9]", "", t)
 
 
-def _yc_tokens(s: Any) -> set:
-    b = _yc_identity_base(s)
-    return set(b.split("|")) if b else set()
-
-
-def _yc_declared_identity_mismatch(
-    requested_yahoo: str,
-    info: Optional[Dict[str, Any]],
-    meta: Optional[Dict[str, Any]],
-) -> Optional[str]:
-    """v8.6.0 YC-1: compare every identity the response set declares about
-    itself against the requested (Yahoo-mapped) symbol. Lenient: nothing
-    declared -> None; any declared token-set intersecting the requested
-    token-set -> None; only when ALL present declared identities are
-    fully disjoint -> the first observed declared identity (definite
-    crossing)."""
-    want = _yc_tokens(requested_yahoo)
-    if not want:
-        return None
-    declared: List[str] = []
-    for src_d in (info, meta):
-        if isinstance(src_d, dict):
-            for key in ("symbol", "underlyingSymbol", "quoteSymbol"):
-                v = src_d.get(key)
-                s = str(v if v is not None else "").strip()
-                if s:
-                    declared.append(s)
-    if not declared:
-        return None
-    for s in declared:
-        if _yc_tokens(s) & want:
-            return None
-    return declared[0]
-
-
-def _yf_history_retry_enabled() -> bool:
-    """True iff TFB_YF_HISTORY_RETRY is explicitly enabled (default OFF)."""
-    raw = (os.getenv("TFB_YF_HISTORY_RETRY") or "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
-
-
-def _yf_history_retry_attempts() -> int:
-    """
-    Total history-fetch attempts. Returns 1 when the gate is OFF so the fetch
-    path is byte-identical to v8.2.0 (single attempt, no retry). When ON,
-    returns the configured count bounded to [1, 5].
-    """
-    if not _yf_history_retry_enabled():
-        return 1
-    try:
-        n = int(float(
-            (os.getenv("TFB_YF_HISTORY_RETRY_ATTEMPTS")
-             or str(DEFAULT_YF_HISTORY_RETRY_ATTEMPTS)).strip()
-        ))
-    except Exception:
-        n = DEFAULT_YF_HISTORY_RETRY_ATTEMPTS
-    return max(1, min(5, n))
-
-
-def _yf_history_retry_base_sec() -> float:
-    """Base backoff seconds (exponential), bounded to [0.05, 3.0]."""
-    try:
-        v = float(
-            (os.getenv("TFB_YF_HISTORY_RETRY_BASE_SEC")
-             or str(DEFAULT_YF_HISTORY_RETRY_BASE_SEC)).strip()
-        )
-    except Exception:
-        v = DEFAULT_YF_HISTORY_RETRY_BASE_SEC
-    return max(0.05, min(3.0, v))
-
-
-def _yf_history_retry_cap_sec() -> float:
-    """Per-attempt backoff ceiling in seconds, bounded to [0.1, 8.0]."""
-    try:
-        v = float(
-            (os.getenv("TFB_YF_HISTORY_RETRY_CAP_SEC")
-             or str(DEFAULT_YF_HISTORY_RETRY_CAP_SEC)).strip()
-        )
-    except Exception:
-        v = DEFAULT_YF_HISTORY_RETRY_CAP_SEC
-    return max(0.1, min(8.0, v))
-
-
-def _is_rate_limit_error(exc: Any) -> bool:
-    """
-    Heuristic: does this exception look like a Yahoo/yfinance rate-limit error?
-    yfinance raises with messages like "Too Many Requests. Rate limited. Try
-    after a while." We retry ONLY these; genuine delisted/no-data errors must
-    NOT be retried (they will never succeed and would waste the retry budget).
-    """
-    try:
-        msg = str(exc).lower()
-    except Exception:
+def _identity_mismatch(requested: str, returned: Any) -> bool:
+    """True iff the guard is enabled AND both base tickers are present AND they
+    clearly differ. Conservative: any absent side returns False (no discard)."""
+    if not _fund_identity_guard_enabled():
         return False
+    req = _ticker_identity_base(requested)
+    ret = _ticker_identity_base(returned)
+    if not req or not ret:
+        return False
+    return req != ret
+
+
+# =============================================================================
+# v6.5.0 locale cross-check
+# =============================================================================
+# WHY (live 2026-06-29 audit): the v6.4.0 symbol-base guard only catches records
+# where Yahoo stamps a DIFFERENT ticker on the wrong-instrument `info`. With
+# TFB_FUND_IDENTITY_GUARD=1 already enabled, yf.Ticker("5023.SR").info returned
+# Apple Inc.'s full record (name, Technology sector, ~$4.17T market cap,
+# P/E/EPS/revenue) but carried info["symbol"] == "5023.SR" -- the REQUESTED
+# ticker -- so _identity_mismatch saw base "5023" == "5023" and passed the wrong
+# record straight through (that row showed NO provider_identity_mismatch warning,
+# confirming the symbol-base check never fired). A symbol-vs-symbol compare can
+# not detect a right-symbol / wrong-everything-else record.
+#
+# The robust, instrument-agnostic signal is LOCALE: an exchange-suffixed symbol
+# (".SR" -> Tadawul/SAR/Saudi Arabia) must not come back denominated in another
+# country's currency. Apple's record is USD/United States; the sukuk is
+# SAR/Saudi Arabia. The check discards `info` only when the suffix implies a
+# known locale AND the returned record clearly contradicts it.
+#
+# SAFETY (cannot blank a valid holding):
+#   * Only symbols whose suffix is in _SUFFIX_TO_LOCALE_DEFAULTS are checked.
+#     Plain US tickers, ".US", "=F"/"=X"/"^" carry no suffix-locale and are never
+#     locale-checked (they still get the v6.4.0 symbol-base check).
+#   * Currency is the primary signal and is decisive when present: GBp/GBX pence
+#     notation is normalized to GBP, so a London ".L" stock returning GBP rather
+#     than GBp is NOT a mismatch. All EUR suffixes share EUR.
+#   * Country is used ONLY as a fallback when the returned record has no
+#     currency, and US synonyms (USA/US/United States) are canonicalized, so a
+#     US record never trips against a US expectation.
+#   * Same master switch as v6.4.0 (TFB_FUND_IDENTITY_GUARD); OFF => None, no-op.
+# For the current book this fires on 5023.SR (USD/US vs SAR/Saudi) ONLY; every
+# real ".SR" holding returns SAR and is left untouched.
+
+def _norm_ccy_token(x: Any) -> str:
+    """Upper-case ISO currency token; collapse UK pence (GBp/GBX) to GBP so
+    pence and pounds compare equal. '' when nothing usable."""
+    t = re.sub(r"[^A-Z]", "", str(x if x is not None else "").strip().upper())
+    if not t:
+        return ""
+    if t == "GBX" or t.startswith("GBP"):
+        return "GBP"
+    return t
+
+
+_US_COUNTRY_TOKENS = {"US", "USA", "UNITEDSTATES", "UNITEDSTATESOFAMERICA"}
+
+
+def _norm_country_token(x: Any) -> str:
+    """Upper-case alphanumeric country token; canonicalize US synonyms. '' when
+    nothing usable."""
+    t = re.sub(r"[^A-Z0-9]", "", str(x if x is not None else "").strip().upper())
+    if not t:
+        return ""
+    if t in _US_COUNTRY_TOKENS:
+        return "US"
+    return t
+
+
+def _expected_locale_for_symbol(requested: str) -> Tuple[str, str]:
+    """(expected_currency, expected_country) implied by the symbol's exchange
+    suffix via _SUFFIX_TO_LOCALE_DEFAULTS, or ('', '') when the suffix carries no
+    known locale (US/plain, '=F', '=X', '^', or an unrecognized suffix). Longest
+    matching suffix wins."""
+    s = str(requested if requested is not None else "").strip().upper()
+    if not s or s.endswith("=F") or s.endswith("=X") or s.startswith("^"):
+        return "", ""
+    best_suffix: Optional[str] = None
+    for suf in _SUFFIX_TO_LOCALE_DEFAULTS:
+        if s.endswith(suf):
+            if best_suffix is None or len(suf) > len(best_suffix):
+                best_suffix = suf
+    if best_suffix is None:
+        return "", ""
+    _exch, curr, country = _SUFFIX_TO_LOCALE_DEFAULTS[best_suffix]
+    return _norm_ccy_token(curr), _norm_country_token(country)
+
+
+def _identity_locale_mismatch(requested: str, info: Dict[str, Any]) -> Optional[str]:
+    """Human-readable mismatch detail iff the guard is enabled, the requested
+    symbol's suffix implies a known locale, AND the returned record clearly
+    contradicts it -- decided on currency when the record has one, else on
+    country. None otherwise (any absent/ambiguous field => no mismatch)."""
+    if not _fund_identity_guard_enabled():
+        return None
+    if not isinstance(info, dict) or not info:
+        return None
+    exp_ccy, exp_country = _expected_locale_for_symbol(requested)
+    if not exp_ccy and not exp_country:
+        return None
+
+    ret_ccy = _norm_ccy_token(_pick(info, "currency", "financialCurrency"))
+    ret_country = _norm_country_token(_pick(info, "country"))
+
+    mismatch = False
+    if ret_ccy:
+        # currency present -> decisive (avoids country-spelling false positives)
+        mismatch = bool(exp_ccy and ret_ccy != exp_ccy)
+    elif exp_country and ret_country:
+        # no currency on the record -> fall back to country
+        mismatch = ret_country != exp_country
+
+    if not mismatch:
+        return None
+    ret_ccy_disp = safe_str(_pick(info, "currency", "financialCurrency")) or "?"
+    ret_ctry_disp = safe_str(_pick(info, "country")) or "?"
     return (
-        "too many requests" in msg
-        or "rate limited" in msg
-        or "rate-limit" in msg
-        or "rate limit" in msg
+        f"{str(requested).strip().upper()}:returned[{ret_ccy_disp}/{ret_ctry_disp}]"
+        f"!=expected[{exp_ccy or '?'}]"
     )
 
 
 # =============================================================================
-# v8.7.0 (Fix YC-RAW): RAW CHART TRANSPORT — crumb-free quotes & history
+# Prometheus Metrics (optional)
 # =============================================================================
-# The yfinance library authenticates via a cookie+crumb pair that Yahoo now
-# refuses to this datacenter IP (production log 2026-07-08: sustained
-# "401 Invalid Crumb" / "User is unable to access this feature"), while the
-# plain v8/finance/chart endpoint answers the SAME box with 200 and a full
-# correct payload (Render shell: 2222.SR -> regularMarketPrice 26.68 SAR).
-# This transport fetches that endpoint directly and synthesizes the exact
-# (info, meta, history) triple _fetch_ticker_sync produces, so the ENTIRE
-# existing pipeline — YC-1 identity guard, YC-3 coherence, _enrich_data,
-# cache, circuit breaker — is reused untouched. yfinance remains the
-# fallback transport. Master switch TFB_YAHOO_RAW_CHART (default ON);
-# set 0/false/off to restore the v8.6.0 yfinance-only flow byte-identically.
 
-_RAW_CHART_HOSTS: Tuple[str, ...] = (
-    "https://query1.finance.yahoo.com",
-    "https://query2.finance.yahoo.com",
-)
-_RAW_CHART_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
+if _PROMETHEUS_AVAILABLE and Counter and Gauge and Histogram:
+    yf_fund_requests_total = Counter(
+        "yf_fund_requests_total",
+        "Total Yahoo fundamentals provider requests",
+        ["status"],
+    )
+    yf_fund_request_duration = Histogram(
+        "yf_fund_request_duration_seconds",
+        "Yahoo fundamentals provider request duration (seconds)",
+        buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0],
+    )
+    yf_fund_circuit_breaker_state = Gauge(
+        "yf_fund_circuit_breaker_state",
+        "Circuit breaker state (0=closed, 1=half_open, 2=open)",
+    )
+else:
+    class _DummyMetric:
+        def labels(self, *args: Any, **kwargs: Any) -> "_DummyMetric":
+            return self
 
+        def inc(self, *args: Any, **kwargs: Any) -> None:
+            return None
 
-def _raw_chart_enabled() -> bool:
-    """v8.7.0 (YC-RAW): raw chart transport master switch. Default ON —
-    the yfinance transport is crumb-blocked in production and the raw
-    endpoint is the proven-alive path (esp. critical for .SR, where Yahoo
-    is the only viable source). TFB_YAHOO_RAW_CHART in {0,false,off}
-    restores the v8.6.0 yfinance-only flow byte-identically."""
-    return os.getenv("TFB_YAHOO_RAW_CHART", "1").strip().lower() not in ("0", "false", "no", "off")
+        def observe(self, *args: Any, **kwargs: Any) -> None:
+            return None
 
+        def set(self, *args: Any, **kwargs: Any) -> None:
+            return None
 
-async def _raw_http_get_json(url: str, params: Dict[str, Any], timeout: float) -> Any:
-    """Single HTTP seam for the raw transport (tests monkeypatch this)."""
-    if not _HAS_HTTPX or httpx is None:
-        raise YahooFetchError("httpx_unavailable")
-    async with httpx.AsyncClient(
-        timeout=timeout, follow_redirects=True,
-        headers={"User-Agent": _RAW_CHART_UA, "Accept": "application/json"},
-    ) as client:
-        resp = await client.get(url, params=params)
-        if resp.status_code != 200:
-            raise YahooFetchError(f"http_{resp.status_code}")
-        return resp.json()
-
-
-def _yc_adjusted_history_enabled() -> bool:
-    """v8.8.0 (YC-ADJ): split-adjusted raw history master switch. Default ON.
-    TFB_YC_ADJUSTED_HISTORY=0/false/off/no restores the v8.7.1 unadjusted
-    parse byte-identically."""
-    return (os.getenv("TFB_YC_ADJUSTED_HISTORY") or "1").strip().lower() not in {"0", "false", "off", "no"}
-
-
-def _raw_chart_parse_triple(
-    ysym: str, data: Any, range_: str = "",
-) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
-    """Parse a v8/finance/chart payload into the (info, meta, history)
-    triple _fetch_ticker_sync returns, so downstream is transport-blind.
-    Pure; raises YahooFetchError on error/malformed payloads.
-
-    v8.7.1 PREV-CLOSE SEMANTICS: Yahoo's meta.chartPreviousClose is the
-    close BEFORE THE REQUESTED WINDOW, not the prior session — on the 2y
-    history range it handed 2222.SR a "previous close" of 28.25 (above
-    its own 52w high 27.96), fabricating a -4.78% day move (live probe
-    2026-07-08). Priority is now: regularMarketPreviousClose (true
-    session field) -> second-to-last history bar close -> plain
-    previousClose -> chartPreviousClose ONLY for intraday ranges
-    (1d/5d), where its meaning coincides with the prior session."""
-    chart = (data or {}).get("chart") if isinstance(data, dict) else None
-    if not isinstance(chart, dict):
-        raise YahooFetchError("malformed_payload")
-    err = chart.get("error")
-    if err:
-        code = err.get("code") if isinstance(err, dict) else str(err)
-        raise YahooFetchError(f"chart_error:{code}")
-    results = chart.get("result") or []
-    if not results or not isinstance(results[0], dict):
-        raise YahooFetchError("empty_result")
-    r0 = results[0]
-    meta_raw = r0.get("meta") or {}
-    if not isinstance(meta_raw, dict):
-        meta_raw = {}
-
-    history: List[Dict[str, Any]] = []
-    ts_list = r0.get("timestamp") or []
-    inds = r0.get("indicators") or {}
-    quotes = (inds.get("quote") or [{}])
-    q0 = quotes[0] if quotes and isinstance(quotes[0], dict) else {}
-    opens = q0.get("open") or []
-    highs = q0.get("high") or []
-    lows = q0.get("low") or []
-    closes = q0.get("close") or []
-    vols = q0.get("volume") or []
-
-    # v8.8.0 (YC-ADJ-1): Yahoo ships the split/dividend-adjusted close series
-    # in indicators.adjclose[0].adjclose alongside the raw quote block. Reading
-    # only the raw block hands every reverse-splitter one fake +N00% daily
-    # return — the proven source of the Volatility-15,068 rows. Per bar:
-    # k = adj/close, applied to O/H/L/C alike so candle geometry is preserved
-    # exactly; volume stays as printed. Any per-bar doubt (missing / non-finite
-    # / <= 0) -> k = 1. adjclose absent entirely, or
-    # TFB_YC_ADJUSTED_HISTORY=0 -> v8.7.1 verbatim.
-    adjs: List[Any] = []
-    if _yc_adjusted_history_enabled():
-        adj_blocks = inds.get("adjclose") or []
-        a0 = adj_blocks[0] if adj_blocks and isinstance(adj_blocks[0], dict) else {}
-        adjs = a0.get("adjclose") or []
-
-    n = len(ts_list)
-    for i in range(n):
-        close_v = _safe_float(closes[i] if i < len(closes) else None)
-        if close_v is None:
-            continue
-        k = 1.0
-        if adjs:
-            adj_v = _safe_float(adjs[i] if i < len(adjs) else None)
-            if adj_v is not None and adj_v > 0 and close_v > 0:
-                k = adj_v / close_v
-        open_v = _safe_float(opens[i] if i < len(opens) else None)
-        high_v = _safe_float(highs[i] if i < len(highs) else None)
-        low_v = _safe_float(lows[i] if i < len(lows) else None)
-        ts_raw = ts_list[i]
-        try:
-            dt = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
-            ts_iso = _utc_iso(dt)
-        except Exception:
-            ts_iso = str(ts_raw)
-        history.append({
-            "timestamp": ts_iso,
-            "open": open_v * k if open_v is not None else None,
-            "high": high_v * k if high_v is not None else None,
-            "low": low_v * k if low_v is not None else None,
-            "close": close_v * k,
-            "volume": _safe_float(vols[i] if i < len(vols) else None),
-        })
-
-    prev_close = _first_number(meta_raw.get("regularMarketPreviousClose"))
-    if prev_close is None and len(history) >= 2:
-        prev_close = history[-2].get("close")
-    if prev_close is None:
-        prev_close = _first_number(meta_raw.get("previousClose"))
-    if prev_close is None and (range_ or "").strip().lower() in ("1d", "5d"):
-        prev_close = _first_number(meta_raw.get("chartPreviousClose"))
-
-    info: Dict[str, Any] = {
-        "symbol": _safe_str(meta_raw.get("symbol")) or ysym,
-        "regularMarketPrice": _safe_float(meta_raw.get("regularMarketPrice")),
-        "previousClose": prev_close,
-        "regularMarketPreviousClose": prev_close,
-        "currency": _safe_str(meta_raw.get("currency")),
-        "exchange": _safe_str(meta_raw.get("exchangeName")),
-        "fullExchangeName": _safe_str(meta_raw.get("fullExchangeName")),
-        "regularMarketDayHigh": _safe_float(meta_raw.get("regularMarketDayHigh")),
-        "regularMarketDayLow": _safe_float(meta_raw.get("regularMarketDayLow")),
-        "fiftyTwoWeekHigh": _safe_float(meta_raw.get("fiftyTwoWeekHigh")),
-        "fiftyTwoWeekLow": _safe_float(meta_raw.get("fiftyTwoWeekLow")),
-        "regularMarketVolume": _safe_float(meta_raw.get("regularMarketVolume")),
-        "regularMarketTime": meta_raw.get("regularMarketTime"),
-    }
-    info = {k: v for k, v in info.items() if v is not None}
-    return info, meta_raw, history
-
-
-async def _raw_chart_fetch_triple(
-    ysym: str, range_: str, interval: str, timeout: float,
-) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
-    """Fetch the chart payload over the host ladder and parse the triple.
-    Raises YahooFetchError (with the LAST host's reason) on total failure."""
-    params = {"range": range_ or "1y", "interval": interval or "1d"}
-    last_exc: Optional[Exception] = None
-    for host in _RAW_CHART_HOSTS:
-        try:
-            data = await _raw_http_get_json(f"{host}/v8/finance/chart/{ysym}", params, timeout)
-            return _raw_chart_parse_triple(ysym, data, range_)
-        except Exception as exc:  # noqa: BLE001 — ladder tries next host
-            last_exc = exc
-            continue
-    raise YahooFetchError(f"raw_chart_failed:{last_exc}")
+    yf_fund_requests_total = _DummyMetric()
+    yf_fund_request_duration = _DummyMetric()
+    yf_fund_circuit_breaker_state = _DummyMetric()
 
 
 # =============================================================================
-# Configuration
+# Environment Helpers
 # =============================================================================
 
-@dataclass(frozen=True)
-class YahooConfig:
-    """Immutable configuration for Yahoo provider."""
-
-    enabled: bool = True
-    timeout_sec: float = DEFAULT_TIMEOUT_SEC
-    quote_ttl_sec: float = DEFAULT_QUOTE_TTL_SEC
-    history_ttl_sec: float = DEFAULT_HISTORY_TTL_SEC
-    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
-    rate_limit_per_sec: float = DEFAULT_RATE_LIMIT_PER_SEC
-    rate_limit_burst: int = DEFAULT_RATE_LIMIT_BURST
-    cb_fail_threshold: int = DEFAULT_CB_FAIL_THRESHOLD
-    cb_cooldown_sec: float = DEFAULT_CB_COOLDOWN_SEC
-    cb_success_threshold: int = DEFAULT_CB_SUCCESS_THRESHOLD
-    threadpool_workers: int = DEFAULT_THREADPOOL_WORKERS
-    history_period: str = DEFAULT_HISTORY_PERIOD
-    history_interval: str = DEFAULT_HISTORY_INTERVAL
-    tracing_enabled: bool = False
-    metrics_enabled: bool = False
-
-    @classmethod
-    def from_env(cls) -> "YahooConfig":
-        """Load configuration from environment variables."""
-
-        def _env_str(name: str, default: str = "") -> str:
-            v = os.getenv(name)
-            return str(v).strip() if v is not None and str(v).strip() else default
-
-        def _env_bool(name: str, default: bool) -> bool:
-            raw = (os.getenv(name) or "").strip().lower()
-            if not raw:
-                return default
-            if raw in _FALSY:
-                return False
-            if raw in _TRUTHY:
-                return True
-            return default
-
-        def _env_int(name: str, default: int) -> int:
-            try:
-                return int(float(str(os.getenv(name, str(default))).strip()))
-            except Exception:
-                return default
-
-        def _env_float(name: str, default: float) -> float:
-            try:
-                return float(str(os.getenv(name, str(default))).strip())
-            except Exception:
-                return default
-
-        # v8.7.0: availability is transport-agnostic — yfinance OR the raw
-        # chart transport can serve; the env kill-switch still rules all.
-        enabled = _env_bool("YAHOO_ENABLED", True) and (
-            _HAS_YFINANCE or (_raw_chart_enabled() and _HAS_HTTPX)
-        )
-
-        return cls(
-            enabled=enabled,
-            timeout_sec=max(5.0, _env_float("YAHOO_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC)),
-            quote_ttl_sec=max(5.0, _env_float("YAHOO_QUOTE_TTL_SEC", DEFAULT_QUOTE_TTL_SEC)),
-            history_ttl_sec=max(30.0, _env_float("YAHOO_HISTORY_TTL_SEC", DEFAULT_HISTORY_TTL_SEC)),
-            max_concurrency=max(2, _env_int("YAHOO_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY)),
-            rate_limit_per_sec=max(0.0, _env_float("YAHOO_RATE_LIMIT_PER_SEC", DEFAULT_RATE_LIMIT_PER_SEC)),
-            rate_limit_burst=max(1, _env_int("YAHOO_RATE_LIMIT_BURST", DEFAULT_RATE_LIMIT_BURST)),
-            cb_fail_threshold=max(2, _env_int("YAHOO_CB_FAIL_THRESHOLD", DEFAULT_CB_FAIL_THRESHOLD)),
-            cb_cooldown_sec=max(5.0, _env_float("YAHOO_CB_COOLDOWN_SEC", DEFAULT_CB_COOLDOWN_SEC)),
-            cb_success_threshold=max(1, _env_int("YAHOO_CB_SUCCESS_THRESHOLD", DEFAULT_CB_SUCCESS_THRESHOLD)),
-            threadpool_workers=max(2, _env_int("YAHOO_THREADPOOL_WORKERS", DEFAULT_THREADPOOL_WORKERS)),
-            history_period=_env_str("YAHOO_HISTORY_PERIOD", DEFAULT_HISTORY_PERIOD),
-            history_interval=_env_str("YAHOO_HISTORY_INTERVAL", DEFAULT_HISTORY_INTERVAL),
-            tracing_enabled=_env_bool("CORE_TRACING_ENABLED", False) or _env_bool("TRACING_ENABLED", False),
-            metrics_enabled=_env_bool("PROMETHEUS_ENABLED", False) or _env_bool("METRICS_ENABLED", False),
-        )
-
-    @property
-    def is_available(self) -> bool:
-        """Return True if the provider can serve requests.
-        v8.7.0: the raw chart transport is a full quote/history capability,
-        so availability no longer requires yfinance alone."""
-        return self.enabled and (_HAS_YFINANCE or (_raw_chart_enabled() and _HAS_HTTPX))
+def _env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    v = str(v).strip() if v is not None else ""
+    return v if v else default
 
 
-# =============================================================================
-# Custom Exceptions
-# =============================================================================
-
-class YahooProviderError(Exception):
-    """Base exception for Yahoo provider errors."""
-
-
-class YahooFetchError(YahooProviderError):
-    """Raised when a data fetch fails."""
-
-
-# =============================================================================
-# Metrics (Optional)
-# =============================================================================
-
-class _DummyMetric:
-    """No-op metric used when Prometheus isn't available."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def labels(self, *args: Any, **kwargs: Any) -> "_DummyMetric":
-        return self
-
-    def inc(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def observe(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def set(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-
-def _safe_create_metric(ctor: Any, name: str, doc: str, labelnames: List[str]) -> Any:
-    """Create a Prometheus metric or return a DummyMetric if unavailable/duplicate."""
-    if not _HAS_PROM or ctor is None:
-        return _DummyMetric()
+def _env_int(name: str, default: int) -> int:
     try:
-        return ctor(name, doc, labelnames)
+        v = os.getenv(name)
+        return int(float(str(v).strip())) if v is not None else default
     except Exception:
-        return _DummyMetric()
+        return default
 
 
-@dataclass(slots=True)
-class _Metrics:
-    """Container for Prometheus metrics."""
-    requests_total: Any
-    request_duration: Any
-    cache_hits_total: Any
-    cache_misses_total: Any
-    circuit_state: Any
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        return float(str(v).strip()) if v is not None else default
+    except Exception:
+        return default
 
 
-_METRICS_INSTANCE: Optional[_Metrics] = None
+def _env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in _FALSY:
+        return False
+    if raw in _TRUTHY:
+        return True
+    return default
 
 
-def _get_metrics() -> _Metrics:
-    """Get or create the module-level metrics instance."""
-    global _METRICS_INSTANCE
-    if _METRICS_INSTANCE is None:
-        _METRICS_INSTANCE = _Metrics(
-            requests_total=_safe_create_metric(
-                Counter, "yahoo_requests_total", "Total Yahoo requests", ["symbol", "op", "status"],
-            ),
-            request_duration=_safe_create_metric(
-                Histogram, "yahoo_request_duration_seconds", "Yahoo request duration", ["symbol", "op"],
-            ),
-            cache_hits_total=_safe_create_metric(
-                Counter, "yahoo_cache_hits_total", "Yahoo cache hits", ["symbol"],
-            ),
-            cache_misses_total=_safe_create_metric(
-                Counter, "yahoo_cache_misses_total", "Yahoo cache misses", ["symbol"],
-            ),
-            circuit_state=_safe_create_metric(
-                Gauge, "yahoo_circuit_state", "Yahoo circuit breaker", ["state"],
-            ),
-        )
-    return _METRICS_INSTANCE
+def _configured() -> bool:
+    return _env_bool("YF_ENABLED", True) and _HAS_YFINANCE
+
+
+def _emit_warnings() -> bool:
+    return _env_bool("YF_VERBOSE_WARNINGS", False)
+
+
+def _timeout_sec() -> float:
+    return max(5.0, _env_float("YF_TIMEOUT_SEC", 25.0))
+
+
+def _fund_ttl_sec() -> float:
+    return max(300.0, _env_float("YF_FUND_TTL_SEC", 21600.0))
+
+
+def _err_ttl_sec() -> float:
+    return max(5.0, _env_float("YF_ERROR_TTL_SEC", 20.0))
+
+
+def _max_concurrency() -> int:
+    return max(1, _env_int("YF_MAX_CONCURRENCY", 6))
+
+
+def _rate_limit() -> float:
+    return max(0.0, _env_float("YF_RATE_LIMIT_PER_SEC", 4.0))
+
+
+def _cb_enabled() -> bool:
+    return _env_bool("YF_CIRCUIT_BREAKER", True)
+
+
+def _cb_fail_threshold() -> int:
+    return max(2, _env_int("YF_CB_FAIL_THRESHOLD", 6))
+
+
+def _cb_cooldown_sec() -> float:
+    return max(5.0, _env_float("YF_CB_COOLDOWN_SEC", 30.0))
+
+
+def _enable_redis() -> bool:
+    return _env_bool("YF_ENABLE_REDIS", False) and _REDIS_AVAILABLE
+
+
+def _redis_url() -> str:
+    return _env_str("REDIS_URL", "redis://localhost:6379/0")
+
+
+def _user_agent_rotation() -> bool:
+    return _env_bool("YF_USER_AGENT_ROTATION", DEFAULT_USER_AGENT_ROTATION) and _HAS_REQUESTS
+
+
+def _price_sanity_guard() -> bool:
+    return _env_bool("YF_PRICE_SANITY_GUARD", DEFAULT_PRICE_SANITY_GUARD)
+
+
+def _retry_attempts() -> int:
+    return max(1, _env_int("YF_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS))
+
+
+def _price_ratio_high() -> float:
+    v = _env_float("YF_PRICE_RATIO_HIGH", DEFAULT_PRICE_RATIO_HIGH)
+    return v if v > 1.0 else DEFAULT_PRICE_RATIO_HIGH
+
+
+def _price_ratio_low() -> float:
+    v = _env_float("YF_PRICE_RATIO_LOW", DEFAULT_PRICE_RATIO_LOW)
+    return v if 0.0 < v < 1.0 else DEFAULT_PRICE_RATIO_LOW
 
 
 # =============================================================================
 # Pure Utility Functions
 # =============================================================================
 
-def _utc_now() -> datetime:
-    """Get current UTC time."""
-    return datetime.now(timezone.utc)
-
-
 def _utc_iso(dt: Optional[datetime] = None) -> str:
-    """Get UTC time in ISO format."""
-    d = dt or _utc_now()
+    d = dt or datetime.now(timezone.utc)
     if d.tzinfo is None:
         d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(timezone.utc).isoformat()
 
 
 def _riyadh_iso(dt: Optional[datetime] = None) -> str:
-    """Get Riyadh time (UTC+3) in ISO format."""
-    d = dt or datetime.now(_RIYADH_TZ)
+    tz = timezone(timedelta(hours=3))
+    d = dt or datetime.now(tz)
     if d.tzinfo is None:
-        d = d.replace(tzinfo=_RIYADH_TZ)
-    return d.astimezone(_RIYADH_TZ).isoformat()
+        d = d.replace(tzinfo=tz)
+    return d.astimezone(tz).isoformat()
 
 
-def _safe_str(value: Any) -> Optional[str]:
-    """Safely convert to non-empty stripped string; None for empty."""
-    if value is None:
+def safe_str(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s if s else None
+
+
+def safe_float(x: Any) -> Optional[float]:
+    if x is None:
         return None
     try:
-        s = str(value).strip()
-        return s if s else None
-    except Exception:
-        return None
-
-
-def _safe_float(value: Any) -> Optional[float]:
-    """Safely convert to float; handles Arabic digits, K/M/B/T, parens-negative."""
-    if value is None:
-        return None
-
-    try:
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            f = float(value)
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, (int, float)):
+            f = float(x)
             return None if (math.isnan(f) or math.isinf(f)) else f
 
-        s = str(value).strip()
-        if not s or s.lower() in {"-", "\u2014", "n/a", "na", "null", "none", "nan"}:
+        s = str(x).strip()
+        if not s:
+            return None
+        if s.lower() in {"n/a", "na", "null", "none", "-", "--"}:
             return None
 
         s = s.translate(_ARABIC_DIGITS)
-        s = s.replace(",", "").replace("%", "").replace("+", "")
-        s = s.replace("$", "").replace("\u00a3", "").replace("\u20ac", "")
-        s = s.replace("SAR", "").replace("USD", "").replace("EUR", "").strip()
+        s = s.replace(",", "").strip()
+
+        if s.endswith("%"):
+            s = s[:-1].strip()
 
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
 
-        match = _K_M_B_T_RE.match(s)
-        if match:
-            f = float(match.group(1)) * _K_M_B_T_MULT[match.group(2).upper()]
+        m = _K_M_B_T_RE.match(s)
+        if m:
+            f = float(m.group(1)) * _K_M_B_T_MULT[m.group(2).upper()]
         else:
             f = float(s)
 
         return None if (math.isnan(f) or math.isinf(f)) else f
-    except (ValueError, TypeError):
+    except Exception:
         return None
 
 
-def _as_fraction(value: Any) -> Optional[float]:
-    """
-    Convert percent-like value to ratio using the abs>1.5 heuristic.
+def safe_int(x: Any) -> Optional[int]:
+    f = safe_float(x)
+    return int(round(f)) if f is not None else None
 
-    Used for Yahoo's percent-ish fields (dividendYield, margins, ROE).
-    Yahoo sometimes returns ratios (0.025) and sometimes percents (2.5),
-    so the heuristic is defensible here. Low-magnitude values <1.5 are
-    left as-is (treated as ratios).
-    """
-    f = _safe_float(value)
-    if f is None:
+
+def _as_fraction(x: Any) -> Optional[float]:
+    v = safe_float(x)
+    if v is None:
         return None
-    return f / 100.0 if abs(f) > 1.5 else f
+    return v / 100.0 if abs(v) > 1.5 else v
 
 
-def _first_number(*values: Any) -> Optional[float]:
-    """Return the first non-None numeric value."""
-    for v in values:
-        f = _safe_float(v)
-        if f is not None:
-            return f
-    return None
+def _pct_from_ratio(numerator: Any, denominator: Any) -> Optional[float]:
+    a = safe_float(numerator)
+    b = safe_float(denominator)
+    if a is None or b is None or b == 0:
+        return None
+    return a / b
 
 
-def _first_fraction(*values: Any) -> Optional[float]:
-    """Return the first non-None value coerced to a fraction."""
-    for v in values:
-        f = _as_fraction(v)
-        if f is not None:
-            return f
-    return None
-
-
-def _first_str(*values: Any) -> Optional[str]:
-    """Return the first non-None string value."""
-    for v in values:
-        s = _safe_str(v)
-        if s is not None:
-            return s
-    return None
-
-
-def normalize_symbol(symbol: str) -> str:
-    """
-    Normalize symbol to Yahoo Finance format.
-
-    Detection order (first match wins):
-      1. Empty / whitespace -> ""
-      2. KSA numeric code (3-6 digits) -> append ".SR"
-      3. Bare 6-letter currency pair (v8.1.0) -> append "=X"
-      4. Anything else -> upper-cased pass-through
-
-    Examples:
-        ""         -> ""
-        "2222"     -> "2222.SR"
-        "2222.SR"  -> "2222.SR"
-        "AAPL"     -> "AAPL"
-        "GC=F"     -> "GC=F"
-        "^GSPC"    -> "^GSPC"
-        "EURUSD=X" -> "EURUSD=X"        (already has =X, untouched)
-        "AUDCAD"   -> "AUDCAD=X"        (v8.1.0)
-        "USDSAR"   -> "USDSAR=X"        (v8.1.0)
-        "BTCUSD"   -> "BTCUSD"          (BTC not a known currency, untouched)
-    """
-    s = (symbol or "").strip()
-    if not s:
-        return ""
-
-    s = s.translate(_ARABIC_DIGITS).strip().upper()
-
-    # 1. KSA numeric codes get the .SR suffix.
-    if _KSA_CODE_RE.match(s):
-        return f"{s}.SR"
-
-    # 2. Bare 6-letter currency-pair tokens get =X. (v8.1.0)
-    #    Both halves must be in _KNOWN_CURRENCIES, so 6-letter US stock
-    #    tickers and BTCUSD-style crypto are not affected.
-    if _is_likely_fx_pair(s):
-        return f"{s}=X"
-
-    # 3. Otherwise keep the symbol as-is (ETFs, futures, indices,
-    #    already-suffixed FX, US/global equities, KSA .SR, etc).
-    return s
-
-
-def clean_dict(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove None, empty strings, and recursively empty containers from a dict."""
-    result: Dict[str, Any] = {}
-    for k, v in d.items():
+def clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in (p or {}).items():
         if v is None:
             continue
         if isinstance(v, str) and not v.strip():
             continue
-        if isinstance(v, dict):
-            cleaned = clean_dict(v)
-            if cleaned:
-                result[k] = cleaned
-        elif isinstance(v, (list, tuple)):
-            cleaned_list = []
-            for item in v:
-                if isinstance(item, dict):
-                    cleaned_item = clean_dict(item)
-                    if cleaned_item:
-                        cleaned_list.append(cleaned_item)
-                elif item is not None:
-                    cleaned_list.append(item)
-            if cleaned_list:
-                result[k] = cleaned_list
-        else:
-            result[k] = v
-    return result
-
-
-# =============================================================================
-# Async Primitives: TokenBucket, CircuitBreaker, SingleFlight, AdvancedCache
-# =============================================================================
-
-@dataclass(slots=True)
-class TokenBucket:
-    """Token bucket rate limiter."""
-
-    rate_per_sec: float
-    burst: float
-    tokens: float = 0.0
-    last: float = 0.0
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-    async def acquire(self, n: float = 1.0) -> None:
-        """Acquire `n` tokens (blocking until available)."""
-        if self.rate_per_sec <= 0:
-            return
-
-        async with self.lock:
-            now = time.monotonic()
-            if self.last <= 0:
-                self.last = now
-                self.tokens = float(self.burst)
-
-            elapsed = max(0.0, now - self.last)
-            self.tokens = min(float(self.burst), self.tokens + elapsed * float(self.rate_per_sec))
-            self.last = now
-
-            if self.tokens >= n:
-                self.tokens -= n
-                return
-
-            need = n - self.tokens
-            wait = need / float(self.rate_per_sec)
-            self.tokens = 0.0
-
-        await asyncio.sleep(min(5.0, max(0.0, wait)))
-
-
-@dataclass(slots=True)
-class CircuitBreaker:
-    """Circuit breaker for failure isolation."""
-
-    fail_threshold: int
-    cooldown_sec: float
-    success_threshold: int
-    failures: int = 0
-    successes: int = 0
-    opened_at: float = 0.0
-    state: str = "closed"
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-    async def allow(self) -> bool:
-        """Return True if a request is allowed through."""
-        metrics = _get_metrics()
-        async with self.lock:
-            if self.state == "closed":
-                metrics.circuit_state.labels(state="closed").set(0.0)
-                return True
-
-            if self.state == "open":
-                if time.monotonic() - self.opened_at >= self.cooldown_sec:
-                    self.state = "half_open"
-                    self.successes = 0
-                    metrics.circuit_state.labels(state="half_open").set(1.0)
-                    return True
-                metrics.circuit_state.labels(state="open").set(2.0)
-                return False
-
-            metrics.circuit_state.labels(state="half_open").set(1.0)
-            return True
-
-    async def record_success(self) -> None:
-        """Record a successful request."""
-        async with self.lock:
-            if self.state == "half_open":
-                self.successes += 1
-                if self.successes >= self.success_threshold:
-                    self.state = "closed"
-                    self.failures = 0
-                    self.successes = 0
-            else:
-                self.failures = max(0, self.failures - 1)
-
-    async def record_failure(self) -> None:
-        """Record a failed request (may open the breaker)."""
-        async with self.lock:
-            self.failures += 1
-            if self.state == "half_open":
-                self.state = "open"
-                self.opened_at = time.monotonic()
-                return
-            if self.failures >= self.fail_threshold:
-                self.state = "open"
-                self.opened_at = time.monotonic()
-
-
-class SingleFlight:
-    """Deduplicate concurrent requests for the same key."""
-
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._futures: Dict[str, asyncio.Future] = {}
-
-    async def run(self, key: str, coro_fn: Callable[[], Awaitable[Any]]) -> Any:
-        """Execute coroutine; concurrent callers for the same key share the result."""
-        async with self._lock:
-            future = self._futures.get(key)
-            if future is not None:
-                return await future
-
-            loop = asyncio.get_running_loop()
-            future = loop.create_future()
-            self._futures[key] = future
-
-        try:
-            result = await coro_fn()
-            if not future.cancelled() and not future.done():
-                future.set_result(result)
-            return result
-        except Exception as exc:
-            if not future.cancelled() and not future.done():
-                future.set_exception(exc)
-            raise
-        finally:
-            async with self._lock:
-                self._futures.pop(key, None)
-
-
-@dataclass(slots=True)
-class AdvancedCache:
-    """Async TTL cache with size limit (mass eviction on overflow)."""
-
-    name: str
-    ttl_sec: float
-    max_size: int = 5000
-    _data: Dict[str, Tuple[Any, float]] = field(default_factory=dict)
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-    def _make_key(self, symbol: str, kind: str) -> str:
-        return f"{self.name}:{kind}:{symbol}"
-
-    async def get(self, symbol: str, kind: str = "quote") -> Optional[Any]:
-        """Get value from cache if not expired."""
-        key = self._make_key(symbol, kind)
-        now = time.monotonic()
-
-        async with self._lock:
-            item = self._data.get(key)
-            if not item:
-                return None
-            value, expires_at = item
-            if now <= expires_at:
-                return value
-            self._data.pop(key, None)
-            return None
-
-    async def set(
-        self,
-        symbol: str,
-        value: Any,
-        kind: str = "quote",
-        ttl_sec: Optional[float] = None,
-    ) -> None:
-        """Set value in cache with TTL; mass-evicts on overflow."""
-        key = self._make_key(symbol, kind)
-        ttl = ttl_sec if ttl_sec is not None else self.ttl_sec
-        expires_at = time.monotonic() + max(0.5, ttl)
-
-        async with self._lock:
-            if len(self._data) >= self.max_size and key not in self._data:
-                n = max(1, self.max_size // 10)
-                for k in list(self._data.keys())[:n]:
-                    self._data.pop(k, None)
-            self._data[key] = (value, expires_at)
-
-    async def clear(self) -> None:
-        """Clear cache."""
-        async with self._lock:
-            self._data.clear()
-
-    async def size(self) -> int:
-        """Get current cache size."""
-        async with self._lock:
-            return len(self._data)
-
-
-# =============================================================================
-# Technical Indicators (Pure Python with NumPy acceleration)
-# =============================================================================
-
-def _simple_returns(closes: List[float]) -> List[float]:
-    """Simple returns from close prices."""
-    returns: List[float] = []
-    for i in range(1, len(closes)):
-        prev, curr = closes[i - 1], closes[i]
-        if prev and prev > 0:
-            returns.append((curr / prev) - 1.0)
-    return returns
-
-
-def _log_returns(closes: List[float]) -> List[float]:
-    """Log returns from close prices."""
-    returns: List[float] = []
-    for i in range(1, len(closes)):
-        prev, curr = closes[i - 1], closes[i]
-        if prev and prev > 0 and curr and curr > 0:
-            returns.append(math.log(curr / prev))
-    return returns
-
-
-def _annualized_vol_from_log_returns(log_returns: List[float]) -> Optional[float]:
-    """Annualized volatility from log returns."""
-    if len(log_returns) < 2:
-        return None
-    try:
-        if _HAS_NUMPY and np is not None:
-            vol = float(np.std(np.asarray(log_returns, dtype=float), ddof=1) * math.sqrt(252.0))
-            return None if (math.isnan(vol) or math.isinf(vol)) else vol
-        std = statistics.stdev(log_returns)
-        return float(std * math.sqrt(252.0))
-    except Exception:
-        return None
-
-
-def _volatility_nd(closes: List[float], days: int) -> Optional[float]:
-    """N-day annualized volatility as a fraction."""
-    if len(closes) < days + 1:
-        return None
-    window = closes[-(days + 1):]
-    return _annualized_vol_from_log_returns(_log_returns(window))
-
-
-def _max_drawdown_1y(closes: List[float]) -> Optional[float]:
-    """Maximum drawdown over ~1 year as a positive fraction."""
-    if len(closes) < 20:
-        return None
-    window = closes[-252:] if len(closes) >= 252 else closes[:]
-    peak: Optional[float] = None
-    max_dd = 0.0
-    for p in window:
-        if p is None or p <= 0:
+        if k == "warnings" and isinstance(v, list):
+            if v:
+                out[k] = v
             continue
-        if peak is None or p > peak:
-            peak = p
-        if peak and peak > 0:
-            dd = (p / peak) - 1.0
-            if dd < max_dd:
-                max_dd = dd
-    return float(abs(max_dd)) if max_dd < 0 else 0.0
+        out[k] = v
+    return out
 
 
-def _var_95_1d(closes: List[float]) -> Optional[float]:
-    """95% daily VaR as a positive fraction."""
-    returns = _simple_returns(closes)
-    if len(returns) < 30:
+def normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip()
+    if not s:
+        return ""
+    s = s.translate(_ARABIC_DIGITS).strip().upper()
+
+    for prefix in ("TADAWUL:", "SAUDI:", "KSA:", "ETF:", "INDEX:"):
+        if s.startswith(prefix):
+            s = s.split(":", 1)[1].strip()
+
+    for suffix in (".TADAWUL", ".SAUDI", ".KSA"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+
+    if _KSA_CODE_RE.match(s):
+        return f"{s}.SR"
+
+    if s.endswith(".SR") and _KSA_CODE_RE.match(s[:-3]):
+        return s
+
+    return s
+
+
+def _is_ksa_symbol(norm_symbol: str) -> bool:
+    u = (norm_symbol or "").strip().upper()
+    if u.endswith(".SR"):
+        code = u[:-3]
+        return bool(_KSA_CODE_RE.match(code))
+    return False
+
+
+# =============================================================================
+# v6.3.0: Recommendation Vocabulary -- canonical 8-tier output + provider_rating
+# =============================================================================
+
+# (8tier, provider_rating)  -- single source of truth for v6.3.0
+_RECO_VOCAB: Tuple[Tuple[str, str, str], ...] = (
+    # --- Strong tokens (8-tier extremes) ---
+    ("strong_buy",        "STRONG_BUY",   "strong_buy"),
+    ("strongbuy",         "STRONG_BUY",   "strong_buy"),
+    ("strong_sell",       "STRONG_SELL",  "strong_sell"),
+    ("strongsell",        "STRONG_SELL",  "strong_sell"),
+    ("conviction_sell",   "STRONG_SELL",  "strong_sell"),
+    ("deep_sell",         "STRONG_SELL",  "strong_sell"),
+
+    # --- ACCUMULATE tier (v8.0.0 vocabulary) ---
+    ("accumulate",        "ACCUMULATE",   "accumulate"),
+    ("scale_in",          "ACCUMULATE",   "accumulate"),
+    ("moderate_buy",      "ACCUMULATE",   "accumulate"),
+    ("mod_buy",           "ACCUMULATE",   "accumulate"),
+
+    # --- AVOID tier (v8.0.0 vocabulary) ---
+    ("avoid",             "AVOID",        "avoid"),
+    ("hard_pass",         "AVOID",        "avoid"),
+    ("dnb",               "AVOID",        "avoid"),
+    ("do_not_buy",        "AVOID",        "avoid"),
+    ("uninvestable",      "AVOID",        "avoid"),
+
+    # --- BUY tier (broker-vocab equivalents) ---
+    ("outperform",        "BUY",          "outperform"),
+    ("overweight",        "BUY",          "overweight"),
+    ("market_outperform", "BUY",          "outperform"),
+    ("add",               "BUY",          "add"),
+    ("buy",               "BUY",          "buy"),
+
+    # --- HOLD tier ---
+    ("market_perform",    "HOLD",         "market_perform"),
+    ("neutral",           "HOLD",         "neutral"),
+    ("hold",              "HOLD",         "hold"),
+    ("equal_weight",      "HOLD",         "neutral"),
+    ("perform",           "HOLD",         "hold"),       # fallback for "perform" not caught above
+
+    # --- REDUCE tier ---
+    ("underperform",      "REDUCE",       "underperform"),
+    ("underweight",       "REDUCE",       "underweight"),
+    ("market_underperform","REDUCE",      "underperform"),
+    ("trim",              "REDUCE",       "trim"),
+    ("reduce",            "REDUCE",       "reduce"),
+
+    # --- SELL tier (after strong_sell, so substring matches don't pre-empt) ---
+    ("exit",              "SELL",         "exit"),
+    ("sell",              "SELL",         "sell"),
+)
+
+# v6.3.1: length-descending view of the vocab used ONLY by the substring
+# pass, so longer/more-specific tokens are matched before shorter ones that
+# are substrings of them ("underperform" before "perform", "market_outperform"
+# before "outperform"/"perform"). The exact-match pass still iterates
+# _RECO_VOCAB in declaration order.
+_RECO_VOCAB_BY_LEN: Tuple[Tuple[str, str, str], ...] = tuple(
+    sorted(_RECO_VOCAB, key=lambda t: len(t[0]), reverse=True)
+)
+
+
+def _canonicalize_raw_recommendation(rec: Optional[str]) -> str:
+    if not rec:
+        return ""
+    s = str(rec).strip()
+    if not s:
+        return ""
+    s = re.sub(r"([a-z])([A-Z])", r"\1_\2", s)
+    s = s.lower().strip()
+    for sep in (" ", "-", "/", ".", ","):
+        s = s.replace(sep, "_")
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+
+def map_recommendation(rec: Optional[str]) -> str:
+    if not rec:
+        return "HOLD"
+    canon = _canonicalize_raw_recommendation(rec)
+    if not canon:
+        return "HOLD"
+
+    # First pass: exact match
+    for key, out8, _provider in _RECO_VOCAB:
+        if canon == key:
+            return out8
+
+    # Second pass: substring match (for compound tokens like
+    # "strong_buy_with_conviction"). v6.3.1: iterate length-descending so
+    # "underperform" beats "perform", "market_outperform" beats "outperform".
+    for key, out8, _provider in _RECO_VOCAB_BY_LEN:
+        if key in canon:
+            return out8
+
+    return "HOLD"
+
+
+def extract_provider_rating(rec: Optional[str]) -> str:
+    if not rec:
+        return ""
+    canon = _canonicalize_raw_recommendation(rec)
+    if not canon:
+        return ""
+
+    for key, _out8, provider_tok in _RECO_VOCAB:
+        if canon == key:
+            return provider_tok
+
+    for key, _out8, provider_tok in _RECO_VOCAB_BY_LEN:
+        if key in canon:
+            return provider_tok
+
+    return canon
+
+
+def _get_attr(obj: Any, *names: str) -> Any:
+    if obj is None:
         return None
-    try:
-        if _HAS_NUMPY and np is not None:
-            q = float(np.quantile(np.asarray(returns, dtype=float), 0.05))
-        else:
-            sorted_returns = sorted(returns)
-            idx = max(0, int(0.05 * (len(sorted_returns) - 1)))
-            q = float(sorted_returns[idx])
-        return float(abs(q)) if q < 0 else 0.0
-    except Exception:
-        return None
-
-
-def _sharpe_1y(closes: List[float]) -> Optional[float]:
-    """Annualized Sharpe ratio (dimensionless)."""
-    returns = _simple_returns(closes)
-    if len(returns) < 60:
-        return None
-    window = returns[-252:] if len(returns) >= 252 else returns[:]
-    if len(window) < 30:
-        return None
-    try:
-        if _HAS_NUMPY and np is not None:
-            arr = np.asarray(window, dtype=float)
-            mu = float(np.mean(arr))
-            sd = float(np.std(arr, ddof=1))
-        else:
-            mu = float(sum(window) / len(window))
-            sd = float(statistics.stdev(window))
-        if sd <= 0 or math.isnan(sd) or math.isinf(sd):
-            return None
-        return float((mu * 252.0) / (sd * math.sqrt(252.0)))
-    except Exception:
-        return None
-
-
-def _rsi_14(closes: List[float]) -> Optional[float]:
-    """RSI(14) with Wilder's smoothing (NumPy-accelerated with pure-Python fallback)."""
-    if len(closes) < 15:
-        return None
-
-    period = 14
-
-    if _HAS_NUMPY and np is not None:
+    for name in names:
         try:
-            arr = np.asarray(closes, dtype=float)
-            diff = np.diff(arr)
-            gains = np.where(diff > 0, diff, 0.0)
-            losses = np.where(diff < 0, -diff, 0.0)
-
-            avg_gain = float(gains[:period].mean())
-            avg_loss = float(losses[:period].mean())
-
-            for i in range(period, len(gains)):
-                avg_gain = (avg_gain * (period - 1) + float(gains[i])) / period
-                avg_loss = (avg_loss * (period - 1) + float(losses[i])) / period
-
-            if avg_loss == 0:
-                return 100.0
-            rs = avg_gain / avg_loss
-            return 100.0 - (100.0 / (1.0 + rs))
+            if isinstance(obj, dict) and name in obj:
+                return obj.get(name)
+            if hasattr(obj, name):
+                return getattr(obj, name)
         except Exception:
-            pass
-
-    # Pure Python fallback
-    diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0.0 for d in diffs]
-    losses = [-d if d < 0 else 0.0 for d in diffs]
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+            continue
+    return None
 
 
-def _simple_forecast(
-    closes: List[float],
-    horizon_days: int,
-) -> Tuple[Optional[float], Optional[float], float]:
-    """Simple price forecast via log-linear regression. Returns (price, roi_frac, confidence)."""
-    if len(closes) < 60 or horizon_days <= 0:
-        return None, None, 0.0
+def _pick(info: Dict[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in info:
+            return info.get(name)
+    return None
 
-    try:
-        n = min(len(closes), 252)
-        y = closes[-n:]
-        if any(p <= 0 for p in y):
-            return None, None, 0.0
 
-        last = float(closes[-1])
-
-        if _HAS_NUMPY and np is not None:
-            arr = np.asarray(y, dtype=float)
-            x = np.arange(len(arr), dtype=float)
-            log_y = np.log(arr)
-            slope, intercept = np.polyfit(x, log_y, 1)
-            pred = slope * x + intercept
-            ss_res = float(np.sum((log_y - pred) ** 2))
-            ss_tot = float(np.sum((log_y - float(np.mean(log_y))) ** 2))
-            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-            future_x = float(len(arr) - 1 + horizon_days)
-            forecast_price = float(math.exp(float(slope) * future_x + float(intercept)))
-        else:
-            # CAGR-based fallback
-            start, end = y[0], y[-1]
-            years = max(1e-6, len(y) / 252.0)
-            cagr = (end / start) ** (1 / years) - 1
-            forecast_price = end * ((1 + cagr) ** (horizon_days / 252.0))
-            r2 = 0.25
-
-        roi_fraction = (forecast_price / last) - 1.0
-        vol30 = _volatility_nd(closes, 30) or 0.25
-        confidence = max(0.05, min(0.95,
-            (max(0.0, min(1.0, r2)) * 0.8 + 0.2)
-            * (1.0 / (1.0 + max(0.0, vol30 - 0.25)))
-        ))
-        return forecast_price, roi_fraction, confidence
-    except Exception:
-        return None, None, 0.0
+def _coalesce(*vals: Any) -> Any:
+    for v in vals:
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        return v
+    return None
 
 
 # =============================================================================
-# v8.2.0: Identity Defaults Table (suffix -> exchange/currency/country)
+# v6.2.0: Identity Defaults Table (suffix -> exchange/currency/country)
 # =============================================================================
-#
-# Byte-aligned with enriched_quote.py v4.6.0 _SUFFIX_TO_LOCALE. Used as
-# fallback when the normalize.py SSOT (`_infer_symbol_metadata_external`)
-# is unavailable. Adding a new suffix here AND in enriched_quote.py keeps
-# the two layers in sync; preferring the SSOT route avoids the need.
 
 _SUFFIX_TO_LOCALE_DEFAULTS: Dict[str, Tuple[str, str, str]] = {
     # Hong Kong
@@ -1786,11 +973,13 @@ _SUFFIX_TO_LOCALE_DEFAULTS: Dict[str, Tuple[str, str, str]] = {
     ".SW":    ("SIX",                     "CHF", "Switzerland"),
     # Oceania
     ".AX":    ("ASX",                     "AUD", "Australia"),
+    ".AU":    ("ASX",                     "AUD", "Australia"),   # v6.3.1: EODHD-format Australia
     ".NZ":    ("NZX",                     "NZD", "New Zealand"),
     # Japan / Korea / SE Asia
     ".T":     ("TSE",                     "JPY", "Japan"),
     ".TYO":   ("TSE",                     "JPY", "Japan"),
     ".KS":    ("KRX",                     "KRW", "South Korea"),
+    ".KO":    ("KRX",                     "KRW", "South Korea"),   # v6.3.1: EODHD-format Korea
     ".KQ":    ("KOSDAQ",                  "KRW", "South Korea"),
     ".SI":    ("SGX",                     "SGD", "Singapore"),
     ".KL":    ("Bursa Malaysia",          "MYR", "Malaysia"),
@@ -1801,9 +990,10 @@ _SUFFIX_TO_LOCALE_DEFAULTS: Dict[str, Tuple[str, str, str]] = {
     ".SZ":    ("Shenzhen",                "CNY", "China"),
     ".TW":    ("TWSE",                    "TWD", "Taiwan"),
     ".TWO":   ("TPEx",                    "TWD", "Taiwan"),
-    # Latin America / Africa
+    # Latin America
     ".MX":    ("BMV",                     "MXN", "Mexico"),
     ".BA":    ("BCBA",                    "ARS", "Argentina"),
+    # Africa
     ".JO":    ("JSE",                     "ZAR", "South Africa"),
     ".JSE":   ("JSE",                     "ZAR", "South Africa"),
     # GCC (Kuwait / Qatar / UAE)
@@ -1834,55 +1024,51 @@ _SUFFIX_TO_LOCALE_DEFAULTS: Dict[str, Tuple[str, str, str]] = {
 }
 
 
-def _identity_defaults_for_symbol(symbol: str) -> Dict[str, Optional[str]]:
-    """
-    Return identity defaults (exchange / currency / country / asset_class)
-    derived purely from the symbol's structure (v8.2.0).
-
-    Resolution order (first match wins):
-      1. Empty / None             -> all None
-      2. ``...=F`` futures        -> NYMEX / USD / USA / FUTURE
-      3. ``...=X`` FX pairs       -> CCY / None / None / FX
-      4. ``^...`` indices         -> INDEX / None / None / INDEX
-      5. SSOT (normalize.py)      -> whatever it returns (when available)
-      6. Longest-match suffix in  -> (exchange, currency, country) / EQUITY
-         ``_SUFFIX_TO_LOCALE_DEFAULTS``
-      7. Plain alpha, no dot      -> NASDAQ/NYSE / USD / USA / EQUITY
-      8. Unknown                  -> all None (don't guess)
-
-    Used by ``_infer_asset_class`` / ``_infer_exchange`` / ``_enrich_data``
-    when Yahoo's ``info`` payload doesn't supply the relevant field.
-    """
-    if not symbol:
+def _identity_defaults_for_symbol(norm_symbol: str) -> Dict[str, Optional[str]]:
+    if not norm_symbol:
         return {"exchange": None, "currency": None, "country": None, "asset_class": None}
 
-    s = symbol.strip().upper()
+    s = norm_symbol.strip().upper()
 
-    # Special patterns (these don't appear in _SUFFIX_TO_LOCALE_DEFAULTS)
     if s.endswith("=F"):
-        return {"exchange": "NYMEX", "currency": "USD", "country": "USA", "asset_class": "FUTURE"}
+        return {"exchange": "NYMEX", "currency": "USD", "country": "USA", "asset_class": "Future"}
     if s.endswith("=X"):
-        return {"exchange": "CCY", "currency": None, "country": None, "asset_class": "FX"}
+        return {"exchange": "CCY", "currency": None, "country": None, "asset_class": "Currency"}
     if s.startswith("^"):
-        return {"exchange": "INDEX", "currency": None, "country": None, "asset_class": "INDEX"}
+        return {"exchange": "INDEX", "currency": None, "country": None, "asset_class": "Index"}
 
-    # SSOT path (normalize.py v5.3.0+) when available
     if _infer_symbol_metadata_external is not None:
         try:
             meta = _infer_symbol_metadata_external(s)
             if isinstance(meta, dict):
                 inferred_from = meta.get("inferred_from")
                 if inferred_from not in (None, "", "none"):
+                    ac_raw = meta.get("asset_class") or "EQUITY"
+                    ac_norm = str(ac_raw).strip().upper().replace(" ", "_")
+                    ac_map = {
+                        "EQUITY": "Equity",
+                        "ETF": "ETF",
+                        "MUTUALFUND": "Mutual Fund",
+                        "MUTUAL_FUND": "Mutual Fund",
+                        "INDEX": "Index",
+                        "CURRENCY": "Currency",
+                        "FX": "Currency",
+                        "CRYPTOCURRENCY": "Crypto",
+                        "CRYPTO": "Crypto",
+                        "FUTURE": "Future",
+                        "FUTURES": "Future",
+                        "OPTION": "Option",
+                    }
+                    asset_class = ac_map.get(ac_norm, "Equity")
                     return {
                         "exchange": meta.get("exchange"),
                         "currency": meta.get("currency"),
                         "country": meta.get("country"),
-                        "asset_class": meta.get("asset_class") or "EQUITY",
+                        "asset_class": asset_class,
                     }
         except Exception:
             pass
 
-    # Local table fallback: longest matching suffix wins
     best_suffix: Optional[str] = None
     for suf in _SUFFIX_TO_LOCALE_DEFAULTS:
         if s.endswith(suf):
@@ -1894,754 +1080,1323 @@ def _identity_defaults_for_symbol(symbol: str) -> Dict[str, Optional[str]]:
             "exchange": exch,
             "currency": curr,
             "country": country,
-            "asset_class": "EQUITY",
+            "asset_class": "Equity",
         }
 
-    # Plain alpha with no dot -> US equity by Yahoo convention
-    # (futures/FX/indices already handled above; any remaining no-dot
-    # symbol is a US ticker like AAPL, BRK-A, GOOG, etc.)
     if "." not in s:
         return {
             "exchange": "NASDAQ/NYSE",
             "currency": "USD",
             "country": "USA",
-            "asset_class": "EQUITY",
+            "asset_class": "Equity",
         }
 
-    # Unknown suffix -> don't guess
     return {"exchange": None, "currency": None, "country": None, "asset_class": None}
 
 
-# =============================================================================
-# Yahoo Finance Sync Fetcher (runs in ThreadPool)
-# =============================================================================
+def _infer_asset_class(info: Dict[str, Any], norm_symbol: str) -> Optional[str]:
+    q = safe_str(_pick(info, "quoteType", "instrumentType", "typeDisp"))
+    if q:
+        qn = q.strip().upper().replace(" ", "_")
+        mapping = {
+            "EQUITY": "Equity",
+            "ETF": "ETF",
+            "MUTUALFUND": "Mutual Fund",
+            "MUTUAL_FUND": "Mutual Fund",
+            "INDEX": "Index",
+            "CURRENCY": "Currency",
+            "CRYPTOCURRENCY": "Crypto",
+            "FUTURE": "Future",
+            "FUTURES": "Future",
+            "OPTION": "Option",
+        }
+        if qn in mapping:
+            return mapping[qn]
 
-def _safe_history_metadata(ticker: Any) -> Dict[str, Any]:
-    """
-    Safely extract history metadata from a yfinance Ticker.
-
-    yfinance populates `ticker.history_metadata` after `.history()` is called.
-    v7.0.0 had a dead placeholder that always returned {} -- v8.0.0 reads
-    the real attribute, then falls back to the `get_history_metadata()`
-    method if present.
-    """
-    if ticker is None:
-        return {}
-
-    try:
-        meta = getattr(ticker, "history_metadata", None)
-        if isinstance(meta, dict) and meta:
-            return meta
-    except Exception:
-        pass
-
-    try:
-        fn = getattr(ticker, "get_history_metadata", None)
-        if callable(fn):
-            meta = fn()
-            if isinstance(meta, dict) and meta:
-                return meta
-    except Exception:
-        pass
-
-    return {}
-
-
-def _infer_asset_class(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """
-    Infer asset class from symbol + info + metadata.
-
-    Priority order (v8.2.0):
-      1. Yahoo `info.quoteType` (or `meta.instrumentType`) when present.
-      2. v8.2.0: fall through to `_identity_defaults_for_symbol` which
-         covers 60+ stock-exchange suffixes (all return "EQUITY") plus
-         the futures / FX / index special patterns.
-    """
-    quote_type = None
-    if isinstance(info, dict):
-        quote_type = _safe_str(info.get("quoteType") or info.get("quote_type") or info.get("type"))
-    if quote_type is None and isinstance(meta, dict):
-        quote_type = _safe_str(meta.get("instrumentType") or meta.get("quoteType"))
-
-    if quote_type:
-        qt_upper = quote_type.upper()
-        if qt_upper in {"CURRENCY", "FOREX", "FX"}:
-            return "FX"
-        if qt_upper in {"ETF", "MUTUALFUND", "MUTUAL FUND"}:
-            return qt_upper
-        return qt_upper
-
-    # v8.2.0: suffix-table fallthrough (replaces v8.1.0's hand-coded
-    # .SR / =F / =X / ^ checks; same patterns + 60 more)
-    defaults = _identity_defaults_for_symbol(symbol)
+    defaults = _identity_defaults_for_symbol(norm_symbol)
     return defaults.get("asset_class")
 
 
-def _infer_exchange(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """
-    Infer exchange from symbol + info + metadata.
+# =============================================================================
+# v6.1.0: User-Agent Rotation + Session Factory
+# =============================================================================
 
-    Priority order (v8.2.0):
-      1. Yahoo `info.exchange` / `info.fullExchangeName` / `info.exchangeName`.
-      2. Yahoo `meta.exchangeName` / `meta.exchangeTimezoneName`.
-      3. v8.2.0: fall through to `_identity_defaults_for_symbol` which
-         resolves 60+ stock-exchange suffixes to display names
-         (e.g. .KW -> "Boursa Kuwait", .NS -> "NSE", .HK -> "HKEX").
-    """
-    if isinstance(info, dict):
-        exchange = _first_str(
-            info.get("exchange"), info.get("fullExchangeName"), info.get("exchangeName"),
-        )
-        if exchange:
-            return exchange
-    if isinstance(meta, dict):
-        exchange = _first_str(meta.get("exchangeName"), meta.get("exchangeTimezoneName"))
-        if exchange:
-            return exchange
-
-    # v8.2.0: suffix-table fallthrough (replaces v8.1.0's hand-coded
-    # .SR / =F / =X / ^ checks)
-    defaults = _identity_defaults_for_symbol(symbol)
-    return defaults.get("exchange")
+def _pick_random_ua() -> str:
+    return random.choice(_USER_AGENTS)
 
 
-def _fetch_ticker_sync(
-    symbol: str,
-    period: str = DEFAULT_HISTORY_PERIOD,
-    interval: str = DEFAULT_HISTORY_INTERVAL,
-) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
-    """
-    Blocking fetch of ticker data. Runs in ThreadPoolExecutor.
-
-    v8.0.0 bug fix: `period` and `interval` are now proper parameters.
-    v7.0.0 hardcoded interval="1d" and had the nonsense expression
-      period=_HAS_PANDAS and pd is not None and "YAHOO_HISTORY_PERIOD"
-             in globals() or "2y"
-    which always evaluated to "2y" regardless of config / env var.
-
-    Returns:
-        Tuple of (info_dict, history_metadata, history_list)
-    """
-    if not _HAS_YFINANCE or yf is None:
-        return {}, {}, []
-
+def _create_yf_session(use_rotation: bool) -> Optional[Any]:
+    if not use_rotation or not _HAS_REQUESTS or requests is None:
+        return None
     try:
-        ticker = yf.Ticker(_yc_yahoo_symbol(symbol))  # v8.4.0 SSOT map
-
-        # Info: fast_info first, then full .info
-        info_dict: Dict[str, Any] = {}
-        try:
-            fast_info = getattr(ticker, "fast_info", None)
-            if fast_info:
-                info_dict = dict(fast_info)
-        except Exception:
-            pass
-
-        try:
-            info = getattr(ticker, "info", None)
-            if isinstance(info, dict):
-                info_dict.update(info)
-        except Exception:
-            pass
-
-        # History (respects config-provided period/interval)
-        history_list: List[Dict[str, Any]] = []
-        try:
-            # v8.8.0 (YC-ADJ-2): auto_adjust pinned explicitly — library
-            # default today, but the raw transport now adjusts too and the two
-            # must never diverge again on a yfinance default-flip.
-            hist_df = ticker.history(period=period, interval=interval, auto_adjust=True)
-            if (_HAS_PANDAS and pd is not None
-                    and isinstance(hist_df, pd.DataFrame) and not hist_df.empty):
-                hist_df = hist_df.reset_index()
-                for _, row in hist_df.iterrows():
-                    row_dict = row.to_dict()
-                    dt_val = row_dict.get("Date") or row_dict.get("Datetime")
-                    if hasattr(dt_val, "to_pydatetime"):
-                        dt_val = dt_val.to_pydatetime()
-
-                    history_list.append({
-                        "timestamp": _utc_iso(dt_val) if isinstance(dt_val, datetime) else str(dt_val),
-                        "open": _safe_float(row_dict.get("Open")),
-                        "high": _safe_float(row_dict.get("High")),
-                        "low": _safe_float(row_dict.get("Low")),
-                        "close": _safe_float(row_dict.get("Close")),
-                        "volume": _safe_float(row_dict.get("Volume")),
-                    })
-        except Exception:
-            pass
-
-        # v8.0.0: capture history_metadata *after* calling .history() (it's
-        # populated lazily by yfinance). v7.0.0 passed None to the helper
-        # and got {} back every time.
-        meta = _safe_history_metadata(ticker)
-
-        return info_dict, meta, history_list
+        sess = requests.Session()
+        sess.headers.update({
+            "User-Agent": _pick_random_ua(),
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        })
+        return sess
     except Exception as exc:
-        logger.warning("Sync fetch failed for %s: %s", symbol, exc)
-        return {}, {}, []
+        logger.debug("yf session creation failed: %s", exc)
+        return None
 
 
-def _enrich_data(
-    symbol: str,
-    info: Dict[str, Any],
-    meta: Dict[str, Any],
-    history: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Enrich raw Yahoo data into the canonical patch shape."""
-    # 1. Quote core
-    price = _first_number(
-        info.get("currentPrice"),
-        info.get("regularMarketPrice"),
-        info.get("lastPrice"),
-    )
-    prev_close = _first_number(
-        info.get("previousClose"),
-        info.get("regularMarketPreviousClose"),
-    )
-
-    # Fallback to history when live fields are missing
-    # v8.5.0 (Fix AR support): remember whether `price` came from the live
-    # info fields or the history fallback, so the reported bar time below
-    # describes the bar the price ACTUALLY came from.
-    _price_from_live_info = bool(price)
-    if not price and history:
-        price = history[-1].get("close")
-        if not prev_close and len(history) > 1:
-            prev_close = history[-2].get("close")
-
-    # v8.5.0 (Fix AR support): the ISO time of the bar/quote backing `price`.
-    # Live-info price -> regularMarketTime (info first, then history meta),
-    # epoch -> ISO; missing -> last history bar. History-fallback price ->
-    # that bar's own timestamp. Unresolvable -> None (engine skips the check).
-    price_bar_ts: Optional[str] = None
+def _rotate_session_ua(session: Any) -> None:
+    if session is None:
+        return
     try:
-        if _price_from_live_info:
-            _rmt = _first_number(
-                info.get("regularMarketTime"),
-                (meta or {}).get("regularMarketTime"),
-            )
-            if _rmt and _rmt > 1e8:
-                if _rmt > 1e12:  # milliseconds
-                    _rmt = _rmt / 1000.0
-                price_bar_ts = _utc_iso(datetime.fromtimestamp(float(_rmt), tz=timezone.utc))
-        if not price_bar_ts and history:
-            _last_bar_ts = history[-1].get("timestamp")
-            if _last_bar_ts:
-                price_bar_ts = str(_last_bar_ts)
+        session.headers["User-Agent"] = _pick_random_ua()
     except Exception:
-        price_bar_ts = None
+        pass
 
-    percent_change = None
-    if price and prev_close and prev_close > 0:
-        percent_change = (price / prev_close) - 1.0
 
-    change = None
-    if price and prev_close:
-        change = price - prev_close
+def _is_rate_limit_error(err: Optional[BaseException]) -> bool:
+    if err is None:
+        return False
+    try:
+        s = str(err).lower()
+    except Exception:
+        return False
+    return any(m in s for m in _RATE_LIMIT_MARKERS)
 
-    # 2. Volume + market cap
-    volume = _first_number(info.get("volume"), info.get("regularMarketVolume"))
-    if not volume and history:
-        volume = history[-1].get("volume")
 
-    market_cap = _first_number(info.get("marketCap"))
+def _construct_ticker(symbol: str, session: Any) -> Any:
+    if yf is None:
+        return None
+    if session is None:
+        return yf.Ticker(symbol)
+    try:
+        return yf.Ticker(symbol, session=session)
+    except TypeError:
+        return yf.Ticker(symbol)
+    except Exception as exc:
+        logger.debug("yf.Ticker(%s, session=...) failed (%s); retrying bare",
+                     symbol, exc)
+        try:
+            return yf.Ticker(symbol)
+        except Exception:
+            return None
 
-    # 3. 52-week range
-    week_52_high = _first_number(info.get("fiftyTwoWeekHigh"))
-    week_52_low = _first_number(info.get("fiftyTwoWeekLow"))
 
-    if not week_52_high and history:
-        closes_252 = [h["close"] for h in history[-252:] if h.get("close")]
-        if closes_252:
-            week_52_high = max(closes_252)
-            week_52_low = min(closes_252)
+# =============================================================================
+# v6.1.0: 52W Bounds Validation (Currency-Mismatch Guard)
+# =============================================================================
 
-    week_52_position = None
-    if price and week_52_high and week_52_low and week_52_high > week_52_low:
-        week_52_position = (price - week_52_low) / (week_52_high - week_52_low)
+def _is_suspect_price_ratio(
+    ref: Optional[float],
+    candidate: Optional[float],
+    *,
+    ratio_high: float = DEFAULT_PRICE_RATIO_HIGH,
+    ratio_low: float = DEFAULT_PRICE_RATIO_LOW,
+) -> bool:
+    if ref is None or candidate is None:
+        return False
+    if ref <= 0 or candidate <= 0:
+        return False
+    ratio = candidate / ref
+    return ratio >= ratio_high or ratio <= ratio_low
 
-    # 4. History-derived stats
-    closes_list = [h["close"] for h in history if h.get("close")]
-    volatility_30d = _volatility_nd(closes_list, 30)
-    rsi_14 = _rsi_14(closes_list)
-    max_drawdown_1y = _max_drawdown_1y(closes_list)
-    sharpe_1y = _sharpe_1y(closes_list)
-    var_95_1d = _var_95_1d(closes_list)
 
-    # 5. Forecast
-    forecast_price_12m, expected_roi_12m, forecast_confidence = _simple_forecast(closes_list, 252)
+def _validate_52w_bounds(
+    current_price: Optional[float],
+    info_52w_high: Optional[float],
+    info_52w_low: Optional[float],
+    hist_52w_high: Optional[float],
+    hist_52w_low: Optional[float],
+    *,
+    enabled: bool = True,
+    ratio_high: float = DEFAULT_PRICE_RATIO_HIGH,
+    ratio_low: float = DEFAULT_PRICE_RATIO_LOW,
+) -> Tuple[Optional[float], Optional[float], List[str]]:
+    warnings: List[str] = []
 
-    # 6. Fundamentals (light)
-    dividend_yield = _first_fraction(
-        info.get("dividendYield"),
-        info.get("trailingAnnualDividendYield"),
-    )
-    gross_margin = _first_fraction(info.get("grossMargins"))
-    operating_margin = _first_fraction(info.get("operatingMargins"))
-    profit_margin = _first_fraction(info.get("profitMargins"))
-    roe = _first_fraction(info.get("returnOnEquity"))
+    if not enabled:
+        hi = info_52w_high if info_52w_high is not None else hist_52w_high
+        lo = info_52w_low if info_52w_low is not None else hist_52w_low
+        return hi, lo, warnings
 
-    # 7. Valuation
-    pe_ttm = _first_number(info.get("trailingPE"))
-    pb_ratio = _first_number(info.get("priceToBook"))
-    eps_ttm = _first_number(info.get("trailingEps"))
+    cp = safe_float(current_price)
+    info_hi = safe_float(info_52w_high)
+    info_lo = safe_float(info_52w_low)
+    hist_hi = safe_float(hist_52w_high)
+    hist_lo = safe_float(hist_52w_low)
 
-    # 8. Identity (v8.2.0: when Yahoo doesn't return exchange / currency /
-    #    country, fall through to suffix-derived defaults so the downstream
-    #    `enriched_quote.py` v4.6.0 normalization stage has nothing left to
-    #    repair. Yahoo's values always win when present.)
-    #    v8.0.0: `meta` is now the REAL ticker metadata, not an empty
-    #    placeholder -- so asset class / exchange inference actually
-    #    benefits from yfinance's history_metadata field.
-    asset_class = _infer_asset_class(symbol, info, meta)
-    exchange = _infer_exchange(symbol, info, meta)
+    if cp is None or cp <= 0:
+        hi = info_hi if info_hi is not None else hist_hi
+        lo = info_lo if info_lo is not None else hist_lo
+        return hi, lo, warnings
 
-    # Currency: prefer Yahoo's explicit field, fall back to suffix table
-    currency = _first_str(info.get("currency"), info.get("financialCurrency"))
-
-    # Country: NEW in v8.2.0 (was absent from the v8.1.0 patch shape).
-    # Prefer Yahoo's `country` field, fall back to suffix table.
-    country = _first_str(info.get("country"))
-
-    # Single lookup, used for any field Yahoo left blank
-    _identity_defaults = _identity_defaults_for_symbol(symbol)
-    if currency is None and _identity_defaults.get("currency"):
-        currency = _identity_defaults["currency"]
-    if country is None and _identity_defaults.get("country"):
-        country = _identity_defaults["country"]
-
-    # v8.0.0 minor: compute open_price once instead of twice
-    open_price = _first_number(info.get("open"), info.get("regularMarketOpen"))
-    day_high = _first_number(info.get("dayHigh"), info.get("regularMarketDayHigh"))
-    day_low = _first_number(info.get("dayLow"), info.get("regularMarketDayLow"))
-
-    # Data quality
-    if price and history:
-        data_quality = "EXCELLENT"
-    elif price:
-        data_quality = "GOOD"
+    # --- High ---
+    hi: Optional[float]
+    if info_hi is not None and not _is_suspect_price_ratio(cp, info_hi,
+                                                           ratio_high=ratio_high,
+                                                           ratio_low=ratio_low):
+        hi = info_hi
+    elif info_hi is not None:
+        warnings.append("week_52_high_unit_mismatch_dropped")
+        if hist_hi is not None and not _is_suspect_price_ratio(cp, hist_hi,
+                                                               ratio_high=ratio_high,
+                                                               ratio_low=ratio_low):
+            hi = hist_hi
+            warnings.append("week_52_high_used_history_fallback")
+        else:
+            if hist_hi is not None:
+                warnings.append("week_52_high_history_unit_mismatch_dropped")
+            hi = None
+    elif hist_hi is not None and not _is_suspect_price_ratio(cp, hist_hi,
+                                                             ratio_high=ratio_high,
+                                                             ratio_low=ratio_low):
+        hi = hist_hi
+    elif hist_hi is not None:
+        warnings.append("week_52_high_history_unit_mismatch_dropped")
+        hi = None
     else:
-        data_quality = "STALE"
+        hi = None
 
-    result = {
-        "symbol": symbol,
-        "symbol_normalized": symbol,
-        "provider": PROVIDER_NAME,
-        "provider_version": PROVIDER_VERSION,
-        "data_source": PROVIDER_NAME,
-        "data_quality": data_quality,
-        "last_updated_utc": _utc_iso(),
-        "last_updated_riyadh": _riyadh_iso(),
-        # v8.5.0 (Fix AR support): time of the bar/quote backing current_price.
-        # Canonicalized by the engine into price_bar_ts; inert when the engine
-        # gate is off. None -> dropped by the engine merge (no schema impact).
-        "timestamp": price_bar_ts,
-        # Price fields
-        "current_price": price,
-        "price": price,
-        "previous_close": prev_close,
-        "prev_close": prev_close,
-        "price_change": change,
-        "change": change,
-        "percent_change": percent_change,
-        "change_pct": percent_change,
-        "open_price": open_price,
-        "open": open_price,
-        "day_high": day_high,
-        "day_low": day_low,
-        "volume": volume,
-        "market_cap": market_cap,
-        # 52-week
-        "week_52_high": week_52_high,
-        "week_52_low": week_52_low,
-        "week_52_position_pct": week_52_position,
-        # Fundamentals
-        "dividend_yield": dividend_yield,
-        "pe_ttm": pe_ttm,
-        "pb_ratio": pb_ratio,
-        "roe": roe,
-        "eps_ttm": eps_ttm,
-        "gross_margin": gross_margin,
-        "operating_margin": operating_margin,
-        "profit_margin": profit_margin,
-        # Risk metrics
-        "volatility_30d": volatility_30d,
-        "rsi_14": rsi_14,
-        "max_drawdown_1y": max_drawdown_1y,
-        "sharpe_1y": sharpe_1y,
-        "var_95_1d": var_95_1d,
-        # Forecast
-        "forecast_price_12m": forecast_price_12m,
-        "expected_roi_12m": expected_roi_12m,
-        "forecast_confidence": forecast_confidence,
-        # Identity
-        "currency": currency,
-        "country": country,
-        "asset_class": asset_class,
-        "exchange": exchange,
-    }
+    # --- Low ---
+    lo: Optional[float]
+    if info_lo is not None and not _is_suspect_price_ratio(cp, info_lo,
+                                                           ratio_high=ratio_high,
+                                                           ratio_low=ratio_low):
+        lo = info_lo
+    elif info_lo is not None:
+        warnings.append("week_52_low_unit_mismatch_dropped")
+        if hist_lo is not None and not _is_suspect_price_ratio(cp, hist_lo,
+                                                               ratio_high=ratio_high,
+                                                               ratio_low=ratio_low):
+            lo = hist_lo
+            warnings.append("week_52_low_used_history_fallback")
+        else:
+            if hist_lo is not None:
+                warnings.append("week_52_low_history_unit_mismatch_dropped")
+            lo = None
+    elif hist_lo is not None and not _is_suspect_price_ratio(cp, hist_lo,
+                                                             ratio_high=ratio_high,
+                                                             ratio_low=ratio_low):
+        lo = hist_lo
+    elif hist_lo is not None:
+        warnings.append("week_52_low_history_unit_mismatch_dropped")
+        lo = None
+    else:
+        lo = None
 
-    return clean_dict(result)
+    if hi is not None and lo is not None and hi < lo:
+        warnings.append("week_52_high_low_inverted")
+        hi, lo = lo, hi
+
+    if hi is not None and cp > hi * 1.05:
+        warnings.append("current_price_outside_52w_range")
+    elif lo is not None and cp < lo * 0.95:
+        warnings.append("current_price_outside_52w_range")
+
+    return hi, lo, warnings
+
+
+def _validate_forecast_magnitude(
+    forecast_price: Optional[float],
+    current_price: Optional[float],
+    *,
+    enabled: bool = True,
+    ratio_high: float = DEFAULT_PRICE_RATIO_HIGH,
+    ratio_low: float = DEFAULT_PRICE_RATIO_LOW,
+) -> Tuple[Optional[float], List[str]]:
+    warnings: List[str] = []
+    if not enabled:
+        return forecast_price, warnings
+
+    fp = safe_float(forecast_price)
+    cp = safe_float(current_price)
+    if fp is None or cp is None or cp <= 0:
+        return fp, warnings
+
+    if _is_suspect_price_ratio(cp, fp, ratio_high=ratio_high, ratio_low=ratio_low):
+        warnings.append("forecast_magnitude_suspect")
+        return None, warnings
+
+    return fp, warnings
 
 
 # =============================================================================
-# Yahoo Chart Provider (async wrapper)
+# Data Quality
 # =============================================================================
 
-class YahooChartProvider:
-    """Async wrapper for Yahoo Finance."""
+class DataQuality(str, Enum):
+    EXCELLENT = "EXCELLENT"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    STALE = "STALE"
+    ERROR = "ERROR"
+    MISSING = "MISSING"
 
-    def __init__(self, config: Optional[YahooConfig] = None):
-        self.config = config or YahooConfig.from_env()
-        self._token_bucket = TokenBucket(
-            rate_per_sec=self.config.rate_limit_per_sec,
-            burst=self.config.rate_limit_burst,
-        )
-        self._circuit_breaker = CircuitBreaker(
-            fail_threshold=self.config.cb_fail_threshold,
-            cooldown_sec=self.config.cb_cooldown_sec,
-            success_threshold=self.config.cb_success_threshold,
-        )
-        self._single_flight = SingleFlight()
-        self._cache = AdvancedCache(
-            name="yahoo",
-            ttl_sec=self.config.quote_ttl_sec,
-            max_size=5000,
-        )
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.config.threadpool_workers,
-            thread_name_prefix="YahooWorker",
-        )
-        # v8.7.0: throttle marker so a CB-open storm logs once per cooldown.
-        self._cb_deny_log_ts: float = 0.0
 
-    async def get_enriched_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get an enriched quote for a single symbol."""
-        if not self.config.is_available or not symbol:
-            return None
+def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
+    score = 0.0
 
-        sym = normalize_symbol(symbol)
-        # v8.0.0: early-return on empty normalized symbol, avoiding a pointless cache lookup
-        if not sym:
-            return None
+    if safe_str(patch.get("symbol")):
+        score += 8
+    if safe_str(patch.get("name")):
+        score += 6
+    if safe_str(patch.get("currency")):
+        score += 3
+    if safe_str(patch.get("exchange")):
+        score += 3
+    if safe_str(patch.get("asset_class")):
+        score += 3
 
-        cached = await self._cache.get(sym, kind="enriched")
-        metrics = _get_metrics()
+    cp = safe_float(patch.get("current_price"))
+    if cp is not None and cp > 0:
+        score += 10
+    else:
+        score -= 8
+
+    if safe_float(patch.get("market_cap")) is not None:
+        score += 8
+
+    if safe_float(patch.get("pe_ttm")) is not None:
+        score += 6
+    if safe_float(patch.get("pb_ratio") or patch.get("pb")) is not None:
+        score += 6
+    if safe_float(patch.get("ps_ratio") or patch.get("ps")) is not None:
+        score += 5
+    if safe_float(patch.get("peg_ratio") or patch.get("peg")) is not None:
+        score += 4
+    if safe_float(patch.get("ev_ebitda")) is not None:
+        score += 4
+
+    if _as_fraction(patch.get("profit_margin") or patch.get("net_margin")) is not None:
+        score += 6
+    if _as_fraction(patch.get("gross_margin")) is not None:
+        score += 4
+    if _as_fraction(patch.get("operating_margin")) is not None:
+        score += 4
+    if _as_fraction(patch.get("roe")) is not None:
+        score += 5
+
+    if _as_fraction(patch.get("revenue_growth_yoy") or patch.get("revenue_growth")) is not None:
+        score += 6
+    if safe_float(patch.get("revenue_ttm")) is not None:
+        score += 5
+    if safe_float(patch.get("free_cash_flow_ttm") or patch.get("free_cashflow")) is not None:
+        score += 5
+
+    if safe_float(patch.get("target_mean_price")) is not None:
+        score += 5
+    if safe_int(patch.get("analyst_count")) is not None:
+        score += 3
+    if safe_str(patch.get("provider_rating")):
+        score += 2
+
+    score = max(0.0, min(100.0, score))
+
+    if score >= 85:
+        return DataQuality.EXCELLENT, score
+    if score >= 70:
+        return DataQuality.HIGH, score
+    if score >= 55:
+        return DataQuality.MEDIUM, score
+    if score >= 35:
+        return DataQuality.LOW, score
+    return DataQuality.MISSING, score
+
+
+# =============================================================================
+# Async Primitives (lazy locks)
+# =============================================================================
+
+@dataclass(slots=True)
+class CacheStats:
+    hits: int = 0
+    misses: int = 0
+    sets: int = 0
+    evictions: int = 0
+    size: int = 0
+
+    def to_dict(self) -> Dict[str, int]:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "sets": self.sets,
+            "evictions": self.evictions,
+            "size": self.size,
+        }
+
+
+class AdvancedCache:
+    def __init__(self, name: str, maxsize: int, ttl: float, use_redis: bool, redis_url: str):
+        self.name = name
+        self.maxsize = max(50, int(maxsize))
+        self.ttl = float(ttl)
+        self.use_redis = bool(use_redis and _REDIS_AVAILABLE and Redis)
+        self.redis_url = redis_url
+        self._mem: Dict[str, Tuple[Any, float]] = {}
+        self._touch: Dict[str, float] = {}
+        self._lock: Optional[asyncio.Lock] = None
+        self.stats = CacheStats()
+        self._redis: Any = None
+        if self.use_redis:
+            try:
+                self._redis = Redis.from_url(self.redis_url, decode_responses=False)  # type: ignore
+            except Exception as exc:
+                logger.warning("Redis cache init failed (%s): %s", self.name, exc)
+                self._redis = None
+                self.use_redis = False
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def _key(self, prefix: str) -> str:
+        h = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:16]
+        return f"yffund:{self.name}:{h}:{prefix}"
+
+    def _evict_lru(self) -> None:
+        if not self._touch:
+            return
+        oldest = min(self._touch.items(), key=lambda kv: kv[1])[0]
+        self._mem.pop(oldest, None)
+        self._touch.pop(oldest, None)
+        self.stats.evictions += 1
+
+    async def get(self, prefix: str) -> Optional[Any]:
+        k = self._key(prefix)
+        now = time.monotonic()
+        async with self._get_lock():
+            if k in self._mem:
+                v, exp = self._mem[k]
+                if now < exp:
+                    self._touch[k] = now
+                    self.stats.hits += 1
+                    return v
+                self._mem.pop(k, None)
+                self._touch.pop(k, None)
+
+        if self.use_redis and self._redis:
+            try:
+                blob = await self._redis.get(k)
+                if blob is not None:
+                    val = pickle.loads(zlib.decompress(blob)) if blob else {}
+                    async with self._get_lock():
+                        if len(self._mem) >= self.maxsize:
+                            self._evict_lru()
+                        self._mem[k] = (val, now + self.ttl)
+                        self._touch[k] = now
+                        self.stats.hits += 1
+                        self.stats.size = len(self._mem)
+                    return val
+            except Exception:
+                pass
+
+        self.stats.misses += 1
+        return None
+
+    async def set(self, prefix: str, value: Any, ttl: Optional[float] = None) -> None:
+        k = self._key(prefix)
+        exp = time.monotonic() + float(ttl or self.ttl)
+        now = time.monotonic()
+        async with self._get_lock():
+            if len(self._mem) >= self.maxsize and k not in self._mem:
+                self._evict_lru()
+            self._mem[k] = (value, exp)
+            self._touch[k] = now
+            self.stats.sets += 1
+            self.stats.size = len(self._mem)
+
+        if self.use_redis and self._redis:
+            try:
+                blob = zlib.compress(pickle.dumps(value))
+                await self._redis.setex(k, int(ttl or self.ttl), blob)
+            except Exception:
+                pass
+
+    async def close(self) -> None:
+        if self.use_redis and self._redis:
+            try:
+                await self._redis.close()
+            except Exception:
+                pass
+        self._redis = None
+
+    async def size(self) -> int:
+        async with self._get_lock():
+            return len(self._mem)
+
+
+class TokenBucket:
+    def __init__(self, rate_per_sec: float):
+        self.rate = max(0.0, float(rate_per_sec))
+        self.capacity = max(1.0, self.rate * 2.0) if self.rate > 0 else 1.0
+        self.tokens = self.capacity
+        self.last = time.monotonic()
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def wait_and_acquire(self, tokens: float = 1.0) -> None:
+        if self.rate <= 0:
+            return
+        need = float(tokens)
+        while True:
+            async with self._get_lock():
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+                self.last = now
+                if self.tokens >= need:
+                    self.tokens -= need
+                    return
+                wait = (need - self.tokens) / self.rate
+            await asyncio.sleep(min(1.0, max(0.01, wait)))
+
+
+class CircuitState(Enum):
+    CLOSED = "closed"
+    HALF_OPEN = "half_open"
+    OPEN = "open"
+
+    def to_numeric(self) -> float:
+        return {CircuitState.CLOSED: 0.0, CircuitState.HALF_OPEN: 1.0, CircuitState.OPEN: 2.0}[self]
+
+
+@dataclass(slots=True)
+class CircuitBreakerStats:
+    state: CircuitState = CircuitState.CLOSED
+    failures: int = 0
+    successes: int = 0
+    last_failure_ts: float = 0.0
+    open_until_ts: float = 0.0
+    cooldown_sec: float = 30.0
+
+
+class AdvancedCircuitBreaker:
+    def __init__(self, fail_threshold: int, cooldown_sec: float):
+        self.fail_threshold = max(1, int(fail_threshold))
+        self.stats = CircuitBreakerStats(cooldown_sec=float(cooldown_sec))
+        self._lock: Optional[asyncio.Lock] = None
+        self._half_open_probe_used = False
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def allow_request(self) -> bool:
+        if not _cb_enabled():
+            return True
+        async with self._get_lock():
+            now = time.monotonic()
+            if self.stats.state == CircuitState.CLOSED:
+                yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
+                return True
+            if self.stats.state == CircuitState.OPEN:
+                if now >= self.stats.open_until_ts:
+                    self.stats.state = CircuitState.HALF_OPEN
+                    self._half_open_probe_used = False
+                    yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
+                    return True
+                yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
+                return False
+            if not self._half_open_probe_used:
+                self._half_open_probe_used = True
+                yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
+                return True
+            yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
+            return False
+
+    async def on_success(self) -> None:
+        if not _cb_enabled():
+            return
+        async with self._get_lock():
+            self.stats.successes += 1
+            self.stats.state = CircuitState.CLOSED
+            self.stats.failures = 0
+            self._half_open_probe_used = False
+            yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
+
+    async def on_failure(self, status_code: int = 500) -> None:
+        if not _cb_enabled():
+            return
+        async with self._get_lock():
+            now = time.monotonic()
+            self.stats.failures += 1
+            self.stats.last_failure_ts = now
+            cooldown = self.stats.cooldown_sec
+            if status_code in (401, 403, 429):
+                cooldown = min(300.0, cooldown * 1.5)
+            if self.stats.state == CircuitState.HALF_OPEN:
+                self.stats.state = CircuitState.OPEN
+                self.stats.open_until_ts = now + min(300.0, cooldown * 2)
+            elif self.stats.failures >= self.fail_threshold:
+                self.stats.state = CircuitState.OPEN
+                self.stats.open_until_ts = now + cooldown
+            yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
+
+    def get_stats(self) -> Dict[str, Any]:
+        s = self.stats
+        return {
+            "state": s.state.value,
+            "fail_threshold": self.fail_threshold,
+            "failures": s.failures,
+            "successes": s.successes,
+            "last_failure_ts": s.last_failure_ts,
+            "open_until_ts": s.open_until_ts,
+            "cooldown_sec": s.cooldown_sec,
+        }
+
+
+class SingleFlight:
+    def __init__(self) -> None:
+        self._lock: Optional[asyncio.Lock] = None
+        self._futs: Dict[str, asyncio.Future] = {}
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def run(self, key: str, coro_fn: Callable[[], Awaitable[Any]]) -> Any:
+        owner = False
+        lock = self._get_lock()
+        async with lock:
+            fut = self._futs.get(key)
+            if fut is None:
+                fut = asyncio.get_running_loop().create_future()
+                self._futs[key] = fut
+                owner = True
+        if not owner:
+            return await fut  # type: ignore[return-value]
+        try:
+            res = await coro_fn()
+            if not fut.done():
+                fut.set_result(res)
+            return res
+        except Exception as exc:
+            if not fut.done():
+                fut.set_exception(exc)
+            raise
+        finally:
+            async with lock:
+                self._futs.pop(key, None)
+
+
+# =============================================================================
+# Yahoo Fundamentals Provider
+# =============================================================================
+
+@dataclass(slots=True)
+class YahooFundamentalsProvider:
+    name: str = PROVIDER_NAME
+
+    timeout_sec: float = field(init=False)
+    semaphore: Optional[asyncio.Semaphore] = field(init=False, default=None)
+    max_concurrency: int = field(init=False)
+    rate_limiter: TokenBucket = field(init=False)
+    circuit_breaker: AdvancedCircuitBreaker = field(init=False)
+    singleflight: SingleFlight = field(init=False)
+    fund_cache: AdvancedCache = field(init=False)
+    err_cache: AdvancedCache = field(init=False)
+    user_agent_rotation: bool = field(init=False)
+    price_sanity_guard: bool = field(init=False)
+    retry_attempts: int = field(init=False)
+    price_ratio_high: float = field(init=False)
+    price_ratio_low: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.timeout_sec = _timeout_sec()
+        self.max_concurrency = _max_concurrency()
+        self.semaphore = None
+        self.rate_limiter = TokenBucket(_rate_limit())
+        self.circuit_breaker = AdvancedCircuitBreaker(
+            fail_threshold=_cb_fail_threshold(),
+            cooldown_sec=_cb_cooldown_sec(),
+        )
+        self.singleflight = SingleFlight()
+        self.fund_cache = AdvancedCache(
+            name="fund",
+            maxsize=5000,
+            ttl=_fund_ttl_sec(),
+            use_redis=_enable_redis(),
+            redis_url=_redis_url(),
+        )
+        self.err_cache = AdvancedCache(
+            name="error",
+            maxsize=2000,
+            ttl=_err_ttl_sec(),
+            use_redis=_enable_redis(),
+            redis_url=_redis_url(),
+        )
+        self.user_agent_rotation = _user_agent_rotation()
+        self.price_sanity_guard = _price_sanity_guard()
+        self.retry_attempts = _retry_attempts()
+        self.price_ratio_high = _price_ratio_high()
+        self.price_ratio_low = _price_ratio_low()
+
+        logger.info(
+            "YahooFundamentalsProvider v%s initialized | yfinance=%s | requests=%s | "
+            "UA_rotation=%s | sanity_guard=%s | retries=%s | concurrency=%s | "
+            "rate=%s/s | cb=%s/%ss",
+            PROVIDER_VERSION,
+            _HAS_YFINANCE,
+            _HAS_REQUESTS,
+            self.user_agent_rotation,
+            self.price_sanity_guard,
+            self.retry_attempts,
+            self.max_concurrency,
+            _rate_limit(),
+            _cb_fail_threshold(),
+            _cb_cooldown_sec(),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return _configured()
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        if self.semaphore is None:
+            self.semaphore = asyncio.Semaphore(self.max_concurrency)
+        return self.semaphore
+
+    # -- History helpers --------------------------------------------------
+
+    def _history_rows(
+        self,
+        ticker: Any,
+        period: str = "3mo",
+        interval: str = "1d",
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        try:
+            hist = ticker.history(period=period, interval=interval, auto_adjust=False)
+            if hist is None or getattr(hist, "empty", True):
+                return []
+            for idx, row in hist.iterrows():
+                try:
+                    dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+                except Exception:
+                    dt = idx
+                rows.append({
+                    "date": _utc_iso(dt) if isinstance(dt, datetime) else safe_str(dt),
+                    "open": safe_float(row.get("Open")),
+                    "high": safe_float(row.get("High")),
+                    "low": safe_float(row.get("Low")),
+                    "close": safe_float(row.get("Close")),
+                    "volume": safe_float(row.get("Volume")),
+                })
+        except Exception:
+            return []
+        return rows
+
+    def _history_avg_volumes(
+        self,
+        rows: Iterable[Dict[str, Any]],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        vols = [safe_float(r.get("volume")) for r in rows]
+        clean = [float(v) for v in vols if v is not None and v >= 0]
+        if not clean:
+            return None, None
+        avg10 = sum(clean[-10:]) / min(10, len(clean))
+        avg30 = sum(clean[-30:]) / min(30, len(clean))
+        return (float(avg10), float(avg30))
+
+    def _history_52w(
+        self,
+        rows: Iterable[Dict[str, Any]],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        highs = [safe_float(r.get("high")) for r in rows]
+        lows = [safe_float(r.get("low")) for r in rows]
+        hs = [float(v) for v in highs if v is not None]
+        ls = [float(v) for v in lows if v is not None]
+        return (max(hs) if hs else None, min(ls) if ls else None)
+
+    # -- Blocking fetch (runs in ThreadPoolExecutor) ---------------------
+
+    def _blocking_fetch(self, norm_symbol: str) -> Dict[str, Any]:
+        warnings_list: List[str] = []
+        if not _HAS_YFINANCE or yf is None:
+            warnings_list.append("yfinance_not_installed")
+            return {
+                "error": "yfinance_not_installed",
+                "data_quality": DataQuality.ERROR.value,
+                "warnings": warnings_list,
+                "last_error_class": "ImportError",
+            }
+
+        session = _create_yf_session(self.user_agent_rotation)
+        # v6.3.1: the symbol actually sent to Yahoo must be in Yahoo's suffix
+        # format (.NS/.DE/.AX/.KS), not the EODHD/canonical form -- otherwise
+        # international fundamentals come back empty. Output fields still report
+        # the canonical norm_symbol; provider_symbol records what was queried.
+        provider_symbol = _to_yahoo_provider_symbol(norm_symbol)
+        max_attempts = max(1, int(self.retry_attempts))
+        last_exc: Optional[BaseException] = None
+        last_err_class: str = ""
+
+        for attempt in range(max_attempts):
+            try:
+                t = _construct_ticker(provider_symbol, session)
+                if t is None:
+                    last_err_class = "RuntimeError"
+                    last_exc = RuntimeError("yf_ticker_construct_failed")
+                    break
+
+                _ident_discarded = False  # v6.6.0 YF-1b
+                info: Dict[str, Any] = {}
+                try:
+                    info = t.info or {}
+                except Exception:
+                    info = {}
+
+                # v6.4.0 provider-identity guard: if Yahoo returned a different
+                # instrument than requested (e.g. 5023.SR -> Apple Inc.), discard
+                # the wrong-company `info` so the row does not impersonate it.
+                # Conservative + gated (TFB_FUND_IDENTITY_GUARD); no-ops unless a
+                # clear base-ticker mismatch is present.
+                _yf4_declared = None  # v6.7.0 YF-4: Yahoo's own declared identity
+                if info:
+                    _returned_sym = _pick(info, "symbol", "underlyingSymbol", "quoteSymbol")
+                    _yf4_declared = safe_str(_returned_sym)
+                    if _identity_mismatch(provider_symbol, _returned_sym):
+                        warnings_list.append(
+                            f"provider_identity_mismatch:{_returned_sym}!={provider_symbol}_discarded"
+                        )
+                        logger.warning(
+                            "Yahoo fundamentals identity mismatch: requested %s, Yahoo returned %s "
+                            "-- discarding wrong-instrument info",
+                            provider_symbol, _returned_sym,
+                        )
+                        info = {}
+                        _ident_discarded = True  # v6.6.0 YF-1b
+
+                # v6.5.0 locale cross-check: catches the harder variant where
+                # Yahoo returns a wrong-instrument record but stamps the REQUESTED
+                # symbol on it (so the v6.4.0 symbol-base check above cannot fire),
+                # e.g. yf.Ticker("5023.SR").info returning Apple's USD/US record.
+                # Decided on the returned record's currency/country vs the locale
+                # implied by the symbol suffix; gated by the same env switch.
+                if info:
+                    _loc_detail = _identity_locale_mismatch(norm_symbol, info)
+                    if _loc_detail:
+                        warnings_list.append(
+                            f"provider_locale_mismatch:{_loc_detail}_discarded"
+                        )
+                        logger.warning(
+                            "Yahoo fundamentals locale mismatch for %s -- %s -- "
+                            "discarding wrong-instrument info",
+                            norm_symbol, _loc_detail,
+                        )
+                        info = {}
+                        _ident_discarded = True  # v6.6.0 YF-1b
+
+                try:
+                    # v6.6.0 YF-1b: a convicted response set must not keep
+                    # supplying prices through its sibling fast_info.
+                    fast_info = None if _ident_discarded else getattr(t, "fast_info", None)
+                except Exception:
+                    fast_info = None
+
+                history_rows = self._history_rows(t, period="3mo", interval="1d")
+                hist_avg10, hist_avg30 = self._history_avg_volumes(history_rows)
+                hist_52w_high, hist_52w_low = self._history_52w(history_rows)
+
+                # v6.6.0 YF-2: own-history price coherence. Live price from
+                # the info/fast_info set vs this fetch's OWN last history
+                # close (independent HTTP). A unit-class disagreement
+                # convicts the whole set -- discard info AND fast_info so
+                # every downstream field falls to honest history/None.
+                if (
+                    _fund_price_coherence_enabled()
+                    and not _ident_discarded
+                    and history_rows
+                    and (info or fast_info is not None)
+                ):
+                    _yf2_px = _coalesce(
+                        safe_float(_get_attr(fast_info, "last_price", "lastPrice", "regularMarketPrice")),
+                        safe_float(_pick(info, "currentPrice", "regularMarketPrice")),
+                    )
+                    _yf2_last = None
+                    for _r in reversed(history_rows):
+                        _c = safe_float(_r.get("close"))
+                        if _c:
+                            _yf2_last = _c
+                            break
+                    if (
+                        _yf2_px is not None and _yf2_px > 0
+                        and _yf2_last is not None and _yf2_last > 0
+                        and _is_suspect_price_ratio(
+                            _yf2_px, _yf2_last,
+                            ratio_high=_fund_price_band_high(),   # v6.7.0 YF-3
+                            ratio_low=_fund_price_band_low())
+                    ):
+                        warnings_list.append(
+                            f"provider_price_incoherent:{_yf2_px}!={_yf2_last}_discarded"
+                        )
+                        logger.warning(
+                            "Yahoo fundamentals price incoherent for %s: info=%s vs own-history=%s "
+                            "-- discarding info+fast_info set",
+                            norm_symbol, _yf2_px, _yf2_last,
+                        )
+                        info = {}
+                        fast_info = None
+                        _ident_discarded = True
+
+                now_utc = _utc_iso()
+                now_riy = _riyadh_iso()
+
+                # Price fields
+                current_price = _coalesce(
+                    safe_float(_get_attr(fast_info, "last_price", "lastPrice", "regularMarketPrice")),
+                    safe_float(_pick(info, "currentPrice", "regularMarketPrice", "navPrice")),
+                )
+                previous_close = _coalesce(
+                    safe_float(_get_attr(fast_info, "previous_close", "previousClose", "regularMarketPreviousClose")),
+                    safe_float(_pick(info, "previousClose", "regularMarketPreviousClose", "chartPreviousClose")),
+                )
+                open_price = _coalesce(
+                    safe_float(_get_attr(fast_info, "open", "open_price", "regularMarketOpen")),
+                    safe_float(_pick(info, "open", "regularMarketOpen")),
+                )
+                day_high = _coalesce(
+                    safe_float(_get_attr(fast_info, "day_high", "dayHigh")),
+                    safe_float(_pick(info, "dayHigh", "regularMarketDayHigh")),
+                )
+                day_low = _coalesce(
+                    safe_float(_get_attr(fast_info, "day_low", "dayLow")),
+                    safe_float(_pick(info, "dayLow", "regularMarketDayLow")),
+                )
+
+                info_52w_high = _coalesce(
+                    safe_float(_get_attr(fast_info, "fifty_two_week_high", "fiftyTwoWeekHigh", "week52High")),
+                    safe_float(_pick(info, "fiftyTwoWeekHigh", "week52High")),
+                )
+                info_52w_low = _coalesce(
+                    safe_float(_get_attr(fast_info, "fifty_two_week_low", "fiftyTwoWeekLow", "week52Low")),
+                    safe_float(_pick(info, "fiftyTwoWeekLow", "week52Low")),
+                )
+                week_52_high, week_52_low, bounds_warnings = _validate_52w_bounds(
+                    current_price=current_price,
+                    info_52w_high=info_52w_high,
+                    info_52w_low=info_52w_low,
+                    hist_52w_high=hist_52w_high,
+                    hist_52w_low=hist_52w_low,
+                    enabled=self.price_sanity_guard,
+                    ratio_high=self.price_ratio_high,
+                    ratio_low=self.price_ratio_low,
+                )
+                warnings_list.extend(bounds_warnings)
+
+                volume = _coalesce(
+                    safe_float(_get_attr(fast_info, "last_volume", "lastVolume", "regularMarketVolume")),
+                    safe_float(_pick(info, "volume", "regularMarketVolume")),
+                )
+                market_cap = _coalesce(
+                    safe_float(_get_attr(fast_info, "market_cap", "marketCap")),
+                    safe_float(_pick(info, "marketCap")),
+                )
+
+                # Valuation
+                pe_ttm = safe_float(_pick(info, "trailingPE"))
+                pe_forward = safe_float(_pick(info, "forwardPE"))
+                pb_ratio = safe_float(_pick(info, "priceToBook"))
+                ps_ratio = safe_float(_pick(info, "priceToSalesTrailing12Months", "priceToSales"))
+                peg_ratio = safe_float(_pick(info, "pegRatio", "trailingPegRatio"))
+                ev_ebitda = safe_float(_pick(info, "enterpriseToEbitda"))
+                enterprise_value = safe_float(_pick(info, "enterpriseValue"))
+
+                # Margins
+                gross_margin = _as_fraction(_pick(info, "grossMargins"))
+                operating_margin = _as_fraction(_pick(info, "operatingMargins"))
+                profit_margin = _as_fraction(_pick(info, "profitMargins", "netMargins"))
+                roe = _as_fraction(_pick(info, "returnOnEquity"))
+                roa = _as_fraction(_pick(info, "returnOnAssets"))
+
+                # Growth
+                revenue_growth_yoy = _as_fraction(_pick(info, "revenueGrowth"))
+                earnings_growth_yoy = _as_fraction(_pick(info, "earningsGrowth"))
+                revenue_ttm = safe_float(_pick(info, "totalRevenue", "revenueTTM"))
+                free_cash_flow_ttm = safe_float(_pick(info, "freeCashflow", "freeCashFlow"))
+                operating_cash_flow = safe_float(_pick(info, "operatingCashflow", "operatingCashFlow"))
+
+                # Dividend + shares
+                dividend_yield = _as_fraction(_pick(info, "dividendYield"))
+                payout_ratio = _as_fraction(_pick(info, "payoutRatio"))
+                eps_ttm = safe_float(_pick(info, "trailingEps"))
+                eps_forward = safe_float(_pick(info, "forwardEps"))
+                debt_to_equity = safe_float(_pick(info, "debtToEquity"))
+                beta_5y = safe_float(_pick(info, "beta"))
+                float_shares = safe_float(_pick(info, "floatShares"))
+                shares_outstanding = safe_float(_pick(info, "sharesOutstanding"))
+
+                # Average volumes (with history fallback)
+                avg_volume_10d = _coalesce(
+                    safe_float(_pick(info, "averageVolume10days", "averageDailyVolume10Day")),
+                    hist_avg10,
+                )
+                avg_volume_30d = _coalesce(
+                    safe_float(_pick(info, "averageVolume", "averageDailyVolume3Month")),
+                    hist_avg30,
+                )
+
+                # Analyst
+                target_mean_price = safe_float(_pick(info, "targetMeanPrice"))
+                target_high_price = safe_float(_pick(info, "targetHighPrice"))
+                target_low_price = safe_float(_pick(info, "targetLowPrice"))
+                analyst_count = safe_int(_pick(info, "numberOfAnalystOpinions"))
+
+                # v6.3.0: cascade-bridge fields.
+                raw_rec_key = _pick(info, "recommendationKey")
+                provider_rating = extract_provider_rating(raw_rec_key)
+                provider_rating_score = safe_float(_pick(info, "recommendationMean"))
+                # v6.3.1: emit a canonical recommendation ONLY when Yahoo
+                # actually supplied a rating key. Otherwise leave it None so
+                # clean_patch strips it -- a missing Yahoo rating must NOT
+                # become a fake "HOLD" that data_engine_v2 could capture as a
+                # provider override (reopening the v5.77.17 corruption).
+                recommendation = map_recommendation(raw_rec_key) if provider_rating else None
+                recommendation_source: Optional[str] = (
+                    PROVIDER_NAME if (provider_rating or provider_rating_score is not None) else None
+                )
+                if not provider_rating and provider_rating_score is None:
+                    warnings_list.append("provider_rating_missing")
+
+                # Identity
+                name = safe_str(_pick(info, "longName", "shortName", "displayName"))
+                currency = safe_str(_pick(info, "currency", "financialCurrency"))
+                exchange = safe_str(_pick(info, "fullExchangeName", "exchange", "exchangeName"))
+                country = safe_str(_pick(info, "country"))
+                sector = safe_str(_pick(info, "sector"))
+                industry = safe_str(_pick(info, "industry"))
+                asset_class = _infer_asset_class(info, norm_symbol)
+
+                # v6.2.0: identity defaults fill
+                _identity_defaults = _identity_defaults_for_symbol(norm_symbol)
+                if currency is None and _identity_defaults.get("currency"):
+                    currency = _identity_defaults["currency"]
+                if country is None and _identity_defaults.get("country"):
+                    country = _identity_defaults["country"]
+                if exchange is None and _identity_defaults.get("exchange"):
+                    exchange = _identity_defaults["exchange"]
+                if asset_class is None and _identity_defaults.get("asset_class"):
+                    asset_class = _identity_defaults["asset_class"]
+
+                # v6.1.0: field-level missing-data warnings
+                if not info:
+                    warnings_list.append("info_empty")
+                if not history_rows:
+                    warnings_list.append("history_empty")
+                if not industry:
+                    warnings_list.append("industry_missing_from_provider")
+                if not sector:
+                    warnings_list.append("sector_missing_from_provider")
+                if not currency:
+                    warnings_list.append("currency_missing_from_provider")
+
+                # Misc metrics
+                book_value = safe_float(_pick(info, "bookValue"))
+                current_ratio = safe_float(_pick(info, "currentRatio"))
+                quick_ratio = safe_float(_pick(info, "quickRatio"))
+                short_ratio = safe_float(_pick(info, "shortRatio"))
+                short_percent = _as_fraction(_pick(info, "shortPercentOfFloat"))
+
+                if gross_margin is None:
+                    gross_margin = _pct_from_ratio(_pick(info, "grossProfits"), revenue_ttm)
+                if operating_margin is None:
+                    operating_margin = _pct_from_ratio(_pick(info, "ebitda"), revenue_ttm)
+
+                # 52-week position (fraction in [0,1])
+                week_52_position_pct: Optional[float] = None
+                cp = safe_float(current_price)
+                if (cp is not None and week_52_high is not None and week_52_low is not None
+                        and week_52_high != week_52_low):
+                    week_52_position_pct = (cp - float(week_52_low)) / (float(week_52_high) - float(week_52_low))
+                    week_52_position_pct = max(0.0, min(1.0, float(week_52_position_pct)))
+
+                # v6.1.0: forecast magnitude sanity check
+                forecast_price_12m: Optional[float] = None
+                expected_roi_12m: Optional[float] = None
+                forecast_confidence: Optional[float] = None
+                forecast_method: Optional[str] = None
+                if cp is not None and cp > 0 and target_mean_price is not None and target_mean_price > 0:
+                    candidate_fp = float(target_mean_price)
+                    validated_fp, fc_warnings = _validate_forecast_magnitude(
+                        forecast_price=candidate_fp,
+                        current_price=cp,
+                        enabled=self.price_sanity_guard,
+                        ratio_high=self.price_ratio_high,
+                        ratio_low=self.price_ratio_low,
+                    )
+                    warnings_list.extend(fc_warnings)
+                    if validated_fp is not None:
+                        forecast_price_12m = validated_fp
+                        expected_roi_12m = (validated_fp / cp) - 1.0
+                        forecast_method = "analyst_consensus"
+                        ac = analyst_count or 1
+                        forecast_confidence = min(0.95, 0.40 + (ac * 0.05))
+
+                # Dedupe warnings while preserving order
+                seen_w: set = set()
+                deduped_warnings: List[str] = []
+                for w in warnings_list:
+                    if w and w not in seen_w:
+                        seen_w.add(w)
+                        deduped_warnings.append(w)
+
+                out: Dict[str, Any] = {
+                    "requested_symbol": norm_symbol,
+                    "symbol": norm_symbol,
+                    "provider_symbol": provider_symbol,
+                    # v6.7.0 YF-4: the identity Yahoo's response DECLARED,
+                    # captured before any conviction reset -- the engine's
+                    # AU-1b raw-patch check reads this key, giving it an
+                    # independent second look even with local guards off.
+                    "code": _yf4_declared,
+                    "provider": PROVIDER_NAME,
+                    "data_source": PROVIDER_NAME,
+                    "data_sources": [PROVIDER_NAME],
+                    "provider_version": PROVIDER_VERSION,
+                    "last_updated_utc": now_utc,
+                    "last_updated_riyadh": now_riy,
+
+                    # identity/profile
+                    "currency": currency,
+                    "name": name,
+                    "exchange": exchange,
+                    "country": country,
+                    "sector": sector,
+                    "industry": industry,
+                    "asset_class": asset_class,
+
+                    # price/liquidity (best-effort)
+                    "current_price": current_price,
+                    "previous_close": previous_close,
+                    "open_price": open_price,
+                    "day_high": day_high,
+                    "day_low": day_low,
+                    "week_52_high": week_52_high,
+                    "week_52_low": week_52_low,
+                    "week_52_position_pct": week_52_position_pct,
+                    "volume": volume,
+                    "market_cap": market_cap,
+                    "float_shares": float_shares,
+                    "avg_volume_10d": avg_volume_10d,
+                    "avg_volume_30d": avg_volume_30d,
+                    "beta_5y": beta_5y,
+
+                    # fundamentals
+                    "pe_ttm": pe_ttm,
+                    "pe_forward": pe_forward,
+                    "eps_ttm": eps_ttm,
+                    "dividend_yield": dividend_yield,
+                    "payout_ratio": payout_ratio,
+                    "revenue_ttm": revenue_ttm,
+                    "revenue_growth_yoy": revenue_growth_yoy,
+                    "gross_margin": gross_margin,
+                    "operating_margin": operating_margin,
+                    "profit_margin": profit_margin,
+                    "debt_to_equity": debt_to_equity,
+                    "free_cash_flow_ttm": free_cash_flow_ttm,
+
+                    # valuation
+                    "pb_ratio": pb_ratio,
+                    "ps_ratio": ps_ratio,
+                    "peg_ratio": peg_ratio,
+                    "ev_ebitda": ev_ebitda,
+                    "enterprise_value": enterprise_value,
+                    "intrinsic_value": target_mean_price,
+
+                    # analyst/reco
+                    "target_mean_price": target_mean_price,
+                    "target_high_price": target_high_price,
+                    "target_low_price": target_low_price,
+                    "analyst_count": analyst_count,
+                    "recommendation": recommendation,
+
+                    # v6.3.0: cascade-bridge fields
+                    "provider_rating": provider_rating or None,
+                    "provider_rating_score": provider_rating_score,
+                    "recommendation_source": recommendation_source,
+
+                    # additional
+                    "shares_outstanding": shares_outstanding,
+                    "book_value": book_value,
+                    "eps_forward": eps_forward,
+                    "roe": roe,
+                    "roa": roa,
+                    "earnings_growth_yoy": earnings_growth_yoy,
+                    "operating_cashflow": operating_cash_flow,
+                    "free_cashflow": free_cash_flow_ttm,
+                    "current_ratio": current_ratio,
+                    "quick_ratio": quick_ratio,
+                    "short_ratio": short_ratio,
+                    "short_percent": short_percent,
+                    "history_rows_3mo": len(history_rows),
+
+                    # forecast (may be None if magnitude check dropped it)
+                    "forecast_price_12m": forecast_price_12m,
+                    "expected_roi_12m": expected_roi_12m,
+                    "forecast_method": forecast_method,
+                    "forecast_confidence": forecast_confidence,
+
+                    # v6.1.0: structured warnings
+                    "warnings": deduped_warnings,
+                }
+
+                # Legacy aliases (preserved verbatim from v6.0.0)
+                out["price"] = out.get("current_price")
+                out["prev_close"] = out.get("previous_close")
+                out["open"] = out.get("open_price")
+                out["change"] = None
+                out["change_pct"] = None
+                if current_price is not None and previous_close is not None:
+                    change = float(current_price) - float(previous_close)
+                    pct = (change / float(previous_close)) if float(previous_close) != 0 else None
+                    out["price_change"] = change
+                    out["percent_change"] = pct
+                    out["change"] = change
+                    out["change_pct"] = pct
+                out["52w_high"] = out.get("week_52_high")
+                out["52w_low"] = out.get("week_52_low")
+                out["forward_pe"] = out.get("pe_forward")
+                out["pb"] = out.get("pb_ratio")
+                out["ps"] = out.get("ps_ratio")
+                out["peg"] = out.get("peg_ratio")
+                out["net_margin"] = out.get("profit_margin")
+                out["revenue_growth"] = out.get("revenue_growth_yoy")
+                out["dividend_yield_percent"] = out.get("dividend_yield")
+
+                dq, score = data_quality_score(out)
+                out["data_quality"] = dq.value
+                out["data_quality_score"] = score
+                return clean_patch(out)
+
+            except Exception as exc:
+                last_exc = exc
+                last_err_class = type(exc).__name__
+
+                base = min(8.0, 0.5 * (2 ** attempt))
+                if _is_rate_limit_error(exc):
+                    base = min(16.0, base * 2.0)
+                sleep_for = base + random.uniform(0.0, base * 0.25)
+                time.sleep(sleep_for)
+                _rotate_session_ua(session)
+
+        if last_exc is not None:
+            logger.warning("Yahoo fundamentals fetch failed for %s after %d attempts: %s",
+                           norm_symbol, max_attempts, last_exc)
+            warnings_list.append(f"fetch_failed:{last_err_class}")
+
+        return {
+            "error": str(last_exc) if last_exc is not None else "unknown",
+            "data_quality": DataQuality.ERROR.value,
+            "warnings": warnings_list,
+            "last_error_class": last_err_class or "Unknown",
+        }
+
+    # -- Async fetch API -----------------------------------------------------
+
+    async def fetch_fundamentals(self, symbol: str) -> Dict[str, Any]:
+        if not self.enabled or not symbol:
+            return {}
+
+        norm = normalize_symbol(symbol)
+        if not norm:
+            return {}
+
+        cached = await self.fund_cache.get(norm)
         if cached:
-            metrics.cache_hits_total.labels(symbol=sym).inc()
             return cached
 
-        metrics.cache_misses_total.labels(symbol=sym).inc()
+        if not await self.circuit_breaker.allow_request():
+            return {}
 
-        if not await self._circuit_breaker.allow():
-            # v8.7.0: a CB-open denial was a SILENT None (the exact probe
-            # symptom: RESULT None with zero log lines). Throttled to one
-            # line per cooldown window so a storm cannot flood the log.
-            _now_mono = time.monotonic()
-            if _now_mono - getattr(self, "_cb_deny_log_ts", 0.0) >= self.config.cb_cooldown_sec:
-                self._cb_deny_log_ts = _now_mono
-                logger.warning(
-                    "[yahoo_chart v%s] circuit OPEN — requests denied (incl. %s); retry after %.0fs cooldown",
-                    PROVIDER_VERSION, sym, self.config.cb_cooldown_sec,
-                )
-            return None
+        async def _do() -> Dict[str, Any]:
+            await self.rate_limiter.wait_and_acquire()
 
-        await self._token_bucket.acquire()
-
-        async def _do_fetch() -> Optional[Dict[str, Any]]:
-            loop = asyncio.get_running_loop()
-            start_time = time.monotonic()
-
-            try:
-                # v8.7.0 (YC-RAW): crumb-free raw chart transport FIRST.
-                # Synthesizes the same (info, meta, history) triple, so the
-                # YC-1/YC-3 guards and _enrich_data below run identically.
-                # Any raw failure logs its reason (no more silent None) and
-                # falls through to the untouched yfinance executor path.
-                info: Dict[str, Any] = {}
-                meta: Dict[str, Any] = {}
-                history: List[Dict[str, Any]] = []
-                _raw_ok = False
-                if _raw_chart_enabled() and _HAS_HTTPX:
-                    try:
-                        info, meta, history = await _raw_chart_fetch_triple(
-                            _yc_yahoo_symbol(sym),
-                            self.config.history_period,
-                            self.config.history_interval,
-                            self.config.timeout_sec,
+            async with self._get_semaphore():
+                loop = asyncio.get_running_loop()
+                start_time = time.monotonic()
+                try:
+                    res = await loop.run_in_executor(None, self._blocking_fetch, norm)
+                    if "error" in res and res.get("data_quality") == DataQuality.ERROR.value:
+                        last_cls = (res.get("last_error_class") or "").lower()
+                        is_rate_limited = any(m in last_cls for m in ("403", "429"))
+                        await self.circuit_breaker.on_failure(
+                            status_code=403 if is_rate_limited else 500
                         )
-                        _raw_ok = bool(info or history)
-                    except Exception as _raw_exc:
-                        logger.warning(
-                            "[yahoo_chart v%s YC-RAW] raw chart quote failed for %s: %s — falling back to yfinance",
-                            PROVIDER_VERSION, sym, _raw_exc,
-                        )
-                if not _raw_ok:
-                    # v8.0.0: pass config-provided period/interval to the worker.
-                    info, meta, history = await loop.run_in_executor(
-                        self._executor,
-                        _fetch_ticker_sync,
-                        sym,
-                        self.config.history_period,
-                        self.config.history_interval,
-                    )
+                        yf_fund_requests_total.labels(status="error").inc()
+                        return {}
+                    await self.circuit_breaker.on_success()
+                    yf_fund_requests_total.labels(status="success").inc()
+                    yf_fund_request_duration.observe(time.monotonic() - start_time)
 
-                if not info and not history:
-                    await self._circuit_breaker.record_failure()
-                    metrics.requests_total.labels(symbol=sym, op="enriched", status="error").inc()
-                    # v8.7.0: the empty-set outcome was the other silent
-                    # None. One observable line, transport-attributed.
-                    logger.warning(
-                        "[yahoo_chart v%s] empty response set for %s (transport=%s) — no quote served",
-                        PROVIDER_VERSION, sym, "raw_chart" if _raw_ok else "yfinance",
-                    )
-                    return None
+                    if res.get("current_price") is not None:
+                        await self.fund_cache.set(norm, res)
+                    return res
+                except Exception as exc:
+                    await self.circuit_breaker.on_failure()
+                    yf_fund_requests_total.labels(status="error").inc()
+                    logger.error("Error fetching fundamentals for %s: %s", norm, exc)
+                    return {}
 
-                # v8.6.0 YC-1: response-identity guard. The response set
-                # declares its instrument in info.symbol/underlyingSymbol
-                # and meta.symbol; a definite base-ticker mismatch means
-                # this whole set is NOT ours (crossed under throttle —
-                # live 2026-07-07: 7010.SR served a foreign 17.32 price).
-                # Drop like a failed fetch: nothing cached, engine falls
-                # through. Circuit breaker untouched (crossed != down).
-                if _yc_identity_guard_enabled():
-                    _yc1_got = _yc_declared_identity_mismatch(
-                        _yc_yahoo_symbol(sym), info, meta)
-                    if _yc1_got:
-                        logger.warning(
-                            "[yahoo_chart v%s YC-1] identity mismatch: requested %s got %s — response dropped",
-                            PROVIDER_VERSION, sym, _yc1_got,
-                        )
-                        metrics.requests_total.labels(symbol=sym, op="enriched", status="identity_mismatch").inc()
-                        return None
+        return await self.singleflight.run(norm, _do)
 
-                # v8.6.0 YC-3: unit-class coherence — live info price vs
-                # this fetch's OWN last history close (independent HTTP).
-                # On a definite unit-class disagreement the live-price
-                # keys are stripped so the patch falls back to the
-                # history-grounded price. Belt for fils/cents-class
-                # errors only (see WHY); default OFF.
-                _yc3_tag = False
-                if _yc_coherence_guard_enabled() and isinstance(info, dict) and history:
-                    _yc3_px = _first_number(
-                        info.get("currentPrice"),
-                        info.get("regularMarketPrice"),
-                        info.get("lastPrice"),
-                    )
-                    _yc3_last = None
-                    for _h in reversed(history):
-                        if _h.get("close"):
-                            _yc3_last = _h["close"]
-                            break
-                    if _yc3_px and _yc3_last and _yc3_px > 0 and _yc3_last > 0:
-                        _r = _yc3_px / _yc3_last
-                        if _r >= _yc_coh_ratio_high() or _r <= _yc_coh_ratio_low():
-                            info = dict(info)
-                            for _k in ("currentPrice", "regularMarketPrice", "lastPrice",
-                                       "previousClose", "regularMarketPreviousClose"):
-                                info.pop(_k, None)
-                            _yc3_tag = True
-                            logger.warning(
-                                "[yahoo_chart v%s YC-3] price incoherent for %s: info=%s vs own-history=%s — live-price keys dropped",
-                                PROVIDER_VERSION, sym, _yc3_px, _yc3_last,
-                            )
-
-                result = _enrich_data(sym, info, meta, history)
-                if _yc3_tag and isinstance(result, dict):
-                    _w = result.get("warnings")
-                    if isinstance(_w, list):
-                        _w.append("chart_price_incoherent_dropped")
-                    elif isinstance(_w, str) and _w:
-                        result["warnings"] = _w + "; chart_price_incoherent_dropped"
-                    else:
-                        result["warnings"] = ["chart_price_incoherent_dropped"]
-
-                await self._circuit_breaker.record_success()
-                metrics.requests_total.labels(symbol=sym, op="enriched", status="ok").inc()
-                metrics.request_duration.labels(symbol=sym, op="enriched").observe(
-                    time.monotonic() - start_time
-                )
-
-                if result.get("current_price"):
-                    await self._cache.set(sym, result, kind="enriched")
-
-                return result
-            except Exception as exc:
-                await self._circuit_breaker.record_failure()
-                metrics.requests_total.labels(symbol=sym, op="enriched", status="error").inc()
-                logger.error("Error fetching %s: %s", sym, exc)
-                return None
-
-        return await self._single_flight.run(f"enriched:{sym}", _do_fetch)
-
-    async def get_enriched_quotes_batch(
+    async def fetch_fundamentals_batch(
         self,
         symbols: List[str],
         concurrency: Optional[int] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """Batch fetch enriched quotes for multiple symbols."""
         if not symbols:
             return {}
 
-        semaphore = asyncio.Semaphore(concurrency or self.config.max_concurrency)
+        batch_cap = max(1, concurrency or self.max_concurrency)
+        batch_sem = asyncio.Semaphore(batch_cap)
 
-        async def _fetch_one(sym: str) -> Tuple[str, Optional[Dict[str, Any]]]:
-            async with semaphore:
-                result = await self.get_enriched_quote(sym)
+        async def _fetch_one(sym: str) -> Tuple[str, Dict[str, Any]]:
+            async with batch_sem:
+                result = await self.fetch_fundamentals(sym)
                 return sym, result
 
-        results = await asyncio.gather(
-            *(_fetch_one(sym) for sym in symbols if sym),
-            return_exceptions=True,
-        )
+        tasks = [_fetch_one(sym) for sym in symbols if sym]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
-        output: Dict[str, Dict[str, Any]] = {}
-        for result in results:
-            if isinstance(result, Exception):
+        results: Dict[str, Dict[str, Any]] = {}
+        for item in gathered:
+            if isinstance(item, Exception):
                 continue
-            sym, data = result
+            sym, data = item
             if data:
-                output[sym] = data
-        return output
-
-    async def fetch_history_raw(
-        self,
-        symbol: str,
-        period: str = "1mo",
-        interval: str = "1d",
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch raw history rows for a symbol.
-
-        v8.0.0: this runs on the provider's SHARED executor instead of
-        allocating a fresh ThreadPoolExecutor per call (v7.0.0 leaked threads).
-        """
-        if (not _HAS_YFINANCE or yf is None) and not (_raw_chart_enabled() and _HAS_HTTPX):
-            return []
-
-        sym = normalize_symbol(symbol)
-        if not sym:
-            return []
-
-        # v8.7.0 (YC-RAW): crumb-free raw chart history FIRST — same
-        # endpoint, same bar shape, YC-2-equivalent identity check on the
-        # payload's own meta.symbol. Any failure logs its reason and falls
-        # through to the untouched yfinance retry ladder below.
-        if _raw_chart_enabled() and _HAS_HTTPX:
-            try:
-                _r_info, _r_meta, _r_hist = await _raw_chart_fetch_triple(
-                    _yc_yahoo_symbol(sym), period, interval, self.config.timeout_sec,
-                )
-                if _yc_identity_guard_enabled():
-                    _r_got = _yc_declared_identity_mismatch(
-                        _yc_yahoo_symbol(sym), _r_info, _r_meta)
-                    if _r_got:
-                        logger.warning(
-                            "[yahoo_chart v%s YC-2/RAW] history identity mismatch: requested %s got %s — series dropped",
-                            PROVIDER_VERSION, sym, _r_got,
-                        )
-                        return []
-                if _r_hist:
-                    return _r_hist
-                logger.warning(
-                    "[yahoo_chart v%s YC-RAW] raw chart history empty for %s — falling back to yfinance",
-                    PROVIDER_VERSION, sym,
-                )
-            except Exception as _raw_exc:
-                logger.warning(
-                    "[yahoo_chart v%s YC-RAW] raw chart history failed for %s: %s — falling back to yfinance",
-                    PROVIDER_VERSION, sym, _raw_exc,
-                )
-        if not _HAS_YFINANCE or yf is None:
-            return []
-
-        def _sync_fetch() -> List[Dict[str, Any]]:
-            # v8.3.0: bounded retry+backoff on Yahoo rate-limit ("Too Many
-            # Requests. Rate limited.") so transient throttling no longer
-            # silently drops a symbol's entire price history (which starved
-            # technical/momentum factors and depressed scores -> SELL). Gated by
-            # TFB_YF_HISTORY_RETRY (default OFF). When OFF, _yf_history_retry_
-            # attempts() returns 1 -> exactly one attempt and behavior is
-            # byte-identical to v8.2.0 (give up + warn on any exception). Retries
-            # fire ONLY on rate-limit errors; genuine delisted/no-data results
-            # return [] immediately as before. Delays are bounded (per-attempt
-            # cap + total attempts cap) so latency cannot run away against the
-            # Render edge timeout. time.sleep (not asyncio.sleep) is correct:
-            # this closure runs inside the shared executor, off the event loop.
-            _attempts = _yf_history_retry_attempts()
-            _base = _yf_history_retry_base_sec()
-            _cap = _yf_history_retry_cap_sec()
-            for _attempt in range(_attempts):
-                try:
-                    ticker = yf.Ticker(_yc_yahoo_symbol(sym))  # v8.4.0 SSOT map
-                    df = ticker.history(period=period, interval=interval, auto_adjust=True)  # v8.8.0 YC-ADJ-2
-                    # v8.6.0 YC-2: the history call lazily populates the
-                    # ticker's metadata (zero extra HTTP) and that metadata
-                    # declares `symbol` — the only identity witness bars
-                    # themselves lack. A definite mismatch means this price
-                    # series belongs to another instrument: return [] rather
-                    # than feed the engine's technicals a foreign series.
-                    if _yc_identity_guard_enabled():
-                        _yc2_meta = _safe_history_metadata(ticker)
-                        _yc2_got = _yc_declared_identity_mismatch(
-                            _yc_yahoo_symbol(sym), None, _yc2_meta)
-                        if _yc2_got:
-                            logger.warning(
-                                "[yahoo_chart v%s YC-2] history identity mismatch: requested %s got %s — series dropped",
-                                PROVIDER_VERSION, sym, _yc2_got,
-                            )
-                            return []
-                    if not _HAS_PANDAS or pd is None or df is None or df.empty:
-                        return []
-                    df = df.reset_index()
-                    rows: List[Dict[str, Any]] = []
-                    for _, row in df.iterrows():
-                        row_dict = row.to_dict()
-                        dt_val = row_dict.get("Date") or row_dict.get("Datetime")
-                        ts = _utc_iso(dt_val) if hasattr(dt_val, "to_pydatetime") else str(dt_val)
-                        rows.append({
-                            "timestamp": ts,
-                            "open": _safe_float(row_dict.get("Open")),
-                            "high": _safe_float(row_dict.get("High")),
-                            "low": _safe_float(row_dict.get("Low")),
-                            "close": _safe_float(row_dict.get("Close")),
-                            "volume": _safe_float(row_dict.get("Volume")),
-                        })
-                    return rows
-                except Exception as exc:
-                    if _is_rate_limit_error(exc) and _attempt < (_attempts - 1):
-                        _delay = min(_cap, _base * float(2 ** _attempt)) + random.uniform(0.0, _base)
-                        logger.info(
-                            "History rate-limited for %s; retry %d/%d after %.2fs",
-                            sym, _attempt + 1, _attempts - 1, _delay,
-                        )
-                        time.sleep(_delay)
-                        continue
-                    logger.warning("History fetch failed for %s: %s", sym, exc)
-                    return []
-            return []  # defensive: attempts>=1 always returns inside the loop
-
-        try:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(self._executor, _sync_fetch)
-        except Exception as exc:
-            logger.warning("History executor failed for %s: %s", sym, exc)
-            return []
+                results[sym] = data
+        return results
 
     async def close(self) -> None:
-        """Close the provider and shut down the thread pool."""
         try:
-            self._executor.shutdown(wait=False)
+            await self.fund_cache.close()
         except Exception as exc:
-            logger.debug("yahoo provider close failed: %s", exc)
+            logger.debug("fund_cache close failed: %s", exc)
+        try:
+            await self.err_cache.close()
+        except Exception as exc:
+            logger.debug("err_cache close failed: %s", exc)
 
 
 # =============================================================================
-# Singleton Instance (lazy lock)
+# Singleton Instance (lazy)
 # =============================================================================
 
-_PROVIDER_INSTANCE: Optional[YahooChartProvider] = None
+_PROVIDER_INSTANCE: Optional[YahooFundamentalsProvider] = None
 _PROVIDER_LOCK: Optional[asyncio.Lock] = None
 
 
@@ -2652,19 +2407,17 @@ def _get_provider_lock() -> asyncio.Lock:
     return _PROVIDER_LOCK
 
 
-async def get_provider() -> YahooChartProvider:
-    """Get the singleton YahooChartProvider instance."""
+async def get_provider() -> YahooFundamentalsProvider:
     global _PROVIDER_INSTANCE
     if _PROVIDER_INSTANCE is not None:
         return _PROVIDER_INSTANCE
     async with _get_provider_lock():
         if _PROVIDER_INSTANCE is None:
-            _PROVIDER_INSTANCE = YahooChartProvider()
+            _PROVIDER_INSTANCE = YahooFundamentalsProvider()
     return _PROVIDER_INSTANCE
 
 
 async def close_provider() -> None:
-    """Close and reset the singleton provider."""
     global _PROVIDER_INSTANCE
     if _PROVIDER_INSTANCE is not None:
         await _PROVIDER_INSTANCE.close()
@@ -2675,36 +2428,46 @@ async def close_provider() -> None:
 # Engine-Facing Functions
 # =============================================================================
 
-async def fetch_enriched_quote(symbol: str) -> Optional[Dict[str, Any]]:
-    """Fetch enriched quote for a symbol."""
+async def fetch_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    if args or kwargs:
+        logger.debug("fetch_fundamentals_patch(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
     provider = await get_provider()
-    return await provider.get_enriched_quote(symbol)
+    return await provider.fetch_fundamentals(symbol)
 
 
-async def fetch_enriched_quotes_batch(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Batch fetch enriched quotes for multiple symbols."""
+async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await fetch_fundamentals_patch(symbol, *args, **kwargs)
+
+
+async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await fetch_fundamentals_patch(symbol, *args, **kwargs)
+
+
+async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await fetch_fundamentals_patch(symbol, *args, **kwargs)
+
+
+async def quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await fetch_fundamentals_patch(symbol, *args, **kwargs)
+
+
+async def enriched_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await fetch_fundamentals_patch(symbol, *args, **kwargs)
+
+
+async def get_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await fetch_fundamentals_patch(symbol, *args, **kwargs)
+
+
+async def fetch_quotes(
+    symbols: List[str],
+    concurrency: Optional[int] = None,
+    **kwargs: Any,
+) -> Dict[str, Dict[str, Any]]:
+    if kwargs:
+        logger.debug("fetch_quotes: ignoring kwargs=%r", kwargs)
     provider = await get_provider()
-    return await provider.get_enriched_quotes_batch(symbols)
-
-
-async def fetch_quote(symbol: str) -> Optional[Dict[str, Any]]:
-    """Alias for fetch_enriched_quote."""
-    return await fetch_enriched_quote(symbol)
-
-
-async def fetch_history(
-    symbol: str,
-    period: str = "1mo",
-    interval: str = "1d",
-) -> List[Dict[str, Any]]:
-    """
-    Fetch raw history for a symbol.
-
-    v8.0.0: delegates to the provider's shared ThreadPoolExecutor, so
-    repeated calls no longer leak a fresh executor per invocation.
-    """
-    provider = await get_provider()
-    return await provider.fetch_history_raw(symbol, period=period, interval=interval)
+    return await provider.fetch_fundamentals_batch(symbols, concurrency=concurrency)
 
 
 # =============================================================================
@@ -2712,25 +2475,24 @@ async def fetch_history(
 # =============================================================================
 
 __all__ = [
-    # Metadata
     "PROVIDER_NAME",
     "PROVIDER_VERSION",
     "VERSION",
     "PROVIDER_BATCH_SUPPORTED",
-    # Classes
-    "YahooChartProvider",
-    "YahooConfig",
-    # Singletons
+    "YahooFundamentalsProvider",
+    "DataQuality",
+    "data_quality_score",
+    "normalize_symbol",
+    "map_recommendation",
+    "extract_provider_rating",
     "get_provider",
     "close_provider",
-    # Engine-facing
-    "fetch_enriched_quote",
-    "fetch_enriched_quotes_batch",
+    "fetch_fundamentals_patch",
+    "fetch_enriched_quote_patch",
     "fetch_quote",
-    "fetch_history",
-    # Symbol helper
-    "normalize_symbol",
-    # Exceptions (kept for defensive back-compat even though unraised internally)
-    "YahooProviderError",
-    "YahooFetchError",
+    "get_quote",
+    "get_quote_patch",
+    "quote",
+    "enriched_quote",
+    "fetch_quotes",
 ]
