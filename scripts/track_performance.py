@@ -2,10 +2,60 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.17.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.18.0)
 ===========================================================
 
-Why this revision (v6.17.0 vs v6.16.0) — MATURITY PRICE-INTEGRITY
+Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
+(PF-GEOM + PRICE-FEED-LOUD + CA-GUARD + BT-ADJ)
+  EVIDENCE (live export 2026-07-12 21:15, 2,264 records): 1,850 records
+  entered >= 2 days earlier showed Current Price == Entry Price on 100.0%
+  of rows and Unrealized ROI == 0.00 everywhere, while Last Updated
+  stamped the same run on all of them — the job runs, touches every
+  record, and never lands a single fresh price. First Target Date =
+  2026-07-28 (1M x 1,128 + 3M x 1,128): without a working feed the
+  v6.17.0 fresh-only gate — correctly — expires the ENTIRE first
+  calibration cohort UNPRICED starting ~Aug 2. Four fixes:
+
+  v6.18.0 A [PF-GEOM]  update_summary wrote its 13-row KPI block to
+       A1:E13 — straight across the record grid: START_ROW=5 means the
+       HEADER row's first five cells (Record ID, Key, Symbol, Horizon,
+       Date Recorded) were overwritten every run ('Wins' sat where
+       'Record ID' belongs) and data rows 6-13 lost their identity cells
+       (the 8 earliest records are orphaned on-sheet; the loader —
+       positional by canonical HEADERS — already drops them via the
+       blank-symbol filter). FIX: the summary block moves BESIDE the grid
+       (AG1:AK13); _ensure_headers' brand-new-sheet seed moves with it,
+       and its existing header-mismatch repair restores the clobbered
+       A5:AE5 header row automatically on the next run. Kill-switch
+       TFB_TRACK_SUMMARY_SIDE=0 restores A1:E13 (not recommended). The 8
+       orphaned rows self-heal on the next full grid save.
+  v6.18.0 B [PRICE-FEED-LOUD]  the price map was built as
+       `fetch_prices(syms) if self.backend.base_url else {}` — an EMPTY
+       base_url (workflow ENV missing) or an all-zero response produced a
+       silent {} and the run looked green. FIX: a dead/degraded feed now
+       logs an ERROR with the [v6.18.0 PRICE-FEED] tag naming the cause
+       (no-base-url vs 0/N priced vs n/N priced), so a cohort-threatening
+       outage is one grep away, never silent.
+  v6.18.0 C [CA-GUARD]  maturation computed realized ROI as
+       current_print / entry_print - 1. A corporate action between entry
+       and maturity puts the two prints in different share-count units: a
+       Tadawul 1:1 bonus issue (routine) matures a fake -50% LOSS; a
+       1-for-10 US reverse split a fake +900% WIN — straight into the
+       Calibrator's tails. FIX: when |print ROI| >= TFB_TRACK_CA_VERIFY_PCT
+       (default 15) the maturation is verified against the ADJUSTED
+       history: agree -> mature as-is; disagree by > 12pp -> mature on the
+       ADJUSTED ROI with a [v6.18.0 CA-ADJUST] note; history unavailable
+       -> EXPIRED outcome CORP_ACTION_SUSPECT (structurally excluded, like
+       UNPRICED — never a fake WIN/LOSS). TFB_TRACK_CA_GUARD=0 restores
+       the v6.17.0 maturation verbatim.
+  v6.18.0 D [BT-ADJ]  _yf_deep_history pinned auto_adjust=False, feeding
+       UNADJUSTED closes to every hypothesis backtest while EODHD bars
+       arrive adjusted — the same split-brain fixed provider-side in
+       yahoo_chart v8.8.0. FIX: auto_adjust=True (TFB_BT_ADJUSTED=0
+       restores raw), and each bar now also carries "adjclose" so
+       _bt_bar_close's adjusted-first preference actually engages.
+
+Why the previous revision (v6.17.0 vs v6.16.0) — MATURITY PRICE-INTEGRITY
 (fresh-price-or-hold; evidence: 2026-07-10 workbook audits, first 1M
 cohort maturing ~2026-07-18)
   ROOT CAUSE. audit_active_records matured every past-due record on
@@ -653,7 +703,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.17.0"
+SCRIPT_VERSION = "6.18.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -1257,6 +1307,114 @@ class RiyadhTime:
 
 
 # =============================================================================
+# v6.18.0 — cohort-rescue helpers (PF-GEOM / PRICE-FEED-LOUD / CA-GUARD)
+_CA_TAG = "[v6.18.0 CA-GUARD]"
+_PRICE_FEED_TAG = "[v6.18.0 PRICE-FEED]"
+
+
+def _summary_side_enabled() -> bool:
+    """v6.18.0 (PF-GEOM): write the KPI summary BESIDE the record grid
+    (AG1:AK13) instead of on top of it (A1:E13, which overwrote the header
+    row's identity cells and orphaned the 8 earliest records). Default ON.
+    TFB_TRACK_SUMMARY_SIDE=0 restores the v6.17.0 placement."""
+    return (os.getenv("TFB_TRACK_SUMMARY_SIDE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _summary_block_range(n_rows: int) -> str:
+    """v6.18.0 (PF-GEOM): A1-range for an n_rows x 5 KPI block. Side placement
+    = column AG (33), safely right of the 31-column record grid."""
+    if _summary_side_enabled():
+        return f"AG1:AK{int(n_rows)}"
+    return f"A1:E{int(n_rows)}"
+
+
+def _price_feed_dead(syms: List[str], price_map: Dict[str, float]) -> Optional[str]:
+    """v6.18.0 (PRICE-FEED-LOUD): classify a dead/degraded feed. None when
+    healthy, else a short cause for the ERROR log. 'Dead' = symbols were
+    requested but not one positive price arrived — the exact condition that
+    silently froze all 2,264 records at entry price in the 2026-07-12 export."""
+    if not syms:
+        return None
+    priced = sum(1 for s in syms if float(price_map.get(s, 0.0) or 0.0) > 0.0)
+    if priced == 0:
+        return f"0/{len(syms)} symbols priced — feed dead"
+    if priced * 4 < len(syms):
+        return f"only {priced}/{len(syms)} symbols priced"
+    return None
+
+
+def _ca_guard_enabled() -> bool:
+    """v6.18.0 (CA-GUARD) master switch. Default ON. TFB_TRACK_CA_GUARD=0
+    restores the v6.17.0 maturation verbatim."""
+    return (os.getenv("TFB_TRACK_CA_GUARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _ca_verify_pct() -> float:
+    """|print ROI| (pp) above which maturation is verified vs adjusted
+    history. Default 15."""
+    try:
+        v = float((os.getenv("TFB_TRACK_CA_VERIFY_PCT") or "").strip() or 15.0)
+    except Exception:
+        v = 15.0
+    return max(0.0, v)
+
+
+def _ca_decide(print_roi: float, adj_roi: Optional[float],
+               tol_pp: float = 12.0) -> Tuple[str, float]:
+    """v6.18.0 (CA-GUARD) pure decision core. Returns (verdict, roi_to_use):
+      ('ok', print_roi)      adjusted agrees within tol_pp — real move.
+      ('adjust', adj_roi)    prints disagree with the adjusted series by
+                             > tol_pp — a corporate action re-based the share
+                             count; the ADJUSTED number is the honest outcome
+                             (bonus 1:1: print -50 vs adj ~0 -> 0).
+      ('suspect', print_roi) verification impossible — never let a possibly
+                             fake WIN/LOSS into the calibration cohort."""
+    if adj_roi is None:
+        return "suspect", print_roi
+    if abs(print_roi - adj_roi) > tol_pp:
+        return "adjust", float(adj_roi)
+    return "ok", print_roi
+
+
+def _ca_adjusted_roi(symbol: str, entry_date: Any) -> Optional[float]:
+    """ROI% from the ADJUSTED close series between entry_date and the latest
+    bar (deep-history pull, adjusted via v6.18.0 D). Start bar = nearest bar
+    within 7 days of entry_date. Fail-soft None on any doubt."""
+    try:
+        sym = _safe_str(symbol).upper()
+        if not sym:
+            return None
+        if sym.endswith(".US"):
+            sym = sym[:-3]  # yfinance wants bare US tickers
+        bars = _yf_deep_history(sym, period="1y")
+        if not bars:
+            return None
+        want = _safe_str(entry_date)[:10]
+        if not want:
+            return None
+        best = None
+        best_gap = 99
+        for b in bars:
+            d = _safe_str(b.get("date"))[:10]
+            if not d:
+                continue
+            try:
+                gap = abs((datetime.strptime(d, "%Y-%m-%d") - datetime.strptime(want, "%Y-%m-%d")).days)
+            except Exception:
+                continue
+            if gap < best_gap:
+                best, best_gap = b, gap
+        if best is None or best_gap > 7:
+            return None
+        c0 = _bt_bar_close(best)
+        c1 = _bt_bar_close(bars[-1])
+        if not c0 or not c1 or c0 <= 0:
+            return None
+        return (c1 / c0 - 1.0) * 100.0
+    except Exception:
+        return None
+
+
 # v6.17.0 — maturity price-integrity switches
 # =============================================================================
 _MATURE_FRESH_TAG = "[v6.17.0 MATURE-FRESH-ONLY]"
@@ -2286,7 +2444,7 @@ class PerformanceStore:
                 ["Sharpe Ratio", "0", "", "", ""],
             ]
             try:
-                self.ws.update(values=summary, range_name="A1:E7")
+                self.ws.update(values=summary, range_name=_summary_block_range(7))
                 self.ws.freeze(rows=self.START_ROW)
             except Exception:
                 pass
@@ -2426,7 +2584,7 @@ class PerformanceStore:
             ["Sortino Ratio", f"{summary.sortino_ratio:.2f}", "", "", ""],
         ]
         try:
-            self.backoff.execute_sync(lambda: self.ws.update(values=block, range_name="A1:E13"))  # type: ignore
+            self.backoff.execute_sync(lambda: self.ws.update(values=block, range_name=_summary_block_range(13)))  # type: ignore
             return True
         except Exception:
             return False
@@ -3814,7 +3972,12 @@ def _yf_deep_history(sym: str, period: str = "2y") -> List[Dict[str, Any]]:
     except Exception:
         return []
     try:
-        df = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=False)
+        # v6.18.0 (BT-ADJ): adjusted by default — unadjusted bars fed every
+        # hypothesis backtest a fake +/-N00% bar at each split/bonus issue
+        # (the same split-brain fixed provider-side in yahoo_chart v8.8.0).
+        # TFB_BT_ADJUSTED=0 restores the raw v6.17.0 pull.
+        _adj = (os.getenv("TFB_BT_ADJUSTED") or "1").strip().lower() not in {"0", "false", "off", "no"}
+        df = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=_adj)
     except Exception:
         return []
     if df is None or getattr(df, "empty", True):
@@ -3826,6 +3989,10 @@ def _yf_deep_history(sym: str, period: str = "2y") -> List[Dict[str, Any]]:
                 "date": idx.strftime("%Y-%m-%d"),
                 "open": float(r["Open"]), "high": float(r["High"]),
                 "low": float(r["Low"]), "close": float(r["Close"]),
+                # v6.18.0 (BT-ADJ): with auto_adjust=True, Close IS the
+                # adjusted close — surfaced under the key _bt_bar_close
+                # prefers, so the adjusted-first pick actually engages.
+                "adjclose": float(r["Close"]),
                 "volume": float(r.get("Volume", 0) or 0),
             })
         except Exception:
@@ -4792,11 +4959,23 @@ class PerformanceTrackerApp:
             return records
 
         syms = list(dict.fromkeys([r.symbol for r in active]))
-        price_map = (
-            await self.backend.fetch_prices(syms)
-            if self.backend.base_url
-            else {}
-        )
+        if not self.backend.base_url:
+            # v6.18.0 (PRICE-FEED-LOUD): this exact silent {} froze all 2,264
+            # records at entry price on 2026-07-12 — and would have expired the
+            # whole first cohort UNPRICED. Never silent again.
+            price_map: Dict[str, float] = {}
+            logger.error(
+                "%s backend base_url is EMPTY — %d active symbols cannot be "
+                "priced; fresh-only maturation will hold/expire the cohort. "
+                "Set the backend URL env for this job.",
+                _PRICE_FEED_TAG, len(syms),
+            )
+        else:
+            price_map = await self.backend.fetch_prices(syms)
+            _dead = _price_feed_dead(syms, price_map)
+            if _dead:
+                logger.error("%s %s — fresh-only maturation will hold/expire "
+                             "affected records.", _PRICE_FEED_TAG, _dead)
         now_r = RiyadhTime.now()
 
         _fresh_only = _mature_fresh_only_enabled()
@@ -4829,9 +5008,40 @@ class PerformanceTrackerApp:
                 elif _fresh and r.entry_price > 0:
                     # v6.17.0 (A): fresh positive price THIS run -> honest
                     # maturation on today's realized number.
+                    # v6.18.0 (CA-GUARD): a big print-ROI is verified against
+                    # the ADJUSTED series before it becomes a WIN/LOSS — a
+                    # bonus issue / split between entry and maturity fakes the
+                    # print ratio (1:1 bonus => -50%; 1-for-10 reverse =>
+                    # +900%). Verified-agree matures as-is; disagree matures on
+                    # the adjusted ROI; unverifiable expires CORP_ACTION_SUSPECT
+                    # (excluded like UNPRICED). TFB_TRACK_CA_GUARD=0 -> v6.17.0.
+                    _roi_print = float(r.unrealized_roi or 0.0)
+                    _verdict, _roi_use = "ok", _roi_print
+                    if _ca_guard_enabled() and abs(_roi_print) >= _ca_verify_pct():
+                        _adj = _ca_adjusted_roi(r.symbol, r.date_recorded)
+                        _verdict, _roi_use = _ca_decide(_roi_print, _adj)
+                    if _verdict == "suspect":
+                        r.status = PerformanceStatus.EXPIRED
+                        r.maturity_date = now_r
+                        r.realized_roi = None
+                        r.outcome = "CORP_ACTION_SUSPECT"
+                        _note = (f"{_CA_TAG} |print ROI| {_roi_print:+.1f}% >= "
+                                 f"{_ca_verify_pct():.0f}% but adjusted history "
+                                 f"unavailable — excluded, never a fake outcome")
+                        r.notes = f"{r.notes} | {_note}" if r.notes else _note
+                        _expired_syms.append(r.symbol)
+                        r.last_updated = _utc_now()
+                        continue
+                    if _verdict == "adjust":
+                        _note = (f"[v6.18.0 CA-ADJUST] print {_roi_print:+.1f}% "
+                                 f"vs adjusted {_roi_use:+.1f}% — corporate "
+                                 f"action re-based the prints; matured on the "
+                                 f"adjusted series")
+                        r.notes = f"{r.notes} | {_note}" if r.notes else _note
+                        r.unrealized_roi = float(_roi_use)
                     r.status = PerformanceStatus.MATURED
                     r.maturity_date = now_r
-                    r.realized_roi = float(r.unrealized_roi or 0.0)
+                    r.realized_roi = float(_roi_use)
                     if (r.realized_roi or 0.0) > 0:
                         r.outcome = "WIN"
                     elif (r.realized_roi or 0.0) < 0:
