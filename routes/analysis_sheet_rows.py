@@ -2,12 +2,56 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.5.1  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
+Analysis Sheet-Rows Router — v4.8.0  (V2.15.0-ALIGNED / 118-COL TOP10 / WAVE 3)
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 DIAGNOSTIC-VISIBLE • ENGINE-V2-PREFERRED • PROXY-TIMEOUT-SAFE • GLOBAL-RANK
 GLOBAL-DEDUP
+
+WHY v4.8.0 — route-level P/E coherence [ROUTE-COHERENCE / Fix RC]
+--------------------------------------------------------------------------
+Live conviction (2026-07-13): Global_Markets served through THIS router on
+07-12/07-13 carried 63.6–89.2% transposed enrichment (price from the QUOTE
+block correct; name/EPS/PE from the ENRICHMENT block foreign — GOOG named
+"Gulfport Energy", implied P/E 11.7 vs stated 5.5), while the small-batch
+GAS pulls stayed at 0.4%. Engine v5.116.0 (Fix AY) now blocks the class at
+the source; this router — the single funnel BOTH writers pull through
+(GitHub daily_sync AND GAS refreshPageInBatches) — gains the independent
+second layer so a future engine regression can never ship a poisoned page
+silently again. Three pieces, all inside _payload_envelope (the one
+function every tier's response passes through, on the ORIGINAL row dicts
+BEFORE projection/matrix so rows, matrix and display stay consistent),
+scoped to the four cross-sectional market pages exactly like GLOBAL-RANK/
+GLOBAL-DEDUP:
+
+  RC-1 per-row CLEAR (TFB_ROUTE_PE_COHERENCE, default ON): P/E == Price/
+  EPS by construction; ratio (cp/eps)/pe coherent in [0.5, 2.0] or in the
+  LSE-pence band [50, 200] (same carve-out as engine AY-2 and sync L3b).
+  A definite break clears eps_ttm + pe_ttm in place (the pair is mutually
+  contradictory and unattributable) and tags the row
+  pe_incoherent_cleared:route (substring-safe; idempotent — a row the
+  engine already cleared has eps None and is simply not testable here).
+
+  RC-2 per-request TELEMETRY (always on): one [ROUTE-COHERENCE] log line
+  and a meta.route_coherence block (tested / incoherent / pct / cleared /
+  engine_cleared) on every market-page response — every pull by every
+  writer becomes server-side evidence in the Render log.
+
+  RC-3 page TRIPWIRE (TFB_ROUTE_COHERENCE_TRIPWIRE, default ON;
+  TFB_ROUTE_COHERENCE_MAX_BAD_PCT=25, TFB_ROUTE_COHERENCE_MIN_ROWS=50):
+  when a page's PRE-clear incoherence exceeds the threshold with enough
+  testable rows, the request is REFUSED with HTTP 409 (detail carries the
+  counts) BEFORE any clearing — the sibling fields on those rows (name/
+  sector/market cap) are equally foreign and no math can repair them.
+  Clearing-and-serving would still write foreign names; refusal is the
+  only honest response. Consumers fail safe by construction: daily_sync
+  treats non-200 as a failed fetch and preserves last-good (its own L3b
+  semantics); GAS keep-last-good withholds; and GAS's small batches sit
+  under MIN_ROWS so they are never page-judged. The wrapper's explicit
+  `except HTTPException: raise` guarantees the 409 propagates — the
+  emergency fallback only catches non-HTTP failures. Kill-switches
+  restore v4.7.0 byte-identically. ZERO functions removed.
 
 WHY v4.5.1 — Top_10 contract no longer clamped to the stale 93-col width
 -----------------------------------------------------------------------
@@ -307,7 +351,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.7.0"
+ANALYSIS_SHEET_ROWS_VERSION = "4.8.0"
 
 def _pair_rows_to_symbols(symbols, rows):
     """v4.7.0 TRANSPOSITION FIREWALL (2026-07-07): pair engine rows to the
@@ -1364,6 +1408,194 @@ def _apply_global_symbol_dedup(rows: List[Dict[str, Any]], page: str) -> int:
     return dropped
 
 
+# =============================================================================
+# v4.8.0 [ROUTE-COHERENCE / Fix RC] helpers — see header WHY block
+# =============================================================================
+_RC_TAG = "pe_incoherent_cleared:route"
+_RC_ENGINE_TAG = "pe_incoherent_cleared"  # matches engine AY-2 (any suffix)
+_RC_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _route_pe_coherence_enabled() -> bool:
+    """v4.8.0 [RC-1]: master switch for per-row eps/pe clearing (default ON).
+    Set TFB_ROUTE_PE_COHERENCE to 0/false/off to pass rows through unchanged
+    (telemetry still counts; the tripwire still judges)."""
+    raw = (os.getenv("TFB_ROUTE_PE_COHERENCE", "") or "").strip().lower()
+    return raw not in _RC_FALSY
+
+
+def _route_coherence_tripwire_enabled() -> bool:
+    """v4.8.0 [RC-3]: master switch for the page-level 409 refusal
+    (default ON). Set TFB_ROUTE_COHERENCE_TRIPWIRE to 0/false/off to serve
+    (and, with RC-1, clear) even a systemically incoherent page."""
+    raw = (os.getenv("TFB_ROUTE_COHERENCE_TRIPWIRE", "") or "").strip().lower()
+    return raw not in _RC_FALSY
+
+
+def _route_coh_max_bad_pct() -> float:
+    """v4.8.0 [RC-3]: trip threshold in percent (default 25, clamped to
+    [1, 95]) — same separation logic as run_dashboard_sync v6.23.0 L3b
+    (live measurement: poisoned GM 89.2% vs clean ML 1.0%)."""
+    try:
+        v = float(os.getenv("TFB_ROUTE_COHERENCE_MAX_BAD_PCT", "") or 25.0)
+    except Exception:
+        v = 25.0
+    return min(95.0, max(1.0, v))
+
+
+def _route_coh_min_rows() -> int:
+    """v4.8.0 [RC-3]: minimum TESTABLE rows before a page may be judged
+    (default 50, floor 10) — GAS small batches sit under this by design and
+    are never page-judged, exactly like L3b's MIN_ROWS rule."""
+    try:
+        v = int(float(os.getenv("TFB_ROUTE_COHERENCE_MIN_ROWS", "") or 50))
+    except Exception:
+        v = 50
+    return max(10, v)
+
+
+def _rc_float(v: Any) -> Optional[float]:
+    """v4.8.0: tolerant scalar->float; None on blank/unparseable/non-finite."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(str(v).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
+
+
+def _rc_row_verdict(row: Mapping[str, Any]) -> int:
+    """v4.8.0: one row's coherence verdict. Returns 0 = not testable,
+    1 = coherent, 2 = incoherent. Testable iff current_price, eps_ttm and
+    pe_ttm are all present and > 0 (missing/zero/negative -> no judgement,
+    the L3b rule). Coherent when ratio (cp/eps)/pe lies in [0.5, 2.0] or in
+    the LSE-pence band [50, 200]."""
+    cp = _rc_float(row.get("current_price"))
+    eps = _rc_float(row.get("eps_ttm"))
+    pe = _rc_float(row.get("pe_ttm"))
+    if cp is None or eps is None or pe is None:
+        return 0
+    if cp <= 0 or eps <= 0 or pe <= 0:
+        return 0
+    ratio = (cp / eps) / pe
+    if 0.5 <= ratio <= 2.0 or 50.0 <= ratio <= 200.0:
+        return 1
+    return 2
+
+
+def _rc_append_warning(row: Dict[str, Any], tag: str) -> None:
+    """v4.8.0: append a warnings tag using the engine's string convention
+    ('a; b'); idempotent — a tag already present is never doubled."""
+    existing = str(row.get("warnings") or "").strip()
+    if tag in existing:
+        return
+    row["warnings"] = (existing + "; " + tag) if existing else tag
+
+
+def _rc_scan_rows(rows: Sequence[Any]) -> Tuple[int, int, int, List[int]]:
+    """v4.8.0 [RC-2]: pure count pass. Returns (tested, incoherent,
+    engine_cleared, incoherent_indices). engine_cleared counts rows already
+    tagged by the engine's AY-2 pass (those rows carry eps None and are not
+    testable here — the two layers never double-count)."""
+    tested = incoherent = engine_cleared = 0
+    bad_idx: List[int] = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            continue
+        if _RC_ENGINE_TAG in str(row.get("warnings") or ""):
+            engine_cleared += 1
+        verdict = _rc_row_verdict(row)
+        if verdict == 0:
+            continue
+        tested += 1
+        if verdict == 2:
+            incoherent += 1
+            bad_idx.append(i)
+    return tested, incoherent, engine_cleared, bad_idx
+
+
+def _rc_clear_rows(rows: Sequence[Any], bad_idx: Sequence[int]) -> int:
+    """v4.8.0 [RC-1]: clear the mutually-contradictory eps_ttm/pe_ttm pair on
+    each incoherent row IN PLACE (before projection, so rows/matrix/display
+    all agree) and tag it. Returns rows cleared. current_price is never
+    touched."""
+    cleared = 0
+    for i in bad_idx:
+        row = rows[i]
+        if not isinstance(row, dict):
+            continue
+        row["eps_ttm"] = None
+        row["pe_ttm"] = None
+        _rc_append_warning(row, _RC_TAG)
+        cleared += 1
+    return cleared
+
+
+def _apply_route_coherence(page: str, row_objects: Sequence[Any], request_id: str) -> Optional[Dict[str, Any]]:
+    """v4.8.0 [ROUTE-COHERENCE]: the funnel hook. Scoped to the four
+    cross-sectional market pages (same set as GLOBAL-RANK/GLOBAL-DEDUP).
+    Counts first; TRIPS (HTTP 409, pre-clear — the sibling identity fields
+    on those rows are equally foreign and unrepairable) when the page is
+    judgeable and over threshold; otherwise clears the bad pairs (RC-1) and
+    returns the telemetry block for meta.route_coherence. Returns None off
+    scope. Never raises anything except the deliberate HTTPException."""
+    if page not in _RANKED_MARKET_PAGES:
+        return None
+    tested, incoherent, engine_cleared, bad_idx = _rc_scan_rows(row_objects or [])
+    pct = round((100.0 * incoherent / tested), 1) if tested else 0.0
+    trip_on = _route_coherence_tripwire_enabled()
+    min_rows = _route_coh_min_rows()
+    max_pct = _route_coh_max_bad_pct()
+    if trip_on and tested >= min_rows and pct > max_pct:
+        try:
+            logger.warning(
+                "[analysis_sheet_rows v%s] ROUTE-COHERENCE TRIP page=%r req=%s "
+                "tested=%d incoherent=%d (%.1f%% > %.1f%%, min_rows=%d) — "
+                "refusing to serve (HTTP 409); upstream enrichment is "
+                "systemically transposed",
+                ANALYSIS_SHEET_ROWS_VERSION, page, request_id,
+                tested, incoherent, pct, max_pct, min_rows,
+            )
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "page_coherence_tripwire",
+                "page": page,
+                "tested": tested,
+                "incoherent": incoherent,
+                "incoherent_pct": pct,
+                "threshold_pct": max_pct,
+                "min_rows": min_rows,
+                "request_id": request_id,
+                "version": ANALYSIS_SHEET_ROWS_VERSION,
+            },
+        )
+    cleared = _rc_clear_rows(row_objects or [], bad_idx) if (_route_pe_coherence_enabled() and bad_idx) else 0
+    if tested or engine_cleared:
+        try:
+            logger.info(
+                "[analysis_sheet_rows v%s] ROUTE-COHERENCE page=%r req=%s "
+                "tested=%d incoherent=%d (%.1f%%) cleared=%d engine_cleared=%d",
+                ANALYSIS_SHEET_ROWS_VERSION, page, request_id,
+                tested, incoherent, pct, cleared, engine_cleared,
+            )
+        except Exception:
+            pass
+    return {
+        "tested": tested,
+        "incoherent": incoherent,
+        "incoherent_pct": pct,
+        "cleared": cleared,
+        "engine_cleared": engine_cleared,
+        "tripwire": "on" if trip_on else "off",
+    }
+
+
 def _key_variants(key: str) -> List[str]:
     k = _strip(key)
     if not k:
@@ -1858,6 +2090,10 @@ def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
 def _payload_envelope(*, page: str, route_family: str, headers: Sequence[str], keys: Sequence[str], row_objects: Sequence[Mapping[str, Any]], include_matrix: bool, request_id: str, started_at: float, mode: str, status_out: str, error_out: Optional[str], meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     hdrs = list(headers or [])
     ks = list(keys or [])
+    # v4.8.0 [ROUTE-COHERENCE]: judge/clear on the ORIGINAL row dicts BEFORE
+    # projection, so rows / matrix / display all agree. May raise HTTP 409
+    # (RC-3) — the impl wrapper's `except HTTPException: raise` propagates it.
+    _rc_meta = _apply_route_coherence(page, row_objects or [], request_id)
     rows_dict = [_strip_internal_fields(_project_row(ks, dict(r))) for r in (row_objects or [])]
     if page == _TOP10_PAGE:
         for idx, row in enumerate(rows_dict, start=1):
@@ -1902,6 +2138,7 @@ def _payload_envelope(*, page: str, route_family: str, headers: Sequence[str], k
             "count": len(rows_dict),
             "row_object_count": len(rows_dict),
             "matrix_row_count": len(matrix),
+            **({"route_coherence": _rc_meta} if _rc_meta is not None else {}),
             **(meta or {}),
         },
     })
