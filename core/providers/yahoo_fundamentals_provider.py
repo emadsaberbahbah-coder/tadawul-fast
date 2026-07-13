@@ -2,6 +2,52 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
+Yahoo Finance Fundamentals Provider -- v6.7.0
+================================================================================
+v6.7.0 -- YF-2 ON + TIGHT CROSS-RESPONSE BAND + DECLARED-IDENTITY ECHO
+          (Fixes YF-2b / YF-3 / YF-4)
+--------------------------------------------------------------------------------
+WHY (live workbook audit 2026-07-13, export v39 + repo forensics): the
+2026-07-12/13 sync-scale writes carried 63.6-89.2% transposed enrichment on
+Global_Markets -- SAME-LOCALE crossings the v6.6.0 guards structurally pass:
+GOOG served Gulfport Energy's name/EPS/PE (US<->US, Yahoo stamped the
+REQUESTED ticker, price plausible). The v6.6.0 header documented exactly
+this residual; today it is the live failure mode, so the residual shrinks:
+
+YF-2b DEFAULT FLIP: TFB_FUND_PRICE_COHERENCE_GUARD now defaults ON (=0 is
+the kill switch) -- same house rule as YF-1: a documented control that the
+live failure class violates ships armed.
+
+YF-3 TIGHT CROSS-RESPONSE BAND: YF-2 compared info/fast_info price against
+this fetch's OWN history last close using the UNIT-CLASS thresholds
+(8.0/0.125) -- the live GOOG<->Gulfport crossing sits at 2.14x and sailed
+through. Two SAME-DAY responses for the SAME instrument cannot legitimately
+disagree 2x (a >100% one-day move; auto-adjusted history makes split days a
+non-class), so YF-2's conviction test now uses a dedicated tight band --
+TFB_FUND_PRICE_BAND_HIGH (default 2.0, floor 1.25) / TFB_FUND_PRICE_BAND_LOW
+(default 0.5, ceiling 0.8) -- while every OTHER consumer of the unit-class
+thresholds (52W bounds, sanity guard) keeps 8.0/0.125 untouched. Same
+conviction semantics: discard info AND fast_info, tag
+provider_price_incoherent, fall to honest history/None. Stated honestly:
+a crossing whose two instruments trade within 2x of each other still passes
+here -- the engine AY-2 / route RC / sync L3b layers (all shipped
+2026-07-13) own that residue via the P/E==Price/EPS invariant.
+
+YF-4 DECLARED-IDENTITY ECHO: the patch now carries the identity Yahoo's OWN
+response declared -- out["code"] = the raw symbol/underlyingSymbol Yahoo
+stamped -- captured BEFORE any conviction resets info. The engine's AU-1b
+raw-patch check reads exactly this key, so even with every provider-local
+guard kill-switched OFF the engine gets an independent second look; a
+response that declares the requested ticker echoes it back (harmless), and
+canonicalization is unaffected (the engine passes normalized_symbol
+explicitly). Belt-and-braces, zero behavior change on honest responses.
+
+Version: PROVIDER_VERSION = "6.7.0". All prior WHYs preserved verbatim.
+Zero functions removed; additions: _fund_price_band_high,
+_fund_price_band_low.
+================================================================================
+(v6.6.0 header retained below)
+================================================================================
 Yahoo Finance Fundamentals Provider -- v6.6.0
 ================================================================================
 v6.6.0 -- GUARD DEFAULT ON + FAST-INFO SUPPRESSION + OWN-HISTORY PRICE
@@ -113,7 +159,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.6.0"
+PROVIDER_VERSION = "6.7.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -294,11 +340,34 @@ def _fund_identity_guard_enabled() -> bool:
 
 
 def _fund_price_coherence_enabled() -> bool:
-    """v6.6.0 YF-2: own-history price-coherence guard. DEFAULT OFF; set
-    TFB_FUND_PRICE_COHERENCE_GUARD=1 to convict an info/fast_info set whose
-    live price disagrees with this provider's own history last close by a
-    unit-class ratio (YF_PRICE_RATIO_HIGH/LOW thresholds)."""
-    return (os.getenv("TFB_FUND_PRICE_COHERENCE_GUARD") or "0").strip().lower() in {"1", "true", "on", "yes"}
+    """v6.6.0 YF-2 / v6.7.0 YF-2b: own-history price-coherence guard.
+    DEFAULT ON since v6.7.0 (the 2026-07-12/13 GM crossings ran with it
+    dark); set TFB_FUND_PRICE_COHERENCE_GUARD=0/false/off/no to disable.
+    v6.7.0 YF-3: conviction uses the TIGHT cross-response band
+    (_fund_price_band_high/low, default 2.0/0.5) -- two same-day responses
+    for the same instrument cannot legitimately disagree 2x."""
+    return (os.getenv("TFB_FUND_PRICE_COHERENCE_GUARD") or "1").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _fund_price_band_high() -> float:
+    """v6.7.0 YF-3: upper conviction ratio for YF-2's info-vs-own-history
+    check (default 2.0, floored at 1.25 so a mis-set env can never convict
+    an ordinary daily move). Distinct from YF_PRICE_RATIO_HIGH (8.0), which
+    keeps guarding the unit-class checks (52W bounds / sanity)."""
+    try:
+        v = float(os.getenv("TFB_FUND_PRICE_BAND_HIGH", "") or 2.0)
+    except Exception:
+        v = 2.0
+    return v if v >= 1.25 else 1.25
+
+
+def _fund_price_band_low() -> float:
+    """v6.7.0 YF-3: lower conviction ratio (default 0.5, ceiling 0.8)."""
+    try:
+        v = float(os.getenv("TFB_FUND_PRICE_BAND_LOW", "") or 0.5)
+    except Exception:
+        v = 0.5
+    return v if 0.0 < v <= 0.8 else 0.5
 
 
 def _ticker_identity_base(s: Any) -> str:
@@ -1796,8 +1865,10 @@ class YahooFundamentalsProvider:
                 # the wrong-company `info` so the row does not impersonate it.
                 # Conservative + gated (TFB_FUND_IDENTITY_GUARD); no-ops unless a
                 # clear base-ticker mismatch is present.
+                _yf4_declared = None  # v6.7.0 YF-4: Yahoo's own declared identity
                 if info:
                     _returned_sym = _pick(info, "symbol", "underlyingSymbol", "quoteSymbol")
+                    _yf4_declared = safe_str(_returned_sym)
                     if _identity_mismatch(provider_symbol, _returned_sym):
                         warnings_list.append(
                             f"provider_identity_mismatch:{_returned_sym}!={provider_symbol}_discarded"
@@ -1867,8 +1938,8 @@ class YahooFundamentalsProvider:
                         and _yf2_last is not None and _yf2_last > 0
                         and _is_suspect_price_ratio(
                             _yf2_px, _yf2_last,
-                            ratio_high=self.price_ratio_high,
-                            ratio_low=self.price_ratio_low)
+                            ratio_high=_fund_price_band_high(),   # v6.7.0 YF-3
+                            ratio_low=_fund_price_band_low())
                     ):
                         warnings_list.append(
                             f"provider_price_incoherent:{_yf2_px}!={_yf2_last}_discarded"
@@ -2087,6 +2158,11 @@ class YahooFundamentalsProvider:
                     "requested_symbol": norm_symbol,
                     "symbol": norm_symbol,
                     "provider_symbol": provider_symbol,
+                    # v6.7.0 YF-4: the identity Yahoo's response DECLARED,
+                    # captured before any conviction reset -- the engine's
+                    # AU-1b raw-patch check reads this key, giving it an
+                    # independent second look even with local guards off.
+                    "code": _yf4_declared,
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
                     "data_sources": [PROVIDER_NAME],
