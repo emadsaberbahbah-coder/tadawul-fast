@@ -2,8 +2,54 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.115.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.116.0
 ================================================================================
+
+WHY v5.116.0 - MASTER GUARDS ON + P/E-COHERENCE TWIN (Fix AY)
+--------------------------------------------------------------------------
+Live conviction (2026-07-13 morning audit, v39 export + repo forensics):
+Global_Markets 63.6% P/E-incoherent (1,601/2,518; GOOG named "Gulfport
+Energy", UU.L named "Franco-Nevada", BAJAJ-AUTO.NS named "ZTO Express"),
+Mutual_Funds anchors AGG/BND/VEA/XLE all FOREIGN - while Market_Leaders
+(GAS small-batch path) reads 0.4%. The sync-scale writes rode through
+/v1/analysis with the engine's OWN firewalls dark: AU-1 (the _fetch_patch
+choke-point identity guard, built after the 2026-07-06 poisoning) and
+Fix AV (price coherence) both shipped DEFAULT OFF, and the Render ENV
+carries neither flag - so the exact defense built for this failure class
+never ran in production. scripts/run_dashboard_sync.py v6.23.0 (L3b)
+proves the page-level detection; the engine must stop emitting the rows.
+
+AY-1 (defaults): TFB_ENGINE_IDENTITY_GUARD and TFB_ENGINE_PRICE_COHERENCE
+now default ON ("1"). Kill-switches unchanged: =0/false/off restores the
+prior byte-identical behavior. AU-1b (yahoo fundamentals side-band) shares
+the identity flag and lights up with it; AW (TFB_FUND_IDENTITY_GUARD) and
+AU-2 (TFB_SNAPSHOT_POISON_REFUSAL) were already ON.
+
+AY-2 (the guard that works even when a misdelivered payload DECLARES the
+requested symbol): _engine_apply_pe_coherence on the fully-merged row -
+the per-row twin of v6.23.0's L3b. current_price, eps_ttm and pe_ttm are
+not independent (P/E == Price/EPS) and price rides the QUOTE block while
+EPS/PE ride the ENRICHMENT block, so a transposed enrichment breaks the
+identity BY CONSTRUCTION. Coherent band ratio(implied/stated) in
+[0.5, 2.0]; the LSE pence convention band [50, 200] is treated coherent
+(same carve-out as L3b, ML residue 1.0% -> 3 rows, all explainable).
+On incoherence: eps_ttm + pe_ttm are cleared IN PLACE (the pair is
+mutually contradictory and unattributable) and the row is tagged
+pe_incoherent_cleared:engine (reliability-scan substring-safe: no
+cap/forecast/target/roi/drop/reject -> repeat gate passes byte-identical).
+Runs in the factory immediately after the Fix AV block, BEFORE scoring/
+gate, so valuation_score and the DQ fundamentals weights see honest
+blanks instead of foreign multiples. Env TFB_ENGINE_PE_COHERENCE default
+ON; =0 restores v5.115.0 byte-identically. Missing/non-positive cp, eps
+or pe -> no judgement (skip), exactly like L3b's testable-row rule.
+
+AY-3 (operational proof): DataEngineV5.__init__ logs a one-line
+[v... GUARDS] banner with the EFFECTIVE on/off of identity / price_coh /
+pe_coh / fund_identity / snapshot_refusal / final_action_invariant -
+Render logs now prove guard state at every boot, closing the
+"fixed-in-GitHub, dark-in-Render" doubt class the external 2026-07-13
+audit correctly flagged. ZERO functions removed; additions:
+_engine_pe_coherence_enabled, _engine_apply_pe_coherence.
 
 WHY v5.111.0 - FINAL-ACTION BOUNDARY INVARIANT (Fix AW)
 --------------------------------------------------------------------------
@@ -2656,7 +2702,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.115.0"
+__version__ = "5.116.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -8498,11 +8544,14 @@ def _bar_age_max_sessions() -> int:
 
 def _engine_identity_guard_enabled() -> bool:
     """v5.109.0 (Fix AU-1): engine-level provider-patch identity firewall.
-    Default OFF; set TFB_ENGINE_IDENTITY_GUARD=1 to drop provider patches
-    whose self-declared identity definitively mismatches the requested
-    symbol at _fetch_patch (the single choke point feeding the factory
-    loop, AR-2 failover, and AR-5 verification)."""
-    return os.getenv("TFB_ENGINE_IDENTITY_GUARD", "0").strip().lower() in ("1", "true", "yes", "on")
+    v5.116.0 (Fix AY-1): default ON - the 2026-07-12/13 chimeric writes
+    (GM 63.6-89.2% foreign enrichment) happened with this exact defense
+    dark; TFB_ENGINE_IDENTITY_GUARD in {0,false,no,off} restores the
+    prior OFF state. Drops provider patches whose self-declared identity
+    definitively mismatches the requested symbol at _fetch_patch (the
+    single choke point feeding the factory loop, AR-2 failover, and AR-5
+    verification); AU-1b (yahoo fundamentals side-band) shares this flag."""
+    return os.getenv("TFB_ENGINE_IDENTITY_GUARD", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _snapshot_provenance_label_enabled() -> bool:
@@ -8613,9 +8662,10 @@ _AW_IDENTITY_QUARANTINE_KEYS: Tuple[str, ...] = (
 
 def _engine_price_coherence_enabled() -> bool:
     """v5.110.0 (Fix AV): engine-level current_price<->previous_close
-    unit-class coherence tag on the fully-merged row. Default OFF; set
-    TFB_ENGINE_PRICE_COHERENCE=1 to enable."""
-    return os.getenv("TFB_ENGINE_PRICE_COHERENCE", "0").strip().lower() in ("1", "true", "yes", "on")
+    unit-class coherence tag on the fully-merged row. v5.116.0 (Fix
+    AY-1): default ON; TFB_ENGINE_PRICE_COHERENCE in {0,false,no,off}
+    restores the prior OFF state byte-identically."""
+    return os.getenv("TFB_ENGINE_PRICE_COHERENCE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _engine_coh_ratio_high() -> float:
@@ -8655,6 +8705,42 @@ def _engine_apply_price_coherence(merged: Dict[str, Any]) -> Optional[str]:
         if k in merged:
             merged[k] = None
     return "previous_close_incoherent_dropped:engine"
+
+
+def _engine_pe_coherence_enabled() -> bool:
+    """v5.116.0 (Fix AY-2): engine-level P/E == Price/EPS coherence check
+    on the fully-merged row - the per-row twin of run_dashboard_sync
+    v6.23.0's L3b page tripwire. Default ON; TFB_ENGINE_PE_COHERENCE in
+    {0,false,no,off} restores v5.115.0 byte-identically."""
+    return os.getenv("TFB_ENGINE_PE_COHERENCE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _engine_apply_pe_coherence(merged: Dict[str, Any]) -> Optional[str]:
+    """v5.116.0 (Fix AY-2): current_price, eps_ttm and pe_ttm are not
+    independent (P/E == Price/EPS); price rides the QUOTE block while
+    EPS/PE ride the ENRICHMENT block, so a transposed enrichment breaks
+    the identity BY CONSTRUCTION whatever the symbol. Coherent when
+    ratio = (cp/eps)/pe lies in [0.5, 2.0], or in [50, 200] (LSE pence
+    convention: price GBX, EPS GBP - same carve-out as L3b). On a
+    definite break: clear eps_ttm + pe_ttm in place (the pair is
+    mutually contradictory and unattributable) and return the warning
+    tag; else None. Missing/non-positive cp, eps or pe -> no judgement.
+    Never touches current_price."""
+    if not isinstance(merged, dict):
+        return None
+    cp = _as_float(merged.get("current_price"))
+    eps = _as_float(merged.get("eps_ttm"))
+    pe = _as_float(merged.get("pe_ttm"))
+    if cp is None or eps is None or pe is None:
+        return None
+    if cp <= 0 or eps <= 0 or pe <= 0:
+        return None
+    ratio = (cp / eps) / pe
+    if 0.5 <= ratio <= 2.0 or 50.0 <= ratio <= 200.0:
+        return None
+    merged["eps_ttm"] = None
+    merged["pe_ttm"] = None
+    return "pe_incoherent_cleared:engine"
 
 
 def _final_action_invariant_enabled() -> bool:
@@ -11760,6 +11846,28 @@ class DataEngineV5:
         self._page_snapshots: Dict[str, List[Dict[str, Any]]] = {}
         self._symbol_snapshots: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._closed = False
+        # v5.116.0 (Fix AY-3): one-line effective guard-state banner so the
+        # Render boot log PROVES what is armed (closes the fixed-in-GitHub /
+        # dark-in-Render doubt class). Never raises.
+        try:
+            def _g(fn: Any) -> str:
+                try:
+                    return "on" if fn() else "OFF"
+                except Exception:
+                    return "?"
+            logger.info(
+                "[v%s GUARDS] identity=%s price_coh=%s pe_coh=%s "
+                "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s",
+                __version__,
+                _g(_engine_identity_guard_enabled),
+                _g(_engine_price_coherence_enabled),
+                _g(_engine_pe_coherence_enabled),
+                _g(_fund_identity_guard_enabled),
+                _g(_snapshot_poison_refusal_enabled),
+                _g(_final_action_invariant_enabled),
+            )
+        except Exception:
+            pass
 
     async def aclose(self) -> None:
         if self._closed:
@@ -12789,6 +12897,16 @@ class DataEngineV5:
                 _av_tag = _engine_apply_price_coherence(merged)
                 if _av_tag:
                     _aq_append_warning(merged, _av_tag)
+
+            # --- v5.116.0 (Fix AY-2) ENGINE P/E-COHERENCE (L3b twin) --------
+            # Catches a transposed ENRICHMENT block even when the payload
+            # declared the requested symbol (guard-blind case): the pair
+            # eps_ttm/pe_ttm is cleared, the row tagged, and scoring/gate
+            # see honest blanks instead of a foreign multiple.
+            if _engine_pe_coherence_enabled() and not _is_empty_data_row(merged):
+                _ay_tag = _engine_apply_pe_coherence(merged)
+                if _ay_tag:
+                    _aq_append_warning(merged, _ay_tag)
 
             # v5.103.0 (Fix AQ): record price provenance for this run. A price
             # present HERE came from a real provider quote; anything filled by
