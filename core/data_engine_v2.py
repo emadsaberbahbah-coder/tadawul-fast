@@ -2,7 +2,78 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.116.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.117.0
+================================================================================
+
+WHY v5.117.0 - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY (Fix AZ)
+--------------------------------------------------------------------------
+Live conviction (2026-07-14 morning audit, v40 export, Signal_History):
+NMM.US whipsawed BUY->REDUCE->HOLD->SELL->REDUCE->HOLD across 48h while its
+price moved -0.5%. Forecast Reliability oscillated 76.5<->31.3 and Data
+Quality 100<->73.7 FIVE times (Jul 12 17:56 through Jul 14 06:34), the 12M
+engine forecast collapsed +22.4% -> +2.2%, and the row's forecast source
+flipped real <-> phase_ii_synthetic / momentum_only_fallback. The 23:20
+daily brief then shipped an ADD ticket (Rel 75) that the engine had already
+downgraded to SELL (Rel 31) two hours before send.
+
+ROOT CAUSE: a TRANSIENT provider fundamentals gap (Yahoo/EODHD miss, quota
+throttle, or a guard CORRECTLY discarding a poisoned response - the
+v6.7.0/v5.116.0 armed guards make honest discards MORE common by design)
+propagates INSTANTLY into the row: core fundamentals blank -> scoring falls
+to momentum-only -> forecast source degrades to synthetic -> DQ/Rel collapse
+-> action flips. The engine had NO MEMORY that the same symbol carried a
+complete, guard-clean fundamentals block hours earlier, so every gap read
+as if the company's data had never existed.
+
+FIX AZ - in-worker last-known-good (LKG) fundamentals continuity layer:
+  AZ-1 CAPTURE: after the Yahoo enrichment pass + EODHD fallback (i.e.
+       after every live fundamentals source has spoken and every identity/
+       coherence guard has run), a row whose core-fundamentals block is
+       organically complete (>= _fund_lkg_min_fields() of the 24 canonical
+       _YAHOO_FUNDAMENTAL_NEEDS_CHECK_FIELDS present AND an anchor field -
+       eps_ttm / pe_ttm / market_cap / revenue_ttm - present) and whose
+       warnings carry NO conviction tag (identity_patch_refused,
+       previous_close_incoherent_dropped, pe_incoherent_cleared,
+       provider_price_incoherent, enrichment_failed) has its fundamentals
+       block copied into an in-process store keyed by canonical symbol
+       ({fields, name, ts}). Rows that were themselves LKG-restored are
+       NEVER re-captured (tag check), so TTL cannot be self-refreshed.
+  AZ-2 RESTORE: when the SAME point in the pipeline finds the block
+       DEGRADED (< min-fields present) and a store entry younger than
+       _fund_lkg_ttl_h() (default 72h) exists, the missing fields are
+       backfilled FILL-ONLY through the existing
+       _filter_patch_to_missing_fields whitelist - a live value is never
+       overwritten - and the row is tagged fundamentals_lkg:<age>h through
+       the standard warnings channel, so scoring/gates/audits/sheet all SEE
+       the continuity honestly. Restored fundamentals keep scoring on the
+       real path instead of the momentum-only/synthetic cliff, which is
+       exactly the Rel-76-vs-31 / forecast-22%-vs-2% flap measured live.
+  AZ-3 BOOT BANNER: the Fix AY-3 one-line guard banner gains fund_lkg=on/
+       OFF so the Render boot log proves the layer's armed state.
+HONESTY + SAFETY CONSTRAINTS (all hold by construction):
+  - Fill-only: never overwrites a present value; price/volume/day fields
+    are NOT in the whitelist and can never be served from LKG.
+  - Capture-only-clean: conviction-tagged rows never seed the store, so a
+    guard-rejected poisoned response cannot enter LKG; restore AFTER a
+    conviction supplies the last CLEAN block - the guard and the cache
+    cooperate instead of the guard creating the outage.
+  - Age is disclosed on the row (warnings tag) every time a restore fires.
+  - Store is per-worker, in-memory, TTL-pruned and size-capped
+    (_fund_lkg_max_symbols, default 20000; oldest evicted first). A deploy
+    resets it - the first clean fetch cycle repopulates. No persistence,
+    no cross-worker sharing: acceptable for a flap measured in hours.
+KILL-SWITCH / ENV (house rule: a control that the live failure class
+violates ships ARMED): TFB_ENGINE_FUND_LKG default ON; =0/false/off/no
+restores v5.116.0 byte-identical behavior. TFB_ENGINE_FUND_LKG_TTL_H
+(default 72, floor 1), TFB_ENGINE_FUND_LKG_MIN_FIELDS (default 8, floor 3,
+ceiling 24), TFB_ENGINE_FUND_LKG_MAX (default 20000, floor 100). No Render
+ENV action is required to arm this fix.
+Version: __version__ = "5.117.0". All prior WHYs preserved verbatim.
+Zero functions removed; additions: _fund_lkg_enabled, _fund_lkg_ttl_h,
+_fund_lkg_min_fields, _fund_lkg_max_symbols, _fund_lkg_present_count,
+_fund_lkg_row_tainted, _fund_lkg_capture, _fund_lkg_restore,
+_fund_lkg_store_size (+ module store _FUND_LKG_STORE and constants
+_FUND_LKG_FIELDS, _FUND_LKG_ANCHOR_FIELDS, _FUND_LKG_TAINT_SUBSTRINGS).
 ================================================================================
 
 WHY v5.116.0 - MASTER GUARDS ON + P/E-COHERENCE TWIN (Fix AY)
@@ -2702,7 +2773,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.116.0"
+__version__ = "5.117.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -8743,6 +8814,205 @@ def _engine_apply_pe_coherence(merged: Dict[str, Any]) -> Optional[str]:
     return "pe_incoherent_cleared:engine"
 
 
+# =============================================================================
+# v5.117.0 (Fix AZ) - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY
+# =============================================================================
+# In-worker memory of the last guard-clean core-fundamentals block per
+# canonical symbol. See the WHY v5.117.0 header block for the live NMM.US
+# conviction (Rel 76.5<->31.3 / DQ 100<->73.7 flap, action whipsaw on a flat
+# price) and the honesty/safety constraints. Store shape:
+#     _FUND_LKG_STORE[sym] = {"ts": epoch_seconds, "name": str,
+#                             "fields": {canonical_field: value, ...}}
+# Single event loop per worker; helpers contain no await, so plain dict ops
+# are race-free within a worker. A deploy resets the store by design.
+
+_FUND_LKG_STORE: Dict[str, Dict[str, Any]] = {}
+
+# The 24 canonical core fundamentals (the exact needs-check vocabulary) are
+# the ONLY fields LKG may capture or restore. Price / volume / day-move /
+# forecast fields are deliberately outside this whitelist.
+_FUND_LKG_FIELDS: Tuple[str, ...] = _YAHOO_FUNDAMENTAL_NEEDS_CHECK_FIELDS
+
+# A block without at least one anchor is not a fundamentals block worth
+# remembering (identity strings alone must never qualify).
+_FUND_LKG_ANCHOR_FIELDS: Tuple[str, ...] = (
+    "eps_ttm", "pe_ttm", "market_cap", "revenue_ttm",
+)
+
+# Conviction vocabulary: a row whose warnings carry any of these substrings
+# never SEEDS the store (capture-only-clean). "fundamentals_lkg" blocks
+# re-capture of a restored row, so a restore can never refresh its own TTL.
+_FUND_LKG_TAINT_SUBSTRINGS: Tuple[str, ...] = (
+    "identity_patch_refused",
+    "previous_close_incoherent_dropped",
+    "pe_incoherent_cleared",
+    "provider_price_incoherent",
+    "enrichment_failed",
+    "fundamentals_lkg",
+)
+
+
+def _fund_lkg_enabled() -> bool:
+    """v5.117.0 (Fix AZ): fundamentals last-known-good continuity layer.
+    Default ON (house rule: the live NMM.US flap class violates it); set
+    TFB_ENGINE_FUND_LKG=0/false/off/no to restore v5.116.0 byte-identical
+    behavior."""
+    return (os.getenv("TFB_ENGINE_FUND_LKG") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fund_lkg_ttl_h() -> float:
+    """Store-entry time-to-live in hours (default 72, floor 1). Past the
+    TTL an entry is dead: restore refuses it and capture-side pruning
+    removes it."""
+    try:
+        v = float((os.getenv("TFB_ENGINE_FUND_LKG_TTL_H") or "72").strip())
+    except Exception:
+        v = 72.0
+    return v if v >= 1.0 else 1.0
+
+
+def _fund_lkg_min_fields() -> int:
+    """Completeness threshold over _FUND_LKG_FIELDS: >= this many present
+    fields = organically complete (capturable); < this = degraded
+    (restorable). Default 8; floor 3; ceiling len(_FUND_LKG_FIELDS)."""
+    try:
+        v = int((os.getenv("TFB_ENGINE_FUND_LKG_MIN_FIELDS") or "8").strip())
+    except Exception:
+        v = 8
+    if v < 3:
+        v = 3
+    if v > len(_FUND_LKG_FIELDS):
+        v = len(_FUND_LKG_FIELDS)
+    return v
+
+
+def _fund_lkg_max_symbols() -> int:
+    """Store size cap (default 20000, floor 100). Expired entries are
+    pruned first; if still over cap the oldest-captured entries are
+    evicted."""
+    try:
+        v = int((os.getenv("TFB_ENGINE_FUND_LKG_MAX") or "20000").strip())
+    except Exception:
+        v = 20000
+    return v if v >= 100 else 100
+
+
+def _fund_lkg_present_count(row: Mapping[str, Any]) -> int:
+    """How many of the 24 whitelisted core fundamentals carry a real value."""
+    if not isinstance(row, Mapping):
+        return 0
+    n = 0
+    for k in _FUND_LKG_FIELDS:
+        if not _is_missing_or_unknown_field(row.get(k)):
+            n += 1
+    return n
+
+
+def _fund_lkg_row_tainted(row: Mapping[str, Any]) -> bool:
+    """True when the row's warnings carry any conviction/LKG substring."""
+    if not isinstance(row, Mapping):
+        return True
+    w = _safe_str(row.get("warnings")).lower()
+    if not w:
+        return False
+    for sub in _FUND_LKG_TAINT_SUBSTRINGS:
+        if sub in w:
+            return True
+    return False
+
+
+def _fund_lkg_store_size() -> int:
+    """Introspection helper (self-tests / diagnostics)."""
+    return len(_FUND_LKG_STORE)
+
+
+def _fund_lkg_capture(sym: str, row: Mapping[str, Any]) -> bool:
+    """AZ-1: seed/refresh the store from an organically-complete,
+    conviction-free row. Fill-only philosophy applies to the STORE too: the
+    entry is a fresh snapshot of present whitelisted fields (missing fields
+    are simply absent from it). Returns True when a snapshot was stored.
+    Never raises."""
+    try:
+        if not _fund_lkg_enabled():
+            return False
+        s = _safe_str(sym).strip().upper()
+        if not s or not isinstance(row, Mapping):
+            return False
+        if _fund_lkg_row_tainted(row):
+            return False
+        if _fund_lkg_present_count(row) < _fund_lkg_min_fields():
+            return False
+        if all(_is_missing_or_unknown_field(row.get(k)) for k in _FUND_LKG_ANCHOR_FIELDS):
+            return False
+        fields: Dict[str, Any] = {}
+        for k in _FUND_LKG_FIELDS:
+            v = row.get(k)
+            if not _is_missing_or_unknown_field(v):
+                fields[k] = v
+        if not fields:
+            return False
+        now = time.time()
+        _FUND_LKG_STORE[s] = {
+            "ts": now,
+            "name": _safe_str(row.get("name")),
+            "fields": fields,
+        }
+        # Hygiene: prune expired, then enforce the size cap oldest-first.
+        cap = _fund_lkg_max_symbols()
+        if len(_FUND_LKG_STORE) > cap:
+            ttl_s = _fund_lkg_ttl_h() * 3600.0
+            expired = [k for k, e in _FUND_LKG_STORE.items()
+                       if (now - float(e.get("ts") or 0.0)) > ttl_s]
+            for k in expired:
+                _FUND_LKG_STORE.pop(k, None)
+            if len(_FUND_LKG_STORE) > cap:
+                by_age = sorted(_FUND_LKG_STORE.items(),
+                                key=lambda kv: float(kv[1].get("ts") or 0.0))
+                for k, _e in by_age[: len(_FUND_LKG_STORE) - cap]:
+                    _FUND_LKG_STORE.pop(k, None)
+        return True
+    except Exception:
+        return False
+
+
+def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
+    """AZ-2: when the row's core-fundamentals block is DEGRADED and a live
+    (younger than TTL) store entry exists, backfill ONLY the missing
+    whitelisted fields (fill-only via _filter_patch_to_missing_fields) and
+    return the honest warnings tag "fundamentals_lkg:<age>h". Returns None
+    when nothing was restored. Mutates row in place. Never raises."""
+    try:
+        if not _fund_lkg_enabled() or not isinstance(row, dict):
+            return None
+        s = _safe_str(sym).strip().upper()
+        if not s:
+            return None
+        if _fund_lkg_present_count(row) >= _fund_lkg_min_fields():
+            return None
+        entry = _FUND_LKG_STORE.get(s)
+        if not entry:
+            return None
+        now = time.time()
+        age_s = now - float(entry.get("ts") or 0.0)
+        if age_s < 0:
+            age_s = 0.0
+        if age_s > _fund_lkg_ttl_h() * 3600.0:
+            _FUND_LKG_STORE.pop(s, None)
+            return None
+        fields = entry.get("fields")
+        if not isinstance(fields, dict) or not fields:
+            return None
+        filtered, filled = _filter_patch_to_missing_fields(row, fields, _FUND_LKG_FIELDS)
+        if not filtered:
+            return None
+        for k, v in filtered.items():
+            row[k] = v
+        age_h = int(age_s // 3600)
+        return "fundamentals_lkg:%dh" % age_h
+    except Exception:
+        return None
+
+
 def _final_action_invariant_enabled() -> bool:
     """v5.111.0 (Fix AW): final-boundary INVEST-on-SELL invariant. Default
     ON (enforces the registry-documented gate.no_invest_on_sell_reco that
@@ -11857,7 +12127,8 @@ class DataEngineV5:
                     return "?"
             logger.info(
                 "[v%s GUARDS] identity=%s price_coh=%s pe_coh=%s "
-                "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s",
+                "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
+                "fund_lkg=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
@@ -11865,6 +12136,7 @@ class DataEngineV5:
                 _g(_fund_identity_guard_enabled),
                 _g(_snapshot_poison_refusal_enabled),
                 _g(_final_action_invariant_enabled),
+                _g(_fund_lkg_enabled),
             )
         except Exception:
             pass
@@ -13005,6 +13277,24 @@ class DataEngineV5:
             # scoring and the investability gate. Fetches only when a gap
             # remains. Env-toggleable (TFB_EODHD_FUNDAMENTALS_FALLBACK).
             merged = await self._apply_eodhd_fundamentals_fallback(merged, sym, page_ctx)
+
+            # --- v5.117.0 (Fix AZ) FUNDAMENTALS LKG CONTINUITY ---------------
+            # Every live fundamentals source (provider loop, Yahoo enrichment,
+            # EODHD fallback) and every identity/coherence guard has now
+            # spoken. A degraded core block is backfilled FILL-ONLY from the
+            # last guard-clean snapshot (<= TTL) and tagged honestly; an
+            # organically-complete, conviction-free block refreshes the
+            # snapshot. Restored rows are never re-captured (tag check), so a
+            # restore cannot refresh its own TTL. OFF => byte-identical.
+            if _fund_lkg_enabled() and not _is_empty_data_row(merged):
+                _az_tag = _fund_lkg_restore(sym, merged)
+                if _az_tag:
+                    _aq_append_warning(merged, _az_tag)
+                    logger.info(
+                        "[engine_v2 v%s AZ-2] fundamentals LKG restore on %s (page=%s): %s",
+                        __version__, sym, page_ctx or "?", _az_tag,
+                    )
+                _fund_lkg_capture(sym, merged)
 
             # Phase BB sanity normalization.
             merged = _apply_phase_bb_sanity(merged)
