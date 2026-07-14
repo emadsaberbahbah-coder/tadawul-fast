@@ -2,9 +2,35 @@
 """
 core/news_intelligence.py
 ================================================================================
-Advanced News Intelligence Engine -- v5.1.0
+Advanced News Intelligence Engine -- v5.2.0
 ================================================================================
 RENDER-SAFE • IMPORT-SAFE • LAZY-ML • RSS/GOOGLE SAFE • CACHE-BACKED • ASYNC-SAFE
+
+v5.2.0 changes (over v5.1.0) — FACTUAL DISPLAY SUMMARY (Fix N1)
+---------------------------------------------------------------
+Strategy pillar (b) constraint (registry 2026-06-21): news may be SURFACED
+as conditional fact — never as a signal — until every event→effect linkage
+is hypothesis-gated. The 2026-07-13/14 NMM.US audit showed the cost of a
+blind surface: CEO Form-4 insider buying (Jul 1–9) was public, supportive
+context on an ADD ticket the operator was mailed — and no layer could show
+it. This build adds the SANCTIONED surface, nothing more:
+
+- NEW `summarize_for_display(result, days=7)` — PURE, sync, zero I/O:
+  compresses an existing NewsResult (object or to_dict payload) into one
+  compact factual dict {headline_count, recent_count, sentiment,
+  sentiment_label (>= +0.15 Positive / <= -0.15 Negative / else Neutral),
+  confidence, velocity, top_topics, latest_headline, display_line}. The
+  display_line ALWAYS ends "Context only — not a signal."; the empty case
+  reads "No recent headlines found (Nd) — absence of news is not a
+  signal." No fetching, no scoring changes, no recommendation influence.
+- NEW `summarize_symbol_news(symbol, company_name="", days=7)` — async
+  convenience: awaits get_news_intelligence(...) then summarizes. This is
+  the one-call surface the brief / cockpit wiring consumes next.
+- Insider-filing feeds (SEC Form 4) are NOT in this module's sources
+  (RSS/Google News); a dedicated filings source is a separate, later
+  build — stated here so the gap is on the record, not papered over.
+Public API additions only; zero functions removed; all v5.1.0 behaviour
+byte-identical.
 
 v5.1.0 changes (what moved from v5.0.0)
 ---------------------------------------
@@ -48,6 +74,7 @@ BatchResult, SentimentBreakdown, get_news_intelligence,
 batch_news_intelligence, clear_cache, get_cache_stats, warmup_cache,
 health_check, DeepLearningSentiment, analyze_sentiment_lexicon,
 build_query_terms. All endpoint shapes unchanged.
+v5.2.0 additions: summarize_for_display, summarize_symbol_news.
 ================================================================================
 """
 
@@ -127,7 +154,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "5.1.0"
+__version__ = "5.2.0"
 NEWS_VERSION = __version__
 
 # =============================================================================
@@ -1778,6 +1805,101 @@ async def batch_news_intelligence(
     }
 
     return BatchResult(items=valid_results, meta=meta, errors=errors)
+
+
+# =============================================================================
+# v5.2.0 (Fix N1) — Factual display summary (conditional framing baked in)
+# =============================================================================
+
+_N1_POS_THRESHOLD = 0.15   # sentiment >= this  -> "Positive"
+_N1_NEG_THRESHOLD = -0.15  # sentiment <= this  -> "Negative"
+
+
+def summarize_for_display(result: Union["NewsResult", Dict[str, Any]],
+                          days: int = 7) -> Dict[str, Any]:
+    """v5.2.0 (Fix N1): PURE compression of an existing NewsResult into the
+    one factual dict the brief / cockpit may print. No I/O, no scoring, no
+    recommendation influence — the conditional framing is baked into
+    display_line so no downstream renderer can strip it accidentally.
+    Accepts the dataclass or its to_dict() payload. Never raises."""
+    try:
+        d = result.to_dict() if hasattr(result, "to_dict") else dict(result or {})
+    except Exception:
+        d = {}
+    try:
+        days = max(1, int(days))
+    except Exception:
+        days = 7
+    symbol = str(d.get("symbol") or "").strip().upper()
+    sentiment = float(d.get("sentiment") or 0.0)
+    confidence = float(d.get("confidence") or 0.0)
+    total = int(d.get("articles_analyzed") or 0)
+    velocity = float(d.get("article_velocity") or 0.0)
+    topics = [str(t) for t in (d.get("emerging_topics") or [])][:3]
+
+    if sentiment >= _N1_POS_THRESHOLD:
+        label = "Positive"
+    elif sentiment <= _N1_NEG_THRESHOLD:
+        label = "Negative"
+    else:
+        label = "Neutral"
+
+    cutoff = _utc_now() - timedelta(days=days)
+    recent = 0
+    latest_ts: Optional[datetime] = None
+    latest_line = ""
+    for a in (d.get("articles") or []):
+        aa = a if isinstance(a, dict) else {}
+        ts = _parse_datetime(aa.get("published_at") or aa.get("published"))
+        if ts is None:
+            continue
+        if ts >= cutoff:
+            recent += 1
+        if latest_ts is None or ts > latest_ts:
+            latest_ts = ts
+            title = str(aa.get("title") or "").strip()
+            src_d = str(aa.get("source") or aa.get("domain") or "").strip()
+            latest_line = (title[:70] + (" — " + src_d if src_d else "") +
+                           (" (" + ts.strftime("%m-%d") + ")"))
+
+    if total <= 0:
+        line = ("No recent headlines found (%dd) — absence of news is not "
+                "a signal." % days)
+    else:
+        line = ("News (%dd): %d headline%s, sentiment %s (%.2f, conf %.2f)"
+                % (days, total, "" if total == 1 else "s", label,
+                   sentiment, confidence))
+        if latest_line:
+            line += "; latest: " + latest_line
+        line += ". Context only — not a signal."
+
+    return {
+        "symbol": symbol,
+        "window_days": days,
+        "headline_count": total,
+        "recent_count": recent,
+        "sentiment": round(sentiment, 4),
+        "sentiment_label": label,
+        "confidence": round(confidence, 4),
+        "velocity": round(velocity, 4),
+        "top_topics": topics,
+        "latest_headline": latest_line or None,
+        "display_line": line,
+        "version": __version__,
+    }
+
+
+async def summarize_symbol_news(symbol: str, company_name: str = "",
+                                days: int = 7) -> Dict[str, Any]:
+    """v5.2.0 (Fix N1): one-call factual surface — fetch (cache-backed via
+    get_news_intelligence) then summarize_for_display. Fail-open: any fault
+    returns the honest empty summary for the symbol."""
+    try:
+        res = await get_news_intelligence(symbol, company_name=company_name)
+        return summarize_for_display(res, days=days)
+    except Exception as e:
+        logger.warning("summarize_symbol_news(%s) failed: %s", symbol, e)
+        return summarize_for_display({"symbol": symbol}, days=days)
 
 
 async def clear_cache() -> None:
