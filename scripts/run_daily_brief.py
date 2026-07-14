@@ -36,6 +36,56 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.10.0 — SEND-TIME SIGNAL-COHERENCE GUARD + PER-PAGE STALENESS BANNER
+--------------------------------------------------------------------------
+EVIDENCE (the sent brief of 2026-07-13 23:20 + Signal_History forensics,
+2026-07-14 audit): the brief shipped "ADD NMM.US ... Reliability 75, Engine
+12M +22%" from the Portfolio_Decision snapshot (cockpit run ~20:50) while
+the SAME email's outlook strip — sourced live from the My_Portfolio row —
+printed Reliability 39 and a flat 1M/3M/12M path (+0.0%). Signal_History
+shows the engine had flipped NMM.US to SELL/Rel 31.3 at 21:34, two hours
+BEFORE send. The email was internally contradictory and presented a stale
+high-confidence ADD the live engine no longer believed. Separately, the
+same brief showed Commodities_FX data 4 days old (07-09×233) with NO
+staleness banner: the v1.7.0 banner keys on the NEWEST update across ALL
+pages, so one fresh page (ML/GM 07-13) silences the warning for every
+stale sibling.
+
+FIX (BR-1) SEND-TIME SIGNAL-COHERENCE GUARD (_apply_signal_coherence,
+called in build_model after extract_symbol_metrics): every ADD and EXIT/
+SELL action is re-checked against the freshest per-symbol reading this
+brief already fetched for its own strips (metrics: 'Forecast Reliability
+Score' + 'Expected ROI 12M', My_Portfolio-first). Both sides arrive in
+percent POINTS (v1.6.0 B1 convention), so no unit guessing. The action is
+DEMOTED out of "Act now" into a new "VERIFY — SIGNAL UNSTABLE" group when
+ANY of: |rel_action − rel_live| > TFB_BRIEF_COHERENCE_REL_GAP (default
+15); |roi12_action − roi12_live| > TFB_BRIEF_COHERENCE_ROI_GAP (default
+15); or the two 12M readings disagree in SIGN with both magnitudes >= 3.
+Demoted recs carry live_rel / live_roi / coh_reason (both readings are
+printed — the reader sees exactly what disagreed). A demoted EXIT's cash
+leaves freed_cash (it is no longer part of the plan); ADD cash was never
+in freed_cash. The hero, subject, glance bars, book-snapshot count,
+concentration line, summary table, plaintext and PDF all follow the
+post-guard groups, so every surface tells one coherent story. Fail-open:
+a symbol with no metrics row (or both live values missing) is NOT demoted
+— the guard only acts on evidence. Applied AFTER the v1.8.0 min-ticket
+fold (the fold target can be demoted; its note carries the fold trail).
+Kill switch TFB_BRIEF_COHERENCE_GUARD (default ON; 0/false/off restores
+v1.9.0 byte-identically). The 2026-07-13 NMM.US case demotes on ALL THREE
+tests (rel gap 36, roi gap ~20, sign-adjacent flat-vs-+22).
+
+FIX (BR-2) PER-PAGE STALENESS: the DATA VINTAGE banner now fires when ANY
+market page's newest update is older than TFB_BRIEF_STALE_HOURS (default
+24) and LISTS each stale page with its newest stamp and age; the plaintext
+DATA VINTAGE line prefixes stale pages with "STALE>". The old newest-
+across-all check remains as the fallback when TFB_BRIEF_STALE_PER_PAGE=0
+(default ON). Fail-safe unchanged: a page without parseable stamps
+contributes nothing and can never fire the banner.
+
+ZERO functions removed; additions: _coherence_guard_enabled,
+_coherence_rel_gap, _coherence_roi_gap, _coherence_check,
+_apply_signal_coherence, _stale_per_page_enabled, _verify_reason.
+
 v1.9.0 — FAIR-VALUE SATURATION MARKER (honest-display; evidence-driven)
 --------------------------------------------------------------------------
 EVIDENCE (2026-07-13 sent brief): all six Best-New-Buys candidates printed
@@ -254,7 +304,7 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 import argparse
 import datetime as _dt
@@ -550,6 +600,98 @@ def _enforce_min_ticket(adds: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         # even the folded total misses the floor: a 14-SAR order is not a plan
         return [], [], keep + small if isinstance(small, list) else keep
     return keep, folded, []
+
+
+
+# ----------------------------------------------------------------------------- #
+# v1.10.0 (BR-1) — send-time signal-coherence guard
+# ----------------------------------------------------------------------------- #
+def _coherence_guard_enabled() -> bool:
+    """v1.10.0 (BR-1): demote ADD/EXIT actions whose decision-layer signal
+    disagrees materially with the freshest per-symbol reading in this same
+    brief. Default ON; TFB_BRIEF_COHERENCE_GUARD=0/false/off restores
+    v1.9.0 byte-identically."""
+    return (os.getenv("TFB_BRIEF_COHERENCE_GUARD") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _coherence_rel_gap() -> float:
+    """Reliability-points divergence that trips the guard (default 15, floor 1)."""
+    try:
+        return max(1.0, float(os.getenv("TFB_BRIEF_COHERENCE_REL_GAP") or "15"))
+    except Exception:
+        return 15.0
+
+
+def _coherence_roi_gap() -> float:
+    """12M-ROI percent-points divergence that trips the guard (default 15, floor 1)."""
+    try:
+        return max(1.0, float(os.getenv("TFB_BRIEF_COHERENCE_ROI_GAP") or "15"))
+    except Exception:
+        return 15.0
+
+
+def _coherence_check(rec: Dict[str, Any], m: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return a human-readable divergence reason, or None when coherent /
+    unverifiable. Both sides are percent POINTS (v1.6.0 B1 convention).
+    Fail-open by design: no metrics row, or both live values missing, means
+    no demotion — the guard acts only on evidence."""
+    if not m:
+        return None
+    a_rel, l_rel = rec.get("rel"), m.get("rel")
+    a_roi, l_roi = rec.get("eroi"), m.get("roi12m")
+    reasons: List[str] = []
+    if a_rel is not None and l_rel is not None and abs(a_rel - l_rel) > _coherence_rel_gap():
+        reasons.append(f"reliability {a_rel:.0f} vs live {l_rel:.0f}")
+    if a_roi is not None and l_roi is not None:
+        if abs(a_roi - l_roi) > _coherence_roi_gap():
+            reasons.append(f"12M {a_roi:+.1f}% vs live {l_roi:+.1f}%")
+        elif (a_roi > 0) != (l_roi > 0) and abs(a_roi) >= 3.0 and abs(l_roi) >= 3.0:
+            reasons.append(f"12M sign flip {a_roi:+.1f}% vs live {l_roi:+.1f}%")
+    if not reasons:
+        return None
+    return "; ".join(reasons)
+
+
+def _apply_signal_coherence(decision: Dict[str, Any],
+                            metrics: Dict[str, Dict[str, Any]]) -> None:
+    """v1.10.0 (BR-1): move divergent ADD / EXIT recs out of the executable
+    groups into decision["verify"], attaching live_rel / live_roi /
+    coh_reason. A demoted EXIT's cash leaves freed_cash (its trade is no
+    longer part of the plan). Mutates in place; always leaves the "verify"
+    key present so every renderer can rely on it."""
+    decision.setdefault("verify", [])
+    if not _coherence_guard_enabled():
+        return
+    for grp, is_sell in (("add", False), ("sell", True)):
+        kept: List[Dict[str, Any]] = []
+        for rec in decision.get(grp, []) or []:
+            m = (metrics or {}).get(_s(rec.get("symbol")).upper())
+            reason = _coherence_check(rec, m)
+            if reason is None:
+                kept.append(rec)
+                continue
+            rec["coh_reason"] = reason
+            rec["coh_from"] = "EXIT" if is_sell else "ADD"
+            rec["live_rel"] = m.get("rel") if m else None
+            rec["live_roi"] = m.get("roi12m") if m else None
+            decision["verify"].append(rec)
+            if is_sell:
+                decision["freed_cash"] = max(0.0, (decision.get("freed_cash") or 0.0) - (rec.get("sar") or 0.0))
+        decision[grp] = kept
+
+
+def _verify_reason(r: Dict[str, Any]) -> str:
+    """Card body line for a demoted action: name both readings plainly."""
+    was = _esc(r.get("coh_from") or "ACTION")
+    return (f"Was <strong>{was}</strong> in the decision layer, but the live reading disagrees: "
+            f"<strong>{_esc(r.get('coh_reason') or 'signal divergence')}</strong>. "
+            f"Signal unstable — re-check before any trade; not counted in today's plan.")
+
+
+def _stale_per_page_enabled() -> bool:
+    """v1.10.0 (BR-2): per-page staleness semantics for the DATA VINTAGE
+    banner. Default ON; =0 restores the v1.7.0 newest-across-all check."""
+    return (os.getenv("TFB_BRIEF_STALE_PER_PAGE") or "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _note_sar(note: str) -> float:
@@ -855,10 +997,13 @@ def extract_symbol_metrics(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, 
 # ----------------------------------------------------------------------------- #
 def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     decision = extract_decision(pages_data.get(PAGE_DECISION, []))
-    held = {r["symbol"].upper() for grp in ("sell", "trim", "add", "hold") for r in decision[grp]}
+    metrics = extract_symbol_metrics(pages_data)  # v1.3.0 visual sections
+    # v1.10.0 (BR-1): send-time coherence guard — demote ADD/EXIT recs whose
+    # decision-layer signal disagrees with the freshest per-symbol reading.
+    _apply_signal_coherence(decision, metrics)
+    held = {r["symbol"].upper() for grp in ("sell", "trim", "add", "hold", "verify") for r in decision[grp]}
     top10 = extract_top10(pages_data.get(PAGE_TOP10, []), exclude=held)
     market = {p: extract_market_page(pages_data.get(p, [])) for p in MARKET_PAGES}
-    metrics = extract_symbol_metrics(pages_data)  # v1.3.0 visual sections
     # v1.7.0 (A): per-page data vintage for provenance rendering.
     vintage = {p: _page_vintage(pages_data.get(p, []) or []) for p in MARKET_PAGES}
     # v1.7.0 (B): flag candidates whose ISSUER is already held under a
@@ -1077,7 +1222,7 @@ def _range52_bar(m: Optional[Dict[str, Any]]) -> str:
 
 def _glance_block(d: Dict[str, Any]) -> str:
     """v1.3.0: diverging unrealized-P&L bar per holding + weight column."""
-    holdings = d["sell"] + d["trim"] + d["add"] + d["hold"]
+    holdings = d["sell"] + d["trim"] + d["add"] + d["hold"] + (d.get("verify") or [])
 
     def v(r: Dict[str, Any]) -> float:
         # v1.6.0 (B1): percent-POINTS as stored; the old <=1.5 fraction guess
@@ -1130,7 +1275,33 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
         if _ts is not None and (_newest_ts is None or _ts > _newest_ts):
             _newest_ts = _ts
     vintage_banner = ""
-    if _newest_ts is not None:
+    # v1.10.0 (BR-2): per-page semantics — ANY stale page fires the banner
+    # and is named with its newest stamp + age. One fresh page can no longer
+    # silence the warning for a 4-day-old sibling (the 2026-07-13 CFX case).
+    if _stale_per_page_enabled():
+        _stale_pages: List[Tuple[str, _dt.datetime, float]] = []
+        for _pg in MARKET_PAGES:
+            _ts = (_vin_all.get(_pg) or {}).get("latest_ts")
+            if _ts is None:
+                continue
+            try:
+                _age = max(0.0, (when - _ts).total_seconds() / 3600.0)
+            except Exception:
+                continue
+            if _age >= _stale_hours_threshold():
+                _stale_pages.append((_pg, _ts, _age))
+        if _stale_pages:
+            _items = "".join(
+                f'<div style="margin-top:3px;">&#8226; <strong>{_esc(_pg)}</strong> — newest '
+                f'{_ts.strftime("%Y-%m-%d %H:%M")} Riyadh (&asymp;{_age:.0f}h old)</div>'
+                for _pg, _ts, _age in _stale_pages)
+            vintage_banner = f"""
+  <tr><td style="padding:14px 32px 0 32px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FCF4E3; border:1px solid #E8D5A8; border-left:4px solid {TRIM_C};"><tr><td style="padding:11px 16px; font-family:{SANS}; font-size:12px; color:#7A5A17; line-height:1.6;">
+      <strong>Data vintage notice.</strong> {len(_stale_pages)} market page{"s are" if len(_stale_pages) != 1 else " is"} older than {_stale_hours_threshold():.0f}h — their prices and scores reflect the last completed sync, not live quotes:{_items}
+    </td></tr></table>
+  </td></tr>"""
+    elif _newest_ts is not None:
         try:
             _age_h = max(0.0, (when - _newest_ts).total_seconds() / 3600.0)
         except Exception:
@@ -1224,6 +1395,20 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
         + _outlook_strip(metrics.get(r["symbol"].upper()))  # v1.3.0
         for r in d["add"])
 
+    # v1.10.0 (BR-1): demoted-action cards — amber, both readings printed.
+    verify_rows = "".join(
+        _action_row(r, "VERIFY", TRIM_C, "#FFF8E7", "#E8D5A8",
+                    _verify_reason(r), f'{_pct(r["eroi"],0)} vs {_pct(r.get("live_roi"),0)}',
+                    f'rel {_num_str(r.get("rel"))} vs {_num_str(r.get("live_rel"))}', "#8A6D1F")
+        + _outlook_strip(metrics.get(r["symbol"].upper()))
+        for r in d.get("verify", []))
+    verify_block = (f"""
+  <tr><td style="padding:18px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#8A6D1F; border-bottom:2px solid {TRIM_C}; padding-bottom:6px;">Verify first &mdash; do not execute <span style="font-family:{SANS}; font-size:11px; color:#A8926B; letter-spacing:0.5px;">SIGNAL UNSTABLE &middot; AUTO-DEMOTED AT SEND TIME</span></div></td></tr>
+  <tr><td style="padding:10px 32px 0 32px;">
+    <div style="font-family:{SANS}; font-size:12px; color:#555; line-height:1.6; margin-bottom:9px;">The decision layer and the live per-symbol reading disagree materially on these &mdash; the signal flipped between the decision run and this send. Both readings are shown; re-check before any trade.</div>
+    {verify_rows}
+  </td></tr>""" if d.get("verify") else "")
+
     hold_rows = "".join(_hold_row(r) for r in d["hold"])
 
     # ---- opportunities ----
@@ -1283,7 +1468,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
   <tr><td style="padding:18px 32px 4px 32px;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6F4EF; border:1px solid #E6E1D6;"><tr><td style="padding:14px 18px; font-family:{SANS}; font-size:13px; color:#3A3A3A; line-height:1.7;">
-      <strong style="font-family:{SERIF}; font-size:14px;">Book snapshot.</strong> {len(d['sell'])+len(d['trim'])+len(d['add'])+len(d['hold'])} holdings · <strong style="color:{SELL_C};">{_pct(d['pl_pct'])}</strong> overall ({_money(d['mv'])} vs {_money(d['cost'])}&nbsp;SAR). {len(d['hold'])} positions are <em>held only because the data is too weak to act</em> — not comfort holds. {_concentration(d)}
+      <strong style="font-family:{SERIF}; font-size:14px;">Book snapshot.</strong> {len(d['sell'])+len(d['trim'])+len(d['add'])+len(d['hold'])+len(d.get('verify') or [])} holdings · <strong style="color:{SELL_C};">{_pct(d['pl_pct'])}</strong> overall ({_money(d['mv'])} vs {_money(d['cost'])}&nbsp;SAR). {len(d['hold'])} positions are <em>held only because the data is too weak to act</em> — not comfort holds. {_concentration(d)}
     </td></tr></table>
   </td></tr>
 
@@ -1291,6 +1476,8 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
   <tr><td style="padding:22px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:{INK}; border-bottom:2px solid {INK}; padding-bottom:6px;">Act now <span style="font-family:{SANS}; font-size:11px; color:#7E8AA0; letter-spacing:0.5px;">HIGH-CONFIDENCE CALLS</span></div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;">{sell_rows}{trim_rows}{add_rows}</td></tr>
+
+{verify_block}
 
   <tr><td style="padding:18px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#46535F; border-bottom:2px solid {HOLD_C}; padding-bottom:6px;">Hold &mdash; no action <span style="font-family:{SANS}; font-size:11px; color:#8C97A3; letter-spacing:0.5px;">DATA TOO WEAK TO ACT</span></div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;">
@@ -1329,7 +1516,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
 
 def _concentration(d: Dict[str, Any]) -> str:
-    everyone = d["sell"] + d["trim"] + d["add"] + d["hold"]
+    everyone = d["sell"] + d["trim"] + d["add"] + d["hold"] + (d.get("verify") or [])
     ranked = sorted([r for r in everyone if r.get("weight") is not None],
                     key=lambda r: r["weight"], reverse=True)[:2]
     if len(ranked) < 2:
@@ -1471,6 +1658,7 @@ def _summary_table_html(model: Dict[str, Any]) -> str:
     groups = (("EXIT / SELL", d["sell"], SELL_C, True),
               ("TRIM", d["trim"], TRIM_C, True),
               ("ADD / BUY", d["add"], ADD_C, True),
+              ("VERIFY", d.get("verify", []), "#8A6D1F", False),
               ("HOLD", d["hold"], HOLD_C, False))
     body = ""
     for label, recs, color, cash in groups:
@@ -1547,7 +1735,7 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
     try:
         d = model["decision"]; t = model["top10"]
         mx: Dict[str, Dict[str, Any]] = model.get("metrics", {}) or {}
-        holdings = d["sell"] + d["trim"] + d["add"] + d["hold"]
+        holdings = d["sell"] + d["trim"] + d["add"] + d["hold"] + (d.get("verify") or [])
 
         ink = colors.HexColor(INK); brass = colors.HexColor(BRASS)
         grid = colors.HexColor("#DAD5CA"); zebra = colors.HexColor("#F6F4EF")
@@ -1644,7 +1832,9 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
                                   "ROI 12M", "Rel", "Note"]]
         extra = []
         for label, recs, hexc in (("EXIT/SELL", d["sell"], SELL_C), ("TRIM", d["trim"], TRIM_C),
-                                  ("ADD", d["add"], ADD_C), ("HOLD", d["hold"], HOLD_C)):
+                                  ("ADD", d["add"], ADD_C),
+                                  ("VERIFY", d.get("verify", []), TRIM_C),
+                                  ("HOLD", d["hold"], HOLD_C)):
             for r in recs:
                 rows.append([label, _pdf_txt(r["symbol"], 12), _pdf_txt(r["name"], 28),
                              _pct(r.get("pl")), _pct(r.get("weight"), 1).lstrip("+"),
@@ -1741,6 +1931,7 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
         for label, recs, hexc, cash in (("EXIT / SELL", d["sell"], SELL_C, True),
                                         ("TRIM", d["trim"], TRIM_C, True),
                                         ("ADD / BUY", d["add"], ADD_C, True),
+                                        ("VERIFY", d.get("verify", []), TRIM_C, False),
                                         ("HOLD", d["hold"], HOLD_C, False)):
             sar = _grp_cash(recs)
             rows5.append([label, str(len(recs)),
@@ -1816,9 +2007,19 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     _vin_t = model.get("vintage", {}) or {}
     _vparts: List[str] = []
     for _pg in MARKET_PAGES:
-        _vd = (_vin_t.get(_pg) or {}).get("dates") or []
+        _vv = _vin_t.get(_pg) or {}
+        _vd = _vv.get("dates") or []
         if _vd:
-            _vparts.append(_PAGE_ABBREV.get(_pg, _pg) + " " +
+            # v1.10.0 (BR-2): mark pages older than the staleness threshold.
+            _mark = ""
+            _lts = _vv.get("latest_ts")
+            if _stale_per_page_enabled() and _lts is not None:
+                try:
+                    if (when - _lts).total_seconds() / 3600.0 >= _stale_hours_threshold():
+                        _mark = "STALE>"
+                except Exception:
+                    _mark = ""
+            _vparts.append(_mark + _PAGE_ABBREV.get(_pg, _pg) + " " +
                            "/".join(f"{d[5:]}x{c}" for d, c in _vd[:2]))
     if _vparts:
         lines.append("DATA VINTAGE: " + "; ".join(_vparts))
@@ -1836,6 +2037,10 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
                 lines.append(f"       {r['symbol']} outlook: 1M {_pct(_m.get('roi1m'))} / "
                              f"3M {_pct(_m.get('roi3m'))} / 12M {_pct(_m.get('roi12m'))} "
                              f"(valuation path, reliability {_num_str(_m.get('rel'))})")
+    if d.get("verify"):
+        lines.append("VERIFY (signal unstable - auto-demoted at send; do NOT execute):")
+        for r in d["verify"]:
+            lines.append(f"       {r['symbol']} was {r.get('coh_from','ACTION')}: {r.get('coh_reason','divergence')}")
     if d["hold"]:
         lines.append("HOLD (data too weak to act): " + ", ".join(r["symbol"] for r in d["hold"]))
     if t["top"]:
@@ -1853,7 +2058,9 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     # v1.4.0: end-of-brief action summary (owner request 2026-07-05)
     lines += ["", "ACTION SUMMARY"]
     for label, grp, cash in (("EXIT/SELL", d["sell"], True), ("TRIM", d["trim"], True),
-                             ("ADD", d["add"], True), ("HOLD", d["hold"], False)):
+                             ("ADD", d["add"], True),
+                             ("VERIFY", d.get("verify", []), False),
+                             ("HOLD", d["hold"], False)):
         if not grp:
             continue
         sar = _grp_cash(grp)
