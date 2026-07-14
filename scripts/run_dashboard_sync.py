@@ -7,6 +7,60 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.23.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.24.0 fix — ID-FIREWALL: KLG IDENTITY GATE + OUTGOING ROW STRIP + RUN-LOG VERDICT
+--------------------------------------------------------------------------
+EVIDENCE (v32 export forensics, 2026-07-14 23:00 audit; D3 closeout):
+Market_Leaders rows stamped 21:07-21:23 on 2026-07-13 still carried
+poisoned identities (2010.SR named "NiSource Inc.", 1140.SR named "Oracle
+Corporation", DD.US and HSBA.L both named "Microsoft Corporation") AFTER
+the engine's v5.116.0 guards were armed. MECHANISM: the armed guards
+correctly DISCARD poisoned enrichment -> the fetched row arrives as a
+data-free stub -> v6.22.3 KEEP-LAST-GOOD certifies the symbol's OLD sheet
+row as "good" on price+provider alone and swaps it back in -> the old row
+IS the poisoned one -> the write re-publishes and re-stamps the poison.
+The guard and the cache cooperate to keep the damage alive. Prevention
+without an identity test on the KEPT row can never converge.
+FIX (three cuts; each honesty-first and fail-open):
+  FW-1 KLG IDENTITY GATE (_klg_old_row_identity_ok, inside
+       _keep_last_good_rows): an old row is certifiable as GOOD only if,
+       in addition to the v6.22.3 price+provider test, (a) its Name cell
+       is non-blank AND (b) when its Price/EPS/PE triple is testable, the
+       row passes the SAME single-row P/E == Price/EPS identity L3b runs
+       page-wide (tolerance _COH_REL_TOL, GBX/GBP unit band excluded).
+       An identity-suspect old row is NOT kept: the fresh stub is written
+       instead, which finally lets the next healthy backend fetch replace
+       the poisoned cells (self-healing instead of self-preserving).
+       Suspects are reported per page via module counter
+       _LAST_KLG_ID_SUSPECTS (signature unchanged).
+       ENV: TFB_SYNC_KLG_IDENTITY_GATE default ON; =0/false/off/no
+       restores the v6.22.3 keep-test byte-identically.
+  FW-2 OUTGOING ROW FIREWALL (_row_identity_firewall, applied right
+       after the L3b page scan): any OUTGOING row that is testable and
+       breaks the same single-row identity beyond the unit band is
+       QUARANTINED before it can reach the sheet - every cell except its
+       Symbol is blanked and the Warnings column (when present) is set to
+       'identity_quarantined:v6.24.0'. Page-level L3b still guards bulk
+       transposition; FW-2 stops the sub-threshold trickle (a page 24%%
+       poisoned passes L3b's 25%% trip yet still writes hundreds of bad
+       rows). Expected strip count on a healthy backend: 0 - this is a
+       tripwire that also contains.
+       ENV: TFB_SYNC_ROW_ID_FIREWALL default ON; =0 restores v6.23.0.
+  FW-3 RUN-LOG VERDICT (_append_runlog_idfirewall): one line per market
+       page write into the workbook's _Run_Log -
+       [ID-FIREWALL v6.24.0] page | klg_kept=K | klg_suspect_dropped=D
+       (syms...) | out_stripped=S (syms...) - so the standing six-gate
+       morning audit sees the firewall working (or firing) the next day.
+       Best-effort append via the existing SheetsWriter service;
+       ENV: TFB_SYNC_IDFW_RUNLOG default ON.
+DONE-CRITERION (owner-verifiable in the next export): anchor census
+(GOOG, DD.US, HSBA.L, 2010.SR, 1140.SR, JPM, KO, MA, ...) correct after
+one repair pass + one sync; [ID-FIREWALL v6.24.0] lines present in
+_Run_Log; suspect_dropped decays to 0 across consecutive syncs.
+New helpers (6): _klg_identity_gate_enabled, _klg_old_row_identity_ok,
+_row_firewall_enabled, _row_identity_firewall, _idfw_runlog_enabled,
+_append_runlog_idfirewall (+ counter _LAST_KLG_ID_SUSPECTS,
+tag _IDFW_TAG). ZERO functions removed; all prior WHYs preserved.
+
 v6.23.0 fix — L3b UNIVERSAL COHERENCE TRIPWIRE + L3 ANCHOR COVERAGE
 - WHY (evening export 2026-07-12, audited row-by-row): Global_Markets came
   back 89.2% CHIMERIC and Mutual_Funds 33% chimeric, both written by the
@@ -880,7 +934,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.23.0"
+SCRIPT_VERSION = "6.24.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2572,6 +2626,180 @@ def _unpersisted_missing(
 
 
 _KEEP_LAST_GOOD_TAG = "[v6.22.3 KEEP-LAST-GOOD]"
+_IDFW_TAG = "[ID-FIREWALL v6.24.0]"
+# v6.24.0 FW-1: per-page list of symbols whose OLD sheet row was refused
+# certification by the identity gate this pass (read by the call site for
+# the warnings line + FW-3 verdict; single-threaded sync loop).
+_LAST_KLG_ID_SUSPECTS: list = []
+
+
+def _klg_identity_gate_enabled() -> bool:
+    """v6.24.0 FW-1: an old row must also pass an identity test (non-blank
+    Name + single-row P/E==Price/EPS when testable) before KEEP-LAST-GOOD
+    may certify it as GOOD. Default ON - the live failure class (guards
+    discard poison, KLG restores the poisoned predecessor, 2026-07-13
+    21:07-21:23 stamps) violates it. TFB_SYNC_KLG_IDENTITY_GATE=0/false/
+    off/no restores the v6.22.3 keep-test byte-identically."""
+    return (os.getenv("TFB_SYNC_KLG_IDENTITY_GATE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _klg_old_row_identity_ok(
+    row: list,
+    name_i: int,
+    px_i: int,
+    eps_i: int,
+    pe_i: int,
+) -> bool:
+    """v6.24.0 FW-1: single-row identity check for a KEEP-LAST-GOOD
+    candidate. Mirrors _coherence_scan's per-row rules exactly (testability
+    gate, _COH_REL_TOL, GBX/GBP unit band) so the two layers can never
+    disagree about the same row. FAIL-OPEN: an untestable row (missing any
+    of the triple, |EPS|<0.01, non-positive stated P/E) passes the ratio
+    leg - only the Name leg is unconditional."""
+    def _cell(i: int):
+        return row[i] if (0 <= i < len(row)) else ""
+    # Leg 1 (unconditional): a nameless old row is a stub, not last-GOOD.
+    if name_i >= 0 and _guard_is_blank(_cell(name_i)):
+        return False
+    # Leg 2 (when testable): the row must agree with itself.
+    if min(px_i, eps_i, pe_i) < 0:
+        return True
+    px = _coh_float(_cell(px_i))
+    eps = _coh_float(_cell(eps_i))
+    pe = _coh_float(_cell(pe_i))
+    if px is None or eps is None or pe is None:
+        return True
+    if abs(eps) < 0.01 or pe <= 0.0 or px <= 0.0:
+        return True
+    implied = px / eps
+    if implied <= 0.0:
+        return True
+    rel = abs(implied - pe) / abs(pe)
+    if rel < _COH_REL_TOL:
+        return True
+    ratio = implied / pe
+    if _COH_FX_UNIT_LO <= ratio <= _COH_FX_UNIT_HI:
+        return True  # pence/pound convention - healthy
+    return False
+
+
+def _row_firewall_enabled() -> bool:
+    """v6.24.0 FW-2: quarantine OUTGOING rows that individually break the
+    P/E==Price/EPS identity before they reach the sheet. Default ON;
+    TFB_SYNC_ROW_ID_FIREWALL=0/false/off/no restores v6.23.0 (page-level
+    L3b only) byte-identically."""
+    return (os.getenv("TFB_SYNC_ROW_ID_FIREWALL") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _row_identity_firewall(
+    headers: list,
+    rows_matrix: list,
+) -> tuple:
+    """v6.24.0 FW-2: blank every cell except Symbol on each OUTGOING row
+    that is testable and identity-broken (same per-row rules as
+    _coherence_scan); the Warnings column (when locatable) is set to
+    'identity_quarantined:v6.24.0'. Mutates rows in place. Returns
+    (rows_matrix, stripped_symbols). FAIL-SAFE: any missing column of the
+    triple -> nothing is ever stripped."""
+    stripped: list = []
+    if not headers or not rows_matrix:
+        return rows_matrix, stripped
+    hdr = list(headers)
+    px_i = _guard_find_col(hdr, _COH_PRICE_ALIASES)
+    eps_i = _guard_find_col(hdr, _COH_EPS_ALIASES)
+    pe_i = _guard_find_col(hdr, _COH_PE_ALIASES)
+    sym_i = _guard_find_col(hdr, _GUARD_SYMBOL_ALIASES)
+    if min(px_i, eps_i, pe_i, sym_i) < 0:
+        return rows_matrix, stripped
+    warn_i = -1
+    for i, h in enumerate(hdr):
+        if str(h or "").strip().casefold() == "warnings":
+            warn_i = i
+            break
+    hi = max(px_i, eps_i, pe_i, sym_i)
+    for r_i, row in enumerate(rows_matrix):
+        if not isinstance(row, list) or len(row) <= hi:
+            continue
+        if _guard_is_blank(row[sym_i]):
+            continue
+        px = _coh_float(row[px_i])
+        eps = _coh_float(row[eps_i])
+        pe = _coh_float(row[pe_i])
+        if px is None or eps is None or pe is None:
+            continue
+        if abs(eps) < 0.01 or pe <= 0.0 or px <= 0.0:
+            continue
+        implied = px / eps
+        if implied <= 0.0:
+            continue
+        rel = abs(implied - pe) / abs(pe)
+        if rel < _COH_REL_TOL:
+            continue
+        ratio = implied / pe
+        if _COH_FX_UNIT_LO <= ratio <= _COH_FX_UNIT_HI:
+            continue
+        sym = str(row[sym_i]).strip().upper()
+        blanked = ["" for _ in row]
+        blanked[sym_i] = row[sym_i]
+        if 0 <= warn_i < len(blanked):
+            blanked[warn_i] = "identity_quarantined:v6.24.0"
+        rows_matrix[r_i] = blanked
+        stripped.append(sym)
+    return rows_matrix, stripped
+
+
+def _idfw_runlog_enabled() -> bool:
+    """v6.24.0 FW-3: append one [ID-FIREWALL] verdict line per market page
+    to the workbook's _Run_Log. Default ON; TFB_SYNC_IDFW_RUNLOG=0 off."""
+    return (os.getenv("TFB_SYNC_IDFW_RUNLOG") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _append_runlog_idfirewall(
+    sheets: "SheetsWriter",
+    spreadsheet_id: str,
+    page: str,
+    klg_kept: int,
+    klg_suspects: list,
+    out_stripped: list,
+) -> None:
+    """v6.24.0 FW-3: best-effort, fail-open verdict append (columns match
+    the _Run_Log layout: Timestamp, Level, Action, Page, Status, Message,
+    Endpoint, HTTP Code, Duration ms, Details JSON). Silence on any error
+    - the tripwire must never break the write path it watches."""
+    if not _idfw_runlog_enabled() or sheets is None:
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        level = "WARNING" if (klg_suspects or out_stripped) else "INFO"
+        status = "SUSPECT" if (klg_suspects or out_stripped) else "OK"
+        msg = (
+            f"{_IDFW_TAG} {page} | klg_kept={klg_kept} | "
+            f"klg_suspect_dropped={len(klg_suspects)}"
+            f"{' (' + ', '.join(klg_suspects[:10]) + ('…' if len(klg_suspects) > 10 else '') + ')' if klg_suspects else ''}"
+            f" | out_stripped={len(out_stripped)}"
+            f"{' (' + ', '.join(out_stripped[:10]) + ('…' if len(out_stripped) > 10 else '') + ')' if out_stripped else ''}"
+        )
+        details = json.dumps({
+            "klg_kept": int(klg_kept),
+            "klg_suspect_dropped": klg_suspects[:50],
+            "out_stripped": out_stripped[:50],
+            "version": SCRIPT_VERSION,
+        })
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        body = {"values": [[ts, level, "run_dashboard_sync", page, status, msg, "", "", "", details]]}
+        svc.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range="'_Run_Log'!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute()
+        logger.info(msg)
+    except Exception as _e:
+        logger.warning("%s run-log verdict skipped: %s", _IDFW_TAG, _e)
+
 
 # Data-provider column aliases (normalized via _guard_norm).
 _KLG_PROVIDER_ALIASES = frozenset({
@@ -2636,6 +2864,8 @@ def _keep_last_good_rows(
     cannot be read, or nothing qualifies. Raising is reserved for the
     caller's try/except."""
     swapped: List[str] = []
+    # v6.24.0 FW-1: fresh suspects list per invocation (read by the caller).
+    del _LAST_KLG_ID_SUSPECTS[:]
     if not headers or not rows_matrix:
         return rows_matrix, swapped
     sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
@@ -2690,6 +2920,10 @@ def _keep_last_good_rows(
             old_idx[hn] = i
     old_px_i = _guard_find_col(list(old_headers_raw), _XPAGE_PRICE_ALIASES)
     old_prov_i = _guard_find_col(list(old_headers_raw), _KLG_PROVIDER_ALIASES)
+    # v6.24.0 FW-1: identity columns of the OLD grid for the keep-gate.
+    old_name_i = _guard_find_col(list(old_headers_raw), _GUARD_NAME_ALIASES)
+    old_eps_i = _guard_find_col(list(old_headers_raw), _COH_EPS_ALIASES)
+    old_pe_i = _guard_find_col(list(old_headers_raw), _COH_PE_ALIASES)
     if old_px_i < 0:
         return rows_matrix, swapped  # cannot certify an old row as GOOD without a price
 
@@ -2707,6 +2941,15 @@ def _keep_last_good_rows(
             continue  # old row not good -> keep the fresh stub
         if 0 <= old_prov_i < len(row) and _klg_provider_is_error(row[old_prov_i]):
             continue
+        # v6.24.0 FW-1: price+provider is no longer enough - the 2026-07-13
+        # poison rode back in on exactly that certification. The old row
+        # must also carry a Name and agree with its own P/E==Price/EPS
+        # identity (when testable) before it may be kept.
+        if _klg_identity_gate_enabled() and not _klg_old_row_identity_ok(
+            row, old_name_i, old_px_i, old_eps_i, old_pe_i
+        ):
+            _LAST_KLG_ID_SUSPECTS.append(t)
+            continue  # identity-suspect predecessor -> write the fresh stub
         aligned: List[Any] = []
         for h in headers:
             j = old_idx.get(_hnorm(h), -1)
@@ -4474,10 +4717,63 @@ async def _run_one_task(
                     )
                     res.warnings.append(_kw)
                     logger.warning(_kw)
+                _idfw_klg_suspects = list(_LAST_KLG_ID_SUSPECTS)
+                if _idfw_klg_suspects:
+                    _sw = (
+                        f"{_IDFW_TAG} refused to keep {len(_idfw_klg_suspects)} "
+                        f"identity-suspect predecessor row(s) on "
+                        f"'{task.sheet_name}': "
+                        f"{', '.join(_idfw_klg_suspects[:15])}"
+                        f"{'…' if len(_idfw_klg_suspects) > 15 else ''} — fresh "
+                        f"stub written so the next healthy fetch can heal it."
+                    )
+                    res.warnings.append(_sw)
+                    logger.warning(_sw)
             except Exception as _ke:  # never let the guard break the write path
                 _kw = f"{_KEEP_LAST_GOOD_TAG} skipped (error: {_ke})"
                 res.warnings.append(_kw)
                 logger.warning(_kw)
+                _idfw_klg_suspects = []
+        else:
+            _klg_syms = []
+            _idfw_klg_suspects = []
+
+        # --- v6.24.0 FW-2: OUTGOING row identity firewall -----------------
+        # Runs on every market page AFTER KLG (so kept rows are re-checked
+        # too - belt over the FW-1 suspenders) and BEFORE the write. A page
+        # 24% poisoned sails under L3b's 25% page trip; FW-2 stops each row
+        # individually. Expected strips on a healthy backend: 0.
+        _idfw_stripped: list = []
+        if (_row_firewall_enabled() and task.expects_rows
+                and rows_matrix and headers
+                and task.sheet_name in _RANKED_MARKET_PAGES):
+            try:
+                rows_matrix, _idfw_stripped = _row_identity_firewall(
+                    headers, rows_matrix
+                )
+                if _idfw_stripped:
+                    _fw = (
+                        f"{_IDFW_TAG} quarantined {len(_idfw_stripped)} "
+                        f"identity-broken outgoing row(s) on "
+                        f"'{task.sheet_name}': "
+                        f"{', '.join(_idfw_stripped[:15])}"
+                        f"{'…' if len(_idfw_stripped) > 15 else ''} — Symbol "
+                        f"kept, every other cell blanked + tagged."
+                    )
+                    res.warnings.append(_fw)
+                    logger.warning(_fw)
+            except Exception as _fe:
+                logger.warning("%s outgoing firewall skipped: %s", _IDFW_TAG, _fe)
+        # --- v6.24.0 FW-3: workbook verdict line (best-effort) ------------
+        if (task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES
+                and sheets is not None):
+            try:
+                _append_runlog_idfirewall(
+                    sheets, spreadsheet_id, task.sheet_name,
+                    len(_klg_syms or []), _idfw_klg_suspects, _idfw_stripped,
+                )
+            except Exception:
+                pass
         # ----------------------------------------------------------------------
 
         # --- Persistence outcome verification (v6.22.2 L4b) ------------------
