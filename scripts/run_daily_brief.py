@@ -36,6 +36,44 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.11.0 — EVENT & NEWS CONTEXT ON MONEY TICKETS (Phase 3 display wiring)
+--------------------------------------------------------------------------
+WHY (the 2026-07-13/14 NMM.US audit, closing its last visible gap): the
+mailed ADD carried no view of two PUBLIC facts — the symbol's next
+earnings date (Calendar_Events had it blank then; calendar_provider
+v1.1.0's Yahoo fallback now fills it, .SR included) and a week of CEO
+Form-4 insider buying that news_intelligence could have summarized. Both
+context channels existed by 2026-07-14; nothing printed them where money
+moves. This build wires the two SANCTIONED factual surfaces onto every
+ADD and VERIFY ticket — caution flags, never signals:
+
+(E1) EARNINGS-PROXIMITY FLAG: Calendar_Events joins the fetched pages.
+  A ticket whose symbol reports within TFB_BRIEF_EARNINGS_FLAG_DAYS
+  (default 7; 0 disables) gains an amber "⚠ Earnings YYYY-MM-DD (in Nd)"
+  line (HTML) / "!! Earnings ..." (text). Days compute from the date at
+  render time (the sheet's Days-To column is the fallback). A missing
+  tab, blank dates, or dates past the window render NOTHING — factual
+  proximity only, no directional claim, per the registry constraint that
+  anything predictive built ON these dates stays hypothesis-gated.
+
+(N1-WIRE) NEWS CONTEXT LINE: for the ADD+VERIFY symbol set (bounded,
+  typically <=6), build_model calls news_intelligence v5.2.0's
+  summarize_symbol_news and prints its display_line verbatim — the
+  framing ("Context only — not a signal." / "absence of news is not a
+  signal.") is baked into the string upstream so no renderer can strip
+  it. Lazy sys.path-bootstrapped import (script runs from scripts/);
+  per-symbol timeout TFB_BRIEF_NEWS_TIMEOUT_SEC (default 8, total capped
+  at 45s); ANY fault — module absent (offline xlsx mode), network, quota
+  — yields no line and one stderr WARN. The brief must send on time with
+  or without news. Kill switch TFB_BRIEF_NEWS_CONTEXT=0.
+
+Both surfaces: HTML + plaintext; PDF unchanged by design (space-
+constrained card grid — the v1.7.0 vintage precedent). OFF-states are
+byte-identical v1.10.0. ZERO functions removed; additions:
+_earnings_flag_days, _extract_calendar, _earnings_flag_for,
+_news_context_enabled, _news_timeout_sec, _fetch_news_context,
+_ticket_flags_html.
+
 v1.10.0 — SEND-TIME SIGNAL-COHERENCE GUARD + PER-PAGE STALENESS BANNER
 --------------------------------------------------------------------------
 EVIDENCE (the sent brief of 2026-07-13 23:20 + Signal_History forensics,
@@ -304,7 +342,7 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 import argparse
 import datetime as _dt
@@ -323,7 +361,8 @@ PAGE_DECISION = "Portfolio_Decision"
 PAGE_TOP10 = "Top_10_Investments"
 PAGE_PORTFOLIO = "My_Portfolio"  # v1.5.0: fetched for position ROI + ratios
 MARKET_PAGES = ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds"]
-ALL_PAGES = [PAGE_DECISION, PAGE_TOP10, PAGE_PORTFOLIO] + MARKET_PAGES
+PAGE_CALENDAR = "Calendar_Events"  # v1.11.0 (E1): earnings-proximity source
+ALL_PAGES = [PAGE_DECISION, PAGE_TOP10, PAGE_PORTFOLIO] + MARKET_PAGES + [PAGE_CALENDAR]
 
 VALID_ACTIONS = {"EXIT", "SELL", "TRIM", "REDUCE", "ADD", "BUY", "HOLD"}
 SELL_ACTIONS = {"EXIT", "SELL"}
@@ -993,6 +1032,151 @@ def extract_symbol_metrics(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, 
 
 
 # ----------------------------------------------------------------------------- #
+# v1.11.0 (E1 / N1-WIRE) — event & news context helpers
+# ----------------------------------------------------------------------------- #
+def _earnings_flag_days() -> int:
+    """v1.11.0 (E1): flag tickets whose symbol reports within this many days
+    (TFB_BRIEF_EARNINGS_FLAG_DAYS, default 7; 0 disables the flag; cap 60)."""
+    try:
+        return max(0, min(60, int(os.getenv("TFB_BRIEF_EARNINGS_FLAG_DAYS") or "7")))
+    except Exception:
+        return 7
+
+
+def _extract_calendar(rows: List[List[Any]]) -> Dict[str, Dict[str, Any]]:
+    """v1.11.0 (E1): Calendar_Events -> {SYM: {"earn": "YYYY-MM-DD"|None,
+    "days": float|None}}. Fail-safe: missing tab/columns yield {} and
+    nothing renders."""
+    rows = _pad(rows or [])
+    out: Dict[str, Dict[str, Any]] = {}
+    h = _find_header(rows, ("symbol", "next earnings"))
+    if h < 0:
+        h = _find_header(rows, ("symbol", "earnings"))
+    if h < 0:
+        return out
+    hdr = rows[h]
+    i_sym = _col_index(hdr, "Symbol")
+    i_earn = _col_index(hdr, "Next Earnings Date")
+    i_days = _col_index(hdr, "Days To Earnings")
+    if i_sym is None or i_earn is None:
+        return out
+    for r in rows[h + 1:]:
+        sym = _s(_cell(r, i_sym)).upper()
+        if not sym or sym == "SYMBOL":
+            continue
+        earn = _s(_cell(r, i_earn))[:10]
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", earn):
+            earn = ""
+        out[sym] = {"earn": earn or None,
+                    "days": _num(_cell(r, i_days)) if i_days is not None else None}
+    return out
+
+
+def _earnings_flag_for(sym: str, calendar: Dict[str, Dict[str, Any]],
+                       when: _dt.datetime) -> Optional[str]:
+    """One factual proximity line ("Earnings 2026-08-12 (in 5d)") when the
+    symbol reports within the window; None otherwise. Days compute from
+    the date at render time; the sheet's Days-To column is the fallback."""
+    win = _earnings_flag_days()
+    if win <= 0:
+        return None
+    info = (calendar or {}).get(_s(sym).upper())
+    if not info:
+        return None
+    days: Optional[float] = None
+    if info.get("earn"):
+        try:
+            d = _dt.datetime.strptime(info["earn"], "%Y-%m-%d").date()
+            days = float((d - when.date()).days)
+        except Exception:
+            days = None
+    if days is None:
+        days = info.get("days")
+    if days is None or days < 0 or days > win:
+        return None
+    d_txt = info.get("earn") or "date on Calendar_Events"
+    return "Earnings %s (in %dd)" % (d_txt, int(days))
+
+
+def _news_context_enabled() -> bool:
+    """v1.11.0 (N1-WIRE): default ON; TFB_BRIEF_NEWS_CONTEXT=0/false/off
+    restores v1.10.0 byte-identically."""
+    return (os.getenv("TFB_BRIEF_NEWS_CONTEXT") or "1").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _news_timeout_sec() -> float:
+    try:
+        return max(2.0, min(30.0, float(os.getenv("TFB_BRIEF_NEWS_TIMEOUT_SEC") or "8")))
+    except Exception:
+        return 8.0
+
+
+def _fetch_news_context(symbols: List[str],
+                        names: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """v1.11.0 (N1-WIRE): {SYM: display_line} via news_intelligence v5.2.0's
+    summarize_symbol_news. Bounded (first 8 symbols, per-symbol timeout,
+    45s total). ANY fault — module absent (offline xlsx mode), network,
+    quota — returns what it has and warns once; the brief sends on time
+    with or without news."""
+    syms = [_s(s).upper() for s in (symbols or []) if _s(s)][:8]
+    if not syms or not _news_context_enabled():
+        return {}
+    try:
+        import asyncio
+        from pathlib import Path
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:  # script runs from scripts/; core/ lives at root
+            sys.path.insert(0, root)
+        from core import news_intelligence as _ni  # type: ignore
+        if not hasattr(_ni, "summarize_symbol_news"):
+            sys.stderr.write("[brief] WARN news_intelligence lacks "
+                             "summarize_symbol_news (v5.2.0+ required)\n")
+            return {}
+
+        async def _all() -> Dict[str, str]:
+            out: Dict[str, str] = {}
+            per = _news_timeout_sec()
+            for s in syms:
+                try:
+                    r = await asyncio.wait_for(
+                        _ni.summarize_symbol_news(
+                            s, company_name=(names or {}).get(s, "")),
+                        timeout=per)
+                    line = _s((r or {}).get("display_line"))
+                    if line:
+                        out[s] = line
+                except Exception as exc:
+                    sys.stderr.write("[brief] WARN news context %s: %s\n"
+                                     % (s, exc))
+            return out
+
+        return asyncio.run(asyncio.wait_for(_all(), timeout=45.0))
+    except Exception as exc:
+        sys.stderr.write("[brief] WARN news context unavailable: %s\n" % exc)
+        return {}
+
+
+def _ticket_flags_html(sym: str, model: Dict[str, Any],
+                       when: _dt.datetime) -> str:
+    """v1.11.0: the amber earnings line + grey news line under a ticket.
+    Empty string when neither applies (v1.10.0-identical layout)."""
+    bits = []
+    ef = _earnings_flag_for(sym, model.get("calendar") or {}, when)
+    if ef:
+        bits.append(f'<div style="font-family:{SANS}; font-size:11px; '
+                    f'color:{TRIM_C}; margin:2px 0 0 2px;">&#9888;&#65039; '
+                    f'{_esc(ef)} &mdash; scheduled fact, not a signal</div>')
+    nl = (model.get("news_ctx") or {}).get(_s(sym).upper())
+    if nl:
+        bits.append(f'<div style="font-family:{SANS}; font-size:11px; '
+                    f'color:#6B7A6F; margin:2px 0 0 2px;">{_esc(nl)}</div>')
+    if not bits:
+        return ""
+    return ('<div style="margin:-4px 0 8px 0;">' + "".join(bits) + "</div>")
+
+
+# ----------------------------------------------------------------------------- #
 # Build model (parse all pages)
 # ----------------------------------------------------------------------------- #
 def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
@@ -1004,6 +1188,14 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     held = {r["symbol"].upper() for grp in ("sell", "trim", "add", "hold", "verify") for r in decision[grp]}
     top10 = extract_top10(pages_data.get(PAGE_TOP10, []), exclude=held)
     market = {p: extract_market_page(pages_data.get(p, [])) for p in MARKET_PAGES}
+    # v1.11.0 (E1): earnings-proximity source.
+    calendar = _extract_calendar(pages_data.get(PAGE_CALENDAR, []))
+    # v1.11.0 (N1-WIRE): news context for the money tickets only.
+    _ctx_syms = [r["symbol"] for r in decision["add"]] + \
+                [r["symbol"] for r in decision.get("verify", [])]
+    _ctx_names = {_s(r["symbol"]).upper(): _s(r.get("name"))
+                  for r in decision["add"] + decision.get("verify", [])}
+    news_ctx = _fetch_news_context(_ctx_syms, _ctx_names)
     # v1.7.0 (A): per-page data vintage for provenance rendering.
     vintage = {p: _page_vintage(pages_data.get(p, []) or []) for p in MARKET_PAGES}
     # v1.7.0 (B): flag candidates whose ISSUER is already held under a
@@ -1027,7 +1219,8 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     for _pg_ in MARKET_PAGES:
         _annotate(market[_pg_]["top"])
     return {"decision": decision, "top10": top10, "market": market,
-            "metrics": metrics, "vintage": vintage}
+            "metrics": metrics, "vintage": vintage,
+            "calendar": calendar, "news_ctx": news_ctx}
 
 
 # ----------------------------------------------------------------------------- #
@@ -1393,6 +1586,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
         _action_row(r, "ADD", ADD_C, "#E9F5EF", "#C7E4D5",
                     _add_reason(r), f'{_pct(r["eroi"],0)} outlook', f'now {_pct(r["weight"],1).lstrip("+")}', "#0E7C5A")
         + _outlook_strip(metrics.get(r["symbol"].upper()))  # v1.3.0
+        + _ticket_flags_html(r["symbol"], model, when)      # v1.11.0
         for r in d["add"])
 
     # v1.10.0 (BR-1): demoted-action cards — amber, both readings printed.
@@ -1401,6 +1595,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
                     _verify_reason(r), f'{_pct(r["eroi"],0)} vs {_pct(r.get("live_roi"),0)}',
                     f'rel {_num_str(r.get("rel"))} vs {_num_str(r.get("live_rel"))}', "#8A6D1F")
         + _outlook_strip(metrics.get(r["symbol"].upper()))
+        + _ticket_flags_html(r["symbol"], model, when)      # v1.11.0
         for r in d.get("verify", []))
     verify_block = (f"""
   <tr><td style="padding:18px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#8A6D1F; border-bottom:2px solid {TRIM_C}; padding-bottom:6px;">Verify first &mdash; do not execute <span style="font-family:{SANS}; font-size:11px; color:#A8926B; letter-spacing:0.5px;">SIGNAL UNSTABLE &middot; AUTO-DEMOTED AT SEND TIME</span></div></td></tr>
@@ -2037,10 +2232,22 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
                 lines.append(f"       {r['symbol']} outlook: 1M {_pct(_m.get('roi1m'))} / "
                              f"3M {_pct(_m.get('roi3m'))} / 12M {_pct(_m.get('roi12m'))} "
                              f"(valuation path, reliability {_num_str(_m.get('rel'))})")
+            _ef = _earnings_flag_for(r["symbol"], model.get("calendar") or {}, when)
+            if _ef:
+                lines.append(f"       !! {_ef} - scheduled fact, not a signal")
+            _nl = (model.get("news_ctx") or {}).get(r["symbol"].upper())
+            if _nl:
+                lines.append(f"       {_nl}")
     if d.get("verify"):
         lines.append("VERIFY (signal unstable - auto-demoted at send; do NOT execute):")
         for r in d["verify"]:
             lines.append(f"       {r['symbol']} was {r.get('coh_from','ACTION')}: {r.get('coh_reason','divergence')}")
+            _efv = _earnings_flag_for(r["symbol"], model.get("calendar") or {}, when)
+            if _efv:
+                lines.append(f"       !! {_efv} - scheduled fact, not a signal")
+            _nlv = (model.get("news_ctx") or {}).get(r["symbol"].upper())
+            if _nlv:
+                lines.append(f"       {_nlv}")
     if d["hold"]:
         lines.append("HOLD (data too weak to act): " + ", ".join(r["symbol"] for r in d["hold"]))
     if t["top"]:
