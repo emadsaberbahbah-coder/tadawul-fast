@@ -1,0 +1,70 @@
+name: "🧹 TFB Repair Stores (one-time: identity + junk)"
+
+# Build 2 companion workflow for scripts/repair_stores.py v1.0.0.
+# SAFETY: dry-run by default. Run once with apply=false, read the
+# [REPAIR-VERDICT] in the job log (and in the workbook's _Run_Log),
+# then re-run with apply=true.
+#
+# Credentials/vars reused verbatim from daily_sync.yml conventions:
+#   secrets.GOOGLE_SHEETS_CREDENTIALS      (JSON, preferred)
+#   secrets.GOOGLE_SHEETS_CREDENTIALS_B64  (base64 fallback)
+#   vars.DEFAULT_SPREADSHEET_ID            (target workbook)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "APPLY changes (false = dry-run report only)"
+        type: boolean
+        default: false
+      sheet_id:
+        description: "Override spreadsheet id (blank = vars.DEFAULT_SPREADSHEET_ID)"
+        required: false
+        default: ""
+      max_deletes:
+        description: "Safety ceiling per store"
+        required: false
+        default: "2000"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tfb-repair-stores
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Deps
+        run: pip install --quiet gspread google-auth
+
+      - name: 🧹 Run repair (dry unless apply=true)
+        env:
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TARGET_SHEET_ID: ${{ github.event.inputs.sheet_id != '' && github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
+          REPAIR_APPLY: ${{ github.event.inputs.apply == true && '1' || '0' }}
+          REPAIR_MAX_DELETES: ${{ github.event.inputs.max_deletes }}
+        run: |
+          set -euo pipefail
+          python scripts/repair_stores.py 2>&1 | tee /tmp/repair.log
+          echo "----------------------------------------------------------"
+          grep -E "REPAIR-VERDICT" /tmp/repair.log || true
+
+      - name: 📤 Log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-stores-log
+          path: /tmp/repair.log
