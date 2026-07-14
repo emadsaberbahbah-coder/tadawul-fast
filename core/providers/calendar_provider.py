@@ -2,9 +2,41 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider — v1.0.1 (F1: FORWARD-LOOKING EVENT-CALENDAR LAYER)
+Calendar Provider — v1.1.0 (F2: YAHOO EARNINGS/EX-DIV FALLBACK)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
+
+v1.1.0 (over v1.0.1) — Yahoo fallback fills what EODHD leaves blank (Fix F2):
+- EVIDENCE (Calendar_Events tab, 2026-07-13 11:28 run): NMM.US carried an
+  EMPTY "Next Earnings Date" from EODHD — and every `.SR` symbol carries
+  None by design (the documented KSA gap). A blind calendar row means the
+  earnings-proximity context the Forward-Looking layer exists for is
+  silently absent exactly where the operator holds positions.
+- FIX: after the EODHD pass, symbols still missing an earnings date (and,
+  in the same pass, an ex-div date) are retried through yfinance's
+  Ticker(...).calendar — one bounded-concurrency thread-pool call per
+  missing symbol, wrapped in the module timeout. Yahoo COVERS Saudi
+  symbols, so the KSA gap now fills too (the skip notice says "trying
+  Yahoo fallback"). EODHD stays PRIMARY: a date EODHD supplied is never
+  overwritten. Only FUTURE dates are accepted (earliest upcoming wins).
+  Yahoo earnings dates are frequently *estimates* — for the intended
+  consumers (Days-To-Earnings context, proximity caution flags) an
+  estimated date is honest and useful; nothing predictive hangs on it.
+- Return shape UNCHANGED ({symbol: {next_earnings_date, next_ex_div_date}})
+  so track_performance v6.14.0 and run_calendar_sync read it untouched;
+  fallback fills are disclosed in one INFO line with counts + symbols.
+- Import-safe: yfinance absent => fallback no-ops with one INFO line.
+- GATE SPLIT: fetch_event_context now gates on the layer flag alone
+  (_flag_enabled); a missing EODHD key degrades to Yahoo-only instead of
+  returning all-None (each source no-ops independently). Flag OFF is
+  byte-identical v1.0.1.
+- KILL SWITCH: TFB_CAL_YAHOO_FALLBACK=0/false/off/no restores v1.0.1
+  byte-identical behaviour (default ON — the live failure class violates
+  it). Concurrency reuses TFB_CALENDAR_CONCURRENCY; per-symbol timeout
+  reuses TFB_CALENDAR_TIMEOUT_SEC.
+- Zero functions removed; additions: _yahoo_fallback_enabled,
+  _yahoo_symbol_for_cal, _yf_calendar_dates, _yahoo_calendar_one,
+  _yahoo_calendar_fill.
 
 v1.0.1 (over v1.0.0) — token-safe logging + log dedup:
 - The __main__ self-test silences httpx request logging (WARNING+): httpx's
@@ -58,6 +90,8 @@ ENV
     TFB_CALENDAR_DIV_DAYS_AHEAD       ex-div look-ahead     (default 90)
     TFB_CALENDAR_EARNINGS_CHUNK       symbols per earnings call (default 50)
     TFB_CALENDAR_CONCURRENCY          parallel dividend calls   (default 4)
+    TFB_CAL_YAHOO_FALLBACK            "0" disables the v1.1.0 Yahoo
+                                      earnings/ex-div fallback (default ON)
 
 VALIDATE FROM RENDER SHELL (after setting TFB_CALENDAR_ENABLED=1):
     python3 -m core.providers.calendar_provider AAPL MSFT.US 2222.SR
@@ -76,7 +110,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-__version__ = "1.0.1"
+try:  # v1.1.0 (Fix F2): optional — fallback no-ops when absent
+    import yfinance as _yf  # type: ignore
+except Exception:  # pragma: no cover - environment dependent
+    _yf = None  # type: ignore
+
+__version__ = "1.1.0"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -137,6 +176,16 @@ def _api_key() -> str:
 
 def _base_url() -> str:
     return _env_str("EODHD_BASE_URL", "https://eodhd.com/api").rstrip("/")
+
+
+def _flag_enabled() -> bool:
+    """v1.1.0 (Fix F2): the LAYER master flag alone (TFB_CALENDAR_ENABLED).
+    is_enabled() below additionally requires the EODHD key — correct for
+    the EODHD sub-fetches, but with a Yahoo fallback in the module a
+    missing EODHD key must degrade to Yahoo-only, not to nothing. The
+    merged fetch_event_context gates on THIS; each source then degrades
+    independently (EODHD fetches still no-op without their key)."""
+    return _env_str("TFB_CALENDAR_ENABLED", "0").lower() in ("1", "true", "yes", "on")
 
 
 def is_enabled() -> bool:
@@ -355,6 +404,125 @@ async def fetch_ipos(days_ahead: int = 30) -> List[Dict[str, Any]]:
 
 
 # ----------------------------------------------------------------------------- #
+# v1.1.0 (Fix F2) — Yahoo earnings/ex-div fallback for EODHD blanks
+# ----------------------------------------------------------------------------- #
+def _yahoo_fallback_enabled() -> bool:
+    """v1.1.0 (Fix F2): fill EODHD-blank earnings/ex-div dates from Yahoo.
+    Default ON; TFB_CAL_YAHOO_FALLBACK=0/false/off/no restores v1.0.1
+    byte-identically."""
+    return (os.getenv("TFB_CAL_YAHOO_FALLBACK") or "1").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _yahoo_symbol_for_cal(symbol: str) -> str:
+    """Yahoo form of a TFB symbol for calendar lookups: `.US` strips to the
+    bare ticker; `.SR` and other real exchange suffixes pass through
+    (Yahoo uses the same `.SR` form for Tadawul)."""
+    s = (symbol or "").strip().upper()
+    if s.endswith(".US"):
+        return s[:-3]
+    return s
+
+
+def _yf_calendar_dates(ysym: str) -> Tuple[Optional[_dt.date], Optional[_dt.date]]:
+    """SYNC worker (runs in a thread): (next_earnings, next_exdiv) from
+    yfinance Ticker(...).calendar. Tolerates the dict shape (yfinance
+    >=0.2.28: {'Earnings Date': [date, ...], 'Ex-Dividend Date': date})
+    and degrades to (None, None) on anything else. Never raises."""
+    try:
+        cal = _yf.Ticker(ysym).calendar  # type: ignore[union-attr]
+    except Exception:
+        return None, None
+    if not isinstance(cal, dict) or not cal:
+        return None, None
+
+    def _coerce(v: Any) -> Optional[_dt.date]:
+        if isinstance(v, _dt.datetime):
+            return v.date()
+        if isinstance(v, _dt.date):
+            return v
+        return _parse_date(v)
+
+    earn: Optional[_dt.date] = None
+    raw_e = cal.get("Earnings Date")
+    for item in (raw_e if isinstance(raw_e, (list, tuple)) else [raw_e]):
+        d = _coerce(item)
+        if d is not None and (earn is None or d < earn):
+            earn = d
+    exdiv = _coerce(cal.get("Ex-Dividend Date"))
+    return earn, exdiv
+
+
+async def _yahoo_calendar_one(sem: asyncio.Semaphore, orig: str,
+                              today: _dt.date,
+                              out_earn: Dict[str, str],
+                              out_exdiv: Dict[str, str]) -> None:
+    """One symbol through the thread-pooled yfinance call, bounded by the
+    shared semaphore and the module timeout. Only FUTURE dates land."""
+    async with sem:
+        try:
+            earn, exdiv = await asyncio.wait_for(
+                asyncio.to_thread(_yf_calendar_dates,
+                                  _yahoo_symbol_for_cal(orig)),
+                timeout=float(_env_int("TFB_CALENDAR_TIMEOUT_SEC", 12,
+                                       lo=2, hi=120)),
+            )
+        except Exception as e:
+            logger.debug("[calendar_provider] yahoo fallback %s: %s", orig, e)
+            return
+        if earn is not None and earn >= today:
+            out_earn[orig] = _iso(earn)
+        if exdiv is not None and exdiv >= today:
+            out_exdiv[orig] = _iso(exdiv)
+
+
+async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
+                               today: _dt.date) -> Tuple[int, int]:
+    """Fill-only pass over `base` for symbols whose earnings date is still
+    None (ex-div fills ride along where also None). EODHD values are never
+    overwritten. Returns (earnings_filled, exdiv_filled). Never raises."""
+    try:
+        if not _yahoo_fallback_enabled():
+            return 0, 0
+        if _yf is None:
+            logger.info("[calendar_provider v%s] yahoo fallback unavailable "
+                        "(yfinance not importable) — EODHD blanks stay blank",
+                        __version__)
+            return 0, 0
+        missing = [s for s, d in base.items()
+                   if d.get("next_earnings_date") is None]
+        if not missing:
+            return 0, 0
+        sem = asyncio.Semaphore(_env_int("TFB_CALENDAR_CONCURRENCY", 4,
+                                         lo=1, hi=16))
+        f_earn: Dict[str, str] = {}
+        f_exdiv: Dict[str, str] = {}
+        await asyncio.gather(*[
+            _yahoo_calendar_one(sem, s, today, f_earn, f_exdiv)
+            for s in missing
+        ])
+        n_e = n_d = 0
+        for s, d in f_earn.items():
+            if base.get(s, {}).get("next_earnings_date") is None:
+                base[s]["next_earnings_date"] = d
+                n_e += 1
+        for s, d in f_exdiv.items():
+            if base.get(s, {}).get("next_ex_div_date") is None:
+                base[s]["next_ex_div_date"] = d
+                n_d += 1
+        if n_e or n_d:
+            logger.info("[calendar_provider v%s F2] yahoo fallback filled "
+                        "earnings=%d exdiv=%d of %d blank: %s",
+                        __version__, n_e, n_d, len(missing),
+                        ",".join(sorted(f_earn)[:20]))
+        return n_e, n_d
+    except Exception as e:
+        logger.error("[calendar_provider v%s] yahoo fallback pass failed: %s",
+                     __version__, e)
+        return 0, 0
+
+
+# ----------------------------------------------------------------------------- #
 # The one call consumers need: merged per-symbol event context
 # ----------------------------------------------------------------------------- #
 async def fetch_event_context(symbols: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
@@ -366,13 +534,16 @@ async def fetch_event_context(symbols: List[str]) -> Dict[str, Dict[str, Optiona
     base: Dict[str, Dict[str, Optional[str]]] = {
         s: {"next_earnings_date": None, "next_ex_div_date": None} for s in syms
     }
-    if not syms or not is_enabled():
+    if not syms or not _flag_enabled():
         return base
+    if not is_enabled():  # v1.1.0: EODHD unconfigured — Yahoo-only degrade
+        logger.info("[calendar_provider v%s] EODHD key missing — "
+                    "Yahoo-only degraded mode", __version__)
     try:
         ksa = sorted(s for s in syms if _is_ksa(s))
         if ksa:  # v1.0.1: one notice per context call (sub-fns log at DEBUG)
-            logger.info("[calendar_provider v%s] KSA symbols carry no calendar "
-                        "data (EODHD has no Saudi coverage): %s",
+            logger.info("[calendar_provider v%s] EODHD has no Saudi coverage "
+                        "for: %s — trying the v1.1.0 Yahoo fallback",
                         __version__, ",".join(ksa))
         earn, exdiv = await asyncio.gather(
             fetch_earnings_map(syms), fetch_next_exdiv_map(syms)
@@ -383,6 +554,8 @@ async def fetch_event_context(symbols: List[str]) -> Dict[str, Dict[str, Optiona
         for s, d in exdiv.items():
             if s in base:
                 base[s]["next_ex_div_date"] = d
+        # v1.1.0 (Fix F2): Yahoo fills what EODHD left blank (fill-only).
+        await _yahoo_calendar_fill(base, _today())
         return base
     except Exception as e:
         logger.error("[calendar_provider v%s] fetch_event_context failed: %s",
