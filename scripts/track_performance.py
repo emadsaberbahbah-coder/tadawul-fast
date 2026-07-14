@@ -211,6 +211,38 @@ symbol|date against the daily snapshots, so no record-schema churn):
 
 Why this revision (v6.13.0 vs v6.12.0)
 --------------------------------------
+v6.19.0 -- DAY-KEYED TREND WINDOW + INTRADAY-AWARE FLIP COUNT (Fix TR-1)
+--------------------------------------------------------------------------
+EVIDENCE (Signal_Trends row for NMM.US, 2026-07-13 19:36): Flip Count 0.0,
+Stability DRIFTING, Direction STRENGTHENING -- while Signal_History showed
+the SAME symbol whipsawing BUY -> REDUCE -> HOLD -> SELL -> REDUCE -> HOLD
+across 48h (Rel 76.5<->31.3 flap, price flat). ROOT CAUSE: Signal_History
+carries MULTIPLE same-day rows per symbol|YYYYMMDD key (the documented
+first-of-day idempotency is not enforced on the live sheet), so
+SignalTrendAnalyzer.analyze's window of 5 SNAPSHOTS spanned ~18 HOURS of
+same-day REDUCE rows -- the BUY->REDUCE side flip fell OUTSIDE the window
+and flip_count computed 0 on a textbook whipsaw. days_in_current_action
+counted snapshots, not days, for the same reason.
+
+FIX TR-1 (env TFB_TREND_DAY_KEYED, default ON; =0/false restores the
+v6.18.0 analyzer byte-identically):
+  * The per-symbol series is collapsed to ONE representative per Riyadh
+    DAY (the day's LAST snapshot = the standing end-of-day verdict);
+    `window` now means DAYS, matching the column header's intent and the
+    SignalSnapshot docstring.
+  * days_in_current_action / distinct_actions / score slope compute over
+    the day representatives (slope header becomes "Score Slope (pts/day)";
+    the writer self-heals the header row on the next write).
+  * flip_count computes over ALL snapshots inside the window's day span
+    (chronological, side-transition formula unchanged) -- so an INTRADAY
+    bull->bear crossing is counted, not hidden by the day collapse. The
+    live NMM.US series now yields flip_count>=1, Stability CHOPPY,
+    Direction FLIPPED.
+Zero functions removed; addition: _trend_day_keyed_enabled. The analyze()
+body gains the day-keyed branch; the legacy branch is preserved verbatim
+under the kill switch.
+
+
 SURFACE THE ACTION-TREND TRAJECTORY (new Signal_Trends tab; env-gated
 TFB_SIGNAL_TRENDS_TAB, default OFF -> the --analyze path is byte-identical
 to v6.12.0). Since v6.7.0 this script has COMPUTED the full day-to-day
@@ -703,7 +735,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.18.0"
+SCRIPT_VERSION = "6.19.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -2792,6 +2824,14 @@ class SignalHistoryStore:
             return 0
 
 
+def _trend_day_keyed_enabled() -> bool:
+    """v6.19.0 (Fix TR-1): day-keyed trend windows + intraday-aware flips.
+    Default ON; TFB_TREND_DAY_KEYED=0/false/off restores the v6.18.0
+    snapshot-window analyzer byte-identically."""
+    return (os.getenv("TFB_TREND_DAY_KEYED") or "1").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 class SignalTrendStore:
     """
     v6.13.0 — Best-effort gspread store that SURFACES the day-to-day
@@ -2831,7 +2871,8 @@ class SignalTrendStore:
         "Current Action",
         "Direction",                 # STRENGTHENING/WEAKENING/STABLE/FLIPPED/NEW
         "Days In Action",
-        "Score Slope (pts/snap)",
+        ("Score Slope (pts/day)" if _trend_day_keyed_enabled()
+         else "Score Slope (pts/snap)"),
         "Stability",                 # STABLE/DRIFTING/CHOPPY/NEW
         "Latest Score",
         "Investability",
@@ -3238,29 +3279,81 @@ class SignalTrendAnalyzer:
                 by_sym[s.symbol].append(s)
 
         trends: List[SignalTrend] = []
+        _day_keyed = _trend_day_keyed_enabled()
         for sym, snaps in by_sym.items():
             snaps_sorted = sorted(snaps, key=lambda x: x.date_recorded)
             n = len(snaps_sorted)
             latest = snaps_sorted[-1]
-            win = snaps_sorted[-window:]
-            recs = [s.recommendation.value for s in win]
-            scores = [float(s.overall_score) for s in win]
 
-            # snapshots (days, at the daily cadence) the latest action has
-            # held, counting back from the most recent.
-            days_in = 1
-            for prev in reversed(snaps_sorted[:-1]):
-                if prev.recommendation.value == latest.recommendation.value:
-                    days_in += 1
-                else:
-                    break
+            if _day_keyed:
+                # v6.19.0 (Fix TR-1): Signal_History carries multiple
+                # same-day rows per key on the live sheet, so a
+                # snapshot-count window spans HOURS, not days, and hides
+                # multi-hour flips (NMM.US 2026-07-13: Flip Count 0 on a
+                # BUY->SELL whipsaw). Collapse to ONE representative per
+                # Riyadh day -- the day's LAST snapshot, the standing
+                # end-of-day verdict -- so `window` means DAYS.
+                by_day: Dict[str, SignalSnapshot] = {}
+                day_order: List[str] = []
+                for s in snaps_sorted:
+                    dk = RiyadhTime.format(s.date_recorded, fmt="%Y-%m-%d")
+                    if dk not in by_day:
+                        day_order.append(dk)
+                    by_day[dk] = s  # last write wins = last snapshot of day
+                day_reps = [by_day[d] for d in day_order]
+                win = day_reps[-window:]
+                win_days = set(
+                    RiyadhTime.format(s.date_recorded, fmt="%Y-%m-%d")
+                    for s in win
+                )
+                recs = [s.recommendation.value for s in win]
+                scores = [float(s.overall_score) for s in win]
 
-            distinct = len(set(recs))
-            sides = [self._side(r) for r in recs]
-            nonzero = [x for x in sides if x != 0]
-            flip_count = sum(
-                1 for i in range(1, len(nonzero)) if nonzero[i] != nonzero[i - 1]
-            )
+                # consecutive trailing DAYS the latest action has held.
+                days_in = 1
+                for prev in reversed(day_reps[:-1]):
+                    if prev.recommendation.value == latest.recommendation.value:
+                        days_in += 1
+                    else:
+                        break
+
+                distinct = len(set(recs))
+                # Intraday-aware flip count: EVERY snapshot inside the
+                # window's day span, chronological, so a same-day
+                # bull->bear crossing is counted, never hidden by the
+                # day collapse.
+                _win_snaps = [
+                    s for s in snaps_sorted
+                    if RiyadhTime.format(s.date_recorded, fmt="%Y-%m-%d")
+                    in win_days
+                ]
+                sides = [self._side(s.recommendation.value)
+                         for s in _win_snaps]
+                nonzero = [x for x in sides if x != 0]
+                flip_count = sum(
+                    1 for i in range(1, len(nonzero))
+                    if nonzero[i] != nonzero[i - 1]
+                )
+            else:
+                win = snaps_sorted[-window:]
+                recs = [s.recommendation.value for s in win]
+                scores = [float(s.overall_score) for s in win]
+
+                # snapshots (days, at the daily cadence) the latest action has
+                # held, counting back from the most recent.
+                days_in = 1
+                for prev in reversed(snaps_sorted[:-1]):
+                    if prev.recommendation.value == latest.recommendation.value:
+                        days_in += 1
+                    else:
+                        break
+
+                distinct = len(set(recs))
+                sides = [self._side(r) for r in recs]
+                nonzero = [x for x in sides if x != 0]
+                flip_count = sum(
+                    1 for i in range(1, len(nonzero)) if nonzero[i] != nonzero[i - 1]
+                )
 
             # slope of overall_score over the window (least squares if numpy,
             # else endpoint slope) -- points per snapshot.
@@ -3309,7 +3402,7 @@ class SignalTrendAnalyzer:
                 SignalTrend(
                     symbol=sym,
                     n_observations=n,
-                    window=min(window, n),
+                    window=min(window, len(day_reps)) if _day_keyed else min(window, n),
                     current_action=latest.recommendation.value,
                     current_investability=latest.investability_status,
                     latest_score=float(latest.overall_score),
