@@ -2,9 +2,32 @@
 # core/providers/calendar_provider.py
 """
 ================================================================================
-Calendar Provider — v1.1.0 (F2: YAHOO EARNINGS/EX-DIV FALLBACK)
+Calendar Provider — v1.2.0 (F2b: EARNINGS-DATES TIER + THROTTLE DISCLOSURE)
 ================================================================================
 NEW module (owner greenlight 2026-07-05; Forward-Looking Layer plan, Phase F1).
+
+v1.2.0 (over v1.1.0) — get_earnings_dates becomes the earnings tier (Fix F2b):
+- EVIDENCE (Render shell, 2026-07-14 ~10:40 UTC, verbatim): Ticker.calendar
+  raised YFRateLimitError for BOTH NMM and 2222.SR — the quoteSummary
+  endpoint is throttled from the datacenter IP — while, in the SAME
+  session, Ticker.get_earnings_dates(limit=8) delivered NMM 2026-08-20
+  (cross-confirming EODHD) and 2222.SR 2026-08-04 (Aramco Q2 — the first
+  KSA earnings date the platform has ever held). Two defects in v1.1.0:
+  (a) it bet earnings on the one Yahoo endpoint that rate-limits here,
+  (b) its broad except swallowed the throttle as (None, None), reporting
+  "no data" when the truth was "blocked".
+- FIX F2b: NEW _yf_earnings_dates_future() — earliest FUTURE date from
+  get_earnings_dates (limit 12) — is tried FIRST for earnings;
+  _yf_calendar_dates (unchanged) remains for ex-div and as the earnings
+  backup. Per-symbol exceptions are now CLASSIFIED: anything whose type
+  name contains "RateLimit" increments a throttle counter that the fill
+  INFO line discloses ("throttled=N") — a blocked run can never again
+  masquerade as an empty one. Both tiers keep the future-only /
+  earliest-wins / EODHD-never-overwritten rules.
+- Zero functions removed; addition: _yf_earnings_dates_future.
+  _yahoo_calendar_one gains the throttle counter; _yf_calendar_dates'
+  internal except is NARROWED (rate-limit re-raises, all else still
+  degrades to (None, None)) so BOTH tiers classify throttling.
 
 v1.1.0 (over v1.0.1) — Yahoo fallback fills what EODHD leaves blank (Fix F2):
 - EVIDENCE (Calendar_Events tab, 2026-07-13 11:28 run): NMM.US carried an
@@ -115,7 +138,7 @@ try:  # v1.1.0 (Fix F2): optional — fallback no-ops when absent
 except Exception:  # pragma: no cover - environment dependent
     _yf = None  # type: ignore
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 PROVIDER_NAME = "calendar"
 
 logger = logging.getLogger("core.providers.calendar_provider")
@@ -431,7 +454,11 @@ def _yf_calendar_dates(ysym: str) -> Tuple[Optional[_dt.date], Optional[_dt.date
     and degrades to (None, None) on anything else. Never raises."""
     try:
         cal = _yf.Ticker(ysym).calendar  # type: ignore[union-attr]
-    except Exception:
+    except Exception as e:
+        # v1.2.0 (F2b): rate-limit-class exceptions RE-RAISE so the caller
+        # can count them — a blocked endpoint must never report as empty.
+        if "ratelimit" in type(e).__name__.lower():
+            raise
         return None, None
     if not isinstance(cal, dict) or not cal:
         return None, None
@@ -453,23 +480,63 @@ def _yf_calendar_dates(ysym: str) -> Tuple[Optional[_dt.date], Optional[_dt.date
     return earn, exdiv
 
 
+def _yf_earnings_dates_future(ysym: str) -> Optional[_dt.date]:
+    """v1.2.0 (F2b) SYNC worker: earliest FUTURE date from yfinance's
+    get_earnings_dates — the endpoint that KEEPS WORKING from datacenter
+    IPs where Ticker.calendar rate-limits (Render shell proof 2026-07-14:
+    calendar=YFRateLimitError while this returned NMM 2026-08-20 and
+    2222.SR 2026-08-04 in the same second). Raises on rate-limit so the
+    caller can classify; returns None on genuinely absent data."""
+    df = _yf.Ticker(ysym).get_earnings_dates(limit=12)  # type: ignore[union-attr]
+    idx = getattr(df, "index", None)
+    if idx is None:
+        return None
+    today = _today()
+    best: Optional[_dt.date] = None
+    for x in idx:
+        try:
+            d = x.date() if hasattr(x, "date") else _parse_date(str(x)[:10])
+        except Exception:
+            d = _parse_date(str(x)[:10])
+        if d is not None and d >= today and (best is None or d < best):
+            best = d
+    return best
+
+
 async def _yahoo_calendar_one(sem: asyncio.Semaphore, orig: str,
                               today: _dt.date,
                               out_earn: Dict[str, str],
-                              out_exdiv: Dict[str, str]) -> None:
+                              out_exdiv: Dict[str, str],
+                              throttled: List[int]) -> None:
     """One symbol through the thread-pooled yfinance call, bounded by the
     shared semaphore and the module timeout. Only FUTURE dates land."""
     async with sem:
+        ysym = _yahoo_symbol_for_cal(orig)
+        tmo = float(_env_int("TFB_CALENDAR_TIMEOUT_SEC", 12, lo=2, hi=120))
+        earn: Optional[_dt.date] = None
+        exdiv: Optional[_dt.date] = None
+        # Tier 1 (v1.2.0 F2b): get_earnings_dates — survives datacenter
+        # throttling that kills Ticker.calendar. Earnings only.
         try:
-            earn, exdiv = await asyncio.wait_for(
-                asyncio.to_thread(_yf_calendar_dates,
-                                  _yahoo_symbol_for_cal(orig)),
-                timeout=float(_env_int("TFB_CALENDAR_TIMEOUT_SEC", 12,
-                                       lo=2, hi=120)),
-            )
+            earn = await asyncio.wait_for(
+                asyncio.to_thread(_yf_earnings_dates_future, ysym),
+                timeout=tmo)
         except Exception as e:
-            logger.debug("[calendar_provider] yahoo fallback %s: %s", orig, e)
-            return
+            if "ratelimit" in type(e).__name__.lower():
+                throttled[0] += 1
+            logger.debug("[calendar_provider] yahoo earnings_dates %s: %s",
+                         orig, e)
+        # Tier 2: Ticker.calendar — ex-div (its only source) + earnings
+        # backup. Throttles here are classified too, never silently eaten.
+        try:
+            c_earn, exdiv = await asyncio.wait_for(
+                asyncio.to_thread(_yf_calendar_dates, ysym), timeout=tmo)
+            if earn is None:
+                earn = c_earn
+        except Exception as e:
+            if "ratelimit" in type(e).__name__.lower():
+                throttled[0] += 1
+            logger.debug("[calendar_provider] yahoo calendar %s: %s", orig, e)
         if earn is not None and earn >= today:
             out_earn[orig] = _iso(earn)
         if exdiv is not None and exdiv >= today:
@@ -497,8 +564,9 @@ async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
                                          lo=1, hi=16))
         f_earn: Dict[str, str] = {}
         f_exdiv: Dict[str, str] = {}
+        _throttled = [0]
         await asyncio.gather(*[
-            _yahoo_calendar_one(sem, s, today, f_earn, f_exdiv)
+            _yahoo_calendar_one(sem, s, today, f_earn, f_exdiv, _throttled)
             for s in missing
         ])
         n_e = n_d = 0
@@ -510,10 +578,10 @@ async def _yahoo_calendar_fill(base: Dict[str, Dict[str, Optional[str]]],
             if base.get(s, {}).get("next_ex_div_date") is None:
                 base[s]["next_ex_div_date"] = d
                 n_d += 1
-        if n_e or n_d:
+        if n_e or n_d or _throttled[0]:
             logger.info("[calendar_provider v%s F2] yahoo fallback filled "
-                        "earnings=%d exdiv=%d of %d blank: %s",
-                        __version__, n_e, n_d, len(missing),
+                        "earnings=%d exdiv=%d of %d blank (throttled=%d): %s",
+                        __version__, n_e, n_d, len(missing), _throttled[0],
                         ",".join(sorted(f_earn)[:20]))
         return n_e, n_d
     except Exception as e:
