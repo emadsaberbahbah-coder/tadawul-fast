@@ -275,6 +275,32 @@ ENV KILL-SWITCHES (read per call; explicit controls > env > defaults)
                                  contradicted by the engine 12M forecast
   TFB_PF_VF_CONFLICT_MIN_ENGINE_ROI "12" v1.0.5: engine-ROI floor (percent)
                                  for a contradiction
+  TFB_PF_ADD_CONFIRM_DAYS "2"    v1.1.0: an ADD must be proposed on this many
+                                 DISTINCT UTC days consecutively (any non-ADD
+                                 day resets) before it ships as ADD; until
+                                 then it renders HOLD "ADD pending
+                                 confirmation (day n/N)". 0 or 1 disables
+                                 (v1.0.5 byte-identical). In-worker, day-keyed
+                                 memory (same class as engine Fix AZ): a
+                                 deploy resets the clock — conservative.
+
+v1.1.0 — ADD-CONFIRMATION GATE (Fix #3; evidence: NMM.US 2026-07-12/14)
+--------------------------------------------------------------------------
+Signal_History shows NMM.US whipsawing BUY→REDUCE→HOLD→SELL→REDUCE→HOLD
+across 48h on a flat price (Rel 76.5↔31.3 flap). The 2026-07-13 20:50
+cockpit run caught a 4-hour up-flap and issued "ADD 12 sh (~3,418 SAR),
+Reliability 75" — which the 23:20 brief mailed as a high-confidence call
+while the engine had already flipped to SELL at 21:34. A single snapshot
+must never fund a position. _apply_add_confirmation (called in _build
+Pass 2, immediately after decide_action) requires the SAME symbol to
+qualify for ADD on `add_confirm_days` (default 2) distinct consecutive
+UTC days: day 1 renders ACTION_HOLD, reason "ADD pending confirmation
+(day 1/2) …", capped_from=ADD (the exact low-confidence-cap contract, so
+every downstream consumer — funding pass, cockpit render, brief, alert
+split — already handles it); a confirmed ADD carries "; ADD confirmed
+(day n/n)" in its reason. Any non-ADD outcome for the symbol resets its
+clock; same-day re-runs never advance it. Store is bounded (2000 syms,
+14-day prune). Fail-open: any store fault ships the v1.0.5 verdict.
 
 HONESTY RULES (L13): zero ADDs, all-HOLD, empty holdings, unknown trends and
 None P&L are CORRECT outputs; nothing is upgraded or padded to fill space.
@@ -286,7 +312,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 
-PORTFOLIO_ACTIONS_VERSION = "1.0.5"
+PORTFOLIO_ACTIONS_VERSION = "1.1.0"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -377,6 +403,10 @@ DEFAULT_CONTROLS = {
     # valuation-driven EXIT/TRIM.
     "vf_conflict_guard_enabled": False,
     "vf_conflict_min_engine_roi_pct": 12.0,
+    # v1.1.0 ADD-confirmation gate (Fix #3; env TFB_PF_ADD_CONFIRM_DAYS).
+    # 2 = an ADD ships only on its 2nd distinct consecutive UTC day;
+    # 0/1 = gate off (v1.0.5 byte-identical decisions).
+    "add_confirm_days": 2,
 }
 
 _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
@@ -386,7 +416,8 @@ _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
                    "max_data_age_hours", "identity_min_reliability",
                    "vf_conflict_min_engine_roi_pct")
 _CONTROLS_INT = ("review_days", "lot_size", "max_holdings", "period_months",
-                 "min_trust_fields")
+                 "min_trust_fields",
+                 "add_confirm_days")
 _CONTROLS_BOOL = ("engine_roi_display_enabled", "cost_basis_gate_enabled",
                   "block_missing_cost_basis", "trust_gate_enabled",
                   "block_thin_coverage", "identity_gate_enabled",
@@ -523,6 +554,9 @@ def _env_overrides():
             "TFB_PF_IDENTITY_MIN_RELIABILITY",
             DEFAULT_CONTROLS["identity_min_reliability"]),
         "vf_conflict_guard_enabled": _env_vf_conflict_guard(),
+        # v1.1.0: ADD-confirmation gate depth (0/1 disables).
+        "add_confirm_days": _env_int("TFB_PF_ADD_CONFIRM_DAYS",
+                                     DEFAULT_CONTROLS["add_confirm_days"]),
         "vf_conflict_min_engine_roi_pct": _env_float(
             "TFB_PF_VF_CONFLICT_MIN_ENGINE_ROI",
             DEFAULT_CONTROLS["vf_conflict_min_engine_roi_pct"]),
@@ -577,6 +611,9 @@ def make_controls(overrides=None):
     if not (0.0 <= ctl["vf_conflict_min_engine_roi_pct"] <= 100.0):
         ctl["vf_conflict_min_engine_roi_pct"] = (
             DEFAULT_CONTROLS["vf_conflict_min_engine_roi_pct"])
+    # v1.1.0 ADD-confirmation sanity: keep depth in [0, 10].
+    if not (0 <= ctl["add_confirm_days"] <= 10):
+        ctl["add_confirm_days"] = DEFAULT_CONTROLS["add_confirm_days"]
     mode = str(ctl.get("rebalance_mode") or REBALANCE_ADVISORY)
     low = mode.strip().lower()
     if "new cash" in low:
@@ -886,6 +923,85 @@ def _identity_unverifiable(cand, controls):
             "BLOCKED — review identity (name mirrors the symbol, no valuation "
             "reference, reliability %s); ghost-ticker class, action withheld "
             "pending data review" % rel_txt)
+
+
+# ---------------------------------------------------------------------------
+# v1.1.0 (Fix #3) — ADD-confirmation gate (in-worker, day-keyed memory)
+# ---------------------------------------------------------------------------
+# A single up-flap snapshot must never fund a position (NMM.US 2026-07-13:
+# one 4-hour Rel-75 window between Rel-31 readings produced a mailed ADD the
+# engine had already reversed before send). The gate requires the SAME symbol
+# to qualify for ADD on `add_confirm_days` distinct consecutive UTC days.
+# Store shape: _ADD_CONFIRM_STORE[SYM] = {"count": int, "date": "YYYY-MM-DD"}.
+# Per-worker, in-memory (same class as engine Fix AZ); a deploy resets the
+# clock — the conservative direction. Fail-open: any fault ships the
+# ungated verdict.
+
+_ADD_CONFIRM_STORE = {}
+_ADD_CONFIRM_PRUNE_DAYS = 14
+_ADD_CONFIRM_MAX_SYMBOLS = 2000
+
+
+def _add_confirm_today():
+    """UTC day key (matches the DT10 stability day clock)."""
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _add_confirm_store_size():
+    """Introspection helper (harness/diagnostics)."""
+    return len(_ADD_CONFIRM_STORE)
+
+
+def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
+    """Returns (action, reason, capped_from) with the confirmation gate
+    applied. Non-ADD outcomes reset the symbol's clock. Never raises."""
+    try:
+        days = int(controls.get("add_confirm_days") or 0)
+    except (TypeError, ValueError):
+        days = 0
+    try:
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return action, reason, capped_from
+        if action != ACTION_ADD:
+            # Any non-ADD verdict (HOLD/TRIM/EXIT/BLOCK, including a
+            # low-confidence-capped ADD) breaks the consecutive-day chain.
+            _ADD_CONFIRM_STORE.pop(sym, None)
+            return action, reason, capped_from
+        if days <= 1:
+            return action, reason, capped_from  # gate off: v1.0.5 verbatim
+        today = _add_confirm_today()
+        st = _ADD_CONFIRM_STORE.get(sym)
+        if st is None:
+            count = 1
+        elif st.get("date") == today:
+            count = int(st.get("count") or 1)      # same-day rerun: frozen
+        else:
+            count = int(st.get("count") or 0) + 1  # new day: advance
+        _ADD_CONFIRM_STORE[sym] = {"count": count, "date": today}
+        # Hygiene: prune stale entries, then cap oldest-first.
+        if len(_ADD_CONFIRM_STORE) > _ADD_CONFIRM_MAX_SYMBOLS:
+            cutoff = (datetime.now(timezone.utc)
+                      - timedelta(days=_ADD_CONFIRM_PRUNE_DAYS)
+                      ).date().isoformat()
+            for k in [k for k, v in _ADD_CONFIRM_STORE.items()
+                      if str(v.get("date") or "") < cutoff]:
+                _ADD_CONFIRM_STORE.pop(k, None)
+            while len(_ADD_CONFIRM_STORE) > _ADD_CONFIRM_MAX_SYMBOLS:
+                oldest = min(_ADD_CONFIRM_STORE.items(),
+                             key=lambda kv: str(kv[1].get("date") or ""))
+                _ADD_CONFIRM_STORE.pop(oldest[0], None)
+        if count >= days:
+            return (ACTION_ADD,
+                    reason + " — ADD confirmed (day %d/%d)" % (count, days),
+                    capped_from)
+        return (ACTION_HOLD,
+                "ADD pending confirmation (day %d/%d) — signal must persist "
+                "%d consecutive days before funding; qualifying: %s"
+                % (count, days, days, reason),
+                ACTION_ADD)
+    except Exception:
+        return action, reason, capped_from
 
 
 def decide_action(cand, controls, weight_pct, sector_weight_pct,
@@ -1396,6 +1512,10 @@ def _build(rows, ctl, fx_rates, upstream_meta):
             excess_share = sector_excess[sec] * (mv / sec_val)
         action, reason, proceeds, capped_from = decide_action(
             c, ctl, weight, sec_weight, excess_share)
+        # v1.1.0 (Fix #3): a first-day ADD renders HOLD "pending
+        # confirmation"; a non-ADD verdict resets the symbol's clock.
+        action, reason, capped_from = _apply_add_confirmation(
+            c.get("symbol"), action, reason, capped_from, ctl)
         sec_room = None
         if total_value:
             sec_room = max(0.0, (ctl["max_sector_pct"] / 100.0) *
