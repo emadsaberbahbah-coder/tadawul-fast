@@ -105,6 +105,39 @@ What's improved vs v4.5.0  —  DATA_ENGINE_V2 v5.67.0 FRACTION-CONTRACT ALIGNME
       `SCRIPT_VERSION` alias, executor try/finally, async-safe exports,
       HMAC signing, exit codes.
 
+v4.9.0 — RELIABILITY FLAP METER (Fix D1-METER; evidence NMM.US 2026-07-12/14)
+- 🔑 NEW: quantifies the D1 defect class engine v5.117.0 (Fix AZ) exists to
+  fix — symbols whose Forecast Reliability BAND (High >=75 / Medium 60-74 /
+  Low <60; the L8 confidence vocabulary) oscillates within a rolling window.
+  NMM.US flapped High<->Low FIVE times in 48h on a flat price and no audit
+  surface counted it. The meter reads the Signal_History tab (the same
+  series that convicted NMM), computes per-symbol band-transition counts
+  inside AUDIT_FLAP_WINDOW_H (default 48), and flags symbols with >=
+  AUDIT_FLAP_MIN_TRANSITIONS (default 2).
+- OUTPUTS (all disclosure, zero influence on scores/exit codes):
+    * one summary line + top offenders on the console,
+    * a "flap" block in the --json-out payload,
+    * an idempotent, marker-bounded block upserted into the _Data_Audit
+      tab ("RELIABILITY FLAP METER (rows=N)" — the row count in the marker
+      is the exact region cleared on the next run, so re-runs can never
+      grow the tab). Sheet write requires gspread + the standard
+      GOOGLE_SHEETS_CREDENTIALS chain; absence logs one line and the
+      audit proceeds untouched.
+- DENOMINATOR HONESTY: flap_rate_pct counts only symbols with >=2 banded
+  in-window snapshots; series too short to flap are reported separately
+  (insufficient_series), never silently folded into the rate.
+- PURE CORE: _compute_flap_report is deterministic over supplied rows —
+  the harness replays the live NMM sequence and asserts transitions>=3.
+- ENV: AUDIT_FLAP (default ON; 0 restores v4.8.0 byte-identically),
+  AUDIT_FLAP_WINDOW_H=48, AUDIT_FLAP_MIN_TRANSITIONS=2, AUDIT_FLAP_TOP=15,
+  AUDIT_FLAP_MAX_ROWS=20000, AUDIT_FLAP_SHEET_WRITE (default ON),
+  AUDIT_FLAP_SOURCE_SHEET=Signal_History,
+  AUDIT_FLAP_TARGET_SHEET=_Data_Audit. CLI: --flap 0/1 override.
+- Zero functions removed; additions: _flap_enabled, _flap_env_int,
+  _rel_band, _compute_flap_report, _flap_load_credentials,
+  _load_signal_history_rows, _write_flap_block_to_data_audit,
+  run_flap_meter.
+
 Exit codes (stable)
 - 0 = no MEDIUM/HIGH/CRITICAL
 - 1 = at least one MEDIUM
@@ -188,7 +221,7 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-SERVICE_VERSION = "4.8.0"
+SERVICE_VERSION = "4.9.0"
 SCRIPT_VERSION = SERVICE_VERSION  # v4.5.0: alias for cross-script consistency
 
 logger = logging.getLogger("TFB.Audit")
@@ -1733,6 +1766,314 @@ async def run_audit(
 
 
 # -----------------------------------------------------------------------------
+# v4.9.0 (Fix D1-METER) — Reliability flap meter over Signal_History
+# -----------------------------------------------------------------------------
+_FLAP_MARKER_PREFIX = "RELIABILITY FLAP METER"
+_RIYADH_OFFSET = timedelta(hours=3)
+
+
+def _flap_enabled() -> bool:
+    """AUDIT_FLAP default ON; 0/false/off/no restores v4.8.0 byte-identically."""
+    v = (os.getenv("AUDIT_FLAP") or "1").strip().lower()
+    return v not in _FALSY
+
+
+def _flap_env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return _clamp_int(int((os.getenv(name) or str(default)).strip()), lo, hi)
+    except Exception:
+        return default
+
+
+def _rel_band(rel: Optional[float]) -> Optional[str]:
+    """L8 confidence vocabulary (opportunity_builder parity):
+    High >= 75, Medium 60-74.99, Low < 60; None/unparseable -> None
+    (excluded from transition counting — an absent score is not a band)."""
+    r = _safe_float(rel, None)
+    if r is None:
+        return None
+    if r >= 75.0:
+        return "High"
+    if r >= 60.0:
+        return "Medium"
+    return "Low"
+
+
+def _compute_flap_report(rows: List[Dict[str, Any]], now_utc: datetime,
+                         window_h: int, min_transitions: int,
+                         top_n: int) -> Dict[str, Any]:
+    """PURE: Signal_History-shaped rows -> flap report. Row keys:
+    symbol, recorded_at (aware datetime | parseable), reliability, dq,
+    recommendation. Deterministic; never raises."""
+    try:
+        cutoff = now_utc - timedelta(hours=max(1, int(window_h)))
+        by_sym: Dict[str, List[Dict[str, Any]]] = {}
+        snaps_scanned = 0
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            sym = _norm_symbol(r.get("symbol"))
+            if not sym:
+                continue
+            ts = r.get("recorded_at")
+            if not isinstance(ts, datetime):
+                ts = _parse_any_time(ts)
+            if ts is None:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts < cutoff or ts > now_utc + timedelta(minutes=5):
+                continue
+            snaps_scanned += 1
+            by_sym.setdefault(sym, []).append({
+                "ts": ts,
+                "band": _rel_band(r.get("reliability")),
+                "rel": _safe_float(r.get("reliability"), None),
+                "dq": _safe_float(r.get("dq"), None),
+                "action": safe_str(r.get("recommendation")),
+            })
+
+        flappers: List[Dict[str, Any]] = []
+        eligible = 0
+        insufficient = 0
+        for sym, snaps in by_sym.items():
+            snaps.sort(key=lambda s: s["ts"])
+            banded = [s for s in snaps if s["band"] is not None]
+            if len(banded) < 2:
+                insufficient += 1
+                continue
+            eligible += 1
+            transitions = sum(
+                1 for i in range(1, len(banded))
+                if banded[i]["band"] != banded[i - 1]["band"]
+            )
+            if transitions >= max(1, int(min_transitions)):
+                rels = [s["rel"] for s in banded if s["rel"] is not None]
+                dqs = [s["dq"] for s in snaps if s["dq"] is not None]
+                flappers.append({
+                    "symbol": sym,
+                    "transitions": transitions,
+                    "rel_min": round(min(rels), 1) if rels else None,
+                    "rel_max": round(max(rels), 1) if rels else None,
+                    "dq_min": round(min(dqs), 1) if dqs else None,
+                    "dq_max": round(max(dqs), 1) if dqs else None,
+                    "snapshots": len(snaps),
+                    "last_action": snaps[-1]["action"],
+                })
+        flappers.sort(key=lambda f: (-f["transitions"], f["symbol"]))
+        rate = round(len(flappers) / eligible * 100.0, 1) if eligible else 0.0
+        return {
+            "enabled": True,
+            "window_h": int(window_h),
+            "min_transitions": int(min_transitions),
+            "symbols_scanned": len(by_sym),
+            "symbols_eligible": eligible,
+            "insufficient_series": insufficient,
+            "snapshots_scanned": snaps_scanned,
+            "flapping_count": len(flappers),
+            "flap_rate_pct": rate,
+            "top": flappers[: max(0, int(top_n))],
+            "generated_riyadh": _riyadh_iso(),
+            "audit_version": SERVICE_VERSION,
+        }
+    except Exception as e:  # pure fn stays fail-open too
+        logger.error("flap meter compute failed: %s", e)
+        return {"enabled": True, "error": str(e), "flapping_count": 0,
+                "top": [], "audit_version": SERVICE_VERSION}
+
+
+def _flap_load_credentials() -> Optional[Any]:
+    """Standard TFB service-account chain (track_performance parity):
+    GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS, raw JSON or base64."""
+    raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+           or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+    if not raw:
+        return None
+    s = raw
+    if not s.startswith("{"):
+        try:
+            import base64
+            dec = base64.b64decode(s).decode("utf-8", errors="replace").strip()
+            if dec.startswith("{"):
+                s = dec
+        except Exception:
+            pass
+    try:
+        from google.oauth2 import service_account  # type: ignore
+        obj = json_loads(s)
+        if isinstance(obj, dict):
+            return service_account.Credentials.from_service_account_info(
+                obj, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    except Exception:
+        return None
+    return None
+
+
+def _load_signal_history_rows(spreadsheet_id: str,
+                              max_rows: int) -> Tuple[List[Dict[str, Any]], str]:
+    """Read Signal_History via gspread into flap-core row dicts. Riyadh
+    naive stamps become aware UTC. Returns (rows, note); any fault returns
+    ([], reason) — the meter then reports unavailable, never breaks."""
+    try:
+        import gspread  # type: ignore
+    except Exception:
+        return [], "gspread not importable"
+    try:
+        creds = _flap_load_credentials()
+        gc = gspread.authorize(creds) if creds else gspread.service_account()
+        ws = gc.open_by_key(spreadsheet_id).worksheet(
+            (os.getenv("AUDIT_FLAP_SOURCE_SHEET") or "Signal_History").strip())
+        values = ws.get_all_values()
+    except Exception as e:
+        return [], "sheet read failed: %s" % e
+    if not values or len(values) < 2:
+        return [], "Signal_History empty"
+    header = [safe_str(h).strip().lower() for h in values[0]]
+
+    def _col(*names: str) -> int:
+        for n in names:
+            if n in header:
+                return header.index(n)
+        return -1
+
+    i_sym = _col("symbol")
+    i_ts = _col("recorded at (riyadh)", "recorded at")
+    i_rec = _col("recommendation")
+    i_rel = _col("forecast reliability")
+    i_dq = _col("data quality")
+    if i_sym < 0 or i_ts < 0 or i_rel < 0:
+        return [], "Signal_History header missing required columns"
+    body = values[1:]
+    if max_rows > 0 and len(body) > max_rows:
+        body = body[-max_rows:]
+    out: List[Dict[str, Any]] = []
+    for row in body:
+        try:
+            ts = _parse_any_time(row[i_ts] if i_ts < len(row) else None)
+            if ts is not None and ts.tzinfo == timezone.utc and                     "T" not in safe_str(row[i_ts]):
+                # "_parse_any_time" stamps naive sheet times as UTC; the
+                # sheet writes Riyadh — shift to true UTC.
+                ts = ts - _RIYADH_OFFSET
+            out.append({
+                "symbol": row[i_sym] if i_sym < len(row) else "",
+                "recorded_at": ts,
+                "recommendation": row[i_rec] if 0 <= i_rec < len(row) else "",
+                "reliability": row[i_rel] if i_rel < len(row) else None,
+                "dq": row[i_dq] if 0 <= i_dq < len(row) else None,
+            })
+        except Exception:
+            continue
+    return out, ""
+
+
+def _write_flap_block_to_data_audit(spreadsheet_id: str,
+                                    report: Dict[str, Any]) -> bool:
+    """Idempotent marker-bounded upsert into _Data_Audit. The marker line
+    carries the block's own row count — exactly the region cleared on the
+    next run, so re-runs can never grow the tab. Fail-open."""
+    v = (os.getenv("AUDIT_FLAP_SHEET_WRITE") or "1").strip().lower()
+    if v in _FALSY:
+        return False
+    try:
+        import gspread  # type: ignore
+    except Exception:
+        logger.info("flap meter: gspread absent — sheet block skipped")
+        return False
+    try:
+        creds = _flap_load_credentials()
+        gc = gspread.authorize(creds) if creds else gspread.service_account()
+        ws = gc.open_by_key(spreadsheet_id).worksheet(
+            (os.getenv("AUDIT_FLAP_TARGET_SHEET") or "_Data_Audit").strip())
+        top = report.get("top") or []
+        block: List[List[Any]] = []
+        block.append(["%s (rows=%d)" % (_FLAP_MARKER_PREFIX, 0)])  # patched below
+        block.append(["Window %dh | min transitions %d | audit v%s | %s"
+                      % (report.get("window_h") or 0,
+                         report.get("min_transitions") or 0,
+                         SERVICE_VERSION,
+                         report.get("generated_riyadh") or "")])
+        block.append(["Scanned %d symbols (%d eligible, %d too-short) | "
+                      "%d snapshots | FLAPPING: %d (%.1f%% of eligible)"
+                      % (report.get("symbols_scanned") or 0,
+                         report.get("symbols_eligible") or 0,
+                         report.get("insufficient_series") or 0,
+                         report.get("snapshots_scanned") or 0,
+                         report.get("flapping_count") or 0,
+                         float(report.get("flap_rate_pct") or 0.0))])
+        block.append(["Symbol", "Band Transitions", "Rel Min", "Rel Max",
+                      "DQ Min", "DQ Max", "Snapshots", "Last Action"])
+        for f in top:
+            block.append([f.get("symbol"), f.get("transitions"),
+                          f.get("rel_min"), f.get("rel_max"),
+                          f.get("dq_min"), f.get("dq_max"),
+                          f.get("snapshots"), f.get("last_action")])
+        if not top:
+            block.append(["(no flapping symbols in window)", "", "", "",
+                          "", "", "", ""])
+        block[0][0] = "%s (rows=%d)" % (_FLAP_MARKER_PREFIX, len(block))
+
+        col_a = ws.col_values(1)
+        start = None
+        old_rows = 0
+        for idx, cell in enumerate(col_a, start=1):
+            s = safe_str(cell)
+            if s.startswith(_FLAP_MARKER_PREFIX):
+                start = idx
+                try:
+                    old_rows = int(s.rsplit("rows=", 1)[1].rstrip(")"))
+                except Exception:
+                    old_rows = len(block)
+                break
+        if start is None:
+            start = len(col_a) + 2
+        clear_rows = max(old_rows, len(block))
+        end_row = start + clear_rows - 1
+        rng = "A%d:H%d" % (start, end_row)
+        ws.batch_clear([rng])
+        ws.update(values=block,
+                  range_name="A%d:H%d" % (start, start + len(block) - 1))
+        logger.info("flap meter: _Data_Audit block upserted at row %d "
+                    "(%d rows)", start, len(block))
+        return True
+    except Exception as e:
+        logger.warning("flap meter: sheet write failed (audit unaffected): %s", e)
+        return False
+
+
+def run_flap_meter(spreadsheet_id: str) -> Dict[str, Any]:
+    """Public one-call meter: load Signal_History -> compute -> upsert the
+    _Data_Audit block. Returns the report dict (with `note` on degrade).
+    Independent of the quote audit; never raises."""
+    try:
+        if not _flap_enabled():
+            return {"enabled": False}
+        window_h = _flap_env_int("AUDIT_FLAP_WINDOW_H", 48, 2, 720)
+        min_tr = _flap_env_int("AUDIT_FLAP_MIN_TRANSITIONS", 2, 1, 50)
+        top_n = _flap_env_int("AUDIT_FLAP_TOP", 15, 1, 100)
+        max_rows = _flap_env_int("AUDIT_FLAP_MAX_ROWS", 20000, 100, 200000)
+        rows, note = _load_signal_history_rows(spreadsheet_id, max_rows)
+        if note:
+            logger.info("flap meter unavailable: %s", note)
+            return {"enabled": True, "note": note, "flapping_count": 0,
+                    "top": [], "audit_version": SERVICE_VERSION}
+        report = _compute_flap_report(rows, datetime.now(timezone.utc),
+                                      window_h, min_tr, top_n)
+        logger.info("FLAP METER (%dh): %d/%d eligible symbols flapping "
+                    "(%.1f%%) | top: %s",
+                    window_h, report.get("flapping_count") or 0,
+                    report.get("symbols_eligible") or 0,
+                    float(report.get("flap_rate_pct") or 0.0),
+                    ", ".join("%s(%d)" % (f["symbol"], f["transitions"])
+                              for f in (report.get("top") or [])[:5]) or "—")
+        _write_flap_block_to_data_audit(spreadsheet_id, report)
+        return report
+    except Exception as e:
+        logger.error("flap meter failed: %s", e)
+        return {"enabled": True, "error": str(e), "flapping_count": 0,
+                "top": [], "audit_version": SERVICE_VERSION}
+
+
+# -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 def _severity_rank(s: AuditSeverity) -> int:
@@ -1794,6 +2135,12 @@ def main() -> None:
         default=0,
         help="v4.6.0: 1=disable UNIT_DRIFT_* detection (not recommended); 0=enabled (default)",
     )
+    p.add_argument(
+        "--flap",
+        type=int,
+        default=-1,
+        help="v4.9.0: 1=force reliability flap meter ON, 0=OFF, -1=env AUDIT_FLAP (default ON)",
+    )
 
     args = p.parse_args()
 
@@ -1816,6 +2163,17 @@ def main() -> None:
             )
         )
         summary.audit_duration_ms = (time.time() - t0) * 1000.0
+
+        # v4.9.0 (Fix D1-METER): reliability flap meter — disclosure only,
+        # independent of the quote audit, never touches exit codes.
+        flap_report: Dict[str, Any] = {"enabled": False}
+        _flap_flag = int(getattr(args, "flap", -1) or -1)
+        if _flap_flag == 1 or (_flap_flag == -1 and _flap_enabled()):
+            _sid_flap = (args.sheet_id or os.getenv("DEFAULT_SPREADSHEET_ID", "")).strip()
+            if _sid_flap:
+                flap_report = run_flap_meter(_sid_flap)
+            else:
+                logger.info("flap meter skipped: no spreadsheet id")
 
         alerts = [r for r in results if r.severity != AuditSeverity.OK]
 
@@ -1840,9 +2198,9 @@ def main() -> None:
 
         if args.json_out:
             if int(args.alerts_only) == 1:
-                payload = {"summary": summary.to_dict(), "alerts": [r.to_dict() for r in alerts]}
+                payload = {"summary": summary.to_dict(), "alerts": [r.to_dict() for r in alerts], "flap": flap_report}
             else:
-                payload = {"summary": summary.to_dict(), "results": [r.to_dict() for r in results], "alerts": [r.to_dict() for r in alerts]}
+                payload = {"summary": summary.to_dict(), "results": [r.to_dict() for r in results], "alerts": [r.to_dict() for r in alerts], "flap": flap_report}
             export_tasks.append(_export_json(args.json_out, payload, indent=int(args.json_indent)))
 
         if args.csv_out:
