@@ -211,6 +211,72 @@ symbol|date against the daily snapshots, so no record-schema churn):
 
 Why this revision (v6.13.0 vs v6.12.0)
 --------------------------------------
+v6.20.0 -- PRICE-FEED SELF-SUFFICIENCY + SYMBOL-SOURCE CONTRACT + VERDICT TRIPWIRE
+--------------------------------------------------------------------------
+EVIDENCE (v32 export, 2026-07-14 23:00 audit; run #2382 artifacts):
+(A) ALL 2,600 active Performance_Log records carry Current Price == Entry
+    Price and Unrealized ROI 0.0 -- including records from 2026-06-28 --
+    while every record is re-stamped 21:30:33 by the run that just
+    finished. The backend was "Health: healthy" in the same run's own
+    summary. Conclusion: fetch_prices returned {} on EVERY run since
+    inception inside the Actions context (v6.18.0 made this LOUD in a log
+    nobody reads; the feed itself was never given a source that works
+    there). The 1M calibration cohort maturing from 2026-07-28 would have
+    expired UNPRICED.
+(B) 17 non-symbols (TRUTH:, STATUS:, _PORTFOLIO_COSTBASIS, (FREEZES, =, &,
+    em-dash, ...) appear as "symbols" x33 Decision_Coverage snapshots = 561
+    junk Signal_History rows + junk Signal_Trends rows. Traced:
+    _load_costbasis_symbols (v6.16.0) reads ALL of column A and skips only
+    'SYMBOL'; the ledger's title/status/legend cells (rows A1-A3 of
+    _Portfolio_CostBasis) enter the priority set and are tokenized
+    downstream into fake tickers.
+(C) A stale duplicate KPI panel (Total Records 2334, 07-13 07:44) sits at
+    A1:E4 beside the live AG1:AK13 panel: update_summary never clears
+    superseded panel locations.
+FIX (three cuts, one build):
+  PF-1 BACKEND-INDEPENDENT PRICE FALLBACK: after the backend endpoint chain
+       has spoken, every still-unpriced symbol is fetched directly from the
+       Yahoo v8 chart API (meta.regularMarketPrice; .US suffix stripped,
+       all other suffixes/classes pass through), bounded by a concurrency
+       cap, per-call timeout and an overall time budget. Fill-only into
+       price_map -- a backend-delivered price is never overwritten. The
+       tracker can now price the cohort even when every backend endpoint
+       is unreachable/gated from the Actions runner.
+       ENV: TFB_TRACK_PRICE_FALLBACK default ON (=0 restores v6.19.0
+       byte-identical pricing); TFB_TRACK_FALLBACK_CONC (default 8,
+       floor 1, ceiling 32); TFB_TRACK_FALLBACK_TIMEOUT_SEC (default 8);
+       TFB_TRACK_FALLBACK_BUDGET_SEC (default 420, floor 30).
+  SG-1 SYMBOL-SOURCE CONTRACT: _load_costbasis_symbols anchors below the
+       row whose column-A cell equals 'Symbol' and every candidate (there
+       AND in the merged priority set of _augment_with_decision_symbols,
+       covering TFB_TRACK_FORCE_SYMBOLS too) must match the ticker shape
+       ^[A-Z0-9^][A-Z0-9.=^-]{0,14}$ -- no whitespace, no leading
+       underscore. Rejected cells are counted and logged, killing the
+       561-row junk class at the source.
+       ENV: TFB_TRACK_SYMBOL_SHAPE_GUARD default ON (=0 restores the
+       v6.16.0 whole-column read verbatim).
+  VT-1 VERDICT TRIPWIRE + PANEL HYGIENE: every --audit run appends ONE
+       line to the workbook's _Run_Log --
+       [PERF-VERDICT v6.20.0] priced P/T | roi_nonzero Z | fallback_filled
+       F | junk_rejected J | matured M -- so the standing six-gate audit
+       (which already reads _Run_Log) sees a dead feed the NEXT morning
+       instead of in a forensic session. update_summary batch-clears the
+       known historical panel footprints (A1:E4 legacy, AG1:AK13 side)
+       before writing, removing the stale-duplicate class.
+       ENV: TFB_TRACK_RUNLOG_VERDICT default ON.
+DONE-CRITERION (owner-verifiable in the next export): Current Price !=
+Entry Price on the clear majority of active records; zero new junk
+symbols; a [PERF-VERDICT v6.20.0] line in _Run_Log; single KPI panel.
+SCRIPT_VERSION 6.19.0 -> 6.20.0. ZERO functions removed; additions:
+_price_fallback_enabled, _fallback_conc, _fallback_timeout_sec,
+_fallback_budget_sec, _yahoo_symbol, _yahoo_parse_chart_price,
+_yahoo_fetch_one_price, _yahoo_chart_fallback_prices,
+_symbol_guard_enabled, _valid_symbol_shape,
+_extract_symbols_below_header, _runlog_verdict_enabled,
+PerformanceTrackerApp._append_runlog_verdict (+ module constants
+_SYMBOL_SHAPE_RE, _YF_CHART_URL, _PF_TAG, _SG_TAG and counters
+_LAST_COSTBASIS_REJECTED, _LAST_FALLBACK_FILLED).
+
 v6.19.0 -- DAY-KEYED TREND WINDOW + INTRADAY-AWARE FLIP COUNT (Fix TR-1)
 --------------------------------------------------------------------------
 EVIDENCE (Signal_Trends row for NMM.US, 2026-07-13 19:36): Flip Count 0.0,
@@ -717,6 +783,7 @@ import logging
 import math
 import os
 import random
+import re
 import signal
 import sys
 import time
@@ -735,7 +802,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.19.0"
+SCRIPT_VERSION = "6.20.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -956,6 +1023,63 @@ def _costbasis_tab() -> str:
             or "_Portfolio_CostBasis").strip() or "_Portfolio_CostBasis"
 
 
+# =============================================================================
+# v6.20.0 (SG-1) -- symbol-source contract guard
+# =============================================================================
+# Ticker shape: leading A-Z/0-9/^ then up to 14 of A-Z 0-9 . - = ^ .
+# Deliberately admits futures/FX/index classes (GC=F, SAR=X, ^N225) and
+# every exchange suffix in the universe (.SR .US .HK .T .L .KL .WA .TO
+# .MC .AT .NS -UN.TO ...). Whitespace and leading underscores can never
+# match, which is exactly what kills the ledger title/legend token class.
+_SYMBOL_SHAPE_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.\-=^]{0,14}$")
+_SG_TAG = "[v6.20.0 SYMBOL-GUARD]"
+# Module counters read by the VT-1 verdict line (single-threaded runner).
+_LAST_COSTBASIS_REJECTED: int = 0
+_LAST_FALLBACK_FILLED: int = 0
+
+
+def _symbol_guard_enabled() -> bool:
+    """v6.20.0 (SG-1): header-anchored + shape-validated symbol sourcing.
+    Default ON; TFB_TRACK_SYMBOL_SHAPE_GUARD=0/false/off/no restores the
+    v6.16.0 whole-column read byte-identically."""
+    return (os.getenv("TFB_TRACK_SYMBOL_SHAPE_GUARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _valid_symbol_shape(sym: str) -> bool:
+    """True iff sym looks like a market symbol (see _SYMBOL_SHAPE_RE)."""
+    s = _safe_str(sym).strip().upper()
+    if not s or s.startswith("_"):
+        return False
+    return bool(_SYMBOL_SHAPE_RE.match(s))
+
+
+def _extract_symbols_below_header(col: List[str]) -> Tuple[List[str], int]:
+    """v6.20.0 (SG-1): from a raw column-A value list, return
+    (valid_symbols_below_the_'Symbol'_header, rejected_count). If no
+    header cell is found the whole column is scanned (backward-compatible
+    with a header-less sheet) but shape validation still applies. Dedupes
+    preserving first-seen order."""
+    start = 0
+    for i, v in enumerate(col):
+        if _safe_str(v).strip().upper() == "SYMBOL":
+            start = i + 1
+            break
+    out: List[str] = []
+    seen: set = set()
+    rejected = 0
+    for v in col[start:]:
+        sym = _safe_str(v).strip().upper()
+        if not sym or sym == "SYMBOL":
+            continue
+        if not _valid_symbol_shape(sym):
+            rejected += 1
+            continue
+        if sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    return out, rejected
+
+
 def _load_costbasis_symbols(spreadsheet_id: str) -> List[str]:
     """v6.16.0 (Fix #5): Symbol column of _Portfolio_CostBasis, uppercased,
     deduped, header-skipped. Fail-open: ANY problem -> [] with a debug line
@@ -984,6 +1108,23 @@ def _load_costbasis_symbols(spreadsheet_id: str) -> List[str]:
         gc = gspread.authorize(creds)
         ws = gc.open_by_key(spreadsheet_id).worksheet(_costbasis_tab())
         col = ws.col_values(1) or []
+        # v6.20.0 (SG-1): header-anchored, shape-validated read. The ledger
+        # carries a title, a Status: line and a legend ABOVE the 'Symbol'
+        # header; v6.16.0's whole-column read swept those cells into the
+        # priority set, where downstream space-splitting turned them into
+        # 17 fake tickers x every Decision_Coverage snapshot (561 junk
+        # Signal_History rows in the v32 export). Kill switch restores the
+        # old read verbatim.
+        global _LAST_COSTBASIS_REJECTED
+        if _symbol_guard_enabled():
+            out, rejected = _extract_symbols_below_header(col)
+            _LAST_COSTBASIS_REJECTED = rejected
+            if rejected:
+                logger.info(
+                    "%s costbasis: kept %d symbol(s), rejected %d non-symbol cell(s)",
+                    _SG_TAG, len(out), rejected,
+                )
+            return out
         out: List[str] = []
         seen: set = set()
         for v in col:
@@ -993,6 +1134,7 @@ def _load_costbasis_symbols(spreadsheet_id: str) -> List[str]:
             if sym not in seen:
                 seen.add(sym)
                 out.append(sym)
+        _LAST_COSTBASIS_REJECTED = 0
         return out
     except Exception as e:
         logger.debug("cost-basis symbol read skipped: %s", e)
@@ -1358,6 +1500,179 @@ def _summary_block_range(n_rows: int) -> str:
     if _summary_side_enabled():
         return f"AG1:AK{int(n_rows)}"
     return f"A1:E{int(n_rows)}"
+
+
+# =============================================================================
+# v6.20.0 (PF-1) -- backend-independent Yahoo chart price fallback
+# =============================================================================
+_PF_TAG = "[v6.20.0 PRICE-FALLBACK]"
+_YF_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"
+_YF_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+}
+
+
+def _price_fallback_enabled() -> bool:
+    """v6.20.0 (PF-1): direct Yahoo v8 chart pricing for symbols the
+    backend chain left unpriced. Default ON (the live failure class --
+    2,600/2,600 records frozen at entry price -- violates it);
+    TFB_TRACK_PRICE_FALLBACK=0/false/off/no restores v6.19.0 pricing
+    byte-identically."""
+    return (os.getenv("TFB_TRACK_PRICE_FALLBACK") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _fallback_conc() -> int:
+    """Concurrent Yahoo fetches (default 8, floor 1, ceiling 32)."""
+    try:
+        v = int((os.getenv("TFB_TRACK_FALLBACK_CONC") or "8").strip())
+    except Exception:
+        v = 8
+    return max(1, min(32, v))
+
+
+def _fallback_timeout_sec() -> float:
+    """Per-call timeout seconds (default 8, floor 2)."""
+    try:
+        v = float((os.getenv("TFB_TRACK_FALLBACK_TIMEOUT_SEC") or "8").strip())
+    except Exception:
+        v = 8.0
+    return max(2.0, v)
+
+
+def _fallback_budget_sec() -> float:
+    """Overall wall-clock budget for the whole fallback pass (default 420,
+    floor 30). When exhausted, no NEW fetches launch; in-flight ones
+    finish. Whatever was priced is kept -- fill-only, never blocking."""
+    try:
+        v = float((os.getenv("TFB_TRACK_FALLBACK_BUDGET_SEC") or "420").strip())
+    except Exception:
+        v = 420.0
+    return max(30.0, v)
+
+
+def _yahoo_symbol(sym: str) -> str:
+    """TFB symbol -> Yahoo symbol. The universe's only non-native suffix is
+    .US (Yahoo lists US tickers bare); every other suffix (.SR .HK .T .L
+    .KL .WA .TO .MC .AT .NS -UN.TO ...) and every futures/FX/index class
+    (GC=F, SAR=X, ^N225) is already Yahoo-native and passes through."""
+    s = _safe_str(sym).strip().upper()
+    if s.endswith(".US"):
+        return s[:-3]
+    return s
+
+
+def _yahoo_parse_chart_price(payload: Any) -> float:
+    """Extract meta.regularMarketPrice from a v8 chart envelope. 0.0 when
+    absent/malformed. Pure + total: never raises."""
+    try:
+        res = (((payload or {}).get("chart") or {}).get("result") or [])
+        if not res:
+            return 0.0
+        meta = (res[0] or {}).get("meta") or {}
+        px = _safe_float(meta.get("regularMarketPrice"), default=0.0)
+        if px <= 0:
+            px = _safe_float(meta.get("previousClose"), default=0.0)
+        return px if px > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _yahoo_fetch_one_price_sync(sym: str, timeout: float) -> float:
+    """Blocking single-symbol fetch (urllib) -- executor path when aiohttp
+    is unavailable. Returns 0.0 on any failure."""
+    try:
+        url = _YF_CHART_URL.format(sym=_yahoo_symbol(sym))
+        req = UrlRequest(url, method="GET")
+        for k, v in _YF_HEADERS.items():
+            req.add_header(k, v)
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        return _yahoo_parse_chart_price(json_loads(raw))
+    except Exception:
+        return 0.0
+
+
+async def _yahoo_fetch_one_price(session: Any, sym: str, timeout: float) -> float:
+    """Async single-symbol fetch. aiohttp session when provided, else the
+    sync path in the shared executor. Returns 0.0 on any failure."""
+    if session is not None:
+        try:
+            url = _YF_CHART_URL.format(sym=_yahoo_symbol(sym))
+            async with session.get(url) as resp:
+                if int(resp.status) != 200:
+                    return 0.0
+                raw = await resp.read()
+            return _yahoo_parse_chart_price(json_loads(raw))
+        except Exception:
+            return 0.0
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(
+            _get_executor(), _yahoo_fetch_one_price_sync, sym, timeout
+        )
+    except Exception:
+        return 0.0
+
+
+async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
+    """v6.20.0 (PF-1): price the given symbols directly from Yahoo's v8
+    chart API under a concurrency cap and wall-clock budget. Returns only
+    positive prices, keyed by the ORIGINAL (TFB) symbol. Never raises."""
+    syms = [
+        _safe_str(x).strip().upper()
+        for x in (symbols or [])
+        if _safe_str(x).strip()
+    ]
+    syms = list(dict.fromkeys(syms))
+    if not syms:
+        return {}
+    t0 = time.time()
+    budget = _fallback_budget_sec()
+    timeout = _fallback_timeout_sec()
+    sem = asyncio.Semaphore(_fallback_conc())
+    out: Dict[str, float] = {}
+    session = None
+    try:
+        if ASYNC_HTTP_AVAILABLE and aiohttp is not None:
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                headers=dict(_YF_HEADERS),
+            )
+
+        async def one(s: str) -> None:
+            if (time.time() - t0) > budget:
+                return
+            async with sem:
+                if (time.time() - t0) > budget:
+                    return
+                px = await _yahoo_fetch_one_price(session, s, timeout)
+                if px > 0:
+                    out[s] = px
+
+        await asyncio.gather(*(one(s) for s in syms), return_exceptions=True)
+    except Exception as e:
+        logger.warning("%s pass error: %s", _PF_TAG, e)
+    finally:
+        if session is not None:
+            try:
+                await session.close()
+            except Exception:
+                pass
+    logger.info(
+        "%s priced %d/%d symbol(s) in %.1fs (conc=%d, budget=%.0fs)",
+        _PF_TAG, len(out), len(syms), time.time() - t0,
+        _fallback_conc(), budget,
+    )
+    return out
+
+
+def _runlog_verdict_enabled() -> bool:
+    """v6.20.0 (VT-1): append one [PERF-VERDICT] line per --audit run to the
+    workbook's _Run_Log so the standing six-gate audit sees feed health
+    next morning. Default ON; TFB_TRACK_RUNLOG_VERDICT=0 disables."""
+    return (os.getenv("TFB_TRACK_RUNLOG_VERDICT") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _price_feed_dead(syms: List[str], price_map: Dict[str, float]) -> Optional[str]:
@@ -2615,6 +2930,20 @@ class PerformanceStore:
             ["Sharpe Ratio", f"{summary.sharpe_ratio:.2f}", "", "", ""],
             ["Sortino Ratio", f"{summary.sortino_ratio:.2f}", "", "", ""],
         ]
+        # v6.20.0 (VT-1 hygiene): clear every historical panel footprint
+        # first (A1:E4 legacy top-left stub, AG1:AK13 side block) so a
+        # placement change can never leave a stale duplicate panel behind
+        # (the v32 export carried a 07-13 "Total Records 2334" ghost at
+        # A1:E4 beside the live AG panel). Rows 1-4 sit above the header
+        # row (START_ROW=5) and AG:AK sits right of the 31-column grid, so
+        # neither range can touch record data. Best-effort: a clear hiccup
+        # must not block the write.
+        try:
+            self.backoff.execute_sync(
+                lambda: self.ws.batch_clear(["A1:E4", "AG1:AK13"])
+            )
+        except Exception:
+            pass
         try:
             self.backoff.execute_sync(lambda: self.ws.update(values=block, range_name=_summary_block_range(13)))  # type: ignore
             return True
@@ -4936,6 +5265,18 @@ class PerformanceTrackerApp:
                 priority |= set(held or [])
             except Exception as e:
                 logger.warning("cost-basis holdings read failed: %s", e)
+        # v6.20.0 (SG-1): the merged priority set (cost-basis + forced
+        # extras from TFB_TRACK_FORCE_SYMBOLS) passes the same shape gate,
+        # so junk can never reach the backend fetch regardless of source.
+        if _symbol_guard_enabled():
+            _bad = sorted(x for x in priority if x and not _valid_symbol_shape(x))
+            if _bad:
+                logger.info(
+                    "%s priority set: rejected %d non-symbol token(s): %s",
+                    _SG_TAG, len(_bad),
+                    ", ".join(_bad[:6]) + ("..." if len(_bad) > 6 else ""),
+                )
+                priority = {x for x in priority if _valid_symbol_shape(x)}
         missing = sorted(s for s in priority if s and s not in covered)
         if len(missing) > _force_max():
             logger.warning(
@@ -5069,6 +5410,23 @@ class PerformanceTrackerApp:
             if _dead:
                 logger.error("%s %s — fresh-only maturation will hold/expire "
                              "affected records.", _PRICE_FEED_TAG, _dead)
+
+        # v6.20.0 (PF-1): backend-independent fill for whatever the chain
+        # left unpriced -- INCLUDING the base_url-empty branch above (the
+        # whole point is not depending on the backend). Fill-only: a
+        # backend-delivered price is never overwritten.
+        global _LAST_FALLBACK_FILLED
+        _LAST_FALLBACK_FILLED = 0
+        if _price_fallback_enabled():
+            _missing = [s for s in syms
+                        if float(price_map.get(s, 0.0) or 0.0) <= 0.0]
+            if _missing:
+                _fb = await _yahoo_chart_fallback_prices(_missing)
+                for _k, _v in _fb.items():
+                    if float(price_map.get(_k, 0.0) or 0.0) <= 0.0 and _v > 0:
+                        price_map[_k] = _v
+                _LAST_FALLBACK_FILLED = len(_fb)
+
         now_r = RiyadhTime.now()
 
         _fresh_only = _mature_fresh_only_enabled()
@@ -5174,7 +5532,85 @@ class PerformanceTrackerApp:
                 f" ({', '.join(_expired_syms[:8])}{'…' if len(_expired_syms) > 8 else ''})" if _expired_syms else "",
             )
 
+        # v6.20.0 (VT-1): stash this pass's feed stats for the verdict line.
+        try:
+            _priced = sum(
+                1 for s in syms if float(price_map.get(s, 0.0) or 0.0) > 0.0
+            )
+            _roi_nz = sum(
+                1 for r in active
+                if float(r.current_price or 0.0) > 0.0
+                and float(r.entry_price or 0.0) > 0.0
+                and abs(float(r.current_price) - float(r.entry_price)) > 1e-12
+            )
+            self._last_audit_stats = {
+                "priced": _priced,
+                "total": len(syms),
+                "roi_nonzero": _roi_nz,
+                "fallback_filled": int(_LAST_FALLBACK_FILLED),
+                "matured": int(_n_matured),
+                "pending": len(_pending_syms),
+                "expired": len(_expired_syms),
+            }
+        except Exception:
+            self._last_audit_stats = {}
+
         return records
+
+    def _append_runlog_verdict(self) -> None:
+        """v6.20.0 (VT-1): one-line health verdict into the workbook's
+        _Run_Log (the sheet the standing six-gate audit already reads).
+        Best-effort and fail-open: any hiccup is logged and swallowed --
+        a tripwire must never break the run it is watching."""
+        if not _runlog_verdict_enabled():
+            return
+        st = getattr(self, "_last_audit_stats", None) or {}
+        if not st:
+            return
+        try:
+            sheet = getattr(self.store, "sheet", None)
+            if sheet is None:
+                return
+            ws = sheet.worksheet("_Run_Log")
+            msg = (
+                "[PERF-VERDICT v%s] priced %d/%d | roi_nonzero %d | "
+                "fallback_filled %d | junk_rejected %d | matured %d | "
+                "pending %d | expired %d"
+                % (
+                    SCRIPT_VERSION,
+                    int(st.get("priced") or 0),
+                    int(st.get("total") or 0),
+                    int(st.get("roi_nonzero") or 0),
+                    int(st.get("fallback_filled") or 0),
+                    int(_LAST_COSTBASIS_REJECTED),
+                    int(st.get("matured") or 0),
+                    int(st.get("pending") or 0),
+                    int(st.get("expired") or 0),
+                )
+            )
+            level = (
+                "INFO"
+                if int(st.get("priced") or 0) > 0
+                else "ERROR"
+            )
+            row = [
+                RiyadhTime.format(),
+                level,
+                "track_performance",
+                "Performance_Log",
+                "OK" if level == "INFO" else "FEED_DEAD",
+                msg,
+                "",
+                "",
+                "",
+                json_dumps(st),
+            ]
+            self.store.backoff.execute_sync(
+                lambda: ws.append_row(row, value_input_option="USER_ENTERED")
+            )
+            logger.info("%s", msg)
+        except Exception as e:
+            logger.warning("[v6.20.0 VT-1] run-log verdict skipped: %s", e)
 
     async def run_once(self) -> int:
         loop = asyncio.get_running_loop()
@@ -5232,6 +5668,13 @@ class PerformanceTrackerApp:
                 await loop.run_in_executor(
                     _get_executor(), self.store.save_records, records
                 )
+            # v6.20.0 (VT-1): tripwire into the workbook, post-save.
+            try:
+                await loop.run_in_executor(
+                    _get_executor(), self._append_runlog_verdict
+                )
+            except Exception as _vt_e:
+                logger.warning("[v6.20.0 VT-1] verdict dispatch skipped: %s", _vt_e)
 
         summary = (
             self.analyzer.analyze(records)
