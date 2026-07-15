@@ -7,6 +7,48 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.23.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.24.1 fix — SELF-DIAGNOSIS LAYER: FW-3 LOUD-FAILURE, FW-4 NAME-DEDUP CENSUS, STARTUP SELF-TEST
+--------------------------------------------------------------------------
+EVIDENCE (v41 morning export, 2026-07-15 audit):
+(1) FW-1 healing PROVEN in production (GOOG/HSBA.L/NMM.US/2222.SR all
+    restored overnight) — yet ZERO [ID-FIREWALL] verdict lines reached
+    _Run_Log: FW-3's only failure channel was a logger.warning nobody can
+    see. A tripwire whose own failure is silent violates the discipline it
+    exists to enforce.
+(2) NEW finding the ratio tests CANNOT catch: 196 Names on >=3 symbols in
+    Global_Markets and 55 in Market_Leaders — all stamped TODAY. These are
+    self-consistent whole-row transpositions (Price/EPS/PE move together,
+    so P/E==Price/EPS holds on the wrong symbol). Root fix is engine-side
+    pairing (Build 4); until it lands, the sync needs eyes on the class.
+FIX (three cuts):
+  FW-3b LOUD VERDICT: the _Run_Log append now retries once and, on final
+       failure, emits a GitHub ::warning:: annotation carrying the
+       exception class+message — visible on the run page like the
+       track_performance notices. A silent tripwire is no longer possible.
+  FW-4 NAME-DEDUP CENSUS/QUARANTINE: after FW-2, the OUTGOING batch is
+       censused Name->symbols. Any non-blank Name on >=
+       TFB_SYNC_NAME_DEDUP_MIN (default 3) distinct symbols is reported in
+       the [ID-FIREWALL] verdict as name_dup groups. Mode is env-gated:
+       TFB_SYNC_NAME_DEDUP_MODE=observe (DEFAULT: report only — legit
+       multi-listings like HSBC on 3 exchanges must be measured before any
+       automatic action) | quarantine (carriers stubbed to Symbol-only +
+       'identity_quarantined:name_dedup' Warnings tag) | off. The observe
+       census gives a daily workbook-visible measurement so the flip to
+       quarantine (or the Build-4 fix) is made on data, not guesswork.
+  ST-1 STARTUP SELF-TEST: _idfw_selftest_() runs canned fixtures through
+       _klg_old_row_identity_ok, _row_identity_firewall and the FW-4
+       census before any page is touched (poisoned GOOG row must be
+       refused/stripped; healthy+GBX rows must pass; 3-symbol name group
+       must be detected). Result is logged as [SELFTEST v6.24.1] PASS k/k
+       and included in every FW-3 verdict's details. On ANY failure: a
+       ::error:: annotation fires and FW-4 quarantine (the only
+       destructive-ish new action) self-disables for the run; FW-1/FW-2
+       remain armed (their failure mode is the old behavior, never data
+       loss). The system now checks its own guards every run and refuses
+       to act on a guard it just proved broken.
+ENV: TFB_SYNC_NAME_DEDUP_MODE (observe), TFB_SYNC_NAME_DEDUP_MIN (3).
+No other changes; all v6.24.0 behavior and every prior WHY preserved.
+
 v6.24.0 fix — ID-FIREWALL: KLG IDENTITY GATE + OUTGOING ROW STRIP + RUN-LOG VERDICT
 --------------------------------------------------------------------------
 EVIDENCE (v32 export forensics, 2026-07-14 23:00 audit; D3 closeout):
@@ -934,7 +976,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.24.0"
+SCRIPT_VERSION = "6.24.1"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2748,6 +2790,147 @@ def _row_identity_firewall(
     return rows_matrix, stripped
 
 
+def _name_dedup_mode() -> str:
+    """v6.24.1 FW-4: observe (default) | quarantine | off."""
+    v = (os.getenv("TFB_SYNC_NAME_DEDUP_MODE") or "observe").strip().lower()
+    return v if v in {"observe", "quarantine", "off"} else "observe"
+
+
+def _name_dedup_min() -> int:
+    """v6.24.1 FW-4: group-size threshold (default 3, floor 2)."""
+    try:
+        v = int((os.getenv("TFB_SYNC_NAME_DEDUP_MIN") or "3").strip())
+    except Exception:
+        v = 3
+    return max(2, v)
+
+
+# v6.24.1 ST-1: set False by the startup self-test on failure — quarantine
+# (the only new destructive-ish action) refuses to run on a broken guard.
+_IDFW_SELFTEST_OK = True
+_IDFW_SELFTEST_MSG = "not-run"
+
+
+def _name_dedup_census(headers: list, rows_matrix: list) -> tuple:
+    """v6.24.1 FW-4: census Name -> distinct symbols across the OUTGOING
+    batch. Returns (groups, name_i, sym_i, warn_i) where groups is a dict
+    {name: sorted([symbols])} restricted to groups of size >=
+    _name_dedup_min(). Blank names ignored. Fail-safe: missing columns ->
+    empty groups."""
+    groups: dict = {}
+    if not headers or not rows_matrix:
+        return groups, -1, -1, -1
+    hdr = list(headers)
+    name_i = _guard_find_col(hdr, _GUARD_NAME_ALIASES)
+    sym_i = _guard_find_col(hdr, _GUARD_SYMBOL_ALIASES)
+    warn_i = -1
+    for i, h in enumerate(hdr):
+        if str(h or "").strip().casefold() == "warnings":
+            warn_i = i
+            break
+    if name_i < 0 or sym_i < 0:
+        return groups, name_i, sym_i, warn_i
+    owners: dict = {}
+    for row in rows_matrix:
+        if not isinstance(row, list) or len(row) <= max(name_i, sym_i):
+            continue
+        nm = str(row[name_i] or "").strip()
+        sym = str(row[sym_i] or "").strip().upper()
+        if not nm or not sym:
+            continue
+        owners.setdefault(nm, set()).add(sym)
+    m = _name_dedup_min()
+    for nm, syms in owners.items():
+        if len(syms) >= m:
+            groups[nm] = sorted(syms)
+    return groups, name_i, sym_i, warn_i
+
+
+def _name_dedup_apply(headers: list, rows_matrix: list) -> tuple:
+    """v6.24.1 FW-4: run the census and, in quarantine mode (and only when
+    the startup self-test passed), stub every carrier row to Symbol-only +
+    Warnings tag. Returns (rows_matrix, groups, quarantined_symbols).
+    Mutates in place. Never raises."""
+    quarantined: list = []
+    try:
+        mode = _name_dedup_mode()
+        if mode == "off":
+            return rows_matrix, {}, quarantined
+        groups, name_i, sym_i, warn_i = _name_dedup_census(headers, rows_matrix)
+        if not groups:
+            return rows_matrix, groups, quarantined
+        if mode == "quarantine" and _IDFW_SELFTEST_OK:
+            doomed = set()
+            for syms in groups.values():
+                doomed.update(syms)
+            for r_i, row in enumerate(rows_matrix):
+                if not isinstance(row, list) or len(row) <= sym_i:
+                    continue
+                sym = str(row[sym_i] or "").strip().upper()
+                if sym in doomed:
+                    blanked = ["" for _ in row]
+                    blanked[sym_i] = row[sym_i]
+                    if 0 <= warn_i < len(blanked):
+                        blanked[warn_i] = "identity_quarantined:name_dedup"
+                    rows_matrix[r_i] = blanked
+                    quarantined.append(sym)
+        return rows_matrix, groups, quarantined
+    except Exception as e:
+        logger.warning("%s FW-4 skipped: %s", _IDFW_TAG, e)
+        return rows_matrix, {}, quarantined
+
+
+def _idfw_selftest_() -> bool:
+    """v6.24.1 ST-1: prove the guards on canned fixtures BEFORE touching a
+    page. Sets _IDFW_SELFTEST_OK/_IDFW_SELFTEST_MSG. Never raises."""
+    global _IDFW_SELFTEST_OK, _IDFW_SELFTEST_MSG
+    passed = 0
+    total = 6
+    try:
+        H = ["Symbol", "Name", "Price", "EPS (TTM)", "P/E (TTM)", "Warnings"]
+        ni, pi, ei, qi = 1, 2, 3, 4
+        poisoned = ["GOOG", "Gulfport Energy Corporation", 213.5, 9.18, 3.6, ""]
+        healthy = ["MSFT", "Microsoft Corporation", 500.0, 12.5, 40.0, ""]
+        gbx = ["NG.L", "National Grid plc", 1050.0, 0.60, 17.5, ""]
+        if _klg_old_row_identity_ok(poisoned, ni, pi, ei, qi) is False:
+            passed += 1
+        if _klg_old_row_identity_ok(healthy, ni, pi, ei, qi) is True:
+            passed += 1
+        if _klg_old_row_identity_ok(gbx, ni, pi, ei, qi) is True:
+            passed += 1
+        m = [list(healthy), list(poisoned), list(gbx)]
+        _m, stripped = _row_identity_firewall(H, m)
+        if stripped == ["GOOG"] and _m[0][1] == "Microsoft Corporation":
+            passed += 1
+        rows = [
+            ["A.US", "Same Name Co", 10, 1, 10, ""],
+            ["B.L", "Same Name Co", 11, 1.1, 10, ""],
+            ["C.HK", "Same Name Co", 12, 1.2, 10, ""],
+            ["D.US", "Other Co", 9, 1, 9, ""],
+        ]
+        groups, _n, _s, _w = _name_dedup_census(H, rows)
+        if list(groups.keys()) == ["Same Name Co"] and len(groups["Same Name Co"]) == 3:
+            passed += 1
+        rows2 = [list(r) for r in rows]
+        _r2, g2, q2 = _name_dedup_apply(H, rows2)  # observe default: no stubs
+        if q2 == [] and g2:
+            passed += 1
+    except Exception as e:
+        _IDFW_SELFTEST_OK = False
+        _IDFW_SELFTEST_MSG = "EXC %s: %s" % (type(e).__name__, e)
+        print("::error::[SELFTEST v6.24.1] guard self-test crashed: %s — "
+              "FW-4 quarantine disabled for this run." % _IDFW_SELFTEST_MSG)
+        return False
+    _IDFW_SELFTEST_OK = (passed == total)
+    _IDFW_SELFTEST_MSG = "PASS %d/%d" % (passed, total) if _IDFW_SELFTEST_OK else "FAIL %d/%d" % (passed, total)
+    if _IDFW_SELFTEST_OK:
+        logger.info("[SELFTEST v6.24.1] %s — guards verified on fixtures.", _IDFW_SELFTEST_MSG)
+    else:
+        print("::error::[SELFTEST v6.24.1] %s — a guard fixture failed; "
+              "FW-4 quarantine disabled for this run (FW-1/FW-2 remain on)." % _IDFW_SELFTEST_MSG)
+    return _IDFW_SELFTEST_OK
+
+
 def _idfw_runlog_enabled() -> bool:
     """v6.24.0 FW-3: append one [ID-FIREWALL] verdict line per market page
     to the workbook's _Run_Log. Default ON; TFB_SYNC_IDFW_RUNLOG=0 off."""
@@ -2761,6 +2944,8 @@ def _append_runlog_idfirewall(
     klg_kept: int,
     klg_suspects: list,
     out_stripped: list,
+    name_dup_groups: dict = None,
+    name_dup_quarantined: list = None,
 ) -> None:
     """v6.24.0 FW-3: best-effort, fail-open verdict append (columns match
     the _Run_Log layout: Timestamp, Level, Action, Page, Status, Message,
@@ -2772,32 +2957,57 @@ def _append_runlog_idfirewall(
         svc = sheets._get_service()
         if not svc:
             return
-        level = "WARNING" if (klg_suspects or out_stripped) else "INFO"
-        status = "SUSPECT" if (klg_suspects or out_stripped) else "OK"
+        name_dup_groups = dict(list((name_dup_groups or {}).items())[:12])
+        name_dup_quarantined = list(name_dup_quarantined or [])
+        _dup_n = len(name_dup_groups)
+        level = "WARNING" if (klg_suspects or out_stripped or _dup_n or name_dup_quarantined) else "INFO"
+        status = "SUSPECT" if (klg_suspects or out_stripped or _dup_n or name_dup_quarantined) else "OK"
         msg = (
             f"{_IDFW_TAG} {page} | klg_kept={klg_kept} | "
             f"klg_suspect_dropped={len(klg_suspects)}"
             f"{' (' + ', '.join(klg_suspects[:10]) + ('…' if len(klg_suspects) > 10 else '') + ')' if klg_suspects else ''}"
             f" | out_stripped={len(out_stripped)}"
             f"{' (' + ', '.join(out_stripped[:10]) + ('…' if len(out_stripped) > 10 else '') + ')' if out_stripped else ''}"
+            f" | name_dup={_dup_n}"
+            f"{' [' + '; '.join(k + 'x' + str(len(v)) for k, v in list(name_dup_groups.items())[:5]) + ']' if _dup_n else ''}"
+            f" | dedup_mode={_name_dedup_mode()}"
+            f"{' | quarantined=' + str(len(name_dup_quarantined)) if name_dup_quarantined else ''}"
+            f" | selftest={_IDFW_SELFTEST_MSG}"
         )
         details = json.dumps({
             "klg_kept": int(klg_kept),
             "klg_suspect_dropped": klg_suspects[:50],
             "out_stripped": out_stripped[:50],
+            "name_dup_groups": name_dup_groups,
+            "name_dup_quarantined": name_dup_quarantined[:50],
+            "selftest": _IDFW_SELFTEST_MSG,
             "version": SCRIPT_VERSION,
         })
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         body = {"values": [[ts, level, "run_dashboard_sync", page, status, msg, "", "", "", details]]}
-        svc.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range="'_Run_Log'!A1",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body=body,
-        ).execute()
+        _last_err = None
+        for _attempt in (1, 2):
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'_Run_Log'!A1",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body=body,
+                ).execute()
+                _last_err = None
+                break
+            except Exception as _ae:
+                _last_err = _ae
+                time.sleep(1.0)
+        if _last_err is not None:
+            raise _last_err
         logger.info(msg)
     except Exception as _e:
+        # v6.24.1 FW-3b: a tripwire's own failure must be LOUD — annotate
+        # the run page so it can never fail invisibly again.
+        print("::warning::%s _Run_Log verdict append FAILED for %s — %s: %s"
+              % (_IDFW_TAG, page, type(_e).__name__, _e))
         logger.warning("%s run-log verdict skipped: %s", _IDFW_TAG, _e)
 
 
@@ -4764,6 +4974,29 @@ async def _run_one_task(
                     logger.warning(_fw)
             except Exception as _fe:
                 logger.warning("%s outgoing firewall skipped: %s", _IDFW_TAG, _fe)
+
+        # --- v6.24.1 FW-4: name-dedup census / quarantine ------------------
+        _idfw_dup_groups: dict = {}
+        _idfw_dup_quar: list = []
+        if (task.expects_rows and rows_matrix and headers
+                and task.sheet_name in _RANKED_MARKET_PAGES):
+            rows_matrix, _idfw_dup_groups, _idfw_dup_quar = _name_dedup_apply(
+                headers, rows_matrix
+            )
+            if _idfw_dup_groups:
+                _dw = (
+                    f"{_IDFW_TAG} name_dup: {len(_idfw_dup_groups)} Name(s) on "
+                    f">= {_name_dedup_min()} symbols in the outgoing batch on "
+                    f"'{task.sheet_name}' (mode={_name_dedup_mode()}"
+                    f"{', quarantined ' + str(len(_idfw_dup_quar)) if _idfw_dup_quar else ''}). "
+                    f"Top: " + "; ".join(
+                        k + " -> " + ",".join(v[:4]) + ("…" if len(v) > 4 else "")
+                        for k, v in list(_idfw_dup_groups.items())[:3]
+                    )
+                )
+                res.warnings.append(_dw)
+                logger.warning(_dw)
+
         # --- v6.24.0 FW-3: workbook verdict line (best-effort) ------------
         if (task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES
                 and sheets is not None):
@@ -4771,6 +5004,7 @@ async def _run_one_task(
                 _append_runlog_idfirewall(
                     sheets, spreadsheet_id, task.sheet_name,
                     len(_klg_syms or []), _idfw_klg_suspects, _idfw_stripped,
+                    _idfw_dup_groups, _idfw_dup_quar,
                 )
             except Exception:
                 pass
@@ -4947,6 +5181,7 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
 
     backend = BackendClient(backend_url, timeout_sec=timeout_sec, token=token)
     sheets = SheetsWriter()
+    _idfw_selftest_()  # v6.24.1 ST-1: verify guards on fixtures before any page
 
     lock_name = f"{spreadsheet_id}:{','.join([_canon_key(t.key) for t in tasks])}"
     lock = RedisLock(lock_name, ttl_sec=600)
