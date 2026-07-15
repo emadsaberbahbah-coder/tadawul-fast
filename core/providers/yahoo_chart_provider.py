@@ -59,7 +59,17 @@ errors, NOT same-currency crossings like today's 17.32-vs-43.54
 (ratio 2.5x) — YC-1 is the fix for those; YC-3 is belt for the
 unit-class family only.
 
-Version: PROVIDER_VERSION = "8.8.0". All prior WHY blocks preserved
+Version: PROVIDER_VERSION = "8.9.0". All prior WHY blocks preserved
+
+v8.9.0 (Fix BA-0, 2026-07-15) -- CHART-META IDENTITY SURFACED
+  Shell probes proved quoteSummary/info dead from this host (info_empty in
+  0.4s for MSFT) while /v8/finance/chart answers normally -- and the chart
+  META block carries shortName/longName. This build (1) maps
+  shortName/longName into the parsed info dict and (2) exposes
+  fetch_chart_meta(symbol) as a thin, never-raising public accessor so the
+  engine's v5.118.0 identity rescue can recover names through the one door
+  Yahoo left open. Zero behavior change for existing consumers; identity is
+  additive and fill-only downstream.
 verbatim. Zero functions removed (AST-verified).
 
 v8.7.1 — RAW PREV-CLOSE SEMANTICS HOTFIX
@@ -572,7 +582,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.8.0"
+PROVIDER_VERSION = "8.9.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -965,6 +975,14 @@ def _raw_chart_parse_triple(
 
     info: Dict[str, Any] = {
         "symbol": _safe_str(meta_raw.get("symbol")) or ysym,
+        # v8.9.0 (Fix BA-0): the v8 chart meta carries the instrument's
+        # display identity. Surface it so consumers can rescue a blank name
+        # through the ONE Yahoo endpoint proven open from Render (2026-07-15:
+        # quoteSummary/info returns info_empty in 0.4s while /v8/finance/chart
+        # answers normally). Fill-only downstream; never authoritative over a
+        # provider-verified name.
+        "shortName": _safe_str(meta_raw.get("shortName")),
+        "longName": _safe_str(meta_raw.get("longName")),
         "regularMarketPrice": _safe_float(meta_raw.get("regularMarketPrice")),
         "previousClose": prev_close,
         "regularMarketPreviousClose": prev_close,
@@ -980,6 +998,24 @@ def _raw_chart_parse_triple(
     }
     info = {k: v for k, v in info.items() if v is not None}
     return info, meta_raw, history
+
+
+async def fetch_chart_meta(
+    symbol: str, range_: str = "1d", interval: str = "1d",
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """v8.9.0 (Fix BA-0): thin public accessor for the v8 chart META block
+    (shortName/longName/currency/exchangeName/...). Returns {} on ANY
+    failure -- rescue callers must never be able to break the request path.
+    Uses the same host ladder as every other raw chart fetch."""
+    try:
+        ysym = _yc_yahoo_symbol(symbol)
+        _info, meta_raw, _hist = await _raw_chart_fetch_triple(
+            ysym, range_, interval, timeout
+        )
+        return meta_raw if isinstance(meta_raw, dict) else {}
+    except Exception:
+        return {}
 
 
 async def _raw_chart_fetch_triple(
