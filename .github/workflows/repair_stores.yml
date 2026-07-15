@@ -54,7 +54,7 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
           TARGET_SHEET_ID: ${{ github.event.inputs.sheet_id != '' && github.event.inputs.sheet_id || vars.DEFAULT_SPREADSHEET_ID }}
-          REPAIR_APPLY: ${{ github.event.inputs.apply == true && '1' || '0' }}
+          REPAIR_APPLY: ${{ inputs.apply && '1' || '0' }}
           REPAIR_MAX_DELETES: ${{ github.event.inputs.max_deletes }}
         run: |
           set -euo pipefail
