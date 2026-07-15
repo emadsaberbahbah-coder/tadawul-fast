@@ -211,6 +211,45 @@ symbol|date against the daily snapshots, so no record-schema churn):
 
 Why this revision (v6.13.0 vs v6.12.0)
 --------------------------------------
+v6.21.0 -- PF-2 ADAPTIVE FALLBACK + FEED SELF-DIAGNOSIS + STARTUP SELF-TEST
+--------------------------------------------------------------------------
+EVIDENCE (v41 export + [PERF-VERDICT] lines, 2026-07-15): fallback priced
+2/583 missing at conc=8 -- the classic Yahoo datacenter-IP pattern: the
+first ~2 requests succeed, then 429/999 blocks the burst. Meanwhile the
+backend chain priced 0/585 on every run and the ONLY diagnostic (the
+[PRICE-FEED] branch line) lives in an Actions log the owner has to dig
+for; the workbook verdict said 'priced 2/585' without saying WHY.
+FIX (three cuts):
+  PF-2 ADAPTIVE THROTTLE + RETRY: fallback concurrency default drops to
+       2; a spacing delay (default 0.45s) is inserted between launches;
+       each symbol gets ONE retry on 429/999 after a jittered 3-6s
+       backoff; per-status counters (ok/429/403/timeout/other) are kept in
+       _LAST_FALLBACK_STATS. Yahoo's limiter is now respected instead of
+       tripped -- throughput rises by slowing down. ENV additions:
+       TFB_TRACK_FALLBACK_SPACING_SEC (0.45), TFB_TRACK_FALLBACK_RETRY429
+       (default ON). TFB_TRACK_FALLBACK_CONC default 8 -> 2.
+  FD-1 FEED SELF-DIAGNOSIS INTO THE WORKBOOK: the exact price-feed branch
+       (base_url empty / endpoint chain dead reason / OK) is captured in
+       _LAST_FEED_DIAGNOSIS and written into every [PERF-VERDICT] line as
+       'feed=...' plus the fallback status histogram as 'fb=...'. The
+       question 'WHY is the feed dead' is now answered inside _Run_Log
+       every run -- no Actions-log archaeology required.
+  ST-1 STARTUP SELF-TEST: _track_selftest_() proves the guards on canned
+       fixtures before recording (symbol shape guard accepts/rejects the
+       real token classes; the Yahoo payload parser handles primary/
+       fallback/garbage; the ledger header-anchor extracts exactly the
+       holdings from a replica of the live column A). Result rides in the
+       verdict as 'selftest=PASS k/k'; on failure a ::error:: annotation
+       fires and the result is recorded -- guards stay ON (their failure
+       mode is over-rejection visibility, never silent damage).
+DONE-CRITERION: next export's [PERF-VERDICT] shows feed=... (root cause
+named), fb=... histogram, selftest=PASS, and priced N/585 with N
+substantially above 2 (throttle) -- or feed=OK once the backend chain is
+revived. ZERO functions removed; additions: _fallback_spacing_sec,
+_fallback_retry429_enabled, _yahoo_fetch_one_status, _track_selftest_
+(+ counters _LAST_FALLBACK_STATS, _LAST_FEED_DIAGNOSIS,
+_TRACK_SELFTEST_MSG).
+
 v6.20.0 -- PRICE-FEED SELF-SUFFICIENCY + SYMBOL-SOURCE CONTRACT + VERDICT TRIPWIRE
 --------------------------------------------------------------------------
 EVIDENCE (v32 export, 2026-07-14 23:00 audit; run #2382 artifacts):
@@ -802,7 +841,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.20.0"
+SCRIPT_VERSION = "6.21.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -1505,7 +1544,7 @@ def _summary_block_range(n_rows: int) -> str:
 # =============================================================================
 # v6.20.0 (PF-1) -- backend-independent Yahoo chart price fallback
 # =============================================================================
-_PF_TAG = "[v6.20.0 PRICE-FALLBACK]"
+_PF_TAG = "[v6.21.0 PRICE-FALLBACK]"
 _YF_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"
 _YF_HEADERS = {
     "Accept": "application/json",
@@ -1524,12 +1563,34 @@ def _price_fallback_enabled() -> bool:
 
 
 def _fallback_conc() -> int:
-    """Concurrent Yahoo fetches (default 8, floor 1, ceiling 32)."""
+    """Concurrent Yahoo fetches (v6.21.0: default 2, floor 1, ceiling 32).
+    Evidence 2026-07-15: conc=8 from a GitHub runner yields ~2 successes
+    then a 429/999 wall; Yahoo's limiter rewards politeness."""
     try:
-        v = int((os.getenv("TFB_TRACK_FALLBACK_CONC") or "8").strip())
+        v = int((os.getenv("TFB_TRACK_FALLBACK_CONC") or "2").strip())
     except Exception:
-        v = 8
+        v = 2
     return max(1, min(32, v))
+
+
+def _fallback_spacing_sec() -> float:
+    """v6.21.0 PF-2: delay between request launches (default 0.45s)."""
+    try:
+        v = float((os.getenv("TFB_TRACK_FALLBACK_SPACING_SEC") or "0.45").strip())
+    except Exception:
+        v = 0.45
+    return max(0.0, min(5.0, v))
+
+
+def _fallback_retry429_enabled() -> bool:
+    """v6.21.0 PF-2: one jittered retry on 429/999. Default ON."""
+    return (os.getenv("TFB_TRACK_FALLBACK_RETRY429") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+# v6.21.0 telemetry read by the verdict line (single-threaded runner).
+_LAST_FALLBACK_STATS: Dict[str, int] = {}
+_LAST_FEED_DIAGNOSIS: str = "not-run"
+_TRACK_SELFTEST_MSG: str = "not-run"
 
 
 def _fallback_timeout_sec() -> float:
@@ -1594,26 +1655,41 @@ def _yahoo_fetch_one_price_sync(sym: str, timeout: float) -> float:
         return 0.0
 
 
-async def _yahoo_fetch_one_price(session: Any, sym: str, timeout: float) -> float:
-    """Async single-symbol fetch. aiohttp session when provided, else the
-    sync path in the shared executor. Returns 0.0 on any failure."""
+async def _yahoo_fetch_one_status(session: Any, sym: str, timeout: float) -> tuple:
+    """v6.21.0 PF-2: status-aware single fetch -> (price, status_class)
+    where status_class is one of ok/429/403/timeout/other. Never raises."""
     if session is not None:
         try:
             url = _YF_CHART_URL.format(sym=_yahoo_symbol(sym))
             async with session.get(url) as resp:
-                if int(resp.status) != 200:
-                    return 0.0
+                code = int(resp.status)
+                if code in (429, 999):
+                    return 0.0, "429"
+                if code == 403:
+                    return 0.0, "403"
+                if code != 200:
+                    return 0.0, "other"
                 raw = await resp.read()
-            return _yahoo_parse_chart_price(json_loads(raw))
+            px = _yahoo_parse_chart_price(json_loads(raw))
+            return (px, "ok") if px > 0 else (0.0, "other")
+        except asyncio.TimeoutError:
+            return 0.0, "timeout"
         except Exception:
-            return 0.0
+            return 0.0, "other"
     loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(
+        px = await loop.run_in_executor(
             _get_executor(), _yahoo_fetch_one_price_sync, sym, timeout
         )
+        return (px, "ok") if px > 0 else (0.0, "other")
     except Exception:
-        return 0.0
+        return 0.0, "other"
+
+
+async def _yahoo_fetch_one_price(session: Any, sym: str, timeout: float) -> float:
+    """Back-compat wrapper over the status-aware fetcher."""
+    px, _st = await _yahoo_fetch_one_status(session, sym, timeout)
+    return px
 
 
 async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
@@ -1641,17 +1717,33 @@ async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
                 headers=dict(_YF_HEADERS),
             )
 
+        stats: Dict[str, int] = {"ok": 0, "429": 0, "403": 0, "timeout": 0, "other": 0}
+        spacing = _fallback_spacing_sec()
+        retry_on = _fallback_retry429_enabled()
+        launch_lock = asyncio.Lock()
+
         async def one(s: str) -> None:
             if (time.time() - t0) > budget:
                 return
             async with sem:
                 if (time.time() - t0) > budget:
                     return
-                px = await _yahoo_fetch_one_price(session, s, timeout)
+                # v6.21.0 PF-2: serialize launch spacing so the runner
+                # never bursts past Yahoo's limiter.
+                if spacing > 0:
+                    async with launch_lock:
+                        await asyncio.sleep(spacing)
+                px, st = await _yahoo_fetch_one_status(session, s, timeout)
+                if st == "429" and retry_on and (time.time() - t0) < budget:
+                    await asyncio.sleep(3.0 + random.random() * 3.0)
+                    px, st = await _yahoo_fetch_one_status(session, s, timeout)
+                stats[st] = stats.get(st, 0) + 1
                 if px > 0:
                     out[s] = px
 
         await asyncio.gather(*(one(s) for s in syms), return_exceptions=True)
+        global _LAST_FALLBACK_STATS
+        _LAST_FALLBACK_STATS = dict(stats)
     except Exception as e:
         logger.warning("%s pass error: %s", _PF_TAG, e)
     finally:
@@ -1661,9 +1753,10 @@ async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
             except Exception:
                 pass
     logger.info(
-        "%s priced %d/%d symbol(s) in %.1fs (conc=%d, budget=%.0fs)",
+        "%s priced %d/%d symbol(s) in %.1fs (conc=%d, spacing=%.2fs, budget=%.0fs) stats=%s",
         _PF_TAG, len(out), len(syms), time.time() - t0,
-        _fallback_conc(), budget,
+        _fallback_conc(), _fallback_spacing_sec(), budget,
+        dict(_LAST_FALLBACK_STATS),
     )
     return out
 
@@ -5398,6 +5491,8 @@ class PerformanceTrackerApp:
             # records at entry price on 2026-07-12 — and would have expired the
             # whole first cohort UNPRICED. Never silent again.
             price_map: Dict[str, float] = {}
+            global _LAST_FEED_DIAGNOSIS
+            _LAST_FEED_DIAGNOSIS = "base_url_EMPTY"
             logger.error(
                 "%s backend base_url is EMPTY — %d active symbols cannot be "
                 "priced; fresh-only maturation will hold/expire the cohort. "
@@ -5407,6 +5502,7 @@ class PerformanceTrackerApp:
         else:
             price_map = await self.backend.fetch_prices(syms)
             _dead = _price_feed_dead(syms, price_map)
+            _LAST_FEED_DIAGNOSIS = ("backend_dead: " + str(_dead)[:160]) if _dead else "backend_ok"
             if _dead:
                 logger.error("%s %s — fresh-only maturation will hold/expire "
                              "affected records.", _PRICE_FEED_TAG, _dead)
@@ -5572,10 +5668,12 @@ class PerformanceTrackerApp:
             if sheet is None:
                 return
             ws = sheet.worksheet("_Run_Log")
+            _fb = getattr(sys.modules[__name__], "_LAST_FALLBACK_STATS", {}) or {}
+            _fb_s = "/".join("%s:%d" % (k, v) for k, v in _fb.items() if v) or "none"
             msg = (
                 "[PERF-VERDICT v%s] priced %d/%d | roi_nonzero %d | "
                 "fallback_filled %d | junk_rejected %d | matured %d | "
-                "pending %d | expired %d"
+                "pending %d | expired %d | feed=%s | fb=%s | selftest=%s"
                 % (
                     SCRIPT_VERSION,
                     int(st.get("priced") or 0),
@@ -5586,6 +5684,9 @@ class PerformanceTrackerApp:
                     int(st.get("matured") or 0),
                     int(st.get("pending") or 0),
                     int(st.get("expired") or 0),
+                    _LAST_FEED_DIAGNOSIS,
+                    _fb_s,
+                    _TRACK_SELFTEST_MSG,
                 )
             )
             level = (
@@ -5605,12 +5706,55 @@ class PerformanceTrackerApp:
                 "",
                 json_dumps(st),
             ]
+            st["feed"] = _LAST_FEED_DIAGNOSIS
+            st["fb_stats"] = dict(_LAST_FALLBACK_STATS)
+            st["selftest"] = _TRACK_SELFTEST_MSG
+            row[9] = json_dumps(st)
             self.store.backoff.execute_sync(
                 lambda: ws.append_row(row, value_input_option="USER_ENTERED")
             )
             logger.info("%s", msg)
         except Exception as e:
             logger.warning("[v6.20.0 VT-1] run-log verdict skipped: %s", e)
+
+    def _track_selftest_(self) -> bool:
+        """v6.21.0 ST-1: prove the guards on canned fixtures before any
+        recording. Records PASS/FAIL into the verdict; guards stay ON
+        either way (their failure mode is visible over-rejection, never
+        silent damage). Never raises."""
+        global _TRACK_SELFTEST_MSG
+        passed = 0
+        total = 6
+        try:
+            junk = ["TRUTH:", "_PORTFOLIO_COSTBASIS", "(FREEZES", "=", "\u00b7", "\u2014"]
+            good = ["1050.SR", "RCI.US", "GC=F", "^N225", "0016.HK", "DIR-UN.TO"]
+            if not any(_valid_symbol_shape(j) for j in junk):
+                passed += 1
+            if all(_valid_symbol_shape(g) for g in good):
+                passed += 1
+            colA = ["_Portfolio_CostBasis \u2014 LEDGER (source of truth)", "Status:",
+                    "BLUE = operator \u00b7 GRAY = script", "Symbol",
+                    "FER.US", "RCI.US", "1050.SR", "RCI.US"]
+            out, rej = _extract_symbols_below_header(colA)
+            if out == ["FER.US", "RCI.US", "1050.SR"] and rej == 0:
+                passed += 1
+            if _yahoo_parse_chart_price({"chart": {"result": [{"meta": {"regularMarketPrice": 33.38}}]}}) == 33.38:
+                passed += 1
+            if _yahoo_parse_chart_price({"chart": {"result": [{"meta": {"previousClose": 19.0}}]}}) == 19.0:
+                passed += 1
+            if _yahoo_parse_chart_price({}) == 0.0 and _yahoo_parse_chart_price(None) == 0.0:
+                passed += 1
+        except Exception as e:
+            _TRACK_SELFTEST_MSG = "EXC %s" % type(e).__name__
+            print("::error::[SELFTEST v6.21.0] guard self-test crashed: %s: %s" % (type(e).__name__, e))
+            return False
+        ok = (passed == total)
+        _TRACK_SELFTEST_MSG = ("PASS %d/%d" if ok else "FAIL %d/%d") % (passed, total)
+        if ok:
+            logger.info("[SELFTEST v6.21.0] %s \u2014 guards verified on fixtures.", _TRACK_SELFTEST_MSG)
+        else:
+            print("::error::[SELFTEST v6.21.0] %s \u2014 a guard fixture failed; see log." % _TRACK_SELFTEST_MSG)
+        return ok
 
     async def run_once(self) -> int:
         loop = asyncio.get_running_loop()
@@ -5662,6 +5806,7 @@ class PerformanceTrackerApp:
             if prefetched is not None:
                 await self.record_signal_snapshots(prefetched)
 
+        self._track_selftest_()  # v6.21.0 ST-1
         if self.args.audit:
             records = await self.audit_active_records(records)
             if self.store.is_available():
