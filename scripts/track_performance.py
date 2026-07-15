@@ -211,6 +211,35 @@ symbol|date against the daily snapshots, so no record-schema churn):
 
 Why this revision (v6.13.0 vs v6.12.0)
 --------------------------------------
+v6.21.1 -- PF-3 CHUNKED BACKEND FETCH (root cause of the dead feed, finally proven)
+--------------------------------------------------------------------------
+EVIDENCE (Render shell probe, 2026-07-15): POST /v1/enriched/quotes with 8
+symbols and the EXACT body this script sends -> HTTP 200, priced 8/8, NO
+token required. The endpoint works; auth was never the problem. What the
+script actually does in production: ONE request carrying ALL ~585 active
+symbols with timeout_sec=30 (then 30, then 45 on the fallbacks). A
+585-symbol enrichment pass cannot answer in 30s, so every endpoint 'fails'
+by timeout, the chain falls through to {}, and the cohort starves -- on
+every run since the record count outgrew the timeout. The tracker was
+DDOSing itself with its own ambition.
+FIX:
+  PF-3 CHUNKING: fetch_prices now walks the primary endpoint in chunks of
+       TFB_TRACK_PRICE_CHUNK symbols (default 40, floor 5, cap 150) with a
+       per-chunk timeout TFB_TRACK_PRICE_CHUNK_TIMEOUT_SEC (default 45s),
+       accumulating results; only symbols STILL missing after the primary
+       pass go to the legacy endpoint (same chunking); the heavy
+       sheet-rows fallback is retained as a last resort for the residue,
+       capped at one chunk. A single slow chunk can no longer zero the
+       whole feed.
+  FD-2 PRECISE DIAGNOSIS: every chunk failure is recorded (endpoint,
+       chunk index, code/err) into _LAST_FEED_DIAGNOSIS -- the
+       [PERF-VERDICT] 'feed=' field now names the exact first failure
+       (e.g. 'primary_timeout@chunk3 (TimeoutError)') or 'backend_ok
+       N/M via primary'. No more guessing between auth, shape and time.
+DONE-CRITERION: next [PERF-VERDICT] shows priced >= ~500/585 with
+feed=backend_ok; Yahoo fallback shrinks to the residue. ZERO functions
+removed; additions: _price_chunk_size, _price_chunk_timeout_sec.
+
 v6.21.0 -- PF-2 ADAPTIVE FALLBACK + FEED SELF-DIAGNOSIS + STARTUP SELF-TEST
 --------------------------------------------------------------------------
 EVIDENCE (v41 export + [PERF-VERDICT] lines, 2026-07-15): fallback priced
@@ -841,7 +870,7 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.21.0"
+SCRIPT_VERSION = "6.21.1"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -1585,6 +1614,24 @@ def _fallback_spacing_sec() -> float:
 def _fallback_retry429_enabled() -> bool:
     """v6.21.0 PF-2: one jittered retry on 429/999. Default ON."""
     return (os.getenv("TFB_TRACK_FALLBACK_RETRY429") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _price_chunk_size() -> int:
+    """v6.21.1 PF-3: symbols per backend price request (default 40)."""
+    try:
+        v = int((os.getenv("TFB_TRACK_PRICE_CHUNK") or "40").strip())
+    except Exception:
+        v = 40
+    return max(5, min(150, v))
+
+
+def _price_chunk_timeout_sec() -> float:
+    """v6.21.1 PF-3: per-chunk timeout (default 45s, floor 10)."""
+    try:
+        v = float((os.getenv("TFB_TRACK_PRICE_CHUNK_TIMEOUT_SEC") or "45").strip())
+    except Exception:
+        v = 45.0
+    return max(10.0, v)
 
 
 # v6.21.0 telemetry read by the verdict line (single-threaded runner).
@@ -2617,95 +2664,98 @@ class BackendClient:
         if not syms:
             return {}
 
-        # v6.4.0: preferred canonical endpoint — /v1/enriched/quotes
-        # (same one used by run_market_scan v5.3.0).
-        data, err, code = await self.post_json(
-            _QUOTES_ENDPOINT_PRIMARY,
-            {"symbols": syms, "format": "items", "include_raw": False, "debug": False},
-            timeout_sec=30.0,
-        )
-        if isinstance(data, dict) and code == 200 and not err:
-            rows = _extract_rows_from_envelope(data)
-            if rows:
-                out: Dict[str, float] = {}
-                for r in rows:
-                    sym = _safe_str(r.get("symbol")).upper()
-                    price = _safe_float(
-                        r.get("current_price")
-                        or r.get("price")
-                        or r.get("last")
-                        or r.get("last_price"),
-                        default=0.0,
-                    )
-                    if sym and price > 0:
-                        out[sym] = price
-                if out:
-                    return out
-            # shape 2: {"data": {SYM: {...}}}
-            blob = data.get("data") if isinstance(data.get("data"), dict) else None
-            if isinstance(blob, dict):
-                out = {}
-                for k, v in blob.items():
-                    if isinstance(v, dict):
-                        p = (
-                            v.get("current_price")
-                            or v.get("price")
-                            or v.get("last")
-                            or v.get("last_price")
-                        )
-                        fv = _safe_float(p, default=0.0)
-                        if fv > 0:
-                            out[str(k).upper()] = fv
-                if out:
-                    return out
+        # v6.21.1 PF-3: CHUNKED endpoint chain. Evidence 2026-07-15: the
+        # endpoint answers 8 symbols instantly, but this method used to send
+        # ALL ~585 in ONE 30s request -- guaranteed timeout, guaranteed {}.
+        out: Dict[str, float] = {}
+        chunk_n = _price_chunk_size()
+        chunk_to = _price_chunk_timeout_sec()
+        global _LAST_FEED_DIAGNOSIS
+        _first_fail = ""
 
-        # Legacy /quotes endpoint
-        data, err, code = await self.post_json(
-            _QUOTES_ENDPOINT_LEGACY,
-            {"symbols": syms, "include_raw": False},
-            timeout_sec=30.0,
-        )
-        if isinstance(data, dict) and code == 200 and not err:
-            blob = data.get("data") if isinstance(data.get("data"), dict) else data
-            if isinstance(blob, dict):
-                out = {}
-                for k, v in blob.items():
-                    if isinstance(v, dict):
-                        p = (
-                            v.get("current_price")
-                            or v.get("price")
-                            or v.get("last")
-                            or v.get("last_price")
-                        )
-                        fv = _safe_float(p, default=0.0)
-                        if fv > 0:
-                            out[str(k).upper()] = fv
-                if out:
-                    return out
-
-        # /v1/enriched/sheet-rows fallback
-        data, err, code = await self.post_json(
-            _SHEET_ROWS_ENRICHED,
-            {
-                "page": "Global_Markets",
-                "symbols": syms,
-                "include_matrix": False,
-                "top_n": len(syms),
-            },
-            timeout_sec=45.0,
-        )
-        if isinstance(data, dict) and code == 200 and not err:
-            rows = _extract_rows_from_envelope(data)
-            out = {}
-            for r in rows:
+        def _absorb_rows(rows: Any) -> None:
+            for r in rows or []:
+                if not isinstance(r, dict):
+                    continue
                 sym = _safe_str(r.get("symbol")).upper()
                 price = _safe_float(
-                    r.get("current_price") or r.get("price"), default=0.0
+                    r.get("current_price")
+                    or r.get("price")
+                    or r.get("last")
+                    or r.get("last_price"),
+                    default=0.0,
                 )
-                if sym and price > 0:
+                if sym and price > 0 and sym not in out:
                     out[sym] = price
-            if out:
-                return out
+
+        def _absorb_map(blob: Any) -> None:
+            if not isinstance(blob, dict):
+                return
+            for k, v in blob.items():
+                if isinstance(v, dict):
+                    fv = _safe_float(
+                        v.get("current_price")
+                        or v.get("price")
+                        or v.get("last")
+                        or v.get("last_price"),
+                        default=0.0,
+                    )
+                    if fv > 0 and str(k).upper() not in out:
+                        out[str(k).upper()] = fv
+
+        # --- pass 1: primary /v1/enriched/quotes, chunked -----------------
+        for ci in range(0, len(syms), chunk_n):
+            chunk = syms[ci:ci + chunk_n]
+            data, err, code = await self.post_json(
+                _QUOTES_ENDPOINT_PRIMARY,
+                {"symbols": chunk, "format": "items",
+                 "include_raw": False, "debug": False},
+                timeout_sec=chunk_to,
+            )
+            if isinstance(data, dict) and code == 200 and not err:
+                _absorb_rows(_extract_rows_from_envelope(data))
+                _absorb_map(data.get("data") if isinstance(data.get("data"), dict) else None)
+            elif not _first_fail:
+                _first_fail = "primary@chunk%d (HTTP %s: %s)" % (
+                    ci // chunk_n + 1, code, _safe_str(err)[:90])
+
+        # --- pass 2: legacy /quotes for whatever is still missing ---------
+        missing = [x for x in syms if x not in out]
+        if missing:
+            for ci in range(0, len(missing), chunk_n):
+                chunk = missing[ci:ci + chunk_n]
+                data, err, code = await self.post_json(
+                    _QUOTES_ENDPOINT_LEGACY,
+                    {"symbols": chunk, "include_raw": False},
+                    timeout_sec=chunk_to,
+                )
+                if isinstance(data, dict) and code == 200 and not err:
+                    _absorb_map(data.get("data") if isinstance(data.get("data"), dict) else data)
+                elif not _first_fail:
+                    _first_fail = "legacy@chunk%d (HTTP %s: %s)" % (
+                        ci // chunk_n + 1, code, _safe_str(err)[:90])
+
+        # --- pass 3: heavy sheet-rows, ONE capped chunk of the residue ----
+        missing = [x for x in syms if x not in out]
+        if missing:
+            data, err, code = await self.post_json(
+                _SHEET_ROWS_ENRICHED,
+                {"page": "Global_Markets", "symbols": missing[:chunk_n],
+                 "include_matrix": False, "top_n": min(len(missing), chunk_n)},
+                timeout_sec=chunk_to,
+            )
+            if isinstance(data, dict) and code == 200 and not err:
+                _absorb_rows(_extract_rows_from_envelope(data))
+            elif not _first_fail:
+                _first_fail = "sheetrows (HTTP %s: %s)" % (code, _safe_str(err)[:90])
+
+        _LAST_FEED_DIAGNOSIS = (
+            "backend_ok %d/%d via chunked chain" % (len(out), len(syms))
+            if out else
+            ("backend_dead: " + (_first_fail or "all endpoints empty"))
+        )
+        if out:
+            return out
 
         # /v1/analysis/sheet-rows fallback
         data, err, code = await self.post_json(
@@ -5502,7 +5552,8 @@ class PerformanceTrackerApp:
         else:
             price_map = await self.backend.fetch_prices(syms)
             _dead = _price_feed_dead(syms, price_map)
-            _LAST_FEED_DIAGNOSIS = ("backend_dead: " + str(_dead)[:160]) if _dead else "backend_ok"
+            if _dead and not str(_LAST_FEED_DIAGNOSIS).startswith("backend_dead"):
+                _LAST_FEED_DIAGNOSIS = "backend_dead: " + str(_dead)[:160]
             if _dead:
                 logger.error("%s %s — fresh-only maturation will hold/expire "
                              "affected records.", _PRICE_FEED_TAG, _dead)
