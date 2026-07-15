@@ -68,7 +68,43 @@ restores v5.116.0 byte-identical behavior. TFB_ENGINE_FUND_LKG_TTL_H
 (default 72, floor 1), TFB_ENGINE_FUND_LKG_MIN_FIELDS (default 8, floor 3,
 ceiling 24), TFB_ENGINE_FUND_LKG_MAX (default 20000, floor 100). No Render
 ENV action is required to arm this fix.
-Version: __version__ = "5.117.0". All prior WHYs preserved verbatim.
+Version: __version__ = "5.118.0". All prior WHYs preserved verbatim.
+
+WHY v5.118.0 - IDENTITY RESCUE (Fix BA): chart-meta name + static-map belt
+---------------------------------------------------------------------------
+EVIDENCE (Render shell probes #3/#4, 2026-07-15): the fundamentals provider
+answers in 0.4s with info_empty + history_empty for MSFT itself -- Yahoo's
+crumb-gated quoteSummary path is refusing this host outright -- while the
+v8 chart endpoint on the SAME box verifies prices normally. Result: every
+analysis row ships name=None + name_unresolved (MSFT, GOOG, 2222.SR
+included), reliability collapses to the degraded templates, and the pages'
+poisoned names survive as archaeology because nothing healthy ever arrives
+to replace them. The enriched route already carries a static-name belt
+(core/enriched_quote v4.9.0 position 5b); the analysis pipeline that feeds
+every page sync has NO name path at all once quoteSummary dies.
+FIX -- _apply_identity_rescue(), run at the END of the Yahoo enrichment
+pass, STRICTLY FILL-ONLY (a non-blank name is never touched, prices never
+touched), each step provenance-tagged:
+  BA-1 CHART-META NAME: when the row's name is blank, fetch the v8 chart
+       meta via yahoo_chart_provider.fetch_chart_meta (new v8.9.0 public
+       accessor) and fill name from longName/shortName -- the working
+       endpoint carries the identity we lost. Blank exchange/currency are
+       filled from the same meta. Tags: name_from_chart_meta,
+       identity_from_chart_meta.
+  BA-2 STATIC-MAP BELT: if still blank, consult the SAME operator map the
+       enriched route honors -- ENV TFB_STATIC_NAME_MAP
+       ("SYM=Name;SYM2=Name2"; parsed once per process) -- so one env
+       entry names a symbol on BOTH routes. No hardcoded seed here: the
+       engine ships an EMPTY seed on purpose (a name this engine cannot
+       verify is a name it must not invent). Tag: name_static_fallback.
+ENV: TFB_ENGINE_IDENTITY_RESCUE default ON (=0 restores v5.117.0
+byte-identically); TFB_STATIC_NAME_MAP shared with enriched_quote;
+TFB_STATIC_NAME_FALLBACK honored for BA-2.
+DONE-CRITERION: analysis probe rows for MSFT/GOOG/2222.SR carry real names
+with a name_from_chart_meta tag; name_unresolved count collapses on the
+next export; after repair APPLY the page anchors converge and STAY.
+New: _identity_rescue_enabled, _engine_static_name_map,
+_apply_identity_rescue (+ _ENGINE_STATIC_MAP_CACHE). ZERO removals.
 Zero functions removed; additions: _fund_lkg_enabled, _fund_lkg_ttl_h,
 _fund_lkg_min_fields, _fund_lkg_max_symbols, _fund_lkg_present_count,
 _fund_lkg_row_tainted, _fund_lkg_capture, _fund_lkg_restore,
@@ -2773,7 +2809,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.117.0"
+__version__ = "5.118.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4590,6 +4626,47 @@ _TRUST_LOW_TAG = "low_data_trust"
 # for a real-but-unnamed instrument, and this tag never demotes. Substring-safe
 # for the reliability scan (no cap/forecast/target/roi/drop/reject).
 _NAME_UNRESOLVED_TAG = "name_unresolved"
+
+# =============================================================================
+# v5.118.0 (Fix BA) -- identity rescue: chart-meta name + static-map belt
+# =============================================================================
+_ENGINE_STATIC_MAP_CACHE: Optional[Dict[str, str]] = None
+
+
+def _identity_rescue_enabled() -> bool:
+    """v5.118.0 (Fix BA): fill-only name/identity rescue at the end of the
+    Yahoo enrichment pass. Default ON -- the live failure class (universal
+    name_unresolved while the chart endpoint holds the identity) violates
+    it. TFB_ENGINE_IDENTITY_RESCUE=0/false/off/no restores v5.117.0."""
+    return (os.getenv("TFB_ENGINE_IDENTITY_RESCUE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _engine_static_name_map() -> Dict[str, str]:
+    """v5.118.0 (Fix BA-2): operator name map, shared ENV with
+    core/enriched_quote v4.9.0 (TFB_STATIC_NAME_MAP, "SYM=Name;..."), gated
+    by the same TFB_STATIC_NAME_FALLBACK kill-switch. Parsed once per
+    process; malformed segments skipped. Engine seed is deliberately EMPTY:
+    a name this engine cannot verify is a name it must not invent."""
+    global _ENGINE_STATIC_MAP_CACHE
+    if _ENGINE_STATIC_MAP_CACHE is not None:
+        return _ENGINE_STATIC_MAP_CACHE
+    out: Dict[str, str] = {}
+    try:
+        if (os.getenv("TFB_STATIC_NAME_FALLBACK") or "1").strip().lower() not in {"0", "false", "off", "no"}:
+            raw = os.getenv("TFB_STATIC_NAME_MAP", "") or ""
+            for seg in raw.split(";"):
+                if "=" not in seg:
+                    continue
+                k, v = seg.split("=", 1)
+                k = k.strip().upper()
+                v = v.strip()
+                if k and v:
+                    out[k] = v
+    except Exception:
+        out = {}
+    _ENGINE_STATIC_MAP_CACHE = out
+    return out
+
 
 
 def _name_unresolved_tag_enabled() -> bool:
@@ -12970,6 +13047,66 @@ class DataEngineV5:
                 if filtered:
                     row = self._merge(row, filtered)
                     _append_yahoo_warning_tag(row, "yahoo_chart_enrichment_applied")
+
+        # v5.118.0 (Fix BA): identity rescue -- runs after BOTH passes so a
+        # provider-verified name always wins; strictly fill-only.
+        row = await self._apply_identity_rescue(row, symbol)
+        return row
+
+    async def _apply_identity_rescue(self, row: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+        """v5.118.0 (Fix BA): fill a BLANK name (never overwrite) from
+        (BA-1) the v8 chart meta -- the one Yahoo surface proven reachable
+        from this host -- then (BA-2) the operator static map. Blank
+        exchange/currency piggyback on BA-1. Every fill is provenance-
+        tagged. Never touches price. Never raises."""
+        try:
+            if not _identity_rescue_enabled():
+                return row
+            if not isinstance(row, dict):
+                return row
+            if _safe_str(row.get("name")).strip():
+                return row
+            sym = _safe_str(row.get("symbol") or row.get("requested_symbol") or symbol).strip().upper()
+            if not sym:
+                return row
+
+            # ---- BA-1: chart meta ----------------------------------------
+            try:
+                mod = _import_yahoo_provider_module("yahoo_chart_provider")
+                fn = _pick_provider_callable(mod, "fetch_chart_meta") if mod is not None else None
+                if fn is not None:
+                    meta = await fn(sym)
+                    if isinstance(meta, dict) and meta:
+                        nm = _safe_str(
+                            meta.get("longName") or meta.get("shortName") or meta.get("displayName")
+                        ).strip()
+                        if nm:
+                            row["name"] = nm
+                            _append_yahoo_warning_tag(row, "name_from_chart_meta")
+                        _filled_other = False
+                        if not _safe_str(row.get("exchange")).strip():
+                            ex = _safe_str(meta.get("fullExchangeName") or meta.get("exchangeName")).strip()
+                            if ex:
+                                row["exchange"] = ex
+                                _filled_other = True
+                        if not _safe_str(row.get("currency")).strip():
+                            cc = _safe_str(meta.get("currency")).strip()
+                            if cc:
+                                row["currency"] = cc
+                                _filled_other = True
+                        if _filled_other:
+                            _append_yahoo_warning_tag(row, "identity_from_chart_meta")
+            except Exception:
+                pass
+
+            # ---- BA-2: operator static map --------------------------------
+            if not _safe_str(row.get("name")).strip():
+                nm = _engine_static_name_map().get(sym, "")
+                if nm:
+                    row["name"] = nm
+                    _append_yahoo_warning_tag(row, "name_static_fallback")
+        except Exception:
+            return row
         return row
 
     async def _fetch_eodhd_fundamentals_patch(self, symbol: str, page: str = "") -> Dict[str, Any]:
