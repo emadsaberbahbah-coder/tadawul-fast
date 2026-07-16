@@ -2,10 +2,34 @@
 """
 core/symbols_reader.py
 ================================================================================
-TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v8.4.0)
+TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v8.5.0)
 ================================================================================
 RENDER-ALIGNED | ENGINE-COMPATIBLE | SETTINGS-AWARE | SCHEMA-AWARE
 ASYNC-SAFE | CACHE-SAFE
+
+Why this revision (v8.5.0)  [rebuilt directly on live v8.4.3 — all 8.4.1/8.4.2/
+8.4.3 fixes carried verbatim]
+- ✅ FIX (data-integrity, 1/2): PAGE_REGISTRY's max_rows came from a hardcoded
+  PageSpec dataclass default (5000) for every registered page; the
+  TFB_SYMBOL_MAX_ROWS env var never reached them (ad-hoc sheets only). After
+  the 2026-07 universe expansion (Global_Markets -> 6,512 data rows,
+  Mutual_Funds -> 4,496), discovery silently truncated Global_Markets by
+  ~1,512 symbols. Each market page now has its own env-tunable cap:
+  TFB_PAGE_MAX_ROWS_MARKET_LEADERS (3000) / _GLOBAL_MARKETS (10000) /
+  _COMMODITIES_FX (2000) / _MUTUAL_FUNDS (8000), all with headroom above
+  current sheet counts.
+- ✅ FIX (data-integrity, 2/2): the engine-compatible wrappers
+  (get_symbols_for_sheet_async + aliases + SymbolsReader methods) declared
+  `limit: int = 5000` and sliced `[:limit]` — a SECOND independent 5,000
+  truncation that survives the max_rows fix whenever the caller omits limit.
+  Signature defaults are now 0 (= "use module default"); the single slice
+  site resolves via _effective_wrapper_limit(): explicit positive limits
+  behave exactly as before; unspecified limits use env-tunable
+  TFB_SYMBOLS_DEFAULT_LIMIT (default 20000, sized above the full 12,486
+  universe).
+- ✅ Both behaviors gated by ONE kill-switch, TFB_SYMBOLS_PAGE_CAP_V2
+  (default ON). Setting it to 0 restores the exact legacy 5000 caps
+  everywhere (registry max_rows AND wrapper default) for instant rollback.
 
 Why this revision (v8.4.3)
 - ✅ FIX (QUOTA): _resolve_actual_sheet_names queried nonexistent alias tabs
@@ -114,7 +138,7 @@ from typing import (
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "8.4.3"
+SCRIPT_VERSION = "8.5.0"
 
 
 # ---------------------------------------------------------------------------
@@ -642,8 +666,79 @@ class Config:
     LOG_DETECTION = coerce_bool(os.getenv("TFB_SYMBOLS_LOG_DETECTION"), True)
     LOG_PERFORMANCE = coerce_bool(os.getenv("TFB_SYMBOLS_LOG_PERFORMANCE"), True)
 
+    # -------------------------------------------------------------------
+    # v8.5.0 — Row-cap / limit fix (two silent truncation points)
+    # WHY (1/2, max_rows): PageSpec.max_rows defaulted to a hardcoded 5000
+    # for every PAGE_REGISTRY entry, and TFB_SYMBOL_MAX_ROWS never reached
+    # these registered pages — it only fed the ad-hoc/unregistered-sheet
+    # path (_build_adhoc_spec). After the 2026-07 universe expansion
+    # (Global_Markets -> 6,512 data rows, Mutual_Funds -> 4,496), the
+    # 5000-row cap silently truncated Global_Markets reads by ~1,512
+    # symbols per discovery.
+    # WHY (2/2, wrapper limit): every engine-compatible wrapper
+    # (get_symbols_for_sheet_async and its aliases, plus the SymbolsReader
+    # methods) declared `limit: int = 0` and sliced `[:limit]` — a
+    # SECOND, independent 5000 truncation that survives any max_rows fix
+    # for callers that don't pass an explicit limit.
+    # FIX: per-page env-tunable caps with headroom above current counts,
+    # plus an env-tunable wrapper default limit sized above the full
+    # 12,486-symbol universe. Both behaviors are gated by ONE kill-switch,
+    # TFB_SYMBOLS_PAGE_CAP_V2 (default ON); setting it to 0 restores the
+    # exact legacy 5000 caps everywhere for instant rollback.
+    # -------------------------------------------------------------------
+    PAGE_CAP_V2_ENABLED = coerce_bool(os.getenv("TFB_SYMBOLS_PAGE_CAP_V2"), True)
+
+    PAGE_MAX_ROWS_MARKET_LEADERS = get_env_int("TFB_PAGE_MAX_ROWS_MARKET_LEADERS", 3000, lo=100, hi=200000)
+    PAGE_MAX_ROWS_GLOBAL_MARKETS = get_env_int("TFB_PAGE_MAX_ROWS_GLOBAL_MARKETS", 10000, lo=100, hi=200000)
+    PAGE_MAX_ROWS_COMMODITIES_FX = get_env_int("TFB_PAGE_MAX_ROWS_COMMODITIES_FX", 2000, lo=100, hi=200000)
+    PAGE_MAX_ROWS_MUTUAL_FUNDS = get_env_int("TFB_PAGE_MAX_ROWS_MUTUAL_FUNDS", 8000, lo=100, hi=200000)
+    # Fallback cap for any future registered page without its own var.
+    PAGE_MAX_ROWS_DEFAULT = get_env_int("TFB_PAGE_MAX_ROWS_DEFAULT", 8000, lo=100, hi=200000)
+
+    # Effective wrapper limit when the caller does not pass one (or passes
+    # 0/None). Sized above the full expanded universe (12,486) w/ headroom.
+    WRAPPER_DEFAULT_LIMIT = get_env_int("TFB_SYMBOLS_DEFAULT_LIMIT", 20000, lo=100, hi=500000)
+
 
 config = Config()
+
+
+# Legacy wrapper default, preserved verbatim for the kill-switch path.
+_LEGACY_WRAPPER_LIMIT = 5000
+
+
+def _registry_max_rows(explicit_cap: int) -> int:
+    """
+    Resolve the max_rows a PAGE_REGISTRY entry should use.
+
+    v2 (default ON): the page's env-tunable cap (headroom above current
+    known sheet counts).
+    v1 (legacy, TFB_SYMBOLS_PAGE_CAP_V2=0): the original hardcoded 5000
+    for every page, for instant rollback.
+    """
+    if config.PAGE_CAP_V2_ENABLED:
+        return explicit_cap
+    return 5000
+
+
+def _effective_wrapper_limit(limit: Any) -> int:
+    """
+    Resolve the slice limit for the engine-compatible wrappers.
+
+    An explicit positive limit from the caller ALWAYS wins (unchanged
+    behavior). When the caller passes nothing / 0 / None, v2 uses the
+    env-tunable WRAPPER_DEFAULT_LIMIT; the kill-switch path restores the
+    legacy hardcoded 5000 exactly.
+    """
+    try:
+        v = int(limit) if limit is not None else 0
+    except Exception:
+        v = 0
+    if v > 0:
+        return v
+    if config.PAGE_CAP_V2_ENABLED:
+        return config.WRAPPER_DEFAULT_LIMIT
+    return _LEGACY_WRAPPER_LIMIT
 
 
 # =============================================================================
@@ -655,6 +750,7 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
         sheet_names=("Market_Leaders", "Market Leaders", "Leaders"),
         header_candidates=("SYMBOL", "TICKER", "CODE", "TRADING SYMBOL", "SECURITY CODE"),
         symbol_type=SymbolType.GLOBAL,
+        max_rows=_registry_max_rows(config.PAGE_MAX_ROWS_MARKET_LEADERS),
         description="Market leaders list (single source of truth for symbols).",
         required=True,
     ),
@@ -663,6 +759,7 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
         sheet_names=("Global_Markets", "Global Markets", "World Markets"),
         header_candidates=("SYMBOL", "TICKER", "CODE", "PAIR"),
         symbol_type=SymbolType.GLOBAL,
+        max_rows=_registry_max_rows(config.PAGE_MAX_ROWS_GLOBAL_MARKETS),
         description="Global markets / indices / shares.",
     ),
     "COMMODITIES_FX": PageSpec(
@@ -670,6 +767,7 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
         sheet_names=("Commodities_FX", "Commodities & FX", "FX & Commodities"),
         header_candidates=("SYMBOL", "TICKER", "PAIR", "COMMODITY", "INSTRUMENT"),
         symbol_type=SymbolType.COMMODITY,
+        max_rows=_registry_max_rows(config.PAGE_MAX_ROWS_COMMODITIES_FX),
         description="Commodities and FX symbols.",
     ),
     "MUTUAL_FUNDS": PageSpec(
@@ -677,6 +775,7 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
         sheet_names=("Mutual_Funds", "Mutual Funds", "Funds"),
         header_candidates=("SYMBOL", "TICKER", "FUND", "CODE"),
         symbol_type=SymbolType.MUTUAL_FUND,
+        max_rows=_registry_max_rows(config.PAGE_MAX_ROWS_MUTUAL_FUNDS),
         description="Mutual fund tickers/symbols.",
     ),
     "MY_PORTFOLIO": PageSpec(
@@ -1740,7 +1839,7 @@ async def get_universe_async(
 async def get_symbols_for_sheet_async(
     sheet: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     page: Optional[str] = None,
     sheet_name: Optional[str] = None,
     tab: Optional[str] = None,
@@ -1756,13 +1855,18 @@ async def get_symbols_for_sheet_async(
         settings=settings,
     )
     syms = result.get("all") or result.get("symbols") or []
-    return list(syms)[: max(1, int(limit or 5000))]
+    # WHY (v8.5.0): `limit or 5000` silently truncated any default-limit call
+    # at 5,000 symbols — independently of PageSpec.max_rows — which caps
+    # Global_Markets (6,512) even after the registry fix. Explicit positive
+    # limits behave exactly as before; only the "caller didn't specify"
+    # default changes (env-tunable, kill-switch restores legacy 5000).
+    return list(syms)[: max(1, _effective_wrapper_limit(limit))]
 
 
 async def read_symbols_for_sheet_async(
     sheet: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -1778,7 +1882,7 @@ async def read_symbols_for_sheet_async(
 async def get_sheet_symbols_async(
     sheet: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -1794,7 +1898,7 @@ async def get_sheet_symbols_async(
 async def get_symbols_for_page_async(
     page: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     sheet: Optional[str] = None,
     settings: Any = None,
     **kwargs: Any,
@@ -1811,7 +1915,7 @@ async def get_symbols_for_page_async(
 async def list_symbols_for_page_async(
     page: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     sheet: Optional[str] = None,
     settings: Any = None,
     **kwargs: Any,
@@ -1830,7 +1934,7 @@ async def get_symbols_async(
     sheet: Optional[str] = None,
     page: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -1847,7 +1951,7 @@ async def list_symbols_async(
     sheet: Optional[str] = None,
     page: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -1908,7 +2012,7 @@ def get_universe(
 def get_symbols_for_sheet(
     sheet: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -1926,7 +2030,7 @@ def get_symbols_for_sheet(
 def read_symbols_for_sheet(
     sheet: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -1944,7 +2048,7 @@ def read_symbols_for_sheet(
 def get_sheet_symbols(
     sheet: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -1962,7 +2066,7 @@ def get_sheet_symbols(
 def get_symbols_for_page(
     page: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -1980,7 +2084,7 @@ def get_symbols_for_page(
 def list_symbols_for_page(
     page: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -1999,7 +2103,7 @@ def get_symbols(
     sheet: Optional[str] = None,
     page: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -2019,7 +2123,7 @@ def list_symbols(
     sheet: Optional[str] = None,
     page: Optional[str] = None,
     spreadsheet_id: Optional[str] = None,
-    limit: int = 5000,
+    limit: int = 0,
     settings: Any = None,
     **kwargs: Any,
 ) -> List[str]:
@@ -2054,7 +2158,7 @@ class SymbolsReader:
         self.settings = settings
         self.spreadsheet_id = strip_value(spreadsheet_id) or _default_spreadsheet_id(settings)
 
-    async def get_symbols_for_sheet(self, sheet: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+    async def get_symbols_for_sheet(self, sheet: Optional[str] = None, limit: int = 0, **kwargs: Any) -> List[str]:
         return await get_symbols_for_sheet_async(
             sheet=sheet,
             spreadsheet_id=self.spreadsheet_id,
@@ -2063,7 +2167,7 @@ class SymbolsReader:
             **kwargs,
         )
 
-    async def read_symbols_for_sheet(self, sheet: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+    async def read_symbols_for_sheet(self, sheet: Optional[str] = None, limit: int = 0, **kwargs: Any) -> List[str]:
         return await read_symbols_for_sheet_async(
             sheet=sheet,
             spreadsheet_id=self.spreadsheet_id,
@@ -2072,7 +2176,7 @@ class SymbolsReader:
             **kwargs,
         )
 
-    async def get_sheet_symbols(self, sheet: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+    async def get_sheet_symbols(self, sheet: Optional[str] = None, limit: int = 0, **kwargs: Any) -> List[str]:
         return await get_sheet_symbols_async(
             sheet=sheet,
             spreadsheet_id=self.spreadsheet_id,
@@ -2081,7 +2185,7 @@ class SymbolsReader:
             **kwargs,
         )
 
-    async def get_symbols_for_page(self, page: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+    async def get_symbols_for_page(self, page: Optional[str] = None, limit: int = 0, **kwargs: Any) -> List[str]:
         return await get_symbols_for_page_async(
             page=page,
             spreadsheet_id=self.spreadsheet_id,
@@ -2090,7 +2194,7 @@ class SymbolsReader:
             **kwargs,
         )
 
-    async def list_symbols_for_page(self, page: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+    async def list_symbols_for_page(self, page: Optional[str] = None, limit: int = 0, **kwargs: Any) -> List[str]:
         return await list_symbols_for_page_async(
             page=page,
             spreadsheet_id=self.spreadsheet_id,
@@ -2099,7 +2203,7 @@ class SymbolsReader:
             **kwargs,
         )
 
-    async def get_symbols(self, sheet: Optional[str] = None, page: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+    async def get_symbols(self, sheet: Optional[str] = None, page: Optional[str] = None, limit: int = 0, **kwargs: Any) -> List[str]:
         return await get_symbols_async(
             sheet=sheet,
             page=page,
@@ -2109,7 +2213,7 @@ class SymbolsReader:
             **kwargs,
         )
 
-    async def list_symbols(self, sheet: Optional[str] = None, page: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+    async def list_symbols(self, sheet: Optional[str] = None, page: Optional[str] = None, limit: int = 0, **kwargs: Any) -> List[str]:
         return await list_symbols_async(
             sheet=sheet,
             page=page,
