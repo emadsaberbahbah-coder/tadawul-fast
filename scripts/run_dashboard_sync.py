@@ -7,6 +7,32 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.23.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.24.2 fix — HEAL-FIRST ROTATION (Fix HF-1): blank-name rows jump the queue
+--------------------------------------------------------------------------
+EVIDENCE (v42 export, 2026-07-16 morning): the 2026-07-15 repair correctly
+stubbed 2,539 identity-corrupt Global_Markets rows (+571 ML). The sync
+reads its symbol list back from the page in SHEET ORDER and caps it
+(TFB_SYNC_MAX_SYMBOLS_MARKET, default 2500), so each leg spends its whole
+budget walking the catalog from the top — healthy rows and stubs alike —
+and only ~925 stub rows were revisited in a full day of legs. At that
+pace the page needs ~3 more days to converge, and (latent, now visible)
+the 1,262 GM symbols beyond the 2,500 cap in a 3,762-row page would sit
+at the queue's tail indefinitely. The rotation is fair; healing needs it
+to be UNFAIR in the stubs' favor.
+FIX — _read_existing_page_symbols now also reads the Name column (already
+inside the A1:E5000 block it fetches — zero extra API calls), and, when
+TFB_SYNC_HEAL_FIRST is on (DEFAULT), stably partitions the symbol list
+BLANK-NAME-FIRST before the max_symbols cap is applied. Every repaired
+stub therefore lands inside the very next leg's slice; healthy rows keep
+their relative order behind them and resume normal rotation once the
+blanks are gone (steady-state behavior identical to v6.24.1, since a
+healthy page has ~zero blanks). Telemetry: one
+[HEAL-FIRST v6.24.2] '<page>: prioritized N blank-name symbol(s) of M'
+logger line whenever the partition moved anything.
+ENV: TFB_SYNC_HEAL_FIRST default ON; =0/false/off/no restores the
+v6.24.1 sheet-order read byte-identically. New helper:
+_heal_first_enabled. ZERO functions removed; all prior WHYs preserved.
+
 v6.24.1 fix — SELF-DIAGNOSIS LAYER: FW-3 LOUD-FAILURE, FW-4 NAME-DEDUP CENSUS, STARTUP SELF-TEST
 --------------------------------------------------------------------------
 EVIDENCE (v41 morning export, 2026-07-15 audit):
@@ -976,7 +1002,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.24.1"
+SCRIPT_VERSION = "6.24.2"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2528,6 +2554,14 @@ def _market_readback_pages() -> set:
     return {_guard_norm(p) for p in pages}
 
 
+def _heal_first_enabled() -> bool:
+    """v6.24.2 (HF-1): put blank-name (repaired/stub) rows at the FRONT of a
+    market page's refresh order so the sync's per-leg budget heals damage
+    before re-polishing healthy rows. Default ON; TFB_SYNC_HEAL_FIRST=0/
+    false/off/no restores the v6.24.1 sheet-order read byte-identically."""
+    return (os.getenv("TFB_SYNC_HEAL_FIRST") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
 def _read_existing_page_symbols(
     sheets: "SheetsWriter",
     spreadsheet_id: str,
@@ -2565,6 +2599,45 @@ def _read_existing_page_symbols(
             break
     if sym_i < 0:
         return []
+
+    # v6.24.2 (HF-1): heal-first partition. The Name column lives inside the
+    # same A1:E5000 block we already hold, so prioritizing blank-name rows
+    # costs nothing. Partition happens BEFORE the cap so every stub fits in
+    # the very next leg's slice; the kill-switch path below preserves the
+    # v6.24.1 single-pass capped read byte-identically.
+    name_i = _guard_find_col(
+        grid[hdr_r] if isinstance(grid[hdr_r], list) else [],
+        _GUARD_NAME_ALIASES,
+    )
+    if _heal_first_enabled() and name_i >= 0:
+        blanks: List[str] = []
+        named: List[str] = []
+        seen: set = set()
+        for row in grid[hdr_r + 1:]:
+            if not isinstance(row, list) or sym_i >= len(row):
+                continue
+            raw = row[sym_i]
+            if _guard_is_blank(raw):
+                continue
+            t = str(raw).strip().upper()
+            if not t or t in {"SYMBOL", "TICKER"}:
+                continue
+            if t in seen:
+                continue
+            seen.add(t)
+            nm = row[name_i] if name_i < len(row) else ""
+            (blanks if _guard_is_blank(nm) else named).append(t)
+        if blanks:
+            logger.info(
+                "[HEAL-FIRST v6.24.2] %s: prioritized %d blank-name symbol(s) "
+                "of %d — repaired stubs jump the refresh queue.",
+                sheet_name, len(blanks), len(blanks) + len(named),
+            )
+        out = blanks + named
+        if max_symbols > 0:
+            out = out[:max_symbols]
+        return out
+
     out: List[str] = []
     seen: set = set()
     for row in grid[hdr_r + 1:]:
