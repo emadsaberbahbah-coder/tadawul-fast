@@ -99,9 +99,39 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+
+# v1.2.0 — PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
+# WHY (2026-07-16): _load_page fetched each tab via a hardcoded
+# "A1:ZZ5000" block. With today's default DIGEST_CANDIDATE_PAGES
+# ("Market_Leaders", 1,025 rows) nothing binds YET — but the pages are
+# env-configurable and pointing them at Global_Markets (6,512 data rows)
+# would silently drop the tail 1,513 from every digest: the identical
+# symbol-remover class fixed in run_dashboard_sync v6.24.3 and
+# run_daily_brief v1.12.0. Same knobs reused: TFB_SYNC_PAGE_READ_MAX_ROW
+# (default 12000) under TFB_SYNC_UNIVERSE_CAP_V2 (default ON; set 0 to
+# restore the exact legacy "A1:ZZ5000"). Fail-soft per-page behavior
+# (WARN + empty list) unchanged.
 
 RIYADH_TZ = timezone(timedelta(hours=3))  # Saudi Arabia is fixed UTC+3 (no DST).
+
+
+def _universe_cap_v2_enabled() -> bool:
+    """v1.2.0: master switch shared with run_dashboard_sync v6.24.3. Default
+    ON; TFB_SYNC_UNIVERSE_CAP_V2=0/false/off/no restores "A1:ZZ5000" exactly."""
+    return (os.getenv("TFB_SYNC_UNIVERSE_CAP_V2") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _page_read_row_bound() -> int:
+    """v1.2.0: row bound for full-page reads. Env TFB_SYNC_PAGE_READ_MAX_ROW,
+    default 12000, clamped 1000..100000 (same semantics as run_dashboard_sync
+    v6.24.3 _page_read_row_bound). Unparsable values fall back to 12000."""
+    raw = (os.getenv("TFB_SYNC_PAGE_READ_MAX_ROW") or "").strip()
+    try:
+        v = int(raw) if raw else 12000
+    except Exception:
+        v = 12000
+    return max(1000, min(v, 100000))
 
 
 # --------------------------------------------------------------------------- #
@@ -277,7 +307,8 @@ FIELD_ALIASES: Dict[str, List[str]] = {
 def _load_page(read_range, sheet_id: str, page: str) -> List[Dict[str, Any]]:
     """Read one tab and return list of dicts with the resolved fields we need."""
     try:
-        values = read_range(sheet_id, f"'{page}'!A1:ZZ5000")
+        _bound = f"A1:ZZ{_page_read_row_bound()}" if _universe_cap_v2_enabled() else "A1:ZZ5000"
+        values = read_range(sheet_id, f"'{page}'!{_bound}")
     except Exception as exc:  # noqa: BLE001
         _log(f"WARN could not read '{page}': {exc}")
         return []
