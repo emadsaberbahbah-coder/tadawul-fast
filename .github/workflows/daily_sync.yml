@@ -353,20 +353,27 @@ jobs:
       # KILL-SWITCH: remove this line (or "0") for v6.22.3 behavior verbatim.
       TFB_SYNC_TIME_BUDGET_SEC: "3600"
       # Per-page symbol cap for the four MARKET pages (scripts/
-      # run_dashboard_sync.py v6.19.2 _market_symbol_cap). RAISED to the
-      # script's own clamp ceiling.
+      # run_dashboard_sync.py _market_symbol_cap).
       # WHY (2026-07-07 forensics): the script default is 2500. A cap SMALLER
       # than the sheet universe silently UN-REQUESTS the overflow, and the
       # v6.19.0 symbol-persistence guard can only protect REQUESTED symbols —
       # so the default cap acted as a symbol REMOVER: Global_Markets pinned at
       # ~2,500 after the Jul-5 universe reached ~3,500, and every restore past
       # position 2,500 was silently dropped again on the next run (the macro
-      # symbol-loss ratchet). 5000 covers the full documented universe with
-      # headroom. NOTE: this lets the sync REQUEST past 2,500; the request
-      # list still comes from the sheet's Symbol column, so previously-lost
-      # symbols return only once pasted back / restored to the page.
+      # symbol-loss ratchet). NOTE: this lets the sync REQUEST past the cap;
+      # the request list still comes from the sheet's Symbol column, so
+      # previously-lost symbols return only once pasted back to the page.
+      # WHY 7000 (2026-07-16 universe expansion): owner-approved additions
+      # take Global_Markets to 6,512 symbols (ML 1,025 / CFX 453 / MF 4,496;
+      # 12,486 total). The old value 5000 sat exactly at v6.24.2's code clamp
+      # and became the binding truncator for GM. run_dashboard_sync v6.24.3
+      # raised the clamp ceiling to 20000 (TFB_SYNC_UNIVERSE_CAP_V2, default
+      # ON) and the page re-read bounds to 12000 rows, so this value is now
+      # the ONLY knob that decides the requested universe size. 7000 covers
+      # the largest page (6,512) with headroom; raise here first if any page
+      # ever approaches it.
       # KILL-SWITCH: remove the line to fall back to the script default (2500).
-      TFB_SYNC_MAX_SYMBOLS_MARKET: "5000"
+      TFB_SYNC_MAX_SYMBOLS_MARKET: "7000"
       # (2026-07-13) GATEWAY DECLARATION ALIGNED WITH ENFORCED REALITY.
       # History: the boolean below (v6.10.0) routed the four market pages to
       # /v1/analysis; a v6.18.0 override then forced "advanced" after a 25-min
