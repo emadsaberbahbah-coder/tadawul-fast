@@ -7,6 +7,42 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.23.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.24.3 fix — UNIVERSE CAPS RAISED FOR THE 12,486-SYMBOL EXPANSION
+--------------------------------------------------------------------------
+WHY (owner-approved staged expansion, 2026-07-16: Market_Leaders 1,025 /
+Global_Markets 6,512 / Commodities_FX 453 / Mutual_Funds 4,496): four
+hard bounds in this script bind BELOW the new Global_Markets size and
+would act as silent symbol removers / guard blind spots:
+  (1) _read_existing_page_symbols read a hardcoded "A1:E5000" block —
+      rows past 5000 are PHYSICALLY never read, so symbols there are
+      never requested and (per the v6.19.2 lesson) never protected by
+      the persistence guard. At 6,512 GM rows that un-requests ~1,512.
+  (2) _market_symbol_cap clamped TFB_SYNC_MAX_SYMBOLS_MARKET at
+      min(v, 5000) — the workflow already sets 5000, the max; no yml
+      edit can pass 6,512 until this code ceiling is raised.
+  (3)+(4) the KEEP-LAST-GOOD stub-swap and the v6.19.0 PERSISTENCE
+      pass each re-read the live page via "A1:ZZ6000" — at 6,513+ total
+      rows, last-good rows past 6000 become INVISIBLE to both guards,
+      so tail stubs can't be healed and tail requested-but-missing
+      symbols can't be preserved.
+  (+) the request-limit ceilings (batched p["limit"] and non-batched
+      safe_limit) were min(5000, …) — harmless at batch size 25, but a
+      latent truncator if batching is ever disabled on a >5000 page.
+FIX: one master switch TFB_SYNC_UNIVERSE_CAP_V2 (default ON; set 0 to
+restore EVERY legacy literal above byte-for-byte). Under v2: page
+re-reads use an env-tunable row bound TFB_SYNC_PAGE_READ_MAX_ROW
+(default 12000, clamped 1000..100000) — the readback block becomes
+A1:E{bound}, both guard re-reads become A1:ZZ{bound}; the market cap
+ceiling rises to 20000 (default value stays 2500 — yml still drives the
+actual cap and MUST be raised to ~7000 to take effect); request-limit
+ceilings rise to the same 20000. Sheets API responses only contain the
+USED range, so raising the requested bound does not inflate payloads.
+Fail-safe: every touched path keeps its exact prior fail-soft behavior
+([] / skip / unchanged rows) on any read failure. New helpers:
+_universe_cap_v2_enabled(), _page_read_row_bound(),
+_request_limit_ceiling(). Nothing removed; all v6.24.2 functions
+carried verbatim.
+
 v6.24.2 fix — HEAL-FIRST ROTATION (Fix HF-1): blank-name rows jump the queue
 --------------------------------------------------------------------------
 EVIDENCE (v42 export, 2026-07-16 morning): the 2026-07-15 repair correctly
@@ -1002,7 +1038,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.24.2"
+SCRIPT_VERSION = "6.24.3"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2584,7 +2620,10 @@ def _read_existing_page_symbols(
     """
     if sheets is None:
         return []
-    grid = sheets.read_values(spreadsheet_id, sheet_name, "A1:E5000")
+    # v6.24.3: rows past the read block are PHYSICALLY invisible — the classic
+    # symbol remover. Bound is env-tunable under v2; legacy literal preserved.
+    _rb_block = f"A1:E{_page_read_row_bound()}" if _universe_cap_v2_enabled() else "A1:E5000"
+    grid = sheets.read_values(spreadsheet_id, sheet_name, _rb_block)
     if not grid or not isinstance(grid, list):
         return []
     # Locate the header row (first row with a Symbol-like column) in the top rows.
@@ -3176,7 +3215,9 @@ def _keep_last_good_rows(
     if not stub_rows:
         return rows_matrix, swapped
 
-    grid = sheets.read_values(spreadsheet_id, sheet_name, "A1:ZZ6000") if sheets is not None else None
+    # v6.24.3: last-good rows past the read bound were invisible to the swap.
+    _klg_block = f"A1:ZZ{_page_read_row_bound()}" if _universe_cap_v2_enabled() else "A1:ZZ6000"
+    grid = sheets.read_values(spreadsheet_id, sheet_name, _klg_block) if sheets is not None else None
     if not grid or not isinstance(grid, list):
         return rows_matrix, swapped
 
@@ -3713,7 +3754,9 @@ def _persist_missing_symbol_rows(
     if not missing:
         return rows_matrix, kept
 
-    grid = sheets.read_values(spreadsheet_id, sheet_name, "A1:ZZ6000") if sheets is not None else None
+    # v6.24.3: last-good rows past the read bound could not be preserved.
+    _pp_block = f"A1:ZZ{_page_read_row_bound()}" if _universe_cap_v2_enabled() else "A1:ZZ6000"
+    grid = sheets.read_values(spreadsheet_id, sheet_name, _pp_block) if sheets is not None else None
     if not grid or not isinstance(grid, list):
         return rows_matrix, kept
 
@@ -3759,21 +3802,59 @@ def _persist_missing_symbol_rows(
     return rows_matrix, kept
 
 
+def _universe_cap_v2_enabled() -> bool:
+    """v6.24.3 master switch for the expansion-sized universe caps. Default ON;
+    set TFB_SYNC_UNIVERSE_CAP_V2=0/false/off/no to restore EVERY legacy bound
+    byte-for-byte: readback "A1:E5000", guard re-reads "A1:ZZ6000", market cap
+    ceiling min(v, 5000), request-limit ceilings min(5000, ...)."""
+    return (os.getenv("TFB_SYNC_UNIVERSE_CAP_V2") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _page_read_row_bound() -> int:
+    """v6.24.3: row bound for full-page re-reads (symbol read-back, KEEP-LAST-
+    GOOD stub-swap, PERSISTENCE pass). Env TFB_SYNC_PAGE_READ_MAX_ROW, default
+    12000 (Global_Markets 6,512 data rows + header, with ~1.8x headroom),
+    clamped 1000..100000. Sheets API responses contain only the USED range, so
+    a larger requested bound is a ceiling, not a payload inflator. Fail-safe:
+    unparsable values fall back to 12000."""
+    raw = (os.getenv("TFB_SYNC_PAGE_READ_MAX_ROW") or "").strip()
+    try:
+        v = int(raw) if raw else 12000
+    except Exception:
+        v = 12000
+    return max(1000, min(v, 100000))
+
+
+def _request_limit_ceiling() -> int:
+    """v6.24.3: ceiling applied to the backend request 'limit' field. Legacy
+    hardcoded 5000; under v2 this rises to 20000 (above the full 12,486-symbol
+    universe) so a non-batched >5000-symbol page can no longer be silently
+    limit-truncated. With batching active (batch size 25) the effective value
+    is unchanged: min(ceiling, 25) == 25 either way."""
+    return 20000 if _universe_cap_v2_enabled() else 5000
+
+
 def _market_symbol_cap() -> int:
     """v6.19.2: per-page symbol cap for the four MARKET pages (Market_Leaders,
     Global_Markets, Commodities_FX, Mutual_Funds). Default 2500 — sized to the
     Symbol Expansion Pack / build_universes documented ceiling with headroom —
-    override with TFB_SYNC_MAX_SYMBOLS_MARKET (clamped 1..5000). A cap SMALLER
+    override with TFB_SYNC_MAX_SYMBOLS_MARKET. A cap SMALLER
     than the sheet universe silently un-requests the overflow, and the
     persistence guard can only protect REQUESTED symbols, so an undersized cap
     acts as a symbol remover (the 2026-07-03 Global_Markets pin at exactly 800
-    rows). Fail-safe: any unparsable value falls back to 2500."""
+    rows). Fail-safe: any unparsable value falls back to 2500.
+    v6.24.3: ceiling raised 5000 -> 20000 under TFB_SYNC_UNIVERSE_CAP_V2 (the
+    2026-07 expansion puts Global_Markets at 6,512 — the old ceiling made the
+    yml's value of 5000 the binding truncator). Legacy path keeps min(v, 5000)
+    exactly. NOTE: the yml still drives the ACTUAL cap; raise
+    TFB_SYNC_MAX_SYMBOLS_MARKET to ~7000 for the expansion to take effect."""
     raw = (os.getenv("TFB_SYNC_MAX_SYMBOLS_MARKET") or "").strip()
     try:
         v = int(raw) if raw else 2500
     except Exception:
         v = 2500
-    return max(1, min(v, 5000))
+    ceiling = 20000 if _universe_cap_v2_enabled() else 5000
+    return max(1, min(v, ceiling))
 
 
 def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
@@ -4204,7 +4285,7 @@ async def _fetch_market_rows_batched(
         p = dict(base_payload)
         p["tickers"] = batch
         p["symbols"] = batch
-        p["limit"] = min(5000, max(1, len(batch)))
+        p["limit"] = min(_request_limit_ceiling(), max(1, len(batch)))
         p["request_id"] = f"{res.request_id}-b{bi + 1}"
 
         # Reuse the resolved endpoint once one answers; only the first batch
@@ -4598,7 +4679,7 @@ async def _run_one_task(
         #     returns. Never sends literal 0.
         #     Reversible: TFB_SYNC_PAGE_LIMIT_FIX=0 restores the v6.6.0 limit:1.
         if symbols:
-            safe_limit = min(5000, max(1, len(symbols)))
+            safe_limit = min(_request_limit_ceiling(), max(1, len(symbols)))
         elif _page_limit_fix_enabled():
             safe_limit = task.max_symbols if (task.max_symbols and task.max_symbols > 0) else 5000
         else:
