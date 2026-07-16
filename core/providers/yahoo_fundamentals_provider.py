@@ -2,6 +2,85 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
+Yahoo Finance Fundamentals Provider -- v6.8.0
+================================================================================
+v6.8.0 -- CIRCUIT BREAKER ACTUALLY TRIPS ON THE CRUMB-BLOCK CLASS
+          (Fixes YF-CB-1 / YF-CB-2 / YF-CB-3 / YF-CB-4)
+--------------------------------------------------------------------------------
+WHY (production log 2026-07-16 06:33 UTC + two solo Render-shell probes +
+code scan): the box's crumb-issuance path is institutionally blocked --
+GET /v1/test/getcrumb returns 429 on BOTH query1 and query2 from a COLD
+session with zero concurrency (two spaced probes, 2026-07-16), and the
+production sync log shows yfinance "HTTP Error 401 ... Invalid Crumb" /
+"User is unable to access this feature" SUSTAINED ACROSS THE ENTIRE RUN.
+A working circuit breaker would have opened after YF_CB_FAIL_THRESHOLD
+(default 6) failures and skipped the remaining ~600 doomed quoteSummary
+round-trips per run. It never opened, for two provable reasons:
+
+YF-CB-1 SUCCESS-RESET ON EVERY CRUMB FAILURE: _blocking_fetch swallows the
+t.info exception to info={} (the yfinance library logs the 401 itself --
+those are the ERROR lines in the sync log -- and this provider's inner
+try/except discards it). fast_info and t.history() ride the chart endpoint
+(no crumb) and still answer, so the assembled payload carries price/52W/
+volume fields, data_quality lands non-ERROR, and fetch_fundamentals calls
+circuit_breaker.on_success() -- RESETTING failures=0 and state=CLOSED on
+every single crumb-blocked symbol. The breaker structurally cannot open in
+exactly the failure mode it exists for. Fix: _blocking_fetch now captures
+the info-fetch exception text and a pre-guard info-absent flag into two
+PRIVATE payload keys (_yf68_info_absent / _yf68_info_err -- popped by
+fetch_fundamentals BEFORE cache/return, never reach the engine); when the
+guard is on and the quoteSummary leg came back empty at fetch time, the
+call feeds circuit_breaker.on_failure(classified_status) instead of
+on_success. Data behavior is UNCHANGED on that call: the partial payload
+(price/history legs) still returns and caches exactly as v6.7.0 did -- only
+the breaker accounting changes; the saving is every call AFTER it opens.
+Identity/locale/coherence-guard convictions (info discarded ON PURPOSE) set
+the flag pre-guard, so a conviction never counts as a transport failure.
+
+YF-CB-2 DEAD ERROR CLASSIFIER: the error branch classified rate-limiting
+via any(m in last_error_class for m in ("403","429")) -- but
+last_error_class is an exception CLASS NAME ("HTTPError"), which never
+contains those digits, so every auth/ratelimit error mapped to status 500
+and the 401/403/429 cooldown escalation in on_failure never fired. The
+module's own _RATE_LIMIT_MARKERS already lists "401"/"unauthorized";
+the inline check ignored it. Fix: _classify_error_status() scans class
+name AND message against explicit auth/forbidden/ratelimit marker sets
+(_AUTH_BLOCK_MARKERS incl. "invalid crumb", "user is unable to access")
+and returns 401/403/429/500; the error branch and the YF-CB-1 branch both
+use it when the guard is on.
+
+YF-CB-3 KILL SWITCH: TFB_YF_CB_AUTH_GUARD, default ON (house rule: a
+documented control the live failure class violates ships armed). =0/false/
+off restores the exact v6.7.0 flow: info-absent -> on_success, error branch
+-> the old ("403","429")-in-class-name check. (Blunt owner alternative that
+needs no deploy: YF_ENABLED=0 disables this provider entirely; the breaker
+fix is preferred because it self-recovers via half-open probes if Yahoo
+ever unblocks this IP.)
+
+YF-CB-4 TRIPWIRE (Build Law 3): every transition INTO OPEN logs ONE
+WARNING line -- "[YF-CB v6.8.0] OPEN reason=auth_block status=401
+failures=N cooldown=Ns -- yfinance fundamentals suspended for cooldown;
+EODHD fallback carries fundamentals" -- and recovery logs "[YF-CB v6.8.0]
+CLOSED -- yfinance fundamentals resumed". Run-log visible (Render + Actions
+artifacts). on_failure gains an optional reason="" kwarg; every existing
+call site passes positionally/by keyword and is unaffected.
+
+Honest scope note: NOTHING here restores fundamentals data -- the crumb
+endpoint is blocked Yahoo-side (Build 4c "crumb transport hardening" is
+CLOSED WONT-FIX on this evidence; a raw-httpx handshake would hit the same
+429). This fix stops the provider from pretending the path is alive:
+doomed calls stop after ~threshold symbols instead of ~600, the 401 log
+spam collapses to a handful of lines + one verdict line per open, and the
+breaker metric/state stops lying. EODHD (v5.79.0 engine fallback) keeps
+carrying fundamentals, exactly as it already does today.
+
+Version: PROVIDER_VERSION = "6.8.0". All prior WHYs preserved verbatim.
+Zero functions removed; additions: _AUTH_BLOCK_MARKERS,
+_FORBIDDEN_MARKERS, _RATELIMIT_ONLY_MARKERS, _classify_error_status,
+_cb_auth_guard_enabled.
+================================================================================
+(v6.7.0 header retained below)
+================================================================================
 Yahoo Finance Fundamentals Provider -- v6.7.0
 ================================================================================
 v6.7.0 -- YF-2 ON + TIGHT CROSS-RESPONSE BAND + DECLARED-IDENTITY ECHO
@@ -159,7 +238,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "6.7.0"
+PROVIDER_VERSION = "6.8.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -199,6 +278,38 @@ _RATE_LIMIT_MARKERS: Tuple[str, ...] = (
     "403", "429", "forbidden", "rate limit", "too many requests",
     "unauthorized", "401",
 )
+
+# v6.8.0 (YF-CB-2): explicit per-status marker sets for the circuit-breaker
+# classifier. _RATE_LIMIT_MARKERS above stays untouched (it feeds the retry
+# backoff in _is_rate_limit_error); these sets map an error's class name +
+# message onto the status code on_failure escalates cooldown for. The auth
+# set names the live 2026-07-16 failure signatures verbatim.
+_AUTH_BLOCK_MARKERS: Tuple[str, ...] = (
+    "401", "unauthorized", "invalid crumb", "crumb",
+    "user is unable to access this feature",
+)
+_FORBIDDEN_MARKERS: Tuple[str, ...] = ("403", "forbidden")
+_RATELIMIT_ONLY_MARKERS: Tuple[str, ...] = (
+    "429", "too many requests", "rate limit",
+)
+
+
+def _classify_error_status(error_text: str) -> int:
+    """v6.8.0 (YF-CB-2): map an error's class name + message onto the HTTP
+    status class the circuit breaker escalates on (401/403/429; else 500).
+    Pure; scans lowercase substrings. The old inline check scanned ONLY the
+    exception class name for "403"/"429" -- class names ("HTTPError") never
+    contain digits, so it was structurally dead."""
+    s = (error_text or "").lower()
+    if not s:
+        return 500
+    if any(m in s for m in _AUTH_BLOCK_MARKERS):
+        return 401
+    if any(m in s for m in _FORBIDDEN_MARKERS):
+        return 403
+    if any(m in s for m in _RATELIMIT_ONLY_MARKERS):
+        return 429
+    return 500
 
 # =============================================================================
 # Optional Dependencies (prod-safe)
@@ -610,6 +721,15 @@ def _rate_limit() -> float:
 
 def _cb_enabled() -> bool:
     return _env_bool("YF_CIRCUIT_BREAKER", True)
+
+
+def _cb_auth_guard_enabled() -> bool:
+    """v6.8.0 (YF-CB-3): master kill-switch for the crumb-block breaker fix.
+    Default ON (house rule: a documented control the live failure class
+    violates ships armed). TFB_YF_CB_AUTH_GUARD in {0,false,no,off} restores
+    the exact v6.7.0 flow: an info-empty fetch counts as success and the
+    error branch classifies via the legacy class-name check."""
+    return _env_bool("TFB_YF_CB_AUTH_GUARD", True)
 
 
 def _cb_fail_threshold() -> int:
@@ -1621,17 +1741,29 @@ class AdvancedCircuitBreaker:
         if not _cb_enabled():
             return
         async with self._get_lock():
+            _was = self.stats.state  # v6.8.0 (YF-CB-4)
             self.stats.successes += 1
             self.stats.state = CircuitState.CLOSED
             self.stats.failures = 0
             self._half_open_probe_used = False
+            if _was != CircuitState.CLOSED:
+                # v6.8.0 (YF-CB-4): recovery is announced too -- if Yahoo
+                # ever unblocks this IP the resume is self-evident in logs.
+                logger.info(
+                    "[YF-CB v%s] CLOSED -- yfinance fundamentals resumed"
+                    " (recovered from %s)",
+                    PROVIDER_VERSION, _was.value,
+                )
             yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
 
-    async def on_failure(self, status_code: int = 500) -> None:
+    async def on_failure(self, status_code: int = 500, reason: str = "") -> None:
+        # v6.8.0 (YF-CB-4): optional reason kwarg -- every pre-existing call
+        # site passes status_code only and is unaffected.
         if not _cb_enabled():
             return
         async with self._get_lock():
             now = time.monotonic()
+            _was = self.stats.state  # v6.8.0 (YF-CB-4)
             self.stats.failures += 1
             self.stats.last_failure_ts = now
             cooldown = self.stats.cooldown_sec
@@ -1643,6 +1775,20 @@ class AdvancedCircuitBreaker:
             elif self.stats.failures >= self.fail_threshold:
                 self.stats.state = CircuitState.OPEN
                 self.stats.open_until_ts = now + cooldown
+            # v6.8.0 (YF-CB-4, Build Law 3 tripwire): ONE warning line per
+            # transition into OPEN -- run-log visible on Render and in the
+            # Actions log artifact.
+            if self.stats.state == CircuitState.OPEN and _was != CircuitState.OPEN:
+                logger.warning(
+                    "[YF-CB v%s] OPEN reason=%s status=%s failures=%d cooldown=%.0fs"
+                    " -- yfinance fundamentals suspended for cooldown;"
+                    " EODHD fallback carries fundamentals",
+                    PROVIDER_VERSION,
+                    reason or f"http_{status_code}",
+                    status_code,
+                    self.stats.failures,
+                    max(0.0, self.stats.open_until_ts - now),
+                )
             yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
 
     def get_stats(self) -> Dict[str, Any]:
@@ -1855,10 +2001,21 @@ class YahooFundamentalsProvider:
 
                 _ident_discarded = False  # v6.6.0 YF-1b
                 info: Dict[str, Any] = {}
+                _info_fetch_err: str = ""  # v6.8.0 (YF-CB-1)
                 try:
                     info = t.info or {}
-                except Exception:
+                except Exception as _info_exc:
                     info = {}
+                    # v6.8.0 (YF-CB-1): the swallowed exception here is the
+                    # crumb-block signature (yfinance logs the 401 itself and
+                    # this except discarded it -- the breaker never learned).
+                    # Capture class+message for the classifier.
+                    _info_fetch_err = f"{type(_info_exc).__name__}: {_info_exc}"
+                # v6.8.0 (YF-CB-1): transport-level signal, captured PRE-guard
+                # on purpose -- an identity/locale/coherence conviction below
+                # empties info DELIBERATELY and must never count as a
+                # transport failure.
+                _info_absent_at_fetch = not info
 
                 # v6.4.0 provider-identity guard: if Yahoo returned a different
                 # instrument than requested (e.g. 5023.SR -> Apple Inc.), discard
@@ -2252,6 +2409,12 @@ class YahooFundamentalsProvider:
 
                     # v6.1.0: structured warnings
                     "warnings": deduped_warnings,
+
+                    # v6.8.0 (YF-CB-1): PRIVATE transport-health keys --
+                    # popped by fetch_fundamentals BEFORE cache/return;
+                    # never reach the engine or the sheet.
+                    "_yf68_info_absent": _info_absent_at_fetch,
+                    "_yf68_info_err": _info_fetch_err,
                 }
 
                 # Legacy aliases (preserved verbatim from v6.0.0)
@@ -2330,14 +2493,50 @@ class YahooFundamentalsProvider:
                 start_time = time.monotonic()
                 try:
                     res = await loop.run_in_executor(None, self._blocking_fetch, norm)
+                    # v6.8.0 (YF-CB-1): pop the private transport-health keys
+                    # FIRST so they can never leak into the cache, the engine
+                    # merge, or any downstream consumer.
+                    _info_absent = bool(res.pop("_yf68_info_absent", False))
+                    _info_err = str(res.pop("_yf68_info_err", "") or "")
                     if "error" in res and res.get("data_quality") == DataQuality.ERROR.value:
                         last_cls = (res.get("last_error_class") or "").lower()
-                        is_rate_limited = any(m in last_cls for m in ("403", "429"))
+                        if _cb_auth_guard_enabled():
+                            # v6.8.0 (YF-CB-2): classify on class name AND
+                            # message -- the class-name-only check below never
+                            # matched a digit and mapped every auth/ratelimit
+                            # error to 500.
+                            _status = _classify_error_status(
+                                f"{res.get('last_error_class') or ''} {res.get('error') or ''}"
+                            )
+                        else:
+                            _status = 403 if any(
+                                m in last_cls for m in ("403", "429")
+                            ) else 500
                         await self.circuit_breaker.on_failure(
-                            status_code=403 if is_rate_limited else 500
+                            status_code=_status,
+                            reason="fetch_error",
                         )
                         yf_fund_requests_total.labels(status="error").inc()
                         return {}
+                    if _cb_auth_guard_enabled() and _info_absent:
+                        # v6.8.0 (YF-CB-1): the quoteSummary leg came back
+                        # empty at fetch time while the chart/history legs
+                        # answered -- the exact crumb-block signature
+                        # (production 2026-07-16). This is a BREAKER FAILURE,
+                        # not a success. Data behavior on THIS call is
+                        # unchanged from v6.7.0: the partial payload still
+                        # returns and caches; the saving is every call after
+                        # the breaker opens.
+                        _status = _classify_error_status(_info_err) if _info_err else 500
+                        await self.circuit_breaker.on_failure(
+                            status_code=_status,
+                            reason="auth_block" if _status == 401 else "info_empty",
+                        )
+                        yf_fund_requests_total.labels(status="success").inc()
+                        yf_fund_request_duration.observe(time.monotonic() - start_time)
+                        if res.get("current_price") is not None:
+                            await self.fund_cache.set(norm, res)
+                        return res
                     await self.circuit_breaker.on_success()
                     yf_fund_requests_total.labels(status="success").inc()
                     yf_fund_request_duration.observe(time.monotonic() - start_time)
