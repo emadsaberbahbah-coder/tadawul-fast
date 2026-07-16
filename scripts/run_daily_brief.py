@@ -342,7 +342,20 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
+
+# v1.12.0 — MARKET-PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
+# WHY (2026-07-16): read_pages_live fetched every page via a hardcoded
+# "A1:DZ5000" block. The brief reads ALL_PAGES — including the four market
+# pages — so at Global_Markets' new size (6,512 data rows + header) every
+# brief silently computed movers / action counts / vintage from only the
+# first ~4,999 data rows and never saw the tail 1,513. Same class of bug
+# fixed in run_dashboard_sync v6.24.3; same knobs reused so one mental
+# model governs all page re-reads: TFB_SYNC_PAGE_READ_MAX_ROW (default
+# 12000) under master switch TFB_SYNC_UNIVERSE_CAP_V2 (default ON; set 0
+# to restore the exact legacy "A1:DZ5000"). Sheets API responses contain
+# only the USED range, so the larger bound is a ceiling, not a payload
+# inflator. Fail-soft per-page behavior (WARN + empty list) unchanged.
 
 import argparse
 import datetime as _dt
@@ -458,13 +471,32 @@ def _cell(row: List[Any], idx: Optional[int]) -> Any:
 # ----------------------------------------------------------------------------- #
 # Page reading: live (read_range) and local (xlsx) — both yield List[List]
 # ----------------------------------------------------------------------------- #
+def _universe_cap_v2_enabled() -> bool:
+    """v1.12.0: master switch shared with run_dashboard_sync v6.24.3. Default
+    ON; TFB_SYNC_UNIVERSE_CAP_V2=0/false/off/no restores "A1:DZ5000" exactly."""
+    return (os.getenv("TFB_SYNC_UNIVERSE_CAP_V2") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _page_read_row_bound() -> int:
+    """v1.12.0: row bound for full-page reads. Env TFB_SYNC_PAGE_READ_MAX_ROW,
+    default 12000, clamped 1000..100000 (same semantics as run_dashboard_sync
+    v6.24.3 _page_read_row_bound). Unparsable values fall back to 12000."""
+    raw = (os.getenv("TFB_SYNC_PAGE_READ_MAX_ROW") or "").strip()
+    try:
+        v = int(raw) if raw else 12000
+    except Exception:
+        v = 12000
+    return max(1000, min(v, 100000))
+
+
 def read_pages_live(spreadsheet_id: str, pages: List[str]) -> Dict[str, List[List[Any]]]:
     from integrations.google_sheets_service import read_range  # local import: CI only
 
+    _bound = f"A1:DZ{_page_read_row_bound()}" if _universe_cap_v2_enabled() else "A1:DZ5000"
     out: Dict[str, List[List[Any]]] = {}
     for p in pages:
         try:
-            out[p] = read_range(spreadsheet_id, f"{p}!A1:DZ5000") or []
+            out[p] = read_range(spreadsheet_id, f"{p}!{_bound}") or []
         except Exception as exc:  # one bad page must not kill the brief
             sys.stderr.write(f"[brief] WARN could not read {p}: {exc}\n")
             out[p] = []
