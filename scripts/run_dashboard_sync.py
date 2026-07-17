@@ -7,6 +7,38 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.23.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.25.0 fix — EXPANSION THROUGHPUT + PARTIAL-WRITE UNLOCK (evidence:
+run #2413 artifacts, 2026-07-17 06:19 leg)
+--------------------------------------------------------------------------
+Observed in the uploaded sync logs: GM completed 6/261 batches in the full
+3600s budget; ML 447/1025, CFX 125/453, MF 450/2475 — then EVERY page's
+write was vetoed by the 70% coverage floor, so a whole hour of fetching
+wrote zero rows and the new-universe symbols stayed blank for another leg.
+Three defects compounded:
+  (1) DEAD ENDPOINT CANDIDATE: the safe-mode analysis chain listed a bare
+      "/analysis/sheet-rows" that is NOT in the backend's canonical route
+      map (boot-log owners) — it can only ever 404. Every pre-sticky
+      failure paid a pointless extra roundtrip on it.
+  (2) LOST BATCHES: a batch whose /v1 attempt failed (the ~95s silent
+      timeouts under morning contention) was NEVER re-fetched — its 25
+      symbols were simply gone from the run (ML's exact 447/1025). FIX:
+      failed batches are queued and re-attempted in a second pass on the
+      sticky endpoint until the time budget ends (TFB_SYNC_BATCH_RETRY,
+      default ON; 0 restores single-attempt behavior).
+  (3) FLOOR/PERSISTENCE DEADLOCK: the v6.18.2 shrink floor vetoes any
+      <70%-coverage write to avoid dropping missed symbols — but the
+      v6.19.0 persistence pass, which runs IMMEDIATELY AFTER the floor,
+      appends the last-good row of every requested-but-missing symbol, so
+      a floored partial write cannot drop anything anymore. On a 261-batch
+      page the floor therefore guaranteed ZERO server writes forever.
+      FIX: the floor now vetoes only when persistence cannot run
+      (disabled, or no Sheets handle); otherwise the partial proceeds into
+      the persistence merge and WRITES, and heal-first (v6.24.2) turns the
+      remaining blanks into a natural cross-leg cursor — Global_Markets
+      converges over ~2-3 legs instead of never.
+      TFB_SYNC_FLOOR_STRICT=1 restores the unconditional veto.
+Nothing removed; guards, KLG, identity firewall, tripwires unchanged.
+
 v6.24.3 fix — UNIVERSE CAPS RAISED FOR THE 12,486-SYMBOL EXPANSION
 --------------------------------------------------------------------------
 WHY (owner-approved staged expansion, 2026-07-16: Market_Leaders 1,025 /
@@ -1038,7 +1070,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.24.3"
+SCRIPT_VERSION = "6.25.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3926,9 +3958,11 @@ def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
         # firewall — confirmed serving 200s in the 2026-07-09 01:48 Riyadh
         # Render log — so it cannot sit in the verified market chain.
         if gw in {"analysis", "ai", "advanced"}:
+            # v6.25.0: bare "/analysis/sheet-rows" removed — it is absent from
+            # the backend's canonical route map and can only ever 404 (run
+            # #2413 logs show it 404ing on every pre-sticky attempt).
             return [
                 "/v1/analysis/sheet-rows",
-                "/analysis/sheet-rows",
             ]
     # include ai aliases because route naming can vary
     if gw in {"analysis", "ai"}:
@@ -4178,6 +4212,20 @@ def _time_budget_exceeded() -> bool:
     return _time_budget_left() <= 0.0
 
 
+def _batch_retry_enabled() -> bool:
+    """v6.25.0: second-pass retry of failed symbol batches. Default ON;
+    TFB_SYNC_BATCH_RETRY=0/false/off/no restores single-attempt behavior."""
+    v = (os.getenv("TFB_SYNC_BATCH_RETRY") or "1").strip().lower()
+    return v not in {"0", "false", "off", "no"}
+
+
+def _floor_strict_enabled() -> bool:
+    """v6.25.0: TFB_SYNC_FLOOR_STRICT=1 restores the unconditional coverage
+    floor veto (pre-6.25.0), even when persistence could merge safely."""
+    v = (os.getenv("TFB_SYNC_FLOOR_STRICT") or "0").strip().lower()
+    return v in {"1", "true", "on", "yes"}
+
+
 def _symbol_batch_size() -> int:
     """v6.17.0: per-request symbol batch size for market pages. <=0 disables
     batching (original single-request path). A positive N fetches the page in
@@ -4257,6 +4305,9 @@ async def _fetch_market_rows_batched(
     used_endpoint: Optional[str] = None
     last_err: Optional[str] = None
     ok_batches = 0
+    # v6.25.0: batches whose fetch failed outright (timeout/5xx on every
+    # candidate) are re-attempted in a second pass instead of being lost.
+    failed_batches: List[Tuple[int, List[str]]] = []
 
     # v6.22.0 L2 [BATCH-IDENTITY]: accumulate BY SYMBOL instead of by position.
     _idb_on = _batch_identity_enabled()
@@ -4337,9 +4388,87 @@ async def _fetch_market_rows_batched(
                     # positional accumulation, byte-identical.
                     combined.extend(b_matrix)
             ok_batches += 1
+        else:
+            # v6.25.0: remember the whole batch for the retry pass.
+            failed_batches.append((bi, list(batch)))
 
         if delay_ms > 0 and bi < len(batches) - 1:
             await asyncio.sleep(delay_ms / 1000.0)
+
+    # ---- v6.25.0 RETRY PASS: one more attempt per failed batch, on the
+    # sticky endpoint (or full candidates if none resolved), inside the same
+    # time budget. Converts transient morning timeouts into coverage instead
+    # of permanently losing 25 symbols per failure.
+    if failed_batches and _batch_retry_enabled():
+        retried_ok = 0
+        for rbi, rbatch in failed_batches:
+            if _time_budget_exceeded():
+                _rw = (
+                    f"[v6.25.0 BATCH-RETRY] {task.sheet_name}: budget ended "
+                    f"with {len(failed_batches) - retried_ok} failed batch(es) "
+                    f"still unrecovered; heal-first fronts them next leg."
+                )
+                res.warnings.append(_rw)
+                logger.warning(_rw)
+                break
+            p = dict(base_payload)
+            p["tickers"] = rbatch
+            p["symbols"] = rbatch
+            p["limit"] = min(_request_limit_ceiling(), max(1, len(rbatch)))
+            p["request_id"] = f"{res.request_id}-r{rbi + 1}"
+            cand = [used_endpoint] if used_endpoint else candidates
+            b_headers = []
+            b_matrix = []
+            for ep in cand:
+                data, err, _code = await backend.post_json(ep, p)
+                if err:
+                    last_err = f"{ep} -> {err}"
+                    continue
+                if not isinstance(data, dict):
+                    last_err = f"{ep} -> Non-dict response"
+                    continue
+                b_headers, b_matrix = _extract_table_payload(data)
+                if not b_headers:
+                    last_err = f"{ep} -> Missing headers"
+                    continue
+                b_matrix = _rectify_matrix(b_headers, b_matrix)
+                used_endpoint = ep
+                break
+            if not b_headers:
+                continue
+            if not headers:
+                headers = b_headers
+                if _idb_on:
+                    _idb_sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+            if b_matrix:
+                if _idb_on and _idb_sym_i >= 0:
+                    _batch_set = {str(t or "").strip().upper() for t in rbatch}
+                    _batch_set.discard("")
+                    for _row in b_matrix:
+                        if (not isinstance(_row, (list, tuple))
+                                or _idb_sym_i >= len(_row)
+                                or _guard_is_blank(_row[_idb_sym_i])):
+                            _idb_blank += 1
+                            continue
+                        _t = str(_row[_idb_sym_i]).strip().upper()
+                        if _t not in _batch_set:
+                            _idb_bleed += 1
+                            continue
+                        if _t in _idb_by_sym:
+                            _idb_dupes += 1
+                            continue
+                        _idb_by_sym[_t] = list(_row)
+                else:
+                    combined.extend(b_matrix)
+            ok_batches += 1
+            retried_ok += 1
+        if retried_ok:
+            _rw = (
+                f"[v6.25.0 BATCH-RETRY] {task.sheet_name}: recovered "
+                f"{retried_ok}/{len(failed_batches)} previously failed batch(es)."
+            )
+            res.warnings.append(_rw)
+            logger.warning(_rw)
 
     # v6.22.0 L2: emit in the REQUESTED symbol order (no positional artifact
     # can survive), falling through to the legacy `combined` when the Symbol
@@ -5011,20 +5140,41 @@ async def _run_one_task(
                 and rows_matrix is not None
                 and len(rows_matrix) < (len(symbols) * _cov_floor / 100.0)):
             _cov = 100.0 * len(rows_matrix) / max(1, len(symbols))
+            # v6.25.0: the veto exists to stop a short FULL-TABLE write from
+            # dropping missed symbols — but the v6.19.0 persistence pass runs
+            # immediately below and appends the last-good row of EVERY
+            # requested-but-missing symbol, so a floored partial cannot drop
+            # anything when persistence can run. Veto only when it cannot
+            # (persistence off, or no Sheets handle), or when explicitly
+            # forced strict via TFB_SYNC_FLOOR_STRICT=1. Run #2413 evidence:
+            # the unconditional veto turned a whole hour of fetching into
+            # rows_written=0 on every page, every leg.
+            _persist_ok = (_symbol_persistence_enabled() and sheets is not None
+                           and not _floor_strict_enabled())
+            if not _persist_ok:
+                msg = (
+                    f"Partial fetch on '{task.sheet_name}': {len(rows_matrix)} row(s) "
+                    f"for {len(symbols)} requested symbol(s) ({_cov:.0f}% coverage, "
+                    f"floor {_cov_floor:.0f}%). Skipping write to PRESERVE last-good "
+                    f"rows — persistence unavailable, so writing this would "
+                    f"permanently drop the missed symbols from the page (it is its "
+                    f"own symbol source). Self-heals on the next healthy sync."
+                )
+                res.status = "skipped"
+                res.rows_written = 0
+                res.rows_failed = 0
+                res.warnings.append(msg)
+                logger.warning(msg)
+                return res
             msg = (
-                f"Partial fetch on '{task.sheet_name}': {len(rows_matrix)} row(s) "
-                f"for {len(symbols)} requested symbol(s) ({_cov:.0f}% coverage, "
-                f"floor {_cov_floor:.0f}%). Skipping write to PRESERVE last-good "
-                f"rows — writing this would permanently drop the missed symbols "
-                f"from the page (it is its own symbol source). Self-heals on the "
-                f"next healthy sync."
+                f"[v6.25.0 FLOOR-MERGE] Partial fetch on '{task.sheet_name}': "
+                f"{len(rows_matrix)} fresh row(s) for {len(symbols)} requested "
+                f"({_cov:.0f}% coverage, floor {_cov_floor:.0f}%) — proceeding "
+                f"through the persistence merge; every missed symbol keeps its "
+                f"last-good row, heal-first fronts the remainder next leg."
             )
-            res.status = "skipped"
-            res.rows_written = 0
-            res.rows_failed = 0
             res.warnings.append(msg)
             logger.warning(msg)
-            return res
         # ---------------------------------------------------------------------
 
         # --- Per-symbol persistence (v6.19.0, WHY 1) -------------------------
