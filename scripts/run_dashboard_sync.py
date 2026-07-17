@@ -7,6 +7,29 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.23.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.25.1 fix — FW-2 QUARANTINE KEEPS LAST-GOOD (evidence: 2026-07-17
+17:34 leg, out_stripped=30 incl. AMAT/SNPS/NXPI/F/TRV + 15 .SR majors)
+--------------------------------------------------------------------------
+FW-2 (v6.24.0) rightly distrusts an OUTGOING row whose P/E != Price/EPS
+identity is broken — during the recurring ~12:00-14:30 Riyadh provider
+degradation, mixed-vintage fields (fresh price + stale EPS) trip it on
+perfectly real blue-chips. But its quarantine action wrote a destructive
+symbol-only stub OVER the sheet's healthy last-good row. Pre-6.25.0 the
+coverage floor happened to veto those writes, masking the defect; the
+FLOOR-MERGE unlock surfaced it: 30 Market_Leaders majors landed as stubs
+('identity_quarantined' + 113 blank cells). Ordering is the root cause —
+the KLG stub-swap (the rescuer) runs BEFORE FW-2, so FW-2's stubs are born
+orphaned.
+FIX: immediately after FW-2 strips, a TARGETED second stub-swap restores
+each stripped symbol's last-good sheet row (same KLG machinery, same
+suspect-validation of the old row), then re-tags its Warnings cell
+'identity_quarantined:kept_last_good:v6.25.1' so the event stays visible
+on-sheet and in the firewall line. Symbols with no last-good (brand-new
+additions) correctly remain stubs. Quarantine thus becomes non-destructive:
+distrust the fetch, never destroy the sheet.
+KILL-SWITCH: TFB_SYNC_FW_KEEP_LAST_GOOD=0 restores the v6.24.0 destructive
+stub byte-identically.
+
 v6.25.0 fix — EXPANSION THROUGHPUT + PARTIAL-WRITE UNLOCK (evidence:
 run #2413 artifacts, 2026-07-17 06:19 leg)
 --------------------------------------------------------------------------
@@ -1070,7 +1093,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.25.0"
+SCRIPT_VERSION = "6.25.1"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2867,6 +2890,14 @@ def _klg_old_row_identity_ok(
     if _COH_FX_UNIT_LO <= ratio <= _COH_FX_UNIT_HI:
         return True  # pence/pound convention - healthy
     return False
+
+
+def _fw_keep_last_good_enabled() -> bool:
+    """v6.25.1: after FW-2 strips a row, restore that symbol's last-good
+    sheet row (targeted KLG swap) instead of leaving a destructive stub.
+    Default ON; TFB_SYNC_FW_KEEP_LAST_GOOD=0/false/off/no restores the
+    v6.24.0 destructive-stub behavior exactly."""
+    return (os.getenv("TFB_SYNC_FW_KEEP_LAST_GOOD") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _row_firewall_enabled() -> bool:
@@ -5276,6 +5307,48 @@ async def _run_one_task(
                     )
                     res.warnings.append(_fw)
                     logger.warning(_fw)
+
+                    # v6.25.1 FW-KEEP: the KLG stub-swap ran BEFORE FW-2, so
+                    # these fresh stubs have no rescuer — run a targeted
+                    # second swap for exactly the stripped symbols, then
+                    # re-tag Warnings so the quarantine stays visible. New
+                    # symbols with no last-good remain stubs (correct).
+                    if _fw_keep_last_good_enabled() and sheets is not None:
+                        try:
+                            rows_matrix, _fwk_restored = _keep_last_good_rows(
+                                sheets, spreadsheet_id, task.sheet_name,
+                                headers, rows_matrix,
+                            )
+                            _fwk_set = {s for s in _fwk_restored
+                                        if s in set(_idfw_stripped)}
+                            if _fwk_set:
+                                _w_i = -1
+                                for _hi2, _h2 in enumerate(headers):
+                                    if str(_h2 or "").strip().casefold() == "warnings":
+                                        _w_i = _hi2
+                                        break
+                                _s_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+                                if _w_i >= 0 and _s_i >= 0:
+                                    for _row2 in rows_matrix:
+                                        if (isinstance(_row2, list)
+                                                and _s_i < len(_row2)
+                                                and str(_row2[_s_i] or "").strip().upper() in _fwk_set
+                                                and _w_i < len(_row2)):
+                                            _row2[_w_i] = "identity_quarantined:kept_last_good:v6.25.1"
+                            _unrest = len(_idfw_stripped) - len(_fwk_set)
+                            _kw = (
+                                f"[v6.25.1 FW-KEEP] '{task.sheet_name}': restored "
+                                f"{len(_fwk_set)}/{len(_idfw_stripped)} quarantined "
+                                f"row(s) from last-good"
+                                f"{f'; {_unrest} had no last-good (left as stub)' if _unrest else ''}."
+                            )
+                            res.warnings.append(_kw)
+                            logger.warning(_kw)
+                        except Exception as _ke:
+                            logger.warning(
+                                "[v6.25.1 FW-KEEP] restore skipped on '%s': %s",
+                                task.sheet_name, _ke,
+                            )
             except Exception as _fe:
                 logger.warning("%s outgoing firewall skipped: %s", _IDFW_TAG, _fe)
 
