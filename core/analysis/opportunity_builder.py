@@ -545,6 +545,24 @@ from datetime import datetime, timedelta, timezone
 # KILL SWITCH: leave TFB_OPP_PRIMARY_ROI_BASIS unset (or "valuation") ->
 # byte-identical v1.0.19 payload.
 # =============================================================================
+# v1.0.24 (2026-07-18) — SECTOR CAP BASIS: CASH-AWARE DENOMINATOR
+# --------------------------------------------------------------------------
+# WHY (evidence: cockpit boards 2026-07-16/17 — 18-19 qualified candidates
+# across FIVE different sectors ALL deferred "post-action sector weight
+# would exceed 30%", Selected 0/10, with Deployable 100,000 SAR against a
+# ~5K-SAR current book): both sector-weight checks divided by the CURRENT
+# portfolio value only — (a) _sector_context existing-holdings
+# pre-saturation, v/pv; (b) the §4.2 post-action check,
+# (sector+ticket)/(pv+ticket). With cash >> holdings, ANY first ticket
+# (§4.4 sizes ~15% of pv+deployable ≈ 15.7K here) becomes 60-90% of the
+# tiny pv-based denominator, so every sector trips and the selector
+# deadlocks at 0 forever — while the §4.4 sizer itself already correctly
+# uses budget_base = pv + deployable.
+# FIX: TFB_OPP_SECTOR_CAP_BASIS = "budget" (new default) makes BOTH checks
+# divide by budget_base — the true post-round portfolio (every deployable
+# SAR is portfolio after the round, as cash or positions). "legacy"
+# restores both v1.0.23 formulas byte-identically (kill-switch).
+#
 # v1.0.23 (2026-07-08) — TP1 EXECUTION-PLAN ROI BASIS (new default "plan")
 # -----------------------------------------------------------------------------
 # WHY (operator conviction, live sheet 2026-07-08): the three rendered columns
@@ -573,7 +591,7 @@ from datetime import datetime, timedelta, timezone
 # =engine -> the v1.0.20 engine basis. All prior WHYs preserved verbatim.
 # Zero functions removed (AST-verified).
 # =============================================================================
-OPPORTUNITY_BUILDER_VERSION = "1.0.23"
+OPPORTUNITY_BUILDER_VERSION = "1.0.24"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1907,12 +1925,29 @@ def _normalize_portfolio(portfolio):
             "portfolio_value": max(0.0, pv), "holdings": holdings}
 
 
-def _sector_context(pf, criteria):
+def _sector_cap_basis() -> str:
+    """v1.0.24: 'budget' (default) -> sector-weight checks divide by
+    budget_base = portfolio_value + deployable; 'legacy' -> v1.0.23
+    portfolio-value-only denominators, byte-identical."""
+    v = (os.getenv("TFB_OPP_SECTOR_CAP_BASIS") or "budget").strip().lower()
+    return v if v in {"budget", "legacy"} else "budget"
+
+
+def _sector_context(pf, criteria, deployable=0.0):
     sectors = {}
     for h in pf["holdings"]:
         sectors[h["sector"]] = sectors.get(h["sector"], 0.0) + h["value_sar"]
     cap_hit = set()
-    if pf["portfolio_value"] > 0:
+    # v1.0.24: cash-aware base under the default 'budget' basis; 'legacy'
+    # keeps the v1.0.23 pv-only formula exactly.
+    if _sector_cap_basis() == "budget":
+        _base = pf["portfolio_value"] + max(0.0, float(deployable or 0.0))
+        if _base > 0:
+            cap = criteria["pf_max_sector_pct"]
+            for s, v in sectors.items():
+                if v / _base * 100.0 >= cap:
+                    cap_hit.add(s)
+    elif pf["portfolio_value"] > 0:
         cap = criteria["pf_max_sector_pct"]
         for s, v in sectors.items():
             if v / pf["portfolio_value"] * 100.0 >= cap:
@@ -2070,9 +2105,13 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                 " below minimum ticket floor " + _fmt_sar(_min_ticket))
             continue
         # §4.2 combined post-action portfolio sector cap (only if sized & ctx)
-        if (suggested > 0 and pf["portfolio_value"] > 0 and
+        # v1.0.24: 'budget' basis divides by budget_base (pv + deployable) —
+        # the true post-round portfolio; 'legacy' keeps pv + suggested.
+        _scb_budget = _sector_cap_basis() == "budget"
+        _cap_base_ok = (budget_base > 0) if _scb_budget else (pf["portfolio_value"] > 0)
+        if (suggested > 0 and _cap_base_ok and
                 sector_ctx["available"]):
-            post_total = pf["portfolio_value"] + suggested
+            post_total = budget_base if _scb_budget else (pf["portfolio_value"] + suggested)
             post_sector = pf_sector_sar.get(sec, 0.0) + suggested
             if post_sector / post_total * 100.0 > criteria[
                     "pf_max_sector_pct"]:
@@ -2453,7 +2492,7 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     if crit["max_candidates"] > 0:
         rows = rows[:crit["max_candidates"]]
     pf = _normalize_portfolio(portfolio)
-    sector_ctx = _sector_context(pf, crit)
+    sector_ctx = _sector_context(pf, crit, pf["cash"] + pf["proceeds"])
     held = {h["symbol"] for h in pf["holdings"]}
     # v1.0.21 (Fix #4): expand to normalized bare/.US variants so the
     # Portfolio gate honors "Include Portfolio Holdings = No" regardless of
