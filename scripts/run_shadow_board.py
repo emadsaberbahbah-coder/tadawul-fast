@@ -39,7 +39,12 @@ from core import regime as rg                   # noqa: E402
 from core.analysis import opportunity_builder as ob   # noqa: E402
 from core.analysis import portfolio_actions as pa     # noqa: E402
 
-SCRIPT_VERSION = "1.0.0"
+# v1.0.1 (2026-07-18): header scan deepened to 40 rows (cockpit control-panel
+# preambles run past row 12 in the real workbook); table-end detection added —
+# break on a repeated header row or a non-symbol-shaped symbol cell (stops
+# ingestion at "ALL QUALIFIED" / "SECTOR SUMMARY" sections); dedupe by symbol.
+# Root-caused from export __44_ after live dry-run returned cands=0.
+SCRIPT_VERSION = "1.0.1"
 TAB_OUT = "Shadow_Board"
 TAB_TOP10 = "Top_10_Investments"
 TAB_HOLDINGS = "Portfolio_Decision"
@@ -87,21 +92,43 @@ def resolve_columns(header: Sequence[Any]) -> Dict[str, Optional[int]]:
     }
 
 
+_SYM_SHAPE = None  # compiled lazily
+
+
+def _symbol_shaped(s: str) -> bool:
+    global _SYM_SHAPE
+    if _SYM_SHAPE is None:
+        import re
+        _SYM_SHAPE = (re.compile(r"[A-Z0-9\-\^]{1,10}\.[A-Z]{1,3}"),
+                      re.compile(r"[A-Z\-\^]{1,6}"))
+    return bool(_SYM_SHAPE[0].fullmatch(s) or _SYM_SHAPE[1].fullmatch(s))
+
+
 def rows_to_records(values: Sequence[Sequence[Any]],
-                    max_scan: int = 8) -> List[Dict[str, Any]]:
-    """Find the header row (first row whose resolved symbol column exists and
-    whose cell says something symbol-ish), then map data rows to dicts."""
+                    max_scan: int = 40) -> List[Dict[str, Any]]:
+    """Find the FIRST data-table header (cockpit preambles run deep), map its
+    rows, and STOP at the table's end: a repeated header or a non-symbol-shaped
+    symbol cell means a new section (ALL QUALIFIED / SECTOR SUMMARY / ALERTS)
+    has begun. Blank symbol cells are spacers and are skipped, not terminal."""
     for h_i in range(min(max_scan, len(values or []))):
         cols = resolve_columns(values[h_i])
         if cols["symbol"] is not None and _norm(values[h_i][cols["symbol"]]) in (
                 "symbol", "ticker"):
             out = []
+            seen = set()
             for row in values[h_i + 1:]:
                 if cols["symbol"] >= len(row):
                     continue
                 sym = str(row[cols["symbol"]]).strip().upper()
-                if not sym or sym in ("SYMBOL", "-"):
+                if not sym or sym == "-":
                     continue
+                if sym in ("SYMBOL", "TICKER"):
+                    break            # second table header -> this table ended
+                if not _symbol_shaped(sym):
+                    break            # section title / summary block reached
+                if sym in seen:
+                    continue
+                seen.add(sym)
                 def g(key):
                     c = cols.get(key)
                     return row[c] if c is not None and c < len(row) else None
@@ -327,6 +354,42 @@ def _selftest() -> int:
     checks.append(("records mapped + %% and comma parsed",
                    len(recs) == 2 and recs[0]["roi_pct"] == 14.5
                    and recs[0]["market_value_sar"] == 18000.0))
+    # real-workbook clone: 18-row control preamble, SELECTED table, spacer,
+    # second table ("ALL QUALIFIED") and a summary block — v1.0.1 must ingest
+    # exactly the SELECTED rows and stop.
+    pre = [["TOP 10 INVESTMENTS"], ["Status:", "Last run"], [""],
+           ["CONTROL PANEL"]] + [[f"T10: knob {i}", "1.0"] for i in range(9)] + \
+          [["KPIs"], ["Deployable (SAR)", "Exp. Gain"], ["100000", "17484"],
+           [""], ["SELECTED — EXECUTABLE"]]
+    tbl = [["Rank", "Symbol", "Name", "Expected ROI %", "Confidence"],
+           ["1", "6960.T", "Fukuda Denshi", "35", "High"],
+           ["2", "2269.T", "Meiji Holdings", "35", "High"],
+           ["3", "0083.HK", "Sino Land", "35", "Medium"],
+           [""],
+           ["ALL QUALIFIED — TOP 30"],
+           ["Rank", "Symbol", "Name", "ROI %", "Confidence"],
+           ["1", "2269.T", "Meiji Holdings", "35", "High"],
+           ["2", "9999.HK", "Tencent-ish", "22", "High"]]
+    deep = rows_to_records(pre + tbl)
+    checks.append(("deep preamble: exactly the 3 SELECTED rows, no bleed",
+                   [r["symbol"] for r in deep] == ["6960.T", "2269.T", "0083.HK"]))
+    pd_vals = [["MY PORTFOLIO"], ["Status:", "x"], [""], ["CONTROL"],
+               ["PF: k", "1"], ["PF: k", "1"], ["PF: Rebalance", "Advisory"],
+               [""], ["KPIs"],
+               ["Portfolio (SAR)", "Holdings (SAR)"], ["30075", "30075"], [""],
+               ["ACTIONS — one per holding"],
+               ["Action", "Symbol", "Name", "Qty", "Market Value (SAR)",
+                "Confidence", "Expected ROI %"],
+               ["TRIM", "1050.SR", "Banque Saudi", "290", "5,684", "Low", "2"],
+               ["HOLD", "5023.SR", "5023.SR", "100", "10,126", "", ""],
+               [""],
+               ["SECTOR SUMMARY (vs caps)"],
+               ["Sector", "Value SAR", "Weight %"],
+               ["Financials", "10302.0", "34.3"]]
+    pd_recs = rows_to_records(pd_vals)
+    checks.append(("PD: holdings only, summary block never parsed as symbols",
+                   [r["symbol"] for r in pd_recs] == ["1050.SR", "5023.SR"]
+                   and pd_recs[0]["market_value_sar"] == 5684.0))
     auth = cg.build_authority_index([
         {"symbol": "7010.SR", "status": "PASS", "as_of": str(date.today())}])
     rows, summary = evaluate_board(recs, auth, {}, equity=130000)
