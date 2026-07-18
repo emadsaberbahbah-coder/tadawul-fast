@@ -1,0 +1,67 @@
+name: "🧭 TFB Weekly Decision Brief"
+
+# Wave S deliverable #12b (Master Plan v2.1 §18.1/§18.8). The advisor memo:
+# Sunday 07:10 Riyadh, before the Tadawul decision session. Reuses the
+# shadow-board computations (imported module) so memo and tab never disagree.
+# Mail via the proven TFB_MAIL_* secrets; missing creds degrade to a logged
+# no-send, never a red run.
+
+on:
+  schedule:
+    - cron: "10 4 * * 0"      # Sunday 04:10 UTC = 07:10 Riyadh
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = print memo only (no mail, no state save)"
+        default: "false"
+      no_mail:
+        description: "true = write state + log, skip mail"
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+      TFB_COMPLIANCE_GATE_ENABLED: "1"
+      TFB_SHADOW_EQUITY_SAR: ${{ vars.TFB_SHADOW_EQUITY_SAR }}
+      TFB_MAIL_FROM: ${{ secrets.TFB_MAIL_FROM }}
+      TFB_MAIL_PASSWORD: ${{ secrets.TFB_MAIL_PASSWORD }}
+      TFB_MAIL_TO: ${{ secrets.TFB_MAIL_TO }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install --quiet gspread google-auth httpx yfinance
+
+      - name: Materialize Google credentials
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+          CREDS_PATH="$RUNNER_TEMP/gcreds.json"
+          if [[ -n "${SECRET_CREDS:-}" ]]; then
+            printf '%s' "$SECRET_CREDS" > "$CREDS_PATH"
+          elif [[ -n "${SECRET_CREDS_B64:-}" ]]; then
+            printf '%s' "$SECRET_CREDS_B64" | base64 -d > "$CREDS_PATH"
+          else
+            echo "::error::No Google credentials secret present."; exit 1
+          fi
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
+
+      - name: Run weekly brief
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then EXTRA="--dry-run"; fi
+          if [[ "${{ github.event.inputs.no_mail }}" == "true" ]]; then EXTRA="$EXTRA --no-mail"; fi
+          python scripts/run_weekly_brief.py $EXTRA
