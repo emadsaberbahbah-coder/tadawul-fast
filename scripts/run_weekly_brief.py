@@ -40,7 +40,10 @@ _spec = importlib.util.spec_from_file_location("tfb_shadow_board", _SB_PATH)
 sb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 
-SCRIPT_VERSION = "1.0.0"
+# v1.0.1 (2026-07-18): eligibility-coherent scan — BUY proposals restricted
+# to Gen2-eligible candidates via shadow_board.eligible_symbols() (§4: a
+# blocked name can never be a BUY). Caught reading the first live memo.
+SCRIPT_VERSION = "1.0.1"
 TAB_STATE = "_Brief_State"
 
 
@@ -254,7 +257,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ameta = sa.get_meta()
     fnd, _fnd_errs = sb.fetch_board_fundamentals([c["symbol"] for c in cands])
     rows, summary = sb.evaluate_board(cands, auth, monitor, equity, fnd)
-    scan = pa.advisor_switch_scan(holds, cands)
+    ok = sb.eligible_symbols(rows)
+    scan = pa.advisor_switch_scan(
+        holds, [c for c in cands if c["symbol"] in ok])
     regime = sb.build_regime_block()
 
     prev = load_state(sh)
@@ -332,6 +337,8 @@ def _selftest() -> int:
     checks.append(("NO_ACTION phrased as first-class recommendation",
                    "Keeping everything is the recommendation" in text
                    and "لا فعل" in text))
+    checks.append(("brief binds the shared eligibility filter",
+                   sb.eligible_symbols([r1, r2]) == {"7010.SR", "2269.T"}))
     scan_sw = {"verdict": "SWITCH_CANDIDATES", "pairs_checked": 8,
                "proposals": [{"sell": "1120.SR", "buy": "STNG.US",
                               "delta_pct": 5.7, "hurdle_pct": 1.72}]}
