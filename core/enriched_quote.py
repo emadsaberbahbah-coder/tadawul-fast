@@ -358,7 +358,17 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-MODULE_VERSION = "4.9.0"
+# -----------------------------------------------------------------------------
+# v4.10.0 (2026-07-18) — GEN-2 COMPLIANCE ATTACH CAPABILITY (Wave A0 #3)
+# WHY: Master Plan v2.1 §4/§19 + Decision_Log D-2. compliance_gate v1.0.0 is
+# live; quote rows need its stamps (asset class, tradability, venue, shariah
+# status/source, floor law, INVEST eligibility) for Shadow consumers and the
+# Weekly memo. DESIGN: capability, not activation — nothing in this module
+# calls the attacher; Shadow callers opt in explicitly, and the attacher is
+# double-gated (TFB_ENRICH_COMPLIANCE env + lazy gate import). Champion
+# behavior is byte-identical. Absence of core.compliance_gate never raises.
+# -----------------------------------------------------------------------------
+MODULE_VERSION = "4.10.0"
 
 # v4.7.0: explicit markers of which engine/scoring releases this enriched_quote.py
 # was built to align with. data_engine_v2 v5.75.0 introduced the disciplined
@@ -3564,11 +3574,104 @@ def get_router() -> None:
 
 
 # =============================================================================
+# Gen-2 Compliance Attach (v4.10.0) — opt-in, kill-switched, never raises
+# =============================================================================
+
+_COMPLIANCE_GATE_MOD: Any = None
+_COMPLIANCE_GATE_TRIED = False
+
+
+def _compliance_env_on() -> bool:
+    """TFB_ENRICH_COMPLIANCE default OFF — the attacher is a no-op unless set."""
+    return (os.getenv("TFB_ENRICH_COMPLIANCE") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _load_compliance_gate() -> Any:
+    """Lazy, cached import of core.compliance_gate; None if unavailable."""
+    global _COMPLIANCE_GATE_MOD, _COMPLIANCE_GATE_TRIED
+    if _COMPLIANCE_GATE_TRIED:
+        return _COMPLIANCE_GATE_MOD
+    _COMPLIANCE_GATE_TRIED = True
+    try:
+        _COMPLIANCE_GATE_MOD = importlib.import_module("core.compliance_gate")
+        logger.info("enriched_quote v4.10.0: compliance_gate bound (v%s)",
+                    getattr(_COMPLIANCE_GATE_MOD, "__version__", "?"))
+    except Exception as exc:  # pragma: no cover - environment dependent
+        logger.debug("enriched_quote v4.10.0: compliance_gate unavailable: %s", exc)
+        _COMPLIANCE_GATE_MOD = None
+    return _COMPLIANCE_GATE_MOD
+
+
+def attach_compliance_fields(
+    row: Dict[str, Any],
+    authority_index: Optional[Dict[str, Dict[str, Any]]] = None,
+    monitor: Optional[Dict[str, str]] = None,
+    equity_sar: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Stamp one enriched row with Layer-0 verdict fields (prefix-namespaced;
+    canonical 115 schema untouched). No-op unless TFB_ENRICH_COMPLIANCE is on
+    and core.compliance_gate imports. Exceptions become a Warnings tag."""
+    if not isinstance(row, dict) or not _compliance_env_on():
+        return row
+    cg = _load_compliance_gate()
+    if cg is None:
+        return row
+    try:
+        symbol = _strip(row.get("symbol") or row.get("Symbol"))
+        if not symbol:
+            return row
+        gate_row = {
+            "name": _strip(row.get("name") or row.get("company_name")
+                           or row.get("Company Name")),
+            "sector": _strip(row.get("sector") or row.get("Sector")),
+            "industry": _strip(row.get("industry") or row.get("Industry")),
+            "market_cap": _to_number(row.get("market_cap")),
+            "interest_debt": _to_number(row.get("interest_debt")
+                                        or row.get("total_debt")),
+            "impure_income_ratio": _to_number(row.get("impure_income_ratio")),
+            "quote_type": _strip(row.get("quote_type")),
+        }
+        kw: Dict[str, Any] = {}
+        if equity_sar is not None:
+            kw["equity_sar"] = float(equity_sar)
+        v = cg.evaluate(symbol, gate_row, authority_index or {},
+                        monitor=monitor, **kw)
+        row["compliance_asset_class"] = v.asset_class
+        row["compliance_tradability"] = v.tradability
+        row["compliance_market"] = v.market or ""
+        row["compliance_venue"] = v.venue or ""
+        row["compliance_floor_sar"] = v.floor_sar
+        row["compliance_floor_unlocked"] = v.floor_unlocked
+        row["shariah_status"] = v.shariah_status
+        row["shariah_source"] = v.shariah_source
+        row["invest_eligible_gate"] = bool(v.invest_eligible)
+        row["compliance_reasons"] = ";".join(v.reasons)[:280]
+    except Exception as exc:  # never break enrichment
+        _append_warning(row, f"compliance_attach_error:{type(exc).__name__}")
+    return row
+
+
+def attach_compliance_to_rows(
+    rows: Sequence[Dict[str, Any]],
+    authority_index: Optional[Dict[str, Dict[str, Any]]] = None,
+    monitor: Optional[Dict[str, str]] = None,
+    equity_sar: Optional[float] = None,
+) -> Sequence[Dict[str, Any]]:
+    """Batch helper for Shadow consumers."""
+    for r in rows or []:
+        attach_compliance_fields(r, authority_index, monitor, equity_sar)
+    return rows
+
+
+# =============================================================================
 # Module Exports
 # =============================================================================
 
 __all__ = [
     "MODULE_VERSION",
+    "attach_compliance_fields",
+    "attach_compliance_to_rows",
     "VIEW_COLUMN_KEYS",
     "build_enriched_quote_payload",
     "build_enriched_sheet_rows_payload",
