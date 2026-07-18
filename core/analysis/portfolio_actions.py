@@ -312,7 +312,21 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 
-PORTFOLIO_ACTIONS_VERSION = "1.1.0"
+# -----------------------------------------------------------------------------
+# v1.2.0 (2026-07-18) — GEN-2 ADVISOR MATH, STAGE 2 (Wave A, script #8)
+# WHY (Master Plan v2.1 §18.3/§18.4): holdings must speak edge, and switching
+# must clear arithmetic, not habit. Adds (a) env-gated per-holding hold-edge
+# annotation (p_hit_proxy x roi_pct − 0; exit RT cost via the
+# opportunity_builder v1.1.0 venue model through the existing fail-soft _ob
+# bridge), (b) PURE switch_test — sell-A-buy-B only when
+# EdgeB − EdgeA > 2 x max(RT_A, RT_B) + 1.0% buffer — and (c) PURE
+# advisor_switch_scan whose honest default verdict is NO_ACTION (§18.4,
+# do-nothing as a first-class recommendation). Consumed by the Wave-S Weekly
+# memo; nothing here alters actions, reasons, ordering, or any champion
+# field. Gate: TFB_PA_HOLDEDGE_ANNOTATE (default OFF => byte-identical).
+# p_hit remains a labeled PROXY until the calibrator graduates.
+# -----------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.2.0"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -561,6 +575,107 @@ def _env_overrides():
             "TFB_PF_VF_CONFLICT_MIN_ENGINE_ROI",
             DEFAULT_CONTROLS["vf_conflict_min_engine_roi_pct"]),
     }
+
+
+
+# ---- v1.2.0 Gen-2 hold-edge / switch-test model (§18.3, §18.4) ------------- #
+_P_HIT_PROXY_PA = {"High": 0.65, "Medium": 0.55, "Low": 0.45}
+
+
+def _env_holdedge_annotate():
+    v = os.environ.get("TFB_PA_HOLDEDGE_ANNOTATE", "0")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _rt_cost_pct_safe(symbol, ticket_sar):
+    try:
+        if _ob is not None and hasattr(_ob, "rt_cost_pct"):
+            return _ob.rt_cost_pct(symbol, ticket_sar)
+    except Exception:
+        pass
+    return None
+
+
+def _venue_floor_safe(symbol):
+    try:
+        if _ob is not None and hasattr(_ob, "_venue_floor"):
+            return _ob._venue_floor(symbol)
+    except Exception:
+        pass
+    return None
+
+
+def _edge_fields(row):
+    """(p_hit, roi_pct, rt_cost_pct) for a holding/candidate row; Nones on gaps."""
+    p = _P_HIT_PROXY_PA.get(str((row or {}).get("confidence_band") or "").strip(), 0.50)
+    roi = _to_float((row or {}).get("roi_pct"))
+    sym = (row or {}).get("symbol")
+    size = _to_float((row or {}).get("market_value_sar")) \
+        or _to_float((row or {}).get("suggested_sar"))
+    if not size or size <= 0:
+        size = float(_venue_floor_safe(sym) or 10000.0)
+    return p, roi, _rt_cost_pct_safe(sym, size)
+
+
+def _annotate_hold_edge(row):
+    """Per-holding §18 stamp. Annotation only; env-gated; never raises."""
+    if not _env_holdedge_annotate() or not isinstance(row, dict):
+        return
+    try:
+        p, roi, rt = _edge_fields(row)
+        row["p_hit_proxy"] = p
+        if rt is not None:
+            row["exit_rt_cost_pct"] = round(rt, 2)
+        if roi is not None:
+            row["hold_edge_pct"] = round(p * roi, 2)
+    except Exception as exc:
+        row["hold_edge_err"] = type(exc).__name__
+
+
+def switch_test(hold_edge_pct, cand_edge_pct, rt_hold_pct, rt_cand_pct,
+                buffer_pct=1.0):
+    """§18.3 replacement test (PURE). SWITCH only when
+    cand − hold > 2 x max(RT) + buffer; anything unpriceable => honest refusal."""
+    he, ce = _to_float(hold_edge_pct), _to_float(cand_edge_pct)
+    rh, rc = _to_float(rt_hold_pct), _to_float(rt_cand_pct)
+    if he is None or ce is None or rh is None or rc is None:
+        return {"verdict": "INSUFFICIENT_DATA", "delta": None, "hurdle": None}
+    hurdle = 2.0 * max(rh, rc) + float(buffer_pct)
+    delta = ce - he
+    return {"verdict": "SWITCH" if delta > hurdle else "KEEP",
+            "delta": round(delta, 2), "hurdle": round(hurdle, 2)}
+
+
+def advisor_switch_scan(holdings, candidates, buffer_pct=1.0, top_k=3):
+    """§18.3/§18.4 (PURE). Compare every holding against every candidate;
+    return top-k clearing proposals, else the first-class NO_ACTION verdict."""
+    proposals = []
+    checked = 0
+    for h in holdings or []:
+        hp, hroi, hrt = _edge_fields(h)
+        if hroi is None:
+            continue
+        he = hp * hroi
+        for c in candidates or []:
+            cp, croi, crt = _edge_fields(c)
+            if croi is None:
+                continue
+            checked += 1
+            res = switch_test(he, cp * croi, hrt, crt, buffer_pct)
+            if res["verdict"] == "SWITCH":
+                proposals.append({
+                    "sell": (h or {}).get("symbol"),
+                    "buy": (c or {}).get("symbol"),
+                    "delta_pct": res["delta"],
+                    "hurdle_pct": res["hurdle"],
+                })
+    proposals.sort(key=lambda x: -(x["delta_pct"] or 0))
+    return {"verdict": "SWITCH_CANDIDATES" if proposals else "NO_ACTION",
+            "proposals": proposals[:max(1, int(top_k))],
+            "pairs_checked": checked,
+            "note": ("no candidate beats any holding by 2xRT + "
+                     + str(buffer_pct) + "% — keeping everything is the "
+                     "recommendation" if not proposals else "")}
 
 
 def make_controls(overrides=None):
@@ -1404,6 +1519,7 @@ def _action_row(entry, review_date, controls):
             "review_date": review_date,
         },
     }
+    _annotate_hold_edge(row)  # v1.2.0 hold-edge stamp (env-gated)
     if _eng_display:
         row["engine_roi_pct"] = _round(engine_pct, 1)
         row["valuation_roi_pct"] = _round(cand.get("roi_pct"), 1)
