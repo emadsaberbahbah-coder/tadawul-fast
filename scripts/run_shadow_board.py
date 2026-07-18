@@ -44,15 +44,24 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 # break on a repeated header row or a non-symbol-shaped symbol cell (stops
 # ingestion at "ALL QUALIFIED" / "SECTOR SUMMARY" sections); dedupe by symbol.
 # Root-caused from export __44_ after live dry-run returned cands=0.
-SCRIPT_VERSION = "1.0.1"
+# v1.1.0 (2026-07-18): BOARD FUNDAMENTALS — per-symbol market cap + total debt
+# + sector/industry fetched via yfinance inside the job (<=12 symbols, gentle
+# pacing) so the Rajhi-style model screen resolves REAL pass/fail instead of
+# UNKNOWN. Mapper fixes from export-evidence: `Conf` and `Ticket SAR` header
+# tokens (both were missed -> p defaulted to 0.50 and tickets to venue
+# floors); board `Sector` captured. ROI binding verified CORRECT: col `ROI %`
+# is the champion's stability-adjusted display ROI (17.5 vs Engine 34.8 on
+# 2269.T is real data, not a bug). Board gains Sector + Debt/MCap %% columns;
+# verdict line now carries fundamentals coverage + regime summary.
+SCRIPT_VERSION = "1.1.0"
 TAB_OUT = "Shadow_Board"
 TAB_TOP10 = "Top_10_Investments"
 TAB_HOLDINGS = "Portfolio_Decision"
 
-OUT_HEADER = ["Symbol", "Name", "Champion Action", "ROI %", "Confidence",
-              "Shariah Status", "Shariah Source", "Tradability", "Venue",
-              "Floor OK", "RT Cost %", "Net Edge %", "Hurdle %",
-              "Edge Verdict", "Gen2 Eligible"]
+OUT_HEADER = ["Symbol", "Name", "Champion Action", "Sector", "ROI %",
+              "Confidence", "Shariah Status", "Shariah Source", "Tradability",
+              "Venue", "Floor OK", "RT Cost %", "Net Edge %", "Hurdle %",
+              "Edge Verdict", "Debt/MCap %", "Gen2 Eligible"]
 
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=2y&interval=1mo"
 REGIME_SLEEVES = {"Global": "SPUS", "Saudi": "^TASI.SR"}
@@ -86,9 +95,10 @@ def resolve_columns(header: Sequence[Any]) -> Dict[str, Optional[int]]:
         "symbol": find("symbol", "ticker"),
         "name": find("companyname", "name"),
         "action": find("action", "recommendation"),
+        "sector": find("sector"),
         "roi": find("roi", prefer="expectedroi"),
-        "confidence": find("confidence"),
-        "value_sar": find("valuesar", "marketvalue", "suggestedsar"),
+        "confidence": find("confidence", "conf"),
+        "value_sar": find("ticketsar", "valuesar", "marketvalue", "suggestedsar"),
     }
 
 
@@ -145,21 +155,56 @@ def rows_to_records(values: Sequence[Sequence[Any]],
                     "roi_pct": f(g("roi")),
                     "confidence_band": str(g("confidence") or "").strip().title() or None,
                     "market_value_sar": f(g("value_sar")),
+                    "sector": str(g("sector") or "").strip(),
                 })
             return out
     return []
 
 
+def fetch_board_fundamentals(symbols: Sequence[str], sleep_s: float = 0.4
+                             ) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """Per-symbol marketCap/totalDebt/sector/industry for the model screen.
+    Board-sized only (<=12), gently paced; every miss is reported, never
+    fabricated. yfinance absent => empty coverage with the reason."""
+    out: Dict[str, Dict[str, Any]] = {}
+    errs: List[str] = []
+    try:
+        import yfinance as yf
+    except Exception as exc:  # noqa: BLE001
+        return out, [f"yfinance_unavailable:{type(exc).__name__}"]
+    import time as _t
+    for sym in list(symbols)[:12]:
+        try:
+            info = yf.Ticker(sym).get_info()
+            out[sym] = {"market_cap": info.get("marketCap"),
+                        "interest_debt": info.get("totalDebt"),
+                        "sector": info.get("sector") or "",
+                        "industry": info.get("industry") or ""}
+        except Exception as exc:  # noqa: BLE001
+            errs.append(f"{sym}:{type(exc).__name__}")
+        _t.sleep(sleep_s)
+    return out, errs
+
+
 def evaluate_board(cands: List[Dict[str, Any]],
                    auth_index: Dict[str, Dict[str, Any]],
                    monitor: Dict[str, str],
-                   equity: float) -> Tuple[List[List[Any]], Dict[str, Any]]:
+                   equity: float,
+                   fundamentals: Optional[Dict[str, Dict[str, Any]]] = None
+                   ) -> Tuple[List[List[Any]], Dict[str, Any]]:
     """-> (Shadow_Board data rows, summary dict). Pure given inputs."""
     rows: List[List[Any]] = []
     eligible = 0
     blocked: Dict[str, int] = {}
+    fnd_all = fundamentals or {}
     for c in cands:
-        v = cg.evaluate(c["symbol"], {"name": c["name"]}, auth_index,
+        fnd = fnd_all.get(c["symbol"], {})
+        sector = fnd.get("sector") or c.get("sector") or ""
+        gate_row = {"name": c["name"], "sector": sector,
+                    "industry": fnd.get("industry") or "",
+                    "market_cap": fnd.get("market_cap"),
+                    "interest_debt": fnd.get("interest_debt")}
+        v = cg.evaluate(c["symbol"], gate_row, auth_index,
                         monitor=monitor, equity_sar=equity)
         ticket = c.get("market_value_sar") or (ob._venue_floor(c["symbol"]) or 10000.0)
         rt = ob.rt_cost_pct(c["symbol"], ticket)
@@ -179,8 +224,10 @@ def evaluate_board(cands: List[Dict[str, Any]],
             key = ("FLOOR_LOCKED" if v.shariah_status in cg.INVEST_OK_STATUSES
                    else v.shariah_status)
             blocked[key] = blocked.get(key, 0) + 1
+        mc, dbt = fnd.get("market_cap"), fnd.get("interest_debt")
+        ratio = round(float(dbt) / float(mc) * 100.0, 1) if (mc and dbt) else ""
         rows.append([
-            c["symbol"], c["name"], c["action"],
+            c["symbol"], c["name"], c["action"], sector,
             roi if roi is not None else "",
             c.get("confidence_band") or "",
             v.shariah_status, v.shariah_source, v.tradability, v.venue or "",
@@ -188,7 +235,7 @@ def evaluate_board(cands: List[Dict[str, Any]],
             round(rt, 2) if rt is not None else "",
             round(ne, 2) if ne is not None else "",
             round(hurdle, 2) if hurdle is not None else "",
-            verdict, "YES" if gen2 else "NO",
+            verdict, ratio, "YES" if gen2 else "NO",
         ])
     return rows, {"evaluated": len(cands), "compliance_eligible": eligible,
                   "blocked": blocked}
@@ -291,7 +338,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     monitor = sa.get_monitor_map()
     ameta = sa.get_meta()
 
-    data_rows, summary = evaluate_board(cands, auth, monitor, equity)
+    fnd, fnd_errs = fetch_board_fundamentals([c["symbol"] for c in cands])
+    data_rows, summary = evaluate_board(cands, auth, monitor, equity, fnd)
     scan = pa.advisor_switch_scan(holds, cands)
     regime_block = build_regime_block()
 
@@ -306,6 +354,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         ["switch scan: " + scan["verdict"],
          json.dumps(scan["proposals"][:3], ensure_ascii=False),
          f"pairs={scan['pairs_checked']}"],
+        [f"fundamentals coverage={len(fnd)}/{len(cands)}",
+         ";".join(fnd_errs[:4]) or "-"],
         ["regime: " + json.dumps(regime_block.get("sleeves", {}), default=str),
          "weights=" + json.dumps(regime_block.get("suggested_weights") or {}),
          ";".join(regime_block.get("errors", []) or [])],
@@ -315,7 +365,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     verdict = (f"[SHADOW-BOARD v{SCRIPT_VERSION}] cands={summary['evaluated']} "
                f"eligible={summary['compliance_eligible']} "
                f"blocked={summary['blocked']} switch={scan['verdict']} "
-               f"auth_rows={ameta.get('rows', 0)}")
+               f"auth_rows={ameta.get('rows', 0)} fnd={len(fnd)}/{len(cands)} "
+               f"regime={'ERR' if regime_block.get('errors') else 'OK'} "
+               f"w={json.dumps(regime_block.get('suggested_weights') or {})}")
     print(verdict)
     if args.dry_run:
         for r in data_rows[:10]:
@@ -395,16 +447,46 @@ def _selftest() -> int:
     rows, summary = evaluate_board(recs, auth, {}, equity=130000)
     by = {r[0]: r for r in rows}
     checks.append(("board: STC authority-pass + TRADE + Gen2 YES",
-                   by["7010.SR"][5] == "AUTHORITY_PASS"
-                   and by["7010.SR"][13] == "TRADE"
-                   and by["7010.SR"][14] == "YES"))
+                   by["7010.SR"][6] == "AUTHORITY_PASS"
+                   and by["7010.SR"][14] == "TRADE"
+                   and by["7010.SR"][16] == "YES"))
     checks.append(("board: Nomu venue-blocked, Gen2 NO",
-                   by["9628.SR"][5] == "VENUE_BLOCK" and by["9628.SR"][14] == "NO"))
+                   by["9628.SR"][6] == "VENUE_BLOCK" and by["9628.SR"][16] == "NO"))
     checks.append(("summary counts", summary["evaluated"] == 2
                    and summary["compliance_eligible"] == 1
                    and summary["blocked"] == {"VENUE_BLOCK": 1}))
     checks.append(("header width matches rows",
                    all(len(r) == len(OUT_HEADER) for r in rows)))
+    # cockpit header variant: `Conf` + `Ticket SAR` + `Sector` must bind
+    v_hdr = ["Rank", "Symbol", "Name", "Sector", "Ticket SAR", "ROI %",
+             "Engine ROI %", "Conf"]
+    vcols = resolve_columns(v_hdr)
+    checks.append(("cockpit tokens bind (Conf/Ticket SAR/Sector, ROI=first)",
+                   vcols["confidence"] == 7 and vcols["value_sar"] == 4
+                   and vcols["sector"] == 3 and vcols["roi"] == 5))
+    fnd = {"2269.T": {"market_cap": 1.1e12, "interest_debt": 2.0e11,
+                      "sector": "Consumer Staples", "industry": "Food"},
+           "BBD.US": {"market_cap": 3.0e10, "interest_debt": 5.0e9,
+                      "sector": "Financials", "industry": "Banks"}}
+    f_cands = [{"symbol": "2269.T", "name": "Meiji Holdings", "action": "",
+                "roi_pct": 17.5, "confidence_band": "High",
+                "market_value_sar": 18000, "sector": ""},
+               {"symbol": "BBD.US", "name": "Banco Bradesco", "action": "",
+                "roi_pct": 9.0, "confidence_band": "High",
+                "market_value_sar": 8000, "sector": ""},
+               {"symbol": "4502.T", "name": "Takeda", "action": "",
+                "roi_pct": 12.0, "confidence_band": "High",
+                "market_value_sar": 15000, "sector": "Health Care"}]
+    f_rows, _ = evaluate_board(f_cands, {}, {}, 130000, fnd)
+    fb = {r[0]: r for r in f_rows}
+    checks.append(("fundamentals -> Meiji real MODEL_SCREEN pass + ratio + YES",
+                   fb["2269.T"][6] == "MODEL_SCREEN_PASS_NOT_FATWA"
+                   and fb["2269.T"][15] == 18.2 and fb["2269.T"][16] == "YES"))
+    checks.append(("fundamentals -> bank fails the screen",
+                   fb["BBD.US"][6] == "MODEL_SCREEN_FAIL"
+                   and fb["BBD.US"][16] == "NO"))
+    checks.append(("no fundamentals -> honest UNKNOWN persists",
+                   fb["4502.T"][6] == "UNKNOWN"))
     mo = rg.monthly_from_daily([(date(2026, m, 1), 100.0 + m) for m in range(1, 13)])
     checks.append(("regime helpers importable end-to-end",
                    rg.current_regime(mo)["state"] in ("RISK_ON", "RISK_OFF")))
