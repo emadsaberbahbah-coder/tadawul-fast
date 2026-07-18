@@ -53,7 +53,14 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 # is the champion's stability-adjusted display ROI (17.5 vs Engine 34.8 on
 # 2269.T is real data, not a bug). Board gains Sector + Debt/MCap %% columns;
 # verdict line now carries fundamentals coverage + regime summary.
-SCRIPT_VERSION = "1.1.0"
+# v1.1.1 (2026-07-18): live-memo findings. (1) Yahoo-native symbol mapping —
+# `.US` suffix stripped for fundamentals queries (TRMD.US -> TRMD); Tokyo/
+# Brussels/HK suffixes are Yahoo-native and pass through. (2) Coverage
+# honesty — yfinance returns an empty shell instead of raising on unknown
+# symbols; a symbol now counts as covered ONLY if it actually carried data
+# (market cap, debt, or sector), else it lands in the error list. (3) Regime
+# history widened to 5y (2y left ^TASI.SR under the 10-month minimum).
+SCRIPT_VERSION = "1.1.1"
 TAB_OUT = "Shadow_Board"
 TAB_TOP10 = "Top_10_Investments"
 TAB_HOLDINGS = "Portfolio_Decision"
@@ -63,7 +70,7 @@ OUT_HEADER = ["Symbol", "Name", "Champion Action", "Sector", "ROI %",
               "Venue", "Floor OK", "RT Cost %", "Net Edge %", "Hurdle %",
               "Edge Verdict", "Debt/MCap %", "Gen2 Eligible"]
 
-YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=2y&interval=1mo"
+YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5y&interval=1mo"
 REGIME_SLEEVES = {"Global": "SPUS", "Saudi": "^TASI.SR"}
 
 
@@ -175,15 +182,30 @@ def fetch_board_fundamentals(symbols: Sequence[str], sleep_s: float = 0.4
     import time as _t
     for sym in list(symbols)[:12]:
         try:
-            info = yf.Ticker(sym).get_info()
-            out[sym] = {"market_cap": info.get("marketCap"),
-                        "interest_debt": info.get("totalDebt"),
-                        "sector": info.get("sector") or "",
-                        "industry": info.get("industry") or ""}
+            info = yf.Ticker(_yahoo_symbol(sym)).get_info()
+            rec = {"market_cap": info.get("marketCap"),
+                   "interest_debt": info.get("totalDebt"),
+                   "sector": info.get("sector") or "",
+                   "industry": info.get("industry") or ""}
+            if _fnd_valid(rec):
+                out[sym] = rec
+            else:
+                errs.append(f"{sym}:no_data")
         except Exception as exc:  # noqa: BLE001
             errs.append(f"{sym}:{type(exc).__name__}")
         _t.sleep(sleep_s)
     return out, errs
+
+
+def _yahoo_symbol(sym: str) -> str:
+    """Yahoo-native mapping: `.US` is a TFB convention, not a Yahoo suffix."""
+    s = str(sym).strip().upper()
+    return s[:-3] if s.endswith(".US") else s
+
+
+def _fnd_valid(rec: Dict[str, Any]) -> bool:
+    return bool(rec.get("market_cap") or rec.get("interest_debt")
+                or rec.get("sector"))
 
 
 def evaluate_board(cands: List[Dict[str, Any]],
@@ -487,6 +509,15 @@ def _selftest() -> int:
                    and fb["BBD.US"][16] == "NO"))
     checks.append(("no fundamentals -> honest UNKNOWN persists",
                    fb["4502.T"][6] == "UNKNOWN"))
+    checks.append(("yahoo symbol mapping (.US stripped, natives pass)",
+                   _yahoo_symbol("TRMD.US") == "TRMD"
+                   and _yahoo_symbol("2269.T") == "2269.T"
+                   and _yahoo_symbol("0083.HK") == "0083.HK"))
+    checks.append(("coverage honesty: empty shell rejected, partial accepted",
+                   not _fnd_valid({"market_cap": None, "interest_debt": None,
+                                   "sector": "", "industry": ""})
+                   and _fnd_valid({"market_cap": None, "interest_debt": None,
+                                   "sector": "Energy", "industry": ""})))
     mo = rg.monthly_from_daily([(date(2026, m, 1), 100.0 + m) for m in range(1, 13)])
     checks.append(("regime helpers importable end-to-end",
                    rg.current_regime(mo)["state"] in ("RISK_ON", "RISK_OFF")))
