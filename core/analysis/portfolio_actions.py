@@ -326,7 +326,13 @@ from datetime import datetime, timedelta, timezone
 # field. Gate: TFB_PA_HOLDEDGE_ANNOTATE (default OFF => byte-identical).
 # p_hit remains a labeled PROXY until the calibrator graduates.
 # -----------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.2.0"
+# v1.2.1 (2026-07-18) — D-9 CLOSED: ANCHOR PROTECTION. SUKUK-class holdings
+# are excluded from the SELL side of switch proposals (the capital-
+# preservation anchor is a policy choice, not a low-edge position to churn).
+# Detection via core.compliance_gate.classify_asset (lazy, fail-open).
+# TFB_PA_PROTECT_SUKUK=0 restores v1.2.0. Scan result gains
+# `anchors_protected` for the memo's audit trail.
+PORTFOLIO_ACTIONS_VERSION = "1.2.1"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -632,6 +638,22 @@ def _annotate_hold_edge(row):
         row["hold_edge_err"] = type(exc).__name__
 
 
+def _protect_sukuk_enabled():
+    v = os.environ.get("TFB_PA_PROTECT_SUKUK", "1")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_sukuk_holding(row):
+    """D-9: classify via the compliance gate's taxonomy; fail-open False."""
+    try:
+        import importlib as _il
+        cgm = _il.import_module("core.compliance_gate")
+        return cgm.classify_asset(str((row or {}).get("symbol") or ""),
+                                  str((row or {}).get("name") or "")) == "SUKUK"
+    except Exception:
+        return False
+
+
 def switch_test(hold_edge_pct, cand_edge_pct, rt_hold_pct, rt_cand_pct,
                 buffer_pct=1.0):
     """§18.3 replacement test (PURE). SWITCH only when
@@ -651,7 +673,11 @@ def advisor_switch_scan(holdings, candidates, buffer_pct=1.0, top_k=3):
     return top-k clearing proposals, else the first-class NO_ACTION verdict."""
     proposals = []
     checked = 0
+    protected = 0
     for h in holdings or []:
+        if _protect_sukuk_enabled() and _is_sukuk_holding(h):
+            protected += 1          # D-9: the anchor is never a SELL leg
+            continue
         hp, hroi, hrt = _edge_fields(h)
         if hroi is None:
             continue
@@ -673,6 +699,7 @@ def advisor_switch_scan(holdings, candidates, buffer_pct=1.0, top_k=3):
     return {"verdict": "SWITCH_CANDIDATES" if proposals else "NO_ACTION",
             "proposals": proposals[:max(1, int(top_k))],
             "pairs_checked": checked,
+            "anchors_protected": protected,
             "note": ("no candidate beats any holding by 2xRT + "
                      + str(buffer_pct) + "% — keeping everything is the "
                      "recommendation" if not proposals else "")}
