@@ -1,5 +1,6 @@
 name: "🕶️ TFB Shadow Board"
 
+# v1.1.0: +yfinance (board fundamentals), actions bumped to Node-24 majors.
 # Wave S deliverable #10b (Master Plan v2.1 §3/§15). Writes the Shadow_Board
 # tab from the CHAMPION's own workbook outputs, twice daily + on dispatch.
 # Gate env is job-scoped here — independent of Render's flag set.
@@ -26,14 +27,14 @@ jobs:
       TFB_COMPLIANCE_GATE_ENABLED: "1"
       TFB_SHADOW_EQUITY_SAR: ${{ vars.TFB_SHADOW_EQUITY_SAR }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install --quiet gspread google-auth httpx
+        run: pip install --quiet gspread google-auth httpx yfinance
 
       - name: Materialize Google credentials
         env:
