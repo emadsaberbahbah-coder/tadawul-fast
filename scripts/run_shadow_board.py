@@ -60,7 +60,12 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 # symbols; a symbol now counts as covered ONLY if it actually carried data
 # (market cap, debt, or sector), else it lands in the error list. (3) Regime
 # history widened to 5y (2y left ^TASI.SR under the 10-month minimum).
-SCRIPT_VERSION = "1.1.1"
+# v1.1.2 (2026-07-18): ELIGIBILITY-COHERENT SWITCH SCAN. The live memo caught
+# the scan proposing to BUY names Gen-2 itself blocks (TRMD.US/MRP.US,
+# MODEL_SCREEN_FAIL). Plan rule (§4): non-eligible can never be a BUY —
+# candidates are now filtered to Gen2-eligible before advisor_switch_scan,
+# via the shared eligible_symbols() helper (the weekly brief imports it).
+SCRIPT_VERSION = "1.1.2"
 TAB_OUT = "Shadow_Board"
 TAB_TOP10 = "Top_10_Investments"
 TAB_HOLDINGS = "Portfolio_Decision"
@@ -166,6 +171,11 @@ def rows_to_records(values: Sequence[Sequence[Any]],
                 })
             return out
     return []
+
+
+def eligible_symbols(rows: List[List[Any]]) -> set:
+    """Symbols whose board row says Gen2 Eligible == YES (last column)."""
+    return {r[0] for r in rows or [] if r and r[-1] == "YES"}
 
 
 def fetch_board_fundamentals(symbols: Sequence[str], sleep_s: float = 0.4
@@ -362,7 +372,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     fnd, fnd_errs = fetch_board_fundamentals([c["symbol"] for c in cands])
     data_rows, summary = evaluate_board(cands, auth, monitor, equity, fnd)
-    scan = pa.advisor_switch_scan(holds, cands)
+    ok = eligible_symbols(data_rows)
+    scan = pa.advisor_switch_scan(
+        holds, [c for c in cands if c["symbol"] in ok])
     regime_block = build_regime_block()
 
     meta = [
@@ -518,6 +530,8 @@ def _selftest() -> int:
                                    "sector": "", "industry": ""})
                    and _fnd_valid({"market_cap": None, "interest_debt": None,
                                    "sector": "Energy", "industry": ""})))
+    checks.append(("eligibility filter reads the YES column",
+                   eligible_symbols(rows) == {"7010.SR"}))
     mo = rg.monthly_from_daily([(date(2026, m, 1), 100.0 + m) for m in range(1, 13)])
     checks.append(("regime helpers importable end-to-end",
                    rg.current_regime(mo)["state"] in ("RISK_ON", "RISK_OFF")))
