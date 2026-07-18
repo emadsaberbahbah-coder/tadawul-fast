@@ -209,7 +209,21 @@ logger.addHandler(logging.NullHandler())
 # Version / Canonical contract
 # =============================================================================
 
-__version__ = "5.9.0"
+# -----------------------------------------------------------------------------
+# v5.10.0 (2026-07-19) — ROI SOFT-CAP: THE SATURATION KILLER (revision #14)
+# WHY (Master Plan v2.1 §6/§10; live evidence 2026-07-18): the hard _clamp on
+# expected-ROI bounds pins every strong forecast at the identical ceiling —
+# the production Top-10 printed 35.0 across formerly-distinct names, starving
+# net-edge math and ranking of differentiation. Fix: an ORDER-PRESERVING
+# tanh soft-cap applied at every horizon bound. Below a knee (60% of the
+# bound) values pass identically; above it they compress monotonically and
+# asymptotically toward the bound — never exceeding it, never equal for
+# distinct inputs. Bound-agnostic: honors whatever min/max the settings
+# supply. The full percentile→realized mapping remains the Wave-B
+# calibrator's job; this restores ORDERING today with bounded honesty.
+# Gate: TFB_SCORE_ROI_SOFTCAP (default OFF => _roi_bound ≡ _clamp exactly;
+# champion byte-identical until armed).
+__version__ = "5.10.0"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -658,6 +672,37 @@ DEFAULT_FORECASTS = DEFAULT_FORECAST_PARAMETERS
 # =============================================================================
 # Utility helpers
 # =============================================================================
+
+def _roi_softcap_enabled() -> bool:
+    """v5.10.0 master switch. Default OFF => hard clamp, byte-identical."""
+    return (os.getenv("TFB_SCORE_ROI_SOFTCAP") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _roi_bound(value: float, min_val: float, max_val: float) -> float:
+    """v5.10.0: order-preserving bound. Flag off -> _clamp verbatim. Flag on:
+    identity below the knee (60% of each side's bound), tanh compression
+    above it, asymptotic to the bound. Degenerate bounds fall back to
+    _clamp."""
+    if not _roi_softcap_enabled():
+        return _clamp(value, min_val, max_val)
+    try:
+        v = float(value)
+        hi, lo = float(max_val), float(min_val)
+        if not (hi > 0.0 and lo < 0.0):
+            return _clamp(value, min_val, max_val)
+        knee_p = 0.6 * hi
+        if v > knee_p:
+            span = hi - knee_p
+            return knee_p + span * math.tanh((v - knee_p) / span)
+        knee_n = 0.6 * lo
+        if v < knee_n:
+            span = knee_n - lo
+            return knee_n - span * math.tanh((knee_n - v) / span)
+        return v
+    except Exception:
+        return _clamp(value, min_val, max_val)
+
 
 def _clamp(value: float, min_val: float, max_val: float) -> float:
     return max(min_val, min(value, max_val))
@@ -1351,15 +1396,15 @@ def derive_forecast_patch(row: Mapping[str, Any], forecasts: ForecastParameters)
         fp1 = None
 
     if roi12 is not None:
-        roi12 = _clamp(roi12, forecasts.min_roi_12m, forecasts.max_roi_12m)
+        roi12 = _roi_bound(roi12, forecasts.min_roi_12m, forecasts.max_roi_12m)
     if roi3 is None and roi12 is not None:
-        roi3 = _clamp(roi12 * forecasts.ratio_3m_of_12m, forecasts.min_roi_3m, forecasts.max_roi_3m)
+        roi3 = _roi_bound(roi12 * forecasts.ratio_3m_of_12m, forecasts.min_roi_3m, forecasts.max_roi_3m)
     if roi1 is None and roi12 is not None:
-        roi1 = _clamp(roi12 * forecasts.ratio_1m_of_12m, forecasts.min_roi_1m, forecasts.max_roi_1m)
+        roi1 = _roi_bound(roi12 * forecasts.ratio_1m_of_12m, forecasts.min_roi_1m, forecasts.max_roi_1m)
     if roi3 is not None:
-        roi3 = _clamp(roi3, forecasts.min_roi_3m, forecasts.max_roi_3m)
+        roi3 = _roi_bound(roi3, forecasts.min_roi_3m, forecasts.max_roi_3m)
     if roi1 is not None:
-        roi1 = _clamp(roi1, forecasts.min_roi_1m, forecasts.max_roi_1m)
+        roi1 = _roi_bound(roi1, forecasts.min_roi_1m, forecasts.max_roi_1m)
 
     if price is not None and price > 0:
         if fp12 is None and roi12 is not None:
