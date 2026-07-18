@@ -591,7 +591,21 @@ from datetime import datetime, timedelta, timezone
 # =engine -> the v1.0.20 engine basis. All prior WHYs preserved verbatim.
 # Zero functions removed (AST-verified).
 # =============================================================================
-OPPORTUNITY_BUILDER_VERSION = "1.0.24"
+# -----------------------------------------------------------------------------
+# v1.1.0 (2026-07-18) — GEN-2 ADVISOR MATH, STAGE 1 (Wave A, script #7)
+# WHY (Master Plan v2.1 §18.2/§18.5/§19.3): tickets must speak COST. Adds a
+# per-venue Derayah cost/floor model (official schedule constants of
+# 2026-07-18; slippage ledger reconciles), a NET-EDGE annotation
+# (p_hit_proxy x ROI − round-trip cost vs hurdle max(3xRT, 1.5%)) and an
+# opt-in venue-floor raise feeding the EXISTING v1.0.14 min-ticket deferral
+# branch. Both additions are env-gated OFF by default => byte-identical
+# champion behavior until flipped:
+#   TFB_OPP_NETEDGE_ANNOTATE=1  -> annotation fields only (champion-safe)
+#   TFB_OPP_VENUE_FLOORS=1      -> BEHAVIORAL: sub-floor picks defer
+# p_hit is an honest PROXY (confidence-band map) until the calibrator
+# graduates; the proxy used is printed on every ticket.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1140,6 +1154,100 @@ def _env_overrides():
         "audit_rows_max": _env_int("TFB_OPP_AUDIT_ROWS_MAX",
                                    DEFAULT_CRITERIA["audit_rows_max"]),
     }
+
+
+
+# ---- v1.1.0 Gen-2 venue cost / floor / net-edge model (§18.2, §18.5) ------- #
+_VENUE_COSTS = {
+    # suffix: (comm_pct_per_side, min_fee_sar_per_side, spread_rt_pct, floor_sar)
+    "":    (0.0,   0.0,  0.10,  5000),   # US via Derayah Global Lite (zero comm)
+    ".US": (0.0,   0.0,  0.10,  5000),
+    ".SR": (0.155, 0.0,  0.05,  4000),   # conservative ceiling until zero-tier confirmed
+    ".T":  (0.199, 46.0, 0.10, 13200),
+    ".HK": (0.199, 95.0, 0.15, 27200),
+    ".L":  (0.199, 97.2, 0.15, 27700),
+    ".PA": (0.199, 85.5, 0.12, 24500), ".AS": (0.199, 85.5, 0.12, 24500),
+    ".BR": (0.199, 85.5, 0.12, 24500), ".DE": (0.199, 85.5, 0.12, 24500),
+    ".MI": (0.199, 85.5, 0.12, 24500), ".MC": (0.199, 85.5, 0.12, 24500),
+    ".LS": (0.199, 85.5, 0.12, 24500), ".VI": (0.199, 85.5, 0.12, 24500),
+    ".SW": (0.199, 84.0, 0.12, 24200),
+    ".TO": (0.199, 54.0, 0.12, 15500),
+    ".AX": (0.199, 49.0, 0.12, 14100),
+    ".OL": (0.199, 70.0, 0.15, 20100),
+    ".SI": (0.199, 58.0, 0.12, 16700),
+    ".MX": (0.199, 38.0, 0.20, 11000),
+}
+_P_HIT_PROXY = {"High": 0.65, "Medium": 0.55, "Low": 0.45}
+
+
+def _env_flag01(name, default="0"):
+    v = os.environ.get(name, default)
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_netedge_annotate():
+    return _env_flag01("TFB_OPP_NETEDGE_ANNOTATE", "0")
+
+
+def _env_venue_floors():
+    return _env_flag01("TFB_OPP_VENUE_FLOORS", "0")
+
+
+def _venue_cost_row(symbol):
+    s = _to_text(symbol).strip().upper()
+    suf = ""
+    if "." in s:
+        suf = "." + s.rsplit(".", 1)[1]
+    if suf == ".US":
+        suf = ".US"
+    return _VENUE_COSTS.get(suf if suf else "")
+
+
+def _venue_floor(symbol):
+    row = _venue_cost_row(symbol)
+    return row[3] if row else None
+
+
+def rt_cost_pct(symbol, ticket_sar):
+    """Round-trip cost %% of ticket (2 sides commission-with-minimum + spread).
+    FX omitted per the tranche-batching policy (§18.7). None = no model."""
+    row = _venue_cost_row(symbol)
+    t = _to_float(ticket_sar)
+    if not row or not t or t <= 0:
+        return None
+    comm, min_fee, spread, _floor = row
+    per_side = max(comm / 100.0 * t, min_fee)
+    return (2.0 * per_side / t) * 100.0 + spread
+
+
+def _annotate_cost_edge(ticket, suggested):
+    """§18.2 net-edge stamp on one output ticket. Annotation only; never raises."""
+    if not _env_netedge_annotate():
+        return
+    try:
+        sym = ticket.get("symbol")
+        floor = _venue_floor(sym)
+        t = _to_float(suggested)
+        t_eff = t if (t and t > 0) else float(floor or 10000.0)
+        rt = rt_cost_pct(sym, t_eff)
+        ticket["venue_floor_sar"] = floor
+        if rt is None:
+            ticket["edge_verdict"] = "NO_COST_MODEL"
+            return
+        ticket["rt_cost_pct"] = round(rt, 2)
+        roi = _to_float(ticket.get("roi_pct"))
+        p = _P_HIT_PROXY.get(_to_text(ticket.get("confidence_band")).strip(), 0.50)
+        ticket["p_hit_proxy"] = p
+        if roi is None:
+            ticket["edge_verdict"] = "NO_ROI"
+            return
+        hurdle = max(3.0 * rt, 1.5)
+        ne = p * roi - rt
+        ticket["net_edge_pct"] = round(ne, 2)
+        ticket["edge_hurdle_pct"] = round(hurdle, 2)
+        ticket["edge_verdict"] = "TRADE" if ne >= hurdle else "EDGE_BELOW_COST"
+    except Exception as exc:  # annotation must never break tickets
+        ticket["edge_verdict"] = "EDGE_ERR:" + type(exc).__name__
 
 
 def make_criteria(overrides=None):
@@ -2099,6 +2207,12 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
         # == 0 (capital fully exhausted) is intentionally left to the existing
         # unfunded_watch path; this floor handles the 0 < suggested < min band.
         _min_ticket = criteria.get("min_ticket_sar", 0.0) or 0.0
+        # v1.1.0 (§18.5/§19.3, opt-in): the venue floor RAISES the operator
+        # floor; the existing deferral + near-miss machinery does the rest.
+        if _env_venue_floors():
+            _vf = _venue_floor(cand["symbol"])
+            if _vf and float(_vf) > _min_ticket:
+                _min_ticket = float(_vf)
         if _min_ticket > 0.0 and 0.0 < suggested < _min_ticket:
             deferrals[cand["symbol"]] = (
                 "Unfunded \u2014 sized ticket " + _fmt_sar(suggested) +
@@ -2329,6 +2443,7 @@ def _build_ticket(rank, pick, criteria, review_date):
         # labelled honestly as valuation for THIS ticket.
         ticket["primary_roi_basis"] = ("plan" if _ticket_plan_primary
                                        else "valuation")
+    _annotate_cost_edge(ticket, suggested)  # v1.1.0 net-edge stamp (env-gated)
     return ticket
 
 
