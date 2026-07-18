@@ -557,7 +557,19 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.21.0"
+# -----------------------------------------------------------------------------
+# v4.22.0 (2026-07-18) — SHADOW COMPLIANCE OBSERVER (Gen-2 Wave A0 #5)
+# WHY: Master Plan v2.1 §3 (Champion-Challenger) + §4/§19. The Layer-0 gate
+# (compliance_gate v1.0.0) and authority loader (shariah_authority v1.0.0) are
+# live; the S-1 evidence clock needs the selector to EVALUATE every produced
+# row against the gate WITHOUT touching champion output. Implementation: one
+# hook inside _build_payload (the single funnel all wrappers share) annotates
+# rows with shadow_* fields and writes meta["shadow_compliance"] + one
+# [SHADOW-GATE] log line. Double-gated: TFB_SHADOW_COMPLIANCE (default OFF)
+# and the gate's own TFB_COMPLIANCE_GATE_ENABLED. Any error degrades to an
+# error field in meta — the champion payload is NEVER altered or blocked.
+# -----------------------------------------------------------------------------
+TOP10_SELECTOR_VERSION = "4.22.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -4237,9 +4249,91 @@ def _apply_selection_stability(
     return out_rows, stability_meta
 
 
+def _apply_shadow_compliance(rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> None:
+    """v4.22.0 Shadow observer: annotate rows + meta with Layer-0 verdicts.
+    Read-only with respect to champion semantics; never raises."""
+    if not _env_bool("TFB_SHADOW_COMPLIANCE", False):
+        return
+    try:
+        cg = importlib.import_module("core.compliance_gate")
+        sa = importlib.import_module("core.shariah_authority")
+        if not cg.gate_enabled():
+            meta["shadow_compliance"] = {
+                "enabled": True,
+                "error": "gate_env_off:set TFB_COMPLIANCE_GATE_ENABLED=1",
+            }
+            logger.warning("[SHADOW-GATE v%s] gate env off — set "
+                           "TFB_COMPLIANCE_GATE_ENABLED=1", TOP10_SELECTOR_VERSION)
+            return
+        equity = _env_float("TFB_SHADOW_EQUITY_SAR", 130000.0)
+        auth = sa.get_authority_index()
+        mon = sa.get_monitor_map()
+        ameta = sa.get_meta()
+        blocked: Dict[str, int] = {}
+        eligible: List[Dict[str, Any]] = []
+        evaluated = 0
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            sym = _s(row.get("symbol") or row.get("Symbol"))
+            if not sym:
+                continue
+            gate_row = {
+                "name": _s(row.get("name") or row.get("company_name")
+                           or row.get("Company Name")),
+                "sector": _s(row.get("sector") or row.get("Sector")),
+                "industry": _s(row.get("industry") or row.get("Industry")),
+                "market_cap": _safe_float(row.get("market_cap")
+                                          or row.get("Market Cap")),
+                "interest_debt": _safe_float(row.get("interest_debt")
+                                             or row.get("total_debt")
+                                             or row.get("Total Debt")),
+                "impure_income_ratio": _safe_float(row.get("impure_income_ratio")),
+                "quote_type": _s(row.get("quote_type")),
+            }
+            v = cg.evaluate(sym, gate_row, auth, monitor=mon, equity_sar=equity)
+            evaluated += 1
+            row["shadow_shariah_status"] = v.shariah_status
+            row["shadow_shariah_source"] = v.shariah_source
+            row["shadow_asset_class"] = v.asset_class
+            row["shadow_invest_eligible"] = bool(v.invest_eligible)
+            row["shadow_floor_unlocked"] = v.floor_unlocked
+            if v.invest_eligible:
+                eligible.append({"symbol": sym, "status": v.shariah_status,
+                                 "source": v.shariah_source})
+            else:
+                key = ("FLOOR_LOCKED"
+                       if v.shariah_status in cg.INVEST_OK_STATUSES
+                       else v.shariah_status)
+                blocked[key] = blocked.get(key, 0) + 1
+        meta["shadow_compliance"] = {
+            "enabled": True,
+            "selector_version": TOP10_SELECTOR_VERSION,
+            "gate_version": getattr(cg, "__version__", "?"),
+            "authority_rows": ameta.get("rows", 0),
+            "authority_as_of": str(ameta.get("as_of") or ""),
+            "authority_error": sa.last_error(),
+            "equity_sar": equity,
+            "evaluated": evaluated,
+            "invest_eligible": len(eligible),
+            "blocked": blocked,
+            "board_preview": eligible[:12],
+        }
+        logger.info("[SHADOW-GATE v%s] evaluated=%d eligible=%d blocked=%s "
+                    "auth_rows=%s auth_err=%s", TOP10_SELECTOR_VERSION,
+                    evaluated, len(eligible), blocked,
+                    ameta.get("rows", 0), sa.last_error() or "-")
+    except Exception as exc:  # shadow must never harm the champion
+        meta["shadow_compliance"] = {"enabled": True,
+                                     "error": f"{type(exc).__name__}:{exc}"}
+        logger.warning("[SHADOW-GATE v%s] observer error: %s",
+                       TOP10_SELECTOR_VERSION, exc)
+
+
 def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
     include_headers = _coerce_bool(meta.get("include_headers", True), True)
     include_matrix = _coerce_bool(meta.get("include_matrix", True), True)
+    _apply_shadow_compliance(rows, meta)  # v4.22.0 shadow observer (no-op unless enabled)
     payload = {
         "status": status,
         "page": OUTPUT_PAGE,
