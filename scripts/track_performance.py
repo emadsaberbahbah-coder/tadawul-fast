@@ -870,7 +870,19 @@ from urllib.error import HTTPError, URLError
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "6.21.1"
+# -----------------------------------------------------------------------------
+# v6.22.0 (2026-07-18) — CA-GUARD LEDGER LAYER (Gen-2 revision program #13)
+# WHY: v6.18.0's CA-GUARD verifies only when |print ROI| >= 15pp, so a
+# CONFIRMED corporate action below the heuristic (a 21:20 bonus prints
+# -4.8%) slips through and matures wrong. The operator-confirmed
+# `_Corporate_Actions` ledger (core/corporate_actions v1.0.0) is
+# deterministic truth: when a confirmed action covers (symbol, entry_date),
+# verification is FORCED regardless of print magnitude, and the ledger's
+# pure-arithmetic ROI takes precedence over the chart heuristic. Empty
+# ledger (today) => byte-identical maturation. TFB_TRACK_CA_LEDGER=0
+# restores v6.21.1 verbatim; default ON so protection never depends on
+# remembering a flag before a confirmed action lands.
+SCRIPT_VERSION = "6.22.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -1901,6 +1913,117 @@ def _ca_adjusted_roi(symbol: str, entry_date: Any) -> Optional[float]:
     except Exception:
         return None
 
+
+
+# v6.22.0 — CA-GUARD ledger layer (confirmed `_Corporate_Actions` truth)
+# =============================================================================
+_CA_LEDGER_CACHE: Dict[str, Any] = {"loaded": False, "index": {}, "mod": None}
+
+
+def _ca_ledger_enabled() -> bool:
+    """v6.22.0 master switch. Default ON (empty ledger == exact no-op)."""
+    return (os.getenv("TFB_TRACK_CA_LEDGER") or "1").strip().lower() not in {
+        "0", "false", "off", "no"}
+
+
+def _ca_mod():
+    """Lazy import of core.corporate_actions; None if unavailable."""
+    if _CA_LEDGER_CACHE["mod"] is None:
+        try:
+            _ensure_project_root_on_path()
+            from core import corporate_actions as _cam  # noqa: PLC0415
+            _CA_LEDGER_CACHE["mod"] = _cam
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("%s ledger module unavailable: %s", _CA_TAG, exc)
+            _CA_LEDGER_CACHE["mod"] = False
+    return _CA_LEDGER_CACHE["mod"] or None
+
+
+def _ca_ledger_index() -> Dict[str, Any]:
+    """Confirmed-only adjustment index from `_Corporate_Actions`, loaded once
+    per run. Mirrors _load_costbasis_symbols' SA-credential pattern; ANY
+    problem -> {} with a debug line (never breaks maturation)."""
+    if _CA_LEDGER_CACHE["loaded"]:
+        return _CA_LEDGER_CACHE["index"]
+    _CA_LEDGER_CACHE["loaded"] = True
+    cam = _ca_mod()
+    sid = (os.getenv("TRACK_SHEET_ID") or os.getenv("TARGET_SHEET_ID")
+           or os.getenv("DEFAULT_SPREADSHEET_ID") or "").strip()
+    if not cam or not sid or not GSPREAD_AVAILABLE or gspread is None:
+        return {}
+    raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+           or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+    if not raw or service_account is None:
+        return {}
+    txt = raw
+    if not txt.startswith("{"):
+        try:
+            dec = base64.b64decode(txt).decode("utf-8", errors="replace").strip()
+            if dec.startswith("{"):
+                txt = dec
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        obj = json.loads(txt)
+        creds = service_account.Credentials.from_service_account_info(
+            obj, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        ws = gspread.authorize(creds).open_by_key(sid).worksheet(
+            cam.TAB_ACTIONS)
+        idx = cam.build_adjustment_index(
+            cam.parse_actions(ws.get_all_values()), confirmed_only=True)
+        _CA_LEDGER_CACHE["index"] = idx
+        if idx:
+            logger.info("%s ledger loaded: %d symbol(s) with confirmed "
+                        "actions", _CA_TAG, len(idx))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("%s ledger load failed: %s", _CA_TAG, exc)
+    return _CA_LEDGER_CACHE["index"]
+
+
+def _ca_ledger_factor(symbol: str, entry_date: Any) -> Optional[float]:
+    """Cumulative confirmed price factor for prices dated entry_date; 1.0/None
+    when no confirmed action applies."""
+    if not _ca_ledger_enabled():
+        return None
+    cam = _ca_mod()
+    idx = _ca_ledger_index()
+    if not cam or not idx:
+        return None
+    try:
+        f = cam.cumulative_factor(_safe_str(symbol).upper(),
+                                  cam._as_date(entry_date), idx)
+        return f if abs(f - 1.0) > 1e-9 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ca_ledger_roi(print_roi: float, factor: Optional[float]
+                   ) -> Optional[float]:
+    """Pure arithmetic: the honest ROI implied by the print under a confirmed
+    factor f (entry re-based: cur/(entry/f) - 1)."""
+    if factor is None:
+        return None
+    try:
+        return ((1.0 + float(print_roi) / 100.0) * float(factor) - 1.0) * 100.0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _ca_decide_v2(print_roi: float, adj_roi: Optional[float],
+                  ledger_roi: Optional[float],
+                  tol_pp: float = 12.0) -> Tuple[str, float]:
+    """v6.22.0 decision core. Precedence: confirmed ledger (deterministic)
+    > adjusted series (heuristic) > suspect. A ledger that AGREES with the
+    print confirms it without any network verification."""
+    if ledger_roi is not None:
+        # Deterministic truth takes NO tolerance: tol_pp exists for the noisy
+        # chart heuristic only. A 21:20 bonus prints -4.76 vs ledger 0.0 —
+        # within 12pp, yet the OUTCOME flips LOSS->BREAKEVEN. 0.5pp epsilon
+        # merely avoids note-churn on numerically identical values.
+        if abs(float(print_roi) - float(ledger_roi)) > 0.5:
+            return "ledger", float(ledger_roi)
+        return "ok", float(print_roi)
+    return _ca_decide(print_roi, adj_roi, tol_pp)
 
 # v6.17.0 — maturity price-integrity switches
 # =============================================================================
@@ -5615,9 +5738,20 @@ class PerformanceTrackerApp:
                     # (excluded like UNPRICED). TFB_TRACK_CA_GUARD=0 -> v6.17.0.
                     _roi_print = float(r.unrealized_roi or 0.0)
                     _verdict, _roi_use = "ok", _roi_print
-                    if _ca_guard_enabled() and abs(_roi_print) >= _ca_verify_pct():
-                        _adj = _ca_adjusted_roi(r.symbol, r.date_recorded)
-                        _verdict, _roi_use = _ca_decide(_roi_print, _adj)
+                    _lf = (_ca_ledger_factor(r.symbol, r.date_recorded)
+                           if _ca_guard_enabled() else None)
+                    _ledger_roi = _ca_ledger_roi(_roi_print, _lf)
+                    if _ca_guard_enabled() and (
+                            abs(_roi_print) >= _ca_verify_pct()
+                            or _ledger_roi is not None):
+                        # v6.22.0: a CONFIRMED ledger action forces
+                        # verification even below the 15pp heuristic (the
+                        # sub-threshold hole: a 21:20 bonus prints -4.8%).
+                        _adj = (None if _ledger_roi is not None
+                                else _ca_adjusted_roi(r.symbol,
+                                                      r.date_recorded))
+                        _verdict, _roi_use = _ca_decide_v2(
+                            _roi_print, _adj, _ledger_roi)
                     if _verdict == "suspect":
                         r.status = PerformanceStatus.EXPIRED
                         r.maturity_date = now_r
@@ -5630,13 +5764,20 @@ class PerformanceTrackerApp:
                         _expired_syms.append(r.symbol)
                         r.last_updated = _utc_now()
                         continue
-                    if _verdict == "adjust":
-                        _note = (f"[v6.18.0 CA-ADJUST] print {_roi_print:+.1f}% "
-                                 f"vs adjusted {_roi_use:+.1f}% — corporate "
-                                 f"action re-based the prints; matured on the "
-                                 f"adjusted series")
+                    if _verdict in ("adjust", "ledger"):
+                        _src = ("confirmed ledger" if _verdict == "ledger"
+                                else "adjusted series")
+                        _note = (f"[v6.22.0 CA-ADJUST] print "
+                                 f"{_roi_print:+.1f}% vs {_src} "
+                                 f"{_roi_use:+.1f}% — corporate action "
+                                 f"re-based the prints; matured on the "
+                                 f"{_src}")
                         r.notes = f"{r.notes} | {_note}" if r.notes else _note
                         r.unrealized_roi = float(_roi_use)
+                        if _verdict == "ledger":
+                            logger.info("%s ledger override %s: print "
+                                        "%+.1f%% -> %+.1f%%", _CA_TAG,
+                                        r.symbol, _roi_print, _roi_use)
                     r.status = PerformanceStatus.MATURED
                     r.maturity_date = now_r
                     r.realized_roi = float(_roi_use)
