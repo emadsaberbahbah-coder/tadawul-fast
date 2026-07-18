@@ -1,0 +1,62 @@
+name: "🕌 TFB Shariah Authority Refresh"
+
+# Wave A0 deliverable #2b (Master Plan v2.1 §4.1). Quarterly + manual.
+# Authority source order: AL_RAJHI_OFFICIAL (vars.TFB_SHARIAH_OFFICIAL_URLS,
+# captured in E0.4) -> operator upload tab `_Shariah_Upload` -> never Argaam
+# (Argaam = monitor only; disagreements land in the Monitor column => the
+# compliance gate marks CONFLICT and blocks).
+
+on:
+  schedule:
+    - cron: "17 6 1 1,4,7,10 *"     # 1st of Jan/Apr/Jul/Oct 06:17 UTC
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "auto | fetch | upload"
+        default: "auto"
+      as_of:
+        description: "Override As-Of date (YYYY-MM-DD, optional)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TFB_SHARIAH_OFFICIAL_URLS: ${{ vars.TFB_SHARIAH_OFFICIAL_URLS }}
+      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install --quiet gspread google-auth httpx
+
+      - name: Materialize Google credentials
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+          CREDS_PATH="$RUNNER_TEMP/gcreds.json"
+          if [[ -n "${SECRET_CREDS:-}" ]]; then
+            printf '%s' "$SECRET_CREDS" > "$CREDS_PATH"
+          elif [[ -n "${SECRET_CREDS_B64:-}" ]]; then
+            printf '%s' "$SECRET_CREDS_B64" | base64 -d > "$CREDS_PATH"
+          else
+            echo "::error::No Google credentials secret present."; exit 1
+          fi
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
+
+      - name: Refresh authority table
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [[ -n "${{ github.event.inputs.as_of }}" ]]; then EXTRA="--as-of ${{ github.event.inputs.as_of }}"; fi
+          python scripts/refresh_shariah_authority.py --mode "${{ github.event.inputs.mode || 'auto' }}" $EXTRA
