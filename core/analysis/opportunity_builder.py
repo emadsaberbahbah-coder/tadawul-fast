@@ -605,7 +605,29 @@ from datetime import datetime, timedelta, timezone
 # p_hit is an honest PROXY (confidence-band map) until the calibrator
 # graduates; the proxy used is printed on every ticket.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.1.0"
+# -----------------------------------------------------------------------------
+# v1.2.0 (2026-07-19) — STOP VOLATILITY UNIT FIX (env-gated, DEFAULT OFF)
+# WHY (measured on the live board 2026-07-19): the stop model is
+#     stop_pct = max(stop_floor_pct, stop_vol_mult * vol_30d), cap stop_max_pct
+# and it has NEVER fired the volatility term. The provider supplies
+# `Volatility 30D` as an ANNUALIZED FRACTION (CL.US 0.2802 = 28.0%,
+# HSIC.US 0.2375 = 23.7%, SNDK.US 1.4548 = 145.5% — cross-checked against
+# real names), while the formula's own documentation calls for a MONTHLYIZED
+# PERCENT. So 2.5 * 0.28 = 0.70%, always below the 8% floor, on every row.
+# EVIDENCE: all ten names on today's board print a stop distance of exactly
+# 8.00% — a tanker and a Japanese pharma given identical stops.
+# FIX: convert fraction-shaped input to monthlyized percent
+# (v * 100 / sqrt(12)) before the multiplier. Shape-detected, so a provider
+# that later supplies percent-shaped values is left alone.
+# CONSEQUENCE — READ BEFORE ARMING: correct stops are WIDER (Colgate-like
+# 28% vol -> ~20% stop at mult 2.5, vs 8% today). Wider stops mean SMALLER
+# positions for the same 0.75% risk budget (0.75/20 = 3.75% of equity vs
+# 0.75/8 = 9.4%), which pushes tickets BELOW several venue floors — Japan's
+# 13.2K in particular. Arming this without lowering stop_vol_mult will make
+# Japan unaffordable. Recommended pairing: TFB_OPP_STOP_VOL_MULT=1.5.
+# GATE: TFB_OPP_STOP_VOL_UNITS_FIX (default OFF) — committing changes NOTHING.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1537,9 +1559,10 @@ def normalize_candidate(row, fx_rates, criteria):
                        - 1.0) * 100.0
 
     vol30 = _to_float(_field(view, "vol_30d_pct"))
+    vol_for_stop = _stop_vol_input(vol30)
     stop_pct = criteria["stop_floor_pct"]
-    if vol30 is not None and vol30 > 0:
-        stop_pct = max(stop_pct, criteria["stop_vol_mult"] * vol30)
+    if vol_for_stop is not None and vol_for_stop > 0:
+        stop_pct = max(stop_pct, criteria["stop_vol_mult"] * vol_for_stop)
     stop_pct = min(stop_pct, criteria["stop_max_pct"])
 
     stop = tp1 = tp2 = rr = None
@@ -2277,6 +2300,29 @@ def _advisor_sentence(cand, suggested_sar, shares, conf, review_date):
               _fmt_num(_round1(cand["reliability"])))
     return ("INVEST \u2014 " + size_txt + " @ " + levels + "; " + reason +
             ". Confidence " + conf + ". Review by " + review_date + ".")
+
+
+def _stop_vol_input(vol30: Optional[float]) -> Optional[float]:
+    """v1.2.0: normalize the volatility input the stop model consumes.
+
+    Flag OFF -> returns the raw value, i.e. v1.1.0 behaviour verbatim.
+    Flag ON  -> a fraction-shaped value (annualized, e.g. 0.28 = 28%) is
+    converted to MONTHLYIZED PERCENT, which is what stop_vol_mult expects.
+    Shape detection (< 5.0) keeps a percent-shaped provider untouched, so
+    the fix cannot double-apply."""
+    if vol30 is None or vol30 <= 0:
+        return None
+    raw = float(vol30)
+    if not _stop_vol_units_fix_enabled():
+        return raw
+    if raw < 5.0:                       # annualized fraction
+        return raw * 100.0 / math.sqrt(12.0)
+    return raw                          # already percent-shaped
+
+
+def _stop_vol_units_fix_enabled() -> bool:
+    val = os.environ.get("TFB_OPP_STOP_VOL_UNITS_FIX", "0")
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _build_ticket(rank, pick, criteria, review_date):
