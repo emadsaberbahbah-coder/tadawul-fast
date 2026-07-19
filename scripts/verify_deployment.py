@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -70,7 +70,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_shadow_board", "1.1.3", "shadow board"),
     ("run_weekly_brief", "1.0.2", "weekly brief"),
     ("run_shadow_scorer", "1.1.0", "shadow scorer"),
-    ("track_performance", "6.24.0", "track performance"),
+    ("track_performance", "6.26.0", "track performance"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)
@@ -89,6 +89,8 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ("TRACK_HORIZONS", "1M,3M", "7D/14D checkpoints recorded", False),
     ("TFB_BACKTEST_KSA_YF", "0", "deep history unblocks hypothesis backtest", False),
     ("TFB_BACKTEST_NONOVERLAP", "0", "non-overlapping windows (honest t-stat)", False),
+    ("TFB_BACKTEST_DSR_GATE", "0", "deflated-Sharpe penalty on acceptance", False),
+    ("TFB_OPP_STOP_VOL_MULT", "2.5", "stop = mult x monthlyized vol", False),
     ("TFB_SYNC_NAME_DEDUP_MODE", "", "duplicate-name quarantine (D-4)", False),
 ]
 
