@@ -926,7 +926,31 @@ from urllib.error import HTTPError, URLError
 # also cleared when their own inputs were empty. Ships DEFAULT-ON: this is a
 # correctness fix to a display path, not a change to any decision logic.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.24.0"
+# -----------------------------------------------------------------------------
+# v6.25.0 (2026-07-19) — US LEG OF THE BACKTEST UNIVERSE RESTORED
+# WHY (observed in the first successful backtest, 2026-07-19): the run reported
+# "history fetched for 16/16 symbols", yet every US name carried only ~22 bars
+# and was silently skipped by run_backtest's `len(bars) < min_window+h+1` (33)
+# guard. The KSA+US universe was therefore ~100% KSA. Two causes compound:
+#   (1) the provider loop BREAKS on the first non-empty result, and yahoo_chart
+#       answers 200 OK with a shallow range=1mo window — so EODHD, which does
+#       serve US at full depth, is never consulted;
+#   (2) the deep-history fallback then calls yfinance with the '.US' suffix
+#       still attached, which 404s ("Quote not found for symbol: AAPL.US").
+# The v6.11.0 note reasoned that .US failing here "is fine -- EODHD already
+# serves US at full depth". That reasoning is sound but unreachable in practice,
+# because (1) means EODHD is never tried.
+# FIX: strip the '.US' suffix before the yfinance call. yfinance resolves bare
+# US tickers (AAPL, MSFT, JPM) at period=2y for ~500 bars, the same depth the
+# KSA leg already gets. Native suffixes yfinance understands (.SR, .T, .HK, .L
+# and friends) are passed through untouched.
+# IMPACT: the backtest universe roughly doubles and stops being KSA-weighted,
+# so effect sizes and hit rates describe the intended universe. It does NOT
+# change any verdict logic — the non-overlapping independent-window gate still
+# governs, and ACCEPTED still requires clearing min_sample, effect and t.
+# GATE: inherits TFB_BACKTEST_KSA_YF (already required for this path to run).
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.25.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -4710,6 +4734,21 @@ def default_hypotheses() -> List[Hypothesis]:
     ]
 
 
+def _yf_ticker(sym: str) -> str:
+    """v6.25.0: map a TFB symbol to the form yfinance resolves.
+
+    yfinance addresses US equities by BARE ticker — 'AAPL', not 'AAPL.US' —
+    and returns 404 / "possibly delisted" for the suffixed form, which is
+    exactly what silently emptied the US half of the backtest universe. Every
+    other suffix in our venue matrix (.SR .T .HK .L .PA .AS .BR .DE .MI .MC
+    .LS .VI .SW .TO .AX .OL .SI .MX) IS a native Yahoo suffix and must be
+    passed through unchanged."""
+    raw = str(sym or "").strip().upper()
+    if raw.endswith(".US"):
+        return raw[:-3]
+    return raw
+
+
 def _yf_deep_history(sym: str, period: str = "2y") -> List[Dict[str, Any]]:
     """v6.11.0: direct yfinance pull at an explicit multi-year depth. Used ONLY
     when TFB_BACKTEST_KSA_YF is enabled and a symbol came back shallow from the
@@ -4729,7 +4768,8 @@ def _yf_deep_history(sym: str, period: str = "2y") -> List[Dict[str, Any]]:
         # (the same split-brain fixed provider-side in yahoo_chart v8.8.0).
         # TFB_BT_ADJUSTED=0 restores the raw v6.17.0 pull.
         _adj = (os.getenv("TFB_BT_ADJUSTED") or "1").strip().lower() not in {"0", "false", "off", "no"}
-        df = yf.Ticker(sym).history(period=period, interval="1d", auto_adjust=_adj)
+        df = yf.Ticker(_yf_ticker(sym)).history(period=period, interval="1d",
+                                                auto_adjust=_adj)
     except Exception:
         return []
     if df is None or getattr(df, "empty", True):
