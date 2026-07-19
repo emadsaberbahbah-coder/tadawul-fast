@@ -846,6 +846,7 @@ import base64
 import concurrent.futures
 import csv
 import io
+import functools
 import json
 import logging
 import math
@@ -950,7 +951,28 @@ from urllib.error import HTTPError, URLError
 # governs, and ACCEPTED still requires clearing min_sample, effect and t.
 # GATE: inherits TFB_BACKTEST_KSA_YF (already required for this path to run).
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.25.0"
+# -----------------------------------------------------------------------------
+# v6.26.0 (2026-07-19) — DEFLATED-SHARPE GATE ON HYPOTHESIS ACCEPTANCE
+# WHY: core/validation.py v1.0.0 shipped the multiple-testing machinery the
+# Master Plan requires, and nothing called it. The backtest accepts on
+# (effect >= min_effect) AND (|t_indep| >= min_t) — a bar that says nothing
+# about HOW MANY hypotheses were tried to find that t. Four are registered
+# today and the registry is designed to grow; with enough registered triggers
+# a t of 2.0 arrives by chance alone. That is precisely what the Deflated
+# Sharpe Ratio (Bailey & Lopez de Prado) exists to price.
+# WHAT: when armed, an otherwise-ACCEPTED hypothesis must ALSO clear
+# DSR >= TFB_BACKTEST_MIN_DSR (default 0.95), computed on the INDEPENDENT
+# windows only, with n_trials = the number of hypotheses in this backtest run.
+# Skew and kurtosis of the signal returns enter the statistic, so a fat-tailed
+# edge is discounted the way it should be.
+# WHAT IT CANNOT DO: DSR only ever makes acceptance HARDER. It can turn
+# ACCEPTED into REJECTED; it can never rescue a REJECTED or promote an
+# INSUFFICIENT_DATA. The thin-sample branch still fires first and still wins.
+# GATE: TFB_BACKTEST_DSR_GATE (default OFF) — committing changes nothing.
+# When validation.py is unavailable the gate no-ops and says so in the notes,
+# never silently passing a hypothesis it failed to examine.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.26.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -4792,6 +4814,35 @@ def _yf_deep_history(sym: str, period: str = "2y") -> List[Dict[str, Any]]:
     return rows
 
 
+def _dsr_verdict(signal_indep: List[float], n_trials: int) -> Tuple[bool, str]:
+    """v6.26.0 -> (passes, note_fragment). Deflated Sharpe on the INDEPENDENT
+    windows. Fail-soft in one direction only: if the gate is off it passes
+    silently; if validation.py is missing it REFUSES and says so, rather than
+    passing a hypothesis it never examined."""
+    if (os.getenv("TFB_BACKTEST_DSR_GATE") or "0").strip().lower() \
+            not in {"1", "true", "yes", "on"}:
+        return True, ""
+    try:
+        from core import validation as _v  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return False, ("; DSR gate armed but validation.py unavailable (%s) "
+                       "-- refusing rather than assuming" % type(exc).__name__)
+    vals = [float(x) for x in (signal_indep or [])]
+    if len(vals) < 3:
+        return False, "; DSR not computable (n_indep<3)"
+    sr = _v.sharpe_ratio(vals)
+    if sr is None:
+        return False, "; DSR not computable (zero dispersion)"
+    mom = _v.moments(vals)
+    dsr = _v.deflated_sharpe_ratio(sr, len(vals), max(1, int(n_trials)),
+                                   mom.get("skew", 0.0), mom.get("kurt", 3.0))
+    if dsr is None:
+        return False, "; DSR not computable"
+    floor = float(os.getenv("TFB_BACKTEST_MIN_DSR") or 0.95)
+    return (dsr >= floor,
+            "; DSR=%.3f vs %.2f over %d trial(s)" % (dsr, floor, max(1, int(n_trials))))
+
+
 def _bt_bar_close(bar: Dict[str, Any]) -> Optional[float]:
     """Adjusted close preferred (EODHD EOD), else close. Positive floats only."""
     for k in ("adjusted_close", "adjclose", "close", "c"):
@@ -4860,6 +4911,7 @@ def run_backtest(
     *,
     nonoverlap: Optional[bool] = None,
     tstat_floor: Optional[float] = None,
+    n_trials: int = 1,
 ) -> Hypothesis:
     """Event-study backtest of a single hypothesis. PURE: takes per-symbol bar
     history (date-ASCENDING EOD dicts) + a trigger_fn, returns a COPY of the
@@ -4996,10 +5048,21 @@ def run_backtest(
                          "t=%+.2f NOT trusted (autocorrelated)"
                          % (n_indep, hypothesis.min_sample, overlap_t))
         elif eff_ok and t_ok_i:
-            hyp.status = HypothesisStatus.ACCEPTED
-            hyp.notes = ("edge confirmed (independent windows): effect %+.0f bps, "
-                         "t_indep=%+.2f, n_indep=%d, hit %.0f%% [%.0f-%.0f] [overlap t=%+.2f]"
-                         % (hyp.effect_bps, t_indep, n_indep, hyp.hit_rate, lo, hi, overlap_t))
+            # v6.26.0: an edge that clears effect+t must still survive the
+            # multiple-testing penalty before it may influence anything.
+            dsr_ok, dsr_note = _dsr_verdict(signal_indep, n_trials)
+            if dsr_ok:
+                hyp.status = HypothesisStatus.ACCEPTED
+                hyp.notes = ("edge confirmed (independent windows): effect %+.0f bps, "
+                             "t_indep=%+.2f, n_indep=%d, hit %.0f%% [%.0f-%.0f] "
+                             "[overlap t=%+.2f]%s"
+                             % (hyp.effect_bps, t_indep, n_indep, hyp.hit_rate,
+                                lo, hi, overlap_t, dsr_note))
+            else:
+                hyp.status = HypothesisStatus.REJECTED
+                hyp.notes = ("effect+t cleared but multiple-testing penalty not: "
+                             "effect %+.0f bps, t_indep=%+.2f, n_indep=%d%s"
+                             % (hyp.effect_bps, t_indep, n_indep, dsr_note))
         else:
             hyp.status = HypothesisStatus.REJECTED
             hyp.notes = ("no robust edge (independent windows): effect %+.0f bps, "
@@ -6381,7 +6444,9 @@ class PerformanceTrackerApp:
         loop = asyncio.get_running_loop()
         results: List[Hypothesis] = []
         for h in testable:
-            res = await loop.run_in_executor(_get_executor(), run_backtest, h, history)
+            res = await loop.run_in_executor(
+                _get_executor(), functools.partial(
+                    run_backtest, h, history, n_trials=len(testable)))
             results.append(res)
             _out("  %-20s %-18s n=%-5d hit=%.0f%% [%.0f-%.0f] eff=%+.0fbps t=%+.2f\n" % (
                 res.hypothesis_id, res.status.value, res.sample_size,
