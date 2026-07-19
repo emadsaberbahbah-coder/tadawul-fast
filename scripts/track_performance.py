@@ -882,7 +882,31 @@ from urllib.error import HTTPError, URLError
 # ledger (today) => byte-identical maturation. TFB_TRACK_CA_LEDGER=0
 # restores v6.21.1 verbatim; default ON so protection never depends on
 # remembering a flag before a confirmed action lands.
-SCRIPT_VERSION = "6.22.0"
+# -----------------------------------------------------------------------------
+# v6.23.0 (2026-07-19) — 7D/14D CHECKPOINT HORIZONS (Wave B, S-1 critical path)
+# WHY: Master Plan v2.1 §8 defines 7D/14D as CHECKPOINTS-NOT-MATURITIES, and
+# §15 criterion 4 ("calibration error within band on 7D/14D checkpoints")
+# blocks Gate S-1. Nothing recorded them: HorizonType.WEEK_1 existed but
+# _derive_target returned (0,0) for it — no `forecast_price_1w` exists in
+# source rows — so enabling 1W would have written targetless records; 2W did
+# not exist at all. This closes the debt I acknowledged when v6.22.0 shipped
+# without it.
+# METHOD: a checkpoint target is the 1M forecast TIME-SCALED to the elapsed
+# fraction (7/30, 14/30). Expected return scales linearly in time (volatility
+# does not — but bands, not point targets, are the calibrator's concern in
+# Wave B). This measures whether a position is TRACKING its 1M thesis, which
+# is what an early-warning checkpoint is for; it is NOT a separate forecast
+# and must never be read as one. Records are self-identifying via the
+# Horizon column ("1W"/"2W").
+# TIMING: checkpoints need elapsed time. Instrumented 2026-07-19 => first 7D
+# data 2026-07-26, first 14D 2026-08-02, both well before the S-1 window
+# closes ~2026-08-16. Deferring to Jul 28 would have left ~12 days of
+# samples; that is why this was built ahead of the rest of Wave B.
+# ACTIVATION: default horizons remain "1M,3M" (byte-identical behavior).
+# 1W/2W activate only via TRACK_HORIZONS / --horizons — a separately flagged
+# operator item, never bundled.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.23.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -2061,6 +2085,7 @@ class PerformanceStatus(str, Enum):
 
 class HorizonType(str, Enum):
     WEEK_1 = "1W"
+    WEEK_2 = "2W"          # v6.23.0 checkpoint horizon (14 calendar days)
     MONTH_1 = "1M"
     MONTH_3 = "3M"
     MONTH_6 = "6M"
@@ -2071,7 +2096,7 @@ class HorizonType(str, Enum):
     @property
     def days(self) -> int:
         return {
-            "1W": 7, "1M": 30, "3M": 90, "6M": 180,
+            "1W": 7, "2W": 14, "1M": 30, "3M": 90, "6M": 180,
             "1Y": 365, "3Y": 1095, "5Y": 1825,
         }[self.value]
 
@@ -5147,9 +5172,32 @@ class PerformanceTrackerApp:
                 final.append(h)
         return final
 
+    _CHECKPOINT_HORIZONS = ("1W", "2W")
+    _CHECKPOINT_BASE_DAYS = 30.0
+
+    def _derive_checkpoint_target(
+        self, row: Dict[str, Any], horizon: HorizonType, entry_price: float
+    ) -> Tuple[float, float]:
+        """v6.23.0: time-scaled slice of the 1M thesis (see module WHY).
+        Returns (0.0, 0.0) when no 1M forecast exists — a checkpoint is never
+        invented from nothing."""
+        base_roi = _safe_float(row.get("expected_roi_1m"), default=0.0)
+        base_price = _safe_float(row.get("forecast_price_1m"), default=0.0)
+        if base_roi == 0.0 and base_price > 0.0 and entry_price > 0.0:
+            base_roi = (base_price / entry_price - 1.0) * 100.0
+        if base_roi == 0.0:
+            return 0.0, 0.0
+        frac = float(horizon.days) / self._CHECKPOINT_BASE_DAYS
+        tgt_roi = base_roi * frac
+        tgt_price = (entry_price * (1.0 + tgt_roi / 100.0)
+                     if entry_price > 0.0 else 0.0)
+        return tgt_price, tgt_roi
+
     def _derive_target(
         self, row: Dict[str, Any], horizon: HorizonType, entry_price: float
     ) -> Tuple[float, float]:
+        if horizon.value in self._CHECKPOINT_HORIZONS:
+            return self._derive_checkpoint_target(row, horizon, entry_price)
         suffix = (
             "1m"
             if horizon.value == "1M"
