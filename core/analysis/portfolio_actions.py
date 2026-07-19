@@ -332,7 +332,29 @@ from datetime import datetime, timedelta, timezone
 # Detection via core.compliance_gate.classify_asset (lazy, fail-open).
 # TFB_PA_PROTECT_SUKUK=0 restores v1.2.0. Scan result gains
 # `anchors_protected` for the memo's audit trail.
-PORTFOLIO_ACTIONS_VERSION = "1.2.1"
+# -----------------------------------------------------------------------------
+# v1.3.0 (2026-07-19) — SUKUK IS AN ASSET CLASS, NOT AN EQUITY SECTOR
+# WHY (observed live 2026-07-19): Portfolio_Decision reports
+#     Unknown | 10,130 SAR | 33.6% | cap 30.0% | Over Cap YES
+# That row is 5023.SR, a sukuk. Two things are wrong with it. The label is
+# wrong — the instrument has no equity sector, so it lands in "Unknown"
+# alongside genuine classification failures, and pasting its NAME (D-5, done)
+# could never fix that because the alert is driven by SECTOR. And the
+# comparison itself is a category error: max_sector_pct limits concentration
+# in an equity SECTOR. A sukuk is a fixed-income allocation; measuring it
+# against an equity-sector cap answers a question nobody asked.
+# CONSEQUENCE OF THE BUG: a permanent false "over cap" alert. No TRIM was ever
+# emitted for it (D-9 protects sukuk from the sell side), so nothing was
+# mis-traded — but a standing false alert erodes trust in the real ones.
+# FIX: sukuk holdings aggregate into their own "Sukuk (fixed income)" bucket,
+# reported with its true weight for visibility but EXEMPT from the equity
+# sector cap (cap_pct None, over_cap False, exempt True). Detection reuses
+# _is_sukuk_holding -> compliance_gate.classify_asset, already proven by D-9.
+# GATE: TFB_PA_SUKUK_ASSET_CLASS (default OFF) — committing changes nothing.
+# Inherits D-9's fail-open behaviour: if compliance_gate is unavailable the
+# holding stays in its original bucket exactly as v1.2.1.
+# -----------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.3.0"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -636,6 +658,34 @@ def _annotate_hold_edge(row):
             row["hold_edge_pct"] = round(p * roi, 2)
     except Exception as exc:
         row["hold_edge_err"] = type(exc).__name__
+
+
+SUKUK_BUCKET = "Sukuk (fixed income)"
+
+
+def _sukuk_asset_class_enabled():
+    v = os.environ.get("TFB_PA_SUKUK_ASSET_CLASS", "0")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_exempt_bucket(sector_name):
+    """v1.3.0: buckets that are asset classes, not equity sectors, and are
+    therefore outside max_sector_pct."""
+    return str(sector_name or "") == SUKUK_BUCKET
+
+
+def _sector_bucket(cand):
+    """v1.3.0: the bucket a holding is counted under for concentration.
+    Flag OFF -> the raw sector, i.e. v1.2.1 behaviour verbatim."""
+    raw = (cand or {}).get("sector") or "Unknown"
+    if not _sukuk_asset_class_enabled():
+        return raw
+    try:
+        if _is_sukuk_holding(cand):
+            return SUKUK_BUCKET
+    except Exception:          # noqa: BLE001 — fail-open, same as D-9
+        return raw
+    return raw
 
 
 def _protect_sukuk_enabled():
@@ -1634,11 +1684,14 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     sector_value = {}
     for c in cands:
         if c["market_value_sar"]:
-            sec = c.get("sector") or "Unknown"
+            sec = _sector_bucket(c)          # v1.3.0: sukuk gets its own
             sector_value[sec] = sector_value.get(sec, 0.0) + \
                 c["market_value_sar"]
     sector_excess = {}
     for sec, val in sector_value.items():
+        if _is_exempt_bucket(sec):           # v1.3.0: not an equity sector
+            sector_excess[sec] = 0.0
+            continue
         cap_val = (ctl["max_sector_pct"] / 100.0) * total_value
         sector_excess[sec] = max(0.0, val - cap_val)
 
@@ -1720,13 +1773,15 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     for sec in sorted(sector_value, key=lambda s: -sector_value[s]):
         val = sector_value[sec]
         wpct = val / total_value * 100.0 if total_value else None
+        exempt = _is_exempt_bucket(sec)
         sector_summary.append({
             "sector": sec, "value_sar": _round(val, 0),
             "weight_pct": _round(wpct, 1),
-            "cap_pct": ctl["max_sector_pct"],
-            "over_cap": bool(sector_excess.get(sec, 0.0) > 0),
-            "positions": sum(1 for c in cands
-                             if (c.get("sector") or "Unknown") == sec),
+            "cap_pct": (None if exempt else ctl["max_sector_pct"]),
+            "over_cap": (False if exempt
+                         else bool(sector_excess.get(sec, 0.0) > 0)),
+            "exempt": exempt,
+            "positions": sum(1 for c in cands if _sector_bucket(c) == sec),
         })
 
     # Alerts
