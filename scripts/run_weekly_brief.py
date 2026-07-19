@@ -43,7 +43,11 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # v1.0.1 (2026-07-18): eligibility-coherent scan — BUY proposals restricted
 # to Gen2-eligible candidates via shadow_board.eligible_symbols() (§4: a
 # blocked name can never be a BUY). Caught reading the first live memo.
-SCRIPT_VERSION = "1.0.1"
+# v1.0.2 (2026-07-19): RISK section in the memo — the concentration verdict
+# from risk_limits v1.0.0 (via shadow_board v1.1.3's build_risk_block) now
+# appears in both the text and HTML memo, so a structural concentration is
+# read on Sunday morning rather than discovered after capital moves.
+SCRIPT_VERSION = "1.0.2"
 TAB_STATE = "_Brief_State"
 
 
@@ -120,7 +124,7 @@ def _verdict_headline(scan: Dict[str, Any]) -> Tuple[str, str]:
     return ar, "SWITCH candidates cleared the arithmetic: " + lines
 
 def render_memo(rows, summary, scan, regime, ameta, fnd_n, cand_n,
-                diff, equity) -> Tuple[str, str, str]:
+                diff, equity, risk=None) -> Tuple[str, str, str]:
     """-> (subject, text, html)."""
     ar, en = _verdict_headline(scan)
     subject = (f"TFB Weekly Decision Brief — {_now_riyadh()[:10]} — "
@@ -152,6 +156,17 @@ def render_memo(rows, summary, scan, regime, ameta, fnd_n, cand_n,
         for f in diff["flips"]:
             L.append(f"  FLIP {f['symbol']}: {f['from']} -> {f['to']}")
     L.append("")
+    if risk:
+        L.append(f"RISK | {risk.get('verdict')} — heat naive "
+                 f"{risk.get('naive_heat_pct')}% -> effective "
+                 f"{risk.get('effective_heat_pct')}% "
+                 f"(diversification ratio {risk.get('diversification_ratio')})")
+        L.append("  country: " + json.dumps(risk.get("country") or {}))
+        for br in (risk.get("breaches") or []):
+            L.append(f"  BREACH {br}")
+        if risk.get("note"):
+            L.append("  " + risk["note"])
+        L.append("")
     L.append("REGIME | " + json.dumps(regime.get("sleeves", {}), default=str))
     L.append("Suggested weights: "
              + json.dumps(regime.get("suggested_weights") or {}))
@@ -188,6 +203,14 @@ def render_memo(rows, summary, scan, regime, ameta, fnd_n, cand_n,
 blocked {esc(json.dumps(summary['blocked']))})</h3>
 <table style='border-collapse:collapse;font-size:12px'>{board_html}</table>
 <h3>Changes</h3>{changes_html}
+<h3>Risk &amp; Concentration</h3>
+<p><b>{esc(risk.get('verdict')) if risk else 'n/a'}</b> — heat
+{esc(risk.get('naive_heat_pct')) if risk else '-'}% naive →
+<b>{esc(risk.get('effective_heat_pct')) if risk else '-'}%</b> effective
+(diversification ratio {esc(risk.get('diversification_ratio')) if risk else '-'})<br>
+country: {esc(json.dumps((risk or {}).get('country') or {}))}<br>
+{"".join(f"<span style='color:#b30000'>BREACH {esc(x)}</span><br>" for x in ((risk or {}).get('breaches') or []))}
+<i>{esc((risk or {}).get('note',''))}</i></p>
 <h3>Regime</h3><p>{esc(json.dumps(regime.get('sleeves', {}), default=str))}<br>
 Suggested weights: {esc(json.dumps(regime.get('suggested_weights') or {}))}<br>
 <i>{esc(regime.get('governance', ''))}</i></p>
@@ -265,8 +288,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     prev = load_state(sh)
     cur = snapshot(rows, scan["verdict"])
     diff = compute_diff(prev, cur)
+    risk = sb.build_risk_block(cands, ok, fnd)
     subject, text, html = render_memo(rows, summary, scan, regime, ameta,
-                                      len(fnd), len(cands), diff, equity)
+                                      len(fnd), len(cands), diff, equity, risk)
 
     verdict = (f"[WEEKLY-BRIEF v{SCRIPT_VERSION}] cands={len(cands)} "
                f"switch={scan['verdict']} entered={len(diff['entered'])} "
@@ -324,9 +348,19 @@ def _selftest() -> int:
     regime = {"sleeves": {"Global": {"state": "RISK_ON"}},
               "suggested_weights": {"Global": 0.7, "Saudi": 0.3, "Cash": 0.0},
               "governance": "advisory stamp — drives nothing until gated"}
+    risk_fx = {"verdict": "BREACH", "naive_heat_pct": 3.75,
+               "effective_heat_pct": 2.51, "diversification_ratio": 0.6693,
+               "country": {"Japan": 60.0, "USA": 40.0},
+               "breaches": ["Japan 60.0% > cap 40.0%"],
+               "note": "caps CANNOT be met by trimming this book"}
     subject, text, html = render_memo(
         rows, {"compliance_eligible": 2, "blocked": {}}, scan_na, regime,
-        {"rows": 137, "as_of": "2026-07-15"}, 2, 2, d1, 130000)
+        {"rows": 137, "as_of": "2026-07-15"}, 2, 2, d1, 130000, risk_fx)
+    checks.append(("memo carries the RISK section with breach + note",
+                   "RISK | BREACH" in text and "BREACH Japan 60.0%" in text
+                   and "CANNOT be met" in text))
+    checks.append(("risk section sits before regime in the memo",
+                   text.index("RISK |") < text.index("REGIME |")))
     checks.append(("subject carries verdict + shadow banner",
                    "NO_ACTION" in subject and "SHADOW MODE" in subject))
     checks.append(("text memo: verdict-first + governance + provenance",
