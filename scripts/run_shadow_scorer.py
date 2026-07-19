@@ -51,15 +51,26 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
 from core.analysis import opportunity_builder as ob   # noqa: E402
+from core import regret as rg                        # noqa: E402
 
 _SB_PATH = os.path.join(_ROOT, "scripts", "run_shadow_board.py")
 _spec = importlib.util.spec_from_file_location("tfb_shadow_board", _SB_PATH)
 sb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 
-SCRIPT_VERSION = "1.0.0"
+# v1.1.0 (2026-07-19): REGRET LEDGER WIRED. core/regret v1.0.0 was live but
+# nothing called it. Each run now (a) opens a fork for every name the board
+# REFUSED today — deduped so a name blocked for ten days holds ONE fork, not
+# ten — (b) re-scores every open fork against today's prices, and (c) rewrites
+# Regret_Summary. `Regret_Ledger` is append-only like Shadow_History: forks
+# are written once with the price at the moment of refusal, and scoring is
+# always recomputed on read, so a fork can never be silently restated.
+# On the live board this opens 5 forks (4 compliance, 1 floor).
+SCRIPT_VERSION = "1.1.0"
 TAB_HISTORY = "Shadow_History"
 TAB_GATE = "S1_Gate"
+TAB_REGRET = "Regret_Ledger"
+TAB_REGRET_SUMMARY = "Regret_Summary"
 HISTORY_HEADER = ["Date", "Basket", "Symbols", "Prices JSON", "Daily Return %",
                   "Cum Index", "Turnover %", "Cost Drag %", "Notes"]
 
@@ -301,6 +312,83 @@ def append_history(sh, rows: List[List[Any]]) -> None:
     ws.append_rows(rows, value_input_option="RAW")
 
 
+def read_regret_ledger(sh) -> List[Dict[str, Any]]:
+    """Open forks as written (append-only). Scoring is always recomputed."""
+    try:
+        vals = sh.worksheet(TAB_REGRET).get_all_values()
+    except Exception:  # noqa: BLE001
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in vals[1:]:
+        if not row or not str(row[0]).strip():
+            continue
+        out.append({"date": str(row[0]).strip()[:10],
+                    "fork": str(row[1]).strip().upper() if len(row) > 1 else "",
+                    "symbol": str(row[2]).strip().upper() if len(row) > 2 else "",
+                    "counterparty": (str(row[3]).strip().upper()
+                                     if len(row) > 3 else ""),
+                    "reason": str(row[4]) if len(row) > 4 else "",
+                    "ref_price": _num(row[5]) if len(row) > 5 else None,
+                    "alt_price": _num(row[6]) if len(row) > 6 else None})
+    return out
+
+
+def dedupe_new_forks(existing: Sequence[Dict[str, Any]],
+                     candidates: Sequence[Dict[str, Any]]
+                     ) -> List[Dict[str, Any]]:
+    """One open fork per (symbol, fork kind). A name refused for ten days
+    holds ONE fork opened at first refusal — not ten, which would triple-count
+    the same constraint in every aggregate."""
+    have = {(f.get("symbol"), f.get("fork")) for f in existing or []}
+    fresh: List[Dict[str, Any]] = []
+    for c in candidates or []:
+        key = (c.get("symbol"), c.get("fork"))
+        if key in have:
+            continue
+        have.add(key)
+        fresh.append(c)
+    return fresh
+
+
+def append_regret(sh, rows: List[List[Any]]) -> None:
+    if not rows:
+        return
+    try:
+        ws = sh.worksheet(TAB_REGRET)
+    except Exception:  # noqa: BLE001
+        ws = sh.add_worksheet(title=TAB_REGRET, rows=1000,
+                              cols=len(rg.LEDGER_HEADER))
+        ws.update(values=[rg.LEDGER_HEADER], range_name="A1")
+    ws.append_rows(rows, value_input_option="RAW")
+
+
+def write_regret_summary(sh, summary: Dict[str, Any],
+                         scored: List[Dict[str, Any]]) -> None:
+    try:
+        ws = sh.worksheet(TAB_REGRET_SUMMARY)
+    except Exception:  # noqa: BLE001
+        ws = sh.add_worksheet(title=TAB_REGRET_SUMMARY, rows=200, cols=8)
+    body: List[List[Any]] = [
+        [f"REGRET SUMMARY v{rg.__version__}", f"as of {_now_riyadh()}",
+         f"open forks {len(scored)}", f"pending {summary.get('pending')}"],
+        [summary.get("governance", "")],
+    ]
+    for n in summary.get("notes") or []:
+        body.append([n])
+    body.append([])
+    body.append(["Fork", "n", "Mean Regret %", "Median %", "Worst %", "Hit Rate"])
+    for kind, st in (summary.get("by_fork") or {}).items():
+        body.append([kind, st.get("n"), st.get("mean_regret_pct"),
+                     st.get("median_regret_pct"), st.get("worst_pct"),
+                     st.get("hit_rate")])
+    body.append([])
+    body.append(["OPEN FORKS"] + rg.LEDGER_HEADER[1:])
+    for r in rg.to_rows(scored)[:200]:
+        body.append([""] + r[1:])
+    ws.clear()
+    ws.update(values=body, range_name="A1")
+
+
 def write_gate(sh, gate: Dict[str, Any], meta: List[List[Any]]) -> None:
     try:
         ws = sh.worksheet(TAB_GATE)
@@ -399,11 +487,29 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     prev = {b: last_row_for(history, b)
             for b in (CHAMPION, CHALLENGER, BENCHMARK)}
+    existing_forks = read_regret_ledger(sh)
+    board_header = board[0] if board and board[0] and board[0][0] == "Symbol" else None
+    new_forks = dedupe_new_forks(
+        existing_forks,
+        rg.forks_from_board(data_rows, today, {}, header=board_header))
+    all_forks = list(existing_forks) + list(new_forks)
+
     need = set(champ_syms) | set(chal_syms) | set(BENCH_WEIGHTS)
+    for f in all_forks:
+        if f.get("symbol"):
+            need.add(f["symbol"])
+        if f.get("counterparty"):
+            need.add(f["counterparty"])
     for p in prev.values():
         if p:
             need |= set(p["symbols"])
     spot, price_errs = fetch_spot(sorted(need))
+
+    for f in new_forks:                      # price at the moment of refusal
+        if f.get("ref_price") is None:
+            f["ref_price"] = spot.get(f.get("symbol"))
+    scored_forks = rg.score_all(all_forks, spot, today)
+    regret_summary = rg.summarize(scored_forks)
 
     new_rows: List[List[Any]] = []
     results: Dict[str, Dict[str, Any]] = {}
@@ -444,13 +550,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                f"{S1_WINDOW_DAYS} | challenger {chal_cum:+.2f}% champion "
                f"{champ_cum:+.2f}% benchmark {bench_cum:+.2f}% | net alpha "
                f"{'n/a' if net_alpha is None else f'{net_alpha:+.2f}%'} | "
-               f"violations={len(violations)}")
+               f"violations={len(violations)} | forks {len(all_forks)} "
+               f"(+{len(new_forks)} new)")
     print(verdict)
     if args.dry_run:
         for r in new_rows:
             print("  ", r[:3], "ret=", r[4], "idx=", r[5], "drag=", r[7])
         for c in gate["criteria"]:
             print(f"   [{c['status']:<7}] {c['id']}. {c['name']} — {c['detail']}")
+        for f in scored_forks[:12]:
+            print(f"   FORK {f['fork']:<17} {f['symbol']:<10} "
+                  f"regret={f.get('regret_pct')} ({f.get('reason')})")
+        for n in regret_summary.get("notes") or []:
+            print("   " + n)
         return 0
 
     meta = [
@@ -466,6 +578,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
     append_history(sh, new_rows)
+    append_regret(sh, rg.to_rows(new_forks))
+    write_regret_summary(sh, regret_summary, scored_forks)
     write_gate(sh, gate, meta)
     try:
         sh.worksheet("_Run_Log").append_row(
@@ -570,6 +684,23 @@ def _selftest() -> int:
     checks.append(("gate: unrepaired corporate action -> FAIL",
                    g6["verdict"] == "FAIL"))
     checks.append(("gate always reports six criteria", len(g4["criteria"]) == 6))
+
+    ex = [{"symbol": "TRMD.US", "fork": rg.COMPLIANCE_BLOCK},
+          {"symbol": "0083.HK", "fork": rg.FLOOR_LOCK}]
+    cand = [{"symbol": "TRMD.US", "fork": rg.COMPLIANCE_BLOCK},
+            {"symbol": "MRP.US", "fork": rg.COMPLIANCE_BLOCK},
+            {"symbol": "0083.HK", "fork": rg.FLOOR_LOCK}]
+    fresh = dedupe_new_forks(ex, cand)
+    checks.append(("dedupe: a still-blocked name does NOT re-open a fork",
+                   [f["symbol"] for f in fresh] == ["MRP.US"]))
+    checks.append(("dedupe: same symbol under a DIFFERENT fork is allowed",
+                   len(dedupe_new_forks(ex, [{"symbol": "TRMD.US",
+                                              "fork": rg.EDGE_BELOW_COST}])) == 1))
+    checks.append(("dedupe: empty ledger admits everything",
+                   len(dedupe_new_forks([], cand)) == 3))
+    checks.append(("regret rows match the ledger header width",
+                   all(len(r) == len(rg.LEDGER_HEADER)
+                       for r in rg.to_rows(rg.score_all(cand, {}, None)))))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
