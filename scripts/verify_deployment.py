@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.3"
+SCRIPT_VERSION = "1.0.4"  # v1.0.4 (2026-07-20): +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -84,6 +84,7 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ("TFB_SCORE_ROI_SOFTCAP", "0", "ROI soft-cap ends 35/17.5 saturation", False),
     ("TFB_TOP10_TRADABILITY_GATE", "0", "untradable names excluded (D-10)", False),
     ("TFB_OPP_STOP_VOL_UNITS_FIX", "0", "stop volatility units fixed (D-11)", False),
+    ("TFB_OPP_REF_CONSERVATIVE", "0", "ticket ref = min(valuation, engine 12M) (D-12)", False),
     ("TFB_PA_PROTECT_SUKUK", "1", "sukuk never a SELL leg (D-9)", True),
     ("TFB_TRACK_CA_LEDGER", "1", "confirmed CA forces verification", True),
     ("TRACK_HORIZONS", "1M,3M", "7D/14D checkpoints recorded", False),
