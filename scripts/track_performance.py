@@ -906,7 +906,27 @@ from urllib.error import HTTPError, URLError
 # 1W/2W activate only via TRACK_HORIZONS / --horizons — a separately flagged
 # operator item, never bundled.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.23.0"
+# -----------------------------------------------------------------------------
+# v6.24.0 (2026-07-19) — STALE-STATISTIC PURGE ON A FAILED BACKTEST
+# WHY (found in the live Hypothesis_Registry, 2026-07-19): all four registered
+# hypotheses read Sample Size 0, Universe Size 0, History Days 0 and
+# "0 trigger events (< min 30); no verdict" — while simultaneously displaying
+# Hit Rate 62.8%, Effect -140.7 bps and t-stat -1.62. Those numbers are from
+# an OLDER run. Cause: `Hypothesis` is hydrated FROM the existing sheet row,
+# and the insufficient-data branch returns EARLY, before hit_count / hit_rate /
+# hit_rate_lo / hit_rate_hi / effect_bps / t_stat are assigned. The stale
+# values therefore survive and are rewritten as if current, mixing two runs
+# in one row.
+# IMPACT: the governance guard itself held — status stayed INSUFFICIENT_DATA
+# so nothing graduated and no recommendation was influenced. What failed is
+# HONESTY OF THE SURFACE: a human (or a future automated consumer reading
+# effect_bps) sees statistics that describe a run which no longer exists.
+# FIX: on the insufficient-data branch, purge every derived statistic before
+# returning, and say so in the note. mean_signal_roi / mean_baseline_roi are
+# also cleared when their own inputs were empty. Ships DEFAULT-ON: this is a
+# correctness fix to a display path, not a change to any decision logic.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.24.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -4650,6 +4670,25 @@ class Hypothesis:
         )
 
 
+def _purge_derived_stats(hyp: "Hypothesis", n: int, n_baseline: int) -> List[str]:
+    """v6.24.0: clear every statistic that a failed backtest did not compute.
+    Returns the names of the fields that actually held stale values, so the
+    note can state what was discarded rather than silently rewriting."""
+    purged: List[str] = []
+    for field in ("hit_count", "hit_rate", "hit_rate_lo", "hit_rate_hi",
+                  "effect_bps", "t_stat"):
+        if getattr(hyp, field, 0):
+            purged.append(field)
+        setattr(hyp, field, 0 if field == "hit_count" else 0.0)
+    if n <= 0 and getattr(hyp, "mean_signal_roi", 0.0):
+        purged.append("mean_signal_roi")
+        hyp.mean_signal_roi = 0.0
+    if n_baseline <= 0 and getattr(hyp, "mean_baseline_roi", 0.0):
+        purged.append("mean_baseline_roi")
+        hyp.mean_baseline_roi = 0.0
+    return purged
+
+
 def default_hypotheses() -> List[Hypothesis]:
     """The flow + candle-structure factors already shipped, as registered
     hypotheses to validate against history. STRONG reads only -- the high-
@@ -4867,7 +4906,15 @@ def run_backtest(
 
     if n < max(1, hypothesis.min_sample):
         hyp.status = HypothesisStatus.INSUFFICIENT_DATA
-        hyp.notes = "%d trigger events (< min %d); no verdict" % (n, hypothesis.min_sample)
+        # v6.24.0: purge derived statistics. `hyp` was hydrated from the
+        # existing sheet row, so returning here without clearing leaves the
+        # PREVIOUS run's hit rate / effect / t-stat in the row beside a
+        # sample size of 0 — two different runs displayed as one.
+        _purged = _purge_derived_stats(hyp, n, len(baseline_rois))
+        hyp.notes = ("%d trigger events (< min %d); no verdict"
+                     % (n, hypothesis.min_sample))
+        if _purged:
+            hyp.notes += "; stale statistics purged (%s)" % ", ".join(_purged)
         return hyp
 
     hyp.effect_bps = (hyp.mean_signal_roi - hyp.mean_baseline_roi) * 100.0   # 1% ROI = 100 bps
