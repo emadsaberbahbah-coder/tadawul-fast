@@ -295,6 +295,13 @@ jobs:
       # TFB_SYNC_EMPTY_RETRY_DELAY_SEC "0"); splice is header-guarded and can
       # never make a page worse.
       TFB_SYNC_EMPTY_RETRY: "0"
+      # (2026-07-19) D-4 — DUPLICATE-NAME QUARANTINE.
+      # ID-FIREWALL has been raising SUSPECT on Market_Leaders / Global_Markets
+      # in observe-only mode: it detects a name collision but still writes the
+      # row. "quarantine" makes it withhold the suspect row instead, so a
+      # chimeric name/symbol pairing cannot reach the sheet.
+      # KILL-SWITCH: delete this line -> observe-only behaviour returns.
+      TFB_SYNC_NAME_DEDUP_MODE: "quarantine"
       TFB_PORTFOLIO_REBUILD: "1"
       # Top_10_Investments — decision guard ENABLED ("1"). [2026-06-29 corrected]
       # SUPERSEDES the earlier "0" setting. That setting let the 2-hourly daily sync
@@ -891,6 +898,16 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
           TRACK_SHEET_ID: ${{ env.TARGET_SHEET_ID }}
+          # (2026-07-19) S-1 CRITERION 4 — 7D/14D CHECKPOINT HORIZONS.
+          # track_performance v6.23.0+ records "1W"/"2W" as CHECKPOINTS, not
+          # maturities: a time-scaled slice of the 1M thesis used to measure
+          # whether a position is TRACKING its forecast. Gate S-1 criterion 4
+          # ("calibration error within band on 7D/14D checkpoints") has no
+          # other input, and checkpoints need ELAPSED time — days not sampled
+          # cannot be recovered later. Default is "1M,3M".
+          # COST: ~2x Performance_Log records per decision symbol.
+          # KILL-SWITCH: delete this line -> v6.22.0 behaviour exactly.
+          TRACK_HORIZONS: "1W,2W,1M,3M"
           # BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}   # uncomment if backend is token-gated
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then
