@@ -569,7 +569,25 @@ logger.addHandler(logging.NullHandler())
 # and the gate's own TFB_COMPLIANCE_GATE_ENABLED. Any error degrades to an
 # error field in meta — the champion payload is NEVER altered or blocked.
 # -----------------------------------------------------------------------------
-TOP10_SELECTOR_VERSION = "4.22.0"
+# -----------------------------------------------------------------------------
+# v4.23.0 (2026-07-19) — D-10 TRADABILITY GATE (env-gated, DEFAULT OFF)
+# WHY: measured on the live board 2026-07-19, ENKAI.IS (Turkey) occupied one
+# of ten Top-10 slots. The Derayah matrix (compliance_gate v1.0.0) covers 20
+# venues; Turkey is not among them, so that recommendation is UNEXECUTABLE —
+# 10% of the actionable board spent on a name the operator cannot buy. Per
+# §19 roughly 8% of the global universe is watch-only, so this recurs by
+# construction. Watch-only names belong on Global_Markets, not on the board
+# capital is deployed from.
+# BEHAVIOR: runs pre-tiering beside the investability gate, so the next
+# qualified TRADABLE candidate is pulled up rather than a slot being lost.
+# Excluded rows are logged by symbol + venue, never silently dropped.
+# GATE: TFB_TOP10_TRADABILITY_GATE (default OFF) — committing this file
+# changes NOTHING until the operator arms it (same protocol as D-8).
+# SAFETY: if the compliance module is unavailable or errors, the gate is a
+# no-op and the champion behaves exactly as v4.22.0. Never empties the pool:
+# if every candidate is untradable, the exclusion is abandoned and logged.
+# -----------------------------------------------------------------------------
+TOP10_SELECTOR_VERSION = "4.23.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -4330,6 +4348,44 @@ def _apply_shadow_compliance(rows: List[Dict[str, Any]], meta: Dict[str, Any]) -
                        TOP10_SELECTOR_VERSION, exc)
 
 
+def _apply_tradability_gate(rows: List[Dict[str, Any]]
+                            ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+    """v4.23.0 (D-10). -> (kept_rows, excluded[{symbol,venue}]).
+    No-op unless TFB_TOP10_TRADABILITY_GATE is armed. Never raises, never
+    empties the pool."""
+    if not _env_bool("TFB_TOP10_TRADABILITY_GATE", False):
+        return list(rows), []
+    try:
+        from core import compliance_gate as _cg  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[TRADABILITY v%s] module unavailable (%s) — no-op",
+                       TOP10_SELECTOR_VERSION, type(exc).__name__)
+        return list(rows), []
+    kept: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, str]] = []
+    for row in rows or []:
+        sym = _s(row.get("symbol"))
+        try:
+            status, market, _floor = _cg.tradability(sym)
+        except Exception:  # noqa: BLE001
+            kept.append(row)
+            continue
+        if status == _cg.BROKER_UNTRADABLE:
+            excluded.append({"symbol": sym, "venue": _cg.symbol_suffix(sym) or "-"})
+        else:
+            kept.append(row)
+    if not kept and rows:
+        logger.warning("[TRADABILITY v%s] every candidate untradable — "
+                       "exclusion ABANDONED to avoid an empty board",
+                       TOP10_SELECTOR_VERSION)
+        return list(rows), []
+    if excluded:
+        logger.info("[TRADABILITY v%s] excluded=%d %s | kept=%d",
+                    TOP10_SELECTOR_VERSION, len(excluded),
+                    _json_compact(excluded[:10]), len(kept))
+    return kept, excluded
+
+
 def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
     include_headers = _coerce_bool(meta.get("include_headers", True), True)
     include_matrix = _coerce_bool(meta.get("include_matrix", True), True)
@@ -4481,6 +4537,14 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         # rank on fresh verdicts (v4.17.0 gated only the 10 FINAL rows —
         # after selection). Pure-CPU, idempotent, AA-tag-aware (v5.84.0+).
         final_gate_applied, final_gate_errors, final_gate_available = _apply_final_gate(admissible_candidates)
+
+        # ---------------------------------------------------------------------
+        # v4.23.0 [D-10] — TRADABILITY GATE (env-gated, default OFF).
+        # ---------------------------------------------------------------------
+        # A board the operator cannot execute is a board slot wasted. Runs
+        # here (pre-tiering) so the next qualified TRADABLE name is pulled up.
+        admissible_candidates, tradability_excluded = _apply_tradability_gate(
+            admissible_candidates)
 
         # ---------------------------------------------------------------------
         # v4.18.0 [FIX W-2a] — SELL-CLASS EXCLUSION (env-gated, default ON).
