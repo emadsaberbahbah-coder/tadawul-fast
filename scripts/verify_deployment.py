@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.2"
+SCRIPT_VERSION = "1.0.3"
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -102,6 +102,13 @@ _ARMED = {"1", "true", "yes", "on"}
 # is worse than no check at all. Parameters report SET vs DEFAULT instead.
 _VALUE_FLAGS = {"TFB_OPP_STOP_VOL_MULT", "TFB_BACKTEST_MIN_DSR",
                 "TRACK_HORIZONS", "TFB_SYNC_NAME_DEDUP_MODE"}
+
+# v1.0.3: SCOPE. These live in GitHub workflow env blocks, never in Render, so
+# this script — which reads the LOCAL process environment — structurally
+# cannot see them. Reporting them as "using default" implied they were
+# unconfigured when they were correctly committed to daily_sync.yml. A checker
+# that cannot observe something must say so, not report absence as a finding.
+_WORKFLOW_SCOPED = {"TRACK_HORIZONS", "TFB_SYNC_NAME_DEDUP_MODE"}
 
 
 def check_modules() -> List[Dict[str, Any]]:
@@ -189,7 +196,9 @@ def check_flags() -> List[Dict[str, Any]]:
             armed = str(live).strip().lower() in _ARMED
         out.append({"flag": name, "value": live, "set": raw is not None,
                     "default": default, "armed": armed, "meaning": meaning,
-                    "kill_switch": kill, "kind": kind})
+                    "kill_switch": kill, "kind": kind,
+                    "scope": ("workflow" if name in _WORKFLOW_SCOPED
+                              else "render")})
     return out
 
 
@@ -257,11 +266,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("\nFLAGS")
     for f in flags:
-        if f.get("kind") == "value":
+        if f.get("scope") == "workflow":
+            state = "GH-ENV"
+        elif f.get("kind") == "value":
             state = " SET  " if f["armed"] else "DEFAULT"
         else:
             state = "ARMED " if f["armed"] else "  off "
-        src = "" if f["set"] else "  (not set — using default)"
+        if f.get("scope") == "workflow":
+            src = "  (set in daily_sync.yml — NOT visible from this shell)"
+        else:
+            src = "" if f["set"] else "  (not set — using default)"
         note = "  [kill-switch: off DISABLES protection]" if f["kill_switch"] and not f["armed"] else ""
         print(f"  [{state}] {f['flag']:<32} {str(f['value'])[:14]:<15} {f['meaning']}{src}{note}")
 
@@ -270,11 +284,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         for t in tests:
             print(f"  [{t['status']:<5}] {t['label']:<24} {t.get('summary','')}")
 
-    armed_n = sum(1 for f in flags if f["armed"])
+    armed_n = sum(1 for f in flags
+                  if f["armed"] and f.get("scope") != "workflow")
+    wf_n = sum(1 for f in flags if f.get("scope") == "workflow")
     print("\n" + "=" * 64)
     print(f"VERDICT: {verdict}   modules {len(mods)+len(scripts)} "
           f"({len(drift)} drift, {len(missing)} missing) | "
-          f"flags {armed_n}/{len(flags)} armed"
+          f"flags {armed_n}/{len(flags) - wf_n} armed "
+          f"(+{wf_n} workflow-scoped, verify in daily_sync.yml)"
           + (f" | selftests {sum(1 for t in tests if t['status']=='PASS')}"
              f"/{len(tests)}" if tests else ""))
     if drift:
@@ -282,9 +299,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if missing:
         print("  MISSING: " + ", ".join(m["label"] for m in missing))
     unarmed = [f["flag"] for f in flags
-               if not f["armed"] and not f["kill_switch"] and f.get("kind") != "value"]
+               if not f["armed"] and not f["kill_switch"]
+               and f.get("kind") != "value" and f.get("scope") != "workflow"]
     undef = [f["flag"] for f in flags
-             if not f["armed"] and f.get("kind") == "value"]
+             if not f["armed"] and f.get("kind") == "value"
+             and f.get("scope") != "workflow"]
     if unarmed:
         print("  not armed: " + ", ".join(unarmed))
     if undef:
