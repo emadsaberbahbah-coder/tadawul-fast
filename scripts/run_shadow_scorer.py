@@ -66,7 +66,20 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # are written once with the price at the moment of refusal, and scoring is
 # always recomputed on read, so a fork can never be silently restated.
 # On the live board this opens 5 forks (4 compliance, 1 floor).
-SCRIPT_VERSION = "1.1.0"
+# v1.1.1 (2026-07-19): WRITE-ORDER + GRID-WIDTH FIX. The first live dispatch
+# wrote Shadow_History and Regret_Ledger (append_rows) but left S1_Gate ABSENT
+# and Regret_Summary EMPTY, with no [S1-GATE] line in _Run_Log. Cause, mine:
+# write_regret_summary created the tab with cols=8 then wrote a 13-column row
+# ("OPEN FORKS" + the 12-field ledger header), exceeding the grid; the API
+# raised, and because it ran BEFORE write_gate the primary deliverable and the
+# log line were never reached. Three corrections:
+#   (1) the summary tab is sized from the data, and every row is padded to a
+#       uniform width so a ragged body can never exceed the grid again;
+#   (2) S1_Gate is written FIRST — the gate is the point of this script and
+#       must not depend on a secondary tab succeeding;
+#   (3) each sheet write is independently guarded, so one failure degrades
+#       that tab alone and is reported, instead of silently killing the run.
+SCRIPT_VERSION = "1.1.1"
 TAB_HISTORY = "Shadow_History"
 TAB_GATE = "S1_Gate"
 TAB_REGRET = "Regret_Ledger"
@@ -364,10 +377,11 @@ def append_regret(sh, rows: List[List[Any]]) -> None:
 
 def write_regret_summary(sh, summary: Dict[str, Any],
                          scored: List[Dict[str, Any]]) -> None:
+    width = max(6, len(rg.LEDGER_HEADER) + 1)
     try:
         ws = sh.worksheet(TAB_REGRET_SUMMARY)
     except Exception:  # noqa: BLE001
-        ws = sh.add_worksheet(title=TAB_REGRET_SUMMARY, rows=200, cols=8)
+        ws = sh.add_worksheet(title=TAB_REGRET_SUMMARY, rows=400, cols=width)
     body: List[List[Any]] = [
         [f"REGRET SUMMARY v{rg.__version__}", f"as of {_now_riyadh()}",
          f"open forks {len(scored)}", f"pending {summary.get('pending')}"],
@@ -385,6 +399,7 @@ def write_regret_summary(sh, summary: Dict[str, Any],
     body.append(["OPEN FORKS"] + rg.LEDGER_HEADER[1:])
     for r in rg.to_rows(scored)[:200]:
         body.append([""] + r[1:])
+    body = [list(r) + [""] * (width - len(r)) for r in body]   # uniform width
     ws.clear()
     ws.update(values=body, range_name="A1")
 
@@ -398,6 +413,8 @@ def write_gate(sh, gate: Dict[str, Any], meta: List[List[Any]]) -> None:
     body.append(["#", "Criterion", "Status", "Detail"])
     for c in gate["criteria"]:
         body.append([c["id"], c["name"], c["status"], c["detail"]])
+    width = max(len(r) for r in body) if body else 4
+    body = [list(r) + [""] * (width - len(r)) for r in body]
     ws.clear()
     ws.update(values=body, range_name="A1")
 
@@ -577,10 +594,22 @@ def main(argv: Optional[List[str]] = None) -> int:
          f"price errors: {len(price_errs)}"],
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
-    append_history(sh, new_rows)
-    append_regret(sh, rg.to_rows(new_forks))
-    write_regret_summary(sh, regret_summary, scored_forks)
-    write_gate(sh, gate, meta)
+    # v1.1.1: gate FIRST, then evidence, then the secondary summary. Each
+    # write independently guarded so one failure cannot suppress the others.
+    _write_errors: List[str] = []
+    for _label, _fn in (
+            ("S1_Gate", lambda: write_gate(sh, gate, meta)),
+            ("Shadow_History", lambda: append_history(sh, new_rows)),
+            ("Regret_Ledger", lambda: append_regret(sh, rg.to_rows(new_forks))),
+            ("Regret_Summary",
+             lambda: write_regret_summary(sh, regret_summary, scored_forks))):
+        try:
+            _fn()
+        except Exception as _exc:  # noqa: BLE001
+            _write_errors.append(f"{_label}:{type(_exc).__name__}")
+            print(f"[S1-GATE v{SCRIPT_VERSION}] WRITE FAILED {_label}: {_exc}")
+    if _write_errors:
+        verdict += " | write_errors=" + ",".join(_write_errors)
     try:
         sh.worksheet("_Run_Log").append_row(
             [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "INFO",
