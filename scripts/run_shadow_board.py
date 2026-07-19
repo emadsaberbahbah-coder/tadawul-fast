@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import compliance_gate as cg          # noqa: E402
 from core import shariah_authority as sa        # noqa: E402
 from core import regime as rg                   # noqa: E402
+from core import risk_limits as rl              # noqa: E402
 from core.analysis import opportunity_builder as ob   # noqa: E402
 from core.analysis import portfolio_actions as pa     # noqa: E402
 
@@ -65,7 +66,13 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 # MODEL_SCREEN_FAIL). Plan rule (§4): non-eligible can never be a BUY —
 # candidates are now filtered to Gen2-eligible before advisor_switch_scan,
 # via the shared eligible_symbols() helper (the weekly brief imports it).
-SCRIPT_VERSION = "1.1.2"
+# v1.1.3 (2026-07-19): CONCENTRATION VERDICT. risk_limits v1.0.0 is live but
+# nothing called it. The eligible book is now scored for correlation-adjusted
+# heat and country/sector/theme caps, and the verdict lands in the meta block
+# + the [SHADOW-BOARD] line. Measured on the live board this reports
+# BREACH (Japan 60% vs 40% cap) with the honest structural note. Advisory:
+# it annotates, never filters the board.
+SCRIPT_VERSION = "1.1.3"
 TAB_OUT = "Shadow_Board"
 TAB_TOP10 = "Top_10_Investments"
 TAB_HOLDINGS = "Portfolio_Decision"
@@ -171,6 +178,35 @@ def rows_to_records(values: Sequence[Sequence[Any]],
                 })
             return out
     return []
+
+
+def build_risk_block(cands: List[Dict[str, Any]], eligible: set,
+                     fnd: Optional[Dict[str, Dict[str, Any]]] = None
+                     ) -> Dict[str, Any]:
+    """v1.1.3: concentration + correlation-adjusted heat on the ELIGIBLE book
+    (what Gen-2 would actually hold). Never raises; never edits the board."""
+    try:
+        fnd = fnd or {}
+        rows = [{"symbol": c["symbol"], "name": c.get("name", ""),
+                 "sector": (fnd.get(c["symbol"], {}).get("sector")
+                            or c.get("sector") or ""),
+                 "industry": fnd.get(c["symbol"], {}).get("industry") or ""}
+                for c in cands if c["symbol"] in eligible]
+        pos = rl.enrich_positions(rows)
+        res = rl.check_limits(pos)
+        trims = rl.suggest_trims(pos)
+        return {"verdict": res["verdict"],
+                "naive_heat_pct": res["heat"]["naive_heat_pct"],
+                "effective_heat_pct": res["heat"]["effective_heat_pct"],
+                "diversification_ratio": res["heat"]["diversification_ratio"],
+                "country": res["concentration"]["country"],
+                "theme": res["concentration"]["theme"],
+                "breaches": [b["detail"] for b in res["breaches"]],
+                "trims": [d["symbol"] for d in trims["drops"]],
+                "feasible": trims["feasible"], "note": trims["note"],
+                "rho": res["rho"]}
+    except Exception as exc:  # noqa: BLE001
+        return {"verdict": "ERROR", "error": f"{type(exc).__name__}:{exc}"}
 
 
 def eligible_symbols(rows: List[List[Any]]) -> set:
@@ -373,6 +409,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     fnd, fnd_errs = fetch_board_fundamentals([c["symbol"] for c in cands])
     data_rows, summary = evaluate_board(cands, auth, monitor, equity, fnd)
     ok = eligible_symbols(data_rows)
+    risk_block = build_risk_block(cands, ok, fnd)
     scan = pa.advisor_switch_scan(
         holds, [c for c in cands if c["symbol"] in ok])
     regime_block = build_regime_block()
@@ -390,6 +427,13 @@ def main(argv: Optional[List[str]] = None) -> int:
          f"pairs={scan['pairs_checked']}"],
         [f"fundamentals coverage={len(fnd)}/{len(cands)}",
          ";".join(fnd_errs[:4]) or "-"],
+        ["risk: " + risk_block.get("verdict", "?"),
+         (f"heat naive {risk_block.get('naive_heat_pct')}% -> effective "
+          f"{risk_block.get('effective_heat_pct')}% "
+          f"(div ratio {risk_block.get('diversification_ratio')})"),
+         "country=" + json.dumps(risk_block.get("country") or {}),
+         "breaches=" + json.dumps(risk_block.get("breaches") or [])],
+        [risk_block.get("note", ""), "rho=" + json.dumps(risk_block.get("rho") or {})],
         ["regime: " + json.dumps(regime_block.get("sleeves", {}), default=str),
          "weights=" + json.dumps(regime_block.get("suggested_weights") or {}),
          ";".join(regime_block.get("errors", []) or [])],
@@ -400,6 +444,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                f"eligible={summary['compliance_eligible']} "
                f"blocked={summary['blocked']} switch={scan['verdict']} "
                f"auth_rows={ameta.get('rows', 0)} fnd={len(fnd)}/{len(cands)} "
+               f"risk={risk_block.get('verdict')} "
+               f"heat={risk_block.get('effective_heat_pct')}% "
                f"regime={'ERR' if regime_block.get('errors') else 'OK'} "
                f"w={json.dumps(regime_block.get('suggested_weights') or {})}")
     print(verdict)
@@ -532,6 +578,24 @@ def _selftest() -> int:
                                    "sector": "Energy", "industry": ""})))
     checks.append(("eligibility filter reads the YES column",
                    eligible_symbols(rows) == {"7010.SR"}))
+    rb = build_risk_block(
+        [{"symbol": "6960.T", "name": "Fukuda Denshi", "sector": "Healthcare"},
+         {"symbol": "4503.T", "name": "Astellas Pharma", "sector": "Healthcare"},
+         {"symbol": "2269.T", "name": "Meiji Holdings", "sector": "Consumer Defensive"},
+         {"symbol": "TNK.US", "name": "Teekay Tankers", "sector": "Energy"},
+         {"symbol": "EXE.US", "name": "Expand Energy", "sector": "Energy"}],
+        {"6960.T", "4503.T", "2269.T", "TNK.US", "EXE.US"})
+    checks.append(("risk block: live board reports BREACH + Japan 60%",
+                   rb["verdict"] == "BREACH" and rb["country"]["Japan"] == 60.0))
+    checks.append(("risk block: heat is correlation-adjusted below naive",
+                   0 < rb["effective_heat_pct"] < rb["naive_heat_pct"]))
+    checks.append(("risk block: structural infeasibility surfaced",
+                   rb["feasible"] is False and "ADDING" in rb["note"]))
+    checks.append(("risk block: only the eligible subset is scored",
+                   build_risk_block(
+                       [{"symbol": "A.US", "name": "A", "sector": "Energy"},
+                        {"symbol": "B.T", "name": "B", "sector": "Utilities"}],
+                       {"A.US"})["country"] == {"USA": 100.0}))
     mo = rg.monthly_from_daily([(date(2026, m, 1), 100.0 + m) for m in range(1, 13)])
     checks.append(("regime helpers importable end-to-end",
                    rg.current_regime(mo)["state"] in ("RISK_ON", "RISK_OFF")))
