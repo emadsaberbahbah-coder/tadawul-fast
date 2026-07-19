@@ -1,0 +1,62 @@
+name: "📊 TFB Shadow Scorer (S-1 Gate)"
+
+# Wave S deliverable #15 (Master Plan v2.1 §3, §15). Daily Champion-vs-
+# Challenger scoring and the S-1 acceptance gate. Runs AFTER the shadow board
+# so it scores the board the challenger actually published that day.
+# Append-only: Shadow_History refuses duplicate dates by design.
+
+on:
+  schedule:
+    - cron: "40 14 * * *"     # ~17:40 Riyadh, after the 17:10 shadow board
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = compute and print, write nothing"
+        default: "false"
+      rollback_drill_passed:
+        description: "true = record today's rollback drill (criterion 6)"
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+      TFB_COMPLIANCE_GATE_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install --quiet gspread google-auth httpx yfinance
+
+      - name: Materialize Google credentials
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+          CREDS_PATH="$RUNNER_TEMP/gcreds.json"
+          if [[ -n "${SECRET_CREDS:-}" ]]; then
+            printf '%s' "$SECRET_CREDS" > "$CREDS_PATH"
+          elif [[ -n "${SECRET_CREDS_B64:-}" ]]; then
+            printf '%s' "$SECRET_CREDS_B64" | base64 -d > "$CREDS_PATH"
+          else
+            echo "::error::No Google credentials secret present."; exit 1
+          fi
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
+
+      - name: Score shadow vs champion
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then EXTRA="--dry-run"; fi
+          if [[ "${{ github.event.inputs.rollback_drill_passed }}" == "true" ]]; then EXTRA="--rollback-drill-passed"; fi
+          python scripts/run_shadow_scorer.py $EXTRA
