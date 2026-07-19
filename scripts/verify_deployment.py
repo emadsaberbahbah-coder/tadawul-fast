@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.0.2"
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -69,7 +69,7 @@ MODULES: List[Tuple[str, str, str, str]] = [
 SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_shadow_board", "1.1.3", "shadow board"),
     ("run_weekly_brief", "1.0.2", "weekly brief"),
-    ("run_shadow_scorer", "1.1.0", "shadow scorer"),
+    ("run_shadow_scorer", "1.1.1", "shadow scorer"),
     ("track_performance", "6.26.0", "track performance"),
 ]
 
@@ -95,6 +95,13 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
 ]
 
 _ARMED = {"1", "true", "yes", "on"}
+
+# v1.0.2: not every env var is a toggle. A multiplier or a mode string is a
+# PARAMETER — reporting TFB_OPP_STOP_VOL_MULT=1.5 as "off" because 1.5 is not
+# in {1,true,yes,on} is a false alarm on a correctly configured system, which
+# is worse than no check at all. Parameters report SET vs DEFAULT instead.
+_VALUE_FLAGS = {"TFB_OPP_STOP_VOL_MULT", "TFB_BACKTEST_MIN_DSR",
+                "TRACK_HORIZONS", "TFB_SYNC_NAME_DEDUP_MODE"}
 
 
 def check_modules() -> List[Dict[str, Any]]:
@@ -170,15 +177,19 @@ def check_flags() -> List[Dict[str, Any]]:
     for name, default, meaning, kill in FLAGS:
         raw = os.getenv(name)
         live = raw if raw is not None else default
+        kind = "value" if name in _VALUE_FLAGS else "bool"
         if name == "TRACK_HORIZONS":
             armed = bool(raw) and ("1W" in raw or "2W" in raw)
         elif name == "TFB_SYNC_NAME_DEDUP_MODE":
             armed = str(live).strip().lower() == "quarantine"
+        elif kind == "value":
+            # a parameter is "armed" when explicitly configured, whatever value
+            armed = raw is not None and str(raw).strip() != ""
         else:
             armed = str(live).strip().lower() in _ARMED
         out.append({"flag": name, "value": live, "set": raw is not None,
                     "default": default, "armed": armed, "meaning": meaning,
-                    "kill_switch": kill})
+                    "kill_switch": kill, "kind": kind})
     return out
 
 
@@ -246,7 +257,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("\nFLAGS")
     for f in flags:
-        state = "ARMED " if f["armed"] else "  off "
+        if f.get("kind") == "value":
+            state = " SET  " if f["armed"] else "DEFAULT"
+        else:
+            state = "ARMED " if f["armed"] else "  off "
         src = "" if f["set"] else "  (not set — using default)"
         note = "  [kill-switch: off DISABLES protection]" if f["kill_switch"] and not f["armed"] else ""
         print(f"  [{state}] {f['flag']:<32} {str(f['value'])[:14]:<15} {f['meaning']}{src}{note}")
@@ -267,9 +281,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("  drift: " + ", ".join(f"{m['label']}={m.get('live')}" for m in drift))
     if missing:
         print("  MISSING: " + ", ".join(m["label"] for m in missing))
-    unarmed = [f["flag"] for f in flags if not f["armed"] and not f["kill_switch"]]
+    unarmed = [f["flag"] for f in flags
+               if not f["armed"] and not f["kill_switch"] and f.get("kind") != "value"]
+    undef = [f["flag"] for f in flags
+             if not f["armed"] and f.get("kind") == "value"]
     if unarmed:
         print("  not armed: " + ", ".join(unarmed))
+    if undef:
+        print("  using default: " + ", ".join(undef))
     return 0 if verdict != "FAIL" else 1
 
 
