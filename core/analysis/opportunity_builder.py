@@ -627,7 +627,24 @@ from datetime import datetime, timedelta, timezone
 # Japan unaffordable. Recommended pairing: TFB_OPP_STOP_VOL_MULT=1.5.
 # GATE: TFB_OPP_STOP_VOL_UNITS_FIX (default OFF) — committing changes NOTHING.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.2.0"
+# -----------------------------------------------------------------------------
+# v1.3.0 (2026-07-20) — REF-CONSERVATIVE: ROI% 35.0/17.5 SATURATION ROOT FIX (D-12)
+# WHY (R1 defect; audit 2026-07-19 "ROI column saturated despite armed softcap"):
+# TFB_SCORE_ROI_SOFTCAP (scoring.py v5.10.0) differentiates expected_roi_*, but
+# the displayed ROI% never reads that field: ref = target_price|intrinsic_value,
+# and both arrive display-capped (engine v5.87.0 Fix AG pins intrinsic_value at
+# exactly price*1.35 on every overshooting row) -> roi_pct = exactly 35.0 and
+# the TP1 plan basis (price+0.5*(ref-price)) = exactly 17.5. The armed softcap
+# was structurally unreachable from the column whose saturation it names.
+# FIX: env TFB_OPP_REF_CONSERVATIVE (default OFF -> byte-identical v1.2.0).
+# When ON in normalize_candidate: ref = min(valuation ref, price*(1+engine 12M
+# forecast/100)) for a POSITIVE engine forecast only; valuation_basis =
+# "engine_forecast_min" when it binds. Only ever SHRINKS an inflated claim;
+# tp1/tp2/roi_pct/ann_roi/rr and the plan basis inherit the engine's order-
+# preserving differentiation; honest refs stay untouched; mos_pct remains a
+# raw-intrinsic valuation concept. KILL: unset/0 -> v1.2.0 exactly.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -974,6 +991,14 @@ def _env_engine_roi_display():
     v1.0.4."""
     return str(_env_str("TFB_OPP_ENGINE_ROI_DISPLAY", "0")).strip().lower() \
         in ("1", "true", "yes", "on")
+
+
+def _ref_conservative_enabled():
+    """v1.3.0 (D-12): master switch for the conservative ticket reference —
+    ref = min(valuation ref, engine 12M forecast price). Default OFF ->
+    normalize_candidate byte-identical to v1.2.0."""
+    return str(_env_str("TFB_OPP_REF_CONSERVATIVE", "0")).strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def _env_primary_roi_basis():
@@ -1546,6 +1571,26 @@ def normalize_candidate(row, fx_rates, criteria):
     ref = target if target is not None else iv
     valuation_basis = ("target_price" if target is not None
                        else "intrinsic_value" if iv is not None else None)
+
+    # v1.3.0 [REF-CONSERVATIVE] (D-12): the valuation ref (target_price /
+    # intrinsic_value) arrives display-capped upstream (engine Fix AG pins
+    # intrinsic_value at exactly price*1.35 on every overshooting row), which
+    # pinned roi_pct/TP2 at 35.0 and the TP1 plan basis at 17.5 across the
+    # board — the armed TFB_SCORE_ROI_SOFTCAP differentiates expected_roi_*
+    # in core/scoring.py but is structurally unreachable from this column.
+    # When armed, bound the ladder reference by the engine's own softcap-
+    # differentiated 12M forecast — min(), so an inflated claim only ever
+    # SHRINKS and an honest ref already below the forecast is untouched.
+    # Positive forecasts only; missing/<=0 keeps the v1.2.0 ref exactly (the
+    # v1.0.3 FORECAST-GATE already governs forecast losers).
+    if _ref_conservative_enabled() and price and ref:
+        _eng_pct_ref = _engine_roi_to_pct(
+            _to_float(_field(view, "engine_roi_12m_pct")))
+        if _eng_pct_ref is not None and _eng_pct_ref > 0.0:
+            _ref_eng = price * (1.0 + _eng_pct_ref / 100.0)
+            if _ref_eng < ref:
+                ref = _ref_eng
+                valuation_basis = "engine_forecast_min"
 
     roi_pct = None
     if price and ref:
