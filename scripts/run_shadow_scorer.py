@@ -79,7 +79,35 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 #       must not depend on a secondary tab succeeding;
 #   (3) each sheet write is independently guarded, so one failure degrades
 #       that tab alone and is reported, instead of silently killing the run.
-SCRIPT_VERSION = "1.1.1"
+# v1.2.0 (2026-07-20): PRICE-HONESTY [VBREAK — Register §5 evidence semantics].
+# Evening audit 2026-07-20 (export __39_): day-2 CHAMPION/CHALLENGER rows were
+# recorded with Daily Return 0.0000 while their Prices JSON was byte-identical
+# to the day-1 seed across all 10/5 symbols — even though Global_Markets held
+# fresh Tokyo closes (2269.T +71) hours before the run, and the benchmark leg
+# ^TASI.SR moved in the very same spot fetch. Whatever the transport cause
+# (Yahoo serving a stale last bar, or the seed itself mis-anchored), the
+# scorer had no instrument to KNOW a price was stale, so a dead feed scored
+# as a flat market. Fix — measure, never assume:
+#   (1) fetch_spot now also returns each symbol's LAST-BAR DATE (bar epoch +
+#       the payload's own gmtoffset), so freshness is evidence, not hope;
+#   (2) a symbol whose last bar is not strictly newer than the previous
+#       history row's date is STALE: excluded from that day's return pairing
+#       and carried at its previous stored price so the next fresh bar
+#       captures the full move (nothing lost, nothing invented);
+#   (3) if a basket's fresh coverage falls below TFB_SHADOW_MIN_FRESH_PCT
+#       (default 60%), the DAY IS EXCLUDED-INFRA per Gate & Evidence
+#       Register §5: Daily Return blank, Cum Index carried, note
+#       `DAY_EXCLUDED_INFRA fresh=a/b stale=c` — never a fabricated 0;
+#   (4) criterion 1 now counts SCORED evidence days only (seed and excluded
+#       days do not count), with excluded days reported alongside;
+#   (5) stale counts and the fresh/excluded state print in the verdict line,
+#       the S1 meta block, and each history row's note;
+#   (6) EVIDENCE_EPOCH = 2026-07-21 segments the evidence at this version
+#       break: the two pre-break rows (seed + the fabricated-flat day) stay
+#       in the tab untouched but can never count as scored days — repair by
+#       segmentation, never by restatement.
+# Kill-switch: TFB_SHADOW_PRICE_HONESTY=0 restores v1.1.1 behavior exactly.
+SCRIPT_VERSION = "1.2.0"
 TAB_HISTORY = "Shadow_History"
 TAB_GATE = "S1_Gate"
 TAB_REGRET = "Regret_Ledger"
@@ -91,6 +119,14 @@ CHAMPION, CHALLENGER, BENCHMARK = "CHAMPION", "CHALLENGER", "BENCHMARK"
 BENCH_WEIGHTS = {"SPUS": 0.70, "^TASI.SR": 0.30}   # §1 locked benchmark
 S1_WINDOW_DAYS = 28                                 # >=4 full weeks
 BASE_INDEX = 100.0
+# v1.2.0 [VBREAK]: evidence counting starts at this date. Rows before it
+# (the 2026-07-19 seed and the 2026-07-20 fabricated-flat day, audit
+# 2026-07-20) remain in the tab untouched — append-only, never restated —
+# but can NEVER count as scored evidence days. Register §5: a methodology
+# version break segments evidence; pre-break cum is retained (the ≤1bp
+# benchmark drift from day 2 is acknowledged and immaterial to the ±
+# tolerance of criterion 3).
+EVIDENCE_EPOCH = date(2026, 7, 21)
 
 YAHOO_SPOT = ("https://query1.finance.yahoo.com/v8/finance/chart/"
               "{sym}?range=5d&interval=1d")
@@ -115,6 +151,104 @@ def _num(x: Any) -> Optional[float]:
 # --------------------------------------------------------------------------- #
 # pure scoring core (fully selftested offline)                                 #
 # --------------------------------------------------------------------------- #
+def _price_honesty_enabled() -> bool:
+    """v1.2.0 kill-switch — default ON (protective; guards ship armed)."""
+    return (os.getenv("TFB_SHADOW_PRICE_HONESTY") or "1").strip().lower() \
+        not in {"0", "false", "off", "no"}
+
+
+def _min_fresh_frac() -> float:
+    """Minimum fresh-priced share of a basket for the day to count (§5)."""
+    try:
+        v = float(os.getenv("TFB_SHADOW_MIN_FRESH_PCT") or 60.0)
+        return v / 100.0 if v > 1.0 else v
+    except Exception:  # noqa: BLE001
+        return 0.60
+
+
+def _parse_iso_date(s: Any) -> Optional[date]:
+    try:
+        return datetime.strptime(str(s).strip()[:10], "%Y-%m-%d").date()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def basket_return_fresh(prev_prices: Dict[str, float],
+                        cur_prices: Dict[str, float],
+                        cur_asof: Dict[str, date],
+                        prev_date: Optional[date],
+                        ) -> Tuple[Optional[float], int, int, List[str]]:
+    """v1.2.0 honest pairing: (return, n_fresh, n_stale, stale_symbols).
+
+    A pair contributes only when today's bar date is STRICTLY newer than the
+    previous row's date; otherwise the symbol is stale — reported, excluded,
+    never scored as a fake 0% leg. With honesty OFF or no prev_date, falls
+    back to v1.1.1 semantics (every present pair counts, stale=0)."""
+    rets: List[float] = []
+    stale: List[str] = []
+    honest = _price_honesty_enabled() and prev_date is not None
+    for sym, p0 in (prev_prices or {}).items():
+        p1 = (cur_prices or {}).get(sym)
+        if p1 is None or not p0:
+            continue
+        if honest:
+            a = cur_asof.get(sym)
+            if a is None or a <= prev_date:
+                stale.append(sym)
+                continue
+        rets.append((p1 / p0 - 1.0) * 100.0)
+    if not rets:
+        return None, 0, len(stale), stale
+    return sum(rets) / len(rets), len(rets), len(stale), stale
+
+
+def blended_benchmark_return_fresh(prices_prev: Dict[str, float],
+                                   prices_cur: Dict[str, float],
+                                   cur_asof: Dict[str, date],
+                                   prev_date: Optional[date],
+                                   ) -> Tuple[Optional[float], int, int]:
+    """§1 benchmark with §6 calendar honesty: weights renormalize over the
+    legs that produced a NEW bar since the previous row (a closed venue's
+    carried close contributes no fake 0%). Returns (ret, n_fresh, n_stale)."""
+    honest = _price_honesty_enabled() and prev_date is not None
+    total_w, acc, n_fresh, n_stale = 0.0, 0.0, 0, 0
+    for sym, w in BENCH_WEIGHTS.items():
+        p0, p1 = (prices_prev or {}).get(sym), (prices_cur or {}).get(sym)
+        if p0 and p1 is not None:
+            if honest:
+                a = cur_asof.get(sym)
+                if a is None or a <= prev_date:
+                    n_stale += 1
+                    continue
+            acc += w * (p1 / p0 - 1.0) * 100.0
+            total_w += w
+            n_fresh += 1
+    if total_w <= 0:
+        return None, n_fresh, n_stale
+    return acc / total_w, n_fresh, n_stale
+
+
+def count_scored_days(history: List[Dict[str, Any]], basket: str) -> Tuple[int, int]:
+    """v1.2.0 criterion-1 semantics: (scored_days, excluded_days) for a basket.
+    Scored = row carries a numeric Daily Return AND is dated on/after
+    EVIDENCE_EPOCH (the v1.2.0 version break — pre-break rows include the
+    2026-07-20 fabricated-flat day and never count). Seed rows (blank
+    return, 'seeded' note) and DAY_EXCLUDED_INFRA rows never count."""
+    scored, excluded = set(), set()
+    for h in history or []:
+        if h.get("basket") != basket:
+            continue
+        d = _parse_iso_date(h.get("date"))
+        if d is None or d < EVIDENCE_EPOCH:
+            continue
+        note = str(h.get("note") or "")
+        if h.get("daily_return") is not None:
+            scored.add(h.get("date"))
+        elif "DAY_EXCLUDED" in note:
+            excluded.add(h.get("date"))
+    return len(scored), len(excluded)
+
+
 def basket_return(prev_prices: Dict[str, float],
                   cur_prices: Dict[str, float]) -> Tuple[Optional[float], int]:
     """Equal-weight 1-day return over symbols priced in BOTH snapshots.
@@ -213,13 +347,18 @@ def check_point_in_time(history: Sequence[Dict[str, Any]]) -> Tuple[bool, str]:
 def evaluate_s1(days: int, violations: List[str],
                 net_alpha_pct: Optional[float],
                 calibration_state: str, ca_clean: bool, pit_ok: bool,
-                pit_note: str, drill_date: Optional[str]) -> Dict[str, Any]:
+                pit_note: str, drill_date: Optional[str],
+                excluded_days: int = 0) -> Dict[str, Any]:
     """§15 verdict. PASS requires all six; anything unmet => NOT_DECIDABLE
-    (or FAIL where a criterion is definitively breached). Never auto-promotes."""
+    (or FAIL where a criterion is definitively breached). Never auto-promotes.
+    v1.2.0: `days` are SCORED evidence days only; excluded-infra days are
+    reported beside them (Register §5) and can never satisfy criterion 1."""
     c: List[Dict[str, Any]] = []
     c.append({"id": 1, "name": "4+ weeks shadow evidence",
               "status": "PASS" if days >= S1_WINDOW_DAYS else "PENDING",
-              "detail": f"{days}/{S1_WINDOW_DAYS} days"})
+              "detail": f"{days}/{S1_WINDOW_DAYS} scored days"
+                        + (f" · {excluded_days} excluded-infra"
+                           if excluded_days else "")})
     c.append({"id": 2, "name": "zero compliance violations",
               "status": "FAIL" if violations else "PASS",
               "detail": (", ".join(violations[:5]) if violations
@@ -255,14 +394,42 @@ def evaluate_s1(days: int, violations: List[str],
 # --------------------------------------------------------------------------- #
 # price fetch                                                                  #
 # --------------------------------------------------------------------------- #
-def fetch_spot(symbols: Sequence[str]) -> Tuple[Dict[str, float], List[str]]:
-    """Last daily close per symbol. Misses are reported, never invented."""
+def _last_bar(res: Dict[str, Any]) -> Tuple[Optional[float], Optional[date]]:
+    """v1.2.0: last (close, bar-date) from a chart payload. The bar's date is
+    computed with the payload's own gmtoffset so a Tokyo Monday bar is dated
+    Monday, not the UTC Sunday its epoch lands on."""
+    closes = (res.get("indicators", {}).get("quote", [{}])[0] or {}).get("close") or []
+    stamps = res.get("timestamp") or []
+    try:
+        off = int((res.get("meta") or {}).get("gmtoffset") or 0)
+    except Exception:  # noqa: BLE001
+        off = 0
+    px, dt = None, None
+    for i, c in enumerate(closes):
+        if c is None:
+            continue
+        px = float(c)
+        if i < len(stamps) and stamps[i]:
+            try:
+                dt = datetime.fromtimestamp(int(stamps[i]) + off,
+                                            tz=timezone.utc).date()
+            except Exception:  # noqa: BLE001
+                dt = None
+    return px, dt
+
+
+def fetch_spot(symbols: Sequence[str]
+               ) -> Tuple[Dict[str, float], Dict[str, date], List[str]]:
+    """Last daily close per symbol + its bar date. Misses are reported,
+    never invented; a close without a readable bar date is reported in errs
+    and treated as stale by the honesty layer (unproven freshness ≠ fresh)."""
     out: Dict[str, float] = {}
+    asof: Dict[str, date] = {}
     errs: List[str] = []
     try:
         import httpx
     except Exception as exc:  # noqa: BLE001
-        return out, [f"httpx_unavailable:{type(exc).__name__}"]
+        return out, asof, [f"httpx_unavailable:{type(exc).__name__}"]
     with httpx.Client(timeout=20.0, follow_redirects=True,
                       headers={"User-Agent": "Mozilla/5.0 (TFB scorer)"}) as cl:
         for sym in list(dict.fromkeys(symbols)):
@@ -270,15 +437,18 @@ def fetch_spot(symbols: Sequence[str]) -> Tuple[Dict[str, float], List[str]]:
                 r = cl.get(YAHOO_SPOT.format(sym=sb._yahoo_symbol(sym)))
                 r.raise_for_status()
                 res = r.json()["chart"]["result"][0]
-                closes = [c for c in res["indicators"]["quote"][0]["close"]
-                          if c is not None]
-                if closes:
-                    out[sym] = float(closes[-1])
+                px, bar_date = _last_bar(res)
+                if px is not None:
+                    out[sym] = px
+                    if bar_date is not None:
+                        asof[sym] = bar_date
+                    else:
+                        errs.append(f"{sym}:no_bar_date")
                 else:
                     errs.append(f"{sym}:no_close")
             except Exception as exc:  # noqa: BLE001
                 errs.append(f"{sym}:{type(exc).__name__}")
-    return out, errs
+    return out, asof, errs
 
 
 # --------------------------------------------------------------------------- #
@@ -305,6 +475,7 @@ def read_history(sh) -> List[Dict[str, Any]]:
             "prices": prices,
             "daily_return": _num(row[4]) if len(row) > 4 else None,
             "cum_index": _num(row[5]) if len(row) > 5 else None,
+            "note": str(row[8]).strip() if len(row) > 8 else "",
         })
     return out
 
@@ -520,7 +691,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     for p in prev.values():
         if p:
             need |= set(p["symbols"])
-    spot, price_errs = fetch_spot(sorted(need))
+    spot, spot_asof, price_errs = fetch_spot(sorted(need))
 
     for f in new_forks:                      # price at the moment of refusal
         if f.get("ref_price") is None:
@@ -528,45 +699,112 @@ def main(argv: Optional[List[str]] = None) -> int:
     scored_forks = rg.score_all(all_forks, spot, today)
     regret_summary = rg.summarize(scored_forks)
 
+    # ---- v1.2.0 honest pass 1: measure freshness per basket --------------- #
+    measured: Dict[str, Dict[str, Any]] = {}
+    for basket, syms in ((CHAMPION, champ_syms), (CHALLENGER, chal_syms),
+                         (BENCHMARK, list(BENCH_WEIGHTS))):
+        p = prev[basket]
+        p_date = _parse_iso_date(p["date"]) if p else None
+        if basket == BENCHMARK:
+            ret, n_fresh, n_stale = (
+                blended_benchmark_return_fresh(p["prices"], spot, spot_asof,
+                                               p_date) if p else (None, 0, 0))
+            stale_syms: List[str] = []
+        else:
+            ret, n_fresh, n_stale, stale_syms = (
+                basket_return_fresh(p["prices"], spot, spot_asof, p_date)
+                if p else (None, 0, 0, []))
+        measured[basket] = {"ret": ret, "n_fresh": n_fresh,
+                            "n_stale": n_stale, "stale_syms": stale_syms,
+                            "p": p}
+
+    # Day gate (Register §5): the CHALLENGER is the evidence subject. If its
+    # fresh coverage is under floor — or the benchmark produced no fresh leg —
+    # the whole day is EXCLUDED-INFRA for every basket (indexes carried), so
+    # the three series never diverge on which days they consider real.
+    _chal_m = measured[CHALLENGER]
+    _chal_frac = (_chal_m["n_fresh"] / len(chal_syms)) if chal_syms else 0.0
+    day_excluded = bool(
+        _price_honesty_enabled()
+        and _chal_m["p"] is not None
+        and (_chal_frac < _min_fresh_frac()
+             or (measured[BENCHMARK]["p"] is not None
+                 and measured[BENCHMARK]["ret"] is None)))
+    total_stale = sum(m["n_stale"] for m in measured.values())
+
     new_rows: List[List[Any]] = []
     results: Dict[str, Dict[str, Any]] = {}
     for basket, syms in ((CHAMPION, champ_syms), (CHALLENGER, chal_syms),
                          (BENCHMARK, list(BENCH_WEIGHTS))):
-        p = prev[basket]
+        m = measured[basket]
+        p = m["p"]
+        p_date = _parse_iso_date(p["date"]) if p else None
+        ret = None if day_excluded else m["ret"]
         if basket == BENCHMARK:
-            ret = (blended_benchmark_return(p["prices"], spot) if p else None)
-            n_used = len(BENCH_WEIGHTS)
-            drag = 0.0
-            turn = 0.0
+            drag, turn = 0.0, 0.0
         else:
-            ret, n_used = (basket_return(p["prices"], spot) if p else (None, 0))
-            turn = turnover_pct(p["symbols"] if p else [], syms)
-            drag = cost_drag_pct(p["symbols"] if p else [], syms)
+            turn = 0.0 if day_excluded else turnover_pct(
+                p["symbols"] if p else [], syms)
+            drag = 0.0 if day_excluded else cost_drag_pct(
+                p["symbols"] if p else [], syms)
         idx = chain_index(p["cum_index"] if p else None, ret, drag)
-        prices_today = {s: spot[s] for s in syms if s in spot}
-        note = (f"n={n_used}" + (f" seeded" if not p else "")
-                + (f" price_errs={len(price_errs)}" if price_errs else ""))
+        # Stored snapshot: fresh symbols at today's bar; stale symbols carry
+        # their previous stored price so the next fresh bar captures the full
+        # move; nothing is stored at an invented level.
+        prices_today: Dict[str, float] = {}
+        for s in syms:
+            if s in spot and (not _price_honesty_enabled() or p_date is None
+                              or (spot_asof.get(s) is not None
+                                  and spot_asof[s] > p_date)):
+                prices_today[s] = spot[s]
+            elif p and s in (p.get("prices") or {}):
+                prices_today[s] = p["prices"][s]
+        if day_excluded and p:
+            note = (f"DAY_EXCLUDED_INFRA fresh={m['n_fresh']}/{len(syms)} "
+                    f"stale={m['n_stale']}")
+        else:
+            note = f"n={m['n_fresh']}" + (" seeded" if not p else "")
+            if m["n_stale"]:
+                note += (f" stale={m['n_stale']}"
+                         f"[{','.join(m['stale_syms'][:4])}"
+                         f"{',…' if m['n_stale'] > 4 else ''}]")
+        if price_errs:
+            note += f" price_errs={len(price_errs)}"
         new_rows.append([str(today), basket, ",".join(syms),
-                         json.dumps(prices_today), 
+                         json.dumps(prices_today),
                          "" if ret is None else round(ret, 4),
                          idx, round(turn, 2), round(drag, 4), note])
         results[basket] = {"ret": ret, "index": idx, "n": len(syms)}
 
-    days = len({h["date"] for h in history if h["basket"] == CHALLENGER}) + 1
+    scored_prev, excluded_prev = count_scored_days(history, CHALLENGER)
+    if _price_honesty_enabled():
+        days = scored_prev + (0 if (day_excluded
+                                    or results[CHALLENGER]["ret"] is None)
+                              else 1)
+        excluded_days = excluded_prev + (1 if day_excluded else 0)
+    else:  # v1.1.1 legacy counting, kill-switch path
+        days = len({h["date"] for h in history
+                    if h["basket"] == CHALLENGER}) + 1
+        excluded_days = 0
     chal_cum = (results[CHALLENGER]["index"] / BASE_INDEX - 1.0) * 100.0
     bench_cum = (results[BENCHMARK]["index"] / BASE_INDEX - 1.0) * 100.0
     champ_cum = (results[CHAMPION]["index"] / BASE_INDEX - 1.0) * 100.0
-    net_alpha = (chal_cum - bench_cum) if days > 1 else None
+    net_alpha = (chal_cum - bench_cum) if days >= 1 else None
 
     pit_ok, pit_note = check_point_in_time(history)
     gate = evaluate_s1(days, violations, net_alpha, "PENDING",
                        ca_is_clean(sh), pit_ok, pit_note,
-                       find_drill_marker(sh, today - timedelta(days=45)))
+                       find_drill_marker(sh, today - timedelta(days=45)),
+                       excluded_days=excluded_days)
 
     verdict = (f"[S1-GATE v{SCRIPT_VERSION}] {gate['verdict']} day {days}/"
-               f"{S1_WINDOW_DAYS} | challenger {chal_cum:+.2f}% champion "
+               f"{S1_WINDOW_DAYS}"
+               + (f" (+{excluded_days} excluded-infra)" if excluded_days else "")
+               + f" | challenger {chal_cum:+.2f}% champion "
                f"{champ_cum:+.2f}% benchmark {bench_cum:+.2f}% | net alpha "
                f"{'n/a' if net_alpha is None else f'{net_alpha:+.2f}%'} | "
+               f"{'DAY_EXCLUDED_INFRA' if day_excluded else 'day_scored'} "
+               f"stale={total_stale} | "
                f"violations={len(violations)} | forks {len(all_forks)} "
                f"(+{len(new_forks)} new)")
     print(verdict)
@@ -591,7 +829,8 @@ def main(argv: Optional[List[str]] = None) -> int:
          f"net alpha {'n/a' if net_alpha is None else f'{net_alpha:+.2f}%'}"],
         [f"benchmark = {json.dumps(BENCH_WEIGHTS)} (§1 locked)",
          "returns are cost-adjusted, daily-rebalanced equal-weight",
-         f"price errors: {len(price_errs)}"],
+         f"price errors: {len(price_errs)} | stale: {total_stale} | "
+         f"day: {'EXCLUDED_INFRA' if day_excluded else 'scored'}"],
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
     # v1.1.1: gate FIRST, then evidence, then the secondary summary. Each
@@ -730,6 +969,68 @@ def _selftest() -> int:
     checks.append(("regret rows match the ledger header width",
                    all(len(r) == len(rg.LEDGER_HEADER)
                        for r in rg.to_rows(rg.score_all(cand, {}, None)))))
+
+    # ---- v1.2.0 price-honesty layer (the 2026-07-20 frozen-day defect) ---- #
+    d0, d1 = date(2026, 7, 19), date(2026, 7, 20)
+    os.environ["TFB_SHADOW_PRICE_HONESTY"] = "1"
+    rF, nF, sF, ssF = basket_return_fresh(
+        {"A": 100.0, "B": 50.0}, {"A": 110.0, "B": 50.0},
+        {"A": d1, "B": d0}, d0)
+    checks.append(("fresh: stale bar excluded from pairing, fresh bar scores",
+                   abs(rF - 10.0) < 1e-9 and nF == 1 and sF == 1
+                   and ssF == ["B"]))
+    rG, nG, sG, _ = basket_return_fresh(
+        {"A": 100.0, "B": 50.0}, {"A": 100.0, "B": 50.0},
+        {"A": d0, "B": d0}, d0)
+    checks.append(("fresh: fully-stale basket -> None, never a fabricated 0",
+                   rG is None and nG == 0 and sG == 2))
+    rH, nH, sH, _ = basket_return_fresh(
+        {"A": 100.0}, {"A": 100.0}, {"A": d1}, d0)
+    checks.append(("fresh: unchanged price WITH a new bar is a real 0%",
+                   rH is not None and abs(rH) < 1e-9 and nH == 1 and sH == 0))
+    rB, nBf, nBs = blended_benchmark_return_fresh(
+        {"SPUS": 100.0, "^TASI.SR": 10000.0},
+        {"SPUS": 100.0, "^TASI.SR": 10100.0},
+        {"SPUS": d0, "^TASI.SR": d1}, d0)
+    checks.append(("benchmark: carried leg drops out, fresh leg renormalizes",
+                   rB is not None and abs(rB - 1.0) < 1e-9
+                   and nBf == 1 and nBs == 1))
+    os.environ["TFB_SHADOW_PRICE_HONESTY"] = "0"
+    rL, nL, sL, _ = basket_return_fresh(
+        {"A": 100.0, "B": 50.0}, {"A": 100.0, "B": 50.0},
+        {"A": d0, "B": d0}, d0)
+    checks.append(("kill-switch OFF restores v1.1.1 semantics exactly",
+                   rL is not None and abs(rL) < 1e-9 and nL == 2 and sL == 0))
+    os.environ["TFB_SHADOW_PRICE_HONESTY"] = "1"
+    hist = [
+        {"basket": CHALLENGER, "date": "2026-07-19", "daily_return": None,
+         "note": "n=0 seeded"},
+        {"basket": CHALLENGER, "date": "2026-07-21", "daily_return": 0.42,
+         "note": "n=5"},
+        {"basket": CHALLENGER, "date": "2026-07-22", "daily_return": None,
+         "note": "DAY_EXCLUDED_INFRA fresh=0/5 stale=5"},
+    ]
+    checks.append(("scored-day counter: seed=0, excluded=0, scored=1",
+                   count_scored_days(hist, CHALLENGER) == (1, 1)))
+    hist_pre = [
+        {"basket": CHALLENGER, "date": "2026-07-20", "daily_return": 0.0,
+         "note": "n=5"},          # the fabricated-flat day: numeric 0, pre-epoch
+    ] + hist
+    checks.append(("evidence epoch: pre-VBREAK fabricated 0-day NEVER counts",
+                   count_scored_days(hist_pre, CHALLENGER) == (1, 1)))
+    g5 = evaluate_s1(1, [], 0.1, "PENDING", True, True, "ok", None,
+                     excluded_days=2)
+    c1 = next(x for x in g5["criteria"] if x["id"] == 1)
+    checks.append(("criterion 1 reports scored + excluded-infra days",
+                   "1/28 scored" in c1["detail"]
+                   and "2 excluded-infra" in c1["detail"]))
+    checks.append(("bar date honors payload gmtoffset (Tokyo Monday = Monday)",
+                   _last_bar({"indicators": {"quote": [{"close": [3883.0]}]},
+                              # 2026-07-23 15:00 UTC == 2026-07-24 00:00 JST:
+                              # naive UTC dating would say the 23rd.
+                              "timestamp": [1784818800],
+                              "meta": {"gmtoffset": 32400}})[1]
+                   == date(2026, 7, 24)))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
