@@ -59,7 +59,23 @@ errors, NOT same-currency crossings like today's 17.32-vs-43.54
 (ratio 2.5x) — YC-1 is the fix for those; YC-3 is belt for the
 unit-class family only.
 
-Version: PROVIDER_VERSION = "8.9.0". All prior WHY blocks preserved
+Version: PROVIDER_VERSION = "8.10.0". All prior WHY blocks preserved
+
+v8.10.0 (W-5, 2026-07-20) -- ENV SYMBOL SKIP-LIST (Yahoo-dead / junk symbols)
+  Evidence (evening audit 2026-07-20, Execution Plan v2.1 W-5): XAUUSD=X and
+  AEDMXN=X were long-running permanent-404 noise; tonight they went from
+  dead to WORSE -- Yahoo now answers them with junk values (XAUUSD=X wrote
+  26.21 to Commodities_FX while GC=F on the same page printed 4,037), so a
+  dead symbol silently became a wrong-value symbol. Fix: an operator-owned
+  env list `TFB_YC_SYMBOL_SKIP` (comma-separated; matched case-insensitively
+  against the raw, normalized, and Yahoo-mapped forms). A listed symbol
+  short-circuits BEFORE any HTTP or yfinance work in both
+  get_enriched_quote() and fetch_history_raw(): quote -> None, history -> []
+  (the provider's standard miss shapes -- downstream fallback chains behave
+  exactly as they do for any miss), with one `[YC-SKIP]` log line per symbol
+  per process. Default: env unset/empty => set is empty => ZERO behavior
+  change (the switch ships inert; arming is an explicit operator ENV action
+  per the standing ENV rule).
 
 v8.9.0 (Fix BA-0, 2026-07-15) -- CHART-META IDENTITY SURFACED
   Shell probes proved quoteSummary/info dead from this host (info_empty in
@@ -582,7 +598,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.9.0"
+PROVIDER_VERSION = "8.10.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -674,6 +690,59 @@ DEFAULT_HISTORY_INTERVAL = "1d"
 DEFAULT_YF_HISTORY_RETRY_ATTEMPTS = 3      # total tries when gate ON (1 try + 2 retries)
 DEFAULT_YF_HISTORY_RETRY_BASE_SEC = 0.5    # base backoff seconds (exponential)
 DEFAULT_YF_HISTORY_RETRY_CAP_SEC = 2.0     # per-attempt backoff ceiling (seconds)
+
+
+# ---------------------------------------------------------------------------
+# v8.10.0 (W-5): operator-owned symbol skip-list
+# ---------------------------------------------------------------------------
+_YC_SKIP_CACHE: Tuple[str, frozenset] = ("", frozenset())
+_YC_SKIP_LOGGED: set = set()
+
+
+def _yc_skip_set() -> frozenset:
+    """Parse TFB_YC_SYMBOL_SKIP (comma-separated, case-insensitive).
+
+    Cached per raw env value so repeated calls cost one string compare.
+    Empty/unset env => empty set => v8.9.0 behavior byte-for-byte.
+    """
+    global _YC_SKIP_CACHE
+    raw = (os.getenv("TFB_YC_SYMBOL_SKIP") or "").strip()
+    if raw == _YC_SKIP_CACHE[0]:
+        return _YC_SKIP_CACHE[1]
+    toks = frozenset(t.strip().upper() for t in raw.split(",") if t.strip())
+    _YC_SKIP_CACHE = (raw, toks)
+    return toks
+
+
+def _yc_symbol_skipped(raw_symbol: str, norm_symbol: str) -> bool:
+    """True when the symbol is on the operator skip-list.
+
+    Matched against the raw input, the normalized form, and the
+    Yahoo-mapped form, so `XAUUSD=X` is caught however a caller spells it.
+    Logs one [YC-SKIP] line per symbol per process (never per call)."""
+    skip = _yc_skip_set()
+    if not skip:
+        return False
+    forms = {
+        (raw_symbol or "").strip().upper(),
+        (norm_symbol or "").strip().upper(),
+    }
+    try:
+        forms.add(_yc_yahoo_symbol(norm_symbol).strip().upper())
+    except Exception:  # noqa: BLE001
+        pass
+    forms.discard("")
+    if not (forms & skip):
+        return False
+    key = (norm_symbol or raw_symbol or "").upper()
+    if key not in _YC_SKIP_LOGGED:
+        _YC_SKIP_LOGGED.add(key)
+        logger.info(
+            "[yahoo_chart v%s YC-SKIP] %s skipped via TFB_YC_SYMBOL_SKIP "
+            "(no HTTP attempted; standard miss shape returned)",
+            PROVIDER_VERSION, key,
+        )
+    return True
 
 
 def _yc_identity_guard_enabled() -> bool:
@@ -2362,6 +2431,10 @@ class YahooChartProvider:
         if not sym:
             return None
 
+        # v8.10.0 (W-5): operator skip-list — before cache, breaker, or HTTP.
+        if _yc_symbol_skipped(symbol, sym):
+            return None
+
         cached = await self._cache.get(sym, kind="enriched")
         metrics = _get_metrics()
         if cached:
@@ -2558,6 +2631,10 @@ class YahooChartProvider:
 
         sym = normalize_symbol(symbol)
         if not sym:
+            return []
+
+        # v8.10.0 (W-5): operator skip-list — before raw chart or yfinance.
+        if _yc_symbol_skipped(symbol, sym):
             return []
 
         # v8.7.0 (YC-RAW): crumb-free raw chart history FIRST — same
