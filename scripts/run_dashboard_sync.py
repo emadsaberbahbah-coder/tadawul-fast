@@ -1106,7 +1106,23 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # preserved, name blanked, Warnings tag, non-dupe untouched). No behavior
 # change outside the selftest; FW-4 gating logic untouched.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.25.2"
+# -----------------------------------------------------------------------------
+# v6.25.3 (2026-07-20) — FW-4 LEGITIMATE-FAMILY EXEMPTION (urgent, pre-15:00)
+# WHY (run #2485 artifacts): with the v6.25.2 selftest fix on main, FW-4
+# quarantine arms for the FIRST time at the next leg — and the same run's
+# census shows it would blank five LEGITIMATE Global_Markets multi-listing
+# families (ONB/ONBPO/ONBPP preferred shares; TTE/TTE.PA/TTE.US; TLK/TLK.US/
+# TLKM.JK; Trip.com; Teck) exactly like the ONE true chimera it exists for
+# (Goodyear's name on BRK-B + FI + GT.US). FIX: the census exempts a
+# same-name group whose symbols reduce to one root / one alphabetic prefix
+# (share-class + exchange-suffix strip); chimeras with unrelated roots stay
+# doomed. Operator override TFB_SYNC_NAME_DEDUP_EXEMPT_NAMES for families
+# the heuristic cannot see (numeric cross-listings). Selftest grows to 7/7
+# with a discriminator fixture. KILL: TFB_SYNC_NAME_DEDUP_FAMILY_EXEMPT=0
+# -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
+# v6.25.1 FW-KEEP last-good restore on the following merge.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.25.3"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2999,6 +3015,53 @@ _IDFW_SELFTEST_OK = True
 _IDFW_SELFTEST_MSG = "not-run"
 
 
+def _name_dedup_family_exempt_enabled() -> bool:
+    """v6.25.3: default ON. 0/false/off -> v6.25.2 census verbatim."""
+    return (os.getenv("TFB_SYNC_NAME_DEDUP_FAMILY_EXEMPT") or "1").strip().lower() not in {
+        "0", "false", "off", "no"}
+
+
+def _name_dedup_exempt_names() -> set:
+    """v6.25.3: operator-listed names never quarantined (comma-separated,
+    casefolded). For families the root heuristic cannot see (e.g. a numeric
+    cross-listing like 9961.HK beside TCOM)."""
+    raw = os.getenv("TFB_SYNC_NAME_DEDUP_EXEMPT_NAMES") or ""
+    return {t.strip().casefold() for t in raw.split(",") if t.strip()}
+
+
+_SR_FAMILY_SUFFIXES = (".US", ".PA", ".L", ".HK", ".JK", ".SW", ".DE", ".SR",
+                       ".T", ".AS", ".BR", ".MC", ".MI", ".TO", ".AX", ".NS",
+                       ".IS", ".KW", ".SA", ".SI", ".KS", ".TW")
+
+
+def _sym_root(sym: str) -> str:
+    """v6.25.3: exchange-suffix + share-class strip -> comparable root."""
+    s = str(sym or "").strip().upper()
+    for suf in _SR_FAMILY_SUFFIXES:
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+            break
+    s = s.split(".")[0]
+    for sep in ("-", "/"):
+        s = s.split(sep)[0]
+    return s
+
+
+def _name_dedup_is_family(syms: list) -> bool:
+    """v6.25.3: True when a same-name group is a LEGITIMATE multi-listing /
+    share-class family (TTE + TTE.PA + TTE.US; ONB + ONBPO + ONBPP;
+    TLK + TLK.US + TLKM.JK) rather than chimeric poison (Goodyear's name on
+    BRK-B + FI + GT.US -> roots differ -> NOT family)."""
+    roots = {_sym_root(x) for x in syms if str(x).strip()}
+    if not roots:
+        return False
+    if len(roots) == 1:
+        return True
+    base = min(roots, key=len)
+    return (len(base) >= 2 and base.isalpha()
+            and all(r.startswith(base) for r in roots))
+
+
 def _name_dedup_census(headers: list, rows_matrix: list) -> tuple:
     """v6.24.1 FW-4: census Name -> distinct symbols across the OUTGOING
     batch. Returns (groups, name_i, sym_i, warn_i) where groups is a dict
@@ -3028,9 +3091,22 @@ def _name_dedup_census(headers: list, rows_matrix: list) -> tuple:
             continue
         owners.setdefault(nm, set()).add(sym)
     m = _name_dedup_min()
+    fam_exempt = _name_dedup_family_exempt_enabled()
+    manual = _name_dedup_exempt_names() if fam_exempt else set()
     for nm, syms in owners.items():
         if len(syms) >= m:
-            groups[nm] = sorted(syms)
+            ss = sorted(syms)
+            # v6.25.3: a legitimate multi-listing family shares its name by
+            # DESIGN — exempt it from the quarantine census entirely so FW-4
+            # (armed for the first time by the v6.25.2 selftest fix) blanks
+            # only chimeric poison, never TTE.PA / ONBPO / TLKM.JK.
+            if fam_exempt and (nm.casefold() in manual
+                               or _name_dedup_is_family(ss)):
+                logger.info("%s FW-4 family-exempt: '%s' -> %s "
+                            "(multi-listing, not quarantined)",
+                            _IDFW_TAG, nm, ",".join(ss[:6]))
+                continue
+            groups[nm] = ss
     return groups, name_i, sym_i, warn_i
 
 
@@ -3073,7 +3149,7 @@ def _idfw_selftest_() -> bool:
     page. Sets _IDFW_SELFTEST_OK/_IDFW_SELFTEST_MSG. Never raises."""
     global _IDFW_SELFTEST_OK, _IDFW_SELFTEST_MSG
     passed = 0
-    total = 6
+    total = 7
     try:
         H = ["Symbol", "Name", "Price", "EPS (TTM)", "P/E (TTM)", "Warnings"]
         ni, pi, ei, qi = 1, 2, 3, 4
@@ -3128,6 +3204,25 @@ def _idfw_selftest_() -> bool:
         else:  # observe (default)
             if q2 == [] and g2:
                 passed += 1
+        # v6.25.3 case 7: family discriminator — a legitimate multi-listing
+        # group is EXEMPT from the census; a chimeric group is KEPT.
+        fam_rows = [
+            ["TTE", "TotalEnergies SE", 60, 6, 10, ""],
+            ["TTE.PA", "TotalEnergies SE", 60, 6, 10, ""],
+            ["TTE.US", "TotalEnergies SE", 60, 6, 10, ""],
+            ["BRK-B", "The Goodyear Tire & Rubber Company", 480, 20, 24, ""],
+            ["FI", "The Goodyear Tire & Rubber Company", 160, 8, 20, ""],
+            ["GT.US", "The Goodyear Tire & Rubber Company", 9, 1, 9, ""],
+        ]
+        g7, _i7, _j7, _k7 = _name_dedup_census(H, fam_rows)
+        _fam_ok = ("TotalEnergies SE" not in g7
+                   and g7.get("The Goodyear Tire & Rubber Company")
+                   == ["BRK-B", "FI", "GT.US"])
+        if not _name_dedup_family_exempt_enabled():
+            _fam_ok = ("TotalEnergies SE" in g7
+                       and "The Goodyear Tire & Rubber Company" in g7)
+        if _fam_ok:
+            passed += 1
     except Exception as e:
         _IDFW_SELFTEST_OK = False
         _IDFW_SELFTEST_MSG = "EXC %s: %s" % (type(e).__name__, e)
