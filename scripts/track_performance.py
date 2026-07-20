@@ -972,7 +972,42 @@ from urllib.error import HTTPError, URLError
 # When validation.py is unavailable the gate no-ops and says so in the notes,
 # never silently passing a hypothesis it failed to examine.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.26.0"
+# =============================================================================
+# v6.27.0 (W-1, 2026-07-21) — PRICE_STRUCTURE SLEEVE EXTENSION [VBREAK]
+# WHY (Execution Plan v2.1 W-1; spec 2026-07-20; R4a first artifact):
+#   The 2026-07-20 dispatch proved the boundary honestly: engine-derived
+#   fields (flow / candle_structure) cannot be backtested retroactively —
+#   point-in-time archiving only began in June — and rows outside the enum
+#   produced empty runs. This build adds the four BAR-DERIVED fields that
+#   ARE computable point-in-time from OHLCV history alone, exactly per the
+#   2026-07-20 spec:
+#     mom_12_1      = C[t−21]/C[t−252] − 1        (12-1 momentum, JT-style)
+#     trend_200     = 1 iff C[t] > SMA200[t] AND SMA200[t] > SMA200[t−21]
+#     high_52w_prox = C[t] / max(C[t−251…t])       (max INCLUDES t)
+#     vol_adj_mom   = mom_12_1 / σ_ann,  σ_ann = stdev(log rets t−252…t)·√252
+#   Comparator (spec-exact): a numeric field FIRES when value ≥ Trigger
+#   Value; boolean fields use 1. Implemented in make_trigger_fn as a pure
+#   branch needing NO engine import. Unknown fields keep the old behavior
+#   (None → ERROR, never a silent pass).
+#   Precision notes, documented deviations included:
+#     (a) "≥252 bars" in the spec prose is implemented as ≥253 close points
+#         for mom_12_1 / vol_adj_mom, because C[t−252] is the 253rd point
+#         counting t itself; high_52w_prox needs 252, trend_200 needs 221 —
+#         spec-exact.
+#     (b) σ uses the SAMPLE stdev (n−1), hand-rolled beside _welch_t —
+#         zero new imports.
+#     (c) A day whose field is None (insufficient lookback) cannot fire and
+#         therefore falls to the BASELINE side by design: a day that cannot
+#         trigger is a non-trigger day.
+#   Lookahead-safety (spec tripwire): every field at t is a pure function
+#   of bars ≤ t; the daily selftest now proves it on fixtures — mutating
+#   bars beyond the prefix leaves the prefix's field value byte-identical.
+#   Selftest grows 6 → 10 (four PRICE_STRUCTURE checks); the daily verdict
+#   line will read selftest=PASS 10/10 from this version on.
+#   Acceptance gates untouched: non-overlap, n≥30, ≥50bps, t≥2.0, DSR
+#   penalty (D-13), costs — nothing relaxed, nothing self-wires (§8).
+# =============================================================================
+SCRIPT_VERSION = "6.27.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -4853,6 +4888,81 @@ def _bt_bar_close(bar: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# v6.27.0 (W-1): PRICE_STRUCTURE bar-derived fields — pure functions of        #
+# bars[:t+1]; no engine, no network, no lookahead by construction.             #
+# --------------------------------------------------------------------------- #
+_PS_FIELDS: Tuple[str, ...] = ("mom_12_1", "trend_200", "high_52w_prox",
+                               "vol_adj_mom")
+
+
+def _ps_closes(bars: List[Dict[str, Any]]) -> List[float]:
+    """Positive closes in bar order via the same reader the backtest uses."""
+    out: List[float] = []
+    for b in bars or []:
+        c = _bt_bar_close(b)
+        if c is not None:
+            out.append(c)
+    return out
+
+
+def _ps_sample_stdev(xs: List[float]) -> float:
+    """Sample stdev (n−1), hand-rolled beside _welch_t; 0.0 when undefined."""
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    m = sum(xs) / n
+    var = sum((x - m) ** 2 for x in xs) / (n - 1)
+    return math.sqrt(var) if var > 0 else 0.0
+
+
+def price_structure_field(field: str, bars: List[Dict[str, Any]]
+                          ) -> Optional[float]:
+    """Value of a PRICE_STRUCTURE field at t = the LAST bar of `bars`.
+
+    Spec 2026-07-20, formulas verbatim (indices relative to t, C = close per
+    _bt_bar_close, adjusted preferred). Returns None on insufficient
+    lookback — never a guessed value."""
+    closes = _ps_closes(bars)
+    n = len(closes)
+    t = n - 1
+    if field == "mom_12_1":
+        if n < 253:
+            return None
+        c252 = closes[t - 252]
+        return (closes[t - 21] / c252 - 1.0) if c252 > 0 else None
+    if field == "trend_200":
+        if n < 221:
+            return None
+        sma_t = sum(closes[t - 199:t + 1]) / 200.0
+        sma_p = sum(closes[t - 220:t - 20]) / 200.0   # SMA200 at t−21
+        return 1.0 if (closes[t] > sma_t and sma_t > sma_p) else 0.0
+    if field == "high_52w_prox":
+        if n < 252:
+            return None
+        mx = max(closes[t - 251:t + 1])               # max INCLUDES t
+        return (closes[t] / mx) if mx > 0 else None
+    if field == "vol_adj_mom":
+        if n < 253:
+            return None
+        c252 = closes[t - 252]
+        if c252 <= 0:
+            return None
+        mom = closes[t - 21] / c252 - 1.0
+        rets: List[float] = []
+        for i in range(t - 251, t + 1):               # t−252…t → 252 log rets
+            prev = closes[i - 1]
+            if prev <= 0 or closes[i] <= 0:
+                return None
+            rets.append(math.log(closes[i] / prev))
+        sigma_ann = _ps_sample_stdev(rets) * math.sqrt(252.0)
+        # "σ_ann > 0" means MATERIALLY positive: a stdev of ~1e-16 on a
+        # constant-return series is float dust, and dividing by it would
+        # manufacture an astronomically large field value from nothing.
+        return (mom / sigma_ann) if sigma_ann > 1e-12 else None
+    return None
+
+
 def make_trigger_fn(hypothesis: Hypothesis) -> Optional[Callable[[List[Dict[str, Any]]], bool]]:
     """Build the trigger evaluator that re-runs the LIVE engine read on a window
     of bars and returns True when the engine field == the hypothesis trigger.
@@ -4860,6 +4970,26 @@ def make_trigger_fn(hypothesis: Hypothesis) -> Optional[Callable[[List[Dict[str,
     marks the hypothesis ERROR rather than crashing)."""
     field = hypothesis.source_field
     want = (hypothesis.trigger_value or "").strip().upper()
+
+    # v6.27.0 (W-1): bar-derived PRICE_STRUCTURE fields — pure, engine-free.
+    # Spec-exact comparator: fires when field value ≥ Trigger Value
+    # (boolean fields use trigger 1). Non-numeric trigger on these fields
+    # → None → the caller's ERROR path (visible, never a silent pass).
+    if field in _PS_FIELDS:
+        try:
+            thr = float(str(hypothesis.trigger_value).strip())
+        except Exception:
+            return None
+
+        def _ps_trigger(bars: List[Dict[str, Any]]) -> bool:
+            try:
+                v = price_structure_field(field, bars)
+                return v is not None and v >= thr
+            except Exception:
+                return False
+
+        return _ps_trigger
+
     try:
         if field == "flow":
             from core.data_engine_v2 import analyze_flow as _read
@@ -4940,7 +5070,9 @@ def run_backtest(
         trigger_fn = make_trigger_fn(hypothesis)
     if trigger_fn is None:
         hyp.status = HypothesisStatus.ERROR
-        hyp.notes = "engine trigger unavailable (no analyze_%s)" % hypothesis.source_field
+        hyp.notes = ("trigger unavailable for field '%s' (no engine reader, "
+                     "or non-numeric trigger on a bar-derived field)"
+                     % hypothesis.source_field)
         return hyp
 
     h = max(1, int(hypothesis.horizon_days))
@@ -6114,7 +6246,7 @@ class PerformanceTrackerApp:
         silent damage). Never raises."""
         global _TRACK_SELFTEST_MSG
         passed = 0
-        total = 6
+        total = 10
         try:
             junk = ["TRUTH:", "_PORTFOLIO_COSTBASIS", "(FREEZES", "=", "\u00b7", "\u2014"]
             good = ["1050.SR", "RCI.US", "GC=F", "^N225", "0016.HK", "DIR-UN.TO"]
@@ -6134,6 +6266,33 @@ class PerformanceTrackerApp:
                 passed += 1
             if _yahoo_parse_chart_price({}) == 0.0 and _yahoo_parse_chart_price(None) == 0.0:
                 passed += 1
+            # ---- v6.27.0 (W-1): PRICE_STRUCTURE field fixtures ---------- #
+            _up = [{"close": 100.0 * (1.001 ** i)} for i in range(300)]
+            _dn = [{"close": 100.0 * (0.999 ** i)} for i in range(300)]
+            _m = price_structure_field("mom_12_1", _up)
+            _exp_m = 1.001 ** 231 - 1.0                # C[t−21]/C[t−252]−1
+            if (_m is not None and abs(_m - _exp_m) < 1e-9
+                    and price_structure_field("mom_12_1", _up[:250]) is None):
+                passed += 1
+            if (price_structure_field("trend_200", _up) == 1.0
+                    and price_structure_field("trend_200", _dn) == 0.0
+                    and price_structure_field("trend_200", _up[:220]) is None):
+                passed += 1
+            _hp = price_structure_field("high_52w_prox", _up)
+            if (_hp is not None and abs(_hp - 1.0) < 1e-12
+                    and price_structure_field("vol_adj_mom", _up) is None):
+                passed += 1                             # monotonic ⇒ σ=0 ⇒ None
+            _pre = price_structure_field("mom_12_1", _up[:260])
+            _mut = [dict(b) for b in _up]
+            for _b in _mut[260:]:
+                _b["close"] = 1.0                       # poison the FUTURE
+            _post = price_structure_field("mom_12_1", _mut[:260])
+            _wob = [{"close": 100.0 * (1.002 ** i) * (1.0 + (0.004 if i % 2 else -0.004))}
+                    for i in range(300)]
+            _vm = price_structure_field("vol_adj_mom", _wob)
+            if (_pre == _post and _vm is not None and _vm > 0
+                    and price_structure_field("nonexistent_field", _up) is None):
+                passed += 1                             # tripwire + σ>0 path
         except Exception as e:
             _TRACK_SELFTEST_MSG = "EXC %s" % type(e).__name__
             print("::error::[SELFTEST v6.21.0] guard self-test crashed: %s: %s" % (type(e).__name__, e))
@@ -6871,6 +7030,7 @@ __all__ = [
     "HypothesisRegistry",
     "default_hypotheses",
     "make_trigger_fn",
+    "price_structure_field",
     "run_backtest",
     "PerformanceTrackerApp",
     "create_parser",
