@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.4"  # v1.0.4 (2026-07-20): +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
+SCRIPT_VERSION = "1.0.5"  # v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -57,9 +57,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.scoring", "__version__", "5.10.0", "scoring"),
     ("core.enriched_quote", "MODULE_VERSION", "4.10.0", "enriched quote"),
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.2.0", "opportunity builder"),
+     "1.3.0", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.2.1", "portfolio actions"),
+     "1.3.0", "portfolio actions"),
     ("core.analysis.top10_selector", "TOP10_SELECTOR_VERSION", "4.23.0",
      "top10 selector"),
     ("core.data_engine_v2", "ENGINE_VERSION", "", "data engine (informational)"),
