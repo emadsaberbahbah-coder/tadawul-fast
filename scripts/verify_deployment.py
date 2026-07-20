@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.5"  # v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
+SCRIPT_VERSION = "1.0.6"  # v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -87,6 +87,7 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ("TFB_OPP_REF_CONSERVATIVE", "0", "ticket ref = min(valuation, engine 12M) (D-12)", False),
     ("TFB_PA_PROTECT_SUKUK", "1", "sukuk never a SELL leg (D-9)", True),
     ("TFB_TRACK_CA_LEDGER", "1", "confirmed CA forces verification", True),
+    ("TFB_SR_TRANSIENT_RETRY", "1", "sheets reads retry transient transport errors", True),
     ("TRACK_HORIZONS", "1M,3M", "7D/14D checkpoints recorded", False),
     ("TFB_BACKTEST_KSA_YF", "0", "deep history unblocks hypothesis backtest", False),
     ("TFB_BACKTEST_NONOVERLAP", "0", "non-overlapping windows (honest t-stat)", False),
