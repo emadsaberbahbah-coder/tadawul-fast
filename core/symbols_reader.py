@@ -116,6 +116,8 @@ import sys
 import threading
 import time
 import zlib
+import ssl
+import http.client as _http_client
 from collections import defaultdict, OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -138,7 +140,22 @@ from typing import (
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "8.5.0"
+# -----------------------------------------------------------------------------
+# v8.6.0 (2026-07-20) — TRANSIENT-RETRY AT THE TWO KEYSTONES (R1 defect fix)
+# WHY (live log 2026-07-20 07:46 UTC): a transient IncompleteRead(0 bytes) on
+# Mutual_Funds!A1:ZZ6 plus an [SSL: WRONG_VERSION_NUMBER] burst were treated
+# like a wrong sheet name: the reader walked the alias ladder verbatim
+# ("Mutual Funds", "Funds") because the SAME burst also broke the tab-list
+# fetch that v8.4.3 uses to filter dead aliases — 400 spam, failed page read.
+# FIX: _sr_retry_sync gives read_range and list_sheets up to 2 bounded
+# same-target retries on TRANSIENT transport errors ONLY (SSL/Connection/
+# Timeout/IncompleteRead + message markers). Definitive errors — HttpError,
+# "Unable to parse range" — are NEVER retried, so v8.4.3 ladder semantics
+# are byte-identical. With the tab list surviving blips, dead aliases stay
+# filtered and the canonical read heals in-place.
+# GATE: TFB_SR_TRANSIENT_RETRY, default ON (protective); =0 -> v8.5.0 exact.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "8.6.0"
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +273,49 @@ _TRACING_ENABLED = (
     or _env_truthy("CORE_TRACING_ENABLED")
     or _env_truthy("TRACING_ENABLED")
 )
+
+
+# --- v8.6.0 TRANSIENT-RETRY ---------------------------------------------------
+def _sr_transient_retry_enabled() -> bool:
+    """v8.6.0: master switch (default ON). 0/false/off -> v8.5.0 verbatim."""
+    return (os.getenv("TFB_SR_TRANSIENT_RETRY") or "1").strip().lower() not in {
+        "0", "false", "off", "no"}
+
+
+_SR_TRANSIENT_MARKERS = ("incompleteread", "wrong_version_number",
+                         "connection reset", "connection aborted", "timed out",
+                         "temporarily unavailable", "broken pipe",
+                         "eof occurred")
+
+
+def _sr_is_transient(e: BaseException) -> bool:
+    """v8.6.0: NETWORK-transport failures only. HttpError (incl. the
+    definitive 'Unable to parse range') is NEVER transient, so the v8.4.3
+    candidate-ladder semantics are preserved exactly."""
+    if isinstance(e, (ssl.SSLError, ConnectionError, TimeoutError,
+                      _http_client.IncompleteRead)):
+        return True
+    if "httperror" in type(e).__name__.lower():
+        return False
+    msg = (str(e) or "").lower()
+    return any(m in msg for m in _SR_TRANSIENT_MARKERS)
+
+
+def _sr_retry_sync(label: str, fn):
+    """v8.6.0: bounded same-target retry — up to 2 extra attempts (0.4s/0.8s
+    backoff) on TRANSIENT transport errors only; anything else re-raises to
+    the caller's existing handler unchanged. Worst-case added latency ~1.2s,
+    and only on a failing call."""
+    attempts = 3 if _sr_transient_retry_enabled() else 1
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if i + 1 >= attempts or not _sr_is_transient(e):
+                raise
+            logger.warning("[SR-RETRY v8.6.0] transient %s on %s — retry %d/2",
+                           type(e).__name__, label, i + 1)
+            time.sleep(0.4 * (i + 1))
 
 
 class TraceContext:
@@ -1002,7 +1062,8 @@ class GoogleSheetsReader:
         try:
             with TraceContext("sheets_read_range", {"range": range_a1}):
                 t0 = time.perf_counter()
-                out = self.backoff.execute_sync(_execute)
+                out = _sr_retry_sync(range_a1,
+                                     lambda: self.backoff.execute_sync(_execute))
                 if config.LOG_PERFORMANCE:
                     dt_ms = (time.perf_counter() - t0) * 1000
                     logger.debug("Sheet read %s: %.1fms", range_a1, dt_ms)
@@ -1031,7 +1092,8 @@ class GoogleSheetsReader:
             return out
 
         try:
-            return self.backoff.execute_sync(_execute)
+            return _sr_retry_sync("list_sheets",
+                                  lambda: self.backoff.execute_sync(_execute))
         except Exception as e:
             logger.error("Failed to list sheets: %s", e)
             return []
