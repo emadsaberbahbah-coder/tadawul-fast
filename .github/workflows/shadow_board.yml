@@ -26,6 +26,7 @@ jobs:
       TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_COMPLIANCE_GATE_ENABLED: "1"
       TFB_SHADOW_EQUITY_SAR: ${{ vars.TFB_SHADOW_EQUITY_SAR }}
+      DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
     steps:
       - uses: actions/checkout@v5
 
