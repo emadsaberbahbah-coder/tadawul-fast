@@ -644,7 +644,36 @@ from datetime import datetime, timedelta, timezone
 # preserving differentiation; honest refs stay untouched; mos_pct remains a
 # raw-intrinsic valuation concept. KILL: unset/0 -> v1.2.0 exactly.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.3.0"
+# -----------------------------------------------------------------------------
+# v1.4.0 (2026-07-21) — W-2 QUOTE-FRESHNESS GATE (Execution Plan v2.1; Register §4.3)
+# WHY (evening audit 2026-07-20, export __39_): the cockpit built its #1 ticket
+# on EXE.US at 88.13 while Market_Leaders held the 86.95 Monday close (~1.3%
+# stale at build); NFG.US and 0083.HK rode 2-day-old rows; ENKAI.IS repeated
+# its ~14% lesson. The existing v1.0.6 Data-Trust ceiling (168h) passed every
+# one of them — a weekly-scale guard cannot catch session-scale staleness.
+# FIX — venue-session-aware freshness on the price feeding a ticket:
+#   * quote age <= TFB_TICKET_MAX_QUOTE_AGE_MIN (default 15) => LIVE, pass;
+#   * else, venue calendar (exchange_calendars, lazy, fully defended):
+#       session OPEN  => FAIL "STALE_PRICE intraday" (an old quote while the
+#                        market trades is exactly the EXE failure);
+#       session CLOSED => pass iff quote_ts >= last scheduled close − 2min
+#                        (the last regular close is fresh by definition —
+#                        Register §4.3 — so Friday closes stay valid all
+#                        weekend); older => FAIL "STALE_PRICE pre-close";
+#   * calendar unavailable / unknown suffix => permissive fallback: pass iff
+#     age <= TFB_TICKET_FALLBACK_MAX_AGE_H (default 78h — covers Fri→Mon on
+#     any venue), never a false weekend block;
+#   * unparseable/absent timestamp => SKIPPED (pass), preserving the v1.0.6
+#     philosophy: freshness fails only on PROVEN staleness.
+# Failure class MAJOR => DO_NOT_INVEST: the candidate DEFERS — visible in the
+# audit grid / Why-Not with the STALE_PRICE tag, never sized, never selected.
+# GATE: TFB_TICKET_FRESHNESS_GATE, DEFAULT ON (protective guards ship armed —
+# the v5.116.0 default-OFF lesson). Kill: =0 => gate list byte-identical to
+# v1.3.0. Venue map: .SR→XSAU ·.T→XTKS ·.HK→XHKG ·.IS→XIST ·.L→XLON ·.AS→XAMS
+# ·.BR→XBRU ·.PA→XPAR ·.DE→XETR ·.F→XFRA ·.MI→XMIL ·.MC→XMAD ·.ST→XSTO
+# ·.TO→XTSE ·.SW→XSWX · US/none→XNYS.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.4.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1765,6 +1794,140 @@ def _parse_age_hours(last_updated_text):
     return 0.0 if age < 0 else age
 
 
+# --------------------------------------------------------------------------- #
+# v1.4.0 (W-2): venue-session-aware quote freshness                           #
+# --------------------------------------------------------------------------- #
+def _parse_ts_utc(last_updated_text):
+    """The timestamp behind _parse_age_hours, as an aware UTC datetime (or
+    None). Same parsing ladder, same naive⇒UTC assumption; extracted so the
+    freshness gate can compare against a venue close, not just an age."""
+    if not last_updated_text:
+        return None
+    s = str(last_updated_text).strip()
+    if not s:
+        return None
+    iso = s.replace("Z", "+00:00").replace("z", "+00:00")
+    dt = None
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except (ValueError, TypeError):
+                continue
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _env_freshness_gate():
+    """W-2 kill-switch — DEFAULT ON (protective guards ship armed)."""
+    return (os.getenv("TFB_TICKET_FRESHNESS_GATE") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _env_quote_max_age_min():
+    try:
+        v = float(os.getenv("TFB_TICKET_MAX_QUOTE_AGE_MIN") or 15.0)
+        return v if v > 0 else 15.0
+    except (TypeError, ValueError):
+        return 15.0
+
+
+def _env_freshness_fallback_h():
+    try:
+        v = float(os.getenv("TFB_TICKET_FALLBACK_MAX_AGE_H") or 78.0)
+        return v if v > 0 else 78.0
+    except (TypeError, ValueError):
+        return 78.0
+
+
+_VENUE_CAL_MAP = {
+    "SR": "XSAU", "T": "XTKS", "HK": "XHKG", "IS": "XIST", "L": "XLON",
+    "AS": "XAMS", "BR": "XBRU", "PA": "XPAR", "DE": "XETR", "F": "XFRA",
+    "MI": "XMIL", "MC": "XMAD", "ST": "XSTO", "TO": "XTSE", "SW": "XSWX",
+    "US": "XNYS",
+}
+_VENUE_CAL_CACHE = {}
+
+
+def _venue_state(symbol, now_utc):
+    """(is_open, prev_close_utc_datetime) for the symbol's venue at now_utc,
+    or None when the calendar layer cannot answer (unknown suffix, import
+    failure, any exception) — the caller then uses the permissive fallback.
+    Lazy exchange_calendars + pandas; NEVER raises."""
+    try:
+        s = (str(symbol or "").strip().upper())
+        suffix = s.rsplit(".", 1)[1] if "." in s else "US"
+        code = _VENUE_CAL_MAP.get(suffix)
+        if not code:
+            return None
+        cal = _VENUE_CAL_CACHE.get(code)
+        if cal is None:
+            import exchange_calendars as _xc  # lazy; present on Render
+            cal = _xc.get_calendar(code)
+            _VENUE_CAL_CACHE[code] = cal
+        import pandas as _pd  # lazy
+        ts = _pd.Timestamp(now_utc)
+        prev_close = cal.previous_close(ts)
+        prev_open = cal.previous_open(ts)
+        is_open = bool(prev_open > prev_close)
+        pc = prev_close.to_pydatetime()
+        if pc.tzinfo is None:
+            pc = pc.replace(tzinfo=timezone.utc)
+        return is_open, pc
+    except Exception:
+        return None
+
+
+def _quote_freshness_assessment(cand):
+    """v1.4.0 (W-2). Returns (passed, current_str, detail). Pure-defensive:
+    the only FAIL paths are PROVEN staleness; absent/unparseable timestamps
+    and calendar outages never block a candidate on their own."""
+    eng = cand.get("engine_gate") or {}
+    qdt = _parse_ts_utc(eng.get("last_updated"))
+    detail = {"quote_ts": (None if qdt is None else qdt.isoformat()),
+              "mode": None, "age_min": None}
+    if qdt is None:
+        detail["mode"] = "skipped_no_timestamp"
+        return True, "no timestamp (skipped)", detail
+    now = datetime.now(timezone.utc)
+    age_min = max(0.0, (now - qdt).total_seconds() / 60.0)
+    detail["age_min"] = round(age_min, 1)
+    max_min = _env_quote_max_age_min()
+    if age_min <= max_min:
+        detail["mode"] = "live"
+        return True, "live %.0fm old" % age_min, detail
+    vs = _venue_state(cand.get("symbol") or "", now)
+    if vs is not None:
+        is_open, prev_close = vs
+        detail["prev_close"] = prev_close.isoformat()
+        if is_open:
+            detail["mode"] = "session_open"
+            return False, ("STALE_PRICE intraday: quote %.0fm old while the "
+                           "venue trades (max %.0fm)" % (age_min, max_min)), \
+                detail
+        detail["mode"] = "session_closed"
+        if qdt >= prev_close - timedelta(minutes=2):
+            return True, ("last close, %.1fh old" % (age_min / 60.0)), detail
+        return False, ("STALE_PRICE pre-close: quote %.1fh old predates the "
+                       "venue close %s"
+                       % (age_min / 60.0,
+                          prev_close.strftime("%Y-%m-%d %H:%M UTC"))), detail
+    detail["mode"] = "fallback_no_calendar"
+    fb_h = _env_freshness_fallback_h()
+    if age_min <= fb_h * 60.0:
+        return True, ("fallback: %.1fh old, no venue calendar"
+                      % (age_min / 60.0)), detail
+    return False, ("STALE_PRICE %.1fh old (no venue calendar; cap %.0fh)"
+                   % (age_min / 60.0, fb_h)), detail
+
+
 def _data_trust_assessment(cand, criteria):
     """v1.0.6 Phase-0 trust signal for a Top_10 candidate. Returns
     (passed, current_str, detail). passed=False => the caller emits a MAJOR
@@ -1902,6 +2065,22 @@ def evaluate_gates(cand, criteria, held_symbols=None):
              "/6 core signals"))
         tg["trust_detail"] = t_detail
         g.append(tg)
+
+    # v1.4.0 [W-2 QUOTE-FRESHNESS-GATE]: session-scale freshness on the price
+    # feeding the ticket (the 168h trust ceiling passed EXE@88.13-vs-86.95,
+    # NFG/0083.HK 2-day rows, ENKAI — evening audit 2026-07-20). MAJOR fail =>
+    # DO_NOT_INVEST: candidate DEFERS with the STALE_PRICE tag in the audit
+    # grid, never sized. DEFAULT ON; TFB_TICKET_FRESHNESS_GATE=0 restores the
+    # v1.3.0 gate list byte-for-byte.
+    if _env_freshness_gate():
+        f_ok, f_cur, f_detail = _quote_freshness_assessment(cand)
+        fg = _gate(
+            "Quote Freshness", f_ok, FAIL_MAJOR, f_cur,
+            ("live <= %.0fm in-session; else >= venue last close; "
+             "fallback <= %.0fh"
+             % (_env_quote_max_age_min(), _env_freshness_fallback_h())))
+        fg["freshness_detail"] = f_detail
+        g.append(fg)
 
     # v1.0.7 [INVESTABILITY-GATE]: enforce the engine's authoritative verdict.
     # normalize_candidate captures investability_status into
