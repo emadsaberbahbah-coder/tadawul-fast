@@ -1093,7 +1093,20 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.25.1"
+# -----------------------------------------------------------------------------
+# v6.25.2 (2026-07-20) — ST-1 SELFTEST MODE-AWARENESS (R1 defect fix)
+# WHY: selftest case 6 asserted the observe-default dedup contract (q2==[]).
+# When D-4 armed TFB_SYNC_NAME_DEDUP_MODE=quarantine in daily_sync.yml
+# (2026-07-19), _name_dedup_apply correctly quarantined the canned dupes,
+# case 6 failed, every run logged selftest=FAIL 5/6, and — because FW-4 is
+# gated on _IDFW_SELFTEST_OK — the quarantine feature was DISABLED by its
+# own arming on every sync since. Reproduced byte-identically offline.
+# FIX: case 6 tests the contract under the CONFIGURED mode (observe /
+# quarantine / off) and is stricter in quarantine mode (exact set, symbol
+# preserved, name blanked, Warnings tag, non-dupe untouched). No behavior
+# change outside the selftest; FW-4 gating logic untouched.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.25.2"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3056,7 +3069,7 @@ def _name_dedup_apply(headers: list, rows_matrix: list) -> tuple:
 
 
 def _idfw_selftest_() -> bool:
-    """v6.24.1 ST-1: prove the guards on canned fixtures BEFORE touching a
+    """v6.25.2 ST-1: prove the guards on canned fixtures BEFORE touching a
     page. Sets _IDFW_SELFTEST_OK/_IDFW_SELFTEST_MSG. Never raises."""
     global _IDFW_SELFTEST_OK, _IDFW_SELFTEST_MSG
     passed = 0
@@ -3086,22 +3099,47 @@ def _idfw_selftest_() -> bool:
         groups, _n, _s, _w = _name_dedup_census(H, rows)
         if list(groups.keys()) == ["Same Name Co"] and len(groups["Same Name Co"]) == 3:
             passed += 1
+        # v6.25.2 ST-1 fix: case 6 is MODE-AWARE. The old fixture asserted the
+        # observe default (q2 == []); once D-4 armed
+        # TFB_SYNC_NAME_DEDUP_MODE=quarantine in the workflow env (2026-07-19),
+        # _name_dedup_apply correctly stubbed the canned dupes, the case
+        # failed, and the resulting FAIL 5/6 disabled FW-4 for every run —
+        # the arming itself switched the feature off. Case 6 now verifies the
+        # guard's contract under the CONFIGURED mode, and in quarantine mode
+        # it is STRICTER than before: exact quarantine set, symbol preserved,
+        # name blanked, Warnings tag stamped, non-duplicate row untouched.
         rows2 = [list(r) for r in rows]
-        _r2, g2, q2 = _name_dedup_apply(H, rows2)  # observe default: no stubs
-        if q2 == [] and g2:
-            passed += 1
+        _prev_ok = _IDFW_SELFTEST_OK
+        _IDFW_SELFTEST_OK = True  # exercise the stub path deterministically
+        try:
+            _r2, g2, q2 = _name_dedup_apply(H, rows2)
+        finally:
+            _IDFW_SELFTEST_OK = _prev_ok
+        _mode6 = _name_dedup_mode()
+        if _mode6 == "quarantine":
+            if (q2 == ["A.US", "B.L", "C.HK"] and bool(g2)
+                    and _r2[1][0] == "B.L" and _r2[1][1] == ""
+                    and _r2[1][5] == "identity_quarantined:name_dedup"
+                    and _r2[3][1] == "Other Co"):
+                passed += 1
+        elif _mode6 == "off":
+            if q2 == [] and g2 == {}:
+                passed += 1
+        else:  # observe (default)
+            if q2 == [] and g2:
+                passed += 1
     except Exception as e:
         _IDFW_SELFTEST_OK = False
         _IDFW_SELFTEST_MSG = "EXC %s: %s" % (type(e).__name__, e)
-        print("::error::[SELFTEST v6.24.1] guard self-test crashed: %s — "
+        print("::error::[SELFTEST v6.25.2] guard self-test crashed: %s — "
               "FW-4 quarantine disabled for this run." % _IDFW_SELFTEST_MSG)
         return False
     _IDFW_SELFTEST_OK = (passed == total)
     _IDFW_SELFTEST_MSG = "PASS %d/%d" % (passed, total) if _IDFW_SELFTEST_OK else "FAIL %d/%d" % (passed, total)
     if _IDFW_SELFTEST_OK:
-        logger.info("[SELFTEST v6.24.1] %s — guards verified on fixtures.", _IDFW_SELFTEST_MSG)
+        logger.info("[SELFTEST v6.25.2] %s — guards verified on fixtures.", _IDFW_SELFTEST_MSG)
     else:
-        print("::error::[SELFTEST v6.24.1] %s — a guard fixture failed; "
+        print("::error::[SELFTEST v6.25.2] %s — a guard fixture failed; "
               "FW-4 quarantine disabled for this run (FW-1/FW-2 remain on)." % _IDFW_SELFTEST_MSG)
     return _IDFW_SELFTEST_OK
 
