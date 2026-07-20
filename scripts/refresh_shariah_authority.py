@@ -1,6 +1,20 @@
 """
 scripts/refresh_shariah_authority.py — TFB Gen-2 Shariah Authority Refresher
 =============================================================================
+VERSION 1.1.0  (2026-07-20)  — UPLOAD-MODE PROVENANCE HASH
+
+WHY v1.1.0 (evening audit 2026-07-20):
+  * The first live 🕌 run (09:48) wrote 408 rows with Doc Hash EMPTY on every
+    row and `hash=""` in the run-log line — upload mode hardcoded
+    `doc_hash = ""`, so the A0 provenance requirement (§4.1: every authority
+    edition archived with a hash) was unmet for the operator-staged Q1-2026
+    Al-Rajhi list. Fix: `upload_doc_hash()` — SHA-256 over the CANONICAL
+    serialization of the upload tab (sorted symbol,status pairs + as_of), so
+    the same list always hashes the same regardless of paste order, and any
+    edit to a single row changes the hash. The second-run 🕌 line can now
+    archive the edition with real provenance. Fetch/file modes unchanged
+    (they already hashed the raw document bytes).
+
 VERSION 1.0.0  (2026-07-18)  — NEW SCRIPT (Wave A0, deliverable #2)
 
 WHY (Master Plan v2.1 §4.1, Decision_Log D-2/D-4 context):
@@ -45,7 +59,7 @@ import tempfile
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 RULE_VERSION = "RAJHI-2026Q3-pending-official-capture"   # updated by E0.4
 TAB_AUTH = "_Shariah_Authority"
 TAB_UPLOAD = "_Shariah_Upload"
@@ -65,6 +79,16 @@ def _now_utc() -> str:
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+def upload_doc_hash(pairs, as_of) -> str:
+    """v1.1.0: canonical hash of an operator-uploaded edition.
+
+    Sorted `symbol,status` lines + as_of => paste order can never change the
+    hash; any single-row change always does. This is the provenance stamp
+    §4.1 requires for editions that arrive via the upload tab rather than as
+    a fetched document."""
+    canon = "\n".join(f"{s},{st}" for s, st in sorted(pairs)) + f"|as_of={as_of}"
+    return sha256_hex(canon.encode("utf-8"))
 
 def normalize_symbol(raw: str) -> Optional[str]:
     s = str(raw).strip().upper()
@@ -305,7 +329,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         pairs, up_as_of = read_upload_tab(sh)
         if up_as_of:
             as_of = up_as_of
-        source, doc_hash, src_url = "OPERATOR_UPLOAD_TAB", "", TAB_UPLOAD
+        source, src_url = "OPERATOR_UPLOAD_TAB", TAB_UPLOAD
+        doc_hash = upload_doc_hash(pairs, as_of) if pairs else ""
         if not pairs:
             msg = (f"[shariah_refresh v{SCRIPT_VERSION}] NO SOURCE: paste the official "
                    f"list into '{TAB_UPLOAD}' (Symbol, Status) then dispatch again — "
@@ -365,6 +390,19 @@ def _selftest() -> int:
     checks.append(("status: english tokens", map_status("Non-Compliant") == "FAIL" and map_status("PASS") == "PASS"))
     h1, h2 = sha256_hex(b"abc"), sha256_hex(b"abc")
     checks.append(("hash: stable sha256", h1 == h2 and len(h1) == 64))
+    _p = [("7010.SR", "PASS"), ("1120.SR", "FAIL")]
+    checks.append(("upload hash: order-insensitive canonical form",
+                   upload_doc_hash(_p, "2026-03-31")
+                   == upload_doc_hash(list(reversed(_p)), "2026-03-31")))
+    checks.append(("upload hash: any row change changes the hash",
+                   upload_doc_hash(_p, "2026-03-31")
+                   != upload_doc_hash([("7010.SR", "PASS"),
+                                       ("1120.SR", "PASS")], "2026-03-31")))
+    checks.append(("upload hash: as_of is part of the edition identity",
+                   upload_doc_hash(_p, "2026-03-31")
+                   != upload_doc_hash(_p, "2026-06-30")))
+    checks.append(("upload hash: 64-hex sha256",
+                   len(upload_doc_hash(_p, "2026-03-31")) == 64))
     mon = {"7010.SR": "FAIL", "2222.SR": "PASS"}
     conflicts = sum(1 for s, st in pairs if mon.get(s) and mon[s] != st)
     checks.append(("monitor: conflict counted once", conflicts == 1))
