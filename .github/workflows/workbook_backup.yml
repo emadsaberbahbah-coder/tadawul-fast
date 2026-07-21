@@ -1,0 +1,64 @@
+name: "💾 TFB Workbook Backup"
+
+# v1.0.0 (W-4, Execution Plan v2.1; Gate & Evidence Register §8).
+# Nightly full-workbook xlsx into the operator's Drive backup folder:
+# RPO ≤24h · retention 30 daily + 12 monthly · restore-test on dispatch.
+# Scope: workbook DATA only — credentials/config are excluded by design.
+# Alerting: any failure writes an ERROR row to _Run_Log (seven-gate audit
+# reads it daily) AND turns this workflow red (GitHub failure e-mail).
+
+on:
+  schedule:
+    - cron: "30 23 * * *"     # ~02:30 Riyadh — quiet window after all syncs
+  workflow_dispatch:
+    inputs:
+      restore_test:
+        description: "true = download newest daily, open it, assert core tabs (Register §8 acceptance)"
+        default: "false"
+      dry_run:
+        description: "true = export + verify only, upload nothing"
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+      TFB_BACKUP_FOLDER_ID: ${{ vars.TFB_BACKUP_FOLDER_ID }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install --quiet gspread google-auth requests openpyxl
+
+      - name: Materialize Google credentials
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+          CREDS_PATH="$RUNNER_TEMP/gcreds.json"
+          if [[ -n "${SECRET_CREDS:-}" ]]; then
+            printf '%s' "$SECRET_CREDS" > "$CREDS_PATH"
+          elif [[ -n "${SECRET_CREDS_B64:-}" ]]; then
+            printf '%s' "$SECRET_CREDS_B64" | base64 -d > "$CREDS_PATH"
+          else
+            echo "::error::No Google credentials secret present."; exit 1
+          fi
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
+
+      - name: Run backup
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [[ "${{ github.event.inputs.restore_test }}" == "true" ]]; then EXTRA="--restore-test"; fi
+          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then EXTRA="--dry-run"; fi
+          python scripts/backup_workbook.py $EXTRA
