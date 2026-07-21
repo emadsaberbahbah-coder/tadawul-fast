@@ -475,6 +475,7 @@ TFB_OPP_STOP_VOL_MULT rather than editing formulas.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -673,7 +674,24 @@ from datetime import datetime, timedelta, timezone
 # ·.BR→XBRU ·.PA→XPAR ·.DE→XETR ·.F→XFRA ·.MI→XMIL ·.MC→XMAD ·.ST→XSTO
 # ·.TO→XTSE ·.SW→XSWX · US/none→XNYS.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.4.0"
+# -----------------------------------------------------------------------------
+# v1.4.1 (2026-07-21 morning audit, export __47_) — VENUE-CALENDAR RESILIENCE
+# EVIDENCE (defect-class, window-legal): at the 07:22 Riyadh cockpit run the
+# board sized PAM.US (16.4h old, XNYS closed, quote PREDATES Monday's close),
+# MRP.US (16.3h, same class) and 4503.T (6.2h old DURING the Tokyo session) —
+# all three are exactly what the venue path must defer, and all three pass the
+# 78h fallback. Conclusion: _venue_state is degrading to fallback in
+# production while the same code+exchange_calendars 4.13.2 works in the test
+# environment. Prime suspect: tz-AWARE Timestamp rejection inside
+# previous_close/previous_open under the Render pandas build.
+# FIX: (a) tz-robust lookup — try the aware Timestamp, on ANY exception retry
+# tz-naive-UTC; (b) the silent degradation becomes VISIBLE: one WARNING per
+# venue-suffix per process, `[FRESHNESS v1.4.1] venue calendar unavailable
+# for '.US' -> 78h fallback (…)`, carrying the captured error. The fallback
+# REMAINS the safety net — this build makes the precise path work and makes
+# any remaining degradation announce itself, never widen silently.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.4.1"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1854,6 +1872,9 @@ _VENUE_CAL_MAP = {
     "US": "XNYS",
 }
 _VENUE_CAL_CACHE = {}
+_LOG = logging.getLogger("core.analysis.opportunity_builder")
+_VENUE_LAST_ERROR = {"msg": ""}
+_FRESHNESS_FALLBACK_LOGGED = set()
 
 
 def _venue_state(symbol, now_utc):
@@ -1874,14 +1895,27 @@ def _venue_state(symbol, now_utc):
             _VENUE_CAL_CACHE[code] = cal
         import pandas as _pd  # lazy
         ts = _pd.Timestamp(now_utc)
-        prev_close = cal.previous_close(ts)
-        prev_open = cal.previous_open(ts)
+        try:
+            prev_close = cal.previous_close(ts)
+            prev_open = cal.previous_open(ts)
+        except Exception:
+            # v1.4.1: some pandas/exchange_calendars builds reject tz-AWARE
+            # minutes here — retry tz-naive UTC (same instant).
+            ts_n = ts.tz_convert("UTC").tz_localize(None) \
+                if ts.tzinfo is not None else ts
+            prev_close = cal.previous_close(ts_n)
+            prev_open = cal.previous_open(ts_n)
         is_open = bool(prev_open > prev_close)
         pc = prev_close.to_pydatetime()
         if pc.tzinfo is None:
             pc = pc.replace(tzinfo=timezone.utc)
         return is_open, pc
-    except Exception:
+    except Exception as e_vs:
+        try:
+            _VENUE_LAST_ERROR["msg"] = ("%s: %s" % (type(e_vs).__name__,
+                                                    e_vs))[:120]
+        except Exception:
+            pass
         return None
 
 
@@ -1920,6 +1954,18 @@ def _quote_freshness_assessment(cand):
                        % (age_min / 60.0,
                           prev_close.strftime("%Y-%m-%d %H:%M UTC"))), detail
     detail["mode"] = "fallback_no_calendar"
+    try:
+        _sfx = (str(cand.get("symbol") or "").strip().upper()
+                .rsplit(".", 1)[-1]) or "?"
+        if _sfx not in _FRESHNESS_FALLBACK_LOGGED:
+            _FRESHNESS_FALLBACK_LOGGED.add(_sfx)
+            _LOG.warning(
+                "[FRESHNESS v%s] venue calendar unavailable for '.%s' -> "
+                "78h fallback in effect (last err: %s)",
+                OPPORTUNITY_BUILDER_VERSION, _sfx,
+                _VENUE_LAST_ERROR.get("msg") or "none captured")
+    except Exception:
+        pass
     fb_h = _env_freshness_fallback_h()
     if age_min <= fb_h * 60.0:
         return True, ("fallback: %.1fh old, no venue calendar"
