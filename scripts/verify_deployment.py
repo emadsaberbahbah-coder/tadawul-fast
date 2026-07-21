@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.6"  # v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
+SCRIPT_VERSION = "1.0.7"  # v1.0.7 (2026-07-21): WINDOW MANIFEST SYNC — the verifier must mirror every live-verified bump or its drift reports are fiction: opportunity_builder 1.4.0 (W-2), run_shadow_scorer 1.2.0 (P0-C), track_performance 6.27.0 (W-1); +core.providers.yahoo_chart_provider 8.10.0 (W-5); SCRIPTS +refresh_shariah_authority 1.1.0, +backup_workbook 1.0.0 (W-4), +pit_snapshot 1.0.0 (W-6); check_scripts gains a __version__ fallback (new scripts use the calendar_sync convention); FLAGS +W-2 freshness family, +scorer honesty pair (workflow-scoped), +TFB_YC_SYMBOL_SKIP, +TFB_SHARIAH_SHEET_ID; v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -57,11 +57,13 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.scoring", "__version__", "5.10.0", "scoring"),
     ("core.enriched_quote", "MODULE_VERSION", "4.10.0", "enriched quote"),
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.3.0", "opportunity builder"),
+     "1.4.0", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
      "1.3.0", "portfolio actions"),
     ("core.analysis.top10_selector", "TOP10_SELECTOR_VERSION", "4.23.0",
      "top10 selector"),
+    ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.10.0",
+     "yahoo chart provider"),
     ("core.data_engine_v2", "ENGINE_VERSION", "", "data engine (informational)"),
 ]
 
@@ -69,8 +71,11 @@ MODULES: List[Tuple[str, str, str, str]] = [
 SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_shadow_board", "1.1.3", "shadow board"),
     ("run_weekly_brief", "1.0.2", "weekly brief"),
-    ("run_shadow_scorer", "1.1.1", "shadow scorer"),
-    ("track_performance", "6.26.0", "track performance"),
+    ("run_shadow_scorer", "1.2.0", "shadow scorer"),
+    ("track_performance", "6.27.0", "track performance"),
+    ("refresh_shariah_authority", "1.1.0", "shariah refresh"),
+    ("backup_workbook", "1.0.0", "workbook backup"),
+    ("pit_snapshot", "1.0.0", "pit snapshot"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)
@@ -94,6 +99,13 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ("TFB_BACKTEST_DSR_GATE", "0", "deflated-Sharpe penalty on acceptance", False),
     ("TFB_OPP_STOP_VOL_MULT", "2.5", "stop = mult x monthlyized vol", False),
     ("TFB_SYNC_NAME_DEDUP_MODE", "", "duplicate-name quarantine (D-4)", False),
+    ("TFB_TICKET_FRESHNESS_GATE", "1", "stale-priced candidates defer (W-2)", True),
+    ("TFB_TICKET_MAX_QUOTE_AGE_MIN", "15", "in-session live-quote max age (W-2)", False),
+    ("TFB_TICKET_FALLBACK_MAX_AGE_H", "78", "no-calendar freshness cap (W-2)", False),
+    ("TFB_YC_SYMBOL_SKIP", "", "yahoo-chart hard-skips dead symbols (W-5)", False),
+    ("TFB_SHARIAH_SHEET_ID", "", "authority reader workbook override (P0-B)", False),
+    ("TFB_SHADOW_PRICE_HONESTY", "1", "scorer excludes stale bars, honest exclusions (P0-C)", True),
+    ("TFB_SHADOW_MIN_FRESH_PCT", "60", "challenger fresh-coverage floor (P0-C)", False),
 ]
 
 _ARMED = {"1", "true", "yes", "on"}
@@ -103,14 +115,18 @@ _ARMED = {"1", "true", "yes", "on"}
 # in {1,true,yes,on} is a false alarm on a correctly configured system, which
 # is worse than no check at all. Parameters report SET vs DEFAULT instead.
 _VALUE_FLAGS = {"TFB_OPP_STOP_VOL_MULT", "TFB_BACKTEST_MIN_DSR",
-                "TRACK_HORIZONS", "TFB_SYNC_NAME_DEDUP_MODE"}
+                "TRACK_HORIZONS", "TFB_SYNC_NAME_DEDUP_MODE",
+                "TFB_TICKET_MAX_QUOTE_AGE_MIN", "TFB_TICKET_FALLBACK_MAX_AGE_H",
+                "TFB_YC_SYMBOL_SKIP", "TFB_SHARIAH_SHEET_ID",
+                "TFB_SHADOW_MIN_FRESH_PCT"}
 
 # v1.0.3: SCOPE. These live in GitHub workflow env blocks, never in Render, so
 # this script — which reads the LOCAL process environment — structurally
 # cannot see them. Reporting them as "using default" implied they were
 # unconfigured when they were correctly committed to daily_sync.yml. A checker
 # that cannot observe something must say so, not report absence as a finding.
-_WORKFLOW_SCOPED = {"TRACK_HORIZONS", "TFB_SYNC_NAME_DEDUP_MODE"}
+_WORKFLOW_SCOPED = {"TRACK_HORIZONS", "TFB_SYNC_NAME_DEDUP_MODE",
+                    "TFB_SHADOW_PRICE_HONESTY", "TFB_SHADOW_MIN_FRESH_PCT"}
 
 
 def check_modules() -> List[Dict[str, Any]]:
@@ -169,6 +185,8 @@ def check_scripts() -> List[Dict[str, Any]]:
         try:
             mod = importlib.import_module(name)
             live = str(getattr(mod, "SCRIPT_VERSION", "") or "")
+            if not live:  # v1.0.7: calendar_sync-convention scripts use __version__
+                live = str(getattr(mod, "__version__", "") or "")
             rec["live"] = live or None
             rec["status"] = ("OK" if live == expected else
                              "NO_VERSION" if not live else
