@@ -8,6 +8,36 @@ Version: 1.0.19  (TFB Final Execution Plan v5.0 — Phase P2;
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
 
+v1.6.0 [PREGATE-ORDER — quality-ordered candidate clamp; kills the
+adverse-selection cut. WHY (2026-07-22 evening audit, workbook evidence):
+the Top_10 run scanned exactly TFB_OPP_MAX_CANDIDATES=300 of a 10,311-row
+pool because the v1.0.10 clamp is POSITIONAL (`rows[:max_candidates]`) and
+runs BEFORE any gate — whichever 300 rows arrive first get the only scan
+slots. Tonight's 300 were dominated by junk micro-caps whose implausible
+fair-value gaps then CORRECTLY failed Valuation Sanity (291/300 = 97%),
+leaving 1 survivor (already held) and 0 executable tickets — a permanently
+empty buy surface while 10,011 rows were never examined. The gates were
+right; the ordering starved them. FIX: when the clamp WILL cut (flag ON,
+len(rows) > max_candidates > 0), _pregate_quality_order() first re-orders
+the pool CHEAP-ELIGIBLE-FIRST using row-local mirrors of the same gates —
+price+valuation-ref present, trust-style freshness (last_updated age <=
+max_data_age_hours; absent/unparseable is NOT stale, same semantics as
+_data_trust_assessment), Valuation Sanity bound (roi_pct <= max_valuation_
+roi_pct; None passes), Forecast floor (engine 12M >= min_engine_roi_pct;
+None passes), and the min_reliability floor — then inside each bucket by
+reliability desc, engine forecast desc, symbol, arrival index (total order,
+deterministic). Every mirror reads the IDENTICAL raw fields via the same
+_field tokens normalize_candidate uses, including the v1.3.0
+REF-CONSERVATIVE min() so the sanity mirror sees the same roi_pct the real
+gate will. The clamp then cuts the re-ordered list; everything downstream
+(normalize, gates, verdicts, scoring, selection, funding) is UNTOUCHED.
+Full-pool funnel telemetry lands in kpis["pregate"] (additive key, absent
+when the reorder did not run) and one [PREGATE] log line. Kill-switch
+TFB_OPP_PREGATE_ORDER=0 restores the v1.5.0 positional cut byte-for-byte;
+no clamp (max_candidates=0) or no cut (len<=cap) also bypasses the reorder
+entirely => byte-identical output. Zero functions removed; additions:
+_env_pregate_order, _pregate_quality_order.]
+
 v1.0.19 [PANEL-DEFAULT RECALIBRATION — Max Selected 3->10, Max Per Market
 4->10. WHY: the owner's standing instruction (2026-07-02) is a TEN-pick
 Selected list. Two DEFAULT_CRITERIA literals blocked that as the standard:
@@ -436,6 +466,12 @@ ENV KILL-SWITCHES (policy block — read per call, not at import)
   TFB_OPP_STOP_MAX_PCT     "35"  stop distance clamp %
   TFB_OPP_REVIEW_DAYS      "30"  review-by horizon for advisor sentence
   TFB_OPP_MAX_CANDIDATES   "0"   0 = unlimited; CPU safety clamp on input rows
+  TFB_OPP_PREGATE_ORDER    "1"   v1.6.0: when the clamp above WILL cut the
+                                 pool, first re-order it eligible-first
+                                 (cheap row-local gate mirrors) by
+                                 reliability desc so the scan slots go to
+                                 trustworthy names; 0 = v1.5.0 positional
+                                 cut byte-for-byte
   TFB_OPP_PF_MAX_SECTOR_PCT "30" post-action portfolio sector cap (§4.2)
   TFB_OPP_TRUST_GATE       "1"   v1.0.6: "0" ⇒ skip the Data Trust MAJOR gate
   TFB_OPP_MAX_DATA_AGE_HOURS "168" v1.0.6: last_updated older ⇒ stale ⇒ fail
@@ -714,7 +750,7 @@ from datetime import datetime, timedelta, timezone
 # Kills: TFB_COMPLIANCE_SURFACE_GATE=0 / TFB_ELIGIBILITY_GATE=0 restore the
 # v1.4.1 gate list byte-for-byte. Guards ship armed.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.5.0"
+OPPORTUNITY_BUILDER_VERSION = "1.6.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1212,6 +1248,14 @@ def _env_issuer_dedup():
     return str(_env_str(
         "TFB_OPP_ISSUER_DEDUP", "0")).strip().lower() in (
         "1", "true", "yes", "on", "enabled", "enable")
+
+
+def _env_pregate_order():
+    """v1.6.0 [PREGATE-ORDER] kill-switch — DEFAULT ON. Set
+    TFB_OPP_PREGATE_ORDER=0 to restore the v1.5.0 arrival-order clamp
+    byte-for-byte."""
+    return str(_env_str("TFB_OPP_PREGATE_ORDER", "1")).strip().lower() \
+        not in ("0", "false", "off", "no")
 
 
 def _env_canon_market():
@@ -2983,6 +3027,82 @@ def _build_alerts(audit, deployable, selected, upstream_meta):
 # §5 payload assembly (fail-soft, JSON-safe)
 # ---------------------------------------------------------------------------
 
+def _pregate_quality_order(rows, crit):
+    """v1.6.0 [PREGATE-ORDER]: re-order the incoming pool ELIGIBLE-FIRST
+    before the max_candidates clamp cuts it, using cheap row-local mirrors
+    of the real gates (field-token-identical to normalize_candidate /
+    evaluate_gates; see the header WHY-block). Returns (reordered_rows,
+    stats). Pure and deterministic: ties break on symbol then arrival
+    index; malformed rows never raise — they fail their mirrors and sink.
+    Cost: a handful of dict lookups + float parses per row (~10k rows well
+    under a second); no FX resolve, no ticket math, no venue calendar."""
+    stats = {"pool": len(rows), "eligible": 0, "fail_price_or_ref": 0,
+             "fail_fresh": 0, "fail_sanity": 0, "fail_forecast": 0,
+             "fail_reliability": 0}
+    max_age = crit.get("max_data_age_hours")
+    vmax = (crit.get("max_valuation_roi_pct", 80.0)
+            if crit.get("valuation_sanity_gate_enabled") else None)
+    f_floor = (crit.get("min_engine_roi_pct", 0.0)
+               if crit.get("forecast_gate_enabled") else None)
+    rel_floor = crit.get("min_reliability")
+    keyed = []
+    for i, raw in enumerate(rows):
+        view = _row_lookup(raw if isinstance(raw, dict) else {})
+        symbol = _to_text(_field(view, "symbol")) or "?"
+        price = _to_float(_field(view, "price"))
+        if price is not None and price <= 0:
+            price = None
+        target = _to_float(_field(view, "target_price"))
+        iv = _to_float(_field(view, "intrinsic_value"))
+        if target is not None and target <= 0:
+            target = None
+        if iv is not None and iv <= 0:
+            iv = None
+        ref = target if target is not None else iv
+        eng_pct = _engine_roi_to_pct(
+            _to_float(_field(view, "engine_roi_12m_pct")))
+        # mirror of the v1.3.0 REF-CONSERVATIVE bound so the sanity mirror
+        # sees the same roi_pct the real Valuation Sanity gate will see.
+        if (_ref_conservative_enabled() and price and ref
+                and eng_pct is not None and eng_pct > 0.0):
+            _ref_eng = price * (1.0 + eng_pct / 100.0)
+            if _ref_eng < ref:
+                ref = _ref_eng
+        roi_pct = None
+        if price and ref:
+            roi_pct = (ref - price) / price * 100.0
+        rel = _to_float(_field(view, "reliability"))
+        age_h = _parse_age_hours(_to_text(_field(view, "last_updated")))
+        ok_pr = price is not None and ref is not None
+        ok_fresh = not (max_age is not None and max_age > 0
+                        and age_h is not None and age_h > max_age)
+        ok_sane = (vmax is None or roi_pct is None or roi_pct <= vmax)
+        ok_fcst = (f_floor is None or eng_pct is None
+                   or eng_pct >= f_floor)
+        ok_rel = (rel_floor is None
+                  or (rel is not None and rel >= float(rel_floor)))
+        eligible = (ok_pr and ok_fresh and ok_sane and ok_fcst and ok_rel)
+        if eligible:
+            stats["eligible"] += 1
+        else:
+            if not ok_pr:
+                stats["fail_price_or_ref"] += 1
+            if not ok_fresh:
+                stats["fail_fresh"] += 1
+            if not ok_sane:
+                stats["fail_sanity"] += 1
+            if not ok_fcst:
+                stats["fail_forecast"] += 1
+            if not ok_rel:
+                stats["fail_reliability"] += 1
+        rel_k = rel if rel is not None else -1.0e18
+        eng_k = eng_pct if eng_pct is not None else -1.0e18
+        keyed.append(((0 if eligible else 1, -rel_k, -eng_k, symbol, i),
+                      raw))
+    keyed.sort(key=lambda kv: kv[0])
+    return [raw for _k, raw in keyed], stats
+
+
 def build_opportunity_payload(rows, criteria=None, portfolio=None,
                               fx_rates=None, upstream_meta=None):
     """The one entry point P3 calls. Never raises: hard failures return an
@@ -3002,7 +3122,29 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         return _json_safe(_skeleton("disabled",
                                     "TFB_OPP_ENABLED=0", crit))
     rows = list(rows or [])
+    pregate_stats = None
     if crit["max_candidates"] > 0:
+        # v1.6.0 [PREGATE-ORDER]: the clamp is about to discard everything
+        # past max_candidates, so make the kept slice the QUALITY slice,
+        # not the arrival slice (2026-07-22 evidence: 10,311 -> first 300
+        # -> 291 Valuation-Sanity kills -> 0 tickets). OFF-switch, no-clamp
+        # and no-cut paths leave rows untouched => byte-identical v1.5.0.
+        if _env_pregate_order() and len(rows) > crit["max_candidates"]:
+            rows, pregate_stats = _pregate_quality_order(rows, crit)
+            pregate_stats["kept"] = crit["max_candidates"]
+            try:
+                _LOG.info(
+                    "[PREGATE v%s] pool=%d eligible=%d kept=%d fail("
+                    "fresh=%d sanity=%d forecast=%d rel=%d price_ref=%d)",
+                    OPPORTUNITY_BUILDER_VERSION, pregate_stats["pool"],
+                    pregate_stats["eligible"], pregate_stats["kept"],
+                    pregate_stats["fail_fresh"],
+                    pregate_stats["fail_sanity"],
+                    pregate_stats["fail_forecast"],
+                    pregate_stats["fail_reliability"],
+                    pregate_stats["fail_price_or_ref"])
+            except Exception:
+                pass
         rows = rows[:crit["max_candidates"]]
     pf = _normalize_portfolio(portfolio)
     sector_ctx = _sector_context(pf, crit, pf["cash"] + pf["proceeds"])
@@ -3175,6 +3317,11 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         "passed": len(invest),
         "capital_unallocated_sar": round(deployable - total_suggested, 0),
     }
+    # v1.6.0 [PREGATE-ORDER]: full-pool funnel telemetry. Additive key,
+    # absent whenever the reorder did not run, so every v1.5.0 consumer
+    # sees an unchanged kpis dict on the OFF/no-cut paths.
+    if pregate_stats is not None:
+        kpis["pregate"] = pregate_stats
     # v1.0.5: parallel engine-based expected gain (additive; the primary
     # expected_gain_12m_sar above stays == Σ ticket exp_gain — v1.0.20 note:
     # under TFB_OPP_PRIMARY_ROI_BASIS=engine the ADDENDS are engine-based, so
