@@ -3,9 +3,50 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.23.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.26.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.26.0 — STALE-SKIP ESCALATION + PAGE-VERDICT TELEMETRY
+--------------------------------------------------------------------------
+EVIDENCE (2026-07-22 evening + GitHub run forensics): three scheduled runs
+(10:30 / 14:09 / 17:25 UTC) each ran the dedicated global-markets leg for
+65-80 minutes and finished GREEN — yet the 23:10 Riyadh workbook export
+carried ZERO Global_Markets rows stamped 07-22 out of 6,512 (histogram:
+07-16x3,317 · 07-17x1,254 · 07-18x426 · 07-20x112 · 07-21x1,012 ·
+Nonex339). Root cause is the runner's own protective architecture: EVERY
+degradation guard — L4a readback-empty, L4b persistence-hard, the
+empty-fetch skip, the shrink floor, the L3/L3b identity & coherence
+tripwires, FW quarantine soft-landings — resolves to status="skipped",
+which the exit-code policy maps to 0 ("stale-but-complete beats
+fresh-but-amputated"). That trade is CORRECT for one cycle and
+CATASTROPHIC when chronic: five consecutive dark days on the largest page
+looked like five green days, and nothing downstream could tell an
+intentional skip from a data outage. FIX (single post-run pass, ZERO
+changes inside any guard):
+  (1) STALE-SKIP ESCALATION — after all tasks settle, any RANKED market
+      page whose TaskResult is status="skipped" for a HEALTH reason (not
+      dry-run / decision-owned / forbidden / unknown-key / empty-disallowed)
+      while the page's NEWEST on-sheet data stamp is older than
+      TFB_SYNC_SKIP_MAX_STALE_H (default 30h) is re-classed to
+      status="failed" with a [STALE-SKIP] error naming the first guard —
+      the existing exit-code policy then returns 2 and the CI leg goes
+      RED. A skip on a still-fresh page stays a green skip (the guards'
+      availability trade is preserved); an unreadable stamp column
+      escalates nothing (fail-safe None).
+  (2) PAGE-VERDICT TELEMETRY — one grep-stable INFO line per task:
+      [PAGE-VERDICT v6.26.0] page=<name> status=<s> rows_written=<n>
+      newest_stamp_age_h=<h|NA> reason=<first warning> — the per-page
+      health signal the 5-day outage never produced.
+ENV: TFB_SYNC_STALE_SKIP_RED "1" (kill-switch — 0/false/off/no restores
+v6.25.3 statuses, exit codes and logs byte-identically);
+TFB_SYNC_SKIP_MAX_STALE_H "30" (floor 1, unparseable -> 30).
+Stamp reading: header row located by scanning the first 45 rows for a row
+holding both a Symbol column and one of Last Updated (Riyadh)/(UTC)/bare;
+cells parsed as Sheets date serials OR "YYYY-MM-DD[ HH:MM:SS]" text;
+Riyadh-labeled stamps age against UTC+3. ZERO functions removed;
+additions: _stale_skip_red_enabled, _skip_max_stale_h, _col_idx_to_a1,
+_parse_stamp_cell, _page_newest_stamp_age_h, _apply_stale_skip_escalation.
 
 v6.25.1 fix — FW-2 QUARANTINE KEEPS LAST-GOOD (evidence: 2026-07-17
 17:34 leg, out_stripped=30 incl. AMAT/SNPS/NXPI/F/TRV + 15 .SR majors)
@@ -1122,7 +1163,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.25.3"
+SCRIPT_VERSION = "6.26.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -4799,6 +4840,163 @@ def _rectify_matrix(headers: List[Any], matrix: List[List[Any]]) -> List[List[An
 # -----------------------------------------------------------------------------
 # Run one task
 # -----------------------------------------------------------------------------
+_STALE_SKIP_TAG = "[STALE-SKIP v6.26.0]"
+_PAGE_VERDICT_TAG = "[PAGE-VERDICT v6.26.0]"
+# Skips that are CONFIGURATION, not health — never escalated.
+_BENIGN_SKIP_MARKERS = (
+    "Dry run", "decision-owned", "Forbidden legacy key", "Unknown key",
+    "disallows empty symbols",
+)
+_STAMP_HEADER_CANDIDATES = (
+    "last updated (riyadh)", "last updated (utc)", "last updated",
+)
+
+
+def _stale_skip_red_enabled() -> bool:
+    """v6.26.0 kill-switch — DEFAULT ON. 0/false/off/no restores v6.25.3
+    statuses, exit codes and logging byte-identically."""
+    raw = (os.getenv("TFB_SYNC_STALE_SKIP_RED", "1") or "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+def _skip_max_stale_h() -> float:
+    """v6.26.0: newest-stamp age (hours) beyond which a guard-skip on a
+    ranked page is a data outage, not an availability trade. Default 30
+    (one missed day + margin); floor 1; unparseable -> 30."""
+    try:
+        return max(1.0, float(os.getenv("TFB_SYNC_SKIP_MAX_STALE_H") or "30"))
+    except Exception:
+        return 30.0
+
+
+def _col_idx_to_a1(idx0: int) -> str:
+    """0-based column index -> A1 letters (0->A, 25->Z, 26->AA)."""
+    out = ""
+    n = int(idx0)
+    while True:
+        out = chr(ord("A") + (n % 26)) + out
+        n = n // 26 - 1
+        if n < 0:
+            return out
+
+
+def _parse_stamp_cell(v: Any) -> Optional[datetime]:
+    """One stamp cell -> naive datetime. Accepts Sheets date serials
+    (UNFORMATTED_VALUE numbers; epoch 1899-12-30) and 'YYYY-MM-DD[ HH:MM:SS]'
+    text prefixes. Anything else -> None; never raises."""
+    try:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            f = float(v)
+            if 20000.0 < f < 80000.0:  # ~1954..2118: plausible date serial
+                base = datetime(1899, 12, 30)
+                from datetime import timedelta as _td
+                return base + _td(days=f)
+            return None
+        t = str(v or "").strip()
+        if len(t) >= 19:
+            try:
+                return datetime.strptime(t[:19], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+        if len(t) >= 10:
+            return datetime.strptime(t[:10], "%Y-%m-%d")
+        return None
+    except Exception:
+        return None
+
+
+def _page_newest_stamp_age_h(sheets: Any, spreadsheet_id: str,
+                             sheet_name: str) -> Optional[float]:
+    """v6.26.0: age in hours of the NEWEST data stamp on a page, read from
+    its Last Updated column. Header row found by scanning the first 45 rows
+    for a row carrying both a Symbol column and a stamp header. Riyadh-
+    labeled stamps age against UTC+3, others against UTC (both naive; a
+    3h label error is immaterial vs a 30h threshold). Returns None on ANY
+    failure — an unreadable page must never escalate anything."""
+    try:
+        if sheets is None:
+            return None
+        head = sheets.read_values(spreadsheet_id, sheet_name, "A1:EZ45")
+        if not head:
+            return None
+        hdr_row = -1
+        stamp_idx = -1
+        riyadh = False
+        for ri, row in enumerate(head):
+            low = [str(c or "").strip().lower() for c in (row or [])]
+            if "symbol" not in low:
+                continue
+            for ci, cell in enumerate(low):
+                if cell in _STAMP_HEADER_CANDIDATES:
+                    hdr_row, stamp_idx = ri, ci
+                    riyadh = "riyadh" in cell
+                    break
+            if hdr_row >= 0:
+                break
+        if hdr_row < 0 or stamp_idx < 0:
+            return None
+        col = _col_idx_to_a1(stamp_idx)
+        rng = "%s%d:%s" % (col, hdr_row + 2, col)
+        vals = sheets.read_values(spreadsheet_id, sheet_name, rng)
+        if not vals:
+            return None
+        newest: Optional[datetime] = None
+        for r in vals:
+            dt = _parse_stamp_cell(r[0] if r else None)
+            if dt is not None and (newest is None or dt > newest):
+                newest = dt
+        if newest is None:
+            return None
+        from datetime import timedelta as _td
+        now = _utc_now().replace(tzinfo=None) \
+            + (_td(hours=3) if riyadh else _td(0))
+        return max(0.0, (now - newest).total_seconds() / 3600.0)
+    except Exception:
+        return None
+
+
+def _apply_stale_skip_escalation(results: List["TaskResult"], sheets: Any,
+                                 spreadsheet_id: str) -> None:
+    """v6.26.0 post-run pass (see header WHY block). Mutates TaskResult
+    statuses in place BEFORE the summary tally, so the existing exit-code
+    policy (failed>0 -> 2) turns a chronic dark page into a RED leg. Also
+    emits one [PAGE-VERDICT] line per task. Entirely inert when
+    TFB_SYNC_STALE_SKIP_RED=0."""
+    if not _stale_skip_red_enabled():
+        return
+    thr = _skip_max_stale_h()
+    for r in results:
+        ranked = r.sheet_name in _RANKED_MARKET_PAGES
+        age: Optional[float] = None
+        if ranked:
+            age = _page_newest_stamp_age_h(sheets, spreadsheet_id,
+                                           r.sheet_name)
+        if ranked and r.status == "skipped":
+            wtxt = " | ".join(r.warnings or [])
+            benign = any(m in wtxt for m in _BENIGN_SKIP_MARKERS)
+            if (not benign) and age is not None and age > thr:
+                first_guard = (r.warnings[0][:180] if r.warnings else "n/a")
+                r.status = "failed"
+                r.error = (
+                    "%s '%s' guard-skipped while its newest data stamp is "
+                    "%.1fh old (> %.0fh): a protective skip is tolerable "
+                    "once, but skipping an ALREADY-STALE page is a data "
+                    "outage — failing the leg so it cannot report green. "
+                    "First guard: %s" % (_STALE_SKIP_TAG, r.sheet_name,
+                                         age, thr, first_guard))
+                logger.error(r.error)
+        try:
+            reason = (r.warnings[0] if r.warnings else (r.error or "clean"))
+            logger.info(
+                "%s page=%s status=%s rows_written=%d "
+                "newest_stamp_age_h=%s reason=%s",
+                _PAGE_VERDICT_TAG, r.sheet_name, r.status, r.rows_written,
+                ("%.1f" % age) if age is not None else "NA",
+                str(reason)[:120])
+        except Exception:
+            pass
+
+
 async def _run_one_task(
     task: TaskSpec,
     spreadsheet_id: str,
@@ -5745,6 +5943,16 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
                 results.append(tr)
             else:
                 results.append(r)
+
+        # v6.26.0 [STALE-SKIP]: escalate health-skips on already-stale ranked
+        # pages to FAILED (existing policy below then exits 2 => RED CI leg)
+        # + one [PAGE-VERDICT] line per task. Inert when
+        # TFB_SYNC_STALE_SKIP_RED=0; a crash here must never sink the run.
+        try:
+            _apply_stale_skip_escalation(results, sheets, spreadsheet_id)
+        except Exception as _sse:
+            logger.warning("%s escalation pass skipped (error: %s)",
+                           _STALE_SKIP_TAG, _sse)
 
         for r in results:
             if r.status == "success":
