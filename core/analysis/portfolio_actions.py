@@ -354,7 +354,23 @@ from datetime import datetime, timedelta, timezone
 # Inherits D-9's fail-open behaviour: if compliance_gate is unavailable the
 # holding stays in its original bucket exactly as v1.2.1.
 # -----------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.3.0"
+# -----------------------------------------------------------------------------
+# v1.4.0 (2026-07-21 PM, operator-approved) — EXIT-BY-RULE ON THE HELD SIDE
+# WHY: today's live gap, in the operator's own words — the surface said TRIM
+# (position-cap math) while the rulebook said EXIT (authority FAIL), and the
+# low-confidence cap can mint HOLDs on names the rules have already judged.
+# FIX — Rule 1a (immediately after the data gate, BEFORE every cap and every
+# valuation rule): a held symbol on the rule-exit set returns
+#   EXIT | "EXIT-BY-RULE (§4.6): compliance/authority verdict — not
+#          confidence-cappable" | proceeds = full market value.
+# The set = opportunity_builder.compliance_rule_sets(): official KSA
+# authority FAIL list (env-refreshable) ∪ TFB_EXIT_BY_RULE_EXTRA (the
+# operator's model-screen verdicts for globals, e.g. BBD.US / NMM.US).
+# A rule exit is a RULE: reliability cannot cap it, valuation cannot soften
+# it, and the reason string names the clause. Kill: TFB_EXIT_BY_RULE_GATE=0
+# restores v1.3.0 decisions byte-for-byte. Ships armed.
+# -----------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.4.0"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -488,6 +504,24 @@ def _env_int(name, default):
 def _env_enabled():
     return str(_env_str("TFB_PF_ENABLED", "1")).strip().lower() not in (
         "0", "false", "no", "off")
+
+
+def _env_exit_by_rule_gate():
+    """v1.4.0 kill-switch — DEFAULT ON (rule exits ship armed)."""
+    return (os.getenv("TFB_EXIT_BY_RULE_GATE") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _rule_exit_set():
+    """The shared resolver from opportunity_builder; empty set when the
+    import is unavailable (fail-open to v1.3.0 behavior, never a crash)."""
+    try:
+        if _ob is not None and hasattr(_ob, "compliance_rule_sets"):
+            fail, _restricted = _ob.compliance_rule_sets()
+            return fail
+    except Exception:
+        pass
+    return set()
 
 
 def _env_cost_basis_gate():
@@ -1220,6 +1254,18 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
         return (ACTION_BLOCK,
                 "Data gate: missing " + "/".join(missing) +
                 " — manual review required", 0.0, None)
+
+    # 1a. EXIT-BY-RULE (v1.4.0) — the rulebook outranks every cap below.
+    #     Placed before the confidence cap ON PURPOSE: a rule exit is a
+    #     compliance verdict, not a signal, and weak reliability must never
+    #     convert it into a HOLD (today's 1180/BBD lesson).
+    if _env_exit_by_rule_gate():
+        _sym_r = (str(cand.get("symbol") or "").strip().upper())
+        if _sym_r and _sym_r in _rule_exit_set():
+            return (ACTION_EXIT,
+                    "EXIT-BY-RULE (\u00a74.6): compliance/authority verdict "
+                    "\u2014 not confidence-cappable",
+                    float(mv or 0.0), None)
 
     # 1b. BLOCK — cost-basis plausibility (v1.0.2; Phase 0, Finding 2).
     #     Presence (gate above) is not plausibility: a held position can pass
