@@ -61,7 +61,20 @@ import sys
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-__version__ = "1.0.0"
+# v1.1.0 (2026-07-22): STICKY DATES — replace-mode amnesia cured.
+# EVIDENCE: EXE.US (earnings 2026-07-28, known since Monday) was stripped
+# from the harvest pages by Tuesday's provider-429 wave; the full-tab
+# REPLACE then erased its known FUTURE date, and Wednesday's selected EXE
+# ticket rendered with no ⚠ tag — a protective layer silently lost to an
+# unrelated page incident. FIX (merge semantics, three rules):
+#   1. FILL:      a harvested symbol whose fetch returns no date inherits
+#                 its prior FUTURE date (source column: "... +carried").
+#   2. RESURRECT: a symbol missing from today's harvest but holding a
+#                 prior FUTURE date keeps its row (the EXE case).
+#   3. EXPIRE:    past dates are never carried — they die naturally.
+# Fresh provider data always wins; carried rows are visibly marked; the
+# summary line reports carried=/resurrected= for the audit chain.
+__version__ = "1.1.0"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 HEADERS = ["Symbol", "Next Earnings Date", "Days To Earnings",
@@ -150,16 +163,93 @@ def harvest_symbols(values: List[List[Any]]) -> List[str]:
     return [s for s in out if not (s in seen or seen.add(s))]
 
 
+def parse_prior(values: List[List[Any]]) -> Dict[str, Dict[str, str]]:
+    """v1.1.0: {SYM: {"e": date, "x": date}} from the existing tab —
+    FUTURE dates only (rule 3: the past is never carried)."""
+    out: Dict[str, Dict[str, str]] = {}
+    if not values:
+        return out
+    hdr_i, cs, ce, cx = -1, -1, -1, -1
+    for i, row in enumerate(values[:5]):
+        low = [str(c or "").strip().lower() for c in row]
+        if "symbol" in low:
+            hdr_i, cs = i, low.index("symbol")
+            for j, h in enumerate(low):
+                if "next earnings" in h:
+                    ce = j
+                elif "ex-div" in h or "ex div" in h:
+                    cx = j
+            break
+    if hdr_i < 0 or cs < 0:
+        return out
+    for row in values[hdr_i + 1:]:
+        sym = str(row[cs] if cs < len(row) else "").strip().upper()
+        if not sym or sym == "SYMBOL":
+            continue
+        rec: Dict[str, str] = {}
+        for key, cix in (("e", ce), ("x", cx)):
+            d = str(row[cix] if 0 <= cix < len(row) else "").strip()[:10]
+            du = _days_until(d)
+            if d and du is not None and du >= 0:
+                rec[key] = d
+        if rec:
+            out[sym] = rec
+    return out
+
+
+def apply_sticky(symbols: List[str],
+                 ctx: Dict[str, Dict[str, Optional[str]]],
+                 prior: Dict[str, Dict[str, str]]
+                 ) -> Tuple[List[str], Dict[str, Dict[str, Optional[str]]],
+                            set, int, int]:
+    """v1.1.0 merge: (symbols_out, ctx_out, carried_syms, n_fill, n_resur).
+    Fresh provider data ALWAYS wins; prior fills blanks (rule 1) and
+    resurrects vanished symbols (rule 2); only future dates exist in
+    `prior` by construction (rule 3)."""
+    ctx_out = {s: dict(ctx.get(s) or {}) for s in symbols}
+    carried: set = set()
+    n_fill = 0
+    for s in symbols:
+        p = prior.get(s)
+        if not p:
+            continue
+        c = ctx_out[s]
+        touched = False
+        if not c.get("next_earnings_date") and p.get("e"):
+            c["next_earnings_date"] = p["e"]
+            touched = True
+        if not c.get("next_ex_div_date") and p.get("x"):
+            c["next_ex_div_date"] = p["x"]
+            touched = True
+        if touched:
+            carried.add(s)
+            n_fill += 1
+    symbols_out = list(symbols)
+    n_res = 0
+    for s, p in prior.items():
+        if s in ctx_out or not p.get("e"):
+            continue
+        symbols_out.append(s)
+        ctx_out[s] = {"next_earnings_date": p.get("e"),
+                      "next_ex_div_date": p.get("x")}
+        carried.add(s)
+        n_res += 1
+    return symbols_out, ctx_out, carried, n_fill, n_res
+
+
 def build_rows(symbols: List[str],
                ctx: Dict[str, Dict[str, Optional[str]]],
-               source: str) -> List[List[Any]]:
+               source: str,
+               carried: Optional[set] = None) -> List[List[Any]]:
     stamp = _dt.datetime.now(_RIYADH).strftime("%Y-%m-%d %H:%M")
+    carried = carried or set()
     rows: List[List[Any]] = []
     for s in symbols:
         c = ctx.get(s) or {}
         e, x = c.get("next_earnings_date"), c.get("next_ex_div_date")
+        row_src = (source + " +carried") if s in carried else source
         rows.append([s, e or "", _days_until(e), x or "", _days_until(x),
-                     stamp, source])
+                     stamp, row_src])
     return rows
 
 
@@ -171,7 +261,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--write", action="store_true", help="write the tab (CI mode)")
     g.add_argument("--dry-run", action="store_true", help="print table only")
+    g.add_argument("--selftest", action="store_true",
+                   help="offline logic harness (no network)")
     args = ap.parse_args(argv)
+    if getattr(args, "selftest", False):
+        return _selftest()
     write = bool(args.write) and not args.dry_run
 
     pages = [p.strip() for p in _env(
@@ -214,9 +308,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         _out(f"WARN: provider failed ({e}) — writing blank dates")
         ctx, source = {}, f"provider error — blank dates"
 
-    rows = build_rows(symbols, ctx, source)
+    # v1.1.0: sticky merge against the tab's prior state (read once, early).
+    prior: Dict[str, Dict[str, str]] = {}
+    try:
+        prior = parse_prior(book.worksheet(tab).get("A1:H400"))
+    except Exception as e:
+        _out(f"WARN: prior-tab read failed ({e}) — no carry this run")
+    symbols, ctx, carried, n_fill, n_res = apply_sticky(symbols, ctx, prior)
+    rows = build_rows(symbols, ctx, source, carried)
     filled = sum(1 for r in rows if r[1] or r[3])
-    _out(f"rows: {len(rows)} | with at least one date: {filled}")
+    _out(f"rows: {len(rows)} | with at least one date: {filled} | "
+         f"carried={n_fill} resurrected={n_res}")
 
     if not write:
         for r in rows[:15]:
@@ -242,6 +344,55 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as e:
         _out(f"ERROR: sheet write failed: {e}")
         return 3
+
+
+
+
+# ----------------------------------------------------------------------------- #
+# v1.1.0 offline selftest
+# ----------------------------------------------------------------------------- #
+def _selftest() -> int:
+    today = _dt.datetime.now(_RIYADH).date()
+    fut = (today + _dt.timedelta(days=6)).isoformat()
+    fut2 = (today + _dt.timedelta(days=13)).isoformat()
+    past = (today - _dt.timedelta(days=2)).isoformat()
+    tab = [["Symbol", "Next Earnings Date", "Days To Earnings",
+            "Next Ex-Div Date", "Days To ExDiv", "Updated At (Riyadh)",
+            "Source"],
+           ["EXE.US", fut, 6, "", "", "x", "eodhd"],
+           ["OLD.US", past, -2, "", "", "x", "eodhd"],
+           ["MRP.US", fut2, 13, past, -2, "x", "eodhd"]]
+    prior = parse_prior(tab)
+    checks = []
+    checks.append(("prior: future kept, past expired (rows and fields)",
+                   "EXE.US" in prior and "OLD.US" not in prior
+                   and prior["MRP.US"].get("e") == fut2
+                   and "x" not in prior["MRP.US"]))
+    syms, ctx, carried, nf, nr = apply_sticky(
+        ["MRP.US", "NEW.US"],
+        {"MRP.US": {"next_earnings_date": ""},
+         "NEW.US": {"next_earnings_date": fut}},
+        prior)
+    checks.append(("fill: harvested blank inherits prior future",
+                   ctx["MRP.US"]["next_earnings_date"] == fut2
+                   and "MRP.US" in carried and nf == 1))
+    checks.append(("resurrect: vanished EXE returns carried",
+                   "EXE.US" in syms and ctx["EXE.US"]["next_earnings_date"] == fut
+                   and "EXE.US" in carried and nr == 1))
+    checks.append(("fresh wins: provider date untouched",
+                   ctx["NEW.US"]["next_earnings_date"] == fut
+                   and "NEW.US" not in carried))
+    rows = build_rows(syms, ctx, "eodhd v1.2.0", carried)
+    by = {r[0]: r for r in rows}
+    checks.append(("rows: carried marked, days computed",
+                   by["EXE.US"][6].endswith("+carried")
+                   and by["EXE.US"][2] == 6
+                   and by["NEW.US"][6] == "eodhd v1.2.0"))
+    passed = sum(1 for _, ok in checks if ok)
+    for name, ok in checks:
+        print(("PASS " if ok else "FAIL ") + name)
+    print(f"[calendar_sync v{__version__}] SELFTEST {passed}/{len(checks)}")
+    return 0 if passed == len(checks) else 1
 
 
 if __name__ == "__main__":
