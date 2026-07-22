@@ -342,7 +342,26 @@ USAGE
 """
 from __future__ import annotations
 
-__version__ = "1.12.0"
+# v1.13.0 (2026-07-22): RULEBOOK ON THE BRIEF + TAG-TOLERANT BUYS (two
+# defects, both proven by the sent briefs themselves):
+#   (1) COMPLIANCE-BLIND CANDIDATES — the 2026-07-20 brief printed 1050.SR
+#       (authority FAIL) and 4030.SR (foreign-restricted for the operator)
+#       as Best-new-buy candidates: extract_market_page screens on the
+#       engine's Final Action, a layer the v1.5.0 decision gates do not
+#       cover. Fix: _rulebook_blocked() — official KSA FAIL list ∪ Nomu
+#       (9xxx.SR) ∪ foreign-restricted — sourced from
+#       opportunity_builder.compliance_rule_sets() when importable (single
+#       source), else an embedded mirror of its compiled defaults (ob wins
+#       whenever present; mirror refreshed with the quarterly list).
+#       Blocked names stay in page totals but never in investable counts,
+#       top names, or buy candidates.
+#   (2) TAG-STARVED BUYS — v1.6.0 prefixes funded tickets with
+#       "⚠ earnings ≤Nd · " BEFORE the word INVEST, so extract_top10's
+#       startswith("INVEST") would silently drop every earnings-tagged
+#       ticket from tonight's brief onward. Fix: tag-tolerant detection
+#       (INVEST anywhere in the note's first 60 chars; grace/exit notes
+#       carry no INVEST and remain excluded).
+__version__ = "1.13.0"
 
 # v1.12.0 — MARKET-PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
 # WHY (2026-07-16): read_pages_live fetched every page via a hardcoded
@@ -884,6 +903,50 @@ def _held_issuers(pages_data: Dict[str, List[List[Any]]]) -> Tuple[set, Dict[str
     return syms, {k: sorted(set(v)) for k, v in names.items()}
 
 
+# --------------------------------------------------------------------------- #
+# v1.13.0: the operator's rulebook, enforced on every brief candidate surface  #
+# --------------------------------------------------------------------------- #
+_RULEBOOK_FAIL_MIRROR = (
+    "1010.SR", "1030.SR", "1050.SR", "1060.SR", "1080.SR", "1180.SR",
+    "4011.SR", "4072.SR", "4280.SR", "8100.SR", "8310.SR", "9642.SR")
+_RULEBOOK_RESTRICTED_MIRROR = ("4030.SR",)
+_RULEBOOK_NOMU_RE = re.compile(r"^9\d{3}\.SR$")
+_RULEBOOK_CACHE: Optional[Tuple[set, set]] = None
+
+
+def _rulebook_sets() -> Tuple[set, set]:
+    """(fail_set, restricted_set) — opportunity_builder is the single source
+    when importable; the embedded mirror keeps the brief safe standalone."""
+    global _RULEBOOK_CACHE
+    if _RULEBOOK_CACHE is not None:
+        return _RULEBOOK_CACHE
+    try:
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+        from core.analysis.opportunity_builder import compliance_rule_sets
+        _RULEBOOK_CACHE = compliance_rule_sets()
+    except Exception:
+        _RULEBOOK_CACHE = (set(_RULEBOOK_FAIL_MIRROR),
+                           set(_RULEBOOK_RESTRICTED_MIRROR))
+    return _RULEBOOK_CACHE
+
+
+def _rulebook_blocked(sym: str) -> Optional[str]:
+    """Reason string when a symbol may never be a buy candidate, else None."""
+    s = (sym or "").strip().upper()
+    if not s.endswith(".SR"):
+        return None
+    if _RULEBOOK_NOMU_RE.match(s):
+        return "NOMU"
+    fail, restricted = _rulebook_sets()
+    if s in fail:
+        return "AUTHORITY_FAIL"
+    if s in restricted:
+        return "FOREIGN_RESTRICTED"
+    return None
+
+
 def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
                   top_n: int = 5) -> Dict[str, Any]:
     """Parse Top_10_Investments funded picks (Advisor Note starts with INVEST)."""
@@ -912,7 +975,9 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
         symbol = _s(_cell(r, ci["symbol"]))
         if not symbol:
             continue
-        if not note.upper().startswith("INVEST"):  # funded, executable tickets only
+        # v1.13.0: tag-tolerant — v1.6.0 prefixes "⚠ earnings ≤Nd · " before
+        # INVEST; grace/exit notes carry no INVEST and stay excluded.
+        if "INVEST" not in note.upper()[:60]:
             continue
         if symbol.upper() in exclude:
             continue
@@ -956,6 +1021,8 @@ def extract_market_page(rows: List[List[Any]], top_n: int = 5) -> Dict[str, Any]
             continue
         total += 1
         if _s(_cell(r, ci["fa"])).upper() == "INVEST":
+            if _rulebook_blocked(sym):          # v1.13.0: rulebook filter
+                continue
             invest.append({
                 "symbol": sym,
                 "name": _s(_cell(r, ci["name"])),
