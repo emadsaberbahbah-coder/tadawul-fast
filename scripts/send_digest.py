@@ -99,7 +99,17 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.2.0"
+# v1.2.1 (2026-07-22): RULEBOOK ON THE BUY PICK. The digest's own changelog
+# confessed the class of failure ("did recommend BBDO.US while held-blind");
+# this week's twin proved it live: the daily brief printed 1050.SR (authority
+# FAIL) and 4030.SR (foreign-restricted) as candidates from the same
+# Final-Action layer the digest screens. Fix: _rulebook_blocked() — official
+# KSA FAIL list ∪ Nomu (9xxx.SR) ∪ foreign-restricted — single-sourced from
+# opportunity_builder.compliance_rule_sets() when importable, embedded
+# mirror otherwise. Applied to BOTH buy branches (INVEST primary and the
+# raw-BUY fallback). The SELL side is deliberately untouched: exiting a
+# blocked holding is exactly what the rulebook wants.
+__version__ = "1.2.1"
 
 # v1.2.0 — PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
 # WHY (2026-07-16): _load_page fetched each tab via a hardcoded
@@ -519,7 +529,48 @@ def _annotate_sibling(pick: Optional[Dict[str, Any]],
 # --------------------------------------------------------------------------- #
 # selection
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# v1.2.1: the operator's rulebook on the buy surface                           #
+# --------------------------------------------------------------------------- #
+_RULEBOOK_FAIL_MIRROR = (
+    "1010.SR", "1030.SR", "1050.SR", "1060.SR", "1080.SR", "1180.SR",
+    "4011.SR", "4072.SR", "4280.SR", "8100.SR", "8310.SR", "9642.SR")
+_RULEBOOK_RESTRICTED_MIRROR = ("4030.SR",)
+_RULEBOOK_NOMU_RE = re.compile(r"^9\d{3}\.SR$")
+_RULEBOOK_CACHE = None
+
+
+def _rulebook_sets():
+    """opportunity_builder is the single source when importable; the mirror
+    keeps the digest safe standalone (ob wins whenever present)."""
+    global _RULEBOOK_CACHE
+    if _RULEBOOK_CACHE is None:
+        try:
+            _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if _root not in sys.path:
+                sys.path.insert(0, _root)
+            from core.analysis.opportunity_builder import compliance_rule_sets
+            _RULEBOOK_CACHE = compliance_rule_sets()
+        except Exception:
+            _RULEBOOK_CACHE = (set(_RULEBOOK_FAIL_MIRROR),
+                               set(_RULEBOOK_RESTRICTED_MIRROR))
+    return _RULEBOOK_CACHE
+
+
+def _rulebook_blocked(sym) -> bool:
+    s = (str(sym or "")).strip().upper()
+    if not s.endswith(".SR"):
+        return False
+    if _RULEBOOK_NOMU_RE.match(s):
+        return True
+    fail, restricted = _rulebook_sets()
+    return s in fail or s in restricted
+
+
 def _pick_best_buy(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    # v1.2.1: blocked names may never be the buy pick — either branch.
+    candidates = [r for r in candidates
+                  if not _rulebook_blocked(r.get("symbol"))]
     def _score(r: Dict[str, Any]) -> float:
         return r["score"] if r["score"] is not None else -1e9
 
