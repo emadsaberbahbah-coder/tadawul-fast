@@ -36,6 +36,53 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.14.0 — WHY-ZERO FUNNEL + FRESH-SHARE DEGRADATION + EARNINGS ON EXITS/TRIMS
+--------------------------------------------------------------------------
+EVIDENCE (2026-07-22 evening audit of the sent 23:15 brief + workbook
+export): three blind spots shipped in one brief. (a) ZERO buys with no
+explanation — Top_10 scanned 300 of a 10,311 pool, Valuation Sanity killed
+291, 1 passed (held), 0 funded; the mailed brief said only "no buy clears
+the bar", hiding a diagnosable funnel. (b) Global_Markets looked healthy —
+its newest stamp was <24h so the v1.10.0 per-page banner stayed SILENT —
+while 5,000+ of its rows were 5-6 days stale (3,317x07-16, 1,254x07-17,
+zero rows stamped send-day): one fresh row masked a dark pool. (c) The
+TRIM RCI.US card carried no earnings context although Calendar_Events
+showed RCI reporting THAT DAY (days-to-earnings 0) — v1.11.0 wired the
+flag onto ADD/VERIFY tickets only; money-out actions stayed blind (the
+exact "trimmed RCI on the eve of its earnings" failure adjudicated
+2026-07-22 midday). Three additive surfaces, each with its own
+kill-switch, all default ON; every OFF state renders byte-identical
+v1.13.0 HTML:
+
+(F1) WHY-ZERO FUNNEL — TFB_BRIEF_FUNNEL=0 kills. When the funded buy list
+  is EMPTY, a slate info box inside "Best new buys" prints the engine's
+  own numbers parsed off the Top_10 sheet banners (_extract_top10_funnel:
+  SELECTED count, "N of M passed all gates; top blocker: G, K names",
+  footer pool=body_rows/NNNN): "pool -> scanned -> top blocker (K) ->
+  passed -> funded". Zero becomes a diagnosis, not a shrug. Any parse
+  miss renders NOTHING (regexes return {}).
+
+(F2) FRESH-SHARE DEGRADATION BANNER — TFB_BRIEF_FRESH_SHARE_BANNER=0
+  kills; threshold TFB_BRIEF_FRESH_SHARE_MIN_PCT (default 60). Inside the
+  existing per-page vintage pass, a page whose share of stamped rows dated
+  within {send-day, send-day-1} falls below the floor gains a RED banner
+  naming the page, its fresh share and stamped-row count — even when its
+  newest stamp is recent (the exact GM hole). Pages already named by the
+  v1.10.0 age banner are not double-listed. Day-granular by design
+  (_page_vintage counts dates, not times).
+
+(F3) EARNINGS FLAG ON EXIT/TRIM ROWS — TFB_BRIEF_EARNINGS_ON_ACTIONS=0
+  kills. _action_earn_chip() prepends the amber factual line ("Earnings
+  YYYY-MM-DD (in Nd) — scheduled fact, not a signal.") to the reason text
+  of every EXIT and TRIM card via the SAME _earnings_flag_for/-window
+  (TFB_BRIEF_EARNINGS_FLAG_DAYS, default 7) v1.11.0 wired onto ADD/VERIFY
+  tickets. HOLD rows stay untouched (compact grid); PDF/plaintext
+  unchanged by design (v1.7.0 vintage precedent).
+
+ZERO functions removed; additions: _fresh_share_banner_enabled,
+_fresh_share_min_pct, _page_fresh_share, _funnel_enabled,
+_extract_top10_funnel, _earnings_on_actions_enabled, _action_earn_chip.
+
 v1.11.0 — EVENT & NEWS CONTEXT ON MONEY TICKETS (Phase 3 display wiring)
 --------------------------------------------------------------------------
 WHY (the 2026-07-13/14 NMM.US audit, closing its last visible gap): the
@@ -361,7 +408,7 @@ from __future__ import annotations
 #       ticket from tonight's brief onward. Fix: tag-tolerant detection
 #       (INVEST anywhere in the note's first 60 chars; grace/exit notes
 #       carry no INVEST and remain excluded).
-__version__ = "1.13.0"
+__version__ = "1.14.0"
 
 # v1.12.0 — MARKET-PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
 # WHY (2026-07-16): read_pages_live fetched every page via a hardcoded
@@ -830,6 +877,43 @@ def _stale_hours_threshold() -> float:
         return 24.0
 
 
+def _fresh_share_banner_enabled() -> bool:
+    """v1.14.0 (F2) kill-switch — default ON; =0 restores v1.13.0."""
+    return (os.getenv("TFB_BRIEF_FRESH_SHARE_BANNER") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fresh_share_min_pct() -> float:
+    """v1.14.0 (F2): minimum acceptable share (%) of stamped rows dated
+    within {send-day, send-day-1}. TFB_BRIEF_FRESH_SHARE_MIN_PCT,
+    default 60; unparseable falls back to 60; clamped to [1, 100]."""
+    try:
+        return min(100.0, max(1.0, float(
+            os.getenv("TFB_BRIEF_FRESH_SHARE_MIN_PCT") or "60")))
+    except Exception:
+        return 60.0
+
+
+def _page_fresh_share(vin: Optional[Dict[str, Any]],
+                      when: _dt.datetime) -> Optional[float]:
+    """v1.14.0 (F2): % of a page's STAMPED rows dated send-day or the day
+    before. None when the page has no parseable stamps (nothing renders —
+    the v1.7.0 fail-safe convention)."""
+    vin = vin or {}
+    total = int(vin.get("total") or 0)
+    if total <= 0:
+        return None
+    d0 = when.date()
+    fresh_days = {d0.isoformat(), (d0 - _dt.timedelta(days=1)).isoformat()}
+    fresh = sum(int(c) for d, c in (vin.get("dates") or [])
+                if str(d) in fresh_days)
+    return 100.0 * fresh / total
+
+
+def _funnel_enabled() -> bool:
+    """v1.14.0 (F1) kill-switch — default ON; =0 restores v1.13.0."""
+    return (os.getenv("TFB_BRIEF_FUNNEL") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _page_vintage(rows: List[List[Any]]) -> Dict[str, Any]:
     """v1.7.0 (A): per-page data vintage from the 'Last Updated (Riyadh)'
     column (UTC/plain fallbacks). Returns {"dates": [(YYYY-MM-DD, count)…
@@ -995,6 +1079,34 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
     for p in picks[top_n:]:
         rest.setdefault(p["market"], []).append(p)
     return {"top": top, "rest": rest}
+
+
+def _extract_top10_funnel(rows: List[List[Any]]) -> Dict[str, Any]:
+    """v1.14.0 (F1): parse the opportunity builder's own banner lines off
+    the Top_10_Investments sheet — SELECTED count, the DATA GAPS headline
+    ("N of M passed all gates; top blocker: G, K names") and the footer
+    pool size ("pool=body_rows/NNNN"). Tolerant of em-dash/hyphen and
+    curly apostrophes; ANY miss simply leaves its key absent and the
+    renderer prints nothing ({} on a fully unrecognized sheet)."""
+    out: Dict[str, Any] = {}
+    for r in _pad(rows):
+        c0 = _s(r[0] if r else "")
+        if not c0:
+            continue
+        m = re.search(r"SELECTED\s*[\u2014\-]+\s*EXECUTABLE\s+TICKETS\s*\((\d+)\)", c0)
+        if m:
+            out["funded"] = int(m.group(1))
+        m = re.search(r"\((\d+)\s+of\s+(\d+)\s+passed\s+all\s+gates;\s*"
+                      r"top\s+blocker:\s*([^,]+),\s*(\d+)\s+names", c0)
+        if m:
+            out["passed"] = int(m.group(1))
+            out["scanned"] = int(m.group(2))
+            out["blocker"] = m.group(3).strip()
+            out["blocker_n"] = int(m.group(4))
+        m = re.search(r"pool=\w+/(\d+)", c0)
+        if m:
+            out["pool"] = int(m.group(1))
+    return out
 
 
 def extract_market_page(rows: List[List[Any]], top_n: int = 5) -> Dict[str, Any]:
@@ -1256,6 +1368,27 @@ def _fetch_news_context(symbols: List[str],
         return {}
 
 
+def _earnings_on_actions_enabled() -> bool:
+    """v1.14.0 (F3) kill-switch — default ON; =0 restores v1.13.0."""
+    return (os.getenv("TFB_BRIEF_EARNINGS_ON_ACTIONS") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _action_earn_chip(sym: str, model: Dict[str, Any],
+                      when: _dt.datetime) -> str:
+    """v1.14.0 (F3): amber inline earnings prefix for EXIT/TRIM reason
+    lines — the same factual window _earnings_flag_for gives ADD/VERIFY
+    tickets, now on money-OUT actions too (the 2026-07-22 TRIM-RCI-on-
+    earnings-day blind spot). Empty string when the flag is off or the
+    symbol reports outside the window => v1.13.0-identical rows."""
+    if not _earnings_on_actions_enabled():
+        return ""
+    ef = _earnings_flag_for(sym, model.get("calendar") or {}, when)
+    if not ef:
+        return ""
+    return (f'<span style="color:{TRIM_C}; font-weight:bold;">&#9888;&#65039; '
+            f'{_esc(ef)} &mdash; scheduled fact, not a signal.</span> ')
+
+
 def _ticket_flags_html(sym: str, model: Dict[str, Any],
                        when: _dt.datetime) -> str:
     """v1.11.0: the amber earnings line + grey news line under a ticket.
@@ -1289,6 +1422,8 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     market = {p: extract_market_page(pages_data.get(p, [])) for p in MARKET_PAGES}
     # v1.11.0 (E1): earnings-proximity source.
     calendar = _extract_calendar(pages_data.get(PAGE_CALENDAR, []))
+    # v1.14.0 (F1): the builder's own funnel numbers off the Top_10 sheet.
+    funnel = _extract_top10_funnel(pages_data.get(PAGE_TOP10, []))
     # v1.11.0 (N1-WIRE): news context for the money tickets only.
     _ctx_syms = [r["symbol"] for r in decision["add"]] + \
                 [r["symbol"] for r in decision.get("verify", [])]
@@ -1319,7 +1454,8 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
         _annotate(market[_pg_]["top"])
     return {"decision": decision, "top10": top10, "market": market,
             "metrics": metrics, "vintage": vintage,
-            "calendar": calendar, "news_ctx": news_ctx}
+            "calendar": calendar, "news_ctx": news_ctx,
+            "funnel": funnel}
 
 
 # ----------------------------------------------------------------------------- #
@@ -1606,6 +1742,33 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     </td></tr></table>
   </td></tr>"""
 
+    # v1.14.0 (F2): fresh-SHARE degradation — fires even when a page's
+    # newest stamp is recent (2026-07-22 GM hole: newest 07-21 kept the age
+    # banner silent while 5,000+ rows sat 5-6 days stale). Pages already
+    # named by the age banner above are not double-listed.
+    if _stale_per_page_enabled() and _fresh_share_banner_enabled():
+        _already = {_pg0 for _pg0, _ts0, _ag0 in _stale_pages}
+        _degraded: List[Tuple[str, float, int]] = []
+        for _pg in MARKET_PAGES:
+            if _pg in _already:
+                continue
+            _vv = _vin_all.get(_pg) or {}
+            _sh = _page_fresh_share(_vv, when)
+            if _sh is not None and _sh < _fresh_share_min_pct():
+                _degraded.append((_pg, _sh, int(_vv.get("total") or 0)))
+        if _degraded:
+            _ditems = "".join(
+                f'<div style="margin-top:3px;">&#8226; <strong>{_esc(_pg)}</strong>'
+                f' &mdash; only {_sh:.0f}% of {_tot:,} stamped rows priced in the'
+                f' last 2 days; the freshness gate hides the rest from candidacy</div>'
+                for _pg, _sh, _tot in _degraded)
+            vintage_banner += f"""
+  <tr><td style="padding:14px 32px 0 32px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FBEEEC; border:1px solid #EBD5D1; border-left:4px solid {SELL_C};"><tr><td style="padding:11px 16px; font-family:{SANS}; font-size:12px; color:#7A2E24; line-height:1.6;">
+      <strong>Data degradation.</strong> {len(_degraded)} market page{"s" if len(_degraded) != 1 else ""} look{"" if len(_degraded) != 1 else "s"} fresh by newest stamp but {"are" if len(_degraded) != 1 else "is"} mostly stale underneath &mdash; buy candidates there are largely invisible to the engine until the sync heals:{_ditems}
+    </td></tr></table>
+  </td></tr>"""
+
     # ---- hero numbers ----
     # v1.6.0 (B4): the hero used to narrate ONLY d["add"][0] and call the rest
     # "dry powder" — while the decision layer it quotes was deploying that
@@ -1675,11 +1838,13 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     # ---- action rows ----
     sell_rows = "".join(
         _action_row(r, "EXIT" if r else "EXIT", SELL_C, "#FBEEEC", "#EBD5D1",
-                    _exit_reason(r), _pct(r["pl"]), f'{_pct(r["weight"],1).lstrip("+")} of book', SELL_C)
+                    _action_earn_chip(r["symbol"], model, when) + _exit_reason(r),
+                    _pct(r["pl"]), f'{_pct(r["weight"],1).lstrip("+")} of book', SELL_C)
         for r in d["sell"])
     trim_rows = "".join(
         _action_row(r, "TRIM", TRIM_C, "#FBF4E7", "#ECDDBE",
-                    _trim_reason(r), _pct(r["pl"]), f'{_pct(r["weight"],1).lstrip("+")} of book', SELL_C)
+                    _action_earn_chip(r["symbol"], model, when) + _trim_reason(r),
+                    _pct(r["pl"]), f'{_pct(r["weight"],1).lstrip("+")} of book', SELL_C)
         for r in d["trim"])
     add_rows = "".join(
         _action_row(r, "ADD", ADD_C, "#E9F5EF", "#C7E4D5",
@@ -1718,6 +1883,17 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     rest_block = f"""
     <div style="font-family:{SERIF}; font-size:13px; color:#0E7C5A; margin:14px 2px 8px 2px;">Across the rest of your markets</div>
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F2F8F5; border:1px solid #D5E8DE;">{rest_rows}</table>""" if rest_rows else ""
+
+    # ---- v1.14.0 (F1): why-zero funnel (renders ONLY on an empty buy list)
+    funnel_html = ""
+    if _funnel_enabled() and not t["top"]:
+        _fu = model.get("funnel") or {}
+        if _fu.get("scanned") is not None:
+            _pool_txt = (f'{_fu["pool"]:,} in pool &rarr; '
+                         if _fu.get("pool") else "")
+            funnel_html = f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#EEF1F4; border:1px solid #D5DCE3; border-left:4px solid {HOLD_C}; margin-bottom:10px;"><tr><td style="padding:11px 14px; font-family:{SANS}; font-size:12px; color:#46535F; line-height:1.7;">
+      <strong style="font-family:{SERIF};">Why zero today.</strong> {_pool_txt}<strong>{_fu["scanned"]:,} scanned</strong> &rarr; top blocker <strong>{_esc(_fu.get("blocker") or "&mdash;")}</strong> ({_fu.get("blocker_n") or 0} names) &rarr; {_fu.get("passed", 0)} passed every gate &rarr; <strong>{_fu.get("funded", 0)} funded</strong>. An empty list is the gates holding the bar, not a scan failure &mdash; the per-gate breakdown is on your Top&nbsp;10 sheet's Data&nbsp;Gaps table.
+    </td></tr></table>"""
 
     # ---- per-page strip ----
     page_rows = "".join(_page_row(name, mk[name], (model.get("vintage", {}) or {}).get(name))
@@ -1782,7 +1958,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
   <tr><td style="padding:20px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#0E7C5A; border-bottom:2px solid {ADD_C}; padding-bottom:6px;">Best new buys <span style="font-family:{SANS}; font-size:11px; color:#8A958E; letter-spacing:0.5px;">ALL MARKETS · WHERE YOUR DRY POWDER GOES</span></div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;">
     <div style="font-family:{SANS}; font-size:12px; color:#555; line-height:1.6; margin-bottom:10px;">Ranked entry candidates you <strong>don't hold</strong>, screened across <strong>all your markets</strong>. The figure is the gap to estimated <strong>fair value — a valuation target, not a prediction</strong>; reliability and confidence show how much weight to give each. The 1M&nbsp;/&nbsp;3M&nbsp;/&nbsp;12M strip under each name is the engine's valuation path with its stated reliability — <strong>targets, not predictions</strong>. Full entry/stop/target levels are in your Top&nbsp;10 sheet.</div>
-    {opp_rows}{rest_block}
+    {funnel_html}{opp_rows}{rest_block}
     <div style="font-family:{SANS}; font-size:11px; color:#A09B90; line-height:1.6; padding:8px 2px 0 2px; font-style:italic;">Live brief refreshes the full cross-market list each morning and always excludes names you hold.</div>
   </td></tr>
 
