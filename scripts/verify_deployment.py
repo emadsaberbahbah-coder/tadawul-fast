@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.7"  # v1.0.7 (2026-07-21): WINDOW MANIFEST SYNC — the verifier must mirror every live-verified bump or its drift reports are fiction: opportunity_builder 1.4.0 (W-2), run_shadow_scorer 1.2.0 (P0-C), track_performance 6.27.0 (W-1); +core.providers.yahoo_chart_provider 8.10.0 (W-5); SCRIPTS +refresh_shariah_authority 1.1.0, +backup_workbook 1.0.0 (W-4), +pit_snapshot 1.0.0 (W-6); check_scripts gains a __version__ fallback (new scripts use the calendar_sync convention); FLAGS +W-2 freshness family, +scorer honesty pair (workflow-scoped), +TFB_YC_SYMBOL_SKIP, +TFB_SHARIAH_SHEET_ID; v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
+SCRIPT_VERSION = "1.0.8"  # v1.0.8 (2026-07-21 PM): compliance-gate wave — opportunity_builder 1.5.0, +core.analysis.portfolio_actions 1.4.0; FLAGS +TFB_COMPLIANCE_SURFACE_GATE/TFB_ELIGIBILITY_GATE/TFB_EXIT_BY_RULE_GATE (armed kills) +TFB_SHARIAH_FAIL_LIST/TFB_EXIT_BY_RULE_EXTRA/TFB_KSA_FOREIGN_RESTRICTED (value flags); # v1.0.7 (2026-07-21): WINDOW MANIFEST SYNC — the verifier must mirror every live-verified bump or its drift reports are fiction: opportunity_builder 1.4.0 (W-2), run_shadow_scorer 1.2.0 (P0-C), track_performance 6.27.0 (W-1); +core.providers.yahoo_chart_provider 8.10.0 (W-5); SCRIPTS +refresh_shariah_authority 1.1.0, +backup_workbook 1.0.0 (W-4), +pit_snapshot 1.0.0 (W-6); check_scripts gains a __version__ fallback (new scripts use the calendar_sync convention); FLAGS +W-2 freshness family, +scorer honesty pair (workflow-scoped), +TFB_YC_SYMBOL_SKIP, +TFB_SHARIAH_SHEET_ID; v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -57,9 +57,9 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.scoring", "__version__", "5.10.0", "scoring"),
     ("core.enriched_quote", "MODULE_VERSION", "4.10.0", "enriched quote"),
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.4.0", "opportunity builder"),
+     "1.5.0", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.3.0", "portfolio actions"),
+     "1.4.0", "portfolio actions"),
     ("core.analysis.top10_selector", "TOP10_SELECTOR_VERSION", "4.23.0",
      "top10 selector"),
     ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.10.0",
@@ -106,6 +106,12 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ("TFB_SHARIAH_SHEET_ID", "", "authority reader workbook override (P0-B)", False),
     ("TFB_SHADOW_PRICE_HONESTY", "1", "scorer excludes stale bars, honest exclusions (P0-C)", True),
     ("TFB_SHADOW_MIN_FRESH_PCT", "60", "challenger fresh-coverage floor (P0-C)", False),
+    ("TFB_COMPLIANCE_SURFACE_GATE", "1", "KSA authority FAIL blocks candidates", True),
+    ("TFB_ELIGIBILITY_GATE", "1", "Nomu + foreign-restricted blocked (operator universe)", True),
+    ("TFB_EXIT_BY_RULE_GATE", "1", "held FAIL names force EXIT-BY-RULE, uncappable", True),
+    ("TFB_SHARIAH_FAIL_LIST", "", "authority FAIL override list (CSV)", False),
+    ("TFB_EXIT_BY_RULE_EXTRA", "", "operator model-screen exits, e.g. BBD.US,NMM.US", False),
+    ("TFB_KSA_FOREIGN_RESTRICTED", "4030.SR", "broker-rejected symbols for the operator", False),
 ]
 
 _ARMED = {"1", "true", "yes", "on"}
@@ -118,7 +124,9 @@ _VALUE_FLAGS = {"TFB_OPP_STOP_VOL_MULT", "TFB_BACKTEST_MIN_DSR",
                 "TRACK_HORIZONS", "TFB_SYNC_NAME_DEDUP_MODE",
                 "TFB_TICKET_MAX_QUOTE_AGE_MIN", "TFB_TICKET_FALLBACK_MAX_AGE_H",
                 "TFB_YC_SYMBOL_SKIP", "TFB_SHARIAH_SHEET_ID",
-                "TFB_SHADOW_MIN_FRESH_PCT"}
+                "TFB_SHADOW_MIN_FRESH_PCT",
+                "TFB_SHARIAH_FAIL_LIST", "TFB_EXIT_BY_RULE_EXTRA",
+                "TFB_KSA_FOREIGN_RESTRICTED"}
 
 # v1.0.3: SCOPE. These live in GitHub workflow env blocks, never in Render, so
 # this script — which reads the LOCAL process environment — structurally
@@ -126,7 +134,9 @@ _VALUE_FLAGS = {"TFB_OPP_STOP_VOL_MULT", "TFB_BACKTEST_MIN_DSR",
 # unconfigured when they were correctly committed to daily_sync.yml. A checker
 # that cannot observe something must say so, not report absence as a finding.
 _WORKFLOW_SCOPED = {"TRACK_HORIZONS", "TFB_SYNC_NAME_DEDUP_MODE",
-                    "TFB_SHADOW_PRICE_HONESTY", "TFB_SHADOW_MIN_FRESH_PCT"}
+                    "TFB_SHADOW_PRICE_HONESTY", "TFB_SHADOW_MIN_FRESH_PCT",
+                "TFB_SHARIAH_FAIL_LIST", "TFB_EXIT_BY_RULE_EXTRA",
+                "TFB_KSA_FOREIGN_RESTRICTED"}
 
 
 def check_modules() -> List[Dict[str, Any]]:
