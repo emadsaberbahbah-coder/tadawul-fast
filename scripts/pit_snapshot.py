@@ -62,7 +62,16 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-__version__ = "1.0.0"
+# v1.0.1 (2026-07-22): HARVEST TICKER-SHAPE GUARD. First live run proved the
+# Top_10 tab's multi-section layout leaks non-symbols into the naive harvest:
+# 11 of 21 "symbols" were section artifacts (FORECAST / COUNT / 413 / SEMPRA
+# ...) sitting under the first Symbol column across later tables — written
+# into the ledger as junk absence rows. Every real decision symbol in this
+# system carries a venue suffix; the harvest now accepts ONLY ticker-shaped
+# tokens (^[A-Z0-9]{1,8}\.[A-Z]{1,4}$). Selftest fixture extended to prove
+# the exact production leak is filtered. One-time operator cleanup: delete
+# the 11 junk rows of 2026-07-22 (bug noise is not evidence).
+__version__ = "1.0.1"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 HEADERS = ["Snapshot Date", "Symbol", "Source Page", "Price", "Market Cap",
@@ -126,10 +135,12 @@ def harvest_symbols(values: List[List[Any]]) -> List[str]:
                     col = i
                     break
             continue
-        v = cells[col] if col < len(cells) else ""
-        if not v or " " in v or v.lower() == "symbol":
+        v = (cells[col] if col < len(cells) else "").upper()
+        # v1.0.1: ticker-shape guard — decision symbols are always
+        # venue-suffixed; section titles, counts, and bare names are not.
+        if not re.match(r"^[A-Z0-9]{1,8}\.[A-Z]{1,4}$", v):
             continue
-        out.append(v.upper())
+        out.append(v)
     seen: set = set()
     return [s for s in out if not (s in seen or seen.add(s))]
 
@@ -379,9 +390,11 @@ def _selftest() -> int:
                    and len(idx) == 2))
     syms = harvest_symbols([["Control", ""], ["Symbol", "Name"],
                             ["EXE.US", "x"], ["Grace note", ""],
-                            ["4030.SR", "y"], ["EXE.US", "again"]])
-    checks.append(("harvest: dedup + label filtering",
-                   syms == ["EXE.US", "4030.SR"]))
+                            ["4030.SR", "y"], ["EXE.US", "again"],
+                            ["FORECAST", ""], ["COUNT", ""], ["413", ""],
+                            ["SEMPRA", ""], ["NAME", ""], ["0939.HK", "cn"]])
+    checks.append(("harvest: dedup + production-leak junk filtered",
+                   syms == ["EXE.US", "4030.SR", "0939.HK"]))
     rows, skipped, missing = build_rows(
         "2026-07-22", ["EXE.US", "4030.SR", "GHOST.XX"],
         [("Market_Leaders", idx)], {("2026-07-22", "4030.SR")})
