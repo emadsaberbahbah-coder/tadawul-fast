@@ -107,7 +107,14 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 #       in the tab untouched but can never count as scored days — repair by
 #       segmentation, never by restatement.
 # Kill-switch: TFB_SHADOW_PRICE_HONESTY=0 restores v1.1.1 behavior exactly.
-SCRIPT_VERSION = "1.2.0"
+# v1.2.1 (2026-07-22): DEF-R — Regret_Summary NameError. `_now_riyadh()` was
+# called by write_regret_summary since v1.1.0 but never defined; the guarded
+# writer swallowed it into `write_errors=Regret_Summary:NameError` on the
+# window's very first scored day (evidence: _Run_Log 2026-07-21 16:05).
+# Scoring, gate, history, and ledger were never affected — the guard did its
+# job. Fix: define the helper (fixed UTC+3, no new imports). One name, one
+# line, verified end-to-end against a stub sheet in the harness.
+SCRIPT_VERSION = "1.2.1"
 TAB_HISTORY = "Shadow_History"
 TAB_GATE = "S1_Gate"
 TAB_REGRET = "Regret_Ledger"
@@ -544,6 +551,12 @@ def append_regret(sh, rows: List[List[Any]]) -> None:
                               cols=len(rg.LEDGER_HEADER))
         ws.update(values=[rg.LEDGER_HEADER], range_name="A1")
     ws.append_rows(rows, value_input_option="RAW")
+
+
+def _now_riyadh() -> str:
+    """Riyadh wall-clock stamp (fixed UTC+3) for the summary header."""
+    return datetime.now(timezone(timedelta(hours=3))).strftime(
+        "%Y-%m-%d %H:%M")
 
 
 def write_regret_summary(sh, summary: Dict[str, Any],
