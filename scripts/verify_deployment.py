@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.9"  # v1.0.9 (2026-07-22): +run_daily_brief 1.13.0 (rulebook filter + tag-tolerant buys), +run_shadow_scorer 1.2.1 (DEF-R _now_riyadh), +pit_snapshot 1.0.1 (harvest ticker-shape guard); # v1.0.8 (2026-07-21 PM): compliance-gate wave — opportunity_builder 1.5.0, +core.analysis.portfolio_actions 1.4.0; FLAGS +TFB_COMPLIANCE_SURFACE_GATE/TFB_ELIGIBILITY_GATE/TFB_EXIT_BY_RULE_GATE (armed kills) +TFB_SHARIAH_FAIL_LIST/TFB_EXIT_BY_RULE_EXTRA/TFB_KSA_FOREIGN_RESTRICTED (value flags); # v1.0.7 (2026-07-21): WINDOW MANIFEST SYNC — the verifier must mirror every live-verified bump or its drift reports are fiction: opportunity_builder 1.4.0 (W-2), run_shadow_scorer 1.2.0 (P0-C), track_performance 6.27.0 (W-1); +core.providers.yahoo_chart_provider 8.10.0 (W-5); SCRIPTS +refresh_shariah_authority 1.1.0, +backup_workbook 1.0.0 (W-4), +pit_snapshot 1.0.0 (W-6); check_scripts gains a __version__ fallback (new scripts use the calendar_sync convention); FLAGS +W-2 freshness family, +scorer honesty pair (workflow-scoped), +TFB_YC_SYMBOL_SKIP, +TFB_SHARIAH_SHEET_ID; v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
+SCRIPT_VERSION = "1.0.9"  # v1.0.9 (2026-07-22): +run_daily_brief 1.13.0 + send_digest 1.2.1 (rulebook on all mail surfaces), +run_shadow_scorer 1.2.1 (DEF-R _now_riyadh), +pit_snapshot 1.0.1 (harvest ticker-shape guard); # v1.0.8 (2026-07-21 PM): compliance-gate wave — opportunity_builder 1.5.0, +core.analysis.portfolio_actions 1.4.0; FLAGS +TFB_COMPLIANCE_SURFACE_GATE/TFB_ELIGIBILITY_GATE/TFB_EXIT_BY_RULE_GATE (armed kills) +TFB_SHARIAH_FAIL_LIST/TFB_EXIT_BY_RULE_EXTRA/TFB_KSA_FOREIGN_RESTRICTED (value flags); # v1.0.7 (2026-07-21): WINDOW MANIFEST SYNC — the verifier must mirror every live-verified bump or its drift reports are fiction: opportunity_builder 1.4.0 (W-2), run_shadow_scorer 1.2.0 (P0-C), track_performance 6.27.0 (W-1); +core.providers.yahoo_chart_provider 8.10.0 (W-5); SCRIPTS +refresh_shariah_authority 1.1.0, +backup_workbook 1.0.0 (W-4), +pit_snapshot 1.0.0 (W-6); check_scripts gains a __version__ fallback (new scripts use the calendar_sync convention); FLAGS +W-2 freshness family, +scorer honesty pair (workflow-scoped), +TFB_YC_SYMBOL_SKIP, +TFB_SHARIAH_SHEET_ID; v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -77,6 +77,7 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("backup_workbook", "1.0.0", "workbook backup"),
     ("pit_snapshot", "1.0.1", "pit snapshot"),
     ("run_daily_brief", "1.13.0", "daily brief"),
+    ("send_digest", "1.2.1", "digest"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)
