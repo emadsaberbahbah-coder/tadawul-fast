@@ -57,6 +57,7 @@ import base64
 import datetime as _dt
 import json
 import os
+import re
 import sys
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -74,7 +75,35 @@ from zoneinfo import ZoneInfo
 #   3. EXPIRE:    past dates are never carried — they die naturally.
 # Fresh provider data always wins; carried rows are visibly marked; the
 # summary line reports carried=/resurrected= for the audit chain.
-__version__ = "1.1.0"
+# v1.1.1 (2026-07-23): TICKER-SHAPE GUARD — the pit_snapshot v1.0.1 lesson,
+# ported. EVIDENCE (2026-07-22 evening audit of the production workbook):
+# Calendar_Events carried section-leak rows in its Symbol column — FORECAST,
+# COUNT, 402, 1298, VERSABANK, … — harvested off the Top_10 cockpit's
+# multi-section layout exactly the way pit_snapshot's first live run proved
+# (11 of 21 "symbols" were artifacts). Two leak paths existed here:
+#   (1) harvest_symbols() filtered only blanks/spaces, so any section title
+#       or bare count under a later Symbol column entered the universe and
+#       burned a per-symbol provider call;
+#   (2) WORSE — parse_prior() accepted ANY symbol holding a future date, so
+#       the v1.1.0 RESURRECT rule made junk rows IMMORTAL: once a leak row
+#       acquired a future date it would be carried forever, surviving every
+#       REPLACE.
+# FIX: every real decision symbol in this system carries a venue suffix
+# (the pit v1.0.1 invariant); both the harvest and the prior-tab reader now
+# accept ONLY ticker-shaped tokens (^[A-Z0-9]{1,8}\.[A-Z]{1,4}$ — verbatim
+# the pit regex, kept identical ON PURPOSE so the two harvesters share one
+# invariant). Existing contamination self-purges on the first run: junk
+# can no longer harvest OR resurrect, and the tab is REPLACE-written, so
+# the 2026-07-22 leak rows die without operator cleanup. Dropped counts are
+# reported (junk_dropped= / prior_junk_purged=) for the audit chain. Note
+# the shape excludes '='/'-' classes (GC=F, BRK-B): futures and unsuffixed
+# share-classes are not calendar decision symbols today; widen the regex in
+# BOTH scripts together if that invariant ever changes. Kill-switch:
+# TFB_CALENDAR_TICKER_GUARD=0 restores v1.1.0 byte-identically (junk
+# passes again). ZERO functions removed; additions: _ticker_guard_enabled,
+# _is_ticker_shaped. Selftest grows 5 -> 9 with the exact production leak
+# fixture.
+__version__ = "1.1.1"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 HEADERS = ["Symbol", "Next Earnings Date", "Days To Earnings",
@@ -87,6 +116,22 @@ def _out(msg: str) -> None:
 
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
+
+
+# v1.1.1: the pit_snapshot v1.0.1 ticker shape — one invariant, two scripts.
+_TICKER_RE = re.compile(r"^[A-Z0-9]{1,8}\.[A-Z]{1,4}$")
+
+
+def _ticker_guard_enabled() -> bool:
+    """v1.1.1 kill-switch — DEFAULT ON. TFB_CALENDAR_TICKER_GUARD=0
+    restores the v1.1.0 unguarded harvest/prior byte-identically."""
+    return (_env("TFB_CALENDAR_TICKER_GUARD", "1") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _is_ticker_shaped(sym: str) -> bool:
+    """True when `sym` matches the venue-suffixed decision-symbol shape."""
+    return bool(_TICKER_RE.match((sym or "").strip().upper()))
 
 
 def _today_riyadh() -> _dt.date:
@@ -146,6 +191,8 @@ def harvest_symbols(values: List[List[Any]]) -> List[str]:
     'Symbol', then collect that column below it. Filters headers repeated in
     body, blanks, and cell values with spaces (labels, notes)."""
     out: List[str] = []
+    dropped: List[str] = []
+    harvest_symbols.last_dropped = dropped  # v1.1.1: telemetry, reset per call
     col: Optional[int] = None
     for row in values or []:
         cells = [str(c or "").strip() for c in row]
@@ -158,7 +205,14 @@ def harvest_symbols(values: List[List[Any]]) -> List[str]:
         v = cells[col] if col < len(cells) else ""
         if not v or " " in v or v.lower() == "symbol":
             continue
+        # v1.1.1: ticker-shape guard — section titles (FORECAST), counts
+        # (402, 1298) and bare names (VERSABANK) are not venue-suffixed;
+        # they never enter the universe or burn a provider call.
+        if _ticker_guard_enabled() and not _is_ticker_shaped(v):
+            dropped.append(v.upper())
+            continue
         out.append(v.upper())
+    harvest_symbols.last_dropped = dropped
     seen: set = set()
     return [s for s in out if not (s in seen or seen.add(s))]
 
@@ -182,9 +236,16 @@ def parse_prior(values: List[List[Any]]) -> Dict[str, Dict[str, str]]:
             break
     if hdr_i < 0 or cs < 0:
         return out
+    parse_prior.junk_purged = 0  # v1.1.1: telemetry, reset per call
     for row in values[hdr_i + 1:]:
         sym = str(row[cs] if cs < len(row) else "").strip().upper()
         if not sym or sym == "SYMBOL":
+            continue
+        # v1.1.1: junk must not be immortal — a leak row holding a future
+        # date would otherwise RESURRECT forever (rule 2). Purged rows die
+        # on this run's REPLACE write.
+        if _ticker_guard_enabled() and not _is_ticker_shaped(sym):
+            parse_prior.junk_purged += 1
             continue
         rec: Dict[str, str] = {}
         for key, cix in (("e", ce), ("x", cx)):
@@ -286,7 +347,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             _out(f"WARN: cannot read page {p}: {e}")
             continue
         got = harvest_symbols(vals)
-        _out(f"page {p}: {len(got)} symbols")
+        _dropped = list(getattr(harvest_symbols, "last_dropped", []) or [])
+        _out(f"page {p}: {len(got)} symbols"
+             + (f" | junk_dropped={len(_dropped)}"
+                f" ({', '.join(_dropped[:6])}{'…' if len(_dropped) > 6 else ''})"
+                if _dropped else ""))
         symbols += [s for s in got if s not in symbols]
     if not symbols:
         _out("ERROR: no symbols harvested — nothing to do")
@@ -318,7 +383,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     rows = build_rows(symbols, ctx, source, carried)
     filled = sum(1 for r in rows if r[1] or r[3])
     _out(f"rows: {len(rows)} | with at least one date: {filled} | "
-         f"carried={n_fill} resurrected={n_res}")
+         f"carried={n_fill} resurrected={n_res} | "
+         f"prior_junk_purged={getattr(parse_prior, 'junk_purged', 0)}")
 
     if not write:
         for r in rows[:15]:
@@ -388,6 +454,46 @@ def _selftest() -> int:
                    by["EXE.US"][6].endswith("+carried")
                    and by["EXE.US"][2] == 6
                    and by["NEW.US"][6] == "eodhd v1.2.0"))
+    # --- v1.1.1: the exact 2026-07-22 production leak, both guard states ---
+    leak_page = [["Rank", "Symbol", "Name"],
+                 ["1", "1050.SR", "BSF"],
+                 ["2", "RCI.US", "Rogers"],
+                 ["", "FORECAST", ""],
+                 ["", "COUNT", ""],
+                 ["", "402", ""],
+                 ["", "1298", ""],
+                 ["", "VERSABANK", ""],
+                 ["3", "0405.HK", "Yuexiu"]]
+    os.environ.pop("TFB_CALENDAR_TICKER_GUARD", None)
+    got_on = harvest_symbols(leak_page)
+    checks.append(("guard ON: leak tokens dropped, real symbols kept",
+                   got_on == ["1050.SR", "RCI.US", "0405.HK"]
+                   and sorted(harvest_symbols.last_dropped)
+                   == ["1298", "402", "COUNT", "FORECAST", "VERSABANK"]))
+    junk_tab = [["Symbol", "Next Earnings Date", "Days To Earnings",
+                 "Next Ex-Div Date", "Days To ExDiv", "Updated At (Riyadh)",
+                 "Source"],
+                ["EXE.US", fut, 6, "", "", "x", "eodhd"],
+                ["FORECAST", fut, 6, "", "", "x", "eodhd"],
+                ["402", fut2, 13, "", "", "x", "eodhd"]]
+    p_on = parse_prior(junk_tab)
+    checks.append(("guard ON: junk never resurrects (immortality cured)",
+                   list(p_on) == ["EXE.US"] and parse_prior.junk_purged == 2))
+    os.environ["TFB_CALENDAR_TICKER_GUARD"] = "0"
+    got_off = harvest_symbols(leak_page)
+    p_off = parse_prior(junk_tab)
+    checks.append(("guard OFF: v1.1.0 verbatim (junk passes both paths)",
+                   "FORECAST" in got_off and "402" in got_off
+                   and "FORECAST" in p_off and "402" in p_off
+                   and parse_prior.junk_purged == 0))
+    os.environ.pop("TFB_CALENDAR_TICKER_GUARD", None)
+    checks.append(("shape edge cases: suffix required, 8+dot+4 bound",
+                   _is_ticker_shaped("1050.SR") and _is_ticker_shaped("0405.HK")
+                   and _is_ticker_shaped("MPHASIS.NS")
+                   and not _is_ticker_shaped("FICO")
+                   and not _is_ticker_shaped("GC=F")
+                   and not _is_ticker_shaped("BRK-B")
+                   and not _is_ticker_shaped("TOOLONGNAME.US")))
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
         print(("PASS " if ok else "FAIL ") + name)
