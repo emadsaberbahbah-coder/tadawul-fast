@@ -691,7 +691,30 @@ from datetime import datetime, timedelta, timezone
 # REMAINS the safety net — this build makes the precise path work and makes
 # any remaining degradation announce itself, never widen silently.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.4.1"
+# -----------------------------------------------------------------------------
+# v1.5.0 (2026-07-21 PM, operator-approved) — COMPLIANCE + ELIGIBILITY GATES
+# WHY: the same morning the operator exited 1050.SR by rule (authority FAIL),
+# the universe surface ranked it #1 INVEST — the rulebook lived beside the
+# decision surfaces, not inside them. And two operator-eligibility facts are
+# now law: he is Nomu-UNQUALIFIED (all 9xxx.SR barred) and foreign-restricted
+# from specific symbols (4030.SR broker-rejected). FIX — two MAJOR gates on
+# every candidate, decision-surface-enforced:
+#   "Shariah (KSA)":     .SR on the official authority FAIL list => blocked
+#                        (AUTHORITY_FAIL). List sources, in order: env
+#                        TFB_SHARIAH_FAIL_LIST (CSV, replaces) else the
+#                        compiled Al-Rajhi Q1-2026 default (12 names,
+#                        as_of 2026-03-31 — refreshed quarterly).
+#   "Eligibility (KSA)": 9xxx.SR => NOMU_BLOCKED; symbols in
+#                        TFB_KSA_FOREIGN_RESTRICTED (default "4030.SR")
+#                        => FOREIGN_RESTRICTED.
+# Globals stay outside these gates by design (official list governs KSA;
+# the model screen governs globals in the Gen-2 layer — the operator's
+# rule). compliance_rule_sets() is the single resolver, imported by
+# portfolio_actions for the held-side EXIT-BY-RULE.
+# Kills: TFB_COMPLIANCE_SURFACE_GATE=0 / TFB_ELIGIBILITY_GATE=0 restore the
+# v1.4.1 gate list byte-for-byte. Guards ship armed.
+# -----------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.5.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1865,6 +1888,45 @@ def _env_freshness_fallback_h():
         return 78.0
 
 
+# v1.5.0: official authority FAIL list — compiled default (Al-Rajhi Q1-2026,
+# as_of 2026-03-31; quarterly refresh via env or the next authority upload).
+_KSA_AUTHORITY_FAIL_DEFAULT = (
+    "1010.SR", "1030.SR", "1050.SR", "1060.SR", "1080.SR", "1180.SR",
+    "4011.SR", "4072.SR", "4280.SR", "8100.SR", "8310.SR", "9642.SR")
+
+
+def _env_csv_set(name, default_csv=""):
+    raw = (os.getenv(name) or default_csv).strip()
+    return {p.strip().upper() for p in raw.split(",") if p.strip()}
+
+
+def _env_compliance_gate():
+    return (os.getenv("TFB_COMPLIANCE_SURFACE_GATE") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _env_eligibility_gate():
+    return (os.getenv("TFB_ELIGIBILITY_GATE") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def compliance_rule_sets():
+    """(authority_fail_set, foreign_restricted_set) — the ONE resolver both
+    decision surfaces share. Env layers: TFB_SHARIAH_FAIL_LIST replaces the
+    compiled default; TFB_EXIT_BY_RULE_EXTRA adds (any venue — the
+    operator's model-screen verdicts for globals live here until the Gen-2
+    wiring); TFB_KSA_FOREIGN_RESTRICTED defaults to 4030.SR."""
+    fail = _env_csv_set("TFB_SHARIAH_FAIL_LIST")
+    if not fail:
+        fail = set(_KSA_AUTHORITY_FAIL_DEFAULT)
+    fail |= _env_csv_set("TFB_EXIT_BY_RULE_EXTRA")
+    restricted = _env_csv_set("TFB_KSA_FOREIGN_RESTRICTED", "4030.SR")
+    return fail, restricted
+
+
+_NOMU_RE = re.compile(r"^9\d{3}\.SR$")
+
+
 _VENUE_CAL_MAP = {
     "SR": "XSAU", "T": "XTKS", "HK": "XHKG", "IS": "XIST", "L": "XLON",
     "AS": "XAMS", "BR": "XBRU", "PA": "XPAR", "DE": "XETR", "F": "XFRA",
@@ -2127,6 +2189,26 @@ def evaluate_gates(cand, criteria, held_symbols=None):
              % (_env_quote_max_age_min(), _env_freshness_fallback_h())))
         fg["freshness_detail"] = f_detail
         g.append(fg)
+
+    # v1.5.0 [COMPLIANCE GATE — KSA]: the rulebook enforced ON the surface.
+    _sym_u = (str(cand.get("symbol") or "").strip().upper())
+    if _env_compliance_gate() and _sym_u.endswith(".SR"):
+        _fail_set, _restr = compliance_rule_sets()
+        _ok_sh = _sym_u not in _fail_set
+        g.append(_gate(
+            "Shariah (KSA)", _ok_sh, FAIL_MAJOR,
+            ("authority pass/uncovered" if _ok_sh else "AUTHORITY_FAIL"),
+            "official authority list — FAIL is a structural block (§4.6)"))
+    # v1.5.0 [ELIGIBILITY GATE — KSA]: the operator's tradable universe.
+    if _env_eligibility_gate() and _sym_u.endswith(".SR"):
+        _f2, _restr2 = compliance_rule_sets()
+        _nomu = bool(_NOMU_RE.match(_sym_u))
+        _ok_el = (not _nomu) and (_sym_u not in _restr2)
+        g.append(_gate(
+            "Eligibility (KSA)", _ok_el, FAIL_MAJOR,
+            ("NOMU_BLOCKED" if _nomu else
+             ("FOREIGN_RESTRICTED" if _sym_u in _restr2 else "eligible")),
+            "Main Market only; foreign-resident tradable set"))
 
     # v1.0.7 [INVESTABILITY-GATE]: enforce the engine's authoritative verdict.
     # normalize_candidate captures investability_status into
