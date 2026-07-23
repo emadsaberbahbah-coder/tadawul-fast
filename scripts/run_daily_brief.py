@@ -36,6 +36,24 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.15.0 — SHADOW ROTATION BOX (operator-requested, 2026-07-23)
+--------------------------------------------------------------------------
+The operator is now live-investing and asked to SEE the Shadow_Board
+switch scanner's top pair daily instead of waiting for the rotation-hurdle
+module. This surfaces exactly that — with the honesty rails welded on:
+the box is labelled UNCALIBRATED · NOT A RECOMMENDATION UNTIL S-1, quotes
+the sheet's own "advisory stamp — drives nothing" stance, and shows the
+shadow run's as-of stamp so a stale scan can't masquerade as fresh.
+Mechanics: Shadow_Board joins ALL_PAGES; _extract_shadow_switch() parses
+the header stamp and the "switch scan" row's JSON pair list (any miss =>
+{} => nothing renders); the renderer is HELD-AWARE — it prefers the top
+pair whose SELL leg is still in the book (the 2026-07-23 case: top pair
+sell 4200.SR was exited that morning, so the box correctly promotes the
+2222.SR pair) and annotates when no pair matches current holdings.
+Kill-switch TFB_BRIEF_SHADOW_ROTATION=0 restores v1.14.1 byte-identically.
+ZERO functions removed; additions: _shadow_rotation_enabled,
+_extract_shadow_switch, _shadow_rotation_html.
+
 v1.14.1 — HOLD-NARRATIVE TRUTH (reason-aware hold copy)
 --------------------------------------------------------------------------
 EVIDENCE (2026-07-23 12:45 sent brief): the hold section carried the fixed
@@ -430,7 +448,7 @@ from __future__ import annotations
 #       ticket from tonight's brief onward. Fix: tag-tolerant detection
 #       (INVEST anywhere in the note's first 60 chars; grace/exit notes
 #       carry no INVEST and remain excluded).
-__version__ = "1.14.1"
+__version__ = "1.15.0"
 
 # v1.12.0 — MARKET-PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
 # WHY (2026-07-16): read_pages_live fetched every page via a hardcoded
@@ -463,7 +481,8 @@ PAGE_TOP10 = "Top_10_Investments"
 PAGE_PORTFOLIO = "My_Portfolio"  # v1.5.0: fetched for position ROI + ratios
 MARKET_PAGES = ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds"]
 PAGE_CALENDAR = "Calendar_Events"  # v1.11.0 (E1): earnings-proximity source
-ALL_PAGES = [PAGE_DECISION, PAGE_TOP10, PAGE_PORTFOLIO] + MARKET_PAGES + [PAGE_CALENDAR]
+PAGE_SHADOW = "Shadow_Board"  # v1.15.0: shadow rotation top pair
+ALL_PAGES = [PAGE_DECISION, PAGE_TOP10, PAGE_PORTFOLIO] + MARKET_PAGES + [PAGE_CALENDAR, PAGE_SHADOW]
 
 VALID_ACTIONS = {"EXIT", "SELL", "TRIM", "REDUCE", "ADD", "BUY", "HOLD"}
 SELL_ACTIONS = {"EXIT", "SELL"}
@@ -1103,6 +1122,87 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
     return {"top": top, "rest": rest}
 
 
+def _shadow_rotation_enabled() -> bool:
+    """v1.15.0 kill-switch — default ON; =0 restores v1.14.1."""
+    return (os.getenv("TFB_BRIEF_SHADOW_ROTATION") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _extract_shadow_switch(rows: List[List[Any]]) -> Dict[str, Any]:
+    """v1.15.0: parse the Shadow_Board header stamp and the 'switch scan'
+    row's JSON pair list. ANY miss returns {} and nothing renders (the
+    v1.7.0 fail-safe convention)."""
+    import json as _json
+    out: Dict[str, Any] = {}
+    for r in _pad(rows):
+        c0 = _s(r[0] if r else "")
+        if not c0:
+            continue
+        if c0.startswith("SHADOW BOARD"):
+            # v1.15.0 fix: the stamp sits in its OWN cell on this row
+            # (["SHADOW BOARD v1.1.3", "as of 2026-07-22 18:51 Riyadh", ...])
+            for _cell in (r or []):
+                m = re.search(r"as of\s+([0-9][0-9:\-\s]*[0-9])", _s(_cell))
+                if m:
+                    out["as_of"] = m.group(1).strip()
+                    break
+        if c0.startswith("switch scan"):
+            blob = _s(r[1] if len(r) > 1 else "")
+            try:
+                pairs = _json.loads(blob)
+            except Exception:
+                return {}
+            good = []
+            for p in pairs if isinstance(pairs, list) else []:
+                try:
+                    good.append({
+                        "sell": _s(p.get("sell")).upper(),
+                        "buy": _s(p.get("buy")).upper(),
+                        "delta_pct": float(p.get("delta_pct")),
+                        "hurdle_pct": float(p.get("hurdle_pct")),
+                    })
+                except Exception:
+                    continue
+            if good:
+                out["pairs"] = good
+    return out if out.get("pairs") else {}
+
+
+def _shadow_rotation_html(model: Dict[str, Any]) -> str:
+    """v1.15.0: the amber shadow-rotation box. Held-aware: prefers the top
+    pair whose SELL leg is still held; annotates when none matches."""
+    if not _shadow_rotation_enabled():
+        return ""
+    sh = model.get("shadow") or {}
+    pairs = sh.get("pairs") or []
+    if not pairs:
+        return ""
+    d = model.get("decision") or {}
+    held = set()
+    for grp in ("sell", "trim", "add", "hold", "verify"):
+        for r in d.get(grp) or []:
+            held.add(_s(r.get("symbol")).upper())
+    pick = None
+    for p in pairs:
+        if p["sell"] in held:
+            pick = p
+            break
+    note = ""
+    if pick is None:
+        pick = pairs[0]
+        note = (' <span style="color:#8C97A3;">(sell leg no longer held '
+                '&mdash; position already exited)</span>')
+    asof = _esc(sh.get("as_of") or "last shadow run")
+    return f"""
+
+  <tr><td style="padding:20px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#8A6D1F; border-bottom:2px solid #C57B1E; padding-bottom:6px;">Shadow rotation <span style="font-family:{SANS}; font-size:11px; color:#B08A3E; letter-spacing:0.5px;">UNCALIBRATED &middot; NOT A RECOMMENDATION UNTIL S-1</span></div></td></tr>
+  <tr><td style="padding:10px 32px 0 32px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FBF6EA; border:1px solid #EBDCC0; border-left:4px solid #C57B1E;"><tr><td style="padding:12px 16px; font-family:{SANS}; font-size:12px; color:#5A4A28; line-height:1.7;">
+      The shadow switch scanner's strongest pair right now: <strong>sell {_esc(pick["sell"])} &rarr; buy {_esc(pick["buy"])}</strong> &mdash; modelled edge <strong>{pick["delta_pct"]:+.1f}%</strong> vs a {pick["hurdle_pct"]:.1f}% cost hurdle{note}. {len(pairs)} pair{"s" if len(pairs) != 1 else ""} scanned &middot; as of {asof}. This engine runs in shadow and <strong>drives nothing</strong> &mdash; its forecast accuracy is unmeasured until the S-1 verdict (&asymp;18&nbsp;Aug); shown for your judgement only.
+    </td></tr></table>
+  </td></tr>
+"""
+
+
 def _extract_top10_funnel(rows: List[List[Any]]) -> Dict[str, Any]:
     """v1.14.0 (F1): parse the opportunity builder's own banner lines off
     the Top_10_Investments sheet — SELECTED count, the DATA GAPS headline
@@ -1446,6 +1546,8 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     calendar = _extract_calendar(pages_data.get(PAGE_CALENDAR, []))
     # v1.14.0 (F1): the builder's own funnel numbers off the Top_10 sheet.
     funnel = _extract_top10_funnel(pages_data.get(PAGE_TOP10, []))
+    # v1.15.0: shadow rotation top pairs off Shadow_Board.
+    shadow = _extract_shadow_switch(pages_data.get(PAGE_SHADOW, []))
     # v1.11.0 (N1-WIRE): news context for the money tickets only.
     _ctx_syms = [r["symbol"] for r in decision["add"]] + \
                 [r["symbol"] for r in decision.get("verify", [])]
@@ -1477,7 +1579,7 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     return {"decision": decision, "top10": top10, "market": market,
             "metrics": metrics, "vintage": vintage,
             "calendar": calendar, "news_ctx": news_ctx,
-            "funnel": funnel}
+            "funnel": funnel, "shadow": shadow}
 
 
 # ----------------------------------------------------------------------------- #
@@ -1985,7 +2087,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     {funnel_html}{opp_rows}{rest_block}
     <div style="font-family:{SANS}; font-size:11px; color:#A09B90; line-height:1.6; padding:8px 2px 0 2px; font-style:italic;">Live brief refreshes the full cross-market list each morning and always excludes names you hold.</div>
   </td></tr>
-
+{_shadow_rotation_html(model)}
   <tr><td style="padding:20px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#46535F; border-bottom:2px solid {HOLD_C}; padding-bottom:6px;">Across your market pages</div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F5F4F0; border:1px solid #E2DDD2;">{page_rows}</table></td></tr>
 
