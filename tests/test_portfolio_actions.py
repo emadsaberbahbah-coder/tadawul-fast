@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """Behavioral suite for portfolio_actions (real opportunity_builder).
 
+v2.2.0 (2026-07-23): + CONFIRM-PERSIST coverage (v1.6.0): the ADD
+confirmation chain survives a process restart via an injected fake Redis
+(deploy-wipe cure), a multi-day gap restarts the chain (strict
+consecutiveness), and the kill-switch generates zero cache traffic.
+
 v2.1.0 (2026-07-23 AM): + Rule 1b-X coverage (v1.5.1 capped-EXIT
 fallthrough — the RCI.US morning-audit gap): a Low-reliability sell-tier
 EXIT that gets confidence-capped no longer swallows a live position-cap
@@ -56,7 +61,8 @@ FAILS = []
 
 _RULE_ENV_KEYS = ("TFB_EXIT_BY_RULE_GATE", "TFB_EXIT_BY_RULE_EXTRA",
                   "TFB_TRIM_BY_RULE_GATE", "TFB_RULE1B_CAPPED_EXIT_GATE",
-                  "TFB_PF_ENABLED", "TFB_PF_ADD_CONFIRM_DAYS")
+                  "TFB_PF_ENABLED", "TFB_PF_ADD_CONFIRM_DAYS",
+                  "TFB_PF_CONFIRM_PERSIST")
 
 
 def ok(name, cond, extra=""):
@@ -102,6 +108,7 @@ def _run_legacy_suite():
     os.environ["TFB_EXIT_BY_RULE_GATE"] = "0"
     os.environ.pop("TFB_EXIT_BY_RULE_EXTRA", None)
     os.environ["TFB_PF_ADD_CONFIRM_DAYS"] = "0"  # pre-v1.1.0 contract
+    os.environ["TFB_PF_CONFIRM_PERSIST"] = "0"   # v1.6.0 cache stays cold
     try:
         # --- 1. clean ADD with sizing + funding ------------------------------
         p = pa.build_portfolio_actions([H("1050.SR")], controls=CTL, fx_rates=FX)
@@ -399,6 +406,75 @@ class TestPortfolioActionsContract(unittest.TestCase):
         self.assertEqual(a["action"], "HOLD")
         self.assertEqual(a["detail"]["capped_from"], "TRIM")
         self.assertIn("capped TRIM -> HOLD", a["action_reason"])
+
+    class _FakeRedis(object):
+        def __init__(self):
+            self.d = {}
+            self.calls = 0
+        def get(self, k):
+            self.calls += 1
+            return self.d.get(k)
+        def set(self, k, v, ex=None):
+            self.calls += 1
+            self.d[k] = v
+        def delete(self, k):
+            self.calls += 1
+            self.d.pop(k, None)
+
+    def _inject_redis(self, fake):
+        pa._CONFIRM_REDIS = fake
+        pa._CONFIRM_REDIS_DEAD = False
+        self.addCleanup(lambda: (setattr(pa, "_CONFIRM_REDIS", None),
+                                 setattr(pa, "_CONFIRM_REDIS_DEAD", False)))
+
+    def test_confirm_persist_deploy_wipe_cured(self):
+        """v1.6.0: yesterday's day-1 chain, read from the durable store by a
+        FRESH process (empty memory), funds today as day 2/2."""
+        import datetime as _d
+        os.environ.pop("TFB_PF_CONFIRM_PERSIST", None)   # default ON
+        os.environ["TFB_EXIT_BY_RULE_GATE"] = "0"
+        pa._ADD_CONFIRM_STORE.clear()
+        fake = self._FakeRedis()
+        yday = (_d.datetime.now(_d.timezone.utc).date()
+                - _d.timedelta(days=1)).isoformat()
+        fake.d["tfb:pf:add_confirm:CP1.SR"] = (
+            '{"count": 1, "date": "%s"}' % yday)
+        self._inject_redis(fake)
+        p = pa.build_portfolio_actions([H("CP1.SR")], controls=CTL,
+                                       fx_rates=FX)
+        a = find(p, "CP1.SR")
+        self.assertEqual(a["action"], "ADD")
+        self.assertIn("ADD confirmed (day 2/2)", a["action_reason"])
+
+    def test_confirm_persist_gap_restarts_chain(self):
+        import datetime as _d
+        os.environ.pop("TFB_PF_CONFIRM_PERSIST", None)
+        os.environ["TFB_EXIT_BY_RULE_GATE"] = "0"
+        pa._ADD_CONFIRM_STORE.clear()
+        fake = self._FakeRedis()
+        old = (_d.datetime.now(_d.timezone.utc).date()
+               - _d.timedelta(days=3)).isoformat()
+        fake.d["tfb:pf:add_confirm:CP2.SR"] = (
+            '{"count": 1, "date": "%s"}' % old)
+        self._inject_redis(fake)
+        p = pa.build_portfolio_actions([H("CP2.SR")], controls=CTL,
+                                       fx_rates=FX)
+        a = find(p, "CP2.SR")
+        self.assertEqual(a["action"], "HOLD")
+        self.assertIn("pending confirmation (day 1/2)", a["action_reason"])
+
+    def test_confirm_persist_kill_switch_cold_cache(self):
+        os.environ["TFB_PF_CONFIRM_PERSIST"] = "0"
+        os.environ["TFB_EXIT_BY_RULE_GATE"] = "0"
+        pa._ADD_CONFIRM_STORE.clear()
+        fake = self._FakeRedis()
+        self._inject_redis(fake)
+        p = pa.build_portfolio_actions([H("CP3.SR")], controls=CTL,
+                                       fx_rates=FX)
+        a = find(p, "CP3.SR")
+        self.assertEqual(a["action"], "HOLD")
+        self.assertIn("day 1/2", a["action_reason"])
+        self.assertEqual(fake.calls, 0)
 
     def test_rule_1bx_capped_exit_falls_through_to_cap_trim(self):
         """v1.5.1 Rule 1b-X (the RCI.US case): sell-tier EXIT capped by Low
