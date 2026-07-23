@@ -7,6 +7,37 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.26.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.27.0 — OLDEST-FIRST WORKLIST (kills the fixed-head refresh starvation)
+--------------------------------------------------------------------------
+EVIDENCE (2026-07-23 morning workbook vs the 07-22 23:10 baseline): the
+01:18 UTC global-markets leg refreshed 1,044 rows — and 783 of them were
+the 07-21 cohort (the rows ALREADY freshest on the page), while the
+week-old 07-16 core of 3,313 rows received exactly FOUR refreshes and
+07-17's 1,254 received ZERO. Root cause is structural, not a failure:
+_read_existing_page_symbols returns the Symbol column in SHEET ORDER
+(only v6.24.2 HEAL-FIRST stubs jump the queue), the fetch loop walks that
+order, and the v6.22.4 TIME-BUDGET stops fetching after ~1,000 symbols —
+so the SAME sheet-head refreshes every run and rows past the budget
+horizon are permanently unreachable. Stale-but-complete beats
+fresh-but-amputated (v6.23.0), but a fixed horizon means the amputation
+line never moves. FIX — one reorder at the read-back convergence point,
+ranked market pages only: _page_symbol_stamps() reads the page's Symbol
+and Last Updated columns (two single-column reads; header located by the
+same scan as the v6.26.0 stamp reader; cells parsed by _parse_stamp_cell,
+so Sheets date serials and text stamps both work) and
+_order_symbols_oldest_first() STABLY sorts the worklist by stamp
+ascending with never-stamped rows FIRST (datetime.min key). Under any
+per-run budget the kept slice is now the STALEST slice, so the page
+round-robins by staleness and fully cycles in ~ceil(rows/budget) runs
+with zero cross-run state. HEAL-FIRST interaction: never-stamped stubs
+still land at the very front; a freshly-stamped-but-still-nameless stub
+can defer one cycle — documented trade, repair beats starvation. Stamp
+read failure or empty map => order untouched (fail-safe). One
+[OLDEST-FIRST] INFO line reports span and unstamped count. Kill:
+TFB_SYNC_OLDEST_FIRST=0 restores the v6.26.0 sheet-order worklist
+byte-identically. ZERO functions removed; additions:
+_oldest_first_enabled, _page_symbol_stamps, _order_symbols_oldest_first.
+
 v6.26.0 — STALE-SKIP ESCALATION + PAGE-VERDICT TELEMETRY
 --------------------------------------------------------------------------
 EVIDENCE (2026-07-22 evening + GitHub run forensics): three scheduled runs
@@ -1163,7 +1194,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.26.0"
+SCRIPT_VERSION = "6.27.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -4955,6 +4986,82 @@ def _page_newest_stamp_age_h(sheets: Any, spreadsheet_id: str,
         return None
 
 
+_OLDEST_FIRST_TAG = "[OLDEST-FIRST v6.27.0]"
+
+
+def _oldest_first_enabled() -> bool:
+    """v6.27.0 kill-switch — DEFAULT ON. TFB_SYNC_OLDEST_FIRST=0 restores
+    the sheet-order worklist byte-identically."""
+    raw = (os.getenv("TFB_SYNC_OLDEST_FIRST", "1") or "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+def _page_symbol_stamps(sheets: Any, spreadsheet_id: str,
+                        sheet_name: str) -> Optional[Dict[str, Any]]:
+    """v6.27.0: {SYMBOL: parsed Last-Updated datetime-or-None} for a page,
+    via two single-column reads (Symbol + stamp), rows aligned by index.
+    Header row located exactly like _page_newest_stamp_age_h. Returns None
+    on ANY failure — an unreadable page must never reorder anything."""
+    try:
+        if sheets is None:
+            return None
+        head = sheets.read_values(spreadsheet_id, sheet_name, "A1:EZ45")
+        if not head:
+            return None
+        hdr_row = -1
+        sym_idx = -1
+        stamp_idx = -1
+        for ri, row in enumerate(head):
+            low = [str(c or "").strip().lower() for c in (row or [])]
+            if "symbol" not in low:
+                continue
+            for ci, cell in enumerate(low):
+                if cell in _STAMP_HEADER_CANDIDATES:
+                    hdr_row = ri
+                    sym_idx = low.index("symbol")
+                    stamp_idx = ci
+                    break
+            if hdr_row >= 0:
+                break
+        if hdr_row < 0 or sym_idx < 0 or stamp_idx < 0:
+            return None
+        s_col = _col_idx_to_a1(sym_idx)
+        t_col = _col_idx_to_a1(stamp_idx)
+        first = hdr_row + 2
+        syms = sheets.read_values(
+            spreadsheet_id, sheet_name, "%s%d:%s" % (s_col, first, s_col))
+        stamps = sheets.read_values(
+            spreadsheet_id, sheet_name, "%s%d:%s" % (t_col, first, t_col))
+        if not syms:
+            return None
+        out: Dict[str, Any] = {}
+        n = len(syms)
+        for i in range(n):
+            raw = syms[i][0] if (syms[i] and len(syms[i])) else ""
+            sym = str(raw or "").strip().upper()
+            if not sym or sym in ("SYMBOL", "TICKER"):
+                continue
+            cell = ""
+            if stamps and i < len(stamps) and stamps[i]:
+                cell = stamps[i][0]
+            if sym not in out:
+                out[sym] = _parse_stamp_cell(cell)
+        return out or None
+    except Exception:
+        return None
+
+
+def _order_symbols_oldest_first(symbols: List[str],
+                                stamps: Dict[str, Any]) -> List[str]:
+    """v6.27.0: STABLE sort of the worklist by stamp ascending; symbols
+    with no parseable stamp sort FIRST (datetime.min) — never-refreshed
+    rows outrank everything. Ties keep the incoming (heal-first-aware)
+    order, so equal-stamp cohorts round-robin deterministically."""
+    _min = datetime.min
+    return sorted(symbols,
+                  key=lambda s: stamps.get(str(s).strip().upper()) or _min)
+
+
 def _apply_stale_skip_escalation(results: List["TaskResult"], sheets: Any,
                                  spreadsheet_id: str) -> None:
     """v6.26.0 post-run pass (see header WHY block). Mutates TaskResult
@@ -5107,6 +5214,27 @@ async def _run_one_task(
                 res.warnings.append(
                     f"{_MARKET_READBACK_TAG} sourced {len(symbols)} symbol(s) from the {task.sheet_name} sheet"
                 )
+                # v6.27.0 [OLDEST-FIRST]: under any per-run budget the kept
+                # slice must be the STALEST slice, not the sheet head (the
+                # 2026-07-23 GM starvation — see the header WHY block).
+                if (_oldest_first_enabled()
+                        and task.sheet_name in _RANKED_MARKET_PAGES):
+                    _stamp_map = _page_symbol_stamps(
+                        sheets, spreadsheet_id, task.sheet_name)
+                    if _stamp_map:
+                        symbols = _order_symbols_oldest_first(
+                            symbols, _stamp_map)
+                        _n_uns = sum(
+                            1 for _s in symbols
+                            if _stamp_map.get(str(_s).strip().upper()) is None)
+                        try:
+                            logger.info(
+                                "%s %s: worklist reordered stalest-first "
+                                "(%d symbols; %d never-stamped lead)",
+                                _OLDEST_FIRST_TAG, task.sheet_name,
+                                len(symbols), _n_uns)
+                        except Exception:
+                            pass
             elif _readback_empty_guard_enabled() and task.expects_rows:
                 # v6.22.2 L4a [READBACK-EMPTY-GUARD]: the sheet IS this page's
                 # symbol source; ZERO usable symbols after a retry means the
