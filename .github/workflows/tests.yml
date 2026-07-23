@@ -86,4 +86,5 @@ jobs:
             tests/test_current_schema_contract.py \
             tests/test_recent_fixes.py \
             tests/test_harness_ic.py \
-            tests/test_scoring_engine_contract.py
+            tests/test_scoring_engine_contract.py \
+            tests/test_data_engine_v2.py
