@@ -309,6 +309,7 @@ None P&L are CORRECT outputs; nothing is upgraded or padded to fill space.
 from __future__ import annotations
 
 import math
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -355,6 +356,37 @@ from datetime import datetime, timedelta, timezone
 # holding stays in its original bucket exactly as v1.2.1.
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
+# v1.6.0 (2026-07-23, operator-approved) — CONFIRM-PERSIST: ADD-CONFIRMATION
+# SURVIVES DEPLOYS (Redis write-through, fail-open)
+# ---------------------------------------------------------------------------
+# EVIDENCE (2026-07-23 morning audit, F-2): 1831.SR and 1150.SR rendered
+# "ADD pending confirmation (day 1/2)" for the SECOND consecutive morning —
+# yesterday's day-1 never became today's day-2 because _ADD_CONFIRM_STORE
+# is process memory and the night's five deploys wiped it. During active
+# development weeks every deploy postpones funding by a day; qualifying
+# ADDs can be starved indefinitely. WHY REDIS: render.yaml already
+# provisions the `tadawul-redis` service and injects REDIS_URL into this
+# web service, so durable state costs zero new infrastructure and zero GAS
+# changes. FIX — write-through persistence inside _apply_add_confirmation,
+# entirely behind TFB_PF_CONFIRM_PERSIST (default ON; =0 restores v1.5.1
+# memory-only byte-identically):
+#   * read-through: a symbol absent from process memory is seeded from
+#     redis key tfb:pf:add_confirm:<SYM> (JSON {"count","date"});
+#   * write-through: every state advance mirrors to redis with a TTL of
+#     _ADD_CONFIRM_PRUNE_DAYS+1 days (self-pruning); non-ADD outcomes
+#     delete the key exactly as they pop memory;
+#   * STRICT CONSECUTIVENESS (correction, same flag): a stored date older
+#     than yesterday restarts the chain at day 1 — persistence makes
+#     multi-day gaps real, and the rendered contract says "signal must
+#     persist N CONSECUTIVE days"; the old +1-after-any-gap behavior
+#     survives only under the kill-switch;
+#   * FAIL-OPEN: the client is lazy, uses 0.5s socket timeouts, and any
+#     redis exception latches _CONFIRM_REDIS_DEAD for the process — one
+#     WARNING, then pure v1.5.1 memory behavior; the cockpit can never
+#     block on the cache. ZERO functions removed; additions:
+# _confirm_persist_enabled, _confirm_redis, _confirm_redis_get,
+# _confirm_redis_put, _confirm_redis_del.
+# ---------------------------------------------------------------------------
 # v1.5.1 (2026-07-23 AM, operator-approved) — RULE 1b-X: CAPPED EXIT FALLS
 # THROUGH TO CAP ENFORCEMENT
 # ---------------------------------------------------------------------------
@@ -426,7 +458,7 @@ from datetime import datetime, timedelta, timezone
 # it, and the reason string names the clause. Kill: TFB_EXIT_BY_RULE_GATE=0
 # restores v1.3.0 decisions byte-for-byte. Ships armed.
 # -----------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.5.1"
+PORTFOLIO_ACTIONS_VERSION = "1.6.0"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -566,6 +598,107 @@ def _env_exit_by_rule_gate():
     """v1.4.0 kill-switch — DEFAULT ON (rule exits ship armed)."""
     return (os.getenv("TFB_EXIT_BY_RULE_GATE") or "1").strip().lower() \
         not in ("0", "false", "off", "no")
+
+
+_CONFIRM_REDIS = None
+_CONFIRM_REDIS_DEAD = False
+_CONFIRM_REDIS_PREFIX = "tfb:pf:add_confirm:"
+
+
+def _confirm_persist_enabled():
+    """v1.6.0 kill-switch — DEFAULT ON. TFB_PF_CONFIRM_PERSIST=0 restores
+    the v1.5.1 memory-only confirmation store byte-identically."""
+    return (os.getenv("TFB_PF_CONFIRM_PERSIST") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _confirm_redis():
+    """Lazy, latched Redis client. None whenever REDIS_URL is absent, the
+    library is missing, or any prior operation failed (fail-open: the
+    cockpit must never block on the cache)."""
+    global _CONFIRM_REDIS, _CONFIRM_REDIS_DEAD
+    if _CONFIRM_REDIS_DEAD:
+        return None
+    if _CONFIRM_REDIS is not None:
+        return _CONFIRM_REDIS
+    url = (os.getenv("REDIS_URL") or "").strip()
+    if not url:
+        _CONFIRM_REDIS_DEAD = True
+        return None
+    try:
+        import redis as _redis_mod  # lazy: keep module import light
+        _CONFIRM_REDIS = _redis_mod.Redis.from_url(
+            url, socket_connect_timeout=0.5, socket_timeout=0.5,
+            decode_responses=True)
+        return _CONFIRM_REDIS
+    except Exception as exc:
+        _CONFIRM_REDIS_DEAD = True
+        try:
+            logger.warning("[CONFIRM-PERSIST v1.6.0] redis unavailable "
+                           "(%s: %s) — memory-only fallback for this "
+                           "process.", type(exc).__name__, exc)
+        except Exception:
+            pass
+        return None
+
+
+def _confirm_redis_get(sym):
+    """-> {"count": int, "date": "YYYY-MM-DD"} | None. Never raises."""
+    global _CONFIRM_REDIS_DEAD
+    cli = _confirm_redis()
+    if cli is None:
+        return None
+    try:
+        raw = cli.get(_CONFIRM_REDIS_PREFIX + sym)
+        if not raw:
+            return None
+        obj = json.loads(raw)
+        cnt = int(obj.get("count") or 0)
+        dte = str(obj.get("date") or "")
+        if cnt > 0 and len(dte) == 10:
+            return {"count": cnt, "date": dte}
+        return None
+    except Exception as exc:
+        _CONFIRM_REDIS_DEAD = True
+        try:
+            logger.warning("[CONFIRM-PERSIST v1.6.0] redis read failed "
+                           "(%s) — memory-only fallback.", exc)
+        except Exception:
+            pass
+        return None
+
+
+def _confirm_redis_put(sym, state):
+    global _CONFIRM_REDIS_DEAD
+    cli = _confirm_redis()
+    if cli is None:
+        return
+    try:
+        cli.set(_CONFIRM_REDIS_PREFIX + sym, json.dumps(state),
+                ex=(_ADD_CONFIRM_PRUNE_DAYS + 1) * 86400)
+    except Exception as exc:
+        _CONFIRM_REDIS_DEAD = True
+        try:
+            logger.warning("[CONFIRM-PERSIST v1.6.0] redis write failed "
+                           "(%s) — memory-only fallback.", exc)
+        except Exception:
+            pass
+
+
+def _confirm_redis_del(sym):
+    global _CONFIRM_REDIS_DEAD
+    cli = _confirm_redis()
+    if cli is None:
+        return
+    try:
+        cli.delete(_CONFIRM_REDIS_PREFIX + sym)
+    except Exception as exc:
+        _CONFIRM_REDIS_DEAD = True
+        try:
+            logger.warning("[CONFIRM-PERSIST v1.6.0] redis delete failed "
+                           "(%s) — memory-only fallback.", exc)
+        except Exception:
+            pass
 
 
 def _env_rule1b_capped_exit_gate():
@@ -1284,18 +1417,37 @@ def _apply_add_confirmation(symbol, action, reason, capped_from, controls):
             # Any non-ADD verdict (HOLD/TRIM/EXIT/BLOCK, including a
             # low-confidence-capped ADD) breaks the consecutive-day chain.
             _ADD_CONFIRM_STORE.pop(sym, None)
+            if _confirm_persist_enabled():
+                _confirm_redis_del(sym)  # v1.6.0: the chain break is durable
             return action, reason, capped_from
         if days <= 1:
             return action, reason, capped_from  # gate off: v1.0.5 verbatim
         today = _add_confirm_today()
         st = _ADD_CONFIRM_STORE.get(sym)
+        _persist = _confirm_persist_enabled()
+        if _persist and st is None:
+            # v1.6.0 read-through: a deploy wiped process memory — the
+            # durable copy carries yesterday's chain across the restart.
+            st = _confirm_redis_get(sym)
         if st is None:
             count = 1
         elif st.get("date") == today:
             count = int(st.get("count") or 1)      # same-day rerun: frozen
+        elif _persist:
+            # v1.6.0 STRICT CONSECUTIVENESS: persistence makes multi-day
+            # gaps real; the contract says CONSECUTIVE days, so only a
+            # yesterday-dated chain advances — anything older restarts.
+            _yday = (datetime.now(timezone.utc).date()
+                     - timedelta(days=1)).isoformat()
+            if str(st.get("date") or "") == _yday:
+                count = int(st.get("count") or 0) + 1
+            else:
+                count = 1
         else:
             count = int(st.get("count") or 0) + 1  # new day: advance
         _ADD_CONFIRM_STORE[sym] = {"count": count, "date": today}
+        if _persist:
+            _confirm_redis_put(sym, {"count": count, "date": today})
         # Hygiene: prune stale entries, then cap oldest-first.
         if len(_ADD_CONFIRM_STORE) > _ADD_CONFIRM_MAX_SYMBOLS:
             cutoff = (datetime.now(timezone.utc)
