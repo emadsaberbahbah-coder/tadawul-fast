@@ -355,6 +355,36 @@ from datetime import datetime, timedelta, timezone
 # holding stays in its original bucket exactly as v1.2.1.
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
+# v1.5.1 (2026-07-23 AM, operator-approved) — RULE 1b-X: CAPPED EXIT FALLS
+# THROUGH TO CAP ENFORCEMENT
+# ---------------------------------------------------------------------------
+# EVIDENCE (2026-07-23 morning audit, RCI.US): overnight the engine flipped
+# RCI to sell-tier REDUCE, so step 3's EXIT branch fired FIRST; reliability
+# had collapsed to 39.2 (band Low) so the low-confidence rule capped the
+# EXIT to HOLD and RETURNED — before step 4 ever ran. Result: a live
+# 17.5% > 15.0% position-cap breach was never evaluated, the holding
+# rendered as a confident HOLD, and the over_position_cap alert counted
+# only 5023.SR. Rule 1b (v1.5.0) could not help because control flow never
+# reached it. WHY THIS IS WRONG: capping a SELL SIGNAL is legitimate
+# (signals can be unreliable); letting that cap also swallow RISK-BUDGET
+# ARITHMETIC is the same category error v1.5.0 fixed one branch lower.
+# FIX — Rule 1b-X, inside the step-3 Low-confidence cap only: when BOTH
+# gates are ON (TFB_TRIM_BY_RULE_GATE parent + TFB_RULE1B_CAPPED_EXIT_GATE
+# extension, each defaulting ON) and a cap-kind breach exists, enforce the
+# LARGEST cap trim as
+#   TRIM | "TRIM-BY-RULE (§4.6): risk-budget breach — <cap reason> — not
+#          confidence-cappable (reliability X); EXIT signal capped by low
+#          confidence: <original exit reason>"
+# capped_from=None (nothing was capped — the risk budget executed; the
+# capped SELL SIGNAL is recorded in the reason for the audit chain). With
+# no breach, the v1.5.0 capped-HOLD string returns verbatim. The two
+# cap-trim expressions moved into _cap_trims(), shared verbatim by step 4
+# and this fallthrough so sizing and reason strings can never diverge
+# (step-4 output proven byte-identical). Kill: TFB_RULE1B_CAPPED_EXIT_GATE
+# =0 restores v1.5.0 byte-identically; parent gate OFF keeps the
+# extension inert by construction. ZERO functions removed; additions:
+# _env_rule1b_capped_exit_gate, _cap_trims.
+# ---------------------------------------------------------------------------
 # v1.5.0 (2026-07-23, operator-delegated) — RULE 1b: TRIM-BY-RULE ON CAP BREACH
 # ---------------------------------------------------------------------------
 # EVIDENCE (2026-07-22 evening audit): 5023.SR sat at 28.6% of book against
@@ -396,7 +426,7 @@ from datetime import datetime, timedelta, timezone
 # it, and the reason string names the clause. Kill: TFB_EXIT_BY_RULE_GATE=0
 # restores v1.3.0 decisions byte-for-byte. Ships armed.
 # -----------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.5.0"
+PORTFOLIO_ACTIONS_VERSION = "1.5.1"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -536,6 +566,34 @@ def _env_exit_by_rule_gate():
     """v1.4.0 kill-switch — DEFAULT ON (rule exits ship armed)."""
     return (os.getenv("TFB_EXIT_BY_RULE_GATE") or "1").strip().lower() \
         not in ("0", "false", "off", "no")
+
+
+def _env_rule1b_capped_exit_gate():
+    """v1.5.1 Rule 1b-X kill-switch — DEFAULT ON. TFB_RULE1B_CAPPED_EXIT_
+    GATE=0 restores the v1.5.0 capped-EXIT-returns-HOLD behavior
+    byte-identically. Inert unless the parent Rule 1b gate is also ON."""
+    return (os.getenv("TFB_RULE1B_CAPPED_EXIT_GATE") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _cap_trims(mv, weight_pct, sector_weight_pct, sector_excess_share_sar,
+               controls):
+    """v1.5.1: the two RISK-BUDGET (cap-kind) trims, shared VERBATIM by
+    step 4 and the Rule 1b-X capped-EXIT fallthrough so sizing and reason
+    strings can never diverge between the two call sites."""
+    out = []
+    cap_pct = controls["max_position_pct"]
+    if weight_pct is not None and weight_pct > cap_pct and mv:
+        target_mv = mv * (cap_pct / weight_pct)
+        out.append((mv - target_mv,
+                    "Position %.1f%% > Max Position %.1f%% — trim to cap"
+                    % (weight_pct, cap_pct), "cap"))
+    if sector_excess_share_sar and sector_excess_share_sar > 0:
+        out.append((sector_excess_share_sar,
+                    "Sector %.1f%% > Max Sector %.1f%% — pro-rata trim"
+                    % (sector_weight_pct or 0.0,
+                       controls["max_sector_pct"]), "cap"))
+    return out
 
 
 def _env_trim_by_rule_gate():
@@ -1389,6 +1447,23 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
         exit_reason = "Engine recommendation '%s' is sell-tier" % reco
     if exit_reason:
         if conf == "Low":  # 2. low-confidence cap
+            # 3b. Rule 1b-X (v1.5.1): a capped EXIT must not also swallow
+            #     the risk budget (the 2026-07-23 RCI.US lesson — see the
+            #     header WHY block). Both gates required; no breach means
+            #     the v1.5.0 capped-HOLD string below returns verbatim.
+            if _env_trim_by_rule_gate() and _env_rule1b_capped_exit_gate():
+                _ct = _cap_trims(mv, weight_pct, sector_weight_pct,
+                                 sector_excess_share_sar, controls)
+                if _ct:
+                    _ct.sort(key=lambda t: -t[0])
+                    _p_rule, _r_rule, _k_rule = _ct[0]
+                    return (ACTION_TRIM,
+                            "TRIM-BY-RULE (\u00a74.6): risk-budget breach "
+                            "\u2014 %s \u2014 not confidence-cappable "
+                            "(reliability %s); EXIT signal capped by low "
+                            "confidence: %s"
+                            % (_r_rule, _fmt(rel), exit_reason),
+                            round(_p_rule, 0), None)
             return (ACTION_HOLD,
                     "Low confidence (reliability %s) capped EXIT -> HOLD: %s"
                     % (_fmt(rel), exit_reason), 0.0, ACTION_EXIT)
@@ -1397,18 +1472,10 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
     # 4. TRIM — largest of position-cap / sector-cap / valuation trims.
     #    v1.5.0: each trim carries its KIND ("cap" = risk-budget breach,
     #    "valuation" = signal-driven) so Rule 1b below can tell them apart.
-    trims = []
-    cap_pct = controls["max_position_pct"]
-    if weight_pct is not None and weight_pct > cap_pct and mv:
-        target_mv = mv * (cap_pct / weight_pct)
-        trims.append((mv - target_mv,
-                      "Position %.1f%% > Max Position %.1f%% — trim to cap"
-                      % (weight_pct, cap_pct), "cap"))
-    if sector_excess_share_sar and sector_excess_share_sar > 0:
-        trims.append((sector_excess_share_sar,
-                      "Sector %.1f%% > Max Sector %.1f%% — pro-rata trim"
-                      % (sector_weight_pct or 0.0,
-                         controls["max_sector_pct"]), "cap"))
+    # v1.5.1: cap-kind trims now come from _cap_trims() — shared verbatim
+    # with the Rule 1b-X fallthrough above; output proven byte-identical.
+    trims = _cap_trims(mv, weight_pct, sector_weight_pct,
+                       sector_excess_share_sar, controls)
     if (roi is not None and roi <= controls["trim_roi_pct"] and mv
             and not vf_conflict):
         trims.append((mv * controls["valuation_trim_frac"],
@@ -1429,9 +1496,11 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
             #     trim is always sized on a fresh quote. Valuation trims
             #     stay cappable. Kill: TFB_TRIM_BY_RULE_GATE=0 -> v1.4.0.
             if _env_trim_by_rule_gate():
-                _cap_trims = [t for t in trims if t[2] == "cap"]
-                if _cap_trims:
-                    _p_rule, _r_rule, _k_rule = _cap_trims[0]
+                # v1.5.1: local renamed _cap_trims -> _cap_only (the module
+                # helper _cap_trims() now owns that name); behavior verbatim.
+                _cap_only = [t for t in trims if t[2] == "cap"]
+                if _cap_only:
+                    _p_rule, _r_rule, _k_rule = _cap_only[0]
                     return (ACTION_TRIM,
                             "TRIM-BY-RULE (\u00a74.6): risk-budget breach "
                             "\u2014 %s \u2014 not confidence-cappable "
