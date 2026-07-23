@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """Behavioral suite for portfolio_actions (real opportunity_builder).
 
+v2.1.0 (2026-07-23 AM): + Rule 1b-X coverage (v1.5.1 capped-EXIT
+fallthrough — the RCI.US morning-audit gap): a Low-reliability sell-tier
+EXIT that gets confidence-capped no longer swallows a live position-cap
+breach; with no breach the capped-HOLD contract is byte-identical.
+
 v2.0.0 (2026-07-23) — HERMETIC REFRESH + RULE 1a/1b COVERAGE
 --------------------------------------------------------------------------
 WHY: this file was broken AT HEAD and nobody could see it. The t1 "clean
@@ -50,8 +55,8 @@ from core.analysis import portfolio_actions as pa
 FAILS = []
 
 _RULE_ENV_KEYS = ("TFB_EXIT_BY_RULE_GATE", "TFB_EXIT_BY_RULE_EXTRA",
-                  "TFB_TRIM_BY_RULE_GATE", "TFB_PF_ENABLED",
-                  "TFB_PF_ADD_CONFIRM_DAYS")
+                  "TFB_TRIM_BY_RULE_GATE", "TFB_RULE1B_CAPPED_EXIT_GATE",
+                  "TFB_PF_ENABLED", "TFB_PF_ADD_CONFIRM_DAYS")
 
 
 def ok(name, cond, extra=""):
@@ -394,6 +399,40 @@ class TestPortfolioActionsContract(unittest.TestCase):
         self.assertEqual(a["action"], "HOLD")
         self.assertEqual(a["detail"]["capped_from"], "TRIM")
         self.assertIn("capped TRIM -> HOLD", a["action_reason"])
+
+    def test_rule_1bx_capped_exit_falls_through_to_cap_trim(self):
+        """v1.5.1 Rule 1b-X (the RCI.US case): sell-tier EXIT capped by Low
+        reliability must still enforce a live position-cap breach as
+        TRIM-BY-RULE, with the capped EXIT signal recorded in the reason."""
+        os.environ.pop("TFB_TRIM_BY_RULE_GATE", None)        # parent ON
+        os.environ.pop("TFB_RULE1B_CAPPED_EXIT_GATE", None)  # ext ON
+        ctl = dict(CTL)
+        ctl["cash_available_sar"] = 29183   # mv 6180 => weight ~17.5%
+        h = H("RCIX.SR", qty=100, price=61.8, cost=67.0, iv=64.0,
+              rel=39.2, reco="REDUCE")
+        p = pa.build_portfolio_actions([h], controls=ctl, fx_rates=FX)
+        a = find(p, "RCIX.SR")
+        self.assertEqual(a["action"], "TRIM")
+        self.assertIn("TRIM-BY-RULE", a["action_reason"])
+        self.assertIn("EXIT signal capped by low confidence",
+                      a["action_reason"])
+        self.assertIn("REDUCE", a["action_reason"])
+        self.assertIsNone(a["detail"]["capped_from"])
+        total = 6180.0 + 29183.0
+        self.assertAlmostEqual(a["proceeds_sar"],
+                               round(6180.0 - 0.15 * total), delta=1)
+
+    def test_rule_1bx_kill_switch_restores_v150(self):
+        os.environ["TFB_RULE1B_CAPPED_EXIT_GATE"] = "0"
+        ctl = dict(CTL)
+        ctl["cash_available_sar"] = 29183
+        h = H("RCIX.SR", qty=100, price=61.8, cost=67.0, iv=64.0,
+              rel=39.2, reco="REDUCE")
+        p = pa.build_portfolio_actions([h], controls=ctl, fx_rates=FX)
+        a = find(p, "RCIX.SR")
+        self.assertEqual(a["action"], "HOLD")
+        self.assertEqual(a["detail"]["capped_from"], "EXIT")
+        self.assertIn("capped EXIT -> HOLD", a["action_reason"])
 
     def test_rule_1b_valuation_trim_still_cappable(self):
         os.environ.pop("TFB_TRIM_BY_RULE_GATE", None)      # gate ON
