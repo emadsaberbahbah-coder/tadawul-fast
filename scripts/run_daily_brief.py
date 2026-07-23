@@ -36,6 +36,28 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.14.1 — HOLD-NARRATIVE TRUTH (reason-aware hold copy)
+--------------------------------------------------------------------------
+EVIDENCE (2026-07-23 12:45 sent brief): the hold section carried the fixed
+v1.13-era narrative — chip "DATA TOO WEAK TO ACT", intro "The engine leans
+bearish on most of these, but their data reliability is too low to act on"
+and the Book-snapshot claim "held only because the data is too weak to
+act" — while NONE of the day's four holds matched it: three were BULLISH
+ADD-pending-confirmation rows (1831/1321/1150, engine +31..35%) and one
+was the v1.0.5 VF-conflict guard on 2222.SR at reliability 87. The blanket
+copy told the operator the opposite of his own decision layer. FIX: the
+hold chip, intro and Book-snapshot phrase are now COMPOSED from the actual
+mix of hold reasons (_hold_mix classifies each note: ADD-pending /
+conflict-guard / reliability-capped / other) — e.g. "2 awaiting ADD
+confirmation (bullish — day-2 funds them) · 1 under the valuation/forecast
+conflict guard (manual review) · 1 capped by low reliability." When EVERY
+hold is a reliability cap (or there are none), all three strings are
+emitted byte-for-byte v1.14.0 — the legacy narrative was written for
+exactly that case and remains correct there. Kill-switch
+TFB_BRIEF_HOLD_NARRATIVE_V2=0 restores v1.14.0 verbatim. ZERO functions
+removed; additions: _hold_narrative_enabled, _hold_mix, _hold_section_copy,
+_book_snapshot_hold_phrase.
+
 v1.14.0 — WHY-ZERO FUNNEL + FRESH-SHARE DEGRADATION + EARNINGS ON EXITS/TRIMS
 --------------------------------------------------------------------------
 EVIDENCE (2026-07-22 evening audit of the sent 23:15 brief + workbook
@@ -408,7 +430,7 @@ from __future__ import annotations
 #       ticket from tonight's brief onward. Fix: tag-tolerant detection
 #       (INVEST anywhere in the note's first 60 chars; grace/exit notes
 #       carry no INVEST and remain excluded).
-__version__ = "1.14.0"
+__version__ = "1.14.1"
 
 # v1.12.0 — MARKET-PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
 # WHY (2026-07-16): read_pages_live fetched every page via a hardcoded
@@ -1869,6 +1891,8 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
   </td></tr>""" if d.get("verify") else "")
 
     hold_rows = "".join(_hold_row(r) for r in d["hold"])
+    # v1.14.1: hold copy composed from the actual reason mix.
+    hold_chip, hold_intro = _hold_section_copy(d)
 
     # ---- opportunities ----
     # v1.9.0: judge FV saturation on EVERYTHING shown (top + rest), once.
@@ -1938,7 +1962,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
   <tr><td style="padding:18px 32px 4px 32px;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6F4EF; border:1px solid #E6E1D6;"><tr><td style="padding:14px 18px; font-family:{SANS}; font-size:13px; color:#3A3A3A; line-height:1.7;">
-      <strong style="font-family:{SERIF}; font-size:14px;">Book snapshot.</strong> {len(d['sell'])+len(d['trim'])+len(d['add'])+len(d['hold'])+len(d.get('verify') or [])} holdings · <strong style="color:{SELL_C};">{_pct(d['pl_pct'])}</strong> overall ({_money(d['mv'])} vs {_money(d['cost'])}&nbsp;SAR). {len(d['hold'])} positions are <em>held only because the data is too weak to act</em> — not comfort holds. {_concentration(d)}
+      <strong style="font-family:{SERIF}; font-size:14px;">Book snapshot.</strong> {len(d['sell'])+len(d['trim'])+len(d['add'])+len(d['hold'])+len(d.get('verify') or [])} holdings · <strong style="color:{SELL_C};">{_pct(d['pl_pct'])}</strong> overall ({_money(d['mv'])} vs {_money(d['cost'])}&nbsp;SAR). {_book_snapshot_hold_phrase(d)} {_concentration(d)}
     </td></tr></table>
   </td></tr>
 
@@ -1949,9 +1973,9 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
 
 {verify_block}
 
-  <tr><td style="padding:18px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#46535F; border-bottom:2px solid {HOLD_C}; padding-bottom:6px;">Hold &mdash; no action <span style="font-family:{SANS}; font-size:11px; color:#8C97A3; letter-spacing:0.5px;">DATA TOO WEAK TO ACT</span></div></td></tr>
+  <tr><td style="padding:18px 32px 0 32px;"><div style="font-family:{SERIF}; font-size:16px; color:#46535F; border-bottom:2px solid {HOLD_C}; padding-bottom:6px;">Hold &mdash; no action <span style="font-family:{SANS}; font-size:11px; color:#8C97A3; letter-spacing:0.5px;">{hold_chip}</span></div></td></tr>
   <tr><td style="padding:10px 32px 0 32px;">
-    <div style="font-family:{SANS}; font-size:12px; color:#555; line-height:1.6; margin-bottom:9px;">The engine leans bearish on most of these, but their data reliability is too low to act on — so they're capped to hold. Verify before any move.</div>
+    <div style="font-family:{SANS}; font-size:12px; color:#555; line-height:1.6; margin-bottom:9px;">{hold_intro}</div>
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F0F2F4; border:1px solid #DDE2E7;">{hold_rows}</table>
   </td></tr>
 
@@ -2016,6 +2040,83 @@ def _add_reason(r: Dict[str, Any]) -> str:
     sh = f'{r.get("shares")} shares ' if r.get("shares") else ""
     return (f'Add <strong>{sh}(~{_money(r["sar"])} SAR)</strong> from the freed cash. '
             f'Reliability {_num_str(r["rel"])}, room in the book. Engine 12M {_pct(r["eroi"],0)}.')
+
+
+def _hold_narrative_enabled() -> bool:
+    """v1.14.1 kill-switch — default ON; =0 restores v1.14.0."""
+    return (os.getenv("TFB_BRIEF_HOLD_NARRATIVE_V2") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+_LEGACY_HOLD_CHIP = "DATA TOO WEAK TO ACT"
+_LEGACY_HOLD_INTRO = ("The engine leans bearish on most of these, but their "
+                      "data reliability is too low to act on — so they're "
+                      "capped to hold. Verify before any move.")
+
+
+def _hold_mix(d: Dict[str, Any]) -> Dict[str, int]:
+    """v1.14.1: classify each hold row by its own note. Buckets: pending
+    (ADD awaiting day-2), conflict (VF-conflict guard), capped (low-
+    reliability cap), other."""
+    mix = {"pending": 0, "conflict": 0, "capped": 0, "other": 0}
+    for r in d.get("hold") or []:
+        note = str(r.get("note") or "").lower()
+        if "pending confirmation" in note:
+            mix["pending"] += 1
+        elif "conflict" in note:
+            mix["conflict"] += 1
+        elif "capped" in note or "low confidence" in note:
+            mix["capped"] += 1
+        else:
+            mix["other"] += 1
+    return mix
+
+
+def _hold_section_copy(d: Dict[str, Any]) -> Tuple[str, str]:
+    """v1.14.1: (chip, intro) for the hold section. Legacy strings verbatim
+    when the mix is all-capped/empty or the kill-switch is off."""
+    mix = _hold_mix(d)
+    total = sum(mix.values())
+    if (not _hold_narrative_enabled()) or total == 0 \
+            or mix["capped"] == total:
+        return _LEGACY_HOLD_CHIP, _LEGACY_HOLD_INTRO
+    parts = []
+    if mix["pending"]:
+        parts.append("%d awaiting ADD confirmation (bullish — a second "
+                     "qualifying day funds them)" % mix["pending"])
+    if mix["conflict"]:
+        parts.append("%d under the valuation/forecast conflict guard "
+                     "(manual review)" % mix["conflict"])
+    if mix["capped"]:
+        parts.append("%d capped by low reliability" % mix["capped"])
+    if mix["other"]:
+        parts.append("%d holding for the reason on its row" % mix["other"])
+    intro = ("Each name is held for its own stated reason: "
+             + " · ".join(parts)
+             + ". Nothing here is a bearish call unless its note says so.")
+    return "MIXED REASONS — SEE NOTES", intro
+
+
+def _book_snapshot_hold_phrase(d: Dict[str, Any]) -> str:
+    """v1.14.1: the Book-snapshot hold clause, reason-aware. Legacy
+    sentence verbatim for the all-capped/empty case or kill-switch off."""
+    mix = _hold_mix(d)
+    total = sum(mix.values())
+    legacy = ("%d positions are <em>held only because the data is too weak "
+              "to act</em> — not comfort holds." % len(d.get("hold") or []))
+    if (not _hold_narrative_enabled()) or total == 0 \
+            or mix["capped"] == total:
+        return legacy
+    bits = []
+    if mix["pending"]:
+        bits.append("%d awaiting ADD confirmation" % mix["pending"])
+    if mix["conflict"]:
+        bits.append("%d conflict-guarded" % mix["conflict"])
+    if mix["capped"]:
+        bits.append("%d reliability-capped" % mix["capped"])
+    if mix["other"]:
+        bits.append("%d per their notes" % mix["other"])
+    return ("%d positions are on hold for stated reasons — %s — not "
+            "comfort holds." % (total, ", ".join(bits)))
 
 
 def _hold_row(r: Dict[str, Any]) -> str:
