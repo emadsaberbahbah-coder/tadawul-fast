@@ -55,9 +55,54 @@ on:
         default: false
         type: boolean
 
+# ============================================================================
+# CONCURRENCY — SINGLE WRITE LEASE ON THE PRODUCTION WORKBOOK
+# ============================================================================
+# WHY (2026-07-24, [VBREAK] window fix — evidence integrity):
+#   The group key previously included ${{ github.event_name }}. Because a cron
+#   fire reports event_name="schedule" and an operator run reports
+#   "workflow_dispatch", the two occupied DIFFERENT concurrency groups and were
+#   therefore ALLOWED TO RUN AT THE SAME TIME — both holding write access to the
+#   same production workbook, interleaving writes on the same tabs.
+#
+#   That is a chimeric-write path requiring NO human error and NO bad commit;
+#   only a timing coincidence between the 4-hourly cron and a manual dispatch
+#   during an audit session. Chimeric writes are the exact failure class behind
+#   the original contamination crisis, and under Gate & Evidence Register §5 a
+#   chimeric write reaching the shadow board is a TAINTED day -> window RESTART
+#   (~4 weeks of evidence lost).
+#
+#   FIX 1 — event_name dropped: every write-capable trigger (push, schedule,
+#   workflow_dispatch, pull_request) now shares ONE lease per ref. At most one
+#   run holds the workbook at any instant.
+#
+#   FIX 2 — cancel-in-progress: true -> false: a newly triggered run must WAIT
+#   for the in-flight writer to finish rather than killing it. Cancelling a
+#   sync mid-write would abandon the workbook in a partially-written state,
+#   which is the same disease this block exists to cure. Waiting is correct;
+#   pre-empting is not.
+#
+# ACCEPTED COSTS (stated, not hidden):
+#   (a) A push now queues behind a running sync, delaying CI feedback by up to
+#       the sync's timeout-minutes: 115. This is removed by the standalone
+#       ci.yml (Part 2), which gets its own concurrency group.
+#   (b) GitHub holds at most one pending run per group; a third trigger
+#       supersedes the pending one. A scheduled sync can therefore be skipped
+#       if a long manual run is holding the lease. This is bounded and
+#       recoverable: sync-dashboard is capped at timeout-minutes: 115 while
+#       cron fires every 240 minutes, so the lease is always released well
+#       before the next scheduled fire. A skipped sync is visible in the
+#       Actions tab and self-heals on the next run; a chimeric write is
+#       neither visible nor reversible. The trade is deliberate.
+#
+# ROLLBACK: restore the two lines below to
+#   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+#   cancel-in-progress: true
+# No redeploy, no ENV change, no code path involved.
+# ============================================================================
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
