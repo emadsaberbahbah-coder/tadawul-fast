@@ -4,6 +4,26 @@ name: "🕶️ TFB Shadow Board"
 # Wave S deliverable #10b (Master Plan v2.1 §3/§15). Writes the Shadow_Board
 # tab from the CHAMPION's own workbook outputs, twice daily + on dispatch.
 # Gate env is job-scoped here — independent of Render's flag set.
+#
+# ============================================================================
+# v1.2.0 (2026-07-24) — [VBREAK] WINDOW HARDENING. Config only: no Python
+# touched, no schedule moved, no decision behaviour changed.
+#   1. CONCURRENCY: this file previously had NO concurrency block at all. Two
+#      daily crons (05:10 / 14:10 UTC) plus dispatch could hold the workbook
+#      simultaneously and interleave writes into Shadow_History — S-1 evidence.
+#      A chimeric write reaching the shadow board is a TAINTED day under Gate &
+#      Evidence Register §5 -> window RESTART.
+#   2. BRANCH PIN: `workflow_dispatch` can be fired from ANY branch, and repo
+#      secrets + vars are available to all of them. An unreviewed branch could
+#      therefore write real evidence with production credentials. checkout is
+#      now pinned to main.
+#   3. DRY-RUN BY DEFAULT on manual dispatch. An append-only evidence system
+#      should preview, not write, when a human clicks the button by hand.
+#      SCHEDULED RUNS STILL WRITE — see the WHY on the run step, this is the
+#      one place where a plausible-looking "fix" silently kills the archive.
+#   4. Credential file mode 600.
+# ROLLBACK: each item is independently removable; none depends on another.
+# ============================================================================
 
 on:
   schedule:
@@ -12,8 +32,34 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "true = print only, write nothing"
-        default: "false"
+        description: "Preview only (true = print, write nothing)"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+# ============================================================================
+# CONCURRENCY — SINGLE WRITE LEASE (v1.2.0)
+# ============================================================================
+# LITERAL group: one lease per workflow, unescapable by branch (github.ref) or
+# trigger type (github.event_name) — the two escape hatches found and closed in
+# daily_sync.yml on the same date.
+#
+# cancel-in-progress: false — a second run WAITS. Cancelling a board build
+# mid-write would abandon Shadow_History partially written, which is the same
+# disease this block exists to cure.
+#
+# DELIBERATELY NOT a cross-workflow lease. Sharing one group with daily_sync.yml
+# would serialise against a writer capped at 115 minutes that fires 4-hourly.
+# GitHub holds at most ONE pending run per group, so a third trigger supersedes
+# the pending one — under a shared lease the 14:10 UTC (17:10 Riyadh) board run,
+# which is the S-1-critical half of the daily pair, could be SKIPPED rather than
+# merely delayed. That trade needs daily_sync's real median runtime, which is not
+# yet measured. Registered, not guessed.
+# ============================================================================
+concurrency:
+  group: tfb-shadow-board
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -28,7 +74,15 @@ jobs:
       TFB_SHADOW_EQUITY_SAR: ${{ vars.TFB_SHADOW_EQUITY_SAR }}
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
     steps:
+      # v1.2.0: pinned to main. A dispatch from any other branch would otherwise
+      # run unreviewed code against the production workbook with production
+      # credentials. persist-credentials: false keeps the GITHUB_TOKEN out of
+      # the on-disk git config for the rest of the job.
       - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
 
       - uses: actions/setup-python@v6
         with:
@@ -43,6 +97,7 @@ jobs:
           SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
         run: |
           set -euo pipefail
+          umask 077
           CREDS_PATH="$RUNNER_TEMP/gcreds.json"
           if [[ -n "${SECRET_CREDS:-}" ]]; then
             printf '%s' "$SECRET_CREDS" > "$CREDS_PATH"
@@ -51,11 +106,24 @@ jobs:
           else
             echo "::error::No Google credentials secret present."; exit 1
           fi
+          chmod 600 "$CREDS_PATH"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
 
       - name: Run shadow board
+        env:
+          # v1.2.0: the input is read through the environment instead of being
+          # interpolated straight into the shell line.
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
+          # WHY THE DEFAULT IS WRITE, NOT DRY-RUN — READ BEFORE EDITING:
+          # On a SCHEDULED run there is no dispatch input, so INPUT_DRY_RUN is
+          # EMPTY. The obvious-looking idiom "${INPUT_DRY_RUN:-true}" would
+          # substitute "true" for that empty value and turn BOTH daily scheduled
+          # runs into dry-runs — silently ending Shadow_History collection with
+          # every workflow still green. Only an explicit "true" from a human
+          # dispatch may suppress the write.
           EXTRA=""
-          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then EXTRA="--dry-run"; fi
+          if [[ "${INPUT_DRY_RUN:-}" == "true" ]]; then EXTRA="--dry-run"; fi
+          echo "dry_run input='${INPUT_DRY_RUN:-<scheduled: none>}' -> args='${EXTRA:-<write>}'"
           python scripts/run_shadow_board.py $EXTRA
