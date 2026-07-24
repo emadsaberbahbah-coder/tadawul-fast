@@ -28,6 +28,17 @@ USAGE:
   python3 scripts/verify_deployment.py              # versions + flags
   python3 scripts/verify_deployment.py --selftests  # also run selftests
   python3 scripts/verify_deployment.py --json       # machine-readable
+  python3 scripts/verify_deployment.py --strict     # DRIFT exits 2 (v1.0.15+)
+
+EXIT CODES
+  Default (v1.0.14-compatible):  FAIL -> 1,  everything else -> 0
+  With --strict:                 CLEAN -> 0,  DRIFT -> 2,  FAIL -> 1
+
+SCOPE OF "CLEAN"
+  CLEAN describes the Render process this shell can see. Four flags are
+  workflow-scoped (set in .github/workflows/daily_sync.yml) and are reported
+  but deliberately excluded from the verdict — they are not observable here.
+  CLEAN therefore means "the Render side is clean", not "the deployment is".
 """
 
 from __future__ import annotations
@@ -43,7 +54,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.14"  # v1.0.14 (2026-07-24) — MY BUG, caught by its own first live run: _range_violation was fed the RESOLVED value (env or code default), so an UNSET TFB_OPP_MAX_CANDIDATES resolved to its legitimate default 0 ("no clamp") and printed OUT OF RANGE, forcing a permanent false DRIFT. A verifier that cries wolf is worse than none. The range check now sees the RAW env only: unset => code default governs => no violation, exactly as the v1.0.13 docstring promised. # v1.0.13 (2026-07-24) — MY OWN BUG, caught in review: the v1.0.8/1.0.11 edits appended the new value flags with a str.replace anchored on a token that ends BOTH _VALUE_FLAGS and _WORKFLOW_SCOPED, so seven RENDER-scoped flags (the three rule lists + the four numeric budgets) were silently filed as workflow-only and printed "GH-ENV — NOT visible from this shell" instead of being read from the live process. That is the exact class of fiction this verifier exists to prevent — and it is why TFB_EXIT_BY_RULE_EXTRA looked workflow-scoped on 2026-07-22. _WORKFLOW_SCOPED is now the genuine four. ALSO: numeric budgets are range-checked (a value outside its safe band is DRIFT, not "SET"); TFB_OPP_BUILD_OFFLOOP + TFB_ADV_ENGINE_CALL_TIMEOUT are marked protection-expected-armed so CLEAN can never print over a disabled 502 guard; route pin 4.12.0->4.13.0. # v1.0.12 (2026-07-24): routes.advanced_analysis 4.11.0->4.12.0 (off-loop opportunity build); FLAGS +TFB_OPP_BUILD_OFFLOOP/_S. # v1.0.11 (2026-07-24, external-review catches): +routes.advanced_analysis 4.11.0 pinned (the layer that owns the edge-timeout guard was unverifiable); TFB_OPP_MAX_CANDIDATES + TFB_OPP_AUDIT_ROWS_MAX moved to _VALUE_FLAGS (a numeric 300/1000 was being read as a boolean and printed "off"); FLAGS += eight live-verified switches never checked (TFB_ADV_ENGINE_CALL_TIMEOUT[_S], TFB_PF_IDENTITY_GATE, TFB_PF_CONFIRM_PERSIST, TFB_PF_VF_CONFLICT_GUARD, TFB_RULE1B_CAPPED_EXIT_GATE, TFB_PA_SUKUK_ASSET_CLASS, TFB_OPP_AUDIT_ROWS_MAX); and a DISARMED KILL-SWITCH now degrades the verdict to DRIFT instead of printing CLEAN over an unprotected system. pa pin 1.7.0->1.7.1. # v1.0.10 (2026-07-24): MANIFEST RE-SYNC after two unattended build days — a stale manifest makes every drift report fiction. Live-verified pins: opportunity_builder 1.5.0->1.7.0, portfolio_actions 1.4.0->1.7.0 (PRECEDENCE), run_daily_brief 1.13.0->1.15.1, run_calendar_sync 1.1.0->1.1.1. FLAGS += the five builder/pa switches shipped since v1.0.9 and never checked: TFB_OPP_PREGATE_ORDER, TFB_OPP_SELL_CLASS_GATE, TFB_TRIM_BY_RULE_GATE, TFB_PA_PRECEDENCE_GATE (armed kills) + TFB_OPP_MAX_CANDIDATES, TFB_OPP_INVESTABILITY_GATE, TFB_OPP_RANK_BY_ENGINE_ROI (value flags). # v1.0.9 (2026-07-22): +run_daily_brief 1.13.0 + send_digest 1.2.1 (rulebook on all mail surfaces) + run_calendar_sync 1.1.0 (sticky dates), +run_shadow_scorer 1.2.1 (DEF-R _now_riyadh), +pit_snapshot 1.0.1 (harvest ticker-shape guard); # v1.0.8 (2026-07-21 PM): compliance-gate wave — opportunity_builder 1.5.0, +core.analysis.portfolio_actions 1.4.0; FLAGS +TFB_COMPLIANCE_SURFACE_GATE/TFB_ELIGIBILITY_GATE/TFB_EXIT_BY_RULE_GATE (armed kills) +TFB_SHARIAH_FAIL_LIST/TFB_EXIT_BY_RULE_EXTRA/TFB_KSA_FOREIGN_RESTRICTED (value flags); # v1.0.7 (2026-07-21): WINDOW MANIFEST SYNC — the verifier must mirror every live-verified bump or its drift reports are fiction: opportunity_builder 1.4.0 (W-2), run_shadow_scorer 1.2.0 (P0-C), track_performance 6.27.0 (W-1); +core.providers.yahoo_chart_provider 8.10.0 (W-5); SCRIPTS +refresh_shariah_authority 1.1.0, +backup_workbook 1.0.0 (W-4), +pit_snapshot 1.0.0 (W-6); check_scripts gains a __version__ fallback (new scripts use the calendar_sync convention); FLAGS +W-2 freshness family, +scorer honesty pair (workflow-scoped), +TFB_YC_SYMBOL_SKIP, +TFB_SHARIAH_SHEET_ID; v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
+SCRIPT_VERSION = "1.0.16"  # v1.0.16 (2026-07-24) — EXTERNAL AUDIT OF v1.0.15, four accepted findings, all REPORTING-ONLY (this script still changes zero production behaviour). (A) MY DEFECT, SHIPPED IN v1.0.15: an EXPLICITLY SET TFB_OPP_MAX_CANDIDATES=0 was scored OUT OF SAFE RANGE, because _range_violation only exempts the UNSET case while the band is 300..2000 and 0 is BOTH the documented code default AND the documented "full pool" value. v1.0.14 fixed unset; the explicitly-set-to-the-default case was one step over and I missed it. _RANGE_FLAGS entries now carry an explicit set of sentinel values that are always legal. (B) BOOLEAN VOCABULARY SPLIT-BRAIN — the audit reported this as a verifier gap; it is worse than that, and it is a PRODUCTION defect the verifier merely made visible. Live grep of main: verifier _ARMED={1,true,yes,on}; run_dashboard_sync _TRUTHY={1,true,yes,y,on}; track_performance _TRUTHY={1,true,yes,y,on,t,enabled,enable}; advanced_analysis carries BOTH {1,true,yes,y,on} AND {1,true,yes}; data_engine_v2 carries THREE different sets. So TFB_X=enabled is ON for track_performance and OFF for advanced_analysis SIMULTANEOUSLY. The naive fix — widen _ARMED to the union — would be actively harmful: it would print ARMED over a flag that half the codebase reads as off, converting a false DRIFT into a false CLEAN. Instead, values inside the union but outside the intersection are now reported AMBIGUOUS and degrade the verdict to DRIFT with the disagreement named. Unifying the production vocabularies is a POST-WINDOW defect (it touches five modules on the hot path). (C) SELFTESTS COULD PASS WITHOUT RUNNING — status was "PASS" if returncode==0, and the SELFTEST marker was only harvested for the summary line, never required. A target that exits 0 without testing anything reported PASS. Marker is now required; returncode 0 with no marker is NO_MARKER, which degrades to DRIFT (not FAIL — the target ran, we just cannot prove it tested). (D) DATA ENGINE WAS UNVERIFIABLE — expected version was "", so check_modules short-circuited to INFO whatever it read. Pinned to 5.118.0 against live main, and the attribute corrected to __version__ (ENGINE_VERSION does not exist in that module; the check was only ever succeeding through the alternate-attribute fallback). ALSO: duplicate "default" key removed from the check_flags record; --strict documented in the usage header; the CLEAN line now states its own scope. AUDIT ITEMS DEFERRED POST-WINDOW, with reasons: subprocess-isolated imports with timeouts (real, but rewriting the import path of the tool we depend on mid-window is the wrong trade); parsing daily_sync.yml for workflow-scoped flags; self-tests for the decision layer (largely answered instead by ci.yml, which now runs the real opportunity_builder and portfolio_actions suites on every push); config/deployment_manifest.json as a shared source; split armed-counts; packaging.version for semantic compare (adds a dependency to solve a problem no current version string has). # v1.0.15 (2026-07-24) — TWO GATE HOLES, both found by live inspection of main, both closed here. (A) DRIFT EXITED 0: main() returned "0 if verdict != FAIL else 1" on BOTH the --json and the text path, so a pipeline that shelled out to this verifier continued happily over BEHIND/AHEAD versions, a disarmed kill-switch, or an out-of-range budget — the verifier said DRIFT and the exit status said proceed. A --strict flag now maps CLEAN=0, DRIFT=2, FAIL=1. It is OPT-IN: without --strict the exit codes are byte-identical to v1.0.14, so no existing caller changes behaviour, and the flag itself is the kill-switch. (B) run_dashboard_sync WAS NOT IN THE MANIFEST AT ALL: the script that writes every market page and My_Portfolio into the production workbook was the one major script whose version this verifier could not see. Added at 6.27.0 (live-verified against main). Import-safety checked before adding: its top-level imports are stdlib+asyncio only (gspread/google/requests are all deferred inside functions), it carries a __main__ guard, and its sole module-level side effect is logging.basicConfig(), which cannot affect this verifier because the verifier prints rather than logs. NOTE for the record: track_performance was NOT missing — it is present at 6.27.0 and matches live. An earlier review claim that the verifier "expects 6.27 while the file shows 6.18" confused the stale module DOCSTRING with the runtime SCRIPT_VERSION constant; the constant is correct and so is this manifest. # v1.0.14 (2026-07-24) — MY BUG, caught by its own first live run: _range_violation was fed the RESOLVED value (env or code default), so an UNSET TFB_OPP_MAX_CANDIDATES resolved to its legitimate default 0 ("no clamp") and printed OUT OF RANGE, forcing a permanent false DRIFT. A verifier that cries wolf is worse than none. The range check now sees the RAW env only: unset => code default governs => no violation, exactly as the v1.0.13 docstring promised. # v1.0.13 (2026-07-24) — MY OWN BUG, caught in review: the v1.0.8/1.0.11 edits appended the new value flags with a str.replace anchored on a token that ends BOTH _VALUE_FLAGS and _WORKFLOW_SCOPED, so seven RENDER-scoped flags (the three rule lists + the four numeric budgets) were silently filed as workflow-only and printed "GH-ENV — NOT visible from this shell" instead of being read from the live process. That is the exact class of fiction this verifier exists to prevent — and it is why TFB_EXIT_BY_RULE_EXTRA looked workflow-scoped on 2026-07-22. _WORKFLOW_SCOPED is now the genuine four. ALSO: numeric budgets are range-checked (a value outside its safe band is DRIFT, not "SET"); TFB_OPP_BUILD_OFFLOOP + TFB_ADV_ENGINE_CALL_TIMEOUT are marked protection-expected-armed so CLEAN can never print over a disabled 502 guard; route pin 4.12.0->4.13.0. # v1.0.12 (2026-07-24): routes.advanced_analysis 4.11.0->4.12.0 (off-loop opportunity build); FLAGS +TFB_OPP_BUILD_OFFLOOP/_S. # v1.0.11 (2026-07-24, external-review catches): +routes.advanced_analysis 4.11.0 pinned (the layer that owns the edge-timeout guard was unverifiable); TFB_OPP_MAX_CANDIDATES + TFB_OPP_AUDIT_ROWS_MAX moved to _VALUE_FLAGS (a numeric 300/1000 was being read as a boolean and printed "off"); FLAGS += eight live-verified switches never checked (TFB_ADV_ENGINE_CALL_TIMEOUT[_S], TFB_PF_IDENTITY_GATE, TFB_PF_CONFIRM_PERSIST, TFB_PF_VF_CONFLICT_GUARD, TFB_RULE1B_CAPPED_EXIT_GATE, TFB_PA_SUKUK_ASSET_CLASS, TFB_OPP_AUDIT_ROWS_MAX); and a DISARMED KILL-SWITCH now degrades the verdict to DRIFT instead of printing CLEAN over an unprotected system. pa pin 1.7.0->1.7.1. # v1.0.10 (2026-07-24): MANIFEST RE-SYNC after two unattended build days — a stale manifest makes every drift report fiction. Live-verified pins: opportunity_builder 1.5.0->1.7.0, portfolio_actions 1.4.0->1.7.0 (PRECEDENCE), run_daily_brief 1.13.0->1.15.1, run_calendar_sync 1.1.0->1.1.1. FLAGS += the five builder/pa switches shipped since v1.0.9 and never checked: TFB_OPP_PREGATE_ORDER, TFB_OPP_SELL_CLASS_GATE, TFB_TRIM_BY_RULE_GATE, TFB_PA_PRECEDENCE_GATE (armed kills) + TFB_OPP_MAX_CANDIDATES, TFB_OPP_INVESTABILITY_GATE, TFB_OPP_RANK_BY_ENGINE_ROI (value flags). # v1.0.9 (2026-07-22): +run_daily_brief 1.13.0 + send_digest 1.2.1 (rulebook on all mail surfaces) + run_calendar_sync 1.1.0 (sticky dates), +run_shadow_scorer 1.2.1 (DEF-R _now_riyadh), +pit_snapshot 1.0.1 (harvest ticker-shape guard); # v1.0.8 (2026-07-21 PM): compliance-gate wave — opportunity_builder 1.5.0, +core.analysis.portfolio_actions 1.4.0; FLAGS +TFB_COMPLIANCE_SURFACE_GATE/TFB_ELIGIBILITY_GATE/TFB_EXIT_BY_RULE_GATE (armed kills) +TFB_SHARIAH_FAIL_LIST/TFB_EXIT_BY_RULE_EXTRA/TFB_KSA_FOREIGN_RESTRICTED (value flags); # v1.0.7 (2026-07-21): WINDOW MANIFEST SYNC — the verifier must mirror every live-verified bump or its drift reports are fiction: opportunity_builder 1.4.0 (W-2), run_shadow_scorer 1.2.0 (P0-C), track_performance 6.27.0 (W-1); +core.providers.yahoo_chart_provider 8.10.0 (W-5); SCRIPTS +refresh_shariah_authority 1.1.0, +backup_workbook 1.0.0 (W-4), +pit_snapshot 1.0.0 (W-6); check_scripts gains a __version__ fallback (new scripts use the calendar_sync convention); FLAGS +W-2 freshness family, +scorer honesty pair (workflow-scoped), +TFB_YC_SYMBOL_SKIP, +TFB_SHARIAH_SHEET_ID; v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -66,7 +77,10 @@ MODULES: List[Tuple[str, str, str, str]] = [
      "top10 selector"),
     ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.10.0",
      "yahoo chart provider"),
-    ("core.data_engine_v2", "ENGINE_VERSION", "", "data engine (informational)"),
+    # v1.0.16: was ("ENGINE_VERSION", "") -> always INFO, never enforced. The
+    # attribute does not exist in that module (only __version__), so the read
+    # was surviving purely on the alternate-attribute fallback.
+    ("core.data_engine_v2", "__version__", "5.118.0", "data engine"),
 ]
 
 # scripts are checked by SCRIPT_VERSION via a light import
@@ -75,6 +89,10 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("run_weekly_brief", "1.0.2", "weekly brief"),
     ("run_shadow_scorer", "1.2.1", "shadow scorer"),
     ("track_performance", "6.27.0", "track performance"),
+    # v1.0.15: the production workbook writer — every market page and the
+    # My_Portfolio rebuild pass through this script. Verified import-safe
+    # (stdlib+asyncio at module level) before being added here.
+    ("run_dashboard_sync", "6.27.0", "dashboard sync"),
     ("refresh_shariah_authority", "1.1.0", "shariah refresh"),
     ("backup_workbook", "1.0.0", "workbook backup"),
     ("pit_snapshot", "1.0.1", "pit snapshot"),
@@ -137,6 +155,21 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
 ]
 
 _ARMED = {"1", "true", "yes", "on"}
+# v1.0.16: tokens that SOME production modules accept as true and others do not
+# (see the version note). A flag carrying one of these is genuinely ambiguous:
+# track_performance reads "enabled" as ON while advanced_analysis reads it as OFF.
+# We do NOT silently widen _ARMED — that would print CLEAN over a half-armed
+# protection. We name the disagreement instead.
+_ARMED_AMBIGUOUS = {"y", "t", "enabled", "enable"}
+
+
+def _bool_ambiguity(value: Any) -> str:
+    """'' when the token is unambiguous, else a message naming the split."""
+    tok = str(value or "").strip().lower()
+    if tok in _ARMED_AMBIGUOUS:
+        return ("%r is read as ON by track_performance/data_engine_v2 and as OFF "
+                "by advanced_analysis — use 1 or 0" % tok)
+    return ""
 
 # v1.0.2: not every env var is a toggle. A multiplier or a mode string is a
 # PARAMETER — reporting TFB_OPP_STOP_VOL_MULT=1.5 as "off" because 1.5 is not
@@ -172,6 +205,14 @@ _RANGE_FLAGS = {
     "TFB_ADV_ENGINE_CALL_TIMEOUT_S": (60.0, 85.0),
 }
 
+# v1.0.16: values that are ALWAYS legal for a range flag regardless of the band,
+# because the flag documents them as a sentinel rather than as a quantity.
+# TFB_OPP_MAX_CANDIDATES=0 means "no clamp / full pool" (see FLAGS) and is also
+# the code default, so it can be set explicitly and must never read as drift.
+_RANGE_SENTINELS = {
+    "TFB_OPP_MAX_CANDIDATES": {0.0},
+}
+
 
 def _range_violation(name: str, live: Any) -> str:
     """v1.0.13: '' when fine, else 'value not in lo..hi'. Unset values are
@@ -184,6 +225,8 @@ def _range_violation(name: str, live: Any) -> str:
         v = float(raw)
     except (TypeError, ValueError):
         return "%s not numeric (expected %g..%g)" % (raw, band[0], band[1])
+    if v in _RANGE_SENTINELS.get(name, ()):   # v1.0.16: documented sentinel
+        return ""
     if v < band[0] or v > band[1]:
         return "%g not in %g..%g" % (v, band[0], band[1])
     return ""
@@ -279,7 +322,12 @@ def check_flags() -> List[Dict[str, Any]]:
                     "kill_switch": kill, "kind": kind,
                     "scope": ("workflow" if name in _WORKFLOW_SCOPED
                               else "render"),
-                    "default": default,
+                    # v1.0.16: "default" appeared twice here; the second literal
+                    # silently replaced the first. Same value, so no behaviour
+                    # change, but a duplicate key in an audit record is exactly
+                    # the kind of thing that hides a real one later.
+                    "ambiguous": (_bool_ambiguity(live)
+                                  if kind not in ("value",) else ""),
                     "range_bad": _range_violation(name, raw)})
     return out
 
@@ -300,13 +348,44 @@ def run_selftests(timeout: int = 120) -> List[Dict[str, Any]]:
                                text=True, timeout=timeout, cwd=_ROOT)
             tail = [ln for ln in (p.stdout or "").strip().splitlines()
                     if "SELFTEST" in ln]
-            out.append({"target": rel, "label": label,
-                        "status": "PASS" if p.returncode == 0 else "FAIL",
-                        "summary": (tail[-1] if tail else "").strip()})
+            # v1.0.16: returncode 0 alone proved only that the process exited,
+            # not that it tested anything. The SELFTEST marker is now required.
+            if p.returncode != 0:
+                st = "FAIL"
+            elif not tail:
+                st = "NO_MARKER"
+            else:
+                st = "PASS"
+            out.append({"target": rel, "label": label, "status": st,
+                        "summary": (tail[-1] if tail else
+                                    "exited 0 but printed no SELFTEST line")})
         except Exception as exc:  # noqa: BLE001
             out.append({"target": rel, "label": label, "status": "ERROR",
                         "summary": f"{type(exc).__name__}: {exc}"})
     return out
+
+
+def _exit_code(verdict: str, strict: bool) -> int:
+    """Map a verdict to a process exit status.
+
+    v1.0.15. DEFAULT BEHAVIOUR IS UNCHANGED FROM v1.0.14: FAIL -> 1, everything
+    else -> 0. That is deliberate; existing callers must not change meaning
+    underneath them.
+
+    With --strict, DRIFT gets its own status (2) so a deployment pipeline can
+    refuse to continue over a configuration this verifier has already judged
+    unsafe. Absence of --strict is the kill-switch: drop the flag and v1.0.14
+    semantics return exactly.
+
+        CLEAN -> 0
+        DRIFT -> 2 (strict) / 0 (default)
+        FAIL  -> 1
+    """
+    if verdict == "FAIL":
+        return 1
+    if strict and verdict == "DRIFT":
+        return 2
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -314,6 +393,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--selftests", action="store_true",
                     help="also run each module's selftest")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit 2 on DRIFT (default: DRIFT exits 0, as v1.0.14)")
     args = ap.parse_args(argv)
 
     mods = check_modules()
@@ -324,24 +405,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     drift = [m for m in mods + scripts
              if m["status"] in ("BEHIND", "AHEAD", "NO_VERSION")]
     missing = [m for m in mods + scripts if m["status"] == "MISSING"]
-    failed = [t for t in tests if t["status"] != "PASS"]
+    # v1.0.16: NO_MARKER is not a failure — the target ran and exited clean, we
+    # simply cannot prove it tested anything. That is drift, not breakage.
+    failed = [t for t in tests if t["status"] in ("FAIL", "ERROR", "MISSING")]
+    nomarker = [t for t in tests if t["status"] == "NO_MARKER"]
     # v1.0.11: a kill-switch that ships ARMED but reads disarmed on the live
     # box is a silently unprotected system — it must never print CLEAN.
     disarmed = [f for f in flags
                 if f.get("kill_switch") and not f.get("armed")
                 and f.get("scope") != "workflow"]
     out_of_range = [f for f in flags if f.get("range_bad")]
+    # v1.0.16: a token that half the codebase reads as ON and half as OFF is not
+    # a clean configuration, whichever way this verifier happens to guess.
+    ambiguous = [f for f in flags
+                 if f.get("ambiguous") and f.get("scope") != "workflow"]
     verdict = ("FAIL" if (missing or failed)
-               else "DRIFT" if (drift or disarmed or out_of_range)
+               else "DRIFT" if (drift or disarmed or out_of_range
+                                or ambiguous or nomarker)
                else "CLEAN")
 
     if args.json:
         print(json.dumps({"version": SCRIPT_VERSION, "verdict": verdict,
                           "modules": mods, "scripts": scripts,
                           "flags": flags, "selftests": tests}, indent=2))
-        return 0 if verdict != "FAIL" else 1
+        return _exit_code(verdict, args.strict)
 
-    print(f"TFB DEPLOYMENT VERIFIER v{SCRIPT_VERSION}")
+    print(f"TFB DEPLOYMENT VERIFIER v{SCRIPT_VERSION}"
+          + ("   [--strict: DRIFT will exit 2]" if args.strict else ""))
     print("=" * 64)
     print("\nMODULES")
     for m in mods + scripts:
@@ -365,7 +455,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             src = "  (set in daily_sync.yml — NOT visible from this shell)"
         else:
             src = "" if f["set"] else "  (not set — using default)"
-        if f.get("range_bad"):
+        if f.get("ambiguous"):
+            note = "  [AMBIGUOUS TOKEN — see footer]"
+        elif f.get("range_bad"):
             note = "  [OUT OF SAFE RANGE %s]" % (f["range_bad"],)
         elif f["kill_switch"] and not f["armed"]:
             note = ("  [protection expected ARMED in production]"
@@ -384,6 +476,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                   if f["armed"] and f.get("scope") != "workflow")
     wf_n = sum(1 for f in flags if f.get("scope") == "workflow")
     print("\n" + "=" * 64)
+    if verdict == "CLEAN":
+        # v1.0.16 (audit finding 4): CLEAN is a statement about the Render
+        # process this shell can see. Workflow-scoped values live in
+        # daily_sync.yml and are NOT part of this verdict.
+        print("SCOPE: Render process configuration only — "
+              "workflow-scoped flags must be read in daily_sync.yml")
     print(f"VERDICT: {verdict}   modules {len(mods)+len(scripts)} "
           f"({len(drift)} drift, {len(missing)} missing) | "
           f"flags {armed_n}/{len(flags) - wf_n} armed "
@@ -398,6 +496,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if disarmed:
         print("  UNARMED PROTECTIONS: "
               + ", ".join(f["flag"] for f in disarmed))
+    if ambiguous:
+        print("  AMBIGUOUS BOOLEANS (production modules disagree on these tokens):")
+        for f in ambiguous:
+            print("    %s=%s -> %s" % (f["flag"], f["value"], f["ambiguous"]))
+    if nomarker:
+        print("  SELFTEST UNPROVEN: "
+              + ", ".join(t["label"] for t in nomarker)
+              + "  (exit 0 but no SELFTEST line printed)")
     if missing:
         print("  MISSING: " + ", ".join(m["label"] for m in missing))
     unarmed = [f["flag"] for f in flags
@@ -410,7 +516,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("  not armed: " + ", ".join(unarmed))
     if undef:
         print("  using default: " + ", ".join(undef))
-    return 0 if verdict != "FAIL" else 1
+    return _exit_code(verdict, args.strict)
 
 
 if __name__ == "__main__":
