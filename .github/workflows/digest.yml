@@ -53,9 +53,35 @@ on:
         required: false
         type: string
 
+# ============================================================================
+# CONCURRENCY — fixed 2026-07-24 (v1.1.0, [VBREAK] window hardening)
+# ============================================================================
+# TWO escape hatches were in this key at once:
+#   ${{ github.event_name }} — a cron fire ("schedule") and an operator run
+#     ("workflow_dispatch") occupied DIFFERENT groups and could run together.
+#     Identical defect to the one closed in daily_sync.yml the same date.
+#   ${{ github.ref }} — a dispatch from another branch received the same
+#     workbook + SMTP credentials under a different lease.
+#
+# The sharper problem was on the SCHEDULE ALONE. This file's own header states a
+# run takes 60-100 minutes, and the crons fire 05:30 / 07:00 / 13:30 UTC. Both
+# scheduled runs carry event_name="schedule", so they SHARED a group — and
+# cancel-in-progress: true then KILLED the 05:30 run mid-flight whenever it
+# overran 90 minutes. The workflow has been aborting its own sends.
+#
+# Literal group + cancel-in-progress: false — the second run now WAITS instead of
+# aborting a digest halfway through.
+#
+# NOT a cross-workflow lease with daily_sync.yml: registered, pending daily_sync's
+# measured median runtime (see the note in shadow_board.yml).
+#
+# ROLLBACK: restore
+#   group: tfb-digest-${{ github.ref }}-${{ github.event_name }}
+#   cancel-in-progress: true
+# ============================================================================
 concurrency:
-  group: tfb-digest-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  group: tfb-digest
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -76,9 +102,16 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      # v1.1.0: pinned to main. workflow_dispatch can be fired from ANY branch,
+      # and repo secrets/vars are available to all of them — an unreviewed branch
+      # could otherwise email real recommendations using production SMTP and the
+      # production workbook. Action versions (checkout@v4 / setup-python@v5) are
+      # deliberately left as-is: bumping them mid-window is churn with breakage
+      # risk and no safety gain. Registered for post-window alignment.
       - name: 📥 Checkout
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 1
           persist-credentials: false
 
