@@ -338,6 +338,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 import json
 import logging
 import math
@@ -358,7 +359,63 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 # v4.11.0 — Version constant.
 # =============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.11.0"
+# ==============================================================================
+# v4.12.0 [OPP-BUILD OFF-LOOP + BUDGET] (2026-07-24)
+# WHY (evidence, 2026-07-24): /sheet-rows/opportunity-candidates returned
+# HTTP 502 at 11:06 and its last SUCCESSFUL run took 113.5s (an earlier
+# diagnostic recorded 127.4s) — both over Render's ~100s edge ceiling. The
+# v4.11.0 edge-timeout guard does NOT cover this path: it lives in
+# _run_advanced_sheet_rows_impl, while this handler calls _opp_collect_pool
+# and then _build_opportunity_payload directly. Worse, the builder is a
+# SYNCHRONOUS CPU call awaited on the event loop: for ~2 minutes that worker
+# serves nothing else, which is the most parsimonious explanation for the
+# SAME-WINDOW 502s on unrelated endpoints (track_performance priced 7/862 with
+# feed=backend_dead at 07:36 while a cockpit run was in flight) on a 2-worker
+# gunicorn box.
+# FIX (env-gated, DEFAULT OFF — this file's convention): when
+# TFB_OPP_BUILD_OFFLOOP=1 the builder runs in a worker thread via
+# asyncio.to_thread and is bounded by TFB_OPP_BUILD_TIMEOUT_S (default 70.0,
+# clamped [5, 95]). Two distinct wins: (a) the event loop keeps serving other
+# requests while the pool is scored; (b) on budget exhaustion the handler
+# answers with the EXISTING fail-soft envelope (status "degraded",
+# error "builder_timeout") instead of letting the platform kill the request,
+# so the caller gets a readable 200 and full telemetry rather than a raw 502.
+# HONEST LIMIT, documented: Python cannot kill a running thread — on timeout
+# the build finishes in the background and its result is discarded. The budget
+# bounds the RESPONSE, not the CPU. Reducing the work itself (pool size,
+# caching) remains the structural fix and is unchanged by this build.
+# OFF => byte-identical v4.11.0. Zero functions removed; additions:
+# _opp_build_offloop_enabled, _opp_build_timeout_s.
+# ==============================================================================
+# ==============================================================================
+# v4.13.0 [SINGLE-FLIGHT + HEALTH BUDGET + CONTRACT] (2026-07-24, review catches)
+# Three defects the v4.12.0 guard left open, all on the 502 path:
+# 1. THREAD PILE-UP. v4.12.0 answers at the budget but the timed-out build keeps
+#    running (Python cannot kill a thread). A second refresh — the operator's
+#    natural reaction to a DEGRADED banner — starts a SECOND expensive build on
+#    top of the first, so the guard could amplify the very overload it exists to
+#    contain. FIX: a process-level non-blocking lock. While a build is in
+#    flight, later requests answer immediately with status "degraded",
+#    error "build_already_running". The lock is released by the THREAD in a
+#    finally block, so it survives the handler having already returned.
+#    HONEST SCOPE: the lock is per worker process — an N-worker box permits at
+#    most N concurrent builds, not one. That is a hard bound where there was
+#    none, not a global mutex.
+# 2. UNBOUNDED PROVIDER HEALTH. _extract_provider_health_snapshot() awaits the
+#    v2 engine instance and its health() call with no time budget, BEFORE the
+#    guarded build. "Never raises" is exception-safety, not time-safety: a
+#    stalled engine still ends in a platform 502 having never reached the
+#    budget. Telemetry must never block a decision response. FIX: 3s budget,
+#    degrade to {"unavailable": True, "reason": "provider_health_timeout"}.
+# 3. PAYLOAD CONTRACT. The v4.12.0 timeout envelope carried "audit": [] while
+#    the builder's frozen contract emits "candidates_rows", "alerts" and
+#    "meta". Consumers other than the cockpit read that shape. FIX: the
+#    degraded envelope now mirrors the real contract exactly.
+# Both new guards are always-on and cost nothing when nothing is wrong; the
+# off-loop switch (TFB_OPP_BUILD_OFFLOOP) still gates the threading itself.
+# Zero functions removed; addition: _opp_build_lock + _opp_build_in_thread.
+# ==============================================================================
+ADVANCED_ANALYSIS_VERSION = "4.13.0"
 
 
 # =============================================================================
@@ -656,6 +713,58 @@ def _adv_engine_call_timeout_s() -> float:
     call. Clamped to a sane [5, 95] range so a bad env value can't disable the
     protection (too high) or make every request fail-soft (too low)."""
     v = _env_num("TFB_ADV_ENGINE_CALL_TIMEOUT_S", 75.0)
+    return max(5.0, min(95.0, v))
+
+
+# v4.13.0: process-level single-flight for the expensive opportunity build.
+# Non-blocking acquire; released inside the worker thread's finally so a
+# handler that already timed out never strands the lock.
+_OPP_BUILD_LOCK = threading.Lock()
+
+
+def _opp_build_in_thread(build_fn, *args, **kwargs):
+    """Run the (synchronous) builder, always releasing the single-flight lock
+    even when the awaiting handler has already answered degraded."""
+    try:
+        return build_fn(*args, **kwargs)
+    finally:
+        try:
+            _OPP_BUILD_LOCK.release()
+        except RuntimeError:
+            pass
+
+
+def _opp_degraded_payload(error: str, message: str, pool_rows, criteria):
+    """v4.13.0: a degraded envelope in the builder's FROZEN shape —
+    candidates_rows / alerts / meta included, so non-cockpit consumers read
+    the same contract they always did."""
+    return {
+        "version": _OPP_BUILDER_VERSION,
+        "status": "degraded",
+        "error": error,
+        "message": message,
+        "kpis": {"scanned": len(pool_rows), "passed": 0,
+                 "selected_count": 0},
+        "selected": [],
+        "near_miss": [],
+        "alerts": [],
+        "candidates_rows": [],
+        "meta": {"criteria_snapshot": criteria},
+    }
+
+
+def _opp_build_offloop_enabled() -> bool:
+    """v4.12.0: run the opportunity build off the event loop under a budget.
+    Default OFF -> byte-identical v4.11.0 (inline, unbounded)."""
+    return _env_truthy("TFB_OPP_BUILD_OFFLOOP", False)
+
+
+def _opp_build_timeout_s() -> float:
+    """Budget (seconds) for the off-loop opportunity build. Default 70.0 —
+    under Render's ~100s edge ceiling with headroom for pool collection,
+    envelope assembly and transport. Clamped to [5, 95] so a bad env value
+    can neither disable the protection nor fail every request."""
+    v = _env_num("TFB_OPP_BUILD_TIMEOUT_S", 70.0)
     return max(5.0, min(95.0, v))
 
 
@@ -2909,7 +3018,19 @@ async def opportunity_candidates_post(
             trends_meta = {"enabled": False, "bound": True,
                            "error": "{}: {}".format(_te.__class__.__name__, str(_te)[:160])}
 
-    provider_health = await _extract_provider_health_snapshot()
+    # v4.13.0: telemetry must never block a decision response (see CHANGELOG).
+    try:
+        provider_health = await asyncio.wait_for(
+            _extract_provider_health_snapshot(), timeout=3.0)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[advanced_analysis v%s] provider-health snapshot exceeded 3.0s "
+            "— continuing without it", ADVANCED_ANALYSIS_VERSION)
+        provider_health = {"unavailable": True,
+                           "reason": "provider_health_timeout"}
+    except Exception as _phe:
+        provider_health = {"unavailable": True,
+                           "reason": _phe.__class__.__name__}
     engine_version = provider_health.get("engine_version") if isinstance(provider_health, Mapping) else None
 
     # v4.7.2 [META-MAP]: live selector v4.19.0 key names first, prior names as
@@ -2935,13 +3056,60 @@ async def opportunity_candidates_post(
     }
 
     try:
-        payload = _build_opportunity_payload(
-            pool_rows,
-            criteria=criteria,
-            portfolio=dict(portfolio or {}),
-            fx_rates=dict(fx_rates or {}),
-            upstream_meta=upstream_meta,
-        )
+        if _opp_build_offloop_enabled() and not _OPP_BUILD_LOCK.acquire(
+                blocking=False):
+            # v4.13.0: a build is already in flight in this worker — never
+            # stack a second expensive scan on top of it.
+            logger.warning(
+                "[advanced_analysis v%s] opportunity build already running in "
+                "this worker — answering build_already_running",
+                ADVANCED_ANALYSIS_VERSION)
+            payload = _opp_degraded_payload(
+                "build_already_running",
+                "an opportunity build is already running in this worker — "
+                "this request was not queued",
+                pool_rows, criteria)
+        elif _opp_build_offloop_enabled():
+            # v4.12.0 [OPP-BUILD OFF-LOOP + BUDGET]: see CHANGELOG. The build
+            # is CPU-bound and synchronous; running it in a thread frees the
+            # event loop for other requests, and the budget guarantees this
+            # handler answers before Render's edge timeout can kill it.
+            _budget = _opp_build_timeout_s()
+            try:
+                payload = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _opp_build_in_thread,
+                        _build_opportunity_payload,
+                        pool_rows,
+                        criteria=criteria,
+                        portfolio=dict(portfolio or {}),
+                        fx_rates=dict(fx_rates or {}),
+                        upstream_meta=upstream_meta,
+                    ),
+                    timeout=_budget,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[advanced_analysis v%s] opportunity build exceeded %.1fs "
+                    "budget for %d pool rows (off-loop guard); answering "
+                    "fail-soft. The thread finishes in the background and its "
+                    "result is discarded.",
+                    ADVANCED_ANALYSIS_VERSION, _budget, len(pool_rows),
+                )
+                payload = _opp_degraded_payload(
+                    "builder_timeout",
+                    "opportunity build exceeded the %.0fs budget for %d pool "
+                    "rows — no board produced this run"
+                    % (_budget, len(pool_rows)),
+                    pool_rows, criteria)
+        else:
+            payload = _build_opportunity_payload(
+                pool_rows,
+                criteria=criteria,
+                portfolio=dict(portfolio or {}),
+                fx_rates=dict(fx_rates or {}),
+                upstream_meta=upstream_meta,
+            )
     except Exception as e:
         logger.warning(
             "[advanced_analysis v%s] opportunity builder raised %s: %s",
@@ -3109,7 +3277,19 @@ async def portfolio_actions_post(
             },
         })
 
-    provider_health = await _extract_provider_health_snapshot()
+    # v4.13.0: telemetry must never block a decision response (see CHANGELOG).
+    try:
+        provider_health = await asyncio.wait_for(
+            _extract_provider_health_snapshot(), timeout=3.0)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[advanced_analysis v%s] provider-health snapshot exceeded 3.0s "
+            "— continuing without it", ADVANCED_ANALYSIS_VERSION)
+        provider_health = {"unavailable": True,
+                           "reason": "provider_health_timeout"}
+    except Exception as _phe:
+        provider_health = {"unavailable": True,
+                           "reason": _phe.__class__.__name__}
     engine_version = provider_health.get("engine_version") if isinstance(provider_health, Mapping) else None
     upstream_meta: Dict[str, Any] = {
         "versions": {"engine": engine_version},
