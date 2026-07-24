@@ -8,6 +8,42 @@ Version: 1.0.19  (TFB Final Execution Plan v5.0 — Phase P2;
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
 
+v1.7.0 [SELL-CLASS GATE — replace the all-or-nothing Investability gate with
+the narrow guard the audit contract actually needs. WHY (2026-07-23 evening,
+measured on the live 10,465-row pool with the deployed code): the operator's
+Render env has TFB_OPP_INVESTABILITY_GATE=1, but the engine marks only 59 of
+10,465 rows INVESTABLE (WATCHLIST 9,829 · BLOCKED 285 · blank 292), so the
+gate is not a backstop — it IS the buy funnel, and it collapses it. A/B on
+identical data: gate OFF -> 120 passed / 10 tickets; gate ON -> 7 passed /
+6 tickets, and after held-exclusion + the KSA Shariah/eligibility MAJOR
+gates the operator saw ZERO candidates for days. The v1.0.8 header already
+warned this exact failure ("a live build proved the selector backfills
+Tier-2 (WATCHLIST / low-reliability) rows, so the gate WOULD drop real
+selections") and shipped it DEFAULT OFF; production overrode that.
+Inspection of the 10 suppressed tickets showed the suppression is mostly
+UNJUSTIFIED: 3 were engine-INVESTABLE outright (1831.SR, 1321.SR — both
+independently bought and held by the operator — plus 4503.T), and 6 were
+WATCHLIST only because of a two-point conservative-score margin ("overall
+66 < 68") while carrying reliability 77-92 and DQ 100. Exactly ONE carried
+a genuine sell-side verdict (0023.HK, "Engine recommends REDUCE").
+FIX: a new "Sell-Class" gate fails MAJOR when the engine's own
+recommendation is an explicit sell-tier token (SELL / STRONG_SELL /
+STRONG SELL / REDUCE / AVOID / UNDERPERFORM / UNDERWEIGHT). This is a
+STRICT SUBSET of the Investability gate: it drops the one row that gate
+was right about and keeps the nine it was wrong about, and it enforces
+standing audit gate #2 ("no INVEST on SELL-class") explicitly rather than
+by side effect. Blank/unknown/buy-tier tokens PASS (fail-open + traced),
+matching the Investability gate's own convention. The two gates are
+INDEPENDENT and compose: with both enabled, Investability still dominates
+(it is strictly stricter), so enabling this gate can never widen the
+funnel of an Investability-gated run — it can only narrow an ungated one.
+Default ON via TFB_OPP_SELL_CLASS_GATE; =0 restores v1.6.0 gate lists and
+verdicts byte-for-byte. Added to GATE_ORDER at its true append position so
+first_failed_gate attribution stays correct (the v1.0.7 GATE_ORDER lesson).
+OPERATOR ACTION REQUIRED, flagged separately: this build only takes effect
+once TFB_OPP_INVESTABILITY_GATE is set to 0 in Render. Zero functions
+removed; addition: _env_sell_class_gate.]
+
 v1.6.0 [PREGATE-ORDER — quality-ordered candidate clamp; kills the
 adverse-selection cut. WHY (2026-07-22 evening audit, workbook evidence):
 the Top_10 run scanned exactly TFB_OPP_MAX_CANDIDATES=300 of a 10,311-row
@@ -466,6 +502,12 @@ ENV KILL-SWITCHES (policy block — read per call, not at import)
   TFB_OPP_STOP_MAX_PCT     "35"  stop distance clamp %
   TFB_OPP_REVIEW_DAYS      "30"  review-by horizon for advisor sentence
   TFB_OPP_MAX_CANDIDATES   "0"   0 = unlimited; CPU safety clamp on input rows
+  TFB_OPP_SELL_CLASS_GATE  "1"   v1.7.0: MAJOR-fail a candidate whose ENGINE
+                                 recommendation is explicit sell-tier
+                                 (SELL/STRONG_SELL/REDUCE/AVOID/...);
+                                 the narrow replacement for the
+                                 all-or-nothing Investability gate;
+                                 0 = v1.6.0 byte-for-byte
   TFB_OPP_PREGATE_ORDER    "1"   v1.6.0: when the clamp above WILL cut the
                                  pool, first re-order it eligible-first
                                  (cheap row-local gate mirrors) by
@@ -750,7 +792,7 @@ from datetime import datetime, timedelta, timezone
 # Kills: TFB_COMPLIANCE_SURFACE_GATE=0 / TFB_ELIGIBILITY_GATE=0 restore the
 # v1.4.1 gate list byte-for-byte. Guards ship armed.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.6.0"
+OPPORTUNITY_BUILDER_VERSION = "1.7.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -906,6 +948,7 @@ DEFAULT_CRITERIA = {
     "stop_max_pct": 35.0,
     "pf_max_sector_pct": 30.0,
     "max_candidates": 0,
+    "sell_class_gate_enabled": True,
     # v1.0.3 forecast safety gate (env-tunable; see policy block)
     "forecast_gate_enabled": True,
     "min_engine_roi_pct": 0.0,
@@ -968,6 +1011,8 @@ _CRITERIA_INT_KEYS = (
     "min_trust_fields", "audit_rows_max",
 )
 _CRITERIA_BOOL_KEYS = (
+    "sell_class_gate_enabled",   # v1.7.0
+
     "allow_conflict", "allow_negative_news", "allow_negative_sector",
     "include_portfolio_holdings", "forecast_gate_enabled",
     "valuation_sanity_gate_enabled", "engine_roi_display_enabled",
@@ -1012,8 +1057,18 @@ DIVERSIFICATION_NO_CONTEXT = 60.0
 GATE_ORDER = (
     "Price", "FX", "Valuation", "ROI", "Annualized ROI", "Valuation Sanity",
     "Forecast", "Reliability", "Data Quality", "Data Trust", "Investability",
+    # v1.7.0: appended at its true position (the v1.0.7 GATE_ORDER lesson —
+    # a gate missing from this tuple sorts to 99 and can mis-attribute
+    # first_failed_gate on the near-miss surface).
+    "Sell-Class",
     "Risk Level", "Risk/Reward", "Conflict", "News", "Sector Trend", "Portfolio",
 )
+
+# v1.7.0: explicit sell-tier tokens (normalized). Everything else — including
+# blanks, HOLD, and every buy tier — passes the Sell-Class gate.
+_SELL_CLASS_TOKENS = frozenset((
+    "sell", "strongsell", "reduce", "avoid", "underperform", "underweight",
+))
 
 FAIL_MAJOR = "MAJOR"
 FAIL_NON_CRITICAL = "NON_CRITICAL"
@@ -1081,6 +1136,14 @@ def _env_forecast_gate():
     TFB_OPP_FORECAST_GATE=0 to restore byte-identical v1.0.2 behavior."""
     return str(_env_str("TFB_OPP_FORECAST_GATE", "1")).strip().lower() not in (
         "0", "false", "no", "off")
+
+
+def _env_sell_class_gate():
+    """v1.7.0 [SELL-CLASS GATE] kill-switch — DEFAULT ON. Set
+    TFB_OPP_SELL_CLASS_GATE=0 to restore the v1.6.0 gate list and verdicts
+    byte-for-byte."""
+    return str(_env_str("TFB_OPP_SELL_CLASS_GATE", "1")).strip().lower() \
+        not in ("0", "false", "off", "no")
 
 
 def _env_valuation_sanity_gate():
@@ -1286,6 +1349,7 @@ def _env_overrides():
                                 DEFAULT_CRITERIA["review_days"]),
         "max_candidates": _env_int("TFB_OPP_MAX_CANDIDATES",
                                    DEFAULT_CRITERIA["max_candidates"]),
+        "sell_class_gate_enabled": _env_sell_class_gate(),
         "pf_max_sector_pct": _env_float("TFB_OPP_PF_MAX_SECTOR_PCT",
                                         DEFAULT_CRITERIA["pf_max_sector_pct"]),
         "min_engine_roi_pct": _env_float(
@@ -2276,6 +2340,24 @@ def evaluate_gates(cand, criteria, held_symbols=None):
             "Investability", inv_ok, FAIL_MAJOR,
             (_to_text(inv_raw) or "Unknown"),
             "engine verdict INVESTABLE (blank/Unknown passes)"))
+
+    # v1.7.0 [SELL-CLASS GATE]: the narrow guard — MAJOR-fail only an
+    # EXPLICIT engine sell-tier verdict, instead of the Investability gate's
+    # all-or-nothing "must be INVESTABLE" (which benched 9 legitimate names
+    # for every 1 it was right about; see the header WHY block). Enforces
+    # standing audit gate #2 ("no INVEST on SELL-class") explicitly.
+    # Blank/unknown/buy-tier PASSES (fail-open + traced), matching the
+    # Investability gate convention. Appended ONLY when
+    # sell_class_gate_enabled => byte-identical v1.6.0 when
+    # TFB_OPP_SELL_CLASS_GATE=0.
+    if criteria.get("sell_class_gate_enabled"):
+        _sc_raw = cand.get("recommendation")
+        _sc_norm = _norm_token(_to_text(_sc_raw) or "")
+        _sc_ok = _sc_norm not in _SELL_CLASS_TOKENS
+        g.append(_gate(
+            "Sell-Class", _sc_ok, FAIL_MAJOR,
+            (_to_text(_sc_raw) or "Unknown"),
+            "engine reco not sell-tier (blank/Unknown passes)"))
 
     cap = _norm_risk(criteria["max_risk_level"]) or "Medium"
     risk = cand["risk_level"]
