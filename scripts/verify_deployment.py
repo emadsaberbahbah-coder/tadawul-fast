@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-SCRIPT_VERSION = "1.0.9"  # v1.0.9 (2026-07-22): +run_daily_brief 1.13.0 + send_digest 1.2.1 (rulebook on all mail surfaces) + run_calendar_sync 1.1.0 (sticky dates), +run_shadow_scorer 1.2.1 (DEF-R _now_riyadh), +pit_snapshot 1.0.1 (harvest ticker-shape guard); # v1.0.8 (2026-07-21 PM): compliance-gate wave — opportunity_builder 1.5.0, +core.analysis.portfolio_actions 1.4.0; FLAGS +TFB_COMPLIANCE_SURFACE_GATE/TFB_ELIGIBILITY_GATE/TFB_EXIT_BY_RULE_GATE (armed kills) +TFB_SHARIAH_FAIL_LIST/TFB_EXIT_BY_RULE_EXTRA/TFB_KSA_FOREIGN_RESTRICTED (value flags); # v1.0.7 (2026-07-21): WINDOW MANIFEST SYNC — the verifier must mirror every live-verified bump or its drift reports are fiction: opportunity_builder 1.4.0 (W-2), run_shadow_scorer 1.2.0 (P0-C), track_performance 6.27.0 (W-1); +core.providers.yahoo_chart_provider 8.10.0 (W-5); SCRIPTS +refresh_shariah_authority 1.1.0, +backup_workbook 1.0.0 (W-4), +pit_snapshot 1.0.0 (W-6); check_scripts gains a __version__ fallback (new scripts use the calendar_sync convention); FLAGS +W-2 freshness family, +scorer honesty pair (workflow-scoped), +TFB_YC_SYMBOL_SKIP, +TFB_SHARIAH_SHEET_ID; v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
+SCRIPT_VERSION = "1.0.11"  # v1.0.11 (2026-07-24, external-review catches): +routes.advanced_analysis 4.11.0 pinned (the layer that owns the edge-timeout guard was unverifiable); TFB_OPP_MAX_CANDIDATES + TFB_OPP_AUDIT_ROWS_MAX moved to _VALUE_FLAGS (a numeric 300/1000 was being read as a boolean and printed "off"); FLAGS += eight live-verified switches never checked (TFB_ADV_ENGINE_CALL_TIMEOUT[_S], TFB_PF_IDENTITY_GATE, TFB_PF_CONFIRM_PERSIST, TFB_PF_VF_CONFLICT_GUARD, TFB_RULE1B_CAPPED_EXIT_GATE, TFB_PA_SUKUK_ASSET_CLASS, TFB_OPP_AUDIT_ROWS_MAX); and a DISARMED KILL-SWITCH now degrades the verdict to DRIFT instead of printing CLEAN over an unprotected system. pa pin 1.7.0->1.7.1. # v1.0.10 (2026-07-24): MANIFEST RE-SYNC after two unattended build days — a stale manifest makes every drift report fiction. Live-verified pins: opportunity_builder 1.5.0->1.7.0, portfolio_actions 1.4.0->1.7.0 (PRECEDENCE), run_daily_brief 1.13.0->1.15.1, run_calendar_sync 1.1.0->1.1.1. FLAGS += the five builder/pa switches shipped since v1.0.9 and never checked: TFB_OPP_PREGATE_ORDER, TFB_OPP_SELL_CLASS_GATE, TFB_TRIM_BY_RULE_GATE, TFB_PA_PRECEDENCE_GATE (armed kills) + TFB_OPP_MAX_CANDIDATES, TFB_OPP_INVESTABILITY_GATE, TFB_OPP_RANK_BY_ENGINE_ROI (value flags). # v1.0.9 (2026-07-22): +run_daily_brief 1.13.0 + send_digest 1.2.1 (rulebook on all mail surfaces) + run_calendar_sync 1.1.0 (sticky dates), +run_shadow_scorer 1.2.1 (DEF-R _now_riyadh), +pit_snapshot 1.0.1 (harvest ticker-shape guard); # v1.0.8 (2026-07-21 PM): compliance-gate wave — opportunity_builder 1.5.0, +core.analysis.portfolio_actions 1.4.0; FLAGS +TFB_COMPLIANCE_SURFACE_GATE/TFB_ELIGIBILITY_GATE/TFB_EXIT_BY_RULE_GATE (armed kills) +TFB_SHARIAH_FAIL_LIST/TFB_EXIT_BY_RULE_EXTRA/TFB_KSA_FOREIGN_RESTRICTED (value flags); # v1.0.7 (2026-07-21): WINDOW MANIFEST SYNC — the verifier must mirror every live-verified bump or its drift reports are fiction: opportunity_builder 1.4.0 (W-2), run_shadow_scorer 1.2.0 (P0-C), track_performance 6.27.0 (W-1); +core.providers.yahoo_chart_provider 8.10.0 (W-5); SCRIPTS +refresh_shariah_authority 1.1.0, +backup_workbook 1.0.0 (W-4), +pit_snapshot 1.0.0 (W-6); check_scripts gains a __version__ fallback (new scripts use the calendar_sync convention); FLAGS +W-2 freshness family, +scorer honesty pair (workflow-scoped), +TFB_YC_SYMBOL_SKIP, +TFB_SHARIAH_SHEET_ID; v1.0.6 (2026-07-20): +TFB_SR_TRANSIENT_RETRY; v1.0.5: v1.0.5 (2026-07-20): manifest sync — opportunity_builder 1.3.0, portfolio_actions 1.3.0 (live-verified); v1.0.4: +TFB_OPP_REF_CONSERVATIVE (D-12) in FLAGS
 
 # (import path, version attribute, expected version, label)
 MODULES: List[Tuple[str, str, str, str]] = [
@@ -57,9 +57,11 @@ MODULES: List[Tuple[str, str, str, str]] = [
     ("core.scoring", "__version__", "5.10.0", "scoring"),
     ("core.enriched_quote", "MODULE_VERSION", "4.10.0", "enriched quote"),
     ("core.analysis.opportunity_builder", "OPPORTUNITY_BUILDER_VERSION",
-     "1.5.0", "opportunity builder"),
+     "1.7.0", "opportunity builder"),
     ("core.analysis.portfolio_actions", "PORTFOLIO_ACTIONS_VERSION",
-     "1.4.0", "portfolio actions"),
+     "1.7.1", "portfolio actions"),
+    ("routes.advanced_analysis", "ADVANCED_ANALYSIS_VERSION", "4.11.0",
+     "advanced analysis route"),
     ("core.analysis.top10_selector", "TOP10_SELECTOR_VERSION", "4.23.0",
      "top10 selector"),
     ("core.providers.yahoo_chart_provider", "PROVIDER_VERSION", "8.10.0",
@@ -76,9 +78,9 @@ SCRIPTS: List[Tuple[str, str, str]] = [
     ("refresh_shariah_authority", "1.1.0", "shariah refresh"),
     ("backup_workbook", "1.0.0", "workbook backup"),
     ("pit_snapshot", "1.0.1", "pit snapshot"),
-    ("run_daily_brief", "1.13.0", "daily brief"),
+    ("run_daily_brief", "1.15.1", "daily brief"),
     ("send_digest", "1.2.1", "digest"),
-    ("run_calendar_sync", "1.1.0", "calendar sync"),
+    ("run_calendar_sync", "1.1.1", "calendar sync"),
 ]
 
 # (env name, default, meaning when ARMED, is_kill_switch)
@@ -115,6 +117,21 @@ FLAGS: List[Tuple[str, str, str, bool]] = [
     ("TFB_SHARIAH_FAIL_LIST", "", "authority FAIL override list (CSV)", False),
     ("TFB_EXIT_BY_RULE_EXTRA", "", "operator model-screen exits, e.g. BBD.US,NMM.US", False),
     ("TFB_KSA_FOREIGN_RESTRICTED", "4030.SR", "broker-rejected symbols for the operator", False),
+    ("TFB_OPP_PREGATE_ORDER", "1", "candidate clamp cuts the QUALITY slice, not arrival order", True),
+    ("TFB_OPP_SELL_CLASS_GATE", "1", "sell-class names excluded from candidates", True),
+    ("TFB_TRIM_BY_RULE_GATE", "1", "risk-budget trims uncappable by low confidence", True),
+    ("TFB_PA_PRECEDENCE_GATE", "1", "allocator may narrow the engine verdict, never upgrade", True),
+    ("TFB_OPP_MAX_CANDIDATES", "0", "0 = full pool; >0 clamps the scan (pregate-ordered)", False),
+    ("TFB_OPP_INVESTABILITY_GATE", "0", "engine WATCHLIST/BLOCKED excluded from candidates", False),
+    ("TFB_OPP_RANK_BY_ENGINE_ROI", "0", "INVEST pool ordered by engine 12M, not opportunity score", False),
+    ("TFB_OPP_AUDIT_ROWS_MAX", "0", "0 = unlimited written audit rows", False),
+    ("TFB_ADV_ENGINE_CALL_TIMEOUT", "0", "engine call fails SOFT before Render's ~100s edge kill (502 guard)", False),
+    ("TFB_ADV_ENGINE_CALL_TIMEOUT_S", "75", "edge-guard budget in seconds", False),
+    ("TFB_PF_IDENTITY_GATE", "0", "holding identity mismatch blocks its action", False),
+    ("TFB_PF_CONFIRM_PERSIST", "1", "ADD needs 2 consecutive days before funding", True),
+    ("TFB_PF_VF_CONFLICT_GUARD", "0", "valuation EXIT/TRIM withheld on provider conflict", False),
+    ("TFB_RULE1B_CAPPED_EXIT_GATE", "1", "capped EXIT still surfaces as a rule exit", True),
+    ("TFB_PA_SUKUK_ASSET_CLASS", "0", "sukuk scored on its own asset-class rules", False),
 ]
 
 _ARMED = {"1", "true", "yes", "on"}
@@ -129,7 +146,9 @@ _VALUE_FLAGS = {"TFB_OPP_STOP_VOL_MULT", "TFB_BACKTEST_MIN_DSR",
                 "TFB_YC_SYMBOL_SKIP", "TFB_SHARIAH_SHEET_ID",
                 "TFB_SHADOW_MIN_FRESH_PCT",
                 "TFB_SHARIAH_FAIL_LIST", "TFB_EXIT_BY_RULE_EXTRA",
-                "TFB_KSA_FOREIGN_RESTRICTED"}
+                "TFB_KSA_FOREIGN_RESTRICTED",
+                "TFB_OPP_MAX_CANDIDATES", "TFB_OPP_AUDIT_ROWS_MAX",
+                "TFB_ADV_ENGINE_CALL_TIMEOUT_S"}
 
 # v1.0.3: SCOPE. These live in GitHub workflow env blocks, never in Render, so
 # this script — which reads the LOCAL process environment — structurally
@@ -139,7 +158,9 @@ _VALUE_FLAGS = {"TFB_OPP_STOP_VOL_MULT", "TFB_BACKTEST_MIN_DSR",
 _WORKFLOW_SCOPED = {"TRACK_HORIZONS", "TFB_SYNC_NAME_DEDUP_MODE",
                     "TFB_SHADOW_PRICE_HONESTY", "TFB_SHADOW_MIN_FRESH_PCT",
                 "TFB_SHARIAH_FAIL_LIST", "TFB_EXIT_BY_RULE_EXTRA",
-                "TFB_KSA_FOREIGN_RESTRICTED"}
+                "TFB_KSA_FOREIGN_RESTRICTED",
+                "TFB_OPP_MAX_CANDIDATES", "TFB_OPP_AUDIT_ROWS_MAX",
+                "TFB_ADV_ENGINE_CALL_TIMEOUT_S"}
 
 
 def check_modules() -> List[Dict[str, Any]]:
@@ -276,8 +297,13 @@ def main(argv: Optional[List[str]] = None) -> int:
              if m["status"] in ("BEHIND", "AHEAD", "NO_VERSION")]
     missing = [m for m in mods + scripts if m["status"] == "MISSING"]
     failed = [t for t in tests if t["status"] != "PASS"]
+    # v1.0.11: a kill-switch that ships ARMED but reads disarmed on the live
+    # box is a silently unprotected system — it must never print CLEAN.
+    disarmed = [f for f in flags
+                if f.get("kill_switch") and not f.get("armed")
+                and f.get("scope") != "workflow"]
     verdict = ("FAIL" if (missing or failed)
-               else "DRIFT" if drift else "CLEAN")
+               else "DRIFT" if (drift or disarmed) else "CLEAN")
 
     if args.json:
         print(json.dumps({"version": SCRIPT_VERSION, "verdict": verdict,
@@ -329,6 +355,9 @@ def main(argv: Optional[List[str]] = None) -> int:
              f"/{len(tests)}" if tests else ""))
     if drift:
         print("  drift: " + ", ".join(f"{m['label']}={m.get('live')}" for m in drift))
+    if disarmed:
+        print("  DISARMED KILL-SWITCHES: "
+              + ", ".join(f["flag"] for f in disarmed))
     if missing:
         print("  MISSING: " + ", ".join(m["label"] for m in missing))
     unarmed = [f["flag"] for f in flags
