@@ -36,6 +36,34 @@ ENV
     TFB_BRIEF_PDF        "1" (default) attach a PDF copy of the recommendations to the
                          email and write it next to --out; "0" disables (kill-switch)
 
+v1.15.1 — TWO HONESTY FIXES (funnel wording + shadow buy-leg awareness)
+--------------------------------------------------------------------------
+(H1) FUNNEL WORDING. The v1.14.0 box rendered "10,311 in pool -> 300
+scanned -> top blocker Valuation Sanity (285 names)". Forensics on
+2026-07-23 proved that sentence is FALSE: TFB_OPP_MAX_CANDIDATES is unset
+(0 = unlimited), so the builder evaluates the WHOLE pool — a
+production-equivalent run on that day's 10,465 rows returned
+kpis["scanned"] = 10,465. The "300" is TFB_OPP_AUDIT_ROWS_MAX, the cap on
+the WRITTEN audit grid, and because that grid is filled by descending
+opportunity score it is structurally biased toward implausible-upside
+names — which is why 285 of it fails Valuation Sanity. So the old line
+understated the scan by ~35x AND presented a biased sample's blocker
+profile as the funnel's. FIX: the universe count leads, the blocker is
+explicitly attributed to the audit SAMPLE, and no number claims to be the
+scan size unless the sheet actually reports one. No parser change — same
+regexes, honest wording.
+
+(H2) SHADOW BUY-LEG AWARENESS. The first live box (2026-07-23) read "sell
+2222.SR -> buy 1321.SR" while 1321.SR was already 9.5% of the operator's
+book; all three scanned pairs bought the same held name. v1.15.0 was
+held-aware on the SELL leg only. FIX: the pair chooser now prefers a pair
+whose sell leg IS held AND whose buy leg is NOT; when only held-buy pairs
+exist the box still renders (the signal is real) but says so plainly —
+"adds to a position you already hold" — so it can never read as a fresh
+buy idea. Kill-switches unchanged (TFB_BRIEF_FUNNEL,
+TFB_BRIEF_SHADOW_ROTATION); both OFF states remain byte-identical
+v1.14.1/v1.15.0. ZERO functions removed.
+
 v1.15.0 — SHADOW ROTATION BOX (operator-requested, 2026-07-23)
 --------------------------------------------------------------------------
 The operator is now live-investing and asked to SEE the Shadow_Board
@@ -448,7 +476,7 @@ from __future__ import annotations
 #       ticket from tonight's brief onward. Fix: tag-tolerant detection
 #       (INVEST anywhere in the note's first 60 chars; grace/exit notes
 #       carry no INVEST and remain excluded).
-__version__ = "1.15.0"
+__version__ = "1.15.1"
 
 # v1.12.0 — MARKET-PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
 # WHY (2026-07-16): read_pages_live fetched every page via a hardcoded
@@ -1181,12 +1209,23 @@ def _shadow_rotation_html(model: Dict[str, Any]) -> str:
     for grp in ("sell", "trim", "add", "hold", "verify"):
         for r in d.get(grp) or []:
             held.add(_s(r.get("symbol")).upper())
+    # v1.15.1 (H2): prefer a pair that is a genuine ROTATION — sell leg held,
+    # buy leg NOT held. Fall back through held-buy pairs (still a real signal,
+    # but labelled as an add) and finally to an exited sell leg.
     pick = None
+    note = ""
     for p in pairs:
-        if p["sell"] in held:
+        if p["sell"] in held and p["buy"] not in held:
             pick = p
             break
-    note = ""
+    if pick is None:
+        for p in pairs:
+            if p["sell"] in held:
+                pick = p
+                note = (' <span style="color:#8C97A3;">(buy leg is a name you '
+                        'already hold &mdash; this would ADD to it, not open '
+                        'a new position)</span>')
+                break
     if pick is None:
         pick = pairs[0]
         note = (' <span style="color:#8C97A3;">(sell leg no longer held '
@@ -2015,10 +2054,12 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     if _funnel_enabled() and not t["top"]:
         _fu = model.get("funnel") or {}
         if _fu.get("scanned") is not None:
-            _pool_txt = (f'{_fu["pool"]:,} in pool &rarr; '
+            # v1.15.1 (H1): the universe count leads and is named honestly —
+            # every row in it is evaluated (the clamp is unset in production).
+            _pool_txt = (f'<strong>{_fu["pool"]:,} names screened</strong> &rarr; '
                          if _fu.get("pool") else "")
             funnel_html = f"""<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#EEF1F4; border:1px solid #D5DCE3; border-left:4px solid {HOLD_C}; margin-bottom:10px;"><tr><td style="padding:11px 14px; font-family:{SANS}; font-size:12px; color:#46535F; line-height:1.7;">
-      <strong style="font-family:{SERIF};">Why zero today.</strong> {_pool_txt}<strong>{_fu["scanned"]:,} scanned</strong> &rarr; top blocker <strong>{_esc(_fu.get("blocker") or "&mdash;")}</strong> ({_fu.get("blocker_n") or 0} names) &rarr; {_fu.get("passed", 0)} passed every gate &rarr; <strong>{_fu.get("funded", 0)} funded</strong>. An empty list is the gates holding the bar, not a scan failure &mdash; the per-gate breakdown is on your Top&nbsp;10 sheet's Data&nbsp;Gaps table.
+      <strong style="font-family:{SERIF};">Why zero today.</strong> {_pool_txt}<strong>{_fu.get("passed", 0)} cleared every gate</strong> &rarr; <strong>{_fu.get("funded", 0)} funded</strong>. Most common blocker in the {_fu["scanned"]:,}-row audit sample written to your sheet: <strong>{_esc(_fu.get("blocker") or "&mdash;")}</strong> ({_fu.get("blocker_n") or 0} names) &mdash; that grid is ordered by opportunity score, so it over-represents implausible-upside names and is a sample, not the whole funnel. An empty list is the gates holding the bar, not a scan failure; the full per-gate breakdown is on your Top&nbsp;10 sheet's Data&nbsp;Gaps table.
     </td></tr></table>"""
 
     # ---- per-page strip ----
