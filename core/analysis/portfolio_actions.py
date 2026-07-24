@@ -458,7 +458,52 @@ from datetime import datetime, timedelta, timezone
 # it, and the reason string names the clause. Kill: TFB_EXIT_BY_RULE_GATE=0
 # restores v1.3.0 decisions byte-for-byte. Ships armed.
 # -----------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.6.0"
+# -----------------------------------------------------------------------------
+# v1.7.0 (2026-07-24) — ACTION PRECEDENCE: THE ALLOCATOR MAY NARROW, NEVER
+# UPGRADE. WHY (workbook evidence, export of 2026-07-24 08:45):
+#   1321.SR — My_Portfolio (the engine's canonical row) says
+#       Recommendation=HOLD · Investability Status=WATCHLIST ·
+#       Final Action=WATCH · Block Reason="Conservative gate: overall 64 < 68"
+#   Portfolio_Decision the same minute says  ADD 9 sh (~1,797 SAR).
+#   The ADD ladder (step 5) qualifies on valuation ROI + reliability + DQ +
+#   conflict alone; it never consults the engine's own investability verdict,
+#   so a name the engine explicitly WATCH-listed was upgraded to a funded buy.
+#   This is the compliance-blindness class of defect on a third surface: a
+#   downstream allocator is allowed to be MORE conservative than the engine
+#   (INVEST -> HOLD/TRIM/EXIT) and must never be more aggressive.
+# FIX — step 5a, evaluated the moment ADD qualifies and BEFORE cap/headroom
+#   and confidence logic so the printed reason names the true binding fact:
+#   a non-INVESTABLE engine verdict vetoes ADD and returns
+#       HOLD | "PRECEDENCE (§4.7): engine verdict WATCHLIST blocks ADD (...)"
+#   with capped_from=ADD (the existing suppressed-action contract every
+#   consumer already handles: funding pass, cockpit, brief, alert split).
+#   Blank/unknown investability PERMITS the add — proven-block-only, the same
+#   philosophy the freshness and trust gates use. TRIM/EXIT/HOLD paths are
+#   untouched: narrowing is always allowed, and rule exits (1a) and rule
+#   trims still outrank everything.
+# Kill: TFB_PA_PRECEDENCE_GATE=0 restores v1.6.0 decisions byte-for-byte.
+# Ships armed. Zero functions removed; additions: _env_precedence_gate,
+# _engine_add_veto.
+# -----------------------------------------------------------------------------
+# v1.7.1 (2026-07-24, external-review catch — credited): v1.7.0's WHY-block
+# promised "blank/unknown PERMITS the add" but the allow-list code vetoed every
+# non-blank token it did not recognize (UNKNOWN / N/A / PENDING). Doc and code
+# disagreed. Resolved by making BOTH lists explicit and the third case loud —
+# and NOT by the reviewer's deny-list-only fix, which would silently permit an
+# ADD on any FUTURE negative status the list has not learned yet (SUSPENDED,
+# HALTED, RESTRICTED...) — i.e. it would re-open the exact 1321.SR hole on the
+# next vocabulary change. Final policy, in evaluation order:
+#   blank / column absent      -> PERMIT (schema tolerance; nothing was said)
+#   _ENGINE_ADD_OK token       -> PERMIT (the engine said yes)
+#   _ENGINE_ADD_DENY token     -> VETO, verdict named
+#   anything else (populated)  -> VETO with a DISTINCT "unrecognized engine
+#                                 verdict" reason, so an unknown vocabulary is
+#                                 VISIBLE on the row instead of silently
+#                                 upgrading or silently blocking.
+# Rationale: this gate may only ever NARROW. Over-blocking is printed on the
+# holding and reversible in one env flip; under-blocking is invisible and puts
+# money into a name the engine refused. Zero functions removed.
+PORTFOLIO_ACTIONS_VERSION = "1.7.1"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -592,6 +637,46 @@ def _env_int(name, default):
 def _env_enabled():
     return str(_env_str("TFB_PF_ENABLED", "1")).strip().lower() not in (
         "0", "false", "no", "off")
+
+
+def _env_precedence_gate():
+    """v1.7.0 kill-switch — DEFAULT ON. Set TFB_PA_PRECEDENCE_GATE=0 to
+    restore the v1.6.0 ADD ladder (engine verdict ignored) byte-for-byte."""
+    return (os.getenv("TFB_PA_PRECEDENCE_GATE") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+# Engine investability tokens that PERMIT an allocator ADD. Anything else
+# (WATCHLIST, BLOCKED, NOT_INVESTABLE, DO_NOT_INVEST, ...) vetoes it; blank
+# or unknown permits, matching the house "fail on PROVEN block only" rule.
+_ENGINE_ADD_OK = ("INVESTABLE", "INVEST", "OK", "ELIGIBLE", "TRADABLE",
+                  "APPROVED", "PASS")
+# v1.7.1: proven-negative vocabulary — these produce the clean, named veto.
+_ENGINE_ADD_DENY = ("WATCHLIST", "WATCH", "BLOCKED", "BLOCK",
+                    "NOTINVESTABLE", "NONINVESTABLE", "DONOTINVEST",
+                    "INELIGIBLE", "EXCLUDED", "RESTRICTED", "SUSPENDED",
+                    "HALTED", "FAIL", "REJECTED")
+
+
+def _engine_add_veto(cand):
+    """v1.7.0: (verdict, why) when the engine's own investability verdict
+    forbids upgrading this holding to ADD; (None, None) when it permits.
+    Reads the canonical value normalize_candidate captured into
+    cand.engine_gate.investability (source column: Investability Status),
+    with its Block Reason as the explanation."""
+    eg = cand.get("engine_gate") or {}
+    raw = str(eg.get("investability") or "").strip()
+    tok = "".join(ch for ch in raw.upper() if ch.isalnum())
+    if not tok or tok in _ENGINE_ADD_OK:
+        return (None, None)                      # nothing said / said yes
+    why = str(eg.get("reasons") or "").strip()
+    if tok in _ENGINE_ADD_DENY:
+        return (raw.upper(), why[:80])           # proven negative
+    # v1.7.1: populated but unrecognized — narrow (never upgrade on a verdict
+    # nobody can read) and SAY SO, so a vocabulary drift is diagnosable.
+    return ("UNRECOGNIZED:" + raw.upper()[:24],
+            (why[:60] + " | " if why else "") +
+            "verdict not in known vocabulary")
 
 
 def _env_exit_by_rule_gate():
@@ -1670,6 +1755,18 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
               roi is not None and roi >= controls["add_roi_pct"] and
               cand.get("conflict") is not True)
     if add_ok:
+        # 5a. PRECEDENCE (v1.7.0) — the engine's verdict outranks the
+        #     allocator's arithmetic. Placed before headroom/confidence so
+        #     the reason names the binding fact (1321.SR lesson).
+        if _env_precedence_gate():
+            _eng_verdict, _eng_why = _engine_add_veto(cand)
+            if _eng_verdict:
+                return (ACTION_HOLD,
+                        "PRECEDENCE (\u00a74.7): engine verdict %s blocks "
+                        "ADD%s \u2014 allocator may narrow, never upgrade"
+                        % (_eng_verdict,
+                           (" (%s)" % _eng_why) if _eng_why else ""),
+                        0.0, ACTION_ADD)
         headroom = (weight_pct is None or
                     weight_pct < controls["max_position_pct"])
         sector_room = (sector_weight_pct is None or
