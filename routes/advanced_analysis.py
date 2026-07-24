@@ -2,6 +2,50 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
+Advanced Analysis Root Owner — v4.14.0
+REQUEST-BUDGETED • DISTRIBUTED-SINGLE-FLIGHT • AUTH-FAIL-CLOSED
+CANONICAL-ENV • PROVIDER-HEALTH-TIMEBOXED • EVENT-LOOP-SAFE
+================================================================================
+v4.14.0 [ROUTE-HARDENING] closes the remaining operational gaps in v4.13.0
+without changing scoring, ranking, portfolio arithmetic, schemas, or the
+frozen decision payloads:
+
+1. TOTAL OPPORTUNITY DEADLINE. The route budget now covers pool collection,
+   provider health, opportunity construction, optional news display, and final
+   envelope work. Previously only the final opportunity-builder call was
+   bounded; the Top-10 selector that creates the pool could consume minutes
+   before that guard started.
+2. DISTRIBUTED SINGLE-FLIGHT. The local process lock is retained and an
+   optional Redis lease now coordinates Gunicorn workers. When REDIS_URL is
+   configured the distributed lease is required by default; a second worker
+   receives a controlled `build_already_running` response instead of starting
+   another full-universe scan.
+3. LOCK COVERS THE EXPENSIVE POOL. The lease is acquired before the selector,
+   not after it. Timed-out background work keeps ownership until it actually
+   finishes, preventing retry-driven thread pile-up.
+4. PROVIDER HEALTH IS ALWAYS TIME-BOXED and synchronous health/factory calls
+   run off the event loop. The generic sheet-row path and health endpoints now
+   receive the same protection previously limited to the two decision routes.
+5. SYNC/ASYNC ENGINE COMPATIBILITY. v2 adapters no longer blindly `await` a
+   synchronous `get_sheet_rows`; synchronous methods execute in a worker
+   thread and awaitable returns are still supported.
+6. AUTH FAILS CLOSED. If the shared auth module cannot import, protected data
+   endpoints no longer become public. A constant-time environment/settings
+   fallback is used. A client-supplied header can no longer self-enable query
+   tokens.
+7. CANONICAL BOOLEAN/NUMERIC PARSING. All route flags accept the project-wide
+   eight-value vocabulary and reject NaN/Inf.
+8. PORTFOLIO BUILDER BUDGET. The synchronous portfolio action builder runs
+   off-loop under a bounded timeout and returns the existing error contract on
+   exhaustion.
+9. SAFER TELEMETRY. Request IDs are sanitized, production payloads avoid raw
+   internal exception text, explicit candidate/holding row counts are capped,
+   and route metadata exposes phase timings and lock state.
+
+Kill switches remain available. Safety guards default ON; setting their
+documented flags to a canonical false value restores the prior inline behavior.
+
+================================================================================
 Advanced Analysis Root Owner — v4.11.0  (EDGE-TIMEOUT-GUARD)
 ================================================================================
 v4.11.0 [EDGE-TIMEOUT-GUARD]: WHY -- diagnosed from the 2026-07-01 sync +
@@ -339,6 +383,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import threading
+import hmac
 import json
 import logging
 import math
@@ -346,8 +391,8 @@ import os
 import re
 import time
 import uuid
-from dataclasses import is_dataclass
-from datetime import date, datetime, time as dt_time
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -415,7 +460,54 @@ logger.addHandler(logging.NullHandler())
 # off-loop switch (TFB_OPP_BUILD_OFFLOOP) still gates the threading itself.
 # Zero functions removed; addition: _opp_build_lock + _opp_build_in_thread.
 # ==============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.13.0"
+ADVANCED_ANALYSIS_VERSION = "4.14.1"
+# =============================================================================
+# v4.14.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v4.14.0.
+#
+# v4.14.0 is good work and NOTHING in it is removed here: zero function
+# deletions (90 -> 124, all additive), and the long-requested Redis distributed
+# build lease is real and correct. Two DEFAULTS are changed, because as shipped
+# they arm behaviour changes on the single most decision-critical route in the
+# system while the S-1 evidence window is open.
+#
+#  1. REDIS BECAME A HARD DEPENDENCY FOR THE TOP-10 BOARD.
+#     _opp_distributed_lock_required() defaulted to bool(_opp_redis_url()) —
+#     i.e. TRUE whenever REDIS_URL is set, which it is (TFB_PF_CONFIRM_PERSIST=1
+#     is armed in Render and uses Redis-backed ADD confirmation). The lease path
+#     then reads:
+#         if state == "held" or _opp_distributed_lock_required(): refuse
+#     so a Redis blip, or merely exceeding the 2.5s lock-acquire timeout, yields
+#     state="unavailable" -> lease refused -> THE BOARD DOES NOT BUILD. Today the
+#     same blip is invisible, because this path has no Redis dependency at all.
+#     And transient Redis failure is not hypothetical here: portfolio_actions
+#     already documents latching to memory-only mode after one.
+#     v4.14.1 default: FALSE. The distributed lease still ACQUIRES normally and
+#     still refuses on genuine contention (state == "held" is untouched — that is
+#     the two-worker double-build this feature exists to stop). It simply
+#     degrades to the process-local lock when Redis is unreachable, which is
+#     exactly today's behaviour. Fail-open on infrastructure, fail-closed on
+#     contention. Set TFB_OPP_DISTRIBUTED_LOCK_REQUIRED=1 to restore v4.14.0.
+#
+#  2. A NEW EXECUTION PATH WAS ON BY DEFAULT.
+#     _portfolio_build_offloop_enabled() defaulted True, moving portfolio-action
+#     construction onto a worker thread. That is the right direction and it is
+#     the same shape as the opportunity off-loop — but it has never run in this
+#     deployment, and it produces the ADD/HOLD/TRIM/EXIT legs. New execution
+#     paths on the capital route are opt-in, not opt-out.
+#     v4.14.1 default: FALSE. Set TFB_PF_BUILD_OFFLOOP=1 to enable.
+#
+# KEPT ARMED, deliberately — these are improvements with no contract regression:
+#   * total route deadlines (_adv_total_timeout_s / _opp_total_timeout_s, 88s):
+#     below Render's ~100s edge kill, and both existing budgets
+#     (TFB_OPP_BUILD_TIMEOUT_S=70, TFB_ADV_ENGINE_CALL_TIMEOUT_S=75) bind first,
+#     so a clean degraded response replaces a raw 502 rather than cutting work
+#     that used to finish.
+#   * _sanitize_request_id, _constant_time_match (hmac.compare_digest with an
+#     == fallback: identical semantics, timing-safe), phase budgets, and the
+#     _opp_* lock plumbing itself.
+#   * _fallback_auth_tokens widens the accepted token sources rather than
+#     narrowing them, so it cannot lock the Apps Script frontend out.
+# ==============================================================================
 
 
 # =============================================================================
@@ -452,9 +544,18 @@ try:
         builds, returns a coroutine that resolves to the instance).
         `inspect.isawaitable` distinguishes at runtime.
         """
-        raw = _v2_get_engine()
+        if inspect.iscoroutinefunction(_v2_get_engine):
+            raw = await _v2_get_engine()
+        else:
+            raw = await asyncio.to_thread(_v2_get_engine)
         engine = await raw if inspect.isawaitable(raw) else raw
-        return await engine.get_sheet_rows(*args, **kwargs)
+        method = getattr(engine, "get_sheet_rows", None)
+        if not callable(method):
+            raise RuntimeError("v2 engine has no callable get_sheet_rows")
+        if inspect.iscoroutinefunction(method):
+            return await method(*args, **kwargs)
+        result = await asyncio.to_thread(method, *args, **kwargs)
+        return await result if inspect.isawaitable(result) else result
 
     core_get_sheet_rows = _v2_engine_factory_adapter  # type: ignore[assignment]
     CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_engine().get_sheet_rows"
@@ -485,7 +586,13 @@ if core_get_sheet_rows is None:
                     raise RuntimeError(
                         "v2 engine not ready and async factory unavailable: " + repr(inner_err)
                     ) from inner_err
-            return await engine.get_sheet_rows(*args, **kwargs)
+            method = getattr(engine, "get_sheet_rows", None)
+            if not callable(method):
+                raise RuntimeError("v2 ready engine has no callable get_sheet_rows")
+            if inspect.iscoroutinefunction(method):
+                return await method(*args, **kwargs)
+            result = await asyncio.to_thread(method, *args, **kwargs)
+            return await result if inspect.isawaitable(result) else result
 
         core_get_sheet_rows = _v2_engine_ready_adapter  # type: ignore[assignment]
         CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_engine_if_ready().get_sheet_rows"
@@ -679,19 +786,50 @@ except Exception:
         )
 
 
+_TRUTHY = frozenset({"1", "true", "yes", "y", "on", "t", "enabled", "enable"})
+_FALSY = frozenset({"0", "false", "no", "n", "off", "f", "disabled", "disable"})
+
+
+def _env_truthy_any(*names: str, default: bool = False) -> bool:
+    """Return the first explicitly configured boolean among `names`."""
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            continue
+        value = str(raw).strip().lower()
+        if value in _TRUTHY:
+            return True
+        if value in _FALSY:
+            return False
+        return bool(default)
+    return bool(default)
+
+
 def _env_truthy(name: str, default: bool = False) -> bool:
-    """1/true/yes/y/on -> True; empty -> default. Matches the route's existing
-    inline env idiom (see ALLOW_QUERY_TOKEN / TFB_TOP10_FULL_UNIVERSE)."""
-    v = (os.getenv(name) or "").strip().lower()
-    if not v:
-        return default
-    return v in {"1", "true", "yes", "y", "on"}
+    """Canonical project boolean parser.
+
+    Accepts the shared eight-value vocabulary used by main.py/config.py.
+    Unknown values fail to the caller-provided default rather than being
+    treated as truthy merely because they are non-empty.
+    """
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return bool(default)
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return bool(default)
 
 
 def _env_num(name: str, default: float) -> float:
+    """Read a finite numeric environment value, otherwise return default."""
     try:
         raw = (os.getenv(name) or "").strip()
-        return float(raw) if raw else float(default)
+        if not raw:
+            return float(default)
+        value = float(raw)
+        return value if math.isfinite(value) else float(default)
     except Exception:
         return float(default)
 
@@ -701,9 +839,8 @@ def _news_display_enabled() -> bool:
 
 
 def _adv_engine_call_timeout_enabled() -> bool:
-    """v4.11.0 edge-timeout guard master switch. See CHANGELOG. Default OFF ->
-    byte-identical to v4.10.0 (unbounded engine call)."""
-    return _env_truthy("TFB_ADV_ENGINE_CALL_TIMEOUT", False)
+    """Bound generic engine calls by default; canonical false values disable."""
+    return _env_truthy("TFB_ADV_ENGINE_CALL_TIMEOUT", True)
 
 
 def _adv_engine_call_timeout_s() -> float:
@@ -716,22 +853,219 @@ def _adv_engine_call_timeout_s() -> float:
     return max(5.0, min(95.0, v))
 
 
-# v4.13.0: process-level single-flight for the expensive opportunity build.
-# Non-blocking acquire; released inside the worker thread's finally so a
-# handler that already timed out never strands the lock.
+def _adv_total_timeout_s() -> float:
+    """End-to-end budget for generic/special sheet-row requests."""
+    value = _env_num("TFB_ADV_TOTAL_TIMEOUT_S", 88.0)
+    return max(15.0, min(95.0, value))
+
+
+# v4.14.0: local + optional Redis single-flight lease. The local lock protects
+# this worker; the Redis lease coordinates all Gunicorn workers.
 _OPP_BUILD_LOCK = threading.Lock()
+_OPP_REDIS_INIT_LOCK = threading.Lock()
+_OPP_REDIS_CLIENT: Any = None
+_OPP_REDIS_INITED = False
+_OPP_REDIS_INIT_ERROR = ""
 
 
-def _opp_build_in_thread(build_fn, *args, **kwargs):
-    """Run the (synchronous) builder, always releasing the single-flight lock
-    even when the awaiting handler has already answered degraded."""
+def _opp_redis_url() -> str:
+    for name in ("REDIS_URL", "TFB_REDIS_URL", "CACHE_REDIS_URL"):
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _opp_distributed_lock_enabled() -> bool:
+    return _env_truthy(
+        "TFB_OPP_DISTRIBUTED_LOCK",
+        bool(_opp_redis_url()),
+    )
+
+
+def _opp_distributed_lock_required() -> bool:
+    # When Redis is configured, fail closed by default if the global lease
+    # cannot be checked; otherwise the process-local lock remains a valid
+    # development fallback.
+    # v4.14.1: was bool(_opp_redis_url()) -> TRUE in production, making a Redis
+    # blip fatal to the Top-10 build. Now opt-in; the lease still acquires and
+    # still refuses genuine contention, it just falls back to the process-local
+    # lock when Redis cannot be reached.
+    return _env_truthy("TFB_OPP_DISTRIBUTED_LOCK_REQUIRED", False)
+
+
+def _opp_lock_ttl_s() -> int:
+    value = int(_env_num("TFB_OPP_LOCK_TTL_S", 900.0))
+    return max(120, min(3600, value))
+
+
+def _opp_lock_key() -> str:
+    return (os.getenv("TFB_OPP_LOCK_KEY") or "tfb:opportunity:build-lock").strip()
+
+
+def _get_opp_redis_client() -> Any:
+    global _OPP_REDIS_CLIENT, _OPP_REDIS_INITED, _OPP_REDIS_INIT_ERROR
+    if _OPP_REDIS_INITED:
+        return _OPP_REDIS_CLIENT
+    with _OPP_REDIS_INIT_LOCK:
+        if _OPP_REDIS_INITED:
+            return _OPP_REDIS_CLIENT
+        _OPP_REDIS_INITED = True
+        url = _opp_redis_url()
+        if not url:
+            _OPP_REDIS_INIT_ERROR = "redis_url_missing"
+            return None
+        try:
+            import redis  # type: ignore
+            _OPP_REDIS_CLIENT = redis.Redis.from_url(
+                url,
+                decode_responses=True,
+                socket_connect_timeout=1.5,
+                socket_timeout=1.5,
+                health_check_interval=30,
+            )
+            return _OPP_REDIS_CLIENT
+        except Exception as exc:
+            _OPP_REDIS_INIT_ERROR = exc.__class__.__name__
+            _OPP_REDIS_CLIENT = None
+            return None
+
+
+def _opp_redis_acquire_sync(token: str) -> Tuple[str, str]:
+    client = _get_opp_redis_client()
+    if client is None:
+        return "unavailable", _OPP_REDIS_INIT_ERROR or "redis_unavailable"
     try:
-        return build_fn(*args, **kwargs)
-    finally:
+        acquired = bool(client.set(
+            _opp_lock_key(), token, nx=True, ex=_opp_lock_ttl_s()))
+        return ("acquired", "") if acquired else ("held", "redis_lease_held")
+    except Exception as exc:
+        return "unavailable", exc.__class__.__name__
+
+
+def _opp_redis_release_sync(token: str) -> None:
+    if not token:
+        return
+    client = _get_opp_redis_client()
+    if client is None:
+        return
+    script = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] then "
+        "return redis.call('del', KEYS[1]) else return 0 end"
+    )
+    try:
+        client.eval(script, 1, _opp_lock_key(), token)
+    except Exception:
+        logger.warning(
+            "[advanced_analysis v%s] Redis opportunity lease release failed",
+            ADVANCED_ANALYSIS_VERSION,
+            exc_info=True,
+        )
+
+
+async def _opp_acquire_build_lease() -> Dict[str, Any]:
+    token = uuid.uuid4().hex
+    if not _OPP_BUILD_LOCK.acquire(blocking=False):
+        return {
+            "acquired": False,
+            "reason": "local_build_already_running",
+            "token": "",
+            "distributed": "not_checked",
+        }
+
+    lease: Dict[str, Any] = {
+        "acquired": True,
+        "reason": "",
+        "token": token,
+        "distributed": "disabled",
+        "distributed_acquired": False,
+    }
+    if not _opp_distributed_lock_enabled():
+        return lease
+
+    try:
+        state, reason = await asyncio.wait_for(
+            asyncio.to_thread(_opp_redis_acquire_sync, token),
+            timeout=2.5,
+        )
+    except asyncio.TimeoutError:
+        state, reason = "unavailable", "redis_lock_timeout"
+    except Exception as exc:
+        state, reason = "unavailable", exc.__class__.__name__
+
+    lease["distributed"] = state
+    lease["distributed_reason"] = reason
+    if state == "acquired":
+        lease["distributed_acquired"] = True
+        return lease
+
+    if state == "held" or _opp_distributed_lock_required():
         try:
             _OPP_BUILD_LOCK.release()
         except RuntimeError:
             pass
+        lease["acquired"] = False
+        lease["reason"] = (
+            "distributed_build_already_running"
+            if state == "held"
+            else "distributed_lock_unavailable"
+        )
+    return lease
+
+
+async def _opp_release_build_lease(lease: Mapping[str, Any]) -> None:
+    token = str(lease.get("token") or "")
+    if bool(lease.get("distributed_acquired")) and token:
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(_opp_redis_release_sync, token),
+                timeout=2.5,
+            )
+        except Exception:
+            pass
+    try:
+        _OPP_BUILD_LOCK.release()
+    except RuntimeError:
+        pass
+
+
+def _opp_release_build_lease_sync(lease: Mapping[str, Any]) -> None:
+    token = str(lease.get("token") or "")
+    if bool(lease.get("distributed_acquired")) and token:
+        _opp_redis_release_sync(token)
+    try:
+        _OPP_BUILD_LOCK.release()
+    except RuntimeError:
+        pass
+
+
+def _opp_defer_lease_release(task: "asyncio.Task[Any]", lease: Mapping[str, Any]) -> None:
+    """Keep the lease until shielded background work really finishes."""
+    try:
+        loop = asyncio.get_running_loop()
+
+        def _done(_: Any) -> None:
+            try:
+                loop.create_task(_opp_release_build_lease(lease))
+            except Exception:
+                _opp_release_build_lease_sync(lease)
+
+        task.add_done_callback(_done)
+    except Exception:
+        _opp_release_build_lease_sync(lease)
+
+
+def _opp_build_in_thread(
+    build_fn: Any,
+    lease: Mapping[str, Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run the synchronous builder and release local/global leases on exit."""
+    try:
+        return build_fn(*args, **kwargs)
+    finally:
+        _opp_release_build_lease_sync(lease)
 
 
 def _opp_degraded_payload(error: str, message: str, pool_rows, criteria):
@@ -754,18 +1088,65 @@ def _opp_degraded_payload(error: str, message: str, pool_rows, criteria):
 
 
 def _opp_build_offloop_enabled() -> bool:
-    """v4.12.0: run the opportunity build off the event loop under a budget.
-    Default OFF -> byte-identical v4.11.0 (inline, unbounded)."""
-    return _env_truthy("TFB_OPP_BUILD_OFFLOOP", False)
+    """Run synchronous opportunity work off the event loop by default."""
+    return _env_truthy("TFB_OPP_BUILD_OFFLOOP", True)
 
 
 def _opp_build_timeout_s() -> float:
-    """Budget (seconds) for the off-loop opportunity build. Default 70.0 —
-    under Render's ~100s edge ceiling with headroom for pool collection,
-    envelope assembly and transport. Clamped to [5, 95] so a bad env value
-    can neither disable the protection nor fail every request."""
-    v = _env_num("TFB_OPP_BUILD_TIMEOUT_S", 70.0)
-    return max(5.0, min(95.0, v))
+    """Maximum budget for opportunity construction after pool collection."""
+    value = _env_num("TFB_OPP_BUILD_TIMEOUT_S", 70.0)
+    return max(5.0, min(90.0, value))
+
+
+def _opp_total_timeout_s() -> float:
+    """End-to-end opportunity route budget, kept below the edge ceiling."""
+    value = _env_num("TFB_OPP_TOTAL_TIMEOUT_S", 88.0)
+    return max(15.0, min(95.0, value))
+
+
+def _opp_pool_timeout_s() -> float:
+    """Maximum selector/pool-collection budget within the total deadline."""
+    value = _env_num("TFB_OPP_POOL_TIMEOUT_S", 70.0)
+    return max(5.0, min(90.0, value))
+
+
+def _provider_health_timeout_s() -> float:
+    value = _env_num("TFB_PROVIDER_HEALTH_TIMEOUT_S", 3.0)
+    return max(0.5, min(10.0, value))
+
+
+def _special_builder_timeout_s() -> float:
+    value = _env_num("TFB_ADV_SPECIAL_BUILD_TIMEOUT_S", 70.0)
+    return max(5.0, min(90.0, value))
+
+
+def _portfolio_build_timeout_s() -> float:
+    value = _env_num("TFB_PF_BUILD_TIMEOUT_S", 20.0)
+    return max(2.0, min(60.0, value))
+
+
+def _portfolio_build_offloop_enabled() -> bool:
+    # v4.14.1: new execution path on the capital route -> opt-in.
+    return _env_truthy("TFB_PF_BUILD_OFFLOOP", False)
+
+
+def _remaining_budget(deadline_monotonic: float, *, reserve: float = 0.0) -> float:
+    return max(0.0, float(deadline_monotonic) - time.monotonic() - max(0.0, reserve))
+
+
+def _opp_explicit_rows_max() -> int:
+    value = int(_env_num("TFB_OPP_EXPLICIT_ROWS_MAX", 5000.0))
+    return max(100, min(20000, value))
+
+
+def _portfolio_holdings_max() -> int:
+    value = int(_env_num("TFB_PF_HOLDINGS_MAX", 5000.0))
+    return max(10, min(20000, value))
+
+
+def _news_display_timeout_s() -> float:
+    value = _env_num("TFB_NEWS_DISPLAY_TIMEOUT_S", 25.0)
+    return max(1.0, min(30.0, value))
 
 
 def _news_display_max() -> int:
@@ -805,7 +1186,11 @@ def _news_safe_int(x: Any) -> int:
         return 0
 
 
-async def _attach_news_display(payload: Dict[str, Any]) -> Dict[str, Any]:
+async def _attach_news_display(
+    payload: Dict[str, Any],
+    *,
+    timeout_s: Optional[float] = None,
+) -> Dict[str, Any]:
     """v4.10.0 [NEWS-DISPLAY]: fill the News column for the SURFACED decision
     symbols (selected + near_miss + candidates_rows) with live sentiment.
 
@@ -852,7 +1237,11 @@ async def _attach_news_display(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         batch = await asyncio.wait_for(
             _ni_batch_news(items, include_articles=False),
-            timeout=_env_num("TFB_NEWS_DISPLAY_TIMEOUT_S", 25.0),
+            timeout=(
+                _news_display_timeout_s()
+                if timeout_s is None
+                else max(0.5, min(_news_display_timeout_s(), float(timeout_s)))
+            ),
         )
     except Exception as exc:  # timeout or runtime/network guard
         meta["error"] = "{}: {}".format(exc.__class__.__name__, str(exc)[:160])
@@ -995,31 +1384,29 @@ def _resolve_v2_engine_factory() -> Optional[Any]:
 
 
 async def _get_v2_engine_instance() -> Optional[Any]:
-    """v4.1.0: Resolve the v2 engine instance (sync or async factory)."""
+    """Resolve the v2 engine without allowing a synchronous factory to block."""
     factory = _resolve_v2_engine_factory()
     if factory is None:
         return None
     try:
-        raw = factory()
-        if inspect.isawaitable(raw):
-            return await raw
-        return raw
-    except Exception as e:
+        if inspect.iscoroutinefunction(factory):
+            raw = await factory()
+        else:
+            raw = await asyncio.to_thread(factory)
+        return await raw if inspect.isawaitable(raw) else raw
+    except Exception as exc:
         logger.warning(
             "[advanced_analysis v%s] v2 engine factory call failed: %s: %s",
-            ADVANCED_ANALYSIS_VERSION, e.__class__.__name__, e,
+            ADVANCED_ANALYSIS_VERSION, exc.__class__.__name__, exc,
         )
         return None
 
 
 async def _extract_provider_health_snapshot() -> Dict[str, Any]:
-    """v4.1.0 [ADD-C]: Fetch the engine's provider-health snapshot.
+    """Fetch provider health without blocking the event loop.
 
-    Calls `engine.health()` and extracts the `provider_unhealthy_markers` field
-    plus `engine_version`. Returns a JSON-safe dict suitable for embedding in
-    `meta.provider_health` or serving from the dedicated endpoint.
-
-    Never raises. Safe to call from any request path.
+    The caller still owns the outer timeout. Synchronous health methods are
+    executed in a worker thread; async implementations are awaited normally.
     """
     engine = await _get_v2_engine_instance()
     if engine is None:
@@ -1030,22 +1417,28 @@ async def _extract_provider_health_snapshot() -> Dict[str, Any]:
         return {"unavailable": True, "reason": "engine_has_no_health_method"}
 
     try:
-        raw = health_method()
-        health = await raw if inspect.isawaitable(raw) else raw
-    except Exception as e:
+        if inspect.iscoroutinefunction(health_method):
+            health = await health_method()
+        else:
+            raw = await asyncio.to_thread(health_method)
+            health = await raw if inspect.isawaitable(raw) else raw
+    except Exception as exc:
         return {
             "unavailable": True,
-            "error_class": e.__class__.__name__,
-            "error_detail": str(e)[:200],
+            "error_class": exc.__class__.__name__,
+            "error_detail": _client_error_detail(
+                exc, "provider_health_failed"),
         }
 
     if not isinstance(health, dict):
-        return {"unavailable": True, "reason": "health_returned_non_dict",
-                "type": type(health).__name__}
+        return {
+            "unavailable": True,
+            "reason": "health_returned_non_dict",
+            "type": type(health).__name__,
+        }
 
     markers = health.get("provider_unhealthy_markers")
     if markers is None:
-        # Older engine version without the registry field.
         return {
             "unavailable": True,
             "reason": "no_registry_in_health",
@@ -1056,6 +1449,43 @@ async def _extract_provider_health_snapshot() -> Dict[str, Any]:
         "unhealthy_markers": markers,
         "engine_version": _strip(health.get("engine_version")) or None,
     })
+
+
+async def _provider_health_with_budget(
+    timeout_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    budget = (
+        _provider_health_timeout_s()
+        if timeout_s is None
+        else max(0.25, float(timeout_s))
+    )
+    try:
+        return await asyncio.wait_for(
+            _extract_provider_health_snapshot(),
+            timeout=budget,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "unavailable": True,
+            "reason": "provider_health_timeout",
+            "timeout_s": round(budget, 3),
+        }
+    except Exception as exc:
+        return {
+            "unavailable": True,
+            "reason": exc.__class__.__name__,
+        }
+
+
+async def _provider_engine_for_builder() -> Optional[Any]:
+    """Resolve an optional engine for derived builders under the same budget."""
+    try:
+        return await asyncio.wait_for(
+            _get_v2_engine_instance(),
+            timeout=_provider_health_timeout_s(),
+        )
+    except Exception:
+        return None
 
 
 def _lift_systemic_warning_markers(row_objects: Sequence[Mapping[str, Any]]) -> List[str]:
@@ -1354,20 +1784,89 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
 
 def _strip(v: Any) -> str:
     try:
-        s = str(v).strip()
-        return "" if s.lower() in {"none", "null"} else s
+        value = str(v).strip()
+        return "" if value.lower() in {"none", "null"} else value
     except Exception:
         return ""
 
-def _json_safe(value: Any) -> Any:
+
+def _sanitize_request_id(value: Any) -> str:
+    raw = _strip(value)
+    if not raw:
+        return uuid.uuid4().hex[:12]
+    cleaned = re.sub(r"[^A-Za-z0-9._:-]+", "", raw)[:96]
+    return cleaned or uuid.uuid4().hex[:12]
+
+
+def _is_production() -> bool:
+    env = (
+        os.getenv("TFB_ENV")
+        or os.getenv("APP_ENV")
+        or os.getenv("ENV")
+        or "production"
+    ).strip().lower()
+    return env in {"production", "prod", "live"}
+
+
+def _client_error_detail(exc: BaseException, code: str) -> str:
+    """Avoid leaking provider paths, credentials, or internals in production."""
+    if _is_production():
+        return str(code)
+    try:
+        return "{}: {}".format(exc.__class__.__name__, str(exc)[:240])
+    except Exception:
+        return str(code)
+
+
+def _constant_time_match(candidate: str, allowed: str) -> bool:
+    if not candidate or not allowed:
+        return False
+    try:
+        return hmac.compare_digest(str(candidate), str(allowed))
+    except Exception:
+        return str(candidate) == str(allowed)
+
+
+def _fallback_auth_tokens(settings: Any) -> List[str]:
+    values: List[str] = []
+    for attr in (
+        "APP_TOKEN", "app_token", "AUTH_TOKEN", "auth_token",
+        "BEARER_TOKEN", "bearer_token", "API_KEY", "api_key",
+        "app_tokens", "auth_tokens", "bearer_tokens",
+    ):
+        try:
+            value = getattr(settings, attr, None) if settings is not None else None
+        except Exception:
+            value = None
+        if isinstance(value, (list, tuple, set)):
+            values.extend(_strip(item) for item in value)
+        elif value is not None:
+            values.append(_strip(value))
+    for name in (
+        "TFB_APP_TOKEN", "APP_TOKEN", "BACKEND_TOKEN", "BACKUP_APP_TOKEN",
+        "X_APP_TOKEN", "TFB_AUTH_TOKEN", "AUTH_TOKEN", "TOKEN",
+        "TFB_BEARER_TOKEN", "BEARER_TOKEN", "TFB_API_KEY", "API_KEY",
+        "X_API_KEY", "API_TOKEN",
+    ):
+        values.append(_strip(os.getenv(name)))
+    out: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+def _json_safe(value: Any, _seen: Optional[Set[int]] = None) -> Any:
+    """Convert arbitrary objects to strict-JSON-safe values with cycle guards."""
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
-        return None if (math.isnan(value) or math.isinf(value)) else value
+        return value if math.isfinite(value) else None
     if isinstance(value, Decimal):
         try:
-            f = float(value)
-            return None if (math.isnan(f) or math.isinf(f)) else f
+            number = float(value)
+            return number if math.isfinite(number) else None
         except Exception:
             return str(value)
     if isinstance(value, (datetime, date, dt_time)):
@@ -1375,34 +1874,48 @@ def _json_safe(value: Any) -> Any:
             return value.isoformat()
         except Exception:
             return str(value)
-    if isinstance(value, bytes):
+    if isinstance(value, (bytes, bytearray, memoryview)):
         try:
-            return value.decode("utf-8", errors="replace")
+            return bytes(value).decode("utf-8", errors="replace")
         except Exception:
             return str(value)
-    if isinstance(value, Mapping):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(v) for v in value]
+
+    if _seen is None:
+        _seen = set()
+    object_id = id(value)
+    if object_id in _seen:
+        return None
+
+    _seen.add(object_id)
     try:
-        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
-            return _json_safe(value.model_dump(mode="python"))  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    try:
-        if hasattr(value, "dict") and callable(getattr(value, "dict")):
-            return _json_safe(value.dict())  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    try:
-        if is_dataclass(value):
-            return _json_safe(getattr(value, "__dict__", {}))
-    except Exception:
-        pass
-    try:
-        return _json_safe(vars(value))
-    except Exception:
-        return str(value)
+        if isinstance(value, Mapping):
+            return {str(k): _json_safe(v, _seen) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [_json_safe(v, _seen) for v in value]
+
+        try:
+            if is_dataclass(value):
+                return _json_safe(asdict(value), _seen)
+        except Exception:
+            pass
+        try:
+            dump = getattr(value, "model_dump", None)
+            if callable(dump):
+                return _json_safe(dump(mode="python"), _seen)
+        except Exception:
+            pass
+        try:
+            dump = getattr(value, "dict", None)
+            if callable(dump):
+                return _json_safe(dump(), _seen)
+        except Exception:
+            pass
+        try:
+            return _json_safe(vars(value), _seen)
+        except Exception:
+            return str(value)
+    finally:
+        _seen.discard(object_id)
 
 async def _maybe_await(x: Any) -> Any:
     try:
@@ -1411,6 +1924,22 @@ async def _maybe_await(x: Any) -> Any:
     except Exception:
         pass
     return x
+
+
+async def _invoke_callable_maybe_async(
+    fn: Any,
+    *args: Any,
+    offload_sync: bool = True,
+    **kwargs: Any,
+) -> Any:
+    """Call sync or async functions without blocking the event loop."""
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+    if offload_sync:
+        result = await asyncio.to_thread(fn, *args, **kwargs)
+    else:
+        result = fn(*args, **kwargs)
+    return await result if inspect.isawaitable(result) else result
 
 def _as_list(v: Any) -> List[Any]:
     if v is None:
@@ -1435,15 +1964,18 @@ def _maybe_bool(v: Any, default: bool) -> bool:
         return v
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         try:
-            return bool(int(v))
+            number = float(v)
+            if not math.isfinite(number):
+                return bool(default)
+            return bool(int(number))
         except Exception:
-            return default
-    s = _strip(v).lower()
-    if s in {"1", "true", "yes", "y", "on"}:
+            return bool(default)
+    value = _strip(v).lower()
+    if value in _TRUTHY:
         return True
-    if s in {"0", "false", "no", "n", "off"}:
+    if value in _FALSY:
         return False
-    return default
+    return bool(default)
 
 def _maybe_int(v: Any, default: int) -> int:
     try:
@@ -1551,19 +2083,26 @@ def _merge_body_with_query(body: Optional[Dict[str, Any]], request: Request) -> 
     return out
 
 def _allow_query_token(settings: Any, request: Request) -> bool:
+    """Query-token transport may be enabled only by trusted configuration.
+
+    A request header can no longer self-authorize query tokens.
+    """
     try:
         if settings is not None:
-            return bool(getattr(settings, "ALLOW_QUERY_TOKEN", False) or getattr(settings, "allow_query_token", False))
+            configured = getattr(
+                settings,
+                "ALLOW_QUERY_TOKEN",
+                getattr(settings, "allow_query_token", None),
+            )
+            if configured is not None:
+                return _maybe_bool(configured, False)
     except Exception:
         pass
-    if (os.getenv("ALLOW_QUERY_TOKEN", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}:
-        return True
-    try:
-        if _strip(request.headers.get("X-Allow-Query-Token")).lower() in {"1", "true", "yes"}:
-            return True
-    except Exception:
-        pass
-    return False
+    return _env_truthy_any(
+        "TFB_ALLOW_QUERY_TOKEN",
+        "ALLOW_QUERY_TOKEN",
+        default=False,
+    )
 
 def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str], settings: Any, request: Request) -> str:
     auth_token = _strip(x_app_token) or _strip(x_api_key)
@@ -1573,32 +2112,114 @@ def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str
         auth_token = _strip(token_query)
     return auth_token
 
-def _auth_passed(*, request: Request, settings: Any, auth_token: str, authorization: Optional[str]) -> bool:
-    if auth_ok is None:
-        return True
+def _auth_passed(
+    *,
+    request: Request,
+    settings: Any,
+    auth_token: str,
+    authorization: Optional[str],
+) -> bool:
+    """Authenticate through the shared config layer, failing closed on drift."""
+    open_mode = False
     try:
-        if callable(is_open_mode) and bool(is_open_mode()):
-            return True
+        if callable(is_open_mode):
+            open_mode = bool(is_open_mode())
     except Exception:
-        pass
-    headers_dict = dict(request.headers)
-    path = str(getattr(getattr(request, "url", None), "path", "") or "")
-    attempts = [
-        {"token": auth_token, "authorization": authorization, "headers": headers_dict, "path": path, "request": request, "settings": settings},
-        {"token": auth_token, "authorization": authorization, "headers": headers_dict, "path": path, "request": request},
-        {"token": auth_token, "authorization": authorization, "headers": headers_dict, "path": path},
-        {"token": auth_token, "authorization": authorization, "headers": headers_dict},
-        {"token": auth_token, "authorization": authorization},
-        {"token": auth_token},
-    ]
-    for kwargs in attempts:
+        open_mode = False
+    if not open_mode:
         try:
-            return bool(auth_ok(**kwargs))
-        except TypeError:
-            continue
+            open_mode = _maybe_bool(
+                getattr(
+                    settings,
+                    "OPEN_MODE",
+                    getattr(settings, "open_mode", False),
+                ),
+                False,
+            )
         except Exception:
-            return False
-    return False
+            open_mode = False
+    if not open_mode:
+        open_mode = _env_truthy_any(
+            "TFB_OPEN_MODE", "OPEN_MODE", "APP_OPEN_MODE", default=False)
+    if open_mode:
+        return True
+
+    require_auth: Optional[bool] = None
+    try:
+        if settings is not None:
+            configured = getattr(
+                settings,
+                "REQUIRE_AUTH",
+                getattr(settings, "require_auth", None),
+            )
+            if configured is not None:
+                require_auth = _maybe_bool(configured, True)
+    except Exception:
+        require_auth = None
+    if require_auth is None:
+        require_auth = _env_truthy_any(
+            "TFB_REQUIRE_AUTH",
+            "REQUIRE_AUTH",
+            "APP_REQUIRE_AUTH",
+            default=True,
+        )
+    if not require_auth:
+        return True
+
+    if callable(auth_ok):
+        headers_dict = dict(request.headers)
+        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        attempts = [
+            {
+                "token": auth_token,
+                "authorization": authorization,
+                "headers": headers_dict,
+                "path": path,
+                "request": request,
+                "settings": settings,
+            },
+            {
+                "token": auth_token,
+                "authorization": authorization,
+                "headers": headers_dict,
+                "path": path,
+                "request": request,
+            },
+            {
+                "token": auth_token,
+                "authorization": authorization,
+                "headers": headers_dict,
+                "path": path,
+            },
+            {
+                "token": auth_token,
+                "authorization": authorization,
+                "headers": headers_dict,
+            },
+            {"token": auth_token, "authorization": authorization},
+            {"token": auth_token},
+        ]
+        for kwargs in attempts:
+            try:
+                return bool(auth_ok(**kwargs))
+            except TypeError:
+                continue
+            except Exception:
+                return False
+        return False
+
+    # Shared auth import failed: never fail open. Use a constant-time fallback
+    # against the same settings/environment token family.
+    allowed = _fallback_auth_tokens(settings)
+    if not allowed:
+        return False
+    candidate = _strip(auth_token)
+    if not candidate and authorization:
+        parts = _strip(authorization).split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            candidate = _strip(parts[1])
+    return bool(candidate and any(
+        _constant_time_match(candidate, item) for item in allowed))
 
 def _normalize_page_flexible(page_raw: str) -> str:
     raw = _strip(page_raw)
@@ -2015,7 +2636,7 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     if kk == "data_provider":
         return "advanced_analysis.placeholder_fallback"
     if kk in {"last_updated_utc", "last_updated_riyadh"}:
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
     if kk == "recommendation":
         return "Watch" if row_index > 3 else "Accumulate"
     if kk == "recommendation_reason":
@@ -2237,35 +2858,88 @@ def _payload_envelope(
         envelope["warnings"] = list(lifted_warnings)
     return _json_safe(envelope)
 
-async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+async def _call_core_sheet_rows_best_effort(
+    *,
+    page: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Call the engine across supported signatures without blocking the loop.
+
+    Only signature-shaped TypeErrors trigger another candidate invocation.
+    A TypeError raised inside the engine is treated as a real failure instead
+    of replaying the same expensive request with several argument variants.
+    """
     if core_get_sheet_rows is None:
         return None, None
+
     candidates = [
-        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
-        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+        ((), {
+            "sheet": page, "limit": limit, "offset": offset,
+            "mode": mode, "body": body,
+        }),
+        ((), {
+            "sheet": page, "limit": limit, "offset": offset,
+            "mode": mode,
+        }),
         ((), {"sheet": page, "limit": limit, "offset": offset}),
-        ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((page,), {
+            "limit": limit, "offset": offset,
+            "mode": mode, "body": body,
+        }),
         ((page,), {"limit": limit, "offset": offset, "mode": mode}),
         ((page,), {"limit": limit, "offset": offset}),
         ((page,), {}),
     ]
-    last_err: Optional[Exception] = None
+
+    def _signature_type_error(exc: TypeError) -> bool:
+        message = str(exc).lower()
+        markers = (
+            "unexpected keyword argument",
+            "required positional argument",
+            "missing 1 required",
+            "missing required",
+            "positional arguments but",
+            "takes ",
+            "got multiple values for argument",
+        )
+        return any(marker in message for marker in markers)
+
+    last_error: Optional[Exception] = None
     for args, kwargs in candidates:
         try:
-            res = core_get_sheet_rows(*args, **kwargs)
-            res = await _maybe_await(res)
-            if isinstance(res, dict):
-                return res, CORE_GET_SHEET_ROWS_SOURCE
-            if isinstance(res, list):
-                return {"row_objects": res}, CORE_GET_SHEET_ROWS_SOURCE
-        except TypeError as e:
-            last_err = e
-            continue
-        except Exception as e:
-            last_err = e
+            result = await _invoke_callable_maybe_async(
+                core_get_sheet_rows,
+                *args,
+                offload_sync=True,
+                **kwargs,
+            )
+            if isinstance(result, dict):
+                return result, CORE_GET_SHEET_ROWS_SOURCE
+            if isinstance(result, list):
+                return {"row_objects": result}, CORE_GET_SHEET_ROWS_SOURCE
+        except TypeError as exc:
+            last_error = exc
+            if _signature_type_error(exc):
+                continue
             break
-    if last_err is not None:
-        return {"status": "error", "error": str(last_err), "row_objects": []}, CORE_GET_SHEET_ROWS_SOURCE
+        except Exception as exc:
+            last_error = exc
+            break
+
+    if last_error is not None:
+        return (
+            {
+                "status": "error",
+                "error": _client_error_detail(
+                    last_error, "engine_sheet_rows_failed"),
+                "error_class": last_error.__class__.__name__,
+                "row_objects": [],
+            },
+            CORE_GET_SHEET_ROWS_SOURCE,
+        )
     return None, None
 
 def _normalize_external_payload(
@@ -2344,57 +3018,102 @@ async def _build_special_page_payload(
     offset: int,
     top_n: int,
     requested_symbols: Sequence[str],
+    timeout_s: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
-    """v4.5.0 [BRIDGE-FIX]: invoke the REAL builder for a derived special page.
-
-    Returns the builder's raw envelope dict (to be projected by
-    `_normalize_external_payload`), or None when the page is not a
-    builder-backed special page, the builder is unbound, it raises, or it
-    yields nothing. NEVER raises — every failure degrades to None so the caller
-    falls through to the engine path and then the existing fallback.
-
-    Top_10: `build_top10_rows` returns a coroutine inside the running loop, so
-    we `_maybe_await` it (the un-awaited-coroutine bug fixed here). We pass
-    `symbols` only when the request explicitly supplied them, so a bare Top_10
-    request performs the full-universe selection rather than being constrained.
-
-    Insights: `build_insights_analysis_rows` is async + keyword-only; we hand it
-    the resolved v2 engine when available (it is engine-optional and will
-    self-resolve its universe otherwise).
-    """
+    """Invoke a derived-page builder under a bounded, event-loop-safe budget."""
+    configured_budget = _special_builder_timeout_s()
+    budget = (
+        configured_budget
+        if timeout_s is None
+        else max(0.5, min(configured_budget, float(timeout_s)))
+    )
+    del merged_body, offset  # reserved for future builder-specific controls
     try:
         if page == _TOP10_PAGE and _build_top10_rows is not None:
-            kwargs: Dict[str, Any] = {"limit": max(top_n, limit), "mode": mode or ""}
-            syms = [s for s in (requested_symbols or []) if s]
-            if syms:
-                kwargs["symbols"] = list(syms)
-                kwargs["direct_symbols"] = list(syms)
-            res = _build_top10_rows(**kwargs)
-            res = await _maybe_await(res)
-            if isinstance(res, dict) and _extract_rows_like(res):
-                return res
+            lease = await _opp_acquire_build_lease()
+            if not bool(lease.get("acquired")):
+                logger.warning(
+                    "[advanced_analysis v%s] Top_10 special builder skipped: %s",
+                    ADVANCED_ANALYSIS_VERSION,
+                    lease.get("reason") or "build_already_running",
+                )
+                return None
+
+            kwargs: Dict[str, Any] = {
+                "limit": max(top_n, limit),
+                "mode": mode or "",
+            }
+            symbols = [symbol for symbol in (requested_symbols or []) if symbol]
+            if symbols:
+                kwargs["symbols"] = list(symbols)
+                kwargs["direct_symbols"] = list(symbols)
+
+            task = asyncio.create_task(
+                _invoke_callable_maybe_async(
+                    _build_top10_rows,
+                    **kwargs,
+                    offload_sync=True,
+                )
+            )
+            release_deferred = False
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=budget,
+                )
+            except asyncio.TimeoutError:
+                release_deferred = True
+                _opp_defer_lease_release(task, lease)
+                logger.warning(
+                    "[advanced_analysis v%s] Top_10 special builder exceeded %.1fs; "
+                    "falling through without starting another build",
+                    ADVANCED_ANALYSIS_VERSION,
+                    budget,
+                )
+                return None
+            finally:
+                if not release_deferred:
+                    await _opp_release_build_lease(lease)
+
+            if isinstance(result, dict) and _extract_rows_like(result):
+                return result
             return None
 
         if page == _INSIGHTS_PAGE and _build_insights_rows is not None:
-            engine = None
-            try:
-                engine = await _get_v2_engine_instance()
-            except Exception:
-                engine = None
-            syms = [s for s in (requested_symbols or []) if s]
-            res = await _build_insights_rows(
-                engine=engine,
-                symbols=(list(syms) or None),
-                mode=mode or "",
+            engine = await _provider_engine_for_builder()
+            symbols = [symbol for symbol in (requested_symbols or []) if symbol]
+            task = asyncio.create_task(
+                _invoke_callable_maybe_async(
+                    _build_insights_rows,
+                    engine=engine,
+                    symbols=(list(symbols) or None),
+                    mode=mode or "",
+                    offload_sync=True,
+                )
             )
-            if isinstance(res, dict) and _extract_rows_like(res):
-                return res
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=budget,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[advanced_analysis v%s] Insights builder exceeded %.1fs",
+                    ADVANCED_ANALYSIS_VERSION,
+                    budget,
+                )
+                return None
+            if isinstance(result, dict) and _extract_rows_like(result):
+                return result
             return None
-    except Exception as e:
+    except Exception as exc:
         logger.warning(
             "[advanced_analysis v%s] special-page builder for %s failed (%s: %s); "
             "falling through to engine/fallback path",
-            ADVANCED_ANALYSIS_VERSION, page, e.__class__.__name__, e,
+            ADVANCED_ANALYSIS_VERSION,
+            page,
+            exc.__class__.__name__,
+            exc,
         )
         return None
 
@@ -2413,7 +3132,11 @@ async def _run_advanced_sheet_rows_impl(
     x_request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     start = time.time()
-    request_id = _strip(x_request_id) or str(uuid.uuid4())[:12]
+    start_mono = time.monotonic()
+    total_budget_s = _adv_total_timeout_s()
+    deadline = start_mono + total_budget_s
+    phase_meta: Dict[str, float] = {}
+    request_id = _sanitize_request_id(x_request_id)
     try:
         settings = get_settings_cached()
     except Exception:
@@ -2452,7 +3175,21 @@ async def _run_advanced_sheet_rows_impl(
     # Total budget = single async call to engine.health() (no upstream API).
     # Forwarded into both success and fail-soft envelopes so every response
     # carries the engine's current view of provider health at request time.
-    provider_health = await _extract_provider_health_snapshot()
+    health_started = time.monotonic()
+    health_budget = min(
+        _provider_health_timeout_s(),
+        _remaining_budget(deadline, reserve=5.0),
+    )
+    provider_health = (
+        await _provider_health_with_budget(health_budget)
+        if health_budget >= 0.25
+        else {
+            "unavailable": True,
+            "reason": "route_budget_exhausted_before_health",
+        }
+    )
+    phase_meta["provider_health_ms"] = round(
+        (time.monotonic() - health_started) * 1000.0, 3)
 
     # v4.5.0 [BRIDGE-FIX]: dispatch derived special pages to their REAL builders
     # FIRST (mirrors the v4.4.0 Data_Dictionary precedence). The live engine
@@ -2461,11 +3198,23 @@ async def _run_advanced_sheet_rows_impl(
     # a None return (unbound / empty / raised) falls straight through to the
     # engine path below, then to the existing non-empty fallback.
     if page in (_TOP10_PAGE, _INSIGHTS_PAGE):
-        special_payload = await _build_special_page_payload(
-            page=page, merged_body=merged_body, mode=mode or "",
-            limit=limit, offset=offset, top_n=top_n,
-            requested_symbols=requested_symbols,
+        special_started = time.monotonic()
+        special_budget = min(
+            _special_builder_timeout_s(),
+            _remaining_budget(deadline, reserve=8.0),
         )
+        special_payload = (
+            await _build_special_page_payload(
+                page=page, merged_body=merged_body, mode=mode or "",
+                limit=limit, offset=offset, top_n=top_n,
+                requested_symbols=requested_symbols,
+                timeout_s=special_budget,
+            )
+            if special_budget >= 0.5
+            else None
+        )
+        phase_meta["special_builder_ms"] = round(
+            (time.monotonic() - special_started) * 1000.0, 3)
         if isinstance(special_payload, dict):
             special_dispatch = "top10_selector_real" if page == _TOP10_PAGE else "insights_builder_real"
             special_source = (
@@ -2478,9 +3227,16 @@ async def _run_advanced_sheet_rows_impl(
                 include_matrix=include_matrix, request_id=request_id, started_at=start,
                 mode=mode, limit=limit, offset=offset, top_n=top_n,
                 requested_symbols=requested_symbols,
-                meta_extra={"schema_source": schema_source,
-                            "source": special_source,
-                            "dispatch": special_dispatch},
+                meta_extra={
+                    "schema_source": schema_source,
+                    "source": special_source,
+                    "dispatch": special_dispatch,
+                    "route_budget": {
+                        "total_s": total_budget_s,
+                        "remaining_s": round(_remaining_budget(deadline), 3),
+                        "phases": dict(phase_meta),
+                    },
+                },
                 provider_health=provider_health,
                 top10_preserve_order=(page == _TOP10_PAGE),
             )
@@ -2491,27 +3247,49 @@ async def _run_advanced_sheet_rows_impl(
     # slow/throttled batch degrades to the EXISTING fail-soft path below
     # instead of running until Render's platform-level edge timeout kills the
     # whole request (which never gives this handler's fail-soft code a chance
-    # to run -- the caller just sees a raw connection failure). Default OFF ->
-    # the else-branch below is byte-identical to v4.10.0.
+    # to run -- the caller just sees a raw connection failure). v4.14.0 makes
+    # the guard default ON; a canonical false value remains the rollback.
     if _adv_engine_call_timeout_enabled():
-        try:
-            payload, source = await asyncio.wait_for(
-                _call_core_sheet_rows_best_effort(
-                    page=page, limit=max(limit + offset, top_n), offset=0,
-                    mode=mode or "", body=merged_body,
-                ),
-                timeout=_adv_engine_call_timeout_s(),
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "[advanced_analysis v%s] engine call timed out after %.1fs for page=%s "
-                "(edge-timeout guard); falling through to fail-soft",
-                ADVANCED_ANALYSIS_VERSION, _adv_engine_call_timeout_s(), page,
-            )
+        engine_budget = min(
+            _adv_engine_call_timeout_s(),
+            _remaining_budget(deadline, reserve=2.0),
+        )
+        if engine_budget < 0.5:
             payload, source = (
-                {"status": "error", "error": "engine_call_timeout", "row_objects": []},
+                {
+                    "status": "error",
+                    "error": "route_budget_exhausted",
+                    "row_objects": [],
+                },
                 CORE_GET_SHEET_ROWS_SOURCE,
             )
+        else:
+            engine_started = time.monotonic()
+            try:
+                payload, source = await asyncio.wait_for(
+                    _call_core_sheet_rows_best_effort(
+                        page=page, limit=max(limit + offset, top_n), offset=0,
+                        mode=mode or "", body=merged_body,
+                    ),
+                    timeout=engine_budget,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[advanced_analysis v%s] engine call timed out after %.1fs "
+                    "for page=%s; falling through to fail-soft",
+                    ADVANCED_ANALYSIS_VERSION, engine_budget, page,
+                )
+                payload, source = (
+                    {
+                        "status": "error",
+                        "error": "engine_call_timeout",
+                        "row_objects": [],
+                    },
+                    CORE_GET_SHEET_ROWS_SOURCE,
+                )
+            finally:
+                phase_meta["engine_ms"] = round(
+                    (time.monotonic() - engine_started) * 1000.0, 3)
     else:
         payload, source = await _call_core_sheet_rows_best_effort(
             page=page, limit=max(limit + offset, top_n), offset=0,
@@ -2523,8 +3301,15 @@ async def _run_advanced_sheet_rows_impl(
             include_matrix=include_matrix, request_id=request_id, started_at=start,
             mode=mode, limit=limit, offset=offset, top_n=top_n,
             requested_symbols=requested_symbols,
-            meta_extra={"schema_source": schema_source,
-                        "source": source or CORE_GET_SHEET_ROWS_SOURCE},
+            meta_extra={
+                "schema_source": schema_source,
+                "source": source or CORE_GET_SHEET_ROWS_SOURCE,
+                "route_budget": {
+                    "total_s": total_budget_s,
+                    "remaining_s": round(_remaining_budget(deadline), 3),
+                    "phases": dict(phase_meta),
+                },
+            },
             provider_health=provider_health,
         )
         if _extract_rows_like(normalized):
@@ -2551,6 +3336,11 @@ async def _run_advanced_sheet_rows_impl(
             "dispatch": "advanced_analysis_fail_soft_nonempty" if fallback_rows else "advanced_analysis_fail_soft",
             "schema_source": schema_source,
             "source": source or CORE_GET_SHEET_ROWS_SOURCE,
+            "route_budget": {
+                "total_s": total_budget_s,
+                "remaining_s": round(_remaining_budget(deadline), 3),
+                "phases": dict(phase_meta),
+            },
         },
         provider_health=provider_health,
         lifted_warnings=lifted or None,
@@ -2559,58 +3349,53 @@ async def _run_advanced_sheet_rows_impl(
 @router.get("/health")
 @router.get("/v1/schema/health")
 async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
-    """v4.1.0: enhanced with engine_version + provider_health summary.
+    """Bounded operational health for this route family."""
+    started = time.monotonic()
+    snap = await _provider_health_with_budget()
 
-    Operators monitoring this endpoint can now see at a glance whether the
-    upstream-provider chain is healthy:
-      - provider_unhealthy_count == 0 -> all providers healthy
-      - provider_unhealthy_count > 0  -> engine is demoting/skipping at least
-        one provider; check /v1/schema/provider-health for detail.
-
-    Failures inside provider_health resolution are caught and surfaced as
-    `provider_health_error`; the health endpoint itself never raises.
-    """
-    # v4.1.0: cheap one-shot snapshot. Bounded by engine.health() cost.
-    provider_health_summary: Dict[str, Any] = {}
     engine_version: Optional[str] = None
     provider_unhealthy_count: Optional[int] = None
-    try:
-        snap = await _extract_provider_health_snapshot()
-        if isinstance(snap, dict):
-            engine_version = snap.get("engine_version")
-            markers = snap.get("unhealthy_markers")
-            if isinstance(markers, dict):
-                ac = markers.get("active_count")
-                if isinstance(ac, int):
-                    provider_unhealthy_count = ac
-            if snap.get("unavailable"):
-                provider_health_summary = {
-                    "available": False,
-                    "reason": snap.get("reason") or snap.get("error_class") or "unknown",
-                }
-            else:
-                provider_health_summary = {"available": True}
-    except Exception as e:
-        provider_health_summary = {
-            "available": False,
-            "reason": "{}:{}".format(e.__class__.__name__, str(e)[:120]),
-        }
+    if isinstance(snap, dict):
+        engine_version = snap.get("engine_version")
+        markers = snap.get("unhealthy_markers")
+        if isinstance(markers, dict):
+            active_count = markers.get("active_count")
+            if isinstance(active_count, int):
+                provider_unhealthy_count = active_count
+
+    adapter_available = bool(core_get_sheet_rows is not None)
+    schema_available = bool(get_sheet_spec is not None)
+    provider_available = not bool(
+        isinstance(snap, Mapping) and snap.get("unavailable"))
+    health_status = (
+        "ok"
+        if adapter_available and schema_available and provider_available
+        else "degraded"
+    )
 
     return _json_safe({
-        "status": "ok",
+        "status": health_status,
         "service": "advanced_analysis",
         "version": ADVANCED_ANALYSIS_VERSION,
-        "schema_registry_available": bool(get_sheet_spec is not None),
-        "adapter_available": bool(core_get_sheet_rows is not None),
+        "schema_registry_available": schema_available,
+        "adapter_available": adapter_available,
         "engine_source": CORE_GET_SHEET_ROWS_SOURCE,
         "engine_version": engine_version,
         "provider_health_endpoint_enabled": True,
-        "provider_health_summary": provider_health_summary,
+        "provider_health_summary": {
+            "available": provider_available,
+            "reason": (
+                ""
+                if provider_available
+                else (
+                    snap.get("reason")
+                    or snap.get("error_class")
+                    or "unknown"
+                )
+            ),
+            "timeout_s": _provider_health_timeout_s(),
+        },
         "provider_unhealthy_count": provider_unhealthy_count,
-        # v4.2.0/v4.3.0: expose the registry-derived contract widths this route
-        # is serving so operators can confirm whether Top_10 is at the full
-        # canonical width (118) or still tracking a stale registry. The static
-        # fallback values are now 115 / 118 (v4.3.0).
         "contract_widths": {
             "instrument_static_fallback": _CANONICAL_INSTRUMENT_LEN,
             "top10_static_fallback": _TOP10_STATIC_LEN,
@@ -2619,7 +3404,21 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
             "insights_effective": _expected_len(_INSIGHTS_PAGE),
             "dictionary_effective": _expected_len(_DICTIONARY_PAGE),
         },
+        "safety_controls": {
+            "engine_timeout_enabled": _adv_engine_call_timeout_enabled(),
+            "engine_timeout_s": _adv_engine_call_timeout_s(),
+            "advanced_total_timeout_s": _adv_total_timeout_s(),
+            "opportunity_offloop": _opp_build_offloop_enabled(),
+            "opportunity_total_timeout_s": _opp_total_timeout_s(),
+            "opportunity_pool_timeout_s": _opp_pool_timeout_s(),
+            "opportunity_build_timeout_s": _opp_build_timeout_s(),
+            "distributed_lock_enabled": _opp_distributed_lock_enabled(),
+            "distributed_lock_required": _opp_distributed_lock_required(),
+            "portfolio_offloop": _portfolio_build_offloop_enabled(),
+            "portfolio_timeout_s": _portfolio_build_timeout_s(),
+        },
         "allowed_pages_count": len(_safe_allowed_pages()),
+        "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
         "path": str(getattr(getattr(request, "url", None), "path", "")),
     })
 
@@ -2627,37 +3426,36 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
 @router.get("/schema/provider-health")
 @router.get("/v1/schema/provider-health")
 async def schema_provider_health(request: Request) -> Dict[str, Any]:
-    """v4.1.0 [ADD-G]: Dedicated provider-health snapshot endpoint.
-
-    Returns the engine's `provider_unhealthy_markers` registry without
-    triggering a sheet build. Cheap polling target for Apps Script
-    `12_Diagnostics.gs runFullDiagnosticSweep_()` — one HTTP call instead of
-    one-per-page to discover systemic provider outages.
-
-    On v2-engine-unavailable / no-registry-in-health, returns
-    `status: "unavailable"` with a `reason` field instead of raising. Always
-    returns 200; consumers should inspect the `status` field rather than
-    relying on HTTP codes.
-    """
-    request_id = str(uuid.uuid4())[:12]
-    started = time.time()
-
-    snap = await _extract_provider_health_snapshot()
-    unavailable = bool(snap.get("unavailable")) if isinstance(snap, dict) else True
+    """Return a bounded provider-health snapshot without triggering a sheet build."""
+    request_id = uuid.uuid4().hex[:12]
+    started = time.monotonic()
+    snapshot = await _provider_health_with_budget()
+    unavailable = bool(
+        snapshot.get("unavailable")
+        if isinstance(snapshot, dict)
+        else True
+    )
 
     return _json_safe({
         "status": "unavailable" if unavailable else "success",
         "version": ADVANCED_ANALYSIS_VERSION,
-        "engine_version": snap.get("engine_version") if isinstance(snap, dict) else None,
+        "engine_version": (
+            snapshot.get("engine_version")
+            if isinstance(snapshot, dict)
+            else None
+        ),
         "engine_source": CORE_GET_SHEET_ROWS_SOURCE,
-        "provider_health": snap,
-        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "provider_health": snapshot,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "request_id": request_id,
         "meta": {
-            "duration_ms": round((time.time() - started) * 1000.0, 3),
+            "duration_ms": round(
+                (time.monotonic() - started) * 1000.0, 3),
             "dispatch": "schema_provider_health",
             "source": "core.data_engine_v2.get_engine().health",
-            "path": str(getattr(getattr(request, "url", None), "path", "")),
+            "timeout_s": _provider_health_timeout_s(),
+            "path": str(
+                getattr(getattr(request, "url", None), "path", "")),
         },
     })
 
@@ -2890,28 +3688,37 @@ def _opp_criteria_from_body(raw: Any) -> Dict[str, Any]:
     return out
 
 
-async def _opp_collect_pool(*, pool_limit: int, mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
-    """v4.7.0: candidate pool via the v4.5.0 selector binding.
-
-    Returns (rows, selector_meta, pool_source). pool_source is one of
-    selector / selector_empty / selector_error / selector_unbound. NEVER
-    raises — every failure degrades to an empty pool so the builder can
-    answer honestly ("no_candidates")."""
+async def _opp_collect_pool(
+    *,
+    pool_limit: int,
+    mode: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
+    """Collect the selector pool without blocking the event loop."""
     if _build_top10_rows is None:
         return [], {}, "selector_unbound"
     try:
-        res = _build_top10_rows(limit=pool_limit, mode=mode or "")
-        res = await _maybe_await(res)
-    except Exception as e:
+        result = await _invoke_callable_maybe_async(
+            _build_top10_rows,
+            limit=pool_limit,
+            mode=mode or "",
+            offload_sync=True,
+        )
+    except Exception as exc:
         logger.warning(
             "[advanced_analysis v%s] opportunity pool: selector raised %s: %s",
-            ADVANCED_ANALYSIS_VERSION, e.__class__.__name__, e,
+            ADVANCED_ANALYSIS_VERSION,
+            exc.__class__.__name__,
+            exc,
         )
-        return [], {"error": "{}: {}".format(e.__class__.__name__, e)}, "selector_error"
-    if not isinstance(res, Mapping):
+        return (
+            [],
+            {"error": _client_error_detail(exc, "selector_error")},
+            "selector_error",
+        )
+    if not isinstance(result, Mapping):
         return [], {}, "selector_empty"
-    rows = _extract_rows_like(res)
-    meta = res.get("meta") if isinstance(res.get("meta"), Mapping) else {}
+    rows = _extract_rows_like(result)
+    meta = result.get("meta") if isinstance(result.get("meta"), Mapping) else {}
     return rows, dict(meta or {}), ("selector" if rows else "selector_empty")
 
 
@@ -2928,58 +3735,83 @@ async def opportunity_candidates_post(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    """v4.7.0 [OPP-ADD]: §5 zone payload for the Top_10 decision page.
+    """Build the frozen Top-10 decision payload under one end-to-end budget.
 
-    Body fields (all optional):
-      criteria   : dict — GAS panel values; labels or snake_case (see
-                   _opp_criteria_from_body). Echoed in meta.criteria_snapshot.
-      fx_rates   : dict ccy -> SAR rate, read by GAS from _Lists_Config
-                   TFB_FX_LOOKUP (the backend never reads the spreadsheet).
-      portfolio  : dict — cash_available_sar, pending_proceeds_sar,
-                   portfolio_value_sar, holdings[{symbol, sector, market,
-                   value_sar}].
-      rows       : explicit candidate rows (bypasses the selector pool —
-                   used by tests and GAS replays).
-      pool_limit : selector pool size (default 60, clamp 1..500).
-
-    Fail-soft: builder unbound -> status "unavailable"; selector failures
-    degrade to an empty pool; the only raise is auth (401).
+    The build lease is acquired before selector/pool collection, so retries
+    cannot pile up the most expensive phase. Explicit body rows still bypass
+    the selector but remain subject to row-count and route-budget controls.
     """
-    start = time.time()
-    request_id = _strip(x_request_id) or str(uuid.uuid4())[:12]
+    started_wall = time.time()
+    started_mono = time.monotonic()
+    total_budget_s = _opp_total_timeout_s()
+    deadline = started_mono + total_budget_s
+    request_id = _sanitize_request_id(x_request_id)
+    phases: Dict[str, float] = {}
+
     try:
         settings = get_settings_cached()
     except Exception:
         settings = None
-    auth_token = _extract_auth_token(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, settings=settings, request=request)
-    if not _auth_passed(request=request, settings=settings, auth_token=auth_token, authorization=authorization):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    auth_started = time.monotonic()
+    auth_token = _extract_auth_token(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        settings=settings,
+        request=request,
+    )
+    if not _auth_passed(
+        request=request,
+        settings=settings,
+        auth_token=auth_token,
+        authorization=authorization,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+    phases["auth_ms"] = round((time.monotonic() - auth_started) * 1000.0, 3)
 
     merged_body = _merge_body_with_query(body, request)
     criteria = _opp_criteria_from_body(merged_body.get("criteria"))
-    fx_rates = merged_body.get("fx_rates") if isinstance(merged_body.get("fx_rates"), Mapping) else {}
-    portfolio = merged_body.get("portfolio") if isinstance(merged_body.get("portfolio"), Mapping) else {}
-    # v8.12.0 (Fix AE -- FULL-UNIVERSE SCAN): pool_limit was clamped to a hard
-    # ceiling of 500, capping the candidate pool well below the ~2,189-row live
-    # universe even when the operator raised the panel's "Pool Limit" cell. The
-    # ceiling now follows TFB_TOP10_POOL_CEILING (explicit override) OR rises
-    # automatically to 20000 when TFB_TOP10_FULL_UNIVERSE is on, so the selector
-    # can ingest every page. Default (both unset) = 500, byte-identical clamp.
-    # NOTE: the panel "Pool Limit" operator cell still drives the actual count --
-    # set it to ~2200 (or blank to inherit the larger default) to scan all names.
-    _full_universe = (os.getenv("TFB_TOP10_FULL_UNIVERSE") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-    _pool_ceiling = _maybe_int(os.getenv("TFB_TOP10_POOL_CEILING"), 20000 if _full_universe else 500)
-    if _pool_ceiling < 1:
-        _pool_ceiling = 20000 if _full_universe else 500
-    _pool_default = 3000 if _full_universe else 60
-    pool_limit = max(1, min(_pool_ceiling, _maybe_int(merged_body.get("pool_limit"), _pool_default)))
+    fx_rates = (
+        merged_body.get("fx_rates")
+        if isinstance(merged_body.get("fx_rates"), Mapping)
+        else {}
+    )
+    portfolio = (
+        merged_body.get("portfolio")
+        if isinstance(merged_body.get("portfolio"), Mapping)
+        else {}
+    )
+
+    full_universe = _env_truthy("TFB_TOP10_FULL_UNIVERSE", False)
+    pool_ceiling_default = 20000 if full_universe else 500
+    pool_ceiling = _maybe_int(
+        os.getenv("TFB_TOP10_POOL_CEILING"),
+        pool_ceiling_default,
+    )
+    pool_ceiling = max(1, min(20000, pool_ceiling))
+    pool_default = 3000 if full_universe else 60
+    pool_limit = max(
+        1,
+        min(
+            pool_ceiling,
+            _maybe_int(merged_body.get("pool_limit"), pool_default),
+        ),
+    )
 
     if _build_opportunity_payload is None:
         return _json_safe({
             "version": None,
             "status": "unavailable",
             "message": "core.analysis.opportunity_builder not deployed",
-            "kpis": {}, "selected": [], "near_miss": [], "alerts": [],
+            "kpis": {},
+            "selected": [],
+            "near_miss": [],
+            "alerts": [],
             "candidates_rows": [],
             "meta": {
                 "criteria_snapshot": criteria,
@@ -2987,170 +3819,347 @@ async def opportunity_candidates_post(
                     "version": ADVANCED_ANALYSIS_VERSION,
                     "request_id": request_id,
                     "dispatch": "opportunity_candidates_unavailable",
-                    "duration_ms": round((time.time() - start) * 1000.0, 3),
+                    "duration_ms": round(
+                        (time.time() - started_wall) * 1000.0, 3),
+                    "total_budget_s": total_budget_s,
+                    "phases": phases,
                 },
             },
         })
 
-    explicit_rows = merged_body.get("rows")
-    if isinstance(explicit_rows, list) and explicit_rows and isinstance(explicit_rows[0], Mapping):
-        pool_rows: List[Dict[str, Any]] = [dict(r) for r in explicit_rows]
-        sel_meta: Dict[str, Any] = {}
-        pool_source = "body_rows"
-    else:
-        pool_rows, sel_meta, pool_source = await _opp_collect_pool(
-            pool_limit=pool_limit, mode=mode or _strip(merged_body.get("mode")),
-        )
-
-    # v4.9.0 [TREND-ADD]: cross-sectional sector-trend enrichment (env-gated
-    # inside the module; default OFF -> rows pass through untouched).
-    trends_meta: Dict[str, Any] = {"enabled": False, "bound": False}
-    if _enrich_rows_with_trends is not None:
-        try:
-            pool_rows, trends_meta = _enrich_rows_with_trends(pool_rows)
-            trends_meta = dict(trends_meta or {})
-            trends_meta["bound"] = True
-        except Exception as _te:
-            logger.warning(
-                "[advanced_analysis v%s] trend enrichment raised %s: %s — pool used unenriched",
-                ADVANCED_ANALYSIS_VERSION, _te.__class__.__name__, _te,
-            )
-            trends_meta = {"enabled": False, "bound": True,
-                           "error": "{}: {}".format(_te.__class__.__name__, str(_te)[:160])}
-
-    # v4.13.0: telemetry must never block a decision response (see CHANGELOG).
-    try:
-        provider_health = await asyncio.wait_for(
-            _extract_provider_health_snapshot(), timeout=3.0)
-    except asyncio.TimeoutError:
-        logger.warning(
-            "[advanced_analysis v%s] provider-health snapshot exceeded 3.0s "
-            "— continuing without it", ADVANCED_ANALYSIS_VERSION)
-        provider_health = {"unavailable": True,
-                           "reason": "provider_health_timeout"}
-    except Exception as _phe:
-        provider_health = {"unavailable": True,
-                           "reason": _phe.__class__.__name__}
-    engine_version = provider_health.get("engine_version") if isinstance(provider_health, Mapping) else None
-
-    # v4.7.2 [META-MAP]: live selector v4.19.0 key names first, prior names as
-    # fallbacks. budget is normalized to a dict with an "exhausted" flag so the
-    # builder's budget alert logic fires from the live boolean.
-    _sel_budget = sel_meta.get("budget") or sel_meta.get("budget_meta")
-    if not isinstance(_sel_budget, Mapping):
-        _sel_budget = {}
-    _budget_norm: Dict[str, Any] = dict(_sel_budget)
-    if "exhausted" not in _budget_norm and sel_meta.get("budget_exhausted") is not None:
-        _budget_norm["exhausted"] = bool(sel_meta.get("budget_exhausted"))
-    if sel_meta.get("universe_starved") is not None:
-        _budget_norm.setdefault("universe_starved", bool(sel_meta.get("universe_starved")))
-    upstream_meta: Dict[str, Any] = {
-        "coverage": sel_meta.get("page_coverage") or sel_meta.get("coverage"),
-        "budget": _budget_norm or None,
-        "timeouts": sel_meta.get("timeouts"),
-        "freshness": sel_meta.get("freshness") or sel_meta.get("data_as_of") or sel_meta.get("generated_at"),
-        "versions": {
-            "selector": sel_meta.get("selector_version") or sel_meta.get("version"),
-            "engine": engine_version,
-        },
+    lease_started = time.monotonic()
+    lease = await _opp_acquire_build_lease()
+    phases["lock_ms"] = round(
+        (time.monotonic() - lease_started) * 1000.0, 3)
+    lock_meta = {
+        "acquired": bool(lease.get("acquired")),
+        "reason": lease.get("reason") or "",
+        "distributed": lease.get("distributed") or "disabled",
+        "distributed_reason": lease.get("distributed_reason") or "",
+        "ttl_s": _opp_lock_ttl_s(),
     }
 
+    pool_rows: List[Dict[str, Any]] = []
+    sel_meta: Dict[str, Any] = {}
+    pool_source = "not_started"
+    trends_meta: Dict[str, Any] = {"enabled": False, "bound": False}
+    provider_health: Dict[str, Any] = {
+        "unavailable": True,
+        "reason": "not_requested",
+    }
+    payload: Optional[Dict[str, Any]] = None
+    release_deferred = False
+    lease_acquired = bool(lease.get("acquired"))
+
     try:
-        if _opp_build_offloop_enabled() and not _OPP_BUILD_LOCK.acquire(
-                blocking=False):
-            # v4.13.0: a build is already in flight in this worker — never
-            # stack a second expensive scan on top of it.
-            logger.warning(
-                "[advanced_analysis v%s] opportunity build already running in "
-                "this worker — answering build_already_running",
-                ADVANCED_ANALYSIS_VERSION)
+        if not lease_acquired:
             payload = _opp_degraded_payload(
                 "build_already_running",
-                "an opportunity build is already running in this worker — "
-                "this request was not queued",
-                pool_rows, criteria)
-        elif _opp_build_offloop_enabled():
-            # v4.12.0 [OPP-BUILD OFF-LOOP + BUDGET]: see CHANGELOG. The build
-            # is CPU-bound and synchronous; running it in a thread frees the
-            # event loop for other requests, and the budget guarantees this
-            # handler answers before Render's edge timeout can kill it.
-            _budget = _opp_build_timeout_s()
-            try:
-                payload = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        _opp_build_in_thread,
-                        _build_opportunity_payload,
-                        pool_rows,
-                        criteria=criteria,
-                        portfolio=dict(portfolio or {}),
-                        fx_rates=dict(fx_rates or {}),
-                        upstream_meta=upstream_meta,
-                    ),
-                    timeout=_budget,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[advanced_analysis v%s] opportunity build exceeded %.1fs "
-                    "budget for %d pool rows (off-loop guard); answering "
-                    "fail-soft. The thread finishes in the background and its "
-                    "result is discarded.",
-                    ADVANCED_ANALYSIS_VERSION, _budget, len(pool_rows),
-                )
-                payload = _opp_degraded_payload(
-                    "builder_timeout",
-                    "opportunity build exceeded the %.0fs budget for %d pool "
-                    "rows — no board produced this run"
-                    % (_budget, len(pool_rows)),
-                    pool_rows, criteria)
-        else:
-            payload = _build_opportunity_payload(
+                "another opportunity build currently owns the decision lease",
                 pool_rows,
-                criteria=criteria,
-                portfolio=dict(portfolio or {}),
-                fx_rates=dict(fx_rates or {}),
-                upstream_meta=upstream_meta,
+                criteria,
             )
-    except Exception as e:
+            pool_source = "lease_busy"
+        else:
+            explicit_rows = merged_body.get("rows")
+            if (
+                isinstance(explicit_rows, list)
+                and explicit_rows
+                and isinstance(explicit_rows[0], Mapping)
+            ):
+                cap = _opp_explicit_rows_max()
+                pool_rows = [
+                    dict(row)
+                    for row in explicit_rows[:cap]
+                    if isinstance(row, Mapping)
+                ]
+                pool_source = "body_rows"
+                sel_meta = {
+                    "explicit_rows_received": len(explicit_rows),
+                    "explicit_rows_used": len(pool_rows),
+                    "explicit_rows_truncated": len(explicit_rows) > cap,
+                }
+            else:
+                pool_budget = min(
+                    _opp_pool_timeout_s(),
+                    _remaining_budget(deadline, reserve=8.0),
+                )
+                if pool_budget < 1.0:
+                    payload = _opp_degraded_payload(
+                        "total_budget_exhausted",
+                        "no safe time remained for candidate-pool collection",
+                        pool_rows,
+                        criteria,
+                    )
+                    pool_source = "budget_exhausted_before_pool"
+                else:
+                    pool_started = time.monotonic()
+                    pool_task = asyncio.create_task(
+                        _opp_collect_pool(
+                            pool_limit=pool_limit,
+                            mode=mode or _strip(merged_body.get("mode")),
+                        )
+                    )
+                    try:
+                        pool_rows, sel_meta, pool_source = await asyncio.wait_for(
+                            asyncio.shield(pool_task),
+                            timeout=pool_budget,
+                        )
+                    except asyncio.TimeoutError:
+                        release_deferred = True
+                        _opp_defer_lease_release(pool_task, lease)
+                        pool_source = "selector_timeout"
+                        sel_meta = {
+                            "timeout_s": round(pool_budget, 3),
+                            "background_work_continues": True,
+                        }
+                        payload = _opp_degraded_payload(
+                            "pool_timeout",
+                            "candidate-pool collection exceeded the route budget",
+                            pool_rows,
+                            criteria,
+                        )
+                    finally:
+                        phases["pool_ms"] = round(
+                            (time.monotonic() - pool_started) * 1000.0, 3)
+
+            if payload is None:
+                trend_started = time.monotonic()
+                if _enrich_rows_with_trends is not None:
+                    try:
+                        pool_rows, trends_meta = _enrich_rows_with_trends(
+                            pool_rows)
+                        trends_meta = dict(trends_meta or {})
+                        trends_meta["bound"] = True
+                    except Exception as exc:
+                        logger.warning(
+                            "[advanced_analysis v%s] trend enrichment raised "
+                            "%s: %s — pool used unenriched",
+                            ADVANCED_ANALYSIS_VERSION,
+                            exc.__class__.__name__,
+                            exc,
+                        )
+                        trends_meta = {
+                            "enabled": False,
+                            "bound": True,
+                            "error": _client_error_detail(
+                                exc, "trend_enrichment_failed"),
+                        }
+                phases["trends_ms"] = round(
+                    (time.monotonic() - trend_started) * 1000.0, 3)
+
+                health_started = time.monotonic()
+                health_budget = min(
+                    _provider_health_timeout_s(),
+                    _remaining_budget(deadline, reserve=4.0),
+                )
+                if health_budget >= 0.25:
+                    provider_health = await _provider_health_with_budget(
+                        health_budget)
+                else:
+                    provider_health = {
+                        "unavailable": True,
+                        "reason": "route_budget_exhausted_before_health",
+                    }
+                phases["provider_health_ms"] = round(
+                    (time.monotonic() - health_started) * 1000.0, 3)
+
+                selector_budget = (
+                    sel_meta.get("budget")
+                    or sel_meta.get("budget_meta")
+                )
+                if not isinstance(selector_budget, Mapping):
+                    selector_budget = {}
+                budget_norm: Dict[str, Any] = dict(selector_budget)
+                if (
+                    "exhausted" not in budget_norm
+                    and sel_meta.get("budget_exhausted") is not None
+                ):
+                    budget_norm["exhausted"] = bool(
+                        sel_meta.get("budget_exhausted"))
+                if sel_meta.get("universe_starved") is not None:
+                    budget_norm.setdefault(
+                        "universe_starved",
+                        bool(sel_meta.get("universe_starved")),
+                    )
+
+                engine_version = (
+                    provider_health.get("engine_version")
+                    if isinstance(provider_health, Mapping)
+                    else None
+                )
+                upstream_meta: Dict[str, Any] = {
+                    "coverage": (
+                        sel_meta.get("page_coverage")
+                        or sel_meta.get("coverage")
+                    ),
+                    "budget": budget_norm or None,
+                    "timeouts": sel_meta.get("timeouts"),
+                    "freshness": (
+                        sel_meta.get("freshness")
+                        or sel_meta.get("data_as_of")
+                        or sel_meta.get("generated_at")
+                    ),
+                    "versions": {
+                        "selector": (
+                            sel_meta.get("selector_version")
+                            or sel_meta.get("version")
+                        ),
+                        "engine": engine_version,
+                    },
+                }
+
+                build_budget = min(
+                    _opp_build_timeout_s(),
+                    _remaining_budget(deadline, reserve=2.0),
+                )
+                if build_budget < 1.0:
+                    payload = _opp_degraded_payload(
+                        "total_budget_exhausted",
+                        "candidate collection consumed the safe request budget",
+                        pool_rows,
+                        criteria,
+                    )
+                elif _opp_build_offloop_enabled():
+                    build_started = time.monotonic()
+                    build_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _opp_build_in_thread,
+                            _build_opportunity_payload,
+                            lease,
+                            pool_rows,
+                            criteria=criteria,
+                            portfolio=dict(portfolio or {}),
+                            fx_rates=dict(fx_rates or {}),
+                            upstream_meta=upstream_meta,
+                        )
+                    )
+                    try:
+                        payload = await asyncio.wait_for(
+                            asyncio.shield(build_task),
+                            timeout=build_budget,
+                        )
+                    except asyncio.TimeoutError:
+                        # The worker thread owns lease release in its finally
+                        # block. Do not release early while CPU work continues.
+                        release_deferred = True
+                        payload = _opp_degraded_payload(
+                            "builder_timeout",
+                            (
+                                "opportunity construction exceeded the "
+                                f"{build_budget:.0f}s phase budget"
+                            ),
+                            pool_rows,
+                            criteria,
+                        )
+                    finally:
+                        phases["builder_ms"] = round(
+                            (time.monotonic() - build_started) * 1000.0, 3)
+                else:
+                    build_started = time.monotonic()
+                    try:
+                        payload = _build_opportunity_payload(
+                            pool_rows,
+                            criteria=criteria,
+                            portfolio=dict(portfolio or {}),
+                            fx_rates=dict(fx_rates or {}),
+                            upstream_meta=upstream_meta,
+                        )
+                    finally:
+                        phases["builder_ms"] = round(
+                            (time.monotonic() - build_started) * 1000.0, 3)
+    except Exception as exc:
         logger.warning(
-            "[advanced_analysis v%s] opportunity builder raised %s: %s",
-            ADVANCED_ANALYSIS_VERSION, e.__class__.__name__, e,
+            "[advanced_analysis v%s] opportunity pipeline raised %s: %s",
+            ADVANCED_ANALYSIS_VERSION,
+            exc.__class__.__name__,
+            exc,
         )
         payload = {
             "version": _OPP_BUILDER_VERSION,
             "status": "error",
-            "message": "{}: {}".format(e.__class__.__name__, str(e)[:200]),
-            "kpis": {}, "selected": [], "near_miss": [], "alerts": [],
+            "message": _client_error_detail(
+                exc, "opportunity_pipeline_failed"),
+            "kpis": {},
+            "selected": [],
+            "near_miss": [],
+            "alerts": [],
             "candidates_rows": [],
-            "meta": {"criteria_snapshot": criteria},
+            "meta": {
+                "criteria_snapshot": criteria,
+                "error_class": exc.__class__.__name__,
+            },
         }
+    finally:
+        if lease_acquired and not release_deferred:
+            await _opp_release_build_lease(lease)
+
     if not isinstance(payload, dict):
-        payload = {"status": "error", "message": "builder returned non-dict",
-                   "kpis": {}, "selected": [], "near_miss": [], "alerts": [],
-                   "candidates_rows": [], "meta": {}}
+        payload = {
+            "version": _OPP_BUILDER_VERSION,
+            "status": "error",
+            "message": "builder_returned_non_dict",
+            "kpis": {},
+            "selected": [],
+            "near_miss": [],
+            "alerts": [],
+            "candidates_rows": [],
+            "meta": {},
+        }
+
     meta = payload.get("meta")
     if not isinstance(meta, dict):
         meta = {}
         payload["meta"] = meta
     meta["provider_health"] = _json_safe(provider_health)
-    # v4.10.0 [NEWS-DISPLAY]: fill the News column for the surfaced decision
-    # symbols (display-only; the builder's selection above is already final).
-    # Env-gated default OFF -> no fetch, no mutation, byte-identical to v4.9.0.
+
     news_display_meta: Dict[str, Any] = {"enabled": False}
     if _news_display_enabled():
-        try:
-            news_display_meta = await _attach_news_display(payload)
-        except Exception as _nde:
-            news_display_meta = {"enabled": True,
-                                 "error": "{}: {}".format(_nde.__class__.__name__, str(_nde)[:160])}
+        news_budget = min(
+            _news_display_timeout_s(),
+            _remaining_budget(deadline, reserve=0.5),
+        )
+        if news_budget >= 0.5:
+            news_started = time.monotonic()
+            try:
+                news_display_meta = await _attach_news_display(
+                    payload,
+                    timeout_s=news_budget,
+                )
+            except Exception as exc:
+                news_display_meta = {
+                    "enabled": True,
+                    "error": _client_error_detail(
+                        exc, "news_display_failed"),
+                }
+            phases["news_ms"] = round(
+                (time.monotonic() - news_started) * 1000.0, 3)
+        else:
+            news_display_meta = {
+                "enabled": True,
+                "skipped": True,
+                "reason": "route_budget_exhausted",
+            }
+
+    duration_ms = round((time.time() - started_wall) * 1000.0, 3)
     meta["route"] = {
         "version": ADVANCED_ANALYSIS_VERSION,
         "opportunity_builder_version": _OPP_BUILDER_VERSION,
         "request_id": request_id,
         "dispatch": "opportunity_candidates",
-        "pool": {"source": pool_source, "count": len(pool_rows), "pool_limit": pool_limit},
+        "pool": {
+            "source": pool_source,
+            "count": len(pool_rows),
+            "pool_limit": pool_limit,
+        },
+        "lock": _json_safe(lock_meta),
         "trends": _json_safe(trends_meta),
         "news_display": _json_safe(news_display_meta),
-        "duration_ms": round((time.time() - start) * 1000.0, 3),
+        "phases": _json_safe(phases),
+        "total_budget_s": total_budget_s,
+        "remaining_budget_s": round(
+            _remaining_budget(deadline), 3),
+        "duration_ms": duration_ms,
     }
     return _json_safe(payload)
 
@@ -3227,98 +4236,166 @@ async def portfolio_actions_post(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    """v4.8.0 [PF-ADD]: action payload for the My_Portfolio decision page.
+    """Build portfolio actions off-loop under a bounded operational budget."""
+    started_wall = time.time()
+    request_id = _sanitize_request_id(x_request_id)
+    phases: Dict[str, float] = {}
 
-    Body fields:
-      rows     : holdings dicts from 10_My_Portfolio.gs — the Top_10 pool
-                 display headers PLUS "Quantity" and "Buy Price" (average
-                 cost, native ccy, from _Portfolio_CostBasis). Empty/absent
-                 rows -> the builder answers status="empty" honestly (L13).
-      controls : dict — PF panel values; labels or snake_case (see
-                 _pf_controls_from_body). Echoed in meta.controls_snapshot.
-      fx_rates : dict ccy -> SAR rate, read by GAS from _Lists_Config
-                 TFB_FX_LOOKUP (the backend never reads the spreadsheet).
-
-    Fail-soft: builder unbound -> status "unavailable"; builder exceptions ->
-    status "error" (inside the builder); the only raise is auth (401).
-    """
-    start = time.time()
-    request_id = _strip(x_request_id) or str(uuid.uuid4())[:12]
     try:
         settings = get_settings_cached()
     except Exception:
         settings = None
-    auth_token = _extract_auth_token(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, settings=settings, request=request)
-    if not _auth_passed(request=request, settings=settings, auth_token=auth_token, authorization=authorization):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    auth_started = time.monotonic()
+    auth_token = _extract_auth_token(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        settings=settings,
+        request=request,
+    )
+    if not _auth_passed(
+        request=request,
+        settings=settings,
+        auth_token=auth_token,
+        authorization=authorization,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+    phases["auth_ms"] = round((time.monotonic() - auth_started) * 1000.0, 3)
 
     merged_body = _merge_body_with_query(body, request)
     controls = _pf_controls_from_body(merged_body.get("controls"))
-    fx_rates = merged_body.get("fx_rates") if isinstance(merged_body.get("fx_rates"), Mapping) else {}
+    fx_rates = (
+        merged_body.get("fx_rates")
+        if isinstance(merged_body.get("fx_rates"), Mapping)
+        else {}
+    )
     raw_rows = merged_body.get("rows")
     holdings: List[Dict[str, Any]] = []
+    received_count = len(raw_rows) if isinstance(raw_rows, list) else 0
     if isinstance(raw_rows, list):
-        holdings = [dict(r) for r in raw_rows if isinstance(r, Mapping)]
+        cap = _portfolio_holdings_max()
+        holdings = [
+            dict(row)
+            for row in raw_rows[:cap]
+            if isinstance(row, Mapping)
+        ]
 
     if _build_portfolio_actions is None:
         return _json_safe({
             "version": None,
             "status": "unavailable",
             "message": "core.analysis.portfolio_actions not deployed",
-            "kpis": {}, "actions": [], "sector_summary": [], "alerts": [],
+            "kpis": {},
+            "actions": [],
+            "sector_summary": [],
+            "alerts": [],
             "meta": {
                 "controls_snapshot": controls,
                 "route": {
                     "version": ADVANCED_ANALYSIS_VERSION,
                     "request_id": request_id,
                     "dispatch": "portfolio_actions_unavailable",
-                    "duration_ms": round((time.time() - start) * 1000.0, 3),
+                    "holdings": {
+                        "received": received_count,
+                        "used": len(holdings),
+                    },
+                    "duration_ms": round(
+                        (time.time() - started_wall) * 1000.0, 3),
+                    "phases": phases,
                 },
             },
         })
 
-    # v4.13.0: telemetry must never block a decision response (see CHANGELOG).
-    try:
-        provider_health = await asyncio.wait_for(
-            _extract_provider_health_snapshot(), timeout=3.0)
-    except asyncio.TimeoutError:
-        logger.warning(
-            "[advanced_analysis v%s] provider-health snapshot exceeded 3.0s "
-            "— continuing without it", ADVANCED_ANALYSIS_VERSION)
-        provider_health = {"unavailable": True,
-                           "reason": "provider_health_timeout"}
-    except Exception as _phe:
-        provider_health = {"unavailable": True,
-                           "reason": _phe.__class__.__name__}
-    engine_version = provider_health.get("engine_version") if isinstance(provider_health, Mapping) else None
+    health_started = time.monotonic()
+    provider_health = await _provider_health_with_budget()
+    phases["provider_health_ms"] = round(
+        (time.monotonic() - health_started) * 1000.0, 3)
+    engine_version = (
+        provider_health.get("engine_version")
+        if isinstance(provider_health, Mapping)
+        else None
+    )
     upstream_meta: Dict[str, Any] = {
         "versions": {"engine": engine_version},
         "rows_supplied_by": "gas_sheets",
     }
 
+    build_started = time.monotonic()
     try:
-        payload = _build_portfolio_actions(
-            holdings,
-            controls=controls,
-            fx_rates=dict(fx_rates or {}),
-            upstream_meta=upstream_meta,
-        )
-    except Exception as e:
+        if _portfolio_build_offloop_enabled():
+            payload = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _build_portfolio_actions,
+                    holdings,
+                    controls=controls,
+                    fx_rates=dict(fx_rates or {}),
+                    upstream_meta=upstream_meta,
+                ),
+                timeout=_portfolio_build_timeout_s(),
+            )
+        else:
+            payload = _build_portfolio_actions(
+                holdings,
+                controls=controls,
+                fx_rates=dict(fx_rates or {}),
+                upstream_meta=upstream_meta,
+            )
+    except asyncio.TimeoutError:
+        payload = {
+            "version": _PF_ACTIONS_VERSION,
+            "status": "degraded",
+            "error": "builder_timeout",
+            "message": "portfolio action build exceeded its time budget",
+            "kpis": {},
+            "actions": [],
+            "sector_summary": [],
+            "alerts": [],
+            "meta": {"controls_snapshot": controls},
+        }
+    except Exception as exc:
         logger.warning(
             "[advanced_analysis v%s] portfolio actions builder raised %s: %s",
-            ADVANCED_ANALYSIS_VERSION, e.__class__.__name__, e,
+            ADVANCED_ANALYSIS_VERSION,
+            exc.__class__.__name__,
+            exc,
         )
         payload = {
             "version": _PF_ACTIONS_VERSION,
             "status": "error",
-            "message": "{}: {}".format(e.__class__.__name__, str(e)[:200]),
-            "kpis": {}, "actions": [], "sector_summary": [], "alerts": [],
-            "meta": {"controls_snapshot": controls},
+            "error": "portfolio_builder_failed",
+            "message": _client_error_detail(
+                exc, "portfolio_builder_failed"),
+            "kpis": {},
+            "actions": [],
+            "sector_summary": [],
+            "alerts": [],
+            "meta": {
+                "controls_snapshot": controls,
+                "error_class": exc.__class__.__name__,
+            },
         }
+    finally:
+        phases["builder_ms"] = round(
+            (time.monotonic() - build_started) * 1000.0, 3)
+
     if not isinstance(payload, dict):
-        payload = {"status": "error", "message": "builder returned non-dict",
-                   "kpis": {}, "actions": [], "sector_summary": [],
-                   "alerts": [], "meta": {}}
+        payload = {
+            "version": _PF_ACTIONS_VERSION,
+            "status": "error",
+            "error": "builder_returned_non_dict",
+            "message": "builder_returned_non_dict",
+            "kpis": {},
+            "actions": [],
+            "sector_summary": [],
+            "alerts": [],
+            "meta": {},
+        }
+
     meta = payload.get("meta")
     if not isinstance(meta, dict):
         meta = {}
@@ -3329,8 +4406,17 @@ async def portfolio_actions_post(
         "portfolio_actions_version": _PF_ACTIONS_VERSION,
         "request_id": request_id,
         "dispatch": "portfolio_actions",
-        "holdings": {"count": len(holdings)},
-        "duration_ms": round((time.time() - start) * 1000.0, 3),
+        "holdings": {
+            "received": received_count,
+            "used": len(holdings),
+            "truncated": received_count > len(holdings),
+            "cap": _portfolio_holdings_max(),
+        },
+        "builder_offloop": _portfolio_build_offloop_enabled(),
+        "builder_timeout_s": _portfolio_build_timeout_s(),
+        "phases": _json_safe(phases),
+        "duration_ms": round(
+            (time.time() - started_wall) * 1000.0, 3),
     }
     return _json_safe(payload)
 
