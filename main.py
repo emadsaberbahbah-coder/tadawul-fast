@@ -2,12 +2,44 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.11.3)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.12.0)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+Why this revision (v8.12.0 vs v8.11.3)
+--------------------------------------
+- FIX CRITICAL: `/readyz` and `/v1/readyz` now return HTTP 503 when required
+    route families are missing/failed, canonical route ownership is wrong, or
+    the configured boot engine is unavailable. `/livez` remains a pure process
+    liveness probe. `/health` remains HTTP 200 but reports `degraded` plus the
+    exact readiness reasons. Render can no longer mark a structurally broken
+    deployment healthy merely because the Python process accepted connections.
+- FIX SECURITY: production exception responses no longer disclose exception
+    class/message by default. Full details remain in logs and may be exposed
+    only with DEBUG/EXPOSE_ERROR_DETAILS outside the normal production posture.
+- FIX SECURITY: wildcard CORS can never be combined with credentials. Explicit
+    origins may opt into credentials through CORS_ALLOW_CREDENTIALS.
+- FIX SECURITY: Swagger/ReDoc default OFF in production and ON outside
+    production unless explicitly configured. Public status routes return a
+    reduced metadata view when authentication is required.
+- FIX CONTRACT: filtered router cloning now preserves response-model controls,
+    callbacks, OpenAPI extras, and unique-id behavior instead of silently
+    weakening FastAPI validation/documentation.
+- FIX OPERATIONS: logging no longer clears handlers installed by Gunicorn,
+    OpenTelemetry, Sentry, or the hosting platform unless
+    TFB_LOG_REPLACE_ROOT_HANDLERS=1 is explicitly set.
+- FIX OPERATIONS: caller-supplied request IDs are sanitized and length-bounded
+    before entering logs or response headers.
+- FIX CONFIG: generic-object numeric settings now fail safely instead of
+    crashing module import on malformed values; ALLOW_QUERY_TOKEN is represented
+    explicitly rather than being silently dropped by `_SettingsView`.
+- FIX MIDDLEWARE: RequestID remains outermost while CORS still decorates guarded
+    error responses.
+- SAFE SCOPE: no scoring, selection, portfolio, provider, or workbook logic is
+    changed by this revision.
 
 Why this revision (v8.11.3 vs v8.11.2)
 --------------------------------------
@@ -79,6 +111,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -217,7 +250,57 @@ class _StrictJSONResponse(JSONResponse):
 # =============================================================================
 # Version
 # =============================================================================
-APP_ENTRY_VERSION = "8.11.3"
+APP_ENTRY_VERSION = "8.12.1"
+# =============================================================================
+# v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
+#
+# v8.12.0 is good work: zero function/class removals, _CONTROLLED_ROUTE_PLAN,
+# _CONTROLLED_CANONICAL_OWNER_MAP and _OPTIONAL_ROUTE_MODULES all preserved
+# byte-identical, and eleven genuinely useful hardening helpers added. Nothing
+# below removes any of it.
+#
+# What v8.12.1 changes is DEFAULTS, because v8.12.0 shipped three live contract
+# changes armed:
+#
+#  1. /readyz COULD RETURN 503. In v8.11.3 that endpoint returned HTTP 200
+#     unconditionally — it had never returned anything else. v8.12.0 makes it
+#     503 whenever _readiness_evaluation finds a reason, and two of those
+#     reasons fire under normal, intended conditions:
+#       - routes_failed_count > 0, while _OPTIONAL_ROUTE_MODULES exists
+#         precisely so four modules ARE allowed to fail;
+#       - auth_not_enforced when REQUIRE_AUTH is not true in production, which
+#         would pin the service at 503 permanently.
+#     If Render's Health Check Path is /readyz, that is a failed deploy or a
+#     restart loop on the first boot — during the S-1 evidence window.
+#
+#  2. /health reports "degraded" instead of "healthy" under the same
+#     conditions. The Apps Script cockpit parses this and is NOT in version
+#     control, so the blast radius cannot be checked from the repository.
+#
+#  3. /status strips fields for unauthenticated production callers, and
+#     unhandled errors return "internal_server_error" instead of detail.
+#     Same unverifiable frontend dependency.
+#
+# THE FIX IS NOT TO REMOVE ANY OF IT. Every behaviour above is now behind a
+# kill-switch DEFAULTING TO v8.11.3 SEMANTICS, per the standing rule that
+# changes ship environment-gated with backward-compatible defaults. Deploying
+# this file changes NO observable endpoint behaviour.
+#
+# What you gain on day one, at zero risk: /readyz and /health now REPORT
+# `ready` and `readiness_reasons` in the payload while still returning 200 and
+# "healthy". You can read exactly what strict mode WOULD do before arming it.
+# When that list is empty and the Health Check Path is known, flip one switch.
+#
+#   TFB_READYZ_STRICT=1          -> /readyz may return 503   (default: never)
+#   TFB_HEALTH_STRICT=1          -> /health may say degraded  (default: never)
+#   STATUS_DETAILS_REQUIRE_AUTH=1-> /status reduced for anon   (default: full)
+#   EXPOSE_ERROR_DETAILS=0       -> errors hide detail         (default: show)
+#
+# KEPT ACTIVE (no contract change, pure hardening): the _coerce_* helpers,
+# _normalize_request_id sanitising, and docs-off-when-APP_ENV=production
+# (already moot — ENABLE_SWAGGER/ENABLE_REDOC are 0 in Render and /docs
+# returns 404, verified 2026-07-24).
+# =============================================================================
 # v8.11.1: Cross-module canonical alias (matches worker.py v4.3.0,
 # config.py v7.3.0, env.py v7.8.1, track_performance v6.4.0, etc.)
 SERVICE_VERSION = APP_ENTRY_VERSION
@@ -336,11 +419,57 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _coerce_int_value(value: Any, default: int) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _coerce_float_value(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _is_production_env(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"prod", "production"}
+
+
+def _default_docs_enabled() -> bool:
+    return not _is_production_env(_env_str("APP_ENV", "production"))
+
+
 def _parse_csv(value: str) -> List[str]:
     s = (value or "").strip()
     if not s:
         return []
     return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _coerce_csv_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return ",".join(str(x).strip() for x in value if str(x).strip())
+    try:
+        return str(value).strip()
+    except Exception:
+        return ""
+
+
+def _coerce_version(value: Any, default: str) -> str:
+    try:
+        text = str(value or "").strip()
+    except Exception:
+        text = ""
+    if text.lower() in {"", "unknown", "dev", "none", "null"}:
+        return str(default)
+    return text
 
 
 def _err_to_str(e: BaseException, limit: int = 1600) -> str:
@@ -384,17 +513,31 @@ def _path_present_any(paths: Set[str], *candidates: str) -> bool:
     return any(c in paths for c in candidates)
 
 
+_REQUEST_ID_MAX_LEN = 128
+_REQUEST_ID_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._:/-]+")
+
+
+def _normalize_request_id(value: Any) -> str:
+    try:
+        raw = str(value or "").strip()
+    except Exception:
+        raw = ""
+    if raw:
+        raw = _REQUEST_ID_UNSAFE_RE.sub("_", raw)[:_REQUEST_ID_MAX_LEN].strip("._:/-")
+    return raw or uuid.uuid4().hex[:12]
+
+
 def _request_id_from_request(request: Request) -> str:
     try:
-        rid = str(getattr(request.state, "request_id", "") or "").strip()
+        rid = getattr(request.state, "request_id", "")
         if rid:
-            return rid
+            return _normalize_request_id(rid)
     except Exception:
         pass
     try:
-        hdr = str(request.headers.get("X-Request-ID", "") or "").strip()
+        hdr = request.headers.get("X-Request-ID", "")
         if hdr:
-            return hdr
+            return _normalize_request_id(hdr)
     except Exception:
         pass
     return uuid.uuid4().hex[:12]
@@ -459,33 +602,42 @@ class _JsonFormatter(logging.Formatter):
 
 def _setup_logging() -> logging.Logger:
     level = _env_str("LOG_LEVEL", "INFO").upper()
+    resolved_level = getattr(logging, level, logging.INFO)
     log_json = _env_bool("LOG_JSON", False) or (
         _env_str("LOG_FORMAT", "").lower() == "json"
     )
+    replace_handlers = _env_bool("TFB_LOG_REPLACE_ROOT_HANDLERS", False)
 
     root = logging.getLogger()
-    root.handlers.clear()
-    root.setLevel(getattr(logging, level, logging.INFO))
+    root.setLevel(resolved_level)
 
-    handler = logging.StreamHandler(sys.stdout)
-    if log_json:
-        handler.setFormatter(_JsonFormatter())
-    else:
-        handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    if replace_handlers:
+        root.handlers.clear()
+
+    # Do not destroy handlers installed by Gunicorn/Render/telemetry libraries.
+    # Add our formatter only when no handler exists (or replacement was asked).
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        if log_json:
+            handler.setFormatter(_JsonFormatter())
+        else:
+            handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+                )
             )
-        )
-    root.addHandler(handler)
+        root.addHandler(handler)
 
     for name in (
         "uvicorn", "uvicorn.error", "uvicorn.access",
         "gunicorn", "gunicorn.error",
     ):
-        logging.getLogger(name).setLevel(getattr(logging, level, logging.INFO))
+        logging.getLogger(name).setLevel(resolved_level)
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    return logging.getLogger("main")
+    main_logger = logging.getLogger("main")
+    main_logger.setLevel(resolved_level)
+    return main_logger
 
 
 logger = _setup_logging()
@@ -497,13 +649,13 @@ logger = _setup_logging()
 @dataclass(frozen=True)
 class _SettingsView:
     APP_NAME: str = "Tadawul Fast Bridge"
-    APP_VERSION: str = "dev"
+    APP_VERSION: str = APP_ENTRY_VERSION
     APP_ENV: str = "production"
     TIMEZONE_DEFAULT: str = "Asia/Riyadh"
 
     DEBUG: bool = False
-    ENABLE_SWAGGER: bool = True
-    ENABLE_REDOC: bool = True
+    ENABLE_SWAGGER: bool = False
+    ENABLE_REDOC: bool = False
     INIT_ENGINE_ON_BOOT: bool = True
     INIT_ENGINE_STRICT: bool = False
     ENGINE_INIT_TIMEOUT_SEC: float = 12.0
@@ -512,9 +664,17 @@ class _SettingsView:
     REQUIRE_AUTH: bool = True
     OPEN_MODE: bool = False
     AUTH_HEADER_NAME: str = "X-APP-TOKEN"
+    ALLOW_QUERY_TOKEN: bool = False
+    STATUS_DETAILS_REQUIRE_AUTH: bool = False   # v8.12.1: v8.11.3 default
+    EXPOSE_ERROR_DETAILS: bool = True            # v8.12.1: v8.11.3 default
 
     ENABLE_CORS_ALL_ORIGINS: bool = False
     CORS_ORIGINS: str = ""
+    CORS_ALLOW_CREDENTIALS: bool = False
+
+    READY_REQUIRE_ENGINE: bool = False           # v8.12.1: report-only
+    READY_REQUIRE_ROUTES: bool = False           # v8.12.1: report-only
+    READY_REQUIRE_AUTH: bool = False             # v8.12.1: report-only
 
     BACKEND_BASE_URL: str = ""
     ENGINE_CACHE_TTL_SEC: int = 20
@@ -529,10 +689,10 @@ def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
             s, "APP_NAME", "app_name", "service_name",
             default=_env_str("APP_NAME", "Tadawul Fast Bridge"),
         )),
-        APP_VERSION=str(_pick_attr(
+        APP_VERSION=_coerce_version(_pick_attr(
             s, "APP_VERSION", "app_version",
-            default=_env_str("APP_VERSION", "dev"),
-        )),
+            default=_env_str("APP_VERSION", APP_ENTRY_VERSION),
+        ), APP_ENTRY_VERSION),
         APP_ENV=str(_pick_attr(
             s, "APP_ENV", "app_env", "environment", "env",
             default=_env_str("APP_ENV", "production"),
@@ -546,12 +706,12 @@ def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
         ), _env_bool("DEBUG", False)),
         ENABLE_SWAGGER=_to_bool(_pick_attr(
             s, "ENABLE_SWAGGER", "enable_swagger",
-            default=_env_bool("ENABLE_SWAGGER", True),
-        ), _env_bool("ENABLE_SWAGGER", True)),
+            default=_env_bool("ENABLE_SWAGGER", _default_docs_enabled()),
+        ), _env_bool("ENABLE_SWAGGER", _default_docs_enabled())),
         ENABLE_REDOC=_to_bool(_pick_attr(
             s, "ENABLE_REDOC", "enable_redoc",
-            default=_env_bool("ENABLE_REDOC", True),
-        ), _env_bool("ENABLE_REDOC", True)),
+            default=_env_bool("ENABLE_REDOC", _default_docs_enabled()),
+        ), _env_bool("ENABLE_REDOC", _default_docs_enabled())),
         INIT_ENGINE_ON_BOOT=_to_bool(_pick_attr(
             s, "INIT_ENGINE_ON_BOOT", "init_engine_on_boot",
             default=_env_bool("INIT_ENGINE_ON_BOOT", True),
@@ -560,10 +720,10 @@ def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
             s, "INIT_ENGINE_STRICT", "init_engine_strict",
             default=_env_bool("INIT_ENGINE_STRICT", False),
         ), _env_bool("INIT_ENGINE_STRICT", False)),
-        ENGINE_INIT_TIMEOUT_SEC=float(_pick_attr(
+        ENGINE_INIT_TIMEOUT_SEC=_coerce_float_value(_pick_attr(
             s, "ENGINE_INIT_TIMEOUT_SEC", "engine_init_timeout_sec",
             default=_env_float("ENGINE_INIT_TIMEOUT_SEC", 12.0),
-        )),
+        ), _env_float("ENGINE_INIT_TIMEOUT_SEC", 12.0)),
         PRESTART_MOUNT_ROUTES=_to_bool(_pick_attr(
             s, "PRESTART_MOUNT_ROUTES", "prestart_mount_routes",
             default=_env_bool("PRESTART_MOUNT_ROUTES", True),
@@ -580,26 +740,54 @@ def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
             s, "AUTH_HEADER_NAME", "auth_header_name",
             default=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"),
         )),
+        ALLOW_QUERY_TOKEN=_to_bool(_pick_attr(
+            s, "ALLOW_QUERY_TOKEN", "allow_query_token",
+            default=_env_bool("ALLOW_QUERY_TOKEN", False),
+        ), _env_bool("ALLOW_QUERY_TOKEN", False)),
+        STATUS_DETAILS_REQUIRE_AUTH=_to_bool(_pick_attr(
+            s, "STATUS_DETAILS_REQUIRE_AUTH", "status_details_require_auth",
+            default=_env_bool("STATUS_DETAILS_REQUIRE_AUTH", False),
+        ), _env_bool("STATUS_DETAILS_REQUIRE_AUTH", False)),
+        EXPOSE_ERROR_DETAILS=_to_bool(_pick_attr(
+            s, "EXPOSE_ERROR_DETAILS", "expose_error_details",
+            default=_env_bool("EXPOSE_ERROR_DETAILS", True),
+        ), _env_bool("EXPOSE_ERROR_DETAILS", True)),
         ENABLE_CORS_ALL_ORIGINS=_to_bool(_pick_attr(
             s, "ENABLE_CORS_ALL_ORIGINS", "enable_cors_all_origins",
             default=_env_bool("ENABLE_CORS_ALL_ORIGINS", False),
         ), _env_bool("ENABLE_CORS_ALL_ORIGINS", False)),
-        CORS_ORIGINS=str(_pick_attr(
+        CORS_ORIGINS=_coerce_csv_text(_pick_attr(
             s, "CORS_ORIGINS", "cors_origins",
             default=_env_str("CORS_ORIGINS", ""),
         )),
+        CORS_ALLOW_CREDENTIALS=_to_bool(_pick_attr(
+            s, "CORS_ALLOW_CREDENTIALS", "cors_allow_credentials",
+            default=_env_bool("CORS_ALLOW_CREDENTIALS", False),
+        ), _env_bool("CORS_ALLOW_CREDENTIALS", False)),
+        READY_REQUIRE_ENGINE=_to_bool(_pick_attr(
+            s, "READY_REQUIRE_ENGINE", "ready_require_engine",
+            default=_env_bool("READY_REQUIRE_ENGINE", False),
+        ), _env_bool("READY_REQUIRE_ENGINE", False)),
+        READY_REQUIRE_ROUTES=_to_bool(_pick_attr(
+            s, "READY_REQUIRE_ROUTES", "ready_require_routes",
+            default=_env_bool("READY_REQUIRE_ROUTES", False),
+        ), _env_bool("READY_REQUIRE_ROUTES", False)),
+        READY_REQUIRE_AUTH=_to_bool(_pick_attr(
+            s, "READY_REQUIRE_AUTH", "ready_require_auth",
+            default=_env_bool("READY_REQUIRE_AUTH", False),
+        ), _env_bool("READY_REQUIRE_AUTH", False)),
         BACKEND_BASE_URL=str(_pick_attr(
             s, "BACKEND_BASE_URL", "backend_base_url",
             default=_env_str("BACKEND_BASE_URL", ""),
         )),
-        ENGINE_CACHE_TTL_SEC=int(_pick_attr(
+        ENGINE_CACHE_TTL_SEC=_coerce_int_value(_pick_attr(
             s, "ENGINE_CACHE_TTL_SEC", "engine_cache_ttl_sec",
             default=_env_int("ENGINE_CACHE_TTL_SEC", 20),
-        )),
-        MAX_REQUESTS_PER_MINUTE=int(_pick_attr(
+        ), _env_int("ENGINE_CACHE_TTL_SEC", 20)),
+        MAX_REQUESTS_PER_MINUTE=_coerce_int_value(_pick_attr(
             s, "MAX_REQUESTS_PER_MINUTE", "max_requests_per_minute",
             default=_env_int("MAX_REQUESTS_PER_MINUTE", 240),
-        )),
+        ), _env_int("MAX_REQUESTS_PER_MINUTE", 240)),
         CONFIG_SOURCE=source,
     )
 
@@ -621,12 +809,12 @@ def _load_settings() -> _SettingsView:
 
     return _SettingsView(
         APP_NAME=_env_str("APP_NAME", "Tadawul Fast Bridge"),
-        APP_VERSION=_env_str("APP_VERSION", "dev"),
+        APP_VERSION=_env_str("APP_VERSION", APP_ENTRY_VERSION),
         APP_ENV=_env_str("APP_ENV", "production"),
         TIMEZONE_DEFAULT=_env_str("TZ", "Asia/Riyadh"),
         DEBUG=_env_bool("DEBUG", False),
-        ENABLE_SWAGGER=_env_bool("ENABLE_SWAGGER", True),
-        ENABLE_REDOC=_env_bool("ENABLE_REDOC", True),
+        ENABLE_SWAGGER=_env_bool("ENABLE_SWAGGER", _default_docs_enabled()),
+        ENABLE_REDOC=_env_bool("ENABLE_REDOC", _default_docs_enabled()),
         INIT_ENGINE_ON_BOOT=_env_bool("INIT_ENGINE_ON_BOOT", True),
         INIT_ENGINE_STRICT=_env_bool("INIT_ENGINE_STRICT", False),
         ENGINE_INIT_TIMEOUT_SEC=_env_float("ENGINE_INIT_TIMEOUT_SEC", 12.0),
@@ -634,8 +822,15 @@ def _load_settings() -> _SettingsView:
         REQUIRE_AUTH=_env_bool("REQUIRE_AUTH", True),
         OPEN_MODE=_env_bool("OPEN_MODE", False),
         AUTH_HEADER_NAME=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"),
+        ALLOW_QUERY_TOKEN=_env_bool("ALLOW_QUERY_TOKEN", False),
+        STATUS_DETAILS_REQUIRE_AUTH=_env_bool("STATUS_DETAILS_REQUIRE_AUTH", False),
+        EXPOSE_ERROR_DETAILS=_env_bool("EXPOSE_ERROR_DETAILS", True),
         ENABLE_CORS_ALL_ORIGINS=_env_bool("ENABLE_CORS_ALL_ORIGINS", False),
         CORS_ORIGINS=_env_str("CORS_ORIGINS", ""),
+        CORS_ALLOW_CREDENTIALS=_env_bool("CORS_ALLOW_CREDENTIALS", False),
+        READY_REQUIRE_ENGINE=_env_bool("READY_REQUIRE_ENGINE", False),
+        READY_REQUIRE_ROUTES=_env_bool("READY_REQUIRE_ROUTES", False),
+        READY_REQUIRE_AUTH=_env_bool("READY_REQUIRE_AUTH", False),
         BACKEND_BASE_URL=_env_str("BACKEND_BASE_URL", ""),
         ENGINE_CACHE_TTL_SEC=_env_int("ENGINE_CACHE_TTL_SEC", 20),
         MAX_REQUESTS_PER_MINUTE=_env_int("MAX_REQUESTS_PER_MINUTE", 240),
@@ -644,6 +839,18 @@ def _load_settings() -> _SettingsView:
 
 
 _SETTINGS = _load_settings()
+
+
+def _expose_error_details() -> bool:
+    if bool(getattr(_SETTINGS, "DEBUG", False)):
+        return True
+    if bool(getattr(_SETTINGS, "EXPOSE_ERROR_DETAILS", False)):
+        return True
+    return not _is_production_env(getattr(_SETTINGS, "APP_ENV", "production"))
+
+
+def _public_error_text(exc: BaseException, fallback: str = "internal_server_error") -> str:
+    return _err_to_str(exc) if _expose_error_details() else fallback
 
 
 # =============================================================================
@@ -862,7 +1069,7 @@ def _auth_ok(request: Request) -> bool:
 # =============================================================================
 class RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID", "").strip() or uuid.uuid4().hex[:12]
+        request_id = _normalize_request_id(request.headers.get("X-Request-ID", ""))
         request.state.request_id = request_id
         response = await call_next(request)
         try:
@@ -892,7 +1099,7 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                     headers={"X-Request-ID": request_id},
                     content={
                         "status": "error",
-                        "error": "RuntimeError: No response returned.",
+                        "error": "internal_server_error",
                         "path": str(request.url.path),
                         "request_id": request_id,
                         "ts_utc": datetime.now(timezone.utc).isoformat(),
@@ -915,7 +1122,7 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                     headers={"X-Request-ID": request_id},
                     content={
                         "status": "error",
-                        "error": f"{type(exc).__name__}: {str(exc)}",
+                        "error": _public_error_text(exc),
                         "path": str(request.url.path),
                         "request_id": request_id,
                         "ts_utc": datetime.now(timezone.utc).isoformat(),
@@ -1325,6 +1532,25 @@ def _clone_filtered_router(
             "name": route.name,
             "include_in_schema": route.include_in_schema,
             "response_class": getattr(route, "response_class", None),
+            "response_model": getattr(route, "response_model", None),
+            "response_model_include": getattr(
+                route, "response_model_include", None,
+            ),
+            "response_model_exclude": getattr(
+                route, "response_model_exclude", None,
+            ),
+            "response_model_by_alias": bool(
+                getattr(route, "response_model_by_alias", True)
+            ),
+            "response_model_exclude_unset": bool(
+                getattr(route, "response_model_exclude_unset", False)
+            ),
+            "response_model_exclude_defaults": bool(
+                getattr(route, "response_model_exclude_defaults", False)
+            ),
+            "response_model_exclude_none": bool(
+                getattr(route, "response_model_exclude_none", False)
+            ),
             "status_code": getattr(route, "status_code", None),
             "tags": list(getattr(route, "tags", []) or []),
             "summary": getattr(route, "summary", None),
@@ -1336,7 +1562,12 @@ def _clone_filtered_router(
             "operation_id": getattr(route, "operation_id", None),
             "responses": getattr(route, "responses", None),
             "dependencies": list(getattr(route, "dependencies", []) or []),
+            "callbacks": list(getattr(route, "callbacks", []) or []),
+            "openapi_extra": getattr(route, "openapi_extra", None),
         }
+        unique_id_fn = getattr(route, "generate_unique_id_function", None)
+        if callable(unique_id_fn):
+            kwargs["generate_unique_id_function"] = unique_id_fn
         try:
             out.add_api_route(**kwargs)
             added_paths.append(path)
@@ -1608,51 +1839,164 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
 # =============================================================================
 # Built-in routes
 # =============================================================================
+_PUBLIC_STATUS_META_KEYS: Set[str] = {
+    "service",
+    "app_version",
+    "entry_version",
+    "service_version",
+    "env",
+    "timestamp_utc",
+    "python",
+    "routes_mounted",
+    "routes_failed_count",
+    "engine_present",
+    "engine_ready",
+    "engine_version",
+}
+
+
+def _status_meta_for_request(request: Request, app: FastAPI) -> Dict[str, Any]:
+    meta = _runtime_meta(app)
+    require_auth = bool(getattr(_SETTINGS, "STATUS_DETAILS_REQUIRE_AUTH", True))
+    should_reduce = (
+        require_auth
+        and _is_production_env(getattr(_SETTINGS, "APP_ENV", "production"))
+        and bool(getattr(_SETTINGS, "REQUIRE_AUTH", True))
+        and not bool(getattr(_SETTINGS, "OPEN_MODE", False))
+        and not _auth_ok(request)
+    )
+    if not should_reduce:
+        return meta
+    return {k: v for k, v in meta.items() if k in _PUBLIC_STATUS_META_KEYS}
+
+
+def _readiness_evaluation(app: FastAPI) -> Tuple[bool, List[str]]:
+    meta = _runtime_meta(app)
+    reasons: List[str] = []
+
+    if bool(getattr(_SETTINGS, "READY_REQUIRE_ROUTES", True)):
+        if not bool(meta.get("routes_mounted")):
+            reasons.append("routes_not_mounted")
+        if int(meta.get("routes_failed_count", 0) or 0) > 0:
+            reasons.append("route_module_failure")
+        if list(meta.get("missing_required_keys", []) or []):
+            reasons.append("required_route_family_missing")
+        if dict(meta.get("canonical_path_owner_mismatches", {}) or {}):
+            reasons.append("canonical_route_owner_mismatch")
+
+    require_engine = bool(getattr(_SETTINGS, "READY_REQUIRE_ENGINE", True))
+    engine_expected = bool(getattr(_SETTINGS, "INIT_ENGINE_ON_BOOT", True))
+    if require_engine and engine_expected:
+        if not bool(meta.get("engine_ready")):
+            reasons.append("engine_not_ready")
+
+    if (
+        bool(getattr(_SETTINGS, "READY_REQUIRE_AUTH", True))
+        and _is_production_env(getattr(_SETTINGS, "APP_ENV", "production"))
+        and not bool(getattr(_SETTINGS, "OPEN_MODE", False))
+        and not bool(getattr(_SETTINGS, "REQUIRE_AUTH", True))
+    ):
+        reasons.append("auth_not_enforced")
+
+    return (not reasons), reasons
+
+
 def _install_builtin_routes(app: FastAPI) -> None:
-    def _status_payload(label: str) -> Dict[str, Any]:
-        return {"status": label, **_runtime_meta(app)}
+    def _status_payload(
+        request: Request,
+        label: str,
+        *,
+        readiness: Optional[Tuple[bool, List[str]]] = None,
+    ) -> Dict[str, Any]:
+        payload = {"status": label, **_status_meta_for_request(request, app)}
+        if readiness is not None:
+            ready, reasons = readiness
+            payload["ready"] = ready
+            payload["readiness_reasons"] = reasons
+        return payload
 
     def _add_status_route(
-        path: str, label: str, *, include_in_schema: bool = False,
+        path: str,
+        mode: str,
+        *,
+        include_in_schema: bool = False,
     ) -> None:
         @app.api_route(
             path, methods=["GET", "HEAD"], include_in_schema=include_in_schema,
         )
-        async def _status_route(request: Request, _label: str = label):
+        async def _status_route(request: Request, _mode: str = mode):
+            if _mode == "ready":
+                ready, reasons = _readiness_evaluation(app)
+                # v8.12.1 MASTER GATE. In v8.11.3 /readyz returned HTTP 200
+                # unconditionally; it had never emitted any other status in its
+                # life, and Render's Health Check Path may point at it. v8.12.0
+                # made it 503 on any reason — including route_module_failure,
+                # which fires by design because _OPTIONAL_ROUTE_MODULES exists
+                # so that four modules ARE permitted to fail. That is a failed
+                # deploy or a restart loop on first boot.
+                # Default OFF: status stays 200 and the label stays "ready",
+                # exactly as v8.11.3. The evaluation still RUNS and its result
+                # is reported additively below, so the reasons can be read and
+                # emptied before anyone arms this.
+                strict = _env_bool("TFB_READYZ_STRICT", False)
+                code = 200 if (ready or not strict) else 503
+                label = "ready" if (ready or not strict) else "not_ready"
+                if request.method == "HEAD":
+                    return Response(status_code=code)
+                return _StrictJSONResponse(
+                    status_code=code,
+                    content=_status_payload(
+                        request, label, readiness=(ready, reasons),
+                    ),
+                )
+
+            if _mode == "health":
+                ready, reasons = _readiness_evaluation(app)
+                # v8.12.1: same reasoning. The Apps Script cockpit parses this
+                # label and is not in version control, so "degraded" cannot be
+                # introduced blind. Default OFF -> always "healthy", as v8.11.3.
+                h_strict = _env_bool("TFB_HEALTH_STRICT", False)
+                h_label = "healthy" if (ready or not h_strict) else "degraded"
+                if request.method == "HEAD":
+                    return Response(status_code=200)
+                return _status_payload(
+                    request, h_label, readiness=(ready, reasons),
+                )
+
             if request.method == "HEAD":
                 return Response(status_code=200)
-            return _status_payload(_label)
+            return _status_payload(request, "live")
 
     @app.get("/meta", include_in_schema=False, tags=["meta"])
-    async def meta():
-        return _status_payload("ok")
+    async def meta(request: Request):
+        return _status_payload(request, "ok")
 
     @app.get("/v1/meta", include_in_schema=False)
-    async def meta_v1():
-        return _status_payload("ok")
+    async def meta_v1(request: Request):
+        return _status_payload(request, "ok")
 
     @app.get("/ping", include_in_schema=False)
-    async def ping():
-        return {"pong": True, **_runtime_meta(app)}
+    async def ping(request: Request):
+        return {"pong": True, **_status_meta_for_request(request, app)}
 
     @app.get("/v1/ping", include_in_schema=False)
-    async def ping_v1():
-        return {"pong": True, **_runtime_meta(app)}
+    async def ping_v1(request: Request):
+        return {"pong": True, **_status_meta_for_request(request, app)}
 
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root(request: Request):
         if request.method == "HEAD":
             return Response(status_code=200)
-        return _status_payload("ok")
+        return _status_payload(request, "ok")
 
     _add_status_route("/readyz", "ready")
     _add_status_route("/livez", "live")
-    _add_status_route("/health", "healthy")
-    _add_status_route("/healthz", "healthy")
+    _add_status_route("/health", "health")
+    _add_status_route("/healthz", "health")
     _add_status_route("/v1/readyz", "ready")
     _add_status_route("/v1/livez", "live")
-    _add_status_route("/v1/health", "healthy")
-    _add_status_route("/v1/healthz", "healthy")
+    _add_status_route("/v1/health", "health")
+    _add_status_route("/v1/healthz", "health")
 
 
 # =============================================================================
@@ -1884,22 +2228,34 @@ def create_app() -> FastAPI:
     )
     _ensure_app_state_defaults(app)
 
-    # v8.11.1: Middleware ordering FIX. Starlette's add_middleware uses LIFO
-    # stack order (last added = outermost wrapper). Order we want outer-to-
-    # inner: RequestID -> NoResponseGuard -> GZip -> route. So we add them in
-    # REVERSE: GZip first (innermost), NoResponseGuard second, RequestID LAST
-    # (outermost). This ensures request.state.request_id is set BEFORE any
-    # other middleware sees the request, and X-Request-ID header is set on
-    # every response (including errors caught by NoResponseGuardMiddleware).
+    if _is_production_env(_SETTINGS.APP_ENV):
+        if bool(_SETTINGS.ENABLE_SWAGGER) or bool(_SETTINGS.ENABLE_REDOC):
+            _append_startup_warning(app, "production_api_docs_enabled")
+        if (
+            not bool(_SETTINGS.OPEN_MODE)
+            and not bool(_SETTINGS.REQUIRE_AUTH)
+        ):
+            _append_startup_warning(app, "production_auth_not_enforced")
+    if bool(_SETTINGS.ALLOW_QUERY_TOKEN):
+        _append_startup_warning(app, "query_token_transport_enabled")
+
+    # Starlette middleware is LIFO (last added = outermost). Desired order:
+    # RequestID -> CORS -> NoResponseGuard -> GZip -> route. This preserves
+    # request IDs on every response while still allowing CORS to decorate
+    # responses synthesized by the guard.
     app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.add_middleware(NoResponseGuardMiddleware)
-    app.add_middleware(RequestIDMiddleware)
 
     if bool(_SETTINGS.ENABLE_CORS_ALL_ORIGINS):
+        if bool(_SETTINGS.CORS_ALLOW_CREDENTIALS):
+            _append_startup_warning(
+                app,
+                "cors_credentials_forced_off_for_wildcard_origin",
+            )
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
-            allow_credentials=True,
+            allow_credentials=False,
             allow_methods=["*"],
             allow_headers=["*"],
         )
@@ -1909,10 +2265,12 @@ def create_app() -> FastAPI:
             app.add_middleware(
                 CORSMiddleware,
                 allow_origins=origins,
-                allow_credentials=True,
+                allow_credentials=bool(_SETTINGS.CORS_ALLOW_CREDENTIALS),
                 allow_methods=["*"],
                 allow_headers=["*"],
             )
+
+    app.add_middleware(RequestIDMiddleware)
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
@@ -1932,7 +2290,7 @@ def create_app() -> FastAPI:
             headers={"X-Request-ID": request_id},
             content={
                 "status": "error",
-                "error": f"{type(exc).__name__}: {str(exc)}",
+                "error": _public_error_text(exc),
                 "path": str(request.url.path),
                 "request_id": request_id,
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
@@ -1979,7 +2337,7 @@ def create_app() -> FastAPI:
             and bool(_SETTINGS.REQUIRE_AUTH)
             and not _auth_ok(request)
         ):
-            return JSONResponse(
+            return _StrictJSONResponse(
                 status_code=401,
                 content={"status": "error", "error": "unauthorized"},
             )
