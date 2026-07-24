@@ -4,6 +4,33 @@ name: "🗄️ TFB PIT Snapshot"
 # fundamentals + engine-output snapshot for the decision symbols to
 # _PIT_Fundamentals — append-only, duplicate-proof, off the request path.
 # "Every unarchived day is evidence lost forever" — this starts the archive.
+#
+# ============================================================================
+# v1.1.0 (2026-07-24) — [VBREAK] WINDOW HARDENING. Config only: no Python
+# touched, no schedule moved, no decision behaviour changed.
+#   1. CONCURRENCY: this file previously had NO concurrency block. A scheduled
+#      20:10 UTC run and a manual dispatch could append CONCURRENTLY to the one
+#      store whose entire purpose is being a trustworthy historical record —
+#      producing duplicate or interleaved rows in the archive.
+#   2. BRANCH PIN: dispatch can fire from any branch, and repo secrets/vars are
+#      available to all of them. checkout is now pinned to main.
+#   3. DRY-RUN BY DEFAULT on manual dispatch. SCHEDULED RUNS STILL WRITE — see
+#      the WHY on the run step before touching that logic.
+#   4. Credential file mode 600.
+#
+# KNOWN, DELIBERATELY NOT FIXED HERE — US DAYLIGHT-SAVING DRIFT:
+#   The cron reads "after the US close". That holds during US DAYLIGHT time
+#   (close 20:00 UTC, snapshot 20:10). Under US STANDARD time the close moves to
+#   21:00 UTC and this snapshot would fire ~50 minutes BEFORE it — silently
+#   changing the meaning of "daily closing snapshot" mid-archive. Correct
+#   finding, and NOT LIVE during this evidence window: US DST runs to early
+#   November and the window closes 2026-08-16, so every snapshot in the window is
+#   genuinely post-close. Moving the capture time now would introduce an evidence
+#   discontinuity for zero present benefit. Registered for post-window, where the
+#   right fix is a New-York-calendar check in pit_snapshot.py rather than a
+#   guessed UTC hour.
+# ROLLBACK: each item is independently removable.
+# ============================================================================
 
 on:
   schedule:
@@ -11,8 +38,28 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "true = print rows, write nothing"
-        default: "false"
+        description: "Preview only (true = print rows, write nothing)"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+# ============================================================================
+# CONCURRENCY — SINGLE WRITE LEASE (v1.1.0)
+# ============================================================================
+# LITERAL group: one lease per workflow, unescapable by branch or trigger type.
+# cancel-in-progress: false — a partially written snapshot is worse than a late
+# one, and this archive is append-only, so an aborted run can leave a half-day.
+#
+# NOT a cross-workflow lease, deliberately: the 20:10 UTC start sits only ten
+# minutes after the 20:00 daily_sync fire, so sharing a group with a writer
+# capped at 115 minutes would make this snapshot the one most likely to be
+# superseded and skipped outright. A skipped snapshot is a permanently lost
+# evidence day. Registered pending daily_sync's measured median runtime.
+# ============================================================================
+concurrency:
+  group: tfb-pit-snapshot
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -24,7 +71,13 @@ jobs:
     env:
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
     steps:
+      # v1.1.0: pinned to main — a dispatch from any other branch would
+      # otherwise append unreviewed output into the permanent evidence archive.
       - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
 
       - uses: actions/setup-python@v6
         with:
@@ -39,6 +92,7 @@ jobs:
           SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
         run: |
           set -euo pipefail
+          umask 077
           CREDS_PATH="$RUNNER_TEMP/gcreds.json"
           if [[ -n "${SECRET_CREDS:-}" ]]; then
             printf '%s' "$SECRET_CREDS" > "$CREDS_PATH"
@@ -47,11 +101,24 @@ jobs:
           else
             echo "::error::No Google credentials secret present."; exit 1
           fi
+          chmod 600 "$CREDS_PATH"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
 
       - name: Run PIT snapshot
+        env:
+          # v1.1.0: input read through the environment, not interpolated into
+          # the shell line.
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
+          # WHY THE DEFAULT IS --write, NOT --dry-run — READ BEFORE EDITING:
+          # A SCHEDULED run carries no dispatch input, so INPUT_DRY_RUN is EMPTY.
+          # The idiom "${INPUT_DRY_RUN:-true}" would substitute "true" there and
+          # turn the ONLY daily archival run into a dry-run — ending the PIT
+          # archive silently, with the workflow still green, against a store
+          # whose stated purpose is that an unarchived day is lost forever.
+          # Only an explicit "true" from a human dispatch suppresses the write.
           EXTRA="--write"
-          if [[ "${{ github.event.inputs.dry_run }}" == "true" ]]; then EXTRA="--dry-run"; fi
+          if [[ "${INPUT_DRY_RUN:-}" == "true" ]]; then EXTRA="--dry-run"; fi
+          echo "dry_run input='${INPUT_DRY_RUN:-<scheduled: none>}' -> args='$EXTRA'"
           python scripts/pit_snapshot.py $EXTRA
