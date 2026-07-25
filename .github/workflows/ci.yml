@@ -211,7 +211,12 @@ jobs:
       - name: 📐 Run schema alignment
         run: |
           echo "::group::pytest (contract)"
-          python -m pytest -q tests/test_schema_alignment.py
+          # PY-4 (2026-07-26): the exact current-schema contract is now an
+          # UNCONDITIONAL gate — previously only the legacy alignment test
+          # ran here, and tests.yml guards the exact test behind a path
+          # filter that omits schema_registry.py, so a registry change
+          # could dodge the strongest check entirely.
+          python -m pytest -q tests/test_schema_alignment.py tests/test_current_schema_contract.py
           echo "::endgroup::"
 
   # ==========================================================================
