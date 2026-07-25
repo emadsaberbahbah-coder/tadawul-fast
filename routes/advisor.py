@@ -196,7 +196,49 @@ if _advisor_debug_enabled():
         pass
 
 
-ADVISOR_VERSION = "6.7.4"
+# -----------------------------------------------------------------------------
+# v6.8.0 (2026-07-25) — [RULE-OVR] MY_PORTFOLIO RULE-EXIT DISPLAY OVERRIDE
+# WHY (2026-07-25 evening workbook audit): My_Portfolio painted NMM.US as
+# Recommendation=BUY / Final Action=INVEST (overall 70.49) in the very same
+# export where Portfolio_Decision ordered "EXIT | EXIT-BY-RULE (§4.6):
+# compliance/authority verdict — not confidence-cappable". Both were on
+# screen at once. This is the third surface of the compliance-blindness
+# defect class (1180.SR / BBD lesson, then Rule 1a on the decision side)
+# and the exact ACCUMULATE-vs-WATCH labelling trap the operator already
+# acted on once: the holdings page shows the raw engine signal while the
+# rulebook — which outranks every signal — says leave. A reader of
+# My_Portfolio alone is invited to average down into a rule-mandated exit.
+# FIX — one fill-only pass at the proven My_Portfolio choke point
+# (_ensure_tabular_shape, immediately after the v6.7.2 FIX-10 enrichment
+# and BEFORE the matrix rebuild, so row_objects, rows_matrix and the
+# FIX-12 snake_case backfill all agree):
+#   * the rule set is read from core.analysis.portfolio_actions
+#     ._rule_exit_set() — the SAME resolver Rule 1a uses on the decision
+#     side (opportunity_builder.compliance_rule_sets union), imported
+#     lazily and fail-open, so the two surfaces can never drift;
+#   * every held row whose Symbol is in the set gets its display cells
+#     Recommendation -> "SELL", Final Action -> "EXIT", Recommendation
+#     Reason -> the §4.6 tag — and the matching snake_case keys
+#     (recommendation / final_action / recommendation_reason) whenever
+#     the resolver already supplied them, so header-mapped AND key-mapped
+#     consumers both see the rule verdict;
+#   * scores are NOT touched (the engine signal stays auditable; only the
+#     actionable verdict cells are clamped — mirroring Rule 1a's "a rule
+#     exit is a compliance verdict, not a signal");
+#   * touched symbols are reported in meta.rule_exit_overrides and one
+#     [advisor v6.8.0 RULE-OVR] log line, so the six-gate morning audit
+#     can grep the override working (or firing on the wrong symbol).
+# SCOPE (stated, not hidden): compliance/authority EXITs only. Cap-driven
+# TRIM-BY-RULE (Rule 1b) depends on whole-portfolio weight math that the
+# per-row advisor surface does not own; duplicating it here is the drift
+# risk this fix exists to kill. Cap breaches remain Portfolio_Decision's
+# to display.
+# ENV: TFB_ADVISOR_RULE_OVERRIDE default ON; =0/false/off/no restores the
+# v6.7.4 passthrough byte-identically. ZERO functions removed; additions:
+# _rule_override_enabled, _rule_exit_symbols,
+# _apply_rule_exit_override_my_portfolio (+ tag _RULE_OVERRIDE_TAG).
+# -----------------------------------------------------------------------------
+ADVISOR_VERSION = "6.8.0"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 DEFAULT_ADVISOR_PAGE = "Top_10_Investments"
@@ -1298,6 +1340,91 @@ def _enrich_my_portfolio_portfolio_fields(*, headers: List[str], row_objects: Li
     return row_objects
 
 
+# v6.8.0 [RULE-OVR]: the §4.6 tag written into Recommendation Reason on an
+# overridden holding — grep-stable for the six-gate morning audit.
+_RULE_OVERRIDE_TAG = ("EXIT-BY-RULE (\u00a74.6): compliance/authority verdict "
+                      "\u2014 display override v6.8.0")
+
+
+def _rule_override_enabled() -> bool:
+    """v6.8.0 [RULE-OVR] kill-switch — DEFAULT ON. Set
+    TFB_ADVISOR_RULE_OVERRIDE=0/false/off/no to restore the v6.7.4
+    passthrough (raw engine Recommendation / Final Action) byte-identically."""
+    return (os.getenv("TFB_ADVISOR_RULE_OVERRIDE") or "1").strip().lower() not in {
+        "0", "false", "off", "no"}
+
+
+def _rule_exit_symbols() -> set:
+    """v6.8.0 [RULE-OVR]: the rule-exit symbol set, read from the SAME
+    resolver Rule 1a uses on the decision side
+    (core.analysis.portfolio_actions._rule_exit_set, which wraps
+    opportunity_builder.compliance_rule_sets). Lazy import, fail-open:
+    any import or call failure returns an empty set and the page renders
+    exactly as v6.7.4 did — the override can only ever narrow, never
+    invent, and never crash the sheet-rows path."""
+    try:
+        mod = import_module("core.analysis.portfolio_actions")
+        fn = getattr(mod, "_rule_exit_set", None)
+        if callable(fn):
+            got = fn()
+            if got:
+                return {str(s or "").strip().upper() for s in got
+                        if str(s or "").strip()}
+    except Exception:
+        pass
+    return set()
+
+
+def _apply_rule_exit_override_my_portfolio(
+    *, headers: List[str], row_objects: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """v6.8.0 [RULE-OVR]: clamp the actionable verdict cells of every held
+    row whose Symbol carries an active compliance/authority EXIT. Fill-only
+    and total: mutates the verdict cells in place, touches nothing else,
+    returns (row_objects, [overridden symbols]); any exception returns the
+    rows untouched. Scores are deliberately left intact — the engine
+    signal stays auditable, only the verdict is outranked (Rule 1a's own
+    contract: a rule exit is a compliance verdict, not a signal)."""
+    hits: List[str] = []
+    try:
+        if not row_objects or not _rule_override_enabled():
+            return row_objects, hits
+        rule_set = _rule_exit_symbols()
+        if not rule_set:
+            return row_objects, hits
+        # display-header cells + snake_case keys (set only when the key is
+        # already present, mirroring the FIX-12 "never drop / never invent"
+        # convention for resolver-supplied keys).
+        _targets = (
+            ("Recommendation", "recommendation", "SELL"),
+            ("Final Action", "final_action", "EXIT"),
+            ("Recommendation Reason", "recommendation_reason",
+             _RULE_OVERRIDE_TAG),
+        )
+        for row in row_objects:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("Symbol") or row.get("symbol") or "").strip().upper()
+            if not sym or sym not in rule_set:
+                continue
+            for disp, snake, value in _targets:
+                if disp in row:
+                    row[disp] = value
+                if snake in row:
+                    row[snake] = value
+            hits.append(sym)
+        if hits:
+            logger.info(
+                "[advisor v%s RULE-OVR] My_Portfolio: %d rule-exit "
+                "override(s): %s", ADVISOR_VERSION, len(hits),
+                ", ".join(hits[:10]))
+    except Exception as exc:  # fail-open: never break the sheet-rows path
+        logger.warning("[advisor v%s RULE-OVR] skipped: %s",
+                       ADVISOR_VERSION, exc)
+        return row_objects, []
+    return row_objects, hits
+
+
 def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any]:
     effective_headers: List[str] = _effective_headers_from_result(result)
     object_rows: List[Dict[str, Any]] = _extract_object_rows_any(result)
@@ -1307,8 +1434,15 @@ def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any
     # math + weights + action + decision) on the projected rows via the engine's
     # own pass, then rebuild the matrix so rows_matrix reflects the filled values.
     # Resolver-agnostic (every resolver funnels through here) and fill-only.
+    _rovr_hits: List[str] = []
     if page == "My_Portfolio" and object_rows:
         object_rows = _enrich_my_portfolio_portfolio_fields(headers=effective_headers, row_objects=object_rows)
+        # v6.8.0 [RULE-OVR]: clamp Recommendation / Final Action on rule-exit
+        # holdings AFTER enrichment and BEFORE the matrix rebuild, so
+        # row_objects, rows_matrix and the FIX-12 snake_case backfill all
+        # carry the same §4.6 verdict.
+        object_rows, _rovr_hits = _apply_rule_exit_override_my_portfolio(
+            headers=effective_headers, row_objects=object_rows)
         if effective_headers:
             matrix_rows = _mapping_list_to_rows(object_rows, effective_headers)
     result["headers"] = effective_headers
@@ -1343,6 +1477,8 @@ def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any
         result["rows_matrix"] = _mapping_list_to_rows(object_rows, effective_headers)
         result["rows"] = object_rows
     meta = _extract_meta_mapping(result)
+    if _rovr_hits:
+        meta["rule_exit_overrides"] = list(_rovr_hits)
     if effective_headers:
         meta.setdefault("contract_header_count", _contract_header_count(page) or len(effective_headers))
         meta.setdefault("actual_header_count", len(effective_headers))
