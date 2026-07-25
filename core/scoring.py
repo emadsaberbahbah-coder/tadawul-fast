@@ -11,6 +11,47 @@ Canonical scoring and recommendation source for Tadawul Fast Bridge.
 Canonical tiers (best -> worst):
     STRONG_BUY, BUY, ACCUMULATE, HOLD, REDUCE, SELL, STRONG_SELL, AVOID
 
+v5.11.0 — DOWNSIDE-METRIC SIGN NORMALISATION (Fix BD-1)
+================================================================================
+WHY (live workbook audit 2026-07-25, "Market Share DeepseekV3" export v52):
+compute_risk_score() applied abs() to max_drawdown_1y but NOT to var_95_1d,
+while the two providers disagree on the sign convention for both:
+
+    Max Drawdown 1Y   eodhd 93.6% negative   yahoo_chart 0% negative
+    VaR 95% (1D)      eodhd 93.6% negative   yahoo_chart 0% negative
+
+Because _scale(x, 0.01, 0.08) clamps to [0,1], every negative VaR collapsed to
+0.0 — the MINIMUM risk contribution at weight 0.20 — while positive-sign rows
+received a real value. 8,658 of 9,380 scored rows (92.3%) were affected, i.e.
+effectively the entire non-Tadawul universe was scored as carrying ZERO tail
+risk. The defect was one-directional (it could only ever UNDERSTATE risk) and
+provider-correlated (eodhd rows only), so it never produced an outlier anyone
+would notice — it silently flattered US names against Saudi ones in the same
+ranking. Recomputing the live portfolio reproduces the published Risk Scores
+exactly, then corrects them:
+
+    NMM.US  VaR -0.027873   26.75 -> 31.86   understated 5.11 pts
+    YUMC    VaR -0.023694   29.34 -> 33.26   understated 3.92 pts
+    NTES    VaR -0.030892   37.24 -> 43.21   understated 5.97 pts
+
+NTES carried the largest absolute tail risk in the portfolio and was scored as
+if it had none.
+
+BD-1 FIX: one line — abs(var1d), mirroring the abs(dd1y) already present one
+branch above. Deliberately NOT applied to beta_5y: 6.5% of rows carry a negative
+beta and that sign is meaningful (inverse market correlation), so abs(beta)
+would score a hedge as high-risk — a worse error than the one being fixed.
+Volatility needs no guard (0 of 9,217 rows negative).
+
+RESIDUAL (not fixed here, by design): the sheet still DISPLAYS mixed signs, so
+a reader comparing "Max Drawdown 1Y" across a US and a Saudi row sees -0.31 next
+to +0.17 for comparable risk. Scoring is now sign-agnostic, but display
+normalisation belongs at ingest in data_engine_v2, not in the scorer.
+
+Version: __version__ = "5.11.0". No functions added or removed; no signature
+changed. Behaviour change is confined to rows with a negative var_95_1d, whose
+Risk Score can only rise.
+
 v5.7.0 aligned the canonical RECOMMENDATION_ENUM to core.reco_normalize v8.0.0's
 8-tier vocabulary (added ACCUMULATE between BUY and HOLD; AVOID as worst tier),
 extended the recommendation ladder, priority bands, position-size hints, and
@@ -223,7 +264,7 @@ logger.addHandler(logging.NullHandler())
 # calibrator's job; this restores ORDERING today with bounded honesty.
 # Gate: TFB_SCORE_ROI_SOFTCAP (default OFF => _roi_bound ≡ _clamp exactly;
 # champion byte-identical until armed).
-__version__ = "5.10.0"
+__version__ = "5.11.0"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -1885,7 +1926,30 @@ def compute_risk_score(row: Mapping[str, Any]) -> Optional[float]:
     if dd1y is not None:
         parts.append((0.35, _scale(abs(dd1y), 0.05, 0.55) or 0.0))
     if var1d is not None:
-        parts.append((0.20, _scale(var1d, 0.01, 0.08) or 0.0))
+        # v5.11.0 [FIX BD-1]: abs() — mirrors the abs(dd1y) one branch above.
+        # Providers disagree on the sign of a downside metric: eodhd returns
+        # VaR/drawdown NEGATIVE (a loss), yahoo_chart returns them POSITIVE (a
+        # magnitude). Measured on the 2026-07-25 export, 8,658 of 9,380 rows
+        # (92.3%) carry a negative var_95_1d. _scale(x, 0.01, 0.08) clamps to
+        # [0,1], so every one of those was floored to 0.0 — the MINIMUM risk
+        # contribution — while the positive-sign rows got a real value. The
+        # drawdown line was made sign-safe; this line was missed, so the defect
+        # was one-directional and invisible: it never raised a score, it only
+        # ever understated one, and only for one provider's rows.
+        #
+        # Live holdings (recomputation reproduces the published scores exactly):
+        #   NMM.US  VaR -0.0279  risk 26.75 -> 31.86  (understated 5.11)
+        #   YUMC    VaR -0.0237  risk 29.34 -> 33.26  (understated 3.92)
+        #   NTES    VaR -0.0309  risk 37.24 -> 43.21  (understated 5.97)
+        # The four .SR holdings are unaffected (their VaR is already positive),
+        # so US and Saudi rows were being risk-ranked against each other on
+        # inconsistent inputs, with the US side always flattered.
+        #
+        # NOT applied to beta_5y below: 6.5% of rows carry a NEGATIVE beta and
+        # that sign is meaningful (inverse market correlation). abs(beta) would
+        # score a hedge as high-risk, which is a worse error than the one being
+        # fixed here. Volatility needs no guard — 0 of 9,217 rows are negative.
+        parts.append((0.20, _scale(abs(var1d), 0.01, 0.08) or 0.0))
     if sharpe is not None:
         sharpe_norm = _clamp(1.0 - _clamp((sharpe + 0.5) / 2.5, 0.0, 1.0), 0.0, 1.0)
         parts.append((0.05, sharpe_norm))
