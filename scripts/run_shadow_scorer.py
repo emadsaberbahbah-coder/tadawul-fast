@@ -114,7 +114,34 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # Scoring, gate, history, and ledger were never affected — the guard did its
 # job. Fix: define the helper (fixed UTC+3, no new imports). One name, one
 # line, verified end-to-end against a stub sheet in the harness.
-SCRIPT_VERSION = "1.2.1"
+# v1.3.0 (2026-07-26): W-7 — BENCHMARK_EQW INFORMATIONAL ROW (whitelist item 7,
+# Execution Plan v2.1 §W-7; Gate & Evidence Register §2). WHY: at the August
+# verdict the board must answer "does the intelligence beat simplicity?"
+# without any mid-window instrument change. This adds a FOURTH basket to
+# Shadow_History — BENCHMARK_EQW, the naive 1/N strategy: equal-weight of the
+# FULL published shadow board (every symbol on the board that day, BEFORE the
+# eligibility screen), daily-rebalanced, priced through the same v1.2.0
+# freshness honesty, charged the same turnover round-trip costs as CHAMPION/
+# CHALLENGER (it is a tradable naive strategy, so it is cost-adjusted —
+# unlike the §1 index blend, which stays drag-free). Row note carries
+# W7-INFORMATIONAL so no reader can mistake it for evidence.
+# GATE (the whitelist's own words, in code): the row is written only when
+# today >= EQW_START (2026-07-27). Deploying this file BEFORE that date
+# changes nothing — byte-identical output — which is the backward-safe
+# default the governance rails require. Kill-switch TFB_SHADOW_BENCHMARK_EQW
+# =0 disables it on/after the date (set it in .github/workflows/
+# shadow_scorer.yml env — this script runs in GitHub Actions, NOT Render).
+# S-1 INTEGRITY (Register §2 acceptance — "S-1 criteria and composite
+# benchmark code byte-identical, hash before/after"): count_scored_days,
+# check_point_in_time, count_compliance_violations, evaluate_s1,
+# basket_return[_fresh], blended_benchmark_return[_fresh], turnover_pct,
+# cost_drag_pct, chain_index and the constants BENCH_WEIGHTS/S1_WINDOW_DAYS/
+# EVIDENCE_EPOCH/_BLOCKING/HISTORY_HEADER are BYTE-IDENTICAL to v1.2.1
+# (SHA256 proof in the delivery). Criterion 1 counts CHALLENGER rows only;
+# criterion 5b groups per basket — a fourth basket with one row per day is
+# structurally invisible to both (selftested). The gate call, day-exclusion
+# rule, scored-day counting and net-alpha inputs are untouched lines.
+SCRIPT_VERSION = "1.3.0"
 TAB_HISTORY = "Shadow_History"
 TAB_GATE = "S1_Gate"
 TAB_REGRET = "Regret_Ledger"
@@ -123,6 +150,8 @@ HISTORY_HEADER = ["Date", "Basket", "Symbols", "Prices JSON", "Daily Return %",
                   "Cum Index", "Turnover %", "Cost Drag %", "Notes"]
 
 CHAMPION, CHALLENGER, BENCHMARK = "CHAMPION", "CHALLENGER", "BENCHMARK"
+BENCHMARK_EQW = "BENCHMARK_EQW"      # v1.3.0 W-7: informational naive basket
+EQW_START = date(2026, 7, 27)        # W-7 whitelist date gate, verbatim
 BENCH_WEIGHTS = {"SPUS": 0.70, "^TASI.SR": 0.30}   # §1 locked benchmark
 S1_WINDOW_DAYS = 28                                 # >=4 full weeks
 BASE_INDEX = 100.0
@@ -171,6 +200,16 @@ def _min_fresh_frac() -> float:
         return v / 100.0 if v > 1.0 else v
     except Exception:  # noqa: BLE001
         return 0.60
+
+
+def _eqw_enabled(today: date) -> bool:
+    """v1.3.0 W-7 gate. Returns False before EQW_START regardless of env
+    (deploy-early is a no-op, backward-safe). On/after the date: ON unless
+    TFB_SHADOW_BENCHMARK_EQW is explicitly falsy (workflow-side env)."""
+    if today < EQW_START:
+        return False
+    return (os.getenv("TFB_SHADOW_BENCHMARK_EQW") or "1").strip().lower() \
+        not in {"0", "false", "off", "no"}
 
 
 def _parse_iso_date(s: Any) -> Optional[date]:
@@ -679,6 +718,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     chal_syms = [r[0] for r in data_rows if str(r[-1]).strip().upper() == "YES"]
     violations = count_compliance_violations(data_rows)
 
+    # v1.3.0 W-7: naive pool = the FULL published board (pre-eligibility),
+    # order-preserving unique. Board empty -> no EQW row (never invented).
+    eqw_on = _eqw_enabled(today)
+    eqw_syms: List[str] = []
+    if eqw_on:
+        _eqw_seen = set()
+        for _r in data_rows:
+            _s = str(_r[0]).strip()
+            if _s and _s not in _eqw_seen:
+                _eqw_seen.add(_s)
+                eqw_syms.append(_s)
+        eqw_on = bool(eqw_syms)
+
     history = read_history(sh)
     if any(h["date"] == str(today) for h in history):
         print(f"[S1-GATE v{SCRIPT_VERSION}] {today} already recorded — "
@@ -688,6 +740,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     prev = {b: last_row_for(history, b)
             for b in (CHAMPION, CHALLENGER, BENCHMARK)}
+    if eqw_on:                                     # v1.3.0 W-7
+        prev[BENCHMARK_EQW] = last_row_for(history, BENCHMARK_EQW)
     existing_forks = read_regret_ledger(sh)
     board_header = board[0] if board and board[0] and board[0][0] == "Symbol" else None
     new_forks = dedupe_new_forks(
@@ -696,6 +750,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     all_forks = list(existing_forks) + list(new_forks)
 
     need = set(champ_syms) | set(chal_syms) | set(BENCH_WEIGHTS)
+    if eqw_on:                                     # v1.3.0 W-7
+        need |= set(eqw_syms)
     for f in all_forks:
         if f.get("symbol"):
             need.add(f["symbol"])
@@ -712,10 +768,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     scored_forks = rg.score_all(all_forks, spot, today)
     regret_summary = rg.summarize(scored_forks)
 
+    # v1.3.0 W-7: one shared pair list feeds both passes below; the EQW
+    # basket rides the ordinary basket path (exact-match `== BENCHMARK` is
+    # False for it, so it gets basket_return_fresh + turnover + cost drag).
+    basket_pairs: List[Tuple[str, List[str]]] = [
+        (CHAMPION, champ_syms), (CHALLENGER, chal_syms),
+        (BENCHMARK, list(BENCH_WEIGHTS))]
+    if eqw_on:
+        basket_pairs.append((BENCHMARK_EQW, eqw_syms))
+
     # ---- v1.2.0 honest pass 1: measure freshness per basket --------------- #
     measured: Dict[str, Dict[str, Any]] = {}
-    for basket, syms in ((CHAMPION, champ_syms), (CHALLENGER, chal_syms),
-                         (BENCHMARK, list(BENCH_WEIGHTS))):
+    for basket, syms in basket_pairs:
         p = prev[basket]
         p_date = _parse_iso_date(p["date"]) if p else None
         if basket == BENCHMARK:
@@ -747,8 +811,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     new_rows: List[List[Any]] = []
     results: Dict[str, Dict[str, Any]] = {}
-    for basket, syms in ((CHAMPION, champ_syms), (CHALLENGER, chal_syms),
-                         (BENCHMARK, list(BENCH_WEIGHTS))):
+    for basket, syms in basket_pairs:
         m = measured[basket]
         p = m["p"]
         p_date = _parse_iso_date(p["date"]) if p else None
@@ -781,6 +844,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 note += (f" stale={m['n_stale']}"
                          f"[{','.join(m['stale_syms'][:4])}"
                          f"{',…' if m['n_stale'] > 4 else ''}]")
+        if basket == BENCHMARK_EQW:                # v1.3.0 W-7
+            note = "W7-INFORMATIONAL naive-eqw(all-board); " + note
         if price_errs:
             note += f" price_errs={len(price_errs)}"
         new_rows.append([str(today), basket, ",".join(syms),
@@ -820,6 +885,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                f"stale={total_stale} | "
                f"violations={len(violations)} | forks {len(all_forks)} "
                f"(+{len(new_forks)} new)")
+    if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
+        _eqw_cum = (results[BENCHMARK_EQW]["index"] / BASE_INDEX - 1.0) * 100.0
+        verdict += f" | eqw {_eqw_cum:+.2f}% (informational)"
     print(verdict)
     if args.dry_run:
         for r in new_rows:
@@ -846,6 +914,13 @@ def main(argv: Optional[List[str]] = None) -> int:
          f"day: {'EXCLUDED_INFRA' if day_excluded else 'scored'}"],
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
+    if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
+        meta.append([
+            f"BENCHMARK_EQW (W-7) {_eqw_cum:+.2f}% cum",
+            f"naive equal-weight of the full board (n={len(eqw_syms)}), "
+            "cost-adjusted",
+            "INFORMATIONAL ONLY — not an S-1 input; criteria and the §1 "
+            "composite benchmark are byte-untouched"])
     # v1.1.1: gate FIRST, then evidence, then the secondary summary. Each
     # write independently guarded so one failure cannot suppress the others.
     _write_errors: List[str] = []
@@ -1044,6 +1119,49 @@ def _selftest() -> int:
                               "timestamp": [1784818800],
                               "meta": {"gmtoffset": 32400}})[1]
                    == date(2026, 7, 24)))
+
+    # ---- v1.3.0 W-7 layer: date gate + structural inertness --------------- #
+    _eqw_env_saved = os.environ.pop("TFB_SHADOW_BENCHMARK_EQW", None)
+    os.environ["TFB_SHADOW_BENCHMARK_EQW"] = "1"
+    checks.append(("W7: date gate — day before EQW_START is OFF even armed",
+                   _eqw_enabled(date(2026, 7, 26)) is False))
+    checks.append(("W7: date gate — EQW_START day is ON by default",
+                   _eqw_enabled(date(2026, 7, 27)) is True))
+    os.environ["TFB_SHADOW_BENCHMARK_EQW"] = "0"
+    checks.append(("W7: kill-switch 0 disables on/after the date",
+                   _eqw_enabled(date(2026, 7, 28)) is False))
+    del os.environ["TFB_SHADOW_BENCHMARK_EQW"]
+    checks.append(("W7: unset env on/after the date defaults ON",
+                   _eqw_enabled(date(2026, 7, 27)) is True))
+    if _eqw_env_saved is not None:
+        os.environ["TFB_SHADOW_BENCHMARK_EQW"] = _eqw_env_saved
+    hist_w7 = [
+        {"basket": CHALLENGER, "date": "2026-07-27", "daily_return": 0.30,
+         "note": "n=5"},
+        {"basket": BENCHMARK_EQW, "date": "2026-07-27", "daily_return": None,
+         "note": "W7-INFORMATIONAL naive-eqw(all-board); n=0 seeded"},
+        {"basket": CHALLENGER, "date": "2026-07-28", "daily_return": 0.10,
+         "note": "n=5"},
+        {"basket": BENCHMARK_EQW, "date": "2026-07-28", "daily_return": 0.55,
+         "note": "W7-INFORMATIONAL naive-eqw(all-board); n=12"},
+    ]
+    checks.append(("W7: criterion-1 counter ignores EQW rows entirely",
+                   count_scored_days(hist_w7, CHALLENGER) == (2, 0)))
+    checks.append(("W7: PIT check passes with the fourth basket present",
+                   check_point_in_time(hist_w7)[0]))
+    checks.append(("W7: PIT still catches a duplicate EQW date",
+                   not check_point_in_time(
+                       hist_w7 + [{"basket": BENCHMARK_EQW,
+                                   "date": "2026-07-28"}])[0]))
+    checks.append(("W7: last_row_for isolates EQW from BENCHMARK exactly",
+                   last_row_for(hist_w7, BENCHMARK) is None
+                   and last_row_for(hist_w7, BENCHMARK_EQW)["date"]
+                   == "2026-07-28"))
+    _g_w7 = evaluate_s1(2, [], 0.5, "PENDING", True,
+                        check_point_in_time(hist_w7)[0], "ok", None)
+    checks.append(("W7: gate evaluation unchanged by EQW presence",
+                   _g_w7["verdict"] == "NOT_DECIDABLE"
+                   and len(_g_w7["criteria"]) == 6))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
