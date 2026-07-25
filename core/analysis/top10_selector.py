@@ -587,7 +587,7 @@ logger.addHandler(logging.NullHandler())
 # no-op and the champion behaves exactly as v4.22.0. Never empties the pool:
 # if every candidate is untradable, the exclusion is abandoned and logged.
 # -----------------------------------------------------------------------------
-TOP10_SELECTOR_VERSION = "4.23.0"
+TOP10_SELECTOR_VERSION = "4.24.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -3809,7 +3809,105 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
                 meta["universe_starved"] = True
 
     meta["deduped_candidate_count"] = len(candidates)
-    return list(candidates.values()), meta
+
+    # v4.24.0 [FIX BC-1]: collapse suffix-variant duplicates of the SAME
+    # security. `candidates` is keyed by _normalize_symbol, which canonicalises
+    # TADAWUL:/.SA/bare-digit forms but NOT bare-vs-.US -- so
+    # _normalize_symbol("NTES") == "NTES" while _normalize_symbol("NTES.US") ==
+    # "NTES.US", two keys, two candidate rows for one company. Live consequence
+    # (Signal_History, 2026-07-22): NetEase was scored twice in the same run at
+    # 121.11 and 129.55 -- 6.97% apart -- with Overall Score 63.39 vs 64.04 and
+    # Forecast Reliability 71.5 vs 76.5. The stale copy carried an ACCUMULATE.
+    #
+    # Keying on the base ticker alone is NOT the fix: measured on the live
+    # universe, 113 base-ticker collisions were DIFFERENT issuers (ALV.US
+    # Autoliv vs ALV.DE Allianz; 1211.SR Maaden vs 1211.HK BYD; AAL.L Anglo
+    # American vs AAL.US American Airlines). core.analysis.symbol_dedup keys on
+    # (base symbol, name, currency), so distinct issuers, share classes,
+    # preferred series and cross-listings all survive while genuine twins
+    # collapse to the freshest row.
+    #
+    # Deliberately applied AFTER _put_row rather than by changing its key: the
+    # v4.16.0 provenance merge (_merge_row_provenance) stays byte-identical,
+    # and this pass only removes whole rows it can prove are the same security.
+    _cand_rows, _dedup_meta = _bc1_collapse_symbol_variants(list(candidates.values()))
+    meta.update(_dedup_meta)
+    return _cand_rows, meta
+
+
+def _bc1_symbol_variant_dedup_enabled() -> bool:
+    """v4.24.0 BC-1 kill switch. TFB_TOP10_SYMBOL_VARIANT_DEDUP=0/false/off/no
+    restores v4.23.0 byte-identical candidate output."""
+    return (os.getenv("TFB_TOP10_SYMBOL_VARIANT_DEDUP") or "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _bc1_collapse_symbol_variants(
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """v4.24.0 BC-1: remove suffix-variant duplicates of the same security.
+
+    Returns (rows, meta_patch). Fail-open by design: if core.analysis.
+    symbol_dedup is unavailable or raises, the rows are returned untouched and
+    the meta patch records why -- a selector that can silently drop candidates
+    is worse than one that occasionally carries a duplicate.
+
+    meta keys written:
+      symbol_variant_duplicates_removed  int   rows actually removed
+      symbol_variant_dedup_status        str   ok | disabled | unavailable | error
+      symbol_variant_dedup_detail        str   one-line audit summary
+      symbol_variant_distinct_issuers    int   collisions deliberately KEPT
+    """
+    patch: Dict[str, Any] = {
+        "symbol_variant_duplicates_removed": 0,
+        "symbol_variant_dedup_status": "ok",
+        "symbol_variant_dedup_detail": "",
+        "symbol_variant_distinct_issuers": 0,
+    }
+    if not rows:
+        return rows, patch
+    if not _bc1_symbol_variant_dedup_enabled():
+        patch["symbol_variant_dedup_status"] = "disabled"
+        return rows, patch
+    try:
+        from core.analysis.symbol_dedup import DedupVerdict, dedupe_symbol_rows
+    except Exception as exc:
+        patch["symbol_variant_dedup_status"] = "unavailable"
+        patch["symbol_variant_dedup_detail"] = f"{exc.__class__.__name__}: {exc}"
+        return rows, patch
+    try:
+        result = dedupe_symbol_rows(
+            rows,
+            sheet=OUTPUT_PAGE,
+            drop_shells=False,          # candidate pool: never drop on blankness
+            flag_suspect_quotes=False,  # the engine already tags those
+        )
+    except Exception as exc:
+        patch["symbol_variant_dedup_status"] = "error"
+        patch["symbol_variant_dedup_detail"] = f"{exc.__class__.__name__}: {exc}"
+        return rows, patch
+
+    removed = len(rows) - len(result.rows)
+    if removed < 0:  # cannot happen; refuse to trust it if it does
+        patch["symbol_variant_dedup_status"] = "error"
+        patch["symbol_variant_dedup_detail"] = "row count grew; result discarded"
+        return rows, patch
+
+    patch["symbol_variant_duplicates_removed"] = removed
+    patch["symbol_variant_distinct_issuers"] = len(
+        result.by_verdict(DedupVerdict.DISTINCT_ISSUER)
+    )
+    patch["symbol_variant_dedup_detail"] = result.warning_summary()
+    if removed:
+        dropped: List[str] = []
+        for finding in result.by_verdict(DedupVerdict.DUPLICATE):
+            dropped.extend(finding.dropped)
+        logger.info(
+            "[top10_selector v%s BC-1] collapsed %d suffix-variant duplicate(s): %s",
+            TOP10_SELECTOR_VERSION, removed, ", ".join(_dedupe_keep_order(dropped)[:12]),
+        )
+    return result.rows, patch
 
 
 def _fill_top10_selection(
