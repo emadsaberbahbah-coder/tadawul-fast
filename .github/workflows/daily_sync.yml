@@ -45,10 +45,11 @@ on:
         required: false
         default: "MARKET_LEADERS"
         type: string
-      google_creds_json:
-        description: "🔐 Service Account JSON (Emergency Only - Prefer Secrets)"
-        required: false
-        type: string
+      # (2026-07-26 PY-5) google_creds_json input REMOVED. workflow_dispatch
+      # inputs are recorded in run metadata — on a PUBLIC repo, a service-
+      # account key pasted there is published. Secrets are the only creds
+      # path now (GOOGLE_SHEETS_CREDENTIALS / _B64); the "emergency" input
+      # was an invitation to leak a key under pressure.
       enable_debug:
         description: "🐛 Enable Debug Logging"
         required: false
@@ -523,7 +524,6 @@ jobs:
           INPUT_MODE: ${{ github.event.inputs.run_mode }}
           INPUT_KEY: ${{ github.event.inputs.single_key }}
           INPUT_DEBUG: ${{ github.event.inputs.enable_debug }}
-          INPUT_CREDS: ${{ github.event.inputs.google_creds_json }}
 
           VAR_URL: ${{ vars.BACKEND_BASE_URL }}
           VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
@@ -536,7 +536,6 @@ jobs:
           # this workflow invalid (GitHub allows only ONE env: per step). These
           # are consumed by the run script below; step env is available to the
           # whole run regardless of block position, so this is behaviour-identical.
-          RAW_CREDS: ${{ github.event.inputs.google_creds_json }}
           CREDS_PATH: ${{ runner.temp }}/google_credentials.json
         run: |
           set -euo pipefail
@@ -680,8 +679,10 @@ jobs:
           DEBUG="$(get_val "${INPUT_DEBUG:-}" "false")"
           echo "ENABLE_DEBUG=$DEBUG" >> "$GITHUB_ENV"
 
-          # 5) Credentials
-          RAW_CREDS="$(get_val "${INPUT_CREDS:-}" "${SECRET_CREDS:-}")"
+          # 5) Credentials — secrets only (2026-07-26 PY-5: the dispatch
+          # input path is gone; a key can no longer be pasted into a public
+          # run's metadata).
+          RAW_CREDS="${SECRET_CREDS:-}"
           if [[ -z "${RAW_CREDS:-}" && -n "${SECRET_CREDS_B64:-}" ]]; then
             echo "🔓 Decoding Base64 credentials..."
             RAW_CREDS="$(printf '%s' "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
@@ -781,6 +782,13 @@ jobs:
         id: execute_sync
         env:
           PYTHONPATH: ${{ github.workspace }}
+          # (2026-07-26) Backend auth wall (main.py v8.13.0). The sync's
+          # backend HTTP calls must carry the token once Render arms
+          # APP_TOKEN. run_dashboard_sync.py already reads BACKEND_TOKEN and
+          # sends X-APP-TOKEN + Bearer; empty secret = anonymous = today's
+          # behavior exactly (safe before AND after arming, provided the
+          # secret is set before Render is).
+          BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           set -euo pipefail
           echo "::group::📊 Sync Execution"
@@ -935,7 +943,8 @@ jobs:
       # and re-prices / matures active records. Records are keyed by
       # symbol|horizon|YYYYMMDD, so the 15-minute cron re-runs are idempotent
       # (no Performance_Log spam). Non-blocking: a tracking hiccup must never
-      # fail the sync. If the backend needs auth, add BACKEND_TOKEN below.
+      # fail the sync. (2026-07-26) BACKEND_TOKEN armed below for the auth
+      # wall — empty secret keeps today's anonymous behavior exactly.
       - name: 📈 Track Performance (record + audit)
         if: success()
         continue-on-error: true
@@ -953,7 +962,7 @@ jobs:
           # COST: ~2x Performance_Log records per decision symbol.
           # KILL-SWITCH: delete this line -> v6.22.0 behaviour exactly.
           TRACK_HORIZONS: "1W,2W,1M,3M"
-          # BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}   # uncomment if backend is token-gated
+          BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           if [ ! -f "scripts/track_performance.py" ]; then
             echo "::warning::scripts/track_performance.py not found — skipping"
