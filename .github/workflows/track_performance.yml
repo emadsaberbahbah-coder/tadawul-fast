@@ -150,6 +150,11 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
           # The tracker reads these directly (BackendClient + best-effort SA auth):
           BACKEND_BASE_URL: ${{ env.TARGET_URL }}
+          # (2026-07-26) Backend auth wall (main.py v8.13.0): the tracker's
+          # backend HTTP fetches must carry the token once Render arms
+          # APP_TOKEN. track_performance.py already reads BACKEND_TOKEN and
+          # sends X-APP-TOKEN + Bearer; empty secret = today's behavior.
+          BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
           DEFAULT_SPREADSHEET_ID: ${{ env.TARGET_SHEET_ID }}
           TRACK_SHEET_ID: ${{ env.TARGET_SHEET_ID }}
           # v6.13.0 ACTIVATION — surface the action-trend trajectory to a
