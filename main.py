@@ -2,12 +2,54 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.12.0)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.13.0)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
 REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+
+Why this revision (v8.13.0 vs v8.12.1)
+--------------------------------------
+- ADD SECURITY (Correction Plan 1.3, "global token enforcement"): a GLOBAL
+    auth wall. Until now authentication lived inside each route module; main
+    mounted routers but enforced nothing itself, so a route file without its
+    own auth machinery (the PY-2 class) was only ever one mount-plan edit away
+    from being exposed. GlobalAuthEnforcementMiddleware now sits directly
+    inside CORS: when auth is required it returns 401 on EVERY request before
+    routing -- mounted business routes, aliases, and even unknown paths --
+    except the built-in probe/meta paths (_BUILTIN_META_PATHS: /health,
+    /healthz, /livez, /readyz, /ping, /meta, /, the /v1 aliases, docs and
+    /_debug/routes, which self-guards with its own production 401) and OPTIONS
+    preflight. Probes MUST stay open or Render's health checks would cycle
+    the service the moment tokens are armed.
+- ACTIVATION IS AN OPERATOR EVENT, NOT THIS DEPLOY: the wall is active only
+    when REQUIRE_AUTH resolves true (and OPEN_MODE false). Production today
+    resolves REQUIRE_AUTH false (the standing production_auth_not_enforced
+    boot warning), so deploying this file changes NO observable behaviour --
+    the standing backward-safe-default rule. When the operator sets APP_TOKEN
+    (env.py then resolves require_auth=true from tokens_exist) or explicit
+    REQUIRE_AUTH=1, the wall goes up and the boot warning goes silent in the
+    same boot. Kill-switch TFB_GLOBAL_AUTH_ENFORCE=0 drops the wall back to
+    per-route-auth-only without touching tokens.
+- ADD SAFEGUARD: arming REQUIRE_AUTH with NO token configured is a total
+    lockout of business routes (fail-closed _auth_ok). That state now boots
+    with startup warning global_auth_active_without_tokens_all_requests_401
+    so it is visible on /health before anyone debugs a dead workbook refresh.
+- ADD OBSERVABILITY: additive _runtime_meta key global_auth_enforcement
+    (same pattern as v8.11.3's engine_version) -- one browser hit on /health
+    proves whether the wall is up, no shell session needed.
+- FIX PY-2 (Correction Plan, adjudicated 2026-07-25/26): routes.ai_analysis
+    removed from _OPTIONAL_ROUTE_MODULES. Evidence: it appears in NO mount
+    plan (_CONTROLLED_ROUTE_PLAN is the single strategy,
+    main.controlled_priority_plan) and is imported nowhere else, so the entry
+    was a dangling reference to the only route file with zero auth machinery.
+    The file itself is deleted from the repo in the same commit (operator
+    action, GitHub web UI). No mounted route changes; route counts and
+    readiness families are untouched.
+- SAFE SCOPE: zero function/class removals (AST-proven); no scoring,
+    selection, portfolio, provider, workbook, mount-plan, readiness, or
+    engine-lifecycle change. All v8.12.1 kill-switch defaults preserved.
 
 Why this revision (v8.12.0 vs v8.11.3)
 --------------------------------------
@@ -250,7 +292,7 @@ class _StrictJSONResponse(JSONResponse):
 # =============================================================================
 # Version
 # =============================================================================
-APP_ENTRY_VERSION = "8.12.1"
+APP_ENTRY_VERSION = "8.13.0"
 # =============================================================================
 # v8.12.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v8.12.0.
 #
@@ -356,10 +398,14 @@ _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
     "/quotes": "enriched_quote",
 }
 
+# v8.13.0 PY-2: "routes.ai_analysis" removed. It was never in
+# _CONTROLLED_ROUTE_PLAN (the only mount strategy), is imported nowhere,
+# and was the only route file with zero auth machinery -- the entry here
+# was a dangling reference keeping a dead, unguarded module looking alive.
+# The file routes/ai_analysis.py is deleted from the repo alongside this.
 _OPTIONAL_ROUTE_MODULES: Set[str] = {
     "routes.config",
     "routes.data_dictionary",
-    "routes.ai_analysis",
     "routes.routes_argaam",
 }
 
@@ -1065,6 +1111,60 @@ def _auth_ok(request: Request) -> bool:
 
 
 # =============================================================================
+# v8.13.0 Global auth wall (Correction Plan 1.3)
+# =============================================================================
+# Exempt paths = the built-in probe/meta surface only. Render health checks,
+# livez/readyz probes and the reduced /status view must stay reachable when
+# tokens are armed; /_debug/routes stays here because it already self-guards
+# with a production 401 of its own (defense in depth, not an opening).
+_GLOBAL_AUTH_EXEMPT_PATHS: Set[str] = set(_BUILTIN_META_PATHS)
+
+# Keep in LOCKSTEP with the v8.11.1 env fallback list inside _auth_ok and
+# config.py v7.3.0 allowed_tokens(). Presence-only check: never logs values.
+_AUTH_TOKEN_ENV_NAMES: Tuple[str, ...] = (
+    "APP_TOKEN", "BACKEND_TOKEN", "BACKUP_APP_TOKEN", "X_APP_TOKEN",
+    "AUTH_TOKEN", "TOKEN", "TFB_APP_TOKEN", "TFB_TOKEN", "API_TOKEN",
+    "TFB_BEARER_TOKEN", "BEARER_TOKEN", "TFB_API_KEY", "API_KEY", "X_API_KEY",
+)
+
+
+def _any_auth_token_configured() -> bool:
+    """True when at least one auth token env var is non-empty, or the config
+    module exposes a non-empty allowed_tokens(). Never raises."""
+    try:
+        for name in _AUTH_TOKEN_ENV_NAMES:
+            if _env_str(name, ""):
+                return True
+    except Exception:
+        pass
+    for mod_name in ("config", "core.config"):
+        try:
+            cfg = importlib.import_module(mod_name)
+            fn = getattr(cfg, "allowed_tokens", None)
+            if callable(fn) and fn():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _global_auth_enforcement_active() -> bool:
+    """The wall is up only when auth is genuinely required: REQUIRE_AUTH true,
+    OPEN_MODE false, and the TFB_GLOBAL_AUTH_ENFORCE kill-switch not falsy.
+    With production currently resolving REQUIRE_AUTH false, deploying this
+    build is a no-op until the operator arms tokens (backward-safe default).
+    """
+    try:
+        if bool(getattr(_SETTINGS, "OPEN_MODE", False)):
+            return False
+        if not bool(getattr(_SETTINGS, "REQUIRE_AUTH", True)):
+            return False
+    except Exception:
+        return False
+    return _env_bool("TFB_GLOBAL_AUTH_ENFORCE", True)
+
+
+# =============================================================================
 # Middleware
 # =============================================================================
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -1130,6 +1230,47 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                 )
             raise
 
+
+
+class GlobalAuthEnforcementMiddleware(BaseHTTPMiddleware):
+    """v8.13.0 (Correction Plan 1.3): the global token wall.
+
+    Runs BEFORE routing, so every mounted business route, every alias, and
+    even unknown paths answer 401 to anonymous callers once auth is armed.
+    Per-route auth in the route modules stays exactly as it was -- this is an
+    outer wall, not a replacement -- and both layers accept the same token
+    sources via _auth_ok (X-APP-TOKEN / X-API-Key / Bearer / config.auth_ok).
+    Exemptions: the built-in probe/meta paths and CORS OPTIONS preflight
+    (browsers cannot attach custom headers to a preflight by design).
+    Inactive whenever REQUIRE_AUTH resolves false, OPEN_MODE is on, or the
+    TFB_GLOBAL_AUTH_ENFORCE kill-switch is set falsy -- which makes deploying
+    this build a behavioural no-op in today's production posture."""
+
+    async def dispatch(self, request: Request, call_next):
+        try:
+            if not _global_auth_enforcement_active():
+                return await call_next(request)
+            if str(request.method or "").upper() == "OPTIONS":
+                return await call_next(request)
+            if str(request.url.path or "") in _GLOBAL_AUTH_EXEMPT_PATHS:
+                return await call_next(request)
+            if _auth_ok(request):
+                return await call_next(request)
+        except Exception:
+            # Fail-closed: an error while deciding must never open the wall.
+            pass
+        request_id = _request_id_from_request(request)
+        return _StrictJSONResponse(
+            status_code=401,
+            headers={"X-Request-ID": request_id},
+            content={
+                "status": "error",
+                "error": "unauthorized",
+                "path": str(request.url.path),
+                "request_id": request_id,
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
 # =============================================================================
 # Route diagnostics helpers
@@ -1786,6 +1927,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "app_version": _SETTINGS.APP_VERSION,
         "entry_version": APP_ENTRY_VERSION,
         "service_version": SERVICE_VERSION,          # v8.11.1: cross-module alias
+        "global_auth_enforcement": _global_auth_enforcement_active(),  # v8.13.0
         "env": _SETTINGS.APP_ENV,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "python": sys.version.split()[0],
@@ -2236,15 +2378,23 @@ def create_app() -> FastAPI:
             and not bool(_SETTINGS.REQUIRE_AUTH)
         ):
             _append_startup_warning(app, "production_auth_not_enforced")
+    # v8.13.0: arming auth with no token configured is a fail-closed total
+    # lockout of business routes -- boot must say so, loudly, in any env.
+    if _global_auth_enforcement_active() and not _any_auth_token_configured():
+        _append_startup_warning(
+            app, "global_auth_active_without_tokens_all_requests_401",
+        )
     if bool(_SETTINGS.ALLOW_QUERY_TOKEN):
         _append_startup_warning(app, "query_token_transport_enabled")
 
     # Starlette middleware is LIFO (last added = outermost). Desired order:
-    # RequestID -> CORS -> NoResponseGuard -> GZip -> route. This preserves
-    # request IDs on every response while still allowing CORS to decorate
-    # responses synthesized by the guard.
+    # RequestID -> CORS -> GlobalAuth -> NoResponseGuard -> GZip -> route.
+    # This preserves request IDs on every response, lets CORS decorate the
+    # 401s the wall synthesizes, and keeps the wall OUTSIDE the response
+    # guard and compression so an anonymous caller costs no route work.
     app.add_middleware(GZipMiddleware, minimum_size=1024)
     app.add_middleware(NoResponseGuardMiddleware)
+    app.add_middleware(GlobalAuthEnforcementMiddleware)   # v8.13.0 wall
 
     if bool(_SETTINGS.ENABLE_CORS_ALL_ORIGINS):
         if bool(_SETTINGS.CORS_ALLOW_CREDENTIALS):
