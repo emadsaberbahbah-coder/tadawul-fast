@@ -1007,7 +1007,51 @@ from urllib.error import HTTPError, URLError
 #   Acceptance gates untouched: non-overlap, n≥30, ≥50bps, t≥2.0, DSR
 #   penalty (D-13), costs — nothing relaxed, nothing self-wires (§8).
 # =============================================================================
-SCRIPT_VERSION = "6.27.0"
+# -----------------------------------------------------------------------------
+# v6.28.0 (2026-07-25) — FEED-R RESILIENT PRICE CHAIN + FB-BRK YAHOO BREAKER
+# WHY (same-day _Run_Log evidence, 2026-07-25): PERF-VERDICT coverage
+# collapsed through the day — priced 654/900 → 508 → 262 → 40 → 1 → 39 —
+# with feed=backend_dead: primary@chunk1 (HTTP 502 ...) at 18:00 and
+# fb=429:166..171 / ok:0..1 on every leg. Mechanism: (a) each backend
+# chunk gets exactly ONE attempt, so a transient Render 502/edge timeout
+# zeroes the chunk and, when global, the whole chain; (b) the ~900-symbol
+# residue then stampedes Yahoo from a shared GitHub-runner IP, which
+# walls the run at ~170 straight 429s while the spacing loop burns the
+# entire 420s budget learning nothing. Net: S-1 criterion 1 is starved
+# (1/28 scored days, EXCLUDED_INFRA) by infrastructure, not by markets.
+# FIX (two cuts, fetch_prices + _yahoo_chart_fallback_prices only):
+#   FEED-R: every chunk POST now retries on TRANSIENT failures only
+#        (_feed_transient: HTTP 0/429/500/502/503/504 or timeout-class
+#        error text) with exponential backoff + full jitter, under a
+#        wall-clock feed deadline; a chunk that still fails and holds
+#        >= 10 symbols is BISECTED once so one poisoned symbol can no
+#        longer zero its 39 neighbours; after pass 3 a final primary
+#        sweep re-requests whatever is still missing while the deadline
+#        allows. Diagnosis strings keep their grep-stable tokens
+#        (backend_ok / backend_dead: primary@chunkN ...) and gain
+#        " (retries=R, bisects=B)" telemetry; per-run counters exported
+#        via _LAST_FEED_RETRY_STATS into the verdict Details JSON.
+#   FB-BRK: the Yahoo fallback SHUFFLES its worklist (the same head no
+#        longer eats the budget every leg) and trips a circuit breaker
+#        after TFB_TRACK_FALLBACK_BREAK_429 consecutive 429s (default
+#        15): remaining launches are skipped and counted in fb_stats
+#        ("skipped") instead of feeding a walled limiter for 420s.
+# ENV (all optional, defaults live): TFB_TRACK_FEED_RETRIES "3",
+# TFB_TRACK_FEED_BACKOFF_SEC "2", TFB_TRACK_FEED_BUDGET_SEC "240",
+# TFB_TRACK_FEED_BISECT "1", TFB_TRACK_FALLBACK_BREAK_429 "15",
+# TFB_TRACK_FALLBACK_SHUFFLE "1". KILL-SWITCH: TFB_TRACK_FEED_LEGACY=1
+# (alias TFB_PERF_LEGACY_FEED=1) restores the v6.27.0 single-attempt
+# chain AND the unshuffled, breaker-free fallback byte-identically.
+# ST-1 grows to 12/12: transient classifier truth-table + legacy-flag
+# parsing proven on fixtures every run. ZERO functions removed;
+# additions: _feed_legacy, _feed_retries, _feed_backoff_sec,
+# _feed_budget_sec, _feed_bisect_enabled, _feed_transient,
+# _fallback_break_429, _fallback_shuffle_enabled
+# (+ counter _LAST_FEED_RETRY_STATS; in-method closures _chunk_call/
+# _mk_primary/_mk_legacy/_mk_sheetrows are new nested defs, not
+# replacements).
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.28.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -1771,6 +1815,96 @@ def _price_chunk_timeout_sec() -> float:
     return max(10.0, v)
 
 
+def _feed_legacy() -> bool:
+    """v6.28.0 FEED-R kill-switch — DEFAULT OFF. TFB_TRACK_FEED_LEGACY=1
+    (alias TFB_PERF_LEGACY_FEED=1) restores the v6.27.0 single-attempt
+    chunk chain and the unshuffled, breaker-free Yahoo fallback
+    byte-identically."""
+    for k in ("TFB_TRACK_FEED_LEGACY", "TFB_PERF_LEGACY_FEED"):
+        if (os.getenv(k) or "").strip().lower() in {"1", "true", "on", "yes"}:
+            return True
+    return False
+
+
+def _feed_retries() -> int:
+    """v6.28.0 FEED-R: max attempts per chunk on TRANSIENT failure
+    (default 3, floor 1, ceiling 6)."""
+    try:
+        v = int((os.getenv("TFB_TRACK_FEED_RETRIES") or "3").strip())
+    except Exception:
+        v = 3
+    return max(1, min(6, v))
+
+
+def _feed_backoff_sec() -> float:
+    """v6.28.0 FEED-R: base backoff seconds, doubled per attempt with full
+    jitter (default 2, clamped 0.01..15 — the low floor keeps the guard
+    testable)."""
+    try:
+        v = float((os.getenv("TFB_TRACK_FEED_BACKOFF_SEC") or "2").strip())
+    except Exception:
+        v = 2.0
+    return max(0.01, min(15.0, v))
+
+
+def _feed_budget_sec() -> float:
+    """v6.28.0 FEED-R: wall-clock deadline for the WHOLE backend chain
+    including retries and the final sweep (default 240s, floor 20)."""
+    try:
+        v = float((os.getenv("TFB_TRACK_FEED_BUDGET_SEC") or "240").strip())
+    except Exception:
+        v = 240.0
+    return max(20.0, v)
+
+
+def _feed_bisect_enabled() -> bool:
+    """v6.28.0 FEED-R: one-level chunk bisection after retries exhaust
+    (default ON) — isolates a poisoned symbol instead of losing 40."""
+    return (os.getenv("TFB_TRACK_FEED_BISECT") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _feed_transient(code: Any, err: Any) -> bool:
+    """v6.28.0 FEED-R: pure classifier — is this chunk failure worth a
+    retry? TRANSIENT: HTTP 0 (socket/URLError/aiohttp exception), 429,
+    500, 502, 503, 504, or a timeout/connection-class error text.
+    NON-TRANSIENT (never retried): 400/404-class contract errors and a
+    200 that failed JSON parsing. Total function: never raises."""
+    try:
+        c = int(code or 0)
+    except Exception:
+        c = 0
+    if c in (0, 429, 500, 502, 503, 504):
+        if c == 0:
+            e = str(err or "").lower()
+            if not e:
+                return False
+            return any(t in e for t in ("timeout", "timed out", "connection",
+                                        "reset", "refused", "unreachable",
+                                        "temporarily", "eof"))
+        return True
+    return False
+
+
+def _fallback_break_429() -> int:
+    """v6.28.0 FB-BRK: consecutive-429 trip threshold for the Yahoo
+    fallback circuit breaker (default 15, floor 3, ceiling 200)."""
+    try:
+        v = int((os.getenv("TFB_TRACK_FALLBACK_BREAK_429") or "15").strip())
+    except Exception:
+        v = 15
+    return max(3, min(200, v))
+
+
+def _fallback_shuffle_enabled() -> bool:
+    """v6.28.0 FB-BRK: shuffle the fallback worklist so the same head
+    symbols never monopolise the budget run after run (default ON)."""
+    return (os.getenv("TFB_TRACK_FALLBACK_SHUFFLE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+# v6.28.0 FEED-R telemetry read by the verdict line (single-threaded runner).
+_LAST_FEED_RETRY_STATS: Dict[str, int] = {}
+
+
 # v6.21.0 telemetry read by the verdict line (single-threaded runner).
 _LAST_FALLBACK_STATS: Dict[str, int] = {}
 _LAST_FEED_DIAGNOSIS: str = "not-run"
@@ -1888,6 +2022,10 @@ async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
     syms = list(dict.fromkeys(syms))
     if not syms:
         return {}
+    # v6.28.0 FB-BRK: rotate the worklist so the same head symbols never
+    # monopolise the budget leg after leg. Legacy flag keeps sheet order.
+    if _fallback_shuffle_enabled() and not _feed_legacy():
+        random.shuffle(syms)
     t0 = time.time()
     budget = _fallback_budget_sec()
     timeout = _fallback_timeout_sec()
@@ -1905,12 +2043,30 @@ async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
         spacing = _fallback_spacing_sec()
         retry_on = _fallback_retry429_enabled()
         launch_lock = asyncio.Lock()
+        # v6.28.0 FB-BRK: consecutive-429 circuit breaker. When the wall
+        # count trips, remaining launches are SKIPPED (counted) instead of
+        # feeding a walled limiter for the rest of the budget.
+        _brk = {"consec": 0, "tripped": False}
+        _brk_at = _fallback_break_429()
+        _brk_on = not _feed_legacy()
 
         async def one(s: str) -> None:
             if (time.time() - t0) > budget:
                 return
+            if _brk_on and _brk["consec"] >= _brk_at:
+                if not _brk["tripped"]:
+                    _brk["tripped"] = True
+                    logger.warning(
+                        "%s circuit breaker: %d consecutive 429s — "
+                        "skipping the remaining launches this leg.",
+                        _PF_TAG, _brk["consec"])
+                stats["skipped"] = stats.get("skipped", 0) + 1
+                return
             async with sem:
                 if (time.time() - t0) > budget:
+                    return
+                if _brk_on and _brk["consec"] >= _brk_at:
+                    stats["skipped"] = stats.get("skipped", 0) + 1
                     return
                 # v6.21.0 PF-2: serialize launch spacing so the runner
                 # never bursts past Yahoo's limiter.
@@ -1922,6 +2078,10 @@ async def _yahoo_chart_fallback_prices(symbols: List[str]) -> Dict[str, float]:
                     await asyncio.sleep(3.0 + random.random() * 3.0)
                     px, st = await _yahoo_fetch_one_status(session, s, timeout)
                 stats[st] = stats.get(st, 0) + 1
+                if st == "429":
+                    _brk["consec"] += 1
+                elif st == "ok":
+                    _brk["consec"] = 0
                 if px > 0:
                     out[s] = px
 
@@ -2916,11 +3076,19 @@ class BackendClient:
         # v6.21.1 PF-3: CHUNKED endpoint chain. Evidence 2026-07-15: the
         # endpoint answers 8 symbols instantly, but this method used to send
         # ALL ~585 in ONE 30s request -- guaranteed timeout, guaranteed {}.
+        # v6.28.0 FEED-R: each chunk call is now transient-retried with
+        # backoff+jitter under a feed deadline, bisected once on final
+        # failure, and the residue gets one last primary sweep. The legacy
+        # kill-switch routes every call through a single attempt, restoring
+        # v6.27.0 byte-identically (same payloads, same _first_fail strings).
         out: Dict[str, float] = {}
         chunk_n = _price_chunk_size()
         chunk_to = _price_chunk_timeout_sec()
-        global _LAST_FEED_DIAGNOSIS
+        global _LAST_FEED_DIAGNOSIS, _LAST_FEED_RETRY_STATS
         _first_fail = ""
+        _legacy = _feed_legacy()
+        _deadline = time.time() + _feed_budget_sec()
+        _rstats = {"retries": 0, "bisects": 0, "sweep": 0}
 
         def _absorb_rows(rows: Any) -> None:
             for r in rows or []:
@@ -2952,54 +3120,110 @@ class BackendClient:
                     if fv > 0 and str(k).upper() not in out:
                         out[str(k).upper()] = fv
 
+        async def _chunk_call(label: str, endpoint: str, mk_payload: Any,
+                              chunk: List[str]) -> List[Dict[str, Any]]:
+            """v6.28.0 FEED-R: one chunk against one endpoint. Returns the
+            list of 200-envelopes to absorb (0, 1 or 2 — two after a
+            successful bisection). Sets _first_fail exactly where v6.27.0
+            did, with the same string format."""
+            nonlocal _first_fail
+            data, err, code = await self.post_json(
+                endpoint, mk_payload(chunk), timeout_sec=chunk_to)
+            if isinstance(data, dict) and code == 200 and not err:
+                return [data]
+            if _legacy:
+                if not _first_fail:
+                    _first_fail = "%s (HTTP %s: %s)" % (
+                        label, code, _safe_str(err)[:90])
+                return []
+            attempt = 1
+            while (attempt < _feed_retries()
+                   and _feed_transient(code, err)
+                   and time.time() < _deadline):
+                delay = min(15.0, _feed_backoff_sec() * (2 ** (attempt - 1)))
+                await asyncio.sleep(delay + random.uniform(0.0, min(1.0, delay)))
+                _rstats["retries"] += 1
+                data, err, code = await self.post_json(
+                    endpoint, mk_payload(chunk), timeout_sec=chunk_to)
+                if isinstance(data, dict) and code == 200 and not err:
+                    return [data]
+                attempt += 1
+            if not _first_fail:
+                _first_fail = "%s (HTTP %s: %s)" % (
+                    label, code, _safe_str(err)[:90])
+            if (_feed_bisect_enabled() and len(chunk) >= 10
+                    and time.time() < _deadline):
+                _rstats["bisects"] += 1
+                mid = len(chunk) // 2
+                envs: List[Dict[str, Any]] = []
+                for half in (chunk[:mid], chunk[mid:]):
+                    d2, e2, c2 = await self.post_json(
+                        endpoint, mk_payload(half), timeout_sec=chunk_to)
+                    if isinstance(d2, dict) and c2 == 200 and not e2:
+                        envs.append(d2)
+                return envs
+            return []
+
+        def _mk_primary(c: List[str]) -> Dict[str, Any]:
+            return {"symbols": c, "format": "items",
+                    "include_raw": False, "debug": False}
+
+        def _mk_legacy(c: List[str]) -> Dict[str, Any]:
+            return {"symbols": c, "include_raw": False}
+
+        def _mk_sheetrows(c: List[str]) -> Dict[str, Any]:
+            return {"page": "Global_Markets", "symbols": c,
+                    "include_matrix": False, "top_n": len(c)}
+
+        def _absorb_primary(envs: List[Dict[str, Any]]) -> None:
+            for data in envs:
+                _absorb_rows(_extract_rows_from_envelope(data))
+                _absorb_map(data.get("data") if isinstance(data.get("data"), dict) else None)
+
         # --- pass 1: primary /v1/enriched/quotes, chunked -----------------
         for ci in range(0, len(syms), chunk_n):
             chunk = syms[ci:ci + chunk_n]
-            data, err, code = await self.post_json(
-                _QUOTES_ENDPOINT_PRIMARY,
-                {"symbols": chunk, "format": "items",
-                 "include_raw": False, "debug": False},
-                timeout_sec=chunk_to,
-            )
-            if isinstance(data, dict) and code == 200 and not err:
-                _absorb_rows(_extract_rows_from_envelope(data))
-                _absorb_map(data.get("data") if isinstance(data.get("data"), dict) else None)
-            elif not _first_fail:
-                _first_fail = "primary@chunk%d (HTTP %s: %s)" % (
-                    ci // chunk_n + 1, code, _safe_str(err)[:90])
+            _absorb_primary(await _chunk_call(
+                "primary@chunk%d" % (ci // chunk_n + 1),
+                _QUOTES_ENDPOINT_PRIMARY, _mk_primary, chunk))
 
         # --- pass 2: legacy /quotes for whatever is still missing ---------
         missing = [x for x in syms if x not in out]
         if missing:
             for ci in range(0, len(missing), chunk_n):
                 chunk = missing[ci:ci + chunk_n]
-                data, err, code = await self.post_json(
-                    _QUOTES_ENDPOINT_LEGACY,
-                    {"symbols": chunk, "include_raw": False},
-                    timeout_sec=chunk_to,
-                )
-                if isinstance(data, dict) and code == 200 and not err:
+                for data in await _chunk_call(
+                        "legacy@chunk%d" % (ci // chunk_n + 1),
+                        _QUOTES_ENDPOINT_LEGACY, _mk_legacy, chunk):
                     _absorb_map(data.get("data") if isinstance(data.get("data"), dict) else data)
-                elif not _first_fail:
-                    _first_fail = "legacy@chunk%d (HTTP %s: %s)" % (
-                        ci // chunk_n + 1, code, _safe_str(err)[:90])
 
         # --- pass 3: heavy sheet-rows, ONE capped chunk of the residue ----
         missing = [x for x in syms if x not in out]
         if missing:
-            data, err, code = await self.post_json(
-                _SHEET_ROWS_ENRICHED,
-                {"page": "Global_Markets", "symbols": missing[:chunk_n],
-                 "include_matrix": False, "top_n": min(len(missing), chunk_n)},
-                timeout_sec=chunk_to,
-            )
-            if isinstance(data, dict) and code == 200 and not err:
+            for data in await _chunk_call(
+                    "sheetrows", _SHEET_ROWS_ENRICHED, _mk_sheetrows,
+                    missing[:chunk_n]):
                 _absorb_rows(_extract_rows_from_envelope(data))
-            elif not _first_fail:
-                _first_fail = "sheetrows (HTTP %s: %s)" % (code, _safe_str(err)[:90])
 
+        # --- pass 1b (v6.28.0 FEED-R): final primary sweep of the residue -
+        missing = [x for x in syms if x not in out]
+        if missing and not _legacy and time.time() < _deadline:
+            _rstats["sweep"] = len(missing)
+            for ci in range(0, len(missing), chunk_n):
+                if time.time() >= _deadline:
+                    break
+                chunk = missing[ci:ci + chunk_n]
+                _absorb_primary(await _chunk_call(
+                    "sweep@chunk%d" % (ci // chunk_n + 1),
+                    _QUOTES_ENDPOINT_PRIMARY, _mk_primary, chunk))
+
+        _LAST_FEED_RETRY_STATS = dict(_rstats)
+        _retry_sfx = ""
+        if not _legacy and (_rstats["retries"] or _rstats["bisects"]):
+            _retry_sfx = " (retries=%d, bisects=%d)" % (
+                _rstats["retries"], _rstats["bisects"])
         _LAST_FEED_DIAGNOSIS = (
-            "backend_ok %d/%d via chunked chain" % (len(out), len(syms))
+            "backend_ok %d/%d via chunked chain%s" % (len(out), len(syms), _retry_sfx)
             if out else
             ("backend_dead: " + (_first_fail or "all endpoints empty"))
         )
@@ -6230,6 +6454,8 @@ class PerformanceTrackerApp:
             ]
             st["feed"] = _LAST_FEED_DIAGNOSIS
             st["fb_stats"] = dict(_LAST_FALLBACK_STATS)
+            if _LAST_FEED_RETRY_STATS:
+                st["feed_retry"] = dict(_LAST_FEED_RETRY_STATS)
             st["selftest"] = _TRACK_SELFTEST_MSG
             row[9] = json_dumps(st)
             self.store.backoff.execute_sync(
@@ -6246,7 +6472,7 @@ class PerformanceTrackerApp:
         silent damage). Never raises."""
         global _TRACK_SELFTEST_MSG
         passed = 0
-        total = 10
+        total = 12
         try:
             junk = ["TRUTH:", "_PORTFOLIO_COSTBASIS", "(FREEZES", "=", "\u00b7", "\u2014"]
             good = ["1050.SR", "RCI.US", "GC=F", "^N225", "0016.HK", "DIR-UN.TO"]
@@ -6293,6 +6519,40 @@ class PerformanceTrackerApp:
             if (_pre == _post and _vm is not None and _vm > 0
                     and price_structure_field("nonexistent_field", _up) is None):
                 passed += 1                             # tripwire + σ>0 path
+            # ---- v6.28.0 FEED-R fixtures -------------------------------- #
+            # case 11: transient classifier truth table — retry ONLY on the
+            # outage class, never on contract errors or JSON failures.
+            if (_feed_transient(502, "HTTP 502: b'<!DOCTYPE html>'") is True
+                    and _feed_transient(503, "") is True
+                    and _feed_transient(429, "") is True
+                    and _feed_transient(0, "URLError: <urlopen error timed out>") is True
+                    and _feed_transient(0, "Connection reset by peer") is True
+                    and _feed_transient(404, "HTTPError 404") is False
+                    and _feed_transient(400, "bad symbol") is False
+                    and _feed_transient(200, "Non-JSON response") is False
+                    and _feed_transient(0, "") is False):
+                passed += 1
+            # case 12: legacy kill-switch parsing (primary key + alias),
+            # env saved/restored so the fixture never leaks state.
+            _sv = {k: os.environ.get(k) for k in
+                   ("TFB_TRACK_FEED_LEGACY", "TFB_PERF_LEGACY_FEED")}
+            try:
+                os.environ.pop("TFB_TRACK_FEED_LEGACY", None)
+                os.environ.pop("TFB_PERF_LEGACY_FEED", None)
+                _c12 = _feed_legacy() is False
+                os.environ["TFB_TRACK_FEED_LEGACY"] = "1"
+                _c12 = _c12 and _feed_legacy() is True
+                os.environ.pop("TFB_TRACK_FEED_LEGACY", None)
+                os.environ["TFB_PERF_LEGACY_FEED"] = "1"
+                _c12 = _c12 and _feed_legacy() is True
+            finally:
+                for _k, _v in _sv.items():
+                    if _v is None:
+                        os.environ.pop(_k, None)
+                    else:
+                        os.environ[_k] = _v
+            if _c12:
+                passed += 1
         except Exception as e:
             _TRACK_SELFTEST_MSG = "EXC %s" % type(e).__name__
             print("::error::[SELFTEST v6.21.0] guard self-test crashed: %s: %s" % (type(e).__name__, e))
