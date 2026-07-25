@@ -3,9 +3,48 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.26.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.28.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.28.0 — FW-4b SAFE NAME-DEDUP: KEEP-ONE-PER-CURRENCY, NEVER WIPE A GROUP
+--------------------------------------------------------------------------
+EVIDENCE (2026-07-25 evening workbook audit, _Run_Log 13:58:49 leg):
+FW-4 in quarantine mode stubbed ALL carriers of every flagged name group
+— Alibaba (BABA + BABA.US + 9988.HK), TSMC (TSM + TSM.US + 2330.TW),
+AB InBev, Diageo, Trip.com, Shinhan vanished from Global_Markets in one
+pass, 21 rows quarantined, zero survivors. Two design gaps compounded:
+  (1) the v6.24.1 stub action was written for the OBSERVE->flip decision
+      and stubs the WHOLE group — correct for pure chimeric poison, data
+      loss for anything with one legitimate copy; and
+  (2) the v6.25.3 family heuristic is alphabetic-root-based, so numeric
+      cross-listings (9961.HK vs TCOM, 2330.TW vs TSM, 055550.KS vs SHG)
+      and renamed ADR roots (ABI.BR vs BUD, DGE.L vs DEO) can NEVER pass
+      it — exactly the class its own docstring predicted and the
+      operator exemption list was never populated for.
+FIX — FW-4b survivor selection (default ON), quarantine mode only:
+  * each flagged group is partitioned by its rows' Currency cell
+    (missing column -> one bucket); DIFFERENT currencies are different
+    listings, so every currency bucket keeps its own survivor — a
+    cross-listing family can no longer be wiped whole;
+  * inside one currency bucket exactly ONE row survives: newest
+    Last-Updated stamp first (reuses _parse_stamp_cell; ISO 'T'
+    separators normalised), explicit exchange suffix second, most
+    non-blank cells third, lexicographic symbol last — fully
+    deterministic; only the true losers are stubbed, tagged
+    'identity_quarantined:name_dedup_loser:v6.28.0';
+  * HARD INVARIANT: a group can never lose all members — helper failure
+    or an all-survivor verdict resolves to keep-everything with a
+    logged [ID-FIREWALL] note (fail-open, never fail-destructive);
+  * verdict line reports dedup_mode=quarantine(keep1) and Details JSON
+    carries "dedup_safe" so the six-gate morning audit can grep the
+    armed path; ST-1 case 6 now proves the keep-one contract (survivor
+    intact, losers tagged, bystander untouched) under the configured
+    mode, and the legacy assertions remain under the kill-switch.
+ENV: TFB_SYNC_NAME_DEDUP_SAFE default ON; =0/false/off/no restores the
+v6.27.0 whole-group stub byte-identically. ZERO functions removed;
+additions: _name_dedup_safe_enabled, _name_dedup_survivors
+(+ tag _NAME_DEDUP_LOSER_TAG).
 
 v6.27.0 — OLDEST-FIRST WORKLIST (kills the fixed-head refresh starvation)
 --------------------------------------------------------------------------
@@ -1194,7 +1233,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.27.0"
+SCRIPT_VERSION = "6.28.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3101,6 +3140,91 @@ def _name_dedup_exempt_names() -> set:
     return {t.strip().casefold() for t in raw.split(",") if t.strip()}
 
 
+# v6.28.0 FW-4b: Warnings tag stamped on a dedup LOSER (the survivor keeps
+# its full row; the loser keeps its Symbol so heal-first can re-fetch it).
+_NAME_DEDUP_LOSER_TAG = "identity_quarantined:name_dedup_loser:v6.28.0"
+
+
+def _name_dedup_safe_enabled() -> bool:
+    """v6.28.0 FW-4b kill-switch — DEFAULT ON. 0/false/off/no restores the
+    v6.27.0 whole-group quarantine stub byte-identically."""
+    return (os.getenv("TFB_SYNC_NAME_DEDUP_SAFE") or "1").strip().lower() not in {
+        "0", "false", "off", "no"}
+
+
+def _name_dedup_survivors(headers: list, rows_matrix: list, sym_i: int,
+                          syms: list) -> set:
+    """v6.28.0 FW-4b: pick the KEEP set for ONE same-name group.
+
+    Partition the group's rows by their Currency cell (missing column or
+    blank cell -> one shared bucket); DIFFERENT currencies are different
+    listings, so every currency bucket keeps its own survivor — a numeric
+    cross-listing family (9961.HK / TCOM / TCOM.US) can never be wiped
+    whole. Inside one currency bucket exactly ONE row survives, chosen by
+    a fully deterministic key: newest Last-Updated stamp first (reuses
+    _parse_stamp_cell; ISO 'T' separators normalised so intraday stamps
+    compare), explicit exchange suffix second, most non-blank cells third,
+    lexicographically-first symbol last.
+
+    Fail-safe contract: on ANY failure, or when the group has no locatable
+    rows, returns set(syms) — keep EVERYTHING; the caller treats an
+    all-survivor verdict as keep-all. Never raises."""
+    try:
+        want = {str(s or "").strip().upper() for s in (syms or []) if str(s or "").strip()}
+        if not want:
+            return set()
+        hdr = [str(h or "").strip().casefold() for h in (headers or [])]
+        cur_i = -1
+        stamp_i = -1
+        for i, h in enumerate(hdr):
+            if cur_i < 0 and h in ("currency", "ccy"):
+                cur_i = i
+            if stamp_i < 0 and h.startswith("last updated"):
+                stamp_i = i
+        best: dict = {}  # SYM -> (stamp, has_suffix, nonblank, currency)
+        for row in rows_matrix:
+            if not isinstance(row, list) or len(row) <= sym_i:
+                continue
+            sym = str(row[sym_i] or "").strip().upper()
+            if sym not in want:
+                continue
+            cur = ""
+            if 0 <= cur_i < len(row):
+                cur = str(row[cur_i] or "").strip().upper()
+            ts = None
+            if 0 <= stamp_i < len(row):
+                cell = row[stamp_i]
+                if isinstance(cell, str):
+                    cell = cell.strip().replace("T", " ")
+                ts = _parse_stamp_cell(cell)
+                if ts is not None and ts.tzinfo is not None:
+                    ts = ts.replace(tzinfo=None)
+            ts = ts or datetime.min
+            has_suffix = 1 if any(sym.endswith(suf) for suf in _SR_FAMILY_SUFFIXES) else 0
+            nonblank = sum(1 for c in row if str(c or "").strip() != "")
+            cand = (ts, has_suffix, nonblank, cur)
+            prev = best.get(sym)
+            if prev is None or cand[:3] > prev[:3]:
+                best[sym] = cand
+        if not best:
+            return set(want)
+        buckets: dict = {}
+        for sym, (ts, suf, nb, cur) in best.items():
+            buckets.setdefault(cur, []).append((ts, suf, nb, sym))
+        keep = set()
+        for cur, members in buckets.items():
+            members.sort(key=lambda m: (m[0], m[1], m[2]), reverse=True)
+            top = members[0][:3]
+            tied = sorted(m[3] for m in members if m[:3] == top)
+            keep.add(tied[0])
+        # symbols the census saw but this matrix pass could not locate are
+        # NEVER doomed on absence of evidence
+        keep |= (want - set(best.keys()))
+        return keep if keep else set(want)
+    except Exception:
+        return {str(s or "").strip().upper() for s in (syms or [])}
+
+
 _SR_FAMILY_SUFFIXES = (".US", ".PA", ".L", ".HK", ".JK", ".SW", ".DE", ".SR",
                        ".T", ".AS", ".BR", ".MC", ".MI", ".TO", ".AX", ".NS",
                        ".IS", ".KW", ".SA", ".SI", ".KS", ".TW")
@@ -3196,9 +3320,30 @@ def _name_dedup_apply(headers: list, rows_matrix: list) -> tuple:
         if not groups:
             return rows_matrix, groups, quarantined
         if mode == "quarantine" and _IDFW_SELFTEST_OK:
+            safe = _name_dedup_safe_enabled()
+            tag = _NAME_DEDUP_LOSER_TAG if safe else "identity_quarantined:name_dedup"
             doomed = set()
-            for syms in groups.values():
-                doomed.update(syms)
+            for nm, syms in groups.items():
+                if not safe:
+                    # v6.27.0 legacy path (kill-switch): whole-group stub
+                    doomed.update(syms)
+                    continue
+                # v6.28.0 FW-4b: keep one survivor per currency bucket;
+                # stub only the true losers. HARD INVARIANT — a group can
+                # never lose all members: an empty or all-member survivor
+                # set resolves to keep-everything.
+                survivors = _name_dedup_survivors(headers, rows_matrix,
+                                                  sym_i, list(syms))
+                losers = [s for s in syms if s not in survivors]
+                if not survivors or len(losers) >= len(syms):
+                    logger.warning("%s FW-4b keep-all failsafe: '%s' -> %s",
+                                   _IDFW_TAG, nm, ",".join(sorted(syms)[:6]))
+                    continue
+                if not losers:
+                    logger.info("%s FW-4b cross-listing kept whole: '%s' -> %s",
+                                _IDFW_TAG, nm, ",".join(sorted(syms)[:6]))
+                    continue
+                doomed.update(losers)
             for r_i, row in enumerate(rows_matrix):
                 if not isinstance(row, list) or len(row) <= sym_i:
                     continue
@@ -3207,7 +3352,7 @@ def _name_dedup_apply(headers: list, rows_matrix: list) -> tuple:
                     blanked = ["" for _ in row]
                     blanked[sym_i] = row[sym_i]
                     if 0 <= warn_i < len(blanked):
-                        blanked[warn_i] = "identity_quarantined:name_dedup"
+                        blanked[warn_i] = tag
                     rows_matrix[r_i] = blanked
                     quarantined.append(sym)
         return rows_matrix, groups, quarantined
@@ -3265,11 +3410,25 @@ def _idfw_selftest_() -> bool:
             _IDFW_SELFTEST_OK = _prev_ok
         _mode6 = _name_dedup_mode()
         if _mode6 == "quarantine":
-            if (q2 == ["A.US", "B.L", "C.HK"] and bool(g2)
-                    and _r2[1][0] == "B.L" and _r2[1][1] == ""
-                    and _r2[1][5] == "identity_quarantined:name_dedup"
-                    and _r2[3][1] == "Other Co"):
-                passed += 1
+            if _name_dedup_safe_enabled():
+                # v6.28.0 FW-4b contract: no Currency/stamp columns in the
+                # fixture -> one bucket -> lexicographic survivor A.US keeps
+                # its FULL row; B.L and C.HK are stubbed with the loser tag;
+                # the non-duplicate bystander is untouched.
+                if (q2 == ["B.L", "C.HK"] and bool(g2)
+                        and _r2[0][0] == "A.US"
+                        and _r2[0][1] == "Same Name Co"
+                        and _r2[1][0] == "B.L" and _r2[1][1] == ""
+                        and _r2[1][5] == _NAME_DEDUP_LOSER_TAG
+                        and _r2[2][1] == ""
+                        and _r2[3][1] == "Other Co"):
+                    passed += 1
+            else:
+                if (q2 == ["A.US", "B.L", "C.HK"] and bool(g2)
+                        and _r2[1][0] == "B.L" and _r2[1][1] == ""
+                        and _r2[1][5] == "identity_quarantined:name_dedup"
+                        and _r2[3][1] == "Other Co"):
+                    passed += 1
         elif _mode6 == "off":
             if q2 == [] and g2 == {}:
                 passed += 1
@@ -3350,7 +3509,7 @@ def _append_runlog_idfirewall(
             f"{' (' + ', '.join(out_stripped[:10]) + ('…' if len(out_stripped) > 10 else '') + ')' if out_stripped else ''}"
             f" | name_dup={_dup_n}"
             f"{' [' + '; '.join(k + 'x' + str(len(v)) for k, v in list(name_dup_groups.items())[:5]) + ']' if _dup_n else ''}"
-            f" | dedup_mode={_name_dedup_mode()}"
+            f" | dedup_mode={_name_dedup_mode() + ('(keep1)' if (_name_dedup_mode() == 'quarantine' and _name_dedup_safe_enabled()) else '')}"
             f"{' | quarantined=' + str(len(name_dup_quarantined)) if name_dup_quarantined else ''}"
             f" | selftest={_IDFW_SELFTEST_MSG}"
         )
@@ -3360,6 +3519,7 @@ def _append_runlog_idfirewall(
             "out_stripped": out_stripped[:50],
             "name_dup_groups": name_dup_groups,
             "name_dup_quarantined": name_dup_quarantined[:50],
+            "dedup_safe": bool(_name_dedup_safe_enabled()),
             "selftest": _IDFW_SELFTEST_MSG,
             "version": SCRIPT_VERSION,
         })
