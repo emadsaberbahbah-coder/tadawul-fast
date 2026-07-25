@@ -70,6 +70,80 @@ ceiling 24), TFB_ENGINE_FUND_LKG_MAX (default 20000, floor 100). No Render
 ENV action is required to arm this fix.
 Version: __version__ = "5.118.0". All prior WHYs preserved verbatim.
 
+WHY v5.119.0 - IDENTITY ECHO GATE + SHEET IDENTITY GUARD (Fix BB)
+--------------------------------------------------------------------------
+Live conviction (2026-07-25 export + _Run_Log ID-FIREWALL trail):
+608 rows across Global_Markets (508), Market_Leaders (97) and Commodities_FX
+(3) carried a symbol and NOTHING else - no name, no price, no score. All 608
+were tagged identity_quarantined. 459 of them (90%) had NO duplicate twin
+anywhere in the sheet, so their data was destroyed for nothing; 16 had BOTH
+twins blanked, removing Alibaba, Equinix, Trip.com, AB InBev, HDFC Bank,
+FEMSA, SK Telecom and Five Below from the universe entirely. Market_Leaders
+lost Visa, JPMorgan, Wells Fargo, PepsiCo, Chubb, TJX, American Tower and
+Saudi codes 9631/4700/9621/9533/9581/9565/8311/1835/9602/9551.
+
+ROOT CAUSE - two defects in series, not one:
+
+  BB-1 THE LEAK. core/yahoo_chart_provider.py::_ensure_shape stamps the
+  REQUESTED symbol onto whatever payload came back
+  (out.setdefault("symbol", sym)), while _extract_candidate_dicts reads
+  nested candidates at result[0] / response[0] / items[0] / chart.result[0]
+  regardless of which security sits at that index, and
+  _normalize_quote_payload lets the LAST candidate carrying any NAME_ALIASES
+  value win. A batch or fallback payload therefore returns another issuer's
+  name and price wearing our symbol. Measured: 127 owner/borrower pairs.
+  ACU.US "Acme United" 45.90 USD -> 7205.T same name, 47.00 "JPY". AAOI.US
+  "Applied Opto" 110.52 USD -> KOZAA.IS same name, 102.41 "TRY". NUVA.US
+  carrying Posco Future M's 144,700 KRW. BRK-B carrying "Taiwan
+  Semiconductor". 52.8% of borrowed prices land within 5% of the real
+  owner's price against 1.85% expected at random (29x), and 79 of the 127
+  cross a currency boundary - so the number is not a quote at all.
+
+  BB-2 THE AMPLIFIER. The dashboard-sync ID-FIREWALL grouped rows by company
+  NAME ALONE and quarantined EVERY member of each group. Because the names
+  were already corrupted by BB-1, healthy securities were grouped with
+  contaminated ones and blanked alongside them - 45 groups, 138 member rows,
+  at minimum one legitimate security lost per group. Name-only grouping also
+  swept up things that merely share an issuer name: share classes
+  (LBTYA/LBTYB/LBTYK.US), preferred series (BEPH/BEPI/BEPJ.US,
+  AFGB..AFGE.US), and cross-listings (0005.HK / HSBA.L / HSBC in three
+  currencies). dedup_mode flipped observe -> quarantine on 2026-07-20
+  between 01:01:34 and 07:27:43; the quarantine BLANKS a row in place rather
+  than dropping it, so the sheet keeps a shell indistinguishable from a
+  provider outage.
+
+FIX BB:
+  BB-1 identity echo gate - _apply_identity_rescue accepts a chart-meta name
+       ONLY when the payload echoes a symbol consistent with the one
+       requested (raw / canonical / base forms compared; .SR preserved so
+       Tadawul numerics cannot collide with HK/JP/TW numerics). An ABSENT
+       echo is tolerated (many meta shapes omit it); a CONTRADICTING echo is
+       refused and tagged identity_echo_refused. _bb1_echo_matches is
+       self-contained: this module's `normalize_symbol` is a trivial local
+       stub and extract_base_symbol is not imported, so leaning on either
+       would make the gate refuse the valid AAPL / AAPL.US case.
+  BB-2 sheet identity guard - get_sheet_rows calls
+       core.analysis.identity_guard.guard_sheet_rows BEFORE _apply_rank_overall,
+       so a borrowed name can never reach the board or the duplicate grouper.
+       The guard clears only the contaminated identity/price fields (symbol,
+       currency, exchange, sector and provenance survive), keeps the row
+       re-fetchable with an explicit Block Reason, and de-duplicates on
+       (base symbol, name, currency) - never on name alone. My_Portfolio is
+       guarded but NEVER de-duplicated: those rows are operator-owned
+       holdings keyed to _Portfolio_CostBasis.
+  Fail-open throughout: import or runtime failure returns rows unchanged. The
+  guard refuses any run that would alter >25% of a sheet (the 2026-07-20 run
+  blanked 9.5% of Market_Leaders and logged selftest=PASS 7/7).
+
+ENV (both ARMED by default): TFB_ENGINE_SHEET_IDENTITY_GUARD=0/false/off/no
+restores v5.118.0 byte-identical row output. BB-1 has no separate switch - a
+contradicting symbol echo is never legitimate.
+
+Zero functions removed; additions: _bb1_base, _bb1_echo_matches,
+_bb2_identity_guard_enabled, _bb2_apply_identity_guard (+ module constants
+_BB1_SUFFIXES, _bb1_extract_base, _bb1_normalize).
+Version: __version__ = "5.119.0". All prior WHYs preserved verbatim.
+
 WHY v5.118.0 - IDENTITY RESCUE (Fix BA): chart-meta name + static-map belt
 ---------------------------------------------------------------------------
 EVIDENCE (Render shell probes #3/#4, 2026-07-15): the fundamentals provider
@@ -2809,7 +2883,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.118.0"
+__version__ = "5.119.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -12169,6 +12243,128 @@ class _EngineSymbolsReaderProxy:
 # =============================================================================
 # DataEngineV5 — the main orchestrator
 # =============================================================================
+# =============================================================================
+# v5.119.0 BB-1 / BB-2 - identity echo gate + sheet identity guard
+# =============================================================================
+# Named _bb1_* / _bb2_* deliberately: this module already owns
+# _engine_identity_guard_enabled (v5.73) and _fund_identity_guard_enabled
+# (v5.107), which are unrelated guards. Do not merge the three.
+#
+# Self-contained on purpose. The module-level `normalize_symbol` here is a
+# trivial local stub (_safe_str(symbol).upper() - it canonicalises nothing) and
+# `extract_base_symbol` is not imported at all, so BB-1 must NOT lean on either:
+# a silent NameError inside the comparison would make the gate refuse the valid
+# AAPL / AAPL.US case, blocking legitimate name rescues.
+
+try:  # pragma: no cover - real canonicaliser when available
+    from core.symbols.normalize import (
+        extract_base_symbol as _bb1_extract_base,
+        normalize_symbol as _bb1_normalize,
+    )
+except Exception:  # pragma: no cover
+    _bb1_extract_base = None  # type: ignore
+    _bb1_normalize = None  # type: ignore
+
+# Fallback suffix set, used only when core.symbols.normalize is unavailable.
+_BB1_SUFFIXES: frozenset = frozenset({
+    "US", "SR", "L", "TO", "V", "NE", "CN", "PA", "DE", "F", "MI", "AS", "BR",
+    "LS", "MC", "SW", "VI", "ST", "CO", "HE", "OL", "IR", "WA", "AT", "IS",
+    "TA", "SA", "MX", "BA", "HK", "SS", "SZ", "T", "KS", "KQ", "TW", "TWO",
+    "SI", "KL", "JK", "BK", "NS", "BO", "AX", "NZ", "VN", "PH", "JO", "KW",
+    "QA", "AE", "EG", "MA",
+})
+
+
+def _bb1_base(symbol: Any) -> str:
+    """Base ticker with a real exchange suffix removed. .SR is preserved so
+    Tadawul numeric codes never collide with HK/JP/TW numerics. Never raises."""
+    try:
+        if _bb1_extract_base is not None:
+            v = _safe_str(_bb1_extract_base(symbol)).strip().upper()
+            if v:
+                return v
+    except Exception:
+        pass
+    t = _safe_str(symbol).strip().upper()
+    if "." not in t:
+        return t
+    root, _, tail = t.rpartition(".")
+    if root and tail in _BB1_SUFFIXES:
+        return t if tail == "SR" else root
+    return t
+
+
+def _bb1_echo_matches(requested: Any, echo: Any) -> bool:
+    """True when a provider payload's echoed symbol is consistent with what was
+    requested. Compares raw, canonical and base forms so AAPL / AAPL.US agree
+    while 7205.T / ACU.US do not. Never raises. Returns True when either side
+    resolves to nothing - the caller only consults this when an echo exists."""
+    try:
+        want = {_safe_str(requested).strip().upper(), _bb1_base(requested)}
+        got = {_safe_str(echo).strip().upper(), _bb1_base(echo)}
+        if _bb1_normalize is not None:
+            for src, dst in ((requested, want), (echo, got)):
+                try:
+                    dst.add(_safe_str(_bb1_normalize(src)).strip().upper())
+                except Exception:
+                    pass
+        want.discard("")
+        got.discard("")
+        if not want or not got:
+            return True
+        return bool(want & got)
+    except Exception:
+        return True
+
+
+def _bb2_identity_guard_enabled() -> bool:
+    """BB-2 kill switch. TFB_ENGINE_SHEET_IDENTITY_GUARD=0/false/off/no restores
+    v5.118.0 byte-identical behaviour."""
+    return (os.getenv("TFB_ENGINE_SHEET_IDENTITY_GUARD") or "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _bb2_apply_identity_guard(rows: List[Dict[str, Any]], sheet: str) -> List[Dict[str, Any]]:
+    """BB-2: clear borrowed identities, then collapse genuine duplicates.
+
+    Fail-open by design: any import or runtime problem returns `rows` unchanged,
+    because a guard able to empty the board is worse than no guard. The guard
+    itself raises RuntimeError if it would alter >25% of a sheet -- caught here,
+    logged at ERROR, rows returned untouched."""
+    if not _bb2_identity_guard_enabled() or not rows:
+        return rows
+    try:
+        from core.analysis.identity_guard import guard_sheet_rows
+    except Exception as exc:
+        logger.debug(
+            "[engine_v2 v%s] identity_guard unavailable (%s: %s); rows unchanged",
+            __version__, exc.__class__.__name__, exc,
+        )
+        return rows
+    try:
+        plan = guard_sheet_rows(rows, sheet=sheet, run_dedup=(sheet != "My_Portfolio"))
+    except RuntimeError as exc:
+        logger.error("[engine_v2 v%s] identity_guard REFUSED on %s: %s",
+                     __version__, sheet, exc)
+        return rows
+    except Exception as exc:
+        logger.warning(
+            "[engine_v2 v%s] identity_guard raised on %s (%s: %s); rows unchanged",
+            __version__, sheet, exc.__class__.__name__, exc,
+        )
+        return rows
+    if plan.counts():
+        logger.info("[engine_v2 v%s] %s", __version__, plan.summary())
+        refetch = plan.refetch_symbols()
+        if refetch:
+            logger.info(
+                "[engine_v2 v%s] %s identity unverified, needs re-fetch (%d): %s",
+                __version__, sheet, len(refetch), ", ".join(refetch[:12]),
+            )
+    return plan.rows
+
+
 class DataEngineV5:
     """Global-first data orchestrator (v5.79.4)."""
 
@@ -13077,6 +13273,30 @@ class DataEngineV5:
                 if fn is not None:
                     meta = await fn(sym)
                     if isinstance(meta, dict) and meta:
+                        # v5.119.0 BB-1 (identity echo gate). core/
+                        # yahoo_chart_provider.py::_ensure_shape stamps the
+                        # REQUESTED symbol onto whatever payload came back
+                        # (out.setdefault("symbol", sym)), and
+                        # _extract_candidate_dicts reads nested candidates at
+                        # result[0] / response[0] / items[0] regardless of which
+                        # security that index holds. A batch or fallback payload
+                        # therefore returns another issuer's identity wearing our
+                        # symbol. Measured on the 2026-07-25 export: 127
+                        # owner/borrower pairs -- 7205.T carrying "Acme United
+                        # Corporation" @ 47.00 "JPY" (Acme's USD price), NUVA.US
+                        # carrying Posco's 144,700 KRW, BRK-B carrying "Taiwan
+                        # Semiconductor". Accept the name ONLY when the payload
+                        # echoes a symbol matching what we asked for. An ABSENT
+                        # echo is tolerated (many meta shapes omit it); a
+                        # CONTRADICTING echo is refused.
+                        echo = _safe_str(
+                            meta.get("symbol")
+                            or meta.get("requested_symbol")
+                            or meta.get("symbol_normalized")
+                        ).strip().upper()
+                        if echo and not _bb1_echo_matches(sym, echo):
+                            _append_yahoo_warning_tag(row, "identity_echo_refused")
+                            return row
                         nm = _safe_str(
                             meta.get("longName") or meta.get("shortName") or meta.get("displayName")
                         ).strip()
@@ -14029,6 +14249,15 @@ class DataEngineV5:
         # whole projected list; gate fields are already populated by projection).
         if target_sheet == "My_Portfolio":
             _compute_portfolio_fields(rows)
+        # v5.119.0 BB-2 (identity guard): verify identities BEFORE ranking, so a
+        # borrowed name can never reach the board or the duplicate grouper.
+        # Ordering is the whole point -- the ID-FIREWALL grouped on company NAME
+        # first, and because names were already corrupted it quarantined healthy
+        # securities alongside contaminated ones (608 rows blanked 2026-07-20..25,
+        # 459 of them with no duplicate at all). My_Portfolio is guarded but NEVER
+        # de-duplicated: those rows are operator-owned holdings keyed to
+        # _Portfolio_CostBasis, and dropping one breaks the cost-basis linkage.
+        rows = _bb2_apply_identity_guard(rows, target_sheet)
         _apply_rank_overall(rows)
         _pop_trust_carry(rows)  # v5.90.0: drop the transient trust_level carry
         await self._apply_news_veto(rows)
