@@ -5,6 +5,54 @@
 Yahoo Chart Provider (Global + KSA History) -- v8.5.0
 ================================================================================
 
+v8.11.0 — CHART-META IDENTITY GUARD (Fix YC-4)
+--------------------------------------------------------------------------------
+WHY (live workbook audit 2026-07-25, "Market Share DeepseekV3" export v52,
+plus the _Run_Log ID-FIREWALL trail): 608 rows across Global_Markets (508),
+Market_Leaders (97) and Commodities_FX (3) were left holding a symbol and
+NOTHING else. Tracing the surviving rows found 127 owner/borrower pairs in
+which a row whose quote had FAILED was carrying another issuer's company name
+— and a price to match:
+
+    owner (healthy quote)                borrower (quote_current_price_missing)
+    ACU.US  "Acme United"    45.90 USD   7205.T   same name,  47.00 "JPY"
+    AAOI.US "Applied Opto"  110.52 USD   KOZAA.IS same name, 102.41 "TRY"
+    BXMT.US "Blackstone M"   16.70 USD   BBGI.L   same name,  17.08 "GBX"
+    NUVA.US                              carrying Posco Future M's 144,700 KRW
+    BRK-B                                carrying "Taiwan Semiconductor"
+
+52.8% of borrowed prices land within 5% of the true owner's price against
+1.85% expected if names were assigned at random — a 29x enrichment — and 79 of
+the 127 pairs cross a currency boundary, so the borrowed number is not a quote
+at all: 7205.T at "47.00 JPY" is Acme's dollar price wearing a yen label.
+
+ROOT CAUSE: v8.6.0 YC-1 correctly guards every response the CLASS serves
+(get_enriched_quote, get_quote, history — three armed call sites). v8.9.0
+(Fix BA-0) then added `fetch_chart_meta` as a "thin, never-raising public
+accessor" for the engine's identity-rescue path. Being module-level it calls
+_raw_chart_fetch_triple directly and returns meta_raw unverified, bypassing
+the class and therefore bypassing YC-1. The one call whose entire purpose is
+to resolve a MISSING company name became the only fetch path that never
+checked whose name it was returning, and its consumer
+(data_engine_v2::_apply_identity_rescue) writes the result straight into
+row["name"]. Downstream, the dashboard-sync ID-FIREWALL groups rows by company
+NAME and quarantined every member of each group — so one borrowed name
+destroyed healthy securities alongside the contaminated one (45 groups, 138
+rows blanked; 459 of the 608 had no duplicate at all).
+
+YC-4 FIX: `fetch_chart_meta` now applies the same _yc_declared_identity_mismatch
+check, against the same TFB_CHART_IDENTITY_GUARD switch, with the same leniency
+contract as YC-1 — nothing declared serves; any declared token-set intersecting
+the request serves; only ALL-disjoint declared identities are a definite
+crossing. On a crossing it returns {} (not a raise, not a partial), so the
+rescue caller leaves the name unresolved rather than adopting a stranger's.
+A name_unresolved row is honest and re-fetchable; a confidently wrong name is
+neither, and it is what reached the board.
+
+Metrics: op="chart_meta", status="identity_mismatch". Kill switch unchanged:
+TFB_CHART_IDENTITY_GUARD=0 restores v8.10.0 behaviour on all four sites.
+Version: PROVIDER_VERSION = "8.11.0". All prior WHY blocks preserved verbatim.
+
 v8.6.0 — RESPONSE-IDENTITY GUARD + PRICE-COHERENCE GUARD (Fixes YC-1/YC-2/YC-3)
 --------------------------------------------------------------------------------
 WHY (live workbook audit 2026-07-07, "Market_Share_Deepseek-V3" export v30):
@@ -59,7 +107,7 @@ errors, NOT same-currency crossings like today's 17.32-vs-43.54
 (ratio 2.5x) — YC-1 is the fix for those; YC-3 is belt for the
 unit-class family only.
 
-Version: PROVIDER_VERSION = "8.10.0". All prior WHY blocks preserved
+Version: PROVIDER_VERSION = "8.11.0". All prior WHY blocks preserved
 
 v8.10.0 (W-5, 2026-07-20) -- ENV SYMBOL SKIP-LIST (Yahoo-dead / junk symbols)
   Evidence (evening audit 2026-07-20, Execution Plan v2.1 W-5): XAUUSD=X and
@@ -598,7 +646,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.10.0"
+PROVIDER_VERSION = "8.11.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -1082,7 +1130,46 @@ async def fetch_chart_meta(
         _info, meta_raw, _hist = await _raw_chart_fetch_triple(
             ysym, range_, interval, timeout
         )
-        return meta_raw if isinstance(meta_raw, dict) else {}
+        if not isinstance(meta_raw, dict):
+            return {}
+        # v8.11.0 YC-4: apply the SAME YC-1 response-identity guard the class
+        # methods apply. v8.9.0 added this accessor as a "thin" module-level
+        # helper for the engine's identity-rescue path, and in doing so it
+        # bypassed the class entirely -- so the one call whose entire job is to
+        # resolve a MISSING company name was the one call that never verified
+        # the response belonged to the symbol requested. That reopened exactly
+        # the crossing YC-1 was built to close, and the rescue consumer writes
+        # the result straight into row["name"].
+        #
+        # Live evidence (2026-07-25 export, 127 owner/borrower pairs):
+        #   7205.T  <- "Acme United Corporation"   47.00 "JPY"  (ACU.US USD price)
+        #   KOZAA.IS<- "Applied Optoelectronics"  102.41 "TRY"  (AAOI.US USD)
+        #   NUVA.US <- "Posco Future M"        144,700 "USD"  (Posco KRW)
+        #   BRK-B   <- "Taiwan Semiconductor"     398.37 "USD"
+        # 52.8% of borrowed prices land within 5% of the true owner's price vs
+        # 1.85% expected at random (29x), and 79 of 127 cross a currency
+        # boundary -- so the borrowed number is not a quote at all.
+        #
+        # Same leniency contract as YC-1: nothing declared -> serve; any
+        # declared token-set intersecting the request -> serve; ALL declared
+        # identities disjoint -> definite crossing, serve {} so the caller
+        # leaves the name unresolved rather than adopting a stranger's.
+        if _yc_identity_guard_enabled():
+            _yc4_got = _yc_declared_identity_mismatch(ysym, _info, meta_raw)
+            if _yc4_got:
+                logger.warning(
+                    "[yahoo_chart v%s YC-4] chart-meta identity mismatch: "
+                    "requested %s got %s — meta dropped (name left unresolved)",
+                    PROVIDER_VERSION, symbol, _yc4_got,
+                )
+                try:
+                    metrics.requests_total.labels(
+                        symbol=str(symbol), op="chart_meta", status="identity_mismatch",
+                    ).inc()
+                except Exception:
+                    pass
+                return {}
+        return meta_raw
     except Exception:
         return {}
 
