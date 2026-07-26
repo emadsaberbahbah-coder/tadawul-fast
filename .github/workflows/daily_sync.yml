@@ -347,7 +347,19 @@ jobs:
       # row. "quarantine" makes it withhold the suspect row instead, so a
       # chimeric name/symbol pairing cannot reach the sheet.
       # KILL-SWITCH: delete this line -> observe-only behaviour returns.
-      TFB_SYNC_NAME_DEDUP_MODE: "quarantine"
+      #
+      # (2026-07-26, plan item 1.8) FLIPPED quarantine -> observe. WHY: on
+      # 2026-07-19 D-4 armed quarantine, and FW-4 then stubbed EVERY carrier
+      # of each flagged name group — BABA/TSM/BUD/DEO/TCOM/SHG were wiped as
+      # families because cross-currency listings of the SAME issuer read as a
+      # name collision. run_dashboard_sync v6.28.0 (FW-4b keep-one-per-
+      # currency) removes the zero-survivor path, but quarantine still STUBS
+      # every loser row — a destructive write during the S-1 evidence window,
+      # to fix a collision class that is usually legitimate dual-listing.
+      # "observe" detects and reports the same collisions and writes every
+      # row: the diagnosis is kept, the destructive action is not.
+      # ROLLBACK: set this back to "quarantine" (one line, no redeploy).
+      TFB_SYNC_NAME_DEDUP_MODE: "observe"
       TFB_PORTFOLIO_REBUILD: "1"
       # Top_10_Investments — decision guard ENABLED ("1"). [2026-06-29 corrected]
       # SUPERSEDES the earlier "0" setting. That setting let the 2-hourly daily sync
