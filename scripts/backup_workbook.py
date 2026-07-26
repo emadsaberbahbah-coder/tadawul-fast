@@ -89,7 +89,31 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+# v1.2.0 (2026-07-26) — SURFACE GOOGLE'S OWN REASON. Still NO change to
+# export, upload, retention or exit codes.
+# WHY, from run #7: v1.1.0 named the account and normalised the folder id,
+# and the failure moved 404 -> 403. That is progress with a wall behind
+# it: 404 meant "cannot see the folder", 403 means "sees it, refused the
+# write" — and TWO very different causes both return 403:
+#   insufficientFilePermissions  the account has Viewer/Commenter, not
+#                                Editor  -> fix by changing the role
+#   storageQuotaExceeded         a bare GCP service account has NO Drive
+#                                storage of its own. A file it creates in
+#                                a normal (My Drive) folder would be owned
+#                                by the service account, so Google refuses
+#                                -> re-sharing as Editor will NEVER fix
+#                                this; the folder must live on a SHARED
+#                                DRIVE (service account added as Content
+#                                Manager), which owns the storage itself.
+# requests' raise_for_status() discards the response BODY, which is where
+# Google states which one it is — so the operator was left guessing
+# between a 30-second fix and an architectural one. _api_reason() now
+# extracts error.errors[].reason and error.message from the body and the
+# failure message names the reason AND the matching remedy.
+# drive_upload_resumable is deliberately NOT touched: the body is read
+# from the exception's attached response in the caller, so the upload path
+# stays byte-identical.
 # v1.1.0 (2026-07-26) — SELF-DIAGNOSING AUTH + FOLDER ID. NO backup logic,
 # retention rule, export path, upload call or exit code changed.
 # WHY, from a real failed run (Actions #6, 2026-07-26): the export
@@ -227,6 +251,50 @@ def _creds_email(creds) -> str:
     return (getattr(creds, "_tfb_client_email", "")
             or getattr(creds, "service_account_email", "")
             or "?")
+
+
+def _api_reason(exc) -> str:
+    """v1.2.0: Google's own machine reason + human message from the failed
+    response attached to a requests HTTPError. Returns "" when there is no
+    body to read. Never raises — a diagnostic must not become the fault."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return ""
+    reason = message = ""
+    try:
+        err = (resp.json() or {}).get("error") or {}
+        message = str(err.get("message") or "")
+        errs = err.get("errors") or []
+        if errs and isinstance(errs, list) and isinstance(errs[0], dict):
+            reason = str(errs[0].get("reason") or "")
+        if not reason:
+            reason = str(err.get("status") or "")
+    except Exception:
+        try:
+            message = (resp.text or "")[:300]
+        except Exception:
+            message = ""
+    out = ":".join(x for x in (reason, message) if x)
+    return out[:400]
+
+
+def _403_remedy(reason_blob: str, email: str, folder_id: str) -> str:
+    """v1.2.0: map Google's reason to the ONE action that fixes it."""
+    r = (reason_blob or "").lower()
+    if "storagequota" in r or "storage quota" in r:
+        return ("service accounts have NO Drive storage of their own, so a "
+                "file created in a My Drive folder cannot be owned — "
+                "re-sharing will NOT fix this. Move the backup folder to a "
+                "SHARED DRIVE and add " + email + " as Content Manager, or "
+                "point TFB_BACKUP_FOLDER_ID at a Shared Drive folder.")
+    if "insufficientfilepermissions" in r or "permission" in r:
+        return ("the folder is visible to " + email + " but not writable — "
+                "open the folder's Share dialog and set that account to "
+                "EDITOR (Viewer/Commenter cannot upload).")
+    return ("folder " + repr(folder_id) + " is visible to " + email + " but "
+            "refused the write — check the share role is EDITOR; if it "
+            "already is, this is the service-account storage-quota case "
+            "and the folder must live on a Shared Drive.")
 
 
 def _drive_id(raw: str) -> str:
@@ -406,15 +474,23 @@ def run_backup(dry_run: bool) -> int:
         up = drive_upload_resumable(sess, folder_id, daily_name(today), data)
     except Exception as e:  # noqa: BLE001
         email = _creds_email(creds)
-        # v1.1.0: Drive answers 404 for a parent this account cannot SEE,
-        # which covers BOTH "not shared" and "wrong id" — say both.
-        _hint = ("folder_id " + repr(folder_id) + " is not visible to "
-                 + email + " — either share that Drive folder with it as "
-                 "EDITOR, or the id is wrong (it must be the bare id from "
-                 "drive.google.com/drive/folders/<ID>, no ?usp=... tail)"
-                 if "404" in str(e) else
-                 "is the folder shared EDITOR with " + email + "?")
-        msg = (f"[BACKUP v{__version__}] FAIL upload: {e} — {_hint}")
+        reason = _api_reason(e)          # v1.2.0: Google's own words
+        _err = str(e)
+        if "404" in _err:
+            # Drive answers 404 for a parent this account cannot SEE,
+            # which covers BOTH "not shared" and "wrong id" — say both.
+            _hint = ("folder_id " + repr(folder_id) + " is not visible to "
+                     + email + " — either share that Drive folder with it "
+                     "as EDITOR, or the id is wrong (it must be the bare "
+                     "id from drive.google.com/drive/folders/<ID>, no "
+                     "?usp=... tail)")
+        elif "403" in _err:
+            _hint = _403_remedy(reason, email, folder_id)
+        else:
+            _hint = "is the folder shared EDITOR with " + email + "?"
+        msg = (f"[BACKUP v{__version__}] FAIL upload: {e}"
+               + (f" [api_reason={reason}]" if reason else "")
+               + f" — {_hint}")
         _out("ERROR: " + msg)
         append_run_log("FAIL", msg, {"stage": "upload"})
         return 3
@@ -476,8 +552,11 @@ def run_restore_test() -> int:
     try:
         listing = drive_list(sess, folder_id)
     except Exception as e:  # noqa: BLE001  v1.1.0: name the cause
-        msg = (f"[RESTORE-TEST v{__version__}] FAIL list: {e} — folder "
-               f"{folder_id!r} not visible to {_creds_email(_creds)}")
+        _r = _api_reason(e)              # v1.2.0
+        msg = (f"[RESTORE-TEST v{__version__}] FAIL list: {e}"
+               + (f" [api_reason={_r}]" if _r else "")
+               + f" — folder {folder_id!r} not readable by "
+               + _creds_email(_creds))
         _out("ERROR: " + msg)
         append_run_log("FAIL", msg, {"stage": "list"})
         return 3
