@@ -114,6 +114,32 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # Scoring, gate, history, and ledger were never affected — the guard did its
 # job. Fix: define the helper (fixed UTC+3, no new imports). One name, one
 # line, verified end-to-end against a stub sheet in the harness.
+# v1.4.0 (2026-07-26): WAVE B — CRITERION 4 STOPS BEING A HARDCODED STRING.
+# WHY: evaluate_s1() has been called with the LITERAL "PENDING" for the
+# calibration criterion since this gate was written. That was honest while
+# nothing measured it — 7D/14D checkpoints only began accruing 2026-07-19
+# — but it meant criterion 4 could never resolve, so the gate could never
+# reach PASS however good the evidence got. track_performance v6.29.0 now
+# computes the measurement (mean |realized - time-scaled forecast| over
+# matured 1W/2W checkpoints) and publishes it to the _S1_Calibration tab.
+# This release READS that tab and passes the real state through.
+# FAIL-SAFE IS THE WHOLE DESIGN: read_s1_calibration() returns "PENDING"
+# on a missing tab, an unreadable row, an unrecognised state token, or a
+# stale as_of. Only a freshly-published, explicitly PASS/FAIL row can move
+# the criterion. A gate that cannot read its own evidence must never award
+# a PASS, and it must never invent a FAIL either — it says PENDING and
+# names the reason in the criterion detail.
+# STALENESS: the published row must be no older than
+# TFB_S1_CAL_MAX_AGE_H (default 48h). The clock runs daily; a row that has
+# stopped refreshing means the tracker is broken, and a frozen verdict
+# from a broken tracker is exactly the fiction this gate exists to catch.
+# NO DATE GATE, deliberately: the sample-size gate lives in the PRODUCER
+# (TFB_S1_CAL_MIN_SAMPLE, default 20), which is the scientifically correct
+# activation condition. Deploying this on any date is safe — with today's
+# handful of matured checkpoints the producer publishes PENDING, so the
+# criterion reads exactly as the hardcoded string did.
+# KILL-SWITCH: TFB_S1_CAL_CONSUME=0 restores the literal "PENDING".
+#
 # v1.3.0 (2026-07-26): W-7 — BENCHMARK_EQW INFORMATIONAL ROW (whitelist item 7,
 # Execution Plan v2.1 §W-7; Gate & Evidence Register §2). WHY: at the August
 # verdict the board must answer "does the intelligence beat simplicity?"
@@ -141,7 +167,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # criterion 5b groups per basket — a fourth basket with one row per day is
 # structurally invisible to both (selftested). The gate call, day-exclusion
 # rule, scored-day counting and net-alpha inputs are untouched lines.
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.4.0"
 TAB_HISTORY = "Shadow_History"
 TAB_GATE = "S1_Gate"
 TAB_REGRET = "Regret_Ledger"
@@ -151,6 +177,8 @@ HISTORY_HEADER = ["Date", "Basket", "Symbols", "Prices JSON", "Daily Return %",
 
 CHAMPION, CHALLENGER, BENCHMARK = "CHAMPION", "CHALLENGER", "BENCHMARK"
 BENCHMARK_EQW = "BENCHMARK_EQW"      # v1.3.0 W-7: informational naive basket
+TAB_S1_CAL = "_S1_Calibration"       # v1.4.0 Wave B: written by
+                                     # track_performance v6.29.0
 EQW_START = date(2026, 7, 27)        # W-7 whitelist date gate, verbatim
 BENCH_WEIGHTS = {"SPUS": 0.70, "^TASI.SR": 0.30}   # §1 locked benchmark
 S1_WINDOW_DAYS = 28                                 # >=4 full weeks
@@ -200,6 +228,64 @@ def _min_fresh_frac() -> float:
         return v / 100.0 if v > 1.0 else v
     except Exception:  # noqa: BLE001
         return 0.60
+
+
+def _s1_cal_consume() -> bool:
+    """v1.4.0 Wave B kill-switch. 0 => the v1.3.0 literal "PENDING"."""
+    return (os.getenv("TFB_S1_CAL_CONSUME") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _s1_cal_max_age_h() -> float:
+    try:
+        return abs(float((os.getenv("TFB_S1_CAL_MAX_AGE_H") or "48").strip()))
+    except Exception:
+        return 48.0
+
+
+def read_s1_calibration(sh, now_local: Optional[datetime] = None
+                        ) -> Tuple[str, str]:
+    """v1.4.0 Wave B -> (state, detail). state is always one of
+    PASS / FAIL / PENDING. Every failure mode resolves to PENDING with the
+    reason in `detail`; this function never raises and never guesses."""
+    if not _s1_cal_consume():
+        return "PENDING", "consumer disabled (TFB_S1_CAL_CONSUME=0)"
+    try:
+        vals = sh.worksheet(TAB_S1_CAL).get_all_values()
+    except Exception as exc:
+        return "PENDING", f"no {TAB_S1_CAL} tab ({type(exc).__name__})"
+    if not vals or len(vals) < 2:
+        return "PENDING", f"{TAB_S1_CAL} empty — tracker has not published"
+    header = [str(h).strip().lower() for h in vals[0]]
+    row = vals[1]
+
+    def _cell(name: str) -> str:
+        try:
+            return str(row[header.index(name)]).strip()
+        except Exception:
+            return ""
+
+    state = _cell("state").upper()
+    if state not in ("PASS", "FAIL", "PENDING"):
+        return "PENDING", f"unreadable state token {state!r}"
+    as_of_raw = _cell("as of (riyadh)")
+    stamp = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            stamp = datetime.strptime(as_of_raw[:19], fmt)
+            break
+        except Exception:
+            continue
+    if stamp is None:
+        return "PENDING", f"unreadable as_of {as_of_raw!r}"
+    ref = now_local or datetime.now()
+    age_h = (ref - stamp).total_seconds() / 3600.0
+    limit = _s1_cal_max_age_h()
+    if age_h > limit:
+        return "PENDING", (f"calibration row stale ({age_h:.0f}h > "
+                           f"{limit:.0f}h) — tracker not publishing")
+    detail = _cell("detail") or f"n={_cell('n checkpoints')}"
+    return state, detail
 
 
 def _eqw_enabled(today: date) -> bool:
@@ -394,7 +480,8 @@ def evaluate_s1(days: int, violations: List[str],
                 net_alpha_pct: Optional[float],
                 calibration_state: str, ca_clean: bool, pit_ok: bool,
                 pit_note: str, drill_date: Optional[str],
-                excluded_days: int = 0) -> Dict[str, Any]:
+                excluded_days: int = 0,
+                calibration_detail: str = "") -> Dict[str, Any]:
     """§15 verdict. PASS requires all six; anything unmet => NOT_DECIDABLE
     (or FAIL where a criterion is definitively breached). Never auto-promotes.
     v1.2.0: `days` are SCORED evidence days only; excluded-infra days are
@@ -416,10 +503,14 @@ def evaluate_s1(days: int, violations: List[str],
         c.append({"id": 3, "name": "shadow net alpha >= 0",
                   "status": "PASS" if net_alpha_pct >= 0 else "FAIL",
                   "detail": f"{net_alpha_pct:+.2f}% vs benchmark (cost-adj.)"})
+    # v1.4.0 Wave B: the caller supplies the measured detail; the legacy
+    # strings remain the fallback so evaluate_s1 keeps its old signature
+    # semantics for any caller that passes only a state.
     c.append({"id": 4, "name": "calibration in band (7D/14D)",
               "status": calibration_state,
-              "detail": "7D/14D horizons land in Wave B (track_performance)"
-                        if calibration_state == "PENDING" else "in band"})
+              "detail": calibration_detail or (
+                  "7D/14D horizons land in Wave B (track_performance)"
+                  if calibration_state == "PENDING" else "in band")})
     c.append({"id": 5, "name": "corporate-actions + point-in-time",
               "status": "PASS" if (ca_clean and pit_ok) else "FAIL",
               "detail": f"CA {'clean' if ca_clean else 'UNREPAIRED'}; {pit_note}"})
@@ -870,10 +961,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     net_alpha = (chal_cum - bench_cum) if days >= 1 else None
 
     pit_ok, pit_note = check_point_in_time(history)
-    gate = evaluate_s1(days, violations, net_alpha, "PENDING",
+    # v1.4.0 Wave B: criterion 4 reads the published measurement instead
+    # of the hardcoded literal. Fail-safe to PENDING on any read problem.
+    cal_state, cal_detail = read_s1_calibration(sh)
+    gate = evaluate_s1(days, violations, net_alpha, cal_state,
                        ca_is_clean(sh), pit_ok, pit_note,
                        find_drill_marker(sh, today - timedelta(days=45)),
-                       excluded_days=excluded_days)
+                       excluded_days=excluded_days,
+                       calibration_detail=cal_detail)
 
     verdict = (f"[S1-GATE v{SCRIPT_VERSION}] {gate['verdict']} day {days}/"
                f"{S1_WINDOW_DAYS}"
@@ -1162,6 +1257,69 @@ def _selftest() -> int:
     checks.append(("W7: gate evaluation unchanged by EQW presence",
                    _g_w7["verdict"] == "NOT_DECIDABLE"
                    and len(_g_w7["criteria"]) == 6))
+
+    # ---- v1.4.0 Wave-B layer: criterion-4 consumption + fail-safes ------- #
+    class _WS:
+        def __init__(self, vals): self._v = vals
+        def get_all_values(self): return self._v
+
+    class _SH:
+        def __init__(self, vals=None, boom=False): self._v, self._b = vals, boom
+        def worksheet(self, name):
+            if self._b or self._v is None:
+                raise RuntimeError("no such tab: " + name)
+            return _WS(self._v)
+
+    _HDR = ["As Of (Riyadh)", "State", "N Checkpoints", "Mean Abs Error (pp)",
+            "Mean Signed Error (pp)", "Band (pp)", "Min Sample", "By Horizon",
+            "Detail", "Writer Version"]
+    _NOW = datetime(2026, 8, 20, 18, 0, 0)
+
+    def _sheet(state, when="2026-08-20 17:40:00", detail="mean |err| 4.10pp"):
+        return _SH([_HDR, [when, state, 41, 4.1, -0.8, 10.0, 20,
+                           "1W n=22 |err|=3.9pp; 2W n=19 |err|=4.3pp",
+                           detail, "6.29.0"]])
+
+    _envsave = os.environ.pop("TFB_S1_CAL_CONSUME", None)
+    checks.append(("W-B: published PASS is consumed",
+                   read_s1_calibration(_sheet("PASS"), _NOW)[0] == "PASS"))
+    checks.append(("W-B: published FAIL is consumed",
+                   read_s1_calibration(_sheet("FAIL"), _NOW)[0] == "FAIL"))
+    checks.append(("W-B: published PENDING stays PENDING",
+                   read_s1_calibration(_sheet("PENDING"), _NOW)[0] == "PENDING"))
+    checks.append(("W-B: missing tab -> PENDING, never PASS",
+                   read_s1_calibration(_SH(boom=True), _NOW)[0] == "PENDING"))
+    checks.append(("W-B: header-only tab -> PENDING",
+                   read_s1_calibration(_SH([_HDR]), _NOW)[0] == "PENDING"))
+    checks.append(("W-B: junk state token -> PENDING",
+                   read_s1_calibration(_sheet("MAYBE"), _NOW)[0] == "PENDING"))
+    _stale = read_s1_calibration(_sheet("PASS", "2026-08-15 17:40:00"), _NOW)
+    checks.append(("W-B: stale row -> PENDING with reason",
+                   _stale[0] == "PENDING" and "stale" in _stale[1]))
+    checks.append(("W-B: unreadable as_of -> PENDING",
+                   read_s1_calibration(_sheet("PASS", "not-a-date"),
+                                       _NOW)[0] == "PENDING"))
+    os.environ["TFB_S1_CAL_CONSUME"] = "0"
+    checks.append(("W-B: kill-switch restores v1.3.0 literal PENDING",
+                   read_s1_calibration(_sheet("PASS"), _NOW)[0] == "PENDING"))
+    if _envsave is None:
+        os.environ.pop("TFB_S1_CAL_CONSUME", None)
+    else:
+        os.environ["TFB_S1_CAL_CONSUME"] = _envsave
+
+    _g_pass = evaluate_s1(28, [], 1.0, "PASS", True, True, "ok", "2026-08-01",
+                          calibration_detail="mean |err| 4.10pp vs band 10pp")
+    checks.append(("W-B: PASS state can carry the gate to PASS",
+                   _g_pass["verdict"] == "PASS"
+                   and _g_pass["criteria"][3]["status"] == "PASS"
+                   and "4.10pp" in _g_pass["criteria"][3]["detail"]))
+    _g_fail = evaluate_s1(28, [], 1.0, "FAIL", True, True, "ok", "2026-08-01")
+    checks.append(("W-B: FAIL state freezes promotion",
+                   _g_fail["verdict"] == "FAIL"))
+    _g_pend = evaluate_s1(28, [], 1.0, "PENDING", True, True, "ok", "2026-08-01")
+    checks.append(("W-B: PENDING keeps the gate NOT_DECIDABLE (v1.3.0 shape)",
+                   _g_pend["verdict"] == "NOT_DECIDABLE"
+                   and len(_g_pend["criteria"]) == 6))
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
