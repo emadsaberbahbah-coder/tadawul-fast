@@ -1821,6 +1821,8 @@ def normalize_candidate(row, fx_rates, criteria):
                    if _env_sector_normalize()
                    else _to_text(_field(view, "sector"))) or "Unknown",
         "asset_class": _to_text(_field(view, "asset_class")),
+        # v1.8.0 [1.4]: additive — third input to the global activity blob.
+        "industry": _to_text(_field(view, "industry")),
         "currency": currency_raw,
         "fx_to_sar": fx,
         "fx_source": fx_source,
@@ -2003,6 +2005,71 @@ _KSA_AUTHORITY_FAIL_DEFAULT = (
     "4011.SR", "4072.SR", "4280.SR", "8100.SR", "8310.SR", "9642.SR")
 
 
+# =============================================================================
+# v1.8.0 (2026-07-26) — PY-1 BLENDED R/R BASIS + GLOBAL ACTIVITY SCREEN (1.4)
+# =============================================================================
+# [PY-1] THE 1.25 LIE. Evidence (workbook audit 2026-07-24/25): the Top-10 KPI
+#   strip reported Blended R/R 1.25 while the two rendered tickets showed 2.89
+#   and 2.10 (mean 2.495). Root cause, proven arithmetically: under the
+#   v1.0.23 "plan" primary basis (the live default) detail.rr is deliberately
+#   the PLAN R/R — _plan_roi / stop_pct — and _plan_roi is BY CONSTRUCTION
+#   half the valuation ROI, because TP1 = price + 0.5*(ref - price).
+#   kpis.blended_rr blended THAT field, so the KPI printed ~half the R/R every
+#   other surface printed. 2.495 / 2 = 1.2475 -> 1.25: the observed number.
+#   The three other surfaces already agree with each other and with the
+#   ladder: the Risk/Reward GATE tests cand["rr"], the advisor sentence prints
+#   cand["rr"], and the audit grid emits cand["rr"] — all equal to
+#   (tp2 - price) / (price - stop), the true reward-to-risk of the ticket's
+#   own ladder. The KPI was the sole outlier.
+#   FIX: detail.rr_tp2 is now emitted explicitly (always, every basis) and
+#   kpis.blended_rr blends IT. detail.rr is BYTE-UNTOUCHED — the plan-basis
+#   decision R/R keeps its meaning for every existing reader.
+#   DEFAULT IS THE FIX, deliberately, against the usual backward-safe rule:
+#   blended_rr has ZERO consumers in this repo outside the GAS KPI-CHECK that
+#   is currently FIRING on the contradiction (repo-wide grep). It feeds no
+#   gate, no ticket, no recommendation and no evidence row — it is a dashboard
+#   number that is presently wrong. Shipping the fix defaulted OFF would
+#   commit a correction that does nothing while the workbook keeps printing a
+#   false KPI. Under any basis other than "plan", detail.rr already EQUALS
+#   rr_tp2, so the new default is byte-identical there.
+#   KILL-SWITCH: TFB_OPP_BLENDED_RR_BASIS=plan restores v1.7.0 exactly.
+#
+# [1.4] GLOBAL ACTIVITY SCREEN. Operator policy recorded 2026-07-25: haram
+#   activities (tobacco, alcohol, gambling) are excluded from investment
+#   consideration GLOBALLY, not only for Saudi listings — the decision that
+#   killed the 2914.T (Japan Tobacco) fast-track candidate. Until now the
+#   activity screen ran only inside core.compliance_gate.model_screen on the
+#   KSA path, so a Tokyo- or US-listed tobacco name faced no activity test.
+#   WIRING: the screen reuses core.compliance_gate's regexes as the single
+#   source of truth (the compliance_rule_sets() precedent — one resolver, no
+#   second copy of the rulebook), adding a MAJOR "Activity Screen" gate for
+#   symbols of EVERY venue.
+#   TWO SCOPES, because they are NOT the same policy question:
+#     haram (recommended)  blocks casino/gambling/betting/lottery/alcohol/
+#                          brewer/distiller/winer/tobacco/cigarette/adult/pork
+#     full                 ALSO blocks conventional finance (bank/insurance/
+#                          assurance/reinsurance) worldwide
+#   The distinction is deliberate and load-bearing: compliance_gate's block
+#   list is a SHARIAH screen, so it includes conventional banking. Applying it
+#   globally at face value would silently exclude every non-Islamic bank and
+#   insurer on every exchange — a sweeping change to the recommendation
+#   universe that the recorded policy did not authorize. "haram" implements
+#   the policy as stated; "full" is available if the operator decides the
+#   broader screen is intended.
+#   FAIL-OPEN ON MISSING DATA: activity_screen returns "activity_undisclosed"
+#   for an empty name/sector/industry blob. That verdict PASSES this gate.
+#   Blocking it would turn every provider gap into an exclusion — a data
+#   outage would silently empty the board.
+#   DEFAULT OFF (TFB_GLOBAL_ACTIVITY_SCREEN unset) = byte-identical v1.7.0.
+#   This one keeps the backward-safe default because it DOES change the
+#   recommendation universe, and that requires the operator's explicit arming.
+#
+# SAFE SCOPE: zero function removals; no change to scoring, ranking, sizing,
+# funding, the ticket ladder, stop/TP math, or any existing gate. cand gains
+# one additive key ("industry"); ticket detail gains one ("rr_tp2").
+# =============================================================================
+
+
 def _env_csv_set(name, default_csv=""):
     raw = (os.getenv(name) or default_csv).strip()
     return {p.strip().upper() for p in raw.split(",") if p.strip()}
@@ -2030,6 +2097,82 @@ def compliance_rule_sets():
     fail |= _env_csv_set("TFB_EXIT_BY_RULE_EXTRA")
     restricted = _env_csv_set("TFB_KSA_FOREIGN_RESTRICTED", "4030.SR")
     return fail, restricted
+
+
+# --------------------------------------------------------------------------- #
+# v1.8.0 [PY-1] blended R/R basis                                              #
+# --------------------------------------------------------------------------- #
+def _env_blended_rr_basis():
+    """"tp2" (default, the fix) | "plan" (v1.7.0 behaviour)."""
+    v = (os.getenv("TFB_OPP_BLENDED_RR_BASIS") or "tp2").strip().lower()
+    return "plan" if v == "plan" else "tp2"
+
+
+# --------------------------------------------------------------------------- #
+# v1.8.0 [1.4] global activity screen                                          #
+# --------------------------------------------------------------------------- #
+# Conventional-finance terms live in compliance_gate's block list because that
+# list is a SHARIAH screen. The global "haram" scope subtracts exactly these
+# and nothing else, so a term added to compliance_gate later is inherited by
+# BOTH scopes automatically — no second rulebook, no drift.
+_ACTIVITY_FINANCE_TERMS = frozenset((
+    "bank", "banks", "banking", "insurance", "assurance", "reinsurance"))
+
+_ACTIVITY_SCREEN_FN = {"fn": None, "loaded": False}
+
+
+def _env_global_activity_screen():
+    """"" (OFF, default) | "haram" | "full"."""
+    v = (os.getenv("TFB_GLOBAL_ACTIVITY_SCREEN") or "").strip().lower()
+    if v in ("1", "true", "on", "yes", "haram"):
+        return "haram"
+    if v == "full":
+        return "full"
+    return ""
+
+
+def _activity_screen_fn():
+    """Lazy, cached, failure-tolerant import of the single source of truth.
+    A missing/broken compliance_gate must never break the builder: the screen
+    then resolves to unavailable and the gate is simply not appended."""
+    if not _ACTIVITY_SCREEN_FN["loaded"]:
+        _ACTIVITY_SCREEN_FN["loaded"] = True
+        try:
+            from core.compliance_gate import activity_screen as _fn
+            _ACTIVITY_SCREEN_FN["fn"] = _fn
+        except Exception:
+            try:
+                from compliance_gate import activity_screen as _fn
+                _ACTIVITY_SCREEN_FN["fn"] = _fn
+            except Exception:
+                _LOG.warning(
+                    "[v1.8.0 ACTIVITY-SCREEN] core.compliance_gate "
+                    "unavailable — global activity gate not applied")
+                _ACTIVITY_SCREEN_FN["fn"] = None
+    return _ACTIVITY_SCREEN_FN["fn"]
+
+
+def global_activity_verdict(name, sector, industry, scope):
+    """-> (ok, reason) for the global screen, or (None, reason) when the
+    screen cannot run. Blocks ONLY on an explicit activity_blocked hit;
+    undisclosed/exempt/clean all PASS (fail-open on missing data)."""
+    if not scope:
+        return None, "screen_off"
+    fn = _activity_screen_fn()
+    if fn is None:
+        return None, "screen_unavailable"
+    try:
+        _clean, why = fn(name or "", sector or "", industry or "")
+    except Exception:
+        return None, "screen_error"
+    why = str(why or "")
+    if not why.startswith("activity_blocked:"):
+        # activity_clean / activity_islamic_exempt / activity_undisclosed
+        return True, why
+    term = why.split(":", 1)[1].strip().lower()
+    if scope == "haram" and term in _ACTIVITY_FINANCE_TERMS:
+        return True, "activity_finance_out_of_global_scope:" + term
+    return False, why
 
 
 _NOMU_RE = re.compile(r"^9\d{3}\.SR$")
@@ -2317,6 +2460,22 @@ def evaluate_gates(cand, criteria, held_symbols=None):
             ("NOMU_BLOCKED" if _nomu else
              ("FOREIGN_RESTRICTED" if _sym_u in _restr2 else "eligible")),
             "Main Market only; foreign-resident tradable set"))
+
+    # v1.8.0 [1.4 GLOBAL ACTIVITY SCREEN]: haram-activity exclusion on EVERY
+    # venue, not just .SR. Appended only when armed, so the gate list and the
+    # verdict are byte-identical to v1.7.0 while TFB_GLOBAL_ACTIVITY_SCREEN is
+    # unset. Fails MAJOR => DO_NOT_INVEST (audit/near-miss, never selected).
+    _act_scope = _env_global_activity_screen()
+    if _act_scope:
+        _act_ok, _act_why = global_activity_verdict(
+            cand.get("name"), cand.get("sector"), cand.get("industry"),
+            _act_scope)
+        if _act_ok is not None:
+            g.append(_gate(
+                "Activity Screen", _act_ok, FAIL_MAJOR, _act_why,
+                ("no haram activity (global, all venues)"
+                 if _act_scope == "haram"
+                 else "no haram or conventional-finance activity (global)")))
 
     # v1.0.7 [INVESTABILITY-GATE]: enforce the engine's authoritative verdict.
     # normalize_candidate captures investability_status into
@@ -2940,6 +3099,12 @@ def _build_ticket(rank, pick, criteria, review_date):
                    if (_ticket_plan_primary and cand["stop_pct"]
                        and cand["stop_pct"] > 0)
                    else _round2(cand["rr"])),
+            # v1.8.0 [PY-1]: the TP2-ladder R/R — (tp2-price)/(price-stop) —
+            # i.e. exactly the number the Risk/Reward gate tests, the advisor
+            # sentence prints and the audit grid emits. Emitted on EVERY
+            # basis so kpis.blended_rr can never again speak a different
+            # language from the tickets it summarizes.
+            "rr_tp2": _round2(cand["rr"]),
             "liquidity_sar": _round0(cand["liquidity_sar"]),
             "opportunity_score": cand.get("_score"),
             "score_components": cand.get("_components"),
@@ -3394,7 +3559,11 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         "selected_count": len(tickets),
         "max_selected": crit["max_selected"],
         "blended_reliability": _blend(tickets, "reliability"),
-        "blended_rr": _blend_detail(tickets, "rr"),
+        # v1.8.0 [PY-1]: blend the TP2 R/R the tickets actually display.
+        # TFB_OPP_BLENDED_RR_BASIS=plan restores the v1.7.0 "rr" blend.
+        "blended_rr": _blend_detail(
+            tickets,
+            "rr" if _env_blended_rr_basis() == "plan" else "rr_tp2"),
         "scanned": len(audit),
         "passed": len(invest),
         "capital_unallocated_sar": round(deployable - total_suggested, 0),
