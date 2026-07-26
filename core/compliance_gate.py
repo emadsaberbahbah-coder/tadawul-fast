@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 COMPLIANCE_GATE_VERSION = __version__
 
 # --------------------------------------------------------------------------- #
@@ -214,9 +214,31 @@ DEFAULT_PERMISSIONS: Dict[str, bool] = {
 # Takaful / Islamic bank names are exempted before the block scan.             #
 # --------------------------------------------------------------------------- #
 _ACTIVITY_EXEMPT = re.compile(r"\b(ISLAMIC|TAKAFUL|SHARIA|SHARIAH|الراجحي|الإنماء|البلاد|الجزيرة)\b", re.I)
+# v1.0.1 (2026-07-26) -- PLURAL BLIND SPOT. PROVEN DEFECT: every term below
+# was singular-only behind a word boundary, so the standard industry labels a
+# provider actually sends passed CLEAN: "Cigarettes", "Casinos & Gaming",
+# "Brewers", "Distillers & Vintners", "Wineries", "Lotteries" -- all MISS.
+# Only the exact singular ("Tobacco", "Casino") hit. "WINER" was worse than
+# useless: it matches no English word at all (the trailing \\b blocks
+# "Winery"/"Wineries"), so the entire wine family was unscreened; it is
+# replaced by WINERY|WINERIES.
+# SCOPE OF THIS FIX: plurals and real-world variants of the HARAM families
+# only. The conventional-finance terms are UNCHANGED, deliberately, because
+# opportunity_builder v1.8.0's global "haram" scope subtracts exactly that
+# frozen set -- adding to it here would silently widen the global screen.
+# DELIBERATELY NOT ADDED: "GAMING". Yahoo/GICS use it for VIDEO games
+# ("Electronic Gaming & Multimedia"), so it would block EA/Nintendo-class
+# names as gambling. Gambling is already covered by CASINO(S)/BETTING/LOTTERY.
+# BLAST RADIUS: verified zero -- repo-wide grep shows activity_screen and
+# model_screen have NO caller in the live decision path today; the first
+# consumer is opportunity_builder v1.8.0's gate, which ships default-OFF.
 _ACTIVITY_BLOCK = re.compile(
-    r"\b(BANK|BANKS|BANKING|INSURANCE|ASSURANCE|REINSURANCE|CASINO|GAMBLING|"
-    r"BETTING|LOTTERY|ALCOHOL|BREWER|DISTILLER|WINER|TOBACCO|CIGARETTE|"
+    r"\b(BANK|BANKS|BANKING|INSURANCE|ASSURANCE|REINSURANCE|"
+    r"CASINO|CASINOS|GAMBLING|BETTING|LOTTERY|LOTTERIES|"
+    r"ALCOHOL|ALCOHOLIC|BREWER|BREWERS|BREWERY|BREWERIES|BREWING|"
+    r"DISTILLER|DISTILLERS|DISTILLERY|DISTILLERIES|VINTNER|VINTNERS|"
+    r"WINERY|WINERIES|SPIRITS|LIQUOR|LIQUORS|"
+    r"TOBACCO|CIGARETTE|CIGARETTES|CIGAR|CIGARS|"
     r"ADULT|PORK)\b", re.I)
 
 def activity_screen(name: str, sector: str = "", industry: str = "") -> Tuple[bool, str]:
