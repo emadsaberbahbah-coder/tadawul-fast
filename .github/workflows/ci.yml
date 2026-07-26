@@ -166,7 +166,8 @@ jobs:
             core/quality_gates.py \
             core/scoring.py \
             core/analysis/opportunity_builder.py \
-            core/analysis/portfolio_actions.py
+            core/analysis/portfolio_actions.py \
+            core/analysis/top10_selector.py
 
       - name: 🧪 Run decision-layer suites
         run: |
@@ -177,7 +178,8 @@ jobs:
             tests/test_opportunity_builder.py \
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
-            tests/test_scoring_engine_contract.py
+            tests/test_scoring_engine_contract.py \
+            tests/test_top10_selector.py
           echo "::endgroup::"
 
       - name: ✅ Coverage note
