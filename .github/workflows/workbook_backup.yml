@@ -29,6 +29,22 @@ jobs:
     env:
       DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
       TFB_BACKUP_FOLDER_ID: ${{ vars.TFB_BACKUP_FOLDER_ID }}
+      # (2026-07-26) backup_workbook v1.3.0 destination switch. Drive is
+      # architecturally impossible for a bare service account — Google returns
+      # storageQuotaExceeded because a service account owns no Drive storage.
+      # Unset => "drive" => v1.2.0 behaviour verbatim, so adding these lines
+      # changes nothing until the Variables are set.
+      TFB_BACKUP_DEST: ${{ vars.TFB_BACKUP_DEST }}
+      TFB_BACKUP_GCS_BUCKET: ${{ vars.TFB_BACKUP_GCS_BUCKET }}
+      TFB_BACKUP_GCS_PREFIX: ${{ vars.TFB_BACKUP_GCS_PREFIX }}
+      # (2026-07-26) v1.4.0 operator-delegated Drive ("oauth"). These are the
+      # OPERATOR's credentials, scoped to drive.file — the app can only touch
+      # files it creates itself, never the rest of the Drive. Empty secrets =>
+      # dest stays "drive" => nothing changes.
+      TFB_BACKUP_OAUTH_CLIENT_ID: ${{ secrets.TFB_BACKUP_OAUTH_CLIENT_ID }}
+      TFB_BACKUP_OAUTH_CLIENT_SECRET: ${{ secrets.TFB_BACKUP_OAUTH_CLIENT_SECRET }}
+      TFB_BACKUP_OAUTH_REFRESH_TOKEN: ${{ secrets.TFB_BACKUP_OAUTH_REFRESH_TOKEN }}
+      TFB_BACKUP_DRIVE_FOLDER_NAME: ${{ vars.TFB_BACKUP_DRIVE_FOLDER_NAME }}
     steps:
       - uses: actions/checkout@v5
 
