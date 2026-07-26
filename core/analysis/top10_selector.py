@@ -587,7 +587,7 @@ logger.addHandler(logging.NullHandler())
 # no-op and the champion behaves exactly as v4.22.0. Never empties the pool:
 # if every candidate is untradable, the exclusion is abandoned and logged.
 # -----------------------------------------------------------------------------
-TOP10_SELECTOR_VERSION = "4.24.0"
+TOP10_SELECTOR_VERSION = "4.25.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1112,7 +1112,51 @@ STABILITY_OUTPUT_KEY_HEADERS: "OrderedDict[str, str]" = OrderedDict(
         ("stability_trend", "Stability Trend"),
     )
 )
-STABILITY_STATE_VERSION = 1
+# v4.25.0 (2026-07-26) [PY-10] STABILITY HISTORY SPEAKS THE RANKING SCORE
+# =========================================================================
+# PROVEN INCOHERENCE. Two different numbers were deciding one board:
+#   ADMISSION ranked candidates by _selector_score() -- since v4.20.0 the
+#     golden composite (0.40*overall + 0.25*reliability + 0.20*conviction
+#     + 0.15*horizon-ROI - risk penalty).
+#   MEMBERSHIP CHURN ranked them by _score_of(), which read the RAW
+#     `overall_score` (fallback `opportunity_score`) into `hist`, and
+#     _smoothed() drives THREE decisions that move real seats:
+#       (a) capacity eviction  -- survivors beyond `limit` are EXITED,
+#       (b) displacement       -- a confirmed challenger unseats the
+#                                 weakest incumbent it beats on smoothed,
+#       (c) final ordering     -- i.e. the published top10_rank,
+#     and it is also published to the sheet as `score_smoothed`.
+# So a name admitted at rank 3 on the composite could be evicted for
+# capacity, or displaced, on a metric that never selected it -- and
+# reliability, conviction and ROI (75% of the composite) had no vote in
+# who KEEPS a seat. This is the churn class the workbook audit gate 3
+# ("no unexplained flip-flops") keeps surfacing.
+# FIX: TFB_TOP10_STABILITY_SCORE_BASIS=selector makes `hist` store
+# _selector_score(row, criteria) -- the same number that ranked the row.
+# DEFAULT IS "engine" = v4.24.0 BYTE-IDENTICAL, and deliberately so: unlike
+# the display-only blended_rr fix, this one CHANGES BOARD MEMBERSHIP, and
+# the S-1 evidence window forbids a silent recommendation change. Arming it
+# is an explicit operator ENV decision.
+# SCALE-MIGRATION SELF-HEAL: a persisted `hist` holds points on ONE scale.
+# Flipping the basis would otherwise average engine-scale and composite-
+# scale points inside the same smoothing window for up to smooth_days --
+# a silently wrong number during the exact days the flip is being judged.
+# Each symbol now carries `hs` (hist scale); when it disagrees with the
+# active basis the history is CLEARED and refills cleanly on the new scale.
+# The flip therefore costs smooth_days of smoothing depth, visibly, once.
+# STATE SCHEMA -> 2 (additive `hs`; v1 blobs parse unchanged, missing `hs`
+# reads as the engine scale, which is exactly what a v1 blob contains).
+STABILITY_STATE_VERSION = 2
+STABILITY_HIST_SCALE_ENGINE = "engine"
+STABILITY_HIST_SCALE_SELECTOR = "selector"
+
+
+def _stability_score_basis() -> str:
+    """v4.25.0 [PY-10]: "engine" (default, v4.24.0 verbatim) | "selector"."""
+    v = (os.getenv("TFB_TOP10_STABILITY_SCORE_BASIS") or "").strip().lower()
+    if v in ("selector", "composite", "1", "true", "on", "yes"):
+        return STABILITY_HIST_SCALE_SELECTOR
+    return STABILITY_HIST_SCALE_ENGINE
 STABILITY_DEFAULT_CONFIRM_DAYS = 3   # consecutive qualifying days before ENTRY
 STABILITY_DEFAULT_EXIT_DAYS = 3      # consecutive missed days before soft EXIT
 STABILITY_DEFAULT_RANK_BUFFER = 15   # all-pool rank <= buffer pauses the exit clock
@@ -4073,6 +4117,12 @@ def _stability_parse_state(raw: Any) -> Dict[str, Any]:
                 "since": _s(v.get("since")).strip(),
                 "ls": _s(v.get("ls")).strip(),
                 "hist": hist[-30:],
+                # v4.25.0 [PY-10]: which scale `hist` is denominated in.
+                # Absent (v1 blob) => engine scale, which is what it holds.
+                "hs": (STABILITY_HIST_SCALE_SELECTOR
+                       if _s(v.get("hs")).strip().lower()
+                       == STABILITY_HIST_SCALE_SELECTOR
+                       else STABILITY_HIST_SCALE_ENGINE),
             }
     return out
 
@@ -4122,10 +4172,22 @@ def _apply_selection_stability(
             raw_by_sym[sym] = row
     raw_set = frozenset(raw_syms)
 
+    # v4.25.0 [PY-10]: resolved once per call; every hist point written
+    # below is denominated in THIS scale and stamped with it.
+    hist_scale = _stability_score_basis()
+
     def _score_of(sym: str) -> Optional[float]:
         row = raw_by_sym.get(sym) or sym2row.get(sym)
         if row is None:
             return None
+        if hist_scale == STABILITY_HIST_SCALE_SELECTOR:
+            # The SAME function that ranked this row for admission.
+            # Fail-soft: any scoring error falls back to the v4.24.0
+            # engine reading rather than dropping the day's point.
+            try:
+                return _safe_float(_selector_score(row, criteria), None)
+            except Exception:
+                pass
         v = _safe_float(row.get("overall_score"), None)
         if v is None:
             v = _safe_float(row.get("opportunity_score"), None)
@@ -4137,8 +4199,14 @@ def _apply_selection_stability(
     for sym in set(symbols) | raw_set:
         st = symbols.get(sym)
         if st is None:
-            st = {"ci": 0, "co": 0, "member": False, "since": "", "ls": "", "hist": []}
+            st = {"ci": 0, "co": 0, "member": False, "since": "", "ls": "",
+                  "hist": [], "hs": hist_scale}
             symbols[sym] = st
+        # v4.25.0 [PY-10] scale-migration self-heal: never average two
+        # scales inside one smoothing window. Membership/clocks untouched.
+        if _s(st.get("hs")).strip().lower() != hist_scale:
+            st["hist"] = []
+            st["hs"] = hist_scale
         sc = _score_of(sym)
         if day_advance:
             if sym in raw_set:
