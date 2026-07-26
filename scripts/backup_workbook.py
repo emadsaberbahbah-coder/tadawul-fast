@@ -89,7 +89,76 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-__version__ = "1.2.0"
+__version__ = "1.4.0"
+# v1.4.0 (2026-07-26) — OAUTH USER-DELEGATED DRIVE DESTINATION ("oauth").
+# WHY: the service account cannot own Drive files (storageQuotaExceeded,
+# run #8) and GCS needs billing, which is unavailable for individual
+# onboarding in this region. Remaining free path: authenticate the UPLOAD
+# as the OPERATOR, so backups consume the operator's own 15 GB and land
+# in the operator's own Drive — openable and restorable by hand, with no
+# tooling, which is what a disaster-recovery artefact should be.
+#
+# TWO IDENTITIES, DELIBERATELY. This is the load-bearing design point:
+#   SERVICE ACCOUNT  keeps exporting the workbook and writing _Run_Log.
+#                    It already has read access to the workbook (proven:
+#                    18.5 MB exported cleanly on runs #6-#8).
+#   OAUTH USER       performs ONLY the destination operations (upload,
+#                    list, copy, delete, download).
+# They are NOT interchangeable. The OAuth grant uses the NARROW
+# drive.file scope — access strictly limited to files THIS APP CREATES —
+# so it can neither read the workbook nor touch anything else in the
+# operator's Drive. Trying to serve both roles from one credential would
+# have meant requesting full Drive scope, i.e. handing a CI job standing
+# read/write over the operator's entire Drive to solve a backup problem.
+# Refused. The split costs one extra session object and nothing else.
+#
+# FOLDER, WITHOUT OVER-REACHING. drive.file cannot write into a folder the
+# app did not create — supplying an arbitrary parent id returns 404. So
+# the app CREATES its own folder (default "TFB Workbook Backups") on first
+# run and FINDS IT AGAIN on later runs, because files.list under
+# drive.file returns exactly the app-created set. Self-healing: delete the
+# folder and the next run rebuilds it. TFB_BACKUP_FOLDER_ID is NOT used on
+# this path and must not be — that id names a folder the app did not
+# create.
+#
+# TOKEN LONGEVITY: a refresh token for an app left in "Testing" publishing
+# status expires after 7 DAYS, which would make this job die silently each
+# week — worse than no backup, because the dashboard would look healthy.
+# The operator app is published ("In production"), so the token persists.
+# drive.file is non-sensitive, so publishing needs no Google review.
+# Failure of the refresh exchange is reported explicitly, never as a
+# generic auth error, so an expired grant is diagnosable in one glance.
+#
+# DEFAULT UNCHANGED: TFB_BACKUP_DEST unset => "drive" => v1.3.0 verbatim.
+# Every drive_* and gcs_* helper is byte-identical; "oauth" reuses the
+# drive_* helpers wholesale, differing ONLY in which session they receive.
+# v1.3.0 (2026-07-26) — PLUGGABLE DESTINATION + GCS BACKEND.
+# WHY: run #8 proved the Drive path is architecturally impossible for this
+# credential. Google's own words: "Service Accounts do not have storage
+# quota." A file a service account creates in a My Drive folder has no
+# owner Drive will accept, so NO sharing change, folder id or permission
+# grant can ever make it work. The destination had to change, not the
+# configuration. Options weighed: a Shared Drive (clean, but needs a paid
+# Workspace subscription); OAuth user-delegation (free, but a refresh
+# token for an app in "Testing" publishing status EXPIRES EVERY 7 DAYS —
+# a disaster-recovery job that silently dies weekly is worse than none);
+# and Google Cloud Storage, where the bucket belongs to the PROJECT, so
+# the service account writes against project-owned storage and the quota
+# problem does not exist. GCS chosen: same credentials, no token to
+# expire, ~555 MB for 30 dailies + 12 monthlies — inside the free tier.
+# DESIGN: destination is a SWITCH, not a replacement. TFB_BACKUP_DEST
+# defaults to "drive", so this build is byte-identical in behaviour until
+# the operator sets "gcs" — and if a Shared Drive becomes available later,
+# flipping back needs no code change. Every drive_* helper is untouched.
+# The retention engine is destination-agnostic: it reasons over NAMES, and
+# the GCS helpers return the same {"id", "name"} shape the Drive ones do,
+# so plan_pruning / monthly_needed / _DAILY_RE / _MONTHLY_RE and the
+# 30-daily + 12-monthly policy are shared verbatim by both backends.
+# SCOPE ADDED: devstorage.read_write. Harmless to the Drive and Sheets
+# paths — a service account only ever gets what IAM already grants it.
+# OPERATOR SETUP for gcs: enable billing on the GCP project, create a
+# bucket, grant the service account Storage Object Admin on it, then set
+# TFB_BACKUP_DEST=gcs and TFB_BACKUP_GCS_BUCKET=<name>.
 # v1.2.0 (2026-07-26) — SURFACE GOOGLE'S OWN REASON. Still NO change to
 # export, upload, retention or exit codes.
 # WHY, from run #7: v1.1.0 named the account and normalised the folder id,
@@ -208,7 +277,11 @@ def monthly_needed(today: _dt.date, existing_names: List[str]) -> bool:
 def _credentials():
     from google.oauth2 import service_account  # local import: CI only
     scopes = ["https://www.googleapis.com/auth/drive",
-              "https://www.googleapis.com/auth/spreadsheets"]
+              "https://www.googleapis.com/auth/spreadsheets",
+              # v1.3.0: GCS backend. Requesting a scope grants nothing on
+              # its own — IAM still decides — so this is inert for the
+              # drive destination.
+              "https://www.googleapis.com/auth/devstorage.read_write"]
     path = _env("GOOGLE_APPLICATION_CREDENTIALS")
     if path and os.path.exists(path):
         creds = service_account.Credentials.from_service_account_file(
@@ -251,6 +324,98 @@ def _creds_email(creds) -> str:
     return (getattr(creds, "_tfb_client_email", "")
             or getattr(creds, "service_account_email", "")
             or "?")
+
+
+def _backup_dest() -> str:
+    """"drive" (default, service account) | "gcs" | "oauth" (v1.4.0,
+    operator-delegated Drive). Anything unrecognised falls back to the
+    v1.2.0 default rather than guessing."""
+    v = _env("TFB_BACKUP_DEST", "drive").lower()
+    if v in ("gcs", "gcloud", "cloud-storage", "storage"):
+        return "gcs"
+    if v in ("oauth", "user", "drive_oauth", "drive-oauth"):
+        return "oauth"
+    return "drive"
+
+
+def _oauth_folder_name() -> str:
+    return _env("TFB_BACKUP_DRIVE_FOLDER_NAME", "TFB Workbook Backups")
+
+
+def _oauth_credentials():
+    """v1.4.0: operator-delegated user credentials, drive.file scope only.
+    Raises with a NAMED cause — an expired or revoked grant must never
+    surface as an anonymous auth error."""
+    from google.oauth2.credentials import Credentials as UserCredentials
+    cid = _env("TFB_BACKUP_OAUTH_CLIENT_ID")
+    csec = _env("TFB_BACKUP_OAUTH_CLIENT_SECRET")
+    rtok = _env("TFB_BACKUP_OAUTH_REFRESH_TOKEN")
+    missing = [n for n, v in (("TFB_BACKUP_OAUTH_CLIENT_ID", cid),
+                              ("TFB_BACKUP_OAUTH_CLIENT_SECRET", csec),
+                              ("TFB_BACKUP_OAUTH_REFRESH_TOKEN", rtok))
+               if not v]
+    if missing:
+        raise RuntimeError("oauth secrets missing: " + ", ".join(missing))
+    return UserCredentials(
+        None, refresh_token=rtok,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=cid, client_secret=csec,
+        scopes=["https://www.googleapis.com/auth/drive.file"])
+
+
+def _oauth_session():
+    """A session that has already PROVED its refresh token works, so a
+    dead grant is reported before the 20-second export rather than after."""
+    from google.auth.transport.requests import Request, AuthorizedSession
+    creds = _oauth_credentials()
+    try:
+        creds.refresh(Request())
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "oauth refresh failed (" + type(e).__name__ + ": " + str(e)
+            + ") — the refresh token is expired or revoked. Re-run the "
+            "OAuth Playground consent for scope drive.file and update "
+            "TFB_BACKUP_OAUTH_REFRESH_TOKEN. Confirm the OAuth app is "
+            "published (In production): a Testing-status app expires "
+            "refresh tokens after 7 days.")
+    return AuthorizedSession(creds)
+
+
+def drive_ensure_app_folder(sess, name: str) -> str:
+    """v1.4.0: find-or-create the app's OWN backup folder and return its
+    id. Under drive.file, files.list returns only app-created items, so a
+    name match here cannot collide with anything else in the Drive."""
+    q = ("mimeType='application/vnd.google-apps.folder' and trashed=false "
+         "and name='" + name.replace("'", "\\'") + "'")
+    r = sess.get("https://www.googleapis.com/drive/v3/files",
+                 params={"q": q, "fields": "files(id,name)", "pageSize": 10},
+                 timeout=60)
+    r.raise_for_status()
+    hits = r.json().get("files", [])
+    if hits:
+        return hits[0]["id"]
+    r2 = sess.post("https://www.googleapis.com/drive/v3/files",
+                   json={"name": name,
+                         "mimeType": "application/vnd.google-apps.folder"},
+                   params={"fields": "id"}, timeout=60)
+    r2.raise_for_status()
+    return r2.json()["id"]
+
+
+def _gcs_bucket() -> str:
+    return _env("TFB_BACKUP_GCS_BUCKET")
+
+
+def _gcs_prefix() -> str:
+    """Object-name prefix. Normalised to end with exactly one slash, or be
+    empty — so object names are never accidentally concatenated."""
+    raw = os.environ.get("TFB_BACKUP_GCS_PREFIX")
+    # Present-but-empty is a DELIBERATE choice (objects at the bucket root);
+    # only an absent variable falls back to the default.
+    v = ("tfb-backups/" if raw is None else raw).strip().lstrip("/")
+    if v and not v.endswith("/"):
+        v += "/"
+    return v
 
 
 def _api_reason(exc) -> str:
@@ -399,6 +564,135 @@ def drive_download(sess, file_id: str) -> bytes:
 
 
 # --------------------------------------------------------------------------- #
+# v1.3.0 Google Cloud Storage backend                                         #
+# --------------------------------------------------------------------------- #
+# Contract: every function below returns the SAME shape as its drive_*
+# counterpart — {"id": <full object name>, "name": <bare file name>} — so
+# the retention engine, which reasons purely over names, is shared verbatim.
+# For GCS the object name IS the identifier, so id carries the prefixed
+# path while name carries the basename the regexes match on.
+def _gcs_obj_path(name: str) -> str:
+    return _gcs_prefix() + name
+
+
+def _gcs_quote(obj: str) -> str:
+    """Object names contain slashes; they MUST be percent-encoded when they
+    sit in the URL PATH, or the API reads them as resource separators."""
+    from urllib.parse import quote
+    return quote(obj, safe="")
+
+
+def gcs_list(sess, bucket: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    token = None
+    prefix = _gcs_prefix()
+    while True:
+        params: Dict[str, Any] = {"maxResults": 200,
+                                  "fields": "nextPageToken,items(name,size,timeCreated)"}
+        if prefix:
+            params["prefix"] = prefix
+        if token:
+            params["pageToken"] = token
+        r = sess.get(f"https://storage.googleapis.com/storage/v1/b/{bucket}/o",
+                     params=params, timeout=60)
+        r.raise_for_status()
+        j = r.json()
+        for it in j.get("items", []):
+            full = it.get("name", "")
+            out.append({"id": full, "name": full.rsplit("/", 1)[-1],
+                        "size": it.get("size"),
+                        "createdTime": it.get("timeCreated")})
+        token = j.get("nextPageToken")
+        if not token:
+            return out
+
+
+def gcs_upload_resumable(sess, bucket: str, name: str,
+                         data: bytes) -> Dict[str, Any]:
+    obj = _gcs_obj_path(name)
+    r = sess.post(
+        f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o",
+        params={"uploadType": "resumable", "name": obj},
+        json={"name": obj, "contentType": _XLSX_MIME},
+        headers={"X-Upload-Content-Type": _XLSX_MIME,
+                 "X-Upload-Content-Length": str(len(data))},
+        timeout=60)
+    r.raise_for_status()
+    loc = r.headers.get("Location")
+    if not loc:
+        raise RuntimeError("gcs resumable upload: no session Location header")
+    r2 = sess.put(loc, data=data,
+                  headers={"Content-Type": _XLSX_MIME}, timeout=600)
+    r2.raise_for_status()
+    j = r2.json()
+    full = j.get("name", obj)
+    return {"id": full, "name": full.rsplit("/", 1)[-1]}
+
+
+def gcs_copy(sess, bucket: str, src_obj: str, new_name: str
+             ) -> Dict[str, Any]:
+    dst = _gcs_obj_path(new_name)
+    r = sess.post(
+        f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/"
+        f"{_gcs_quote(src_obj)}/copyTo/b/{bucket}/o/{_gcs_quote(dst)}",
+        json={}, timeout=300)
+    r.raise_for_status()
+    j = r.json().get("resource") or r.json()
+    full = j.get("name", dst)
+    return {"id": full, "name": full.rsplit("/", 1)[-1]}
+
+
+def gcs_delete(sess, bucket: str, obj: str) -> None:
+    r = sess.delete(
+        f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/"
+        f"{_gcs_quote(obj)}", timeout=60)
+    if r.status_code not in (200, 204):
+        raise RuntimeError(f"gcs delete {obj}: HTTP {r.status_code}")
+
+
+def gcs_download(sess, bucket: str, obj: str) -> bytes:
+    r = sess.get(
+        f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/"
+        f"{_gcs_quote(obj)}", params={"alt": "media"}, timeout=600)
+    r.raise_for_status()
+    return r.content
+
+
+# --------------------------------------------------------------------------- #
+# v1.3.0 destination dispatch — the ONE place the two backends meet          #
+# --------------------------------------------------------------------------- #
+# v1.4.0: "oauth" is the Drive API with a different IDENTITY, not a
+# different protocol — it reuses every drive_* helper unchanged.
+def _store_list(sess, dest: str, container: str) -> List[Dict[str, Any]]:
+    return (gcs_list(sess, container) if dest == "gcs"
+            else drive_list(sess, container))
+
+
+def _store_upload(sess, dest: str, container: str, name: str,
+                  data: bytes) -> Dict[str, Any]:
+    return (gcs_upload_resumable(sess, container, name, data) if dest == "gcs"
+            else drive_upload_resumable(sess, container, name, data))
+
+
+def _store_copy(sess, dest: str, container: str, src_id: str,
+                new_name: str) -> Dict[str, Any]:
+    return (gcs_copy(sess, container, src_id, new_name) if dest == "gcs"
+            else drive_copy(sess, src_id, container, new_name))
+
+
+def _store_delete(sess, dest: str, container: str, fid: str) -> None:
+    if dest == "gcs":
+        gcs_delete(sess, container, fid)
+    else:
+        drive_delete(sess, fid)
+
+
+def _store_download(sess, dest: str, container: str, fid: str) -> bytes:
+    return (gcs_download(sess, container, fid) if dest == "gcs"
+            else drive_download(sess, fid))
+
+
+# --------------------------------------------------------------------------- #
 # _Run_Log audit line (guarded — logging must never mask the real outcome)    #
 # --------------------------------------------------------------------------- #
 def append_run_log(status: str, message: str, details: Dict[str, Any]) -> None:
@@ -426,16 +720,35 @@ def run_backup(dry_run: bool) -> int:
     _folder_raw = _env("TFB_BACKUP_FOLDER_ID")
     sheet_id = _drive_id(_sheet_raw)          # v1.1.0 [B]
     folder_id = _drive_id(_folder_raw)        # v1.1.0 [B]
+    dest = _backup_dest()                     # v1.3.0 / v1.4.0
+    container = _gcs_bucket() if dest == "gcs" else folder_id
     if not sheet_id:
         _out("ERROR: DEFAULT_SPREADSHEET_ID not set")
         return 2
     creds = _credentials()
-    sess = _session(creds)
+    sess = _session(creds)          # service account: EXPORT + _Run_Log
+    dsess = sess                    # destination session (may differ)
+    if dest == "oauth":
+        # v1.4.0: the operator identity owns the storage. Resolved BEFORE
+        # the export so a dead grant costs 2 seconds, not 25.
+        try:
+            dsess = _oauth_session()
+            container = drive_ensure_app_folder(dsess, _oauth_folder_name())
+        except Exception as e:  # noqa: BLE001
+            msg = f"[BACKUP v{__version__}] FAIL oauth setup: {e}"
+            _out("ERROR: " + msg)
+            append_run_log("FAIL", msg, {"stage": "oauth"})
+            return 2
     # v1.1.0: preflight BEFORE the multi-second export, so a misconfigured
     # run is visible at the top of the log rather than 13 seconds in.
-    _out(f"preflight: account={_creds_email(creds)} "
-         f"sheet_id={sheet_id} folder_id={folder_id or '(unset)'} "
-         f"dry_run={bool(dry_run)}")
+    _out(f"preflight: export_account={_creds_email(creds)} dest={dest} "
+         f"sheet_id={sheet_id} "
+         + (f"bucket={container or '(unset)'} prefix={_gcs_prefix()!r} "
+            if dest == "gcs"
+            else f"folder={_oauth_folder_name()!r} folder_id={container} "
+            if dest == "oauth"
+            else f"folder_id={container or '(unset)'} ")
+         + f"dry_run={bool(dry_run)}")
     if folder_id != _folder_raw.strip():
         _out(f"NOTE: TFB_BACKUP_FOLDER_ID normalised from "
              f"{_folder_raw.strip()!r} to {folder_id!r} — set the bare id "
@@ -460,7 +773,7 @@ def run_backup(dry_run: bool) -> int:
     if dry_run:
         _out("dry-run — export verified, nothing uploaded")
         return 0
-    if not folder_id:
+    if dest == "drive" and not folder_id:      # v1.3.0: destination-aware
         email = getattr(creds, "_tfb_client_email", "?")
         msg = (f"[BACKUP v{__version__}] FAIL TFB_BACKUP_FOLDER_ID not set — "
                f"create a Drive folder, share EDITOR with {email}, add the "
@@ -468,10 +781,16 @@ def run_backup(dry_run: bool) -> int:
         _out("ERROR: " + msg)
         append_run_log("FAIL", msg, {"setup": "folder_id_missing"})
         return 2
+    if dest == "gcs" and not container:                    # v1.3.0
+        msg = (f"[BACKUP v{__version__}] FAIL TFB_BACKUP_DEST=gcs but "
+               f"TFB_BACKUP_GCS_BUCKET not set")
+        _out("ERROR: " + msg)
+        append_run_log("FAIL", msg, {"setup": "gcs_bucket_missing"})
+        return 2
 
     today = _now_riyadh().date()
     try:
-        up = drive_upload_resumable(sess, folder_id, daily_name(today), data)
+        up = _store_upload(dsess, dest, container, daily_name(today), data)
     except Exception as e:  # noqa: BLE001
         email = _creds_email(creds)
         reason = _api_reason(e)          # v1.2.0: Google's own words
@@ -479,13 +798,29 @@ def run_backup(dry_run: bool) -> int:
         if "404" in _err:
             # Drive answers 404 for a parent this account cannot SEE,
             # which covers BOTH "not shared" and "wrong id" — say both.
-            _hint = ("folder_id " + repr(folder_id) + " is not visible to "
+            _hint = (("bucket " + repr(container) + " not found for "
+                      + email + " — check the name and that the bucket "
+                      "exists in this project")
+                     if dest == "gcs" else
+                     ("app folder " + repr(container) + " vanished between "
+                      "resolution and upload — re-run; the folder is "
+                      "recreated automatically")
+                     if dest == "oauth" else
+                     "folder_id " + repr(folder_id) + " is not visible to "
                      + email + " — either share that Drive folder with it "
                      "as EDITOR, or the id is wrong (it must be the bare "
                      "id from drive.google.com/drive/folders/<ID>, no "
                      "?usp=... tail)")
         elif "403" in _err:
-            _hint = _403_remedy(reason, email, folder_id)
+            _hint = (("bucket " + repr(container) + " refused the write for "
+                  + email + " — grant it the Storage Object Admin role "
+                  "(roles/storage.objectAdmin) on that bucket")
+                 if dest == "gcs" else
+                 ("the operator grant refused the write — re-run consent "
+                  "for scope drive.file and refresh "
+                  "TFB_BACKUP_OAUTH_REFRESH_TOKEN")
+                 if dest == "oauth"
+                 else _403_remedy(reason, email, folder_id))
         else:
             _hint = "is the folder shared EDITOR with " + email + "?"
         msg = (f"[BACKUP v{__version__}] FAIL upload: {e}"
@@ -496,14 +831,14 @@ def run_backup(dry_run: bool) -> int:
         return 3
     _out(f"uploaded {up.get('name')} id={up.get('id')}")
 
-    listing = drive_list(sess, folder_id)
+    listing = _store_list(dsess, dest, container)
     names = [f.get("name", "") for f in listing]
 
     monthly_done = ""
     if monthly_needed(today, names):
         mn = monthly_name(today)
         try:
-            drive_copy(sess, up["id"], folder_id, mn)
+            _store_copy(dsess, dest, container, up["id"], mn)
             monthly_done = mn
             names.append(mn)
             _out(f"monthly copy created: {mn}")
@@ -520,7 +855,7 @@ def run_backup(dry_run: bool) -> int:
         if not fid:
             continue
         try:
-            drive_delete(sess, fid)
+            _store_delete(dsess, dest, container, fid)
             deleted += 1
         except Exception as e:  # noqa: BLE001
             _out(f"WARN: prune failed for {n}: {e}")
@@ -542,20 +877,31 @@ def run_restore_test() -> int:
     """Acceptance criterion (Register §8): a backup never restored is a hope.
     Downloads the newest DAILY_, opens it, asserts the core tabs, logs."""
     folder_id = _drive_id(_env("TFB_BACKUP_FOLDER_ID"))   # v1.1.0 [B]
-    if not folder_id:
-        _out("ERROR: TFB_BACKUP_FOLDER_ID not set")
-        return 2
+    dest = _backup_dest()                                 # v1.3.0 / v1.4.0
+    container = _gcs_bucket() if dest == "gcs" else folder_id
     _creds = _credentials()
     sess = _session(_creds)
-    _out(f"preflight: account={_creds_email(_creds)} "
-         f"folder_id={folder_id} mode=restore-test")
+    if dest == "oauth":                                   # v1.4.0
+        try:
+            sess = _oauth_session()
+            container = drive_ensure_app_folder(sess, _oauth_folder_name())
+        except Exception as e:  # noqa: BLE001
+            msg = f"[RESTORE-TEST v{__version__}] FAIL oauth setup: {e}"
+            _out("ERROR: " + msg)
+            append_run_log("FAIL", msg, {"stage": "oauth"})
+            return 2
+    if not container:
+        _out("ERROR: " + ("TFB_BACKUP_GCS_BUCKET not set" if dest == "gcs"
+                          else "TFB_BACKUP_FOLDER_ID not set"))
+        return 2
+    _out(f"preflight: dest={dest} container={container} mode=restore-test")
     try:
-        listing = drive_list(sess, folder_id)
+        listing = _store_list(sess, dest, container)
     except Exception as e:  # noqa: BLE001  v1.1.0: name the cause
         _r = _api_reason(e)              # v1.2.0
         msg = (f"[RESTORE-TEST v{__version__}] FAIL list: {e}"
                + (f" [api_reason={_r}]" if _r else "")
-               + f" — folder {folder_id!r} not readable by "
+               + f" — {dest} container {container!r} not readable by "
                + _creds_email(_creds))
         _out("ERROR: " + msg)
         append_run_log("FAIL", msg, {"stage": "list"})
@@ -570,7 +916,7 @@ def run_restore_test() -> int:
         return 3
     target = dailies[0]
     t0 = time.monotonic()
-    data = drive_download(sess, target["id"])
+    data = _store_download(sess, dest, container, target["id"])
     from openpyxl import load_workbook  # CI-only import
     wb = load_workbook(io.BytesIO(data), read_only=True)
     tabs = set(wb.sheetnames)
