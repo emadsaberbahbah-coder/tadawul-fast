@@ -884,6 +884,49 @@ from urllib.error import HTTPError, URLError
 # restores v6.21.1 verbatim; default ON so protection never depends on
 # remembering a flag before a confirmed action lands.
 # -----------------------------------------------------------------------------
+# =========================================================================
+# v6.29.0 (2026-07-26) — WAVE B: S-1 CRITERION 4 GETS A REAL NUMBER
+# =========================================================================
+# WHAT WAS MISSING. run_shadow_scorer has passed the LITERAL STRING
+# "PENDING" into evaluate_s1() for criterion 4 since the gate was written —
+# "calibration error within band on 7D/14D checkpoints" was never computed
+# by anything. v6.23.0 instrumented the DATA (1W/2W checkpoint records,
+# live since 2026-07-19, target_roi = the 1M thesis time-scaled to the
+# elapsed window). This release adds the MEASUREMENT and publishes it.
+# THE METRIC. Per matured checkpoint record: error_pp = realized_roi -
+# target_roi, in PERCENTAGE POINTS (both fields are already percentages).
+# The gate reads MEAN ABSOLUTE error — a symmetric miss, over- or
+# under-shooting, is a miss. The signed mean is published beside it
+# because it separates NOISE (abs high, signed ~0) from BIAS (both high,
+# same sign), and a systematically optimistic forecast is a different
+# disease from a noisy one. Neither number feeds any recommendation.
+# WHY ONLY records with a REAL target: _derive_checkpoint_target returns
+# (0.0, 0.0) when no 1M forecast existed — "a checkpoint is never invented
+# from nothing". Those rows carry target_roi == 0.0 and are EXCLUDED, not
+# scored as a perfect-zero forecast, which would flatter the error toward
+# whatever the realized ROI happened to be.
+# THE SAMPLE GATE IS THE HONEST GATE. state is PENDING until at least
+# TFB_S1_CAL_MIN_SAMPLE (default 20) qualifying checkpoints exist. This is
+# deliberately the ONLY activation gate — no calendar date. A date gate
+# would let the criterion answer on 3 records because a day passed; the
+# sample gate makes it answer when the evidence can support an answer,
+# which is the whole reason criterion 4 exists. Deployment is therefore
+# safe on any date: with today's handful of matured checkpoints the state
+# is PENDING, exactly as the hardcoded string was.
+# THE BAND. TFB_S1_CAL_BAND_PP, default 10.0 percentage points on the mean
+# absolute error. This is an OPERATOR THRESHOLD, not a derived constant,
+# and it is published in the row so no reader has to guess what "in band"
+# meant on the day the verdict was taken. It is NOT tuned to make the
+# current data pass — nobody has seen the current data yet.
+# PUBLICATION. One overwrite-in-place block on the _S1_Calibration tab.
+# run_shadow_scorer v1.4.0 reads it and fails SAFE to PENDING on anything
+# unexpected: a missing tab, an unreadable row, a stale as_of. A gate that
+# cannot read its evidence must never award a PASS.
+# DEFAULT ON (TFB_S1_CALIBRATION=0 disables). Publishing a measurement
+# cannot change a recommendation; the consumer side is what gates the
+# verdict, and it defaults to the honest PENDING until the sample lands.
+# =========================================================================
+
 # v6.23.0 (2026-07-19) — 7D/14D CHECKPOINT HORIZONS (Wave B, S-1 critical path)
 # WHY: Master Plan v2.1 §8 defines 7D/14D as CHECKPOINTS-NOT-MATURITIES, and
 # §15 criterion 4 ("calibration error within band on 7D/14D checkpoints")
@@ -1051,7 +1094,7 @@ from urllib.error import HTTPError, URLError
 # _mk_primary/_mk_legacy/_mk_sheetrows are new nested defs, not
 # replacements).
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.28.0"
+SCRIPT_VERSION = "6.29.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -2336,6 +2379,103 @@ def _mature_grace_days() -> int:
 # =============================================================================
 # Enums & Data Models
 # =============================================================================
+# --------------------------------------------------------------------- #
+# v6.29.0 [WAVE B] S-1 criterion-4 checkpoint calibration                #
+# --------------------------------------------------------------------- #
+S1_CAL_TAB = "_S1_Calibration"
+S1_CAL_HEADER = [
+    "As Of (Riyadh)", "State", "N Checkpoints", "Mean Abs Error (pp)",
+    "Mean Signed Error (pp)", "Band (pp)", "Min Sample", "By Horizon",
+    "Detail", "Writer Version",
+]
+
+
+def _s1_cal_enabled() -> bool:
+    return (os.getenv("TFB_S1_CALIBRATION") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _s1_cal_band_pp() -> float:
+    try:
+        return abs(float((os.getenv("TFB_S1_CAL_BAND_PP") or "10").strip()))
+    except Exception:
+        return 10.0
+
+
+def _s1_cal_min_sample() -> int:
+    try:
+        return max(1, int(float((os.getenv("TFB_S1_CAL_MIN_SAMPLE")
+                                 or "20").strip())))
+    except Exception:
+        return 20
+
+
+def s1_checkpoint_calibration(records: Any) -> Dict[str, Any]:
+    """v6.29.0 [WAVE B] — the criterion-4 measurement. PURE: no I/O, no
+    clock, no env beyond the two published thresholds. Never raises.
+
+    Qualifying record: horizon in {1W, 2W} AND status MATURED AND
+    realized_roi is not None AND target_roi != 0 (a zero target means no
+    1M forecast existed, so there is no forecast to score).
+    """
+    band = _s1_cal_band_pp()
+    min_sample = _s1_cal_min_sample()
+    out: Dict[str, Any] = {
+        "state": "PENDING", "n": 0, "mean_abs_error_pp": None,
+        "mean_signed_error_pp": None, "band_pp": band,
+        "min_sample": min_sample, "by_horizon": {},
+        "detail": "no qualifying checkpoints yet",
+    }
+    errs: List[float] = []
+    per_hz: Dict[str, List[float]] = {}
+    try:
+        for r in (records or []):
+            hz = getattr(getattr(r, "horizon", None), "value", None)
+            if hz not in ("1W", "2W"):
+                continue
+            if getattr(r, "status", None) != PerformanceStatus.MATURED:
+                continue
+            realized = getattr(r, "realized_roi", None)
+            if realized is None:
+                continue
+            target = _safe_float(getattr(r, "target_roi", 0.0), default=0.0)
+            if target == 0.0:
+                continue                      # no forecast to score
+            err = float(realized) - float(target)
+            errs.append(err)
+            per_hz.setdefault(hz, []).append(err)
+    except Exception as exc:                  # measurement never breaks a run
+        out["detail"] = f"calibration_error:{type(exc).__name__}"
+        return out
+
+    n = len(errs)
+    out["n"] = n
+    out["by_horizon"] = {
+        k: {"n": len(v), "mean_abs_pp": round(sum(abs(x) for x in v) / len(v), 2)}
+        for k, v in sorted(per_hz.items()) if v
+    }
+    if n == 0:
+        return out
+    mean_abs = sum(abs(x) for x in errs) / float(n)
+    mean_signed = sum(errs) / float(n)
+    out["mean_abs_error_pp"] = round(mean_abs, 2)
+    out["mean_signed_error_pp"] = round(mean_signed, 2)
+    if n < min_sample:
+        out["state"] = "PENDING"
+        out["detail"] = (f"{n}/{min_sample} checkpoints — sample too small "
+                         f"to decide (mean |err| {mean_abs:.2f}pp so far)")
+        return out
+    in_band = mean_abs <= band
+    out["state"] = "PASS" if in_band else "FAIL"
+    _bias = ("optimistic" if mean_signed < 0 else "conservative")
+    _bias_note = (f" ({_bias} bias)" if abs(mean_signed) >= band / 2.0
+                  else " (no strong directional bias)")
+    out["detail"] = (
+        f"mean |err| {mean_abs:.2f}pp vs band {band:.2f}pp over n={n}; "
+        f"signed {mean_signed:+.2f}pp" + _bias_note)
+    return out
+
+
 class PerformanceStatus(str, Enum):
     ACTIVE = "active"
     MATURED = "matured"
@@ -6465,6 +6605,56 @@ class PerformanceTrackerApp:
         except Exception as e:
             logger.warning("[v6.20.0 VT-1] run-log verdict skipped: %s", e)
 
+    def _publish_s1_calibration(self, records: Any) -> bool:
+        """v6.29.0 [WAVE B]: compute criterion-4 calibration and overwrite
+        the _S1_Calibration block. Returns True on a successful write.
+        Never raises — the caller treats this as best-effort telemetry."""
+        if not _s1_cal_enabled():
+            return False
+        try:
+            rep_ = s1_checkpoint_calibration(records)
+            _out(
+                f"S-1 CRITERION 4 (checkpoint calibration): {rep_['state']} "
+                f"— {rep_['detail']}"
+            )
+            if not (self.store and self.store.is_available()
+                    and getattr(self.store, "sheet", None)):
+                logger.warning("[v6.29.0 WAVE-B] no sheet handle — "
+                               "calibration computed but not published")
+                return False
+            sheet = self.store.sheet
+            try:
+                ws = sheet.worksheet(S1_CAL_TAB)
+            except Exception:
+                ws = sheet.add_worksheet(title=S1_CAL_TAB, rows=20,
+                                         cols=len(S1_CAL_HEADER) + 2)
+            by_hz = "; ".join(
+                f"{k} n={v['n']} |err|={v['mean_abs_pp']}pp"
+                for k, v in (rep_.get("by_horizon") or {}).items()
+            ) or "-"
+            row = [
+                _riyadh_now().strftime("%Y-%m-%d %H:%M:%S"),
+                rep_["state"],
+                rep_["n"],
+                "" if rep_["mean_abs_error_pp"] is None
+                else rep_["mean_abs_error_pp"],
+                "" if rep_["mean_signed_error_pp"] is None
+                else rep_["mean_signed_error_pp"],
+                rep_["band_pp"],
+                rep_["min_sample"],
+                by_hz,
+                rep_["detail"],
+                SCRIPT_VERSION,
+            ]
+            self.store.backoff.execute_sync(
+                ws.update, "A1", [S1_CAL_HEADER, row]
+            )
+            return True
+        except Exception as exc:
+            logger.warning("[v6.29.0 WAVE-B] calibration publish failed: %s",
+                           exc)
+            return False
+
     def _track_selftest_(self) -> bool:
         """v6.21.0 ST-1: prove the guards on canned fixtures before any
         recording. Records PASS/FAIL into the verdict; guards stay ON
@@ -6618,6 +6808,17 @@ class PerformanceTrackerApp:
         self._track_selftest_()  # v6.21.0 ST-1
         if self.args.audit:
             records = await self.audit_active_records(records)
+            # v6.29.0 [WAVE B]: publish the S-1 criterion-4 measurement
+            # from the freshly-audited records. Strictly non-blocking:
+            # a publication failure must never fail the clock, and the
+            # scorer fails safe to PENDING when the tab is unreadable.
+            try:
+                await loop.run_in_executor(
+                    _get_executor(), self._publish_s1_calibration, records
+                )
+            except Exception as _cal_e:
+                logger.warning("[v6.29.0 WAVE-B] calibration publish "
+                               "skipped: %s", _cal_e)
             if self.store.is_available():
                 await loop.run_in_executor(
                     _get_executor(), self.store.save_records, records
