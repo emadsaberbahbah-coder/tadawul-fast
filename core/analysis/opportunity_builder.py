@@ -792,7 +792,7 @@ from datetime import datetime, timedelta, timezone
 # Kills: TFB_COMPLIANCE_SURFACE_GATE=0 / TFB_ELIGIBILITY_GATE=0 restore the
 # v1.4.1 gate list byte-for-byte. Guards ship armed.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.7.0"
+OPPORTUNITY_BUILDER_VERSION = "1.8.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
