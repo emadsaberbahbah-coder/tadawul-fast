@@ -89,7 +89,32 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
+# v1.1.0 (2026-07-26) — SELF-DIAGNOSING AUTH + FOLDER ID. NO backup logic,
+# retention rule, export path, upload call or exit code changed.
+# WHY, from a real failed run (Actions #6, 2026-07-26): the export
+# SUCCEEDED (18,547,634 bytes) and the upload then returned
+#   "404 ... — is the folder shared EDITOR with ??"
+# Two defects made a one-line problem into a guessing game:
+#  [A] THE EMAIL PRINTED AS "??". _credentials() stamps
+#      _tfb_client_email ONLY on the inline-JSON branch. Every workflow in
+#      this repo materializes the secret to a FILE and exports
+#      GOOGLE_APPLICATION_CREDENTIALS, so the file branch is the one that
+#      ALWAYS runs in CI — and it never stamped the address. The single
+#      fact needed to fix the failure was the one fact the error could not
+#      state. Now read from the file and stamped on both branches.
+#  [B] A PASTED FOLDER ID IS SILENTLY WRONG. Drive's "Copy link" yields
+#      .../folders/<ID>?usp=drive_link; pasting that whole tail into the
+#      variable sends "<ID>?usp=drive_link" to the API, which answers 404
+#      — indistinguishable from a genuine permission problem. _drive_id()
+#      now extracts the id from a full URL, strips any query/fragment, and
+#      SAYS SO when it had to alter the operator's value.
+# Also: a preflight line names the account, the folder id and the sheet id
+# BEFORE the 13-second export, so a misconfigured run is obvious at the top
+# of the log; and a failed upload/list re-states the account and folder
+# with the exact sharing instruction. 404 is called what it is — the
+# folder is invisible to THIS account, which is Drive's answer for both
+# "not shared" and "wrong id".
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 _XLSX_MIME = ("application/vnd.openxmlformats-officedocument"
@@ -162,8 +187,20 @@ def _credentials():
               "https://www.googleapis.com/auth/spreadsheets"]
     path = _env("GOOGLE_APPLICATION_CREDENTIALS")
     if path and os.path.exists(path):
-        return service_account.Credentials.from_service_account_file(
+        creds = service_account.Credentials.from_service_account_file(
             path, scopes=scopes)
+        # v1.1.0 [A]: the branch CI actually takes must name its identity.
+        # service_account_email is the library's own attribute; the file
+        # read is a belt-and-braces fallback and never fatal.
+        email = getattr(creds, "service_account_email", "") or ""
+        if not email:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    email = json.load(fh).get("client_email", "") or ""
+            except Exception:
+                email = ""
+        creds._tfb_client_email = email or "?"
+        return creds
     raw = (_env("GOOGLE_SHEETS_CREDENTIALS")
            or _env("GOOGLE_SHEETS_CREDENTIALS_B64")
            or _env("GOOGLE_CREDENTIALS"))
@@ -182,6 +219,35 @@ def _credentials():
         info, scopes=scopes)
     creds._tfb_client_email = info.get("client_email", "?")  # for error help
     return creds
+
+
+def _creds_email(creds) -> str:
+    """v1.1.0: the account this run authenticates as, whatever branch
+    _credentials() took. Never raises."""
+    return (getattr(creds, "_tfb_client_email", "")
+            or getattr(creds, "service_account_email", "")
+            or "?")
+
+
+def _drive_id(raw: str) -> str:
+    """v1.1.0 [B]: accept what an operator can realistically paste and
+    return the bare Drive id.
+
+    Handles a full folder URL, a "Copy link" tail (?usp=drive_link), a
+    trailing slash, surrounding quotes or whitespace. Pure and total: an
+    unrecognised value is returned trimmed rather than rejected, so this
+    can never turn a working configuration into a failure."""
+    v = (raw or "").strip().strip('"').strip("'")
+    if not v:
+        return ""
+    for marker in ("/folders/", "/d/"):
+        if marker in v:
+            v = v.split(marker, 1)[1]
+            break
+    for cut in ("?", "#", "/"):
+        if cut in v:
+            v = v.split(cut, 1)[0]
+    return v.strip()
 
 
 def _session(creds):
@@ -288,13 +354,27 @@ def append_run_log(status: str, message: str, details: Dict[str, Any]) -> None:
 # Modes                                                                       #
 # --------------------------------------------------------------------------- #
 def run_backup(dry_run: bool) -> int:
-    sheet_id = _env("DEFAULT_SPREADSHEET_ID") or _env("SPREADSHEET_ID")
-    folder_id = _env("TFB_BACKUP_FOLDER_ID")
+    _sheet_raw = _env("DEFAULT_SPREADSHEET_ID") or _env("SPREADSHEET_ID")
+    _folder_raw = _env("TFB_BACKUP_FOLDER_ID")
+    sheet_id = _drive_id(_sheet_raw)          # v1.1.0 [B]
+    folder_id = _drive_id(_folder_raw)        # v1.1.0 [B]
     if not sheet_id:
         _out("ERROR: DEFAULT_SPREADSHEET_ID not set")
         return 2
     creds = _credentials()
     sess = _session(creds)
+    # v1.1.0: preflight BEFORE the multi-second export, so a misconfigured
+    # run is visible at the top of the log rather than 13 seconds in.
+    _out(f"preflight: account={_creds_email(creds)} "
+         f"sheet_id={sheet_id} folder_id={folder_id or '(unset)'} "
+         f"dry_run={bool(dry_run)}")
+    if folder_id != _folder_raw.strip():
+        _out(f"NOTE: TFB_BACKUP_FOLDER_ID normalised from "
+             f"{_folder_raw.strip()!r} to {folder_id!r} — set the bare id "
+             f"in the repo Variable to remove this step")
+    if sheet_id != _sheet_raw.strip():
+        _out(f"NOTE: spreadsheet id normalised from {_sheet_raw.strip()!r} "
+             f"to {sheet_id!r}")
 
     t0 = time.monotonic()
     data = export_xlsx(sess, sheet_id)
@@ -325,9 +405,16 @@ def run_backup(dry_run: bool) -> int:
     try:
         up = drive_upload_resumable(sess, folder_id, daily_name(today), data)
     except Exception as e:  # noqa: BLE001
-        email = getattr(creds, "_tfb_client_email", "?")
-        msg = (f"[BACKUP v{__version__}] FAIL upload: {e} — is the folder "
-               f"shared EDITOR with {email}?")
+        email = _creds_email(creds)
+        # v1.1.0: Drive answers 404 for a parent this account cannot SEE,
+        # which covers BOTH "not shared" and "wrong id" — say both.
+        _hint = ("folder_id " + repr(folder_id) + " is not visible to "
+                 + email + " — either share that Drive folder with it as "
+                 "EDITOR, or the id is wrong (it must be the bare id from "
+                 "drive.google.com/drive/folders/<ID>, no ?usp=... tail)"
+                 if "404" in str(e) else
+                 "is the folder shared EDITOR with " + email + "?")
+        msg = (f"[BACKUP v{__version__}] FAIL upload: {e} — {_hint}")
         _out("ERROR: " + msg)
         append_run_log("FAIL", msg, {"stage": "upload"})
         return 3
@@ -378,12 +465,22 @@ def run_backup(dry_run: bool) -> int:
 def run_restore_test() -> int:
     """Acceptance criterion (Register §8): a backup never restored is a hope.
     Downloads the newest DAILY_, opens it, asserts the core tabs, logs."""
-    folder_id = _env("TFB_BACKUP_FOLDER_ID")
+    folder_id = _drive_id(_env("TFB_BACKUP_FOLDER_ID"))   # v1.1.0 [B]
     if not folder_id:
         _out("ERROR: TFB_BACKUP_FOLDER_ID not set")
         return 2
-    sess = _session(_credentials())
-    listing = drive_list(sess, folder_id)
+    _creds = _credentials()
+    sess = _session(_creds)
+    _out(f"preflight: account={_creds_email(_creds)} "
+         f"folder_id={folder_id} mode=restore-test")
+    try:
+        listing = drive_list(sess, folder_id)
+    except Exception as e:  # noqa: BLE001  v1.1.0: name the cause
+        msg = (f"[RESTORE-TEST v{__version__}] FAIL list: {e} — folder "
+               f"{folder_id!r} not visible to {_creds_email(_creds)}")
+        _out("ERROR: " + msg)
+        append_run_log("FAIL", msg, {"stage": "list"})
+        return 3
     dailies = sorted((f for f in listing
                       if _DAILY_RE.match(f.get("name", ""))),
                      key=lambda f: f.get("name", ""), reverse=True)
