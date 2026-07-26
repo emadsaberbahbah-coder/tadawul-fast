@@ -59,7 +59,34 @@ import tempfile
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
+# v1.2.0 (2026-07-26) — NO_SOURCE STOPS PASSING SILENTLY.
+# WHY, from run #2 (2026-07-26): the job found an empty _Shariah_Upload
+# tab, printed a ::warning::, and RETURNED 0. GitHub showed a green tick.
+# That is the "green over nothing" class: this workflow is on a QUARTERLY
+# cron (1 Jan/Apr/Jul/Oct), and nobody pre-pastes the list before a
+# scheduled run — so the normal scheduled outcome was a success badge over
+# a refresh that refreshed nothing. Meanwhile shariah_authority v1.1.0
+# stops serving the index once the snapshot passes its max age, so the
+# authority would go FAIL_CLOSED with every prior run reporting healthy.
+# A refresh job that can report success without refreshing is worse than
+# no job: it manufactures confidence.
+# FIX: NO_SOURCE now consults the LIVE snapshot age and escalates.
+#   runway comfortable  -> exit 0 + warning   (unchanged, stays quiet)
+#   runway short        -> exit 3 + ::error:: (workflow RED, e-mail sent)
+# "Short" = the snapshot is within TFB_SHARIAH_REFRESH_ALERT_DAYS (default
+# 30) of the max age enforced by the reader, or already past it. The
+# threshold is read from the SAME env chain shariah_authority uses
+# (TFB_SHARIAH_MAX_AGE_DAYS -> TFB_COMPLIANCE_AUTHORITY_MAX_AGE_DAYS ->
+# 120) so the alarm can never drift away from the rule it guards.
+# WHY NOT ALWAYS RED: a hard failure on every empty tab would train the
+# operator to ignore this workflow for the ten months a year when the
+# snapshot is perfectly fresh — the same alarm-fatigue trade the verifier
+# makes. The alarm fires when, and only when, it means something.
+# UNDATED SNAPSHOT counts as expired: an authority list with no As Of
+# cannot be shown to be current, matching shariah_authority v1.1.0.
+# NOTHING ELSE CHANGES: parsing, status mapping, hashing, publication and
+# every success path are byte-identical.
 RULE_VERSION = "RAJHI-2026Q3-pending-official-capture"   # updated by E0.4
 TAB_AUTH = "_Shariah_Authority"
 TAB_UPLOAD = "_Shariah_Upload"
@@ -269,6 +296,75 @@ def read_upload_tab(sh) -> Tuple[List[Tuple[str, str]], Optional[str]]:
             as_of = row[2].strip()[:10]
     return sorted(set(pairs)), as_of
 
+def _authority_max_age_days() -> int:
+    """v1.2.0: the SAME chain core.shariah_authority reads, so the alarm
+    and the rule it guards can never disagree."""
+    for name in ("TFB_SHARIAH_MAX_AGE_DAYS",
+                 "TFB_COMPLIANCE_AUTHORITY_MAX_AGE_DAYS"):
+        raw = (os.getenv(name) or "").strip()
+        if raw:
+            try:
+                return max(0, int(float(raw)))
+            except Exception:
+                continue
+    return 120
+
+
+def _alert_days() -> int:
+    try:
+        return max(0, int(float((os.getenv("TFB_SHARIAH_REFRESH_ALERT_DAYS")
+                                 or "30").strip())))
+    except Exception:
+        return 30
+
+
+def live_snapshot_age_days(sh, today=None) -> Optional[int]:
+    """v1.2.0: age of the snapshot CURRENTLY published in _Shariah_Authority.
+    None means unreadable/absent — treated by the caller as expired, because
+    an authority that cannot be dated cannot be shown to be current.
+    Never raises: this is a diagnostic, not a gate."""
+    try:
+        vals = sh.worksheet(TAB_AUTH).get_all_values()
+    except Exception:
+        return None
+    if not vals or len(vals) < 2:
+        return None
+    header = [str(h).strip().lower() for h in vals[0]]
+    try:
+        col = header.index("as of")
+    except ValueError:
+        return None
+    ref = today or date.today()
+    best = None
+    for row in vals[1:]:
+        if len(row) <= col:
+            continue
+        raw = str(row[col]).strip()[:10]
+        if not raw:
+            continue
+        try:
+            d = datetime.strptime(raw, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        age = (ref - d).days
+        if best is None or age < best:
+            best = age            # newest edition present governs
+    return best
+
+
+def no_source_exit_code(age_days: Optional[int]) -> Tuple[int, str]:
+    """v1.2.0 -> (exit_code, severity). PURE, so the escalation rule is
+    testable without a sheet. 3/error when the runway is short or the age
+    is unknown; 0/warning while there is comfortable runway."""
+    limit = _authority_max_age_days()
+    alert = _alert_days()
+    if limit <= 0:                      # age enforcement disabled
+        return 0, "warning"
+    if age_days is None:
+        return 3, "error"               # undated == cannot be shown current
+    return (3, "error") if age_days >= (limit - alert) else (0, "warning")
+
+
 def append_run_log(sh, status: str, message: str, details: Dict) -> None:
     try:
         ws = sh.worksheet("_Run_Log")
@@ -332,12 +428,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         source, src_url = "OPERATOR_UPLOAD_TAB", TAB_UPLOAD
         doc_hash = upload_doc_hash(pairs, as_of) if pairs else ""
         if not pairs:
+            # v1.2.0: escalate on the LIVE snapshot age — see module WHY.
+            age = live_snapshot_age_days(sh)
+            code, sev = no_source_exit_code(age)
+            limit = _authority_max_age_days()
+            runway = ("unknown (published snapshot has no readable As Of)"
+                      if age is None
+                      else f"{max(0, limit - age)} day(s) before the reader "
+                           f"stops serving the index "
+                           f"(age {age}/{limit})")
             msg = (f"[shariah_refresh v{SCRIPT_VERSION}] NO SOURCE: paste the official "
                    f"list into '{TAB_UPLOAD}' (Symbol, Status) then dispatch again — "
-                   f"or set repo Variable TFB_SHARIAH_OFFICIAL_URLS (E0.4).")
-            print("::warning::" + msg)
-            append_run_log(sh, "NO_SOURCE", msg, {"version": SCRIPT_VERSION})
-            return 0
+                   f"or set repo Variable TFB_SHARIAH_OFFICIAL_URLS (E0.4). "
+                   f"Runway: {runway}.")
+            print(f"::{sev}::" + msg)
+            append_run_log(sh, "NO_SOURCE", msg,
+                           {"version": SCRIPT_VERSION, "age_days": age,
+                            "max_age_days": limit, "exit": code})
+            return code
 
     print(f"[shariah_refresh v{SCRIPT_VERSION}] mode={mode} rows={len(pairs)} "
           f"as_of={as_of} source={source} hash={doc_hash[:12]}")
