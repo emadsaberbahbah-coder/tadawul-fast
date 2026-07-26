@@ -476,7 +476,50 @@ from __future__ import annotations
 #       ticket from tonight's brief onward. Fix: tag-tolerant detection
 #       (INVEST anywhere in the note's first 60 chars; grace/exit notes
 #       carry no INVEST and remain excluded).
-__version__ = "1.15.1"
+__version__ = "1.16.0"
+# =========================================================================
+# v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
+# =========================================================================
+# EVIDENCE: the 2026-07-26 12:30 brief, read end-to-end.
+#
+# [L] NO EXECUTION LEVELS. Eight actions, not one price - no entry, no stop,
+#     no target. The operator standard is that a recommendation be directly
+#     executable: broker-side conditional orders with stop and TP taken from
+#     system levels. You could not place a single order from that document.
+#     The data was never missing: Portfolio_Decision already carries
+#     "Stop SAR"/"TP1 SAR"/"TP2 SAR" and Top_10_Investments adds "Entry
+#     Zone" - this reader simply never mapped the columns. Now it prints
+#     Stop/TP1 beside every action and Entry/Stop/TP1 beside every candidate.
+#
+# [N] THE REASONING WAS AMPUTATED. The Note column - the only column that
+#     explains anything - was hard-truncated at 52 characters, so every row
+#     ended mid-word: "EXIT-BY-RULE (S4.6...", "Position 40.4% > Max Position
+#     15...". The reader got the WHAT and was denied the WHY on every line.
+#     Note cells are now WRAPPING Paragraphs: nothing is cut, rows grow to
+#     fit. Same for candidate names, which lost their tails the same way.
+#
+# [K] THE HEADLINE KPI WAS THE LEAST TRUE NUMBER ON THE PAGE. "NEW BUYS: 2"
+#     sat in the largest type in the document while both names were, the same
+#     day, blocked on the other decision surface - one priced off a nine-day-
+#     stale quote that had FAILED verification. A candidate list is not a buy
+#     list. Replaced with ACTIONS TODAY, which counts what actually requires
+#     the operator to act and agrees with section 5 by construction.
+#     Candidates stay in section 4 where their caveats travel with them.
+#
+# WIDTH CAME FROM DROPPING DEAD COLUMNS, NOT FROM SHRINKING TYPE:
+#   section 1  -Name (the symbol identifies it) -ROI 12M (repeated verbatim
+#              in section 2)   => +49mm for Stop/TP1/Note
+#   section 4  -Market -Sector (a "United States / Energy" label never
+#              decided anything) => +49mm for Entry/Stop/TP1
+# Both tables still total exactly 180mm; the frame is unchanged. Also
+# "Rel" -> "Rel /100" (the scale was never stated) and section 3 numerics
+# right-aligned so magnitudes compare down the column.
+#
+# KILL-SWITCH: TFB_BRIEF_LEVELS=0 restores the v1.15.1 layout exactly. Level
+# PARSING still runs under the switch (additive, cannot fail a row); only the
+# rendering reverts. NOTHING about selection, ranking, gating, exclusion or
+# the action set changes here: this is a presentation build.
+# =========================================================================
 
 # v1.12.0 — MARKET-PAGE READ BOUND RAISED FOR THE 12,486-SYMBOL EXPANSION
 # WHY (2026-07-16): read_pages_live fetched every page via a hardcoded
@@ -712,6 +755,10 @@ def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:
         "note": _col_index(hdr, "Advisor Note"),
         "mv": _col_index(hdr, "MV SAR"),
         "cost": _col_index(hdr, "Cost SAR"),
+        # v1.16.0 [L]: on the sheet all along, never read until now.
+        "stop": _col_index(hdr, "Stop SAR", "Stop"),
+        "tp1": _col_index(hdr, "TP1 SAR", "TP1"),
+        "tp2": _col_index(hdr, "TP2 SAR", "TP2"),
     }
     for r in rows[h + 1:]:
         action = _s(_cell(r, ci["action"])).upper()
@@ -732,6 +779,11 @@ def extract_decision(rows: List[List[Any]]) -> Dict[str, Any]:
             "conf": _s(_cell(r, ci["conf"])),
             "note": note,
             "sar": _note_sar(note),
+            # v1.16.0 [L]: None when column/cell absent -> renders "-".
+            # A level is never invented.
+            "stop": _num(_cell(r, ci["stop"])),
+            "tp1": _num(_cell(r, ci["tp1"])),
+            "tp2": _num(_cell(r, ci["tp2"])),
         }
         mv, cost = _num(_cell(r, ci["mv"])), _num(_cell(r, ci["cost"]))
         if mv is not None:
@@ -1122,6 +1174,9 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
         "rel": _col_index(hdr, "Rel", "Forecast Reliability Score"),
         "conf": _col_index(hdr, "Conf", "Confidence Bucket"),
         "note": _col_index(hdr, "Advisor Note"),
+        "entry": _col_index(hdr, "Entry Zone", "Entry"),   # v1.16.0 [L]
+        "stop": _col_index(hdr, "Stop SAR", "Stop"),
+        "tp1": _col_index(hdr, "TP1 SAR", "TP1"),
     }
     for r in rows[h + 1:]:
         note = _s(_cell(r, ci["note"]))
@@ -1142,12 +1197,21 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
             "roi": _num(_cell(r, ci["roi"])),
             "rel": _num(_cell(r, ci["rel"])),
             "conf": _s(_cell(r, ci["conf"])) or "—",
+            "entry": _s(_cell(r, ci["entry"])),           # v1.16.0 [L]
+            "stop": _num(_cell(r, ci["stop"])),
+            "tp1": _num(_cell(r, ci["tp1"])),
         })
     top = picks[:top_n]
     rest: Dict[str, List[Dict[str, Any]]] = {}
     for p in picks[top_n:]:
         rest.setdefault(p["market"], []).append(p)
     return {"top": top, "rest": rest}
+
+
+def _brief_levels_enabled() -> bool:
+    """v1.16.0 kill-switch - default ON; =0 restores the v1.15.1 layout."""
+    return (os.getenv("TFB_BRIEF_LEVELS") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
 
 
 def _shadow_rotation_enabled() -> bool:
@@ -2495,6 +2559,21 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
             cmds += (extra or [])
             return TableStyle(cmds)
 
+        def _lvl(v) -> str:
+            """v1.16.0 [L]: a price level, or '-'. Never fabricates."""
+            try:
+                return "-" if v is None else f"{float(v):,.2f}"
+            except Exception:
+                return "-"
+
+        # v1.16.0 [N]: wrapping cell -> no truncation anywhere it is used.
+        st_cell = ParagraphStyle("cell", fontName="Helvetica", fontSize=6.6,
+                                 leading=8.0, textColor=ink)
+
+        def _wrap(v: Any) -> Any:
+            txt = _pdf_txt(v, 400).replace("&", "&amp;").replace("<", "&lt;")
+            return Paragraph(txt or "-", st_cell)
+
         story: List[Any] = []
 
         # ---- masthead band (matches the email's ink/brass identity) ----
@@ -2520,11 +2599,17 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
 
         # ---- KPI strip ----
         pl = d.get("pl_pct")
+        # v1.16.0 [K]: count what REQUIRES action. A candidate list is not a
+        # buy list, and "NEW BUYS" in the largest type on the page read as one.
+        _n_actions = (len(d["sell"]) + len(d["trim"]) + len(d["add"])
+                      + len(d.get("verify", [])))
+        _lv = _brief_levels_enabled()
         kpis = [("BOOK VALUE", f"{d['mv']:,.0f} SAR", gray6),
                 ("CURRENT ROI", _p(pl), (green if (pl or 0) >= 0 else red)),
                 ("FREED CASH", f"~{d['freed_cash']:,.0f} SAR", gray6),
                 ("HOLDINGS", str(len(holdings)), gray6),
-                ("NEW BUYS", str(len(t["top"])), gray6)]
+                (("ACTIONS TODAY" if _lv else "NEW BUYS"),
+                 (str(_n_actions) if _lv else str(len(t["top"]))), gray6)]
         cells = [Paragraph(f'<font color="#7E8AA0" size="6">{k}</font><br/>'
                            f'<font color="{v_c.hexval() if hasattr(v_c, "hexval") else INK}" size="10">'
                            f'<b>{_pdf_txt(v, 20)}</b></font>',
@@ -2542,24 +2627,39 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
         story.append(Paragraph("Actions come from the confidence-gated Portfolio_Decision layer. "
                                "Daily-horizon decision support - not advice; verify before acting.",
                                st_note))
-        rows: List[List[str]] = [["Action", "Symbol", "Name", "P&L %", "Wt %",
-                                  "ROI 12M", "Rel", "Note"]]
+        rows: List[List[Any]] = ([["Action", "Symbol", "P&L %", "Wt %",
+                                   "Rel /100", "Stop", "TP1", "Note"]] if _lv
+                                 else [["Action", "Symbol", "Name", "P&L %",
+                                        "Wt %", "ROI 12M", "Rel", "Note"]])
         extra = []
         for label, recs, hexc in (("EXIT/SELL", d["sell"], SELL_C), ("TRIM", d["trim"], TRIM_C),
                                   ("ADD", d["add"], ADD_C),
                                   ("VERIFY", d.get("verify", []), TRIM_C),
                                   ("HOLD", d["hold"], HOLD_C)):
             for r in recs:
-                rows.append([label, _pdf_txt(r["symbol"], 12), _pdf_txt(r["name"], 28),
-                             _pct(r.get("pl")), _pct(r.get("weight"), 1).lstrip("+"),
-                             _pct(r.get("eroi")), _num_str(r.get("rel")), _pdf_txt(r.get("note"), 52)])
+                if _lv:
+                    rows.append([label, _pdf_txt(r["symbol"], 12),
+                                 _pct(r.get("pl")),
+                                 _pct(r.get("weight"), 1).lstrip("+"),
+                                 _num_str(r.get("rel")), _lvl(r.get("stop")),
+                                 _lvl(r.get("tp1")), _wrap(r.get("note"))])
+                else:
+                    rows.append([label, _pdf_txt(r["symbol"], 12), _pdf_txt(r["name"], 28),
+                                 _pct(r.get("pl")), _pct(r.get("weight"), 1).lstrip("+"),
+                                 _pct(r.get("eroi")), _num_str(r.get("rel")), _pdf_txt(r.get("note"), 52)])
                 ri = len(rows) - 1
                 extra.append(("TEXTCOLOR", (0, ri), (0, ri), colors.HexColor(hexc)))
                 extra.append(("FONTNAME", (0, ri), (0, ri), "Helvetica-Bold"))
         if len(rows) == 1:
             rows.append(["-", "-", "no holdings parsed", "-", "-", "-", "-", "-"])
-        extra.append(("ALIGN", (3, 1), (6, -1), "RIGHT"))
-        story.append(Table(rows, colWidths=[17*mm, 17*mm, 36*mm, 12*mm, 10*mm, 13*mm, 9*mm, 66*mm],
+        extra.append(("ALIGN", (2, 1), (6, -1), "RIGHT"))
+        # 17+17+12+10+13+16+16+79 = 180mm  (unchanged frame; Name/ROI 12M
+        # dropped, Stop/TP1 added, the remainder given to Note)
+        story.append(Table(rows,
+                           colWidths=([17*mm, 17*mm, 12*mm, 10*mm, 13*mm,
+                                       16*mm, 16*mm, 79*mm] if _lv else
+                                      [17*mm, 17*mm, 36*mm, 12*mm, 10*mm,
+                                       13*mm, 9*mm, 66*mm]),
                            repeatRows=1, style=_base(extra)))
 
         # ---- 2) Portfolio — current ROI & key ratios ----
@@ -2615,28 +2715,54 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
         _pdf_all = list(t["top"]) + [p for names in (t.get("rest") or {}).values()
                                      for p in names]
         _sat4 = _fv_saturation(_pdf_all)
-        rows4: List[List[str]] = [["#", "Symbol", "Name", "Market", "Sector", "To FV %", "Rel", "Conf"]]
+        rows4: List[List[Any]] = ([["#", "Symbol", "Name", "To FV %", "Rel /100",
+                                    "Conf", "Entry", "Stop", "TP1"]] if _lv
+                                  else [["#", "Symbol", "Name", "Market",
+                                         "Sector", "To FV %", "Rel", "Conf"]])
         n = 0
         for p in t["top"]:
             n += 1
-            rows4.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 28),
-                          _pdf_txt(p["market"], 14), _pdf_txt(p["sector"], 16),
-                          _fv_display(p.get("roi"), _sat4, 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
+            if _lv:
+                rows4.append([str(n), _pdf_txt(p["symbol"], 12), _wrap(p["name"]),
+                              _fv_display(p.get("roi"), _sat4, 0),
+                              _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10),
+                              _pdf_txt(p.get("entry"), 18) or "-",
+                              _lvl(p.get("stop")), _lvl(p.get("tp1"))])
+            else:
+                rows4.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 28),
+                              _pdf_txt(p["market"], 14), _pdf_txt(p["sector"], 16),
+                              _fv_display(p.get("roi"), _sat4, 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
         for market, names in (t.get("rest") or {}).items():
             for p in names:
                 n += 1
-                rows4.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 28),
-                              _pdf_txt(market, 14), _pdf_txt(p.get("sector"), 16),
-                              _fv_display(p.get("roi"), _sat4, 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
+                if _lv:
+                    rows4.append([str(n), _pdf_txt(p["symbol"], 12), _wrap(p["name"]),
+                                  _fv_display(p.get("roi"), _sat4, 0),
+                                  _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10),
+                                  _pdf_txt(p.get("entry"), 18) or "-",
+                                  _lvl(p.get("stop")), _lvl(p.get("tp1"))])
+                else:
+                    rows4.append([str(n), _pdf_txt(p["symbol"], 12), _pdf_txt(p["name"], 28),
+                                  _pdf_txt(market, 14), _pdf_txt(p.get("sector"), 16),
+                                  _fv_display(p.get("roi"), _sat4, 0), _num_str(p.get("rel")), _pdf_txt(p.get("conf"), 10)])
         if len(rows4) == 1:
-            rows4.append(["-", "-", "no funded candidates today", "-", "-", "-", "-", "-"])
+            rows4.append(["-", "-", "no funded candidates today", "-", "-",
+                          "-", "-", "-"] + (["-"] if _lv else []))
         if _sat4 is not None:
             story.append(Paragraph("≥ = the engine's fair-value display ceiling; "
                                    "the true gap is at least the figure shown. "
                                    "1M/3M/12M outlooks remain differentiated.", st_note))
-        story.append(Table(rows4, colWidths=[7*mm, 17*mm, 45*mm, 21*mm, 28*mm, 14*mm, 9*mm, 39*mm],
+        # 7+17+50+16+13+18+21+19+19 = 180mm (Market/Sector dropped for levels)
+        story.append(Table(rows4,
+                           colWidths=([7*mm, 17*mm, 50*mm, 16*mm, 13*mm, 18*mm,
+                                       21*mm, 19*mm, 19*mm] if _lv else
+                                      [7*mm, 17*mm, 45*mm, 21*mm, 28*mm, 14*mm,
+                                       9*mm, 39*mm]),
                            repeatRows=1,
-                           style=_base([("ALIGN", (5, 1), (6, -1), "RIGHT")])))
+                           style=_base([("ALIGN", (3, 1), (4, -1), "RIGHT"),
+                                        ("ALIGN", (7, 1), (-1, -1), "RIGHT")]
+                                       if _lv else
+                                       [("ALIGN", (5, 1), (6, -1), "RIGHT")])))
 
         # ---- 5) Action summary (END) ----
         story.append(Paragraph("5 - Action summary", st_h2))
