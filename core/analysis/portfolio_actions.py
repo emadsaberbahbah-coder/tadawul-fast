@@ -374,9 +374,11 @@ from datetime import datetime, timedelta, timezone
 # comparison itself is a category error: max_sector_pct limits concentration
 # in an equity SECTOR. A sukuk is a fixed-income allocation; measuring it
 # against an equity-sector cap answers a question nobody asked.
-# CONSEQUENCE OF THE BUG: a permanent false "over cap" alert. No TRIM was ever
-# emitted for it (D-9 protects sukuk from the sell side), so nothing was
-# mis-traded — but a standing false alert erodes trust in the real ones.
+# CONSEQUENCE OF THE BUG: a permanent false "over cap" alert. At the time of
+# writing no TRIM had ever been emitted for it (D-9 protected sukuk from the
+# sell side), so nothing was mis-traded — but a standing false alert erodes
+# trust in the real ones. [SUPERSEDED 2026-07-27: that parenthetical stopped
+# being true on 2026-07-23 when Rule 1b landed and bypassed D-9. See v1.7.3.]
 # FIX: sukuk holdings aggregate into their own "Sukuk (fixed income)" bucket,
 # reported with its true weight for visibility but EXEMPT from the equity
 # sector cap (cap_pct None, over_cap False, exempt True). Detection reuses
@@ -533,7 +535,46 @@ from datetime import datetime, timedelta, timezone
 # Rationale: this gate may only ever NARROW. Over-blocking is printed on the
 # holding and reversible in one env flip; under-blocking is invisible and puts
 # money into a name the engine refused. Zero functions removed.
-PORTFOLIO_ACTIONS_VERSION = "1.7.2"
+# -----------------------------------------------------------------------------
+# v1.7.3 (2026-07-27, operator-approved) — RULE 1b HONOURS D-9: A SUKUK IS NOT
+# TRIMMED TO SATISFY AN EQUITY POSITION CAP
+# EVIDENCE (live board 2026-07-27 13:50, Portfolio_Decision):
+#     TRIM | 5023.SR | 29 of 100 units | -2,976 SAR
+#     "TRIM-BY-RULE (§4.6): risk-budget breach — Position 21.2% > Max Position
+#      15.0% — trim to cap — not confidence-cappable (reliability 26.2)"
+# 5023.SR is Arabian Centres Sukuk. compliance_gate.EXPLICIT_ASSET_CLASS maps
+# it to SUKUK on the SYMBOL and that map wins before any name matching, so
+# detection was never the problem — _is_sukuk_holding() has always returned
+# True for this holding, blank Name column notwithstanding.
+# ROOT CAUSE — TWO ARMED RULES THAT CONTRADICT EACH OTHER:
+#   D-9  (v1.2.1, 2026-07-18) "a SUKUK-class holding is never a SELL leg".
+#        Enforced ONLY inside advisor_switch_scan().
+#   1b   (v1.5.0, 2026-07-23) "a cap breach is arithmetic, not a signal, and
+#        is therefore uncappable" — written with 5023.SR as its own worked
+#        example ("the 5023.SR 28.6%-vs-15% lesson"), and never consulting
+#        _is_sukuk_holding(). Five days apart, opposite verdicts on the same
+#        instrument. Rule 1b wins because it sits downstream in the same
+#        function, so D-9 fails SILENTLY — no error, no log line, no alert.
+# WHY THE EXEMPTION IS CORRECT AND NOT A LOOSENING: max_position_pct bounds
+# concentration risk in an EQUITY position. A sukuk is a fixed-income
+# allocation held as a capital-preservation anchor; trimming it to satisfy an
+# equity cap is the same category error v1.3.0 already identified for
+# max_sector_pct — "answers a question nobody asked". The instrument's true
+# weight stays fully visible on the holdings table and in the sector summary,
+# so the allocation is never hidden; only the mechanical SELL is withheld.
+# SCOPE, deliberately narrow: the POSITION-cap branch only. The sector-cap
+# branch is untouched — TFB_PA_SUKUK_ASSET_CLASS already owns that half and
+# arming it is the operator's separate decision.
+# GATE: rides on the EXISTING TFB_PA_PROTECT_SUKUK (default ON) — no new
+# environment variable. TFB_PA_PROTECT_SUKUK=0 restores v1.7.2 byte-identically
+# for every input, sukuk and non-sukuk alike.
+# FAIL-OPEN: inherits D-9's contract — if core.compliance_gate is unavailable
+# _is_sukuk_holding() returns False and the trim is emitted exactly as v1.7.2.
+# _cap_trims() gains an OPTIONAL `cand` parameter defaulting to None; omitting
+# it reproduces v1.7.2 verbatim, so the "shared verbatim by two call sites"
+# invariant of v1.5.1 is preserved. Zero functions removed.
+# -----------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.7.3"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -825,13 +866,21 @@ def _env_rule1b_capped_exit_gate():
 
 
 def _cap_trims(mv, weight_pct, sector_weight_pct, sector_excess_share_sar,
-               controls):
+               controls, cand=None):
     """v1.5.1: the two RISK-BUDGET (cap-kind) trims, shared VERBATIM by
     step 4 and the Rule 1b-X capped-EXIT fallthrough so sizing and reason
-    strings can never diverge between the two call sites."""
+    strings can never diverge between the two call sites.
+
+    v1.7.3: `cand` is OPTIONAL and defaults to None. Omitted => the v1.5.1
+    result verbatim. Supplied => D-9's anchor protection is honoured on the
+    POSITION-cap branch, so a SUKUK-class holding is not trimmed to satisfy
+    an equity position cap. Sector-cap branch unchanged."""
     out = []
     cap_pct = controls["max_position_pct"]
-    if weight_pct is not None and weight_pct > cap_pct and mv:
+    _anchor_exempt = bool(
+        cand is not None and _protect_sukuk_enabled() and _is_sukuk_holding(cand))
+    if (weight_pct is not None and weight_pct > cap_pct and mv
+            and not _anchor_exempt):
         target_mv = mv * (cap_pct / weight_pct)
         out.append((mv - target_mv,
                     "Position %.1f%% > Max Position %.1f%% — trim to cap"
@@ -1720,7 +1769,7 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
             #     the v1.5.0 capped-HOLD string below returns verbatim.
             if _env_trim_by_rule_gate() and _env_rule1b_capped_exit_gate():
                 _ct = _cap_trims(mv, weight_pct, sector_weight_pct,
-                                 sector_excess_share_sar, controls)
+                                 sector_excess_share_sar, controls, cand)
                 if _ct:
                     _ct.sort(key=lambda t: -t[0])
                     _p_rule, _r_rule, _k_rule = _ct[0]
@@ -1742,7 +1791,7 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
     # v1.5.1: cap-kind trims now come from _cap_trims() — shared verbatim
     # with the Rule 1b-X fallthrough above; output proven byte-identical.
     trims = _cap_trims(mv, weight_pct, sector_weight_pct,
-                       sector_excess_share_sar, controls)
+                       sector_excess_share_sar, controls, cand)
     if (roi is not None and roi <= controls["trim_roi_pct"] and mv
             and not vf_conflict):
         trims.append((mv * controls["valuation_trim_frac"],
