@@ -1177,7 +1177,50 @@ from urllib.error import HTTPError, URLError
 #   the hard way in v6.18.0 B [PRICE-FEED-LOUD].
 # Zero functions removed. One helper added.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.31.0"
+# -----------------------------------------------------------------------------
+# v6.32.0 (2026-07-27, operator-approved) — PLACEHOLDER ROWS ARE NOT FORECASTS
+# ROOT CAUSE of the 24 poisoned records v6.31.0 detects statistically. From
+# core/data_engine.py's own changelog, describing a fail-soft branch it once
+# shipped and has since removed:
+#       current_price   = 100.0 + idx    ->  101, 102, 103, ...
+#       overall_score   = 100 - idx*3    ->   97,  94,  91, ...
+# The live Performance_Log rows recorded 2026-07-25:
+#       1120.SR  entry 102  target_roi 94      idx 2
+#       AAPL     entry 103  target_roi 91      idx 3
+#       MSFT     entry 104  target_roi 88      idx 4
+#       NVDA     entry 105  target_roi 85      idx 5
+# BOTH formulas, same idx run. These were never prices. They are fail-soft
+# PLACEHOLDER rows that leaked into the forecast log and were recorded as
+# genuine HIGH-confidence forecasts.
+# WHERE THE GENERATOR IS: not in current main. The formulas survive only as
+# changelog text in core/data_engine.py; data_engine_v2, routes/ and scripts/
+# contain no such ladder. The most likely explanation is that the deployed
+# revision on 25-26 Jul predated the removal. That is a HYPOTHESIS and is
+# labelled as one — but the defensive conclusion does not depend on it.
+# THE ACTUAL GAP, which is current and certain: core/data_engine.py has
+# carried `_row_looks_placeholder()` for exactly this purpose, and
+# track_performance has never called it. This file contains ZERO references
+# to data_provider, data_quality, warnings or PLACEHOLDER. It records
+# whatever the backend hands it.
+# WHY THIS IS NOT REDUNDANT WITH v6.31.0: the entry-sanity gate is
+# STATISTICAL and needs MIN_N priors before it can judge. A placeholder row
+# for a symbol with no history sails straight through it — that hole is real
+# and this closes it. Marker detection is DECLARATIVE: it reads a field the
+# producer sets deliberately, works on a symbol's very first sighting, and
+# cannot be fooled by a plausible-looking number. The two mechanisms fail in
+# different directions on purpose:
+#       v6.31.0  catches implausible numbers, needs history
+#       v6.32.0  catches declared placeholders, needs no history
+# HONEST LIMIT: marker detection only fires if the marker survives the API
+# boundary into the row dict. If a row carries no provider/quality field at
+# all, this gate cannot see it and v6.31.0 remains the backstop. That case is
+# now COUNTED and logged once per run at WARNING, so the blind spot is
+# measured instead of assumed.
+# GATE: TFB_TRACK_PLACEHOLDER_GATE (default ON — a guard, per the identity-
+# guard lesson). =0 restores v6.31.0 behaviour exactly.
+# Zero functions removed. One helper added.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.32.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -1240,6 +1283,73 @@ def _env_int(
     if hi is not None and v > hi:
         v = hi
     return v
+
+
+_PLACEHOLDER_PROVIDER_MARKERS = (
+    "placeholder", "local_dictionary_fallback", "no_live_data",
+)
+_PLACEHOLDER_TEXT_MARKERS = (
+    "placeholder fallback", "no live data", "placeholder row",
+    "generated locally because upstream", "auto-generated fallback row",
+    "upstream degradation", "no usable rows", "local non-empty fallback",
+)
+_PLACEHOLDER_QUALITY_MARKERS = ("no_data", "nodata")
+
+# v6.32.0: fields a producer may use to declare a row synthetic. Mirrors the
+# contract in core/data_engine._row_looks_placeholder deliberately rather than
+# importing it, so this script keeps its zero-dependency-on-core property.
+_PROVIDER_FIELDS = ("data_provider", "provider", "source", "data_source")
+_QUALITY_FIELDS = ("data_quality", "quality", "data_quality_flag")
+_TEXT_FIELDS = ("warnings", "warning", "error", "detail", "message",
+                "recommendation_reason", "selection_reason", "notes",
+                "reason", "status_reason")
+
+
+def _row_is_placeholder(row: Dict[str, Any]) -> Tuple[bool, str]:
+    """v6.32.0 — did the PRODUCER declare this row synthetic?
+
+    Returns (is_placeholder, evidence). Declarative, not inferential: it reads
+    markers the upstream sets on purpose, so it works on a symbol's very first
+    sighting, where the v6.31.0 statistical gate cannot yet judge anything.
+
+    Returns (False, "no-marker-fields") when the row carries none of the
+    marker fields at all — an honest "cannot see", counted by the caller, not
+    a clean bill of health.
+    """
+    if not _env_bool("TFB_TRACK_PLACEHOLDER_GATE", True):
+        return False, ""
+    if not isinstance(row, dict):
+        return False, ""
+
+    saw_any_field = False
+
+    for f in _PROVIDER_FIELDS:
+        if f in row:
+            saw_any_field = True
+            v = _safe_str(row.get(f)).strip().lower()
+            for m in _PLACEHOLDER_PROVIDER_MARKERS:
+                if m in v:
+                    return True, "%s=%s" % (f, v[:60])
+
+    for f in _QUALITY_FIELDS:
+        if f in row:
+            saw_any_field = True
+            v = _safe_str(row.get(f)).strip().lower()
+            for m in _PLACEHOLDER_QUALITY_MARKERS:
+                if m == v or m in v:
+                    return True, "%s=%s" % (f, v[:60])
+
+    blob = []
+    for f in _TEXT_FIELDS:
+        if f in row:
+            saw_any_field = True
+            blob.append(_safe_str(row.get(f)))
+    text = " ".join(blob).lower()
+    for m in _PLACEHOLDER_TEXT_MARKERS:
+        if m in text:
+            return True, "text~'%s'" % m
+
+    return False, ("" if saw_any_field else "no-marker-fields")
 
 
 def _entry_price_sane(
@@ -6177,6 +6287,8 @@ class PerformanceTrackerApp:
         horizons = self._horizons()
 
         new_records: List[PerformanceRecord] = []
+        _placeholder_rejects = 0   # v6.32.0
+        _unmarked_rows = 0         # v6.32.0: rows carrying no marker field
         for row in rows:
             sym = _safe_str(row.get("symbol")).upper()
             if not sym:
@@ -6186,6 +6298,19 @@ class PerformanceTrackerApp:
             )
             if entry_price <= 0.0:
                 continue
+
+            # v6.32.0 PLACEHOLDER: a fail-soft row is not a forecast.
+            _ph, _ev = _row_is_placeholder(row)
+            if _ph:
+                _placeholder_rejects += 1
+                logger.error(
+                    "[v6.32.0 PLACEHOLDER] REJECTED %s — producer declared "
+                    "this row synthetic (%s); entry=%s NOT written",
+                    sym, _ev, entry_price,
+                )
+                continue
+            if _ev == "no-marker-fields":
+                _unmarked_rows += 1
 
             # v6.31.0 ENTRY-SANITY: refuse an entry price that is not a price
             # for this symbol. See the WHY block at SCRIPT_VERSION.
@@ -6268,6 +6393,23 @@ class PerformanceTrackerApp:
                 if r.key not in existing_keys:
                     existing_keys.add(r.key)
                     new_records.append(r)
+
+        # v6.32.0: report both the rejections and the blind spot. A run that
+        # sees no marker fields at all is NOT a clean run -- it is a run where
+        # this gate could not look, and the operator must know which it was.
+        if _placeholder_rejects:
+            logger.error(
+                "[v6.32.0 PLACEHOLDER] %d row(s) rejected as producer-declared "
+                "synthetic; %d record(s) written from %d source row(s)",
+                _placeholder_rejects, len(new_records), len(rows),
+            )
+        if _unmarked_rows:
+            logger.warning(
+                "[v6.32.0 PLACEHOLDER] %d of %d source row(s) carried NO "
+                "provider/quality/warning field -- marker detection could not "
+                "inspect them; v6.31.0 entry-sanity is the only cover for those",
+                _unmarked_rows, len(rows),
+            )
 
         return new_records
 
