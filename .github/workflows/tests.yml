@@ -88,4 +88,5 @@ jobs:
             tests/test_harness_ic.py \
             tests/test_scoring_engine_contract.py \
             tests/test_data_engine_v2.py \
-            tests/test_trend_signals.py
+            tests/test_trend_signals.py \
+            tests/test_learning_guards.py
