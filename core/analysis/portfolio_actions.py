@@ -5,6 +5,36 @@ Version: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
 
+v1.7.2 [B-7 ABSENT LEVELS RENDER BLANK, NEVER 0]: an absent stop/TP was
+being coerced to a printed 0.0. The idiom `(cand.get("tp1") or 0) * fx`
+maps None -> 0, so a holding with NO valuation ladder shipped
+`TP1 0.0 / TP2 0.0` into Portfolio_Decision and into the advisor sentence
+as though 0 were a real level. Live evidence (2026-07-27 export): 2222.SR
+carries stop 24.47 with TP1=TP2=0.0 — correct behaviour upstream (the
+v1.0.5 VF-conflict guard withholds valuation targets when valuation ROI
+-9.3% contradicts engine 12M +25.1%), rendered dishonestly downstream.
+CONSEQUENCE, observed not hypothesised: today's hand-built PDF brief read
+the 0.0, judged the field missing, and PRINTED INVENTED TARGETS (27.52 /
+28.44) for Aramco under a footnote claiming engine provenance. A blank
+cannot be mistaken for a level; a 0 invites replacement. Same failure
+class as the 2026-07-25 finding that a failed quote rendered as a plain
+number.
+FIX: _level_sar() converts a level to SAR and returns None when the raw
+level is None or non-positive (a 0/negative stop or target is not a
+tradable level under any convention). Applied to stop_sar/tp1_sar/tp2_sar.
+The advisor sentence prints the stop alone and names the reason when the
+ladder is absent ("no TP ladder — no valuation reference") instead of
+"TP1 0 / TP2 0 SAR". None was ALREADY a possible value in all three
+fields (the `if fx else None` arm), so no consumer contract changes.
+NOT TOUCHED: rule chain, sizing, funding identity, caps, confidence bands,
+P&L, gates, EXIT-BY-RULE precedence (Rule 1a), or which action is chosen —
+this is a RENDERING correction only; every action in today's export is
+byte-identical under the fix.
+KILL-SWITCH: TFB_PF_NULL_LEVELS=0 restores v1.7.1 zero-coercion exactly.
+Default ON — a fabricatable 0 is a data-integrity hazard, and protective
+guards ship default-ON (v5.116.0 doctrine). Zero function removals;
+additions: _null_levels_enabled, _level_sar.
+
 v1.0.5 [VF-CONFLICT-GUARD]: the 2026-07-05 audit's FER.US case: the valuation
 EXIT clause (rule 3, first leg) fires on valuation ROI alone — reference
 (target/intrinsic) 23% BELOW price -> ROI -23% <= -15% -> EXIT — while the
@@ -503,7 +533,7 @@ from datetime import datetime, timedelta, timezone
 # Rationale: this gate may only ever NARROW. Over-blocking is printed on the
 # holding and reversible in one env flip; under-blocking is invisible and puts
 # money into a name the engine refused. Zero functions removed.
-PORTFOLIO_ACTIONS_VERSION = "1.7.1"
+PORTFOLIO_ACTIONS_VERSION = "1.7.2"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -1908,6 +1938,35 @@ def _round(v, nd=2):
         return None
 
 
+def _null_levels_enabled():
+    """v1.7.2 B-7 kill-switch. Default ON: an absent price level renders
+    blank, never 0. TFB_PF_NULL_LEVELS=0 restores v1.7.1 coercion."""
+    return (os.getenv("TFB_PF_NULL_LEVELS") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _level_sar(level, fx, nd=2):
+    """v1.7.2 B-7: a price LEVEL (stop / TP1 / TP2) converted to SAR.
+    Returns None — rendered blank — when the level is absent or not
+    strictly positive, because 0 is not a tradable level under any
+    convention and a printed 0 invites downstream fabrication.
+    With the kill-switch off, reproduces the v1.7.1 `(x or 0) * fx`
+    coercion byte-for-byte."""
+    if not fx:
+        return None
+    if not _null_levels_enabled():
+        return _round((level or 0) * fx, nd)
+    if level is None:
+        return None
+    try:
+        f = float(level)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0:
+        return None
+    return _round(f * fx, nd)
+
+
 def _advisor_sentence(entry, controls, review_date):
     cand = entry["cand"]
     act = entry["action"]
@@ -1933,10 +1992,16 @@ def _advisor_sentence(entry, controls, review_date):
         bits.append("HOLD")
     bits.append(entry["action_reason"])
     if act in (ACTION_ADD, ACTION_HOLD) and cand.get("stop") is not None:
-        bits.append("stop %s / TP1 %s / TP2 %s SAR"
-                    % (_fmt(_round((cand["stop"] or 0) * fx)),
-                       _fmt(_round((cand["tp1"] or 0) * fx)),
-                       _fmt(_round((cand["tp2"] or 0) * fx))))
+        # v1.7.2 B-7: name an absent ladder instead of printing 0/0.
+        _s = _level_sar(cand.get("stop"), fx)
+        _t1 = _level_sar(cand.get("tp1"), fx)
+        _t2 = _level_sar(cand.get("tp2"), fx)
+        if _null_levels_enabled() and (_t1 is None or _t2 is None):
+            bits.append("stop %s SAR; no TP ladder — no valuation reference"
+                        % _fmt(_s))
+        else:
+            bits.append("stop %s / TP1 %s / TP2 %s SAR"
+                        % (_fmt(_s), _fmt(_t1), _fmt(_t2)))
     bits.append("confidence %s" % conf)
     bits.append("review by %s" % review_date)
     return "; ".join(bits) + "."
@@ -1985,9 +2050,9 @@ def _action_row(entry, review_date, controls):
         "suggested_delta_shares": entry.get("suggested_delta_shares"),
         "proceeds_sar": _round(entry.get("proceeds_sar"), 0),
         "funds_from": entry.get("funds_from"),
-        "stop_sar": _round((cand.get("stop") or 0) * fx) if fx else None,
-        "tp1_sar": _round((cand.get("tp1") or 0) * fx) if fx else None,
-        "tp2_sar": _round((cand.get("tp2") or 0) * fx) if fx else None,
+        "stop_sar": _level_sar(cand.get("stop"), fx),
+        "tp1_sar": _level_sar(cand.get("tp1"), fx),
+        "tp2_sar": _level_sar(cand.get("tp2"), fx),
         "roi_pct": _round(cand.get("roi_pct"), 1),
         "ann_roi_pct": _round(cand.get("ann_roi_pct"), 1),
         "reliability": _round(cand.get("reliability"), 1),
