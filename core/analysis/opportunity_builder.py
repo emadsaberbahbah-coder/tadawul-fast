@@ -8,6 +8,36 @@ Version: 1.0.19  (TFB Final Execution Plan v5.0 — Phase P2;
                  near-miss labeling, all env-gated DEFAULT-OFF;
                  A2 — Yahoo->GICS sector map relocated to core.sectors)
 
+v1.9.0 [B-6 SHARIAH MODEL GATE — the resolver's own "until the Gen-2
+wiring" note, closed]: compliance_rule_sets() has merged the operator's
+global model-screen verdicts (TFB_EXIT_BY_RULE_EXTRA, "any venue") since
+v1.5.0 — but the opportunity surface only ever consulted the fail set for
+.SR symbols. Evidence (2026-07-27 morning audit): MRP.US took the run's
+ONLY executable ticket (19,666 SAR) while carrying MODEL_SCREEN_FAIL on
+the weekly board; portfolio_actions blocks the same class at §4.6 EXIT-BY-
+RULE, so the two decision surfaces disagreed about one rulebook. A new
+"Shariah (Model)" gate fails MAJOR (=> DO_NOT_INVEST; audit/near-miss,
+never selected) for a NON-.SR candidate whose symbol is in the resolver
+fail set. Same one-resolver principle as Shariah (KSA): no second rulebook,
+no drift; the fail set is fed today by TFB_EXIT_BY_RULE_EXTRA (the board's
+published verdicts, operator-applied) and inherits any future automated
+feed for free. DEFAULT OFF (TFB_OPP_SHARIAH_MODEL_GATE unset) = gate list
+and verdict byte-identical to v1.8.0 — arming alters candidate eligibility
+mid-window, so the flip is the operator's explicit decision and a declared
+version break. Fail-open by construction: a symbol absent from the fail
+set passes ("model pass/unscreened") — an empty or unreachable list can
+never empty the board.
+ALSO [GATE_ORDER — the v1.0.7 lesson completed]: "Quote Freshness",
+"Shariah (KSA)", "Eligibility (KSA)" and "Activity Screen" append in
+evaluate_gates but were never added to GATE_ORDER, so first_failed_gate
+sorted them to 99 and could mis-attribute the near-miss "failed gate" and
+the DATA GAPS grouping whenever one of them co-failed with a tuple member.
+All four (plus the new gate) now sit at their TRUE append positions.
+Selection, verdicts, scoring, tickets: untouched — this corrects
+ATTRIBUTION on the audit surfaces only; tonight's gap-table counts may
+shift toward the true first gate, which is the fix working. Zero function
+removals; additions: _env_shariah_model_gate.]
+
 v1.7.0 [SELL-CLASS GATE — replace the all-or-nothing Investability gate with
 the narrow guard the audit contract actually needs. WHY (2026-07-23 evening,
 measured on the live 10,465-row pool with the deployed code): the operator's
@@ -519,6 +549,11 @@ ENV KILL-SWITCHES (policy block — read per call, not at import)
   TFB_OPP_MAX_DATA_AGE_HOURS "168" v1.0.6: last_updated older ⇒ stale ⇒ fail
   TFB_OPP_MIN_TRUST_FIELDS "2"   v1.0.6: fewer core signals present ⇒ thin ⇒ fail
   TFB_OPP_INVESTABILITY_GATE "0" v1.0.8: "1" ⇒ add Investability MAJOR gate (opt-in)
+  TFB_OPP_SHARIAH_MODEL_GATE "0" v1.9.0: "1" ⇒ add "Shariah (Model)" MAJOR gate:
+                                 NON-.SR symbol in the resolver fail set
+                                 (TFB_SHARIAH_FAIL_LIST ∪ TFB_EXIT_BY_RULE_EXTRA)
+                                 ⇒ DO_NOT_INVEST. Default OFF (operator flip
+                                 = declared version break)
   TFB_OPP_AUDIT_ROWS_MAX   "0"   v1.0.10: 0 = unlimited; >0 caps the written
                                  candidates_rows audit grid to N highest-score
                                  rows (selected / INVEST-qualified / near-miss
@@ -792,7 +827,7 @@ from datetime import datetime, timedelta, timezone
 # Kills: TFB_COMPLIANCE_SURFACE_GATE=0 / TFB_ELIGIBILITY_GATE=0 restore the
 # v1.4.1 gate list byte-for-byte. Guards ship armed.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.8.0"
+OPPORTUNITY_BUILDER_VERSION = "1.9.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1056,7 +1091,15 @@ DIVERSIFICATION_NO_CONTEXT = 60.0
 # §4.2 gate evaluation order (first fail in this order = headline failed_gate)
 GATE_ORDER = (
     "Price", "FX", "Valuation", "ROI", "Annualized ROI", "Valuation Sanity",
-    "Forecast", "Reliability", "Data Quality", "Data Trust", "Investability",
+    "Forecast", "Reliability", "Data Quality", "Data Trust",
+    # v1.9.0: the v1.0.7 lesson COMPLETED — these four have appended between
+    # Data Trust and Investability since v1.0.6/v1.5.0/v1.8.0 but were never
+    # added here, so first_failed_gate sorted them to 99 and could
+    # mis-attribute the near-miss surface. True append positions:
+    "Quote Freshness", "Shariah (KSA)", "Eligibility (KSA)",
+    "Shariah (Model)",       # v1.9.0 B-6 (appends after Eligibility (KSA))
+    "Activity Screen",
+    "Investability",
     # v1.7.0: appended at its true position (the v1.0.7 GATE_ORDER lesson —
     # a gate missing from this tuple sorts to 99 and can mis-attribute
     # first_failed_gate on the near-miss surface).
@@ -2085,6 +2128,14 @@ def _env_eligibility_gate():
         not in ("0", "false", "off", "no")
 
 
+def _env_shariah_model_gate():
+    """v1.9.0 B-6: DEFAULT OFF — arming alters candidate eligibility inside
+    the S-1 evidence window, so the flip is the operator's explicit decision
+    (declared version break). "1"/"true"/"on"/"yes" arms the gate."""
+    return (os.getenv("TFB_OPP_SHARIAH_MODEL_GATE") or "").strip().lower() \
+        in ("1", "true", "on", "yes")
+
+
 def compliance_rule_sets():
     """(authority_fail_set, foreign_restricted_set) — the ONE resolver both
     decision surfaces share. Env layers: TFB_SHARIAH_FAIL_LIST replaces the
@@ -2460,6 +2511,23 @@ def evaluate_gates(cand, criteria, held_symbols=None):
             ("NOMU_BLOCKED" if _nomu else
              ("FOREIGN_RESTRICTED" if _sym_u in _restr2 else "eligible")),
             "Main Market only; foreign-resident tradable set"))
+
+    # v1.9.0 [B-6 SHARIAH MODEL GATE — GLOBAL]: the resolver fail set,
+    # finally consulted for NON-.SR candidates too. Same one-resolver
+    # principle as Shariah (KSA); fed by TFB_EXIT_BY_RULE_EXTRA (the
+    # board's published model-screen verdicts) until the automated feed
+    # lands. Appended ONLY when armed, so the gate list and verdict are
+    # byte-identical to v1.8.0 while TFB_OPP_SHARIAH_MODEL_GATE is unset.
+    # Fail-open: absent-from-list passes — a missing list never empties
+    # the board.
+    if _env_shariah_model_gate() and _sym_u and not _sym_u.endswith(".SR"):
+        _f3, _r3 = compliance_rule_sets()
+        _ok_m = _sym_u not in _f3
+        g.append(_gate(
+            "Shariah (Model)", _ok_m, FAIL_MAJOR,
+            ("model pass/unscreened" if _ok_m else "MODEL_SCREEN_FAIL"),
+            "published model-screen FAIL set (one resolver) — "
+            "FAIL is a structural block (§4.6)"))
 
     # v1.8.0 [1.4 GLOBAL ACTIVITY SCREEN]: haram-activity exclusion on EVERY
     # venue, not just .SR. Appended only when armed, so the gate list and the
