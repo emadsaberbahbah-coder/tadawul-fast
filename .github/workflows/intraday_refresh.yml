@@ -1,0 +1,93 @@
+name: Intraday Quote Refresh
+
+# =============================================================================
+# WHY THIS WORKFLOW EXISTS
+#
+#   TFB_TICKET_MAX_QUOTE_AGE_MIN = 15   (in-session freshness limit)
+#   daily_sync cron `0 */4 * * *`   ->  Riyadh 03 07 11 15 19 23
+#   Tadawul session                 ->  10:00 - 15:00   (ONE sync inside it)
+#
+#       Top_10 run 09:58  ->  last sync 07:00  ->  quote age 178 min
+#       Top_10 run 13:40  ->  last sync 11:00  ->  quote age 160 min
+#       engine reported                            178m / 156m   EXACT MATCH
+#
+#   Quote Freshness blocked 125 of 300 candidates (41.7%) on 2026-07-27.
+#   The gate is correct; the cadence cannot serve it. daily_sync cannot simply
+#   run more often — it walks up to 7,000 symbols with a 3600s budget and a
+#   115-minute ceiling, and its own notes record the GM leg taking ~69 min.
+#
+#   This job refreshes ONLY the decision symbols (~311 measured on the live
+#   grid) and writes ONLY two cells each — 622 cells, versus daily_sync
+#   rewriting ~7,000 rows. It never clears, never rewrites a row, and writes
+#   only into cells whose row it has re-verified carries the expected symbol.
+#
+# SCHEDULE — Tadawul trades 10:00-15:00 Riyadh (UTC+3) = 07:00-12:00 UTC,
+# Sunday..Thursday. Every 15 minutes across the session keeps the worst-case
+# quote age inside the 15-minute gate. 21 short runs per session day.
+# =============================================================================
+
+on:
+  schedule:
+    # 07:00-11:45 UTC every 15 min, Sun-Thu  ->  10:00-14:45 Riyadh
+    - cron: "*/15 7-11 * * 0-4"
+    # final pass at 12:00 UTC = 15:00 Riyadh (the close)
+    - cron: "0 12 * * 0-4"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "write cells (false = dry-run)"
+        required: false
+        default: "true"
+
+concurrency:
+  # Never let two refreshes overlap. cancel-in-progress because a newer quote
+  # always supersedes an older one — there is nothing to preserve in a run
+  # that a fresher run has already lapped.
+  group: intraday-quote-refresh
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # A refresh that cannot finish inside the gate window is worthless; fail
+    # fast rather than pile up against the next scheduled tick.
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install gspread google-auth
+
+      - name: Selftest (offline, blocks a broken deploy from writing)
+        run: python scripts/intraday_quote_refresh.py --selftest
+
+      - name: Refresh decision-symbol quotes
+        env:
+          TARGET_SHEET_ID: ${{ secrets.TARGET_SHEET_ID }}
+          DEFAULT_SPREADSHEET_ID: ${{ secrets.TARGET_SHEET_ID }}
+          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+          TFB_BACKEND_URL: ${{ secrets.TFB_BACKEND_URL }}
+          TFB_IQR_SYMBOL_PAGES: "Top_10_Investments,My_Portfolio,Shadow_Board"
+          TFB_IQR_TARGET_PAGES: "Market_Leaders,Global_Markets"
+          TFB_IQR_MAX_SYMBOLS: "400"
+          TFB_IQR_TIMEOUT_SEC: "45"
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ github.event.inputs.apply }}" != "true" ]; then
+            echo "::notice::dry-run (manual dispatch, apply=false)"
+            python scripts/intraday_quote_refresh.py --scan
+          else
+            python scripts/intraday_quote_refresh.py --apply
+          fi
