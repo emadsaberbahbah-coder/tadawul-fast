@@ -114,6 +114,39 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # Scoring, gate, history, and ledger were never affected — the guard did its
 # job. Fix: define the helper (fixed UTC+3, no new imports). One name, one
 # line, verified end-to-end against a stub sheet in the harness.
+# v1.5.0 (2026-07-27): B-2 — DAY CLASSIFIER GAINS A NON-TRADING STATE. [VBREAK]
+# WHY: v1.2.0 has exactly two day states — scored or DAY_EXCLUDED_INFRA.
+# A venue-closed day (Saturday everywhere; Sunday for a US-only challenger)
+# has fresh=0 by NATURE, not by infrastructure failure, yet it was written
+# as EXCLUDED_INFRA and counted against Register §5's 5-excluded-day cap
+# (evidence: Shadow_History 2026-07-25/26 rows; S1_Gate "4 excluded-infra"
+# by day 7). Weekends alone would breach the cap ~Aug 2 and force a FALSE
+# RESTART of the evidence window. Fix, three parts, all kill-switched:
+#   (1) WRITER: before declaring EXCLUDED-INFRA, ask whether ANY challenger
+#       symbol's venue had a session since the previous row (suffix weekday
+#       calendars: .SR/^TASI.SR Sun-Thu; everything else Mon-Fri; empty
+#       challenger falls back to the benchmark legs). No session anywhere ->
+#       note `DAY_NON_TRADING no-venue-session` — return None, index
+#       carried, turnover/drag 0, exactly the excluded-day carry semantics.
+#       The token deliberately does NOT contain "DAY_EXCLUDED", so the
+#       UNTOUCHED count_scored_days puts it in neither bucket.
+#   (2) READ-TIME RETRO: excluded_prev is reduced by historical rows whose
+#       note says DAY_EXCLUDED but whose date had no venue session for the
+#       row's own stored symbols (2026-07-25 Sat, 2026-07-26 Sun qualify).
+#       Rows are NEVER edited — append-only law; repair by computation,
+#       the same segmentation principle as EVIDENCE_EPOCH.
+#   (3) Verdict line and S1 meta print the third state.
+# S-1 INTEGRITY: count_scored_days, evaluate_s1, basket_return_fresh,
+# blended_benchmark_return_fresh, check_point_in_time,
+# count_compliance_violations, chain_index, turnover_pct, cost_drag_pct and
+# all constants are BYTE-IDENTICAL to v1.4.0 (SHA256 proof in delivery).
+# RESIDUAL (documented, accepted): ad-hoc exchange holidays (e.g. a US
+# Monday holiday) still classify as EXCLUDED_INFRA — the weekday calendar
+# cannot see them; with weekends no longer burning the cap, §5 headroom
+# (5) absorbs the ~1-2 such days in this window.
+# KILL-SWITCH: TFB_SHADOW_DAY_CLASS=legacy restores v1.4.0 exactly (writer
+# AND retro-count). Default "venue" — protective fix, default-ON doctrine.
+#
 # v1.4.0 (2026-07-26): WAVE B — CRITERION 4 STOPS BEING A HARDCODED STRING.
 # WHY: evaluate_s1() has been called with the LITERAL "PENDING" for the
 # calibration criterion since this gate was written. That was honest while
@@ -167,7 +200,7 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # criterion 5b groups per basket — a fourth basket with one row per day is
 # structurally invisible to both (selftested). The gate call, day-exclusion
 # rule, scored-day counting and net-alpha inputs are untouched lines.
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.5.0"
 TAB_HISTORY = "Shadow_History"
 TAB_GATE = "S1_Gate"
 TAB_REGRET = "Regret_Ledger"
@@ -303,6 +336,78 @@ def _parse_iso_date(s: Any) -> Optional[date]:
         return datetime.strptime(str(s).strip()[:10], "%Y-%m-%d").date()
     except Exception:  # noqa: BLE001
         return None
+
+
+def _day_class_venue_enabled() -> bool:
+    """v1.5.0 B-2 kill-switch: 'venue' (default) enables the NON_TRADING day
+    class + read-time retro; 'legacy' restores v1.4.0 two-state behavior."""
+    return (os.getenv("TFB_SHADOW_DAY_CLASS") or "venue").strip().lower() \
+        != "legacy"
+
+
+_SUNTHU = frozenset({6, 0, 1, 2, 3})   # Sun-Thu (Python: Mon=0 .. Sun=6)
+_MONFRI = frozenset({0, 1, 2, 3, 4})
+
+
+def _venue_weekdays(symbol: str) -> frozenset:
+    """Weekday session calendar for a symbol's venue, by suffix. Saudi
+    (.SR, ^TASI.SR) trades Sun-Thu; every other covered venue Mon-Fri.
+    Deliberately calendar-only: ad-hoc holidays stay EXCLUDED_INFRA."""
+    s = (symbol or "").strip().upper()
+    if s.endswith(".SR"):
+        return _SUNTHU
+    return _MONFRI
+
+
+def venue_had_session(symbol: str, prev_date: Optional[date],
+                      today: date) -> bool:
+    """True iff the symbol's venue had >=1 calendar trading day in
+    (prev_date, today]. Unknown prev_date -> True (seed rows are never
+    classified non-trading)."""
+    if prev_date is None or today is None or today <= prev_date:
+        return True
+    days = _venue_weekdays(symbol)
+    d = prev_date + timedelta(days=1)
+    while d <= today:
+        if d.weekday() in days:
+            return True
+        d += timedelta(days=1)
+    return False
+
+
+def day_is_non_trading(symbols: Sequence[str], prev_date: Optional[date],
+                       today: date) -> bool:
+    """v1.5.0 B-2: a day is NON-TRADING for a basket iff NO basket symbol's
+    venue had a session since the previous row. An EMPTY basket falls back
+    to the benchmark legs (an empty board on a day when venues traded stays
+    an evidence problem -> not non-trading)."""
+    pool = [s for s in (symbols or []) if str(s).strip()]
+    if not pool:
+        pool = list(BENCH_WEIGHTS)
+    return not any(venue_had_session(s, prev_date, today) for s in pool)
+
+
+def retro_nontrading_excluded(history: List[Dict[str, Any]],
+                              basket: str) -> int:
+    """v1.5.0 B-2 [VBREAK] read-time reclassification: count historical rows
+    for `basket` whose note says DAY_EXCLUDED but whose date had no venue
+    session for the row's own stored symbols (single-day interval — the
+    cadence is daily). Rows themselves are never touched (append-only law).
+    Returns the number the excluded count must be reduced by."""
+    n = 0
+    for h in history or []:
+        if h.get("basket") != basket:
+            continue
+        d = _parse_iso_date(h.get("date"))
+        if d is None or d < EVIDENCE_EPOCH:
+            continue
+        if "DAY_EXCLUDED" not in str(h.get("note") or ""):
+            continue
+        syms = [s for s in str(h.get("symbols") or "").split(",")
+                if s.strip()]
+        if day_is_non_trading(syms, d - timedelta(days=1), d):
+            n += 1
+    return n
 
 
 def basket_return_fresh(prev_prices: Dict[str, float],
@@ -892,8 +997,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     # the three series never diverge on which days they consider real.
     _chal_m = measured[CHALLENGER]
     _chal_frac = (_chal_m["n_fresh"] / len(chal_syms)) if chal_syms else 0.0
+    # v1.5.0 B-2: venue-closed days are NON-TRADING, not infra failures.
+    _chal_p_date = (_parse_iso_date(_chal_m["p"]["date"])
+                    if _chal_m["p"] else None)
+    day_non_trading = bool(
+        _price_honesty_enabled() and _day_class_venue_enabled()
+        and _chal_m["p"] is not None
+        and day_is_non_trading(chal_syms, _chal_p_date, today))
     day_excluded = bool(
-        _price_honesty_enabled()
+        (not day_non_trading)
+        and _price_honesty_enabled()
         and _chal_m["p"] is not None
         and (_chal_frac < _min_fresh_frac()
              or (measured[BENCHMARK]["p"] is not None
@@ -906,13 +1019,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         m = measured[basket]
         p = m["p"]
         p_date = _parse_iso_date(p["date"]) if p else None
-        ret = None if day_excluded else m["ret"]
+        ret = None if (day_excluded or day_non_trading) else m["ret"]
         if basket == BENCHMARK:
             drag, turn = 0.0, 0.0
         else:
-            turn = 0.0 if day_excluded else turnover_pct(
+            turn = 0.0 if (day_excluded or day_non_trading) else turnover_pct(
                 p["symbols"] if p else [], syms)
-            drag = 0.0 if day_excluded else cost_drag_pct(
+            drag = 0.0 if (day_excluded or day_non_trading) else cost_drag_pct(
                 p["symbols"] if p else [], syms)
         idx = chain_index(p["cum_index"] if p else None, ret, drag)
         # Stored snapshot: fresh symbols at today's bar; stale symbols carry
@@ -926,7 +1039,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 prices_today[s] = spot[s]
             elif p and s in (p.get("prices") or {}):
                 prices_today[s] = p["prices"][s]
-        if day_excluded and p:
+        if day_non_trading and p:                  # v1.5.0 B-2
+            note = (f"DAY_NON_TRADING no-venue-session "
+                    f"fresh={m['n_fresh']}/{len(syms)}")
+        elif day_excluded and p:
             note = (f"DAY_EXCLUDED_INFRA fresh={m['n_fresh']}/{len(syms)} "
                     f"stale={m['n_stale']}")
         else:
@@ -946,6 +1062,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         results[basket] = {"ret": ret, "index": idx, "n": len(syms)}
 
     scored_prev, excluded_prev = count_scored_days(history, CHALLENGER)
+    if _price_honesty_enabled() and _day_class_venue_enabled():
+        # v1.5.0 B-2 [VBREAK]: read-time reclassification of historical
+        # venue-closed rows mis-written as EXCLUDED_INFRA. Rows untouched.
+        excluded_prev = max(
+            0, excluded_prev - retro_nontrading_excluded(history, CHALLENGER))
     if _price_honesty_enabled():
         days = scored_prev + (0 if (day_excluded
                                     or results[CHALLENGER]["ret"] is None)
@@ -976,7 +1097,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                + f" | challenger {chal_cum:+.2f}% champion "
                f"{champ_cum:+.2f}% benchmark {bench_cum:+.2f}% | net alpha "
                f"{'n/a' if net_alpha is None else f'{net_alpha:+.2f}%'} | "
-               f"{'DAY_EXCLUDED_INFRA' if day_excluded else 'day_scored'} "
+               f"{'DAY_NON_TRADING' if day_non_trading else ('DAY_EXCLUDED_INFRA' if day_excluded else 'day_scored')} "
                f"stale={total_stale} | "
                f"violations={len(violations)} | forks {len(all_forks)} "
                f"(+{len(new_forks)} new)")
@@ -1006,7 +1127,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         [f"benchmark = {json.dumps(BENCH_WEIGHTS)} (§1 locked)",
          "returns are cost-adjusted, daily-rebalanced equal-weight",
          f"price errors: {len(price_errs)} | stale: {total_stale} | "
-         f"day: {'EXCLUDED_INFRA' if day_excluded else 'scored'}"],
+         f"day: {'NON_TRADING' if day_non_trading else ('EXCLUDED_INFRA' if day_excluded else 'scored')}"],
         ["Gen-2 moves NO capital. This gate authorizes Tranche 1 only on PASS."],
     ]
     if eqw_on and BENCHMARK_EQW in results:        # v1.3.0 W-7 informational
@@ -1320,6 +1441,58 @@ def _selftest() -> int:
     checks.append(("W-B: PENDING keeps the gate NOT_DECIDABLE (v1.3.0 shape)",
                    _g_pend["verdict"] == "NOT_DECIDABLE"
                    and len(_g_pend["criteria"]) == 6))
+
+    # ---- v1.5.0 B-2 layer: three-state day classifier ------------------- #
+    _dc_saved = os.environ.pop("TFB_SHADOW_DAY_CLASS", None)
+    sat, sun, mon = date(2026, 7, 25), date(2026, 7, 26), date(2026, 7, 27)
+    checks.append(("B2: .SR venue trades Sunday, closed Saturday",
+                   venue_had_session("1831.SR", sat, sun) is True
+                   and venue_had_session("1831.SR", date(2026, 7, 24), sat)
+                   is False))
+    checks.append(("B2: US venue closed Sunday, open Monday",
+                   venue_had_session("SNX.US", sat, sun) is False
+                   and venue_had_session("SNX.US", sun, mon) is True))
+    checks.append(("B2: Sunday with US-only challenger = NON-TRADING",
+                   day_is_non_trading(["SNX.US"], sat, sun) is True))
+    checks.append(("B2: Sunday with a .SR name present = trading day",
+                   day_is_non_trading(["SNX.US", "1831.SR"], sat, sun)
+                   is False))
+    checks.append(("B2: Saturday empty basket falls back to bench legs "
+                   "= NON-TRADING",
+                   day_is_non_trading([], date(2026, 7, 24), sat) is True))
+    checks.append(("B2: weekday empty basket stays an evidence problem",
+                   day_is_non_trading([], sun, mon) is False))
+    checks.append(("B2: seed row (no prev date) never non-trading",
+                   day_is_non_trading(["SNX.US"], None, sun) is False))
+    checks.append(("B2: NON_TRADING note invisible to count_scored_days "
+                   "(neither scored nor excluded)",
+                   count_scored_days(
+                       [{"basket": CHALLENGER, "date": "2026-07-26",
+                         "daily_return": None,
+                         "note": "DAY_NON_TRADING no-venue-session fresh=0/1"},
+                        {"basket": CHALLENGER, "date": "2026-07-27",
+                         "daily_return": 0.2, "note": "n=5"}],
+                       CHALLENGER) == (1, 0)))
+    hist_b2 = [
+        {"basket": CHALLENGER, "date": "2026-07-24", "daily_return": None,
+         "symbols": "SNX.US", "note": "DAY_EXCLUDED_INFRA fresh=0/1 stale=1"},
+        {"basket": CHALLENGER, "date": "2026-07-25", "daily_return": None,
+         "symbols": "", "note": "DAY_EXCLUDED_INFRA fresh=0/0 stale=0"},
+        {"basket": CHALLENGER, "date": "2026-07-26", "daily_return": None,
+         "symbols": "SNX.US", "note": "DAY_EXCLUDED_INFRA fresh=0/1 stale=1"},
+    ]
+    checks.append(("B2: retro reclassifies Sat(empty)+Sun(US) = 2, "
+                   "keeps Friday infra day excluded",
+                   retro_nontrading_excluded(hist_b2, CHALLENGER) == 2))
+    os.environ["TFB_SHADOW_DAY_CLASS"] = "legacy"
+    checks.append(("B2: kill-switch 'legacy' disables the venue classifier",
+                   _day_class_venue_enabled() is False))
+    del os.environ["TFB_SHADOW_DAY_CLASS"]
+    checks.append(("B2: unset env defaults to 'venue' (protective ON)",
+                   _day_class_venue_enabled() is True))
+    if _dc_saved is not None:
+        os.environ["TFB_SHADOW_DAY_CLASS"] = _dc_saved
+
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
