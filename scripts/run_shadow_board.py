@@ -72,8 +72,73 @@ from core.analysis import portfolio_actions as pa     # noqa: E402
 # + the [SHADOW-BOARD] line. Measured on the live board this reports
 # BREACH (Japan 60% vs 40% cap) with the honest structural note. Advisory:
 # it annotates, never filters the board.
-SCRIPT_VERSION = "1.1.3"
+# -----------------------------------------------------------------------------
+# v1.2.0 (2026-07-27) - REGIME HISTORY. One append per run to `Regime_History`.
+# WHY: regime is computed every run and written into `Shadow_Board`, which is
+# REWRITTEN each run. Today's reading (global=RISK_ON, saudi=UNKNOWN) is gone
+# tomorrow. Nothing anywhere retains it.
+# WHY IT MATTERS MORE THAN IT LOOKS: when a forecast matures and misses,
+# scoring it WITHOUT the regime it was made in pools incomparable
+# observations. A call made in RISK_ON that matured in RISK_OFF failed for
+# reasons that have nothing to do with model skill. Pooling across regimes
+# when the effect is regime-dependent yields an estimate that is wrong in
+# EVERY regime - and the Min-t-stat gate waves it through, because the
+# arithmetic is fine and only the pooling is broken.
+# CANNOT BE BACKFILLED. Regime derives from a rolling monthly series as it
+# stood at the time; reconstructing "what the model would have said last
+# Tuesday" is not the same fact. Every day without this is a day of
+# permanently unconditioned evidence, which is why it ships now rather than
+# with the rest of the conditioned-scoring work.
+# SHAPE: LONG, not wide - one row per SLEEVE per run, so a new sleeve never
+# forces a schema change. ~2 sleeves x 2 runs/day = ~1,460 rows/year.
+# Append-only; never updated, never deleted.
+# FAIL-SOFT: wrapped exactly like the existing _Run_Log append. A history
+# failure can never undo the board write that precedes it. The board is the
+# product; this is evidence about the board.
+# GATE: TFB_SB_REGIME_HISTORY (default ON - evidence capture, and the lesson
+# of default-OFF guards is that they stay off). =0 restores v1.1.3 exactly.
+# Zero functions removed. Two helpers added.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "1.2.0"
 TAB_OUT = "Shadow_Board"
+
+# v1.2.0 - regime history
+TAB_REGIME_HISTORY = "Regime_History"
+REGIME_HISTORY_HEADER = ["Captured At (UTC)", "Date (Riyadh)", "Sleeve",
+                         "State", "Distance Pct", "Months In State",
+                         "Abs Momentum Pct", "Suggested Weight", "Errors",
+                         "Regime Version"]
+
+
+def _regime_history_enabled() -> bool:
+    return (os.getenv("TFB_SB_REGIME_HISTORY") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def build_regime_history_rows(regime_block, captured_utc, date_riyadh):
+    """v1.2.0 - LONG-format rows, one per sleeve. Pure: no IO, selftestable.
+
+    A sleeve with no state still emits a row. An absent reading at time t is
+    itself point-in-time evidence - the same contract pit_snapshot uses for a
+    symbol missing from every page."""
+    block = regime_block or {}
+    sleeves = block.get("sleeves") or {}
+    weights = block.get("suggested_weights") or {}
+    errs = ";".join(block.get("errors") or [])
+    ver = str(block.get("version") or "")
+    out = []
+    for name in sorted(sleeves.keys()):
+        v = sleeves.get(name) or {}
+        def _c(key):
+            val = v.get(key)
+            return "" if val is None else val
+        out.append([captured_utc, date_riyadh, str(name),
+                    "" if v.get("state") is None else str(v.get("state")),
+                    _c("distance_pct"), _c("months_in_state"),
+                    _c("abs_mom_pct"),
+                    "" if weights.get(name) is None else weights.get(name),
+                    errs, ver])
+    return out
 TAB_TOP10 = "Top_10_Investments"
 TAB_HOLDINGS = "Portfolio_Decision"
 
@@ -455,6 +520,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     write_board(sh, data_rows, meta)
+
+    # v1.2.0: append the regime reading, fail-soft. The board is already
+    # written and must never be undone by evidence capture.
+    if _regime_history_enabled():
+        try:
+            _cap = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            _hrows = build_regime_history_rows(
+                regime_block, _cap, _now_riyadh()[:10])
+            if _hrows:
+                try:
+                    _hws = sh.worksheet(TAB_REGIME_HISTORY)
+                except Exception:  # noqa: BLE001
+                    _hws = sh.add_worksheet(
+                        title=TAB_REGIME_HISTORY, rows=4000,
+                        cols=len(REGIME_HISTORY_HEADER))
+                    _hws.update(values=[REGIME_HISTORY_HEADER],
+                                range_name="A1")
+                    try:
+                        _hws.freeze(rows=1)
+                    except Exception:  # noqa: BLE001
+                        pass
+                _hws.append_rows(_hrows, value_input_option="RAW")
+                print("[REGIME-HISTORY v1.2.0] appended "
+                      + str(len(_hrows)) + " sleeve row(s)")
+        except Exception as _e:  # noqa: BLE001
+            print("[REGIME-HISTORY v1.2.0] WARN append failed "
+                  "(board unaffected): " + str(_e))
+
     try:
         sh.worksheet("_Run_Log").append_row(
             [datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "INFO",
