@@ -854,6 +854,7 @@ import os
 import random
 import re
 import signal
+import statistics
 import sys
 import time
 import uuid
@@ -1133,7 +1134,50 @@ from urllib.error import HTTPError, URLError
 # _mk_primary/_mk_legacy/_mk_sheetrows are new nested defs, not
 # replacements).
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.30.0"
+# -----------------------------------------------------------------------------
+# v6.31.0 (2026-07-27, operator-approved) — ENTRY-PRICE SANITY GATE
+# EVIDENCE (live Performance_Log, 5,528 records, export 2026-07-27 13:50):
+#   24 records recorded 25-26 Jul carry entry prices that are not prices:
+#       1120.SR  entry 102.00   symbol median  66.05    (-54%)
+#       AAPL     entry 103.00   symbol median 283.78    (-64%)
+#       MSFT     entry 104.00   symbol median 385.66    (-73%)
+#       NVDA     entry 105.00   symbol median 194.83    (-46%)
+#   102, 103, 104, 105 — four CONSECUTIVE integers across four unrelated
+#   symbols, in sorted-symbol order (numeric tickers sort before alphabetic:
+#   1120.SR -> AAPL -> MSFT -> NVDA). A price feed does not produce that.
+#   All 24 carry Origin Tab = Top_10_Investments and Confidence = HIGH, while
+#   620 OTHER Top_10 records written the SAME two days are clean (LPG.US
+#   45.32, MA 539.66). So the fault is narrow, not systemic.
+# WHAT THIS DOES *NOT* CLAIM: the write path is NOT identified. The sheet-row
+#   hypothesis was tested and FALSIFIED — 1120.SR sits at Market_Leaders row
+#   563, AAPL 882, MSFT 927, nowhere near 102-105. This gate is a detector,
+#   not a cure. The upstream cause remains open and must still be found.
+# WHY A GATE IS STILL RIGHT: a poisoned entry price is silent. It passes every
+#   existing check, sits "active" for weeks, and only speaks when the record
+#   matures — as a spectacular fake result. The four above would have printed
+#   1120.SR -37%, NVDA +97%, AAPL +223%, MSFT +267%, with the first four rows
+#   maturing 2026-08-02, BEFORE the S-1 verdict of 16 Aug. A single +267%
+#   outlier visibly moves any mean-based calibration statistic in a cohort of
+#   ~1,128 against a +/-10pp band.
+# MECHANISM: at record time, compare the incoming entry price against the
+#   MEDIAN of that symbol's own prior entry prices. Median, not mean, so one
+#   earlier poisoned row cannot drag the reference. Requires MIN_PRIORS prior
+#   records before it will judge anything — a symbol's first sightings are
+#   always admitted, so a new symbol is never blocked for being new.
+# VALIDATION (replay of all 5,528 historical records, chronological):
+#   blocked 24 | passed 5,504 | poisoned symbols caught 4/4 | FALSE POSITIVES 0
+# GATE: TFB_TRACK_ENTRY_SANITY (default ON — this is a guard, and the identity-
+#   guard lesson is that default-OFF guards poison production for weeks before
+#   anyone looks). TFB_TRACK_ENTRY_SANITY=0 restores v6.30.0 byte-identically.
+#   TFB_TRACK_ENTRY_SANITY_PCT   default 0.35  deviation that trips the gate
+#   TFB_TRACK_ENTRY_SANITY_MIN_N default 3     priors required before judging
+# LOUD BY DESIGN: every rejection logs at ERROR with the [v6.31.0 ENTRY-SANITY]
+#   tag naming symbol, incoming price, median and deviation — one grep away,
+#   never silent. Silence is the failure mode this file already learned about
+#   the hard way in v6.18.0 B [PRICE-FEED-LOUD].
+# Zero functions removed. One helper added.
+# -----------------------------------------------------------------------------
+SCRIPT_VERSION = "6.31.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -1196,6 +1240,57 @@ def _env_int(
     if hi is not None and v > hi:
         v = hi
     return v
+
+
+def _entry_price_sane(
+    symbol: str,
+    entry_price: float,
+    prior_entries: Optional[List[float]] = None,
+) -> Tuple[bool, Optional[float], float]:
+    """v6.31.0 — is this entry price plausibly a PRICE for this symbol?
+
+    Returns (ok, median_or_None, deviation_fraction).
+
+    Judged against the MEDIAN of the symbol's own prior entry prices, so a
+    single earlier bad row cannot move the reference. Fewer than MIN_N priors
+    => always ok (a symbol's first sightings establish the baseline; a new
+    symbol must never be blocked for being new). Non-positive or unusable
+    input => always ok, because rejecting it is already this caller's job.
+    """
+    if not _env_bool("TFB_TRACK_ENTRY_SANITY", True):
+        return True, None, 0.0
+    try:
+        px = float(entry_price)
+    except Exception:
+        return True, None, 0.0
+    if px <= 0.0:
+        return True, None, 0.0
+
+    vals: List[float] = []
+    for v in (prior_entries or []):
+        try:
+            f = float(v)
+        except Exception:
+            continue
+        if f > 0.0:
+            vals.append(f)
+
+    min_n = _env_int("TFB_TRACK_ENTRY_SANITY_MIN_N", 3, lo=1, hi=1000)
+    if len(vals) < min_n:
+        return True, None, 0.0
+
+    try:
+        med = float(statistics.median(vals))
+    except Exception:
+        return True, None, 0.0
+    if med <= 0.0:
+        return True, None, 0.0
+
+    dev = abs(px - med) / med
+    tol = _env_float("TFB_TRACK_ENTRY_SANITY_PCT", 0.35)
+    if tol <= 0.0:
+        tol = 0.35
+    return (dev <= tol), med, dev
 
 
 def _env_float(name: str, default: float) -> float:
@@ -6090,6 +6185,24 @@ class PerformanceTrackerApp:
                 row.get("current_price") or row.get("price"), default=0.0
             )
             if entry_price <= 0.0:
+                continue
+
+            # v6.31.0 ENTRY-SANITY: refuse an entry price that is not a price
+            # for this symbol. See the WHY block at SCRIPT_VERSION.
+            _ok, _med, _dev = _entry_price_sane(
+                sym, entry_price,
+                [r.entry_price for r in existing
+                 if _safe_str(r.symbol).upper() == sym],
+            )
+            if not _ok:
+                logger.error(
+                    "[v6.31.0 ENTRY-SANITY] REJECTED %s entry=%s median=%s "
+                    "deviation=%.0f%% — record NOT written; upstream feed "
+                    "returned a non-price for this symbol",
+                    sym, entry_price,
+                    ("%.4f" % _med) if _med is not None else "n/a",
+                    _dev * 100.0,
+                )
                 continue
 
             score = _safe_float(row.get("overall_score"), default=0.0)
