@@ -885,6 +885,45 @@ from urllib.error import HTTPError, URLError
 # remembering a flag before a confirmed action lands.
 # -----------------------------------------------------------------------------
 # =========================================================================
+# v6.30.0 (2026-07-27) — REGISTER THE STABILITY TILT AS A HYPOTHESIS
+# Operator request 2026-07-27: "top opportunity should rely more on stable
+# shares". REGISTRY-ONLY: status REGISTERED/IDLE, no code path to any
+# recommendation, no gate, no score, no weight. Nothing about today's
+# selection changes. The ONLY effect is that these two triggers begin
+# ACCUMULATING evidence tonight instead of on 2026-08-17, so they reach the
+# calibration window with a sample instead of a zero.
+# WHY THESE TWO FIELDS: both are already-shipped W-1 PRICE_STRUCTURE fields
+# (_PS_FIELDS) — bar-derived, engine-free, no-lookahead, computed by the SAME
+# price_structure_field() the existing backtest uses. Registration adds ZERO
+# new computation and ZERO new data dependency.
+#   STABILITY_TREND_200     trend_200 >= 1 (BULLISH, 20d) — price above a
+#       RISING 200-day SMA: structural persistence, the textbook stable
+#       uptrend. BOOLEAN field, so there is no threshold to choose and
+#       therefore none that can be tuned.
+#   STABILITY_VOL_ADJ_MOM   vol_adj_mom >= 0.5 (BULLISH, 20d) — 12-1
+#       momentum divided by annualised volatility: rewards the name that
+#       climbed QUIETLY over the one that climbed violently. This is the
+#       operator's request stated numerically.
+# THRESHOLD DISCIPLINE: 0.5 is a conventional risk-adjusted-trend cut chosen
+# A PRIORI and recorded here BEFORE any result exists. It was not fitted,
+# scanned, or picked from alternatives. A future run wanting a different cut
+# registers a NEW hypothesis — never a quiet edit of this one. That is the
+# entire purpose of the front door.
+# HONEST COST, stated up front: the v6.26.0 deflated-Sharpe gate uses
+# n_trials = the number of hypotheses in the run. Going 4 -> 6 RAISES the bar
+# every hypothesis must clear. That is the multiple-testing correction
+# working as designed, and it is the price of testing two more ideas — paid
+# deliberately here, not discovered later.
+# NOT REGISTERED: EVENT_SECTOR / THEME_ROTATION (news-driven sector
+# rotation). The framework note below says these need a historical event
+# archive "that does not exist" — that is now STALE: News_Archive holds 561
+# rows since 2026-06-22. But its `Sector` column is EMPTY on every row, so an
+# event->sector trigger has no field to read and would register only to
+# report ERROR. Populating that column is the prerequisite, tracked
+# separately; the hypotheses land the moment it is real.
+# KILL-SWITCH: TRACK_STABILITY_HYPOTHESES=0 returns default_hypotheses() to
+# the exact v6.29.0 four-item list.
+#
 # v6.29.0 (2026-07-26) — WAVE B: S-1 CRITERION 4 GETS A REAL NUMBER
 # =========================================================================
 # WHAT WAS MISSING. run_shadow_scorer has passed the LITERAL STRING
@@ -1094,7 +1133,7 @@ from urllib.error import HTTPError, URLError
 # _mk_primary/_mk_legacy/_mk_sheetrows are new nested defs, not
 # replacements).
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.29.0"
+SCRIPT_VERSION = "6.30.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -5152,6 +5191,32 @@ def default_hypotheses() -> List[Hypothesis]:
         Hypothesis("CANDLE_STRONG_BEAR", "Structure strong-bearish precedes downside",
                    HypothesisType.PRICE_STRUCTURE, "candle_structure", "STRONG_BEARISH",
                    HypothesisDirection.BEARISH, horizon_days=h),
+    ] + _stability_hypotheses(h)
+
+
+def _stability_hypotheses(h: int = 20) -> List[Hypothesis]:
+    """v6.30.0: the operator's stability tilt, registered as hypotheses.
+
+    Both read EXISTING _PS_FIELDS through price_structure_field(), so this
+    adds no computation and no data dependency. REGISTERED/IDLE: a
+    hypothesis cannot influence a recommendation until run_backtest marks it
+    ACCEPTED, which requires min_sample trigger events AND the deflated-
+    Sharpe gate. Thresholds are pre-registered (see the v6.30.0 changelog) —
+    changing one means registering a NEW hypothesis, never editing this.
+
+    TRACK_STABILITY_HYPOTHESES=0 -> [] -> the v6.29.0 list byte-for-byte.
+    """
+    if not _env_bool("TRACK_STABILITY_HYPOTHESES", True):
+        return []
+    return [
+        Hypothesis("STABILITY_TREND_200",
+                   "Price above a rising 200d SMA precedes upside",
+                   HypothesisType.PRICE_STRUCTURE, "trend_200", "1",
+                   HypothesisDirection.BULLISH, horizon_days=h),
+        Hypothesis("STABILITY_VOL_ADJ_MOM",
+                   "High volatility-adjusted momentum precedes upside",
+                   HypothesisType.PRICE_STRUCTURE, "vol_adj_mom", "0.5",
+                   HypothesisDirection.BULLISH, horizon_days=h),
     ]
 
 
