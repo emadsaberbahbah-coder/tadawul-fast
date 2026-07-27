@@ -1219,6 +1219,33 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 # v6.25.3 (2026-07-20) — FW-4 LEGITIMATE-FAMILY EXEMPTION (urgent, pre-15:00)
+# v6.29.0 (2026-07-27): B-4 — FORCE-REFETCH OVERRIDE + LIVE FIREWALL TAG.
+# WHY (2026-07-27 morning audit): three Market_Leaders rows carry poisoned
+# identities that the guard stack now PROTECTS instead of heals — BK
+# ("Hanwha Aerospace", 979,000 "USD"), BRK-B ("Taiwan Semiconductor"),
+# FI ("Western Digital"). The poison predates FW-1; whenever the incoming
+# fetch for these symbols is a stub, KEEP-LAST-GOOD certifies the poisoned
+# predecessor (price+provider+name all "plausible", P/E identity untestable
+# or accidentally consistent) and writes it back with a fresh stamp. Three
+# stale off-policy .SR rows (8270.SR/4328.SR snapshot 07-10, 3001.SR eodhd
+# 07-15) are stuck the same way. FIX, two parts:
+#   (1) TFB_SYNC_FORCE_REFETCH_SYMBOLS — comma list of symbols whose OLD
+#       sheet row may NEVER be substituted by KEEP-LAST-GOOD this run: the
+#       fresh fetch (or a fresh stub, which the next healthy fetch heals)
+#       always wins. Blocked substitutions are reported per symbol.
+#   (2) [FORCE-REFETCH] report line: for every forced symbol the run logs
+#       the INCOMING Name/Price/Provider at WARNING — if a provider is
+#       re-sending the wrong instrument (the BK->Hanwha mapping class),
+#       the very next run makes it visible instead of silent.
+# OPERATOR CONTRACT: set the env for ONE workflow run, verify the report,
+# then REMOVE it — an empty/absent list is a byte-exact no-op (default).
+# Also: _IDFW_TAG stops lying — the log prefix was hardcoded
+# "[ID-FIREWALL v6.24.0]" while the JSON version field moved on; the tag
+# now derives from SCRIPT_VERSION. Selftest grows to 9/9 (env parsing +
+# an end-to-end stub-grid case proving the forced bypass and the
+# unforced path byte-identical behavior).
+# KILL: unset TFB_SYNC_FORCE_REFETCH_SYMBOLS (default) -> v6.28.0 exactly.
+# -----------------------------------------------------------------------------
 # WHY (run #2485 artifacts): with the v6.25.2 selftest fix on main, FW-4
 # quarantine arms for the FIRST time at the next leg — and the same run's
 # census shows it would blank five LEGITIMATE Global_Markets multi-listing
@@ -1233,7 +1260,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.28.0"
+SCRIPT_VERSION = "6.29.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2975,11 +3002,26 @@ def _unpersisted_missing(
 
 
 _KEEP_LAST_GOOD_TAG = "[v6.22.3 KEEP-LAST-GOOD]"
-_IDFW_TAG = "[ID-FIREWALL v6.24.0]"
+# v6.29.0 B-4: the tag derives from SCRIPT_VERSION — it was frozen at
+# "v6.24.0" while the engine moved on, and every audit had to cross-check
+# the JSON version field to learn the truth.
+_IDFW_TAG = f"[ID-FIREWALL v{SCRIPT_VERSION}]"
+_FORCE_REFETCH_TAG = "[FORCE-REFETCH v6.29.0]"
 # v6.24.0 FW-1: per-page list of symbols whose OLD sheet row was refused
 # certification by the identity gate this pass (read by the call site for
 # the warnings line + FW-3 verdict; single-threaded sync loop).
 _LAST_KLG_ID_SUSPECTS: list = []
+# v6.29.0 B-4: per-page list of forced symbols whose old-row substitution
+# was blocked this pass (read by the call site for the report line).
+_LAST_KLG_FORCED: list = []
+
+
+def _force_refetch_symbols() -> set:
+    """v6.29.0 B-4: parse TFB_SYNC_FORCE_REFETCH_SYMBOLS into an UPPER-cased
+    symbol set. Absent/empty -> empty set (byte-exact v6.28.0 behavior).
+    One-run operator tool: set for a single workflow dispatch, then remove."""
+    raw = os.getenv("TFB_SYNC_FORCE_REFETCH_SYMBOLS") or ""
+    return {t.strip().upper() for t in raw.split(",") if t.strip()}
 
 
 def _klg_identity_gate_enabled() -> bool:
@@ -3366,7 +3408,7 @@ def _idfw_selftest_() -> bool:
     page. Sets _IDFW_SELFTEST_OK/_IDFW_SELFTEST_MSG. Never raises."""
     global _IDFW_SELFTEST_OK, _IDFW_SELFTEST_MSG
     passed = 0
-    total = 7
+    total = 9
     try:
         H = ["Symbol", "Name", "Price", "EPS (TTM)", "P/E (TTM)", "Warnings"]
         ni, pi, ei, qi = 1, 2, 3, 4
@@ -3454,6 +3496,42 @@ def _idfw_selftest_() -> bool:
                        and "The Goodyear Tire & Rubber Company" in g7)
         if _fam_ok:
             passed += 1
+
+        # v6.29.0 B-4 case 8: env parsing — case/space tolerant, absent=empty.
+        _fr_saved = os.environ.pop("TFB_SYNC_FORCE_REFETCH_SYMBOLS", None)
+        _c8 = (_force_refetch_symbols() == set())
+        os.environ["TFB_SYNC_FORCE_REFETCH_SYMBOLS"] = " bk , BRK-B ,, 3001.sr "
+        _c8 = _c8 and (_force_refetch_symbols() == {"BK", "BRK-B", "3001.SR"})
+        if _c8:
+            passed += 1
+        # v6.29.0 B-4 case 9: end-to-end stub-grid — unforced stub is healed
+        # from the old grid; a FORCED stub is NOT (old row blocked), and the
+        # blocked symbol is reported in _LAST_KLG_FORCED.
+        class _StubSheets:
+            def __init__(self, grid): self._g = grid
+            def read_values(self, sid, name, rng): return self._g
+        _kH = ["Symbol", "Name", "Price", "Data Provider"]
+        _old_grid = [list(_kH),
+                     ["BK", "Bank of New York Mellon Corp", 137.16, "eodhd"],
+                     ["V.US", "Visa Inc.", 355.74, "eodhd"]]
+        _mk = lambda: [["BK", "", "", "fallback_error"],
+                       ["V.US", "", "", "fallback_error"]]
+        os.environ.pop("TFB_SYNC_FORCE_REFETCH_SYMBOLS", None)
+        _m9a, _sw9a = _keep_last_good_rows(_StubSheets(_old_grid), "sid", "P", _kH, _mk())
+        os.environ["TFB_SYNC_FORCE_REFETCH_SYMBOLS"] = "BK"
+        _m9b, _sw9b = _keep_last_good_rows(_StubSheets(_old_grid), "sid", "P", _kH, _mk())
+        _c9 = (sorted(_sw9a) == ["BK", "V.US"]
+               and _m9a[0][1] == "Bank of New York Mellon Corp"
+               and _sw9b == ["V.US"]
+               and _m9b[0][1] == ""            # forced stub stays fresh
+               and _m9b[1][1] == "Visa Inc."   # unforced path untouched
+               and _LAST_KLG_FORCED == ["BK"])
+        if _c9:
+            passed += 1
+        if _fr_saved is not None:
+            os.environ["TFB_SYNC_FORCE_REFETCH_SYMBOLS"] = _fr_saved
+        else:
+            os.environ.pop("TFB_SYNC_FORCE_REFETCH_SYMBOLS", None)
     except Exception as e:
         _IDFW_SELFTEST_OK = False
         _IDFW_SELFTEST_MSG = "EXC %s: %s" % (type(e).__name__, e)
@@ -3616,6 +3694,8 @@ def _keep_last_good_rows(
     swapped: List[str] = []
     # v6.24.0 FW-1: fresh suspects list per invocation (read by the caller).
     del _LAST_KLG_ID_SUSPECTS[:]
+    del _LAST_KLG_FORCED[:]                     # v6.29.0 B-4
+    _forced = _force_refetch_symbols()
     if not headers or not rows_matrix:
         return rows_matrix, swapped
     sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
@@ -3689,6 +3769,9 @@ def _keep_last_good_rows(
         if t not in pending:
             continue
         pending.discard(t)  # first occurrence wins; duplicate old rows are ignored
+        if t in _forced:                         # v6.29.0 B-4
+            _LAST_KLG_FORCED.append(t)
+            continue  # forced symbol: the old row may NEVER ride back in
         if not _klg_price_ok(row[old_px_i] if old_px_i < len(row) else ""):
             continue  # old row not good -> keep the fresh stub
         if 0 <= old_prov_i < len(row) and _klg_provider_is_error(row[old_prov_i]):
@@ -5898,6 +5981,35 @@ async def _run_one_task(
                 res.warnings.append(_kw)
                 logger.warning(_kw)
                 _idfw_klg_suspects = []
+            # v6.29.0 B-4: forced-refetch visibility — report the INCOMING
+            # identity for every forced symbol so a provider re-sending the
+            # wrong instrument is caught on the very next run.
+            _forced_now = _force_refetch_symbols()
+            if _forced_now:
+                try:
+                    _f_sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
+                    _f_name_i = _guard_find_col(list(headers), _GUARD_NAME_ALIASES)
+                    _f_px_i = _guard_find_col(list(headers), _XPAGE_PRICE_ALIASES)
+                    _f_prov_i = _guard_find_col(list(headers), _KLG_PROVIDER_ALIASES)
+                    for _f_row in rows_matrix:
+                        if not isinstance(_f_row, list) or _f_sym_i < 0 or _f_sym_i >= len(_f_row):
+                            continue
+                        _f_t = str(_f_row[_f_sym_i]).strip().upper()
+                        if _f_t not in _forced_now:
+                            continue
+                        def _f_cell(i):
+                            return _f_row[i] if 0 <= i < len(_f_row) else ""
+                        _fw = (
+                            f"{_FORCE_REFETCH_TAG} {task.sheet_name} {_f_t} "
+                            f"incoming name='{str(_f_cell(_f_name_i))[:48]}' "
+                            f"price={_f_cell(_f_px_i)} provider={_f_cell(_f_prov_i)}"
+                            f"{' | klg-substitution BLOCKED' if _f_t in _LAST_KLG_FORCED else ''}"
+                            f" — verify identity, then REMOVE the env after this run."
+                        )
+                        res.warnings.append(_fw)
+                        logger.warning(_fw)
+                except Exception as _fe:
+                    logger.warning(f"{_FORCE_REFETCH_TAG} report skipped (error: {_fe})")
         else:
             _klg_syms = []
             _idfw_klg_suspects = []
