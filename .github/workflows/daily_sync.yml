@@ -360,6 +360,21 @@ jobs:
       # row: the diagnosis is kept, the destructive action is not.
       # ROLLBACK: set this back to "quarantine" (one line, no redeploy).
       TFB_SYNC_NAME_DEDUP_MODE: "observe"
+      # (2026-07-27) B-4 — ONE-RUN FORCE-REFETCH OVERRIDE. **REMOVE AFTER ONE RUN.**
+      # WHY (2026-07-27 morning audit): three Market_Leaders rows carry poisoned
+      # identities that KEEP-LAST-GOOD now PROTECTS instead of heals — BK
+      # ("Hanwha Aerospace" @979,000), BRK-B ("Taiwan Semiconductor"),
+      # FI ("Western Digital") — plus three stale off-policy .SR rows
+      # (8270.SR / 4328.SR snapshot 07-10, 3001.SR eodhd 07-15).
+      # For the listed symbols, run_dashboard_sync v6.29.0 refuses to substitute
+      # the OLD sheet row, so the fresh fetch always wins, and logs each
+      # symbol's INCOMING name/price/provider as [FORCE-REFETCH] in _Run_Log —
+      # if a provider is re-sending the wrong instrument, the log shows it.
+      # REQUIRES: scripts/run_dashboard_sync.py v6.29.0 committed FIRST.
+      # OPERATOR CONTRACT: dispatch ONE fresh "Run workflow", read the six
+      # [FORCE-REFETCH] lines, then DELETE this whole block (comment + line) —
+      # restore file provided. Absent line = byte-exact v6.28.0 behavior.
+      TFB_SYNC_FORCE_REFETCH_SYMBOLS: "BK, BRK-B, FI, 8270.SR, 4328.SR, 3001.SR"
       TFB_PORTFOLIO_REBUILD: "1"
       # Top_10_Investments — decision guard ENABLED ("1"). [2026-06-29 corrected]
       # SUPERSEDES the earlier "0" setting. That setting let the 2-hourly daily sync
