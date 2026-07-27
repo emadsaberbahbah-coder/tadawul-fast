@@ -71,13 +71,65 @@ from zoneinfo import ZoneInfo
 # tokens (^[A-Z0-9]{1,8}\.[A-Z]{1,4}$). Selftest fixture extended to prove
 # the exact production leak is filtered. One-time operator cleanup: delete
 # the 11 junk rows of 2026-07-22 (bug noise is not evidence).
-__version__ = "1.0.1"
+# v1.1.0 (2026-07-27): TWO DEFECTS FOUND IN THE LIVE LEDGER, AND THE FIELD SET
+# WIDENED TO THE ONES THAT EXPLAIN FAILURES.
+#
+# DEFECT A — THE ARCHIVE HAS NEVER SEEN THE LARGEST POSITION IN THE BOOK.
+#   v1.0.1's ticker-shape guard requires a venue suffix:
+#       ^[A-Z0-9]{1,8}\.[A-Z]{1,4}$
+#   NTES and YUMC carry none. Live _PIT_Fundamentals, 6 consecutive days,
+#   28 distinct symbols: NTES absent every day, YUMC absent every day. NTES is
+#   40.3% of the book. When its forecasts mature there is NO point-in-time
+#   record to test them against — the exact failure this script exists to
+#   prevent, on the position that matters most.
+#   WHY A BETTER REGEX CANNOT FIX IT: the junk the guard was written to stop
+#   (NAME, COUNT, FORECAST, SEMPRA) is the SAME SHAPE as the tickers it is
+#   wrongly rejecting (NTES, YUMC). No pattern separates them.
+#   FIX: admit a token if it is venue-suffixed OR it RESOLVES to a real row on
+#   a source page. Junk resolves nowhere; NTES and YUMC resolve on
+#   Global_Markets. Deterministic, self-maintaining, no stop-list to curate.
+#   main() now indexes the source pages BEFORE harvesting so the oracle exists
+#   at harvest time; indexing never depended on the symbol list, so the
+#   reorder is safe. harvest_symbols(values) with no `known` is byte-identical
+#   to v1.0.1.
+#
+# DEFECT B — the 11 junk rows v1.0.1 told the operator to delete are still
+#   present. All 11 are dated 2026-07-22 and NONE appear after it, so the
+#   guard did hold; only the one-time cleanup is outstanding. Recorded here so
+#   it is not mistaken for an ongoing leak by whoever reads this next.
+#
+# FIELD SET — 16 columns became 24. The 8 added are the ones that explain WHY
+#   a forecast failed, and every one of them is already sitting on the source
+#   pages, unread:
+#       Forecast Source · Forecast Reliability · Data Quality · Confidence
+#       Risk Score · Expected ROI 1M · Expected ROI 3M · Investability
+#   The whole 2026-07-27 root-cause finding turned on Forecast Source
+#   (phase_ii_synthetic vs provider_target). Without it in the archive, a
+#   matured miss gets blamed on the model when the input was the fault.
+#   MIGRATION: an existing 16-column tab has its header row rewritten in place
+#   to the 24-column set. Historical rows keep 16 values and the new columns
+#   stay blank for them — which is the honest record: those fields were never
+#   captured, and back-filling them would invent evidence.
+__version__ = "1.1.0"
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 HEADERS = ["Snapshot Date", "Symbol", "Source Page", "Price", "Market Cap",
            "P/E", "P/B", "EPS", "Dividend Yield %", "Debt Ratio %",
            "Expected ROI 12M %", "Value Score", "Recommendation",
-           "Data Provider", "Row Last Updated", "Captured At (UTC)"]
+           "Data Provider",
+           # v1.1.0 — the diagnostic block
+           "Forecast Source", "Forecast Reliability", "Data Quality",
+           "Confidence Score", "Risk Score", "Expected ROI 1M %",
+           "Expected ROI 3M %", "Investability",
+           "Row Last Updated", "Captured At (UTC)"]
+
+# v1.1.0: the 16-column header this tab shipped with. Detected on the live
+# sheet so the header can be migrated in place exactly once.
+LEGACY_HEADERS_16 = ["Snapshot Date", "Symbol", "Source Page", "Price",
+                     "Market Cap", "P/E", "P/B", "EPS", "Dividend Yield %",
+                     "Debt Ratio %", "Expected ROI 12M %", "Value Score",
+                     "Recommendation", "Data Provider", "Row Last Updated",
+                     "Captured At (UTC)"]
 
 # field -> normalized header aliases (normalize: lowercase, alnum only)
 _ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -97,10 +149,24 @@ _ALIASES: Dict[str, Tuple[str, ...]] = {
                        "recommendationcanonical"),
     "provider": ("dataprovider", "provider", "primaryprovider"),
     "last_updated": ("lastupdatedutc", "lastupdated", "asof", "timestamp"),
+    # v1.1.0 diagnostic block
+    "forecast_source": ("forecastsource", "forecastorigin"),
+    "reliability": ("forecastreliabilityscore", "forecastreliability",
+                    "reliabilityscore"),
+    "data_quality": ("dataqualityscore", "dataquality"),
+    "confidence": ("confidencescore", "forecastconfidence"),
+    "risk_score": ("riskscore",),
+    "roi_1m": ("expectedroi1m", "forecastroi1m", "engineroi1m"),
+    "roi_3m": ("expectedroi3m", "forecastroi3m", "engineroi3m"),
+    "investability": ("investabilitystatus", "investability"),
 }
 _FIELD_ORDER = ("price", "market_cap", "pe", "pb", "eps", "div_yield",
                 "debt_ratio", "roi_12m", "value_score", "recommendation",
-                "provider", "last_updated")
+                "provider",
+                "forecast_source", "reliability", "data_quality",
+                "confidence", "risk_score", "roi_1m", "roi_3m",
+                "investability",
+                "last_updated")
 
 
 def _out(msg: str) -> None:
@@ -122,9 +188,16 @@ def _today_riyadh() -> str:
 # --------------------------------------------------------------------------- #
 # Pure helpers (offline selftest)                                             #
 # --------------------------------------------------------------------------- #
-def harvest_symbols(values: List[List[Any]]) -> List[str]:
+def harvest_symbols(values: List[List[Any]],
+                    known: Optional[set] = None) -> List[str]:
     """Symbols from a raw sheet matrix (same contract as calendar_sync):
-    find the header row containing 'Symbol', collect below, drop labels."""
+    find the header row containing 'Symbol', collect below, drop labels.
+
+    v1.1.0: `known` is the union of symbols indexed on the SOURCE pages. A
+    token is admitted when it is venue-suffixed OR present in `known`. That
+    admits bare US tickers (NTES, YUMC) which v1.0.1 silently discarded, while
+    still rejecting section artifacts (NAME / COUNT / FORECAST / SEMPRA),
+    which resolve to no page. known=None reproduces v1.0.1 exactly."""
     out: List[str] = []
     col: Optional[int] = None
     for row in values or []:
@@ -139,7 +212,9 @@ def harvest_symbols(values: List[List[Any]]) -> List[str]:
         # v1.0.1: ticker-shape guard — decision symbols are always
         # venue-suffixed; section titles, counts, and bare names are not.
         if not re.match(r"^[A-Z0-9]{1,8}\.[A-Z]{1,4}$", v):
-            continue
+            # v1.1.0: second admission path — resolves on a source page.
+            if not (known and v in known):
+                continue
         out.append(v)
     seen: set = set()
     return [s for s in out if not (s in seen or seen.add(s))]
@@ -298,22 +373,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         _out(f"ERROR: cannot open workbook: {e}")
         return 2
 
-    symbols: List[str] = []
-    for p in sym_pages:
-        try:
-            vals = book.worksheet(p).get("A1:DZ2000")
-        except Exception as e:  # noqa: BLE001
-            _out(f"WARN: cannot read symbol page {p}: {e}")
-            continue
-        got = harvest_symbols(vals)
-        _out(f"symbol page {p}: {len(got)}")
-        symbols += [s for s in got if s not in symbols]
-    if not symbols:
-        msg = f"[PIT-SNAPSHOT v{__version__}] FAIL no decision symbols harvested"
-        _out("ERROR: " + msg)
-        append_run_log(book, "FAIL", msg, {})
-        return 2
-
+    # v1.1.0: SOURCE pages are indexed FIRST so their symbol union can act as
+    # the harvest oracle (see harvest_symbols). Indexing never depended on the
+    # symbol list, so the reorder changes nothing else.
     indexed: List[Tuple[str, Dict[str, Dict[str, Any]]]] = []
     for p in src_pages:
         try:
@@ -324,9 +386,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as e:  # noqa: BLE001
             _out(f"WARN: cannot index source page {p}: {e}")
 
+    known: set = set()
+    for _pname, _idx in indexed:
+        known |= set(_idx.keys())
+    _out(f"harvest oracle: {len(known)} symbols resolvable on source pages")
+
+    symbols: List[str] = []
+    for p in sym_pages:
+        try:
+            vals = book.worksheet(p).get("A1:DZ2000")
+        except Exception as e:  # noqa: BLE001
+            _out(f"WARN: cannot read symbol page {p}: {e}")
+            continue
+        got = harvest_symbols(vals, known=known)
+        _out(f"symbol page {p}: {len(got)}")
+        symbols += [s for s in got if s not in symbols]
+    if not symbols:
+        msg = f"[PIT-SNAPSHOT v{__version__}] FAIL no decision symbols harvested"
+        _out("ERROR: " + msg)
+        append_run_log(book, "FAIL", msg, {})
+        return 2
+
     try:
         ws = book.worksheet(tab)
-        existing = ws.get("A1:B100000")
+        existing = ws.get("A1:Z100000")   # v1.1.0: full width for header check
     except Exception:
         ws = None
         existing = []
@@ -350,6 +433,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ws.freeze(rows=1)
             except Exception:
                 pass
+        else:
+            # v1.1.0 HEADER MIGRATION, once. An existing 16-column tab is
+            # widened to 24 in place. Historical rows keep their 16 values and
+            # the new columns stay BLANK for them -- those fields were never
+            # captured, and back-filling them would invent evidence.
+            try:
+                cur = (existing[0] if existing else []) or []
+                cur = [str(c or "").strip() for c in cur]
+                if cur and cur[:len(LEGACY_HEADERS_16)] == LEGACY_HEADERS_16 \
+                        and len(cur) < len(HEADERS):
+                    ws.update(values=[HEADERS], range_name="A1")
+                    _out(f"header migrated {len(cur)} -> {len(HEADERS)} cols "
+                         f"(historical rows keep blanks in the new columns)")
+            except Exception as e:  # noqa: BLE001
+                _out(f"WARN: header migration skipped ({e}); append continues")
         if rows:
             ws.append_rows(rows, value_input_option="RAW")
         msg = (f"[PIT-SNAPSHOT v{__version__}] date={today} "
