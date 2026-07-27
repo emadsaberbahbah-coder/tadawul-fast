@@ -179,7 +179,8 @@ jobs:
             tests/test_recent_fixes.py \
             tests/test_portfolio_actions.py \
             tests/test_scoring_engine_contract.py \
-            tests/test_top10_selector.py
+            tests/test_top10_selector.py \
+            tests/test_learning_guards.py
           echo "::endgroup::"
 
       - name: ✅ Coverage note
