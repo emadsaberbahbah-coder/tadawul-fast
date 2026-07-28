@@ -2883,7 +2883,109 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.119.0"
+# =============================================================================
+# v5.120.0 - PORTFOLIO WEIGHTS WERE CURRENCY-BLIND
+# -----------------------------------------------------------------------------
+# THE BUG. _compute_portfolio_fields sums position_value across the WHOLE book
+# and divides each row by that total:
+#       total_mv += mv                  # mixed currencies, no conversion
+#       aw = (mv / total_mv) * 100.0
+# position_value is denominated in the row's OWN currency. Summing SAR and USD
+# together treats 1 USD as 1 SAR, so every USD weight is understated by the
+# SAR/USD rate (~3.75x) and every SAR weight is overstated to compensate.
+#
+# LIVE EVIDENCE, export 2026-07-28 08:39:
+#       SNX.US   sheet Actual Weight %  7.5060      true SAR weight  17.5%
+#       NTES     sheet                  7.2684      true               17.0%
+#       5023.SR  sheet                 25.8603      true               16.1%
+# The book is 51.4% USD. THREE positions breach the 15% cap and the column
+# reports none of them. Portfolio_Decision computes SAR-correct weights on its
+# own path, so the two surfaces disagree and the operator sees the wrong one.
+#
+# WHY THIS IS NOT MERELY A DISPLAY BUG: this column is what an operator reads
+# when judging whether a position is oversized. Understating the largest
+# holding by more than half, on the page named My_Portfolio, is the failure
+# mode most likely to produce a real allocation error.
+#
+# THE FIX. Convert every position_value to ONE base currency before summing and
+# before the ratio. Nothing else in this function changes.
+#
+# ALL-OR-NOTHING, DELIBERATELY. If ANY currency present in the book cannot be
+# resolved to a rate, the pass falls back to the v5.119.0 arithmetic verbatim and
+# logs at ERROR. A partially-converted book is worse than an honestly
+# unconverted one: it is wrong in a way that looks right. No silent partial.
+#
+# RATES. This is a pure cross-sectional pass and does no IO, so rates arrive by
+# one of three routes, in order:
+#   1. the optional fx_rates argument (default None => v5.119.0 signature preserved)
+#   2. TFB_PF_FX_RATES, e.g. "USD:3.7476,EUR:4.05"
+#   3. a built-in SAR-base default for USD only (the peg), so the common case
+#      needs no configuration at all
+# Base currency: TFB_PF_BASE_CCY, default SAR. The base always resolves to 1.0.
+#
+# GATE: TFB_PF_WEIGHT_FX, default ON. This is a CORRECTION, not a feature - the
+# existing number is simply wrong, and a default-OFF correction is one nobody
+# turns on. TFB_PF_WEIGHT_FX=0 restores v5.119.0 byte-for-byte.
+# Zero functions removed. Two helpers added.
+# =============================================================================
+# =============================================================================
+# v5.121.0 - AN UNCONVERTIBLE BOOK PUBLISHES NOTHING (external review, accepted)
+# -----------------------------------------------------------------------------
+# WHAT v5.120.0 GOT WRONG. v5.120.0 converted correctly but chose the WRONG FAILURE
+# MODE. When a currency could not be resolved it reverted to the unconverted
+# arithmetic and CARRIED ON: it still published actual_weight, still published
+# weight_gap, and still emitted ADD/REDUCE from allocation drift computed
+# across incomparable currencies. The only trace was a server log line the
+# sheet reader never sees. An external review put it exactly right: a knowingly
+# incorrect fallback is worse than a blank result. Accepted in full.
+#
+# WHY IT WAS ABOUT TO MATTER. v5.120.0's default table held SAR and USD only. The
+# pending universe expansion introduces TWENTY currencies - AED ARS BHD BRL CHF
+# CLP CNY DKK EUR GBP KWD NOK NZD OMR PHP PLN QAR SEK USD VND - so 19 of 20
+# would have been unresolved and the silent fallback would have fired
+# book-wide the day those symbols loaded.
+#
+# v5.121.0 BEHAVIOUR. If ANY held position carries a currency with no rate:
+#   * actual_weight  -> blank for EVERY row (a weight is a ratio to the book;
+#                       if the book cannot be summed, no row's share is known)
+#   * weight_gap     -> blank
+#   * action_flag    -> HOLD via gap=None, so no ADD/REDUCE from drift
+#   * portfolio_fx_status -> "PORTFOLIO_FX_INCOMPLETE: <ccys>" ON THE ROW, so
+#                       the operator sees it on the page, not only in logs
+# Signal-driven verdicts in `decision` are PRESERVED - they never depended on
+# cross-currency arithmetic, and suppressing them would hide real sell signals.
+#
+# STALE FIELDS ARE CLEARED FIRST. v5.120.0 wrote a field only when a new value
+# existed, so a holding that lost its price kept yesterday's weight and gap
+# beside today's action. Every engine-derived portfolio field is now cleared at
+# the start of the pass and repopulated only on success.
+#
+# RATES: PEGGED vs INDICATIVE - the distinction matters.
+#   PEGGED (USD AED QAR KWD BHD OMR) are administered against the USD and move
+#   only on a policy decision, so a built-in constant is safe and is used
+#   silently.
+#   INDICATIVE (EUR GBP CHF SEK NOK DKK PLN BRL CNY VND PHP CLP ARS NZD and the
+#   rest) FLOAT. A hardcoded float rate in a decision engine goes stale in
+#   silence, which is the same class of failure this block exists to remove. So
+#   they ship as a usable default AND log a WARNING naming every indicative
+#   rate actually used, telling the operator to set TFB_PF_FX_RATES.
+#   TFB_PF_FX_AS_OF (YYYY-MM-DD) stamps when the operator's rates were set;
+#   past TFB_PF_FX_MAX_AGE_DAYS (default 30) the pass warns loudly.
+#
+# ALSO FROM THE SAME REVIEW, NOT FIXED HERE AND DELIBERATELY SO:
+#   * weights computed on a PAGINATED slice (lines ~14039 / ~14251). Real, and
+#     confirmed. LATENT at present: limit defaults to 2000 against a 10-line
+#     book, so no current path slices. Fixing it means moving the portfolio
+#     pass above pagination in two async routes - a structural change that does
+#     not belong in the same commit as a correctness fix the operator is
+#     trading against today.
+#   * Insights totals sum native-currency values and label them SAR. Same root
+#     cause, different module (insights_builder), separate commit.
+#
+# GATE: TFB_PF_WEIGHT_FX, default ON (unchanged). =0 restores v5.119 exactly,
+# including the old permissive behaviour. Zero functions removed.
+# =============================================================================
+__version__ = "5.121.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -7683,7 +7785,91 @@ def _compute_position_math(row: Dict[str, Any]) -> None:
         row["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
 
 
-def _compute_portfolio_fields(rows: List[Dict[str, Any]]) -> None:
+# v5.121.0 - units of SAR per 1 unit of the keyed currency.
+# PEGGED: administered against USD, move only by policy decision -> safe as a
+# built-in constant, used without warning.
+_PF_PEGGED_FX_TO_SAR: Dict[str, float] = {
+    "SAR": 1.0,
+    "USD": 3.7500,     # SAR peg
+    "AED": 1.0211,     # AED 3.6725/USD
+    "QAR": 1.0302,     # QAR 3.6400/USD
+    "KWD": 12.2549,    # KWD ~0.3060/USD
+    "BHD": 9.9734,     # BHD 0.3760/USD
+    "OMR": 9.7529,     # OMR 0.3845/USD
+    "HKD": 0.4808,     # HKD ~7.80/USD (band)
+}
+# INDICATIVE: these FLOAT. Usable defaults so a book is never blocked outright,
+# but every one actually used is named in a WARNING - a hardcoded float rate in
+# a decision engine goes stale silently, which is exactly the failure this
+# version exists to remove. Override via TFB_PF_FX_RATES.
+_PF_INDICATIVE_FX_TO_SAR: Dict[str, float] = {
+    "EUR": 4.0500, "GBP": 4.8000, "CHF": 4.2500, "SEK": 0.3600,
+    "NOK": 0.3500, "DKK": 0.5430, "PLN": 0.9400, "BRL": 0.6800,
+    "CNY": 0.5200, "VND": 0.000147, "PHP": 0.0640, "CLP": 0.0039,
+    "ARS": 0.0026, "NZD": 2.2400, "JPY": 0.0240, "INR": 0.0450,
+    "SGD": 2.8000, "ZAR": 0.2000, "TRY": 0.1000, "IDR": 0.00023,
+    "KRW": 0.0027, "THB": 0.1050, "TWD": 0.1170, "MXN": 0.1900,
+    "CAD": 2.7200, "AUD": 2.4500, "MYR": 0.8400, "TWO": 0.1170,
+}
+_PF_DEFAULT_FX_TO_SAR: Dict[str, float] = dict(_PF_PEGGED_FX_TO_SAR)
+_PF_DEFAULT_FX_TO_SAR.update(_PF_INDICATIVE_FX_TO_SAR)
+
+
+def _pf_weight_fx_enabled() -> bool:
+    return (os.getenv("TFB_PF_WEIGHT_FX") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _pf_fx_age_days() -> Optional[float]:
+    """v5.121.0 - age of the operator's FX rates from TFB_PF_FX_AS_OF
+    (YYYY-MM-DD). None when unset or unparseable: an absent stamp is not an
+    error, it simply cannot be aged."""
+    raw = _safe_str(os.getenv("TFB_PF_FX_AS_OF"))
+    if not raw:
+        return None
+    try:
+        d = datetime.strptime(raw[:10], "%Y-%m-%d")
+        return max(0.0, (datetime.utcnow() - d).total_seconds() / 86400.0)
+    except Exception:
+        return None
+
+
+def _pf_fx_table(fx_rates: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
+    """v5.120.0 - units of BASE currency per 1 unit of the keyed currency.
+
+    Precedence: explicit argument, then TFB_PF_FX_RATES, then a built-in
+    SAR-base default covering the USD peg. The base currency is written LAST so
+    it can never be overridden to anything other than 1.0.
+    """
+    base = (_safe_str(os.getenv("TFB_PF_BASE_CCY")) or "SAR").upper()
+    out: Dict[str, float] = {}
+    if base == "SAR":
+        out.update(_PF_DEFAULT_FX_TO_SAR)
+    raw = _safe_str(os.getenv("TFB_PF_FX_RATES"))
+    if raw:
+        for part in raw.split(","):
+            if ":" not in part:
+                continue
+            k, _, v = part.partition(":")
+            try:
+                rate = float(v.strip())
+            except Exception:
+                continue
+            if rate > 0.0:
+                out[k.strip().upper()] = rate
+    for k, v in (fx_rates or {}).items():
+        try:
+            rate = float(v)
+        except Exception:
+            continue
+        if rate > 0.0:
+            out[_safe_str(k).upper()] = rate
+    out[base] = 1.0
+    return out
+
+
+def _compute_portfolio_fields(rows: List[Dict[str, Any]],
+                              fx_rates: Optional[Dict[str, Any]] = None) -> None:
     """v5.80.0: cross-sectional My_Portfolio pass. v5.85.4 (Fix AF): the per-row
     position math (position_cost/value/unrealized_pl/pct) is filled HERE first --
     on the external-rows path that serves My_Portfolio nothing upstream computes
@@ -7707,13 +7893,93 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]]) -> None:
         targets = _portfolio_target_weights()
         band = _portfolio_rebalance_band_pp()
         weak = _portfolio_weak_score_threshold()
+        # v5.120.0: resolve an FX factor per row BEFORE any summing. All-or-nothing:
+        # one unresolvable currency and the whole pass reverts to v5.119.0.
+        _fx_on = _pf_weight_fx_enabled()
+        _fx: Dict[str, float] = _pf_fx_table(fx_rates) if _fx_on else {}
+        _factor: Dict[int, float] = {}
+        _unresolved = set()
+        _indicative_used = set()
+        _base_ccy = (_safe_str(os.getenv("TFB_PF_BASE_CCY")) or "SAR").upper()
+        _operator_set = set()
+        for _k in (_safe_str(os.getenv("TFB_PF_FX_RATES")) or "").split(","):
+            if ":" in _k:
+                _operator_set.add(_k.partition(":")[0].strip().upper())
+        for _k in (fx_rates or {}):
+            _operator_set.add(_safe_str(_k).upper())
+        # v5.121.0: clear every engine-derived portfolio field BEFORE recomputing,
+        # so a holding whose price vanished cannot keep yesterday's weight and
+        # gap sitting beside today's action.
+        for r in rows:
+            if isinstance(r, dict):
+                r["actual_weight"] = None
+                r["weight_gap"] = None
+                r["portfolio_fx_status"] = None
+        if _fx_on:
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                if _as_float(r.get("position_value")) is None:
+                    continue
+                ccy = (_safe_str(r.get("currency")) or "").upper()
+                if not ccy:
+                    _unresolved.add("(blank)")
+                    continue
+                f = _fx.get(ccy)
+                if f is None or f <= 0.0:
+                    _unresolved.add(ccy)
+                else:
+                    _factor[id(r)] = f
+                    if ccy in _PF_INDICATIVE_FX_TO_SAR and ccy not in _operator_set:
+                        _indicative_used.add(ccy)
+            if _indicative_used:
+                logger.warning(
+                    "[engine_v2 v%s PF-WEIGHT-FX] INDICATIVE (floating) rate used "
+                    "for: %s -- these are built-in constants, not live quotes, and "
+                    "go stale silently. Set TFB_PF_FX_RATES and TFB_PF_FX_AS_OF.",
+                    __version__, ",".join(sorted(_indicative_used)),
+                )
+            _stale_days = _pf_fx_age_days()
+            if _stale_days is not None:
+                _max_age = _as_float(os.getenv("TFB_PF_FX_MAX_AGE_DAYS")) or 30.0
+                if _stale_days > _max_age:
+                    logger.warning(
+                        "[engine_v2 v%s PF-WEIGHT-FX] operator FX rates are %.0f "
+                        "days old (TFB_PF_FX_AS_OF), limit %.0f.",
+                        __version__, _stale_days, _max_age,
+                    )
+            if _unresolved:
+                # v5.121.0: DO NOT fall back to unconverted arithmetic. A weight is
+                # a ratio to the whole book; if the book cannot be summed in one
+                # currency then NO row's share is known, and publishing a number
+                # anyway is the failure this version exists to remove.
+                _msg = "PORTFOLIO_FX_INCOMPLETE: " + ",".join(sorted(_unresolved))
+                logger.error(
+                    "[engine_v2 v%s PF-WEIGHT-FX] %s -- actual_weight and "
+                    "weight_gap BLANKED for the whole book and no drift-based "
+                    "ADD/REDUCE emitted. Signal-driven verdicts are unaffected. "
+                    "Set TFB_PF_FX_RATES.", __version__, _msg,
+                )
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    r["actual_weight"] = None
+                    r["weight_gap"] = None
+                    r["portfolio_fx_status"] = _msg
+                    r["action_flag"] = _portfolio_rebalance_action(None, band)
+                    r["decision"] = _portfolio_decision(r, None, band, weak)
+                return
+            for r in rows:
+                if isinstance(r, dict):
+                    r["portfolio_fx_status"] = "OK:" + _base_ccy
+
         total_mv = 0.0
         for r in rows:
             if not isinstance(r, dict):
                 continue
             mv = _as_float(r.get("position_value"))
             if mv is not None and mv > 0.0:
-                total_mv += mv
+                total_mv += mv * (_factor.get(id(r), 1.0) if _fx_on else 1.0)
         for r in rows:
             if not isinstance(r, dict):
                 continue
@@ -7723,6 +7989,8 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]]) -> None:
                 tw = targets[sym]
                 r["target_weight"] = round(tw, 4)
             mv = _as_float(r.get("position_value"))
+            if mv is not None and _fx_on:
+                mv = mv * _factor.get(id(r), 1.0)
             aw = round((mv / total_mv) * 100.0, 4) if (mv is not None and total_mv > 0.0) else None
             if aw is not None:
                 r["actual_weight"] = aw
