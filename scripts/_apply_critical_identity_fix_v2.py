@@ -65,8 +65,15 @@ def patch_runner_response_symbols() -> None:
         text,
         '_batch_set = {str(t or "").strip().upper() for t in batch}',
         '_batch_set = {canonicalize_symbol(t) for t in batch}',
-        2,
-        "batch requested canonicalization",
+        1,
+        "primary batch requested canonicalization",
+    )
+    text = replace_exact(
+        text,
+        '_batch_set = {str(t or "").strip().upper() for t in rbatch}',
+        '_batch_set = {canonicalize_symbol(t) for t in rbatch}',
+        1,
+        "retry batch requested canonicalization",
     )
     text = replace_exact(
         text,
