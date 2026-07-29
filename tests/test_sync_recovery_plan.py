@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.plan_sync_recovery import PAGE_CONFIG, RECOVERY_ORDER, build_recovery_plan
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class SyncRecoveryPlanTests(unittest.TestCase):
@@ -103,6 +108,47 @@ class SyncRecoveryPlanTests(unittest.TestCase):
         rendered = json.dumps(plan["matrix"], separators=(",", ":"))
         self.assertIn('"include"', rendered)
         self.assertEqual(len(plan["matrix"]["include"]), 4)
+
+    def test_direct_cli_invocation_matches_github_actions(self):
+        """Exercise the exact path used by page_refresh_recovery.yml."""
+        text = "".join((
+            self._verdict("Market_Leaders", "success", 1360),
+            self._verdict("Global_Markets", "skipped", 0),
+            self._verdict("Commodities_FX", "success", 0),
+            self._verdict("Mutual_Funds", "success", 2475),
+        ))
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp)
+            artifact = temp / "source"
+            artifact.mkdir()
+            (artifact / "sync_execution.log").write_text(text, encoding="utf-8")
+            json_out = temp / "sync-recovery-plan.json"
+            github_output = temp / "github-output.txt"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/plan_sync_recovery.py",
+                    "--root",
+                    str(temp),
+                    "--json-out",
+                    str(json_out),
+                    "--github-output",
+                    str(github_output),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            plan = json.loads(json_out.read_text(encoding="utf-8"))
+            outputs = github_output.read_text(encoding="utf-8")
+
+        self.assertEqual(plan["retry_pages"], ["Global_Markets", "Commodities_FX"])
+        self.assertIn("needs_recovery=true", outputs)
+        self.assertIn('"include"', outputs)
 
 
 if __name__ == "__main__":
