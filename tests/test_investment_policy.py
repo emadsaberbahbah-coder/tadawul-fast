@@ -1,4 +1,4 @@
-import json
+import copy
 from pathlib import Path
 import sys
 import unittest
@@ -7,8 +7,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.investment_policy import (
+    build_policy_shadow_report,
+    candidate_to_policy_input,
     evaluate_speculation_gate,
     load_policy,
+    policy_runtime_enabled,
     validate_price_plan,
     validate_recommendation_card,
 )
@@ -140,6 +143,52 @@ class InvestmentPolicyTests(unittest.TestCase):
         self.assertFalse(result.allowed)
         self.assertEqual(result.status, "INCOMPLETE_NOT_EXECUTABLE")
         self.assertIn("MISSING_INSTRUMENT_IDENTITY", result.reasons)
+
+    def test_runtime_remains_disabled(self):
+        self.assertFalse(policy_runtime_enabled(self.policy))
+
+    def test_shadow_report_has_no_decision_effect_and_does_not_mutate(self):
+        candidate = self.base_candidate()
+        before = copy.deepcopy(candidate)
+        report = build_policy_shadow_report([candidate], self.policy)
+        self.assertEqual(candidate, before)
+        self.assertFalse(report["enforcement_applied"])
+        self.assertEqual(report["decision_effect"], "NONE_SHADOW_ONLY")
+        self.assertEqual(report["evaluated"], 1)
+        self.assertEqual(report["eligible"], 1)
+        self.assertEqual(report["would_block"], 0)
+
+    def test_shadow_report_surfaces_missing_evidence(self):
+        report = build_policy_shadow_report(
+            [{"symbol": "AAPL.US", "market": "NASDAQ", "current_price": 200}],
+            self.policy,
+        )
+        self.assertEqual(report["evaluated"], 1)
+        self.assertEqual(report["would_block"], 1)
+        self.assertIn(
+            "UNKNOWN_CRITICAL_MEDIAN_DAILY_TRADED_VALUE",
+            report["reason_counts"],
+        )
+        self.assertIn(
+            "INSTRUMENT_IDENTITY_UNVERIFIED",
+            report["unknown_or_unverified_counts"],
+        )
+
+    def test_adapter_does_not_replace_median_with_average(self):
+        mapped = candidate_to_policy_input({
+            "symbol": "AAPL.US",
+            "market": "NASDAQ",
+            "avg_daily_traded_value": 99_000_000,
+        })
+        self.assertIsNone(mapped["median_daily_traded_value"])
+
+    def test_adapter_recognizes_saudi_market_without_inventing_identity(self):
+        mapped = candidate_to_policy_input({
+            "symbol": "1120.SR",
+            "market": "Tadawul",
+        })
+        self.assertEqual(mapped["market"], "SAUDI")
+        self.assertFalse(mapped["instrument_identity_verified"])
 
 
 if __name__ == "__main__":
