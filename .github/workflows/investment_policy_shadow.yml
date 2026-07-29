@@ -1,0 +1,73 @@
+name: 🧭 Investment Policy Shadow
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 05:15 Asia/Riyadh: after the US session and before the Saudi market opens.
+    - cron: '15 2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: investment-policy-shadow
+  cancel-in-progress: true
+
+jobs:
+  shadow-report:
+    name: Generate non-enforcing shadow report
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      TFB_INVESTMENT_POLICY_PATH: config/project_wide_execution_learning_policy_v1.json
+      EODHD_API_TOKEN: ${{ secrets.EODHD_API_TOKEN }}
+      DISABLE_NETWORK_AT_IMPORT: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install production dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements.txt
+
+      - name: Generate shadow report from real Top-10 selector
+        id: generate
+        continue-on-error: true
+        run: |
+          python scripts/run_investment_policy_shadow.py \
+            --output investment-policy-shadow.json \
+            --sample-limit 50 \
+            --require-candidates
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: investment-policy-shadow-${{ github.run_number }}
+          path: investment-policy-shadow.json
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Verify non-empty shadow-only contract
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("investment-policy-shadow.json").read_text())
+          assert report["enforcement_applied"] is False
+          assert report["decision_effect"] == "NONE_SHADOW_ONLY"
+          assert report["runtime_enabled"] is False
+          assert report["status"] == "ok", report
+          assert report["evaluated"] > 0, report
+          assert report["source"]["mode"] == "top10_selector", report
+          PY

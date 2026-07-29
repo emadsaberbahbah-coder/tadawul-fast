@@ -1,17 +1,24 @@
+import copy
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core.investment_policy import (
+    build_policy_shadow_report,
+    candidate_to_policy_input,
     evaluate_speculation_gate,
     load_policy,
+    policy_runtime_enabled,
     validate_price_plan,
     validate_recommendation_card,
 )
+from scripts import run_investment_policy_shadow as shadow_runner
 
 
 class InvestmentPolicyTests(unittest.TestCase):
@@ -140,6 +147,97 @@ class InvestmentPolicyTests(unittest.TestCase):
         self.assertFalse(result.allowed)
         self.assertEqual(result.status, "INCOMPLETE_NOT_EXECUTABLE")
         self.assertIn("MISSING_INSTRUMENT_IDENTITY", result.reasons)
+
+    def test_runtime_remains_disabled(self):
+        self.assertFalse(policy_runtime_enabled(self.policy))
+
+    def test_shadow_report_has_no_decision_effect_and_does_not_mutate(self):
+        candidate = self.base_candidate()
+        before = copy.deepcopy(candidate)
+        report = build_policy_shadow_report([candidate], self.policy)
+        self.assertEqual(candidate, before)
+        self.assertFalse(report["enforcement_applied"])
+        self.assertEqual(report["decision_effect"], "NONE_SHADOW_ONLY")
+        self.assertEqual(report["evaluated"], 1)
+        self.assertEqual(report["eligible"], 1)
+        self.assertEqual(report["would_block"], 0)
+
+    def test_shadow_report_surfaces_missing_evidence(self):
+        report = build_policy_shadow_report(
+            [{"symbol": "AAPL.US", "market": "NASDAQ", "current_price": 200}],
+            self.policy,
+        )
+        self.assertEqual(report["evaluated"], 1)
+        self.assertEqual(report["would_block"], 1)
+        self.assertIn(
+            "UNKNOWN_CRITICAL_MEDIAN_DAILY_TRADED_VALUE",
+            report["reason_counts"],
+        )
+        self.assertIn(
+            "INSTRUMENT_IDENTITY_UNVERIFIED",
+            report["unknown_or_unverified_counts"],
+        )
+
+    def test_adapter_does_not_replace_median_with_average(self):
+        mapped = candidate_to_policy_input({
+            "symbol": "AAPL.US",
+            "market": "NASDAQ",
+            "avg_daily_traded_value": 99_000_000,
+        })
+        self.assertIsNone(mapped["median_daily_traded_value"])
+
+    def test_adapter_recognizes_saudi_market_without_inventing_identity(self):
+        mapped = candidate_to_policy_input({
+            "symbol": "1120.SR",
+            "market": "Tadawul",
+        })
+        self.assertEqual(mapped["market"], "SAUDI")
+        self.assertFalse(mapped["instrument_identity_verified"])
+
+    def test_extract_rows_preserves_malformed_records_for_accounting(self):
+        raw_rows = [self.base_candidate(), "bad-row", 123]
+        extracted = shadow_runner._extract_rows({"rows": raw_rows})
+        self.assertEqual(extracted, raw_rows)
+        report = build_policy_shadow_report(extracted, self.policy)
+        self.assertEqual(report["evaluated"], 1)
+        self.assertEqual(report["invalid_rows"], 2)
+        self.assertEqual(report["reason_counts"]["INVALID_CANDIDATE_ROW"], 2)
+
+    def test_selector_input_uses_exported_top10_entry_point(self):
+        selector_payload = {
+            "status": "ok",
+            "rows": [self.base_candidate()],
+            "meta": {"coverage": "test"},
+        }
+        with mock.patch(
+            "core.analysis.top10_selector.build_top10_rows",
+            return_value=selector_payload,
+        ):
+            rows, source = shadow_runner._load_input(None)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(source["mode"], "top10_selector")
+        self.assertEqual(
+            source["entry_point"],
+            "core.analysis.top10_selector.build_top10_rows",
+        )
+
+    def test_require_candidates_fails_loudly_instead_of_empty_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "report.json"
+            with mock.patch.object(
+                shadow_runner,
+                "_load_input",
+                return_value=([], {"mode": "selector_unavailable"}),
+            ):
+                code = shadow_runner.main([
+                    "--output", str(output), "--require-candidates"
+                ])
+            report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(code, 2)
+        self.assertEqual(report["status"], "operational_error")
+        self.assertFalse(report["enforcement_applied"])
+        self.assertEqual(report["decision_effect"], "NONE_SHADOW_ONLY")
+        self.assertIn("shadow_source_returned_no_candidates", report["error"])
 
 
 if __name__ == "__main__":
