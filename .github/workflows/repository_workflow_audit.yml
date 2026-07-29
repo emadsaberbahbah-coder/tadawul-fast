@@ -1,0 +1,44 @@
+name: 🔐 Repository Workflow Audit
+
+on:
+  push:
+    paths:
+      - '.github/**'
+      - 'scripts/audit_repository_workflows.py'
+      - 'tests/test_repository_workflow_audit.py'
+  # Required checks must start on every PR. Path-filtered required workflows can
+  # remain pending forever on source-only changes and block otherwise valid PRs.
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repository-workflow-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Validate workflow safety and maintenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Compile audit code
+        run: |
+          python -m py_compile scripts/audit_repository_workflows.py \
+            tests/test_repository_workflow_audit.py
+
+      - name: Run audit unit tests
+        run: python -m unittest tests/test_repository_workflow_audit.py
+
+      - name: Audit all repository workflows
+        run: python scripts/audit_repository_workflows.py
