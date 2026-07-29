@@ -9,6 +9,7 @@ from scripts.critical_symbol_identity import (
     fail_result_on_identity,
     quarantine_critical_rows,
     sanitize_active_universe,
+    validate_fresh_critical_rows,
 )
 
 
@@ -60,6 +61,33 @@ class CriticalSymbolIdentityTests(unittest.TestCase):
             self.assertTrue(row[0])
             self.assertEqual(row[1], "")
             self.assertEqual(row[6], CRITICAL_IDENTITY_TAG)
+
+    def test_response_aliases_are_canonicalized_before_identity_rules(self):
+        rows = [
+            ["FI.US", "Western Digital Corporation", "NASDAQ", "USD", "USA", 499.33, ""],
+            ["BRK.B", "National Bank of Bahrain", "NYSE", "USD", "USA", 0.52, ""],
+            ["BK", "Hanwha Aerospace", "NYSE", "USD", "USA", 979000, ""],
+        ]
+        _, failures = quarantine_critical_rows(HEADERS, rows)
+        self.assertEqual([row[0] for row in rows], ["FISV.US", "BRK-B.US", "BK.US"])
+        self.assertEqual([failure.symbol for failure in failures], ["FISV.US", "BRK-B.US", "BK.US"])
+
+    def test_missing_fresh_critical_row_fails_even_if_predecessor_is_available(self):
+        fresh_rows = [["AAPL", "Apple Inc.", "NASDAQ", "USD", "USA", 200.0, ""]]
+        _, failures = validate_fresh_critical_rows(
+            HEADERS, fresh_rows, ["AAPL", "FI.US"]
+        )
+        # Simulate persistence restoring a perfectly valid predecessor only
+        # after current-run proof has already been recorded.
+        fresh_rows.append(
+            ["FISV.US", "Fiserv, Inc.", "NASDAQ", "USD", "USA", 51.0, ""]
+        )
+        result = SimpleNamespace(status="success", rows_failed=0, error=None)
+        fail_result_on_identity(result, failures)
+        self.assertEqual([(failure.symbol, failure.reason) for failure in failures],
+                         [("FISV.US", "missing fresh response row")])
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(fresh_rows[-1][1], "Fiserv, Inc.")
 
     def test_existing_bk_us_poison_is_blocked(self):
         rows = [["BK.US", "Saudi Enaya Cooperative Insurance Company", "NYSE/NASDAQ", "USD", "USA", 8.95, ""]]

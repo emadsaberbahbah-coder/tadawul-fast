@@ -1208,6 +1208,7 @@ try:
         fail_result_on_identity,
         quarantine_critical_rows,
         sanitize_active_universe,
+        validate_fresh_critical_rows,
     )
 except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
     from critical_symbol_identity import (
@@ -1216,6 +1217,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
         fail_result_on_identity,
         quarantine_critical_rows,
         sanitize_active_universe,
+        validate_fresh_critical_rows,
     )
 
 # -----------------------------------------------------------------------------
@@ -3838,7 +3840,7 @@ def _filter_rows_to_requested(
         return rows_matrix, []
     wanted: set = set()
     for s in requested_symbols:
-        t = str(s or "").strip().upper()
+        t = canonicalize_symbol(s)
         if t:
             wanted.add(t)
     if not wanted:
@@ -3850,7 +3852,8 @@ def _filter_rows_to_requested(
         if not isinstance(row, list) or sym_i >= len(row) or _guard_is_blank(row[sym_i]):
             kept_rows.append(row)
             continue
-        t = str(row[sym_i]).strip().upper()
+        t = canonicalize_symbol(row[sym_i])
+        row[sym_i] = t
         if t in wanted:
             kept_rows.append(row)
         else:
@@ -5695,6 +5698,12 @@ async def _run_one_task(
         res.gateway_used = f"{eff_gw}:{used_endpoint}" if used_endpoint else eff_gw
         res.symbols_processed = len(symbols)
 
+        # Capture current-run critical identity proof before persistence or
+        # KEEP-LAST-GOOD can restore a valid predecessor.  Those mechanisms
+        # may preserve stored data, but may never turn a missing/rejected
+        # provider response into a green verdict.
+        _critical_identity_failures: list = []
+
         # No creds => partial (data fetched but not written)
         if sheets is None or sheets._get_service() is None:
             res.status = "partial"
@@ -5737,6 +5746,23 @@ async def _run_one_task(
                 logger.warning(_sm)
         # ---------------------------------------------------------------------
 
+        if (task.expects_rows and symbols and headers
+                and task.sheet_name in _RANKED_MARKET_PAGES):
+            rows_matrix, _critical_identity_failures = validate_fresh_critical_rows(
+                headers, rows_matrix, symbols
+            )
+            if _critical_identity_failures:
+                _fresh_msg = (
+                    "[CRITICAL-IDENTITY v1.0.0] current fetch did not provide "
+                    "valid identity proof for: "
+                    + "; ".join(
+                        f"{failure.symbol} ({failure.reason})"
+                        for failure in _critical_identity_failures
+                    )
+                )
+                res.warnings.append(_fresh_msg)
+                logger.error(_fresh_msg)
+
         # --- Symbol<->Name identity tripwire (v6.22.0 L3) --------------------
         # Live failure mode (2026-07-08 17:30-18:12 UTC): the response carried
         # the REQUESTED symbols with attribute payloads belonging to OTHER
@@ -5776,6 +5802,7 @@ async def _run_one_task(
                     res.rows_failed = 0
                     res.warnings.append(_msg)
                     logger.error(_msg)
+                    fail_result_on_identity(res, _critical_identity_failures)
                     return res
             except Exception as _ie:  # never let the tripwire break the write path
                 _iw = f"{_IDENTITY_TAG} skipped (error: {_ie})"
@@ -5826,6 +5853,7 @@ async def _run_one_task(
                         res.rows_failed = 0
                         res.warnings.append(_cmsg)
                         logger.error(_cmsg)
+                        fail_result_on_identity(res, _critical_identity_failures)
                         return res
                 else:
                     res.warnings.append(
@@ -5856,6 +5884,7 @@ async def _run_one_task(
                 res.status = "partial"
                 res.rows_written = 0
                 res.rows_failed = len(rows_matrix or [])
+                fail_result_on_identity(res, _critical_identity_failures)
                 return res
         # ---------------------------------------------------------------------
 
@@ -5900,6 +5929,7 @@ async def _run_one_task(
             res.rows_failed = 0
             res.warnings.append(msg)
             logger.warning(msg)
+            fail_result_on_identity(res, _critical_identity_failures)
             return res
         # ---------------------------------------------------------------------
 
@@ -5940,6 +5970,7 @@ async def _run_one_task(
                 res.rows_failed = 0
                 res.warnings.append(msg)
                 logger.warning(msg)
+                fail_result_on_identity(res, _critical_identity_failures)
                 return res
             msg = (
                 f"[v6.25.0 FLOOR-MERGE] Partial fetch on '{task.sheet_name}': "
@@ -5980,8 +6011,6 @@ async def _run_one_task(
                 _pw = f"{_SYMBOL_PERSISTENCE_TAG} skipped (error: {_pe})"
                 res.warnings.append(_pw)
                 logger.warning(_pw)
-
-        _critical_identity_failures: list = []
 
         # --- Keep-last-good substitution (v6.22.3 L4c) ------------------------
         # Persistence protects a symbol the backend OMITS; a symbol answered
@@ -6155,8 +6184,15 @@ async def _run_one_task(
         # a tagged symbol-only stub, then force the page result RED after write.
         if (task.expects_rows and rows_matrix and headers
                 and task.sheet_name in _RANKED_MARKET_PAGES):
-            rows_matrix, _critical_identity_failures = quarantine_critical_rows(
+            rows_matrix, _outgoing_critical_failures = quarantine_critical_rows(
                 headers, rows_matrix
+            )
+            _known_critical_failures = {
+                (failure.symbol, failure.reason) for failure in _critical_identity_failures
+            }
+            _critical_identity_failures.extend(
+                failure for failure in _outgoing_critical_failures
+                if (failure.symbol, failure.reason) not in _known_critical_failures
             )
             if _critical_identity_failures:
                 _cf = (
@@ -6230,6 +6266,7 @@ async def _run_one_task(
                 res.rows_failed = 0
                 res.warnings.append(_hm)
                 logger.error(_hm)
+                fail_result_on_identity(res, _critical_identity_failures)
                 return res
         # ---------------------------------------------------------------------
 

@@ -202,10 +202,14 @@ def quarantine_critical_rows(
     for row_index, row in enumerate(list(rows)):
         if not isinstance(row, list) or sym_i >= len(row):
             continue
-        symbol = normalize_symbol(row[sym_i])
+        # Provider responses are not guaranteed to echo the current request
+        # spelling.  Resolve aliases here (rather than relying on the batched
+        # fetcher) so the same rule is selected on every call path.
+        symbol = canonicalize_symbol(row[sym_i])
         rule = CRITICAL_IDENTITIES.get(symbol)
         if rule is None:
             continue
+        row[sym_i] = symbol
 
         name = row[name_i] if 0 <= name_i < len(row) else ""
         name_text = _norm_cell(name)
@@ -239,6 +243,42 @@ def quarantine_critical_rows(
             IdentityFailure(symbol=symbol, reason=reason, seen_name=str(name or "")[:100])
         )
 
+    return rows, failures
+
+
+def validate_fresh_critical_rows(
+    headers: Sequence[Any],
+    rows: MutableSequence[list[Any]],
+    requested_symbols: Iterable[Any],
+) -> tuple[MutableSequence[list[Any]], list[IdentityFailure]]:
+    """Validate current-run proof for every requested critical identifier.
+
+    This must run directly after response membership filtering, before any
+    persistence or KEEP-LAST-GOOD operation can add a predecessor row.  A
+    valid predecessor protects stored data, but is deliberately not evidence
+    that the provider returned the right instrument in this run.
+    """
+    requested = {
+        canonicalize_symbol(symbol)
+        for symbol in requested_symbols
+        if canonicalize_symbol(symbol) in CRITICAL_FETCH_SYMBOLS
+    }
+    rows, failures = quarantine_critical_rows(headers, rows)
+    failed = {failure.symbol for failure in failures}
+
+    sym_i = _find_column(headers, ("Symbol", "Ticker", "Code"))
+    returned: set[str] = set()
+    if sym_i >= 0:
+        for row in rows:
+            if not isinstance(row, list) or sym_i >= len(row):
+                continue
+            symbol = canonicalize_symbol(row[sym_i])
+            if symbol in requested:
+                row[sym_i] = symbol
+                returned.add(symbol)
+
+    for symbol in sorted(requested - returned - failed):
+        failures.append(IdentityFailure(symbol=symbol, reason="missing fresh response row"))
     return rows, failures
 
 
