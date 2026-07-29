@@ -6,11 +6,9 @@ on:
       - '.github/**'
       - 'scripts/audit_repository_workflows.py'
       - 'tests/test_repository_workflow_audit.py'
+  # Required checks must start on every PR. Path-filtered required workflows can
+  # remain pending forever on source-only changes and block otherwise valid PRs.
   pull_request:
-    paths:
-      - '.github/**'
-      - 'scripts/audit_repository_workflows.py'
-      - 'tests/test_repository_workflow_audit.py'
   workflow_dispatch:
 
 permissions:
