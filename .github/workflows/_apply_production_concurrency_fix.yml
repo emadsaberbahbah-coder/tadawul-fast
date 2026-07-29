@@ -1,0 +1,50 @@
+name: Apply production concurrency fix
+
+on:
+  push:
+    branches:
+      - fix/production-concurrency-inline-recovery-2026-07-29
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Apply fail-closed workflow redesign
+        run: python scripts/_apply_production_concurrency_fix.py
+
+      - name: Compile and test recovery code
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            scripts/run_inline_page_recovery.py \
+            scripts/plan_sync_recovery.py \
+            scripts/audit_sync_outcome.py \
+            tests/test_inline_page_recovery.py
+          python -m unittest \
+            tests/test_sync_outcome_audit.py \
+            tests/test_sync_recovery_plan.py \
+            tests/test_inline_page_recovery.py
+          git diff --check
+          test ! -e scripts/_apply_production_concurrency_fix.py
+          test ! -e .github/workflows/_apply_production_concurrency_fix.yml
+
+      - name: Commit final workflow files
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/daily_sync.yml \
+                  .github/workflows/page_refresh_recovery.yml \
+                  scripts/_apply_production_concurrency_fix.py \
+                  .github/workflows/_apply_production_concurrency_fix.yml
+          git commit -m "Fix production concurrency and inline page recovery"
+          git push origin HEAD
