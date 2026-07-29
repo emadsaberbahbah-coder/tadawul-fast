@@ -20,8 +20,10 @@ CRITICAL_IDENTITY_TAG = "identity_quarantined:critical_registry:v1.0.0"
 CANONICAL_SYMBOLS: Mapping[str, str] = {
     "BK": "BK.US",
     "BRK-B": "BRK-B.US",
+    "BRK.B": "BRK-B.US",
     "FI": "FISV.US",
     "FI.US": "FISV.US",
+    "FISV": "FISV.US",
 }
 
 # These identifiers must not remain in the active refresh universe.
@@ -39,7 +41,7 @@ INACTIVE_SYMBOLS: Mapping[str, str] = {
 class IdentityRule:
     accepted_name_tokens: tuple[str, ...]
     currency_tokens: tuple[str, ...] = ("usd",)
-    country_tokens: tuple[str, ...] = ("usa", "united states", "us")
+    country_tokens: tuple[str, ...] = ("usa", "united states")
     exchange_tokens: tuple[str, ...] = ()
 
 
@@ -80,6 +82,11 @@ def normalize_symbol(value: Any) -> str:
     return str(value or "").strip().upper()
 
 
+def canonicalize_symbol(value: Any) -> str:
+    symbol = normalize_symbol(value)
+    return CANONICAL_SYMBOLS.get(symbol, symbol)
+
+
 def sanitize_active_universe(symbols: Iterable[Any]) -> tuple[list[str], list[UniverseChange]]:
     """Remove inactive identifiers, canonicalize collision-prone US tickers,
     and de-duplicate stably.
@@ -106,7 +113,7 @@ def sanitize_active_universe(symbols: Iterable[Any]) -> tuple[list[str], list[Un
             )
             continue
 
-        target = CANONICAL_SYMBOLS.get(source, source)
+        target = canonicalize_symbol(source)
         if target != source:
             changes.append(
                 UniverseChange(

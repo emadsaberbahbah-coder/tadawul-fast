@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.28.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.30.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1201,6 +1201,23 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+try:
+    from scripts.critical_symbol_identity import (
+        build_isolated_batches,
+        canonicalize_symbol,
+        fail_result_on_identity,
+        quarantine_critical_rows,
+        sanitize_active_universe,
+    )
+except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
+    from critical_symbol_identity import (
+        build_isolated_batches,
+        canonicalize_symbol,
+        fail_result_on_identity,
+        quarantine_critical_rows,
+        sanitize_active_universe,
+    )
+
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
@@ -1260,7 +1277,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.29.0"
+SCRIPT_VERSION = "6.30.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -4776,7 +4793,7 @@ async def _fetch_market_rows_batched(
 
     size = _symbol_batch_size()
     delay_ms = _batch_delay_ms()
-    batches = [symbols[i:i + size] for i in range(0, len(symbols), size)]
+    batches = build_isolated_batches(symbols, size)
     candidates = _endpoint_candidates_for_gateway(eff_gw)
 
     headers: List[Any] = []
@@ -4846,7 +4863,7 @@ async def _fetch_market_rows_batched(
                     _idb_sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
             if b_matrix:
                 if _idb_on and _idb_sym_i >= 0:
-                    _batch_set = {str(t or "").strip().upper() for t in batch}
+                    _batch_set = {canonicalize_symbol(t) for t in batch}
                     _batch_set.discard("")
                     for _row in b_matrix:
                         if (not isinstance(_row, (list, tuple))
@@ -4854,7 +4871,8 @@ async def _fetch_market_rows_batched(
                                 or _guard_is_blank(_row[_idb_sym_i])):
                             _idb_blank += 1
                             continue
-                        _t = str(_row[_idb_sym_i]).strip().upper()
+                        _t = canonicalize_symbol(_row[_idb_sym_i])
+                        _row[_idb_sym_i] = _t
                         if _t not in _batch_set:
                             _idb_bleed += 1
                             continue
@@ -4921,7 +4939,7 @@ async def _fetch_market_rows_batched(
                     _idb_sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
             if b_matrix:
                 if _idb_on and _idb_sym_i >= 0:
-                    _batch_set = {str(t or "").strip().upper() for t in rbatch}
+                    _batch_set = {canonicalize_symbol(t) for t in rbatch}
                     _batch_set.discard("")
                     for _row in b_matrix:
                         if (not isinstance(_row, (list, tuple))
@@ -4929,7 +4947,8 @@ async def _fetch_market_rows_batched(
                                 or _guard_is_blank(_row[_idb_sym_i])):
                             _idb_blank += 1
                             continue
-                        _t = str(_row[_idb_sym_i]).strip().upper()
+                        _t = canonicalize_symbol(_row[_idb_sym_i])
+                        _row[_idb_sym_i] = _t
                         if _t not in _batch_set:
                             _idb_bleed += 1
                             continue
@@ -4955,7 +4974,7 @@ async def _fetch_market_rows_batched(
     if _idb_on and _idb_sym_i >= 0:
         combined = [
             _idb_by_sym[t]
-            for t in (str(s or "").strip().upper() for s in symbols)
+            for t in (canonicalize_symbol(s) for s in symbols)
             if t in _idb_by_sym
         ]
         if _idb_bleed or _idb_dupes or _idb_blank:
@@ -5453,6 +5472,29 @@ async def _run_one_task(
                         logger.warning(_fw)
                     _existing_syms = _clean_syms
             if _existing_syms:
+                _existing_syms, _critical_universe_changes = sanitize_active_universe(
+                    _existing_syms
+                )
+                if _critical_universe_changes:
+                    _change_notes = []
+                    for _change in _critical_universe_changes[:20]:
+                        if _change.target_symbol:
+                            _change_notes.append(
+                                f"{_change.source_symbol}->{_change.target_symbol} "
+                                f"({_change.action})"
+                            )
+                        else:
+                            _change_notes.append(
+                                f"{_change.source_symbol} ({_change.action}: "
+                                f"{_change.reason})"
+                            )
+                    _cw = (
+                        "[CRITICAL-IDENTITY v1.0.0] sanitized active universe on "
+                        f"'{task.sheet_name}': " + "; ".join(_change_notes)
+                    )
+                    res.warnings.append(_cw)
+                    logger.warning(_cw)
+            if _existing_syms:
                 symbols = _existing_syms
                 res.warnings.append(
                     f"{_MARKET_READBACK_TAG} sourced {len(symbols)} symbol(s) from the {task.sheet_name} sheet"
@@ -5939,6 +5981,8 @@ async def _run_one_task(
                 res.warnings.append(_pw)
                 logger.warning(_pw)
 
+        _critical_identity_failures: list = []
+
         # --- Keep-last-good substitution (v6.22.3 L4c) ------------------------
         # Persistence protects a symbol the backend OMITS; a symbol answered
         # with a DATA-FREE ERROR STUB is "present", passes every membership
@@ -6105,6 +6149,29 @@ async def _run_one_task(
                 res.warnings.append(_dw)
                 logger.warning(_dw)
 
+        # --- v6.30.0: exact critical Symbol->Issuer firewall -----------------
+        # Page-level anchor thresholds intentionally tolerate one mismatch; these
+        # known collision symbols do not. Purge a poisoned predecessor by writing
+        # a tagged symbol-only stub, then force the page result RED after write.
+        if (task.expects_rows and rows_matrix and headers
+                and task.sheet_name in _RANKED_MARKET_PAGES):
+            rows_matrix, _critical_identity_failures = quarantine_critical_rows(
+                headers, rows_matrix
+            )
+            if _critical_identity_failures:
+                _cf = (
+                    "[CRITICAL-IDENTITY v1.0.0] quarantined "
+                    f"{len(_critical_identity_failures)} exact identity mismatch(es) "
+                    f"on '{task.sheet_name}': "
+                    + "; ".join(
+                        f"{_f.symbol}={_f.seen_name!r} ({_f.reason})"
+                        for _f in _critical_identity_failures[:10]
+                    )
+                    + " — page verdict will be failed even if the stub write succeeds."
+                )
+                res.warnings.append(_cf)
+                logger.error(_cf)
+
         # --- v6.24.0 FW-3: workbook verdict line (best-effort) ------------
         if (task.expects_rows and task.sheet_name in _RANKED_MARKET_PAGES
                 and sheets is not None):
@@ -6211,6 +6278,8 @@ async def _run_one_task(
             else:
                 res.rows_failed = max(0, len(rows_matrix) - res.rows_written)
                 res.status = "success" if res.rows_failed == 0 else ("partial" if res.rows_written > 0 else "failed")
+            if _critical_identity_failures:
+                fail_result_on_identity(res, _critical_identity_failures)
         except Exception as e:
             res.status = "failed"
             res.error = f"Write failed: {e}"
