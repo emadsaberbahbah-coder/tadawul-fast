@@ -5704,14 +5704,6 @@ async def _run_one_task(
         # provider response into a green verdict.
         _critical_identity_failures: list = []
 
-        # No creds => partial (data fetched but not written)
-        if sheets is None or sheets._get_service() is None:
-            res.status = "partial"
-            res.warnings.append("No Google Sheets credentials. Backend data fetched but not written.")
-            res.rows_written = 0
-            res.rows_failed = len(rows_matrix or [])
-            return res
-
         # --- Strict response membership (v6.19.1) ----------------------------
         # The backend can return MORE rows than were requested (gateway/universe
         # over-return — the confirmed no-paste origin of the 749 -> 3,068
@@ -5746,8 +5738,7 @@ async def _run_one_task(
                 logger.warning(_sm)
         # ---------------------------------------------------------------------
 
-        if (task.expects_rows and symbols and headers
-                and task.sheet_name in _RANKED_MARKET_PAGES):
+        if task.expects_rows and symbols and headers:
             rows_matrix, _critical_identity_failures = validate_fresh_critical_rows(
                 headers, rows_matrix, symbols
             )
@@ -5762,6 +5753,17 @@ async def _run_one_task(
                 )
                 res.warnings.append(_fresh_msg)
                 logger.error(_fresh_msg)
+
+        # No creds => partial (data fetched but not written). Critical identity
+        # validation has already run, so this path cannot report green when
+        # fresh identity proof is missing or invalid.
+        if sheets is None or sheets._get_service() is None:
+            res.status = "partial"
+            res.warnings.append("No Google Sheets credentials. Backend data fetched but not written.")
+            res.rows_written = 0
+            res.rows_failed = len(rows_matrix or [])
+            fail_result_on_identity(res, _critical_identity_failures)
+            return res
 
         # --- Symbol<->Name identity tripwire (v6.22.0 L3) --------------------
         # Live failure mode (2026-07-08 17:30-18:12 UTC): the response carried
