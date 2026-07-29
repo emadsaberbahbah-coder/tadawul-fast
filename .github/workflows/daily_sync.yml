@@ -57,54 +57,21 @@ on:
         type: boolean
 
 # ============================================================================
-# CONCURRENCY — SINGLE WRITE LEASE ON THE PRODUCTION WORKBOOK
+# CONCURRENCY — PRODUCTION WRITE LEASE, CI ISOLATED
 # ============================================================================
-# WHY (2026-07-24, [VBREAK] window fix — evidence integrity):
-#   The group key previously included ${{ github.event_name }}. Because a cron
-#   fire reports event_name="schedule" and an operator run reports
-#   "workflow_dispatch", the two occupied DIFFERENT concurrency groups and were
-#   therefore ALLOWED TO RUN AT THE SAME TIME — both holding write access to the
-#   same production workbook, interleaving writes on the same tabs.
+# WHY (2026-07-29): push/PR runs execute tests only and never write the workbook.
+# Putting those CI-only runs in the production write group caused GitHub's
+# one-running/one-pending concurrency rule to cancel both Advanced Sync and Page
+# Refresh Recovery runs before they started. Scheduled and manual production syncs
+# must still share one lease to prevent chimeric Google Sheet writes.
 #
-#   That is a chimeric-write path requiring NO human error and NO bad commit;
-#   only a timing coincidence between the 4-hourly cron and a manual dispatch
-#   during an audit session. Chimeric writes are the exact failure class behind
-#   the original contamination crisis, and under Gate & Evidence Register §5 a
-#   chimeric write reaching the shadow board is a TAINTED day -> window RESTART
-#   (~4 weeks of evidence lost).
-#
-#   FIX 1 — event_name dropped: every write-capable trigger (push, schedule,
-#   workflow_dispatch, pull_request) now shares ONE lease per ref. At most one
-#   run holds the workbook at any instant.
-#
-#   FIX 2 — cancel-in-progress: true -> false: a newly triggered run must WAIT
-#   for the in-flight writer to finish rather than killing it. Cancelling a
-#   sync mid-write would abandon the workbook in a partially-written state,
-#   which is the same disease this block exists to cure. Waiting is correct;
-#   pre-empting is not.
-#
-# ACCEPTED COSTS (stated, not hidden):
-#   (a) A push now queues behind a running sync, delaying CI feedback by up to
-#       the sync's timeout-minutes: 115. This is removed by the standalone
-#       ci.yml (Part 2), which gets its own concurrency group.
-#   (b) GitHub holds at most one pending run per group; a third trigger
-#       supersedes the pending one. A scheduled sync can therefore be skipped
-#       if a long manual run is holding the lease. This is bounded and
-#       recoverable: sync-dashboard is capped at timeout-minutes: 115 while
-#       cron fires every 240 minutes, so the lease is always released well
-#       before the next scheduled fire. A skipped sync is visible in the
-#       Actions tab and self-heals on the next run; a chimeric write is
-#       neither visible nor reversible. The trade is deliberate.
-#
-# ROLLBACK: restore the two lines below to
-#   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-#   cancel-in-progress: true
-# No redeploy, no ENV change, no code path involved.
+# Production: schedule + workflow_dispatch share one non-cancelling write lease.
+# CI only: push + pull_request use their own cancellable group and never block data
+# refresh or recovery.
 # ============================================================================
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
+  group: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('tadawul-production-write-{0}', github.ref) || format('tadawul-ci-{0}-{1}-{2}', github.workflow, github.event_name, github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 permissions:
   contents: read
   id-token: write
@@ -199,7 +166,7 @@ jobs:
             exit 1
           fi
 
-          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py
+          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py tests/test_inline_page_recovery.py
           echo "::endgroup::"
 
   # =============================================================================
@@ -1154,7 +1121,7 @@ jobs:
       # -------------------------------------------------------------------------
       - name: 📤 Upload Logs
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: tadawul-sync-logs-${{ github.run_id }}-${{ matrix.group }}
           path: |
@@ -1237,3 +1204,181 @@ jobs:
             echo "ℹ️  No credentials file to remove"
           fi
           echo "::endgroup::"
+
+  # =============================================================================
+  # AUTOMATIC INLINE PAGE RECOVERY — retains the same production write lease
+  # =============================================================================
+  recover-missing-market-pages:
+    name: 🧯 Recover missing market pages
+    needs: sync-dashboard
+    if: >-
+      ${{
+        always() &&
+        (
+          github.event_name == 'schedule' ||
+          (
+            github.event_name == 'workflow_dispatch' &&
+            github.event.inputs.run_mode == 'full_sync'
+          )
+        )
+      }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 360
+    env:
+      PYTHON_VERSION: "3.11"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}
+      TZ: Asia/Riyadh
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      TARGET_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
+      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+      TFB_XPAGE_PRICE_CHECK: "1"
+      TFB_SYNC_EMPTY_RETRY: "0"
+      TFB_SYNC_NAME_DEDUP_MODE: "observe"
+      TFB_PORTFOLIO_REBUILD: "1"
+      TFB_SYNC_DECISION_GUARD: "1"
+      TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
+      TFB_SYNC_TIME_BUDGET_SEC: "3600"
+      TFB_SYNC_MAX_SYMBOLS_MARKET: "7000"
+      TFB_SYNC_MARKET_GATEWAY: "analysis"
+      BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
+
+    steps:
+      - name: 📥 Secure Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+
+      - name: 📦 Install Dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+          if [[ -f requirements.render.txt ]]; then
+            python -m pip install -r requirements.render.txt
+          elif [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "::error::No requirements file found."
+            exit 1
+          fi
+
+      - name: 📥 Download current sync evidence
+        uses: actions/download-artifact@v8
+        with:
+          pattern: tadawul-sync-logs-${{ github.run_id }}-*
+          path: source-sync-artifacts
+          merge-multiple: false
+
+      - name: 🔐 Configure production credentials
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TARGET_SHEET_ID:-}" ]]; then
+            echo "::error::vars.DEFAULT_SPREADSHEET_ID is empty."
+            exit 1
+          fi
+          RAW_CREDS="${SECRET_CREDS:-}"
+          if [[ -z "$RAW_CREDS" && -n "${SECRET_CREDS_B64:-}" ]]; then
+            RAW_CREDS="$(printf '%s' "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
+          fi
+          if [[ -z "$RAW_CREDS" ]] || ! printf '%s' "$RAW_CREDS" | jq empty >/dev/null 2>&1; then
+            echo "::error::No valid Google Sheets credentials found."
+            exit 1
+          fi
+          CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
+          printf '%s' "$RAW_CREDS" > "$CREDS_PATH"
+          chmod 600 "$CREDS_PATH"
+          SA_EMAIL="$(jq -r '.client_email // empty' "$CREDS_PATH")"
+          [[ -n "$SA_EMAIL" ]] && echo "::add-mask::$SA_EMAIL"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
+
+      - name: 💓 Check backend health
+        run: |
+          set -euo pipefail
+          for endpoint in /readyz /health /livez; do
+            if curl -fsS --max-time 15 "$TARGET_URL$endpoint" >/dev/null; then
+              echo "Backend healthy via $endpoint"
+              exit 0
+            fi
+          done
+          echo "::error::Backend health checks failed."
+          exit 1
+
+      - name: 🧯 Recover only pages that did not refresh
+        run: |
+          set -euo pipefail
+          python scripts/run_inline_page_recovery.py \
+            --source-root source-sync-artifacts \
+            --backend "$TARGET_URL" \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --evidence-root inline-recovery-evidence \
+            --plan-out inline-recovery-plan.json \
+            --summary-out inline-recovery-summary.json
+
+      - name: 📤 Upload recovery plan and summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: inline-recovery-${{ github.run_id }}
+          path: |
+            inline-recovery-plan.json
+            inline-recovery-summary.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: 📤 Upload Global Markets evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: page-refresh-${{ github.run_id }}-global-markets
+          path: inline-recovery-evidence/global-markets
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: 📤 Upload Commodities/FX evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: page-refresh-${{ github.run_id }}-commodities-fx
+          path: inline-recovery-evidence/commodities-fx
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: 📤 Upload Mutual Funds evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: page-refresh-${{ github.run_id }}-mutual-funds
+          path: inline-recovery-evidence/mutual-funds
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: 📤 Upload Market Leaders evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: page-refresh-${{ github.run_id }}-market-leaders
+          path: inline-recovery-evidence/market-leaders
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: 🧹 Secure Cleanup
+        if: always()
+        run: |
+          CREDS_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$RUNNER_TEMP/google_credentials.json}"
+          if [[ -f "$CREDS_PATH" ]]; then
+            shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
+          fi
