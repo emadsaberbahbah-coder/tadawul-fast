@@ -6,19 +6,20 @@ on:
       - '.github/workflows/page_refresh_recovery.yml'
       - 'scripts/audit_sync_outcome.py'
       - 'scripts/plan_sync_recovery.py'
+      - 'scripts/run_inline_page_recovery.py'
       - 'tests/test_sync_outcome_audit.py'
       - 'tests/test_sync_recovery_plan.py'
+      - 'tests/test_inline_page_recovery.py'
   push:
     branches: [main]
     paths:
       - '.github/workflows/page_refresh_recovery.yml'
       - 'scripts/audit_sync_outcome.py'
       - 'scripts/plan_sync_recovery.py'
+      - 'scripts/run_inline_page_recovery.py'
       - 'tests/test_sync_outcome_audit.py'
       - 'tests/test_sync_recovery_plan.py'
-  workflow_run:
-    workflows: ['🏦 Tadawul Dashboard Advanced Sync']
-    types: [completed]
+      - 'tests/test_inline_page_recovery.py'
   workflow_dispatch:
     inputs:
       run_id:
@@ -30,12 +31,12 @@ permissions:
   contents: read
   actions: read
 
-# Match the production workflow's resolved concurrency key. A recovery run starts
-# after its source run, and this shared key also prevents a manual/scheduled sync
-# from writing the production workbook while recovery is active.
+# Automatic recovery now runs inside Advanced Sync and keeps the same production
+# lease. This workflow remains for manual historical-run recovery only. Its CI
+# tests use a separate cancellable group and never compete with production writes.
 concurrency:
-  group: 🏦 Tadawul Dashboard Advanced Sync-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'workflow_dispatch' && format('tadawul-production-write-{0}', github.ref) || format('page-recovery-ci-{0}-{1}', github.event_name, github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   regression-tests:
@@ -57,28 +58,21 @@ jobs:
           python -m py_compile \
             scripts/audit_sync_outcome.py \
             scripts/plan_sync_recovery.py \
+            scripts/run_inline_page_recovery.py \
             tests/test_sync_outcome_audit.py \
-            tests/test_sync_recovery_plan.py
+            tests/test_sync_recovery_plan.py \
+            tests/test_inline_page_recovery.py
 
       - name: Run recovery regression tests
         run: |
           python -m unittest \
             tests/test_sync_outcome_audit.py \
-            tests/test_sync_recovery_plan.py
+            tests/test_sync_recovery_plan.py \
+            tests/test_inline_page_recovery.py
 
   plan:
     name: Plan missing page refreshes
-    if: >-
-      ${{
-        github.event_name == 'workflow_dispatch' ||
-        (
-          github.event_name == 'workflow_run' &&
-          (
-            github.event.workflow_run.event == 'schedule' ||
-            github.event.workflow_run.event == 'workflow_dispatch'
-          )
-        )
-      }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
