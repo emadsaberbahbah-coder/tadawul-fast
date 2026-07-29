@@ -24,8 +24,8 @@ Why this file exists
        provider checking that flag stays offline.
 - FIX: schema contract tests can inspect routes before FastAPI's lifespan has
        mounted startup-owned routers. The lifecycle-safe hook below invokes the
-       same production mount function and then retries discovery; genuine route
-       import or mount failures remain visible and still fail the test.
+       same controlled production mounting implementation and then retries
+       discovery; genuine route import or mount failures remain visible.
 
 Notes
 -----
@@ -37,6 +37,7 @@ Notes
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -93,11 +94,12 @@ def pytest_runtest_setup(item: Any) -> None:
     """Make schema endpoint discovery lifecycle-safe without masking failures.
 
     `test_schema_alignment` historically discovers `/sheet-rows` routes before
-    entering `TestClient`, while the application is allowed to mount routers in
-    FastAPI startup. When the first discovery sees no endpoint, call the same
-    production `_mount_routes_once` helper on that test app and retry. If route
-    imports, filtering, or mounting are genuinely broken, the original helper
-    raises again and CI remains red.
+    entering `TestClient`, while the application may mount routers during its
+    lifespan. If the first lookup is empty, run the same controlled mounting
+    implementation used by production and retry. `_mount_routes_controlled` is
+    deliberately used rather than `_mount_routes_once`: a partially completed
+    prestart attempt may already have set `routes_mounted=True`, and the once
+    guard would then return without retrying missing route families.
     """
     module = getattr(item, "module", None)
     if module is None or not str(getattr(module, "__name__", "")).endswith(
@@ -117,16 +119,43 @@ def pytest_runtest_setup(item: Any) -> None:
                 raise
 
         # Importing main is safe in the test environment: network and engine
-        # boot are disabled above. Use the real production mount helper.
+        # boot are disabled above. Re-run the actual controlled mount directly
+        # so a stale/partial `routes_mounted` flag cannot suppress the retry.
         import main as main_mod
 
-        mount_once = getattr(main_mod, "_mount_routes_once", None)
-        if not callable(mount_once):
+        controlled_mount = getattr(main_mod, "_mount_routes_controlled", None)
+        if not callable(controlled_mount):
             raise AssertionError(
-                "main._mount_routes_once is unavailable for schema contract setup"
+                "main._mount_routes_controlled is unavailable for contract setup"
             )
-        mount_once(app, phase="pytest-contract-discovery")
-        return original(app)
+
+        snapshot = controlled_mount(app)
+        try:
+            app.state.routes_snapshot = snapshot
+            app.state.routes_mounted = True
+            app.state.routes_mount_phase = "pytest-contract-discovery"
+        except Exception:
+            pass
+
+        try:
+            return original(app)
+        except AssertionError as exc:
+            diagnostics = {
+                "import_errors": dict(snapshot.get("import_errors", {}) or {}),
+                "mount_errors": dict(snapshot.get("mount_errors", {}) or {}),
+                "no_router": dict(snapshot.get("no_router", {}) or {}),
+                "filtered_out_routes": dict(
+                    snapshot.get("filtered_out_routes", {}) or {}
+                ),
+                "mounted": list(snapshot.get("mounted", []) or []),
+                "route_family_presence": dict(
+                    snapshot.get("route_family_presence", {}) or {}
+                ),
+            }
+            raise AssertionError(
+                f"{exc} Controlled-mount diagnostics: "
+                f"{json.dumps(diagnostics, ensure_ascii=False, default=str)}"
+            ) from exc
 
     lifecycle_safe_find._tfb_lifecycle_safe = True  # type: ignore[attr-defined]
     setattr(module, "_find_sheet_rows_endpoints", lifecycle_safe_find)
