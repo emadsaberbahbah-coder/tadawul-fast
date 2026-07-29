@@ -45,7 +45,7 @@ def audit_workflow_text(path: str, text: str) -> list[Finding]:
     findings: list[Finding] = []
 
     action_pattern = re.compile(
-        r"(?m)^\s*uses:\s*"
+        r"(?m)^\s*(?:-\s*)?uses:\s*"
         r"(actions/(?:checkout|setup-python|upload-artifact))@v(\d+)\s*$"
     )
     for match in action_pattern.finditer(text):
