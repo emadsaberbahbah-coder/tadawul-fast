@@ -1,0 +1,119 @@
+name: 🚦 Sync Outcome Audit
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/sync_outcome_audit.yml'
+      - 'scripts/audit_sync_outcome.py'
+      - 'tests/test_sync_outcome_audit.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sync_outcome_audit.yml'
+      - 'scripts/audit_sync_outcome.py'
+      - 'tests/test_sync_outcome_audit.py'
+  workflow_run:
+    workflows: ['🏦 Tadawul Dashboard Advanced Sync']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Existing Daily Sync run ID to audit'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: sync-outcome-audit-${{ github.event.workflow_run.id || inputs.run_id || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression-tests:
+    name: Sync outcome audit tests
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Compile auditor
+        run: python -m py_compile scripts/audit_sync_outcome.py tests/test_sync_outcome_audit.py
+
+      - name: Run regression tests
+        run: python -m unittest tests/test_sync_outcome_audit.py
+
+  audit-scheduled-run:
+    name: Verify required market pages actually refreshed
+    if: >-
+      ${{
+        (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'schedule') ||
+        github.event_name == 'workflow_dispatch'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Resolve source run
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            RUN_ID="$WORKFLOW_RUN_ID"
+            if [[ "$WORKFLOW_CONCLUSION" != "success" ]]; then
+              echo "::error::Source Daily Sync run concluded '$WORKFLOW_CONCLUSION'."
+              exit 1
+            fi
+          else
+            RUN_ID="$INPUT_RUN_ID"
+          fi
+          if [[ ! "$RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid workflow run id: '$RUN_ID'"
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Auditing Daily Sync run $RUN_ID"
+
+      - name: Download source run artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: tadawul-sync-logs-${{ steps.source.outputs.run_id }}-*
+          path: downloaded-sync-artifacts
+          merge-multiple: false
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Audit page verdicts
+        run: |
+          python scripts/audit_sync_outcome.py \
+            --root downloaded-sync-artifacts \
+            --json-out sync-outcome-audit.json
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sync-outcome-audit-${{ steps.source.outputs.run_id }}
+          path: sync-outcome-audit.json
+          retention-days: 30
+          if-no-files-found: warn
