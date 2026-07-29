@@ -2,6 +2,13 @@
 """Corrected one-shot wrapper for the concurrency workflow patch."""
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from scripts import _apply_production_concurrency_fix as original
 
 SELF = original.ROOT / "scripts" / "_apply_production_concurrency_fix_v2.py"
