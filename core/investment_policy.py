@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -30,12 +31,29 @@ class GateResult:
 
 
 def _number(value: Any) -> Optional[float]:
+    """Return a finite float; non-numeric, NaN, and infinities are unknown."""
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
+
+
+def _is_missing(value: Any) -> bool:
+    """Treat empty/content-free required values as missing without rejecting 0/False."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, Mapping):
+        return not value or all(_is_missing(item) for item in value.values())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return not value or all(_is_missing(item) for item in value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return True
+    return False
 
 
 @lru_cache(maxsize=4)
@@ -118,7 +136,9 @@ def evaluate_speculation_gate(
         reasons.append("INSUFFICIENT_TRADING_HISTORY")
 
     split_days = _number(candidate.get("reverse_split_days_ago"))
-    if split_days is not None and split_days <= float(gate["recent_reverse_split_days"]):
+    if split_days is None:
+        reasons.append("UNKNOWN_CRITICAL_REVERSE_SPLIT_HISTORY")
+    elif split_days <= float(gate["recent_reverse_split_days"]):
         reasons.append("RECENT_REVERSE_SPLIT")
 
     one_day = abs(_number(candidate.get("one_day_return_pct")) or 0.0)
@@ -149,23 +169,44 @@ def validate_price_plan(
     section = cfg["entry_price_policy"] if side_upper == "BUY" else cfg["exit_price_policy"]
     missing = [
         field for field in section["required_fields"]
-        if plan.get(field) in (None, "", [])
+        if _is_missing(plan.get(field))
     ]
     reasons = [f"MISSING_{field.upper()}" for field in missing]
 
     if side_upper == "BUY":
-        low = _number(plan.get("buy_zone_low"))
-        high = _number(plan.get("buy_zone_high"))
-        max_price = _number(plan.get("max_acceptable_price"))
+        numeric_fields = {
+            "buy_zone_low": _number(plan.get("buy_zone_low")),
+            "buy_zone_high": _number(plan.get("buy_zone_high")),
+            "max_acceptable_price": _number(plan.get("max_acceptable_price")),
+        }
+        for field, number in numeric_fields.items():
+            if not _is_missing(plan.get(field)) and number is None:
+                reasons.append(f"INVALID_NUMERIC_{field.upper()}")
+
+        low = numeric_fields["buy_zone_low"]
+        high = numeric_fields["buy_zone_high"]
+        max_price = numeric_fields["max_acceptable_price"]
         if None not in (low, high) and low > high:
             reasons.append("INVALID_BUY_ZONE")
         if None not in (high, max_price) and high > max_price:
             reasons.append("BUY_ZONE_EXCEEDS_MAX_ACCEPTABLE_PRICE")
     else:
-        low = _number(plan.get("sell_zone_low"))
-        high = _number(plan.get("sell_zone_high"))
+        numeric_fields = {
+            "sell_zone_low": _number(plan.get("sell_zone_low")),
+            "sell_zone_high": _number(plan.get("sell_zone_high")),
+            "min_acceptable_exit_price": _number(plan.get("min_acceptable_exit_price")),
+        }
+        for field, number in numeric_fields.items():
+            if not _is_missing(plan.get(field)) and number is None:
+                reasons.append(f"INVALID_NUMERIC_{field.upper()}")
+
+        low = numeric_fields["sell_zone_low"]
+        high = numeric_fields["sell_zone_high"]
+        min_exit = numeric_fields["min_acceptable_exit_price"]
         if None not in (low, high) and low > high:
             reasons.append("INVALID_SELL_ZONE")
+        if None not in (min_exit, low) and min_exit > low:
+            reasons.append("MIN_EXIT_EXCEEDS_SELL_ZONE_LOW")
 
     if reasons:
         return GateResult(False, "INCOMPLETE_NOT_EXECUTABLE", tuple(sorted(set(reasons))))
@@ -178,7 +219,7 @@ def validate_recommendation_card(
 ) -> GateResult:
     cfg = dict(policy or load_policy())
     required: Sequence[str] = cfg["recommendation_card"]["required_fields"]
-    missing = [field for field in required if card.get(field) in (None, "", [])]
+    missing = [field for field in required if _is_missing(card.get(field))]
     if missing:
         return GateResult(
             False,
