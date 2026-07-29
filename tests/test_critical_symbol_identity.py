@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from scripts import run_dashboard_sync as rds
 from scripts.critical_symbol_identity import (
     CRITICAL_IDENTITY_TAG,
     build_isolated_batches,
@@ -14,6 +17,7 @@ from scripts.critical_symbol_identity import (
 
 
 HEADERS = ["Symbol", "Name", "Exchange", "Currency", "Country", "Current Price", "Warnings"]
+PRODUCTION_HEADERS = HEADERS + ["Data Provider"]
 
 
 class CriticalSymbolIdentityTests(unittest.TestCase):
@@ -77,8 +81,6 @@ class CriticalSymbolIdentityTests(unittest.TestCase):
         _, failures = validate_fresh_critical_rows(
             HEADERS, fresh_rows, ["AAPL", "FI.US"]
         )
-        # Simulate persistence restoring a perfectly valid predecessor only
-        # after current-run proof has already been recorded.
         fresh_rows.append(
             ["FISV.US", "Fiserv, Inc.", "NASDAQ", "USD", "USA", 51.0, ""]
         )
@@ -115,6 +117,127 @@ class CriticalSymbolIdentityTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.rows_failed, 1)
         self.assertIn("FISV.US", result.error)
+
+
+class _Backend:
+    def __init__(self, response_rows):
+        self.response_rows = response_rows
+        self.calls = []
+
+    async def post_json(self, path, payload):
+        self.calls.append((path, dict(payload)))
+        return {
+            "headers": list(PRODUCTION_HEADERS),
+            "rows_matrix": self.response_rows(payload),
+        }, None, 200
+
+
+class _Sheets:
+    def __init__(self, grid):
+        self.grid = grid
+        self.writes = []
+
+    def _get_service(self):
+        return object()
+
+    def read_values(self, spreadsheet_id, sheet_name, a1_range="A1:EZ2000"):
+        return [list(row) for row in self.grid]
+
+    def write_table(self, spreadsheet_id, sheet_name, start_a1, headers, rows):
+        self.writes.append((sheet_name, list(headers), [list(row) for row in rows]))
+        return len(rows)
+
+    def clear_from(self, *args, **kwargs):
+        return None
+
+
+class CriticalIdentityProductionPathTests(unittest.IsolatedAsyncioTestCase):
+    async def test_batched_alias_responses_are_canonicalized(self):
+        backend = _Backend(
+            lambda payload: [
+                [symbol, "placeholder", "NYSE", "USD", "USA", 1.0, "", "test"]
+                for symbol in payload["symbols"]
+            ]
+        )
+        task = rds.TaskSpec("MARKET_LEADERS", "Market_Leaders", "analysis", max_symbols=10)
+        result = rds.TaskResult(
+            key=task.key,
+            sheet_name=task.sheet_name,
+            status="pending",
+            start_utc="2026-07-29T00:00:00+00:00",
+        )
+        env = {
+            "TFB_SYNC_SYMBOL_BATCH_SIZE": "1",
+            "TFB_SYNC_BATCH_IDENTITY": "1",
+            "TFB_SYNC_BATCH_RETRY": "0",
+            "TFB_SYNC_TIME_BUDGET_SEC": "0",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            headers, rows, _, _ = await rds._fetch_market_rows_batched(
+                backend, task, ["FI.US", "BRK.B", "BK"], {}, "analysis", result
+            )
+
+        self.assertEqual(headers, PRODUCTION_HEADERS)
+        self.assertEqual([row[0] for row in rows], ["FISV.US", "BRK-B.US", "BK.US"])
+
+    async def test_non_batched_membership_canonicalizes_alias_responses(self):
+        rows = [
+            ["FI.US", "Fiserv, Inc.", "NASDAQ", "USD", "USA", 51.0, "", "test"],
+            ["BRK.B", "Berkshire Hathaway Inc.", "NYSE", "USD", "USA", 492.0, "", "test"],
+            ["BK", "The Bank of New York Mellon Corporation", "NYSE", "USD", "USA", 116.0, "", "test"],
+        ]
+        kept, dropped = rds._filter_rows_to_requested(
+            PRODUCTION_HEADERS, rows, ["FI.US", "BRK.B", "BK"]
+        )
+        self.assertEqual(dropped, [])
+        self.assertEqual([row[0] for row in kept], ["FISV.US", "BRK-B.US", "BK.US"])
+
+    async def test_run_one_task_no_credentials_fails_missing_fresh_critical_proof(self):
+        backend = _Backend(
+            lambda payload: [
+                ["AAPL", "Apple Inc.", "NASDAQ", "USD", "USA", 200.0, "", "test"]
+            ]
+        )
+        task = rds.TaskSpec("MY_PORTFOLIO", "My_Portfolio", "enriched", max_symbols=10)
+
+        with patch.object(rds, "_read_symbols", return_value=["FI.US"]), \
+             patch.dict(os.environ, {"TFB_PORTFOLIO_REBUILD": "0"}, clear=False):
+            result = await rds._run_one_task(
+                task, "sheet", "A5", -1, False, False, backend, None
+            )
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("FISV.US", result.error or "")
+        self.assertEqual(result.rows_written, 0)
+
+    async def test_run_one_task_successful_write_still_fails_missing_fresh_proof(self):
+        fresh_aapl = ["AAPL", "Apple Inc.", "NASDAQ", "USD", "USA", 200.0, "", "test"]
+        old_fisv = ["FISV.US", "Fiserv, Inc.", "NASDAQ", "USD", "USA", 51.0, "", "eodhd"]
+        sheets = _Sheets([PRODUCTION_HEADERS, fresh_aapl, old_fisv])
+        backend = _Backend(lambda payload: [list(fresh_aapl)])
+        task = rds.TaskSpec("MARKET_LEADERS", "Market_Leaders", "analysis", max_symbols=10)
+
+        env = {
+            "TFB_MARKET_SYMBOL_READBACK": "0",
+            "TFB_SYNC_SYMBOL_BATCH_SIZE": "0",
+            "TFB_SYNC_STRICT_MEMBERSHIP": "1",
+            "TFB_SYNC_SYMBOL_PERSISTENCE": "1",
+            "TFB_SYNC_PERSISTENCE_HARD": "1",
+            "TFB_SYNC_FLOOR_STRICT": "0",
+            "TFB_SYNC_IDFW_RUNLOG": "0",
+            "TFB_SYNC_NAME_DEDUP_MODE": "off",
+        }
+        with patch.object(rds, "_read_symbols", return_value=["AAPL", "FISV.US"]), \
+             patch.dict(os.environ, env, clear=False):
+            result = await rds._run_one_task(
+                task, "sheet", "A5", -1, False, False, backend, sheets
+            )
+
+        self.assertEqual(len(sheets.writes), 1, "the write path must actually execute")
+        self.assertEqual([row[0] for row in sheets.writes[0][2]], ["AAPL", "FISV.US"])
+        self.assertEqual(result.rows_written, 2)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("FISV.US", result.error or "")
 
 
 if __name__ == "__main__":
