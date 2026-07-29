@@ -1,0 +1,73 @@
+name: 🛡️ Investment Policy CI
+
+on:
+  push:
+    paths:
+      - 'core/investment_policy.py'
+      - 'config/project_wide_execution_learning_policy_v1.json'
+      - 'scripts/run_investment_policy_shadow.py'
+      - 'tests/test_investment_policy.py'
+      - '.github/workflows/investment_policy_*.yml'
+  pull_request:
+    paths:
+      - 'core/investment_policy.py'
+      - 'config/project_wide_execution_learning_policy_v1.json'
+      - 'scripts/run_investment_policy_shadow.py'
+      - 'tests/test_investment_policy.py'
+      - '.github/workflows/investment_policy_*.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: investment-policy-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Fail-closed policy tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Compile policy and shadow runner
+        run: |
+          python -m py_compile \
+            core/investment_policy.py \
+            scripts/run_investment_policy_shadow.py \
+            tests/test_investment_policy.py
+
+      - name: Run policy regression suite
+        run: python -m unittest tests/test_investment_policy.py
+
+      - name: Generate deterministic smoke artifact
+        run: |
+          cat > /tmp/policy-shadow-input.json <<'JSON'
+          [
+            {
+              "symbol": "AAPL.US",
+              "market": "NASDAQ",
+              "current_price": 200
+            }
+          ]
+          JSON
+          python scripts/run_investment_policy_shadow.py \
+            --input /tmp/policy-shadow-input.json \
+            --output /tmp/investment-policy-shadow-smoke.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("/tmp/investment-policy-shadow-smoke.json").read_text())
+          assert report["enforcement_applied"] is False
+          assert report["decision_effect"] == "NONE_SHADOW_ONLY"
+          assert report["evaluated"] == 1
+          assert report["would_block"] == 1
+          PY
