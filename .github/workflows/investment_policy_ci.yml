@@ -8,13 +8,10 @@ on:
       - 'scripts/run_investment_policy_shadow.py'
       - 'tests/test_investment_policy.py'
       - '.github/workflows/investment_policy_*.yml'
+  # This check is required by the main-branch ruleset. It must report on every
+  # pull request; path-filtering a required check can leave unrelated PRs
+  # permanently pending and therefore unmergeable.
   pull_request:
-    paths:
-      - 'core/investment_policy.py'
-      - 'config/project_wide_execution_learning_policy_v1.json'
-      - 'scripts/run_investment_policy_shadow.py'
-      - 'tests/test_investment_policy.py'
-      - '.github/workflows/investment_policy_*.yml'
   workflow_dispatch:
 
 permissions:
@@ -31,7 +28,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v6
