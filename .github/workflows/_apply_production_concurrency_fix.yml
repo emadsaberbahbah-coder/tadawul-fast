@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/_apply_production_concurrency_fix.yml'
       - 'scripts/_apply_production_concurrency_fix.py'
+      - 'scripts/_apply_production_concurrency_fix_v2.py'
       - 'scripts/run_inline_page_recovery.py'
       - 'tests/test_inline_page_recovery.py'
 
@@ -25,7 +26,7 @@ jobs:
           fetch-depth: 1
 
       - name: Apply fail-closed workflow redesign
-        run: python scripts/_apply_production_concurrency_fix.py
+        run: python scripts/_apply_production_concurrency_fix_v2.py
 
       - name: Compile and test recovery code
         run: |
@@ -41,6 +42,7 @@ jobs:
             tests/test_inline_page_recovery.py
           git diff --check
           test ! -e scripts/_apply_production_concurrency_fix.py
+          test ! -e scripts/_apply_production_concurrency_fix_v2.py
           test ! -e .github/workflows/_apply_production_concurrency_fix.yml
 
       - name: Commit final workflow files
