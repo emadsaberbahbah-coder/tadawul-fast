@@ -35,11 +35,55 @@ def patch_runner() -> None:
     )
 
     import_anchor = "from typing import Any, Dict, List, Optional, Sequence, Tuple\n"
-    import_block = import_anchor + '''\ntry:\n    from scripts.critical_symbol_identity import (\n        build_isolated_batches,\n        fail_result_on_identity,\n        quarantine_critical_rows,\n        sanitize_active_universe,\n    )\nexcept ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``\n    from critical_symbol_identity import (\n        build_isolated_batches,\n        fail_result_on_identity,\n        quarantine_critical_rows,\n        sanitize_active_universe,\n    )\n'''
+    import_block = import_anchor + '''
+try:
+    from scripts.critical_symbol_identity import (
+        build_isolated_batches,
+        fail_result_on_identity,
+        quarantine_critical_rows,
+        sanitize_active_universe,
+    )
+except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
+    from critical_symbol_identity import (
+        build_isolated_batches,
+        fail_result_on_identity,
+        quarantine_critical_rows,
+        sanitize_active_universe,
+    )
+'''
     text = replace_once(text, import_anchor, import_block, "critical policy import")
 
-    readback_old = '''                    _existing_syms = _clean_syms\n            if _existing_syms:\n                symbols = _existing_syms\n'''
-    readback_new = '''                    _existing_syms = _clean_syms\n            if _existing_syms:\n                _existing_syms, _critical_universe_changes = sanitize_active_universe(\n                    _existing_syms\n                )\n                if _critical_universe_changes:\n                    _change_notes = []\n                    for _change in _critical_universe_changes[:20]:\n                        if _change.target_symbol:\n                            _change_notes.append(\n                                f"{_change.source_symbol}->{_change.target_symbol} "\n                                f"({_change.action})"\n                            )\n                        else:\n                            _change_notes.append(\n                                f"{_change.source_symbol} ({_change.action}: "\n                                f"{_change.reason})"\n                            )\n                    _cw = (\n                        "[CRITICAL-IDENTITY v1.0.0] sanitized active universe on "\n                        f"'{task.sheet_name}': " + "; ".join(_change_notes)\n                    )\n                    res.warnings.append(_cw)\n                    logger.warning(_cw)\n            if _existing_syms:\n                symbols = _existing_syms\n'''
+    readback_old = '''                    _existing_syms = _clean_syms
+            if _existing_syms:
+                symbols = _existing_syms
+'''
+    readback_new = '''                    _existing_syms = _clean_syms
+            if _existing_syms:
+                _existing_syms, _critical_universe_changes = sanitize_active_universe(
+                    _existing_syms
+                )
+                if _critical_universe_changes:
+                    _change_notes = []
+                    for _change in _critical_universe_changes[:20]:
+                        if _change.target_symbol:
+                            _change_notes.append(
+                                f"{_change.source_symbol}->{_change.target_symbol} "
+                                f"({_change.action})"
+                            )
+                        else:
+                            _change_notes.append(
+                                f"{_change.source_symbol} ({_change.action}: "
+                                f"{_change.reason})"
+                            )
+                    _cw = (
+                        "[CRITICAL-IDENTITY v1.0.0] sanitized active universe on "
+                        f"'{task.sheet_name}': " + "; ".join(_change_notes)
+                    )
+                    res.warnings.append(_cw)
+                    logger.warning(_cw)
+            if _existing_syms:
+                symbols = _existing_syms
+'''
     text = replace_once(text, readback_old, readback_new, "active universe sanitation")
 
     text = replace_once(
@@ -58,11 +102,44 @@ def patch_runner() -> None:
     )
 
     runlog_anchor = "        # --- v6.24.0 FW-3: workbook verdict line (best-effort) ------------\n"
-    critical_gate = '''        # --- v6.30.0: exact critical Symbol->Issuer firewall -----------------\n        # Page-level anchor thresholds intentionally tolerate one mismatch; these\n        # known collision symbols do not. Purge a poisoned predecessor by writing\n        # a tagged symbol-only stub, then force the page result RED after write.\n        if (task.expects_rows and rows_matrix and headers\n                and task.sheet_name in _RANKED_MARKET_PAGES):\n            rows_matrix, _critical_identity_failures = quarantine_critical_rows(\n                headers, rows_matrix\n            )\n            if _critical_identity_failures:\n                _cf = (\n                    "[CRITICAL-IDENTITY v1.0.0] quarantined "\n                    f"{len(_critical_identity_failures)} exact identity mismatch(es) "\n                    f"on '{task.sheet_name}': "\n                    + "; ".join(\n                        f"{_f.symbol}={_f.seen_name!r} ({_f.reason})"\n                        for _f in _critical_identity_failures[:10]\n                    )\n                    + " — page verdict will be failed even if the stub write succeeds."\n                )\n                res.warnings.append(_cf)\n                logger.error(_cf)\n\n'''
+    critical_gate = '''        # --- v6.30.0: exact critical Symbol->Issuer firewall -----------------
+        # Page-level anchor thresholds intentionally tolerate one mismatch; these
+        # known collision symbols do not. Purge a poisoned predecessor by writing
+        # a tagged symbol-only stub, then force the page result RED after write.
+        if (task.expects_rows and rows_matrix and headers
+                and task.sheet_name in _RANKED_MARKET_PAGES):
+            rows_matrix, _critical_identity_failures = quarantine_critical_rows(
+                headers, rows_matrix
+            )
+            if _critical_identity_failures:
+                _cf = (
+                    "[CRITICAL-IDENTITY v1.0.0] quarantined "
+                    f"{len(_critical_identity_failures)} exact identity mismatch(es) "
+                    f"on '{task.sheet_name}': "
+                    + "; ".join(
+                        f"{_f.symbol}={_f.seen_name!r} ({_f.reason})"
+                        for _f in _critical_identity_failures[:10]
+                    )
+                    + " — page verdict will be failed even if the stub write succeeds."
+                )
+                res.warnings.append(_cf)
+                logger.error(_cf)
+
+'''
     text = replace_once(text, runlog_anchor, critical_gate + runlog_anchor, "critical row gate")
 
-    status_old = '''            else:\n                res.rows_failed = max(0, len(rows_matrix) - res.rows_written)\n                res.status = "success" if res.rows_failed == 0 else ("partial" if res.rows_written > 0 else "failed")\n        except Exception as e:\n'''
-    status_new = '''            else:\n                res.rows_failed = max(0, len(rows_matrix) - res.rows_written)\n                res.status = "success" if res.rows_failed == 0 else ("partial" if res.rows_written > 0 else "failed")\n            if _critical_identity_failures:\n                fail_result_on_identity(res, _critical_identity_failures)\n        except Exception as e:\n'''
+    status_old = '''            else:
+                res.rows_failed = max(0, len(rows_matrix) - res.rows_written)
+                res.status = "success" if res.rows_failed == 0 else ("partial" if res.rows_written > 0 else "failed")
+        except Exception as e:
+'''
+    status_new = '''            else:
+                res.rows_failed = max(0, len(rows_matrix) - res.rows_written)
+                res.status = "success" if res.rows_failed == 0 else ("partial" if res.rows_written > 0 else "failed")
+            if _critical_identity_failures:
+                fail_result_on_identity(res, _critical_identity_failures)
+        except Exception as e:
+'''
     text = replace_once(text, status_old, status_new, "failed page verdict override")
 
     RUNNER.write_text(text, encoding="utf-8")
@@ -73,7 +150,38 @@ def patch_required_ci_tests() -> None:
     marker = "# (e) run_dashboard_sync v6.30.0 — critical symbol identity"
     if marker in text:
         raise SystemExit("required CI tests already contain critical identity block")
-    addition = r'''\n\n# --------------------------------------------------------------------------- #\n# (e) run_dashboard_sync v6.30.0 — critical symbol identity\n# --------------------------------------------------------------------------- #\ndef test_rds_critical_identity_policy_is_wired():\n    rds = _rds()\n    assert _ver_at_least(rds.SCRIPT_VERSION, "6.30.0")\n    clean, changes = rds.sanitize_active_universe(\n        ["BK", "BRK-B", "FI", "3001.SR", "8270.SR", "4328.SR"]\n    )\n    assert clean == ["BK.US", "BRK-B.US", "FISV.US"]\n    assert len(changes) == 6\n\n\ndef test_rds_critical_symbols_are_isolated_before_normal_batches():\n    rds = _rds()\n    assert rds.build_isolated_batches(\n        ["AAPL", "BK.US", "MSFT", "BRK-B.US", "FISV.US"], 2\n    ) == [["BK.US"], ["BRK-B.US"], ["FISV.US"], ["AAPL", "MSFT"]]\n\n\ndef test_rds_wrong_critical_issuer_cannot_report_success():\n    rds = _rds()\n    headers = ["Symbol", "Name", "Exchange", "Currency", "Country", "Warnings"]\n    rows = [["BK.US", "Hanwha Aerospace Co., Ltd.", "NYSE", "USD", "USA", ""]]\n    _, failures = rds.quarantine_critical_rows(headers, rows)\n    assert failures and rows[0][1] == ""\n    result = type("Result", (), {"status": "success", "rows_failed": 0, "error": None})()\n    rds.fail_result_on_identity(result, failures)\n    assert result.status == "failed"\n'''
+    addition = '''
+
+# --------------------------------------------------------------------------- #
+# (e) run_dashboard_sync v6.30.0 — critical symbol identity
+# --------------------------------------------------------------------------- #
+def test_rds_critical_identity_policy_is_wired():
+    rds = _rds()
+    assert _ver_at_least(rds.SCRIPT_VERSION, "6.30.0")
+    clean, changes = rds.sanitize_active_universe(
+        ["BK", "BRK-B", "FI", "3001.SR", "8270.SR", "4328.SR"]
+    )
+    assert clean == ["BK.US", "BRK-B.US", "FISV.US"]
+    assert len(changes) == 6
+
+
+def test_rds_critical_symbols_are_isolated_before_normal_batches():
+    rds = _rds()
+    assert rds.build_isolated_batches(
+        ["AAPL", "BK.US", "MSFT", "BRK-B.US", "FISV.US"], 2
+    ) == [["BK.US"], ["BRK-B.US"], ["FISV.US"], ["AAPL", "MSFT"]]
+
+
+def test_rds_wrong_critical_issuer_cannot_report_success():
+    rds = _rds()
+    headers = ["Symbol", "Name", "Exchange", "Currency", "Country", "Warnings"]
+    rows = [["BK.US", "Hanwha Aerospace Co., Ltd.", "NYSE", "USD", "USA", ""]]
+    _, failures = rds.quarantine_critical_rows(headers, rows)
+    assert failures and rows[0][1] == ""
+    result = type("Result", (), {"status": "success", "rows_failed": 0, "error": None})()
+    rds.fail_result_on_identity(result, failures)
+    assert result.status == "failed"
+'''
     RECENT_TESTS.write_text(text.rstrip() + addition + "\n", encoding="utf-8")
 
 
