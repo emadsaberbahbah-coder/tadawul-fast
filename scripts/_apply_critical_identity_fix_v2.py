@@ -97,6 +97,10 @@ def main() -> None:
     original.patch_runner()
     patch_runner_response_symbols()
     original.patch_required_ci_tests()
+    original.RECENT_TESTS.write_text(
+        original.RECENT_TESTS.read_text(encoding="utf-8").rstrip() + "\n",
+        encoding="utf-8",
+    )
     original.SELF.unlink(missing_ok=True)
     original.HELPER.unlink(missing_ok=True)
     SELF.unlink(missing_ok=True)
