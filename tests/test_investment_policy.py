@@ -10,6 +10,7 @@ from core.investment_policy import (
     evaluate_speculation_gate,
     load_policy,
     validate_price_plan,
+    validate_recommendation_card,
 )
 
 
@@ -89,6 +90,56 @@ class InvestmentPolicyTests(unittest.TestCase):
         }
         result = validate_price_plan(plan, side="BUY", policy=self.policy)
         self.assertTrue(result.allowed)
+
+    def test_nan_market_data_is_fail_closed(self):
+        candidate = self.base_candidate()
+        candidate["market_cap"] = float("nan")
+        result = evaluate_speculation_gate(candidate, self.policy)
+        self.assertFalse(result.allowed)
+        self.assertIn("UNKNOWN_CRITICAL_MARKET_CAP", result.reasons)
+
+    def test_infinite_spread_is_fail_closed(self):
+        candidate = self.base_candidate()
+        candidate["spread_pct"] = float("inf")
+        result = evaluate_speculation_gate(candidate, self.policy)
+        self.assertFalse(result.allowed)
+        self.assertIn("UNKNOWN_CRITICAL_SPREAD_PCT", result.reasons)
+
+    def test_unknown_reverse_split_history_is_blocked(self):
+        candidate = self.base_candidate()
+        candidate["reverse_split_days_ago"] = None
+        result = evaluate_speculation_gate(candidate, self.policy)
+        self.assertFalse(result.allowed)
+        self.assertIn("UNKNOWN_CRITICAL_REVERSE_SPLIT_HISTORY", result.reasons)
+
+    def test_malformed_buy_prices_are_rejected(self):
+        plan = {
+            "buy_zone_low": "garbage",
+            "buy_zone_high": "nonsense",
+            "max_acceptable_price": "bad",
+            "price_as_of": "2026-07-29T10:00:00Z",
+            "price_source": "VERIFIED_EOD",
+            "order_type": "LIMIT",
+            "order_validity": "DAY",
+            "full_buy_cost": 8,
+            "entry_invalidation": "Thesis condition",
+            "next_review_date": "2026-08-15",
+        }
+        result = validate_price_plan(plan, side="BUY", policy=self.policy)
+        self.assertFalse(result.allowed)
+        self.assertIn("INVALID_NUMERIC_BUY_ZONE_LOW", result.reasons)
+        self.assertIn("INVALID_NUMERIC_BUY_ZONE_HIGH", result.reasons)
+        self.assertIn("INVALID_NUMERIC_MAX_ACCEPTABLE_PRICE", result.reasons)
+
+    def test_empty_recommendation_sections_are_missing(self):
+        card = {
+            field: {}
+            for field in self.policy["recommendation_card"]["required_fields"]
+        }
+        result = validate_recommendation_card(card, self.policy)
+        self.assertFalse(result.allowed)
+        self.assertEqual(result.status, "INCOMPLETE_NOT_EXECUTABLE")
+        self.assertIn("MISSING_INSTRUMENT_IDENTITY", result.reasons)
 
 
 if __name__ == "__main__":
