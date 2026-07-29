@@ -14,12 +14,22 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 from typing import Mapping, Sequence
+
+# GitHub Actions invokes this file directly as
+# `python scripts/plan_sync_recovery.py`. In that mode Python places the scripts/
+# directory, not the repository root, at sys.path[0]. Add the root explicitly so
+# the sibling `scripts.audit_sync_outcome` import works in the real CLI path as
+# well as under unittest/pytest imports.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from scripts.audit_sync_outcome import CRITICAL_MARKET_PAGES, audit_artifacts
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 
 # Order deliberately pairs one large and one smaller page when the workflow uses
 # max-parallel=2. GitHub normally launches matrix includes in declaration order.
