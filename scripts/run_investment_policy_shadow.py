@@ -8,6 +8,8 @@ the production workbook, places orders, or enables policy runtime enforcement.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import inspect
 import json
 from pathlib import Path
 import sys
@@ -20,18 +22,19 @@ if str(ROOT) not in sys.path:
 from core.investment_policy import build_policy_shadow_report, load_policy
 
 
-def _extract_rows(payload: Any) -> list[Mapping[str, Any]]:
+def _extract_rows(payload: Any) -> list[Any]:
+    """Extract the raw row list without hiding malformed source records."""
     if isinstance(payload, list):
-        return [row for row in payload if isinstance(row, Mapping)]
+        return list(payload)
     if isinstance(payload, Mapping):
         for key in ("rows", "candidates_rows", "candidates", "selected", "data"):
             value = payload.get(key)
             if isinstance(value, list):
-                return [row for row in value if isinstance(row, Mapping)]
+                return list(value)
     return []
 
 
-def _load_input(path: str | None) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+def _load_input(path: str | None) -> tuple[list[Any], dict[str, Any]]:
     if path:
         if path == "-":
             payload = json.load(sys.stdin)
@@ -42,15 +45,28 @@ def _load_input(path: str | None) -> tuple[list[Mapping[str, Any]], dict[str, An
         return _extract_rows(payload), {"mode": "file", "path": str(source)}
 
     try:
-        from core.analysis.opportunity_builder import collect_candidates_via_selector
-        rows, meta = collect_candidates_via_selector()
-        return (
-            [row for row in rows if isinstance(row, Mapping)],
-            {"mode": "selector", "meta": dict(meta or {})},
+        from core.analysis.top10_selector import (
+            TOP10_SELECTOR_VERSION,
+            build_top10_rows,
         )
+
+        payload = build_top10_rows()
+        if inspect.isawaitable(payload):
+            payload = asyncio.run(payload)
+        rows = _extract_rows(payload)
+        meta = dict(payload.get("meta") or {}) if isinstance(payload, Mapping) else {}
+        return rows, {
+            "mode": "top10_selector",
+            "entry_point": "core.analysis.top10_selector.build_top10_rows",
+            "selector_version": TOP10_SELECTOR_VERSION,
+            "payload_status": payload.get("status") if isinstance(payload, Mapping) else None,
+            "row_count": len(rows),
+            "meta": meta,
+        }
     except Exception as exc:
         return [], {
             "mode": "selector_unavailable",
+            "entry_point": "core.analysis.top10_selector.build_top10_rows",
             "error_class": type(exc).__name__,
             "error": str(exc),
         }
@@ -72,7 +88,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--input",
-        help="JSON file, or '-' for stdin. Omit to use the selector best-effort.",
+        help="JSON file, or '-' for stdin. Omit to use the real Top-10 selector.",
     )
     parser.add_argument("--output", help="Output JSON path. Omit to print to stdout.")
     parser.add_argument(
@@ -81,11 +97,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=25,
         help="Maximum candidate samples included in the report.",
     )
+    parser.add_argument(
+        "--require-candidates",
+        action="store_true",
+        help="Exit nonzero when the selected source returns no rows.",
+    )
     args = parser.parse_args(argv)
 
     try:
         policy = load_policy()
         rows, source = _load_input(args.input)
+        if args.require_candidates and not rows:
+            raise RuntimeError(
+                "shadow_source_returned_no_candidates: "
+                + json.dumps(source, ensure_ascii=False, default=str)
+            )
         report = build_policy_shadow_report(
             rows,
             policy,
@@ -99,6 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         failure = {
             "report_type": "INVESTMENT_POLICY_SHADOW",
             "status": "operational_error",
+            "runtime_enabled": False,
             "enforcement_applied": False,
             "decision_effect": "NONE_SHADOW_ONLY",
             "error_class": type(exc).__name__,
