@@ -1,0 +1,284 @@
+{
+  "policy": {
+    "name": "project_wide_execution_learning_policy",
+    "version": "1.0.0",
+    "effective_date": "2026-07-29",
+    "scope": "PROJECT_WIDE",
+    "runtime_enabled": false,
+    "fail_closed": true,
+    "objective": "maximize_sustainable_risk_adjusted_net_terminal_wealth_vs_no_action"
+  },
+  "position_classes": {
+    "default_allowed": [
+      "INCOME",
+      "INVESTMENT"
+    ],
+    "blocked_for_new_positions": [
+      "SPECULATION"
+    ],
+    "classification_required_before_action": true,
+    "reclassification_to_avoid_stop_prohibited": true
+  },
+  "speculation_gate": {
+    "enabled": true,
+    "unknown_critical_field_action": "UNKNOWN_BLOCK",
+    "blocked_venues": [
+      "OTC",
+      "PINK"
+    ],
+    "market_profiles": {
+      "US": {
+        "currency": "USD",
+        "min_market_cap": 1000000000,
+        "min_median_daily_traded_value": 5000000,
+        "price_floor_warning": 5.0
+      },
+      "SAUDI": {
+        "currency": "SAR",
+        "min_market_cap": 1000000000,
+        "min_median_daily_traded_value": 5000000,
+        "price_floor_warning": 5.0
+      }
+    },
+    "max_spread_pct": 0.75,
+    "max_annualized_volatility_pct": 80.0,
+    "extreme_one_day_move_pct": 20.0,
+    "extreme_five_day_move_pct": 35.0,
+    "recent_reverse_split_days": 180,
+    "min_actual_trading_days": 60,
+    "extreme_move_cooling_off_sessions": 3,
+    "manual_exception_status": "RESEARCH_ONLY",
+    "price_alone_is_not_speculation": true
+  },
+  "entry_price_policy": {
+    "output_type": "ZONE",
+    "required_fields": [
+      "buy_zone_low",
+      "buy_zone_high",
+      "max_acceptable_price",
+      "price_as_of",
+      "price_source",
+      "order_type",
+      "order_validity",
+      "full_buy_cost",
+      "entry_invalidation",
+      "next_review_date"
+    ],
+    "dimensions": [
+      "fundamental_value_margin_of_safety",
+      "verified_market_structure",
+      "volatility_and_gap_risk",
+      "liquidity_spread_and_order_participation"
+    ],
+    "exact_best_price_without_executable_timestamp_prohibited": true,
+    "chasing_above_max_acceptable_price_prohibited": true,
+    "no_trade_is_valid": true,
+    "each_tranche_must_pass_cost_test": true
+  },
+  "exit_price_policy": {
+    "output_type": "ZONE",
+    "required_fields": [
+      "sell_zone_low",
+      "sell_zone_high",
+      "min_acceptable_exit_price",
+      "thesis_exit",
+      "risk_exit",
+      "concentration_trim_zone",
+      "expected_hold_return_range",
+      "expected_redeploy_return_range",
+      "full_switch_cost",
+      "net_rotation_alpha"
+    ],
+    "sell_merely_because_profitable_prohibited": true,
+    "premature_winner_exit_regret_required": true,
+    "market_order_language_for_illiquid_positions_prohibited": true
+  },
+  "stop_policy": {
+    "investment_equity": {
+      "max_planned_loss_pct": 20.0,
+      "thesis_invalidation_required": true,
+      "price_risk_level_required": true,
+      "widen_after_entry_prohibited": true,
+      "negative_position_time_stop_days": 90,
+      "extension_requires_reason_and_review_date": true
+    },
+    "income_and_sukuk": {
+      "equity_price_stop_prohibited": true,
+      "required_review_factors": [
+        "coupon_or_yield",
+        "maturity",
+        "callability",
+        "credit_quality",
+        "payment_status",
+        "covenants",
+        "liquidity",
+        "expected_cash_flows"
+      ]
+    },
+    "reit": {
+      "required_review_factors": [
+        "affo",
+        "dividend_coverage",
+        "refinancing_risk",
+        "asset_quality",
+        "property_metrics"
+      ],
+      "gaap_payout_only_prohibited": true
+    },
+    "legacy_speculation": {
+      "new_positions_blocked": true,
+      "max_position_pct": 5.0,
+      "max_planned_loss_pct": 8.0,
+      "short_review_horizon_required": true
+    }
+  },
+  "decision_comparison": {
+    "required_alternatives": [
+      "HOLD_DO_NOTHING",
+      "SELL_HOLD_CASH",
+      "SELL_REDEPLOY_BEST_ELIGIBLE"
+    ],
+    "sale_and_purchase_are_separate": true,
+    "proposed_sale_proceeds_are_buying_power": false,
+    "settlement_required_before_redeployment": true,
+    "full_switch_cost_required": true,
+    "uncertainty_buffer_required": true,
+    "negative_net_rotation_alpha_action": "REJECT_ROTATION"
+  },
+  "data_sources": {
+    "provider_capability_discovery_required": true,
+    "api_token_env": "EODHD_API_TOKEN",
+    "internal_user_entitlement_check_required": true,
+    "uses": {
+      "screener": [
+        "universe",
+        "market_cap",
+        "liquidity",
+        "initial_filters"
+      ],
+      "fundamentals": [
+        "identity",
+        "quality",
+        "valuation",
+        "financials",
+        "holders",
+        "insiders"
+      ],
+      "eod": [
+        "point_in_time_history",
+        "adjusted_returns",
+        "drawdown",
+        "counterfactuals"
+      ],
+      "intraday": [
+        "execution_study",
+        "volume_profile",
+        "timing",
+        "spread_proxy"
+      ],
+      "news": [
+        "claims",
+        "events",
+        "provenance",
+        "scenario_context"
+      ],
+      "economic_events": [
+        "regime_context"
+      ],
+      "macro": [
+        "regime_context"
+      ],
+      "splits": [
+        "return_normalization",
+        "corporate_action_gate"
+      ]
+    }
+  },
+  "continuous_learning": {
+    "enabled": true,
+    "production_auto_update": false,
+    "shadow_mode_required": true,
+    "human_approval_required": true,
+    "rollback_required": true,
+    "minimum_cohort_size": 30,
+    "horizons_trading_days": [
+      1,
+      5,
+      20,
+      60,
+      90,
+      180,
+      365
+    ],
+    "required_counterfactuals": [
+      "RECOMMENDED_ACTION",
+      "HOLD_DO_NOTHING",
+      "CASH",
+      "BEST_ELIGIBLE_AT_DECISION_TIME",
+      "ACTUAL_EXECUTED_ACTION"
+    ],
+    "required_metrics": [
+      "net_decision_alpha_vs_no_action",
+      "net_rotation_alpha",
+      "realized_pnl",
+      "unrealized_pnl",
+      "maximum_favorable_excursion",
+      "maximum_adverse_excursion",
+      "execution_slippage",
+      "forecast_calibration",
+      "interval_coverage",
+      "premature_winner_exit_regret",
+      "long_loser_retention_regret",
+      "source_error_attribution",
+      "model_error_attribution",
+      "process_quality",
+      "outcome_quality"
+    ],
+    "prohibitions": [
+      "look_ahead",
+      "survivorship_bias",
+      "retroactive_model_attribution",
+      "optimize_for_trade_frequency",
+      "optimize_for_raw_hit_rate"
+    ]
+  },
+  "recommendation_card": {
+    "missing_critical_field_status": "INCOMPLETE_NOT_EXECUTABLE",
+    "required_fields": [
+      "recommendation_id",
+      "policy_version",
+      "model_version",
+      "market_snapshot_id",
+      "instrument_identity",
+      "position_class",
+      "signal_strength",
+      "buy_zone",
+      "sell_zone",
+      "stop_or_invalidation",
+      "hold_no_action_result",
+      "sell_cash_result",
+      "sell_redeploy_result",
+      "best_use_of_proceeds",
+      "full_cost",
+      "liquidity_and_execution",
+      "source_provenance",
+      "contradictions",
+      "expected_return_range",
+      "downside_range",
+      "error_condition",
+      "review_date",
+      "unknown_fields"
+    ]
+  },
+  "integration": {
+    "required_modules": [
+      "core/analysis/opportunity_builder.py",
+      "core/analysis/portfolio_actions.py",
+      "core/investment_advisor_engine.py",
+      "core/news_intelligence.py",
+      "routes/advanced_analysis.py",
+      "scripts/track_performance.py"
+    ],
+    "module_level_production_bypass_prohibited": true
+  }
+}

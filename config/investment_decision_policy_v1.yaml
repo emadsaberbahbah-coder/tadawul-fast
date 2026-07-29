@@ -1,0 +1,251 @@
+policy:
+  name: investment_decision_policy
+  version: "1.0.0"
+  effective_date: "2026-07-29"
+  status: specification_only
+  runtime_enabled: false
+  objective: maximize_sustainable_risk_adjusted_net_wealth_vs_no_action
+
+historical_review:
+  prohibit_retroactive_model_attribution: true
+  require_point_in_time_inputs: true
+  require_policy_version_at_decision_date: true
+  separate_hindsight_information: true
+
+sheet_role:
+  decision_source: false
+  allowed_uses:
+    - positions
+    - quantities
+    - purchase_cost
+    - account
+    - currency
+    - settlement_state
+    - documented_transaction_costs
+  field_provenance_required: true
+  blank_value_semantics: UNKNOWN
+  provenance_values:
+    - SHEET_RECORDED
+    - MARKET_VERIFIED
+    - PUBLIC_SOURCE_VERIFIED
+    - INFERRED
+    - UNKNOWN
+
+decision_comparison:
+  required_alternatives:
+    - HOLD_DO_NOTHING
+    - SELL_HOLD_CASH
+    - SELL_REDEPLOY_BEST_ELIGIBLE
+  sale_and_purchase_are_separate: true
+  sale_proceeds_do_not_authorize_purchase: true
+  compare_against_no_action: true
+  require_expected_return_range: true
+  require_downside_range: true
+  require_probability_weighting: true
+  require_uncertainty_buffer: true
+  block_rotation_to_lower_score_without_documented_constraint: true
+
+currency:
+  keep_us_sale_proceeds_in_usd: true
+  prohibit_automatic_round_trip_fx: true
+  require_full_fx_cost_test: true
+
+cost_model:
+  require_sell_commission: true
+  require_buy_commission: true
+  require_spread: true
+  require_slippage: true
+  require_fx_cost: true
+  require_settlement_delay_effect: true
+  require_opportunity_cost: true
+  require_income_forgone: true
+  max_explicit_cost_pct_of_trade: 0.5
+  practical_min_us_trade_usd: 500
+  unknown_critical_cost_blocks_precise_recommendation: true
+
+instrument_gate:
+  required_fields:
+    - instrument_type
+    - market
+    - currency
+    - income_source
+    - coupon_or_dividend
+    - payment_frequency
+    - maturity_and_callability
+    - last_actual_trade_date
+    - average_volume
+    - average_transaction_size
+    - executable_price_proxy
+    - material_dates
+  unknown_critical_field_invalidates_recommendation: true
+  income_security_equity_model_prohibited: true
+
+position_class:
+  required_before_action: true
+  allowed:
+    - INCOME
+    - INVESTMENT
+    - SPECULATION
+  prohibit_reclassification_to_avoid_stop: true
+
+opportunity_set:
+  require_best_alternative: true
+  require_second_best_alternative: true
+  require_cash_alternative: true
+  eligibility_filters:
+    - investability
+    - data_quality
+    - conviction
+    - account_currency_compatibility
+    - minimum_trade_size
+    - earnings_blackout
+    - fed_day_rule
+    - liquidity
+    - portfolio_limits
+    - concentration
+    - sustainability
+
+sources:
+  tiers:
+    A:
+      role: primary_official
+    B:
+      role: institutional_research
+    C:
+      role: reputable_media_context
+    D:
+      role: investor_and_insider_context
+    E:
+      role: unverified_not_decision_evidence
+  require_claim_provenance: true
+  require_publication_and_event_time: true
+  require_freshness_gap: true
+  show_reliable_source_conflicts: true
+  prohibit_averaging_incompatible_facts: true
+  prohibit_cross_asset_citation: true
+
+external_research:
+  bank_recommendation_is_input_not_decision: true
+  preserve_original_rating: true
+  normalize_rating_vocabulary: true
+  required_fields:
+    - institution
+    - date
+    - original_rating
+    - target_price
+    - horizon
+    - assumptions
+    - prior_rating
+    - price_at_publication
+    - disclosures
+    - source_type
+
+investor_evidence:
+  form4_purchase_weight: contextual_positive_after_validation
+  insider_sale_weight: weak_context
+  warn_10b5_1_and_option_exercise: true
+  thirteen_f_current_position_claim_prohibited: true
+  thirteen_f_delay_warning_required: true
+  prohibit_copying_famous_investor_as_sole_basis: true
+
+news_intelligence:
+  sentiment_may_directly_change_recommendation: false
+  required_pipeline:
+    - entity_match
+    - fact_verification
+    - event_timestamping
+    - novelty_test
+    - transmission_map
+    - duration_estimate
+    - market_reaction_check
+    - scenario_tree
+    - reversal_and_recurrence_check
+    - action_threshold
+  primary_or_two_high_quality_sources_required: true
+  repeated_headline_without_incremental_information_is_not_new_signal: true
+  next_state_probability_required: true
+  event_states:
+    - RUMOR
+    - CONFIRMED_ESCALATION
+    - ACTIVE_CONFLICT
+    - CEASEFIRE_OR_PAUSE
+    - NEGOTIATION
+    - RENEWED_ESCALATION
+    - RESOLUTION
+    - STALE_OR_UNVERIFIED
+  required_scenario_fields:
+    - base_case_next_state
+    - upside_next_state
+    - downside_next_state
+    - probability_ranges
+    - expected_duration
+    - asset_sensitivity
+    - financial_impact_lag
+    - confirmation_indicators
+    - rejection_indicators
+
+news_to_trade_gate:
+  require_position_class: true
+  require_evidence_gate: true
+  require_non_stale_event: true
+  require_incremental_information: true
+  require_next_state_scenario: true
+  require_execution_check: true
+  require_class_specific_size_and_stop: true
+  require_predeclared_error_condition: true
+  require_review_date: true
+
+required_decision_card_fields:
+  - position_class
+  - proposed_action
+  - signal_strength
+  - verified_instrument_facts
+  - thesis_status
+  - no_action_outcome
+  - sell_and_cash_outcome
+  - sell_and_redeploy_outcome
+  - best_use_of_proceeds
+  - full_cost_breakdown
+  - liquidity_execution_assessment
+  - source_ledger_and_conflicts
+  - event_state_and_scenarios
+  - external_research_summary
+  - investor_insider_evidence
+  - expected_return_range
+  - downside_range
+  - rotation_break_even_excess_return
+  - error_condition
+  - mandatory_review_date
+  - unknown_fields
+  - final_decision_vs_no_action
+  missing_required_field_invalidates_recommendation: true
+
+performance_measurement:
+  require_outcome_score_vs_no_action_net_of_costs: true
+  require_process_compliance_score: true
+  separate_decision_quality_from_outcome: true
+  attribution_components:
+    - market
+    - selection
+    - timing
+    - sizing
+    - transaction_cost
+    - fx
+    - income_received_or_forgone
+    - policy_compliance
+
+audit:
+  required_snapshot_fields:
+    - policy_version
+    - model_version
+    - data_snapshot_id
+    - market_data_timestamp
+    - news_snapshot_id
+    - source_bundle_hash
+    - opportunity_set_snapshot
+    - cost_schedule_version
+    - scenario_assumptions
+    - decision_card
+    - execution_details
+    - review_outcome
+  prohibit_overwriting_historical_decision_snapshot: true
