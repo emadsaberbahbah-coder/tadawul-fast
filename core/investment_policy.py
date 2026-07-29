@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Central loader and fail-closed validators for the project-wide investment policy.
+"""Central loader, fail-closed validators, and shadow reporting for investment policy.
 
 This module performs no network I/O and does not produce BUY/SELL recommendations.
 It provides a single policy surface that every project component can import.
+
+Shadow reporting is deliberately non-enforcing: it measures what the policy would
+block, records missing evidence, and never changes a live verdict or action.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
 DEFAULT_CONFIG_PATH = (
@@ -70,6 +75,14 @@ def load_policy(path: Optional[str] = None) -> dict[str, Any]:
     if policy.get("policy", {}).get("scope") != "PROJECT_WIDE":
         raise ValueError("Investment policy must declare PROJECT_WIDE scope")
     return policy
+
+
+def policy_runtime_enabled(
+    policy: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Return the policy runtime flag without enabling or changing it."""
+    cfg = dict(policy or load_policy())
+    return bool(cfg.get("policy", {}).get("runtime_enabled", False))
 
 
 def evaluate_speculation_gate(
@@ -153,6 +166,167 @@ def evaluate_speculation_gate(
     if reasons:
         return GateResult(False, "SPECULATION_BLOCK", tuple(sorted(set(reasons))), tuple(warnings))
     return GateResult(True, "INVESTMENT_UNIVERSE_ELIGIBLE", (), tuple(warnings))
+
+
+def _first_present(candidate: Mapping[str, Any], names: Sequence[str]) -> Any:
+    """Return the first present, non-empty alias while preserving 0 and False."""
+    for name in names:
+        if name not in candidate:
+            continue
+        value = candidate.get(name)
+        if not _is_missing(value):
+            return value
+    return None
+
+
+def _canonical_market(candidate: Mapping[str, Any]) -> str:
+    raw = str(
+        _first_present(candidate, ("market_profile", "market", "country", "region"))
+        or ""
+    ).strip().upper()
+    symbol = str(
+        _first_present(candidate, ("symbol", "ticker", "Symbol", "Ticker"))
+        or ""
+    ).strip().upper()
+
+    if symbol.endswith(".SR") or any(token in raw for token in ("TADAWUL", "SAUDI", "KSA")):
+        return "SAUDI"
+    if symbol.endswith(".US") or raw in {
+        "US", "USA", "UNITED STATES", "NYSE", "NASDAQ", "AMEX",
+        "NYSE/NASDAQ", "NASDAQ/NYSE",
+    }:
+        return "US"
+    return raw
+
+
+def candidate_to_policy_input(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Map only semantically equivalent project fields into the policy gate.
+
+    Important: averages are not substituted for medians, 30-day volatility is
+    not assumed annualized, and identity is never inferred. Missing evidence
+    remains missing so the shadow report exposes the actual integration gaps.
+    """
+    return {
+        "market": _canonical_market(candidate),
+        "exchange": _first_present(candidate, ("exchange", "venue", "listing_venue")),
+        "market_cap": _first_present(
+            candidate,
+            ("market_cap", "market_capitalization", "market_cap_value"),
+        ),
+        "median_daily_traded_value": _first_present(
+            candidate,
+            (
+                "median_daily_traded_value",
+                "median_traded_value_30d",
+                "median_daily_value",
+            ),
+        ),
+        "price": _first_present(candidate, ("price", "current_price", "last_price")),
+        "spread_pct": _first_present(
+            candidate,
+            ("spread_pct", "bid_ask_spread_pct", "quoted_spread_pct"),
+        ),
+        "annualized_volatility_pct": _first_present(
+            candidate,
+            ("annualized_volatility_pct", "volatility_annualized_pct"),
+        ),
+        "one_day_return_pct": _first_present(
+            candidate,
+            ("one_day_return_pct", "return_1d_pct", "change_1d_pct"),
+        ),
+        "five_day_return_pct": _first_present(
+            candidate,
+            ("five_day_return_pct", "return_5d_pct", "change_5d_pct"),
+        ),
+        "reverse_split_days_ago": _first_present(
+            candidate,
+            ("reverse_split_days_ago", "days_since_reverse_split"),
+        ),
+        "actual_trading_days": _first_present(
+            candidate,
+            ("actual_trading_days", "trading_history_days"),
+        ),
+        "instrument_identity_verified": (
+            candidate.get("instrument_identity_verified") is True
+        ),
+        "extreme_move_fundamental_event_verified": (
+            candidate.get("extreme_move_fundamental_event_verified") is True
+        ),
+    }
+
+
+def build_policy_shadow_report(
+    candidates: Iterable[Mapping[str, Any]] | None,
+    policy: Optional[Mapping[str, Any]] = None,
+    *,
+    sample_limit: int = 25,
+) -> dict[str, Any]:
+    """Measure policy outcomes without changing any recommendation or action."""
+    cfg = dict(policy or load_policy())
+    policy_meta = dict(cfg.get("policy", {}) or {})
+    reason_counts: Counter[str] = Counter()
+    warning_counts: Counter[str] = Counter()
+    samples: list[dict[str, Any]] = []
+    evaluated = 0
+    eligible = 0
+    would_block = 0
+    invalid_rows = 0
+
+    for raw in candidates or ():
+        if not isinstance(raw, Mapping):
+            invalid_rows += 1
+            reason_counts["INVALID_CANDIDATE_ROW"] += 1
+            continue
+
+        mapped = candidate_to_policy_input(raw)
+        result = evaluate_speculation_gate(mapped, cfg)
+        evaluated += 1
+        if result.allowed:
+            eligible += 1
+        else:
+            would_block += 1
+        reason_counts.update(result.reasons)
+        warning_counts.update(result.warnings)
+
+        if len(samples) < max(0, int(sample_limit)):
+            samples.append({
+                "symbol": str(
+                    _first_present(raw, ("symbol", "ticker", "Symbol", "Ticker"))
+                    or ""
+                ),
+                "market": mapped.get("market") or "",
+                "status": result.status,
+                "would_block": not result.allowed,
+                "reasons": list(result.reasons),
+                "warnings": list(result.warnings),
+            })
+
+    unknown_counts = {
+        reason: count
+        for reason, count in sorted(reason_counts.items())
+        if reason.startswith("UNKNOWN_")
+        or reason in {"INSTRUMENT_IDENTITY_UNVERIFIED", "INVALID_CANDIDATE_ROW"}
+    }
+
+    return {
+        "report_type": "INVESTMENT_POLICY_SHADOW",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "policy_name": policy_meta.get("name"),
+        "policy_version": policy_meta.get("version"),
+        "policy_scope": policy_meta.get("scope"),
+        "runtime_enabled": bool(policy_meta.get("runtime_enabled", False)),
+        "enforcement_applied": False,
+        "decision_effect": "NONE_SHADOW_ONLY",
+        "status": "ok" if evaluated or invalid_rows else "no_candidates",
+        "evaluated": evaluated,
+        "eligible": eligible,
+        "would_block": would_block,
+        "invalid_rows": invalid_rows,
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "warning_counts": dict(sorted(warning_counts.items())),
+        "unknown_or_unverified_counts": unknown_counts,
+        "samples": samples,
+    }
 
 
 def validate_price_plan(
