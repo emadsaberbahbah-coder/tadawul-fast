@@ -64,8 +64,8 @@ def _bool(name: str, default: bool) -> bool:
 
 
 def concurrency() -> int:
-    """Configured concurrent provider requests; 1 is the safe rollback mode."""
-    return _int("TFB_SYNC_BATCH_CONCURRENCY", 3, 1, 6)
+    """Configured provider requests; default 1 until the staged gate passes."""
+    return _int("TFB_SYNC_BATCH_CONCURRENCY", 1, 1, 6)
 
 
 def outer_retries() -> int:
