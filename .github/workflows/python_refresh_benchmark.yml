@@ -108,11 +108,28 @@ jobs:
       - name: Require backend readiness
         run: |
           set -euo pipefail
-          BODY="$(curl -fsS --max-time 30 "$TARGET_URL/readyz")"
+          BODY=''
+          READY='false'
+          for attempt in 1 2 3 4 5; do
+            echo "Readiness attempt ${attempt}/5"
+            if BODY="$(curl -fsS \
+              --retry 2 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              --connect-timeout 15 \
+              --max-time 30 \
+              "$TARGET_URL/readyz")"; then
+              printf '%s' "$BODY" > backend_ready.json
+              READY="$(printf '%s' "$BODY" | jq -r '.ready // (.status == "ok") // false' 2>/dev/null || printf false)"
+              if [[ "$READY" == 'true' ]]; then
+                break
+              fi
+            fi
+            sleep $((attempt * 2))
+          done
           printf '%s' "$BODY" > backend_ready.json
-          READY="$(printf '%s' "$BODY" | jq -r '.ready // (.status == "ok") // false')"
           if [[ "$READY" != 'true' ]]; then
-            echo '::error::Render backend is reachable but not ready.'
+            echo '::error::Render backend did not become ready after bounded retries.'
             cat backend_ready.json
             exit 1
           fi
