@@ -6,6 +6,8 @@ on:
       - 'scripts/run_dashboard_sync.py'
       - 'scripts/concurrent_batch_fetch.py'
       - 'scripts/benchmark_dashboard_fetch.py'
+      - 'scripts/verify_backend_symbol_capabilities.py'
+      - 'tests/test_backend_symbol_capabilities.py'
       - '.github/workflows/python_refresh_benchmark.yml'
   workflow_dispatch:
     inputs:
@@ -103,6 +105,28 @@ jobs:
             exit 1
           fi
 
+      - name: Require backend readiness
+        run: |
+          set -euo pipefail
+          BODY="$(curl -fsS --max-time 30 "$TARGET_URL/readyz")"
+          printf '%s' "$BODY" > backend_ready.json
+          READY="$(printf '%s' "$BODY" | jq -r '.ready // (.status == "ok") // false')"
+          if [[ "$READY" != 'true' ]]; then
+            echo '::error::Render backend is reachable but not ready.'
+            cat backend_ready.json
+            exit 1
+          fi
+
+      - name: Require deployed provider-symbol capabilities
+        run: |
+          set -euo pipefail
+          python scripts/verify_backend_symbol_capabilities.py \
+            --backend "$TARGET_URL" \
+            --endpoint '/v1/analysis/sheet-rows' \
+            --page 'Market_Leaders' \
+            --timeout 120 \
+            --json-out backend_symbol_capabilities.json
+
       - name: Configure read-only Google credentials
         env:
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
@@ -127,18 +151,6 @@ jobs:
           SA_EMAIL="$(jq -r '.client_email // empty' "$CREDS_PATH")"
           [[ -n "$SA_EMAIL" ]] && echo "::add-mask::$SA_EMAIL"
           echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
-
-      - name: Require backend readiness
-        run: |
-          set -euo pipefail
-          BODY="$(curl -fsS --max-time 30 "$TARGET_URL/readyz")"
-          printf '%s' "$BODY" > backend_ready.json
-          READY="$(printf '%s' "$BODY" | jq -r '.ready // (.status == "ok") // false')"
-          if [[ "$READY" != 'true' ]]; then
-            echo '::error::Render backend is reachable but not ready.'
-            cat backend_ready.json
-            exit 1
-          fi
 
       - name: Run no-write 1,000-row benchmark
         id: benchmark
@@ -171,13 +183,34 @@ jobs:
       - name: Publish benchmark summary
         if: always()
         run: |
+          {
+            echo '# 🧪 Python Refresh Deployment Gate'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ -f backend_symbol_capabilities.json ]]; then
+            {
+              echo '## Backend capability proof'
+              echo
+              echo '| Capability | Passed | Reason |'
+              echo '|---|---:|---|'
+              jq -r '.probes[] | "| \(.capability) | \(.passed) | \(.reason) |"' backend_symbol_capabilities.json
+              echo
+              echo "Ready for full benchmark: $(jq -r '.ready_for_full_benchmark' backend_symbol_capabilities.json)"
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Backend capability report was not produced.' >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           if [[ ! -f python_refresh_benchmark.json ]]; then
-            echo '# Python Refresh Benchmark' >> "$GITHUB_STEP_SUMMARY"
-            echo 'No benchmark report was produced.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'The 1,000-symbol benchmark did not run because an earlier deployment gate failed.' >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+
           {
-            echo '# 🧪 Python Refresh Benchmark — no Sheet writes'
+            echo '## 1,000-symbol no-write benchmark'
             echo
             echo '| Metric | Value |'
             echo '|---|---:|'
@@ -207,6 +240,7 @@ jobs:
           path: |
             python_refresh_benchmark.json
             backend_ready.json
+            backend_symbol_capabilities.json
           retention-days: 30
           if-no-files-found: warn
 
