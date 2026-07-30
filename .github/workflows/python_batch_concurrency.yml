@@ -177,7 +177,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          python -m compileall -q core/providers/eodhd_provider.py tests/test_eodhd_http402_guard.py
+          python -m compileall -q core/providers/eodhd_provider.py scripts/concurrent_batch_fetch.py tests/test_eodhd_http402_guard.py
           python -m pytest -q tests/test_eodhd_http402_guard.py
           python -m pytest -q tests/test_provider_symbol_recovery.py tests/test_backend_symbol_capabilities.py
 
@@ -185,12 +185,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if git diff --quiet -- core/providers/eodhd_provider.py tests/test_eodhd_http402_guard.py; then
-            echo "No provider changes to commit."
+          if git diff --quiet -- core/providers/eodhd_provider.py scripts/concurrent_batch_fetch.py tests/test_eodhd_http402_guard.py; then
+            echo "No hotfix changes to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add core/providers/eodhd_provider.py tests/test_eodhd_http402_guard.py
-          git commit -m "fix(provider): signal EODHD HTTP 402 as unhealthy"
+          git add core/providers/eodhd_provider.py scripts/concurrent_batch_fetch.py tests/test_eodhd_http402_guard.py
+          git commit -m "fix(provider): signal HTTP 402 and keep concurrency at one"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
