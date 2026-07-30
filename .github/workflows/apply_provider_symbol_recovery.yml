@@ -3,7 +3,7 @@ name: 🧩 Apply Provider Symbol Recovery
 on:
   pull_request:
     paths:
-      - 'tmp/provider_symbol_recovery.patch'
+      - 'tmp/apply_provider_symbol_recovery.py'
       - '.github/workflows/apply_provider_symbol_recovery.yml'
   workflow_dispatch:
 
@@ -28,20 +28,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Apply patch once
+      - name: Apply deterministic changes
         id: patch
         run: |
           set -euo pipefail
-          PATCH=tmp/provider_symbol_recovery.patch
-          if git apply --check "$PATCH"; then
-            git apply "$PATCH"
+          python tmp/apply_provider_symbol_recovery.py
+          CHANGED="$(git status --porcelain -- \
+            core/symbols/normalize.py \
+            scripts/critical_symbol_identity.py \
+            scripts/concurrent_batch_fetch.py \
+            tests/test_provider_symbol_recovery.py)"
+          if [[ -n "$CHANGED" ]]; then
             echo "changed=1" >> "$GITHUB_OUTPUT"
-          elif git apply --reverse --check "$PATCH"; then
-            echo "Patch is already applied."
-            echo "changed=0" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::Patch neither applies nor reverses cleanly."
-            exit 1
+            echo "Provider recovery changes are already applied."
+            echo "changed=0" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Compile changed Python
@@ -65,7 +66,7 @@ jobs:
             tests/test_provider_symbol_recovery.py \
             tests/test_critical_symbol_identity.py -v
 
-      - name: Commit verified patch
+      - name: Commit verified changes
         if: steps.patch.outputs.changed == '1'
         run: |
           set -euo pipefail
