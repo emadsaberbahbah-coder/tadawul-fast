@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'scripts/apply_deployment_gate_truth_fix.py'
+      - 'scripts/run_deployment_gate_truth_fix.py'
       - '.github/workflows/apply_deployment_gate_truth_fix_pr.yml'
 
 permissions:
@@ -33,7 +34,7 @@ jobs:
           python-version: '3.11'
 
       - name: Apply assertion-heavy transformer
-        run: python scripts/apply_deployment_gate_truth_fix.py
+        run: python scripts/run_deployment_gate_truth_fix.py
 
       - name: Compile patched files
         run: |
