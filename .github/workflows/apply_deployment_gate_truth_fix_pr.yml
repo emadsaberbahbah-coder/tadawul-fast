@@ -83,7 +83,6 @@ jobs:
             tests/test_provider_symbol_recovery.py \
             tests/test_backend_symbol_capabilities.py \
             tests/test_critical_symbol_identity.py \
-            tests/test_truthful_failsoft_contract.py \
-            .github/workflows/python_batch_concurrency.yml
+            tests/test_truthful_failsoft_contract.py
           git commit -m 'fix: make deployment gate identity and fallback truthful'
           git push origin "HEAD:${HEAD_BRANCH}"
