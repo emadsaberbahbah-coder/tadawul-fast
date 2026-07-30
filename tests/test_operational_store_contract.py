@@ -8,13 +8,17 @@ PLAN = ROOT / "docs" / "architecture" / "DATA_PLATFORM_MIGRATION_V1.md"
 REQUIRED_TABLES = {
     "instruments",
     "provider_symbol_map",
+    "data_class_policies",
+    "provider_budget_policies",
     "sync_runs",
+    "job_leases",
     "page_refresh_runs",
     "batch_refresh_runs",
     "instrument_observations",
     "latest_instrument_state",
     "identity_quarantine",
     "provider_usage_daily",
+    "manual_overrides",
     "sheet_publish_runs",
     "recommendation_snapshots",
 }
@@ -39,7 +43,7 @@ def test_schema_is_additive_and_transactional() -> None:
     assert "delete from" not in sql
 
 
-def test_freshness_and_identity_contract_is_persisted() -> None:
+def test_freshness_identity_and_api_contract_is_persisted() -> None:
     sql = _sql()
     for token in ("FRESH", "PRESERVED", "STALE", "UNKNOWN", "QUARANTINED"):
         assert token in sql
@@ -50,14 +54,30 @@ def test_freshness_and_identity_contract_is_persisted() -> None:
         "stub_count",
         "identity_failure_count",
         "coverage_pct",
+        "api_units",
     ):
         assert column in sql
 
 
-def test_recommendations_are_non_executable_in_foundation_migration() -> None:
+def test_current_and_last_good_state_are_separate() -> None:
     sql = _sql().lower()
-    assert "executable              boolean not null default false" in sql
-    assert "check (executable = false)" in sql
+    assert "current_observation_id" in sql
+    assert "last_good_observation_id" in sql
+
+
+def test_provider_budget_has_operating_limit_and_reserve() -> None:
+    sql = _sql().lower()
+    assert "daily_limit_units" in sql
+    assert "operating_limit_units" in sql
+    assert "reserve_units" in sql
+    assert "operating_limit_units + reserve_units <= daily_limit_units" in sql
+
+
+def test_recommendations_default_to_not_authorized_and_require_owner_reference() -> None:
+    sql = _sql().lower()
+    assert "execution_authorized    boolean not null default false" in sql
+    assert "owner_approval_ref" in sql
+    assert "execution_authorized = false" in sql
 
 
 def test_plan_preserves_runtime_kill_switch_and_orders_postgres_before_bigquery() -> None:
