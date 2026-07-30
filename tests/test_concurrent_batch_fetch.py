@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.concurrent_batch_fetch import build, get_metrics, install
+from scripts import run_dashboard_sync as production_sync
 
 
 @dataclass
@@ -41,11 +42,7 @@ class Backend:
                 self.failed.add(key)
                 return None, "temporary", 500
             headers = ["Value", "Symbol"] if key in self.mismatch else ["Symbol", "Value"]
-            rows = (
-                [[s.lower(), s] for s in reversed(symbols)]
-                if key in self.mismatch
-                else [[s, s.lower()] for s in reversed(symbols)]
-            )
+            rows = [[s.lower(), s] for s in reversed(symbols)] if key in self.mismatch else [[s, s.lower()] for s in reversed(symbols)]
             return {"headers": headers, "rows": rows}, None, 200
         finally:
             self.active -= 1
@@ -57,9 +54,7 @@ def fake(size=1):
         _time_budget_exceeded=lambda: False,
         _symbol_batch_size=lambda: size,
         _batch_delay_ms=lambda: 0,
-        build_isolated_batches=lambda syms, n: [
-            syms[i:i + n] for i in range(0, len(syms), n)
-        ],
+        build_isolated_batches=lambda syms, n: [syms[i:i+n] for i in range(0, len(syms), n)],
         _endpoint_candidates_for_gateway=lambda g: ["/e"],
         _extract_table_payload=lambda d: (d.get("headers", []), d.get("rows", [])),
         _rectify_matrix=lambda h, r: r,
@@ -82,18 +77,8 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         fn = build(fake())
         backend = Backend(delay=.03)
         result = Result("bounded")
-        with patch.dict(
-            os.environ,
-            {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"},
-        ):
-            _, rows, _, _ = await fn(
-                backend,
-                SimpleNamespace(sheet_name="Global_Markets"),
-                list("ABCDEFG"),
-                {},
-                "analysis",
-                result,
-            )
+        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"}):
+            _, rows, _, _ = await fn(backend, SimpleNamespace(sheet_name="Global_Markets"), list("ABCDEFG"), {}, "analysis", result)
         self.assertEqual(backend.max_active, 3)
         self.assertEqual([row[0] for row in rows], list("ABCDEFG"))
         self.assertEqual(result.batch_metrics["symbols_fresh"], 7)
@@ -101,17 +86,10 @@ class Tests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_first_batch_does_not_block_endpoint_resolution(self):
         fn = build(fake())
         result = Result("resolve")
-        with patch.dict(
-            os.environ,
-            {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "1"},
-        ):
+        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "1"}):
             _, rows, endpoint, _ = await fn(
-                Backend(fail_once={"A"}),
-                SimpleNamespace(sheet_name="P"),
-                list("ABCD"),
-                {},
-                "analysis",
-                result,
+                Backend(fail_once={"A"}), SimpleNamespace(sheet_name="P"),
+                list("ABCD"), {}, "analysis", result,
             )
         self.assertEqual(endpoint, "/e")
         self.assertEqual([row[0] for row in rows], list("ABCD"))
@@ -120,36 +98,16 @@ class Tests(unittest.IsolatedAsyncioTestCase):
     async def test_retry_recovers_failed_batch(self):
         fn = build(fake())
         result = Result("retry")
-        with patch.dict(
-            os.environ,
-            {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "1"},
-        ):
-            _, rows, _, _ = await fn(
-                Backend({"C"}),
-                SimpleNamespace(sheet_name="P"),
-                list("ABCD"),
-                {},
-                "analysis",
-                result,
-            )
+        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "1"}):
+            _, rows, _, _ = await fn(Backend({"C"}), SimpleNamespace(sheet_name="P"), list("ABCD"), {}, "analysis", result)
         self.assertEqual([row[0] for row in rows], list("ABCD"))
         self.assertEqual(get_metrics("retry")["symbols_failed"], 0)
 
     async def test_header_mismatch_is_not_merged(self):
         fn = build(fake())
         result = Result("header")
-        with patch.dict(
-            os.environ,
-            {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"},
-        ):
-            _, rows, _, _ = await fn(
-                Backend(mismatch={"C"}),
-                SimpleNamespace(sheet_name="P"),
-                list("ABCD"),
-                {},
-                "analysis",
-                result,
-            )
+        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"}):
+            _, rows, _, _ = await fn(Backend(mismatch={"C"}), SimpleNamespace(sheet_name="P"), list("ABCD"), {}, "analysis", result)
         self.assertEqual([row[0] for row in rows], ["A", "B", "D"])
         self.assertEqual(result.batch_metrics["symbols_failed"], 1)
 
@@ -164,9 +122,7 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         sync._fetch_market_rows_batched = original
         install(sync)
         with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "1"}):
-            result = await sync._fetch_market_rows_batched(
-                None, None, [], {}, "g", Result()
-            )
+            result = await sync._fetch_market_rows_batched(None, None, [], {}, "g", Result())
         self.assertEqual(calls, ["original"])
         self.assertEqual(result[2], "/old")
 
@@ -179,49 +135,77 @@ class Tests(unittest.IsolatedAsyncioTestCase):
 
         sync = fake()
         sync._fetch_market_rows_batched = original
-        sync.build_isolated_batches = lambda *_: (_ for _ in ()).throw(
-            RuntimeError("boom")
-        )
+        sync.build_isolated_batches = lambda *_: (_ for _ in ()).throw(RuntimeError("boom"))
         install(sync)
         with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3"}):
-            result = await sync._fetch_market_rows_batched(
-                None, None, ["A"], {}, "g", Result()
-            )
+            result = await sync._fetch_market_rows_batched(None, None, ["A"], {}, "g", Result())
         self.assertEqual(calls, ["original"])
         self.assertEqual(result[2], "/old")
 
     async def test_parallel_is_materially_faster(self):
         fn = build(fake())
         symbols = list("ABCDEFG")
-        with patch.dict(
-            os.environ,
-            {"TFB_SYNC_BATCH_CONCURRENCY": "1", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"},
-        ):
+        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "1", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"}):
             start = time.perf_counter()
-            await fn(
-                Backend(delay=.03),
-                SimpleNamespace(sheet_name="P"),
-                symbols,
-                {},
-                "analysis",
-                Result("sequential"),
-            )
+            await fn(Backend(delay=.03), SimpleNamespace(sheet_name="P"), symbols, {}, "analysis", Result("sequential"))
             sequential = time.perf_counter() - start
-        with patch.dict(
-            os.environ,
-            {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"},
-        ):
+        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"}):
             start = time.perf_counter()
-            await fn(
-                Backend(delay=.03),
-                SimpleNamespace(sheet_name="P"),
-                symbols,
-                {},
-                "analysis",
-                Result("parallel"),
-            )
+            await fn(Backend(delay=.03), SimpleNamespace(sheet_name="P"), symbols, {}, "analysis", Result("parallel"))
             parallel = time.perf_counter() - start
         self.assertLess(parallel, sequential * .65)
+
+    async def test_production_runner_dispatches_concurrent_adapter(self):
+        called = {}
+
+        async def fake_fetch(backend, task, symbols, payload, gateway, result):
+            called["symbols"] = list(symbols)
+            return ["Symbol"], [["A"]], "/fast", None
+
+        task = production_sync.TaskSpec(
+            key="GLOBAL_MARKETS",
+            sheet_name="Global_Markets",
+            gateway="analysis",
+        )
+        result = production_sync.TaskResult(
+            key=task.key,
+            sheet_name=task.sheet_name,
+            status="pending",
+            start_utc="2026-07-30T00:00:00+00:00",
+        )
+        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3"}), patch(
+            "scripts.concurrent_batch_fetch.build", return_value=fake_fetch
+        ):
+            output = await production_sync._fetch_market_rows_batched(
+                object(), task, ["A", "B"], {}, "analysis", result
+            )
+        self.assertEqual(called["symbols"], ["A", "B"])
+        self.assertEqual(output[2], "/fast")
+
+    async def test_production_runner_concurrency_one_avoids_adapter(self):
+        task = production_sync.TaskSpec(
+            key="GLOBAL_MARKETS",
+            sheet_name="Global_Markets",
+            gateway="analysis",
+        )
+        result = production_sync.TaskResult(
+            key=task.key,
+            sheet_name=task.sheet_name,
+            status="pending",
+            start_utc="2026-07-30T00:00:00+00:00",
+        )
+        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "1"}), patch(
+            "scripts.concurrent_batch_fetch.build",
+            side_effect=AssertionError("adapter must not load"),
+        ), patch.object(
+            production_sync, "_time_budget_exceeded", return_value=True
+        ), patch.object(
+            production_sync, "_time_budget_sec", return_value=3600.0
+        ):
+            output = await production_sync._fetch_market_rows_batched(
+                object(), task, ["A"], {}, "analysis", result
+            )
+        self.assertEqual(output[3], "time budget exhausted before fetch")
 
 
 if __name__ == "__main__":
