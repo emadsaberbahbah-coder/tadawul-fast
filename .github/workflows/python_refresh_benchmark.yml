@@ -29,7 +29,7 @@ on:
       concurrency:
         description: Concurrent requests
         required: true
-        default: '3'
+        default: '1'
         type: string
 
 permissions:
@@ -60,7 +60,7 @@ jobs:
       BENCH_PAGE: ${{ inputs.page || 'Market_Leaders' }}
       BENCH_MAX_SYMBOLS: ${{ inputs.max_symbols || '1000' }}
       BENCH_BATCH_SIZE: ${{ inputs.batch_size || '25' }}
-      BENCH_CONCURRENCY: ${{ inputs.concurrency || '3' }}
+      BENCH_CONCURRENCY: ${{ inputs.concurrency || '1' }}
       TFB_SYNC_BATCH_OUTER_RETRIES: '1'
       TFB_SYNC_TARGET_RECOVERY: '1'
       TFB_SYNC_TARGET_RECOVERY_MAX: '120'
