@@ -1,0 +1,80 @@
+name: 🧩 Apply Provider Symbol Recovery
+
+on:
+  pull_request:
+    paths:
+      - 'tmp/provider_symbol_recovery.patch'
+      - '.github/workflows/apply_provider_symbol_recovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: apply-provider-symbol-recovery-${{ github.head_ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply-and-verify:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.head_ref == 'perf/python-batch-concurrency-v1' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref || 'perf/python-batch-concurrency-v1' }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply patch once
+        id: patch
+        run: |
+          set -euo pipefail
+          PATCH=tmp/provider_symbol_recovery.patch
+          if git apply --check "$PATCH"; then
+            git apply "$PATCH"
+            echo "changed=1" >> "$GITHUB_OUTPUT"
+          elif git apply --reverse --check "$PATCH"; then
+            echo "Patch is already applied."
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Patch neither applies nor reverses cleanly."
+            exit 1
+          fi
+
+      - name: Compile changed Python
+        if: steps.patch.outputs.changed == '1'
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            core/symbols/normalize.py \
+            scripts/critical_symbol_identity.py \
+            scripts/concurrent_batch_fetch.py \
+            tests/test_provider_symbol_recovery.py
+
+      - name: Run focused regression tests
+        if: steps.patch.outputs.changed == '1'
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m unittest \
+            tests/test_concurrent_batch_fetch.py \
+            tests/test_provider_symbol_recovery.py \
+            tests/test_critical_symbol_identity.py -v
+
+      - name: Commit verified patch
+        if: steps.patch.outputs.changed == '1'
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            core/symbols/normalize.py \
+            scripts/critical_symbol_identity.py \
+            scripts/concurrent_batch_fetch.py \
+            tests/test_provider_symbol_recovery.py
+          git commit -m 'Recover provider-specific market symbols'
+          git push origin HEAD:${{ github.head_ref || 'perf/python-batch-concurrency-v1' }}
