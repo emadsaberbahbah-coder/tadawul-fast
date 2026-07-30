@@ -3,6 +3,7 @@ name: ⚡ Python Batch Concurrency
 on:
   pull_request:
     paths:
+      - 'scripts/run_dashboard_sync.py'
       - 'scripts/concurrent_batch_fetch.py'
       - 'scripts/run_dashboard_sync_fast.py'
       - 'tests/test_concurrent_batch_fetch.py'
@@ -10,6 +11,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'scripts/run_dashboard_sync.py'
       - 'scripts/concurrent_batch_fetch.py'
       - 'scripts/run_dashboard_sync_fast.py'
       - 'tests/test_concurrent_batch_fetch.py'
@@ -42,22 +44,32 @@ jobs:
         run: |
           set -euo pipefail
           python -m py_compile \
+            scripts/run_dashboard_sync.py \
             scripts/concurrent_batch_fetch.py \
             scripts/run_dashboard_sync_fast.py \
             tests/test_concurrent_batch_fetch.py
           python -m unittest tests/test_concurrent_batch_fetch.py -v
-      - name: Import against current production runner
+      - name: Verify production-runner integration contract
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
           python - <<'PY'
           from scripts import run_dashboard_sync as sync
-          from scripts.concurrent_batch_fetch import install
-          original = sync._fetch_market_rows_batched
-          install(sync)
-          assert sync._fetch_market_rows_batched is not original
-          assert sync._TFB_CONCURRENT_BATCH_FETCH_INSTALLED is True
-          assert callable(sync.TaskResult.to_dict)
-          print('production-runner adapter contract: PASS')
+          from scripts.concurrent_batch_fetch import build, concurrency
+
+          assert sync.SCRIPT_VERSION == "6.31.0"
+          assert callable(sync._fetch_market_rows_batched)
+          assert callable(build(sync))
+          result = sync.TaskResult(
+              key="GLOBAL_MARKETS",
+              sheet_name="Global_Markets",
+              status="pending",
+              start_utc="2026-07-30T00:00:00+00:00",
+          )
+          payload = result.to_dict()
+          assert "batch_metrics" in payload
+          assert isinstance(payload["batch_metrics"], dict)
+          assert 1 <= concurrency() <= 6
+          print("production-runner concurrency contract: PASS")
           PY
