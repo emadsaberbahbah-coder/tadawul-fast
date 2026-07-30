@@ -1,6 +1,17 @@
 name: 🔎 Full Refresh Coverage Audit
 
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/full_refresh_coverage.yml'
+      - 'scripts/audit_full_refresh_coverage.py'
+      - 'tests/test_full_refresh_coverage.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/full_refresh_coverage.yml'
+      - 'scripts/audit_full_refresh_coverage.py'
+      - 'tests/test_full_refresh_coverage.py'
   workflow_run:
     workflows: ["🏦 Tadawul Dashboard Advanced Sync"]
     types: [completed]
@@ -10,16 +21,44 @@ permissions:
   contents: read
 
 concurrency:
-  group: full-refresh-coverage-${{ github.event.workflow_run.id || github.run_id }}
-  cancel-in-progress: false
+  group: full-refresh-coverage-${{ github.event.workflow_run.id || github.run_id }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
+  regression-tests:
+    name: Test full refresh coverage audit
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Compile and test
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            scripts/audit_full_refresh_coverage.py \
+            tests/test_full_refresh_coverage.py
+          python -m unittest tests/test_full_refresh_coverage.py
+
   audit-live-workbook:
     name: Audit every refreshed row and page
     if: >-
       ${{
         github.event_name == 'workflow_dispatch' ||
         (
+          github.event_name == 'workflow_run' &&
           github.event.workflow_run.head_branch == 'main' &&
           (
             github.event.workflow_run.event == 'schedule' ||
@@ -108,12 +147,23 @@ jobs:
           echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
 
       - name: Scan all rows and pages
+        id: coverage
         run: |
           set -euo pipefail
+          code=0
           python scripts/audit_full_refresh_coverage.py \
             --sheet-id "$TARGET_SHEET_ID" \
             --max-rows "$TFB_REFRESH_AUDIT_MAX_ROWS" \
-            --json-out full_refresh_coverage.json
+            --json-out full_refresh_coverage.json || code=$?
+          echo "audit_exit=$code" >> "$GITHUB_OUTPUT"
+          if [[ "$code" -ge 2 ]]; then
+            echo "::error::Full refresh coverage failed (exit $code)."
+            exit "$code"
+          fi
+          if [[ "$code" -eq 1 ]]; then
+            echo "::warning::Full refresh coverage completed with warnings."
+          fi
+          exit 0
 
       - name: Publish audit summary
         if: always()
@@ -128,7 +178,7 @@ jobs:
           {
             echo "# 🔎 Full Refresh Coverage"
             echo
-            echo "Failures: **$FAILS** · Warnings: **$WARNS**"
+            echo "Failures: **$FAILS** · Warnings: **$WARNS** · Audit exit: **${{ steps.coverage.outputs.audit_exit || 'n/a' }}**"
             echo
             echo "| Page | Status | Rows | Unique | Fresh % | Stale | Duplicates |"
             echo "|---|---:|---:|---:|---:|---:|---:|"
