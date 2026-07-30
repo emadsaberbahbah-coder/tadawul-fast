@@ -124,7 +124,7 @@ jobs:
             --backend "$TARGET_URL" \
             --endpoint '/v1/analysis/sheet-rows' \
             --page 'Market_Leaders' \
-            --timeout 120 \
+            --timeout 60 \
             --json-out backend_symbol_capabilities.json
 
       - name: Configure read-only Google credentials
