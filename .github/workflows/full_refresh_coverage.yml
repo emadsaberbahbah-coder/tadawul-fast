@@ -1,0 +1,153 @@
+name: 🔎 Full Refresh Coverage Audit
+
+on:
+  workflow_run:
+    workflows: ["🏦 Tadawul Dashboard Advanced Sync"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-refresh-coverage-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  audit-live-workbook:
+    name: Audit every refreshed row and page
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.workflow_run.head_branch == 'main' &&
+          (
+            github.event.workflow_run.event == 'schedule' ||
+            github.event.workflow_run.event == 'workflow_dispatch'
+          )
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      PYTHON_VERSION: "3.11"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}
+      TZ: Asia/Riyadh
+      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+      TFB_REFRESH_AUDIT_MAX_ROWS: "20000"
+      TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '1025' }}
+      TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS: ${{ vars.EXPECTED_MIN_ROWS_GLOBAL_MARKETS || '6512' }}
+      TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX: ${{ vars.EXPECTED_MIN_ROWS_COMMODITIES_FX || '453' }}
+      TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS: ${{ vars.EXPECTED_MIN_ROWS_MUTUAL_FUNDS || '4496' }}
+      TFB_REFRESH_MIN_FRESH_PCT_MARKET_LEADERS: "95"
+      TFB_REFRESH_MIN_FRESH_PCT_GLOBAL_MARKETS: "95"
+      TFB_REFRESH_MIN_FRESH_PCT_COMMODITIES_FX: "95"
+      TFB_REFRESH_MIN_FRESH_PCT_MUTUAL_FUNDS: "95"
+      TFB_REFRESH_MIN_FRESH_PCT_MY_PORTFOLIO: "100"
+      TFB_REFRESH_MAX_AGE_H_MARKET_LEADERS: "30"
+      TFB_REFRESH_MAX_AGE_H_GLOBAL_MARKETS: "30"
+      TFB_REFRESH_MAX_AGE_H_COMMODITIES_FX: "30"
+      TFB_REFRESH_MAX_AGE_H_MUTUAL_FUNDS: "30"
+      TFB_REFRESH_MAX_AGE_H_MY_PORTFOLIO: "8"
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+          if [[ -f requirements.render.txt ]]; then
+            python -m pip install -r requirements.render.txt
+          elif [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "::error::No requirements file found."
+            exit 1
+          fi
+
+      - name: Configure read-only audit credentials
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TARGET_SHEET_ID:-}" ]]; then
+            echo "::error::vars.DEFAULT_SPREADSHEET_ID is empty."
+            exit 1
+          fi
+          RAW_CREDS="${SECRET_CREDS:-}"
+          if [[ -z "$RAW_CREDS" && -n "${SECRET_CREDS_B64:-}" ]]; then
+            RAW_CREDS="$(printf '%s' "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
+          fi
+          if [[ -z "$RAW_CREDS" ]] || ! printf '%s' "$RAW_CREDS" | jq empty >/dev/null 2>&1; then
+            echo "::error::No valid Google Sheets credentials found."
+            exit 1
+          fi
+          CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
+          printf '%s' "$RAW_CREDS" > "$CREDS_PATH"
+          chmod 600 "$CREDS_PATH"
+          SA_EMAIL="$(jq -r '.client_email // empty' "$CREDS_PATH")"
+          [[ -n "$SA_EMAIL" ]] && echo "::add-mask::$SA_EMAIL"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
+
+      - name: Scan all rows and pages
+        run: |
+          set -euo pipefail
+          python scripts/audit_full_refresh_coverage.py \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --max-rows "$TFB_REFRESH_AUDIT_MAX_ROWS" \
+            --json-out full_refresh_coverage.json
+
+      - name: Publish audit summary
+        if: always()
+        run: |
+          if [[ ! -f full_refresh_coverage.json ]]; then
+            echo "## Full Refresh Coverage" >> "$GITHUB_STEP_SUMMARY"
+            echo "Audit report was not produced." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          FAILS="$(jq -r '.summary.failures // 0' full_refresh_coverage.json)"
+          WARNS="$(jq -r '.summary.warnings // 0' full_refresh_coverage.json)"
+          {
+            echo "# 🔎 Full Refresh Coverage"
+            echo
+            echo "Failures: **$FAILS** · Warnings: **$WARNS**"
+            echo
+            echo "| Page | Status | Rows | Unique | Fresh % | Stale | Duplicates |"
+            echo "|---|---:|---:|---:|---:|---:|---:|"
+            jq -r '.pages[] | "| \(.page) | \(.status) | \(.rows) | \(.unique) | \(.fresh_pct // "n/a") | \(.stale) | \(.duplicates | length) |"' full_refresh_coverage.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full coverage evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-refresh-coverage-${{ github.event.workflow_run.id || github.run_id }}
+          path: full_refresh_coverage.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Secure cleanup
+        if: always()
+        run: |
+          CREDS_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$RUNNER_TEMP/google_credentials.json}"
+          if [[ -f "$CREDS_PATH" ]]; then
+            shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
+          fi
