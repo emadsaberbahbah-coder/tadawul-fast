@@ -53,3 +53,5 @@ jobs:
           git add scripts/run_dashboard_sync.py
           git commit -m 'Integrate bounded concurrency into Python runner'
           git push origin HEAD:perf/python-batch-concurrency-v1
+
+# Triggered after workflow creation so the patch is applied exactly once.
