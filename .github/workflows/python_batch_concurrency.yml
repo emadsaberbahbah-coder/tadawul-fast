@@ -11,7 +11,6 @@ on:
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'scripts/verify_backend_symbol_capabilities.py'
-      - 'scripts/apply_eodhd_http402_hotfix.py'
       - 'tests/test_concurrent_batch_fetch.py'
       - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
@@ -29,7 +28,6 @@ on:
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'scripts/verify_backend_symbol_capabilities.py'
-      - 'scripts/apply_eodhd_http402_hotfix.py'
       - 'tests/test_concurrent_batch_fetch.py'
       - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
@@ -39,7 +37,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: python-batch-concurrency-${{ github.ref }}
@@ -47,9 +45,9 @@ concurrency:
 
 jobs:
   test:
-    name: Test bounded batch concurrency
+    name: Test bounded batch concurrency and provider safeguards
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v6
         with:
@@ -58,6 +56,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      - name: Install focused test dependencies
+        run: python -m pip install -q pytest httpx
       - name: Compile and test
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -65,17 +65,18 @@ jobs:
           set -euo pipefail
           python -m py_compile \
             core/symbols/normalize.py \
+            core/providers/eodhd_provider.py \
             scripts/critical_symbol_identity.py \
             scripts/run_dashboard_sync.py \
             scripts/concurrent_batch_fetch.py \
             scripts/run_dashboard_sync_fast.py \
             scripts/benchmark_dashboard_fetch.py \
             scripts/verify_backend_symbol_capabilities.py \
-            scripts/apply_eodhd_http402_hotfix.py \
             tests/test_concurrent_batch_fetch.py \
             tests/test_provider_symbol_recovery.py \
             tests/test_benchmark_dashboard_fetch.py \
-            tests/test_backend_symbol_capabilities.py
+            tests/test_backend_symbol_capabilities.py \
+            tests/test_eodhd_http402_guard.py
           python -m unittest \
             tests/test_concurrent_batch_fetch.py \
             tests/test_provider_symbol_recovery.py \
@@ -83,12 +84,15 @@ jobs:
             tests/test_backend_symbol_capabilities.py \
             tests/test_critical_symbol_identity.py \
             -v
-      - name: Verify production-runner integration contract
+          python -m pytest -q tests/test_eodhd_http402_guard.py
+      - name: Verify staged production contract
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
           python - <<'PY'
+          import os
+          from core.providers import eodhd_provider
           from core.symbols.normalize import to_eodhd_symbol, to_yahoo_symbol
           from scripts import run_dashboard_sync as sync
           from scripts.concurrent_batch_fetch import build, concurrency, provider_recovery_variants
@@ -96,6 +100,9 @@ jobs:
           from scripts.critical_symbol_identity import canonicalize_symbol
           from scripts.verify_backend_symbol_capabilities import RULES, evaluate_table
 
+          os.environ.pop("TFB_SYNC_BATCH_CONCURRENCY", None)
+          assert concurrency() == 1
+          assert eodhd_provider._err_indicates_provider_unhealthy("HTTP 402") is True
           assert sync.SCRIPT_VERSION == "6.31.0"
           assert callable(sync._fetch_market_rows_batched)
           assert callable(build(sync))
@@ -121,76 +128,8 @@ jobs:
           payload = result.to_dict()
           assert "batch_metrics" in payload
           assert isinstance(payload["batch_metrics"], dict)
-          assert 1 <= concurrency() <= 6
           sink = NoWriteSheets()
           assert sink.write_table("sid", "P", "A1", ["Symbol"], [["A"]]) == 1
           assert sink.planned_writes[0]["rows"] == 1
-          print("production-runner concurrency + provider mapping + deployment gate + no-write contract: PASS")
+          print("staged provider normalization + HTTP 402 fallback + concurrency=1 contract: PASS")
           PY
-
-  apply-http402-hotfix:
-    name: Apply EODHD HTTP 402 hotfix
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout PR branch with write credentials
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 1
-          persist-credentials: true
-
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: |
-            requirements.render.txt
-            requirements.txt
-
-      - name: Apply assertion-based provider hotfix exactly once
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/apply_eodhd_http402_hotfix.py
-
-      - name: Install focused test dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip setuptools wheel
-          if [[ -f requirements.render.txt ]]; then
-            python -m pip install -r requirements.render.txt
-          elif [[ -f requirements.txt ]]; then
-            python -m pip install -r requirements.txt
-          fi
-          python -m pip install -q pytest
-
-      - name: Compile and test HTTP 402 provider behavior
-        shell: bash
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          python -m compileall -q core/providers/eodhd_provider.py scripts/concurrent_batch_fetch.py tests/test_eodhd_http402_guard.py
-          python -m pytest -q tests/test_eodhd_http402_guard.py
-          python -m pytest -q tests/test_provider_symbol_recovery.py tests/test_backend_symbol_capabilities.py
-
-      - name: Commit tested hotfix to PR branch
-        shell: bash
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- core/providers/eodhd_provider.py scripts/concurrent_batch_fetch.py tests/test_eodhd_http402_guard.py; then
-            echo "No hotfix changes to commit."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add core/providers/eodhd_provider.py scripts/concurrent_batch_fetch.py tests/test_eodhd_http402_guard.py
-          git commit -m "fix(provider): signal HTTP 402 and keep concurrency at one"
-          git push origin HEAD:${{ github.event.pull_request.head.ref }}
