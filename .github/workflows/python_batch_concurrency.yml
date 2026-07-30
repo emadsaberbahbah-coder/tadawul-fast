@@ -5,6 +5,7 @@ on:
     paths:
       - 'core/symbols/normalize.py'
       - 'core/providers/eodhd_provider.py'
+      - 'routes/advanced_analysis.py'
       - 'scripts/critical_symbol_identity.py'
       - 'scripts/run_dashboard_sync.py'
       - 'scripts/concurrent_batch_fetch.py'
@@ -16,12 +17,14 @@ on:
       - 'tests/test_benchmark_dashboard_fetch.py'
       - 'tests/test_backend_symbol_capabilities.py'
       - 'tests/test_eodhd_http402_guard.py'
+      - 'tests/test_truthful_failsoft_contract.py'
       - '.github/workflows/python_batch_concurrency.yml'
   push:
     branches: [main]
     paths:
       - 'core/symbols/normalize.py'
       - 'core/providers/eodhd_provider.py'
+      - 'routes/advanced_analysis.py'
       - 'scripts/critical_symbol_identity.py'
       - 'scripts/run_dashboard_sync.py'
       - 'scripts/concurrent_batch_fetch.py'
@@ -33,6 +36,7 @@ on:
       - 'tests/test_benchmark_dashboard_fetch.py'
       - 'tests/test_backend_symbol_capabilities.py'
       - 'tests/test_eodhd_http402_guard.py'
+      - 'tests/test_truthful_failsoft_contract.py'
       - '.github/workflows/python_batch_concurrency.yml'
   workflow_dispatch:
 
@@ -66,6 +70,7 @@ jobs:
           python -m py_compile \
             core/symbols/normalize.py \
             core/providers/eodhd_provider.py \
+            routes/advanced_analysis.py \
             scripts/critical_symbol_identity.py \
             scripts/run_dashboard_sync.py \
             scripts/concurrent_batch_fetch.py \
@@ -76,7 +81,8 @@ jobs:
             tests/test_provider_symbol_recovery.py \
             tests/test_benchmark_dashboard_fetch.py \
             tests/test_backend_symbol_capabilities.py \
-            tests/test_eodhd_http402_guard.py
+            tests/test_eodhd_http402_guard.py \
+            tests/test_truthful_failsoft_contract.py
           python -m unittest \
             tests/test_concurrent_batch_fetch.py \
             tests/test_provider_symbol_recovery.py \
@@ -84,7 +90,7 @@ jobs:
             tests/test_backend_symbol_capabilities.py \
             tests/test_critical_symbol_identity.py \
             -v
-          python -m pytest -q tests/test_eodhd_http402_guard.py
+          python -m pytest -q tests/test_eodhd_http402_guard.py tests/test_truthful_failsoft_contract.py
       - name: Verify staged production contract
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -101,24 +107,27 @@ jobs:
           from scripts.verify_backend_symbol_capabilities import RULES, evaluate_table
 
           os.environ.pop("TFB_SYNC_BATCH_CONCURRENCY", None)
+          os.environ.pop("TFB_EODHD_ENGINE_PATCH_BIND", None)
           assert concurrency() == 1
           assert eodhd_provider._err_indicates_provider_unhealthy("HTTP 402") is True
+          assert eodhd_provider._engine_patch_bind_enabled() is True
           assert sync.SCRIPT_VERSION == "6.31.0"
           assert callable(sync._fetch_market_rows_batched)
           assert callable(build(sync))
-          assert to_eodhd_symbol("ADNOCDIST.AB") == "ADNOCDIST.ADX"
+          assert to_eodhd_symbol("ADNOCDIST.AD") == "ADNOCDIST.ADX"
           assert to_eodhd_symbol("BPI.PS") == "BPI.PSE"
-          assert to_yahoo_symbol("ADNOCDIST.ADX") == "ADNOCDIST.AB"
+          assert to_yahoo_symbol("ADNOCDIST.ADX") == "ADNOCDIST.AD"
           assert canonicalize_symbol("NZYM-B.CO") == "NSIS-B.CO"
-          assert provider_recovery_variants("BK.US") == ["BK.US", "BK"]
+          assert canonicalize_symbol("BK.US") == "BNY.US"
+          assert provider_recovery_variants("BNY.US") == ["BNY.US", "BNY", "BK.US", "BK"]
           assert len(RULES) == 3
-          bk_rule = next(rule for rule in RULES if rule.requested_symbol == "BK.US")
-          bk_check = evaluate_table(
-              bk_rule,
+          bny_rule = next(rule for rule in RULES if rule.requested_symbol == "BNY.US")
+          bny_check = evaluate_table(
+              bny_rule,
               ["Symbol", "Name", "Current Price", "Data Provider"],
-              [["BK.US", "The Bank of New York Mellon Corporation", 71.2, "eodhd"]],
+              [["BNY.US", "The Bank of New York Mellon Corporation", 71.2, "eodhd"]],
           )
-          assert bk_check["passed"] is True
+          assert bny_check["passed"] is True
           result = sync.TaskResult(
               key="GLOBAL_MARKETS",
               sheet_name="Global_Markets",
@@ -131,5 +140,5 @@ jobs:
           sink = NoWriteSheets()
           assert sink.write_table("sid", "P", "A1", ["Symbol"], [["A"]]) == 1
           assert sink.planned_writes[0]["rows"] == 1
-          print("staged provider normalization + HTTP 402 fallback + concurrency=1 contract: PASS")
+          print("truthful provider normalization + HTTP 402 fallback + concurrency=1 contract: PASS")
           PY
