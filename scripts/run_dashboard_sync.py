@@ -3,9 +3,24 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.30.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.31.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.31.0 — BOUNDED BATCH CONCURRENCY WITH EXACT SEQUENTIAL ROLLBACK
+-----------------------------------------------------------------
+WHY: the market-page batch fetcher executed every 25-symbol request in strict
+sequence. At roughly 1,000 requested symbols this produced about 40 network
+waits and observed page refresh times close to 70 minutes.
+FIX: TFB_SYNC_BATCH_CONCURRENCY>1 delegates only the provider-fetch scheduling
+to scripts/concurrent_batch_fetch.py. The existing symbol read-back,
+persistence, KEEP-LAST-GOOD, identity firewalls, write-then-trim publication,
+and exit-code policy remain unchanged. Concurrency=1 follows the original
+v6.30.0 function byte-for-byte. Adapter import/runtime failure logs a warning
+and falls back to the original sequential path for that page. TaskResult now
+publishes batch_metrics (requested/attempted/fresh/failed/unattempted,
+coverage, retry and latency evidence). Initial production candidate: 3;
+hard clamp: 1..6. No scoring, recommendation, portfolio or trading changes.
 
 v6.28.0 — FW-4b SAFE NAME-DEDUP: KEEP-ONE-PER-CURRENCY, NEVER WIPE A GROUP
 --------------------------------------------------------------------------
@@ -1279,7 +1294,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.30.0"
+SCRIPT_VERSION = "6.31.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1518,6 +1533,7 @@ class TaskResult:
     gateway_used: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
     error: Optional[str] = None
+    batch_metrics: Dict[str, Any] = field(default_factory=dict)
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1535,6 +1551,7 @@ class TaskResult:
             "gateway_used": self.gateway_used,
             "warnings": self.warnings,
             "error": self.error,
+            "batch_metrics": self.batch_metrics,
             "request_id": self.request_id,
             "version": SCRIPT_VERSION,
         }
@@ -4769,7 +4786,12 @@ async def _fetch_market_rows_batched(
     eff_gw: str,
     res: "TaskResult",
 ) -> Tuple[List[Any], List[List[Any]], Optional[str], Optional[str]]:
-    """v6.17.0: fetch `symbols` for a market page in small SEQUENTIAL batches,
+    """Fetch market rows in sequential or bounded-concurrent symbol batches.
+
+    v6.31.0: TFB_SYNC_BATCH_CONCURRENCY > 1 activates the concurrency adapter.
+    Value 1 preserves the exact v6.30.0 sequential implementation below.
+
+    v6.17.0: fetch `symbols` for a market page in small SEQUENTIAL batches,
     accumulating the data rows, and return (headers, rows_matrix, used_endpoint,
     last_err) with the SAME shape the inline single-request loop produces — so
     the caller's guards + clear/write run unchanged on the combined result.
@@ -4781,6 +4803,32 @@ async def _fetch_market_rows_batched(
     Top_10 header-repair steps are (by scope) no-ops and are intentionally not
     duplicated here.
     """
+    _requested_concurrency = _safe_int(
+        os.getenv("TFB_SYNC_BATCH_CONCURRENCY", "1"), 1, lo=1, hi=6
+    )
+    if _requested_concurrency > 1:
+        try:
+            import importlib
+
+            try:
+                from scripts.concurrent_batch_fetch import build as _build_concurrent_fetch
+            except ImportError:
+                from concurrent_batch_fetch import build as _build_concurrent_fetch
+
+            _sync_module = importlib.import_module(__name__)
+            _concurrent_fetch = _build_concurrent_fetch(_sync_module)
+            return await _concurrent_fetch(
+                backend, task, symbols, base_payload, eff_gw, res
+            )
+        except Exception as _concurrency_error:
+            _cw = (
+                f"[BATCH-CONCURRENCY v1.1.0] integration failure on "
+                f"{task.sheet_name}; falling back to sequential: "
+                f"{_concurrency_error}"
+            )
+            res.warnings.append(_cw)
+            logger.exception(_cw)
+
     # v6.22.4 L5 [TIME-BUDGET]: a page whose fetch would START after the
     # budget is spent is skipped whole -> the caller's empty-fetch guards
     # PRESERVE its last-good rows (identical to a provider outage).
