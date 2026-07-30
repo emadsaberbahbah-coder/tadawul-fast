@@ -2,7 +2,7 @@ diff --git a/scripts/run_dashboard_sync.py b/scripts/run_dashboard_sync.py
 index c2edb6a..0000000 100644
 --- a/scripts/run_dashboard_sync.py
 +++ b/scripts/run_dashboard_sync.py
-@@ -5,10 +5,28 @@
+@@ -5,9 +5,24 @@
  scripts/run_dashboard_sync.py
  ================================================================================
 -TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.30.0)
@@ -28,7 +28,7 @@ index c2edb6a..0000000 100644
  v6.28.0 — FW-4b SAFE NAME-DEDUP: KEEP-ONE-PER-CURRENCY, NEVER WIPE A GROUP
  --------------------------------------------------------------------------
  EVIDENCE (2026-07-25 evening workbook audit, _Run_Log 13:58:49 leg):
-@@ -1281,7 +1299,7 @@
+@@ -1281,7 +1296,7 @@
  # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
  # v6.25.1 FW-KEEP last-good restore on the following merge.
  # -----------------------------------------------------------------------------
@@ -37,7 +37,7 @@ index c2edb6a..0000000 100644
  
  # -----------------------------------------------------------------------------
  # Logging (Render-safe)
-@@ -1520,6 +1538,7 @@ class TaskResult:
+@@ -1520,6 +1535,7 @@ class TaskResult:
      gateway_used: Optional[str] = None
      warnings: List[str] = field(default_factory=list)
      error: Optional[str] = None
@@ -45,7 +45,7 @@ index c2edb6a..0000000 100644
      request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
  
      def to_dict(self) -> Dict[str, Any]:
-@@ -1537,6 +1556,7 @@ class TaskResult:
+@@ -1537,6 +1553,7 @@ class TaskResult:
              "gateway_used": self.gateway_used,
              "warnings": self.warnings,
              "error": self.error,
@@ -53,7 +53,7 @@ index c2edb6a..0000000 100644
              "request_id": self.request_id,
              "version": SCRIPT_VERSION,
          }
-@@ -4771,10 +4791,38 @@ async def _fetch_market_rows_batched(
+@@ -4771,7 +4788,12 @@ async def _fetch_market_rows_batched(
      eff_gw: str,
      res: "TaskResult",
  ) -> Tuple[List[Any], List[List[Any]], Optional[str], Optional[str]]:
@@ -67,7 +67,7 @@ index c2edb6a..0000000 100644
      accumulating the data rows, and return (headers, rows_matrix, used_endpoint,
      last_err) with the SAME shape the inline single-request loop produces — so
      the caller's guards + clear/write run unchanged on the combined result.
-@@ -4783,6 +4831,28 @@ async def _fetch_market_rows_batched(
+@@ -4783,6 +4805,32 @@ async def _fetch_market_rows_batched(
      Top_10 header-repair steps are (by scope) no-ops and are intentionally not
      duplicated here.
      """
