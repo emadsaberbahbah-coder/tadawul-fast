@@ -65,6 +65,21 @@ class BackendSymbolCapabilityTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertEqual(result["reason"], "provider returned an error/stub marker")
 
+    def test_placeholder_provider_is_not_capability_proof(self):
+        rule = self.by_capability["yahoo_ps_to_eodhd_pse"]
+        result = evaluate_table(
+            rule,
+            self.headers,
+            [[
+                "BPI.PS",
+                "Market_Leaders BPI.PS",
+                101.0,
+                "advanced_analysis.placeholder_fallback",
+            ]],
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["reason"], "provider returned an error/stub marker")
+
     def test_missing_required_column_is_not_treated_as_blank_or_zero(self):
         rule = self.by_capability["yahoo_ab_to_eodhd_adx"]
         result = evaluate_table(
