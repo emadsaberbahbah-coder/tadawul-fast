@@ -4,8 +4,10 @@
 The dashboard sync intentionally preserves last-good rows during provider
 failures. That availability protection must not be mistaken for fresh data.
 This auditor understands both the legacy rows-written verdict and the v2
-freshness contract. Legacy evidence remains temporarily accepted in shadow mode,
-but is reported as incomplete and can be blocked with ``--enforce-v2``.
+freshness contract. Legacy or incomplete v2 evidence remains temporarily
+accepted in shadow mode, but is reported as incomplete and can be blocked with
+``--enforce-v2``. Low coverage, stubs, identity failures, zero writes, and bad
+statuses still block even during shadow rollout.
 
 Exit codes
 ----------
@@ -23,13 +25,20 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-from scripts.freshness_verdict_v2 import (
-    FreshnessEvidence,
-    assess_evidence,
-    parse_verdict_line,
-)
+try:  # Supports module and direct-script workflow invocation.
+    from scripts.freshness_verdict_v2 import (
+        FreshnessEvidence,
+        assess_evidence,
+        parse_verdict_line,
+    )
+except ModuleNotFoundError:  # pragma: no cover - workflow direct-script path
+    from freshness_verdict_v2 import (  # type: ignore
+        FreshnessEvidence,
+        assess_evidence,
+        parse_verdict_line,
+    )
 
-SCRIPT_VERSION = "2.0.0"
+SCRIPT_VERSION = "2.0.1"
 CRITICAL_MARKET_PAGES = (
     "Market_Leaders",
     "Global_Markets",
@@ -129,12 +138,21 @@ def _v2_page_verdict(
     line_number: int,
     min_fresh_coverage_pct: float,
     max_stubs: int,
+    enforce_v2: bool,
 ) -> PageVerdict:
     assessment = assess_evidence(
         evidence,
         min_fresh_coverage_pct=min_fresh_coverage_pct,
         max_stubs=max_stubs,
     )
+    failure_reasons = assessment.failure_reasons
+    passed = assessment.passed
+    # Transitional rule: incomplete legacy-derived v2 metrics may pass only when
+    # every proven core control passes. The incomplete flag stays visible and
+    # enforcement_ready remains False. Hard v2 enforcement blocks it.
+    if not enforce_v2 and failure_reasons == ("incomplete_v2_evidence",):
+        passed = True
+        failure_reasons = ()
     return PageVerdict(
         page=evidence.page,
         status=evidence.status,
@@ -144,8 +162,8 @@ def _v2_page_verdict(
         evidence_version=evidence.evidence_version,
         evidence_complete=evidence.evidence_complete,
         enforcement_ready=evidence.evidence_complete,
-        passed=assessment.passed,
-        failure_reasons=assessment.failure_reasons,
+        passed=passed,
+        failure_reasons=failure_reasons,
         requested=evidence.requested,
         fresh=evidence.fresh,
         preserved=evidence.preserved,
@@ -218,6 +236,7 @@ def _read_logs(
                         line_number=line_number,
                         min_fresh_coverage_pct=min_fresh_coverage_pct,
                         max_stubs=max_stubs,
+                        enforce_v2=enforce_v2,
                     )
                 )
                 continue
@@ -327,7 +346,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--enforce-v2",
         action="store_true",
-        help="block legacy PAGE-VERDICT lines; omit while v2 is in shadow rollout",
+        help="block legacy/incomplete PAGE-VERDICT evidence; omit during shadow rollout",
     )
     parser.add_argument("--json-out", help="optional JSON report path")
     args = parser.parse_args(argv)
@@ -356,7 +375,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"status={verdict.status}, rows_written={verdict.rows_written}, "
             f"evidence={verdict.evidence_version}, coverage={verdict.coverage_pct}, "
             f"fresh={verdict.fresh}, preserved={verdict.preserved}, "
-            f"stubs={verdict.stubs}, identity_failures={verdict.identity_failures}"
+            f"stale={verdict.stale}, stubs={verdict.stubs}, "
+            f"identity_failures={verdict.identity_failures}, "
+            f"provider_failures={verdict.provider_failures}, api_units={verdict.api_units}"
         )
         print(
             f"::{annotation} file={verdict.source},line={verdict.line}::"
