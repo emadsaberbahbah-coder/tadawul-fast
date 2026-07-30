@@ -1,0 +1,63 @@
+name: ⚡ Python Batch Concurrency
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/concurrent_batch_fetch.py'
+      - 'scripts/run_dashboard_sync_fast.py'
+      - 'tests/test_concurrent_batch_fetch.py'
+      - '.github/workflows/python_batch_concurrency.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/concurrent_batch_fetch.py'
+      - 'scripts/run_dashboard_sync_fast.py'
+      - 'tests/test_concurrent_batch_fetch.py'
+      - '.github/workflows/python_batch_concurrency.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-batch-concurrency-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test bounded batch concurrency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Compile and test
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            scripts/concurrent_batch_fetch.py \
+            scripts/run_dashboard_sync_fast.py \
+            tests/test_concurrent_batch_fetch.py
+          python -m unittest tests/test_concurrent_batch_fetch.py -v
+      - name: Import against current production runner
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from scripts import run_dashboard_sync as sync
+          from scripts.concurrent_batch_fetch import install
+          original = sync._fetch_market_rows_batched
+          install(sync)
+          assert sync._fetch_market_rows_batched is not original
+          assert sync._TFB_CONCURRENT_BATCH_FETCH_INSTALLED is True
+          assert callable(sync.TaskResult.to_dict)
+          print('production-runner adapter contract: PASS')
+          PY
