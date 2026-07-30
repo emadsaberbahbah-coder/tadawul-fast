@@ -1,0 +1,86 @@
+name: Apply EODHD HTTP 402 circuit hotfix
+
+on:
+  push:
+    branches:
+      - perf/python-batch-concurrency-v1
+    paths:
+      - patches/eodhd_http402_circuit_hotfix.patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-eodhd-http402-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply-hotfix:
+    name: Apply and verify provider hotfix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout hotfix branch
+        uses: actions/checkout@v6
+        with:
+          ref: perf/python-batch-concurrency-v1
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+
+      - name: Apply patch exactly once
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATCH="patches/eodhd_http402_circuit_hotfix.patch"
+          if git apply --check "$PATCH"; then
+            git apply "$PATCH"
+          elif git apply --reverse --check "$PATCH"; then
+            echo "Patch is already applied."
+          else
+            echo "::error::Patch neither applies cleanly nor appears already applied."
+            exit 1
+          fi
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+          if [[ -f requirements.render.txt ]]; then
+            python -m pip install -r requirements.render.txt
+          elif [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt
+          fi
+          python -m pip install -q pytest
+
+      - name: Verify compile and focused regression tests
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m compileall -q core/providers/eodhd_provider.py tests/test_eodhd_http402_guard.py
+          python -m pytest -q tests/test_eodhd_http402_guard.py
+
+      - name: Commit applied hotfix
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- core/providers/eodhd_provider.py tests/test_eodhd_http402_guard.py; then
+            echo "No code changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add core/providers/eodhd_provider.py tests/test_eodhd_http402_guard.py
+          git commit -m "fix(provider): circuit-break EODHD HTTP 402 failures"
+          git push origin HEAD:perf/python-batch-concurrency-v1
