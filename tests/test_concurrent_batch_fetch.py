@@ -20,11 +20,23 @@ class Result:
 
 
 class Backend:
-    def __init__(self, fail_once=(), fail_always=(), delay=.02, mismatch=()):
+    def __init__(
+        self,
+        fail_once=(),
+        fail_always=(),
+        delay=.02,
+        mismatch=(),
+        omit_once=(),
+        stub_once=(),
+    ):
         self.fail_once = set(fail_once)
         self.fail_always = set(fail_always)
         self.mismatch = set(mismatch)
+        self.omit_once = set(omit_once)
+        self.stub_once = set(stub_once)
         self.failed = set()
+        self.omitted = set()
+        self.stubbed = set()
         self.delay = delay
         self.active = 0
         self.max_active = 0
@@ -41,33 +53,68 @@ class Backend:
             if key in self.fail_once and key not in self.failed:
                 self.failed.add(key)
                 return None, "temporary", 500
-            headers = ["Value", "Symbol"] if key in self.mismatch else ["Symbol", "Value"]
-            rows = [[s.lower(), s] for s in reversed(symbols)] if key in self.mismatch else [[s, s.lower()] for s in reversed(symbols)]
+
+            headers = ["Symbol", "Name", "Current Price", "Data Provider"]
+            rows = [[symbol, symbol.lower(), 100.0, "mock"] for symbol in reversed(symbols)]
+            if key in self.omit_once and key not in self.omitted:
+                self.omitted.add(key)
+                rows = [row for row in rows if row[0] != key]
+            if key in self.stub_once and key not in self.stubbed:
+                self.stubbed.add(key)
+                rows = [
+                    [row[0], "", None, "fallback_error"] if row[0] == key else row
+                    for row in rows
+                ]
+            if key in self.mismatch:
+                headers = ["Name", "Symbol", "Current Price", "Data Provider"]
+                rows = [[row[1], row[0], row[2], row[3]] for row in rows]
             return {"headers": headers, "rows": rows}, None, 200
         finally:
             self.active -= 1
 
 
 def fake(size=1):
+    symbol_aliases = {"symbol", "ticker"}
+    name_aliases = {"name", "companyname"}
+    price_aliases = {"currentprice", "price", "lastprice"}
+    provider_aliases = {"dataprovider", "provider", "datasource"}
+
+    def normalize(value):
+        return "".join(character for character in str(value or "").lower() if character.isalnum())
+
+    def find_column(headers, aliases):
+        wanted = {normalize(alias) for alias in aliases}
+        for index, header in enumerate(headers):
+            if normalize(header) in wanted:
+                return index
+        return -1
+
     return SimpleNamespace(
         _request_limit_ceiling=lambda: 1000,
         _time_budget_exceeded=lambda: False,
         _symbol_batch_size=lambda: size,
         _batch_delay_ms=lambda: 0,
-        build_isolated_batches=lambda syms, n: [syms[i:i+n] for i in range(0, len(syms), n)],
-        _endpoint_candidates_for_gateway=lambda g: ["/e"],
-        _extract_table_payload=lambda d: (d.get("headers", []), d.get("rows", [])),
-        _rectify_matrix=lambda h, r: r,
+        build_isolated_batches=lambda symbols, batch_size: [
+            symbols[index:index + batch_size]
+            for index in range(0, len(symbols), batch_size)
+        ],
+        _endpoint_candidates_for_gateway=lambda gateway: ["/e"],
+        _extract_table_payload=lambda data: (data.get("headers", []), data.get("rows", [])),
+        _rectify_matrix=lambda headers, rows: rows,
         _batch_identity_enabled=lambda: True,
-        _guard_find_col=lambda h, a: 0,
-        _GUARD_SYMBOL_ALIASES={"symbol"},
-        _guard_is_blank=lambda v: v is None or str(v).strip() == "",
-        canonicalize_symbol=lambda v: str(v).strip().upper(),
+        _guard_find_col=find_column,
+        _GUARD_SYMBOL_ALIASES=symbol_aliases,
+        _GUARD_NAME_ALIASES=name_aliases,
+        _XPAGE_PRICE_ALIASES=price_aliases,
+        _KLG_PROVIDER_ALIASES=provider_aliases,
+        _guard_is_blank=lambda value: value is None or str(value).strip() == "",
+        _klg_provider_is_error=lambda value: normalize(value) in {"fallbackerror", "error"},
+        canonicalize_symbol=lambda value: str(value).strip().upper(),
         _BATCH_IDENTITY_TAG="[ID]",
         logger=SimpleNamespace(
-            info=lambda *a, **k: None,
-            warning=lambda *a, **k: None,
-            exception=lambda *a, **k: None,
+            info=lambda *args, **kwargs: None,
+            warning=lambda *args, **kwargs: None,
+            exception=lambda *args, **kwargs: None,
         ),
     )
 
@@ -77,8 +124,22 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         fn = build(fake())
         backend = Backend(delay=.03)
         result = Result("bounded")
-        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"}):
-            _, rows, _, _ = await fn(backend, SimpleNamespace(sheet_name="Global_Markets"), list("ABCDEFG"), {}, "analysis", result)
+        with patch.dict(
+            os.environ,
+            {
+                "TFB_SYNC_BATCH_CONCURRENCY": "3",
+                "TFB_SYNC_BATCH_OUTER_RETRIES": "0",
+                "TFB_SYNC_TARGET_RECOVERY": "1",
+            },
+        ):
+            _, rows, _, _ = await fn(
+                backend,
+                SimpleNamespace(sheet_name="Global_Markets"),
+                list("ABCDEFG"),
+                {},
+                "analysis",
+                result,
+            )
         self.assertEqual(backend.max_active, 3)
         self.assertEqual([row[0] for row in rows], list("ABCDEFG"))
         self.assertEqual(result.batch_metrics["symbols_fresh"], 7)
@@ -86,10 +147,17 @@ class Tests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_first_batch_does_not_block_endpoint_resolution(self):
         fn = build(fake())
         result = Result("resolve")
-        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "1"}):
+        with patch.dict(
+            os.environ,
+            {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "1"},
+        ):
             _, rows, endpoint, _ = await fn(
-                Backend(fail_once={"A"}), SimpleNamespace(sheet_name="P"),
-                list("ABCD"), {}, "analysis", result,
+                Backend(fail_once={"A"}),
+                SimpleNamespace(sheet_name="P"),
+                list("ABCD"),
+                {},
+                "analysis",
+                result,
             )
         self.assertEqual(endpoint, "/e")
         self.assertEqual([row[0] for row in rows], list("ABCD"))
@@ -98,18 +166,93 @@ class Tests(unittest.IsolatedAsyncioTestCase):
     async def test_retry_recovers_failed_batch(self):
         fn = build(fake())
         result = Result("retry")
-        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "1"}):
-            _, rows, _, _ = await fn(Backend({"C"}), SimpleNamespace(sheet_name="P"), list("ABCD"), {}, "analysis", result)
+        with patch.dict(
+            os.environ,
+            {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "1"},
+        ):
+            _, rows, _, _ = await fn(
+                Backend(fail_once={"C"}),
+                SimpleNamespace(sheet_name="P"),
+                list("ABCD"),
+                {},
+                "analysis",
+                result,
+            )
         self.assertEqual([row[0] for row in rows], list("ABCD"))
         self.assertEqual(get_metrics("retry")["symbols_failed"], 0)
+
+    async def test_targeted_recovery_heals_missing_symbol(self):
+        fn = build(fake())
+        result = Result("missing")
+        with patch.dict(
+            os.environ,
+            {
+                "TFB_SYNC_BATCH_CONCURRENCY": "3",
+                "TFB_SYNC_BATCH_OUTER_RETRIES": "0",
+                "TFB_SYNC_TARGET_RECOVERY": "1",
+                "TFB_SYNC_TARGET_RECOVERY_ROUNDS": "1",
+            },
+        ):
+            _, rows, _, _ = await fn(
+                Backend(omit_once={"C"}),
+                SimpleNamespace(sheet_name="P"),
+                list("ABCD"),
+                {},
+                "analysis",
+                result,
+            )
+        self.assertEqual([row[0] for row in rows], list("ABCD"))
+        self.assertEqual(result.batch_metrics["symbols_missing_initial"], 1)
+        self.assertEqual(result.batch_metrics["targeted_recovery_healed"], 1)
+        self.assertEqual(result.batch_metrics["symbols_missing"], 0)
+
+    async def test_targeted_recovery_heals_data_free_stub(self):
+        fn = build(fake())
+        result = Result("stub")
+        with patch.dict(
+            os.environ,
+            {
+                "TFB_SYNC_BATCH_CONCURRENCY": "3",
+                "TFB_SYNC_BATCH_OUTER_RETRIES": "0",
+                "TFB_SYNC_TARGET_RECOVERY": "1",
+                "TFB_SYNC_TARGET_RECOVERY_ROUNDS": "1",
+            },
+        ):
+            _, rows, _, _ = await fn(
+                Backend(stub_once={"C"}),
+                SimpleNamespace(sheet_name="P"),
+                list("ABCD"),
+                {},
+                "analysis",
+                result,
+            )
+        self.assertEqual([row[0] for row in rows], list("ABCD"))
+        self.assertEqual(result.batch_metrics["symbols_data_free_initial"], 1)
+        self.assertEqual(result.batch_metrics["targeted_recovery_healed"], 1)
+        self.assertEqual(result.batch_metrics["symbols_data_free"], 0)
+        self.assertEqual(result.batch_metrics["fresh_coverage_pct"], 100.0)
 
     async def test_header_mismatch_is_not_merged(self):
         fn = build(fake())
         result = Result("header")
-        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"}):
-            _, rows, _, _ = await fn(Backend(mismatch={"C"}), SimpleNamespace(sheet_name="P"), list("ABCD"), {}, "analysis", result)
+        with patch.dict(
+            os.environ,
+            {
+                "TFB_SYNC_BATCH_CONCURRENCY": "3",
+                "TFB_SYNC_BATCH_OUTER_RETRIES": "0",
+                "TFB_SYNC_TARGET_RECOVERY_ROUNDS": "1",
+            },
+        ):
+            _, rows, _, _ = await fn(
+                Backend(mismatch={"C"}),
+                SimpleNamespace(sheet_name="P"),
+                list("ABCD"),
+                {},
+                "analysis",
+                result,
+            )
         self.assertEqual([row[0] for row in rows], ["A", "B", "D"])
-        self.assertEqual(result.batch_metrics["symbols_failed"], 1)
+        self.assertEqual(result.batch_metrics["symbols_missing"], 1)
 
     async def test_install_concurrency_one_uses_exact_original(self):
         calls = []
@@ -122,9 +265,11 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         sync._fetch_market_rows_batched = original
         install(sync)
         with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "1"}):
-            result = await sync._fetch_market_rows_batched(None, None, [], {}, "g", Result())
+            output = await sync._fetch_market_rows_batched(
+                None, None, [], {}, "g", Result()
+            )
         self.assertEqual(calls, ["original"])
-        self.assertEqual(result[2], "/old")
+        self.assertEqual(output[2], "/old")
 
     async def test_adapter_exception_falls_back_to_original(self):
         calls = []
@@ -135,23 +280,45 @@ class Tests(unittest.IsolatedAsyncioTestCase):
 
         sync = fake()
         sync._fetch_market_rows_batched = original
-        sync.build_isolated_batches = lambda *_: (_ for _ in ()).throw(RuntimeError("boom"))
+        sync.build_isolated_batches = lambda *_: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        )
         install(sync)
         with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3"}):
-            result = await sync._fetch_market_rows_batched(None, None, ["A"], {}, "g", Result())
+            output = await sync._fetch_market_rows_batched(
+                None, None, ["A"], {}, "g", Result()
+            )
         self.assertEqual(calls, ["original"])
-        self.assertEqual(result[2], "/old")
+        self.assertEqual(output[2], "/old")
 
     async def test_parallel_is_materially_faster(self):
         fn = build(fake())
         symbols = list("ABCDEFG")
-        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "1", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"}):
+        base_env = {
+            "TFB_SYNC_BATCH_OUTER_RETRIES": "0",
+            "TFB_SYNC_TARGET_RECOVERY": "0",
+        }
+        with patch.dict(os.environ, base_env | {"TFB_SYNC_BATCH_CONCURRENCY": "1"}):
             start = time.perf_counter()
-            await fn(Backend(delay=.03), SimpleNamespace(sheet_name="P"), symbols, {}, "analysis", Result("sequential"))
+            await fn(
+                Backend(delay=.03),
+                SimpleNamespace(sheet_name="P"),
+                symbols,
+                {},
+                "analysis",
+                Result("sequential"),
+            )
             sequential = time.perf_counter() - start
-        with patch.dict(os.environ, {"TFB_SYNC_BATCH_CONCURRENCY": "3", "TFB_SYNC_BATCH_OUTER_RETRIES": "0"}):
+        with patch.dict(os.environ, base_env | {"TFB_SYNC_BATCH_CONCURRENCY": "3"}):
             start = time.perf_counter()
-            await fn(Backend(delay=.03), SimpleNamespace(sheet_name="P"), symbols, {}, "analysis", Result("parallel"))
+            await fn(
+                Backend(delay=.03),
+                SimpleNamespace(sheet_name="P"),
+                symbols,
+                {},
+                "analysis",
+                Result("parallel"),
+            )
             parallel = time.perf_counter() - start
         self.assertLess(parallel, sequential * .65)
 
