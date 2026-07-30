@@ -20,7 +20,7 @@ from typing import Any, Iterable, Sequence
 
 from scripts import run_dashboard_sync as sync
 
-GATE_VERSION = "1.0.1"
+GATE_VERSION = "1.0.2"
 
 
 @dataclass(frozen=True)
@@ -54,7 +54,11 @@ RULES: tuple[ProbeRule, ...] = (
 
 
 def _norm(value: Any) -> str:
-    return "".join(character for character in str(value or "").strip().casefold() if character.isalnum())
+    return "".join(
+        character
+        for character in str(value or "").strip().casefold()
+        if character.isalnum()
+    )
 
 
 def _find_column(headers: Sequence[Any], aliases: Iterable[str]) -> int:
@@ -74,13 +78,28 @@ def _positive(value: Any) -> bool:
 
 
 def _provider_error(value: Any) -> bool:
+    normalized = _norm(value)
     checker = getattr(sync, "_klg_provider_is_error", None)
     if callable(checker):
         try:
-            return bool(checker(value))
+            if bool(checker(value)):
+                return True
         except Exception:
             pass
-    return _norm(value) in {"fallbackerror", "error", "unavailable", "none"}
+    # Capability proof must come from a real provider result. Generic fallback,
+    # placeholder, synthetic or stub rows can have plausible names/prices but
+    # are not evidence that the deployed backend understands the symbol.
+    rejected_tokens = (
+        "error",
+        "unavailable",
+        "none",
+        "fallback",
+        "placeholder",
+        "synthetic",
+        "stub",
+        "mock",
+    )
+    return (not normalized) or any(token in normalized for token in rejected_tokens)
 
 
 def _accepted_symbol(value: Any, rule: ProbeRule) -> bool:
@@ -96,13 +115,22 @@ def evaluate_table(
     """Evaluate one probe response without network access.
 
     The gate requires a matching symbol, a non-blank issuer name, a positive
-    current price, a non-error provider marker, and an accepted issuer token.
-    Missing columns are reported explicitly rather than treated as zero/blank.
+    current price, a real non-fallback provider marker, and an accepted issuer
+    token. Missing columns are reported explicitly rather than treated as zero.
     """
     symbol_index = _find_column(headers, ("Symbol", "Ticker", "Code"))
-    name_index = _find_column(headers, ("Name", "Company Name", "Instrument Name", "Short Name"))
-    price_index = _find_column(headers, ("Current Price", "Price", "Last Price", "Last"))
-    provider_index = _find_column(headers, ("Data Provider", "Provider", "Data Source", "Source"))
+    name_index = _find_column(
+        headers,
+        ("Name", "Company Name", "Instrument Name", "Short Name"),
+    )
+    price_index = _find_column(
+        headers,
+        ("Current Price", "Price", "Last Price", "Last"),
+    )
+    provider_index = _find_column(
+        headers,
+        ("Data Provider", "Provider", "Data Source", "Source"),
+    )
 
     missing_columns: list[str] = []
     if symbol_index < 0:
@@ -143,9 +171,17 @@ def evaluate_table(
         return outcome
 
     symbol = str(selected[symbol_index] or "").strip().upper()
-    name = str(selected[name_index] or "").strip() if name_index < len(selected) else ""
+    name = (
+        str(selected[name_index] or "").strip()
+        if name_index < len(selected)
+        else ""
+    )
     price = selected[price_index] if price_index < len(selected) else None
-    provider = str(selected[provider_index] or "").strip() if provider_index < len(selected) else ""
+    provider = (
+        str(selected[provider_index] or "").strip()
+        if provider_index < len(selected)
+        else ""
+    )
     outcome.update(
         seen_symbol=symbol,
         seen_name=name[:120],
@@ -162,7 +198,7 @@ def evaluate_table(
     if not _positive(price):
         outcome["reason"] = "missing or non-positive current price"
         return outcome
-    if not provider or _provider_error(provider):
+    if _provider_error(provider):
         outcome["reason"] = "provider returned an error/stub marker"
         return outcome
 
@@ -172,9 +208,8 @@ def evaluate_table(
 
 
 def _payload(rule: ProbeRule, page: str, request_id: str) -> dict[str, Any]:
-    # Include the aliases accepted across the analysis-router generations. Extra
-    # keys are intentional compatibility fields; the production runner sends the
-    # same symbol/page concepts through this route.
+    # Include aliases accepted across analysis-router generations. Extra keys are
+    # intentional compatibility fields and do not broaden the symbol request.
     return {
         "sheet": page,
         "page": page,
@@ -194,12 +229,25 @@ async def _probe_one(
     page: str,
     rule: ProbeRule,
     position: int,
+    timeout_sec: float,
 ) -> dict[str, Any]:
     request_id = f"deploy-capability-{int(time.time())}-{position + 1}"
-    data, error, status_code = await backend.post_json(
-        endpoint,
-        _payload(rule, page, request_id),
-    )
+    try:
+        data, error, status_code = await asyncio.wait_for(
+            backend.post_json(endpoint, _payload(rule, page, request_id)),
+            timeout=max(5.0, float(timeout_sec)),
+        )
+    except asyncio.TimeoutError:
+        return {
+            "capability": rule.capability,
+            "requested_symbol": rule.requested_symbol,
+            "accepted_symbols": list(rule.accepted_symbols),
+            "passed": False,
+            "reason": "probe time budget exceeded",
+            "http_status": 0,
+            "request_id": request_id,
+        }
+
     if error or not isinstance(data, dict):
         return {
             "capability": rule.capability,
@@ -218,9 +266,11 @@ async def _probe_one(
         http_status=int(status_code or 0),
         request_id=request_id,
         response_status=str(data.get("status") or ""),
-        response_source=str((data.get("meta") or {}).get("source") or "")
-        if isinstance(data.get("meta"), dict)
-        else "",
+        response_source=(
+            str((data.get("meta") or {}).get("source") or "")
+            if isinstance(data.get("meta"), dict)
+            else ""
+        ),
     )
     return outcome
 
@@ -230,9 +280,10 @@ async def run_gate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     if not backend_url:
         raise RuntimeError("Backend URL is required")
 
+    probe_budget = max(5.0, float(args.timeout))
     backend = sync.BackendClient(
         backend_url,
-        timeout_sec=float(args.timeout),
+        timeout_sec=min(30.0, probe_budget),
         token=sync._env_token(),
     )
     started = time.perf_counter()
@@ -241,7 +292,14 @@ async def run_gate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         probes = list(
             await asyncio.gather(
                 *[
-                    _probe_one(backend, args.endpoint, args.page, rule, index)
+                    _probe_one(
+                        backend,
+                        args.endpoint,
+                        args.page,
+                        rule,
+                        index,
+                        probe_budget,
+                    )
                     for index, rule in enumerate(RULES)
                 ]
             )
@@ -259,6 +317,7 @@ async def run_gate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "backend": backend_url,
         "endpoint": args.endpoint,
         "page": args.page,
+        "probe_wall_clock_budget_sec": probe_budget,
         "ready_for_full_benchmark": ready,
         "elapsed_ms": round((time.perf_counter() - started) * 1000.0),
         "meta_http_status": int(meta_status or 0),
@@ -290,7 +349,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         code, payload = asyncio.run(run_gate(args))
     except Exception as exc:
-        print(f"::error::BACKEND_CAPABILITY_GATE_FAILED: {type(exc).__name__}: {exc}")
+        print(
+            "::error::BACKEND_CAPABILITY_GATE_FAILED: "
+            f"{type(exc).__name__}: {exc}"
+        )
         return 3
 
     rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
