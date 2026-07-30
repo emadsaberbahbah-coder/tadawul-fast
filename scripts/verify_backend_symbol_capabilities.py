@@ -20,7 +20,7 @@ from typing import Any, Iterable, Sequence
 
 from scripts import run_dashboard_sync as sync
 
-GATE_VERSION = "1.0.0"
+GATE_VERSION = "1.0.1"
 
 
 @dataclass(frozen=True)
@@ -238,10 +238,14 @@ async def run_gate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     started = time.perf_counter()
     try:
         meta, meta_error, meta_status = await backend.get_json("/meta")
-        probes = [
-            await _probe_one(backend, args.endpoint, args.page, rule, index)
-            for index, rule in enumerate(RULES)
-        ]
+        probes = list(
+            await asyncio.gather(
+                *[
+                    _probe_one(backend, args.endpoint, args.page, rule, index)
+                    for index, rule in enumerate(RULES)
+                ]
+            )
+        )
     finally:
         await backend.close()
 
@@ -276,7 +280,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", default="")
     parser.add_argument("--endpoint", default="/v1/analysis/sheet-rows")
     parser.add_argument("--page", default="Market_Leaders")
-    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--json-out", default="backend_symbol_capabilities.json")
     return parser
 
