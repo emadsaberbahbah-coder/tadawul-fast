@@ -11,12 +11,12 @@ on:
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'scripts/verify_backend_symbol_capabilities.py'
+      - 'scripts/apply_eodhd_http402_hotfix.py'
       - 'tests/test_concurrent_batch_fetch.py'
       - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
       - 'tests/test_backend_symbol_capabilities.py'
       - 'tests/test_eodhd_http402_guard.py'
-      - 'patches/eodhd_http402_circuit_hotfix.patch'
       - '.github/workflows/python_batch_concurrency.yml'
   push:
     branches: [main]
@@ -29,6 +29,7 @@ on:
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'scripts/verify_backend_symbol_capabilities.py'
+      - 'scripts/apply_eodhd_http402_hotfix.py'
       - 'tests/test_concurrent_batch_fetch.py'
       - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
@@ -70,6 +71,7 @@ jobs:
             scripts/run_dashboard_sync_fast.py \
             scripts/benchmark_dashboard_fetch.py \
             scripts/verify_backend_symbol_capabilities.py \
+            scripts/apply_eodhd_http402_hotfix.py \
             tests/test_concurrent_batch_fetch.py \
             tests/test_provider_symbol_recovery.py \
             tests/test_benchmark_dashboard_fetch.py \
@@ -151,20 +153,11 @@ jobs:
             requirements.render.txt
             requirements.txt
 
-      - name: Apply staged provider patch exactly once
+      - name: Apply assertion-based provider hotfix exactly once
         shell: bash
         run: |
           set -euo pipefail
-          PATCH="patches/eodhd_http402_circuit_hotfix.patch"
-          test -f "$PATCH"
-          if git apply --check "$PATCH"; then
-            git apply "$PATCH"
-          elif git apply --reverse --check "$PATCH"; then
-            echo "Patch is already applied."
-          else
-            echo "::error::HTTP 402 patch neither applies cleanly nor appears already applied."
-            exit 1
-          fi
+          python scripts/apply_eodhd_http402_hotfix.py
 
       - name: Install focused test dependencies
         shell: bash
@@ -199,5 +192,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add core/providers/eodhd_provider.py tests/test_eodhd_http402_guard.py
-          git commit -m "fix(provider): circuit-break EODHD HTTP 402 failures"
+          git commit -m "fix(provider): signal EODHD HTTP 402 as unhealthy"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
