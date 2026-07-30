@@ -95,7 +95,13 @@ def main() -> None:
 '''
 
 pattern = r"def patch_workflow\(\) -> None:\n.*?\n\ndef main\(\) -> None:\n"
-updated, count = re.subn(pattern, replacement, text, count=1, flags=re.S | re.M)
+updated, count = re.subn(
+    pattern,
+    lambda _match: replacement,
+    text,
+    count=1,
+    flags=re.S | re.M,
+)
 if count != 1:
     raise RuntimeError(f"temporary transformer patch_workflow replacement failed: {count}")
 TARGET.write_text(updated, encoding="utf-8")
