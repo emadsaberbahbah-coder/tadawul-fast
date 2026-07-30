@@ -1,0 +1,52 @@
+name: "🖐️ Manual Refresh Priority"
+
+on:
+  pull_request:
+    paths:
+      - "apps_script/11_Manual_Refresh_Coordinator.gs"
+      - "docs/MANUAL_REFRESH_PRIORITY_V1.md"
+      - "tests/test_manual_refresh_priority_contract.py"
+      - ".github/workflows/manual_refresh_priority.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "apps_script/11_Manual_Refresh_Coordinator.gs"
+      - "docs/MANUAL_REFRESH_PRIORITY_V1.md"
+      - "tests/test_manual_refresh_priority_contract.py"
+      - ".github/workflows/manual_refresh_priority.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-refresh-priority-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Compile test
+        run: python -m py_compile tests/test_manual_refresh_priority_contract.py
+
+      - name: Run coordinator contract tests
+        run: python -m unittest -v tests.test_manual_refresh_priority_contract
+
+      - name: Verify source is deployment-inert
+        run: |
+          set -euo pipefail
+          grep -q "This file is inert until" apps_script/11_Manual_Refresh_Coordinator.gs
+          grep -q "not deployed to the bound Google Apps Script project" docs/MANUAL_REFRESH_PRIORITY_V1.md
