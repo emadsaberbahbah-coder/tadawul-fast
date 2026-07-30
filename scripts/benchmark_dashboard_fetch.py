@@ -2,9 +2,9 @@
 """Read-only benchmark for the production Python dashboard refresh path.
 
 The benchmark reads the live page universe and calls the same Render/backend
-routes and the same guards used by ``run_dashboard_sync.py``.  It replaces the
-final Sheet writer with an in-memory sink and disables the optional _Run_Log
-append, so no workbook cell is changed.
+routes and guards used by ``run_dashboard_sync.py``. It replaces the final
+Sheet writer with an in-memory sink and disables the optional _Run_Log append,
+so no workbook cell is changed.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from typing import Any, Sequence
 
 from scripts import run_dashboard_sync as sync
 
-BENCHMARK_VERSION = "1.0.0"
+BENCHMARK_VERSION = "1.1.0"
 
 
 class NoWriteSheets(sync.SheetsWriter):
@@ -29,15 +29,8 @@ class NoWriteSheets(sync.SheetsWriter):
         self.planned_writes: list[dict[str, Any]] = []
         self.clear_requests: list[dict[str, Any]] = []
 
-    def clear_from(
-        self,
-        spreadsheet_id: str,
-        sheet_name: str,
-        start_a1: str,
-    ) -> None:
-        self.clear_requests.append(
-            {"sheet_name": sheet_name, "start_a1": start_a1}
-        )
+    def clear_from(self, spreadsheet_id: str, sheet_name: str, start_a1: str) -> None:
+        self.clear_requests.append({"sheet_name": sheet_name, "start_a1": start_a1})
 
     def write_table(
         self,
@@ -61,10 +54,7 @@ class NoWriteSheets(sync.SheetsWriter):
 def _task_for(value: str) -> sync.TaskSpec:
     wanted = sync._guard_norm(value)
     for task in sync._default_tasks():
-        if wanted in {
-            sync._guard_norm(task.key),
-            sync._guard_norm(task.sheet_name),
-        }:
+        if wanted in {sync._guard_norm(task.key), sync._guard_norm(task.sheet_name)}:
             return task
     raise ValueError(f"Unknown benchmark page/key: {value}")
 
@@ -76,8 +66,10 @@ def _set_runtime_env(args: argparse.Namespace) -> None:
     os.environ["TFB_SYNC_TIME_BUDGET_SEC"] = str(args.time_budget)
     os.environ["TFB_SYNC_IDFW_RUNLOG"] = "0"
     os.environ["TFB_XPAGE_PRICE_CHECK"] = "0"
-    # The benchmark must not acquire or alter a production writer lock. It is
-    # read-only by construction and performs no Sheet publication.
+    os.environ.setdefault("TFB_SYNC_TARGET_RECOVERY", "1")
+    os.environ.setdefault("TFB_SYNC_TARGET_RECOVERY_MAX", "120")
+    os.environ.setdefault("TFB_SYNC_TARGET_RECOVERY_BATCH_SIZE", "10")
+    os.environ.setdefault("TFB_SYNC_TARGET_RECOVERY_ROUNDS", "1")
     sync._TIME_BUDGET_START = time.monotonic()
 
 
@@ -114,8 +106,14 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     elapsed_ms = round((time.perf_counter() - started) * 1000.0)
     result_payload = result.to_dict()
     metrics = dict(result_payload.get("batch_metrics") or {})
+    requested = int(metrics.get("symbols_requested") or result.symbols_requested or 0)
+    returned = int(metrics.get("symbols_returned") or 0)
+    fresh = int(metrics.get("symbols_fresh") or 0)
+    data_free = int(metrics.get("symbols_data_free") or 0)
+    missing = int(metrics.get("symbols_missing") or 0)
+
     payload: dict[str, Any] = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "benchmark_version": BENCHMARK_VERSION,
         "runner_version": sync.SCRIPT_VERSION,
         "mode": "read_live_fetch_no_write",
@@ -136,21 +134,30 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "batch_metrics": metrics,
         "planned_writes": sheets.planned_writes,
         "clear_requests": sheets.clear_requests,
-    }
-
-    requested = int(metrics.get("symbols_requested") or result.symbols_requested or 0)
-    fresh = int(metrics.get("symbols_fresh") or 0)
-    payload["acceptance"] = {
-        "requested_symbols": requested,
-        "fresh_symbols": fresh,
-        "fresh_coverage_pct": metrics.get("fresh_coverage_pct"),
-        "failed_symbols": metrics.get("symbols_failed"),
-        "unattempted_symbols": metrics.get("symbols_unattempted"),
-        "http_429": metrics.get("http_429"),
-        "http_5xx": metrics.get("http_5xx"),
-        "within_25_minutes": elapsed_ms <= 25 * 60 * 1000,
-        "within_35_minutes": elapsed_ms <= 35 * 60 * 1000,
-        "complete_fresh_fetch": bool(requested and fresh == requested),
+        "acceptance": {
+            "requested_symbols": requested,
+            "returned_symbols": returned,
+            "fresh_symbols": fresh,
+            "data_free_symbols": data_free,
+            "missing_symbols": missing,
+            "returned_coverage_pct": metrics.get("returned_coverage_pct"),
+            "fresh_coverage_pct": metrics.get("fresh_coverage_pct"),
+            "targeted_recovery_requested": metrics.get("targeted_recovery_requested"),
+            "targeted_recovery_healed": metrics.get("targeted_recovery_healed"),
+            "unattempted_symbols": metrics.get("symbols_unattempted"),
+            "http_429": metrics.get("http_429"),
+            "http_5xx": metrics.get("http_5xx"),
+            "within_25_minutes": elapsed_ms <= 25 * 60 * 1000,
+            "within_35_minutes": elapsed_ms <= 35 * 60 * 1000,
+            "complete_fresh_fetch": bool(
+                requested
+                and fresh == requested
+                and data_free == 0
+                and missing == 0
+            ),
+            "runner_status": result.status,
+            "runner_error": result.error,
+        },
     }
 
     if result.status == "failed":
