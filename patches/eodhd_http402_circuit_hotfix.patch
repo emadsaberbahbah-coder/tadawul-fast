@@ -1,0 +1,213 @@
+diff --git a/core/providers/eodhd_provider.py b/core/providers/eodhd_provider.py
+index 3a4f377..0000000 100644
+--- a/core/providers/eodhd_provider.py
++++ b/core/providers/eodhd_provider.py
+@@ -4,6 +4,24 @@
+ """
+ ================================================================================
+-EODHD Provider — v4.15.0 (UNIT-AWARE PERCENT CONVERSION: the magnitude guess
++EODHD Provider — v4.15.1 (HTTP 402 PLAN-RESTRICTION CIRCUIT BREAKER)
++================================================================================
++
++v4.15.1 — WHY
++--------------------------------------------------------------------------------
++The production workbook showed `fetch_failed:HTTP 402` on 9,797 rows across the
++four market pages. HTTP 402 means the requested endpoint is not available under
++the active account/plan. The provider previously treated 402 as a generic,
++per-symbol FetchError: it did not emit `provider_unhealthy:eodhd`, did not count
++the failures toward the circuit breaker, and continued repeating the same known-
++failing request thousands of times. That wasted most of the refresh window and
++left the engine with price-only fallback rows.
++
++FIX: classify HTTP 402 as PlanRestricted, emit the existing provider-unhealthy
++marker, count consecutive plan failures independently, and open the EODHD circuit
++at the same configurable threshold used for auth/IP failures. A 402 is terminal
++for the request and is never retried. The engine can therefore move immediately
++to the next provider instead of burning the batch window on an unavailable plan.
++
++EODHD Provider — v4.15.0 (UNIT-AWARE PERCENT CONVERSION: the magnitude guess
+                            that silently inflated every sub-1.5% value by 100x
+                            is retired)
+@@ -914,9 +932,12 @@ _PROVIDER_UNHEALTHY_TRIGGER_TOKENS: Tuple[str, ...] = (
+     "auth_error",
+     "ip_blocked",
++    "plan_restricted",
++    "payment_required",
++    "http 402",
+ )
+@@ -1020,7 +1041,7 @@ def _build_error_patch_with_geo(
+-PROVIDER_VERSION = "4.15.0"
++PROVIDER_VERSION = "4.15.1"
+ VERSION = PROVIDER_VERSION
+@@ -1254,6 +1275,7 @@ class _ProviderHealth:
+         # Consecutive-failure tracking (reset on first success)
+         self._consecutive_auth = 0
+         self._consecutive_ip = 0
++        self._consecutive_plan = 0
+         # Circuit state
+         self._state: str = "closed"
+@@ -1265,6 +1287,7 @@ class _ProviderHealth:
+         self._success_count = 0
+         self._auth_count = 0
+         self._ip_count = 0
++        self._plan_count = 0
+         self._rate_count = 0
+         self._network_count = 0
+@@ -1299,6 +1322,7 @@ class _ProviderHealth:
+             self._success_count += 1
+             self._consecutive_auth = 0
+             self._consecutive_ip = 0
++            self._consecutive_plan = 0
+             self._last_success = now
+@@ -1327,6 +1351,9 @@ class _ProviderHealth:
+             elif cls_lower == "ipblocked":
+                 self._ip_count += 1
+                 self._consecutive_ip += 1
++            elif cls_lower == "planrestricted":
++                self._plan_count += 1
++                self._consecutive_plan += 1
+             elif cls_lower == "ratelimited":
+                 self._rate_count += 1
+@@ -1351,15 +1378,17 @@ class _ProviderHealth:
+             if self._state == "open":
+                 return
+ 
+-            if self._consecutive_auth >= threshold or self._consecutive_ip >= threshold:
++            if (self._consecutive_auth >= threshold
++                    or self._consecutive_ip >= threshold
++                    or self._consecutive_plan >= threshold):
+                 self._state = "open"
+                 self._opened_at = now
+                 logger.error(
+                     "[eodhd v4.9.1] circuit_breaker OPEN: "
+-                    "consecutive_auth=%d consecutive_ip=%d threshold=%d "
+-                    "(EODHD provider unhealthy — verify EODHD_API_KEY env var)",
+-                    self._consecutive_auth, self._consecutive_ip, threshold,
++                    "consecutive_auth=%d consecutive_ip=%d consecutive_plan=%d threshold=%d "
++                    "(EODHD provider unhealthy — verify key, plan and endpoint entitlement)",
++                    self._consecutive_auth, self._consecutive_ip,
++                    self._consecutive_plan, threshold,
+                 )
+@@ -1383,6 +1412,7 @@ class _ProviderHealth:
+                 "circuit_breaker_enabled": _circuit_breaker_enabled(),
+                 "consecutive_auth_errors": self._consecutive_auth,
+                 "consecutive_ip_blocks": self._consecutive_ip,
++                "consecutive_plan_restrictions": self._consecutive_plan,
+                 "last_failure_class": self._last_failure_class,
+@@ -1401,6 +1431,7 @@ class _ProviderHealth:
+                     "success_count": self._success_count,
+                     "auth_error_count": self._auth_count,
+                     "ip_block_count": self._ip_count,
++                    "plan_restricted_count": self._plan_count,
+                     "rate_limit_count": self._rate_count,
+                     "network_error_count": self._network_count,
+@@ -2108,6 +2139,8 @@ class EODHDClient:
+         if "auth_error" in lerr:
+             return "AuthError"
+         if "ip_blocked" in lerr:
+             return "IpBlocked"
++        if "plan_restricted" in lerr or "payment_required" in lerr or "402" in lerr:
++            return "PlanRestricted"
+         if "quota_or_rate_limit" in lerr or "429" in lerr:
+             return "RateLimited"
+@@ -2174,6 +2207,18 @@ class EODHDClient:
+                     r = await self._client.get(url, params=p)
+                     sc = int(r.status_code)
+ 
++                    if sc == 402:
++                        body_hint = ""
++                        try:
++                            body_hint = (r.text or "")[:200]
++                        except Exception:
++                            body_hint = ""
++                        err_str = f"HTTP 402 plan_restricted {body_hint}".strip()
++                        # A plan/entitlement rejection cannot succeed on retry for
++                        # another symbol in the same process. Count it toward the
++                        # circuit immediately and let the engine use its fallback.
++                        await health.record_failure("PlanRestricted")
++                        return None, err_str
++
+                     if sc == 429:
+                         ra = r.headers.get("Retry-After")
+                         wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else min(15.0, 1.0 + attempt)
+diff --git a/tests/test_eodhd_http402_guard.py b/tests/test_eodhd_http402_guard.py
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/tests/test_eodhd_http402_guard.py
+@@ -0,0 +1,86 @@
++"""Regression tests for the EODHD HTTP 402 plan-restriction circuit."""
++
++from __future__ import annotations
++
++import asyncio
++
++from core.providers import eodhd_provider as eodhd
++
++
++def test_http_402_classifies_as_plan_restricted() -> None:
++    assert eodhd.EODHDClient._classify_error("HTTP 402 plan_restricted") == "PlanRestricted"
++    assert eodhd.EODHDClient._classify_error("payment_required") == "PlanRestricted"
++
++
++def test_http_402_emits_provider_unhealthy_marker() -> None:
++    assert eodhd._err_indicates_provider_unhealthy("HTTP 402 plan_restricted") is True
++
++
++def test_repeated_plan_restrictions_open_circuit(monkeypatch) -> None:
++    monkeypatch.setenv("EODHD_CIRCUIT_BREAKER_ENABLE", "1")
++    monkeypatch.setenv("EODHD_CIRCUIT_AUTH_THRESHOLD", "2")
++
++    async def scenario() -> None:
++        health = eodhd._ProviderHealth()
++        await health.record_failure("PlanRestricted")
++        first = await health.snapshot()
++        assert first["circuit_state"] == "closed"
++        assert first["consecutive_plan_restrictions"] == 1
++
++        await health.record_failure("PlanRestricted")
++        second = await health.snapshot()
++        assert second["circuit_state"] == "open"
++        assert second["consecutive_plan_restrictions"] == 2
++        assert second["session_stats"]["plan_restricted_count"] == 2
++
++    asyncio.run(scenario())
++
++
++def test_request_json_treats_402_as_terminal_and_does_not_retry(monkeypatch) -> None:
++    monkeypatch.setenv("EODHD_RATE_LIMIT_RPS", "0")
++    monkeypatch.setenv("EODHD_RETRY_ATTEMPTS", "4")
++    monkeypatch.setenv("EODHD_CIRCUIT_AUTH_THRESHOLD", "8")
++    eodhd._HEALTH = None
++
++    class Response402:
++        status_code = 402
++        headers = {}
++        text = "This endpoint is not available under the current plan"
++        content = b"{}"
++
++    async def scenario() -> None:
++        client = eodhd.EODHDClient()
++        client.api_key = "test-token"
++        calls = 0
++
++        async def fake_get(*_args, **_kwargs):
++            nonlocal calls
++            calls += 1
++            return Response402()
++
++        client._client.get = fake_get  # type: ignore[method-assign]
++        try:
++            data, err = await client._request_json("fundamentals/AAPL.US")
++            assert data is None
++            assert err is not None and "HTTP 402 plan_restricted" in err
++            assert calls == 1, "HTTP 402 must never consume the configured retry loop"
++
++            health = await eodhd._get_health()
++            snap = await health.snapshot()
++            assert snap["consecutive_plan_restrictions"] == 1
++            assert snap["session_stats"]["plan_restricted_count"] == 1
++        finally:
++            await client._client.aclose()
++
++    asyncio.run(scenario())
