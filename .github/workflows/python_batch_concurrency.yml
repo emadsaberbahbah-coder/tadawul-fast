@@ -9,9 +9,11 @@ on:
       - 'scripts/concurrent_batch_fetch.py'
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
+      - 'scripts/verify_backend_symbol_capabilities.py'
       - 'tests/test_concurrent_batch_fetch.py'
       - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
+      - 'tests/test_backend_symbol_capabilities.py'
       - '.github/workflows/python_batch_concurrency.yml'
   push:
     branches: [main]
@@ -22,9 +24,11 @@ on:
       - 'scripts/concurrent_batch_fetch.py'
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
+      - 'scripts/verify_backend_symbol_capabilities.py'
       - 'tests/test_concurrent_batch_fetch.py'
       - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
+      - 'tests/test_backend_symbol_capabilities.py'
       - '.github/workflows/python_batch_concurrency.yml'
   workflow_dispatch:
 
@@ -60,13 +64,16 @@ jobs:
             scripts/concurrent_batch_fetch.py \
             scripts/run_dashboard_sync_fast.py \
             scripts/benchmark_dashboard_fetch.py \
+            scripts/verify_backend_symbol_capabilities.py \
             tests/test_concurrent_batch_fetch.py \
             tests/test_provider_symbol_recovery.py \
-            tests/test_benchmark_dashboard_fetch.py
+            tests/test_benchmark_dashboard_fetch.py \
+            tests/test_backend_symbol_capabilities.py
           python -m unittest \
             tests/test_concurrent_batch_fetch.py \
             tests/test_provider_symbol_recovery.py \
             tests/test_benchmark_dashboard_fetch.py \
+            tests/test_backend_symbol_capabilities.py \
             tests/test_critical_symbol_identity.py \
             -v
       - name: Verify production-runner integration contract
@@ -80,6 +87,7 @@ jobs:
           from scripts.concurrent_batch_fetch import build, concurrency, provider_recovery_variants
           from scripts.benchmark_dashboard_fetch import NoWriteSheets
           from scripts.critical_symbol_identity import canonicalize_symbol
+          from scripts.verify_backend_symbol_capabilities import RULES, evaluate_table
 
           assert sync.SCRIPT_VERSION == "6.31.0"
           assert callable(sync._fetch_market_rows_batched)
@@ -89,6 +97,14 @@ jobs:
           assert to_yahoo_symbol("ADNOCDIST.ADX") == "ADNOCDIST.AB"
           assert canonicalize_symbol("NZYM-B.CO") == "NSIS-B.CO"
           assert provider_recovery_variants("BK.US") == ["BK.US", "BK"]
+          assert len(RULES) == 3
+          bk_rule = next(rule for rule in RULES if rule.requested_symbol == "BK.US")
+          bk_check = evaluate_table(
+              bk_rule,
+              ["Symbol", "Name", "Current Price", "Data Provider"],
+              [["BK.US", "The Bank of New York Mellon Corporation", 71.2, "eodhd"]],
+          )
+          assert bk_check["passed"] is True
           result = sync.TaskResult(
               key="GLOBAL_MARKETS",
               sheet_name="Global_Markets",
@@ -102,5 +118,5 @@ jobs:
           sink = NoWriteSheets()
           assert sink.write_table("sid", "P", "A1", ["Symbol"], [["A"]]) == 1
           assert sink.planned_writes[0]["rows"] == 1
-          print("production-runner concurrency + provider mapping + no-write contract: PASS")
+          print("production-runner concurrency + provider mapping + deployment gate + no-write contract: PASS")
           PY
