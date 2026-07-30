@@ -3,21 +3,27 @@ name: ⚡ Python Batch Concurrency
 on:
   pull_request:
     paths:
+      - 'core/symbols/normalize.py'
+      - 'scripts/critical_symbol_identity.py'
       - 'scripts/run_dashboard_sync.py'
       - 'scripts/concurrent_batch_fetch.py'
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'tests/test_concurrent_batch_fetch.py'
+      - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
       - '.github/workflows/python_batch_concurrency.yml'
   push:
     branches: [main]
     paths:
+      - 'core/symbols/normalize.py'
+      - 'scripts/critical_symbol_identity.py'
       - 'scripts/run_dashboard_sync.py'
       - 'scripts/concurrent_batch_fetch.py'
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'tests/test_concurrent_batch_fetch.py'
+      - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
       - '.github/workflows/python_batch_concurrency.yml'
   workflow_dispatch:
@@ -48,15 +54,20 @@ jobs:
         run: |
           set -euo pipefail
           python -m py_compile \
+            core/symbols/normalize.py \
+            scripts/critical_symbol_identity.py \
             scripts/run_dashboard_sync.py \
             scripts/concurrent_batch_fetch.py \
             scripts/run_dashboard_sync_fast.py \
             scripts/benchmark_dashboard_fetch.py \
             tests/test_concurrent_batch_fetch.py \
+            tests/test_provider_symbol_recovery.py \
             tests/test_benchmark_dashboard_fetch.py
           python -m unittest \
             tests/test_concurrent_batch_fetch.py \
+            tests/test_provider_symbol_recovery.py \
             tests/test_benchmark_dashboard_fetch.py \
+            tests/test_critical_symbol_identity.py \
             -v
       - name: Verify production-runner integration contract
         env:
@@ -64,13 +75,20 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
+          from core.symbols.normalize import to_eodhd_symbol, to_yahoo_symbol
           from scripts import run_dashboard_sync as sync
-          from scripts.concurrent_batch_fetch import build, concurrency
+          from scripts.concurrent_batch_fetch import build, concurrency, provider_recovery_variants
           from scripts.benchmark_dashboard_fetch import NoWriteSheets
+          from scripts.critical_symbol_identity import canonicalize_symbol
 
           assert sync.SCRIPT_VERSION == "6.31.0"
           assert callable(sync._fetch_market_rows_batched)
           assert callable(build(sync))
+          assert to_eodhd_symbol("ADNOCDIST.AB") == "ADNOCDIST.ADX"
+          assert to_eodhd_symbol("BPI.PS") == "BPI.PSE"
+          assert to_yahoo_symbol("ADNOCDIST.ADX") == "ADNOCDIST.AB"
+          assert canonicalize_symbol("NZYM-B.CO") == "NSIS-B.CO"
+          assert provider_recovery_variants("BK.US") == ["BK.US", "BK"]
           result = sync.TaskResult(
               key="GLOBAL_MARKETS",
               sheet_name="Global_Markets",
@@ -84,5 +102,5 @@ jobs:
           sink = NoWriteSheets()
           assert sink.write_table("sid", "P", "A1", ["Symbol"], [["A"]]) == 1
           assert sink.planned_writes[0]["rows"] == 1
-          print("production-runner concurrency + no-write benchmark contract: PASS")
+          print("production-runner concurrency + provider mapping + no-write contract: PASS")
           PY
