@@ -1,21 +1,23 @@
 name: 🧩 Apply Python Concurrency Integration
 
 on:
-  push:
-    branches: [perf/python-batch-concurrency-v1]
+  pull_request:
     paths:
       - 'patches/run_dashboard_sync_concurrency.patch'
       - '.github/workflows/apply_python_concurrency_integration.yml'
+      - 'scripts/concurrent_batch_fetch.py'
+      - 'tests/test_concurrent_batch_fetch.py'
 
 permissions:
   contents: write
 
 concurrency:
-  group: apply-python-concurrency-integration
+  group: apply-python-concurrency-integration-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
   apply:
+    if: ${{ github.event.pull_request.head.ref == 'perf/python-batch-concurrency-v1' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -53,5 +55,3 @@ jobs:
           git add scripts/run_dashboard_sync.py
           git commit -m 'Integrate bounded concurrency into Python runner'
           git push origin HEAD:perf/python-batch-concurrency-v1
-
-# Triggered after workflow creation so the patch is applied exactly once.
