@@ -104,5 +104,9 @@ updated, count = re.subn(
 )
 if count != 1:
     raise RuntimeError(f"temporary transformer patch_workflow replacement failed: {count}")
+updated = updated.replace(
+    '"""Expose coverage status only; never emit synthetic Accumulate/Watch signals."""',
+    '"""Expose coverage status only; never emit synthetic decision signals."""',
+)
 TARGET.write_text(updated, encoding="utf-8")
 runpy.run_path(str(TARGET), run_name="__main__")
