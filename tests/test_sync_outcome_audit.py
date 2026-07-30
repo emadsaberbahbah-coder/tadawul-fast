@@ -32,10 +32,10 @@ class SyncOutcomeAuditTests(unittest.TestCase):
         requested: int = 100,
         fresh: int = 100,
         preserved: int = 0,
-        stale: int = 0,
+        stale: object = 0,
         stubs: int = 0,
         identity_failures: int = 0,
-        provider_failures: int = 0,
+        provider_failures: object = 0,
         rows_written: int = 100,
     ) -> str:
         coverage = 100.0 * fresh / requested if requested else 0.0
@@ -74,6 +74,20 @@ class SyncOutcomeAuditTests(unittest.TestCase):
         self.assertTrue(result.enforcement_ready)
         self.assertFalse(result.incomplete_pages)
         self.assertEqual(result.v2_pages, CRITICAL_MARKET_PAGES)
+
+    def test_incomplete_v2_core_passes_shadow_but_not_enforcement(self):
+        text = "".join(
+            self._v2_line(page, stale="NA", provider_failures="NA")
+            for page in CRITICAL_MARKET_PAGES
+        )
+        shadow = self._audit(text)
+        self.assertEqual(shadow.status, "ok")
+        self.assertFalse(shadow.enforcement_ready)
+        self.assertEqual(shadow.incomplete_pages, CRITICAL_MARKET_PAGES)
+
+        enforced = self._audit(text, enforce_v2=True)
+        self.assertEqual(enforced.status, "blocked")
+        self.assertEqual(enforced.failed_pages, CRITICAL_MARKET_PAGES)
 
     def test_low_coverage_v2_page_blocks_even_in_shadow_rollout(self):
         text = "".join(
