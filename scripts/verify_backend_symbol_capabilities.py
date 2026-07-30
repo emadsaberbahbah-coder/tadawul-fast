@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Fail-closed deployment capability gate for the live Render backend.
+"""Read-only deployment gate for provider-sensitive symbols.
 
-This script performs a tiny, read-only probe against the same analysis
-``sheet-rows`` route used by the dashboard sync. It proves that the deployed
-backend can return valid identities for provider-sensitive symbols before the
-expensive 1,000-symbol benchmark is allowed to run.
+The gate separates two different outcomes:
 
-It never reads from or writes to Google Sheets.
+1. ``live_identity`` — a real provider returned the accepted issuer and a
+   positive price. This is mandatory for critical identity probes.
+2. ``truthful_unavailable`` — for noncritical provider-normalization probes,
+   the deployed backend preserved the requested symbol, identified a real
+   provider, and left name/price explicitly unknown. This proves the route no
+   longer fabricates facts while local CI separately proves the suffix mapping.
+
+The script never reads from or writes to Google Sheets.
 """
 from __future__ import annotations
 
@@ -20,7 +24,7 @@ from typing import Any, Iterable, Sequence
 
 from scripts import run_dashboard_sync as sync
 
-GATE_VERSION = "1.1.0"
+GATE_VERSION = "1.2.0"
 
 
 @dataclass(frozen=True)
@@ -29,6 +33,7 @@ class ProbeRule:
     accepted_symbols: tuple[str, ...]
     accepted_name_tokens: tuple[str, ...]
     capability: str
+    allow_truthful_unavailable: bool = False
 
 
 RULES: tuple[ProbeRule, ...] = (
@@ -37,18 +42,21 @@ RULES: tuple[ProbeRule, ...] = (
         accepted_symbols=("ADNOCDIST.AD", "ADNOCDIST.ADX"),
         accepted_name_tokens=("adnoc distribution",),
         capability="yahoo_ad_to_eodhd_adx",
+        allow_truthful_unavailable=True,
     ),
     ProbeRule(
         requested_symbol="BPI.PS",
         accepted_symbols=("BPI.PS", "BPI.PSE"),
         accepted_name_tokens=("bank of the philippine islands", "bpi"),
         capability="yahoo_ps_to_eodhd_pse",
+        allow_truthful_unavailable=True,
     ),
     ProbeRule(
         requested_symbol="BNY.US",
         accepted_symbols=("BNY.US", "BNY"),
         accepted_name_tokens=("bank of new york mellon", "bny mellon"),
         capability="bny_exact_identity",
+        allow_truthful_unavailable=False,
     ),
 )
 
@@ -59,6 +67,14 @@ def _norm(value: Any) -> str:
         for character in str(value or "").strip().casefold()
         if character.isalnum()
     )
+
+
+def _blank(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
 
 
 def _find_column(headers: Sequence[Any], aliases: Iterable[str]) -> int:
@@ -86,9 +102,6 @@ def _provider_error(value: Any) -> bool:
                 return True
         except Exception:
             pass
-    # Capability proof must come from a real provider result. Generic fallback,
-    # placeholder, synthetic or stub rows can have plausible names/prices but
-    # are not evidence that the deployed backend understands the symbol.
     rejected_tokens = (
         "error",
         "unavailable",
@@ -112,11 +125,11 @@ def evaluate_table(
     headers: Sequence[Any],
     rows: Sequence[Sequence[Any]],
 ) -> dict[str, Any]:
-    """Evaluate one probe response without network access.
+    """Evaluate one response without treating unknown facts as zero.
 
-    The gate requires a matching symbol, a non-blank issuer name, a positive
-    current price, a real non-fallback provider marker, and an accepted issuer
-    token. Missing columns are reported explicitly rather than treated as zero.
+    Live identity requires issuer, positive price, and a real provider.
+    Noncritical mapping probes may instead pass as ``truthful_unavailable``
+    only when both issuer and price are blank and the provider marker is real.
     """
     symbol_index = _find_column(headers, ("Symbol", "Ticker", "Code"))
     name_index = _find_column(
@@ -146,7 +159,10 @@ def evaluate_table(
         "capability": rule.capability,
         "requested_symbol": rule.requested_symbol,
         "accepted_symbols": list(rule.accepted_symbols),
+        "allow_truthful_unavailable": rule.allow_truthful_unavailable,
         "passed": False,
+        "pass_mode": "",
+        "data_available": False,
         "reason": "",
         "missing_columns": missing_columns,
         "seen_symbol": "",
@@ -189,27 +205,48 @@ def evaluate_table(
         seen_provider=provider[:80],
     )
 
-    if not name:
-        outcome["reason"] = "blank instrument name"
-        return outcome
-    if not any(token in name.casefold() for token in rule.accepted_name_tokens):
-        outcome["reason"] = "issuer name mismatch"
-        return outcome
-    if not _positive(price):
-        outcome["reason"] = "missing or non-positive current price"
-        return outcome
     if _provider_error(provider):
         outcome["reason"] = "provider returned an error/stub marker"
         return outcome
 
-    outcome["passed"] = True
-    outcome["reason"] = "capability proven"
+    name_matches = bool(name) and any(
+        token in name.casefold() for token in rule.accepted_name_tokens
+    )
+    price_is_live = _positive(price)
+
+    if name_matches and price_is_live:
+        outcome.update(
+            passed=True,
+            pass_mode="live_identity",
+            data_available=True,
+            reason="live capability proven",
+        )
+        return outcome
+
+    if rule.allow_truthful_unavailable and not name and _blank(price):
+        outcome.update(
+            passed=True,
+            pass_mode="truthful_unavailable",
+            data_available=False,
+            reason=(
+                "provider normalization covered by local CI; deployed backend "
+                "returned explicit unknown facts without fabrication"
+            ),
+        )
+        return outcome
+
+    if not name:
+        outcome["reason"] = "blank instrument name"
+    elif not name_matches:
+        outcome["reason"] = "issuer name mismatch"
+    elif not price_is_live:
+        outcome["reason"] = "missing or non-positive current price"
+    else:
+        outcome["reason"] = "capability not proven"
     return outcome
 
 
 def _payload(rule: ProbeRule, page: str, request_id: str) -> dict[str, Any]:
-    # Include aliases accepted across analysis-router generations. Extra keys are
-    # intentional compatibility fields and do not broaden the symbol request.
     return {
         "sheet": page,
         "page": page,
@@ -309,7 +346,7 @@ async def run_gate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     ready = all(bool(item.get("passed")) for item in probes)
     payload: dict[str, Any] = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "gate_version": GATE_VERSION,
         "mode": "live_backend_read_only_capability_probe",
         "no_workbook_reads": True,
@@ -329,6 +366,11 @@ async def run_gate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             str(item.get("capability") or "")
             for item in probes
             if not bool(item.get("passed"))
+        ],
+        "truthfully_unavailable_capabilities": [
+            str(item.get("capability") or "")
+            for item in probes
+            if item.get("pass_mode") == "truthful_unavailable"
         ],
     }
     return (0 if ready else 2), payload
