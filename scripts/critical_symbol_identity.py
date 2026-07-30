@@ -12,11 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, MutableSequence, Sequence
 
-POLICY_VERSION = "1.0.0"
-CRITICAL_IDENTITY_TAG = "identity_quarantined:critical_registry:v1.0.0"
+POLICY_VERSION = "1.1.0"
+CRITICAL_IDENTITY_TAG = "identity_quarantined:critical_registry:v1.1.0"
 
 # Provider-safe canonical identifiers. EODHD uses the .US exchange suffix and
 # BRK-B.US for Berkshire Class B. Fiserv moved from FI to FISV in November 2025.
+# Novozymes changed name/ticker to Novonesis / NSIS-B.CO.
 CANONICAL_SYMBOLS: Mapping[str, str] = {
     "BK": "BK.US",
     "BRK-B": "BRK-B.US",
@@ -24,6 +25,7 @@ CANONICAL_SYMBOLS: Mapping[str, str] = {
     "FI": "FISV.US",
     "FI.US": "FISV.US",
     "FISV": "FISV.US",
+    "NZYM-B.CO": "NSIS-B.CO",
 }
 
 # These identifiers must not remain in the active refresh universe.
@@ -57,6 +59,12 @@ CRITICAL_IDENTITIES: Mapping[str, IdentityRule] = {
     "FISV.US": IdentityRule(
         accepted_name_tokens=("fiserv",),
         exchange_tokens=("nasdaq",),
+    ),
+    "NSIS-B.CO": IdentityRule(
+        accepted_name_tokens=("novonesis", "novozymes"),
+        currency_tokens=("dkk",),
+        country_tokens=("denmark",),
+        exchange_tokens=("copenhagen", "nasdaq"),
     ),
 }
 

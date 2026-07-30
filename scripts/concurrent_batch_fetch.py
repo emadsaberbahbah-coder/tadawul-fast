@@ -14,8 +14,36 @@ import statistics
 import time
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 _METRICS: dict[str, dict[str, Any]] = {}
+
+_RECOVERY_SUFFIX_VARIANTS: tuple[tuple[str, str], ...] = (
+    (".AB", ".ADX"),
+    (".PS", ".PSE"),
+)
+
+
+def provider_recovery_variants(symbol: str) -> list[str]:
+    """Return a small, deterministic provider-safe variant set for recovery.
+
+    The original canonical symbol is always first. Variants are used only after
+    the normal fetch failed or returned a data-free stub; they never broaden the
+    primary page request or bypass the final identity firewall.
+    """
+    canonical = str(symbol or "").strip().upper()
+    variants = [canonical] if canonical else []
+    for source_suffix, provider_suffix in _RECOVERY_SUFFIX_VARIANTS:
+        if canonical.endswith(source_suffix):
+            variants.append(canonical[: -len(source_suffix)] + provider_suffix)
+    if canonical == "BK.US":
+        variants.append("BK")
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in variants:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
 
 
 def _int(name: str, default: int, lo: int, hi: int) -> int:
@@ -299,6 +327,99 @@ def build(
         ]
         return list(await asyncio.gather(*tasks)) if tasks else []
 
+    async def provider_variant_fan(
+        backend: Any,
+        indexed_batches: Sequence[tuple[int, Sequence[str]]],
+        payload: dict[str, Any],
+        endpoints: Sequence[str],
+        request_id: str,
+        *,
+        phase: str,
+        max_concurrency: int,
+        delay_ms: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch recovery aliases and map accepted rows to requested symbols."""
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def guarded(
+            position: int,
+            idx: int,
+            originals: Sequence[str],
+        ) -> dict[str, Any]:
+            async with semaphore:
+                alias_to_original: dict[str, str] = {}
+                alias_rank: dict[str, int] = {}
+                expanded: list[str] = []
+                for original in originals:
+                    canonical_original = sync.canonicalize_symbol(original)
+                    for rank, alias in enumerate(provider_recovery_variants(canonical_original)):
+                        alias_key = str(alias or "").strip().upper()
+                        canonical_alias = sync.canonicalize_symbol(alias)
+                        for key in (alias_key, canonical_alias):
+                            if key and key not in alias_to_original:
+                                alias_to_original[key] = canonical_original
+                                alias_rank[key] = rank
+                        if alias_key and alias_key not in expanded:
+                            expanded.append(alias_key)
+
+                stagger = (position % max_concurrency) * delay_ms
+                outcome = await one(
+                    backend,
+                    idx,
+                    expanded,
+                    payload,
+                    endpoints,
+                    f"{request_id}-{phase}-{idx + 1}",
+                    delay_ms=stagger,
+                    require_good=False,
+                )
+                item = dict(outcome)
+                item["b"] = list(originals)
+                item["provider_variants"] = list(expanded)
+                if not item.get("h"):
+                    return item
+
+                headers = list(item["h"])
+                symbol_index = _column(
+                    headers, "_GUARD_SYMBOL_ALIASES", ("symbol", "ticker")
+                )
+                selected: dict[str, tuple[int, list[Any]]] = {}
+                for raw in item.get("r", []):
+                    if (
+                        not isinstance(raw, (list, tuple))
+                        or symbol_index < 0
+                        or symbol_index >= len(raw)
+                        or sync._guard_is_blank(raw[symbol_index])
+                    ):
+                        continue
+                    row = list(raw)
+                    raw_key = str(row[symbol_index] or "").strip().upper()
+                    canonical_key = sync.canonicalize_symbol(raw_key)
+                    original = alias_to_original.get(raw_key) or alias_to_original.get(
+                        canonical_key
+                    )
+                    if not original:
+                        continue
+                    row[symbol_index] = original
+                    if not _row_good(headers, row):
+                        continue
+                    rank = alias_rank.get(raw_key, alias_rank.get(canonical_key, 999))
+                    previous = selected.get(original)
+                    if previous is None or rank < previous[0]:
+                        selected[original] = (rank, row)
+                item["r"] = [
+                    selected[sync.canonicalize_symbol(original)][1]
+                    for original in originals
+                    if sync.canonicalize_symbol(original) in selected
+                ]
+                return item
+
+        tasks = [
+            asyncio.create_task(guarded(position, idx, batch))
+            for position, (idx, batch) in enumerate(indexed_batches)
+        ]
+        return list(await asyncio.gather(*tasks)) if tasks else []
+
     def normalize_outcomes(
         outcomes: Iterable[dict[str, Any]],
         canonical_headers: Sequence[Any],
@@ -538,7 +659,7 @@ def build(
                     targets, targeted_recovery_batch_size()
                 )
                 indexed_recovery = list(enumerate(recovery_batches))
-                recovered = await fan(
+                recovered = await provider_variant_fan(
                     backend,
                     indexed_recovery,
                     payload,
@@ -547,7 +668,6 @@ def build(
                     phase=f"target{recovery_round}",
                     max_concurrency=max_concurrency,
                     delay_ms=sync._batch_delay_ms(),
-                    require_good=True,
                 )
                 recovered = normalize_outcomes(recovered, headers)
                 recovery_outcomes.extend(recovered)
@@ -597,14 +717,19 @@ def build(
             symbols_fresh_initial=len(initial_good),
             symbols_data_free_initial=len(initial_data_free),
             symbols_missing_initial=len(initial_missing),
+            data_free_symbols_initial=initial_data_free[:100],
+            missing_symbols_initial=initial_missing[:100],
             targeted_recovery_requested=len(recovery_requested),
             targeted_recovery_healed=len(recovery_healed),
+            targeted_recovery_healed_symbols=sorted(recovery_healed)[:100],
             targeted_recovery_batches=len(recovery_outcomes),
             symbols_returned=len(final_rows),
             symbols_fresh=len(final_good),
             symbols_data_free=len(final_data_free),
             symbols_missing=len(final_missing),
             symbols_failed=len(final_data_free),
+            data_free_symbols=final_data_free[:100],
+            missing_symbols=final_missing[:100],
             symbols_unattempted=symbols_unattempted,
             returned_coverage_pct=round(returned_coverage, 3),
             fresh_coverage_pct=round(fresh_coverage, 3),
