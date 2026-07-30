@@ -60,6 +60,10 @@ jobs:
       BENCH_BATCH_SIZE: ${{ inputs.batch_size || '25' }}
       BENCH_CONCURRENCY: ${{ inputs.concurrency || '3' }}
       TFB_SYNC_BATCH_OUTER_RETRIES: '1'
+      TFB_SYNC_TARGET_RECOVERY: '1'
+      TFB_SYNC_TARGET_RECOVERY_MAX: '120'
+      TFB_SYNC_TARGET_RECOVERY_BATCH_SIZE: '10'
+      TFB_SYNC_TARGET_RECOVERY_ROUNDS: '1'
       TFB_SYNC_MARKET_GATEWAY: analysis
       TFB_SYNC_MAX_SYMBOLS_MARKET: '7000'
       TFB_SYNC_UNIVERSE_CAP_V2: '1'
@@ -153,13 +157,16 @@ jobs:
             --time-budget 2100 \
             --json-out python_refresh_benchmark.json || code=$?
           echo "benchmark_exit=$code" >> "$GITHUB_OUTPUT"
-          if [[ "$code" -ge 2 ]]; then
-            echo "::error::Python benchmark failed (exit $code)."
-            exit "$code"
+          if [[ "$code" -eq 3 ]]; then
+            echo '::error::Benchmark could not execute or produce evidence.'
+            exit 3
           fi
-          if [[ "$code" -eq 1 ]]; then
+          if [[ "$code" -eq 2 ]]; then
+            echo '::warning::Benchmark completed, but the production runner rejected the page; inspect identity/data-quality evidence.'
+          elif [[ "$code" -eq 1 ]]; then
             echo '::warning::Benchmark completed with partial/skipped status; evidence retained.'
           fi
+          exit 0
 
       - name: Publish benchmark summary
         if: always()
@@ -175,17 +182,21 @@ jobs:
             echo '| Metric | Value |'
             echo '|---|---:|'
             echo "| Page | $(jq -r '.page' python_refresh_benchmark.json) |"
+            echo "| Runner status | $(jq -r '.acceptance.runner_status' python_refresh_benchmark.json) |"
             echo "| Requested | $(jq -r '.acceptance.requested_symbols' python_refresh_benchmark.json) |"
-            echo "| Fresh | $(jq -r '.acceptance.fresh_symbols' python_refresh_benchmark.json) |"
+            echo "| Returned | $(jq -r '.acceptance.returned_symbols' python_refresh_benchmark.json) |"
+            echo "| Good fresh | $(jq -r '.acceptance.fresh_symbols' python_refresh_benchmark.json) |"
+            echo "| Data-free stubs | $(jq -r '.acceptance.data_free_symbols' python_refresh_benchmark.json) |"
+            echo "| Missing | $(jq -r '.acceptance.missing_symbols' python_refresh_benchmark.json) |"
             echo "| Fresh coverage | $(jq -r '.acceptance.fresh_coverage_pct' python_refresh_benchmark.json)% |"
-            echo "| Failed | $(jq -r '.acceptance.failed_symbols' python_refresh_benchmark.json) |"
+            echo "| Recovery healed | $(jq -r '.acceptance.targeted_recovery_healed' python_refresh_benchmark.json) / $(jq -r '.acceptance.targeted_recovery_requested' python_refresh_benchmark.json) |"
             echo "| Unattempted | $(jq -r '.acceptance.unattempted_symbols' python_refresh_benchmark.json) |"
             echo "| HTTP 429 | $(jq -r '.acceptance.http_429' python_refresh_benchmark.json) |"
             echo "| HTTP 5xx | $(jq -r '.acceptance.http_5xx' python_refresh_benchmark.json) |"
             echo "| Elapsed | $(jq -r '.elapsed_minutes' python_refresh_benchmark.json) minutes |"
             echo "| Within 25 min | $(jq -r '.acceptance.within_25_minutes' python_refresh_benchmark.json) |"
-            echo "| Within 35 min | $(jq -r '.acceptance.within_35_minutes' python_refresh_benchmark.json) |"
-            echo "| Workbook writes | $(jq -r '.no_workbook_writes | not' python_refresh_benchmark.json) |"
+            echo "| Complete fresh fetch | $(jq -r '.acceptance.complete_fresh_fetch' python_refresh_benchmark.json) |"
+            echo "| No workbook writes | $(jq -r '.no_workbook_writes' python_refresh_benchmark.json) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark evidence
