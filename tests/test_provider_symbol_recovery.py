@@ -17,7 +17,7 @@ class VariantBackend:
         for symbol in payload["symbols"]:
             if symbol.endswith(".ADX") or symbol.endswith(".PSE"):
                 rows.append([symbol, symbol.lower(), 100.0, "mock"])
-            elif symbol == "BK":
+            elif symbol in {"BNY", "BK"}:
                 rows.append([symbol, "The Bank of New York Mellon Corporation", 100.0, "mock"])
             elif symbol == "NSIS-B.CO":
                 rows.append([symbol, "Novonesis A/S", 100.0, "mock"])
@@ -26,11 +26,11 @@ class VariantBackend:
 
 class ProviderSymbolNormalizationTests(unittest.TestCase):
     def test_yahoo_to_eodhd_exchange_suffixes(self):
-        self.assertEqual(to_eodhd_symbol("ADNOCDIST.AB"), "ADNOCDIST.ADX")
+        self.assertEqual(to_eodhd_symbol("ADNOCDIST.AD"), "ADNOCDIST.ADX")
         self.assertEqual(to_eodhd_symbol("BPI.PS"), "BPI.PSE")
 
     def test_eodhd_to_yahoo_exchange_suffixes(self):
-        self.assertEqual(to_yahoo_symbol("ADNOCDIST.ADX"), "ADNOCDIST.AB")
+        self.assertEqual(to_yahoo_symbol("ADNOCDIST.ADX"), "ADNOCDIST.AD")
         self.assertEqual(to_yahoo_symbol("BPI.PSE"), "BPI.PS")
 
     def test_ab_metadata_is_uae(self):
@@ -40,19 +40,19 @@ class ProviderSymbolNormalizationTests(unittest.TestCase):
         self.assertEqual(canonicalize_symbol("NZYM-B.CO"), "NSIS-B.CO")
 
     def test_recovery_variant_order(self):
-        self.assertEqual(provider_recovery_variants("ADNOCDIST.AB"), ["ADNOCDIST.AB", "ADNOCDIST.ADX"])
+        self.assertEqual(provider_recovery_variants("ADNOCDIST.AD"), ["ADNOCDIST.AD", "ADNOCDIST.ADX"])
         self.assertEqual(provider_recovery_variants("BPI.PS"), ["BPI.PS", "BPI.PSE"])
-        self.assertEqual(provider_recovery_variants("BK.US"), ["BK.US", "BK"])
+        self.assertEqual(provider_recovery_variants("BNY.US"), ["BNY.US", "BNY", "BK.US", "BK"])
 
 
 class ProviderVariantRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_targeted_recovery_maps_provider_aliases_back(self):
         sync = fake(size=2)
-        aliases = {"NZYM-B.CO": "NSIS-B.CO", "BK": "BK.US"}
+        aliases = {"NZYM-B.CO": "NSIS-B.CO", "BK": "BNY.US", "BK.US": "BNY.US", "BNY": "BNY.US"}
         sync.canonicalize_symbol = lambda value: aliases.get(str(value).strip().upper(), str(value).strip().upper())
         fn = build(sync)
         result = Result("provider-variants")
-        requested = ["ADNOCDIST.AB", "BPI.PS", "BK.US", "NZYM-B.CO"]
+        requested = ["ADNOCDIST.AD", "BPI.PS", "BK.US", "NZYM-B.CO"]
         with patch.dict(os.environ, {
             "TFB_SYNC_BATCH_CONCURRENCY": "3",
             "TFB_SYNC_BATCH_OUTER_RETRIES": "0",
@@ -61,7 +61,7 @@ class ProviderVariantRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "TFB_SYNC_TARGET_RECOVERY_BATCH_SIZE": "2",
         }):
             _, rows, _, _ = await fn(VariantBackend(), SimpleNamespace(sheet_name="Market_Leaders"), requested, {}, "analysis", result)
-        self.assertEqual([row[0] for row in rows], ["ADNOCDIST.AB", "BPI.PS", "BK.US", "NSIS-B.CO"])
+        self.assertEqual([row[0] for row in rows], ["ADNOCDIST.AD", "BPI.PS", "BNY.US", "NSIS-B.CO"])
         self.assertEqual(result.batch_metrics["symbols_fresh"], 4)
         self.assertEqual(result.batch_metrics["symbols_missing"], 0)
         self.assertEqual(result.batch_metrics["targeted_recovery_healed"], 4)

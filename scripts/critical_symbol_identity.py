@@ -12,14 +12,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, MutableSequence, Sequence
 
-POLICY_VERSION = "1.1.0"
-CRITICAL_IDENTITY_TAG = "identity_quarantined:critical_registry:v1.1.0"
+POLICY_VERSION = "1.2.0"
+CRITICAL_IDENTITY_TAG = "identity_quarantined:critical_registry:v1.2.0"
 
-# Provider-safe canonical identifiers. EODHD uses the .US exchange suffix and
-# BRK-B.US for Berkshire Class B. Fiserv moved from FI to FISV in November 2025.
-# Novozymes changed name/ticker to Novonesis / NSIS-B.CO.
+# Provider-safe canonical identifiers. BNY changed its common-stock ticker
+# from BK to BNY effective 2026-05-21; stale BK spellings are lifecycle aliases,
+# not active provider identities. EODHD uses the .US exchange suffix and BRK-B.US
+# for Berkshire Class B. Fiserv moved from FI to FISV in November 2025. Novozymes
+# changed name/ticker to Novonesis / NSIS-B.CO.
 CANONICAL_SYMBOLS: Mapping[str, str] = {
-    "BK": "BK.US",
+    "BK": "BNY.US",
+    "BK.US": "BNY.US",
+    "BNY": "BNY.US",
     "BRK-B": "BRK-B.US",
     "BRK.B": "BRK-B.US",
     "FI": "FISV.US",
@@ -48,7 +52,7 @@ class IdentityRule:
 
 
 CRITICAL_IDENTITIES: Mapping[str, IdentityRule] = {
-    "BK.US": IdentityRule(
+    "BNY.US": IdentityRule(
         accepted_name_tokens=("bank of new york mellon", "bny mellon"),
         exchange_tokens=("nyse",),
     ),

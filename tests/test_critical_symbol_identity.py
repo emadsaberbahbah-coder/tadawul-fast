@@ -23,29 +23,36 @@ PRODUCTION_HEADERS = HEADERS + ["Data Provider"]
 class CriticalSymbolIdentityTests(unittest.TestCase):
     def test_universe_removes_retired_and_canonicalizes_collisions(self):
         clean, changes = sanitize_active_universe(
-            ["AAPL", "BK", "BK.US", "BRK-B", "FI", "FI.US", "3001.SR", "8270.SR", "4328.SR"]
+            ["AAPL", "BK", "BNY.US", "BRK-B", "FI", "FI.US", "3001.SR", "8270.SR", "4328.SR"]
         )
-        self.assertEqual(clean, ["AAPL", "BK.US", "BRK-B.US", "FISV.US"])
+        self.assertEqual(clean, ["AAPL", "BNY.US", "BRK-B.US", "FISV.US"])
         actions = {(c.source_symbol, c.action, c.target_symbol) for c in changes}
-        self.assertIn(("BK", "canonicalized", "BK.US"), actions)
+        self.assertIn(("BK", "canonicalized", "BNY.US"), actions)
+        self.assertIn(("BNY.US", "deduplicated", "BNY.US"), actions)
         self.assertIn(("BRK-B", "canonicalized", "BRK-B.US"), actions)
         self.assertIn(("FI", "canonicalized", "FISV.US"), actions)
         self.assertIn(("3001.SR", "removed", ""), actions)
         self.assertIn(("8270.SR", "removed", ""), actions)
         self.assertIn(("4328.SR", "removed", ""), actions)
 
+    def test_stale_bk_us_lifecycle_alias_maps_to_bny(self):
+        clean, changes = sanitize_active_universe(["BK.US"])
+        self.assertEqual(clean, ["BNY.US"])
+        self.assertEqual(changes[0].source_symbol, "BK.US")
+        self.assertEqual(changes[0].target_symbol, "BNY.US")
+
     def test_critical_symbols_get_single_symbol_batches_first(self):
         batches = build_isolated_batches(
-            ["AAPL", "BK.US", "MSFT", "BRK-B.US", "FISV.US", "NVDA"], 2
+            ["AAPL", "BNY.US", "MSFT", "BRK-B.US", "FISV.US", "NVDA"], 2
         )
         self.assertEqual(
             batches,
-            [["BK.US"], ["BRK-B.US"], ["FISV.US"], ["AAPL", "MSFT"], ["NVDA"]],
+            [["BNY.US"], ["BRK-B.US"], ["FISV.US"], ["AAPL", "MSFT"], ["NVDA"]],
         )
 
     def test_correct_current_identities_pass(self):
         rows = [
-            ["BK.US", "The Bank of New York Mellon Corporation", "NYSE", "USD", "USA", 116.0, ""],
+            ["BNY.US", "The Bank of New York Mellon Corporation", "NYSE", "USD", "USA", 116.0, ""],
             ["BRK-B.US", "Berkshire Hathaway Inc", "NYSE", "USD", "United States", 492.0, ""],
             ["FISV.US", "Fiserv, Inc.", "NASDAQ", "USD", "USA", 51.0, ""],
         ]
@@ -55,12 +62,12 @@ class CriticalSymbolIdentityTests(unittest.TestCase):
 
     def test_known_provider_collisions_are_quarantined(self):
         rows = [
-            ["BK.US", "Hanwha Aerospace Co., Ltd.", "NYSE/NASDAQ", "USD", "USA", 979000, ""],
+            ["BNY.US", "Hanwha Aerospace Co., Ltd.", "NYSE/NASDAQ", "USD", "USA", 979000, ""],
             ["BRK-B.US", "National Bank of Bahrain B.S.C.", "NYSE/NASDAQ", "USD", "USA", 0.52, ""],
             ["FISV.US", "Western Digital Corporation", "NASDAQ/NYSE", "USD", "USA", 499.33, ""],
         ]
         out, failures = quarantine_critical_rows(HEADERS, rows)
-        self.assertEqual([f.symbol for f in failures], ["BK.US", "BRK-B.US", "FISV.US"])
+        self.assertEqual([f.symbol for f in failures], ["BNY.US", "BRK-B.US", "FISV.US"])
         for row in out:
             self.assertTrue(row[0])
             self.assertEqual(row[1], "")
@@ -73,8 +80,8 @@ class CriticalSymbolIdentityTests(unittest.TestCase):
             ["BK", "Hanwha Aerospace", "NYSE", "USD", "USA", 979000, ""],
         ]
         _, failures = quarantine_critical_rows(HEADERS, rows)
-        self.assertEqual([row[0] for row in rows], ["FISV.US", "BRK-B.US", "BK.US"])
-        self.assertEqual([failure.symbol for failure in failures], ["FISV.US", "BRK-B.US", "BK.US"])
+        self.assertEqual([row[0] for row in rows], ["FISV.US", "BRK-B.US", "BNY.US"])
+        self.assertEqual([failure.symbol for failure in failures], ["FISV.US", "BRK-B.US", "BNY.US"])
 
     def test_missing_fresh_critical_row_fails_even_if_predecessor_is_available(self):
         fresh_rows = [["AAPL", "Apple Inc.", "NASDAQ", "USD", "USA", 200.0, ""]]
@@ -92,7 +99,7 @@ class CriticalSymbolIdentityTests(unittest.TestCase):
         self.assertEqual(fresh_rows[-1][1], "Fiserv, Inc.")
 
     def test_existing_bk_us_poison_is_blocked(self):
-        rows = [["BK.US", "Saudi Enaya Cooperative Insurance Company", "NYSE/NASDAQ", "USD", "USA", 8.95, ""]]
+        rows = [["BNY.US", "Saudi Enaya Cooperative Insurance Company", "NYSE/NASDAQ", "USD", "USA", 8.95, ""]]
         _, failures = quarantine_critical_rows(HEADERS, rows)
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0].reason, "issuer name mismatch")
@@ -104,7 +111,7 @@ class CriticalSymbolIdentityTests(unittest.TestCase):
         self.assertEqual(failures[0].reason, "blank instrument name")
 
     def test_wrong_currency_fails_even_with_right_name(self):
-        rows = [["BK.US", "The Bank of New York Mellon Corporation", "NYSE", "KRW", "USA", 116.0, ""]]
+        rows = [["BNY.US", "The Bank of New York Mellon Corporation", "NYSE", "KRW", "USA", 116.0, ""]]
         _, failures = quarantine_critical_rows(HEADERS, rows)
         self.assertEqual(len(failures), 1)
         self.assertEqual(failures[0].reason, "currency mismatch")
@@ -178,7 +185,7 @@ class CriticalIdentityProductionPathTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(headers, PRODUCTION_HEADERS)
-        self.assertEqual([row[0] for row in rows], ["FISV.US", "BRK-B.US", "BK.US"])
+        self.assertEqual([row[0] for row in rows], ["FISV.US", "BRK-B.US", "BNY.US"])
 
     async def test_non_batched_membership_canonicalizes_alias_responses(self):
         rows = [
@@ -190,7 +197,7 @@ class CriticalIdentityProductionPathTests(unittest.IsolatedAsyncioTestCase):
             PRODUCTION_HEADERS, rows, ["FI.US", "BRK.B", "BK"]
         )
         self.assertEqual(dropped, [])
-        self.assertEqual([row[0] for row in kept], ["FISV.US", "BRK-B.US", "BK.US"])
+        self.assertEqual([row[0] for row in kept], ["FISV.US", "BRK-B.US", "BNY.US"])
 
     async def test_run_one_task_no_credentials_fails_missing_fresh_critical_proof(self):
         backend = _Backend(

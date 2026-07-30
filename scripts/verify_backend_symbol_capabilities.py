@@ -20,7 +20,7 @@ from typing import Any, Iterable, Sequence
 
 from scripts import run_dashboard_sync as sync
 
-GATE_VERSION = "1.0.2"
+GATE_VERSION = "1.1.0"
 
 
 @dataclass(frozen=True)
@@ -33,10 +33,10 @@ class ProbeRule:
 
 RULES: tuple[ProbeRule, ...] = (
     ProbeRule(
-        requested_symbol="ADNOCDIST.AB",
-        accepted_symbols=("ADNOCDIST.AB", "ADNOCDIST.ADX"),
+        requested_symbol="ADNOCDIST.AD",
+        accepted_symbols=("ADNOCDIST.AD", "ADNOCDIST.ADX"),
         accepted_name_tokens=("adnoc distribution",),
-        capability="yahoo_ab_to_eodhd_adx",
+        capability="yahoo_ad_to_eodhd_adx",
     ),
     ProbeRule(
         requested_symbol="BPI.PS",
@@ -45,10 +45,10 @@ RULES: tuple[ProbeRule, ...] = (
         capability="yahoo_ps_to_eodhd_pse",
     ),
     ProbeRule(
-        requested_symbol="BK.US",
-        accepted_symbols=("BK.US", "BK"),
+        requested_symbol="BNY.US",
+        accepted_symbols=("BNY.US", "BNY"),
         accepted_name_tokens=("bank of new york mellon", "bny mellon"),
-        capability="bk_exact_identity",
+        capability="bny_exact_identity",
     ),
 )
 

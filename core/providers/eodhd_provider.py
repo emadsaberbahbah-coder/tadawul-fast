@@ -2,9 +2,9 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.15.1 (HTTP 402 PROVIDER-UNHEALTHY SIGNAL)
+EODHD Provider — v4.15.2 (HTTP 402 PROVIDER-UNHEALTHY SIGNAL)
 
-v4.15.1 — WHY
+v4.15.2 — WHY
 --------------------------------------------------------------------------------
 The production workbook carried `fetch_failed:HTTP 402` on thousands of rows.
 HTTP 402 is a provider-wide plan or endpoint-entitlement failure, but v4.15.0
@@ -929,7 +929,7 @@ def _validate_52w_bounds_merged(
 _PROVIDER_UNHEALTHY_TRIGGER_TOKENS: Tuple[str, ...] = (
     "auth_error",
     "ip_blocked",
-    # v4.15.1: EODHD uses HTTP 402 for plan/endpoint entitlement rejection.
+    # v4.15.2: EODHD uses HTTP 402 for plan/endpoint entitlement rejection.
     # This is systemic, not symbol-specific, so let the existing engine health
     # registry demote the provider and use the next provider in the chain.
     "http 402",
@@ -1039,7 +1039,7 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.15.1"
+PROVIDER_VERSION = "4.15.2"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -1202,10 +1202,10 @@ def _engine_patch_bind_enabled() -> bool:
     """v4.13.0 AS-3: when ON, the module-level get_quote_async /
     fetch_quote_async aliases return the patch dict (error shells and
     warning markers intact, never raise) so engine v5.108.1's
-    _pick_provider_callable preference order receives them. OFF =
-    legacy raise-on-err delegation (engine sees {} on failure), byte-
-    identical to v4.12.1."""
-    return _env_str("TFB_EODHD_ENGINE_PATCH_BIND", "0").strip().lower() in _TRUTHY
+    _pick_provider_callable preference order receives them. Default ON so
+    HTTP 402/auth error patches reach the engine health registry. Set the flag
+    to 0 only as an explicit rollback to legacy raise-on-error behavior."""
+    return _env_str("TFB_EODHD_ENGINE_PATCH_BIND", "1").strip().lower() in _TRUTHY
 
 
 def _circuit_breaker_enabled() -> bool:

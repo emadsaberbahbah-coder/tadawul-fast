@@ -11,7 +11,7 @@ class BackendSymbolCapabilityTests(unittest.TestCase):
         self.by_capability = {rule.capability: rule for rule in RULES}
 
     def test_accepts_eodhd_adx_alias_for_yahoo_ab_request(self):
-        rule = self.by_capability["yahoo_ab_to_eodhd_adx"]
+        rule = self.by_capability["yahoo_ad_to_eodhd_adx"]
         result = evaluate_table(
             rule,
             self.headers,
@@ -30,27 +30,27 @@ class BackendSymbolCapabilityTests(unittest.TestCase):
         self.assertTrue(result["passed"])
 
     def test_bk_requires_exact_issuer_identity(self):
-        rule = self.by_capability["bk_exact_identity"]
+        rule = self.by_capability["bny_exact_identity"]
         good = evaluate_table(
             rule,
             self.headers,
-            [["BK.US", "The Bank of New York Mellon Corporation", 71.2, "eodhd"]],
+            [["BNY.US", "The Bank of New York Mellon Corporation", 71.2, "eodhd"]],
         )
         wrong = evaluate_table(
             rule,
             self.headers,
-            [["BK.US", "Booking Holdings Inc.", 3900.0, "eodhd"]],
+            [["BNY.US", "Booking Holdings Inc.", 3900.0, "eodhd"]],
         )
         self.assertTrue(good["passed"])
         self.assertFalse(wrong["passed"])
         self.assertEqual(wrong["reason"], "issuer name mismatch")
 
     def test_blank_name_fails_closed(self):
-        rule = self.by_capability["bk_exact_identity"]
+        rule = self.by_capability["bny_exact_identity"]
         result = evaluate_table(
             rule,
             self.headers,
-            [["BK.US", "", 71.2, "eodhd"]],
+            [["BNY.US", "", 71.2, "eodhd"]],
         )
         self.assertFalse(result["passed"])
         self.assertEqual(result["reason"], "blank instrument name")
@@ -81,11 +81,11 @@ class BackendSymbolCapabilityTests(unittest.TestCase):
         self.assertEqual(result["reason"], "provider returned an error/stub marker")
 
     def test_missing_required_column_is_not_treated_as_blank_or_zero(self):
-        rule = self.by_capability["yahoo_ab_to_eodhd_adx"]
+        rule = self.by_capability["yahoo_ad_to_eodhd_adx"]
         result = evaluate_table(
             rule,
             ["Symbol", "Name", "Data Provider"],
-            [["ADNOCDIST.AB", "ADNOC Distribution PJSC", "eodhd"]],
+            [["ADNOCDIST.AD", "ADNOC Distribution PJSC", "eodhd"]],
         )
         self.assertFalse(result["passed"])
         self.assertIn("current_price", result["missing_columns"])

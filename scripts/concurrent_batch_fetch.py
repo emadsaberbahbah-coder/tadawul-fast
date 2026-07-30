@@ -14,11 +14,12 @@ import statistics
 import time
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 _METRICS: dict[str, dict[str, Any]] = {}
 
 _RECOVERY_SUFFIX_VARIANTS: tuple[tuple[str, str], ...] = (
-    (".AB", ".ADX"),
+    (".AD", ".ADX"),
+    (".AB", ".ADX"),  # legacy project spelling
     (".PS", ".PSE"),
 )
 
@@ -35,8 +36,9 @@ def provider_recovery_variants(symbol: str) -> list[str]:
     for source_suffix, provider_suffix in _RECOVERY_SUFFIX_VARIANTS:
         if canonical.endswith(source_suffix):
             variants.append(canonical[: -len(source_suffix)] + provider_suffix)
-    if canonical == "BK.US":
-        variants.append("BK")
+    if canonical == "BNY.US":
+        # Current ticker first; stale BK spellings are last-resort lifecycle aliases.
+        variants.extend(["BNY", "BK.US", "BK"])
     result: list[str] = []
     seen: set[str] = set()
     for value in variants:
