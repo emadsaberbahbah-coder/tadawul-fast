@@ -58,14 +58,31 @@ if legacy_probe in text:
 elif text.count(sequential_probe) != 1:
     raise RuntimeError('sequential capability command not found exactly once')
 
+# Scope timeout validation to the provider-capability step. The benchmark command
+# also legitimately uses --timeout 120, so a global count is not a valid gate.
+capability_heading = '      - name: Require deployed provider-symbol capabilities\n'
+start = text.find(capability_heading)
+if start < 0:
+    raise RuntimeError('provider capability step not found')
+end = text.find('\n      - name:', start + len(capability_heading))
+if end < 0:
+    raise RuntimeError('provider capability step boundary not found')
+capability_block = text[start:end]
 legacy_timeout = '            --timeout 60 \\\n'
 per_probe_timeout = '            --timeout 120 \\\n'
-if legacy_timeout in text:
-    if text.count(legacy_timeout) != 1:
-        raise RuntimeError('legacy capability timeout is not unique')
-    text = text.replace(legacy_timeout, per_probe_timeout, 1)
-elif text.count(per_probe_timeout) != 1:
-    raise RuntimeError('120-second per-probe timeout not found exactly once')
+if legacy_timeout in capability_block:
+    if capability_block.count(legacy_timeout) != 1:
+        raise RuntimeError('legacy capability timeout is not unique in its step')
+    capability_block = capability_block.replace(
+        legacy_timeout,
+        per_probe_timeout,
+        1,
+    )
+    text = text[:start] + capability_block + text[end:]
+elif capability_block.count(per_probe_timeout) != 1:
+    raise RuntimeError(
+        '120-second per-probe timeout not found exactly once in capability step'
+    )
 
 path_anchor = "      - 'scripts/verify_backend_symbol_capabilities.py'\n"
 new_path = "      - 'scripts/verify_backend_symbol_capabilities_sequential.py'\n"
