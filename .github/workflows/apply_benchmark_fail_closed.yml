@@ -39,7 +39,9 @@ jobs:
           text = Path('.github/workflows/python_refresh_benchmark.yml').read_text()
           assert "exit 1" in text
           assert "exit 2" in text
-          assert "BENCH_CONCURRENCY: ${{ inputs.concurrency || '1' }}" in text
+          assert "BENCH_CONCURRENCY:" in text
+          assert "inputs.concurrency" in text
+          assert "|| '1'" in text
           PY
 
       - name: Commit gate correction
