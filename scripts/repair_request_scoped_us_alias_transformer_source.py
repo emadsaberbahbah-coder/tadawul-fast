@@ -13,24 +13,38 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PATH = ROOT / "scripts" / "apply_request_scoped_us_alias_fix.py"
 
-BROAD = r'''        r"^def _filter_rows_to_requested\\(.*?(?=^def [A-Za-z_]\\w*\\()",
-'''
-NARROW = r'''        r"^def _filter_rows_to_requested\\(.*?^    return kept_rows, dropped\\n\\n",
-'''
-
 
 def main() -> None:
     text = PATH.read_text(encoding="utf-8")
-    if BROAD in text:
-        if text.count(BROAD) != 1:
-            raise RuntimeError("broad membership replacement pattern is not unique")
-        text = text.replace(BROAD, NARROW, 1)
-        PATH.write_text(text, encoding="utf-8")
-        print("request-membership transformer boundary narrowed")
+    lines = text.splitlines(keepends=True)
+    matches = [
+        index
+        for index, line in enumerate(lines)
+        if "^def _filter_rows_to_requested" in line
+        and ("(?=^def" in line or "return kept_rows, dropped" in line)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "membership replacement boundary is not unique: "
+            f"found {len(matches)} candidate lines"
+        )
+
+    index = matches[0]
+    current = lines[index]
+    if "return kept_rows, dropped" in current:
+        print("request-membership transformer boundary already safe")
         return
-    if text.count(NARROW) != 1:
-        raise RuntimeError("neither broad nor repaired membership boundary found")
-    print("request-membership transformer boundary already safe")
+    if "(?=^def" not in current:
+        raise RuntimeError("unexpected membership replacement boundary")
+
+    indent = current[: len(current) - len(current.lstrip())]
+    lines[index] = (
+        indent
+        + r'r"^def _filter_rows_to_requested\(.*?^    return kept_rows, dropped\n\n",'
+        + "\n"
+    )
+    PATH.write_text("".join(lines), encoding="utf-8")
+    print("request-membership transformer boundary narrowed")
 
 
 if __name__ == "__main__":
