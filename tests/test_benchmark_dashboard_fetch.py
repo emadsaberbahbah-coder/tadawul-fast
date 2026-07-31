@@ -25,6 +25,14 @@ class BenchmarkTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             benchmark._task_for("Not_A_Page")
 
+    def test_parser_defaults_to_sequential_concurrency(self):
+        args = benchmark.create_parser().parse_args([])
+        self.assertEqual(
+            args.concurrency,
+            1,
+            "concurrency greater than 1 must require an explicit benchmark argument",
+        )
+
     async def test_run_benchmark_reports_no_write_acceptance(self):
         args = argparse.Namespace(
             page="Market_Leaders",
