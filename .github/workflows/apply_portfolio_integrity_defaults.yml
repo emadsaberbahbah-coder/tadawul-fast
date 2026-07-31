@@ -1,0 +1,99 @@
+name: Apply portfolio integrity defaults
+
+on:
+  push:
+    branches:
+      - perf/python-batch-concurrency-v1
+    paths:
+      - 'scripts/apply_portfolio_integrity_defaults.py'
+      - '.github/workflows/apply_portfolio_integrity_defaults.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-portfolio-integrity-defaults
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v6
+        with:
+          ref: perf/python-batch-concurrency-v1
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Apply assertion-heavy defaults patch
+        run: python scripts/apply_portfolio_integrity_defaults.py
+
+      - name: Compile portfolio engine
+        run: python -m py_compile core/analysis/portfolio_actions.py
+
+      - name: Verify conservative defaults and rollback switches
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import os
+          from core.analysis import portfolio_actions as pa
+
+          keys = (
+              'TFB_PF_IDENTITY_GATE',
+              'TFB_PF_VF_CONFLICT_GUARD',
+              'TFB_PF_ENGINE_ROI_DISPLAY',
+              'TFB_PA_SUKUK_ASSET_CLASS',
+          )
+          for key in keys:
+              os.environ.pop(key, None)
+
+          assert pa._env_identity_gate() is True
+          assert pa._env_vf_conflict_guard() is True
+          assert pa._env_engine_roi_display() is True
+          assert pa._sukuk_asset_class_enabled() is True
+          assert pa._protect_sukuk_enabled() is True
+
+          os.environ['TFB_PF_IDENTITY_GATE'] = '0'
+          os.environ['TFB_PF_VF_CONFLICT_GUARD'] = '0'
+          os.environ['TFB_PF_ENGINE_ROI_DISPLAY'] = '0'
+          os.environ['TFB_PA_SUKUK_ASSET_CLASS'] = '0'
+          assert pa._env_identity_gate() is False
+          assert pa._env_vf_conflict_guard() is False
+          assert pa._env_engine_roi_display() is False
+          assert pa._sukuk_asset_class_enabled() is False
+          print('portfolio integrity default and rollback checks passed')
+          PY
+
+      - name: Run focused portfolio tests when present
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m pip install -q pytest
+          files=$(find tests -maxdepth 1 -type f \( -name '*portfolio*test*.py' -o -name 'test_portfolio*.py' \) -print)
+          if [ -n "$files" ]; then
+            python -m pytest -q $files
+          else
+            echo 'No focused portfolio test files found; compile and default assertions passed.'
+          fi
+
+      - name: Commit patched engine
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add core/analysis/portfolio_actions.py
+          if git diff --cached --quiet; then
+            echo 'No source changes produced.'
+            exit 0
+          fi
+          git commit -m 'fix: default portfolio integrity guards on'
+          git push origin HEAD:perf/python-batch-concurrency-v1
