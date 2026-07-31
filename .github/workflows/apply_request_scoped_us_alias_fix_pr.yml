@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'scripts/apply_request_scoped_us_alias_fix.py'
+      - 'scripts/repair_request_scoped_us_alias_transform_output.py'
       - '.github/workflows/apply_request_scoped_us_alias_fix_pr.yml'
 
 permissions:
@@ -52,9 +53,14 @@ jobs:
       - name: Apply assertion-heavy transformer
         run: python scripts/apply_request_scoped_us_alias_fix.py
 
+      - name: Repair and verify transformer output
+        run: python scripts/repair_request_scoped_us_alias_transform_output.py
+
       - name: Compile patched files
         run: |
           python -m py_compile \
+            scripts/apply_request_scoped_us_alias_fix.py \
+            scripts/repair_request_scoped_us_alias_transform_output.py \
             scripts/run_dashboard_sync.py \
             scripts/concurrent_batch_fetch.py \
             tests/test_concurrent_batch_fetch.py \
