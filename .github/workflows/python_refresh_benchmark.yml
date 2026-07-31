@@ -2,14 +2,7 @@ name: 🧪 Python Refresh Benchmark
 
 on:
   pull_request:
-    paths:
-      - 'scripts/run_dashboard_sync.py'
-      - 'scripts/concurrent_batch_fetch.py'
-      - 'scripts/benchmark_dashboard_fetch.py'
-      - 'scripts/verify_backend_symbol_capabilities.py'
-      - 'scripts/verify_backend_symbol_capabilities_sequential.py'
-      - 'tests/test_backend_symbol_capabilities.py'
-      - '.github/workflows/python_refresh_benchmark.yml'
+    types: [labeled]
 
   workflow_dispatch:
     inputs:
@@ -40,9 +33,12 @@ on:
 permissions:
   contents: read
 
+# Live provider tests are intentionally serialized across the benchmark and
+# data-free diagnostic workflows. A PR commit must never launch two 1,000-row
+# probes against Render at the same time.
 concurrency:
-  group: python-refresh-benchmark-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  group: live-read-only-refresh-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   live-read-only-benchmark:
@@ -51,7 +47,10 @@ jobs:
     if: >-
       ${{
         github.event_name == 'workflow_dispatch' ||
-        github.event.pull_request.head.ref == 'perf/python-batch-concurrency-v1'
+        (
+          github.event.pull_request.head.ref == 'perf/python-batch-concurrency-v1' &&
+          github.event.label.name == 'run-live-benchmark'
+        )
       }}
 
     runs-on: ubuntu-latest
@@ -109,7 +108,6 @@ jobs:
       - name: Install dependencies
         run: |
           set -euo pipefail
-
           python -m pip install --upgrade pip setuptools wheel
 
           if [[ -f requirements.render.txt ]]; then
@@ -124,13 +122,11 @@ jobs:
       - name: Require backend readiness
         run: |
           set -euo pipefail
-
           BODY=''
           READY='false'
 
           for attempt in 1 2 3 4 5; do
             echo "Readiness attempt ${attempt}/5"
-
             if BODY="$(curl -fsS \
               --retry 2 \
               --retry-all-errors \
@@ -138,25 +134,20 @@ jobs:
               --connect-timeout 15 \
               --max-time 30 \
               "$TARGET_URL/readyz")"; then
-
               printf '%s' "$BODY" > backend_ready.json
-
               READY="$(
                 printf '%s' "$BODY" |
                 jq -r '.ready // (.status == "ok") // false' 2>/dev/null ||
                 printf false
               )"
-
               if [[ "$READY" == 'true' ]]; then
                 break
               fi
             fi
-
             sleep $((attempt * 2))
           done
 
           printf '%s' "$BODY" > backend_ready.json
-
           if [[ "$READY" != 'true' ]]; then
             echo '::error::Render backend did not become ready after bounded retries.'
             cat backend_ready.json
@@ -166,7 +157,6 @@ jobs:
       - name: Require deployed provider-symbol capabilities
         run: |
           set -euo pipefail
-
           python scripts/verify_backend_symbol_capabilities_sequential.py \
             --backend "$TARGET_URL" \
             --endpoint '/v1/analysis/sheet-rows' \
@@ -178,7 +168,6 @@ jobs:
         env:
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
-
         run: |
           set -euo pipefail
 
@@ -188,7 +177,6 @@ jobs:
           fi
 
           RAW_CREDS="${SECRET_CREDS:-}"
-
           if [[ -z "$RAW_CREDS" && -n "${SECRET_CREDS_B64:-}" ]]; then
             RAW_CREDS="$(
               printf '%s' "$SECRET_CREDS_B64" |
@@ -204,12 +192,10 @@ jobs:
           fi
 
           CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
-
           printf '%s' "$RAW_CREDS" > "$CREDS_PATH"
           chmod 600 "$CREDS_PATH"
 
           SA_EMAIL="$(jq -r '.client_email // empty' "$CREDS_PATH")"
-
           if [[ -n "$SA_EMAIL" ]]; then
             echo "::add-mask::$SA_EMAIL"
           fi
@@ -220,7 +206,6 @@ jobs:
         id: benchmark
         run: |
           set -euo pipefail
-
           code=0
 
           python scripts/benchmark_dashboard_fetch.py \
@@ -241,23 +226,21 @@ jobs:
             echo '::error::Benchmark could not execute or produce evidence.'
             exit 3
           fi
-
           if [[ "$code" -eq 2 ]]; then
             echo '::error::Benchmark completed, but the production runner rejected the page. Concurrency escalation is blocked.'
             exit 2
           fi
-
           if [[ "$code" -eq 1 ]]; then
             echo '::error::Benchmark evidence is incomplete or the full fresh-fetch gate did not pass. Concurrency escalation is blocked.'
             exit 1
           fi
 
           echo 'Benchmark deployment gate passed with complete evidence.'
-          exit 0
 
       - name: Publish benchmark summary
         if: always()
         run: |
+          set -euo pipefail
           {
             echo '# 🧪 Python Refresh Deployment Gate'
             echo
@@ -269,21 +252,15 @@ jobs:
               echo
               echo '| Capability | Passed | Reason |'
               echo '|---|---:|---|'
-
               jq -r \
-                '.probes[] |
-                "| \(.capability) | \(.passed) | \(.reason) |"' \
+                '.probes[] | "| \(.capability) | \(.passed) | \(.reason) |"' \
                 backend_symbol_capabilities.json
-
               echo
               echo "Ready for full benchmark: $(jq -r '.ready_for_full_benchmark' backend_symbol_capabilities.json)"
               echo
             } >> "$GITHUB_STEP_SUMMARY"
           else
-            {
-              echo 'Backend capability report was not produced.'
-              echo
-            } >> "$GITHUB_STEP_SUMMARY"
+            echo 'Backend capability report was not produced.' >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [[ ! -f python_refresh_benchmark.json ]]; then
@@ -296,7 +273,6 @@ jobs:
             echo
             echo '| Metric | Value |'
             echo '|---|---:|'
-
             echo "| Page | $(jq -r '.page' python_refresh_benchmark.json) |"
             echo "| Runner status | $(jq -r '.acceptance.runner_status' python_refresh_benchmark.json) |"
             echo "| Requested | $(jq -r '.acceptance.requested_symbols' python_refresh_benchmark.json) |"
@@ -305,23 +281,20 @@ jobs:
             echo "| Data-free stubs | $(jq -r '.acceptance.data_free_symbols' python_refresh_benchmark.json) |"
             echo "| Missing | $(jq -r '.acceptance.missing_symbols' python_refresh_benchmark.json) |"
             echo "| Fresh coverage | $(jq -r '.acceptance.fresh_coverage_pct' python_refresh_benchmark.json)% |"
-
             echo "| Recovery healed | $(jq -r '.acceptance.targeted_recovery_healed' python_refresh_benchmark.json) / $(jq -r '.acceptance.targeted_recovery_requested' python_refresh_benchmark.json) |"
             echo "| Unattempted | $(jq -r '.acceptance.unattempted_symbols' python_refresh_benchmark.json) |"
-
-            echo "| HTTP 429 | $(jq -r '.acceptance.http_429' python_refresh_benchmark.json) |"
-            echo "| HTTP 5xx | $(jq -r '.acceptance.http_5xx' python_refresh_benchmark.json) |"
-
+            echo "| Transport HTTP 429 | $(jq -r '.acceptance.http_429' python_refresh_benchmark.json) |"
+            echo "| Transport HTTP 5xx | $(jq -r '.acceptance.http_5xx' python_refresh_benchmark.json) |"
             echo "| Acceptance metrics complete | $(jq -r '.acceptance.acceptance_metrics_complete' python_refresh_benchmark.json) |"
             echo "| Missing acceptance metrics | $(jq -r '(.acceptance.missing_acceptance_metrics // []) | join(", ")' python_refresh_benchmark.json) |"
             echo "| Identity/coherence failure | $(jq -r '.acceptance.identity_or_coherence_failure' python_refresh_benchmark.json) |"
-
             echo "| Elapsed | $(jq -r '.elapsed_minutes' python_refresh_benchmark.json) minutes |"
             echo "| Within 25 min | $(jq -r '.acceptance.within_25_minutes' python_refresh_benchmark.json) |"
             echo "| Universe preserved | $(jq -r '.acceptance.universe_preserved' python_refresh_benchmark.json) |"
             echo "| Complete fresh fetch | $(jq -r '.acceptance.complete_fresh_fetch' python_refresh_benchmark.json) |"
             echo "| No workbook writes | $(jq -r '.no_workbook_writes' python_refresh_benchmark.json) |"
-
+            echo
+            echo 'Transport codes describe the GitHub-to-Render request only. Provider-level HTTP 402/404 markers are classified by the separate Data-Free Diagnostics workflow.'
             echo
             echo "Benchmark exit code: ${{ steps.benchmark.outputs.benchmark_exit || 'unknown' }}"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -342,8 +315,6 @@ jobs:
         if: always()
         run: |
           CREDS_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$RUNNER_TEMP/google_credentials.json}"
-
           if [[ -f "$CREDS_PATH" ]]; then
-            shred -u -z "$CREDS_PATH" 2>/dev/null ||
-            rm -f "$CREDS_PATH"
+            shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
           fi
