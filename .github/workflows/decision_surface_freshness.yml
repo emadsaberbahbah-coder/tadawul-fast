@@ -1,0 +1,195 @@
+name: 🛡️ Decision Surface Freshness
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/decision_surface_freshness.yml'
+      - 'scripts/audit_decision_surface_freshness.py'
+      - 'tests/test_decision_surface_freshness.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/decision_surface_freshness.yml'
+      - 'scripts/audit_decision_surface_freshness.py'
+      - 'tests/test_decision_surface_freshness.py'
+  workflow_run:
+    workflows: ["🏦 Tadawul Dashboard Advanced Sync"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decision-surface-${{ github.event.workflow_run.id || github.run_id }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
+jobs:
+  regression-tests:
+    name: Test decision-surface freshness gate
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Compile and test
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            scripts/audit_decision_surface_freshness.py \
+            tests/test_decision_surface_freshness.py
+          python -m unittest tests/test_decision_surface_freshness.py -v
+
+  audit-live-surfaces:
+    name: Block stale or mixed-snapshot decisions
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          (
+            github.event.workflow_run.event == 'schedule' ||
+            github.event.workflow_run.event == 'workflow_dispatch'
+          )
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTHONPATH: ${{ github.workspace }}
+      TZ: Asia/Riyadh
+      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+      TFB_DECISION_SURFACE_MAX_AGE_H: '8'
+      TFB_DECISION_SOURCE_MAX_AGE_H: '30'
+      TFB_EXPECTED_MIN_ROWS_MARKET_LEADERS: ${{ vars.EXPECTED_MIN_ROWS_MARKET_LEADERS || '1025' }}
+      TFB_EXPECTED_MIN_ROWS_GLOBAL_MARKETS: ${{ vars.EXPECTED_MIN_ROWS_GLOBAL_MARKETS || '6512' }}
+      TFB_EXPECTED_MIN_ROWS_COMMODITIES_FX: ${{ vars.EXPECTED_MIN_ROWS_COMMODITIES_FX || '453' }}
+      TFB_EXPECTED_MIN_ROWS_MUTUAL_FUNDS: ${{ vars.EXPECTED_MIN_ROWS_MUTUAL_FUNDS || '4496' }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+          if [[ -f requirements.render.txt ]]; then
+            python -m pip install -r requirements.render.txt
+          elif [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt
+          else
+            echo '::error::No requirements file found.'
+            exit 1
+          fi
+
+      - name: Configure read-only credentials
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TARGET_SHEET_ID:-}" ]]; then
+            echo '::error::vars.DEFAULT_SPREADSHEET_ID is empty.'
+            exit 1
+          fi
+          RAW_CREDS="${SECRET_CREDS:-}"
+          if [[ -z "$RAW_CREDS" && -n "${SECRET_CREDS_B64:-}" ]]; then
+            RAW_CREDS="$(printf '%s' "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
+          fi
+          if [[ -z "$RAW_CREDS" ]] || ! printf '%s' "$RAW_CREDS" | jq empty >/dev/null 2>&1; then
+            echo '::error::No valid Google Sheets credentials found.'
+            exit 1
+          fi
+          CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
+          printf '%s' "$RAW_CREDS" > "$CREDS_PATH"
+          chmod 600 "$CREDS_PATH"
+          SA_EMAIL="$(jq -r '.client_email // empty' "$CREDS_PATH")"
+          [[ -n "$SA_EMAIL" ]] && echo "::add-mask::$SA_EMAIL"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
+
+      - name: Audit decision surfaces
+        id: audit
+        run: |
+          set -euo pipefail
+          code=0
+          python scripts/audit_decision_surface_freshness.py \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --json-out decision_surface_freshness.json || code=$?
+          echo "audit_exit=$code" >> "$GITHUB_OUTPUT"
+          if [[ "$code" -ge 2 ]]; then
+            echo "::error::Decision surfaces are not executable (exit $code)."
+            exit "$code"
+          fi
+          if [[ "$code" -eq 1 ]]; then
+            echo '::warning::Decision-surface audit completed with warnings.'
+          fi
+
+      - name: Publish decision-surface summary
+        if: always()
+        run: |
+          if [[ ! -f decision_surface_freshness.json ]]; then
+            echo '# Decision Surface Freshness' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Audit report was not produced.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo '# 🛡️ Decision Surface Freshness'
+            echo
+            echo "Executable: **$(jq -r '.executable' decision_surface_freshness.json)** · Exit: **${{ steps.audit.outputs.audit_exit || 'n/a' }}**"
+            echo
+            echo "Portfolio run: $(jq -r '.portfolio_run_riyadh // "unknown"' decision_surface_freshness.json)"
+            echo
+            echo "My_Portfolio source: $(jq -r '.my_portfolio_updated_riyadh // "unknown"' decision_surface_freshness.json)"
+            echo
+            echo "Top-10 run: $(jq -r '.top10_run_riyadh // "unknown"' decision_surface_freshness.json)"
+            echo
+            echo '| Severity | Surface | Code | Finding |'
+            echo '|---|---|---|---|'
+            jq -r '.findings[] | "| \(.severity) | \(.surface) | \(.code) | \(.message | gsub("\\|"; "\\\\|")) |"' decision_surface_freshness.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload decision-surface evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: decision-surface-freshness-${{ github.event.workflow_run.id || github.run_id }}
+          path: decision_surface_freshness.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Secure cleanup
+        if: always()
+        run: |
+          CREDS_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$RUNNER_TEMP/google_credentials.json}"
+          if [[ -f "$CREDS_PATH" ]]; then
+            shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
+          fi
