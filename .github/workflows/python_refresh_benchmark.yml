@@ -7,6 +7,7 @@ on:
       - 'scripts/concurrent_batch_fetch.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'scripts/verify_backend_symbol_capabilities.py'
+      - 'scripts/verify_backend_symbol_capabilities_sequential.py'
       - 'tests/test_backend_symbol_capabilities.py'
       - '.github/workflows/python_refresh_benchmark.yml'
 
@@ -166,11 +167,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          python scripts/verify_backend_symbol_capabilities.py \
+          python scripts/verify_backend_symbol_capabilities_sequential.py \
             --backend "$TARGET_URL" \
             --endpoint '/v1/analysis/sheet-rows' \
             --page 'Market_Leaders' \
-            --timeout 60 \
+            --timeout 120 \
             --json-out backend_symbol_capabilities.json
 
       - name: Configure read-only Google credentials
