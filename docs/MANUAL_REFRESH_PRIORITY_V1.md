@@ -16,7 +16,8 @@ The required behavior is:
 3. manual refresh runs alone;
 4. automatic refresh resumes after manual completion;
 5. no duplicate time-driven triggers are created;
-6. an error never leaves automation paused forever.
+6. an error never leaves automation paused forever;
+7. an old cleanup can never erase a newer manual-priority request.
 
 ## Platform limitation
 
@@ -32,6 +33,23 @@ long-running step.
 The coordinator is inert until the existing bound Apps Script entrypoints call it.
 The repository currently does not contain the live bound Apps Script sources, so
 this PR cannot by itself change the Google Sheet menu or triggers.
+
+### Coordinator locking model — v1.0.2
+
+Two independent lock domains are used deliberately:
+
+- `ScriptLock` protects the long-running automatic or manual refresh execution;
+- `DocumentLock` protects only short coordinator transactions: pause ownership,
+  compare-and-delete expiry cleanup, deferred-trigger lookup/creation, tracked
+  trigger-ID persistence, and one-shot resume deduplication.
+
+Each manual request receives an ownership ID. A finishing or failed execution may
+clear only the same request ID. If a newer manual request replaced it, the old
+cleanup records the mismatch and leaves the newer request intact.
+
+Deferred-trigger lookup, creation, and saved trigger-ID update occur inside one
+`DocumentLock` transaction. Two simultaneous manual clicks therefore cannot both
+observe “no trigger” and create duplicate one-shot triggers.
 
 ## Integration into the live bound Apps Script
 
@@ -63,7 +81,8 @@ tfbManualRefresh
 ```
 
 Do not configure `TFB_MANUAL_REFRESH_HANDLER=tfbManualRefresh`; the coordinator
-rejects that recursive configuration.
+rejects that recursive configuration. Handler existence is validated before any
+pause state is claimed.
 
 ### 3. Wrap every automatic entrypoint
 
@@ -118,8 +137,9 @@ Never yield:
 ### 5. Automatic continuation after manual refresh
 
 Normal time-driven triggers remain installed. They fire as usual but skip while
-the manual pause is active. When manual refresh finishes, the pause is cleared in
-`finally`, so the next scheduled trigger continues automatically.
+the manual pause is active. When the owned manual request finishes, its pause is
+cleared in isolated `finally` cleanup, so the next scheduled trigger continues
+automatically.
 
 Optionally set:
 
@@ -141,37 +161,52 @@ exactly. It also risks duplicates, missed schedules and authorization failures.
 The coordinator therefore keeps triggers installed and uses a TTL-backed pause.
 
 The only trigger it deletes is its own deduplicated deferred-manual one-shot
-trigger, identified by its saved unique ID.
+trigger, identified by its saved unique ID. Trigger enumeration, creation, tracked
+ID persistence, and deletion are serialized by the coordinator `DocumentLock`.
 
 ## Failure handling
 
-- If an automatic run still owns the ScriptLock, manual refresh waits up to 25
+- If an automatic run still owns `ScriptLock`, manual refresh waits up to 25
   seconds and then queues one deferred attempt.
+- Simultaneous queue attempts share one atomically created deferred trigger.
 - The pause has a 20-minute TTL, so an abandoned request self-expires.
-- The pause is cleared in `finally` after manual success or failure.
-- `tfbClearStaleManualRefreshPause()` is the owner-only emergency reset.
-- `tfbManualRefreshStatus()` reports the current pause and last coordinator event.
+- Expiry cleanup uses compare-and-delete: it clears only the exact stored expiry
+  value and request ID that were read as stale.
+- Final cleanup clears only the request ID owned by the finishing execution.
+- Pause clearing occurs before fallible trigger cleanup or resume scheduling.
+- `tfbClearStaleManualRefreshPause()` is the owner-only force reset.
+- `tfbManualRefreshStatus()` reports the current pause request ID, reason,
+  remaining TTL, deferred trigger ID, and last coordinator event.
 
 ## Required verification before deployment
 
 1. Manual click during idle: manual starts immediately; next automatic cycle runs.
 2. Manual click during automatic page 1: automatic completes the safe page,
    records cursor and yields; manual runs; automation resumes from cursor.
-3. Two manual clicks: no concurrent manual executions and no duplicate deferred
-   trigger.
-4. Manual handler throws: pause clears and automatic schedule remains active.
-5. Automatic trigger fires during manual: it records
+3. Two simultaneous manual clicks while automatic holds `ScriptLock`: one deferred
+   trigger exists, no concurrent manual executions occur, and repeated clicks are
+   reported as already queued/running.
+4. Expired-pause race: replace an expired request with a new request while an
+   automatic read is cleaning the old value; the new request remains present.
+5. Newer-request race: create a second request before the first manual execution
+   exits; first-execution cleanup must not clear the newer request ID.
+6. Manual handler throws: the owned pause clears and the automatic schedule remains
+   active.
+7. Deferred-trigger enumeration or deletion throws: pause clearing has already run
+   and automation is not suppressed until TTL expiry.
+8. Automatic trigger fires during manual: it records
    `skipped_manual_priority` and performs no write.
-6. No clear-without-write state under forced yield testing.
-7. Existing trigger count is unchanged except for a temporary coordinator-owned
-   deferred trigger when needed.
+9. No clear-without-write state under forced yield testing.
+10. Existing trigger count is unchanged except for one temporary
+    coordinator-owned deferred trigger when needed.
 
 ## Production acceptance
 
 - three successful manual-during-auto simulations;
 - zero lost rows;
-- zero duplicate triggers;
-- zero `lockBusySkips` for the manual request after the cooperative integration;
+- zero duplicate triggers under simultaneous-click testing;
+- zero newer request IDs deleted by stale or final cleanup;
+- zero `lockBusySkips` for the manual request after cooperative integration;
 - `_Run_Log` distinguishes manual request, automatic yield, manual completion and
   automatic resume;
-- owner and second reviewer approve the deployment.
+- owner and second reviewer approve the live deployment.
