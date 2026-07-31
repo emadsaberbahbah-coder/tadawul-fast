@@ -68,14 +68,29 @@ class BenchmarkTests(unittest.IsolatedAsyncioTestCase):
             async def close(self):
                 return None
 
+        async def fake_run_one_task(**kwargs):
+            # The production runner writes into NoWriteSheets, which records the
+            # planned matrix without calling Google write APIs. Simulate that
+            # contract so the acceptance test proves both complete metrics and
+            # preservation of the requested 1,000-row universe.
+            kwargs["sheets"].write_table(
+                "sheet-id",
+                "Market_Leaders",
+                "A1",
+                ["Symbol"],
+                [[f"S{i}"] for i in range(1000)],
+            )
+            return result
+
         with patch.object(sync, "BackendClient", FakeBackend), patch.object(
-            sync, "_run_one_task", AsyncMock(return_value=result)
+            sync, "_run_one_task", AsyncMock(side_effect=fake_run_one_task)
         ), patch.object(sync, "_idfw_selftest_", return_value=True):
             code, payload = await benchmark.run_benchmark(args)
 
         self.assertEqual(code, 0)
         self.assertTrue(payload["no_workbook_writes"])
         self.assertTrue(payload["acceptance"]["complete_fresh_fetch"])
+        self.assertTrue(payload["acceptance"]["universe_preserved"])
         self.assertEqual(payload["batch_metrics"]["symbols_fresh"], 1000)
 
 
