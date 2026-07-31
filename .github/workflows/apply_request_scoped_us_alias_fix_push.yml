@@ -1,65 +1,70 @@
-name: Apply request-scoped US alias fix (push)
+name: Validate request-scoped US alias fix (branch)
 
 on:
   push:
     branches:
       - perf/python-batch-concurrency-v1
     paths:
+      - 'scripts/apply_request_scoped_us_alias_fix.py'
       - 'scripts/repair_request_scoped_us_alias_transformer_source.py'
       - 'scripts/repair_request_scoped_us_alias_transform_output.py'
+      - 'scripts/run_dashboard_sync.py'
+      - 'scripts/concurrent_batch_fetch.py'
+      - 'tests/test_concurrent_batch_fetch.py'
+      - 'tests/test_critical_symbol_identity.py'
+      - 'tests/test_provider_symbol_recovery.py'
+      - 'tests/test_backend_symbol_capabilities.py'
       - '.github/workflows/apply_request_scoped_us_alias_fix_push.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: apply-request-scoped-us-alias-fix-push
-  cancel-in-progress: false
+  group: validate-request-scoped-us-alias-fix-branch
+  cancel-in-progress: true
 
 jobs:
-  apply:
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Checkout branch
+      - name: Checkout branch head
         uses: actions/checkout@v6
         with:
           ref: perf/python-batch-concurrency-v1
           fetch-depth: 1
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
-      - name: Preserve identity-firewall block in transformer
-        run: python scripts/repair_request_scoped_us_alias_transformer_source.py
-
-      - name: Align transformer with current sequential path
+      - name: Verify one-time transformer source is safely bounded
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('scripts/apply_request_scoped_us_alias_fix.py')
-          text = path.read_text(encoding='utf-8')
-          old = '''        2,
-                  label="sequential batch request indexes",
-          '''
-          new = '''        1,
-                  label="sequential batch request indexes",
-          '''
-          if old in text:
-              text = text.replace(old, new, 1)
-              path.write_text(text, encoding='utf-8')
-          PY
+          set -euo pipefail
+          python scripts/repair_request_scoped_us_alias_transformer_source.py
+          if ! git diff --quiet -- scripts/apply_request_scoped_us_alias_fix.py; then
+            echo '::error::The one-time alias transformer source is not in its committed safe bounded form.'
+            git diff -- scripts/apply_request_scoped_us_alias_fix.py
+            exit 1
+          fi
 
-      - name: Apply request-scoped alias repair
-        run: python scripts/apply_request_scoped_us_alias_fix.py
+      - name: Verify transformed output is already committed
+        run: |
+          set -euo pipefail
+          python scripts/repair_request_scoped_us_alias_transform_output.py
+          if ! git diff --quiet -- \
+            scripts/run_dashboard_sync.py \
+            tests/test_critical_symbol_identity.py; then
+            echo '::error::Request-scoped alias output drift detected. Commit the reviewed repair; CI will not mutate the branch.'
+            git diff -- \
+              scripts/run_dashboard_sync.py \
+              tests/test_critical_symbol_identity.py
+            exit 1
+          fi
 
-      - name: Repair and verify transformer output
-        run: python scripts/repair_request_scoped_us_alias_transform_output.py
-
-      - name: Compile patched sources
+      - name: Compile validated sources
         run: |
           python -m py_compile \
             scripts/apply_request_scoped_us_alias_fix.py \
@@ -71,29 +76,14 @@ jobs:
             tests/test_critical_symbol_identity.py
 
       - name: Run focused regression tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
+          set -euo pipefail
           python -m pip install -q pytest httpx
-          PYTHONPATH="$GITHUB_WORKSPACE" python -m unittest \
+          python -m unittest \
             tests/test_concurrent_batch_fetch.py \
             tests/test_critical_symbol_identity.py \
             tests/test_provider_symbol_recovery.py \
             tests/test_backend_symbol_capabilities.py \
             -v
-
-      - name: Commit patched sources
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add \
-            scripts/apply_request_scoped_us_alias_fix.py \
-            scripts/run_dashboard_sync.py \
-            scripts/concurrent_batch_fetch.py \
-            tests/test_concurrent_batch_fetch.py \
-            tests/test_critical_symbol_identity.py
-          if git diff --cached --quiet; then
-            echo 'No changes produced.'
-            exit 0
-          fi
-          git commit -m 'fix: preserve request-scoped US response aliases'
-          git push origin HEAD:perf/python-batch-concurrency-v1
