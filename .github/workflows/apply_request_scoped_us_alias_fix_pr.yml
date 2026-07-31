@@ -1,4 +1,4 @@
-name: Apply request-scoped US alias fix (PR)
+name: Validate request-scoped US alias fix (PR)
 
 on:
   pull_request:
@@ -6,17 +6,23 @@ on:
       - 'scripts/apply_request_scoped_us_alias_fix.py'
       - 'scripts/repair_request_scoped_us_alias_transformer_source.py'
       - 'scripts/repair_request_scoped_us_alias_transform_output.py'
+      - 'scripts/run_dashboard_sync.py'
+      - 'scripts/concurrent_batch_fetch.py'
+      - 'tests/test_concurrent_batch_fetch.py'
+      - 'tests/test_critical_symbol_identity.py'
+      - 'tests/test_provider_symbol_recovery.py'
+      - 'tests/test_backend_symbol_capabilities.py'
       - '.github/workflows/apply_request_scoped_us_alias_fix_pr.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: apply-request-scoped-us-alias-fix-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
+  group: validate-request-scoped-us-alias-fix-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  apply:
+  validate:
     if: github.event.pull_request.head.ref == 'perf/python-batch-concurrency-v1'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -24,43 +30,40 @@ jobs:
       - name: Checkout PR head
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
-      - name: Preserve identity-firewall block in transformer
-        run: python scripts/repair_request_scoped_us_alias_transformer_source.py
-
-      - name: Align assertion with current runner shape
+      - name: Verify one-time transformer source is safely bounded
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('scripts/apply_request_scoped_us_alias_fix.py')
-          text = path.read_text(encoding='utf-8')
-          old = '''        2,
-                  label="sequential batch request indexes",
-          '''
-          new = '''        1,
-                  label="sequential batch request indexes",
-          '''
-          if text.count(old) != 1:
-              raise SystemExit('expected one replace-count assertion block')
-          path.write_text(text.replace(old, new, 1), encoding='utf-8')
-          PY
+          set -euo pipefail
+          python scripts/repair_request_scoped_us_alias_transformer_source.py
+          if ! git diff --quiet -- scripts/apply_request_scoped_us_alias_fix.py; then
+            echo '::error::The one-time alias transformer source was not committed in its safe bounded form.'
+            git diff -- scripts/apply_request_scoped_us_alias_fix.py
+            exit 1
+          fi
 
-      - name: Apply assertion-heavy transformer
-        run: python scripts/apply_request_scoped_us_alias_fix.py
+      - name: Verify transformed output is already committed
+        run: |
+          set -euo pipefail
+          python scripts/repair_request_scoped_us_alias_transform_output.py
+          if ! git diff --quiet -- \
+            scripts/run_dashboard_sync.py \
+            tests/test_critical_symbol_identity.py; then
+            echo '::error::Request-scoped alias output drift detected. Commit the reviewed repair instead of allowing CI to mutate the PR.'
+            git diff -- \
+              scripts/run_dashboard_sync.py \
+              tests/test_critical_symbol_identity.py
+            exit 1
+          fi
 
-      - name: Repair and verify transformer output
-        run: python scripts/repair_request_scoped_us_alias_transform_output.py
-
-      - name: Compile patched files
+      - name: Compile validated sources
         run: |
           python -m py_compile \
             scripts/apply_request_scoped_us_alias_fix.py \
@@ -72,36 +75,14 @@ jobs:
             tests/test_critical_symbol_identity.py
 
       - name: Run focused regression tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
+          set -euo pipefail
           python -m pip install -q pytest httpx
-          PYTHONPATH="$GITHUB_WORKSPACE" python -m unittest \
+          python -m unittest \
             tests/test_concurrent_batch_fetch.py \
             tests/test_critical_symbol_identity.py \
             tests/test_provider_symbol_recovery.py \
             tests/test_backend_symbol_capabilities.py \
             -v
-
-      - name: Commit patched sources
-        env:
-          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- \
-            scripts/apply_request_scoped_us_alias_fix.py \
-            scripts/run_dashboard_sync.py \
-            scripts/concurrent_batch_fetch.py \
-            tests/test_concurrent_batch_fetch.py \
-            tests/test_critical_symbol_identity.py; then
-            echo 'No source changes produced.'
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add \
-            scripts/apply_request_scoped_us_alias_fix.py \
-            scripts/run_dashboard_sync.py \
-            scripts/concurrent_batch_fetch.py \
-            tests/test_concurrent_batch_fetch.py \
-            tests/test_critical_symbol_identity.py
-          git commit -m 'fix: accept request-scoped US suffix response aliases'
-          git push origin "HEAD:${HEAD_BRANCH}"
