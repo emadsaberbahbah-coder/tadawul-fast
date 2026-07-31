@@ -2,12 +2,14 @@
 """Repair and verify the request-scoped US-alias transformer output.
 
 This is a narrow safety patch for the assertion-heavy transformer. It fixes
-only two mechanically introduced defects:
+only mechanically introduced defects and verifies that the pre-existing
+identity firewall remains intact:
 
 1. orphan ``_batch_set.discard("")`` calls after the transformer replaces the
-   corresponding set with a request index; and
+   corresponding set with a request index;
 2. a stale regression assertion that expected a Sheet write before a critical
-   identity proof failure.
+   identity proof failure; and
+3. accidental deletion of the identity-tripwire constants/anchor registry.
 
 It does not change provider requests, symbol canonicalization, scoring,
 portfolio logic, Sheet writers, or the production concurrency default.
@@ -80,6 +82,21 @@ def patch_runner() -> None:
             "response resolver must use the request index in both sequential passes"
         )
 
+    guard_markers = (
+        '_IDENTITY_TAG = "[v6.22.0 IDENTITY-TRIPWIRE]"',
+        '_BATCH_IDENTITY_TAG = "[v6.22.0 BATCH-IDENTITY]"',
+        '_SAFE_GW_TAG = "[v6.22.0 SAFE-GATEWAYS]"',
+        '_COHERENCE_TAG = "[v6.23.0 COHERENCE-TRIPWIRE]"',
+        '_IDENTITY_ANCHORS: Dict[str, Tuple[str, ...]] = {',
+        'def _identity_anchor_map() -> Dict[str, Tuple[str, ...]]:',
+    )
+    missing = [marker for marker in guard_markers if marker not in text]
+    if missing:
+        raise RuntimeError(
+            "request-scoped transform damaged the identity firewall; "
+            f"missing markers: {missing}"
+        )
+
     _write(path, text)
 
 
@@ -125,7 +142,8 @@ def main() -> None:
     patch_runner()
     patch_critical_identity_test()
     print(
-        "request-scoped alias output repaired; critical identity failures remain no-write"
+        "request-scoped alias output repaired; identity firewall preserved; "
+        "critical identity failures remain no-write"
     )
 
 
