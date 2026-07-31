@@ -18,7 +18,7 @@ from typing import Any, Sequence
 
 from scripts import run_dashboard_sync as sync
 
-BENCHMARK_VERSION = "1.1.0"
+BENCHMARK_VERSION = "1.2.0"
 
 
 class NoWriteSheets(sync.SheetsWriter):
@@ -73,6 +73,16 @@ def _set_runtime_env(args: argparse.Namespace) -> None:
     sync._TIME_BUDGET_START = time.monotonic()
 
 
+def _metric_int(metrics: dict[str, Any], key: str) -> int | None:
+    value = metrics.get(key)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     _set_runtime_env(args)
     task = _task_for(args.page)
@@ -107,13 +117,65 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     result_payload = result.to_dict()
     metrics = dict(result_payload.get("batch_metrics") or {})
     requested = int(metrics.get("symbols_requested") or result.symbols_requested or 0)
-    returned = int(metrics.get("symbols_returned") or 0)
-    fresh = int(metrics.get("symbols_fresh") or 0)
-    data_free = int(metrics.get("symbols_data_free") or 0)
-    missing = int(metrics.get("symbols_missing") or 0)
+    returned = _metric_int(metrics, "symbols_returned")
+    fresh = _metric_int(metrics, "symbols_fresh")
+    data_free = _metric_int(metrics, "symbols_data_free")
+    missing = _metric_int(metrics, "symbols_missing")
+    unattempted = _metric_int(metrics, "symbols_unattempted")
+    http_429 = _metric_int(metrics, "http_429")
+    http_5xx = _metric_int(metrics, "http_5xx")
+    recovery_requested = _metric_int(metrics, "targeted_recovery_requested")
+    recovery_healed = _metric_int(metrics, "targeted_recovery_healed")
+
+    warnings = [str(item) for item in (result_payload.get("warnings") or [])]
+    critical_warning_tokens = (
+        "quarantined ",
+        "identity-broken",
+        "IDENTITY-TRIPWIRE]" and "mismatched=",
+        "COHERENCE-TRIPWIRE]" and "incoherent=",
+    )
+    identity_or_coherence_failure = any(
+        ("quarantined " in warning)
+        or ("identity-broken" in warning)
+        or ("mismatched=" in warning and "mismatched=0" not in warning)
+        or ("incoherent=" in warning and "incoherent=0" not in warning)
+        for warning in warnings
+    )
+
+    required_metrics = {
+        "symbols_returned": returned,
+        "symbols_fresh": fresh,
+        "symbols_data_free": data_free,
+        "symbols_missing": missing,
+        "symbols_unattempted": unattempted,
+        "http_429": http_429,
+        "http_5xx": http_5xx,
+        "targeted_recovery_requested": recovery_requested,
+        "targeted_recovery_healed": recovery_healed,
+    }
+    missing_acceptance_metrics = sorted(
+        key for key, value in required_metrics.items() if value is None
+    )
+    metrics_complete = not missing_acceptance_metrics
+    planned_rows = sum(int(item.get("rows") or 0) for item in sheets.planned_writes)
+    universe_preserved = requested > 0 and planned_rows == requested
+    complete_fresh_fetch = bool(
+        metrics_complete
+        and requested
+        and returned == requested
+        and fresh == requested
+        and data_free == 0
+        and missing == 0
+        and unattempted == 0
+        and http_429 == 0
+        and http_5xx == 0
+        and recovery_healed == recovery_requested
+        and universe_preserved
+        and not identity_or_coherence_failure
+    )
 
     payload: dict[str, Any] = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "benchmark_version": BENCHMARK_VERSION,
         "runner_version": sync.SCRIPT_VERSION,
         "mode": "read_live_fetch_no_write",
@@ -142,19 +204,18 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "missing_symbols": missing,
             "returned_coverage_pct": metrics.get("returned_coverage_pct"),
             "fresh_coverage_pct": metrics.get("fresh_coverage_pct"),
-            "targeted_recovery_requested": metrics.get("targeted_recovery_requested"),
-            "targeted_recovery_healed": metrics.get("targeted_recovery_healed"),
-            "unattempted_symbols": metrics.get("symbols_unattempted"),
-            "http_429": metrics.get("http_429"),
-            "http_5xx": metrics.get("http_5xx"),
+            "targeted_recovery_requested": recovery_requested,
+            "targeted_recovery_healed": recovery_healed,
+            "unattempted_symbols": unattempted,
+            "http_429": http_429,
+            "http_5xx": http_5xx,
             "within_25_minutes": elapsed_ms <= 25 * 60 * 1000,
             "within_35_minutes": elapsed_ms <= 35 * 60 * 1000,
-            "complete_fresh_fetch": bool(
-                requested
-                and fresh == requested
-                and data_free == 0
-                and missing == 0
-            ),
+            "universe_preserved": universe_preserved,
+            "identity_or_coherence_failure": identity_or_coherence_failure,
+            "acceptance_metrics_complete": metrics_complete,
+            "missing_acceptance_metrics": missing_acceptance_metrics,
+            "complete_fresh_fetch": complete_fresh_fetch,
             "runner_status": result.status,
             "runner_error": result.error,
         },
@@ -162,7 +223,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     if result.status == "failed":
         exit_code = 2
-    elif result.status in {"partial", "skipped"}:
+    elif result.status in {"partial", "skipped"} or not complete_fresh_fetch:
         exit_code = 1
     else:
         exit_code = 0
