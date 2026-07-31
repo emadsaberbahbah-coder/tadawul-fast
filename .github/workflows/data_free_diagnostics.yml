@@ -1,0 +1,302 @@
+name: 🔎 Data-Free Row Diagnostics
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/run_dashboard_sync.py'
+      - 'scripts/benchmark_dashboard_fetch.py'
+      - 'scripts/diagnose_data_free_rows.py'
+      - 'tests/test_data_free_diagnostics.py'
+      - '.github/workflows/data_free_diagnostics.yml'
+
+  workflow_dispatch:
+    inputs:
+      page:
+        description: Page/key to diagnose
+        required: true
+        default: Market_Leaders
+        type: string
+
+      max_symbols:
+        description: Maximum symbols
+        required: true
+        default: '1000'
+        type: string
+
+      batch_size:
+        description: Symbols per request
+        required: true
+        default: '25'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: data-free-diagnostics-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  diagnose-live-read-only:
+    name: Classify every data-free row without Sheet writes
+
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        github.event.pull_request.head.ref == 'perf/python-batch-concurrency-v1'
+      }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    environment: production
+
+    env:
+      PYTHON_VERSION: '3.11'
+      PYTHONUNBUFFERED: '1'
+      PYTHONPATH: ${{ github.workspace }}
+      TZ: Asia/Riyadh
+
+      TARGET_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
+      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+
+      DIAG_PAGE: ${{ inputs.page || 'Market_Leaders' }}
+      DIAG_MAX_SYMBOLS: ${{ inputs.max_symbols || '1000' }}
+      DIAG_BATCH_SIZE: ${{ inputs.batch_size || '25' }}
+
+      TFB_SYNC_BATCH_CONCURRENCY: '1'
+      TFB_SYNC_BATCH_OUTER_RETRIES: '1'
+      TFB_SYNC_TARGET_RECOVERY: '1'
+      TFB_SYNC_TARGET_RECOVERY_MAX: '120'
+      TFB_SYNC_TARGET_RECOVERY_BATCH_SIZE: '10'
+      TFB_SYNC_TARGET_RECOVERY_ROUNDS: '1'
+
+      TFB_SYNC_MARKET_GATEWAY: analysis
+      TFB_SYNC_MAX_SYMBOLS_MARKET: '7000'
+      TFB_SYNC_UNIVERSE_CAP_V2: '1'
+      TFB_SYNC_OLDEST_FIRST: '1'
+      TFB_SYNC_HEAL_FIRST: '1'
+      TFB_SYNC_IDFW_RUNLOG: '0'
+      TFB_XPAGE_PRICE_CHECK: '0'
+
+      BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
+
+    steps:
+      - name: Checkout diagnostic branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+
+          if [[ -f requirements.render.txt ]]; then
+            python -m pip install -r requirements.render.txt
+          elif [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt
+          else
+            echo '::error::No requirements file found.'
+            exit 1
+          fi
+
+      - name: Run focused diagnostic tests
+        run: |
+          set -euo pipefail
+          python -m compileall -q \
+            scripts/diagnose_data_free_rows.py \
+            tests/test_data_free_diagnostics.py
+          python -m unittest -v tests.test_data_free_diagnostics
+
+      - name: Require backend readiness
+        run: |
+          set -euo pipefail
+          BODY=''
+          READY='false'
+
+          for attempt in 1 2 3 4 5; do
+            echo "Readiness attempt ${attempt}/5"
+            if BODY="$(curl -fsS \
+              --retry 2 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              --connect-timeout 15 \
+              --max-time 30 \
+              "$TARGET_URL/readyz")"; then
+              printf '%s' "$BODY" > backend_ready.json
+              READY="$(
+                printf '%s' "$BODY" |
+                jq -r '.ready // (.status == "ok") // false' 2>/dev/null ||
+                printf false
+              )"
+              if [[ "$READY" == 'true' ]]; then
+                break
+              fi
+            fi
+            sleep $((attempt * 2))
+          done
+
+          printf '%s' "$BODY" > backend_ready.json
+          if [[ "$READY" != 'true' ]]; then
+            echo '::error::Render backend did not become ready after bounded retries.'
+            cat backend_ready.json
+            exit 1
+          fi
+
+      - name: Configure read-only Google credentials
+        env:
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TARGET_SHEET_ID:-}" ]]; then
+            echo '::error::vars.DEFAULT_SPREADSHEET_ID is empty.'
+            exit 1
+          fi
+
+          RAW_CREDS="${SECRET_CREDS:-}"
+          if [[ -z "$RAW_CREDS" && -n "${SECRET_CREDS_B64:-}" ]]; then
+            RAW_CREDS="$(
+              printf '%s' "$SECRET_CREDS_B64" |
+              base64 --decode 2>/dev/null ||
+              true
+            )"
+          fi
+
+          if [[ -z "$RAW_CREDS" ]] ||
+             ! printf '%s' "$RAW_CREDS" | jq empty >/dev/null 2>&1; then
+            echo '::error::No valid Google Sheets credentials found.'
+            exit 1
+          fi
+
+          CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
+          printf '%s' "$RAW_CREDS" > "$CREDS_PATH"
+          chmod 600 "$CREDS_PATH"
+
+          SA_EMAIL="$(jq -r '.client_email // empty' "$CREDS_PATH")"
+          if [[ -n "$SA_EMAIL" ]]; then
+            echo "::add-mask::$SA_EMAIL"
+          fi
+
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
+
+      - name: Run complete data-free diagnostic
+        id: diagnostic
+        run: |
+          set -euo pipefail
+          code=0
+
+          python scripts/diagnose_data_free_rows.py \
+            --page "$DIAG_PAGE" \
+            --sheet-id "$TARGET_SHEET_ID" \
+            --backend "$TARGET_URL" \
+            --max-symbols "$DIAG_MAX_SYMBOLS" \
+            --batch-size "$DIAG_BATCH_SIZE" \
+            --concurrency 1 \
+            --outer-retries 1 \
+            --timeout 120 \
+            --time-budget 2100 \
+            --json-out data_free_diagnostics.json \
+            --csv-out data_free_rows.csv \
+            > data_free_diagnostic_stdout.json || code=$?
+
+          echo "diagnostic_exit=$code" >> "$GITHUB_OUTPUT"
+
+          if [[ "$code" -eq 3 ]]; then
+            echo '::error::Diagnostic could not execute or produce evidence.'
+            exit 3
+          fi
+          if [[ "$code" -eq 2 ]]; then
+            echo '::error::Production runner rejected the page during diagnostics.'
+            exit 2
+          fi
+          if [[ "$code" -eq 1 ]]; then
+            echo '::error::Diagnostic evidence did not reconcile to collector metrics.'
+            exit 1
+          fi
+
+          jq -e '.no_workbook_writes == true and .evidence_consistent == true' \
+            data_free_diagnostics.json >/dev/null
+
+      - name: Publish diagnostic summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          {
+            echo '# 🔎 Data-Free Row Diagnostics'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ! -f data_free_diagnostics.json ]]; then
+            echo 'Diagnostic evidence was not produced.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo '| Metric | Value |'
+            echo '|---|---:|'
+            echo "| Page | $(jq -r '.page' data_free_diagnostics.json) |"
+            echo "| Requested | $(jq -r '.summary.requested_symbols' data_free_diagnostics.json) |"
+            echo "| Verified fresh | $(jq -r '.summary.fresh_symbols' data_free_diagnostics.json) |"
+            echo "| Decision blocked | $(jq -r '.summary.data_free_symbols' data_free_diagnostics.json) |"
+            echo "| Unclassified data-free | $(jq -r '.summary.unclassified_data_free' data_free_diagnostics.json) |"
+            echo "| Evidence consistent | $(jq -r '.evidence_consistent' data_free_diagnostics.json) |"
+            echo "| No workbook writes | $(jq -r '.no_workbook_writes' data_free_diagnostics.json) |"
+            echo
+            echo '## Reason counts'
+            echo
+            echo '| Reason | Rows |'
+            echo '|---|---:|'
+            jq -r \
+              '.summary.reason_counts | to_entries | sort_by(-.value, .key)[] |
+              "| \(.key) | \(.value) |"' \
+              data_free_diagnostics.json
+            echo
+            echo '## Symbol-market buckets'
+            echo
+            echo '| Bucket | Rows |'
+            echo '|---|---:|'
+            jq -r \
+              '.summary.symbol_bucket_counts | to_entries | sort_by(-.value, .key)[] |
+              "| \(.key) | \(.value) |"' \
+              data_free_diagnostics.json
+            echo
+            echo 'All affected rows are included in the JSON and CSV artifacts; no 100-row cap is applied.'
+            echo
+            echo "Diagnostic exit code: ${{ steps.diagnostic.outputs.diagnostic_exit || 'unknown' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload complete diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: data-free-diagnostics-${{ github.run_id }}
+          path: |
+            data_free_diagnostics.json
+            data_free_rows.csv
+            data_free_diagnostic_stdout.json
+            backend_ready.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Secure cleanup
+        if: always()
+        run: |
+          CREDS_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$RUNNER_TEMP/google_credentials.json}"
+          if [[ -f "$CREDS_PATH" ]]; then
+            shred -u -z "$CREDS_PATH" 2>/dev/null ||
+            rm -f "$CREDS_PATH"
+          fi
