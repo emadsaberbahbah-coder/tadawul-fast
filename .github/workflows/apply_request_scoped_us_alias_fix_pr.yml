@@ -46,19 +46,6 @@ jobs:
           '''
           if text.count(old) != 1:
               raise SystemExit('expected one replace-count assertion block')
-          text = text.replace(old, new, 1)
-          old = '''    if count != 2:
-                  raise RuntimeError(
-                      f"sequential response resolver: expected 2 matches, found {count}"
-                  )
-          '''
-          new = '''    if count != 1:
-                  raise RuntimeError(
-                      f"sequential response resolver: expected 1 match, found {count}"
-                  )
-          '''
-          if text.count(old) != 1:
-              raise SystemExit('expected one sequential-regex assertion block')
           path.write_text(text.replace(old, new, 1), encoding='utf-8')
           PY
 
