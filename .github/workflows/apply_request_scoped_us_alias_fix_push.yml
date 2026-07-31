@@ -5,6 +5,7 @@ on:
     branches:
       - perf/python-batch-concurrency-v1
     paths:
+      - 'scripts/repair_request_scoped_us_alias_transformer_source.py'
       - 'scripts/repair_request_scoped_us_alias_transform_output.py'
       - '.github/workflows/apply_request_scoped_us_alias_fix_push.yml'
 
@@ -31,6 +32,9 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+
+      - name: Preserve identity-firewall block in transformer
+        run: python scripts/repair_request_scoped_us_alias_transformer_source.py
 
       - name: Align transformer with current sequential path
         run: |
@@ -59,6 +63,7 @@ jobs:
         run: |
           python -m py_compile \
             scripts/apply_request_scoped_us_alias_fix.py \
+            scripts/repair_request_scoped_us_alias_transformer_source.py \
             scripts/repair_request_scoped_us_alias_transform_output.py \
             scripts/run_dashboard_sync.py \
             scripts/concurrent_batch_fetch.py \
