@@ -1,7 +1,7 @@
 # Manual Refresh Priority v1
 
-Status: **Draft / not deployed to the bound Google Apps Script project**  
-Owner activation: **not authorized until reviewed**
+Status: **Reviewed source / not deployed to the bound Google Apps Script project**  
+Owner activation: **Source approved; live deployment still requires bound-script integration, simulation evidence, and a second deployment review**
 
 ## Problem
 
