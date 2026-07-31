@@ -5,6 +5,9 @@ The benchmark reads the live page universe and calls the same Render/backend
 routes and guards used by ``run_dashboard_sync.py``. It replaces the final
 Sheet writer with an in-memory sink and disables the optional _Run_Log append,
 so no workbook cell is changed.
+
+Concurrency defaults to the exact sequential production path (1). A higher
+value must be supplied explicitly after the sequential deployment gate passes.
 """
 from __future__ import annotations
 
@@ -18,7 +21,7 @@ from typing import Any, Sequence
 
 from scripts import run_dashboard_sync as sync
 
-BENCHMARK_VERSION = "1.2.0"
+BENCHMARK_VERSION = "1.2.1"
 
 
 class NoWriteSheets(sync.SheetsWriter):
@@ -128,12 +131,6 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     recovery_healed = _metric_int(metrics, "targeted_recovery_healed")
 
     warnings = [str(item) for item in (result_payload.get("warnings") or [])]
-    critical_warning_tokens = (
-        "quarantined ",
-        "identity-broken",
-        "IDENTITY-TRIPWIRE]" and "mismatched=",
-        "COHERENCE-TRIPWIRE]" and "incoherent=",
-    )
     identity_or_coherence_failure = any(
         ("quarantined " in warning)
         or ("identity-broken" in warning)
@@ -237,7 +234,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", default="")
     parser.add_argument("--max-symbols", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=25)
-    parser.add_argument("--concurrency", type=int, default=3)
+    parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--outer-retries", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--time-budget", type=int, default=2100)
