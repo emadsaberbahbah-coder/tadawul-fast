@@ -12,6 +12,7 @@ on:
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'scripts/verify_backend_symbol_capabilities.py'
+      - 'scripts/verify_backend_symbol_capabilities_sequential.py'
       - 'tests/test_concurrent_batch_fetch.py'
       - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
@@ -31,6 +32,7 @@ on:
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'scripts/verify_backend_symbol_capabilities.py'
+      - 'scripts/verify_backend_symbol_capabilities_sequential.py'
       - 'tests/test_concurrent_batch_fetch.py'
       - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
@@ -77,6 +79,7 @@ jobs:
             scripts/run_dashboard_sync_fast.py \
             scripts/benchmark_dashboard_fetch.py \
             scripts/verify_backend_symbol_capabilities.py \
+            scripts/verify_backend_symbol_capabilities_sequential.py \
             tests/test_concurrent_batch_fetch.py \
             tests/test_provider_symbol_recovery.py \
             tests/test_benchmark_dashboard_fetch.py \
@@ -102,25 +105,40 @@ jobs:
           from core.symbols.normalize import to_eodhd_symbol, to_yahoo_symbol
           from scripts import run_dashboard_sync as sync
           from scripts.concurrent_batch_fetch import build, concurrency, provider_recovery_variants
-          from scripts.benchmark_dashboard_fetch import NoWriteSheets
+          from scripts.benchmark_dashboard_fetch import NoWriteSheets, create_parser
           from scripts.critical_symbol_identity import canonicalize_symbol
           from scripts.verify_backend_symbol_capabilities import RULES, evaluate_table
+          from scripts.verify_backend_symbol_capabilities_sequential import GATE_VERSION
 
           os.environ.pop("TFB_SYNC_BATCH_CONCURRENCY", None)
           os.environ.pop("TFB_EODHD_ENGINE_PATCH_BIND", None)
+
+          # Production and no-write benchmark defaults must both remain the exact
+          # sequential path. Values above 1 require an explicit canary input.
           assert concurrency() == 1
+          assert create_parser().parse_args([]).concurrency == 1
+
           assert eodhd_provider._err_indicates_provider_unhealthy("HTTP 402") is True
           assert eodhd_provider._engine_patch_bind_enabled() is True
-          assert sync.SCRIPT_VERSION == "6.31.0"
+
+          # Require the feature-bearing version or newer without creating a false
+          # failure for safe patch releases.
+          version_parts = tuple(int(part) for part in sync.SCRIPT_VERSION.split("."))
+          assert version_parts >= (6, 32, 0), sync.SCRIPT_VERSION
           assert callable(sync._fetch_market_rows_batched)
+          assert callable(sync._build_request_symbol_index)
+          assert callable(sync._resolve_requested_symbol)
           assert callable(build(sync))
+
           assert to_eodhd_symbol("ADNOCDIST.AD") == "ADNOCDIST.ADX"
           assert to_eodhd_symbol("BPI.PS") == "BPI.PSE"
           assert to_yahoo_symbol("ADNOCDIST.ADX") == "ADNOCDIST.AD"
           assert canonicalize_symbol("NZYM-B.CO") == "NSIS-B.CO"
           assert canonicalize_symbol("BK.US") == "BNY.US"
           assert provider_recovery_variants("BNY.US") == ["BNY.US", "BNY", "BK.US", "BK"]
+
           assert len(RULES) == 3
+          assert "sequential" in GATE_VERSION
           bny_rule = next(rule for rule in RULES if rule.requested_symbol == "BNY.US")
           bny_check = evaluate_table(
               bny_rule,
@@ -128,6 +146,7 @@ jobs:
               [["BNY.US", "The Bank of New York Mellon Corporation", 71.2, "eodhd"]],
           )
           assert bny_check["passed"] is True
+
           result = sync.TaskResult(
               key="GLOBAL_MARKETS",
               sheet_name="Global_Markets",
@@ -137,8 +156,11 @@ jobs:
           payload = result.to_dict()
           assert "batch_metrics" in payload
           assert isinstance(payload["batch_metrics"], dict)
+
           sink = NoWriteSheets()
           assert sink.write_table("sid", "P", "A1", ["Symbol"], [["A"]]) == 1
           assert sink.planned_writes[0]["rows"] == 1
-          print("truthful provider normalization + HTTP 402 fallback + concurrency=1 contract: PASS")
+          assert sink.clear_requests == []
+
+          print("truthful normalization + HTTP 402 guard + exact sequential defaults: PASS")
           PY
