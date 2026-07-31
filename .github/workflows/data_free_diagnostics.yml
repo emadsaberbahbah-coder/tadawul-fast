@@ -2,12 +2,7 @@ name: 🔎 Data-Free Row Diagnostics
 
 on:
   pull_request:
-    paths:
-      - 'scripts/run_dashboard_sync.py'
-      - 'scripts/benchmark_dashboard_fetch.py'
-      - 'scripts/diagnose_data_free_rows.py'
-      - 'tests/test_data_free_diagnostics.py'
-      - '.github/workflows/data_free_diagnostics.yml'
+    types: [labeled]
 
   workflow_dispatch:
     inputs:
@@ -32,9 +27,11 @@ on:
 permissions:
   contents: read
 
+# Shared with python_refresh_benchmark.yml so the two expensive live read-only
+# jobs queue rather than competing for Render/provider capacity.
 concurrency:
-  group: data-free-diagnostics-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  group: live-read-only-refresh-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   diagnose-live-read-only:
@@ -43,7 +40,10 @@ jobs:
     if: >-
       ${{
         github.event_name == 'workflow_dispatch' ||
-        github.event.pull_request.head.ref == 'perf/python-batch-concurrency-v1'
+        (
+          github.event.pull_request.head.ref == 'perf/python-batch-concurrency-v1' &&
+          github.event.label.name == 'run-data-diagnostics'
+        )
       }}
 
     runs-on: ubuntu-latest
@@ -210,6 +210,7 @@ jobs:
             --time-budget 2100 \
             --json-out data_free_diagnostics.json \
             --csv-out data_free_rows.csv \
+            --eligibility-csv-out decision_eligibility.csv \
             > data_free_diagnostic_stdout.json || code=$?
 
           echo "diagnostic_exit=$code" >> "$GITHUB_OUTPUT"
@@ -234,7 +235,6 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-
           {
             echo '# 🔎 Data-Free Row Diagnostics'
             echo
@@ -252,6 +252,10 @@ jobs:
             echo "| Requested | $(jq -r '.summary.requested_symbols' data_free_diagnostics.json) |"
             echo "| Verified fresh | $(jq -r '.summary.fresh_symbols' data_free_diagnostics.json) |"
             echo "| Decision blocked | $(jq -r '.summary.data_free_symbols' data_free_diagnostics.json) |"
+            echo "| Provider HTTP 402 rows | $(jq -r '.summary.provider_warning_counts.http_402_rows // 0' data_free_diagnostics.json) |"
+            echo "| Provider HTTP 404 rows | $(jq -r '.summary.provider_warning_counts.http_404_rows // 0' data_free_diagnostics.json) |"
+            echo "| Metadata conflicts | $(jq -r '.summary.metadata_conflict_rows // 0' data_free_diagnostics.json) |"
+            echo "| Invalid symbol shapes | $(jq -r '.summary.invalid_symbol_shape_rows // 0' data_free_diagnostics.json) |"
             echo "| Unclassified data-free | $(jq -r '.summary.unclassified_data_free' data_free_diagnostics.json) |"
             echo "| Evidence consistent | $(jq -r '.evidence_consistent' data_free_diagnostics.json) |"
             echo "| No workbook writes | $(jq -r '.no_workbook_writes' data_free_diagnostics.json) |"
@@ -274,7 +278,7 @@ jobs:
               "| \(.key) | \(.value) |"' \
               data_free_diagnostics.json
             echo
-            echo 'All affected rows are included in the JSON and CSV artifacts; no 100-row cap is applied.'
+            echo 'All affected rows and the complete decision-eligibility manifest are included in the artifacts.'
             echo
             echo "Diagnostic exit code: ${{ steps.diagnostic.outputs.diagnostic_exit || 'unknown' }}"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -287,6 +291,7 @@ jobs:
           path: |
             data_free_diagnostics.json
             data_free_rows.csv
+            decision_eligibility.csv
             data_free_diagnostic_stdout.json
             backend_ready.json
           retention-days: 30
@@ -297,6 +302,5 @@ jobs:
         run: |
           CREDS_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$RUNNER_TEMP/google_credentials.json}"
           if [[ -f "$CREDS_PATH" ]]; then
-            shred -u -z "$CREDS_PATH" 2>/dev/null ||
-            rm -f "$CREDS_PATH"
+            shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
           fi
