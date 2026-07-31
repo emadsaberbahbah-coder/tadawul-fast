@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'scripts/apply_benchmark_fail_closed.py'
+      - 'scripts/verify_backend_symbol_capabilities_sequential.py'
       - '.github/workflows/apply_benchmark_fail_closed.yml'
 
 permissions:
@@ -20,19 +21,34 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           persist-credentials: true
+
       - name: Apply fail-closed gate
         run: python scripts/apply_benchmark_fail_closed.py
-      - name: Validate workflow text
+
+      - name: Validate workflow text and probe wrapper
         run: |
+          set -euo pipefail
           grep -F "Concurrency escalation is blocked" .github/workflows/python_refresh_benchmark.yml
+          grep -F "verify_backend_symbol_capabilities_sequential.py" .github/workflows/python_refresh_benchmark.yml
+          grep -F -- "--timeout 120" .github/workflows/python_refresh_benchmark.yml
+          python -m py_compile \
+            scripts/apply_benchmark_fail_closed.py \
+            scripts/verify_backend_symbol_capabilities_sequential.py
           python - <<'PY'
           from pathlib import Path
           text = Path('.github/workflows/python_refresh_benchmark.yml').read_text()
           assert "exit 1" in text
           assert "exit 2" in text
+          assert "BENCH_CONCURRENCY: ${{ inputs.concurrency || '1' }}" in text
           PY
+
       - name: Commit gate correction
         run: |
+          set -euo pipefail
+          if git diff --quiet -- .github/workflows/python_refresh_benchmark.yml; then
+            echo 'Benchmark workflow already satisfies the required gate.'
+            exit 0
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .github/workflows/python_refresh_benchmark.yml
