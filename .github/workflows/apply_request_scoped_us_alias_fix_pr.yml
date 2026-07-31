@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'scripts/apply_request_scoped_us_alias_fix.py'
+      - 'scripts/repair_request_scoped_us_alias_transformer_source.py'
       - 'scripts/repair_request_scoped_us_alias_transform_output.py'
       - '.github/workflows/apply_request_scoped_us_alias_fix_pr.yml'
 
@@ -33,6 +34,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Preserve identity-firewall block in transformer
+        run: python scripts/repair_request_scoped_us_alias_transformer_source.py
+
       - name: Align assertion with current runner shape
         run: |
           python - <<'PY'
@@ -60,6 +64,7 @@ jobs:
         run: |
           python -m py_compile \
             scripts/apply_request_scoped_us_alias_fix.py \
+            scripts/repair_request_scoped_us_alias_transformer_source.py \
             scripts/repair_request_scoped_us_alias_transform_output.py \
             scripts/run_dashboard_sync.py \
             scripts/concurrent_batch_fetch.py \
@@ -82,6 +87,7 @@ jobs:
         run: |
           set -euo pipefail
           if git diff --quiet -- \
+            scripts/apply_request_scoped_us_alias_fix.py \
             scripts/run_dashboard_sync.py \
             scripts/concurrent_batch_fetch.py \
             tests/test_concurrent_batch_fetch.py \
@@ -92,6 +98,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add \
+            scripts/apply_request_scoped_us_alias_fix.py \
             scripts/run_dashboard_sync.py \
             scripts/concurrent_batch_fetch.py \
             tests/test_concurrent_batch_fetch.py \
