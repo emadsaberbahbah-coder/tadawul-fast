@@ -8,6 +8,10 @@ so no workbook cell is changed.
 
 Concurrency defaults to the exact sequential production path (1). A higher
 value must be supplied explicitly after the sequential deployment gate passes.
+For concurrency=1, this benchmark observes the unchanged production path and
+builds the acceptance telemetry externally; the runner's sequential rollback
+therefore remains behavior-identical while the gate still receives complete,
+verifiable per-symbol evidence.
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ from typing import Any, Sequence
 
 from scripts import run_dashboard_sync as sync
 
-BENCHMARK_VERSION = "1.2.1"
+BENCHMARK_VERSION = "1.3.0"
 
 
 class NoWriteSheets(sync.SheetsWriter):
@@ -86,6 +90,260 @@ def _metric_int(metrics: dict[str, Any], key: str) -> int | None:
         return None
 
 
+def _ordered_symbols(values: Sequence[Any]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        symbol = sync.canonicalize_symbol(raw)
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            ordered.append(symbol)
+    return ordered
+
+
+def _positive(value: Any) -> bool:
+    try:
+        parsed = float(str(value).replace(",", "").strip())
+    except Exception:
+        return False
+    return 0.0 < parsed < 1e15
+
+
+def _provider_error(value: Any) -> bool:
+    checker = getattr(sync, "_klg_provider_is_error", None)
+    if callable(checker):
+        try:
+            return bool(checker(value))
+        except Exception:
+            pass
+    normalized = "".join(
+        character
+        for character in str(value or "").strip().casefold()
+        if character.isalnum()
+    )
+    return (not normalized) or normalized in {
+        "fallbackerror",
+        "error",
+        "unavailable",
+        "none",
+        "placeholder",
+        "synthetic",
+        "stub",
+    }
+
+
+def _find_column(headers: Sequence[Any], attr: str, fallback: Sequence[str]) -> int:
+    aliases = getattr(sync, attr, frozenset(fallback))
+    return sync._guard_find_col(list(headers), aliases)
+
+
+def _row_good(headers: Sequence[Any], row: Sequence[Any]) -> bool:
+    symbol_index = _find_column(headers, "_GUARD_SYMBOL_ALIASES", ("symbol", "ticker"))
+    name_index = _find_column(headers, "_GUARD_NAME_ALIASES", ("name", "companyname"))
+    price_index = _find_column(
+        headers,
+        "_XPAGE_PRICE_ALIASES",
+        ("currentprice", "price", "lastprice"),
+    )
+    provider_index = _find_column(
+        headers,
+        "_KLG_PROVIDER_ALIASES",
+        ("dataprovider", "provider", "datasource"),
+    )
+    if symbol_index < 0 or symbol_index >= len(row):
+        return False
+    if sync._guard_is_blank(row[symbol_index]):
+        return False
+    if name_index >= 0 and (
+        name_index >= len(row) or sync._guard_is_blank(row[name_index])
+    ):
+        return False
+    if price_index >= 0 and (
+        price_index >= len(row) or not _positive(row[price_index])
+    ):
+        return False
+    if provider_index >= 0 and provider_index < len(row):
+        if _provider_error(row[provider_index]):
+            return False
+    return True
+
+
+class SequentialEvidenceCollector:
+    """Observe concurrency=1 without changing the production fetch algorithm.
+
+    The collector wraps only the benchmark process. It records the exact symbols
+    submitted to ``BackendClient.post_json`` and captures the raw batched matrix
+    returned before persistence/KEEP-LAST-GOOD can supplement it. No request,
+    response, retry, ordering, guard, or writer behavior is changed.
+    """
+
+    def __init__(self) -> None:
+        self.started = time.perf_counter()
+        self.requested_symbols: list[str] = []
+        self.headers: list[Any] = []
+        self.rows: list[list[Any]] = []
+        self.attempted_symbols: set[str] = set()
+        self.api_calls: list[dict[str, Any]] = []
+        self._backend: Any = None
+        self._original_post_json: Any = None
+        self._original_fetch: Any = None
+
+    def install(self, backend: Any) -> None:
+        self._backend = backend
+        self._original_post_json = backend.post_json
+        self._original_fetch = sync._fetch_market_rows_batched
+
+        async def tracked_post_json(endpoint: str, payload: dict[str, Any]):
+            raw_symbols = payload.get("symbols") or payload.get("tickers") or []
+            requested = _ordered_symbols(list(raw_symbols))
+            self.attempted_symbols.update(requested)
+            started = time.perf_counter()
+            data, error, code = await self._original_post_json(endpoint, payload)
+            self.api_calls.append(
+                {
+                    "endpoint": str(endpoint),
+                    "request_id": str(payload.get("request_id") or ""),
+                    "symbols": requested,
+                    "symbol_count": len(requested),
+                    "http_status": int(code or 0),
+                    "error": str(error or ""),
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000.0),
+                }
+            )
+            return data, error, code
+
+        async def tracked_fetch(*args: Any, **kwargs: Any):
+            output = await self._original_fetch(*args, **kwargs)
+            symbols = kwargs.get("symbols")
+            if symbols is None and len(args) > 2:
+                symbols = args[2]
+            headers, rows, _endpoint, _error = output
+            self.requested_symbols = _ordered_symbols(list(symbols or []))
+            self.headers = list(headers or [])
+            self.rows = [list(row) for row in (rows or []) if isinstance(row, (list, tuple))]
+            return output
+
+        backend.post_json = tracked_post_json
+        sync._fetch_market_rows_batched = tracked_fetch
+
+    def restore(self) -> None:
+        if self._backend is not None and self._original_post_json is not None:
+            self._backend.post_json = self._original_post_json
+        if self._original_fetch is not None:
+            sync._fetch_market_rows_batched = self._original_fetch
+
+    def _rows_by_symbol(self) -> dict[str, list[Any]]:
+        symbol_index = _find_column(
+            self.headers,
+            "_GUARD_SYMBOL_ALIASES",
+            ("symbol", "ticker"),
+        )
+        if symbol_index < 0:
+            return {}
+        builder = getattr(sync, "_build_request_symbol_index", None)
+        resolver = getattr(sync, "_resolve_requested_symbol", None)
+        request_index = (
+            builder(self.requested_symbols)
+            if callable(builder)
+            else ({symbol: symbol for symbol in self.requested_symbols}, {})
+        )
+        result: dict[str, list[Any]] = {}
+        for raw in self.rows:
+            if symbol_index >= len(raw) or sync._guard_is_blank(raw[symbol_index]):
+                continue
+            if callable(resolver):
+                symbol = resolver(raw[symbol_index], request_index=request_index)
+            else:
+                candidate = sync.canonicalize_symbol(raw[symbol_index])
+                symbol = candidate if candidate in request_index[0] else ""
+            if not symbol or symbol in result:
+                continue
+            row = list(raw)
+            row[symbol_index] = symbol
+            result[symbol] = row
+        return result
+
+    def metrics(self) -> dict[str, Any]:
+        if not self.requested_symbols or not self.headers:
+            return {}
+        rows_by_symbol = self._rows_by_symbol()
+        returned = [
+            symbol for symbol in self.requested_symbols if symbol in rows_by_symbol
+        ]
+        fresh = [
+            symbol
+            for symbol in returned
+            if _row_good(self.headers, rows_by_symbol[symbol])
+        ]
+        fresh_set = set(fresh)
+        data_free = [symbol for symbol in returned if symbol not in fresh_set]
+        returned_set = set(returned)
+        missing = [
+            symbol for symbol in self.requested_symbols if symbol not in returned_set
+        ]
+        attempted = [
+            symbol
+            for symbol in self.requested_symbols
+            if symbol in self.attempted_symbols
+        ]
+        attempted_set = set(attempted)
+        unattempted = [
+            symbol
+            for symbol in self.requested_symbols
+            if symbol not in attempted_set
+        ]
+        requested_count = len(self.requested_symbols)
+        returned_coverage = (
+            100.0 * len(returned) / requested_count if requested_count else 100.0
+        )
+        fresh_coverage = (
+            100.0 * len(fresh) / requested_count if requested_count else 100.0
+        )
+        request_ids = {
+            str(item.get("request_id") or "")
+            for item in self.api_calls
+            if str(item.get("request_id") or "")
+        }
+        http_429 = sum(item["http_status"] == 429 for item in self.api_calls)
+        http_5xx = sum(500 <= item["http_status"] < 600 for item in self.api_calls)
+        http_402 = sum(item["http_status"] == 402 for item in self.api_calls)
+        timeout_calls = sum(
+            "timeout" in str(item.get("error") or "").casefold()
+            for item in self.api_calls
+        )
+        return {
+            "version": BENCHMARK_VERSION,
+            "mode": "benchmark_observed_sequential",
+            "telemetry_source": "read_only_benchmark_wrapper",
+            "concurrency": 1,
+            "symbols_requested": requested_count,
+            "symbols_attempted": len(attempted),
+            "symbols_returned": len(returned),
+            "symbols_fresh": len(fresh),
+            "symbols_data_free": len(data_free),
+            "symbols_missing": len(missing),
+            "symbols_failed": len(data_free),
+            "symbols_unattempted": len(unattempted),
+            "data_free_symbols": data_free[:100],
+            "missing_symbols": missing[:100],
+            "unattempted_symbols": unattempted[:100],
+            "returned_coverage_pct": round(returned_coverage, 3),
+            "fresh_coverage_pct": round(fresh_coverage, 3),
+            "targeted_recovery_requested": 0,
+            "targeted_recovery_healed": 0,
+            "api_calls": len(self.api_calls),
+            "api_request_ids": len(request_ids),
+            "api_symbol_attempts": sum(
+                int(item.get("symbol_count") or 0) for item in self.api_calls
+            ),
+            "http_402": int(http_402),
+            "http_429": int(http_429),
+            "http_5xx": int(http_5xx),
+            "timeout_calls": int(timeout_calls),
+            "elapsed_ms": round((time.perf_counter() - self.started) * 1000.0),
+        }
+
+
 async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     _set_runtime_env(args)
     task = _task_for(args.page)
@@ -100,6 +358,9 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         token=sync._env_token(),
     )
     sheets = NoWriteSheets()
+    collector = SequentialEvidenceCollector() if int(args.concurrency) == 1 else None
+    if collector is not None:
+        collector.install(backend)
     started = time.perf_counter()
     try:
         sync._idfw_selftest_()
@@ -114,11 +375,18 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             sheets=sheets,
         )
     finally:
+        if collector is not None:
+            collector.restore()
         await backend.close()
 
     elapsed_ms = round((time.perf_counter() - started) * 1000.0)
     result_payload = result.to_dict()
     metrics = dict(result_payload.get("batch_metrics") or {})
+    if not metrics and collector is not None:
+        metrics = collector.metrics()
+        result.batch_metrics = dict(metrics)
+        result_payload = result.to_dict()
+
     requested = int(metrics.get("symbols_requested") or result.symbols_requested or 0)
     returned = _metric_int(metrics, "symbols_returned")
     fresh = _metric_int(metrics, "symbols_fresh")
@@ -172,7 +440,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     )
 
     payload: dict[str, Any] = {
-        "schema_version": "1.2",
+        "schema_version": "1.3",
         "benchmark_version": BENCHMARK_VERSION,
         "runner_version": sync.SCRIPT_VERSION,
         "mode": "read_live_fetch_no_write",
@@ -204,8 +472,10 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "targeted_recovery_requested": recovery_requested,
             "targeted_recovery_healed": recovery_healed,
             "unattempted_symbols": unattempted,
+            "http_402": _metric_int(metrics, "http_402"),
             "http_429": http_429,
             "http_5xx": http_5xx,
+            "timeout_calls": _metric_int(metrics, "timeout_calls"),
             "within_25_minutes": elapsed_ms <= 25 * 60 * 1000,
             "within_35_minutes": elapsed_ms <= 35 * 60 * 1000,
             "universe_preserved": universe_preserved,
