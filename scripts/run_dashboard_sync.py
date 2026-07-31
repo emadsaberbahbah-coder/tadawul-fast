@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.31.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.32.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1294,7 +1294,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.31.0"
+SCRIPT_VERSION = "6.32.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3831,53 +3831,113 @@ def _keep_last_good_rows(
     return rows_matrix, swapped
 
 
+
+_US_REQUEST_ALIAS_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,11}$")
+
+
+def _request_symbol_alternates(symbol: Any) -> List[str]:
+    """Return only the bare-US/.US spelling alternate for one request token.
+
+    This is deliberately request-scoped. It does not change the global symbol
+    canonicalizer and it never treats non-US exchange suffixes as equivalent.
+    """
+    canonical = canonicalize_symbol(symbol)
+    if not canonical:
+        return []
+    if canonical.endswith(".US"):
+        base = canonical[:-3]
+        return [base] if _US_REQUEST_ALIAS_RE.fullmatch(base) else []
+    if "." not in canonical and _US_REQUEST_ALIAS_RE.fullmatch(canonical):
+        return [f"{canonical}.US"]
+    return []
+
+
+def _build_request_symbol_index(
+    requested_symbols: Iterable[Any],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Build exact and unambiguous response-alias maps for one request only.
+
+    Exact requested spellings always win. An alternate spelling is accepted
+    only when it is not itself requested and maps to exactly one requested
+    symbol. Therefore requesting both AAPL and AAPL.US preserves both exact
+    identities and creates no cross-mapping.
+    """
+    exact: Dict[str, str] = {}
+    for raw in requested_symbols or []:
+        requested = canonicalize_symbol(raw)
+        if requested and requested not in exact:
+            exact[requested] = requested
+
+    aliases: Dict[str, str] = {}
+    collisions: set[str] = set()
+    for requested in exact:
+        for alternate in _request_symbol_alternates(requested):
+            if alternate in exact:
+                continue
+            previous = aliases.get(alternate)
+            if previous is not None and previous != requested:
+                collisions.add(alternate)
+            else:
+                aliases[alternate] = requested
+    for alternate in collisions:
+        aliases.pop(alternate, None)
+    return exact, aliases
+
+
+def _resolve_requested_symbol(
+    value: Any,
+    requested_symbols: Optional[Iterable[Any]] = None,
+    *,
+    request_index: Optional[Tuple[Dict[str, str], Dict[str, str]]] = None,
+) -> str:
+    """Resolve a returned symbol to the exact spelling requested in this call."""
+    exact, aliases = request_index or _build_request_symbol_index(
+        requested_symbols or []
+    )
+    returned = canonicalize_symbol(value)
+    if not returned:
+        return ""
+    if returned in exact:
+        return exact[returned]
+    return aliases.get(returned, "")
+
+
 def _filter_rows_to_requested(
     headers: List[Any],
     rows_matrix: List[List[Any]],
     requested_symbols: List[str],
 ) -> Tuple[List[List[Any]], List[str]]:
-    """v6.19.1: drop response rows whose Symbol is NOT in the requested set.
+    """Drop response rows outside the current request, preserving request spelling.
 
-    The backend can answer a requested-symbol fetch with EXTRA rows (its own
-    universe on top of the request). Writing them makes each foreign symbol a
-    requested symbol on the next run (the sheet is the symbol source) — the
-    749 -> 3,068 Global_Markets ratchet of 2026-07-02/03. This keeps only rows
-    carrying a requested symbol; the dropped (unique, normalized) symbols are
-    returned for the caller's [STRICT-MEMBERSHIP] warning.
+    Exact membership remains authoritative. The only accepted response alias is
+    the unambiguous bare-US/.US alternate for a symbol in this same request.
+    Accepted rows are rewritten to the requested spelling before persistence.
+    """
+    if not headers or not rows_matrix:
+        return rows_matrix, []
+    symbol_index = _guard_find_col(headers, _GUARD_SYMBOL_ALIASES)
+    if symbol_index < 0:
+        return rows_matrix, []
 
-    FAIL-SAFE: returns the matrix unchanged (and []) when headers, rows, or the
-    requested set are empty, or when the Symbol column cannot be located in the
-    NEW headers (shared alias logic). Rows with a BLANK symbol cell are KEPT
-    unchanged — this filter can drop only a row that positively identifies
-    itself as an unrequested symbol, never a structural row."""
-    if not headers or not rows_matrix or not requested_symbols:
-        return rows_matrix, []
-    sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
-    if sym_i < 0:
-        return rows_matrix, []
-    wanted: set = set()
-    for s in requested_symbols:
-        t = canonicalize_symbol(s)
-        if t:
-            wanted.add(t)
-    if not wanted:
-        return rows_matrix, []
-    kept_rows: List[List[Any]] = []
+    request_index = _build_request_symbol_index(requested_symbols)
+    kept: List[List[Any]] = []
     dropped: List[str] = []
-    dropped_seen: set = set()
-    for row in rows_matrix:
-        if not isinstance(row, list) or sym_i >= len(row) or _guard_is_blank(row[sym_i]):
-            kept_rows.append(row)
+    for raw in rows_matrix:
+        row = list(raw)
+        if symbol_index >= len(row) or _guard_is_blank(row[symbol_index]):
+            kept.append(row)
             continue
-        t = canonicalize_symbol(row[sym_i])
-        row[sym_i] = t
-        if t in wanted:
-            kept_rows.append(row)
-        else:
-            if t not in dropped_seen:
-                dropped_seen.add(t)
-                dropped.append(t)
-    return kept_rows, dropped
+        raw_symbol = canonicalize_symbol(row[symbol_index])
+        requested = _resolve_requested_symbol(
+            row[symbol_index], request_index=request_index
+        )
+        if not requested:
+            dropped.append(raw_symbol or str(row[symbol_index] or ""))
+            continue
+        row[symbol_index] = requested
+        kept.append(row)
+    return kept, dropped
+
 
 
 # -----------------------------------------------------------------------------
@@ -4914,19 +4974,20 @@ async def _fetch_market_rows_batched(
                     _idb_sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
             if b_matrix:
                 if _idb_on and _idb_sym_i >= 0:
-                    _batch_set = {canonicalize_symbol(t) for t in batch}
-                    _batch_set.discard("")
+                    _batch_index = _build_request_symbol_index(batch)
                     for _row in b_matrix:
                         if (not isinstance(_row, (list, tuple))
                                 or _idb_sym_i >= len(_row)
                                 or _guard_is_blank(_row[_idb_sym_i])):
                             _idb_blank += 1
                             continue
-                        _t = canonicalize_symbol(_row[_idb_sym_i])
-                        _row[_idb_sym_i] = _t
-                        if _t not in _batch_set:
+                        _t = _resolve_requested_symbol(
+                            _row[_idb_sym_i], request_index=_batch_index
+                        )
+                        if not _t:
                             _idb_bleed += 1
                             continue
+                        _row[_idb_sym_i] = _t
                         if _t in _idb_by_sym:
                             _idb_dupes += 1
                             continue
@@ -4990,19 +5051,20 @@ async def _fetch_market_rows_batched(
                     _idb_sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
             if b_matrix:
                 if _idb_on and _idb_sym_i >= 0:
-                    _batch_set = {canonicalize_symbol(t) for t in rbatch}
-                    _batch_set.discard("")
+                    _batch_index = _build_request_symbol_index(rbatch)
                     for _row in b_matrix:
                         if (not isinstance(_row, (list, tuple))
                                 or _idb_sym_i >= len(_row)
                                 or _guard_is_blank(_row[_idb_sym_i])):
                             _idb_blank += 1
                             continue
-                        _t = canonicalize_symbol(_row[_idb_sym_i])
-                        _row[_idb_sym_i] = _t
-                        if _t not in _batch_set:
+                        _t = _resolve_requested_symbol(
+                            _row[_idb_sym_i], request_index=_batch_index
+                        )
+                        if not _t:
                             _idb_bleed += 1
                             continue
+                        _row[_idb_sym_i] = _t
                         if _t in _idb_by_sym:
                             _idb_dupes += 1
                             continue

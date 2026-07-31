@@ -177,7 +177,7 @@ def _resolve_requested_symbol(
 '''
     text = regex_once(
         text,
-        r"^def _filter_rows_to_requested\(.*?(?=^def [A-Za-z_]\w*\()",
+        r"^def _filter_rows_to_requested\(.*?^    return kept_rows, dropped\n\n",
         filter_function,
         label="runner request membership function",
     )
@@ -186,7 +186,7 @@ def _resolve_requested_symbol(
         text,
         "_batch_set = {canonicalize_symbol(t) for t in batch}",
         "_batch_index = _build_request_symbol_index(batch)",
-        2,
+        1,
         label="sequential batch request indexes",
     )
 

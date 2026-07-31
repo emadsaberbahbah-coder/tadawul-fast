@@ -14,7 +14,7 @@ import statistics
 import time
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 _METRICS: dict[str, dict[str, Any]] = {}
 
 _RECOVERY_SUFFIX_VARIANTS: tuple[tuple[str, str], ...] = (
@@ -178,13 +178,42 @@ def build(
                 ordered.append(symbol)
         return ordered
 
+
+    def _request_index(
+        symbols: Sequence[str],
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        builder = getattr(sync, "_build_request_symbol_index", None)
+        if callable(builder):
+            return builder(symbols)
+        exact: dict[str, str] = {}
+        for raw in symbols:
+            requested = sync.canonicalize_symbol(raw)
+            if requested and requested not in exact:
+                exact[requested] = requested
+        return exact, {}
+
+    def _resolve(
+        value: Any,
+        symbols: Sequence[str],
+        *,
+        request_index: tuple[dict[str, str], dict[str, str]] | None = None,
+    ) -> str:
+        index = request_index or _request_index(symbols)
+        resolver = getattr(sync, "_resolve_requested_symbol", None)
+        if callable(resolver):
+            return resolver(value, request_index=index)
+        returned = sync.canonicalize_symbol(value)
+        return index[0].get(returned, "")
+
     def _rows_by_symbol(
         headers: Sequence[Any],
         rows: Sequence[Sequence[Any]],
+        symbols: Sequence[str],
     ) -> dict[str, list[Any]]:
         symbol_index = _column(headers, "_GUARD_SYMBOL_ALIASES", ("symbol", "ticker"))
         if symbol_index < 0:
             return {}
+        request_index = _request_index(symbols)
         result: dict[str, list[Any]] = {}
         for raw in rows:
             if (
@@ -194,11 +223,13 @@ def build(
             ):
                 continue
             row = list(raw)
-            symbol = sync.canonicalize_symbol(row[symbol_index])
-            if not symbol:
+            requested = _resolve(
+                row[symbol_index], symbols, request_index=request_index
+            )
+            if not requested:
                 continue
-            row[symbol_index] = symbol
-            result.setdefault(symbol, row)
+            row[symbol_index] = requested
+            result.setdefault(requested, row)
         return result
 
     def _classify(
@@ -207,9 +238,16 @@ def build(
         symbols: Sequence[str],
     ) -> tuple[dict[str, list[Any]], list[str], list[str], list[str]]:
         ordered = _requested_order(symbols)
-        mapping = _rows_by_symbol(headers, rows)
-        good = [symbol for symbol in ordered if symbol in mapping and _row_good(headers, mapping[symbol])]
-        data_free = [symbol for symbol in ordered if symbol in mapping and symbol not in set(good)]
+        mapping = _rows_by_symbol(headers, rows, symbols)
+        good_set = {
+            symbol
+            for symbol in ordered
+            if symbol in mapping and _row_good(headers, mapping[symbol])
+        }
+        good = [symbol for symbol in ordered if symbol in good_set]
+        data_free = [
+            symbol for symbol in ordered if symbol in mapping and symbol not in good_set
+        ]
         missing = [symbol for symbol in ordered if symbol not in mapping]
         return mapping, good, data_free, missing
 
@@ -453,8 +491,7 @@ def build(
         rows_by_symbol: dict[str, list[Any]] = {}
         bleed = duplicate = blank = 0
         for outcome in sorted(outcomes, key=lambda item: item["i"]):
-            requested = {sync.canonicalize_symbol(value) for value in outcome["b"]}
-            requested.discard("")
+            request_index = _request_index(outcome["b"])
             for raw in outcome.get("r", []):
                 if (
                     not isinstance(raw, (list, tuple))
@@ -464,11 +501,13 @@ def build(
                     blank += 1
                     continue
                 row = list(raw)
-                symbol = sync.canonicalize_symbol(row[symbol_index])
-                row[symbol_index] = symbol
-                if symbol not in requested:
+                symbol = _resolve(
+                    row[symbol_index], outcome["b"], request_index=request_index
+                )
+                if not symbol:
                     bleed += 1
                     continue
+                row[symbol_index] = symbol
                 if symbol in rows_by_symbol:
                     duplicate += 1
                     continue

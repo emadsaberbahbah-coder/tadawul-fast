@@ -159,6 +159,26 @@ class _Sheets:
 
 
 class CriticalIdentityProductionPathTests(unittest.IsolatedAsyncioTestCase):
+
+    def test_request_scoped_us_suffix_echoes_are_rewritten_to_requested_spelling(self):
+        requested = ["HNGE", "TT.US", "ADP", "ITW.US"]
+        rows = [
+            ["HNGE.US", "Hinge Health", "NYSE", "USD", "USA", 50.0, "", "eodhd"],
+            ["TT", "Trane Technologies", "NYSE", "USD", "USA", 400.0, "", "eodhd"],
+            ["ADP.US", "Automatic Data Processing", "NASDAQ", "USD", "USA", 300.0, "", "eodhd"],
+            ["ITW", "Illinois Tool Works", "NYSE", "USD", "USA", 250.0, "", "eodhd"],
+        ]
+        kept, dropped = rds._filter_rows_to_requested(
+            PRODUCTION_HEADERS, rows, requested
+        )
+        self.assertEqual(dropped, [])
+        self.assertEqual([row[0] for row in kept], requested)
+
+    def test_request_scoped_alias_does_not_merge_two_exact_requested_spellings(self):
+        index = rds._build_request_symbol_index(["AAPL", "AAPL.US"])
+        self.assertEqual(rds._resolve_requested_symbol("AAPL", request_index=index), "AAPL")
+        self.assertEqual(rds._resolve_requested_symbol("AAPL.US", request_index=index), "AAPL.US")
+
     async def test_batched_alias_responses_are_canonicalized(self):
         backend = _Backend(
             lambda payload: [
@@ -217,7 +237,7 @@ class CriticalIdentityProductionPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("FISV.US", result.error or "")
         self.assertEqual(result.rows_written, 0)
 
-    async def test_run_one_task_successful_write_still_fails_missing_fresh_proof(self):
+    async def test_run_one_task_preserves_last_good_but_fails_missing_fresh_proof(self):
         fresh_aapl = ["AAPL", "Apple Inc.", "NASDAQ", "USD", "USA", 200.0, "", "test"]
         old_fisv = ["FISV.US", "Fiserv, Inc.", "NASDAQ", "USD", "USA", 51.0, "", "eodhd"]
         sheets = _Sheets([PRODUCTION_HEADERS, fresh_aapl, old_fisv])
@@ -240,8 +260,14 @@ class CriticalIdentityProductionPathTests(unittest.IsolatedAsyncioTestCase):
                 task, "sheet", "A5", -1, False, False, backend, sheets
             )
 
-        self.assertEqual(len(sheets.writes), 1, "the write path must actually execute")
-        self.assertEqual([row[0] for row in sheets.writes[0][2]], ["AAPL", "FISV.US"])
+        self.assertEqual(len(sheets.writes), 1, "safe persistence may still land")
+        written_rows = sheets.writes[0][2]
+        self.assertEqual([row[0] for row in written_rows], ["AAPL", "FISV.US"])
+        self.assertEqual(
+            written_rows[1],
+            old_fisv,
+            "a missing fresh proof may preserve only the exact verified last-good row",
+        )
         self.assertEqual(result.rows_written, 2)
         self.assertEqual(result.status, "failed")
         self.assertIn("FISV.US", result.error or "")

@@ -28,12 +28,14 @@ class Backend:
         mismatch=(),
         omit_once=(),
         stub_once=(),
+        response_aliases=None,
     ):
         self.fail_once = set(fail_once)
         self.fail_always = set(fail_always)
         self.mismatch = set(mismatch)
         self.omit_once = set(omit_once)
         self.stub_once = set(stub_once)
+        self.response_aliases = dict(response_aliases or {})
         self.failed = set()
         self.omitted = set()
         self.stubbed = set()
@@ -55,7 +57,10 @@ class Backend:
                 return None, "temporary", 500
 
             headers = ["Symbol", "Name", "Current Price", "Data Provider"]
-            rows = [[symbol, symbol.lower(), 100.0, "mock"] for symbol in reversed(symbols)]
+            rows = [
+                [self.response_aliases.get(symbol, symbol), symbol.lower(), 100.0, "mock"]
+                for symbol in reversed(symbols)
+            ]
             if key in self.omit_once and key not in self.omitted:
                 self.omitted.add(key)
                 rows = [row for row in rows if row[0] != key]
@@ -110,6 +115,8 @@ def fake(size=1):
         _guard_is_blank=lambda value: value is None or str(value).strip() == "",
         _klg_provider_is_error=lambda value: normalize(value) in {"fallbackerror", "error"},
         canonicalize_symbol=lambda value: str(value).strip().upper(),
+        _build_request_symbol_index=production_sync._build_request_symbol_index,
+        _resolve_requested_symbol=production_sync._resolve_requested_symbol,
         _BATCH_IDENTITY_TAG="[ID]",
         logger=SimpleNamespace(
             info=lambda *args, **kwargs: None,
@@ -231,6 +238,38 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.batch_metrics["targeted_recovery_healed"], 1)
         self.assertEqual(result.batch_metrics["symbols_data_free"], 0)
         self.assertEqual(result.batch_metrics["fresh_coverage_pct"], 100.0)
+
+
+    async def test_request_scoped_us_suffix_echoes_map_back_to_requested_order(self):
+        fn = build(fake(size=2))
+        requested = ["HNGE", "TT.US", "ADP", "ITW.US"]
+        aliases = {
+            "HNGE": "HNGE.US",
+            "TT.US": "TT",
+            "ADP": "ADP.US",
+            "ITW.US": "ITW",
+        }
+        result = Result("us-suffix-echo")
+        with patch.dict(
+            os.environ,
+            {
+                "TFB_SYNC_BATCH_CONCURRENCY": "3",
+                "TFB_SYNC_BATCH_OUTER_RETRIES": "0",
+                "TFB_SYNC_TARGET_RECOVERY": "0",
+            },
+        ):
+            _, rows, _, _ = await fn(
+                Backend(response_aliases=aliases),
+                SimpleNamespace(sheet_name="Market_Leaders"),
+                requested,
+                {},
+                "analysis",
+                result,
+            )
+        self.assertEqual([row[0] for row in rows], requested)
+        self.assertEqual(result.batch_metrics["symbols_fresh"], 4)
+        self.assertEqual(result.batch_metrics["symbols_missing"], 0)
+        self.assertFalse(any("cross_batch=" in warning for warning in result.warnings))
 
     async def test_header_mismatch_is_not_merged(self):
         fn = build(fake())
