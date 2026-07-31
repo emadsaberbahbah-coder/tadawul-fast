@@ -7,8 +7,8 @@ identity firewall remains intact:
 
 1. orphan ``_batch_set.discard("")`` calls after the transformer replaces the
    corresponding set with a request index;
-2. a stale regression assertion that expected a Sheet write before a critical
-   identity proof failure; and
+2. a regression contract that must distinguish preserving an exact last-good
+   row from proving a fresh critical identity; and
 3. accidental deletion of the identity-tripwire constants/anchor registry.
 
 It does not change provider requests, symbol canonicalization, scoring,
@@ -107,10 +107,12 @@ def patch_critical_identity_test() -> None:
     old_name = (
         "test_run_one_task_successful_write_still_fails_missing_fresh_proof"
     )
-    new_name = "test_run_one_task_blocks_write_without_fresh_critical_proof"
+    new_name = (
+        "test_run_one_task_preserves_last_good_but_fails_missing_fresh_proof"
+    )
     if old_name in text:
         if text.count(old_name) != 1:
-            raise RuntimeError("stale critical-identity test name is not unique")
+            raise RuntimeError("critical-identity test name is not unique")
         text = text.replace(old_name, new_name, 1)
     elif text.count(new_name) != 1:
         raise RuntimeError("repaired critical-identity test name not found")
@@ -121,19 +123,22 @@ def patch_critical_identity_test() -> None:
         self.assertEqual(result.status, "failed")
         self.assertIn("FISV.US", result.error or "")
 '''
-    new_assertions = '''        self.assertEqual(
-            sheets.writes,
-            [],
-            "fresh critical identity proof must be established before any Sheet write",
+    new_assertions = '''        self.assertEqual(len(sheets.writes), 1, "safe persistence may still land")
+        written_rows = sheets.writes[0][2]
+        self.assertEqual([row[0] for row in written_rows], ["AAPL", "FISV.US"])
+        self.assertEqual(
+            written_rows[1],
+            old_fisv,
+            "a missing fresh proof may preserve only the exact verified last-good row",
         )
-        self.assertEqual(result.rows_written, 0)
+        self.assertEqual(result.rows_written, 2)
         self.assertEqual(result.status, "failed")
         self.assertIn("FISV.US", result.error or "")
 '''
     if old_assertions in text:
         text = text.replace(old_assertions, new_assertions, 1)
     elif new_assertions not in text:
-        raise RuntimeError("critical-identity no-write assertion block not found")
+        raise RuntimeError("critical-identity last-good assertion block not found")
 
     _write(path, text)
 
@@ -143,7 +148,7 @@ def main() -> None:
     patch_critical_identity_test()
     print(
         "request-scoped alias output repaired; identity firewall preserved; "
-        "critical identity failures remain no-write"
+        "last-good persistence cannot upgrade missing fresh identity proof"
     )
 
 
