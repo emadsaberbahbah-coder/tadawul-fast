@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Read-only diagnostic for every data-free row in the dashboard refresh.
+"""Read-only decision-eligibility diagnostic for dashboard refresh rows.
 
 This command executes the same sequential production fetch path used by
 ``scripts/benchmark_dashboard_fetch.py`` with the same in-memory Sheet sink.
 It does not change request ordering, retries, provider selection, scoring,
 ranking, portfolio logic, or Google Sheets data.
 
-The output explains *why* each returned row is not decision-eligible. Missing
-facts remain unknown; this tool never substitutes zero, stale data, or a
-synthetic recommendation.
+The report distinguishes three layers that were previously conflated:
+
+* transport health — GitHub's HTTP request to Render;
+* provider health — e.g. ``fetch_failed:HTTP 402`` embedded in a returned row;
+* decision eligibility — verified identity, venue metadata, name and price.
+
+Missing facts remain unknown. This tool never substitutes zero, stale data or a
+synthetic recommendation. All requested symbols are emitted in the eligibility
+manifest; data-free details are not capped at 100 rows.
 """
 from __future__ import annotations
 
@@ -16,6 +22,7 @@ import argparse
 import asyncio
 import csv
 import json
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -23,7 +30,52 @@ from typing import Any, Mapping, Sequence
 from scripts import benchmark_dashboard_fetch as benchmark
 from scripts import run_dashboard_sync as sync
 
-DIAGNOSTIC_VERSION = "1.0.0"
+DIAGNOSTIC_VERSION = "1.1.0"
+
+
+_MARKET_TRUTH: dict[str, tuple[str, str, str]] = {
+    ".AB": ("ADX", "AED", "United Arab Emirates"),
+    ".AD": ("ADX", "AED", "United Arab Emirates"),
+    ".ADX": ("ADX", "AED", "United Arab Emirates"),
+    ".PS": ("PSE", "PHP", "Philippines"),
+    ".PSE": ("PSE", "PHP", "Philippines"),
+    ".OM": ("MSX", "OMR", "Oman"),
+}
+_VALID_SR = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
+
+_PROVIDER_PATTERNS: dict[str, tuple[str, ...]] = {
+    "provider_http_402": (
+        "http 402",
+        "http_402",
+        "status 402",
+        "payment_required",
+        "plan_restricted",
+    ),
+    "provider_http_404": ("http 404", "http_404", "status 404"),
+    "provider_unhealthy_eodhd": ("provider_unhealthy:eodhd",),
+    "provider_timeout": ("provider_timeout", "fetch_timeout", "timed out", "timeout"),
+}
+
+_BLOCKING_REASONS = {
+    "missing_response_row",
+    "missing_symbol",
+    "missing_name",
+    "missing_price",
+    "nonpositive_or_invalid_price",
+    "missing_provider",
+    "provider_error_or_placeholder",
+    "identity_blocked_or_quarantined",
+    "provider_reported_unavailable",
+    "provider_http_402",
+    "provider_http_404",
+    "provider_unhealthy_eodhd",
+    "provider_timeout",
+    "metadata_exchange_conflict",
+    "metadata_currency_conflict",
+    "metadata_country_conflict",
+    "invalid_symbol_shape",
+    "unclassified_data_free",
+}
 
 
 def _text(value: Any) -> str:
@@ -109,10 +161,16 @@ def _column_map(headers: Sequence[Any]) -> dict[str, int]:
         "provider": _header_index(headers, ("Data Provider", "Provider", "Data Source")),
         "exchange": _header_index(headers, ("Exchange", "Market")),
         "currency": _header_index(headers, ("Currency",)),
+        "country": _header_index(headers, ("Country",)),
         "asset_class": _header_index(headers, ("Asset Class", "Asset Type")),
         "warnings": _header_index(headers, ("Warnings", "Warning")),
         "block_reason": _header_index(headers, ("Block Reason", "Blocked Reason")),
         "row_source": _header_index(headers, ("Row Source", "Source")),
+        "investability_status": _header_index(
+            headers,
+            ("Investability Status", "Investability"),
+        ),
+        "final_action": _header_index(headers, ("Final Action",)),
         "last_updated_utc": _header_index(headers, ("Last Updated (UTC)", "Last Updated UTC")),
         "last_updated_riyadh": _header_index(
             headers,
@@ -121,7 +179,97 @@ def _column_map(headers: Sequence[Any]) -> dict[str, int]:
     }
 
 
+def _diagnostic_text(row: Sequence[Any] | None, columns: Mapping[str, int]) -> str:
+    if row is None:
+        return ""
+    return " | ".join(
+        _text(_cell(row, columns[key])).casefold()
+        for key in ("warnings", "block_reason", "row_source")
+        if columns[key] >= 0
+    )
+
+
+def _provider_warning_codes(text: str) -> list[str]:
+    codes: list[str] = []
+    lowered = text.casefold()
+    for code, patterns in _PROVIDER_PATTERNS.items():
+        if any(pattern in lowered for pattern in patterns):
+            codes.append(code)
+    return codes
+
+
+def _expected_market(symbol: str) -> tuple[str, str, str] | None:
+    upper = _text(symbol).upper()
+    for suffix in sorted(_MARKET_TRUTH, key=len, reverse=True):
+        if upper.endswith(suffix):
+            return _MARKET_TRUTH[suffix]
+    if upper.endswith(".SR") and _VALID_SR.fullmatch(upper):
+        return ("Tadawul", "SAR", "Saudi Arabia")
+    return None
+
+
+def _exchange_matches(actual: str, expected: str) -> bool:
+    a = sync._guard_norm(actual)
+    e = sync._guard_norm(expected)
+    if not a:
+        return True
+    aliases = {
+        "adx": {"adx", "abudhabisecuritiesexchange", "dfmadx"},
+        "pse": {"pse", "philippinestockexchange"},
+        "msx": {"msx", "muscatstockexchange", "muscatsecuritiesmarket"},
+        "tadawul": {"tadawul", "saudiexchange"},
+    }
+    return a == e or a in aliases.get(e, set())
+
+
+def _country_matches(actual: str, expected: str) -> bool:
+    a = sync._guard_norm(actual)
+    e = sync._guard_norm(expected)
+    if not a:
+        return True
+    aliases = {
+        "unitedarabemirates": {"unitedarabemirates", "uae"},
+        "philippines": {"philippines", "philippine"},
+        "saudiarabia": {"saudiarabia", "ksa"},
+        "oman": {"oman"},
+    }
+    return a == e or a in aliases.get(e, set())
+
+
+def _metadata_reason_codes(
+    symbol: str,
+    row: Sequence[Any] | None,
+    columns: Mapping[str, int],
+) -> list[str]:
+    if row is None:
+        return []
+    upper = _text(symbol).upper()
+    if upper.endswith(".SR") and not _VALID_SR.fullmatch(upper):
+        return ["invalid_symbol_shape"]
+
+    expected = _expected_market(upper)
+    if expected is None:
+        return []
+    expected_exchange, expected_currency, expected_country = expected
+
+    actual_exchange = _text(_cell(row, columns["exchange"]))
+    actual_currency = _text(_cell(row, columns["currency"])).upper()
+    actual_country = _text(_cell(row, columns["country"]))
+
+    reasons: list[str] = []
+    if actual_exchange and not _exchange_matches(actual_exchange, expected_exchange):
+        reasons.append("metadata_exchange_conflict")
+    if actual_currency and actual_currency != expected_currency:
+        reasons.append("metadata_currency_conflict")
+    if actual_country and not _country_matches(actual_country, expected_country):
+        reasons.append("metadata_country_conflict")
+    if upper.endswith(".AB"):
+        reasons.append("legacy_symbol_alias")
+    return reasons
+
+
 def _reason_codes(
+    symbol: str,
     row: Sequence[Any] | None,
     columns: Mapping[str, int],
 ) -> list[str]:
@@ -129,12 +277,12 @@ def _reason_codes(
         return ["missing_response_row"]
 
     reasons: list[str] = []
-    symbol = _cell(row, columns["symbol"])
+    row_symbol = _cell(row, columns["symbol"])
     name = _cell(row, columns["name"])
     price = _cell(row, columns["price"])
     provider = _cell(row, columns["provider"])
 
-    if _is_blank(symbol):
+    if _is_blank(row_symbol):
         reasons.append("missing_symbol")
     if columns["name"] >= 0 and _is_blank(name):
         reasons.append("missing_name")
@@ -149,11 +297,7 @@ def _reason_codes(
         elif _provider_error(provider):
             reasons.append("provider_error_or_placeholder")
 
-    diagnostic_text = " | ".join(
-        _text(_cell(row, columns[key])).casefold()
-        for key in ("warnings", "block_reason", "row_source")
-        if columns[key] >= 0
-    )
+    diagnostic_text = _diagnostic_text(row, columns)
     if any(
         marker in diagnostic_text
         for marker in (
@@ -178,26 +322,96 @@ def _reason_codes(
     ):
         reasons.append("provider_reported_unavailable")
 
+    reasons.extend(_provider_warning_codes(diagnostic_text))
+    reasons.extend(_metadata_reason_codes(symbol, row, columns))
     return list(dict.fromkeys(reasons))
 
 
-def _availability_class(data_free: bool, reasons: Sequence[str]) -> str:
+def _availability_class(
+    *,
+    collector_data_free: bool,
+    decision_blocked: bool,
+    reasons: Sequence[str],
+) -> str:
     reason_set = set(reasons)
-    if not data_free:
+    if not decision_blocked:
         return "VERIFIED_FRESH"
+    if "invalid_symbol_shape" in reason_set:
+        return "INVALID_SYMBOL_SHAPE"
     if "missing_response_row" in reason_set:
         return "MISSING_RESPONSE_ROW"
     if "identity_blocked_or_quarantined" in reason_set:
         return "IDENTITY_BLOCKED"
     if reason_set.intersection(
         {
+            "provider_http_402",
+            "provider_http_404",
+            "provider_unhealthy_eodhd",
+            "provider_timeout",
             "missing_provider",
             "provider_error_or_placeholder",
             "provider_reported_unavailable",
         }
     ):
         return "PROVIDER_UNAVAILABLE_OR_ERROR"
-    return "MISSING_VERIFIED_FACTS"
+    if reason_set.intersection(
+        {
+            "metadata_exchange_conflict",
+            "metadata_currency_conflict",
+            "metadata_country_conflict",
+        }
+    ):
+        return "MARKET_METADATA_CONFLICT"
+    if collector_data_free:
+        return "MISSING_VERIFIED_FACTS"
+    return "DECISION_BLOCKED"
+
+
+def _build_record(
+    *,
+    symbol: str,
+    row: Sequence[Any] | None,
+    columns: Mapping[str, int],
+    collector_data_free: bool,
+    reasons: Sequence[str],
+) -> dict[str, Any]:
+    blocking = any(reason in _BLOCKING_REASONS for reason in reasons)
+    decision_blocked = collector_data_free or blocking
+    availability = _availability_class(
+        collector_data_free=collector_data_free,
+        decision_blocked=decision_blocked,
+        reasons=reasons,
+    )
+    expected = _expected_market(symbol)
+    return {
+        "symbol": symbol,
+        "symbol_bucket": _symbol_bucket(symbol),
+        "availability_class": availability,
+        "collector_data_free": collector_data_free,
+        "decision_eligible": not decision_blocked,
+        "reason_codes": list(reasons),
+        "expected_exchange": expected[0] if expected else "",
+        "expected_currency": expected[1] if expected else "",
+        "expected_country": expected[2] if expected else "",
+        "name": _text(_cell(row, columns["name"])),
+        "current_price": _cell(row, columns["price"]),
+        "data_provider": _text(_cell(row, columns["provider"])),
+        "exchange": _text(_cell(row, columns["exchange"])),
+        "currency": _text(_cell(row, columns["currency"])),
+        "country": _text(_cell(row, columns["country"])),
+        "asset_class": _text(_cell(row, columns["asset_class"])),
+        "investability_status": _text(
+            _cell(row, columns["investability_status"])
+        ),
+        "final_action": _text(_cell(row, columns["final_action"])),
+        "warnings": _text(_cell(row, columns["warnings"])),
+        "block_reason": _text(_cell(row, columns["block_reason"])),
+        "row_source": _text(_cell(row, columns["row_source"])),
+        "last_updated_utc": _text(_cell(row, columns["last_updated_utc"])),
+        "last_updated_riyadh": _text(
+            _cell(row, columns["last_updated_riyadh"])
+        ),
+    }
 
 
 def build_diagnostic_payload(
@@ -213,78 +427,106 @@ def build_diagnostic_payload(
     backend_url: str,
 ) -> dict[str, Any]:
     columns = _column_map(headers)
-    records: list[dict[str, Any]] = []
+    eligibility: list[dict[str, Any]] = []
+    data_free_records: list[dict[str, Any]] = []
     reason_counts: Counter[str] = Counter()
     class_counts: Counter[str] = Counter()
     suffix_counts: Counter[str] = Counter()
     reason_suffix_counts: Counter[str] = Counter()
+    provider_warning_counts: Counter[str] = Counter()
 
-    fresh_count = 0
+    collector_fresh_count = 0
+    metadata_conflict_rows = 0
+    invalid_symbol_shape_rows = 0
+
     for symbol in requested_symbols:
         row = rows_by_symbol.get(symbol)
-        data_free = row is None or not benchmark._row_good(headers, row)
-        reasons = _reason_codes(row, columns)
-        if data_free and not reasons:
+        collector_data_free = row is None or not benchmark._row_good(headers, row)
+        reasons = _reason_codes(symbol, row, columns)
+        if collector_data_free and not reasons:
             reasons = ["unclassified_data_free"]
-        availability = _availability_class(data_free, reasons)
-        suffix = _symbol_bucket(symbol)
 
-        if not data_free:
-            fresh_count += 1
-            continue
-
-        for reason in reasons:
-            reason_counts[reason] += 1
-            reason_suffix_counts[f"{reason}|{suffix}"] += 1
-        class_counts[availability] += 1
-        suffix_counts[suffix] += 1
-
-        records.append(
-            {
-                "symbol": symbol,
-                "symbol_bucket": suffix,
-                "availability_class": availability,
-                "decision_eligible": False,
-                "reason_codes": reasons,
-                "name": _text(_cell(row, columns["name"])),
-                "current_price": _cell(row, columns["price"]),
-                "data_provider": _text(_cell(row, columns["provider"])),
-                "exchange": _text(_cell(row, columns["exchange"])),
-                "currency": _text(_cell(row, columns["currency"])),
-                "asset_class": _text(_cell(row, columns["asset_class"])),
-                "warnings": _text(_cell(row, columns["warnings"])),
-                "block_reason": _text(_cell(row, columns["block_reason"])),
-                "row_source": _text(_cell(row, columns["row_source"])),
-                "last_updated_utc": _text(_cell(row, columns["last_updated_utc"])),
-                "last_updated_riyadh": _text(
-                    _cell(row, columns["last_updated_riyadh"])
-                ),
-            }
+        record = _build_record(
+            symbol=symbol,
+            row=row,
+            columns=columns,
+            collector_data_free=collector_data_free,
+            reasons=reasons,
         )
+        eligibility.append(record)
+
+        if collector_data_free:
+            data_free_records.append(record)
+        else:
+            collector_fresh_count += 1
+
+        if not record["decision_eligible"]:
+            class_counts[record["availability_class"]] += 1
+            suffix_counts[record["symbol_bucket"]] += 1
+            for reason in reasons:
+                reason_counts[reason] += 1
+                reason_suffix_counts[f"{reason}|{record['symbol_bucket']}"] += 1
+
+        provider_codes = set(_provider_warning_codes(_diagnostic_text(row, columns)))
+        for code in provider_codes:
+            provider_warning_counts[code] += 1
+
+        reason_set = set(reasons)
+        if reason_set.intersection(
+            {
+                "metadata_exchange_conflict",
+                "metadata_currency_conflict",
+                "metadata_country_conflict",
+            }
+        ):
+            metadata_conflict_rows += 1
+        if "invalid_symbol_shape" in reason_set:
+            invalid_symbol_shape_rows += 1
 
     expected_data_free = int(collector_metrics.get("symbols_data_free") or 0)
     evidence_consistent = (
-        len(records) == expected_data_free
-        and fresh_count == int(collector_metrics.get("symbols_fresh") or 0)
+        len(data_free_records) == expected_data_free
+        and collector_fresh_count == int(collector_metrics.get("symbols_fresh") or 0)
         and len(requested_symbols)
         == int(collector_metrics.get("symbols_requested") or 0)
+        and len(eligibility) == len(requested_symbols)
     )
 
+    decision_eligible_count = sum(
+        1 for record in eligibility if record["decision_eligible"]
+    )
+    provider_warning_summary = {
+        "http_402_rows": provider_warning_counts.get("provider_http_402", 0),
+        "http_404_rows": provider_warning_counts.get("provider_http_404", 0),
+        "provider_unhealthy_eodhd_rows": provider_warning_counts.get(
+            "provider_unhealthy_eodhd",
+            0,
+        ),
+        "timeout_rows": provider_warning_counts.get("provider_timeout", 0),
+    }
+
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "diagnostic_version": DIAGNOSTIC_VERSION,
-        "mode": "read_live_fetch_no_write_data_free_diagnostic",
+        "mode": "read_live_fetch_no_write_decision_eligibility",
         "page": page,
         "backend": backend_url,
         "no_workbook_writes": True,
         "evidence_consistent": evidence_consistent,
         "summary": {
             "requested_symbols": len(requested_symbols),
-            "fresh_symbols": fresh_count,
-            "data_free_symbols": len(records),
-            "decision_eligible_symbols": fresh_count,
-            "decision_blocked_symbols": len(records),
-            "unclassified_data_free": reason_counts.get("unclassified_data_free", 0),
+            "fresh_symbols": collector_fresh_count,
+            "data_free_symbols": len(data_free_records),
+            "decision_eligible_symbols": decision_eligible_count,
+            "decision_blocked_symbols": len(requested_symbols)
+            - decision_eligible_count,
+            "unclassified_data_free": reason_counts.get(
+                "unclassified_data_free",
+                0,
+            ),
+            "metadata_conflict_rows": metadata_conflict_rows,
+            "invalid_symbol_shape_rows": invalid_symbol_shape_rows,
+            "provider_warning_counts": provider_warning_summary,
             "reason_counts": dict(reason_counts.most_common()),
             "availability_class_counts": dict(class_counts.most_common()),
             "symbol_bucket_counts": dict(suffix_counts.most_common()),
@@ -294,47 +536,57 @@ def build_diagnostic_payload(
         "runner_result": dict(result_payload),
         "planned_writes": [dict(item) for item in planned_writes],
         "clear_requests": [dict(item) for item in clear_requests],
-        "data_free_rows": records,
+        "data_free_rows": data_free_records,
+        "decision_eligibility": eligibility,
     }
+
+
+_CSV_COLUMNS = [
+    "symbol",
+    "symbol_bucket",
+    "availability_class",
+    "collector_data_free",
+    "decision_eligible",
+    "reason_codes",
+    "expected_exchange",
+    "expected_currency",
+    "expected_country",
+    "name",
+    "current_price",
+    "data_provider",
+    "exchange",
+    "currency",
+    "country",
+    "asset_class",
+    "investability_status",
+    "final_action",
+    "warnings",
+    "block_reason",
+    "row_source",
+    "last_updated_utc",
+    "last_updated_riyadh",
+]
 
 
 def _write_csv(path: str, records: Sequence[Mapping[str, Any]]) -> None:
     if not path:
         return
-    columns = [
-        "symbol",
-        "symbol_bucket",
-        "availability_class",
-        "decision_eligible",
-        "reason_codes",
-        "name",
-        "current_price",
-        "data_provider",
-        "exchange",
-        "currency",
-        "asset_class",
-        "warnings",
-        "block_reason",
-        "row_source",
-        "last_updated_utc",
-        "last_updated_riyadh",
-    ]
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer = csv.DictWriter(handle, fieldnames=_CSV_COLUMNS)
         writer.writeheader()
         for record in records:
             row = dict(record)
             row["reason_codes"] = ";".join(record.get("reason_codes") or [])
-            writer.writerow({key: row.get(key, "") for key in columns})
+            writer.writerow({key: row.get(key, "") for key in _CSV_COLUMNS})
 
 
 async def run_diagnostic(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     if int(args.concurrency) != 1:
         raise ValueError(
-            "data-free diagnostics must run on the accepted sequential baseline "
-            "with --concurrency 1"
+            "decision-eligibility diagnostics must run on the accepted "
+            "sequential baseline with --concurrency 1"
         )
 
     benchmark._set_runtime_env(args)
@@ -373,12 +625,10 @@ async def run_diagnostic(args: argparse.Namespace) -> tuple[int, dict[str, Any]]
         raise RuntimeError("runner returned no TaskResult")
 
     collector_metrics = collector.metrics()
-    rows_by_symbol = collector._rows_by_symbol()
-    requested_symbols = list(collector.requested_symbols)
     payload = build_diagnostic_payload(
         headers=collector.headers,
-        requested_symbols=requested_symbols,
-        rows_by_symbol=rows_by_symbol,
+        requested_symbols=list(collector.requested_symbols),
+        rows_by_symbol=collector._rows_by_symbol(),
         collector_metrics=collector_metrics,
         result_payload=result.to_dict(),
         planned_writes=sheets.planned_writes,
@@ -407,6 +657,10 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--time-budget", type=int, default=2100)
     parser.add_argument("--json-out", default="data_free_diagnostics.json")
     parser.add_argument("--csv-out", default="data_free_rows.csv")
+    parser.add_argument(
+        "--eligibility-csv-out",
+        default="decision_eligibility.csv",
+    )
     return parser
 
 
@@ -415,7 +669,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         code, payload = asyncio.run(run_diagnostic(args))
     except Exception as exc:
-        print(f"::error::DATA_FREE_DIAGNOSTIC_FAILED: {type(exc).__name__}: {exc}")
+        print(
+            f"::error::DATA_FREE_DIAGNOSTIC_FAILED: "
+            f"{type(exc).__name__}: {exc}"
+        )
         return 3
 
     rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -425,6 +682,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(rendered + "\n", encoding="utf-8")
     _write_csv(args.csv_out, payload.get("data_free_rows") or [])
+    _write_csv(
+        args.eligibility_csv_out,
+        payload.get("decision_eligibility") or [],
+    )
     return code
 
 
