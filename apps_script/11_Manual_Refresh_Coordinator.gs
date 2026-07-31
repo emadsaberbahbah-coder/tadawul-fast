@@ -1,4 +1,4 @@
-// TADAWUL FAST BRIDGE — MANUAL REFRESH PRIORITY COORDINATOR v1.0.0
+// TADAWUL FAST BRIDGE — MANUAL REFRESH PRIORITY COORDINATOR v1.0.1
 //
 // Purpose
 // -------
@@ -7,17 +7,19 @@
 //
 // IMPORTANT: Google Apps Script cannot forcibly kill an execution that is already
 // running. The safe design is cooperative:
-//   1) manual refresh records a pause request immediately;
+//   1) the manual handler is validated before a pause request is recorded;
 //   2) automatic refresh checks the request at startup and between safe page/batch
 //      boundaries, then exits cleanly;
 //   3) manual refresh acquires the ScriptLock and runs alone;
-//   4) the pause is cleared in finally and automation continues on its next trigger
-//      (or via one configured, deduplicated one-shot resume trigger).
+//   4) the pause is cleared in an isolated finally cleanup before any fallible
+//      trigger cleanup or automatic-resume scheduling;
+//   5) automation continues on its next trigger or one configured, deduplicated
+//      one-shot resume trigger.
 //
 // This file is inert until the existing manual and automatic entrypoints call the
 // wrapper functions documented in docs/MANUAL_REFRESH_PRIORITY_V1.md.
 
-var TFB_REFRESH_COORDINATOR_VERSION = '1.0.0';
+var TFB_REFRESH_COORDINATOR_VERSION = '1.0.1';
 
 var TFB_REFRESH_COORDINATOR_ = Object.freeze({
   PROP_MANUAL_UNTIL_MS: 'TFB_MANUAL_REFRESH_UNTIL_MS',
@@ -210,6 +212,13 @@ function tfbConfiguredFunction_(propertyName, forbiddenName) {
   return {name: handlerName, fn: fn};
 }
 
+function tfbConfiguredManualHandler_() {
+  return tfbConfiguredFunction_(
+    TFB_REFRESH_COORDINATOR_.PROP_MANUAL_HANDLER,
+    'tfbManualRefresh'
+  );
+}
+
 function tfbToast_(message, title, seconds) {
   try {
     SpreadsheetApp.getActiveSpreadsheet().toast(
@@ -306,15 +315,32 @@ function tfbScheduleAutomaticResume_() {
   return scheduled;
 }
 
-function tfbExecuteManualHandler_(sourceLabel) {
-  var configured = tfbConfiguredFunction_(
-    TFB_REFRESH_COORDINATOR_.PROP_MANUAL_HANDLER,
-    'tfbManualRefresh'
+function tfbLogCleanupFailure_(step, err) {
+  console.error(
+    '[REFRESH-COORDINATOR] cleanup step failed: ' +
+    String(step || 'unknown') + ' | ' + String(err && err.stack || err)
   );
+}
+
+function tfbExecuteManualHandler_(sourceLabel, configured) {
+  // Public entrypoints resolve this before setting the pause. The fallback keeps
+  // direct internal/test calls valid and still occurs before this function sets
+  // or extends any pause state.
+  configured = configured || tfbConfiguredManualHandler_();
   var lock = LockService.getScriptLock();
 
   if (!lock.tryLock(TFB_REFRESH_COORDINATOR_.MANUAL_LOCK_WAIT_MS)) {
-    tfbScheduleDeferredManual_();
+    try {
+      tfbScheduleDeferredManual_();
+    } catch (scheduleErr) {
+      // A manual request that cannot be queued must not leave automation paused.
+      try {
+        tfbClearManualPause_('deferred-schedule-failed');
+      } catch (clearErr) {
+        tfbLogCleanupFailure_('clear-after-deferred-schedule-failure', clearErr);
+      }
+      throw scheduleErr;
+    }
     tfbToast_(
       'Automatic refresh is finishing a safe step. Manual refresh has been queued.',
       'Manual refresh queued',
@@ -339,10 +365,29 @@ function tfbExecuteManualHandler_(sourceLabel) {
     tfbToast_('Manual refresh failed: ' + err, 'Refresh error', 10);
     throw err;
   } finally {
-    lock.releaseLock();
-    tfbRemoveOwnDeferredTrigger_();
-    tfbClearManualPause_('manual-finally');
-    tfbScheduleAutomaticResume_();
+    // Every cleanup step is isolated. Most importantly, pause clearing runs
+    // before trigger enumeration/deletion, so trigger cleanup failure cannot
+    // keep automatic refresh suppressed until TTL expiry.
+    try {
+      lock.releaseLock();
+    } catch (releaseErr) {
+      tfbLogCleanupFailure_('release-lock', releaseErr);
+    }
+    try {
+      tfbClearManualPause_('manual-finally');
+    } catch (clearErr) {
+      tfbLogCleanupFailure_('clear-manual-pause', clearErr);
+    }
+    try {
+      tfbRemoveOwnDeferredTrigger_();
+    } catch (triggerErr) {
+      tfbLogCleanupFailure_('remove-deferred-trigger', triggerErr);
+    }
+    try {
+      tfbScheduleAutomaticResume_();
+    } catch (resumeErr) {
+      tfbLogCleanupFailure_('schedule-automatic-resume', resumeErr);
+    }
   }
 }
 
@@ -351,14 +396,19 @@ function tfbExecuteManualHandler_(sourceLabel) {
  * the existing core refresh function (for example refreshAllDataCore_).
  */
 function tfbManualRefresh() {
+  // Resolve before setting the pause: invalid/missing configuration cannot leave
+  // automatic refresh suppressed for the full TTL.
+  var configured = tfbConfiguredManualHandler_();
   tfbRequestManualPause_('menu-request');
-  return tfbExecuteManualHandler_('menu');
+  return tfbExecuteManualHandler_('menu', configured);
 }
 
 /** One-shot retry used only when an automatic run still held the ScriptLock. */
 function tfbManualRefreshDeferred_() {
+  // The deferred trigger can outlive a configuration change. Validate first.
+  var configured = tfbConfiguredManualHandler_();
   tfbRequestManualPause_('deferred-request');
-  return tfbExecuteManualHandler_('deferred');
+  return tfbExecuteManualHandler_('deferred', configured);
 }
 
 /** Read-only diagnostic callable from the Apps Script editor. */
@@ -384,7 +434,14 @@ function tfbManualRefreshStatus() {
 
 /** Emergency owner control: clears only this coordinator's pause state. */
 function tfbClearStaleManualRefreshPause() {
-  tfbRemoveOwnDeferredTrigger_();
-  tfbClearManualPause_('owner-emergency-clear');
+  try {
+    tfbClearManualPause_('owner-emergency-clear');
+  } finally {
+    try {
+      tfbRemoveOwnDeferredTrigger_();
+    } catch (err) {
+      tfbLogCleanupFailure_('emergency-remove-deferred-trigger', err);
+    }
+  }
   tfbToast_('Manual refresh pause cleared. Automatic refresh may continue.', 'Refresh control', 6);
 }
