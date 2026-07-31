@@ -8,9 +8,11 @@ The live 1,000-symbol diagnostic proved two separate integrity failures:
   ``NASDAQ/NYSE`` / ``USD`` by the engine's generic suffix fallback.
 
 This module fixes only deterministic instrument identity metadata. It never
-creates a price, score, rank, forecast or recommendation. Any contradictory
-venue/currency row is allowed to flow through the existing identity guard,
-which removes untrusted facts and blocks the decision rather than guessing.
+creates a price, score, rank, forecast or recommendation. Contradictory venue
+metadata is corrected *before* the existing identity guard runs, explicitly
+blocked, and disclosed in ``warnings``. Pre-correction prevents the guard's
+25% blast-radius refusal from turning a broad deterministic metadata defect
+into an unguarded page.
 
 Installed from :mod:`core.symbols.__init__` so direct imports such as
 ``from core.symbols.normalize import to_yahoo_symbol`` receive the patched
@@ -22,7 +24,7 @@ import re
 from functools import lru_cache
 from typing import Any, Dict, Mapping, MutableMapping, Optional, Tuple
 
-PATCH_VERSION = "1.0.0"
+PATCH_VERSION = "1.0.1"
 __version__ = PATCH_VERSION
 
 _INSTALLED = False
@@ -91,14 +93,6 @@ def _correct_market_metadata(row: MutableMapping[str, Any]) -> bool:
     # not inherit SAR/Tadawul merely because it ends with .SR. Keep the symbol
     # visible for operator repair, clear false venue facts and block decisions.
     if symbol.endswith(".SR") and not _VALID_SR.fullmatch(symbol):
-        changed = any(
-            _text(_get(row, canonical, display))
-            for canonical, display in (
-                ("exchange", "Exchange"),
-                ("currency", "Currency"),
-                ("country", "Country"),
-            )
-        )
         _set(row, "exchange", "Exchange", "")
         _set(row, "currency", "Currency", "")
         _set(row, "country", "Country", "")
@@ -109,7 +103,7 @@ def _correct_market_metadata(row: MutableMapping[str, Any]) -> bool:
             "Invalid .SR symbol shape: Tadawul identifiers must be numeric",
         )
         _append_warning(row, "invalid_symbol_shape:non_numeric_sr")
-        return True or changed
+        return True
 
     truth = _suffix_truth(symbol)
     if truth is None:
@@ -136,9 +130,6 @@ def _correct_market_metadata(row: MutableMapping[str, Any]) -> bool:
         _append_warning(row, "legacy_symbol_alias:.AB->Yahoo.AD/EODHD.ADX")
 
     if conflicts:
-        # A conflicting venue/currency is an identity problem. The existing
-        # guard normally quarantines the price before this post-pass; this
-        # explicit block is a second independent fail-safe.
         _set(row, "investability_status", "Investability Status", "BLOCKED")
         _set(row, "final_action", "Final Action", "DO_NOT_INVEST")
         _append_block_reason(
@@ -267,15 +258,31 @@ def _patch_identity_guard() -> None:
         *,
         run_dedup: bool = True,
     ) -> Any:
-        plan = original_guard(rows, sheet=sheet, run_dedup=run_dedup)
-        corrected = []
+        prepared = []
         invalid_symbols = []
-        for raw in plan.rows:
+        for raw in rows or []:
+            if not isinstance(raw, Mapping):
+                prepared.append(raw)
+                continue
             row = dict(raw)
             symbol = _text(_get(row, "symbol", "Symbol")).upper()
             _correct_market_metadata(row)
             if symbol.endswith(".SR") and not _VALID_SR.fullmatch(symbol):
                 invalid_symbols.append(symbol)
+            prepared.append(row)
+
+        # Run the existing identity and duplicate controls on metadata that is
+        # already internally coherent. The explicit block/warning remains on
+        # every row that arrived with a conflict.
+        plan = original_guard(prepared, sheet=sheet, run_dedup=run_dedup)
+
+        corrected = []
+        for raw in plan.rows:
+            if not isinstance(raw, Mapping):
+                corrected.append(raw)
+                continue
+            row = dict(raw)
+            _correct_market_metadata(row)
             corrected.append(row)
         plan.rows = corrected
 
