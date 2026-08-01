@@ -1,8 +1,7 @@
 """Shared initialization for repository scripts.
 
-Only the sync-integrity installer is started here. It is network-idle, performs
-no workbook writes, and patches nothing unless ``run_dashboard_sync`` is loaded
-in the same process.
+The installers started here are network-idle, perform no workbook writes, and
+patch nothing unless ``run_dashboard_sync`` is loaded in the same process.
 """
 from __future__ import annotations
 
@@ -17,6 +16,19 @@ try:
 except Exception as exc:  # pragma: no cover - startup resilience boundary
     _log.warning(
         "scripts sync-integrity installer unavailable (%s: %s)",
+        exc.__class__.__name__,
+        exc,
+    )
+
+try:
+    from scripts.klg_identity_gate_v131 import (
+        start_deferred_install as start_klg_identity_install,
+    )
+
+    start_klg_identity_install()
+except Exception as exc:  # pragma: no cover - startup resilience boundary
+    _log.warning(
+        "KEEP-LAST-GOOD identity installer unavailable (%s: %s)",
         exc.__class__.__name__,
         exc,
     )
