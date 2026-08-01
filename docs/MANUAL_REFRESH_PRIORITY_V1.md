@@ -34,7 +34,7 @@ The coordinator is inert until the existing bound Apps Script entrypoints call i
 The repository currently does not contain the live bound Apps Script sources, so
 this PR cannot by itself change the Google Sheet menu or triggers.
 
-### Coordinator locking model — v1.0.2
+### Coordinator locking and lease model — v1.1.0
 
 Two independent lock domains are used deliberately:
 
@@ -58,15 +58,35 @@ observe “no trigger” and create duplicate one-shot triggers.
 Copy `apps_script/11_Manual_Refresh_Coordinator.gs` into the spreadsheet's bound
 Apps Script project.
 
-### 2. Preserve the existing manual refresh body
+### 2. Make the manual handler checkpoint-capable
 
-Rename the current manual refresh body to a private core function. Example:
+Rename the current manual refresh body to a private core function and accept the
+owner-bound lease context supplied by the coordinator. JavaScript functions that
+ignore the extra argument remain compatible, but an hours-long refresh must either:
+
+- call `lease.renew(label)` only after a completed write, verification, and saved
+  checkpoint; or
+- return the canonical persisted-partial shape shown below so the coordinator
+  renews the lease and queues its owned one-shot continuation.
 
 ```javascript
-function refreshAllDataCore_() {
-  // Existing manual-refresh body, unchanged.
+function refreshAllDataCore_(lease) {
+  var result = refreshPageInBatchesCore_(/* existing arguments */);
+
+  // The canonical batch helper returns this only after the batch is written,
+  // verified, and checkpointed. Return it unchanged to activate continuation.
+  if (result && result.partial === true && result.paused === true) {
+    return result; // includes nextIndex and totalSymbols
+  }
+
+  // A custom multi-step loop may instead renew at its own proven safe boundary:
+  // lease.renew('after-persisted-batch:' + completedBatchNumber);
+  return result;
 }
 ```
+
+Do not renew after clearing a page and before completing its write. Do not return
+`partial/paused` before the resume cursor or checkpoint has been saved.
 
 Set this Script Property:
 
@@ -134,12 +154,23 @@ Never yield:
 - before saving the resume cursor;
 - while manual operator values are temporarily staged.
 
-### 5. Automatic continuation after manual refresh
+### 5. Manual continuation and automatic resume
 
-Normal time-driven triggers remain installed. They fire as usual but skip while
-the manual pause is active. When the owned manual request finishes, its pause is
-cleared in isolated `finally` cleanup, so the next scheduled trigger continues
-automatically.
+When the configured manual handler returns a persisted partial result containing
+`partial=true` or `paused=true` plus valid `nextIndex < totalSymbols`, the
+coordinator:
+
+1. renews the same request-owned idle lease;
+2. queues one coordinator-owned `tfbManualRefreshDeferred_` trigger;
+3. retains the pause through cleanup;
+4. consumes that exact trigger ID before the next batch; and
+5. stops rather than reviving the request if the lease expired or hit its hard
+   ceiling.
+
+Normal time-driven automatic triggers remain installed. They fire as usual but
+skip while the manual pause is active. When the manual refresh finally completes,
+its pause is cleared in isolated `finally` cleanup, so the next scheduled trigger
+continues automatically.
 
 Optionally set:
 
@@ -169,7 +200,9 @@ ID persistence, and deletion are serialized by the coordinator `DocumentLock`.
 - If an automatic run still owns `ScriptLock`, manual refresh waits up to 25
   seconds and then queues one deferred attempt.
 - Simultaneous queue attempts share one atomically created deferred trigger.
-- The pause has a 20-minute TTL, so an abandoned request self-expires.
+- The pause is a renewable 20-minute idle lease, capped at six hours from the
+  immutable original request time; an abandoned or stuck request therefore
+  self-expires and cannot be renewed forever.
 - Expiry cleanup uses compare-and-delete: it clears only the exact stored expiry
   value and request ID that were read as stale.
 - Final cleanup clears only the request ID owned by the finishing execution.
@@ -194,10 +227,15 @@ ID persistence, and deletion are serialized by the coordinator `DocumentLock`.
    active.
 7. Deferred-trigger enumeration or deletion throws: pause clearing has already run
    and automation is not suppressed until TTL expiry.
-8. Automatic trigger fires during manual: it records
+8. Checkpoint continuation: a handler returns a persisted partial result,
+   the lease is renewed, exactly one owned continuation trigger is queued, the
+   next invocation resumes, and final completion clears the owned pause.
+9. Expired continuation: after idle expiry or the six-hour ceiling, the deferred
+   trigger does not create a new request and performs no write.
+10. Automatic trigger fires during manual: it records
    `skipped_manual_priority` and performs no write.
-9. No clear-without-write state under forced yield testing.
-10. Existing trigger count is unchanged except for one temporary
+11. No clear-without-write state under forced yield testing.
+12. Existing trigger count is unchanged except for one temporary
     coordinator-owned deferred trigger when needed.
 
 ## Production acceptance

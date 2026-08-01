@@ -45,10 +45,217 @@ function tfbScheduleDeferredManual_() {var scheduled=tfbWithCoordinatorLock_('sc
 function tfbRemoveOwnDeferredTrigger_() {var removed=tfbWithCoordinatorLock_('remove-deferred-manual',function(){var props=tfbScriptProperties_();var expectedId=props.getProperty(TFB_REFRESH_COORDINATOR_.PROP_DEFERRED_TRIGGER_ID)||'';if(!expectedId){return false;}var triggers=ScriptApp.getProjectTriggers();for(var i=0;i<triggers.length;i++){if(triggers[i].getUniqueId() === expectedId){ScriptApp.deleteTrigger(triggers[i]);break;}}props.deleteProperty(TFB_REFRESH_COORDINATOR_.PROP_DEFERRED_TRIGGER_ID);return true;});return removed;}
 function tfbScheduleAutomaticResume_() {var handlerName=String(tfbScriptProperties_().getProperty(TFB_REFRESH_COORDINATOR_.PROP_AUTO_RESUME_HANDLER)||'').trim();if(!handlerName){tfbRecordRefreshEvent_('automatic-resume-next-schedule','no one-shot handler');return{created: false,reason:'next_scheduled_trigger'};}if(handlerName==='tfbManualRefresh'||handlerName==='tfbManualRefreshDeferred_'){throw new Error('Invalid automatic resume handler: '+handlerName);}var scheduled=tfbWithCoordinatorLock_('schedule-automatic-resume',function(){return tfbEnsureOneShotTrigger_(handlerName,TFB_REFRESH_COORDINATOR_.AUTO_RESUME_DELAY_MS);});tfbRecordRefreshEvent_('automatic-resume-scheduled','handler='+handlerName+' created='+scheduled.created);return scheduled;}
 function tfbLogCleanupFailure_(step, err) {console.error('[REFRESH-COORDINATOR] cleanup step failed: '+String(step||'unknown')+' | '+String(err&&err.stack||err));}
-function tfbManualLeaseContext_(requestId) {var ownedId=String(requestId||'');return{requestId:ownedId,renew:function(boundaryLabel){var outcome=tfbRenewManualPause_(ownedId);tfbRecordRefreshEvent_(outcome&&outcome.renewed?'manual-handler-boundary-renewed':'manual-handler-boundary-renewal-failed','boundary='+String(boundaryLabel||'')+' requestId='+ownedId+' status='+String(outcome&&outcome.status||'unknown'));return outcome;}};}
-function tfbManualHandlerNeedsContinuation_(result) {if(!result||typeof result!=='object')return false;var nextIndex=Number(result.nextIndex);var totalSymbols=Number(result.totalSymbols);if(!isFinite(nextIndex)||!isFinite(totalSymbols))return false;if(nextIndex<0||totalSymbols<=0||nextIndex>=totalSymbols)return false;return result.partial===true||result.paused===true;}
-function tfbExecuteManualHandler_(sourceLabel, configured, requestId) {configured=configured||tfbConfiguredManualHandler_();requestId=String(requestId||tfbNewManualRequestId_());var lock=LockService.getScriptLock();if(!lock.tryLock(TFB_REFRESH_COORDINATOR_.MANUAL_LOCK_WAIT_MS)){try{tfbScheduleDeferredManual_();}catch(scheduleErr){try{tfbClearManualPause_('deferred-schedule-failed', requestId, false);}catch(clearErr){tfbLogCleanupFailure_('clear-after-deferred-schedule-failure',clearErr);}throw scheduleErr;}tfbToast_('Automatic refresh is finishing a safe step. Manual refresh has been queued.','Manual refresh queued',8);return{status:'queued',handler:configured.name,requestId:requestId};}var pauseCleared=false;var keepPauseForContinuation=false;try{var latestPause=tfbReadManualPause_();if(latestPause.active&&latestPause.requestId){requestId=latestPause.requestId;}tfbExtendManualPause_(String(sourceLabel||'manual')+':running',requestId);tfbRecordRefreshEvent_('manual-started',configured.name+' requestId='+requestId);tfbToast_('Automatic refresh paused. Manual refresh started.','Manual refresh',5);var leaseContext=tfbManualLeaseContext_(requestId);var result=configured.fn(leaseContext);SpreadsheetApp.flush();if(tfbManualHandlerNeedsContinuation_(result)){var renewal=leaseContext.renew('handler-checkpoint:'+String(result.nextIndex)+'/'+String(result.totalSymbols));if(!renewal||renewal.renewed!==true){throw new Error('Manual refresh checkpoint was saved but lease renewal failed: '+String(renewal&&renewal.status||'unknown'));}var continuation=tfbScheduleDeferredManual_();keepPauseForContinuation=true;tfbRecordRefreshEvent_('manual-continuation-queued','handler='+configured.name+' requestId='+requestId+' progress='+String(result.nextIndex)+'/'+String(result.totalSymbols)+' triggerId='+String(continuation.triggerId||''));tfbToast_('Checkpoint saved at '+String(result.nextIndex)+' / '+String(result.totalSymbols)+'. Continuation queued.','Manual refresh continuing',8);var continuationResult={};for(var resultKey in result){if(Object.prototype.hasOwnProperty.call(result,resultKey)){continuationResult[resultKey]=result[resultKey];}}continuationResult.coordinatorStatus='queued_continuation';continuationResult.handler=configured.name;continuationResult.requestId=requestId;continuationResult.renewal=renewal;continuationResult.continuation=continuation;return continuationResult;}tfbRecordRefreshEvent_('manual-finished',configured.name+' requestId='+requestId);tfbToast_('Manual refresh completed. Automatic refresh resumed.','Refresh complete',7);return result;}catch(err){tfbRecordRefreshEvent_('manual-failed',String(err&&err.stack||err));tfbToast_('Manual refresh failed: '+err,'Refresh error',10);throw err;}finally{try{lock.releaseLock();}catch(releaseErr){tfbLogCleanupFailure_('release-lock',releaseErr);}if(keepPauseForContinuation){tfbRecordRefreshEvent_('manual-cleanup-kept-for-continuation','requestId='+requestId);}else{try{pauseCleared=tfbClearManualPause_('manual-finally', requestId, false);}catch(clearErr){tfbLogCleanupFailure_('clear-manual-pause',clearErr);}}if(keepPauseForContinuation){}else if (pauseCleared){try{tfbRemoveOwnDeferredTrigger_();}catch(triggerErr){tfbLogCleanupFailure_('remove-deferred-trigger',triggerErr);}try{tfbScheduleAutomaticResume_();}catch(resumeErr){tfbLogCleanupFailure_('schedule-automatic-resume',resumeErr);}}else{tfbRecordRefreshEvent_('manual-cleanup-preserved-newer-request','requestId='+requestId);}}}
+/**
+ * Owner-bound renewal capability passed to the configured manual handler.
+ * Renew only after a completed write, verification and saved checkpoint.
+ */
+function tfbManualLeaseContext_(requestId) {
+  var ownedId = String(requestId || '');
+  return {
+    requestId: ownedId,
+    renew: function(boundaryLabel) {
+      var outcome = tfbRenewManualPause_(ownedId);
+      tfbRecordRefreshEvent_(
+        outcome && outcome.renewed
+          ? 'manual-handler-boundary-renewed'
+          : 'manual-handler-boundary-renewal-failed',
+        'boundary=' + String(boundaryLabel || '') +
+          ' requestId=' + ownedId +
+          ' status=' + String(outcome && outcome.status || 'unknown')
+      );
+      return outcome;
+    }
+  };
+}
+
+/** Recognize the canonical persisted partial/checkpoint result. */
+function tfbManualHandlerNeedsContinuation_(result) {
+  if (!result || typeof result !== 'object') return false;
+
+  var nextIndex = Number(result.nextIndex);
+  var totalSymbols = Number(result.totalSymbols);
+  if (!isFinite(nextIndex) || !isFinite(totalSymbols)) return false;
+  if (nextIndex < 0 || totalSymbols <= 0 || nextIndex >= totalSymbols) return false;
+
+  return result.partial === true || result.paused === true;
+}
+function tfbExecuteManualHandler_(sourceLabel, configured, requestId) {
+  configured = configured || tfbConfiguredManualHandler_();
+  requestId = String(requestId || tfbNewManualRequestId_());
+  var lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(TFB_REFRESH_COORDINATOR_.MANUAL_LOCK_WAIT_MS)) {
+    try {
+      tfbScheduleDeferredManual_();
+    } catch (scheduleErr) {
+      // A request that cannot be queued may clear only its own pause instance.
+      try {
+        tfbClearManualPause_('deferred-schedule-failed', requestId, false);
+      } catch (clearErr) {
+        tfbLogCleanupFailure_('clear-after-deferred-schedule-failure', clearErr);
+      }
+      throw scheduleErr;
+    }
+    tfbToast_(
+      'Automatic refresh is finishing a safe step. Manual refresh has been queued.',
+      'Manual refresh queued',
+      8
+    );
+    return {status: 'queued', handler: configured.name, requestId: requestId};
+  }
+
+  var pauseCleared = false;
+  var keepPauseForContinuation = false;
+  try {
+    // Adopt the newest queued request before extending the lease. This lets one
+    // manual execution satisfy repeated clicks without overwriting a newer token.
+    var latestPause = tfbReadManualPause_();
+    if (latestPause.active && latestPause.requestId) {
+      requestId = latestPause.requestId;
+    }
+    tfbExtendManualPause_(String(sourceLabel || 'manual') + ':running', requestId);
+
+    tfbRecordRefreshEvent_(
+      'manual-started',
+      configured.name + ' requestId=' + requestId
+    );
+    tfbToast_('Automatic refresh paused. Manual refresh started.', 'Manual refresh', 5);
+
+    // P1 fix: pass executable renewal capability into the configured handler.
+    // Existing handlers may ignore the extra argument. Checkpoint-aware handlers
+    // can renew explicitly at their own post-write/post-checkpoint boundaries.
+    var leaseContext = tfbManualLeaseContext_(requestId);
+    var result = configured.fn(leaseContext);
+    SpreadsheetApp.flush();
+
+    // The canonical batch refresher returns this shape only after its write,
+    // verification, and checkpoint save are complete. Renew here and queue one
+    // coordinator-owned continuation instead of clearing the pause after 20 min.
+    if (tfbManualHandlerNeedsContinuation_(result)) {
+      var renewal = leaseContext.renew(
+        'handler-checkpoint:' +
+          String(result.nextIndex) + '/' + String(result.totalSymbols)
+      );
+      if (!renewal || renewal.renewed !== true) {
+        throw new Error(
+          'Manual refresh checkpoint was saved but lease renewal failed: ' +
+          String(renewal && renewal.status || 'unknown')
+        );
+      }
+
+      var continuation = tfbScheduleDeferredManual_();
+      keepPauseForContinuation = true;
+      tfbRecordRefreshEvent_(
+        'manual-continuation-queued',
+        'handler=' + configured.name +
+          ' requestId=' + requestId +
+          ' progress=' + String(result.nextIndex) +
+          '/' + String(result.totalSymbols) +
+          ' triggerId=' + String(continuation.triggerId || '')
+      );
+      tfbToast_(
+        'Checkpoint saved at ' + String(result.nextIndex) +
+          ' / ' + String(result.totalSymbols) + '. Continuation queued.',
+        'Manual refresh continuing',
+        8
+      );
+
+      var continuationResult = {};
+      for (var resultKey in result) {
+        if (Object.prototype.hasOwnProperty.call(result, resultKey)) {
+          continuationResult[resultKey] = result[resultKey];
+        }
+      }
+      continuationResult.coordinatorStatus = 'queued_continuation';
+      continuationResult.handler = configured.name;
+      continuationResult.requestId = requestId;
+      continuationResult.renewal = renewal;
+      continuationResult.continuation = continuation;
+      return continuationResult;
+    }
+
+    tfbRecordRefreshEvent_(
+      'manual-finished',
+      configured.name + ' requestId=' + requestId
+    );
+    tfbToast_('Manual refresh completed. Automatic refresh resumed.', 'Refresh complete', 7);
+    return result;
+  } catch (err) {
+    tfbRecordRefreshEvent_('manual-failed', String(err && err.stack || err));
+    tfbToast_('Manual refresh failed: ' + err, 'Refresh error', 10);
+    throw err;
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (releaseErr) {
+      tfbLogCleanupFailure_('release-lock', releaseErr);
+    }
+
+    if (keepPauseForContinuation) {
+      // The owned pause and trigger are deliberately retained. The deferred
+      // handler consumes that exact trigger ID before invoking the next batch.
+      tfbRecordRefreshEvent_(
+        'manual-cleanup-kept-for-continuation',
+        'requestId=' + requestId
+      );
+    } else {
+      try {
+        pauseCleared = tfbClearManualPause_('manual-finally', requestId, false);
+      } catch (clearErr) {
+        tfbLogCleanupFailure_('clear-manual-pause', clearErr);
+      }
+
+      if (pauseCleared) {
+        try {
+          tfbRemoveOwnDeferredTrigger_();
+        } catch (triggerErr) {
+          tfbLogCleanupFailure_('remove-deferred-trigger', triggerErr);
+        }
+        try {
+          tfbScheduleAutomaticResume_();
+        } catch (resumeErr) {
+          tfbLogCleanupFailure_('schedule-automatic-resume', resumeErr);
+        }
+      } else {
+        tfbRecordRefreshEvent_(
+          'manual-cleanup-preserved-newer-request',
+          'requestId=' + requestId
+        );
+      }
+    }
+  }
+}
 function tfbManualRefresh() {var configured = tfbConfiguredManualHandler_();var claim = tfbClaimManualPause_('menu-request');if(!claim.claimed){tfbToast_('A manual refresh is already queued or running.','Manual refresh already requested',6);return{status:String(claim.reason||'').indexOf(':running')>=0?'already_running':'already_queued',requestId:claim.requestId};}return tfbExecuteManualHandler_('menu',configured,claim.requestId);}
-function tfbManualRefreshDeferred_() {var configured = tfbConfiguredManualHandler_();try{tfbRemoveOwnDeferredTrigger_();}catch(consumeErr){tfbLogCleanupFailure_('consume-deferred-trigger',consumeErr);}var pause = tfbReadManualPause_();if(!pause.active||!pause.requestId){tfbRecordRefreshEvent_('manual-deferred-expired','Consumed deferred trigger found no active owned pause; continuation stopped.');return{status:'expired_continuation',reason:'manual_pause_not_active'};}var requestId=pause.requestId;if(!tfbExtendManualPause_('deferred-request',requestId)){return{status:'expired_continuation',reason:'manual_pause_extension_failed',requestId:requestId};}return tfbExecuteManualHandler_('deferred',configured,requestId);}
+function tfbManualRefreshDeferred_() {
+  // The deferred trigger can outlive a configuration change. Validate first.
+  var configured = tfbConfiguredManualHandler_();
+
+  // Consume only the exact coordinator-owned one-shot trigger before the next
+  // batch. This lets a later partial result create a fresh continuation trigger.
+  try {
+    tfbRemoveOwnDeferredTrigger_();
+  } catch (consumeErr) {
+    tfbLogCleanupFailure_('consume-deferred-trigger', consumeErr);
+  }
+
+  var pause = tfbReadManualPause_();
+  if (!pause.active || !pause.requestId) {
+    tfbRecordRefreshEvent_(
+      'manual-deferred-expired',
+      'Consumed deferred trigger found no active owned pause; continuation stopped.'
+    );
+    return {status: 'expired_continuation', reason: 'manual_pause_not_active'};
+  }
+
+  var requestId = pause.requestId;
+  if (!tfbExtendManualPause_('deferred-request', requestId)) {
+    return {
+      status: 'expired_continuation',
+      reason: 'manual_pause_extension_failed',
+      requestId: requestId
+    };
+  }
+  return tfbExecuteManualHandler_('deferred', configured, requestId);
+}
 function tfbManualRefreshStatus() {var pause = tfbReadManualPause_();var props=tfbScriptProperties_();var status={version:TFB_REFRESH_COORDINATOR_VERSION,pause:pause,manualHandler:props.getProperty(TFB_REFRESH_COORDINATOR_.PROP_MANUAL_HANDLER)||'',autoResumeHandler:props.getProperty(TFB_REFRESH_COORDINATOR_.PROP_AUTO_RESUME_HANDLER)||'',deferredTriggerId:props.getProperty(TFB_REFRESH_COORDINATOR_.PROP_DEFERRED_TRIGGER_ID)||'',lastEvent:props.getProperty(TFB_REFRESH_COORDINATOR_.PROP_LAST_EVENT)||''};console.log('[REFRESH-COORDINATOR-STATUS] '+JSON.stringify(status));return status;}
 function tfbClearStaleManualRefreshPause() {try{tfbClearManualPause_('owner-emergency-clear','',true);}finally{try{tfbRemoveOwnDeferredTrigger_();}catch(err){tfbLogCleanupFailure_('emergency-remove-deferred-trigger',err);}}tfbToast_('Manual refresh pause cleared. Automatic refresh may continue.','Refresh control',6);}
