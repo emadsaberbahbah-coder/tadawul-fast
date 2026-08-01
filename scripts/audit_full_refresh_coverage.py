@@ -5,6 +5,37 @@ import argparse, asyncio, importlib, inspect, json, math, os, sys
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+
+# =============================================================================
+# v1.1.0 (2026-08-01) — TZ-AWARE parse_dt (3-hour UTC/Riyadh conflation fixed).
+# parse_dt stripped tzinfo blindly: "...Z" lost its zone and the UTC wall time
+# was then compared against Riyadh-naive now (audit_decision_surface_freshness
+# builds now_riyadh at +03:00 and every _age_hours call is naive-Riyadh), so a
+# 22:03:19Z stamp read as 22:03 Riyadh — 3 hours OLDER than reality, enough to
+# flip stale/fresh at the 4-8h thresholds in live use. Offset-suffixed ISO
+# ("+03:00"/"+00:00") took the fromisoformat tail, which normalised to
+# UTC-naive — the SAME +3h error by the other route. Aware datetime instances
+# were blind-stripped identically. FIX (flag TFB_AUDIT_TZ_AWARE, default ON):
+# any tz-AWARE input — Z, ±offset ISO, aware datetime — converts to Riyadh
+# (+03:00, no DST) BEFORE the naive strip; naive strings keep the documented
+# Riyadh-local convention unchanged; Excel serials and m/d/Y unchanged.
+# Requires Python 3.11+ fromisoformat (runtime.txt pins 3.11). OFF-path
+# preserves the legacy body byte-equivalently (dual-run selftested against
+# the untouched baseline). This file previously carried NO version constant
+# and NO verify_deployment pin — both added here (implicit prior = 1.0.0).
+# audit_decision_surface_freshness imports parse_dt from here and is fixed
+# transitively; it stays unversioned/unpinned until its own run_id build
+# (CG-4) touches it. Zero functions removed.
+# =============================================================================
+SCRIPT_VERSION = "1.1.0"
+_RIYADH_TZ = timezone(timedelta(hours=3))
+
+
+def _audit_tz_aware_enabled():
+    """v1.1.0 kill-switch (default ON). 0/false/off/no -> legacy parse."""
+    return (os.getenv("TFB_AUDIT_TZ_AWARE") or "1").strip().lower() \
+        not in {"0", "false", "off", "no"}
+
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
@@ -84,9 +115,38 @@ def idx(headers, names):
 def has(row): return any(s(x) for x in row)
 
 def parse_dt(v):
-    if isinstance(v, datetime): return v.replace(tzinfo=None)
+    tz_on = _audit_tz_aware_enabled()
+    if isinstance(v, datetime):
+        # v1.1.0: an AWARE instance converts to Riyadh before the strip;
+        # a naive instance keeps the legacy pass-through.
+        if tz_on and v.tzinfo is not None:
+            return v.astimezone(_RIYADH_TZ).replace(tzinfo=None)
+        return v.replace(tzinfo=None)
     if isinstance(v,(int,float)) and not isinstance(v,bool) and 20000 < float(v) < 80000:
         return datetime(1899,12,30)+timedelta(days=float(v))
+    if tz_on:
+        # v1.1.0: aware-first. "Z" becomes an explicit +00:00 (never
+        # silently dropped); any offset-carrying ISO converts to Riyadh
+        # then strips. Naive strings fall through to the legacy formats
+        # under the documented Riyadh-local convention.
+        t = s(v).replace("T", " ")
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        try:
+            d = datetime.fromisoformat(t)
+            if d.tzinfo is not None:
+                return d.astimezone(_RIYADH_TZ).replace(tzinfo=None)
+        except Exception:
+            pass
+        t2 = s(v).replace("T", " ").replace("Z", "")
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M","%Y-%m-%d","%m/%d/%Y %H:%M:%S","%m/%d/%Y"):
+            try: return datetime.strptime(t2,fmt)
+            except Exception: pass
+        try:
+            d = datetime.fromisoformat(t2)
+            return d.astimezone(_RIYADH_TZ).replace(tzinfo=None) if d.tzinfo else d
+        except Exception: return None
+    # ---- legacy path (TFB_AUDIT_TZ_AWARE=0): v-prior body, verbatim ----
     t=s(v).replace("T"," ").replace("Z","")
     for fmt in ("%Y-%m-%d %H:%M:%S.%f","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M","%Y-%m-%d","%m/%d/%Y %H:%M:%S","%m/%d/%Y"):
         try: return datetime.strptime(t,fmt)
