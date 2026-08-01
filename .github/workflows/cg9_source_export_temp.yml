@@ -8,6 +8,7 @@ on:
       - "apps_script/11_Manual_Refresh_Coordinator.gs"
       - "tests/test_manual_refresh_priority_contract.py"
       - "docs/MANUAL_REFRESH_PRIORITY_V1.md"
+      - ".tmp_bad_blob.gs"
   workflow_dispatch:
 
 permissions:
@@ -29,6 +30,7 @@ jobs:
           cp apps_script/11_Manual_Refresh_Coordinator.gs cg9-source/apps_script/
           cp tests/test_manual_refresh_priority_contract.py cg9-source/tests/
           cp docs/MANUAL_REFRESH_PRIORITY_V1.md cg9-source/docs/
+          cp .tmp_bad_blob.gs cg9-source/tmp_bad_blob.gs
           python - <<'PY'
           import json, pathlib, re
           path = pathlib.Path('apps_script/11_Manual_Refresh_Coordinator.gs')
