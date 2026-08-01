@@ -29,6 +29,26 @@ for _path in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.p
 
 from scripts.audit_full_refresh_coverage import parse_dt, resolve_reader, s  # noqa: E402
 
+# =============================================================================
+# v1.1.0 (2026-08-01) — RUN-ID LINEAGE (additive; verdict-neutral by default).
+# This audit passed on age windows + ordering + pool counts alone, so two
+# RECENT-BUT-DIFFERENT snapshots inside the windows passed together — the
+# exact gap the 2026-08-01 independent review confirmed (Q6). The status
+# lines this script ALREADY reads carry a request id ("… | req 198d9a7f3917
+# | …") that was never compared. v1.1.0 extracts it from top10_text and
+# portfolio_text (zero new sheet reads), publishes portfolio_run_id /
+# top10_run_id / run_id_match in the JSON, and appends RUN_ID_MISMATCH when
+# the two surfaces name different runs: severity INFO while
+# TFB_FRESHNESS_REQUIRE_RUN_ID is unset/0, FAIL once armed post-window.
+# BUILD CORRECTION: exit_code returned 1 on ANY finding (not FAIL only),
+# so default-neutrality needed a one-line INFO exemption there — the ONLY
+# verdict-logic touch; WARN and FAIL exits are byte-identical, suite-proven. An ABSENT token never fails:
+# armed + absent yields a single INFO RUN_ID_ABSENT naming the surface.
+# This file previously carried NO version constant and NO verify pin — both
+# added here (implicit prior = 1.0.0). Zero functions removed.
+# =============================================================================
+SCRIPT_VERSION = "1.1.0"
+
 VERSION = "1.0.0"
 GOOD_FULL_PAGE_STATUSES = {"OK", "SUCCESS", "VALID", "PASS", "COMPLETE"}
 RUN_RE = re.compile(
@@ -37,6 +57,7 @@ RUN_RE = re.compile(
     re.I,
 )
 POOL_RE = re.compile(r"(?P<page>[A-Za-z][A-Za-z0-9_]+)\s+(?P<used>\d+)\/(?P<total>\d+)")
+RUNID_RE = re.compile(r"\breq\s+(?P<rid>[0-9a-fA-F]{6,32})\b")
 
 
 @dataclass(frozen=True)
@@ -65,6 +86,9 @@ class DecisionSurfaceReport:
     portfolio_run_riyadh: Optional[str] = None
     top10_run_riyadh: Optional[str] = None
     my_portfolio_updated_riyadh: Optional[str] = None
+    portfolio_run_id: Optional[str] = None
+    top10_run_id: Optional[str] = None
+    run_id_match: Optional[bool] = None
     source_status: dict[str, dict[str, Any]] = field(default_factory=dict)
     top10_pool_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     findings: list[Finding] = field(default_factory=list)
@@ -76,8 +100,11 @@ class DecisionSurfaceReport:
             return 3
         if any(item.severity == "FAIL" for item in self.findings):
             return 2
-        if self.findings:
+        if any(item.severity != "INFO" for item in self.findings):
+            # v1.1.0: unchanged for WARN/FAIL — any non-INFO finding still
+            # soft-fails exactly as before.
             return 1
+        # v1.1.0: INFO-only findings are advisory lineage notes — exit 0.
         return 0
 
     def payload(self) -> dict[str, Any]:
@@ -89,6 +116,9 @@ class DecisionSurfaceReport:
             "portfolio_run_riyadh": self.portfolio_run_riyadh,
             "top10_run_riyadh": self.top10_run_riyadh,
             "my_portfolio_updated_riyadh": self.my_portfolio_updated_riyadh,
+            "portfolio_run_id": self.portfolio_run_id,
+            "top10_run_id": self.top10_run_id,
+            "run_id_match": self.run_id_match,
             "source_status": self.source_status,
             "top10_pool_counts": self.top10_pool_counts,
             "summary": {
@@ -185,6 +215,53 @@ def _age_hours(stamp: Optional[datetime], now_riyadh: datetime) -> Optional[floa
     return max(0.0, (now_riyadh.replace(tzinfo=None) - local).total_seconds() / 3600.0)
 
 
+def _extract_run_id(text: Optional[str]) -> Optional[str]:
+    """v1.1.0: pull the 'req <hex>' token a surface status line carries."""
+    m = RUNID_RE.search(s(text))
+    return m.group("rid").lower() if m else None
+
+
+def _require_run_id_enabled() -> bool:
+    """v1.1.0 arming switch — default OFF (INFO only). Post-window: set
+    TFB_FRESHNESS_REQUIRE_RUN_ID=1 to make a mismatch FAIL."""
+    return (os.getenv("TFB_FRESHNESS_REQUIRE_RUN_ID") or "0") \
+        .strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _apply_run_id_lineage(report: "DecisionSurfaceReport",
+                          top10_text: Optional[str],
+                          portfolio_text: Optional[str]) -> None:
+    """v1.1.0: snapshot-identity check over the texts already in hand.
+    Adds fields always; adds a finding only on a PRESENT-and-different
+    pair (INFO unarmed / FAIL armed) or, when armed, one INFO for an
+    absent token. Never touches any existing finding."""
+    report.top10_run_id = _extract_run_id(top10_text)
+    report.portfolio_run_id = _extract_run_id(portfolio_text)
+    armed = _require_run_id_enabled()
+    if report.top10_run_id and report.portfolio_run_id:
+        report.run_id_match = report.top10_run_id == report.portfolio_run_id
+        if not report.run_id_match:
+            report.findings.append(Finding(
+                "FAIL" if armed else "INFO",
+                "RUN_ID_MISMATCH",
+                "Top_10_Investments",
+                f"Decision surfaces carry different run ids (top10 req "
+                f"{report.top10_run_id}, portfolio req "
+                f"{report.portfolio_run_id}) — recent-but-different "
+                f"snapshots can pass the age windows; identity says they "
+                f"are not one run."))
+    elif armed:
+        missing = [n for n, v in (("top10", report.top10_run_id),
+                                  ("portfolio", report.portfolio_run_id))
+                   if not v]
+        report.findings.append(Finding(
+            "INFO", "RUN_ID_ABSENT", "Top_10_Investments",
+            "Armed lineage check found no req token on: "
+            + ", ".join(missing)
+            + " — absence never fails; only a present-and-different "
+              "pair can."))
+
+
 def _iso(stamp: Optional[datetime]) -> Optional[str]:
     return stamp.isoformat(sep=" ", timespec="seconds") if stamp else None
 
@@ -252,6 +329,8 @@ def audit_surfaces(
         report.findings.append(Finding("FAIL", "T10_RUN_STALE", "Top_10_Investments", f"Top-10 surface age exceeds {decision_max_age_h:g} hours."))
     if top10_state != "OK":
         report.findings.append(Finding("FAIL", "T10_STATUS_NOT_OK", "Top_10_Investments", f"Embedded status is {top10_state or 'unknown'}, not OK."))
+
+    _apply_run_id_lineage(report, top10_text, portfolio_text)  # v1.1.0
 
     incomplete_sources: list[str] = []
     for page, floor in floors.items():
