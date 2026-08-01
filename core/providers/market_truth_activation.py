@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Bounded activation for the market-identity truth guard.
+"""Bounded activation for the market-identity and issuer-truth guards.
 
 ``core.providers`` can be imported while ``core.analysis.identity_guard`` is
 still being initialized through a circular-but-valid import chain. Calling the
-truth patch synchronously at that moment sees a partially initialized module
-and cannot wrap ``guard_sheet_rows``.
+patches synchronously at that moment sees a partially initialized module and
+cannot wrap ``guard_sheet_rows``.
 
 This module closes that production-only race with a small daemon worker. The
-worker performs no network I/O and retries only the idempotent in-process patch.
-It is bounded by attempt count and delay, and it never changes prices, scores,
+worker performs no network I/O and retries only idempotent in-process patches.
+It is bounded by attempt count and delay, and it never creates prices, scores,
 ranks, forecasts, recommendations, or workbook data.
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Callable, Dict, Optional
 
-ACTIVATION_VERSION = "1.0.0"
+ACTIVATION_VERSION = "1.1.0"
 __version__ = ACTIVATION_VERSION
 
 _log = logging.getLogger(__name__)
@@ -34,7 +34,14 @@ def _ensure_once() -> bool:
         ensure_identity_guard_truth_patch,
     )
 
-    return bool(ensure_identity_guard_truth_patch())
+    if not ensure_identity_guard_truth_patch():
+        return False
+
+    from core.providers.urgent_issuer_firewall import (
+        ensure_urgent_issuer_firewall,
+    )
+
+    return bool(ensure_urgent_issuer_firewall())
 
 
 def _run_bounded(
@@ -77,13 +84,14 @@ def _deferred_worker(*, attempts: int, delay_sec: float) -> None:
 
     if armed:
         _log.info(
-            "Market identity truth patch armed after deferred import retry "
-            "(attempt=%s)",
+            "Market identity truth + urgent issuer firewall armed after "
+            "deferred import retry (attempt=%s)",
             used,
         )
     else:
         _log.error(
-            "Market identity truth patch did not arm after %s bounded attempts%s",
+            "Market identity truth + urgent issuer firewall did not arm after "
+            "%s bounded attempts%s",
             used,
             f" ({error})" if error else "",
         )
@@ -132,6 +140,29 @@ def arm_identity_guard_truth_patch(
 
 
 def activation_snapshot() -> Dict[str, object]:
+    issuer_armed = False
+    issuer_version = ""
+    try:
+        from core.analysis import identity_guard
+
+        issuer_armed = bool(
+            getattr(
+                identity_guard,
+                "_TFB_URGENT_ISSUER_FIREWALL_PATCHED",
+                False,
+            )
+        )
+        issuer_version = str(
+            getattr(
+                identity_guard,
+                "_TFB_URGENT_ISSUER_FIREWALL_VERSION",
+                "",
+            )
+            or ""
+        )
+    except Exception:
+        pass
+
     with _lock:
         return {
             "version": ACTIVATION_VERSION,
@@ -139,6 +170,8 @@ def activation_snapshot() -> Dict[str, object]:
             "attempts_used": int(_attempts_used),
             "last_error": str(_last_error),
             "thread_alive": bool(_thread is not None and _thread.is_alive()),
+            "urgent_issuer_firewall_armed": issuer_armed,
+            "urgent_issuer_firewall_version": issuer_version,
         }
 
 
