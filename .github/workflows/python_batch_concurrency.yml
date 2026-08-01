@@ -3,6 +3,8 @@ name: ⚡ Python Batch Concurrency
 on:
   pull_request:
     paths:
+      - 'core/providers/__init__.py'
+      - 'core/providers/eodhd_http402_circuit.py'
       - 'core/symbols/__init__.py'
       - 'core/symbols/normalize.py'
       - 'core/symbols/runtime_truth_patch.py'
@@ -21,6 +23,7 @@ on:
       - 'tests/test_benchmark_dashboard_fetch.py'
       - 'tests/test_data_free_diagnostics.py'
       - 'tests/test_runtime_truth_patch.py'
+      - 'tests/test_eodhd_http402_circuit.py'
       - 'tests/test_backend_symbol_capabilities.py'
       - 'tests/test_eodhd_http402_guard.py'
       - 'tests/test_truthful_failsoft_contract.py'
@@ -28,6 +31,8 @@ on:
   push:
     branches: [main]
     paths:
+      - 'core/providers/__init__.py'
+      - 'core/providers/eodhd_http402_circuit.py'
       - 'core/symbols/__init__.py'
       - 'core/symbols/normalize.py'
       - 'core/symbols/runtime_truth_patch.py'
@@ -46,6 +51,7 @@ on:
       - 'tests/test_benchmark_dashboard_fetch.py'
       - 'tests/test_data_free_diagnostics.py'
       - 'tests/test_runtime_truth_patch.py'
+      - 'tests/test_eodhd_http402_circuit.py'
       - 'tests/test_backend_symbol_capabilities.py'
       - 'tests/test_eodhd_http402_guard.py'
       - 'tests/test_truthful_failsoft_contract.py'
@@ -80,6 +86,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m py_compile \
+            core/providers/__init__.py \
+            core/providers/eodhd_http402_circuit.py \
             core/symbols/__init__.py \
             core/symbols/normalize.py \
             core/symbols/runtime_truth_patch.py \
@@ -98,6 +106,7 @@ jobs:
             tests/test_benchmark_dashboard_fetch.py \
             tests/test_data_free_diagnostics.py \
             tests/test_runtime_truth_patch.py \
+            tests/test_eodhd_http402_circuit.py \
             tests/test_backend_symbol_capabilities.py \
             tests/test_eodhd_http402_guard.py \
             tests/test_truthful_failsoft_contract.py
@@ -107,6 +116,7 @@ jobs:
             tests/test_benchmark_dashboard_fetch.py \
             tests/test_data_free_diagnostics.py \
             tests/test_runtime_truth_patch.py \
+            tests/test_eodhd_http402_circuit.py \
             tests/test_backend_symbol_capabilities.py \
             tests/test_critical_symbol_identity.py \
             -v
@@ -120,9 +130,11 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import os
+          import core.providers
           import core.symbols
           from core.analysis import identity_guard
           from core.providers import eodhd_provider
+          from core.providers.eodhd_http402_circuit import circuit_snapshot
           from core.symbols.normalize import (
               infer_symbol_metadata,
               to_eodhd_symbol,
@@ -146,7 +158,18 @@ jobs:
           assert create_diagnostic_parser().parse_args([]).concurrency == 1
 
           assert eodhd_provider._err_indicates_provider_unhealthy("HTTP 402") is True
+          assert eodhd_provider._err_indicates_provider_unhealthy(
+              "provider_circuit_open:eodhd:plan_restricted"
+          ) is True
           assert eodhd_provider._engine_patch_bind_enabled() is True
+          assert getattr(
+              eodhd_provider.EODHDClient,
+              "_TFB_HTTP402_CIRCUIT_INSTALLED",
+              False,
+          ) is True
+          circuit = circuit_snapshot()
+          assert circuit["enabled"] is True
+          assert circuit["ttl_sec"] >= 60
 
           version_parts = tuple(int(part) for part in sync.SCRIPT_VERSION.split("."))
           assert version_parts >= (6, 32, 0), sync.SCRIPT_VERSION
@@ -212,7 +235,8 @@ jobs:
           assert sink.clear_requests == []
 
           print(
-              "truthful normalization + provider warning diagnostics + "
-              "market metadata block + exact sequential defaults: PASS"
+              "truthful normalization + immediate EODHD 402 circuit + "
+              "provider warning diagnostics + market metadata block + "
+              "exact sequential defaults: PASS"
           )
           PY
