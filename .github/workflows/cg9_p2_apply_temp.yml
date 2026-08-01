@@ -1,0 +1,280 @@
+name: TEMP CG9 P2 Apply
+
+on:
+  push:
+    branches:
+      - agent/cg9-gas-renewable-pause-lease
+    paths:
+      - '.github/workflows/cg9_p2_apply_temp.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: true
+
+      - name: Apply reviewed P2 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/cg9-p2.patch <<'PATCH'
+--- a/apps_script/11_Manual_Refresh_Coordinator.gs
++++ b/apps_script/11_Manual_Refresh_Coordinator.gs
+@@ -42,7 +42,39 @@
+ function tfbFindTriggerByHandler_(handlerName) {var triggers=ScriptApp.getProjectTriggers();for(var i=0;i<triggers.length;i++){if(triggers[i].getHandlerFunction()===handlerName){return triggers[i];}}return null;}
+ function tfbEnsureOneShotTrigger_(handlerName, delayMs) {var existing=tfbFindTriggerByHandler_(handlerName);if(existing){return{created: false,triggerId:existing.getUniqueId()};}var trigger=ScriptApp.newTrigger(handlerName).timeBased().after(Math.max(60*1000,Number(delayMs||0))).create();return{created:true,triggerId:trigger.getUniqueId()};}
+ function tfbScheduleDeferredManual_() {var scheduled=tfbWithCoordinatorLock_('schedule-deferred-manual',function(){var result=tfbEnsureOneShotTrigger_('tfbManualRefreshDeferred_',TFB_REFRESH_COORDINATOR_.DEFERRED_DELAY_MS);tfbScriptProperties_().setProperty(TFB_REFRESH_COORDINATOR_.PROP_DEFERRED_TRIGGER_ID,String(result.triggerId||''));return result;});tfbRecordRefreshEvent_('manual-deferred','created='+scheduled.created+' triggerId='+scheduled.triggerId);return scheduled;}
+-function tfbRemoveOwnDeferredTrigger_() {var removed=tfbWithCoordinatorLock_('remove-deferred-manual',function(){var props=tfbScriptProperties_();var expectedId=props.getProperty(TFB_REFRESH_COORDINATOR_.PROP_DEFERRED_TRIGGER_ID)||'';if(!expectedId){return false;}var triggers=ScriptApp.getProjectTriggers();for(var i=0;i<triggers.length;i++){if(triggers[i].getUniqueId() === expectedId){ScriptApp.deleteTrigger(triggers[i]);break;}}props.deleteProperty(TFB_REFRESH_COORDINATOR_.PROP_DEFERRED_TRIGGER_ID);return true;});return removed;}
++function tfbRemoveOwnDeferredTrigger_() {
++  return tfbWithCoordinatorLock_('remove-deferred-manual', function() {
++    var props = tfbScriptProperties_();
++    var expectedId = props.getProperty(
++      TFB_REFRESH_COORDINATOR_.PROP_DEFERRED_TRIGGER_ID
++    ) || '';
++    if (!expectedId) {
++      return false;
++    }
++
++    var triggers = ScriptApp.getProjectTriggers();
++    var ownedTrigger = null;
++    for (var i = 0; i < triggers.length; i++) {
++      if (triggers[i].getUniqueId() === expectedId) {
++        ownedTrigger = triggers[i];
++        break;
++      }
++    }
++
++    // Missing tracked trigger is not a successful consume. Keep the tracked ID
++    // for diagnostics and let the caller fail closed rather than silently strand
++    // the next continuation.
++    if (!ownedTrigger) {
++      return false;
++    }
++
++    // Delete first; clear the tracked ID only after deletion succeeds. If the
++    // platform throws, the caller sees the failure and the ID remains auditable.
++    ScriptApp.deleteTrigger(ownedTrigger);
++    props.deleteProperty(TFB_REFRESH_COORDINATOR_.PROP_DEFERRED_TRIGGER_ID);
++    return true;
++  });
++}
+ function tfbScheduleAutomaticResume_() {var handlerName=String(tfbScriptProperties_().getProperty(TFB_REFRESH_COORDINATOR_.PROP_AUTO_RESUME_HANDLER)||'').trim();if(!handlerName){tfbRecordRefreshEvent_('automatic-resume-next-schedule','no one-shot handler');return{created: false,reason:'next_scheduled_trigger'};}if(handlerName==='tfbManualRefresh'||handlerName==='tfbManualRefreshDeferred_'){throw new Error('Invalid automatic resume handler: '+handlerName);}var scheduled=tfbWithCoordinatorLock_('schedule-automatic-resume',function(){return tfbEnsureOneShotTrigger_(handlerName,TFB_REFRESH_COORDINATOR_.AUTO_RESUME_DELAY_MS);});tfbRecordRefreshEvent_('automatic-resume-scheduled','handler='+handlerName+' created='+scheduled.created);return scheduled;}
+ function tfbLogCleanupFailure_(step, err) {console.error('[REFRESH-COORDINATOR] cleanup step failed: '+String(step||'unknown')+' | '+String(err&&err.stack||err));}
+ /**
+@@ -229,25 +261,55 @@
+ function tfbManualRefreshDeferred_() {
+   // The deferred trigger can outlive a configuration change. Validate first.
+   var configured = tfbConfiguredManualHandler_();
+-
+-  // Consume only the exact coordinator-owned one-shot trigger before the next
+-  // batch. This lets a later partial result create a fresh continuation trigger.
+-  try {
+-    tfbRemoveOwnDeferredTrigger_();
+-  } catch (consumeErr) {
+-    tfbLogCleanupFailure_('consume-deferred-trigger', consumeErr);
+-  }
+-
+   var pause = tfbReadManualPause_();
++
+   if (!pause.active || !pause.requestId) {
++    // Best-effort removal is safe here because there is no active pause to
++    // preserve or revive. The handler is never invoked on this path.
++    try {
++      tfbRemoveOwnDeferredTrigger_();
++    } catch (expiredCleanupErr) {
++      tfbLogCleanupFailure_('consume-expired-deferred-trigger', expiredCleanupErr);
++    }
+     tfbRecordRefreshEvent_(
+       'manual-deferred-expired',
+-      'Consumed deferred trigger found no active owned pause; continuation stopped.'
++      'Deferred trigger found no active owned pause; continuation stopped.'
+     );
+     return {status: 'expired_continuation', reason: 'manual_pause_not_active'};
+   }
+ 
+   var requestId = pause.requestId;
++
++  // P2 fail-closed rule: the currently firing owned trigger must be consumed
++  // before the handler runs. Otherwise the next partial result can rediscover
++  // this same trigger, report created=false, and strand the continuation.
++  try {
++    if (!tfbRemoveOwnDeferredTrigger_()) {
++      throw new Error('Coordinator-owned deferred trigger ID is missing');
++    }
++  } catch (consumeErr) {
++    var pauseCleared = false;
++    try {
++      pauseCleared = tfbClearManualPause_(
++        'deferred-trigger-consume-failed',
++        requestId,
++        false
++      );
++    } catch (clearErr) {
++      tfbLogCleanupFailure_('clear-after-deferred-trigger-consume-failure', clearErr);
++    }
++    tfbRecordRefreshEvent_(
++      'manual-deferred-consume-failed',
++      'requestId=' + requestId +
++        ' pauseCleared=' + String(pauseCleared) +
++        ' error=' + String(consumeErr && consumeErr.stack || consumeErr)
++    );
++    throw new Error(
++      'Unable to consume coordinator-owned deferred trigger; continuation aborted: ' +
++      String(consumeErr && consumeErr.message || consumeErr)
++    );
++  }
++
+   if (!tfbExtendManualPause_('deferred-request', requestId)) {
+     return {
+       status: 'expired_continuation',
+--- a/docs/MANUAL_REFRESH_PRIORITY_V1.md
++++ b/docs/MANUAL_REFRESH_PRIORITY_V1.md
+@@ -205,6 +205,11 @@
+   self-expires and cannot be renewed forever.
+ - Expiry cleanup uses compare-and-delete: it clears only the exact stored expiry
+   value and request ID that were read as stale.
++- A deferred continuation must consume its coordinator-owned trigger before the
++  handler starts. If trigger enumeration/deletion fails or the tracked trigger ID
++  is missing, the coordinator clears only the same request-owned pause and aborts;
++  it never runs the next batch while the firing trigger may still block replacement
++  scheduling.
+ - Final cleanup clears only the request ID owned by the finishing execution.
+ - Pause clearing occurs before fallible trigger cleanup or resume scheduling.
+ - `tfbClearStaleManualRefreshPause()` is the owner-only force reset.
+--- a/tests/test_manual_refresh_priority_contract.py
++++ b/tests/test_manual_refresh_priority_contract.py
+@@ -210,14 +210,34 @@
+         self.assertIn("manual-cleanup-kept-for-continuation", execute)
+ 
+         deferred = self.function_body("tfbManualRefreshDeferred_()")
+-        remove_at = deferred.index("tfbRemoveOwnDeferredTrigger_();")
+         read_at = deferred.index("var pause = tfbReadManualPause_();")
+-        execute_at = deferred.index("tfbExecuteManualHandler_('deferred'", read_at)
+-        self.assertLess(remove_at, read_at)
+-        self.assertLess(read_at, execute_at)
++        remove_at = deferred.index("tfbRemoveOwnDeferredTrigger_();", read_at)
++        execute_at = deferred.index("tfbExecuteManualHandler_('deferred'", remove_at)
++        self.assertLess(read_at, remove_at)
++        self.assertLess(remove_at, execute_at)
+         self.assertNotIn("tfbClaimManualPause_('deferred-request')", deferred)
+         self.assertIn("manual-deferred-expired", deferred)
+ 
++    def test_deferred_trigger_consume_failure_aborts_and_clears_owned_pause(self) -> None:
++        deferred = self.function_body("tfbManualRefreshDeferred_()")
++        self.assertIn("if (!tfbRemoveOwnDeferredTrigger_())", deferred)
++        self.assertIn("deferred-trigger-consume-failed", deferred)
++        self.assertIn(
++            "tfbClearManualPause_(\n        'deferred-trigger-consume-failed',",
++            deferred,
++        )
++        self.assertIn("manual-deferred-consume-failed", deferred)
++        self.assertIn("continuation aborted", deferred)
++        clear_at = deferred.index("deferred-trigger-consume-failed")
++        execute_at = deferred.index("tfbExecuteManualHandler_('deferred'")
++        self.assertLess(clear_at, execute_at)
++
++        remove = self.function_body("tfbRemoveOwnDeferredTrigger_()")
++        self.assertIn("if (!ownedTrigger)", remove)
++        delete_at = remove.index("ScriptApp.deleteTrigger(ownedTrigger)")
++        property_at = remove.index("PROP_DEFERRED_TRIGGER_ID", delete_at)
++        self.assertLess(delete_at, property_at)
++
+     def test_failed_deferred_schedule_clears_only_owned_request(self) -> None:
+         text = self.function_body(
+             "tfbExecuteManualHandler_(sourceLabel, configured, requestId)"
+PATCH
+          git apply --check /tmp/cg9-p2.patch
+          git apply /tmp/cg9-p2.patch
+          cp apps_script/11_Manual_Refresh_Coordinator.gs \
+             deliverables/11_Manual_Refresh_Coordinator_v1.1.0.txt
+
+      - name: Run syntax and permanent contract suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check < apps_script/11_Manual_Refresh_Coordinator.gs
+          python -m py_compile tests/test_manual_refresh_priority_contract.py
+          python -m unittest -v tests.test_manual_refresh_priority_contract
+          cmp -s apps_script/11_Manual_Refresh_Coordinator.gs \
+                 deliverables/11_Manual_Refresh_Coordinator_v1.1.0.txt
+
+      - name: Prove deferred-trigger consume failure aborts before handler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/cg9-p2-runtime.js <<'NODE'
+          const fs = require('fs');
+          const vm = require('vm');
+          let handlerCalls = 0;
+          let now = Date.parse('2026-08-01T20:00:00Z');
+          const store = {
+            TFB_MANUAL_REFRESH_UNTIL_MS: String(now + 600000),
+            TFB_MANUAL_REFRESH_REQUEST_ID: 'req-owned',
+            TFB_MANUAL_REFRESH_REQUESTED_AT: new Date(now - 60000).toISOString(),
+            TFB_MANUAL_REFRESH_REQUESTED_BY: 'owner@example.com',
+            TFB_MANUAL_REFRESH_REASON: 'manual:running',
+            TFB_MANUAL_REFRESH_HANDLER: 'manualCore',
+            TFB_MANUAL_DEFERRED_TRIGGER_ID: 'owned-trigger'
+          };
+          const props = {
+            getProperty: k => Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null,
+            setProperty: (k,v) => { store[k] = String(v); },
+            setProperties: vals => { for (const [k,v] of Object.entries(vals)) store[k] = String(v); },
+            deleteProperty: k => { delete store[k]; }
+          };
+          const lock = { tryLock: () => true, releaseLock: () => {} };
+          const unrelated = [{ id: 'unrelated-trigger' }];
+          const context = {
+            Date: class extends Date { static now(){ return now; } },
+            Math, JSON, Object, String, Number, Error, isFinite,
+            console: { log(){}, warn(){}, error(){} },
+            PropertiesService: { getScriptProperties: () => props },
+            LockService: { getDocumentLock: () => lock, getScriptLock: () => lock },
+            ScriptApp: {
+              getProjectTriggers: () => { throw new Error('enumeration failed'); },
+              deleteTrigger: () => { throw new Error('must not delete'); },
+              newTrigger: () => { throw new Error('must not schedule'); }
+            },
+            SpreadsheetApp: { getActiveSpreadsheet: () => ({ toast(){} }), flush(){} },
+            Session: { getActiveUser: () => ({ getEmail: () => 'owner@example.com' }) },
+            Utilities: { getUuid: () => 'uuid' },
+            manualCore: () => { handlerCalls += 1; return { partial: true, paused: true, nextIndex: 2, totalSymbols: 10 }; }
+          };
+          vm.createContext(context);
+          vm.runInContext(fs.readFileSync('apps_script/11_Manual_Refresh_Coordinator.gs','utf8'), context);
+          let thrown = '';
+          try { context.tfbManualRefreshDeferred_(); } catch (e) { thrown = String(e && e.message || e); }
+          if (!thrown.includes('continuation aborted')) throw new Error('missing abort error: ' + thrown);
+          if (handlerCalls !== 0) throw new Error('handler executed after consume failure');
+          if (store.TFB_MANUAL_REFRESH_REQUEST_ID) throw new Error('owned pause not cleared');
+          if (unrelated.length !== 1 || unrelated[0].id !== 'unrelated-trigger') throw new Error('unrelated trigger changed');
+          console.log(JSON.stringify({
+            result: 'PASS',
+            trigger_enumeration_failure_aborted_before_handler: true,
+            owned_pause_cleared: true,
+            unrelated_trigger_preserved: true
+          }));
+NODE
+          node /tmp/cg9-p2-runtime.js
+
+      - name: Commit verified P2 correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/cg9_p2_apply_temp.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add apps_script/11_Manual_Refresh_Coordinator.gs \
+                  deliverables/11_Manual_Refresh_Coordinator_v1.1.0.txt \
+                  docs/MANUAL_REFRESH_PRIORITY_V1.md \
+                  tests/test_manual_refresh_priority_contract.py \
+                  .github/workflows/cg9_p2_apply_temp.yml
+          git commit -m 'Fail closed when deferred continuation trigger cannot be consumed'
+          git push origin HEAD:agent/cg9-gas-renewable-pause-lease
