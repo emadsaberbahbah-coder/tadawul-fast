@@ -14,9 +14,11 @@ blocked, and disclosed in ``warnings``. Pre-correction prevents the guard's
 25% blast-radius refusal from turning a broad deterministic metadata defect
 into an unguarded page.
 
-Installed from :mod:`core.symbols.__init__` so direct imports such as
-``from core.symbols.normalize import to_yahoo_symbol`` receive the patched
-provider formatter before the engine starts serving requests.
+The normalizer can be imported while :mod:`core.analysis.identity_guard` is
+still only partially initialized. Therefore normalizer installation and guard
+installation are intentionally separate: the former installs immediately and
+the latter can be retried safely after provider initialization. This closes the
+production import-order race without weakening the fail-open startup boundary.
 """
 from __future__ import annotations
 
@@ -24,7 +26,7 @@ import re
 from functools import lru_cache
 from typing import Any, Dict, Mapping, MutableMapping, Optional, Tuple
 
-PATCH_VERSION = "1.0.1"
+PATCH_VERSION = "1.0.2"
 __version__ = PATCH_VERSION
 
 _INSTALLED = False
@@ -233,8 +235,16 @@ def _patch_normalize_module() -> None:
     normalizer._TFB_RUNTIME_TRUTH_PATCHED = True
 
 
-def _patch_identity_guard() -> None:
+def _patch_identity_guard() -> bool:
+    """Patch the fully initialized identity guard; return False when too early."""
     from core.analysis import identity_guard
+
+    original_guard = getattr(identity_guard, "guard_sheet_rows", None)
+    if not callable(original_guard):
+        # Production can reach this function while identity_guard is still
+        # importing through symbol_dedup -> core.symbols.normalize. Defer rather
+        # than converting a harmless import order into a startup failure.
+        return False
 
     identity_guard.SUFFIX_CURRENCY.update(
         {
@@ -248,9 +258,7 @@ def _patch_identity_guard() -> None:
     )
 
     if getattr(identity_guard, "_TFB_MARKET_METADATA_TRUTH_PATCHED", False):
-        return
-
-    original_guard = identity_guard.guard_sheet_rows
+        return True
 
     def guard_sheet_rows(
         rows: Any,
@@ -303,20 +311,29 @@ def _patch_identity_guard() -> None:
 
     identity_guard.guard_sheet_rows = guard_sheet_rows
     identity_guard._TFB_MARKET_METADATA_TRUTH_PATCHED = True
+    return True
+
+
+def ensure_identity_guard_truth_patch() -> bool:
+    """Retry the guard patch after imports settle and report its armed state."""
+    _patch_normalize_module()
+    return _patch_identity_guard()
 
 
 def install_runtime_truth_patch() -> None:
-    """Install once. Failures are handled by the package initializer."""
+    """Install normalizer truth immediately and guard truth when available."""
     global _INSTALLED
-    if _INSTALLED:
-        return
-    _patch_normalize_module()
+    if not _INSTALLED:
+        _patch_normalize_module()
+        _INSTALLED = True
+    # Do not fail package import when identity_guard is only partially loaded.
+    # core.providers.__init__ retries this after provider initialization.
     _patch_identity_guard()
-    _INSTALLED = True
 
 
 __all__ = [
     "PATCH_VERSION",
     "install_runtime_truth_patch",
+    "ensure_identity_guard_truth_patch",
     "_correct_market_metadata",
 ]
