@@ -25,7 +25,7 @@ from typing import Any, Mapping, Sequence
 from scripts import diagnose_data_free_rows as base
 from scripts.sync_integrity_v13 import ensure_installed
 
-POLICY_VERSION = "1.3.1"
+POLICY_VERSION = "1.3.0"
 __version__ = POLICY_VERSION
 
 _INSTALLED = False
