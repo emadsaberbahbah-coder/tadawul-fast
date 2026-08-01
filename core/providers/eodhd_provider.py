@@ -2,9 +2,41 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.15.0 (UNIT-AWARE PERCENT CONVERSION: the magnitude guess
-                          that silently inflated every sub-1.5% value by 100x
-                          is retired)
+EODHD Provider — v4.16.0 (HTTP-402 ENTITLEMENT LATCH: one plan/payment
+                          rejection now halts the hammering for a bounded TTL
+                          instead of failing identically N more times)
+
+v4.16.0 — WHY (live evidence 2026-08-01; surgical build, full protocol)
+--------------------------------------------------------------------------------
+On the 2026-08-01 01:03 UTC portfolio run EODHD returned HTTP 402
+(plan/entitlement) and every US holding row carried
+`fetch_failed:HTTP 402; provider_unhealthy:eodhd`. 402 was the ONE 4xx this
+file did not classify: 429 waits, 401/403 parse bodies, 404 names itself —
+402 fell to the generic `HTTP {sc}` branch, so each of the dozens of rows in
+a batch re-attempted a rejection that is ACCOUNT-level and deterministic.
+The v4.8.0 breaker could not help: it opens only on 8 consecutive
+AuthError/IpBlocked failures, and 402 recorded as FetchError.
+
+Fix (additive; two sites in _request_json + fields in __init__):
+  1. sc==402 -> error "HTTP 402 plan_or_entitlement", failure class
+     "Entitlement" recorded on the existing health registry (counter-only;
+     auth thresholds untouched), and a provider-level latch opens for
+     TFB_EODHD_HTTP402_TTL_SEC seconds (default 900, clamped 30..86400).
+  2. While the latch is open _request_json returns
+     "HTTP 402 plan_or_entitlement circuit_open" BEFORE any network call or
+     health accounting — "HTTP 402" preserves the v4.9.0 per-failure
+     provider_unhealthy marker on every affected row (honest, never
+     synthetic); "circuit_open" maps to CircuitOpen in _classify_error.
+     Other providers keep serving the symbol; fallback order untouched.
+  3. WARN at most once/60s while latched; ERROR once per trip.
+
+Gate: TFB_EODHD_HTTP402_CIRCUIT, DEFAULT ON (protection flag — a lapsed
+plan must not silently burn the batch). =0 restores v4.15.0 behaviour
+exactly: sc==402 falls through to the generic >=400 branch (FetchError +
+"HTTP 402") and no latch ever opens. Zero functions removed.
+
+(v4.15.0 header, preserved: UNIT-AWARE PERCENT CONVERSION — the magnitude
+guess that silently inflated every sub-1.5% value by 100x is retired)
 
 v4.15.0 — WHY (evening export 2026-07-12; proven from the sheet's OWN numbers)
 --------------------------------------------------------------------------------
@@ -1017,7 +1049,7 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.15.0"
+PROVIDER_VERSION = "4.16.0"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -2065,6 +2097,20 @@ class EODHDClient:
         self._budget_warned: bool = False
         self._budget_lock = asyncio.Lock()
 
+        # v4.16.0: HTTP 402 plan/entitlement latch (see WHY at file head).
+        # A 402 is an ACCOUNT-level rejection, not symbol-specific — one is
+        # enough to know every further call this process makes will fail
+        # until the plan is fixed. Protection flag, DEFAULT ON;
+        # TFB_EODHD_HTTP402_CIRCUIT=0 restores v4.15.0 behaviour exactly.
+        self._http402_gate = _env_bool("TFB_EODHD_HTTP402_CIRCUIT", True)
+        self._http402_ttl_sec = _env_float(
+            "TFB_EODHD_HTTP402_TTL_SEC", 900.0, lo=30.0, hi=86400.0)
+        self._http402_open_until: float = 0.0
+        self._http402_count: int = 0
+        self._http402_short_circuits: int = 0
+        self._http402_last_log: float = 0.0
+        self._http402_lock = asyncio.Lock()
+
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self.timeout_sec),
             headers={"User-Agent": _env_str("EODHD_USER_AGENT", UA_DEFAULT)},
@@ -2132,6 +2178,26 @@ class EODHDClient:
         """
         if not self.api_key:
             return None, "EODHD_API_KEY missing"
+
+        # v4.16.0: HTTP 402 entitlement latch — after one plan/entitlement
+        # rejection, refuse further EODHD network calls for a bounded TTL.
+        # Placed BEFORE health.begin_request() so short-circuits never
+        # pollute the breaker's request/consecutive accounting.
+        if self._http402_gate:
+            async with self._http402_lock:
+                _now = time.monotonic()
+                if _now < self._http402_open_until:
+                    self._http402_short_circuits += 1
+                    if (_now - self._http402_last_log) >= 60.0:
+                        self._http402_last_log = _now
+                        logger.warning(
+                            "[eodhd v4.16.0 HTTP402] entitlement latch open — "
+                            "short-circuiting EODHD calls for %.0fs more "
+                            "(rejections=%d short_circuited=%d)",
+                            self._http402_open_until - _now,
+                            self._http402_count,
+                            self._http402_short_circuits)
+                    return None, "HTTP 402 plan_or_entitlement circuit_open"
 
         # v4.8.0 AB: circuit-breaker check before the network call.
         health = await _get_health()
@@ -2224,6 +2290,24 @@ class EODHDClient:
 
                     if sc == 404:
                         return None, "HTTP 404 not_found"
+
+                    if sc == 402 and self._http402_gate:
+                        # v4.16.0: plan/entitlement failure — deterministic
+                        # at ACCOUNT level; classify, count on the health
+                        # registry (class "Entitlement": cumulative only,
+                        # auth thresholds untouched), open the latch, stop.
+                        async with self._http402_lock:
+                            self._http402_count += 1
+                            self._http402_open_until = (
+                                time.monotonic() + self._http402_ttl_sec)
+                            self._http402_last_log = 0.0
+                        logger.error(
+                            "[eodhd v4.16.0 HTTP402] plan/entitlement "
+                            "rejection #%d — latch OPEN for %.0fs; "
+                            "TFB_EODHD_HTTP402_CIRCUIT=0 disables",
+                            self._http402_count, self._http402_ttl_sec)
+                        await health.record_failure("Entitlement")
+                        return None, "HTTP 402 plan_or_entitlement"
 
                     if sc >= 400:
                         await health.record_failure("FetchError")
