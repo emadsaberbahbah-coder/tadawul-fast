@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Fail-closed KEEP-LAST-GOOD identity gate v1.3.1.
 
-The runtime issuer firewall can correctly turn a mismatched provider response
+The deployed backend issuer firewall can turn a mismatched provider response
 into a symbol-only, decision-blocked stub. The sync runner's KEEP-LAST-GOOD
 stage executes later and may replace that safe stub with the old workbook row.
 When the old row is itself the poisoned predecessor, the cache revives the
 wrong issuer and prevents convergence.
 
-This module patches only ``_keep_last_good_rows`` after the sync runner finishes
-importing. Every proposed last-good substitution is checked by the active
-critical Symbol-to-Issuer / venue policy. A failed candidate is rejected and
-the incoming blocked stub is retained. No price, name, score, rank, forecast,
+This module wraps only ``_keep_last_good_rows`` after the sync runner finishes
+importing. Every proposed last-good substitution is checked against a small,
+auditable registry derived from the live 2026-08-01 contamination evidence and
+against deterministic venue rules. A failed candidate is rejected and the
+incoming blocked stub is retained. No price, name, score, rank, forecast,
 recommendation, or workbook value is created here, and this module performs no
 network or workbook I/O of its own.
 """
@@ -18,10 +19,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 PATCH_VERSION = "1.3.1"
 PATCH_TAG = "[KLG-IDENTITY v1.3.1]"
@@ -31,6 +33,54 @@ _LOCK = threading.Lock()
 _STARTED = False
 _PATCHED_MODULE_IDS: set[int] = set()
 
+# Exact audited identities. These are safety assertions for accepting a cached
+# predecessor, not an attempt to build the full instrument master in this patch.
+EXPECTED_ISSUER_TOKENS: Mapping[str, tuple[str, ...]] = {
+    "AC.PS": ("ayala corporation",),
+    "SCC.PS": ("semirara mining",),
+    "BDO.PS": ("bdo unibank",),
+    "SMPH.PS": ("sm prime",),
+    "SM.PS": ("sm investments",),
+    "JFC.PS": ("jollibee foods",),
+    "AREIT.PS": ("areit",),
+    "MONDE.PS": ("monde nissin",),
+    "SMC.PS": ("san miguel corporation",),
+    "ICT.PS": ("international container terminal", "ictsi"),
+    "URC.PS": ("universal robina",),
+    "BPI.PS": ("bank of the philippine islands",),
+    "TEL.PS": ("pldt",),
+    "GTCAP.PS": ("gt capital",),
+    "TAQA.AB": ("abu dhabi national energy",),
+    "ALPHADHABI.AB": ("alpha dhabi",),
+    "FAB.AB": ("first abu dhabi bank",),
+    "FERTIGLOBE.AB": ("fertiglobe",),
+    "ADNOCGAS.AB": ("adnoc gas",),
+    "ADPORTS.AB": ("ad ports", "abu dhabi ports"),
+    "ALDAR.AB": ("aldar properties",),
+    "IHC.AB": ("international holding company",),
+    "ADNOCLS.AB": ("adnoc logistics", "adnoc l&s"),
+    "EAND.AB": ("emirates telecommunications", "etisalat by e&"),
+    "PRESIGHT.AB": ("presight",),
+    "ADNOCDIST.AB": ("adnoc distribution", "abu dhabi national oil company for distribution"),
+    "BOROUGE.AB": ("borouge",),
+    "ADIB.AB": ("abu dhabi islamic bank",),
+    "OQGN.OM": ("oq gas networks",),
+    # Lifecycle aliases remain unsafe as cached rows unless their issuer is the
+    # exact current company. This gate does not rewrite symbols; it only refuses
+    # a wrong predecessor.
+    "BK.US": ("bank of new york mellon", "bny mellon"),
+    "BNY.US": ("bank of new york mellon", "bny mellon"),
+    "NZYM-B.CO": ("novonesis", "novozymes"),
+    "NSIS-B.CO": ("novonesis", "novozymes"),
+}
+
+VENUE_RULES: tuple[tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
+    (".AB", ("adx", "abu dhabi securities", "abu dhabi"), ("aed",), ("united arab emirates", "uae")),
+    (".PS", ("pse", "philippine stock exchange"), ("php",), ("philippines",)),
+    (".OM", ("msx", "muscat stock exchange", "muscat"), ("omr",), ("oman",)),
+)
+_VALID_SR = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
+
 
 def _text(value: Any) -> str:
     return "" if value is None else str(value).strip()
@@ -38,6 +88,10 @@ def _text(value: Any) -> str:
 
 def _symbol(value: Any) -> str:
     return _text(value).upper()
+
+
+def _norm(value: Any) -> str:
+    return " ".join(_text(value).casefold().split())
 
 
 def _key(value: Any) -> str:
@@ -50,6 +104,77 @@ def _find(headers: Sequence[Any], aliases: Sequence[str]) -> int:
         if _key(header) in wanted:
             return index
     return -1
+
+
+def _cell(row: Sequence[Any], index: int) -> Any:
+    return row[index] if 0 <= index < len(row) else ""
+
+
+def _positive(value: Any) -> bool:
+    try:
+        return float(str(value).replace(",", "").strip()) > 0
+    except Exception:
+        return False
+
+
+def _contains_any(value: Any, tokens: Sequence[str]) -> bool:
+    text = _norm(value)
+    return bool(text) and any(token in text for token in tokens)
+
+
+def _venue_rule(symbol: str):
+    for suffix, exchanges, currencies, countries in VENUE_RULES:
+        if symbol.endswith(suffix):
+            return suffix, exchanges, currencies, countries
+    return None
+
+
+def candidate_identity_failure(headers: Sequence[Any], row: Sequence[Any]) -> str:
+    """Return a refusal reason for an unsafe last-good candidate, else blank."""
+    sym_i = _find(headers, ("Symbol", "Ticker", "Code"))
+    if sym_i < 0:
+        return "symbol column missing"
+    symbol = _symbol(_cell(row, sym_i))
+    if not symbol:
+        return "symbol missing"
+
+    name_i = _find(headers, ("Name", "Company Name", "Instrument Name", "Short Name"))
+    exchange_i = _find(headers, ("Exchange", "Market", "Exchange Code"))
+    currency_i = _find(headers, ("Currency", "Currency Code"))
+    country_i = _find(headers, ("Country", "Country Name"))
+    price_i = _find(headers, ("Current Price", "Price", "Last Price"))
+
+    if symbol.endswith(".SR") and not _VALID_SR.fullmatch(symbol):
+        return "invalid Saudi symbol format"
+
+    issuer_tokens = EXPECTED_ISSUER_TOKENS.get(symbol)
+    if issuer_tokens:
+        name = _cell(row, name_i)
+        if not _contains_any(name, issuer_tokens):
+            return "issuer name mismatch"
+        # A predecessor accepted as last-good must carry an actual positive
+        # current price; otherwise the incoming explicit stub is more truthful.
+        if price_i >= 0 and not _positive(_cell(row, price_i)):
+            return "current price missing or invalid"
+
+    venue = _venue_rule(symbol)
+    if venue is None:
+        return ""
+    _suffix, exchanges, currencies, countries = venue
+    exchange = _cell(row, exchange_i)
+    currency = _cell(row, currency_i)
+    country = _cell(row, country_i)
+
+    # For exact audited instruments, venue metadata is required. For other
+    # symbols on the same venue, only an explicit contradiction is refused.
+    require = issuer_tokens is not None
+    if (require or _text(exchange)) and not _contains_any(exchange, exchanges):
+        return "exchange mismatch"
+    if (require or _text(currency)) and not _contains_any(currency, currencies):
+        return "currency mismatch"
+    if (require or _text(country)) and not _contains_any(country, countries):
+        return "country mismatch"
+    return ""
 
 
 def _canonical(sync_module: Any, value: Any) -> str:
@@ -83,8 +208,7 @@ def _patch_sync_module(sync_module: Any) -> bool:
             return True
 
         original = getattr(sync_module, "_keep_last_good_rows", None)
-        guard = getattr(sync_module, "quarantine_critical_rows", None)
-        if not callable(original) or not callable(guard):
+        if not callable(original):
             return False
         if getattr(original, "_TFB_KLG_CRITICAL_GATE_PATCHED", False):
             _PATCHED_MODULE_IDS.add(module_id)
@@ -123,29 +247,23 @@ def _patch_sync_module(sync_module: Any) -> bool:
                 if not symbol or symbol not in swapped_set:
                     continue
 
-                candidate = [list(row)]
-                failed = False
                 try:
-                    _guarded, failures = guard(list(headers), candidate)
-                    failed = bool(failures)
+                    reason = candidate_identity_failure(list(headers), row)
                 except Exception as exc:
-                    # A safety check that cannot execute may not certify stale
-                    # data. Retain the fresh blocked stub instead.
-                    failed = True
-                    logger = getattr(sync_module, "logger", _log)
-                    logger.error(
-                        "%s identity check failed for %s; refusing stale substitution (%s: %s)",
-                        PATCH_TAG,
-                        symbol,
-                        exc.__class__.__name__,
-                        exc,
-                    )
+                    reason = f"identity check unavailable: {exc.__class__.__name__}"
 
-                if not failed:
+                if not reason:
                     continue
                 rows[index] = list(before[index])
                 if symbol not in refused:
                     refused.append(symbol)
+                logger = getattr(sync_module, "logger", _log)
+                logger.error(
+                    "%s refusing stale substitution for %s: %s",
+                    PATCH_TAG,
+                    symbol,
+                    reason,
+                )
 
             if not refused:
                 return rows, list(swapped)
@@ -229,6 +347,8 @@ def start_deferred_install() -> None:
 __all__ = [
     "PATCH_VERSION",
     "PATCH_TAG",
+    "EXPECTED_ISSUER_TOKENS",
+    "candidate_identity_failure",
     "ensure_installed",
     "start_deferred_install",
     "_patch_sync_module",
