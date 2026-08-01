@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
 import unittest
 
 import core.symbols  # installs the runtime patch
@@ -117,6 +120,55 @@ class RuntimeTruthPatchTests(unittest.TestCase):
 
         install_runtime_truth_patch()
         self.assertIs(identity_guard.guard_sheet_rows, before)
+
+    def test_provider_init_repairs_identity_guard_import_order(self):
+        code = textwrap.dedent(
+            """
+            from core.analysis import identity_guard
+            import core.providers
+
+            assert getattr(
+                identity_guard,
+                "_TFB_MARKET_METADATA_TRUTH_PATCHED",
+                False,
+            ) is True
+
+            result = identity_guard.guard_sheet_rows(
+                [
+                    {
+                        "symbol": "BPI.PS",
+                        "name": "Bank of the Philippine Islands",
+                        "current_price": 120.0,
+                        "exchange": "NASDAQ/NYSE",
+                        "currency": "USD",
+                        "country": "USA",
+                        "asset_class": "Equity",
+                        "warnings": "",
+                        "block_reason": "",
+                    }
+                ],
+                sheet="Market_Leaders",
+                run_dedup=False,
+            ).apply()[0]
+
+            assert result["exchange"] == "PSE"
+            assert result["currency"] == "PHP"
+            assert result["country"] == "Philippines"
+            assert result["investability_status"] == "BLOCKED"
+            assert result["final_action"] == "DO_NOT_INVEST"
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
 
 
 if __name__ == "__main__":
