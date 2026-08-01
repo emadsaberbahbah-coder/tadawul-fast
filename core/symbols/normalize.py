@@ -2,10 +2,18 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization — v5.4.0 (ENTERPRISE ALIGNED + METADATA INFERENCE)
+Symbol Normalization — v5.4.2 (PROVIDER EXCHANGE-SUFFIX ALIGNMENT)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
+
+v5.4.2 (over v5.4.0) — Yahoo/EODHD suffix alignment:
+- FIX Abu Dhabi mapping: .AD (Yahoo) <-> .ADX (EODHD); .AB remains a legacy input alias only.
+- ADD Philippine mapping .PS (Yahoo) <-> .PSE (EODHD).
+- WHY: the dashboard stores provider-facing Yahoo symbols, while EODHD requires
+  its own exchange IDs. Without these mappings, healthy listed instruments are
+  repeatedly returned as missing/error stubs and Keep-Last-Good masks the stale
+  rows instead of refreshing them.
 
 v5.4.0 (over v5.3.2) — EODHD FOREX mapping for Yahoo =X pairs (owner
 greenlight 2026-07-05; Forward-Looking/CFX reliability item):
@@ -78,7 +86,7 @@ except Exception:
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-__version__ = "5.4.0"
+__version__ = "5.4.1"
 
 __all__ = [
     "MarketType",
@@ -377,7 +385,7 @@ EXCHANGE_SUFFIXES: Dict[str, str] = {
     ".ZA": "ZA", ".JSE": "ZA",
     ".TA": "IL", ".TASE": "IL",
     ".SAU": "SA", ".SR": "SA", ".TADAWUL": "SA",
-    ".AE": "AE", ".DFM": "AE", ".ADX": "AE",
+    ".AE": "AE", ".AD": "AE", ".AB": "AE", ".DFM": "AE", ".ADX": "AE",
     ".QA": "QA", ".QE": "QA",
     ".KW": "KW", ".KSE": "KW",
     ".EG": "EG", ".EGX": "EG",
@@ -411,6 +419,9 @@ _YAHOO_TO_EODHD_SUFFIX: Dict[str, str] = {
     "DE": "XETRA",  # Germany     (Yahoo .DE  -> EODHD .XETRA)
     "AX": "AU",     # Australia   (Yahoo .AX  -> EODHD .AU)
     "KS": "KO",     # Korea KOSPI (Yahoo .KS  -> EODHD .KO)
+    "AD": "ADX",    # Abu Dhabi   (Yahoo .AD  -> EODHD .ADX)
+    "AB": "ADX",    # Legacy project alias -> EODHD .ADX
+    "PS": "PSE",    # Philippines (Yahoo .PS  -> EODHD .PSE)
 }
 _EODHD_TO_YAHOO_SUFFIX: Dict[str, str] = {
     "NSE": "NS",
@@ -418,6 +429,8 @@ _EODHD_TO_YAHOO_SUFFIX: Dict[str, str] = {
     "XETRA": "DE",
     "AU": "AX",
     "KO": "KS",
+    "ADX": "AD",
+    "PSE": "PS",
 }
 
 CURRENCY_BY_COUNTRY: Dict[str, str] = {

@@ -460,7 +460,7 @@ logger.addHandler(logging.NullHandler())
 # off-loop switch (TFB_OPP_BUILD_OFFLOOP) still gates the threading itself.
 # Zero functions removed; addition: _opp_build_lock + _opp_build_in_thread.
 # ==============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.14.1"
+ADVANCED_ANALYSIS_VERSION = "4.14.2"
 # =============================================================================
 # v4.14.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v4.14.0.
 #
@@ -2614,69 +2614,39 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
     return final_rows
 
 def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
+    """Return an explicit unavailable stub value without fabricating market facts.
+
+    The symbol is preserved so callers can retry it.  All prices, scores, ranks,
+    names, forecasts and recommendations remain unknown (None).  Only provenance,
+    timestamps and an explicit unavailability marker are populated.
+    """
     kk = _normalize_key_name(key)
     if kk in {"symbol", "ticker"}:
         return symbol
-    if kk == "name":
-        return f"{page} {symbol}"
-    if kk == "asset_class":
-        return "Commodity" if symbol.endswith("=F") else "FX" if symbol.endswith("=X") else "Fund" if page == "Mutual_Funds" else "Equity"
-    if kk == "exchange":
-        if symbol.endswith(".SR"):
-            return "Tadawul"
-        if symbol.endswith("=F"):
-            return "Futures"
-        if symbol.endswith("=X"):
-            return "FX"
-        return "NASDAQ/NYSE"
-    if kk == "currency":
-        return "SAR" if symbol.endswith(".SR") else "USD"
-    if kk == "country":
-        return "Saudi Arabia" if symbol.endswith(".SR") else "Global"
     if kk == "data_provider":
-        return "advanced_analysis.placeholder_fallback"
+        return "advanced_analysis.unavailable_stub"
     if kk in {"last_updated_utc", "last_updated_riyadh"}:
         return datetime.now(timezone.utc).isoformat()
-    if kk == "recommendation":
-        return "Watch" if row_index > 3 else "Accumulate"
-    if kk == "recommendation_reason":
-        return "Placeholder fallback because live engine returned no usable rows."
-    if kk in {"top10_rank", "rank_overall"}:
-        return row_index
-    if kk == "selection_reason":
-        return "Placeholder fallback because upstream builders returned no usable rows."
+    if kk in {"warnings", "notes", "block_reason"}:
+        return "upstream_unavailable"
+    if kk in {"recommendation_reason", "selection_reason"}:
+        return "No usable provider data; decision fields are unavailable."
     if kk == "criteria_snapshot":
-        return json.dumps({"symbol": symbol, "row_index": row_index, "source": "placeholder"}, ensure_ascii=False)
-    if kk in {"warnings", "notes"}:
-        return "placeholder"
-    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "avg_cost", "position_cost", "position_value", "unrealized_pl", "intrinsic_value"}:
-        base = 100.0 + float(row_index)
-        return round(base, 2)
-    if kk in {"percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score"}:
-        return round(max(1.0, 100.0 - float(row_index * 3)), 2)
-    if kk in {"risk_bucket", "confidence_bucket"}:
-        return "Moderate" if row_index > 3 else "High Confidence"
-    if kk == "invest_period_label":
-        return "3M"
-    if kk == "horizon_days":
-        return 90
+        return json.dumps({"symbol": symbol, "source": "unavailable_stub"}, ensure_ascii=False)
     return None
 
 def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
+    """Build retryable symbol stubs only; never manufacture investment data."""
+    if page == _TOP10_PAGE:
+        return []
     symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
     if not symbols:
-        symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, []) if _normalize_symbol_token(x)]
+        return []
     symbols = symbols[offset : offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
-    rows: List[Dict[str, Any]] = []
-    for idx, sym in enumerate(symbols, start=offset + 1):
-        row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
-        rows.append(row)
-    if page == _TOP10_PAGE:
-        for idx, row in enumerate(rows, start=offset + 1):
-            row["top10_rank"] = idx
-            row.setdefault("selection_reason", "Placeholder fallback because upstream builders returned no usable rows.")
-            row.setdefault("criteria_snapshot", "{}")
-    return rows
+    return [
+        {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
+        for idx, sym in enumerate(symbols, start=offset + 1)
+    ]
 
 def _real_data_dictionary_rows() -> List[Dict[str, Any]]:
     """v4.4.0 [DD-FIX]: rows from the real core.sheets.data_dictionary builder.
@@ -2744,30 +2714,13 @@ def _build_dictionary_fallback_rows(*, page: str, headers: Sequence[str], keys: 
     return _slice(rows, limit=limit, offset=offset)
 
 def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
-    # v4.3.0 [FIX-C]: emit the engine/registry v2.12.0+ Insights keys
-    # (section, item, metric, value, notes, source, sort_order). Dropped the
-    # pre-v2.12.0 `symbol` / `last_updated_riyadh` fields; the requested symbol
-    # is folded into the row `item` so the fallback summary stays informative.
+    """Expose coverage status only; never emit synthetic decision signals."""
     symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
-    if not symbols:
-        symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(_INSIGHTS_PAGE, []) if _normalize_symbol_token(x)]
-    src = "advanced_analysis.local_insights_fallback"
+    src = "advanced_analysis.unavailable_insights_stub"
     rows: List[Dict[str, Any]] = [
-        {"section": "Coverage", "item": "Requested symbols", "metric": "count", "value": len(symbols), "notes": "Local insights fallback summary", "source": src, "sort_order": 1},
-        {"section": "Coverage", "item": "Universe sample", "metric": "symbols", "value": ", ".join(symbols[:5]), "notes": "Sample of the symbols used by fallback mode", "source": src, "sort_order": 2},
+        {"section": "Coverage", "item": "Requested symbols", "metric": "count", "value": len(symbols), "notes": "Upstream insights unavailable", "source": src, "sort_order": 1},
+        {"section": "Status", "item": "Insight generation", "metric": "availability", "value": "Unknown", "notes": "No usable upstream rows; no recommendation generated", "source": src, "sort_order": 2},
     ]
-    next_order = 3
-    for idx, sym in enumerate(symbols[: max(1, limit + offset)], start=1):
-        rows.append({
-            "section": "Signals",
-            "item": f"{sym} fallback signal",
-            "metric": "recommendation",
-            "value": "Watch" if idx > 2 else "Accumulate",
-            "notes": "Generated locally because upstream insights payload was unavailable",
-            "source": src,
-            "sort_order": next_order,
-        })
-        next_order += 1
     return _slice(rows, limit=limit, offset=offset)
 
 def _build_nonempty_failsoft_rows(*, page: str, headers: Sequence[str], keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int, top_n: int) -> List[Dict[str, Any]]:
@@ -2776,10 +2729,10 @@ def _build_nonempty_failsoft_rows(*, page: str, headers: Sequence[str], keys: Se
     if page == _INSIGHTS_PAGE:
         return _build_insights_fallback_rows(requested_symbols=requested_symbols, limit=limit, offset=offset)
     if page == _TOP10_PAGE:
-        rows = _build_placeholder_rows(page=page, keys=keys, requested_symbols=requested_symbols or EMERGENCY_PAGE_SYMBOLS.get(page, []), limit=max(limit, top_n), offset=0)
-        rows = _ensure_top10_rows(rows, requested_symbols=requested_symbols, top_n=top_n, schema_keys=keys, schema_headers=headers)
-        return _slice(rows, limit=limit, offset=offset)
-    return _build_placeholder_rows(page=page, keys=keys, requested_symbols=requested_symbols or EMERGENCY_PAGE_SYMBOLS.get(page, []), limit=limit, offset=offset)
+        # A ranked investment list requires verified facts.  Empty is honest;
+        # synthetic ranks/prices/recommendations are not.
+        return []
+    return _build_placeholder_rows(page=page, keys=keys, requested_symbols=requested_symbols, limit=limit, offset=offset)
 
 def _payload_envelope(
     *,

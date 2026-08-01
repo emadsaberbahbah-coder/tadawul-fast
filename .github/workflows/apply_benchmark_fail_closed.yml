@@ -1,0 +1,53 @@
+name: Apply benchmark fail-closed gate
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/apply_benchmark_fail_closed.py'
+      - 'scripts/verify_backend_symbol_capabilities_sequential.py'
+      - '.github/workflows/python_refresh_benchmark.yml'
+      - '.github/workflows/apply_benchmark_fail_closed.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    if: github.event.pull_request.head.ref == 'perf/python-batch-concurrency-v1'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          persist-credentials: false
+
+      - name: Validate idempotent fail-closed gate
+        run: |
+          set -euo pipefail
+          python scripts/apply_benchmark_fail_closed.py
+          if ! git diff --quiet -- .github/workflows/python_refresh_benchmark.yml; then
+            echo '::error::Benchmark workflow drift detected. Apply the reviewed workflow change through an authority with workflows permission.'
+            git diff -- .github/workflows/python_refresh_benchmark.yml
+            exit 1
+          fi
+
+      - name: Validate workflow text and probe wrapper
+        run: |
+          set -euo pipefail
+          grep -F "Concurrency escalation is blocked" .github/workflows/python_refresh_benchmark.yml
+          grep -F "verify_backend_symbol_capabilities_sequential.py" .github/workflows/python_refresh_benchmark.yml
+          grep -F -- "--timeout 120" .github/workflows/python_refresh_benchmark.yml
+          python -m py_compile \
+            scripts/apply_benchmark_fail_closed.py \
+            scripts/verify_backend_symbol_capabilities_sequential.py
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('.github/workflows/python_refresh_benchmark.yml').read_text()
+          assert "exit 1" in text
+          assert "exit 2" in text
+          assert "BENCH_CONCURRENCY:" in text
+          assert "inputs.concurrency" in text
+          assert "|| '1'" in text
+          PY

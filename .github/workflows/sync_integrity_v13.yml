@@ -1,0 +1,86 @@
+name: 🧷 Sync Integrity v1.3
+
+on:
+  pull_request:
+    paths:
+      - 'core/analysis/identity_guard.py'
+      - 'core/providers/__init__.py'
+      - 'core/providers/market_truth_activation.py'
+      - 'core/providers/urgent_issuer_firewall.py'
+      - 'scripts/__init__.py'
+      - 'scripts/sync_integrity_v13.py'
+      - 'scripts/klg_identity_gate_v131.py'
+      - 'scripts/diagnose_data_free_rows_v13.py'
+      - 'scripts/critical_symbol_identity.py'
+      - 'tests/test_sync_integrity_v13.py'
+      - 'tests/test_klg_identity_gate_v131.py'
+      - 'tests/test_urgent_market_identity_firewall.py'
+      - 'tests/test_urgent_issuer_runtime_firewall.py'
+      - '.github/workflows/sync_integrity_v13.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'core/analysis/identity_guard.py'
+      - 'core/providers/__init__.py'
+      - 'core/providers/market_truth_activation.py'
+      - 'core/providers/urgent_issuer_firewall.py'
+      - 'scripts/__init__.py'
+      - 'scripts/sync_integrity_v13.py'
+      - 'scripts/klg_identity_gate_v131.py'
+      - 'scripts/diagnose_data_free_rows_v13.py'
+      - 'scripts/critical_symbol_identity.py'
+      - 'tests/test_sync_integrity_v13.py'
+      - 'tests/test_klg_identity_gate_v131.py'
+      - 'tests/test_urgent_market_identity_firewall.py'
+      - 'tests/test_urgent_issuer_runtime_firewall.py'
+      - '.github/workflows/sync_integrity_v13.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-integrity-v13-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Preserve universe and block unknown facts
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Compile focused files
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            core/providers/__init__.py \
+            core/providers/market_truth_activation.py \
+            core/providers/urgent_issuer_firewall.py \
+            scripts/__init__.py \
+            scripts/sync_integrity_v13.py \
+            scripts/klg_identity_gate_v131.py \
+            scripts/diagnose_data_free_rows_v13.py \
+            scripts/critical_symbol_identity.py \
+            tests/test_sync_integrity_v13.py \
+            tests/test_klg_identity_gate_v131.py \
+            tests/test_urgent_market_identity_firewall.py \
+            tests/test_urgent_issuer_runtime_firewall.py
+      - name: Run sync-integrity tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m unittest -v \
+            tests.test_sync_integrity_v13 \
+            tests.test_klg_identity_gate_v131 \
+            tests.test_urgent_market_identity_firewall \
+            tests.test_urgent_issuer_runtime_firewall

@@ -1,0 +1,257 @@
+name: ⚡ Python Batch Concurrency
+
+on:
+  pull_request:
+    paths:
+      - 'core/providers/__init__.py'
+      - 'core/providers/eodhd_http402_circuit.py'
+      - 'core/symbols/__init__.py'
+      - 'core/symbols/normalize.py'
+      - 'core/symbols/runtime_truth_patch.py'
+      - 'core/providers/eodhd_provider.py'
+      - 'routes/advanced_analysis.py'
+      - 'scripts/critical_symbol_identity.py'
+      - 'scripts/run_dashboard_sync.py'
+      - 'scripts/concurrent_batch_fetch.py'
+      - 'scripts/run_dashboard_sync_fast.py'
+      - 'scripts/benchmark_dashboard_fetch.py'
+      - 'scripts/diagnose_data_free_rows.py'
+      - 'scripts/diagnose_data_free_rows_v13.py'
+      - 'scripts/verify_backend_symbol_capabilities.py'
+      - 'scripts/verify_backend_symbol_capabilities_sequential.py'
+      - 'tests/test_concurrent_batch_fetch.py'
+      - 'tests/test_provider_symbol_recovery.py'
+      - 'tests/test_benchmark_dashboard_fetch.py'
+      - 'tests/test_data_free_diagnostics.py'
+      - 'tests/test_data_free_policy_v13.py'
+      - 'tests/test_runtime_truth_patch.py'
+      - 'tests/test_eodhd_http402_circuit.py'
+      - 'tests/test_backend_symbol_capabilities.py'
+      - 'tests/test_eodhd_http402_guard.py'
+      - 'tests/test_truthful_failsoft_contract.py'
+      - '.github/workflows/python_batch_concurrency.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'core/providers/__init__.py'
+      - 'core/providers/eodhd_http402_circuit.py'
+      - 'core/symbols/__init__.py'
+      - 'core/symbols/normalize.py'
+      - 'core/symbols/runtime_truth_patch.py'
+      - 'core/providers/eodhd_provider.py'
+      - 'routes/advanced_analysis.py'
+      - 'scripts/critical_symbol_identity.py'
+      - 'scripts/run_dashboard_sync.py'
+      - 'scripts/concurrent_batch_fetch.py'
+      - 'scripts/run_dashboard_sync_fast.py'
+      - 'scripts/benchmark_dashboard_fetch.py'
+      - 'scripts/diagnose_data_free_rows.py'
+      - 'scripts/diagnose_data_free_rows_v13.py'
+      - 'scripts/verify_backend_symbol_capabilities.py'
+      - 'scripts/verify_backend_symbol_capabilities_sequential.py'
+      - 'tests/test_concurrent_batch_fetch.py'
+      - 'tests/test_provider_symbol_recovery.py'
+      - 'tests/test_benchmark_dashboard_fetch.py'
+      - 'tests/test_data_free_diagnostics.py'
+      - 'tests/test_data_free_policy_v13.py'
+      - 'tests/test_runtime_truth_patch.py'
+      - 'tests/test_eodhd_http402_circuit.py'
+      - 'tests/test_backend_symbol_capabilities.py'
+      - 'tests/test_eodhd_http402_guard.py'
+      - 'tests/test_truthful_failsoft_contract.py'
+      - '.github/workflows/python_batch_concurrency.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-batch-concurrency-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test bounded batch concurrency and provider safeguards
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install focused test dependencies
+        run: python -m pip install -q pytest httpx
+      - name: Compile and test
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            core/providers/__init__.py \
+            core/providers/eodhd_http402_circuit.py \
+            core/symbols/__init__.py \
+            core/symbols/normalize.py \
+            core/symbols/runtime_truth_patch.py \
+            core/providers/eodhd_provider.py \
+            routes/advanced_analysis.py \
+            scripts/critical_symbol_identity.py \
+            scripts/run_dashboard_sync.py \
+            scripts/concurrent_batch_fetch.py \
+            scripts/run_dashboard_sync_fast.py \
+            scripts/benchmark_dashboard_fetch.py \
+            scripts/diagnose_data_free_rows.py \
+            scripts/diagnose_data_free_rows_v13.py \
+            scripts/verify_backend_symbol_capabilities.py \
+            scripts/verify_backend_symbol_capabilities_sequential.py \
+            tests/test_concurrent_batch_fetch.py \
+            tests/test_provider_symbol_recovery.py \
+            tests/test_benchmark_dashboard_fetch.py \
+            tests/test_data_free_diagnostics.py \
+            tests/test_data_free_policy_v13.py \
+            tests/test_runtime_truth_patch.py \
+            tests/test_eodhd_http402_circuit.py \
+            tests/test_backend_symbol_capabilities.py \
+            tests/test_eodhd_http402_guard.py \
+            tests/test_truthful_failsoft_contract.py
+          python -m unittest \
+            tests/test_concurrent_batch_fetch.py \
+            tests/test_provider_symbol_recovery.py \
+            tests/test_benchmark_dashboard_fetch.py \
+            tests/test_data_free_diagnostics.py \
+            tests/test_data_free_policy_v13.py \
+            tests/test_runtime_truth_patch.py \
+            tests/test_eodhd_http402_circuit.py \
+            tests/test_backend_symbol_capabilities.py \
+            tests/test_critical_symbol_identity.py \
+            -v
+          python -m pytest -q \
+            tests/test_eodhd_http402_guard.py \
+            tests/test_truthful_failsoft_contract.py
+      - name: Verify staged production contract
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import core.providers
+          import core.symbols
+          from core.analysis import identity_guard
+          from core.providers import eodhd_provider
+          from core.providers.eodhd_http402_circuit import circuit_snapshot
+          from core.symbols.normalize import (
+              infer_symbol_metadata,
+              to_eodhd_symbol,
+              to_yahoo_symbol,
+          )
+          from scripts import diagnose_data_free_rows_v13 as diagnostic_policy
+          from scripts import run_dashboard_sync as sync
+          from scripts.concurrent_batch_fetch import build, concurrency, provider_recovery_variants
+          from scripts.benchmark_dashboard_fetch import NoWriteSheets, create_parser
+          from scripts.critical_symbol_identity import canonicalize_symbol
+          from scripts.diagnose_data_free_rows import create_parser as create_diagnostic_parser
+          from scripts.verify_backend_symbol_capabilities import RULES, evaluate_table
+          from scripts.verify_backend_symbol_capabilities_sequential import GATE_VERSION
+
+          os.environ.pop("TFB_SYNC_BATCH_CONCURRENCY", None)
+          os.environ.pop("TFB_EODHD_ENGINE_PATCH_BIND", None)
+
+          # Production and no-write benchmark defaults must both remain the exact
+          # sequential path. Values above 1 require an explicit canary input.
+          assert concurrency() == 1
+          assert create_parser().parse_args([]).concurrency == 1
+          assert create_diagnostic_parser().parse_args([]).concurrency == 1
+          assert diagnostic_policy.POLICY_VERSION == "1.3.0"
+          assert diagnostic_policy._exchange_matches("SAU", "Tadawul") is True
+
+          assert eodhd_provider._err_indicates_provider_unhealthy("HTTP 402") is True
+          assert eodhd_provider._err_indicates_provider_unhealthy(
+              "provider_circuit_open:eodhd:plan_restricted"
+          ) is True
+          assert eodhd_provider._engine_patch_bind_enabled() is True
+          assert getattr(
+              eodhd_provider.EODHDClient,
+              "_TFB_HTTP402_CIRCUIT_INSTALLED",
+              False,
+          ) is True
+          circuit = circuit_snapshot()
+          assert circuit["enabled"] is True
+          assert circuit["ttl_sec"] >= 60
+
+          version_parts = tuple(int(part) for part in sync.SCRIPT_VERSION.split("."))
+          assert version_parts >= (6, 32, 0), sync.SCRIPT_VERSION
+          assert callable(sync._fetch_market_rows_batched)
+          assert callable(sync._build_request_symbol_index)
+          assert callable(sync._resolve_requested_symbol)
+          assert callable(build(sync))
+
+          assert to_eodhd_symbol("ADNOCDIST.AD") == "ADNOCDIST.ADX"
+          assert to_eodhd_symbol("BPI.PS") == "BPI.PSE"
+          assert to_yahoo_symbol("ADNOCDIST.ADX") == "ADNOCDIST.AD"
+          assert to_yahoo_symbol("ADNOCDIST.AB") == "ADNOCDIST.AD"
+          assert infer_symbol_metadata("OQBI.OM")["currency"] == "OMR"
+          assert infer_symbol_metadata("ELET3.SR")["currency"] is None
+          assert getattr(
+              identity_guard,
+              "_TFB_MARKET_METADATA_TRUTH_PATCHED",
+              False,
+          ) is True
+
+          guarded = identity_guard.guard_sheet_rows(
+              [{
+                  "symbol": "BPI.PS",
+                  "name": "Bank of the Philippine Islands",
+                  "current_price": 120.0,
+                  "exchange": "NASDAQ/NYSE",
+                  "currency": "USD",
+                  "country": "USA",
+                  "asset_class": "Equity",
+                  "warnings": "",
+                  "block_reason": "",
+              }],
+              sheet="Market_Leaders",
+              run_dedup=False,
+          ).apply()[0]
+          assert guarded["exchange"] == "PSE"
+          assert guarded["currency"] == "PHP"
+          assert guarded["investability_status"] == "BLOCKED"
+          assert guarded["final_action"] == "DO_NOT_INVEST"
+
+          assert canonicalize_symbol("NZYM-B.CO") == "NSIS-B.CO"
+          assert canonicalize_symbol("BK.US") == "BNY.US"
+          assert provider_recovery_variants("BNY.US") == ["BNY.US", "BNY", "BK.US", "BK"]
+
+          assert len(RULES) == 3
+          assert "sequential" in GATE_VERSION
+          bny_rule = next(rule for rule in RULES if rule.requested_symbol == "BNY.US")
+          bny_check = evaluate_table(
+              bny_rule,
+              ["Symbol", "Name", "Current Price", "Data Provider"],
+              [["BNY.US", "The Bank of New York Mellon Corporation", 71.2, "eodhd"]],
+          )
+          assert bny_check["passed"] is True
+
+          result = sync.TaskResult(
+              key="GLOBAL_MARKETS",
+              sheet_name="Global_Markets",
+              status="pending",
+              start_utc="2026-07-30T00:00:00+00:00",
+          )
+          payload = result.to_dict()
+          assert "batch_metrics" in payload
+          assert isinstance(payload["batch_metrics"], dict)
+
+          sink = NoWriteSheets()
+          assert sink.write_table("sid", "P", "A1", ["Symbol"], [["A"]]) == 1
+          assert sink.planned_writes[0]["rows"] == 1
+          assert sink.clear_requests == []
+
+          print(
+              "truthful normalization + immediate EODHD 402 circuit + "
+              "provider warning diagnostics + market metadata block + "
+              "exact sequential defaults: PASS"
+          )
+          PY

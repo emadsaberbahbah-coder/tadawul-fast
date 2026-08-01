@@ -2,6 +2,22 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
+EODHD Provider — v4.15.2 (HTTP 402 PROVIDER-UNHEALTHY SIGNAL)
+
+v4.15.2 — WHY
+--------------------------------------------------------------------------------
+The production workbook carried `fetch_failed:HTTP 402` on thousands of rows.
+HTTP 402 is a provider-wide plan or endpoint-entitlement failure, but v4.15.0
+classified it as an ordinary one-symbol FetchError. The existing engine health
+registry therefore never saw `provider_unhealthy:eodhd` and retried EODHD for
+every symbol in the universe.
+
+FIX: treat an HTTP 402 error string as a provider-unhealthy trigger. The existing
+error patch then emits `provider_unhealthy:eodhd`; data_engine_v2's existing
+provider health registry demotes EODHD for its bounded TTL and proceeds to the
+next provider instead of repeating a known failing request thousands of times.
+No scoring, recommendation, schema, price-selection or Sheet-writer logic changes.
+
 EODHD Provider — v4.15.0 (UNIT-AWARE PERCENT CONVERSION: the magnitude guess
                           that silently inflated every sub-1.5% value by 100x
                           is retired)
@@ -913,6 +929,12 @@ def _validate_52w_bounds_merged(
 _PROVIDER_UNHEALTHY_TRIGGER_TOKENS: Tuple[str, ...] = (
     "auth_error",
     "ip_blocked",
+    # v4.15.2: EODHD uses HTTP 402 for plan/endpoint entitlement rejection.
+    # This is systemic, not symbol-specific, so let the existing engine health
+    # registry demote the provider and use the next provider in the chain.
+    "http 402",
+    "plan_restricted",
+    "payment_required",
 )
 
 
@@ -1017,7 +1039,7 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.15.0"
+PROVIDER_VERSION = "4.15.2"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -1180,10 +1202,10 @@ def _engine_patch_bind_enabled() -> bool:
     """v4.13.0 AS-3: when ON, the module-level get_quote_async /
     fetch_quote_async aliases return the patch dict (error shells and
     warning markers intact, never raise) so engine v5.108.1's
-    _pick_provider_callable preference order receives them. OFF =
-    legacy raise-on-err delegation (engine sees {} on failure), byte-
-    identical to v4.12.1."""
-    return _env_str("TFB_EODHD_ENGINE_PATCH_BIND", "0").strip().lower() in _TRUTHY
+    _pick_provider_callable preference order receives them. Default ON so
+    HTTP 402/auth error patches reach the engine health registry. Set the flag
+    to 0 only as an explicit rollback to legacy raise-on-error behavior."""
+    return _env_str("TFB_EODHD_ENGINE_PATCH_BIND", "1").strip().lower() in _TRUTHY
 
 
 def _circuit_breaker_enabled() -> bool:

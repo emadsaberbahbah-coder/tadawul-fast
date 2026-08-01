@@ -1,0 +1,89 @@
+name: Validate request-scoped US alias fix (branch)
+
+on:
+  push:
+    branches:
+      - perf/python-batch-concurrency-v1
+    paths:
+      - 'scripts/apply_request_scoped_us_alias_fix.py'
+      - 'scripts/repair_request_scoped_us_alias_transformer_source.py'
+      - 'scripts/repair_request_scoped_us_alias_transform_output.py'
+      - 'scripts/run_dashboard_sync.py'
+      - 'scripts/concurrent_batch_fetch.py'
+      - 'tests/test_concurrent_batch_fetch.py'
+      - 'tests/test_critical_symbol_identity.py'
+      - 'tests/test_provider_symbol_recovery.py'
+      - 'tests/test_backend_symbol_capabilities.py'
+      - '.github/workflows/apply_request_scoped_us_alias_fix_push.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-request-scoped-us-alias-fix-branch
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout branch head
+        uses: actions/checkout@v6
+        with:
+          ref: perf/python-batch-concurrency-v1
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Verify one-time transformer source is safely bounded
+        run: |
+          set -euo pipefail
+          python scripts/repair_request_scoped_us_alias_transformer_source.py
+          if ! git diff --quiet -- scripts/apply_request_scoped_us_alias_fix.py; then
+            echo '::error::The one-time alias transformer source is not in its committed safe bounded form.'
+            git diff -- scripts/apply_request_scoped_us_alias_fix.py
+            exit 1
+          fi
+
+      - name: Verify transformed output is already committed
+        run: |
+          set -euo pipefail
+          python scripts/repair_request_scoped_us_alias_transform_output.py
+          if ! git diff --quiet -- \
+            scripts/run_dashboard_sync.py \
+            tests/test_critical_symbol_identity.py; then
+            echo '::error::Request-scoped alias output drift detected. Commit the reviewed repair; CI will not mutate the branch.'
+            git diff -- \
+              scripts/run_dashboard_sync.py \
+              tests/test_critical_symbol_identity.py
+            exit 1
+          fi
+
+      - name: Compile validated sources
+        run: |
+          python -m py_compile \
+            scripts/apply_request_scoped_us_alias_fix.py \
+            scripts/repair_request_scoped_us_alias_transformer_source.py \
+            scripts/repair_request_scoped_us_alias_transform_output.py \
+            scripts/run_dashboard_sync.py \
+            scripts/concurrent_batch_fetch.py \
+            tests/test_concurrent_batch_fetch.py \
+            tests/test_critical_symbol_identity.py
+
+      - name: Run focused regression tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m pip install -q pytest httpx
+          python -m unittest \
+            tests/test_concurrent_batch_fetch.py \
+            tests/test_critical_symbol_identity.py \
+            tests/test_provider_symbol_recovery.py \
+            tests/test_backend_symbol_capabilities.py \
+            -v

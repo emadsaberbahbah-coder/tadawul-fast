@@ -315,21 +315,21 @@ def test_rds_critical_identity_policy_is_wired():
     clean, changes = rds.sanitize_active_universe(
         ["BK", "BRK-B", "FI", "3001.SR", "8270.SR", "4328.SR"]
     )
-    assert clean == ["BK.US", "BRK-B.US", "FISV.US"]
+    assert clean == ["BNY.US", "BRK-B.US", "FISV.US"]
     assert len(changes) == 6
 
 
 def test_rds_critical_symbols_are_isolated_before_normal_batches():
     rds = _rds()
     assert rds.build_isolated_batches(
-        ["AAPL", "BK.US", "MSFT", "BRK-B.US", "FISV.US"], 2
-    ) == [["BK.US"], ["BRK-B.US"], ["FISV.US"], ["AAPL", "MSFT"]]
+        ["AAPL", "BNY.US", "MSFT", "BRK-B.US", "FISV.US"], 2
+    ) == [["BNY.US"], ["BRK-B.US"], ["FISV.US"], ["AAPL", "MSFT"]]
 
 
 def test_rds_wrong_critical_issuer_cannot_report_success():
     rds = _rds()
     headers = ["Symbol", "Name", "Exchange", "Currency", "Country", "Warnings"]
-    rows = [["BK.US", "Hanwha Aerospace Co., Ltd.", "NYSE", "USD", "USA", ""]]
+    rows = [["BNY.US", "Hanwha Aerospace Co., Ltd.", "NYSE", "USD", "USA", ""]]
     _, failures = rds.quarantine_critical_rows(headers, rows)
     assert failures and rows[0][1] == ""
     result = type("Result", (), {"status": "success", "rows_failed": 0, "error": None})()
