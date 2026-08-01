@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Decision-eligibility policy v1.3 for the read-only data-free diagnostic.
 
-This thin entry point deliberately leaves the production fetch path untouched.
-It refines only diagnostic interpretation after the backend has returned rows:
+This thin entry point leaves prices, scoring, ranking, portfolio arithmetic,
+and workbook data untouched. It refines diagnostic interpretation and ensures
+the production sync-integrity boundary is armed before the evidence collector
+wraps the fetch function:
 
 * ``SAU`` / ``XSAU`` / ``SA`` are accepted venue aliases for a valid numeric
   Tadawul ``.SR`` symbol, preventing a code-vs-display false conflict;
 * an EODHD HTTP 404 remains visible in evidence, but it is not a decision block
   when the same row has a verified positive price, a non-blank name, and an
-  explicit ``xprovider_verified:`` marker from an alternative provider.
+  explicit ``xprovider_verified:`` marker from an alternative provider;
+* omitted backend rows remain visible as explicit, decision-blocked stubs in
+  exact request order, never as missing symbols.
 
 Missing facts, identity conflicts, HTTP 402, circuit-open states, timeouts and
 unverified 404 rows remain blocked. No price, score, rank, forecast or
@@ -19,8 +23,9 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from scripts import diagnose_data_free_rows as base
+from scripts.sync_integrity_v13 import ensure_installed
 
-POLICY_VERSION = "1.3.0"
+POLICY_VERSION = "1.3.1"
 __version__ = POLICY_VERSION
 
 _INSTALLED = False
@@ -86,6 +91,11 @@ def install_policy() -> None:
     _INSTALLED = True
 
 
+# run_dashboard_sync has completed importing by the time this wrapper loads.
+# Install synchronously so the evidence collector observes the same completed
+# response matrix that the production runner receives.
+if not ensure_installed():
+    raise RuntimeError("sync integrity v1.3.0 did not arm before diagnostics")
 install_policy()
 
 
