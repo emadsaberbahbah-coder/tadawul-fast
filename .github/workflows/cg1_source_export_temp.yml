@@ -1,0 +1,45 @@
+name: TEMP CG1 Source Export
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Collect current source
+        run: |
+          set -euo pipefail
+          mkdir -p cg1-source/core/providers cg1-source/scripts
+          cp core/providers/eodhd_provider.py cg1-source/core/providers/
+          cp scripts/verify_deployment.py cg1-source/scripts/
+          python - <<'PY'
+          import ast, json, pathlib
+          out = {}
+          for path in [
+              pathlib.Path('core/providers/eodhd_provider.py'),
+              pathlib.Path('scripts/verify_deployment.py'),
+          ]:
+              tree = ast.parse(path.read_text(encoding='utf-8'))
+              out[str(path)] = {
+                  'functions': sum(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) for n in ast.walk(tree)),
+                  'classes': sum(isinstance(n, ast.ClassDef) for n in ast.walk(tree)),
+              }
+          pathlib.Path('cg1-source/ast_inventory_base.json').write_text(
+              json.dumps(out, indent=2), encoding='utf-8'
+          )
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cg1-source-${{ github.run_id }}
+          path: cg1-source
+          retention-days: 1
