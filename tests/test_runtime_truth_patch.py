@@ -7,6 +7,7 @@ import unittest
 
 import core.symbols  # installs the runtime patch
 from core.analysis import identity_guard
+from core.providers.market_truth_activation import _run_bounded
 from core.symbols import normalize
 
 
@@ -121,6 +122,35 @@ class RuntimeTruthPatchTests(unittest.TestCase):
         install_runtime_truth_patch()
         self.assertIs(identity_guard.guard_sheet_rows, before)
 
+    def test_bounded_activation_retries_until_guard_is_ready(self):
+        calls = []
+
+        def ensure() -> bool:
+            calls.append(len(calls) + 1)
+            return len(calls) == 3
+
+        armed, attempts, error = _run_bounded(
+            ensure,
+            attempts=5,
+            delay_sec=0,
+            sleeper=lambda _delay: None,
+        )
+        self.assertTrue(armed)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(error, "")
+        self.assertEqual(calls, [1, 2, 3])
+
+    def test_bounded_activation_fails_closed_after_limit(self):
+        armed, attempts, error = _run_bounded(
+            lambda: False,
+            attempts=4,
+            delay_sec=0,
+            sleeper=lambda _delay: None,
+        )
+        self.assertFalse(armed)
+        self.assertEqual(attempts, 4)
+        self.assertEqual(error, "")
+
     def test_provider_init_repairs_identity_guard_import_order(self):
         code = textwrap.dedent(
             """
@@ -154,6 +184,66 @@ class RuntimeTruthPatchTests(unittest.TestCase):
             assert result["exchange"] == "PSE"
             assert result["currency"] == "PHP"
             assert result["country"] == "Philippines"
+            assert result["investability_status"] == "BLOCKED"
+            assert result["final_action"] == "DO_NOT_INVEST"
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+
+    def test_production_engine_import_order_arms_guard_before_use(self):
+        code = textwrap.dedent(
+            """
+            import time
+            import core.data_engine_v2
+            import core.providers
+            from core.analysis import identity_guard
+            from core.providers.market_truth_activation import activation_snapshot
+
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if getattr(
+                    identity_guard,
+                    "_TFB_MARKET_METADATA_TRUTH_PATCHED",
+                    False,
+                ):
+                    break
+                time.sleep(0.01)
+
+            assert getattr(
+                identity_guard,
+                "_TFB_MARKET_METADATA_TRUTH_PATCHED",
+                False,
+            ) is True, activation_snapshot()
+
+            result = identity_guard.guard_sheet_rows(
+                [{
+                    "symbol": "OQBI.OM",
+                    "name": "Oman Investment Bank",
+                    "current_price": 0.12,
+                    "exchange": "NASDAQ/NYSE",
+                    "currency": "USD",
+                    "country": "USA",
+                    "asset_class": "Equity",
+                    "warnings": "",
+                    "block_reason": "",
+                }],
+                sheet="Market_Leaders",
+                run_dedup=False,
+            ).apply()[0]
+
+            assert result["exchange"] == "MSX"
+            assert result["currency"] == "OMR"
+            assert result["country"] == "Oman"
             assert result["investability_status"] == "BLOCKED"
             assert result["final_action"] == "DO_NOT_INVEST"
             """
