@@ -19,9 +19,12 @@ jobs:
       - name: Collect current source
         run: |
           set -euo pipefail
-          mkdir -p cg1-source/core/providers cg1-source/scripts
+          mkdir -p cg1-source/core/providers cg1-source/scripts cg1-source/tests
           cp core/providers/eodhd_provider.py cg1-source/core/providers/
+          cp core/providers/eodhd_http402_circuit.py cg1-source/core/providers/
           cp scripts/verify_deployment.py cg1-source/scripts/
+          cp tests/test_eodhd_http402_circuit.py cg1-source/tests/
+          cp tests/test_eodhd_http402_guard.py cg1-source/tests/
           python - <<'PY'
           import ast, json, pathlib
           out = {}
