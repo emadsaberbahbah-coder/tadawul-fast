@@ -251,8 +251,9 @@ jobs:
             echo "| Page | $(jq -r '.page' data_free_diagnostics.json) |"
             echo "| Requested | $(jq -r '.summary.requested_symbols' data_free_diagnostics.json) |"
             echo "| Verified fresh | $(jq -r '.summary.fresh_symbols' data_free_diagnostics.json) |"
-            echo "| Decision blocked | $(jq -r '.summary.data_free_symbols' data_free_diagnostics.json) |"
-            echo "| Provider HTTP 402 rows | $(jq -r '.summary.provider_warning_counts.http_402_rows // 0' data_free_diagnostics.json) |"
+            echo "| Decision blocked | $(jq -r '.summary.decision_blocked_symbols' data_free_diagnostics.json) |"
+            echo "| Provider HTTP 402 network rows | $(jq -r '.summary.provider_warning_counts.http_402_rows // 0' data_free_diagnostics.json) |"
+            echo "| Provider circuit-open rows | $(jq -r '.summary.provider_warning_counts.circuit_open_rows // 0' data_free_diagnostics.json) |"
             echo "| Provider HTTP 404 rows | $(jq -r '.summary.provider_warning_counts.http_404_rows // 0' data_free_diagnostics.json) |"
             echo "| Metadata conflicts | $(jq -r '.summary.metadata_conflict_rows // 0' data_free_diagnostics.json) |"
             echo "| Invalid symbol shapes | $(jq -r '.summary.invalid_symbol_shape_rows // 0' data_free_diagnostics.json) |"
@@ -279,6 +280,8 @@ jobs:
               data_free_diagnostics.json
             echo
             echo 'All affected rows and the complete decision-eligibility manifest are included in the artifacts.'
+            echo
+            echo 'Provider HTTP 402 counts are actual embedded network failures. Circuit-open rows are blocked without repeating the provider request.'
             echo
             echo "Diagnostic exit code: ${{ steps.diagnostic.outputs.diagnostic_exit || 'unknown' }}"
           } >> "$GITHUB_STEP_SUMMARY"
