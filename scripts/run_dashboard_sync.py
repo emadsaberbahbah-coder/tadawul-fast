@@ -3,9 +3,41 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.30.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.31.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.31.0 — CG-6: ISSUER/VENUE IDENTITY CHECKS AT THE NATIVE FW SEAMS
+--------------------------------------------------------------------------
+EVIDENCE (2026-08-01 live workbook, two independent reads): Global_Markets
+BF-A row carrying Biofrontera name/price and DENN.US carrying Amer Sports
+data — the poisoned-last-good class FW-1 Name+P/E legs cannot see (both
+rows are named and internally coherent). PR #32 held the right checks in
+the wrong mechanism: a scripts/__init__.py deferred monkeypatch that
+NEVER arms under the production command `python scripts/
+run_dashboard_sync.py` (daily_sync.yml:830, page_refresh_recovery.yml:247
+execute the file directly; __init__ never runs), a 10ms-poll race, five
+fail-open branches, row-index reverts. Closed in favour of this build.
+FIX: critical_symbol_identity v1.1.0 owns the registry (the PR #32 set of
+34 audited identities + the two live-observed ones above, VENUE_RULES
+explicit-contradiction-only, _VALID_SR) and exposes pure
+identity_contradiction / row_identity_contradiction. This runner consults
+them at BOTH native seams: (a) the KLG keep-gate call site — a registered
+issuer mismatch, malformed .SR, or venue contradiction on the OLD row
+refuses the restore and keeps the fresh stub, named in the FW-3 verdict
+line as klg_issuer_refused; (b) _row_identity_firewall — an OUTGOING row
+with a contradiction is blanked to its stub with Warnings
+identity_quarantined:issuer:v6.31.0, joining the existing stripped set.
+Blanks never refuse; unlisted symbols pass untouched. Gate
+TFB_SYNC_KLG_ISSUER_CHECKS, DEFAULT ON (identity guards armed by default
+— standing project principle; FW-wave precedent v6.24.x shipped in-window
+on the same basis); =0 restores v6.30.0 verdicts byte-identically.
+DECLARED INTEGRITY FIX: changes only rows that carry a provably wrong
+registered identity. Offline proof hook: TFB_SYNC_IDENTITY_SELFTEST=1
+makes main() run _identity_selftest() (fixtures incl. both live cases,
+FW-2 integration, kill-switch equivalence) and exit BEFORE argparse and
+any network — the subprocess activation test drives the LITERAL
+production command shape. Zero functions removed.
 
 v6.28.0 — FW-4b SAFE NAME-DEDUP: KEEP-ONE-PER-CURRENCY, NEVER WIPE A GROUP
 --------------------------------------------------------------------------
@@ -1206,7 +1238,9 @@ try:
         build_isolated_batches,
         canonicalize_symbol,
         fail_result_on_identity,
+        identity_contradiction,
         quarantine_critical_rows,
+        row_identity_contradiction,
         sanitize_active_universe,
         validate_fresh_critical_rows,
     )
@@ -1215,7 +1249,9 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
         build_isolated_batches,
         canonicalize_symbol,
         fail_result_on_identity,
+        identity_contradiction,
         quarantine_critical_rows,
+        row_identity_contradiction,
         sanitize_active_universe,
         validate_fresh_critical_rows,
     )
@@ -1279,7 +1315,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.30.0"
+SCRIPT_VERSION = "6.31.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3030,6 +3066,7 @@ _FORCE_REFETCH_TAG = "[FORCE-REFETCH v6.29.0]"
 # certification by the identity gate this pass (read by the call site for
 # the warnings line + FW-3 verdict; single-threaded sync loop).
 _LAST_KLG_ID_SUSPECTS: list = []
+_LAST_KLG_ISSUER_REFUSED: list = []  # v6.31.0 CG-6
 # v6.29.0 B-4: per-page list of forced symbols whose old-row substitution
 # was blocked this pass (read by the call site for the report line).
 _LAST_KLG_FORCED: list = []
@@ -3051,6 +3088,14 @@ def _klg_identity_gate_enabled() -> bool:
     21:07-21:23 stamps) violates it. TFB_SYNC_KLG_IDENTITY_GATE=0/false/
     off/no restores the v6.22.3 keep-test byte-identically."""
     return (os.getenv("TFB_SYNC_KLG_IDENTITY_GATE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _klg_issuer_checks_enabled() -> bool:
+    """v6.31.0 CG-6: registered-issuer / venue / .SR-format checks at the
+    KLG keep-gate and the outgoing firewall. Default ON (identity guards
+    armed by default); TFB_SYNC_KLG_ISSUER_CHECKS=0/false/off/no restores
+    v6.30.0 verdicts byte-identically."""
+    return (os.getenv("TFB_SYNC_KLG_ISSUER_CHECKS") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _klg_old_row_identity_ok(
@@ -3140,6 +3185,22 @@ def _row_identity_firewall(
             continue
         if _guard_is_blank(row[sym_i]):
             continue
+        # v6.31.0 CG-6: outgoing issuer/venue refusal (same registry as the
+        # KLG seam; explicit contradiction only, blanks pass). Fail-open.
+        if _klg_issuer_checks_enabled():
+            try:
+                _iss2 = row_identity_contradiction(hdr, row)
+            except Exception:
+                _iss2 = ""
+            if _iss2:
+                sym = str(row[sym_i]).strip().upper()
+                blanked = ["" for _ in row]
+                blanked[sym_i] = row[sym_i]
+                if 0 <= warn_i < len(blanked):
+                    blanked[warn_i] = f"identity_quarantined:issuer:v{SCRIPT_VERSION}"
+                rows_matrix[r_i] = blanked
+                stripped.append(sym)
+                continue
         px = _coh_float(row[px_i])
         eps = _coh_float(row[eps_i])
         pe = _coh_float(row[pe_i])
@@ -3595,15 +3656,18 @@ def _append_runlog_idfirewall(
             return
         name_dup_groups = dict(list((name_dup_groups or {}).items())[:12])
         name_dup_quarantined = list(name_dup_quarantined or [])
+        _issuer = list(_LAST_KLG_ISSUER_REFUSED)          # v6.31.0 CG-6
         _dup_n = len(name_dup_groups)
-        level = "WARNING" if (klg_suspects or out_stripped or _dup_n or name_dup_quarantined) else "INFO"
-        status = "SUSPECT" if (klg_suspects or out_stripped or _dup_n or name_dup_quarantined) else "OK"
+        level = "WARNING" if (klg_suspects or out_stripped or _dup_n or name_dup_quarantined or _issuer) else "INFO"
+        status = "SUSPECT" if (klg_suspects or out_stripped or _dup_n or name_dup_quarantined or _issuer) else "OK"
         msg = (
             f"{_IDFW_TAG} {page} | klg_kept={klg_kept} | "
             f"klg_suspect_dropped={len(klg_suspects)}"
             f"{' (' + ', '.join(klg_suspects[:10]) + ('…' if len(klg_suspects) > 10 else '') + ')' if klg_suspects else ''}"
             f" | out_stripped={len(out_stripped)}"
             f"{' (' + ', '.join(out_stripped[:10]) + ('…' if len(out_stripped) > 10 else '') + ')' if out_stripped else ''}"
+            f" | klg_issuer_refused={len(_issuer)}"
+            f"{' (' + ', '.join(_issuer[:10]) + ('…' if len(_issuer) > 10 else '') + ')' if _issuer else ''}"
             f" | name_dup={_dup_n}"
             f"{' [' + '; '.join(k + 'x' + str(len(v)) for k, v in list(name_dup_groups.items())[:5]) + ']' if _dup_n else ''}"
             f" | dedup_mode={_name_dedup_mode() + ('(keep1)' if (_name_dedup_mode() == 'quarantine' and _name_dedup_safe_enabled()) else '')}"
@@ -3713,6 +3777,7 @@ def _keep_last_good_rows(
     swapped: List[str] = []
     # v6.24.0 FW-1: fresh suspects list per invocation (read by the caller).
     del _LAST_KLG_ID_SUSPECTS[:]
+    del _LAST_KLG_ISSUER_REFUSED[:]           # v6.31.0 CG-6
     del _LAST_KLG_FORCED[:]                     # v6.29.0 B-4
     _forced = _force_refetch_symbols()
     if not headers or not rows_matrix:
@@ -3775,6 +3840,10 @@ def _keep_last_good_rows(
     old_name_i = _guard_find_col(list(old_headers_raw), _GUARD_NAME_ALIASES)
     old_eps_i = _guard_find_col(list(old_headers_raw), _COH_EPS_ALIASES)
     old_pe_i = _guard_find_col(list(old_headers_raw), _COH_PE_ALIASES)
+    # v6.31.0 CG-6: issuer/venue identity columns of the OLD grid.
+    old_exch_i = _guard_find_col(list(old_headers_raw), ("Exchange", "Market"))
+    old_ccy_i = _guard_find_col(list(old_headers_raw), ("Currency",))
+    old_ctry_i = _guard_find_col(list(old_headers_raw), ("Country",))
     if old_px_i < 0:
         return rows_matrix, swapped  # cannot certify an old row as GOOD without a price
 
@@ -3804,6 +3873,25 @@ def _keep_last_good_rows(
         ):
             _LAST_KLG_ID_SUSPECTS.append(t)
             continue  # identity-suspect predecessor -> write the fresh stub
+        # v6.31.0 CG-6: registered-issuer / venue / .SR-format refusal at
+        # the native seam (see WHY). Fail-open on any exception; a refusal
+        # keeps the fresh stub and is named in the FW-3 verdict line.
+        if _klg_issuer_checks_enabled():
+            try:
+                _iss = identity_contradiction(
+                    t,
+                    row[old_name_i] if 0 <= old_name_i < len(row) else "",
+                    row[old_px_i] if 0 <= old_px_i < len(row) else "",
+                    row[old_exch_i] if 0 <= old_exch_i < len(row) else "",
+                    row[old_ccy_i] if 0 <= old_ccy_i < len(row) else "",
+                    row[old_ctry_i] if 0 <= old_ctry_i < len(row) else "",
+                )
+            except Exception:
+                _iss = ""
+            if _iss:
+                _LAST_KLG_ISSUER_REFUSED.append(f"{t}:{_iss}")
+                logger.error("%s KLG issuer refusal for %s: %s", _IDFW_TAG, t, _iss)
+                continue  # wrong registered identity -> keep the fresh stub
         aligned: List[Any] = []
         for h in headers:
             j = old_idx.get(_hnorm(h), -1)
@@ -6548,7 +6636,76 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
         await backend.close()
 
 
+def _identity_selftest() -> int:
+    """v6.31.0 CG-6: offline fixtures proving the issuer checks are live
+    IN THIS PROCESS - no argparse, no network, no sheets. Driven by the
+    subprocess activation test via TFB_SYNC_IDENTITY_SELFTEST=1 on the
+    literal production command shape."""
+    checks: list = []
+    checks.append(("live case: BF-A carrying Biofrontera refused",
+                   bool(identity_contradiction("BF-A", "Biofrontera Inc"))))
+    checks.append(("live case: correct BF-A (Brown-Forman) passes",
+                   identity_contradiction("BF-A", "Brown-Forman Corporation") == ""))
+    checks.append(("live case: DENN.US carrying Amer Sports refused",
+                   bool(identity_contradiction("DENN.US", "Amer Sports, Inc."))))
+    checks.append(("registry: AC.PS wrong issuer refused",
+                   bool(identity_contradiction("AC.PS", "Jollibee Foods"))))
+    checks.append(("format: malformed .SR refused",
+                   bool(identity_contradiction("12.SR", "Anything"))))
+    checks.append(("format: 4-digit .SR passes",
+                   identity_contradiction("1120.SR", "Al Rajhi Bank") == ""))
+    checks.append(("venue: TAQA.AB on NASDAQ/USD refused",
+                   bool(identity_contradiction("TAQA.AB",
+                        "Abu Dhabi National Energy", "3.5", "NASDAQ", "USD", ""))))
+    checks.append(("venue: blanks never refuse",
+                   identity_contradiction("TAQA.AB",
+                        "Abu Dhabi National Energy", "", "", "", "") == ""))
+    checks.append(("unlisted symbol passes untouched",
+                   identity_contradiction("VICI", "Random Name Corp") == ""))
+    hdr = ["Symbol", "Name", "Current Price", "EPS", "P/E", "Exchange",
+           "Currency", "Country", "Warnings"]
+    good = ["1120.SR", "Al Rajhi Bank", "98.5", "5.0", "19.7", "Tadawul",
+            "SAR", "Saudi Arabia", ""]
+    poison = ["DENN.US", "Amer Sports, Inc.", "24.1", "1.0", "24.1",
+              "NYSE", "USD", "USA", ""]
+    pe_broken = ["8309.T", "Some Name", "100.0", "5.0", "99.0", "TSE",
+                 "JPY", "Japan", ""]
+    saved = os.environ.get("TFB_SYNC_KLG_ISSUER_CHECKS")
+    os.environ["TFB_SYNC_KLG_ISSUER_CHECKS"] = "1"
+    m = [list(good), list(poison), list(pe_broken)]
+    _m2, stripped_on = _row_identity_firewall(list(hdr), m)
+    checks.append(("FW-2 ON: poisoned issuer row stripped",
+                   "DENN.US" in stripped_on))
+    checks.append(("FW-2 ON: legacy P/E strip still fires",
+                   "8309.T" in stripped_on))
+    checks.append(("FW-2 ON: clean row untouched",
+                   "1120.SR" not in stripped_on and m[0][1] == "Al Rajhi Bank"))
+    checks.append(("FW-2 ON: issuer tag written",
+                   str(m[1][-1]).startswith("identity_quarantined:issuer:")))
+    os.environ["TFB_SYNC_KLG_ISSUER_CHECKS"] = "0"
+    m_off = [list(good), list(poison), list(pe_broken)]
+    _m3, stripped_off = _row_identity_firewall(list(hdr), m_off)
+    checks.append(("kill-switch OFF: issuer row NOT stripped (v6.30.0 verdicts)",
+                   "DENN.US" not in stripped_off))
+    checks.append(("kill-switch OFF: legacy P/E strip byte-identical",
+                   "8309.T" in stripped_off))
+    if saved is None:
+        os.environ.pop("TFB_SYNC_KLG_ISSUER_CHECKS", None)
+    else:
+        os.environ["TFB_SYNC_KLG_ISSUER_CHECKS"] = saved
+    passed = sum(1 for _, ok in checks if ok)
+    for name, ok in checks:
+        print(("PASS " if ok else "FAIL ") + f"[IDENTITY-SELFTEST v{SCRIPT_VERSION}] " + name)
+    print(f"[dashboard_sync v{SCRIPT_VERSION}] IDENTITY SELFTEST {passed}/{len(checks)}")
+    return 0 if passed == len(checks) else 1
+
+
 def main() -> int:
+    # v6.31.0 CG-6: offline identity selftest hook - BEFORE argparse and
+    # any network so the subprocess test can drive the literal production
+    # command. Absent env -> byte-identical entry path.
+    if (os.getenv("TFB_SYNC_IDENTITY_SELFTEST") or "").strip().lower() in {"1", "true", "yes", "on"}:
+        return _identity_selftest()
     try:
         return asyncio.run(main_async())
     except KeyboardInterrupt:
