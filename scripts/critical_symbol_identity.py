@@ -203,7 +203,7 @@ def quarantine_critical_rows(
         if not isinstance(row, list) or sym_i >= len(row):
             continue
         # Provider responses are not guaranteed to echo the current request
-        # spelling. Resolve aliases here (rather than relying on the batched
+        # spelling.  Resolve aliases here (rather than relying on the batched
         # fetcher) so the same rule is selected on every call path.
         symbol = canonicalize_symbol(row[sym_i])
         rule = CRITICAL_IDENTITIES.get(symbol)
@@ -254,7 +254,7 @@ def validate_fresh_critical_rows(
     """Validate current-run proof for every requested critical identifier.
 
     This must run directly after response membership filtering, before any
-    persistence or KEEP-LAST-GOOD operation can add a predecessor row. A
+    persistence or KEEP-LAST-GOOD operation can add a predecessor row.  A
     valid predecessor protects stored data, but is deliberately not evidence
     that the provider returned the right instrument in this run.
     """
