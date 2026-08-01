@@ -6,7 +6,9 @@ on:
       - 'scripts/__init__.py'
       - 'scripts/sync_integrity_v13.py'
       - 'scripts/diagnose_data_free_rows_v13.py'
+      - 'scripts/critical_symbol_identity.py'
       - 'tests/test_sync_integrity_v13.py'
+      - 'tests/test_urgent_market_identity_firewall.py'
       - '.github/workflows/sync_integrity_v13.yml'
   push:
     branches: [main]
@@ -14,7 +16,9 @@ on:
       - 'scripts/__init__.py'
       - 'scripts/sync_integrity_v13.py'
       - 'scripts/diagnose_data_free_rows_v13.py'
+      - 'scripts/critical_symbol_identity.py'
       - 'tests/test_sync_integrity_v13.py'
+      - 'tests/test_urgent_market_identity_firewall.py'
       - '.github/workflows/sync_integrity_v13.yml'
   workflow_dispatch:
 
@@ -47,10 +51,14 @@ jobs:
             scripts/__init__.py \
             scripts/sync_integrity_v13.py \
             scripts/diagnose_data_free_rows_v13.py \
-            tests/test_sync_integrity_v13.py
+            scripts/critical_symbol_identity.py \
+            tests/test_sync_integrity_v13.py \
+            tests/test_urgent_market_identity_firewall.py
       - name: Run sync-integrity tests
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          python -m unittest -v tests.test_sync_integrity_v13
+          python -m unittest -v \
+            tests.test_sync_integrity_v13 \
+            tests.test_urgent_market_identity_firewall
