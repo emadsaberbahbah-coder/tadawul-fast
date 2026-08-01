@@ -1,0 +1,35 @@
+name: TEMP CG9 Final Source Export
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/cg9_final_export_temp.yml'
+      - 'apps_script/11_Manual_Refresh_Coordinator.gs'
+      - 'docs/MANUAL_REFRESH_PRIORITY_V1.md'
+      - 'tests/test_manual_refresh_priority_contract.py'
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Collect final CG9 inputs
+        run: |
+          set -euo pipefail
+          mkdir -p cg9-final/apps_script cg9-final/docs cg9-final/tests
+          cp apps_script/11_Manual_Refresh_Coordinator.gs cg9-final/apps_script/
+          cp docs/MANUAL_REFRESH_PRIORITY_V1.md cg9-final/docs/
+          cp tests/test_manual_refresh_priority_contract.py cg9-final/tests/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cg9-final-${{ github.run_id }}
+          path: cg9-final
+          retention-days: 1
