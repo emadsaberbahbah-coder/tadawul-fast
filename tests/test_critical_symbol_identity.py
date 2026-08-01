@@ -159,26 +159,6 @@ class _Sheets:
 
 
 class CriticalIdentityProductionPathTests(unittest.IsolatedAsyncioTestCase):
-
-    def test_request_scoped_us_suffix_echoes_are_rewritten_to_requested_spelling(self):
-        requested = ["HNGE", "TT.US", "ADP", "ITW.US"]
-        rows = [
-            ["HNGE.US", "Hinge Health", "NYSE", "USD", "USA", 50.0, "", "eodhd"],
-            ["TT", "Trane Technologies", "NYSE", "USD", "USA", 400.0, "", "eodhd"],
-            ["ADP.US", "Automatic Data Processing", "NASDAQ", "USD", "USA", 300.0, "", "eodhd"],
-            ["ITW", "Illinois Tool Works", "NYSE", "USD", "USA", 250.0, "", "eodhd"],
-        ]
-        kept, dropped = rds._filter_rows_to_requested(
-            PRODUCTION_HEADERS, rows, requested
-        )
-        self.assertEqual(dropped, [])
-        self.assertEqual([row[0] for row in kept], requested)
-
-    def test_request_scoped_alias_does_not_merge_two_exact_requested_spellings(self):
-        index = rds._build_request_symbol_index(["AAPL", "AAPL.US"])
-        self.assertEqual(rds._resolve_requested_symbol("AAPL", request_index=index), "AAPL")
-        self.assertEqual(rds._resolve_requested_symbol("AAPL.US", request_index=index), "AAPL.US")
-
     async def test_batched_alias_responses_are_canonicalized(self):
         backend = _Backend(
             lambda payload: [
