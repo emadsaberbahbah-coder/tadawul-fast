@@ -136,9 +136,40 @@ class DataFreeDiagnosticTests(unittest.TestCase):
         record = payload["data_free_rows"][0]
         self.assertIn("provider_http_402", record["reason_codes"])
         self.assertIn("provider_unhealthy_eodhd", record["reason_codes"])
+        self.assertNotIn("provider_circuit_open", record["reason_codes"])
         counts = payload["summary"]["provider_warning_counts"]
         self.assertEqual(counts["http_402_rows"], 1)
+        self.assertEqual(counts["circuit_open_rows"], 0)
         self.assertEqual(counts["provider_unhealthy_eodhd_rows"], 1)
+
+    def test_open_circuit_is_not_counted_as_another_http_402(self):
+        payload = self._payload(
+            ["MBT.PS"],
+            {
+                "MBT.PS": row(
+                    "MBT.PS",
+                    name="",
+                    price=None,
+                    provider="eodhd",
+                    exchange="PSE",
+                    currency="PHP",
+                    country="Philippines",
+                    warnings=(
+                        "fetch_failed:provider_circuit_open:eodhd:"
+                        "plan_restricted:retry_after_sec=1700; "
+                        "provider_unhealthy:eodhd"
+                    ),
+                )
+            },
+            0,
+            1,
+        )
+        record = payload["data_free_rows"][0]
+        self.assertIn("provider_circuit_open", record["reason_codes"])
+        self.assertNotIn("provider_http_402", record["reason_codes"])
+        counts = payload["summary"]["provider_warning_counts"]
+        self.assertEqual(counts["http_402_rows"], 0)
+        self.assertEqual(counts["circuit_open_rows"], 1)
 
     def test_market_metadata_conflict_blocks_otherwise_complete_row(self):
         payload = self._payload(
