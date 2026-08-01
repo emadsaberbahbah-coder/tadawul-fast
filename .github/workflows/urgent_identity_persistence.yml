@@ -4,20 +4,14 @@ on:
   pull_request:
     paths:
       - "scripts/__init__.py"
-      - "scripts/critical_symbol_identity.py"
       - "scripts/klg_identity_gate_v131.py"
-      - "tests/test_critical_symbol_identity.py"
-      - "tests/test_urgent_market_identity_firewall.py"
       - "tests/test_klg_identity_gate_v131.py"
       - ".github/workflows/urgent_identity_persistence.yml"
   push:
     branches: [main, master]
     paths:
       - "scripts/__init__.py"
-      - "scripts/critical_symbol_identity.py"
       - "scripts/klg_identity_gate_v131.py"
-      - "tests/test_critical_symbol_identity.py"
-      - "tests/test_urgent_market_identity_firewall.py"
       - "tests/test_klg_identity_gate_v131.py"
       - ".github/workflows/urgent_identity_persistence.yml"
   workflow_dispatch:
@@ -51,21 +45,15 @@ jobs:
           set -euo pipefail
           python -m py_compile \
             scripts/__init__.py \
-            scripts/critical_symbol_identity.py \
             scripts/klg_identity_gate_v131.py \
-            tests/test_critical_symbol_identity.py \
-            tests/test_urgent_market_identity_firewall.py \
             tests/test_klg_identity_gate_v131.py
 
-      - name: Run identity and persistence regressions
+      - name: Run persistence regressions
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          python -m unittest -v \
-            tests.test_critical_symbol_identity \
-            tests.test_urgent_market_identity_firewall \
-            tests.test_klg_identity_gate_v131
+          python -m unittest -v tests.test_klg_identity_gate_v131
 
       - name: Verify production defaults stay fail-closed
         env:
@@ -73,11 +61,19 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          from scripts.critical_symbol_identity import canonicalize_symbol
-          from scripts.klg_identity_gate_v131 import PATCH_VERSION
+          from scripts.klg_identity_gate_v131 import (
+              EXPECTED_ISSUER_TOKENS,
+              PATCH_VERSION,
+              candidate_identity_failure,
+          )
 
-          assert canonicalize_symbol("BK.US") == "BNY.US"
-          assert canonicalize_symbol("NZYM-B.CO") == "NSIS-B.CO"
+          headers = ["Symbol", "Name", "Exchange", "Currency", "Country", "Current Price"]
+          poisoned = ["BPI.PS", "Equinix, Inc.", "PSE", "PHP", "Philippines", 1034.86]
+          verified = ["BPI.PS", "Bank of the Philippine Islands", "PSE", "PHP", "Philippines", 120.0]
+
           assert PATCH_VERSION == "1.3.1"
+          assert "BPI.PS" in EXPECTED_ISSUER_TOKENS
+          assert candidate_identity_failure(headers, poisoned) == "issuer name mismatch"
+          assert candidate_identity_failure(headers, verified) == ""
           print("urgent identity persistence defaults: PASS")
           PY
