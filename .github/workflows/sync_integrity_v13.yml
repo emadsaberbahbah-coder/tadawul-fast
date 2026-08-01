@@ -9,9 +9,11 @@ on:
       - 'core/providers/urgent_issuer_firewall.py'
       - 'scripts/__init__.py'
       - 'scripts/sync_integrity_v13.py'
+      - 'scripts/klg_identity_gate_v131.py'
       - 'scripts/diagnose_data_free_rows_v13.py'
       - 'scripts/critical_symbol_identity.py'
       - 'tests/test_sync_integrity_v13.py'
+      - 'tests/test_klg_identity_gate_v131.py'
       - 'tests/test_urgent_market_identity_firewall.py'
       - 'tests/test_urgent_issuer_runtime_firewall.py'
       - '.github/workflows/sync_integrity_v13.yml'
@@ -24,9 +26,11 @@ on:
       - 'core/providers/urgent_issuer_firewall.py'
       - 'scripts/__init__.py'
       - 'scripts/sync_integrity_v13.py'
+      - 'scripts/klg_identity_gate_v131.py'
       - 'scripts/diagnose_data_free_rows_v13.py'
       - 'scripts/critical_symbol_identity.py'
       - 'tests/test_sync_integrity_v13.py'
+      - 'tests/test_klg_identity_gate_v131.py'
       - 'tests/test_urgent_market_identity_firewall.py'
       - 'tests/test_urgent_issuer_runtime_firewall.py'
       - '.github/workflows/sync_integrity_v13.yml'
@@ -63,9 +67,11 @@ jobs:
             core/providers/urgent_issuer_firewall.py \
             scripts/__init__.py \
             scripts/sync_integrity_v13.py \
+            scripts/klg_identity_gate_v131.py \
             scripts/diagnose_data_free_rows_v13.py \
             scripts/critical_symbol_identity.py \
             tests/test_sync_integrity_v13.py \
+            tests/test_klg_identity_gate_v131.py \
             tests/test_urgent_market_identity_firewall.py \
             tests/test_urgent_issuer_runtime_firewall.py
       - name: Run sync-integrity tests
@@ -75,5 +81,6 @@ jobs:
           set -euo pipefail
           python -m unittest -v \
             tests.test_sync_integrity_v13 \
+            tests.test_klg_identity_gate_v131 \
             tests.test_urgent_market_identity_firewall \
             tests.test_urgent_issuer_runtime_firewall
