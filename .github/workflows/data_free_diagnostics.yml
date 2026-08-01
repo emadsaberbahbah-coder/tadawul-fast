@@ -116,8 +116,12 @@ jobs:
           set -euo pipefail
           python -m compileall -q \
             scripts/diagnose_data_free_rows.py \
-            tests/test_data_free_diagnostics.py
-          python -m unittest -v tests.test_data_free_diagnostics
+            scripts/diagnose_data_free_rows_v13.py \
+            tests/test_data_free_diagnostics.py \
+            tests/test_data_free_policy_v13.py
+          python -m unittest -v \
+            tests.test_data_free_diagnostics \
+            tests.test_data_free_policy_v13
 
       - name: Require backend readiness
         run: |
@@ -198,7 +202,7 @@ jobs:
           set -euo pipefail
           code=0
 
-          python scripts/diagnose_data_free_rows.py \
+          python scripts/diagnose_data_free_rows_v13.py \
             --page "$DIAG_PAGE" \
             --sheet-id "$TARGET_SHEET_ID" \
             --backend "$TARGET_URL" \
@@ -255,6 +259,7 @@ jobs:
             echo "| Provider HTTP 402 network rows | $(jq -r '.summary.provider_warning_counts.http_402_rows // 0' data_free_diagnostics.json) |"
             echo "| Provider circuit-open rows | $(jq -r '.summary.provider_warning_counts.circuit_open_rows // 0' data_free_diagnostics.json) |"
             echo "| Provider HTTP 404 rows | $(jq -r '.summary.provider_warning_counts.http_404_rows // 0' data_free_diagnostics.json) |"
+            echo "| HTTP 404 rows verified by an alternate provider | $(jq -r '[.decision_eligibility[] | select((.reason_codes // []) | index("provider_http_404_alternate_verified"))] | length' data_free_diagnostics.json) |"
             echo "| Metadata conflicts | $(jq -r '.summary.metadata_conflict_rows // 0' data_free_diagnostics.json) |"
             echo "| Invalid symbol shapes | $(jq -r '.summary.invalid_symbol_shape_rows // 0' data_free_diagnostics.json) |"
             echo "| Unclassified data-free | $(jq -r '.summary.unclassified_data_free' data_free_diagnostics.json) |"
@@ -282,6 +287,8 @@ jobs:
             echo 'All affected rows and the complete decision-eligibility manifest are included in the artifacts.'
             echo
             echo 'Provider HTTP 402 counts are actual embedded network failures. Circuit-open rows are blocked without repeating the provider request.'
+            echo
+            echo 'A provider HTTP 404 remains visible, but it is warning-only when a named, positive-price row carries explicit cross-provider verification.'
             echo
             echo "Diagnostic exit code: ${{ steps.diagnostic.outputs.diagnostic_exit || 'unknown' }}"
           } >> "$GITHUB_STEP_SUMMARY"
