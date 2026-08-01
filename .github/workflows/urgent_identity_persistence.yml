@@ -1,0 +1,83 @@
+name: "🧯 Urgent Identity Persistence"
+
+on:
+  pull_request:
+    paths:
+      - "scripts/__init__.py"
+      - "scripts/critical_symbol_identity.py"
+      - "scripts/klg_identity_gate_v131.py"
+      - "tests/test_critical_symbol_identity.py"
+      - "tests/test_urgent_market_identity_firewall.py"
+      - "tests/test_klg_identity_gate_v131.py"
+      - ".github/workflows/urgent_identity_persistence.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "scripts/__init__.py"
+      - "scripts/critical_symbol_identity.py"
+      - "scripts/klg_identity_gate_v131.py"
+      - "tests/test_critical_symbol_identity.py"
+      - "tests/test_urgent_market_identity_firewall.py"
+      - "tests/test_klg_identity_gate_v131.py"
+      - ".github/workflows/urgent_identity_persistence.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: urgent-identity-persistence-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    name: Refuse poisoned last-good identities
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Compile focused production and test files
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            scripts/__init__.py \
+            scripts/critical_symbol_identity.py \
+            scripts/klg_identity_gate_v131.py \
+            tests/test_critical_symbol_identity.py \
+            tests/test_urgent_market_identity_firewall.py \
+            tests/test_klg_identity_gate_v131.py
+
+      - name: Run identity and persistence regressions
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m unittest -v \
+            tests.test_critical_symbol_identity \
+            tests.test_urgent_market_identity_firewall \
+            tests.test_klg_identity_gate_v131
+
+      - name: Verify production defaults stay fail-closed
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from scripts.critical_symbol_identity import canonicalize_symbol
+          from scripts.klg_identity_gate_v131 import PATCH_VERSION
+
+          assert canonicalize_symbol("BK.US") == "BNY.US"
+          assert canonicalize_symbol("NZYM-B.CO") == "NSIS-B.CO"
+          assert PATCH_VERSION == "1.3.1"
+          print("urgent identity persistence defaults: PASS")
+          PY
