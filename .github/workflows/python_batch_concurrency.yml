@@ -16,12 +16,14 @@ on:
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'scripts/diagnose_data_free_rows.py'
+      - 'scripts/diagnose_data_free_rows_v13.py'
       - 'scripts/verify_backend_symbol_capabilities.py'
       - 'scripts/verify_backend_symbol_capabilities_sequential.py'
       - 'tests/test_concurrent_batch_fetch.py'
       - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
       - 'tests/test_data_free_diagnostics.py'
+      - 'tests/test_data_free_policy_v13.py'
       - 'tests/test_runtime_truth_patch.py'
       - 'tests/test_eodhd_http402_circuit.py'
       - 'tests/test_backend_symbol_capabilities.py'
@@ -44,12 +46,14 @@ on:
       - 'scripts/run_dashboard_sync_fast.py'
       - 'scripts/benchmark_dashboard_fetch.py'
       - 'scripts/diagnose_data_free_rows.py'
+      - 'scripts/diagnose_data_free_rows_v13.py'
       - 'scripts/verify_backend_symbol_capabilities.py'
       - 'scripts/verify_backend_symbol_capabilities_sequential.py'
       - 'tests/test_concurrent_batch_fetch.py'
       - 'tests/test_provider_symbol_recovery.py'
       - 'tests/test_benchmark_dashboard_fetch.py'
       - 'tests/test_data_free_diagnostics.py'
+      - 'tests/test_data_free_policy_v13.py'
       - 'tests/test_runtime_truth_patch.py'
       - 'tests/test_eodhd_http402_circuit.py'
       - 'tests/test_backend_symbol_capabilities.py'
@@ -99,12 +103,14 @@ jobs:
             scripts/run_dashboard_sync_fast.py \
             scripts/benchmark_dashboard_fetch.py \
             scripts/diagnose_data_free_rows.py \
+            scripts/diagnose_data_free_rows_v13.py \
             scripts/verify_backend_symbol_capabilities.py \
             scripts/verify_backend_symbol_capabilities_sequential.py \
             tests/test_concurrent_batch_fetch.py \
             tests/test_provider_symbol_recovery.py \
             tests/test_benchmark_dashboard_fetch.py \
             tests/test_data_free_diagnostics.py \
+            tests/test_data_free_policy_v13.py \
             tests/test_runtime_truth_patch.py \
             tests/test_eodhd_http402_circuit.py \
             tests/test_backend_symbol_capabilities.py \
@@ -115,6 +121,7 @@ jobs:
             tests/test_provider_symbol_recovery.py \
             tests/test_benchmark_dashboard_fetch.py \
             tests/test_data_free_diagnostics.py \
+            tests/test_data_free_policy_v13.py \
             tests/test_runtime_truth_patch.py \
             tests/test_eodhd_http402_circuit.py \
             tests/test_backend_symbol_capabilities.py \
@@ -140,6 +147,7 @@ jobs:
               to_eodhd_symbol,
               to_yahoo_symbol,
           )
+          from scripts import diagnose_data_free_rows_v13 as diagnostic_policy
           from scripts import run_dashboard_sync as sync
           from scripts.concurrent_batch_fetch import build, concurrency, provider_recovery_variants
           from scripts.benchmark_dashboard_fetch import NoWriteSheets, create_parser
@@ -156,6 +164,8 @@ jobs:
           assert concurrency() == 1
           assert create_parser().parse_args([]).concurrency == 1
           assert create_diagnostic_parser().parse_args([]).concurrency == 1
+          assert diagnostic_policy.POLICY_VERSION == "1.3.0"
+          assert diagnostic_policy._exchange_matches("SAU", "Tadawul") is True
 
           assert eodhd_provider._err_indicates_provider_unhealthy("HTTP 402") is True
           assert eodhd_provider._err_indicates_provider_unhealthy(
@@ -184,6 +194,11 @@ jobs:
           assert to_yahoo_symbol("ADNOCDIST.AB") == "ADNOCDIST.AD"
           assert infer_symbol_metadata("OQBI.OM")["currency"] == "OMR"
           assert infer_symbol_metadata("ELET3.SR")["currency"] is None
+          assert getattr(
+              identity_guard,
+              "_TFB_MARKET_METADATA_TRUTH_PATCHED",
+              False,
+          ) is True
 
           guarded = identity_guard.guard_sheet_rows(
               [{
