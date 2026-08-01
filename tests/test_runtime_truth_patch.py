@@ -61,7 +61,7 @@ class RuntimeTruthPatchTests(unittest.TestCase):
         rows = [
             {
                 "symbol": "ADNOCDIST.AB",
-                "name": "",
+                "name": "ADNOC Distribution",
                 "current_price": None,
                 "exchange": "",
                 "currency": "",
@@ -71,11 +71,13 @@ class RuntimeTruthPatchTests(unittest.TestCase):
                 "block_reason": "Missing current price",
             }
         ]
-        result = identity_guard.guard_sheet_rows(
+        guarded = identity_guard.guard_sheet_rows(
             rows,
             sheet="Market_Leaders",
             run_dedup=False,
-        ).apply()[0]
+        ).apply()
+        self.assertEqual(len(guarded), 1)
+        result = guarded[0]
         self.assertEqual(result["exchange"], "ADX")
         self.assertEqual(result["currency"], "AED")
         self.assertEqual(result["country"], "United Arab Emirates")
