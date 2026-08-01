@@ -1,0 +1,56 @@
+name: 🧷 Sync Integrity v1.3
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/__init__.py'
+      - 'scripts/sync_integrity_v13.py'
+      - 'scripts/diagnose_data_free_rows_v13.py'
+      - 'tests/test_sync_integrity_v13.py'
+      - '.github/workflows/sync_integrity_v13.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/__init__.py'
+      - 'scripts/sync_integrity_v13.py'
+      - 'scripts/diagnose_data_free_rows_v13.py'
+      - 'tests/test_sync_integrity_v13.py'
+      - '.github/workflows/sync_integrity_v13.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-integrity-v13-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Preserve universe and block unknown facts
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Compile focused files
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            scripts/__init__.py \
+            scripts/sync_integrity_v13.py \
+            scripts/diagnose_data_free_rows_v13.py \
+            tests/test_sync_integrity_v13.py
+      - name: Run sync-integrity tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m unittest -v tests.test_sync_integrity_v13
