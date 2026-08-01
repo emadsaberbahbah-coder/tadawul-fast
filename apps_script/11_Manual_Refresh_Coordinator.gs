@@ -1,4 +1,25 @@
-// TADAWUL FAST BRIDGE — MANUAL REFRESH PRIORITY COORDINATOR v1.0.2
+// TADAWUL FAST BRIDGE — MANUAL REFRESH PRIORITY COORDINATOR v1.1.0
+//
+// v1.1.0 — WHY: RENEWABLE MANUAL-PAUSE IDLE LEASE (CG-9, 2026-08-01)
+// -----------------------------------------------------------------------------
+// Root cause / live evidence: Global_Markets manual refreshes can run for hours;
+// one live run remained at 1400/6190 while MANUAL_PAUSE_TTL_MS was a one-time
+// 20-minute expiry. The pause could therefore lapse while the manual runner was
+// still active, allowing an automatic execution to collide with the same work.
+//
+// Fix: the 20-minute pause is now a renewable idle lease. A long-running manual
+// page/batch loop renews only between fully completed, safely persisted batches.
+// The original request start is immutable and caps total pause time at six hours,
+// so a crashed runner cannot keep automation paused forever.
+//
+// Blast radius: coordinator pause-state and diagnostics only. No provider, score,
+// ranking, recommendation, portfolio, Sheet-write implementation, trigger
+// installation, or live Apps Script deployment changes.
+//
+// Reversibility: stop calling tfbRenewManualPause_(requestId) to retain the prior
+// fixed-idle-TTL behavior. Emergency clear, unique-trigger ownership, cleanup
+// ordering, automatic yield points, and configured.fn() invocation are unchanged.
+// Historical race-hardened assignment: TFB_REFRESH_COORDINATOR_VERSION = '1.0.2'.
 //
 // Purpose
 // -------
@@ -18,7 +39,7 @@
 // This file is inert until the existing bound Apps Script entrypoints call the
 // wrapper functions documented in docs/MANUAL_REFRESH_PRIORITY_V1.md.
 
-var TFB_REFRESH_COORDINATOR_VERSION = '1.0.2';
+var TFB_REFRESH_COORDINATOR_VERSION = '1.1.0';
 
 var TFB_REFRESH_COORDINATOR_ = Object.freeze({
   PROP_MANUAL_UNTIL_MS: 'TFB_MANUAL_REFRESH_UNTIL_MS',
@@ -31,6 +52,7 @@ var TFB_REFRESH_COORDINATOR_ = Object.freeze({
   PROP_DEFERRED_TRIGGER_ID: 'TFB_MANUAL_DEFERRED_TRIGGER_ID',
   PROP_LAST_EVENT: 'TFB_REFRESH_COORDINATOR_LAST_EVENT',
   MANUAL_PAUSE_TTL_MS: 20 * 60 * 1000,
+  MANUAL_PAUSE_MAX_TOTAL_MS: 6 * 60 * 60 * 1000,
   MANUAL_LOCK_WAIT_MS: 25 * 1000,
   AUTO_LOCK_WAIT_MS: 1000,
   COORDINATOR_LOCK_WAIT_MS: 5000,
@@ -109,6 +131,10 @@ function tfbInactivePause_() {
     requestId: '',
     untilMs: 0,
     remainingMs: 0,
+    startedAtMs: 0,
+    maxUntilMs: 0,
+    ceilingRemainingMs: 0,
+    ceilingReached: false,
     reason: '',
     requestedBy: ''
   };
@@ -122,17 +148,81 @@ function tfbDeleteManualPauseUnlocked_(props) {
   props.deleteProperty(TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REASON);
 }
 
+/**
+ * Resolve the immutable start of the current request while the caller owns the
+ * coordinator DocumentLock. Existing v1.0.2 states already carry the ISO
+ * PROP_MANUAL_REQUESTED_AT value, so they migrate without a new property.
+ */
+function tfbManualPauseStartMsUnlocked_(props, requestId, nowMs) {
+  var requestedId = String(requestId || '');
+  var currentId = props.getProperty(
+    TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUEST_ID
+  ) || '';
+  var rawStartedAt = props.getProperty(
+    TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUESTED_AT
+  ) || '';
+  var parsedStartedAt = Date.parse(rawStartedAt);
+  if (requestedId && currentId === requestedId && isFinite(parsedStartedAt)) {
+    return parsedStartedAt;
+  }
+  return Number(nowMs || tfbNowMs_());
+}
+
 function tfbWriteManualPauseUnlocked_(props, reason, requestId) {
   var nowMs = tfbNowMs_();
-  var untilMs = nowMs + TFB_REFRESH_COORDINATOR_.MANUAL_PAUSE_TTL_MS;
+  var requestIdText = String(requestId || '');
+  var previousId = props.getProperty(
+    TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUEST_ID
+  ) || '';
+  var startedAtMs = tfbManualPauseStartMsUnlocked_(
+    props,
+    requestIdText,
+    nowMs
+  );
+  var maxUntilMs = startedAtMs +
+    TFB_REFRESH_COORDINATOR_.MANUAL_PAUSE_MAX_TOTAL_MS;
+  var untilMs = Math.min(
+    nowMs + TFB_REFRESH_COORDINATOR_.MANUAL_PAUSE_TTL_MS,
+    maxUntilMs
+  );
+
+  if (untilMs <= nowMs) {
+    if (previousId === requestIdText) {
+      tfbDeleteManualPauseUnlocked_(props);
+    }
+    return {
+      requestId: requestIdText,
+      untilMs: nowMs,
+      startedAtMs: startedAtMs,
+      maxUntilMs: maxUntilMs,
+      ceilingRemainingMs: 0,
+      ceilingReached: true,
+      expired: true
+    };
+  }
+
+  var requestedBy = previousId === requestIdText
+    ? (props.getProperty(TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUESTED_BY) || '')
+    : '';
   var values = {};
   values[TFB_REFRESH_COORDINATOR_.PROP_MANUAL_UNTIL_MS] = String(untilMs);
-  values[TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUEST_ID] = String(requestId || '');
-  values[TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUESTED_AT] = new Date(nowMs).toISOString();
-  values[TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUESTED_BY] = tfbSafeUserEmail_();
-  values[TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REASON] = String(reason || 'manual-refresh');
+  values[TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUEST_ID] = requestIdText;
+  values[TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUESTED_AT] =
+    new Date(startedAtMs).toISOString();
+  values[TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUESTED_BY] =
+    requestedBy || tfbSafeUserEmail_();
+  values[TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REASON] =
+    String(reason || 'manual-refresh');
   props.setProperties(values, false);
-  return {requestId: String(requestId || ''), untilMs: untilMs};
+  return {
+    requestId: requestIdText,
+    untilMs: untilMs,
+    startedAtMs: startedAtMs,
+    maxUntilMs: maxUntilMs,
+    ceilingRemainingMs: Math.max(0, maxUntilMs - nowMs),
+    ceilingReached: untilMs >= maxUntilMs,
+    expired: false
+  };
 }
 
 /** Clear an expired pause only when the stored instance is still the one read. */
@@ -149,8 +239,17 @@ function tfbClearExpiredManualPauseIfMatch_(expectedRaw, expectedRequestId) {
       return false;
     }
 
+    var nowMs = tfbNowMs_();
     var currentUntilMs = Number(currentRaw || 0);
-    if (isFinite(currentUntilMs) && currentUntilMs > tfbNowMs_()) {
+    var startedAtMs = tfbManualPauseStartMsUnlocked_(
+      props,
+      currentRequestId,
+      nowMs
+    );
+    var maxUntilMs = startedAtMs +
+      TFB_REFRESH_COORDINATOR_.MANUAL_PAUSE_MAX_TOTAL_MS;
+    var effectiveUntilMs = Math.min(currentUntilMs, maxUntilMs);
+    if (isFinite(effectiveUntilMs) && effectiveUntilMs > nowMs) {
       return false;
     }
 
@@ -179,13 +278,21 @@ function tfbReadManualPause_() {
     ) || '';
     var untilMs = Number(raw || 0);
     var nowMs = tfbNowMs_();
+    var startedAtMs = tfbManualPauseStartMsUnlocked_(props, requestId, nowMs);
+    var maxUntilMs = startedAtMs +
+      TFB_REFRESH_COORDINATOR_.MANUAL_PAUSE_MAX_TOTAL_MS;
+    var effectiveUntilMs = Math.min(untilMs, maxUntilMs);
 
-    if (isFinite(untilMs) && untilMs > nowMs) {
+    if (isFinite(effectiveUntilMs) && effectiveUntilMs > nowMs) {
       return {
         active: true,
         requestId: requestId,
-        untilMs: untilMs,
-        remainingMs: Math.max(0, untilMs - nowMs),
+        untilMs: effectiveUntilMs,
+        remainingMs: Math.max(0, effectiveUntilMs - nowMs),
+        startedAtMs: startedAtMs,
+        maxUntilMs: maxUntilMs,
+        ceilingRemainingMs: Math.max(0, maxUntilMs - nowMs),
+        ceilingReached: effectiveUntilMs >= maxUntilMs,
         reason: props.getProperty(TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REASON) || '',
         requestedBy: props.getProperty(
           TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUESTED_BY
@@ -209,15 +316,29 @@ function tfbReadManualPause_() {
   var latestRaw = latestProps.getProperty(
     TFB_REFRESH_COORDINATOR_.PROP_MANUAL_UNTIL_MS
   ) || '';
+  var latestRequestId = latestProps.getProperty(
+    TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUEST_ID
+  ) || '';
+  var latestNowMs = tfbNowMs_();
   var latestUntilMs = Number(latestRaw || 0);
-  if (isFinite(latestUntilMs) && latestUntilMs > tfbNowMs_()) {
+  var latestStartedAtMs = tfbManualPauseStartMsUnlocked_(
+    latestProps,
+    latestRequestId,
+    latestNowMs
+  );
+  var latestMaxUntilMs = latestStartedAtMs +
+    TFB_REFRESH_COORDINATOR_.MANUAL_PAUSE_MAX_TOTAL_MS;
+  var latestEffectiveUntilMs = Math.min(latestUntilMs, latestMaxUntilMs);
+  if (isFinite(latestEffectiveUntilMs) && latestEffectiveUntilMs > latestNowMs) {
     return {
       active: true,
-      requestId: latestProps.getProperty(
-        TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUEST_ID
-      ) || '',
-      untilMs: latestUntilMs,
-      remainingMs: Math.max(0, latestUntilMs - tfbNowMs_()),
+      requestId: latestRequestId,
+      untilMs: latestEffectiveUntilMs,
+      remainingMs: Math.max(0, latestEffectiveUntilMs - latestNowMs),
+      startedAtMs: latestStartedAtMs,
+      maxUntilMs: latestMaxUntilMs,
+      ceilingRemainingMs: Math.max(0, latestMaxUntilMs - latestNowMs),
+      ceilingReached: latestEffectiveUntilMs >= latestMaxUntilMs,
       reason: latestProps.getProperty(TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REASON) || '',
       requestedBy: latestProps.getProperty(
         TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUESTED_BY
@@ -231,16 +352,28 @@ function tfbReadManualPause_() {
 function tfbClaimManualPause_(reason) {
   var claim = tfbWithCoordinatorLock_('claim-manual-pause', function() {
     var props = tfbScriptProperties_();
+    var nowMs = tfbNowMs_();
+    var currentId = props.getProperty(
+      TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUEST_ID
+    ) || '';
     var currentUntilMs = Number(
       props.getProperty(TFB_REFRESH_COORDINATOR_.PROP_MANUAL_UNTIL_MS) || 0
     );
-    if (isFinite(currentUntilMs) && currentUntilMs > tfbNowMs_()) {
+    var currentStartedAtMs = tfbManualPauseStartMsUnlocked_(
+      props,
+      currentId,
+      nowMs
+    );
+    var currentMaxUntilMs = currentStartedAtMs +
+      TFB_REFRESH_COORDINATOR_.MANUAL_PAUSE_MAX_TOTAL_MS;
+    var currentEffectiveUntilMs = Math.min(currentUntilMs, currentMaxUntilMs);
+    if (isFinite(currentEffectiveUntilMs) && currentEffectiveUntilMs > nowMs) {
       return {
         claimed: false,
-        requestId: props.getProperty(
-          TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUEST_ID
-        ) || '',
-        untilMs: currentUntilMs,
+        requestId: currentId,
+        untilMs: currentEffectiveUntilMs,
+        startedAtMs: currentStartedAtMs,
+        maxUntilMs: currentMaxUntilMs,
         reason: props.getProperty(TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REASON) || ''
       };
     }
@@ -271,8 +404,8 @@ function tfbExtendManualPause_(reason, requestId) {
     if (currentId && currentId !== String(requestId || '')) {
       return false;
     }
-    tfbWriteManualPauseUnlocked_(props, reason, requestId);
-    return true;
+    var state = tfbWriteManualPauseUnlocked_(props, reason, requestId);
+    return !state.expired;
   });
 
   tfbRecordRefreshEvent_(
@@ -280,6 +413,126 @@ function tfbExtendManualPause_(reason, requestId) {
     'requestId=' + String(requestId || '') + ' reason=' + String(reason || '')
   );
   return extended;
+}
+
+/**
+ * Renew the manual pause only between fully completed, safely persisted manual
+ * batches. The caller must retain the active requestId (or read it from
+ * tfbManualRefreshStatus().pause.requestId). Never renew after clearing a page
+ * and before completing that page's write.
+ */
+function tfbRenewManualPause_(requestId) {
+  var requestedId = String(requestId || '').trim();
+  var outcome = tfbWithCoordinatorLock_('renew-manual-pause', function() {
+    var props = tfbScriptProperties_();
+    var currentId = props.getProperty(
+      TFB_REFRESH_COORDINATOR_.PROP_MANUAL_REQUEST_ID
+   ) || '';
+    var nowMs = tfbNowMs_();
+
+    if (!requestedId) {
+      return {
+        renewed: false,
+        status: 'invalid_request_id',
+        requestId: requestedId,
+        currentId: currentId,
+        cleared: false
+      };
+    }
+    if (currentId !== requestedId) {
+      return {
+        renewed: false,
+        status: 'stale_request_id',
+        requestId: requestedId,
+        currentId: currentId,
+        cleared: false
+      };
+    }
+
+    var rawUntilMs = props.getProperty(
+      TFB_REFRESH_COORDINATOR_.PROP_MANUAL_UNTIL_MS
+    ) || '';
+    var currentUntilMs = Number(rawUntilMs || 0);
+    var startedAtMs = tfbManualPauseStartMsUnlocked_(
+      props,
+      currentId,
+      nowMs
+    );
+    var maxUntilMs = startedAtMs +
+      TFB_REFRESH_COORDINATOR_.MANUAL_PAUSE_MAX_TOTAL_MS;
+
+    // Classify the hard ceiling before the idle expiry. At the exact ceiling,
+    // both conditions can be true; the safety-relevant reason is the immutable
+    // six-hour maximum, and operators must see that named outcome.
+    if (nowMs >= maxUntilMs) {
+      tfbDeleteManualPauseUnlocked_(props);
+      return {
+        renewed: false,
+        status: 'hard_ceiling_reached',
+        requestId: requestedId,
+        currentId: currentId,
+        untilMs: nowMs,
+        startedAtMs: startedAtMs,
+        maxUntilMs: maxUntilMs,
+        ceilingRemainingMs: 0,
+        ceilingReached: true,
+        cleared: true
+      };
+    }
+    if (!isFinite(currentUntilMs) || currentUntilMs <= nowMs) {
+      tfbDeleteManualPauseUnlocked_(props);
+      return {
+        renewed: false,
+        status: 'idle_lease_expired',
+        requestId: requestedId,
+        currentId: currentId,
+        untilMs: currentUntilMs,
+        startedAtMs: startedAtMs,
+        maxUntilMs: maxUntilMs,
+        ceilingRemainingMs: Math.max(0, maxUntilMs - nowMs),
+        ceilingReached: false,
+        cleared: true
+      };
+    }
+
+    var untilMs = Math.min(
+      nowMs + TFB_REFRESH_COORDINATOR_.MANUAL_PAUSE_TTL_MS,
+      maxUntilMs
+    );
+    props.setProperty(
+      TFB_REFRESH_COORDINATOR_.PROP_MANUAL_UNTIL_MS,
+      String(untilMs)
+    );
+    return {
+      renewed: true,
+      status: 'renewed',
+      requestId: requestedId,
+      currentId: currentId,
+      untilMs: untilMs,
+      startedAtMs: startedAtMs,
+      maxUntilMs: maxUntilMs,
+      remainingMs: Math.max(0, untilMs - nowMs),
+      ceilingRemainingMs: Math.max(0, maxUntilMs - nowMs),
+      ceilingReached: untilMs >= maxUntilMs,
+      cleared: false
+    };
+  });
+
+  var eventName = outcome.renewed
+    ? 'manual-pause-renewed'
+    : (outcome.status === 'hard_ceiling_reached' ||
+       outcome.status === 'idle_lease_expired'
+      ? 'manual-pause-renewal-expired'
+      : 'manual-pause-renewal-refused');
+  tfbRecordRefreshEvent_(
+    eventName,
+    'status=' + String(outcome.status || '') +
+      ' requestId=' + requestedId +
+      ' currentId=' + String(outcome.currentId || '') +
+      ' untilMs=' + String(outcome.untilMs || 0) +
+      ' maxUntilMs=' + String(outcome.maxUntilMs || 0)
+  );
+  return outcome;
 }
 
 /** Clear only the owned request unless force=true for the owner emergency reset. */
@@ -450,7 +703,7 @@ function tfbRemoveOwnDeferredTrigger_() {
     var props = tfbScriptProperties_();
     var expectedId = props.getProperty(
       TFB_REFRESH_COORDINATOR_.PROP_DEFERRED_TRIGGER_ID
-    ) || '';
+   ) || '';
     if (!expectedId) {
       return false;
     }
@@ -516,7 +769,7 @@ function tfbExecuteManualHandler_(sourceLabel, configured, requestId) {
       // A request that cannot be queued may clear only its own pause instance.
       try {
         tfbClearManualPause_('deferred-schedule-failed', requestId, false);
-      } catch (clearErr) {
+      } catch (clearErr){
         tfbLogCleanupFailure_('clear-after-deferred-schedule-failure', clearErr);
       }
       throw scheduleErr;
@@ -542,6 +795,8 @@ function tfbExecuteManualHandler_(sourceLabel, configured, requestId) {
 
     tfbRecordRefreshEvent_('manual-started', configured.name + ' requestId=' + requestId);
     tfbToast_('Automatic refresh paused. Manual refresh started.', 'Manual refresh', 5);
+    // configured.fn() remains argument-free. Its long-running manual batch loop
+    // integrates tfbRenewManualPause_(requestId) only at safe persisted boundaries.
     var result = configured.fn();
     SpreadsheetApp.flush();
     tfbRecordRefreshEvent_('manual-finished', configured.name + ' requestId=' + requestId);
