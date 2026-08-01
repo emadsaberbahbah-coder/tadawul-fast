@@ -10,6 +10,8 @@ The report distinguishes three layers that were previously conflated:
 
 * transport health — GitHub's HTTP request to Render;
 * provider health — e.g. ``fetch_failed:HTTP 402`` embedded in a returned row;
+* provider circuit state — rows intentionally short-circuited after the first
+  plan/entitlement failure, without repeating the network call;
 * decision eligibility — verified identity, venue metadata, name and price.
 
 Missing facts remain unknown. This tool never substitutes zero, stale data or a
@@ -30,7 +32,7 @@ from typing import Any, Mapping, Sequence
 from scripts import benchmark_dashboard_fetch as benchmark
 from scripts import run_dashboard_sync as sync
 
-DIAGNOSTIC_VERSION = "1.1.0"
+DIAGNOSTIC_VERSION = "1.2.0"
 
 
 _MARKET_TRUTH: dict[str, tuple[str, str, str]] = {
@@ -43,14 +45,17 @@ _MARKET_TRUTH: dict[str, tuple[str, str, str]] = {
 }
 _VALID_SR = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
 
+# Provider-level signals live inside a successful Render response. Do not merge
+# them with the outer GitHub->Render HTTP status. In particular, an open local
+# circuit is not another HTTP 402 network event.
 _PROVIDER_PATTERNS: dict[str, tuple[str, ...]] = {
     "provider_http_402": (
         "http 402",
         "http_402",
         "status 402",
         "payment_required",
-        "plan_restricted",
     ),
+    "provider_circuit_open": ("provider_circuit_open:eodhd",),
     "provider_http_404": ("http 404", "http_404", "status 404"),
     "provider_unhealthy_eodhd": ("provider_unhealthy:eodhd",),
     "provider_timeout": ("provider_timeout", "fetch_timeout", "timed out", "timeout"),
@@ -67,6 +72,7 @@ _BLOCKING_REASONS = {
     "identity_blocked_or_quarantined",
     "provider_reported_unavailable",
     "provider_http_402",
+    "provider_circuit_open",
     "provider_http_404",
     "provider_unhealthy_eodhd",
     "provider_timeout",
@@ -318,6 +324,7 @@ def _reason_codes(
             "provider_unavailable",
             "payment_required",
             "plan_restricted",
+            "provider_circuit_open",
         )
     ):
         reasons.append("provider_reported_unavailable")
@@ -345,6 +352,7 @@ def _availability_class(
     if reason_set.intersection(
         {
             "provider_http_402",
+            "provider_circuit_open",
             "provider_http_404",
             "provider_unhealthy_eodhd",
             "provider_timeout",
@@ -497,6 +505,7 @@ def build_diagnostic_payload(
     )
     provider_warning_summary = {
         "http_402_rows": provider_warning_counts.get("provider_http_402", 0),
+        "circuit_open_rows": provider_warning_counts.get("provider_circuit_open", 0),
         "http_404_rows": provider_warning_counts.get("provider_http_404", 0),
         "provider_unhealthy_eodhd_rows": provider_warning_counts.get(
             "provider_unhealthy_eodhd",
@@ -506,7 +515,7 @@ def build_diagnostic_payload(
     }
 
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "diagnostic_version": DIAGNOSTIC_VERSION,
         "mode": "read_live_fetch_no_write_decision_eligibility",
         "page": page,
