@@ -5,13 +5,21 @@ on:
     paths:
       - '.github/workflows/sync_outcome_audit.yml'
       - 'scripts/audit_sync_outcome.py'
+      - 'scripts/freshness_verdict_v2.py'
+      - 'scripts/derive_freshness_verdict_v2.py'
       - 'tests/test_sync_outcome_audit.py'
+      - 'tests/test_freshness_verdict_v2.py'
+      - 'tests/test_derive_freshness_verdict_v2.py'
   push:
     branches: [main]
     paths:
       - '.github/workflows/sync_outcome_audit.yml'
       - 'scripts/audit_sync_outcome.py'
+      - 'scripts/freshness_verdict_v2.py'
+      - 'scripts/derive_freshness_verdict_v2.py'
       - 'tests/test_sync_outcome_audit.py'
+      - 'tests/test_freshness_verdict_v2.py'
+      - 'tests/test_derive_freshness_verdict_v2.py'
   workflow_run:
     workflows: ['🏦 Tadawul Dashboard Advanced Sync']
     types: [completed]
@@ -46,10 +54,21 @@ jobs:
           python-version: '3.11'
 
       - name: Compile auditor
-        run: python -m py_compile scripts/audit_sync_outcome.py tests/test_sync_outcome_audit.py
+        run: >-
+          python -m py_compile
+          scripts/freshness_verdict_v2.py
+          scripts/derive_freshness_verdict_v2.py
+          scripts/audit_sync_outcome.py
+          tests/test_freshness_verdict_v2.py
+          tests/test_derive_freshness_verdict_v2.py
+          tests/test_sync_outcome_audit.py
 
       - name: Run regression tests
-        run: python -m unittest tests/test_sync_outcome_audit.py
+        run: >-
+          python -m unittest
+          tests/test_freshness_verdict_v2.py
+          tests/test_derive_freshness_verdict_v2.py
+          tests/test_sync_outcome_audit.py
 
   audit-scheduled-run:
     name: Verify required market pages actually refreshed
@@ -103,17 +122,30 @@ jobs:
           run-id: ${{ steps.source.outputs.run_id }}
           github-token: ${{ github.token }}
 
+      - name: Derive Freshness Verdict v2 shadow evidence
+        run: |
+          python scripts/derive_freshness_verdict_v2.py \
+            --root downloaded-sync-artifacts \
+            --append \
+            --json-out freshness-verdict-v2-shadow.json
+
       - name: Audit page verdicts
         run: |
+          # Shadow rollout: do not add --enforce-v2 until the operational store
+          # supplies stale counts, oldest source age, and weighted API units.
           python scripts/audit_sync_outcome.py \
             --root downloaded-sync-artifacts \
+            --min-fresh-coverage 95 \
+            --max-stubs 0 \
             --json-out sync-outcome-audit.json
 
-      - name: Upload audit report
+      - name: Upload audit reports
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: sync-outcome-audit-${{ steps.source.outputs.run_id }}
-          path: sync-outcome-audit.json
+          path: |
+            sync-outcome-audit.json
+            freshness-verdict-v2-shadow.json
           retention-days: 30
           if-no-files-found: warn
