@@ -7,6 +7,29 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.32.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.33.0 — INTEGRITY CLOSEOUT (external audit P0-2 / P0-3, 2026-08-03)
+================================================================================
+P0-3a SHEETS-SERIAL DATES: Google Sheets returns date cells as numeric
+  serials under UNFORMATTED_VALUE; the ISO-only parser failed OPEN and
+  silently ignored real holds. _mh_parse_hold_until now recognizes plausible
+  serials (20000..80000, epoch 1899-12-30, naive => Riyadh) alongside ISO.
+P0-3b REJECT, NOT CLAMP: min(dt, now+12h) re-evaluated every read turned a
+  far-future cell into a PERPETUALLY-ROLLING hold. A value beyond
+  now + 12h (+60s skew) is now REJECTED -> None (fail-open, logged), matching
+  the documented ceiling contract instead of renewing it forever.
+P0-3c BENIGN HOLD SKIP: "[MANUAL-HOLD" joined _BENIGN_SKIP_MARKERS and the
+  per-task deferral now carries the marker in TaskResult.warnings, so the
+  v6.26.0 stale-skip escalation can never convert an intentional operator
+  hold into a red leg.
+P0-2 POISON-PREDECESSOR RESURRECTION CLOSED: FW-5 stripped fresh fabrications
+  but KLG/FW-KEEP could certify and restore an OLD fabricated row (nonblank
+  fabricated Name passed Leg-1; provider 'placeholder_fallback' was not in
+  the KLG error set). Central primitives are now consulted at certification:
+  _klg_provider_is_error treats _FABRICATED_PROVIDER_TOKEN as error, and
+  _klg_old_row_identity_ok adds unconditional Leg-1b via _name_is_fabricated.
+  Honest stubs (no_data_stub/placeholder_stub) remain non-error, non-GOOD.
+  ZERO functions removed; all v6.32.0 behavior otherwise byte-identical.
+================================================================================
 v6.32.0 — MANUAL-HOLD BRIDGE (operator manual refresh gets clean priority)
 --------------------------------------------------------------------------
 WHY (2026-08-02, operator report + layer audit): manual in-sheet refreshes
@@ -1359,7 +1382,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.32.0"
+SCRIPT_VERSION = "6.33.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3157,6 +3180,12 @@ def _klg_old_row_identity_ok(
     # Leg 1 (unconditional): a nameless old row is a stub, not last-GOOD.
     if name_i >= 0 and _guard_is_blank(_cell(name_i)):
         return False
+    # Leg 1b (unconditional, v6.33.0 P0-2): a FABRICATED name ("<Page>
+    # <Symbol>" pattern) is poison, not last-GOOD — closes the resurrection
+    # path where FW-5 strips the fresh fabrication and FW-KEEP/KLG then
+    # restores the old one. Same central matcher as FW-5/HF-2.
+    if name_i >= 0 and _name_is_fabricated(_cell(name_i)):
+        return False
     # Leg 2 (when testable): the row must agree with itself.
     if min(px_i, eps_i, pe_i) < 0:
         return True
@@ -3856,7 +3885,16 @@ def _klg_price_ok(v: Any) -> bool:
 
 def _klg_provider_is_error(v: Any) -> bool:
     """True iff the Data Provider cell normalizes into the error-marker set
-    (blank normalizes to '' and is therefore NEVER an error marker)."""
+    (blank normalizes to '' and is therefore NEVER an error marker).
+    v6.33.0 [P0-2]: a fabricated-placeholder provider
+    (_FABRICATED_PROVIDER_TOKEN) is unconditionally an ERROR marker, so a
+    poisoned predecessor can never be certified last-GOOD. Honest stubs
+    (no_data_stub / placeholder_stub) do NOT match and stay non-error."""
+    try:
+        if _FABRICATED_PROVIDER_TOKEN in str(v or "").casefold():
+            return True
+    except Exception:
+        pass
     return _guard_norm(v) in _KLG_ERROR_PROVIDERS
 
 
@@ -4621,27 +4659,51 @@ def _manual_hold_gate_enabled() -> bool:
 
 
 def _mh_parse_hold_until(raw: Any):
-    """Parse the hold-expiry cell. Returns an aware-UTC datetime or None.
+    """v6.33.0 [P0-3a/b]: Parse the hold-expiry cell -> aware-UTC datetime or None.
 
-    Accepts ISO-8601 ('2026-08-02T14:30:00Z', '+03:00' offsets, or the
-    space-separated form Sheets renders). A NAIVE value is interpreted as
-    Riyadh local time (UTC+3). Anything unparsable -> None (no hold).
-    The result is clamped to now + _MH_MAX_HOLD_HOURS so a bad cell can
-    never freeze automation for longer than the documented ceiling."""
+    Accepts (1) ISO-8601 ('...Z', '+03:00', or space-separated) and
+    (2) numeric Google Sheets DATE SERIALS (epoch 1899-12-30) in the
+    plausible band 20000..80000 — Sheets returns date cells as serials
+    under UNFORMATTED_VALUE, which previously failed OPEN and silently
+    ignored real holds. NAIVE values (string or serial) are Riyadh local
+    (UTC+3). A value beyond now + _MH_MAX_HOLD_HOURS (+60s clock skew) is
+    REJECTED -> None (fail-open, never a rolling re-clamp: the old
+    min(dt, now+12h) renewed a far-future hold on every read, forever).
+    Anything unparsable -> None (no hold)."""
     try:
         s = str(raw or "").strip()
         if not s:
             return None
-        if s.endswith(("Z", "z")):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc) - __import__("datetime").timedelta(
-                hours=_MH_RIYADH_OFFSET_HOURS)
-        dt_utc = dt.astimezone(timezone.utc)
+        _td = __import__("datetime").timedelta
+        dt_utc = None
+        # (2) Sheets serial branch first: pure numerics are never valid ISO.
+        try:
+            serial = float(s)
+            if 20000.0 < serial < 80000.0:
+                base = datetime(1899, 12, 30, tzinfo=timezone.utc)
+                dt_utc = (base + _td(days=serial)
+                          - _td(hours=_MH_RIYADH_OFFSET_HOURS))
+        except ValueError:
+            pass
+        if dt_utc is None:
+            if s.endswith(("Z", "z")):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc) - _td(
+                    hours=_MH_RIYADH_OFFSET_HOURS)
+            dt_utc = dt.astimezone(timezone.utc)
         now = datetime.now(timezone.utc)
-        ceiling = now + __import__("datetime").timedelta(hours=_MH_MAX_HOLD_HOURS)
-        return min(dt_utc, ceiling)
+        ceiling = now + _td(hours=_MH_MAX_HOLD_HOURS) + _td(seconds=60)
+        if dt_utc > ceiling:
+            try:
+                logger.warning("%s rejected far-future hold value %r "
+                               "(> %.0fh ceiling) — fail-open, no hold",
+                               _MANUAL_HOLD_TAG, s, _MH_MAX_HOLD_HOURS)
+            except Exception:
+                pass
+            return None
+        return dt_utc
     except Exception:
         return None
 
@@ -5416,6 +5478,7 @@ _PAGE_VERDICT_TAG = "[PAGE-VERDICT v6.26.0]"
 _BENIGN_SKIP_MARKERS = (
     "Dry run", "decision-owned", "Forbidden legacy key", "Unknown key",
     "disallows empty symbols",
+    "[MANUAL-HOLD",  # v6.33.0 P0-3c: operator hold is a benign deferral, never a red leg
 )
 _STAMP_HEADER_CANDIDATES = (
     "last updated (riyadh)", "last updated (utc)", "last updated",
@@ -6742,6 +6805,7 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
                             status="skipped", start_utc=_now, end_utc=_now,
                             duration_ms=0.0,
                             error=f"{_MANUAL_HOLD_TAG} {_mh_m}",
+                            warnings=[f"{_MANUAL_HOLD_TAG} deferred (benign): {_mh_m}"],
                         )
                 return await _run_one_task(
                     task=task,
