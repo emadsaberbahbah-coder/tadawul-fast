@@ -3,9 +3,89 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.30.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.32.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.32.0 — MANUAL-HOLD BRIDGE (operator manual refresh gets clean priority)
+--------------------------------------------------------------------------
+WHY (2026-08-02, operator report + layer audit): manual in-sheet refreshes
+collide with the Actions sync legs (now three, every 4h) and stall — e.g.
+Global_Markets stuck "PARTIAL — paused at 50 of 6190". The repository GAS
+coordinator is deployment-INERT by design (its CI verifies the inert
+banner), and even deployed its pause lives in GAS ScriptProperties which
+this Python sync cannot see. No bridge existed between the two layers.
+
+FIX — a workbook cell both layers can read is the bus:
+
+  CONTRACT: sheet tab `_Sync_Control`, any row within A1:B6 whose column-A
+  text normalizes to "manual hold until"; column B holds the hold-expiry
+  timestamp. ISO-8601 accepted with or without offset; a NAIVE value is
+  interpreted as Riyadh time (UTC+3) because the operator types local time;
+  an explicit Z/offset is honored exactly. Blank cell, past time, garbage,
+  a missing tab, or ANY read error => NO hold (fail-open: a signalling
+  hiccup must never freeze the automation). Expiry is clamped to at most
+  now+12h so a forgotten hold can never deadlock the system.
+
+  GATES (env TFB_SYNC_MANUAL_HOLD_GATE, default ON; =0/false/off/no
+  restores v6.31.0 byte-identically):
+    * STARTUP: if a hold is active the whole run defers — exit 0, one
+      "[MANUAL-HOLD v6.32.0]" line in the log and a best-effort _Run_Log
+      append, exactly the "No tasks selected" no-op semantics.
+    * PER-TASK: each task re-checks at semaphore acquisition; a task that
+      has not started its page defers with status="skipped". A task already
+      past that point finishes its page and its WRITE untouched — a write
+      in flight is never abandoned (the v6.18.0 mid-write lesson).
+  The cell is polled through a 30-second cache so per-task checks cost at
+  most one Sheets read per half-minute.
+
+  RESUME (the second half of the operator request) needs NO new code:
+  [OLDEST-FIRST v6.27.0] is default-ON, so the first automatic run after a
+  hold clears continues from the least-recently-refreshed rows — resume,
+  never restart. HEAL-FIRST keeps damaged rows at the very front.
+
+  Operator usage: set the cell before a manual session (by hand, or via the
+  optional standalone menu snippet shipped alongside: "TFB Sync Hold");
+  clear it — or simply let it expire — when done.
+ZERO functions removed; all prior WHYs preserved.
+
+================================================================================
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.31.0)
+================================================================================
+PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.31.0 — FW-5 FABRICATED-PLACEHOLDER TRIPWIRE + HEAL-FIRST POISONED-NAME FIX
+-----------------------------------------------------------------------------
+EVIDENCE (2026-08-02 Render Shell test campaign, T13):
+POST /v1/analysis/sheet-rows returned FABRICATED rows from the route's
+placeholder factory (name = "<Page> <Symbol>", sequential prices 100+idx,
+"Accumulate" recommendations, fresh timestamps, provider tag
+"advanced_analysis.placeholder_fallback"). This sync wrote them verbatim:
+Global_Markets Name cells reading "Global_Markets HELN.SW" etc., open_price
+cells of 104.00–108.00 on unrelated .SR rows, GAB$H.US at 107.00 / +7,900%.
+Backend fix shipped as advanced_analysis v4.15.0 [NO-FABRICATION]; this
+release is the sync-side defense-in-depth + residue healer:
+
+FW-5 (_fabrication_tripwire, new): on the ranked market pages, strip any
+OUTGOING row whose Name matches the "<Page> <Symbol>" fabrication pattern OR
+whose Data Provider cell contains "placeholder_fallback" — Symbol kept, all
+other cells blanked, Warnings tagged
+'identity_quarantined:fabricated_placeholder:v6.31.0'. Runs inside the FW-2
+block; stripped symbols merge into _idfw_stripped so the existing v6.25.1
+FW-KEEP last-good restore and the FW-3 _Run_Log verdict cover FW-5 with zero
+new plumbing. v4.15.0 stub rows ("no_data_stub" / "placeholder_stub") are
+NOT matched — they are honest no-data rows handled by KLG.
+
+HF-2 (HEAL-FIRST extension): rows already POISONED on the sheet carry a
+non-blank fabricated Name, so v6.24.2 HF-1 (blank-name only) never healed
+them. The heal-first partition now treats a fabricated-pattern Name as
+blank-equivalent, so existing "Global_Markets <sym>" rows jump the refresh
+queue and get refilled.
+
+ENV: TFB_SYNC_PLACEHOLDER_GUARD (default ON — identity guards armed by
+default per the declared-disarm registry lesson). =0/false/off/no disables
+BOTH FW-5 and HF-2, restoring v6.30.0 byte-identically.
+ZERO functions removed; all prior WHYs preserved.
 
 v6.28.0 — FW-4b SAFE NAME-DEDUP: KEEP-ONE-PER-CURRENCY, NEVER WIPE A GROUP
 --------------------------------------------------------------------------
@@ -1279,7 +1359,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.30.0"
+SCRIPT_VERSION = "6.32.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2906,7 +2986,13 @@ def _read_existing_page_symbols(
                 continue
             seen.add(t)
             nm = row[name_i] if name_i < len(row) else ""
-            (blanks if _guard_is_blank(nm) else named).append(t)
+            # v6.31.0 HF-2: fabricated '<Page> <Symbol>' names are
+            # poison, not identity — treat them as blank so the row
+            # jumps the heal queue and gets refilled.
+            _nm_blankish = _guard_is_blank(nm) or (
+                _placeholder_guard_enabled() and _name_is_fabricated(nm)
+            )
+            (blanks if _nm_blankish else named).append(t)
         if blanks:
             logger.info(
                 "[HEAL-FIRST v6.24.2] %s: prioritized %d blank-name symbol(s) "
@@ -3107,6 +3193,94 @@ def _row_firewall_enabled() -> bool:
     TFB_SYNC_ROW_ID_FIREWALL=0/false/off/no restores v6.23.0 (page-level
     L3b only) byte-identically."""
     return (os.getenv("TFB_SYNC_ROW_ID_FIREWALL") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+# ---------------------------------------------------------------------------
+# v6.31.0 FW-5: FABRICATED-PLACEHOLDER TRIPWIRE (WHY: see v6.31.0 header)
+# ---------------------------------------------------------------------------
+_FABRICATED_NAME_PAGES = (
+    "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
+    "My_Portfolio", "Top_10_Investments", "Insights_Analysis",
+)
+_FABRICATED_NAME_RE = re.compile(
+    r"^(?:%s)\s+\S" % "|".join(_FABRICATED_NAME_PAGES)
+)
+_FABRICATED_PROVIDER_TOKEN = "placeholder_fallback"
+_FAB_QUARANTINE_TAG = "identity_quarantined:fabricated_placeholder:v6.31.0"
+
+
+def _placeholder_guard_enabled() -> bool:
+    """v6.31.0: master switch for FW-5 + the HF-2 heal-first extension.
+    Default ON (identity guards armed by default); TFB_SYNC_PLACEHOLDER_GUARD
+    =0/false/off/no restores v6.30.0 behavior byte-identically."""
+    return (os.getenv("TFB_SYNC_PLACEHOLDER_GUARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _name_is_fabricated(value) -> bool:
+    """True iff a Name cell matches the route placeholder fabrication
+    pattern '<Page> <Symbol>' (e.g. 'Global_Markets HELN.SW'). No real
+    instrument name begins with an underscored page token + whitespace."""
+    try:
+        s = str(value or "").strip()
+    except Exception:
+        return False
+    return bool(s) and bool(_FABRICATED_NAME_RE.match(s))
+
+
+def _fabrication_tripwire(
+    headers: list,
+    rows_matrix: list,
+) -> tuple:
+    """v6.31.0 FW-5: blank every cell except Symbol on each OUTGOING row that
+    is fabricated placeholder output (Name matches '<Page> <Symbol>' OR the
+    Data Provider cell contains 'placeholder_fallback'); the Warnings column
+    (when locatable) is set to the FW-5 quarantine tag. Mutates rows in place.
+    Returns (rows_matrix, stripped_symbols). FAIL-SAFE: missing Symbol column
+    -> nothing stripped; missing Name AND Provider columns -> nothing
+    stripped. v4.15.0 honest stubs ('no_data_stub'/'placeholder_stub') are
+    never matched."""
+    stripped: list = []
+    if not headers or not rows_matrix:
+        return rows_matrix, stripped
+    hdr = list(headers)
+    sym_i = _guard_find_col(hdr, _GUARD_SYMBOL_ALIASES)
+    if sym_i < 0:
+        return rows_matrix, stripped
+    name_i = _guard_find_col(hdr, _GUARD_NAME_ALIASES)
+    prov_i = -1
+    warn_i = -1
+    for i, h in enumerate(hdr):
+        hh = str(h or "").strip().casefold()
+        if prov_i < 0 and hh in {"data provider", "data_provider", "provider"}:
+            prov_i = i
+        if warn_i < 0 and hh == "warnings":
+            warn_i = i
+    if name_i < 0 and prov_i < 0:
+        return rows_matrix, stripped
+    for r_i, row in enumerate(rows_matrix):
+        if not isinstance(row, list) or sym_i >= len(row):
+            continue
+        if _guard_is_blank(row[sym_i]):
+            continue
+        fab = False
+        if name_i >= 0 and name_i < len(row) and _name_is_fabricated(row[name_i]):
+            fab = True
+        if not fab and prov_i >= 0 and prov_i < len(row):
+            try:
+                if _FABRICATED_PROVIDER_TOKEN in str(row[prov_i] or "").casefold():
+                    fab = True
+            except Exception:
+                pass
+        if not fab:
+            continue
+        sym = str(row[sym_i]).strip().upper()
+        blanked = ["" for _ in row]
+        blanked[sym_i] = row[sym_i]
+        if 0 <= warn_i < len(blanked):
+            blanked[warn_i] = _FAB_QUARANTINE_TAG
+        rows_matrix[r_i] = blanked
+        stripped.append(sym)
+    return rows_matrix, stripped
 
 
 def _row_identity_firewall(
@@ -4427,6 +4601,106 @@ def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[
 # -----------------------------------------------------------------------------
 # Task definitions (aligned with your dashboard tabs + canonical schema)
 # -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# v6.32.0 MANUAL-HOLD BRIDGE (WHY: see the v6.32.0 header block)               #
+# --------------------------------------------------------------------------- #
+_MANUAL_HOLD_TAG = "[MANUAL-HOLD v6.32.0]"
+_MH_SHEET = "_Sync_Control"
+_MH_RANGE = "_Sync_Control!A1:B6"
+_MH_KEY_NORM = "manualholduntil"
+_MH_MAX_HOLD_HOURS = 12.0
+_MH_CACHE_TTL_SEC = 30.0
+_MH_RIYADH_OFFSET_HOURS = 3
+_MH_CACHE = {"at": None, "active": False, "msg": ""}  # at=None => never checked (monotonic() can be tiny on fresh runners)
+
+
+def _manual_hold_gate_enabled() -> bool:
+    """v6.32.0: default ON. TFB_SYNC_MANUAL_HOLD_GATE=0/false/off/no restores
+    v6.31.0 behavior byte-identically (no _Sync_Control reads at all)."""
+    return (os.getenv("TFB_SYNC_MANUAL_HOLD_GATE") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _mh_parse_hold_until(raw: Any):
+    """Parse the hold-expiry cell. Returns an aware-UTC datetime or None.
+
+    Accepts ISO-8601 ('2026-08-02T14:30:00Z', '+03:00' offsets, or the
+    space-separated form Sheets renders). A NAIVE value is interpreted as
+    Riyadh local time (UTC+3). Anything unparsable -> None (no hold).
+    The result is clamped to now + _MH_MAX_HOLD_HOURS so a bad cell can
+    never freeze automation for longer than the documented ceiling."""
+    try:
+        s = str(raw or "").strip()
+        if not s:
+            return None
+        if s.endswith(("Z", "z")):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc) - __import__("datetime").timedelta(
+                hours=_MH_RIYADH_OFFSET_HOURS)
+        dt_utc = dt.astimezone(timezone.utc)
+        now = datetime.now(timezone.utc)
+        ceiling = now + __import__("datetime").timedelta(hours=_MH_MAX_HOLD_HOURS)
+        return min(dt_utc, ceiling)
+    except Exception:
+        return None
+
+
+def _mh_read_hold(sheets: Any, spreadsheet_id: str):
+    """Read the hold cell. FAIL-OPEN: any error -> (None, ''). Never raises."""
+    try:
+        grid = sheets.read_values(spreadsheet_id, _MH_SHEET, "A1:B6")
+        if not grid or not isinstance(grid, list):
+            return None, ""
+        for row in grid:
+            if not isinstance(row, list) or not row:
+                continue
+            key = re.sub(r"[^a-z0-9]+", "", str(row[0] or "").lower())
+            if key == _MH_KEY_NORM:
+                raw = row[1] if len(row) > 1 else ""
+                return _mh_parse_hold_until(raw), str(raw or "").strip()
+        return None, ""
+    except Exception:
+        return None, ""
+
+
+def _manual_hold_active(sheets: Any, spreadsheet_id: str) -> tuple:
+    """(active: bool, human message). 30s cache keeps per-task checks cheap.
+    Gate OFF or dry callers should not reach here; callers hold that logic."""
+    now_mono = time.monotonic()
+    _at = _MH_CACHE.get("at")
+    if _at is not None and (now_mono - float(_at)) < _MH_CACHE_TTL_SEC:
+        return bool(_MH_CACHE["active"]), str(_MH_CACHE["msg"])
+    until, raw = _mh_read_hold(sheets, spreadsheet_id)
+    active = bool(until and until > datetime.now(timezone.utc))
+    msg = (f"manual hold active until {until.isoformat()} (cell: {raw!r})"
+           if active else "")
+    _MH_CACHE.update({"at": now_mono, "active": active, "msg": msg})
+    return active, msg
+
+
+def _append_runlog_manual_hold(sheets: Any, spreadsheet_id: str, msg: str) -> None:
+    """Best-effort, fail-open _Run_Log line so deferrals stay auditable."""
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        svc.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range="'_Run_Log'!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[
+                datetime.now(timezone.utc).isoformat(),
+                "WARNING", "manual_hold", "ALL", "DEFERRED",
+                f"{_MANUAL_HOLD_TAG} {msg}", "", "", "",
+                json.dumps({"version": SCRIPT_VERSION}),
+            ]]},
+        ).execute()
+    except Exception:
+        pass
+
+
 def _default_tasks() -> List[TaskSpec]:
     return [
         TaskSpec(key="MY_PORTFOLIO", sheet_name="My_Portfolio", gateway="enriched", priority=1, max_symbols=800, allow_empty_symbols=True, expects_rows=True),
@@ -6102,6 +6376,28 @@ async def _run_one_task(
                 rows_matrix, _idfw_stripped = _row_identity_firewall(
                     headers, rows_matrix
                 )
+                # --- v6.31.0 FW-5: fabricated-placeholder tripwire --------
+                # Merges into _idfw_stripped so FW-KEEP last-good restore
+                # and the FW-3 verdict cover FW-5 strips with zero plumbing.
+                if _placeholder_guard_enabled():
+                    rows_matrix, _fab_stripped = _fabrication_tripwire(
+                        headers, rows_matrix
+                    )
+                    if _fab_stripped:
+                        _fab_msg = (
+                            f"{_IDFW_TAG} FW-5 quarantined "
+                            f"{len(_fab_stripped)} FABRICATED placeholder "
+                            f"row(s) on '{task.sheet_name}': "
+                            f"{', '.join(_fab_stripped[:15])}"
+                            f"{'…' if len(_fab_stripped) > 15 else ''} — "
+                            f"route-fabricated name/provider pattern."
+                        )
+                        res.warnings.append(_fab_msg)
+                        logger.warning(_fab_msg)
+                        _seen_strip = set(_idfw_stripped)
+                        _idfw_stripped = list(_idfw_stripped) + [
+                            s for s in _fab_stripped if s not in _seen_strip
+                        ]
                 if _idfw_stripped:
                     _fw = (
                         f"{_IDFW_TAG} quarantined {len(_idfw_stripped)} "
@@ -6399,6 +6695,15 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     sheets = SheetsWriter()
     _idfw_selftest_()  # v6.24.1 ST-1: verify guards on fixtures before any page
 
+    # --- v6.32.0 MANUAL-HOLD startup gate --------------------------------
+    if _manual_hold_gate_enabled() and not bool(args.dry_run):
+        _mh_active, _mh_msg = _manual_hold_active(sheets, spreadsheet_id)
+        if _mh_active:
+            logger.warning("%s deferring entire run — %s", _MANUAL_HOLD_TAG, _mh_msg)
+            _append_runlog_manual_hold(sheets, spreadsheet_id, _mh_msg)
+            summary.total_tasks = 0
+            return 0
+
     lock_name = f"{spreadsheet_id}:{','.join([_canon_key(t.key) for t in tasks])}"
     lock = RedisLock(lock_name, ttl_sec=600)
 
@@ -6424,6 +6729,20 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
 
         async def _guarded(task: TaskSpec) -> TaskResult:
             async with sem:
+                # v6.32.0: a task that has NOT started defers under a manual
+                # hold; a task already past this point finishes page + write.
+                if _manual_hold_gate_enabled() and not bool(args.dry_run):
+                    _mh_a, _mh_m = _manual_hold_active(sheets, spreadsheet_id)
+                    if _mh_a:
+                        logger.warning("%s skipping '%s' — %s",
+                                       _MANUAL_HOLD_TAG, task.sheet_name, _mh_m)
+                        _now = _utc_now().isoformat()
+                        return TaskResult(
+                            key=task.key, sheet_name=task.sheet_name,
+                            status="skipped", start_utc=_now, end_utc=_now,
+                            duration_ms=0.0,
+                            error=f"{_MANUAL_HOLD_TAG} {_mh_m}",
+                        )
                 return await _run_one_task(
                     task=task,
                     spreadsheet_id=spreadsheet_id,
