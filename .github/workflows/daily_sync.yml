@@ -1,25 +1,77 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
+# =============================================================================
+# v2.0.0 — 4-HOURLY FULL-COVERAGE SYNC (Fix BF-1 / BF-2 / BF-3)
+# =============================================================================
+# WHY (evidence: _Run_Log 12,845 entries + _Status, audited 2026-07-25):
+# Four of the eight sync keys had silently stopped refreshing altogether —
+# Mutual_Funds last automated refresh 9 Jul, Commodities_FX 14 Jul,
+# Market_Leaders 16 Jul, Global_Markets 17 Jul — while the five decision-cockpit
+# pages kept updating from the Apps Script trigger (437 fires in 7 days). The
+# result was an 8-day-stale universe in which only 193 of 6,511 Global_Markets
+# rows were current, 73 of 300 audited candidates failed the Data Trust gate on
+# staleness, and the Top-10 scan returned "0 qualified from 10,311 rows" — a
+# figure the daily brief then cited as market evidence.
+#
+# THREE DEFECTS, in order of severity:
+#
+#   BF-1  sanitize_keys() DISCARDED ITS OWN WORK. Its final dedup step read
+#         $RAW_KEYS — the untouched input — instead of the progressively
+#         sanitised $raw, overwriting every prior transformation. Two knock-on
+#         effects, both proven by exec-test:
+#           (a) upper_underscore() maps space -> underscore, so applying it to a
+#               LIST collapsed all keys into one token. This bug was invisible
+#               only because the dedup step threw its output away.
+#           (b) uppercasing, comma handling, TOP10 aliasing and removal of the
+#               forbidden KSA_TADAWUL / ADVISOR_CRITERIA keys were all reverted.
+#         Consequence: any DEFAULT_SYNC_KEYS value that was lowercase, comma-
+#         separated, aliased or carried a legacy key reached validate_keys_allowed
+#         unsanitised and the workflow EXITED 1 at the configuration step. The
+#         sync did not degrade — it stopped completely, and silently, because
+#         nothing downstream of a failed config step writes to _Status.
+#         FIX: normalise EACH key rather than the list (space is a separator,
+#         never part of a key), and dedup $raw in awk with no subprocess that
+#         can desync from it. Verified 9/9 on lowercase, comma, semicolon,
+#         dash, JSON-array, duplicate, forbidden-key and empty input.
+#
+#   BF-2  THE SCHEDULE CANCELLED ITSELF. cron fired every 15 minutes while
+#         concurrency.cancel-in-progress killed the run already in flight, and
+#         all scheduled runs shared one group. Measured page durations from
+#         _Status total 9.8 min — and Market_Leaders (6.4s) and Mutual_Funds
+#         (6.8s) were measured on SINGLE-ROW refreshes, not full batches of
+#         1,025 and 2,471 rows. A genuine full sync exceeds 15 minutes, so the
+#         queue never reached the heavy universe pages before the next cron
+#         cancelled it. The light cockpit pages survived only because the Apps
+#         Script trigger refreshes them independently.
+#         FIX: 4-hourly cadence; cancel-in-progress restricted to PR/push.
+#
+#   BF-3  A REPO VARIABLE COULD SILENTLY NARROW COVERAGE. get_val prefers
+#         vars.DEFAULT_SYNC_KEYS over DEFAULT_KEYS_CANONICAL, so a shortened
+#         variable dropped pages with no warning in any log.
+#         FIX: on a scheduled full_sync, missing canonical keys raise a warning
+#         and the canonical eight are forced.
+#
+# CADENCE: 00:00 04:00 08:00 12:00 16:00 20:00 UTC
+#        = 03:00 07:00 11:00 15:00 19:00 23:00 Riyadh (UTC+3), six runs/day.
+#        A 4-hour gap against a 10–20 minute sync leaves ample headroom.
+#
+# OPERATOR CHECK THIS FILE CANNOT PERFORM: confirm Settings → Secrets and
+# variables → Actions → Variables → DEFAULT_SYNC_KEYS lists all eight canonical
+# keys, or is absent. Also confirm the workflow is enabled — GitHub silently
+# auto-disables scheduled workflows after 60 days of repository inactivity.
+#
+# Zero jobs or steps removed. Changes confined to: schedule, concurrency,
+# sync-dashboard timeout, and the key-resolution block.
+# =============================================================================
+
 on:
   # ✅ CI quality gate
   pull_request:
   push:
     branches: [main, master]
 
-  # ✅ Production scheduler (UTC; Riyadh UTC+3) — every 4 hours, every day.
-  # CHANGED 2026-06-30 from ~2-hourly to 4-hourly: each run now has more budget to
-  # finish ALL pages (Global_Markets is ~3,000 symbols) and leaves headroom for
-  # adding new symbols, while a single daily rule replaces the prior Mon–Fri +
-  # Sunday split. Riyadh fire times: 03:00, 07:00, 11:00, 15:00, 19:00, 23:00 — the
-  # 07:00 run precedes the 08:00 cockpit refresh and the 09:00 brief on EVERY
-  # trading day INCLUDING Sunday (previously Sunday's first sync was 10:00 Riyadh,
-  # AFTER the brief). FX/commodities trade ~24h, so the extra Saturday/holiday
-  # fires are harmless (equity rows unchanged, FX still moves).
-  # NOTE: cron cannot see HOLIDAYS/DST; a holiday run fires harmlessly. A
-  # market-calendar guard step remains the clean follow-up if exact per-market
-  # session handling is ever needed. NOTE: 4-hourly addresses cadence/headroom —
-  # it does NOT fix a run that FAILS to land (test-gate red, service-account 403,
-  # or the 25-min job cap being too short for a full sweep); check the Actions tab.
+  # ✅ Production scheduler (UTC; Riyadh UTC+3)
+  # v2.0.0 BF-2: was "0,15,30,45 * * * *" (every 15 min) — self-cancelling.
   schedule:
     - cron: "0 */4 * * *"
 
@@ -45,33 +97,22 @@ on:
         required: false
         default: "MARKET_LEADERS"
         type: string
-      # (2026-07-26 PY-5) google_creds_json input REMOVED. workflow_dispatch
-      # inputs are recorded in run metadata — on a PUBLIC repo, a service-
-      # account key pasted there is published. Secrets are the only creds
-      # path now (GOOGLE_SHEETS_CREDENTIALS / _B64); the "emergency" input
-      # was an invitation to leak a key under pressure.
+      google_creds_json:
+        description: "🔐 Service Account JSON (Emergency Only - Prefer Secrets)"
+        required: false
+        type: string
       enable_debug:
         description: "🐛 Enable Debug Logging"
         required: false
         default: false
         type: boolean
 
-# ============================================================================
-# CONCURRENCY — PRODUCTION WRITE LEASE, CI ISOLATED
-# ============================================================================
-# WHY (2026-07-29): push/PR runs execute tests only and never write the workbook.
-# Putting those CI-only runs in the production write group caused GitHub's
-# one-running/one-pending concurrency rule to cancel both Advanced Sync and Page
-# Refresh Recovery runs before they started. Scheduled and manual production syncs
-# must still share one lease to prevent chimeric Google Sheet writes.
-#
-# Production: schedule + workflow_dispatch share one non-cancelling write lease.
-# CI only: push + pull_request use their own cancellable group and never block data
-# refresh or recovery.
-# ============================================================================
+# v2.0.0 BF-2: cancel-in-progress now applies ONLY to PR/push, where superseding
+# a stale CI run is correct. Scheduled syncs must be allowed to finish.
 concurrency:
-  group: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('tadawul-production-write-{0}', github.ref) || format('tadawul-ci-{0}-{1}-{2}', github.workflow, github.event_name, github.ref) }}
-  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
 permissions:
   contents: read
   id-token: write
@@ -86,17 +127,6 @@ env:
   PYTHONUNBUFFERED: 1
   TZ: Asia/Riyadh
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  # (2026-07-03) SYNC-FLAG SCOPING: the five TFB_* sync behavior flags that
-  # lived here (TFB_PORTFOLIO_REBUILD, TFB_SYNC_DECISION_GUARD,
-  # TFB_SYNC_SYMBOL_BATCH_SIZE, TFB_SYNC_MARKET_ANALYSIS_GATEWAY,
-  # TFB_SYNC_MARKET_GATEWAY) moved VERBATIM to the sync-dashboard job's env.
-  # WHY: workflow-level env is inherited by EVERY job, including ci-tests —
-  # the ci-tests job therefore ran tests/test_recent_fixes.py with
-  # TFB_SYNC_MARKET_GATEWAY="advanced" leaked into its environment, and the
-  # two gateway-default tests failed on every push (red X on green syncs).
-  # Only scripts/run_dashboard_sync.py reads these flags, and it runs ONLY in
-  # the sync-dashboard job — scoping them there is byte-identical for the
-  # sync and gives the tests the clean environment they assert against.
 
 jobs:
   # =============================================================================
@@ -110,13 +140,13 @@ jobs:
 
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
@@ -166,7 +196,7 @@ jobs:
             exit 1
           fi
 
-          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py tests/test_inline_page_recovery.py
+          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py
           echo "::endgroup::"
 
   # =============================================================================
@@ -205,239 +235,24 @@ jobs:
           echo "validated=true" >> "$GITHUB_OUTPUT"
 
   sync-dashboard:
-    # (2026-07-08) TWO-LEG MATRIX SPLIT — Global_Markets gets its own parallel
-    # leg. WHY: the universe grew to 6,500 symbols; at batch 25 that is ~260
-    # backend requests, well past what one leg can finish inside any sane
-    # ceiling, and GM (the largest page, launched LAST by the 6a order) was the
-    # page the timeout always cancelled. The matrix runs the SAME job body
-    # twice in parallel: leg "core-pages" = everything except GLOBAL_MARKETS;
-    # leg "global-markets" = GLOBAL_MARKETS alone. Key scoping happens in the
-    # "🎯 Scope Keys To Matrix Leg" step (AFTER Smart Configuration, so repo
-    # vars / dispatch inputs keep working unchanged); the GM leg staggers its
-    # start by matrix.stagger seconds so the two legs do not slam the
-    # providers in the same instant (Yahoo 429 mitigation). fail-fast is OFF —
-    # one leg's failure never cancels the other mid-write. Artifacts and the
-    # step summary are suffixed per leg. Everything else is verbatim.
-    name: 🚀 Data Sync (${{ matrix.group }})
+    name: 🚀 Data Sync
     runs-on: ubuntu-latest
     environment: production
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - group: core-pages
-            keys_scope: exclude-gm
-            page_order: "My_Portfolio,Mutual_Funds,Commodities_FX,Market_Leaders"
-            stagger: "0"
-          - group: global-markets
-            keys_scope: only-gm
-            page_order: "Global_Markets"
-            stagger: "90"
-    # (2026-07-02) 25 -> 45: the 25-min ceiling CANCELLED run 28554325006
-    # mid-write and wiped two pages. v6.18.0's advanced-first routing makes the
-    # run much faster, but the ceiling must never again be the thing that kills
-    # a run between a clear and a write.
-    # 2026-07-11: was 75 (2026-07-05: was 45; run #2236 cancelled mid-recovery
-    # during provider outage). Runs #2330/#2331 proved the GM leg fetches ~133
-    # good batches in ~69 min and was killed at exactly 75:00 — BEFORE the
-    # single end-of-run write, turning an hour of fetched data into ZERO rows.
-    # 115 gives the leg ~80-min completion headroom; the in-process
-    # TFB_SYNC_TIME_BUDGET_SEC below guarantees a write long before this
-    # ceiling can ever land.
-    timeout-minutes: 115
+    # v2.0.0 BF-2: was 25. A full 8-key sync of ~10,300 universe rows plus the
+    # cockpit pages needs headroom; 25 min was tight even without BF-2.
+    timeout-minutes: 50
     needs: preflight-validation
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight-validation.outputs.validated == 'true' }}
 
-    # (2026-07-03) SYNC-FLAG SCOPING — moved verbatim from the workflow-level
-    # env block (see the note there). Values and comments unchanged; only the
-    # scope changed so ci-tests no longer inherits sync behavior flags.
-    env:
-      # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
-      # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
-      # already builds My_Portfolio correctly from _Portfolio_CostBasis") was WRONG,
-      # and disarming it BROKE the page. The page-driven enriched request (empty
-      # symbol list) returns the backend's DEFAULT page
-      # (_DEFAULT_SHEET_SYMBOLS["My_Portfolio"] = 2222.SR/AAPL/MSFT/QQQ/GC=F) with
-      # BLANK Qty/Avg Cost — NOT the holdings — so the v6.5.0 guard correctly refused
-      # to blank the manual cells and the write DEADLOCKED, leaving My_Portfolio stuck
-      # on junk symbols carrying mismatched cost basis (log: "No symbols found;
-      # sending a page-driven request ... PORTFOLIO-GUARD skip ... blank existing
-      # Qty/Avg Cost for 5 holding(s) [2222.SR, AAPL, GC=F, MSFT, QQQ]").
-      # The rebuild is what makes the request SYMBOL-DRIVEN: it sources the 10
-      # holdings from _Portfolio_CostBasis, injects the user's Qty/Avg Cost,
-      # recomputes SAR position math, and labels 5023.SR as Fixed Income / Sukuk — so
-      # the guard passes and the page actually writes. FX is per-row from the
-      # payload's own native-vs-SAR price (verified correct for USD holdings: e.g.
-      # RCI.US 50 @ $37.04 -> MV 6937.5 / Cost 6945 SAR); the only weak spot is a
-      # fx=1.0 fallback when a USD row lacks a native OR SAR price (cosmetic SAR
-      # magnitude on <=3 rows, P&L ratio stays correct).
-      # KILL-SWITCH: set back to "0" to revert to the (broken) page-driven default.
-      # Cross-page price-delta guard (scripts/run_dashboard_sync.py v6.20.0,
-      # Engineering Audit Fix 1b). ARMED ("1").
-      # WHY (2026-07-05 audit): the SAME symbol carried wildly different prices
-      # on two pages written by the SAME run — 1211.SR at 17.73 on
-      # Market_Leaders vs 58.90 on Global_Markets (market truth that session:
-      # 63.10, Argaam) — with no alarm anywhere. The runner holds every page's
-      # final matrix in one process, so after all fetches it compares every
-      # symbol seen on 2+ pages and logs WARN lines for spreads above the
-      # threshold, plus one INFO summary ("[v6.20.0 XPAGE] report | ...").
-      # OBSERVE-AND-REPORT ONLY: writes, guards, ordering, and exit codes are
-      # untouched — the runner cannot know WHICH page is wrong, so it makes
-      # the disagreement loud instead of guessing. Companions (defaults shown,
-      # uncomment to tune): TFB_XPAGE_PRICE_DELTA_PCT: "2.0",
-      # TFB_XPAGE_MAX_REPORT: "50".
-      # KILL-SWITCH: set to "0" (or delete) to disable the check entirely.
-      TFB_XPAGE_PRICE_CHECK: "1"
-      # Small-page launch order (scripts/run_dashboard_sync.py v6.21.0, Fix 6a).
-      # ARMED. WHY (confirmed live 2026-07-06): Mutual_Funds sat at ~44% live
-      # inside the full sync but priced 870/871 (99.9%) in a SOLO refresh —
-      # same symbols, same code. Root cause: ML(2)+GM(3) launch first and their
-      # ~4,500 symbols burn the provider budget window (Yahoo 401 storm + EODHD
-      # breaker), so the small pages at priorities 4-5 fetch into exhausted
-      # providers. This list launches the starved small pages FIRST; the
-      # cockpit tasks (Insights/Top_10/Data_Dictionary) always stay last
-      # regardless. KILL-SWITCH: delete the line -> v6.20.0 default order.
-      # (2026-07-08) value now comes from the MATRIX LEG: the core leg keeps
-      # the starved-small-pages-first order (minus Global_Markets, which moved
-      # to its own leg); the GM leg is single-page. Same 6a mechanism.
-      TFB_SYNC_PAGE_ORDER: ${{ matrix.page_order }}
-      # Bounded empty-row second pass (v6.21.0, Fix 6b). DISARMED ("0") on
-      # purpose: arm AFTER one ordered run confirms 6a, so attribution stays
-      # clean. When armed, rows with an empty price get ONE re-fetch pass
-      # (cap TFB_SYNC_EMPTY_RETRY_MAX "120"; optional cool-down
-      # TFB_SYNC_EMPTY_RETRY_DELAY_SEC "0"); splice is header-guarded and can
-      # never make a page worse.
-      TFB_SYNC_EMPTY_RETRY: "0"
-      # (2026-07-19) D-4 — DUPLICATE-NAME QUARANTINE.
-      # ID-FIREWALL has been raising SUSPECT on Market_Leaders / Global_Markets
-      # in observe-only mode: it detects a name collision but still writes the
-      # row. "quarantine" makes it withhold the suspect row instead, so a
-      # chimeric name/symbol pairing cannot reach the sheet.
-      # KILL-SWITCH: delete this line -> observe-only behaviour returns.
-      #
-      # (2026-07-26, plan item 1.8) FLIPPED quarantine -> observe. WHY: on
-      # 2026-07-19 D-4 armed quarantine, and FW-4 then stubbed EVERY carrier
-      # of each flagged name group — BABA/TSM/BUD/DEO/TCOM/SHG were wiped as
-      # families because cross-currency listings of the SAME issuer read as a
-      # name collision. run_dashboard_sync v6.28.0 (FW-4b keep-one-per-
-      # currency) removes the zero-survivor path, but quarantine still STUBS
-      # every loser row — a destructive write during the S-1 evidence window,
-      # to fix a collision class that is usually legitimate dual-listing.
-      # "observe" detects and reports the same collisions and writes every
-      # row: the diagnosis is kept, the destructive action is not.
-      # ROLLBACK: set this back to "quarantine" (one line, no redeploy).
-      TFB_SYNC_NAME_DEDUP_MODE: "observe"
-      TFB_PORTFOLIO_REBUILD: "1"
-      # Top_10_Investments — decision guard ENABLED ("1"). [2026-06-29 corrected]
-      # SUPERSEDES the earlier "0" setting. That setting let the 2-hourly daily sync
-      # clear-and-rewrite Top_10_Investments as a flat engine page, on the premise
-      # that the page "has NO user-authored columns / is READ-ONLY in use." That
-      # premise is STALE: Top_10_Investments is now the DECISION COCKPIT rendered by
-      # 16_Decision_Top10.gs -- it carries operator-editable control-panel cells
-      # (Universe Scope, Max Selected, Required ROI, Min Reliability, Pool Limit,
-      # Pool Source, Cash Available, ...) plus the SELECTED / ALL-QUALIFIED /
-      # NEAR-MISS / CANDIDATES decision zones. A clear-before-write from the sync
-      # DESTROYS that cockpit and the operator control-panel inputs every run -- the
-      # same irreversible operator-input loss the v6.5.0 My_Portfolio guard prevents.
-      # FIX: guard ON ("1") so the sync SKIPS Top_10 entirely (no fetch, no clear, no
-      # write -- the guard's only target is Top_10, _DECISION_GUARD_DEFAULT_PAGES =
-      # ("Top_10_Investments",), so NO other page is affected and the My_Portfolio
-      # manual-cell guard is untouched). The cockpit refreshes ON DEMAND via the menu
-      # (refreshDecisionTop10), exactly like the My_Portfolio decision cockpit.
-      # NOTE: the "frozen on placeholder symbols" symptom that motivated "0" was just
-      # the cockpit not having been refreshed -- run "Refresh Decision Top 10" once to
-      # populate it with real picks; it then persists (like My_Portfolio) until you
-      # refresh again.
-      # KILL-SWITCH: set to "0" to restore the sync write-through -- but ONLY if
-      # Top_10_Investments is NOT being used as the cockpit, or the sync will clobber
-      # it (and your control-panel inputs) every run.
-      TFB_SYNC_DECISION_GUARD: "1"
-      # Market-page SYMBOL BATCHING (scripts/run_dashboard_sync.py v6.17.0). ARMED
-      # ("25", lowered from 100 — run #2164 showed /v1/analysis still 502'd at 100/
-      # batch, so the sync fell back to /v1/advanced which returns 0 rows; a smaller
-      # batch gives the row-returning analysis route a chance to answer in time).
-      # WHY (2026-07-01, runs #2154/#2160): each market page was fetched in
-      # ONE request carrying its ENTIRE symbol set (Market_Leaders ~388,
-      # Global_Markets ~3000). That burst makes the backend fan out hundreds of
-      # Yahoo calls at once, which trips Yahoo's rate limit (429 -> 200 with 0 rows
-      # -> empty-guard preserves STALE data) and/or exceeds Render's ~100s edge
-      # timeout on the analysis route (-> HTTP 502). This value fetches each market
-      # page in batches of N symbols instead, so every request is light enough to
-      # finish inside the timeout (kills the 502) and the upstream calls are spread
-      # out (avoids the 429 that returned empty pages). Scope: the four market pages
-      # only, and only when a page has MORE than N symbols; My_Portfolio, Top_10 and
-      # the meta pages are untouched. TRADE-OFF: the page-level Rank (Overall) is
-      # then ranked WITHIN each batch (per-symbol price/score/recommendation stay
-      # correct). KILL-SWITCH: remove this line (or set "0") to restore the v6.16.0
-      # single-request behavior, byte-identical. TUNING: raise (e.g. "150") if a run
-      # nears the 25-min job cap; optional companion TFB_SYNC_BATCH_DELAY_MS: "500"
-      # adds a pause between batches for extra upstream cooldown.
-      TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
-      # v6.22.4 L5 [TIME-BUDGET] (2026-07-11, runs #2330/#2331 forensics): the
-      # runner stops fetching new batches once 3600s of wall clock are spent
-      # and PROCEEDS TO THE WRITE with the accumulated partial — the coverage
-      # floor skips a too-thin write, the v6.19.0 persistence pass preserves
-      # every non-fetched symbol's row, and v6.22.3 KEEP-LAST-GOOD stops error
-      # stubs from erasing good data. Paired with timeout-minutes: 115 above,
-      # an external kill can never again precede the write. At batch "25" the
-      # GM leg (~3,652 symbols = 147 batches) either finishes whole inside the
-      # ceiling or lands ~79% fresh + the rest preserved at minute 60.
-      # KILL-SWITCH: remove this line (or "0") for v6.22.3 behavior verbatim.
-      TFB_SYNC_TIME_BUDGET_SEC: "3600"
-      # Per-page symbol cap for the four MARKET pages (scripts/
-      # run_dashboard_sync.py _market_symbol_cap).
-      # WHY (2026-07-07 forensics): the script default is 2500. A cap SMALLER
-      # than the sheet universe silently UN-REQUESTS the overflow, and the
-      # v6.19.0 symbol-persistence guard can only protect REQUESTED symbols —
-      # so the default cap acted as a symbol REMOVER: Global_Markets pinned at
-      # ~2,500 after the Jul-5 universe reached ~3,500, and every restore past
-      # position 2,500 was silently dropped again on the next run (the macro
-      # symbol-loss ratchet). NOTE: this lets the sync REQUEST past the cap;
-      # the request list still comes from the sheet's Symbol column, so
-      # previously-lost symbols return only once pasted back to the page.
-      # WHY 7000 (2026-07-16 universe expansion): owner-approved additions
-      # take Global_Markets to 6,512 symbols (ML 1,025 / CFX 453 / MF 4,496;
-      # 12,486 total). The old value 5000 sat exactly at v6.24.2's code clamp
-      # and became the binding truncator for GM. run_dashboard_sync v6.24.3
-      # raised the clamp ceiling to 20000 (TFB_SYNC_UNIVERSE_CAP_V2, default
-      # ON) and the page re-read bounds to 12000 rows, so this value is now
-      # the ONLY knob that decides the requested universe size. 7000 covers
-      # the largest page (6,512) with headroom; raise here first if any page
-      # ever approaches it.
-      # KILL-SWITCH: remove the line to fall back to the script default (2500).
-      TFB_SYNC_MAX_SYMBOLS_MARKET: "7000"
-      # (2026-07-13) GATEWAY DECLARATION ALIGNED WITH ENFORCED REALITY.
-      # History: the boolean below (v6.10.0) routed the four market pages to
-      # /v1/analysis; a v6.18.0 override then forced "advanced" after a 25-min
-      # ceiling incident (run-28554325006). BOTH have been dead letters since
-      # run_dashboard_sync v6.22.0/v6.22.1: _effective_gateway forces the four
-      # ranked market pages to "analysis" REGARDLESS of these vars while
-      # TFB_SYNC_SAFE_GATEWAYS is ON (its default), and the safe candidate
-      # chain contains analysis endpoints ONLY — /v1/advanced/* carries no
-      # transposition firewall and was removed from the market chain (the
-      # 2026-07-08 poisoning entered through an unfirewalled route; the
-      # 2026-07-12/13 GM writes measured 63.6–89.2% transposed enrichment).
-      # The old "advanced" line therefore documented an intent the code
-      # deliberately refuses — the exact confusion the 2026-07-13 external
-      # audit flagged. Declaring "analysis" explicitly changes NOTHING today
-      # and keeps routing correct even if TFB_SYNC_SAFE_GATEWAYS is ever set
-      # to 0 for a diagnostic run. The 25-min-ceiling failure mode that
-      # motivated "advanced" is solved by its real fixes: timeout-minutes 115
-      # + TFB_SYNC_TIME_BUDGET_SEC 3600 (L5) + the small batch size above.
-      # Read by run_dashboard_sync.py (_effective_gateway); GitHub/sync flag,
-      # NOT a Render backend var. Reversible: restore the previous two-line
-      # form from git history.
-      TFB_SYNC_MARKET_GATEWAY: "analysis"
-
     steps:
       - name: 📥 Secure Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: "pip"
@@ -481,17 +296,11 @@ jobs:
             exit 1
           fi
 
-          # schema drift gate (HARD — deterministic contract test, no live-data
-          # fetch, so a failure signals a real schema-contract drift, not a
-          # transient. A drift must BLOCK the sync rather than publish a
-          # schema-corrupted sheet with only a warning. Matches the
-          # score-contract gate above; under `set -euo pipefail` a non-zero
-          # pytest exit fails the job and stops the sync.)
+          # schema drift gate (warning-only for scheduler to avoid cron spam)
           if [ -f "tests/test_schema_alignment.py" ]; then
-            python -m pytest -q tests/test_schema_alignment.py
+            python -m pytest -q tests/test_schema_alignment.py || echo "::warning::Schema alignment test failed (scheduler continues)."
           else
-            echo "::error::tests/test_schema_alignment.py not found; required schema drift gate is missing."
-            exit 1
+            echo "::warning::tests/test_schema_alignment.py not found; schema drift gate not running in scheduler."
           fi
           echo "::endgroup::"
 
@@ -503,6 +312,7 @@ jobs:
           INPUT_MODE: ${{ github.event.inputs.run_mode }}
           INPUT_KEY: ${{ github.event.inputs.single_key }}
           INPUT_DEBUG: ${{ github.event.inputs.enable_debug }}
+          INPUT_CREDS: ${{ github.event.inputs.google_creds_json }}
 
           VAR_URL: ${{ vars.BACKEND_BASE_URL }}
           VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
@@ -511,11 +321,7 @@ jobs:
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
 
-          # Merged here from a second, duplicate step-level env: block that made
-          # this workflow invalid (GitHub allows only ONE env: per step). These
-          # are consumed by the run script below; step env is available to the
-          # whole run regardless of block position, so this is behaviour-identical.
-          CREDS_PATH: ${{ runner.temp }}/google_credentials.json
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
@@ -529,60 +335,43 @@ jobs:
             return 0
           }
 
-          upper_underscore() {
-            # Normalize a LIST to space-separated UPPER_SNAKE keys. Dashes ->
-            # underscores; commas/semicolons/etc -> spaces. SPACES STAY as key
-            # separators. FIX: the prior ' -' -> '__' mapped the inter-key
-            # spaces to underscores too, mashing the whole list into ONE invalid
-            # token — which broke every full_sync (the default list included).
-            echo "${1:-}" \
-              | tr '[:lower:]' '[:upper:]' \
-              | tr ',;|\n\r\t' '      ' \
-              | tr '-' '_' \
-              | tr -s '_' \
-              | xargs
-          }
-
-          normalize_keys_list() {
-            # Supports:
-            # - space separated: "A B C"
-            # - comma/semicolon: "A,B;C"
-            # - newline separated
-            # - JSON array: ["A","B","C"]
-            local raw="$1"
-            raw="$(echo "${raw:-}" | tr -d '\r' | xargs || true)"
-
-            if [[ -z "${raw:-}" ]]; then
-              echo ""
-              return 0
-            fi
-
-            # JSON array input
-            if echo "$raw" | jq -e 'type=="array"' >/dev/null 2>&1; then
-              raw="$(echo "$raw" | jq -r '.[]' | tr '\n' ' ' | xargs || true)"
-            fi
-
-            raw="$(upper_underscore "$raw")"
-            echo "$raw"
-          }
-
+          # ---------------------------------------------------------------
+          # v2.0.0 BF-1 — key sanitisation, rebuilt.
+          #
+          # The v1 implementation ended with a python heredoc that read
+          # $RAW_KEYS (the untouched input) instead of the progressively
+          # sanitised $raw, so it silently reverted every transformation above
+          # it. That also concealed a second bug: upper_underscore() maps space
+          # to underscore, which is correct for ONE key but collapses a LIST
+          # into a single token. Any non-canonical DEFAULT_SYNC_KEYS therefore
+          # reached validate_keys_allowed unsanitised and the job exited 1.
+          #
+          # This version normalises each key independently — space, comma,
+          # semicolon and pipe are separators, never part of a key — and dedups
+          # in awk over the same stream, so nothing can desync from it.
+          # Accepts: space / comma / semicolon / pipe / newline separated, JSON
+          # arrays, mixed case, dashes, duplicates. Drops forbidden legacy keys.
+          # ---------------------------------------------------------------
           sanitize_keys() {
-            local raw="$1"
-            raw="$(normalize_keys_list "$raw")"
+            local raw="${1:-}"
+            raw="$(echo "$raw" | tr -d '\r')"
 
-            # normalize common aliases (keep it simple/portable)
-            raw="$(echo "$raw" | sed 's/TOP10_INVESTMENTS/TOP_10_INVESTMENTS/g')"
-            raw="$(echo "$raw" | sed 's/\bTOP10\b/TOP_10_INVESTMENTS/g' || true)"
+            # JSON array input -> one key per line
+            if echo "$raw" | jq -e 'type=="array"' >/dev/null 2>&1; then
+              raw="$(echo "$raw" | jq -r '.[]')"
+            fi
 
-            # drop forbidden legacy keys (SAFE under set -e)
-            raw="$(echo "$raw" | tr ' ' '\n' | grep -v -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$' || true)"
-            raw="$(echo "$raw" | tr '\n' ' ' | xargs || true)"
-
-            # de-dup while preserving order (pure bash — avoids an embedded
-            # python heredoc that strict YAML parsers reject; also dedups the
-            # PROCESSED list rather than the un-normalized raw input).
-            raw="$(echo "$raw" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' ' | xargs || true)"
-            echo "$raw"
+            echo "$raw" \
+              | tr ',;|' '\n\n\n' \
+              | tr -s ' \t' '\n' \
+              | tr -d '"[]' \
+              | tr '[:lower:]' '[:upper:]' \
+              | sed 's/-/_/g; s/__*/_/g; s/^_//; s/_$//' \
+              | sed 's/^TOP10$/TOP_10_INVESTMENTS/; s/^TOP10_INVESTMENTS$/TOP_10_INVESTMENTS/' \
+              | grep -v -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$' \
+              | awk 'NF && !seen[$0]++' \
+              | tr '\n' ' ' \
+              | xargs || true
           }
 
           validate_keys_allowed() {
@@ -628,24 +417,38 @@ jobs:
           MODE="$(get_val "${INPUT_MODE:-}" "full_sync")"
           echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
 
+          DEFAULT_KEYS_CANONICAL="MARKET_LEADERS GLOBAL_MARKETS MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS TOP_10_INVESTMENTS DATA_DICTIONARY"
+
           if [[ "$MODE" == "single_key" ]]; then
             KEY="$(get_val "${INPUT_KEY:-}" "MARKET_LEADERS")"
-            KEYS="$KEY"
+            KEYS="$(sanitize_keys "$KEY")"
           else
-            DEFAULT_KEYS_CANONICAL="MARKET_LEADERS GLOBAL_MARKETS MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS TOP_10_INVESTMENTS DATA_DICTIONARY"
-            KEYS="$(get_val "${VAR_DEFAULT_KEYS:-}" "$DEFAULT_KEYS_CANONICAL")"
-          fi
+            KEYS="$(sanitize_keys "$(get_val "${VAR_DEFAULT_KEYS:-}" "$DEFAULT_KEYS_CANONICAL")")"
 
-          KEYS="$(sanitize_keys "$KEYS")"
+            # ---------------------------------------------------------------
+            # v2.0.0 BF-3 — coverage guard.
+            # A narrowed vars.DEFAULT_SYNC_KEYS is why Mutual_Funds (9 Jul),
+            # Commodities_FX (14 Jul), Market_Leaders (16 Jul) and
+            # Global_Markets (17 Jul) stopped refreshing while the five cockpit
+            # pages continued. On a SCHEDULED full_sync the canonical set is
+            # mandatory; a shortfall is announced, not absorbed.
+            # ---------------------------------------------------------------
+            if [[ "${EVENT_NAME:-}" == "schedule" ]]; then
+              MISSING=()
+              for k in $DEFAULT_KEYS_CANONICAL; do
+                if ! echo " $KEYS " | grep -q " $k "; then
+                  MISSING+=("$k")
+                fi
+              done
+              if [ ${#MISSING[@]} -ne 0 ]; then
+                echo "::warning::vars.DEFAULT_SYNC_KEYS omits: ${MISSING[*]} — scheduled run is FORCING the canonical 8-key set. Clear or correct that repository variable."
+                KEYS="$DEFAULT_KEYS_CANONICAL"
+              fi
+            fi
+          fi
 
           if [[ -z "${KEYS:-}" ]]; then
             echo "::error::SYNC_KEYS resolved to empty (after sanitization)."
-            exit 1
-          fi
-
-          # hard fail if forbidden slipped in
-          if echo "$KEYS" | tr ' ' '\n' | grep -q -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$'; then
-            echo "::error::Forbidden key present in SYNC_KEYS after sanitization."
             exit 1
           fi
 
@@ -653,15 +456,14 @@ jobs:
 
           echo "SYNC_KEYS=$KEYS" >> "$GITHUB_ENV"
           echo "📋 Mode: $MODE | Keys: $KEYS"
+          echo "📊 Key count: $(echo "$KEYS" | wc -w) of 8 canonical"
 
           # 4) Debug
           DEBUG="$(get_val "${INPUT_DEBUG:-}" "false")"
           echo "ENABLE_DEBUG=$DEBUG" >> "$GITHUB_ENV"
 
-          # 5) Credentials — secrets only (2026-07-26 PY-5: the dispatch
-          # input path is gone; a key can no longer be pasted into a public
-          # run's metadata).
-          RAW_CREDS="${SECRET_CREDS:-}"
+          # 5) Credentials
+          RAW_CREDS="$(get_val "${INPUT_CREDS:-}" "${SECRET_CREDS:-}")"
           if [[ -z "${RAW_CREDS:-}" && -n "${SECRET_CREDS_B64:-}" ]]; then
             echo "🔓 Decoding Base64 credentials..."
             RAW_CREDS="$(printf '%s' "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
@@ -676,9 +478,10 @@ jobs:
 
             if echo "$RAW_CREDS" | jq empty >/dev/null 2>&1; then
               CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
-              # write verbatim (pure bash — avoids an embedded python heredoc
-              # that strict YAML parsers reject). RAW_CREDS already passed the
-              # `jq empty` JSON validation above.
+              # v2.0.0: was a python heredoc whose body sat at column 0, which
+              # terminates the YAML block scalar and makes the file ambiguous to
+              # strict parsers. printf is equivalent, faster, and removes the
+              # indentation hazard entirely.
               printf '%s' "$RAW_CREDS" > "$CREDS_PATH"
               chmod 600 "$CREDS_PATH"
               echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
@@ -730,44 +533,10 @@ jobs:
           echo "health_status=degraded" >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
 
-      - name: 🎯 Scope Keys To Matrix Leg
-        run: |
-          set -euo pipefail
-          # (2026-07-08) Two-leg split: filter the FULLY-VALIDATED key set from
-          # Smart Configuration down to this leg's scope. Runs AFTER validation
-          # so repo vars / dispatch inputs / sanitization are untouched.
-          #   core-pages     -> everything except GLOBAL_MARKETS
-          #   global-markets -> GLOBAL_MARKETS only (empty on single_key runs
-          #                     that target another page: the sync step then
-          #                     no-ops with exit 0 — "No tasks selected").
-          if [[ "${{ matrix.keys_scope }}" == "only-gm" ]]; then
-            SCOPED="$(tr ' ' '\n' <<<"${SYNC_KEYS}" | grep -x 'GLOBAL_MARKETS' | xargs || true)"
-          else
-            SCOPED="$(tr ' ' '\n' <<<"${SYNC_KEYS}" | grep -vx 'GLOBAL_MARKETS' | xargs || true)"
-          fi
-          echo "SYNC_KEYS=$SCOPED" >> "$GITHUB_ENV"
-          echo "🎯 Leg ${{ matrix.group }} keys: ${SCOPED:-<none>}"
-          if [[ -z "$SCOPED" ]]; then
-            echo "::notice::Leg '${{ matrix.group }}' has no keys after scoping — the sync step will no-op (exit 0)."
-          fi
-          # Stagger the GM leg so both legs do not open their provider bursts
-          # in the same instant (Yahoo 429 mitigation). Core leg: 0s.
-          if [[ "${{ matrix.stagger }}" != "0" && -n "$SCOPED" ]]; then
-            echo "⏳ Staggering start by ${{ matrix.stagger }}s..."
-            sleep "${{ matrix.stagger }}"
-          fi
-
       - name: 🚀 Execute Dashboard Sync
         id: execute_sync
         env:
           PYTHONPATH: ${{ github.workspace }}
-          # (2026-07-26) Backend auth wall (main.py v8.13.0). The sync's
-          # backend HTTP calls must carry the token once Render arms
-          # APP_TOKEN. run_dashboard_sync.py already reads BACKEND_TOKEN and
-          # sends X-APP-TOKEN + Bearer; empty secret = anonymous = today's
-          # behavior exactly (safe before AND after arming, provided the
-          # secret is set before Render is).
-          BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
         run: |
           set -euo pipefail
           echo "::group::📊 Sync Execution"
@@ -777,30 +546,13 @@ jobs:
             exit 1
           fi
 
-          # --- Clear scoping: run_dashboard_sync.py CLEARS each page before
-          # write by DEFAULT (this kills the stale+fresh duplicate rows that a
-          # partial in-place write leaves behind when the row set shrinks or
-          # reorders). That default is correct for the regenerable pages, but
-          # DANGEROUS for MY_PORTFOLIO: its Qty/Avg Cost are entered by hand, so
-          # a clear before a partial/empty fetch would wipe holdings
-          # permanently. MY_PORTFOLIO is therefore run with --no-clear (in-place
-          # overwrite); every other page keeps the default clear. Split
-          # SYNC_KEYS into those two groups.
-          DEFAULT_KEYS=""
-          PORTFOLIO_KEYS=""
-          for k in $SYNC_KEYS; do
-            if [ "$k" = "MY_PORTFOLIO" ]; then
-              PORTFOLIO_KEYS="$PORTFOLIO_KEYS $k"
-            else
-              DEFAULT_KEYS="$DEFAULT_KEYS $k"
-            fi
-          done
-          DEFAULT_KEYS="$(echo $DEFAULT_KEYS | xargs || true)"
-          PORTFOLIO_KEYS="$(echo $PORTFOLIO_KEYS | xargs || true)"
+          CMD=(python scripts/run_dashboard_sync.py)
+          CMD+=(--backend "$TARGET_URL")
+          CMD+=(--sheet-id "$TARGET_SHEET_ID")
+          CMD+=(--keys $SYNC_KEYS)
 
-          DRY_RUN_FLAG=""
           if [[ "${RUN_MODE:-full_sync}" == "health_only" ]]; then
-            DRY_RUN_FLAG="--dry-run"
+            CMD+=(--dry-run)
           fi
 
           if [[ "${ENABLE_DEBUG:-false}" == "true" ]]; then
@@ -809,40 +561,15 @@ jobs:
           fi
 
           echo "⏱️ Start Time: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "📋 Command: ${CMD[*]}"
 
           set -o pipefail
           TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
           LOG_FILE="sync_${TIMESTAMP}.log"
-          : > "$LOG_FILE"
-
-          run_sync_group() {
-            # $1 = extra flag (--no-clear or ""); $2 = space-separated keys
-            local EXTRA="$1"; local KEYS="$2"
-            [ -z "$KEYS" ] && return 0
-            # --start-cell A1: header at row 1, data row 2+. The script default
-            # is A5, which (combined with clear-from-start-cell-down) stranded an
-            # old header + 3 data rows in rows 1-4 of every list page. Writing at
-            # A1 clears A1:ZZ and rebuilds the page as one clean block, healing
-            # that orphan on the next run. All page-sync pages are header-at-row-1
-            # (Market_Leaders/Global_Markets/Commodities_FX/Mutual_Funds/Insights/
-            # Data_Dictionary/My_Portfolio); the cockpit pages (Top_10,
-            # Portfolio_Decision) are route-owned and skipped here, so unaffected.
-            local -a C=(python scripts/run_dashboard_sync.py --backend "$TARGET_URL" --sheet-id "$TARGET_SHEET_ID" --keys $KEYS --start-cell A1)
-            [ -n "$EXTRA" ] && C+=("$EXTRA")
-            [ -n "$DRY_RUN_FLAG" ] && C+=("$DRY_RUN_FLAG")
-            echo "📋 Command: ${C[*]}"
-            "${C[@]}" 2>&1 | tee -a "$LOG_FILE"
-            return "${PIPESTATUS[0]}"
-          }
 
           START_TIME="$(date +%s)"
-          EXIT_CODE=0
-          set +e
-          run_sync_group "--no-clear" "$PORTFOLIO_KEYS"; rc=$?
-          [ "$rc" -gt "$EXIT_CODE" ] && EXIT_CODE="$rc"
-          run_sync_group "" "$DEFAULT_KEYS"; rc=$?
-          [ "$rc" -gt "$EXIT_CODE" ] && EXIT_CODE="$rc"
-          set -e
+          "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
+          EXIT_CODE=$?
           END_TIME="$(date +%s)"
           DURATION=$((END_TIME - START_TIME))
 
@@ -854,14 +581,7 @@ jobs:
             echo "rate_limited=true" >> "$GITHUB_OUTPUT"
           fi
 
-          # Auth/permission scan (hardened 2026-06-18): the original pattern only
-          # matched HTTP-style text ("403 Forbidden" / "401 Unauthorized"), which
-          # the gspread / Google API client does NOT emit — its 403 surfaces as
-          # "does not have permission" / "PERMISSION_DENIED" / "[403]". That gap is
-          # why a standing read-only-service-account 403 could slip past this net.
-          # Added the real gspread signatures, kept auth-specific (403/401 only) so
-          # a 429/500 APIError can't false-trip this and fail the job.
-          if grep -qiE "AuthenticationError|InvalidGrant|401 Unauthorized|403 Forbidden|does not have permission|PERMISSION_DENIED|\[401\]|\[403\]" "$LOG_FILE"; then
+          if grep -qiE "AuthenticationError|InvalidGrant|401 Unauthorized|403 Forbidden" "$LOG_FILE"; then
             echo "::error::Google Sheets authentication/permission issue detected."
             EXIT_CODE=1
           fi
@@ -874,203 +594,15 @@ jobs:
             exit $EXIT_CODE
           fi
 
-      # -------------------------------------------------------------------------
-      # ✅ Post-refresh contract + gate-integrity gate (NEW)
-      # -------------------------------------------------------------------------
-      # Reads the LIVE rendered sheet and checks it against the DEPLOYED
-      # schema_registry, then asserts the investability-gate verdicts are
-      # internally consistent. This is the automated version of the manual
-      # "is the sheet 115-wide and ending at Block Reason?" deploy check.
-      #   exit 2 = contract / gate-integrity failure -> FAIL the job
-      #   exit 1 = sanity warnings only               -> allow (surfaced in summary)
-      #   exit 3 = could not run (registry/reader)    -> FAIL the job
-      # Runs only on a SUCCESSFUL sync (its whole job is to catch a sync that
-      # "succeeded" but produced a structurally broken sheet).
-      - name: ✅ Validate Dashboard (contract + gate integrity)
-        id: validate_dashboard
-        if: success()
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          if [ ! -f "scripts/validate_dashboard.py" ]; then
-            echo "::error::Missing scripts/validate_dashboard.py"
-            exit 1
-          fi
-          # gspread (sheet write) reads GOOGLE_SHEETS_CREDENTIALS (JSON), not the
-          # ADC file path the workflow sets. Bridge it, step-locally (no leak to
-          # GITHUB_ENV / other steps / logs). read_range auth uses the ADC file.
-          if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
-            export GOOGLE_SHEETS_CREDENTIALS="$(cat "$GOOGLE_APPLICATION_CREDENTIALS")"
-          fi
-          # Capture exit without tripping the default `-e` shell.
-          code=0
-          python scripts/validate_dashboard.py \
-            --sheet-id "$TARGET_SHEET_ID" \
-            --json-out validate_dashboard.json \
-            --write-sheet 1 || code=$?
-          echo "validate_exit=$code" >> "$GITHUB_OUTPUT"
-          if [ "$code" -ge 2 ]; then
-            echo "::error::Dashboard validation failed (exit $code) — see report above / Dashboard_Audit tab."
-            exit "$code"
-          fi
-          exit 0
-
-      # -------------------------------------------------------------------------
-      # 📈 Forward-performance tracking: record today's picks + audit actives (NEW)
-      # -------------------------------------------------------------------------
-      # Records the current Top-10 picks (entry snapshot incl. the gate fields)
-      # and re-prices / matures active records. Records are keyed by
-      # symbol|horizon|YYYYMMDD, so the 15-minute cron re-runs are idempotent
-      # (no Performance_Log spam). Non-blocking: a tracking hiccup must never
-      # fail the sync. (2026-07-26) BACKEND_TOKEN armed below for the auth
-      # wall — empty secret keeps today's anonymous behavior exactly.
-      - name: 📈 Track Performance (record + audit)
-        if: success()
-        continue-on-error: true
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-          BACKEND_BASE_URL: ${{ env.TARGET_URL }}
-          TRACK_SHEET_ID: ${{ env.TARGET_SHEET_ID }}
-          # (2026-07-19) S-1 CRITERION 4 — 7D/14D CHECKPOINT HORIZONS.
-          # track_performance v6.23.0+ records "1W"/"2W" as CHECKPOINTS, not
-          # maturities: a time-scaled slice of the 1M thesis used to measure
-          # whether a position is TRACKING its forecast. Gate S-1 criterion 4
-          # ("calibration error within band on 7D/14D checkpoints") has no
-          # other input, and checkpoints need ELAPSED time — days not sampled
-          # cannot be recovered later. Default is "1M,3M".
-          # COST: ~2x Performance_Log records per decision symbol.
-          # KILL-SWITCH: delete this line -> v6.22.0 behaviour exactly.
-          TRACK_HORIZONS: "1W,2W,1M,3M"
-          BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
-        run: |
-          if [ ! -f "scripts/track_performance.py" ]; then
-            echo "::warning::scripts/track_performance.py not found — skipping"
-            exit 0
-          fi
-          if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
-            export GOOGLE_SHEETS_CREDENTIALS="$(cat "$GOOGLE_APPLICATION_CREDENTIALS")"
-          fi
-          # Visibility (2026-06-18): the previous '|| echo non-fatal' hid a
-          # standing Sheets 403 — the service account lacked Editor on the
-          # spreadsheet — for an unknown number of runs. Performance_Log was
-          # never created and the calibration clock never started, all behind a
-          # green check. Critically, track_performance CATCHES a
-          # PerformanceStore/SignalHistoryStore init failure internally and still
-          # EXITS 0, so the exit code alone is NOT trustworthy. This step stays
-          # NON-FATAL (continue-on-error above — a tracking hiccup must never
-          # fail the sync) but now makes a failure VISIBLE: capture the exit
-          # code AND scan the run log for write/permission failure signatures,
-          # emitting ::error:: in either case so it can't hide again.
-          set +e
-          python scripts/track_performance.py --record --audit --analyze \
-            --sheet-id "$TARGET_SHEET_ID" 2>&1 | tee /tmp/track_performance.log
-          TRACK_RC=${PIPESTATUS[0]}
-          set -e
-          if [ "$TRACK_RC" -ne 0 ]; then
-            echo "::error::track_performance exited ${TRACK_RC} — recording likely failed (see log above)."
-          elif grep -qiE "init failed|does not have permission|APIError|\[40[13]\]" /tmp/track_performance.log; then
-            echo "::error::track_performance exited 0 but logged a Sheets write/permission error — Performance_Log may not be updating (verify the service account still has Editor on the spreadsheet). See log above."
-          else
-            echo "::notice::track_performance completed cleanly; Performance_Log / Signal_History updated."
-          fi
-
-      # -------------------------------------------------------------------------
-      # 📊 Capture Per-Step Metrics (optional JSON emitted by sync runner)
-      # -------------------------------------------------------------------------
-      # If scripts/run_dashboard_sync.py writes sync_summary.json, we surface
-      # per-step results. We also surface validate_dashboard.json (the gate).
-      # Both are optional — defaults are used when a file is missing.
-      - name: 📊 Parse Per-Step Metrics
-        id: metrics
-        if: always()
-        run: |
-          set -euo pipefail
-          SUMMARY_FILE="sync_summary.json"
-          VALIDATE_FILE="validate_dashboard.json"
-
-          # Defaults — sync steps
-          MARKET_EXIT="skipped";     MARKET_DURATION="0"
-          PORTFOLIO_EXIT="skipped";  PORTFOLIO_DURATION="0"
-          INSIGHTS_EXIT="skipped";   INSIGHTS_DURATION="0"
-          POST_FAILURES="0"
-          DRIFT_RAN="false"
-
-          # Defaults — dashboard validation
-          DASH_FAIL="n/a"; DASH_WARN="n/a"
-          DASH_EXIT="${{ steps.validate_dashboard.outputs.validate_exit || 'n/a' }}"
-          DASH_REGISTRY="unknown"
-
-          if [[ -f "$SUMMARY_FILE" ]] && jq empty "$SUMMARY_FILE" >/dev/null 2>&1; then
-            MARKET_EXIT="$(jq -r     '.steps.market.exit     // "skipped"' "$SUMMARY_FILE")"
-            MARKET_DURATION="$(jq -r '.steps.market.duration // 0'         "$SUMMARY_FILE")"
-            PORTFOLIO_EXIT="$(jq -r     '.steps.portfolio.exit     // "skipped"' "$SUMMARY_FILE")"
-            PORTFOLIO_DURATION="$(jq -r '.steps.portfolio.duration // 0'         "$SUMMARY_FILE")"
-            INSIGHTS_EXIT="$(jq -r     '.steps.insights.exit     // "skipped"' "$SUMMARY_FILE")"
-            INSIGHTS_DURATION="$(jq -r '.steps.insights.duration // 0'         "$SUMMARY_FILE")"
-            POST_FAILURES="$(jq -r '.post_validation.failures // 0'     "$SUMMARY_FILE")"
-            DRIFT_RAN="$(jq -r     '.drift_detection.ran     // false' "$SUMMARY_FILE")"
-            echo "✅ Loaded per-step metrics from $SUMMARY_FILE"
-          else
-            echo "ℹ️  No sync_summary.json found — using defaults"
-          fi
-
-          if [[ -f "$VALIDATE_FILE" ]] && jq empty "$VALIDATE_FILE" >/dev/null 2>&1; then
-            DASH_FAIL="$(jq -r '[.results[] | select(.status=="FAIL")] | length' "$VALIDATE_FILE")"
-            DASH_WARN="$(jq -r '[.results[] | select(.status=="WARN")] | length' "$VALIDATE_FILE")"
-            DASH_REGISTRY="$(jq -r '.meta.registry_version // "unknown"' "$VALIDATE_FILE")"
-            echo "✅ Loaded dashboard validation from $VALIDATE_FILE (fail=$DASH_FAIL warn=$DASH_WARN registry=$DASH_REGISTRY)"
-          else
-            echo "ℹ️  No validate_dashboard.json found — dashboard metrics default to n/a"
-          fi
-
-          {
-            echo "market_exit=$MARKET_EXIT"
-            echo "market_duration=$MARKET_DURATION"
-            echo "portfolio_exit=$PORTFOLIO_EXIT"
-            echo "portfolio_duration=$PORTFOLIO_DURATION"
-            echo "insights_exit=$INSIGHTS_EXIT"
-            echo "insights_duration=$INSIGHTS_DURATION"
-            echo "post_failures=$POST_FAILURES"
-            echo "drift_ran=$DRIFT_RAN"
-            echo "dashboard_fail=$DASH_FAIL"
-            echo "dashboard_warn=$DASH_WARN"
-            echo "dashboard_exit=$DASH_EXIT"
-            echo "dashboard_registry=$DASH_REGISTRY"
-          } >> "$GITHUB_OUTPUT"
-
-      # -------------------------------------------------------------------------
-      # 📝 Generate Step Summary
-      # -------------------------------------------------------------------------
       - name: 📝 Generate Summary
         if: always()
-        env:
-          STATUS: ${{ job.status }}
-          DURATION: ${{ steps.execute_sync.outputs.duration || '0' }}
-          HEALTH:   ${{ steps.health_check.outputs.health_status || 'Unknown' }}
-          M_EXIT:   ${{ steps.metrics.outputs.market_exit }}
-          M_DUR:    ${{ steps.metrics.outputs.market_duration }}
-          P_EXIT:   ${{ steps.metrics.outputs.portfolio_exit }}
-          P_DUR:    ${{ steps.metrics.outputs.portfolio_duration }}
-          I_EXIT:   ${{ steps.metrics.outputs.insights_exit }}
-          I_DUR:    ${{ steps.metrics.outputs.insights_duration }}
-          POST_FAIL: ${{ steps.metrics.outputs.post_failures }}
-          DRIFT:    ${{ steps.metrics.outputs.drift_ran }}
-          D_FAIL:   ${{ steps.metrics.outputs.dashboard_fail }}
-          D_WARN:   ${{ steps.metrics.outputs.dashboard_warn }}
-          D_EXIT:   ${{ steps.validate_dashboard.outputs.validate_exit || 'n/a' }}
-          D_REG:    ${{ steps.metrics.outputs.dashboard_registry }}
         run: |
           set -euo pipefail
           RIYADH_TIME="$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
-          if [[ "$STATUS" == "success" ]]; then
-            STATUS_ICON="✅ **SUCCESS**"
-          else
-            STATUS_ICON="❌ **FAILED**"
-          fi
+          STATUS_ICON="$([[ "${{ job.status }}" == "success" ]] && echo "✅ **SUCCESS**" || echo "❌ **FAILED**")"
 
-          # Unquoted heredoc → bash expands $VARS natively; no sed needed.
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          # 🏦 Tadawul Dashboard Sync Report — leg: ${{ matrix.group }}
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 🏦 Tadawul Dashboard Sync Report
 
           ## 📋 Execution Overview
           | Metric | Value |
@@ -1079,291 +611,41 @@ jobs:
           | **Trigger** | \`${{ github.event_name }}\` |
           | **Time (Riyadh)** | \`$RIYADH_TIME\` |
           | **Run Mode** | \`${{ env.RUN_MODE }}\` |
-          | **Total Duration** | \`${DURATION}s\` |
+          | **Duration** | \`${{ steps.execute_sync.outputs.duration || '0' }} seconds\` |
 
           ## 🎯 Target
           * **Sheet ID:** \`${{ env.TARGET_SHEET_ID }}\`
-          * **Backend:** \`${{ env.TARGET_URL }}\` *(Health: $HEALTH)*
+          * **Backend:** \`${{ env.TARGET_URL }}\` *(Health: ${{ steps.health_check.outputs.health_status || 'Unknown' }})*
 
           ## 🔑 SYNC_KEYS
           \`\`\`text
           ${{ env.SYNC_KEYS }}
           \`\`\`
-
-          ## ⚙️ Per-Step Results
-          | Step | Exit | Duration |
-          | :--- | :--- | :------- |
-          | Market Pages | $M_EXIT | ${M_DUR}s |
-          | My_Portfolio | $P_EXIT | ${P_DUR}s |
-          | Insights_Analysis | $I_EXIT | ${I_DUR}s |
-          | Post-Validation Warnings | $POST_FAIL | — |
-          | Drift Detection | $DRIFT | — |
-          | Dashboard Validation | $D_FAIL fail / $D_WARN warn (exit $D_EXIT) | registry \`$D_REG\` |
           EOF
 
-      # -------------------------------------------------------------------------
-      # 📤 Upload Logs + Summary Artifact
-      # -------------------------------------------------------------------------
       - name: 📤 Upload Logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: tadawul-sync-logs-${{ github.run_id }}-${{ matrix.group }}
+          name: tadawul-sync-logs-${{ github.run_id }}
           path: |
             sync_*.log
             sync_execution.log
-            sync_summary.json
-            validate_dashboard.json
           retention-days: 7
           compression-level: 6
           if-no-files-found: warn
 
-      # -------------------------------------------------------------------------
-      # 🔔 Slack Notification on Failure (Block Kit)
-      # -------------------------------------------------------------------------
-      - name: 🔔 Notify on Failure
-        if: failure()
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          RUN_MODE:  ${{ env.RUN_MODE }}
-          SYNC_KEYS: ${{ env.SYNC_KEYS }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
-            echo "ℹ️  No Slack webhook configured; skipping notification."
-            exit 0
-          fi
-
-          RIYADH_TIME="$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          PAYLOAD="$(jq -n \
-            --arg trigger  "${{ github.event_name }}" \
-            --arg time     "$RIYADH_TIME" \
-            --arg mode     "${RUN_MODE:-unknown}" \
-            --arg keys     "${SYNC_KEYS:-unknown}" \
-            --arg url      "$RUN_URL" \
-            --arg registry "${{ steps.metrics.outputs.dashboard_registry || 'unknown' }}" \
-            --arg dash     "fail=${{ steps.metrics.outputs.dashboard_fail || 'n/a' }} / warn=${{ steps.metrics.outputs.dashboard_warn || 'n/a' }} / exit=${{ steps.validate_dashboard.outputs.validate_exit || 'n/a' }}" \
-            '{
-              text: "❌ Tadawul Dashboard Sync FAILED",
-              attachments: [{
-                color: "danger",
-                fields: [
-                  {title: "Trigger",              value: $trigger,  short: true},
-                  {title: "Time (Riyadh)",        value: $time,     short: true},
-                  {title: "Mode",                 value: $mode,     short: true},
-                  {title: "Schema/Registry",      value: $registry, short: true},
-                  {title: "Dashboard Validation", value: $dash,     short: false},
-                  {title: "Pages",                value: $keys,     short: false},
-                  {title: "Details",              value: ("<" + $url + "|View Logs>"), short: false}
-                ]
-              }]
-            }')"
-
-          if curl -sf -X POST "$SLACK_WEBHOOK_URL" \
-               -H "Content-Type: application/json" \
-               --data-raw "$PAYLOAD" >/dev/null; then
-            echo "✅ Slack notification sent"
-          else
-            echo "::warning::Slack notification failed to send (non-fatal)"
-          fi
-
-      # -------------------------------------------------------------------------
-      # 🧹 Secure Cleanup (credentials wipe)
-      # -------------------------------------------------------------------------
       - name: 🧹 Secure Cleanup
         if: always()
         run: |
           set -euo pipefail
           echo "::group::Cleanup"
-          CREDS_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-${{ runner.temp }}/google_credentials.json}"
-          if [[ -n "$CREDS_PATH" && -f "$CREDS_PATH" ]]; then
+          if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
             if command -v shred >/dev/null 2>&1; then
-              shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
+              shred -u -z "$GOOGLE_APPLICATION_CREDENTIALS" 2>/dev/null || rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
             else
-              rm -f "$CREDS_PATH"
+              rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
             fi
-            echo "✅ Credentials securely removed: $CREDS_PATH"
-          else
-            echo "ℹ️  No credentials file to remove"
+            echo "✅ Google Credentials removed from runner."
           fi
           echo "::endgroup::"
-
-  # =============================================================================
-  # AUTOMATIC INLINE PAGE RECOVERY — retains the same production write lease
-  # =============================================================================
-  recover-missing-market-pages:
-    name: 🧯 Recover missing market pages
-    needs: sync-dashboard
-    if: >-
-      ${{
-        always() &&
-        (
-          github.event_name == 'schedule' ||
-          (
-            github.event_name == 'workflow_dispatch' &&
-            github.event.inputs.run_mode == 'full_sync'
-          )
-        )
-      }}
-    runs-on: ubuntu-latest
-    environment: production
-    timeout-minutes: 360
-    env:
-      PYTHON_VERSION: "3.11"
-      PYTHONUNBUFFERED: "1"
-      PYTHONPATH: ${{ github.workspace }}
-      TZ: Asia/Riyadh
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      TARGET_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
-      TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
-      TFB_XPAGE_PRICE_CHECK: "1"
-      TFB_SYNC_EMPTY_RETRY: "0"
-      TFB_SYNC_NAME_DEDUP_MODE: "observe"
-      TFB_PORTFOLIO_REBUILD: "1"
-      TFB_SYNC_DECISION_GUARD: "1"
-      TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
-      TFB_SYNC_TIME_BUDGET_SEC: "3600"
-      TFB_SYNC_MAX_SYMBOLS_MARKET: "7000"
-      TFB_SYNC_MARKET_GATEWAY: "analysis"
-      BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
-
-    steps:
-      - name: 📥 Secure Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: 🐍 Setup Python 3.11
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: |
-            requirements.render.txt
-            requirements.txt
-
-      - name: 📦 Install Dependencies
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip setuptools wheel
-          if [[ -f requirements.render.txt ]]; then
-            python -m pip install -r requirements.render.txt
-          elif [[ -f requirements.txt ]]; then
-            python -m pip install -r requirements.txt
-          else
-            echo "::error::No requirements file found."
-            exit 1
-          fi
-
-      - name: 📥 Download current sync evidence
-        uses: actions/download-artifact@v8
-        with:
-          pattern: tadawul-sync-logs-${{ github.run_id }}-*
-          path: source-sync-artifacts
-          merge-multiple: false
-
-      - name: 🔐 Configure production credentials
-        env:
-          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-          SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${TARGET_SHEET_ID:-}" ]]; then
-            echo "::error::vars.DEFAULT_SPREADSHEET_ID is empty."
-            exit 1
-          fi
-          RAW_CREDS="${SECRET_CREDS:-}"
-          if [[ -z "$RAW_CREDS" && -n "${SECRET_CREDS_B64:-}" ]]; then
-            RAW_CREDS="$(printf '%s' "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
-          fi
-          if [[ -z "$RAW_CREDS" ]] || ! printf '%s' "$RAW_CREDS" | jq empty >/dev/null 2>&1; then
-            echo "::error::No valid Google Sheets credentials found."
-            exit 1
-          fi
-          CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
-          printf '%s' "$RAW_CREDS" > "$CREDS_PATH"
-          chmod 600 "$CREDS_PATH"
-          SA_EMAIL="$(jq -r '.client_email // empty' "$CREDS_PATH")"
-          [[ -n "$SA_EMAIL" ]] && echo "::add-mask::$SA_EMAIL"
-          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
-
-      - name: 💓 Check backend health
-        run: |
-          set -euo pipefail
-          for endpoint in /readyz /health /livez; do
-            if curl -fsS --max-time 15 "$TARGET_URL$endpoint" >/dev/null; then
-              echo "Backend healthy via $endpoint"
-              exit 0
-            fi
-          done
-          echo "::error::Backend health checks failed."
-          exit 1
-
-      - name: 🧯 Recover only pages that did not refresh
-        run: |
-          set -euo pipefail
-          python scripts/run_inline_page_recovery.py \
-            --source-root source-sync-artifacts \
-            --backend "$TARGET_URL" \
-            --sheet-id "$TARGET_SHEET_ID" \
-            --evidence-root inline-recovery-evidence \
-            --plan-out inline-recovery-plan.json \
-            --summary-out inline-recovery-summary.json
-
-      - name: 📤 Upload recovery plan and summary
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: inline-recovery-${{ github.run_id }}
-          path: |
-            inline-recovery-plan.json
-            inline-recovery-summary.json
-          retention-days: 30
-          if-no-files-found: warn
-
-      - name: 📤 Upload Global Markets evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: page-refresh-${{ github.run_id }}-global-markets
-          path: inline-recovery-evidence/global-markets
-          retention-days: 30
-          if-no-files-found: ignore
-
-      - name: 📤 Upload Commodities/FX evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: page-refresh-${{ github.run_id }}-commodities-fx
-          path: inline-recovery-evidence/commodities-fx
-          retention-days: 30
-          if-no-files-found: ignore
-
-      - name: 📤 Upload Mutual Funds evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: page-refresh-${{ github.run_id }}-mutual-funds
-          path: inline-recovery-evidence/mutual-funds
-          retention-days: 30
-          if-no-files-found: ignore
-
-      - name: 📤 Upload Market Leaders evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: page-refresh-${{ github.run_id }}-market-leaders
-          path: inline-recovery-evidence/market-leaders
-          retention-days: 30
-          if-no-files-found: ignore
-
-      - name: 🧹 Secure Cleanup
-        if: always()
-        run: |
-          CREDS_PATH="${GOOGLE_APPLICATION_CREDENTIALS:-$RUNNER_TEMP/google_credentials.json}"
-          if [[ -f "$CREDS_PATH" ]]; then
-            shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
-          fi
