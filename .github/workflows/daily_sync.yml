@@ -205,6 +205,21 @@ jobs:
           echo "validated=true" >> "$GITHUB_OUTPUT"
 
   sync-dashboard:
+    # (2026-08-02) THREE-LEG MATRIX SPLIT — Mutual_Funds gets its own leg.
+    # WHY (live evidence, 2026-08-02 review): the universe expansion grew
+    # Mutual_Funds from ~1,065 to ~2,471 rows. Leg "core-pages" runs
+    # My_Portfolio -> Mutual_Funds -> Commodities_FX -> Market_Leaders under
+    # one TFB_SYNC_TIME_BUDGET_SEC=3600; post-expansion MF consumes the leg
+    # and the pages BEHIND it starve. Measured on the production workbook:
+    # Commodities_FX last full batch 2026-07-14 (19 days), Mutual_Funds
+    # 2026-07-22, Market_Leaders 2026-07-30 — despite the cron firing every
+    # 4 hours. Fix mirrors the proven 2026-07-08 GM split: MF moves to its
+    # own parallel leg (stagger 180s so the three legs never open their
+    # provider bursts together); core keeps My_Portfolio first (manual-cell
+    # protection order) then CFX + ML with the full budget to themselves.
+    # keys_scope "core" excludes BOTH GLOBAL_MARKETS and MUTUAL_FUNDS in the
+    # scoping step below. Everything else is verbatim. Rollback: restore the
+    # two-leg matrix block and the two-branch scoping step (git revert).
     # (2026-07-08) TWO-LEG MATRIX SPLIT — Global_Markets gets its own parallel
     # leg. WHY: the universe grew to 6,500 symbols; at batch 25 that is ~260
     # backend requests, well past what one leg can finish inside any sane
@@ -226,13 +241,17 @@ jobs:
       matrix:
         include:
           - group: core-pages
-            keys_scope: exclude-gm
-            page_order: "My_Portfolio,Mutual_Funds,Commodities_FX,Market_Leaders"
+            keys_scope: core
+            page_order: "My_Portfolio,Commodities_FX,Market_Leaders"
             stagger: "0"
           - group: global-markets
             keys_scope: only-gm
             page_order: "Global_Markets"
             stagger: "90"
+          - group: mutual-funds
+            keys_scope: only-mf
+            page_order: "Mutual_Funds"
+            stagger: "180"
     # (2026-07-02) 25 -> 45: the 25-min ceiling CANCELLED run 28554325006
     # mid-write and wiped two pages. v6.18.0's advanced-first routing makes the
     # run much faster, but the ceiling must never again be the thing that kills
@@ -736,15 +755,23 @@ jobs:
           # (2026-07-08) Two-leg split: filter the FULLY-VALIDATED key set from
           # Smart Configuration down to this leg's scope. Runs AFTER validation
           # so repo vars / dispatch inputs / sanitization are untouched.
-          #   core-pages     -> everything except GLOBAL_MARKETS
+          #   core           -> everything except GLOBAL_MARKETS and
+          #                     MUTUAL_FUNDS (2026-08-02 three-leg split)
           #   global-markets -> GLOBAL_MARKETS only (empty on single_key runs
           #                     that target another page: the sync step then
           #                     no-ops with exit 0 — "No tasks selected").
-          if [[ "${{ matrix.keys_scope }}" == "only-gm" ]]; then
-            SCOPED="$(tr ' ' '\n' <<<"${SYNC_KEYS}" | grep -x 'GLOBAL_MARKETS' | xargs || true)"
-          else
-            SCOPED="$(tr ' ' '\n' <<<"${SYNC_KEYS}" | grep -vx 'GLOBAL_MARKETS' | xargs || true)"
-          fi
+          #   mutual-funds   -> MUTUAL_FUNDS only (same no-op semantics).
+          case "${{ matrix.keys_scope }}" in
+            only-gm)
+              SCOPED="$(tr ' ' '\n' <<<"${SYNC_KEYS}" | grep -x 'GLOBAL_MARKETS' | xargs || true)"
+              ;;
+            only-mf)
+              SCOPED="$(tr ' ' '\n' <<<"${SYNC_KEYS}" | grep -x 'MUTUAL_FUNDS' | xargs || true)"
+              ;;
+            *)
+              SCOPED="$(tr ' ' '\n' <<<"${SYNC_KEYS}" | grep -vx 'GLOBAL_MARKETS' | grep -vx 'MUTUAL_FUNDS' | xargs || true)"
+              ;;
+          esac
           echo "SYNC_KEYS=$SCOPED" >> "$GITHUB_ENV"
           echo "🎯 Leg ${{ matrix.group }} keys: ${SCOPED:-<none>}"
           if [[ -z "$SCOPED" ]]; then
