@@ -106,7 +106,7 @@ def _extract_funcs(rel_path, names, extra_globals=None):
         mod.__dict__.update(extra_globals or {})
         # module-level simple assignments the functions rely on
         for node in tree.body:
-            if isinstance(node, ast.Assign):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
                 try:
                     exec(compile(ast.Module([node], []), "<lift>", "exec"),
                          mod.__dict__)
@@ -532,3 +532,394 @@ def test_at_least_one_guard_module_loaded():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# =========================================================================== #
+# GUARDS 5-7 — shipped 2026-08-02 (Render Shell test campaign, same doctrine) #
+# =========================================================================== #
+# WHY THESE EXIST — anchored to REAL live defects found 2026-08-02:
+#
+#   5. routes/advanced_analysis._placeholder_value_for_key   (v4.15.0)
+#      POST /v1/analysis/sheet-rows for the .AB/.PS chunk returned FABRICATED
+#      rows: name "Market_Leaders ADNOCDIST.AB", prices 101.0/102.0/103.0
+#      (100+idx), recommendation "Accumulate", FRESH now() timestamps,
+#      provider "advanced_analysis.placeholder_fallback". The sync wrote them
+#      verbatim: workbook Name cells "Global_Markets HELN.SW", open_price
+#      104.00-108.00 on unrelated .SR rows, GAB$H.US at 107.00 / +7,900%
+#      (percent 79.00 = 100-idx*3 rendered as a fraction x100). Same generator
+#      family as defect #2 above — this time caught at the ROUTE, its source.
+#      v4.15.0 stub mode (default ON) must emit ZERO fabricated values; the
+#      legacy kill-switch must stay byte-faithful so rollback is honest.
+#
+#   6. scripts/run_dashboard_sync._fabrication_tripwire      (v6.31.0 FW-5)
+#      Sync-side defense-in-depth: any outgoing row whose Name matches the
+#      "<Page> <Symbol>" fabrication pattern or whose provider contains
+#      "placeholder_fallback" is stripped to a tagged symbol-only stub.
+#      Honest v4.15.0 no_data_stub rows must PASS (KLG owns them).
+#
+#   7. scripts/run_dashboard_sync heal-first HF-2            (v6.31.0)
+#      18 rows poisoned with "Global_Markets <sym>" names never healed:
+#      v6.24.2 HF-1 prioritized BLANK names only, and a poisoned name is
+#      non-blank. HF-2 treats fabricated-pattern names as blank-equivalent.
+#      The kill-switch must restore v6.30.0 ordering byte-identically.
+#
+# Loader note: same _extract_funcs AST-lift as the guards above — if the
+# v4.15.0 / v6.31.0 symbols are not yet on the branch under test, the lift
+# returns None and every guard SKIPS with a version-pinned reason instead of
+# failing an unrelated PR.
+
+import json as _g5_json
+import re as _g5_re
+import typing as _g5_typing
+from datetime import datetime as _g5_dt, timezone as _g5_tz
+
+_AA = _extract_funcs(
+    "routes/advanced_analysis.py",
+    {"_placeholder_stub_mode", "_stub_value_for_key", "_placeholder_value_for_key",
+     "_build_placeholder_rows", "_normalize_key_name", "_normalize_symbol_token",
+     "_strip"},
+    extra_globals={"json": _g5_json, "re": _g5_re,
+                   "Sequence": _g5_typing.Sequence, "Mapping": _g5_typing.Mapping,
+                   "datetime": _g5_dt, "timezone": _g5_tz},
+)
+_RDS_FW = _extract_funcs(
+    "scripts/run_dashboard_sync.py",
+    {"_placeholder_guard_enabled", "_name_is_fabricated", "_fabrication_tripwire",
+     "_guard_find_col", "_guard_is_blank", "_guard_norm",
+     "_read_existing_page_symbols", "_heal_first_enabled",
+     "_universe_cap_v2_enabled", "_page_read_row_bound",
+     "_manual_hold_gate_enabled", "_mh_parse_hold_until", "_mh_read_hold"},
+    extra_globals={"re": _g5_re, "Sequence": _g5_typing.Sequence,
+                   "datetime": _g5_dt, "timezone": _g5_tz,
+                   "logger": types.SimpleNamespace(
+                       info=lambda *a, **k: None,
+                       warning=lambda *a, **k: None)},
+)
+
+_G5_KEYS = ["symbol", "name", "current_price", "previous_close", "open_price",
+            "percent_change", "expected_roi_12m", "overall_score",
+            "recommendation", "recommendation_reason", "data_provider",
+            "warnings", "last_updated_utc", "exchange", "currency", "country",
+            "risk_bucket", "top10_rank", "horizon_days", "asset_class",
+            "selection_reason", "criteria_snapshot"]
+
+
+def _g5_mode(value):
+    """Set/clear TFB_ANALYSIS_PLACEHOLDER_MODE; returns restore callable."""
+    prev = os.environ.pop("TFB_ANALYSIS_PLACEHOLDER_MODE", None)
+    if value is not None:
+        os.environ["TFB_ANALYSIS_PLACEHOLDER_MODE"] = value
+    def _restore():
+        os.environ.pop("TFB_ANALYSIS_PLACEHOLDER_MODE", None)
+        if prev is not None:
+            os.environ["TFB_ANALYSIS_PLACEHOLDER_MODE"] = prev
+    return _restore
+
+
+@pytest.mark.skipif(_AA is None, reason="advanced_analysis v4.15.0 guards not present")
+def test_stub_mode_is_the_armed_default():
+    restore = _g5_mode(None)
+    try:
+        assert _AA._placeholder_stub_mode() is True
+    finally:
+        restore()
+
+
+@pytest.mark.skipif(_AA is None, reason="advanced_analysis v4.15.0 guards not present")
+def test_stub_rows_carry_zero_fabricated_values():
+    restore = _g5_mode(None)
+    try:
+        rows = _AA._build_placeholder_rows(
+            page="Global_Markets", keys=_G5_KEYS,
+            requested_symbols=["BALN.SW", "ADNOCDIST.AB"], limit=10, offset=0)
+        r = rows[0]
+        assert r["symbol"] == "BALN.SW"
+        assert r["name"] == ""                       # never "<Page> <Symbol>"
+        assert r["current_price"] is None            # never 100+idx
+        assert r["open_price"] is None               # the 104-108 artifact class
+        assert r["percent_change"] is None           # the +7,900% artifact class
+        assert r["overall_score"] is None and r["expected_roi_12m"] is None
+        assert r["recommendation"] == ""             # never "Accumulate"
+        assert r["last_updated_utc"] is None         # never fresh-stamped
+        assert r["data_provider"] == "advanced_analysis.no_data_stub"
+        assert r["warnings"] == "no_provider_data; placeholder_stub"
+        assert r["exchange"] == ""                   # never "NASDAQ/NYSE" guess
+        assert r["top10_rank"] is None
+    finally:
+        restore()
+
+
+@pytest.mark.skipif(_AA is None, reason="advanced_analysis v4.15.0 guards not present")
+def test_stub_keeps_only_structurally_certain_sr_identity():
+    restore = _g5_mode(None)
+    try:
+        r = _AA._build_placeholder_rows(
+            page="Market_Leaders", keys=_G5_KEYS,
+            requested_symbols=["1120.SR"], limit=5, offset=0)[0]
+        assert (r["exchange"], r["currency"], r["country"]) == (
+            "Tadawul", "SAR", "Saudi Arabia")
+        assert r["current_price"] is None
+    finally:
+        restore()
+
+
+@pytest.mark.skipif(_AA is None, reason="advanced_analysis v4.15.0 guards not present")
+def test_legacy_killswitch_reproduces_v414_fabrications_exactly():
+    """Rollback honesty: 'legacy' must be byte-faithful to the defect it names,
+    reproducing the live T13 evidence verbatim."""
+    restore = _g5_mode("legacy")
+    try:
+        rows = _AA._build_placeholder_rows(
+            page="Market_Leaders", keys=_G5_KEYS,
+            requested_symbols=["ADNOCDIST.AB", "FAB.AB", "BPI.PS"],
+            limit=10, offset=0)
+        assert rows[0]["name"] == "Market_Leaders ADNOCDIST.AB"
+        assert [r["current_price"] for r in rows] == [101.0, 102.0, 103.0]
+        assert rows[0]["open_price"] == 101.0
+        assert rows[0]["recommendation"] == "Accumulate"
+        assert rows[0]["percent_change"] == 97.0
+        assert rows[0]["data_provider"] == "advanced_analysis.placeholder_fallback"
+        assert rows[0]["warnings"] == "placeholder"
+        assert bool(rows[0]["last_updated_utc"])
+    finally:
+        restore()
+
+
+@pytest.mark.skipif(_AA is None, reason="advanced_analysis v4.15.0 guards not present")
+def test_top10_stub_rows_carry_no_fabricated_rank():
+    restore = _g5_mode(None)
+    try:
+        rows = _AA._build_placeholder_rows(
+            page="Top_10_Investments", keys=_G5_KEYS,
+            requested_symbols=["AAA", "BBB"], limit=5, offset=0)
+        assert all(r["top10_rank"] is None for r in rows)
+    finally:
+        restore()
+
+
+_G6_HDR = ["Symbol", "Name", "Current Price", "Data Provider", "Warnings"]
+
+
+@pytest.mark.skipif(_RDS_FW is None, reason="run_dashboard_sync v6.31.0 guards not present")
+def test_fw5_name_pattern_matches_fabrications_not_real_names():
+    fab = _RDS_FW._name_is_fabricated
+    assert fab("Global_Markets HELN.SW") is True
+    assert fab("Market_Leaders ADNOCDIST.AB") is True
+    assert fab("Baloise Holding AG") is False
+    assert fab("Global Markets Inc") is False        # space, not page token
+    assert fab("Global_Markets") is False            # bare token, no symbol
+    assert fab("") is False and fab(None) is False
+
+
+@pytest.mark.skipif(_RDS_FW is None, reason="run_dashboard_sync v6.31.0 guards not present")
+def test_fw5_strips_fabricated_passes_stub_and_healthy():
+    rows = [
+        ["BALN.SW", "Global_Markets BALN.SW", "106.0",
+         "advanced_analysis.placeholder_fallback", "placeholder"],
+        ["XYZ.US", "XYZ Corp", "55.2",
+         "advanced_analysis.placeholder_fallback", ""],
+        ["BK.US", "", "", "advanced_analysis.no_data_stub",
+         "no_provider_data; placeholder_stub"],
+        ["AAPL", "Apple Inc.", "213.1", "eodhd", "yahoo_enrichment_applied"],
+    ]
+    out, stripped = _RDS_FW._fabrication_tripwire(_G6_HDR, [list(r) for r in rows])
+    assert "BALN.SW" in stripped and "XYZ.US" in stripped
+    assert "BK.US" not in stripped and "AAPL" not in stripped
+    assert out[0][0] == "BALN.SW" and out[0][1] == "" and out[0][2] == ""
+    assert out[0][4] == "identity_quarantined:fabricated_placeholder:v6.31.0"
+    assert out[3][1] == "Apple Inc."
+
+
+@pytest.mark.skipif(_RDS_FW is None, reason="run_dashboard_sync v6.31.0 guards not present")
+def test_fw5_failsafe_missing_columns_is_a_noop():
+    _, stripped = _RDS_FW._fabrication_tripwire(["A", "B"], [["x", "y"]])
+    assert stripped == []
+
+
+class _G7MockSheets:
+    def read_values(self, *_a, **_k):
+        return [["Symbol", "Name", "Price", "D", "E"],
+                ["GOOD.US", "Real Company", "1", "", ""],
+                ["POIS.US", "Global_Markets POIS.US", "1", "", ""],
+                ["BLNK.US", "", "1", "", ""]]
+
+
+@pytest.mark.skipif(_RDS_FW is None, reason="run_dashboard_sync v6.31.0 guards not present")
+def test_hf2_poisoned_names_jump_the_heal_queue():
+    prev = os.environ.pop("TFB_SYNC_PLACEHOLDER_GUARD", None)
+    try:
+        out = _RDS_FW._read_existing_page_symbols(
+            _G7MockSheets(), "sid", "Global_Markets", 50)
+        assert out == ["POIS.US", "BLNK.US", "GOOD.US"]
+    finally:
+        if prev is not None:
+            os.environ["TFB_SYNC_PLACEHOLDER_GUARD"] = prev
+
+
+@pytest.mark.skipif(_RDS_FW is None, reason="run_dashboard_sync v6.31.0 guards not present")
+def test_hf2_killswitch_restores_v6300_blankonly_order():
+    prev = os.environ.pop("TFB_SYNC_PLACEHOLDER_GUARD", None)
+    os.environ["TFB_SYNC_PLACEHOLDER_GUARD"] = "0"
+    try:
+        out = _RDS_FW._read_existing_page_symbols(
+            _G7MockSheets(), "sid", "Global_Markets", 50)
+        assert out == ["BLNK.US", "GOOD.US", "POIS.US"]
+    finally:
+        os.environ.pop("TFB_SYNC_PLACEHOLDER_GUARD", None)
+        if prev is not None:
+            os.environ["TFB_SYNC_PLACEHOLDER_GUARD"] = prev
+
+
+# --------------------------------------------------------------------------- #
+# GUARD 8 — MANUAL-HOLD bridge (v6.32.0): operator manual refresh priority    #
+# --------------------------------------------------------------------------- #
+from datetime import timedelta as _g8_td
+
+@pytest.mark.skipif(_RDS_FW is None or not hasattr(_RDS_FW, "_mh_parse_hold_until"),
+                    reason="run_dashboard_sync v6.32.0 manual-hold not present")
+def test_manual_hold_parse_clamp_and_riyadh_naive():
+    p = _RDS_FW._mh_parse_hold_until
+    now = _g5_dt.now(_g5_tz.utc)
+    z = (now + _g8_td(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert abs((p(z) - (now + _g8_td(hours=2))).total_seconds()) < 2
+    naive = (now + _g8_td(hours=5)).strftime("%Y-%m-%d %H:%M:%S")  # +5h wall
+    assert abs((p(naive) - (now + _g8_td(hours=2))).total_seconds()) < 2  # Riyadh-3h
+    assert p("soon") is None and p("") is None and p(None) is None
+    far = (now + _g8_td(hours=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert p(far) <= now + _g8_td(hours=12, minutes=1)  # deadlock ceiling
+
+
+@pytest.mark.skipif(_RDS_FW is None or not hasattr(_RDS_FW, "_mh_read_hold"),
+                    reason="run_dashboard_sync v6.32.0 manual-hold not present")
+def test_manual_hold_read_is_fail_open():
+    class _Boom:
+        def read_values(self, *a): raise RuntimeError("no _Sync_Control tab")
+    assert _RDS_FW._mh_read_hold(_Boom(), "sid") == (None, "")
+    class _MS:
+        def read_values(self, *a):
+            return [["Key", "Value"], ["Manual Hold Until", "2020-01-01T00:00:00Z"]]
+    until, raw = _RDS_FW._mh_read_hold(_MS(), "sid")
+    assert until is not None and raw == "2020-01-01T00:00:00Z"
+
+
+@pytest.mark.skipif(_RDS_FW is None or not hasattr(_RDS_FW, "_manual_hold_gate_enabled"),
+                    reason="run_dashboard_sync v6.32.0 manual-hold not present")
+def test_manual_hold_gate_default_on_with_killswitch():
+    prev = os.environ.pop("TFB_SYNC_MANUAL_HOLD_GATE", None)
+    try:
+        assert _RDS_FW._manual_hold_gate_enabled() is True
+        os.environ["TFB_SYNC_MANUAL_HOLD_GATE"] = "0"
+        assert _RDS_FW._manual_hold_gate_enabled() is False
+    finally:
+        os.environ.pop("TFB_SYNC_MANUAL_HOLD_GATE", None)
+        if prev is not None:
+            os.environ["TFB_SYNC_MANUAL_HOLD_GATE"] = prev
+
+
+# --------------------------------------------------------------------------- #
+# GUARD 9 — EODHD plan_restricted isolation (v4.16.0): one uncovered symbol   #
+# class must never trip the whole-provider circuit breaker                    #
+# --------------------------------------------------------------------------- #
+import time as _g9_time
+
+_EODHD = _extract_funcs(
+    "core/providers/eodhd_provider.py",
+    {"_plan_restricted_isolation_enabled", "_plan_restricted_ttl_sec",
+     "_plan_restricted_tokens", "_body_indicates_plan_restricted",
+     "_plan_restricted_cache_active", "_plan_restricted_cache_set"},
+    extra_globals={"time": _g9_time},
+)
+
+
+@pytest.mark.skipif(_EODHD is None, reason="eodhd_provider v4.16.0 isolation not present")
+def test_plan_restricted_matcher_and_precedence_safety():
+    m = _EODHD._body_indicates_plan_restricted
+    assert m("you are not subscribed to this api.") is True
+    assert m("your plan doesn't support this feature") is True
+    assert m("api rate limit exceeded, too many requests") is False  # quota stays quota
+    assert m("invalid api key") is False                              # auth stays auth
+    assert m("") is False
+    prev = os.environ.pop("TFB_EODHD_PLAN_RESTRICTED_TOKENS", None)
+    try:
+        os.environ["TFB_EODHD_PLAN_RESTRICTED_TOKENS"] = "custom probe marker"
+        assert m("body with custom probe marker inside") is True
+    finally:
+        os.environ.pop("TFB_EODHD_PLAN_RESTRICTED_TOKENS", None)
+        if prev is not None:
+            os.environ["TFB_EODHD_PLAN_RESTRICTED_TOKENS"] = prev
+
+
+@pytest.mark.skipif(_EODHD is None, reason="eodhd_provider v4.16.0 isolation not present")
+def test_plan_restricted_cache_ttl_and_expiry():
+    _EODHD._plan_restricted_cache_set("real-time/G9TEST.US")
+    assert _EODHD._plan_restricted_cache_active("real-time/G9TEST.US") is True
+    assert _EODHD._plan_restricted_cache_active("real-time/OTHER.US") is False
+    _EODHD._PLAN_RESTRICTED_CACHE["real-time/G9TEST.US"] = _g9_time.monotonic() - 1
+    assert _EODHD._plan_restricted_cache_active("real-time/G9TEST.US") is False
+    prev = os.environ.pop("TFB_EODHD_PLAN_RESTRICTED_TTL_SEC", None)
+    try:
+        os.environ["TFB_EODHD_PLAN_RESTRICTED_TTL_SEC"] = "999999999"
+        assert _EODHD._plan_restricted_ttl_sec() == 7 * 86400.0  # deadlock ceiling
+    finally:
+        os.environ.pop("TFB_EODHD_PLAN_RESTRICTED_TTL_SEC", None)
+        if prev is not None:
+            os.environ["TFB_EODHD_PLAN_RESTRICTED_TTL_SEC"] = prev
+
+
+@pytest.mark.skipif(_EODHD is None, reason="eodhd_provider v4.16.0 isolation not present")
+def test_plan_restricted_gate_default_on_with_killswitch():
+    prev = os.environ.pop("TFB_EODHD_PLAN_RESTRICTED_ISOLATION", None)
+    try:
+        assert _EODHD._plan_restricted_isolation_enabled() is True
+        os.environ["TFB_EODHD_PLAN_RESTRICTED_ISOLATION"] = "0"
+        assert _EODHD._plan_restricted_isolation_enabled() is False
+    finally:
+        os.environ.pop("TFB_EODHD_PLAN_RESTRICTED_ISOLATION", None)
+        if prev is not None:
+            os.environ["TFB_EODHD_PLAN_RESTRICTED_ISOLATION"] = prev
+
+
+# --------------------------------------------------------------------------- #
+# GUARD 10 — yahoo_chart symmetric range fallbacks (v8.12.0, B8): a present   #
+# 52w HIGH must never block healing a missing 52w LOW; day range heals from   #
+# the latest candle; real provider values are never overridden               #
+# --------------------------------------------------------------------------- #
+import math as _g10_math
+
+_YC = _extract_funcs(
+    "core/providers/yahoo_chart_provider.py",
+    {"_yc_range_fallbacks_enabled", "_apply_range_fallbacks",
+     "_first_number", "_safe_float"},
+    extra_globals={"math": _g10_math},
+)
+
+
+@pytest.mark.skipif(_YC is None, reason="yahoo_chart v8.12.0 fallbacks not present")
+def test_range_fallbacks_heal_only_missing_sides():
+    hist = [{"close": 20.0 + i * 0.01, "high": 27.1, "low": 26.0} for i in range(300)]
+    prev = os.environ.pop("TFB_YC_RANGE_FALLBACKS", None)
+    try:
+        dh, dl, h52, l52 = _YC._apply_range_fallbacks(None, None, 30.5, 0.0, hist)
+        assert h52 == 30.5                       # real high untouched
+        assert abs(l52 - 20.48) < 1e-9           # the 2222.SR defect: low healed
+        assert dh == 27.1 and dl == 26.0         # day range from last candle
+        assert _YC._apply_range_fallbacks(26.9, None, 1.0, 1.0, hist)[0] == 26.9
+        assert _YC._apply_range_fallbacks(None, 5.0, None, 2.0, []) == (None, 5.0, None, 2.0)
+        assert _YC._apply_range_fallbacks(None, None, None, None, ["x"]) == (None, None, None, None)
+    finally:
+        if prev is not None:
+            os.environ["TFB_YC_RANGE_FALLBACKS"] = prev
+
+
+@pytest.mark.skipif(_YC is None, reason="yahoo_chart v8.12.0 fallbacks not present")
+def test_range_fallbacks_killswitch_restores_v8110():
+    hist = [{"close": 21.0, "high": 27.1, "low": 26.0}] * 10
+    prev = os.environ.pop("TFB_YC_RANGE_FALLBACKS", None)
+    os.environ["TFB_YC_RANGE_FALLBACKS"] = "0"
+    try:
+        assert _YC._apply_range_fallbacks(None, None, 30.5, 0.0, hist) == (None, None, 30.5, 0.0)
+        assert _YC._yc_range_fallbacks_enabled() is False
+    finally:
+        os.environ.pop("TFB_YC_RANGE_FALLBACKS", None)
+        if prev is not None:
+            os.environ["TFB_YC_RANGE_FALLBACKS"] = prev
