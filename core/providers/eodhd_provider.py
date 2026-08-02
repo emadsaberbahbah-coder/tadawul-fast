@@ -936,6 +936,16 @@ def _plan_restricted_tokens() -> Tuple[str, ...]:
     return _PLAN_RESTRICTED_TOKENS_DEFAULT + tuple(extra)
 
 
+def _plan_restricted_applies(sc: int, is_ip_blocked: bool, body_low: str) -> bool:
+    """v4.17.0 [P0-4]: plan-restricted isolation applies ONLY to HTTP 403.
+    A 401 — even with subscription wording — is an account/authentication
+    failure and must keep feeding AuthError + provider health."""
+    return (sc == 403
+            and _plan_restricted_isolation_enabled()
+            and (not is_ip_blocked)
+            and _body_indicates_plan_restricted(body_low))
+
+
 def _body_indicates_plan_restricted(body_low: str) -> bool:
     """True iff the (lowercased) 401/403 body matches the subscription-gap
     class. Callers MUST test quota/rate first — precedence is preserved by
@@ -1090,7 +1100,17 @@ def _build_error_patch_with_geo(
 #      restores v4.15.0), TFB_EODHD_PLAN_RESTRICTED_TOKENS (comma-separated
 #      additions), TFB_EODHD_PLAN_RESTRICTED_TTL_SEC (default 86400).
 # ---------------------------------------------------------------------------
-PROVIDER_VERSION = "4.16.0"
+PROVIDER_VERSION = "4.17.0"
+# =============================================================================
+# v4.17.0 (2026-08-03) — P0-4 STRICT-403 PLAN-RESTRICTED GATE (external audit)
+# The isolation branch sat inside `if sc in (401, 403)` with broad tokens
+# ("subscription", "your plan", ...), so an expired-account 401 could be
+# misclassified as an endpoint plan limitation — suppressing AuthError and
+# provider-health signaling. New pure gate _plan_restricted_applies() requires
+# sc == 403 exactly; a 401 always falls through to the auth path and feeds the
+# circuit. The gate is a lifted-testable helper (tests Guard 12). ZERO
+# functions removed; token matcher / cache / TTL / kill-switch unchanged.
+# =============================================================================
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -2288,9 +2308,9 @@ class EODHDClient:
                         # (precedence kept), BEFORE ip/auth. No breaker
                         # impact, no unhealthy token; endpoint cached so the
                         # engine falls to the next provider instantly.
-                        if (_plan_restricted_isolation_enabled()
-                                and not is_ip_blocked
-                                and _body_indicates_plan_restricted(body_low)):
+                        if _plan_restricted_applies(sc, is_ip_blocked, body_low):
+                            # v4.17.0: strictly 403 — a 401 falls through to
+                            # the auth path below (AuthError + health).
                             _plan_restricted_cache_set(endpoint)
                             return None, f"HTTP {sc} plan_restricted {body_hint}".strip()
 
