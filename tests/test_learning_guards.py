@@ -596,6 +596,23 @@ _RDS_FW = _extract_funcs(
                        warning=lambda *a, **k: None)},
 )
 
+# --------------------------------------------------------------------------- #
+# v3 VERSION FLAGS — the guards adapt to the contract each file actually      #
+# ships, so this suite is green on EVERY commit-order combination of the      #
+# 2026-08-03 integrity-closeout wave (route v4.16.0 / sync v6.33.0).          #
+# --------------------------------------------------------------------------- #
+def _read_src(rel):
+    try:
+        with open(os.path.join(_ROOT, rel), "r", encoding="utf-8") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+_AA_SRC = _read_src("routes/advanced_analysis.py")
+_RDS_SRC = _read_src("scripts/run_dashboard_sync.py")
+_ROUTE_V16 = "TFB_ALLOW_LEGACY_FABRICATION" in _AA_SRC
+_SYNC_V33 = 'SCRIPT_VERSION = "6.33' in _RDS_SRC
+
 _G5_KEYS = ["symbol", "name", "current_price", "previous_close", "open_price",
             "percent_change", "expected_roi_12m", "overall_score",
             "recommendation", "recommendation_reason", "data_provider",
@@ -666,8 +683,14 @@ def test_stub_keeps_only_structurally_certain_sr_identity():
 @pytest.mark.skipif(_AA is None, reason="advanced_analysis v4.15.0 guards not present")
 def test_legacy_killswitch_reproduces_v414_fabrications_exactly():
     """Rollback honesty: 'legacy' must be byte-faithful to the defect it names,
-    reproducing the live T13 evidence verbatim."""
+    reproducing the live T13 evidence verbatim.
+    v3: under route v4.16.0 the P0-1d hardening requires the dev-only second
+    key TFB_ALLOW_LEGACY_FABRICATION=1 — supplied here so byte-fidelity of the
+    legacy branch stays pinned; legacy-ALONE-is-blocked is Guard 11."""
     restore = _g5_mode("legacy")
+    _prev_allow = os.environ.pop("TFB_ALLOW_LEGACY_FABRICATION", None)
+    if _ROUTE_V16:
+        os.environ["TFB_ALLOW_LEGACY_FABRICATION"] = "1"
     try:
         rows = _AA._build_placeholder_rows(
             page="Market_Leaders", keys=_G5_KEYS,
@@ -682,6 +705,9 @@ def test_legacy_killswitch_reproduces_v414_fabrications_exactly():
         assert rows[0]["warnings"] == "placeholder"
         assert bool(rows[0]["last_updated_utc"])
     finally:
+        os.environ.pop("TFB_ALLOW_LEGACY_FABRICATION", None)
+        if _prev_allow is not None:
+            os.environ["TFB_ALLOW_LEGACY_FABRICATION"] = _prev_allow
         restore()
 
 
@@ -786,7 +812,21 @@ def test_manual_hold_parse_clamp_and_riyadh_naive():
     assert abs((p(naive) - (now + _g8_td(hours=2))).total_seconds()) < 2  # Riyadh-3h
     assert p("soon") is None and p("") is None and p(None) is None
     far = (now + _g8_td(hours=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    assert p(far) <= now + _g8_td(hours=12, minutes=1)  # deadlock ceiling
+    if _SYNC_V33:
+        # v6.33.0 P0-3b: far-future is REJECTED (fail-open), never re-clamped
+        # into a perpetually-rolling hold.
+        assert p(far) is None
+        ok11 = now + _g8_td(hours=11)
+        assert abs((p(ok11.strftime("%Y-%m-%dT%H:%M:%SZ")) - ok11).total_seconds()) < 2
+        # v6.33.0 P0-3a: Google Sheets date-serials (epoch 1899-12-30) parse.
+        tgt = now + _g8_td(hours=2)
+        serial = ((tgt + _g8_td(hours=3)).replace(tzinfo=None)
+                  - _g5_dt(1899, 12, 30)).total_seconds() / 86400.0
+        assert abs((p(serial) - tgt).total_seconds()) < 2
+        assert abs((p(str(serial)) - tgt).total_seconds()) < 2
+        assert p("0.5") is None
+    else:
+        assert p(far) <= now + _g8_td(hours=12, minutes=1)  # v6.32 clamp pin
 
 
 @pytest.mark.skipif(_RDS_FW is None or not hasattr(_RDS_FW, "_mh_read_hold"),
@@ -923,3 +963,75 @@ def test_range_fallbacks_killswitch_restores_v8110():
         os.environ.pop("TFB_YC_RANGE_FALLBACKS", None)
         if prev is not None:
             os.environ["TFB_YC_RANGE_FALLBACKS"] = prev
+
+
+# =========================================================================== #
+# GUARD 8b — sync v6.33.0 INTEGRITY CLOSEOUT (audit P0-2 / P0-3c)             #
+# =========================================================================== #
+@pytest.mark.skipif(not _SYNC_V33, reason="run_dashboard_sync v6.33.0 not present")
+def test_v633_manual_hold_skip_is_registered_benign():
+    assert '"[MANUAL-HOLD",' in _RDS_SRC          # marker in _BENIGN_SKIP_MARKERS
+    assert "deferred (benign)" in _RDS_SRC        # per-task TaskResult.warnings entry
+
+
+@pytest.mark.skipif(not _SYNC_V33, reason="run_dashboard_sync v6.33.0 not present")
+def test_v633_poison_predecessor_certification_closed():
+    # KLG error set consults the fabricated-provider token via RAW casefold
+    # (P0-2; _guard_norm strips underscores so it could never match through it)
+    assert 'str(v or "").casefold()' in _RDS_SRC
+    # Leg-1b: fabricated "<Page> <Symbol>" names are never last-GOOD
+    assert "_name_is_fabricated(_cell(name_i))" in _RDS_SRC
+
+
+@pytest.mark.skipif(not _SYNC_V33, reason="run_dashboard_sync v6.33.0 not present")
+def test_v633_far_future_reject_is_logged_not_clamped():
+    assert "rejected far-future hold" in _RDS_SRC
+    assert "min(dt_utc, ceiling)" not in _RDS_SRC
+
+
+# =========================================================================== #
+# GUARD 11 — route v4.16.0 NO-FABRICATION CLOSEOUT (audit P0-1 a/b/c/d)       #
+# =========================================================================== #
+@pytest.mark.skipif(not _ROUTE_V16 or _AA is None,
+                    reason="advanced_analysis v4.16.0 not present")
+def test_v416_runtime_version_matches_file():
+    assert 'ADVANCED_ANALYSIS_VERSION = "4.16.0"' in _AA_SRC
+
+
+@pytest.mark.skipif(not _ROUTE_V16 or _AA is None,
+                    reason="advanced_analysis v4.16.0 not present")
+def test_v416_legacy_alone_is_blocked_fail_closed():
+    """P0-1d: without the dev-only second key, 'legacy' (and any boolean-ish
+    value) must fail CLOSED to honest stubs — no fabricated name/price/reco."""
+    for value in ("legacy", "0", "false", "off"):
+        restore = _g5_mode(value)
+        prev = os.environ.pop("TFB_ALLOW_LEGACY_FABRICATION", None)
+        try:
+            r = _AA._build_placeholder_rows(
+                page="Market_Leaders", keys=_G5_KEYS,
+                requested_symbols=["FAB.AB"], limit=5, offset=0)[0]
+            assert r["name"] == ""
+            assert r["current_price"] is None
+            assert r["recommendation"] == ""
+            assert r["data_provider"] == "advanced_analysis.no_data_stub"
+        finally:
+            if prev is not None:
+                os.environ["TFB_ALLOW_LEGACY_FABRICATION"] = prev
+            restore()
+
+
+@pytest.mark.skipif(not _ROUTE_V16, reason="advanced_analysis v4.16.0 not present")
+def test_v416_insights_failure_no_generated_recommendations():
+    # P0-1b: the Insights fallback stub branch exists and the fabricated
+    # Accumulate/Watch generator survives ONLY inside the legacy-gated else.
+    assert "fabricated fallback disabled (v4.16.0" in _AA_SRC
+    stub_i = _AA_SRC.find("fabricated fallback disabled")
+    legacy_i = _AA_SRC.find('"Watch" if idx > 2 else "Accumulate"', stub_i)
+    assert legacy_i > stub_i > 0
+    assert "if _placeholder_stub_mode():" in _AA_SRC[stub_i-1200:stub_i]
+
+
+@pytest.mark.skipif(not _ROUTE_V16, reason="advanced_analysis v4.16.0 not present")
+def test_v416_ensure_top10_exempts_stub_rows():
+    # P0-1c: the second-pass ranker carries the stub exemption.
+    assert "P0-1c" in _AA_SRC and _AA_SRC.count("stub row (no fabricated values)") >= 2
