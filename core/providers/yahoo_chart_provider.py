@@ -646,7 +646,25 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.11.0"
+# ---------------------------------------------------------------------------
+# v8.12.0 — SYMMETRIC RANGE FALLBACKS (2026-08-02, B8)
+# WHY (live Render evidence): 2222.SR -> price 26.48 but day_high/day_low/
+# week_52_low all 0.0 on the sheet. Root causes, both code-evident:
+#   1. The 52-week fallback keyed ONLY on the HIGH being missing
+#      (`if not week_52_high and history:`). Yahoo's .SR chart meta supplies
+#      fiftyTwoWeekHigh but returns a zero/absent fiftyTwoWeekLow, so the
+#      condition was False and the LOW was never recomputed from the candle
+#      history sitting right there. Asymmetric guard = one-sided healing.
+#   2. day_high/day_low had NO candle fallback at all: meta-only reads, and
+#      .SR meta omits regularMarketDayHigh/Low.
+# FIX: one pure helper `_apply_range_fallbacks` wired at both sites — fills
+# ONLY missing/zero sides, never overrides a real provider value; day range
+# from the latest candle's high/low (also open as a last-resort floor/cap
+# companion is NOT used — candle high/low only, honest); 52w from the last
+# 252 closes, each side independently. ENV TFB_YC_RANGE_FALLBACKS default ON;
+# =0/false/off/no restores v8.11.0 behavior byte-identically.
+# ---------------------------------------------------------------------------
+PROVIDER_VERSION = "8.12.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -1450,6 +1468,43 @@ def _first_number(*values: Any) -> Optional[float]:
         if f is not None:
             return f
     return None
+
+def _yc_range_fallbacks_enabled() -> bool:
+    """v8.12.0: default ON. TFB_YC_RANGE_FALLBACKS=0/false/off/no restores
+    v8.11.0 (asymmetric 52w guard, no day-range candle fallback)."""
+    return (os.getenv("TFB_YC_RANGE_FALLBACKS") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _apply_range_fallbacks(
+    day_high: Optional[float],
+    day_low: Optional[float],
+    week_52_high: Optional[float],
+    week_52_low: Optional[float],
+    history: Any,
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """v8.12.0: fill ONLY missing/zero sides from candle history; a real
+    provider value is never overridden. Fail-safe: any exception returns the
+    inputs unchanged. `history` is the provider's list of candle dicts."""
+    try:
+        if not _yc_range_fallbacks_enabled() or not history:
+            return day_high, day_low, week_52_high, week_52_low
+        last = history[-1] if isinstance(history[-1], dict) else {}
+        if not day_high:
+            day_high = _first_number(last.get("high"))
+        if not day_low:
+            day_low = _first_number(last.get("low"))
+        if not week_52_high or not week_52_low:
+            closes_252 = [h["close"] for h in history[-252:]
+                          if isinstance(h, dict) and h.get("close")]
+            if closes_252:
+                if not week_52_high:
+                    week_52_high = max(closes_252)
+                if not week_52_low:
+                    week_52_low = min(closes_252)
+        return day_high, day_low, week_52_high, week_52_low
+    except Exception:
+        return day_high, day_low, week_52_high, week_52_low
+
 
 
 def _first_fraction(*values: Any) -> Optional[float]:
@@ -2343,7 +2398,11 @@ def _enrich_data(
     week_52_high = _first_number(info.get("fiftyTwoWeekHigh"))
     week_52_low = _first_number(info.get("fiftyTwoWeekLow"))
 
-    if not week_52_high and history:
+    if _yc_range_fallbacks_enabled():
+        # v8.12.0: symmetric — each missing side healed independently.
+        _, _, week_52_high, week_52_low = _apply_range_fallbacks(
+            None, None, week_52_high, week_52_low, history)
+    elif not week_52_high and history:
         closes_252 = [h["close"] for h in history[-252:] if h.get("close")]
         if closes_252:
             week_52_high = max(closes_252)
@@ -2407,6 +2466,9 @@ def _enrich_data(
     open_price = _first_number(info.get("open"), info.get("regularMarketOpen"))
     day_high = _first_number(info.get("dayHigh"), info.get("regularMarketDayHigh"))
     day_low = _first_number(info.get("dayLow"), info.get("regularMarketDayLow"))
+    # v8.12.0: .SR meta omits day range — heal from the latest candle.
+    day_high, day_low, _, _ = _apply_range_fallbacks(
+        day_high, day_low, 1.0, 1.0, history)
 
     # Data quality
     if price and history:
