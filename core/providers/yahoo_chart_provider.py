@@ -664,7 +664,17 @@ PROVIDER_NAME = "yahoo_chart"
 # 252 closes, each side independently. ENV TFB_YC_RANGE_FALLBACKS default ON;
 # =0/false/off/no restores v8.11.0 behavior byte-identically.
 # ---------------------------------------------------------------------------
-PROVIDER_VERSION = "8.12.0"
+PROVIDER_VERSION = "8.13.0"
+# =============================================================================
+# v8.13.0 (2026-08-03) — P1-6 CANDLE-TRUE 52W RANGE + PROVENANCE (audit)
+# v8.12.0 derived 52w from CLOSES, understating highs / overstating lows when
+# intraday extremes sat away from the close. The helper now uses valid candle
+# highs/lows first and closes only as an explicitly TAGGED last resort; an
+# optional `provenance` dict receives range_source ∈ {history_high_low,
+# close_only_fallback} + per-side day/week tags, and both call sites attach it
+# to the outgoing payload as `range_source`. Real provider values are still
+# never overridden; kill-switch TFB_YC_RANGE_FALLBACKS unchanged. ZERO removed.
+# =============================================================================
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -1481,6 +1491,7 @@ def _apply_range_fallbacks(
     week_52_high: Optional[float],
     week_52_low: Optional[float],
     history: Any,
+    provenance: Optional[dict] = None,
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """v8.12.0: fill ONLY missing/zero sides from candle history; a real
     provider value is never overridden. Fail-safe: any exception returns the
@@ -1491,16 +1502,46 @@ def _apply_range_fallbacks(
         last = history[-1] if isinstance(history[-1], dict) else {}
         if not day_high:
             day_high = _first_number(last.get("high"))
+            if day_high is not None and provenance is not None:
+                provenance["day_source"] = "history_last_candle"
         if not day_low:
             day_low = _first_number(last.get("low"))
+            if day_low is not None and provenance is not None:
+                provenance.setdefault("day_source", "history_last_candle")
         if not week_52_high or not week_52_low:
-            closes_252 = [h["close"] for h in history[-252:]
-                          if isinstance(h, dict) and h.get("close")]
-            if closes_252:
-                if not week_52_high:
+            win = [h for h in history[-252:] if isinstance(h, dict)]
+            highs_252 = [v for v in (_first_number(h.get("high")) for h in win)
+                         if v is not None and v > 0]
+            lows_252 = [v for v in (_first_number(h.get("low")) for h in win)
+                        if v is not None and v > 0]
+            closes_252 = [v for v in (_first_number(h.get("close")) for h in win)
+                          if v is not None and v > 0]
+            # v8.13.0 [P1-6]: candle extremes are the truth; closes are an
+            # explicitly tagged LAST resort (they understate the true range).
+            if not week_52_high:
+                if highs_252:
+                    week_52_high = max(highs_252)
+                    if provenance is not None:
+                        provenance["week52_high_source"] = "history_high_low"
+                elif closes_252:
                     week_52_high = max(closes_252)
-                if not week_52_low:
+                    if provenance is not None:
+                        provenance["week52_high_source"] = "close_only_fallback"
+            if not week_52_low:
+                if lows_252:
+                    week_52_low = min(lows_252)
+                    if provenance is not None:
+                        provenance["week52_low_source"] = "history_high_low"
+                elif closes_252:
                     week_52_low = min(closes_252)
+                    if provenance is not None:
+                        provenance["week52_low_source"] = "close_only_fallback"
+            if provenance is not None and any(
+                    k.startswith("week52") for k in provenance):
+                provenance["range_source"] = (
+                    "close_only_fallback"
+                    if "close_only_fallback" in provenance.values()
+                    else "history_high_low")
         return day_high, day_low, week_52_high, week_52_low
     except Exception:
         return day_high, day_low, week_52_high, week_52_low
@@ -2398,10 +2439,12 @@ def _enrich_data(
     week_52_high = _first_number(info.get("fiftyTwoWeekHigh"))
     week_52_low = _first_number(info.get("fiftyTwoWeekLow"))
 
+    _range_prov: dict = {}
     if _yc_range_fallbacks_enabled():
-        # v8.12.0: symmetric — each missing side healed independently.
+        # v8.12.0 symmetric heal; v8.13.0 adds candle-true 52w + provenance.
         _, _, week_52_high, week_52_low = _apply_range_fallbacks(
-            None, None, week_52_high, week_52_low, history)
+            None, None, week_52_high, week_52_low, history,
+            provenance=_range_prov)
     elif not week_52_high and history:
         closes_252 = [h["close"] for h in history[-252:] if h.get("close")]
         if closes_252:
@@ -2468,7 +2511,7 @@ def _enrich_data(
     day_low = _first_number(info.get("dayLow"), info.get("regularMarketDayLow"))
     # v8.12.0: .SR meta omits day range — heal from the latest candle.
     day_high, day_low, _, _ = _apply_range_fallbacks(
-        day_high, day_low, 1.0, 1.0, history)
+        day_high, day_low, 1.0, 1.0, history, provenance=_range_prov)
 
     # Data quality
     if price and history:
@@ -2485,6 +2528,10 @@ def _enrich_data(
         "provider_version": PROVIDER_VERSION,
         "data_source": PROVIDER_NAME,
         "data_quality": data_quality,
+        # v8.13.0 [P1-6]: how the range fields were sourced (empty when the
+        # provider supplied them directly).
+        "range_source": (_range_prov.get("range_source")
+                         or _range_prov.get("day_source") or ""),
         "last_updated_utc": _utc_iso(),
         "last_updated_riyadh": _riyadh_iso(),
         # v8.5.0 (Fix AR support): time of the bar/quote backing current_price.
