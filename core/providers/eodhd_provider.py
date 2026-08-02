@@ -910,6 +910,56 @@ def _validate_52w_bounds_merged(
 #   - "circuit_open"                                -> handled separately
 #                                                       by _build_circuit_open_patch
 
+# --- v4.16.0 PLAN-RESTRICTED ISOLATION helpers (WHY: header block) ---------
+_PLAN_RESTRICTED_TOKENS_DEFAULT: Tuple[str, ...] = (
+    "not subscribed", "subscription", "your plan", "upgrade your",
+    "not available for your", "plan does not", "not included in",
+    "requires a higher", "paid plan",
+)
+_PLAN_RESTRICTED_CACHE: Dict[str, float] = {}
+
+
+def _plan_restricted_isolation_enabled() -> bool:
+    return (os.getenv("TFB_EODHD_PLAN_RESTRICTED_ISOLATION") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _plan_restricted_ttl_sec() -> float:
+    try:
+        v = float((os.getenv("TFB_EODHD_PLAN_RESTRICTED_TTL_SEC") or "86400").strip())
+        return min(max(v, 60.0), 7 * 86400.0)
+    except Exception:
+        return 86400.0
+
+
+def _plan_restricted_tokens() -> Tuple[str, ...]:
+    extra = [t.strip().lower() for t in (os.getenv("TFB_EODHD_PLAN_RESTRICTED_TOKENS") or "").split(",") if t.strip()]
+    return _PLAN_RESTRICTED_TOKENS_DEFAULT + tuple(extra)
+
+
+def _body_indicates_plan_restricted(body_low: str) -> bool:
+    """True iff the (lowercased) 401/403 body matches the subscription-gap
+    class. Callers MUST test quota/rate first — precedence is preserved by
+    call order in the classifier, not here."""
+    if not body_low:
+        return False
+    return any(tok in body_low for tok in _plan_restricted_tokens())
+
+
+def _plan_restricted_cache_active(endpoint: str) -> bool:
+    try:
+        exp = _PLAN_RESTRICTED_CACHE.get(endpoint)
+        return bool(exp is not None and exp > time.monotonic())
+    except Exception:
+        return False
+
+
+def _plan_restricted_cache_set(endpoint: str) -> None:
+    try:
+        _PLAN_RESTRICTED_CACHE[endpoint] = time.monotonic() + _plan_restricted_ttl_sec()
+    except Exception:
+        pass
+
+
 _PROVIDER_UNHEALTHY_TRIGGER_TOKENS: Tuple[str, ...] = (
     "auth_error",
     "ip_blocked",
@@ -1017,7 +1067,30 @@ def _build_error_patch_with_geo(
 #      case ~2x the configured value) and resets on deploy; it is a safety
 #      rail, not accounting. Suggested starting value: 40000.
 # =============================================================================
-PROVIDER_VERSION = "4.15.0"
+# ---------------------------------------------------------------------------
+# v4.16.0 — PLAN-RESTRICTED ISOLATION (2026-08-02)
+# WHY: EODHD answers subscription-gap requests (instrument/endpoint not in
+# the plan, e.g. the Mutual_Funds population) with HTTP 403 whose body
+# matches NEITHER the quota nor the ip-block keyword sets, so it fell into
+# the auth_error catch-all: `provider_unhealthy:eodhd` emitted per row AND
+# health.record_failure("AuthError") feeding the 8-consecutive breaker.
+# 2,471 consecutive uncovered MF symbols therefore tripped a WHOLE-PROVIDER
+# CircuitOpen cooldown, blacking out EODHD for thousands of symbols the plan
+# fully covers (workbook fossil: "provider_circuit_open:eodhd:plan_
+# restricted:retry_after_sec=1232" — older engine's name for this same path).
+# FIX: a fourth 403 class `plan_restricted`, matched AFTER quota (precedence
+# kept) and BEFORE ip/auth: no record_failure (zero breaker impact), no
+# unhealthy token (trigger list is auth_error/ip_blocked only), and a
+# per-ENDPOINT not-covered cache (endpoint string embeds the symbol) so
+# later calls skip HTTP instantly and fall through to the next provider.
+# Matcher tokens are ENV-extensible (TFB_EODHD_PLAN_RESTRICTED_TOKENS) so
+# the B7 probe output tunes an ENV, not code; an UNMATCHED body follows the
+# v4.15.0 auth_error path byte-identically (fail-safe).
+# ENV: TFB_EODHD_PLAN_RESTRICTED_ISOLATION (default ON; 0/false/off/no
+#      restores v4.15.0), TFB_EODHD_PLAN_RESTRICTED_TOKENS (comma-separated
+#      additions), TFB_EODHD_PLAN_RESTRICTED_TTL_SEC (default 86400).
+# ---------------------------------------------------------------------------
+PROVIDER_VERSION = "4.16.0"
 VERSION = PROVIDER_VERSION
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
@@ -2130,6 +2203,10 @@ class EODHDClient:
         `_build_error_patch_with_geo`, based on inspecting the error
         string returned here. _request_json itself is unchanged.
         """
+        # v4.16.0: known plan-restricted endpoint -> skip HTTP entirely.
+        if _plan_restricted_isolation_enabled() and _plan_restricted_cache_active(endpoint):
+            return None, "plan_restricted:cached"
+
         if not self.api_key:
             return None, "EODHD_API_KEY missing"
 
@@ -2206,6 +2283,16 @@ class EODHDClient:
                             await health.record_failure("RateLimited")
                             await asyncio.sleep(wait)
                             continue
+
+                        # v4.16.0: subscription-gap class — AFTER quota
+                        # (precedence kept), BEFORE ip/auth. No breaker
+                        # impact, no unhealthy token; endpoint cached so the
+                        # engine falls to the next provider instantly.
+                        if (_plan_restricted_isolation_enabled()
+                                and not is_ip_blocked
+                                and _body_indicates_plan_restricted(body_low)):
+                            _plan_restricted_cache_set(endpoint)
+                            return None, f"HTTP {sc} plan_restricted {body_hint}".strip()
 
                         if is_ip_blocked:
                             err_str = f"HTTP {sc} ip_blocked {body_hint}".strip()
