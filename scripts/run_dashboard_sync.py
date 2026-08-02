@@ -3,9 +3,42 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.30.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.31.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
+
+v6.31.0 — FW-5 FABRICATED-PLACEHOLDER TRIPWIRE + HEAL-FIRST POISONED-NAME FIX
+-----------------------------------------------------------------------------
+EVIDENCE (2026-08-02 Render Shell test campaign, T13):
+POST /v1/analysis/sheet-rows returned FABRICATED rows from the route's
+placeholder factory (name = "<Page> <Symbol>", sequential prices 100+idx,
+"Accumulate" recommendations, fresh timestamps, provider tag
+"advanced_analysis.placeholder_fallback"). This sync wrote them verbatim:
+Global_Markets Name cells reading "Global_Markets HELN.SW" etc., open_price
+cells of 104.00–108.00 on unrelated .SR rows, GAB$H.US at 107.00 / +7,900%.
+Backend fix shipped as advanced_analysis v4.15.0 [NO-FABRICATION]; this
+release is the sync-side defense-in-depth + residue healer:
+
+FW-5 (_fabrication_tripwire, new): on the ranked market pages, strip any
+OUTGOING row whose Name matches the "<Page> <Symbol>" fabrication pattern OR
+whose Data Provider cell contains "placeholder_fallback" — Symbol kept, all
+other cells blanked, Warnings tagged
+'identity_quarantined:fabricated_placeholder:v6.31.0'. Runs inside the FW-2
+block; stripped symbols merge into _idfw_stripped so the existing v6.25.1
+FW-KEEP last-good restore and the FW-3 _Run_Log verdict cover FW-5 with zero
+new plumbing. v4.15.0 stub rows ("no_data_stub" / "placeholder_stub") are
+NOT matched — they are honest no-data rows handled by KLG.
+
+HF-2 (HEAL-FIRST extension): rows already POISONED on the sheet carry a
+non-blank fabricated Name, so v6.24.2 HF-1 (blank-name only) never healed
+them. The heal-first partition now treats a fabricated-pattern Name as
+blank-equivalent, so existing "Global_Markets <sym>" rows jump the refresh
+queue and get refilled.
+
+ENV: TFB_SYNC_PLACEHOLDER_GUARD (default ON — identity guards armed by
+default per the declared-disarm registry lesson). =0/false/off/no disables
+BOTH FW-5 and HF-2, restoring v6.30.0 byte-identically.
+ZERO functions removed; all prior WHYs preserved.
 
 v6.28.0 — FW-4b SAFE NAME-DEDUP: KEEP-ONE-PER-CURRENCY, NEVER WIPE A GROUP
 --------------------------------------------------------------------------
@@ -1279,7 +1312,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.30.0"
+SCRIPT_VERSION = "6.31.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -2906,7 +2939,13 @@ def _read_existing_page_symbols(
                 continue
             seen.add(t)
             nm = row[name_i] if name_i < len(row) else ""
-            (blanks if _guard_is_blank(nm) else named).append(t)
+            # v6.31.0 HF-2: fabricated '<Page> <Symbol>' names are
+            # poison, not identity — treat them as blank so the row
+            # jumps the heal queue and gets refilled.
+            _nm_blankish = _guard_is_blank(nm) or (
+                _placeholder_guard_enabled() and _name_is_fabricated(nm)
+            )
+            (blanks if _nm_blankish else named).append(t)
         if blanks:
             logger.info(
                 "[HEAL-FIRST v6.24.2] %s: prioritized %d blank-name symbol(s) "
@@ -3107,6 +3146,94 @@ def _row_firewall_enabled() -> bool:
     TFB_SYNC_ROW_ID_FIREWALL=0/false/off/no restores v6.23.0 (page-level
     L3b only) byte-identically."""
     return (os.getenv("TFB_SYNC_ROW_ID_FIREWALL") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+# ---------------------------------------------------------------------------
+# v6.31.0 FW-5: FABRICATED-PLACEHOLDER TRIPWIRE (WHY: see v6.31.0 header)
+# ---------------------------------------------------------------------------
+_FABRICATED_NAME_PAGES = (
+    "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
+    "My_Portfolio", "Top_10_Investments", "Insights_Analysis",
+)
+_FABRICATED_NAME_RE = re.compile(
+    r"^(?:%s)\s+\S" % "|".join(_FABRICATED_NAME_PAGES)
+)
+_FABRICATED_PROVIDER_TOKEN = "placeholder_fallback"
+_FAB_QUARANTINE_TAG = "identity_quarantined:fabricated_placeholder:v6.31.0"
+
+
+def _placeholder_guard_enabled() -> bool:
+    """v6.31.0: master switch for FW-5 + the HF-2 heal-first extension.
+    Default ON (identity guards armed by default); TFB_SYNC_PLACEHOLDER_GUARD
+    =0/false/off/no restores v6.30.0 behavior byte-identically."""
+    return (os.getenv("TFB_SYNC_PLACEHOLDER_GUARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _name_is_fabricated(value) -> bool:
+    """True iff a Name cell matches the route placeholder fabrication
+    pattern '<Page> <Symbol>' (e.g. 'Global_Markets HELN.SW'). No real
+    instrument name begins with an underscored page token + whitespace."""
+    try:
+        s = str(value or "").strip()
+    except Exception:
+        return False
+    return bool(s) and bool(_FABRICATED_NAME_RE.match(s))
+
+
+def _fabrication_tripwire(
+    headers: list,
+    rows_matrix: list,
+) -> tuple:
+    """v6.31.0 FW-5: blank every cell except Symbol on each OUTGOING row that
+    is fabricated placeholder output (Name matches '<Page> <Symbol>' OR the
+    Data Provider cell contains 'placeholder_fallback'); the Warnings column
+    (when locatable) is set to the FW-5 quarantine tag. Mutates rows in place.
+    Returns (rows_matrix, stripped_symbols). FAIL-SAFE: missing Symbol column
+    -> nothing stripped; missing Name AND Provider columns -> nothing
+    stripped. v4.15.0 honest stubs ('no_data_stub'/'placeholder_stub') are
+    never matched."""
+    stripped: list = []
+    if not headers or not rows_matrix:
+        return rows_matrix, stripped
+    hdr = list(headers)
+    sym_i = _guard_find_col(hdr, _GUARD_SYMBOL_ALIASES)
+    if sym_i < 0:
+        return rows_matrix, stripped
+    name_i = _guard_find_col(hdr, _GUARD_NAME_ALIASES)
+    prov_i = -1
+    warn_i = -1
+    for i, h in enumerate(hdr):
+        hh = str(h or "").strip().casefold()
+        if prov_i < 0 and hh in {"data provider", "data_provider", "provider"}:
+            prov_i = i
+        if warn_i < 0 and hh == "warnings":
+            warn_i = i
+    if name_i < 0 and prov_i < 0:
+        return rows_matrix, stripped
+    for r_i, row in enumerate(rows_matrix):
+        if not isinstance(row, list) or sym_i >= len(row):
+            continue
+        if _guard_is_blank(row[sym_i]):
+            continue
+        fab = False
+        if name_i >= 0 and name_i < len(row) and _name_is_fabricated(row[name_i]):
+            fab = True
+        if not fab and prov_i >= 0 and prov_i < len(row):
+            try:
+                if _FABRICATED_PROVIDER_TOKEN in str(row[prov_i] or "").casefold():
+                    fab = True
+            except Exception:
+                pass
+        if not fab:
+            continue
+        sym = str(row[sym_i]).strip().upper()
+        blanked = ["" for _ in row]
+        blanked[sym_i] = row[sym_i]
+        if 0 <= warn_i < len(blanked):
+            blanked[warn_i] = _FAB_QUARANTINE_TAG
+        rows_matrix[r_i] = blanked
+        stripped.append(sym)
+    return rows_matrix, stripped
 
 
 def _row_identity_firewall(
@@ -6102,6 +6229,28 @@ async def _run_one_task(
                 rows_matrix, _idfw_stripped = _row_identity_firewall(
                     headers, rows_matrix
                 )
+                # --- v6.31.0 FW-5: fabricated-placeholder tripwire --------
+                # Merges into _idfw_stripped so FW-KEEP last-good restore
+                # and the FW-3 verdict cover FW-5 strips with zero plumbing.
+                if _placeholder_guard_enabled():
+                    rows_matrix, _fab_stripped = _fabrication_tripwire(
+                        headers, rows_matrix
+                    )
+                    if _fab_stripped:
+                        _fab_msg = (
+                            f"{_IDFW_TAG} FW-5 quarantined "
+                            f"{len(_fab_stripped)} FABRICATED placeholder "
+                            f"row(s) on '{task.sheet_name}': "
+                            f"{', '.join(_fab_stripped[:15])}"
+                            f"{'…' if len(_fab_stripped) > 15 else ''} — "
+                            f"route-fabricated name/provider pattern."
+                        )
+                        res.warnings.append(_fab_msg)
+                        logger.warning(_fab_msg)
+                        _seen_strip = set(_idfw_stripped)
+                        _idfw_stripped = list(_idfw_stripped) + [
+                            s for s in _fab_stripped if s not in _seen_strip
+                        ]
                 if _idfw_stripped:
                     _fw = (
                         f"{_IDFW_TAG} quarantined {len(_idfw_stripped)} "
