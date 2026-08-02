@@ -2,6 +2,29 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
+Advanced Analysis Root Owner — v4.16.0
+NO-FABRICATION CLOSEOUT  (external audit P0-1 a/b/c/d — 2026-08-03)
+================================================================================
+v4.16.0 (2026-08-03) — closes the four residual fabrication paths found by the
+independent repository audit of commit e8061d03:
+  P0-1a  ADVANCED_ANALYSIS_VERSION was frozen at "4.14.1"; runtime telemetry,
+         health evidence and deploy verifiers could not see v4.15 behavior.
+         Now 4.16.0 and kept in lockstep going forward.
+  P0-1b  _build_insights_fallback_rows generated "Accumulate"/"Watch"
+         recommendations with no provider evidence — a fabrication path that
+         BYPASSED the v4.15.0 stub factory. Stub mode now emits identity/
+         status-only rows (metric=status, value=no_provider_data,
+         source=advanced_analysis.no_data_stub); legacy branch preserved
+         byte-identical behind the hardened switch.
+  P0-1c  _ensure_top10_rows stamped top10_rank + generated selection reasons
+         onto no-data stub rows on the fail-soft second pass. Stub rows
+         (data_provider=advanced_analysis.no_data_stub OR warnings containing
+         placeholder_stub) are now exempt from ranking/reason generation.
+  P0-1d  Kill-switch hardened: restoring fabricated placeholders now requires
+         TFB_ANALYSIS_PLACEHOLDER_MODE=legacy (exact) AND
+         TFB_ALLOW_LEGACY_FABRICATION=1. A mistaken "false"/"0" fails CLOSED
+         to honest stubs. ZERO functions removed.
+================================================================================
 Advanced Analysis Root Owner — v4.15.0
 NO-FABRICATION PLACEHOLDER GUARD  (stub mode default ON • legacy kill-switch)
 ================================================================================
@@ -505,7 +528,7 @@ logger.addHandler(logging.NullHandler())
 # off-loop switch (TFB_OPP_BUILD_OFFLOOP) still gates the threading itself.
 # Zero functions removed; addition: _opp_build_lock + _opp_build_in_thread.
 # ==============================================================================
-ADVANCED_ANALYSIS_VERSION = "4.14.1"
+ADVANCED_ANALYSIS_VERSION = "4.16.0"  # v4.16.0: runtime telemetry now matches file version (P0-1a)
 # =============================================================================
 # v4.14.1 (2026-07-24) — SAFE-DEFAULTS PASS OVER v4.14.0.
 #
@@ -2647,6 +2670,11 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
         deduped.append(row)
     final_rows = deduped[:max(1, int(top_n))]
     for idx, row in enumerate(final_rows, start=1):
+        # v4.16.0 [P0-1c]: a no-data stub must never receive a fabricated
+        # rank or generated selection reason on ANY later pass.
+        if str(row.get("data_provider") or "") == "advanced_analysis.no_data_stub" or "placeholder_stub" in str(row.get("warnings") or ""):
+            row.setdefault("selection_reason", "No provider data — stub row (no fabricated values).")
+            continue
         if preserve_order:
             if not _strip(row.get("top10_rank")) and not isinstance(row.get("top10_rank"), (int, float)):
                 row["top10_rank"] = idx
@@ -2668,12 +2696,16 @@ _PLACEHOLDER_MODE_ENV = "TFB_ANALYSIS_PLACEHOLDER_MODE"
 
 
 def _placeholder_stub_mode() -> bool:
-    """v4.15.0: True (default) -> honest no-data stub rows; False -> legacy
-    fabricated placeholder rows (kill-switch values: legacy/0/false/off/no).
-    Read at call time so the operator can flip the Render env without a
-    redeploy taking effect only on new workers."""
+    """v4.16.0 [P0-1d HARDENED]: True (default) -> honest no-data stub rows.
+    Restoring the v4.14.x FABRICATED placeholder behavior now requires BOTH:
+      TFB_ANALYSIS_PLACEHOLDER_MODE=legacy   (exact value; '0'/'false'/'off'
+                                              /'no' now FAIL CLOSED to stub)
+      TFB_ALLOW_LEGACY_FABRICATION=1         (explicit dev-only second key)
+    Rationale: a mistaken boolean must never recreate fake prices and
+    recommendations in a real-money system. Read at call time."""
     raw = (os.getenv(_PLACEHOLDER_MODE_ENV) or "").strip().lower()
-    return raw not in {"legacy", "0", "false", "off", "no"}
+    allow = (os.getenv("TFB_ALLOW_LEGACY_FABRICATION") or "").strip()
+    return not (raw == "legacy" and allow == "1")
 
 
 def _stub_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
@@ -2874,17 +2906,34 @@ def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: in
         {"section": "Coverage", "item": "Universe sample", "metric": "symbols", "value": ", ".join(symbols[:5]), "notes": "Sample of the symbols used by fallback mode", "source": src, "sort_order": 2},
     ]
     next_order = 3
-    for idx, sym in enumerate(symbols[: max(1, limit + offset)], start=1):
-        rows.append({
-            "section": "Signals",
-            "item": f"{sym} fallback signal",
-            "metric": "recommendation",
-            "value": "Watch" if idx > 2 else "Accumulate",
-            "notes": "Generated locally because upstream insights payload was unavailable",
-            "source": src,
-            "sort_order": next_order,
-        })
-        next_order += 1
+    if _placeholder_stub_mode():
+        # v4.16.0 [P0-1b NO-FABRICATION]: identity/status-only rows on failure.
+        # The old branch generated "Accumulate"/"Watch" recommendations with
+        # zero provider evidence; those fabrications reached the workbook.
+        for sym in symbols[: max(1, limit + offset)]:
+            rows.append({
+                "section": "Signals",
+                "item": f"{sym} fallback signal",
+                "metric": "status",
+                "value": "no_provider_data",
+                "notes": "No provider/engine data — honest stub; fabricated fallback disabled (v4.16.0 NO-FABRICATION guard)",
+                "source": "advanced_analysis.no_data_stub",
+                "sort_order": next_order,
+            })
+            next_order += 1
+    else:
+        # legacy fabricated behavior — byte-identical, dev-only double-key gated.
+        for idx, sym in enumerate(symbols[: max(1, limit + offset)], start=1):
+            rows.append({
+                "section": "Signals",
+                "item": f"{sym} fallback signal",
+                "metric": "recommendation",
+                "value": "Watch" if idx > 2 else "Accumulate",
+                "notes": "Generated locally because upstream insights payload was unavailable",
+                "source": src,
+                "sort_order": next_order,
+            })
+            next_order += 1
     return _slice(rows, limit=limit, offset=offset)
 
 def _build_nonempty_failsoft_rows(*, page: str, headers: Sequence[str], keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int, top_n: int) -> List[Dict[str, Any]]:
