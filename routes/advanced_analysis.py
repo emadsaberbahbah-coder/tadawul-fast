@@ -2,6 +2,51 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
+Advanced Analysis Root Owner — v4.15.0
+NO-FABRICATION PLACEHOLDER GUARD  (stub mode default ON • legacy kill-switch)
+================================================================================
+v4.15.0 [NO-FABRICATION] (2026-08-02) — WHY, from live Render Shell evidence:
+
+  POST /v1/analysis/sheet-rows {"page":"Market_Leaders","symbols":
+  ["ADNOCDIST.AB","FAB.AB","BPI.PS"]} returned status=partial with FABRICATED
+  rows from _placeholder_value_for_key:
+    name          = "Market_Leaders ADNOCDIST.AB"   (f"{page} {symbol}")
+    current_price = 101.0 / 102.0 / 103.0           (100.0 + row_index)
+    provider      = "advanced_analysis.placeholder_fallback"
+  The dashboard sync writes route rows verbatim, so these fabrications landed
+  in the production workbook as REAL-LOOKING data:
+    * Global_Markets Name cells reading "Global_Markets <symbol>"
+    * open_price / price cells of 104.00–108.00 on unrelated .SR rows
+    * GAB$H.US priced 107.00 with +7,900% change (percent field 79.00 =
+      100 − idx*3, rendered as a fraction ×100)
+    * fabricated "Accumulate"/"Watch" recommendations carrying FRESH
+      last_updated timestamps (datetime.now), defeating every staleness check
+  Collateral confirmed: ID-FIREWALL strip spike (385), 24 poisoned
+  Performance_Log records (quarantined), shadow-board "price errors: 19"
+  blocking S-1 criterion 1.
+
+  FIX — single choke point at the factory. _placeholder_value_for_key now
+  branches on TFB_ANALYSIS_PLACEHOLDER_MODE:
+    stub   (DEFAULT, armed) -> _stub_value_for_key: schema-shaped rows that
+           keep ONLY the symbol and structurally-certain identity fields
+           (.SR -> Tadawul/SAR/Saudi Arabia; =F Futures; =X FX). Everything
+           else is blank/None: NO fabricated name (blank name keeps the row
+           HEAL-FIRST-eligible in run_dashboard_sync), NO prices, NO ROI/score
+           numbers, NO recommendation, NO rank, NO timestamps. Rows carry
+           warnings "no_provider_data; placeholder_stub" and
+           data_provider "advanced_analysis.no_data_stub".
+    legacy (kill-switch: TFB_ANALYSIS_PLACEHOLDER_MODE=legacy|0|false|off|no)
+           -> v4.14.x fabricated-value behavior, byte-identical.
+  _build_placeholder_rows Top-10 rank stamping is likewise gated: no
+  fabricated top10_rank in stub mode (legacy branch preserved verbatim).
+
+  Known residual (documented, out of scope here): on the Top_10 fail-soft
+  path _ensure_top10_rows may still stamp a bare rank onto stub rows; the
+  rows carry no price/recommendation, so no ticket can form from them.
+
+  The non-empty schema-shaped fail-soft ENVELOPE contract of v4.11.0 is
+  unchanged — only fabricated VALUES are removed. ZERO functions removed.
+================================================================================
 Advanced Analysis Root Owner — v4.14.0
 REQUEST-BUDGETED • DISTRIBUTED-SINGLE-FLIGHT • AUTH-FAIL-CLOSED
 CANONICAL-ENV • PROVIDER-HEALTH-TIMEBOXED • EVENT-LOOP-SAFE
@@ -2613,7 +2658,73 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
             row["criteria_snapshot"] = _top10_criteria_snapshot(row)
     return final_rows
 
+# ---------------------------------------------------------------------------
+# v4.15.0 NO-FABRICATION PLACEHOLDER GUARD
+# WHY: see the v4.15.0 changelog block at the top of this file. Stub mode
+# (default) stops fabricated names/prices/recommendations/timestamps from ever
+# leaving this route; legacy mode restores v4.14.x byte-identically.
+# ---------------------------------------------------------------------------
+_PLACEHOLDER_MODE_ENV = "TFB_ANALYSIS_PLACEHOLDER_MODE"
+
+
+def _placeholder_stub_mode() -> bool:
+    """v4.15.0: True (default) -> honest no-data stub rows; False -> legacy
+    fabricated placeholder rows (kill-switch values: legacy/0/false/off/no).
+    Read at call time so the operator can flip the Render env without a
+    redeploy taking effect only on new workers."""
+    raw = (os.getenv(_PLACEHOLDER_MODE_ENV) or "").strip().lower()
+    return raw not in {"legacy", "0", "false", "off", "no"}
+
+
+def _stub_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
+    """v4.15.0 stub factory — schema-shaped, zero fabrication.
+
+    Keeps the symbol plus structurally-certain identity derivations only.
+    Name stays BLANK on purpose: run_dashboard_sync HEAL-FIRST prioritizes
+    blank-name rows, so stubs remain self-healing once a provider recovers.
+    No numeric market data, no recommendation, no rank, no timestamps."""
+    kk = _normalize_key_name(key)
+    if kk in {"symbol", "ticker"}:
+        return symbol
+    if kk == "name":
+        # Blank on purpose — never f"{page} {symbol}"; keeps the row
+        # HEAL-FIRST-eligible in run_dashboard_sync.
+        return ""
+    if kk == "data_provider":
+        return "advanced_analysis.no_data_stub"
+    if kk in {"warnings", "notes"}:
+        return "no_provider_data; placeholder_stub"
+    if kk == "recommendation_reason":
+        return "No provider data for this symbol — stub row; no fabricated values (v4.15.0 NO-FABRICATION guard)."
+    if kk == "selection_reason":
+        return "No provider data — stub row (no fabricated values)."
+    if kk == "criteria_snapshot":
+        return json.dumps({"symbol": symbol, "row_index": row_index, "source": "no_data_stub"}, ensure_ascii=False)
+    if kk == "asset_class":
+        return "Commodity" if symbol.endswith("=F") else "FX" if symbol.endswith("=X") else ""
+    if kk == "exchange":
+        if symbol.endswith(".SR"):
+            return "Tadawul"
+        if symbol.endswith("=F"):
+            return "Futures"
+        if symbol.endswith("=X"):
+            return "FX"
+        return ""
+    if kk == "currency":
+        return "SAR" if symbol.endswith(".SR") else ""
+    if kk == "country":
+        return "Saudi Arabia" if symbol.endswith(".SR") else ""
+    if kk in {"recommendation", "risk_bucket", "confidence_bucket", "invest_period_label"}:
+        return ""
+    # Every numeric / forecast / score / rank / timestamp field: honest blank.
+    return None
+
+
 def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
+    if _placeholder_stub_mode():
+        # v4.15.0 NO-FABRICATION guard (default): honest no-data stub values.
+        return _stub_value_for_key(page, str(key), symbol, row_index)
+    # v4.14.x legacy fabricated-placeholder behavior — byte-identical below.
     kk = _normalize_key_name(key)
     if kk in {"symbol", "ticker"}:
         return symbol
@@ -2672,10 +2783,16 @@ def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols
         row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
         rows.append(row)
     if page == _TOP10_PAGE:
-        for idx, row in enumerate(rows, start=offset + 1):
-            row["top10_rank"] = idx
-            row.setdefault("selection_reason", "Placeholder fallback because upstream builders returned no usable rows.")
-            row.setdefault("criteria_snapshot", "{}")
+        if _placeholder_stub_mode():
+            # v4.15.0: no fabricated top10_rank on stub rows.
+            for row in rows:
+                row.setdefault("selection_reason", "No provider data — stub row (no fabricated values).")
+                row.setdefault("criteria_snapshot", "{}")
+        else:
+            for idx, row in enumerate(rows, start=offset + 1):
+                row["top10_rank"] = idx
+                row.setdefault("selection_reason", "Placeholder fallback because upstream builders returned no usable rows.")
+                row.setdefault("criteria_snapshot", "{}")
     return rows
 
 def _real_data_dictionary_rows() -> List[Dict[str, Any]]:
