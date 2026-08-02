@@ -612,6 +612,10 @@ _AA_SRC = _read_src("routes/advanced_analysis.py")
 _RDS_SRC = _read_src("scripts/run_dashboard_sync.py")
 _ROUTE_V16 = "TFB_ALLOW_LEGACY_FABRICATION" in _AA_SRC
 _SYNC_V33 = 'SCRIPT_VERSION = "6.33' in _RDS_SRC
+_EOD_SRC = _read_src("core/providers/eodhd_provider.py")
+_YC_SRC = _read_src("core/providers/yahoo_chart_provider.py")
+_EOD_V17 = "_plan_restricted_applies" in _EOD_SRC
+_YC_V13 = "history_high_low" in _YC_SRC
 
 _G5_KEYS = ["symbol", "name", "current_price", "previous_close", "open_price",
             "percent_change", "expected_roi_12m", "overall_score",
@@ -941,7 +945,10 @@ def test_range_fallbacks_heal_only_missing_sides():
     try:
         dh, dl, h52, l52 = _YC._apply_range_fallbacks(None, None, 30.5, 0.0, hist)
         assert h52 == 30.5                       # real high untouched
-        assert abs(l52 - 20.48) < 1e-9           # the 2222.SR defect: low healed
+        if _YC_V13:
+            assert l52 == 26.0                   # v8.13.0: candle-true LOW
+        else:
+            assert abs(l52 - 20.48) < 1e-9       # v8.12.0 closes-pin (legacy)
         assert dh == 27.1 and dl == 26.0         # day range from last candle
         assert _YC._apply_range_fallbacks(26.9, None, 1.0, 1.0, hist)[0] == 26.9
         assert _YC._apply_range_fallbacks(None, 5.0, None, 2.0, []) == (None, 5.0, None, 2.0)
@@ -1035,3 +1042,63 @@ def test_v416_insights_failure_no_generated_recommendations():
 def test_v416_ensure_top10_exempts_stub_rows():
     # P0-1c: the second-pass ranker carries the stub exemption.
     assert "P0-1c" in _AA_SRC and _AA_SRC.count("stub row (no fabricated values)") >= 2
+
+
+# =========================================================================== #
+# GUARD 12 — provider corrections (audit P0-4 strict-403 / P1-6 candle range) #
+# =========================================================================== #
+_EODG12 = _extract_funcs(
+    "core/providers/eodhd_provider.py",
+    {"_plan_restricted_applies", "_plan_restricted_isolation_enabled",
+     "_body_indicates_plan_restricted", "_plan_restricted_tokens"},
+    extra_globals={"os": os},
+) if _EOD_V17 else None
+
+
+@pytest.mark.skipif(_EODG12 is None, reason="eodhd v4.17.0 not present")
+def test_v417_plan_restricted_is_strictly_http_403():
+    prev = os.environ.pop("TFB_EODHD_PLAN_RESTRICTED_ISOLATION", None)
+    try:
+        g = _EODG12._plan_restricted_applies
+        body = "your plan does not include this endpoint"
+        assert g(403, False, body) is True
+        assert g(401, False, body) is False          # P0-4: 401 stays AuthError
+        assert g(403, True, body) is False           # ip-block precedence kept
+        assert g(403, False, "quota exceeded, too many calls") is False
+    finally:
+        if prev is not None:
+            os.environ["TFB_EODHD_PLAN_RESTRICTED_ISOLATION"] = prev
+    assert "sc == 403" in _EOD_SRC                   # gate literal on file
+
+
+# reuse Guard 10's _YC lift — same module, proven-good scaffold.
+@pytest.mark.skipif(_YC is None or not _YC_V13,
+                    reason="yahoo_chart v8.13.0 not present")
+def test_v813_52w_uses_candle_extremes_with_provenance():
+    hist = ([{"close": 20.0, "high": 30.0, "low": 10.0}]
+            + [{"close": 20.0, "high": 21.0, "low": 19.0}] * 260)
+    prev = os.environ.pop("TFB_YC_RANGE_FALLBACKS", None)
+    try:
+        prov = {}
+        _, _, h52, l52 = _YC._apply_range_fallbacks(
+            None, None, None, None, hist, provenance=prov)
+        assert h52 == 21.0 and l52 == 19.0           # 252-window candle truth
+        assert prov["range_source"] == "history_high_low"
+        # close-only last resort when candles lack high/low
+        c_only = [{"close": 20.0 + i * 0.01} for i in range(300)]
+        prov2 = {}
+        _, _, h2, l2 = _YC._apply_range_fallbacks(
+            None, None, None, None, c_only, provenance=prov2)
+        assert abs(l2 - 20.48) < 1e-9 and h2 == max(
+            c["close"] for c in c_only[-252:])
+        assert prov2["range_source"] == "close_only_fallback"
+        # provider-supplied values untouched, no range_source emitted
+        prov3 = {}
+        assert _YC._apply_range_fallbacks(
+            5.0, 4.0, 50.0, 40.0, hist, provenance=prov3)[2:] == (50.0, 40.0)
+        assert "range_source" not in prov3
+        # backward-compatible: kwarg optional
+        assert _YC._apply_range_fallbacks(None, None, None, None, hist)[2] == 21.0
+    finally:
+        if prev is not None:
+            os.environ["TFB_YC_RANGE_FALLBACKS"] = prev
