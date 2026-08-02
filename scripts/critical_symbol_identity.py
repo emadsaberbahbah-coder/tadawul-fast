@@ -9,10 +9,30 @@ or scoring logic.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, MutableSequence, Sequence
 
-POLICY_VERSION = "1.0.0"
+# =============================================================================
+# v1.1.0 (2026-08-01, CG-6) — ISSUER/VENUE REGISTRY + PURE CONTRADICTION CHECKS.
+# PR #32 carried the right identity checks in the wrong mechanism (a deferred
+# monkeypatch that never arms under the production command). This module is
+# the owning registry, so the checks land here as pure data + pure functions
+# and the sync runner consults them at its native FW-1/FW-2 seams.
+# Ported verbatim from PR #32: EXPECTED_ISSUER_TOKENS (34 audited identities),
+# VENUE_RULES (.AB/.PS/.OM explicit-contradiction only), _VALID_SR format.
+# EXTENDED with the two LIVE-OBSERVED contaminations of 2026-08-01 that the
+# PR #32 set did not cover: BF-A rows carrying Biofrontera identity and
+# DENN.US carrying Amer Sports identity — exact audited identities, same
+# contract. CRITICAL_IDENTITIES (fetch-time quarantine) is unchanged and
+# remains the authority for the critical-fetch path; the token map is the
+# KLG/outgoing consult. identity_contradiction() is field-level;
+# row_identity_contradiction() resolves headers. Both return "" (pass) or a
+# named reason; blanks NEVER refuse (explicit contradiction only). Zero
+# removals.
+# =============================================================================
+POLICY_VERSION = "1.1.0"
+__version__ = POLICY_VERSION  # verify_deployment fallback attribute
 CRITICAL_IDENTITY_TAG = "identity_quarantined:critical_registry:v1.0.0"
 
 # Provider-safe canonical identifiers. EODHD uses the .US exchange suffix and
@@ -61,6 +81,131 @@ CRITICAL_IDENTITIES: Mapping[str, IdentityRule] = {
 }
 
 CRITICAL_FETCH_SYMBOLS = frozenset(CRITICAL_IDENTITIES)
+
+# v1.1.0: exact audited identities (PR #32 set + the two live 2026-08-01
+# contaminations). Safety assertions for accepting/emitting a row - not an
+# instrument master.
+EXPECTED_ISSUER_TOKENS: Mapping[str, tuple[str, ...]] = {
+    "AC.PS": ("ayala corporation",),
+    "SCC.PS": ("semirara mining",),
+    "BDO.PS": ("bdo unibank",),
+    "SMPH.PS": ("sm prime",),
+    "SM.PS": ("sm investments",),
+    "JFC.PS": ("jollibee foods",),
+    "AREIT.PS": ("areit",),
+    "MONDE.PS": ("monde nissin",),
+    "SMC.PS": ("san miguel corporation",),
+    "ICT.PS": ("international container terminal", "ictsi"),
+    "URC.PS": ("universal robina",),
+    "BPI.PS": ("bank of the philippine islands",),
+    "TEL.PS": ("pldt",),
+    "GTCAP.PS": ("gt capital",),
+    "TAQA.AB": ("abu dhabi national energy",),
+    "ALPHADHABI.AB": ("alpha dhabi",),
+    "FAB.AB": ("first abu dhabi bank",),
+    "FERTIGLOBE.AB": ("fertiglobe",),
+    "ADNOCGAS.AB": ("adnoc gas",),
+    "ADPORTS.AB": ("ad ports", "abu dhabi ports"),
+    "ALDAR.AB": ("aldar properties",),
+    "IHC.AB": ("international holding company",),
+    "ADNOCLS.AB": ("adnoc logistics", "adnoc l&s"),
+    "EAND.AB": ("emirates telecommunications", "etisalat by e&"),
+    "PRESIGHT.AB": ("presight",),
+    "ADNOCDIST.AB": ("adnoc distribution", "abu dhabi national oil company for distribution"),
+    "BOROUGE.AB": ("borouge",),
+    "ADIB.AB": ("abu dhabi islamic bank",),
+    "OQGN.OM": ("oq gas networks",),
+    "BK.US": ("bank of new york mellon", "bny mellon"),
+    "BNY.US": ("bank of new york mellon", "bny mellon"),
+    "NZYM-B.CO": ("novonesis", "novozymes"),
+    "NSIS-B.CO": ("novonesis", "novozymes"),
+    # v1.1.0 live-observed additions (2026-08-01 workbook audit):
+    "BF-A": ("brown-forman", "brown forman"),
+    "BF-A.US": ("brown-forman", "brown forman"),
+    "DENN": ("denny",),
+    "DENN.US": ("denny",),
+}
+
+VENUE_RULES: tuple[tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
+    (".AB", ("adx", "abu dhabi securities", "abu dhabi"), ("aed",), ("united arab emirates", "uae")),
+    (".PS", ("pse", "philippine stock exchange"), ("php",), ("philippines",)),
+    (".OM", ("msx", "muscat stock exchange", "muscat"), ("omr",), ("oman",)),
+)
+_VALID_SR = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
+
+
+def identity_contradiction(
+    symbol: Any,
+    name: Any = "",
+    price: Any = "",
+    exchange: Any = "",
+    currency: Any = "",
+    country: Any = "",
+) -> str:
+    """v1.1.0: empty string = pass; otherwise a named refusal reason.
+    Explicit contradiction only - blanks never refuse (except a token-listed
+    symbol that is BOTH nameless and priceless, the PR #32 stub rule)."""
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return "symbol missing"
+    if sym.endswith(".SR") and not _VALID_SR.fullmatch(sym):
+        return "invalid Saudi symbol format"
+    toks = EXPECTED_ISSUER_TOKENS.get(sym)
+    if toks:
+        nm = str(name or "").strip().casefold()
+        if nm:
+            if not any(t in nm for t in toks):
+                return "issuer mismatch (name lacks " + repr(toks[0]) + ")"
+        else:
+            try:
+                p = float(str(price).replace(",", "")) if str(price).strip() else 0.0
+            except Exception:
+                p = 0.0
+            if p <= 0:
+                return "listed symbol with blank name and no positive price"
+    for suffix, ex_toks, ccy_toks, ctry_toks in VENUE_RULES:
+        if sym.endswith(suffix):
+            for label, val, accepted in (
+                ("exchange", exchange, ex_toks),
+                ("currency", currency, ccy_toks),
+                ("country", country, ctry_toks),
+            ):
+                v = str(val or "").strip().casefold()
+                if v and not any(a in v for a in accepted):
+                    return label + " contradicts " + suffix + " venue"
+            break
+    return ""
+
+
+_IDC_SYMBOL_ALIASES = ("Symbol", "Ticker", "Code")
+_IDC_NAME_ALIASES = ("Name", "Company", "Company Name")
+_IDC_PRICE_ALIASES = ("Current Price", "Price", "Last Price")
+_IDC_EXCH_ALIASES = ("Exchange", "Market")
+_IDC_CCY_ALIASES = ("Currency",)
+_IDC_CTRY_ALIASES = ("Country",)
+
+
+def row_identity_contradiction(headers: Sequence[Any], row: Sequence[Any]) -> str:
+    """v1.1.0: header-resolving wrapper over identity_contradiction.
+    Missing symbol column -> empty string (fail-open; the caller guards
+    own that case)."""
+    sym_i = _find_column(headers, _IDC_SYMBOL_ALIASES)
+    if sym_i < 0 or sym_i >= len(row):
+        return ""
+
+    def _cell(aliases: Sequence[str]) -> Any:
+        i = _find_column(headers, aliases)
+        return row[i] if 0 <= i < len(row) else ""
+
+    return identity_contradiction(
+        row[sym_i],
+        _cell(_IDC_NAME_ALIASES),
+        _cell(_IDC_PRICE_ALIASES),
+        _cell(_IDC_EXCH_ALIASES),
+        _cell(_IDC_CCY_ALIASES),
+        _cell(_IDC_CTRY_ALIASES),
+    )
+
 
 
 @dataclass(frozen=True)
