@@ -12,18 +12,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, MutableSequence, Sequence
 
-POLICY_VERSION = "1.0.0"
+POLICY_VERSION = "1.1.0"
 CRITICAL_IDENTITY_TAG = "identity_quarantined:critical_registry:v1.0.0"
 
 # Provider-safe canonical identifiers. EODHD uses the .US exchange suffix and
 # BRK-B.US for Berkshire Class B. Fiserv moved from FI to FISV in November 2025.
 CANONICAL_SYMBOLS: Mapping[str, str] = {
-    "BK": "BK.US",
+    # v1.1.0 POLICY: BARE aliases (provider echoes / oracle shorthand) map to
+    # the LIVE successor; SUFFIXED dead forms are retired via INACTIVE below
+    # (a sheet row keeps its own symbol until the operator renames it —
+    # auto-rewriting it in-flight would desync sheet vs write-matrix).
+    #   BK  -> BNY.US   (NYSE ticker change effective 2026-05-21)
+    #   FI  -> FISV.US  (NYSE->Nasdaq move effective 2025-11-11)
+    #   BJK -> GENZ.US  (fund conversion effective 2026-04-09)
+    "BK": "BNY.US",
+    "BNY": "BNY.US",
+    "FI": "FISV.US",
+    "FISV": "FISV.US",
+    "BJK": "GENZ.US",
+    "GENZ": "GENZ.US",
     "BRK-B": "BRK-B.US",
     "BRK.B": "BRK-B.US",
-    "FI": "FISV.US",
-    "FI.US": "FISV.US",
-    "FISV": "FISV.US",
 }
 
 # These identifiers must not remain in the active refresh universe.
@@ -31,6 +40,9 @@ CANONICAL_SYMBOLS: Mapping[str, str] = {
 # Saudi Exchange issuer mapping and is treated as unsupported until an official
 # listing can be evidenced.
 INACTIVE_SYMBOLS: Mapping[str, str] = {
+    "BK.US": "ticker changed: BNY Mellon trades as BNY.US since 2026-05-21 — add BNY.US to the page to retain exposure",
+    "FI.US": "ticker changed: Fiserv moved NYSE->Nasdaq as FISV.US since 2025-11-11 — add FISV.US to retain exposure",
+    "BJK.US": "converted: VanEck Gaming ETF became Digital Native Economy ETF, GENZ.US, effective 2026-04-09 (mandate changed — operator decision whether to add GENZ.US)",
     "3001.SR": "delisted: Hail Cement acquired by Qassim Cement",
     "8270.SR": "inactive: Buruj merger into MEDGULF and trading suspension pending delisting",
     "4328.SR": "unsupported: no verified active Saudi Exchange issuer mapping",
@@ -46,8 +58,8 @@ class IdentityRule:
 
 
 CRITICAL_IDENTITIES: Mapping[str, IdentityRule] = {
-    "BK.US": IdentityRule(
-        accepted_name_tokens=("bank of new york mellon", "bny mellon"),
+    "BNY.US": IdentityRule(
+        accepted_name_tokens=("bny", "bank of new york mellon"),
         exchange_tokens=("nyse",),
     ),
     "BRK-B.US": IdentityRule(
