@@ -7,6 +7,25 @@ TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.32.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
+v6.34.0 — PERSISTENCE TRUTH & SECOND-CHANCE PASS (run 30782099065 forensics)
+================================================================================
+EVIDENCE (2026-08-03 03:33 UTC, first scheduled 3-leg night): all four ranked
+pages ended rows_written=0. The v6.19.0 persistence injector produced ZERO
+preserved rows on every page (no 'preserved N' line, no error line) while the
+KLG pass read the same sheets successfully seconds later, and the L4b
+HARD-GUARD then vetoed each write (GM 3,589 / CFX 75 / ML 3 / MF 1 absent).
+Three ordering-proof, loud fixes — kill-switch TFB_SYNC_PERSIST_V2=0 restores
+v6.33.0 byte-behavior:
+  PV-1 INSTRUMENTED INJECTOR: logs [PERSIST v6.34.0] missing/grid/hdr/
+       injected/reason on EVERY invocation (each silent early-return is
+       named) and retries an empty page read once after 4s.
+  PV-2 SECOND-CHANCE PASS: a final injector invocation runs AFTER
+       batch-identity / KLG / ID-FIREWALL, immediately before L4b, so rows
+       dropped by later stages (the ML MSI/WM/MSFT class) are re-preserved.
+  PV-3 GUARD COUNTS ONLY REAL LOSS: absent symbols whose old row is missing
+       or identity-blank/fabricated are EXEMPT (nothing to lose); the veto
+       fires only for non-blank last-good rows. ZERO functions removed.
+================================================================================
 v6.33.0 — INTEGRITY CLOSEOUT (external audit P0-2 / P0-3, 2026-08-03)
 ================================================================================
 P0-3a SHEETS-SERIAL DATES: Google Sheets returns date cells as numeric
@@ -1382,7 +1401,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.33.0"
+SCRIPT_VERSION = "6.34.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3091,10 +3110,51 @@ def _persistence_hard_enabled() -> bool:
     return (os.getenv("TFB_SYNC_PERSISTENCE_HARD") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
+def _persist_v2_enabled() -> bool:
+    """v6.34.0 master switch (PV-1/2/3). Default ON; TFB_SYNC_PERSIST_V2=0
+    restores v6.33.0 behavior byte-for-byte."""
+    return (os.getenv("TFB_SYNC_PERSIST_V2") or "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _page_old_name_map(sheets, spreadsheet_id: str, sheet_name: str):
+    """v6.34.0 PV-3: {SYMBOL: name_is_blank(bool)} from the live page — the
+    guard's evidence of what a skipped write would actually lose. Fail-safe:
+    {} on any read/locate problem (guard then behaves as v6.33.0)."""
+    out: dict = {}
+    try:
+        blk = f"A1:ZZ{_page_read_row_bound()}" if _universe_cap_v2_enabled() else "A1:ZZ6000"
+        grid = sheets.read_values(spreadsheet_id, sheet_name, blk) if sheets is not None else None
+        if not grid or not isinstance(grid, list):
+            return out
+        hdr_r, sym_i, name_i = -1, -1, -1
+        for r in range(min(len(grid), 25)):
+            row = grid[r] if isinstance(grid[r], list) else []
+            si = _guard_find_col(row, _GUARD_SYMBOL_ALIASES)
+            if si >= 0:
+                hdr_r, sym_i = r, si
+                name_i = _guard_find_col(row, _GUARD_NAME_ALIASES)
+                break
+        if sym_i < 0:
+            return out
+        for row in grid[hdr_r + 1:]:
+            if not isinstance(row, list) or sym_i >= len(row) or _guard_is_blank(row[sym_i]):
+                continue
+            t = str(row[sym_i]).strip().upper()
+            blank_name = (name_i < 0 or name_i >= len(row)
+                          or _guard_is_blank(row[name_i])
+                          or _name_is_fabricated(row[name_i]))
+            if t not in out:
+                out[t] = blank_name
+    except Exception:
+        return {}
+    return out
+
+
 def _unpersisted_missing(
     headers: List[Any],
     rows_matrix: List[List[Any]],
     requested_symbols: List[str],
+    old_name_map: Optional[dict] = None,
 ) -> List[str]:
     """v6.22.2 L4b: the requested symbols STILL absent from the final matrix
     AFTER the persistence pass — i.e. the symbols the write would delete.
@@ -3126,6 +3186,16 @@ def _unpersisted_missing(
             continue
         seen.add(t)
         out.append(t)
+    if old_name_map and _persist_v2_enabled():
+        # v6.34.0 PV-3: an absent symbol with NO old row, or an old row whose
+        # identity is blank/fabricated, loses nothing if the write proceeds.
+        real = [t for t in out if old_name_map.get(t) is False]
+        exempt = len(out) - len(real)
+        if exempt:
+            logger.warning(
+                "[PERSIST v6.34.0] hard-guard scope: absent_total=%s "
+                "absent_blank_exempt=%s counted=%s", len(out), exempt, len(real))
+        return real
     return out
 
 
@@ -4474,7 +4544,15 @@ def _persist_missing_symbol_rows(
     Raising is reserved for the caller's try/except — any unexpected error
     leaves the v6.18.2 write path untouched."""
     kept: List[str] = []
+    _pv_note = {"missing": 0, "grid": 0, "hdr": -1, "reason": "ok"}
+    def _pv_log():
+        if _persist_v2_enabled():
+            logger.warning(
+                "[PERSIST v6.34.0] %s | missing=%s grid=%s hdr=%s injected=%s reason=%s",
+                sheet_name, _pv_note["missing"], _pv_note["grid"],
+                _pv_note["hdr"], len(kept), _pv_note["reason"])
     if not headers or rows_matrix is None or not requested_symbols:
+        _pv_note["reason"] = "empty_inputs"; _pv_log()
         return rows_matrix, kept
     new_sym_i = _guard_find_col(list(headers), _GUARD_SYMBOL_ALIASES)
     if new_sym_i < 0:
@@ -4494,14 +4572,25 @@ def _persist_missing_symbol_rows(
             continue
         seen_missing.add(t)
         missing.append(t)
+    _pv_note["missing"] = len(missing)
     if not missing:
+        _pv_note["reason"] = "no_missing"; _pv_log()
         return rows_matrix, kept
 
     # v6.24.3: last-good rows past the read bound could not be preserved.
     _pp_block = f"A1:ZZ{_page_read_row_bound()}" if _universe_cap_v2_enabled() else "A1:ZZ6000"
     grid = sheets.read_values(spreadsheet_id, sheet_name, _pp_block) if sheets is not None else None
+    if (not grid or not isinstance(grid, list)) and _persist_v2_enabled():
+        try:
+            time.sleep(4)
+        except Exception:
+            pass
+        grid = sheets.read_values(spreadsheet_id, sheet_name, _pp_block) if sheets is not None else None
+        _pv_note["reason"] = "grid_empty_retried"
     if not grid or not isinstance(grid, list):
+        _pv_note["reason"] = "grid_empty"; _pv_log()
         return rows_matrix, kept
+    _pv_note["grid"] = len(grid)
 
     # Locate the existing header row + Symbol column (same scan as the read-back).
     old_sym_i = -1
@@ -4513,7 +4602,9 @@ def _persist_missing_symbol_rows(
             old_sym_i = idx
             hdr_r = r
             break
+    _pv_note["hdr"] = hdr_r
     if old_sym_i < 0:
+        _pv_note["reason"] = "header_not_found"; _pv_log()
         return rows_matrix, kept
 
     def _hnorm(h: Any) -> str:
@@ -4542,6 +4633,7 @@ def _persist_missing_symbol_rows(
         kept.append(t)
         missing_set.discard(t)
 
+    _pv_log()
     return rows_matrix, kept
 
 
@@ -6603,8 +6695,30 @@ async def _run_one_task(
                 and task.expects_rows and symbols and headers
                 and rows_matrix and sheets is not None
                 and task.sheet_name in _RANKED_MARKET_PAGES):
+            _old_name_map: dict = {}
+            if _persist_v2_enabled():
+                # v6.34.0 PV-2: SECOND-CHANCE persistence — later stages
+                # (batch-identity / KLG / firewall) may have dropped rows the
+                # first pass saw as present. Idempotent re-injection.
+                try:
+                    rows_matrix, _kept2 = _persist_missing_symbol_rows(
+                        sheets, spreadsheet_id, task.sheet_name, headers,
+                        rows_matrix, symbols)
+                    if _kept2:
+                        _p2 = (f"[PERSIST v6.34.0] second-chance pass restored "
+                               f"{len(_kept2)} row(s) dropped by later stages on "
+                               f"'{task.sheet_name}': {', '.join(_kept2[:12])}"
+                               f"{'…' if len(_kept2) > 12 else ''}")
+                        res.warnings.append(_p2)
+                        logger.warning(_p2)
+                except Exception as _p2e:
+                    logger.warning("[PERSIST v6.34.0] second-chance skipped (%s)", _p2e)
+                try:
+                    _old_name_map = _page_old_name_map(sheets, spreadsheet_id, task.sheet_name)
+                except Exception:
+                    _old_name_map = {}
             try:
-                _still_missing = _unpersisted_missing(headers, rows_matrix, symbols)
+                _still_missing = _unpersisted_missing(headers, rows_matrix, symbols, _old_name_map)
             except Exception as _ve:  # never let verification break the write path
                 _still_missing = []
                 _vw = f"{_PERSISTENCE_HARD_TAG} verification skipped (error: {_ve})"
