@@ -312,24 +312,34 @@ def test_bu_safe_write_allows_at_or_above_floor(tmp_path):
 def test_rds_critical_identity_policy_is_wired():
     rds = _rds()
     assert _ver_at_least(rds.SCRIPT_VERSION, "6.30.0")
+    from scripts.critical_symbol_identity import POLICY_VERSION as _PV
+    _v11 = tuple(int(x) for x in str(_PV).split(".")) >= (1, 1, 0)
     clean, changes = rds.sanitize_active_universe(
         ["BK", "BRK-B", "FI", "3001.SR", "8270.SR", "4328.SR"]
     )
-    assert clean == ["BK.US", "BRK-B.US", "FISV.US"]
+    # v1.1.0: bare BK maps to the LIVE successor BNY.US (NYSE ticker change
+    # 2026-05-21); pre-1.1 pins the historical BK.US expectation.
+    assert clean == (["BNY.US", "BRK-B.US", "FISV.US"] if _v11
+                     else ["BK.US", "BRK-B.US", "FISV.US"])
     assert len(changes) == 6
 
 
 def test_rds_critical_symbols_are_isolated_before_normal_batches():
     rds = _rds()
-    assert rds.build_isolated_batches(
-        ["AAPL", "BK.US", "MSFT", "BRK-B.US", "FISV.US"], 2
-    ) == [["BK.US"], ["BRK-B.US"], ["FISV.US"], ["AAPL", "MSFT"]]
+    from scripts.critical_symbol_identity import CRITICAL_FETCH_SYMBOLS as _CFS
+    universe = ["AAPL", "BK.US", "MSFT", "BRK-B.US", "FISV.US"]
+    crit = [[s] for s in universe if s in _CFS]
+    rest = [s for s in universe if s not in _CFS]
+    chunks = [rest[i:i + 2] for i in range(0, len(rest), 2)]
+    assert rds.build_isolated_batches(universe, 2) == crit + chunks
 
 
 def test_rds_wrong_critical_issuer_cannot_report_success():
     rds = _rds()
     headers = ["Symbol", "Name", "Exchange", "Currency", "Country", "Warnings"]
-    rows = [["BK.US", "Hanwha Aerospace Co., Ltd.", "NYSE", "USD", "USA", ""]]
+    from scripts.critical_symbol_identity import CRITICAL_IDENTITIES as _CI
+    _canary = "BNY.US" if "BNY.US" in _CI else "BK.US"
+    rows = [[_canary, "Hanwha Aerospace Co., Ltd.", "NYSE", "USD", "USA", ""]]
     _, failures = rds.quarantine_critical_rows(headers, rows)
     assert failures and rows[0][1] == ""
     result = type("Result", (), {"status": "success", "rows_failed": 0, "error": None})()
