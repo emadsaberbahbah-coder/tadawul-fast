@@ -611,11 +611,26 @@ def _read_src(rel):
 _AA_SRC = _read_src("routes/advanced_analysis.py")
 _RDS_SRC = _read_src("scripts/run_dashboard_sync.py")
 _ROUTE_V16 = "TFB_ALLOW_LEGACY_FABRICATION" in _AA_SRC
-_SYNC_V33 = 'SCRIPT_VERSION = "6.33' in _RDS_SRC
+
+
+def _src_ver(src, pattern):
+    """Parse a version constant into a comparable tuple; (0,) when absent."""
+    m = __import__("re").search(pattern, src)
+    if not m:
+        return (0,)
+    try:
+        return tuple(int(x) for x in m.group(1).split("."))
+    except Exception:
+        return (0,)
+
+
+_SYNC_VER = _src_ver(_RDS_SRC, r'SCRIPT_VERSION = "([0-9.]+)"')
+_SYNC_V33 = _SYNC_VER >= (6, 33, 0)
 _EOD_SRC = _read_src("core/providers/eodhd_provider.py")
 _YC_SRC = _read_src("core/providers/yahoo_chart_provider.py")
 _EOD_V17 = "_plan_restricted_applies" in _EOD_SRC
 _YC_V13 = "history_high_low" in _YC_SRC
+_SYNC_V34 = _SYNC_VER >= (6, 34, 0)
 
 _G5_KEYS = ["symbol", "name", "current_price", "previous_close", "open_price",
             "percent_change", "expected_roi_12m", "overall_score",
@@ -1102,3 +1117,70 @@ def test_v813_52w_uses_candle_extremes_with_provenance():
     finally:
         if prev is not None:
             os.environ["TFB_YC_RANGE_FALLBACKS"] = prev
+
+
+# =========================================================================== #
+# GUARD 13 — persistence truth (v6.34.0 PV-1/2/3) + identity registry v1.1.0  #
+# =========================================================================== #
+_CSI13 = None
+try:
+    import importlib.util as _ilu13
+    _sp13 = _ilu13.spec_from_file_location(
+        "csi13", os.path.join(_ROOT, "scripts", "critical_symbol_identity.py"))
+    _m13 = _ilu13.module_from_spec(_sp13)
+    import sys as _sys13
+    _sys13.modules["csi13"] = _m13
+    _sp13.loader.exec_module(_m13)
+    if str(getattr(_m13, "POLICY_VERSION", "0")) >= "1.1.0":
+        _CSI13 = _m13
+except Exception:
+    _CSI13 = None
+
+
+@pytest.mark.skipif(_CSI13 is None, reason="critical_symbol_identity v1.1.0 not present")
+def test_v110_dead_tickers_are_registry_inactive():
+    for dead in ("BK.US", "FI.US", "BJK.US", "8270.SR", "3001.SR"):
+        assert dead in _CSI13.INACTIVE_SYMBOLS
+    assert "BNY.US" in _CSI13.CRITICAL_IDENTITIES
+    assert "BK.US" not in _CSI13.CRITICAL_IDENTITIES
+    clean, changes = _CSI13.sanitize_active_universe(
+        ["AAPL.US", "BK.US", "FI.US", "BJK.US", "BRK.B"])
+    assert clean == ["AAPL.US", "BRK-B.US"]
+    assert sum(1 for ch in changes if ch.action == "removed") == 3
+
+
+_RDS13 = _extract_funcs(
+    "scripts/run_dashboard_sync.py",
+    {"_unpersisted_missing", "_persist_v2_enabled", "_guard_find_col",
+     "_guard_is_blank", "_guard_norm", "_name_is_fabricated",
+     "_universe_deny_patterns", "_universe_junk"},
+    extra_globals={"os": os, "re": __import__("re"), "logger": type("_L13", (object,), {"warning": staticmethod(lambda *a, **k: None)})()},
+) if _SYNC_V34 else None
+
+
+@pytest.mark.skipif(_RDS13 is None, reason="run_dashboard_sync v6.34.0 not present")
+def test_v634_hard_guard_counts_only_real_loss():
+    H = ["Symbol", "Name", "Price"]
+    matrix = [["AAPL.US", "Apple", 1]]
+    req = ["AAPL.US", "GOOD.US", "STUB.US", "NEW.US"]
+    nmap = {"AAPL.US": False, "GOOD.US": False, "STUB.US": True}
+    prev = os.environ.pop("TFB_SYNC_PERSIST_V2", None)
+    try:
+        assert _RDS13._unpersisted_missing(H, matrix, req, nmap) == ["GOOD.US"]
+        assert _RDS13._unpersisted_missing(H, matrix, req, None) == [
+            "GOOD.US", "STUB.US", "NEW.US"]          # legacy shape intact
+        os.environ["TFB_SYNC_PERSIST_V2"] = "0"      # kill-switch
+        assert _RDS13._unpersisted_missing(H, matrix, req, nmap) == [
+            "GOOD.US", "STUB.US", "NEW.US"]
+    finally:
+        os.environ.pop("TFB_SYNC_PERSIST_V2", None)
+        if prev is not None:
+            os.environ["TFB_SYNC_PERSIST_V2"] = prev
+
+
+@pytest.mark.skipif(not _SYNC_V34, reason="run_dashboard_sync v6.34.0 not present")
+def test_v634_second_chance_and_instrumentation_are_wired():
+    assert "second-chance pass restored" in _RDS_SRC          # PV-2 at guard site
+    assert "absent_blank_exempt" in _RDS_SRC                  # PV-3 scope log
+    assert _RDS_SRC.count("_pv_log()") >= 5                   # PV-1 every exit named
+    assert "grid_empty_retried" in _RDS_SRC                   # PV-1 retry
