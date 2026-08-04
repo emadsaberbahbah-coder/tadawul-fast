@@ -26,7 +26,19 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.audit_sync_outcome import audit_artifacts
 from scripts.plan_sync_recovery import build_recovery_plan
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
+
+
+def _max_cycles() -> int:
+    """v1.1.0 FULL-FILL loop cap. Default "1" => v1.0.0 single-pass behavior
+    byte-identical. TFB_INLINE_RECOVERY_MAX_CYCLES=N (1..6) lets recovery
+    re-plan from its own evidence and retry still-incomplete pages, each
+    attempt with an independent TFB_SYNC_TIME_BUDGET_SEC budget, until the
+    audit criterion passes or cycles are exhausted."""
+    try:
+        return max(1, min(6, int((os.getenv("TFB_INLINE_RECOVERY_MAX_CYCLES") or "1").strip())))
+    except ValueError:
+        return 1
 
 
 def _stream_process(
@@ -91,69 +103,90 @@ def run_inline_recovery(
 
     evidence_root.mkdir(parents=True, exist_ok=True)
     failed_pages: list[str] = []
-
-    for item in plan["matrix"]["include"]:
-        page = str(item["page"])
-        key = str(item["key"])
-        group = str(item["group"])
-        page_root = evidence_root / group
-        log_path = page_root / "sync_execution.log"
-
-        print(f"::group::Recover {page}")
-        env = os.environ.copy()
-        env["TFB_SYNC_PAGE_ORDER"] = page
-
-        command = (
-            sys.executable,
-            str(REPO_ROOT / "scripts" / "run_dashboard_sync.py"),
-            "--backend",
-            backend,
-            "--sheet-id",
-            sheet_id,
-            "--keys",
-            key,
-            "--start-cell",
-            "A1",
-        )
-        runner_exit = _stream_process(command, env=env, log_path=log_path)
-
-        audit_status = "blocked"
-        audit_payload: dict[str, object]
-        try:
-            audit = audit_artifacts(page_root, required_pages=(page,))
-            audit_status = audit.status
-            audit_payload = audit.to_dict()
-        except OSError as exc:
-            audit_payload = {"status": "read_error", "error": str(exc)}
-
-        (page_root / "page-audit.json").write_text(
-            json.dumps(audit_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-
-        passed = runner_exit == 0 and audit_status == "ok"
-        if not passed:
-            failed_pages.append(page)
+    max_cycles = _max_cycles()
+    summary["max_cycles"] = max_cycles
+    pending: list[dict] = [dict(item) for item in plan["matrix"]["include"]]
+    cycle = 0
+    while pending and cycle < max_cycles:
+        cycle += 1
+        if cycle > 1:
             print(
-                f"::error::Inline recovery failed for {page}: "
-                f"runner_exit={runner_exit}, audit_status={audit_status}"
+                f"::notice::FULL-FILL cycle {cycle}/{max_cycles} — retrying "
+                f"{', '.join(str(i['page']) for i in pending)}"
             )
-        else:
-            print(f"::notice::Inline recovery passed for {page}")
+        current, pending = pending, []
+        for item in current:
+            page = str(item["page"])
+            key = str(item["key"])
+            group = str(item["group"])
+            page_root = evidence_root / group if cycle == 1 else evidence_root / group / f"cycle{cycle}"
+            log_path = page_root / "sync_execution.log"
 
-        summary["results"].append(
-            {
-                "page": page,
-                "key": key,
-                "group": group,
-                "runner_exit": runner_exit,
-                "audit_status": audit_status,
-                "passed": passed,
-                "evidence_root": str(page_root),
-            }
-        )
-        print("::endgroup::")
+            print(f"::group::Recover {page} (cycle {cycle})")
+            env = os.environ.copy()
+            env["TFB_SYNC_PAGE_ORDER"] = page
 
+            command = (
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "run_dashboard_sync.py"),
+                "--backend",
+                backend,
+                "--sheet-id",
+                sheet_id,
+                "--keys",
+                key,
+                "--start-cell",
+                "A1",
+            )
+            runner_exit = _stream_process(command, env=env, log_path=log_path)
+
+            audit_status = "blocked"
+            audit_payload: dict[str, object]
+            try:
+                audit = audit_artifacts(page_root, required_pages=(page,))
+                audit_status = audit.status
+                audit_payload = audit.to_dict()
+            except OSError as exc:
+                audit_payload = {"status": "read_error", "error": str(exc)}
+
+            (page_root / "page-audit.json").write_text(
+                json.dumps(audit_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            passed = runner_exit == 0 and audit_status == "ok"
+            if not passed:
+                if cycle < max_cycles:
+                    pending.append(item)
+                    print(
+                        f"::warning::Inline recovery incomplete for {page} "
+                        f"(cycle {cycle}): runner_exit={runner_exit}, "
+                        f"audit_status={audit_status} — will retry."
+                    )
+                else:
+                    failed_pages.append(page)
+                    print(
+                        f"::error::Inline recovery failed for {page}: "
+                        f"runner_exit={runner_exit}, audit_status={audit_status}"
+                    )
+            else:
+                print(f"::notice::Inline recovery passed for {page} (cycle {cycle})")
+
+            summary["results"].append(
+                {
+                    "page": page,
+                    "key": key,
+                    "group": group,
+                    "cycle": cycle,
+                    "runner_exit": runner_exit,
+                    "audit_status": audit_status,
+                    "passed": passed,
+                    "evidence_root": str(page_root),
+                }
+            )
+            print("::endgroup::")
+
+    summary["cycles_used"] = cycle
     summary["status"] = "ok" if not failed_pages else "blocked"
     summary["failed_pages"] = failed_pages
     summary_out.parent.mkdir(parents=True, exist_ok=True)
