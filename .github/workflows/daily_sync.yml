@@ -392,9 +392,10 @@ jobs:
       # nears the 25-min job cap; optional companion TFB_SYNC_BATCH_DELAY_MS: "500"
       # adds a pause between batches for extra upstream cooldown.
       TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
-      # ONE-RUN (2026-08-04): heal six symbols after page rebuild — REMOVE after the
-      # verified dispatch by restoring daily_sync_RESTORE.yml (workflow audit WARNs while present).
-      TFB_SYNC_FORCE_REFETCH_SYMBOLS: "BK.US,BRK-B.US,FI.US,8270.SR,4328.SR,3001.SR"
+      # ONE-RUN v2 (2026-08-04): receipt for the three active critical symbols after page
+      # rebuild (registry: BK->BNY.US, FI->FISV.US; 3001/8270/4328.SR retired). REMOVE after
+      # the verified dispatch by restoring daily_sync_RESTORE.yml.
+      TFB_SYNC_FORCE_REFETCH_SYMBOLS: "BNY.US,BRK-B.US,FISV.US"
       # v6.22.4 L5 [TIME-BUDGET] (2026-07-11, runs #2330/#2331 forensics): the
       # runner stops fetching new batches once 3600s of wall clock are spent
       # and PROCEEDS TO THE WRITE with the accumulated partial — the coverage
@@ -1254,9 +1255,10 @@ jobs:
       TFB_PORTFOLIO_REBUILD: "1"
       TFB_SYNC_DECISION_GUARD: "1"
       TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
-      # ONE-RUN (2026-08-04): heal six symbols after page rebuild — REMOVE after the
-      # verified dispatch by restoring daily_sync_RESTORE.yml (workflow audit WARNs while present).
-      TFB_SYNC_FORCE_REFETCH_SYMBOLS: "BK.US,BRK-B.US,FI.US,8270.SR,4328.SR,3001.SR"
+      # ONE-RUN v2 (2026-08-04): receipt for the three active critical symbols after page
+      # rebuild (registry: BK->BNY.US, FI->FISV.US; 3001/8270/4328.SR retired). REMOVE after
+      # the verified dispatch by restoring daily_sync_RESTORE.yml.
+      TFB_SYNC_FORCE_REFETCH_SYMBOLS: "BNY.US,BRK-B.US,FISV.US"
       TFB_SYNC_TIME_BUDGET_SEC: "3600"
       TFB_SYNC_MAX_SYMBOLS_MARKET: "7000"
       TFB_SYNC_MARKET_GATEWAY: "analysis"
