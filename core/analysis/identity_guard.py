@@ -5,6 +5,25 @@
 Identity Guard — v1.1.0   (replaces the destructive ID-FIREWALL dedup stage)
 ================================================================================
 
+v1.1.1 — FLAG-COMBINATION HOLE CLOSED (Codex review, PR #118)
+-------------------------------------------------------------
+v1.1.0 made the two gates fully independent. That admitted a combination
+I had not reasoned about: TFB_IDENTITY_QUARANTINE_KEYS=1 with
+TFB_SURFACE_ACTION_PRECEDENCE=0 writes investability_status=BLOCKED and
+clears `recommendation`, but leaves final_action=INVEST untouched -- the
+exact contradiction this module exists to remove, and STRICTLY WORSE than
+v1.0.0: with the recommendation blanked, nothing on the row explains the
+INVEST any more.
+
+The planned rollout order (precedence first, quarantine after 2026-08-16)
+happens to avoid it, but a correctness invariant must not depend on the
+operator arming flags in a particular sequence.
+
+FIX: quarantining a row now forces the action whenever EITHER gate is on.
+Rejected alternative -- forcing DO_NOT_INVEST unconditionally -- would drop
+the gate and break the default-OFF byte-identity guarantee the S-1 window
+requires. Both gates unset still yields v1.0.0 behaviour exactly.
+
 v1.1.0 WHY-BLOCK — THE QUARANTINE NEVER QUARANTINED ANYTHING
 ------------------------------------------------------------
 Root cause, measured on the live 2026-08-05 Global_Markets export (6,646 rows):
@@ -170,7 +189,7 @@ from core.analysis.symbol_dedup import (
     resolve_identity,
 )
 
-IDENTITY_GUARD_VERSION = "1.1.0"
+IDENTITY_GUARD_VERSION = "1.1.1"
 __version__ = IDENTITY_GUARD_VERSION
 
 __all__ = [
@@ -787,7 +806,13 @@ def guard_sheet_rows(
         # v1.1.0: a BLOCKED row must never publish an INVEST action.
         # Never creates the key -- a row without an action field is a
         # caller that does not carry one, not a row to invent one for.
-        if action_precedence_on:
+        #
+        # v1.1.1 (Codex review, PR #118): fires when EITHER gate is armed.
+        # Quarantine-armed-alone used to publish BLOCKED + INVEST with the
+        # recommendation already blanked -- worse than doing nothing. The
+        # action is now tied to the BLOCK itself, not to one flag, so no
+        # arming order can produce an incoherent row.
+        if action_precedence_on or quarantine_keys_on:
             _set_first_present(row, _ACTION_KEYS, "DO_NOT_INVEST")
 
     plan.rows = working
