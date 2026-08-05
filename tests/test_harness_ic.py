@@ -63,7 +63,15 @@ def _render(rep):
 
 def test_core_stats_importable():
     assert tp._IC_AVAILABLE is True
-    assert tp.SCRIPT_VERSION == "6.12.0"
+    # 2026-08-05: the exact pin ("6.12.0") went stale — track_performance had
+    # advanced to 6.32.0 through twenty routine bumps, so foundations-tests
+    # failed on EVERY PR/push regardless of content (first seen failing PR
+    # #123, which never touched this module). The test's intent is "the IC
+    # harness exists and the module is at least the version that introduced
+    # it" — assert a FLOOR, not an exact pin, so routine version bumps can
+    # never break foundations again.
+    assert tuple(int(p) for p in str(tp.SCRIPT_VERSION).split(".")[:3]) >= (6, 12, 0), \
+        "track_performance older than the IC-harness introduction (6.12.0): %s" % tp.SCRIPT_VERSION
 
 
 def test_off_path_is_inert(recs, monkeypatch):
