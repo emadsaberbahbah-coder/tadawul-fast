@@ -574,7 +574,35 @@ from datetime import datetime, timedelta, timezone
 # it reproduces v1.7.2 verbatim, so the "shared verbatim by two call sites"
 # invariant of v1.5.1 is preserved. Zero functions removed.
 # -----------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.7.3"
+# ---------------------------------------------------------------------------
+# v1.7.4 (2026-08-05) [B1b-2/2 SYNTHETIC-BASIS DEFERRAL] - env-gated, OFF
+# WHY (operator evidence, 2026-08-05 workbook): 7 of 10 holdings carried
+# forecast_source=phase_ii_synthetic after the 2026-08-04 21:59 sync, and the
+# 01:01 Portfolio_Decision emitted "TRIM ~2515 SAR; Valuation ROI -9.7% <=
+# trim threshold -5.0%" on 2222.SR - a valuation signal computed on a
+# synthetic reference - while the engine's live intraday read was BUY +23.4%.
+# The vf-conflict guard cannot catch this class: when valuation ref and
+# engine ROI come from the SAME synthetic snapshot they agree with each
+# other and disagree only with reality. Reliability does not discriminate
+# either (70.5 synthetic vs 85.8 provider observed on the same book).
+#
+# CHANGE: when TFB_PF_REQUIRE_FRESH_BASIS=1 AND
+# cand["forecast_source"] == "phase_ii_synthetic" (exact token; blank or
+# any other value passes fail-open, matching every gate convention in this
+# module), the two VALUATION-driven branches are deferred to HOLD with an
+# explicit manual-review reason and capped_from set to the withheld action,
+# riding the same late rail as the vf-conflict guard:
+#   - step 3 valuation EXIT  (roi <= exit_roi_pct)   -> HOLD, capped EXIT
+#   - step 4 valuation TRIM  (roi <= trim_roi_pct)   -> HOLD, capped TRIM
+# NOT deferred (by design): cap-kind trims (arithmetic on the operator's
+# own holdings), sell-tier EXITs (recommendation-driven, not valuation),
+# TRIM-BY-RULE, ADD/HOLD paths. Requires opportunity_builder >= 1.9.1
+# (forecast_source on the cand contract); older cand dicts simply lack the
+# key -> "" -> fail-open, gate inert.
+# KILL: TFB_PF_REQUIRE_FRESH_BASIS unset/0 -> decide_action byte-identical
+# to v1.7.3 (proven by the A/B harness in the PR).
+# ---------------------------------------------------------------------------
+PORTFOLIO_ACTIONS_VERSION = "1.7.4"
 _OB_VERSION_FLOOR = (1, 0, 1)
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
@@ -951,6 +979,15 @@ def _env_identity_gate():
         in ("1", "true", "yes", "on")
 
 
+def _env_fresh_basis_gate():
+    """v1.7.4 [SYNTHETIC-BASIS DEFERRAL] kill-switch - DEFAULT OFF. Set
+    TFB_PF_REQUIRE_FRESH_BASIS=1 to defer VALUATION-driven TRIM/EXIT to
+    HOLD (manual review) when the holding's forecast_source is
+    phase_ii_synthetic. Off => v1.7.3 decisions byte-for-byte."""
+    return str(_env_str("TFB_PF_REQUIRE_FRESH_BASIS", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
 def _env_vf_conflict_guard():
     """v1.0.5: master switch for the valuation<->forecast conflict guard.
     DEFAULT OFF (opt-in) — set TFB_PF_VF_CONFLICT_GUARD=1 to withhold a
@@ -1018,6 +1055,7 @@ def _env_overrides():
             "TFB_PF_IDENTITY_MIN_RELIABILITY",
             DEFAULT_CONTROLS["identity_min_reliability"]),
         "vf_conflict_guard_enabled": _env_vf_conflict_guard(),
+        "fresh_basis_gate_enabled": _env_fresh_basis_gate(),  # v1.7.4
         # v1.1.0: ADD-confirmation gate depth (0/1 disables).
         "add_confirm_days": _env_int("TFB_PF_ADD_CONFIRM_DAYS",
                                      DEFAULT_CONTROLS["add_confirm_days"]),
@@ -1753,12 +1791,30 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
                          "valuation-driven %s withheld, manual review"
                          % (roi, _vf_engine_pct, _fmt(rel), vf_suppressed))
 
+    # v1.7.4 [SYNTHETIC-BASIS DEFERRAL]: exact-token check, fail-open.
+    # Only the two valuation-driven branches below consult these flags.
+    _basis = str(cand.get("forecast_source") or "").strip().lower()
+    basis_deferral = bool(controls.get("fresh_basis_gate_enabled")) \
+        and _basis == "phase_ii_synthetic"
+    basis_note = None
+    basis_suppressed = None
+
     # 3. EXIT
     exit_reason = None
     if (roi is not None and roi <= controls["exit_roi_pct"]
             and not vf_conflict):
-        exit_reason = ("Valuation ROI %.1f%% <= exit threshold %.1f%%"
-                       % (roi, controls["exit_roi_pct"]))
+        if basis_deferral:
+            # v1.7.4: valuation EXIT withheld on synthetic basis.
+            basis_suppressed = ACTION_EXIT
+            basis_note = ("Synthetic-basis deferral: valuation EXIT "
+                          "withheld - Valuation ROI %.1f%% <= exit "
+                          "threshold %.1f%% but forecast basis is "
+                          "phase_ii_synthetic; refresh provider basis - "
+                          "manual review"
+                          % (roi, controls["exit_roi_pct"]))
+        else:
+            exit_reason = ("Valuation ROI %.1f%% <= exit threshold %.1f%%"
+                           % (roi, controls["exit_roi_pct"]))
     elif _is_sell_tier(reco):
         exit_reason = "Engine recommendation '%s' is sell-tier" % reco
     if exit_reason:
@@ -1794,12 +1850,24 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
                        sector_excess_share_sar, controls, cand)
     if (roi is not None and roi <= controls["trim_roi_pct"] and mv
             and not vf_conflict):
-        trims.append((mv * controls["valuation_trim_frac"],
-                      "Valuation ROI %.1f%% <= trim threshold %.1f%% — trim "
-                      "%d%% of position"
-                      % (roi, controls["trim_roi_pct"],
-                         int(controls["valuation_trim_frac"] * 100)),
-                      "valuation"))
+        if basis_deferral:
+            # v1.7.4: valuation TRIM withheld on synthetic basis. Cap-kind
+            # trims above are untouched and still compete normally.
+            if basis_note is None:
+                basis_suppressed = ACTION_TRIM
+                basis_note = ("Synthetic-basis deferral: valuation TRIM "
+                              "withheld - Valuation ROI %.1f%% <= trim "
+                              "threshold %.1f%% but forecast basis is "
+                              "phase_ii_synthetic; refresh provider basis "
+                              "- manual review"
+                              % (roi, controls["trim_roi_pct"]))
+        else:
+            trims.append((mv * controls["valuation_trim_frac"],
+                          "Valuation ROI %.1f%% <= trim threshold %.1f%% — trim "
+                          "%d%% of position"
+                          % (roi, controls["trim_roi_pct"],
+                             int(controls["valuation_trim_frac"] * 100)),
+                          "valuation"))
     if trims:
         trims.sort(key=lambda t: -t[0])
         proceeds, reason, _tkind = trims[0]
@@ -1872,6 +1940,12 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
     # carries the suppressed action for the alert split.
     if vf_conflict:
         return (ACTION_HOLD, vf_reason, 0.0, vf_suppressed)
+    # v1.7.4 [SYNTHETIC-BASIS DEFERRAL] - same late rail as the vf guard:
+    # every non-valuation branch above (cap trims, sell-tier, TRIM-BY-RULE,
+    # ADD, BLOCK) has already had its chance to return; only a holding whose
+    # sole signal was the withheld valuation action reaches this line.
+    if basis_note is not None:
+        return (ACTION_HOLD, basis_note, 0.0, basis_suppressed)
     if roi is None:
         why = "No valuation reference (target/intrinsic) — upside unknown"
     elif roi < controls["add_roi_pct"]:
