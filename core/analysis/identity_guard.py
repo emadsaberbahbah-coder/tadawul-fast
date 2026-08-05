@@ -2,7 +2,82 @@
 # core/analysis/identity_guard.py
 """
 ================================================================================
-Identity Guard — v1.0.0   (replaces the destructive ID-FIREWALL dedup stage)
+Identity Guard — v1.1.0   (replaces the destructive ID-FIREWALL dedup stage)
+================================================================================
+
+v1.1.0 WHY-BLOCK — THE QUARANTINE NEVER QUARANTINED ANYTHING
+------------------------------------------------------------
+Root cause, measured on the live 2026-08-05 Global_Markets export (6,646 rows):
+
+    identity-unverified rows ................  82
+    ...carrying the quarantine stamp ........   0   <- should have been 82
+    ...still carrying Name ..................  82   <- should have been 0
+    ...still carrying Recommendation ........  82   <- should have been 0
+    ...still carrying Expected ROI 12M ......  82   <- should have been 0
+    ...still carrying Current Price .........  74   <- should have been 0
+    ...still carrying Rank (Overall) ........  72   <- should have been 0
+    quarantine stamps anywhere in the file ..   0
+
+CONTAMINATED_FIELDS holds PHYSICAL SHEET HEADERS ("Name", "Current Price",
+"Rank (Overall)"). Rows reaching this module on the engine sheet-rows path
+(data_engine_v2._bb2_apply_identity_guard, called at the get_sheet_rows
+boundary AFTER _project_rows_with_trust_carry) have already been projected
+onto the canonical snake_case contract -- the code immediately after that
+call site writes r["investability_status"] / r["final_action"] /
+r["block_reason"]. So `if key in row` was False for all 34 fields on every
+production row and the quarantine cleared NOTHING, while
+row["Warnings"] = stamp created an orphan Title-Case key that the 115-key
+projection then stripped -- destroying the audit trail that would have
+exposed the no-op.
+
+The two writes that DID land are the two that already carried a snake_case
+fallback -- ("Block Reason", "block_reason") and ("Investability Status",
+"investability_status"). That asymmetry is the whole reason the defect read
+as a cosmetic mismatch instead of a dead guard: the verdict was published,
+the enforcement was not.
+
+Why 47 CI tests did not catch it: every fixture in tests/test_identity_guard.py
+builds Title-Case rows, so the suite has only ever exercised a key casing
+production does not use. New snake_case cases are added rather than replacing
+the Title-Case ones -- both callers must work.
+
+A THIRD defect, independent of casing: `final_action` was never referenced
+at all, so a row demoted to investability_status=BLOCKED kept whatever action
+the engine gate had already assigned. Live evidence, same export:
+BSANTANDER.SN, VCB.VN, VPB.VN, MBB.VN all published
+Investability Status=BLOCKED alongside Final Action=INVEST.
+
+FIXES (all additive, zero removals, all env-gated DEFAULT OFF):
+
+  TFB_IDENTITY_QUARANTINE_KEYS (default OFF)
+      Clears every spelling a contaminated field is known by
+      (CONTAMINATED_FIELD_ALIASES, keys taken from
+      core/sheets/schema_registry.py -- NOT inferred), and routes the
+      warning stamp through the same case-tolerant writer so the audit
+      trail survives projection. MATERIAL: arming this blanks name/price/
+      forecast/recommendation/rank on rows the guard already judged
+      contaminated, which changes what the decision surface shows.
+      Arm AFTER the S-1 certification window closes (2026-08-16).
+
+  TFB_SURFACE_ACTION_PRECEDENCE (default OFF)
+      A quarantined row is BLOCKED, so its action is forced to
+      DO_NOT_INVEST. DISPLAY-ONLY in the current wiring: the Top_10
+      selector filters on Investability Status, not Final Action -- the
+      2026-08-05 candidate audit shows all four leak rows already rejected
+      with "First Fail = Investability: BLOCKED". Safe to arm immediately.
+
+With both unset this module is behaviourally identical to v1.0.0. The only
+output delta is the version substring inside the quarantine stamp itself
+(identity_guard_v1.1.0:fields_quarantined), which is deliberate provenance:
+the stamp records which guard version acted. On the production snake_case
+path that stamp is written to an orphan key and stripped, so the served
+rows are byte-identical.
+
+NOT FIXED HERE, and deliberately not folded in: the 66 Global_Markets rows
+whose price sits outside their own 52-week range. Only 1 of those 66 is in
+the identity-unverified set, so this defect does not explain them and
+claiming otherwise would be a false close.
+
 ================================================================================
 Fixes the defect that blanked 608 rows across Global_Markets, Market_Leaders and
 Commodities_FX between 2026-07-20 and 2026-07-25.
@@ -81,6 +156,7 @@ Pure stdlib. No I/O, no network. Safe to import at startup.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -94,7 +170,7 @@ from core.analysis.symbol_dedup import (
     resolve_identity,
 )
 
-IDENTITY_GUARD_VERSION = "1.0.0"
+IDENTITY_GUARD_VERSION = "1.1.0"
 __version__ = IDENTITY_GUARD_VERSION
 
 __all__ = [
@@ -107,6 +183,7 @@ __all__ = [
     "price_is_plausible",
     "price_band_applies",
     "row_asset_class",
+    "CONTAMINATED_FIELD_ALIASES",
     "IDENTITY_GUARD_VERSION",
     "__version__",
 ]
@@ -206,6 +283,140 @@ CONTAMINATED_FIELDS: Tuple[str, ...] = (
     "Recommendation", "Recommendation Detail", "Recommendation Reason",
     "Target Price", "Upside/Downside %", "Analyst Rating",
 )
+
+
+# ---------------------------------------------------------------------------
+# v1.1.0 -- case-tolerant field resolution
+# ---------------------------------------------------------------------------
+# CONTAMINATED_FIELDS above holds the PHYSICAL SHEET HEADERS and is preserved
+# verbatim (it remains the single ordered source of truth for WHICH fields are
+# contaminated). This table adds, per header, EVERY key that field is known by
+# on the paths that reach this module. The snake_case names are taken from
+# core/sheets/schema_registry.py -- they are read from the registry, not
+# guessed. Extra provider/engine aliases are included where the engine is known
+# to write them, because leaving an alias populated would let a later stage
+# resurrect the contaminated value: _apply_investability_gate (v5.79.5 Fix Q)
+# explicitly backfills current_price from the `price` alias, so clearing only
+# "Current Price"/"current_price" would be undone one stage later.
+CONTAMINATED_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "Name": ("Name", "name", "company_name", "companyName", "long_name"),
+    "Current Price": ("Current Price", "current_price", "currentPrice", "price", "last_price"),
+    "Previous Close": ("Previous Close", "previous_close", "previousClose"),
+    "Open": ("Open", "open_price", "open", "day_open"),
+    "Day High": ("Day High", "day_high", "high"),
+    "Day Low": ("Day Low", "day_low", "low"),
+    "52W High": ("52W High", "week_52_high", "fifty_two_week_high"),
+    "52W Low": ("52W Low", "week_52_low", "fifty_two_week_low"),
+    "Price Change": ("Price Change", "price_change", "change"),
+    "Percent Change": ("Percent Change", "percent_change", "change_percent"),
+    "52W Position %": ("52W Position %", "week_52_position_pct"),
+    "Market Cap": ("Market Cap", "market_cap", "marketCap"),
+    "Float Shares": ("Float Shares", "float_shares"),
+    "P/E (TTM)": ("P/E (TTM)", "pe_ttm"),
+    "P/E (Forward)": ("P/E (Forward)", "pe_forward"),
+    "EPS (TTM)": ("EPS (TTM)", "eps_ttm"),
+    "Intrinsic Value": ("Intrinsic Value", "intrinsic_value"),
+    "Upside %": ("Upside %", "upside_pct"),
+    "Valuation Score": ("Valuation Score", "valuation_score"),
+    "Forecast Price 1M": ("Forecast Price 1M", "forecast_price_1m"),
+    "Forecast Price 3M": ("Forecast Price 3M", "forecast_price_3m"),
+    "Forecast Price 12M": ("Forecast Price 12M", "forecast_price_12m"),
+    "Expected ROI 1M": ("Expected ROI 1M", "expected_roi_1m"),
+    "Expected ROI 3M": ("Expected ROI 3M", "expected_roi_3m"),
+    "Expected ROI 12M": ("Expected ROI 12M", "expected_roi_12m"),
+    "Overall Score": ("Overall Score", "overall_score"),
+    "Opportunity Score": ("Opportunity Score", "opportunity_score"),
+    "Rank (Overall)": ("Rank (Overall)", "rank_overall"),
+    "Recommendation": ("Recommendation", "recommendation"),
+    "Recommendation Detail": ("Recommendation Detail", "recommendation_detailed"),
+    "Recommendation Reason": ("Recommendation Reason", "recommendation_reason"),
+    "Target Price": ("Target Price", "target_price", "analyst_target_price"),
+    "Upside/Downside %": ("Upside/Downside %", "upside_downside_pct"),
+    "Analyst Rating": ("Analyst Rating", "analyst_rating", "analyst_recommendation"),
+}
+
+# Warning / action fields, in the order a writer should try them.
+_WARNING_KEYS: Tuple[str, ...] = ("Warnings", "warnings", "warning", "flags")
+_ACTION_KEYS: Tuple[str, ...] = ("Final Action", "final_action")
+
+# Key created when a row carries no warnings field at all. snake_case, because
+# that is the canonical 115-key contract this module sits inside; a Title-Case
+# key would be stripped at projection (the v1.0.0 defect).
+_WARNING_FALLBACK_KEY = "warnings"
+
+
+def _env_flag_on(name: str, default: str = "0") -> bool:
+    """True when the env flag is set to an affirmative value. Default OFF."""
+    return (os.getenv(name) or default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _quarantine_keys_enabled() -> bool:
+    """v1.1.0 case-tolerant quarantine. DEFAULT OFF -> exact v1.0.0 behaviour.
+
+    MATERIAL when armed: it blanks the display/decision fields on rows the guard
+    judged contaminated. Arm only after the S-1 window closes (2026-08-16).
+    """
+    return _env_flag_on("TFB_IDENTITY_QUARANTINE_KEYS", "0")
+
+
+def _action_precedence_enabled() -> bool:
+    """BLOCKED => Final Action DO_NOT_INVEST. DEFAULT OFF.
+
+    Display-only in the current wiring (the Top_10 selector gates on
+    Investability Status), so this is safe to arm inside the S-1 window.
+    """
+    return _env_flag_on("TFB_SURFACE_ACTION_PRECEDENCE", "0")
+
+
+def _field_spellings(header: str) -> Tuple[str, ...]:
+    """Every key `header` may appear under. Falls back to the header itself."""
+    return CONTAMINATED_FIELD_ALIASES.get(header, (header,))
+
+
+def _clear_contaminated_field(row: Dict[str, Any], header: str) -> bool:
+    """Blank EVERY present spelling of `header`. Never creates a key.
+
+    Unlike a first-match write, this clears all aliases: leaving one populated
+    is exactly how a cleared value gets resurrected downstream.
+    """
+    cleared = False
+    for key in _field_spellings(header):
+        if key in row:
+            row[key] = None
+            cleared = True
+    return cleared
+
+
+def _set_first_present(
+    row: Dict[str, Any], candidates: Sequence[str], value: Any
+) -> bool:
+    """Write `value` to the first candidate key present. Never creates a key.
+
+    Mirrors the v1.0.0 idiom already used for Block Reason / Investability
+    Status: a strict schema contract means inventing a key is worse than
+    skipping the write.
+    """
+    for key in candidates:
+        if key in row:
+            row[key] = value
+            return True
+    return False
+
+
+def _append_guard_warning(row: Dict[str, Any], stamp: str) -> None:
+    """Append `stamp` to whichever warnings field the row carries.
+
+    Idempotent: a stamp already present is not duplicated, so a second guard
+    pass over the same rows is byte-identical.
+    """
+    for key in _WARNING_KEYS:
+        if key in row:
+            existing = str(row.get(key) or "").strip()
+            if stamp in existing:
+                return
+            row[key] = f"{existing}; {stamp}" if existing else stamp
+            return
+    row[_WARNING_FALLBACK_KEY] = stamp
 
 
 # ---------------------------------------------------------------------------
@@ -542,14 +753,29 @@ def guard_sheet_rows(
             )
 
     # --- clear only the contaminated fields, never the whole row ------------
+    quarantine_keys_on = _quarantine_keys_enabled()   # v1.1.0
+    action_precedence_on = _action_precedence_enabled()  # v1.1.0
+    stamp = f"identity_guard_v{IDENTITY_GUARD_VERSION}:fields_quarantined"
     for index in contaminated:
         row = working[index]
-        for key in CONTAMINATED_FIELDS:
-            if key in row:
-                row[key] = None
-        existing = str(row.get("Warnings") or "").strip()
-        stamp = f"identity_guard_v{IDENTITY_GUARD_VERSION}:fields_quarantined"
-        row["Warnings"] = f"{existing}; {stamp}" if existing else stamp
+        if quarantine_keys_on:
+            # v1.1.0: clear every spelling, so a snake_case projected row is
+            # actually quarantined instead of silently skipped.
+            for header in CONTAMINATED_FIELDS:
+                _clear_contaminated_field(row, header)
+        else:
+            # v1.0.0 path, preserved verbatim.
+            for key in CONTAMINATED_FIELDS:
+                if key in row:
+                    row[key] = None
+        if quarantine_keys_on:
+            # v1.1.0: stamp the field the row actually carries, so the audit
+            # trail survives the 115-key projection.
+            _append_guard_warning(row, stamp)
+        else:
+            # v1.0.0 path, preserved verbatim.
+            existing = str(row.get("Warnings") or "").strip()
+            row["Warnings"] = f"{existing}; {stamp}" if existing else stamp
         for key in ("Block Reason", "block_reason"):
             if key in row:
                 row[key] = "Identity unverified — re-fetch required"
@@ -558,6 +784,11 @@ def guard_sheet_rows(
             if key in row:
                 row[key] = "BLOCKED"
                 break
+        # v1.1.0: a BLOCKED row must never publish an INVEST action.
+        # Never creates the key -- a row without an action field is a
+        # caller that does not carry one, not a row to invent one for.
+        if action_precedence_on:
+            _set_first_present(row, _ACTION_KEYS, "DO_NOT_INVEST")
 
     plan.rows = working
 
