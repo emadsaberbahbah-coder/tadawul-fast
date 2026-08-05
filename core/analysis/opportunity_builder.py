@@ -827,7 +827,21 @@ from datetime import datetime, timedelta, timezone
 # Kills: TFB_COMPLIANCE_SURFACE_GATE=0 / TFB_ELIGIBILITY_GATE=0 restore the
 # v1.4.1 gate list byte-for-byte. Guards ship armed.
 # -----------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.9.0"
+# ---------------------------------------------------------------------------
+# v1.9.1 (2026-08-05) [B1b-1/2 FORECAST-SOURCE PASSTHROUGH]
+# WHY: the 2026-08-05 workbook audit proved 7 of 10 portfolio holdings on
+# phase_ii_synthetic forecast basis, and Portfolio_Decision (01:01) emitted a
+# valuation TRIM on 2222.SR from a synthetic -9.7% while the engine's live
+# read was BUY +23.4%. portfolio_actions.decide_action cannot defer on basis
+# because the candidate contract never carried it: the sheet column
+# "Forecast Source" (My_Portfolio col 106 / GM col 100) was dropped at
+# normalize_candidate. CHANGE (additive only): a "forecast_source" alias +
+# one always-present string key on the cand dict ("" when absent). No gate
+# reads it here; payload rows project explicit keys, so served bytes are
+# unchanged. Consumer: portfolio_actions v1.7.4 TFB_PF_REQUIRE_FRESH_BASIS
+# (default OFF). Zero removals.
+# ---------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.9.1"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1628,6 +1642,8 @@ _FIELD_ALIASES = {
                            "engineroi12m", "expectedroipct"),
     "reliability": ("reliabilityscore", "reliability", "rel",
                     "forecastreliability", "forecastreliabilityscore"),
+    # v1.9.1: sheet header "Forecast Source" -> compact "forecastsource".
+    "forecast_source": ("forecastsource", "forecastbasis"),
     "dq": ("dataqualityscore", "dataquality", "dq", "dqscore",
            "dataqualitypct"),
     "risk_level": ("risklevel", "riskbucket", "riskband", "riskcategory"),
@@ -1878,6 +1894,9 @@ def normalize_candidate(row, fx_rates, criteria):
         "roi_pct": roi_pct,
         "ann_roi_pct": ann_roi_pct,
         "engine_roi_12m_pct": _to_float(_field(view, "engine_roi_12m_pct")),
+        # v1.9.1: basis passthrough for portfolio_actions' synthetic-basis
+        # deferral (TFB_PF_REQUIRE_FRESH_BASIS). Always a string; "" absent.
+        "forecast_source": _to_text(_field(view, "forecast_source")) or "",
         "reliability": reliability,
         "dq": dq,
         "risk_level": _norm_risk(_field(view, "risk_level")),
