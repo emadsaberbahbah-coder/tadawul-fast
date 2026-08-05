@@ -2985,7 +2985,7 @@ if str(ROOT_DIR) not in sys.path:
 # GATE: TFB_PF_WEIGHT_FX, default ON (unchanged). =0 restores v5.119 exactly,
 # including the old permissive behaviour. Zero functions removed.
 # =============================================================================
-__version__ = "5.121.0"
+__version__ = "5.122.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -11292,6 +11292,128 @@ def _horizon_roi_fraction(row: Dict[str, Any], roi_key: str, fc_key: str) -> Opt
     return None
 
 
+# ---------------------------------------------------------------------------
+# v5.122.0 (B4) FORECAST PAIR COHERENCE -- env TFB_FORECAST_PAIR_COHERENCE,
+# DEFAULT OFF -> forecast_price_* / expected_roi_* byte-identical to v5.121.0.
+# ---------------------------------------------------------------------------
+# ROOT CAUSE (measured on the live 2026-08-05 exports):
+#
+#     Market_Leaders     54 of  255 rows
+#     Global_Markets    141 of 6,646 rows
+#     ------------------------------------
+#     total            195 rows where Forecast Price 12M and Expected ROI 12M
+#                      DISAGREE by more than 0.6pp; worst gap 7.6pp
+#                      (8210.SR: price 176.30, forecast 215.52 => implied
+#                      +22.25%, but the row publishes +24.72%).
+#
+# The 1M and 3M pairs are exact on all 6,901 rows. The 12M pair is not, and
+# the split is not random: 173 of the 195 are forecast_source=provider_target.
+#
+# WHY: in _phase_ii_quality_forecast the provider-target branch preserves the
+# provider's own forecast_price_12m, then fills the ROI ONLY when it is absent
+#
+#     if row.get("expected_roi_12m") is None:
+#         row["expected_roi_12m"] = round(return_12m, 6)
+#
+# A provider that supplies BOTH a target price and its own 12M return leaves
+# that fill dormant, so the published ROI keeps the provider's number --
+# computed in the PROVIDER's frame, against the provider's reference price at
+# their as-of moment. Our current_price is a different, later number. The pair
+# is internally consistent for the provider and inconsistent on our sheet,
+# where the operator reads both cells next to our price. Confirmed empirically:
+# back-solving the ROI's reference price (forecast / (1 + roi)) matches NONE of
+# current_price, previous_close or open on the mismatched rows (median
+# divergence ~1.0-1.4%) -- it is an off-sheet reference, exactly as expected.
+# The 1M/3M legs escape because providers publish a 12M target, not short
+# horizons, so those fills always fire against OUR current_price.
+#
+# DIRECTION OF THE FIX -- deliberately the PRICE, never the ROI:
+#   * expected_roi_12m IS a gate input (core/analysis/top10_selector.py
+#     resolves the ROI gate through row["expected_roi_12m"]), so recomputing it
+#     would change which candidates qualify -- a MATERIAL change, not
+#     permissible inside the S-1 certification window.
+#   * forecast_price_12m is consumed by NO gate. It appears only in the column
+#     / alias lists of top10_selector and is absent from opportunity_builder
+#     and portfolio_actions entirely -- it is a display field.
+# So the displayed price is re-derived from the ROI the gates actually consume:
+#     forecast_price_h := current_price * (1 + expected_roi_h)
+# The number every gate reads is untouched; the two cells stop contradicting
+# each other. Applied to all three horizons for consistency -- 1M/3M already
+# agree, so they are no-ops in practice and the tolerance skips them.
+#
+# PLACEMENT: first statement of _apply_analyst_trend_block, BEFORE its own
+# early return -- the same seam and the same reasoning v5.111.0 used for
+# _enforce_final_action_invariant: that function is the one guaranteed
+# executor on the factory-end, cache-hit and projection paths, and it runs
+# AFTER the investability gate, so nothing here can feed back into scoring,
+# reliability or the verdict.
+#
+# Adds NO column (schema 115). Fail-open on any missing/absurd input. The tag
+# display_pair_synced is reliability-scan substring-safe: the penalty at
+# _apply_investability_gate fires on "cap" AND one of forecast/target/roi, and
+# a second scan on provider_target AND drop/reject -- this tag contains none of
+# cap / forecast / target / roi / drop / reject, so a repeat gate pass is
+# byte-identical. Idempotent: once aligned, the tolerance short-circuits.
+#
+# Reversible: TFB_FORECAST_PAIR_COHERENCE unset -> v5.121.0 exactly.
+
+# Relative tolerance below which the pair already agrees and nothing is
+# rewritten. expected_roi_* is stored to 6dp and forecast_price_* to 4dp, so
+# pure rounding noise is orders of magnitude under this; the live defect band
+# starts at ~0.6% and runs to 7.6%.
+_FORECAST_PAIR_REL_TOLERANCE = 0.0005
+
+_FORECAST_PAIR_HORIZONS = (
+    ("forecast_price_1m", "expected_roi_1m"),
+    ("forecast_price_3m", "expected_roi_3m"),
+    ("forecast_price_12m", "expected_roi_12m"),
+)
+
+_FORECAST_PAIR_TAG = "display_pair_synced"
+
+
+def _forecast_pair_coherence_enabled() -> bool:
+    """v5.122.0 kill switch. DEFAULT OFF -> v5.121.0 byte-identical."""
+    return _get_env_bool("TFB_FORECAST_PAIR_COHERENCE", False)
+
+
+def _apply_forecast_pair_coherence(row: Dict[str, Any]) -> None:
+    """Re-derive the DISPLAYED forecast price from the ROI the gates consume.
+
+    Display-only by construction: expected_roi_* is never written here, so no
+    gate input moves. Pure, fail-open, idempotent.
+    """
+    if not _forecast_pair_coherence_enabled():
+        return
+    if not isinstance(row, dict):
+        return
+    cp = _as_float(row.get("current_price"))
+    if cp is None or cp <= 0:
+        return
+    touched = False
+    for price_key, roi_key in _FORECAST_PAIR_HORIZONS:
+        roi = _as_float(row.get(roi_key))
+        if roi is None:
+            continue
+        fp = _as_float(row.get(price_key))
+        if fp is None or fp <= 0:
+            # Nothing displayed to contradict the ROI -- the existing
+            # derivation paths own population; this pass never invents a
+            # forecast where none was published.
+            continue
+        implied = cp * (1.0 + roi)
+        if implied <= 0:
+            # A <= -100% ROI would imply a non-positive price. Leave the
+            # published pair alone and let the existing guards speak.
+            continue
+        if abs(implied - fp) <= abs(fp) * _FORECAST_PAIR_REL_TOLERANCE:
+            continue
+        row[price_key] = round(implied, 4)
+        touched = True
+    if touched:
+        _v573_append_warning(row, _FORECAST_PAIR_TAG)
+
+
 def _apply_analyst_trend_block(row: Dict[str, Any]) -> None:
     """v5.85.0 (Fix AD): populate the eight schema-defined presentation columns
     the engine never emitted (Analyst Rating, Target Price, Upside/Downside %,
@@ -11309,6 +11431,13 @@ def _apply_analyst_trend_block(row: Dict[str, Any]) -> None:
     # cache-hit and projection paths, which is exactly why the invariant
     # lives here (see the v5.111.0 WHY).
     _enforce_final_action_invariant(row)
+
+    # v5.122.0 (B4): same reasoning as the invariant above -- this function
+    # is the one guaranteed executor on the factory-end, cache-hit and
+    # projection paths, so the pair alignment rides the same seam and must
+    # NOT sit behind this function's own flag. Env-gated independently;
+    # OFF -> no-op.
+    _apply_forecast_pair_coherence(row)
 
     if not _analyst_trend_block_enabled():
         return
