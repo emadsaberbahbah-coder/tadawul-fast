@@ -371,6 +371,16 @@ jobs:
       # Top_10_Investments is NOT being used as the cockpit, or the sync will clobber
       # it (and your control-panel inputs) every run.
       TFB_SYNC_DECISION_GUARD: "1"
+
+      # ── v6.35.0 [DECISION-FIRST] ─────────────────────────────────────────
+      # My_Portfolio holdings + Top_10_Investments symbols (+ optional
+      # TFB_SYNC_PRIORITY_EXTRA csv) jump to the FRONT of every ranked
+      # market page's worklist, so the per-run time budget and provider
+      # 402/quota exhaustion consume the TAIL — never the tradable set.
+      # Kill: set "0" or delete the line (script default OFF).
+      # Optional: TFB_SYNC_PRIORITY_MAX "150" (clamp 10..1000);
+      #           TFB_SYNC_PRIORITY_EXTRA "SYM1,SYM2".
+      TFB_SYNC_PRIORITY_FETCH: "1"
       # Market-page SYMBOL BATCHING (scripts/run_dashboard_sync.py v6.17.0). ARMED
       # ("25", lowered from 100 — run #2164 showed /v1/analysis still 502'd at 100/
       # batch, so the sync fell back to /v1/advanced which returns 0 rows; a smaller
@@ -1250,6 +1260,16 @@ jobs:
       TFB_SYNC_NAME_DEDUP_MODE: "observe"
       TFB_PORTFOLIO_REBUILD: "1"
       TFB_SYNC_DECISION_GUARD: "1"
+
+      # ── v6.35.0 [DECISION-FIRST] ─────────────────────────────────────────
+      # My_Portfolio holdings + Top_10_Investments symbols (+ optional
+      # TFB_SYNC_PRIORITY_EXTRA csv) jump to the FRONT of every ranked
+      # market page's worklist, so the per-run time budget and provider
+      # 402/quota exhaustion consume the TAIL — never the tradable set.
+      # Kill: set "0" or delete the line (script default OFF).
+      # Optional: TFB_SYNC_PRIORITY_MAX "150" (clamp 10..1000);
+      #           TFB_SYNC_PRIORITY_EXTRA "SYM1,SYM2".
+      TFB_SYNC_PRIORITY_FETCH: "1"
       TFB_SYNC_SYMBOL_BATCH_SIZE: "25"
       # FULL-FILL v1.1.0 (2026-08-04): arm the data-complete criterion + cycle loop.
       # Kill-switches: remove these three lines (or set 0/"1" resp.) to restore the
