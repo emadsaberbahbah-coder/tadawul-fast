@@ -841,7 +841,31 @@ from datetime import datetime, timedelta, timezone
 # unchanged. Consumer: portfolio_actions v1.7.4 TFB_PF_REQUIRE_FRESH_BASIS
 # (default OFF). Zero removals.
 # ---------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.9.1"
+# =============================================================================
+# v1.9.2 (Fix SC — SCAN COVERAGE + UNCAPPED GUARANTEE)  2026-08-06
+# -----------------------------------------------------------------------------
+# ROOT CAUSE (live evidence, Top_10 run 2026-08-06 09:07:44): the cockpit KPI
+# showed Scanned 2,000 of a sheets pool of 9,824 (footer pool=body_rows/9824).
+# kpis["scanned"] = len(audit), and audit is built AFTER
+# rows = rows[:crit["max_candidates"]] — so "scanned" reports the POST-CLAMP
+# count, not the pool. make_criteria precedence is DEFAULTS < env < request
+# overrides; the run's request carried max_candidates=2000, which no Render
+# env value can undo. Consequence proven in the 2026-08-06 morning audit:
+# GM INVEST rows with reliability 86–92 (O39.SI, NA.TO, 8306.T, AROW, OBT,
+# PLBC) were absent from the 300-row audit grid AND from every gate-failure
+# line — never evaluated, not filtered.
+# FIX (both DEFAULT OFF / additive — byte-identical v1.9.1 until enabled):
+#   SC-1  TFB_OPP_SCAN_UNCAPPED=1 forces max_candidates → 0 (unlimited) even
+#         against a request-supplied cap (one INFO line when it fires; the
+#         criteria_snapshot then shows the EFFECTIVE 0).
+#   SC-2  Coverage telemetry, additive kpis on every run: pool_received and
+#         scan_coverage_pct; plus scan_clamped / scan_clamp / pregate_ordered
+#         when a clamp actually cut, and scan_cap_overridden when SC-1 fired.
+#         GAS ignores unknown keys; run_daily_brief reads kpis tolerantly.
+# ZERO-REMOVAL: no function removed; clamp path and PREGATE-ORDER (default
+# ON) untouched when the switch is OFF.
+# =============================================================================
+OPPORTUNITY_BUILDER_VERSION = "1.9.2"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1376,6 +1400,16 @@ def _env_pregate_order():
     byte-for-byte."""
     return str(_env_str("TFB_OPP_PREGATE_ORDER", "1")).strip().lower() \
         not in ("0", "false", "off", "no")
+
+
+def _env_scan_uncapped():
+    """v1.9.2 [SC-1] guarantee switch — DEFAULT OFF (byte-identical v1.9.1).
+    TFB_OPP_SCAN_UNCAPPED=1 forces max_candidates to 0 (unlimited) even when
+    the REQUEST criteria carry a positive cap. Needed because make_criteria
+    precedence is DEFAULTS < env < request, so a GAS-seeded cap (live run
+    2026-08-06: 2,000 of a 9,824-row pool) wins over any Render env value."""
+    return str(_env_str("TFB_OPP_SCAN_UNCAPPED", "0")).strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def _env_canon_market():
@@ -3457,6 +3491,26 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
                                     "TFB_OPP_ENABLED=0", crit))
     rows = list(rows or [])
     pregate_stats = None
+    # v1.9.2 [SC-2]: remember the pool size BEFORE any clamp so coverage can
+    # be stated honestly (kpis["scanned"] counts the post-clamp audit).
+    _pool_received = len(rows)
+    _scan_cap_overridden = False
+    if _env_scan_uncapped() and crit["max_candidates"] > 0:
+        # v1.9.2 [SC-1]: request/env supplied a positive cap; the operator's
+        # guarantee switch restores full-pool coverage. criteria_snapshot in
+        # meta reflects the EFFECTIVE value (0).
+        try:
+            _LOG.info(
+                "[SCAN-UNCAPPED v%s] max_candidates=%d overridden to 0 "
+                "(pool=%d) via TFB_OPP_SCAN_UNCAPPED",
+                OPPORTUNITY_BUILDER_VERSION, crit["max_candidates"],
+                _pool_received)
+        except Exception:
+            pass
+        crit["max_candidates"] = 0
+        _scan_cap_overridden = True
+    _scan_clamped = (crit["max_candidates"] > 0
+                     and _pool_received > crit["max_candidates"])
     if crit["max_candidates"] > 0:
         # v1.6.0 [PREGATE-ORDER]: the clamp is about to discard everything
         # past max_candidates, so make the kept slice the QUALITY slice,
@@ -3654,7 +3708,17 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
         "scanned": len(audit),
         "passed": len(invest),
         "capital_unallocated_sar": round(deployable - total_suggested, 0),
+        # v1.9.2 [SC-2] additive coverage keys (absent-key-safe consumers).
+        "pool_received": _pool_received,
+        "scan_coverage_pct": (round(100.0 * len(audit) / _pool_received, 1)
+                              if _pool_received else 100.0),
     }
+    if _scan_clamped:
+        kpis["scan_clamped"] = True
+        kpis["scan_clamp"] = int(crit["max_candidates"])
+        kpis["pregate_ordered"] = pregate_stats is not None
+    if _scan_cap_overridden:
+        kpis["scan_cap_overridden"] = True
     # v1.6.0 [PREGATE-ORDER]: full-pool funnel telemetry. Additive key,
     # absent whenever the reorder did not run, so every v1.5.0 consumer
     # sees an unchanged kpis dict on the OFF/no-cut paths.
