@@ -865,7 +865,59 @@ from datetime import datetime, timedelta, timezone
 # ZERO-REMOVAL: no function removed; clamp path and PREGATE-ORDER (default
 # ON) untouched when the switch is OFF.
 # =============================================================================
-OPPORTUNITY_BUILDER_VERSION = "1.9.2"
+# ---------------------------------------------------------------------------
+# v1.10.0 — [FORECAST-PROVENANCE GATE]
+# ---------------------------------------------------------------------------
+# EVIDENCE (workbook export 2026-08-06 14:17 board vs 14:18-14:28 sync leg,
+# adjudicated the same day). The board is built on forecast values that
+# EVAPORATE minutes later. Same symbols, board value -> post-leg row value:
+#   F34.SI  (selected #1)  rel 86.8 / ROI 34.7%  ->  rel 52.9 / 9.4%  HOLD
+#   6592.T  (selected)     rel 80.9 / ROI 35.0%  ->  rel 52.9 / 12.3% HOLD
+#   3401.T  (the one sized executable ticket, 20,890 SAR)
+#                          rel 84.3 / ROI 35.0%  ->  rel 53.0 / 13.2% HOLD
+#   2503.T                 rel 87.6              ->  rel 53.2        HOLD
+#   DDI.US                 rel 70.4              ->  rel 31.3        SELL
+#   0083.HK                rel 76.5              ->  rel 31.3        SELL
+# Every one of those rows carries Forecast Source = "phase_ii_synthetic"
+# after the leg. The rows written BEFORE the run and still matching the
+# board (CHDRAUIB.MX rel 70.4 @12:58, SON.LS rel 89.5 @14:05) carry
+# "provider_target". Universe-wide the split is 3,801 synthetic vs 2,210
+# provider-backed on Global_Markets (151/104 on Market_Leaders) — 63% of
+# the pool is a synthesized forecast wearing a reliability score.
+# CONSEQUENCE: the raw selection churns every leg, all ten incumbents fall
+# to GRACE, and the board cannot converge — the empty board of 2026-08-06
+# is a SYMPTOM of this, not a stability-layer defect.
+# REJECTED APPROACH: value-fingerprint matching on {70.4, 71.5, 75.4, 76.5}
+# (the original B4 sketch). The same export DISPROVES it — CHDRAUIB.MX
+# carries 70.4 with a genuine provider_target, so fingerprinting would
+# have produced false positives on real forecasts. Provenance is the only
+# sound discriminator, and the field is already captured (v1.9.1, the
+# "forecast_source" alias in normalize_candidate) but was never gated.
+# FIX: a "Forecast Provenance" MAJOR gate — a candidate whose
+# forecast_source is a synthesized token (default "phase_ii_synthetic";
+# tune via TFB_T10_SYNTHETIC_SOURCES) fails MAJOR => DO_NOT_INVEST: it
+# still appears in the audit grid and near-miss surface with its true
+# blocking gate, but can never be sized. BLANK / UNKNOWN PASSES —
+# fail-open, matching the Investability and Sell-Class convention: a
+# missing provenance column must never empty the board.
+# GATE PLACEMENT: appended immediately after "Forecast" (both concern the
+# engine forecast) and registered at that TRUE position in GATE_ORDER —
+# the v1.0.7 lesson, so first_failed_gate attributes the near-miss and the
+# DATA GAPS blocking-gate table correctly instead of sorting it to 99.
+# ENV STYLE: read directly at gate time (the v1.4.0 Quote Freshness
+# precedent) rather than through criteria — the token list is non-scalar
+# and the criteria coercion tuples stay untouched.
+# GATE DEFAULT: **OFF**. This gate CHANGES recommendations, and the S-1
+# certification window (closes 2026-08-16) forbids silent alteration of
+# recommendations/tickets/shadow-board evidence. TFB_T10_EXCLUDE_DEFAULT_CONF
+# unset/0 => v1.9.2 gate list, verdicts and tickets byte-for-byte. The
+# operator arms it deliberately. (The default-armed rule for guards is
+# deliberately NOT applied here: an armed selection-changing gate would
+# restart the 28-day evidence clock.)
+# ZERO functions removed. Additions: _env_forecast_provenance_gate,
+# _env_synthetic_source_tokens, _forecast_provenance_assessment.
+# ---------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.10.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1129,7 +1181,11 @@ DIVERSIFICATION_NO_CONTEXT = 60.0
 # §4.2 gate evaluation order (first fail in this order = headline failed_gate)
 GATE_ORDER = (
     "Price", "FX", "Valuation", "ROI", "Annualized ROI", "Valuation Sanity",
-    "Forecast", "Reliability", "Data Quality", "Data Trust",
+    "Forecast",
+    # v1.10.0: appended immediately after "Forecast" in evaluate_gates —
+    # registered here at its TRUE position (the v1.0.7 GATE_ORDER lesson).
+    "Forecast Provenance",
+    "Reliability", "Data Quality", "Data Trust",
     # v1.9.0: the v1.0.7 lesson COMPLETED — these four have appended between
     # Data Trust and Investability since v1.0.6/v1.5.0/v1.8.0 but were never
     # added here, so first_failed_gate sorted them to 99 and could
@@ -1210,6 +1266,44 @@ def _env_int(name, default):
 def _env_enabled():
     return str(_env_str("TFB_OPP_ENABLED", "1")).strip().lower() not in (
         "0", "false", "no", "off")
+
+
+_DEFAULT_SYNTHETIC_SOURCES = ("phase_ii_synthetic",)
+
+
+def _env_forecast_provenance_gate():
+    """v1.10.0 [FORECAST-PROVENANCE GATE] kill-switch — DEFAULT OFF.
+    TFB_T10_EXCLUDE_DEFAULT_CONF=1 arms the gate; unset/0 restores the
+    v1.9.2 gate list, verdicts and tickets byte-for-byte (S-1 window law
+    — see the header WHY block)."""
+    return str(_env_str("TFB_T10_EXCLUDE_DEFAULT_CONF", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _env_synthetic_source_tokens():
+    """v1.10.0: the forecast_source tokens treated as SYNTHESIZED, as a
+    normalized frozenset. Operator-tunable via TFB_T10_SYNTHETIC_SOURCES
+    (csv; ';' accepted as ','), so a new engine fallback token can be
+    covered without a code change. Empty/blank env => the default set."""
+    raw = str(_env_str("TFB_T10_SYNTHETIC_SOURCES", "") or "").replace(";", ",")
+    toks = [_norm_token(t) for t in raw.split(",") if str(t).strip()]
+    toks = [t for t in toks if t]
+    if not toks:
+        toks = [_norm_token(t) for t in _DEFAULT_SYNTHETIC_SOURCES]
+    return frozenset(toks)
+
+
+def _forecast_provenance_assessment(cand):
+    """v1.10.0: (ok, current_text) for the Forecast Provenance gate.
+    ok=False only when the candidate's forecast_source normalizes to a
+    token in the synthesized set. BLANK / UNKNOWN / provider-backed all
+    PASS — fail-open by design (header WHY): a missing provenance column
+    must never empty the board."""
+    raw = _to_text((cand or {}).get("forecast_source")) or ""
+    norm = _norm_token(raw)
+    if not norm:
+        return True, "Unknown"
+    return (norm not in _env_synthetic_source_tokens()), raw
 
 
 def _env_forecast_gate():
@@ -2489,6 +2583,17 @@ def evaluate_gates(cand, criteria, held_symbols=None):
             "Forecast", fcst_ok, FAIL_MAJOR,
             ("Unknown" if fcst_pct is None else _round1(fcst_pct)),
             ">= " + _fmt_num(fcst_floor) + "% engine 12M (Unknown passes)"))
+
+    # v1.10.0 [FORECAST-PROVENANCE GATE]: a synthesized forecast must never
+    # be sized as a ticket (header WHY — the 2026-08-06 board evaporation).
+    # Appended ONLY when armed, so the gate list and every verdict are
+    # byte-identical to v1.9.2 while TFB_T10_EXCLUDE_DEFAULT_CONF is unset.
+    if _env_forecast_provenance_gate():
+        _pv_ok, _pv_cur = _forecast_provenance_assessment(cand)
+        g.append(_gate(
+            "Forecast Provenance", _pv_ok, FAIL_MAJOR, _pv_cur,
+            "provider-backed forecast (synthesized basis blocked; "
+            "blank/Unknown passes)"))
 
     rel = cand["reliability"]
     min_rel = criteria["min_reliability"]
