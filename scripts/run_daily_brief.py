@@ -476,7 +476,37 @@ from __future__ import annotations
 #       ticket from tonight's brief onward. Fix: tag-tolerant detection
 #       (INVEST anywhere in the note's first 60 chars; grace/exit notes
 #       carry no INVEST and remain excluded).
-__version__ = "1.16.0"
+# ---------------------------------------------------------------------------
+# v1.17.0 — [UNIT-COHERENCE] + [CAND-EARNINGS-GUARD]
+# ---------------------------------------------------------------------------
+# EVIDENCE (2026-08-06 13:06 sent brief, adjudicated same day):
+# (D1) Every Best-new-buys outlook strip and fundamentals chip was wrong by
+#   exactly 100x: Kirin 12M printed "+0.3%" while its own printed targets
+#   (3,938.81 vs now 2,927.00) imply +34.6%; 8309.T "profit margin 0.2%"
+#   is ~20%; "Div yield 0.0%" hid real yields. Root cause is ROW-level:
+#   some Global_Markets rows (Tokyo names) carry Expected ROI 1M/3M/12M,
+#   Dividend Yield and Profit Margin as FRACTIONS while the schema
+#   convention (and _pct's v1.6.0 POINTS contract) is percent-points.
+#   The v1.6.0 lesson BANS magnitude guessing — so the fix uses same-row
+#   PRICE COHERENCE instead: when Forecast Price and price exist, the true
+#   outlook is (fp/price-1)*100 (unit-independent) and ALWAYS wins; a sheet
+#   roi that matches true/100 is hard evidence of a fraction row, and only
+#   then are that row's divy/margin values <=1.5 rescaled x100. Gate:
+#   TFB_BRIEF_UNIT_COHERENCE, DEFAULT ON (guards default-armed — the
+#   registered default-OFF-guard lesson); =0 restores v1.16.0 exactly.
+# (D2) The same brief promoted 2503.T Kirin to #1 with a full ticket while
+#   the cockpit's own board note carried "⚠ earnings ≤1d" — the earnings
+#   machinery (v1.11.0/v1.14.0) was wired to ADD/VERIFY/EXIT/TRIM cards but
+#   never to Best-new-buys. FIX: candidates reporting inside
+#   TFB_BRIEF_EARNINGS_FLAG_DAYS (note-prefix days first, Calendar_Events
+#   fallback) are HELD BACK from the ranked cards and listed in one factual
+#   line on all three surfaces (HTML/PDF/text). Gate:
+#   TFB_BRIEF_CANDIDATE_EARNINGS_GUARD, DEFAULT ON; =0 restores v1.16.0.
+# ZERO functions removed. Additions: _unit_coherence_enabled,
+# _fix_metrics_units, _candidate_earnings_guard_enabled, _note_earn_days,
+# _filter_candidates_earnings, _earnings_held_line.
+# ---------------------------------------------------------------------------
+__version__ = "1.17.0"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
 # =========================================================================
@@ -1152,6 +1182,136 @@ def _rulebook_blocked(sym: str) -> Optional[str]:
     return None
 
 
+_UNIT_COHERENCE_TAG = "[UNIT-COHERENCE v1.17.0]"
+_CAND_EARN_TAG = "[CAND-EARNINGS-GUARD v1.17.0]"
+_EARN_NOTE_RE = re.compile(r"earnings\s*(?:\u2264|<=|<)\s*(\d+)\s*d", re.IGNORECASE)
+
+
+def _unit_coherence_enabled() -> bool:
+    """v1.17.0 guard — DEFAULT ON; =0 restores v1.16.0 byte-identically."""
+    return (os.getenv("TFB_BRIEF_UNIT_COHERENCE") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _candidate_earnings_guard_enabled() -> bool:
+    """v1.17.0 guard — DEFAULT ON; =0 restores v1.16.0 byte-identically."""
+    return (os.getenv("TFB_BRIEF_CANDIDATE_EARNINGS_GUARD") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _fix_metrics_units(metrics: Dict[str, Dict[str, Any]]) -> int:
+    """v1.17.0 (D1): same-row PRICE-COHERENCE unit repair. NOT a magnitude
+    heuristic (banned since v1.6.0). For each horizon with price+forecast
+    price present the true outlook is (fp/price-1)*100 and always replaces
+    the sheet roi; sheet roi ~= true/100 is hard evidence of a fraction
+    row, and only then are that row's divy/margin values <=1.5 rescaled
+    x100. Mutates in place; returns number of rows touched."""
+    fixed = 0
+    for sym, m in (metrics or {}).items():
+        if not isinstance(m, dict):
+            continue
+        price = m.get("price")
+        try:
+            price = float(price) if price is not None else None
+        except Exception:
+            price = None
+        if not price:
+            continue
+        row_fraction = False
+        row_touched = False
+        for rk, fk in (("roi1m", "fp1m"), ("roi3m", "fp3m"), ("roi12m", "fp12m")):
+            fp = m.get(fk)
+            try:
+                fp = float(fp) if fp is not None else None
+            except Exception:
+                fp = None
+            if fp is None or fp <= 0:
+                continue
+            true_pct = (fp / price - 1.0) * 100.0
+            roi = m.get(rk)
+            try:
+                roi = float(roi) if roi is not None else None
+            except Exception:
+                roi = None
+            if roi is not None and abs(roi - true_pct / 100.0) <= max(0.05, abs(true_pct) * 0.002):
+                row_fraction = True
+            if roi is None or abs(roi - true_pct) > 0.05:
+                m[rk] = true_pct
+                row_touched = True
+        if row_fraction:
+            for k in ("divy", "margin"):
+                v = m.get(k)
+                try:
+                    v = float(v) if v is not None else None
+                except Exception:
+                    v = None
+                if v is not None and abs(v) <= 1.5:
+                    m[k] = v * 100.0
+                    row_touched = True
+        if row_touched:
+            fixed += 1
+    return fixed
+
+
+def _note_earn_days(note: Any) -> Optional[int]:
+    """v1.17.0 (D2): days from the sheet note's own '⚠ earnings ≤Nd' prefix."""
+    try:
+        mt = _EARN_NOTE_RE.search(str(note or ""))
+        return int(mt.group(1)) if mt else None
+    except Exception:
+        return None
+
+
+def _filter_candidates_earnings(top10: Dict[str, Any],
+                                calendar: Dict[str, Dict[str, Any]],
+                                when: _dt.datetime):
+    """v1.17.0 (D2): hold back candidates reporting inside the earnings
+    window (note-prefix days first, Calendar_Events fallback via the SAME
+    _earnings_flag_for the action cards use). Returns (top10, held) where
+    held is [{'symbol','days'}]; guard-off callers never reach here."""
+    win = _earnings_flag_days()
+    if win <= 0 or not top10:
+        return top10, []
+    held: List[Dict[str, Any]] = []
+
+    def _keep(p: Dict[str, Any]) -> bool:
+        days = _note_earn_days(p.get("note"))
+        if days is None and _earnings_flag_for(p.get("symbol") or "", calendar, when):
+            days = -1  # inside window, exact day unknown
+        if days is not None and days <= win:
+            held.append({"symbol": p.get("symbol"), "days": days})
+            return False
+        return True
+
+    top10 = dict(top10)
+    top10["top"] = [p for p in (top10.get("top") or []) if _keep(p)]
+    rest = {}
+    for mkt, plist in (top10.get("rest") or {}).items():
+        kept = [p for p in plist if _keep(p)]
+        if kept:
+            rest[mkt] = kept
+    top10["rest"] = rest
+    if held:
+        top10["earnings_held"] = held
+    return top10, held
+
+
+def _earnings_held_line(model: Dict[str, Any]) -> str:
+    """v1.17.0 (D2): one factual sentence for all three surfaces."""
+    held = ((model.get("top10") or {}).get("earnings_held")) or []
+    if not held:
+        return ""
+    win = _earnings_flag_days()
+    parts = []
+    for h in held:
+        d = h.get("days")
+        parts.append("%s (%s)" % (h.get("symbol"),
+                                  ("\u2264%dd" % win) if (d is None or d < 0) else ("%dd" % int(d))))
+    return ("%d candidate(s) held back — earnings within %dd: %s. "
+            "They re-enter automatically after reporting."
+            % (len(held), win, ", ".join(parts)))
+
+
 def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
                   top_n: int = 5) -> Dict[str, Any]:
     """Parse Top_10_Investments funded picks (Advisor Note starts with INVEST)."""
@@ -1200,6 +1360,10 @@ def extract_top10(rows: List[List[Any]], exclude: Optional[set] = None,
             "entry": _s(_cell(r, ci["entry"])),           # v1.16.0 [L]
             "stop": _num(_cell(r, ci["stop"])),
             "tp1": _num(_cell(r, ci["tp1"])),
+            # v1.17.0 (D2): carry the raw note + its earnings-prefix days so
+            # the candidate guard can act on the sheet's own warning.
+            "note": note,
+            "earn_days": _note_earn_days(note),
         })
     top = picks[:top_n]
     rest: Dict[str, List[Dict[str, Any]]] = {}
@@ -1639,6 +1803,12 @@ def _ticket_flags_html(sym: str, model: Dict[str, Any],
 def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     decision = extract_decision(pages_data.get(PAGE_DECISION, []))
     metrics = extract_symbol_metrics(pages_data)  # v1.3.0 visual sections
+    # v1.17.0 (D1) [UNIT-COHERENCE]: price-anchored unit repair — see WHY.
+    if _unit_coherence_enabled():
+        _n_units = _fix_metrics_units(metrics)
+        if _n_units:
+            log.info("%s normalized %d metric row(s) via price coherence",
+                     _UNIT_COHERENCE_TAG, _n_units)
     # v1.10.0 (BR-1): send-time coherence guard — demote ADD/EXIT recs whose
     # decision-layer signal disagrees with the freshest per-symbol reading.
     _apply_signal_coherence(decision, metrics)
@@ -1647,6 +1817,15 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     market = {p: extract_market_page(pages_data.get(p, [])) for p in MARKET_PAGES}
     # v1.11.0 (E1): earnings-proximity source.
     calendar = _extract_calendar(pages_data.get(PAGE_CALENDAR, []))
+    # v1.17.0 (D2) [CAND-EARNINGS-GUARD]: Best-new-buys inherit the same
+    # earnings discipline the action cards have carried since v1.11.0.
+    if _candidate_earnings_guard_enabled():
+        top10, _earn_held = _filter_candidates_earnings(
+            top10, calendar, _dt.datetime.now())
+        if _earn_held:
+            log.info("%s held back %d candidate(s): %s", _CAND_EARN_TAG,
+                     len(_earn_held),
+                     ", ".join(str(h.get("symbol")) for h in _earn_held))
     # v1.14.0 (F1): the builder's own funnel numbers off the Top_10 sheet.
     funnel = _extract_top10_funnel(pages_data.get(PAGE_TOP10, []))
     # v1.15.0: shadow rotation top pairs off Shadow_Board.
@@ -2190,6 +2369,7 @@ def render_html(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
   <tr><td style="padding:10px 32px 0 32px;">
     <div style="font-family:{SANS}; font-size:12px; color:#555; line-height:1.6; margin-bottom:10px;">Ranked entry candidates you <strong>don't hold</strong>, screened across <strong>all your markets</strong>. The figure is the gap to estimated <strong>fair value — a valuation target, not a prediction</strong>; reliability and confidence show how much weight to give each. The 1M&nbsp;/&nbsp;3M&nbsp;/&nbsp;12M strip under each name is the engine's valuation path with its stated reliability — <strong>targets, not predictions</strong>. Full entry/stop/target levels are in your Top&nbsp;10 sheet.</div>
     {funnel_html}{opp_rows}{rest_block}
+    {('<div style="font-family:' + SANS + '; font-size:11px; color:#B26B00; line-height:1.6; padding:8px 2px 0 2px;">&#9888;&#65039; ' + _esc(_earnings_held_line(model)) + '</div>') if _earnings_held_line(model) else ''}
     <div style="font-family:{SANS}; font-size:11px; color:#A09B90; line-height:1.6; padding:8px 2px 0 2px; font-style:italic;">Live brief refreshes the full cross-market list each morning and always excludes names you hold.</div>
   </td></tr>
 {_shadow_rotation_html(model)}
@@ -2711,6 +2891,10 @@ def render_pdf(model: Dict[str, Any], owner: str, when: _dt.datetime) -> Optiona
         story.append(Paragraph("Ranked entry candidates you do not hold. The figure is the gap to "
                                "estimated fair value - a valuation target, not a prediction; "
                                "reliability and confidence show how much weight to give each.", st_note))
+        # v1.17.0 (D2): earnings-held note.
+        _ehl = _earnings_held_line(model)
+        if _ehl:
+            story.append(Paragraph("!! " + _ehl, st_note))
         # v1.9.0: FV saturation judged once over everything listed here.
         _pdf_all = list(t["top"]) + [p for names in (t.get("rest") or {}).values()
                                      for p in names]
@@ -2898,6 +3082,10 @@ def render_text(model: Dict[str, Any], owner: str, when: _dt.datetime) -> str:
     if t["top"]:
         _sat_t = _fv_saturation(list(t["top"]))
         lines += ["", "BEST NEW BUYS (to fair value; a target, not a forecast):"]
+        # v1.17.0 (D2): earnings-held note on the text surface too.
+        _ehl_t = _earnings_held_line(model)
+        if _ehl_t:
+            lines.append("  !! " + _ehl_t)
         if _sat_t is not None:
             lines.append("  (>= marks the display ceiling - the gap is at least the shown figure)")
         _mx2 = model.get("metrics", {}) or {}
