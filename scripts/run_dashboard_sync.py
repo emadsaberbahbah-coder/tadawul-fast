@@ -1401,7 +1401,31 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # -> v6.25.2 census verbatim. A wrongly-blanked row still soft-lands via
 # v6.25.1 FW-KEEP last-good restore on the following merge.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.34.0"
+# --------------------------------------------------------------------------
+# v6.35.0 — [DECISION-FIRST] CROSS-PAGE DECISION-SYMBOL PRIORITY
+# --------------------------------------------------------------------------
+# EVIDENCE (2026-08-06 Top_10 audit, exports __10_/__12_): 6 of 10 board
+# rows GRACE-held on stale quotes while the overnight legs spent their
+# budget on Global_Markets tail rows; the operator's holdings and board
+# symbols sit inside a 6,646-row staleness queue with NO cross-page rank.
+# OLDEST-FIRST (v6.27.0) is fair across the page; decision symbols need it
+# to be UNFAIR in their favor — a 402/quota day must starve the tail, never
+# the tradable set. FIX: when TFB_SYNC_PRIORITY_FETCH=1, the union of
+# My_Portfolio holdings + Top_10_Investments symbols (+ optional
+# TFB_SYNC_PRIORITY_EXTRA csv, capped by TFB_SYNC_PRIORITY_MAX, default
+# 150) is stably partitioned to the FRONT of every ranked market page's
+# worklist AFTER the oldest-first sort (promoted symbols keep stalest-first
+# order among themselves). Read cost: <=2 bounded reads per source page,
+# memoized once per run; ANY read failure => feature inert for the run.
+# The 00:00Z leg (cron 0 */4) lands right after the EODHD budget reset, so
+# with priority ON that leg heals decision symbols first — no separate
+# retry subsystem needed. Kill: TFB_SYNC_PRIORITY_FETCH unset/0 (DEFAULT)
+# restores the v6.34.0 worklist byte-identically. ZERO functions removed;
+# additions: _priority_fetch_enabled, _priority_fetch_max,
+# _priority_extra_symbols, _page_symbol_column, _decision_priority_symbols,
+# _apply_decision_first.
+# --------------------------------------------------------------------------
+SCRIPT_VERSION = "6.35.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -5683,6 +5707,124 @@ def _page_newest_stamp_age_h(sheets: Any, spreadsheet_id: str,
 _OLDEST_FIRST_TAG = "[OLDEST-FIRST v6.27.0]"
 
 
+_DECISION_FIRST_TAG = "[DECISION-FIRST v6.35.0]"
+_DECISION_SOURCE_PAGES = ("My_Portfolio", "Top_10_Investments")
+_PRIORITY_SET_CACHE = {}
+
+
+def _priority_fetch_enabled() -> bool:
+    """v6.35.0 kill-switch — DEFAULT OFF (v6.34.0 byte-identical).
+    TFB_SYNC_PRIORITY_FETCH=1 promotes decision symbols to the front of
+    every ranked market page's worklist (see header WHY block)."""
+    raw = (os.getenv("TFB_SYNC_PRIORITY_FETCH", "0") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _priority_fetch_max() -> int:
+    """v6.35.0: hard cap on the priority set (TFB_SYNC_PRIORITY_MAX,
+    default 150, clamped 10..1000) so a corrupted source page can never
+    promote a whole universe to the head of the queue."""
+    try:
+        v = int(float((os.getenv("TFB_SYNC_PRIORITY_MAX", "150") or "150").strip()))
+    except Exception:
+        v = 150
+    return max(10, min(1000, v))
+
+
+def _priority_extra_symbols():
+    """v6.35.0: operator-supplied csv (TFB_SYNC_PRIORITY_EXTRA), normalized
+    UPPER, ';' accepted as ',' — same tolerance as the force-refetch parser."""
+    raw = (os.getenv("TFB_SYNC_PRIORITY_EXTRA", "") or "").replace(";", ",")
+    return [t.strip().upper() for t in raw.split(",") if t.strip()]
+
+
+def _page_symbol_column(sheets, spreadsheet_id, sheet_name):
+    """v6.35.0: non-blank normalized Symbol column of `sheet_name` via one
+    bounded header scan + ONE single-column read (the _page_symbol_stamps
+    scan family, but stamp-optional — Top_10_Investments carries no Last
+    Updated column and must still contribute). Returns None on ANY failure:
+    an unreadable source page must never reorder anything."""
+    try:
+        if sheets is None:
+            return None
+        head = sheets.read_values(spreadsheet_id, sheet_name, "A1:EZ45")
+        if not head:
+            return None
+        hdr_row = -1
+        sym_idx = -1
+        for ri, row in enumerate(head):
+            low = [str(c or "").strip().lower() for c in (row or [])]
+            if "symbol" in low:
+                hdr_row = ri
+                sym_idx = low.index("symbol")
+                break
+        if hdr_row < 0 or sym_idx < 0:
+            return None
+        s_col = _col_idx_to_a1(sym_idx)
+        first = hdr_row + 2
+        vals = sheets.read_values(
+            spreadsheet_id, sheet_name, "%s%d:%s" % (s_col, first, s_col))
+        if not vals:
+            return None
+        out = []
+        seen = set()
+        for r in vals:
+            raw = r[0] if (r and len(r)) else ""
+            sym = str(raw or "").strip().upper()
+            if not sym or sym in ("SYMBOL", "TICKER") or sym in seen:
+                continue
+            seen.add(sym)
+            out.append(sym)
+        return out or None
+    except Exception:
+        return None
+
+
+def _decision_priority_symbols(sheets, spreadsheet_id):
+    """v6.35.0: memoized-per-run union of decision symbols from
+    _DECISION_SOURCE_PAGES plus TFB_SYNC_PRIORITY_EXTRA, capped by
+    _priority_fetch_max(). A source page that fails to read contributes
+    nothing; empty union => None => feature inert for this run."""
+    key = str(spreadsheet_id or "")
+    if key in _PRIORITY_SET_CACHE:
+        return _PRIORITY_SET_CACHE[key]
+    merged = []
+    seen = set()
+    for page in _DECISION_SOURCE_PAGES:
+        col = _page_symbol_column(sheets, spreadsheet_id, page)
+        for sym in (col or []):
+            if sym not in seen:
+                seen.add(sym)
+                merged.append(sym)
+    for sym in _priority_extra_symbols():
+        if sym and sym not in seen:
+            seen.add(sym)
+            merged.append(sym)
+    cap = _priority_fetch_max()
+    result = frozenset(merged[:cap]) if merged else None
+    _PRIORITY_SET_CACHE[key] = result
+    return result
+
+
+def _apply_decision_first(symbols, priority_set):
+    """v6.35.0: STABLE partition — symbols in `priority_set` first (keeping
+    their relative order, i.e. stalest-first among themselves after
+    OLDEST-FIRST), everything else after in unchanged order. Returns
+    (reordered_list, promoted_count); promoted_count==0 => list unchanged."""
+    if not symbols or not priority_set:
+        return symbols, 0
+    front = []
+    rest = []
+    for sym in symbols:
+        if str(sym or "").strip().upper() in priority_set:
+            front.append(sym)
+        else:
+            rest.append(sym)
+    if not front:
+        return symbols, 0
+    return front + rest, len(front)
+
+
 def _oldest_first_enabled() -> bool:
     """v6.27.0 kill-switch — DEFAULT ON. TFB_SYNC_OLDEST_FIRST=0 restores
     the sheet-order worklist byte-identically."""
@@ -5952,6 +6094,27 @@ async def _run_one_task(
                                 len(symbols), _n_uns)
                         except Exception:
                             pass
+                # v6.35.0 [DECISION-FIRST]: the operator's tradable set must
+                # never wait behind the tail (header WHY). Applied AFTER the
+                # oldest-first sort so promoted symbols keep stalest-first
+                # order among themselves; ahead of never-stamped stubs by
+                # design — decision freshness beats stub repair by minutes.
+                if (_priority_fetch_enabled()
+                        and task.sheet_name in _RANKED_MARKET_PAGES):
+                    _pri_set = _decision_priority_symbols(
+                        sheets, spreadsheet_id)
+                    if _pri_set:
+                        symbols, _n_moved = _apply_decision_first(
+                            symbols, _pri_set)
+                        if _n_moved:
+                            try:
+                                logger.info(
+                                    "%s %s: prioritized %d decision "
+                                    "symbol(s) of %d",
+                                    _DECISION_FIRST_TAG, task.sheet_name,
+                                    _n_moved, len(symbols))
+                            except Exception:
+                                pass
             elif _readback_empty_guard_enabled() and task.expects_rows:
                 # v6.22.2 L4a [READBACK-EMPTY-GUARD]: the sheet IS this page's
                 # symbol source; ZERO usable symbols after a retry means the
