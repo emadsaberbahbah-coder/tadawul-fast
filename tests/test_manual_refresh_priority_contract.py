@@ -194,6 +194,30 @@ class ManualRefreshPriorityContractTests(unittest.TestCase):
         self.assertIn("tfbLogCleanupFailure_('remove-deferred-trigger'", text)
         self.assertIn("tfbLogCleanupFailure_('schedule-automatic-resume'", text)
 
+    def test_manual_handler_receives_executable_lease_and_continues_checkpoint(self) -> None:
+        self.assertIn("function tfbManualLeaseContext_(requestId)", self.source)
+        self.assertIn("function tfbManualHandlerNeedsContinuation_(result)", self.source)
+
+        execute = self.function_body(
+            "tfbExecuteManualHandler_(sourceLabel, configured, requestId)"
+        )
+        self.assertIn("var leaseContext = tfbManualLeaseContext_(requestId);", execute)
+        self.assertIn("configured.fn(leaseContext)", execute)
+        self.assertIn("tfbManualHandlerNeedsContinuation_(result)", execute)
+        self.assertIn("leaseContext.renew(", execute)
+        self.assertIn("tfbScheduleDeferredManual_()", execute)
+        self.assertIn("keepPauseForContinuation = true", execute)
+        self.assertIn("manual-cleanup-kept-for-continuation", execute)
+
+        deferred = self.function_body("tfbManualRefreshDeferred_()")
+        remove_at = deferred.index("tfbRemoveOwnDeferredTrigger_();")
+        read_at = deferred.index("var pause = tfbReadManualPause_();")
+        execute_at = deferred.index("tfbExecuteManualHandler_('deferred'", read_at)
+        self.assertLess(remove_at, read_at)
+        self.assertLess(read_at, execute_at)
+        self.assertNotIn("tfbClaimManualPause_('deferred-request')", deferred)
+        self.assertIn("manual-deferred-expired", deferred)
+
     def test_failed_deferred_schedule_clears_only_owned_request(self) -> None:
         text = self.function_body(
             "tfbExecuteManualHandler_(sourceLabel, configured, requestId)"
