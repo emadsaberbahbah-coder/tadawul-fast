@@ -2,8 +2,38 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.117.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.122.0
 ================================================================================
+
+WHY v5.122.0 - WARNING-CLASS TRUST DEMOTION (CG-5; default OFF, arm post-window)
+--------------------------------------------------------------------------
+Live evidence (2026-08-01 portfolio run): all four US holdings carried
+`fetch_failed:HTTP 402; provider_unhealthy:eodhd` in Warnings while
+data_quality_score printed 100.0 and trust_level stayed non-LOW - a fully
+COMPLETE row (hydrated via the yahoo_chart fallback) that was materially
+DEGRADED, and nothing on the decision surface said so. DQ is definitionally
+a COMPLETENESS metric and feeds the reliability blend (0.7*conf + 0.3*DQ);
+overloading it would corrupt its calibration history - DQ is untouched
+here, byte-for-byte. The designed sink is trust_level (v5.88.0 banding,
+LOW-only-demotes; v5.90.0 carries it through projection).
+SEAM: the providers write these tags as DATA (`fetch_failed:*`,
+`provider_unhealthy*` built in the provider result warnings lists) and they
+arrive on the enriched row's warnings; the literal strings never appear in
+this file's source, which is why a source grep alone mislocates the seam.
+_apply_warning_class_trust(row) runs INSIDE the trust master block,
+immediately after banding + the low_data_trust tag: if
+TFB_TRUST_WARNING_CLASSES is armed and row["warnings"] (string or list
+form, same tolerance as _v573_append_warning) contains any of
+`fetch_failed:` / `provider_unhealthy` / `identity_quarantined` /
+`fund_identity_quarantined`, a non-LOW trust_level is demoted to LOW and
+the row is tagged `low_trust_warning_class`. DEMOTE-ONLY: never upgrades,
+never invents trust when the master switch is off or banding wrote none,
+idempotent, and adds no schema column. The structured conflict FIELDS
+(provider_engine_conflict / conflict_type / xprovider_price_conflict) are
+deliberately excluded - they are separate columns with their own
+consumers, not warning classes. Flag TFB_TRUST_WARNING_CLASSES, DEFAULT
+OFF -> output byte-identical to v5.121.0 (suite-proven). OPERATOR ENV:
+Render scope; arm after 2026-08-16 alongside the post-window list.
 
 WHY v5.117.0 - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY (Fix AZ)
 --------------------------------------------------------------------------
@@ -4885,6 +4915,58 @@ def _trust_dq_low() -> float:
     return v if v < _trust_dq_high() else _TRUST_DQ_LOW_DEFAULT
 
 
+_TRUST_WARNING_CLASS_TAG = "low_trust_warning_class"
+_TRUST_WARNING_CLASS_MARKERS = (
+    "fetch_failed:",
+    "provider_unhealthy",
+    "identity_quarantined",
+    "fund_identity_quarantined",
+)
+
+
+def _trust_warning_classes_enabled() -> bool:
+    """v5.122.0 CG-5 arming switch - DEFAULT OFF (byte-identical output).
+    Set TFB_TRUST_WARNING_CLASSES=1 (Render) after 2026-08-16 to demote
+    trust_level to LOW on rows whose warnings carry a critical class."""
+    return (os.getenv("TFB_TRUST_WARNING_CLASSES") or "0").strip().lower() \
+        in {"1", "true", "yes", "on"}
+
+
+def _warning_class_hit(row: Dict[str, Any]) -> str:
+    """v5.122.0: first critical warning-class marker present in
+    row['warnings'] (string or list form, same tolerance as
+    _v573_append_warning); empty string when none."""
+    raw = row.get("warnings")
+    if isinstance(raw, str):
+        text = raw
+    elif isinstance(raw, (list, tuple, set)):
+        text = "; ".join(_safe_str(p) for p in raw)
+    else:
+        return ""
+    low = text.lower()
+    for marker in _TRUST_WARNING_CLASS_MARKERS:
+        if marker in low:
+            return marker
+    return ""
+
+
+def _apply_warning_class_trust(row: Dict[str, Any]) -> None:
+    """v5.122.0 CG-5: DEMOTE-ONLY warning-class trust hook. No-op unless
+    armed; never upgrades; never invents trust when banding wrote none
+    (missing key = master switch off or pre-banding row); idempotent;
+    data_quality_score untouched by construction."""
+    if not _trust_warning_classes_enabled():
+        return
+    if not isinstance(row, dict):
+        return
+    current = row.get("trust_level")
+    if current is None or current == TRUST_LEVEL_LOW:
+        return
+    if _warning_class_hit(row):
+        row["trust_level"] = TRUST_LEVEL_LOW
+        _v573_append_warning(row, _TRUST_WARNING_CLASS_TAG)
+
+
 def _derive_trust_level(dq: Optional[float], status: str,
                         has_price: bool, degenerate: bool = False) -> str:
     """v5.88.0: band the engine's EXISTING completeness signal into an explicit
@@ -5689,6 +5771,8 @@ def _apply_investability_gate(row: Dict[str, Any]) -> None:
         row["trust_level"] = trust_level
         if trust_level == TRUST_LEVEL_LOW:
             _v573_append_warning(row, _TRUST_LOW_TAG)
+        # v5.122.0 CG-5: warning-class demotion (default OFF; see WHY).
+        _apply_warning_class_trust(row)
 
     # -- v5.93.0: GHOST-TICKER / NAME-UNRESOLVED DISCLOSURE TAG (default ON ->
     # TFB_NAME_UNRESOLVED_TAG=0/false/off makes the row's warnings byte-
