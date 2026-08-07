@@ -43,6 +43,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -200,7 +201,32 @@ _spec.loader.exec_module(sb)  # type: ignore[union-attr]
 # criterion 5b groups per basket — a fourth basket with one row per day is
 # structurally invisible to both (selftested). The gate call, day-exclusion
 # rule, scored-day counting and net-alpha inputs are untouched lines.
-SCRIPT_VERSION = "1.5.0"
+# v1.6.0 (2026-08-01) — BOARD META-ROW SHAPE GUARD (live-proven corruption).
+# The data_rows filter kept any board row with a non-empty first cell and
+# "enough" width — but gspread's get_all_values() pads EVERY row to the
+# sheet's full width, so the width test excludes nothing, and the shadow
+# board's v1.2.0 meta rows ("SHADOW BOARD v1.2.0", "authority rows=408 …",
+# "regime: {…}") flowed into data_rows -> eqw_syms -> the fetch_spot `need`
+# set. Live proof, two independent reads of the production workbook
+# (2026-08-01): the 2026-07-31 BENCHMARK_EQW Basket-Log row carries those
+# meta strings in its Symbols cell, and the panel printed "full board
+# (n=16)" against a 10-name board — 10 symbols + 6 meta rows exactly.
+# FIX: _filter_board_data_rows applies the legacy predicate PLUS a
+# symbol-shape test on the first cell (_looks_like_board_symbol:
+# uppercase A-Z0-9 with . - ^ only, <=20 chars, no spaces/'='/':'/'{'/
+# lowercase). ANTI-DEFECT-A (pit_snapshot v1.1.0 lesson): the guard is a
+# CHARSET rule, not a venue-suffix rule, so bare tickers the board really
+# holds (VICI live at rank 10; NTES/YUMC class) are admitted — selftested
+# by name. S-1 BLAST RADIUS, proven in the selftest: challenger selection
+# (needs a trailing "YES"; padded meta cells are "") and criterion-2
+# violation counting are IDENTICAL with the guard on or off; the guarded
+# set is a subset of the legacy set, so regret forks can only be equal or
+# cleaner, never added. EQW itself is INFORMATIONAL ONLY — not an S-1
+# input (its own banner says so). Dropped rows are printed once per run
+# as a [SHAPE-GUARD] line for the morning audit. Kill-switch
+# TFB_SHADOW_BOARD_ROW_SHAPE_GUARD (default ON; 0/false/off/no restores
+# the v1.5.0 list byte-for-byte — selftested). Zero functions removed.
+SCRIPT_VERSION = "1.6.0"
 TAB_HISTORY = "Shadow_History"
 TAB_GATE = "S1_Gate"
 TAB_REGRET = "Regret_Ledger"
@@ -329,6 +355,47 @@ def _eqw_enabled(today: date) -> bool:
         return False
     return (os.getenv("TFB_SHADOW_BENCHMARK_EQW") or "1").strip().lower() \
         not in {"0", "false", "off", "no"}
+
+
+_META_GUARD_RE = re.compile(r"[A-Z0-9][A-Z0-9.\-\^]{0,19}")
+
+
+def _board_shape_guard_enabled() -> bool:
+    """v1.6.0 kill-switch (default ON). 0/false/off/no -> exact v1.5.0."""
+    return (os.getenv("TFB_SHADOW_BOARD_ROW_SHAPE_GUARD") or "1") \
+        .strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _looks_like_board_symbol(cell: Any) -> bool:
+    """v1.6.0: True iff the first cell is ticker-shaped. Charset rule, NOT a
+    venue-suffix rule — bare tickers (VICI, NTES) must pass (pit_snapshot
+    v1.1.0 Defect A). Meta rows all carry a disqualifier: a space, '=', ':',
+    '{', an em-dash, or lowercase ("SHADOW BOARD v1.2.0", "evaluated=10",
+    "risk: OK", "regime: {…}")."""
+    t = str(cell or "").strip()
+    if not t or t != t.upper():
+        return False
+    return bool(_META_GUARD_RE.fullmatch(t))
+
+
+def _filter_board_data_rows(
+        board: Sequence[Sequence[Any]],
+        min_len: int) -> Tuple[List[Sequence[Any]], List[str]]:
+    """v1.6.0: legacy data_rows predicate + optional shape guard.
+    Returns (rows, dropped_first_cells). Guard OFF -> the exact v1.5.0
+    list and an empty dropped list (selftested byte-for-byte)."""
+    guard = _board_shape_guard_enabled()
+    rows: List[Sequence[Any]] = []
+    dropped: List[str] = []
+    for r in board or []:
+        if not (r and r[0] and r[0] not in ("Symbol",)
+                and len(r) >= min_len):
+            continue
+        if guard and not _looks_like_board_symbol(r[0]):
+            dropped.append(str(r[0]).strip())
+            continue
+        rows.append(r)
+    return rows, dropped
 
 
 def _parse_iso_date(s: Any) -> Optional[date]:
@@ -908,9 +975,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         board = sh.worksheet(sb.TAB_OUT).get_all_values()
     except Exception:  # noqa: BLE001
         board = []
-    data_rows = [r for r in board
-                 if r and r[0] and r[0] not in ("Symbol",)
-                 and len(r) >= len(sb.OUT_HEADER) - 2]
+    data_rows, _shape_dropped = _filter_board_data_rows(
+        board, len(sb.OUT_HEADER) - 2)
+    if _shape_dropped:
+        print(f"[SHAPE-GUARD v{SCRIPT_VERSION}] dropped "
+              f"{len(_shape_dropped)} non-symbol board row(s): "
+              + ", ".join(_shape_dropped[:8])
+              + ("…" if len(_shape_dropped) > 8 else ""))
     chal_syms = [r[0] for r in data_rows if str(r[-1]).strip().upper() == "YES"]
     violations = count_compliance_violations(data_rows)
 
@@ -1493,6 +1564,73 @@ def _selftest() -> int:
     if _dc_saved is not None:
         os.environ["TFB_SHADOW_DAY_CLASS"] = _dc_saved
 
+
+    # ---- v1.6.0 SHAPE-GUARD: board meta-row pollution fixture ------------- #
+    _sg_saved = os.environ.get("TFB_SHADOW_BOARD_ROW_SHAPE_GUARD")
+    _W = len(sb.OUT_HEADER)
+
+    def _pad(cells):
+        return (list(cells) + [""] * _W)[:_W]
+
+    _real_syms = ["4503.T", "REI-UN.TO", "NMDC.NS", "8309.T", "NMM.US",
+                  "BOCHGR.AT", "GPOR.US", "DU.AE", "C5H.IR", "VICI"]
+    _fix_board = [_pad(sb.OUT_HEADER)]
+    for _s in _real_syms:
+        _row = _pad([_s, "Name of " + _s])
+        _row[-1] = "YES" if _s in ("NMDC.NS", "8309.T", "C5H.IR") else "NO"
+        _fix_board.append(_row)
+    _meta_cells = ["SHADOW BOARD v1.2.0",
+                   "authority rows=408 as_of=2026-03-31",
+                   "evaluated=10",
+                   "switch scan: NO_ACTION",
+                   "risk: OK",
+                   'regime: {"Global": {"state": "RISK_ON"}}']
+    for _m in _meta_cells:
+        _fix_board.append(_pad([_m]))
+
+    def _legacy_rows(_b):
+        return [r for r in _b
+                if r and r[0] and r[0] not in ("Symbol",)
+                and len(r) >= len(sb.OUT_HEADER) - 2]
+
+    os.environ["TFB_SHADOW_BOARD_ROW_SHAPE_GUARD"] = "1"
+    _rows_on, _dropped = _filter_board_data_rows(
+        _fix_board, len(sb.OUT_HEADER) - 2)
+    checks.append(("SG: guard ON keeps exactly the 10 symbol rows",
+                   [r[0] for r in _rows_on] == _real_syms))
+    checks.append(("SG: guard ON drops exactly the 6 live meta strings",
+                   _dropped == _meta_cells))
+    checks.append(("SG: anti-Defect-A — bare + hyphen + HK tickers admitted",
+                   all(_looks_like_board_symbol(x) for x in
+                       ("VICI", "NTES", "BRK-B.US", "GRT-UN.TO", "0083.HK"))))
+    checks.append(("SG: every live meta first-cell rejected",
+                   not any(_looks_like_board_symbol(m) for m in _meta_cells)))
+    _eqw_fix, _seen_fix = [], set()
+    for _r in _rows_on:
+        _s2 = str(_r[0]).strip()
+        if _s2 and _s2 not in _seen_fix:
+            _seen_fix.add(_s2)
+            _eqw_fix.append(_s2)
+    checks.append(("SG: EQW over guarded rows = 10 real names (was 16)",
+                   len(_eqw_fix) == 10))
+    _leg = _legacy_rows(_fix_board)
+    checks.append(("SG: S-1 unmoved — challenger set identical on/off",
+                   [r[0] for r in _rows_on
+                    if str(r[-1]).strip().upper() == "YES"]
+                   == [r[0] for r in _leg
+                       if str(r[-1]).strip().upper() == "YES"]))
+    checks.append(("SG: S-1 unmoved — criterion-2 violations identical",
+                   count_compliance_violations(_rows_on)
+                   == count_compliance_violations(_leg)))
+    os.environ["TFB_SHADOW_BOARD_ROW_SHAPE_GUARD"] = "0"
+    _rows_off, _dropped_off = _filter_board_data_rows(
+        _fix_board, len(sb.OUT_HEADER) - 2)
+    checks.append(("SG: kill-switch OFF -> v1.5.0 list byte-for-byte",
+                   _rows_off == _leg and _dropped_off == []))
+    if _sg_saved is None:
+        os.environ.pop("TFB_SHADOW_BOARD_ROW_SHAPE_GUARD", None)
+    else:
+        os.environ["TFB_SHADOW_BOARD_ROW_SHAPE_GUARD"] = _sg_saved
 
     passed = sum(1 for _, ok in checks if ok)
     for name, ok in checks:
