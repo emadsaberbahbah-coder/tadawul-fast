@@ -46,7 +46,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v6
@@ -82,7 +82,7 @@ jobs:
       source_run_id: ${{ steps.source.outputs.run_id }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v6
@@ -168,7 +168,7 @@ jobs:
       BACKEND_TOKEN: ${{ secrets.BACKEND_TOKEN }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
           persist-credentials: false
