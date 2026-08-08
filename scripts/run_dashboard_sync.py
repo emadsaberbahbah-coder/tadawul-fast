@@ -1425,6 +1425,35 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # _priority_extra_symbols, _page_symbol_column, _decision_priority_symbols,
 # _apply_decision_first.
 # --------------------------------------------------------------------------
+# v6.37.0 — [PL-1] OPERATOR QUARANTINE LIST (POISON-LOCK BREAKER)
+# --------------------------------------------------------------------------
+# EVIDENCE (2026-08-08 Global_Markets export, 19:54 stamps): 105 rows sat
+# frozen at the 2026-08-07T18:46 cross-contamination while 98.4% of the
+# page refreshed the same day. MECHANISM (poison-lock): the engine's
+# price-coherence guard compares each HONEST refetch against the poisoned
+# last-good (THS.US real ~24 vs stored 1.26 under 'AEye, Inc.' = 19x) and
+# rejects the fresh row as insane; persistence then re-keeps the poison —
+# the contamination defends itself THROUGH the guard, across the main leg
+# AND three FULL-FILL recovery cycles of run 31258514412. PV-3 (v6.36.0,
+# armed separately) heals the 50 rows whose stored price breaks its own
+# 52W band; the remaining 55 are BAND-COHERENT identity swaps (TAG.DE
+# carrying Moog Inc.'s name, price AND band — internally consistent,
+# numerically invisible to every screen). FIX: env
+# TFB_SYNC_QUARANTINE_SYMBOLS (comma/space list, DEFAULT EMPTY = byte
+# no-op) — any FINAL-matrix row whose Symbol is listed becomes the FW-2
+# stub shape (Symbol kept, cells blanked,
+# Warnings='operator_quarantine_stub:v6.37.0'): L4b still counts the
+# symbol PRESENT, OLDEST-FIRST fronts the stub, and the next fetch has NO
+# poisoned prior to be compared against — the guard passes the honest row
+# and the lock is broken through the NORMAL fetch path. DISTINCT from the
+# SUPERSEDED TFB_SYNC_FORCE_REFETCH_SYMBOLS (retired 2026-08-04): that
+# forced a fetch-path bypass for an obsolete six-symbol heal; this erases
+# the stored prior and lets the standard path heal. OPERATOR CONTRACT
+# (v6.29.x precedent): set for ONE workflow run, verify the [PL-1] report
+# line, then REMOVE the env. Kill: unset/empty (DEFAULT) -> v6.36.0
+# byte-identically. ZERO functions removed; additions:
+# _operator_quarantine_symbols, _apply_operator_quarantine.
+# --------------------------------------------------------------------------
 # v6.36.0 — [PERSIST PV-3] SANITY SCREEN ON SECOND-CHANCE RESTORES
 # --------------------------------------------------------------------------
 # EVIDENCE (2026-08-08, run 31249231779 global-markets leg): the PV-2
@@ -1450,7 +1479,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # _persist_sanity_enabled, _persist_second_chance_sanity,
 # _PSAN_52WH_ALIASES, _PSAN_52WL_ALIASES.
 # --------------------------------------------------------------------------
-SCRIPT_VERSION = "6.36.0"
+SCRIPT_VERSION = "6.37.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3564,6 +3593,79 @@ def _persist_second_chance_sanity(
         rows_matrix[r_i] = blanked
         quarantined.append(sym)
     return rows_matrix, quarantined
+
+
+def _operator_quarantine_symbols() -> set:
+    """v6.37.0 PL-1: parse TFB_SYNC_QUARANTINE_SYMBOLS (comma/space
+    separated). Empty/absent (DEFAULT) -> empty set -> byte-exact no-op.
+    OPERATOR CONTRACT (the v6.29.x precedent): set for ONE workflow run,
+    verify the report, then REMOVE the env."""
+    raw = (os.getenv("TFB_SYNC_QUARANTINE_SYMBOLS") or "").strip()
+    if not raw:
+        return set()
+    out = set()
+    for tok in raw.replace(",", " ").split():
+        t = tok.strip().upper()
+        if t:
+            out.add(t)
+    return out
+
+
+def _apply_operator_quarantine(headers: list, rows_matrix: list) -> tuple:
+    """v6.37.0 PL-1 — POISON-LOCK BREAKER. EVIDENCE (2026-08-08
+    Global_Markets export, 19:54 stamp): 105 rows stayed frozen at the
+    2026-08-07T18:46 cross-contamination while 98.4% of the page
+    refreshed — the engine's price-coherence guard compares each HONEST
+    refetch against the poisoned last-good (THS.US real ~24 vs stored
+    1.26 'AEye' price = 19x) and rejects the fresh row as insane, so
+    persistence re-keeps the poison forever: the contamination defends
+    itself THROUGH the guard. PV-3's numeric screens catch the 50 rows
+    whose price breaks its own 52W band; the remaining 55 are
+    BAND-COHERENT identity swaps (TAG.DE carrying Moog's name, price AND
+    band — internally consistent, numerically invisible). The only clean
+    break is to erase the poisoned prior: any FINAL row whose Symbol is
+    on the operator's list becomes the FW-2 stub shape (Symbol kept,
+    every other cell blanked, Warnings tagged) — L4b still counts the
+    symbol PRESENT, OLDEST-FIRST fronts it, and the next fetch has no
+    poisoned prior to be compared against, so the guard passes the
+    honest row and the lock is broken. Applied to the final matrix
+    unconditionally while listed (a listed-but-already-healthy row costs
+    one refetch cycle — the operator lists deliberately, one-shot).
+    DISTINCT from the SUPERSEDED TFB_SYNC_FORCE_REFETCH_SYMBOLS (retired
+    2026-08-04): that forced a fetch-path bypass for a six-symbol heal
+    objective that no longer exists; THIS stubs the stored prior and
+    lets the NORMAL fetch path heal on the next leg — different
+    mechanism, different incident, same one-run-then-remove contract.
+    FAIL-SAFE: missing Symbol column screens nothing. Mutates in place.
+    Returns (rows_matrix, stubbed_symbols)."""
+    stubbed: list = []
+    listed = _operator_quarantine_symbols()
+    if not listed or not headers or not rows_matrix:
+        return rows_matrix, stubbed
+    hdr = list(headers)
+    sym_i = _guard_find_col(hdr, _GUARD_SYMBOL_ALIASES)
+    if sym_i < 0:
+        return rows_matrix, stubbed
+    warn_i = -1
+    for i, h in enumerate(hdr):
+        if str(h or "").strip().casefold() == "warnings":
+            warn_i = i
+            break
+    for r_i, row in enumerate(rows_matrix):
+        if not isinstance(row, list) or len(row) <= sym_i:
+            continue
+        if _guard_is_blank(row[sym_i]):
+            continue
+        sym = str(row[sym_i]).strip().upper()
+        if sym not in listed:
+            continue
+        blanked = ["" for _ in row]
+        blanked[sym_i] = row[sym_i]
+        if 0 <= warn_i < len(blanked):
+            blanked[warn_i] = "operator_quarantine_stub:v6.37.0"
+        rows_matrix[r_i] = blanked
+        stubbed.append(sym)
+    return rows_matrix, stubbed
 
 
 def _name_dedup_mode() -> str:
@@ -6995,6 +7097,24 @@ async def _run_one_task(
                     _old_name_map = _page_old_name_map(sheets, spreadsheet_id, task.sheet_name)
                 except Exception:
                     _old_name_map = {}
+            # v6.37.0 PL-1: operator quarantine list — runs on the FINAL
+            # matrix regardless of PV-2/PV-3 state so a poison-locked row
+            # is stubbed whether it arrived via restore or via a
+            # guard-rejected fetch's carry. Empty env (default) = no-op.
+            try:
+                rows_matrix, _plq = _apply_operator_quarantine(headers, rows_matrix)
+                if _plq:
+                    _pl = (f"[PL-1 v6.37.0] operator quarantine stubbed "
+                           f"{len(_plq)} row(s) on '{task.sheet_name}': "
+                           f"{', '.join(_plq[:12])}"
+                           f"{'…' if len(_plq) > 12 else ''} — poisoned "
+                           f"prior erased; next leg refetches with no "
+                           f"prior to be compared against. REMOVE "
+                           f"TFB_SYNC_QUARANTINE_SYMBOLS after one green run.")
+                    res.warnings.append(_pl)
+                    logger.warning(_pl)
+            except Exception as _ple:
+                logger.warning("[PL-1 v6.37.0] operator quarantine skipped (%s)", _ple)
             try:
                 _still_missing = _unpersisted_missing(headers, rows_matrix, symbols, _old_name_map)
             except Exception as _ve:  # never let verification break the write path
