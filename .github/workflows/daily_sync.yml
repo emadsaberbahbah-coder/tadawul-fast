@@ -281,6 +281,13 @@ jobs:
       # band): far narrower than FW-4 quarantine, which stays "observe" per
       # the documented S-1-window decision below.
       TFB_SYNC_PERSIST_SANITY: "1"
+      # v6.33.0 SHADOW/REGRET (scripts/track_performance.py). ARMED ("1") —
+      # operator Option B, 2026-08-09, disclosed: every Performance_Log
+      # record now stamps 'Entry Selected' (col 32) YES/NO from the live
+      # board's executable tickets; the calibrate report gains the
+      # BOARD_EXEC vs ALT_TOPK split and the regret headline. Champion
+      # blend history unchanged; rows are class-labeled, S-1 auditable.
+      TFB_TRACK_SHADOW_COHORTS: "1"
       # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
       # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
       # already builds My_Portfolio correctly from _Portfolio_CostBasis") was WRONG,
