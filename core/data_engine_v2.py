@@ -2985,7 +2985,45 @@ if str(ROOT_DIR) not in sys.path:
 # GATE: TFB_PF_WEIGHT_FX, default ON (unchanged). =0 restores v5.119 exactly,
 # including the old permissive behaviour. Zero functions removed.
 # =============================================================================
-__version__ = "5.122.0"
+#
+# =============================================================================
+# v5.123.0 (Fix BC) - ENGINE OHLC-TUPLE COHERENCE
+# =============================================================================
+# WHY (2026-08-08, live export + run 31249231779): 4,613 of 6,646
+# Global_Markets rows (69.4%) carried an Open deviating >50% from
+# current_price - 4,612 stamped the same day, 2,070 of them on
+# provider_target rows - and the garbage re-rolls every leg (two exports
+# hours apart showed DIFFERENT foreign opens on the same symbols:
+# PFLT.US open 43,700 then 122.7 vs cp ~7.5; CTO.US open 204.62 then
+# 0.0745 vs cp ~21.8; 6960.T open 36,100 vs cp 11,820). previous_close
+# stayed correct on those rows, so AV passed; eps/pe stayed correct, so
+# AY-2 passed. Mechanism is the one AY-2 already documents: price rides
+# the QUOTE block while open/day_high/day_low ride the ENRICHMENT block,
+# so a transposed enrichment breaks the tuple BY CONSTRUCTION whatever
+# the symbol. Downstream, every candle pattern / ST signal / technical
+# score / day-range stop computed from the sheet tuple is fabricated.
+#
+# MECHANISM (definite breaks only; current_price is the anchor and is
+# never touched; missing/non-positive members -> no judgement):
+#   R1  day_high < day_low                       -> drop high+low
+#   R2  cp outside [lo*(1-tol), hi*(1+tol)]      -> drop high+low
+#   R3  open outside a surviving healthy range   -> drop open
+#   R4  (no healthy range) open unit-class-breaks
+#       against BOTH cp and prev_close           -> drop open
+# Same-session invariant justifies R3 over pure ratios: even a monster
+# overnight gap keeps open inside the day's own range, so R3 catches the
+# 3.05x 6960.T case a ratio band would miss, with ~zero false-positive
+# surface. Tag: "ohlc_incoherent_dropped:<open|range|open+range>:engine"
+# through _aq_append_warning; gates and reliability see honest blanks.
+#
+# GATE: TFB_ENGINE_OHLC_COHERENCE, default OFF (S-1 window discipline:
+# unset/0 => v5.122.0 behaviour unchanged). Tunables:
+# TFB_ENGINE_OHLC_RATIO_HIGH (default 3.0), TFB_ENGINE_OHLC_RATIO_LOW
+# (default 1/3), TFB_ENGINE_OHLC_RANGE_TOL (default 0.01). Boot banner
+# now prints ohlc_coh=on/OFF beside the sibling guards. Zero functions
+# removed; five functions added.
+# =============================================================================
+__version__ = "5.123.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -9233,6 +9271,109 @@ def _engine_apply_pe_coherence(merged: Dict[str, Any]) -> Optional[str]:
     return "pe_incoherent_cleared:engine"
 
 
+def _engine_ohlc_coherence_enabled() -> bool:
+    """v5.123.0 (Fix BC): engine-level OHLC-tuple coherence on the
+    fully-merged row. Default OFF (S-1 window discipline);
+    TFB_ENGINE_OHLC_COHERENCE=1 arms it. Unset/0 keeps v5.122.0
+    behaviour unchanged."""
+    return os.getenv("TFB_ENGINE_OHLC_COHERENCE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _engine_ohlc_ratio_high() -> float:
+    try:
+        v = float(os.getenv("TFB_ENGINE_OHLC_RATIO_HIGH", "") or 3.0)
+    except Exception:
+        v = 3.0
+    return v if v > 1.0 else 3.0
+
+
+def _engine_ohlc_ratio_low() -> float:
+    try:
+        v = float(os.getenv("TFB_ENGINE_OHLC_RATIO_LOW", "") or (1.0 / 3.0))
+    except Exception:
+        v = 1.0 / 3.0
+    return v if 0.0 < v < 1.0 else (1.0 / 3.0)
+
+
+def _engine_ohlc_range_tol() -> float:
+    try:
+        v = float(os.getenv("TFB_ENGINE_OHLC_RANGE_TOL", "") or 0.01)
+    except Exception:
+        v = 0.01
+    return v if 0.0 <= v < 0.5 else 0.01
+
+
+def _engine_apply_ohlc_coherence(merged: Dict[str, Any]) -> Optional[str]:
+    """v5.123.0 (Fix BC): open_price/day_high/day_low ride the
+    ENRICHMENT block while current_price rides the QUOTE block - the
+    same construction AY-2 documents for eps/pe - so a transposed
+    enrichment plants a foreign open/range under the right price and
+    AV/AY both pass. Same-session invariant makes breaks attributable:
+    day_low <= open <= day_high and day_low <= current <= day_high hold
+    even across monster overnight gaps, because all four members belong
+    to ONE session. On a definite break: drop the offending members in
+    place (never current_price) and return the tag; else None.
+    Missing/non-positive members -> no judgement on that rule."""
+    if not isinstance(merged, dict):
+        return None
+    cp = _as_float(merged.get("current_price"))
+    o = _as_float(merged.get("open_price"))
+    hi = _as_float(merged.get("day_high"))
+    lo = _as_float(merged.get("day_low"))
+    pc = _as_float(merged.get("previous_close"))
+    if pc is None:
+        pc = _as_float(merged.get("prev_close"))
+    tol = _engine_ohlc_range_tol()
+    r_hi = _engine_ohlc_ratio_high()
+    r_lo = _engine_ohlc_ratio_low()
+    parts: List[str] = []
+
+    def _drop(keys: Tuple[str, ...]) -> None:
+        for k in keys:
+            if k in merged:
+                merged[k] = None
+
+    range_ok = hi is not None and lo is not None and hi > 0 and lo > 0
+    # R1: an inverted range is self-contradictory whatever the symbol.
+    if range_ok and hi < lo:
+        _drop(("day_high", "day_low", "high", "low"))
+        parts.append("range")
+        range_ok = False
+    # R2: the trusted anchor must sit inside its own session range.
+    if range_ok and cp is not None and cp > 0 and not (lo * (1.0 - tol) <= cp <= hi * (1.0 + tol)):
+        _drop(("day_high", "day_low", "high", "low"))
+        parts.append("range")
+        range_ok = False
+    # R3: an open outside a healthy session range is foreign by
+    # construction (live 2026-08-08: 6960.T open 36,100 vs range
+    # ~11.7k-11.9k - only 3.05x off the price, but far outside the day).
+    if o is not None and o > 0:
+        if range_ok and not (lo * (1.0 - tol) <= o <= hi * (1.0 + tol)):
+            _drop(("open_price", "day_open", "open"))
+            parts.append("open")
+        elif not range_ok and cp is not None and cp > 0:
+            # R4 fallback: no healthy range to test against; require the
+            # unit-class break against BOTH available anchors before
+            # judging, so legitimate one-sided intraday moves survive.
+            ratio_cp = o / cp
+            broke_cp = ratio_cp >= r_hi or ratio_cp <= r_lo
+            if pc is not None and pc > 0:
+                ratio_pc = o / pc
+                broke_pc = ratio_pc >= r_hi or ratio_pc <= r_lo
+            else:
+                broke_pc = True
+            if broke_cp and broke_pc:
+                _drop(("open_price", "day_open", "open"))
+                parts.append("open")
+    if not parts:
+        return None
+    seen: List[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.append(p)
+    return "ohlc_incoherent_dropped:" + "+".join(seen) + ":engine"
+
+
 # =============================================================================
 # v5.117.0 (Fix AZ) - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY
 # =============================================================================
@@ -12796,13 +12937,14 @@ class DataEngineV5:
                 except Exception:
                     return "?"
             logger.info(
-                "[v%s GUARDS] identity=%s price_coh=%s pe_coh=%s "
+                "[v%s GUARDS] identity=%s price_coh=%s pe_coh=%s ohlc_coh=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
                 "fund_lkg=%s",
                 __version__,
                 _g(_engine_identity_guard_enabled),
                 _g(_engine_price_coherence_enabled),
                 _g(_engine_pe_coherence_enabled),
+                _g(_engine_ohlc_coherence_enabled),
                 _g(_fund_identity_guard_enabled),
                 _g(_snapshot_poison_refusal_enabled),
                 _g(_final_action_invariant_enabled),
@@ -13933,6 +14075,19 @@ class DataEngineV5:
                 _ay_tag = _engine_apply_pe_coherence(merged)
                 if _ay_tag:
                     _aq_append_warning(merged, _ay_tag)
+
+            # --- v5.123.0 (Fix BC) ENGINE OHLC-TUPLE COHERENCE --------------
+            # Open/high/low ride the enrichment block (AY-2's transposition
+            # surface): the live 2026-08-08 export carried a foreign open on
+            # 4,613/6,646 Global_Markets rows (69.4%; PFLT.US open 122.7 vs
+            # cp 7.52, CTO.US open 0.0745 vs 21.75) while price/prev stayed
+            # right, so AV and AY-2 both passed by construction. Drop the
+            # offending tuple members, tag, and let gates/reliability see it
+            # through the normal warning channel. OFF => v5.122.0-identical.
+            if _engine_ohlc_coherence_enabled() and not _is_empty_data_row(merged):
+                _bc_tag = _engine_apply_ohlc_coherence(merged)
+                if _bc_tag:
+                    _aq_append_warning(merged, _bc_tag)
 
             # v5.103.0 (Fix AQ): record price provenance for this run. A price
             # present HERE came from a real provider quote; anything filled by
