@@ -587,7 +587,28 @@ logger.addHandler(logging.NullHandler())
 # no-op and the champion behaves exactly as v4.22.0. Never empties the pool:
 # if every candidate is untradable, the exclusion is abandoned and logged.
 # -----------------------------------------------------------------------------
-TOP10_SELECTOR_VERSION = "4.25.0"
+# v4.26.0 (2026-08-08) — [BC-2] HARD VERDICTS BEAT GRACE (env-gated, DEFAULT OFF)
+# WHY: measured on the live board 2026-08-07 04:16 (status line, run
+# 31249231779 era): ranks 6 and 9 were GRACE-held incumbents whose CURRENT
+# verdicts read SELL / DO_NOT_INVEST (UVV.US) and REDUCE / DO_NOT_INVEST
+# (PFLT.US) — and the operator executed both that morning. The membership
+# pass hard-exits only names ABSENT from every pool; since v4.18.0 pools
+# 3/4 deliberately admit criteria-failing rows with explicit labels, a
+# present-but-hard-blocked incumbent rides grace BY CONSTRUCTION. The
+# doctrine "safety verdicts are never grace-held" was only true for the
+# absent-from-pool case.
+# BEHAVIOR: in the membership pass, an incumbent whose pool row carries
+# final_action in {DO_NOT_INVEST, BLOCKED} or investability_status =
+# BLOCKED exits IMMEDIATELY (state reset exactly like exited_hard),
+# surfaced as stability_meta["exited_verdict"], freeing the slot for the
+# next qualified candidate this same run. Missing or unreadable verdict
+# fields -> NOT excluded (fail-safe; behaviour unchanged for that row).
+# GATE: TFB_T10_HARD_EXCLUDE_OVER_GRACE (default OFF) — committing this
+# file changes NOTHING until the operator arms it (same protocol as D-10).
+# Zero functions removed; additions:
+# _t10_hard_exclude_over_grace_enabled, _t10_row_hard_excluded.
+# -----------------------------------------------------------------------------
+TOP10_SELECTOR_VERSION = "4.26.0"
 # v4.12.0 Phase F: TFB module-version convention alias (mirrors
 # schema_registry v2.15.0, scoring v5.7.4, reco_normalize v8.0.0,
 # insights_builder v8.2.0, criteria_model v3.1.1, advisor_engine v4.5.0,
@@ -1112,6 +1133,47 @@ STABILITY_OUTPUT_KEY_HEADERS: "OrderedDict[str, str]" = OrderedDict(
         ("stability_trend", "Stability Trend"),
     )
 )
+
+
+def _t10_hard_exclude_over_grace_enabled() -> bool:
+    """v4.26.0 [BC-2]: hard safety verdicts beat grace retention.
+    Default OFF; TFB_T10_HARD_EXCLUDE_OVER_GRACE=1 arms it. Unset/0
+    keeps v4.25.0 membership behaviour byte-identically."""
+    return (os.getenv("TFB_T10_HARD_EXCLUDE_OVER_GRACE") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_T10_HARD_ACTIONS = frozenset({"DO_NOT_INVEST", "BLOCKED"})
+_T10_HARD_INVESTABILITY = frozenset({"BLOCKED"})
+
+
+def _t10_row_hard_excluded(row: Any) -> bool:
+    """v4.26.0 [BC-2]: True when the candidate row carries a hard safety
+    verdict — final_action in {DO_NOT_INVEST, BLOCKED} or
+    investability_status = BLOCKED — read tolerantly across canonical
+    and display keys. Missing/unreadable fields -> False (fail-safe:
+    the row is treated exactly as v4.25.0 treated it)."""
+    if not isinstance(row, dict):
+        return False
+    try:
+        fa = str(
+            row.get("final_action")
+            or row.get("Final Action")
+            or ""
+        ).strip().upper().replace(" ", "_")
+        if fa in _T10_HARD_ACTIONS:
+            return True
+        inv = str(
+            row.get("investability_status")
+            or row.get("Investability Status")
+            or ""
+        ).strip().upper()
+        if inv in _T10_HARD_INVESTABILITY:
+            return True
+    except Exception:
+        return False
+    return False
+
+
 # v4.25.0 (2026-07-26) [PY-10] STABILITY HISTORY SPEAKS THE RANKING SCORE
 # =========================================================================
 # PROVEN INCOHERENCE. Two different numbers were deciding one board:
@@ -4238,6 +4300,7 @@ def _apply_selection_stability(
 
     # ---- membership pass ------------------------------------------------------
     exited_hard: List[str] = []
+    exited_verdict: List[str] = []
     exited_soft: List[str] = []
     exited_capacity: List[str] = []
     survivors: List[str] = []
@@ -4250,6 +4313,17 @@ def _apply_selection_stability(
             st["ci"] = 0
             st["co"] = 0
             exited_hard.append(sym)
+            continue
+        if _t10_hard_exclude_over_grace_enabled() and _t10_row_hard_excluded(sym2row.get(sym)):
+            # v4.26.0 [BC-2] HARD EXIT: PRESENT in a pool but carrying a hard
+            # safety verdict (DO_NOT_INVEST / BLOCKED). Pools 3/4 admit
+            # labelled criteria-failing rows since v4.18.0, so presence alone
+            # cannot vouch for an incumbent — the verdict must. State reset
+            # is identical to the absent-from-pool hard exit above.
+            st["member"] = False
+            st["ci"] = 0
+            st["co"] = 0
+            exited_verdict.append(sym)
             continue
         if _safe_int(st.get("co"), 0) >= _safe_int(knobs.get("exit_days"), STABILITY_DEFAULT_EXIT_DAYS):
             st["member"] = False
@@ -4422,6 +4496,7 @@ def _apply_selection_stability(
             "entered": entered,
             "fast_tracked": fast_tracked,
             "exited_hard": exited_hard,
+            "exited_verdict": exited_verdict,
             "exited_soft": exited_soft,
             "exited_capacity": exited_capacity,
             "exited_displaced": exited_displaced,
