@@ -3023,7 +3023,7 @@ if str(ROOT_DIR) not in sys.path:
 # now prints ohlc_coh=on/OFF beside the sibling guards. Zero functions
 # removed; five functions added.
 # =============================================================================
-__version__ = "5.123.0"
+__version__ = "5.124.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4105,9 +4105,53 @@ def _cap_intrinsic_display(row: Dict[str, Any]) -> None:
     ceiling = cp * (1.0 + max_pct / 100.0)
     if iv <= ceiling:
         return
+    # v5.124.0 (Fix B5): OPT-IN soft compression above the ceiling, the exact
+    # v5.79.3 (Fix O) pattern already proven on provider targets. WHY
+    # (2026-08-08 Global_Markets export): 1,779 rows sat at intrinsic ==
+    # price*1.35 EXACTLY and 39% of the qualified Top_10 board pinned
+    # >=34.9% ROI -- the HARD clamp collapses every over-ceiling name onto
+    # one indistinguishable value, so the builder's valuation ranking
+    # saturates and rows at exactly 35.00% are artifacts, not signals. The
+    # soft map cap + band*(1-exp(-excess/band)) keeps distinct inputs
+    # distinct and ORDERED while still crushing the ~2x-price garbage Fix
+    # AG exists to kill (109.8% -> ~39.97% at the default 5pp band; the
+    # asymptote is max_pct + band). DEFAULT OFF -> the hard clamp below is
+    # byte-identical to v5.123.0. Tag 'intrinsic_soft_ceiling_applied'
+    # avoids the reliability-scan substrings (cap/forecast/target/roi/
+    # drop/reject) exactly like the hard tag it parallels.
+    if _intrinsic_display_softcap_enabled():
+        band_pp = _intrinsic_display_softcap_band_pp()
+        excess = (iv - ceiling) / cp * 100.0          # percent points over
+        soft_pct = max_pct + band_pp * (1.0 - math.exp(-excess / band_pp))
+        soft_iv = cp * (1.0 + soft_pct / 100.0)
+        row["intrinsic_value"] = round(soft_iv, 4)
+        row["upside_pct"] = round(soft_pct / 100.0, 6)
+        _v573_append_warning(row, "intrinsic_soft_ceiling_applied")
+        return
     row["intrinsic_value"] = round(ceiling, 4)
     row["upside_pct"] = round(max_pct / 100.0, 6)
     _v573_append_warning(row, "intrinsic_ceiling_applied")
+
+
+def _intrinsic_display_softcap_enabled() -> bool:
+    """v5.124.0 (Fix B5): opt-in switch for the SOFT intrinsic display ceiling.
+    Default OFF -> _cap_intrinsic_display hard-clamps byte-identically to
+    v5.123.0. Env: TFB_INTRINSIC_DISPLAY_SOFTCAP."""
+    raw = (os.getenv("TFB_INTRINSIC_DISPLAY_SOFTCAP") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+
+
+def _intrinsic_display_softcap_band_pp(default: float = 5.0) -> float:
+    """v5.124.0 (Fix B5): soft-compression band in PERCENT POINTS (default 5,
+    clamped 1..15). The displayed-upside asymptote is
+    _intrinsic_display_cap_max_pct() + band. Env:
+    TFB_INTRINSIC_DISPLAY_SOFTCAP_BAND."""
+    v = _get_env_float("TFB_INTRINSIC_DISPLAY_SOFTCAP_BAND", default)
+    if v < 1.0:
+        v = 1.0
+    if v > 15.0:
+        v = 15.0
+    return v
 
 
 def _synthesize_market_cap_if_zero(row: Dict[str, Any]) -> None:
