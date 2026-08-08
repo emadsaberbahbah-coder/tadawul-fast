@@ -95,7 +95,7 @@ jobs:
           echo "Auditing Daily Sync run $RUN_ID"
 
       - name: Download source run artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: tadawul-sync-logs-${{ steps.source.outputs.run_id }}-*
           path: downloaded-sync-artifacts
