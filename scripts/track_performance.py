@@ -1220,7 +1220,37 @@ from urllib.error import HTTPError, URLError
 # guard lesson). =0 restores v6.31.0 behaviour exactly.
 # Zero functions removed. One helper added.
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.32.0"
+# =============================================================================
+# v6.33.0 — [SHADOW/REGRET] CHAMPION SPLIT + REGRET MEASUREMENT
+# =============================================================================
+# OPERATOR MANDATE (2026-08-09): "measure what we lost from the best
+# alternative — not recommendation as self-correction." EVIDENCE the split
+# has never existed: this tracker records the WHOLE audited candidate set
+# (~200 symbols/day; the v6.20.x '620 records, 24 tagged' incident), so
+# every calibration statistic to date has BLENDED board picks with
+# unselected candidates. PRECEDENT the method works: the Investability
+# gate was retired 2026-07-24 on a measured 9:1 false-bench — one manual
+# regret study; this makes it continuous.
+#   1. entry_selected stamp: with TFB_TRACK_SHADOW_COHORTS=1 the champion
+#      set = the LIVE board's EXECUTABLE tickets (grace '—' rows are NOT
+#      champions), read once per run from Top_10_Investments via the
+#      existing sheets handle (fail-open: any read fault -> None -> every
+#      record stamps '' = unknown, exactly the pre-6.33.0 byte shape).
+#      Rows in the audited pool but off the board stamp 'NO'.
+#   2. REGRET block in calibrate(): BOARD_EXEC bucket vs ALT_TOPK bucket
+#      (K=TFB_TRACK_REGRET_TOPK, default 10 — the K highest-entry_score
+#      unselected records: the system's own "best alternatives"), plus the
+#      headline: picked-minus-bestalt mean realized ROI with both sample
+#      counts; suppressed below 3 decided per side. The historical blended
+#      report is UNCHANGED (continuity — it was always blended); the new
+#      section is the first clean champion view.
+#   3. Storage: 'Entry Selected' column APPENDED (position 32; the v6.6.0
+#      end-append law — old rows read blank, nothing re-maps).
+# Kill: TFB_TRACK_SHADOW_COHORTS unset/0 (DEFAULT) -> records, sheet rows
+# and reports byte-identical to v6.32.0. ZERO functions removed; additions:
+# _shadow_cohorts_enabled, _regret_topk, _read_board_selected_symbols.
+# =============================================================================
+SCRIPT_VERSION = "6.33.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -2610,6 +2640,64 @@ def _mature_fresh_only_enabled() -> bool:
     return (os.getenv("TFB_TRACK_MATURE_FRESH_ONLY") or "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
+def _shadow_cohorts_enabled() -> bool:
+    """v6.33.0 SHADOW/REGRET master switch. Default OFF -> entry_selected
+    stamps '' everywhere and calibrate() adds nothing: byte-identical to
+    v6.32.0. Env: TFB_TRACK_SHADOW_COHORTS."""
+    return (os.getenv("TFB_TRACK_SHADOW_COHORTS") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _regret_topk() -> int:
+    """v6.33.0: how many of the highest-entry_score UNSELECTED records form
+    the 'best alternatives' bucket. Default 10, clamped 3..50. Env:
+    TFB_TRACK_REGRET_TOPK."""
+    try:
+        v = int((os.getenv("TFB_TRACK_REGRET_TOPK") or "10").strip())
+    except Exception:
+        v = 10
+    return max(3, min(50, v))
+
+
+def _read_board_selected_symbols(store: Any) -> Optional[set]:
+    """v6.33.0: the CHAMPION set = the live board's EXECUTABLE tickets.
+    Reads the Top_10_Investments SELECTED grid through the same spreadsheet
+    handle the Performance_Log store already holds (Worksheet.spreadsheet on
+    gspread), bounded to rows 12..130. Grace ghosts render '\u2014' in the
+    Rank cell (16_Decision_Top10.gs v1.8.0 D-4) and are deliberately NOT
+    champions — a grace hold is not a pick. FAIL-OPEN: any fault returns
+    None, callers then stamp '' (unknown), never a wrong YES/NO."""
+    try:
+        ws = getattr(store, "ws", None)
+        sh = getattr(store, "sh", None) or (
+            getattr(ws, "spreadsheet", None) if ws is not None else None)
+        if sh is None:
+            return None
+        board = sh.worksheet("Top_10_Investments")
+        vals = board.get_values("A12:B130")
+        out: set = set()
+        in_table = False
+        for row in vals or []:
+            a = _safe_str(row[0] if len(row) > 0 else "")
+            b = _safe_str(row[1] if len(row) > 1 else "").upper()
+            if not in_table:
+                if a.strip() == "Rank" and b == "SYMBOL":
+                    in_table = True
+                continue
+            if a.startswith("ALL QUALIFIED") or (not a.strip() and not b):
+                break
+            if not b:
+                continue
+            if a.strip() == "\u2014":   # grace-held ghost — not a champion
+                continue
+            out.add(b)
+            if len(out) >= 15:
+                break
+        return out
+    except Exception:
+        return None
+
+
 def _mature_grace_days() -> int:
     """v6.17.0 (B): days past target_date a price-less record stays ACTIVE
     (retried every run) before expiring UNPRICED. TFB_TRACK_MATURE_GRACE_DAYS,
@@ -2872,6 +2960,10 @@ class PerformanceRecord:
     entry_forecast_reliability: float = 0.0
     entry_investability_status: str = ""
     entry_final_action: str = ""
+    # v6.33.0: champion stamp at ENTRY — 'YES' (board executable ticket),
+    # 'NO' (audited but unseated), '' (feature off / board unreadable).
+    # END-APPENDED per the v6.6.0 law above.
+    entry_selected: str = ""
 
     @property
     def key(self) -> str:
@@ -2897,6 +2989,7 @@ class PerformanceRecord:
             "entry_forecast_reliability": self.entry_forecast_reliability,
             "entry_investability_status": self.entry_investability_status,
             "entry_final_action": self.entry_final_action,
+            "entry_selected": self.entry_selected,
             "origin_tab": self.origin_tab,
             "target_price": self.target_price,
             "target_roi_pct": self.target_roi,
@@ -2999,6 +3092,7 @@ class PerformanceRecord:
             ),
             entry_investability_status=_safe_str(get("Entry Investability") or ""),
             entry_final_action=_safe_str(get("Entry Final Action") or ""),
+            entry_selected=_safe_str(get("Entry Selected") or ""),
         )
 
 
@@ -3220,6 +3314,12 @@ class CalibrationReport:
     ic_n: int = 0
     signal_trend_mix: Dict[str, int] = field(default_factory=dict)
     advisory_note: str = ""
+    # v6.33.0 SHADOW/REGRET (all default-empty -> old constructors unaffected).
+    by_selection: List[CalibrationBucket] = field(default_factory=list)
+    regret_note: str = ""
+    regret_picked_minus_alt: Optional[float] = None
+    regret_n_board: int = 0
+    regret_n_alt: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -3685,6 +3785,8 @@ class PerformanceStore:
         "Entry Forecast Reliability",
         "Entry Investability",
         "Entry Final Action",
+        # v6.33.0: champion stamp — APPENDED (position 32; end-append law).
+        "Entry Selected",
     ]
 
     def __init__(self, spreadsheet_id: str, sheet_name: str):
@@ -3862,6 +3964,8 @@ class PerformanceStore:
             r.entry_forecast_reliability,
             r.entry_investability_status or "",
             r.entry_final_action or "",
+            # v6.33.0: position 32, same order as HEADERS.
+            r.entry_selected or "",
         ]
 
     def save_records(self, records: List[PerformanceRecord]) -> bool:
@@ -4901,6 +5005,45 @@ class ReliabilityCalibrator:
         disc = self._discrimination(inv_map.get("INVESTABLE"), inv_map.get("WATCHLIST"))
         brier = self._brier(matured)
 
+        # v6.33.0 SHADOW/REGRET: the first champion-clean view. Records
+        # stamped at entry split BOARD_EXEC ('YES') from the audited-but-
+        # unseated ('NO'); legacy blank-stamp records join NEITHER bucket
+        # (they are the historical blend and stay in the blended report
+        # above, unchanged). Best alternatives = the K highest-entry_score
+        # 'NO' records — the system's own next-in-line, which is exactly
+        # "what we lost from the best alternative".
+        by_sel: List[CalibrationBucket] = []
+        regret_note = ""
+        regret_delta: Optional[float] = None
+        regret_n_board = 0
+        regret_n_alt = 0
+        _champ = [r for r in matured if (r.entry_selected or "") == "YES"]
+        _alts = [r for r in matured if (r.entry_selected or "") == "NO"]
+        if _champ or _alts:
+            _k = _regret_topk()
+            _alt_top = sorted(
+                _alts, key=lambda r: -_safe_float(r.entry_score, 0.0))[:_k]
+            by_sel = [self._bucket("BOARD_EXEC", _champ),
+                      self._bucket("ALT_TOP%d" % _k, _alt_top)]
+            _cd = [r for r in _champ if (r.realized_roi or 0.0) != 0.0]
+            _ad = [r for r in _alt_top if (r.realized_roi or 0.0) != 0.0]
+            regret_n_board, regret_n_alt = len(_cd), len(_ad)
+            if regret_n_board >= 3 and regret_n_alt >= 3:
+                _cm = sum((r.realized_roi or 0.0) for r in _cd) / regret_n_board
+                _am = sum((r.realized_roi or 0.0) for r in _ad) / regret_n_alt
+                regret_delta = _cm - _am
+                regret_note = (
+                    "REGRET picked-minus-bestalt: %+.2f%% (board n=%d mean "
+                    "%+.2f%% vs alt-top%d n=%d mean %+.2f%%; positive = the "
+                    "board earned its seats, negative = the gates cost alpha)"
+                    % (regret_delta, regret_n_board, _cm, _k,
+                       regret_n_alt, _am))
+            else:
+                regret_note = (
+                    "REGRET: insufficient split sample (board decided=%d, "
+                    "alt decided=%d; need >=3 each side)"
+                    % (regret_n_board, regret_n_alt))
+
         # v6.12.0: Information Coefficient (disclosure-only, env-gated default OFF).
         # Rank-correlation of the continuous entry_score against realized_roi over
         # DECIDED records -- a more data-efficient "does the score carry signal?"
@@ -4979,6 +5122,11 @@ class ReliabilityCalibrator:
             ic_n=ic_n,
             signal_trend_mix=dict(signal_mix or {}),
             advisory_note=self._ADVISORY,
+            by_selection=by_sel,
+            regret_note=regret_note,
+            regret_picked_minus_alt=regret_delta,
+            regret_n_board=regret_n_board,
+            regret_n_alt=regret_n_alt,
         )
 
 
@@ -5045,6 +5193,13 @@ def render_calibration_report(rep: CalibrationReport, verbose: bool = False) -> 
         _out("By horizon:")
         for b in rep.by_horizon:
             _out(_fmt_cal_bucket(b))
+    if rep.by_selection:
+        _out("")
+        _out("Board vs best alternatives (v6.33.0 regret):")
+        for b in rep.by_selection:
+            _out(_fmt_cal_bucket(b))
+        if rep.regret_note:
+            _out("  " + rep.regret_note)
     if rep.signal_trend_mix:
         mix = ", ".join(f"{k}:{v}" for k, v in sorted(rep.signal_trend_mix.items()))
         _out("")
@@ -6351,6 +6506,12 @@ class PerformanceTrackerApp:
             )
             entry_inv_status = _safe_str(row.get("investability_status"))
             entry_final_action = _safe_str(row.get("final_action"))
+            # v6.33.0: champion stamp from the pre-read board set; '' when
+            # the feature is off or the board was unreadable (fail-open).
+            _bs = getattr(self, "_board_selected", None)
+            entry_sel = ""
+            if _shadow_cohorts_enabled() and _bs is not None:
+                entry_sel = "YES" if sym in _bs else "NO"
 
             origin = (
                 _safe_str(
@@ -6389,6 +6550,7 @@ class PerformanceTrackerApp:
                     entry_forecast_reliability=entry_frel,
                     entry_investability_status=entry_inv_status,
                     entry_final_action=entry_final_action,
+                    entry_selected=entry_sel,
                 )
                 if r.key not in existing_keys:
                     existing_keys.add(r.key)
@@ -7112,6 +7274,21 @@ class PerformanceTrackerApp:
                     prefetched = await self._augment_with_decision_symbols(prefetched)
                 except Exception as e:
                     logger.warning("decision-symbol coverage failed: %s", e)
+
+            # v6.33.0 SHADOW/REGRET: read the champion set ONCE per run —
+            # the board's executable tickets — before records are built.
+            # Fail-open None keeps every stamp '' (unknown).
+            self._board_selected = None
+            if _shadow_cohorts_enabled():
+                try:
+                    self._board_selected = await loop.run_in_executor(
+                        _get_executor(), _read_board_selected_symbols, self.store)
+                except Exception as e:
+                    logger.warning("[v6.33.0 SHADOW] board read failed: %s", e)
+                if self._board_selected is not None:
+                    logger.info(
+                        "[v6.33.0 SHADOW] champion set: %d executable ticket(s)",
+                        len(self._board_selected))
 
             new = await self.record_from_top10(records, rows=prefetched)
             if new and self.store.is_available():
