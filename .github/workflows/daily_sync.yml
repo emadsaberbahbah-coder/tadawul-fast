@@ -271,6 +271,16 @@ jobs:
     # env block (see the note there). Values and comments unchanged; only the
     # scope changed so ci-tests no longer inherits sync behavior flags.
     env:
+      # PV-3 second-chance sanity screen (scripts/run_dashboard_sync.py v6.36.0).
+      # ARMED ("1"). WHY (2026-08-08, run 31249231779 global-markets leg): the
+      # PV-2 restore list LED with the 2026-08-07T18:46 cross-contaminated
+      # batch (THS.US='AEye', TATAMOTORS.NS='Mr Price Group' px 17,450 vs own
+      # 52W 627-740) — poisoned last-good rows resurrected on every
+      # time-starved leg. PV-3 stubs ONLY restored rows with definite
+      # row-internal breaks (px<=0 / inverted 52W band / px outside its own
+      # band): far narrower than FW-4 quarantine, which stays "observe" per
+      # the documented S-1-window decision below.
+      TFB_SYNC_PERSIST_SANITY: "1"
       # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
       # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
       # already builds My_Portfolio correctly from _Portfolio_CostBasis") was WRONG,
@@ -1258,6 +1268,10 @@ jobs:
       TFB_XPAGE_PRICE_CHECK: "1"
       TFB_SYNC_EMPTY_RETRY: "0"
       TFB_SYNC_NAME_DEDUP_MODE: "observe"
+      # PV-3 second-chance sanity screen (v6.36.0) — ARMED, same WHY as the
+      # sync-dashboard block: recovery legs replay the persistence path, so an
+      # unscreened restore here would resurrect the same poisoned last-good rows.
+      TFB_SYNC_PERSIST_SANITY: "1"
       TFB_PORTFOLIO_REBUILD: "1"
       TFB_SYNC_DECISION_GUARD: "1"
 
