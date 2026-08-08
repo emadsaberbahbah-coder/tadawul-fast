@@ -917,7 +917,7 @@ from datetime import datetime, timedelta, timezone
 # ZERO functions removed. Additions: _env_forecast_provenance_gate,
 # _env_synthetic_source_tokens, _forecast_provenance_assessment.
 # ---------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.10.0"
+OPPORTUNITY_BUILDER_VERSION = "1.10.1"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1231,6 +1231,17 @@ FX_STATIC_TO_SAR = {
     "CHF": 4.20, "CAD": 2.70, "AUD": 2.45, "HKD": 0.48, "CNY": 0.52,
     "ZAR": 0.20, "ILS": 1.05, "AED": 1.0211, "KWD": 12.25, "QAR": 1.0302,
     "BHD": 9.95, "OMR": 9.74, "EGP": 0.075, "INR": 0.044, "TRY": 0.09,
+    # v1.10.1 (2026-08-08): 16 join in LOCKSTEP with 15_Lists_Config.gs
+    # v1.3.2 (the sheet reaches 55 seeded currencies; BHD/OMR above were the
+    # only two of the audit's 18-gap already covered here). The sheet's
+    # POSTed fx_rates stays primary; this map is the safety net so a row in
+    # any of these currencies can never fail the FX MAJOR gate on missing
+    # FX alone when the request map is thin. 2026-08 approximations,
+    # SAR pegged 3.75/USD.
+    "BDT": 0.0307, "BRL": 0.68, "CNH": 0.525, "COP": 0.00091,
+    "CZK": 0.163, "HUF": 0.0106, "JOD": 5.29, "KES": 0.029,
+    "LKR": 0.0125, "MAD": 0.38, "NGN": 0.0024, "PEN": 1.00,
+    "PHP": 0.065, "PKR": 0.0133, "RON": 0.82, "VND": 0.000148,
 }
 FX_SUBUNIT_PARENT = {"GBP_SUB": "GBP", "GBX": "GBP", "ZAC": "ZAR",
                      "ILA": "ILS"}
