@@ -1425,7 +1425,32 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # _priority_extra_symbols, _page_symbol_column, _decision_priority_symbols,
 # _apply_decision_first.
 # --------------------------------------------------------------------------
-SCRIPT_VERSION = "6.35.0"
+# v6.36.0 — [PERSIST PV-3] SANITY SCREEN ON SECOND-CHANCE RESTORES
+# --------------------------------------------------------------------------
+# EVIDENCE (2026-08-08, run 31249231779 global-markets leg): the PV-2
+# second-chance pass restored 3,518 row(s) and the restore list LED with
+# the 2026-08-07T18:46 cross-contaminated batch (THS.US='AEye, Inc.',
+# PE&OLES.MX, PEL.NS, BALN.SW, TATAMOTORS.NS='Mr Price Group' px 17,450
+# vs own 52W 627-740…) — the poison lives in the last-good store, so
+# every time-starved leg (47% coverage vs the 70% floor that run)
+# resurrects it and the sheet can never self-heal. FIX: when
+# TFB_SYNC_PERSIST_SANITY=1, restored symbols ONLY are screened with
+# definite row-internal breaks (px<=0; inverted 52W band; px outside
+# [52wLo*0.99, 52wHi*1.01]) and failures become the FW-2 stub shape —
+# Symbol kept, every other cell blanked,
+# Warnings='persist_sanity_quarantined:v6.36.0' — so the L4b outcome
+# check still counts the symbol PRESENT while OLDEST-FIRST's
+# never-stamped lead fronts the stub for a real refetch next leg.
+# Healthy restores pass untouched; a missing Symbol or price column
+# screens nothing (FAIL-SAFE). NOTE: firewall enforce needs NO code —
+# FW-4 already ships TFB_SYNC_NAME_DEDUP_MODE=quarantine (+ MIN=2 for
+# pairs like the double 'Moog Inc.'); arming it is a workflow-env act.
+# Kill: TFB_SYNC_PERSIST_SANITY unset/0 (DEFAULT) restores v6.35.0
+# byte-identically. ZERO functions removed; additions:
+# _persist_sanity_enabled, _persist_second_chance_sanity,
+# _PSAN_52WH_ALIASES, _PSAN_52WL_ALIASES.
+# --------------------------------------------------------------------------
+SCRIPT_VERSION = "6.36.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3461,6 +3486,84 @@ def _row_identity_firewall(
         rows_matrix[r_i] = blanked
         stripped.append(sym)
     return rows_matrix, stripped
+
+
+_PSAN_52WH_ALIASES = frozenset({
+    "52whigh", "week52high", "fiftytwoweekhigh", "52weekhigh", "yearhigh",
+})
+_PSAN_52WL_ALIASES = frozenset({
+    "52wlow", "week52low", "fiftytwoweeklow", "52weeklow", "yearlow",
+})
+
+
+def _persist_sanity_enabled() -> bool:
+    """v6.36.0 PV-3: sanity screen on SECOND-CHANCE restored rows.
+    Default OFF (S-1 window discipline); TFB_SYNC_PERSIST_SANITY=1 arms
+    it. Unset/0 keeps v6.35.0 behaviour byte-identically."""
+    return (os.getenv("TFB_SYNC_PERSIST_SANITY") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _persist_second_chance_sanity(
+    headers: list,
+    rows_matrix: list,
+    restored: set,
+) -> tuple:
+    """v6.36.0 PV-3: the PV-2 second-chance pass re-injects last-good
+    rows BLINDLY, so a poisoned last-good copy (run 31249231779: the
+    2026-08-07T18:46 cross-contaminated batch — THS.US='AEye, Inc.',
+    TATAMOTORS.NS='Mr Price Group' px 17,450 vs own 52W 627-740 — led
+    the restore list) is resurrected on every time-starved leg. Screen
+    ONLY the restored symbols with definite row-internal breaks (px<=0;
+    inverted 52W band; px outside [52wLo*0.99, 52wHi*1.01]) and convert
+    failures to the FW-2 stub shape (Symbol kept, every other cell
+    blanked, Warnings tagged) so the L4b hard-persistence outcome check
+    still sees every requested symbol PRESENT and the OLDEST-FIRST
+    never-stamped lead fronts the stub for a real refetch next leg.
+    FAIL-SAFE: a missing Symbol or price column screens nothing.
+    Mutates rows in place. Returns (rows_matrix, quarantined_symbols)."""
+    quarantined: list = []
+    if not headers or not rows_matrix or not restored:
+        return rows_matrix, quarantined
+    hdr = list(headers)
+    sym_i = _guard_find_col(hdr, _GUARD_SYMBOL_ALIASES)
+    px_i = _guard_find_col(hdr, _COH_PRICE_ALIASES)
+    if sym_i < 0 or px_i < 0:
+        return rows_matrix, quarantined
+    h52_i = _guard_find_col(hdr, _PSAN_52WH_ALIASES)
+    l52_i = _guard_find_col(hdr, _PSAN_52WL_ALIASES)
+    warn_i = -1
+    for i, h in enumerate(hdr):
+        if str(h or "").strip().casefold() == "warnings":
+            warn_i = i
+            break
+    for r_i, row in enumerate(rows_matrix):
+        if not isinstance(row, list) or len(row) <= sym_i:
+            continue
+        if _guard_is_blank(row[sym_i]):
+            continue
+        sym = str(row[sym_i]).strip().upper()
+        if sym not in restored:
+            continue
+        px = _coh_float(row[px_i]) if len(row) > px_i else None
+        h52 = _coh_float(row[h52_i]) if (h52_i >= 0 and len(row) > h52_i) else None
+        l52 = _coh_float(row[l52_i]) if (l52_i >= 0 and len(row) > l52_i) else None
+        broke = False
+        if px is not None and px <= 0.0:
+            broke = True
+        if not broke and h52 is not None and l52 is not None and h52 > 0.0 and l52 > 0.0:
+            if h52 < l52:
+                broke = True
+            elif px is not None and px > 0.0 and not (l52 * 0.99 <= px <= h52 * 1.01):
+                broke = True
+        if not broke:
+            continue
+        blanked = ["" for _ in row]
+        blanked[sym_i] = row[sym_i]
+        if 0 <= warn_i < len(blanked):
+            blanked[warn_i] = "persist_sanity_quarantined:v6.36.0"
+        rows_matrix[r_i] = blanked
+        quarantined.append(sym)
+    return rows_matrix, quarantined
 
 
 def _name_dedup_mode() -> str:
@@ -6874,6 +6977,18 @@ async def _run_one_task(
                                f"{'…' if len(_kept2) > 12 else ''}")
                         res.warnings.append(_p2)
                         logger.warning(_p2)
+                        if _persist_sanity_enabled():
+                            rows_matrix, _psq = _persist_second_chance_sanity(
+                                headers, rows_matrix, set(_kept2))
+                            if _psq:
+                                _p3 = (f"[PERSIST v6.36.0 PV-3] sanity screen "
+                                       f"quarantined {len(_psq)} of "
+                                       f"{len(_kept2)} restored row(s) on "
+                                       f"'{task.sheet_name}': "
+                                       f"{', '.join(_psq[:12])}"
+                                       f"{'…' if len(_psq) > 12 else ''}")
+                                res.warnings.append(_p3)
+                                logger.warning(_p3)
                 except Exception as _p2e:
                     logger.warning("[PERSIST v6.34.0] second-chance skipped (%s)", _p2e)
                 try:
