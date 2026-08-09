@@ -281,6 +281,11 @@ jobs:
       # band): far narrower than FW-4 quarantine, which stays "observe" per
       # the documented S-1-window decision below.
       TFB_SYNC_PERSIST_SANITY: "1"
+      # PL-1 ONE-SHOT (2026-08-09): operator quarantine of the 73 poisoned
+      # rows (67 survivors of 2026-08-07T18:4x + 6 from the 01:39 batch).
+      # Stubs the stored priors so the next fetch has nothing poisoned to be
+      # compared against. REMOVE THIS LINE after ONE green run.
+      TFB_SYNC_QUARANTINE_SYMBOLS: "0011.HK,0489.HK,2899.T,4485.T,6641.T,6755.T,7205.T,7732.T,9062.T,APLS.US,ARCH.US,ATST.L,AZPN.US,BBGI.L,BDEV.L,BF-A,BF-B,BILL2.ST,BRDG.US,BRFS.US,BSIG.US,CADE.US,CEIX.US,CFLT.US,CGG.PA,CHX.US,CIVI.US,CSWI.US,CTRA.US,CVAC.US,DEG.AX,ENLC.US,GATO.US,GMS.US,HEES.US,HL.L,IPL.AX,ITCI.US,JBT.US,KOZAA.IS,KOZAL.IS,LHCG.US,MAG.US,MRUS.US,MYTIL.AT,NUVA.US,NVEI.TO,OPAP.AT,P10.US,PE&OLES.MX,PTM.AX,RCM.US,SEV.PA,SILK.US,SILV.US,SMAR.US,SMDS.L,SPL.WA,SPT.L,SPTN.US,STEC.BK,STLA.PA,SYDB.CO,TAG.DE,TATAMOTORS.NS,TGI.US,TOP.CO,TRTN.US,TTM.US,VTLE.US,VUK.AX,WNS.US,WTAN.L"
       # v6.33.0 SHADOW/REGRET (scripts/track_performance.py). ARMED ("1") —
       # operator Option B, 2026-08-09, disclosed: every Performance_Log
       # record now stamps 'Entry Selected' (col 32) YES/NO from the live
@@ -1279,6 +1284,11 @@ jobs:
       # sync-dashboard block: recovery legs replay the persistence path, so an
       # unscreened restore here would resurrect the same poisoned last-good rows.
       TFB_SYNC_PERSIST_SANITY: "1"
+      # PL-1 ONE-SHOT (2026-08-09): operator quarantine of the 73 poisoned
+      # rows (67 survivors of 2026-08-07T18:4x + 6 from the 01:39 batch).
+      # Stubs the stored priors so the next fetch has nothing poisoned to be
+      # compared against. REMOVE THIS LINE after ONE green run.
+      TFB_SYNC_QUARANTINE_SYMBOLS: "0011.HK,0489.HK,2899.T,4485.T,6641.T,6755.T,7205.T,7732.T,9062.T,APLS.US,ARCH.US,ATST.L,AZPN.US,BBGI.L,BDEV.L,BF-A,BF-B,BILL2.ST,BRDG.US,BRFS.US,BSIG.US,CADE.US,CEIX.US,CFLT.US,CGG.PA,CHX.US,CIVI.US,CSWI.US,CTRA.US,CVAC.US,DEG.AX,ENLC.US,GATO.US,GMS.US,HEES.US,HL.L,IPL.AX,ITCI.US,JBT.US,KOZAA.IS,KOZAL.IS,LHCG.US,MAG.US,MRUS.US,MYTIL.AT,NUVA.US,NVEI.TO,OPAP.AT,P10.US,PE&OLES.MX,PTM.AX,RCM.US,SEV.PA,SILK.US,SILV.US,SMAR.US,SMDS.L,SPL.WA,SPT.L,SPTN.US,STEC.BK,STLA.PA,SYDB.CO,TAG.DE,TATAMOTORS.NS,TGI.US,TOP.CO,TRTN.US,TTM.US,VTLE.US,VUK.AX,WNS.US,WTAN.L"
       TFB_PORTFOLIO_REBUILD: "1"
       TFB_SYNC_DECISION_GUARD: "1"
 
