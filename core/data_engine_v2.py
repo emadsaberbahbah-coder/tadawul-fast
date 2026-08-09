@@ -3023,7 +3023,7 @@ if str(ROOT_DIR) not in sys.path:
 # now prints ohlc_coh=on/OFF beside the sibling guards. Zero functions
 # removed; five functions added.
 # =============================================================================
-__version__ = "5.124.0"
+__version__ = "5.125.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4152,6 +4152,34 @@ def _intrinsic_display_softcap_band_pp(default: float = 5.0) -> float:
     if v > 15.0:
         v = 15.0
     return v
+
+
+def _identity_echo_enabled() -> bool:
+    """v5.125.0 [BC-3] IDENTITY-ECHO BINDING master switch. Default OFF ->
+    _canonicalize_provider_row is byte-identical to v5.124.0. Env:
+    TFB_ENGINE_IDENTITY_ECHO."""
+    raw = (os.getenv("TFB_ENGINE_IDENTITY_ECHO") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+
+
+def _identity_echo_match(requested: str, echo: str) -> bool:
+    """v5.125.0 [BC-3]: does the provider payload's OWN symbol echo belong to
+    the requested symbol? Exact after normalize, with a single-suffix '.US'
+    tolerance on EITHER side only (EODHD echoes 'DENN.US' for a 'DENN'
+    request and vice versa). NEVER cross-venue tolerant: 'BDC.US' can never
+    satisfy a 'SYDB.CO' request — that exact mismatch is the 2026-08-09
+    B-slice contamination this guard exists to kill."""
+    a = normalize_symbol(_safe_str(requested))
+    b = normalize_symbol(_safe_str(echo))
+    if not a or not b:
+        return True
+    if a == b:
+        return True
+    if a.endswith(".US") and a[:-3] == b:
+        return True
+    if b.endswith(".US") and b[:-3] == a:
+        return True
+    return False
 
 
 def _synthesize_market_cap_if_zero(row: Dict[str, Any]) -> None:
@@ -11096,6 +11124,46 @@ def _merge_gate_drop_warnings(row: Dict[str, Any], patch: Dict[str, Any]) -> Non
 def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", normalized_symbol: str = "", provider: str = "") -> Dict[str, Any]:
     src = dict(row or {})
     flat = _flatten_scalar_fields(src)
+    # v5.125.0 [BC-3] IDENTITY-ECHO BINDING (kill-switched, DEFAULT OFF).
+    # EVIDENCE (run 31277306406, recovery cycle 1, 04:38-04:40 Riyadh): a
+    # 7-symbol refetch batch (STM.PA, SYDB.CO, TATAMOTORS.NS, CTRA.US,
+    # CVAC.US, SPT.L, GMS.US) came back carrying an alphabetical B-slice of
+    # FOREIGN companies (Solowin, BriaCell, Belden, Flanigan's, Braiin,
+    # Brilliant Earth, Big Yellow) — a response body bound to the wrong
+    # request. Today the payload's own symbol wins the row label
+    # (setdefault semantics) and NOTHING compares it to what was requested,
+    # so the swap writes straight through every numeric guard (the numbers
+    # are self-coherent — they are simply another company's). The name_dup
+    # census also shows NORMAL-stamped carriers (DENN.US/ZK.US wearing
+    # 'Moog Inc.'), so the crossover is not confined to incident windows.
+    # RULE: if the payload carries ANY symbol echo and it does not belong
+    # to the requested symbol (exact or single '.US'-suffix tolerance),
+    # REJECT the row before assembly — symbol kept, no data, tagged. A
+    # rejected row downgrades to the enrichment-gap path, where
+    # KEEP-LAST-GOOD retains yesterday's honest data instead of writing a
+    # stranger's. Payloads with no echo pass (nothing to verify).
+    if requested_symbol and _identity_echo_enabled():
+        _echo_raw = (
+            _lookup_alias_value(src, flat, "symbol")
+            or _lookup_alias_value(src, flat, "code")
+            or _lookup_alias_value(src, flat, "ticker")
+            or _lookup_alias_value(src, flat, "regularMarketSymbol")
+            or _lookup_alias_value(src, flat, "meta.symbol")
+        )
+        _echo = normalize_symbol(_safe_str(_echo_raw))
+        if _echo and not _identity_echo_match(requested_symbol, _echo):
+            logger.warning(
+                "[v%s BC-3] identity echo mismatch: requested=%s echo=%s "
+                "provider=%s — provider row rejected before assembly",
+                __version__, requested_symbol, _echo, provider or "?",
+            )
+            return {
+                "symbol": requested_symbol,
+                "symbol_normalized": normalize_symbol(requested_symbol) or requested_symbol,
+                "requested_symbol": requested_symbol,
+                "data_provider": _safe_str(provider),
+                "warnings": "identity_echo_mismatch:" + _echo + ":engine",
+            }
     symbol = normalized_symbol or normalize_symbol(_safe_str(_lookup_alias_value(src, flat, "symbol") or requested_symbol))
     out: Dict[str, Any] = {
         "symbol": symbol or requested_symbol,
@@ -12982,6 +13050,7 @@ class DataEngineV5:
                     return "?"
             logger.info(
                 "[v%s GUARDS] identity=%s price_coh=%s pe_coh=%s ohlc_coh=%s "
+                "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
                 "fund_lkg=%s",
                 __version__,
@@ -12989,6 +13058,7 @@ class DataEngineV5:
                 _g(_engine_price_coherence_enabled),
                 _g(_engine_pe_coherence_enabled),
                 _g(_engine_ohlc_coherence_enabled),
+                _g(_identity_echo_enabled),
                 _g(_fund_identity_guard_enabled),
                 _g(_snapshot_poison_refusal_enabled),
                 _g(_final_action_invariant_enabled),
