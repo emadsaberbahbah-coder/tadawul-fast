@@ -917,7 +917,7 @@ from datetime import datetime, timedelta, timezone
 # ZERO functions removed. Additions: _env_forecast_provenance_gate,
 # _env_synthetic_source_tokens, _forecast_provenance_assessment.
 # ---------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.10.1"
+OPPORTUNITY_BUILDER_VERSION = "1.10.2"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1094,6 +1094,8 @@ DEFAULT_CRITERIA = {
     # v1.0.8: DEFAULT OFF (opt-in) — the selector backfills Tier-2 rows, so
     # default-ON would diverge the opportunity surface from the Top_10 page.
     "investability_gate_enabled": False,
+    # v1.10.2 [G-1]: BLOCKED-identity hard gate (env TFB_OPP_BLOCKED_IDENTITY_GATE).
+    "blocked_identity_gate_enabled": False,
     # v1.0.9: DEFAULT OFF (opt-in). When ON, a sized ticket whose suggested
     # SAR is 0 (capital exhausted before it could be funded) is NOT counted as
     # a selected/executable ticket: it is removed from `selected`, excluded
@@ -1142,6 +1144,7 @@ _CRITERIA_BOOL_KEYS = (
     "include_portfolio_holdings", "forecast_gate_enabled",
     "valuation_sanity_gate_enabled", "engine_roi_display_enabled",
     "trust_gate_enabled", "investability_gate_enabled",
+    "blocked_identity_gate_enabled",
     "unfunded_watch_enabled", "rank_by_engine_roi_enabled",
     "issuer_dedup_enabled",
 )
@@ -1194,6 +1197,8 @@ GATE_ORDER = (
     "Shariah (Model)",       # v1.9.0 B-6 (appends after Eligibility (KSA))
     "Activity Screen",
     "Investability",
+    # v1.10.2 [G-1]: appended immediately after Investability in evaluate_gates.
+    "Blocked Identity",
     # v1.7.0: appended at its true position (the v1.0.7 GATE_ORDER lesson —
     # a gate missing from this tuple sorts to 99 and can mis-attribute
     # first_failed_gate on the near-miss surface).
@@ -1410,6 +1415,15 @@ def _env_trust_gate():
         "0", "false", "no", "off")
 
 
+def _env_blocked_identity_gate():
+    """v1.10.2 [G-1]: TFB_OPP_BLOCKED_IDENTITY_GATE — default OFF (house
+    law: ship byte-identical, arm deliberately). When on, an engine
+    investability of exactly BLOCKED MAJOR-fails regardless of the retired
+    Require-Investable setting. Reader mirrors _env_investability_gate."""
+    raw = (os.getenv("TFB_OPP_BLOCKED_IDENTITY_GATE") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _env_investability_gate():
     """v1.0.7 gate; v1.0.8: DEFAULT OFF (opt-in). Set
     TFB_OPP_INVESTABILITY_GATE=1 to append the Investability MAJOR gate
@@ -1566,6 +1580,7 @@ def _env_overrides():
             "TFB_OPP_MIN_TRUST_FIELDS",
             DEFAULT_CRITERIA["min_trust_fields"]),
         "investability_gate_enabled": _env_investability_gate(),
+        "blocked_identity_gate_enabled": _env_blocked_identity_gate(),
         "unfunded_watch_enabled": _env_unfunded_watch(),
         "rank_by_engine_roi_enabled": _env_rank_by_engine_roi(),
         "issuer_dedup_enabled": _env_issuer_dedup(),
@@ -2736,6 +2751,30 @@ def evaluate_gates(cand, criteria, held_symbols=None):
             "Investability", inv_ok, FAIL_MAJOR,
             (_to_text(inv_raw) or "Unknown"),
             "engine verdict INVESTABLE (blank/Unknown passes)"))
+
+    # v1.10.2 [G-1 BLOCKED-IDENTITY GATE]: BLOCKED is not WATCHLIST.
+    # EVIDENCE (independent audit, 2026-08-09 board 10:37): five .VN rows
+    # (CTG/MBB/TCB/VIB/VPB) sat INSIDE the 125-name qualified set with
+    # investability = BLOCKED — carrying VND-scale prices mislabeled
+    # USD/'NASDAQ/NYSE' (an identity/currency corruption class). They
+    # slipped because the operator's deliberate Require-Investable=No
+    # (the 2026-07-24 retirement, measured 9:1 false-bench on WATCHLIST)
+    # switches off the WHOLE Investability check — including the one
+    # verdict that retirement was never meant to cover. WATCHLIST is a
+    # conservative OPINION; BLOCKED is an identity/tradability HARD STATE.
+    # This gate fails MAJOR on exactly the token "blocked" — nothing
+    # else — regardless of the retired gate's setting. Blank/Unknown/
+    # WATCHLIST all PASS here untouched (fail-open + traced, the house
+    # convention). Appended ONLY when blocked_identity_gate_enabled =>
+    # byte-identical v1.10.1 when TFB_OPP_BLOCKED_IDENTITY_GATE=0.
+    if criteria.get("blocked_identity_gate_enabled"):
+        _bi_raw = (cand.get("engine_gate") or {}).get("investability")
+        _bi_norm = _norm_token(_to_text(_bi_raw) or "")
+        _bi_ok = _bi_norm != "blocked"
+        g.append(_gate(
+            "Blocked Identity", _bi_ok, FAIL_MAJOR,
+            (_to_text(_bi_raw) or "Unknown"),
+            "engine identity/tradability not BLOCKED (blank/Unknown/WATCHLIST pass)"))
 
     # v1.7.0 [SELL-CLASS GATE]: the narrow guard — MAJOR-fail only an
     # EXPLICIT engine sell-tier verdict, instead of the Investability gate's
