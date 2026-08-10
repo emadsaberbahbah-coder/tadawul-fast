@@ -3023,7 +3023,7 @@ if str(ROOT_DIR) not in sys.path:
 # now prints ohlc_coh=on/OFF beside the sibling guards. Zero functions
 # removed; five functions added.
 # =============================================================================
-__version__ = "5.125.0"
+__version__ = "5.126.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -11149,6 +11149,17 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
             or _lookup_alias_value(src, flat, "ticker")
             or _lookup_alias_value(src, flat, "regularMarketSymbol")
             or _lookup_alias_value(src, flat, "meta.symbol")
+            # v5.126.0 [BC-4]: NESTED fundamentals echoes. The 2026-08-10
+            # healing round proved the crossover lane lives in the
+            # name/fundamentals leg: swapped payloads sailed through BC-3
+            # because their echo hides nested (EODHD {"General":{"Code":..}},
+            # yahoo quoteSummary price/profile symbol) — the surface scan
+            # saw nothing to compare and JBT.US put on Shopify's name with a
+            # fresh stamp. Same guard, deeper eyes.
+            or _lookup_alias_value(src, flat, "General.Code")
+            or (_lookup_alias_value(src.get("General") or {}, _flatten_scalar_fields(src.get("General") or {}), "code") if isinstance(src.get("General"), dict) else None)
+            or (_lookup_alias_value(src.get("price") or {}, _flatten_scalar_fields(src.get("price") or {}), "symbol") if isinstance(src.get("price"), dict) else None)
+            or (_lookup_alias_value(src.get("profile") or {}, _flatten_scalar_fields(src.get("profile") or {}), "symbol") if isinstance(src.get("profile"), dict) else None)
         )
         _echo = normalize_symbol(_safe_str(_echo_raw))
         if _echo and not _identity_echo_match(requested_symbol, _echo):
