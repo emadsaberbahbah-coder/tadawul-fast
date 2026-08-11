@@ -958,7 +958,37 @@ from datetime import datetime, timedelta, timezone
 # _env_rel_cluster_values, _rel_cluster_values_text,
 # _rel_cluster_assessment.
 # ---------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.10.3"
+# v1.11.0 [F-1 VENUE BOARD LOTS — the sizing defect the floors could not see]
+# WHY: _size_one has lot-floored sizing since §4.4 — but the lot is one
+# GLOBAL criterion (TFB_OPP_LOT_SIZE, default 1). Venues with mandatory
+# board lots therefore received odd-lot tickets: the 2026-08-11 boards
+# sized 6960.T at 64 sh, 4503.T at 327 sh and 3401.T at 438 sh against
+# TSE's uniform 100-share unit — three consecutive un-executable tickets
+# in one day. The v1.1.0 venue FLOORS (§18.5/§19.3) raise the minimum
+# ticket in SAR but know nothing about share multiples, so a ticket can
+# clear the floor and still be unplaceable.
+# WHAT: per-venue board lots by symbol suffix, layered over the global
+# criterion inside _size_one (lot = max(1, criteria lot, venue lot)), plus
+# an honest deferral at the pick loop when the venue lot alone prices a
+# name out (allocation buys >= 1 share but < 1 lot) — otherwise 6960.T
+# would have read as capital exhaustion with 18k SAR still on the table.
+# ENV (read at gate time, the v1.4.0/v1.10.x precedent):
+#   TFB_T10_VENUE_LOTS   unset/blank => feature OFF, sizing and reasons
+#                        byte-identical to v1.10.3 (S-1 window law).
+#                        "default" => the built-in certain set
+#                        T:100, SI:100, KL:100 (venues with a uniform,
+#                        exchange-mandated board lot). Or an explicit csv
+#                        "T:100,TW:1000,BK:100" (';' accepted as ',');
+#                        unknown suffixes keep lot 1. Varying-lot venues
+#                        (e.g. HK) are deliberately NOT defaulted — the
+#                        operator adds them only with confirmed values.
+# GATE DEFAULT: **OFF**. Arming changes tickets, so the flip is the
+# operator's explicit decision, exactly like v1.10.0/v1.10.3.
+# ZERO functions removed. Additions: _env_venue_lots,
+# _venue_lot_for_symbol. One line changed inside _size_one; one deferral
+# block added in the pick loop.
+# ---------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.11.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1416,6 +1446,54 @@ def _rel_cluster_assessment(cand):
         return True, "Unknown"
     cur = "%.1f" % rel_f
     return (cur not in _env_rel_cluster_values()), cur
+
+
+_DEFAULT_VENUE_LOTS = {"T": 100, "SI": 100, "KL": 100}
+
+
+def _env_venue_lots():
+    """v1.11.0 [F-1]: {SUFFIX: board_lot} from TFB_T10_VENUE_LOTS.
+    unset/blank => {} (feature OFF => v1.10.3 byte-for-byte).
+    "default" => _DEFAULT_VENUE_LOTS (uniform-lot venues only).
+    Else csv "T:100,TW:1000" (';' accepted as ','); bad entries skipped."""
+    raw = str(_env_str("TFB_T10_VENUE_LOTS", "") or "").strip()
+    if not raw:
+        return {}
+    if raw.lower() == "default":
+        return dict(_DEFAULT_VENUE_LOTS)
+    out = {}
+    for tok in raw.replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok or ":" not in tok:
+            continue
+        suf, _, val = tok.partition(":")
+        suf = suf.strip().upper().lstrip(".")
+        try:
+            lot = int(float(val.strip()))
+        except (TypeError, ValueError):
+            continue
+        if suf and lot > 1:
+            out[suf] = lot
+    return out
+
+
+def _venue_lot_for_symbol(cand_or_symbol):
+    """v1.11.0 [F-1]: the venue board lot for a symbol's suffix, or 0 when
+    the feature is off / the suffix is unmapped / the symbol has no suffix.
+    Never raises."""
+    try:
+        sym = cand_or_symbol
+        if isinstance(cand_or_symbol, dict):
+            sym = cand_or_symbol.get("symbol")
+        sym = str(sym or "")
+        if "." not in sym:
+            return 0
+        suf = sym.rsplit(".", 1)[1].strip().upper()
+        if not suf:
+            return 0
+        return int(_env_venue_lots().get(suf, 0))
+    except Exception:
+        return 0
 
 
 def _env_forecast_gate():
@@ -3117,7 +3195,10 @@ def _size_one(cand, criteria, budget_base, remaining):
     cap_sar = criteria["max_weight_pct"] / 100.0 * budget_base
     alloc = max(0.0, min(cap_sar, remaining))
     price_sar = cand["price_sar"] or 0.0
-    lot = max(1, int(criteria["lot_size"]))
+    # v1.11.0 [F-1]: venue board lot layered over the global criterion.
+    # _venue_lot_for_symbol returns 0 when TFB_T10_VENUE_LOTS is unset, so
+    # the unarmed path is byte-identical to v1.10.3.
+    lot = max(1, int(criteria["lot_size"]), _venue_lot_for_symbol(cand))
     shares = 0
     if price_sar > 0 and alloc >= price_sar * lot:
         shares = int(alloc // (price_sar * lot)) * lot
@@ -3246,6 +3327,22 @@ def _select_and_size(invest_cands, criteria, pf, sector_ctx):
                 "Diversification: market cap reached (" + mkt + ")")
             continue
         suggested, shares = _size_one(cand, criteria, budget_base, remaining)
+        # v1.11.0 [F-1 VENUE BOARD LOTS]: when the venue lot alone priced the
+        # name out (allocation buys >= 1 share but < 1 lot), say so honestly
+        # instead of letting it read as capital exhaustion. Inert while
+        # TFB_T10_VENUE_LOTS is unset (_vlot == 0 => v1.10.3 byte-for-byte).
+        _vlot = _venue_lot_for_symbol(cand)
+        if _vlot > 1 and shares == 0:
+            _p = cand["price_sar"] or 0.0
+            _alloc = max(0.0, min(
+                criteria["max_weight_pct"] / 100.0 * budget_base, remaining))
+            if _p > 0 and _alloc >= _p:
+                deferrals[cand["symbol"]] = (
+                    "Unfunded \u2014 one board lot (" +
+                    "{:,}".format(_vlot) + " sh \u2248 " +
+                    _fmt_sar(_p * _vlot) + ") exceeds the sized allocation " +
+                    _fmt_sar(_alloc))
+                continue
         # v1.0.14: minimum-ticket floor (OFF when min_ticket_sar <= 0). A sized
         # ticket below the floor is not a meaningful executable position (e.g.
         # 75 SAR / 4 sh from the last scraps of cash). Defer it instead of
