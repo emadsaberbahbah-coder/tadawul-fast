@@ -9,6 +9,7 @@ on:
       - 'core/providers/urgent_issuer_firewall.py'
       - 'scripts/__init__.py'
       - 'scripts/sync_integrity_v13.py'
+      - 'scripts/preserve_explicit_stubs.py'
       - 'scripts/klg_identity_gate_v131.py'
       - 'scripts/diagnose_data_free_rows_v13.py'
       - 'scripts/critical_symbol_identity.py'
@@ -26,6 +27,7 @@ on:
       - 'core/providers/urgent_issuer_firewall.py'
       - 'scripts/__init__.py'
       - 'scripts/sync_integrity_v13.py'
+      - 'scripts/preserve_explicit_stubs.py'
       - 'scripts/klg_identity_gate_v131.py'
       - 'scripts/diagnose_data_free_rows_v13.py'
       - 'scripts/critical_symbol_identity.py'
@@ -67,6 +69,7 @@ jobs:
             core/providers/urgent_issuer_firewall.py \
             scripts/__init__.py \
             scripts/sync_integrity_v13.py \
+            scripts/preserve_explicit_stubs.py \
             scripts/klg_identity_gate_v131.py \
             scripts/diagnose_data_free_rows_v13.py \
             scripts/critical_symbol_identity.py \
