@@ -4,6 +4,7 @@ import asyncio
 import types
 import unittest
 
+from scripts import preserve_explicit_stubs as stub_preserve
 from scripts import sync_integrity_v13 as patch
 
 
@@ -90,6 +91,56 @@ class SyncIntegrityV13Tests(unittest.TestCase):
             self.assertEqual(row[9], "DO_NOT_INVEST")
             self.assertEqual(row[10], "unavailable")
             self.assertIn(patch.MISSING_RESPONSE_TAG, row[6])
+
+    def test_explicit_missing_stub_survives_identity_guard(self):
+        from core.analysis import identity_guard
+
+        stub = dict(zip(HEADERS, patch.missing_response_stub(HEADERS, "MISSING.US")))
+        wrapped = stub_preserve.build_guard_wrapper(
+            identity_guard.guard_sheet_rows,
+            identity_guard,
+        )
+        plan = wrapped([stub], sheet="Global_Markets", run_dedup=False)
+        self.assertEqual([row["Symbol"] for row in plan.rows], ["MISSING.US"])
+        self.assertEqual(plan.rows[0]["Name"], "")
+        self.assertEqual(plan.rows[0]["Current Price"], "")
+        self.assertEqual(plan.rows[0]["Investability Status"], "BLOCKED")
+        self.assertEqual(plan.rows[0]["Final Action"], "DO_NOT_INVEST")
+        self.assertFalse(
+            any(
+                getattr(finding, "reason", "") == "pre_existing_blank_shell"
+                and getattr(finding, "symbol", "") == "MISSING.US"
+                for finding in plan.findings
+            )
+        )
+
+    def test_unexplained_legacy_shell_is_still_dropped(self):
+        from core.analysis import identity_guard
+
+        legacy = {
+            "Symbol": "LEGACY.US",
+            "Name": "",
+            "Current Price": "",
+            "Warnings": "",
+            "Block Reason": "",
+            "Investability Status": "",
+            "Final Action": "",
+            "Data Provider": "",
+            "Row Source": "",
+        }
+        wrapped = stub_preserve.build_guard_wrapper(
+            identity_guard.guard_sheet_rows,
+            identity_guard,
+        )
+        plan = wrapped([legacy], sheet="Global_Markets", run_dedup=False)
+        self.assertEqual(plan.rows, [])
+        self.assertTrue(
+            any(
+                getattr(finding, "reason", "") == "pre_existing_blank_shell"
+                and getattr(finding, "symbol", "") == "LEGACY.US"
+                for finding in plan.findings
+            )
+        )
 
     def test_exact_requested_spellings_do_not_merge(self):
         sync = types.SimpleNamespace()
