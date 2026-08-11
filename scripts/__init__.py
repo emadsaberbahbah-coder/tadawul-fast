@@ -21,6 +21,19 @@ except Exception as exc:  # pragma: no cover - startup resilience boundary
     )
 
 try:
+    from scripts.preserve_explicit_stubs import (
+        start_deferred_install as start_explicit_stub_preserve,
+    )
+
+    start_explicit_stub_preserve()
+except Exception as exc:  # pragma: no cover - startup resilience boundary
+    _log.warning(
+        "explicit missing-response preservation unavailable (%s: %s)",
+        exc.__class__.__name__,
+        exc,
+    )
+
+try:
     from scripts.klg_identity_gate_v131 import (
         start_deferred_install as start_klg_identity_install,
     )
