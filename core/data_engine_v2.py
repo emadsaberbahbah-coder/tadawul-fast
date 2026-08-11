@@ -3023,7 +3023,7 @@ if str(ROOT_DIR) not in sys.path:
 # now prints ohlc_coh=on/OFF beside the sibling guards. Zero functions
 # removed; five functions added.
 # =============================================================================
-__version__ = "5.126.0"
+__version__ = "5.127.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -14453,8 +14453,45 @@ class DataEngineV5:
         tasks = [self._get_enriched_quote_impl(sym, page) for sym in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out: List[Dict[str, Any]] = []
+        # v5.127.0 [BC-5 PAIR-BIND]: the 2026-08-11 live-log evidence
+        # (CancelledError storms followed by identity_guard REFUSED 25/25,
+        # zero echo-mismatch rejections) proved the last poison lane is the
+        # ASSEMBLY layer: shared/stale result dicts surfacing under a
+        # neighbouring requested symbol with a self-consistent echo. Two
+        # structural locks, default-ON (TFB_ENGINE_PAIR_BIND=0 disarms the
+        # stub substitution; the defensive copy is unconditional):
+        #   1. copy-at-assembly — every emitted row is this request's own
+        #      object; no shared mutable dict can leak across symbols.
+        #   2. pairing oath — a row whose own embedded identity names a
+        #      DIFFERENT symbol than the one it is being emitted under is
+        #      replaced by an honest degraded stub tagged pairing_mismatch.
+        _pair_bind = str(os.getenv("TFB_ENGINE_PAIR_BIND", "1")).strip().lower() not in ("0", "off", "false", "no")
         for sym, r in zip(symbols, results):
             if isinstance(r, dict):
+                r = dict(r)
+                if _pair_bind:
+                    _own = str(r.get("requested_symbol") or r.get("symbol") or "").strip().upper()
+                    _req = str(sym).strip().upper()
+                    if _own and _own != _req and _own != f"{_req}.US" and f"{_own}.US" != _req:
+                        logger.warning(
+                            "[engine_v2 v%s BC-5] pairing mismatch on page=%s: row for %s arrived under %s — stubbed, refetch next cycle",
+                            __version__, page or "?", _own, _req,
+                        )
+                        r = {
+                            "symbol": sym,
+                            "requested_symbol": sym,
+                            "data_provider": _degraded_provider_label(),
+                            "warnings": f"pairing_mismatch:{_own}:engine",
+                            "recommendation": "HOLD",
+                            "recommendation_detailed": "HOLD",
+                            "recommendation_source": "pairing_mismatch",
+                            "recommendation_reason": "HOLD: batch pairing mismatch; row quarantined for clean refetch.",
+                            "recommendation_priority": 4,
+                            "recommendation_priority_band": "P4",
+                            "confidence_bucket": "LOW",
+                            "last_updated_utc": _now_utc_iso(),
+                            "last_updated_riyadh": _now_riyadh_iso(),
+                        }
                 out.append(r)
                 continue
             if isinstance(r, BaseException):
