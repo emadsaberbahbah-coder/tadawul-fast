@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.0.0)
+# TADAWUL FAST BRIDGE -- NEWS / SENTIMENT ARCHIVE COLLECTOR  (v1.1.0)
 # -----------------------------------------------------------------------------
 # WHY THIS EXISTS (Strategy items (b) news->sector and (c) theme rotation):
 #   news_intelligence produces per-symbol sentiment / confidence / news_boost /
@@ -33,6 +33,27 @@
 #   - news_intelligence uses Google-News RSS: NO provider API key required;
 #     only GOOGLE_SHEETS_CREDENTIALS + a spreadsheet id are needed.
 # =============================================================================
+# v1.1.0 (2026-08-11) -- WRITE-TIME SECTOR JOIN (ENV-GATED, DEFAULT OFF)
+# -----------------------------------------------------------------------------
+# WHY: every archived row since 2026-06-22 carries a blank Sector -- the v1.0.0
+# design deferred the symbol->sector resolution to backtest time (see the
+# _row_from_result comment). That deferral makes every future consumer repeat
+# the join, and a sector-at-collection snapshot is HISTORICALLY truer: a
+# symbol's sector label can change (reclassification, ticker reuse), and the
+# backtest wants the label AS OF the observation date, which only write time
+# can capture.
+# WHAT: after the idempotency filter and before the append, when
+# TFB_NEWS_ARCHIVE_SECTOR_JOIN=1 the collector reads Symbol+Sector (cols A+C)
+# from the four pool pages of the SAME workbook it is writing to and fills
+# each fresh row's Sector cell from that map. FAIL-OPEN at every step: page
+# read errors, an empty map, or an unknown symbol leave Sector blank exactly
+# as v1.0.0 wrote it -- the join can never block or corrupt collection.
+# ENV: TFB_NEWS_ARCHIVE_SECTOR_JOIN (unset/0 => byte-identical v1.0.0 rows).
+# This script runs in the GitHub Actions sync context, so the flag belongs in
+# the WORKFLOW env (TFB ENV-placement rule), not the Render dashboard.
+# ZERO functions removed. Additions: _env_sector_join_enabled,
+# _sector_map_from_values, NewsArchiveStore.load_symbol_sector_map.
+# =============================================================================
 
 from __future__ import annotations
 
@@ -48,7 +69,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 SCRIPT_NAME = "news_archive_collector"
 
 # --- optional gspread (sheet write); script still runs in --dry-run without it
@@ -72,6 +93,38 @@ logging.basicConfig(
 logger = logging.getLogger("NewsArchive")
 
 _RIYADH_TZ = timezone(timedelta(hours=3))
+
+# v1.1.0: the four pool pages whose Symbol+Sector columns feed the write-time
+# sector join (canonical layout: Symbol = col A, Sector = col C).
+_SECTOR_JOIN_PAGES = ("Market_Leaders", "Global_Markets",
+                      "Commodities_FX", "Mutual_Funds")
+
+
+def _env_sector_join_enabled() -> bool:
+    """v1.1.0 [SECTOR JOIN] kill-switch -- DEFAULT OFF. Unset/0 keeps the
+    archive rows byte-identical to v1.0.0 (Sector blank)."""
+    return (os.getenv("TFB_NEWS_ARCHIVE_SECTOR_JOIN", "0") or "0").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _sector_map_from_values(values_by_page: Dict[str, List[List[Any]]]) -> Dict[str, str]:
+    """v1.1.0 PURE: {UPPER(symbol): sector} from per-page A2:C value grids.
+    First page wins on duplicates (Market_Leaders is authoritative for .SR).
+    Blank symbols/sectors are skipped; never raises."""
+    out: Dict[str, str] = {}
+    for page in _SECTOR_JOIN_PAGES:
+        try:
+            grid = values_by_page.get(page) or []
+            for row in grid:
+                if not row:
+                    continue
+                sym = str(row[0] or "").strip().upper()
+                sec = str(row[2] or "").strip() if len(row) > 2 else ""
+                if sym and sec and sym not in out:
+                    out[sym] = sec
+        except Exception:
+            continue
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -272,6 +325,22 @@ class NewsArchiveStore:
             rng = _a1_range(1, self.START_ROW, len(self.HEADERS), self.START_ROW)
             self.backoff.run(lambda: self.ws.update(values=[self.HEADERS], range_name=rng))
 
+    def load_symbol_sector_map(self) -> Dict[str, str]:
+        """v1.1.0: Symbol->Sector from the pool pages of THIS workbook.
+        FAIL-OPEN: any per-page error skips that page; total failure returns
+        {} and the caller leaves Sector blank (v1.0.0 behavior)."""
+        values_by_page: Dict[str, List[List[Any]]] = {}
+        if not self.sheet:
+            return {}
+        for page in _SECTOR_JOIN_PAGES:
+            try:
+                ws = self.sheet.worksheet(page)
+                values_by_page[page] = self.backoff.run(
+                    lambda w=ws: w.get_values("A2:C")) or []
+            except Exception as e:
+                logger.warning("sector join: page %s unreadable (%s)", page, e)
+        return _sector_map_from_values(values_by_page)
+
     def is_available(self) -> bool:
         return self.ws is not None
 
@@ -339,7 +408,8 @@ def _row_from_result(r: Dict[str, Any], date_str: str) -> Optional[List[Any]]:
     return [
         date_str,
         sym,
-        "",  # Sector -- resolved from the symbol->sector map at backtest time
+        "",  # Sector -- backtest-time resolution by default; v1.1.0 fills it
+            # at write time when TFB_NEWS_ARCHIVE_SECTOR_JOIN=1 (see collect())
         round(_safe_float(r.get("sentiment")), 4),
         round(_safe_float(r.get("confidence")), 4),
         round(_safe_float(r.get("news_boost")), 4),
@@ -418,6 +488,25 @@ async def collect(args: argparse.Namespace) -> int:
     if not fresh:
         print("[news_archive] nothing new to write for %s" % date_str)
         return 0
+
+    # v1.1.0 [SECTOR JOIN] -- env-gated, fail-open; see header WHY.
+    if _env_sector_join_enabled():
+        try:
+            smap = store.load_symbol_sector_map()
+        except Exception as e:
+            logger.warning("sector join failed (%s) -- Sector left blank", e)
+            smap = {}
+        if smap:
+            filled = 0
+            for row in fresh:
+                sec = smap.get(str(row[1]).strip().upper(), "")
+                if sec:
+                    row[2] = sec
+                    filled += 1
+            print("[news_archive] sector join: %d/%d fresh rows filled (map: %d symbols)"
+                  % (filled, len(fresh), len(smap)))
+        else:
+            print("[news_archive] sector join armed but map empty -- Sector left blank (fail-open)")
 
     ok = store.append(fresh)
     print("[news_archive] %s %d rows to %s" % ("wrote" if ok else "FAILED writing", len(fresh), store.sheet_name))
