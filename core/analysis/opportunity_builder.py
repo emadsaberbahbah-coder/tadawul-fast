@@ -988,7 +988,39 @@ from datetime import datetime, timedelta, timezone
 # _venue_lot_for_symbol. One line changed inside _size_one; one deferral
 # block added in the pick loop.
 # ---------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.11.0"
+# v1.12.0 [B4c CAP-BAND GATE — the manufactured-target fingerprint]
+# WHY (2026-08-11 evening forensics, runs eabc8e962bdb → a10e7cb52282 +
+# Actions #3271 artifacts): the inline FULL-FILL recovery (12:56–13:56,
+# 3 cycles, each blocked at 230–239/268 batches yet writing all 6,626 rows
+# live) minted 12M targets that are EXACTLY price × ~1.35 and stamped them
+# provider_target with re-rolled off-cluster reliabilities: VTMX.US
+# ×1.3445 (rel 76.5→82.4), MCY.US ×1.3463 (75.4→86.5), PTTEP.BK ×1.3498
+# (31.3→77.2), 0016.HK ×1.3500 (76.5→73.7). B4 gates the LABEL and B4b
+# gates the old cluster values — both blind to a manufactured VALUE wearing
+# a passing label. Until B4a (true value-level provenance from the engine)
+# lands post-S-1, this gate blocks the fingerprint itself: any candidate
+# whose implied 12M ratio (1 + engine_roi_12m_pct/100, normalized) falls
+# inside the manufactured band is excluded. Honest cost, stated plainly:
+# genuine ~35% forecasts are also excluded while armed — pre-calibrator,
+# a real 35% and a manufactured 35% are indistinguishable, and tonight
+# proved which is more common.
+# ENV (read at gate time):
+#   TFB_T10_EXCLUDE_CAP_BAND  unset/0 => gate absent, list and verdicts
+#                             byte-identical to v1.11.0 (S-1 window law).
+#                             1/true/yes/on => armed.
+#   TFB_T10_CAP_BAND          band as "lo-hi" (also ':' or ','), default
+#                             1.335-1.365. Junk falls back to the default.
+# ALSO [GATE_ORDER — self-caught v1.10.3 omission, owned]: the
+# "Reliability Cluster" gate was appended in evaluate_gates but never
+# registered in GATE_ORDER, so first_failed_gate sorted it to 99 and could
+# mis-attribute the near-miss surface (the v1.0.7 lesson, violated by the
+# v1.10.3 build itself). Both "Reliability Cluster" and the new
+# "Forecast Cap Band" are now registered at their true append positions.
+# Selection was never affected — attribution ordering only.
+# GATE DEFAULT: **OFF**. ZERO functions removed. Additions:
+# _env_cap_band_gate, _env_cap_band, _cap_band_assessment.
+# ---------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.12.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1259,6 +1291,12 @@ GATE_ORDER = (
     # v1.10.0: appended immediately after "Forecast" in evaluate_gates —
     # registered here at its TRUE position (the v1.0.7 GATE_ORDER lesson).
     "Forecast Provenance",
+    # v1.12.0: BOTH lines below are registration fixes at true append
+    # positions — "Reliability Cluster" was appended in evaluate_gates by
+    # v1.10.3 but never registered here (self-caught omission, header WHY);
+    # "Forecast Cap Band" appends immediately after it.
+    "Reliability Cluster",
+    "Forecast Cap Band",
     "Reliability", "Data Quality", "Data Trust",
     # v1.9.0: the v1.0.7 lesson COMPLETED — these four have appended between
     # Data Trust and Investability since v1.0.6/v1.5.0/v1.8.0 but were never
@@ -1494,6 +1532,49 @@ def _venue_lot_for_symbol(cand_or_symbol):
         return int(_env_venue_lots().get(suf, 0))
     except Exception:
         return 0
+
+
+_DEFAULT_CAP_BAND = (1.335, 1.365)
+
+
+def _env_cap_band_gate():
+    """v1.12.0 [B4c] kill-switch — DEFAULT OFF. Unset/0 keeps the gate
+    list and every verdict byte-identical to v1.11.0."""
+    return str(_env_str("TFB_T10_EXCLUDE_CAP_BAND", "0") or "0").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _env_cap_band():
+    """v1.12.0 [B4c]: (lo, hi) implied-ratio band from TFB_T10_CAP_BAND
+    ("lo-hi", ':' or ',' accepted). Junk/inverted/out-of-domain values fall
+    back to _DEFAULT_CAP_BAND. Never raises."""
+    raw = str(_env_str("TFB_T10_CAP_BAND", "") or "").strip()
+    if not raw:
+        return _DEFAULT_CAP_BAND
+    try:
+        norm = raw.replace(":", "-").replace(",", "-")
+        parts = [p for p in (x.strip() for x in norm.split("-")) if p]
+        lo, hi = float(parts[0]), float(parts[1])
+        if 1.0 < lo < hi:
+            return (lo, hi)
+    except Exception:
+        pass
+    return _DEFAULT_CAP_BAND
+
+
+def _cap_band_assessment(cand):
+    """v1.12.0 [B4c]: (ok, current_text) for the Forecast Cap Band gate.
+    ok=True when the implied 12M ratio sits OUTSIDE the manufactured band;
+    blank/unparseable forecasts PASS (the Forecast gate owns those)."""
+    try:
+        pct = _engine_roi_to_pct(cand.get("engine_roi_12m_pct"))
+    except Exception:
+        pct = None
+    if pct is None:
+        return True, "—"
+    ratio = round(1.0 + (pct / 100.0), 4)
+    lo, hi = _env_cap_band()
+    return (not (lo <= ratio <= hi)), ("\u00d7%.4f" % ratio)
 
 
 def _env_forecast_gate():
@@ -2809,6 +2890,21 @@ def evaluate_gates(cand, criteria, held_symbols=None):
             "Reliability Cluster", _rc_ok, FAIL_MAJOR, _rc_cur,
             "reliability off the default-confidence cluster "
             + _rel_cluster_values_text() + " (blank/Unknown passes)"))
+
+    # v1.12.0 [B4c FORECAST CAP-BAND GATE]: the manufactured-target
+    # fingerprint (12M target ≈ price × ~1.35, minted by degraded
+    # enrichment and stamped provider_target — header WHY: the 2026-08-11
+    # recovery cycles) must never be sized as a ticket. Value-level check,
+    # source-agnostic. Appended ONLY when armed, so the gate list and every
+    # verdict are byte-identical to v1.11.0 while TFB_T10_EXCLUDE_CAP_BAND
+    # is unset (S-1 window law).
+    if _env_cap_band_gate():
+        _cb_ok, _cb_cur = _cap_band_assessment(cand)
+        _cb_lo, _cb_hi = _env_cap_band()
+        g.append(_gate(
+            "Forecast Cap Band", _cb_ok, FAIL_MAJOR, _cb_cur,
+            "implied 12M ratio outside the manufactured band "
+            "\u00d7[%.3f\u2013%.3f] (blank passes)" % (_cb_lo, _cb_hi)))
 
     rel = cand["reliability"]
     min_rel = criteria["min_reliability"]
