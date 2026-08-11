@@ -917,7 +917,48 @@ from datetime import datetime, timedelta, timezone
 # ZERO functions removed. Additions: _env_forecast_provenance_gate,
 # _env_synthetic_source_tokens, _forecast_provenance_assessment.
 # ---------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.10.2"
+# v1.10.3 [B4b RELIABILITY-CLUSTER GATE — the fingerprint B4 cannot see]
+# WHY: the v1.10.0 Forecast Provenance gate keys on forecast_source ==
+# phase_ii_synthetic and fails open on blank / provider_target — correct
+# for its threat (a synthesized forecast sized as a ticket), but the
+# operator-confirmed default-confidence ARITHMETIC fingerprint rides rows
+# whose forecast_source is provider_target or blank: reliability lands
+# EXACTLY on the cluster 70.4 / 71.5 / 75.4 / 76.5. Evidence (2026-08-11
+# board, run 09:18:48, req 23ee5d199004, gate armed): DDI.US rel 70.4
+# seated as a day-1 FAST-TRACK ticket with earnings <=0d; PCG.US rel 70.4
+# pending 1/3; SAFE.L / ARCO.US 71.5 and the 76.5 crowd across the
+# qualified 50 — zero "Forecast Provenance" First-Fails in 300 audit rows
+# because the key never matches. Reliability flapping on these rows is the
+# documented churn driver (the 08-09 seven-name GRACE cascade). Until now
+# the only defense was the operator's manual Phase-0 discard rule.
+# WHAT: a "Reliability Cluster" gate, appended immediately AFTER Forecast
+# Provenance and BEFORE the tiered Reliability gate (same GATE_ORDER logic:
+# provenance-class rejections must attribute first_failed_gate ahead of the
+# generic reliability tiers). ok=False only when round(reliability, 1)
+# equals a member of the cluster set; None / unparseable reliability PASSES
+# (fail-open — the tiered Reliability gate below owns the missing-value
+# verdict). Fails MAJOR => DO_NOT_INVEST; appears in audit / near-miss /
+# DATA GAPS, never selected, never sized.
+# ENV STYLE: read directly at gate time (the v1.4.0 Quote Freshness
+# precedent; v1.10.0 followed it) — the value set is non-scalar and the
+# criteria coercion tuples stay untouched.
+#   TFB_T10_EXCLUDE_REL_CLUSTER   (kill-switch, DEFAULT OFF: unset/0 =>
+#                                  v1.10.2 gate list, verdicts and tickets
+#                                  byte-for-byte)
+#   TFB_T10_REL_CLUSTER_VALUES    (csv override of the cluster values;
+#                                  ';' accepted as ','; blank/unparseable
+#                                  => default 70.4,71.5,75.4,76.5 — a newly
+#                                  identified cluster value needs no code
+#                                  change)
+# GATE DEFAULT: **OFF**. This gate CHANGES recommendations, and the S-1
+# certification window (closes 2026-08-16) forbids silent alteration of
+# recommendations/tickets/shadow-board evidence. The operator arms it
+# deliberately, as a declared separate act, exactly like v1.10.0.
+# ZERO functions removed. Additions: _env_rel_cluster_gate,
+# _env_rel_cluster_values, _rel_cluster_values_text,
+# _rel_cluster_assessment.
+# ---------------------------------------------------------------------------
+OPPORTUNITY_BUILDER_VERSION = "1.10.3"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1320,6 +1361,61 @@ def _forecast_provenance_assessment(cand):
     if not norm:
         return True, "Unknown"
     return (norm not in _env_synthetic_source_tokens()), raw
+
+
+_DEFAULT_REL_CLUSTER_VALUES = (70.4, 71.5, 75.4, 76.5)
+
+
+def _env_rel_cluster_gate():
+    """v1.10.3 [B4b RELIABILITY-CLUSTER GATE] kill-switch — DEFAULT OFF.
+    TFB_T10_EXCLUDE_REL_CLUSTER=1 arms the gate; unset/0 restores the
+    v1.10.2 gate list, verdicts and tickets byte-for-byte (S-1 window law
+    — see the header WHY block)."""
+    return str(_env_str("TFB_T10_EXCLUDE_REL_CLUSTER", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _env_rel_cluster_values():
+    """v1.10.3: the reliability values treated as the default-confidence
+    cluster, as a frozenset of one-decimal strings. Operator-tunable via
+    TFB_T10_REL_CLUSTER_VALUES (csv; ';' accepted as ','), so a newly
+    identified cluster value can be covered without a code change.
+    Empty / blank / fully-unparseable env => the default set."""
+    raw = str(_env_str("TFB_T10_REL_CLUSTER_VALUES", "") or "").replace(";", ",")
+    vals = []
+    for t in raw.split(","):
+        t = str(t).strip()
+        if not t:
+            continue
+        try:
+            vals.append("%.1f" % float(t))
+        except (TypeError, ValueError):
+            continue
+    if not vals:
+        vals = ["%.1f" % v for v in _DEFAULT_REL_CLUSTER_VALUES]
+    return frozenset(vals)
+
+
+def _rel_cluster_values_text():
+    """v1.10.3: stable display text for the armed cluster set (sorted,
+    one-decimal), used in the gate's required-text."""
+    return "{" + ", ".join(sorted(_env_rel_cluster_values())) + "}"
+
+
+def _rel_cluster_assessment(cand):
+    """v1.10.3: (ok, current_text) for the Reliability Cluster gate.
+    ok=False only when the candidate's reliability, rounded to one
+    decimal, equals a member of the cluster set. None / unparseable
+    reliability PASSES this gate — fail-open by design (header WHY): the
+    tiered Reliability gate below owns the missing-value verdict; this
+    gate exists solely to catch the default-confidence fingerprint."""
+    rel = (cand or {}).get("reliability")
+    try:
+        rel_f = float(rel)
+    except (TypeError, ValueError):
+        return True, "Unknown"
+    cur = "%.1f" % rel_f
+    return (cur not in _env_rel_cluster_values()), cur
 
 
 def _env_forecast_gate():
@@ -2620,6 +2716,21 @@ def evaluate_gates(cand, criteria, held_symbols=None):
             "Forecast Provenance", _pv_ok, FAIL_MAJOR, _pv_cur,
             "provider-backed forecast (synthesized basis blocked; "
             "blank/Unknown passes)"))
+
+    # v1.10.3 [B4b RELIABILITY-CLUSTER GATE]: the default-confidence
+    # arithmetic fingerprint (reliability exactly on the operator-confirmed
+    # cluster 70.4 / 71.5 / 75.4 / 76.5) must never be sized as a ticket,
+    # regardless of forecast_source — provider_target / blank rows carry it
+    # too (header WHY: the 2026-08-11 board — DDI.US 70.4 seated day-1,
+    # PCG.US 70.4 pending). Appended ONLY when armed, so the gate list and
+    # every verdict are byte-identical to v1.10.2 while
+    # TFB_T10_EXCLUDE_REL_CLUSTER is unset (S-1 window law).
+    if _env_rel_cluster_gate():
+        _rc_ok, _rc_cur = _rel_cluster_assessment(cand)
+        g.append(_gate(
+            "Reliability Cluster", _rc_ok, FAIL_MAJOR, _rc_cur,
+            "reliability off the default-confidence cluster "
+            + _rel_cluster_values_text() + " (blank/Unknown passes)"))
 
     rel = cand["reliability"]
     min_rel = criteria["min_reliability"]
