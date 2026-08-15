@@ -139,7 +139,7 @@ jobs:
         env:
           TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-          TFB_BACKEND_URL: ${{ vars.BACKEND_BASE_URL }}
+          TFB_BACKEND_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
         run: |
           python - <<'PY'
           import json, os, sys
@@ -195,8 +195,12 @@ jobs:
           # only carry the revoked key, so the raw JSON secret is passed and
           # the B64 line is deliberately gone (raw suppresses b64 in-script).
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-          # Was: secrets.TFB_BACKEND_URL (existence never proven).
-          TFB_BACKEND_URL: ${{ vars.BACKEND_BASE_URL }}
+          # Was: secrets.TFB_BACKEND_URL (nonexistent, per the 15-Aug secrets
+          # census). vars.BACKEND_BASE_URL is ALSO absent from the variables
+          # census - daily_sync survives via exactly this fallback idiom (its
+          # own lines 655 and 1273). Same idiom here; H0 item: create the
+          # Variable so the fallback stops carrying production.
+          TFB_BACKEND_URL: ${{ vars.BACKEND_BASE_URL || 'https://tadawul-fast-bridge.onrender.com' }}
           TFB_IQR_SYMBOL_PAGES: "Top_10_Investments,My_Portfolio,Shadow_Board"
           TFB_IQR_TARGET_PAGES: "Market_Leaders,Global_Markets"
           TFB_IQR_MAX_SYMBOLS: "400"
