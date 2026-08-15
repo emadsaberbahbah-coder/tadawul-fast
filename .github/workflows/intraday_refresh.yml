@@ -25,6 +25,67 @@ name: Intraday Quote Refresh
 # Sunday..Thursday. Every 15 minutes across the session keeps the worst-case
 # quote age inside the 15-minute gate. 21 short runs per session day.
 # =============================================================================
+# H4 2026-08-16 (prepared 2026-08-15) — ENV CONTRACT REPAIR
+#
+# EVIDENCE (measured, not inferred):
+#   * Every scheduled run of this workflow has FAILED — zero lifetime
+#     successes. Recon window (adjudicated 2026-08-14): 31 observed runs, 31
+#     failures, against 105 nominal ticks — 29.5% cron delivery. An external
+#     15-Aug check reports 59 lifetime failures; that lifetime total is
+#     carried to H0 for primary verification (GitHub API rate-limited from
+#     the build host). Either count means the same thing: 100% failure.
+#   * The refresh step passed
+#     TARGET_SHEET_ID and DEFAULT_SPREADSHEET_ID from `secrets.TARGET_SHEET_ID`
+#     — a secret that does not exist in this repo. GitHub renders an undefined
+#     secret as an EMPTY string (no error), so intraday_quote_refresh.py's
+#     resolution chain (cli -> TARGET_SHEET_ID -> DEFAULT_SPREADSHEET_ID ->
+#     SPREADSHEET_ID, script lines 277-283) found nothing and exited
+#     "No spreadsheet id". Deterministic — explains every observed failure.
+#   * The PROVEN contract is the one daily_sync.yml used successfully today
+#     (runs #3312/#3313 wrote 1,539 rows): repo Variable
+#     vars.DEFAULT_SPREADSHEET_ID for the workbook and repo Secret
+#     secrets.GOOGLE_SHEETS_CREDENTIALS (raw service-account JSON, rotated
+#     2026-08-15 in Phase 0) for auth. Both are demonstrably live.
+#   * The old env passed ONLY GOOGLE_SHEETS_CREDENTIALS_B64. After the
+#     2026-08-15 key rotation that secret — if it exists at all — can only
+#     hold the REVOKED key f7b62c1f. The line is therefore removed, not kept
+#     as a fallback: a fallback that authenticates with a dead key is worse
+#     than a clean failure. The script prefers raw JSON when present (line
+#     289-292: `if b64 and not raw`), so passing raw also makes any stale
+#     B64 inert wherever it still exists.
+#   * TFB_BACKEND_URL came from `secrets.TFB_BACKEND_URL` (existence never
+#     proven). An empty backend url is a hard exit 2 in --apply (script line
+#     385-387). Switched to vars.BACKEND_BASE_URL — proven live today by
+#     daily_sync's own preflight ("Backend ... Health: healthy").
+#
+# NEW: a PREFLIGHT step fails the run BEFORE any write path when the env
+# contract is broken, with the exact remediation named — and refuses the
+# retired V1 workbook family (19oloY...) outright, so a mis-set Variable can
+# never produce a wrong-workbook write. (H4 exit: "manual canary succeeds
+# with no wrong-workbook write".)
+#
+# AUDIT RESPONSE (external audit 2026-08-15, adjudicated same day):
+#   * actions/checkout v4->v5 and setup-python v5->v6 — aligned to the pins
+#     daily_sync itself runs (verified in-repo: daily_sync.yml lines 113/119);
+#     the repo baseline is v5/v6 across 28 of 35 pin sites.
+#   * NEW guard step: a manual APPLY dispatch is refused unless it runs from
+#     refs/heads/main — production credentials never execute branch code.
+#   * BEHAVIOUR CHANGE (the only one, operator-flagged): the manual-dispatch
+#     `apply` input default flips "true" -> "false". An accidental dispatch
+#     is now a dry-run; writing requires explicitly setting apply=true.
+#     SCHEDULED runs are untouched — the schedule branch never reads this
+#     input and always runs --apply, exactly as before.
+#   * The original header's claim that this cadence "keeps" quote age inside
+#     the 15-minute gate is preserved above as authored, but measured cron
+#     delivery is 29.5% — GitHub schedule is a TARGET, not a guarantee.
+#     Freshness telemetry/postconditions are registered follow-ups (script
+#     exit semantics, dual-writer race, timestamp contract), not this hotfix.
+#
+# UNCHANGED by this repair: both cron lines, the concurrency group, the
+# permissions block, the 8-minute timeout, the selftest gate, all TFB_IQR_*
+# tuning values, and the script invocation itself. Config contract only —
+# zero recommendation impact, per the H batch rule.
+# =============================================================================
 
 on:
   schedule:
@@ -37,7 +98,7 @@ on:
       apply:
         description: "write cells (false = dry-run)"
         required: false
-        default: "true"
+        default: "false"
 
 concurrency:
   # Never let two refreshes overlap. cancel-in-progress because a newer quote
@@ -58,12 +119,63 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+
+      - name: Guard - production apply only from main
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.event.inputs.apply }}" = "true" ] && \
+             [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Production apply is allowed only from main (got ${{ github.ref }}). Dry-run (apply=false) is permitted from any ref."
+            exit 1
+          fi
+
+      - name: Preflight (env contract — fail closed before any write path)
+        env:
+          TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          TFB_BACKEND_URL: ${{ vars.BACKEND_BASE_URL }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+
+          sid = (os.getenv("TARGET_SHEET_ID") or "").strip()
+          if not sid:
+              sys.exit("PREFLIGHT FAIL: workbook id is EMPTY - repo Variable "
+                       "DEFAULT_SPREADSHEET_ID is unset for this workflow. "
+                       "(The pre-H4 file read secrets.TARGET_SHEET_ID, which "
+                       "does not exist; that gap produced 31/31 failures.)")
+          if sid.startswith("19oloY"):
+              sys.exit("PREFLIGHT FAIL: workbook id belongs to the RETIRED V1 "
+                       "workbook family (19oloY...). Refusing to write.")
+          print("preflight: workbook id OK (%s...)" % sid[:12])
+
+          raw = os.getenv("GOOGLE_SHEETS_CREDENTIALS") or ""
+          try:
+              info = json.loads(raw)
+              ok = (info.get("type") == "service_account"
+                    and bool(info.get("client_email"))
+                    and bool(info.get("private_key")))
+          except Exception:
+              ok = False
+          if not ok:
+              sys.exit("PREFLIGHT FAIL: secrets.GOOGLE_SHEETS_CREDENTIALS is "
+                       "missing or is not a service-account JSON. This is the "
+                       "secret rotated 2026-08-15; daily_sync proves it works.")
+          print("preflight: credentials parse OK (service_account, "
+                "client_email present)")
+
+          if not (os.getenv("TFB_BACKEND_URL") or "").strip():
+              sys.exit("PREFLIGHT FAIL: backend url is EMPTY - repo Variable "
+                       "BACKEND_BASE_URL is unset for this workflow. An empty "
+                       "url is a hard exit 2 inside --apply.")
+          print("preflight: backend url OK")
+          PY
 
       - name: Install dependencies
         run: |
@@ -75,10 +187,16 @@ jobs:
 
       - name: Refresh decision-symbol quotes
         env:
-          TARGET_SHEET_ID: ${{ secrets.TARGET_SHEET_ID }}
-          DEFAULT_SPREADSHEET_ID: ${{ secrets.TARGET_SHEET_ID }}
-          GOOGLE_SHEETS_CREDENTIALS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
-          TFB_BACKEND_URL: ${{ secrets.TFB_BACKEND_URL }}
+          # H4 2026-08-16: proven contract (see WHY addendum above).
+          # Was: secrets.TARGET_SHEET_ID (nonexistent -> empty -> 31/31 dead).
+          TARGET_SHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          # Was: GOOGLE_SHEETS_CREDENTIALS_B64 only - post-rotation that can
+          # only carry the revoked key, so the raw JSON secret is passed and
+          # the B64 line is deliberately gone (raw suppresses b64 in-script).
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          # Was: secrets.TFB_BACKEND_URL (existence never proven).
+          TFB_BACKEND_URL: ${{ vars.BACKEND_BASE_URL }}
           TFB_IQR_SYMBOL_PAGES: "Top_10_Investments,My_Portfolio,Shadow_Board"
           TFB_IQR_TARGET_PAGES: "Market_Leaders,Global_Markets"
           TFB_IQR_MAX_SYMBOLS: "400"
