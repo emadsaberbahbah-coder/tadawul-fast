@@ -477,6 +477,34 @@ from __future__ import annotations
 #       (INVEST anywhere in the note's first 60 chars; grace/exit notes
 #       carry no INVEST and remain excluded).
 # ---------------------------------------------------------------------------
+# v1.17.1 — [H-3] ORPHANED LOGGER CALLS (fixes 21/21 workflow failures)
+# ---------------------------------------------------------------------------
+# EVIDENCE: daily_brief.yml — 21 runs, 21 failures, every one
+#   "NameError: name 'log' is not defined" at run_daily_brief.py:1810.
+# ROOT CAUSE, measured on this file at baseline a0f9c0fd:
+#   * "logging" appears ZERO times in all 3,249 lines — no import, no
+#     getLogger, no LOG/logger/_log binding anywhere.
+#   * Exactly TWO references to a bare `log.` exist: lines 1810 and 1826,
+#     both introduced by v1.17.0 items (D1) and (D2).
+#   So this is not a mistyped logger name. The v1.17.0 work wrote two
+#   log.info() calls into a module that has never had logging at all.
+# WHY IT FIRES EVERY RUN: both call sites sit inside guards that default
+#   ON — _unit_coherence_enabled() and _candidate_earnings_guard_enabled()
+#   each read `os.getenv(...) or "1"`. So as soon as either has something
+#   to report, the undefined name is evaluated and the process dies.
+# FIX SHAPE (deliberately NOT `import logging`): this module's established
+#   idiom is sys.stderr.write(f"[brief] ...") — 12 existing call sites, and
+#   `sys` is already imported at module top (baseline a0f9c0fd line 574). Adding a logging subsystem would
+#   introduce handler/level configuration this script has never needed, and
+#   a bare getLogger would silently swallow INFO with no handler attached.
+#   Both sites are converted to the native idiom. No new import, no new
+#   dependency, no configuration surface.
+# SCOPE: message emission only. No parser, no model, no rendering, no
+#   recommendation path is touched — H's zero-recommendation-impact rule.
+# NOT PROVEN: the workflow has never completed successfully, so a later
+#   failure may exist downstream of line 1826. This fix removes the one
+#   defect proven by the traceback; the canary decides the rest.
+# ---------------------------------------------------------------------------
 # v1.17.0 — [UNIT-COHERENCE] + [CAND-EARNINGS-GUARD]
 # ---------------------------------------------------------------------------
 # EVIDENCE (2026-08-06 13:06 sent brief, adjudicated same day):
@@ -506,7 +534,7 @@ from __future__ import annotations
 # _fix_metrics_units, _candidate_earnings_guard_enabled, _note_earn_days,
 # _filter_candidates_earnings, _earnings_held_line.
 # ---------------------------------------------------------------------------
-__version__ = "1.17.0"
+__version__ = "1.17.1"
 # =========================================================================
 # v1.16.0 (2026-07-26) - THE PDF BECOMES EXECUTABLE AND STOPS TRUNCATING
 # =========================================================================
@@ -1807,8 +1835,11 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
     if _unit_coherence_enabled():
         _n_units = _fix_metrics_units(metrics)
         if _n_units:
-            log.info("%s normalized %d metric row(s) via price coherence",
-                     _UNIT_COHERENCE_TAG, _n_units)
+            # v1.17.1 (H-3): was log.info(...) — no logger has ever existed in
+            # this module. Emitted through the file's own stderr idiom instead.
+            sys.stderr.write(
+                f"[brief] {_UNIT_COHERENCE_TAG} normalized {_n_units} "
+                f"metric row(s) via price coherence\n")
     # v1.10.0 (BR-1): send-time coherence guard — demote ADD/EXIT recs whose
     # decision-layer signal disagrees with the freshest per-symbol reading.
     _apply_signal_coherence(decision, metrics)
@@ -1823,9 +1854,12 @@ def build_model(pages_data: Dict[str, List[List[Any]]]) -> Dict[str, Any]:
         top10, _earn_held = _filter_candidates_earnings(
             top10, calendar, _dt.datetime.now())
         if _earn_held:
-            log.info("%s held back %d candidate(s): %s", _CAND_EARN_TAG,
-                     len(_earn_held),
-                     ", ".join(str(h.get("symbol")) for h in _earn_held))
+            # v1.17.1 (H-3): was log.info(...) — see the site above.
+            sys.stderr.write(
+                f"[brief] {_CAND_EARN_TAG} held back {len(_earn_held)} "
+                "candidate(s): "
+                + ", ".join(str(h.get("symbol")) for h in _earn_held)
+                + "\n")
     # v1.14.0 (F1): the builder's own funnel numbers off the Top_10 sheet.
     funnel = _extract_top10_funnel(pages_data.get(PAGE_TOP10, []))
     # v1.15.0: shadow rotation top pairs off Shadow_Board.
