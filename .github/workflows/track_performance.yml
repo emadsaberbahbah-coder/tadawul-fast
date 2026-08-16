@@ -212,7 +212,7 @@ jobs:
 
       - name: 📤 Upload reports + log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tfb-performance-clock-${{ github.run_id }}
           path: |
