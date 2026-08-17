@@ -3027,7 +3027,12 @@ if str(ROOT_DIR) not in sys.path:
 # tags interpolate __version__ (STRUCT was stamped 5.95.0, FLOW 5.98.0
 # while the module ran 5.127.0). Comment-only mentions untouched. Zero
 # behavioral change.
-__version__ = "5.127.1"
+# v5.127.2 (2026-08-17, IR-071 / external audit P0-8 CONFIRMED): Insights
+# Portfolio Summary totals now convert every holding to BASE currency via
+# _pf_fx_table before summing (was: native sum labelled SAR — wrong for any
+# mixed-currency book). Missing rate for any held currency => totals
+# SUPPRESSED with an explicit note, never a mixed-unit number (A19/A20).
+__version__ = "5.127.2"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -7946,6 +7951,39 @@ def _pf_fx_age_days() -> Optional[float]:
         return max(0.0, (datetime.utcnow() - d).total_seconds() / 86400.0)
     except Exception:
         return None
+
+
+def _insights_base_totals(pf: List[Dict[str, Any]],
+                          fx: Dict[str, float]) -> Dict[str, Any]:
+    """v5.127.2 (IR-071 / audit P0-8, A19-A20): base-currency portfolio totals.
+
+    position_value / position_cost are NATIVE currency by contract; summing
+    them and labelling the result SAR was wrong for any mixed-currency book
+    (live example 2026-08-17: USD+SGD+SAR holdings rendered ~27,430 "SAR"
+    against a true ~70,327). Every row converts through the SAME fx table the
+    weight math already uses (_pf_fx_table -> operator TFB_PF_FX_RATES wins).
+    A single holding whose currency is missing from the table SUPPRESSES the
+    totals entirely (complete=False) -- a blank is honest, a mixed-unit sum
+    is not. Pure function; no I/O."""
+    tot_mv = 0.0
+    tot_cost = 0.0
+    missing: List[str] = []
+    for r in pf:
+        if not isinstance(r, dict):
+            continue
+        if (_as_float(r.get("position_qty")) or 0.0) <= 0.0:
+            continue
+        ccy = _safe_str(r.get("currency") or "").upper() or "SAR"
+        f = fx.get(ccy)
+        if f is None or f <= 0.0:
+            missing.append(ccy or "?")
+            continue
+        tot_mv += (_as_float(r.get("position_value")) or 0.0) * f
+        tot_cost += (_as_float(r.get("position_cost")) or 0.0) * f
+    complete = not missing
+    return {"complete": complete, "tot_mv": tot_mv if complete else None,
+            "tot_cost": tot_cost if complete else None,
+            "missing": sorted(set(missing))}
 
 
 def _pf_fx_table(fx_rates: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
@@ -14617,16 +14655,30 @@ class DataEngineV5:
         # ---- Portfolio Summary ----
         pf = page_data.get("My_Portfolio", []) or []
         _compute_portfolio_fields(pf)
-        tot_mv = sum((_as_float(r.get("position_value")) or 0.0) for r in pf if isinstance(r, dict))
-        tot_cost = sum((_as_float(r.get("position_cost")) or 0.0) for r in pf if isinstance(r, dict))
-        pl = tot_mv - tot_cost
-        pl_pct = (pl / tot_cost * 100.0) if tot_cost > 0 else None
+        # v5.127.2 (IR-071): totals in BASE currency via the same fx table the
+        # weight pass uses; suppressed (blank + note) when any rate is missing.
+        _fx_tbl = _pf_fx_table(None)
+        _tot = _insights_base_totals(pf, _fx_tbl)
+        _asof = _safe_str(os.getenv("TFB_PF_FX_AS_OF")) or "built-in/env"
         held = [r for r in pf if isinstance(r, dict) and (_as_float(r.get("position_qty")) or 0.0) > 0.0]
         add("Portfolio Summary", "Holdings", "count", len(held))
-        add("Portfolio Summary", "Total Market Value", "SAR", round(tot_mv, 2))
-        add("Portfolio Summary", "Total Cost", "SAR", round(tot_cost, 2))
-        add("Portfolio Summary", "Unrealized P/L", "SAR", round(pl, 2),
-            notes=("%+.2f%%" % pl_pct if pl_pct is not None else ""))
+        if _tot["complete"]:
+            pl = _tot["tot_mv"] - _tot["tot_cost"]
+            pl_pct = (pl / _tot["tot_cost"] * 100.0) if _tot["tot_cost"] > 0 else None
+            add("Portfolio Summary", "Total Market Value", "SAR",
+                round(_tot["tot_mv"], 2), notes="base=SAR; fx as-of %s" % _asof)
+            add("Portfolio Summary", "Total Cost", "SAR",
+                round(_tot["tot_cost"], 2), notes="base=SAR; fx as-of %s" % _asof)
+            add("Portfolio Summary", "Unrealized P/L", "SAR", round(pl, 2),
+                notes=("%+.2f%%" % pl_pct if pl_pct is not None else ""))
+        else:
+            _miss = ",".join(_tot["missing"])
+            add("Portfolio Summary", "Total Market Value", "SAR", "",
+                notes="SUPPRESSED: no base-ccy rate for %s (IR-071/A20)" % _miss)
+            add("Portfolio Summary", "Total Cost", "SAR", "",
+                notes="SUPPRESSED: no base-ccy rate for %s" % _miss)
+            add("Portfolio Summary", "Unrealized P/L", "SAR", "",
+                notes="SUPPRESSED: no base-ccy rate for %s" % _miss)
 
         # ---- Allocation vs Target ----
         for r in pf:
