@@ -1,0 +1,102 @@
+name: Provider Target Coverage Alert
+
+# W1B-1 v1.1 — read-only forecast-provenance coverage audit.
+# External audit 2026-08-17 (4 P0 accepted): the cached file is now the
+# LAST-GOOD reference, mutated by the Python only on eligible healthy runs
+# (upward) or explicit operator acceptance — so persisting it on every
+# path is safe by construction. Observation + report are separate,
+# always-written evidence artifacts. Scheduled runs with no baseline are
+# control-health failures (exit 2); first deployment runs manual dispatch
+# with bootstrap=true after a verified healthy sync.
+#
+# Exit codes: 0 healthy/bootstrap · 1 coverage failure · 2 control-health.
+
+on:
+  schedule:
+    - cron: "20 6 * * *"   # after the morning sync legs write the pages
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: "First deployment: create the baseline (run after a verified healthy sync)"
+        type: boolean
+        default: false
+      accept_baseline:
+        description: "Operator acceptance of a lower structural baseline (one-shot)"
+        type: boolean
+        default: false
+      drop_pct:
+        description: "Relative drop % that FAILs (default 20)"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provider-target-coverage
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Self-test (pure core, no I/O)
+        run: python scripts/audit_provider_target_coverage.py --selftest
+
+      - name: Restore last-good baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: provider_target_last_good.json
+          key: ptc-lastgood-${{ github.run_id }}
+          restore-keys: |
+            ptc-lastgood-
+
+      - name: Audit provider-target coverage
+        env:
+          DEFAULT_SPREADSHEET_ID: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          TFB_PTC_DROP_PCT: ${{ github.event.inputs.drop_pct || vars.TFB_PTC_DROP_PCT || '20' }}
+          TFB_PTC_ROW_DROP_PCT: ${{ vars.TFB_PTC_ROW_DROP_PCT || '30' }}
+          TFB_PTC_MIN_ROWS: ${{ vars.TFB_PTC_MIN_ROWS || '50' }}
+          TFB_PTC_FLOOR_PCT: ${{ vars.TFB_PTC_FLOOR_PCT || '0' }}
+          TFB_PTC_BASELINE_MAX_AGE_H: ${{ vars.TFB_PTC_BASELINE_MAX_AGE_H || '72' }}
+          TFB_PTC_ZERO_PAGES: ${{ vars.TFB_PTC_ZERO_PAGES || 'Commodities_FX,Mutual_Funds' }}
+          TFB_PTC_PAGES: ${{ vars.TFB_PTC_PAGES || '' }}
+          TFB_PTC_BOOTSTRAP: ${{ github.event.inputs.bootstrap == 'true' && '1' || '0' }}
+          TFB_PTC_ACCEPT_BASELINE: ${{ github.event.inputs.accept_baseline == 'true' && '1' || '0' }}
+          TFB_PTC_FREEZE: ${{ vars.TFB_PTC_FREEZE || '0' }}
+        run: |
+          python scripts/audit_provider_target_coverage.py \
+            --state provider_target_last_good.json \
+            --observation-out provider_target_observation.json \
+            --json-out provider_target_coverage.json
+
+      - name: Save last-good baseline
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: provider_target_last_good.json
+          key: ptc-lastgood-${{ github.run_id }}
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: provider-target-coverage
+          path: |
+            provider_target_coverage.json
+            provider_target_observation.json
+            provider_target_last_good.json
+          retention-days: 30
