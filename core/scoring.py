@@ -264,7 +264,11 @@ logger.addHandler(logging.NullHandler())
 # calibrator's job; this restores ORDERING today with bounded honesty.
 # Gate: TFB_SCORE_ROI_SOFTCAP (default OFF => _roi_bound ≡ _clamp exactly;
 # champion byte-identical until armed).
-__version__ = "5.11.0"
+# v5.11.1 (2026-08-17, IR-064): every log tag now interpolates __version__ —
+# a frozen literal tag ("[v5.7.4 SCORE]" while the module ran 5.11.0) turns
+# the audit chain's version evidence into a claim. Four sites converted;
+# zero behavioral change; SCORING_*_VERSION follow __version__ as before.
+__version__ = "5.11.1"
 SCORING_VERSION = __version__
 SCORING_SCHEMA_VERSION = __version__
 RECOMMENDATION_SOURCE_TAG = f"scoring.py v{__version__}"
@@ -370,8 +374,9 @@ def _resolve_bucket_thresholds_from_env() -> None:
             _RISK_THRESHOLDS_FROM_ENV = True
         else:
             logger.warning(
-                "[v5.5.0 BUCKET_CFG] invalid SCORING_RISK_LOW/HIGH (%s, %s); "
+                "[v%s BUCKET_CFG] invalid SCORING_RISK_LOW/HIGH (%s, %s); "
                 "keeping defaults %s",
+                __version__,
                 rl, rh, RISK_BUCKET_THRESHOLDS,
             )
 
@@ -383,8 +388,9 @@ def _resolve_bucket_thresholds_from_env() -> None:
             _CONF_THRESHOLDS_FROM_ENV = True
         else:
             logger.warning(
-                "[v5.5.0 BUCKET_CFG] invalid SCORING_CONFIDENCE_MODERATE/HIGH "
+                "[v%s BUCKET_CFG] invalid SCORING_CONFIDENCE_MODERATE/HIGH "
                 "(%s, %s); keeping defaults %s",
+                __version__,
                 cm, ch, CONFIDENCE_BUCKET_THRESHOLDS,
             )
 
@@ -2847,7 +2853,8 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             ) if val is None
         ]
         logger.warning(
-            "[v5.7.4 INSUFFICIENT] symbol=%s missing=%s",
+            "[v%s INSUFFICIENT] symbol=%s missing=%s",
+            __version__,
             _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
             ",".join(missing_components),
         )
@@ -2990,7 +2997,8 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     scoring_errors = _dedupe_preserving_order(scoring_errors)
 
     logger.info(
-        "[v5.7.4 SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
+        "[v%s SCORE] symbol=%s overall=%s risk=%s conf=%s rec=%s",
+        __version__,
         _safe_str(source.get("symbol") or source.get("ticker") or source.get("requested_symbol"), "UNKNOWN"),
         overall,
         risk,
