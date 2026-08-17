@@ -1479,7 +1479,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # _persist_sanity_enabled, _persist_second_chance_sanity,
 # _PSAN_52WH_ALIASES, _PSAN_52WL_ALIASES.
 # --------------------------------------------------------------------------
-SCRIPT_VERSION = "6.37.0"
+SCRIPT_VERSION = "6.38.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3666,6 +3666,187 @@ def _apply_operator_quarantine(headers: list, rows_matrix: list) -> tuple:
         rows_matrix[r_i] = blanked
         stubbed.append(sym)
     return rows_matrix, stubbed
+
+
+# =============================================================================
+# v6.38.0 (W1A-6) — PRE-WRITE OHLC COHERENCE GUARD (Class-A arithmetic)
+# -----------------------------------------------------------------------------
+# WHY (2026-08-16/17 exports + engine-code adjudication): 589 rows across the
+# four market pages carried an Open OUTSIDE [Day Low, Day High] while
+# current_price sat INSIDE the band; 85-89% of the foreign Opens are byte-equal
+# to a VALID Open of a DIFFERENT row in the same export (HUF=X 313.61 planted
+# on UNI-USD/ALGO-USD/NG=F...), and the contamination clusters into write-
+# seconds. The ENGINE-side guard (data_engine_v2 Fix BC, R3/R4) already tests
+# Open and emitted ZERO ":open:" tags across 19,616 row-days — and three of
+# its four ":range:" drops (COMI.CA, CT=F, ^TASI.SR) resurfaced ON THE SHEET
+# with the dropped values present. Conclusion: the leak is injected AFTER the
+# engine guard, in the assembly/write layer. No fetch-time check can see it.
+# This guard is therefore placed at the LAST point before the sheet: the FINAL
+# rows_matrix, after KLG / persistence / PL-1, immediately before
+# write_table() — the same seam the L3 tripwires were bypassed away from.
+#
+# MECHANISM (definite same-session breaks only; Symbol + Warnings preserved;
+# missing/non-positive members -> no judgement on that rule):
+#   P1  day_high < day_low                        -> offense "range"
+#   P2  price outside [lo*(1-tol), hi*(1+tol)]    -> offense "price"
+#   P3  open  outside [lo*(1-tol), hi*(1+tol)]    -> offense "open"
+#     (P3 requires a band that survived P1+P2 — a foreign band must not
+#      condemn an honest open.)
+#
+# MODES (TFB_SYNC_OHLC_PREWRITE_MODE, firewall pattern):
+#   observe (default when armed): LOG ONLY — one [OHLC-PREWRITE] line per page
+#     with counts + first offenders. Sheet bytes untouched. Zero mutation.
+#   enforce: blank ONLY the offending member cells (open on P3; high+low on
+#     P1/P2; price is NEVER blanked — it is the anchor, and P2 blanks the band
+#     it distrusts, not the price) + append tag
+#     "ohlc_incoherent_dropped:<open|price_band|range>:prewrite" to Warnings.
+#     Downstream gates/reliability then see honest blanks (same contract as
+#     the engine guard).
+#
+# GATE: TFB_SYNC_OHLC_PREWRITE, DEFAULT OFF — unset/0 => v6.37.0 write path
+# byte-identical. Arming is RECOMMENDATION-TOUCHING in enforce mode (6 of the
+# 2026-08-17 INVESTABLE rows carry a contaminated Open): ship OFF -> observe
+# on operator ENV -> before/after ticket diff -> enforce on operator ENV.
+# Tunable: TFB_SYNC_OHLC_PREWRITE_TOL (default 0.01, same as engine
+# TFB_ENGINE_OHLC_RANGE_TOL). Fail-safe: any exception leaves the matrix
+# untouched and logs a skip line. Zero functions removed; five added.
+# =============================================================================
+
+_OHLC_PREWRITE_TAG = "[OHLC-PREWRITE v6.38.0]"
+
+_GUARD_OPEN_ALIASES = frozenset({"open", "openprice", "dayopen"})
+_GUARD_PRICE_ALIASES = frozenset({"currentprice", "price", "lastprice", "last"})
+_GUARD_DAYHIGH_ALIASES = frozenset({"dayhigh", "high"})
+_GUARD_DAYLOW_ALIASES = frozenset({"daylow", "low"})
+
+
+def _ohlc_prewrite_enabled() -> bool:
+    """v6.38.0 W1A-6: master gate. DEFAULT OFF — unset/0/false/off keeps the
+    v6.37.0 write path byte-identical. TFB_SYNC_OHLC_PREWRITE=1 arms it."""
+    return (os.getenv("TFB_SYNC_OHLC_PREWRITE") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _ohlc_prewrite_mode() -> str:
+    """v6.38.0 W1A-6: observe (default) | enforce — the FW-4 mode pattern.
+    observe logs only; enforce blanks offending members + tags Warnings."""
+    v = (os.getenv("TFB_SYNC_OHLC_PREWRITE_MODE") or "observe").strip().lower()
+    return v if v in {"observe", "enforce"} else "observe"
+
+
+def _ohlc_prewrite_tol() -> float:
+    """v6.38.0 W1A-6: band tolerance (default 0.01 = 1%, engine-aligned)."""
+    try:
+        v = float((os.getenv("TFB_SYNC_OHLC_PREWRITE_TOL") or "0.01").strip())
+    except Exception:
+        v = 0.01
+    return v if 0.0 <= v < 0.5 else 0.01
+
+
+def _ohlc_prewrite_num(v: Any) -> Optional[float]:
+    """v6.38.0 W1A-6: tolerant cell-to-float for the FINAL matrix (cells may
+    already be display-formatted: '1,908.50', '▲ 12.94%', ''). Returns None
+    on blank/unparseable/non-positive-unusable inputs; callers treat None as
+    'no judgement'. 0 parses to 0.0 (P1/P2/P3 each require positives)."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            f = float(v)
+        except Exception:
+            return None
+        return f if f == f else None  # NaN screen
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace(",", "").replace("▲", "").replace("▼", "").replace("%", "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> tuple:
+    """v6.38.0 W1A-6 — pre-write Class-A OHLC coherence on the FINAL matrix.
+
+    Runs at the write boundary so it sees exactly what the sheet will see,
+    catching the assembly-layer Open leak the engine-side guard (Fix BC)
+    structurally cannot. observe: zero mutation, log-line only. enforce:
+    blank offending members (never Symbol, never price, never Warnings) and
+    append 'ohlc_incoherent_dropped:<offenses>:prewrite' to Warnings.
+    FAIL-SAFE by contract: called inside try/except at the call site; any
+    internal error propagates to that handler which logs and writes the
+    matrix untouched. Returns (rows_matrix, stats_dict)."""
+    stats = {"checked": 0, "flagged": 0, "open": 0, "price_band": 0,
+             "range": 0, "examples": []}
+    if not headers or not rows_matrix:
+        return rows_matrix, stats
+    hdr = list(headers)
+    sym_i = _guard_find_col(hdr, _GUARD_SYMBOL_ALIASES)
+    open_i = _guard_find_col(hdr, _GUARD_OPEN_ALIASES)
+    price_i = _guard_find_col(hdr, _GUARD_PRICE_ALIASES)
+    hi_i = _guard_find_col(hdr, _GUARD_DAYHIGH_ALIASES)
+    lo_i = _guard_find_col(hdr, _GUARD_DAYLOW_ALIASES)
+    if hi_i < 0 or lo_i < 0 or (open_i < 0 and price_i < 0):
+        return rows_matrix, stats  # page has no testable OHLC contract
+    warn_i = -1
+    for i, h in enumerate(hdr):
+        if str(h or "").strip().casefold() == "warnings":
+            warn_i = i
+            break
+    tol = _ohlc_prewrite_tol()
+    enforce = _ohlc_prewrite_mode() == "enforce"
+    for r_i, row in enumerate(rows_matrix):
+        if not isinstance(row, list):
+            continue
+        n = len(row)
+        if n <= max(hi_i, lo_i):
+            continue
+        hi = _ohlc_prewrite_num(row[hi_i])
+        lo = _ohlc_prewrite_num(row[lo_i])
+        op = _ohlc_prewrite_num(row[open_i]) if 0 <= open_i < n else None
+        cp = _ohlc_prewrite_num(row[price_i]) if 0 <= price_i < n else None
+        stats["checked"] += 1
+        offenses: list = []
+        range_ok = hi is not None and lo is not None and hi > 0 and lo > 0
+        # P1: inverted band is self-contradictory whatever the symbol.
+        if range_ok and hi < lo:
+            offenses.append("range")
+            range_ok = False
+        # P2: the anchor must sit inside its own session band.
+        if range_ok and cp is not None and cp > 0 and not (
+                lo * (1.0 - tol) <= cp <= hi * (1.0 + tol)):
+            offenses.append("price_band")
+            range_ok = False
+        # P3: an open outside a band that BOTH exists and contains the price
+        # is foreign by construction (the 2026-08-17 fingerprint: 7186.T open
+        # 10.19 vs band [1908.5, 1945] with price 1911 inside).
+        if range_ok and op is not None and op > 0 and not (
+                lo * (1.0 - tol) <= op <= hi * (1.0 + tol)):
+            offenses.append("open")
+        if not offenses:
+            continue
+        stats["flagged"] += 1
+        for k in offenses:
+            stats[k] += 1
+        if len(stats["examples"]) < 12 and 0 <= sym_i < n and not _guard_is_blank(row[sym_i]):
+            stats["examples"].append(str(row[sym_i]).strip())
+        if enforce:
+            if "open" in offenses and 0 <= open_i < n:
+                row[open_i] = ""
+            if ("range" in offenses or "price_band" in offenses):
+                if 0 <= hi_i < n:
+                    row[hi_i] = ""
+                if 0 <= lo_i < n:
+                    row[lo_i] = ""
+            if 0 <= warn_i < n:
+                tag = "ohlc_incoherent_dropped:" + "+".join(offenses) + ":prewrite"
+                prev = "" if _guard_is_blank(row[warn_i]) else str(row[warn_i]).strip()
+                if tag not in prev:
+                    row[warn_i] = (prev + ("; " if prev else "") + tag)
+    return rows_matrix, stats
 
 
 def _name_dedup_mode() -> str:
@@ -7154,6 +7335,35 @@ async def _run_one_task(
                     logger.info("%s harvested %d priced rows from %s", _XPAGE_TAG, _xn, task.sheet_name)
             except Exception as _xe:
                 logger.warning("%s harvest skipped for %s (error: %s)", _XPAGE_TAG, task.sheet_name, _xe)
+
+        # --- v6.38.0 (W1A-6) PRE-WRITE OHLC COHERENCE ------------------------
+        # LAST checkpoint before the sheet: the engine-side Fix BC guard runs
+        # at fetch and cannot see the assembly-layer Open leak (589 foreign
+        # Opens on 2026-08-17, zero ":open:" engine tags, three engine drops
+        # resurfacing on-sheet). observe = log-only; enforce = blank offending
+        # members + tag Warnings. OFF (default) => matrix byte-untouched.
+        if _ohlc_prewrite_enabled():
+            try:
+                rows_matrix, _oc = _apply_ohlc_prewrite_guard(
+                    headers, rows_matrix, task.sheet_name)
+                if _oc.get("checked"):
+                    _ocl = (f"{_OHLC_PREWRITE_TAG} {task.sheet_name} | "
+                            f"checked={_oc['checked']} flagged={_oc['flagged']} "
+                            f"(open={_oc['open']} price_band={_oc['price_band']} "
+                            f"range={_oc['range']}) | "
+                            f"mode={_ohlc_prewrite_mode()} tol={_ohlc_prewrite_tol()}"
+                            + (f" | ex: {', '.join(_oc['examples'][:12])}"
+                               f"{'…' if _oc['flagged'] > 12 else ''}"
+                               if _oc["flagged"] else ""))
+                    if _oc["flagged"]:
+                        res.warnings.append(_ocl)
+                        logger.warning(_ocl)
+                    else:
+                        logger.info(_ocl)
+            except Exception as _oce:
+                logger.warning("%s skipped on %s (%s)", _OHLC_PREWRITE_TAG,
+                               task.sheet_name, _oce)
+        # ---------------------------------------------------------------------
 
         # v6.18.0 (Fix 2): cancellation-safe ordering. Legacy clear-then-write
         # leaves an EMPTY page when the job dies between the two calls (the
