@@ -1479,7 +1479,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # _persist_sanity_enabled, _persist_second_chance_sanity,
 # _PSAN_52WH_ALIASES, _PSAN_52WL_ALIASES.
 # --------------------------------------------------------------------------
-SCRIPT_VERSION = "6.38.0"
+SCRIPT_VERSION = "6.39.1"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -4331,6 +4331,203 @@ def _append_runlog_idfirewall(
         logger.warning("%s run-log verdict skipped: %s", _IDFW_TAG, _e)
 
 
+# =============================================================================
+# v6.39.0 (W1A-4b) — BACKEND _Status STAMP AT THE WRITE SEAM
+# -----------------------------------------------------------------------------
+# WHY (2026-08-17 `_Status` export, adjudicated against the same morning's
+# page exports and _Run_Log): `_Status` is treated project-wide as the
+# freshness contract, and it is not one. It records the last *GAS* action per
+# page; the BACKEND sync legs write the pages and never stamp it. Measured
+# the same morning:
+#     page            _Status says          actually written by a sync leg
+#     Market_Leaders  8/4/2026   255 rows   07:53:49   255 rows   (13d stale)
+#     Commodities_FX  7/14/2026  251 rows   07:57:38   453 rows   (34d, -202)
+#     Mutual_Funds    7/22/2026    1 row    08:19:09  2474 rows   (26d, -2473)
+# The Mutual_Funds row is a single-row GAS refresh ("Selected row refreshed:
+# UCRD.US", Rows=1) from 22 July standing as the whole page's status ever
+# since. Global_Markets simultaneously reports Status=PARTIAL "paused at 290
+# of 6626" AND Rows=6626 — `Rows` is the sheet's physical height, not what
+# was refreshed, so a consumer reading it for coverage gets 6,626 and
+# concludes the page is complete (IR-044).
+#
+# CONSEQUENCE ALREADY BANKED: the W2 coverage certificate cannot be built as
+# a CONSUMER of `_Status`; the stamp has to be emitted by the writer. This is
+# that emitter, and it is deliberately the same seam v6.38.0 proved out —
+# after write_table() returns and the page verdict is decided, so the stamp
+# reports the OUTCOME rather than the intention.
+#
+# WHAT IT WRITES: columns A..J of the page's own row (Page, Last Updated,
+# Status, Message, Endpoint, HTTP Code, Rows, Columns, Duration ms,
+# Warnings). Columns K.. — including the L/M global key-value block — are
+# NEVER touched: the update range is bounded to A:J. If the page has no row,
+# one is appended. Rows carries rows_WRITTEN (the IR-044 fix); Endpoint
+# carries "backend:run_dashboard_sync" so a reader can always tell which
+# layer authored the row; Message carries version, leg status, written/failed
+# and the run id when present.
+#
+# GATE: TFB_SYNC_STATUS_STAMP, DEFAULT OFF — unset/0 => v6.38.0 behaviour
+# byte-identical, no extra API call. Fail-open by construction: every failure
+# path is swallowed with a ::warning:: annotation, exactly like FW-3b. A
+# status stamp must never break the write path it reports on.
+# =============================================================================
+
+_STATUS_STAMP_TAG = "[STATUS-STAMP v6.39.1]"
+_STATUS_SHEET_NAME = "_Status"
+_STATUS_STAMP_ENDPOINT = "backend:run_dashboard_sync"
+
+
+def _status_stamp_enabled() -> bool:
+    """v6.39.0 W1A-4b: master gate. DEFAULT OFF — unset/0/false/off keeps
+    v6.38.0 behaviour byte-identical (no read, no write, no API call)."""
+    return (os.getenv("TFB_SYNC_STATUS_STAMP") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _status_stamp_pages() -> set:
+    """v6.39.0: optional allow-list. Empty (default) = every page the sync
+    writes. TFB_SYNC_STATUS_STAMP_PAGES='Global_Markets,Market_Leaders'."""
+    raw = (os.getenv("TFB_SYNC_STATUS_STAMP_PAGES") or "").strip()
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _status_find_page_row(grid: list, page: str) -> int:
+    """v6.39.0: 1-based sheet row index of the page's own `_Status` row, or
+    -1 if absent. Column A is the page key; the header row is skipped by
+    exact-match on the page name, so a title/branding row cannot collide."""
+    want = str(page or "").strip().casefold()
+    if not want:
+        return -1
+    for i, row in enumerate(grid or []):
+        if not isinstance(row, (list, tuple)) or not row:
+            continue
+        if str(row[0] or "").strip().casefold() == want:
+            return i + 1
+    return -1
+
+
+def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
+    """v6.39.0: build the A..J payload for one page. Pure — no I/O, so the
+    row shape is unit-testable without a sheet. `Rows` is rows WRITTEN, not
+    sheet height (IR-044); a PARTIAL leg can no longer report full
+    coverage."""
+    status = str(getattr(res, "status", "") or "unknown").strip()
+    written = int(getattr(res, "rows_written", 0) or 0)
+    failed = int(getattr(res, "rows_failed", 0) or 0)
+    warns = list(getattr(res, "warnings", None) or [])
+    err = str(getattr(res, "error", "") or "").strip()
+    dur_ms = ""
+    try:
+        _st = getattr(res, "start_utc", "") or ""
+        _en = getattr(res, "end_utc", "") or _utc_now().isoformat()
+        if _st:
+            dur_ms = int(max(0.0, (
+                datetime.fromisoformat(str(_en)) - datetime.fromisoformat(str(_st))
+            ).total_seconds() * 1000.0))
+    except Exception:
+        dur_ms = ""
+    run_id = (os.getenv("GITHUB_RUN_ID") or "").strip()
+    # v6.39.1 (external audit P0-3, ACCEPTED): write completeness is NOT
+    # refresh completeness. A FLOOR-MERGE leg can write a full page of which
+    # only a fraction is fresh — publish fresh/preserved/coverage explicitly
+    # and never let values.update success masquerade as a full refresh.
+    meta = dict(getattr(res, "_stamp_meta", None) or {})
+    requested = int(meta.get("requested") or 0)
+    klg = int(meta.get("klg_kept") or 0)
+    preserved = klg + int(meta.get("persist_restored") or 0) + int(
+        meta.get("pv2_restored") or 0)
+    stubbed = int(meta.get("stubbed") or 0)
+    pre_rows = meta.get("pre_persist_rows")
+    fresh = max(0, int(pre_rows) - klg) if isinstance(pre_rows, int) else None
+    cov = (round(100.0 * fresh / requested, 1)
+           if (fresh is not None and requested > 0) else None)
+    fresh_min = 95.0
+    try:
+        fresh_min = float((os.getenv("TFB_SYNC_STATUS_FRESH_MIN") or "95").strip())
+    except Exception:
+        pass
+    status_cell = status.upper() if status else "UNKNOWN"
+    if (status_cell == "SUCCESS" and cov is not None and cov < fresh_min):
+        status_cell = "PARTIAL_FRESH"
+    msg = (f"{_STATUS_STAMP_TAG} leg={status} written={written} failed={failed}"
+           + (f" requested={requested}" if requested else "")
+           + (f" fresh={fresh}" if fresh is not None else "")
+           + (f" preserved={preserved}" if preserved else "")
+           + (f" stubbed={stubbed}" if stubbed else "")
+           + (f" fresh_cov={cov}%" if cov is not None else "")
+           + (f" warnings={len(warns)}" if warns else "")
+           + (f" error={err[:120]}" if err else "")
+           + (f" run={run_id}" if run_id else ""))
+    return [
+        page,                                       # A Page
+        time.strftime("%Y-%m-%d %H:%M:%S"),         # B Last Updated
+        status_cell,                                # C Status (PARTIAL_FRESH when refresh coverage < min)
+        msg,                                        # D Message
+        _STATUS_STAMP_ENDPOINT,                     # E Endpoint
+        "",                                         # F HTTP Code
+        written,                                    # G Rows  (WRITTEN, not height)
+        int(n_cols or 0),                           # H Columns
+        dur_ms,                                     # I Duration ms
+        len(warns),                                 # J Warnings
+    ]
+
+
+def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
+                       res: Any, n_cols: int) -> None:
+    """v6.39.0 W1A-4b: write the page's own `_Status` row after the page
+    write has completed and its verdict is known.
+
+    Bounded to columns A..J of exactly one row, so the L/M global key-value
+    block and every other page's row are untouched by construction. Appends
+    a row only when the page has none. FAIL-OPEN: any error is annotated and
+    swallowed — the stamp must never break the write path it reports on."""
+    if not _status_stamp_enabled() or sheets is None:
+        return
+    allow = _status_stamp_pages()
+    if allow and page not in allow:
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        payload = _status_stamp_row(page, res, n_cols)
+        grid = []
+        try:
+            _resp = svc.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{_STATUS_SHEET_NAME}'!A1:A200",
+            ).execute()
+            grid = _resp.get("values", []) or []
+        except Exception as _re:
+            print("::warning::%s could not read %s key column for %s — %s: %s"
+                  % (_STATUS_STAMP_TAG, _STATUS_SHEET_NAME, page,
+                     type(_re).__name__, _re))
+            return
+        row_i = _status_find_page_row(grid, page)
+        if row_i > 0:
+            svc.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{_STATUS_SHEET_NAME}'!A{row_i}:J{row_i}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [payload]},
+            ).execute()
+            _where = f"row {row_i}"
+        else:
+            svc.spreadsheets().values().append(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{_STATUS_SHEET_NAME}'!A1:J1",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [payload]},
+            ).execute()
+            _where = "appended"
+        logger.info("%s %s %s | status=%s rows_written=%s", _STATUS_STAMP_TAG,
+                    page, _where, payload[2], payload[6])
+    except Exception as _e:
+        print("::warning::%s stamp FAILED for %s — %s: %s"
+              % (_STATUS_STAMP_TAG, page, type(_e).__name__, _e))
+        logger.warning("%s stamp skipped for %s: %s", _STATUS_STAMP_TAG, page, _e)
+
+
 # Data-provider column aliases (normalized via _guard_norm).
 _KLG_PROVIDER_ALIASES = frozenset({
     "dataprovider", "provider", "datasource", "source",
@@ -5134,6 +5331,19 @@ def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[
             seen.add(t)
             out.append(t)
         if max_symbols > 0 and len(out) >= max_symbols:
+            # v6.39.1 (external audit P0-1, PARTIAL ACCEPT): truncating here
+            # UN-REQUESTS the overflow — persistence protects only requested
+            # symbols, so an undersized cap acts as a silent symbol remover
+            # (the 2026-07-03 GM-pinned-at-800 incident class). Truncation
+            # stays (workload control) but is now LOUD and countable.
+            print("::warning::[CAP v6.39.1] CAP_BELOW_UNIVERSE on %s: sheet "
+                  "universe exceeds cap=%d — overflow is UN-REQUESTED this "
+                  "leg (persistence preserves existing rows; heal-first "
+                  "fronts the remainder next leg). Raise "
+                  "TFB_SYNC_MAX_SYMBOLS_MARKET to cover the universe."
+                  % (task_key, max_symbols))
+            logger.warning("[CAP v6.39.1] CAP_BELOW_UNIVERSE %s cap=%d",
+                           task_key, max_symbols)
             break
     return out
 
@@ -6338,6 +6548,10 @@ async def _run_one_task(
 ) -> TaskResult:
     t0 = time.perf_counter()
     res = TaskResult(key=task.key, sheet_name=task.sheet_name, status="pending", start_utc=_utc_now().isoformat())
+    # v6.39.1 (W1A-4b): freshness accounting for the _Status stamp — updated at
+    # each preservation/stub site, read only by _stamp_page_status (finally).
+    res._stamp_meta = {"requested": 0, "pre_persist_rows": None, "klg_kept": 0,
+                       "persist_restored": 0, "pv2_restored": 0, "stubbed": 0}
 
     try:
         canon_task_key = _canon_key(task.key)
@@ -6974,10 +7188,13 @@ async def _run_one_task(
         if (_symbol_persistence_enabled() and task.expects_rows and symbols
                 and rows_matrix and headers and sheets is not None):
             try:
+                res._stamp_meta["requested"] = len(symbols or [])
+                res._stamp_meta["pre_persist_rows"] = len(rows_matrix or [])
                 rows_matrix, _kept_syms = _persist_missing_symbol_rows(
                     sheets, spreadsheet_id, task.sheet_name, headers, rows_matrix, symbols
                 )
                 if _kept_syms:
+                    res._stamp_meta["persist_restored"] = len(_kept_syms)
                     _pw = (
                         f"{_SYMBOL_PERSISTENCE_TAG} preserved {len(_kept_syms)} "
                         f"last-good row(s) for fetch-missed symbol(s) on "
@@ -7008,6 +7225,7 @@ async def _run_one_task(
                     sheets, spreadsheet_id, task.sheet_name, headers, rows_matrix
                 )
                 if _klg_syms:
+                    res._stamp_meta["klg_kept"] = len(_klg_syms)
                     _kw = (
                         f"{_KEEP_LAST_GOOD_TAG} substituted {len(_klg_syms)} "
                         f"error-stub row(s) with last-good data on "
@@ -7253,6 +7471,7 @@ async def _run_one_task(
                     rows_matrix, _kept2 = _persist_missing_symbol_rows(
                         sheets, spreadsheet_id, task.sheet_name, headers,
                         rows_matrix, symbols)
+                    res._stamp_meta["pv2_restored"] = len(_kept2 or [])
                     if _kept2:
                         _p2 = (f"[PERSIST v6.34.0] second-chance pass restored "
                                f"{len(_kept2)} row(s) dropped by later stages on "
@@ -7285,6 +7504,7 @@ async def _run_one_task(
             try:
                 rows_matrix, _plq = _apply_operator_quarantine(headers, rows_matrix)
                 if _plq:
+                    res._stamp_meta["stubbed"] += len(_plq)
                     _pl = (f"[PL-1 v6.37.0] operator quarantine stubbed "
                            f"{len(_plq)} row(s) on '{task.sheet_name}': "
                            f"{', '.join(_plq[:12])}"
@@ -7298,11 +7518,23 @@ async def _run_one_task(
                 logger.warning("[PL-1 v6.37.0] operator quarantine skipped (%s)", _ple)
             try:
                 _still_missing = _unpersisted_missing(headers, rows_matrix, symbols, _old_name_map)
-            except Exception as _ve:  # never let verification break the write path
-                _still_missing = []
-                _vw = f"{_PERSISTENCE_HARD_TAG} verification skipped (error: {_ve})"
+            except Exception as _ve:
+                # v6.39.1 (external audit P0-4, ACCEPTED): the HARD guard exists
+                # to prevent silent symbol deletion — its own failure must fail
+                # CLOSED, not convert into a clean pass. Skip the write,
+                # preserve last-good; self-heals next leg.
+                _vw = (f"{_PERSISTENCE_HARD_TAG} verification ERRORED on "
+                       f"'{task.sheet_name}' ({type(_ve).__name__}: {_ve}) — "
+                       f"fail-closed: skipping clear+write to PRESERVE last-good "
+                       f"rows. TFB_SYNC_PERSISTENCE_HARD=0 restores the old "
+                       f"warn-and-continue.")
+                res.status = "skipped"
+                res.rows_written = 0
+                res.rows_failed = 0
                 res.warnings.append(_vw)
-                logger.warning(_vw)
+                logger.error(_vw)
+                fail_result_on_identity(res, _critical_identity_failures)
+                return res
             if _still_missing:
                 _hm = (
                     f"{_PERSISTENCE_HARD_TAG} TRIPPED on '{task.sheet_name}': "
@@ -7361,8 +7593,22 @@ async def _run_one_task(
                     else:
                         logger.info(_ocl)
             except Exception as _oce:
-                logger.warning("%s skipped on %s (%s)", _OHLC_PREWRITE_TAG,
-                               task.sheet_name, _oce)
+                if _ohlc_prewrite_mode() == "enforce":
+                    # v6.39.1 (external audit P0-4, ACCEPTED): in ENFORCE the
+                    # guard IS the integrity contract — its own failure means
+                    # an unverified payload. Fail closed; preserve last-good.
+                    _om = (f"{_OHLC_PREWRITE_TAG} guard ERRORED in enforce mode "
+                           f"on '{task.sheet_name}' ({type(_oce).__name__}: "
+                           f"{_oce}) — fail-closed: skipping write.")
+                    res.status = "skipped"
+                    res.rows_written = 0
+                    res.rows_failed = 0
+                    res.warnings.append(_om)
+                    logger.error(_om)
+                    fail_result_on_identity(res, _critical_identity_failures)
+                    return res
+                logger.warning("%s skipped on %s (observe; %s)",
+                               _OHLC_PREWRITE_TAG, task.sheet_name, _oce)
         # ---------------------------------------------------------------------
 
         # v6.18.0 (Fix 2): cancellation-safe ordering. Legacy clear-then-write
@@ -7413,6 +7659,17 @@ async def _run_one_task(
 
     finally:
         res.end_utc = _utc_now().isoformat()
+        # --- v6.39.1 (W1A-4b) BACKEND _Status STAMP (moved to finally) -------
+        # External audit P0-3, ACCEPTED: the terminus-only stamp missed every
+        # early return (skips, identity fails, floor vetoes) and ran before
+        # end_utc so Duration was blank. In finally it covers EVERY exit path
+        # including exceptions, reports the decided OUTCOME, and carries real
+        # duration + fresh/preserved accounting. OFF by default => no-op.
+        try:
+            _stamp_page_status(sheets, spreadsheet_id, task.sheet_name, res,
+                               len(headers or []) if isinstance(headers, list) else 0)
+        except Exception:
+            pass
         res.duration_ms = (time.perf_counter() - t0) * 1000.0
 
 
@@ -7442,7 +7699,12 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
 
     backend_url = (args.backend or _default_backend_url()).rstrip("/")
     start_cell = _validate_a1_cell(args.start_cell)
-    max_symbols = _safe_int(args.max_symbols, -1, lo=-1, hi=5000)
+    # v6.39.1 (external audit P0-1, PARTIAL ACCEPT): the CLI clamp silently
+    # reduced --max-symbols 7000 to 5000 while the v2 ceiling is 20000 and
+    # Global_Markets holds 6,626 — the clamp itself was the binding truncator
+    # on manual runs. Align the CLI ceiling with the active cap regime.
+    max_symbols = _safe_int(args.max_symbols, -1, lo=-1,
+                            hi=(20000 if _universe_cap_v2_enabled() else 5000))
     workers = _safe_int(args.workers, 4, lo=1, hi=32)
     timeout_sec = float(_safe_int(args.timeout, 30, lo=5, hi=180))
 
