@@ -3023,7 +3023,11 @@ if str(ROOT_DIR) not in sys.path:
 # now prints ohlc_coh=on/OFF beside the sibling guards. Zero functions
 # removed; five functions added.
 # =============================================================================
-__version__ = "5.127.0"
+# v5.127.1 (2026-08-17, IR-064): the two remaining hardcoded log version
+# tags interpolate __version__ (STRUCT was stamped 5.95.0, FLOW 5.98.0
+# while the module ran 5.127.0). Comment-only mentions untouched. Zero
+# behavioral change.
+__version__ = "5.127.1"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -13628,7 +13632,8 @@ class DataEngineV5:
                 for _csk, _csv in _cs_struct.items():
                     patch[_csk] = _csv
                 logger.debug(
-                    "[v5.95.0 STRUCT] candle_structure=%s trend=%s swings=%s vol=%s body=%s gap=%s",
+                    "[v%s STRUCT] candle_structure=%s trend=%s swings=%s vol=%s body=%s gap=%s",
+                    __version__,
                     _cs_struct.get("candle_structure"),
                     _cs_struct.get("candle_structure_trend"),
                     _cs_struct.get("candle_structure_swings"),
@@ -13650,7 +13655,8 @@ class DataEngineV5:
                 for _fk, _fv in _flow_read.items():
                     patch[_fk] = _fv
                 logger.debug(
-                    "[v5.98.0 FLOW] flow=%s pressure=%s trend=%s inflection=%s",
+                    "[v%s FLOW] flow=%s pressure=%s trend=%s inflection=%s",
+                    __version__,
                     _flow_read.get("flow"),
                     _flow_read.get("flow_pressure"),
                     _flow_read.get("flow_ad_trend"),
