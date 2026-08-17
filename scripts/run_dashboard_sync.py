@@ -1479,7 +1479,30 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 # _persist_sanity_enabled, _persist_second_chance_sanity,
 # _PSAN_52WH_ALIASES, _PSAN_52WL_ALIASES.
 # --------------------------------------------------------------------------
-SCRIPT_VERSION = "6.39.1"
+# v6.39.2 (2026-08-17, W1A-4b adjudication F2/F3/F4):
+#   F2  _Status stamp writes valueInputOption=RAW — USER_ENTERED let Sheets
+#       locale-parse the ISO timestamp (the IR-029 two-formats disease
+#       re-entering through the fix). Deterministic strings win; consumers
+#       already parse GAS's own mixed formats.
+#   F3  stamp suppressed (with a ::notice::) under dry-run and MANUAL-HOLD —
+#       a mode whose contract is ZERO workbook writes outranks telemetry.
+#       Ordinary skips/vetoes/failures still stamp truthfully (P0-3 kept).
+#   F4  _Status key-column read unbounded (A:A, was A1:A200).
+#   Plus: the stamp tag interpolates SCRIPT_VERSION (IR-064 inside the
+#   touched block). No other regions modified.
+# v6.39.3 (2026-08-17, external Three-Script Production Audit adjudicated):
+#   P0-1 CONFIRMED against the real class: TaskResult is @dataclass(slots=True)
+#        and _stamp_meta was never a declared field -> every task raised
+#        AttributeError at the v6.39.1 assignment, before try. FIX: _stamp_meta
+#        and dry_run are now declared fields; constructor call sites unchanged
+#        (both defaulted). Harness now executes the REAL decorated dataclass —
+#        stand-in objects are banned from behavioral tests (they hid this).
+#   P1-1 CONFIRMED: headers was first assigned deep inside try while the
+#        finally stamp read it -> UnboundLocalError on early exits, swallowed.
+#        FIX: headers pre-initialized before try. dry-run suppression now
+#        rides the declared res.dry_run, populated from the existing dry_run
+#        parameter, plus a marker-text belt in the skip helper.
+SCRIPT_VERSION = "6.39.3"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -1719,6 +1742,9 @@ class TaskResult:
     warnings: List[str] = field(default_factory=list)
     error: Optional[str] = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # v6.39.3 (audit P0-1/P1-1): declared so the slots contract holds.
+    dry_run: bool = False
+    _stamp_meta: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -4371,7 +4397,7 @@ def _append_runlog_idfirewall(
 # status stamp must never break the write path it reports on.
 # =============================================================================
 
-_STATUS_STAMP_TAG = "[STATUS-STAMP v6.39.1]"
+_STATUS_STAMP_TAG = f"[STATUS-STAMP v{SCRIPT_VERSION}]"
 _STATUS_SHEET_NAME = "_Status"
 _STATUS_STAMP_ENDPOINT = "backend:run_dashboard_sync"
 
@@ -4471,6 +4497,28 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     ]
 
 
+def _status_stamp_should_skip(res: Any) -> str:
+    """v6.39.2 (F3): modes whose contract is ZERO workbook writes outrank
+    telemetry. Returns the suppression reason, '' to stamp. dry_run rides
+    `res` when the runner sets it; MANUAL-HOLD arrives via the leg's
+    status/warnings marker (the v6.32.0 convention). Fail-open on
+    inspection error: stamp (the enabled/pages gates still apply)."""
+    try:
+        if bool(getattr(res, "dry_run", False)):
+            return "dry-run"
+        blob = " ".join(
+            [str(getattr(res, "status", "") or "")]
+            + [str(w) for w in (getattr(res, "warnings", None) or [])]
+        )
+        if "MANUAL-HOLD" in blob:
+            return "manual-hold"
+        if "dry-run" in blob.lower() or "dry_run" in blob.lower():
+            return "dry-run"
+    except Exception:
+        return ""
+    return ""
+
+
 def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
                        res: Any, n_cols: int) -> None:
     """v6.39.0 W1A-4b: write the page's own `_Status` row after the page
@@ -4485,6 +4533,11 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
     allow = _status_stamp_pages()
     if allow and page not in allow:
         return
+    _skip = _status_stamp_should_skip(res)
+    if _skip:
+        print("::notice::%s stamp suppressed (%s) for %s"
+              % (_STATUS_STAMP_TAG, _skip, page))
+        return
     try:
         svc = sheets._get_service()
         if not svc:
@@ -4494,7 +4547,7 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
         try:
             _resp = svc.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-                range=f"'{_STATUS_SHEET_NAME}'!A1:A200",
+                range=f"'{_STATUS_SHEET_NAME}'!A:A",
             ).execute()
             grid = _resp.get("values", []) or []
         except Exception as _re:
@@ -4507,7 +4560,7 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
             svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=f"'{_STATUS_SHEET_NAME}'!A{row_i}:J{row_i}",
-                valueInputOption="USER_ENTERED",
+                valueInputOption="RAW",
                 body={"values": [payload]},
             ).execute()
             _where = f"row {row_i}"
@@ -4515,7 +4568,7 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
             svc.spreadsheets().values().append(
                 spreadsheetId=spreadsheet_id,
                 range=f"'{_STATUS_SHEET_NAME}'!A1:J1",
-                valueInputOption="USER_ENTERED",
+                valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body={"values": [payload]},
             ).execute()
@@ -6550,6 +6603,8 @@ async def _run_one_task(
     res = TaskResult(key=task.key, sheet_name=task.sheet_name, status="pending", start_utc=_utc_now().isoformat())
     # v6.39.1 (W1A-4b): freshness accounting for the _Status stamp — updated at
     # each preservation/stub site, read only by _stamp_page_status (finally).
+    res.dry_run = bool(dry_run)
+    headers = None  # v6.39.3: finally-stamp reads this; must exist on every exit
     res._stamp_meta = {"requested": 0, "pre_persist_rows": None, "klg_kept": 0,
                        "persist_restored": 0, "pv2_restored": 0, "stubbed": 0}
 
