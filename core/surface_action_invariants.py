@@ -59,6 +59,7 @@ the delivery validation). Exit 0 iff all fixtures pass.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from typing import Any, Dict, List, Tuple
 
@@ -78,7 +79,28 @@ from typing import Any, Dict, List, Tuple
 #        the invariant guards every instrument surface, not only Top_10).
 #   P2-2 selftest saves/restores prior ENV in finally.
 #   P2-3 adversarial fixtures added (audit A3/A4 classes + soft-WATCH case).
-__version__ = "1.0.1"
+# v1.1.0 (2026-08-18 night, W1A-8 — spec v1.4 table, verbatim scope):
+#   "Identity-warning ⇒ not-INVESTABLE (all surfaces)": any of
+#   xprovider_verified:*:0.0% · quote_current_price_missing ·
+#   quote_exchange_missing · quote_currency_missing · name_unresolved
+#   (the engine's v5.93.0 unresolved-identity tag) means the row cannot be
+#   INVESTABLE/INVEST on Top_10, opportunity surfaces, OR My_Portfolio —
+#   the portfolio surface was the named gap (fixture T82U.SI: My_Portfolio
+#   INVESTABLE/INVEST at rel 90.4 while its GM twin sat BLOCKED and its
+#   warnings carried xprovider_verified:yahoo_chart:0.0% + three quote_*).
+#   SEMANTICS (deliberately SOFTER than W1A-1): identity doubt is not a
+#   verdict of badness — investability INVEST-class → WATCHLIST and
+#   final_action INVEST-class → WATCH; the recommendation text and
+#   reliability are UNTOUCHED, block_reason is NOT written (this is not a
+#   BLOCKED state), marker warn_invest_invariant_applied:v1.1.0 appended.
+#   Surface effect: Top_10 seat eligibility requires INVESTABLE (v5.80), so
+#   the demotion alone removes board eligibility on every path the shared
+#   wrapper covers — including the Top_10 direct branch's post-veto
+#   re-filter and My_Portfolio via the general seam.
+#   GATE: TFB_WARN_INVEST_INVARIANT (alias TFB_SURFACE_WARN_INVEST),
+#   DEFAULT OFF, arms independently of W1A-1/2. 0.0% is exact — a partial
+#   verification (e.g. :12.5%) must NOT trigger.
+__version__ = "1.1.0"
 SAI_TAG = f"[SURFACE-INV v{__version__}]"
 
 _BUY_FAMILY = {"STRONG_BUY", "BUY", "ACCUMULATE"}
@@ -86,6 +108,11 @@ _INVEST_CLASS = {"INVEST", "INVESTABLE", "BUY", "STRONG_BUY", "ACCUMULATE"}
 _BLOCKED_MARK = f"blocked_invariant_applied:v{__version__}"
 _FETCH_MARK = f"fetchfail_blocked_applied:v{__version__}"
 _FETCH_TOKEN = "fetch_failed"
+# --- W1A-8 identity-warning markers (spec-literal set) -----------------------
+_WARN_MARK = f"warn_invest_invariant_applied:v{__version__}"
+_IDW_SUBSTRINGS = ("quote_current_price_missing", "quote_exchange_missing",
+                   "quote_currency_missing", "name_unresolved")
+_IDW_XPROV_RE = re.compile(r"xprovider_verified:[^;\s]*:0\.0+%")
 _INJECTED_REASON = "Provider fetch failed (W1A-2): row data is not decision-grade"
 
 
@@ -102,6 +129,12 @@ def blocked_invariant_enabled() -> bool:
 def fetchfail_blocked_enabled() -> bool:
     return _flag("TFB_T10_FETCHFAIL_BLOCKED") or _flag(
         "TFB_SURFACE_FETCHFAIL_BLOCKED")
+
+
+def warn_invest_invariant_enabled() -> bool:
+    """v1.1.0 W1A-8 gate (independent arming)."""
+    return _flag("TFB_WARN_INVEST_INVARIANT") or _flag(
+        "TFB_SURFACE_WARN_INVEST")
 
 
 def _s(v: Any) -> str:
@@ -133,6 +166,32 @@ def _is_fetch_failed(row: Dict[str, Any]) -> bool:
         _s(row.get("data_status")),
     )).lower()
     return _FETCH_TOKEN in blob
+
+
+def _has_identity_warning(row: Dict[str, Any]) -> bool:
+    """v1.1.0 W1A-8: spec marker set. 0.0% exact-by-regex; substrings for
+    the three quote_* tags and the engine's name_unresolved tag."""
+    blob = _warn_text(row)
+    if any(t in blob for t in _IDW_SUBSTRINGS):
+        return True
+    return bool(_IDW_XPROV_RE.search(blob))
+
+
+def _demote_identity_warning(row: Dict[str, Any]) -> bool:
+    """W1A-8 soft demotion: INVEST-class → WATCHLIST/WATCH. Reco text,
+    reliability, block_reason all untouched. Idempotent via marker."""
+    changed = False
+    inv = _s(row.get("investability_status")).upper()
+    if inv in _INVEST_CLASS:
+        row["investability_status"] = "WATCHLIST"
+        changed = True
+    fa = _s(row.get("final_action")).upper()
+    if fa in _INVEST_CLASS:
+        row["final_action"] = "WATCH"
+        changed = True
+    if changed:
+        _add_warning(row, _WARN_MARK)
+    return changed
 
 
 def _is_hard_blocked(row: Dict[str, Any]) -> bool:
@@ -188,7 +247,8 @@ def apply_surface_action_invariants(
     With both gates off this is a strict no-op returning the SAME object.
     """
     g1, g2 = blocked_invariant_enabled(), fetchfail_blocked_enabled()
-    if not (g1 or g2) or not isinstance(rows, list):
+    g3 = warn_invest_invariant_enabled()
+    if not (g1 or g2 or g3) or not isinstance(rows, list):
         return rows, 0, 0, 0
     n1 = n2 = errs = 0
     for row in rows:
@@ -206,6 +266,12 @@ def apply_surface_action_invariants(
             if _is_blocked(row) and (g1 or ff):
                 if _demote_blocked(row, hard=_is_hard_blocked(row)):
                     n1 += 1
+            # v1.1.0 W1A-8 — after the blocked chain so a row that is BOTH
+            # blocked and identity-doubted takes the STRONGER outcome; a
+            # warned-only row takes the soft WATCHLIST/WATCH demotion.
+            if g3 and _has_identity_warning(row) and not _is_blocked(row):
+                if _demote_identity_warning(row):
+                    n1 += 1
         except Exception:
             errs += 1
     return rows, n1, n2, errs
@@ -217,7 +283,8 @@ def apply_surface_action_invariants(
 def _selftest() -> int:
     import copy
     _KEYS = ("TFB_T10_BLOCKED_INVARIANT", "TFB_T10_FETCHFAIL_BLOCKED",
-             "TFB_SURFACE_BLOCKED_INVARIANT", "TFB_SURFACE_FETCHFAIL_BLOCKED")
+             "TFB_SURFACE_BLOCKED_INVARIANT", "TFB_SURFACE_FETCHFAIL_BLOCKED",
+             "TFB_WARN_INVEST_INVARIANT", "TFB_SURFACE_WARN_INVEST")
     _prior = {k: os.environ.get(k) for k in _KEYS}   # v1.0.1 P2-2
     os.environ["TFB_T10_BLOCKED_INVARIANT"] = "1"
     os.environ["TFB_T10_FETCHFAIL_BLOCKED"] = "1"
@@ -350,6 +417,55 @@ def _selftest() -> int:
          "final_action": "INVEST", "warnings": []}
     apply_surface_action_invariants([r], "GM")
     ck("k1 SURFACE alias arms W1A-1", r["final_action"] == "DO_NOT_INVEST")
+
+    # (l) W1A-8 — the live T82U.SI signature (spec fixture, verbatim tags)
+    for _k in _KEYS:
+        os.environ.pop(_k, None)
+    os.environ["TFB_WARN_INVEST_INVARIANT"] = "1"
+    r = {"symbol": "T82U.SI", "recommendation": "BUY",
+         "recommendation_detailed": "BUY", "final_action": "INVEST",
+         "investability_status": "INVESTABLE",
+         "forecast_reliability_score": 90.4, "block_reason": "",
+         "warnings": "quote_current_price_missing; quote_exchange_missing; "
+                     "quote_currency_missing; "
+                     "xprovider_verified:yahoo_chart:0.0%; "
+                     "yahoo_enrichment_applied"}
+    _, n1, n2, e = apply_surface_action_invariants([r], "My_Portfolio")
+    ck("l1 W1A-8 T82U: INVESTABLE/INVEST -> WATCHLIST/WATCH",
+       r["investability_status"] == "WATCHLIST"
+       and r["final_action"] == "WATCH")
+    ck("l2 W1A-8 soft: BUY text + reliability UNTOUCHED",
+       r["recommendation"] == "BUY"
+       and r["forecast_reliability_score"] == 90.4)
+    ck("l3 W1A-8: block_reason NOT written", r["block_reason"] == "")
+    ck("l4 W1A-8 marker appended once",
+       r["warnings"].count(_WARN_MARK) == 1 and (n1, n2) == (1, 0))
+    import copy as _cp
+    snap = _cp.deepcopy(r)
+    apply_surface_action_invariants([r], "My_Portfolio")
+    ck("l5 W1A-8 idempotent", r == snap)
+    r = {"symbol": "OKX", "recommendation": "BUY", "final_action": "INVEST",
+         "investability_status": "INVESTABLE", "block_reason": "",
+         "warnings": "xprovider_verified:yahoo_chart:87.5%"}
+    snap = _cp.deepcopy(r)
+    apply_surface_action_invariants([r], "GM")
+    ck("l6 partial verification (87.5%) does NOT trigger", r == snap)
+    os.environ["TFB_WARN_INVEST_INVARIANT"] = "0"
+    os.environ["TFB_SURFACE_WARN_INVEST"] = "1"
+    r = {"symbol": "AL2", "final_action": "INVEST",
+         "investability_status": "INVESTABLE",
+         "warnings": ["name_unresolved"], "block_reason": ""}
+    apply_surface_action_invariants([r], "GM")
+    ck("l7 SURFACE alias arms W1A-8", r["final_action"] == "WATCH")
+    os.environ["TFB_T10_BLOCKED_INVARIANT"] = "1"
+    r = {"symbol": "BOTH", "recommendation": "BUY", "final_action": "INVEST",
+         "investability_status": "INVESTABLE", "block_reason": "bad",
+         "warnings": ["name_unresolved"]}
+    apply_surface_action_invariants([r], "GM")
+    ck("l8 blocked+warned -> STRONGER outcome wins (DO_NOT_INVEST/BLOCKED)",
+       r["final_action"] == "DO_NOT_INVEST"
+       and r["investability_status"] == "BLOCKED"
+       and _WARN_MARK not in " ".join(map(str, r["warnings"])))
 
     for _k, _v in _prior.items():                      # v1.0.1 P2-2 restore
         if _v is None:
