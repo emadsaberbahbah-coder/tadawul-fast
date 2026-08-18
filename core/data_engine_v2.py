@@ -3050,7 +3050,12 @@ if str(ROOT_DIR) not in sys.path:
 #        an ARMED-but-unimportable module logs at ERROR, never silently.
 #   Module fixes (P0-3/P0-4/P1-3 semantics) live in
 #        core/surface_action_invariants.py v1.0.1.
-__version__ = "5.128.1"
+# v5.128.2 (2026-08-18 night, W1A-8 parity): module v1.1.0 adds the
+# identity-warning gate (TFB_WARN_INVEST_INVARIANT / TFB_SURFACE_WARN_INVEST).
+# _SAI_GATE_ENVS, the [GUARDS+] boot line and health()["surface_invariants"]
+# now include it, so an ARMED-but-unimportable W1A-8 escalates to ERROR and
+# degraded_armed exactly like W1A-1/2. No behaviour change while OFF.
+__version__ = "5.128.2"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4451,7 +4456,8 @@ _SAI_STATE: Dict[str, Any] = {"import": "unknown", "version": None,
                               "error": ""}
 _SAI_GATE_ENVS = ("TFB_T10_BLOCKED_INVARIANT", "TFB_SURFACE_BLOCKED_INVARIANT",
                   "TFB_T10_FETCHFAIL_BLOCKED",
-                  "TFB_SURFACE_FETCHFAIL_BLOCKED")
+                  "TFB_SURFACE_FETCHFAIL_BLOCKED",
+                  "TFB_WARN_INVEST_INVARIANT", "TFB_SURFACE_WARN_INVEST")
 
 
 def _surface_gate_on(*names: str) -> bool:
@@ -13169,13 +13175,16 @@ class DataEngineV5:
                     return "?"
             logger.info(
                 "[v%s GUARDS+] surface_blocked=%s surface_fetchfail=%s "
-                "sai_import=%s sai_ver=%s",
+                "surface_warn_invest=%s sai_import=%s sai_ver=%s",
                 __version__,
                 "on" if _surface_gate_on("TFB_T10_BLOCKED_INVARIANT",
                                          "TFB_SURFACE_BLOCKED_INVARIANT")
                 else "OFF",
                 "on" if _surface_gate_on("TFB_T10_FETCHFAIL_BLOCKED",
                                          "TFB_SURFACE_FETCHFAIL_BLOCKED")
+                else "OFF",
+                "on" if _surface_gate_on("TFB_WARN_INVEST_INVARIANT",
+                                         "TFB_SURFACE_WARN_INVEST")
                 else "OFF",
                 _SAI_STATE["import"], _SAI_STATE["version"],
             )
@@ -15216,6 +15225,9 @@ class DataEngineV5:
                 "fetchfail_gate": _surface_gate_on(
                     "TFB_T10_FETCHFAIL_BLOCKED",
                     "TFB_SURFACE_FETCHFAIL_BLOCKED"),
+                "warn_invest_gate": _surface_gate_on(
+                    "TFB_WARN_INVEST_INVARIANT",
+                    "TFB_SURFACE_WARN_INVEST"),
                 "import": _SAI_STATE["import"],
                 "version": _SAI_STATE["version"],
                 "error": _SAI_STATE["error"],
