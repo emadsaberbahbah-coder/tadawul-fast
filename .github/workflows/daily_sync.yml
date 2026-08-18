@@ -322,6 +322,10 @@ jobs:
       TFB_SYNC_OHLC_RUNLOG: ${{ vars.TFB_SYNC_OHLC_RUNLOG || '1' }}
       TFB_SYNC_STATUS_STAMP: ${{ vars.TFB_SYNC_STATUS_STAMP || '0' }}
       TFB_SYNC_STATUS_STAMP_PAGES: ${{ vars.TFB_SYNC_STATUS_STAMP_PAGES || '' }}
+      # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
+      TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
+      TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}
+      TFB_SYNC_VERDICT_MAX_AGE_MIN: ${{ vars.TFB_SYNC_VERDICT_MAX_AGE_MIN || '240' }}
       # ─────────────────────────────────────────────────────────────────────
       # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
       # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
@@ -1330,6 +1334,10 @@ jobs:
       TFB_SYNC_OHLC_RUNLOG: ${{ vars.TFB_SYNC_OHLC_RUNLOG || '1' }}
       TFB_SYNC_STATUS_STAMP: ${{ vars.TFB_SYNC_STATUS_STAMP || '0' }}
       TFB_SYNC_STATUS_STAMP_PAGES: ${{ vars.TFB_SYNC_STATUS_STAMP_PAGES || '' }}
+      # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
+      TFB_SYNC_UPSTREAM_VERDICT: ${{ vars.TFB_SYNC_UPSTREAM_VERDICT || '0' }}
+      TFB_SYNC_VERDICT_PAGES: ${{ vars.TFB_SYNC_VERDICT_PAGES || '' }}
+      TFB_SYNC_VERDICT_MAX_AGE_MIN: ${{ vars.TFB_SYNC_VERDICT_MAX_AGE_MIN || '240' }}
       # ─────────────────────────────────────────────────────────────────────
 
       # ── v6.35.0 [DECISION-FIRST] ─────────────────────────────────────────
