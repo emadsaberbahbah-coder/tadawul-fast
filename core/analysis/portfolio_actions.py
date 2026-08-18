@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 core/analysis/portfolio_actions.py — Action Engine for My_Portfolio
-Version: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
+Version: 1.8.0   (header synced to runtime; history below)
+Prior header: 1.0.5   (TFB Final Execution Plan v5.0 — Phase P5, milestone M2;
                   Engineering Audit Fix #2 — valuation<->forecast conflict
                   guard, env-gated DEFAULT-OFF)
 
@@ -342,6 +343,8 @@ import math
 import json
 import os
 from datetime import datetime, timedelta, timezone
+import logging
+logger = logging.getLogger("core.analysis.portfolio_actions")
 
 # -----------------------------------------------------------------------------
 # v1.2.0 (2026-07-18) — GEN-2 ADVISOR MATH, STAGE 2 (Wave A, script #8)
@@ -602,8 +605,37 @@ from datetime import datetime, timedelta, timezone
 # KILL: TFB_PF_REQUIRE_FRESH_BASIS unset/0 -> decide_action byte-identical
 # to v1.7.3 (proven by the A/B harness in the PR).
 # ---------------------------------------------------------------------------
-PORTFOLIO_ACTIONS_VERSION = "1.7.4"
-_OB_VERSION_FLOOR = (1, 0, 1)
+# v1.7.5 (2026-08-18, W1A-5a — typed-unit contract, alert surface):
+#   Spec v1.4.1 W1A-5 fixtures land here. (1) EVERY alert now carries an
+#   explicit unit tag ("unit": "count") with an int-coerced count, plus a
+#   payload-level alerts_units_version — the "low_data_coverage rendered as
+#   '1 SAR'" class becomes a renderer bug it can no longer blame on an
+#   untyped payload (GAS half consumes the tag when pasted). (2)
+#   over_position_cap is now a PORTFOLIO-STATE count — holdings whose
+#   market-value share exceeds the max_position_pct control — not an
+#   ACTION-artifact
+#   count (TRIM + "Position" in reason). The old basis silently dropped any
+#   over-cap holding whose final action was BLOCK/HOLD (the v1.0.2/v1.0.5
+#   comment trail documents exactly this class), which is the 4-vs-3
+#   fixture. Fail-open: rows without a usable weight fall back to the
+#   legacy action-basis so the alert can never go silent on sparse data.
+#   Additive only — no key removed, no consumer broken.
+# v1.8.0 (2026-08-18 evening, external portfolio-layer audit — every P0/P1
+# reproduced against source; per-site F-tags): F1 rule-EXIT passes the SAME
+# step-1 primitives first (cost-basis rule, shared trust assessment,
+# _identity_unverifiable) — data validity is never bypassable. F2 presence
+# demands strictly positive finite price/fx. F3 PORTFOLIO_VALUE_INCOMPLETE
+# suppresses weights, cap/sector trims and ADD funding when a held position
+# has no resolvable MV (flag + typed alert; row verdicts stay). F4 shared
+# per-sector room ledger in fund_adds. F5 (policy, documented): deployable =
+# max(0, cash + eligible_proceeds − cash_floor). F6 over_position_cap uses
+# the allocator's holdings+cash denominator (audit caught my holdings-only
+# basis). F7 pnl on covered cost + coverage kpis. F8 _sector_bucket in
+# pass-2. F9 fresh_basis_gate_enabled boolean-typed. F10 range clamps +
+# configuration_invalid alert. F11 taxonomy split. F12 logging imported.
+# F13 OB floor (1,9,1).
+PORTFOLIO_ACTIONS_VERSION = "1.8.0"
+_OB_VERSION_FLOOR = (1, 9, 1)   # F13
 
 # --- opportunity_builder import (package → relative → flat), fail-soft -----
 _ob = None
@@ -674,6 +706,7 @@ DEFAULT_CONTROLS = {
     "cost_max_ratio": 5.0,
     "cost_min_ratio": 0.2,
     "block_missing_cost_basis": False,
+    "fresh_basis_gate_enabled": True,
     # v1.0.3 data-trust gate (Phase 0 parity with opportunity_builder v1.0.6)
     "trust_gate_enabled": True,
     "max_data_age_hours": 168.0,
@@ -708,7 +741,7 @@ _CONTROLS_FLOAT = ("cash_available_sar", "target_cash_pct", "max_position_pct",
 _CONTROLS_INT = ("review_days", "lot_size", "max_holdings", "period_months",
                  "min_trust_fields",
                  "add_confirm_days")
-_CONTROLS_BOOL = ("engine_roi_display_enabled", "cost_basis_gate_enabled",
+_CONTROLS_BOOL = ("fresh_basis_gate_enabled", "engine_roi_display_enabled", "cost_basis_gate_enabled",
                   "block_missing_cost_basis", "trust_gate_enabled",
                   "block_thin_coverage", "identity_gate_enabled",
                   "vf_conflict_guard_enabled")
@@ -926,6 +959,31 @@ def _env_trim_by_rule_gate():
     restores the v1.4.0 cap-everything-on-Low behavior byte-identically."""
     return (os.getenv("TFB_TRIM_BY_RULE_GATE") or "1").strip().lower() \
         not in ("0", "false", "off", "no")
+
+
+def _rule_exit_data_ok(cand, controls):
+    """v1.8.0 F1: rule-EXIT may bypass confidence caps, never data
+    validity — SAME primitives as step-1 (no forked thresholds)."""
+    try:
+        okb, _r = _cost_basis_block_reason(
+            cand.get("avg_cost_raw", cand.get("avg_cost")),
+            cand.get("price"),
+            cand.get("position_qty",
+                     cand.get("qty", cand.get("quantity"))), controls)
+        if not okb:
+            return False
+        det = _trust_assess(cand, controls)
+        if det is not None and (det.get("stale")
+                                or (det.get("thin") and controls.get(
+                                    "block_thin_coverage"))):
+            return False
+        if controls.get("identity_gate_enabled"):
+            _ok, _ = _identity_unverifiable(cand, controls)
+            if not _ok:
+                return False
+    except Exception:
+        return False
+    return True
 
 
 def _rule_exit_set():
@@ -1243,6 +1301,30 @@ def make_controls(overrides=None):
         ctl["target_cash_pct"] = 0.0
     # v1.0.2: keep the plausibility band sane (high > 1x, low in (0,1),
     # low < high); reset to defaults on any misconfiguration.
+    _cfg_bad = []                                            # F10
+    for _k in ("max_position_pct", "max_sector_pct", "target_cash_pct",
+               "min_reliability_add", "min_dq_add"):
+        try:
+            _fv = float(ctl.get(_k))
+        except Exception:
+            _fv = None
+        _bad = (_fv is None or _fv != _fv or
+                (_k.startswith("max_") and not (0.0 < _fv <= 100.0)) or
+                (not _k.startswith("max_") and not (0.0 <= _fv <= 100.0)))
+        if _bad:
+            _cfg_bad.append("%s=%r" % (_k, ctl.get(_k)))
+            ctl[_k] = DEFAULT_CONTROLS[_k]
+    try:
+        if float(ctl.get("cash_available_sar")) < 0:
+            _cfg_bad.append("cash_available_sar=%r"
+                            % ctl.get("cash_available_sar"))
+            ctl["cash_available_sar"] = 0.0
+    except Exception:
+        pass
+    ctl["_config_warnings"] = _cfg_bad
+    if _cfg_bad:
+        logger.warning("[PF v1.8.0] configuration_invalid: %s",
+                       ", ".join(_cfg_bad))
     if ctl["cost_max_ratio"] <= 1.0:
         ctl["cost_max_ratio"] = DEFAULT_CONTROLS["cost_max_ratio"]
     if not (0.0 < ctl["cost_min_ratio"] < 1.0):
@@ -1689,9 +1771,9 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
 
     # 1. BLOCK — data gate (presence: price / fx / quantity)
     missing = []
-    if cand.get("price") is None:
+    if (_pos_float(cand.get("price")) or 0) <= 0:   # F2: None/0/neg
         missing.append("price")
-    if cand.get("fx_to_sar") is None:
+    if (_pos_float(cand.get("fx_to_sar")) or 0) <= 0:   # F2
         missing.append("fx")
     if not (cand.get("quantity") is not None and cand["quantity"] > 0):
         missing.append("quantity")
@@ -1706,7 +1788,8 @@ def decide_action(cand, controls, weight_pct, sector_weight_pct,
     #     convert it into a HOLD (today's 1180/BBD lesson).
     if _env_exit_by_rule_gate():
         _sym_r = (str(cand.get("symbol") or "").strip().upper())
-        if _sym_r and _sym_r in _rule_exit_set():
+        if (_sym_r and _sym_r in _rule_exit_set()
+                and _rule_exit_data_ok(cand, controls)):
             return (ACTION_EXIT,
                     "EXIT-BY-RULE (\u00a74.6): compliance/authority verdict "
                     "\u2014 not confidence-cappable",
@@ -1991,17 +2074,22 @@ def fund_adds(entries, controls, cash_sar, total_value_sar):
     include_proceeds = controls["rebalance_mode"] != REBALANCE_NEW_CASH
     cash_floor = (controls["target_cash_pct"] / 100.0) * (
         total_value_sar or 0.0)
-    deployable = max(0.0, (cash_sar or 0.0) - cash_floor)
+    # v1.8.0 F5 (policy change, documented): proceeds first restore the
+    # target cash floor; only the surplus funds ADDs.
     if include_proceeds:
-        deployable += proceeds
+        deployable = max(0.0, (cash_sar or 0.0) + proceeds - cash_floor)
+    else:
+        deployable = max(0.0, (cash_sar or 0.0) - cash_floor)
     cash_left = max(0.0, (cash_sar or 0.0) - cash_floor)
-    proceeds_left = proceeds if include_proceeds else 0.0
+    proceeds_left = (max(0.0, deployable - cash_left)
+                     if include_proceeds else 0.0)
 
     adds = [e for e in entries if e["action"] == ACTION_ADD]
     adds.sort(key=lambda e: (-(e["cand"].get("ann_roi_pct") or 0.0),
                              -(e["cand"].get("reliability") or 0.0),
                              e["cand"].get("symbol") or ""))
     remaining = deployable
+    _sec_ledger = {}                       # F4
     funded_total = 0.0
     lot = max(1, int(controls["lot_size"]))
     for e in adds:
@@ -2010,9 +2098,11 @@ def fund_adds(entries, controls, cash_sar, total_value_sar):
         price_sar = (cand.get("price") or 0.0) * (cand.get("fx_to_sar") or 0.0)
         cap_room = max(0.0, (controls["max_position_pct"] / 100.0) *
                        (total_value_sar or 0.0) - mv)
-        sector_room = e.get("_sector_room_sar")
-        if sector_room is None:
-            sector_room = float("inf")
+        _fb = _sector_bucket(cand)                          # F4
+        if _fb not in _sec_ledger:
+            _r0 = e.get("_sector_room_sar")
+            _sec_ledger[_fb] = (float("inf") if _r0 is None else float(_r0))
+        sector_room = _sec_ledger[_fb]
         budget = min(cap_room, sector_room, remaining)
         shares = 0
         suggested = 0.0
@@ -2026,6 +2116,7 @@ def fund_adds(entries, controls, cash_sar, total_value_sar):
             cash_left -= take_cash
             proceeds_left -= take_proc
             remaining -= suggested
+            _sec_ledger[_fb] = max(0.0, _sec_ledger[_fb] - suggested)  # F4
             funded_total += suggested
             if take_proc > 0 and take_cash > 0:
                 ff = ("cash %d + proceeds %d SAR"
@@ -2235,6 +2326,7 @@ def _skeleton(status, reason, controls=None):
         "actions": [],
         "sector_summary": [],
         "alerts": [],
+        "alerts_units_version": 1,
         "meta": {
             "reason": reason,
             "controls_snapshot": controls or {},
@@ -2283,6 +2375,16 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     cands = [normalize_holding(r, fx_rates, ctl) for r in rows]
     holdings_value = sum(c["market_value_sar"] or 0.0 for c in cands)
     total_value = holdings_value + cash
+    _pnl_cov_cost = sum((c.get("cost_sar") or 0.0) for c in cands
+                        if c.get("pnl_sar") is not None
+                        and c.get("cost_sar") is not None)          # F7
+    _pv_incomplete = any(                                            # F3
+        _pos_float(c.get("quantity")) is not None            # cand key
+        and _pos_float(c.get("market_value_sar")) is None
+        for c in cands)
+    if _pv_incomplete:
+        logger.warning("[PF v1.8.0] PORTFOLIO_VALUE_INCOMPLETE — "
+                       "cross-sectional math suppressed")
 
     # Sector aggregation for caps (valued holdings only)
     sector_value = {}
@@ -2304,14 +2406,14 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     for c in cands:
         mv = c["market_value_sar"]
         weight = (mv / total_value * 100.0) if (mv and total_value) else None
-        sec = c.get("sector") or "Unknown"
+        sec = _sector_bucket(c)   # F8
         sec_val = sector_value.get(sec, 0.0)
         sec_weight = (sec_val / total_value * 100.0) if total_value else None
         excess_share = 0.0
         if mv and sector_excess.get(sec, 0.0) > 0 and sec_val > 0:
             excess_share = sector_excess[sec] * (mv / sec_val)
         action, reason, proceeds, capped_from = decide_action(
-            c, ctl, weight, sec_weight, excess_share)
+            c, ctl, (None if _pv_incomplete else weight), (None if _pv_incomplete else sec_weight), (None if _pv_incomplete else excess_share))
         # v1.1.0 (Fix #3): a first-day ADD renders HOLD "pending
         # confirmation"; a non-ADD verdict resets the symbol's clock.
         action, reason, capped_from = _apply_add_confirmation(
@@ -2341,8 +2443,32 @@ def _build(rows, ctl, fx_rates, upstream_meta):
             cb["pnl_pct"] = None
 
     # Pass 3 — L7 funding
-    deployable, proceeds_inc, adds_funded, cash_floor = fund_adds(
-        entries, ctl, cash, total_value)
+    if _pv_incomplete:                                               # F3
+        cash_floor = (ctl["target_cash_pct"] / 100.0) * (total_value or 0.0)
+        deployable, proceeds_inc, adds_funded = 0.0, 0.0, 0.0
+        for _e in entries:
+            if _e["action"] == ACTION_ADD:
+                _e["suggested_delta_sar"] = 0.0
+                _e["suggested_delta_shares"] = 0
+                _e["funds_from"] = None
+                _e["action_reason"] += (" — funding suppressed: "
+                                        "portfolio value incomplete")
+    else:
+        if _pv_incomplete:                                       # F3
+            # An incomplete denominator must fund NOTHING: zero the
+            # deployable surface and blank any ADD sizing so a partial
+            # book can never emit confident allocation numbers.
+            deployable, proceeds_inc, adds_funded = 0.0, 0.0, 0.0
+            cash_floor = (ctl["target_cash_pct"] / 100.0) * (
+                total_value or 0.0)
+            for _e in entries:
+                if _e["action"] == ACTION_ADD:
+                    _e["suggested_delta_sar"] = 0.0
+                    _e["suggested_delta_shares"] = 0
+                    _e["funds_from"] = None
+        else:
+            deployable, proceeds_inc, adds_funded, cash_floor = fund_adds(
+                entries, ctl, cash, total_value)
 
     review_date = (datetime.now(timezone.utc) +
                    timedelta(days=ctl["review_days"])).date().isoformat()
@@ -2393,7 +2519,8 @@ def _build(rows, ctl, fx_rates, upstream_meta):
 
     def _alert(atype, count, action_text):
         if count:
-            alerts.append({"type": atype, "count": count,
+            alerts.append({"type": atype, "count": int(count),
+                           "unit": "count",          # W1A-5a typed contract
                            "required_action": action_text})
 
     # v1.0.2: split BLOCK alerts so the required action is accurate. Cost-basis
@@ -2437,10 +2564,29 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                e["cand"].get("market_value_sar") is not None and
                not _is_cost_basis_block(e["action"], e["action_reason"])),
            "Fill Buy Price in _Portfolio_CostBasis for accurate P&L")
+    # v1.7.5 (W1A-5a): STATE-based — every holding actually over the cap
+    # counts, whatever its final action became (TRIM, BLOCK, conflict-HOLD).
+    # Basis = market_value_sar share, computed self-contained right here: it
+    # is the ONE field the v1.0.2 contract guarantees survives a block
+    # ("market value, being price-based, is kept") — which is precisely why
+    # the old TRIM-reason basis under-counted: an over-cap holding whose
+    # action became BLOCK/HOLD vanished from the alert while its weight
+    # stayed on the book. Fail-open: unusable cap/total falls back to the
+    # legacy action-basis so the alert can never go silent.
+    _opc_cap = _pos_float(ctl.get("max_position_pct"))
+    _opc_mvs = [(_pos_float(e["cand"].get("market_value_sar")) or 0.0)
+                for e in entries]
+    _opc_total = 0.0 if _pv_incomplete else (                        # F6/F3
+        total_value if _pos_float(total_value) else sum(_opc_mvs))
+    _opc_state = 0
+    if _opc_cap is not None and _opc_total > 0:
+        _opc_state = sum(1 for _mv in _opc_mvs
+                         if (_mv / _opc_total) * 100.0 > _opc_cap)
+    _opc_legacy = sum(1 for e in entries
+                      if e["action"] == ACTION_TRIM and
+                      "Position" in e["action_reason"])
     _alert("over_position_cap",
-           sum(1 for e in entries
-               if e["action"] == ACTION_TRIM and
-               "Position" in e["action_reason"]),
+           _opc_state if _opc_state else _opc_legacy,
            "Review position-cap trims")
     _alert("over_sector_cap",
            sum(1 for s in sector_summary if s["over_cap"]),
@@ -2448,11 +2594,36 @@ def _build(rows, ctl, fx_rates, upstream_meta):
     # v1.0.5: conflict holds also carry capped_from (truthfully — the action
     # WAS capped), so exclude them here and count them under their own alert;
     # guard OFF -> zero conflict rows -> both counts byte-identical v1.0.4.
+    def _rl(e): return str(e.get("action_reason") or "").lower()     # F11
+    _alert("add_confirmation_pending",
+           sum(1 for e in entries if e.get("capped_from")
+               and "pending confirmation" in _rl(e)),
+           "No action needed — ADD confirms after the configured window")
+    _alert("engine_precedence_veto",
+           sum(1 for e in entries if e.get("capped_from")
+               and ("precedence" in _rl(e) or "engine state" in _rl(e))),
+           "Engine WATCHLIST/BLOCKED vetoed the upgrade — review the "
+           "engine verdict, not data reliability")
+    _alert("synthetic_basis_deferred",
+           sum(1 for e in entries if e.get("capped_from")
+               and "synthetic" in _rl(e)),
+           "Deferred until a real cost basis replaces the synthetic")
     _alert("low_confidence_capped",
            sum(1 for e in entries
                if e.get("capped_from") and
-               not _is_vf_conflict_hold(e["action"], e["action_reason"])),
+               not _is_vf_conflict_hold(e["action"], e["action_reason"])
+               and "pending confirmation" not in _rl(e)
+               and "precedence" not in _rl(e)
+               and "engine state" not in _rl(e)
+               and "synthetic" not in _rl(e)),
            "Improve data reliability; actions were capped to HOLD")
+    _alert("portfolio_value_incomplete", 1 if _pv_incomplete else 0,  # F3
+           "A held position has no resolvable market value — weights, "
+           "cap trims and ADD funding suppressed this run")
+    _alert("configuration_invalid",
+           len(ctl.get("_config_warnings") or []),                    # F10
+           "Invalid controls reset to defaults: "
+           + (", ".join(ctl.get("_config_warnings") or []) or "-"))
     _alert("valuation_forecast_conflict",
            sum(1 for e in entries
                if _is_vf_conflict_hold(e["action"], e["action_reason"])),
@@ -2465,6 +2636,12 @@ def _build(rows, ctl, fx_rates, upstream_meta):
                "Cash %")
     unalloc = max(0.0, deployable - adds_funded)
 
+    # e24: coverage over the POST-scrub population (v1.0.2 nulls a
+    # cost-blocked holding's pnl, so the pre-loop figure overstated it).
+    _pnl_cov_cost = sum((c.get("cost_sar") or 0.0) for c in cands
+                        if c.get("pnl_sar") is not None
+                        and c.get("cost_sar") is not None)
+
     payload = {
         "version": PORTFOLIO_ACTIONS_VERSION,
         "status": "ok",
@@ -2476,7 +2653,14 @@ def _build(rows, ctl, fx_rates, upstream_meta):
             if total_value else None,
             "cost_basis_sar": _round(cost_total, 0) if cost_total else None,
             "pnl_sar": _round(pnl_total, 0),
-            "pnl_pct": _round(pnl_pct, 1),
+            "pnl_covered_cost_sar": _round(_pnl_cov_cost, 0),        # F7
+            "pnl_coverage_pct": _round(
+                (_pnl_cov_cost / cost_total * 100.0)
+                if _pos_float(cost_total) else None, 1),
+            "pnl_pct": _round(
+                (pnl_total / _pnl_cov_cost * 100.0)
+                if (_pos_float(_pnl_cov_cost)
+                    and pnl_total is not None) else None, 1),
             "deployable_sar": _round(deployable, 0),
             "proceeds_pending_sar": _round(proceeds_inc, 0),
             "adds_funded_sar": _round(adds_funded, 0),
@@ -2488,6 +2672,7 @@ def _build(rows, ctl, fx_rates, upstream_meta):
         "actions": action_rows,
         "sector_summary": sector_summary,
         "alerts": alerts,
+        "alerts_units_version": 1,
         "meta": {
             "controls_snapshot": ctl,
             "cash_floor_sar": _round(cash_floor, 0),
