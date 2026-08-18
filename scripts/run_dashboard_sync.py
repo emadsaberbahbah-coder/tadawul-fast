@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.39.5)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.40.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1570,7 +1570,48 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 #        merge-blocking). F-11 (priority fetch) and F-12 (dedup enforce) are
 #        operator ENV/wave decisions, NOT code — rejected for this PR.
 #   ZERO functions removed. No behaviour change while gates stay OFF.
-SCRIPT_VERSION = "6.39.5"
+# v6.40.0 (2026-08-18 evening, W1A-4a — Top_10 EXECUTABLE / NOT_ACTIONABLE):
+#   WHY: W1A-4 quick form (spec v1.4.x): Top_10 must fail CLOSED — actionable
+#   only when its upstream feed is provably healthy. 4b (v6.39.0-5) made each
+#   page leg stamp its own truthful _Status A:J row; 4a is the PRODUCER of the
+#   cross-page decision verdict the cockpit consumes. The sync cannot write
+#   Top_10 itself (v6.6.0 decision-owned guard — deliberately intact), so the
+#   verdict is published to the `_Status` L:M global key-value block, which
+#   the GAS cockpit already reads. Consumer (a ~15-line ES5 reader rendering
+#   the banner + blanking Ticket/Shares on NOT_ACTIONABLE) is the companion
+#   GAS delivery; its contract is fully documented at _UPSTREAM_VERDICT_KEY.
+#   MECHANICS: after all legs of a job complete, upsert one `TFB Feed <page>`
+#   key per ranked page synced in THIS job (state OK/PARTIAL/STALE_COV/
+#   FAILED/SKIPPED + fresh_cov + run id + timestamp), then recompute the
+#   composite `TFB Decision Feed` by overlaying this job's pages onto the
+#   OTHER pages' last-written keys (matrix legs cover disjoint page sets, so
+#   no single leg sees all four). Composite = EXECUTABLE only when every
+#   required page's freshest state is OK within TFB_SYNC_VERDICT_MAX_AGE_MIN
+#   (default 240) trailing minutes; else NOT_ACTIONABLE:<first reason>.
+#   SAFETY: bounded L{r}:M{r} RAW updates ONLY — values.append is BANNED here
+#   (it inserts whole rows and would shear the A:J page grid). New keys take
+#   the first blank L slot within L1:L60; none free => loud skip. Writer
+#   self-checks the block is really the key-value column (a known key such as
+#   "Backend URL" must be present) before its first write — no blind writes
+#   into a moved layout. Two-attempt retry, fail-open, loud ::warning:: on
+#   final failure — FW-3 discipline throughout. Parallel matrix legs race
+#   only on the composite row; per-page keys are disjoint by construction and
+#   the LAST leg of a cycle recomputes the composite over all fresh keys.
+#   GATE: TFB_SYNC_UPSTREAM_VERDICT, DEFAULT OFF — unset/0 keeps v6.39.5
+#   byte-behaviour (call site not entered). Companions:
+#   TFB_SYNC_VERDICT_PAGES (default: the four ranked pages),
+#   TFB_SYNC_VERDICT_MAX_AGE_MIN (default 240). Arming is a separate operator
+#   decision AFTER the STATUS_STAMP verdict — never bundled.
+#   COMMIT-SAFETY PROOF (why this can land before tonight's observe verdict):
+#   the v6.38.0 guard block, the v6.39.4 run-log appender, the v6.39.x
+#   _Status stamp block and the _run_one_task guard call-site are BYTE-
+#   IDENTICAL to v6.39.5 — verified by sha256 over the extracted regions in
+#   the build record. The only executable-path delta is one default-OFF gate
+#   check after the stale-skip escalation pass. ZERO functions removed;
+#   additions: _upstream_verdict_enabled, _upstream_verdict_pages,
+#   _upstream_verdict_max_age_min, _uv_page_state, _uv_parse_value,
+#   _uv_compose, _write_upstream_verdict.
+SCRIPT_VERSION = "6.40.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -4767,6 +4808,218 @@ def _stamp_page_status(sheets: "SheetsWriter", spreadsheet_id: str, page: str,
         print("::warning::%s stamp FAILED for %s — %s: %s"
               % (_STATUS_STAMP_TAG, page, type(_e).__name__, _e))
         logger.warning("%s stamp skipped for %s: %s", _STATUS_STAMP_TAG, page, _e)
+
+
+# =============================================================================
+# v6.40.0 (W1A-4a) — UPSTREAM DECISION-FEED VERDICT (producer)
+# =============================================================================
+_UPSTREAM_VERDICT_TAG = f"[UPSTREAM-VERDICT v{SCRIPT_VERSION}]"
+# Composite key the cockpit reads. Value contract (single cell, RAW):
+#   "EXECUTABLE | run=<id> | <YYYY-mm-dd HH:MM:SS> | ML:OK GM:OK CFX:OK MF:OK"
+#   "NOT_ACTIONABLE(<reason>) | run=<id> | <ts> | ML:OK GM:STALE_COV ..."
+# Per-page key: "TFB Feed <Page>" ->
+#   "<STATE> | cov=<pct|n/a> | run=<id> | <ts>"   STATE in
+#   OK / PARTIAL / STALE_COV / FAILED / SKIPPED.
+_UPSTREAM_VERDICT_KEY = "TFB Decision Feed"
+_UV_PAGE_KEY_PREFIX = "TFB Feed "
+_UV_BLOCK_RANGE = "L1:M60"          # the documented global key-value block
+_UV_SELFCHECK_KEYS = {"backend url", "last global update", "token loaded"}
+
+
+def _upstream_verdict_enabled() -> bool:
+    """v6.40.0 W1A-4a master gate. DEFAULT OFF — unset/0/false/off keeps
+    v6.39.5 behaviour byte-identical (no read, no write, no API call)."""
+    return (os.getenv("TFB_SYNC_UPSTREAM_VERDICT") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _upstream_verdict_pages() -> list:
+    """Ordered required pages. TFB_SYNC_VERDICT_PAGES overrides (csv)."""
+    raw = (os.getenv("TFB_SYNC_VERDICT_PAGES") or "").strip()
+    if raw:
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    return ["Market_Leaders", "Global_Markets", "Commodities_FX",
+            "Mutual_Funds"]
+
+
+def _upstream_verdict_max_age_min() -> int:
+    """Trailing-freshness window for a per-page key to count (default 240
+    minutes ≈ one morning cycle across the 3-leg matrix; clamp 30..1440)."""
+    try:
+        v = int((os.getenv("TFB_SYNC_VERDICT_MAX_AGE_MIN") or "240").strip())
+    except Exception:
+        v = 240
+    return max(30, min(1440, v))
+
+
+def _uv_page_state(res: Any) -> tuple:
+    """(STATE, cov_or_None) for one leg result. Mirrors the stamp's coverage
+    arithmetic (v6.39.1 P0-3) without touching the verified stamp code:
+    fresh = pre_persist_rows - klg_kept; cov = fresh/requested."""
+    status = str(getattr(res, "status", "") or "").strip().lower()
+    meta = dict(getattr(res, "_stamp_meta", None) or {})
+    requested = int(meta.get("requested")
+                    or getattr(res, "symbols_requested", 0) or 0)
+    pre = meta.get("pre_persist_rows")
+    klg = int(meta.get("klg_kept") or 0)
+    cov = None
+    if isinstance(pre, int) and requested > 0:
+        cov = round(100.0 * max(0, pre - klg) / requested, 1)
+    if status == "success":
+        fmin = 95.0
+        try:
+            fmin = float((os.getenv("TFB_SYNC_STATUS_FRESH_MIN") or "95")
+                         .strip())
+        except Exception:
+            pass
+        if cov is not None and cov < fmin:
+            return "STALE_COV", cov
+        return "OK", cov
+    if status == "partial":
+        return "PARTIAL", cov
+    if status == "failed":
+        return "FAILED", cov
+    return "SKIPPED", cov
+
+
+def _uv_parse_value(val: str) -> tuple:
+    """Parse a stored per-page value -> (STATE, epoch_seconds|None).
+    Tolerant: unknown shapes -> ("", None) and the page counts unhealthy."""
+    try:
+        parts = [p.strip() for p in str(val or "").split("|")]
+        state = parts[0].split("(")[0].strip().upper() if parts else ""
+        ts = None
+        for p in parts:
+            try:
+                ts = time.mktime(time.strptime(p, "%Y-%m-%d %H:%M:%S"))
+                break
+            except Exception:
+                continue
+        return state, ts
+    except Exception:
+        return "", None
+
+
+def _uv_compose(page_states: dict, now_epoch: float) -> tuple:
+    """Pure composite over {page: (STATE, epoch|None)} -> (verdict, summary).
+    EXECUTABLE iff EVERY required page is OK and within the age window.
+    First failing page names the reason — deterministic, order = required
+    list. Unit-tested in scripts/harness_w1a6.py S12."""
+    max_age = _upstream_verdict_max_age_min() * 60.0
+    abbr = {"Market_Leaders": "ML", "Global_Markets": "GM",
+            "Commodities_FX": "CFX", "Mutual_Funds": "MF"}
+    reason = ""
+    frags = []
+    for page in _upstream_verdict_pages():
+        state, ts = page_states.get(page, ("", None))
+        label = state or "MISSING"
+        if ts is not None and (now_epoch - ts) > max_age:
+            label = "AGED"
+        frags.append(f"{abbr.get(page, page)}:{label}")
+        if not reason and label != "OK":
+            reason = f"{label.lower()}:{abbr.get(page, page)}"
+    verdict = "EXECUTABLE" if not reason else f"NOT_ACTIONABLE({reason})"
+    return verdict, " ".join(frags)
+
+
+def _write_upstream_verdict(sheets: "SheetsWriter", spreadsheet_id: str,
+                            results: list) -> None:
+    """v6.40.0 W1A-4a producer. Upsert this job's per-page keys, then the
+    composite, into `_Status` L:M. Bounded L{r}:M{r} RAW updates ONLY —
+    NEVER values.append (row insertion would shear the A:J page grid).
+    Fail-open at every step; loud ::warning:: on final write failure."""
+    if not _upstream_verdict_enabled() or sheets is None:
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        grid = []
+        try:
+            grid = (svc.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{_STATUS_SHEET_NAME}'!{_UV_BLOCK_RANGE}",
+            ).execute().get("values", []) or [])
+        except Exception as _re:
+            print("::warning::%s could not read %s L:M — %s: %s"
+                  % (_UPSTREAM_VERDICT_TAG, _STATUS_SHEET_NAME,
+                     type(_re).__name__, _re))
+            return
+        keys = {}
+        blanks = []
+        known = False
+        for i in range(60):
+            row = grid[i] if i < len(grid) else []
+            k = str(row[0]).strip() if row and len(row) > 0 else ""
+            v = str(row[1]).strip() if row and len(row) > 1 else ""
+            if k:
+                keys[k.casefold()] = (i + 1, v)
+                if k.casefold() in _UV_SELFCHECK_KEYS:
+                    known = True
+            else:
+                blanks.append(i + 1)
+        if not known:
+            print("::warning::%s self-check failed — no known global key in "
+                  "%s!%s; refusing blind write (layout moved?)."
+                  % (_UPSTREAM_VERDICT_TAG, _STATUS_SHEET_NAME,
+                     _UV_BLOCK_RANGE))
+            return
+
+        def _upsert(key: str, value: str) -> None:
+            slot = keys.get(key.casefold(), (None, ""))[0]
+            if slot is None:
+                if not blanks:
+                    print("::warning::%s no free L-slot for '%s' in %s — "
+                          "skipped." % (_UPSTREAM_VERDICT_TAG, key,
+                                        _UV_BLOCK_RANGE))
+                    return
+                slot = blanks.pop(0)
+                keys[key.casefold()] = (slot, "")
+            body = {"values": [[key, value]]}
+            _err = None
+            for _ in (1, 2):
+                try:
+                    svc.spreadsheets().values().update(
+                        spreadsheetId=spreadsheet_id,
+                        range=f"'{_STATUS_SHEET_NAME}'!L{slot}:M{slot}",
+                        valueInputOption="RAW",
+                        body=body,
+                    ).execute()
+                    _err = None
+                    break
+                except Exception as _ae:
+                    _err = _ae
+                    time.sleep(1.0)
+            if _err is not None:
+                raise _err
+            keys[key.casefold()] = (slot, value)
+
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        run_id = (os.getenv("GITHUB_RUN_ID") or "").strip() or "local"
+        required = set(_upstream_verdict_pages())
+        for r in (results or []):
+            page = str(getattr(r, "sheet_name", "") or "")
+            if page not in required:
+                continue
+            state, cov = _uv_page_state(r)
+            _upsert(_UV_PAGE_KEY_PREFIX + page,
+                    f"{state} | cov={cov if cov is not None else 'n/a'} | "
+                    f"run={run_id} | {ts}")
+        page_states = {}
+        now_e = time.time()
+        for page in required:
+            stored = keys.get((_UV_PAGE_KEY_PREFIX + page).casefold())
+            page_states[page] = (_uv_parse_value(stored[1]) if stored
+                                 else ("", None))
+        verdict, summary = _uv_compose(page_states, now_e)
+        _upsert(_UPSTREAM_VERDICT_KEY,
+                f"{verdict} | run={run_id} | {ts} | {summary}")
+        line = f"{_UPSTREAM_VERDICT_TAG} {verdict} | {summary}"
+        (logger.info if verdict == "EXECUTABLE" else logger.warning)(line)
+    except Exception as _e:
+        print("::warning::%s write FAILED — %s: %s"
+              % (_UPSTREAM_VERDICT_TAG, type(_e).__name__, _e))
+        logger.warning("%s skipped: %s", _UPSTREAM_VERDICT_TAG, _e)
 
 
 # Data-provider column aliases (normalized via _guard_norm).
@@ -8082,6 +8335,17 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as _sse:
             logger.warning("%s escalation pass skipped (error: %s)",
                            _STALE_SKIP_TAG, _sse)
+
+        # --- v6.40.0 (W1A-4a) UPSTREAM DECISION-FEED VERDICT -----------------
+        # Publishes the cross-page EXECUTABLE / NOT_ACTIONABLE token the
+        # Top_10 cockpit consumes (contract at _UPSTREAM_VERDICT_KEY). Runs
+        # AFTER escalation so a stale-skip->FAILED page correctly poisons the
+        # composite. DEFAULT OFF; a crash here must never sink the run.
+        try:
+            _write_upstream_verdict(sheets, spreadsheet_id, results)
+        except Exception as _uve:
+            logger.warning("%s pass skipped (error: %s)",
+                           _UPSTREAM_VERDICT_TAG, _uve)
 
         for r in results:
             if r.status == "success":
