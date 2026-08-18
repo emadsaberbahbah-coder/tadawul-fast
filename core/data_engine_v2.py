@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.128.4
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.129.1
 ================================================================================
 
 WHY v5.117.0 - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY (Fix AZ)
@@ -3077,7 +3077,63 @@ if str(ROOT_DIR) not in sys.path:
 #   F-09: wrapper unpacks the module's v1.3.0 six-tuple and logs the four
 #        control counters separately.
 #   F-12: stale title header synchronized (was v5.128.1).
-__version__ = "5.128.4"
+# v5.129.0 (2026-08-18 afternoon, W1A-3 backend half — spec v1.4.1 A-1):
+#   cost_basis_blocked ⇒ COST-DERIVED FIELDS NULL, EXPOSURE PRESERVED.
+#   The SBAC class: a quarantinable buy price rendered +570.62% phantom P&L
+#   while the position's ~20.7% weight was real. Per spec: average cost,
+#   position cost, unrealized P&L and P&L% go NULL and the row becomes
+#   DATA_REVIEW / NOT_ACTIONABLE — but position_value (qty × live price) and
+#   therefore portfolio weight REMAIN visible and inside concentration math,
+#   preserving the portfolio_actions v1.0.2 contract ("market value, being
+#   price-based, is kept"). MIRROR, NOT FORK: the validity rule is imported
+#   from core.analysis.portfolio_actions._cost_basis_block_reason — the
+#   v1.0.2 helper written to be reused — with its own documented defaults
+#   ({} controls), so PD and My_Portfolio can never disagree on what a
+#   blocked basis is. Placement: per-row BEFORE _compute_position_math, and
+#   the derived cells are nulled EXPLICITLY so a stale sheet value cannot
+#   survive the fill-only guards (avg_cost=None then blocks any recompute).
+#   SAI interplay (verified): DATA_REVIEW/NOT_ACTIONABLE are not
+#   INVEST-class, so an armed W1A-1 soft pass preserves them; a buy-family
+#   reco on the row still demotes to HOLD. Deferred to the weights/W1B
+#   lane, stated not hidden: the spec's second clause (FX/identity ALSO
+#   invalid ⇒ market value + weight null too) — qty/price invalidity
+#   already nulls value naturally via the math guards.
+#   GAS half (10_My_Portfolio rendering) awaits the operator's paste.
+#   GATE: TFB_MP_BLOCKED_NULLS (Render ENV, spec name), DEFAULT OFF —
+#   unset/0 keeps v5.128.4 byte-behaviour. Surfaced in [GUARDS+] + health.
+# v5.129.1 (2026-08-18, external v5.129.1 VALIDATION REPORT adjudicated —
+# the artifact itself was never supplied, so per protocol each claim was
+# re-verified as a FINDING against v5.129.0 and re-implemented natively;
+# do not commit any externally-built engine file):
+#   C1 ACCEPTED (P0-class): the v5.129.0 marker short-circuit made
+#        quarantine PERMANENT — a corrected buy price could never retire it,
+#        and a changed cause never refreshed the reason. Now re-validated
+#        EVERY cycle: ok+usable basis ⇒ marker removed, our verdict tokens
+#        cleared (reason cleared only under the PD "BLOCKED — review cost
+#        basis" ownership prefix) and a repaired-marker breadcrumb left;
+#        ok-but-BLANK basis on a previously-quarantined row STAYS
+#        DATA_REVIEW (deleting the wrong price is not a repair).
+#   C2 ACCEPTED: armed + held qty + NO usable price ⇒ stale
+#        position_value / actual_weight / weight_gap / unrealized_* are
+#        cleared — the fill-only math guards preserved stale exposure.
+#   C3 ACCEPTED (parity): controls now built from PD's OWN readers —
+#        _env_cost_basis_gate, TFB_PF_COST_MAX_RATIO / _MIN_RATIO,
+#        TFB_PF_BLOCK_MISSING_COST_BASIS — plus PD's v1.0.6 ratio clamps,
+#        so operator tuning moves BOTH surfaces; PD master gate OFF ⇒
+#        mirror inert. NO new ENV names introduced.
+#   C4 ACCEPTED (scoped): a cost-quarantined holding whose currency cannot
+#        resolve through _pf_fx_table ⇒ position_value/actual_weight also
+#        cleared (spec clause 2, FX leg). Identity leg stays with W1A-8;
+#        blank-currency stays with the weights lane — stated, not hidden.
+#   C5 REJECTED: a "compatibility path" that APPLIES a v1.2 module's
+#        mutations would silently run semantics whose P0s the 08-18 audit
+#        already condemned. Version skew is a broken deploy: detect,
+#        refuse, degrade — never emulate.
+#   C6 ACCEPTED: _SAI_REQUIRED_VERSION pinned; probe marks any other
+#        module version "incompatible", the wrapper REFUSES to apply
+#        (rows pass through untouched, ERROR when armed), health/banner
+#        expose it and degraded_armed fires.
+__version__ = "5.129.1"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4474,6 +4530,7 @@ def _top10_quality_filter_enabled() -> bool:
 # =============================================================================
 # v5.128.1 (audit P1-1/P1-4) — SHARED SURFACE-INVARIANT WRAPPER + STATE
 # =============================================================================
+_SAI_REQUIRED_VERSION = "1.3.0"   # v5.129.1 (C6): engine<->module contract
 _SAI_STATE: Dict[str, Any] = {"import": "unknown", "version": None,
                               "error": ""}
 _SAI_GATE_ENVS = ("TFB_T10_BLOCKED_INVARIANT", "TFB_SURFACE_BLOCKED_INVARIANT",
@@ -4494,8 +4551,15 @@ def _sai_probe():
     before the first request. Returns the module or None."""
     try:
         import core.surface_action_invariants as _sai_mod
+        _v = getattr(_sai_mod, "__version__", "?")
+        _SAI_STATE["version"] = _v
+        if _v != _SAI_REQUIRED_VERSION:
+            # v5.129.1 (C6): skew = broken deploy. Refuse, never emulate.
+            _SAI_STATE["import"] = "incompatible"
+            _SAI_STATE["error"] = (f"module v{_v} != required "
+                                   f"v{_SAI_REQUIRED_VERSION}")
+            return None
         _SAI_STATE["import"] = "ok"
-        _SAI_STATE["version"] = getattr(_sai_mod, "__version__", "?")
         _SAI_STATE["error"] = ""
         return _sai_mod
     except Exception as _pe:
@@ -4557,23 +4621,23 @@ def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
     logged at ERROR and health() reports degraded_armed=True — never a
     silent unprotected pass."""
     try:
-        from core.surface_action_invariants import (
-            SAI_TAG as _tag,
-            __version__ as _sv,
-            apply_surface_action_invariants as _sai,
-        )
-        _SAI_STATE["import"] = "ok"
-        _SAI_STATE["version"] = _sv
-        _SAI_STATE["error"] = ""
-        rows, _n1, _n2, _n3, _n4, _err = _sai(rows, sheet)
+        _mod = _sai_probe()                    # v5.129.1: one gatekeeper
+        if _mod is None:
+            raise ImportError(_SAI_STATE["error"] or "module unavailable")
+        _tag = _mod.SAI_TAG
+        rows, _n1, _n2, _n3, _n4, _err = _mod.apply_surface_action_invariants(
+            rows, sheet)
         if _n1 or _n2 or _n3 or _n4 or _err:
             logger.warning("%s %s | blocked=%d fetchfail=%d warn_invest=%d "
                            "row_sanity=%d errors=%d",
                            _tag, sheet, _n1, _n2, _n3, _n4, _err)
         return rows
     except Exception as _exc:
-        _SAI_STATE["import"] = "error"
-        _SAI_STATE["error"] = str(_exc)[:200]
+        # v5.129.1: keep the probe's finer "incompatible" verdict — the
+        # generic error label only for genuine import/apply failures.
+        if _SAI_STATE.get("import") != "incompatible":
+            _SAI_STATE["import"] = "error"
+            _SAI_STATE["error"] = str(_exc)[:200]
         if _surface_gate_on(*_SAI_GATE_ENVS):
             logger.error("[SURFACE-INV] ARMED but unavailable on %s — "
                          "surfaces UNPROTECTED: %s", sheet, _exc)
@@ -8003,6 +8067,150 @@ def _position_math_authoritative_enabled() -> bool:
     return True
 
 
+_MP_CB_MARK = "mp_cost_basis_quarantined:v5.129.0"
+
+
+def _mp_blocked_nulls_enabled() -> bool:
+    """v5.129.0 W1A-3 gate. DEFAULT OFF."""
+    return (os.getenv("TFB_MP_BLOCKED_NULLS") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+_MP_CB_REPAIRED = "mp_cost_basis_repaired:v5.129.1"
+_MP_CB_REASON_PREFIX = "BLOCKED — review cost basis"
+
+
+def _mp_cb_controls():
+    """v5.129.1 (C3): PD's OWN env readers + v1.0.6 clamps — one tuning
+    surface for both consumers. Fail-open to documented defaults."""
+    import core.analysis.portfolio_actions as _pa
+    try:
+        gate = bool(getattr(_pa, "_env_cost_basis_gate")())
+    except Exception:
+        gate = True
+    try:
+        mx = float(getattr(_pa, "_env_float")(
+            "TFB_PF_COST_MAX_RATIO", _pa.DEFAULT_CONTROLS["cost_max_ratio"]))
+        mn = float(getattr(_pa, "_env_float")(
+            "TFB_PF_COST_MIN_RATIO", _pa.DEFAULT_CONTROLS["cost_min_ratio"]))
+    except Exception:
+        mx, mn = 5.0, 0.2
+    if mx <= 1.0:
+        mx = _pa.DEFAULT_CONTROLS["cost_max_ratio"]
+    if not (0.0 < mn < 1.0):
+        mn = _pa.DEFAULT_CONTROLS["cost_min_ratio"]
+    try:
+        miss = bool(getattr(_pa, "_env_block_missing_cost_basis")())
+    except Exception:
+        miss = False
+    return gate, {"cost_max_ratio": mx, "cost_min_ratio": mn,
+                  "block_missing_cost_basis": miss}
+
+
+def _mp_warn_remove(row: Dict[str, Any], token: str) -> None:
+    w = row.get("warnings")
+    if isinstance(w, list):
+        row["warnings"] = [x for x in w if token not in str(x)]
+    elif w:
+        parts = [p.strip() for p in str(w).split(";")
+                 if p.strip() and token not in p]
+        row["warnings"] = "; ".join(parts)
+
+
+def _mp_cost_basis_quarantine(row: Dict[str, Any]) -> None:
+    """v5.129.1 W1A-3: PD-mirrored cost-basis quarantine with a REPAIR
+    CYCLE. Re-validates every run (C1 — the marker is a breadcrumb, never
+    a bypass): block ⇒ null cost fields + DATA_REVIEW/NOT_ACTIONABLE with
+    a refreshed cause; repair (usable basis, rule ok) ⇒ retire marker,
+    clear OUR tokens/reason; BLANK basis after a prior quarantine stays
+    quarantined. Armed-only extras: no usable price ⇒ stale exposure
+    cleared (C2); quarantined + unresolvable FX ⇒ exposure cleared (C4).
+    position_value is otherwise NEVER touched. Fail-open throughout."""
+    if not _mp_blocked_nulls_enabled() or not isinstance(row, dict):
+        return
+    try:
+        w = row.get("warnings")
+        blob = ("; ".join(str(x) for x in w)
+                if isinstance(w, (list, tuple)) else str(w or ""))
+        marked = _MP_CB_MARK.split(":")[0] in blob
+        from core.analysis.portfolio_actions import (
+            _cost_basis_block_reason as _cbr, _pos_float as _pf,
+        )
+        qty = _pf(row.get("position_qty"))
+        px = _as_float(row.get("current_price"))
+        if px is None:
+            px = _as_float(row.get("price"))
+        if qty is not None and px is None:              # C2
+            for k in ("position_value", "actual_weight", "weight_gap",
+                      "unrealized_pl", "unrealized_pl_pct"):
+                if row.get(k) not in (None, ""):
+                    row[k] = None
+            logger.warning("[MP-CB v5.129.1] %s no usable price — stale "
+                           "exposure cleared", row.get("symbol"))
+        gate, controls = _mp_cb_controls()
+        if not gate:
+            return                                     # C3: PD gate owns us
+        ok, reason = _cbr(row.get("avg_cost"), px,
+                          row.get("position_qty"), controls)
+        basis_usable = _pf(row.get("avg_cost")) is not None
+        if ok and basis_usable and marked:              # C1: REPAIR
+            _mp_warn_remove(row, _MP_CB_MARK.split(":")[0])
+            if row.get("investability_status") == "DATA_REVIEW":
+                row["investability_status"] = ""
+            if row.get("final_action") == "NOT_ACTIONABLE":
+                row["final_action"] = ""
+            br = str(row.get("block_reason") or "")
+            if br.startswith(_MP_CB_REASON_PREFIX):
+                row["block_reason"] = ""
+            w2 = row.get("warnings")
+            if isinstance(w2, list):
+                w2.append(_MP_CB_REPAIRED)
+            else:
+                b2 = str(w2 or "")
+                row["warnings"] = (b2 + ("; " if b2 else "")
+                                   + _MP_CB_REPAIRED)
+            logger.warning("[MP-CB v5.129.1] %s cost-basis REPAIRED — "
+                           "quarantine retired", row.get("symbol"))
+            return
+        if ok and not (marked and not basis_usable):
+            return                                     # clean, or fresh-blank
+        # block (fresh or persisting) — refresh cause, ensure state
+        for k in ("avg_cost", "position_cost", "unrealized_pl",
+                  "unrealized_pl_pct"):
+            row[k] = None
+        row["investability_status"] = "DATA_REVIEW"
+        row["final_action"] = "NOT_ACTIONABLE"
+        br = str(row.get("block_reason") or "").strip()
+        if reason and (not br or br.startswith(_MP_CB_REASON_PREFIX)):
+            row["block_reason"] = reason
+        elif not br:
+            row["block_reason"] = _MP_CB_REASON_PREFIX + " (W1A-3)"
+        if not marked:
+            w3 = row.get("warnings")
+            if isinstance(w3, list):
+                w3.append(_MP_CB_MARK)
+            else:
+                b3 = str(w3 or "")
+                row["warnings"] = (b3 + ("; " if b3 else "") + _MP_CB_MARK)
+        try:                                            # C4: FX leg
+            ccy = _safe_str(row.get("currency")).upper()
+            if ccy and ccy not in _pf_fx_table({}):
+                for k in ("position_value", "actual_weight", "weight_gap"):
+                    if row.get(k) not in (None, ""):
+                        row[k] = None
+                logger.warning("[MP-CB v5.129.1] %s quarantined + FX %s "
+                               "unresolvable — exposure cleared",
+                               row.get("symbol"), ccy)
+        except Exception:
+            pass
+        logger.warning("[MP-CB v5.129.1] %s cost-basis quarantined — "
+                       "cost fields nulled | %s",
+                       row.get("symbol"), (row.get("block_reason") or "")[:90])
+    except Exception as _cbe:
+        logger.warning("[MP-CB v5.129.1] quarantine pass skipped on %s: %s",
+                       row.get("symbol"), _cbe)
+
+
 def _compute_position_math(row: Dict[str, Any]) -> None:
     """v5.85.4 (Fix AF): fill the four DERIVED position columns
     (position_cost, position_value, unrealized_pl, unrealized_pl_pct) from the
@@ -8198,6 +8406,7 @@ def _compute_portfolio_fields(rows: List[Dict[str, Any]],
         # the weight columns starved on total_mv == 0. Fill-only + fail-open.
         for r in rows:
             if isinstance(r, dict):
+                _mp_cost_basis_quarantine(r)   # v5.129.0 W1A-3 (pre-math)
                 _compute_position_math(r)
         targets = _portfolio_target_weights()
         band = _portfolio_rebalance_band_pp()
@@ -13262,7 +13471,8 @@ class DataEngineV5:
             logger.info(
                 "[v%s GUARDS+] surface_blocked=%s surface_fetchfail=%s "
                 "surface_warn_invest=%s surface_row_sanity=%s "
-                "env_combo=%s sai_import=%s sai_ver=%s",
+                "mp_blocked_nulls=%s env_combo=%s sai_import=%s "
+                "sai_ver=%s",
                 __version__,
                 "on" if _surface_gate_on("TFB_T10_BLOCKED_INVARIANT",
                                          "TFB_SURFACE_BLOCKED_INVARIANT")
@@ -13276,6 +13486,7 @@ class DataEngineV5:
                 "on" if _surface_gate_on("TFB_ROW_SANITY_QUARANTINE",
                                          "TFB_SURFACE_ROW_SANITY")
                 else "OFF",
+                "on" if _mp_blocked_nulls_enabled() else "OFF",
                 _sai_env_combo_state(),
                 _SAI_STATE["import"], _SAI_STATE["version"],
             )
@@ -15326,6 +15537,7 @@ class DataEngineV5:
                     "TFB_ROW_SANITY_QUARANTINE",
                     "TFB_SURFACE_ROW_SANITY"),
                 "env_combo": _sai_env_combo_state(),
+                "mp_blocked_nulls": _mp_blocked_nulls_enabled(),
                 "import": _SAI_STATE["import"],
                 "version": _SAI_STATE["version"],
                 "error": _SAI_STATE["error"],
