@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.32.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.39.5)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1502,7 +1502,75 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 #        FIX: headers pre-initialized before try. dry-run suppression now
 #        rides the declared res.dry_run, populated from the existing dry_run
 #        parameter, plus a marker-text belt in the skip helper.
-SCRIPT_VERSION = "6.39.3"
+# v6.39.4 (2026-08-18, W1A-6b — morning audit, adjudicated on primary evidence):
+#   EVIDENCE: the 2026-08-18 08:30 workbook export carries ZERO
+#   "[OHLC-PREWRITE" lines in _Run_Log across 28,028 rows and every sync leg
+#   since the v6.38.0 deploy, while [ID-FIREWALL v6.39.3] verdicts landed on
+#   all four pages in the same runs. Two independent defects produced that:
+#     D1 (workflow, fixed in daily_sync.yml — NOT in this file): the guard's
+#        gate TFB_SYNC_OHLC_PREWRITE was never mapped into either job's env
+#        block, and a GitHub repo *Variable* is not injected into the runner
+#        environment — it is only reachable through ${{ vars.* }}. The
+#        operator armed the Variable on 2026-08-17; os.getenv() still saw
+#        nothing, so _ohlc_prewrite_enabled() stayed False and the guard
+#        never executed. Same class for TFB_SYNC_STATUS_STAMP (W1A-4b).
+#     D2 (this file): even once armed, observe mode's ONLY channel was
+#        logger.info/logger.warning -> the ephemeral Actions job log. The
+#        operator's enforce decision therefore had no durable evidence
+#        surface. This is verbatim the failure the v6.24.1 FW-3b comment
+#        already records for ID-FIREWALL ("FW-3's only failure channel was
+#        a logger.warning nobody can [see]"), which is why FW-3 was given a
+#        _Run_Log appender. The OHLC guard shipped without one.
+#   FIX (D2): _append_runlog_ohlc_prewrite mirrors _append_runlog_idfirewall
+#        exactly in shape — same 10 _Run_Log columns, same two-attempt retry,
+#        same LOUD ::warning:: when the tripwire itself fails, same fail-open
+#        contract. Called from inside the EXISTING guard block, so it can only
+#        run when TFB_SYNC_OHLC_PREWRITE is already armed.
+#   BYTE-BEHAVIOUR: with TFB_SYNC_OHLC_PREWRITE unset/0 (the default, and the
+#        default the workflow now passes) this file is behaviourally identical
+#        to v6.39.3 — the guard block is not entered, so the new function is
+#        never reached. Kill switch inside the armed path:
+#        TFB_SYNC_OHLC_RUNLOG=0.
+#   _OHLC_PREWRITE_TAG deliberately UNCHANGED at "[OHLC-PREWRITE v6.38.0]":
+#        it is a pinned/documented tag (the [SELFTEST v6.25.2] convention) and
+#        the operator's observation gate greps for that exact literal.
+#   ZERO functions removed; additions: _ohlc_prewrite_runlog_enabled,
+#        _append_runlog_ohlc_prewrite.
+# v6.39.5 (2026-08-18, external W1A-6 Deployment Audit adjudicated — Claude
+# re-executed every numeric/code claim against this file before acceptance):
+#   F-08 ACCEPTED (P1) — decision-owned pages could be stamped by a writer
+#        that does not own them: the v6.6.0 DECISION-GUARD early return
+#        (res.status="skipped", marker appended to warnings) still flows
+#        through the v6.39.1 finally-stamp, and _status_stamp_should_skip
+#        suppressed only dry-run/MANUAL-HOLD. With TFB_SYNC_STATUS_STAMP=1
+#        and an empty allow-list, Top_10_Investments would be overwritten to
+#        SKIPPED / rows 0 — clobbering the route-owned cockpit status line.
+#        FIX: should_skip now returns "decision-owned" when the
+#        _DECISION_GUARD_TAG marker is present in the status/warnings blob
+#        (the same blob-inspection convention MANUAL-HOLD already uses).
+#        Ownership is enforced in code, not by operator allow-list memory.
+#   F-09 PARTIAL ACCEPT (P1) — early-exit stamps lost `requested` because
+#        _stamp_meta is populated mainly at the persistence stage. FIX:
+#        _status_stamp_row falls back to res.symbols_requested. fresh/
+#        preserved stay meta-only (they are persistence-stage facts).
+#   F-10 ACCEPTED (P1) — the v6.39.1 CAP_BELOW_UNIVERSE warning lives on
+#        _read_symbols(), but the ACTUAL market path is
+#        _read_existing_page_symbols() (call sites in _run_one_task), whose
+#        heal-first branch slices out[:max_symbols] and whose legacy branch
+#        breaks at the cap — both silently. GM 6,626 < cap 7,000 today, so
+#        the hole is latent; growth past the cap would re-create the
+#        2026-07-03 GM-pinned-at-800 class invisibly. FIX: both branches now
+#        emit the SAME pinned "[CAP v6.39.1] CAP_BELOW_UNIVERSE" literal
+#        (readback-marked) before truncating, so existing grep tooling
+#        catches either path.
+#   F-17 ACCEPTED (P2) — stale top banner (v6.32.0) refreshed.
+#   F-07/F-13/F-14/F-15 land in scripts/harness_w1a6.py v2.0.0 (enforce
+#        contract, _Status writer contract, portability, real T1.2) and in
+#        daily_sync.yml (deterministic harness wired into ci-tests,
+#        merge-blocking). F-11 (priority fetch) and F-12 (dedup enforce) are
+#        operator ENV/wave decisions, NOT code — rejected for this PR.
+#   ZERO functions removed. No behaviour change while gates stay OFF.
+SCRIPT_VERSION = "6.39.5"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3146,7 +3214,17 @@ def _read_existing_page_symbols(
                 sheet_name, len(blanks), len(blanks) + len(named),
             )
         out = blanks + named
-        if max_symbols > 0:
+        if max_symbols > 0 and len(out) > max_symbols:
+            # v6.39.5 (F-10): same pinned literal as _read_symbols so one
+            # grep covers both truncation sites; "readback" marks the path.
+            print("::warning::[CAP v6.39.1] CAP_BELOW_UNIVERSE on %s "
+                  "(readback/heal-first): page has %d usable symbols, "
+                  "cap=%d — overflow is UN-REQUESTED this leg. Raise "
+                  "TFB_SYNC_MAX_SYMBOLS_MARKET to cover the universe."
+                  % (sheet_name, len(out), max_symbols))
+            logger.warning("[CAP v6.39.1] CAP_BELOW_UNIVERSE %s readback "
+                           "usable=%d cap=%d", sheet_name, len(out),
+                           max_symbols)
             out = out[:max_symbols]
         return out
 
@@ -3165,6 +3243,14 @@ def _read_existing_page_symbols(
             seen.add(t)
             out.append(t)
         if max_symbols > 0 and len(out) >= max_symbols:
+            # v6.39.5 (F-10): loud on the legacy (heal-first OFF) branch too.
+            print("::warning::[CAP v6.39.1] CAP_BELOW_UNIVERSE on %s "
+                  "(readback/legacy): symbol read stopped at cap=%d — "
+                  "overflow is UN-REQUESTED this leg. Raise "
+                  "TFB_SYNC_MAX_SYMBOLS_MARKET to cover the universe."
+                  % (sheet_name, max_symbols))
+            logger.warning("[CAP v6.39.1] CAP_BELOW_UNIVERSE %s readback "
+                           "cap=%d", sheet_name, max_symbols)
             break
     return out
 
@@ -4357,6 +4443,98 @@ def _append_runlog_idfirewall(
         logger.warning("%s run-log verdict skipped: %s", _IDFW_TAG, _e)
 
 
+def _ohlc_prewrite_runlog_enabled() -> bool:
+    """v6.39.4 W1A-6b: append one [OHLC-PREWRITE] verdict line per page to
+    the workbook's _Run_Log, mirroring the FW-3 channel. Default ON, but only
+    *within* the armed guard — the guard's own gate (TFB_SYNC_OHLC_PREWRITE,
+    DEFAULT OFF) still decides whether any of this executes, so an unarmed
+    repo keeps v6.39.3 behaviour byte-identically. TFB_SYNC_OHLC_RUNLOG=0
+    silences the append while leaving the guard itself running."""
+    return (os.getenv("TFB_SYNC_OHLC_RUNLOG") or "1").strip().lower() not in {
+        "0", "false", "off", "no"}
+
+
+def _append_runlog_ohlc_prewrite(
+    sheets: "SheetsWriter",
+    spreadsheet_id: str,
+    page: str,
+    stats: dict,
+) -> None:
+    """v6.39.4 W1A-6b: best-effort, fail-open verdict append for the
+    pre-write OHLC coherence guard (columns match the _Run_Log layout:
+    Timestamp, Level, Action, Page, Status, Message, Endpoint, HTTP Code,
+    Duration ms, Details JSON).
+
+    The guard's v6.38.0 observe mode logged only to stdout, which the GitHub
+    Actions runner discards; the operator's enforce decision needs a durable
+    surface in the workbook itself. Contract is identical to FW-3's: silence
+    on any error EXCEPT a loud ::warning:: annotation, because a tripwire
+    must never break the write path it watches, and must never fail
+    invisibly either.
+    """
+    if not _ohlc_prewrite_runlog_enabled() or sheets is None:
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        stats = stats or {}
+        checked = int(stats.get("checked") or 0)
+        flagged = int(stats.get("flagged") or 0)
+        n_open = int(stats.get("open") or 0)
+        n_band = int(stats.get("price_band") or 0)
+        n_range = int(stats.get("range") or 0)
+        examples = [str(e) for e in (stats.get("examples") or [])]
+        mode = _ohlc_prewrite_mode()
+        tol = _ohlc_prewrite_tol()
+        level = "WARNING" if flagged else "INFO"
+        status = "SUSPECT" if flagged else "OK"
+        msg = (
+            f"{_OHLC_PREWRITE_TAG} {page} | checked={checked} "
+            f"flagged={flagged} (open={n_open} price_band={n_band} "
+            f"range={n_range}) | mode={mode} tol={tol}"
+            + (f" | ex: {', '.join(examples[:12])}"
+               f"{'…' if flagged > 12 else ''}" if flagged else "")
+        )
+        details = json.dumps({
+            "checked": checked,
+            "flagged": flagged,
+            "open": n_open,
+            "price_band": n_band,
+            "range": n_range,
+            "examples": examples[:50],
+            "mode": mode,
+            "tol": tol,
+            "version": SCRIPT_VERSION,
+        })
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        body = {"values": [[ts, level, "run_dashboard_sync", page, status,
+                            msg, "", "", "", details]]}
+        _last_err = None
+        for _attempt in (1, 2):
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'_Run_Log'!A1",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body=body,
+                ).execute()
+                _last_err = None
+                break
+            except Exception as _ae:
+                _last_err = _ae
+                time.sleep(1.0)
+        if _last_err is not None:
+            raise _last_err
+    except Exception as _e:
+        # Same FW-3b discipline: the tripwire's own failure must be LOUD.
+        print("::warning::%s _Run_Log verdict append FAILED for %s — %s: %s"
+              % (_OHLC_PREWRITE_TAG, page, type(_e).__name__, _e))
+        logger.warning("%s run-log verdict skipped: %s",
+                       _OHLC_PREWRITE_TAG, _e)
+
+
 # =============================================================================
 # v6.39.0 (W1A-4b) — BACKEND _Status STAMP AT THE WRITE SEAM
 # -----------------------------------------------------------------------------
@@ -4457,7 +4635,11 @@ def _status_stamp_row(page: str, res: Any, n_cols: int) -> list:
     # only a fraction is fresh — publish fresh/preserved/coverage explicitly
     # and never let values.update success masquerade as a full refresh.
     meta = dict(getattr(res, "_stamp_meta", None) or {})
-    requested = int(meta.get("requested") or 0)
+    # v6.39.5 (F-09): early exits (identity fail, floor veto, guard skips)
+    # stamp before the persistence stage populates _stamp_meta — fall back to
+    # the leg's own symbols_requested so diagnostics keep the denominator.
+    requested = int(meta.get("requested")
+                    or getattr(res, "symbols_requested", 0) or 0)
     klg = int(meta.get("klg_kept") or 0)
     preserved = klg + int(meta.get("persist_restored") or 0) + int(
         meta.get("pv2_restored") or 0)
@@ -4512,6 +4694,12 @@ def _status_stamp_should_skip(res: Any) -> str:
         )
         if "MANUAL-HOLD" in blob:
             return "manual-hold"
+        # v6.39.5 (F-08): the daily sync deliberately does NOT own
+        # decision-owned cockpit pages — the v6.6.0 guard skips their write
+        # precisely so the route-owned freshness line survives. A writer that
+        # refuses to write a page must also refuse to stamp its status.
+        if _DECISION_GUARD_TAG in blob:
+            return "decision-owned"
         if "dry-run" in blob.lower() or "dry_run" in blob.lower():
             return "dry-run"
     except Exception:
@@ -7647,6 +7835,17 @@ async def _run_one_task(
                         logger.warning(_ocl)
                     else:
                         logger.info(_ocl)
+                    # v6.39.4 (W1A-6b): the two lines above land ONLY in the
+                    # ephemeral Actions job log. Mirror the verdict into the
+                    # workbook's _Run_Log through the proven FW-3 channel so
+                    # the observe->enforce decision has durable evidence.
+                    # Fail-open twice over (inner helper + this guard): a
+                    # telemetry fault must never touch the write path.
+                    try:
+                        _append_runlog_ohlc_prewrite(
+                            sheets, spreadsheet_id, task.sheet_name, _oc)
+                    except Exception:
+                        pass
             except Exception as _oce:
                 if _ohlc_prewrite_mode() == "enforce":
                     # v6.39.1 (external audit P0-4, ACCEPTED): in ENFORCE the
