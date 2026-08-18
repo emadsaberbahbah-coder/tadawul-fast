@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-W1A-6 / W1A-4b BEHAVIORAL HARNESS v2.0.0  (2026-08-18)
+W1A-6 / W1A-4 BEHAVIORAL HARNESS v2.1.0  (2026-08-18)
 ================================================================================
 v2.0.0 (external W1A-6 Deployment Audit adjudicated):
   F-07 enforce-mode mutation contract (deterministic synthetic fixtures);
@@ -589,8 +589,112 @@ else:
 # =============================================================================
 print()
 print("=" * 78)
+print("S12 W1A-4a upstream verdict (v6.40.0) — pure compose + writer")
+print("=" * 78)
+env(TFB_SYNC_UPSTREAM_VERDICT=None)
+check("S12.1 gate unset -> disabled (v6.39.5 byte-behaviour)",
+      M._upstream_verdict_enabled() is False)
+env(TFB_SYNC_UPSTREAM_VERDICT="0")
+check("S12.2 '0' (workflow default) -> disabled",
+      M._upstream_verdict_enabled() is False)
+env(TFB_SYNC_UPSTREAM_VERDICT="1", TFB_SYNC_VERDICT_PAGES=None,
+    TFB_SYNC_VERDICT_MAX_AGE_MIN=None)
+import time as _t
+_now = _t.time()
+ALL_OK = {p: ("OK", _now - 60) for p in
+          ["Market_Leaders", "Global_Markets", "Commodities_FX",
+           "Mutual_Funds"]}
+v, s = M._uv_compose(dict(ALL_OK), _now)
+check("S12.3 all four OK+fresh -> EXECUTABLE", v == "EXECUTABLE", v)
+check("S12.4 summary lists all four abbreviations",
+      all(t in s for t in ("ML:OK", "GM:OK", "CFX:OK", "MF:OK")), s)
+bad = dict(ALL_OK); bad["Global_Markets"] = ("STALE_COV", _now - 60)
+v, _ = M._uv_compose(bad, _now)
+check("S12.5 one STALE_COV -> NOT_ACTIONABLE(stale_cov:GM)",
+      v == "NOT_ACTIONABLE(stale_cov:GM)", v)
+aged = dict(ALL_OK); aged["Mutual_Funds"] = ("OK", _now - 300 * 60)
+v, _ = M._uv_compose(aged, _now)
+check("S12.6 OK but older than 240min -> AGED -> NOT_ACTIONABLE",
+      v == "NOT_ACTIONABLE(aged:MF)", v)
+miss = dict(ALL_OK); miss.pop("Commodities_FX")
+v, _ = M._uv_compose(miss, _now)
+check("S12.7 missing page -> NOT_ACTIONABLE(missing:CFX)",
+      v == "NOT_ACTIONABLE(missing:CFX)", v)
+st, cov = M._uv_page_state(fresh_res(
+    status="success", symbols_requested=100))
+check("S12.8 success w/o meta -> OK, cov None (no fake numbers)",
+      st == "OK" and cov is None, f"{st}/{cov}")
+r = fresh_res(status="success", symbols_requested=100)
+r._stamp_meta = {"requested": 100, "pre_persist_rows": 50, "klg_kept": 10}
+check("S12.9 success at 40% coverage -> STALE_COV",
+      M._uv_page_state(r) == ("STALE_COV", 40.0))
+check("S12.10 parser round-trips writer format",
+      M._uv_parse_value("OK | cov=99.1 | run=7 | 2026-08-18 21:00:00")[0]
+      == "OK")
+
+UVGRID = [["Global Key", "Value"], ["Last Global Update", "6/6/2026"],
+          ["Backend URL", "https://x"], [], [], []]
+res_gm = fresh_res(sheet_name="Global_Markets", status="success",
+                   symbols_requested=6626)
+res_gm._stamp_meta = {"requested": 6626, "pre_persist_rows": 6626,
+                      "klg_kept": 0}
+rec, sw = rec_writer(grid=UVGRID)
+M._write_upstream_verdict(sw, "SID", [res_gm])
+ups = [kw for k, kw in rec.calls if k == "update"]
+check("S12.11 writer: bounded L{r}:M{r} updates ONLY, ZERO appends",
+      len(ups) == 2 and not [1 for k, _ in rec.calls if k == "append"],
+      f"updates={len(ups)}")
+check("S12.12 new page key took first blank slot L4:M4, RAW",
+      ups[0]["range"] == "'_Status'!L4:M4"
+      and ups[0]["valueInputOption"] == "RAW", ups[0]["range"])
+check("S12.13 composite upserted at next blank L5:M5",
+      ups[1]["range"] == "'_Status'!L5:M5", ups[1]["range"])
+comp = ups[1]["body"]["values"][0]
+check("S12.14 composite key/value: GM fresh-OK but ML/CFX/MF missing "
+      "-> NOT_ACTIONABLE(missing:ML)",
+      comp[0] == "TFB Decision Feed"
+      and comp[1].startswith("NOT_ACTIONABLE(missing:ML)"), comp[1][:60])
+FULLGRID = [["Global Key", "Value"], ["Backend URL", "https://x"],
+            ["TFB Feed Market_Leaders",
+             f"OK | cov=100 | run=1 | {_t.strftime('%Y-%m-%d %H:%M:%S')}"],
+            ["TFB Feed Commodities_FX",
+             f"OK | cov=100 | run=1 | {_t.strftime('%Y-%m-%d %H:%M:%S')}"],
+            ["TFB Feed Mutual_Funds",
+             f"OK | cov=100 | run=1 | {_t.strftime('%Y-%m-%d %H:%M:%S')}"],
+            ["TFB Feed Global_Markets", "FAILED | cov=n/a | run=1 | "
+             + _t.strftime('%Y-%m-%d %H:%M:%S')],
+            ["TFB Decision Feed", "stale"], []]
+rec, sw = rec_writer(grid=FULLGRID)
+M._write_upstream_verdict(sw, "SID", [res_gm])
+comp = [kw for k, kw in rec.calls if k == "update"
+        and kw["range"].endswith("L7:M7")][0]["body"]["values"][0]
+check("S12.15 overlay: this job's fresh GM:OK overrides stored FAILED; "
+      "other legs' keys honoured -> EXECUTABLE",
+      comp[1].startswith("EXECUTABLE"), comp[1][:70])
+NOKEY = [["Wrong", "Block"], [], []]
+rec, sw = rec_writer(grid=NOKEY)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    M._write_upstream_verdict(sw, "SID", [res_gm])
+check("S12.16 layout self-check: unknown block -> refuse, loud, ZERO writes",
+      not [1 for k, _ in rec.calls if k == "update"]
+      and "self-check failed" in buf.getvalue())
+rec, sw = rec_writer(grid=UVGRID, fail=["update"])
+buf = io.StringIO(); raised = None
+try:
+    with contextlib.redirect_stdout(buf):
+        M._write_upstream_verdict(sw, "SID", [res_gm])
+except Exception as e:
+    raised = e
+check("S12.17 write failure: fail-open, no raise, loud ::warning::",
+      raised is None and "::warning::" in buf.getvalue())
+env(TFB_SYNC_UPSTREAM_VERDICT="0")
+
+# =============================================================================
+print()
+print("=" * 78)
 npass = sum(1 for _, ok, _ in RESULTS if ok)
-print(f"HARNESS v2.0.0 RESULT: {npass}/{len(RESULTS)} PASS"
+print(f"HARNESS v2.1.0 RESULT: {npass}/{len(RESULTS)} PASS"
       + (f"  ({len(SKIPPED)} suite(s) skipped)" if SKIPPED else ""))
 for n, ok, d in RESULTS:
     if not ok:
