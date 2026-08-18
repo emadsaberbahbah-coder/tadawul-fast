@@ -167,6 +167,11 @@ jobs:
           fi
 
           python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py tests/test_recent_fixes.py tests/test_inline_page_recovery.py
+          # W1A-6b (2026-08-18, external audit F-13 ACCEPTED): the OHLC
+          # guard + _Run_Log + _Status contracts are merge-blocking. The
+          # harness self-detects CI (no fixture exports) and runs its
+          # deterministic suites only; a non-zero exit fails this job.
+          python scripts/harness_w1a6.py --deterministic
           echo "::endgroup::"
 
   # =============================================================================
@@ -288,6 +293,36 @@ jobs:
       # BOARD_EXEC vs ALT_TOPK split and the regret headline. Champion
       # blend history unchanged; rows are class-labeled, S-1 auditable.
       TFB_TRACK_SHADOW_COHORTS: "1"
+
+      # ── W1A-6a (2026-08-18) OPERATOR-ARMABLE GATES ───────────────────────
+      # WHY: a GitHub repo *Variable* is NOT injected into the runner's
+      # environment. It is reachable only through the ${{ vars.* }} context
+      # and must be mapped here explicitly (same pattern this file already
+      # uses for vars.DEFAULT_SPREADSHEET_ID / vars.BACKEND_BASE_URL, and
+      # full_refresh_coverage.yml for TFB_EXPECTED_MIN_ROWS_*).
+      # EVIDENCE: TFB_SYNC_OHLC_PREWRITE was set as a repo Variable on
+      # 2026-08-17 and the guard still never ran — the 2026-08-18 export has
+      # ZERO "[OHLC-PREWRITE" lines in _Run_Log across every leg since the
+      # v6.38.0 deploy, because os.getenv() saw an unset name.
+      # DEFAULTS BELOW REPRODUCE TODAY'S BEHAVIOUR EXACTLY. Adding these
+      # lines changes nothing on its own: both master gates fall back to the
+      # script defaults ("0" = OFF). Arming is a separate, explicit operator
+      # act — set the repo Variable, then re-run.
+      #   Settings > Secrets and variables > Actions > Variables
+      #     TFB_SYNC_OHLC_PREWRITE      1        (arm W1A-6 guard)
+      #     TFB_SYNC_OHLC_PREWRITE_MODE observe  (observe | enforce)
+      #     TFB_SYNC_STATUS_STAMP       1        (arm W1A-4b stamp)
+      # v6.39.5 (F-08): decision-owned pages (Top_10) are now suppressed in
+      # CODE via the DECISION-GUARD marker — the stamp never overwrites a
+      # route-owned cockpit line, so STATUS_STAMP_PAGES may stay empty
+      # (= all backend-owned pages) without an ownership hazard.
+      TFB_SYNC_OHLC_PREWRITE: ${{ vars.TFB_SYNC_OHLC_PREWRITE || '0' }}
+      TFB_SYNC_OHLC_PREWRITE_MODE: ${{ vars.TFB_SYNC_OHLC_PREWRITE_MODE || 'observe' }}
+      TFB_SYNC_OHLC_PREWRITE_TOL: ${{ vars.TFB_SYNC_OHLC_PREWRITE_TOL || '0.01' }}
+      TFB_SYNC_OHLC_RUNLOG: ${{ vars.TFB_SYNC_OHLC_RUNLOG || '1' }}
+      TFB_SYNC_STATUS_STAMP: ${{ vars.TFB_SYNC_STATUS_STAMP || '0' }}
+      TFB_SYNC_STATUS_STAMP_PAGES: ${{ vars.TFB_SYNC_STATUS_STAMP_PAGES || '' }}
+      # ─────────────────────────────────────────────────────────────────────
       # My_Portfolio rebuild (scripts/run_dashboard_sync.py v6.14.0). ARMED ("1").
       # WHY (2026-06-29, run 28355496400): the prior "0" + its comment ("the backend
       # already builds My_Portfolio correctly from _Portfolio_CostBasis") was WRONG,
@@ -1281,6 +1316,21 @@ jobs:
       TFB_SYNC_PERSIST_SANITY: "1"
       TFB_PORTFOLIO_REBUILD: "1"
       TFB_SYNC_DECISION_GUARD: "1"
+
+      # ── W1A-6a (2026-08-18) OPERATOR-ARMABLE GATES ───────────────────────
+      # Same block as the sync-dashboard job, same defaults. Mirrored here on
+      # purpose: the recovery leg replays the identical write path, so if the
+      # gates were mapped in only one job the two legs would silently apply
+      # different integrity rules to the same pages — the failure mode this
+      # file already warns about for TFB_SYNC_MARKET_GATEWAY (see the
+      # env-scoping note near the top of the workflow).
+      TFB_SYNC_OHLC_PREWRITE: ${{ vars.TFB_SYNC_OHLC_PREWRITE || '0' }}
+      TFB_SYNC_OHLC_PREWRITE_MODE: ${{ vars.TFB_SYNC_OHLC_PREWRITE_MODE || 'observe' }}
+      TFB_SYNC_OHLC_PREWRITE_TOL: ${{ vars.TFB_SYNC_OHLC_PREWRITE_TOL || '0.01' }}
+      TFB_SYNC_OHLC_RUNLOG: ${{ vars.TFB_SYNC_OHLC_RUNLOG || '1' }}
+      TFB_SYNC_STATUS_STAMP: ${{ vars.TFB_SYNC_STATUS_STAMP || '0' }}
+      TFB_SYNC_STATUS_STAMP_PAGES: ${{ vars.TFB_SYNC_STATUS_STAMP_PAGES || '' }}
+      # ─────────────────────────────────────────────────────────────────────
 
       # ── v6.35.0 [DECISION-FIRST] ─────────────────────────────────────────
       # My_Portfolio holdings + Top_10_Investments symbols (+ optional
