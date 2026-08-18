@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.128.1
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.128.4
 ================================================================================
 
 WHY v5.117.0 - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY (Fix AZ)
@@ -3055,7 +3055,29 @@ if str(ROOT_DIR) not in sys.path:
 # _SAI_GATE_ENVS, the [GUARDS+] boot line and health()["surface_invariants"]
 # now include it, so an ARMED-but-unimportable W1A-8 escalates to ERROR and
 # degraded_armed exactly like W1A-1/2. No behaviour change while OFF.
-__version__ = "5.128.2"
+# v5.128.3 (2026-08-18 night, W1A-7 parity): module v1.2.0 adds row-sanity
+# quarantine + the spec-mandated ENV combination matrix. apply() now returns
+# a 5-tuple; the wrapper unpacks/logs row_sanity; _SAI_GATE_ENVS, [GUARDS+]
+# and health() gain the gate AND the live combo-violation state, so an
+# unsafe combination is loud at boot and visible at /health — never a
+# silent misconfiguration. No behaviour change while OFF.
+# v5.128.4 (2026-08-19 early, external XLSX audit adjudicated):
+#   F-03 P0 CONFIRMED: _top10_row_is_eligible line one is the legacy
+#        quality-filter kill switch — with TFB_TOP10_QUALITY_FILTER=0 the
+#        post-invariant re-filter was inert and a demoted WATCHLIST row kept
+#        its seat. FIX: _t10_post_invariant_keep — an UNCONDITIONAL seat
+#        rule layered AFTER the invariants, active whenever ANY surface
+#        gate is armed: BLOCKED never seats; WATCHLIST carrying an
+#        invariant marker never seats. Legacy filter-OFF semantics for rows
+#        the invariants did NOT touch are preserved byte-for-byte, and with
+#        all gates off behaviour is unchanged (default = today).
+#   F-04 P1: _sai_probe() is the ONE import point — boot banner, combo
+#        state, health and the wrapper all share it, so import/version/
+#        degraded_armed are truthful BEFORE the first request.
+#   F-09: wrapper unpacks the module's v1.3.0 six-tuple and logs the four
+#        control counters separately.
+#   F-12: stale title header synchronized (was v5.128.1).
+__version__ = "5.128.4"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4457,12 +4479,74 @@ _SAI_STATE: Dict[str, Any] = {"import": "unknown", "version": None,
 _SAI_GATE_ENVS = ("TFB_T10_BLOCKED_INVARIANT", "TFB_SURFACE_BLOCKED_INVARIANT",
                   "TFB_T10_FETCHFAIL_BLOCKED",
                   "TFB_SURFACE_FETCHFAIL_BLOCKED",
-                  "TFB_WARN_INVEST_INVARIANT", "TFB_SURFACE_WARN_INVEST")
+                  "TFB_WARN_INVEST_INVARIANT", "TFB_SURFACE_WARN_INVEST",
+                  "TFB_ROW_SANITY_QUARANTINE", "TFB_SURFACE_ROW_SANITY")
 
 
 def _surface_gate_on(*names: str) -> bool:
     return any((os.getenv(n) or "0").strip().lower() in
                ("1", "true", "yes", "on") for n in names)
+
+
+def _sai_probe():
+    """v5.128.4 (F-04): the ONE shared import point. Updates _SAI_STATE on
+    every call so boot banner, /health, combo state and the wrapper agree
+    before the first request. Returns the module or None."""
+    try:
+        import core.surface_action_invariants as _sai_mod
+        _SAI_STATE["import"] = "ok"
+        _SAI_STATE["version"] = getattr(_sai_mod, "__version__", "?")
+        _SAI_STATE["error"] = ""
+        return _sai_mod
+    except Exception as _pe:
+        _SAI_STATE["import"] = "error"
+        _SAI_STATE["error"] = str(_pe)[:200]
+        return None
+
+
+def _sai_env_combo_state() -> str:
+    """v5.128.3: 'ok' or the FIRST named violation (truncated) — spec's
+    startup rejection made loud + queryable without killing the service.
+    v5.128.4: routed through _sai_probe so state is set as a side effect."""
+    _mod = _sai_probe()
+    if _mod is None:
+        return "unavailable"
+    try:
+        v = _mod.env_combo_violations()
+        return "ok" if not v else ("VIOLATION:" + v[0][:120])
+    except Exception:
+        return "unavailable"
+
+
+# v5.128.4 (F-03): markers the invariant layer stamps — the unconditional
+# seat rule keys on these so legacy rows stay under legacy semantics.
+_SAI_MARKER_SUBSTRINGS = ("blocked_invariant_applied",
+                          "fetchfail_blocked_applied",
+                          "warn_invest_invariant_applied",
+                          "row_sanity_quarantined")
+
+
+def _t10_post_invariant_keep(row: Dict[str, Any]) -> bool:
+    """v5.128.4 (F-03): UNCONDITIONAL post-invariant Top_10 seat rule —
+    ignores TFB_TOP10_QUALITY_FILTER by design. Active only when a surface
+    gate is armed (all gates off ⇒ always True ⇒ today's behaviour).
+    BLOCKED never seats; WATCHLIST seats only if the invariants did not
+    put it there (no invariant marker present)."""
+    if not _surface_gate_on(*_SAI_GATE_ENVS):
+        return True
+    try:
+        inv = _safe_str(row.get("investability_status")).upper()
+        if inv == "BLOCKED":
+            return False
+        if inv == "WATCHLIST":
+            w = row.get("warnings")
+            blob = ("; ".join(str(x) for x in w)
+                    if isinstance(w, (list, tuple)) else str(w or ""))
+            if any(t in blob for t in _SAI_MARKER_SUBSTRINGS):
+                return False
+        return True
+    except Exception:
+        return True
 
 
 def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
@@ -4481,10 +4565,11 @@ def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
         _SAI_STATE["import"] = "ok"
         _SAI_STATE["version"] = _sv
         _SAI_STATE["error"] = ""
-        rows, _n1, _n2, _err = _sai(rows, sheet)
-        if _n1 or _n2 or _err:
-            logger.warning("%s %s | blocked_demoted=%d fetchfail_blocked=%d "
-                           "row_errors=%d", _tag, sheet, _n1, _n2, _err)
+        rows, _n1, _n2, _n3, _n4, _err = _sai(rows, sheet)
+        if _n1 or _n2 or _n3 or _n4 or _err:
+            logger.warning("%s %s | blocked=%d fetchfail=%d warn_invest=%d "
+                           "row_sanity=%d errors=%d",
+                           _tag, sheet, _n1, _n2, _n3, _n4, _err)
         return rows
     except Exception as _exc:
         _SAI_STATE["import"] = "error"
@@ -13173,9 +13258,11 @@ class DataEngineV5:
                     return "on" if fn() else "OFF"
                 except Exception:
                     return "?"
+            _sai_probe()   # v5.128.4 (F-04): truthful state AT boot
             logger.info(
                 "[v%s GUARDS+] surface_blocked=%s surface_fetchfail=%s "
-                "surface_warn_invest=%s sai_import=%s sai_ver=%s",
+                "surface_warn_invest=%s surface_row_sanity=%s "
+                "env_combo=%s sai_import=%s sai_ver=%s",
                 __version__,
                 "on" if _surface_gate_on("TFB_T10_BLOCKED_INVARIANT",
                                          "TFB_SURFACE_BLOCKED_INVARIANT")
@@ -13186,6 +13273,10 @@ class DataEngineV5:
                 "on" if _surface_gate_on("TFB_WARN_INVEST_INVARIANT",
                                          "TFB_SURFACE_WARN_INVEST")
                 else "OFF",
+                "on" if _surface_gate_on("TFB_ROW_SANITY_QUARANTINE",
+                                         "TFB_SURFACE_ROW_SANITY")
+                else "OFF",
+                _sai_env_combo_state(),
                 _SAI_STATE["import"], _SAI_STATE["version"],
             )
             logger.info(
@@ -15023,6 +15114,9 @@ class DataEngineV5:
             rows = _apply_surface_invariants_safe(rows, target_sheet)
             _t10_pre = len(rows)
             rows = [r for r in rows if _top10_row_is_eligible(r)]
+            # v5.128.4 (F-03): the legacy filter above obeys its kill
+            # switch; this seat rule does not.
+            rows = [r for r in rows if _t10_post_invariant_keep(r)]
             if len(rows) != _t10_pre:
                 logger.warning("[SURFACE-INV] Top_10 post-veto re-filter "
                                "dropped %d row(s)", _t10_pre - len(rows))
@@ -15228,6 +15322,10 @@ class DataEngineV5:
                 "warn_invest_gate": _surface_gate_on(
                     "TFB_WARN_INVEST_INVARIANT",
                     "TFB_SURFACE_WARN_INVEST"),
+                "row_sanity_gate": _surface_gate_on(
+                    "TFB_ROW_SANITY_QUARANTINE",
+                    "TFB_SURFACE_ROW_SANITY"),
+                "env_combo": _sai_env_combo_state(),
                 "import": _SAI_STATE["import"],
                 "version": _SAI_STATE["version"],
                 "error": _SAI_STATE["error"],
