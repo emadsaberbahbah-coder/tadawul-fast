@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.117.0
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.128.1
 ================================================================================
 
 WHY v5.117.0 - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY (Fix AZ)
@@ -3032,7 +3032,25 @@ if str(ROOT_DIR) not in sys.path:
 # _pf_fx_table before summing (was: native sum labelled SAR — wrong for any
 # mixed-currency book). Missing rate for any held currency => totals
 # SUPPRESSED with an explicit note, never a mixed-unit number (A19/A20).
-__version__ = "5.127.2"
+# v5.128.1 (2026-08-18 late, external Full Code Audit adjudicated — every
+# P0 reproduced against source before acceptance):
+#   P0-1 CONFIRMED: get_page_rows applies its own late news veto and returns
+#        WITHOUT the invariant — a route-fallback surface the v5.128.0
+#        comment wrongly excluded from "single API choke point" (comment
+#        retracted). FIX: shared wrapper called after that veto.
+#   P0-2 CONFIRMED: the Top_10 DIRECT branch ranks/filters BEFORE its late
+#        veto and early-returns before the general seam — a just-vetoed row
+#        stayed on the board with rank + BUY. FIX: wrapper + the branch's
+#        OWN _top10_row_is_eligible re-applied post-veto + sequential rank
+#        renumber (audit A6/A12); fallback path inherits via P0-1.
+#   P1-1 shared _apply_surface_invariants_safe owns import/log/state; all
+#        three surfaces now call the SAME wrapper (drift-proof).
+#   P1-2/P1-4: [GUARDS+] boot line + health()["surface_invariants"] expose
+#        effective gate states, module import/version, and degraded_armed;
+#        an ARMED-but-unimportable module logs at ERROR, never silently.
+#   Module fixes (P0-3/P0-4/P1-3 semantics) live in
+#        core/surface_action_invariants.py v1.0.1.
+__version__ = "5.128.1"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4424,6 +4442,54 @@ def _top10_quality_filter_enabled() -> bool:
     if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
         return False
     return True
+
+
+# =============================================================================
+# v5.128.1 (audit P1-1/P1-4) — SHARED SURFACE-INVARIANT WRAPPER + STATE
+# =============================================================================
+_SAI_STATE: Dict[str, Any] = {"import": "unknown", "version": None,
+                              "error": ""}
+_SAI_GATE_ENVS = ("TFB_T10_BLOCKED_INVARIANT", "TFB_SURFACE_BLOCKED_INVARIANT",
+                  "TFB_T10_FETCHFAIL_BLOCKED",
+                  "TFB_SURFACE_FETCHFAIL_BLOCKED")
+
+
+def _surface_gate_on(*names: str) -> bool:
+    return any((os.getenv(n) or "0").strip().lower() in
+               ("1", "true", "yes", "on") for n in names)
+
+
+def _apply_surface_invariants_safe(rows: List[Dict[str, Any]],
+                                   sheet: str) -> List[Dict[str, Any]]:
+    """One wrapper, three call sites (general get_sheet_rows, get_page_rows,
+    Top_10 direct) — the P1-1 drift-proofing. Fail-open ALWAYS returns rows;
+    P1-4: when a gate is ARMED and the module is unavailable, the failure is
+    logged at ERROR and health() reports degraded_armed=True — never a
+    silent unprotected pass."""
+    try:
+        from core.surface_action_invariants import (
+            SAI_TAG as _tag,
+            __version__ as _sv,
+            apply_surface_action_invariants as _sai,
+        )
+        _SAI_STATE["import"] = "ok"
+        _SAI_STATE["version"] = _sv
+        _SAI_STATE["error"] = ""
+        rows, _n1, _n2, _err = _sai(rows, sheet)
+        if _n1 or _n2 or _err:
+            logger.warning("%s %s | blocked_demoted=%d fetchfail_blocked=%d "
+                           "row_errors=%d", _tag, sheet, _n1, _n2, _err)
+        return rows
+    except Exception as _exc:
+        _SAI_STATE["import"] = "error"
+        _SAI_STATE["error"] = str(_exc)[:200]
+        if _surface_gate_on(*_SAI_GATE_ENVS):
+            logger.error("[SURFACE-INV] ARMED but unavailable on %s — "
+                         "surfaces UNPROTECTED: %s", sheet, _exc)
+        else:
+            logger.warning("[SURFACE-INV] pass skipped on %s: %s",
+                           sheet, _exc)
+        return rows
 
 
 def _top10_row_is_eligible(row: Dict[str, Any]) -> bool:
@@ -13102,6 +13168,18 @@ class DataEngineV5:
                 except Exception:
                     return "?"
             logger.info(
+                "[v%s GUARDS+] surface_blocked=%s surface_fetchfail=%s "
+                "sai_import=%s sai_ver=%s",
+                __version__,
+                "on" if _surface_gate_on("TFB_T10_BLOCKED_INVARIANT",
+                                         "TFB_SURFACE_BLOCKED_INVARIANT")
+                else "OFF",
+                "on" if _surface_gate_on("TFB_T10_FETCHFAIL_BLOCKED",
+                                         "TFB_SURFACE_FETCHFAIL_BLOCKED")
+                else "OFF",
+                _SAI_STATE["import"], _SAI_STATE["version"],
+            )
+            logger.info(
                 "[v%s GUARDS] identity=%s price_coh=%s pe_coh=%s ohlc_coh=%s "
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
@@ -14814,6 +14892,10 @@ class DataEngineV5:
         # in get_sheet_rows could still surface here / rank into Top_10. Apply the
         # same one-directional veto so every INVESTABLE-serving path is consistent.
         await self._apply_news_veto(rows)
+        # v5.128.1 (audit P0-1): this route-fallback surface returned AFTER
+        # its own late veto with NO invariant — a vetoed row could leave
+        # here as BUY + block_reason. Same shared wrapper as every surface.
+        rows = _apply_surface_invariants_safe(rows, page)
         return rows
 
     async def get_sheet(self, sheet: str, *, limit: int = 2000, offset: int = 0, **kwargs: Any) -> Dict[str, Any]:
@@ -14924,6 +15006,20 @@ class DataEngineV5:
             _apply_rank_overall(rows)
             _pop_trust_carry(rows)
             await self._apply_news_veto(rows)
+            # v5.128.1 (audit P0-2): this branch ranked and filtered BEFORE
+            # the late veto — a just-vetoed row kept its seat and its BUY.
+            # Invariants, then RE-apply the branch's own eligibility test,
+            # then renumber ranks sequentially so the board never carries a
+            # non-INVESTABLE member (audit A6/A12).
+            rows = _apply_surface_invariants_safe(rows, target_sheet)
+            _t10_pre = len(rows)
+            rows = [r for r in rows if _top10_row_is_eligible(r)]
+            if len(rows) != _t10_pre:
+                logger.warning("[SURFACE-INV] Top_10 post-veto re-filter "
+                               "dropped %d row(s)", _t10_pre - len(rows))
+                for _t10_i, _t10_r in enumerate(rows, start=1):
+                    if "top10_rank" in _t10_r:
+                        _t10_r["top10_rank"] = _t10_i
             return {
                 "rows": rows,
                 "rows_display": _rows_display_objects_from_rows(rows, headers, keys),
@@ -15034,6 +15130,15 @@ class DataEngineV5:
         _pop_trust_carry(rows)  # v5.90.0: drop the transient trust_level carry
         await self._apply_news_veto(rows)
 
+        # --- v5.128.1 (W1A-1/2) SURFACE-ACTION INVARIANTS --------------------
+        # General instrument path, AFTER the last mutators and BEFORE the
+        # rows_display / rows_matrix projections. Shared wrapper (P1-1); the
+        # other surfaces (get_page_rows, Top_10 direct) call the SAME
+        # wrapper — the v5.128.0 "single choke point" claim was wrong and is
+        # retracted in the version WHY.
+        rows = _apply_surface_invariants_safe(rows, target_sheet)
+        # ---------------------------------------------------------------------
+
         return {
             "rows": rows,
             "rows_display": _rows_display_objects_from_rows(rows, headers, keys),
@@ -15104,6 +15209,19 @@ class DataEngineV5:
                 _safe_str(getattr(p, "name", "")) or p.__class__.__name__ if not isinstance(p, str) else p
                 for p in (self._configured_providers or [])
             ],
+            "surface_invariants": {
+                "blocked_gate": _surface_gate_on(
+                    "TFB_T10_BLOCKED_INVARIANT",
+                    "TFB_SURFACE_BLOCKED_INVARIANT"),
+                "fetchfail_gate": _surface_gate_on(
+                    "TFB_T10_FETCHFAIL_BLOCKED",
+                    "TFB_SURFACE_FETCHFAIL_BLOCKED"),
+                "import": _SAI_STATE["import"],
+                "version": _SAI_STATE["version"],
+                "error": _SAI_STATE["error"],
+                "degraded_armed": (_SAI_STATE["import"] == "error"
+                                   and _surface_gate_on(*_SAI_GATE_ENVS)),
+            },
             "cache_size": self._cache.size(),
             "features": self._features,
             "snapshot_pages": len(self._page_snapshots),
