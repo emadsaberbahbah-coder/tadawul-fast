@@ -3133,7 +3133,75 @@ if str(ROOT_DIR) not in sys.path:
 #        module version "incompatible", the wrapper REFUSES to apply
 #        (rows pass through untouched, ERROR when armed), health/banner
 #        expose it and degraded_armed fires.
-__version__ = "5.129.1"
+#
+# =============================================================================
+# v5.130.0 (Fix BC-2 + Fix BD) — FINAL-BOUNDARY OHLC COHERENCE +
+#                                BATCH FINGERPRINT COLLISION DETECTOR
+# -----------------------------------------------------------------------------
+# WHY (2026-08-19 morning six-gate audit + external audit adjudication,
+# IR-077/IR-079/IR-091):
+#   538 rows across GM/CFX/MF reached the sheet with Open OUTSIDE the row's
+#   own [Day Low, Day High] band (GM 368 / CFX 108 / MF 62 / ML 0), with
+#   piecewise-constant page-offset donors (ISP.MI open 9.79 = TTRX.US at
+#   offset -986; control test: 45.7%% of contaminated rows have a
+#   band-consistent donor in the [-1000,-900] window vs 0.5%% of clean
+#   rows). ^TASI.SR carried band 9.53/9.54 under close 10,911.58 — the
+#   direct driver of the S-1 gate's 18 EXCLUDED_INFRA days (3/28 scored).
+#   ROOT CAUSE: the v5.123.0 Fix BC coherence guard (a) has never been
+#   armed (TFB_ENGINE_OHLC_COHERENCE absent from the Render ENV set) and
+#   (b) runs BEFORE the history-patch, best-snapshot, yahoo-enrichment,
+#   eodhd-fundamentals-fallback and page-backfill merges — so a later pass
+#   that plants a foreign open under the row's own H/L/C ships uninspected:
+#   the exact class Fix BC's own docstring warns of ("enrichment plants a
+#   foreign open/range under the right price").
+# WHAT:
+#   BC-2: the SAME detector (_engine_apply_ohlc_coherence, zero logic
+#   change) is applied ONCE MORE at the true final boundary of the quote
+#   factory — after every merge, immediately before cache-set — under the
+#   SAME master env. New sub-envs: TFB_ENGINE_OHLC_COHERENCE_FINAL
+#   (default ON when master armed; =0 restores the v5.129.1 single-site
+#   placement) and TFB_ENGINE_OHLC_COHERENCE_MODE=observe (both sites
+#   detect on a COPY and emit the tag with an :observe suffix, dropping
+#   nothing — the W1A-6 staged-arming pattern; unset = enforce =
+#   v5.123.0 armed semantics byte-for-byte).
+#   BD: _engine_batch_fprint_scan tags (NEVER drops/demotes) every later
+#   row in an emitted batch whose (open, day_high, day_low, volume>0)
+#   fingerprint is byte-identical to an earlier row under a DIFFERENT
+#   symbol — the record fan-out signature (VRE.US/DEG.AX, ERJ.US/HL.L/
+#   ALPH.L, 0011.HK/SEMR.US/P10.US, AXL.US/CEIX.US, 2026-08-19 external
+#   audit, adjudicated). Zero-volume FX alias mirrors excluded by
+#   construction. Env TFB_ENGINE_BATCH_FPRINT, default OFF.
+# BLAST RADIUS: with all three envs unset the module is byte-identical in
+#   behaviour to v5.129.1 (master default OFF unchanged). Zero functions
+#   removed; additions: _engine_ohlc_final_boundary_enabled,
+#   _engine_ohlc_coherence_observe, _engine_batch_fprint_enabled,
+#   _engine_batch_fprint_scan. All prior WHYs preserved verbatim.
+# =============================================================================
+#
+# v5.130.1 (Fix BC-3) — CERTIFICATION HARDENING (external audit 2026-08-19,
+#   adjudicated; scope per its own brief: NO scoring/selection/schema change)
+#   P1-B ACCEPTED: cache-hit rows now pass the SAME boundary policy as the
+#     factory-final site (new shared idempotent helper
+#     _engine_bc_boundary_policy, sites early/final/cache; enforce heals
+#     the stored entry in place, observe tags only, tag-per-site
+#     idempotent). Repro fixed: a 9.79 ISP.MI open cached under master=off
+#     is sanitized+tagged ':cache' on the first hit after arming.
+#   P1-C ACCEPTED: boot GUARDS banner + health() now expose ohlc_final /
+#     ohlc_mode / batch_fprint plus effective R2-R4 thresholds and the BD
+#     error counter — armed-but-dark is the defect class this closes.
+#   F4/F5 ACCEPTED: BD documented as a NORMALIZED fingerprint (6dp/4dp,
+#     intentional); collision tagging is now SYMMETRIC group semantics
+#     (every member tagged with=<co-members>, no donor direction implied).
+#     Silent BD except replaced by counted+bounded-logged failure.
+#   §8 scoring-input caveat REGISTERED (IR), build DEFERRED per the
+#     audit's own "do not broaden" instruction: no confirmed in-file
+#     stale-score defect; a pre-score coherence site is a W-lane item.
+#   Defaults unchanged: all envs unset => byte-identical to v5.129.1.
+#   Zero removals; additions: _engine_bc_boundary_policy,
+#   _BD_SCAN_ERROR_COUNT/_LOGGED. Harness v2 ships subprocess-isolated
+#   OLD/NEW comparison with CLI paths (audit P1-A/F7) + expanded matrix.
+# =============================================================================
+__version__ = "5.130.1"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -9854,6 +9922,186 @@ def _engine_apply_ohlc_coherence(merged: Dict[str, Any]) -> Optional[str]:
     return "ohlc_incoherent_dropped:" + "+".join(seen) + ":engine"
 
 
+def _engine_ohlc_final_boundary_enabled() -> bool:
+    """v5.130.0 (Fix BC-2): second application of the SAME Fix BC coherence
+    check at the true final boundary of the factory (after every history /
+    snapshot / yahoo / eodhd-fallback / page-backfill merge, immediately
+    before cache-set). Active only when the Fix BC master
+    TFB_ENGINE_OHLC_COHERENCE is armed. Default ON when the master is on;
+    TFB_ENGINE_OHLC_COHERENCE_FINAL=0 restores the v5.129.1 single-site
+    (pre-merge) placement byte-for-byte."""
+    raw = (os.getenv("TFB_ENGINE_OHLC_COHERENCE_FINAL") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "f", "disabled", "disable"}:
+        return False
+    return True
+
+
+def _engine_ohlc_coherence_observe() -> bool:
+    """v5.130.0 (Fix BC-2): staged-arming mode for BOTH Fix BC sites.
+    TFB_ENGINE_OHLC_COHERENCE_MODE=observe -> detection runs on a COPY and
+    only the warnings tag is emitted (no member is dropped) so an evidence
+    run can count hits before enforcement. Unset/any other value ->
+    enforce, which is the existing v5.123.0 armed behaviour (drop + tag),
+    byte-identical."""
+    return (os.getenv("TFB_ENGINE_OHLC_COHERENCE_MODE") or "").strip().lower() == "observe"
+
+
+def _engine_bc_boundary_policy(merged: Dict[str, Any], site: str) -> Optional[str]:
+    """v5.130.1 (Fix BC-3): ONE idempotent boundary-policy helper for every
+    Fix BC application site — 'early' (the v5.123.0 pre-merge site),
+    'final' (the v5.130.0 factory-final site) and 'cache' (the cache-hit
+    return, closing the external audit's P1 cache-bypass: a row cached
+    while the master was off/observe survived an in-process arming
+    untouched, reproduced live with the 9.79 ISP.MI open). Behaviour per
+    site is tag-suffix only; detector math is _engine_apply_ohlc_coherence
+    verbatim. enforce mutates in place (on the cache site this heals the
+    stored entry itself, since MultiLevelCache.get returns the stored
+    reference); observe detects on a COPY and only tags. Idempotent: a
+    tag already present for this site is never appended twice, and an
+    already-repaired row re-detects nothing. Returns the appended tag or
+    None. Early-site enforce keeps the EXACT v5.123.0 tag (no suffix)."""
+    if not _engine_ohlc_coherence_enabled() or _is_empty_data_row(merged):
+        return None
+    if site == "final" and not _engine_ohlc_final_boundary_enabled():
+        return None
+    suffix = {"early": "", "final": ":final", "cache": ":cache"}.get(site, "")
+    if _engine_ohlc_coherence_observe():
+        tag = _engine_apply_ohlc_coherence(dict(merged))
+        if not tag:
+            return None
+        tag = tag + suffix + ":observe"
+    else:
+        probe = _engine_apply_ohlc_coherence(dict(merged))
+        if not probe:
+            return None
+        tag = _engine_apply_ohlc_coherence(merged)
+        if not tag:
+            return None
+        tag = tag + suffix
+    existing = merged.get("warnings")
+    existing_s = ";".join(str(x) for x in existing) if isinstance(existing, list) else _safe_str(existing)
+    # v5.130.1: EXACT-tag idempotency AND exact-tag append. Two substring
+    # traps caught by harness B2: (1) substring matching here wrongly
+    # treated '...:cache:observe' as covering '...:cache'; (2) the shared
+    # _aq_append_warning helper ALSO dedupes by substring, so it silently
+    # swallowed the enforce tag whenever the observe tag (its superstring)
+    # was already present — heal succeeded, history lost. The policy
+    # therefore appends locally with exact-token semantics.
+    existing_tags = {t.strip() for t in existing_s.split(";") if t.strip()}
+    if tag in existing_tags:
+        return None
+    _bc_warn_append_exact(merged, tag)
+    return tag
+
+
+def _bc_warn_append_exact(row: Dict[str, Any], tag: str) -> None:
+    """v5.130.1: warnings append with EXACT-token dedupe (None/str/list
+    tolerated, never raises). Exists because _aq_append_warning dedupes by
+    SUBSTRING, which drops any tag that is a prefix of one already present
+    ('...:cache' under '...:cache:observe'). Used only by the BC boundary
+    policy; every other call site keeps the v5.103.0 helper untouched."""
+    try:
+        cur = row.get("warnings")
+        if cur in (None, ""):
+            row["warnings"] = tag
+        elif isinstance(cur, list):
+            if tag not in [str(x).strip() for x in cur]:
+                cur.append(tag)
+        else:
+            s = str(cur)
+            toks = {t.strip() for t in s.split(";") if t.strip()}
+            if tag not in toks:
+                row["warnings"] = (s + "; " + tag) if s.strip() else tag
+    except Exception:
+        pass
+
+
+_BD_SCAN_ERROR_COUNT: int = 0
+_BD_SCAN_ERROR_LOGGED: int = 0
+
+
+def _engine_batch_fprint_enabled() -> bool:
+    """v5.130.0/1 (Fix BD): batch value-fingerprint collision DETECTOR.
+    Default OFF; TFB_ENGINE_BATCH_FPRINT=1 arms it. Tag-only by design -
+    two different symbols sharing a NORMALIZED fingerprint (open/high/low
+    rounded to 6dp, volume to 4dp - float-repr noise makes exact equality
+    brittle by construction) of one session-value block in one emitted
+    batch is the record fan-out signature (2026-08-19 audit: VRE.US/
+    DEG.AX, ERJ.US/HL.L/ALPH.L, 0011.HK/SEMR.US/P10.US, AXL.US/CEIX.US),
+    but value equality is circumstantial (FX alias tickers legitimately
+    mirror), so this NEVER drops or demotes - it names the collision
+    GROUP for the audit chain and the sheet-side guards. Batch order
+    proves nothing about direction: no member is called a donor."""
+    return (os.getenv("TFB_ENGINE_BATCH_FPRINT") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _engine_batch_fprint_scan(rows: List[Dict[str, Any]]) -> int:
+    """v5.130.1 (Fix BD): scan one emitted batch for cross-symbol duplicate
+    NORMALIZED price-block fingerprints. Fingerprint = (open, day_high,
+    day_low, volume), all four present, volume > 0 (zero-volume FX mirror
+    pairs are the known-legitimate alias case, excluded by construction).
+    SYMMETRIC group semantics (external audit F5): EVERY member of a
+    multi-symbol group - including the first in batch order - gains the
+    tag batch_value_collision:with=<other|other2[...]>:engine naming its
+    co-members (capped at 4, then +N). Idempotent: a member already
+    carrying its tag is not re-tagged. Returns rows tagged THIS call.
+    Fail-open with a COUNTED failure: per-row errors increment
+    _BD_SCAN_ERROR_COUNT (surfaced in health) and the first 3 are logged."""
+    global _BD_SCAN_ERROR_COUNT, _BD_SCAN_ERROR_LOGGED
+    groups: Dict[Tuple[float, float, float, float], List[Dict[str, Any]]] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            sym = _safe_str(r.get("symbol") or r.get("requested_symbol")).strip().upper()
+            if not sym:
+                continue
+            o = _as_float(r.get("open_price") if r.get("open_price") is not None else r.get("open"))
+            hi = _as_float(r.get("day_high"))
+            lo = _as_float(r.get("day_low"))
+            v = _as_float(r.get("volume"))
+            if o is None or hi is None or lo is None or v is None or v <= 0:
+                continue
+            key = (round(o, 6), round(hi, 6), round(lo, 6), round(v, 4))
+            groups.setdefault(key, []).append(r)
+        except Exception as exc:
+            _BD_SCAN_ERROR_COUNT += 1
+            if _BD_SCAN_ERROR_LOGGED < 3:
+                _BD_SCAN_ERROR_LOGGED += 1
+                logger.warning("[engine_v2 v%s BD] fingerprint scan row error: %s", __version__, exc)
+            continue
+    tagged = 0
+    for key, members in groups.items():
+        syms: List[str] = []
+        for r in members:
+            s = _safe_str(r.get("symbol") or r.get("requested_symbol")).strip().upper()
+            if s and s not in syms:
+                syms.append(s)
+        if len(syms) < 2:
+            continue
+        for r in members:
+            try:
+                s = _safe_str(r.get("symbol") or r.get("requested_symbol")).strip().upper()
+                others = [x for x in syms if x != s]
+                shown = others[:4]
+                extra = len(others) - len(shown)
+                label = "|".join(shown) + (("+%d" % extra) if extra > 0 else "")
+                tag = "batch_value_collision:with=%s:engine" % label
+                w = r.get("warnings")
+                w_s = ";".join(str(x) for x in w) if isinstance(w, list) else _safe_str(w)
+                if "batch_value_collision:" in w_s:
+                    continue
+                _aq_append_warning(r, tag)
+                tagged += 1
+            except Exception as exc:
+                _BD_SCAN_ERROR_COUNT += 1
+                if _BD_SCAN_ERROR_LOGGED < 3:
+                    _BD_SCAN_ERROR_LOGGED += 1
+                    logger.warning("[engine_v2 v%s BD] fingerprint tag error: %s", __version__, exc)
+                continue
+    return tagged
+
+
 # =============================================================================
 # v5.117.0 (Fix AZ) - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY
 # =============================================================================
@@ -13435,7 +13683,7 @@ def _bb2_apply_identity_guard(rows: List[Dict[str, Any]], sheet: str) -> List[Di
 
 
 class DataEngineV5:
-    """Global-first data orchestrator (v5.79.4)."""
+    """Global-first data orchestrator (see module __version__)."""
 
     def __init__(
         self,
@@ -13492,6 +13740,7 @@ class DataEngineV5:
             )
             logger.info(
                 "[v%s GUARDS] identity=%s price_coh=%s pe_coh=%s ohlc_coh=%s "
+                "ohlc_final=%s ohlc_mode=%s batch_fprint=%s "
                 "echo=%s "
                 "fund_identity=%s snapshot_refusal=%s final_action_invariant=%s "
                 "fund_lkg=%s",
@@ -13500,6 +13749,9 @@ class DataEngineV5:
                 _g(_engine_price_coherence_enabled),
                 _g(_engine_pe_coherence_enabled),
                 _g(_engine_ohlc_coherence_enabled),
+                _g(_engine_ohlc_final_boundary_enabled),
+                ("observe" if _engine_ohlc_coherence_observe() else "enforce"),
+                _g(_engine_batch_fprint_enabled),
                 _g(_identity_echo_enabled),
                 _g(_fund_identity_guard_enabled),
                 _g(_snapshot_poison_refusal_enabled),
@@ -14546,6 +14798,14 @@ class DataEngineV5:
             # ones in place -- every consumer (route-side projections included)
             # then sees the fields regardless of which path served the row.
             _apply_analyst_trend_block(cached)
+            # v5.130.1 (Fix BC-3, external audit P1): the cache-hit return
+            # is a row-emission boundary too. A row cached while the
+            # master was off/observe must not outlive an in-process
+            # arming: the SAME boundary policy runs here (site='cache',
+            # tag suffix ':cache'). enforce heals the STORED entry in
+            # place (cache.get returns the reference); observe tags only.
+            # Master off (default) -> byte-identical cache-hit path.
+            _engine_bc_boundary_policy(cached, "cache")
             return cached
 
         async def factory() -> Dict[str, Any]:
@@ -14642,10 +14902,10 @@ class DataEngineV5:
             # right, so AV and AY-2 both passed by construction. Drop the
             # offending tuple members, tag, and let gates/reliability see it
             # through the normal warning channel. OFF => v5.122.0-identical.
-            if _engine_ohlc_coherence_enabled() and not _is_empty_data_row(merged):
-                _bc_tag = _engine_apply_ohlc_coherence(merged)
-                if _bc_tag:
-                    _aq_append_warning(merged, _bc_tag)
+            # v5.130.1 (Fix BC-3): early site routed through the shared
+            # boundary policy (site='early' keeps the exact v5.123.0
+            # enforce tag; observe suffixes ':observe').
+            _engine_bc_boundary_policy(merged, "early")
 
             # v5.103.0 (Fix AQ): record price provenance for this run. A price
             # present HERE came from a real provider quote; anything filled by
@@ -14855,6 +15115,22 @@ class DataEngineV5:
                 if _ar_hit is not None:
                     _aq_append_warning(merged, "price_bar_stale:%s:%ds" % (_ar_hit[0], _ar_hit[1]))
 
+            # --- v5.130.0 (Fix BC-2) FINAL-BOUNDARY OHLC COHERENCE ----------
+            # The v5.123.0 Fix BC call above runs BEFORE the history / best-
+            # snapshot / yahoo-enrichment / eodhd-fallback / page-backfill
+            # merges, so a pass that plants a foreign open AFTER it ships
+            # uninspected - the exact class Fix BC's own docstring warns of
+            # ("enrichment plants a foreign open/range under the right
+            # price"). Proven live 2026-08-19: 538 rows across GM/CFX/MF
+            # with Open outside the row's own [Day Low, Day High]
+            # (piecewise-constant page-offset donors, e.g. ISP.MI open 9.79
+            # from TTRX.US at offset -986; ^TASI.SR band 9.53/9.54 under a
+            # 10,911.58 close -> 18 EXCLUDED_INFRA S-1 days). Same master
+            # env, same detector, applied ONCE MORE at the true final
+            # boundary: nothing after this point may write an OHLC member.
+            # Master off (default) -> byte-identical to v5.129.1.
+            _engine_bc_boundary_policy(merged, "final")
+
             if not merged.get("last_updated_utc") and not _aq_honest:
                 merged["last_updated_utc"] = _now_utc_iso()
             if not merged.get("last_updated_riyadh") and not _aq_honest:
@@ -14954,6 +15230,22 @@ class DataEngineV5:
                     "last_updated_riyadh": _now_riyadh_iso(),
                 }
                 out.append(degraded)
+        # v5.130.0 (Fix BD): batch value-fingerprint collision detector -
+        # tag-only, default OFF (TFB_ENGINE_BATCH_FPRINT=1 arms). Runs on
+        # the assembled batch AFTER pair-bind, so a whole-block fan-out
+        # (identical open/high/low/volume under a second symbol) is named
+        # per-row for the audit chain even when each row's embedded
+        # identity is self-consistent.
+        if _engine_batch_fprint_enabled() and out:
+            try:
+                _bd_hits = _engine_batch_fprint_scan(out)
+                if _bd_hits:
+                    logger.warning(
+                        "[engine_v2 v%s BD] batch fingerprint collisions on page=%s: %d row(s) tagged",
+                        __version__, page or "?", _bd_hits,
+                    )
+            except Exception:
+                pass
         return out
 
     async def get_enriched_quotes_batch(self, symbols: Sequence[str], page: str = "") -> List[Dict[str, Any]]:
@@ -15543,6 +15835,16 @@ class DataEngineV5:
                 "error": _SAI_STATE["error"],
                 "degraded_armed": (_SAI_STATE["import"] == "error"
                                    and _surface_gate_on(*_SAI_GATE_ENVS)),
+            },
+            "ohlc_coherence": {
+                "master": _engine_ohlc_coherence_enabled(),
+                "final_boundary": _engine_ohlc_final_boundary_enabled(),
+                "mode": ("observe" if _engine_ohlc_coherence_observe() else "enforce"),
+                "range_tol": _engine_ohlc_range_tol(),
+                "ratio_high": _engine_ohlc_ratio_high(),
+                "ratio_low": _engine_ohlc_ratio_low(),
+                "batch_fprint": _engine_batch_fprint_enabled(),
+                "bd_scan_errors": _BD_SCAN_ERROR_COUNT,
             },
             "cache_size": self._cache.size(),
             "features": self._features,
