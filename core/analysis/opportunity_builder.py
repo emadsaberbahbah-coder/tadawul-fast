@@ -1020,7 +1020,7 @@ from datetime import datetime, timedelta, timezone
 # GATE DEFAULT: **OFF**. ZERO functions removed. Additions:
 # _env_cap_band_gate, _env_cap_band, _cap_band_assessment.
 # ---------------------------------------------------------------------------
-OPPORTUNITY_BUILDER_VERSION = "1.12.0"
+OPPORTUNITY_BUILDER_VERSION = "1.13.0"
 
 # ---------------------------------------------------------------------------
 # v1.0.5 [ENGINE-ROI-DISPLAY] — surface the engine forecast (env-gated, OFF)
@@ -1726,6 +1726,39 @@ except Exception:  # pragma: no cover
     }
 
 
+def _alias_key_used(view, field):
+    """v1.13.0 [TRUST-001]: which alias KEY supplied the value _field()
+    returned — per-field provenance for the lineage audit (which spelling
+    of DQ/reliability actually won on this row)."""
+    for alias in _FIELD_ALIASES.get(field, ()):
+        if alias in view and view[alias] not in (None, ""):
+            return alias
+    return None
+
+
+def _env_trust_lineage_mode():
+    """v1.13.0 [TRUST-001 / IR-093]: consumer-side defense for the DQ
+    rewrite class (2026-08-19 audits, Claude-adjudicated: 20 rows whose
+    SOURCE page carried low_data_trust @ DQ 73.7 arrived at the Top-10
+    decision layer as DQ 100.0 — crossing the Min DQ 80 gate). At HEAD the
+    backend is a proven pass-through (route: no live refresh; builder:
+    alias passthrough; trend enrichment: dq-free), so the inflation enters
+    upstream of the POST — this gate defends the LAST line regardless of
+    where, and its meta counters localize the origin from one live run.
+    Returns "" (off, DEFAULT — gate list, verdicts, candidate keys and
+    every row byte-identical to v1.12.0) | "tag" (candidates carry the
+    lineage fields + run counters count; NO gate, NO verdict change) |
+    "gate" (the contradiction — low_data_trust source flag AND DQ passing
+    min_dq — fails MAJOR => DO_NOT_INVEST, visible in audit/near-miss).
+    TFB_OPP_TRUST_LINEAGE = unset/0 | tag/observe/1 | gate/enforce/2."""
+    v = (os.getenv("TFB_OPP_TRUST_LINEAGE") or "").strip().lower()
+    if v in ("gate", "enforce", "2"):
+        return "gate"
+    if v in ("tag", "observe", "1"):
+        return "tag"
+    return ""
+
+
 def _env_sector_normalize():
     """v1.0.13: diversifier sector-quality toggle. Default OFF; set
     v1.0.22: DEFAULT ON (dormant fix + live 5023.SR damage — see WHY).
@@ -2073,6 +2106,10 @@ _FIELD_ALIASES = {
                               "blockreasons", "blockreason",
                               "investabilitynotes"),
     "last_updated": ("lastupdatedutc", "lastupdated", "asof", "timestamp"),
+    # v1.13.0 [TRUST-001]: the sheet row's Warnings column travels in
+    # body_rows; the low_data_trust flag it carries is the SOURCE engine's
+    # own trust verdict and is the lineage witness this build consumes.
+    "warnings": ("warnings", "warning", "rowwarnings"),
     "data_provider": ("dataprovider", "provider", "primaryprovider"),
 }
 
@@ -2273,6 +2310,8 @@ def normalize_candidate(row, fx_rates, criteria):
     if iv and price and iv > 0:
         mos_pct = max(0.0, (iv - price) / iv * 100.0)
 
+    _tl_mode = _env_trust_lineage_mode()
+
     avg_vol = _to_float(_field(view, "avg_volume_30d"))
     liquidity_sar = None
     if avg_vol and price and fx:
@@ -2281,7 +2320,7 @@ def normalize_candidate(row, fx_rates, criteria):
     reliability = _to_float(_field(view, "reliability"))
     dq = _to_float(_field(view, "dq"))
 
-    return {
+    cand = {
         "symbol": symbol,
         "name": _to_text(_field(view, "name")) or symbol,
         "market": _to_text(_field(view, "market")) or "Unknown",
@@ -2330,6 +2369,16 @@ def normalize_candidate(row, fx_rates, criteria):
             "last_updated": _to_text(_field(view, "last_updated")),
         },
     }
+    # v1.13.0 [TRUST-001]: lineage fields attach ONLY when the mode is
+    # armed, so the OFF candidate dict (and therefore every downstream
+    # row/payload outside meta) is byte-identical to v1.12.0.
+    if _tl_mode:
+        _w_txt = _to_text(_field(view, "warnings")) or ""
+        cand["trust_low_source"] = ("low_data_trust" in _w_txt
+                                    or "rank_skipped_low_trust" in _w_txt)
+        cand["dq_alias_key"] = _alias_key_used(view, "dq")
+        cand["rel_alias_key"] = _alias_key_used(view, "reliability")
+    return cand
 
 
 # ---------------------------------------------------------------------------
@@ -2923,6 +2972,21 @@ def evaluate_gates(cand, criteria, held_symbols=None):
     dq_ok = cand["dq"] is not None and cand["dq"] >= criteria["min_dq"]
     g.append(_gate("Data Quality", dq_ok, FAIL_MAJOR, _round1(cand["dq"]),
                    ">= " + _fmt_num(criteria["min_dq"])))
+
+    # v1.13.0 [TRUST-LINEAGE GATE — TRUST-001]: fires ONLY on the exact
+    # contradiction — the source engine flagged this row low_data_trust,
+    # yet the decision-layer DQ PASSES min_dq. A low-trust row whose DQ is
+    # also low already fails the Data Quality gate above; a clean row is
+    # untouched. Appended ONLY in mode "gate", so "tag" and off leave the
+    # gate list and verdict byte-identical to v1.12.0. MAJOR =>
+    # DO_NOT_INVEST: visible in audit / near-miss, never a selected ticket.
+    if (_env_trust_lineage_mode() == "gate"
+            and cand.get("trust_low_source") and dq_ok):
+        g.append(_gate(
+            "Trust Lineage", False, FAIL_MAJOR,
+            "low_data_trust@dq=" + _fmt_num(_round1(cand["dq"])),
+            "no low_data_trust source flag when DQ passes",
+            "TRUST-001: DQ passed min_dq without enrichment provenance"))
 
     # v1.0.6 [DATA-TRUST-GATE]: the engine captures investability / last_updated
     # into cand.engine_gate but it gated nothing, and there was no freshness or
@@ -4010,10 +4074,18 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
     audit = []
     gate_fail_counts = {}
     trust_stats = {"evaluated": 0, "blocked": 0,
-                   "blocked_stale": 0, "blocked_thin": 0}
+                   "blocked_stale": 0, "blocked_thin": 0,
+                   "lineage_low": 0, "lineage_contradiction": 0}
     for raw in rows:
         cand = normalize_candidate(raw, fx_rates, crit)
         gates = evaluate_gates(cand, crit, held)
+        # v1.13.0 [TRUST-001] run telemetry — counts in tag AND gate mode;
+        # zeros when off (keys always present, the v1.0.6 meta precedent).
+        if cand.get("trust_low_source"):
+            trust_stats["lineage_low"] += 1
+            if (cand.get("dq") is not None
+                    and cand["dq"] >= (crit.get("min_dq") or 0)):
+                trust_stats["lineage_contradiction"] += 1
         verdict = derive_verdict(gates, cand["reliability"])
         comps = score_components(cand, sector_ctx)
         score = opportunity_score(comps)
@@ -4255,6 +4327,11 @@ def _build(rows, criteria, portfolio, fx_rates, upstream_meta):
             "blocked": trust_stats["blocked"],
             "blocked_stale": trust_stats["blocked_stale"],
             "blocked_thin": trust_stats["blocked_thin"],
+        },
+        "trust_lineage": {
+            "mode": _env_trust_lineage_mode() or "off",
+            "low_trust_rows": trust_stats["lineage_low"],
+            "contradictions": trust_stats["lineage_contradiction"],
         },
         "coverage": meta_in.get("coverage"),
         "budget": meta_in.get("budget"),
