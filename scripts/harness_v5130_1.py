@@ -1,16 +1,55 @@
 #!/usr/bin/env python3
-"""v5.130.1 harness v2 — audit P1-A/F6/F7 remediation.
+"""v5.130.1 harness v2.2.0 — audit P1-A/F6/F7 remediation.
 OLD/NEW equivalence runs in ISOLATED SUBPROCESSES (own cwd, own
 PYTHONPATH root, own sys.modules); parent compares canonical JSON and
-each child reports its dependency-stack fingerprints. Paths via CLI:
-    harness_v5130_1.py [OLD_TREE] [NEW_TREE]
+each child reports its dependency-stack fingerprints.
 In-process sections exercise the REAL DataEngineV5 of the NEW tree only;
 data-source seams (fetch patch, enrichment pass) are the only patches.
+
+v2.1.0 (2026-08-20) PORTABILITY REBUILD. v2.0 defaulted NEW_TREE to the
+literal "/home/claude/build/work" and OLD_TREE to a sibling of it — paths
+that existed only inside the session that authored this file. From a bare
+`git clone` the harness died on FileNotFoundError before running a single
+assertion, so a committed certification artifact could not be executed by
+anyone but its author. Now:
+    NEW_TREE resolves from THIS FILE (<repo> = parent of scripts/).
+    OLD_TREE is optional; absent -> the differential suite is SKIPPED with
+    a message, and (unless --require-old) the run still certifies what it
+    could actually execute.
+Resolution order, both trees: CLI positional -> env -> derived default.
+
+    harness_v5130_1.py [OLD_TREE] [NEW_TREE]
+    harness_v5130_1.py --require-old            # differential is mandatory
 """
 import asyncio, importlib.util, json, os, subprocess, sys, copy, tempfile
 
-OLD_TREE = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("TFB_OLD_TREE", "/home/claude/build/tadawul-fast-main")
-NEW_TREE = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("TFB_NEW_TREE", "/home/claude/build/work")
+_ARGV = [a for a in sys.argv[1:] if not a.startswith("--")]
+_REQUIRE_OLD = "--require-old" in sys.argv
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE) if os.path.basename(_HERE) == "scripts" else _HERE
+
+OLD_TREE = (_ARGV[0] if len(_ARGV) > 0
+            else os.environ.get("TFB_OLD_TREE", ""))
+NEW_TREE = (_ARGV[1] if len(_ARGV) > 1
+            else os.environ.get("TFB_NEW_TREE", "") or _REPO)
+
+
+def _tree_ok(t):
+    return bool(t) and os.path.isfile(
+        os.path.join(t, "core", "data_engine_v2.py"))
+
+
+HAVE_OLD = _tree_ok(OLD_TREE)
+if not _tree_ok(NEW_TREE):
+    print("FATAL: NEW_TREE has no core/data_engine_v2.py: %r" % NEW_TREE)
+    sys.exit(2)
+print("NEW_TREE : %s" % NEW_TREE)
+print("OLD_TREE : %s" % (OLD_TREE if HAVE_OLD else
+                         "(not supplied — differential suite SKIPPED)"))
+if _REQUIRE_OLD and not HAVE_OLD:
+    print("  FAIL  CERT: --require-old set but no usable OLD_TREE")
+    sys.exit(1)
 
 PASS = FAIL = 0
 def check(label, cond, detail=""):
@@ -105,16 +144,37 @@ def run_child(tree):
     if out.returncode != 0:
         raise RuntimeError(out.stderr[-800:])
     return json.loads(out.stdout.strip().splitlines()[-1])
-o = run_child(OLD_TREE); n = run_child(NEW_TREE)
-check("child versions: OLD=5.129.1 NEW=5.130.1",
-      o["engine_version"]=="5.129.1" and n["engine_version"]=="5.130.1",
-      f"{o['engine_version']} / {n['engine_version']}")
-for nm in o["stack"]:
-    fo, fn = o["stack"][nm], n["stack"][nm]
-    ok = (fo is None and fn is None) or (fo and fn and str(fo["file"]).startswith(OLD_TREE) and str(fn["file"]).startswith(NEW_TREE))
-    check(f"stack isolation: {nm} rooted per-tree", ok, f"{fo} / {fn}")
-check("T0 batch payload identical", json.dumps(o["batch"],sort_keys=True)==json.dumps(n["batch"],sort_keys=True))
-check("T0 factory payload identical", json.dumps(o["factory"],sort_keys=True)==json.dumps(n["factory"],sort_keys=True))
+# v2.1.0: the differential needs BOTH trees. Announcing a skip is not
+# skipping — v2.1.0-pre printed "SKIPPED" and then ran the section anyway,
+# dying in run_child(). Guard the body, and still exercise the NEW tree so a
+# single-tree run certifies what it can rather than certifying nothing.
+if HAVE_OLD:
+    o = run_child(OLD_TREE); n = run_child(NEW_TREE)
+    check("child versions: OLD=5.129.1 NEW=5.130.1",
+          o["engine_version"]=="5.129.1" and n["engine_version"]=="5.130.1",
+          f"{o['engine_version']} / {n['engine_version']}")
+    for nm in o["stack"]:
+        fo, fn = o["stack"][nm], n["stack"][nm]
+        ok = (fo is None and fn is None) or (fo and fn and str(fo["file"]).startswith(OLD_TREE) and str(fn["file"]).startswith(NEW_TREE))
+        check(f"stack isolation: {nm} rooted per-tree", ok, f"{fo} / {fn}")
+    check("T0 batch payload identical", json.dumps(o["batch"],sort_keys=True)==json.dumps(n["batch"],sort_keys=True))
+    check("T0 factory payload identical", json.dumps(o["factory"],sort_keys=True)==json.dumps(n["factory"],sort_keys=True))
+else:
+    print("  ....  SECTION A differential skipped (no OLD_TREE)")
+    n = run_child(NEW_TREE)
+    # v2.2.0 (pre-merge audit F7): smoke mode accepted ANY non-empty
+    # version. Era floor instead: this artifact certifies the 5.130.1
+    # change, so the engine under test must be >= 5.130.1 — a moving HEAD
+    # (5.130.2, 5.130.3, ...) passes; a pre-fix tree cannot.
+    def _vt(v):
+        try: return tuple(int(x) for x in str(v).split("."))
+        except Exception: return (0,)
+    check("NEW tree engine version >= 5.130.1 (era floor)",
+          _vt(n.get("engine_version")) >= (5, 130, 1),
+          str(n.get("engine_version")))
+    check("NEW tree stack rooted in NEW_TREE",
+          all((v is None) or str(v["file"]).startswith(NEW_TREE)
+              for v in n["stack"].values()), str(n["stack"]))
 
 # ========================================================================
 print("="*74); print("SECTION B — NEW tree in-process: real class, expanded matrix"); print("="*74)
