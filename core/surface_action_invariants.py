@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/surface_action_invariants.py — W1A-1/2/7/8 (v1.3.0, 2026-08-18)
+core/surface_action_invariants.py — W1A-1/2/7/8 (v1.4.1, 2026-08-20)
 ================================================================================
 THE TWO INVARIANTS (spec v1.4.x, W1A table):
   W1A-1  BLOCKED ⇒ DO_NOT_INVEST. A row carrying a non-empty block_reason (or
@@ -98,8 +98,15 @@ from typing import Any, Dict, List, Tuple
 #   wrapper covers — including the Top_10 direct branch's post-veto
 #   re-filter and My_Portfolio via the general seam.
 #   GATE: TFB_WARN_INVEST_INVARIANT (alias TFB_SURFACE_WARN_INVEST),
-#   DEFAULT OFF, arms independently of W1A-1/2. 0.0% is exact — a partial
-#   verification (e.g. :12.5%) must NOT trigger.
+#   DEFAULT OFF, arms independently of W1A-1/2.
+#   v1.4.1 CORRECTION: xprovider_verified:<prov>:<pct>% is NOT part of the
+#   trigger set. The engine producer (data_engine_v2 ~10456) computes
+#   pct = |px-alt|/min * 100 — a price-agreement DELTA — and writes the
+#   tag only on agreement within threshold ("positive evidence, no gate
+#   effect", engine WHY ~505). 0.0% is EXACT agreement, the strongest
+#   positive verification. Disagreement writes a different tag,
+#   xprovider_price_conflict, which the investability gate already
+#   handles upstream. W1A-8 triggers ONLY on the four quote/name markers.
 # v1.2.0 (2026-08-18 night, W1A-7 — spec v1.4 table, graded not blanket):
 #   HARD QUARANTINE ⇒ BLOCKED (block_reason "row_sanity:<class> (W1A-7)"
 #   written when blank, appended to warnings otherwise; investability forced
@@ -158,7 +165,81 @@ from typing import Any, Dict, List, Tuple
 #        instrument's identity. The live evidence is the fixture itself:
 #        T82U.SI's GM twin carrying that tag sat BLOCKED. Demotion on 0.0%
 #        is therefore the conservative and intended reading.
-__version__ = "1.3.0"
+# v1.4.0 (2026-08-20 morning, W1A-7b — ONE new HARD row-sanity class):
+#   WHY: the 2026-08-20 board produced exactly ONE executable ticket,
+#   1015.KL, and that row carried Open 4.64 against a Day Low of 7.05 —
+#   34.2% outside the session range — while scoring Data Quality 100.00,
+#   Forecast Reliability 88.10, and passing the Top_10 funnel with
+#   First Fail = NONE. Neither the surface invariants nor the Top_10 gates
+#   test Open against the range at all; day_high_lt_day_low was the only
+#   geometry class and it caught 1 of 669 detectable violations on that
+#   export. The ticket was therefore not a selection error — it was an
+#   unguarded geometry class reaching the executable surface.
+#   CLASS: open_outside_day_range — HARD, so the same-pass W1A-1 chain
+#   finishes the demotion to DO_NOT_INVEST/BLOCKED, identical in shape to
+#   day_high_lt_day_low. Keys coalesced open / open_price / day_open
+#   (all three live in the engine). Guarded on hi >= lo so a High<Low row
+#   is charged to that class only and never double-counted.
+#   TOLERANCE: the module's own _RANGE_TOL (0.1%), reused deliberately —
+#   sub-tolerance rounding is normalized exactly as the 52W tags do it and
+#   is NEVER quarantined. Measured on the live export: 655 rows violate at
+#   0% tolerance, 627 at 0.1%, 623 at 0.5% — only 32 rows sit in the
+#   rounding tail, so 0.1% is the whole decision and a looser tolerance
+#   buys nothing. All four live US holdings measure dev 0.000% and are
+#   untouched; the IR-101 sub-tolerance class does not reproduce here.
+#   BLAST RADIUS (measured, not projected): 627 rows quarantined pool-wide
+#   — 448 GM / 107 CFX / 72 MF / 0 ML. Of those, 501 already read
+#   DO_NOT_INVEST and 114 already read WATCH, so the guard only makes them
+#   honest. Exactly 12 currently read INVEST: board INVEST 83 -> 71 with
+#   this class alone. Market_Leaders returning 0 is the negative control —
+#   its Open column is 100% unpopulated (0/255), so the class must be
+#   structurally silent there, and it is.
+#   NOT CHANGED: the SOFT 52W range_async path, every W1A-1/2/8 predicate,
+#   and every existing class. _RS_MARK moves to :v1.4.0 because the
+#   row-sanity VOCABULARY changed — the marker names the vocabulary, not
+#   the module.
+#   GATE: unchanged — TFB_ROW_SANITY_QUARANTINE (alias
+#   TFB_SURFACE_ROW_SANITY), DEFAULT OFF, and still refused by the ENV
+#   combination matrix unless the W1A-1 blocked-invariant gate is armed.
+#   NO NEW ENV IS INTRODUCED BY THIS VERSION.
+#   DEPLOY CONTRACT: data_engine_v2.py pins _SAI_REQUIRED_VERSION by strict
+#   equality and returns None on any skew ("skew = broken deploy. Refuse,
+#   never emulate."). This module CANNOT ship alone — data_engine_v2 must
+#   move to _SAI_REQUIRED_VERSION = "1.4.0" in the same deploy.
+# v1.4.1 (2026-08-20 midday, external audit F-01/F-04/F-05 — adjudicated
+# against the engine producer before acceptance):
+#   F-01 P0 ACCEPTED — W1A-8 SEMANTIC REVERSAL. The v1.3.0 F-14 governance
+#   answer below is hereby RETRACTED (preserved verbatim per house rule,
+#   exactly as engine v5.108.1 retracted its 4503.T conviction). Producer
+#   evidence: data_engine_v2 line ~10456 computes
+#   delta = abs(px-alt)/min*100 and returns
+#   "xprovider_verified:%s:%.1f%%" only on AGREEMENT within threshold;
+#   engine WHY ~505 calls it "positive evidence, no gate effect"; engine
+#   WHY ~462 (v5.108.1) had ALREADY exonerated the exact-0.0% case as
+#   "two truthful feeds agreeing, not circularity". Empirical (2026-08-20
+#   GM export): 1,501 tags, all yahoo_chart, deltas a continuum
+#   0.0–1.4%; the eighths values the l6 fixture imagined (12.5/87.5)
+#   occur ZERO times. 1,300 rows carry :0.0%; 858 have no other identity
+#   marker; 13 are INVEST; 10 carry no fetch_failed — ten healthy,
+#   OHLC-coherent rows (LUND-B.ST, 0293.HK, ELF.TO, PINFRA.MX, 1398.HK,
+#   RBI.VI, UCB.BR, SAFE.L, PHP.L, SGRO.L) that v1.3.0/v1.4.0 W1A-8
+#   would have FALSELY demoted. The regex is removed; the trigger set is
+#   the four quote/name markers ONLY. T82U.SI and 1015.KL still demote —
+#   both carry quote_current_price_missing — so every row W1A-8 was
+#   built to catch remains caught. The degenerate-0.0% class (350 rows
+#   where the tag co-occurs with quote_current_price_missing because the
+#   enrichment donor equals the reference source) is a PRODUCER item
+#   (suppress verify when alternate == price donor), registered
+#   separately; the consumer must not punish the healthy 858 for it.
+#   F-04 P2 ACCEPTED — _row_is_actionable now treats a detail-only BUY
+#   as actionable (defense-in-depth; the engine's Fix-A reconciliation
+#   normally prevents the split upstream). Fixture q4.
+#   F-05 P2 ACCEPTED — apply() annotation corrected to the six-tuple the
+#   runtime has returned since v1.2.0/F-09.
+#   NOT CHANGED: every hard row-sanity class incl. v1.4.0's
+#   open_outside_day_range; _RS_MARK stays :v1.4.0 (row-sanity
+#   vocabulary unchanged); all gates, aliases, combo matrix.
+__version__ = "1.4.1"
 SAI_TAG = f"[SURFACE-INV v{__version__}]"
 
 _BUY_FAMILY = {"STRONG_BUY", "BUY", "ACCUMULATE"}
@@ -170,7 +251,8 @@ _FETCH_TOKEN = "fetch_failed"
 _WARN_MARK = f"warn_invest_invariant_applied:v{__version__}"
 _IDW_SUBSTRINGS = ("quote_current_price_missing", "quote_exchange_missing",
                    "quote_currency_missing", "name_unresolved")
-_IDW_XPROV_RE = re.compile(r"xprovider_verified:[^;\s]*:0\.0+%")
+# v1.4.1 (F-01): the former _IDW_XPROV_RE (matching :0.0%) is REMOVED —
+# see the header correction and the changelog entry below.
 # v1.3.0 (F-06): full ISO-4217 active alphabetic set + approved quote
 # subunits. Membership, not shape, is the validity test.
 _ISO4217 = {
@@ -190,9 +272,9 @@ _ISO4217 = {
  "ZWL"}
 _CCY_SUBUNITS = {"GBX", "ZAC", "ILA"}          # engine v5.77.22 quote units
 _CCY_ALLOWED = _ISO4217 | _CCY_SUBUNITS
-# --- W1A-7 row-sanity vocab --------------------------------------------------
+# --- W1A-7 row-sanity vocab (v1.4.0: +open_outside_day_range) ---------------
 _RS_PREFIX = "row_sanity:"
-_RS_MARK = ":v" + "1.2.0"
+_RS_MARK = ":v" + "1.4.0"   # v1.4.0: row-sanity vocabulary changed
 _RANGE_TAG_HI = "range_async:52w_high_breach:v1.2.0"
 _RANGE_TAG_LO = "range_async:52w_low_breach:v1.2.0"
 _RANGE_TOL = 0.001  # 0.1% rounding tolerance (spec: normalize sub-tolerance)
@@ -285,9 +367,7 @@ def _has_identity_warning(row: Dict[str, Any]) -> bool:
     """v1.1.0 W1A-8 marker set; v1.3.0 (F-10) case-normalized — mixed-case
     upstream text triggers identically."""
     blob = _warn_text(row).lower()
-    if any(t in blob for t in _IDW_SUBSTRINGS):
-        return True
-    return bool(_IDW_XPROV_RE.search(blob))
+    return any(t in blob for t in _IDW_SUBSTRINGS)
 
 
 def _demote_identity_warning(row: Dict[str, Any]) -> bool:
@@ -331,7 +411,12 @@ def _row_is_actionable(row: Dict[str, Any]) -> bool:
         return True
     if _s(row.get("final_action")).upper() in _INVEST_CLASS:
         return True
-    return _s(row.get("recommendation")).upper() in _BUY_FAMILY
+    if _s(row.get("recommendation")).upper() in _BUY_FAMILY:
+        return True
+    # v1.4.1 (F-04): a detail-only BUY is exactly as actionable — the
+    # Fix-A contract says the fields must agree, so disagreement is
+    # itself suspect and must not weaken the blank-price quarantine.
+    return _s(row.get("recommendation_detailed")).upper() in _BUY_FAMILY
 
 
 def _row_sanity_classes(row: Dict[str, Any]) -> list:
@@ -348,6 +433,26 @@ def _row_sanity_classes(row: Dict[str, Any]) -> list:
     hi, lo = _num(row.get("day_high")), _num(row.get("day_low"))
     if hi is not None and lo is not None and hi < lo:
         out.append("day_high_lt_day_low")
+    # v1.4.0 (W1A-7b): the session Open must lie inside [day_low, day_high].
+    # 2026-08-20 evidence, measured on the live export: 627 rows pool-wide
+    # carried an Open outside the range at _RANGE_TOL — 448 Global_Markets,
+    # 107 Commodities_FX, 72 Mutual_Funds, 0 Market_Leaders (Open column
+    # unpopulated there: negative control). 12 of the 627 surfaced INVEST,
+    # including 1015.KL (Open 4.64 against Day Low 7.05 — 34.2% outside)
+    # which took the day's ONLY executable ticket with First Fail = NONE.
+    # The pre-existing day_high_lt_day_low class caught 1 of 669 detectable
+    # violations; this class is the other 626.
+    # Tolerance is the module's own _RANGE_TOL, so sub-tolerance rounding is
+    # normalized exactly as the 52W tags do it — never quarantined. All four
+    # live US holdings (OTIS/YUM/SBAC/PFS) measure dev 0.000% on this export
+    # and are untouched; the IR-101 sub-tolerance class does not reproduce.
+    # hi >= lo is required so a High<Low row is charged to that class ONLY
+    # and never double-counted here.
+    op = _first_num(row, "open", "open_price", "day_open")
+    if (op is not None and op > 0 and hi is not None and lo is not None
+            and hi >= lo and hi > 0 and lo > 0):
+        if op > hi * (1.0 + _RANGE_TOL) or op < lo * (1.0 - _RANGE_TOL):
+            out.append("open_outside_day_range")
     exch = _s(row.get("exchange")).upper()
     if exch in _CCY_ALLOWED:
         out.append("currency_in_exchange")
@@ -445,7 +550,7 @@ def _demote_blocked(row: Dict[str, Any], hard: bool) -> bool:
 
 def apply_surface_action_invariants(
     rows: List[Dict[str, Any]], sheet: str = ""
-) -> Tuple[List[Dict[str, Any]], int, int, int]:
+) -> Tuple[List[Dict[str, Any]], int, int, int, int, int]:
     """Apply W1A-2 then W1A-1 across `rows` in place.
 
     Returns the v1.3.0 SIX-tuple (rows, n_blocked_demotions,
@@ -856,6 +961,143 @@ def _selftest() -> int:
        r["final_action"] == "WATCH")
     ck("n11 F-09/A-17: telemetry split — warn counter, not blocked",
        (_nw, n1) == (1, 0))
+
+    # (p) v1.4.0 W1A-7b — open_outside_day_range
+    for _k in _KEYS:
+        os.environ.pop(_k, None)
+    os.environ["TFB_T10_BLOCKED_INVARIANT"] = "1"
+    os.environ["TFB_ROW_SANITY_QUARANTINE"] = "1"      # combo satisfied
+    import copy as _c3
+    # p1 — the 1015.KL class: Open far BELOW Day Low on an INVEST row
+    r = {"symbol": "1015.KL", "recommendation": "BUY",
+         "recommendation_detailed": "BUY", "final_action": "INVEST",
+         "investability_status": "INVESTABLE", "current_price": 7.09,
+         "open": 4.64, "day_high": 7.12, "day_low": 7.05,
+         "block_reason": "", "warnings": []}
+    _, n1, _n2, _nw, n4, e = apply_surface_action_invariants([r], "GM")
+    ck("p1 Open below Day Low -> quarantined + W1A-1 finishes",
+       n4 == 1 and e == 0 and r["final_action"] == "DO_NOT_INVEST"
+       and r["investability_status"] == "BLOCKED"
+       and r["recommendation"] == "HOLD"
+       and "open_outside_day_range" in r["block_reason"])
+    snap = _c3.deepcopy(r)
+    apply_surface_action_invariants([r], "GM")
+    ck("p2 idempotent second pass", r == snap)
+    # p3 — Open ABOVE Day High (the BC-2 direction)
+    r = {"symbol": "WSR.US", "recommendation": "HOLD", "current_price": 18.99,
+         "open": 51000.0, "day_high": 19.0, "day_low": 18.98,
+         "block_reason": "", "warnings": []}
+    _, _n1, _n2, _nw, n4, _e = apply_surface_action_invariants([r], "GM")
+    ck("p3 Open above Day High -> quarantined",
+       n4 == 1 and "open_outside_day_range" in r["block_reason"])
+    # p4 — SUB-TOLERANCE: the live-holdings guarantee. Must NOT quarantine.
+    r = {"symbol": "OTIS", "recommendation": "BUY", "final_action": "INVEST",
+         "investability_status": "INVESTABLE", "current_price": 71.95,
+         "open": 72.9436, "day_high": 72.94, "day_low": 70.61,
+         "block_reason": "", "warnings": []}
+    snap = _c3.deepcopy(r)
+    _, _n1, _n2, _nw, n4, _e = apply_surface_action_invariants([r], "GM")
+    ck("p4 sub-tolerance Open>High normalized — INVEST byte-untouched",
+       n4 == 0 and r == snap)
+    # p5 — negative control: Market_Leaders carries NO Open (0/255 populated)
+    r = {"symbol": "1050.SR", "recommendation": "ACCUMULATE",
+         "final_action": "INVEST", "investability_status": "INVESTABLE",
+         "current_price": 21.20, "day_high": 21.20, "day_low": 20.68,
+         "block_reason": "", "warnings": []}
+    snap = _c3.deepcopy(r)
+    _, _n1, _n2, _nw, n4, _e = apply_surface_action_invariants([r], "ML")
+    ck("p5 blank Open (Market_Leaders control) -> structurally silent",
+       n4 == 0 and r == snap)
+    # p6 — clean row inside the range survives untouched
+    r = {"symbol": "CLEAN", "recommendation": "BUY", "final_action": "INVEST",
+         "investability_status": "INVESTABLE", "current_price": 10.0,
+         "open": 9.5, "day_high": 10.5, "day_low": 9.0,
+         "block_reason": "", "warnings": []}
+    snap = _c3.deepcopy(r)
+    _, _n1, _n2, _nw, n4, _e = apply_surface_action_invariants([r], "GM")
+    ck("p6 Open inside range -> no quarantine, INVEST intact",
+       n4 == 0 and r == snap)
+    # p7 — High<Low charged to that class ONLY, never double-counted
+    r = {"symbol": "HG=F", "recommendation": "HOLD", "current_price": 6.597,
+         "open": 6.6345, "day_high": 6.4955, "day_low": 6.728,
+         "block_reason": "", "warnings": []}
+    apply_surface_action_invariants([r], "CFX")
+    ck("p7 High<Low charged once — no open_outside_day_range double-count",
+       "day_high_lt_day_low" in r["block_reason"]
+       and "open_outside_day_range" not in r["block_reason"])
+    # p8 — key coalesce: open_price and day_open are live engine aliases
+    for _alias in ("open_price", "day_open"):
+        r = {"symbol": "ALIAS", "recommendation": "HOLD",
+             "current_price": 5.0, _alias: 99.0, "day_high": 5.5,
+             "day_low": 4.5, "block_reason": "", "warnings": []}
+        _, _n1, _n2, _nw, n4, _e = apply_surface_action_invariants([r], "GM")
+        ck("p8 alias %s coalesced" % _alias,
+           n4 == 1 and "open_outside_day_range" in r["block_reason"])
+    # p9 — gate OFF: the class is inert, row byte-untouched
+    os.environ.pop("TFB_ROW_SANITY_QUARANTINE", None)
+    r = {"symbol": "1015.KL", "recommendation": "BUY", "final_action":
+         "INVEST", "investability_status": "INVESTABLE", "open": 4.64,
+         "current_price": 7.09, "day_high": 7.12, "day_low": 7.05,
+         "block_reason": "", "warnings": []}
+    snap = _c3.deepcopy(r)
+    _, _n1, _n2, _nw, n4, _e = apply_surface_action_invariants([r], "GM")
+    ck("p9 ROW_SANITY gate OFF -> class inert, row untouched",
+       n4 == 0 and r == snap)
+    # p10 — zero/negative Open is the blank-price class's business, not ours
+    r = {"symbol": "ZEROOPEN", "recommendation": "HOLD", "current_price": 5.0,
+         "open": 0.0, "day_high": 5.5, "day_low": 4.5,
+         "block_reason": "", "warnings": []}
+    os.environ["TFB_ROW_SANITY_QUARANTINE"] = "1"
+    _, _n1, _n2, _nw, n4, _e = apply_surface_action_invariants([r], "GM")
+    ck("p10 Open<=0 not charged to open_outside_day_range",
+       "open_outside_day_range" not in _s(r.get("block_reason")))
+
+    # (q) v1.4.1 — F-01 corrected semantics + F-04
+    for _k in _KEYS:
+        os.environ.pop(_k, None)
+    os.environ["TFB_WARN_INVEST_INVARIANT"] = "1"
+    import copy as _c4
+    r = {"symbol": "LUND-B.ST", "recommendation": "BUY", "final_action":
+         "INVEST", "investability_status": "INVESTABLE", "block_reason": "",
+         "warnings": "xprovider_verified:yahoo_chart:0.0%"}
+    snap = _c4.deepcopy(r)
+    _, _n1, _n2, _nw, _n4, _e = apply_surface_action_invariants([r], "GM")
+    ck("q1 F-01: exact 0.0% agreement is POSITIVE — INVEST byte-untouched",
+       r == snap and _nw == 0)
+    r = {"symbol": "RBI.VI", "recommendation": "BUY", "final_action":
+         "INVEST", "investability_status": "INVESTABLE", "block_reason": "",
+         "warnings": "xprovider_verified:yahoo_chart:0.3%"}
+    snap = _c4.deepcopy(r)
+    apply_surface_action_invariants([r], "GM")
+    ck("q2 F-01: small nonzero delta is positive too — untouched", r == snap)
+    r = {"symbol": "T82U.SI", "recommendation": "BUY", "final_action":
+         "INVEST", "investability_status": "INVESTABLE", "block_reason": "",
+         "warnings": "quote_current_price_missing; "
+                     "xprovider_verified:yahoo_chart:0.0%"}
+    _, _n1, _n2, _nw, _n4, _e = apply_surface_action_invariants([r], "MP")
+    ck("q3 F-01: 0.0% + quote-missing STILL demotes (T82U class preserved)",
+       r["final_action"] == "WATCH"
+       and r["investability_status"] == "WATCHLIST" and _nw == 1)
+    r = {"symbol": "CONFLICT", "recommendation": "BUY", "final_action":
+         "INVEST", "investability_status": "INVESTABLE", "block_reason": "",
+         "warnings": "xprovider_price_conflict:eodhd=10:yahoo=12:20.0%"}
+    snap = _c4.deepcopy(r)
+    apply_surface_action_invariants([r], "GM")
+    ck("q5 conflict tag is the investability gate's business — W1A-8 silent",
+       r == snap)
+    for _k in _KEYS:
+        os.environ.pop(_k, None)
+    os.environ["TFB_T10_BLOCKED_INVARIANT"] = "1"
+    os.environ["TFB_ROW_SANITY_QUARANTINE"] = "1"
+    r = {"symbol": "DETB", "recommendation": "HOLD",
+         "recommendation_detailed": "BUY", "current_price": "",
+         "final_action": "", "investability_status": "",
+         "block_reason": "", "warnings": []}
+    _, _n1, _n2, _nw, _n4, _e = apply_surface_action_invariants([r], "GM")
+    ck("q4 F-04: detail-only BUY + blank price -> quarantined + demoted",
+       _n4 == 1 and r["investability_status"] == "BLOCKED"
+       and r["final_action"] == "DO_NOT_INVEST"
+       and "nonpositive_or_blank_price_actionable" in r["block_reason"])
 
     for _k, _v in _prior.items():                      # v1.0.1 P2-2 restore
         if _v is None:
