@@ -1,16 +1,44 @@
 #!/usr/bin/env python3
-"""opportunity_builder v1.13.0 TRUST-001 harness.
+"""opportunity_builder v1.13.0 TRUST-001 harness (v1.2.0).
 REAL module functions only (normalize_candidate, evaluate_gates,
 build_opportunity_payload). Builder imports are stdlib-only (json/logging/
 math/os/re/datetime — verified), so OLD/NEW dual-load in one process has
 no shared-tree contamination surface; both files are loaded by explicit
 path under distinct module names.  Paths via CLI:
     harness_ob_1_13_0.py [OLD_FILE] [NEW_FILE]
+    harness_ob_1_13_0.py --require-old
+
+v1.1.0 (2026-08-20) PORTABILITY REBUILD. v1.0 defaulted both paths to
+"/home/claude/build/head2/..." and "/home/claude/build/work2/..." — session
+-local paths that do not exist in a clean checkout, so the file could not be
+run by anyone but its author and failed before its first assertion. NEW now
+resolves from THIS FILE; OLD is optional and its absence SKIPS the
+differential rather than aborting the run.
 """
 import importlib.util, json, os, sys, copy
 
-OLD = sys.argv[1] if len(sys.argv) > 1 else "/home/claude/build/head2/tadawul-fast-main/core/analysis/opportunity_builder.py"
-NEW = sys.argv[2] if len(sys.argv) > 2 else "/home/claude/build/work2/core/analysis/opportunity_builder.py"
+_ARGV = [a for a in sys.argv[1:] if not a.startswith("--")]
+_REQUIRE_OLD = "--require-old" in sys.argv
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE) if os.path.basename(_HERE) == "scripts" else _HERE
+_DEFAULT_NEW = os.path.join(
+    _REPO, "core", "analysis", "opportunity_builder.py")
+
+OLD = (_ARGV[0] if len(_ARGV) > 0 else os.environ.get("TFB_OB_OLD", ""))
+NEW = (_ARGV[1] if len(_ARGV) > 1
+       else os.environ.get("TFB_OB_NEW", "") or _DEFAULT_NEW)
+
+HAVE_OLD = bool(OLD) and os.path.isfile(OLD)
+if not os.path.isfile(NEW):
+    print("FATAL: NEW builder not found: %r" % NEW)
+    sys.exit(2)
+print("NEW : %s" % NEW)
+print("OLD : %s" % (OLD if HAVE_OLD else
+                    "(not supplied — differential suite SKIPPED)"))
+if _REQUIRE_OLD and not HAVE_OLD:
+    print("  FAIL  CERT: --require-old set but OLD builder not found")
+    sys.exit(1)
 
 PASS = FAIL = 0
 def check(label, cond, detail=""):
@@ -72,23 +100,48 @@ def audit_by_sym(p):
              for a in (p.get("candidates_rows") or []) if isinstance(a, dict) }
 
 print("="*74); print("SECTION 1 — OFF: NEW vs OLD byte-identical outside meta"); print("="*74)
-old = load("ob_old", OLD); new = load("ob_new", NEW)
-check("versions OLD=1.12.0 NEW=1.13.0",
-      old.OPPORTUNITY_BUILDER_VERSION=="1.12.0" and new.OPPORTUNITY_BUILDER_VERSION=="1.13.0",
-      f"{old.OPPORTUNITY_BUILDER_VERSION}/{new.OPPORTUNITY_BUILDER_VERSION}")
-po = payload(old, ""); pn = payload(new, "")
-check("OFF: full payload minus meta byte-identical",
-      json.dumps(strip_meta(po), sort_keys=True) == json.dumps(strip_meta(pn), sort_keys=True))
-mo = json.loads(json.dumps(po.get("meta",{}), default=str))
-mn = json.loads(json.dumps(pn.get("meta",{}), default=str))
-for m in (mo, mn):                   # expected stamps: version + wall clock
-    m.pop("generated_at_utc", None)
-    v = m.get("versions")
-    if isinstance(v, dict): v.pop("opportunity_builder", None)
-tl = mn.pop("trust_lineage", None)
-check("OFF: meta delta is EXACTLY the trust_lineage subtree",
-      json.dumps(mo, sort_keys=True)==json.dumps(mn, sort_keys=True)
-      and tl=={"mode":"off","low_trust_rows":0,"contradictions":0}, str(tl))
+# v1.2.0 (pre-merge audit F8): (a) ambient TFB_OPP_*/TFB_T10_* env must
+# never leak into fixture payloads — snapshot & strip here, restored at
+# exit; (b) the NEW builder gets an UNCONDITIONAL era floor, previously
+# asserted only when an OLD tree was supplied.
+_SAVED_ENV = {k: os.environ.pop(k) for k in list(os.environ)
+              if k.startswith(("TFB_OPP_", "TFB_T10_"))}
+import atexit
+atexit.register(lambda: os.environ.update(_SAVED_ENV))
+new = load("ob_new", NEW)
+def _vt(v):
+    try: return tuple(int(x) for x in str(v).split("."))
+    except Exception: return (0,)
+check("NEW builder version >= 1.13.0 (era floor, unconditional)",
+      _vt(new.OPPORTUNITY_BUILDER_VERSION) >= (1, 13, 0),
+      str(new.OPPORTUNITY_BUILDER_VERSION))
+if HAVE_OLD:
+    old = load("ob_old", OLD)
+    check("versions OLD=1.12.0 NEW=1.13.0",
+          old.OPPORTUNITY_BUILDER_VERSION=="1.12.0" and new.OPPORTUNITY_BUILDER_VERSION=="1.13.0",
+          f"{old.OPPORTUNITY_BUILDER_VERSION}/{new.OPPORTUNITY_BUILDER_VERSION}")
+    po = payload(old, ""); pn = payload(new, "")
+    check("OFF: full payload minus meta byte-identical",
+          json.dumps(strip_meta(po), sort_keys=True) == json.dumps(strip_meta(pn), sort_keys=True))
+    mo = json.loads(json.dumps(po.get("meta",{}), default=str))
+    mn = json.loads(json.dumps(pn.get("meta",{}), default=str))
+    for m in (mo, mn):               # expected stamps: version + wall clock
+        m.pop("generated_at_utc", None)
+        v = m.get("versions")
+        if isinstance(v, dict): v.pop("opportunity_builder", None)
+    tl = mn.pop("trust_lineage", None)
+    check("OFF: meta delta is EXACTLY the trust_lineage subtree",
+          json.dumps(mo, sort_keys=True)==json.dumps(mn, sort_keys=True)
+          and tl=={"mode":"off","low_trust_rows":0,"contradictions":0}, str(tl))
+else:
+    # v1.1.0: guard the BODY, not just the banner. Still assert the NEW-tree
+    # half so a single-file run certifies the OFF contract it can reach.
+    print("  ....  SECTION 1 differential skipped (no OLD builder)")
+    pn = payload(new, "")
+    mn = json.loads(json.dumps(pn.get("meta",{}), default=str))
+    tl = mn.get("trust_lineage")
+    check("OFF: NEW trust_lineage subtree is the inert default",
+          tl=={"mode":"off","low_trust_rows":0,"contradictions":0}, str(tl))
 c_off = new.normalize_candidate(copy.deepcopy(FIX[0]), FX, new.make_criteria({"min_dq":80.0}))
 check("OFF: candidate carries NO lineage keys",
       "trust_low_source" not in c_off and "dq_alias_key" not in c_off)
