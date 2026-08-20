@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.40.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.41.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1570,6 +1570,73 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 #        merge-blocking). F-11 (priority fetch) and F-12 (dedup enforce) are
 #        operator ENV/wave decisions, NOT code — rejected for this PR.
 #   ZERO functions removed. No behaviour change while gates stay OFF.
+# v6.41.0 (2026-08-20 evening, W1A-6c — BLANK COUNTERS + POST-WRITE READBACK):
+#   WHY. On 2026-08-20 the pre-write guard reported, at the write boundary:
+#       [OHLC-PREWRITE] Global_Markets | checked=6627 flagged=5
+#   The page exported minutes later was then fed to THIS FILE'S OWN
+#   _apply_ohlc_prewrite_guard — same aliases, same _ohlc_prewrite_num, same
+#   0.01 tolerance, same P1/P2/P3 chain, lifted verbatim from this commit:
+#       checked=9809 flagged=618  (GM 448 / CFX 98 / MF 72 / ML 0)
+#   Identical code and identical `checked` counts, 5 versus 618. The
+#   predicate is not wrong; the guard is simply not being shown those rows.
+#   Corroborated twice over, independently:
+#     - the engine-side Fix BC guard, armed and in observe, tagged 5 of 623
+#       violating rows in the same export: two detectors at two different
+#       layers, in different code, converging on ~5. Two healthy detectors do
+#       not independently miss the same 618 rows.
+#     - the only ohlc tags on the sheet are 5x
+#       "ohlc_incoherent_dropped:range:engine" with NO ":observe" suffix,
+#       which the engine's observe path cannot emit (it always appends it).
+#       Enforce-era tags, still resident. The rows are persisted, not fresh.
+#   MECHANISM (this file, upstream of the guard): _keep_last_good_rows —
+#   "replace outgoing error stubs with accepted prior rows" — plus
+#   _persist_missing_symbol_rows and the FW-KEEP second pass re-inject PRIOR
+#   SHEET ROWS into the outgoing matrix. Blank-cell preservation is NOT the
+#   mechanism and was ruled out: write_table passes an explicit "" straight
+#   through (an empty string is a str, so both scalar converters return it
+#   unchanged) and holds no per-cell keep-old-on-blank branch.
+#   THE GAP. Both OHLC guards, the identity firewall and every tripwire in
+#   this program inspect the OUTGOING MATRIX. Nothing reads a page back after
+#   writing it. So nothing can see the resident rows, and nothing can ever
+#   clean them: 27 of 31 burst-era symbols were still violating days later.
+#   WHAT THIS VERSION ADDS — two measurements, zero new authority:
+#     (a) blank_open / blank_hi / blank_lo in the guard's stats. Until now a
+#         cell that parsed to None and a genuinely clean cell both produced
+#         no offense, so "checked=6627 flagged=5" could not be read: clean
+#         matrix, or 6,000 untestable cells? Now it is a number.
+#     (b) _ohlc_readback_verify: after a SUCCESSFUL write, read the page back
+#         and re-run the SAME guard on what actually landed. Because the
+#         predicate is shared verbatim (and forced to observe for the
+#         readback window so it cannot mutate the copy), a prewrite/readback
+#         delta can only mean different ROWS — never different rules. The
+#         first armed run is a DISCRIMINATOR between the two remaining
+#         injection topologies, and either outcome is decisive:
+#           delta >> 0  -> resident rows enter BETWEEN this guard and the
+#                          landed sheet (the KLG/persist merge block);
+#           delta ~= 0  -> this leg writes clean and the lake is
+#                          re-established AFTERWARD by another writer
+#                          (intraday_refresh / page_refresh_recovery /
+#                          manual_refresh legs, or non-sync writes) — the
+#                          investigation target moves, with proof.
+#         The instrument is hypothesis-neutral; it does not assume its
+#         author's favourite answer.
+#   DISCIPLINE. The readback is READ-ONLY and DEFAULT OFF. It never mutates
+#   rows_matrix, never changes res.status, never blocks a write. It fails
+#   open twice (helper + call site). A divergence is EVIDENCE, not a verdict:
+#   this version deliberately does not repair the lake, because a repair
+#   written before the injection point is confirmed would be a guess.
+#   COST (audit F5). Per checked page per run: +1 values.get (readback)
+#   AND +1 _Run_Log values.append (<=2 attempts), MATCHED lines included —
+#   ~4 reads + ~4 appends per run against a ~7-read/page baseline.
+#   AUDIT (2026-08-20 pre-merge, external): F1 certification-integration
+#   gap, F2 baseline contract, F3 start-offset range, F4 status taxonomy,
+#   F5 cost disclosure — ACCEPTED and remediated in this same uncommitted
+#   version; F1's tamper reproduction is now harness suite S7.
+#   ENV. ONE new gate, TFB_SYNC_OHLC_READBACK, DEFAULT OFF. Unset keeps
+#   v6.40.0 behaviour byte-identical. No existing gate changes meaning.
+#   NOT CHANGED: the guard predicate itself, enforce semantics, the fail-
+#   closed enforce path, W1A-4a/4b, KLG, persistence, trim, or any write.
+#
 # v6.40.0 (2026-08-18 evening, W1A-4a — Top_10 EXECUTABLE / NOT_ACTIONABLE):
 #   WHY: W1A-4 quick form (spec v1.4.x): Top_10 must fail CLOSED — actionable
 #   only when its upstream feed is provably healthy. 4b (v6.39.0-5) made each
@@ -1611,7 +1678,7 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 #   additions: _upstream_verdict_enabled, _upstream_verdict_pages,
 #   _upstream_verdict_max_age_min, _uv_page_state, _uv_parse_value,
 #   _uv_compose, _write_upstream_verdict.
-SCRIPT_VERSION = "6.40.0"
+SCRIPT_VERSION = "6.41.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -3866,6 +3933,7 @@ def _apply_operator_quarantine(headers: list, rows_matrix: list) -> tuple:
 # =============================================================================
 
 _OHLC_PREWRITE_TAG = "[OHLC-PREWRITE v6.38.0]"
+_OHLC_READBACK_TAG = "[OHLC-READBACK v6.41.0]"   # v6.41.0 W1A-6c
 
 _GUARD_OPEN_ALIASES = frozenset({"open", "openprice", "dayopen"})
 _GUARD_PRICE_ALIASES = frozenset({"currentprice", "price", "lastprice", "last"})
@@ -3894,6 +3962,44 @@ def _ohlc_prewrite_tol() -> float:
     except Exception:
         v = 0.01
     return v if 0.0 <= v < 0.5 else 0.01
+
+
+def _ohlc_readback_enabled() -> bool:
+    """v6.41.0 W1A-6c: post-write READBACK. DEFAULT OFF — unset/0/false/off
+    keeps the v6.40.0 write path byte-identical, and the readback NEVER
+    mutates anything under any setting: it is a measurement, not a guard.
+
+    WHY IT EXISTS (2026-08-20, adjudicated on primary artifacts):
+    the pre-write guard and the engine-side Fix BC guard are BOTH healthy and
+    BOTH blind to the same rows. Running this file's own
+    _apply_ohlc_prewrite_guard — same aliases, same _ohlc_prewrite_num, same
+    0.01 tolerance, same P1/P2/P3 chain — over the EXPORTED sheet returned
+    checked=9809 flagged=618 (GM 448 / CFX 98 / MF 72 / ML 0), while the same
+    guard at the write boundary that morning reported GM flagged=5. Identical
+    code, identical `checked` counts, 5 vs 618. The difference is not the
+    predicate; it is WHICH ROWS the guard was shown.
+
+    The mechanism is upstream of the guard, inside this file:
+    _keep_last_good_rows ("replace outgoing error stubs with accepted prior
+    rows"), _persist_missing_symbol_rows and the FW-KEEP second pass re-inject
+    PRIOR SHEET ROWS into the outgoing matrix. Corroborated independently by
+    the only ohlc tags on the sheet — 5x "ohlc_incoherent_dropped:range:engine"
+    carrying NO ":observe" suffix, which the engine's observe path cannot
+    produce (it always appends it), i.e. enforce-era tags still resident.
+    Blank-cell preservation is NOT the mechanism: write_table sends an explicit
+    "" through unchanged and has no per-cell keep-old branch.
+
+    Nothing that exists today reads the sheet after a write, so nothing can
+    see or ever clean those rows. This is the one pass that looks.
+
+    COST (audit F5, full disclosure): per checked page per run this feature
+    adds ONE values.get (the readback, bounded by _page_read_row_bound) AND
+    ONE _Run_Log values.append with up to 2 attempts — including MATCHED
+    lines, mirroring the prewrite appender's OK lines. Four ranked pages =>
+    ~4 reads + ~4 appends per run against a ~7-read/page healthy baseline.
+    """
+    return (os.getenv("TFB_SYNC_OHLC_READBACK") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def _ohlc_prewrite_num(v: Any) -> Optional[float]:
@@ -3932,8 +4038,14 @@ def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> t
     FAIL-SAFE by contract: called inside try/except at the call site; any
     internal error propagates to that handler which logs and writes the
     matrix untouched. Returns (rows_matrix, stats_dict)."""
+    # v6.41.0 (W1A-6c): blank_* added. Until now a row whose Open/High/Low
+    # parsed to None was indistinguishable from a clean row — both simply
+    # produced no offense. That ambiguity is what made the 2026-08-20
+    # "checked=6627 flagged=5" line unreadable: it could mean the matrix was
+    # clean, or that 6,000 cells were untestable. Now it is measured.
     stats = {"checked": 0, "flagged": 0, "open": 0, "price_band": 0,
-             "range": 0, "examples": []}
+             "range": 0, "blank_open": 0, "blank_hi": 0, "blank_lo": 0,
+             "examples": []}
     if not headers or not rows_matrix:
         return rows_matrix, stats
     hdr = list(headers)
@@ -3962,6 +4074,12 @@ def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> t
         op = _ohlc_prewrite_num(row[open_i]) if 0 <= open_i < n else None
         cp = _ohlc_prewrite_num(row[price_i]) if 0 <= price_i < n else None
         stats["checked"] += 1
+        if op is None:
+            stats["blank_open"] += 1
+        if hi is None:
+            stats["blank_hi"] += 1
+        if lo is None:
+            stats["blank_lo"] += 1
         offenses: list = []
         range_ok = hi is not None and lo is not None and hi > 0 and lo > 0
         # P1: inverted band is self-contradictory whatever the symbol.
@@ -4533,7 +4651,11 @@ def _append_runlog_ohlc_prewrite(
         msg = (
             f"{_OHLC_PREWRITE_TAG} {page} | checked={checked} "
             f"flagged={flagged} (open={n_open} price_band={n_band} "
-            f"range={n_range}) | mode={mode} tol={tol}"
+            f"range={n_range}) | blank(o/h/l)="
+            f"{int(stats.get('blank_open') or 0)}/"
+            f"{int(stats.get('blank_hi') or 0)}/"
+            f"{int(stats.get('blank_lo') or 0)}"
+            f" | mode={mode} tol={tol}"
             + (f" | ex: {', '.join(examples[:12])}"
                f"{'…' if flagged > 12 else ''}" if flagged else "")
         )
@@ -4543,6 +4665,9 @@ def _append_runlog_ohlc_prewrite(
             "open": n_open,
             "price_band": n_band,
             "range": n_range,
+            "blank_open": int(stats.get("blank_open") or 0),
+            "blank_hi": int(stats.get("blank_hi") or 0),
+            "blank_lo": int(stats.get("blank_lo") or 0),
             "examples": examples[:50],
             "mode": mode,
             "tol": tol,
@@ -4574,6 +4699,185 @@ def _append_runlog_ohlc_prewrite(
               % (_OHLC_PREWRITE_TAG, page, type(_e).__name__, _e))
         logger.warning("%s run-log verdict skipped: %s",
                        _OHLC_PREWRITE_TAG, _e)
+
+
+def _ohlc_readback_verify(
+    sheets: "SheetsWriter",
+    spreadsheet_id: str,
+    page: str,
+    headers: list,
+    rows_matrix: list,
+    start_cell: str,
+    prewrite_stats: dict,
+) -> Optional[dict]:
+    """v6.41.0 W1A-6c — read the page BACK after the write and re-run this
+    file's own guard on what actually landed.
+
+    Contract, deliberately narrow:
+      * READ-ONLY. Never writes, never mutates rows_matrix, never changes
+        res.status. A divergence is evidence, not a verdict.
+      * Fail-open, twice: internal try/except here AND at the call site.
+        Telemetry must never damage the write path it observes.
+      * Reuses _apply_ohlc_prewrite_guard verbatim, in a forced-observe
+        window, so prewrite and readback are the SAME predicate. A delta can
+        therefore only mean different ROWS, never different rules.
+
+    Returns a delta dict, or None when disabled/unavailable.
+    """
+    if not _ohlc_readback_enabled() or sheets is None:
+        return None
+    # v6.41.0 pre-merge audit F2 (ACCEPTED): the delta is only meaningful
+    # against a real prewrite baseline. With TFB_SYNC_OHLC_PREWRITE=0 the
+    # baseline dict is empty and every readback flag would present as
+    # "divergence" against zero — false telemetry. Same self-disable
+    # pattern as the ROW_SANITY/BLOCKED_INVARIANT combo matrix.
+    if not _ohlc_prewrite_enabled():
+        return None
+    try:
+        max_row = _page_read_row_bound()
+        n_cols = max(1, len(headers or []))
+        # v6.41.0 review fix (harness E6): _idx_to_a1_col is 1-BASED
+        # (1 -> A, 26 -> Z — its own docstring). The pre-review draft passed
+        # n_cols-1 and silently truncated the LAST column of every page.
+        # v6.41.0 review fix + pre-merge audit F3 (ACCEPTED): honor the
+        # task's start_cell on BOTH axes. Six columns written from B5 occupy
+        # B..G — the end column is start_index + n_cols - 1, not the absolute
+        # n_cols column (the earlier draft read B..F, silently dropping the
+        # last column, and the harness accepted it). Unparseable -> A1.
+        _m = re.match(r"^\$?([A-Za-z]+)\$?(\d+)$",
+                      str(start_cell or "").strip())
+        _scol = (_m.group(1).upper() if _m else "A")
+        _srow = (int(_m.group(2)) if _m else 1)
+        _sidx = 0
+        for _ch in _scol:
+            _sidx = _sidx * 26 + (ord(_ch) - ord("A") + 1)
+        end_col = _idx_to_a1_col(_sidx + n_cols - 1)
+        grid = sheets.read_values(
+            spreadsheet_id, page,
+            f"{_scol}{_srow}:{end_col}{max(max_row, _srow + 1)}")
+        if grid is None:
+            return {"error": "read_failed"}
+        if not grid:
+            return {"error": "empty_readback"}
+        live_hdr = [str(c or "").strip() for c in (grid[0] or [])]
+        live_rows = [list(r) for r in grid[1:] if any(
+            str(c or "").strip() for c in r)]
+        # Force observe for the readback window so the shared guard can never
+        # mutate the copy we just read, whatever the operator armed.
+        _prev = os.environ.get("TFB_SYNC_OHLC_PREWRITE_MODE")
+        os.environ["TFB_SYNC_OHLC_PREWRITE_MODE"] = "observe"
+        try:
+            _, rb = _apply_ohlc_prewrite_guard(live_hdr, live_rows, page)
+        finally:
+            if _prev is None:
+                os.environ.pop("TFB_SYNC_OHLC_PREWRITE_MODE", None)
+            else:
+                os.environ["TFB_SYNC_OHLC_PREWRITE_MODE"] = _prev
+        pw = prewrite_stats or {}
+        return {
+            "page": page,
+            "prewrite_checked": int(pw.get("checked") or 0),
+            "prewrite_flagged": int(pw.get("flagged") or 0),
+            "readback_checked": int(rb.get("checked") or 0),
+            "readback_flagged": int(rb.get("flagged") or 0),
+            "delta_flagged": int(rb.get("flagged") or 0)
+            - int(pw.get("flagged") or 0),
+            "delta_checked": int(rb.get("checked") or 0)
+            - int(pw.get("checked") or 0),
+            "readback_open": int(rb.get("open") or 0),
+            "readback_price_band": int(rb.get("price_band") or 0),
+            "readback_range": int(rb.get("range") or 0),
+            "readback_blank_open": int(rb.get("blank_open") or 0),
+            "prewrite_blank_open": int(pw.get("blank_open") or 0),
+            "matrix_rows": len(rows_matrix or []),
+            "examples": [str(e) for e in (rb.get("examples") or [])][:12],
+        }
+    except Exception as _e:
+        return {"error": "%s: %s" % (type(_e).__name__, _e)}
+
+
+def _ohlc_readback_status(delta: dict) -> tuple:
+    """v6.41.0 pre-merge audit F4 (ACCEPTED): (level, status) for a readback
+    delta. The first draft labelled every non-positive delta "MATCHED",
+    which mislabelled enforcement cleanup (negative delta) and hid pure
+    row-count divergence. Taxonomy:
+        DIVERGENT  d > 0                 (WARNING)  more offenses landed
+        REDUCED    d < 0                 (INFO)     cleanup/enforcement seen
+        ROWS_DELTA d == 0, rows differ   (WARNING if extra rows else INFO)
+        MATCHED    d == 0, rows equal    (INFO)
+    """
+    d = int(delta.get("delta_flagged") or 0)
+    dc = int(delta.get("delta_checked") or 0)
+    if d > 0:
+        return "WARNING", "DIVERGENT"
+    if d < 0:
+        return "INFO", "REDUCED"
+    if dc != 0:
+        return ("WARNING" if dc > 0 else "INFO"), "ROWS_DELTA"
+    return "INFO", "MATCHED"
+
+
+def _append_runlog_ohlc_readback(
+    sheets: "SheetsWriter",
+    spreadsheet_id: str,
+    page: str,
+    delta: dict,
+) -> None:
+    """v6.41.0 W1A-6c: durable _Run_Log line for the readback, same channel
+    and same fail-loud-but-fail-open discipline as W1A-6b's appender."""
+    if not delta or sheets is None:
+        return
+    try:
+        svc = sheets._get_service()
+        if not svc:
+            return
+        if delta.get("error"):
+            msg = (f"{_OHLC_READBACK_TAG} {page} | UNAVAILABLE "
+                   f"({delta['error']})")
+            level, status = "WARNING", "UNKNOWN"
+        else:
+            d = int(delta.get("delta_flagged") or 0)
+            msg = (
+                f"{_OHLC_READBACK_TAG} {page} | "
+                f"prewrite={delta['prewrite_flagged']}"
+                f"/{delta['prewrite_checked']} "
+                f"readback={delta['readback_flagged']}"
+                f"/{delta['readback_checked']} "
+                f"delta={d:+d} rows_delta={delta['delta_checked']:+d} | "
+                f"open={delta['readback_open']} "
+                f"band={delta['readback_price_band']} "
+                f"range={delta['readback_range']} "
+                f"blank_open(rb/pw)={delta['readback_blank_open']}"
+                f"/{delta['prewrite_blank_open']}"
+                + (f" | ex: {', '.join(delta['examples'])}"
+                   if delta.get("examples") else ""))
+            level, status = _ohlc_readback_status(delta)
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        body = {"values": [[ts, level, "run_dashboard_sync", page, status,
+                            msg, "", "", "",
+                            json.dumps(dict(delta,
+                                            version=SCRIPT_VERSION))]]}
+        _last = None
+        for _ in (1, 2):
+            try:
+                svc.spreadsheets().values().append(
+                    spreadsheetId=spreadsheet_id,
+                    range="'_Run_Log'!A1",
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body=body,
+                ).execute()
+                _last = None
+                break
+            except Exception as _ae:
+                _last = _ae
+                time.sleep(1.0)
+        if _last is not None:
+            raise _last
+    except Exception as _e:
+        print("::warning::%s _Run_Log append FAILED for %s — %s: %s"
+              % (_OHLC_READBACK_TAG, page, type(_e).__name__, _e))
+        logger.warning("%s run-log line skipped: %s", _OHLC_READBACK_TAG, _e)
 
 
 # =============================================================================
@@ -8070,15 +8374,20 @@ async def _run_one_task(
         # Opens on 2026-08-17, zero ":open:" engine tags, three engine drops
         # resurfacing on-sheet). observe = log-only; enforce = blank offending
         # members + tag Warnings. OFF (default) => matrix byte-untouched.
+        _oc_stats_for_readback: dict = {}
         if _ohlc_prewrite_enabled():
             try:
                 rows_matrix, _oc = _apply_ohlc_prewrite_guard(
                     headers, rows_matrix, task.sheet_name)
+                _oc_stats_for_readback = dict(_oc or {})
                 if _oc.get("checked"):
                     _ocl = (f"{_OHLC_PREWRITE_TAG} {task.sheet_name} | "
                             f"checked={_oc['checked']} flagged={_oc['flagged']} "
                             f"(open={_oc['open']} price_band={_oc['price_band']} "
                             f"range={_oc['range']}) | "
+                            f"blank(o/h/l)={_oc.get('blank_open', 0)}/"
+                            f"{_oc.get('blank_hi', 0)}/"
+                            f"{_oc.get('blank_lo', 0)} | "
                             f"mode={_ohlc_prewrite_mode()} tol={_ohlc_prewrite_tol()}"
                             + (f" | ex: {', '.join(_oc['examples'][:12])}"
                                f"{'…' if _oc['flagged'] > 12 else ''}"
@@ -8153,6 +8462,60 @@ async def _run_one_task(
                 res.status = "success" if res.rows_failed == 0 else ("partial" if res.rows_written > 0 else "failed")
             if _critical_identity_failures:
                 fail_result_on_identity(res, _critical_identity_failures)
+
+            # --- v6.41.0 (W1A-6c) POST-WRITE READBACK ---------------------
+            # The ONLY code in this program that reads a page after writing
+            # it. Everything else — both OHLC guards, the identity firewall,
+            # every tripwire — inspects the OUTGOING matrix, which is why a
+            # 618-row on-sheet contamination has been invisible to a guard
+            # that this same morning reported flagged=5 on the same 6,627
+            # rows. Strictly observational: it cannot change res.status, it
+            # cannot touch rows_matrix, and it is DEFAULT OFF.
+            # Fail-open twice (inner helper + this guard).
+            try:
+                if _ohlc_readback_enabled() and not _ohlc_prewrite_enabled():
+                    logger.info(
+                        "%s skipped on %s — no baseline "
+                        "(TFB_SYNC_OHLC_PREWRITE=0; audit F2 contract)",
+                        _OHLC_READBACK_TAG, task.sheet_name)
+                elif _ohlc_readback_enabled():
+                    _rb = _ohlc_readback_verify(
+                        sheets, spreadsheet_id, task.sheet_name,
+                        headers, rows_matrix, start_cell,
+                        _oc_stats_for_readback)
+                    if _rb:
+                        if _rb.get("error"):
+                            _rl = (f"{_OHLC_READBACK_TAG} "
+                                   f"{task.sheet_name} | UNAVAILABLE "
+                                   f"({_rb['error']})")
+                            logger.warning(_rl)
+                        else:
+                            _d = int(_rb.get("delta_flagged") or 0)
+                            _rl = (
+                                f"{_OHLC_READBACK_TAG} {task.sheet_name} | "
+                                f"prewrite={_rb['prewrite_flagged']}"
+                                f"/{_rb['prewrite_checked']} "
+                                f"readback={_rb['readback_flagged']}"
+                                f"/{_rb['readback_checked']} "
+                                f"delta={_d:+d} "
+                                f"rows_delta={_rb['delta_checked']:+d}")
+                            _lvl, _st = _ohlc_readback_status(_rb)
+                            _rl += f" status={_st}"
+                            if _lvl == "WARNING":
+                                res.warnings.append(_rl)
+                                logger.warning(_rl)
+                            else:
+                                logger.info(_rl)
+                        try:
+                            _append_runlog_ohlc_readback(
+                                sheets, spreadsheet_id,
+                                task.sheet_name, _rb)
+                        except Exception:
+                            pass
+            except Exception as _rbe:
+                logger.warning("%s skipped on %s (%s)",
+                               _OHLC_READBACK_TAG, task.sheet_name, _rbe)
+            # ---------------------------------------------------------------
         except Exception as e:
             res.status = "failed"
             res.error = f"Write failed: {e}"
