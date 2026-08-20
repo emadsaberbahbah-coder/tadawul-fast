@@ -2,8 +2,80 @@
 # core/analysis/identity_guard.py
 """
 ================================================================================
-Identity Guard — v1.1.0   (replaces the destructive ID-FIREWALL dedup stage)
+Identity Guard — v1.2.0   (replaces the destructive ID-FIREWALL dedup stage)
 ================================================================================
+
+v1.2.0 — TOTAL-WIPE BLIND SPOT CLOSED (2026-08-20 production log)
+------------------------------------------------------------------
+EVIDENCE. Render production, 2026-08-21T00:37 Riyadh, engine v5.130.3,
+TWICE in the same minute on consecutive /v1/analysis/sheet-rows batches:
+
+    [engine_v2 v5.130.3] identity_guard v1.1.1: 10->0 rows | DROP_ROW=10
+    [v5.130.3 RANK]  total=0 scored=0 skipped_no_score=0
+    [v5.130.3 TRUST] total=0 low=0 med=0 high=0
+
+Ten rows in, ZERO rows out, HTTP 200, no warning, no exception. The
+ranker received an empty set and reported success. Twelve hours earlier
+the same route logged `RANK total=10 scored=9`.
+
+ROOT CAUSE — the safety net could not see it. _assert_no_mass_destruction
+exists precisely to stop this (written after the 2026-07-20 incident that
+blanked 9.5% of Market_Leaders unnoticed), but its first statement is:
+
+    if plan.input_count < 20:
+        return
+
+A batch of 10 returns BEFORE the destruction check runs. So the one case
+the guard most needs to catch — total annihilation of a small batch — is
+the one case it is structurally blind to. 10 of 10 (100%) is a far
+stronger defect signal than 26 of 100 (26%), yet only the latter raises.
+The threshold was written as a PERCENTAGE test and small batches were
+excluded to avoid false alarms on tiny samples; nobody asked what a 100%
+share on a tiny sample means. It means the same thing at any size.
+
+WHAT THIS VERSION DOES — and deliberately does NOT do:
+  * ADDS a total-wipe detector that fires at ANY input_count >= 1 when a
+    non-empty input yields an empty output. It emits ONE structured
+    WARNING naming every dropped symbol and its reason, so the next
+    occurrence is self-diagnosing from the log alone. It does NOT raise.
+  * DOES NOT change the existing >25% rule for input_count >= 20. That
+    predicate, its threshold and its RuntimeError are byte-identical.
+  * DOES NOT raise on total wipes by default. RATIONALE: this fix is
+    written from ONE production sample. I have not yet traced whether
+    small all-shell batches are a routine, legitimate outcome (a page of
+    genuinely delisted symbols would produce exactly this). Converting an
+    unmeasured frequency into a hard failure would turn an observability
+    gap into an outage — the same mistake in the opposite direction. The
+    log line is the measurement; the escalation waits for it.
+  * OFFERS the escalation as an opt-in ENV, TFB_IDENTITY_WIPE_RAISE,
+    DEFAULT OFF, so once two clean days of logs establish the frequency
+    the operator can arm fail-closed without another code change.
+    ARMED SEMANTICS AT THE CALL SITE (verified in data_engine_v2): the
+    engine wraps guard_sheet_rows in `except RuntimeError` and RETURNS
+    THE ORIGINAL ROWS with an ERROR log. So arming does NOT produce an
+    HTTP failure — it converts "empty batch, silently" into "original
+    rows pass through unguarded, loudly". The shells stay visible
+    downstream instead of vanishing, which is the fail-open-with-evidence
+    behaviour the panel needs.
+  * REVIEW FIX (E1/E2): total wipes at input_count >= 20 keep the
+    v1.1.1 RuntimeError byte-identically (the new branch only adds the
+    report line before it). The first draft accidentally swallowed that
+    raise; the differential shape that would have caught it (all-shell
+    >= 20) is now harness case S5.7/S6.all_shell_25.
+
+CONTEXT THE SAME LOG SUPPLIES. All ten rows were dropped as
+`pre_existing_blank_shell` — "arrived with no name and no price". The
+same minute shows ~80 provider failures across ten symbols Yahoo reports
+as delisted (ERJ, P10, SCVL, SEMR, ALFAA.MX, AUO, GES, 6641.T, APLS,
+NVEI.TO), each retried over 5d/1mo/3mo/1y/2y plus quoteSummary. Dead
+symbols -> blank shells -> total wipe. That upstream universe question is
+NOT addressed here: this module's job is to notice, loudly, that it just
+emptied a batch. Silence was the defect.
+
+DEFAULT-OFF GUARANTEE: with TFB_IDENTITY_WIPE_RAISE unset, the only
+observable difference from v1.1.1 is one additional WARNING log line on
+a run that would previously have been silent. No row, no action, no
+verdict, no return value changes.
 
 v1.1.1 — FLAG-COMBINATION HOLE CLOSED (Codex review, PR #118)
 -------------------------------------------------------------
@@ -189,7 +261,7 @@ from core.analysis.symbol_dedup import (
     resolve_identity,
 )
 
-IDENTITY_GUARD_VERSION = "1.1.1"
+IDENTITY_GUARD_VERSION = "1.2.0"
 __version__ = IDENTITY_GUARD_VERSION
 
 __all__ = [
@@ -846,6 +918,38 @@ def guard_sheet_rows(
     return plan
 
 
+def _wipe_raise_enabled() -> bool:
+    """v1.2.0: escalate a TOTAL wipe from WARNING to RuntimeError.
+    DEFAULT OFF -- unset keeps v1.1.1 behaviour except for one log line.
+    Arm only after the log has established that total wipes are not a
+    routine, legitimate outcome for small all-shell batches."""
+    return (os.getenv("TFB_IDENTITY_WIPE_RAISE") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _wipe_report(plan: GuardPlan) -> str:
+    """v1.2.0: one self-diagnosing line. Names every dropped symbol with its
+    reason, so the NEXT occurrence needs no code archaeology to interpret."""
+    tally: Dict[str, int] = {}
+    for finding in plan.findings:
+        key = str(getattr(finding, "reason", "") or "unspecified")
+        tally[key] = tally.get(key, 0) + 1
+    reasons = " ".join(f"{k}={v}" for k, v in sorted(tally.items()))
+    symbols = []
+    seen: Set[str] = set()
+    for finding in plan.findings:
+        sym = str(getattr(finding, "symbol", "") or "")
+        if sym and sym not in seen:
+            seen.add(sym)
+            symbols.append(sym)
+    shown = ", ".join(symbols[:20]) + ("…" if len(symbols) > 20 else "")
+    return (
+        f"identity_guard v{IDENTITY_GUARD_VERSION} TOTAL WIPE: "
+        f"{plan.input_count}->0 rows on sheet '{plan.sheet or '?'}' | "
+        f"reasons: {reasons or 'none recorded'} | symbols: {shown or 'none'}"
+    )
+
+
 def _assert_no_mass_destruction(plan: GuardPlan) -> None:
     """
     Guardrail the old firewall lacked.
@@ -853,7 +957,38 @@ def _assert_no_mass_destruction(plan: GuardPlan) -> None:
     The 2026-07-20 incident blanked 9.5% of Market_Leaders in a single run with
     no alarm raised. Any run touching more than a quarter of a sheet is a bug in
     this module, not a data problem -- fail loudly instead of writing it.
+
+    v1.2.0: the percentage rule below skips input_count < 20, which made a
+    100%-destruction event on a 10-row batch INVISIBLE (production, twice,
+    2026-08-21T00:37). The total-wipe check runs FIRST and at any size.
     """
+    # --- v1.2.0 TOTAL-WIPE DETECTOR ------------------------------------
+    # Review fix (self-review E1/E2, 2026-08-21): the first draft returned
+    # here for EVERY total wipe, which SWALLOWED the RuntimeError the
+    # existing >25% rule has always raised for input_count >= 20 — i.e. it
+    # weakened the old protection for exactly its strongest case (25
+    # shells -> 0). Order is therefore: report FIRST (any size, so >=20
+    # wipes gain the same self-diagnosing line), then for input < 20 the
+    # new warn/opt-in-raise path, and for input >= 20 FALL THROUGH so the
+    # v1.1.1 percentage rule raises byte-identically.
+    if plan.input_count >= 1 and not plan.rows:
+        _report = _wipe_report(plan)
+        try:
+            print("::warning::" + _report)
+        except Exception:
+            pass
+        if plan.input_count < 20:
+            if _wipe_raise_enabled():
+                raise RuntimeError(
+                    _report + " | TFB_IDENTITY_WIPE_RAISE is armed: "
+                    "refusing to return an empty batch."
+                )
+            return
+        # input_count >= 20: fall through to the unchanged v1.1.1 rule,
+        # which raises (share = 100% > 25%). Engine call-site catches
+        # RuntimeError and passes the ORIGINAL rows through with an ERROR
+        # log — raise here means "refuse the wipe", not a 500.
+
     if plan.input_count < 20:
         return
     touched = len(plan.by_action(Action.QUARANTINE_FIELDS)) + len(
