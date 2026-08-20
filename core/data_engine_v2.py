@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.129.1
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.130.3
 ================================================================================
 
 WHY v5.117.0 - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY (Fix AZ)
@@ -3134,6 +3134,41 @@ if str(ROOT_DIR) not in sys.path:
 #        (rows pass through untouched, ERROR when armed), health/banner
 #        expose it and degraded_armed fires.
 #
+# v5.130.2 (2026-08-20, W1A-7b): _SAI_REQUIRED_VERSION 1.3.0 -> 1.4.0. This
+#   is the ONLY behavioural line in this version — no engine logic changes.
+#   surface_action_invariants v1.4.0 adds ONE hard row-sanity class,
+#   open_outside_day_range (the session Open must lie inside [day_low,
+#   day_high] at the module's existing 0.1% tolerance). It introduces NO new
+#   ENV and rides the existing TFB_ROW_SANITY_QUARANTINE /
+#   TFB_SURFACE_ROW_SANITY gate, still refused by the combo matrix unless
+#   the W1A-1 blocked-invariant gate is armed.
+#   WHY THE PIN MOVES IN THE SAME DEPLOY: the C6 contract is strict
+#   equality, so a lone module bump makes _sai_probe() return None and the
+#   guard goes offline. These two files are ATOMIC. Commit both while every
+#   surface ENV is OFF — with all gates off apply() is a proven strict
+#   no-op returning the SAME object, so the window between the two web-UI
+#   commits carries zero exposure. Arm only against a matched pair.
+#   EVIDENCE (2026-08-20 export, measured): 618 rows carry an Open outside
+#   the session range — 447 Global_Markets, 99 Commodities_FX, 72
+#   Mutual_Funds, 0 Market_Leaders (Open column 0/255 populated: negative
+#   control). 13 of them surfaced INVEST, including 1015.KL (Open 4.64 vs
+#   Day Low 7.05) which took the day's only executable ticket with
+#   First Fail = NONE. Board INVEST 82 -> 69 with the class armed.
+#
+# v5.130.3 (2026-08-20 midday, external audit F-01/F-02 adjudicated):
+#   PIN: _SAI_REQUIRED_VERSION 1.4.0 -> 1.4.1 (module F-01 semantic
+#   reversal — xprovider_verified 0.0% is EXACT price agreement per the
+#   producer at ~10456 and WHY ~505/~462; the module regex demoting on it
+#   is removed there). ATOMIC with the module, same contract as v5.130.2.
+#   F-02: health "degraded_armed" now treats import state "incompatible"
+#   the same as "error" when any surface gate is armed. Before this fix a
+#   strict-pin refusal left surfaces unprotected while health reported
+#   degraded_armed=False. One-line predicate change at the health block;
+#   a broader decision_ready flag is registered for a later wave, not
+#   smuggled in here.
+#   TITLE: file banner v5.129.1 -> v5.130.3 (was stale since 5.130.0;
+#   __version__ was always authoritative).
+#
 # =============================================================================
 # v5.130.0 (Fix BC-2 + Fix BD) — FINAL-BOUNDARY OHLC COHERENCE +
 #                                BATCH FINGERPRINT COLLISION DETECTOR
@@ -3201,7 +3236,7 @@ if str(ROOT_DIR) not in sys.path:
 #   _BD_SCAN_ERROR_COUNT/_LOGGED. Harness v2 ships subprocess-isolated
 #   OLD/NEW comparison with CLI paths (audit P1-A/F7) + expanded matrix.
 # =============================================================================
-__version__ = "5.130.1"
+__version__ = "5.130.3"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -4598,7 +4633,7 @@ def _top10_quality_filter_enabled() -> bool:
 # =============================================================================
 # v5.128.1 (audit P1-1/P1-4) — SHARED SURFACE-INVARIANT WRAPPER + STATE
 # =============================================================================
-_SAI_REQUIRED_VERSION = "1.3.0"   # v5.129.1 (C6): engine<->module contract
+_SAI_REQUIRED_VERSION = "1.4.1"   # v5.130.3 (F-01/F-02): engine<->module contract
 _SAI_STATE: Dict[str, Any] = {"import": "unknown", "version": None,
                               "error": ""}
 _SAI_GATE_ENVS = ("TFB_T10_BLOCKED_INVARIANT", "TFB_SURFACE_BLOCKED_INVARIANT",
@@ -15833,7 +15868,12 @@ class DataEngineV5:
                 "import": _SAI_STATE["import"],
                 "version": _SAI_STATE["version"],
                 "error": _SAI_STATE["error"],
-                "degraded_armed": (_SAI_STATE["import"] == "error"
+                # v5.130.3 (F-02): "incompatible" is exactly as unprotected
+                # as "error" when a gate is armed — the wrapper refuses to
+                # apply and rows pass through unguarded. Both states now
+                # mark the deployment degraded.
+                "degraded_armed": (_SAI_STATE["import"] in (
+                                       "error", "incompatible")
                                    and _surface_gate_on(*_SAI_GATE_ENVS)),
             },
             "ohlc_coherence": {
