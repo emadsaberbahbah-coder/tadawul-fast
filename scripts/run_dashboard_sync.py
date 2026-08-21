@@ -3,7 +3,7 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.41.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.42.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
@@ -1678,7 +1678,32 @@ except ModuleNotFoundError:  # direct ``python scripts/run_dashboard_sync.py``
 #   additions: _upstream_verdict_enabled, _upstream_verdict_pages,
 #   _upstream_verdict_max_age_min, _uv_page_state, _uv_parse_value,
 #   _uv_compose, _write_upstream_verdict.
-SCRIPT_VERSION = "6.41.0"
+# v6.42.0 (2026-08-21, W1A-6d — six-gate audit adjudicated on the 16:30 TSVs):
+#   WHY: the day's audit re-ran this file's own predicate (verbatim: aliases,
+#   _ohlc_prewrite_num, 0.01 tol, P1/P2/P3) over the exported sheets and got
+#   GM 347 / CFX 98 / MF 60 flagged (505 total; naive strict-band count 542),
+#   against the last recorded write-boundary line "checked=6627 flagged=5".
+#   Same conclusion as the v6.41.0 WHY, now with the residual measured: even
+#   a perfectly-sighted guard is silent on 38 real rows (9 skipped because a
+#   [0,*] band aborts ALL tests; 29 forgiven by the 1% tol) and mis-attributes
+#   6 more (P2 short-circuit hides the Open offense). An arming decision read
+#   off `flagged`/`open` alone would therefore under-see even after placement
+#   is fixed. THIS BUILD IS MEASUREMENT ONLY:
+#   (1) three ADDITIVE stats counters — zero_band, tol_excused, open_masked —
+#       in _apply_ohlc_prewrite_guard; `checked`/`flagged`/`open`/`price_band`
+#       /`range`/blank_* are BYTE-IDENTICAL in meaning and value, so every
+#       historical line and the prewrite<->readback delta stay comparable;
+#   (2) the write-path log line gains the three counters;
+#   (3) companion (separate file, same session): daily_sync.yml maps
+#       TFB_SYNC_OHLC_READBACK into BOTH job envs — the v6.41.0 readback was
+#       fully built and NEVER wired into the workflow env, the exact v6.39.4
+#       failure mode one flag over. Default '0' there; arming is an operator
+#       ENV decision per standing policy.
+#   NOT CHANGED: the predicate (P1/P2/P3, tol, aliases), `flagged` semantics,
+#   enforce behaviour, KLG, trim, readback logic, any write. With every ENV
+#   unset the write path is byte-identical to v6.41.0.
+
+SCRIPT_VERSION = "6.42.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -4045,6 +4070,19 @@ def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> t
     # clean, or that 6,000 cells were untestable. Now it is measured.
     stats = {"checked": 0, "flagged": 0, "open": 0, "price_band": 0,
              "range": 0, "blank_open": 0, "blank_hi": 0, "blank_lo": 0,
+             # v6.42.0 (W1A-6d) ADDITIVE counters — `flagged` semantics
+             # untouched so every historical line stays comparable:
+             #   zero_band   rows silently skipped because hi/lo parse
+             #               but are not BOTH > 0 (the [0,*] bands the
+             #               2026-08-21 audit found: 9 rows, no test ran)
+             #   tol_excused rows whose Open sits strictly outside
+             #               [lo,hi] but inside the 1% tol widening
+             #               (29 rows on 2026-08-21 — real leaks the
+             #               guard forgives by tolerance, now measured)
+             #   open_masked rows where P2 (price_band) fired and the
+             #               Open ALSO violates — the short-circuit
+             #               hid the open attribution (6 rows)
+             "zero_band": 0, "tol_excused": 0, "open_masked": 0,
              "examples": []}
     if not headers or not rows_matrix:
         return rows_matrix, stats
@@ -4081,6 +4119,15 @@ def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> t
         if lo is None:
             stats["blank_lo"] += 1
         offenses: list = []
+        # v6.42.0 (W1A-6d): measure the silent-skip before it happens.
+        if hi is not None and lo is not None and not (hi > 0 and lo > 0):
+            stats["zero_band"] += 1
+        # v6.42.0 (W1A-6d): a strict-band violation the tol widening
+        # forgives — counted independently of the offense chain.
+        if (op is not None and hi is not None and lo is not None
+                and hi >= lo and not (lo <= op <= hi)
+                and lo * (1.0 - tol) <= op <= hi * (1.0 + tol)):
+            stats["tol_excused"] += 1
         range_ok = hi is not None and lo is not None and hi > 0 and lo > 0
         # P1: inverted band is self-contradictory whatever the symbol.
         if range_ok and hi < lo:
@@ -4097,6 +4144,12 @@ def _apply_ohlc_prewrite_guard(headers: list, rows_matrix: list, page: str) -> t
         if range_ok and op is not None and op > 0 and not (
                 lo * (1.0 - tol) <= op <= hi * (1.0 + tol)):
             offenses.append("open")
+        # v6.42.0 (W1A-6d): P2 fired with a valid band and the Open is
+        # ALSO outside the tol band — the P1/P2 short-circuit hides the
+        # open attribution from the counters an arming decision reads.
+        if ("price_band" in offenses and op is not None and op > 0
+                and not (lo * (1.0 - tol) <= op <= hi * (1.0 + tol))):
+            stats["open_masked"] += 1
         if not offenses:
             continue
         stats["flagged"] += 1
@@ -8388,6 +8441,9 @@ async def _run_one_task(
                             f"blank(o/h/l)={_oc.get('blank_open', 0)}/"
                             f"{_oc.get('blank_hi', 0)}/"
                             f"{_oc.get('blank_lo', 0)} | "
+                            f"zero_band={_oc.get('zero_band', 0)} "
+                            f"tol_excused={_oc.get('tol_excused', 0)} "
+                            f"open_masked={_oc.get('open_masked', 0)} | "
                             f"mode={_ohlc_prewrite_mode()} tol={_ohlc_prewrite_tol()}"
                             + (f" | ex: {', '.join(_oc['examples'][:12])}"
                                f"{'…' if _oc['flagged'] > 12 else ''}"
