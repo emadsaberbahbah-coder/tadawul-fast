@@ -320,6 +320,12 @@ jobs:
       TFB_SYNC_OHLC_PREWRITE_MODE: ${{ vars.TFB_SYNC_OHLC_PREWRITE_MODE || 'observe' }}
       TFB_SYNC_OHLC_PREWRITE_TOL: ${{ vars.TFB_SYNC_OHLC_PREWRITE_TOL || '0.01' }}
       TFB_SYNC_OHLC_RUNLOG: ${{ vars.TFB_SYNC_OHLC_RUNLOG || '1' }}
+      # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
+      # in code since 6.41.0 but was never mapped here — the exact v6.39.4
+      # failure mode (a repo Variable that is not in env: never reaches
+      # os.getenv). DEFAULT '0': unset keeps today's behaviour byte-identical.
+      # Measurement-only — the readback never mutates (forced-observe window).
+      TFB_SYNC_OHLC_READBACK: ${{ vars.TFB_SYNC_OHLC_READBACK || '0' }}
       TFB_SYNC_STATUS_STAMP: ${{ vars.TFB_SYNC_STATUS_STAMP || '0' }}
       TFB_SYNC_STATUS_STAMP_PAGES: ${{ vars.TFB_SYNC_STATUS_STAMP_PAGES || '' }}
       # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
@@ -1332,6 +1338,12 @@ jobs:
       TFB_SYNC_OHLC_PREWRITE_MODE: ${{ vars.TFB_SYNC_OHLC_PREWRITE_MODE || 'observe' }}
       TFB_SYNC_OHLC_PREWRITE_TOL: ${{ vars.TFB_SYNC_OHLC_PREWRITE_TOL || '0.01' }}
       TFB_SYNC_OHLC_RUNLOG: ${{ vars.TFB_SYNC_OHLC_RUNLOG || '1' }}
+      # W1A-6d (2026-08-21): map the v6.41.0 READBACK gate. The flag existed
+      # in code since 6.41.0 but was never mapped here — the exact v6.39.4
+      # failure mode (a repo Variable that is not in env: never reaches
+      # os.getenv). DEFAULT '0': unset keeps today's behaviour byte-identical.
+      # Measurement-only — the readback never mutates (forced-observe window).
+      TFB_SYNC_OHLC_READBACK: ${{ vars.TFB_SYNC_OHLC_READBACK || '0' }}
       TFB_SYNC_STATUS_STAMP: ${{ vars.TFB_SYNC_STATUS_STAMP || '0' }}
       TFB_SYNC_STATUS_STAMP_PAGES: ${{ vars.TFB_SYNC_STATUS_STAMP_PAGES || '' }}
       # v6.40.0 (W1A-4a) upstream decision-feed verdict — DEFAULT OFF.
