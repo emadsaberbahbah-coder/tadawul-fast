@@ -33,7 +33,7 @@ jobs:
       TFB_MAIL_PASSWORD: ${{ secrets.TFB_MAIL_PASSWORD }}
       TFB_MAIL_TO: ${{ secrets.TFB_MAIL_TO }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:

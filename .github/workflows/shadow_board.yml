@@ -78,7 +78,7 @@ jobs:
       # run unreviewed code against the production workbook with production
       # credentials. persist-credentials: false keeps the GITHUB_TOKEN out of
       # the on-disk git config for the rest of the job.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 1
