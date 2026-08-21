@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.130.3
+Data Engine V2 - GLOBAL-FIRST ORCHESTRATOR - v5.131.0
 ================================================================================
 
 WHY v5.117.0 - FUNDAMENTALS LAST-KNOWN-GOOD CONTINUITY (Fix AZ)
@@ -3236,7 +3236,27 @@ if str(ROOT_DIR) not in sys.path:
 #   _BD_SCAN_ERROR_COUNT/_LOGGED. Harness v2 ships subprocess-isolated
 #   OLD/NEW comparison with CLI paths (audit P1-A/F7) + expanded matrix.
 # =============================================================================
-__version__ = "5.130.3"
+# v5.131.0 (2026-08-21, W1A-0b — TARGET-BLOCK LKG, six-gate audit adjudicated):
+#   WHY: the 16:30 TSVs show the surface split at full scale — 4,455 rows
+#   (GM 2,118 / CFX 158 / MF 2,179) pinned at forecast_reliability_score
+#   exactly 31.3 on phase_ii_synthetic, while My_Portfolio carries 74.9-90.4
+#   provider_target the SAME HOUR. W1A-0 root cause: the analyst-target leg
+#   throttles independently and outlasts price recovery; the gate then
+#   honestly scores a synthetic source. FIX: keep-last-good for the TARGET
+#   BLOCK at the _phase_ii_quality_forecast seam (capture genuine targets;
+#   on a failed leg restore fp12+source under identity/TTL/taint guards and
+#   let the EXISTING honor branch derive 1M/3M; the gate then recomputes
+#   reliability for a provider source organically — no score is written).
+#   Cloned from Fix BB fundamentals LKG. Tag analyst_lkg:<age>h (scan-safe).
+#   NOT tainted on xprovider_verified:*:0.0% — exact agreement is healthy
+#   (the W1A-8 lesson). Per-worker store, same caveat as FUND LKG.
+#   ENV (Render, ALL default OFF => byte-identical): TFB_ENGINE_TARGET_KLG /
+#   _TTL_H (72) / _MAX (20000). ARMING IS GRADUATED: reliability feeds the
+#   Min-Reliability-70 floor, so first arming is observation-only against a
+#   Top_10 dry-run per standing policy.
+#   NOT CHANGED: synthesize math, reliability formula, gate thresholds,
+#   projection schema (115), SAI contract (1.4.1), any provider call.
+__version__ = "5.131.0"
 
 # v5.76.0 cross-stack contract version markers. Kept in lockstep with
 # core.scoring v5.7.0 and core.reco_normalize v8.0.0.
@@ -7610,6 +7630,19 @@ def _phase_ii_quality_forecast(row: Dict[str, Any]) -> None:
     # negative values (a 0 forecast_price_12m previously passed the
     # `is not None` check and produced a derived -100% ROI).
     existing_source = _safe_str(row.get("forecast_source")).lower()
+    # v5.131.0 (W1A-0b): TARGET-BLOCK LKG seam. Gate OFF => this whole
+    # branch is dead code and the function is byte-identical to v5.130.3.
+    # Capture on a genuine target; on a failed target leg, try the carry
+    # BEFORE the synthesize path — a successful restore re-enters the
+    # existing honor branch below, which derives 1M/3M exactly as it
+    # always has for a provider target.
+    if _tgt_lkg_enabled():
+        if (existing_source == "provider_target"
+                and _forecast_price_is_populated(row.get("forecast_price_12m"))):
+            _tgt_lkg_capture(row)
+        elif not _forecast_price_is_populated(row.get("forecast_price_12m")):
+            if _tgt_lkg_restore(row):
+                existing_source = "provider_target"
     if existing_source == "provider_target" and _forecast_price_is_populated(row.get("forecast_price_12m")):
         fp12 = _as_float(row.get("forecast_price_12m"))
         if fp12 is not None and fp12 > 0:
@@ -10335,6 +10368,156 @@ def _fund_lkg_restore(sym: str, row: Dict[str, Any]) -> Optional[str]:
     except Exception:
         return None
 
+
+# =============================================================================
+# v5.131.0 (W1A-0b) — TARGET-BLOCK LAST-KNOWN-GOOD (analyst 12M target)
+# =============================================================================
+# WHY: W1A-0 (R-6) proved the analyst-target feed has its OWN throttle that
+# outlasts price-feed recovery by 2-3 hours: the row fetches fine, the target
+# leg fails, _phase_ii_quality_forecast synthesizes, and the investability
+# gate then recomputes forecast_reliability_score for a SYNTHETIC source —
+# 31.3 is gate output, not a carried value. Whole-row KLG already works; this
+# is keep-last-good for the TARGET BLOCK alone, cloned from the Fix BB
+# fundamentals LKG (same TTL/taint/prune discipline, same per-worker caveat:
+# the store is process-local, so a cold Gunicorn worker carries nothing).
+# Reliability is NOT written here: restoring source+target UPSTREAM of the
+# gate lets the gate produce provider-target-class reliability organically —
+# fix the input, never the output.
+# IDENTITY: restore refuses on a name mismatch (_tgt_lkg_names_compatible)
+# and on the Fix BB taint substrings. DELIBERATELY NOT tainted:
+# "xprovider_verified:*:0.0%" — a 0.0% cross-provider delta is EXACT
+# AGREEMENT (healthy); tainting on it would repeat the W1A-8 regex mistake.
+# TAG: "analyst_lkg:<age>h" — reliability-scan substring-safe (contains none
+# of cap/forecast/target/roi/drop/reject), so a repeat gate pass is
+# byte-identical. A carried row can never re-seed the store (tag check).
+# ENV (Render; ALL default OFF => byte-identical to v5.130.3):
+#   TFB_ENGINE_TARGET_KLG        master, default 0
+#   TFB_ENGINE_TARGET_KLG_TTL_H  default 72, floor 1
+#   TFB_ENGINE_TARGET_KLG_MAX    default 20000, floor 100
+# =============================================================================
+
+_TGT_LKG_STORE: Dict[str, Dict[str, Any]] = {}
+_TGT_LKG_TAG_PREFIX: str = "analyst_lkg"
+
+
+def _tgt_lkg_enabled() -> bool:
+    """v5.131.0 W1A-0b master gate. DEFAULT OFF — unset/0/false/off keeps
+    _phase_ii_quality_forecast byte-identical to v5.130.3."""
+    return os.getenv("TFB_ENGINE_TARGET_KLG", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _tgt_lkg_ttl_h() -> float:
+    try:
+        v = float(os.getenv("TFB_ENGINE_TARGET_KLG_TTL_H", "72").strip())
+    except Exception:
+        v = 72.0
+    return v if v >= 1.0 else 72.0
+
+
+def _tgt_lkg_max_symbols() -> int:
+    try:
+        v = int(os.getenv("TFB_ENGINE_TARGET_KLG_MAX", "20000").strip())
+    except Exception:
+        v = 20000
+    return v if v >= 100 else 20000
+
+
+def _tgt_lkg_names_compatible(stored: Any, live: Any) -> bool:
+    """Strict-but-not-brittle: blank on either side passes (fill-only
+    philosophy); both present must match after normalization, or one must be
+    a >=6-char prefix of the other (provider name-length variance). Refusal
+    is the SAFE direction — a missed carry costs one synthetic day, a wrong
+    carry is cross-symbol contamination."""
+    a = re.sub(r"[^a-z0-9 ]+", "", _safe_str(stored).lower()).strip()
+    b = re.sub(r"[^a-z0-9 ]+", "", _safe_str(live).lower()).strip()
+    if not a or not b:
+        return True
+    if a == b:
+        return True
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    return len(shorter) >= 6 and longer.startswith(shorter)
+
+
+def _tgt_lkg_capture(row: Mapping[str, Any]) -> bool:
+    """Seed/refresh the store from a GENUINE provider target. Refuses tainted
+    rows and rows whose warnings carry the carry-tag (a restored value must
+    never launder itself into a fresh one). Never raises."""
+    try:
+        if not _tgt_lkg_enabled() or not isinstance(row, Mapping):
+            return False
+        s = _safe_str(row.get("symbol")).strip().upper()
+        if not s:
+            return False
+        if _TGT_LKG_TAG_PREFIX in _safe_str(row.get("warnings")):
+            return False
+        if _fund_lkg_row_tainted(row):
+            return False
+        fp12 = _as_float(row.get("forecast_price_12m"))
+        if fp12 is None or fp12 <= 0:
+            return False
+        entry: Dict[str, Any] = {
+            "ts": time.time(),
+            "name": _safe_str(row.get("name")),
+            "fp12": fp12,
+        }
+        tmp = _as_float(row.get("target_mean_price"))
+        if tmp is not None and tmp > 0:
+            entry["tmp"] = tmp
+        _TGT_LKG_STORE[s] = entry
+        cap = _tgt_lkg_max_symbols()
+        if len(_TGT_LKG_STORE) > cap:
+            now = time.time()
+            ttl_s = _tgt_lkg_ttl_h() * 3600.0
+            for k in [k for k, e in _TGT_LKG_STORE.items()
+                      if (now - float(e.get("ts") or 0.0)) > ttl_s]:
+                _TGT_LKG_STORE.pop(k, None)
+            if len(_TGT_LKG_STORE) > cap:
+                by_age = sorted(_TGT_LKG_STORE.items(),
+                                key=lambda kv: float(kv[1].get("ts") or 0.0))
+                for k, _e in by_age[: len(_TGT_LKG_STORE) - cap]:
+                    _TGT_LKG_STORE.pop(k, None)
+        return True
+    except Exception:
+        return False
+
+
+def _tgt_lkg_restore(row: Dict[str, Any]) -> bool:
+    """When the target leg failed (forecast_price_12m unpopulated) and a
+    live-TTL entry exists for the SAME identity, restore the target block and
+    tag "analyst_lkg:<age>h". Mutates row in place. Never raises; refusal is
+    always the fallback."""
+    try:
+        if not _tgt_lkg_enabled() or not isinstance(row, dict):
+            return False
+        if _forecast_price_is_populated(row.get("forecast_price_12m")):
+            return False
+        s = _safe_str(row.get("symbol")).strip().upper()
+        if not s:
+            return False
+        entry = _TGT_LKG_STORE.get(s)
+        if not entry:
+            return False
+        now = time.time()
+        age_s = max(0.0, now - float(entry.get("ts") or 0.0))
+        if age_s > _tgt_lkg_ttl_h() * 3600.0:
+            _TGT_LKG_STORE.pop(s, None)
+            return False
+        if _fund_lkg_row_tainted(row):
+            return False
+        if not _tgt_lkg_names_compatible(entry.get("name"), row.get("name")):
+            return False
+        fp12 = _as_float(entry.get("fp12"))
+        if fp12 is None or fp12 <= 0:
+            return False
+        row["forecast_price_12m"] = fp12
+        tmp = _as_float(entry.get("tmp"))
+        if tmp is not None and tmp > 0 and _as_float(row.get("target_mean_price")) is None:
+            row["target_mean_price"] = tmp
+        row["forecast_source"] = "provider_target"
+        _v573_append_warning(row, "%s:%dh" % (_TGT_LKG_TAG_PREFIX, int(age_s // 3600)))
+        return True
+    except Exception:
+        return False
 
 def _final_action_invariant_enabled() -> bool:
     """v5.111.0 (Fix AW): final-boundary INVEST-on-SELL invariant. Default
