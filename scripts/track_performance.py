@@ -2,7 +2,7 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.18.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.34.0)
 ===========================================================
 
 Why this revision (v6.18.0 vs v6.17.0) — COHORT RESCUE
@@ -1221,6 +1221,62 @@ from urllib.error import HTTPError, URLError
 # Zero functions removed. One helper added.
 # -----------------------------------------------------------------------------
 # =============================================================================
+# v6.34.0 — [IR-078a / EVIDENCE-DURABILITY] CAPACITY GUARD + FATAL APPENDS
+# =============================================================================
+# EXTERNAL AUDIT 2026-08-22 (adjudicated, P0-1/P0-6 CONFIRMED at source):
+# the live workbook hit Google's 10,000,000-cell allocation limit —
+# Performance_Log / Signal_History / _Run_Log appends fail HTTP 400 while
+# the job stays GREEN (append_records logs-and-returns-False; the caller
+# absorbs it), so the S-1 evidence clock froze silently. Grid arithmetic
+# corroborates: pages allocated to column ZZ (702 cols) put Global_Markets
+# alone at ~4.6M allocated cells.
+# FIX (additive; every default preserves v6.33.0 byte-identically):
+#   A  Capacity gates: _capacity_guard_enabled (TFB_TP_CAPACITY_GUARD,
+#      default ON — telemetry is read-only), _capacity_guard_mode
+#      (TFB_TP_CAPACITY_GUARD_MODE observe|enforce, default observe,
+#      unknown->observe), _capacity_limit (TFB_TP_CAPACITY_LIMIT default
+#      10,000,000 floor 1,000,000), _capacity_pct (TFB_TP_CAPACITY_PCT
+#      default 85, clamp 50..99).
+#   B  _allocated_cells_from_meta(meta): PURE sum of rowCount*columnCount
+#      over sheets[].properties.gridProperties — harness-tested; None on
+#      malformed input (fail-open).
+#   C  _capacity_probe(book, sid): ONE fetch_sheet_metadata per process
+#      per spreadsheet (module cache + lock — appends run in executor
+#      threads), one '[CAPACITY v6.34.0]' log line with allocated/limit/
+#      pct/threshold/breach. Any error -> breach False + error field
+#      (telemetry must never take the writer down).
+#   D  _capacity_block_reason(book, sid): '' unless guard ON AND mode
+#      enforce AND probe breach — the refusal fires BEFORE any Google
+#      call (no backoff burn on a wall we already measured).
+#   E  Evidence-append failure REGISTRY (thread-safe):
+#      _note_evidence_append_failure / _evidence_append_failures. Noted
+#      on (a) real append exceptions, (b) capacity refusals — NOT on
+#      store-unavailable (lean CI / gspread absent stays best-effort).
+#   F  PerformanceStore.append_records + SignalHistoryStore.
+#      append_snapshots: capacity refusal pre-check + registry note in
+#      the except branch. Same return contracts as v6.33.0 (False / 0).
+#   G  run_once tail: if the registry is non-empty, log every failure
+#      loudly; with TFB_TP_APPEND_FATAL=1 (DEFAULT OFF — behaviour-
+#      changing, armed separately) return exit 1 so the workflow goes
+#      RED and the S-1 day cannot be silently credited. VT-1 _Run_Log
+#      verdict + S1 calibration publish stay best-effort by design.
+#   H  Evidence-destination override: _evidence_spreadsheet_id — when
+#      TFB_TP_EVIDENCE_SPREADSHEET_ID is set, the three evidence-tab
+#      stores (Performance_Log, Signal_History, Signal_Trends) open
+#      their WORKSHEET from that dedicated workbook via a second handle
+#      (self._ws_book) while self.sheet stays on the MAIN workbook — so
+#      Top_10 board reads, VT-1 _Run_Log verdicts and the S-1
+#      calibration tab are untouched. Unset -> self._ws_book IS
+#      self.sheet (same object; zero behaviour change). This is the
+#      rotation enabler: create book, share to the SA, set ONE env.
+# ARMING LADDER (each its own evidence day; nothing armed at ship):
+#   1) observe telemetry (automatic)  2) TFB_TP_APPEND_FATAL=1
+#   3) TFB_TP_CAPACITY_GUARD_MODE=enforce
+#   4) TFB_TP_EVIDENCE_SPREADSHEET_ID=<dedicated workbook id>
+# KILL SWITCH: TFB_TP_CAPACITY_GUARD=0 (probe+refusal fully off).
+# Zero functions removed; HypothesisRegistry and every read path verbatim.
+# -----------------------------------------------------------------------------
+# =============================================================================
 # v6.33.0 — [SHADOW/REGRET] CHAMPION SPLIT + REGRET MEASUREMENT
 # =============================================================================
 # OPERATOR MANDATE (2026-08-09): "measure what we lost from the best
@@ -1250,7 +1306,7 @@ from urllib.error import HTTPError, URLError
 # and reports byte-identical to v6.32.0. ZERO functions removed; additions:
 # _shadow_cohorts_enabled, _regret_topk, _read_board_selected_symbols.
 # =============================================================================
-SCRIPT_VERSION = "6.33.0"
+SCRIPT_VERSION = "6.34.0"
 # v6.11.0: BACKTEST HARDENING (additive, default-OFF -- OFF path byte-identical
 #   to v6.10.1). Two independently-gated corrections, both proven on the live
 #   KSA+US grid before folding here:
@@ -3744,6 +3800,164 @@ class BackendClient:
 # =============================================================================
 # Store (Google Sheets) — best-effort, gspread-based
 # =============================================================================
+# =============================================================================
+# v6.34.0 (IR-078a) — workbook-capacity guard + evidence-append registry
+# =============================================================================
+def _capacity_guard_enabled() -> bool:
+    """v6.34.0 master switch. DEFAULT ON — the probe is one read-only
+    metadata GET per process per workbook. TFB_TP_CAPACITY_GUARD=0/false/off
+    disables probe, telemetry and refusal entirely (v6.33.0 verbatim)."""
+    return (os.getenv("TFB_TP_CAPACITY_GUARD") or "1").strip().lower() not in (
+        "0", "false", "off", "no")
+
+
+def _capacity_guard_mode() -> str:
+    """observe (default) -> telemetry only; enforce -> appends are refused
+    at breach BEFORE any Google call. Unknown values -> observe (fail-safe:
+    a typo must not start blocking evidence writes)."""
+    m = (os.getenv("TFB_TP_CAPACITY_GUARD_MODE") or "observe").strip().lower()
+    return m if m in ("observe", "enforce") else "observe"
+
+
+def _capacity_limit() -> int:
+    """Google hard cap is 10,000,000 cells per spreadsheet. Overridable for
+    drills (TFB_TP_CAPACITY_LIMIT); floor 1,000,000 so a typo cannot set a
+    zero/absurd limit that refuses every append under enforce."""
+    try:
+        v = int((os.getenv("TFB_TP_CAPACITY_LIMIT") or "10000000").strip())
+    except Exception:
+        v = 10_000_000
+    return max(1_000_000, v)
+
+
+def _capacity_pct() -> int:
+    """Breach threshold as % of the limit (default 85 per the audit's
+    preventive-gate requirement). Clamped 50..99."""
+    try:
+        v = int((os.getenv("TFB_TP_CAPACITY_PCT") or "85").strip())
+    except Exception:
+        v = 85
+    return min(99, max(50, v))
+
+
+def _allocated_cells_from_meta(meta: Any) -> Optional[int]:
+    """PURE: total ALLOCATED cells (rowCount*columnCount summed over every
+    tab) from a fetch_sheet_metadata() dict. Allocation — not data — is what
+    Google's 10M limit counts, which is why A1:ZZ pages exhaust it. Returns
+    None on any malformed shape (caller fails open)."""
+    try:
+        sheets = meta.get("sheets") if isinstance(meta, dict) else None
+        if not isinstance(sheets, list) or not sheets:
+            return None
+        total = 0
+        seen = False
+        for sh in sheets:
+            try:
+                gp = sh["properties"]["gridProperties"]
+                total += int(gp["rowCount"]) * int(gp["columnCount"])
+                seen = True
+            except Exception:
+                continue
+        return total if seen else None
+    except Exception:
+        return None
+
+
+_CAPACITY_CACHE: Dict[str, Dict[str, Any]] = {}
+_CAPACITY_LOCK = Lock()
+
+
+def _capacity_probe(book: Any, sid: str) -> Dict[str, Any]:
+    """ONE metadata fetch per process per spreadsheet id (appends run in
+    executor threads -> lock + cache). Emits one '[CAPACITY v6.34.0]' line.
+    Fail-open: every error path returns breach=False with an 'error' field
+    — telemetry must never take the evidence writer down."""
+    key = str(sid or "")
+    with _CAPACITY_LOCK:
+        hit = _CAPACITY_CACHE.get(key)
+        if hit is not None:
+            return hit
+    out: Dict[str, Any] = {"allocated": None, "limit": _capacity_limit(),
+                           "threshold_pct": _capacity_pct(),
+                           "pct_used": None, "breach": False}
+    if not _capacity_guard_enabled() or book is None:
+        out["error"] = "guard-off-or-no-book"
+    else:
+        try:
+            meta = book.fetch_sheet_metadata()
+            alloc = _allocated_cells_from_meta(meta)
+            if alloc is None:
+                out["error"] = "meta-unparseable"
+            else:
+                out["allocated"] = alloc
+                out["pct_used"] = round(100.0 * alloc / out["limit"], 2)
+                out["breach"] = out["pct_used"] >= out["threshold_pct"]
+                logger.info(
+                    "[CAPACITY v6.34.0] %s: allocated=%s cells, limit=%s, "
+                    "used=%.2f%%, threshold=%d%%, breach=%s, mode=%s",
+                    key[-8:] or "?", f"{alloc:,}", f"{out['limit']:,}",
+                    out["pct_used"], out["threshold_pct"], out["breach"],
+                    _capacity_guard_mode())
+        except Exception as e:
+            out["error"] = str(e)
+    with _CAPACITY_LOCK:
+        _CAPACITY_CACHE[key] = out
+    return out
+
+
+def _capacity_block_reason(book: Any, sid: str) -> str:
+    """'' unless guard ON, mode ENFORCE and the cached probe says breach —
+    the only path that refuses an append, and it fires BEFORE any Google
+    call so backoff is never burned against a wall we already measured."""
+    if not _capacity_guard_enabled() or _capacity_guard_mode() != "enforce":
+        return ""
+    p = _capacity_probe(book, sid)
+    if p.get("breach"):
+        return ("workbook %s at %.2f%% of %s-cell limit (threshold %d%%)"
+                % (str(sid or "?")[-8:], p.get("pct_used") or 0.0,
+                   f"{p.get('limit', 0):,}", p.get("threshold_pct", 0)))
+    return ""
+
+
+def _append_fatal_enabled() -> bool:
+    """v6.34.0 exit-semantics switch. DEFAULT OFF — turning green runs red
+    is behaviour-changing and is armed as its own evidence day
+    (TFB_TP_APPEND_FATAL=1). The registry + loud logging run regardless."""
+    return (os.getenv("TFB_TP_APPEND_FATAL") or "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _evidence_spreadsheet_id(default_sid: str) -> str:
+    """Rotation enabler: when TFB_TP_EVIDENCE_SPREADSHEET_ID is set, the
+    evidence TABS (Performance_Log / Signal_History / Signal_Trends) live in
+    that dedicated workbook; everything reading the MAIN workbook (board,
+    VT-1 _Run_Log verdict, S-1 calibration tab) is untouched. Unset ->
+    passthrough (v6.33.0 verbatim)."""
+    v = (os.getenv("TFB_TP_EVIDENCE_SPREADSHEET_ID") or "").strip()
+    return v or default_sid
+
+
+_EVIDENCE_APPEND_FAILURES: List[str] = []
+_EVIDENCE_APPEND_LOCK = Lock()
+
+
+def _note_evidence_append_failure(store_name: str, detail: str) -> None:
+    """Thread-safe (appends run in executor threads). Noted ONLY for real
+    append failures and capacity refusals — never for store-unavailable
+    (gspread absent / lean CI keeps v6.33.0 best-effort semantics)."""
+    try:
+        with _EVIDENCE_APPEND_LOCK:
+            _EVIDENCE_APPEND_FAILURES.append(
+                "%s: %s" % (store_name, (detail or "?")[:300]))
+    except Exception:
+        pass
+
+
+def _evidence_append_failures() -> List[str]:
+    with _EVIDENCE_APPEND_LOCK:
+        return list(_EVIDENCE_APPEND_FAILURES)
+
+
 class PerformanceStore:
     SHEET_DEFAULT = "Performance_Log"
     START_ROW = 5  # headers at row 5, data from row 6
@@ -3841,16 +4055,27 @@ class PerformanceStore:
                 self.gc = gspread.service_account()
 
             self.sheet = self.gc.open_by_key(self.spreadsheet_id)
+            # v6.34.0 (IR-078a): evidence tab may live in a dedicated
+            # workbook. self.sheet STAYS on the main workbook (board reads,
+            # VT-1 verdict, S-1 calibration untouched); only the worksheet
+            # handle moves. Unset override -> same object, zero change.
+            _ev_sid = _evidence_spreadsheet_id(self.spreadsheet_id)
+            self._ws_sid = _ev_sid
+            self._ws_book = (self.sheet if _ev_sid == self.spreadsheet_id
+                             else self.gc.open_by_key(_ev_sid))
+            _capacity_probe(self._ws_book, _ev_sid)
             try:
-                self.ws = self.sheet.worksheet(self.sheet_name)
+                self.ws = self._ws_book.worksheet(self.sheet_name)
             except Exception:
-                self.ws = self.sheet.add_worksheet(
+                self.ws = self._ws_book.add_worksheet(
                     title=self.sheet_name, rows=2000, cols=80
                 )
 
             self.backoff.execute_sync(self._ensure_headers)
         except Exception as e:
             logger.error("PerformanceStore init failed: %s", e)
+            self._ws_book = None
+            self._ws_sid = None
             self.gc = None
             self.sheet = None
             self.ws = None
@@ -4004,6 +4229,18 @@ class PerformanceStore:
 
         rows: List[List[Any]] = [self._record_to_row(r) for r in new]
 
+        # v6.34.0 (IR-078a): refuse BEFORE Google when the destination
+        # workbook is measured at/over the capacity threshold under
+        # enforce mode. Observe/default: reason is '' and this is a no-op.
+        _blk = _capacity_block_reason(
+            getattr(self, "_ws_book", None) or self.sheet,
+            getattr(self, "_ws_sid", None) or self.spreadsheet_id)
+        if _blk:
+            logger.error(
+                "[CAPACITY v6.34.0] Performance_Log append REFUSED: %s", _blk)
+            _note_evidence_append_failure("Performance_Log", _blk)
+            return False
+
         try:
             self.backoff.execute_sync(
                 lambda: self.ws.append_rows(rows, value_input_option="RAW")  # type: ignore
@@ -4014,6 +4251,7 @@ class PerformanceStore:
             return True
         except Exception as e:
             logger.error("Failed to append records: %s", e)
+            _note_evidence_append_failure("Performance_Log", str(e))
             return False
 
     def update_summary(self, summary: PerformanceSummary) -> bool:
@@ -4142,15 +4380,24 @@ class SignalHistoryStore:
             else:
                 self.gc = gspread.service_account()
             self.sheet = self.gc.open_by_key(self.spreadsheet_id)
+            # v6.34.0 (IR-078a): same two-handle pattern as PerformanceStore
+            # — see the WHY block there. Unset override -> same object.
+            _ev_sid = _evidence_spreadsheet_id(self.spreadsheet_id)
+            self._ws_sid = _ev_sid
+            self._ws_book = (self.sheet if _ev_sid == self.spreadsheet_id
+                             else self.gc.open_by_key(_ev_sid))
+            _capacity_probe(self._ws_book, _ev_sid)
             try:
-                self.ws = self.sheet.worksheet(self.sheet_name)
+                self.ws = self._ws_book.worksheet(self.sheet_name)
             except Exception:
-                self.ws = self.sheet.add_worksheet(
+                self.ws = self._ws_book.add_worksheet(
                     title=self.sheet_name, rows=4000, cols=40
                 )
             self.backoff.execute_sync(self._ensure_headers)
         except Exception as e:
             logger.error("SignalHistoryStore init failed: %s", e)
+            self._ws_book = None
+            self._ws_sid = None
             self.gc = None
             self.sheet = None
             self.ws = None
@@ -4244,6 +4491,16 @@ class SignalHistoryStore:
         if not new:
             return 0
         rows = [self._snapshot_to_row(s) for s in new]
+        # v6.34.0 (IR-078a): capacity refusal before Google — see
+        # PerformanceStore.append_records.
+        _blk = _capacity_block_reason(
+            getattr(self, "_ws_book", None) or self.sheet,
+            getattr(self, "_ws_sid", None) or self.spreadsheet_id)
+        if _blk:
+            logger.error(
+                "[CAPACITY v6.34.0] Signal_History append REFUSED: %s", _blk)
+            _note_evidence_append_failure("Signal_History", _blk)
+            return 0
         try:
             self.backoff.execute_sync(
                 lambda: self.ws.append_rows(rows, value_input_option="RAW")  # type: ignore
@@ -4254,6 +4511,7 @@ class SignalHistoryStore:
             return len(new)
         except Exception as e:
             logger.error("Failed to append signal snapshots: %s", e)
+            _note_evidence_append_failure("Signal_History", str(e))
             return 0
 
 
@@ -4363,15 +4621,22 @@ class SignalTrendStore:
             else:
                 self.gc = gspread.service_account()
             self.sheet = self.gc.open_by_key(self.spreadsheet_id)
+            # v6.34.0 (IR-078a): trends are DERIVED (rebuildable) — they get
+            # the destination override for tab co-location but neither the
+            # capacity refusal nor the failure registry.
+            _ev_sid = _evidence_spreadsheet_id(self.spreadsheet_id)
+            self._ws_book = (self.sheet if _ev_sid == self.spreadsheet_id
+                             else self.gc.open_by_key(_ev_sid))
             try:
-                self.ws = self.sheet.worksheet(self.sheet_name)
+                self.ws = self._ws_book.worksheet(self.sheet_name)
             except Exception:
-                self.ws = self.sheet.add_worksheet(
+                self.ws = self._ws_book.add_worksheet(
                     title=self.sheet_name, rows=4000, cols=40
                 )
             self.backoff.execute_sync(self._ensure_headers)
         except Exception as e:
             logger.error("SignalTrendStore init failed: %s", e)
+            self._ws_book = None
             self.gc = None
             self.sheet = None
             self.ws = None
@@ -7500,6 +7765,24 @@ class PerformanceTrackerApp:
                     logger.warning("calibration export failed: %s", e)
             _out(f"Export complete: {out_base}.* ({fmt})")
 
+        # v6.34.0 (IR-078a): the evidence clock must not freeze silently.
+        # Every registered append failure is logged loudly; with
+        # TFB_TP_APPEND_FATAL=1 (default OFF, armed separately) the run
+        # exits 1 so the workflow goes RED and the S-1 day cannot be
+        # credited on a broken evidence store. VT-1 _Run_Log verdict and
+        # the S-1 calibration publish above remain best-effort by design.
+        _ev_fails = _evidence_append_failures()
+        if _ev_fails:
+            for _f in _ev_fails:
+                logger.error("[EVIDENCE-APPEND v6.34.0] FAILED — %s", _f)
+            if _append_fatal_enabled():
+                logger.error(
+                    "[EVIDENCE-APPEND v6.34.0] TFB_TP_APPEND_FATAL=1 — "
+                    "failing the run (%d append failure(s)).", len(_ev_fails))
+                return 1
+            logger.error(
+                "[EVIDENCE-APPEND v6.34.0] observe mode — run stays green; "
+                "arm TFB_TP_APPEND_FATAL=1 to make this fatal.")
         return 0
 
     # =========================================================================
