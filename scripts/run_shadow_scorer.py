@@ -1,6 +1,16 @@
 """
 scripts/run_shadow_scorer.py — TFB Gen-2 Champion-vs-Challenger Scorer + S-1 Gate
 =================================================================================
+VERSION 1.3.0  (2026-08-22)  — EODHD RESCUE FALLBACK FOR fetch_spot
+WHY v1.3.0: S1_Gate 2026-08-22 reads 3/28 scored days with 21 EXCLUDED_INFRA;
+the day-state classifier is honest, but the INPUT dies upstream: fetch_spot
+is Yahoo-only from a datacenter IP — the documented midday-throttle family
+(same mechanism as the Render crumb 429s). FIX: per-symbol EODHD EOD-close
+fallback fires ONLY for symbols Yahoo missed, gated by TFB_SHADOW_EODHD
+(default OFF — unset keeps v-prior behaviour byte-identical). Bar dates
+come from EODHD's own row, so the freshness honesty layer still judges
+every close; nothing is ever invented. count_scored_days, evaluate_s1,
+basket math: UNTOUCHED.
 VERSION 1.0.0  (2026-07-19)  — NEW SCRIPT (Wave S, deliverable #15)
 
 WHY (Master Plan v2.1 §3, §15): Gate S-1 decides whether Tranche 1 (~40K) is
@@ -690,6 +700,30 @@ def fetch_spot(symbols: Sequence[str]
                     errs.append(f"{sym}:no_close")
             except Exception as exc:  # noqa: BLE001
                 errs.append(f"{sym}:{type(exc).__name__}")
+    # ---- v1.3.0 EODHD rescue (gated, default OFF => byte-identical) ---- #
+    if (os.getenv("TFB_SHADOW_EODHD", "0").strip().lower()
+            in ("1", "true", "yes", "on")):
+        missing = [s for s in dict.fromkeys(symbols) if s not in out]
+        tok = os.getenv("TFB_EODHD_API_KEY", "").strip()
+        if missing and tok:
+            rescued = 0
+            with httpx.Client(timeout=20.0) as cl2:
+                for sym in missing:
+                    try:
+                        r2 = cl2.get(
+                            "https://eodhd.com/api/eod/" + sym
+                            + "?api_token=" + tok
+                            + "&fmt=json&period=d&order=d&limit=1")
+                        r2.raise_for_status()
+                        row = r2.json()[0]
+                        px2 = float(row["close"])
+                        out[sym] = px2
+                        asof[sym] = date.fromisoformat(row["date"])
+                        rescued += 1
+                    except Exception as exc:  # noqa: BLE001
+                        errs.append(f"{sym}:eodhd_{type(exc).__name__}")
+            if rescued:
+                errs.append(f"eodhd_rescued:{rescued}/{len(missing)}")
     return out, asof, errs
 
 
